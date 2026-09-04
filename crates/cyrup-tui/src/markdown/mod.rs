@@ -63,13 +63,13 @@ mod walk;
 pub use prepass::trim_partial_closing_fence;
 
 pub(crate) use highlight::highlight_code_lines;
-pub(crate) use mermaid::{mode_from_setting, MermaidContext, MessageType};
+pub(crate) use mermaid::{MermaidContext, MessageType, mode_from_setting};
 
 // The markdown-internal items the submodules share. Re-bound here so every submodule reaches them
 // through its own `use super::*;`, the same way `crate::transcript`'s split modules do.
 use highlight::highlight_lines;
 use mermaid::{DiagramOutcome, SpanClass};
-use prepass::{fence_is_closed, latex_prepass, MATH_END, MATH_START};
+use prepass::{MATH_END, MATH_START, fence_is_closed, latex_prepass};
 use table::trim_cell;
 
 /// Render markdown `text` into styled lines at content `width` (spec/tui/06 §2). Total / never panics:
@@ -169,7 +169,15 @@ pub fn render_with_hyperlink_support(
     theme: &UiTheme,
     hyperlinks: bool,
 ) -> Vec<Line<'static>> {
-    render_inner(text, width, theme, None, false, hyperlinks, MermaidContext::OFF)
+    render_inner(
+        text,
+        width,
+        theme,
+        None,
+        false,
+        hyperlinks,
+        MermaidContext::OFF,
+    )
 }
 
 /// [`render_with_text_color`] plus the mermaid gate — cyrup's stand-in for pi's
@@ -410,7 +418,10 @@ struct TableCapture {
 /// skip a table row whose bars happen to be `│ ` would read as blank.
 fn row_is_blank(line: &Line<'_>, quote: u32) -> bool {
     let skip = usize::try_from(quote).unwrap_or(usize::MAX);
-    line.spans.iter().skip(skip).all(|s| s.content.trim().is_empty())
+    line.spans
+        .iter()
+        .skip(skip)
+        .all(|s| s.content.trim().is_empty())
 }
 
 /// Whether `line` is a blank row *produced inside* a blockquote of depth `quote` — exactly `quote`
@@ -445,7 +456,9 @@ fn strip_quote_markers(line: &str, depth: u32) -> &str {
                 None => break,
             }
         }
-        let Some(rest) = t.strip_prefix('>') else { break };
+        let Some(rest) = t.strip_prefix('>') else {
+            break;
+        };
         s = rest.strip_prefix([' ', '\t']).unwrap_or(rest);
     }
     s

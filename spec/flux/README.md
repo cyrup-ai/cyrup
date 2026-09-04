@@ -70,8 +70,10 @@ Three corrections to the parent spec were found while re-planning and are record
 
 ## Shared conventions
 
-- **No tests to be written** — another team owns tests.
-- **No benchmarks to be written** — another team owns benchmarks.
+- **Tests are in scope** — there is no separate team that owns tests; every task names the tests
+  that pin its behaviour (fail-before / pass-after). *(Corrected 2026-09-04: the earlier "another
+  team owns tests" line was inherited from the upstream template and was never true here.)*
+- **Benchmarks** only when a task is performance-scoped.
 - **No documentation work** beyond the content files a task explicitly creates.
 - Definitions of done are behavioural and minimal — one manual run-through, not a test suite.
 - Relative links resolve from this directory: `../flux.md` is the parent spec,

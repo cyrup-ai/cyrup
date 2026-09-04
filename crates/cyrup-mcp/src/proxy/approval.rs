@@ -3,22 +3,20 @@
 //!
 //! See [`crate::proxy`] for the module overview.
 
-
 use indexmap::{IndexMap, IndexSet};
 use serde_json::{Map as JsonMap, Value};
 
-use cyrup_core::{CancelToken};
+use cyrup_core::CancelToken;
 
-use crate::config::{
-    BoolOrList, McpConfig,
-    ToolPrefix,
-};
-use crate::state::McpState;
+use crate::config::{BoolOrList, McpConfig, ToolPrefix};
 use crate::proxy::constants::{
     APPROVAL_OPTIONS, APPROVAL_PREVIEW_LENGTH, APPROVE_FOR_SESSION_OPTION, APPROVE_ONCE_OPTION,
 };
 use crate::proxy::env::{ApprovalOrigin, ApprovalOutcome};
-use crate::proxy::tool_metadata::{ToolMetadata, matches_tool_pattern, resolve_tool_prefix, tool_name_candidates};
+use crate::proxy::tool_metadata::{
+    ToolMetadata, matches_tool_pattern, resolve_tool_prefix, tool_name_candidates,
+};
+use crate::state::McpState;
 
 // ==================================================================================================
 // 15 · `tool-approval.ts` — the approval predicate and the approval dialog (MCP-231, MCP-232)
@@ -120,8 +118,17 @@ pub fn is_tool_call_approval_required(
     let other_current = if server_approval.is_some() {
         // Server scope: `toolMetadata.get(serverName) ?? []`, under THIS server's prefix.
         let mut set = IndexSet::new();
-        for other in metadata.get(server_name).map(Vec::as_slice).unwrap_or_default() {
-            set.extend(tool_name_candidates(&other.original_name, server_name, prefix, false));
+        for other in metadata
+            .get(server_name)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
+            set.extend(tool_name_candidates(
+                &other.original_name,
+                server_name,
+                prefix,
+                false,
+            ));
         }
         set
     } else {
@@ -142,7 +149,14 @@ pub fn is_tool_call_approval_required(
         set
     };
 
-    approval_legacy_arm(&tool.original_name, server_name, prefix, patterns, &current, other_current)
+    approval_legacy_arm(
+        &tool.original_name,
+        server_name,
+        prefix,
+        patterns,
+        &current,
+        other_current,
+    )
 }
 
 /// The tail both scopes of [`is_tool_call_approval_required`] share (`tool-approval.ts:53-67 @v2.26.1`,
@@ -288,7 +302,11 @@ pub async fn ensure_tool_call_approved(
     let cache_key = crate::state::approval_cache_key(server_name, &tool.original_name, args);
     // `approvedToolCalls.has(cacheKey)`. A poisoned lock reads as a MISS, so the worst a lock
     // panicked mid-insert can do is prompt the user a second time.
-    if state.approved_tool_calls.lock().is_ok_and(|approved| approved.contains(&cache_key)) {
+    if state
+        .approved_tool_calls
+        .lock()
+        .is_ok_and(|approved| approved.contains(&cache_key))
+    {
         return ApprovalOutcome::Approved;
     }
 
@@ -341,18 +359,23 @@ pub async fn ensure_tool_call_approved(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
-    use crate::proxy::testsupport::{FakeEnv, config_with, metadata_with, stdio};
-    use crate::state::McpStateParts;
-    use serde_json::json;
     use crate::config::{McpSettings, ServerEntry};
     use crate::lifecycle::McpLifecycleManager;
     use crate::owner::McpRuntimeOwner;
     use crate::proxy::constants::DENY_OPTION;
     use crate::proxy::env::ProxyCtx;
+    use crate::proxy::testsupport::{FakeEnv, config_with, metadata_with, stdio};
     use crate::state::McpServerManager;
+    use crate::state::McpStateParts;
+    use serde_json::json;
     use std::sync::{Arc, Mutex};
 
     // ==============================================================================================
@@ -400,7 +423,12 @@ mod tests {
         }
 
         fn last_prompt(&self) -> String {
-            self.prompts.lock().unwrap().last().cloned().unwrap_or_default()
+            self.prompts
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .unwrap_or_default()
         }
     }
 
@@ -412,14 +440,19 @@ mod tests {
             _opts: &cyrup_ext::DialogOptions,
         ) -> Option<String> {
             if let Some(gate) = self.gate.as_ref() {
-                self.waiting_during_dialog.lock().unwrap().push(gate.is_waiting());
+                self.waiting_during_dialog
+                    .lock()
+                    .unwrap()
+                    .push(gate.is_waiting());
             }
             self.prompts.lock().unwrap().push(prompt.to_string());
             self.options.lock().unwrap().push(
                 options
                     .as_array()
                     .map(|list| {
-                        list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()
+                        list.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
                     })
                     .unwrap_or_default(),
             );
@@ -432,8 +465,10 @@ mod tests {
     fn approval_state(config: McpConfig, ui: Option<Arc<ScriptedUi>>) -> Arc<McpState> {
         let owner = Arc::new(McpRuntimeOwner::new());
         let manager = Arc::new(McpServerManager::default());
-        let lifecycle =
-            Arc::new(McpLifecycleManager::new(Arc::clone(&manager), Arc::new(|_: &str| false)));
+        let lifecycle = Arc::new(McpLifecycleManager::new(
+            Arc::clone(&manager),
+            Arc::new(|_: &str| false),
+        ));
         Arc::new(McpState::new(McpStateParts {
             owner: Arc::clone(&owner),
             manager,
@@ -483,11 +518,22 @@ mod tests {
     #[test]
     fn approval_matches_original_prefixed_and_resource_tool_names() {
         let by_original = demo_config(Some(BoolOrList::Named(vec!["search-records".to_string()])));
-        assert!(is_tool_call_approval_required(&by_original, "demo", &demo_tool(), None));
+        assert!(is_tool_call_approval_required(
+            &by_original,
+            "demo",
+            &demo_tool(),
+            None
+        ));
 
-        let by_prefixed =
-            demo_config(Some(BoolOrList::Named(vec!["demo_search-records".to_string()])));
-        assert!(is_tool_call_approval_required(&by_prefixed, "demo", &demo_tool(), None));
+        let by_prefixed = demo_config(Some(BoolOrList::Named(vec![
+            "demo_search-records".to_string(),
+        ])));
+        assert!(is_tool_call_approval_required(
+            &by_prefixed,
+            "demo",
+            &demo_tool(),
+            None
+        ));
 
         // A global glob against a `short`-mode alias: `docs-mcp` prefixes as `docs`, so the
         // resource tool's current candidate set carries `docs_read_handbook`.
@@ -496,7 +542,12 @@ mod tests {
         let mut resource_tool =
             ToolMetadata::new("docs_read_handbook", "read_handbook", "Read handbook");
         resource_tool.resource_uri = Some("docs://handbook".to_string());
-        assert!(is_tool_call_approval_required(&resource_config, "docs-mcp", &resource_tool, None));
+        assert!(is_tool_call_approval_required(
+            &resource_config,
+            "docs-mcp",
+            &resource_tool,
+            None
+        ));
     }
 
     /// `"gates exact global selectors without applying them through a legacy collision"` — the
@@ -504,8 +555,10 @@ mod tests {
     /// hyphen-escaped legacy alias the two servers share.
     #[test]
     fn a_global_selector_does_not_gate_the_wrong_server_through_a_legacy_alias() {
-        let mut config =
-            config_with(&[("my-server", stdio("hyphen")), ("my_2d_server", stdio("escaped"))]);
+        let mut config = config_with(&[
+            ("my-server", stdio("hyphen")),
+            ("my_2d_server", stdio("escaped")),
+        ]);
         config.settings = settings_approving(&["my_2d_server_do_thing"]);
         let hyphen = ToolMetadata::new("my-server_do-thing", "do-thing", "");
         let escaped = ToolMetadata::new("my_2d_server_do_thing", "do_thing", "");
@@ -514,8 +567,18 @@ mod tests {
             ("my_2d_server", vec![escaped.clone()]),
         ]);
 
-        assert!(!is_tool_call_approval_required(&config, "my-server", &hyphen, Some(&metadata)));
-        assert!(is_tool_call_approval_required(&config, "my_2d_server", &escaped, Some(&metadata)));
+        assert!(!is_tool_call_approval_required(
+            &config,
+            "my-server",
+            &hyphen,
+            Some(&metadata)
+        ));
+        assert!(is_tool_call_approval_required(
+            &config,
+            "my_2d_server",
+            &escaped,
+            Some(&metadata)
+        ));
     }
 
     /// `"matches safe server-scoped normalized approval selectors"` and `"matches safe global
@@ -528,14 +591,23 @@ mod tests {
 
         let mut server_scope = config_with(&[("my-server", stdio("demo"))]);
         if let Some(entry) = server_scope.mcp_servers.get_mut("my-server") {
-            entry.approve_tools =
-                Some(BoolOrList::Named(vec!["my_server_do_thing".to_string()]));
+            entry.approve_tools = Some(BoolOrList::Named(vec!["my_server_do_thing".to_string()]));
         }
-        assert!(is_tool_call_approval_required(&server_scope, "my-server", &scoped, Some(&metadata)));
+        assert!(is_tool_call_approval_required(
+            &server_scope,
+            "my-server",
+            &scoped,
+            Some(&metadata)
+        ));
 
         let mut global_scope = config_with(&[("my-server", stdio("demo"))]);
         global_scope.settings = settings_approving(&["my_server_do_thing"]);
-        assert!(is_tool_call_approval_required(&global_scope, "my-server", &scoped, Some(&metadata)));
+        assert!(is_tool_call_approval_required(
+            &global_scope,
+            "my-server",
+            &scoped,
+            Some(&metadata)
+        ));
     }
 
     /// `"does not gate a same-server legacy collision"` — `demo_search_records` is the *current*
@@ -549,8 +621,18 @@ mod tests {
         config.settings = settings_approving(&["demo_search_records"]);
         let metadata = metadata_with(&[("demo", vec![hyphen.clone(), underscore.clone()])]);
 
-        assert!(!is_tool_call_approval_required(&config, "demo", &hyphen, Some(&metadata)));
-        assert!(is_tool_call_approval_required(&config, "demo", &underscore, Some(&metadata)));
+        assert!(!is_tool_call_approval_required(
+            &config,
+            "demo",
+            &hyphen,
+            Some(&metadata)
+        ));
+        assert!(is_tool_call_approval_required(
+            &config,
+            "demo",
+            &underscore,
+            Some(&metadata)
+        ));
     }
 
     /// The ladder itself: `true` always gates, a per-server value beats the global on **presence**
@@ -574,7 +656,12 @@ mod tests {
 
         let empty = demo_config(Some(BoolOrList::Named(Vec::new())));
         assert!(!is_tool_call_approval_required(&empty, "demo", &tool, None));
-        assert!(!is_tool_call_approval_required(&demo_config(None), "demo", &tool, None));
+        assert!(!is_tool_call_approval_required(
+            &demo_config(None),
+            "demo",
+            &tool,
+            None
+        ));
     }
 
     /// The `tool_metadata == None` asymmetry 13e names: with no collision context the **server**
@@ -585,14 +672,23 @@ mod tests {
 
         let mut server_scope = config_with(&[("my-server", stdio("demo"))]);
         if let Some(entry) = server_scope.mcp_servers.get_mut("my-server") {
-            entry.approve_tools =
-                Some(BoolOrList::Named(vec!["my_server_do_thing".to_string()]));
+            entry.approve_tools = Some(BoolOrList::Named(vec!["my_server_do_thing".to_string()]));
         }
-        assert!(is_tool_call_approval_required(&server_scope, "my-server", &scoped, None));
+        assert!(is_tool_call_approval_required(
+            &server_scope,
+            "my-server",
+            &scoped,
+            None
+        ));
 
         let mut global_scope = config_with(&[("my-server", stdio("demo"))]);
         global_scope.settings = settings_approving(&["my_server_do_thing"]);
-        assert!(!is_tool_call_approval_required(&global_scope, "my-server", &scoped, None));
+        assert!(!is_tool_call_approval_required(
+            &global_scope,
+            "my-server",
+            &scoped,
+            None
+        ));
     }
 
     // ---- MCP-232 · `ensureToolCallApproved` -------------------------------------------------------
@@ -625,8 +721,10 @@ mod tests {
         // The same call with a UI whose dialog is dismissed — upstream's `select` resolving
         // `undefined`.
         let ui = ScriptedUi::answering(None);
-        let interactive =
-            approval_state(demo_config(Some(BoolOrList::All(true))), Some(Arc::clone(&ui)));
+        let interactive = approval_state(
+            demo_config(Some(BoolOrList::All(true))),
+            Some(Arc::clone(&ui)),
+        );
         assert_eq!(
             ensure_tool_call_approved(
                 &interactive,
@@ -640,7 +738,11 @@ mod tests {
             .await,
             ApprovalOutcome::Denied
         );
-        assert_eq!(ui.prompt_count(), 1, "the headless check must not suppress a real dialog");
+        assert_eq!(
+            ui.prompt_count(),
+            1,
+            "the headless check must not suppress a real dialog"
+        );
     }
 
     /// `"caches only Allow for session decisions"` as rewritten by `5bcd6c5` — three calls, two
@@ -651,7 +753,10 @@ mod tests {
         let tool = demo_tool();
         let metadata = metadata_with(&[("demo", vec![tool.clone()])]);
         let ui = ScriptedUi::answering(Some(APPROVE_FOR_SESSION_OPTION));
-        let state = approval_state(demo_config(Some(BoolOrList::All(true))), Some(Arc::clone(&ui)));
+        let state = approval_state(
+            demo_config(Some(BoolOrList::All(true))),
+            Some(Arc::clone(&ui)),
+        );
 
         for args in [
             json!({ "record": { "id": "safe", "type": "demo" } }),
@@ -673,7 +778,11 @@ mod tests {
             );
         }
 
-        assert_eq!(ui.prompt_count(), 2, "the reordered payload reuses the first approval");
+        assert_eq!(
+            ui.prompt_count(),
+            2,
+            "the reordered payload reuses the first approval"
+        );
         assert_eq!(state.approved_tool_calls.lock().unwrap().len(), 2);
     }
 
@@ -684,7 +793,10 @@ mod tests {
         let tool = demo_tool();
         let metadata = metadata_with(&[("demo", vec![tool.clone()])]);
         let ui = ScriptedUi::answering(Some(APPROVE_ONCE_OPTION));
-        let state = approval_state(demo_config(Some(BoolOrList::All(true))), Some(Arc::clone(&ui)));
+        let state = approval_state(
+            demo_config(Some(BoolOrList::All(true))),
+            Some(Arc::clone(&ui)),
+        );
 
         for _ in 0..2 {
             assert_eq!(
@@ -778,7 +890,10 @@ mod tests {
         let tool = demo_tool();
         let metadata = metadata_with(&[("demo", vec![tool.clone()])]);
         let ui = ScriptedUi::answering(Some(APPROVE_ONCE_OPTION));
-        let state = approval_state(demo_config(Some(BoolOrList::All(true))), Some(Arc::clone(&ui)));
+        let state = approval_state(
+            demo_config(Some(BoolOrList::All(true))),
+            Some(Arc::clone(&ui)),
+        );
         let cancel = CancelToken::new();
         cancel.cancel();
 
@@ -822,7 +937,10 @@ mod tests {
         let tool = demo_tool();
         let metadata = metadata_with(&[("demo", vec![tool.clone()])]);
         let ui = ScriptedUi::answering(Some(APPROVE_ONCE_OPTION));
-        let state = approval_state(demo_config(Some(BoolOrList::All(true))), Some(Arc::clone(&ui)));
+        let state = approval_state(
+            demo_config(Some(BoolOrList::All(true))),
+            Some(Arc::clone(&ui)),
+        );
 
         let _ = ensure_tool_call_approved(
             &state,
@@ -844,7 +962,12 @@ mod tests {
             "MCP: demo wants to run search-records\n\nArguments:\n{ \"query\": \"private\" }"
         );
         assert_eq!(
-            ui.options.lock().unwrap().last().cloned().unwrap_or_default(),
+            ui.options
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .unwrap_or_default(),
             vec!["Allow once", "Allow for session", "Deny"]
         );
     }
@@ -884,7 +1007,10 @@ mod tests {
         assert!(!prompt.contains('\u{1b}'), "no ESC survives: {prompt:?}");
         assert!(!prompt.contains('\u{7}'), "no BEL survives: {prompt:?}");
         assert!(!prompt.contains('\u{7f}'), "no DEL survives: {prompt:?}");
-        assert!(!prompt.contains('\u{85}'), "no C1 control survives: {prompt:?}");
+        assert!(
+            !prompt.contains('\u{85}'),
+            "no C1 control survives: {prompt:?}"
+        );
         // BEL is a C0 control and collapses to ONE space; `ESC [ 2 J` is a complete CSI and is
         // removed outright, leaving the two halves of the tool name joined.
         assert!(
@@ -905,7 +1031,10 @@ mod tests {
         let tool = demo_tool();
         let metadata = metadata_with(&[("demo", vec![tool.clone()])]);
         let ui = ScriptedUi::answering(Some(DENY_OPTION));
-        let state = approval_state(demo_config(Some(BoolOrList::All(true))), Some(Arc::clone(&ui)));
+        let state = approval_state(
+            demo_config(Some(BoolOrList::All(true))),
+            Some(Arc::clone(&ui)),
+        );
 
         let _ = ensure_tool_call_approved(
             &state,
@@ -919,8 +1048,15 @@ mod tests {
         .await;
 
         let prompt = ui.last_prompt();
-        let preview = prompt.split("Arguments:\n").nth(1).unwrap_or_default().to_string();
-        assert!(preview.ends_with("..."), "the tail is three ASCII periods: {preview:?}");
+        let preview = prompt
+            .split("Arguments:\n")
+            .nth(1)
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            preview.ends_with("..."),
+            "the tail is three ASCII periods: {preview:?}"
+        );
         assert_eq!(
             preview.trim_end_matches("...").encode_utf16().count(),
             APPROVAL_PREVIEW_LENGTH
@@ -944,7 +1080,10 @@ mod tests {
         let tool = demo_tool();
         let metadata = metadata_with(&[("demo", vec![tool.clone()])]);
         let ui = ScriptedUi::watching(Some(DENY_OPTION), Arc::clone(&gate));
-        let state = approval_state(demo_config(Some(BoolOrList::All(true))), Some(Arc::clone(&ui)));
+        let state = approval_state(
+            demo_config(Some(BoolOrList::All(true))),
+            Some(Arc::clone(&ui)),
+        );
 
         // Nothing recorded yet — the dialog still opens, it just forgives no budget.
         let _ = ensure_tool_call_approved(
@@ -976,7 +1115,10 @@ mod tests {
             vec![false, true],
             "the second dialog runs under the P-3 guard the recorded ctx supplies"
         );
-        assert!(!gate.is_waiting(), "and releases it when the dialog returns");
+        assert!(
+            !gate.is_waiting(),
+            "and releases it when the dialog returns"
+        );
     }
 
     /// The [`ProxyCtx`] seam joins the state and the metadata map for both gates — the two-line
@@ -986,8 +1128,14 @@ mod tests {
     async fn the_proxy_ctx_bridge_reaches_both_gates() {
         let tool = demo_tool();
         let ui = ScriptedUi::answering(Some(DENY_OPTION));
-        let state = approval_state(demo_config(Some(BoolOrList::All(true))), Some(Arc::clone(&ui)));
-        let ctx = Arc::new(ProxyCtx::new(Arc::clone(&state), Arc::new(FakeEnv::default())));
+        let state = approval_state(
+            demo_config(Some(BoolOrList::All(true))),
+            Some(Arc::clone(&ui)),
+        );
+        let ctx = Arc::new(ProxyCtx::new(
+            Arc::clone(&state),
+            Arc::new(FakeEnv::default()),
+        ));
         ctx.with_metadata_mut(|metadata| {
             metadata.insert("demo".to_string(), vec![tool.clone()]);
         });
@@ -1025,7 +1173,11 @@ mod tests {
                 .await,
             ApprovalOutcome::Approved
         );
-        assert_eq!(ui.prompt_count(), 1, "an ungated tool opens no second dialog");
+        assert_eq!(
+            ui.prompt_count(),
+            1,
+            "an ungated tool opens no second dialog"
+        );
     }
 
     /// The two origin derivations differ only in their fallback, and that difference is the whole
@@ -1034,13 +1186,25 @@ mod tests {
     fn the_two_origin_derivations_differ_only_in_their_fallback() {
         let uri = "docs://handbook".to_string();
         assert_eq!(ApprovalOrigin::for_proxy_call(None), ApprovalOrigin::Proxy);
-        assert_eq!(ApprovalOrigin::for_direct_tool(None), ApprovalOrigin::Direct);
-        assert_eq!(ApprovalOrigin::for_proxy_call(Some(&uri)), ApprovalOrigin::Resource);
-        assert_eq!(ApprovalOrigin::for_direct_tool(Some(&uri)), ApprovalOrigin::Resource);
         assert_eq!(
-            [ApprovalOrigin::Proxy.as_str(), ApprovalOrigin::Direct.as_str(), ApprovalOrigin::Resource.as_str()],
+            ApprovalOrigin::for_direct_tool(None),
+            ApprovalOrigin::Direct
+        );
+        assert_eq!(
+            ApprovalOrigin::for_proxy_call(Some(&uri)),
+            ApprovalOrigin::Resource
+        );
+        assert_eq!(
+            ApprovalOrigin::for_direct_tool(Some(&uri)),
+            ApprovalOrigin::Resource
+        );
+        assert_eq!(
+            [
+                ApprovalOrigin::Proxy.as_str(),
+                ApprovalOrigin::Direct.as_str(),
+                ApprovalOrigin::Resource.as_str()
+            ],
             ["proxy", "direct", "resource"]
         );
     }
-
 }

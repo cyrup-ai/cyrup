@@ -152,8 +152,12 @@ pub async fn git_has_available_update(installed_path: &Path) -> bool {
 /// remote's `HEAD`.
 async fn remote_git_head(installed_path: &Path) -> Option<String> {
     if let Some(upstream_ref) = git_upstream_ref(installed_path).await
-        && let Some(out) =
-            git_capture(installed_path, &["ls-remote", "origin", &upstream_ref], true).await
+        && let Some(out) = git_capture(
+            installed_path,
+            &["ls-remote", "origin", &upstream_ref],
+            true,
+        )
+        .await
         && let Some(sha) = first_sha(&out, None)
     {
         return Some(sha);
@@ -166,7 +170,12 @@ async fn remote_git_head(installed_path: &Path) -> Option<String> {
 /// Pi `getGitUpstreamRef` (`:1618-1634`): the tracked branch as `refs/heads/<branch>`, and only when
 /// it is on `origin` — upstream ignores any other remote.
 async fn git_upstream_ref(installed_path: &Path) -> Option<String> {
-    let out = git_capture(installed_path, &["rev-parse", "--abbrev-ref", "@{upstream}"], false).await?;
+    let out = git_capture(
+        installed_path,
+        &["rev-parse", "--abbrev-ref", "@{upstream}"],
+        false,
+    )
+    .await?;
     let trimmed = out.trim();
     let branch = trimmed.strip_prefix("origin/")?;
     if branch.is_empty() {
@@ -211,7 +220,10 @@ async fn git_capture(cwd: &Path, args: &[&str], remote: bool) -> Option<String> 
         cmd.env("GIT_TERMINAL_PROMPT", "0");
     }
     let child = cmd.spawn().ok()?;
-    let out = tokio::time::timeout(NETWORK_TIMEOUT, child.wait_with_output()).await.ok()?.ok()?;
+    let out = tokio::time::timeout(NETWORK_TIMEOUT, child.wait_with_output())
+        .await
+        .ok()?
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -246,7 +258,12 @@ pub fn spawn_package_update_check(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
     use super::*;
 
     #[test]
@@ -273,7 +290,11 @@ mod tests {
         assert_eq!(first_sha("", None), None);
         // A blank leading line must not abort the scan.
         assert_eq!(
-            first_sha("\n\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tHEAD\n", Some("HEAD")).as_deref(),
+            first_sha(
+                "\n\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tHEAD\n",
+                Some("HEAD")
+            )
+            .as_deref(),
             Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
     }
@@ -301,12 +322,10 @@ mod tests {
         };
         let store = PackageStore::new(std::env::temp_dir().join("cyrup-upd-none"), None);
         assert!(check_for_available_updates(store, policy).await.is_empty());
-        assert!(spawn_package_update_check(
-            std::env::temp_dir().join("cyrup-upd-none"),
-            None,
-            policy
-        )
-        .is_none());
+        assert!(
+            spawn_package_update_check(std::env::temp_dir().join("cyrup-upd-none"), None, policy)
+                .is_none()
+        );
     }
 
     /// …and so does the dedicated skip toggle, independently of `offline` (R-07-024: the two knobs
@@ -319,12 +338,10 @@ mod tests {
             install_telemetry: true,
             analytics: false,
         };
-        assert!(spawn_package_update_check(
-            std::env::temp_dir().join("cyrup-upd-skip"),
-            None,
-            policy
-        )
-        .is_none());
+        assert!(
+            spawn_package_update_check(std::env::temp_dir().join("cyrup-upd-skip"), None, policy)
+                .is_none()
+        );
     }
 
     /// A directory that is not a git work tree can never claim an update — `git rev-parse HEAD`

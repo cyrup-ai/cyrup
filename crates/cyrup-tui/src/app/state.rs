@@ -218,6 +218,14 @@ pub struct AppState {
     /// command handlers (`/new`/`/resume`/`/fork`/`/reload`/`/import`); consumed by
     /// [`App::rebind_session`] once the generation bump fires and the new session is installed.
     pub pending_swap_status: Option<SwapCaption>,
+    /// TUI-037 — pi's `autoTrustOnReloadCwd` (`interactive-mode.ts:550` @v0.84.4): the session
+    /// cwd whose trust was granted IMPLICITLY at boot (no `--approve`/`--no-approve`, no
+    /// trust-requiring resources to gate), armed by the host through
+    /// [`App::set_auto_trust_on_reload_cwd`] and consumed by
+    /// [`App::maybe_save_implicit_project_trust`] on `/reload`, which persists the grant once the
+    /// project grows `.cyrup/` resources and disarms it. `None` when trust was decided explicitly
+    /// (a flag, a saved entry, the prompt) or already persisted.
+    pub auto_trust_on_reload_cwd: Option<PathBuf>,
     /// Committed lines already emitted to native scrollback via `Terminal::insert_before`
     /// (R-ARCH-TUI-003). Test/inspection only — OFF in production builds (TUI-092 F1).
     #[cfg(any(test, feature = "scrollback-accumulator"))]
@@ -266,6 +274,13 @@ pub struct AppState {
     /// (`interactive-mode.ts:4749-4779`). Cleared the moment the navigation is dispatched or the
     /// prompt is escaped back to the tree.
     pub(super) pending_tree_nav: Option<PendingTreeNav>,
+    /// TUI-081 — the `/import <path>` awaiting its "Replace current session with …?" answer
+    /// ([`crate::SelectorKind::ImportConfirm`]). Pi holds the same value in `handleImportCommand`'s
+    /// `inputPath` local across the `await this.showExtensionConfirm(…)`
+    /// (`interactive-mode.ts:6063-6069` @v0.84.4). Taken the moment the prompt is answered — `Yes`
+    /// dispatches the import, `No`/Escape pushes `Import cancelled` — so a stale path can never be
+    /// imported by a later confirm.
+    pub(super) pending_import: Option<PendingImport>,
     /// The window title currently asked for — either by an extension (Pi `setTitle` →
     /// `ui.terminal.setTitle`, `interactive-mode.ts:2238` → `terminal.ts:504-507`) or by the
     /// automatic session/cwd title ([`App::update_terminal_title`], Pi `updateTerminalTitle`,
@@ -340,7 +355,8 @@ pub struct AppState {
     /// one-shot (`login_dialog::TuiAuthInteraction::prompt`, Pi's `inputResolver`/`inputRejecter`
     /// pair, `login-dialog.ts:16-17`); [`App::confirm_selector`] resolves it with the typed answer
     /// and [`App::handle_selector_key`]'s `Cancel` arm rejects it with `"Login cancelled"`.
-    pub(super) pending_login_prompt: Option<tokio::sync::oneshot::Sender<Result<String, OAuthError>>>,
+    pub(super) pending_login_prompt:
+        Option<tokio::sync::oneshot::Sender<Result<String, OAuthError>>>,
     /// The dialog's `AbortController` (`login-dialog.ts:15`, `:73-75`) for the flow currently on
     /// screen: `cancel()` fires it so a flow blocked on something other than a prompt (a callback
     /// server, a device-code poll) also unwinds. `None` whenever no login is in flight.
@@ -358,10 +374,13 @@ pub struct AppState {
     /// settled `/login` or `/logout` (each of which ends in `footer.invalidate()`,
     /// `interactive-mode.ts:5449`, `:5475`). See [`App::refresh_auth_snapshot`].
     pub(super) oauth_credential_providers: std::collections::BTreeSet<String>,
-    /// Tool names the live session knows a DEFINITION for — Pi's `getToolDefinition(name)` registry
-    /// (`agent-session.ts:806`, built over the builtins plus every registered/custom tool), which
-    /// `ToolExecutionComponent.hasRendererDefinition()` reads (`tool-execution.ts:103-105`) to
-    /// choose between the two per-side fallbacks and the unbounded `formatToolExecution`.
+    /// Tool names the live session knows a DEFINITION for, each with that definition's
+    /// `renderShell` — Pi's `getToolDefinition(name)` registry (`agent-session.ts:806`, built over
+    /// the builtins plus every registered/custom tool), which `ToolExecutionComponent` reads twice:
+    /// `hasRendererDefinition()` (`tool-execution.ts:103-105`) to choose between the two per-side
+    /// fallbacks and the unbounded `formatToolExecution`, and `getRenderShell()` (`:108-116`) to
+    /// choose between the tinted `Box(1, 1)` shell and the tool's own framing (EXT-024). One
+    /// lookup answers both, so the memo is a map from the name to the shell rather than a set.
     ///
     /// Cached here for the same reason [`Self::oauth_credential_providers`] is: the answer is
     /// needed by the **sync** fold ([`App::ingest_event_rendered_owned`]), which holds no session.
@@ -369,7 +388,8 @@ pub struct AppState {
     /// [`App::ingest_session_event_owned`], which resolves that one name off the live registry, and
     /// a session bind/swap, which reloads the whole set ([`App::refresh_known_tool_definitions`])
     /// so the `/resume` replay walk can answer for calls it never saw start.
-    pub(super) known_tool_definitions: std::collections::HashSet<String>,
+    pub(super) known_tool_definitions:
+        std::collections::HashMap<String, cyrup_core::ToolRenderKind>,
     /// The `(command, argument)` pair [`App::refresh_extension_completions`] last asked an
     /// extension command's own completer about (`getArgumentCompletions`,
     /// `interactive-mode.ts:753` @v0.84.3). `None` whenever the cursor is not inside such an
@@ -455,6 +475,7 @@ impl AppState {
             show_cache_miss_notices: false,
             cache_miss_check_pending: false,
             pending_swap_status: None,
+            auto_trust_on_reload_cwd: None,
             #[cfg(any(test, feature = "scrollback-accumulator"))]
             scrollback: Vec::new(),
             extension_shortcuts: Vec::new(),
@@ -467,6 +488,7 @@ impl AppState {
             editor_mirror: cyrup_session_svc::EditorTextMirror::new(),
             theme_access: None,
             pending_tree_nav: None,
+            pending_import: None,
             terminal_title: None,
             // Off until a session binds and `terminal.showTerminalProgress` is read ([`App::run`]).
             // Pi has no seed at all — it re-reads the setting at each of its five call sites.
@@ -489,7 +511,7 @@ impl AppState {
             pending_login_prompt: None,
             login_cancel: None,
             oauth_credential_providers: std::collections::BTreeSet::new(),
-            known_tool_definitions: std::collections::HashSet::new(),
+            known_tool_definitions: std::collections::HashMap::new(),
             extension_completion_query: None,
         }
     }
@@ -507,7 +529,10 @@ impl AppState {
     ///
     /// Accepts either a bare key-id (`ExtensionHost::shortcut_keys()`'s `Vec<String>`) or an
     /// `(id, description)` pair — see [`ShortcutSpec`] for why both forms exist.
-    pub fn set_extension_shortcuts(&mut self, specs: impl IntoIterator<Item = impl Into<ShortcutSpec>>) {
+    pub fn set_extension_shortcuts(
+        &mut self,
+        specs: impl IntoIterator<Item = impl Into<ShortcutSpec>>,
+    ) {
         self.extension_shortcuts = specs
             .into_iter()
             .map(Into::into)
@@ -523,6 +548,19 @@ pub(crate) struct PendingTreeNav {
     /// The confirmed tree row's entry id.
     pub(crate) target: String,
 }
+
+/// The `/import` awaiting its confirmation (see [`AppState::pending_import`]).
+#[derive(Clone, Debug)]
+pub(crate) struct PendingImport {
+    /// The path the user typed after `/import`, verbatim — it is what the prompt names and what
+    /// `import_from_jsonl` receives.
+    pub(crate) path: String,
+}
+
+/// The row value of the `Yes` option in a first-party confirm prompt ([`PendingImport`]'s
+/// [`crate::SelectorKind::ImportConfirm`]). Pi's `showExtensionConfirm` reads `result === "Yes"`
+/// (`interactive-mode.ts:2564` @v0.84.4); anything else — `No`, Escape — is a decline.
+pub(crate) const CONFIRM_YES: &str = "yes";
 
 pub(crate) const BRANCH_SUMMARY_NONE: &str = "none";
 
@@ -551,19 +589,28 @@ pub struct ShortcutSpec {
 
 impl From<String> for ShortcutSpec {
     fn from(id: String) -> Self {
-        ShortcutSpec { id, description: None }
+        ShortcutSpec {
+            id,
+            description: None,
+        }
     }
 }
 
 impl From<&str> for ShortcutSpec {
     fn from(id: &str) -> Self {
-        ShortcutSpec { id: id.to_string(), description: None }
+        ShortcutSpec {
+            id: id.to_string(),
+            description: None,
+        }
     }
 }
 
 impl From<(String, String)> for ShortcutSpec {
     fn from((id, description): (String, String)) -> Self {
-        ShortcutSpec { id, description: Some(description) }
+        ShortcutSpec {
+            id,
+            description: Some(description),
+        }
     }
 }
 
@@ -640,7 +687,11 @@ pub(crate) fn default_ui_reply(kind: UiKind) -> UiReply {
 /// displayed value belongs to the tick, not to whenever the string happens to be formatted. Reading
 /// the clock in here instead left [`App::tick_extension_dialog_countdown_at`]'s injected instant
 /// governing only the expiry branch, so a ticked-forward countdown still printed its opening value.
-pub(crate) fn countdown_title(base: &str, deadline: tokio::time::Instant, now: tokio::time::Instant) -> String {
+pub(crate) fn countdown_title(
+    base: &str,
+    deadline: tokio::time::Instant,
+    now: tokio::time::Instant,
+) -> String {
     let remaining = deadline.saturating_duration_since(now);
     let secs = remaining.as_millis().div_ceil(1000);
     format!("{base} ({secs}s)")

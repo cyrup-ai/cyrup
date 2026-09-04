@@ -537,7 +537,10 @@ mod tests {
 
         // `off: null` only.
         let flash3 = by_id("gemini-3-flash-preview");
-        let map = flash3.thinking_level_map.as_ref().expect("thinkingLevelMap");
+        let map = flash3
+            .thinking_level_map
+            .as_ref()
+            .expect("thinkingLevelMap");
         assert_eq!(map.get("off"), Some(&None));
         assert_eq!(map.len(), 1);
 

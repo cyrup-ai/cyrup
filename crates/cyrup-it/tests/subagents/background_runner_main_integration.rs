@@ -32,22 +32,26 @@
 //! it as a normal, zero-test pass) rather than every test failing at spawn time with a confusing
 //! "No such file or directory".
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use cyrup_ext_subagents::paths::Roots;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-
 use cyrup_core::ModelId;
 use cyrup_ext_subagents::background::atomic::write_atomic_json;
 use cyrup_ext_subagents::background::control::{ChainAppendRequest, InterruptRequest};
-use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::background::runner_main::{RunnerConfig, RunnerOverrides, run_with};
-use cyrup_ext_subagents::background::{RunId, RunMode, RunPaths, RunState, RunStatus, ResultFile};
+use cyrup_ext_subagents::background::{ResultFile, RunId, RunMode, RunPaths, RunState, RunStatus};
 use cyrup_ext_subagents::discovery::types::SystemPromptMode;
 use cyrup_ext_subagents::exec::ResolvedAgentPersona;
+use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::spawn::chain_graph::{RunnerStep, SingleStepSpec};
 
 /// A minimal resolved persona for a fixture-driven test (T0.1 / C13): a real model so
@@ -58,8 +62,11 @@ use cyrup_ext_subagents::spawn::chain_graph::{RunnerStep, SingleStepSpec};
 /// an unresolved agent as `Unknown agent` rather than synthesizing a placeholder.
 fn fixture_persona(name: &str) -> ResolvedAgentPersona {
     ResolvedAgentPersona {
+        acceptance_role: None, // SUBA-082: no declared role, the name decides
+        default_acceptance: None,
         name: name.to_string(),
         model: Some(ModelId::from("fixture-model")),
+        model_provider: None,
         fallback_models: Vec::new(),
         thinking: None,
         system_prompt_mode: SystemPromptMode::Replace,
@@ -67,6 +74,8 @@ fn fixture_persona(name: &str) -> ResolvedAgentPersona {
         tools: None,
         extensions: None,
         subagent_only_extensions: Vec::new(),
+        exclude_tools: Vec::new(),
+        allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
         inherit_skills: true,
@@ -84,13 +93,11 @@ fn fixture_persona(name: &str) -> ResolvedAgentPersona {
 /// (including the mid-run `appended` step consumed from disk) — mirroring the orchestrator's own
 /// eager, up-front persona resolution.
 fn all_personas() -> BTreeMap<String, ResolvedAgentPersona> {
-    ["worker", "first", "only", "appended"]
+    ["worker", "first", "second", "only", "appended"]
         .into_iter()
         .map(|name| (name.to_string(), fixture_persona(name)))
         .collect()
 }
-
-
 
 /// Path to the real, already-built `cyrup-subagent-fixture` binary.
 ///
@@ -112,7 +119,10 @@ fn fixture_binary_path() -> PathBuf {
 fn fixture_cmd(script_path: &Path) -> SpawnCommand {
     SpawnCommand {
         binary: fixture_binary_path(),
-        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
     }
 }
 
@@ -171,28 +181,44 @@ async fn run_against_fixture(
 
     let async_root = dir.join("async");
     let results_dir = dir.join("results");
-    tokio::fs::create_dir_all(&async_root).await.expect("mkdir async_root");
-    tokio::fs::create_dir_all(&results_dir).await.expect("mkdir results_dir");
+    tokio::fs::create_dir_all(&async_root)
+        .await
+        .expect("mkdir async_root");
+    tokio::fs::create_dir_all(&results_dir)
+        .await
+        .expect("mkdir results_dir");
     let run_paths = RunPaths::for_run(&async_root, &results_dir, &config.run_id);
-    tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run_dir");
+    tokio::fs::create_dir_all(&run_paths.run_dir)
+        .await
+        .expect("mkdir run_dir");
 
     let cfg_path = run_paths.run_dir.join("runner-config.json");
-    write_atomic_json(&cfg_path, &config).await.expect("write runner config");
+    write_atomic_json(&cfg_path, &config)
+        .await
+        .expect("write runner config");
 
     let result = run_with(
         &cfg_path,
         &run_paths,
-        RunnerOverrides { spawn_command: Some(fixture_cmd(&script_path)), ..Default::default() },
-    ).await;
+        RunnerOverrides {
+            spawn_command: Some(fixture_cmd(&script_path)),
+            ..Default::default()
+        },
+    )
+    .await;
 
     result.expect("run() itself never returns Err");
 
     let status: RunStatus = serde_json::from_slice(
-        &tokio::fs::read(&run_paths.status).await.expect("status.json exists"),
+        &tokio::fs::read(&run_paths.status)
+            .await
+            .expect("status.json exists"),
     )
     .expect("parse status.json");
     let result_file: ResultFile = serde_json::from_slice(
-        &tokio::fs::read(&run_paths.result).await.expect("ResultFile exists"),
+        &tokio::fs::read(&run_paths.result)
+            .await
+            .expect("ResultFile exists"),
     )
     .expect("parse ResultFile");
 
@@ -229,7 +255,10 @@ async fn happy_path_writes_status_then_result_both_terminal_and_consistent() {
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
         run_id: RunId::from_token("happyrun1"),
         mode: RunMode::Single,
-        steps: vec![RunnerStep::SingleStep(single_step("worker", "do the thing"))],
+        steps: vec![RunnerStep::SingleStep(single_step(
+            "worker",
+            "do the thing",
+        ))],
         cwd: dir.path().to_path_buf(),
         session_file: None,
         session_id: None,
@@ -245,14 +274,14 @@ async fn happy_path_writes_status_then_result_both_terminal_and_consistent() {
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
-    nested_route: None,
-    nested_self: None,
-    dynamic_fanout_max_items: None,
-    // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
-    model_scope: None,
-    control: None,
-    include_progress: None,
-};
+        nested_route: None,
+        nested_self: None,
+        dynamic_fanout_max_items: None,
+        // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
+        model_scope: None,
+        control: None,
+        include_progress: None,
+    };
 
     let (status, result_file) = run_against_fixture(dir.path(), &script, config).await;
 
@@ -275,7 +304,10 @@ async fn happy_path_writes_status_then_result_both_terminal_and_consistent() {
         .as_ref()
         .expect("status.json must carry a workflowGraph snapshot");
     assert_eq!(graph.nodes.len(), 1, "one-step run has one graph node");
-    assert_eq!(graph.nodes[0].id, "step-0", "the node id is the pi `step-<N>` shape");
+    assert_eq!(
+        graph.nodes[0].id, "step-0",
+        "the node id is the pi `step-<N>` shape"
+    );
     assert_eq!(graph.nodes[0].agent.as_deref(), Some("worker"));
 }
 
@@ -298,14 +330,15 @@ async fn happy_path_writes_status_then_result_both_terminal_and_consistent() {
 async fn result_file_lands_in_the_orchestrator_results_dir_not_a_re_derived_one() {
     let home = tempfile::tempdir().expect("real tempdir");
 
-
     let cwd = home.path().join("project");
     tokio::fs::create_dir_all(&cwd).await.expect("mkdir cwd");
 
     // Orchestrator side: derive the two sibling roots from the ONE shared source of truth and
     // create them (ensureAccessibleDir-equivalent), exactly as `spawn_background_steps` does.
-    let roots =
-        cyrup_ext_subagents::background::run_artifact_roots_in(&Roots::sandboxed(home.path()), &cwd);
+    let roots = cyrup_ext_subagents::background::run_artifact_roots_in(
+        &Roots::sandboxed(home.path()),
+        &cwd,
+    );
     cyrup_ext_subagents::background::ensure_accessible_dir(&roots.async_root)
         .await
         .expect("orchestrator creates async_root");
@@ -335,7 +368,10 @@ async fn result_file_lands_in_the_orchestrator_results_dir_not_a_re_derived_one(
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
         run_id: run_id.clone(),
         mode: RunMode::Single,
-        steps: vec![RunnerStep::SingleStep(single_step("worker", "do the thing"))],
+        steps: vec![RunnerStep::SingleStep(single_step(
+            "worker",
+            "do the thing",
+        ))],
         cwd: cwd.clone(),
         session_file: None,
         session_id: None,
@@ -349,14 +385,14 @@ async fn result_file_lands_in_the_orchestrator_results_dir_not_a_re_derived_one(
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
-    nested_route: None,
-    nested_self: None,
-    dynamic_fanout_max_items: None,
-    // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
-    model_scope: None,
-    control: None,
-    include_progress: None,
-};
+        nested_route: None,
+        nested_self: None,
+        dynamic_fanout_max_items: None,
+        // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
+        model_scope: None,
+        control: None,
+        include_progress: None,
+    };
     let cfg_path = orchestrator_paths.run_dir.join("runner-config.json");
     write_atomic_json(&cfg_path, &config)
         .await
@@ -389,8 +425,12 @@ async fn result_file_lands_in_the_orchestrator_results_dir_not_a_re_derived_one(
     let result = run_with(
         &cfg_path,
         &provisional,
-        RunnerOverrides { spawn_command: Some(fixture_cmd(&script_path)), ..Default::default() },
-    ).await;
+        RunnerOverrides {
+            spawn_command: Some(fixture_cmd(&script_path)),
+            ..Default::default()
+        },
+    )
+    .await;
     result.expect("run() itself never returns Err");
 
     // BOTH the status.json and the terminal ResultFile must be found in the ORCHESTRATOR's dirs.
@@ -473,7 +513,10 @@ async fn run_writes_real_events_jsonl_through_the_shared_bounded_writer() {
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
         run_id: RunId::from_token("eventsrun1"),
         mode: RunMode::Single,
-        steps: vec![RunnerStep::SingleStep(single_step("worker", "do the thing"))],
+        steps: vec![RunnerStep::SingleStep(single_step(
+            "worker",
+            "do the thing",
+        ))],
         cwd: dir.path().to_path_buf(),
         session_file: None,
         session_id: None,
@@ -489,33 +532,48 @@ async fn run_writes_real_events_jsonl_through_the_shared_bounded_writer() {
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
-    nested_route: None,
-    nested_self: None,
-    dynamic_fanout_max_items: None,
-    // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
-    model_scope: None,
-    control: None,
-    include_progress: None,
-};
+        nested_route: None,
+        nested_self: None,
+        dynamic_fanout_max_items: None,
+        // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
+        model_scope: None,
+        control: None,
+        include_progress: None,
+    };
 
     let async_root = dir.path().join("async");
     let results_dir = dir.path().join("results");
-    tokio::fs::create_dir_all(&async_root).await.expect("mkdir async_root");
-    tokio::fs::create_dir_all(&results_dir).await.expect("mkdir results_dir");
+    tokio::fs::create_dir_all(&async_root)
+        .await
+        .expect("mkdir async_root");
+    tokio::fs::create_dir_all(&results_dir)
+        .await
+        .expect("mkdir results_dir");
     let run_paths = RunPaths::for_run(&async_root, &results_dir, &config.run_id);
-    tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run_dir");
+    tokio::fs::create_dir_all(&run_paths.run_dir)
+        .await
+        .expect("mkdir run_dir");
 
     let script_path = write_script(dir.path(), "script.json", &script);
     let cfg_path = run_paths.run_dir.join("runner-config.json");
-    write_atomic_json(&cfg_path, &config).await.expect("write runner config");
+    write_atomic_json(&cfg_path, &config)
+        .await
+        .expect("write runner config");
     let result = run_with(
         &cfg_path,
         &run_paths,
-        RunnerOverrides { spawn_command: Some(fixture_cmd(&script_path)), ..Default::default() },
-    ).await;    result.expect("run() itself never returns Err");
+        RunnerOverrides {
+            spawn_command: Some(fixture_cmd(&script_path)),
+            ..Default::default()
+        },
+    )
+    .await;
+    result.expect("run() itself never returns Err");
 
     assert!(
-        tokio::fs::try_exists(&run_paths.events).await.unwrap_or(false),
+        tokio::fs::try_exists(&run_paths.events)
+            .await
+            .unwrap_or(false),
         "events.jsonl must actually be created by a real run, not merely a path this crate reserves"
     );
 
@@ -532,21 +590,30 @@ async fn run_writes_real_events_jsonl_through_the_shared_bounded_writer() {
     // `kind`) and the event-type strings are `subagent.*`, with step events carrying `agent`.
     let mut types = Vec::new();
     for line in &lines {
-        let parsed: serde_json::Value =
-            serde_json::from_str(line).unwrap_or_else(|e| panic!("every line must be valid JSON: {e}: {line}"));
+        let parsed: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("every line must be valid JSON: {e}: {line}"));
         types.push(
             parsed["type"]
                 .as_str()
                 .unwrap_or_else(|| panic!("every line must carry a string 'type' field: {line}"))
                 .to_string(),
         );
-        assert!(parsed["ts"].is_number(), "every line must carry a numeric 'ts' field: {line}");
+        assert!(
+            parsed["ts"].is_number(),
+            "every line must carry a numeric 'ts' field: {line}"
+        );
     }
 
-    assert_eq!(types.first().map(String::as_str), Some("subagent.run.started"));
+    assert_eq!(
+        types.first().map(String::as_str),
+        Some("subagent.run.started")
+    );
     assert!(types.contains(&"subagent.step.started".to_string()));
     assert!(types.contains(&"subagent.step.completed".to_string()));
-    assert_eq!(types.last().map(String::as_str), Some("subagent.run.completed"));
+    assert_eq!(
+        types.last().map(String::as_str),
+        Some("subagent.run.completed")
+    );
 
     // Step events carry `agent`; the completion event carries `exitCode`/`durationMs` (pi parity).
     let step_completed = lines
@@ -587,7 +654,10 @@ async fn forced_error_path_still_writes_status_then_result_both_terminal() {
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
         run_id: RunId::from_token("failrun001"),
         mode: RunMode::Single,
-        steps: vec![RunnerStep::SingleStep(single_step("worker", "do the thing"))],
+        steps: vec![RunnerStep::SingleStep(single_step(
+            "worker",
+            "do the thing",
+        ))],
         cwd: dir.path().to_path_buf(),
         session_file: None,
         session_id: None,
@@ -603,14 +673,14 @@ async fn forced_error_path_still_writes_status_then_result_both_terminal() {
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
-    nested_route: None,
-    nested_self: None,
-    dynamic_fanout_max_items: None,
-    // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
-    model_scope: None,
-    control: None,
-    include_progress: None,
-};
+        nested_route: None,
+        nested_self: None,
+        dynamic_fanout_max_items: None,
+        // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
+        model_scope: None,
+        control: None,
+        include_progress: None,
+    };
 
     let (status, result_file) = run_against_fixture(dir.path(), &script, config).await;
 
@@ -619,7 +689,10 @@ async fn forced_error_path_still_writes_status_then_result_both_terminal() {
         RunState::Failed,
         "a nonzero-exit step must reconcile the whole run to Failed"
     );
-    assert!(status.ended_at.is_some(), "a terminal status must have ended_at set");
+    assert!(
+        status.ended_at.is_some(),
+        "a terminal status must have ended_at set"
+    );
     assert_eq!(result_file.state, RunState::Failed);
     assert!(!result_file.success);
     assert_eq!(result_file.results.len(), 1);
@@ -636,23 +709,34 @@ async fn missing_config_file_still_reaches_a_terminal_failed_state() {
     let async_root = dir.path().join("async");
     let results_dir = dir.path().join("results");
     tokio::fs::create_dir_all(&async_root).await.expect("mkdir");
-    tokio::fs::create_dir_all(&results_dir).await.expect("mkdir");
+    tokio::fs::create_dir_all(&results_dir)
+        .await
+        .expect("mkdir");
     let run_id = RunId::from_token("noconfig1");
     let run_paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
-    tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run_dir");
+    tokio::fs::create_dir_all(&run_paths.run_dir)
+        .await
+        .expect("mkdir run_dir");
 
     let bogus_cfg_path = run_paths.run_dir.join("does-not-exist.json");
 
     // No fixture: this config never loads, so no step is ever dispatched.
     let outcome = run_with(&bogus_cfg_path, &run_paths, RunnerOverrides::default()).await;
-    assert!(outcome.is_ok(), "run() itself never returns Err to its own caller");
+    assert!(
+        outcome.is_ok(),
+        "run() itself never returns Err to its own caller"
+    );
 
     let status: RunStatus = serde_json::from_slice(
-        &tokio::fs::read(&run_paths.status).await.expect("status.json exists"),
+        &tokio::fs::read(&run_paths.status)
+            .await
+            .expect("status.json exists"),
     )
     .expect("parse status");
     let result_file: ResultFile = serde_json::from_slice(
-        &tokio::fs::read(&run_paths.result).await.expect("ResultFile exists"),
+        &tokio::fs::read(&run_paths.result)
+            .await
+            .expect("ResultFile exists"),
     )
     .expect("parse result");
 
@@ -686,10 +770,14 @@ async fn append_request_written_after_start_is_consumed_next_iteration() {
     let async_root = dir.path().join("async");
     let results_dir = dir.path().join("results");
     tokio::fs::create_dir_all(&async_root).await.expect("mkdir");
-    tokio::fs::create_dir_all(&results_dir).await.expect("mkdir");
+    tokio::fs::create_dir_all(&results_dir)
+        .await
+        .expect("mkdir");
     let run_id = RunId::from_token("appendrun1");
     let run_paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
-    tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run_dir");
+    tokio::fs::create_dir_all(&run_paths.run_dir)
+        .await
+        .expect("mkdir run_dir");
 
     let config = RunnerConfig {
         turn_budget: None,
@@ -722,16 +810,18 @@ async fn append_request_written_after_start_is_consumed_next_iteration() {
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
-    nested_route: None,
-    nested_self: None,
-    dynamic_fanout_max_items: None,
-    // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
-    model_scope: None,
-    control: None,
-    include_progress: None,
-};
+        nested_route: None,
+        nested_self: None,
+        dynamic_fanout_max_items: None,
+        // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
+        model_scope: None,
+        control: None,
+        include_progress: None,
+    };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
-    write_atomic_json(&cfg_path, &config).await.expect("write config");
+    write_atomic_json(&cfg_path, &config)
+        .await
+        .expect("write config");
 
     // Write the append request CONCURRENTLY with `run()`'s own in-flight first step (which sleeps
     // 400ms before emitting) — proving the SECOND step (appended, never present in the original
@@ -756,14 +846,20 @@ async fn append_request_written_after_start_is_consumed_next_iteration() {
     let outcome = run_with(
         &cfg_path,
         &run_paths,
-        RunnerOverrides { spawn_command: Some(fixture_cmd(&script_path)), ..Default::default() },
-    ).await;
+        RunnerOverrides {
+            spawn_command: Some(fixture_cmd(&script_path)),
+            ..Default::default()
+        },
+    )
+    .await;
     append_task.await.expect("append task completes");
 
     outcome.expect("run() itself never returns Err");
 
     let result_file: ResultFile = serde_json::from_slice(
-        &tokio::fs::read(&run_paths.result).await.expect("ResultFile exists"),
+        &tokio::fs::read(&run_paths.result)
+            .await
+            .expect("ResultFile exists"),
     )
     .expect("parse result");
 
@@ -810,10 +906,14 @@ async fn late_interrupt_after_last_step_completes_does_not_downgrade_a_finished_
     let async_root = dir.path().join("async");
     let results_dir = dir.path().join("results");
     tokio::fs::create_dir_all(&async_root).await.expect("mkdir");
-    tokio::fs::create_dir_all(&results_dir).await.expect("mkdir");
+    tokio::fs::create_dir_all(&results_dir)
+        .await
+        .expect("mkdir");
     let run_id = RunId::from_token("lateintrpt");
     let run_paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
-    tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run_dir");
+    tokio::fs::create_dir_all(&run_paths.run_dir)
+        .await
+        .expect("mkdir run_dir");
 
     // A SINGLE-step run: once this one step finishes, the loop cursor is immediately exhausted —
     // exactly the shape needed to race an interrupt against natural completion with nothing left
@@ -849,16 +949,18 @@ async fn late_interrupt_after_last_step_completes_does_not_downgrade_a_finished_
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
-    nested_route: None,
-    nested_self: None,
-    dynamic_fanout_max_items: None,
-    // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
-    model_scope: None,
-    control: None,
-    include_progress: None,
-};
+        nested_route: None,
+        nested_self: None,
+        dynamic_fanout_max_items: None,
+        // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
+        model_scope: None,
+        control: None,
+        include_progress: None,
+    };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
-    write_atomic_json(&cfg_path, &config).await.expect("write config");
+    write_atomic_json(&cfg_path, &config)
+        .await
+        .expect("write config");
 
     // Fire the interrupt file write shortly before the scripted step's own 300ms sleep elapses,
     // aiming to land it in the narrow post-completion, pre-next-iteration-check window rather than
@@ -899,18 +1001,26 @@ async fn late_interrupt_after_last_step_completes_does_not_downgrade_a_finished_
     let outcome = run_with(
         &cfg_path,
         &run_paths,
-        RunnerOverrides { spawn_command: Some(fixture_cmd(&script_path)), ..Default::default() },
-    ).await;
+        RunnerOverrides {
+            spawn_command: Some(fixture_cmd(&script_path)),
+            ..Default::default()
+        },
+    )
+    .await;
     interrupt_task.await.expect("interrupt task completes");
 
     outcome.expect("run() itself never returns Err");
 
     let status: RunStatus = serde_json::from_slice(
-        &tokio::fs::read(&run_paths.status).await.expect("status.json exists"),
+        &tokio::fs::read(&run_paths.status)
+            .await
+            .expect("status.json exists"),
     )
     .expect("parse status.json");
     let result_file: ResultFile = serde_json::from_slice(
-        &tokio::fs::read(&run_paths.result).await.expect("ResultFile exists"),
+        &tokio::fs::read(&run_paths.result)
+            .await
+            .expect("ResultFile exists"),
     )
     .expect("parse result");
 
@@ -943,7 +1053,7 @@ async fn late_interrupt_after_last_step_completes_does_not_downgrade_a_finished_
 /// environment) must reach a terminal `Failed` state carrying a depth-exceeded error, with the
 /// scripted fixture NEVER actually invoked — proven three independent ways: (1) the terminal
 /// `ResultFile`'s error text names the depth guard, not a subprocess/exit-code failure; (2) the
-/// run's own `.cyrup-subagent-scratch` directory (`exec::run_sync`'s first filesystem side effect
+/// run's own spawn-scratch directory (`exec::run_sync`'s first filesystem side effect
 /// on ANY spawn attempt, real or not) was never created; (3) a distinctive marker string the
 /// fixture script would have emitted to stdout if it had EVER actually run appears nowhere in the
 /// terminal result.
@@ -962,11 +1072,17 @@ async fn depth_exhausted_run_rejects_the_whole_run_and_spawns_zero_real_processe
 
     let async_root = dir.path().join("async");
     let results_dir = dir.path().join("results");
-    tokio::fs::create_dir_all(&async_root).await.expect("mkdir async_root");
-    tokio::fs::create_dir_all(&results_dir).await.expect("mkdir results_dir");
+    tokio::fs::create_dir_all(&async_root)
+        .await
+        .expect("mkdir async_root");
+    tokio::fs::create_dir_all(&results_dir)
+        .await
+        .expect("mkdir results_dir");
     let run_id = RunId::from_token("depthrun01");
     let run_paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
-    tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run_dir");
+    tokio::fs::create_dir_all(&run_paths.run_dir)
+        .await
+        .expect("mkdir run_dir");
 
     let config = RunnerConfig {
         turn_budget: None,
@@ -983,7 +1099,10 @@ async fn depth_exhausted_run_rejects_the_whole_run_and_spawns_zero_real_processe
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
         run_id: run_id.clone(),
         mode: RunMode::Single,
-        steps: vec![RunnerStep::SingleStep(single_step("worker", "do something"))],
+        steps: vec![RunnerStep::SingleStep(single_step(
+            "worker",
+            "do something",
+        ))],
         cwd: dir.path().to_path_buf(),
         session_file: None,
         session_id: None,
@@ -999,31 +1118,41 @@ async fn depth_exhausted_run_rejects_the_whole_run_and_spawns_zero_real_processe
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
-    nested_route: None,
-    nested_self: None,
-    dynamic_fanout_max_items: None,
-    // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
-    model_scope: None,
-    control: None,
-    include_progress: None,
-};
+        nested_route: None,
+        nested_self: None,
+        dynamic_fanout_max_items: None,
+        // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
+        model_scope: None,
+        control: None,
+        include_progress: None,
+    };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
-    write_atomic_json(&cfg_path, &config).await.expect("write runner config");
+    write_atomic_json(&cfg_path, &config)
+        .await
+        .expect("write runner config");
 
     let outcome = run_with(
         &cfg_path,
         &run_paths,
-        RunnerOverrides { spawn_command: Some(fixture_cmd(&script_path)), ..Default::default() },
-    ).await;
+        RunnerOverrides {
+            spawn_command: Some(fixture_cmd(&script_path)),
+            ..Default::default()
+        },
+    )
+    .await;
 
     outcome.expect("run() itself never returns Err to its own caller, even on a depth rejection");
 
     let status: RunStatus = serde_json::from_slice(
-        &tokio::fs::read(&run_paths.status).await.expect("status.json exists"),
+        &tokio::fs::read(&run_paths.status)
+            .await
+            .expect("status.json exists"),
     )
     .expect("parse status.json");
     let result_file: ResultFile = serde_json::from_slice(
-        &tokio::fs::read(&run_paths.result).await.expect("ResultFile exists"),
+        &tokio::fs::read(&run_paths.result)
+            .await
+            .expect("ResultFile exists"),
     )
     .expect("parse ResultFile");
 
@@ -1043,10 +1172,9 @@ async fn depth_exhausted_run_rejects_the_whole_run_and_spawns_zero_real_processe
     );
 
     // Proof 2: `exec::run_sync`'s scratch directory (the first filesystem side effect ANY spawn
-    // attempt — real or fixture — would create) must never have been created anywhere under this
-    // run's own cwd.
+    // attempt — real or fixture — would create) must never have been created for this run's cwd.
     assert!(
-        !dir.path().join(".cyrup-subagent-scratch").exists(),
+        !cyrup_ext_subagents::background::attempt_scratch_dir(dir.path()).exists(),
         "no spawn-scratch directory may exist: the depth guard must reject before run_inner ever \
          reaches exec::run_sync for any step"
     );
@@ -1087,11 +1215,17 @@ async fn status_json_carries_live_current_tool_during_a_run() {
 
     let async_root = dir.path().join("async");
     let results_dir = dir.path().join("results");
-    tokio::fs::create_dir_all(&async_root).await.expect("mkdir async_root");
-    tokio::fs::create_dir_all(&results_dir).await.expect("mkdir results_dir");
+    tokio::fs::create_dir_all(&async_root)
+        .await
+        .expect("mkdir async_root");
+    tokio::fs::create_dir_all(&results_dir)
+        .await
+        .expect("mkdir results_dir");
     let run_id = RunId::from_token("livetool01");
     let run_paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
-    tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run_dir");
+    tokio::fs::create_dir_all(&run_paths.run_dir)
+        .await
+        .expect("mkdir run_dir");
 
     let config = RunnerConfig {
         turn_budget: None,
@@ -1108,7 +1242,10 @@ async fn status_json_carries_live_current_tool_during_a_run() {
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
         run_id: run_id.clone(),
         mode: RunMode::Single,
-        steps: vec![RunnerStep::SingleStep(single_step("worker", "grep the code"))],
+        steps: vec![RunnerStep::SingleStep(single_step(
+            "worker",
+            "grep the code",
+        ))],
         cwd: dir.path().to_path_buf(),
         session_file: None,
         session_id: None,
@@ -1122,27 +1259,35 @@ async fn status_json_carries_live_current_tool_during_a_run() {
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
-    nested_route: None,
-    nested_self: None,
-    dynamic_fanout_max_items: None,
-    // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
-    model_scope: None,
-    control: None,
-    include_progress: None,
-};
+        nested_route: None,
+        nested_self: None,
+        dynamic_fanout_max_items: None,
+        // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
+        model_scope: None,
+        control: None,
+        include_progress: None,
+    };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
-    write_atomic_json(&cfg_path, &config).await.expect("write runner config");
+    write_atomic_json(&cfg_path, &config)
+        .await
+        .expect("write runner config");
 
     // Drive `run()` concurrently with a poller of status.json.
     let status_path = run_paths.status.clone();
     let run_handle = {
         let cfg_path = cfg_path.clone();
         let run_paths = run_paths.clone();
-        tokio::spawn(async move { run_with(
-        &cfg_path,
-        &run_paths,
-        RunnerOverrides { spawn_command: Some(fixture_cmd(&script_path)), ..Default::default() },
-    ).await })
+        tokio::spawn(async move {
+            run_with(
+                &cfg_path,
+                &run_paths,
+                RunnerOverrides {
+                    spawn_command: Some(fixture_cmd(&script_path)),
+                    ..Default::default()
+                },
+            )
+            .await
+        })
     };
 
     let mut saw_current_tool = false;
@@ -1196,11 +1341,17 @@ async fn interrupting_a_single_step_run_actually_signals_the_mid_flight_child() 
 
     let async_root = dir.path().join("async");
     let results_dir = dir.path().join("results");
-    tokio::fs::create_dir_all(&async_root).await.expect("mkdir async_root");
-    tokio::fs::create_dir_all(&results_dir).await.expect("mkdir results_dir");
+    tokio::fs::create_dir_all(&async_root)
+        .await
+        .expect("mkdir async_root");
+    tokio::fs::create_dir_all(&results_dir)
+        .await
+        .expect("mkdir results_dir");
     let run_id = RunId::from_token("midintrpt1");
     let run_paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
-    tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run_dir");
+    tokio::fs::create_dir_all(&run_paths.run_dir)
+        .await
+        .expect("mkdir run_dir");
 
     let config = RunnerConfig {
         turn_budget: None,
@@ -1217,7 +1368,10 @@ async fn interrupting_a_single_step_run_actually_signals_the_mid_flight_child() 
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
         run_id: run_id.clone(),
         mode: RunMode::Single,
-        steps: vec![RunnerStep::SingleStep(single_step("only", "sleep a long time"))],
+        steps: vec![RunnerStep::SingleStep(single_step(
+            "only",
+            "sleep a long time",
+        ))],
         cwd: dir.path().to_path_buf(),
         session_file: None,
         session_id: None,
@@ -1231,16 +1385,18 @@ async fn interrupting_a_single_step_run_actually_signals_the_mid_flight_child() 
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
-    nested_route: None,
-    nested_self: None,
-    dynamic_fanout_max_items: None,
-    // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
-    model_scope: None,
-    control: None,
-    include_progress: None,
-};
+        nested_route: None,
+        nested_self: None,
+        dynamic_fanout_max_items: None,
+        // SUBA-003: no `subagents.modelScope` policy configured for this fixture.
+        model_scope: None,
+        control: None,
+        include_progress: None,
+    };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
-    write_atomic_json(&cfg_path, &config).await.expect("write config");
+    write_atomic_json(&cfg_path, &config)
+        .await
+        .expect("write config");
 
     // Deliver the interrupt ~400ms into the child's 6s sleep — squarely mid-flight.
     let run_paths_for_interrupt = run_paths.clone();
@@ -1264,8 +1420,12 @@ async fn interrupting_a_single_step_run_actually_signals_the_mid_flight_child() 
     let outcome = run_with(
         &cfg_path,
         &run_paths,
-        RunnerOverrides { spawn_command: Some(fixture_cmd(&script_path)), ..Default::default() },
-    ).await;
+        RunnerOverrides {
+            spawn_command: Some(fixture_cmd(&script_path)),
+            ..Default::default()
+        },
+    )
+    .await;
     let elapsed = started.elapsed();
     interrupt_task.await.expect("interrupt task completes");
     outcome.expect("run() itself never returns Err");
@@ -1277,11 +1437,15 @@ async fn interrupting_a_single_step_run_actually_signals_the_mid_flight_child() 
     );
 
     let status: RunStatus = serde_json::from_slice(
-        &tokio::fs::read(&run_paths.status).await.expect("status.json exists"),
+        &tokio::fs::read(&run_paths.status)
+            .await
+            .expect("status.json exists"),
     )
     .expect("parse status.json");
     let result_file: ResultFile = serde_json::from_slice(
-        &tokio::fs::read(&run_paths.result).await.expect("ResultFile exists"),
+        &tokio::fs::read(&run_paths.result)
+            .await
+            .expect("ResultFile exists"),
     )
     .expect("parse ResultFile");
 
@@ -1331,7 +1495,11 @@ async fn runner_config_control_reaches_every_step_and_raises_real_events() {
         "exit_code": 0
     });
 
-    fn config_for(dir: &Path, token: &str, control: Option<cyrup_ext_subagents::exec::control::ResolvedControlConfig>) -> RunnerConfig {
+    fn config_for(
+        dir: &Path,
+        token: &str,
+        control: Option<cyrup_ext_subagents::exec::control::ResolvedControlConfig>,
+    ) -> RunnerConfig {
         RunnerConfig {
             turn_budget: None,
             permission_rules: None,
@@ -1345,7 +1513,10 @@ async fn runner_config_control_reaches_every_step_and_raises_real_events() {
             artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
             run_id: RunId::from_token(token),
             mode: RunMode::Single,
-            steps: vec![RunnerStep::SingleStep(single_step("worker", "idle a while"))],
+            steps: vec![RunnerStep::SingleStep(single_step(
+                "worker",
+                "idle a while",
+            ))],
             cwd: dir.to_path_buf(),
             session_file: None,
             session_id: None,
@@ -1399,9 +1570,12 @@ async fn runner_config_control_reaches_every_step_and_raises_real_events() {
 
     // The discriminator: same child, no config => pi's `?? DEFAULT_CONTROL_CONFIG` (60 s window).
     let stock_dir = tempfile::tempdir().expect("real tempdir");
-    let (_status, stock) =
-        run_against_fixture(stock_dir.path(), &script, config_for(stock_dir.path(), "ctrlstock", None))
-            .await;
+    let (_status, stock) = run_against_fixture(
+        stock_dir.path(),
+        &script,
+        config_for(stock_dir.path(), "ctrlstock", None),
+    )
+    .await;
     assert!(
         stock.results[0].control_events.is_empty(),
         "with no control config the stock 60s attention window applies, so the same ~1.8s idle \
@@ -1432,7 +1606,7 @@ async fn the_runner_writes_the_artifact_quadruple_and_honours_session_dir_and_sh
 
     let script = serde_json::json!({
         // Echo the child's real argv into its stdout stream, which `exec::run_sync` tees to
-        // `<cwd>/.cyrup-subagent-scratch/attempt-0.jsonl` (R-SA-058) — the crate's own standing
+        // `<attempt_scratch_dir(cwd)>/attempt-0.jsonl` (R-SA-058) — the crate's own standing
         // observation channel for "what argv did the child actually receive".
         "echo_argv": true,
         "steps": [
@@ -1482,7 +1656,10 @@ async fn the_runner_writes_the_artifact_quadruple_and_honours_session_dir_and_sh
     };
 
     let (_status, result_file) = run_against_fixture(dir.path(), &script, config).await;
-    assert!(result_file.success, "the fixture run must succeed: {result_file:?}");
+    assert!(
+        result_file.success,
+        "the fixture run must succeed: {result_file:?}"
+    );
 
     // --- the artifact quadruple (pi `getArtifactPaths(ctx.artifactsDir, ctx.id, step.agent, index)`)
     let paths = cyrup_ext_subagents::artifacts::artifact_paths(
@@ -1501,24 +1678,32 @@ async fn the_runner_writes_the_artifact_quadruple_and_honours_session_dir_and_sh
         input.contains("# Task for worker") && input.contains("do the thing"),
         "the input artifact carries pi's `# Task for <agent>\\n\\n<task>` body: {input}"
     );
-    assert!(paths.output_path.exists(), "`_output.md` must be written after the run");
+    assert!(
+        paths.output_path.exists(),
+        "`_output.md` must be written after the run"
+    );
     assert_eq!(
         std::fs::read_to_string(&paths.output_path).expect("read _output.md"),
         "delivered answer",
         "the output artifact carries the child's delivered answer"
     );
-    assert!(paths.metadata_path.exists(), "`_meta.json` must be written after the run");
-    let meta: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(&paths.metadata_path).expect("read _meta.json"),
-    )
-    .expect("_meta.json parses");
+    assert!(
+        paths.metadata_path.exists(),
+        "`_meta.json` must be written after the run"
+    );
+    let meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&paths.metadata_path).expect("read _meta.json"))
+            .expect("_meta.json parses");
     assert_eq!(
         meta["runId"], "artifactsrun1",
         "the metadata shape is the SAME one the foreground path emits: {meta}"
     );
     assert_eq!(meta["agent"], "worker");
     assert_eq!(meta["exitCode"], 0);
-    assert!(paths.jsonl_path.exists(), "`.jsonl` must be written (foreground() enables it)");
+    assert!(
+        paths.jsonl_path.exists(),
+        "`.jsonl` must be written (foreground() enables it)"
+    );
 
     // --- sessionDir: created up front and handed to the child as real argv.
     assert!(
@@ -1527,8 +1712,10 @@ async fn the_runner_writes_the_artifact_quadruple_and_honours_session_dir_and_sh
          ahead of `--session-dir`), at {}",
         session_dir.display()
     );
-    let tee = std::fs::read_to_string(dir.path().join(".cyrup-subagent-scratch/attempt-0.jsonl"))
-        .expect("the R-SA-058 raw-stdout tee must exist");
+    let tee = std::fs::read_to_string(
+        cyrup_ext_subagents::background::attempt_scratch_dir(dir.path()).join("attempt-0.jsonl"),
+    )
+    .expect("the R-SA-058 raw-stdout tee must exist");
     assert!(
         tee.contains("--session-dir"),
         "the child's real argv must carry `--session-dir`: {tee}"
@@ -1577,7 +1764,10 @@ async fn the_runner_writes_no_artifacts_when_the_run_disabled_them() {
         },
         run_id: RunId::from_token("noartifacts1"),
         mode: RunMode::Single,
-        steps: vec![RunnerStep::SingleStep(single_step("worker", "do the thing"))],
+        steps: vec![RunnerStep::SingleStep(single_step(
+            "worker",
+            "do the thing",
+        ))],
         cwd: dir.path().to_path_buf(),
         session_file: None,
         session_id: None,
@@ -1641,7 +1831,10 @@ async fn an_already_passed_deadline_in_the_config_times_the_run_out_rather_than_
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
         run_id: RunId::from_token("expiredrun1"),
         mode: RunMode::Single,
-        steps: vec![RunnerStep::SingleStep(single_step("worker", "do the thing"))],
+        steps: vec![RunnerStep::SingleStep(single_step(
+            "worker",
+            "do the thing",
+        ))],
         cwd: dir.path().to_path_buf(),
         session_file: None,
         session_id: None,
@@ -1710,11 +1903,17 @@ async fn stopping_a_mid_flight_run_ends_it_stopped_not_paused_and_not_failed() {
 
     let async_root = dir.path().join("async");
     let results_dir = dir.path().join("results");
-    tokio::fs::create_dir_all(&async_root).await.expect("mkdir async_root");
-    tokio::fs::create_dir_all(&results_dir).await.expect("mkdir results_dir");
+    tokio::fs::create_dir_all(&async_root)
+        .await
+        .expect("mkdir async_root");
+    tokio::fs::create_dir_all(&results_dir)
+        .await
+        .expect("mkdir results_dir");
     let run_id = RunId::from_token("midstop001");
     let run_paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
-    tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run_dir");
+    tokio::fs::create_dir_all(&run_paths.run_dir)
+        .await
+        .expect("mkdir run_dir");
 
     let config = RunnerConfig {
         turn_budget: None,
@@ -1729,7 +1928,10 @@ async fn stopping_a_mid_flight_run_ends_it_stopped_not_paused_and_not_failed() {
         artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
         run_id: run_id.clone(),
         mode: RunMode::Single,
-        steps: vec![RunnerStep::SingleStep(single_step("only", "sleep a long time"))],
+        steps: vec![RunnerStep::SingleStep(single_step(
+            "only",
+            "sleep a long time",
+        ))],
         cwd: dir.path().to_path_buf(),
         session_file: None,
         session_id: None,
@@ -1751,7 +1953,9 @@ async fn stopping_a_mid_flight_run_ends_it_stopped_not_paused_and_not_failed() {
         include_progress: None,
     };
     let cfg_path = run_paths.run_dir.join("runner-config.json");
-    write_atomic_json(&cfg_path, &config).await.expect("write config");
+    write_atomic_json(&cfg_path, &config)
+        .await
+        .expect("write config");
 
     // Deliver the stop ~400ms into the child's 6s sleep — squarely mid-flight, through the REAL
     // parent-side `deliver_stop_request` primitive (never a hand-rolled file write), so this test
@@ -1772,8 +1976,12 @@ async fn stopping_a_mid_flight_run_ends_it_stopped_not_paused_and_not_failed() {
     let outcome = run_with(
         &cfg_path,
         &run_paths,
-        RunnerOverrides { spawn_command: Some(fixture_cmd(&script_path)), ..Default::default() },
-    ).await;
+        RunnerOverrides {
+            spawn_command: Some(fixture_cmd(&script_path)),
+            ..Default::default()
+        },
+    )
+    .await;
     let elapsed = started.elapsed();
     stop_task.await.expect("stop task completes");
     outcome.expect("run() itself never returns Err");
@@ -1785,11 +1993,15 @@ async fn stopping_a_mid_flight_run_ends_it_stopped_not_paused_and_not_failed() {
     );
 
     let status: RunStatus = serde_json::from_slice(
-        &tokio::fs::read(&run_paths.status).await.expect("status.json exists"),
+        &tokio::fs::read(&run_paths.status)
+            .await
+            .expect("status.json exists"),
     )
     .expect("parse status.json");
     let result_file: ResultFile = serde_json::from_slice(
-        &tokio::fs::read(&run_paths.result).await.expect("ResultFile exists"),
+        &tokio::fs::read(&run_paths.result)
+            .await
+            .expect("ResultFile exists"),
     )
     .expect("parse ResultFile");
 
@@ -1825,7 +2037,10 @@ async fn stopping_a_mid_flight_run_ends_it_stopped_not_paused_and_not_failed() {
     // `finalOutput` when it produced none of its own.
     assert_eq!(result_file.results.len(), 1);
     let child = &result_file.results[0];
-    assert!(child.stopped, "the torn-down child's SingleResult must carry stopped=true: {child:?}");
+    assert!(
+        child.stopped,
+        "the torn-down child's SingleResult must carry stopped=true: {child:?}"
+    );
     assert!(
         !child.interrupted,
         "a stop is NOT an interrupt — `interrupted` must be cleared so the run does not read as resumable: {child:?}"
@@ -1856,14 +2071,17 @@ async fn stopping_a_mid_flight_run_ends_it_stopped_not_paused_and_not_failed() {
         "events.jsonl must carry `subagent.run.stopped`: {types:?}"
     );
     assert!(
-        !types.iter().any(|t| t == "subagent.run.paused" || t == "subagent.run.completed"),
+        !types
+            .iter()
+            .any(|t| t == "subagent.run.paused" || t == "subagent.run.completed"),
         "a stopped run must NOT also report itself paused or completed: {types:?}"
     );
 
     // The stop request is consumed exactly once (pi `consumeStopRequest`'s
     // read-then-unconditionally-delete discipline).
     assert!(
-        !cyrup_ext_subagents::background::control::stop_request_path(&run_paths.run_dir).exists(),
+        !cyrup_ext_subagents::background::control::has_pending_stop_request(&run_paths.run_dir)
+            .await,
         "the consumed stop request file must be gone"
     );
 
@@ -1895,7 +2113,10 @@ async fn stopping_a_mid_flight_run_ends_it_stopped_not_paused_and_not_failed() {
     .expect_err("resume must refuse a stopped run");
     assert_eq!(
         resume_err.to_string(),
-        format!("Async run '{}' was stopped and cannot be resumed. Start a new run instead.", run_id.as_str()),
+        format!(
+            "Async run '{}' was stopped and cannot be resumed. Start a new run instead.",
+            run_id.as_str()
+        ),
         "pi `async-resume.ts:406`'s verbatim refusal"
     );
 
@@ -1914,11 +2135,386 @@ async fn stopping_a_mid_flight_run_ends_it_stopped_not_paused_and_not_failed() {
         "the status report must print `stopped`, not `failed`: {rendered}"
     );
     assert!(
-        rendered.contains("Resume: unavailable; stopped runs are not resumable. Start a new run instead."),
+        rendered.contains(
+            "Resume: unavailable; stopped runs are not resumable. Start a new run instead."
+        ),
         "pi `run-status.ts:52`'s verbatim stopped-resume guidance: {rendered}"
     );
     assert!(
         !rendered.contains("Revive:"),
         "a stopped run must never be offered a Revive line: {rendered}"
     );
+}
+
+// =================================================================================================
+// SUBA-087 — child-scoped stop (pi `stopChildStep` / `markChildStopped`, `subagent-runner.ts:
+// 2979-3031,4937-4941` @v0.64.0; parent side `async-stop-action.ts:48-77`)
+// =================================================================================================
+
+/// The `RunnerConfig` shared by the two child-scoped stop proofs below: a two-step CHAIN.
+fn child_stop_chain_config(
+    dir: &Path,
+    run_id: &RunId,
+    async_root: &Path,
+    results_dir: &Path,
+) -> RunnerConfig {
+    RunnerConfig {
+        turn_budget: None,
+        permission_rules: None,
+        usage_budget: None,
+        timeout_ms: None,
+        deadline_at_ms: None,
+        share: None,
+        artifacts_dir: None,
+        artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
+        run_id: run_id.clone(),
+        mode: RunMode::Chain,
+        steps: vec![
+            RunnerStep::SingleStep(single_step("first", "step one")),
+            RunnerStep::SingleStep(single_step("second", "step two")),
+        ],
+        cwd: dir.to_path_buf(),
+        session_file: None,
+        session_id: None,
+        global_concurrency_limit: 20,
+        worktree_base_dir: None,
+        max_subagent_depth: 2,
+        async_root: async_root.to_path_buf(),
+        results_dir: results_dir.to_path_buf(),
+        resolved_agents: all_personas(),
+        original_task: String::new(),
+        chain_dir: None,
+        orchestrator_intercom_target: None,
+        inherited_session_model: None,
+        nested_route: None,
+        nested_self: None,
+        dynamic_fanout_max_items: None,
+        model_scope: None,
+        control: None,
+        include_progress: None,
+    }
+}
+
+fn parsed_events(text: &str) -> Vec<serde_json::Value> {
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect()
+}
+
+/// A child-scoped stop tears down ONE mid-flight step and the run continues: the next step runs
+/// to completion, the run ends `Failed` (one step's `exitCode: 1`), never `Stopped`, and the
+/// events are pi's `subagent.step.stop_requested` → `subagent.child-status` `stopping` →
+/// `subagent.step.stopped` → `subagent.child-status` `stopped`, with no `subagent.run.stopped`.
+///
+/// Fails at the parent commit by construction (`deliver_child_stop_request` and
+/// `StepStatus::stopped` did not exist); behaviourally the old runner treated EVERY stop request
+/// as whole-run, which is the bug SUBA-087 names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_child_scoped_stop_stops_one_chain_step_and_the_next_step_still_completes() {
+    let dir = tempfile::tempdir().expect("real tempdir");
+
+    // Every child sleeps 1.5s then reports DONE. Step 0 is stopped ~300ms in, so its DONE must
+    // never appear; step 1 runs untouched and its DONE must.
+    let script = serde_json::json!({
+        "steps": [
+            {"kind": "sleep_ms", "ms": 1500},
+            {"kind": "emit", "line": message_end_line("DONE")},
+        ],
+        "exit_code": 0
+    });
+    let script_path = write_script(dir.path(), "script.json", &script);
+
+    let async_root = dir.path().join("async");
+    let results_dir = dir.path().join("results");
+    tokio::fs::create_dir_all(&async_root)
+        .await
+        .expect("mkdir async_root");
+    tokio::fs::create_dir_all(&results_dir)
+        .await
+        .expect("mkdir results_dir");
+    let run_id = RunId::from_token("childstop001");
+    let run_paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
+    tokio::fs::create_dir_all(&run_paths.run_dir)
+        .await
+        .expect("mkdir run_dir");
+    let config = child_stop_chain_config(dir.path(), &run_id, &async_root, &results_dir);
+    let cfg_path = run_paths.run_dir.join("runner-config.json");
+    write_atomic_json(&cfg_path, &config)
+        .await
+        .expect("write config");
+
+    // Deliver the child-scoped stop for `step:0` ~300ms in — through the REAL parent-side writer.
+    let stop_dir = run_paths.run_dir.clone();
+    let stop_task = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        cyrup_ext_subagents::background::control::deliver_child_stop_request(
+            &stop_dir,
+            "stop-action",
+            0,
+            Some("step:0".to_string()),
+        )
+        .await
+        .expect("write child stop request");
+    });
+
+    let started = std::time::Instant::now();
+    let outcome = run_with(
+        &cfg_path,
+        &run_paths,
+        RunnerOverrides {
+            spawn_command: Some(fixture_cmd(&script_path)),
+            ..Default::default()
+        },
+    )
+    .await;
+    let elapsed = started.elapsed();
+    stop_task.await.expect("stop task completes");
+    outcome.expect("run() itself never returns Err");
+
+    let status: RunStatus = serde_json::from_slice(
+        &tokio::fs::read(&run_paths.status)
+            .await
+            .expect("status.json exists"),
+    )
+    .expect("parse status.json");
+    let result_file: ResultFile = serde_json::from_slice(
+        &tokio::fs::read(&run_paths.result)
+            .await
+            .expect("ResultFile exists"),
+    )
+    .expect("parse ResultFile");
+
+    // The RUN is not stopped — it ran on and ended on its steps' own exit codes.
+    assert_eq!(
+        status.state,
+        RunState::Failed,
+        "one stopped step (exit 1) + one completed step is a Failed run, never Stopped: {status:?}"
+    );
+    assert_ne!(result_file.state, RunState::Stopped);
+    assert_eq!(status.steps.len(), 2);
+
+    // Step 0: stopped, with pi's stamps.
+    let first = &status.steps[0];
+    assert_eq!(
+        first.status,
+        cyrup_ext_subagents::background::StepState::Stopped,
+        "the targeted step ends Stopped: {first:?}"
+    );
+    assert!(first.stopped, "pi `step.stopped = true`");
+    assert!(first.stop_requested, "pi `step.stopRequested = true`");
+    assert!(first.stop_requested_at.is_some());
+    assert_eq!(
+        first.error.as_deref(),
+        Some(cyrup_ext_subagents::background::control::STOP_MESSAGE)
+    );
+    // Step 1: untouched, completed.
+    let second = &status.steps[1];
+    assert_eq!(
+        second.status,
+        cyrup_ext_subagents::background::StepState::Complete,
+        "the sibling ran to completion: {second:?}"
+    );
+    assert!(!second.stop_requested && !second.stopped);
+
+    // Results: the stopped child's record is promoted exactly as a whole-run stop promotes it;
+    // the sibling's is a normal success carrying its own output.
+    assert_eq!(result_file.results.len(), 2);
+    let stopped = &result_file.results[0];
+    assert!(stopped.stopped && !stopped.interrupted);
+    assert_eq!(stopped.exit_code, 1);
+    assert_eq!(
+        stopped.error.as_deref(),
+        Some(cyrup_ext_subagents::background::control::STOP_MESSAGE)
+    );
+    assert_ne!(
+        stopped.final_output.as_deref(),
+        Some("DONE"),
+        "step 0 was torn down mid-sleep; its post-sleep emit never ran"
+    );
+    let completed = &result_file.results[1];
+    assert_eq!(completed.exit_code, 0);
+    assert!(!completed.stopped);
+    assert_eq!(completed.final_output.as_deref(), Some("DONE"));
+    assert!(
+        elapsed < Duration::from_millis(4000),
+        "0.3s (stop) + 1.5s (sibling) must be far under two full 1.5s children plus slack; \
+         elapsed={elapsed:?}"
+    );
+
+    // Events: pi's child-scoped sequence, and NOT the whole-run terminal event.
+    let events = parsed_events(
+        &tokio::fs::read_to_string(&run_paths.events)
+            .await
+            .expect("events.jsonl exists"),
+    );
+    let of = |kind: &str| -> Vec<&serde_json::Value> {
+        events.iter().filter(|e| e["type"] == kind).collect()
+    };
+    let requested = of("subagent.step.stop_requested");
+    assert_eq!(requested.len(), 1, "{events:?}");
+    assert_eq!(requested[0]["stepIndex"], 0);
+    assert_eq!(requested[0]["childId"], "step:0");
+    assert_eq!(requested[0]["agent"], "first");
+    let child_status = of("subagent.child-status");
+    assert_eq!(
+        child_status
+            .iter()
+            .map(|e| e["status"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec!["stopping", "stopped"],
+        "{events:?}"
+    );
+    assert!(
+        child_status
+            .iter()
+            .all(|e| e["childId"] == "step:0" && e["version"] == 1)
+    );
+    let stopped_events = of("subagent.step.stopped");
+    assert_eq!(stopped_events.len(), 1);
+    assert_eq!(stopped_events[0]["stepIndex"], 0);
+    assert_eq!(stopped_events[0]["exitCode"], 1);
+    assert!(
+        of("subagent.step.stop_queued").is_empty(),
+        "the target was RUNNING, not pending"
+    );
+    assert!(
+        of("subagent.run.stopped").is_empty() && of("subagent.run.paused").is_empty(),
+        "a child-scoped stop must not end the run stopped or paused: {events:?}"
+    );
+    assert_eq!(
+        of("subagent.step.completed")
+            .iter()
+            .map(|e| e["stepIndex"].as_u64())
+            .collect::<Vec<_>>(),
+        vec![Some(1)]
+    );
+    assert!(
+        !cyrup_ext_subagents::background::control::has_pending_stop_request(&run_paths.run_dir)
+            .await,
+        "the child-scoped request was consumed"
+    );
+}
+
+/// A child-scoped stop aimed at a step that has NOT started yet is queued
+/// (`subagent.step.stop_queued`) and applied when the cursor reaches it: the step is marked
+/// `stopped` without a child ever being spawned (pi `childStopResult`,
+/// `subagent-runner.ts:4937-4941`), and the preceding step runs normally.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_child_scoped_stop_for_a_pending_step_is_queued_and_skips_it_when_reached() {
+    let dir = tempfile::tempdir().expect("real tempdir");
+    let script = serde_json::json!({
+        "steps": [
+            {"kind": "sleep_ms", "ms": 400},
+            {"kind": "emit", "line": message_end_line("DONE")},
+        ],
+        "exit_code": 0
+    });
+    let script_path = write_script(dir.path(), "script.json", &script);
+
+    let async_root = dir.path().join("async");
+    let results_dir = dir.path().join("results");
+    tokio::fs::create_dir_all(&async_root)
+        .await
+        .expect("mkdir async_root");
+    tokio::fs::create_dir_all(&results_dir)
+        .await
+        .expect("mkdir results_dir");
+    let run_id = RunId::from_token("childstop002");
+    let run_paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
+    tokio::fs::create_dir_all(&run_paths.run_dir)
+        .await
+        .expect("mkdir run_dir");
+    let config = child_stop_chain_config(dir.path(), &run_id, &async_root, &results_dir);
+    let cfg_path = run_paths.run_dir.join("runner-config.json");
+    write_atomic_json(&cfg_path, &config)
+        .await
+        .expect("write config");
+
+    // Planted BEFORE the runner starts, against the SECOND step (still pending for ~400ms).
+    cyrup_ext_subagents::background::control::deliver_child_stop_request(
+        &run_paths.run_dir,
+        "stop-action",
+        1,
+        None,
+    )
+    .await
+    .expect("plant the child stop request");
+
+    run_with(
+        &cfg_path,
+        &run_paths,
+        RunnerOverrides {
+            spawn_command: Some(fixture_cmd(&script_path)),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("run() itself never returns Err");
+
+    let status: RunStatus = serde_json::from_slice(
+        &tokio::fs::read(&run_paths.status)
+            .await
+            .expect("status.json exists"),
+    )
+    .expect("parse status.json");
+    let result_file: ResultFile = serde_json::from_slice(
+        &tokio::fs::read(&run_paths.result)
+            .await
+            .expect("ResultFile exists"),
+    )
+    .expect("parse ResultFile");
+
+    assert_eq!(status.state, RunState::Failed, "{status:?}");
+    assert_eq!(
+        status.steps[0].status,
+        cyrup_ext_subagents::background::StepState::Complete
+    );
+    let skipped = &status.steps[1];
+    assert_eq!(
+        skipped.status,
+        cyrup_ext_subagents::background::StepState::Stopped,
+        "{skipped:?}"
+    );
+    assert!(skipped.stopped && skipped.stop_requested);
+    assert!(
+        skipped.started_at.is_none(),
+        "the skipped step never started — no child was spawned for it: {skipped:?}"
+    );
+    assert_eq!(result_file.results.len(), 2);
+    assert_eq!(result_file.results[0].final_output.as_deref(), Some("DONE"));
+    let stopped = &result_file.results[1];
+    assert!(stopped.stopped);
+    assert_eq!(stopped.exit_code, 1);
+    assert_eq!(
+        stopped.final_output.as_deref(),
+        Some(cyrup_ext_subagents::background::control::STOP_MESSAGE),
+        "pi `stoppedStepResult`: output IS the stop message"
+    );
+
+    let events = parsed_events(
+        &tokio::fs::read_to_string(&run_paths.events)
+            .await
+            .expect("events.jsonl exists"),
+    );
+    let of = |kind: &str| -> Vec<&serde_json::Value> {
+        events.iter().filter(|e| e["type"] == kind).collect()
+    };
+    let queued = of("subagent.step.stop_queued");
+    assert_eq!(queued.len(), 1, "{events:?}");
+    assert_eq!(queued[0]["stepIndex"], 1);
+    assert_eq!(
+        queued[0]["childId"], "step:1",
+        "the runner derives the identity when the request carried none (`:3020`)"
+    );
+    let stopped_events = of("subagent.step.stopped");
+    assert_eq!(stopped_events.len(), 1);
+    assert_eq!(stopped_events[0]["stepIndex"], 1);
+    assert_eq!(stopped_events[0]["durationMs"], 0);
+    assert!(
+        !of("subagent.step.started")
+            .iter()
+            .any(|e| e["stepIndex"] == 1),
+        "the skipped step must never be reported started: {events:?}"
+    );
+    assert!(of("subagent.run.stopped").is_empty());
 }

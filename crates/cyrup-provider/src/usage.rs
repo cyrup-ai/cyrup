@@ -197,7 +197,11 @@ mod tests {
         };
         let c = compute_cost(&tiered(), &u);
         assert!((c.input - 1.0).abs() < 1e-9, "input {}", c.input);
-        assert!((c.cache_read - 0.05).abs() < 1e-9, "cache_read {}", c.cache_read);
+        assert!(
+            (c.cache_read - 0.05).abs() < 1e-9,
+            "cache_read {}",
+            c.cache_read
+        );
     }
 
     #[test]

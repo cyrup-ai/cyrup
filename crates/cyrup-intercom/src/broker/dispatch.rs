@@ -42,9 +42,10 @@ impl BrokerState {
         // both halves collapse to "no gate" and a client's `stateId` is ignored rather than
         // rejected — pi's `requiresEndpointAuth &&` short-circuit, which is what lets the SAME
         // client code send `stateId` on TCP and omit it on a socket.
-        let has_endpoint_auth = self.endpoint_state_id.as_deref().is_some_and(|id| {
-            value.get("stateId").and_then(|v| v.as_str()) == Some(id)
-        });
+        let has_endpoint_auth = self
+            .endpoint_state_id
+            .as_deref()
+            .is_some_and(|id| value.get("stateId").and_then(|v| v.as_str()) == Some(id));
         let requires_endpoint_auth = self.endpoint_state_id.is_some();
 
         // health — legal before register, no TCP endpoint auth on a Unix socket (broker.ts:312-326).
@@ -94,7 +95,9 @@ impl BrokerState {
             "cancel_ask" => self.handle_cancel_ask(conn_id, value, session_id),
             "presence" => self.handle_presence(conn_id, value, session_id, now),
             "message_receipt" => self.handle_message_receipt(conn_id, value, session_id, now),
-            "cancel_message" => self.handle_cancel_message(conn_id, self_tx, value, session_id, now),
+            "cancel_message" => {
+                self.handle_cancel_message(conn_id, self_tx, value, session_id, now)
+            }
             // Extension-bus frames (`v0.9.2 broker/broker.ts:551-585,961-969`). ICOM-016 landed the
             // effects, so the broker now advertises `EXTENSION_BUS_FEATURE` on `registered` and a
             // conforming pi client sends these as a matter of course (`supportsFeature` gate,
@@ -120,16 +123,15 @@ impl BrokerState {
             _ => FrameResult::protocol_error(),
         }
     }
-
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
-    use serde_json::json;
-    use std::sync::Arc;
     use super::super::frame::FrameOutcome;
     use super::super::state::BrokerState;
+    use serde_json::json;
+    use std::sync::Arc;
     use tokio::sync::Notify;
 
     /// ICOM-015 — the `requiresEndpointAuth` gate on the loopback-TCP endpoint
@@ -150,7 +152,7 @@ mod tests {
                 Arc::new(Notify::new()),
                 super::super::test_support::test_extension_state_dir(),
             )
-                .with_listen_endpoint(state_id.is_none(), state_id.map(str::to_string));
+            .with_listen_endpoint(state_id.is_none(), state_id.map(str::to_string));
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             let mut sid = None;
             state.handle_frame(1, &tx, &frame, &mut sid, 1_000).outcome
@@ -161,7 +163,8 @@ mod tests {
             }
             f
         };
-        let health = |cred: Option<&str>| with_cred(json!({ "type": "health", "requestId": "r1" }), cred);
+        let health =
+            |cred: Option<&str>| with_cred(json!({ "type": "health", "requestId": "r1" }), cred);
         let register = |cred: Option<&str>| {
             with_cred(
                 json!({
@@ -173,9 +176,17 @@ mod tests {
         };
 
         // TCP endpoint (`endpoint_state_id = Some`), no/wrong credential => `throw` => destroy.
-        for frame in [health(None), health(Some("wrong")), register(None), register(Some("wrong"))] {
+        for frame in [
+            health(None),
+            health(Some("wrong")),
+            register(None),
+            register(Some("wrong")),
+        ] {
             assert!(
-                matches!(drive(Some("run-state-id"), frame.clone()), FrameOutcome::ProtocolError),
+                matches!(
+                    drive(Some("run-state-id"), frame.clone()),
+                    FrameOutcome::ProtocolError
+                ),
                 "an uncredentialled {} on the TCP endpoint must destroy the connection",
                 frame["type"]
             );
@@ -183,13 +194,21 @@ mod tests {
         // TCP endpoint, matching credential => served.
         for frame in [health(Some("run-state-id")), register(Some("run-state-id"))] {
             assert!(
-                matches!(drive(Some("run-state-id"), frame.clone()), FrameOutcome::Continue),
+                matches!(
+                    drive(Some("run-state-id"), frame.clone()),
+                    FrameOutcome::Continue
+                ),
                 "the credentialled {} must be served",
                 frame["type"]
             );
         }
         // Socket endpoint: the gate does not exist, with or without a `stateId`.
-        for frame in [health(None), health(Some("anything")), register(None), register(Some("x"))] {
+        for frame in [
+            health(None),
+            health(Some("anything")),
+            register(None),
+            register(Some("x")),
+        ] {
             assert!(
                 matches!(drive(None, frame.clone()), FrameOutcome::Continue),
                 "the socket endpoint must not gate {}",
@@ -210,7 +229,7 @@ mod tests {
                 Arc::new(Notify::new()),
                 super::super::test_support::test_extension_state_dir(),
             )
-                .with_listen_endpoint(trusted, None);
+            .with_listen_endpoint(trusted, None);
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             let mut sid = None;
             state.handle_frame(

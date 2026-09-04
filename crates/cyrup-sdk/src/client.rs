@@ -42,8 +42,11 @@ pub fn zero_config_provider(model_pattern: &str) -> SdkResult<Arc<dyn Provider>>
     let provider_id = model_pattern.split('/').next().unwrap_or(model_pattern);
     let models = cyrup_provider::default_models(CreateModelsOptions::default());
     models.get_provider(provider_id).ok_or_else(|| {
-        let mut available: Vec<String> =
-            models.get_providers().iter().map(|p| p.id().as_str().to_string()).collect();
+        let mut available: Vec<String> = models
+            .get_providers()
+            .iter()
+            .map(|p| p.id().as_str().to_string())
+            .collect();
         available.sort();
         SdkError::Provider(format!(
             "no built-in provider '{provider_id}' (from model pattern '{model_pattern}'); \

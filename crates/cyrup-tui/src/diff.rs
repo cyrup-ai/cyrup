@@ -57,7 +57,11 @@ fn parse_diff_line(line: &str) -> Option<Parsed> {
     }
     let num = rest.get(..i - 1).unwrap_or("");
     let content = rest.get(i..).unwrap_or("");
-    Some(Parsed { prefix: first, line_num: num.to_string(), content: content.to_string() })
+    Some(Parsed {
+        prefix: first,
+        line_num: num.to_string(),
+        content: content.to_string(),
+    })
 }
 
 /// Expand tabs to three spaces (`diff.ts:18-20`).
@@ -105,8 +109,12 @@ pub fn render_diff(diff_text: &str, theme: &UiTheme) -> Vec<Line<'static>> {
                 if let (1, 1, Some(r), Some(a)) =
                     (removed.len(), added.len(), removed.first(), added.first())
                 {
-                    let (rspans, aspans) =
-                        intra_line(&replace_tabs(&r.content), &replace_tabs(&a.content), rem, add);
+                    let (rspans, aspans) = intra_line(
+                        &replace_tabs(&r.content),
+                        &replace_tabs(&a.content),
+                        rem,
+                        add,
+                    );
                     out.push(prefixed_line(format!("-{} ", r.line_num), rem, rspans));
                     out.push(prefixed_line(format!("+{} ", a.line_num), add, aspans));
                 } else {
@@ -144,7 +152,11 @@ pub fn render_diff(diff_text: &str, theme: &UiTheme) -> Vec<Line<'static>> {
 }
 
 /// Build a `Line` from a styled prefix plus already-styled content spans.
-fn prefixed_line(prefix: String, prefix_style: Style, mut spans: Vec<Span<'static>>) -> Line<'static> {
+fn prefixed_line(
+    prefix: String,
+    prefix_style: Style,
+    mut spans: Vec<Span<'static>>,
+) -> Line<'static> {
     let mut all = Vec::with_capacity(spans.len() + 1);
     all.push(Span::styled(prefix, prefix_style));
     all.append(&mut spans);
@@ -249,7 +261,9 @@ fn word_diff(old: &str, new: &str) -> Vec<WordPart> {
     // LCS DP over tokens, stored row-major in a flat vec; `at(i,j)` reads it without indexing.
     let mut dp = vec![0usize; (n + 1) * stride];
     let at = |dp: &[usize], i: usize, j: usize| -> usize {
-        dp.get(i.saturating_mul(stride).saturating_add(j)).copied().unwrap_or(0)
+        dp.get(i.saturating_mul(stride).saturating_add(j))
+            .copied()
+            .unwrap_or(0)
     };
     for i in (0..n).rev() {
         for j in (0..m).rev() {

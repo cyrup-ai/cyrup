@@ -32,7 +32,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use cyrup_core::ExtensionId;
 use cyrup_ext::registry::CommandDescriptor;
-use cyrup_ext::{EventKind, ExtError, HostCtx, HostEvent, HookOutcome, HostServices, InitApi, NativeExtension};
+use cyrup_ext::{
+    EventKind, ExtError, HookOutcome, HostCtx, HostEvent, HostServices, InitApi, NativeExtension,
+};
 use cyrup_ext_subagents::tui::intercom::{ClarifyChannel, DeliveryChannel, SteerChannel};
 
 use crate::config::{IntercomConfig, ask_timeout_ms, config_path, load_config};
@@ -77,14 +79,15 @@ const INTERCOM_OVERLAY_WIDTH: usize = crate::ui::session_list::SESSION_LIST_MAX_
 /// is byte-for-byte upstream.
 #[must_use]
 fn format_intercom_contact_snippet(session_id: &str) -> String {
-    format!(r#"Use cyrup-intercom: intercom({{ action: "send", to: "{session_id}", message: "..." }})"#)
+    format!(
+        r#"Use cyrup-intercom: intercom({{ action: "send", to: "{session_id}", message: "..." }})"#
+    )
 }
 
 /// The extension's fixed id.
 pub const EXTENSION_ID: &str = "cyrup-intercom";
 /// The explicit opt-in flag: set truthy to attach intercom to a plain (non-child) session.
 pub const INSTALL_ENV_VAR: &str = "CYRUP_INTERCOM";
-
 
 /// The intercom native extension.
 pub struct IntercomExtension {
@@ -123,7 +126,10 @@ impl IntercomExtension {
         state.set_presence_metadata(metadata.clone());
         let supervisor_target = metadata.as_ref().map(preferred_supervisor_target);
         let clarify = Arc::new(IntercomClarifyChannel::new(state.clone()));
-        let delivery = Arc::new(IntercomDeliveryChannel::new(state.clone(), supervisor_target));
+        let delivery = Arc::new(IntercomDeliveryChannel::new(
+            state.clone(),
+            supervisor_target,
+        ));
         let steer = Arc::new(IntercomSteerChannel::new(state.clone()));
         Ok(Self {
             id: ExtensionId::from(EXTENSION_ID),
@@ -233,7 +239,6 @@ impl IntercomExtension {
         self.state.sync_presence_identity();
     }
 
-
     /// pi `insertIntoEditor(ctx, text)` (`v0.9.2 index.ts:2261-2268`, 8 lines):
     ///
     /// ```text
@@ -291,19 +296,20 @@ impl IntercomExtension {
     /// handler needing a non-Info level notifies itself and returns nothing, so the level survives.
     /// Returning the text here instead would show a connect FAILURE as an ordinary info toast.
     async fn run_intercom_id_command(&self, ctx: &HostCtx) -> Option<String> {
-        let client = match connect::ensure_connected(&self.state, connect::ConnectReason::Tool).await {
-            Ok(client) => client,
-            Err(e) => {
-                let message = format!("Intercom unavailable: {e}");
-                match self.state.host_services() {
-                    Some(services) => services.notify(&message, cyrup_ext::NotifyKind::Error),
-                    // No live backend (headless with no effect sink): fall back to the return
-                    // channel so the text is not lost entirely.
-                    None => return Some(message),
+        let client =
+            match connect::ensure_connected(&self.state, connect::ConnectReason::Tool).await {
+                Ok(client) => client,
+                Err(e) => {
+                    let message = format!("Intercom unavailable: {e}");
+                    match self.state.host_services() {
+                        Some(services) => services.notify(&message, cyrup_ext::NotifyKind::Error),
+                        // No live backend (headless with no effect sink): fall back to the return
+                        // channel so the text is not lost entirely.
+                        None => return Some(message),
+                    }
+                    return None;
                 }
-                return None;
-            }
-        };
+            };
         // `const sessionId = contactClient.sessionId; if (!sessionId ...) return;` (`:2281-2282`) —
         // upstream returns SILENTLY here (no notify), so this yields no command output either.
         let session_id = client.session_id()?;
@@ -317,7 +323,11 @@ impl IntercomExtension {
     /// The `/intercom` command body (pi `openIntercomOverlay`, `index.ts:1810-1874`, degraded to text
     /// per the port doc §4.3): list sessions over the live broker, then either render the session
     /// picker (no args) or resolve `<target>` + send `<message…>` via [`compose_send`].
-    async fn run_intercom_command(&self, client: &Arc<IntercomClient>, args: &str) -> crate::Result<String> {
+    async fn run_intercom_command(
+        &self,
+        client: &Arc<IntercomClient>,
+        args: &str,
+    ) -> crate::Result<String> {
         let sessions = client.list_sessions().await?;
         let my_id = client.session_id();
         let Some(current) = my_id
@@ -329,9 +339,8 @@ impl IntercomExtension {
         // `duplicates = duplicateSessionNames(allSessions)` (`v0.10.1 index.ts:2393`) — computed
         // over EVERY session including the current one, before the self-filter below, so a peer
         // sharing this session's own name is still labelled with its id suffix.
-        let duplicates = crate::identity::duplicate_session_names(
-            sessions.iter().map(|s| s.name.as_deref()),
-        );
+        let duplicates =
+            crate::identity::duplicate_session_names(sessions.iter().map(|s| s.name.as_deref()));
         let others: Vec<SessionInfo> = sessions
             .into_iter()
             .filter(|s| Some(s.id.as_str()) != my_id.as_deref())
@@ -367,9 +376,14 @@ impl IntercomExtension {
                 let compose = ComposeOverlay::new(session, label)
                     .render(&PlainTheme, &DefaultKeybindings, COMPOSE_MAX_WIDTH)
                     .join("\n");
-                return Ok(format!("{compose}\n\nType `/intercom {target} <message>` to send."));
+                return Ok(format!(
+                    "{compose}\n\nType `/intercom {target} <message>` to send."
+                ));
             }
-            return Ok(format!("Usage: /intercom <session> <message>\n\n{}", render_picker(others)));
+            return Ok(format!(
+                "Usage: /intercom <session> <message>\n\n{}",
+                render_picker(others)
+            ));
         }
         let Some(target_id) = self.state.resolve_target(client, &target).await? else {
             return Ok(format!("No intercom session matches \"{target}\"."));
@@ -453,7 +467,10 @@ impl NativeExtension for IntercomExtension {
         if let Some(metadata) = &self.metadata
             && !self.native_supervisor_channel
         {
-            api.register_tool(Arc::new(ContactSupervisorTool::new(self.state.clone(), metadata.clone())));
+            api.register_tool(Arc::new(ContactSupervisorTool::new(
+                self.state.clone(),
+                metadata.clone(),
+            )));
         }
         // ICOM-028: claim the durable inbound-message entry so [`Self::render_entry`] is reached.
         // Without this registration the TUI's `has_entry_renderer` check short-circuits
@@ -471,7 +488,10 @@ impl NativeExtension for IntercomExtension {
         // §4.3); `execute_command` renders the session picker + drives the compose send.
         api.register_command(
             INTERCOM_COMMAND,
-            CommandDescriptor { description: "Open the session intercom picker / send a message".to_string(), completions: Vec::new() },
+            CommandDescriptor {
+                description: "Open the session intercom picker / send a message".to_string(),
+                completions: Vec::new(),
+            },
         );
         // `/intercom-id` (`v0.9.2 index.ts:2365-2368`). Description is upstream's verbatim
         // ("Insert a stable pi-intercom handoff snippet for this session into the editor", `:2366`)
@@ -574,19 +594,30 @@ impl NativeExtension for IntercomExtension {
     ///   target and send it over the broker (the port doc §4.3 degrade of pi's interactive overlay).
     /// - `/intercom-id` — insert this session's handoff snippet into the editor
     ///   ([`Self::run_intercom_id_command`], pi `v0.9.2 index.ts:2270-2289`).
-    async fn execute_command(&self, name: &str, args: &str, ctx: &HostCtx) -> Result<Option<String>, ExtError> {
+    async fn execute_command(
+        &self,
+        name: &str,
+        args: &str,
+        ctx: &HostCtx,
+    ) -> Result<Option<String>, ExtError> {
         ctx.require_command_tier()?;
         if name == INTERCOM_ID_COMMAND {
             return Ok(self.run_intercom_id_command(ctx).await);
         }
         if name != INTERCOM_COMMAND {
-            return Err(ExtError::Component(format!("native extension has no handler for command `{name}`")));
+            return Err(ExtError::Component(format!(
+                "native extension has no handler for command `{name}`"
+            )));
         }
         // pi's overlay opens through `ensureConnected("overlay")` (index.ts:1827,1864) rather than a
         // bare `client` read: an overlay is a deliberate user action, so it is worth (re)spawning the
         // broker and reconnecting for. A failure still degrades to the same text, never a hard error.
-        let Ok(client) = connect::ensure_connected(&self.state, connect::ConnectReason::Overlay).await else {
-            return Ok(Some("Intercom is not connected in this session.".to_string()));
+        let Ok(client) =
+            connect::ensure_connected(&self.state, connect::ConnectReason::Overlay).await
+        else {
+            return Ok(Some(
+                "Intercom is not connected in this session.".to_string(),
+            ));
         };
         let output = self
             .run_intercom_command(&client, args.trim())
@@ -618,7 +649,9 @@ impl NativeExtension for IntercomExtension {
                 // for the rest of the session, it must arm the reconnect ladder.
                 let state = self.state.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = connect::ensure_connected(&state, connect::ConnectReason::Startup).await {
+                    if let Err(e) =
+                        connect::ensure_connected(&state, connect::ConnectReason::Startup).await
+                    {
                         tracing::warn!(error = %e, "intercom: startup connect failed; scheduling reconnect");
                         connect::schedule_reconnect(&state);
                     }
@@ -639,7 +672,11 @@ impl NativeExtension for IntercomExtension {
                     client.disconnect();
                 }
                 self.state.set_client(None);
-                self.state.tracker.lock().unwrap_or_else(|e| e.into_inner()).reset();
+                self.state
+                    .tracker
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .reset();
                 // `agentRunning = false; activeTools.clear()` (`v0.10.1 index.ts:1408-1409`).
                 self.state.set_agent_running(false);
                 HookOutcome::Noop
@@ -691,7 +728,10 @@ impl NativeExtension for IntercomExtension {
                     let ctx_usage = self.state.current_context_usage();
                     client.update_presence_full(
                         identity.name.clone(),
-                        identity.name.as_ref().map(|_| identity.runtime_fallback_alias),
+                        identity
+                            .name
+                            .as_ref()
+                            .map(|_| identity.runtime_fallback_alias),
                         Some(self.state.current_status()),
                         model_id,
                         ctx_usage.pct,
@@ -710,12 +750,20 @@ impl NativeExtension for IntercomExtension {
                 // `replyTracker.beginTurn()`: prune expired pending asks, then adopt the oldest
                 // queued turn context (queued by `trigger_turn_over_inbound` right before this turn
                 // started) as `current_turn_context`.
-                self.state.tracker.lock().unwrap_or_else(|e| e.into_inner()).begin_turn(now_ms());
+                self.state
+                    .tracker
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .begin_turn(now_ms());
                 HookOutcome::Noop
             }
             HostEvent::TurnEnd { .. } => {
                 // `pi.on("turn_end") -> replyTracker.endTurn()` (`v0.10.1 index.ts:1416-1424`).
-                self.state.tracker.lock().unwrap_or_else(|e| e.into_inner()).end_turn();
+                self.state
+                    .tracker
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .end_turn();
                 HookOutcome::Noop
             }
             // ICOM-004 — hand cyrup's resource discovery the bundled skill
@@ -803,7 +851,9 @@ impl NativeExtension for IntercomExtension {
         }
         let details = payload.get("details").or_else(|| payload.get("data"))?;
         let card = crate::ui::InlineMessage::from_details(details)?;
-        Some(std::sync::Arc::new(crate::ui::InlineMessageComponent::new(card)))
+        Some(std::sync::Arc::new(crate::ui::InlineMessageComponent::new(
+            card,
+        )))
     }
 
     /// The card is emitted at the width it was rendered at (`SURFACE_CARD_WIDTH`). That degrade is
@@ -876,7 +926,8 @@ pub fn intercom_extension_for_env(
     agent_dir: PathBuf,
     cwd: PathBuf,
 ) -> Result<Option<Arc<dyn NativeExtension>>, String> {
-    Ok(intercom_extension_for_env_concrete(agent_dir, cwd)?.map(|ext| ext as Arc<dyn NativeExtension>))
+    Ok(intercom_extension_for_env_concrete(agent_dir, cwd)?
+        .map(|ext| ext as Arc<dyn NativeExtension>))
 }
 
 /// As [`intercom_extension_for_env`], but returns the CONCRETE [`IntercomExtension`] so the caller
@@ -905,7 +956,9 @@ pub fn intercom_extension_for_env_concrete(
     if metadata.is_none() && !is_installed(&intercom_dir) {
         return Ok(None);
     }
-    Ok(Some(Arc::new(IntercomExtension::new(agent_dir, cwd, config, metadata)?)))
+    Ok(Some(Arc::new(IntercomExtension::new(
+        agent_dir, cwd, config, metadata,
+    )?)))
 }
 
 /// The default agent dir (`~/.cyrup` or `$CYRUP_CODING_AGENT_DIR`) — a convenience for a caller that
@@ -963,10 +1016,15 @@ mod tests {
             _ => None,
         };
         let value = answered.expect("discovery must be answered with the bundled skill paths");
-        let paths = value["skillPaths"].as_array().expect("skillPaths is a list");
+        let paths = value["skillPaths"]
+            .as_array()
+            .expect("skillPaths is a list");
         assert_eq!(paths.len(), 1, "exactly the one bundled skill: {paths:?}");
         let path = std::path::PathBuf::from(paths[0].as_str().expect("a path string"));
-        assert!(path.is_file(), "the declared path must exist on disk: {path:?}");
+        assert!(
+            path.is_file(),
+            "the declared path must exist on disk: {path:?}"
+        );
         assert!(
             path.ends_with("skills/pi-intercom/SKILL.md"),
             "the declared path is the ported skill: {path:?}"
@@ -1026,7 +1084,9 @@ mod tests {
     async fn init_claims_the_intercom_message_entry_type() {
         let host = cyrup_ext::ExtensionHost::new(cyrup_ext::HostConfig::default());
         let (_dir, ext) = test_extension();
-        host.load_native(Arc::new(ext)).await.expect("the native loads");
+        host.load_native(Arc::new(ext))
+            .await
+            .expect("the native loads");
         assert!(
             host.has_entry_renderer(crate::inbound::INBOUND_MESSAGE_CUSTOM_TYPE),
             "init must claim the entry type, or `cyrup-tui/src/app.rs:5845` never calls the renderer"
@@ -1059,7 +1119,9 @@ mod tests {
     /// must not share a registry.
     async fn registered_tool_names(ext: IntercomExtension) -> Vec<String> {
         let host = cyrup_ext::ExtensionHost::new(cyrup_ext::HostConfig::default());
-        host.load_native(Arc::new(ext)).await.expect("the native loads");
+        host.load_native(Arc::new(ext))
+            .await
+            .expect("the native loads");
         let mut names: Vec<String> = host
             .active_tools(&[])
             .expect("the active tool set materializes")
@@ -1095,21 +1157,29 @@ mod tests {
         };
 
         // No native channel: the child gets the legacy broker-routed tool (`index.ts:1162-1163`).
-        let legacy = registered_tool_names(child_extension().with_native_supervisor_channel(false)).await;
+        let legacy =
+            registered_tool_names(child_extension().with_native_supervisor_channel(false)).await;
         assert!(
             legacy.iter().any(|n| n == "contact_supervisor"),
             "a child WITHOUT the native channel must be handed the legacy tool: {legacy:?}"
         );
-        assert!(legacy.iter().any(|n| n == "intercom"), "`intercom` is registered always: {legacy:?}");
+        assert!(
+            legacy.iter().any(|n| n == "intercom"),
+            "`intercom` is registered always: {legacy:?}"
+        );
 
         // Native channel available: the SAME extension minus that one tool — `intercom` still
         // registers, so the absence below is the gate firing and not a failed `init`.
-        let native = registered_tool_names(child_extension().with_native_supervisor_channel(true)).await;
+        let native =
+            registered_tool_names(child_extension().with_native_supervisor_channel(true)).await;
         assert!(
             !native.iter().any(|n| n == "contact_supervisor"),
             "a child ON the native channel must NOT also get the broker-routed tool: {native:?}"
         );
-        assert!(native.iter().any(|n| n == "intercom"), "`intercom` is registered always: {native:?}");
+        assert!(
+            native.iter().any(|n| n == "intercom"),
+            "`intercom` is registered always: {native:?}"
+        );
     }
 
     /// The two tool renderers are wired to the names the tools actually register under — a renderer
@@ -1119,10 +1189,16 @@ mod tests {
         let (_dir, ext) = test_extension();
         let call = serde_json::json!({ "action": "send", "to": "reviewer", "message": "hi" });
         assert_eq!(
-            ext.render_call("intercom", &call).unwrap().as_str().unwrap(),
+            ext.render_call("intercom", &call)
+                .unwrap()
+                .as_str()
+                .unwrap(),
             "intercom send → reviewer\n  hi"
         );
-        assert!(ext.render_call("contact_supervisor", &serde_json::json!({})).is_some());
+        assert!(
+            ext.render_call("contact_supervisor", &serde_json::json!({}))
+                .is_some()
+        );
         assert!(ext.render_call("not_our_tool", &call).is_none());
 
         let result = serde_json::json!({
@@ -1130,7 +1206,10 @@ mod tests {
             "details": { "messageId": "0192f3c1-9a10-7000", "delivered": true },
         });
         assert_eq!(
-            ext.render_result("intercom", &result).unwrap().as_str().unwrap(),
+            ext.render_result("intercom", &result)
+                .unwrap()
+                .as_str()
+                .unwrap(),
             "✓ Message sent to reviewer (0192f3c1)"
         );
         assert!(ext.render_result("contact_supervisor", &result).is_some());
@@ -1293,7 +1372,10 @@ mod tests {
         }
 
         let ctx = HostCtx::event(cyrup_ext::ExtMode::Print, false, dir.path().to_path_buf());
-        let ev = HostEvent::TurnStart { turn_index: 0, timestamp: now_ms() };
+        let ev = HostEvent::TurnStart {
+            turn_index: 0,
+            timestamp: now_ms(),
+        };
         let _ = ext.on_event(&ev, &ctx).await;
 
         let resolved = ext
@@ -1302,7 +1384,9 @@ mod tests {
             .lock()
             .unwrap()
             .resolve_reply_target(None, None, now_ms())
-            .expect("current_turn_context resolves a bare reply with no `to`, despite 2 pending asks");
+            .expect(
+                "current_turn_context resolves a bare reply with no `to`, despite 2 pending asks",
+            );
         assert_eq!(resolved.message.id, triggering.message.id);
     }
 

@@ -5,28 +5,32 @@
 //! registry, the result feeds back, and a final assistant message arrives — while a NATIVE built-in
 //! extension observes the tool call through the wired ext seams and the session tree is persisted to
 //! disk across the turn.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use cyrup_agent::AgentMessage;
-use cyrup_core::{
-    TerminateHint,
-    CancelToken, Content, EntryId, ExtensionId, Message, StopReason, Tool, ToolCallId, ToolError,
-    ToolResult, ToolUpdateSink,
-};
-use cyrup_ext::{
-    EventKind, EventPatch, ExtError, HostCtx, HostEvent, HookOutcome, InitApi, NativeExtension,
-};
-use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call, FauxProvider};
-use cyrup_provider::Provider;
 use crate::{
     AgentSessionEvent, AgentSessionRuntime, ForkPosition, InputSource, SessionBuilder,
     SessionCommand, SessionCommandOutput, SessionConfig, SessionFactory, SessionServiceError,
     SessionTarget, UserInput,
 };
+use cyrup_agent::AgentMessage;
+use cyrup_core::{
+    CancelToken, Content, EntryId, ExtensionId, Message, StopReason, TerminateHint, Tool,
+    ToolCallId, ToolError, ToolResult, ToolUpdateSink,
+};
+use cyrup_ext::{
+    EventKind, EventPatch, ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension,
+};
+use cyrup_provider::Provider;
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text, faux_tool_call};
 use futures::StreamExt;
 use tempfile::TempDir;
 
@@ -76,7 +80,10 @@ struct SleeperTool {
 
 impl SleeperTool {
     fn new(cancelled: Arc<Mutex<bool>>) -> Self {
-        Self { params: serde_json::json!({"type": "object", "properties": {}}), cancelled }
+        Self {
+            params: serde_json::json!({"type": "object", "properties": {}}),
+            cancelled,
+        }
     }
 }
 
@@ -97,7 +104,12 @@ impl Tool for SleeperTool {
     ) -> Result<ToolResult, ToolError> {
         cancel.cancelled().await;
         *self.cancelled.lock().unwrap() = true;
-        Ok(ToolResult { content: vec![Content::text("aborted")], details: None, terminate: TerminateHint::Unspecified, ..Default::default() })
+        Ok(ToolResult {
+            content: vec![Content::text("aborted")],
+            details: None,
+            terminate: TerminateHint::Unspecified,
+            ..Default::default()
+        })
     }
 }
 
@@ -135,7 +147,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -172,7 +188,10 @@ async fn end_to_end_tool_call_round_trip_with_native_extension() {
     let faux = Arc::new(FauxProvider::new());
     faux.set_responses(vec![
         faux_assistant_message(
-            vec![faux_tool_call("write", serde_json::json!({"path": "hello.txt", "content": "hi"}))],
+            vec![faux_tool_call(
+                "write",
+                serde_json::json!({"path": "hello.txt", "content": "hi"}),
+            )],
             StopReason::ToolUse,
         ),
         faux_assistant_message(vec![faux_text("all done")], StopReason::Stop),
@@ -188,23 +207,42 @@ async fn end_to_end_tool_call_round_trip_with_native_extension() {
 
     // (c) the assembled system prompt includes tools / skills / context sections.
     let prompt = session.system_prompt().to_string();
-    assert!(prompt.contains("Available tools:"), "tools section missing:\n{prompt}");
+    assert!(
+        prompt.contains("Available tools:"),
+        "tools section missing:\n{prompt}"
+    );
     assert!(prompt.contains("write"), "write tool snippet missing");
-    assert!(prompt.contains("PROJECT_CONTEXT_MARKER"), "context file not injected:\n{prompt}");
-    assert!(prompt.contains("<project_instructions"), "project_instructions wrapper missing");
+    assert!(
+        prompt.contains("PROJECT_CONTEXT_MARKER"),
+        "context file not injected:\n{prompt}"
+    );
+    assert!(
+        prompt.contains("<project_instructions"),
+        "project_instructions wrapper missing"
+    );
     // The skills block is pi's `formatSkillsForPrompt` (`packages/coding-agent/src/core/skills.ts:
     // 342-358` @v0.83.0): three lead-in lines, then an `<available_skills>` element holding one
     // `<skill>` per visible skill with `<name>`/`<description>`/`<location>` children. There is no
     // "Available skills" prose heading anywhere in pi — asserting one pinned a format pi does not
     // emit, and it only passed while cyrup's skills section was still unported.
     assert!(
-        prompt.contains("The following skills provide specialized instructions for specific tasks."),
+        prompt
+            .contains("The following skills provide specialized instructions for specific tasks."),
         "skills lead-in missing:\n{prompt}"
     );
-    assert!(prompt.contains("<available_skills>"), "skills section missing:\n{prompt}");
-    assert!(prompt.contains("</available_skills>"), "skills section unclosed:\n{prompt}");
+    assert!(
+        prompt.contains("<available_skills>"),
+        "skills section missing:\n{prompt}"
+    );
+    assert!(
+        prompt.contains("</available_skills>"),
+        "skills section unclosed:\n{prompt}"
+    );
     // The skill's three children, not merely its name appearing somewhere in the prompt.
-    assert!(prompt.contains("<name>demoskill</name>"), "skill name missing:\n{prompt}");
+    assert!(
+        prompt.contains("<name>demoskill</name>"),
+        "skill name missing:\n{prompt}"
+    );
     assert!(
         prompt.contains("<description>use this when you need a demo</description>"),
         "skill description missing:\n{prompt}"
@@ -212,7 +250,11 @@ async fn end_to_end_tool_call_round_trip_with_native_extension() {
     assert!(
         prompt.contains(&format!(
             "<location>{}</location>",
-            fx.agent_dir.join("skills").join("demoskill").join("SKILL.md").display()
+            fx.agent_dir
+                .join("skills")
+                .join("demoskill")
+                .join("SKILL.md")
+                .display()
         )),
         "skill location must be the absolute SKILL.md path pi points the model at:\n{prompt}"
     );
@@ -227,7 +269,11 @@ async fn end_to_end_tool_call_round_trip_with_native_extension() {
 
     // (a) the AgentSessionEvent stream order is correct.
     let kinds: Vec<&str> = events.iter().map(AgentSessionEvent::kind).collect();
-    assert_eq!(kinds.first(), Some(&"agent_start"), "stream must start with agent_start: {kinds:?}");
+    assert_eq!(
+        kinds.first(),
+        Some(&"agent_start"),
+        "stream must start with agent_start: {kinds:?}"
+    );
     // SEAM-005: the run-scoped stream now closes on `agent_settled`, the event that says the WHOLE
     // run (including any auto-retry / post-run compaction / queued continuation) is done — Pi's
     // `_emitAgentSettled` likewise runs after the post-run loop, in `_runAgentPrompt`'s `finally`
@@ -242,8 +288,14 @@ async fn end_to_end_tool_call_round_trip_with_native_extension() {
         Some(&"agent_end"),
         "…immediately preceded by the run's last agent_end: {kinds:?}"
     );
-    let tes = kinds.iter().position(|k| *k == "tool_execution_start").expect("tool_execution_start");
-    let tee = kinds.iter().position(|k| *k == "tool_execution_end").expect("tool_execution_end");
+    let tes = kinds
+        .iter()
+        .position(|k| *k == "tool_execution_start")
+        .expect("tool_execution_start");
+    let tee = kinds
+        .iter()
+        .position(|k| *k == "tool_execution_end")
+        .expect("tool_execution_end");
     assert!(tes < tee, "tool exec start must precede end");
 
     // message_end role order = user -> assistant(toolCall) -> toolResult -> assistant.
@@ -274,8 +326,16 @@ async fn end_to_end_tool_call_round_trip_with_native_extension() {
 
     // (b) the session tree on disk contains user -> assistant(toolCall) -> toolResult -> assistant.
     let msgs = session.messages().await;
-    assert_eq!(msgs.len(), 4, "expected 4 persisted messages, got {}", msgs.len());
-    assert!(matches!(msgs[0], Message::User { .. }), "msg0 should be user");
+    assert_eq!(
+        msgs.len(),
+        4,
+        "expected 4 persisted messages, got {}",
+        msgs.len()
+    );
+    assert!(
+        matches!(msgs[0], Message::User { .. }),
+        "msg0 should be user"
+    );
     match &msgs[1] {
         Message::Assistant(a) => assert!(
             a.content.iter().any(|c| matches!(c, Content::ToolCall(_))),
@@ -283,18 +343,39 @@ async fn end_to_end_tool_call_round_trip_with_native_extension() {
         ),
         other => panic!("msg1 should be assistant, got {other:?}"),
     }
-    assert!(matches!(msgs[2], Message::ToolResult { .. }), "msg2 should be toolResult");
-    assert!(matches!(msgs[3], Message::Assistant(_)), "msg3 should be assistant");
+    assert!(
+        matches!(msgs[2], Message::ToolResult { .. }),
+        "msg2 should be toolResult"
+    );
+    assert!(
+        matches!(msgs[3], Message::Assistant(_)),
+        "msg3 should be assistant"
+    );
 
     // The tree is durable on disk (not just in memory).
-    let file = session.session_file().await.expect("persisted session file");
+    let file = session
+        .session_file()
+        .await
+        .expect("persisted session file");
     let on_disk = std::fs::read_to_string(&file).expect("read session file");
-    assert!(on_disk.contains("\"role\":\"toolResult\""), "tool result not persisted:\n{on_disk}");
-    assert!(on_disk.contains("hello.txt"), "tool call args not persisted");
+    assert!(
+        on_disk.contains("\"role\":\"toolResult\""),
+        "tool result not persisted:\n{on_disk}"
+    );
+    assert!(
+        on_disk.contains("hello.txt"),
+        "tool call args not persisted"
+    );
 
     // The tool actually executed against the workspace through the registry.
-    assert!(fx.cwd.join("hello.txt").exists(), "write tool did not create the file");
-    assert_eq!(std::fs::read_to_string(fx.cwd.join("hello.txt")).unwrap(), "hi");
+    assert!(
+        fx.cwd.join("hello.txt").exists(),
+        "write tool did not create the file"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.cwd.join("hello.txt")).unwrap(),
+        "hi"
+    );
 }
 
 fn role_with_toolcall(m: &AgentMessage) -> &'static str {
@@ -327,7 +408,10 @@ async fn model_resolution_wiring() {
     // Explicit pattern resolves to the catalog model + wires it into the agent.
     let mut cfg = base_config(&fx);
     cfg.model_pattern = Some("faux-1".to_string());
-    let session = SessionBuilder::new(faux.clone(), cfg).build().await.unwrap();
+    let session = SessionBuilder::new(faux.clone(), cfg)
+        .build()
+        .await
+        .unwrap();
     let m = session.model().expect("session must have a resolved model");
     assert_eq!(m.model.as_str(), "faux-1");
     assert_eq!(m.provider.as_str(), "faux");
@@ -354,7 +438,10 @@ async fn unresolvable_model_on_known_provider_builds_a_custom_fallback() {
     // `faux/custom-9000`: the `faux/` prefix names the resolved provider → custom fallback.
     let mut cfg = base_config(&fx);
     cfg.model_pattern = Some("faux/custom-9000".to_string());
-    let session = SessionBuilder::new(faux.clone(), cfg).build().await.unwrap();
+    let session = SessionBuilder::new(faux.clone(), cfg)
+        .build()
+        .await
+        .unwrap();
     let m = session.model().expect("session must have a resolved model");
     assert_eq!(m.model.as_str(), "custom-9000");
     assert_eq!(m.provider.as_str(), "faux");
@@ -364,7 +451,14 @@ async fn unresolvable_model_on_known_provider_builds_a_custom_fallback() {
     cfg2.model_pattern = Some("totally-made-up".to_string());
     cfg2.cli_provider_explicit = true;
     let session2 = SessionBuilder::new(faux, cfg2).build().await.unwrap();
-    assert_eq!(session2.model().expect("session must have a resolved model").model.as_str(), "totally-made-up");
+    assert_eq!(
+        session2
+            .model()
+            .expect("session must have a resolved model")
+            .model
+            .as_str(),
+        "totally-made-up"
+    );
 }
 
 #[tokio::test]
@@ -376,7 +470,10 @@ async fn trust_gated_context_files() {
     // Untrusted (--no-approve): project context files are NOT loaded (R-06-009).
     let mut untrusted = base_config(&fx);
     untrusted.trust_override = Some(false);
-    let s_untrusted = SessionBuilder::new(faux.clone(), untrusted).build().await.unwrap();
+    let s_untrusted = SessionBuilder::new(faux.clone(), untrusted)
+        .build()
+        .await
+        .unwrap();
     assert!(
         !s_untrusted.system_prompt().contains("TRUST_GATED_MARKER"),
         "untrusted session must not inject project context"
@@ -407,7 +504,9 @@ async fn cancellation_unblocks_a_running_tool() {
     let cancelled = Arc::new(Mutex::new(false));
     let provider: Arc<dyn Provider> = faux.clone();
     let session = SessionBuilder::new(provider, base_config(&fx))
-        .with_native_extension(Arc::new(SleeperExt { cancelled: cancelled.clone() }))
+        .with_native_extension(Arc::new(SleeperExt {
+            cancelled: cancelled.clone(),
+        }))
         .build()
         .await
         .unwrap();
@@ -431,8 +530,14 @@ async fn cancellation_unblocks_a_running_tool() {
     tokio::time::timeout(Duration::from_secs(5), session.wait_for_idle())
         .await
         .expect("wait_for_idle must complete after abort");
-    assert!(!session.is_streaming().await, "session must be idle after abort");
-    assert!(*cancelled.lock().unwrap(), "sleeper tool did not observe cancellation");
+    assert!(
+        !session.is_streaming().await,
+        "session must be idle after abort"
+    );
+    assert!(
+        *cancelled.lock().unwrap(),
+        "sleeper tool did not observe cancellation"
+    );
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -452,8 +557,10 @@ impl NativeExtension for PromptRewriter {
     }
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         if let HostEvent::BeforeAgentStart { .. } = ev {
-            let inject =
-                Message::User { content: vec![Content::text("INJECTED_CONTEXT")], timestamp: 0 };
+            let inject = Message::User {
+                content: vec![Content::text("INJECTED_CONTEXT")],
+                timestamp: 0,
+            };
             HookOutcome::Mutate(EventPatch::SystemPromptAndInject {
                 system: Some("REWRITTEN_SYSTEM_PROMPT".to_string()),
                 inject: Some(Box::new(inject)),
@@ -470,7 +577,10 @@ impl NativeExtension for PromptRewriter {
 async fn before_agent_start_hook_is_invoked_and_applied() {
     let fx = fixture();
     let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("ok")],
+        StopReason::Stop,
+    )]);
 
     let provider: Arc<dyn Provider> = faux.clone();
     let session = SessionBuilder::new(provider, base_config(&fx))
@@ -488,7 +598,10 @@ async fn before_agent_start_hook_is_invoked_and_applied() {
     let _ = stream.collect::<Vec<_>>().await;
 
     // The handler's system-prompt replacement reached the agent (Pi agent-session.ts:1127).
-    assert_eq!(session.current_system_prompt().await, "REWRITTEN_SYSTEM_PROMPT");
+    assert_eq!(
+        session.current_system_prompt().await,
+        "REWRITTEN_SYSTEM_PROMPT"
+    );
 
     // The injected message is part of the persisted run alongside the user prompt.
     let texts: Vec<String> = session
@@ -508,8 +621,14 @@ async fn before_agent_start_hook_is_invoked_and_applied() {
             _ => None,
         })
         .collect();
-    assert!(texts.iter().any(|t| t == "hello"), "original prompt missing: {texts:?}");
-    assert!(texts.iter().any(|t| t == "INJECTED_CONTEXT"), "injected message missing: {texts:?}");
+    assert!(
+        texts.iter().any(|t| t == "hello"),
+        "original prompt missing: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|t| t == "INJECTED_CONTEXT"),
+        "injected message missing: {texts:?}"
+    );
 }
 
 /// gap #30 + #12: the queue mirrors + `queue_update` emission, exercised through the `SessionCommand`
@@ -518,20 +637,28 @@ async fn before_agent_start_hook_is_invoked_and_applied() {
 async fn queue_introspection_and_command_seam() {
     let fx = fixture();
     let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
-    let session =
-        SessionBuilder::new(faux, base_config(&fx)).build().await.expect("build");
+    let session = SessionBuilder::new(faux, base_config(&fx))
+        .build()
+        .await
+        .expect("build");
 
     // Observe queue_update events on a persistent subscription.
     let mut sub = session.subscribe();
 
     // Route everything through the command seam (arch-11 §2.1).
     let out = session
-        .execute(SessionCommand::Steer(UserInput::text("steer-1", InputSource::Rpc)))
+        .execute(SessionCommand::Steer(UserInput::text(
+            "steer-1",
+            InputSource::Rpc,
+        )))
         .await
         .expect("steer");
     assert!(matches!(out, SessionCommandOutput::Accepted(_)));
     session
-        .execute(SessionCommand::FollowUp(UserInput::text("follow-1", InputSource::Rpc)))
+        .execute(SessionCommand::FollowUp(UserInput::text(
+            "follow-1",
+            InputSource::Rpc,
+        )))
         .await
         .expect("follow_up");
 
@@ -555,7 +682,10 @@ async fn queue_introspection_and_command_seam() {
     assert!(saw_queue_update, "expected a queue_update event");
 
     // Clear via the seam.
-    session.execute(SessionCommand::ClearQueue).await.expect("clear");
+    session
+        .execute(SessionCommand::ClearQueue)
+        .await
+        .expect("clear");
     assert_eq!(session.pending_message_count(), 0);
 
     // The state view reflects the cleared queue.
@@ -570,12 +700,16 @@ async fn queue_introspection_and_command_seam() {
 async fn runtime_new_session_invalidates_subscriptions_and_bumps_generation() {
     let fx = fixture();
     let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text("hi")], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("hi")],
+        StopReason::Stop,
+    )]);
 
     let provider: Arc<dyn Provider> = faux.clone();
     let factory = Arc::new(SessionFactory::new(provider, base_config(&fx)));
-    let runtime =
-        AgentSessionRuntime::create(factory, SessionTarget::New).await.expect("runtime");
+    let runtime = AgentSessionRuntime::create(factory, SessionTarget::New)
+        .await
+        .expect("runtime");
 
     assert_eq!(runtime.generation().await, 0);
     let mut gen_watch = runtime.watch_generation();
@@ -592,8 +726,15 @@ async fn runtime_new_session_invalidates_subscriptions_and_bumps_generation() {
     // Replace the session.
     let result = runtime.new_session().await.expect("new_session");
     assert!(!result.cancelled);
-    assert_eq!(runtime.generation().await, 1, "generation must bump on replacement");
-    assert!(gen_watch.changed().await.is_ok(), "generation watch must fire");
+    assert_eq!(
+        runtime.generation().await,
+        1,
+        "generation must bump on replacement"
+    );
+    assert!(
+        gen_watch.changed().await.is_ok(),
+        "generation watch must fire"
+    );
     assert_eq!(*gen_watch.borrow(), 1);
 
     // The OLD subscription terminates with a SessionReplaced terminal (R-11-021).
@@ -610,12 +751,22 @@ async fn runtime_new_session_invalidates_subscriptions_and_bumps_generation() {
             Err(_) => panic!("old subscription did not terminate after replacement"),
         }
     }
-    assert!(saw_replaced, "old subscription must receive the SessionReplaced terminal");
+    assert!(
+        saw_replaced,
+        "old subscription must receive the SessionReplaced terminal"
+    );
 
     // The new session is fresh (different id, empty transcript).
     let second = runtime.session().await;
-    assert_ne!(second.session_id(), &first_id, "new_session must create a distinct session");
-    assert!(second.messages().await.is_empty(), "new session must start empty");
+    assert_ne!(
+        second.session_id(),
+        &first_id,
+        "new_session must create a distinct session"
+    );
+    assert!(
+        second.messages().await.is_empty(),
+        "new session must start empty"
+    );
 }
 
 /// gap #4/#6/#33: entry-anchored fork via the runtime + `getUserMessagesForForking`, plus stats.
@@ -630,11 +781,15 @@ async fn runtime_fork_at_entry_and_fork_anchors() {
 
     let provider: Arc<dyn Provider> = faux.clone();
     let factory = Arc::new(SessionFactory::new(provider, base_config(&fx)));
-    let runtime =
-        AgentSessionRuntime::create(factory, SessionTarget::New).await.expect("runtime");
+    let runtime = AgentSessionRuntime::create(factory, SessionTarget::New)
+        .await
+        .expect("runtime");
 
     let session = runtime.session().await;
-    let _stream = session.prompt("the first user message").await.expect("prompt");
+    let _stream = session
+        .prompt("the first user message")
+        .await
+        .expect("prompt");
     session.wait_for_idle().await;
 
     // Stats reflect the round-trip.
@@ -650,7 +805,10 @@ async fn runtime_fork_at_entry_and_fork_anchors() {
     drop(session);
 
     // Fork AT that entry through the runtime → a fresh branched session, generation bumps.
-    let fork = runtime.fork(anchor_id, ForkPosition::At).await.expect("fork");
+    let fork = runtime
+        .fork(anchor_id, ForkPosition::At)
+        .await
+        .expect("fork");
     assert!(!fork.cancelled);
     assert_eq!(runtime.generation().await, 1, "fork replaces the session");
 }
@@ -667,43 +825,86 @@ async fn trust_settings_and_session_list_seams() {
     let fx = fixture();
     let faux = Arc::new(FauxProvider::new());
     let provider: Arc<dyn Provider> = faux.clone();
-    let session = SessionBuilder::new(provider, base_config(&fx)).build().await.expect("build");
+    let session = SessionBuilder::new(provider, base_config(&fx))
+        .build()
+        .await
+        .expect("build");
 
     // ---- /trust: options + write + saved-decision readback ----
     let options = session.project_trust_options();
     assert!(options.iter().any(|o| o.label == "Trust" && o.trusted));
-    assert!(options.iter().any(|o| o.label == "Do not trust" && !o.trusted));
-    assert_eq!(session.saved_trust_decision().await, None, "no decision persisted yet");
+    assert!(
+        options
+            .iter()
+            .any(|o| o.label == "Do not trust" && !o.trusted)
+    );
+    assert_eq!(
+        session.saved_trust_decision().await,
+        None,
+        "no decision persisted yet"
+    );
 
     // Persist the "Trust" option's store updates → writes agent_dir/trust.json.
-    let trust_opt = options.iter().find(|o| o.label == "Trust").expect("trust option");
-    session.write_project_trust(&trust_opt.updates).await.expect("write trust");
+    let trust_opt = options
+        .iter()
+        .find(|o| o.label == "Trust")
+        .expect("trust option");
+    session
+        .write_project_trust(&trust_opt.updates)
+        .await
+        .expect("write trust");
     assert!(session.trust_store_path().exists(), "trust.json written");
-    let saved = session.saved_trust_decision().await.expect("decision now persisted");
+    let saved = session
+        .saved_trust_decision()
+        .await
+        .expect("decision now persisted");
     assert!(saved.decision.is_trusted(), "persisted decision is trusted");
 
     // Round-trip an explicit untrusted decision.
     session
         .write_project_trust(&[(fx.cwd.clone(), Some(TrustDecision::Untrusted))])
-        .await.expect("write untrusted");
-    assert!(!session.saved_trust_decision().await.expect("decision").decision.is_trusted());
+        .await
+        .expect("write untrusted");
+    assert!(
+        !session
+            .saved_trust_decision()
+            .await
+            .expect("decision")
+            .decision
+            .is_trusted()
+    );
 
     // ---- /settings: persist via the `&self` write seam (the default builder store is in-memory,
     // so this verifies the seam round-trips without error, including the project trust gate). ----
     session
-        .persist_setting(SettingsScope::Global, "terminal.showImages", serde_json::json!(false))
-        .await.expect("persist global setting");
+        .persist_setting(
+            SettingsScope::Global,
+            "terminal.showImages",
+            serde_json::json!(false),
+        )
+        .await
+        .expect("persist global setting");
     session
-        .persist_setting(SettingsScope::Project, "quietStartup", serde_json::json!(true))
-        .await.expect("persist project setting (trusted)");
+        .persist_setting(
+            SettingsScope::Project,
+            "quietStartup",
+            serde_json::json!(true),
+        )
+        .await
+        .expect("persist project setting (trusted)");
 
     // ---- /resume: the session list includes this session (after a turn flushes it to disk) ----
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text("hi")], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("hi")],
+        StopReason::Stop,
+    )]);
     let _stream = session.prompt("hello world").await.expect("prompt");
     session.wait_for_idle().await;
     let sessions = session.list_sessions();
     assert!(
-        sessions.iter().any(|s| s.id.to_string() == session.session_id().to_string()),
+        sessions
+            .iter()
+            .any(|s| s.id.to_string() == session.session_id().to_string()),
         "current session appears in the resume list ({} found)",
         sessions.len()
     );

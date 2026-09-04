@@ -24,7 +24,12 @@
 //! Each test carries a MIRROR so "answer everything" cannot pass: an unknown tag must still tear
 //! the connection down, and a well-formed capabilities update must still be served.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -33,8 +38,8 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
-use cyrup_intercom::transport::framing::{FrameReader, encode_json};
 use crate::common::Broker;
+use cyrup_intercom::transport::framing::{FrameReader, encode_json};
 
 /// A raw length-prefixed-JSON client: it can put ANY frame on the wire.
 struct RawClient {
@@ -47,7 +52,9 @@ struct RawClient {
 impl RawClient {
     async fn connect(socket: &Path) -> Self {
         Self {
-            stream: UnixStream::connect(socket).await.expect("connect to the broker socket"),
+            stream: UnixStream::connect(socket)
+                .await
+                .expect("connect to the broker socket"),
             reader: FrameReader::new(),
             queued: VecDeque::new(),
             buf: vec![0u8; 16 * 1024],
@@ -72,16 +79,21 @@ impl RawClient {
             if let Some(v) = self.queued.pop_front() {
                 return Some(v);
             }
-            let n = match tokio::time::timeout(Duration::from_secs(5), self.stream.read(&mut self.buf))
-                .await
-                .expect("broker responds or closes within 5s")
-            {
-                Ok(0) | Err(_) => return None,
-                Ok(n) => n,
-            };
-            let frames = self.reader.push(&self.buf[..n]).expect("broker frames are well-formed");
+            let n =
+                match tokio::time::timeout(Duration::from_secs(5), self.stream.read(&mut self.buf))
+                    .await
+                    .expect("broker responds or closes within 5s")
+                {
+                    Ok(0) | Err(_) => return None,
+                    Ok(n) => n,
+                };
+            let frames = self
+                .reader
+                .push(&self.buf[..n])
+                .expect("broker frames are well-formed");
             for payload in frames {
-                self.queued.push_back(serde_json::from_slice(&payload).expect("broker frames are JSON"));
+                self.queued
+                    .push_back(serde_json::from_slice(&payload).expect("broker frames are JSON"));
             }
         }
     }
@@ -119,7 +131,8 @@ impl RawClient {
 
     /// The connection is still serving: a `list` round-trips.
     async fn assert_alive(&mut self, request_id: &str) {
-        self.send(&serde_json::json!({ "type": "list", "requestId": request_id })).await;
+        self.send(&serde_json::json!({ "type": "list", "requestId": request_id }))
+            .await;
         assert_eq!(self.expect_frame("sessions").await["requestId"], request_id);
     }
 }
@@ -180,13 +193,28 @@ async fn extension_state_commit_is_always_answered_with_an_extension_state_resul
     // prints for that expression, not what a validated namespace would be.
     for (frame, echoed) in [
         // The frame confirmed live to be swallowed: a non-string namespace.
-        (serde_json::json!({ "type": "extension_state_commit", "namespace": 42 }), "42"),
+        (
+            serde_json::json!({ "type": "extension_state_commit", "namespace": 42 }),
+            "42",
+        ),
         // Absent, null and the other falsy values all short-circuit the `||` to "".
         (serde_json::json!({ "type": "extension_state_commit" }), ""),
-        (serde_json::json!({ "type": "extension_state_commit", "namespace": null }), ""),
-        (serde_json::json!({ "type": "extension_state_commit", "namespace": "" }), ""),
-        (serde_json::json!({ "type": "extension_state_commit", "namespace": false }), ""),
-        (serde_json::json!({ "type": "extension_state_commit", "namespace": 0 }), ""),
+        (
+            serde_json::json!({ "type": "extension_state_commit", "namespace": null }),
+            "",
+        ),
+        (
+            serde_json::json!({ "type": "extension_state_commit", "namespace": "" }),
+            "",
+        ),
+        (
+            serde_json::json!({ "type": "extension_state_commit", "namespace": false }),
+            "",
+        ),
+        (
+            serde_json::json!({ "type": "extension_state_commit", "namespace": 0 }),
+            "",
+        ),
         // A valid namespace is echoed verbatim, with a well-formed rest-of-frame.
         (
             serde_json::json!({
@@ -201,7 +229,10 @@ async fn extension_state_commit_is_always_answered_with_an_extension_state_resul
     ] {
         alpha.send(&frame).await;
         let res = alpha.expect_frame("extension_state_result").await;
-        assert_eq!(res["namespace"], echoed, "String(namespace || \"\") for {frame}");
+        assert_eq!(
+            res["namespace"], echoed,
+            "String(namespace || \"\") for {frame}"
+        );
         assert_eq!(res["committed"], false, "for {frame}");
         assert_eq!(res["revision"], 0, "for {frame}");
         assert_eq!(
@@ -247,11 +278,14 @@ async fn malformed_capabilities_updates_and_unknown_tags_still_destroy_the_conne
         serde_json::json!({ "type": "extension_teleport", "namespace": "ns" }),
     ] {
         let mut c = RawClient::connect(&broker.socket).await;
-        c.register("probe", &format!("probe-{}", uuid::Uuid::new_v4())).await;
+        c.register("probe", &format!("probe-{}", uuid::Uuid::new_v4()))
+            .await;
         c.send(&bad).await;
         // A `list` that never gets its reply is the "socket destroyed" observation; an `EPIPE` on
         // the probe write is the same observation arriving sooner.
-        if c.try_send(&serde_json::json!({ "type": "list", "requestId": "r1" })).await {
+        if c.try_send(&serde_json::json!({ "type": "list", "requestId": "r1" }))
+            .await
+        {
             assert!(
                 c.next_frame().await.is_none(),
                 "the broker must still destroy the connection for {bad}"
@@ -287,7 +321,9 @@ async fn a_well_formed_capabilities_update_is_accepted_and_draws_no_refusal() {
     // set, then one `extension_owner` per advertised namespace goes back to the updating session.
     // What must NOT appear is a refusal or a closed socket, so the `list` mirror still proves the
     // connection is healthy and serving.
-    alpha.send(&serde_json::json!({ "type": "list", "requestId": "r1" })).await;
+    alpha
+        .send(&serde_json::json!({ "type": "list", "requestId": "r1" }))
+        .await;
 
     let mut owned_ns = false;
     let mut unowned_ns = false;
@@ -321,7 +357,13 @@ async fn a_well_formed_capabilities_update_is_accepted_and_draws_no_refusal() {
         }
     };
 
-    assert!(owned_ns, "the ownerEligible namespace must elect this session as its owner");
-    assert!(unowned_ns, "a namespace advertised without ownerEligible must replay with no owner");
+    assert!(
+        owned_ns,
+        "the ownerEligible namespace must elect this session as its owner"
+    );
+    assert!(
+        unowned_ns,
+        "a namespace advertised without ownerEligible must replay with no owner"
+    );
     assert_eq!(sessions["requestId"], "r1");
 }

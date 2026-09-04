@@ -2,19 +2,13 @@
 
 use std::path::{Path, PathBuf};
 
-use cyrup_core::{CancelToken, ModelId, ToolUpdateSink};
+use cyrup_core::{CancelToken, ModelId, ProviderId, ToolUpdateSink};
 
 use crate::background::RunId;
 use crate::discovery::types::{AgentDefinition, AgentReadScope, OutputMode};
 use crate::error::SubagentError;
+use crate::exec::fallback::{provider_of, resolve_model_inheritance};
 use crate::exec::{AgentConfig, RunOptions, SingleResult};
-use crate::exec::fallback::resolve_model_inheritance;
-use crate::fork_context::{
-    forked_child_requires_thinking_off, resolve_effective_context, ContextMode, ContextRequest,
-    ForkContext,
-};
-use crate::registration::SubagentExtensionConfig;
-use crate::spawn::depth::{resolve_effective_depth, DepthEnvelope};
 use crate::extension::EXTENSION_ID;
 use crate::extension::executor::SubagentExecutor;
 use crate::extension::executor::notices::{ForegroundControlEntry, ForegroundControlNotifier};
@@ -26,6 +20,12 @@ use crate::extension::tool::task_items::{
     normalize_single_output_override, parse_tool_output_mode, resolve_single_output_path,
     resolve_single_run_output_base_dir, resolve_single_run_session_root,
 };
+use crate::fork_context::{
+    ContextMode, ContextRequest, ForkContext, forked_child_requires_thinking_off,
+    resolve_effective_context,
+};
+use crate::registration::SubagentExtensionConfig;
+use crate::spawn::depth::{DepthEnvelope, resolve_effective_depth};
 
 /// The persona-and-model half of [`SubagentExecutor::run_foreground_impl`]'s prologue, as resolved
 /// by [`SubagentExecutor::resolve_run_agent`].
@@ -62,6 +62,11 @@ struct ResolvedRunAgent {
     available_models: Vec<ModelId>,
     /// The model override that survived the fail-closed `modelScope` gate.
     effective_override: crate::exec::fallback::ModelOverride,
+    /// SUBA-088 — pi `currentProvider = parentModel?.provider` (`subagent-executor.ts:3648`
+    /// @v0.64.0): the REMEMBERED parent model's provider, handed to `run_sync` as
+    /// [`RunOptions::preferred_provider`] (pi's `preferredModelProvider: currentProvider`,
+    /// `:3825`) — the second rung under the agent's own `model_provider`.
+    preferred_provider: Option<ProviderId>,
 }
 
 /// The run-scoped identity, sinks and directories [`SubagentExecutor::resolve_run_channels`]
@@ -118,6 +123,7 @@ struct ForegroundRunOptionsInput<'a> {
     max_thinking: Option<String>,
     available_models: Vec<ModelId>,
     effective_override: crate::exec::fallback::ModelOverride,
+    preferred_provider: Option<ProviderId>,
     fork_context: ForkContext,
     deadline_at: Option<std::time::Instant>,
     /// Borrowed: the same id the caller registers, tears down and returns.
@@ -136,7 +142,6 @@ struct ForegroundRunOptionsInput<'a> {
 }
 
 impl SubagentExecutor {
-
     // ---------------------------------------------------------------------------------------
     // Foreground single-run dispatch (the tool's synchronous shape; exec::run_sync end to end)
     // ---------------------------------------------------------------------------------------
@@ -257,9 +262,15 @@ impl SubagentExecutor {
             max_thinking,
             available_models,
             effective_override,
+            preferred_provider,
         } = self.resolve_run_agent(&req, &cfg, depth).await?;
         let ForegroundRunRequest {
-            overrides, cwd, task, timeout_ms, cancel, ..
+            overrides,
+            cwd,
+            task,
+            timeout_ms,
+            cancel,
+            ..
         } = req;
 
         let RunChannels {
@@ -287,6 +298,7 @@ impl SubagentExecutor {
             max_thinking,
             available_models,
             effective_override,
+            preferred_provider,
             fork_context,
             deadline_at,
             run_id: &run_id,
@@ -299,7 +311,8 @@ impl SubagentExecutor {
             art_dir: &art_dir,
         });
 
-        self.register_foreground_controls(&run_id, &run_options, &agent, task).await;
+        self.register_foreground_controls(&run_id, &run_options, &agent, task)
+            .await;
 
         let art_paths =
             write_foreground_input_artifact(&art_cfg, &art_dir, &run_id, &agent.name, task);
@@ -319,20 +332,21 @@ impl SubagentExecutor {
         write_foreground_output_artifacts(&art_paths, &art_cfg, run_id.as_str(), &result);
 
         // R-SA-058: the per-attempt raw-stdout tee `run_sync` writes to
-        // `<cwd>/.cyrup-subagent-scratch/attempt-<n>.jsonl` is this run's persisted, observable child
+        // `<attempt_scratch_dir(cwd)>/attempt-<n>.jsonl` (SUBA-072: `<temp_root_dir>/scratch/
+        // <cwd_key>`, never under the project tree) is this run's persisted, observable child
         // record and MUST survive the orchestrator, exactly as it does on every other spawn path in
         // this crate (the tool single/parallel/chain fan-outs and the background hop-2 runner all
         // leave it in place — it is the single observation channel the crate's integration tests read
         // back, e.g. `tool_parallel_chain_integration`'s `/run [model=…]` tee check and
         // `companions_wiring_proof`). This mirrors pi, which likewise never deletes its persisted
         // child NDJSON stream — pi only cleans the *transient* per-spawn prompt/task-overflow dir it
-        // creates under `os.tmpdir()` (`pi-subagents/src/runs/shared/pi-args.ts:143-158` build it,
-        // `:233-236` `cleanupTempDir` removes it, invoked from
-        // `pi-subagents/src/runs/foreground/execution.ts:1109`), a dir that lives OUTSIDE the working
-        // tree and never holds the event stream. An earlier revision erroneously `remove_dir_all`'d
-        // the whole `.cyrup-subagent-scratch` dir here, which silently discarded that tee the moment a
-        // foreground `/run` completed — defeating the tee's own stated purpose and diverging from
-        // every sibling path — so no such deletion is performed.
+        // creates under `os.tmpdir()` (`pi-subagents/src/runs/shared/pi-args.ts:787-855` @v0.64.0
+        // build it, `:1052-1059` `cleanupTempDir` removes it, invoked from
+        // `pi-subagents/src/runs/foreground/execution.ts:491`/`:560`/`:602`/`:635`/`:1387`/`:1426`),
+        // a dir that lives OUTSIDE the working tree and never holds the event stream. An earlier
+        // revision erroneously `remove_dir_all`'d the whole scratch dir here, which silently
+        // discarded that tee the moment a foreground `/run` completed — defeating the tee's own
+        // stated purpose and diverging from every sibling path — so no such deletion is performed.
 
         Ok((result, run_id))
     }
@@ -358,13 +372,12 @@ impl SubagentExecutor {
         cfg: &SubagentExtensionConfig,
         depth: DepthEnvelope,
     ) -> Result<ResolvedRunAgent, SubagentError> {
-        let (agent, model_scope, max_thinking) =
-            self.resolve_agent_with_model_scope(
-                req.cwd,
-                req.agent_name,
-                req.agent_scope,
-                &cfg.roots,
-            )?;
+        let (agent, model_scope, max_thinking) = self.resolve_agent_with_model_scope(
+            req.cwd,
+            req.agent_name,
+            req.agent_scope,
+            &cfg.roots,
+        )?;
         // Fork default-mode (Tier-2, pi `resolveAgentDefaultContextPolicy`): an OMITTED call-site
         // `context` (`None`) takes the defaults ladder rather than being forced to `Fresh`; an
         // explicit call-site value still wins (`resolve_effective_context`).
@@ -401,11 +414,12 @@ impl SubagentExecutor {
         // The `!= Fork` arm is a short-circuit, not a claim: a `Fresh` request returns from
         // `resolve` before the flag is ever read, so there is no reason to walk the registry for
         // an answer nothing will look at.
+        let parent_model = self.remembered_parent_model();
         let force_thinking_off = effective_context != ContextMode::Fork
             || fork_requires_thinking_off(
                 &agent,
                 req.model_override.as_ref(),
-                self.remembered_parent_model().as_ref(),
+                parent_model.as_ref(),
             );
         let fork_context = self
             .resolve_context(req.cwd, effective_context, force_thinking_off)
@@ -499,11 +513,14 @@ impl SubagentExecutor {
         let effective_override = resolve_model_inheritance(
             req.model_override.as_ref(),
             agent_config.model.as_ref(),
-            self.remembered_parent_model().as_ref(),
+            parent_model.as_ref(),
             &mut available_models,
             model_scope.as_ref(),
         )
         .map_err(|violation| SubagentError::ModelOutOfScope(violation.message))?;
+        // SUBA-088 / pi `const currentProvider = parentModel?.provider` (`subagent-executor.ts:3648`
+        // @v0.64.0), from the same remembered parent model the inheritance above used.
+        let preferred_provider = parent_model.as_ref().and_then(provider_of);
 
         Ok(ResolvedRunAgent {
             agent,
@@ -516,6 +533,7 @@ impl SubagentExecutor {
             max_thinking,
             available_models,
             effective_override,
+            preferred_provider,
         })
     }
 
@@ -564,8 +582,11 @@ impl SubagentExecutor {
         );
         // pi `createForegroundControlNotifier(data, deps)` (`:1222` @v0.34.0), plus the ordered pump its
         // Rust equivalent needs; see the method doc.
-        let control_notifier =
-            self.foreground_control_notifier(run_id.clone(), agent.name.clone(), resolved_control.clone());
+        let control_notifier = self.foreground_control_notifier(
+            run_id.clone(),
+            agent.name.clone(),
+            resolved_control.clone(),
+        );
 
         // T6 artifact quadruple config + root (pi `subagent-executor.ts:3387-3391`). Resolved HERE,
         // ahead of `run_options`, because pi derives the single-run output base directory from the
@@ -581,7 +602,9 @@ impl SubagentExecutor {
         // temp root and made all three `artifactDir` preferences — including upstream's `project`
         // DEFAULT — unreachable.
         let art_dir = crate::artifacts::resolve_artifacts_dir(
-            self.host_services().and_then(|s| s.session_file()).as_deref(),
+            self.host_services()
+                .and_then(|s| s.session_file())
+                .as_deref(),
             Some(cwd),
             cwd,
             cfg.artifact_dir_preference(),
@@ -591,8 +614,7 @@ impl SubagentExecutor {
         // configured `singleRunOutputBaseDir` (tilde-expanded, `path.resolve`d) wins, else
         // `<artifactsDir>/outputs/<runId>`. This is the base a RELATIVE `output` resolves against —
         // deliberately NOT the run cwd, so a bare `report.md` never lands in the user's repo.
-        let output_base_dir =
-            resolve_single_run_output_base_dir(cfg, &art_dir, &run_id);
+        let output_base_dir = resolve_single_run_output_base_dir(cfg, &art_dir, &run_id);
         // pi `runSinglePath` (`subagent-executor.ts:3562-3564,3666`): the persona's own `output:` is
         // the fallback for an omitted param and the referent of `output: true`; `outputMode` defaults
         // to `inline` from the PARAM alone (pi never consults the persona's own mode here).
@@ -660,6 +682,7 @@ impl SubagentExecutor {
             max_thinking,
             available_models,
             effective_override,
+            preferred_provider,
             fork_context,
             deadline_at,
             run_id,
@@ -714,7 +737,10 @@ impl SubagentExecutor {
             // process itself inherited via the env, so the bound can only tighten as the tree
             // deepens.
             thinking_ceiling: max_thinking,
-            preferred_provider: None,
+            // SUBA-088: the remembered parent session's provider (pi `preferredModelProvider:
+            // currentProvider`, `subagent-executor.ts:3825` @v0.64.0). `run_sync` consults it only
+            // when the agent carries no `model_provider` of its own.
+            preferred_provider,
             available_models,
             // pi `execute(id, params, signal, ...)` threads the host's own `AbortSignal` into the
             // executor for every mode (`extension/index.ts:498-500` ->
@@ -941,13 +967,16 @@ fn fork_requires_thinking_off(
     ) {
         return true;
     }
-    // pi `agentConfig?.modelProvider ?? parentModel?.provider`. `AgentDefinition` declares no
-    // `modelProvider`, so only the parent rung survives: the provider half of a `provider/id`
-    // parent model, used solely to break a tie when a bare candidate id is offered by more than
-    // one provider.
-    let preferred_provider = parent_model
-        .and_then(|model| model.as_str().split_once('/'))
-        .map(|(provider, _)| provider);
+    // pi `agentConfig?.modelProvider ?? parentModel?.provider` (`subagent-executor.ts:6390`
+    // @v0.64.0): the agent's own `subagents.defaultProvider` stamp (SUBA-088) first, else the
+    // provider half of a `provider/id` parent model — used solely to break a tie when a bare
+    // candidate id is offered by more than one provider.
+    let parent_provider = parent_model.and_then(provider_of);
+    let preferred_provider = agent
+        .model_provider
+        .as_ref()
+        .or(parent_provider.as_ref())
+        .map(ProviderId::as_str);
     // pi resolves the `inherit` sentinel through `resolveEffectiveSubagentModel` BEFORE building
     // candidates (`subagent-executor.ts:5864-5879` @v0.57.0), so it never reaches the predicate
     // upstream. Here it would: discovery hands `model: inherit` straight through as a `ModelId`
@@ -1000,7 +1029,12 @@ fn write_foreground_input_artifact(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
     use crate::extension::testsupport::seed_scope_fixture;
@@ -1030,6 +1064,8 @@ mod tests {
             extensions: None,
             extensions_from_default: false,
             subagent_only_extensions: Vec::new(),
+            exclude_tools: None,
+            allow_nested_subagents: None,
             model: model.map(ModelId::from),
             fallback_models: fallbacks.iter().map(|m| ModelId::from(*m)).collect(),
             thinking: None,
@@ -1047,6 +1083,8 @@ mod tests {
             default_async: None,
             default_timeout_ms: None,
             default_turn_budget: None,
+            default_acceptance: None,
+            acceptance_role: None,
             permission_rules: None,
             runner: None,
             memory: None,
@@ -1059,6 +1097,7 @@ mod tests {
             extra_fields: std::collections::BTreeMap::new(),
             override_info: None,
             model_source: None,
+            model_provider: None,
         }
     }
 
@@ -1101,7 +1140,11 @@ mod tests {
     /// parent to inherit from, has nothing to judge and takes the conservative arm.
     #[test]
     fn an_empty_ladder_forces_thinking_off() {
-        assert!(fork_requires_thinking_off(&gate_agent(None, &[]), None, None));
+        assert!(fork_requires_thinking_off(
+            &gate_agent(None, &[]),
+            None,
+            None
+        ));
     }
 
     /// The `inherit` sentinel is a REQUEST, never a model id. pi resolves it through
@@ -1182,7 +1225,14 @@ mod tests {
         let executor = SubagentExecutor::new();
         let dir = tempfile::tempdir().expect("tempdir");
         let err = executor
-            .run_foreground(dir.path(), "ghost", "do something", Some(ContextRequest::Fresh), None, None)
+            .run_foreground(
+                dir.path(),
+                "ghost",
+                "do something",
+                Some(ContextRequest::Fresh),
+                None,
+                None,
+            )
             .await
             .expect_err("unresolvable agent must fail before any subprocess spawn");
         assert!(matches!(err, SubagentError::AgentNotFound(_)));
@@ -1210,7 +1260,14 @@ mod tests {
         // exact same "ghost" name as the sibling discovery-failure test isolates this test's
         // assertion to purely WHICH error surfaces first.
         let err = executor
-            .run_foreground(dir.path(), "ghost", "do something", Some(ContextRequest::Fresh), None, None)
+            .run_foreground(
+                dir.path(),
+                "ghost",
+                "do something",
+                Some(ContextRequest::Fresh),
+                None,
+                None,
+            )
             .await
             .expect_err("a blocked depth ceiling must reject before agent discovery runs");
         assert!(
@@ -1262,5 +1319,4 @@ mod tests {
             "the caller must see pi's verbatim violation text, naming the model AND the patterns"
         );
     }
-
 }

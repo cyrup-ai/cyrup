@@ -6,12 +6,17 @@
 //!   `tree-selector.ts` + `navigateTree`, agent-session.ts:2704);
 //! - the `compactInstructions` startup bar (`chrome::render_compact_hints`, interactive-mode.ts:697)
 //!   showing at startup and dismissing on the first submission.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
+use super::harness::*;
 use crate::crossterm::event::KeyCode;
 use crate::{App, AppAction, AppCommand, SelectorKind, TreeNode, TreeSelector, UiTheme};
 use ratatui::backend::TestBackend;
-use super::harness::*;
 
 fn submit(app: &mut App<TestBackend>, line: &str) -> AppAction {
     app.editor_mut().set_text(line);
@@ -34,8 +39,14 @@ fn tree_selector_occupies_the_slot_and_renders() {
     app.draw().unwrap();
     let text = buf_text(&app);
     // Header + the bespoke glyph + the node labels reach the buffer (the editor is swapped out).
-    assert!(text.contains("Session Tree"), "tree header rendered:\n{text}");
-    assert!(text.contains("first prompt"), "first node label rendered:\n{text}");
+    assert!(
+        text.contains("Session Tree"),
+        "tree header rendered:\n{text}"
+    );
+    assert!(
+        text.contains("first prompt"),
+        "first node label rendered:\n{text}"
+    );
     assert!(text.contains('●'), "message glyph rendered:\n{text}");
 }
 
@@ -72,7 +83,11 @@ fn tree_selector_esc_cancels_and_restores_the_editor() {
     let action = app.handle_input(&key(KeyCode::Esc));
     assert_eq!(action, AppAction::Redraw);
     assert_eq!(app.active_selector_kind(), None, "slot closed on cancel");
-    assert_eq!(app.editor_mut().text(), "draft", "editor restored on cancel");
+    assert_eq!(
+        app.editor_mut().text(),
+        "draft",
+        "editor restored on cancel"
+    );
 }
 
 #[test]
@@ -81,8 +96,14 @@ fn startup_hint_bar_shows_then_dismisses_on_first_submission() {
     app.draw().unwrap();
     let before = buf_text(&app);
     // The compact bar resolves its keys from the live keymap; the literal affordances are stable.
-    assert!(before.contains("interrupt"), "startup interrupt hint:\n{before}");
-    assert!(before.contains("commands"), "startup /commands hint:\n{before}");
+    assert!(
+        before.contains("interrupt"),
+        "startup interrupt hint:\n{before}"
+    );
+    assert!(
+        before.contains("commands"),
+        "startup /commands hint:\n{before}"
+    );
     assert!(before.contains("bash"), "startup ! bash hint:\n{before}");
 
     // A real prompt submission dismisses the bar (Pi drops compactInstructions once chatting starts).
@@ -90,7 +111,10 @@ fn startup_hint_bar_shows_then_dismisses_on_first_submission() {
     assert!(!app.state().show_startup_hints, "flag cleared on submit");
     app.draw().unwrap();
     let after = buf_text(&app);
-    assert!(!after.contains("commands"), "hint bar gone after submission:\n{after}");
+    assert!(
+        !after.contains("commands"),
+        "hint bar gone after submission:\n{after}"
+    );
 }
 
 #[test]
@@ -102,5 +126,8 @@ fn startup_hint_bar_suppressed_while_a_selector_owns_the_slot() {
     );
     app.draw().unwrap();
     let text = buf_text(&app);
-    assert!(!text.contains("· commands"), "no startup bar under a selector:\n{text}");
+    assert!(
+        !text.contains("· commands"),
+        "no startup bar under a selector:\n{text}"
+    );
 }

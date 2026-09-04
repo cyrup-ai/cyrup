@@ -36,9 +36,10 @@ impl InputEditor {
 
         // 2. Popup-open routing (before normal editing).
         if self.autocomplete.is_some()
-            && let Some(outcome) = self.handle_popup_key(ev) {
-                return outcome;
-            }
+            && let Some(outcome) = self.handle_popup_key(ev)
+        {
+            return outcome;
+        }
 
         // 3. Resolve a bound editor action.
         if let Some(action) = self.keymap.action_for(ev) {
@@ -55,16 +56,16 @@ impl InputEditor {
         // 4. Printable insert (no Ctrl/Super; Alt+char already routed via keymap or ignored).
         if let KeyCode::Char(c) = ev.code
             && !ev.modifiers.contains(KeyModifiers::CONTROL)
-                && !ev.modifiers.contains(KeyModifiers::SUPER)
-                && !ev.modifiers.contains(KeyModifiers::ALT)
-            {
-                self.push_undo_for_type(c);
-                self.insert_char(c);
-                self.last_action = LastAction::Type;
-                self.exit_history();
-                self.update_autocomplete();
-                return EditorOutcome::Edited;
-            }
+            && !ev.modifiers.contains(KeyModifiers::SUPER)
+            && !ev.modifiers.contains(KeyModifiers::ALT)
+        {
+            self.push_undo_for_type(c);
+            self.insert_char(c);
+            self.last_action = LastAction::Type;
+            self.exit_history();
+            self.update_autocomplete();
+            return EditorOutcome::Edited;
+        }
         EditorOutcome::Ignored
     }
 
@@ -149,7 +150,10 @@ impl InputEditor {
         // Any non-vertical action re-seeds the sticky goal column on the next Up/Down (spec/tui/03 §4.2).
         // `PageUp`/`PageDown` ARE vertical motion upstream — `pageScroll` shares `moveToVisualLine`
         // (and therefore `preferredVisualCol`) with `moveCursor` (`editor.ts:1373,1863`).
-        if !matches!(action, E::CursorUp | E::CursorDown | E::PageUp | E::PageDown) {
+        if !matches!(
+            action,
+            E::CursorUp | E::CursorDown | E::PageUp | E::PageDown
+        ) {
             self.reset_preferred_col();
         }
         match action {

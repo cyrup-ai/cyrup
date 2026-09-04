@@ -21,11 +21,11 @@ impl SessionManager {
     /// Append any Pi `AgentMessage` (including the `bashExecution`/`custom` roles) inside a
     /// `type:"message"` entry (Pi `appendMessage(Message | CustomMessage | BashExecutionMessage)`,
     /// `session-manager.ts:954`).
-    pub fn append_agent_message(
-        &mut self,
-        message: AgentMessage,
-    ) -> Result<EntryId, SessionError> {
-        self.push_entry(Entry::known(KnownEntry::Message { base: self.make_base(), message }))
+    pub fn append_agent_message(&mut self, message: AgentMessage) -> Result<EntryId, SessionError> {
+        self.push_entry(Entry::known(KnownEntry::Message {
+            base: self.make_base(),
+            message,
+        }))
     }
 
     pub fn append_model_change(
@@ -40,10 +40,7 @@ impl SessionManager {
         }))
     }
 
-    pub fn append_thinking_level_change(
-        &mut self,
-        level: &str,
-    ) -> Result<EntryId, SessionError> {
+    pub fn append_thinking_level_change(&mut self, level: &str) -> Result<EntryId, SessionError> {
         self.push_entry(Entry::known(KnownEntry::ThinkingLevelChange {
             base: self.make_base(),
             thinking_level: level.to_string(),

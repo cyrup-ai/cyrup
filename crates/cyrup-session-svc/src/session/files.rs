@@ -41,7 +41,8 @@ impl AgentSession {
     pub fn list_sessions(&self) -> Vec<cyrup_session::listing::SessionInfo> {
         let dir = &self.services.session_dir;
         let default_dir =
-            cyrup_session::SessionLayout::new(self.sessions_root(), self.services.cwd.clone()).dir();
+            cyrup_session::SessionLayout::new(self.sessions_root(), self.services.cwd.clone())
+                .dir();
         let cwd_filter = (*dir != default_dir).then_some(self.services.cwd.as_path());
         cyrup_session::listing::list_in_dir(dir, cwd_filter, None)
     }
@@ -84,7 +85,10 @@ impl AgentSession {
     /// The on-disk path of this session's own JSONL, if the live manager exposes one (used to guard the
     /// active session from a `/resume` delete/rename).
     fn manager_path(&self) -> Option<std::path::PathBuf> {
-        self.manager.try_lock().ok().and_then(|g| g.session_file().map(Path::to_path_buf))
+        self.manager
+            .try_lock()
+            .ok()
+            .and_then(|g| g.session_file().map(Path::to_path_buf))
     }
 }
 

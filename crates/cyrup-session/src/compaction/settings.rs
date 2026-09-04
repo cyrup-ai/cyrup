@@ -51,7 +51,10 @@ pub struct BranchSummarySettings {
 
 impl Default for BranchSummarySettings {
     fn default() -> Self {
-        Self { reserve_tokens: default_reserve(), skip_prompt: false }
+        Self {
+            reserve_tokens: default_reserve(),
+            skip_prompt: false,
+        }
     }
 }
 

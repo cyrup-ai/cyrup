@@ -21,20 +21,27 @@ use std::path::Path;
 use anyhow::Result;
 use cyrup_config::{ConfigDirs, Settings, SettingsManager, SettingsScope, TrustStore};
 use cyrup_resources::{
-    discover, DiscoveryConfig, InstallScope, PackageManager, PackageSource, PackageStore,
-    ResourceOrigin, ResourceOverrides, ResourceScope, UpdateTarget,
+    DiscoveryConfig, InstallScope, PackageManager, PackageSource, PackageStore, ResourceOrigin,
+    ResourceOverrides, ResourceScope, UpdateTarget, discover,
 };
 use cyrup_sdk::core::{CancelToken, PackageId};
 use cyrup_tui::{
-    run_startup_selector, ConfigKind, ConfigRow, ConfigScope, ConfigSelector, ConfigToggle,
-    ConfigWriteScope, ProjectOverrideState,
+    ConfigKind, ConfigRow, ConfigScope, ConfigSelector, ConfigToggle, ConfigWriteScope,
+    ProjectOverrideState, run_startup_selector,
 };
 
 /// The recognized subcommand verbs (Pi: `install`/`remove`/`update`/`list` + `uninstall` alias +
 /// `config`, plus cyrup's `mcp`). `config` and `mcp` are both dispatched specially — neither takes
 /// `PackageCommand`'s flag grammar.
-const SUBCOMMANDS: [&str; 7] =
-    ["install", "remove", "uninstall", "update", "list", "config", "mcp"];
+const SUBCOMMANDS: [&str; 7] = [
+    "install",
+    "remove",
+    "uninstall",
+    "update",
+    "list",
+    "config",
+    "mcp",
+];
 
 /// Whether `argv` (program name already stripped) begins with a package/config subcommand.
 pub fn first_subcommand(argv: &[String]) -> Option<&str> {
@@ -228,7 +235,8 @@ pub fn parse_package_command(argv: &[String]) -> Option<ParsedCommand> {
     let mut update_target: Option<UpdateTargetSel> = None;
     let mut show_extensions_skipped_note = false;
     if command == PackageCommand::Update {
-        if all_flag && (self_flag || extensions_flag || models_flag || extension_flag_source.is_some())
+        if all_flag
+            && (self_flag || extensions_flag || models_flag || extension_flag_source.is_some())
         {
             conflicting_options.get_or_insert_with(|| {
                 "--all cannot be combined with --self, --extensions, --models, or --extension"
@@ -441,7 +449,8 @@ async fn saved_trusted(dirs: &ConfigDirs) -> bool {
     let store = TrustStore::new(dirs.trust_path());
     store
         .nearest(&dirs.cwd)
-        .await.ok()
+        .await
+        .ok()
         .flatten()
         .map(|entry| entry.decision.is_trusted())
         .unwrap_or(false)
@@ -459,7 +468,10 @@ pub async fn dispatch(
     if argv.first().map(String::as_str) == Some("mcp") {
         // `.get(1..)` rather than `&argv[1..]`: the slice is provably in bounds but the workspace
         // denies `clippy::indexing_slicing`.
-        return Ok(Some(crate::mcp_cmd::run(argv.get(1..).unwrap_or_default(), dirs)));
+        return Ok(Some(crate::mcp_cmd::run(
+            argv.get(1..).unwrap_or_default(),
+            dirs,
+        )));
     }
 
     // `config` is handled specially (Pi `handleConfigCommand`).
@@ -554,19 +566,20 @@ pub async fn dispatch(
     // diagnostics, before the settings-manager/trust block at `:737-752` — because a catalog refresh
     // touches no project resource and so must not be gated on project trust or pay for a settings
     // load. Upstream's `catch` renders `Error: {message}` and sets exit 1 (`:729-733`).
-    if opts.command == PackageCommand::Update
-        && opts.update_target == Some(UpdateTargetSel::Models)
+    if opts.command == PackageCommand::Update && opts.update_target == Some(UpdateTargetSel::Models)
     {
-        return Ok(Some(match crate::provider::refresh_model_catalogs(dirs).await {
-            Ok(()) => {
-                println!("Model catalogs refreshed");
-                0
-            }
-            Err(message) => {
-                eprintln!("Error: {message}");
-                1
-            }
-        }));
+        return Ok(Some(
+            match crate::provider::refresh_model_catalogs(dirs).await {
+                Ok(()) => {
+                    println!("Model catalogs refreshed");
+                    0
+                }
+                Err(message) => {
+                    eprintln!("Error: {message}");
+                    1
+                }
+            },
+        ));
     }
 
     // Saved-trust lookup + override (Pi createCommandSettingsManager); the interactive trust prompt
@@ -770,7 +783,9 @@ async fn run_update(
                 // wins, and the raw fallback keeps legacy rows updatable.
                 let mut report = None;
                 for id in remove_candidate_ids(src) {
-                    let r = manager.update(UpdateTarget::One(id), cancel.clone()).await?;
+                    let r = manager
+                        .update(UpdateTarget::One(id), cancel.clone())
+                        .await?;
                     let matched = !r.updated.is_empty()
                         || !r.failed.is_empty()
                         || !r.skipped_pinned.is_empty();
@@ -833,11 +848,20 @@ async fn run_config(dirs: &ConfigDirs, trusted: bool, local: bool) -> Result<i32
     // Seed the per-(scope,kind) settings arrays from disk; each toggle read-modify-writes its own
     // scope's array (Pi's `getGlobalSettings()`/`getProjectSettings()` array reads, config-selector.ts).
     let mut arrays: HashMap<(ConfigScope, ConfigKind), Vec<String>> = HashMap::new();
-    for kind in
-        [ConfigKind::Extensions, ConfigKind::Skills, ConfigKind::Prompts, ConfigKind::Themes]
-    {
-        arrays.insert((ConfigScope::User, kind), settings_array(settings.global(), kind));
-        arrays.insert((ConfigScope::Project, kind), settings_array(settings.project(), kind));
+    for kind in [
+        ConfigKind::Extensions,
+        ConfigKind::Skills,
+        ConfigKind::Prompts,
+        ConfigKind::Themes,
+    ] {
+        arrays.insert(
+            (ConfigScope::User, kind),
+            settings_array(settings.global(), kind),
+        );
+        arrays.insert(
+            (ConfigScope::Project, kind),
+            settings_array(settings.project(), kind),
+        );
     }
 
     // `globalResolvedPaths` (`package-manager-cli.ts:655-660`): the SAME resolve run against a
@@ -846,8 +870,7 @@ async fn run_config(dirs: &ConfigDirs, trusted: bool, local: bool) -> Result<i32
     // `isInheritedGlobalItem` (`:781-783`). Skipped when the project is untrusted, because then the
     // two resolves are the same object upstream (`:661-663`).
     let inherited_keys: Vec<String> = if trusted {
-        let global_settings =
-            SettingsManager::load(crate::file_settings_store(dirs), false);
+        let global_settings = SettingsManager::load(crate::file_settings_store(dirs), false);
         resolve_config_rows(dirs, &global_settings, false)
             .await?
             .iter()
@@ -897,9 +920,17 @@ async fn run_config(dirs: &ConfigDirs, trusted: bool, local: bool) -> Result<i32
         // `toggleTopLevelResource`, config-selector.ts:471-480): enabling writes `+pattern`,
         // disabling `-pattern`.
         entry.retain(|p| strip_override_marker(p) != toggle.pattern);
-        entry.push(format!("{}{}", if toggle.enabled { '+' } else { '-' }, toggle.pattern));
+        entry.push(format!(
+            "{}{}",
+            if toggle.enabled { '+' } else { '-' },
+            toggle.pattern
+        ));
         let value = serde_json::Value::Array(
-            entry.iter().cloned().map(serde_json::Value::String).collect(),
+            entry
+                .iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
         );
         // Awaited HERE, before the loop redraws: the row the selector is about to paint as
         // enabled/disabled is already on disk. `run_startup_selector`'s `Err` (a dead terminal
@@ -1023,12 +1054,27 @@ async fn resolve_config_rows(
     let enabled = discover(&enabled_disc, CancelToken::new()).await?;
     let universe = discover(&universe_disc, CancelToken::new()).await?;
 
-    let enabled_skills: HashSet<_> =
-        enabled.registry.skills.all().iter().map(|s| s.skill_md.clone()).collect();
-    let enabled_prompts: HashSet<_> =
-        enabled.registry.prompts.all().iter().map(|p| p.path.clone()).collect();
-    let enabled_themes: HashSet<_> =
-        enabled.registry.themes.all().iter().filter_map(|t| t.origin_path.clone()).collect();
+    let enabled_skills: HashSet<_> = enabled
+        .registry
+        .skills
+        .all()
+        .iter()
+        .map(|s| s.skill_md.clone())
+        .collect();
+    let enabled_prompts: HashSet<_> = enabled
+        .registry
+        .prompts
+        .all()
+        .iter()
+        .map(|p| p.path.clone())
+        .collect();
+    let enabled_themes: HashSet<_> = enabled
+        .registry
+        .themes
+        .all()
+        .iter()
+        .filter_map(|t| t.origin_path.clone())
+        .collect();
     // `loose_extensions` carries the settings verdict on each entry rather than dropping the
     // disabled ones (`LooseExtension::enabled`), so the enabled set is the `enabled` pass's
     // surviving subset — the same shape the three sets above have.
@@ -1047,7 +1093,8 @@ async fn resolve_config_rows(
     // (config-selector.ts:153, the first of four). The widget re-sorts by `ConfigKind::order()`
     // anyway, so this is presentation-neutral; it keeps the collector reading like upstream.
     for ext in &universe.registry.loose_extensions {
-        let Some((cscope, pattern, base_dir)) = loose_pattern(ext.scope, &ext.root, &ext.path, dirs)
+        let Some((cscope, pattern, base_dir)) =
+            loose_pattern(ext.scope, &ext.root, &ext.path, dirs)
         else {
             continue;
         };
@@ -1064,8 +1111,11 @@ async fn resolve_config_rows(
         });
     }
     for skill in universe.registry.skills.all() {
-        let ResourceOrigin::LooseFile { scope, root } = &skill.origin else { continue };
-        let Some((cscope, pattern, base_dir)) = loose_pattern(*scope, root, &skill.skill_md, dirs) else {
+        let ResourceOrigin::LooseFile { scope, root } = &skill.origin else {
+            continue;
+        };
+        let Some((cscope, pattern, base_dir)) = loose_pattern(*scope, root, &skill.skill_md, dirs)
+        else {
             continue;
         };
         if !seen.insert((ConfigKind::Skills, skill.skill_md.clone())) {
@@ -1081,8 +1131,11 @@ async fn resolve_config_rows(
         });
     }
     for prompt in universe.registry.prompts.all() {
-        let ResourceOrigin::LooseFile { scope, root } = &prompt.origin else { continue };
-        let Some((cscope, pattern, base_dir)) = loose_pattern(*scope, root, &prompt.path, dirs) else {
+        let ResourceOrigin::LooseFile { scope, root } = &prompt.origin else {
+            continue;
+        };
+        let Some((cscope, pattern, base_dir)) = loose_pattern(*scope, root, &prompt.path, dirs)
+        else {
             continue;
         };
         if !seen.insert((ConfigKind::Prompts, prompt.path.clone())) {
@@ -1098,8 +1151,12 @@ async fn resolve_config_rows(
         });
     }
     for theme in universe.registry.themes.all() {
-        let ResourceOrigin::LooseFile { scope, root } = &theme.origin else { continue };
-        let Some(path) = theme.origin_path.clone() else { continue };
+        let ResourceOrigin::LooseFile { scope, root } = &theme.origin else {
+            continue;
+        };
+        let Some(path) = theme.origin_path.clone() else {
+            continue;
+        };
         let Some((cscope, pattern, base_dir)) = loose_pattern(*scope, root, &path, dirs) else {
             continue;
         };
@@ -1165,7 +1222,10 @@ fn display_base_dir(base: &Path, home: &Path) -> String {
 /// A skill's display name (Pi config-selector.ts:129-133): the parent directory for a `SKILL.md`,
 /// else the file name.
 fn skill_display_name(path: &Path) -> String {
-    let file = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let file = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
     if file == "SKILL.md" {
         path.parent()
             .and_then(|p| p.file_name())
@@ -1178,7 +1238,9 @@ fn skill_display_name(path: &Path) -> String {
 
 /// A prompt/theme display name: the file name (Pi config-selector.ts:139).
 fn file_display_name(path: &Path) -> String {
-    path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+    path.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default()
 }
 
 /// An extension display name (Pi config-selector.ts:131-140, the `resourceType === "extensions" &&
@@ -1191,8 +1253,14 @@ fn file_display_name(path: &Path) -> String {
 /// naming its entry file, e.g. `demo/index.ts` (cyrup: `extensions/demo` → parent `extensions`, so
 /// the directory name `demo` is what falls out of the same rule).
 fn ext_display_name(path: &Path) -> String {
-    let file = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-    let parent = path.parent().and_then(Path::file_name).map(|n| n.to_string_lossy().to_string());
+    let file = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let parent = path
+        .parent()
+        .and_then(Path::file_name)
+        .map(|n| n.to_string_lossy().to_string());
     match parent {
         Some(p) if p != "extensions" => format!("{p}/{file}"),
         _ => file,
@@ -1364,7 +1432,10 @@ mod tests {
     fn update_models_is_a_target_with_pis_two_conflict_messages() {
         let models = parse_package_command(&v(&["update", "--models"])).unwrap();
         assert_eq!(models.update_target, Some(UpdateTargetSel::Models));
-        assert!(models.invalid_option.is_none(), "--models is a known update flag");
+        assert!(
+            models.invalid_option.is_none(),
+            "--models is a known update flag"
+        );
         assert!(models.conflicting_options.is_none());
         // It is NOT the bare-update path, so pi's extensions-skipped note must stay silent.
         assert!(!models.show_extensions_skipped_note);
@@ -1382,7 +1453,8 @@ mod tests {
                 "expected pi's --models conflict message for {other}"
             );
         }
-        let with_ext = parse_package_command(&v(&["update", "--models", "--extension", "p"])).unwrap();
+        let with_ext =
+            parse_package_command(&v(&["update", "--models", "--extension", "p"])).unwrap();
         assert!(with_ext.conflicting_options.is_some());
 
         // `:334-336` — combined with a positional source.
@@ -1486,7 +1558,10 @@ mod tests {
 
         assert!(install.contains("record it in the package registry"));
         assert!(remove.contains("from the package registry"));
-        assert!(install.contains("packages.json"), "the -l flag names the file it writes");
+        assert!(
+            install.contains("packages.json"),
+            "the -l flag names the file it writes"
+        );
         assert!(remove.contains("packages.json"));
         for (name, text) in [("install", &install), ("remove", &remove)] {
             assert!(
@@ -1499,9 +1574,16 @@ mod tests {
         let examples: Vec<&str> = remove
             .lines()
             .filter_map(|l| l.trim().strip_prefix("cyrup remove "))
-            .chain(remove.lines().filter_map(|l| l.trim().strip_prefix("cyrup uninstall ")))
+            .chain(
+                remove
+                    .lines()
+                    .filter_map(|l| l.trim().strip_prefix("cyrup uninstall ")),
+            )
             .collect();
-        assert!(!examples.is_empty(), "the remove help must keep working examples");
+        assert!(
+            !examples.is_empty(),
+            "the remove help must keep working examples"
+        );
         for example in &examples {
             assert!(
                 PackageSource::parse(example).is_ok(),
@@ -1509,7 +1591,10 @@ mod tests {
             );
         }
         // …which is exactly what `npm:` is not.
-        assert!(!remove.contains("npm:"), "npm sources cannot be installed, so they cannot be removed");
+        assert!(
+            !remove.contains("npm:"),
+            "npm sources cannot be installed, so they cannot be removed"
+        );
     }
 
     /// SEAM-078 — `--self`, `--all`, `--force` and the bare/`pi` short forms all land on the
@@ -1529,7 +1614,10 @@ mod tests {
             help.contains(&format!("cargo install --git {SELF_UPDATE_REPO} cyrup")),
             "the help must name the route that works: {help}"
         );
-        assert!(!help.contains("package manager"), "there is no package manager for this build");
+        assert!(
+            !help.contains("package manager"),
+            "there is no package manager for this build"
+        );
         for flag in ["--self ", "--all ", "--force "] {
             let line = help
                 .lines()
@@ -1580,11 +1668,19 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let d = dirs(tmp.path());
-        assert_eq!(dispatch(&v(&["config", "--help"]), &d, None).await.unwrap(), Some(0));
-        assert_eq!(dispatch(&v(&["config", "-h"]), &d, None).await.unwrap(), Some(0));
+        assert_eq!(
+            dispatch(&v(&["config", "--help"]), &d, None).await.unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            dispatch(&v(&["config", "-h"]), &d, None).await.unwrap(),
+            Some(0)
+        );
         // `--help` wins over the untrusted-project guard, i.e. it is checked first (`:612` < `:648`).
         assert_eq!(
-            dispatch(&v(&["config", "-l", "--help"]), &d, None).await.unwrap(),
+            dispatch(&v(&["config", "-l", "--help"]), &d, None)
+                .await
+                .unwrap(),
             Some(0),
             "help must be answered before the trust guard"
         );
@@ -1596,8 +1692,16 @@ mod tests {
 
         // The rest of upstream's scan (`:626-636`): an unknown option and an unexpected positional
         // are diagnostics, not silently-ignored arguments.
-        assert_eq!(dispatch(&v(&["config", "--bogus"]), &d, None).await.unwrap(), Some(1));
-        assert_eq!(dispatch(&v(&["config", "skills"]), &d, None).await.unwrap(), Some(1));
+        assert_eq!(
+            dispatch(&v(&["config", "--bogus"]), &d, None)
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            dispatch(&v(&["config", "skills"]), &d, None).await.unwrap(),
+            Some(1)
+        );
     }
 
     /// CFG-055 — `remove`/`update <source>` must key off the id `install` STORED, not the string the
@@ -1718,9 +1822,15 @@ mod tests {
         let mut arrays: HashMap<(ConfigScope, ConfigKind), Vec<String>> = HashMap::new();
         arrays.insert(
             (ConfigScope::Project, ConfigKind::Skills),
-            vec!["-skills/a/SKILL.md".to_string(), "+skills/a/SKILL.md".to_string()],
+            vec![
+                "-skills/a/SKILL.md".to_string(),
+                "+skills/a/SKILL.md".to_string(),
+            ],
         );
-        assert_eq!(config_override_states(&rows, &arrays), vec![ProjectOverrideState::Load]);
+        assert_eq!(
+            config_override_states(&rows, &arrays),
+            vec![ProjectOverrideState::Load]
+        );
     }
 
     #[test]

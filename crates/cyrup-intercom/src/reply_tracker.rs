@@ -45,7 +45,10 @@ fn matches_pending_sender(context: &IntercomContext, to: &str) -> bool {
 ///
 /// Note the exact-id tier can only exceed one match when two pending asks share a sender, and that
 /// the prefix tier is evaluated LAST, so an id that is also somebody's exact name resolves by name.
-fn resolve_pending_sender(pending: &[IntercomContext], to: &str) -> Result<IntercomContext, String> {
+fn resolve_pending_sender(
+    pending: &[IntercomContext],
+    to: &str,
+) -> Result<IntercomContext, String> {
     let exact_id: Vec<&IntercomContext> = pending.iter().filter(|c| c.from.id == to).collect();
     if exact_id.len() == 1
         && let Some(hit) = exact_id.first()
@@ -53,7 +56,9 @@ fn resolve_pending_sender(pending: &[IntercomContext], to: &str) -> Result<Inter
         return Ok((*hit).clone());
     }
     if exact_id.len() > 1 {
-        return Err(format!("Multiple pending asks from session ID \"{to}\" — specify `replyTo`"));
+        return Err(format!(
+            "Multiple pending asks from session ID \"{to}\" — specify `replyTo`"
+        ));
     }
 
     let lower_to = to.to_lowercase();
@@ -72,8 +77,10 @@ fn resolve_pending_sender(pending: &[IntercomContext], to: &str) -> Result<Inter
         ));
     }
 
-    let id_prefix: Vec<&IntercomContext> =
-        pending.iter().filter(|c| c.from.id.starts_with(to)).collect();
+    let id_prefix: Vec<&IntercomContext> = pending
+        .iter()
+        .filter(|c| c.from.id.starts_with(to))
+        .collect();
     if id_prefix.len() == 1
         && let Some(hit) = id_prefix.first()
     {
@@ -111,10 +118,20 @@ impl ReplyTracker {
 
     /// Record an inbound message; asks (`expects_reply`) are added to the pending map
     /// (`recordIncomingMessage`, `reply-tracker.ts:25-31`).
-    pub fn record_incoming_message(&mut self, from: SessionInfo, message: Message, received_at: u64) -> IntercomContext {
-        let context = IntercomContext { from, message, received_at };
+    pub fn record_incoming_message(
+        &mut self,
+        from: SessionInfo,
+        message: Message,
+        received_at: u64,
+    ) -> IntercomContext {
+        let context = IntercomContext {
+            from,
+            message,
+            received_at,
+        };
         if context.message.expects_reply == Some(true) {
-            self.pending_asks.insert(context.message.id.clone(), context.clone());
+            self.pending_asks
+                .insert(context.message.id.clone(), context.clone());
         }
         context
     }
@@ -223,13 +240,52 @@ impl ReplyTracker {
             if now.saturating_sub(c.received_at) > self.ask_timeout_ms {
                 return false;
             }
-            c.from.id == to || c.from.name.as_deref().map(str::to_lowercase) == Some(lower_to.clone())
+            c.from.id == to
+                || c.from.name.as_deref().map(str::to_lowercase) == Some(lower_to.clone())
         });
         let first = candidates.next()?;
         if candidates.next().is_some() {
             return None;
         }
         Some(first.clone())
+    }
+
+    /// `findActiveReplyTargetMismatch` (`v0.13.0 reply-tracker.ts:124-130`; added by v0.12.1
+    /// `5fe0ee3` #119 "fix: guard active intercom replies", CHANGELOG 0.12.1: "Refuse non-reply
+    /// `send` calls to a different target during a turn triggered by an inbound ask, preventing
+    /// CWD hierarchy or roster guesses from misdirecting replies"):
+    ///
+    /// ```text
+    /// this.pruneExpired(now);
+    /// if (!this.currentTurnContext?.message.expectsReply) return null;
+    /// return this.currentTurnContext.from.id === to ? null : this.currentTurnContext;
+    /// ```
+    ///
+    /// `Some(asker)` means the CURRENT turn was triggered by that peer's ask and `to` — the
+    /// RESOLVED send target, not the caller's `to` — is not that peer's id, so a plain `send` would
+    /// go to the wrong session. `None` means there is nothing to guard: no turn context, a
+    /// context that was a plain message rather than an ask, or a target that IS the asker.
+    ///
+    /// The comparison is on `from.id` ONLY — no name arm, no prefix arm (upstream
+    /// `reply-tracker.test.ts` "active ask context does not trust sender names as destination
+    /// identity"): the caller has already resolved names to ids, so a bare name reaching here is
+    /// a target that did NOT resolve, and a sender's name is never proof of a destination.
+    /// Unlike [`Self::find_unique_pending_ask_from`] this DOES prune (hence `&mut self`), exactly
+    /// as upstream does — an ask that has timed out cannot make its turn a reply turn.
+    pub fn find_active_reply_target_mismatch(
+        &mut self,
+        to: &str,
+        now: u64,
+    ) -> Option<IntercomContext> {
+        self.prune_expired(now);
+        let current = self.current_turn_context.as_ref()?;
+        if current.message.expects_reply != Some(true) {
+            return None;
+        }
+        if current.from.id == to {
+            return None;
+        }
+        Some(current.clone())
     }
 
     /// Mark an ask replied (`markReplied` → `dismissPendingAsk`, `:95-109`).
@@ -240,8 +296,14 @@ impl ReplyTracker {
     /// Drop a pending ask + any queued/current turn context for it (`dismissPendingAsk`, `:99-109`).
     pub fn dismiss_pending_ask(&mut self, reply_to: &str) {
         self.pending_asks.remove(reply_to);
-        self.pending_turn_contexts.retain(|c| c.message.id != reply_to);
-        if self.current_turn_context.as_ref().map(|c| c.message.id.as_str()) == Some(reply_to) {
+        self.pending_turn_contexts
+            .retain(|c| c.message.id != reply_to);
+        if self
+            .current_turn_context
+            .as_ref()
+            .map(|c| c.message.id.as_str())
+            == Some(reply_to)
+        {
             self.current_turn_context = None;
         }
     }
@@ -251,7 +313,10 @@ impl ReplyTracker {
     /// the body carries `Run: <run_id>`, `formatChildOrchestratorMessage`, `index.ts:104-119`).
     #[must_use]
     pub fn find_pending_containing(&self, needle: &str) -> Option<IntercomContext> {
-        self.pending_asks.values().find(|c| c.message.content.text.contains(needle)).cloned()
+        self.pending_asks
+            .values()
+            .find(|c| c.message.content.text.contains(needle))
+            .cloned()
     }
 
     /// List pending asks, sorted by receipt time, pruning expired (`listPending`, `:111-114`).
@@ -337,9 +402,7 @@ impl OutboundReplyWaiter {
                 from_matches && reply_matches
             }
         };
-        if matched
-            && let Some(slot) = guard.take()
-        {
+        if matched && let Some(slot) = guard.take() {
             let _ = slot.tx.send(Ok(message.clone()));
             return true;
         }
@@ -378,7 +441,10 @@ impl OutboundReplyWaiter {
     /// Whether a waiter is currently outstanding.
     #[must_use]
     pub fn is_waiting(&self) -> bool {
-        self.slot.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+        self.slot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
 }
 
@@ -415,7 +481,11 @@ mod tests {
             timestamp: 0u64.into(),
             reply_to: None,
             expects_reply: Some(true),
-            content: MessageContent { text: "q".to_string(), attachments: None, ..Default::default() },
+            content: MessageContent {
+                text: "q".to_string(),
+                attachments: None,
+                ..Default::default()
+            },
             ..Default::default()
         }
     }
@@ -426,7 +496,9 @@ mod tests {
         let mut rt = ReplyTracker::new(600_000);
         rt.record_incoming_message(session("s1", Some("alice")), ask("q1"), now_ms());
         rt.record_incoming_message(session("s2", Some("bob")), ask("q2"), now_ms());
-        let target = rt.resolve_reply_target(None, Some("q2"), now_ms()).expect("resolves");
+        let target = rt
+            .resolve_reply_target(None, Some("q2"), now_ms())
+            .expect("resolves");
         assert_eq!(target.message.id, "q2");
         assert_eq!(target.from.id, "s2");
     }
@@ -435,7 +507,9 @@ mod tests {
     fn resolve_single_pending_without_hint() {
         let mut rt = ReplyTracker::new(600_000);
         rt.record_incoming_message(session("s1", Some("alice")), ask("q1"), now_ms());
-        let target = rt.resolve_reply_target(None, None, now_ms()).expect("single pending resolves");
+        let target = rt
+            .resolve_reply_target(None, None, now_ms())
+            .expect("single pending resolves");
         assert_eq!(target.message.id, "q1");
     }
 
@@ -444,10 +518,14 @@ mod tests {
         let mut rt = ReplyTracker::new(600_000);
         rt.record_incoming_message(session("s1", Some("alice")), ask("q1"), now_ms());
         rt.record_incoming_message(session("s2", Some("bob")), ask("q2"), now_ms());
-        let err = rt.resolve_reply_target(None, None, now_ms()).expect_err("ambiguous");
+        let err = rt
+            .resolve_reply_target(None, None, now_ms())
+            .expect_err("ambiguous");
         assert!(err.contains("specify"));
         // With a `to` hint that uniquely matches, it resolves.
-        let target = rt.resolve_reply_target(Some("alice"), None, now_ms()).expect("resolves by name");
+        let target = rt
+            .resolve_reply_target(Some("alice"), None, now_ms())
+            .expect("resolves by name");
         assert_eq!(target.from.id, "s1");
     }
 
@@ -457,23 +535,36 @@ mod tests {
     #[test]
     fn explicit_to_overrides_current_turn_context() {
         let mut rt = ReplyTracker::new(600_000);
-        let current = rt.record_incoming_message(session("planner-id", Some("planner")), ask("ask-1"), 1000);
+        let current =
+            rt.record_incoming_message(session("planner-id", Some("planner")), ask("ask-1"), 1000);
         rt.record_incoming_message(session("reviewer-id", Some("reviewer")), ask("ask-2"), 1001);
         rt.queue_turn_context(current);
         rt.begin_turn(1002);
 
         // Sanity: with no `to`, the current turn context still wins (the other ordering).
-        let bare = rt.resolve_reply_target(None, None, 1003).expect("current turn context resolves");
-        assert_eq!(bare.message.id, "ask-1", "no `to` must fall back to the current turn context");
+        let bare = rt
+            .resolve_reply_target(None, None, 1003)
+            .expect("current turn context resolves");
+        assert_eq!(
+            bare.message.id, "ask-1",
+            "no `to` must fall back to the current turn context"
+        );
         assert_eq!(bare.from.id, "planner-id");
 
         // The inverted-precedence bug: `to` must beat the current turn context.
-        let target = rt.resolve_reply_target(Some("reviewer"), None, 1003).expect("`to` resolves");
-        assert_eq!(target.message.id, "ask-2", "explicit `to` must override the current turn context");
+        let target = rt
+            .resolve_reply_target(Some("reviewer"), None, 1003)
+            .expect("`to` resolves");
+        assert_eq!(
+            target.message.id, "ask-2",
+            "explicit `to` must override the current turn context"
+        );
         assert_eq!(target.from.id, "reviewer-id");
 
         // And a `to` that matches nothing must error rather than silently falling back.
-        let err = rt.resolve_reply_target(Some("missing"), None, 1003).expect_err("unmatched `to` errors");
+        let err = rt
+            .resolve_reply_target(Some("missing"), None, 1003)
+            .expect_err("unmatched `to` errors");
         assert_eq!(err, "No pending ask from \"missing\"");
     }
 
@@ -485,7 +576,9 @@ mod tests {
         rt.record_incoming_message(session("planner-id", Some("planner")), ask("ask-1"), 1000);
 
         // Sanity: with no `to`, the single pending ask resolves (the other ordering).
-        let bare = rt.resolve_reply_target(None, None, 1001).expect("single pending resolves");
+        let bare = rt
+            .resolve_reply_target(None, None, 1001)
+            .expect("single pending resolves");
         assert_eq!(bare.message.id, "ask-1");
 
         let err = rt
@@ -501,9 +594,27 @@ mod tests {
         rt.record_incoming_message(session("planner-id", Some("planner")), ask("ask-1"), 1000);
         rt.record_incoming_message(session("reviewer-id", Some("reviewer")), ask("ask-2"), 1001);
 
-        assert_eq!(rt.resolve_reply_target(Some("reviewer"), None, 1002).expect("by name").message.id, "ask-2");
-        assert_eq!(rt.resolve_reply_target(Some("planner-id"), None, 1002).expect("by id").message.id, "ask-1");
-        assert_eq!(rt.resolve_reply_target(Some("REVIEWER"), None, 1002).expect("case-insensitive").message.id, "ask-2");
+        assert_eq!(
+            rt.resolve_reply_target(Some("reviewer"), None, 1002)
+                .expect("by name")
+                .message
+                .id,
+            "ask-2"
+        );
+        assert_eq!(
+            rt.resolve_reply_target(Some("planner-id"), None, 1002)
+                .expect("by id")
+                .message
+                .id,
+            "ask-1"
+        );
+        assert_eq!(
+            rt.resolve_reply_target(Some("REVIEWER"), None, 1002)
+                .expect("case-insensitive")
+                .message
+                .id,
+            "ask-2"
+        );
     }
 
     // reply-tracker.ts:72-74 — two pending asks from the same sender is ambiguous, even when a
@@ -511,14 +622,17 @@ mod tests {
     #[test]
     fn explicit_to_with_multiple_matches_errors_over_turn_context() {
         let mut rt = ReplyTracker::new(600_000);
-        let first = rt.record_incoming_message(session("planner-id", Some("planner")), ask("ask-1"), 1000);
+        let first =
+            rt.record_incoming_message(session("planner-id", Some("planner")), ask("ask-1"), 1000);
         rt.record_incoming_message(session("planner-id", Some("planner")), ask("ask-2"), 1001);
         rt.queue_turn_context(first);
         rt.begin_turn(1002);
 
         // `v0.10.1 reply-tracker.ts:30-32`: two asks from ONE sender addressed by that sender's
         // NAME is the sender-name tier, so it is the "specify a full session ID or `replyTo`" text.
-        let err = rt.resolve_reply_target(Some("planner"), None, 1003).expect_err("ambiguous `to`");
+        let err = rt
+            .resolve_reply_target(Some("planner"), None, 1003)
+            .expect_err("ambiguous `to`");
         assert_eq!(
             err,
             "Multiple pending asks match sender name \"planner\" — specify a full session ID or `replyTo`"
@@ -534,15 +648,22 @@ mod tests {
         let mut rt = ReplyTracker::new(600_000);
         rt.record_incoming_message(session("0192aaaa-1111", None), ask("a1"), 1000);
         rt.record_incoming_message(session("0192aaaa-1111", None), ask("a2"), 1001);
-        let err = rt.resolve_reply_target(Some("0192aaaa-1111"), None, 1002).expect_err("exact-id collision");
-        assert_eq!(err, "Multiple pending asks from session ID \"0192aaaa-1111\" — specify `replyTo`");
+        let err = rt
+            .resolve_reply_target(Some("0192aaaa-1111"), None, 1002)
+            .expect_err("exact-id collision");
+        assert_eq!(
+            err,
+            "Multiple pending asks from session ID \"0192aaaa-1111\" — specify `replyTo`"
+        );
 
         // Tier 2: exact name shared by two DIFFERENT sender ids (what ICOM-040's 8-char alias made
         // routine). Note the ids share no prefix with the name, so the name tier is the one hit.
         let mut rt = ReplyTracker::new(600_000);
         rt.record_incoming_message(session("id-a", Some("worker")), ask("b1"), 1000);
         rt.record_incoming_message(session("id-b", Some("worker")), ask("b2"), 1001);
-        let err = rt.resolve_reply_target(Some("worker"), None, 1002).expect_err("name collision");
+        let err = rt
+            .resolve_reply_target(Some("worker"), None, 1002)
+            .expect_err("name collision");
         assert_eq!(
             err,
             "Multiple pending asks match sender name \"worker\" — specify a full session ID or `replyTo`"
@@ -552,18 +673,24 @@ mod tests {
         let mut rt = ReplyTracker::new(600_000);
         rt.record_incoming_message(session("0192f3c1-aaaa", Some("alpha")), ask("c1"), 1000);
         rt.record_incoming_message(session("0192f3c1-bbbb", Some("beta")), ask("c2"), 1001);
-        let err = rt.resolve_reply_target(Some("0192f3c1"), None, 1002).expect_err("prefix collision");
+        let err = rt
+            .resolve_reply_target(Some("0192f3c1"), None, 1002)
+            .expect_err("prefix collision");
         assert_eq!(
             err,
             "Multiple pending asks match ID prefix \"0192f3c1\" — use a longer session ID prefix or specify `replyTo`"
         );
         // …and a UNIQUE prefix resolves, which is the feature: `list` prints prefixes, so `reply`
         // must accept them.
-        let hit = rt.resolve_reply_target(Some("0192f3c1-a"), None, 1002).expect("unique prefix resolves");
+        let hit = rt
+            .resolve_reply_target(Some("0192f3c1-a"), None, 1002)
+            .expect("unique prefix resolves");
         assert_eq!(hit.message.id, "c1");
 
         // Tier 4: miss.
-        let err = rt.resolve_reply_target(Some("nobody"), None, 1002).expect_err("miss");
+        let err = rt
+            .resolve_reply_target(Some("nobody"), None, 1002)
+            .expect_err("miss");
         assert_eq!(err, "No pending ask from \"nobody\"");
     }
 
@@ -576,8 +703,16 @@ mod tests {
         rt.record_incoming_message(session("s1", Some("Alice")), ask("q1"), 1000);
         rt.record_incoming_message(session("s2", Some("bob")), ask("q2"), 1000);
 
-        assert_eq!(rt.find_unique_pending_ask_from("s1", 1001).map(|c| c.message.id), Some("q1".to_string()));
-        assert_eq!(rt.find_unique_pending_ask_from("alice", 1001).map(|c| c.message.id), Some("q1".to_string()));
+        assert_eq!(
+            rt.find_unique_pending_ask_from("s1", 1001)
+                .map(|c| c.message.id),
+            Some("q1".to_string())
+        );
+        assert_eq!(
+            rt.find_unique_pending_ask_from("alice", 1001)
+                .map(|c| c.message.id),
+            Some("q1".to_string())
+        );
         assert!(rt.find_unique_pending_ask_from("nobody", 1001).is_none());
 
         // Upstream has NO prefix arm here — inference is silent, so it demands an exact hit.
@@ -594,16 +729,123 @@ mod tests {
     }
 
     // reply-tracker.ts:55-64 — `reply_to` still outranks `to`, and `to` is only a cross-check.
+    /// `reply-tracker.test.ts` "active ask context flags non-reply sends to a different target"
+    /// (v0.12.1 `5fe0ee3`, at v0.13.0): with the turn triggered by planner's ask, the asker's own
+    /// id is clean, and BOTH the asker's name and an unrelated id are flagged with the ask.
+    #[test]
+    fn active_ask_context_flags_non_reply_sends_to_a_different_target() {
+        let mut rt = ReplyTracker::new(600_000);
+        let current =
+            rt.record_incoming_message(session("planner-id", Some("planner")), ask("ask-1"), 1000);
+        rt.queue_turn_context(current);
+        rt.begin_turn(1001);
+
+        assert!(
+            rt.find_active_reply_target_mismatch("planner-id", 1002)
+                .is_none()
+        );
+        assert_eq!(
+            rt.find_active_reply_target_mismatch("planner", 1002)
+                .map(|c| c.message.id),
+            Some("ask-1".to_string())
+        );
+        assert_eq!(
+            rt.find_active_reply_target_mismatch("repo-root", 1002)
+                .map(|c| c.message.id),
+            Some("ask-1".to_string())
+        );
+    }
+
+    /// `reply-tracker.test.ts` "active ask context does not trust sender names as destination
+    /// identity" (v0.12.1 `5fe0ee3`, at v0.13.0): `to` equal to the asker's NAME is still a
+    /// mismatch — only the id is destination identity.
+    #[test]
+    fn active_ask_context_does_not_trust_sender_names_as_destination_identity() {
+        let mut rt = ReplyTracker::new(600_000);
+        let current = rt.record_incoming_message(
+            session("asker-session", Some("root-session")),
+            ask("ask-1"),
+            1000,
+        );
+        rt.queue_turn_context(current);
+        rt.begin_turn(1001);
+
+        assert_eq!(
+            rt.find_active_reply_target_mismatch("root-session", 1002)
+                .map(|c| c.message.id),
+            Some("ask-1".to_string())
+        );
+    }
+
+    /// The three `null` arms of `findActiveReplyTargetMismatch` (`v0.13.0 reply-tracker.ts:125-128`):
+    /// no turn context at all; a turn triggered by a plain message (no `expectsReply`); and a
+    /// context whose ask has aged past the timeout — `pruneExpired(now)` runs FIRST and clears the
+    /// current-turn slot, so an expired ask cannot make this a reply turn. `endTurn` clears it too.
+    #[test]
+    fn active_ask_context_is_silent_without_a_live_ask_turn() {
+        let mut rt = ReplyTracker::new(600_000);
+        assert!(
+            rt.find_active_reply_target_mismatch("anyone", 1000)
+                .is_none(),
+            "no turn context"
+        );
+
+        // A plain inbound message (not an ask) triggering the turn.
+        let mut plain = ask("m-1");
+        plain.expects_reply = None;
+        let current = rt.record_incoming_message(session("peer", Some("peer")), plain, 1000);
+        rt.queue_turn_context(current);
+        rt.begin_turn(1001);
+        assert!(
+            rt.find_active_reply_target_mismatch("anyone", 1002)
+                .is_none(),
+            "a non-ask turn context never guards"
+        );
+        rt.end_turn();
+
+        // An ask that expires between `beginTurn` and the send.
+        let mut rt = ReplyTracker::new(1_000);
+        let current = rt.record_incoming_message(session("peer", Some("peer")), ask("ask-1"), 1000);
+        rt.queue_turn_context(current);
+        rt.begin_turn(1001);
+        assert!(
+            rt.find_active_reply_target_mismatch("someone-else", 1500)
+                .is_some(),
+            "live ask guards"
+        );
+        assert!(
+            rt.find_active_reply_target_mismatch("someone-else", 5000)
+                .is_none(),
+            "an expired ask is pruned and the turn slot cleared before the comparison"
+        );
+        assert!(rt.list_pending(5000).is_empty());
+
+        // `endTurn` clears the slot: the guard is scoped to the ask-triggered turn only.
+        let mut rt = ReplyTracker::new(600_000);
+        let current = rt.record_incoming_message(session("peer", Some("peer")), ask("ask-2"), 1000);
+        rt.queue_turn_context(current);
+        rt.begin_turn(1001);
+        rt.end_turn();
+        assert!(
+            rt.find_active_reply_target_mismatch("someone-else", 1002)
+                .is_none()
+        );
+    }
+
     #[test]
     fn explicit_reply_to_still_outranks_to() {
         let mut rt = ReplyTracker::new(600_000);
         rt.record_incoming_message(session("planner-id", Some("planner")), ask("ask-1"), 1000);
         rt.record_incoming_message(session("reviewer-id", Some("reviewer")), ask("ask-2"), 1001);
 
-        let target = rt.resolve_reply_target(None, Some("ask-2"), 1002).expect("reply_to resolves");
+        let target = rt
+            .resolve_reply_target(None, Some("ask-2"), 1002)
+            .expect("reply_to resolves");
         assert_eq!(target.from.id, "reviewer-id");
 
-        let err = rt.resolve_reply_target(Some("planner"), Some("ask-2"), 1002).expect_err("mismatched pair");
+        let err = rt
+            .resolve_reply_target(Some("planner"), Some("ask-2"), 1002)
+            .expect_err("mismatched pair");
         assert_eq!(err, "Pending ask \"ask-2\" is not from \"planner\"");
     }
 
@@ -627,7 +869,9 @@ mod tests {
     #[test]
     fn outbound_waiter_is_single_slot() {
         let waiter = OutboundReplyWaiter::new();
-        let _rx = waiter.register("supervisor".to_string(), "q1".to_string()).expect("first registers");
+        let _rx = waiter
+            .register("supervisor".to_string(), "q1".to_string())
+            .expect("first registers");
         let second = waiter.register("supervisor".to_string(), "q2".to_string());
         assert_eq!(second.err().as_deref(), Some("Already waiting for a reply"));
     }
@@ -635,13 +879,19 @@ mod tests {
     #[tokio::test]
     async fn outbound_waiter_delivers_matching_reply() {
         let waiter = OutboundReplyWaiter::new();
-        let rx = waiter.register("supervisor".to_string(), "q1".to_string()).expect("registers");
+        let rx = waiter
+            .register("supervisor".to_string(), "q1".to_string())
+            .expect("registers");
         let reply = Message {
             id: "r1".to_string(),
             timestamp: 0u64.into(),
             reply_to: Some("q1".to_string()),
             expects_reply: None,
-            content: MessageContent { text: "answer".to_string(), attachments: None, ..Default::default() },
+            content: MessageContent {
+                text: "answer".to_string(),
+                attachments: None,
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert!(waiter.try_deliver(&session("supervisor", Some("supervisor")), &reply));
@@ -656,10 +906,18 @@ mod tests {
     #[tokio::test]
     async fn outbound_waiter_fails_pending_on_disconnect() {
         let waiter = OutboundReplyWaiter::new();
-        let rx = waiter.register("supervisor".to_string(), "q1".to_string()).expect("registers");
+        let rx = waiter
+            .register("supervisor".to_string(), "q1".to_string())
+            .expect("registers");
         assert!(waiter.fail_pending("Disconnected while waiting for reply: socket closed"));
-        let reason = rx.await.expect("resolved immediately").expect_err("failed, not delivered");
-        assert_eq!(reason, "Disconnected while waiting for reply: socket closed");
+        let reason = rx
+            .await
+            .expect("resolved immediately")
+            .expect_err("failed, not delivered");
+        assert_eq!(
+            reason,
+            "Disconnected while waiting for reply: socket closed"
+        );
         assert!(!waiter.is_waiting(), "slot freed by the failure");
         assert!(!waiter.fail_pending("again"), "nothing left to fail");
     }
@@ -667,16 +925,25 @@ mod tests {
     #[test]
     fn outbound_waiter_ignores_non_matching_reply() {
         let waiter = OutboundReplyWaiter::new();
-        let _rx = waiter.register("supervisor".to_string(), "q1".to_string()).expect("registers");
+        let _rx = waiter
+            .register("supervisor".to_string(), "q1".to_string())
+            .expect("registers");
         let wrong = Message {
             id: "r1".to_string(),
             timestamp: 0u64.into(),
             reply_to: Some("q-other".to_string()),
             expects_reply: None,
-            content: MessageContent { text: "answer".to_string(), attachments: None, ..Default::default() },
+            content: MessageContent {
+                text: "answer".to_string(),
+                attachments: None,
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert!(!waiter.try_deliver(&session("supervisor", None), &wrong));
-        assert!(waiter.is_waiting(), "slot stays occupied on a non-matching reply");
+        assert!(
+            waiter.is_waiting(),
+            "slot stays occupied on a non-matching reply"
+        );
     }
 }

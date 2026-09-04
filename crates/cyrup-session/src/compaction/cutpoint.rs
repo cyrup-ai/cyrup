@@ -70,9 +70,10 @@ pub fn find_valid_cut_points(entries: &[Entry], start: usize, end: usize) -> Vec
     let mut i = start;
     while i < end {
         if let Some(e) = entries.get(i)
-            && is_valid_cut_point(e) {
-                out.push(i);
-            }
+            && is_valid_cut_point(e)
+        {
+            out.push(i);
+        }
         i += 1;
     }
     out
@@ -84,9 +85,10 @@ pub fn find_turn_start(entries: &[Entry], idx: usize, start: usize) -> Option<us
     let mut i = idx.min(entries.len());
     loop {
         if let Some(e) = entries.get(i)
-            && is_turn_start_entry(e) {
-                return Some(i);
-            }
+            && is_turn_start_entry(e)
+        {
+            return Some(i);
+        }
         if i <= start {
             return None;
         }
@@ -113,7 +115,11 @@ pub fn find_cut_point(
 ) -> CutPoint {
     let valid = find_valid_cut_points(entries, start, end);
     if valid.is_empty() {
-        return CutPoint { first_kept_index: start, turn_start_index: None, is_split_turn: false };
+        return CutPoint {
+            first_kept_index: start,
+            turn_start_index: None,
+            is_split_turn: false,
+        };
     }
 
     // Walk backward, summing the RAW-CONTEXT estimate of every entry — Pi:
@@ -189,5 +195,9 @@ pub fn find_cut_point(
         }
     };
 
-    CutPoint { first_kept_index: cut_idx, turn_start_index, is_split_turn }
+    CutPoint {
+        first_kept_index: cut_idx,
+        turn_start_index,
+        is_split_turn,
+    }
 }

@@ -19,13 +19,18 @@
 // always true here. Re-spelled in cyrup-it it would name THIS crate's `wasm-host`, which
 // `--features it` does not enable, and every test below would SILENTLY not compile in.
 // See the `[[test]]` note in crates/cyrup-it/Cargo.toml.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::sync::{Arc, Mutex};
 
 use cyrup_core::{ExtensionId, StopReason};
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 use cyrup_provider::Provider;
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
 use cyrup_session_svc::{AgentSession, SessionBuilder, SessionConfig, UiKind, UiReply, UiRequest};
 use tempfile::TempDir;
 
@@ -39,7 +44,10 @@ use crate::support::bins;
 
 fn faux_with_ok() -> Arc<FauxProvider> {
     let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("ok")],
+        StopReason::Stop,
+    )]);
     faux
 }
 
@@ -53,7 +61,10 @@ fn wire_scripted_sink(session: &Arc<AgentSession>) -> Arc<Mutex<Vec<(UiKind, Str
     let seen2 = seen.clone();
     tokio::spawn(async move {
         while let Some(req) = rx.recv().await {
-            seen2.lock().unwrap_or_else(|e| e.into_inner()).push((req.kind, req.prompt.clone()));
+            seen2
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((req.kind, req.prompt.clone()));
             let reply = match req.kind {
                 UiKind::Confirm => UiReply::Confirm(true),
                 UiKind::Input => UiReply::Text(Some("Ada Lovelace".to_string())),
@@ -90,7 +101,10 @@ async fn build_session() -> (Arc<AgentSession>, Arc<cyrup_ext::host::LiveExtensi
     cfg.no_extensions = true;
 
     let session = Arc::new(
-        SessionBuilder::new(faux_with_ok() as Arc<dyn Provider>, cfg).build().await.unwrap(),
+        SessionBuilder::new(faux_with_ok() as Arc<dyn Provider>, cfg)
+            .build()
+            .await
+            .unwrap(),
     );
     let ext = session
         .load_wasm_extension(
@@ -116,7 +130,11 @@ async fn wasm_guest_confirm_dialog_receives_the_real_scripted_answer() {
     session.wait_for_idle().await;
 
     let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    assert_eq!(seen.len(), 2, "confirmdemo opens exactly two dialogs: {seen:?}");
+    assert_eq!(
+        seen.len(),
+        2,
+        "confirmdemo opens exactly two dialogs: {seen:?}"
+    );
     assert_eq!(seen[0].0, UiKind::Confirm);
     assert_eq!(seen[0].1, "proceed?");
     assert_eq!(
@@ -137,11 +155,18 @@ async fn wasm_guest_input_dialog_receives_the_real_scripted_answer() {
     session.wait_for_idle().await;
 
     let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    assert_eq!(seen.len(), 2, "inputdemo opens exactly two dialogs: {seen:?}");
+    assert_eq!(
+        seen.len(),
+        2,
+        "inputdemo opens exactly two dialogs: {seen:?}"
+    );
     assert_eq!(seen[0].0, UiKind::Input);
     assert_eq!(
         seen[1],
-        (UiKind::Confirm, "you typed: Some(\"Ada Lovelace\")".to_string()),
+        (
+            UiKind::Confirm,
+            "you typed: Some(\"Ada Lovelace\")".to_string()
+        ),
         "the guest's SECOND dialog embeds the REAL typed text, not a default: {seen:?}"
     );
 }
@@ -157,7 +182,11 @@ async fn wasm_guest_select_dialog_receives_the_real_scripted_answer() {
     session.wait_for_idle().await;
 
     let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    assert_eq!(seen.len(), 2, "selectdemo opens exactly two dialogs: {seen:?}");
+    assert_eq!(
+        seen.len(),
+        2,
+        "selectdemo opens exactly two dialogs: {seen:?}"
+    );
     assert_eq!(seen[0].0, UiKind::Select);
     assert_eq!(
         seen[1],
@@ -178,17 +207,27 @@ async fn wasm_guest_editor_dialog_receives_the_real_scripted_answer() {
     session.wait_for_idle().await;
 
     let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    assert_eq!(seen.len(), 2, "editordemo opens exactly two dialogs: {seen:?}");
+    assert_eq!(
+        seen.len(),
+        2,
+        "editordemo opens exactly two dialogs: {seen:?}"
+    );
     assert_eq!(seen[0].0, UiKind::Editor);
     // L4 review §2 (editor title fix): `req.prompt` is now genuinely the guest's `title` argument
     // (Pi `editor(title, prefill)`, types.ts:216; world.wit:267) — a REAL wasm guest call, not the
     // hardcoded `""` the pre-fix wire request sent. The seed text arrives separately on
     // `req.message`, unit-proven distinctly in `host_services.rs`'s
     // `ui_grant_round_trips_through_a_scripted_sink`.
-    assert_eq!(seen[0].1, "edit demo", "the LIVE wasm guest's real editor title arrived, not \"\"");
+    assert_eq!(
+        seen[0].1, "edit demo",
+        "the LIVE wasm guest's real editor title arrived, not \"\""
+    );
     assert_eq!(
         seen[1],
-        (UiKind::Confirm, "edited: edited by the scripted sink".to_string()),
+        (
+            UiKind::Confirm,
+            "edited: edited by the scripted sink".to_string()
+        ),
         "the guest's SECOND dialog embeds the edited text, not the seed or a default: {seen:?}"
     );
 }
@@ -204,11 +243,23 @@ async fn wasm_guest_shortcut_confirm_dialog_receives_the_real_scripted_answer() 
     let seen = wire_scripted_sink(&session);
 
     let cancel = cyrup_core::CancelToken::new();
-    session.services().ext_host.run_shortcut("ctrl+t", &cancel).await.expect("shortcut runs");
+    session
+        .services()
+        .ext_host
+        .run_shortcut("ctrl+t", &cancel)
+        .await
+        .expect("shortcut runs");
 
     let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    assert_eq!(seen.len(), 2, "the ctrl+t shortcut opens exactly two dialogs: {seen:?}");
-    assert_eq!(seen[0], (UiKind::Confirm, "shortcut confirm — proceed?".to_string()));
+    assert_eq!(
+        seen.len(),
+        2,
+        "the ctrl+t shortcut opens exactly two dialogs: {seen:?}"
+    );
+    assert_eq!(
+        seen[0],
+        (UiKind::Confirm, "shortcut confirm — proceed?".to_string())
+    );
     assert_eq!(
         seen[1],
         (UiKind::Confirm, "shortcut confirmed: true".to_string()),
@@ -234,7 +285,9 @@ async fn wasm_guest_extension_stays_usable_after_a_dialog_round_trip() {
     let _ = session.prompt("/execdemo").await.unwrap();
     session.wait_for_idle().await;
     assert!(
-        ext.guest().notifications()[before..].iter().any(|n| n.starts_with("exec stdout:")),
+        ext.guest().notifications()[before..]
+            .iter()
+            .any(|n| n.starts_with("exec stdout:")),
         "execdemo genuinely ran (not a silent no-op) after a completed dialog round trip: {:?}",
         ext.guest().notifications()
     );
@@ -289,7 +342,9 @@ async fn wasm_guest_dialog_delayed_past_the_epoch_budget_does_not_wedge_the_exte
     let _ = session.prompt("/execdemo").await.unwrap();
     session.wait_for_idle().await;
     assert!(
-        ext.guest().notifications()[before..].iter().any(|n| n.starts_with("exec stdout:")),
+        ext.guest().notifications()[before..]
+            .iter()
+            .any(|n| n.starts_with("exec stdout:")),
         "the extension survives a dialog delayed past the epoch budget — a later command still \
          genuinely runs, not a silent no-op: {:?}",
         ext.guest().notifications()

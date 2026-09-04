@@ -54,7 +54,10 @@ impl<S> CompiledWildcard<S> {
     /// True iff `name` matches this pattern.
     #[must_use]
     pub fn is_match(&self, name: &str) -> bool {
-        self.regex.as_ref().map(|r| r.is_match(name)).unwrap_or(false)
+        self.regex
+            .as_ref()
+            .map(|r| r.is_match(name))
+            .unwrap_or(false)
     }
 }
 
@@ -72,14 +75,22 @@ pub fn compile<S>(pattern: &str, state: S) -> CompiledWildcard<S> {
 /// from `cfg!(windows)`, so the win32 (`"si"`) branch of pi's platform check
 /// (`wildcard-matcher.ts:41`) is unit-testable on every host platform.
 #[must_use]
-pub fn compile_with_case_insensitive<S>(pattern: &str, state: S, case_insensitive: bool) -> CompiledWildcard<S> {
+pub fn compile_with_case_insensitive<S>(
+    pattern: &str,
+    state: S,
+    case_insensitive: bool,
+) -> CompiledWildcard<S> {
     // pi `wildcard-matcher.ts:21-27`: an over-long pattern short-circuits to `NEVER_MATCH_PATTERN`
     // BEFORE any escaping, and `pattern` is carried through unmodified so `matchedPattern`
     // reporting is unaffected. `> MAX`, so a pattern of exactly 500 still compiles normally.
     // Both `compile` and `compile_entries` funnel through here, so this covers the per-call
     // compiles in `evaluate.rs:27,31` and the pre-compiled tables in `manager.rs` alike.
     if pattern.encode_utf16().count() > MAX_WILDCARD_PATTERN_LENGTH {
-        return CompiledWildcard { pattern: pattern.to_string(), state, regex: None };
+        return CompiledWildcard {
+            pattern: pattern.to_string(),
+            state,
+            regex: None,
+        };
     }
 
     let mut escaped = String::with_capacity(pattern.len() * 2 + 2);
@@ -111,14 +122,23 @@ pub fn compile_with_case_insensitive<S>(pattern: &str, state: S, case_insensitiv
         .build()
         .ok();
 
-    CompiledWildcard { pattern: pattern.to_string(), state, regex }
+    CompiledWildcard {
+        pattern: pattern.to_string(),
+        state,
+        regex,
+    }
 }
 
 /// Compile every `(pattern, state)` entry, preserving order (pi `compileWildcardPatternEntries`,
 /// `wildcard-matcher.ts:45-49`).
 #[must_use]
-pub fn compile_entries<S>(entries: impl IntoIterator<Item = (String, S)>) -> Vec<CompiledWildcard<S>> {
-    entries.into_iter().map(|(pattern, state)| compile(&pattern, state)).collect()
+pub fn compile_entries<S>(
+    entries: impl IntoIterator<Item = (String, S)>,
+) -> Vec<CompiledWildcard<S>> {
+    entries
+        .into_iter()
+        .map(|(pattern, state)| compile(&pattern, state))
+        .collect()
 }
 
 /// pi `findCompiledWildcardMatch` (`wildcard-matcher.ts:57-74`): normalize `\\`→`/` in `name`, then
@@ -179,10 +199,7 @@ mod tests {
 
     #[test]
     fn last_match_wins_from_end() {
-        let ps = compile_entries(vec![
-            ("*".to_string(), 1u8),
-            ("git *".to_string(), 2u8),
-        ]);
+        let ps = compile_entries(vec![("*".to_string(), 1u8), ("git *".to_string(), 2u8)]);
         // "git status" matches both; the LATER entry ("git *") wins.
         let idx = find_match_index(&ps, "git status").unwrap();
         assert_eq!(ps[idx].state, 2u8);
@@ -226,9 +243,15 @@ mod tests {
         let oversized = "*".repeat(MAX_WILDCARD_PATTERN_LENGTH + 1);
         assert_eq!(oversized.encode_utf16().count(), 501);
         let c = compile(&oversized, ());
-        assert!(!c.is_match("rm -rf /"), "an oversized pattern must never match");
+        assert!(
+            !c.is_match("rm -rf /"),
+            "an oversized pattern must never match"
+        );
         assert!(!c.is_match("git status"));
-        assert!(!c.is_match(""), "cyrup is stricter than pi's `/$^/` on the empty subject");
+        assert!(
+            !c.is_match(""),
+            "cyrup is stricter than pi's `/$^/` on the empty subject"
+        );
         // `pattern` is carried through unmodified (pi returns `{ pattern, state, regex }`).
         assert_eq!(c.pattern, oversized);
     }
@@ -247,7 +270,10 @@ mod tests {
         let at_cap = format!("{}*", "a".repeat(MAX_WILDCARD_PATTERN_LENGTH - 1));
         assert_eq!(at_cap.encode_utf16().count(), MAX_WILDCARD_PATTERN_LENGTH);
         let c = compile(&at_cap, ());
-        assert!(c.is_match(&format!("{} --flag", "a".repeat(MAX_WILDCARD_PATTERN_LENGTH - 1))));
+        assert!(c.is_match(&format!(
+            "{} --flag",
+            "a".repeat(MAX_WILDCARD_PATTERN_LENGTH - 1)
+        )));
         assert!(!c.is_match("git status"));
 
         // A 500-`*` pattern is still a match-everything wildcard: the cap is a length rule, not a
@@ -257,17 +283,17 @@ mod tests {
 
         // And one char under the cap.
         let under_cap = format!("{}*", "a".repeat(MAX_WILDCARD_PATTERN_LENGTH - 2));
-        assert!(compile(&under_cap, ()).is_match(&format!("{}z", "a".repeat(MAX_WILDCARD_PATTERN_LENGTH - 2))));
+        assert!(
+            compile(&under_cap, ())
+                .is_match(&format!("{}z", "a".repeat(MAX_WILDCARD_PATTERN_LENGTH - 2)))
+        );
     }
 
     #[test]
     fn find_match_index_skips_oversized_entries() {
         // pi `tests/wildcard-redos.test.ts`: an oversized entry in the list must be ignored, and the
         // normal entry after it must still win.
-        let ps = compile_entries(vec![
-            ("*".repeat(600), 1u8),
-            ("ls *".to_string(), 2u8),
-        ]);
+        let ps = compile_entries(vec![("*".repeat(600), 1u8), ("ls *".to_string(), 2u8)]);
         let idx = find_match_index(&ps, "ls -la").unwrap();
         assert_eq!(ps[idx].state, 2u8);
         assert_eq!(ps[idx].pattern, "ls *");

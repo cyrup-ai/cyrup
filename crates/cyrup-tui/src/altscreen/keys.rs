@@ -57,8 +57,8 @@
 
 use ratatui::crossterm::event::{KeyEvent, KeyEventKind};
 
-use super::scroll::{self, ScrollState};
 use super::TuiRenderMode;
+use super::scroll::{self, ScrollState};
 use crate::keymap::{AltScreenAction, AltScreenKeymap};
 
 /// Rows a page scroll leaves behind for continuity — pi's `PAGE_SCROLL_OVERLAP`

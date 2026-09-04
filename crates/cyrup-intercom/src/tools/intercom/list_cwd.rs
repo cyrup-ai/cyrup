@@ -10,7 +10,9 @@ use crate::tools::text_result;
 use crate::transport::client::IntercomClient;
 use crate::transport::protocol::SessionInfo;
 
-use super::{IntercomParams, IntercomTool, format_session_list_row, resolve_target_cwd, to_tool_err};
+use super::{
+    IntercomParams, IntercomTool, format_session_list_row, resolve_target_cwd, to_tool_err,
+};
 
 impl IntercomTool {
     // `v0.10.1 index.ts:1895-1941`: the same roster, filtered to one working directory —
@@ -23,18 +25,19 @@ impl IntercomTool {
     ) -> Result<ToolResult, ToolError> {
         let self_id = client.session_id();
         let sessions = client.list_sessions().await.map_err(to_tool_err)?;
-        let current_session =
-            self_id.as_deref().and_then(|id| sessions.iter().find(|s| s.id == id));
+        let current_session = self_id
+            .as_deref()
+            .and_then(|id| sessions.iter().find(|s| s.id == id));
         let Some(current_session) = current_session else {
-            return Err(ToolError::new("Current session is missing from intercom session list."));
+            return Err(ToolError::new(
+                "Current session is missing from intercom session list.",
+            ));
         };
         // `v0.10.1 index.ts:1903-1907`: default to the current session's cwd; an explicit
         // `cwd` overrides, with a relative path resolved AGAINST the current session's cwd
         // and `"."` meaning the current cwd.
-        let filter_cwd = resolve_target_cwd(
-            &current_session.cwd,
-            params.cwd.as_deref().unwrap_or("."),
-        );
+        let filter_cwd =
+            resolve_target_cwd(&current_session.cwd, params.cwd.as_deref().unwrap_or("."));
         let other_sessions: Vec<&SessionInfo> = sessions
             .iter()
             .filter(|s| {
@@ -46,9 +49,7 @@ impl IntercomTool {
         // directory with no peers while the session's OWN cwd has some otherwise reads as a
         // misleading empty result (common when a caller passes a guessed parent cwd)."
         let mut empty_note = "No other sessions in this directory.".to_string();
-        if other_sessions.is_empty()
-            && !crate::cwd::same_cwd(&filter_cwd, &current_session.cwd)
-        {
+        if other_sessions.is_empty() && !crate::cwd::same_cwd(&filter_cwd, &current_session.cwd) {
             let here = sessions
                 .iter()
                 .filter(|s| {
@@ -66,11 +67,19 @@ impl IntercomTool {
         }
         let prefixes = crate::identity::session_id_prefixes(sessions.iter().map(|s| s.id.as_str()));
         let id_prefix = |s: &SessionInfo| {
-            prefixes.get(&s.id).cloned().unwrap_or_else(|| short_session_id(&s.id))
+            prefixes
+                .get(&s.id)
+                .cloned()
+                .unwrap_or_else(|| short_session_id(&s.id))
         };
         let current_section = format!(
             "**Current session:**\n{}",
-            format_session_list_row(current_session, &current_session.cwd, true, &id_prefix(current_session))
+            format_session_list_row(
+                current_session,
+                &current_session.cwd,
+                true,
+                &id_prefix(current_session)
+            )
         );
         let other_section = if other_sessions.is_empty() {
             format!("**Other sessions (cwd: {filter_cwd}):**\n{empty_note}")

@@ -93,7 +93,10 @@ impl ChildWatchdogPhase {
     /// `(CHILD_WATCHDOG_PHASES as readonly string[]).includes(value)` (`child-status.ts:181`).
     #[must_use]
     pub fn parse(value: &str) -> Option<ChildWatchdogPhase> {
-        ChildWatchdogPhase::ALL.iter().copied().find(|phase| phase.as_str() == value)
+        ChildWatchdogPhase::ALL
+            .iter()
+            .copied()
+            .find(|phase| phase.as_str() == value)
     }
 }
 
@@ -304,12 +307,14 @@ fn optional_index(
     let Some(value) = input.get(field) else {
         return Ok(None);
     };
-    value.as_u64().ok_or_else(|| {
-        invalid(format!(
-            "Invalid child watchdog config: {field} must be a non-negative integer."
-        ))
-    })
-    .map(Some)
+    value
+        .as_u64()
+        .ok_or_else(|| {
+            invalid(format!(
+                "Invalid child watchdog config: {field} must be a non-negative integer."
+            ))
+        })
+        .map(Some)
 }
 
 /// `childConfigPositiveInteger` (`child-status.ts:100-105`).
@@ -366,9 +371,10 @@ fn config_boolean(
 /// `childConfigLsp` (`child-status.ts:122-133`) — the four LSP fields, each with its own message.
 fn config_lsp(value: Option<&Value>) -> Result<WatchdogLspConfig, ChildWatchdogConfigError> {
     let input = config_object(value, "lsp")?;
-    let enabled = input.get("enabled").and_then(Value::as_bool).ok_or_else(|| {
-        invalid("Invalid child watchdog config: lsp.enabled must be a boolean.")
-    })?;
+    let enabled = input
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| invalid("Invalid child watchdog config: lsp.enabled must be a boolean."))?;
     let timeout_ms = input
         .get("timeoutMs")
         .and_then(Value::as_u64)
@@ -452,10 +458,13 @@ pub fn decode_child_watchdog_config(
         lsp: config_lsp(parsed.get("lsp"))?,
         auto_follow_blockers: config_boolean(parsed, "autoFollowBlockers")?,
         auto_follow_max_attempts: nullable_non_negative_integer(parsed, "autoFollowMaxAttempts")?,
-        stalemate_repeats: u32::try_from(positive_integer(parsed, "stalemateRepeats")?)
-            .map_err(|_| {
-                invalid("Invalid child watchdog config: stalemateRepeats must be a positive integer.")
-            })?,
+        stalemate_repeats: u32::try_from(positive_integer(parsed, "stalemateRepeats")?).map_err(
+            |_| {
+                invalid(
+                    "Invalid child watchdog config: stalemateRepeats must be a positive integer.",
+                )
+            },
+        )?,
     }))
 }
 
@@ -483,8 +492,14 @@ pub fn is_child_watchdog_status_event(value: &Value) -> bool {
     };
     event.get("type").and_then(Value::as_str) == Some(CHILD_WATCHDOG_STATUS_EVENT)
         && event.get("seq").and_then(Value::as_u64).is_some()
-        && event.get("ts").and_then(Value::as_f64).is_some_and(f64::is_finite)
-        && event.get("followUpPending").and_then(Value::as_bool).is_some()
+        && event
+            .get("ts")
+            .and_then(Value::as_f64)
+            .is_some_and(f64::is_finite)
+        && event
+            .get("followUpPending")
+            .and_then(Value::as_bool)
+            .is_some()
         && event
             .get("phase")
             .and_then(Value::as_str)
@@ -544,7 +559,12 @@ pub fn accept_child_watchdog_event(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 mod tests {
     use super::*;
     use crate::watchdog::settings::default_watchdog_config;
@@ -577,13 +597,13 @@ mod tests {
     fn the_master_switch_gates_a_per_agent_override() {
         let mut config = enabled_parent();
         config.enabled = false;
-        config
-            .children
-            .overrides
-            .insert("reviewer".into(), WatchdogChildOverrideConfig {
+        config.children.overrides.insert(
+            "reviewer".into(),
+            WatchdogChildOverrideConfig {
                 enabled: Some(true),
                 ..Default::default()
-            });
+            },
+        );
         assert!(
             resolve_child_watchdog_config(&config, Some("reviewer"), None, None).is_none(),
             "an override must not re-enable a watchdog the master switch turned off"
@@ -593,13 +613,13 @@ mod tests {
     #[test]
     fn a_per_agent_override_can_disable_one_agent_only() {
         let mut config = enabled_parent();
-        config
-            .children
-            .overrides
-            .insert("reviewer".into(), WatchdogChildOverrideConfig {
+        config.children.overrides.insert(
+            "reviewer".into(),
+            WatchdogChildOverrideConfig {
                 enabled: Some(false),
                 ..Default::default()
-            });
+            },
+        );
         assert!(resolve_child_watchdog_config(&config, Some("reviewer"), None, None).is_none());
         assert!(resolve_child_watchdog_config(&config, Some("worker"), None, None).is_some());
     }
@@ -609,14 +629,14 @@ mod tests {
         let mut config = enabled_parent();
         config.children.model = Some("anthropic/base".into());
         config.children.thinking = Some(ThinkingSetting::Level("low".into()));
-        config
-            .children
-            .overrides
-            .insert("reviewer".into(), WatchdogChildOverrideConfig {
+        config.children.overrides.insert(
+            "reviewer".into(),
+            WatchdogChildOverrideConfig {
                 model: Some("openai/strong".into()),
                 thinking: Some(ThinkingSetting::Off),
                 ..Default::default()
-            });
+            },
+        );
         let resolved =
             resolve_child_watchdog_config(&config, Some("reviewer"), Some("r1"), Some(2)).unwrap();
         assert_eq!(resolved.model.as_deref(), Some("openai/strong"));
@@ -633,9 +653,15 @@ mod tests {
     fn encode_decode_round_trips_and_omits_absent_optionals() {
         let config = resolve_child_watchdog_config(&enabled_parent(), None, None, None).unwrap();
         let encoded = encode_child_watchdog_config(Some(&config)).unwrap();
-        assert!(!encoded.contains("runId"), "absent optionals are omitted, not null");
+        assert!(
+            !encoded.contains("runId"),
+            "absent optionals are omitted, not null"
+        );
         assert!(!encoded.contains("\"agent\""));
-        assert_eq!(decode_child_watchdog_config(Some(&encoded)).unwrap(), Some(config));
+        assert_eq!(
+            decode_child_watchdog_config(Some(&encoded)).unwrap(),
+            Some(config)
+        );
         assert_eq!(encode_child_watchdog_config(None), None);
     }
 
@@ -652,8 +678,14 @@ mod tests {
     #[test]
     fn strict_decode_reports_upstreams_verbatim_messages() {
         let cases: &[(&str, &str)] = &[
-            ("[]", "Invalid child watchdog config: root must be an object."),
-            ("{}", "Invalid child watchdog config: enabled must be true or false."),
+            (
+                "[]",
+                "Invalid child watchdog config: root must be an object.",
+            ),
+            (
+                "{}",
+                "Invalid child watchdog config: enabled must be true or false.",
+            ),
             (
                 "{\"enabled\":true,\"thinking\":1}",
                 "Invalid child watchdog config: thinking must be a string or false.",
@@ -729,7 +761,11 @@ mod tests {
                 reason: None,
                 timed_out: None,
             };
-            assert_eq!(child_watchdog_is_active(Some(&snapshot)), active, "{phase:?}");
+            assert_eq!(
+                child_watchdog_is_active(Some(&snapshot)),
+                active,
+                "{phase:?}"
+            );
         }
         // followUpPending overrides an otherwise-terminal phase.
         let pending = ChildWatchdogStateSnapshot {

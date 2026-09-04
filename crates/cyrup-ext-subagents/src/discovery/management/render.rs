@@ -70,7 +70,11 @@ pub(crate) fn format_agent_detail(a: &AgentDefinition) -> String {
     ));
     lines.push(format!(
         "Inherit project context: {}",
-        if a.inherit_project_context { "true" } else { "false" }
+        if a.inherit_project_context {
+            "true"
+        } else {
+            "false"
+        }
     ));
     lines.push(format!(
         "Inherit skills: {}",
@@ -79,16 +83,40 @@ pub(crate) fn format_agent_detail(a: &AgentDefinition) -> String {
     if let Some(ctx) = a.default_context {
         lines.push(format!("Default context: {}", context_str(ctx)));
     }
+    // SUBA-082 (`agent-management.ts:901-902` @v0.64.0): `Acceptance:` renders the launch
+    // default as compact JSON for an object and `String(value)` for a scalar; `Acceptance role:`
+    // only when a role is declared (upstream's truthiness test).
+    if let Some(acceptance) = &a.default_acceptance {
+        let rendered = match acceptance {
+            serde_json::Value::String(text) => text.clone(),
+            value @ serde_json::Value::Object(_) => {
+                serde_json::to_string(value).unwrap_or_default()
+            }
+            other => other.to_string(),
+        };
+        lines.push(format!("Acceptance: {rendered}"));
+    }
+    if let Some(role) = a.acceptance_role {
+        lines.push(format!("Acceptance role: {}", role.as_str()));
+    }
     if a.source == AgentSource::Builtin {
         lines.push(format!(
             "Disabled: {}",
-            if a.disabled.unwrap_or(false) { "true" } else { "false" }
+            if a.disabled.unwrap_or(false) {
+                "true"
+            } else {
+                "false"
+            }
         ));
     }
     if let Some(exts) = &a.extensions {
         lines.push(format!(
             "Extensions: {}",
-            if exts.is_empty() { "(none)".to_string() } else { exts.join(", ") }
+            if exts.is_empty() {
+                "(none)".to_string()
+            } else {
+                exts.join(", ")
+            }
         ));
     }
     // pi renders `Subagent-only extensions` whenever the field is defined (even empty -> "(none)").
@@ -196,7 +224,10 @@ fn format_chain_step_detail(step: &ChainStepConfig, index: usize) -> Vec<String>
             lines.push(format!("   Concurrency: {concurrency}"));
         }
         if let Some(fail_fast) = step.fail_fast {
-            lines.push(format!("   Fail fast: {}", if fail_fast { "true" } else { "false" }));
+            lines.push(format!(
+                "   Fail fast: {}",
+                if fail_fast { "true" } else { "false" }
+            ));
         }
         return lines;
     }
@@ -233,7 +264,10 @@ fn format_chain_step_detail(step: &ChainStepConfig, index: usize) -> Vec<String>
         _ => {}
     }
     if let Some(progress) = step.progress {
-        lines.push(format!("   Progress: {}", if progress { "true" } else { "false" }));
+        lines.push(format!(
+            "   Progress: {}",
+            if progress { "true" } else { "false" }
+        ));
     }
     lines
 }
@@ -266,13 +300,19 @@ pub(crate) fn format_chain_detail(c: &ChainDefinition) -> String {
 /// live session model is bound this reports "inherits current session model" (pi's own wording,
 /// agent-management.ts:798); otherwise it classifies from discovery-time provenance (`override_info`
 /// / `model_source`) and the agent's own resolved `model`.
-pub(crate) fn format_model_source(agent: &AgentDefinition, current_session_model: Option<&str>) -> String {
+pub(crate) fn format_model_source(
+    agent: &AgentDefinition,
+    current_session_model: Option<&str>,
+) -> String {
     if let Some(info) = &agent.override_info
         && agent.model != info.base_snapshot.model
     {
         return format!("{} override", override_scope_str(info.scope));
     }
-    if matches!(agent.model_source, Some(AgentModelSourceInfo::SettingsDefault)) {
+    if matches!(
+        agent.model_source,
+        Some(AgentModelSourceInfo::SettingsDefault)
+    ) {
         return "settings defaultModel".to_string();
     }
     if agent.model.is_some() {

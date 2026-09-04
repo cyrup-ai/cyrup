@@ -3,7 +3,12 @@
 //! Every test here would have been RED before the change it names and green after. Upstream
 //! citations are `pi` @ **v0.83.0** (cyrup's ported baseline), taken from
 //! `git show v0.83.0:packages/coding-agent/src/<path>`.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::path::{Path, PathBuf};
 
@@ -18,7 +23,10 @@ use crate::layout::encode_cwd;
 use crate::{NewSessionOpts, SessionManager};
 
 fn user(s: &str) -> Message {
-    Message::User { content: vec![Content::text(s)], timestamp: 0 }
+    Message::User {
+        content: vec![Content::text(s)],
+        timestamp: 0,
+    }
 }
 
 fn assistant_blocks(content: Vec<Content>) -> Message {
@@ -76,13 +84,21 @@ fn sess007_leading_blank_line_still_opens_and_listing_agrees() {
     // landed at `lineno == 1` and was parsed as an ordinary entry, so `load` returned NotASession.
     let path = write_session_with_prefix(tmp.path(), "\n");
     let mgr = SessionManager::open(&path).expect("a leading blank line must not break `open`");
-    assert_eq!(mgr.cwd(), Path::new("/proj/x"), "header cwd survives the blank prefix");
+    assert_eq!(
+        mgr.cwd(),
+        Path::new("/proj/x"),
+        "header cwd survives the blank prefix"
+    );
 
     // The listing side must agree with the loader — before this change `read_header` skipped blanks
     // while `scan_file` took `lines.next()` unconditionally, so the two disagreed about whether the
     // file was a session at all.
     let infos = crate::listing::list_in_dir(tmp.path(), None, None);
-    assert_eq!(infos.len(), 1, "scan_file uses the same first-parsed-entry rule");
+    assert_eq!(
+        infos.len(),
+        1,
+        "scan_file uses the same first-parsed-entry rule"
+    );
     assert_eq!(infos[0].cwd, "/proj/x");
     assert_eq!(
         crate::listing::newest_session(tmp.path(), None).as_deref(),
@@ -128,17 +144,26 @@ fn sess037_missing_or_empty_target_records_a_real_cwd() {
             std::fs::write(&path, "").unwrap();
         }
         let mut mgr = SessionManager::open(&path).expect("anchors a new session at this path");
-        assert_eq!(mgr.cwd(), process_cwd.as_path(), "{name}: falls back to process.cwd()");
+        assert_eq!(
+            mgr.cwd(),
+            process_cwd.as_path(),
+            "{name}: falls back to process.cwd()"
+        );
 
         // Flush so the header reaches disk (the first ASSISTANT message is what creates the file —
         // pi's deferred `_persist`), then read it back: the recorded cwd must be non-empty and must
         // make the session visible to a cwd-filtered listing.
         mgr.append_message(user("hello")).unwrap();
-        mgr.append_message(assistant_blocks(vec![Content::text("hi")])).unwrap();
+        mgr.append_message(assistant_blocks(vec![Content::text("hi")]))
+            .unwrap();
         let text = std::fs::read_to_string(&path).expect("flushed");
         let header: serde_json::Value =
             serde_json::from_str(text.lines().next().expect("header line")).unwrap();
-        assert_eq!(header["cwd"], json!(process_cwd.to_string_lossy()), "{name}");
+        assert_eq!(
+            header["cwd"],
+            json!(process_cwd.to_string_lossy()),
+            "{name}"
+        );
         assert!(
             !crate::listing::list_in_dir(tmp.path(), Some(&process_cwd), None).is_empty(),
             "{name}: a cwd-filtered listing must find it"
@@ -153,11 +178,31 @@ fn sess037_missing_or_empty_target_records_a_real_cwd() {
 // anchored with NO `g` flag.
 #[test]
 fn sess044_encode_cwd_strips_exactly_one_leading_separator() {
-    assert_eq!(encode_cwd(Path::new("/Users/x/proj")), "--Users-x-proj--", "single slash");
-    assert_eq!(encode_cwd(Path::new("//net/x")), "---net-x--", "second slash becomes a dash");
-    assert_eq!(encode_cwd(Path::new(r"\\srv\share\proj")), "---srv-share-proj--", "UNC");
-    assert_eq!(encode_cwd(Path::new("C:/a/b")), "--C--a-b--", "drive colon still mapped");
-    assert_eq!(encode_cwd(Path::new("rel/path")), "--rel-path--", "no leading separator to strip");
+    assert_eq!(
+        encode_cwd(Path::new("/Users/x/proj")),
+        "--Users-x-proj--",
+        "single slash"
+    );
+    assert_eq!(
+        encode_cwd(Path::new("//net/x")),
+        "---net-x--",
+        "second slash becomes a dash"
+    );
+    assert_eq!(
+        encode_cwd(Path::new(r"\\srv\share\proj")),
+        "---srv-share-proj--",
+        "UNC"
+    );
+    assert_eq!(
+        encode_cwd(Path::new("C:/a/b")),
+        "--C--a-b--",
+        "drive colon still mapped"
+    );
+    assert_eq!(
+        encode_cwd(Path::new("rel/path")),
+        "--rel-path--",
+        "no leading separator to strip"
+    );
 }
 
 // ── SESS-018 — `custom_message` null content and a missing `display` ─────────────────────────────
@@ -189,7 +234,9 @@ fn sess018_custom_message_null_content_and_absent_display() {
     .to_string();
     let entry: Entry = serde_json::from_str(&line).expect("parses");
     match entry {
-        Entry::Known(KnownEntry::CustomMessage { display, content, .. }) => {
+        Entry::Known(KnownEntry::CustomMessage {
+            display, content, ..
+        }) => {
             assert!(!display, "absent `display` is falsy upstream");
             assert!(content.is_null());
         }
@@ -208,7 +255,10 @@ fn sess026_assistant_marker_survives_an_empty_text_block() {
         assistant_blocks(vec![Content::text("")]),
         user("follow up"),
     ]);
-    assert!(out.contains("[Assistant]: "), "marker present for an empty text block; got:\n{out}");
+    assert!(
+        out.contains("[Assistant]: "),
+        "marker present for an empty text block; got:\n{out}"
+    );
     assert_eq!(
         out, "[User]: question\n\n[Assistant]: \n\n[User]: follow up",
         "the empty assistant turn keeps its slot in the interleaving"
@@ -216,7 +266,10 @@ fn sess026_assistant_marker_survives_an_empty_text_block() {
 
     // An assistant turn with NO text block at all still emits nothing (pi's `.some()` is false).
     let no_text = serialize_conversation(&[assistant_blocks(vec![])]);
-    assert!(!no_text.contains("[Assistant]:"), "no text block => no marker; got:\n{no_text}");
+    assert!(
+        !no_text.contains("[Assistant]:"),
+        "no text block => no marker; got:\n{no_text}"
+    );
 }
 
 // ── SESS-029 — role-dispatched content estimation ────────────────────────────────────────────────
@@ -231,11 +284,22 @@ fn sess029_estimate_tokens_dispatches_on_role() {
 
     // Assistant: an image block costs NOTHING.
     let a = assistant_blocks(vec![Content::text(&text), image_block()]);
-    assert_eq!(estimate_tokens(&a), want, "an assistant image contributes 0 (compaction.ts:276-288)");
+    assert_eq!(
+        estimate_tokens(&a),
+        want,
+        "an assistant image contributes 0 (compaction.ts:276-288)"
+    );
 
     // User: an image block DOES cost ESTIMATED_IMAGE_CHARS/4 = 1200.
-    let u = Message::User { content: vec![Content::text(&text), image_block()], timestamp: 0 };
-    assert_eq!(estimate_tokens(&u), want + 1200, "a user image costs 4800 chars (compaction.ts:250)");
+    let u = Message::User {
+        content: vec![Content::text(&text), image_block()],
+        timestamp: 0,
+    };
+    assert_eq!(
+        estimate_tokens(&u),
+        want + 1200,
+        "a user image costs 4800 chars (compaction.ts:250)"
+    );
 
     // User: a thinking block contributes NOTHING (it falls through pi's if/else-if chain).
     let thinking = serde_json::from_value::<Content>(json!({
@@ -243,12 +307,23 @@ fn sess029_estimate_tokens_dispatches_on_role() {
         "thinking": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
     }))
     .expect("thinking block");
-    let u2 = Message::User { content: vec![Content::text(&text), thinking.clone()], timestamp: 0 };
-    assert_eq!(estimate_tokens(&u2), want, "a user thinking block contributes 0");
+    let u2 = Message::User {
+        content: vec![Content::text(&text), thinking.clone()],
+        timestamp: 0,
+    };
+    assert_eq!(
+        estimate_tokens(&u2),
+        want,
+        "a user thinking block contributes 0"
+    );
 
     // Assistant: a thinking block DOES count.
     let a2 = assistant_blocks(vec![Content::text(&text), thinking]);
-    assert_eq!(estimate_tokens(&a2), want + 10, "an assistant thinking block counts");
+    assert_eq!(
+        estimate_tokens(&a2),
+        want + 10,
+        "an assistant thinking block counts"
+    );
 }
 
 // ── SESS-S05 — `TreeNode` carries pi's `labelTimestamp` ─────────────────────────────────────────
@@ -264,8 +339,14 @@ fn sess_s05_tree_node_exposes_the_label_timestamp() {
     let tree = m.tree();
     let node = tree.first().expect("one root");
     assert_eq!(node.label.as_deref(), Some("bookmark"));
-    let ts = node.label_timestamp.as_deref().expect("labelTimestamp is produced");
-    assert!(!ts.is_empty(), "the manager already held it; getTree must hand it out");
+    let ts = node
+        .label_timestamp
+        .as_deref()
+        .expect("labelTimestamp is produced");
+    assert!(
+        !ts.is_empty(),
+        "the manager already held it; getTree must hand it out"
+    );
     assert_eq!(Some(ts), m.label_timestamp(&root));
 
     // Clearing the label clears both halves.
@@ -341,7 +422,11 @@ fn sess013_nested_linked_worktree_loads_agents_md_once() {
 
     let (files, _diags) = ContextFileLoader::new(wt.clone(), global.clone(), true, false).load();
     let contents: Vec<&str> = files.iter().map(|f| &*f.content).collect();
-    assert_eq!(contents, vec!["TRACKED RULES"], "loaded once, not twice; got {files:?}");
+    assert_eq!(
+        contents,
+        vec!["TRACKED RULES"],
+        "loaded once, not twice; got {files:?}"
+    );
     assert!(
         files[0].path.starts_with(&wt),
         "the worktree's own copy is the one kept (the ancestor is shadowed)"
@@ -390,7 +475,11 @@ fn sess004_unknown_top_level_keys_round_trip() {
         back["xExtensionAnnotation"], line["xExtensionAnnotation"],
         "the annotation survives the rewrite; got {back}"
     );
-    assert_eq!(back["type"], json!("compaction"), "the tag is emitted exactly once");
+    assert_eq!(
+        back["type"],
+        json!("compaction"),
+        "the tag is emitted exactly once"
+    );
 }
 
 // ── SESS-017 / SESS-022 / SESS-034 / SESS-042 live in `tests/compaction.rs` beside the other
@@ -411,13 +500,16 @@ fn sess004_unknown_top_level_keys_round_trip() {
 /// blocks appended to the persisted summary (`formatFileOperations`, `utils.ts:72-82`).
 #[test]
 fn compute_file_lists_sorts_by_utf16_code_units_like_pi() {
-    use crate::compaction::files::{format_file_operations, FileOps};
+    use crate::compaction::files::{FileOps, format_file_operations};
 
     // U+1F600 GRINNING FACE — UTF-16 `D83D DE00`, UTF-8 `F0 9F 98 80`.
     let astral = "/p/\u{1F600}.rs";
     // U+E000 (private use) — UTF-16 `E000`, UTF-8 `EE 80 80`. `0xD83D < 0xE000` but `0xF0 > 0xEE`.
     let bmp = "/p/\u{E000}.rs";
-    assert!(astral > bmp, "precondition: Rust byte order puts the astral path LAST");
+    assert!(
+        astral > bmp,
+        "precondition: Rust byte order puts the astral path LAST"
+    );
 
     let mut ops = FileOps::default();
     ops.read.insert(bmp.to_string());
@@ -459,15 +551,43 @@ fn summarization_max_tokens_has_no_lower_clamp() {
     use crate::compaction::summarize::compute_max_tokens_frac;
 
     // 0.8 fraction: floor(0.8 * 1) == 0 upstream.
-    assert_eq!(compute_max_tokens_frac(1, 0, 4, 5), 0, "unbounded model, floor is 0 not 1");
-    assert_eq!(compute_max_tokens_frac(1, 4096, 4, 5), 0, "bounded model, floor is 0 not 1");
+    assert_eq!(
+        compute_max_tokens_frac(1, 0, 4, 5),
+        0,
+        "unbounded model, floor is 0 not 1"
+    );
+    assert_eq!(
+        compute_max_tokens_frac(1, 4096, 4, 5),
+        0,
+        "bounded model, floor is 0 not 1"
+    );
     // 0.5 fraction (turn prefix): floor(0.5 * 1) == 0.
-    assert_eq!(compute_max_tokens_frac(1, 4096, 1, 2), 0, "turn-prefix half takes the same rule");
-    assert_eq!(compute_max_tokens_frac(0, 4096, 4, 5), 0, "a zero reserve stays zero");
+    assert_eq!(
+        compute_max_tokens_frac(1, 4096, 1, 2),
+        0,
+        "turn-prefix half takes the same rule"
+    );
+    assert_eq!(
+        compute_max_tokens_frac(0, 4096, 4, 5),
+        0,
+        "a zero reserve stays zero"
+    );
     // The ordinary path is unchanged.
-    assert_eq!(compute_max_tokens_frac(16384, 0, 4, 5), 13107, "floor(0.8 * 16384)");
-    assert_eq!(compute_max_tokens_frac(16384, 4096, 4, 5), 4096, "model cap wins");
-    assert_eq!(compute_max_tokens_frac(16384, 0, 1, 2), 8192, "floor(0.5 * 16384)");
+    assert_eq!(
+        compute_max_tokens_frac(16384, 0, 4, 5),
+        13107,
+        "floor(0.8 * 16384)"
+    );
+    assert_eq!(
+        compute_max_tokens_frac(16384, 4096, 4, 5),
+        4096,
+        "model cap wins"
+    );
+    assert_eq!(
+        compute_max_tokens_frac(16384, 0, 1, 2),
+        8192,
+        "floor(0.5 * 16384)"
+    );
 }
 
 /// SESS-014's Verify clause — "point `read_header` at a multi-megabyte session and assert bytes
@@ -517,8 +637,15 @@ fn sess014_header_discovery_stops_at_pis_one_mebibyte_scan_cap() {
     );
 
     let infos = crate::listing::list_in_dir(dir.path(), None, None);
-    assert_eq!(infos.len(), 1, "the unbounded listing scan still reads the file: {infos:?}");
-    assert_eq!(infos[0].cwd, "/proj/capped", "…and it is the same header the cap hid");
+    assert_eq!(
+        infos.len(),
+        1,
+        "the unbounded listing scan still reads the file: {infos:?}"
+    );
+    assert_eq!(
+        infos[0].cwd, "/proj/capped",
+        "…and it is the same header the cap hid"
+    );
 
     // Control: the identical header inside the cap IS discovered, so the assertion above is about
     // the byte bound and not about the junk prefix being unreadable.
@@ -588,8 +715,15 @@ fn a_header_without_cwd_or_timestamp_still_opens_like_pi() {
 
         // The listing side must agree with the loader — the SESS-007 invariant.
         let infos = crate::listing::list_in_dir(&sub, None, None);
-        assert_eq!(infos.len(), 1, "[{label}] the file is still a listable session: {infos:?}");
-        assert_eq!(infos[0].cwd, "", "[{label}] `buildSessionInfo`'s `: \"\"` arm");
+        assert_eq!(
+            infos.len(),
+            1,
+            "[{label}] the file is still a listable session: {infos:?}"
+        );
+        assert_eq!(
+            infos[0].cwd, "",
+            "[{label}] `buildSessionInfo`'s `: \"\"` arm"
+        );
         assert_eq!(
             crate::listing::newest_session(&sub, None),
             Some(path),
@@ -668,7 +802,10 @@ fn v1_first_kept_entry_index_drops_for_every_json_number() {
     let entries = build(json!(2.0));
     let kept_id = entries[1].id();
     match &entries[2] {
-        Entry::Known(KnownEntry::Compaction { first_kept_entry_id, .. }) => assert_eq!(
+        Entry::Known(KnownEntry::Compaction {
+            first_kept_entry_id,
+            ..
+        }) => assert_eq!(
             first_kept_entry_id.as_ref(),
             Some(&kept_id),
             "`entries[2.0]` is `entries[\"2\"]` upstream — the same element as `entries[2]`"

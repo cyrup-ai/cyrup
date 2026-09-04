@@ -72,7 +72,7 @@
 use std::sync::Arc;
 
 use cyrup_sdk::core::CancelToken;
-use cyrup_session_svc::{flush_session_writes, AgentSessionRuntime, AppMode};
+use cyrup_session_svc::{AgentSessionRuntime, AppMode, flush_session_writes};
 use cyrup_tools::kill_tracked_detached_children;
 
 /// Which shutdown signal was delivered, so a REPEAT delivery can exit with the conventional code.
@@ -119,7 +119,10 @@ async fn wait_for_signal() -> ShutdownSignal {
     {
         use tokio::signal::unix::{SignalKind, signal};
         // If a handler cannot be installed, fall back to Ctrl-C alone rather than failing startup.
-        match (signal(SignalKind::terminate()), signal(SignalKind::hangup())) {
+        match (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+        ) {
             (Ok(mut sigterm), Ok(mut sighup)) => {
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => ShutdownSignal::Interrupt,

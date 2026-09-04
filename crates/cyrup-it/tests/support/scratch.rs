@@ -60,8 +60,7 @@ impl Scratch {
     /// Create a directory under the scratch root and return it.
     pub fn dir(&self, rel: impl AsRef<Path>) -> PathBuf {
         let path = self.root.path().join(rel);
-        std::fs::create_dir_all(&path)
-            .unwrap_or_else(|e| panic!("create {}: {e}", path.display()));
+        std::fs::create_dir_all(&path).unwrap_or_else(|e| panic!("create {}: {e}", path.display()));
         path
     }
 

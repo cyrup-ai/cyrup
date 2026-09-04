@@ -7,7 +7,7 @@ use crate::agent_message::AgentMessage;
 use crate::compaction::cutpoint::find_cut_point;
 use crate::compaction::files::FileOps;
 use crate::compaction::settings::CompactionSettings;
-use crate::compaction::tokens::{estimate_context_tokens_raw, TokenCache};
+use crate::compaction::tokens::{TokenCache, estimate_context_tokens_raw};
 use crate::context::{build_context_agent_messages, raw_context_messages};
 use crate::entry::{Entry, KnownEntry};
 
@@ -62,7 +62,10 @@ pub fn prepare_compaction(
         return None;
     }
     // Already compacted: the last entry is a compaction summary.
-    if matches!(path.last(), Some(Entry::Known(KnownEntry::Compaction { .. }))) {
+    if matches!(
+        path.last(),
+        Some(Entry::Known(KnownEntry::Compaction { .. }))
+    ) {
         return None;
     }
 
@@ -70,7 +73,8 @@ pub fn prepare_compaction(
     let prev_idx = path
         .iter()
         .rposition(|e| matches!(e, Entry::Known(KnownEntry::Compaction { .. })));
-    let (previous_summary, prev_details, boundary_start) = match prev_idx.and_then(|i| path.get(i)) {
+    let (previous_summary, prev_details, boundary_start) = match prev_idx.and_then(|i| path.get(i))
+    {
         Some(Entry::Known(KnownEntry::Compaction {
             summary,
             first_kept_entry_id,
@@ -110,14 +114,24 @@ pub fn prepare_compaction(
             // Dropping the guard here would match neither upstream: it would feed
             // extension-defined `details` into pi's `{readFiles, modifiedFiles}` reader.
             // Pinned by `tests/compaction.rs::g21_prepare_compaction_ignores_from_hook_prev_details`.
-            let det = if from_hook.unwrap_or(false) { None } else { details.clone() };
+            let det = if from_hook.unwrap_or(false) {
+                None
+            } else {
+                details.clone()
+            };
             (Some(summary.clone()), det, bs)
         }
         _ => (None, None, 0),
     };
 
     let boundary_end = path.len();
-    let cut = find_cut_point(path, cache, boundary_start, boundary_end, settings.keep_recent_tokens);
+    let cut = find_cut_point(
+        path,
+        cache,
+        boundary_start,
+        boundary_end,
+        settings.keep_recent_tokens,
+    );
     let first_kept_entry_id = path.get(cut.first_kept_index).map(Entry::id)?;
 
     let history_end = if cut.is_split_turn {
@@ -126,8 +140,7 @@ pub fn prepare_compaction(
         cut.first_kept_index
     };
 
-    let messages_to_summarize =
-        messages_for(path.get(boundary_start..history_end).unwrap_or(&[]));
+    let messages_to_summarize = messages_for(path.get(boundary_start..history_end).unwrap_or(&[]));
     let turn_prefix_messages = if cut.is_split_turn {
         let ts = cut.turn_start_index.unwrap_or(history_end);
         messages_for(path.get(ts..cut.first_kept_index).unwrap_or(&[]))

@@ -10,9 +10,9 @@
 //! Every pre-existing assertion looked at PARSED values, where a duplicate key is invisible. These
 //! assert on the RAW BYTES, which is the only place the bug is observable.
 
-use std::sync::Arc;
 use crate::AgentMessage;
 use cyrup_core::AssistantMessage;
+use std::sync::Arc;
 
 fn assistant() -> AssistantMessage {
     serde_json::from_value(serde_json::json!({
@@ -33,7 +33,10 @@ fn an_assistant_message_emits_role_exactly_once() {
         "the `role` discriminant must appear exactly once; a duplicate key is silently \
          last-wins in JSON.parse and a hard error in stricter parsers: {raw}"
     );
-    assert!(raw.starts_with(r#"{"role":"assistant","#), "role stays first: {raw}");
+    assert!(
+        raw.starts_with(r#"{"role":"assistant","#),
+        "role stays first: {raw}"
+    );
 }
 
 #[test]
@@ -53,7 +56,11 @@ fn the_other_arms_are_byte_unchanged_and_still_tagged() {
         ),
     ] {
         let raw = serde_json::to_string(&msg).unwrap();
-        assert_eq!(raw.matches(r#""role""#).count(), 1, "exactly one role: {raw}");
+        assert_eq!(
+            raw.matches(r#""role""#).count(),
+            1,
+            "exactly one role: {raw}"
+        );
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v["role"], expect, "{raw}");
     }
@@ -76,8 +83,8 @@ fn every_arm_still_round_trips() {
         },
     ] {
         let raw = serde_json::to_string(&msg).unwrap();
-        let back: AgentMessage = serde_json::from_str(&raw)
-            .unwrap_or_else(|e| panic!("must round-trip: {raw} -> {e}"));
+        let back: AgentMessage =
+            serde_json::from_str(&raw).unwrap_or_else(|e| panic!("must round-trip: {raw} -> {e}"));
         assert_eq!(back, msg, "round-trip must preserve the value: {raw}");
     }
 }
@@ -88,7 +95,10 @@ fn a_user_message_keeps_its_null_timestamp_key() {
     // this test exists so a future "tidy-up" cannot silently change the wire shape while the
     // duplicate-role fix is credited for it.
     let raw = serde_json::to_string(&AgentMessage::user_text("hi")).unwrap();
-    assert!(raw.contains(r#""timestamp":null"#), "null timestamp key retained: {raw}");
+    assert!(
+        raw.contains(r#""timestamp":null"#),
+        "null timestamp key retained: {raw}"
+    );
 }
 
 /// SESS-043 — a declaration-merged coding-agent role rides through `AgentMessage::App` as its pi
@@ -108,7 +118,8 @@ fn a_user_message_keeps_its_null_timestamp_key() {
 /// declaration order explicitly and never sees an `App`.
 #[test]
 fn an_app_message_round_trips_its_pi_wire_object() {
-    let wire = r#"{"role":"compactionSummary","summary":"did the thing","tokensBefore":41,"timestamp":9}"#;
+    let wire =
+        r#"{"role":"compactionSummary","summary":"did the thing","tokensBefore":41,"timestamp":9}"#;
     let msg: AgentMessage = serde_json::from_str(wire).expect("a merged role parses");
     let AgentMessage::App { ref role, .. } = msg else {
         panic!("a merged role must land in App, got {msg:?}");
@@ -120,7 +131,11 @@ fn an_app_message_round_trips_its_pi_wire_object() {
         serde_json::from_str::<serde_json::Value>(wire).unwrap(),
         "every field survives the crossing unchanged: {raw}"
     );
-    assert_eq!(raw.matches(r#""role""#).count(), 1, "still exactly one role key: {raw}");
+    assert_eq!(
+        raw.matches(r#""role""#).count(),
+        1,
+        "still exactly one role key: {raw}"
+    );
 }
 
 /// The `App` fallback is closed over pi's four merged roles (`custom` has its own typed arm), so a
@@ -129,5 +144,8 @@ fn an_app_message_round_trips_its_pi_wire_object() {
 #[test]
 fn an_unknown_role_is_still_a_parse_error() {
     let err = serde_json::from_str::<AgentMessage>(r#"{"role":"nonsense","x":1}"#);
-    assert!(err.is_err(), "an unrecognized role must not be swallowed: {err:?}");
+    assert!(
+        err.is_err(),
+        "an unrecognized role must not be swallowed: {err:?}"
+    );
 }

@@ -12,19 +12,24 @@
 //! `before_tool_call` gate → `resolve_ask` under a `HostCtx::begin_human_wait` (P-3) guard →
 //! `HostServices::select` → the scripted sink → the decision → the tool. Not a unit test of the dialog
 //! in isolation.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cyrup_config::AppMode;
 use cyrup_core::{
-    TerminateHint,
-    CancelToken, Content, Message, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink,
+    CancelToken, Content, Message, TerminateHint, Tool, ToolCallId, ToolError, ToolResult,
+    ToolUpdateSink,
 };
 use cyrup_permission_system::PermissionSystemExtension;
 use cyrup_session_svc::{UiKind, UiReply, UiRequest};
-use cyrup_test_support::{create_harness, FauxResponse, HarnessOptions, TestTempDir};
+use cyrup_test_support::{FauxResponse, HarnessOptions, TestTempDir, create_harness};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 /// A fake `bash` tool that RECORDS every command it actually executes (overrides the built-in of the
@@ -65,10 +70,21 @@ impl Tool for RecordingBash {
         _cancel: CancelToken,
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
-        let command =
-            params.get("command").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
-        self.executed.lock().unwrap_or_else(|e| e.into_inner()).push(command);
-        Ok(ToolResult { content: vec![Content::text("EXECUTED")], details: None, terminate: TerminateHint::Unspecified, ..Default::default() })
+        let command = params
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        self.executed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(command);
+        Ok(ToolResult {
+            content: vec![Content::text("EXECUTED")],
+            details: None,
+            terminate: TerminateHint::Unspecified,
+            ..Default::default()
+        })
     }
 }
 
@@ -105,7 +121,12 @@ fn spawn_select_responder(
 async fn interactive_harness(
     answer: &'static str,
     commands: &[&str],
-) -> (cyrup_test_support::Harness, Arc<Mutex<Vec<String>>>, Arc<AtomicUsize>, TestTempDir) {
+) -> (
+    cyrup_test_support::Harness,
+    Arc<Mutex<Vec<String>>>,
+    Arc<AtomicUsize>,
+    TestTempDir,
+) {
     let agent_dir = TestTempDir::new().unwrap();
     // Empty policy ⇒ default ASK for every category (pi `permission-manager.ts:44-50`).
     std::fs::write(agent_dir.path().join("cyrup-permissions.jsonc"), "{}").unwrap();
@@ -139,7 +160,11 @@ async fn interactive_harness(
     // builder late-bound into the extension via `set_host_services` (P-1), so the extension's
     // `LocalAskChannel::select` round-trips to this sink.
     let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel::<UiRequest>();
-    harness.session().services().host_services.set_ui_sink(ui_tx);
+    harness
+        .session()
+        .services()
+        .host_services
+        .set_ui_sink(ui_tx);
     let selects = spawn_select_responder(ui_rx, answer);
 
     (harness, executed, selects, agent_dir)
@@ -147,7 +172,9 @@ async fn interactive_harness(
 
 fn has_error_tool_result_containing(msgs: &[Message], needle: &str) -> bool {
     msgs.iter().any(|m| match m {
-        Message::ToolResult { is_error, content, .. } => {
+        Message::ToolResult {
+            is_error, content, ..
+        } => {
             *is_error
                 && content.iter().any(|c| match c {
                     Content::Text { text, .. } => text.contains(needle),
@@ -170,7 +197,11 @@ async fn human_allow_once_lets_the_ask_tier_tool_proceed() {
         vec!["ls -la".to_string()],
         "an ask-tier command the human approved must execute through the registered hook"
     );
-    assert_eq!(selects.load(Ordering::SeqCst), 1, "exactly one permission dialog was surfaced");
+    assert_eq!(
+        selects.load(Ordering::SeqCst),
+        1,
+        "exactly one permission dialog was surfaced"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -181,10 +212,17 @@ async fn human_reject_blocks_the_ask_tier_tool() {
 
     // The human rejected → the tool NEVER executed (blocked at the hook).
     assert!(
-        executed.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+        executed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty(),
         "a human-rejected command must not execute; run: {run:?}"
     );
-    assert_eq!(selects.load(Ordering::SeqCst), 1, "the reject was surfaced through one dialog");
+    assert_eq!(
+        selects.load(Ordering::SeqCst),
+        1,
+        "the reject was surfaced through one dialog"
+    );
     // The denial surfaced as an is_error tool result (pi `formatUserDeniedReason`).
     let msgs = harness.session().messages().await;
     assert!(
@@ -235,7 +273,8 @@ async fn human_allow_always_survives_into_a_later_turn_of_the_same_session() {
     // (`cyrup-session-svc/src/session.rs:2941`), so a second `prompt()` on this same session must
     // leave the store standing. If a future change re-announces start per turn, or re-installs the
     // extension mid-session, that latch breaks and this test goes red — which is the point.
-    let (harness, executed, selects, _dir) = interactive_harness("Allow Always", &["echo hi"]).await;
+    let (harness, executed, selects, _dir) =
+        interactive_harness("Allow Always", &["echo hi"]).await;
 
     // Turn 1: the human is asked once and picks "Allow Always".
     harness.run("first turn").await.unwrap();
@@ -285,7 +324,10 @@ async fn perm034_allow_always_sticks_for_the_reported_command() {
 
     assert_eq!(
         executed.lock().unwrap_or_else(|e| e.into_inner()).clone(),
-        vec!["rm -rf ./tmp/test".to_string(), "rm -rf ./tmp/test".to_string()],
+        vec![
+            "rm -rf ./tmp/test".to_string(),
+            "rm -rf ./tmp/test".to_string()
+        ],
         "both calls executed"
     );
     assert_eq!(
@@ -302,7 +344,8 @@ async fn perm034_allow_always_sticks_for_the_reported_command() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn perm034_allow_always_sticks_for_a_compound_command() {
     let cmd = "rm -rf ./tmp/test && echo done";
-    let (harness, _executed, selects, _dir) = interactive_harness("Allow Always", &[cmd, cmd]).await;
+    let (harness, _executed, selects, _dir) =
+        interactive_harness("Allow Always", &[cmd, cmd]).await;
 
     harness.run("go").await.unwrap();
 
@@ -336,7 +379,11 @@ async fn perm034_a_reload_wipes_always_grants_exactly_as_upstream_does() {
         interactive_harness("Allow Always", &["rm -rf ./tmp/test"]).await;
 
     harness.run("first turn").await.unwrap();
-    assert_eq!(selects.load(Ordering::SeqCst), 1, "turn 1 prompts exactly once");
+    assert_eq!(
+        selects.load(Ordering::SeqCst),
+        1,
+        "turn 1 prompts exactly once"
+    );
 
     // The store-clearing half of `ExtensionFacade::reload` (`cyrup-ext/src/facade.rs:2142`), in its
     // order: shutdown the outgoing set, then start the fresh one. Note the session's own
@@ -346,19 +393,28 @@ async fn perm034_a_reload_wipes_always_grants_exactly_as_upstream_does() {
     let dispatcher = harness.session().services().ext_host.dispatcher();
     dispatcher
         .dispatch_notify(
-            &HostEvent::SessionShutdown { reason: "reload".into(), target_session_file: None },
+            &HostEvent::SessionShutdown {
+                reason: "reload".into(),
+                target_session_file: None,
+            },
             &cancel,
         )
         .await;
     dispatcher
         .dispatch_notify(
-            &HostEvent::SessionStart { reason: "reload".into(), previous_session_file: None },
+            &HostEvent::SessionStart {
+                reason: "reload".into(),
+                previous_session_file: None,
+            },
             &cancel,
         )
         .await;
 
     harness.append_responses(vec![
-        FauxResponse::tool_call("bash", serde_json::json!({ "command": "rm -rf ./tmp/test" })),
+        FauxResponse::tool_call(
+            "bash",
+            serde_json::json!({ "command": "rm -rf ./tmp/test" }),
+        ),
         FauxResponse::text("done"),
     ]);
     harness.run("second turn").await.unwrap();

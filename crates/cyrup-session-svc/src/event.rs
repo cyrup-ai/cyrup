@@ -5,14 +5,12 @@
 //! rpc front-ends (func-11 Open-Question resolved: yes, one schema). Snake_case `type` tags match
 //! Pi's event-type names; payload fields are camelCase via the embedded agent types.
 
-use std::sync::Arc;
-use cyrup_agent::{
-    AgentEvent, AgentMessage, AppRole, ToolResultMessage,
-};
+use cyrup_agent::{AgentEvent, AgentMessage, AppRole, ToolResultMessage};
 use cyrup_core::{Content, ToolCallId};
 use cyrup_provider::StreamEvent;
 use cyrup_session::compaction::CompactionReason;
 use serde_json::Value;
+use std::sync::Arc;
 
 /// Where a user submission originated (func-11 §5/§6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -39,7 +37,12 @@ pub struct UserInput {
 impl UserInput {
     /// A plain text submission from the given source.
     pub fn text(text: impl Into<String>, source: InputSource) -> Self {
-        Self { text: text.into(), images: Vec::new(), source, expand_templates: true }
+        Self {
+            text: text.into(),
+            images: Vec::new(),
+            source,
+            expand_templates: true,
+        }
     }
 
     /// Build the agent transcript message for this input (text first, then any images).
@@ -47,7 +50,10 @@ impl UserInput {
         let mut content = Vec::with_capacity(1 + self.images.len());
         content.push(Content::text(self.text));
         content.extend(self.images);
-        AgentMessage::User { content, timestamp: None }
+        AgentMessage::User {
+            content,
+            timestamp: None,
+        }
     }
 }
 
@@ -117,7 +123,11 @@ pub enum SummarizationRetrySource {
 
 /// The event super-set the seam exposes (arch-11 §3.2).
 #[derive(Clone, Debug, serde::Serialize)]
-#[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum AgentSessionEvent {
     // --- forwarded AgentEvent (cyrup-agent / func-02) ---
     AgentStart,
@@ -289,48 +299,61 @@ impl AgentSessionEvent {
         match ev {
             AgentEvent::AgentStart => AgentSessionEvent::AgentStart,
             AgentEvent::TurnStart => AgentSessionEvent::TurnStart,
-            AgentEvent::MessageStart { message } => {
-                AgentSessionEvent::MessageStart { message: message.clone() }
-            }
-            AgentEvent::MessageUpdate { message, assistant_message_event } => {
-                AgentSessionEvent::MessageUpdate {
-                    message: message.clone(),
-                    assistant_message_event: assistant_message_event.clone(),
-                }
-            }
-            AgentEvent::MessageEnd { message } => {
-                AgentSessionEvent::MessageEnd { message: message.clone() }
-            }
-            AgentEvent::ToolExecutionStart { tool_call_id, tool_name, args } => {
-                AgentSessionEvent::ToolExecutionStart {
-                    tool_call_id: tool_call_id.clone(),
-                    tool_name: tool_name.clone(),
-                    args: args.clone(),
-                }
-            }
-            AgentEvent::ToolExecutionUpdate { tool_call_id, tool_name, args, partial_result } => {
-                AgentSessionEvent::ToolExecutionUpdate {
-                    tool_call_id: tool_call_id.clone(),
-                    tool_name: tool_name.clone(),
-                    args: args.clone(),
-                    partial_result: partial_result.clone(),
-                }
-            }
-            AgentEvent::ToolExecutionEnd { tool_call_id, tool_name, result, is_error } => {
-                AgentSessionEvent::ToolExecutionEnd {
-                    tool_call_id: tool_call_id.clone(),
-                    tool_name: tool_name.clone(),
-                    result: result.clone(),
-                    is_error: *is_error,
-                }
-            }
-            AgentEvent::TurnEnd { message, tool_results } => AgentSessionEvent::TurnEnd {
+            AgentEvent::MessageStart { message } => AgentSessionEvent::MessageStart {
+                message: message.clone(),
+            },
+            AgentEvent::MessageUpdate {
+                message,
+                assistant_message_event,
+            } => AgentSessionEvent::MessageUpdate {
+                message: message.clone(),
+                assistant_message_event: assistant_message_event.clone(),
+            },
+            AgentEvent::MessageEnd { message } => AgentSessionEvent::MessageEnd {
+                message: message.clone(),
+            },
+            AgentEvent::ToolExecutionStart {
+                tool_call_id,
+                tool_name,
+                args,
+            } => AgentSessionEvent::ToolExecutionStart {
+                tool_call_id: tool_call_id.clone(),
+                tool_name: tool_name.clone(),
+                args: args.clone(),
+            },
+            AgentEvent::ToolExecutionUpdate {
+                tool_call_id,
+                tool_name,
+                args,
+                partial_result,
+            } => AgentSessionEvent::ToolExecutionUpdate {
+                tool_call_id: tool_call_id.clone(),
+                tool_name: tool_name.clone(),
+                args: args.clone(),
+                partial_result: partial_result.clone(),
+            },
+            AgentEvent::ToolExecutionEnd {
+                tool_call_id,
+                tool_name,
+                result,
+                is_error,
+            } => AgentSessionEvent::ToolExecutionEnd {
+                tool_call_id: tool_call_id.clone(),
+                tool_name: tool_name.clone(),
+                result: result.clone(),
+                is_error: *is_error,
+            },
+            AgentEvent::TurnEnd {
+                message,
+                tool_results,
+            } => AgentSessionEvent::TurnEnd {
                 message: message.clone(),
                 tool_results: tool_results.clone(),
             },
-            AgentEvent::AgentEnd { messages } => {
-                AgentSessionEvent::AgentEnd { messages: messages.clone(), will_retry: false }
-            }
+            AgentEvent::AgentEnd { messages } => AgentSessionEvent::AgentEnd {
+                messages: messages.clone(),
+                will_retry: false,
+            },
         }
     }
 
@@ -377,9 +400,10 @@ impl AgentSessionEvent {
 pub(crate) fn agent_message_to_core(m: &AgentMessage) -> Option<cyrup_core::Message> {
     use cyrup_core::Message;
     match m {
-        AgentMessage::User { content, timestamp } => {
-            Some(Message::User { content: content.clone(), timestamp: timestamp.unwrap_or(0) })
-        }
+        AgentMessage::User { content, timestamp } => Some(Message::User {
+            content: content.clone(),
+            timestamp: timestamp.unwrap_or(0),
+        }),
         AgentMessage::Assistant(a) => Some(Message::Assistant((**a).clone())),
         AgentMessage::ToolResult(t) => Some(Message::ToolResult {
             tool_call_id: t.tool_call_id.clone(),
@@ -462,7 +486,10 @@ pub(crate) fn raw_message_to_agent(m: &cyrup_session::agent_message::AgentMessag
                 other.push_llm(&mut rendered);
                 match rendered.first() {
                     Some(first) => core_message_to_agent(first),
-                    None => AgentMessage::User { content: Vec::new(), timestamp: None },
+                    None => AgentMessage::User {
+                        content: Vec::new(),
+                        timestamp: None,
+                    },
                 }
             }
         },
@@ -479,9 +506,10 @@ fn app_role_of(m: &cyrup_session::agent_message::AgentMessage) -> Option<AppRole
         MessageRole::BashExecution => Some(AppRole::BashExecution),
         MessageRole::BranchSummary => Some(AppRole::BranchSummary),
         MessageRole::CompactionSummary => Some(AppRole::CompactionSummary),
-        MessageRole::User | MessageRole::Assistant | MessageRole::ToolResult | MessageRole::Custom => {
-            None
-        }
+        MessageRole::User
+        | MessageRole::Assistant
+        | MessageRole::ToolResult
+        | MessageRole::Custom => None,
     }
 }
 
@@ -489,9 +517,10 @@ fn app_role_of(m: &cyrup_session::agent_message::AgentMessage) -> Option<AppRole
 pub(crate) fn core_message_to_agent(m: &cyrup_core::Message) -> AgentMessage {
     use cyrup_core::Message;
     match m {
-        Message::User { content, timestamp } => {
-            AgentMessage::User { content: content.clone(), timestamp: Some(*timestamp) }
-        }
+        Message::User { content, timestamp } => AgentMessage::User {
+            content: content.clone(),
+            timestamp: Some(*timestamp),
+        },
         Message::Assistant(a) => AgentMessage::Assistant(Arc::new(a.clone())),
         Message::ToolResult {
             tool_call_id,

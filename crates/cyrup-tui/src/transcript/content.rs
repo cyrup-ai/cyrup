@@ -71,5 +71,10 @@ pub fn parse_skill_block(text: &str) -> Option<ParsedSkillBlock> {
         let um = after.strip_prefix("\n\n")?.trim();
         (!um.is_empty()).then(|| um.to_string())
     };
-    Some(ParsedSkillBlock { name: name.to_string(), location: location.to_string(), content, user_message })
+    Some(ParsedSkillBlock {
+        name: name.to_string(),
+        location: location.to_string(),
+        content,
+        user_message,
+    })
 }

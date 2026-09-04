@@ -4,7 +4,12 @@
 //! Both are `pub` surfaces with no in-workspace caller, which is exactly why neither divergence had
 //! ever been observed. Each test drives the REAL public entry point and asserts on the consumer side
 //! of the seam, never on the setter's own return value.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14,10 +19,10 @@ use cyrup_core::{
     CancelToken, Content, StopReason, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink,
 };
 use cyrup_ext::HostServices as _;
-use cyrup_provider::faux::{
-    faux_assistant_message, faux_text, faux_tool_call, FauxProvider, FauxResponseStep,
-};
 use cyrup_provider::Provider;
+use cyrup_provider::faux::{
+    FauxProvider, FauxResponseStep, faux_assistant_message, faux_text, faux_tool_call,
+};
 
 use crate::{AgentSession, ScopedModel, SessionBuilder, SessionConfig};
 use tempfile::TempDir;
@@ -36,7 +41,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -88,19 +97,29 @@ async fn set_scoped_models_reaches_the_extension_seam() {
 
     // What `main.rs` does after `resolve_scoped_models_reporting`.
     let catalog = session.model_catalog();
-    assert!(!catalog.is_empty(), "the faux provider offers at least one model");
+    assert!(
+        !catalog.is_empty(),
+        "the faux provider offers at least one model"
+    );
     let first = catalog[0].clone();
     session.set_scoped_models(vec![
         ScopedModel {
             model: first.clone(),
             thinking_level: Some(cyrup_core::ModelThinkingLevel::High),
         },
-        ScopedModel { model: first.clone(), thinking_level: None },
+        ScopedModel {
+            model: first.clone(),
+            thinking_level: None,
+        },
     ]);
 
     let scoped = services.scoped_models();
     let rows = scoped.as_array().expect("an array");
-    assert_eq!(rows.len(), 2, "the whole scoped set is visible to extensions: {scoped}");
+    assert_eq!(
+        rows.len(),
+        2,
+        "the whole scoped set is visible to extensions: {scoped}"
+    );
     assert_eq!(
         rows[0]["model"]["id"].as_str(),
         Some(first.id.as_str()),
@@ -154,12 +173,18 @@ impl Tool for WideningCustomTool {
         _cancel: CancelToken,
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
-        let session =
-            self.slot.get().and_then(Weak::upgrade).ok_or_else(|| ToolError::new("no session"))?;
+        let session = self
+            .slot
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| ToolError::new("no session"))?;
         let mut names = session.active_tool_names();
         names.push("custom_late".to_string());
         session.set_active_tools_by_name(&names).await;
-        Ok(ToolResult { content: vec![Content::text("loaded")], ..Default::default() })
+        Ok(ToolResult {
+            content: vec![Content::text("loaded")],
+            ..Default::default()
+        })
     }
 }
 
@@ -185,7 +210,10 @@ impl Tool for LateCustomTool {
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
         self.ran.fetch_add(1, Ordering::SeqCst);
-        Ok(ToolResult { content: vec![Content::text("late-ran")], ..Default::default() })
+        Ok(ToolResult {
+            content: vec![Content::text("late-ran")],
+            ..Default::default()
+        })
     }
 }
 
@@ -204,7 +232,9 @@ fn faux_script(offered: &OfferedTools, script: Vec<Reply>) -> Arc<FauxProvider> 
         .map(|reply| {
             let cap = offered.clone();
             FauxResponseStep::factory(move |ctx, _opts, _state, _model| {
-                cap.lock().unwrap().push(ctx.tools.iter().map(|t| t.name.clone()).collect());
+                cap.lock()
+                    .unwrap()
+                    .push(ctx.tools.iter().map(|t| t.name.clone()).collect());
                 match reply {
                     Reply::Call(name) => faux_assistant_message(
                         vec![faux_tool_call(name.to_string(), serde_json::json!({}))],
@@ -245,7 +275,11 @@ async fn register_custom_tools_wraps_and_contributes_like_the_build_time_path() 
     let offered: OfferedTools = Arc::new(Mutex::new(Vec::new()));
     let faux = faux_script(
         &offered,
-        vec![Reply::Call("custom_loader"), Reply::Call("custom_late"), Reply::Text("done")],
+        vec![
+            Reply::Call("custom_loader"),
+            Reply::Call("custom_late"),
+            Reply::Text("done"),
+        ],
     );
     let slot: SessionSlot = Arc::new(OnceLock::new());
     let late_ran = Arc::new(AtomicUsize::new(0));
@@ -259,19 +293,34 @@ async fn register_custom_tools_wraps_and_contributes_like_the_build_time_path() 
 
     // THE SEAM UNDER TEST: registration AFTER `build()`, the only reason this method is `pub`.
     session.register_custom_tools(vec![
-        Arc::new(WideningCustomTool { slot: slot.clone(), params: empty_schema() }),
-        Arc::new(LateCustomTool { ran: late_ran.clone(), params: empty_schema() }),
+        Arc::new(WideningCustomTool {
+            slot: slot.clone(),
+            params: empty_schema(),
+        }),
+        Arc::new(LateCustomTool {
+            ran: late_ran.clone(),
+            params: empty_schema(),
+        }),
     ]);
 
     // Custom tools register INERT (pi's build-time `customTools` are activated by selection), so
     // activate the loader explicitly — leaving `custom_late` registered-but-inactive.
-    let mut names: Vec<String> =
-        session.active_tool_names().into_iter().filter(|n| n != "custom_late").collect();
+    let mut names: Vec<String> = session
+        .active_tool_names()
+        .into_iter()
+        .filter(|n| n != "custom_late")
+        .collect();
     names.push("custom_loader".to_string());
     session.set_active_tools_by_name(&names).await;
     let active = session.active_tool_names();
-    assert!(active.iter().any(|n| n == "custom_loader"), "the custom tool is active: {active:?}");
-    assert!(!active.iter().any(|n| n == "custom_late"), "`custom_late` is inactive: {active:?}");
+    assert!(
+        active.iter().any(|n| n == "custom_loader"),
+        "the custom tool is active: {active:?}"
+    );
+    assert!(
+        !active.iter().any(|n| n == "custom_late"),
+        "`custom_late` is inactive: {active:?}"
+    );
 
     // (1) PROMPT CONTRIBUTION — the rebuilt base prompt carries the custom tool's snippet. Without
     //     the contribution upsert the name is silently dropped from `tool_contributions`.
@@ -305,7 +354,10 @@ async fn register_custom_tools_wraps_and_contributes_like_the_build_time_path() 
 
     // …and the derivation is not cosmetic: the newly-activated tool really was callable.
     let turns = offered.lock().unwrap().clone();
-    assert!(turns.len() >= 2, "the run drove at least two turns: {turns:?}");
+    assert!(
+        turns.len() >= 2,
+        "the run drove at least two turns: {turns:?}"
+    );
     assert!(
         !turns[0].iter().any(|t| t == "custom_late"),
         "turn 1 did not offer `custom_late`: {:?}",
@@ -316,7 +368,11 @@ async fn register_custom_tools_wraps_and_contributes_like_the_build_time_path() 
         "turn 2 offered `custom_late`: {:?}",
         turns[1]
     );
-    assert_eq!(late_ran.load(Ordering::SeqCst), 1, "`custom_late` actually executed");
+    assert_eq!(
+        late_ran.load(Ordering::SeqCst),
+        1,
+        "`custom_late` actually executed"
+    );
 }
 
 // ------------------------------------------- slash-command outcome surfacing (both tiers) ----
@@ -375,7 +431,10 @@ async fn a_command_handlers_outcome_reaches_the_ui_channel_on_every_shape() {
     // (2) A handler that deliberately says nothing stays silent — including whitespace-only output.
     session.surface_command_outcome("quiet", &Ok(None));
     session.surface_command_outcome("quiet", &Ok(Some("  \n\t ".to_string())));
-    assert!(drain(&mut rx).is_empty(), "silence is preserved, not turned into an empty toast");
+    assert!(
+        drain(&mut rx).is_empty(),
+        "silence is preserved, not turned into an empty toast"
+    );
 
     // (3) A FAULTED handler surfaces as pi's `command:<name>` error, rather than vanishing.
     session.surface_command_outcome(
@@ -383,11 +442,18 @@ async fn a_command_handlers_outcome_reaches_the_ui_channel_on_every_shape() {
         &Err(cyrup_ext::ExtError::Component("guest trapped".to_string())),
     );
     let seen = drain(&mut rx);
-    assert_eq!(seen.len(), 1, "a fault produces exactly one notification: {seen:?}");
+    assert_eq!(
+        seen.len(),
+        1,
+        "a fault produces exactly one notification: {seen:?}"
+    );
     assert_eq!(seen[0].1, NotifyKind::Error);
     assert!(
         seen[0].0.starts_with("command:deploy: "),
         "pi's `extensionPath: command:<name>` prefix is preserved: {seen:?}"
     );
-    assert!(seen[0].0.contains("guest trapped"), "…and carries the real cause: {seen:?}");
+    assert!(
+        seen[0].0.contains("guest trapped"),
+        "…and carries the real cause: {seen:?}"
+    );
 }

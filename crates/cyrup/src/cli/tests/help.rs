@@ -65,6 +65,10 @@ fn the_env_help_block_and_the_read_set_are_the_same_set() {
         ("anthropic", "ANTHROPIC_AUTH_TOKEN"),
         ("qwen-token-plan", "QWEN_TOKEN_PLAN_API_KEY"),
         ("qwen-token-plan-cn", "QWEN_TOKEN_PLAN_CN_API_KEY"),
+        // PROV-014: the Individual plan shares the international variable (env-api-keys.ts:83
+        // @v0.84.4), so pi's block needs no third Qwen row (`args.ts:419-420` @v0.84.4) — and
+        // `RADIUS_API_KEY` is deliberately NOT asserted: pi's block does not list it either.
+        ("qwen-token-plan-individual", "QWEN_TOKEN_PLAN_API_KEY"),
         ("xiaomi", "XIAOMI_API_KEY"),
         ("xiaomi-token-plan-cn", "XIAOMI_TOKEN_PLAN_CN_API_KEY"),
         ("xiaomi-token-plan-ams", "XIAOMI_TOKEN_PLAN_AMS_API_KEY"),

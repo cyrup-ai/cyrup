@@ -25,7 +25,9 @@ pub fn stream_event_type_sequence(events: &[StreamEvent]) -> Vec<String> {
         .iter()
         .filter_map(|e| {
             serde_json::to_value(e).ok().and_then(|v| {
-                v.get("type").and_then(|t| t.as_str()).map(|s| s.to_string())
+                v.get("type")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string())
             })
         })
         .collect()
@@ -157,7 +159,11 @@ const SESSION_LAYER_ONLY_KINDS: &[&str] = &["agent_settled"];
 /// scenario, a golden JSONL of `AgentSessionEvent`) compare the full sequence — `agent_settled` is a
 /// real, ordering-significant part of it.
 pub fn agent_loop_kinds(actual: &[String]) -> Vec<String> {
-    actual.iter().filter(|k| !SESSION_LAYER_ONLY_KINDS.contains(&k.as_str())).cloned().collect()
+    actual
+        .iter()
+        .filter(|k| !SESSION_LAYER_ONLY_KINDS.contains(&k.as_str()))
+        .cloned()
+        .collect()
 }
 
 /// A cross-impl-canonical rendering of one event value (volatile fields zeroed, `role` dropped,
@@ -176,7 +182,10 @@ pub async fn run_differential(
     prompt: impl Into<String>,
     expected_kinds: &[&str],
 ) -> Result<(), String> {
-    let events = harness.run(prompt).await.map_err(|e: HarnessError| e.to_string())?;
+    let events = harness
+        .run(prompt)
+        .await
+        .map_err(|e: HarnessError| e.to_string())?;
     let actual = event_kind_sequence(&events);
     let expected: Vec<String> = expected_kinds.iter().map(|s| s.to_string()).collect();
     assert_event_kinds(&expected, &actual)

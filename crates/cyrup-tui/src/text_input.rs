@@ -17,22 +17,22 @@
 
 use unicode_segmentation::UnicodeSegmentation;
 
+use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use crate::editor::kill_ring::{kill_ring_push, kill_ring_rotate};
-use crate::editor::undo::{push_bounded, should_snapshot_for_type, UNDO_CAP};
+use crate::editor::undo::{UNDO_CAP, push_bounded, should_snapshot_for_type};
 use crate::editor::word_nav::{
     byte_seg_first_punct, byte_seg_is_whitespace, byte_seg_last_punct_end, byte_word_segments,
     find_word_backward, find_word_forward,
 };
 use crate::keymap::{EditorAction, EditorKeymap, SelectAction, SelectKeymap};
 use crate::selector::{
-    border_rule, input_line_spans, stack_rows, title_lines, title_wrapped_height, Selector,
-    SelectorOutcome,
+    Selector, SelectorOutcome, border_rule, input_line_spans, stack_rows, title_lines,
+    title_wrapped_height,
 };
 use crate::theme::UiTheme;
 
@@ -208,8 +208,10 @@ impl Input {
             }
             Some(EditorAction::CursorRight) => {
                 self.last_action = LastAction::None;
-                self.cursor =
-                    self.cursor.saturating_add(self.next_grapheme_len()).min(self.value.len());
+                self.cursor = self
+                    .cursor
+                    .saturating_add(self.next_grapheme_len())
+                    .min(self.value.len());
                 InputOutcome::Moved
             }
             Some(EditorAction::CursorLineStart) => {
@@ -237,10 +239,9 @@ impl Input {
             // `Ctrl+W` from `w`.
             None => match key.code {
                 KeyCode::Char(c)
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
-                        && !c.is_control() =>
+                    if !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) && !c.is_control() =>
                 {
                     self.insert_char(c);
                     InputOutcome::Edited
@@ -273,7 +274,10 @@ impl Input {
     /// The largest char boundary `<= at` — the guard that keeps [`Self::cursor`]'s invariant true
     /// even when a host hands in an arbitrary offset.
     fn snap(&self, at: usize) -> usize {
-        (0..=at.min(self.value.len())).rev().find(|i| self.value.is_char_boundary(*i)).unwrap_or(0)
+        (0..=at.min(self.value.len()))
+            .rev()
+            .find(|i| self.value.is_char_boundary(*i))
+            .unwrap_or(0)
     }
 
     /// Replace `value[start..end]` with `text`, rebuilt from two `str::get` slices. Returns `false`
@@ -294,13 +298,19 @@ impl Input {
     /// The byte length of the grapheme cluster ending at the caret (`input.ts:151-155`'s
     /// `lastGrapheme.segment.length`), `0` at the start of the field.
     fn prev_grapheme_len(&self) -> usize {
-        self.value.get(..self.cursor).and_then(|s| s.graphemes(true).next_back()).map_or(0, str::len)
+        self.value
+            .get(..self.cursor)
+            .and_then(|s| s.graphemes(true).next_back())
+            .map_or(0, str::len)
     }
 
     /// The byte length of the grapheme cluster starting at the caret (`input.ts:161-165`), `0` at
     /// the end of the field.
     fn next_grapheme_len(&self) -> usize {
-        self.value.get(self.cursor..).and_then(|s| s.graphemes(true).next()).map_or(0, str::len)
+        self.value
+            .get(self.cursor..)
+            .and_then(|s| s.graphemes(true).next())
+            .map_or(0, str::len)
     }
 
     /// `pushUndo` (`input.ts:338-340`), bounded exactly as the multi-line editor's stack is.
@@ -352,7 +362,10 @@ impl Input {
             return;
         }
         self.push_undo();
-        let end = self.cursor.saturating_add(self.next_grapheme_len()).min(self.value.len());
+        let end = self
+            .cursor
+            .saturating_add(self.next_grapheme_len())
+            .min(self.value.len());
         self.splice(self.cursor, end, "");
     }
 
@@ -394,7 +407,11 @@ impl Input {
         let was_kill = self.last_action == LastAction::Kill;
         self.push_undo();
         let delete_from = self.word_left();
-        let deleted = self.value.get(delete_from..self.cursor).unwrap_or("").to_string();
+        let deleted = self
+            .value
+            .get(delete_from..self.cursor)
+            .unwrap_or("")
+            .to_string();
         self.push_kill(&deleted, true, was_kill);
         self.last_action = LastAction::Kill;
         if self.splice(delete_from, self.cursor, "") {
@@ -410,7 +427,11 @@ impl Input {
         let was_kill = self.last_action == LastAction::Kill;
         self.push_undo();
         let delete_to = self.word_right();
-        let deleted = self.value.get(self.cursor..delete_to).unwrap_or("").to_string();
+        let deleted = self
+            .value
+            .get(self.cursor..delete_to)
+            .unwrap_or("")
+            .to_string();
         self.push_kill(&deleted, false, was_kill);
         self.last_action = LastAction::Kill;
         self.splice(self.cursor, delete_to, "");
@@ -418,7 +439,9 @@ impl Input {
 
     /// `yank` (`input.ts:309-318`) — Ctrl+Y: insert the ring top at the caret.
     fn yank(&mut self) {
-        let Some(text) = self.kill_ring.last().cloned() else { return };
+        let Some(text) = self.kill_ring.last().cloned() else {
+            return;
+        };
         if text.is_empty() {
             return;
         }
@@ -458,7 +481,9 @@ impl Input {
     /// `undo` (`input.ts:342-348`): pop one snapshot, restore BOTH value and caret, clear
     /// `lastAction`. No redo (pi parity).
     fn undo(&mut self) {
-        let Some((value, cursor)) = self.undo.pop() else { return };
+        let Some((value, cursor)) = self.undo.pop() else {
+            return;
+        };
         self.value = value;
         self.cursor = self.snap(cursor.min(self.value.len()));
         self.last_action = LastAction::None;
@@ -491,7 +516,9 @@ impl Input {
         if self.cursor == 0 {
             return 0;
         }
-        let Some(before) = self.value.get(..self.cursor) else { return self.cursor };
+        let Some(before) = self.value.get(..self.cursor) else {
+            return self.cursor;
+        };
         let segs = byte_word_segments(before);
         find_word_backward(
             segs,
@@ -507,7 +534,9 @@ impl Input {
         if self.cursor >= len {
             return len;
         }
-        let Some(after) = self.value.get(self.cursor..) else { return self.cursor };
+        let Some(after) = self.value.get(self.cursor..) else {
+            return self.cursor;
+        };
         let segs = byte_word_segments(after);
         find_word_forward(
             &segs,
@@ -541,7 +570,11 @@ impl TextInputSelector {
     /// `ui.input` wire field has somewhere to land and then discarded, which is what upstream does
     /// with it (`extension-input.ts:36` binds it as `_placeholder`).
     pub fn new(title: String, _placeholder: Option<String>) -> Self {
-        TextInputSelector { title, input: Input::new(), keymap: SelectKeymap::default() }
+        TextInputSelector {
+            title,
+            input: Input::new(),
+            keymap: SelectKeymap::default(),
+        }
     }
 
     /// Bind the hint row to the app's live `tui.select.*` table, so it names the keys the user has
@@ -687,13 +720,18 @@ impl Selector for TextInputSelector {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 mod tests {
     use super::*;
+    use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyEventKind, KeyEventState};
     use ratatui::style::Modifier;
-    use ratatui::Terminal;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent {
@@ -710,7 +748,8 @@ mod tests {
         let theme = UiTheme::dark();
         let h = sel.desired_height(w);
         let mut term = Terminal::new(TestBackend::new(w, h)).expect("test terminal");
-        term.draw(|f| sel.render(f, f.area(), &theme)).expect("draw");
+        term.draw(|f| sel.render(f, f.area(), &theme))
+            .expect("draw");
         term.backend().buffer().clone()
     }
 
@@ -770,9 +809,22 @@ mod tests {
         let buf = buffer_of(&mut sel, 40);
         // `"> "` (2) + `ab` (2) ⇒ the caret is over the `c` at column 4.
         let caret = buf.cell((4, INPUT_ROW)).unwrap();
-        assert!(caret.modifier.contains(Modifier::REVERSED), "{:?}", row_text(&buf, INPUT_ROW));
-        assert_eq!(caret.symbol(), "c", "the caret highlights the character it is on");
-        assert!(!buf.cell((2, INPUT_ROW)).unwrap().modifier.contains(Modifier::REVERSED));
+        assert!(
+            caret.modifier.contains(Modifier::REVERSED),
+            "{:?}",
+            row_text(&buf, INPUT_ROW)
+        );
+        assert_eq!(
+            caret.symbol(),
+            "c",
+            "the caret highlights the character it is on"
+        );
+        assert!(
+            !buf.cell((2, INPUT_ROW))
+                .unwrap()
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
     }
 
     /// **E10.** The prompt is a plain two-column `"> "` at column 0.
@@ -790,7 +842,10 @@ mod tests {
         }
         let buf = buffer_of(&mut sel, 40);
         let row = row_text(&buf, INPUT_ROW);
-        assert!(row.starts_with("> hi"), "E10: `\"> \"` at column 0 (`input.ts:380`): {row:?}");
+        assert!(
+            row.starts_with("> hi"),
+            "E10: `\"> \"` at column 0 (`input.ts:380`): {row:?}"
+        );
         let theme = UiTheme::dark();
         let prompt = buf.cell((0, INPUT_ROW)).unwrap();
         assert_ne!(
@@ -814,7 +869,11 @@ mod tests {
         // The title row is child index 2, inset one column by its `paddingX = 1`.
         let cell = buf.cell((1, 2)).unwrap();
         assert_eq!(cell.symbol(), "N", "title row: {:?}", row_text(&buf, 2));
-        assert_eq!(cell.fg, theme.accent_style().fg.unwrap(), "the title is accent");
+        assert_eq!(
+            cell.fg,
+            theme.accent_style().fg.unwrap(),
+            "the title is accent"
+        );
         assert!(
             !cell.modifier.contains(Modifier::BOLD),
             "E11: `theme.fg` is colour-only — nothing bolds this title"
@@ -826,17 +885,26 @@ mod tests {
         let mut sel = TextInputSelector::new("Name?".to_string(), None);
         let km = SelectKeymap::default();
         for c in "hi".chars() {
-            assert_eq!(sel.handle(&key(KeyCode::Char(c)), &km), SelectorOutcome::Redraw);
+            assert_eq!(
+                sel.handle(&key(KeyCode::Char(c)), &km),
+                SelectorOutcome::Redraw
+            );
         }
         assert_eq!(sel.text(), "hi");
-        assert_eq!(sel.handle(&key(KeyCode::Enter), &km), SelectorOutcome::Confirm("hi".to_string()));
+        assert_eq!(
+            sel.handle(&key(KeyCode::Enter), &km),
+            SelectorOutcome::Confirm("hi".to_string())
+        );
     }
 
     #[test]
     fn empty_submit_confirms_empty_string() {
         let mut sel = TextInputSelector::new("Name?".to_string(), Some("placeholder".to_string()));
         let km = SelectKeymap::default();
-        assert_eq!(sel.handle(&key(KeyCode::Enter), &km), SelectorOutcome::Confirm(String::new()));
+        assert_eq!(
+            sel.handle(&key(KeyCode::Enter), &km),
+            SelectorOutcome::Confirm(String::new())
+        );
     }
 
     #[test]

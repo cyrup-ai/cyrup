@@ -21,19 +21,19 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::run_rpc;
 use cyrup_core::{ExtensionId, StopReason};
 use cyrup_ext::{
-    CommandDescriptor, ControlOp, ExtError, HostCtx, HostEvent, HookOutcome, HostServices, InitApi,
+    CommandDescriptor, ControlOp, ExtError, HookOutcome, HostCtx, HostEvent, HostServices, InitApi,
     NativeExtension,
 };
-use crate::run_rpc;
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 use cyrup_provider::Provider;
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
 use cyrup_session_svc::{AgentSessionRuntime, SessionFactory, SessionTarget};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 
-use super::support::{base_config_no_ext, create_runtime, fixture, parse_lines, Fixture};
+use super::support::{Fixture, base_config_no_ext, create_runtime, fixture, parse_lines};
 
 // ---------------------------------------------------------------------------------------------
 // Runtime builders
@@ -41,12 +41,19 @@ use super::support::{base_config_no_ext, create_runtime, fixture, parse_lines, F
 
 fn faux_ok() -> Arc<dyn Provider> {
     let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("ok")],
+        StopReason::Stop,
+    )]);
     faux
 }
 
 async fn build_runtime(fx: &Fixture) -> Arc<AgentSessionRuntime> {
-    create_runtime(SessionFactory::new(faux_ok(), base_config_no_ext(fx)), SessionTarget::New).await
+    create_runtime(
+        SessionFactory::new(faux_ok(), base_config_no_ext(fx)),
+        SessionTarget::New,
+    )
+    .await
 }
 
 async fn build_runtime_with(
@@ -68,7 +75,10 @@ async fn drive_rpc_to_eof(
     let payload = lines.to_string();
     let feeder = tokio::spawn(async move {
         let mut client = client;
-        client.write_all(payload.as_bytes()).await.expect("write commands");
+        client
+            .write_all(payload.as_bytes())
+            .await
+            .expect("write commands");
         client.flush().await.expect("flush commands");
         // Dropping the write half closes the pipe — the reader observes EOF, exactly as a scripted
         // client closing its child's stdin does.
@@ -108,7 +118,10 @@ async fn steer_on_an_idle_session_does_not_wedge_the_eof_exit() {
         .iter()
         .find(|l| l["command"] == "steer")
         .unwrap_or_else(|| panic!("no steer response in {out:?}"));
-    assert_eq!(steer["success"], true, "the steer itself is accepted: {steer}");
+    assert_eq!(
+        steer["success"], true,
+        "the steer itself is accepted: {steer}"
+    );
 }
 
 /// The `follow_up` twin of the above — same latch, same wedge.
@@ -124,7 +137,10 @@ async fn follow_up_on_an_idle_session_does_not_wedge_the_eof_exit() {
         .iter()
         .find(|l| l["command"] == "follow_up")
         .unwrap_or_else(|| panic!("no follow_up response in {out:?}"));
-    assert_eq!(fu["success"], true, "the follow_up itself is accepted: {fu}");
+    assert_eq!(
+        fu["success"], true,
+        "the follow_up itself is accepted: {fu}"
+    );
 }
 
 /// A steer that FAILS preflight (`_throwIfExtensionCommand`, agent-session.ts:1312-1321) must not
@@ -200,7 +216,8 @@ impl NativeExtension for SwapExt {
             .ok()
             .and_then(|g| g.clone())
             .ok_or_else(|| ExtError::Component("no host services".into()))?;
-        svc.control(ControlOp::NewSession { opts: json!({}) }).map_err(ExtError::Component)?;
+        svc.control(ControlOp::NewSession { opts: json!({}) })
+            .map_err(ExtError::Component)?;
         Ok(Some(String::new()))
     }
 }
@@ -227,7 +244,10 @@ async fn a_command_after_an_extension_session_swap_reaches_the_new_session() {
 
     // The op really did replace the session at the runtime tier.
     let replaced_id = runtime.session().await.session_id().to_string();
-    assert_ne!(replaced_id, first_id, "ctx.newSession() replaced the runtime's active session");
+    assert_ne!(
+        replaced_id, first_id,
+        "ctx.newSession() replaced the runtime's active session"
+    );
 
     let after = out
         .iter()
@@ -315,7 +335,10 @@ async fn abort_over_rpc_stops_a_retrying_run_and_lets_the_loop_exit() {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(rt.session().await.is_retrying(), "fixture: the run must reach retry backoff");
+        assert!(
+            rt.session().await.is_retrying(),
+            "fixture: the run must reach retry backoff"
+        );
         client
             .write_all(concat!(r#"{"type":"abort","id":"a"}"#, "\n").as_bytes())
             .await
@@ -342,18 +365,26 @@ async fn abort_over_rpc_stops_a_retrying_run_and_lets_the_loop_exit() {
         .iter()
         .find(|l| l["command"] == "abort")
         .unwrap_or_else(|| panic!("no abort response in {out:?}"));
-    assert_eq!(abort["success"], true, "the abort itself succeeded: {abort}");
+    assert_eq!(
+        abort["success"], true,
+        "the abort itself succeeded: {abort}"
+    );
 
     // The cancelled backoff reported itself, and the retry never produced a second turn.
-    let kinds: Vec<&str> =
-        out.iter().filter_map(|l| l["type"].as_str().or_else(|| l["command"].as_str())).collect();
+    let kinds: Vec<&str> = out
+        .iter()
+        .filter_map(|l| l["type"].as_str().or_else(|| l["command"].as_str()))
+        .collect();
     assert!(
-        out.iter().any(|l| l["type"] == "auto_retry_end" && l["success"] == false),
+        out.iter()
+            .any(|l| l["type"] == "auto_retry_end" && l["success"] == false),
         "the aborted backoff must emit auto_retry_end{{success:false}}: {kinds:?}"
     );
     assert!(
         !out.iter().any(|l| l["type"] == "message_end"
-            && l["message"]["content"].to_string().contains("must not appear")),
+            && l["message"]["content"]
+                .to_string()
+                .contains("must not appear")),
         "the aborted retry must not have produced a second assistant turn: {kinds:?}"
     );
 }

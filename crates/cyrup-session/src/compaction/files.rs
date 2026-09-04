@@ -89,8 +89,12 @@ impl FileOps {
     pub fn compute_lists(&self) -> (Vec<String>, Vec<String>) {
         let mut modified: BTreeSet<String> = self.edited.clone();
         modified.extend(self.written.iter().cloned());
-        let mut read: Vec<String> =
-            self.read.iter().filter(|p| !modified.contains(*p)).cloned().collect();
+        let mut read: Vec<String> = self
+            .read
+            .iter()
+            .filter(|p| !modified.contains(*p))
+            .cloned()
+            .collect();
         let mut modified: Vec<String> = modified.into_iter().collect();
         read.sort_by(|a, b| utf16_cmp(a, b));
         modified.sort_by(|a, b| utf16_cmp(a, b));
@@ -100,7 +104,10 @@ impl FileOps {
     /// Build the default `CompactionDetails` from the computed lists.
     pub fn to_details(&self) -> CompactionDetails {
         let (read_files, modified_files) = self.compute_lists();
-        CompactionDetails { read_files, modified_files }
+        CompactionDetails {
+            read_files,
+            modified_files,
+        }
     }
 }
 
@@ -138,7 +145,10 @@ pub fn format_file_operations(read: &[String], modified: &[String]) -> String {
         sections.push(format!("<read-files>\n{}\n</read-files>", read.join("\n")));
     }
     if !modified.is_empty() {
-        sections.push(format!("<modified-files>\n{}\n</modified-files>", modified.join("\n")));
+        sections.push(format!(
+            "<modified-files>\n{}\n</modified-files>",
+            modified.join("\n")
+        ));
     }
     if sections.is_empty() {
         return String::new();

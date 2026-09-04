@@ -46,7 +46,10 @@ pub struct PendingQueue {
 
 impl PendingQueue {
     pub fn new(mode: QueueMode) -> Self {
-        Self { items: VecDeque::new(), mode }
+        Self {
+            items: VecDeque::new(),
+            mode,
+        }
     }
 
     pub fn push(&mut self, m: AgentMessage) {
@@ -136,7 +139,11 @@ mod tests {
         // Something else queued while the rejected continuation was in flight.
         q.push(user("later"));
         q.push_front(drained);
-        assert_eq!(texts(&q), vec!["a", "b", "later"], "restored at the HEAD, order preserved");
+        assert_eq!(
+            texts(&q),
+            vec!["a", "b", "later"],
+            "restored at the HEAD, order preserved"
+        );
 
         assert_eq!(texts(&q).len(), 3);
         let again = q.drain();
@@ -155,6 +162,10 @@ mod tests {
         assert_eq!(texts(&q), vec!["second"]);
 
         q.push_front(drained);
-        assert_eq!(texts(&q), vec!["first", "second"], "the queue is exactly as it was");
+        assert_eq!(
+            texts(&q),
+            vec!["first", "second"],
+            "the queue is exactly as it was"
+        );
     }
 }

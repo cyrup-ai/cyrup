@@ -18,8 +18,7 @@ fn codex_error_events_carry_upstream_text() {
         MappedCodexEvent::Fail("Codex error: websocket_connection_limit_reached".to_string())
     );
     // Neither code nor message: the serialized event.
-    let MappedCodexEvent::Fail(text) = map_codex_event(&json!({ "type": "error" }), None)
-    else {
+    let MappedCodexEvent::Fail(text) = map_codex_event(&json!({ "type": "error" }), None) else {
         panic!("expected Fail");
     };
     assert!(text.starts_with("Codex error: {"), "{text}");
@@ -112,4 +111,3 @@ fn service_tier_resolution_matches_upstream() {
     );
     assert_eq!(resolve_codex_service_tier(None, None), None);
 }
-

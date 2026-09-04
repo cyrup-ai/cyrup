@@ -30,17 +30,15 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use cyrup_ext::native::{ExtMode, HostCtx, InitApi, NativeExtension};
-use cyrup_ext::HostEvent;
 use crate::extension::SubagentsExtension;
 use crate::watchdog::child_status::{
-    ChildWatchdogPhase, ChildWatchdogStatusEvent, CHILD_WATCHDOG_STATUS_EVENT,
+    CHILD_WATCHDOG_STATUS_EVENT, ChildWatchdogPhase, ChildWatchdogStatusEvent,
 };
-use crate::watchdog::register_child::{register_child_watchdog, ChildWatchdog};
-use crate::watchdog::runtime::{
-    WatchdogReview, WatchdogReviewRequest, WatchdogReviewResult,
-};
+use crate::watchdog::register_child::{ChildWatchdog, register_child_watchdog};
+use crate::watchdog::runtime::{WatchdogReview, WatchdogReviewRequest, WatchdogReviewResult};
 use crate::watchdog::types::SUBAGENT_WATCHDOG_WARNING_TYPE;
+use cyrup_ext::HostEvent;
+use cyrup_ext::native::{ExtMode, HostCtx, InitApi, NativeExtension};
 
 fn ctx(cwd: &std::path::Path) -> HostCtx {
     HostCtx::event(ExtMode::Json, false, cwd.to_path_buf())
@@ -256,7 +254,12 @@ async fn the_turn_and_boundary_events_reach_the_runtime() {
         )
         .await;
     extension
-        .on_event(&HostEvent::AgentEnd { messages: Vec::new() }, &cwd)
+        .on_event(
+            &HostEvent::AgentEnd {
+                messages: Vec::new(),
+            },
+            &cwd,
+        )
         .await;
     let snapshot = extension.watchdog().get_snapshot(None);
     assert!(!snapshot.enabled, "the watchdog is default OFF");
@@ -275,7 +278,10 @@ async fn the_slash_command_routes_to_the_watchdog_status_block() {
         .expect("the command is serviced")
         .expect("status text");
     assert!(output.starts_with("Subagent watchdog\n"), "{output}");
-    assert!(output.contains("Review trigger: repo edits only"), "{output}");
+    assert!(
+        output.contains("Review trigger: repo edits only"),
+        "{output}"
+    );
     assert!(output.contains("Sources:"), "{output}");
 }
 
@@ -284,9 +290,16 @@ async fn a_session_override_through_the_slash_command_reaches_the_runtime() {
     let root = tempfile::tempdir().expect("tempdir");
     let extension =
         SubagentsExtension::with_config_and_cwd(Default::default(), root.path().to_path_buf());
-    assert_eq!(extension.watchdog().get_snapshot(None).session_override, None);
+    assert_eq!(
+        extension.watchdog().get_snapshot(None).session_override,
+        None
+    );
     let output = extension
-        .execute_command("subagents-watchdog", "session on", &command_ctx(root.path()))
+        .execute_command(
+            "subagents-watchdog",
+            "session on",
+            &command_ctx(root.path()),
+        )
         .await
         .expect("serviced")
         .expect("text");
@@ -371,14 +384,20 @@ fn child_config_json() -> String {
 
 fn armed_child(
     cwd: &std::path::Path,
-) -> (Arc<ChildWatchdog>, Arc<Mutex<Vec<ChildWatchdogStatusEvent>>>) {
+) -> (
+    Arc<ChildWatchdog>,
+    Arc<Mutex<Vec<ChildWatchdogStatusEvent>>>,
+) {
     armed_child_with_review(cwd, None)
 }
 
 fn armed_child_with_review(
     cwd: &std::path::Path,
     review: Option<Arc<dyn WatchdogReview>>,
-) -> (Arc<ChildWatchdog>, Arc<Mutex<Vec<ChildWatchdogStatusEvent>>>) {
+) -> (
+    Arc<ChildWatchdog>,
+    Arc<Mutex<Vec<ChildWatchdogStatusEvent>>>,
+) {
     let events: Arc<Mutex<Vec<ChildWatchdogStatusEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let sink_events = Arc::clone(&events);
     let watchdog = register_child_watchdog(
@@ -427,8 +446,7 @@ impl WatchdogReview for RecordingReview {
 fn the_env_built_child_watchdog_has_a_review_wired() {
     let config = child_config_json();
     let runtime = crate::prompt_runtime::prompt_runtime_from_env(&|key| {
-        (key == crate::watchdog::child_status::CHILD_WATCHDOG_CONFIG_ENV)
-            .then(|| config.clone())
+        (key == crate::watchdog::child_status::CHILD_WATCHDOG_CONFIG_ENV).then(|| config.clone())
     })
     .expect("a watchdog config alone arms the child runtime");
     let watchdog = runtime.watchdog().expect("the child watchdog is installed");
@@ -453,13 +471,11 @@ async fn an_unarmed_child_installs_no_watchdog_at_all() {
 async fn an_armed_child_drives_its_watchdog_through_the_extension_event_path() {
     let root = tempfile::tempdir().expect("tempdir");
     let (watchdog, events) = armed_child(root.path());
-    let runtime = crate::prompt_runtime::SubagentPromptRuntime::from_parts(
-        None, None, false,
-    )
-    .with_watchdog(
-        Some(Arc::clone(&watchdog)),
-        Arc::new(std::sync::Mutex::new(None)),
-    );
+    let runtime = crate::prompt_runtime::SubagentPromptRuntime::from_parts(None, None, false)
+        .with_watchdog(
+            Some(Arc::clone(&watchdog)),
+            Arc::new(std::sync::Mutex::new(None)),
+        );
 
     // `init` must declare the five subscriptions, or none of the below is ever delivered.
     let mut api = InitApi::new();
@@ -472,7 +488,10 @@ async fn an_armed_child_drives_its_watchdog_through_the_extension_event_path() {
         cyrup_ext::EventKind::AgentEnd,
         cyrup_ext::EventKind::SessionShutdown,
     ] {
-        assert!(subs.contains(kind), "{kind:?} is subscribed by the child runtime");
+        assert!(
+            subs.contains(kind),
+            "{kind:?} is subscribed by the child runtime"
+        );
     }
 
     let cwd = ctx(root.path());
@@ -486,7 +505,12 @@ async fn an_armed_child_drives_its_watchdog_through_the_extension_event_path() {
         )
         .await;
     runtime
-        .on_event(&HostEvent::AgentEnd { messages: Vec::new() }, &cwd)
+        .on_event(
+            &HostEvent::AgentEnd {
+                messages: Vec::new(),
+            },
+            &cwd,
+        )
         .await;
     runtime
         .on_event(
@@ -538,13 +562,11 @@ async fn an_armed_childs_runtime_is_enabled_where_the_orchestrators_is_not() {
 async fn a_child_watchdog_buffers_the_turn_delta_it_is_handed() {
     let root = tempfile::tempdir().expect("tempdir");
     let (watchdog, _events) = armed_child(root.path());
-    let runtime = crate::prompt_runtime::SubagentPromptRuntime::from_parts(
-        None, None, false,
-    )
-    .with_watchdog(
-        Some(Arc::clone(&watchdog)),
-        Arc::new(std::sync::Mutex::new(None)),
-    );
+    let runtime = crate::prompt_runtime::SubagentPromptRuntime::from_parts(None, None, false)
+        .with_watchdog(
+            Some(Arc::clone(&watchdog)),
+            Arc::new(std::sync::Mutex::new(None)),
+        );
     let cwd = ctx(root.path());
     runtime
         .on_event(
@@ -555,7 +577,9 @@ async fn a_child_watchdog_buffers_the_turn_delta_it_is_handed() {
             &cwd,
         )
         .await;
-    runtime.on_event(&turn_end("the child did work"), &cwd).await;
+    runtime
+        .on_event(&turn_end("the child did work"), &cwd)
+        .await;
     assert_eq!(
         watchdog.runtime().get_snapshot(None).buffered_deltas,
         0,
@@ -574,7 +598,6 @@ async fn a_child_watchdog_buffers_the_turn_delta_it_is_handed() {
         1,
         "the child's runtime is live and buffering"
     );
-
 }
 
 /// The delta the review actually receives, driven entirely through the extension event path.
@@ -594,15 +617,15 @@ async fn a_child_watchdog_buffers_the_turn_delta_it_is_handed() {
 async fn the_delta_the_child_review_receives_carries_this_turns_tool_results() {
     let root = tempfile::tempdir().expect("tempdir");
     let review = Arc::new(RecordingReview::default());
-    let (watchdog, _events) =
-        armed_child_with_review(root.path(), Some(Arc::clone(&review) as Arc<dyn WatchdogReview>));
-    let runtime = crate::prompt_runtime::SubagentPromptRuntime::from_parts(
-        None, None, false,
-    )
-    .with_watchdog(
-        Some(Arc::clone(&watchdog)),
-        Arc::new(std::sync::Mutex::new(None)),
+    let (watchdog, _events) = armed_child_with_review(
+        root.path(),
+        Some(Arc::clone(&review) as Arc<dyn WatchdogReview>),
     );
+    let runtime = crate::prompt_runtime::SubagentPromptRuntime::from_parts(None, None, false)
+        .with_watchdog(
+            Some(Arc::clone(&watchdog)),
+            Arc::new(std::sync::Mutex::new(None)),
+        );
     let cwd = ctx(root.path());
 
     runtime
@@ -627,7 +650,12 @@ async fn the_delta_the_child_review_receives_carries_this_turns_tool_results() {
         )
         .await;
     runtime
-        .on_event(&HostEvent::AgentEnd { messages: Vec::new() }, &cwd)
+        .on_event(
+            &HostEvent::AgentEnd {
+                messages: Vec::new(),
+            },
+            &cwd,
+        )
         .await;
 
     let deltas = review
@@ -651,10 +679,7 @@ async fn the_delta_the_child_review_receives_carries_this_turns_tool_results() {
 }
 
 /// A `turn_end` the host really emits: an assistant message plus this turn's tool results.
-fn assistant_turn_end(
-    text: &str,
-    tool_results: Vec<cyrup_agent::ToolResultMessage>,
-) -> HostEvent {
+fn assistant_turn_end(text: &str, tool_results: Vec<cyrup_agent::ToolResultMessage>) -> HostEvent {
     let mut message = cyrup_core::AssistantMessage::errored(
         cyrup_core::ProviderId::from("faux"),
         "m",
@@ -696,14 +721,16 @@ fn tool_result(name: &str, text: &str, is_error: bool) -> cyrup_agent::ToolResul
 async fn a_disabled_child_config_installs_nothing() {
     let root = tempfile::tempdir().expect("tempdir");
     let raw = serde_json::json!({ "enabled": false }).to_string();
-    assert!(register_child_watchdog(
-        Some(&raw),
-        root.path(),
-        Arc::new(|| None),
-        None,
-        Arc::new(|_: &ChildWatchdogStatusEvent| {}),
-    )
-    .is_none());
+    assert!(
+        register_child_watchdog(
+            Some(&raw),
+            root.path(),
+            Arc::new(|| None),
+            None,
+            Arc::new(|_: &ChildWatchdogStatusEvent| {}),
+        )
+        .is_none()
+    );
 }
 
 #[test]

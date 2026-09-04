@@ -38,7 +38,10 @@ impl crate::host_services::SessionCatalog for SessionCatalogHandle {
         // Pi `getCommands()` = `[...extensionCommands, ...templates, ...skills]`
         // (agent-session.ts:2332-2354 @v0.83.0), which is exactly what `slash_command_catalog`
         // builds. A dropped session has no commands, which is the honest empty answer.
-        self.0.upgrade().map(|s| s.slash_command_catalog()).unwrap_or_default()
+        self.0
+            .upgrade()
+            .map(|s| s.slash_command_catalog())
+            .unwrap_or_default()
     }
 
     fn extension_tool_source_info(&self) -> std::collections::HashMap<String, serde_json::Value> {
@@ -48,7 +51,9 @@ impl crate::host_services::SessionCatalog for SessionCatalogHandle {
         // registered extension/guest tool carrying the same `SourceInfo` shape, so it is the map's
         // source; every other name in the dynamic registry is a built-in (or an SDK custom tool) and
         // gets the synthetic form on the host-services side.
-        let Some(s) = self.0.upgrade() else { return std::collections::HashMap::new() };
+        let Some(s) = self.0.upgrade() else {
+            return std::collections::HashMap::new();
+        };
         let Ok(rows) = s.services.ext_host.registry().tool_info() else {
             return std::collections::HashMap::new();
         };

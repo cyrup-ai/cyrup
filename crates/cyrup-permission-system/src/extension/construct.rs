@@ -236,7 +236,9 @@ impl PermissionSystemExtension {
     /// Trims; empty → `None` (pi `normalizeAgentName`, `index.ts:277-284`).
     #[must_use]
     pub fn with_agent_name(mut self, agent_name: Option<String>) -> Self {
-        self.agent_name = agent_name.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        self.agent_name = agent_name
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         self
     }
 }

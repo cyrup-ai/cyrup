@@ -31,16 +31,12 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
-
-
 use cyrup_ext::native::{ExtMode, HostCtx, NativeExtension};
-use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::extension::SubagentsExtension;
-use cyrup_ext_subagents::registration::profiles::{load_profile, NamedProfile};
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
+use cyrup_ext_subagents::registration::profiles::{NamedProfile, load_profile};
 use cyrup_ext_subagents::spawn::SpawnCommand;
-
-
 
 /// RAII guard installing `CYRUP_HOME` at a temp dir for the life of one test.
 /// The config one test runs under: its own `CYRUP_HOME` root, and
@@ -174,10 +170,16 @@ async fn subagents_refresh_provider_models_writes_a_real_catalog_cache_file() {
         .expect("execute_command does not error")
         .expect("refresh produces textual output");
 
-    assert!(!output.contains("recognized by the subagents extension"), "got: {output}");
+    assert!(
+        !output.contains("recognized by the subagents extension"),
+        "got: {output}"
+    );
     assert!(output.contains("refreshed catalog cache"), "got: {output}");
 
-    let cache_path = home.join(".cyrup").join("subagents").join("provider-catalog-cache.json");
+    let cache_path = home
+        .join(".cyrup")
+        .join("subagents")
+        .join("provider-catalog-cache.json");
     let contents = tokio::fs::read_to_string(&cache_path)
         .await
         .expect("the refresh command must genuinely write the cache file");
@@ -202,7 +204,11 @@ async fn subagents_refresh_provider_models_rejects_unsafe_provider_names() {
     let ctx = command_ctx(work_dir.path());
 
     let output = ext
-        .execute_command("subagents-refresh-provider-models", "../../etc/passwd", &ctx)
+        .execute_command(
+            "subagents-refresh-provider-models",
+            "../../etc/passwd",
+            &ctx,
+        )
         .await
         .expect("execute_command does not error")
         .expect("a rendered error message");
@@ -237,8 +243,14 @@ async fn subagents_generate_profiles_writes_two_real_loadable_profiles() {
         .expect("execute_command does not error")
         .expect("generation produces textual output");
 
-    assert!(output.contains(&format!("{provider}.quota")), "got: {output}");
-    assert!(output.contains(&format!("{provider}.quality")), "got: {output}");
+    assert!(
+        output.contains(&format!("{provider}.quota")),
+        "got: {output}"
+    );
+    assert!(
+        output.contains(&format!("{provider}.quality")),
+        "got: {output}"
+    );
 
     let profiles_dir = home.join(".cyrup").join("subagents").join("profiles");
     let quota: NamedProfile = load_profile(&profiles_dir, &format!("{provider}.quota"))
@@ -246,7 +258,10 @@ async fn subagents_generate_profiles_writes_two_real_loadable_profiles() {
     let quality: NamedProfile = load_profile(&profiles_dir, &format!("{provider}.quality"))
         .expect("the quality profile must be genuinely loadable from disk");
     assert!(quota.subagents.default_model.is_some(), "got: {quota:?}");
-    assert!(quality.subagents.default_model.is_some(), "got: {quality:?}");
+    assert!(
+        quality.subagents.default_model.is_some(),
+        "got: {quality:?}"
+    );
 }
 
 // =====================================================================================================
@@ -259,7 +274,9 @@ async fn subagents_check_profile_cross_references_the_real_model_registry() {
     let home = home_dir.path().to_path_buf();
 
     let profiles_dir = home.join(".cyrup").join("subagents").join("profiles");
-    tokio::fs::create_dir_all(&profiles_dir).await.expect("mkdir profiles dir");
+    tokio::fs::create_dir_all(&profiles_dir)
+        .await
+        .expect("mkdir profiles dir");
     // PROV-007: a model id from a provider the retired seed stub never carried, so this really
     // exercises the whole-registry cross-reference (pi `findModelInfo` over
     // `ctx.modelRegistry.getAvailable()`).
@@ -288,6 +305,7 @@ async fn subagents_check_profile_cross_references_the_real_model_registry() {
         subagents: cyrup_ext_subagents::discovery::types::SubagentSettings {
             overrides,
             default_model: None,
+            default_provider: None,
             // G101 added these two; a profile declares neither.
             default_thinking: None,
             default_extensions: None,
@@ -299,9 +317,12 @@ async fn subagents_check_profile_cross_references_the_real_model_registry() {
             max_thinking: None,
         },
     };
-    tokio::fs::write(profiles_dir.join("mixed.json"), serde_json::to_vec_pretty(&profile).expect("serialize"))
-        .await
-        .expect("write profile");
+    tokio::fs::write(
+        profiles_dir.join("mixed.json"),
+        serde_json::to_vec_pretty(&profile).expect("serialize"),
+    )
+    .await
+    .expect("write profile");
 
     let mut bogus_overrides = std::collections::BTreeMap::new();
     bogus_overrides.insert(
@@ -317,6 +338,7 @@ async fn subagents_check_profile_cross_references_the_real_model_registry() {
         subagents: cyrup_ext_subagents::discovery::types::SubagentSettings {
             overrides: bogus_overrides,
             default_model: None,
+            default_provider: None,
             // G101 added these two; a profile declares neither.
             default_thinking: None,
             default_extensions: None,
@@ -414,7 +436,12 @@ async fn subagents_companions_is_no_longer_a_registered_command() {
     );
     let ctx = command_ctx(work_dir.path());
 
-    for args in ["", "status", "hide pi-intercom workspace", "show pi-intercom"] {
+    for args in [
+        "",
+        "status",
+        "hide pi-intercom workspace",
+        "show pi-intercom",
+    ] {
         let err = ext
             .execute_command("subagents-companions", args, &ctx)
             .await

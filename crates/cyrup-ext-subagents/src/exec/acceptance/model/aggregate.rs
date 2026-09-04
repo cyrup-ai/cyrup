@@ -1,7 +1,10 @@
 //! `aggregateAcceptanceReport` (pi `acceptance.ts:671-711`): folding every child's report into
 //! one parent report for a group run.
 
-use super::types::{AcceptanceLedger, AcceptanceLedgerStatus, AcceptanceReport, CommandRunReport, CriterionReport, CriterionStatus};
+use super::types::{
+    AcceptanceLedger, AcceptanceLedgerStatus, AcceptanceReport, CommandRunReport, CriterionReport,
+    CriterionStatus,
+};
 
 // --------------------------------------------------------------------------------------------
 // aggregateAcceptanceReport (acceptance.ts:671-711)
@@ -178,7 +181,9 @@ pub fn aggregate_acceptance_report(
         residual_risks: Some(residual),
         no_staged_files: Some(
             !child_reports.is_empty()
-                && child_reports.iter().all(|r| r.no_staged_files == Some(true)),
+                && child_reports
+                    .iter()
+                    .all(|r| r.no_staged_files == Some(true)),
         ),
         diff_summary: Option::None,
         review_findings: Some(review_findings),
@@ -216,7 +221,6 @@ mod tests {
     use crate::exec::acceptance::model::evaluate::evaluate_acceptance;
     use crate::exec::acceptance::model::testsupport::attested_policy_requiring_no_report;
     use crate::exec::acceptance::model::testsupport::temp_dir;
-
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_caller_supplied_report_is_revalidated_not_trusted() {
@@ -275,5 +279,4 @@ mod tests {
             bad.child_report_parse_error
         );
     }
-
 }

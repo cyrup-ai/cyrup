@@ -96,7 +96,12 @@ impl SessionStats {
         session_file: Option<String>,
         context_usage: Option<StatsContextUsage>,
     ) -> Self {
-        let mut s = Self { session_id, session_file, context_usage, ..Self::default() };
+        let mut s = Self {
+            session_id,
+            session_file,
+            context_usage,
+            ..Self::default()
+        };
         for entry in entries {
             let Entry::Known(known) = entry else { continue };
             match known {
@@ -204,13 +209,19 @@ pub fn usage_cost_breakdown(entries: &[Entry]) -> Vec<UsageCostBreakdownEntry> {
         let Entry::Known(known) = entry else { continue };
         match known {
             // `entry.type === "message" && entry.message.role === "assistant"` (`:43-45`).
-            KnownEntry::Message { message: AgentMessage::Core(Message::Assistant(a)), .. } => {
+            KnownEntry::Message {
+                message: AgentMessage::Core(Message::Assistant(a)),
+                ..
+            } => {
                 let model = a.response_model.as_deref().unwrap_or(a.model.as_str());
                 add(format!("{}/{model}", a.provider.as_str()), &a.usage);
             }
             // `role === "toolResult" && entry.message.usage` (`:46-48`) — the `&& usage` half
             // matters: a toolResult with no usage contributes no bucket at all.
-            KnownEntry::Message { message: AgentMessage::Core(Message::ToolResult { usage: Some(u), .. }), .. } => {
+            KnownEntry::Message {
+                message: AgentMessage::Core(Message::ToolResult { usage: Some(u), .. }),
+                ..
+            } => {
                 add(TOOLS_SUMMARIES_KEY.to_string(), u);
             }
             // `(branch_summary || compaction) && entry.usage` (`:49-51`).
@@ -232,7 +243,11 @@ pub fn usage_cost_breakdown(entries: &[Entry]) -> Vec<UsageCostBreakdownEntry> {
         .collect();
     // `.sort((a, b) => b.cost - a.cost)` (`:69`) — descending by cost. `sort_by` is stable, which
     // is what `Array.prototype.sort` is too, so equal-cost rows keep insertion order on both sides.
-    rows.sort_by(|a, b| b.cost.partial_cmp(&a.cost).unwrap_or(std::cmp::Ordering::Equal));
+    rows.sort_by(|a, b| {
+        b.cost
+            .partial_cmp(&a.cost)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     rows
 }
 
@@ -242,7 +257,9 @@ pub fn usage_cost_breakdown(entries: &[Entry]) -> Vec<UsageCostBreakdownEntry> {
 /// `Compaction`/`BranchSummary` are pi's resets (`cache-stats.ts:110-115`); an assistant message is
 /// a settled turn; everything else — user messages, tool results, settings entries — is ignored and
 /// specifically NOT a reset.
-pub fn cache_scan_entries(entries: &[Entry]) -> Vec<cyrup_provider::cache_stats::CacheScanEntry<'_>> {
+pub fn cache_scan_entries(
+    entries: &[Entry],
+) -> Vec<cyrup_provider::cache_stats::CacheScanEntry<'_>> {
     use cyrup_provider::cache_stats::CacheScanEntry;
     entries
         .iter()
@@ -291,7 +308,11 @@ impl ContextUsage {
         } else {
             used as f64 / context_window as f64
         };
-        Self { used_tokens: used, context_window, fraction }
+        Self {
+            used_tokens: used,
+            context_window,
+            fraction,
+        }
     }
 }
 
@@ -346,9 +367,13 @@ pub struct SessionStateView {
     pub context_usage: ContextUsage,
 }
 
-
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod prov036_tests {
     use super::*;
     use cyrup_core::{Cost, EntryId, ProviderId, StopReason};
@@ -367,7 +392,10 @@ mod prov036_tests {
         Usage {
             input,
             output,
-            cost: Cost { total: cost, ..Cost::default() },
+            cost: Cost {
+                total: cost,
+                ..Cost::default()
+            },
             ..Usage::default()
         }
     }
@@ -407,8 +435,20 @@ mod prov036_tests {
     fn prov036_breakdown_keys_attribute_sort_and_reconcile() {
         let entries = vec![
             // Two turns on the same model coalesce into one row.
-            assistant("a1", "anthropic", "claude-sonnet-5", None, usage(100, 10, 0.10)),
-            assistant("a2", "anthropic", "claude-sonnet-5", None, usage(200, 20, 0.20)),
+            assistant(
+                "a1",
+                "anthropic",
+                "claude-sonnet-5",
+                None,
+                usage(100, 10, 0.10),
+            ),
+            assistant(
+                "a2",
+                "anthropic",
+                "claude-sonnet-5",
+                None,
+                usage(200, 20, 0.20),
+            ),
             // An OpenRouter `auto` route: attributed to what it RESOLVED to (usage-totals.ts:44),
             // never to the requested id.
             assistant(
@@ -453,9 +493,18 @@ mod prov036_tests {
         );
         assert_eq!(rows.len(), 3);
         assert!((rows[0].cost - 0.31).abs() < 1e-9);
-        assert!((rows[1].cost - 0.30).abs() < 1e-9, "two turns on one model coalesce");
-        assert!((rows[2].cost - 0.06).abs() < 1e-9, "compaction + branch summary share the bucket");
-        assert_eq!(rows[1].tokens, 330, "input+output+cacheRead+cacheWrite (usage-totals.ts:66)");
+        assert!(
+            (rows[1].cost - 0.30).abs() < 1e-9,
+            "two turns on one model coalesce"
+        );
+        assert!(
+            (rows[2].cost - 0.06).abs() < 1e-9,
+            "compaction + branch summary share the bucket"
+        );
+        assert_eq!(
+            rows[1].tokens, 330,
+            "input+output+cacheRead+cacheWrite (usage-totals.ts:66)"
+        );
 
         // "so the breakdown reconciles with the session total" — pi's own comment at
         // `interactive-mode.ts:5663-5664`. This is the property that comment asserts.
@@ -515,7 +564,10 @@ mod prov036_tests {
         ];
         let scan = cache_scan_entries(&entries);
         assert!(matches!(scan[0], CacheScanEntry::Assistant(_)));
-        assert!(matches!(scan[1], CacheScanEntry::Reset), "a compaction resets the scan");
+        assert!(
+            matches!(scan[1], CacheScanEntry::Reset),
+            "a compaction resets the scan"
+        );
         assert!(
             matches!(scan[2], CacheScanEntry::Other),
             "a user message is ignored and specifically NOT a reset"

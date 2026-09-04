@@ -5,7 +5,12 @@
 /// `unsafe` in edition 2024 and this crate is `#![forbid(unsafe_code)]`, the same split
 /// `experimental_features_enabled_from` + `tests/experimental_marker.rs` already uses.
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 mod share_viewer_url_tests {
     use crate::app::*;
 
@@ -13,7 +18,10 @@ mod share_viewer_url_tests {
     /// actually prints, plus the two shapes pi's `if (!gistId)` guard is testing for.
     #[test]
     fn the_gist_id_is_the_last_path_segment_of_gh_s_output() {
-        assert_eq!(gist_id_from_url("https://gist.github.com/octocat/abc123def456"), "abc123def456");
+        assert_eq!(
+            gist_id_from_url("https://gist.github.com/octocat/abc123def456"),
+            "abc123def456"
+        );
         // JS `"abc".split("/")` is `["abc"]`, so `pop()` yields the whole string.
         assert_eq!(gist_id_from_url("abc123def456"), "abc123def456");
         // The two failures `if (!gistId)` catches: nothing on stdout, and a trailing separator.
@@ -48,4 +56,3 @@ mod share_viewer_url_tests {
         );
     }
 }
-

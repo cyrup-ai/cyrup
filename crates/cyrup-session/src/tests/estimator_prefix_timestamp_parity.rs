@@ -30,10 +30,10 @@
     clippy::indexing_slicing
 )]
 
-use cyrup_core::{AssistantMessage, Content, Message, StopReason, Usage};
-use cyrup_provider::Context;
 use crate::agent_message::{AgentMessage, CompactionSummaryMessage};
 use crate::compaction::tokens::{estimate_context_tokens, estimate_context_tokens_raw};
+use cyrup_core::{AssistantMessage, Content, Message, StopReason, Usage};
+use cyrup_provider::Context;
 
 /// Tokens reported by the one assistant message that carries usage in every fixture below.
 const ANCHOR_USAGE_TOKENS: u64 = 5_000;

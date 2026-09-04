@@ -362,7 +362,9 @@ mod tests {
         let end_at = whole[body_at..]
             .find("\n    }\n")
             .map_or(whole.len(), |o| body_at + o);
-        let src = whole.get(body_at..end_at).expect("guard body slice is in bounds");
+        let src = whole
+            .get(body_at..end_at)
+            .expect("guard body slice is in bounds");
 
         // Presence before absence: anchor on the real statements, so a rename or a refactor fails
         // loudly here rather than making the ordering assertion vacuous.
@@ -376,7 +378,10 @@ mod tests {
             .find("drop(registration);")
             .expect("`guard` still settles the registration explicitly");
 
-        assert!(key_at < enqueue_at, "key resolution must precede the enqueue");
+        assert!(
+            key_at < enqueue_at,
+            "key resolution must precede the enqueue"
+        );
         assert!(
             enqueue_at < drop_at,
             "the registration must still be held ACROSS the enqueue (pi \
@@ -384,7 +389,6 @@ mod tests {
              `enqueue` narrows the chain to key resolution only"
         );
     }
-
 
     /// Pi funnels key resolution (`file-mutation-queue.ts:34`) AND the queue link (`:42`) through
     /// ONE registration chain (`:33`). Moving `drop(registration)` above `Self::key(..).await` is a
@@ -526,7 +530,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn two_spellings_of_one_path_are_granted_in_call_order() {
-        use std::future::{poll_fn, Future};
+        use std::future::{Future, poll_fn};
         use std::sync::Mutex;
         use std::task::Poll;
 

@@ -15,9 +15,18 @@ use cyrup_ext_subagents::tui::intercom::IntercomPayload;
 /// `agent`/`success`/`outputs`/`total_tokens`/`run_id` — the allowlist is preserved by construction.
 #[must_use]
 pub fn format_result_relay(payload: &IntercomPayload) -> String {
-    let status = if payload.success { "succeeded" } else { "failed" };
+    let status = if payload.success {
+        "succeeded"
+    } else {
+        "failed"
+    };
     let mut lines = vec![
-        format!("Subagent run {} ({}) {}.", payload.run_id.as_str(), payload.agent, status),
+        format!(
+            "Subagent run {} ({}) {}.",
+            payload.run_id.as_str(),
+            payload.agent,
+            status
+        ),
         format!("Total tokens: {}", payload.total_tokens),
     ];
     if !payload.outputs.is_empty() {

@@ -5,18 +5,17 @@ use std::path::{Path, PathBuf};
 use cyrup_core::ModelId;
 
 use crate::discovery::types::{AgentDefinition, AgentSource};
-use crate::registration::doctor::{build_doctor_report, DoctorReportInput};
 use crate::extension::executor::SubagentExecutor;
 use crate::extension::executor::paths::format_configured_session_dir;
-use crate::paths::home_dir;
 use crate::extension::host::slash_render::BUILTIN_AGENT_NAMES;
 use crate::extension::models::{
     format_model_source, registry_available_models, resolve_default_model_scope,
     resolve_subagent_model_override,
 };
+use crate::paths::home_dir;
+use crate::registration::doctor::{DoctorReportInput, build_doctor_report};
 
 impl SubagentExecutor {
-
     // ---------------------------------------------------------------------------------------
     // Registration surfaces: doctor / cost / profiles (delegates to already-implemented modules)
     // ---------------------------------------------------------------------------------------
@@ -41,7 +40,7 @@ impl SubagentExecutor {
         // Discovery block below, never a fabricated zero-count success — so the `Result` is
         // propagated all the way to `build_doctor_report`, never collapsed here.
         let discovery_result: Result<crate::discovery::AgentDiscoveryResult, String> =
-            match Self::discovery_config(cwd, &roots) {
+            match self.discovery_config(cwd, &roots) {
                 Ok(discovery_config) => crate::discovery::discover_agents_all(&discovery_config)
                     .map_err(|err| err.to_string()),
                 Err(err) => Err(err.to_string()),
@@ -63,7 +62,11 @@ impl SubagentExecutor {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
-            (services.session_file(), services.session_id().or(cached_id), None)
+            (
+                services.session_file(),
+                services.session_id().or(cached_id),
+                None,
+            )
         } else {
             let sessions_dir = Self::sessions_dir(cwd);
             match crate::registration::cost::find_latest_session_file_by_mtime(&sessions_dir).await
@@ -137,17 +140,17 @@ impl SubagentExecutor {
         let _ = self; // no executor state needed; a method purely for call-site symmetry/testability.
         match crate::registration::cost::find_latest_session_file_by_mtime(sessions_dir).await {
             Ok(Some(path)) => match cyrup_session::SessionManager::open(&path) {
-                Ok(manager) => crate::registration::cost::build_subagent_cost_report(
-                    manager.branch_path(None),
-                ),
+                Ok(manager) => {
+                    crate::registration::cost::build_subagent_cost_report(manager.branch_path(None))
+                }
                 Err(err) => format!(
                     "subagent-cost: could not open session {}: {err}",
                     path.display()
                 ),
             },
-            Ok(None) => crate::registration::cost::build_subagent_cost_report(
-                std::iter::empty::<&cyrup_session::Entry>(),
-            ),
+            Ok(None) => crate::registration::cost::build_subagent_cost_report(std::iter::empty::<
+                &cyrup_session::Entry,
+            >()),
             Err(err) => format!(
                 "subagent-cost: could not scan session directory {}: {err}",
                 sessions_dir.display()
@@ -175,14 +178,28 @@ impl SubagentExecutor {
         // The live parent session model (pi `ctx.model`) an inheriting builtin resolves to; `None`
         // when no live session backend is bound (headless / SDK-embedder) — then the display degrades
         // to "(unavailable)" exactly as before this seam existed.
-        let current_model = self.inherited_session_model().map(|m| m.as_str().to_string());
+        let current_model = self
+            .inherited_session_model()
+            .map(|m| m.as_str().to_string());
         let current_model = current_model.as_deref();
         // pi `ctx.model?.provider` (agent-management.ts:810) / the `ParentModel` a `model: undefined`
         // (or the `"inherit"` sentinel) resolves to (`resolveSubagentModelOverride`,
         // model-fallback.ts:196-220): both split off the SAME live `provider/id` string.
-        let preferred_provider = current_model
+        //
+        // SUBA-088: this is only the SECOND rung — every resolution below passes
+        // `agent.modelProvider ?? preferredProvider` (`agent-management.ts:1012,1025,1050`
+        // @v0.64.0), so an agent stamped by `subagents.defaultProvider` resolves its bare id
+        // against that provider rather than the session's.
+        let session_provider = current_model
             .and_then(|m| m.split_once('/'))
             .map(|(provider, _)| provider);
+        let provider_for = |agent: &AgentDefinition| -> Option<String> {
+            agent
+                .model_provider
+                .as_ref()
+                .map(|provider| provider.as_str().to_string())
+                .or_else(|| session_provider.map(str::to_string))
+        };
         let parent_model = current_model.and_then(|m| m.split_once('/'));
         let available_models = registry_available_models();
 
@@ -195,7 +212,8 @@ impl SubagentExecutor {
         // not claim to reach the models report. Threading it means making this surface async,
         // which is its own change.
         let env_roots = crate::paths::Roots::from_env();
-        let cfg = Self::discovery_config(cwd, &env_roots)
+        let cfg = self
+            .discovery_config(cwd, &env_roots)
             .or_else(|_| Self::discovery_dirs_config(cwd, &env_roots))
             .unwrap_or_default();
         let default_model_scope = resolve_default_model_scope(&cfg.override_settings);
@@ -233,11 +251,12 @@ impl SubagentExecutor {
             };
 
             let requested_model_str = agent.model.as_ref().map(ModelId::as_str);
+            let preferred_provider = provider_for(agent);
             let resolved_model = resolve_subagent_model_override(
                 requested_model_str,
                 parent_model,
                 &available_models,
-                preferred_provider,
+                preferred_provider.as_deref(),
             );
             let mut lines = vec![
                 "Builtin subagent model".to_string(),
@@ -302,11 +321,12 @@ impl SubagentExecutor {
                 continue;
             };
             let requested_model_str = agent.model.as_ref().map(ModelId::as_str);
+            let preferred_provider = provider_for(agent);
             let resolved_model = resolve_subagent_model_override(
                 requested_model_str,
                 parent_model,
                 &available_models,
-                preferred_provider,
+                preferred_provider.as_deref(),
             );
             let disabled_suffix = if agent.disabled == Some(true) {
                 "; disabled"
@@ -331,7 +351,12 @@ impl SubagentExecutor {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
 
@@ -404,18 +429,35 @@ mod tests {
             "timestamp": 2,
         }))
         .expect("tool result message");
-        manager.append_message(tool_result).expect("append tool result");
+        manager
+            .append_message(tool_result)
+            .expect("append tool result");
 
         let executor = SubagentExecutor::new();
         let report = executor.cost_report_from_sessions_dir(&layout.dir()).await;
 
         assert!(report.starts_with("Subagent cost\n"), "{report}");
-        assert!(report.contains("Parent: ↑200 ↓100"), "parent assistant usage: {report}");
-        assert!(report.contains("Child 1 (worker)"), "per-child breakdown: {report}");
-        assert!(report.contains("Children: ↑50 ↓25"), "child subtotal: {report}");
+        assert!(
+            report.contains("Parent: ↑200 ↓100"),
+            "parent assistant usage: {report}"
+        );
+        assert!(
+            report.contains("Child 1 (worker)"),
+            "per-child breakdown: {report}"
+        );
+        assert!(
+            report.contains("Children: ↑50 ↓25"),
+            "child subtotal: {report}"
+        );
         // Parent (200/100) + child (50/25) summed into the grand Total (250/125), with cost summed.
-        assert!(report.contains("Total: ↑250 ↓125"), "parent+child total: {report}");
-        assert!(report.contains("$0.0250"), "total cost sums parent+child: {report}");
+        assert!(
+            report.contains("Total: ↑250 ↓125"),
+            "parent+child total: {report}"
+        );
+        assert!(
+            report.contains("$0.0250"),
+            "total cost sums parent+child: {report}"
+        );
     }
 
     // ---------------------------------------------------------------------------------------
@@ -452,8 +494,7 @@ mod tests {
 
         let unknown = executor.run_models_report(dir.path(), Some("definitely-not-a-builtin"));
         assert!(
-            unknown
-                .contains("Builtin agent 'definitely-not-a-builtin' not found. Available:"),
+            unknown.contains("Builtin agent 'definitely-not-a-builtin' not found. Available:"),
             "an unknown builtin name must be rejected with the available list: {unknown}"
         );
     }
@@ -573,7 +614,9 @@ mod tests {
                     // the test about bare-id EXPANSION, which is what it is named for.
                     && !m.id.as_str().contains(':')
             })
-            .expect("the registry must carry a unique, colon-free bare id outside anthropic/openai");
+            .expect(
+                "the registry must carry a unique, colon-free bare id outside anthropic/openai",
+            );
         let bare = subject.id.as_str();
         let full = format!("{}/{}", subject.provider.as_str(), bare);
 
@@ -611,7 +654,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let executor = SubagentExecutor::new();
 
-        let report = executor.run_doctor(dir.path(), Some("/abs/custom-sessions")).await;
+        let report = executor
+            .run_doctor(dir.path(), Some("/abs/custom-sessions"))
+            .await;
         assert!(
             report.contains("- configured session dir: /abs/custom-sessions"),
             "an explicit per-call sessionDir must be rendered verbatim (resolved): {report}"
@@ -631,11 +676,9 @@ mod tests {
         }
         let report_configured_default = executor.run_doctor(dir.path(), None).await;
         assert!(
-            report_configured_default
-                .contains("- configured session dir: /abs/configured-default"),
+            report_configured_default.contains("- configured session dir: /abs/configured-default"),
             "the extension's own configured default_session_dir must be consulted when no \
              per-call override is present: {report_configured_default}"
         );
     }
-
 }

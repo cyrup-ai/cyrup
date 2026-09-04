@@ -1,14 +1,19 @@
 //! Autocomplete + SelectList + fuzzy tests (spec/tui/04 §3-5; gaps 3/4).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
+use super::harness::key_event as key;
 use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::{
-    fuzzy_filter, fuzzy_match, fuzzy_score, App, Autocomplete, ColumnLayout, CommandRegistry,
-    CommandSource, EditorOutcome, InputEditor, SelectItem, SelectList, SlashCommand, UiTheme,
+    App, Autocomplete, ColumnLayout, CommandRegistry, CommandSource, EditorOutcome, InputEditor,
+    SelectItem, SelectList, SlashCommand, UiTheme, fuzzy_filter, fuzzy_match, fuzzy_score,
 };
 use ratatui::backend::TestBackend;
 use std::path::Path;
-use super::harness::key_event as key;
 
 fn type_str(ed: &mut InputEditor, s: &str) {
     for c in s.chars() {
@@ -26,7 +31,10 @@ fn fuzzy_subsequence_and_ordering() {
     // Prefix/boundary match outranks a scattered one → LOWER score (fuzzy.ts:35-49).
     let prefix = fuzzy_score("settings", "set").unwrap();
     let scattered = fuzzy_score("scoped-models", "set").unwrap_or(f64::MAX);
-    assert!(prefix < scattered, "prefix {prefix} should beat (be lower than) scattered {scattered}");
+    assert!(
+        prefix < scattered,
+        "prefix {prefix} should beat (be lower than) scattered {scattered}"
+    );
     // Empty query matches everything at score 0.
     assert_eq!(fuzzy_score("anything", ""), Some(0.0));
     // Query longer than text never matches (fuzzy.ts:21-23).
@@ -38,11 +46,17 @@ fn fuzzy_exact_and_boundary_bonuses() {
     // Whole-string-exact gets the -100 bonus (fuzzy.ts:63-65), beating a mere prefix.
     let exact = fuzzy_match("set", "set").unwrap();
     let prefix = fuzzy_match("set", "settings").unwrap();
-    assert!(exact < prefix - 90.0, "exact {exact} should be ~100 below prefix {prefix}");
+    assert!(
+        exact < prefix - 90.0,
+        "exact {exact} should be ~100 below prefix {prefix}"
+    );
     // Word-boundary match (after '-') earns the -10 bonus vs a non-boundary interior match.
     let boundary = fuzzy_match("m", "scoped-models").unwrap();
     let interior = fuzzy_match("e", "scoped-models").unwrap();
-    assert!(boundary < interior, "boundary {boundary} should beat interior {interior}");
+    assert!(
+        boundary < interior,
+        "boundary {boundary} should beat interior {interior}"
+    );
 }
 
 #[test]
@@ -51,9 +65,15 @@ fn fuzzy_alphanumeric_swap_fallback() {
     let direct = fuzzy_match("gpt4", "gpt-4o");
     assert!(direct.is_some());
     let swapped = fuzzy_match("4gpt", "gpt-4o");
-    assert!(swapped.is_some(), "alphanumeric-swap fallback should match (fuzzy.ts:75-92)");
+    assert!(
+        swapped.is_some(),
+        "alphanumeric-swap fallback should match (fuzzy.ts:75-92)"
+    );
     // The swapped retry is penalized by +5 over the equivalent direct query.
-    assert!(swapped.unwrap() > direct.unwrap(), "swap retry carries +5 penalty");
+    assert!(
+        swapped.unwrap() > direct.unwrap(),
+        "swap retry carries +5 penalty"
+    );
     // No swap is possible for a pure-letter query that fails → None.
     assert!(fuzzy_match("zzz", "gpt-4o").is_none());
 }
@@ -63,7 +83,10 @@ fn fuzzy_filter_ranks_best_first() {
     let items = ["settings", "session", "scoped-models"];
     let ranked = fuzzy_filter(&items, "se", |s| *s);
     // "settings" and "session" both start with "se"; "scoped-models" matches s..e scattered.
-    assert_eq!(ranked.first().map(|m| items[m.index]), Some("settings").or(Some("session")));
+    assert_eq!(
+        ranked.first().map(|m| items[m.index]),
+        Some("settings").or(Some("session"))
+    );
     assert!(ranked.iter().any(|m| items[m.index] == "session"));
     // Scattered match ranks last (highest score).
     assert_eq!(ranked.last().map(|m| items[m.index]), Some("scoped-models"));
@@ -75,17 +98,27 @@ fn fuzzy_filter_requires_all_tokens() {
     let items = ["scoped models", "settings", "session"];
     let ranked = fuzzy_filter(&items, "sc mo", |s| *s);
     assert_eq!(ranked.len(), 1);
-    assert_eq!(ranked.first().map(|m| items[m.index]), Some("scoped models"));
+    assert_eq!(
+        ranked.first().map(|m| items[m.index]),
+        Some("scoped models")
+    );
     // Empty/whitespace query keeps every item in original order.
     let all = fuzzy_filter(&items, "   ", |s| *s);
-    assert_eq!(all.iter().map(|m| m.index).collect::<Vec<_>>(), vec![0, 1, 2]);
+    assert_eq!(
+        all.iter().map(|m| m.index).collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
 }
 
 // ---- SelectList ---------------------------------------------------------------------------
 
 #[test]
 fn select_list_wraps_navigation() {
-    let items = vec![SelectItem::label("a"), SelectItem::label("b"), SelectItem::label("c")];
+    let items = vec![
+        SelectItem::label("a"),
+        SelectItem::label("b"),
+        SelectItem::label("c"),
+    ];
     let mut list = SelectList::new(items, ColumnLayout::DEFAULT);
     assert_eq!(list.selected(), 0);
     list.select_up(); // wraps to bottom
@@ -96,7 +129,9 @@ fn select_list_wraps_navigation() {
 
 #[test]
 fn select_list_windows_and_indicates_scroll() {
-    let items: Vec<SelectItem> = (0..22).map(|i| SelectItem::label(format!("cmd{i}"))).collect();
+    let items: Vec<SelectItem> = (0..22)
+        .map(|i| SelectItem::label(format!("cmd{i}")))
+        .collect();
     let mut list = SelectList::new(items, ColumnLayout::SLASH);
     list.set_max_visible(5);
     let theme = UiTheme::dark();
@@ -120,7 +155,11 @@ fn typing_slash_opens_command_popup() {
     let ac = ed.autocomplete().unwrap();
     // Top candidate matches "se" — settings or session.
     let top = ac.list.selected_item().unwrap();
-    assert!(top.label == "settings" || top.label == "session", "unexpected top: {}", top.label);
+    assert!(
+        top.label == "settings" || top.label == "session",
+        "unexpected top: {}",
+        top.label
+    );
 }
 
 #[test]
@@ -160,7 +199,11 @@ fn autocomplete_max_visible_is_plumbed_and_clamped() {
     let mut ed = InputEditor::new();
     ed.set_autocomplete_max_visible(8);
     type_str(&mut ed, "/s");
-    assert_eq!(ed.autocomplete().unwrap().list.max_visible(), 8, "popup height not plumbed");
+    assert_eq!(
+        ed.autocomplete().unwrap().list.max_visible(),
+        8,
+        "popup height not plumbed"
+    );
     // Out-of-range values clamp to 3–20 (and re-apply to the open popup).
     ed.set_autocomplete_max_visible(99);
     assert_eq!(ed.autocomplete().unwrap().list.max_visible(), 20);
@@ -175,7 +218,11 @@ fn best_match_is_preselected() {
     let mut ed = InputEditor::new();
     type_str(&mut ed, "/sett");
     let ac = ed.autocomplete().unwrap();
-    assert_eq!(ac.list.selected(), 0, "best match must be preselected at row 0");
+    assert_eq!(
+        ac.list.selected(),
+        0,
+        "best match must be preselected at row 0"
+    );
     assert_eq!(ac.list.selected_item().unwrap().label, "settings");
 }
 
@@ -199,7 +246,10 @@ fn autocomplete_popup_keys_are_configurable() {
     type_str(&mut ed, "/mod");
     assert!(ed.autocomplete_open());
     ed.handle_key(&KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
-    assert!(!ed.autocomplete_open(), "rebound cancel key did not dismiss the popup");
+    assert!(
+        !ed.autocomplete_open(),
+        "rebound cancel key did not dismiss the popup"
+    );
 }
 
 #[test]
@@ -220,8 +270,14 @@ fn popup_renders_below_editor_in_viewport() {
         }
         text.push('\n');
     }
-    assert!(text.contains("settings"), "popup row 'settings' missing from viewport:\n{text}");
-    assert!(text.contains("Open settings menu"), "description column missing:\n{text}");
+    assert!(
+        text.contains("settings"),
+        "popup row 'settings' missing from viewport:\n{text}"
+    );
+    assert!(
+        text.contains("Open settings menu"),
+        "description column missing:\n{text}"
+    );
 }
 
 // ---- @-mention search (autocomplete.ts:101,164,408) ---------------------------------------
@@ -237,12 +293,19 @@ fn at_mention_auto_pops_and_fuzzy_filters_the_tree() {
     ]);
     // Typing `@` auto-opens the mention popup over the whole tree (no Tab needed).
     type_str(&mut ed, "@");
-    assert!(ed.autocomplete_open(), "@ did not auto-open the mention popup");
+    assert!(
+        ed.autocomplete_open(),
+        "@ did not auto-open the mention popup"
+    );
     // Narrowing by a fuzzy query keeps the popup and ranks matches.
     type_str(&mut ed, "edit");
     let ac = ed.autocomplete().unwrap();
     let top = ac.list.selected_item().unwrap();
-    assert_eq!(top.label, "src/editor.rs", "fuzzy mention ranking wrong; got {}", top.label);
+    assert_eq!(
+        top.label, "src/editor.rs",
+        "fuzzy mention ranking wrong; got {}",
+        top.label
+    );
 }
 
 #[test]
@@ -252,7 +315,10 @@ fn at_mention_accept_inserts_path_with_trailing_space() {
     type_str(&mut ed, "look at @edit");
     ed.handle_key(&key(KeyCode::Tab));
     assert_eq!(ed.text(), "look at @src/editor.rs ");
-    assert!(!ed.autocomplete_open(), "popup should close once the mention completes");
+    assert!(
+        !ed.autocomplete_open(),
+        "popup should close once the mention completes"
+    );
 }
 
 #[test]
@@ -275,9 +341,18 @@ fn mention_list_files_walks_the_tree_skipping_vcs() {
     std::fs::write(root.join(".git/HEAD"), "").unwrap();
     // The walk fallback (used when `fd` is absent) is exercised directly via the public lister.
     let files = crate::mention_list_files(root, 100);
-    assert!(files.contains(&"src/main.rs".to_string()), "missing nested file: {files:?}");
-    assert!(files.contains(&"Cargo.toml".to_string()), "missing root file: {files:?}");
-    assert!(!files.iter().any(|f| f.contains(".git")), ".git must be skipped: {files:?}");
+    assert!(
+        files.contains(&"src/main.rs".to_string()),
+        "missing nested file: {files:?}"
+    );
+    assert!(
+        files.contains(&"Cargo.toml".to_string()),
+        "missing root file: {files:?}"
+    );
+    assert!(
+        !files.iter().any(|f| f.contains(".git")),
+        ".git must be skipped: {files:?}"
+    );
 }
 
 // ---- S35: multi-line descriptions in the slash popup ---------------------------------------
@@ -314,8 +389,14 @@ fn slash_popup_descriptions_are_collapsed_to_one_line() {
     let theme = UiTheme::dark();
     let lines = ac.list.lines(90, &theme);
     let row: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-    assert!(!row.contains('\n'), "no raw newline reaches the row: {row:?}");
-    assert!(!row.contains('\r'), "no raw carriage return reaches the row: {row:?}");
+    assert!(
+        !row.contains('\n'),
+        "no raw newline reaches the row: {row:?}"
+    );
+    assert!(
+        !row.contains('\r'),
+        "no raw carriage return reaches the row: {row:?}"
+    );
     // `[\r\n]+` is one regex alternation with a `+`, so the whole run collapses to ONE space.
     assert!(
         row.contains("Review the diff for correctness bugs"),
@@ -338,9 +419,15 @@ fn select_list_normalizes_and_trims_descriptions() {
     let theme = UiTheme::dark();
     let lines = list.lines(90, &theme);
     let first: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-    assert!(first.trim_end().ends_with("spaced out"), "collapsed + trimmed: {first:?}");
+    assert!(
+        first.trim_end().ends_with("spaced out"),
+        "collapsed + trimmed: {first:?}"
+    );
     let second: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
-    assert_eq!(second, "  b", "a whitespace-only description drops the second column: {second:?}");
+    assert_eq!(
+        second, "  b",
+        "a whitespace-only description drops the second column: {second:?}"
+    );
 }
 
 // ---- TUI-013: quoted paths with spaces ------------------------------------------------------
@@ -356,7 +443,10 @@ fn select_list_normalizes_and_trims_descriptions() {
 /// `findUnclosedQuoteStart` (`:54-68`).
 #[test]
 fn an_unclosed_quote_keeps_a_path_with_spaces_as_one_mention_token() {
-    assert_eq!(crate::mention_query("see @\"my dir/fi").as_deref(), Some("my dir/fi"));
+    assert_eq!(
+        crate::mention_query("see @\"my dir/fi").as_deref(),
+        Some("my dir/fi")
+    );
     // Single quotes are a `PATH_DELIMITERS` member upstream but are NOT what
     // `findUnclosedQuoteStart` scans for — it tests `text[i] === '"'` only — so `'` still splits.
     assert_eq!(crate::mention_query("see @'my dir/fi").as_deref(), None);
@@ -367,7 +457,10 @@ fn an_unclosed_quote_keeps_a_path_with_spaces_as_one_mention_token() {
 #[test]
 fn a_closed_quote_falls_back_to_the_delimiter_split() {
     // `@"done" @stil` — the first pair is balanced, so the token is the trailing `@stil`.
-    assert_eq!(crate::mention_query("@\"done\" @stil").as_deref(), Some("stil"));
+    assert_eq!(
+        crate::mention_query("@\"done\" @stil").as_deref(),
+        Some("stil")
+    );
 }
 
 /// `isTokenStart` (`autocomplete.ts:70-72`) rejects a quote that opens mid-token, so an
@@ -386,9 +479,18 @@ fn a_quote_that_does_not_start_a_token_is_not_a_quoted_prefix() {
 #[test]
 fn is_command_prefix_matches_a_genuine_prefix_and_the_full_name() {
     let reg = CommandRegistry::new();
-    assert!(crate::autocomplete::is_command_prefix(&reg, "mod"), "\"mod\" prefixes \"model\"");
-    assert!(crate::autocomplete::is_command_prefix(&reg, "model"), "a full name is its own prefix");
-    assert!(crate::autocomplete::is_command_prefix(&reg, "se"), "\"se\" prefixes \"settings\"");
+    assert!(
+        crate::autocomplete::is_command_prefix(&reg, "mod"),
+        "\"mod\" prefixes \"model\""
+    );
+    assert!(
+        crate::autocomplete::is_command_prefix(&reg, "model"),
+        "a full name is its own prefix"
+    );
+    assert!(
+        crate::autocomplete::is_command_prefix(&reg, "se"),
+        "\"se\" prefixes \"settings\""
+    );
 }
 
 /// A query matching no registered name at all — including one that IS a fuzzy subsequence match —
@@ -424,7 +526,10 @@ fn fuzzy_matches_where_is_command_prefix_does_not() {
         arg_completion: crate::commands::ArgumentCompleter::None,
     };
     let reg = CommandRegistry::with_dynamic(vec![flux_aug]);
-    assert!(reg.get("flux/aug").is_some(), "the dynamic command registered");
+    assert!(
+        reg.get("flux/aug").is_some(),
+        "the dynamic command registered"
+    );
 
     // `is_command_prefix`: "fa" is not the start of "flux/aug".
     assert!(!crate::autocomplete::is_command_prefix(&reg, "fa"));
@@ -433,8 +538,9 @@ fn fuzzy_matches_where_is_command_prefix_does_not() {
     // popup surfaces it — correct for a suggestion list, wrong as a highlight confirmation.
     let matches = crate::fuzzy_filter(reg.commands(), "fa", |c| c.name.as_ref());
     assert!(
-        matches.iter().any(|m| reg.commands()[m.index].name == "flux/aug"),
+        matches
+            .iter()
+            .any(|m| reg.commands()[m.index].name == "flux/aug"),
         "fuzzy::filter should still match \"fa\" against \"flux/aug\" (subsequence f→a): {matches:?}"
     );
 }
-

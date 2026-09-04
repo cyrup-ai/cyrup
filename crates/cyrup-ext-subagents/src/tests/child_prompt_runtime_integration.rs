@@ -23,21 +23,30 @@
 //! declared listener), and so does a handler that returns the wrong patch shape (`apply_patch`
 //! silently ignores a mismatch). That is the point: they assert the wiring, not just the algorithm.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::sync::Arc;
 
-use cyrup_agent::AgentMessage;
-use cyrup_core::{CancelToken, Content, ToolCallId};
-use cyrup_ext::{ExtMode, ExtensionHost, HostConfig};
 use crate::prompt_runtime::{
     CHILD_FANOUT_BOUNDARY_INSTRUCTIONS, CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS,
     INHERIT_PROJECT_CONTEXT_ENV, INHERIT_SKILLS_ENV, prompt_runtime_extension_from,
 };
 use crate::spawn::nested_events::FANOUT_CHILD_ENV;
+use cyrup_agent::AgentMessage;
+use cyrup_core::{CancelToken, Content, ToolCallId};
+use cyrup_ext::{ExtMode, ExtensionHost, HostConfig};
 
 fn cfg() -> HostConfig {
-    HostConfig { mode: ExtMode::Tui, has_ui: false, cwd: std::path::PathBuf::from(".") }
+    HostConfig {
+        mode: ExtMode::Tui,
+        has_ui: false,
+        cwd: std::path::PathBuf::from("."),
+    }
 }
 
 /// The env a real spawn writes for a child (`exec/mod.rs`'s `env_overlay` + `child_role_env`),
@@ -61,13 +70,18 @@ fn child_env(
 /// reversion to the write-only-flag state this whole file exists to prevent.
 #[test]
 fn the_env_keys_are_the_ones_the_spawn_overlay_writes() {
-    assert_eq!(INHERIT_PROJECT_CONTEXT_ENV, "CYRUP_SUBAGENT_INHERIT_PROJECT_CONTEXT");
+    assert_eq!(
+        INHERIT_PROJECT_CONTEXT_ENV,
+        "CYRUP_SUBAGENT_INHERIT_PROJECT_CONTEXT"
+    );
     assert_eq!(INHERIT_SKILLS_ENV, "CYRUP_SUBAGENT_INHERIT_SKILLS");
     assert_eq!(FANOUT_CHILD_ENV, "CYRUP_SUBAGENT_FANOUT_CHILD");
     // The parent writes the fanout flag through `child_role_env` — assert the value the reader
     // treats as "authorized" is the value the writer emits for an authorized child.
     let authorized: std::collections::HashMap<&str, &str> =
-        crate::spawn::nested_events::child_role_env(true).into_iter().collect();
+        crate::spawn::nested_events::child_role_env(true)
+            .into_iter()
+            .collect();
     assert_eq!(authorized.get(FANOUT_CHILD_ENV), Some(&"1"));
 }
 
@@ -77,12 +91,9 @@ async fn host_with_child_env(
     fanout: &'static str,
 ) -> ExtensionHost {
     let host = ExtensionHost::new(cfg());
-    let ext = prompt_runtime_extension_from(&child_env(
-        inherit_project_context,
-        inherit_skills,
-        fanout,
-    ))
-    .expect("a child env must build the runtime");
+    let ext =
+        prompt_runtime_extension_from(&child_env(inherit_project_context, inherit_skills, fanout))
+            .expect("a child env must build the runtime");
     host.load_native(ext).await.expect("load_native");
     host
 }
@@ -136,7 +147,9 @@ async fn rewritten_prompt(host: &ExtensionHost) -> Option<String> {
 #[tokio::test]
 async fn inherit_project_context_false_removes_project_context_from_the_live_prompt() {
     let host = host_with_child_env("0", "1", "0").await;
-    let prompt = rewritten_prompt(&host).await.expect("the prompt must be rewritten");
+    let prompt = rewritten_prompt(&host)
+        .await
+        .expect("the prompt must be rewritten");
 
     assert!(
         !prompt.contains("PARENT-ONLY MARKER"),
@@ -148,19 +161,30 @@ async fn inherit_project_context_false_removes_project_context_from_the_live_pro
         prompt.contains("deploy-marker"),
         "inheritSkills=1 must leave the skills section alone:\n{prompt}"
     );
-    assert!(prompt.contains("Current date: 2026-08-07"), "the footer must survive");
+    assert!(
+        prompt.contains("Current date: 2026-08-07"),
+        "the footer must survive"
+    );
 }
 
 /// The opposite lever, so neither strip can be a blanket truncation.
 #[tokio::test]
 async fn inherit_skills_false_removes_skills_and_keeps_project_context() {
     let host = host_with_child_env("1", "0", "0").await;
-    let prompt = rewritten_prompt(&host).await.expect("the prompt must be rewritten");
+    let prompt = rewritten_prompt(&host)
+        .await
+        .expect("the prompt must be rewritten");
 
-    assert!(!prompt.contains("deploy-marker"), "skills must be gone:\n{prompt}");
+    assert!(
+        !prompt.contains("deploy-marker"),
+        "skills must be gone:\n{prompt}"
+    );
     assert!(!prompt.contains("<available_skills>"));
     // MIRROR: project context was inherited.
-    assert!(prompt.contains("PARENT-ONLY MARKER"), "project context must survive:\n{prompt}");
+    assert!(
+        prompt.contains("PARENT-ONLY MARKER"),
+        "project context must survive:\n{prompt}"
+    );
 }
 
 /// The second half of the finding: no child was ever TOLD it was a child. Every child now opens on
@@ -169,7 +193,9 @@ async fn inherit_skills_false_removes_skills_and_keeps_project_context() {
 #[tokio::test]
 async fn every_child_is_told_it_is_a_child_and_a_fanout_child_gets_the_fanout_variant() {
     let plain = host_with_child_env("1", "1", "0").await;
-    let plain_prompt = rewritten_prompt(&plain).await.expect("even a fully-inheriting child is told");
+    let plain_prompt = rewritten_prompt(&plain)
+        .await
+        .expect("even a fully-inheriting child is told");
     assert!(
         plain_prompt.starts_with(CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS),
         "a plain child must open on the child boundary:\n{plain_prompt}"
@@ -177,7 +203,9 @@ async fn every_child_is_told_it_is_a_child_and_a_fanout_child_gets_the_fanout_va
     assert!(plain_prompt.contains("Do not propose or run subagents."));
 
     let fanout = host_with_child_env("1", "1", "1").await;
-    let fanout_prompt = rewritten_prompt(&fanout).await.expect("a fanout child is told too");
+    let fanout_prompt = rewritten_prompt(&fanout)
+        .await
+        .expect("a fanout child is told too");
     assert!(
         fanout_prompt.starts_with(CHILD_FANOUT_BOUNDARY_INSTRUCTIONS),
         "a fanout-authorized child must get the fanout boundary:\n{fanout_prompt}"
@@ -202,10 +230,18 @@ async fn a_childs_context_loses_the_parents_orchestration_bookkeeping() {
         parent_notice("subagent-notify"),
         bash_tool_result(),
     ];
-    let out = hooks.transform_context(messages.into_iter().map(Arc::new).collect(), CancelToken::new()).await.unwrap();
+    let out = hooks
+        .transform_context(
+            messages.into_iter().map(Arc::new).collect(),
+            CancelToken::new(),
+        )
+        .await
+        .unwrap();
 
     assert!(
-        !out.iter().any(|m| matches!(m.as_ref(), AgentMessage::Custom { kind, .. } if kind == "subagent-notify")),
+        !out.iter().any(
+            |m| matches!(m.as_ref(), AgentMessage::Custom { kind, .. } if kind == "subagent-notify")
+        ),
         "the parent's completion notice must not reach the child"
     );
     assert!(
@@ -229,15 +265,19 @@ async fn a_childs_context_loses_the_parents_orchestration_bookkeeping() {
     );
     // MIRRORS: the child's real work is untouched.
     assert!(
-        out.iter().any(|m| matches!(m.as_ref(), AgentMessage::ToolResult(tr) if tr.tool_name == "bash")),
+        out.iter()
+            .any(|m| matches!(m.as_ref(), AgentMessage::ToolResult(tr) if tr.tool_name == "bash")),
         "an unrelated tool result must survive"
     );
     assert!(
-        out.iter().any(|m| matches!(m.as_ref(), AgentMessage::User { .. })),
+        out.iter()
+            .any(|m| matches!(m.as_ref(), AgentMessage::User { .. })),
         "the user's own request must survive"
     );
     assert!(
-        assistant_blocks.iter().any(|b| matches!(b, Content::Text { .. })),
+        assistant_blocks
+            .iter()
+            .any(|b| matches!(b, Content::Text { .. })),
         "the assistant's prose must survive"
     );
 }
@@ -254,14 +294,29 @@ async fn a_fanout_child_keeps_its_own_delegation_history() {
         subagent_tool_result(),
         parent_notice("subagent_control_notice"),
     ];
-    let out = hooks.transform_context(messages.into_iter().map(Arc::new).collect(), CancelToken::new()).await.unwrap();
+    let out = hooks
+        .transform_context(
+            messages.into_iter().map(Arc::new).collect(),
+            CancelToken::new(),
+        )
+        .await
+        .unwrap();
 
-    assert_eq!(out.len(), 2, "only the parent-only notice is dropped: {out:?}");
+    assert_eq!(
+        out.len(),
+        2,
+        "only the parent-only notice is dropped: {out:?}"
+    );
     assert!(
-        out.iter().any(|m| matches!(m.as_ref(), AgentMessage::ToolResult(tr) if tr.tool_name == "subagent")),
+        out.iter().any(
+            |m| matches!(m.as_ref(), AgentMessage::ToolResult(tr) if tr.tool_name == "subagent")
+        ),
         "a fanout child's own subagent result is its own work"
     );
-    assert!(out.iter().all(|m| !matches!(m.as_ref(), AgentMessage::Custom { .. })));
+    assert!(
+        out.iter()
+            .all(|m| !matches!(m.as_ref(), AgentMessage::Custom { .. }))
+    );
 }
 
 /// A process that is not a subagent child attaches nothing at all — no prompt rewrite, no context
@@ -279,13 +334,23 @@ async fn a_non_child_process_attaches_no_runtime() {
         rewritten_prompt(&host).await.is_none(),
         "no listener => the assembled prompt is used verbatim"
     );
-    let messages = [AgentMessage::user_text("hi"), parent_notice("subagent-notify")];
+    let messages = [
+        AgentMessage::user_text("hi"),
+        parent_notice("subagent-notify"),
+    ];
     let out = host
         .hooks()
-        .transform_context(messages.iter().cloned().map(Arc::new).collect(), CancelToken::new())
+        .transform_context(
+            messages.iter().cloned().map(Arc::new).collect(),
+            CancelToken::new(),
+        )
         .await
         .unwrap();
-    assert_eq!(out.len(), messages.len(), "a top-level session keeps its own notices");
+    assert_eq!(
+        out.len(),
+        messages.len(),
+        "a top-level session keeps its own notices"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -399,9 +464,7 @@ async fn the_registered_structured_output_tool_advertises_rewritten_local_refs()
     let schema_env = schema_path.display().to_string();
     let capture_env = output_path.display().to_string();
     let ext = prompt_runtime_extension_from(&move |key: &str| match key {
-        k if k == crate::exec::structured::STRUCTURED_OUTPUT_SCHEMA_ENV => {
-            Some(schema_env.clone())
-        }
+        k if k == crate::exec::structured::STRUCTURED_OUTPUT_SCHEMA_ENV => Some(schema_env.clone()),
         k if k == crate::exec::structured::STRUCTURED_OUTPUT_CAPTURE_ENV => {
             Some(capture_env.clone())
         }

@@ -168,7 +168,7 @@ mod out;
 /// Escape-capture handles, re-exported for `crate::tests` — `mod out` is private and the test
 /// modules live outside this tree (`src/tests/mod.rs` explains the convention).
 #[cfg(test)]
-pub(crate) use out::{captured_text, Captured};
+pub(crate) use out::{Captured, captured_text};
 /// `pub(crate)`, unlike its siblings, for one item: `mouse::map_reader_event` is called from
 /// `app/input_reader.rs`, which is outside this module tree (ADR-0005 §B-4). Everything else in it
 /// stays `pub(super)` and reachable only from here.
@@ -307,12 +307,12 @@ pub trait ViewportRenderer {
 
 use std::time::Instant;
 
+use ratatui::Frame;
 use ratatui::backend::Backend;
 use ratatui::crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Text};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use crate::error::TuiError;
 use crate::image::ImageRenderer;
@@ -434,10 +434,7 @@ impl<B: Backend> AltScreen<B> {
     /// Propagates the same failures as [`Self::enter`]; with a capture sink neither write can fail,
     /// so in practice only `Terminal::new` can.
     #[cfg(test)]
-    pub(crate) fn for_test(
-        backend: B,
-        theme: UiTheme,
-    ) -> Result<(Self, out::Captured), TuiError> {
+    pub(crate) fn for_test(backend: B, theme: UiTheme) -> Result<(Self, out::Captured), TuiError> {
         let (sink, captured) = out::Out::capture();
         // Teardown tests pass their own `preserve_screen` to [`Self::stop`]; upstream's case
         // (`test/tui-alt-screen.test.ts:1336`) is the repainting one.
@@ -451,13 +448,22 @@ impl<B: Backend> AltScreen<B> {
     /// [`Self::set_document`] exists to reconcile against a transcript's front-trim reports, which
     /// a fixture has none of; this is the same hand-over with that reconciliation skipped.
     #[cfg(test)]
-    pub(crate) fn set_document_for_test(&mut self, lines: Vec<Line<'static>>, row_starts: Vec<usize>) {
+    pub(crate) fn set_document_for_test(
+        &mut self,
+        lines: Vec<Line<'static>>,
+        row_starts: Vec<usize>,
+    ) {
         let rows = lines.len();
         self.doc = lines;
         self.row_starts = row_starts;
         // `draw` runs this every frame; doing it here too lets a test assert on `viewport_top` and
         // `max_scroll_top` before the first paint, as upstream does off `getViewport()`.
-        let height = self.term.terminal_mut().size().map(|s| s.height).unwrap_or(0);
+        let height = self
+            .term
+            .terminal_mut()
+            .size()
+            .map(|s| s.height)
+            .unwrap_or(0);
         scroll::update_layout(&mut self.scroll, rows, usize::from(height));
     }
 
@@ -551,8 +557,11 @@ impl<B: Backend> AltScreen<B> {
         row_starts: Vec<usize>,
     ) {
         let dropped = transcript.retained_dropped();
-        let rows_dropped =
-            document::rows_dropped(&self.row_starts, dropped.saturating_sub(self.doc_dropped), self.doc.len());
+        let rows_dropped = document::rows_dropped(
+            &self.row_starts,
+            dropped.saturating_sub(self.doc_dropped),
+            self.doc.len(),
+        );
         self.doc_dropped = dropped;
         scroll::rebuild_rows(&mut self.scroll, dropped, rows_dropped);
         self.doc = lines;
@@ -674,18 +683,35 @@ impl<B: Backend> AltScreen<B> {
     pub(crate) fn draw(&mut self, strip: Option<images::Strip<'_>>) -> Result<(), TuiError> {
         // Destructured so the `draw` closure can borrow the renderer state while the terminal is
         // itself mutably borrowed — the shape `app/draw.rs:89` already uses.
-        let Self { term, theme, layout_root, scroll, bar, selection, flashes, doc, images, .. } =
-            self;
+        let Self {
+            term,
+            theme,
+            layout_root,
+            scroll,
+            bar,
+            selection,
+            flashes,
+            doc,
+            images,
+            ..
+        } = self;
         term.terminal_mut()
             .draw(|frame: &mut Frame| {
                 let area = frame.area();
                 let content_width = scroll::content_width(bar, area.width);
-                let viewport = Rect { width: content_width, ..area };
+                let viewport = Rect {
+                    width: content_width,
+                    ..area
+                };
                 scroll::update_layout(scroll, doc.len(), usize::from(area.height));
 
                 let top = scroll::scroll_top(scroll);
-                let visible: Vec<Line<'static>> =
-                    doc.iter().skip(top).take(usize::from(area.height)).cloned().collect();
+                let visible: Vec<Line<'static>> = doc
+                    .iter()
+                    .skip(top)
+                    .take(usize::from(area.height))
+                    .cloned()
+                    .collect();
                 frame.render_widget(Paragraph::new(Text::from(visible)), viewport);
 
                 if let Some(root) = layout_root.as_mut() {
@@ -738,9 +764,16 @@ impl<B: Backend> AltScreen<B> {
 
     /// Route a mouse report in pi's fixed precedence — the scrollbar first (`:526-604`), then
     /// selection (`:605-963`), then the wheel. Returns the selection outcome the caller acts on.
-    pub(crate) fn handle_mouse(&mut self, ev: &MouseEvent, area: Rect) -> selection::PointerOutcome {
+    pub(crate) fn handle_mouse(
+        &mut self,
+        ev: &MouseEvent,
+        area: Rect,
+    ) -> selection::PointerOutcome {
         let content_width = scroll::content_width(&self.bar, area.width);
-        let viewport = Rect { width: content_width, ..area };
+        let viewport = Rect {
+            width: content_width,
+            ..area
+        };
         scrollbar_drag::update_hover(&mut self.bar, &mut self.scroll, ev.column, ev.row, area);
         if scrollbar_drag::route(&mut self.drag, &mut self.bar, &mut self.scroll, ev, area) {
             // A report the scrollbar CLAIMED clears every selection field, which is upstream
@@ -794,7 +827,12 @@ impl<B: Backend> AltScreen<B> {
     pub(crate) fn stop(&mut self, preserve_screen: bool) {
         flash::clear(&mut self.flashes);
         self.images.delete_all(preserve_screen);
-        let width = self.term.terminal_mut().size().map(|s| s.width).unwrap_or(0);
+        let width = self
+            .term
+            .terminal_mut()
+            .size()
+            .map(|s| s.width)
+            .unwrap_or(0);
         self.mouse.disable();
         // pi's `dispose()` (`components/alt-screen-flash.ts:38-41`) on the way out
         // (`tui-alt-screen.ts:303`), so a notice queued in this excursion cannot survive into the

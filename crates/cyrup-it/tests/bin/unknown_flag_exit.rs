@@ -16,7 +16,12 @@
 //! This drives the REAL binary — the only way to observe the exit code and the stderr text
 //! together. Fully offline (`--offline`, faux model, tempdir HOME/agent dir); no network, no
 //! provider credentials.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::process::{Command, Stdio};
 
@@ -55,7 +60,13 @@ fn run(extra: &[&str]) -> (Run, TempDir) {
         .env_remove("CYRUP_INTERCOM")
         .env_remove("CYRUP_SUBAGENTS")
         .env_remove("CYRUP_PERMISSION_SYSTEM")
-        .args(["--offline", "--no-session", "--no-extensions", "--model", "faux/faux-1"])
+        .args([
+            "--offline",
+            "--no-session",
+            "--no-extensions",
+            "--model",
+            "faux/faux-1",
+        ])
         .args(extra)
         .args(["-p", "hi"])
         .stdin(Stdio::null());
@@ -76,12 +87,17 @@ fn a_mistyped_long_flag_reports_unknown_option_and_exits_1() {
     let (r, _tmp) = run(&["--dangerously-skip-permissions"]);
     assert_eq!(r.code, 1, "stderr was: {}", r.stderr);
     assert!(
-        r.stderr.contains("Error: Unknown option: --dangerously-skip-permissions"),
+        r.stderr
+            .contains("Error: Unknown option: --dangerously-skip-permissions"),
         "stderr was: {}",
         r.stderr
     );
     // The error goes to stderr; stdout stays clean for the protocol stream.
-    assert!(!r.stdout.contains("Unknown option"), "stdout was: {}", r.stdout);
+    assert!(
+        !r.stdout.contains("Unknown option"),
+        "stdout was: {}",
+        r.stdout
+    );
 }
 
 /// A `--flag value` pair is captured with its value and still reported by NAME; two unknowns
@@ -91,7 +107,8 @@ fn two_unknown_flags_report_once_in_the_plural() {
     let (r, _tmp) = run(&["--persona", "reviewer", "--depth", "3"]);
     assert_eq!(r.code, 1, "stderr was: {}", r.stderr);
     assert!(
-        r.stderr.contains("Error: Unknown options: --persona, --depth"),
+        r.stderr
+            .contains("Error: Unknown options: --persona, --depth"),
         "stderr was: {}",
         r.stderr
     );

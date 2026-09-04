@@ -7,8 +7,9 @@
 //! Split by concern: [`print_mode`] and [`json_mode`] cover the two one-shot adapters; the `rpc_*`
 //! modules cover the bidirectional protocol — its verb surface ([`rpc_commands`]), its failure
 //! envelopes ([`rpc_errors`]), its request deserialization ([`rpc_command_parsing`]), its bash
-//! surface ([`rpc_bash`]), its extension-UI transport ([`rpc_ui_dialogs`], [`rpc_ui_effects`]),
-//! contained extension faults ([`rpc_extension_errors`]) and the model registry ([`rpc_models`]).
+//! surface ([`rpc_bash`]), the v0.84.4 `clear_queue` verb ([`rpc_clear_queue`]), its extension-UI
+//! transport ([`rpc_ui_dialogs`], [`rpc_ui_effects`]), contained extension faults
+//! ([`rpc_extension_errors`]) and the model registry ([`rpc_models`]).
 //! Every fixture they share lives in [`support`], hoisted to `tests::support` so the sibling
 //! suites outside this module can use it too and re-exported here so `use super::support::…`
 //! keeps resolving.
@@ -18,6 +19,7 @@ pub(super) use super::support;
 mod json_mode;
 mod print_mode;
 mod rpc_bash;
+mod rpc_clear_queue;
 mod rpc_command_parsing;
 mod rpc_commands;
 mod rpc_errors;

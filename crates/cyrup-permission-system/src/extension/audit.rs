@@ -100,11 +100,15 @@ impl PermissionSystemExtension {
     pub(super) fn permission_decision_scope(details: &DedupDetails) -> Value {
         // pi's first three arms — `getNonEmptyString` = trim, then drop if empty
         // (`common::get_non_empty_string`, `common.rs:20`).
-        let trimmed = [details.target.as_deref(), details.command.as_deref(), details.path.as_deref()]
-            .into_iter()
-            .flatten()
-            .map(str::trim)
-            .find(|s| !s.is_empty());
+        let trimmed = [
+            details.target.as_deref(),
+            details.command.as_deref(),
+            details.path.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|s| !s.is_empty());
         if let Some(s) = trimmed {
             return Value::String(s.to_string());
         }

@@ -83,7 +83,9 @@ impl EffectiveSettings {
             .unwrap_or_default()
             .into_iter()
             .filter_map(|(k, v)| {
-                serde_json::from_value::<ModelThinkingLevel>(v).ok().map(|l| (k, l))
+                serde_json::from_value::<ModelThinkingLevel>(v)
+                    .ok()
+                    .map(|l| (k, l))
             })
             .collect()
     }

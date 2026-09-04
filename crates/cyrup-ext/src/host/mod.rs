@@ -24,12 +24,12 @@ pub use limits::StoreLimits;
 pub use live::{LiveExtension, WasmTool};
 pub use overlay::{
     CustomOption, CustomSpec, InteractiveOverlay, OverlayColor, OverlayKey, OverlayKeyCode,
-    OverlayLine, OverlayOutcome, OverlaySpan, SpecOverlay, OverlayOptions,};
+    OverlayLine, OverlayOptions, OverlayOutcome, OverlaySpan, SpecOverlay,
+};
 pub use services::{
-    CannedResponses, ControlOp, DenyServices, DialogOptions, ExecOutput, FsCaps, GuestState,
-    DENIED_EXEC, DENIED_NET, DENIED_UI,
-    HostServices, HttpRequest, HttpResponse, HttpStreamResponse, HumanInteractionGuard,
-    HumanInteractionLock, NotifyKind, OAuthEvent, ProcSpawnSpec, ProviderReduction,
-    RecordingServices, SharedBus, UiChrome, WidgetEffect, WidgetPlacement,
+    CannedResponses, ControlOp, DENIED_EXEC, DENIED_NET, DENIED_UI, DenyServices, DialogOptions,
+    ExecOutput, FsCaps, GuestState, HostServices, HttpRequest, HttpResponse, HttpStreamResponse,
+    HumanInteractionGuard, HumanInteractionLock, NotifyKind, OAuthEvent, ProcSpawnSpec,
+    ProviderReduction, RecordingServices, SharedBus, UiChrome, WidgetEffect, WidgetPlacement,
 };
 pub use store_state::HostState;

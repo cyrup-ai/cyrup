@@ -1,13 +1,16 @@
 //! Conformance tests for arch-04 / A-04-1..10 (sessions & branching).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::path::{Path, PathBuf};
 
-use cyrup_core::{AssistantMessage, Content, Message, StopReason, Usage};
 use crate::agent_message::AgentMessage;
-use crate::{
-    Entry, KnownEntry, NewSessionOpts, SessionLayout, SessionManager, SessionSelector,
-};
+use crate::{Entry, KnownEntry, NewSessionOpts, SessionLayout, SessionManager, SessionSelector};
+use cyrup_core::{AssistantMessage, Content, Message, StopReason, Usage};
 use serde_json::Value;
 
 // ----------------------------------------------------------------- helpers --------------------
@@ -17,7 +20,10 @@ fn layout(root: &Path, cwd: &Path) -> SessionLayout {
 }
 
 fn user(s: &str) -> Message {
-    Message::User { content: vec![Content::text(s)], timestamp: 0 }
+    Message::User {
+        content: vec![Content::text(s)],
+        timestamp: 0,
+    }
 }
 
 fn assistant(s: &str) -> Message {
@@ -66,7 +72,10 @@ fn a04_1_linear_tree_valid_jsonl() {
 
     // File exists after the first assistant message (deferred flush).
     let file = m.session_file().unwrap().to_path_buf();
-    assert!(file.exists(), "session file should exist after assistant message");
+    assert!(
+        file.exists(),
+        "session file should exist after assistant message"
+    );
 
     let text = std::fs::read_to_string(&file).unwrap();
     let mut lines = text.lines();
@@ -80,7 +89,10 @@ fn a04_1_linear_tree_valid_jsonl() {
     let e1: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
     let e2: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
     assert_eq!(e1["type"], "message");
-    assert!(e1["parentId"].is_null(), "first entry parentId must be null");
+    assert!(
+        e1["parentId"].is_null(),
+        "first entry parentId must be null"
+    );
     assert_eq!(e2["parentId"], serde_json::json!(u.as_str()));
     assert_eq!(m.leaf_id().unwrap(), &a);
 }
@@ -136,7 +148,14 @@ fn a04_3_build_context_with_compaction() {
     let u2 = m.append_message(user("keep-q")).unwrap();
     let _a2 = m.append_message(assistant("keep-a")).unwrap();
     let _comp = m
-        .append_compaction("SUMMARY-OF-OLD".to_string(), u2.clone(), 1234, None, None, false)
+        .append_compaction(
+            "SUMMARY-OF-OLD".to_string(),
+            u2.clone(),
+            1234,
+            None,
+            None,
+            false,
+        )
         .unwrap();
     let _u3 = m.append_message(user("new-q")).unwrap();
     let _a3 = m.append_message(assistant("new-a")).unwrap();
@@ -191,20 +210,26 @@ fn a04_4_fork_and_clone() {
     // Clone (createBranchedSession) re-roots the active path through the current leaf into a new
     // file IN PLACE; the previous file (src_path) is untouched on disk.
     let leaf = src.leaf_id().cloned().unwrap();
-    let cloned_path =
-        src.create_branched_session(&leaf, &lay).unwrap().expect("persisted branch returns a path");
+    let cloned_path = src
+        .create_branched_session(&leaf, &lay)
+        .unwrap()
+        .expect("persisted branch returns a path");
     assert!(cloned_path.exists());
     assert_ne!(cloned_path, src_path);
-    assert_eq!(src.header().parent_session.as_deref(), Some(src_path.to_string_lossy().as_ref()));
+    assert_eq!(
+        src.header().parent_session.as_deref(),
+        Some(src_path.to_string_lossy().as_ref())
+    );
     assert_eq!(src.entries().len(), src_entry_count);
     assert_eq!(first_text_of_leaf(&src), "a");
 }
 
 fn first_text_of_leaf(m: &SessionManager) -> String {
     match m.leaf_entry() {
-        Some(Entry::Known(KnownEntry::Message { message: AgentMessage::Core(m), .. })) => {
-            first_text(m)
-        }
+        Some(Entry::Known(KnownEntry::Message {
+            message: AgentMessage::Core(m),
+            ..
+        })) => first_text(m),
         _ => String::new(),
     }
 }
@@ -248,7 +273,9 @@ fn a04_6_ephemeral_writes_no_file() {
     assert_eq!(m.build_context().messages.len(), 2);
 
     // No files anywhere under the (untouched) root.
-    let count = std::fs::read_dir(root.path()).map(|rd| rd.count()).unwrap_or(0);
+    let count = std::fs::read_dir(root.path())
+        .map(|rd| rd.count())
+        .unwrap_or(0);
     assert_eq!(count, 0, "ephemeral mode must not write any files");
 }
 
@@ -273,7 +300,11 @@ fn a04_7_export_import_roundtrip() {
 
     let imported = SessionManager::import_jsonl(&export_path).unwrap();
     assert_eq!(imported.entries().len(), m.entries().len());
-    assert_eq!(imported.leaf_id(), Some(&leaf), "import resumes at the same leaf");
+    assert_eq!(
+        imported.leaf_id(),
+        Some(&leaf),
+        "import resumes at the same leaf"
+    );
 }
 
 // ----------------------------------------------------------------- A-04-8 ---------------------
@@ -297,7 +328,10 @@ fn a04_8_interop_shape_and_unknown_roundtrip() {
     let m = SessionManager::open(&file).unwrap();
     assert_eq!(m.entries().len(), 2);
     // Documented camelCase field shape survives load + index.
-    assert!(matches!(m.entries()[0], Entry::Known(KnownEntry::Message { .. })));
+    assert!(matches!(
+        m.entries()[0],
+        Entry::Known(KnownEntry::Message { .. })
+    ));
     assert!(matches!(m.entries()[1], Entry::Unknown(_)));
 
     // Unknown extension entry is skipped from context but preserved on export.
@@ -306,8 +340,14 @@ fn a04_8_interop_shape_and_unknown_roundtrip() {
     let mut buf = Vec::new();
     m.export_jsonl(&mut buf).unwrap();
     let out = String::from_utf8(buf).unwrap();
-    assert!(out.contains("\"weird_ext\""), "unknown type preserved verbatim");
-    assert!(out.contains("\"payload\""), "unknown payload preserved verbatim");
+    assert!(
+        out.contains("\"weird_ext\""),
+        "unknown type preserved verbatim"
+    );
+    assert!(
+        out.contains("\"payload\""),
+        "unknown payload preserved verbatim"
+    );
     assert!(out.contains("\"parentId\":\"aaaa1111\""));
 
     // model_change entries serialize with Pi camelCase field names.
@@ -315,7 +355,8 @@ fn a04_8_interop_shape_and_unknown_roundtrip() {
     let cwd = PathBuf::from("/proj/mc");
     let lay = layout(root2.path(), &cwd);
     let mut mc = SessionManager::create(&cwd, &lay, NewSessionOpts::default()).unwrap();
-    mc.append_model_change("anthropic".into(), "claude".into()).unwrap();
+    mc.append_model_change("anthropic".into(), "claude".into())
+        .unwrap();
     let line = mc.entries()[0].to_line().unwrap();
     let v: Value = serde_json::from_str(&line).unwrap();
     assert_eq!(v["type"], "model_change");
@@ -334,13 +375,17 @@ fn a04_9_custom_excluded_custom_message_included() {
     let mut m = SessionManager::create(&cwd, &lay, NewSessionOpts::default()).unwrap();
     m.append_message(user("q")).unwrap();
     m.append_message(assistant("a")).unwrap();
-    m.append_custom_entry("ext_state", Some(serde_json::json!({"k": "v"}))).unwrap();
+    m.append_custom_entry("ext_state", Some(serde_json::json!({"k": "v"})))
+        .unwrap();
     m.append_custom_message("ext_msg", Value::String("injected".to_string()), true, None)
         .unwrap();
 
     let ctx = m.build_context();
     let texts: Vec<String> = ctx.messages.iter().map(first_text).collect();
-    assert!(texts.contains(&"injected".to_string()), "CustomMessage must be in context");
+    assert!(
+        texts.contains(&"injected".to_string()),
+        "CustomMessage must be in context"
+    );
     assert!(
         !texts.iter().any(|t| t.contains("ext_state")),
         "CustomEntry must NOT be in context"
@@ -368,13 +413,20 @@ fn a04_10_corrupt_trailing_line_loads_valid_prefix() {
 
     // Append a truncated, unparseable final line (simulating a crash mid-append).
     {
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         f.write_all(b"{\"type\":\"message\",\"id\":\"zz").unwrap();
     }
 
     // Loads the valid prefix without panicking.
     let recovered = SessionManager::open(&path).unwrap();
-    assert_eq!(recovered.entries().len(), good_count, "valid prefix recovered");
+    assert_eq!(
+        recovered.entries().len(),
+        good_count,
+        "valid prefix recovered"
+    );
 }
 
 // -------------------------------------------------- StopReason wire compatibility -------------
@@ -405,7 +457,10 @@ fn an_existing_session_jsonl_still_loads_after_the_pending_variant_was_added() {
     // Hand-written entries in the pre-change on-disk shape, one per settled stop reason.
     let wire = ["stop", "length", "toolUse", "error", "aborted"];
     {
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         for (i, w) in wire.iter().enumerate() {
             let line = serde_json::json!({
                 "type": "message",
@@ -466,10 +521,13 @@ fn an_existing_session_jsonl_still_loads_after_the_pending_variant_was_added() {
 
     // Re-export must reproduce the same bytes — no variant renamed itself on the way out.
     for (i, w) in wire.iter().enumerate() {
-        let a = AssistantMessage { stop_reason: got[i], ..match assistant("x") {
-            Message::Assistant(a) => a,
-            _ => unreachable!(),
-        } };
+        let a = AssistantMessage {
+            stop_reason: got[i],
+            ..match assistant("x") {
+                Message::Assistant(a) => a,
+                _ => unreachable!(),
+            }
+        };
         assert_eq!(serde_json::to_value(a).unwrap()["stopReason"], *w);
     }
 }
@@ -501,7 +559,10 @@ fn a_pi_pending_entry_is_no_longer_silently_dropped_on_load() {
     drop(m);
 
     {
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         let line = serde_json::json!({
             "type": "message",
             "id": "p0",
@@ -623,7 +684,11 @@ fn v1_legacy_file_migrates_to_v3_on_load() {
     std::fs::write(&file, contents).unwrap();
 
     let m = SessionManager::open(&file).unwrap();
-    assert_eq!(m.header().version, Some(3), "header migrated to current version");
+    assert_eq!(
+        m.header().version,
+        Some(3),
+        "header migrated to current version"
+    );
     assert_eq!(m.entries().len(), 2);
     // Ids minted + linear parent chain established.
     assert!(m.entries()[0].parent_id().is_none());
@@ -670,10 +735,24 @@ fn build_context_raw_keeps_the_roles_build_context_flattens() {
     let mut m = SessionManager::create(&cwd, &lay, NewSessionOpts::default()).unwrap();
     let u = m.append_message(user("start")).unwrap();
     m.append_message(assistant("ok")).unwrap();
-    m.append_compaction("we did a refactor".into(), u.clone(), 42_000, None, None, false).unwrap();
-    m.append_branch_summary(u.clone(), "tried a rewrite".into(), None, None, false).unwrap();
-    m.append_custom_message("review.note", serde_json::json!("three findings"), true, None)
+    m.append_compaction(
+        "we did a refactor".into(),
+        u.clone(),
+        42_000,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    m.append_branch_summary(u.clone(), "tried a rewrite".into(), None, None, false)
         .unwrap();
+    m.append_custom_message(
+        "review.note",
+        serde_json::json!("three findings"),
+        true,
+        None,
+    )
+    .unwrap();
     m.append_agent_message(AgentMessage::BashExecution(
         crate::agent_message::BashExecutionMessage {
             command: "git status".into(),
@@ -689,7 +768,10 @@ fn build_context_raw_keeps_the_roles_build_context_flattens() {
     .unwrap();
 
     let raw = m.build_context_raw();
-    let roles: Vec<_> = raw.iter().map(crate::agent_message::AgentMessage::role).collect();
+    let roles: Vec<_> = raw
+        .iter()
+        .map(crate::agent_message::AgentMessage::role)
+        .collect();
     use crate::agent_message::MessageRole;
     assert_eq!(
         roles,
@@ -707,12 +789,14 @@ fn build_context_raw_keeps_the_roles_build_context_flattens() {
     // The LLM view, by contrast, is all `user`/`assistant` — the wrapper prose a UI must never show.
     let llm = m.build_context().messages;
     assert!(
-        llm.iter().any(|msg| matches!(msg, Message::User { content, .. }
+        llm.iter()
+            .any(|msg| matches!(msg, Message::User { content, .. }
             if first_text_blocks(content).contains("compacted into the following summary"))),
         "build_context still flattens the compaction into user prose (the LLM boundary)"
     );
     assert!(
-        llm.iter().any(|msg| matches!(msg, Message::User { content, .. }
+        llm.iter()
+            .any(|msg| matches!(msg, Message::User { content, .. }
             if first_text_blocks(content).starts_with("Ran `git status`"))),
         "…and the `!` run into `Ran `cmd`` prose"
     );

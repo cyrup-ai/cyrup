@@ -37,23 +37,24 @@ mod draw;
 mod event_extract;
 mod events;
 mod events_fold;
-mod frames;
-mod extension_ui;
 mod execute;
 mod execute_misc;
+mod extension_ui;
+mod frames;
 // The per-model-thinking helpers `execute.rs` and `selectors.rs` reach for by path
 // (`crate::app::thinking_level_str`, `crate::app::CLEAR_MODEL_THINKING`).
 pub(crate) use execute_misc::{CLEAR_MODEL_THINKING, thinking_level_str};
 mod execute_session;
-mod hotkeys;
 #[path = "extension_render.rs"]
 mod extension_render_impl;
+mod hotkeys;
 mod input;
 mod input_reader;
 mod layout;
 mod login;
 mod mode_switch;
 mod outcome;
+mod reload_trust;
 #[path = "render.rs"]
 mod render_impl;
 mod run;
@@ -64,38 +65,36 @@ mod session_bind;
 mod settings_rows;
 mod share;
 mod shell;
+mod state;
 mod submit;
 mod tree_nav;
-mod state;
 
 pub use action::{AppAction, AppCommand, CycleDirection};
 pub use backend::{InlineBackend, RebuildBackend, reanchor_inline_region};
 pub(crate) use bash_spawn::{BashMsg, spawn_session_bash};
-pub(crate) use event_extract::{
-    assistant_message_from_event, context_usage_may_have_moved,
-    custom_message_from_event, custom_message_text, edit_preview, message_role_from_event,
-    model_entries, read_clipboard_image_to_temp, stop_reason_notice, tool_result_usage_from_event,
-    truncate_summary, user_message_text_from_event,
-};
 #[cfg(any(test, feature = "scrollback-accumulator"))]
 pub(crate) use event_extract::line_text;
-pub use extension_render_impl::{
-    extension_render, extension_render_entry, extension_render_message,
-    should_honor_extension_shutdown,
+pub(crate) use event_extract::{
+    assistant_message_from_event, context_usage_may_have_moved, custom_message_from_event,
+    custom_message_text, edit_preview, message_role_from_event, model_entries,
+    read_clipboard_image_to_temp, stop_reason_notice, tool_result_usage_from_event,
+    truncate_summary, user_message_text_from_event,
 };
 pub(crate) use extension_render_impl::custom_entry_type;
-pub use input_reader::{crossterm_input_stream, write_terminal_title};
-pub(crate) use input_reader::{
-    ARM_BUDGET, ArmGuard, OVER_BUDGET_ARM, TerminalReleased, mark_input_serviced,
+pub use extension_render_impl::{
+    extension_render, extension_render_entry, extension_render_message, extension_render_tool_call,
+    extension_render_tool_result, should_honor_extension_shutdown,
 };
 #[cfg(test)]
 pub(crate) use input_reader::{
-    ACTIVE_ARM, Escalation, PANIC_MIN_GAP, is_escalate_chord, input_serviced, map_event,
+    ACTIVE_ARM, Escalation, PANIC_MIN_GAP, input_serviced, is_escalate_chord, map_event,
     map_event_on,
 };
-pub(crate) use layout::{
-    live_region_height, max_visible_editor_lines, region_constraints,
+pub(crate) use input_reader::{
+    ARM_BUDGET, ArmGuard, OVER_BUDGET_ARM, TerminalReleased, mark_input_serviced,
 };
+pub use input_reader::{crossterm_input_stream, write_terminal_title};
+pub(crate) use layout::{live_region_height, max_visible_editor_lines, region_constraints};
 /// ADR-0005 §Decision B-14 — the live renderer switch (pi `switchTuiMode`,
 /// `interactive-mode.ts:842-891` @v0.84.3). Re-exported from `lib.rs` because the eventual caller
 /// is the composition root in the `cyrup` crate (`crates/cyrup/src/interactive.rs`), not this one.
@@ -115,20 +114,21 @@ pub(crate) use settings_rows::{
 };
 #[cfg(test)]
 pub(crate) use settings_rows::{settings_rows_for_test, settings_rows_for_test_with_images};
-pub use share::{ShareMsg, gist_id_from_url, share_viewer_url, share_viewer_url_from};
 pub(crate) use share::ShareInFlight;
+pub use share::{ShareMsg, gist_id_from_url, share_viewer_url, share_viewer_url_from};
 
-pub use render_impl::render;
-pub(crate) use render_impl::{env_rows, fallback_columns, is_extension_command};
 pub(crate) use crossterm::resolve_external_editor;
 #[cfg(test)]
 pub(crate) use crossterm::run_editor_over_file;
-pub use tree_nav::tree_node_from_dag;
+pub use reload_trust::{ImplicitTrustReload, implicit_trust_after_reload};
+pub use render_impl::render;
+pub(crate) use render_impl::{env_rows, fallback_columns, is_extension_command};
 pub use state::{ActiveSelector, AppState, ShortcutSpec, SwapCaption};
 pub(crate) use state::{
-    BRANCH_SUMMARY_CUSTOM, BRANCH_SUMMARY_NONE, BRANCH_SUMMARY_YES, PendingTreeNav,
-    PendingUiReply, countdown_title, default_ui_reply,
+    BRANCH_SUMMARY_CUSTOM, BRANCH_SUMMARY_NONE, BRANCH_SUMMARY_YES, CONFIRM_YES, PendingImport,
+    PendingTreeNav, PendingUiReply, countdown_title, default_ui_reply,
 };
+pub use tree_nav::tree_node_from_dag;
 
 use std::io::{self, Stdout};
 use std::path::PathBuf;
@@ -139,12 +139,12 @@ use cyrup_core::{CancelToken, EventStream, ModelThinkingLevel};
 // The extension-facing session backend trait: brings `LiveHostServices::set_label` (the live
 // label-append the `/tree` `e` rename persists through — the SAME path a guest's `setLabel` uses,
 // host_services.rs:866) into scope.
-use cyrup_ext::host::HostServices;
 use cyrup_config::login::{
     AuthType, LoginCommand, LoginProviderOption, LoginStep, ProviderLoginInput,
 };
-use cyrup_provider::auth::oauth::OAuthError;
+use cyrup_ext::host::HostServices;
 use cyrup_provider::StreamEvent;
+use cyrup_provider::auth::oauth::OAuthError;
 use cyrup_resources::theme::ThemeData;
 use cyrup_session_svc::{
     AgentSession, AgentSessionEvent, CompactionReason, InputSource, SummarizationRetrySource,
@@ -157,50 +157,48 @@ use cyrup_session_svc::{
 use cyrup_session_svc::{NotifyKind, UiEffect, UiKind, UiReply, UiRequest};
 use futures::{FutureExt, StreamExt};
 use ratatui::backend::{Backend, CrosstermBackend};
+use ratatui::crossterm::cursor::MoveTo;
 use ratatui::crossterm::event::{
     self, Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
 };
-use ratatui::crossterm::cursor::MoveTo;
 use ratatui::crossterm::terminal::{
-    enable_raw_mode, BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate,
+    BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate, enable_raw_mode,
 };
-use ratatui::crossterm::{execute, queue, ExecutableCommand};
+use ratatui::crossterm::{ExecutableCommand, execute, queue};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 
+use crate::altscreen::AltScreen;
 use crate::commands::{CommandRegistry, Dispatch};
 use crate::component::{Component, InputEvent};
 use crate::editor::{EditorOutcome, InputEditor};
 use crate::error::TuiError;
+use crate::escape_reassembly::EscapeReassembler;
 use crate::extension_editor::ExtensionEditorSelector;
 use crate::image::{ImageBlock, ImageRenderer, TerminalCapabilities};
-use crate::altscreen::AltScreen;
 use crate::keymap::{
-    Action, AltScreenKeymap, EditorAction, Key, KeybindingIssue, Keymap, ModelsKeymap, SelectAction,
-    SelectKeymap, SessionKeymap, TreeKeymap,
+    Action, AltScreenKeymap, EditorAction, Key, KeybindingIssue, Keymap, ModelsKeymap,
+    SelectAction, SelectKeymap, SessionKeymap, TreeKeymap,
 };
 use crate::login_dialog::{
-    notify_auth_dialog, show_auth_prompt, LoginDialog, LoginFinished, LoginUiMsg,
-    TuiAuthInteraction,
+    LoginDialog, LoginFinished, LoginUiMsg, TuiAuthInteraction, notify_auth_dialog,
+    show_auth_prompt,
 };
 use crate::model_selector::{ModelEntry, ModelSelector};
 use crate::overlay::{ExtensionOverlay, Overlay, OverlayOutcome};
-use crate::selector::{
-    CheckboxSelector, ListSelector, Selector, SelectorKind, SelectorOutcome,
-};
+use crate::selector::{CheckboxSelector, ListSelector, Selector, SelectorKind, SelectorOutcome};
 use crate::session_selector::{SessionRow, SessionSelector, SessionSelectorOutcome};
 use crate::settings_selector::{SettingRow, SettingsSelector, TrustSelector};
 use crate::status::StatusLine;
-use crate::status_indicator::{IndicatorKind, StatusIndicator, WorkingIndicator, SPINNER_INTERVAL};
-use crate::escape_reassembly::EscapeReassembler;
+use crate::status_indicator::{IndicatorKind, SPINNER_INTERVAL, StatusIndicator, WorkingIndicator};
 use crate::stray_reply::StrayReplyFilter;
 use crate::terminal_title::session_terminal_title;
 use crate::text_input::TextInputSelector;
 use crate::theme::{ColorMode, ThemeController, UiTheme};
-use crate::transcript::{content_text, entry_lines, thinking_text, TranscriptView};
+use crate::transcript::{TranscriptView, content_text, entry_lines, thinking_text};
 use crate::tree_selector::{TreeKind, TreeNode, TreeSelector};
 
 /// The number of visual lines a `PageUp`/`PageDown` scrolls the active region by (a conservative

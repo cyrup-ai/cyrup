@@ -21,8 +21,8 @@ use std::sync::Arc;
 
 use crate::{Agent, AgentError, ProviderStreamFn, StreamFn};
 use cyrup_core::StopReason;
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 use cyrup_provider::Provider;
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
 
 use super::support::model_ref;
 
@@ -120,7 +120,10 @@ async fn concurrent_starts_admit_exactly_one_run() {
     // flight can test it.
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let inner = stream_fn(8);
-    let gated: Arc<dyn StreamFn> = Arc::new(GatedStreamFn { inner, gate: Arc::clone(&gate) });
+    let gated: Arc<dyn StreamFn> = Arc::new(GatedStreamFn {
+        inner,
+        gate: Arc::clone(&gate),
+    });
     let agent = Arc::new(Agent::builder(model_ref(), gated).build());
 
     // All 16 start together, and none can settle while the gate is closed.
@@ -157,11 +160,17 @@ async fn concurrent_starts_admit_exactly_one_run() {
             Err(other) => panic!("unexpected prompt failure: {other:?}"),
         }
     }
-    assert_eq!(accepted, 1, "exactly one concurrent start may claim the run latch");
+    assert_eq!(
+        accepted, 1,
+        "exactly one concurrent start may claim the run latch"
+    );
 
     agent.wait_for_idle().await;
     gate.add_permits(1);
-    agent.prompt("go").await.expect("the latch is released once the run settles");
+    agent
+        .prompt("go")
+        .await
+        .expect("the latch is released once the run settles");
     agent.wait_for_idle().await;
 }
 
@@ -182,15 +191,15 @@ impl StreamFn for GatedStreamFn {
     ) -> cyrup_core::EventStream<cyrup_provider::StreamEvent> {
         let inner = self.inner.stream(model, ctx, opts);
         let gate = Arc::clone(&self.gate);
-        Box::pin(
-            futures::StreamExt::flatten(futures::stream::once(async move {
+        Box::pin(futures::StreamExt::flatten(futures::stream::once(
+            async move {
                 // A permit is never returned to the semaphore: each `add_permits(1)` releases
                 // exactly one run.
                 if let Ok(p) = gate.acquire().await {
                     p.forget();
                 }
                 inner
-            })),
-        )
+            },
+        )))
     }
 }

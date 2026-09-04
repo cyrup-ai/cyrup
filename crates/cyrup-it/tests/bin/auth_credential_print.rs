@@ -100,7 +100,14 @@ fn print_api_key_writes_the_credential_alone_on_stdout() {
     let tmp = fixture();
     let r = run(
         &tmp,
-        &["auth", "print-api-key", "--provider", "acme", "--model", "acme-1"],
+        &[
+            "auth",
+            "print-api-key",
+            "--provider",
+            "acme",
+            "--model",
+            "acme-1",
+        ],
     );
     assert_eq!(
         r.stdout, "sk-acme-stored\n",
@@ -161,11 +168,16 @@ fn bare_auth_prints_the_usage_block() {
         "cyrup auth print-bearer-token [--provider <provider>] [--model <model>] [--min-expiry <duration>]",
         "cyrup auth check [--provider <provider>] [--model <model>] [--json] [--credentials] [--no-refresh]",
     ] {
-        assert!(r.stdout.contains(line), "usage block is missing `{line}`; stdout was: {}", r.stdout);
+        assert!(
+            r.stdout.contains(line),
+            "usage block is missing `{line}`; stdout was: {}",
+            r.stdout
+        );
     }
     // pi `:44` — the sentence that states the provider-OR-model rule the v0.84.1 surface turns on.
     assert!(
-        r.stdout.contains("Auth commands require at least one of --provider or --model."),
+        r.stdout
+            .contains("Auth commands require at least one of --provider or --model."),
         "stdout was: {}",
         r.stdout
     );
@@ -178,7 +190,14 @@ fn print_bearer_token_rejects_an_api_key_provider() {
     let tmp = fixture();
     let r = run(
         &tmp,
-        &["auth", "print-bearer-token", "--provider", "acme", "--model", "acme-1"],
+        &[
+            "auth",
+            "print-bearer-token",
+            "--provider",
+            "acme",
+            "--model",
+            "acme-1",
+        ],
     );
     assert_eq!(
         r.stderr.trim_end(),
@@ -202,7 +221,14 @@ fn credential_printing_validates_its_argument_surface() {
     // SINGLE message, not one per cause.
     let r = run(
         &tmp,
-        &["auth", "print-api-key", "--model", "acme-1", "--api-key", "sk-injected"],
+        &[
+            "auth",
+            "print-api-key",
+            "--model",
+            "acme-1",
+            "--api-key",
+            "sk-injected",
+        ],
     );
     assert_eq!(
         r.stderr.trim_end(),
@@ -211,7 +237,10 @@ fn credential_printing_validates_its_argument_surface() {
     assert_eq!(r.code, 1);
     assert_eq!(r.stdout, "", "an injected key must never be echoed back");
 
-    let r = run(&tmp, &["auth", "print-api-key", "--model", "acme-1", "extra"]);
+    let r = run(
+        &tmp,
+        &["auth", "print-api-key", "--model", "acme-1", "extra"],
+    );
     assert_eq!(
         r.stderr.trim_end(),
         "Error: Auth commands only accept --provider and --model"
@@ -227,7 +256,10 @@ fn credential_printing_validates_its_argument_surface() {
     assert_eq!(r.code, 1);
 
     // pi `:99-102` — an unmatched flag names the command it was given to.
-    let r = run(&tmp, &["auth", "print-api-key", "--model", "acme-1", "--nope"]);
+    let r = run(
+        &tmp,
+        &["auth", "print-api-key", "--model", "acme-1", "--nope"],
+    );
     assert_eq!(
         r.stderr.trim_end(),
         "Error: Unknown option --nope for \"auth print-api-key\"."
@@ -236,7 +268,14 @@ fn credential_printing_validates_its_argument_surface() {
 
     let r = run(
         &tmp,
-        &["auth", "print-bearer-token", "--model", "acme-1", "--min-expiry", "30d"],
+        &[
+            "auth",
+            "print-bearer-token",
+            "--model",
+            "acme-1",
+            "--min-expiry",
+            "30d",
+        ],
     );
     assert_eq!(
         r.stderr.trim_end(),
@@ -278,7 +317,10 @@ fn print_api_key_accepts_a_provider_with_no_model() {
 #[test]
 fn an_unknown_provider_is_named_and_points_at_list_models() {
     let tmp = fixture();
-    let r = run(&tmp, &["auth", "print-api-key", "--provider", "nosuchprovider"]);
+    let r = run(
+        &tmp,
+        &["auth", "print-api-key", "--provider", "nosuchprovider"],
+    );
     assert_eq!(
         r.stderr.trim_end(),
         "Error: Unknown provider \"nosuchprovider\". Use --list-models to see available providers."
@@ -294,7 +336,8 @@ fn help_advertises_the_auth_command() {
     let r = run(&tmp, &["--help"]);
     assert_eq!(r.code, 0, "stderr was: {}", r.stderr);
     assert!(
-        r.stdout.contains("cyrup auth <command>            Print credentials for external clients"),
+        r.stdout
+            .contains("cyrup auth <command>            Print credentials for external clients"),
         "stdout was: {}",
         r.stdout
     );

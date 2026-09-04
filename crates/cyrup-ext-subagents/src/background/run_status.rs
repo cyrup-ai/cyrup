@@ -131,7 +131,10 @@ fn step_line_label(status: &RunStatus, index: usize) -> String {
 fn format_steering_summary(steer_count: Option<u64>, last_steer_at: Option<i64>) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     if let Some(count) = steer_count {
-        parts.push(format!("{count} steer{}", if count == 1 { "" } else { "s" }));
+        parts.push(format!(
+            "{count} steer{}",
+            if count == 1 { "" } else { "s" }
+        ));
     }
     if let Some(at) = last_steer_at {
         parts.push(format!("last {}", format_iso8601_millis(at)));
@@ -262,8 +265,14 @@ fn format_status(status: &RunStatus, paths: &RunPaths) -> String {
     {
         lines.push(format!("Pending appends: {pending}"));
     }
-    lines.push(format!("Started: {}", format_iso8601_millis(status.started_at)));
-    lines.push(format!("Updated: {}", format_iso8601_millis(status.last_update)));
+    lines.push(format!(
+        "Started: {}",
+        format_iso8601_millis(status.started_at)
+    ));
+    lines.push(format!(
+        "Updated: {}",
+        format_iso8601_millis(status.last_update)
+    ));
     lines.push(format!("Dir: {}", paths.run_dir.display()));
     if paths.result.exists() {
         lines.push(format!("Result: {}", paths.result.display()));
@@ -284,10 +293,8 @@ fn format_status(status: &RunStatus, paths: &RunPaths) -> String {
         // and the error text. This is what makes an `action: "steer"` VISIBLE: without it the tool
         // would report "Steering queued" and the status report would look identical whether the
         // runner accepted the request or dropped it.
-        let steering_text = format_steering_summary(
-            step.telemetry.steer_count,
-            step.telemetry.last_steer_at,
-        );
+        let steering_text =
+            format_steering_summary(step.telemetry.steer_count, step.telemetry.last_steer_at);
         let steering_suffix = steering_text
             .map(|text| format!(", steering: {text}"))
             .unwrap_or_default();
@@ -390,7 +397,11 @@ pub(crate) async fn resolve_run_id(
 
     // Exact match first: a run directory, its status.json, or its terminal result file already
     // exists under this exact id.
-    let exact = RunPaths::for_run(async_root, results_dir, &RunId::from_token(selector.to_string()));
+    let exact = RunPaths::for_run(
+        async_root,
+        results_dir,
+        &RunId::from_token(selector.to_string()),
+    );
     if path_exists(&exact.run_dir).await
         || path_exists(&exact.status).await
         || path_exists(&exact.result).await
@@ -670,7 +681,12 @@ pub fn format_run_list(runs: &[ActiveRun]) -> String {
         let pending = status
             .pending_appends
             .filter(|count| *count > 0)
-            .map(|count| format!(" | {count} pending append{}", if count == 1 { "" } else { "s" }))
+            .map(|count| {
+                format!(
+                    " | {count} pending append{}",
+                    if count == 1 { "" } else { "s" }
+                )
+            })
             .unwrap_or_default();
         lines.push(format!(
             "- {} | {} | {} | {}{} | {}",
@@ -742,17 +758,25 @@ mod tests {
 
         let report = format_status(&status, &paths);
         assert!(
-            report.contains("Step 1: scout running, steering: 2 steers, last 2023-11-14T22:13:20.000Z"),
+            report.contains(
+                "Step 1: scout running, steering: 2 steers, last 2023-11-14T22:13:20.000Z"
+            ),
             "{report}"
         );
 
         // Singular, and no suffix at all when nothing was ever steered.
         status.steps[0].telemetry.steer_count = Some(1);
         status.steps[0].telemetry.last_steer_at = None;
-        assert!(format_status(&status, &paths).contains(", steering: 1 steer"), "singular form");
+        assert!(
+            format_status(&status, &paths).contains(", steering: 1 steer"),
+            "singular form"
+        );
         status.steps[0].telemetry.steer_count = None;
         let quiet = format_status(&status, &paths);
-        assert!(!quiet.contains("steering:"), "an unsteered step gets no suffix: {quiet}");
+        assert!(
+            !quiet.contains("steering:"),
+            "an unsteered step gets no suffix: {quiet}"
+        );
     }
 
     /// G77 — the `status` action's rendering of a stopped run: its own state word, and pi's
@@ -857,7 +881,10 @@ mod tests {
     fn iso8601_formats_a_known_epoch() {
         assert_eq!(format_iso8601_millis(0), "1970-01-01T00:00:00.000Z");
         // 2021-01-01T00:00:00.000Z == 1_609_459_200_000 ms.
-        assert_eq!(format_iso8601_millis(1_609_459_200_000), "2021-01-01T00:00:00.000Z");
+        assert_eq!(
+            format_iso8601_millis(1_609_459_200_000),
+            "2021-01-01T00:00:00.000Z"
+        );
         // Same day + 12:34:56.789 (== 45_296_789 ms of day) exercises the time + millis fields.
         assert_eq!(
             format_iso8601_millis(1_609_459_200_000 + 45_296_789),
@@ -900,15 +927,30 @@ mod tests {
         let ids: Vec<&str> = active.iter().map(|r| r.status.run_id.as_str()).collect();
         assert!(ids.contains(&"run0running"), "running run must be listed");
         assert!(ids.contains(&"run0queued0"), "queued run must be listed");
-        assert!(!ids.contains(&"run0donexxx"), "completed run must be excluded");
+        assert!(
+            !ids.contains(&"run0donexxx"),
+            "completed run must be excluded"
+        );
 
         // running sorts before queued.
-        assert_eq!(active.first().map(|r| r.status.run_id.as_str()), Some("run0running"));
+        assert_eq!(
+            active.first().map(|r| r.status.run_id.as_str()),
+            Some("run0running")
+        );
 
         let rendered = format_run_list(&active);
-        assert!(rendered.starts_with("Active async runs: 2"), "heading: {rendered}");
-        assert!(rendered.contains("run0running | running | chain"), "run line: {rendered}");
-        assert!(!rendered.contains("run0donexxx"), "terminal run absent: {rendered}");
+        assert!(
+            rendered.starts_with("Active async runs: 2"),
+            "heading: {rendered}"
+        );
+        assert!(
+            rendered.contains("run0running | running | chain"),
+            "run line: {rendered}"
+        );
+        assert!(
+            !rendered.contains("run0donexxx"),
+            "terminal run absent: {rendered}"
+        );
     }
 
     #[tokio::test]
@@ -1020,7 +1062,11 @@ mod tests {
         let (_dir, async_root, results_dir) = roots();
         let run_id = RunId::from_token("abcdef123456");
         let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
-        let status = running_status(&run_id, RunMode::Single, vec![StepStatus::pending("worker")]);
+        let status = running_status(
+            &run_id,
+            RunMode::Single,
+            vec![StepStatus::pending("worker")],
+        );
         write_status(&paths, &status).await;
 
         let report = inspect_status_by_id(&async_root, &results_dir, "abcdef")
@@ -1036,7 +1082,10 @@ mod tests {
         let found = inspect_status_by_id(&async_root, &results_dir, "nosuchrun00")
             .await
             .expect("inspect ok");
-        assert!(found.is_none(), "a missing run resolves to None (not-found notice)");
+        assert!(
+            found.is_none(),
+            "a missing run resolves to None (not-found notice)"
+        );
     }
 
     // ---------------------------------------------------------------------------------------
@@ -1056,15 +1105,25 @@ mod tests {
         running_step.session_file = Some(session_file.clone());
         let status = running_status(&run_id, RunMode::Single, vec![running_step]);
         write_status(&paths, &status).await;
-        tokio::fs::write(&session_file, b"{}\n").await.expect("write session");
+        tokio::fs::write(&session_file, b"{}\n")
+            .await
+            .expect("write session");
 
         // Orchestrator side: deliver the interrupt.
-        let outcome = control::interrupt(&async_root, &results_dir, "run0intr000", "interrupt-action", None)
-            .await
-            .expect("interrupt delivered");
+        let outcome = control::interrupt(
+            &async_root,
+            &results_dir,
+            "run0intr000",
+            "interrupt-action",
+            None,
+        )
+        .await
+        .expect("interrupt delivered");
         assert_eq!(outcome, InterruptOutcome::Delivered);
         assert!(
-            tokio::fs::try_exists(&paths.control_inbox).await.expect("exists"),
+            tokio::fs::try_exists(&paths.control_inbox)
+                .await
+                .expect("exists"),
             "the control-inbox interrupt request must be written"
         );
 
@@ -1072,12 +1131,17 @@ mod tests {
         let consumed = control::consume_interrupt_request(&paths)
             .await
             .expect("consume ok");
-        assert!(consumed.is_some(), "the pending interrupt must be consumable");
+        assert!(
+            consumed.is_some(),
+            "the pending interrupt must be consumable"
+        );
         let mut paused = status;
         if let Some(step) = paused.steps.first_mut() {
             step.status = StepState::Paused;
         }
-        paused.advance_state(RunState::Paused).expect("Running -> Paused");
+        paused
+            .advance_state(RunState::Paused)
+            .expect("Running -> Paused");
         write_status(&paths, &paused).await;
 
         // Observable outcome: the status report now reads paused, with a real revive guidance line.
@@ -1085,8 +1149,14 @@ mod tests {
             .await
             .expect("inspect ok")
             .expect("found");
-        assert!(report.contains("State: paused"), "soft-pause, not failed: {report}");
-        assert!(report.contains("researcher paused"), "the step is paused: {report}");
+        assert!(
+            report.contains("State: paused"),
+            "soft-pause, not failed: {report}"
+        );
+        assert!(
+            report.contains("researcher paused"),
+            "the step is paused: {report}"
+        );
         assert!(
             report.contains("Revive: subagent({ action: \"resume\", id: \"run0intr000\""),
             "a paused run with a transcript offers whole-run revive guidance: {report}"
@@ -1136,7 +1206,11 @@ mod tests {
         let (_dir, async_root, results_dir) = roots();
         let run_id = RunId::from_token("run0single0");
         let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
-        let status = running_status(&run_id, RunMode::Single, vec![StepStatus::pending("worker")]);
+        let status = running_status(
+            &run_id,
+            RunMode::Single,
+            vec![StepStatus::pending("worker")],
+        );
         write_status(&paths, &status).await;
 
         let err = control::append_step(
@@ -1199,7 +1273,9 @@ mod tests {
         revive_step.status = StepState::Complete;
         revive_step.session_file = Some(session_file.clone());
         let mut revive = running_status(&revive_id, RunMode::Single, vec![revive_step]);
-        revive.advance_state(RunState::Complete).expect("-> Complete");
+        revive
+            .advance_state(RunState::Complete)
+            .expect("-> Complete");
         write_status(&revive_paths, &revive).await;
 
         let respawn = control::resume(&async_root, &results_dir, "run0revive0", None)

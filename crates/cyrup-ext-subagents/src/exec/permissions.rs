@@ -33,11 +33,17 @@ pub fn validate_permission_config(
     let Some(object) = value.as_object() else {
         return Err(format!("{label} must be an object."));
     };
-    let mut unknown: Vec<&str> =
-        object.keys().map(String::as_str).filter(|k| *k != "rules").collect();
+    let mut unknown: Vec<&str> = object
+        .keys()
+        .map(String::as_str)
+        .filter(|k| *k != "rules")
+        .collect();
     unknown.sort_unstable();
     if !unknown.is_empty() {
-        return Err(format!("{label} has unsupported fields: {}.", unknown.join(", ")));
+        return Err(format!(
+            "{label} has unsupported fields: {}.",
+            unknown.join(", ")
+        ));
     }
     validate_permission_rules(object.get("rules"), &format!("{label}.rules"))
 }
@@ -106,7 +112,10 @@ mod tests {
     /// `validatePermissionConfig`'s own refusals (`permissions.ts:35-41`), byte-for-byte.
     #[test]
     fn validate_permission_config_rejects_non_objects_and_unknown_fields() {
-        assert_eq!(validate_permission_config(None, "config.permissions").unwrap(), None);
+        assert_eq!(
+            validate_permission_config(None, "config.permissions").unwrap(),
+            None
+        );
         assert_eq!(
             validate_permission_config(Some(&serde_json::json!([])), "config.permissions")
                 .unwrap_err(),
@@ -131,7 +140,10 @@ mod tests {
             "config.permissions",
         )
         .expect("valid");
-        assert_eq!(resolved, Some(rules(&[("write", PermissionRuleDecision::Deny)])));
+        assert_eq!(
+            resolved,
+            Some(rules(&[("write", PermissionRuleDecision::Deny)]))
+        );
 
         let err = validate_permission_config(
             Some(&serde_json::json!({"rules": {"bash": "ask"}})),
@@ -159,7 +171,10 @@ mod tests {
         let resolved = resolve_permission_rules(Some(&global), Some(&agent)).expect("non-empty");
         assert_eq!(
             resolved,
-            rules(&[("edit", PermissionRuleDecision::Ask), ("grep", PermissionRuleDecision::Deny)]),
+            rules(&[
+                ("edit", PermissionRuleDecision::Ask),
+                ("grep", PermissionRuleDecision::Deny)
+            ]),
             "write must be gone (agent set it to allow, which is always stripped)"
         );
 
@@ -167,7 +182,10 @@ mod tests {
         assert_eq!(resolve_permission_rules(None, None), None);
         // Only the global rung, entirely `allow` -> None after stripping.
         assert_eq!(
-            resolve_permission_rules(Some(&rules(&[("write", PermissionRuleDecision::Allow)])), None),
+            resolve_permission_rules(
+                Some(&rules(&[("write", PermissionRuleDecision::Allow)])),
+                None
+            ),
             None
         );
     }
@@ -188,7 +206,12 @@ mod tests {
 
         // A policy whose encoded form exceeds 16 KiB is refused outright.
         let huge: PermissionRules = (0..2000)
-            .map(|i| (format!("tool_{i:04}_with_a_long_enough_name_to_pad_bytes"), PermissionRuleDecision::Ask))
+            .map(|i| {
+                (
+                    format!("tool_{i:04}_with_a_long_enough_name_to_pad_bytes"),
+                    PermissionRuleDecision::Ask,
+                )
+            })
             .collect();
         assert_eq!(
             encode_permission_rules(Some(&huge)).unwrap_err(),

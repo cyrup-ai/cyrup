@@ -22,9 +22,9 @@ use crate::api::compat::{
     clamp_openai_prompt_cache_key, mapped_effort_or, off_is_not_null, off_value_or,
     thinking_level_key,
 };
-use crate::utils::constrained_sampling::ConstrainedSamplingError;
 use crate::api::openai_responses::{
-    ConvertResponsesToolsOptions, convert_responses_messages, convert_responses_tools, decode_stream,
+    ConvertResponsesToolsOptions, convert_responses_messages, convert_responses_tools,
+    decode_stream,
 };
 use crate::api::{ApiImpl, EventSink};
 use crate::auth::AuthResult;
@@ -35,6 +35,7 @@ use crate::error::ProviderError;
 use crate::model::Model;
 use crate::stream::StreamOptions;
 use crate::stream::sse::SseRequest;
+use crate::utils::constrained_sampling::ConstrainedSamplingError;
 use crate::utils::provider_plumbing::{connect_sse, provider_env_value};
 use cyrup_core::{ApiId, CancelToken, ModelThinkingLevel};
 use serde_json::{Map, Value, json};

@@ -63,9 +63,12 @@ impl AgentSession {
         let (retry_observer, retry_rx) =
             crate::compact::summarization_retry_channel(SummarizationRetrySource::BranchSummary);
         let retry_pump = self.spawn_event_pump(retry_rx);
-        let summarizer =
-            DynSummarizer::new(self.provider.current(), model.clone(), self.summarization_retry())
-                .with_observer(retry_observer);
+        let summarizer = DynSummarizer::new(
+            self.provider.current(),
+            model.clone(),
+            self.summarization_retry(),
+        )
+        .with_observer(retry_observer);
         let compactor = Compactor::new(summarizer, NoHooks);
         let cancel = self.session_cancel.child_token();
         *Self::lock(&self.branch_summary_cancel) = Some(cancel.clone());
@@ -157,13 +160,25 @@ impl AgentSession {
                 _ => (Some(target.clone()), None),
             };
 
-            let old_path: Vec<Entry> =
-                guard.branch_path(old_leaf.as_ref()).into_iter().cloned().collect();
-            let target_path: Vec<Entry> =
-                guard.branch_path(Some(&target)).into_iter().cloned().collect();
+            let old_path: Vec<Entry> = guard
+                .branch_path(old_leaf.as_ref())
+                .into_iter()
+                .cloned()
+                .collect();
+            let target_path: Vec<Entry> = guard
+                .branch_path(Some(&target))
+                .into_iter()
+                .cloned()
+                .collect();
             let collection = collect_entries_for_branch_summary(&old_path, &target_path);
             let common_ancestor_id = collection.common_ancestor_id.clone();
-            (old_leaf, new_leaf, editor_text, collection, common_ancestor_id)
+            (
+                old_leaf,
+                new_leaf,
+                editor_text,
+                collection,
+                common_ancestor_id,
+            )
         };
 
         // Phase 2 (no guard): session_before_tree ext hook — veto OR a summary/customInstructions/
@@ -189,15 +204,25 @@ impl AgentSession {
                 "label": options.label,
             });
             let cancel = self.session_cancel.child_token();
-            match self.services.ext_host.emit_session_before_tree(preparation, &cancel).await {
+            match self
+                .services
+                .ext_host
+                .emit_session_before_tree(preparation, &cancel)
+                .await
+            {
                 TreeReduction::Blocked { .. } => {
-                    return Ok(NavigateTreeOutcome { cancelled: true, ..Default::default() });
+                    return Ok(NavigateTreeOutcome {
+                        cancelled: true,
+                        ..Default::default()
+                    });
                 }
                 TreeReduction::Override(v) => {
                     if let Some(ci) = v.get("customInstructions").and_then(|s| s.as_str()) {
                         eff_custom_instructions = Some(ci.to_string());
                     }
-                    if let Some(ri) = v.get("replaceInstructions").and_then(serde_json::Value::as_bool)
+                    if let Some(ri) = v
+                        .get("replaceInstructions")
+                        .and_then(serde_json::Value::as_bool)
                     {
                         eff_replace_instructions = ri;
                     }
@@ -213,8 +238,10 @@ impl AgentSession {
                             .or_else(|| s.as_str())
                             .unwrap_or_default()
                             .to_string();
-                        let details =
-                            s.get("details").cloned().unwrap_or_else(|| serde_json::json!({}));
+                        let details = s
+                            .get("details")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!({}));
                         override_summary = Some((text, details));
                     }
                 }
@@ -256,8 +283,7 @@ impl AgentSession {
             // `(contextWindow || 128000) − reserve` (Pi `branch-summarization.ts:315-317`). The
             // fallback matters: without it a model reporting a zero context window would get budget
             // `0`, which `prepare_branch_entries` reads as "no limit".
-            let budget =
-                branch_token_budget(&model, self.branch_summary_settings.reserve_tokens);
+            let budget = branch_token_budget(&model, self.branch_summary_settings.reserve_tokens);
             let prep = prepare_branch_entries(&collection.entries, budget);
             let cancel = self.session_cancel.child_token();
             *Self::lock(&self.branch_summary_cancel) = Some(cancel.clone());
@@ -350,7 +376,12 @@ impl AgentSession {
                 .await;
         }
 
-        Ok(NavigateTreeOutcome { editor_text, cancelled: false, aborted: false, summary_entry })
+        Ok(NavigateTreeOutcome {
+            editor_text,
+            cancelled: false,
+            aborted: false,
+            summary_entry,
+        })
     }
 
     /// Generate a branch summary with optional custom/replace instructions (Pi `generateBranchSummary`
@@ -366,9 +397,9 @@ impl AgentSession {
         cancel: CancelToken,
     ) -> Result<BranchSummaryOutput, cyrup_session::compaction::CompactionError> {
         use cyrup_session::compaction::{
-            format_file_operations, serialize_conversation, SummarizationRequest, Summarizer,
             BRANCH_SUMMARY_EMPTY_PLACEHOLDER, BRANCH_SUMMARY_PREAMBLE, BRANCH_SUMMARY_PROMPT,
-            SUMMARIZATION_SYSTEM_PROMPT,
+            SUMMARIZATION_SYSTEM_PROMPT, SummarizationRequest, Summarizer,
+            check_summarization_response, format_file_operations, serialize_conversation,
         };
         // Pi short-circuits BEFORE the model call when there is nothing to summarize
         // (branch-summarization.ts:309-311).
@@ -394,9 +425,12 @@ impl AgentSession {
         let (retry_observer, retry_rx) =
             crate::compact::summarization_retry_channel(SummarizationRetrySource::BranchSummary);
         let retry_pump = self.spawn_event_pump(retry_rx);
-        let summarizer =
-            DynSummarizer::new(self.provider.current(), model.clone(), self.summarization_retry())
-                .with_observer(retry_observer);
+        let summarizer = DynSummarizer::new(
+            self.provider.current(),
+            model.clone(),
+            self.summarization_retry(),
+        )
+        .with_observer(retry_observer);
         let req = SummarizationRequest {
             system_prompt: SUMMARIZATION_SYSTEM_PROMPT,
             prompt_text: prompt,
@@ -417,48 +451,31 @@ impl AgentSession {
         drop(summarizer);
         let _ = retry_pump.await;
         let resp = resp?;
-        match resp.stop_reason {
-            cyrup_core::StopReason::Error => Err(
-                cyrup_session::compaction::CompactionError::Summarization(
-                    resp.error_message.unwrap_or_default(),
-                ),
+        // The shared acceptance gate — pi `getSummarizationFailure(response, "Branch
+        // summarization")` + the toolCall check (`v0.84.4 branch-summarization.ts:357-363`), with
+        // the `aborted` short-circuit at `:354-356` as its `Aborted` arm. One function for all four
+        // cyrup call sites, so this copy cannot drift from `cyrup_session::compaction::branch`
+        // again (SESS-049: the four hand-copied matches had all kept accepting a `length` stop).
+        check_summarization_response(&resp, "Branch summarization")?;
+        let body = resp
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                Content::Text { text, .. } => Some(text.to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (read, modified) = prep.file_ops.compute_lists();
+        Ok(BranchSummaryOutput {
+            text: format!(
+                "{BRANCH_SUMMARY_PREAMBLE}{body}{}",
+                format_file_operations(&read, &modified)
             ),
-            cyrup_core::StopReason::Aborted => {
-                Err(cyrup_session::compaction::CompactionError::Aborted)
-            }
-            // An unsettled response is NOT a summary — same guard, and the same `Deferred`
-            // rationale, as `cyrup_session::compaction::{summarize,branch}`.
-            cyrup_core::StopReason::Pending | cyrup_core::StopReason::Deferred => {
-                Err(cyrup_session::compaction::CompactionError::Summarization(
-                    resp.error_message.unwrap_or_else(|| {
-                        cyrup_session::compaction::PENDING_SUMMARY.to_string()
-                    }),
-                ))
-            }
-            cyrup_core::StopReason::Stop
-            | cyrup_core::StopReason::Length
-            | cyrup_core::StopReason::ToolUse => {
-                let body = resp
-                    .content
-                    .iter()
-                    .filter_map(|c| match c {
-                        Content::Text { text, .. } => Some(text.to_string()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let (read, modified) = prep.file_ops.compute_lists();
-                Ok(BranchSummaryOutput {
-                    text: format!(
-                        "{BRANCH_SUMMARY_PREAMBLE}{body}{}",
-                        format_file_operations(&read, &modified)
-                    ),
-                    // The branch-summary call's token spend is persisted on the entry (Pi
-                    // `BranchSummaryResult.usage`, `branch-summarization.ts:372`).
-                    usage: Some(resp.usage),
-                })
-            }
-        }
+            // The branch-summary call's token spend is persisted on the entry (Pi
+            // `BranchSummaryResult.usage`, `branch-summarization.ts:372`).
+            usage: Some(resp.usage),
+        })
     }
 
     /// Republish `CYRUP_SESSION_ID` / `CYRUP_SESSION_FILE` from the LIVE manager for the next `bash`
@@ -487,7 +504,10 @@ impl AgentSession {
         // passes the current leaf; an empty session has nothing to fork.
         let leaf = guard.leaf_id().cloned().ok_or_else(|| {
             cyrup_session::SessionError::EmptyFork(
-                guard.session_file().map(Path::to_path_buf).unwrap_or_default(),
+                guard
+                    .session_file()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_default(),
             )
         })?;
         guard.create_branched_session(&leaf, &layout)?;
@@ -512,7 +532,10 @@ impl AgentSession {
             }
             None => guard.leaf_id().cloned().ok_or_else(|| {
                 cyrup_session::SessionError::EmptyFork(
-                    guard.session_file().map(Path::to_path_buf).unwrap_or_default(),
+                    guard
+                        .session_file()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_default(),
                 )
             })?,
         };
@@ -542,10 +565,16 @@ impl AgentSession {
                 guard.create_branched_session(&leaf, &layout)?;
                 self.republish_session_identity(&guard);
                 let id = guard.session_id().clone();
-                Ok(ForkOutcome { session_id: Some(id), selected_text })
+                Ok(ForkOutcome {
+                    session_id: Some(id),
+                    selected_text,
+                })
             }
             // Forking before the first user message: nothing to branch from.
-            None => Ok(ForkOutcome { session_id: None, selected_text }),
+            None => Ok(ForkOutcome {
+                session_id: None,
+                selected_text,
+            }),
         }
     }
 
@@ -557,7 +586,12 @@ impl AgentSession {
         guard
             .branch_path(leaf.as_ref())
             .into_iter()
-            .filter_map(|e| user_message_text(e).map(|text| ForkAnchor { entry_id: e.id(), text }))
+            .filter_map(|e| {
+                user_message_text(e).map(|text| ForkAnchor {
+                    entry_id: e.id(),
+                    text,
+                })
+            })
             .collect()
     }
 
@@ -660,7 +694,9 @@ fn user_message_anchor(e: &cyrup_session::Entry) -> Option<(Option<EntryId>, Str
 /// in-memory session (no file) never persists a branch, so the default-root fallback is inert.
 pub(crate) fn branch_layout(mgr: &SessionManager) -> cyrup_session::SessionLayout {
     match mgr.session_file().and_then(Path::parent) {
-        Some(dir) => cyrup_session::SessionLayout::literal(dir.to_path_buf(), mgr.cwd().to_path_buf()),
+        Some(dir) => {
+            cyrup_session::SessionLayout::literal(dir.to_path_buf(), mgr.cwd().to_path_buf())
+        }
         None => cyrup_session::SessionLayout::for_cwd(mgr.cwd().to_path_buf()),
     }
 }

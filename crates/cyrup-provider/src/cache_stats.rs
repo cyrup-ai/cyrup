@@ -167,16 +167,16 @@ fn detect_miss(
     // cache-read-only providers that is a total miss, while on providers that never report caching
     // it means nothing.
     let prev = prev?;
-    if prompt_tokens == 0
-        || (usage.cache_read + usage.cache_write == 0 && !prev.reported_cache)
-    {
+    if prompt_tokens == 0 || (usage.cache_read + usage.cache_write == 0 && !prev.reported_cache) {
         return None;
     }
 
     // `:69` — `Math.min(prev.promptTokens, promptTokens) - usage.cacheRead`. The subtraction can go
     // negative in JS (more read than the smaller of the two prompts); `saturating_sub` lands on 0,
     // which the noise-floor test below then rejects exactly as a negative would.
-    let missed_tokens = prompt_tokens.min(prev.prompt_tokens).saturating_sub(usage.cache_read);
+    let missed_tokens = prompt_tokens
+        .min(prev.prompt_tokens)
+        .saturating_sub(usage.cache_read);
     // `:70` — `<=`, so exactly NOISE_FLOOR_TOKENS is NOT a miss.
     if missed_tokens <= NOISE_FLOOR_TOKENS {
         return None;
@@ -213,7 +213,10 @@ fn detect_miss(
 
 /// 1:1 port of pi `asPreviousRequest` (`cache-stats.ts:92-103`). `None` when the turn reported no
 /// prompt at all, in which case the caller KEEPS the previous request rather than clearing it.
-fn as_previous_request(message: &AssistantMessage, reported_cache: bool) -> Option<PreviousRequest> {
+fn as_previous_request(
+    message: &AssistantMessage,
+    reported_cache: bool,
+) -> Option<PreviousRequest> {
     let usage = &message.usage;
     let prompt_tokens = usage.input + usage.cache_read + usage.cache_write;
     if prompt_tokens == 0 {
@@ -444,7 +447,10 @@ mod tests {
         let exact = turn("anthropic", "m", 1, NOISE_FLOOR_TOKENS, 0, 0);
         assert_eq!(
             compute_cache_waste(
-                &[CacheScanEntry::Assistant(&base), CacheScanEntry::Assistant(&exact)],
+                &[
+                    CacheScanEntry::Assistant(&base),
+                    CacheScanEntry::Assistant(&exact)
+                ],
                 &NoPrices
             )
             .miss_count,
@@ -455,7 +461,10 @@ mod tests {
         let over = turn("anthropic", "m", 1, NOISE_FLOOR_TOKENS + 1, 0, 0);
         assert_eq!(
             compute_cache_waste(
-                &[CacheScanEntry::Assistant(&base), CacheScanEntry::Assistant(&over)],
+                &[
+                    CacheScanEntry::Assistant(&base),
+                    CacheScanEntry::Assistant(&over)
+                ],
                 &NoPrices
             )
             .miss_count,
@@ -530,7 +539,10 @@ mod tests {
         let first = turn("anthropic", "m", 0, 0, 0, 100_000);
         let late = turn("anthropic", "m", CACHE_TTL_MS + 1, 120_000, 0, 0);
         let miss = collect_cache_misses(
-            &[CacheScanEntry::Assistant(&first), CacheScanEntry::Assistant(&late)],
+            &[
+                CacheScanEntry::Assistant(&first),
+                CacheScanEntry::Assistant(&late),
+            ],
             &NoPrices,
         );
         assert!(miss[&1].exceeded_ttl());

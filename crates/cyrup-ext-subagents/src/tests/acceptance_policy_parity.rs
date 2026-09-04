@@ -73,7 +73,10 @@ fn declared_criteria_evidence_review_and_stop_rules_reach_the_child_prompt() {
 
     let prompt = inject_acceptance_contract("Fix the bug", &contract);
 
-    assert!(prompt.starts_with("Fix the bug"), "task text comes first: {prompt}");
+    assert!(
+        prompt.starts_with("Fix the bug"),
+        "task text comes first: {prompt}"
+    );
     // `- ${criterion.id}: ${criterion.must}` (acceptance.ts:417).
     assert!(
         prompt.contains("- c1: add a regression test"),
@@ -125,7 +128,11 @@ async fn a_child_report_missing_the_declared_criteria_and_evidence_is_rejected()
     let contract = lower_acceptance_input(&policy())
         .expect("valid policy")
         .expect("a contract is lowered");
-    assert_eq!(contract.required_level, AcceptanceStatus::Checked, "premise");
+    assert_eq!(
+        contract.required_level,
+        AcceptanceStatus::Checked,
+        "premise"
+    );
 
     let dir = tempfile::tempdir().expect("tempdir");
     let ledger = evaluate_acceptance(

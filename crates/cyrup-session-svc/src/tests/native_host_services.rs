@@ -12,26 +12,30 @@
 //!
 //! This proves native code genuinely reaches id/file/dialogs/message-injection through the ONE shared
 //! seam every remaining cyrup-ext-subagents blocker + both companions close on — not stubs.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use crate::{AgentSessionEvent, SessionBuilder, SessionConfig, UiKind, UiReply, UiRequest};
 use cyrup_agent::AgentMessage;
 use cyrup_core::{ExtensionId, StopReason};
 use cyrup_ext::{
-    DialogOptions, ExtError, HostCtx, HostEvent, HookOutcome, HostServices, InitApi, NativeExtension,
+    DialogOptions, ExtError, HookOutcome, HostCtx, HostEvent, HostServices, InitApi,
+    NativeExtension,
 };
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 use cyrup_provider::Provider;
-use crate::{
-    AgentSessionEvent, SessionBuilder, SessionConfig, UiKind, UiReply, UiRequest,
-};
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
 use futures::StreamExt;
 use tempfile::TempDir;
-use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Notify;
+use tokio::sync::mpsc::UnboundedSender;
 
 /// What the background probe task observed by calling the captured `Arc<dyn HostServices>` — the raw
 /// return of each seam, so the test can assert each reached the REAL `LiveHostServices`, not a stub.
@@ -93,9 +97,19 @@ impl NativeExtension for ProbeExt {
                 session_id: svc.session_id(),
                 session_file: svc.session_file(),
                 // `confirm` blocks on the scripted ui sink's reply (block_in_place + a oneshot).
-                confirm: svc.confirm("proceed?", "from a native background task", &DialogOptions::default()),
+                confirm: svc.confirm(
+                    "proceed?",
+                    "from a native background task",
+                    &DialogOptions::default(),
+                ),
                 // `inject_message` forwards to the live inject sink, which triggers a REAL turn.
-                inject: svc.inject_message("background result", Some("probe-notify"), true, None, true),
+                inject: svc.inject_message(
+                    "background result",
+                    Some("probe-notify"),
+                    true,
+                    None,
+                    true,
+                ),
             };
             let _ = tx.send(results);
         });
@@ -119,7 +133,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -131,7 +149,10 @@ fn base_config(fx: &Fixture) -> SessionConfig {
 fn faux_with_ok() -> Arc<FauxProvider> {
     let faux = Arc::new(FauxProvider::new());
     // One response feeds the single turn the injected message triggers.
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("ok")],
+        StopReason::Stop,
+    )]);
     faux
 }
 
@@ -160,7 +181,10 @@ async fn native_background_task_reaches_live_host_services() {
 
     // The probe's captured Arc MUST be the very backend the assembled session exposes (P-1 wired the
     // SAME instance the builder stores on the session).
-    assert!(services_slot.get().is_some(), "P-1: the native extension captured a host-services Arc");
+    assert!(
+        services_slot.get().is_some(),
+        "P-1: the native extension captured a host-services Arc"
+    );
 
     // Scripted ui sink: answer every dialog (the probe issues a `confirm`).
     let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel::<UiRequest>();
@@ -195,7 +219,10 @@ async fn native_background_task_reaches_live_host_services() {
     );
 
     // ---- P-2 (b): the REAL persisted session-file path, matching the session's own read. ----
-    assert!(results.session_file.is_some(), "session_file() resolved a real persisted path");
+    assert!(
+        results.session_file.is_some(),
+        "session_file() resolved a real persisted path"
+    );
     assert_eq!(
         results.session_file,
         session.session_file().await,
@@ -203,7 +230,10 @@ async fn native_background_task_reaches_live_host_services() {
     );
 
     // ---- confirm: routed to the scripted ui sink and returned its reply (deny default is `false`). ----
-    assert!(results.confirm, "confirm() reached the live ui sink and returned its scripted reply");
+    assert!(
+        results.confirm,
+        "confirm() reached the live ui sink and returned its scripted reply"
+    );
 
     // ---- inject_message: reached the live inject sink (deny default is `Err`). ----
     assert!(
@@ -218,7 +248,8 @@ async fn native_background_task_reaches_live_host_services() {
     let mut saw_turn = false;
     while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(10), events.next()).await {
         match &ev {
-            AgentSessionEvent::MessageStart { message } | AgentSessionEvent::MessageEnd { message } => {
+            AgentSessionEvent::MessageStart { message }
+            | AgentSessionEvent::MessageEnd { message } => {
                 if let AgentMessage::Custom { kind, .. } = message
                     && kind == "probe-notify"
                 {
@@ -236,7 +267,10 @@ async fn native_background_task_reaches_live_host_services() {
         saw_injected_custom,
         "the injected `probe-notify` custom message flowed through the live turn loop"
     );
-    assert!(saw_turn, "inject_message(trigger_turn=true) drove a REAL agent turn to completion");
+    assert!(
+        saw_turn,
+        "inject_message(trigger_turn=true) drove a REAL agent turn to completion"
+    );
 
     session.wait_for_idle().await;
     // The triggered turn produced the faux assistant response — with NO prior prompt, the ONLY turn is

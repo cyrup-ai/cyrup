@@ -37,9 +37,7 @@ pub(crate) fn fenced_matches(
         let after_fence = fence_at + 3;
         // Read the tag token: characters up to the first whitespace/newline.
         let rest = text.get(after_fence..).unwrap_or("");
-        let tag_end_rel = rest
-            .find(|c: char| c.is_whitespace())
-            .unwrap_or(rest.len());
+        let tag_end_rel = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
         let tag = rest.get(..tag_end_rel).unwrap_or("").to_string();
         let tag_lower = tag.to_ascii_lowercase();
         if !tags.contains(&tag_lower.as_str()) {
@@ -145,10 +143,10 @@ pub(crate) fn parse_report_json(body: &str) -> Result<Value, String> {
         Err(err) => {
             if let Some(json_start) = trimmed.find('{')
                 && json_start > 0
-                    && let Some(json) = extract_balanced_json(trimmed, json_start) {
-                        return serde_json::from_str::<Value>(&json)
-                            .map_err(|e| e.to_string());
-                    }
+                && let Some(json) = extract_balanced_json(trimmed, json_start)
+            {
+                return serde_json::from_str::<Value>(&json).map_err(|e| e.to_string());
+            }
             Err(err.to_string())
         }
     }

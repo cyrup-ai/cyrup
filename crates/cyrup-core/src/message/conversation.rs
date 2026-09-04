@@ -1,14 +1,18 @@
 //! The role-tagged [`Message`] enum — one conversation turn (func-01 §4.2).
 
 use super::assistant::AssistantMessage;
-use super::content::{de_tool_result_content, de_user_content, Content};
+use super::content::{Content, de_tool_result_content, de_user_content};
 use super::usage::Usage;
 use crate::ToolCallId;
 
 /// A conversation message (func-01 §4.2). Custom (extension/app) message types live in
 /// `cyrup-agent`'s `AgentMessage` wrapper and are filtered before the model call (func-02).
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
-#[serde(tag = "role", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "role",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum Message {
     User {
         /// Pi `UserMessage.content: string | (TextContent | ImageContent)[]` (types.ts:379). On
@@ -168,7 +172,12 @@ mod tests {
             content: vec![Content::text("ok")],
             is_error: false,
             details: Some(serde_json::json!({ "d": 1 })),
-            usage: Some(Usage { input: 11, output: 22, total_tokens: 33, ..Usage::default() }),
+            usage: Some(Usage {
+                input: 11,
+                output: 22,
+                total_tokens: 33,
+                ..Usage::default()
+            }),
             added_tool_names: vec!["late".to_string()],
             timestamp: 7,
         };
@@ -182,7 +191,11 @@ mod tests {
         // timestamp. `isError` used to be emitted right after `content`, three keys too early, so
         // a cyrup-exported `toolResult` line was not byte-identical to pi's — the single property
         // this hand-written serializer exists to provide. Red before the fix.
-        let at = |k: &str| first.find(k).unwrap_or_else(|| panic!("{k} missing in {first}"));
+        let at = |k: &str| {
+            first
+                .find(k)
+                .unwrap_or_else(|| panic!("{k} missing in {first}"))
+        };
         assert!(at(r#""content""#) < at(r#""details""#));
         assert!(at(r#""details""#) < at(r#""usage""#));
         assert!(at(r#""usage""#) < at(r#""addedToolNames""#));
@@ -191,7 +204,11 @@ mod tests {
 
         let back: Message = serde_json::from_str(&first).expect("deserialize");
         assert_eq!(back, m, "value round-trips");
-        assert_eq!(serde_json::to_string(&back).expect("re-serialize"), first, "bytes round-trip");
+        assert_eq!(
+            serde_json::to_string(&back).expect("re-serialize"),
+            first,
+            "bytes round-trip"
+        );
     }
 
     /// BACKWARD compatibility — NEW code reading an OLD session file. The two keys are absent, so
@@ -205,13 +222,24 @@ mod tests {
         );
         let m: Message = serde_json::from_str(old).expect("old shape parses");
         match &m {
-            Message::ToolResult { usage, added_tool_names, .. } => {
+            Message::ToolResult {
+                usage,
+                added_tool_names,
+                ..
+            } => {
                 assert_eq!(usage, &None, "absent `usage` defaults to None");
-                assert!(added_tool_names.is_empty(), "absent `addedToolNames` defaults to []");
+                assert!(
+                    added_tool_names.is_empty(),
+                    "absent `addedToolNames` defaults to []"
+                );
             }
             other => panic!("expected a tool result, got {other:?}"),
         }
-        assert_eq!(serde_json::to_string(&m).expect("re-serialize"), old, "byte-identical re-export");
+        assert_eq!(
+            serde_json::to_string(&m).expect("re-serialize"),
+            old,
+            "byte-identical re-export"
+        );
     }
 
     /// FORWARD compatibility — OLD code reading a NEW session file. `OldToolResult` mirrors the
@@ -242,7 +270,12 @@ mod tests {
             content: vec![Content::text("ok")],
             is_error: false,
             details: None,
-            usage: Some(Usage { input: 11, output: 22, total_tokens: 33, ..Usage::default() }),
+            usage: Some(Usage {
+                input: 11,
+                output: 22,
+                total_tokens: 33,
+                ..Usage::default()
+            }),
             added_tool_names: vec!["late".to_string()],
             timestamp: 7,
         };
@@ -260,7 +293,11 @@ mod tests {
         // And the NEW reader recovers defaults from those old bytes without error.
         let back: Message = serde_json::from_str(&re).expect("new reader parses old bytes");
         match back {
-            Message::ToolResult { usage, added_tool_names, .. } => {
+            Message::ToolResult {
+                usage,
+                added_tool_names,
+                ..
+            } => {
                 assert_eq!(usage, None);
                 assert!(added_tool_names.is_empty());
             }
@@ -274,16 +311,23 @@ mod tests {
         // user turn (agent.ts:389, agent-harness.ts:38, agent-session.ts:1117) and Pi's write path
         // (session-manager.ts:940,952,959 — pure JSON.stringify) never collapses it to a bare
         // string. cyrup must emit the same bytes, even for a single signature-less text block.
-        let m = Message::User { content: vec![Content::text("hi")], timestamp: 7 };
+        let m = Message::User {
+            content: vec![Content::text("hi")],
+            timestamp: 7,
+        };
         let v = serde_json::to_value(&m).expect("serialize");
-        assert_eq!(v["content"], serde_json::json!([{ "type": "text", "text": "hi" }]));
+        assert_eq!(
+            v["content"],
+            serde_json::json!([{ "type": "text", "text": "hi" }])
+        );
         let back: Message = serde_json::from_value(v).expect("deserialize");
         assert_eq!(back, m);
         // The bare-string shorthand is still READ-tolerated for legacy/foreign JSONL, promoting to
         // a single text block (Pi's `content: string | Content[]` union accepts it on load).
-        let legacy: Message =
-            serde_json::from_value(serde_json::json!({ "role": "user", "content": "hi", "timestamp": 7 }))
-                .expect("deserialize bare-string legacy shorthand");
+        let legacy: Message = serde_json::from_value(
+            serde_json::json!({ "role": "user", "content": "hi", "timestamp": 7 }),
+        )
+        .expect("deserialize bare-string legacy shorthand");
         assert_eq!(legacy, m);
         // A text block carrying a signature stays the array form (the signature must survive).
         let m2 = Message::User {

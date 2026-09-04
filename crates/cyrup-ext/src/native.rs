@@ -12,8 +12,8 @@ use cyrup_core::{CancelToken, ExtensionId, Tool};
 use futures::FutureExt;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A live component a NATIVE renderer handed back — Pi's `Component`
 /// (`packages/tui/src/index.ts`), whose `render(width)` the host calls on EVERY frame.
@@ -102,7 +102,9 @@ impl HumanWaitGate {
 
     fn begin(self: &Arc<Self>) -> HumanWaitGuard {
         self.waiting.fetch_add(1, Ordering::AcqRel);
-        HumanWaitGuard { gate: Arc::clone(self) }
+        HumanWaitGuard {
+            gate: Arc::clone(self),
+        }
     }
 }
 
@@ -236,9 +238,9 @@ impl HostCtx {
     /// well-formed bag, never `{}` and never an "unavailable" it has to special-case.
     pub fn system_prompt_options(&self) -> Result<serde_json::Value, ExtError> {
         self.require_command_tier()?;
-        Ok(self.rich.system_prompt_options.clone().unwrap_or_else(|| {
-            serde_json::json!({ "cwd": self.cwd.to_string_lossy().into_owned() })
-        }))
+        Ok(self.rich.system_prompt_options.clone().unwrap_or_else(
+            || serde_json::json!({ "cwd": self.cwd.to_string_lossy().into_owned() }),
+        ))
     }
 
     pub fn tier(&self) -> CtxTier {
@@ -621,7 +623,9 @@ pub trait NativeExtension: Send + Sync {
         _args: &str,
         _ctx: &HostCtx,
     ) -> Result<Option<String>, ExtError> {
-        Err(ExtError::Component(format!("native extension has no handler for command `{name}`")))
+        Err(ExtError::Component(format!(
+            "native extension has no handler for command `{name}`"
+        )))
     }
 
     /// Dynamic argument completions for a command this extension registered and opted in with
@@ -661,9 +665,10 @@ pub trait NativeExtension: Send + Sync {
     /// registry, `shortcut_keys()` advertised it, `/hotkeys` listed it, and pressing it resolved an
     /// owner that `run_shortcut` could not reach because it looked only in the live-WASM map.
     async fn execute_shortcut(&self, key: &str, _ctx: &HostCtx) -> Result<(), ExtError> {
-        Err(ExtError::Component(format!("native extension has no handler for shortcut `{key}`")))
+        Err(ExtError::Component(format!(
+            "native extension has no handler for shortcut `{key}`"
+        )))
     }
-
 
     /// Render a tool CALL / custom MESSAGE this extension declared a renderer for (Pi
     /// `renderCall`, extensions/types.ts:489). `key` is the TOOL NAME for a tool renderer
@@ -882,13 +887,15 @@ impl HostCtxSource for ServicesCtxSource {
 }
 
 impl NativeHandle {
-    pub fn new(
-        inner: Arc<dyn NativeExtension>,
-        subs: Subscriptions,
-        ctx: HostCtx,
-    ) -> Self {
+    pub fn new(inner: Arc<dyn NativeExtension>, subs: Subscriptions, ctx: HostCtx) -> Self {
         let id = inner.id();
-        Self { id, subs, ctx, inner, ctx_source: None }
+        Self {
+            id,
+            subs,
+            ctx,
+            inner,
+            ctx_source: None,
+        }
     }
 
     /// Attach the live rich-ctx source so each dispatch gets a FRESH [`HostCtxRich`] (EXT-005).

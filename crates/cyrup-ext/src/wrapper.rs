@@ -56,7 +56,10 @@ impl RegisteredTool {
 }
 
 /// Wrap `tool` so its execution derives `addedToolNames` (Pi `wrapRegisteredTool`).
-pub fn wrap_registered_tool(tool: Arc<dyn Tool>, active: Arc<dyn ActiveToolNames>) -> Arc<dyn Tool> {
+pub fn wrap_registered_tool(
+    tool: Arc<dyn Tool>,
+    active: Arc<dyn ActiveToolNames>,
+) -> Arc<dyn Tool> {
     Arc::new(RegisteredTool::new(tool, active))
 }
 
@@ -68,7 +71,13 @@ fn additive_delta(before: &[String], after: &[String]) -> Option<Vec<String>> {
         return None;
     }
     let before_set: std::collections::HashSet<&str> = before.iter().map(String::as_str).collect();
-    Some(after.iter().filter(|n| !before_set.contains(n.as_str())).cloned().collect())
+    Some(
+        after
+            .iter()
+            .filter(|n| !before_set.contains(n.as_str()))
+            .cloned()
+            .collect(),
+    )
 }
 
 /// Union `derived` onto `existing`, preserving order and dropping duplicates (Pi's
@@ -152,7 +161,10 @@ impl Tool for RegisteredTool {
     ) -> Result<ToolResult, ToolError> {
         let before = self.active.active_tool_names();
         // A failing tool propagates unchanged — upstream the `await` throws past the diff entirely.
-        let mut result = self.inner.execute(call_id, params, cancel, on_update).await?;
+        let mut result = self
+            .inner
+            .execute(call_id, params, cancel, on_update)
+            .await?;
         let (Some(before), Some(after)) = (before, self.active.active_tool_names()) else {
             return Ok(result);
         };
@@ -254,7 +266,10 @@ mod tests {
         fn render_result(&self, result: &Value) -> Option<String> {
             Some(format!(
                 "result:{}",
-                result.get("content").and_then(|c| c.as_array()).map_or(0, Vec::len)
+                result
+                    .get("content")
+                    .and_then(|c| c.as_array())
+                    .map_or(0, Vec::len)
             ))
         }
         /// A MUTATING shim: an identity default would be indistinguishable from a dropped
@@ -287,7 +302,10 @@ mod tests {
         Arc::new(Fixed {
             params: serde_json::json!({}),
             result: Ok(added.into_iter().map(str::to_string).collect()),
-            guidelines: vec!["use fixed sparingly".to_string(), "fixed is not read".to_string()],
+            guidelines: vec![
+                "use fixed sparingly".to_string(),
+                "fixed is not read".to_string(),
+            ],
             constrained: cyrup_core::ConstrainedSampling::Config(
                 cyrup_core::ConstrainedSamplingConfig::JsonSchema {
                     strict: cyrup_core::StrictSampling::Require,
@@ -310,7 +328,10 @@ mod tests {
     async fn a_purely_additive_widening_is_stamped_onto_the_result() {
         let active = ScriptedActive::new(vec![Some(vec!["a"]), Some(vec!["a", "late"])]);
         let w = wrap_registered_tool(tool(vec![]), active);
-        assert_eq!(run(&w).await.unwrap().added_tool_names, vec!["late".to_string()]);
+        assert_eq!(
+            run(&w).await.unwrap().added_tool_names,
+            vec!["late".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -349,15 +370,14 @@ mod tests {
     #[tokio::test]
     async fn a_failing_tool_propagates_unchanged() {
         let active = ScriptedActive::new(vec![Some(vec!["a"]), Some(vec!["a", "late"])]);
-        let inner: Arc<dyn Tool> =
-            Arc::new(Fixed {
-                params: serde_json::json!({}),
-                result: Err(()),
-                guidelines: Vec::new(),
-                // pi's explicit opt-OUT literal (`constrainedSampling: false`,
-                // `packages/ai/README.md:483` @v0.83.0) — behaves as omitted.
-                constrained: cyrup_core::ConstrainedSampling::Disabled(false),
-            });
+        let inner: Arc<dyn Tool> = Arc::new(Fixed {
+            params: serde_json::json!({}),
+            result: Err(()),
+            guidelines: Vec::new(),
+            // pi's explicit opt-OUT literal (`constrainedSampling: false`,
+            // `packages/ai/README.md:483` @v0.83.0) — behaves as omitted.
+            constrained: cyrup_core::ConstrainedSampling::Disabled(false),
+        });
         let w = wrap_registered_tool(inner, active);
         assert!(run(&w).await.is_err());
     }
@@ -387,17 +407,24 @@ mod tests {
         // TOOL-021: the inner tool's guidelines are OWNED `String`s, so this delegation is only
         // expressible since `Tool::prompt_guidelines` returns `Vec<&str>`.
         assert_eq!(w.prompt_guidelines(), inner.prompt_guidelines());
-        assert_eq!(w.prompt_guidelines(), vec!["use fixed sparingly", "fixed is not read"]);
+        assert_eq!(
+            w.prompt_guidelines(),
+            vec!["use fixed sparingly", "fixed is not read"]
+        );
         assert_eq!(w.render_kind(), inner.render_kind());
         assert_eq!(w.render_kind(), ToolRenderKind::SelfRendered);
         // PROV-011 — upstream this survives because `wrapRegisteredTool` SPREADS the wrapped tool
         // (`core/extensions/wrapper.ts:21-22` @v0.83.0); in Rust it survives only because the
         // delegation is written out. Assert PRESENCE on the inner tool first, so a fixture that
         // ever loses its declaration fails loudly rather than passing this vacuously.
-        assert!(inner.constrained_sampling().is_some(), "fixture must declare it");
+        assert!(
+            inner.constrained_sampling().is_some(),
+            "fixture must declare it"
+        );
         assert_eq!(w.constrained_sampling(), inner.constrained_sampling());
         assert!(matches!(
-            w.constrained_sampling().and_then(cyrup_core::ConstrainedSampling::config),
+            w.constrained_sampling()
+                .and_then(cyrup_core::ConstrainedSampling::config),
             Some(cyrup_core::ConstrainedSamplingConfig::JsonSchema {
                 strict: cyrup_core::StrictSampling::Require
             })
@@ -405,9 +432,18 @@ mod tests {
         assert_eq!(w.execution_mode(), inner.execution_mode());
         assert_eq!(w.execution_mode(), ExecMode::Sequential);
         assert_eq!(w.parameters(), inner.parameters());
-        assert_eq!(w.render_call(&serde_json::json!({})), inner.render_call(&serde_json::json!({})));
-        assert_eq!(w.render_call(&serde_json::json!({})), Some("call:{}".to_string()));
-        assert_eq!(w.render_result(&serde_json::json!({"content": []})), Some("result:0".to_string()));
+        assert_eq!(
+            w.render_call(&serde_json::json!({})),
+            inner.render_call(&serde_json::json!({}))
+        );
+        assert_eq!(
+            w.render_call(&serde_json::json!({})),
+            Some("call:{}".to_string())
+        );
+        assert_eq!(
+            w.render_result(&serde_json::json!({"content": []})),
+            Some("result:0".to_string())
+        );
         assert_eq!(
             w.render_result(&serde_json::json!({"content": [{"type": "text"}]})),
             Some("result:1".to_string()),

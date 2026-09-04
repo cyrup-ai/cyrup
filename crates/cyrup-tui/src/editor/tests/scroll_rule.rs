@@ -1,7 +1,12 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
-use crate::editor::*;
 use crate::editor::render::scroll_border;
+use crate::editor::*;
 
 // ------------------------------------------------------------- createScrollBorder ------------
 
@@ -18,7 +23,12 @@ fn the_scroll_rule_reads_as_an_indicator_padded_with_rule() {
 /// clipped on a terminal too narrow even for that.
 #[test]
 fn a_terminal_too_narrow_for_the_indicator_gets_an_ellipsis() {
-    assert_eq!(scroll_border('↓', 5, 10), "─── ↓ 5...", "{:?}", scroll_border('↓', 5, 10));
+    assert_eq!(
+        scroll_border('↓', 5, 10),
+        "─── ↓ 5...",
+        "{:?}",
+        scroll_border('↓', 5, 10)
+    );
     assert_eq!(scroll_border('↓', 5, 2), "..");
     assert_eq!(scroll_border('↓', 5, 0), "");
 }

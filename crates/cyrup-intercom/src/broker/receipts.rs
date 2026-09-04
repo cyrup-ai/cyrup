@@ -94,7 +94,10 @@ impl BrokerState {
         let Some(current_id) = session_id.clone() else {
             return FrameResult::protocol_error();
         };
-        let Some(message_id) = value.get("messageId").and_then(|v| v.as_str()).map(str::to_string)
+        let Some(message_id) = value
+            .get("messageId")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
         else {
             return FrameResult::protocol_error();
         };
@@ -116,7 +119,11 @@ impl BrokerState {
             && sender_info.is_some()
         {
             self.mailbox_messages.remove(index);
-            if self.ask_edges.get(&message_id).is_some_and(|edge| edge.from == current_id) {
+            if self
+                .ask_edges
+                .get(&message_id)
+                .is_some_and(|edge| edge.from == current_id)
+            {
                 self.ask_edges.remove(&message_id);
             }
             send_msg(self_tx, &BrokerMessage::Delivered { message_id });
@@ -129,37 +136,46 @@ impl BrokerState {
             .and_then(|route| self.sessions.get(&route.to))
             .map(|receiver| receiver.tx.clone());
         let (Some(from), Some(receiver_tx)) = (sender_info, receiver_tx) else {
-            send_msg(self_tx, &BrokerMessage::DeliveryFailed {
-                message_id,
-                reason: "Message cannot be cancelled by this session".to_string(),
-            });
+            send_msg(
+                self_tx,
+                &BrokerMessage::DeliveryFailed {
+                    message_id,
+                    reason: "Message cannot be cancelled by this session".to_string(),
+                },
+            );
             return FrameResult::cont();
         };
-        send_msg(&receiver_tx, &BrokerMessage::MessageControl {
-            from,
-            control: MessageControl {
-                message_id: message_id.clone(),
-                action: MessageControlAction::Cancel,
-                timestamp: now_ms().into(),
-                superseded_by: None,
-                detail: None,
-                extra: Default::default(),
+        send_msg(
+            &receiver_tx,
+            &BrokerMessage::MessageControl {
+                from,
+                control: MessageControl {
+                    message_id: message_id.clone(),
+                    action: MessageControlAction::Cancel,
+                    timestamp: now_ms().into(),
+                    superseded_by: None,
+                    detail: None,
+                    extra: Default::default(),
+                },
             },
-        });
-        if self.ask_edges.get(&message_id).is_some_and(|edge| edge.from == current_id) {
+        );
+        if self
+            .ask_edges
+            .get(&message_id)
+            .is_some_and(|edge| edge.from == current_id)
+        {
             self.ask_edges.remove(&message_id);
         }
         send_msg(self_tx, &BrokerMessage::Delivered { message_id });
         FrameResult::cont()
     }
-
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
-    use serde_json::json;
     use super::super::test_support::{make_state, payloads, register_named, send_frame};
+    use serde_json::json;
 
     /// `case "cancel_message"`'s two live arms (`v0.10.1 broker/broker.ts:711-743`), both of which
     /// were unreachable while `messageReceiptRoutes` and the mailbox did not exist: the sender
@@ -200,7 +216,10 @@ mod tests {
                 && p["control"]["messageId"] == "m1"),
             "the receiver is told the message was withdrawn: {control:?}"
         );
-        assert_eq!(payloads(&mut a_rx).first().map(|p| p["type"].clone()), Some(json!("delivered")));
+        assert_eq!(
+            payloads(&mut a_rx).first().map(|p| p["type"].clone()),
+            Some(json!("delivered"))
+        );
 
         // (2) parked mail → dropped in place, with no control frame to send anywhere.
         state.on_connection_closed(2, &b_sid, 1_500);
@@ -222,8 +241,14 @@ mod tests {
             &mut a_sid,
             1_700,
         );
-        assert!(state.mailbox_messages.is_empty(), "the parked entry is withdrawn");
-        assert_eq!(payloads(&mut a_rx).first().map(|p| p["type"].clone()), Some(json!("delivered")));
+        assert!(
+            state.mailbox_messages.is_empty(),
+            "the parked entry is withdrawn"
+        );
+        assert_eq!(
+            payloads(&mut a_rx).first().map(|p| p["type"].clone()),
+            Some(json!("delivered"))
+        );
 
         // NEGATIVE CONTROL: a message this session never sent is still refused.
         state.handle_frame(
@@ -234,8 +259,14 @@ mod tests {
             1_800,
         );
         let refused = payloads(&mut a_rx);
-        assert_eq!(refused.first().map(|p| p["type"].clone()), Some(json!("delivery_failed")));
-        assert_eq!(refused[0]["reason"], "Message cannot be cancelled by this session");
+        assert_eq!(
+            refused.first().map(|p| p["type"].clone()),
+            Some(json!("delivery_failed"))
+        );
+        assert_eq!(
+            refused[0]["reason"],
+            "Message cannot be cancelled by this session"
+        );
     }
     /// `case "message_receipt"` (`v0.10.1 broker/broker.ts:676-696`) forwards a receipt back to the
     /// ORIGINAL sender, which needs the `messageReceiptRoutes` entry the delivery wrote. Every
@@ -317,7 +348,10 @@ mod tests {
             1_100,
         );
         let refused = payloads(&mut a_rx);
-        assert_eq!(refused.last().map(|p| p["type"].clone()), Some(json!("delivery_failed")));
+        assert_eq!(
+            refused.last().map(|p| p["type"].clone()),
+            Some(json!("delivery_failed"))
+        );
         assert_eq!(
             refused[refused.len() - 1]["reason"],
             "Supersede target does not match a previous message from this sender to this receiver"
@@ -345,8 +379,14 @@ mod tests {
         let got = payloads(&mut b_rx);
         let control_at = got.iter().position(|p| p["type"] == "message_control");
         let message_at = got.iter().position(|p| p["type"] == "message");
-        assert!(control_at.is_some() && message_at.is_some(), "both frames arrive: {got:?}");
-        assert!(control_at < message_at, "the supersede notice precedes the replacement");
+        assert!(
+            control_at.is_some() && message_at.is_some(),
+            "both frames arrive: {got:?}"
+        );
+        assert!(
+            control_at < message_at,
+            "the supersede notice precedes the replacement"
+        );
         let control = &got[control_at.unwrap_or(0)];
         assert_eq!(control["control"]["action"], "supersede");
         assert_eq!(control["control"]["messageId"], "m1");

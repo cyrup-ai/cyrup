@@ -119,7 +119,9 @@ impl AgentSession {
             // Agent-state + lifecycle ops (SetModel/SetThinkingLevel/Abort/Shutdown) apply in place
             // via the shared `Send`-safe helper; it returns `Some(op)` for anything it did not
             // handle so the routing below stays exhaustive.
-            let Some(op) = self.apply_agent_state_op(op).await else { continue };
+            let Some(op) = self.apply_agent_state_op(op).await else {
+                continue;
+            };
             let name = control_op_name(&op);
             let outcome = match op {
                 ControlOp::SendUserMessage { content, .. } => {
@@ -127,14 +129,16 @@ impl AgentSession {
                     // `prompt_accepted` → `prepare` → `try_execute_extension_command`), closing an
                     // `async fn` cycle. Box this cold re-entry edge so the future stays finitely
                     // sized (E0733) without adding indirection to the hot prompt path.
-                    Box::pin(self.send_user_message(content, None)).await.map(|_| ())
+                    Box::pin(self.send_user_message(content, None))
+                        .await
+                        .map(|_| ())
                 }
                 // Pi `ctx.compact(options)` (extensions/types.ts:344): `customInstructions`
                 // (types.ts:296-300) rides the op through to the summarizer — the same
                 // `Option<String>` a `/compact <instructions>` slash command passes.
-                ControlOp::Compact { custom_instructions } => {
-                    self.compact(custom_instructions).await.map(|_| ())
-                }
+                ControlOp::Compact {
+                    custom_instructions,
+                } => self.compact(custom_instructions).await.map(|_| ()),
                 // ---- session-local runtime ops (no runtime host needed) ----
                 ControlOp::Navigate { entry_id, opts } => {
                     Box::pin(self.control_navigate(&entry_id, &opts)).await
@@ -145,11 +149,13 @@ impl AgentSession {
                     // `spawn_run`, so the flag is already false — but a concurrent run would
                     // otherwise block the command path indefinitely, so bound it and surface the
                     // expiry instead of hanging.
-                    match tokio::time::timeout(WAIT_IDLE_CONTROL_TIMEOUT, self.wait_for_idle()).await
+                    match tokio::time::timeout(WAIT_IDLE_CONTROL_TIMEOUT, self.wait_for_idle())
+                        .await
                     {
                         Ok(()) => Ok(()),
                         Err(_) => Err(SessionServiceError::Io(
-                            "control op `wait_idle` timed out waiting for the agent to settle".into(),
+                            "control op `wait_idle` timed out waiting for the agent to settle"
+                                .into(),
                         )),
                     }
                 }
@@ -175,7 +181,9 @@ impl AgentSession {
                 },
                 // Handled by `apply_agent_state_op` above; unreachable, but keep the match total so
                 // a future `ControlOp` variant is a compile error rather than a silent drop.
-                other => Err(SessionServiceError::Io(format!("unrouted control op: {other:?}"))),
+                other => Err(SessionServiceError::Io(format!(
+                    "unrouted control op: {other:?}"
+                ))),
             };
             if let Err(e) = outcome {
                 self.report_control_failure(name, &e);
@@ -192,7 +200,10 @@ impl AgentSession {
         opts: &serde_json::Value,
     ) -> Result<(), SessionServiceError> {
         let options = NavigateTreeOptions {
-            summarize: opts.get("summarize").and_then(serde_json::Value::as_bool).unwrap_or(false),
+            summarize: opts
+                .get("summarize")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
             custom_instructions: opts
                 .get("customInstructions")
                 .and_then(serde_json::Value::as_str)
@@ -201,9 +212,14 @@ impl AgentSession {
                 .get("replaceInstructions")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false),
-            label: opts.get("label").and_then(serde_json::Value::as_str).map(str::to_string),
+            label: opts
+                .get("label")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
         };
-        self.navigate_tree(EntryId::from(entry_id), options).await.map(|_| ())
+        self.navigate_tree(EntryId::from(entry_id), options)
+            .await
+            .map(|_| ())
     }
 
     /// Apply a `ControlOp::SendMessage` (Pi `ctx.sendMessage(message, {triggerTurn, deliverAs})`,
@@ -221,7 +237,10 @@ impl AgentSession {
             .unwrap_or("extension")
             .to_string();
         let content = message.get("content").cloned().unwrap_or(Value::Null);
-        let display = message.get("display").and_then(Value::as_bool).unwrap_or(true);
+        let display = message
+            .get("display")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
         let details = message.get("details").cloned();
         let deliver_as = match opts.get("deliverAs").and_then(Value::as_str) {
             Some("steer") => Some(crate::event::DeliverAs::Steer),
@@ -232,7 +251,10 @@ impl AgentSession {
         // Pi's `triggerTurn` runs a fresh turn OVER the custom message when idle
         // (`_runAgentPrompt(appMessage)`); `deliverAs` takes precedence, exactly as in
         // `send_custom_message`/`inject_message`.
-        let trigger_turn = opts.get("triggerTurn").and_then(Value::as_bool).unwrap_or(false);
+        let trigger_turn = opts
+            .get("triggerTurn")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         // AGENT-030 — pi's `sendMessage` tests `this.isStreaming`, the session latch
         // `_isAgentRunActive` (agent-session.ts:900-901, :1477-1483): a trigger-turn message landing
         // in the post-`agent_end` gap steers the active loop rather than starting a second run.
@@ -248,7 +270,8 @@ impl AgentSession {
             };
             return self.spawn_run(vec![msg]).await;
         }
-        self.send_custom_message(&custom_type, content, display, details, deliver_as).await
+        self.send_custom_message(&custom_type, content, display, details, deliver_as)
+            .await
     }
 
     /// Surface a control-op failure. SEAM-003's contract is that an op is either PERFORMED or
@@ -341,7 +364,8 @@ impl AgentSession {
                 // an event handler, and `apply_agent_state_op` handles all four. Re-queue (never
                 // drop) as a guard so a future gating change can't silently lose a command-tier op;
                 // the command-tier drain (`apply_pending_control`) will handle it.
-                let _ = cyrup_ext::host::HostServices::control(&*self.services.host_services, other);
+                let _ =
+                    cyrup_ext::host::HostServices::control(&*self.services.host_services, other);
             }
         }
     }

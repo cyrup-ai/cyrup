@@ -21,7 +21,12 @@
 //!   an ordinary user mistake, because cyrup defers the first file write until then — surfaced a
 //!   filesystem error naming an internal path, with no remedy. Over RPC that string is what a
 //!   client renders (`rpc.rs`'s `fork`/`clone` arms relay it verbatim).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -47,7 +52,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn persisted_config(fx: &Fixture) -> SessionConfig {
@@ -61,7 +70,9 @@ async fn runtime(fx: &Fixture, replies: usize) -> Arc<AgentSessionRuntime> {
     let faux = Arc::new(FauxProvider::new());
     faux.set_responses(
         (0..replies)
-            .map(|i| faux_assistant_message(vec![faux_text(format!("ANSWER-{i}"))], StopReason::Stop))
+            .map(|i| {
+                faux_assistant_message(vec![faux_text(format!("ANSWER-{i}"))], StopReason::Stop)
+            })
             .collect(),
     );
     let provider: Arc<dyn Provider> = faux;

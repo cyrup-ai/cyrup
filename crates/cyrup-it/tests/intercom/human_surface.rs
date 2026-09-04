@@ -15,12 +15,18 @@
 //!     to the still-alive child over the broker. The child's blocking ask unblocks WITH the human's
 //!     answer — the whole child→broker→supervisor→human→broker→child round trip.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::common::registration;
 use cyrup_core::CancelToken;
 use cyrup_ext::{DialogOptions, HostServices};
 use cyrup_ext_subagents::background::RunId;
@@ -36,7 +42,6 @@ use cyrup_intercom::transport::client::IntercomClient;
 use cyrup_intercom::transport::spawn::wait_for_broker;
 use serde_json::Value;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use crate::common::registration;
 
 /// A scripted `HostServices` sink: records every `append_entry` (and signals it on a channel) and
 /// answers `input` with a canned reply. The in-crate analog of the live TUI/RPC backend the session
@@ -70,7 +75,10 @@ impl ScriptedSink {
     /// Record one surfacing under a shape the assertions can read uniformly: `content` is the
     /// model-facing markdown and `details` the structured card, whichever seam delivered them.
     fn record(&self, custom_type: &str, payload: Value) {
-        self.surfaced.lock().unwrap().push((custom_type.to_string(), payload.clone()));
+        self.surfaced
+            .lock()
+            .unwrap()
+            .push((custom_type.to_string(), payload.clone()));
         let _ = self.surface_tx.send((custom_type.to_string(), payload));
     }
 }
@@ -100,7 +108,12 @@ impl HostServices for ScriptedSink {
         Ok(())
     }
 
-    fn input(&self, prompt: &str, _placeholder: Option<&str>, _opts: &DialogOptions) -> Option<String> {
+    fn input(
+        &self,
+        prompt: &str,
+        _placeholder: Option<&str>,
+        _opts: &DialogOptions,
+    ) -> Option<String> {
         self.input_prompts.lock().unwrap().push(prompt.to_string());
         self.input_answer.clone()
     }
@@ -131,15 +144,25 @@ async fn inbound_message_surfaces_and_outbound_ask_receives_the_human_reply() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawn the real intercom broker subprocess");
-    wait_for_broker(&socket_path, Duration::from_secs(5)).await.expect("broker becomes health-connectable");
+    wait_for_broker(&socket_path, Duration::from_secs(5))
+        .await
+        .expect("broker becomes health-connectable");
 
     // ---- The orchestrator (supervisor) session: client + state + scripted human sink + inbound loop.
     let orchestrator = Arc::new(
-        IntercomClient::connect(&socket_path, registration("orchestrator"), Some("orch-session".to_string()))
-            .await
-            .expect("orchestrator registers"),
+        IntercomClient::connect(
+            &socket_path,
+            registration("orchestrator"),
+            Some("orch-session".to_string()),
+        )
+        .await
+        .expect("orchestrator registers"),
     );
-    let orch_state = Arc::new(SharedIntercomState::new(IntercomConfig::default(), 600_000, PathBuf::from("/w")));
+    let orch_state = Arc::new(SharedIntercomState::new(
+        IntercomConfig::default(),
+        600_000,
+        PathBuf::from("/w"),
+    ));
     orch_state.set_client(Some(orchestrator.clone()));
     // The supervisor is the interactive human-facing session (pi `hasUI` = true): the inbound
     // delivery policy drives/steers a turn over the child ask rather than sending it a busy
@@ -160,7 +183,11 @@ async fn inbound_message_surfaces_and_outbound_ask_receives_the_human_reply() {
             .await
             .expect("child registers"),
     );
-    let child_state = Arc::new(SharedIntercomState::new(IntercomConfig::default(), 600_000, PathBuf::from("/w")));
+    let child_state = Arc::new(SharedIntercomState::new(
+        IntercomConfig::default(),
+        600_000,
+        PathBuf::from("/w"),
+    ));
     child_state.set_client(Some(child.clone()));
     spawn_inbound_loop(child_state.clone(), child.clone());
 
@@ -168,7 +195,11 @@ async fn inbound_message_surfaces_and_outbound_ask_receives_the_human_reply() {
     // The body carries `Run: run-xyz` (formatChildOrchestratorMessage) so the orchestrator's
     // ClarifyChannel can correlate it.
     let question_id = "question-abc".to_string();
-    let ask_body = format_child_orchestrator_message(ChildMessageKind::Ask, &child_meta(), "Which database should I use?");
+    let ask_body = format_child_orchestrator_message(
+        ChildMessageKind::Ask,
+        &child_meta(),
+        "Which database should I use?",
+    );
     let child_task = {
         let child_state = child_state.clone();
         let child = child.clone();
@@ -186,7 +217,10 @@ async fn inbound_message_surfaces_and_outbound_ask_receives_the_human_reply() {
         .await
         .expect("the inbound surface fired within the timeout")
         .expect("the surface channel delivered the surfaced message");
-    assert_eq!(custom_type, "intercom_message", "surfaced as the intercom_message custom entry");
+    assert_eq!(
+        custom_type, "intercom_message",
+        "surfaced as the intercom_message custom entry"
+    );
     let content = data["content"].as_str().unwrap_or_default();
     // `**From <sender>** (<cwd>)`, with NO `📨`. pi dropped the emoji in v0.10.0 (the "deslop"
     // pass) and cyrup ported that removal — `inbound.rs:1140-1144` pins it against
@@ -200,13 +234,19 @@ async fn inbound_message_surfaces_and_outbound_ask_receives_the_human_reply() {
         !content.contains('📨'),
         "the v0.10.0 deslop removed the envelope glyph from the header: {content:?}"
     );
-    assert!(content.contains("Which database should I use?"), "content carries the child's ask: {content:?}");
+    assert!(
+        content.contains("Which database should I use?"),
+        "content carries the child's ask: {content:?}"
+    );
     // The structured card rides with it, and round-trips: this is what the registered message
     // renderer rebuilds its component from, so asserting the shape here pins the renderer's input
     // rather than a pre-rendered string frozen at one width.
     let card = cyrup_intercom::ui::InlineMessage::from_details(&data)
         .expect("the surfaced details deserialize as the inline card");
-    assert_eq!(card.message.id, "question-abc", "the card carries the asking message's id");
+    assert_eq!(
+        card.message.id, "question-abc",
+        "the card carries the asking message's id"
+    );
     assert!(
         card.body().contains("Which database should I use?"),
         "the card body is the child's ask: {:?}",
@@ -225,11 +265,18 @@ async fn inbound_message_surfaces_and_outbound_ask_receives_the_human_reply() {
         .await
         .expect("clarify resolved within the timeout")
         .expect("clarify returns the human answer");
-    assert_eq!(clarify_answer, "Use Postgres.", "the ClarifyChannel returned the human's answer");
+    assert_eq!(
+        clarify_answer, "Use Postgres.",
+        "the ClarifyChannel returned the human's answer"
+    );
 
     // The human prompt actually reached the scripted input sink.
     assert!(
-        sink.input_prompts.lock().unwrap().iter().any(|p| p.contains("database decision")),
+        sink.input_prompts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.contains("database decision")),
         "the clarify prompt reached HostServices::input",
     );
 
@@ -239,7 +286,10 @@ async fn inbound_message_surfaces_and_outbound_ask_receives_the_human_reply() {
         .expect("the child ask resolved within the timeout")
         .expect("the child task joined")
         .expect("the child ask returned the reply");
-    assert_eq!(child_reply, "Use Postgres.", "the human's answer reached the child through the broker");
+    assert_eq!(
+        child_reply, "Use Postgres.",
+        "the human's answer reached the child through the broker"
+    );
 
     // Clean teardown.
     child.disconnect();

@@ -14,20 +14,20 @@
 
 use std::collections::HashMap;
 
+use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use crate::keymap::{
     EditorAction, EditorKeymap, Key, SelectAction, SelectKeymap, SessionAction, SessionKeymap,
 };
-use crate::selector::{centered_window, rule_line, Selector, SelectorOutcome};
-use crate::text_input::{Input, InputOutcome};
-use crate::session_search::{filter_and_sort, NameFilter, SearchRow, SortMode};
+use crate::selector::{Selector, SelectorOutcome, centered_window, rule_line};
+use crate::session_search::{NameFilter, SearchRow, SortMode, filter_and_sort};
 use crate::settings_selector::FIELD_SEP;
+use crate::text_input::{Input, InputOutcome};
 use crate::text_width::{spans_width, str_width, truncate_spans_to_width, truncate_to_width};
 use crate::theme::UiTheme;
 
@@ -77,7 +77,12 @@ impl FlatSessionNode {
     /// A root-level (untreed) node — what `filterSessions`' non-threaded branch builds
     /// (`session-selector.ts:379-384`: `{ session, depth: 0, isLast: true, ancestorContinues: [] }`).
     fn flat(row: SessionRow) -> Self {
-        FlatSessionNode { row, depth: 0, is_last: true, ancestor_continues: Vec::new() }
+        FlatSessionNode {
+            row,
+            depth: 0,
+            is_last: true,
+            ancestor_continues: Vec::new(),
+        }
     }
 
     /// `buildTreePrefix` (`session-selector.ts:522-530`): `""` at depth 0, else one
@@ -355,10 +360,16 @@ impl SessionSelector {
                 item: i,
             })
             .collect();
-        let idxs =
-            filter_and_sort(&search_rows, self.input.value(), self.sort, self.name_filter);
-        let rows: Vec<SessionRow> =
-            idxs.into_iter().filter_map(|i| self.rows.get(i).cloned()).collect();
+        let idxs = filter_and_sort(
+            &search_rows,
+            self.input.value(),
+            self.sort,
+            self.name_filter,
+        );
+        let rows: Vec<SessionRow> = idxs
+            .into_iter()
+            .filter_map(|i| self.rows.get(i).cloned())
+            .collect();
         if self.sort == SortMode::Threaded && self.input.value().trim().is_empty() {
             flatten_session_tree(&rows, &self.parents)
         } else {
@@ -368,7 +379,19 @@ impl SessionSelector {
 
     /// The highlighted row of the *filtered* list, if any (test/inspection).
     pub fn current(&self) -> Option<SessionRow> {
-        self.filtered().into_iter().nth(self.selected).map(|n| n.row)
+        self.filtered()
+            .into_iter()
+            .nth(self.selected)
+            .map(|n| n.row)
+    }
+
+    /// `startDeleteConfirmationForSelectedSession` (`session-selector.ts:394-403` @v0.84.4): arm
+    /// the delete confirmation for the highlighted row, or do nothing when the list is empty.
+    /// Shared by `app.session.delete` and `app.session.deleteNoninvasive`.
+    fn start_delete_confirmation_for_selected(&mut self) {
+        if let Some(row) = self.current() {
+            self.confirming_delete = Some(row.path);
+        }
     }
 
     /// The number of currently-visible (filtered) rows (test/inspection).
@@ -470,7 +493,9 @@ impl SessionSelector {
     /// state tells the user to press. Empty when the action is unbound, exactly as `keyText`'s
     /// `keys.length === 0` arm returns `""` (`keybinding-hints.ts:30`).
     fn named_filter_key(&self) -> String {
-        self.session_keymap.keys_label(SessionAction::ToggleNamedFilter).unwrap_or_default()
+        self.session_keymap
+            .keys_label(SessionAction::ToggleNamedFilter)
+            .unwrap_or_default()
     }
 
     /// Build the body display lines for the windowed filtered list at `width` columns.
@@ -560,7 +585,11 @@ impl SessionSelector {
             // `isSelected ? theme.fg("accent", "› ") : "  "`), not U+2192 `→ `. `→ ` is correct in
             // `SelectList` (`select-list.ts:146`) — only this selector diverged.
             let cursor = if is_sel { "› " } else { "  " };
-            let cursor_style = if is_sel { theme.accent_style() } else { theme.base_style() };
+            let cursor_style = if is_sel {
+                theme.accent_style()
+            } else {
+                theme.base_style()
+            };
 
             // `:462` normalizes control characters out of the label before measuring it.
             let normalized = normalize_message(&row.label);
@@ -568,7 +597,10 @@ impl SessionSelector {
             // never less than 10 columns.
             let prefix_width = str_width(&prefix);
             let right_width = str_width(&right).saturating_add(2); // +2 for spacing (`:480`)
-            let available = width.saturating_sub(2).saturating_sub(prefix_width).saturating_sub(right_width);
+            let available = width
+                .saturating_sub(2)
+                .saturating_sub(prefix_width)
+                .saturating_sub(right_width);
             let message = truncate_to_width(&normalized, available.max(10), "…");
 
             // S11 (`:486-497`): the row's state picks the message colour — `error` while its delete
@@ -596,12 +628,18 @@ impl SessionSelector {
                 Span::styled(message, message_style),
             ];
             let left_width = spans_width(&spans);
-            let spacing =
-                width.saturating_sub(left_width).saturating_sub(str_width(&right)).max(1);
+            let spacing = width
+                .saturating_sub(left_width)
+                .saturating_sub(str_width(&right))
+                .max(1);
             spans.push(Span::styled(" ".repeat(spacing), theme.base_style()));
             spans.push(Span::styled(
                 right,
-                if is_confirming { theme.error_style() } else { theme.dim_style() },
+                if is_confirming {
+                    theme.error_style()
+                } else {
+                    theme.dim_style()
+                },
             ));
 
             // `:509` `truncateToWidth(line, width)` — the default `"..."` ellipsis.
@@ -684,12 +722,16 @@ impl SessionSelector {
         let available_left = width.saturating_sub(right_width).saturating_sub(1);
         let left = truncate_to_width(title, available_left, "");
         // `:153`.
-        let spacing = width.saturating_sub(str_width(&left)).saturating_sub(right_width);
+        let spacing = width
+            .saturating_sub(str_width(&left))
+            .saturating_sub(right_width);
 
         // `theme.bold(title)` — bold with no `fg` escape, so the title keeps the default text
         // colour rather than becoming accent teal.
-        let mut spans =
-            vec![Span::styled(left, theme.base_style().add_modifier(Modifier::BOLD))];
+        let mut spans = vec![Span::styled(
+            left,
+            theme.base_style().add_modifier(Modifier::BOLD),
+        )];
         if spacing > 0 {
             spans.push(Span::styled(" ".repeat(spacing), theme.base_style()));
         }
@@ -724,9 +766,8 @@ impl SessionSelector {
         let width = usize::from(width);
         // `:181-182` / `:160` / `:164` — every branch truncates to `width` with a `…` ellipsis
         // (`:150`'s empty-ellipsis clip is the TITLE row's, not these).
-        let clip = |spans: Vec<Span<'static>>| {
-            Line::from(truncate_spans_to_width(spans, width, "…"))
-        };
+        let clip =
+            |spans: Vec<Span<'static>>| Line::from(truncate_spans_to_width(spans, width, "…"));
         let pair = |key: Option<String>, desc: &str| -> Vec<Span<'static>> {
             match key {
                 // `keys.length === 0 ⇒ ""` (`keybinding-hints.ts:30`): an unbound id still renders
@@ -740,10 +781,16 @@ impl SessionSelector {
         // `:158-161`.
         if self.confirming_delete.is_some() {
             let mut spans = vec![Span::styled("Delete session? ", theme.error_style())];
-            spans.extend(pair(self.select_keymap.keys_label(SelectAction::Confirm), "confirm"));
+            spans.extend(pair(
+                self.select_keymap.keys_label(SelectAction::Confirm),
+                "confirm",
+            ));
             // Uncoloured: the preceding `keyHint` already emitted `\x1b[39m`.
             spans.push(Span::styled(" · ", theme.base_style()));
-            spans.extend(pair(self.select_keymap.keys_label(SelectAction::Cancel), "cancel"));
+            spans.extend(pair(
+                self.select_keymap.keys_label(SelectAction::Cancel),
+                "cancel",
+            ));
             return vec![clip(spans), Line::from("")];
         }
         // cyrup-only state: the rename `Input` replaces the search box. Upstream reaches the same
@@ -751,8 +798,14 @@ impl SessionSelector {
         // carries its own `${keyText(confirm)} to save · ${keyText(cancel)} to cancel` row (`:879`);
         // this keeps that text on the header's own hint row instead of duplicating the panel.
         if self.renaming.is_some() {
-            let confirm = self.select_keymap.keys_label(SelectAction::Confirm).unwrap_or_default();
-            let cancel = self.select_keymap.keys_label(SelectAction::Cancel).unwrap_or_default();
+            let confirm = self
+                .select_keymap
+                .keys_label(SelectAction::Confirm)
+                .unwrap_or_default();
+            let cancel = self
+                .select_keymap
+                .keys_label(SelectAction::Cancel)
+                .unwrap_or_default();
             return vec![
                 clip(vec![Span::styled(
                     format!("{confirm} to save · {cancel} to cancel"),
@@ -766,8 +819,13 @@ impl SessionSelector {
         let path_state = if self.show_path { "(on)" } else { "(off)" };
         // `keyHint("tui.input.tab", "scope")` (`:170`) — every key bound to the id, joined `/`, or
         // no key run at all when the user unbound it (`keyText`'s `keys.length === 0` arm).
-        let tab_label = (!self.tab_keys.is_empty())
-            .then(|| self.tab_keys.iter().map(|k| k.label()).collect::<Vec<_>>().join("/"));
+        let tab_label = (!self.tab_keys.is_empty()).then(|| {
+            self.tab_keys
+                .iter()
+                .map(|k| k.label())
+                .collect::<Vec<_>>()
+                .join("/")
+        });
         let mut hint1 = pair(tab_label, "scope");
         hint1.push(sep());
         hint1.push(Span::styled(
@@ -782,7 +840,10 @@ impl SessionSelector {
         hint2.push(sep());
         hint2.extend(pair(k(SessionAction::Delete), "delete"));
         hint2.push(sep());
-        hint2.extend(pair(k(SessionAction::TogglePath), &format!("path {path_state}")));
+        hint2.extend(pair(
+            k(SessionAction::TogglePath),
+            &format!("path {path_state}"),
+        ));
         if self.show_rename_hint {
             hint2.push(sep());
             hint2.extend(pair(k(SessionAction::Rename), "rename"));
@@ -794,7 +855,9 @@ impl SessionSelector {
 impl Selector for SessionSelector {
     fn desired_height(&self, width: u16) -> u16 {
         let filtered = self.filtered();
-        let body = self.body_lines(UiTheme::default_ref(), &filtered, width).len() as u16;
+        let body = self
+            .body_lines(UiTheme::default_ref(), &filtered, width)
+            .len() as u16;
         // blank + top rule + blank + header (title + BOTH hint rows) + blank + search input + blank
         // + body + blank + bottom rule (L4/SYS-3 — see `render`) = body + hints + 9.
         let hints = self.hint_lines(UiTheme::default_ref(), width).len() as u16;
@@ -833,10 +896,10 @@ impl Selector for SessionSelector {
         // `rule_line(.., accent)` below rather than the shared `border_rule_line` every other
         // envelope uses.
         let mut lines: Vec<Line<'static>> = vec![
-            Line::from(""),                               // `Spacer`(:737)
-            rule_line(area.width, theme.accent_style()),  // `DynamicBorder`(:738), accent (S13)
-            Line::from(""),                               // `Spacer`(:739)
-            self.header_line(theme, area.width),          // header line 1 of 3 (:185)
+            Line::from(""),                              // `Spacer`(:737)
+            rule_line(area.width, theme.accent_style()), // `DynamicBorder`(:738), accent (S13)
+            Line::from(""),                              // `Spacer`(:739)
+            self.header_line(theme, area.width),         // header line 1 of 3 (:185)
         ];
         // Header lines 2 and 3 (`hintLine1`/`hintLine2`, `:156-183`).
         lines.extend(self.hint_lines(theme, area.width));
@@ -910,7 +973,9 @@ impl Selector for SessionSelector {
                     };
                     let name = edit.value().trim().to_string();
                     self.apply_rename(&path, &name);
-                    return SelectorOutcome::Apply(SessionSelectorOutcome::rename_payload(&path, &name));
+                    return SelectorOutcome::Apply(SessionSelectorOutcome::rename_payload(
+                        &path, &name,
+                    ));
                 }
                 KeyCode::Esc => {
                     self.renaming = None;
@@ -943,15 +1008,30 @@ impl Selector for SessionSelector {
                 SessionAction::ToggleSort => self.cycle_sort(),
                 SessionAction::ToggleNamedFilter => self.toggle_name_filter(),
                 SessionAction::TogglePath => self.show_path = !self.show_path,
-                SessionAction::Delete => {
-                    if let Some(row) = self.current() {
-                        self.confirming_delete = Some(row.path);
+                SessionAction::Delete => self.start_delete_confirmation_for_selected(),
+                // "Ctrl+Backspace: non-invasive convenience alias for delete. Only triggers
+                // deletion when the query is empty; otherwise it is forwarded to the input"
+                // (`session-selector.ts:590-600` @v0.84.4). Resolved HERE, ahead of the search
+                // `Input` fallthrough in 6), which is modifier-aware and would otherwise report
+                // the chord `Ignored` (TUI-068).
+                SessionAction::DeleteNoninvasive => {
+                    if !self.input.value().is_empty() {
+                        // `this.searchInput.handleInput(keyData); this.filterSessions(...)` —
+                        // whatever the live editor table makes of the chord (nothing, unless the
+                        // user bound it to an editor action), then re-filter from the top.
+                        if self.input.handle_key(key) == InputOutcome::Edited {
+                            self.selected = 0;
+                        }
+                    } else {
+                        self.start_delete_confirmation_for_selected();
                     }
                 }
                 SessionAction::Rename => {
                     if let Some(row) = self.current() {
-                        self.renaming =
-                            Some((row.path, Input::with_value(row.name.clone().unwrap_or_default())));
+                        self.renaming = Some((
+                            row.path,
+                            Input::with_value(row.name.clone().unwrap_or_default()),
+                        ));
                     }
                 }
             }
@@ -1045,8 +1125,16 @@ fn shorten_path(path: &str) -> String {
 
 /// `displayText.replace(/[\x00-\x1f\x7f]/g, " ").trim()` (`session-selector.ts:462`).
 fn normalize_message(s: &str) -> String {
-    let replaced: String =
-        s.chars().map(|c| if c.is_control() || c == '\u{7f}' { ' ' } else { c }).collect();
+    let replaced: String = s
+        .chars()
+        .map(|c| {
+            if c.is_control() || c == '\u{7f}' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
     replaced.trim().to_string()
 }
 
@@ -1104,7 +1192,8 @@ fn flatten_session_tree(
         }
     }
     for &idx in order.iter().rev() {
-        let (Some(p), Some(&child_latest)) = (parent_of.get(idx).copied().flatten(), latest.get(idx))
+        let (Some(p), Some(&child_latest)) =
+            (parent_of.get(idx).copied().flatten(), latest.get(idx))
         else {
             continue;
         };
@@ -1115,7 +1204,11 @@ fn flatten_session_tree(
 
     // `sortNodes` (`:245-251`): latest activity descending, at every level.
     let by_latest = |a: &usize, b: &usize| {
-        latest.get(*b).copied().unwrap_or(0).cmp(&latest.get(*a).copied().unwrap_or(0))
+        latest
+            .get(*b)
+            .copied()
+            .unwrap_or(0)
+            .cmp(&latest.get(*a).copied().unwrap_or(0))
     };
     roots.sort_by(by_latest);
     for kids in &mut children {
@@ -1143,16 +1236,24 @@ fn flatten_session_tree(
         .collect();
     let mut out: Vec<FlatSessionNode> = Vec::with_capacity(n);
     while let Some(frame) = stack.pop() {
-        let Some(row) = rows.get(frame.idx) else { continue };
+        let Some(row) = rows.get(frame.idx) else {
+            continue;
+        };
         out.push(FlatSessionNode {
             row: row.clone(),
             depth: frame.depth,
             is_last: frame.is_last,
             ancestor_continues: frame.ancestor_continues.clone(),
         });
-        let Some(kids) = children.get(frame.idx) else { continue };
+        let Some(kids) = children.get(frame.idx) else {
+            continue;
+        };
         // `:268` — a root's own branch never draws a continuation line under it.
-        let continues = if frame.depth > 0 { !frame.is_last } else { false };
+        let continues = if frame.depth > 0 {
+            !frame.is_last
+        } else {
+            false
+        };
         let mut ancestors = frame.ancestor_continues;
         ancestors.push(continues);
         let kid_count = kids.len();
@@ -1183,13 +1284,18 @@ fn descends_from(parent_of: &[Option<usize>], node: usize, ancestor: usize) -> b
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 mod tests {
     use ratatui::crossterm::event::KeyModifiers;
 
     use super::*;
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     use crate::keymap::Key;
 
@@ -1206,7 +1312,12 @@ mod tests {
 
     fn rows() -> Vec<SessionRow> {
         vec![
-            row("/s/a.jsonl", Some("Build pipeline"), "a build pipeline ci", 3),
+            row(
+                "/s/a.jsonl",
+                Some("Build pipeline"),
+                "a build pipeline ci",
+                3,
+            ),
             row("/s/b.jsonl", None, "b fixing node cve today", 2),
             row("/s/c.jsonl", Some("Docs"), "c writing docs readme", 1),
         ]
@@ -1294,6 +1405,109 @@ mod tests {
         sel.handle(&key(KeyCode::Esc), &km);
         assert!(!sel.is_confirming_delete());
         assert_eq!(sel.visible_len(), 3);
+    }
+
+    fn ctrl_backspace() -> KeyEvent {
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL)
+    }
+
+    /// TUI-068. `app.session.deleteNoninvasive` (`ctrl+backspace`, `core/keybindings.ts:177-180`
+    /// @v0.84.4): with an EMPTY query it is `startDeleteConfirmationForSelectedSession()`
+    /// (`session-selector.ts:599`). Before the port the chord fell through to the search `Input`,
+    /// which ignored it — the confirmation never armed.
+    #[test]
+    fn tui068_ctrl_backspace_with_an_empty_query_arms_the_delete_confirmation() {
+        let mut sel = SessionSelector::new(rows());
+        let km = SelectKeymap::default();
+        let out = sel.handle(&ctrl_backspace(), &km);
+        assert_eq!(out, SelectorOutcome::Redraw);
+        assert!(
+            sel.is_confirming_delete(),
+            "ctrl+backspace on an empty query = ctrl+d"
+        );
+        // And it is the same confirmation flow: Enter deletes the highlighted row.
+        let out = sel.handle(&key(KeyCode::Enter), &km);
+        assert_eq!(
+            match out {
+                SelectorOutcome::Apply(payload) => SessionSelectorOutcome::parse_apply(&payload),
+                other => panic!("expected Apply, got {other:?}"),
+            },
+            Some(SessionSelectorOutcome::Delete("/s/a.jsonl".to_string()))
+        );
+        assert_eq!(sel.visible_len(), 2);
+    }
+
+    /// TUI-068. With a NON-empty query the chord is "forwarded to the input" and the list is
+    /// re-filtered (`session-selector.ts:593-597`) — it never arms a delete. The search `Input`
+    /// has no default binding for `ctrl+backspace`, so the query is left as typed; the selector
+    /// still owns the key (`Redraw`, not the `Ignored` the pre-port fallthrough reported).
+    #[test]
+    fn tui068_ctrl_backspace_with_a_query_forwards_to_the_input_and_keeps_the_list() {
+        let mut sel = SessionSelector::new(rows());
+        let km = SelectKeymap::default();
+        for c in "docs".chars() {
+            sel.handle(&key(KeyCode::Char(c)), &km);
+        }
+        assert_eq!(sel.visible_len(), 1);
+        let out = sel.handle(&ctrl_backspace(), &km);
+        assert_eq!(out, SelectorOutcome::Redraw);
+        assert!(
+            !sel.is_confirming_delete(),
+            "a non-empty query never deletes"
+        );
+        assert_eq!(sel.visible_len(), 1, "the list is alive and still filtered");
+        assert_eq!(sel.current().unwrap().path, "/s/c.jsonl");
+    }
+
+    /// TUI-068. The forward really reaches the live editor table: bind `ctrl+backspace` to
+    /// `tui.editor.deleteWordBackward` and the chord edits the query and re-filters from the top,
+    /// exactly as `this.searchInput.handleInput(keyData); this.filterSessions(...)` would.
+    #[test]
+    fn tui068_ctrl_backspace_with_a_query_honours_an_editor_rebind() {
+        let mut editor = EditorKeymap::default();
+        editor.set_action(
+            EditorAction::DeleteWordBackward,
+            vec![Key::parse("ctrl+backspace").unwrap()],
+        );
+        let mut sel = SessionSelector::new(rows()).with_keymaps(&SessionKeymap::default(), &editor);
+        // The host hands the live editor table to the embedded search input through the
+        // `Selector` trait (`app/selectors.rs:266` does this for every opened selector).
+        sel.set_editor_keymap(&editor);
+        let km = SelectKeymap::default();
+        for c in "docs".chars() {
+            sel.handle(&key(KeyCode::Char(c)), &km);
+        }
+        assert_eq!(sel.visible_len(), 1);
+        sel.handle(&ctrl_backspace(), &km);
+        assert!(!sel.is_confirming_delete());
+        assert_eq!(
+            sel.visible_len(),
+            3,
+            "the word was deleted, so the filter cleared"
+        );
+        // Now the query IS empty, so the same chord arms the confirmation.
+        sel.handle(&ctrl_backspace(), &km);
+        assert!(sel.is_confirming_delete());
+    }
+
+    /// TUI-068. `{"app.session.deleteNoninvasive": "ctrl+k"}` moves the behaviour — the id used
+    /// to be skipped silently by `merge_entries` because `from_id` had no arm for it.
+    #[test]
+    fn tui068_delete_noninvasive_is_rebindable_from_json() {
+        let mut skm = SessionKeymap::default();
+        let issues = skm
+            .merge_json(r#"{"app.session.deleteNoninvasive": "ctrl+k"}"#)
+            .unwrap();
+        assert!(issues.is_empty(), "{issues:?}");
+        let mut sel = SessionSelector::new(rows()).with_keymaps(&skm, &EditorKeymap::default());
+        let km = SelectKeymap::default();
+        sel.handle(&ctrl_backspace(), &km);
+        assert!(
+            !sel.is_confirming_delete(),
+            "ctrl+backspace is no longer bound"
+        );
+        sel.handle(&ctrl('k'), &km);
+        assert!(sel.is_confirming_delete(), "ctrl+k is");
     }
 
     #[test]
@@ -1386,15 +1600,19 @@ mod tests {
     /// agreeing with the column the moment a multi-byte glyph (`◉`, `├`) precedes the match — this
     /// walks cells instead.
     fn col_of(buf: &ratatui::buffer::Buffer, y: u16, needle: &str) -> u16 {
-        let cells: Vec<String> =
-            (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect();
+        let cells: Vec<String> = (0..buf.area.width)
+            .map(|x| buf[(x, y)].symbol().to_string())
+            .collect();
         for x in 0..cells.len() {
             let tail: String = cells[x..].concat();
             if tail.starts_with(needle) {
                 return x as u16;
             }
         }
-        panic!("row {y} does not contain {needle:?}: {:?}", row_text(buf, y));
+        panic!(
+            "row {y} does not contain {needle:?}: {:?}",
+            row_text(buf, y)
+        );
     }
 
     /// A four-session fixture whose parent edges make a two-level tree: `b` and `c` are children of
@@ -1432,13 +1650,29 @@ mod tests {
         assert_eq!(find_row(&buf, "Leaf"), a + 2);
         assert_eq!(find_row(&buf, "Branch two"), a + 3);
 
-        assert!(!row_text(&buf, a).contains('├'), "a root carries no connector: {:?}", row_text(&buf, a));
+        assert!(
+            !row_text(&buf, a).contains('├'),
+            "a root carries no connector: {:?}",
+            row_text(&buf, a)
+        );
         // `b` is a non-last child of the root: `ancestorContinues = [false]` → `"   "`, then `"├─ "`.
-        assert!(row_text(&buf, a + 1).starts_with("     ├─ Branch one"), "{:?}", row_text(&buf, a + 1));
+        assert!(
+            row_text(&buf, a + 1).starts_with("     ├─ Branch one"),
+            "{:?}",
+            row_text(&buf, a + 1)
+        );
         // `d` hangs under `b`, which still has `c` after it, so the depth-1 gutter CONTINUES: `"│  "`.
-        assert!(row_text(&buf, a + 2).starts_with("     │  └─ Leaf"), "{:?}", row_text(&buf, a + 2));
+        assert!(
+            row_text(&buf, a + 2).starts_with("     │  └─ Leaf"),
+            "{:?}",
+            row_text(&buf, a + 2)
+        );
         // `c` is the last child: `"└─ "`.
-        assert!(row_text(&buf, a + 3).starts_with("     └─ Branch two"), "{:?}", row_text(&buf, a + 3));
+        assert!(
+            row_text(&buf, a + 3).starts_with("     └─ Branch two"),
+            "{:?}",
+            row_text(&buf, a + 3)
+        );
     }
 
     /// **S8.** The connectors are `theme.fg("dim", prefix)` (`:500`) — the `dim` token, and a
@@ -1450,7 +1684,11 @@ mod tests {
         let theme = UiTheme::default();
         let y = find_row(&buf, "Branch one");
         let x = col_of(&buf, y, "├");
-        assert_eq!(buf[(x, y)].fg, theme.dim_style().fg.unwrap(), "connector is not `dim`");
+        assert_eq!(
+            buf[(x, y)].fg,
+            theme.dim_style().fg.unwrap(),
+            "connector is not `dim`"
+        );
     }
 
     /// **S8.** A `parentSessionPath` cycle must not hang or blow the stack — cyrup's documented
@@ -1465,7 +1703,11 @@ mod tests {
             ("/s/a.jsonl".to_string(), "/s/b.jsonl".to_string()),
             ("/s/b.jsonl".to_string(), "/s/a.jsonl".to_string()),
         ]);
-        assert_eq!(sel.visible_len(), 2, "every session must still be reachable");
+        assert_eq!(
+            sel.visible_len(),
+            2,
+            "every session must still be reachable"
+        );
     }
 
     /// **S9.** `session-selector.ts:502-505`:
@@ -1482,11 +1724,21 @@ mod tests {
         let buf = draw(&mut sel, 60, 20);
         let y = find_row(&buf, "Build pipeline");
         let text = row_text(&buf, y);
-        assert!(text.ends_with("3 msgs"), "metadata must reach the right edge: {text:?}");
+        assert!(
+            text.ends_with("3 msgs"),
+            "metadata must reach the right edge: {text:?}"
+        );
         // The gap between the label and the column is more than the old fixed two spaces.
-        assert!(text.contains("Build pipeline    "), "column is not right-aligned: {text:?}");
+        assert!(
+            text.contains("Build pipeline    "),
+            "column is not right-aligned: {text:?}"
+        );
         let last = buf.area.width - 1;
-        assert_eq!(buf[(last, y)].fg, theme.dim_style().fg.unwrap(), "column is not `dim`");
+        assert_eq!(
+            buf[(last, y)].fg,
+            theme.dim_style().fg.unwrap(),
+            "column is not `dim`"
+        );
         assert_ne!(
             theme.dim_style().fg.unwrap(),
             theme.muted_style().fg.unwrap(),
@@ -1510,8 +1762,15 @@ mod tests {
         // Row 0 ("Build pipeline") is named AND selected: `warning` + BOLD.
         let y = find_row(&buf, "Build pipeline");
         let x = col_of(&buf, y, "Build");
-        assert_eq!(buf[(x, y)].fg, theme.warning_style().fg.unwrap(), "named row is not `warning`");
-        assert!(buf[(x, y)].modifier.contains(Modifier::BOLD), "selected row is not bold");
+        assert_eq!(
+            buf[(x, y)].fg,
+            theme.warning_style().fg.unwrap(),
+            "named row is not `warning`"
+        );
+        assert!(
+            buf[(x, y)].modifier.contains(Modifier::BOLD),
+            "selected row is not bold"
+        );
         assert_ne!(
             buf[(x, y)].fg,
             theme.accent_style().fg.unwrap(),
@@ -1521,12 +1780,20 @@ mod tests {
         // `/s/b.jsonl` is unnamed and not current: plain `base`.
         let y = find_row(&buf, "/s/b.jsonl");
         let x = col_of(&buf, y, "/s/b");
-        assert_eq!(buf[(x, y)].fg, theme.base_style().fg.unwrap(), "plain row is not `base`");
+        assert_eq!(
+            buf[(x, y)].fg,
+            theme.base_style().fg.unwrap(),
+            "plain row is not `base`"
+        );
 
         // `/s/c.jsonl` is the current session: `accent` beats its name's `warning`.
         let y = find_row(&buf, "Docs");
         let x = col_of(&buf, y, "Docs");
-        assert_eq!(buf[(x, y)].fg, theme.accent_style().fg.unwrap(), "current row is not `accent`");
+        assert_eq!(
+            buf[(x, y)].fg,
+            theme.accent_style().fg.unwrap(),
+            "current row is not `accent`"
+        );
     }
 
     /// **S11.** `:487-488` — the row queued for deletion is `error`, message AND metadata column
@@ -1540,9 +1807,17 @@ mod tests {
         let buf = draw(&mut sel, 60, 20);
         let y = find_row(&buf, "Build pipeline");
         let x = col_of(&buf, y, "Build");
-        assert_eq!(buf[(x, y)].fg, theme.error_style().fg.unwrap(), "message is not `error`");
+        assert_eq!(
+            buf[(x, y)].fg,
+            theme.error_style().fg.unwrap(),
+            "message is not `error`"
+        );
         let last = buf.area.width - 1;
-        assert_eq!(buf[(last, y)].fg, theme.error_style().fg.unwrap(), "column is not `error`");
+        assert_eq!(
+            buf[(last, y)].fg,
+            theme.error_style().fg.unwrap(),
+            "column is not `error`"
+        );
     }
 
     /// **S12.** `session-selector.ts:131-153`: the title NAMES THE SCOPE and is `theme.bold(title)`
@@ -1559,26 +1834,62 @@ mod tests {
         let y = find_row(&buf, "Resume Session");
         let text = row_text(&buf, y);
 
-        assert!(text.starts_with("Resume Session (Current Folder)"), "{text:?}");
-        assert!(text.ends_with("Sort: Threaded"), "right group is not flush right: {text:?}");
-        assert!(text.contains("◉ Current Folder | ○ All"), "no scope radio: {text:?}");
+        assert!(
+            text.starts_with("Resume Session (Current Folder)"),
+            "{text:?}"
+        );
+        assert!(
+            text.ends_with("Sort: Threaded"),
+            "right group is not flush right: {text:?}"
+        );
+        assert!(
+            text.contains("◉ Current Folder | ○ All"),
+            "no scope radio: {text:?}"
+        );
 
         // `theme.bold(title)`: bold, and NOT accent.
-        assert!(buf[(0, y)].modifier.contains(Modifier::BOLD), "title is not bold");
-        assert_eq!(buf[(0, y)].fg, theme.base_style().fg.unwrap(), "title must carry no fg escape");
-        assert_ne!(buf[(0, y)].fg, theme.accent_style().fg.unwrap(), "title is still accent teal");
+        assert!(
+            buf[(0, y)].modifier.contains(Modifier::BOLD),
+            "title is not bold"
+        );
+        assert_eq!(
+            buf[(0, y)].fg,
+            theme.base_style().fg.unwrap(),
+            "title must carry no fg escape"
+        );
+        assert_ne!(
+            buf[(0, y)].fg,
+            theme.accent_style().fg.unwrap(),
+            "title is still accent teal"
+        );
 
         // The live radio side is `accent`; the other side is `muted`.
         let radio = col_of(&buf, y, "◉");
-        assert_eq!(buf[(radio, y)].fg, theme.accent_style().fg.unwrap(), "live scope is not accent");
+        assert_eq!(
+            buf[(radio, y)].fg,
+            theme.accent_style().fg.unwrap(),
+            "live scope is not accent"
+        );
         let other = col_of(&buf, y, "○");
-        assert_eq!(buf[(other, y)].fg, theme.muted_style().fg.unwrap(), "dormant scope is not muted");
+        assert_eq!(
+            buf[(other, y)].fg,
+            theme.muted_style().fg.unwrap(),
+            "dormant scope is not muted"
+        );
 
         // `Name: ` is `muted`, its value `accent` (`:135-138`).
         let label = col_of(&buf, y, "Name: ");
-        assert_eq!(buf[(label, y)].fg, theme.muted_style().fg.unwrap(), "`Name:` is not muted");
+        assert_eq!(
+            buf[(label, y)].fg,
+            theme.muted_style().fg.unwrap(),
+            "`Name:` is not muted"
+        );
         let value = label + 6;
-        assert_eq!(buf[(value, y)].fg, theme.accent_style().fg.unwrap(), "`All` is not accent");
+        assert_eq!(
+            buf[(value, y)].fg,
+            theme.accent_style().fg.unwrap(),
+            "`All` is not accent"
+        );
     }
 
     /// **S12.** `:131` — toggling scope rewrites both the title and which radio is lit.
@@ -1604,16 +1915,25 @@ mod tests {
         let theme = UiTheme::default();
         let mut sel = SessionSelector::new(rows());
         let buf = draw(&mut sel, 60, 20);
-        let rules: Vec<u16> =
-            (0..buf.area.height).filter(|y| row_text(&buf, *y).starts_with("──")).collect();
-        assert_eq!(rules.len(), 2, "expected a top and a bottom rule: {rules:?}");
+        let rules: Vec<u16> = (0..buf.area.height)
+            .filter(|y| row_text(&buf, *y).starts_with("──"))
+            .collect();
+        assert_eq!(
+            rules.len(),
+            2,
+            "expected a top and a bottom rule: {rules:?}"
+        );
         assert_ne!(
             theme.accent_style().fg.unwrap(),
             theme.border_style().fg.unwrap(),
             "`accent` and `border` are distinct tokens — this test would be vacuous otherwise"
         );
         for y in rules {
-            assert_eq!(buf[(0, y)].fg, theme.accent_style().fg.unwrap(), "rule at {y} is not accent");
+            assert_eq!(
+                buf[(0, y)].fg,
+                theme.accent_style().fg.unwrap(),
+                "rule at {y} is not accent"
+            );
         }
     }
 
@@ -1635,7 +1955,10 @@ mod tests {
         );
         let buf = draw(&mut sel, 80, 20);
         let text = row_text(&buf, find_row(&buf, "Build pipeline"));
-        assert!(text.ends_with("/s/a.jsonl 3 msgs"), "path is not in the right column: {text:?}");
+        assert!(
+            text.ends_with("/s/a.jsonl 3 msgs"),
+            "path is not in the right column: {text:?}"
+        );
     }
 
     /// **S27.** The row's message column is cut by the crate's one grapheme-atomic truncator
@@ -1655,16 +1978,25 @@ mod tests {
         let sel = SessionSelector::new(vec![row("/s/z.jsonl", Some(label.as_str()), "z", 1)]);
         let filtered = sel.filtered();
         let lines = sel.body_lines(&theme, &filtered, 40);
-        let text: String =
-            lines.iter().flat_map(|l| l.spans.iter()).map(|s| &*s.content).collect();
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| &*s.content)
+            .collect();
 
-        assert!(text.contains('…'), "the row was not truncated at all: {text:?}");
+        assert!(
+            text.contains('…'),
+            "the row was not truncated at all: {text:?}"
+        );
         let whole = text.contains(FAMILY);
         let partial = text.contains('\u{200d}')
             || text.contains('👨')
             || text.contains('👩')
             || text.contains('👧');
-        assert!(whole || !partial, "the family cluster was split into components: {text:?}");
+        assert!(
+            whole || !partial,
+            "the family cluster was split into components: {text:?}"
+        );
     }
 
     /// **S15.** `session-selector.ts:512-517`: when the `maxVisible` window does not cover the list,
@@ -1675,14 +2007,29 @@ mod tests {
     fn a_short_window_over_a_long_list_reports_its_position() {
         let theme = UiTheme::default();
         let long: Vec<SessionRow> = (0..25)
-            .map(|i| row(&format!("/s/{i}.jsonl"), None, &format!("s{i}"), 100 - i as u128))
+            .map(|i| {
+                row(
+                    &format!("/s/{i}.jsonl"),
+                    None,
+                    &format!("s{i}"),
+                    100 - i as u128,
+                )
+            })
             .collect();
         let mut sel = SessionSelector::new(long);
         let km = SelectKeymap::default();
         let buf = draw(&mut sel, 60, 24);
         let y = find_row(&buf, "(1/25)");
-        assert!(row_text(&buf, y).starts_with("  (1/25)"), "{:?}", row_text(&buf, y));
-        assert_eq!(buf[(2, y)].fg, theme.muted_style().fg.unwrap(), "scroll row is not `muted`");
+        assert!(
+            row_text(&buf, y).starts_with("  (1/25)"),
+            "{:?}",
+            row_text(&buf, y)
+        );
+        assert_eq!(
+            buf[(2, y)].fg,
+            theme.muted_style().fg.unwrap(),
+            "scroll row is not `muted`"
+        );
 
         // It tracks the highlight.
         for _ in 0..6 {
@@ -1698,7 +2045,10 @@ mod tests {
         let mut sel = SessionSelector::new(rows());
         let buf = draw(&mut sel, 60, 20);
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
-        assert!(!text.contains("(1/3)"), "unscrollable list must not report a position");
+        assert!(
+            !text.contains("(1/3)"),
+            "unscrollable list must not report a position"
+        );
     }
 
     // ---- the header's hint rows (`session-selector.ts:155-185`) --------------------------------
@@ -1723,15 +2073,25 @@ mod tests {
         // accident.
         assert_ne!(theme.dim_style().fg, theme.muted_style().fg);
         let y1 = find_row(&buf, "tab scope");
-        assert_eq!(fg_at(&buf, col_of(&buf, y1, "tab"), y1), theme.dim_style().fg, "the key is dim");
+        assert_eq!(
+            fg_at(&buf, col_of(&buf, y1, "tab"), y1),
+            theme.dim_style().fg,
+            "the key is dim"
+        );
         assert_eq!(
             fg_at(&buf, col_of(&buf, y1, "scope"), y1),
             theme.muted_style().fg,
             "its description is muted"
         );
         let y2 = find_row(&buf, "ctrl+s sort");
-        assert_eq!(fg_at(&buf, col_of(&buf, y2, "ctrl+s"), y2), theme.dim_style().fg);
-        assert_eq!(fg_at(&buf, col_of(&buf, y2, "sort"), y2), theme.muted_style().fg);
+        assert_eq!(
+            fg_at(&buf, col_of(&buf, y2, "ctrl+s"), y2),
+            theme.dim_style().fg
+        );
+        assert_eq!(
+            fg_at(&buf, col_of(&buf, y2, "sort"), y2),
+            theme.muted_style().fg
+        );
     }
 
     /// `keyHint("app.session.delete", "delete")` resolves through `getKeybindings().getKeys(...)`
@@ -1744,8 +2104,14 @@ mod tests {
         let mut sel = SessionSelector::new(rows()).with_keymaps(&km, &EditorKeymap::default());
         let buf = draw(&mut sel, 90, 20);
         let text: String = (0..buf.area.height).map(|y| row_text(&buf, y)).collect();
-        assert!(text.contains("ctrl+k delete"), "the hint names the NEW key: {text}");
-        assert!(!text.contains("ctrl+d delete"), "and not the old one: {text}");
+        assert!(
+            text.contains("ctrl+k delete"),
+            "the hint names the NEW key: {text}"
+        );
+        assert!(
+            !text.contains("ctrl+d delete"),
+            "and not the old one: {text}"
+        );
         // The handler moved with it.
         let mut sel = SessionSelector::new(rows()).with_keymaps(&km, &EditorKeymap::default());
         sel.handle(&ctrl('d'), &SelectKeymap::default());
@@ -1761,14 +2127,20 @@ mod tests {
         let mut sel = SessionSelector::new(rows());
         let buf = draw(&mut sel, 100, 20);
         let with: String = (0..buf.area.height).map(|y| row_text(&buf, y)).collect();
-        assert!(with.contains("rename"), "shown by default (`:772` = canRename): {with}");
+        assert!(
+            with.contains("rename"),
+            "shown by default (`:772` = canRename): {with}"
+        );
 
         let mut sel = SessionSelector::new(rows());
         sel.set_show_rename_hint(false);
         let buf = draw(&mut sel, 100, 20);
         let without: String = (0..buf.area.height).map(|y| row_text(&buf, y)).collect();
         assert!(!without.contains("rename"), "gated off: {without}");
-        assert!(without.contains("path (off)"), "the rest of the row survives: {without}");
+        assert!(
+            without.contains("path (off)"),
+            "the rest of the row survives: {without}"
+        );
     }
 
     // ---- the empty state (`session-selector.ts:421-438`) ---------------------------------------
@@ -1786,7 +2158,11 @@ mod tests {
             // produced by the query below and not by an unwired `all` set (SEAM-061).
             sel.set_all_rows(rows());
             sel.set_scope(scope);
-            assert_eq!(sel.visible_len(), 3, "the fixture must be non-empty before the query");
+            assert_eq!(
+                sel.visible_len(),
+                3,
+                "the fixture must be non-empty before the query"
+            );
             if named {
                 sel.handle(&ctrl('n'), &SelectKeymap::default());
             }
@@ -1843,7 +2219,12 @@ mod tests {
     /// A second project's session, absent from the current-folder set and present in the
     /// all-projects one — pi's two loaders (`cli/session-picker.ts:15-19`).
     fn foreign_row() -> SessionRow {
-        row("/other/z.jsonl", Some("Other project"), "z other project work", 9)
+        row(
+            "/other/z.jsonl",
+            Some("Other project"),
+            "z other project work",
+            9,
+        )
     }
 
     fn scoped_selector() -> SessionSelector {
@@ -1855,7 +2236,10 @@ mod tests {
             ("/s/a.jsonl".to_string(), "/home/dev/here".to_string()),
             ("/s/b.jsonl".to_string(), "/home/dev/here".to_string()),
             ("/s/c.jsonl".to_string(), "/home/dev/here".to_string()),
-            ("/other/z.jsonl".to_string(), "/home/dev/elsewhere".to_string()),
+            (
+                "/other/z.jsonl".to_string(),
+                "/home/dev/elsewhere".to_string(),
+            ),
         ]);
         sel
     }
@@ -1875,22 +2259,21 @@ mod tests {
         // Presence before absence: the foreign row exists in the fixture's `all` set.
         assert_eq!(sel.scope(), SessionScope::Current);
         assert_eq!(sel.visible_len(), 3);
-        let current_paths: Vec<String> =
-            sel.filtered().into_iter().map(|n| n.row.path).collect();
+        let current_paths: Vec<String> = sel.filtered().into_iter().map(|n| n.row.path).collect();
         assert!(
             !current_paths.contains(&"/other/z.jsonl".to_string()),
             "the current-folder scope must not list another project: {current_paths:?}"
         );
 
         let out = sel.handle(&key(KeyCode::Tab), &km);
-        assert_eq!(out, SelectorOutcome::Redraw, "`Tab` is handled, not ignored");
+        assert_eq!(
+            out,
+            SelectorOutcome::Redraw,
+            "`Tab` is handled, not ignored"
+        );
         assert_eq!(sel.scope(), SessionScope::All);
         assert_eq!(sel.visible_len(), 4, "the `all` set is on screen");
-        let all_paths: Vec<String> = sel
-            .filtered()
-            .into_iter()
-            .map(|n| n.row.path)
-            .collect();
+        let all_paths: Vec<String> = sel.filtered().into_iter().map(|n| n.row.path).collect();
         assert!(
             all_paths.contains(&"/other/z.jsonl".to_string()),
             "the other project's session is reachable: {all_paths:?}"
@@ -1910,16 +2293,28 @@ mod tests {
         let mut sel = scoped_selector();
         let buf = draw(&mut sel, 100, 24);
         let text: String = (0..buf.area.height).map(|y| row_text(&buf, y)).collect();
-        assert!(text.contains("Build pipeline"), "the current set is on screen: {text}");
-        assert!(!text.contains("/home/dev/here"), "no cwd column in `current`: {text}");
+        assert!(
+            text.contains("Build pipeline"),
+            "the current set is on screen: {text}"
+        );
+        assert!(
+            !text.contains("/home/dev/here"),
+            "no cwd column in `current`: {text}"
+        );
 
         sel.handle(&key(KeyCode::Tab), &SelectKeymap::default());
         let buf = draw(&mut sel, 100, 24);
         let y = find_row(&buf, "Other project");
         let line = row_text(&buf, y);
-        assert!(line.contains("/home/dev/elsewhere"), "foreign row names its cwd: {line:?}");
+        assert!(
+            line.contains("/home/dev/elsewhere"),
+            "foreign row names its cwd: {line:?}"
+        );
         let here = row_text(&buf, find_row(&buf, "Build pipeline"));
-        assert!(here.contains("/home/dev/here"), "local row names its cwd too: {here:?}");
+        assert!(
+            here.contains("/home/dev/here"),
+            "local row names its cwd too: {here:?}"
+        );
         // `:464-473` prepends cwd to the counts column, it does not add a second line per session.
         assert!(
             here.find("/home/dev/here").unwrap() < here.find("3 msgs").unwrap(),
@@ -1934,7 +2329,11 @@ mod tests {
     fn tab_is_swallowed_when_the_host_wired_no_all_set() {
         let mut sel = SessionSelector::new(rows());
         let out = sel.handle(&key(KeyCode::Tab), &SelectKeymap::default());
-        assert_eq!(out, SelectorOutcome::Redraw, "consumed, like upstream's bare `return`");
+        assert_eq!(
+            out,
+            SelectorOutcome::Redraw,
+            "consumed, like upstream's bare `return`"
+        );
         assert_eq!(sel.scope(), SessionScope::Current, "nowhere to switch to");
         assert_eq!(sel.visible_len(), 3, "and the list is untouched");
     }
@@ -1953,7 +2352,11 @@ mod tests {
         assert_eq!(sel.visible_len(), 2, "gone from the current scope");
         sel.handle(&key(KeyCode::Tab), &km);
         let all_paths: Vec<String> = sel.filtered().into_iter().map(|n| n.row.path).collect();
-        assert_eq!(all_paths.len(), 3, "gone from the all scope too: {all_paths:?}");
+        assert_eq!(
+            all_paths.len(),
+            3,
+            "gone from the all scope too: {all_paths:?}"
+        );
         assert!(
             !all_paths.contains(&"/s/a.jsonl".to_string()),
             "the deleted session must not come back on `Tab`: {all_paths:?}"
@@ -1991,19 +2394,25 @@ mod tests {
         editor.set_action(EditorAction::Tab, vec![Key::ctrl('t')]);
         let mut all = rows();
         all.push(foreign_row());
-        let mut sel = SessionSelector::new(rows())
-            .with_keymaps(&SessionKeymap::default(), &editor);
+        let mut sel = SessionSelector::new(rows()).with_keymaps(&SessionKeymap::default(), &editor);
         sel.set_all_rows(all);
 
         let buf = draw(&mut sel, 100, 24);
         let text: String = (0..buf.area.height).map(|y| row_text(&buf, y)).collect();
-        assert!(text.contains("ctrl+t scope"), "the hint names the NEW key: {text}");
+        assert!(
+            text.contains("ctrl+t scope"),
+            "the hint names the NEW key: {text}"
+        );
         assert!(!text.contains("tab scope"), "and not the stock one: {text}");
 
         // The stock key is dead...
         let km = SelectKeymap::default();
         sel.handle(&key(KeyCode::Tab), &km);
-        assert_eq!(sel.scope(), SessionScope::Current, "`tab` is no longer bound");
+        assert_eq!(
+            sel.scope(),
+            SessionScope::Current,
+            "`tab` is no longer bound"
+        );
         // ...and the rebound one drives the toggle.
         sel.handle(&ctrl('t'), &km);
         assert_eq!(sel.scope(), SessionScope::All);
@@ -2019,12 +2428,14 @@ mod tests {
         km.set_action(SessionAction::Delete, vec![Key::parse("tab").unwrap()]);
         let mut all = rows();
         all.push(foreign_row());
-        let mut sel =
-            SessionSelector::new(rows()).with_keymaps(&km, &EditorKeymap::default());
+        let mut sel = SessionSelector::new(rows()).with_keymaps(&km, &EditorKeymap::default());
         sel.set_all_rows(all);
         sel.handle(&key(KeyCode::Tab), &SelectKeymap::default());
         assert_eq!(sel.scope(), SessionScope::All, "the scope toggle wins");
-        assert!(!sel.is_confirming_delete(), "the rebound delete does not fire");
+        assert!(
+            !sel.is_confirming_delete(),
+            "the rebound delete does not fire"
+        );
     }
 
     /// `:158-161` — the confirmation replaces hint row 1 and sets `hintLine2 = ""`, so the row is
@@ -2035,7 +2446,11 @@ mod tests {
         let mut sel = SessionSelector::new(rows());
         let before = sel.desired_height(90);
         sel.handle(&ctrl('d'), &SelectKeymap::default());
-        assert_eq!(sel.desired_height(90), before, "the header stays three rows tall");
+        assert_eq!(
+            sel.desired_height(90),
+            before,
+            "the header stays three rows tall"
+        );
         let buf = draw(&mut sel, 90, 20);
         let y = find_row(&buf, "Delete session?");
         assert!(
@@ -2043,8 +2458,18 @@ mod tests {
             "{:?}",
             row_text(&buf, y)
         );
-        assert_eq!(row_text(&buf, y + 1).trim_end(), "", "hintLine2 = \"\" (:161)");
-        assert!(row_text(&buf, y + 2).trim_end().is_empty(), "then Spacer(:742)");
-        assert!(row_text(&buf, y + 3).starts_with('>'), "then the search Input (:418)");
+        assert_eq!(
+            row_text(&buf, y + 1).trim_end(),
+            "",
+            "hintLine2 = \"\" (:161)"
+        );
+        assert!(
+            row_text(&buf, y + 2).trim_end().is_empty(),
+            "then Spacer(:742)"
+        );
+        assert!(
+            row_text(&buf, y + 3).starts_with('>'),
+            "then the search Input (:418)"
+        );
     }
 }

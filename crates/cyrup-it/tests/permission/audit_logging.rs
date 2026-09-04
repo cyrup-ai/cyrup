@@ -20,7 +20,12 @@
 //! - v0.8.0 `logging.ts:90-93` — ONLY the `debug` stream is gated on `config.debug`; `review`
 //!   (`:98-100`) is a bare `writeLine`. v0.7.1 gated both (`:97-100`), which is the gap tests
 //!   (2)/(2b) pin.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -28,7 +33,7 @@ use std::sync::Arc;
 use cyrup_core::ToolCallId;
 use cyrup_ext::{ExtMode, HookOutcome, HostCtx, HostEvent, HostServices, InitApi, NativeExtension};
 use cyrup_permission_system::PermissionSystemExtension;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// A scripted [`HostServices`] whose ONLY override is the full tool registry — otherwise the
 /// registry / unknown-tool layer (pi `index.ts:2218-2228`) blocks before any permission check is
@@ -61,22 +66,35 @@ fn trail_path(agent_dir: &Path) -> PathBuf {
 /// Every JSONL entry in the trail, parsed. Empty when the file was never created.
 fn trail(agent_dir: &Path) -> Vec<Value> {
     let text = std::fs::read_to_string(trail_path(agent_dir)).unwrap_or_default();
-    text.lines().map(|line| serde_json::from_str::<Value>(line).unwrap()).collect()
+    text.lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect()
 }
 
 fn find_event<'a>(entries: &'a [Value], event: &str) -> Option<&'a Value> {
-    entries.iter().find(|e| e["event"] == Value::String(event.to_string()))
+    entries
+        .iter()
+        .find(|e| e["event"] == Value::String(event.to_string()))
 }
 
 /// Build an installed extension over `agent_dir` with `global` as its global policy and `debug` as
 /// the `config.json` toggle. The config is written BEFORE construction because
 /// `PermissionSystemExtension::new` loads it eagerly (pi `loadPermissionSystemConfig` at module
 /// init, `index.ts:1605`).
-async fn ext_with(agent_dir: &Path, global: &str, debug: bool, registry: &[&str]) -> PermissionSystemExtension {
+async fn ext_with(
+    agent_dir: &Path,
+    global: &str,
+    debug: bool,
+    registry: &[&str],
+) -> PermissionSystemExtension {
     write(&agent_dir.join("cyrup-permissions.jsonc"), global);
     write(
-        &agent_dir.join("cyrup-permission-system").join("config.json"),
-        &format!("{{\n  \"debug\": {debug},\n  \"yoloMode\": false,\n  \"forwardedPromptTimeoutSeconds\": 30\n}}\n"),
+        &agent_dir
+            .join("cyrup-permission-system")
+            .join("config.json"),
+        &format!(
+            "{{\n  \"debug\": {debug},\n  \"yoloMode\": false,\n  \"forwardedPromptTimeoutSeconds\": 30\n}}\n"
+        ),
     );
     let ext = PermissionSystemExtension::new(agent_dir.to_path_buf(), agent_dir.to_path_buf());
     ext.set_host_services(Arc::new(RegistryServices {
@@ -93,7 +111,11 @@ fn ctx(cwd: &Path) -> HostCtx {
 }
 
 fn tool_call(name: &str, input: Value) -> HostEvent {
-    HostEvent::ToolCall { call_id: ToolCallId::from("call-1"), name: name.to_string(), input }
+    HostEvent::ToolCall {
+        call_id: ToolCallId::from("call-1"),
+        name: name.to_string(),
+        input,
+    }
 }
 
 // ================================================================================================
@@ -106,31 +128,61 @@ async fn policy_denied_tool_call_writes_a_review_entry_when_debug_is_on() {
     let agent_dir = dir.path();
     let ext = ext_with(agent_dir, r#"{ "bash": { "*": "deny" } }"#, true, &["bash"]).await;
 
-    let outcome =
-        ext.on_event(&tool_call("bash", json!({ "command": "rm -rf /" })), &ctx(agent_dir)).await;
-    assert!(matches!(outcome, HookOutcome::Block { .. }), "the deny rule must block: {outcome:?}");
+    let outcome = ext
+        .on_event(
+            &tool_call("bash", json!({ "command": "rm -rf /" })),
+            &ctx(agent_dir),
+        )
+        .await;
+    assert!(
+        matches!(outcome, HookOutcome::Block { .. }),
+        "the deny rule must block: {outcome:?}"
+    );
 
     let entries = trail(agent_dir);
-    assert!(!entries.is_empty(), "`\"debug\": true` must produce the audit trail at {:?}", trail_path(agent_dir));
+    assert!(
+        !entries.is_empty(),
+        "`\"debug\": true` must produce the audit trail at {:?}",
+        trail_path(agent_dir)
+    );
 
     let blocked = find_event(&entries, "permission_request.blocked")
         .expect("a policy-denied tool call must be audited (pi `index.ts:2422-2439`)");
     // pi `logging.ts:71-77` — the fixed record shape.
     assert_eq!(blocked["extension"], json!("cyrup-permission-system"));
-    assert_eq!(blocked["stream"], json!("review"), "a decision belongs to the security-review stream");
+    assert_eq!(
+        blocked["stream"],
+        json!("review"),
+        "a decision belongs to the security-review stream"
+    );
     // pi `index.ts:2424-2438` — the decision detail fields.
     assert_eq!(blocked["source"], json!("tool_call"));
     assert_eq!(blocked["resolution"], json!("policy_denied"));
     assert_eq!(blocked["toolName"], json!("bash"));
     assert_eq!(blocked["toolCallId"], json!("call-1"));
-    assert_eq!(blocked["command"], json!("rm -rf /"), "the gated command must be recoverable");
+    assert_eq!(
+        blocked["command"],
+        json!("rm -rf /"),
+        "the gated command must be recoverable"
+    );
     assert_eq!(blocked["decisionPersistence"], json!("none"));
-    assert_eq!(blocked["decisionScope"], json!("rm -rf /"), "pi `getPermissionDecisionScope`");
+    assert_eq!(
+        blocked["decisionScope"],
+        json!("rm -rf /"),
+        "pi `getPermissionDecisionScope`"
+    );
     // pi `createSensitiveLogMetadata` (`index.ts:682-692`) — the digest accompanying the plaintext.
     assert_eq!(blocked["commandMetadata"]["present"], json!(true));
-    assert!(blocked["commandMetadata"]["sha256"].as_str().is_some_and(|h| h.len() == 64));
+    assert!(
+        blocked["commandMetadata"]["sha256"]
+            .as_str()
+            .is_some_and(|h| h.len() == 64)
+    );
     let ts = blocked["timestamp"].as_str().unwrap();
-    assert!(ts.ends_with('Z'), "pi `new Date().toISOString()` shape, got {ts}");
+    assert!(
+        ts.ends_with('Z'),
+        "pi `new Date().toISOString()` shape, got {ts}"
+    );
 }
 
 // ================================================================================================
@@ -147,11 +199,24 @@ async fn policy_denied_tool_call_writes_a_review_entry_when_debug_is_on() {
 async fn debug_off_still_writes_the_review_trail_for_a_denied_call() {
     let dir = tempfile::tempdir().unwrap();
     let agent_dir = dir.path();
-    let ext = ext_with(agent_dir, r#"{ "bash": { "*": "deny" } }"#, false, &["bash"]).await;
+    let ext = ext_with(
+        agent_dir,
+        r#"{ "bash": { "*": "deny" } }"#,
+        false,
+        &["bash"],
+    )
+    .await;
 
-    let outcome =
-        ext.on_event(&tool_call("bash", json!({ "command": "rm -rf /" })), &ctx(agent_dir)).await;
-    assert!(matches!(outcome, HookOutcome::Block { .. }), "the deny rule must still block");
+    let outcome = ext
+        .on_event(
+            &tool_call("bash", json!({ "command": "rm -rf /" })),
+            &ctx(agent_dir),
+        )
+        .await;
+    assert!(
+        matches!(outcome, HookOutcome::Block { .. }),
+        "the deny rule must still block"
+    );
 
     let entries = trail(agent_dir);
     assert!(
@@ -178,12 +243,29 @@ async fn debug_off_still_writes_the_review_trail_for_a_denied_call() {
 async fn debug_off_keeps_the_diagnostic_stream_silent_while_the_review_stream_writes() {
     let dir = tempfile::tempdir().unwrap();
     let agent_dir = dir.path();
-    let ext = ext_with(agent_dir, r#"{ "bash": { "*": "deny" } }"#, false, &["bash"]).await;
+    let ext = ext_with(
+        agent_dir,
+        r#"{ "bash": { "*": "deny" } }"#,
+        false,
+        &["bash"],
+    )
+    .await;
 
     let _ = ext
-        .on_event(&HostEvent::SessionStart { reason: "startup".to_string(), previous_session_file: None }, &ctx(agent_dir))
+        .on_event(
+            &HostEvent::SessionStart {
+                reason: "startup".to_string(),
+                previous_session_file: None,
+            },
+            &ctx(agent_dir),
+        )
         .await;
-    let _ = ext.on_event(&tool_call("bash", json!({ "command": "rm -rf /" })), &ctx(agent_dir)).await;
+    let _ = ext
+        .on_event(
+            &tool_call("bash", json!({ "command": "rm -rf /" })),
+            &ctx(agent_dir),
+        )
+        .await;
 
     let entries = trail(agent_dir);
     assert!(
@@ -212,9 +294,20 @@ async fn debug_on_writes_both_streams() {
     let ext = ext_with(agent_dir, r#"{ "bash": { "*": "deny" } }"#, true, &["bash"]).await;
 
     let _ = ext
-        .on_event(&HostEvent::SessionStart { reason: "startup".to_string(), previous_session_file: None }, &ctx(agent_dir))
+        .on_event(
+            &HostEvent::SessionStart {
+                reason: "startup".to_string(),
+                previous_session_file: None,
+            },
+            &ctx(agent_dir),
+        )
         .await;
-    let _ = ext.on_event(&tool_call("bash", json!({ "command": "rm -rf /" })), &ctx(agent_dir)).await;
+    let _ = ext
+        .on_event(
+            &tool_call("bash", json!({ "command": "rm -rf /" })),
+            &ctx(agent_dir),
+        )
+        .await;
 
     let entries = trail(agent_dir);
     let loaded = find_event(&entries, "config.loaded")
@@ -234,8 +327,16 @@ async fn ask_with_no_reachable_human_is_audited_as_confirmation_unavailable() {
     // `ask` + a headless ctx (`has_ui == false`, no subagent hint, no yolo) ⇒ fail-CLOSED.
     let ext = ext_with(agent_dir, r#"{ "bash": { "*": "ask" } }"#, true, &["bash"]).await;
 
-    let outcome = ext.on_event(&tool_call("bash", json!({ "command": "ls" })), &ctx(agent_dir)).await;
-    assert!(matches!(outcome, HookOutcome::Block { .. }), "a fail-closed ask must block");
+    let outcome = ext
+        .on_event(
+            &tool_call("bash", json!({ "command": "ls" })),
+            &ctx(agent_dir),
+        )
+        .await;
+    assert!(
+        matches!(outcome, HookOutcome::Block { .. }),
+        "a fail-closed ask must block"
+    );
 
     let entries = trail(agent_dir);
     let blocked = find_event(&entries, "permission_request.blocked")
@@ -268,7 +369,12 @@ async fn successive_decisions_append_to_one_trail() {
     let ext = ext_with(agent_dir, r#"{ "bash": { "*": "deny" } }"#, true, &["bash"]).await;
 
     for command in ["one", "two", "three"] {
-        let _ = ext.on_event(&tool_call("bash", json!({ "command": command })), &ctx(agent_dir)).await;
+        let _ = ext
+            .on_event(
+                &tool_call("bash", json!({ "command": command })),
+                &ctx(agent_dir),
+            )
+            .await;
     }
 
     let commands: Vec<String> = trail(agent_dir)
@@ -276,5 +382,9 @@ async fn successive_decisions_append_to_one_trail() {
         .filter(|e| e["event"] == json!("permission_request.blocked"))
         .filter_map(|e| e["command"].as_str().map(str::to_string))
         .collect();
-    assert_eq!(commands, vec!["one", "two", "three"], "every gated call must leave its own line");
+    assert_eq!(
+        commands,
+        vec!["one", "two", "three"],
+        "every gated call must leave its own line"
+    );
 }

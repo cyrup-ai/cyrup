@@ -35,7 +35,9 @@ fn collect_abi_files(path: &std::path::Path, out: &mut Vec<std::path::PathBuf>) 
         out.push(path.to_path_buf());
         return;
     }
-    let Ok(entries) = std::fs::read_dir(path) else { return };
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return;
+    };
     for entry in entries.flatten() {
         collect_abi_files(&entry.path(), out);
     }
@@ -52,7 +54,9 @@ pub fn hash_abi_sources(crates_dir: &std::path::Path) -> String {
         let rel = rel.to_string_lossy().replace('\\', "/");
         hasher.update(rel.as_bytes());
         hasher.update(b"\x00");
-        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
         hasher.update(&(bytes.len() as u64).to_le_bytes());
         hasher.update(&bytes);
     }

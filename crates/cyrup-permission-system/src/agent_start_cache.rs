@@ -60,10 +60,20 @@ pub struct PromptStateKeyInput<'a> {
 pub fn create_prompt_state_key(input: &PromptStateKeyInput<'_>) -> String {
     // pi `normalizeAgentName(input.agentName) ?? ""` — `normalizeAgentName` IS `getNonEmptyString`
     // (`common.ts:29-31`), i.e. trim then drop-if-empty.
-    let agent = input.agent_name.map(str::trim).filter(|s| !s.is_empty()).unwrap_or("");
+    let agent = input
+        .agent_name
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("");
     let tools_key = create_active_tools_cache_key(input.allowed_tool_names);
     let prompt = normalize_line_endings(input.system_prompt);
-    create_cache_key(&[agent, input.cwd, input.permission_stamp, &tools_key, &prompt])
+    create_cache_key(&[
+        agent,
+        input.cwd,
+        input.permission_stamp,
+        &tools_key,
+        &prompt,
+    ])
 }
 
 /// pi `shouldApplyCachedAgentStartState(previousKey, nextKey)`
@@ -107,8 +117,14 @@ mod tests {
     fn active_tools_key_is_order_sensitive_and_injective() {
         let a = create_active_tools_cache_key(&["read".into(), "write".into()]);
         let b = create_active_tools_cache_key(&["write".into(), "read".into()]);
-        assert_ne!(a, b, "pi keys on the ARRAY, so order is part of the identity");
-        assert_eq!(a, r#"["read","write"]"#, "pi `JSON.stringify(allowedToolNames)`");
+        assert_ne!(
+            a, b,
+            "pi keys on the ARRAY, so order is part of the identity"
+        );
+        assert_eq!(
+            a, r#"["read","write"]"#,
+            "pi `JSON.stringify(allowedToolNames)`"
+        );
         // No element can impersonate the delimiter: `["a,b"]` must not equal `["a","b"]`.
         assert_ne!(
             create_active_tools_cache_key(&["read,write".into()]),
@@ -128,8 +144,14 @@ mod tests {
             system_prompt: "p",
             allowed_tool_names: &tools,
         };
-        let bumped = PromptStateKeyInput { permission_stamp: "2", ..base_clone(&base) };
-        assert_ne!(create_prompt_state_key(&base), create_prompt_state_key(&bumped));
+        let bumped = PromptStateKeyInput {
+            permission_stamp: "2",
+            ..base_clone(&base)
+        };
+        assert_ne!(
+            create_prompt_state_key(&base),
+            create_prompt_state_key(&bumped)
+        );
     }
 
     fn base_clone<'a>(i: &PromptStateKeyInput<'a>) -> PromptStateKeyInput<'a> {
@@ -164,9 +186,18 @@ mod tests {
         assert_eq!(create_prompt_state_key(&crlf), create_prompt_state_key(&lf));
 
         // A blank agent name is `""`, not the literal spaces (pi `?? ""` over `getNonEmptyString`).
-        let blank = PromptStateKeyInput { agent_name: Some("   "), ..base_clone(&lf) };
-        let none = PromptStateKeyInput { agent_name: None, ..base_clone(&lf) };
-        assert_eq!(create_prompt_state_key(&blank), create_prompt_state_key(&none));
+        let blank = PromptStateKeyInput {
+            agent_name: Some("   "),
+            ..base_clone(&lf)
+        };
+        let none = PromptStateKeyInput {
+            agent_name: None,
+            ..base_clone(&lf)
+        };
+        assert_eq!(
+            create_prompt_state_key(&blank),
+            create_prompt_state_key(&none)
+        );
     }
 
     #[test]

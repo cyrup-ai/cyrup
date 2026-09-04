@@ -33,8 +33,10 @@ const SKILLS_PREAMBLE: &str = "The following skills provide specialized instruct
 pub(crate) fn emit_skills_section(out: &mut String, skills: &[SkillPointer]) {
     // Pi `const visibleSkills = skills.filter((s) => !s.disableModelInvocation);` then
     // `if (visibleSkills.length === 0) return "";` (skills.ts:335-339).
-    let visible: Vec<&SkillPointer> =
-        skills.iter().filter(|s| !s.disable_model_invocation).collect();
+    let visible: Vec<&SkillPointer> = skills
+        .iter()
+        .filter(|s| !s.disable_model_invocation)
+        .collect();
     if visible.is_empty() {
         return;
     }

@@ -4,7 +4,12 @@
 //!
 //! The binary spawns that check (`cyrup::update_check::spawn_package_update_check`), hands the
 //! receiver to `App::set_package_update_channel`, and `App::run`'s arm calls the method under test.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use crate::{App, UiTheme};
 use ratatui::backend::TestBackend;
@@ -36,7 +41,10 @@ fn the_notice_lists_the_packages_and_the_update_command() {
     app.draw().unwrap();
 
     let text = all_text(&app);
-    assert!(text.contains("Package Updates Available"), "no notification title:\n{text}");
+    assert!(
+        text.contains("Package Updates Available"),
+        "no notification title:\n{text}"
+    );
     assert!(
         text.contains("cyrup update --extensions"),
         "the notice does not name the command that acts on it:\n{text}"

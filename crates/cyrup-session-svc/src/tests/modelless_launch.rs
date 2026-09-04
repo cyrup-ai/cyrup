@@ -27,16 +27,21 @@
 //! empty catalog, `model()` is `None`, the fallback message is pi's exact text, and the first turn
 //! attempted without a model answers `formatNoModelSelectedMessage()`
 //! (`agent-session.ts:1178-1180`) instead of killing anything.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::{ProviderResolver, SessionBuilder, SessionConfig, SessionServiceError};
 use cyrup_config::AuthStore;
 use cyrup_core::{ModelThinkingLevel, ProviderId};
 use cyrup_provider::unconfigured::UnconfiguredProvider;
 use cyrup_provider::{CreateModelsOptions, Provider};
-use crate::{ProviderResolver, SessionBuilder, SessionConfig, SessionServiceError};
 use tempfile::TempDir;
 
 /// Resolves a provider id to the real built-in provider, as the bin's `select_provider` does —
@@ -68,7 +73,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -94,7 +103,10 @@ async fn empty_catalog_builds_a_modelless_session_with_the_no_models_banner() {
         .await
         .expect("an empty catalog must NOT be fatal — pi launches interactive modelless");
 
-    assert!(session.model().is_none(), "pi `session.model` is undefined with nothing configured");
+    assert!(
+        session.model().is_none(),
+        "pi `session.model` is undefined with nothing configured"
+    );
     assert!(
         session.services().model.is_none(),
         "the resolved catalog `Model` is absent too (pi `AgentSession.model: Model | undefined`)"
@@ -119,10 +131,16 @@ async fn empty_catalog_builds_a_modelless_session_with_the_no_models_banner() {
 #[tokio::test]
 async fn modelless_session_reports_off_thinking_and_the_full_level_ladder() {
     let fx = fixture();
-    let session = SessionBuilder::new(unconfigured(), base_config(&fx)).build().await.unwrap();
+    let session = SessionBuilder::new(unconfigured(), base_config(&fx))
+        .build()
+        .await
+        .unwrap();
 
     assert_eq!(session.thinking_level().await, ModelThinkingLevel::Off);
-    assert!(!session.supports_thinking(), "pi `!!this.model?.reasoning` is false with no model");
+    assert!(
+        !session.supports_thinking(),
+        "pi `!!this.model?.reasoning` is false with no model"
+    );
     assert_eq!(
         session.available_thinking_levels(),
         vec![
@@ -140,7 +158,10 @@ async fn modelless_session_reports_off_thinking_and_the_full_level_ladder() {
     // Setting a level cannot escape `off` while there is nothing to clamp against
     // (pi `_clampThinkingLevel`, agent-session.ts:1608-1610).
     assert_eq!(
-        session.set_thinking_level(ModelThinkingLevel::High).await.unwrap(),
+        session
+            .set_thinking_level(ModelThinkingLevel::High)
+            .await
+            .unwrap(),
         ModelThinkingLevel::Off
     );
 }
@@ -151,7 +172,10 @@ async fn modelless_session_reports_off_thinking_and_the_full_level_ladder() {
 #[tokio::test]
 async fn prompting_a_modelless_session_returns_pi_no_model_selected() {
     let fx = fixture();
-    let session = SessionBuilder::new(unconfigured(), base_config(&fx)).build().await.unwrap();
+    let session = SessionBuilder::new(unconfigured(), base_config(&fx))
+        .build()
+        .await
+        .unwrap();
 
     let Err(err) = session.prompt("hello").await else {
         panic!("a modelless prompt must not be accepted");
@@ -176,7 +200,10 @@ async fn prompting_a_modelless_session_returns_pi_no_model_selected() {
 #[tokio::test]
 async fn modelless_session_seeds_no_model_change_entry() {
     let fx = fixture();
-    let session = SessionBuilder::new(unconfigured(), base_config(&fx)).build().await.unwrap();
+    let session = SessionBuilder::new(unconfigured(), base_config(&fx))
+        .build()
+        .await
+        .unwrap();
 
     let kinds: Vec<String> = session
         .entries_json()
@@ -209,7 +236,10 @@ async fn selecting_a_model_promotes_a_modelless_session() {
         .build()
         .await
         .unwrap();
-    assert!(session.model().is_none(), "the session still launched modelless");
+    assert!(
+        session.model().is_none(),
+        "the session still launched modelless"
+    );
 
     // The model the user picks in `/model`, resolved out of the catalog that `/login` just made
     // reachable (`available_model_catalog` = pi `modelRuntime.getAvailable()`).
@@ -241,8 +271,14 @@ async fn selecting_a_model_promotes_a_modelless_session() {
 #[tokio::test]
 async fn modelless_session_agent_baseline_is_none_not_a_sentinel() {
     let fx = fixture();
-    let session = SessionBuilder::new(unconfigured(), base_config(&fx)).build().await.unwrap();
+    let session = SessionBuilder::new(unconfigured(), base_config(&fx))
+        .build()
+        .await
+        .unwrap();
     assert!(session.model().is_none());
     let (model, _thinking) = session.next_turn_model_baseline().await;
-    assert!(model.is_none(), "no sentinel ModelRef may stand in for a missing model");
+    assert!(
+        model.is_none(),
+        "no sentinel ModelRef may stand in for a missing model"
+    );
 }

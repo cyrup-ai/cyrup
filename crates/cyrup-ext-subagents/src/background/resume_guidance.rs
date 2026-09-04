@@ -121,13 +121,22 @@ pub fn format_resume_first_failed_runs_note(runs: &[RunStatus]) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::background::{RunId, RunMode, StepStatus};
     use std::path::PathBuf;
 
-    fn run_with(state: RunState, steps: Vec<StepStatus>, session_file: Option<PathBuf>) -> RunStatus {
+    fn run_with(
+        state: RunState,
+        steps: Vec<StepStatus>,
+        session_file: Option<PathBuf>,
+    ) -> RunStatus {
         let mut status = RunStatus::queued(RunId::from_token("run-1"), RunMode::Single, None);
         status.state = state;
         status.steps = steps;
@@ -232,7 +241,10 @@ mod tests {
     fn a_recorded_but_missing_session_file_yields_no_command() {
         let run = run_with(
             RunState::Failed,
-            vec![step(StepState::Failed, Some(PathBuf::from("/nonexistent/child.jsonl")))],
+            vec![step(
+                StepState::Failed,
+                Some(PathBuf::from("/nonexistent/child.jsonl")),
+            )],
             None,
         );
         assert_eq!(format_async_revive_command(&run), None);
@@ -274,7 +286,10 @@ mod tests {
              launching a replacement. Launch a replacement only if revive fails or the user \
              explicitly asks for one."
         );
-        assert!(note.starts_with(' '), "pi's own leading space is load-bearing");
+        assert!(
+            note.starts_with(' '),
+            "pi's own leading space is load-bearing"
+        );
     }
 
     /// pi `resume-guidance.ts:29-31` — the plural branch names the COUNT and stops naming a

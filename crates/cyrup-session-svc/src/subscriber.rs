@@ -14,10 +14,10 @@ use cyrup_agent::{AgentEvent, AgentMessage, EventSubscriber};
 use cyrup_core::{CancelToken, EventStream};
 use cyrup_ext::ExtensionHost;
 use cyrup_session::manager::SessionManager;
-use tokio::sync::{mpsc, Mutex as AsyncMutex};
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::event::{agent_message_to_core, core_message_to_agent, AgentSessionEvent};
+use crate::event::{AgentSessionEvent, agent_message_to_core, core_message_to_agent};
 use crate::session::SessionHandle;
 
 const CHANNEL_CAPACITY: usize = 1024;
@@ -87,7 +87,8 @@ impl Fanout {
     /// terminal `SessionReplaced` so consumers re-subscribe against the new generation, then drop
     /// every sender (both run-scoped and persistent) so the streams end.
     pub(crate) async fn invalidate(&self, generation: u64) {
-        self.emit(AgentSessionEvent::SessionReplaced { generation }).await;
+        self.emit(AgentSessionEvent::SessionReplaced { generation })
+            .await;
         lock(&self.run_scoped).clear();
         lock(&self.persistent).clear();
     }
@@ -117,7 +118,13 @@ impl SvcSubscriber {
         ext_host: Arc<ExtensionHost>,
         session_cancel: CancelToken,
     ) -> Self {
-        Self { fanout, manager, handle, ext_host, session_cancel }
+        Self {
+            fanout,
+            manager,
+            handle,
+            ext_host,
+            session_cancel,
+        }
     }
 }
 
@@ -169,7 +176,13 @@ impl EventSubscriber for SvcSubscriber {
             if let Some(core) = effective {
                 // Append the finalized (possibly guest-replaced) message to the session tree.
                 let _ = self.manager.lock().await.append_message(core);
-            } else if let AgentMessage::Custom { kind, payload, details, .. } = message {
+            } else if let AgentMessage::Custom {
+                kind,
+                payload,
+                details,
+                ..
+            } = message
+            {
                 // Custom messages (a `trigger_turn` run input, or one queued via
                 // `send_custom_message` deliver_as steer/followUp and pulled mid-run) finalize as a
                 // `message_end` here. Pi persists them as a CustomMessageEntry
@@ -177,11 +190,12 @@ impl EventSubscriber for SvcSubscriber {
                 // silently dropped by the `Custom -> None` core mapping. `details` now rides on the
                 // message, so the persisted entry matches the live one; `display` still follows the
                 // bash-message convention (`true`), which is what every injector passes.
-                let _ = self
-                    .manager
-                    .lock()
-                    .await
-                    .append_custom_message(kind, payload.clone(), true, details.clone());
+                let _ = self.manager.lock().await.append_custom_message(
+                    kind,
+                    payload.clone(),
+                    true,
+                    details.clone(),
+                );
             }
             // `_handleAgentEvent` tail (Pi :562-577): track the last assistant + reset retry/overflow.
             if let (Some(s), AgentMessage::Assistant(a)) = (&session, message) {

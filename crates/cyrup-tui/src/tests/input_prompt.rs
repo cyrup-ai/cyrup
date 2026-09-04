@@ -22,16 +22,21 @@
 //! (U+258F occurs in no pi TUI source at all), an accent `" > "` in `session_selector.rs` and
 //! `login_dialog.rs`, and NO prompt at all in `tree_selector.rs`'s rename box — each one column
 //! further right than upstream, and each coloured.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::{
-    LoginDialog, ModelEntry, ModelSelector, SelectKeymap, Selector, SelectorOutcome, SessionRow,
-    SessionSelector, TreeNode, TreeSelector, UiTheme, INPUT_PROMPT,
+    INPUT_PROMPT, LoginDialog, ModelEntry, ModelSelector, SelectKeymap, Selector, SelectorOutcome,
+    SessionRow, SessionSelector, TreeNode, TreeSelector, UiTheme,
 };
+use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
-use ratatui::Terminal;
 
 fn ch(c: char) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
@@ -41,7 +46,9 @@ fn ch(c: char) -> KeyEvent {
 fn rows_of(sel: &mut dyn Selector, width: u16) -> Vec<String> {
     let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
     let theme = UiTheme::dark();
-    terminal.draw(|f| sel.render(f, Rect::new(0, 0, width, 24), &theme)).unwrap();
+    terminal
+        .draw(|f| sel.render(f, Rect::new(0, 0, width, 24), &theme))
+        .unwrap();
     let buf = terminal.backend().buffer();
     (0..buf.area.height)
         .map(|y| {
@@ -60,12 +67,20 @@ fn prompt_row(rows: &[String], expected_prefix: &str) -> (usize, String) {
         .enumerate()
         .find(|(_, r)| r.starts_with(expected_prefix))
         .map(|(i, r)| (i, r.clone()))
-        .unwrap_or_else(|| panic!("no row starts with {expected_prefix:?}:\n{}", rows.join("\n")))
+        .unwrap_or_else(|| {
+            panic!(
+                "no row starts with {expected_prefix:?}:\n{}",
+                rows.join("\n")
+            )
+        })
 }
 
 #[test]
 fn the_prompt_constant_is_exactly_pis_two_column_marker() {
-    assert_eq!(INPUT_PROMPT, "> ", "`input.ts:380` `const prompt = \"> \";`");
+    assert_eq!(
+        INPUT_PROMPT, "> ",
+        "`input.ts:380` `const prompt = \"> \";`"
+    );
 }
 
 /// `/model` — `model-selector.ts:118`. cyrup drew accent `" ▏"…"▏"` bars around the value.
@@ -81,9 +96,15 @@ fn model_selector_search_box_uses_the_shared_prompt() {
     sel.handle(&ch('o'), &SelectKeymap::default());
     let rows = rows_of(&mut sel, 70);
     let (_, row) = prompt_row(&rows, "> ");
-    assert!(row.starts_with("> o"), "prompt at column 0, then the query: {row:?}");
+    assert!(
+        row.starts_with("> o"),
+        "prompt at column 0, then the query: {row:?}"
+    );
     let joined = rows.join("\n");
-    assert!(!joined.contains('\u{258f}'), "U+258F appears in no pi TUI source:\n{joined}");
+    assert!(
+        !joined.contains('\u{258f}'),
+        "U+258F appears in no pi TUI source:\n{joined}"
+    );
 }
 
 /// `/resume` — `session-selector.ts:418` splices `Input.render`'s own lines in unmodified. cyrup
@@ -101,7 +122,10 @@ fn session_selector_search_box_uses_the_shared_prompt() {
     sel.handle(&ch('b'), &SelectKeymap::default());
     let rows = rows_of(&mut sel, 70);
     let (_, row) = prompt_row(&rows, "> ");
-    assert!(row.starts_with("> b"), "prompt at column 0, then the query: {row:?}");
+    assert!(
+        row.starts_with("> b"),
+        "prompt at column 0, then the query: {row:?}"
+    );
 }
 
 /// `/tree`'s rename box — `LabelInput.render` (`tree-selector.ts:1297-1310`) is the one place
@@ -115,11 +139,17 @@ fn tree_rename_box_indents_then_uses_the_shared_prompt() {
     // editor; a bare letter would be swallowed by the tree's text search instead
     // (`tree-selector.ts:1093-1100`).
     let shift_l = KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT);
-    assert_eq!(sel.handle(&shift_l, &SelectKeymap::default()), SelectorOutcome::Redraw);
+    assert_eq!(
+        sel.handle(&shift_l, &SelectKeymap::default()),
+        SelectorOutcome::Redraw
+    );
     sel.handle(&ch('x'), &SelectKeymap::default());
     let rows = rows_of(&mut sel, 80);
     let (_, row) = prompt_row(&rows, "  > ");
-    assert!(row.starts_with("  > x"), "`indent` + prompt + value (`:1299,1302`): {row:?}");
+    assert!(
+        row.starts_with("  > x"),
+        "`indent` + prompt + value (`:1299,1302`): {row:?}"
+    );
 }
 
 /// The prompt carries no colour of its own — `Input.render` never calls `theme.fg` (`input.ts:
@@ -135,12 +165,18 @@ fn the_prompt_is_unstyled() {
     }]);
     let theme = UiTheme::dark();
     let mut terminal = Terminal::new(TestBackend::new(70, 24)).unwrap();
-    terminal.draw(|f| sel.render(f, Rect::new(0, 0, 70, 24), &theme)).unwrap();
+    terminal
+        .draw(|f| sel.render(f, Rect::new(0, 0, 70, 24), &theme))
+        .unwrap();
     let buf = terminal.backend().buffer();
     let y = (0..buf.area.height)
         .find(|y| buf.cell((0, *y)).unwrap().symbol() == ">")
         .expect("prompt row");
-    assert_eq!(buf.cell((0, y)).unwrap().fg, theme.base_style().fg.unwrap(), "`>` is unstyled");
+    assert_eq!(
+        buf.cell((0, y)).unwrap().fg,
+        theme.base_style().fg.unwrap(),
+        "`>` is unstyled"
+    );
     assert_ne!(
         theme.base_style().fg,
         theme.accent_style().fg,
@@ -161,19 +197,30 @@ fn login_dialog_input_uses_the_shared_prompt_unstyled() {
     }
     let theme = UiTheme::dark();
     let mut terminal = Terminal::new(TestBackend::new(70, 24)).unwrap();
-    terminal.draw(|f| dialog.render(f, Rect::new(0, 0, 70, 24), &theme)).unwrap();
+    terminal
+        .draw(|f| dialog.render(f, Rect::new(0, 0, 70, 24), &theme))
+        .unwrap();
     let buf = terminal.backend().buffer();
     let rows: Vec<String> = (0..buf.area.height)
         .map(|y| {
-            (0..buf.area.width).map(|x| buf.cell((x, y)).unwrap().symbol()).collect::<String>()
+            (0..buf.area.width)
+                .map(|x| buf.cell((x, y)).unwrap().symbol())
+                .collect::<String>()
         })
         .collect();
     let (y, row) = prompt_row(&rows, "> ");
-    assert!(row.starts_with("> abc"), "prompt at column 0, then the value: {row:?}");
+    assert!(
+        row.starts_with("> abc"),
+        "prompt at column 0, then the value: {row:?}"
+    );
     assert_eq!(
         buf.cell((0, y as u16)).unwrap().fg,
         theme.base_style().fg.unwrap(),
         "`>` is unstyled (`input.ts:379-446` never calls `theme.fg`)"
     );
-    assert_ne!(theme.base_style().fg, theme.accent_style().fg, "or this proves nothing");
+    assert_ne!(
+        theme.base_style().fg,
+        theme.accent_style().fg,
+        "or this proves nothing"
+    );
 }

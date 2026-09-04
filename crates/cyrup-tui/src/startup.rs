@@ -59,7 +59,10 @@ pub struct StartupSpan {
 
 impl StartupSpan {
     fn new(text: impl Into<String>, role: StartupRole) -> Self {
-        StartupSpan { text: text.into(), role }
+        StartupSpan {
+            text: text.into(),
+            role,
+        }
     }
 }
 
@@ -74,7 +77,9 @@ impl StartupLine {
         StartupLine { spans }
     }
     fn single(text: impl Into<String>, role: StartupRole) -> Self {
-        StartupLine { spans: vec![StartupSpan::new(text, role)] }
+        StartupLine {
+            spans: vec![StartupSpan::new(text, role)],
+        }
     }
     fn blank() -> Self {
         StartupLine::default()
@@ -118,7 +123,12 @@ impl StartupDiagnostic {
         path: Option<String>,
         message: impl Into<String>,
     ) -> Self {
-        StartupDiagnostic { severity, message: message.into(), path, collision: None }
+        StartupDiagnostic {
+            severity,
+            message: message.into(),
+            path,
+            collision: None,
+        }
     }
 }
 
@@ -172,7 +182,11 @@ pub fn display_path(path: &std::path::Path, home: Option<&std::path::Path>) -> S
         && let Ok(rest) = path.strip_prefix(home)
     {
         let rest = rest.display().to_string();
-        return if rest.is_empty() { "~".to_string() } else { format!("~/{rest}") };
+        return if rest.is_empty() {
+            "~".to_string()
+        } else {
+            format!("~/{rest}")
+        };
     }
     path.display().to_string()
 }
@@ -252,15 +266,21 @@ pub fn build_startup_lines(report: &StartupReport) -> Vec<StartupLine> {
 
 /// One `addLoadedSection` (`:1502-1516`): the `[Name]` header, one indented line per item, a spacer.
 fn push_listing(out: &mut Vec<StartupLine>, name: &str, items: &[String], sort: bool) {
-    let mut labels: Vec<&str> =
-        items.iter().map(|i| i.trim()).filter(|i| !i.is_empty()).collect();
+    let mut labels: Vec<&str> = items
+        .iter()
+        .map(|i| i.trim())
+        .filter(|i| !i.is_empty())
+        .collect();
     if labels.is_empty() {
         return;
     }
     if sort {
         labels.sort_unstable();
     }
-    out.push(StartupLine::single(format!("[{name}]"), StartupRole::Heading));
+    out.push(StartupLine::single(
+        format!("[{name}]"),
+        StartupRole::Heading,
+    ));
     for label in labels {
         out.push(StartupLine::single(format!("  {label}"), StartupRole::Dim));
     }
@@ -273,7 +293,10 @@ fn push_diagnostics(out: &mut Vec<StartupLine>, name: &str, diagnostics: &[Start
     if diagnostics.is_empty() {
         return;
     }
-    out.push(StartupLine::single(format!("[{name}]"), StartupRole::Warning));
+    out.push(StartupLine::single(
+        format!("[{name}]"),
+        StartupRole::Warning,
+    ));
     out.extend(format_diagnostics(diagnostics));
     out.push(StartupLine::blank());
 }
@@ -303,9 +326,14 @@ fn format_diagnostics(diagnostics: &[StartupDiagnostic]) -> Vec<StartupLine> {
     }
 
     for name in &order {
-        let Some(group) = groups.get(name) else { continue };
+        let Some(group) = groups.get(name) else {
+            continue;
+        };
         let Some(first) = group.first() else { continue };
-        lines.push(StartupLine::single(format!("  \"{name}\" collision:"), StartupRole::Warning));
+        lines.push(StartupLine::single(
+            format!("  \"{name}\" collision:"),
+            StartupRole::Warning,
+        ));
         lines.push(StartupLine::of(vec![
             StartupSpan::new("    ", StartupRole::Dim),
             StartupSpan::new("✓", StartupRole::Success),
@@ -381,7 +409,11 @@ pub(crate) fn startup_lines(
                 )
             })
             .collect();
-        out.extend(crate::transcript::text_lines_of(&Line::from(spans), width, output_pad));
+        out.extend(crate::transcript::text_lines_of(
+            &Line::from(spans),
+            width,
+            output_pad,
+        ));
     }
     out
 }
@@ -434,7 +466,12 @@ pub(crate) fn armin_art() -> String {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
     use super::*;
 
     fn texts(lines: &[StartupLine]) -> Vec<String> {
@@ -454,9 +491,19 @@ mod tests {
             ..Default::default()
         };
         let lines = texts(&build_startup_lines(&report));
-        assert!(!lines.iter().any(|l| l.contains("[Skills]")), "listing is quiet: {lines:?}");
-        assert!(lines.iter().any(|l| l.contains("[Skill conflicts]")), "diagnostics: {lines:?}");
-        assert!(lines.iter().any(|l| l.contains("skill path does not exist")));
+        assert!(
+            !lines.iter().any(|l| l.contains("[Skills]")),
+            "listing is quiet: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("[Skill conflicts]")),
+            "diagnostics: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("skill path does not exist"))
+        );
     }
 
     #[test]
@@ -467,25 +514,39 @@ mod tests {
             skills: vec!["review".into()],
             ..Default::default()
         };
-        assert!(build_startup_lines(&report).iter().any(|l| l.text().contains("[Skills]")));
+        assert!(
+            build_startup_lines(&report)
+                .iter()
+                .any(|l| l.text().contains("[Skills]"))
+        );
     }
 
     #[test]
     fn a_clean_quiet_startup_prints_nothing() {
-        let report = StartupReport { quiet_startup: true, ..Default::default() };
+        let report = StartupReport {
+            quiet_startup: true,
+            ..Default::default()
+        };
         assert!(build_startup_lines(&report).is_empty());
     }
 
     #[test]
     fn context_keeps_its_order_while_the_rest_sort() {
         let report = StartupReport {
-            context_files: vec!["AGENTS.md".into(), "CLAUDE.md".into(), "~/.cyrup/AGENTS.md".into()],
+            context_files: vec![
+                "AGENTS.md".into(),
+                "CLAUDE.md".into(),
+                "~/.cyrup/AGENTS.md".into(),
+            ],
             skills: vec!["zebra".into(), "alpha".into()],
             ..Default::default()
         };
         let lines = texts(&build_startup_lines(&report));
         let idx = |needle: &str| lines.iter().position(|l| l.contains(needle)).unwrap();
-        assert!(idx("AGENTS.md") < idx("CLAUDE.md"), "context order is preserved: {lines:?}");
+        assert!(
+            idx("AGENTS.md") < idx("CLAUDE.md"),
+            "context order is preserved: {lines:?}"
+        );
         assert!(idx("alpha") < idx("zebra"), "skills sort: {lines:?}");
     }
 
@@ -507,14 +568,29 @@ mod tests {
             ..Default::default()
         };
         let lines = texts(&build_startup_lines(&report));
-        assert!(lines.iter().any(|l| l == "  \"review\" collision:"), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l == "  \"review\" collision:"),
+            "{lines:?}"
+        );
         assert_eq!(
-            lines.iter().filter(|l| l.contains("✓ project/review")).count(),
+            lines
+                .iter()
+                .filter(|l| l.contains("✓ project/review"))
+                .count(),
             1,
             "exactly one winner line: {lines:?}"
         );
-        assert!(lines.iter().any(|l| l.contains("✗ global/review (skipped)")), "{lines:?}");
-        assert!(lines.iter().any(|l| l.contains("✗ package/review (skipped)")), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("✗ global/review (skipped)")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("✗ package/review (skipped)")),
+            "{lines:?}"
+        );
     }
 }
-

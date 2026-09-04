@@ -248,8 +248,13 @@ impl ResultsWatcher {
     /// are established once by extension initialization).
     pub fn install(
         &self,
-    ) -> Result<(notify::PollWatcher, tokio::sync::mpsc::UnboundedReceiver<()>), SubagentError>
-    {
+    ) -> Result<
+        (
+            notify::PollWatcher,
+            tokio::sync::mpsc::UnboundedReceiver<()>,
+        ),
+        SubagentError,
+    > {
         use notify::Watcher;
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
@@ -469,7 +474,13 @@ impl ResultsWatcher {
             .get(&key)
             .map_or(0, |entry| entry.attempts)
             .saturating_add(1);
-        retry_attempts.insert(key, RetryEntry { attempts, inserted_at: Instant::now() });
+        retry_attempts.insert(
+            key,
+            RetryEntry {
+                attempts,
+                inserted_at: Instant::now(),
+            },
+        );
         // R-SA-102's bound itself is enforced on the READ side, by `check_and_mark_seen` comparing
         // this stored `attempts` count against `MAX_PROCESSING_ATTEMPTS` the next time this key is
         // scanned — this method's own job is only to record that one more failure happened.
@@ -488,7 +499,12 @@ impl ResultsWatcher {
             .get(key)
             .map_or(0, |entry| entry.attempts);
 
-        seen.insert(key.clone(), SeenEntry { inserted_at: Instant::now() });
+        seen.insert(
+            key.clone(),
+            SeenEntry {
+                inserted_at: Instant::now(),
+            },
+        );
 
         if prior_attempts >= MAX_PROCESSING_ATTEMPTS {
             SeenOutcome::Exhausted
@@ -591,21 +607,55 @@ pub fn classify_outcome(result: &ResultFile) -> ClassifiedOutcome {
 // Completion notification (C6): format + deliver + delete (notify.ts / result-watcher.ts)
 // =================================================================================================
 
-/// The `subagent-notify` message a completed background run produces (pi `notify.ts:97-104`'s
-/// `pi.sendMessage({customType:"subagent-notify", content, display:true}, {triggerTurn:true})`).
-/// `custom_type`/`display`/`trigger_turn` are fixed exactly as pi fixes them; only `content` varies,
-/// built by [`format_completion_message`] to reproduce notify.ts's status/summary/session-line
-/// layout character-for-character.
+/// SUBA-090 — pi's `display` predicate for a `subagent-notify` completion
+/// (`v0.64.0:src/runs/background/notify.ts:402`):
+///
+/// ```ts
+/// const display = details.some((detail) => detail.source === "foreground" || detail.status !== "completed" || detail.scheduleOrigin !== undefined);
+/// ```
+///
+/// A plain successful background completion is injected as a NON-displayed context message — the
+/// parent LLM still sees it and the turn still fires (R-SA-101), but nothing is drawn — and the
+/// notice is rendered only when something needs attention: a failed/paused/stopped outcome, a
+/// detached-foreground completion, or a schedule-launched run. The predicate is identical at
+/// `v0.43.0:notify.ts:173` (minus the `scheduleOrigin` clause) and `v0.57.0:notify.ts:239`.
+///
+/// Cyrup's [`ResultFile`] carries neither `source` (every completion this crate observes is an
+/// async background run — detached-foreground completions are not ported) nor `scheduleOrigin`
+/// (durable schedules are not ported), so the first and third clauses are vacuously false here and
+/// the decision reduces to the [`classify_outcome`] status: displayed iff the outcome is anything
+/// but [`ClassifiedOutcome::Completed`]. When either input lands, OR it in here — this is the one
+/// place the predicate lives.
+#[must_use]
+pub fn completion_notice_display(outcome: ClassifiedOutcome) -> bool {
+    outcome != ClassifiedOutcome::Completed
+}
+
+/// The `subagent-notify` message a completed background run produces (pi `sendCompletion`,
+/// `v0.64.0:src/runs/background/notify.ts:399-412`:
+/// `pi.sendMessage({customType:"subagent-notify", content, display}, {triggerTurn: items.some((item) => item.triggerTurn)})`).
+/// `custom_type` is fixed; `content` is built by [`format_completion_message`] to reproduce
+/// notify.ts's status/summary/session-line layout character-for-character; `display` is upstream's
+/// outcome-dependent predicate ([`completion_notice_display`], `notify.ts:402`); `trigger_turn` is
+/// `true` for every completion cyrup can produce today (see the field).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletionMessage {
     /// Always `"subagent-notify"` (pi's `customType`).
     pub custom_type: String,
     /// The rendered notification body (status header, blank line, summary, optional session line).
     pub content: String,
-    /// Always `true` (pi's `display: true`).
+    /// SUBA-090 — pi's `display` (`notify.ts:402` @v0.64.0): `false` for a plain successful
+    /// background completion (the message is context for the LLM, not a rendered notice), `true`
+    /// for a failed/paused/stopped outcome. Computed by [`completion_notice_display`] over
+    /// [`classify_outcome`]; NOT a constant — the previous "Always `true` (pi's `display: true`)"
+    /// claim was wrong at every upstream tag from v0.43.0 on.
     pub display: bool,
-    /// Always `true` (pi's `{ triggerTurn: true }`) — the completion re-enters the parent's normal
-    /// turn/prompt path so the LLM sees and can act on the background result (R-SA-101).
+    /// `true` for every completion cyrup produces — pi's per-completion
+    /// `triggerTurn: result.triggerTurn !== false` (`notify.ts:605` @v0.64.0), OR'd over the batch
+    /// at `:409`; a `CompletionNotification` may carry `triggerTurn: false`, but cyrup's
+    /// [`ResultFile`] has no such input, so the default (`true`) is the only value reachable. The
+    /// completion re-enters the parent's normal turn/prompt path so the LLM sees and can act on the
+    /// background result (R-SA-101) — this holds whether or not the notice is displayed.
     pub trigger_turn: bool,
 }
 
@@ -645,8 +695,8 @@ impl CompletionSink for LoggingCompletionSink {
 /// The REAL turn-injecting completion sink (R-SA-101): a completed background run's `subagent-notify`
 /// message is injected LIVE into the orchestrator session via the P-1
 /// [`cyrup_ext::host::HostServices::inject_message`] backend, with `trigger_turn: true` so the
-/// completion re-enters the parent's turn loop (pi `notify.ts:97-104`'s
-/// `pi.sendMessage({customType, content, display}, {triggerTurn: true})`) — instead of the
+/// completion re-enters the parent's turn loop (pi `sendCompletion`, `notify.ts:404-410` @v0.64.0:
+/// `pi.sendMessage({customType, content, display}, {triggerTurn})`) — instead of the
 /// stderr-only [`LoggingCompletionSink`] degradation. Installed by
 /// [`crate::extension::SubagentExecutor::install_completion_watcher`] whenever the host-services slot
 /// is bound (a live session is present); the logging sink remains the no-host-handle default.
@@ -675,10 +725,21 @@ impl CompletionSink for HostServicesCompletionSink {
         // (no live turn loop / injection unavailable) degrades to "not delivered" → the result file
         // is retried in place next scan, never silently dropped.
         let services = self.services.clone();
-        let CompletionMessage { custom_type, content, display, trigger_turn } = message;
+        let CompletionMessage {
+            custom_type,
+            content,
+            display,
+            trigger_turn,
+        } = message;
         tokio::task::spawn_blocking(move || {
             services
-                .inject_message(&content, Some(custom_type.as_str()), display, None, trigger_turn)
+                .inject_message(
+                    &content,
+                    Some(custom_type.as_str()),
+                    display,
+                    None,
+                    trigger_turn,
+                )
                 .is_ok()
         })
         .await
@@ -697,7 +758,11 @@ fn result_display_summary(result: &ResultFile) -> String {
         .iter()
         .filter_map(|child| {
             let text = child.final_output.clone().or_else(|| child.error.clone())?;
-            if text.trim().is_empty() { None } else { Some(text) }
+            if text.trim().is_empty() {
+                None
+            } else {
+                Some(text)
+            }
         })
         .collect::<Vec<_>>()
         .join("\n\n")
@@ -706,11 +771,14 @@ fn result_display_summary(result: &ResultFile) -> String {
 /// Build the `subagent-notify` [`CompletionMessage`] for `result`, reproducing pi's `notify.ts`
 /// content layout (`notify.ts:58-104`): a `Background task <status>: **<agent>**` header, a blank
 /// line, the display summary (or `"(no output)"`), and — when a session file is present — a blank
-/// line followed by `Session file: <path>`. `<status>` is `completed`/`failed`/`paused` per
-/// [`classify_outcome`] (R-SA-100; a paused run is never reported as failed).
+/// line followed by `Session file: <path>`. `<status>` is `completed`/`failed`/`paused`/`stopped`
+/// per [`classify_outcome`] (R-SA-100; a paused run is never reported as failed). The same
+/// classification decides `display` ([`completion_notice_display`], SUBA-090): a plain
+/// `completed` outcome is injected hidden, anything else is rendered.
 #[must_use]
 pub fn format_completion_message(result: &ResultFile) -> CompletionMessage {
-    let status = match classify_outcome(result) {
+    let outcome = classify_outcome(result);
+    let status = match outcome {
         ClassifiedOutcome::Completed => "completed",
         ClassifiedOutcome::Failed => "failed",
         ClassifiedOutcome::Paused => "paused",
@@ -718,7 +786,11 @@ pub fn format_completion_message(result: &ResultFile) -> CompletionMessage {
         // `Background task <status>: **<agent>**` header.
         ClassifiedOutcome::Stopped => "stopped",
     };
-    let agent = if result.agent.is_empty() { "unknown" } else { result.agent.as_str() };
+    let agent = if result.agent.is_empty() {
+        "unknown"
+    } else {
+        result.agent.as_str()
+    };
 
     let summary = result_display_summary(result);
     let display_summary = if summary.trim().is_empty() {
@@ -742,7 +814,9 @@ pub fn format_completion_message(result: &ResultFile) -> CompletionMessage {
     CompletionMessage {
         custom_type: "subagent-notify".to_string(),
         content: lines.join("\n"),
-        display: true,
+        display: completion_notice_display(outcome),
+        // pi: `triggerTurn: result.triggerTurn !== false` (`notify.ts:605`) — `ResultFile` carries
+        // no `triggerTurn`, so the default (`true`) is the only reachable value.
         trigger_turn: true,
     }
 }
@@ -939,7 +1013,10 @@ pub fn install_completion_watcher_with_observer(
     let watcher = ResultsWatcher::new(results_dir);
     let (poll_watcher, rx) = watcher.install()?;
     let task = tokio::spawn(drive_completion_watcher(watcher, rx, sink, observer));
-    Ok(CompletionWatcherHandle { _poll_watcher: poll_watcher, task })
+    Ok(CompletionWatcherHandle {
+        _poll_watcher: poll_watcher,
+        task,
+    })
 }
 
 /// The background drain loop [`install_completion_watcher`] spawns: prime once (so results already
@@ -1064,7 +1141,9 @@ mod tests {
         let stopped = sample_result("run-stop-3", RunState::Stopped, false);
         let message = format_completion_message(&stopped);
         assert!(
-            message.content.starts_with("Background task stopped: **researcher**"),
+            message
+                .content
+                .starts_with("Background task stopped: **researcher**"),
             "{}",
             message.content
         );
@@ -1114,7 +1193,9 @@ mod tests {
     #[tokio::test]
     async fn scan_finds_a_freshly_written_result_file() {
         let (_dir, results_dir) = temp_results_dir();
-        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir");
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir");
         let result = sample_result("run00001", RunState::Complete, true);
         write_atomic_json(&results_dir.join("run00001.json"), &result)
             .await
@@ -1130,7 +1211,9 @@ mod tests {
     #[tokio::test]
     async fn scan_does_not_renotify_an_already_seen_result() {
         let (_dir, results_dir) = temp_results_dir();
-        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir");
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir");
         let result = sample_result("run00002", RunState::Complete, true);
         write_atomic_json(&results_dir.join("run00002.json"), &result)
             .await
@@ -1152,10 +1235,14 @@ mod tests {
     #[tokio::test]
     async fn scan_for_session_defers_a_result_that_does_not_belong_to_the_session() {
         let (_dir, results_dir) = temp_results_dir();
-        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir");
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir");
         let result = sample_result("run00009", RunState::Complete, true);
         let path = results_dir.join("run00009.json");
-        write_atomic_json(&path, &result).await.expect("write result");
+        write_atomic_json(&path, &result)
+            .await
+            .expect("write result");
 
         let watcher = ResultsWatcher::new(results_dir);
 
@@ -1190,10 +1277,14 @@ mod tests {
     #[tokio::test]
     async fn delete_after_notify_removes_the_file_and_tolerates_a_double_delete() {
         let (_dir, results_dir) = temp_results_dir();
-        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir");
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir");
         let result = sample_result("run00003", RunState::Complete, true);
         let path = results_dir.join("run00003.json");
-        write_atomic_json(&path, &result).await.expect("write result");
+        write_atomic_json(&path, &result)
+            .await
+            .expect("write result");
 
         let watcher = ResultsWatcher::new(results_dir);
         let found = watcher.scan().await.expect("scan");
@@ -1213,12 +1304,19 @@ mod tests {
     #[tokio::test]
     async fn malformed_result_file_is_skipped_not_deleted() {
         let (_dir, results_dir) = temp_results_dir();
-        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir");
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir");
         let path = results_dir.join("garbage.json");
-        tokio::fs::write(&path, b"not valid json").await.expect("write garbage");
+        tokio::fs::write(&path, b"not valid json")
+            .await
+            .expect("write garbage");
 
         let watcher = ResultsWatcher::new(results_dir);
-        let found = watcher.scan().await.expect("scan does not error on a malformed sibling");
+        let found = watcher
+            .scan()
+            .await
+            .expect("scan does not error on a malformed sibling");
         assert!(found.is_empty());
         assert!(
             path.exists(),
@@ -1229,7 +1327,9 @@ mod tests {
     #[tokio::test]
     async fn non_json_sibling_files_are_ignored() {
         let (_dir, results_dir) = temp_results_dir();
-        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir");
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir");
         tokio::fs::write(results_dir.join("README.md"), b"not a result")
             .await
             .expect("write sibling");
@@ -1256,7 +1356,9 @@ mod tests {
     #[tokio::test]
     async fn record_processing_failure_makes_the_result_reappear_on_the_next_scan() {
         let (_dir, results_dir) = temp_results_dir();
-        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir");
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir");
         let result = sample_result("run00010", RunState::Complete, true);
         write_atomic_json(&results_dir.join("run00010.json"), &result)
             .await
@@ -1273,7 +1375,10 @@ mod tests {
         // Simulate the caller failing to process the notification (retry-in-place, R-SA-102).
         watcher.record_processing_failure(&first[0]).await;
 
-        let third = watcher.scan().await.expect("third scan after recorded failure");
+        let third = watcher
+            .scan()
+            .await
+            .expect("third scan after recorded failure");
         assert_eq!(
             third.len(),
             1,
@@ -1285,7 +1390,9 @@ mod tests {
     #[tokio::test]
     async fn processing_failure_bound_eventually_marks_the_result_exhausted() {
         let (_dir, results_dir) = temp_results_dir();
-        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir");
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir");
         let result = sample_result("run00011", RunState::Complete, true);
         write_atomic_json(&results_dir.join("run00011.json"), &result)
             .await
@@ -1321,7 +1428,10 @@ mod tests {
         let paused = sample_result("run00004", RunState::Paused, false);
         assert_eq!(classify_outcome(&paused), ClassifiedOutcome::Paused);
         let paused_success_true = sample_result("run00005", RunState::Paused, true);
-        assert_eq!(classify_outcome(&paused_success_true), ClassifiedOutcome::Paused);
+        assert_eq!(
+            classify_outcome(&paused_success_true),
+            ClassifiedOutcome::Paused
+        );
     }
 
     #[test]
@@ -1349,7 +1459,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn install_observes_a_real_filesystem_write() {
         let (_dir, results_dir) = temp_results_dir();
-        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir");
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir");
 
         let watcher = ResultsWatcher::new(results_dir.clone());
         let (_native_watcher, mut rx) = watcher.install().expect("watcher installs");
@@ -1383,7 +1495,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn watcher_fires_exactly_once_under_duplicate_filesystem_events() {
         let (_dir, results_dir) = temp_results_dir();
-        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir");
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir");
 
         let watcher = ResultsWatcher::new(results_dir.clone());
         let (_native_watcher, mut rx) = watcher.install().expect("watcher installs");
@@ -1524,7 +1638,10 @@ mod tests {
         );
         let msg = format_completion_message(&result);
         assert_eq!(msg.custom_type, "subagent-notify");
-        assert!(msg.display);
+        assert!(
+            !msg.display,
+            "SUBA-090: a plain successful completion is not displayed (notify.ts:402 @v0.64.0)"
+        );
         assert!(msg.trigger_turn);
         assert_eq!(
             msg.content,
@@ -1572,13 +1689,101 @@ mod tests {
         );
     }
 
+    // =============================================================================================
+    // SUBA-090 — the `display` predicate (v0.64.0 `notify.ts:402`)
+    // =============================================================================================
+
+    /// A plain successful background completion is injected as a NON-displayed context message:
+    /// upstream's `display` is `details.some(d => d.source === "foreground" || d.status !==
+    /// "completed" || d.scheduleOrigin !== undefined)` (`notify.ts:402` @v0.64.0), and cyrup's
+    /// `ResultFile` carries neither `source` nor `scheduleOrigin`, so only the status clause can
+    /// hold — and for `completed` it does not. The turn is still triggered (R-SA-101).
+    #[test]
+    fn a_plain_successful_background_completion_is_not_displayed() {
+        let completed = result_with_children(
+            "run-display-1",
+            RunState::Complete,
+            true,
+            Some(PathBuf::from("/tmp/session.jsonl")),
+            vec![child_result("worker", Some("Done"), 0)],
+        );
+        let msg = format_completion_message(&completed);
+        assert_eq!(classify_outcome(&completed), ClassifiedOutcome::Completed);
+        assert!(
+            !msg.display,
+            "a `completed` status is the one outcome upstream keeps invisible"
+        );
+        assert!(
+            msg.trigger_turn,
+            "hidden is not inert: the completion still re-enters the turn loop"
+        );
+        assert!(!completion_notice_display(ClassifiedOutcome::Completed));
+    }
+
+    /// Every non-`completed` status satisfies upstream's `detail.status !== "completed"` clause, so
+    /// failed, paused and stopped completions are rendered — including the `state: Complete,
+    /// success: false` combination `classify_outcome` reports as failed (R-SA-100).
+    #[test]
+    fn failed_paused_and_stopped_completions_are_displayed() {
+        let failed = result_with_children(
+            "run-display-2",
+            RunState::Failed,
+            false,
+            None,
+            vec![child_result("worker", Some("boom"), 1)],
+        );
+        let acceptance_failed = result_with_children(
+            "run-display-3",
+            RunState::Complete,
+            false,
+            None,
+            vec![child_result("worker", Some("rejected"), 0)],
+        );
+        let paused = result_with_children(
+            "run-display-4",
+            RunState::Paused,
+            false,
+            None,
+            vec![child_result("worker", Some("Paused after interrupt."), 0)],
+        );
+        let stopped = result_with_children(
+            "run-display-5",
+            RunState::Stopped,
+            false,
+            None,
+            vec![child_result("worker", Some("stopped"), 0)],
+        );
+        for (label, result) in [
+            ("failed", &failed),
+            ("complete-but-unsuccessful", &acceptance_failed),
+            ("paused", &paused),
+            ("stopped", &stopped),
+        ] {
+            let msg = format_completion_message(result);
+            assert!(
+                msg.display,
+                "{label}: a non-completed status must be displayed"
+            );
+            assert!(msg.trigger_turn, "{label}: the turn is still triggered");
+        }
+        for outcome in [
+            ClassifiedOutcome::Failed,
+            ClassifiedOutcome::Paused,
+            ClassifiedOutcome::Stopped,
+        ] {
+            assert!(completion_notice_display(outcome), "{outcome:?}");
+        }
+    }
+
     /// The load-bearing C6 test: a completing background run fires EXACTLY ONE notify and its
     /// result file is deleted. Uses the real `notify::PollWatcher` install + drain pipeline, a
     /// capturing sink, and a real on-disk result file.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn install_completion_watcher_fires_exactly_one_notify_and_deletes_the_result() {
         let (_dir, results_dir) = temp_results_dir();
-        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir results_dir");
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir results_dir");
 
         let sink = CapturingSink::default();
         let delivered = Arc::clone(&sink.delivered);
@@ -1595,7 +1800,9 @@ mod tests {
             vec![child_result("worker", Some("all done"), 0)],
         );
         let result_path = results_dir.join("run-notify-1.json");
-        write_atomic_json(&result_path, &result).await.expect("write result");
+        write_atomic_json(&result_path, &result)
+            .await
+            .expect("write result");
 
         // Wait for the watcher to fire and delete the file (bounded).
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1606,9 +1813,7 @@ mod tests {
                 break;
             }
             if Instant::now() >= deadline {
-                panic!(
-                    "watcher did not fire+delete in time: delivered={count}, file_gone={gone}"
-                );
+                panic!("watcher did not fire+delete in time: delivered={count}, file_gone={gone}");
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -1622,12 +1827,22 @@ mod tests {
             "a completing background run must fire exactly one notify, got: {messages:?}"
         );
         assert_eq!(messages[0].custom_type, "subagent-notify");
-        assert!(messages[0].trigger_turn, "the notify must trigger a turn (R-SA-101)");
+        assert!(
+            messages[0].trigger_turn,
+            "the notify must trigger a turn (R-SA-101)"
+        );
+        assert!(
+            !messages[0].display,
+            "SUBA-090: the `display` handed to the sink for a plain successful completion is false"
+        );
         assert_eq!(
             messages[0].content,
             "Background task completed: **worker**\n\nall done"
         );
-        assert!(!result_path.exists(), "the result file must be deleted after notify");
+        assert!(
+            !result_path.exists(),
+            "the result file must be deleted after notify"
+        );
 
         drop(handle);
     }
@@ -1686,10 +1901,11 @@ mod tests {
         #[async_trait::async_trait]
         impl CompletionObserver for Recorder {
             async fn observe(&self, notification: &CompletionNotification) {
-                self.log
-                    .lock()
-                    .await
-                    .push(format!("{}:{}", self.tag, notification.result.run_id.as_str()));
+                self.log.lock().await.push(format!(
+                    "{}:{}",
+                    self.tag,
+                    notification.result.run_id.as_str()
+                ));
             }
         }
 
@@ -1697,9 +1913,15 @@ mod tests {
         let bus = CompletionBus::new();
         let mut rx = bus.subscribe();
         let composite = CompositeCompletionObserver::new(vec![
-            Arc::new(Recorder { tag: "first", log: Arc::clone(&log) }),
+            Arc::new(Recorder {
+                tag: "first",
+                log: Arc::clone(&log),
+            }),
             Arc::new(bus),
-            Arc::new(Recorder { tag: "last", log: Arc::clone(&log) }),
+            Arc::new(Recorder {
+                tag: "last",
+                log: Arc::clone(&log),
+            }),
         ]);
 
         composite
@@ -1712,11 +1934,17 @@ mod tests {
 
         assert_eq!(
             log.lock().await.clone(),
-            vec!["first:run-fanout".to_string(), "last:run-fanout".to_string()],
+            vec![
+                "first:run-fanout".to_string(),
+                "last:run-fanout".to_string()
+            ],
             "both recorders must run, in registration order"
         );
         assert_eq!(
-            rx.try_recv().expect("the bus member published too").run_id.as_str(),
+            rx.try_recv()
+                .expect("the bus member published too")
+                .run_id
+                .as_str(),
             "run-fanout",
             "the bus sitting BETWEEN two other members must not be skipped"
         );

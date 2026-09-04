@@ -23,13 +23,18 @@
 //! Every assertion below is on PAINTED CELLS, because that is the layer both defects lived in: the
 //! source at `app.rs` looked correct and the count was being set on a `StatusBar` with no render
 //! site.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
+use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crate::{App, AppAction, InputEvent, UiTheme};
 use cyrup_agent::AgentMessage;
 use cyrup_core::Content;
 use cyrup_session_svc::AgentSessionEvent;
-use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use crate::{App, AppAction, InputEvent, UiTheme};
 use ratatui::backend::TestBackend;
 
 fn new_app() -> App<TestBackend> {
@@ -82,7 +87,10 @@ fn queued(app: &mut App<TestBackend>, steering: &[&str], follow_up: &[&str]) {
 fn dispatched(app: &mut App<TestBackend>, text: &str) {
     app.ingest_event(&AgentSessionEvent::MessageStart {
         message: AgentMessage::User {
-            content: vec![Content::Text { text: text.into(), text_signature: None }],
+            content: vec![Content::Text {
+                text: text.into(),
+                text_signature: None,
+            }],
             timestamp: None,
         },
     });
@@ -102,7 +110,10 @@ fn a_queued_message_renders_as_a_pending_row_and_not_as_a_transcript_bubble() {
     queued(&mut app, &["QUEUEDMSGONE"], &[]);
     app.draw().unwrap();
     let s = screen(&app);
-    assert!(s.contains("Steering: QUEUEDMSGONE"), "the pending row must be on screen:\n{s}");
+    assert!(
+        s.contains("Steering: QUEUEDMSGONE"),
+        "the pending row must be on screen:\n{s}"
+    );
     assert_eq!(
         s.matches("QUEUEDMSGONE").count(),
         1,
@@ -117,12 +128,18 @@ fn steering_follow_up_and_the_dequeue_hint_all_render_in_pi_s_order() {
     queued(&mut app, &["ALPHA", "BETA"], &["GAMMA"]);
     app.draw().unwrap();
     let s = screen(&app);
-    let at = |needle: &str| s.find(needle).unwrap_or_else(|| panic!("missing {needle:?}:\n{s}"));
+    let at = |needle: &str| {
+        s.find(needle)
+            .unwrap_or_else(|| panic!("missing {needle:?}:\n{s}"))
+    };
     let alpha = at("Steering: ALPHA");
     let beta = at("Steering: BETA");
     let gamma = at("Follow-up: GAMMA");
     let hint = at("to edit all queued messages");
-    assert!(alpha < beta && beta < gamma && gamma < hint, "order: {alpha} {beta} {gamma} {hint}");
+    assert!(
+        alpha < beta && beta < gamma && gamma < hint,
+        "order: {alpha} {beta} {gamma} {hint}"
+    );
     // `↳ ${dequeueHint} …` (`interactive-mode.ts:3988`) — the stock `app.message.dequeue` binding
     // is `alt+up` (`core/keybindings.ts:102-105`), title-cased by `keyDisplayText` and — on macOS
     // only — with `alt` rewritten to `option` (`keybinding-hints.ts:13`).
@@ -131,7 +148,10 @@ fn steering_follow_up_and_the_dequeue_hint_all_render_in_pi_s_order() {
     } else {
         "↳ Alt+Up to edit all queued messages"
     };
-    assert!(s.contains(expected), "hint text (expected {expected:?}):\n{s}");
+    assert!(
+        s.contains(expected),
+        "hint text (expected {expected:?}):\n{s}"
+    );
 }
 
 #[test]
@@ -145,7 +165,10 @@ fn the_pending_region_clears_when_the_queue_drains() {
     app.draw().unwrap();
     let s = screen(&app);
     assert!(!s.contains("Steering:"), "the region must collapse:\n{s}");
-    assert!(!s.contains("to edit all queued messages"), "and take the hint with it:\n{s}");
+    assert!(
+        !s.contains("to edit all queued messages"),
+        "and take the hint with it:\n{s}"
+    );
 }
 
 /// The hand-off: the row disappears and the bubble appears, driven by the two events the session
@@ -156,15 +179,26 @@ fn the_bubble_appears_only_when_the_turn_that_carries_the_message_starts() {
     submit(&mut app, "HELLO");
     queued(&mut app, &["HELLO"], &[]);
     app.draw().unwrap();
-    assert_eq!(screen(&app).matches("HELLO").count(), 1, "queued: the pending row only");
+    assert_eq!(
+        screen(&app).matches("HELLO").count(),
+        1,
+        "queued: the pending row only"
+    );
 
     // The turn begins: the agent injects the steering message and the queue drains.
     queued(&mut app, &[], &[]);
     dispatched(&mut app, "HELLO");
     app.draw().unwrap();
     let s = screen(&app);
-    assert!(!s.contains("Steering: HELLO"), "the pending row is gone:\n{s}");
-    assert_eq!(s.matches("HELLO").count(), 1, "and the transcript bubble took its place:\n{s}");
+    assert!(
+        !s.contains("Steering: HELLO"),
+        "the pending row is gone:\n{s}"
+    );
+    assert_eq!(
+        s.matches("HELLO").count(),
+        1,
+        "and the transcript bubble took its place:\n{s}"
+    );
 }
 
 /// A plain idle submission still reaches the transcript — via `message_start`, which is the only
@@ -180,7 +214,10 @@ fn an_idle_submission_still_produces_a_user_bubble() {
     );
     dispatched(&mut app, "PLAINMSG");
     app.draw().unwrap();
-    assert!(screen(&app).contains("PLAINMSG"), "the bubble arrives with `message_start`");
+    assert!(
+        screen(&app).contains("PLAINMSG"),
+        "the bubble arrives with `message_start`"
+    );
 }
 
 // ------------------------------------------------------------------------ TUI-052 ----
@@ -195,12 +232,19 @@ fn a_message_dequeued_by_escape_leaves_no_phantom_in_the_transcript() {
     submit(&mut app, "PHANTOM");
     queued(&mut app, &["PHANTOM"], &[]);
     app.draw().unwrap();
-    assert_eq!(screen(&app).matches("PHANTOM").count(), 1, "the pending row");
+    assert_eq!(
+        screen(&app).matches("PHANTOM").count(),
+        1,
+        "the pending row"
+    );
 
     // Escape mid-turn → the run loop drains the queue and restores it to the editor
     // (`restoreQueuedMessagesToEditor`, `interactive-mode.ts:2636-2637`).
     assert_eq!(
-        app.handle_input(&InputEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))),
+        app.handle_input(&InputEvent::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE
+        ))),
         AppAction::InterruptRestoreQueued
     );
     queued(&mut app, &[], &[]);
@@ -208,7 +252,10 @@ fn a_message_dequeued_by_escape_leaves_no_phantom_in_the_transcript() {
     app.draw().unwrap();
 
     let s = screen(&app);
-    assert!(!s.contains("Steering: PHANTOM"), "the pending row is gone:\n{s}");
+    assert!(
+        !s.contains("Steering: PHANTOM"),
+        "the pending row is gone:\n{s}"
+    );
     assert_eq!(
         s.matches("PHANTOM").count(),
         1,
@@ -228,10 +275,12 @@ fn a_message_dequeued_by_escape_leaves_no_phantom_in_the_transcript() {
 async fn a_message_queued_during_compaction_renders_in_the_pending_region() {
     let mut app = new_app();
     // The session's own queues are empty; only the compaction queue has anything in it.
-    app.state_mut().compaction_queue.push(crate::CompactionQueued {
-        text: "QUEUEDDURINGCOMPACTION".to_string(),
-        follow_up: false,
-    });
+    app.state_mut()
+        .compaction_queue
+        .push(crate::CompactionQueued {
+            text: "QUEUEDDURINGCOMPACTION".to_string(),
+            follow_up: false,
+        });
     app.ingest_event(&AgentSessionEvent::QueueUpdate {
         steering: Vec::new(),
         follow_up: Vec::new(),
@@ -250,14 +299,20 @@ async fn a_follow_up_queued_during_compaction_uses_the_follow_up_label() {
     let mut app = new_app();
     app.state_mut()
         .compaction_queue
-        .push(crate::CompactionQueued { text: "LATER".to_string(), follow_up: true });
+        .push(crate::CompactionQueued {
+            text: "LATER".to_string(),
+            follow_up: true,
+        });
     app.ingest_event(&AgentSessionEvent::QueueUpdate {
         steering: Vec::new(),
         follow_up: Vec::new(),
     });
     app.draw().unwrap();
     let s = screen(&app);
-    assert!(s.contains("Follow-up: LATER"), "follow-up mode must use pi's label:\n{s}");
+    assert!(
+        s.contains("Follow-up: LATER"),
+        "follow-up mode must use pi's label:\n{s}"
+    );
 }
 
 /// The hint is `getAppKeyDisplay("app.message.dequeue")` (`interactive-mode.ts:3987`), i.e. resolved
@@ -272,7 +327,10 @@ fn the_dequeue_hint_follows_a_rebind_of_app_message_dequeue() {
     let issues = app
         .load_keybindings_json(r#"{ "app.message.dequeue": "ctrl+g" }"#)
         .expect("a one-key rebind must load");
-    assert!(issues.is_empty(), "the fixture must be a clean rebind, not a diagnostic: {issues:?}");
+    assert!(
+        issues.is_empty(),
+        "the fixture must be a clean rebind, not a diagnostic: {issues:?}"
+    );
 
     queued(&mut app, &["ALPHA"], &[]);
     app.draw().unwrap();

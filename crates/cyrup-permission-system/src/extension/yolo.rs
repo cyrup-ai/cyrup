@@ -97,7 +97,11 @@ impl PermissionSystemExtension {
         // pi `normalizePermissionSystemConfig({ ...extensionConfig, yoloMode: enabled })` (`:1432`).
         // Cloned out of the mutex first so nothing below runs while the live config is locked.
         let current = guard(&self.config).clone();
-        let normalized = ExtensionConfig { yolo_mode: enabled, ..current.clone() }.normalized();
+        let normalized = ExtensionConfig {
+            yolo_mode: enabled,
+            ..current.clone()
+        }
+        .normalized();
         // pi `const persisted = options.persist !== false` (`:1433`).
         let persisted = options.persists();
         // pi `const changed = extensionConfig.yoloMode !== normalized.yoloMode` (`:1434`).
@@ -149,7 +153,12 @@ impl PermissionSystemExtension {
             }),
         );
         // pi `:1464-1468` — note `error` is absent, not `null`.
-        YoloModeControlResult { yolo_mode: normalized.yolo_mode, changed, persisted, error: None }
+        YoloModeControlResult {
+            yolo_mode: normalized.yolo_mode,
+            changed,
+            persisted,
+            error: None,
+        }
     }
 
     /// pi `toggleYoloMode: (options?) => setYoloModeFromRuntimeApi(!extensionConfig.yoloMode,
@@ -172,7 +181,9 @@ impl PermissionSystemExtension {
     /// rather than through [`Self::into_shared`]. That is the honest state and not a silent
     /// failure: an extension that was never activated has published nothing upstream either.
     pub(super) fn publish_runtime_api(&self) {
-        let Some(weak) = self.self_ref.get() else { return };
+        let Some(weak) = self.self_ref.get() else {
+            return;
+        };
         let api: Arc<dyn crate::runtime_api::PermissionSystemRuntimeApi> =
             Arc::new(PublishedRuntimeApi { ext: weak.clone() });
         *guard(&self.runtime_api) = Some(crate::runtime_api::register_runtime_api(api));

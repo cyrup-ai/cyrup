@@ -60,13 +60,13 @@ impl ExtensionWidget {
         let below = placement == "belowEditor";
         let content = obj.and_then(|o| o.get("lines"));
         let mut lines: Vec<String> = match content {
-            Some(serde_json::Value::String(text)) => {
-                text.lines().map(str::to_string).collect()
-            }
+            Some(serde_json::Value::String(text)) => text.lines().map(str::to_string).collect(),
             Some(serde_json::Value::Array(items)) => items
                 .iter()
                 .map(|i| {
-                    i.as_str().map(str::to_string).unwrap_or_else(|| i.to_string())
+                    i.as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| i.to_string())
                 })
                 .collect(),
             // `content === undefined` removes the widget (`:1935-1938`) — an empty line list is
@@ -95,6 +95,13 @@ pub struct LifecycleEffects {
     /// `/reload` rebuilds the keymaps from this agent dir. Runs AFTER the session reload, which is
     /// Pi's order (`interactive-mode.ts:5386`, session reload then `this.keybindings.reload()`).
     pub reload_keybindings_in: Option<PathBuf>,
+    /// TUI-037 — pi's `showWarning("Could not save project trust after reload: …")`
+    /// (`interactive-mode.ts:4938-4940` @v0.84.4), already framed `Warning: …`. Carried here
+    /// rather than pushed by the `/reload` arm because cyrup's implicit-trust save runs BEFORE the
+    /// rebuild (`app/reload_trust.rs`), and the swap's `rebind_session` resets the transcript —
+    /// a warning pushed there would be wiped before the user saw it. Surfaced after the swap, which
+    /// is where pi shows it.
+    pub warning: Option<String>,
 }
 
 /// What a spawned session-lifecycle op hands back (TUI-092 §5b.2).
@@ -156,6 +163,9 @@ impl TreeNavMsg {
     /// [`App::apply_tree_nav_outcome`] a synthetic outcome (notably the abort case, which is
     /// otherwise a race to provoke) — the crate's established run-loop-only testing seam.
     pub fn new(target: impl Into<String>, outcome: Result<NavigateTreeOutcome, String>) -> Self {
-        TreeNavMsg { target: target.into(), outcome }
+        TreeNavMsg {
+            target: target.into(),
+            outcome,
+        }
     }
 }

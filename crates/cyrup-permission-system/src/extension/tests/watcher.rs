@@ -58,7 +58,15 @@ async fn parent_role_publishes_and_clears_the_process_parent_session_anchor() {
     let ctx = event_ctx(dir.path().to_path_buf());
 
     cyrup_ext_subagents::clear_parent_session_anchor();
-    let _ = ext.on_event(&HostEvent::SessionStart { reason: "startup".to_string(), previous_session_file: None }, &ctx).await;
+    let _ = ext
+        .on_event(
+            &HostEvent::SessionStart {
+                reason: "startup".to_string(),
+                previous_session_file: None,
+            },
+            &ctx,
+        )
+        .await;
     assert_eq!(
         cyrup_ext_subagents::background::parent_anchor::published_parent_session_anchor()
             .as_deref(),
@@ -67,7 +75,13 @@ async fn parent_role_publishes_and_clears_the_process_parent_session_anchor() {
     );
 
     let _ = ext
-        .on_event(&HostEvent::SessionShutdown { reason: "exit".to_string(), target_session_file: None }, &ctx)
+        .on_event(
+            &HostEvent::SessionShutdown {
+                reason: "exit".to_string(),
+                target_session_file: None,
+            },
+            &ctx,
+        )
         .await;
     assert_eq!(
         cyrup_ext_subagents::background::parent_anchor::published_parent_session_anchor(),
@@ -118,7 +132,13 @@ async fn a_subagent_child_never_publishes_or_clears_the_parent_session_anchor() 
 
     cyrup_ext_subagents::clear_parent_session_anchor();
     let _ = child
-        .on_event(&HostEvent::SessionStart { reason: "startup".to_string(), previous_session_file: None }, &ctx)
+        .on_event(
+            &HostEvent::SessionStart {
+                reason: "startup".to_string(),
+                previous_session_file: None,
+            },
+            &ctx,
+        )
         .await;
     assert_eq!(
         cyrup_ext_subagents::background::parent_anchor::published_parent_session_anchor(),
@@ -131,9 +151,9 @@ async fn a_subagent_child_never_publishes_or_clears_the_parent_session_anchor() 
     // The consequence that makes the reorder safe, asserted directly rather than inferred: with
     // nothing published, the inherited ROOT anchor is what a spawn from this process resolves.
     assert_eq!(
-        cyrup_ext_subagents::background::parent_anchor::resolve_parent_session_anchor_from(
-            Some("root-session-anchor".to_string())
-        ),
+        cyrup_ext_subagents::background::parent_anchor::resolve_parent_session_anchor_from(Some(
+            "root-session-anchor".to_string()
+        )),
         Some("root-session-anchor".to_string()),
         "a nested orchestrator keeps threading the ROOT's anchor downward — this is the case \
          the published-first reorder had to leave untouched, and it holds because the register \
@@ -145,7 +165,13 @@ async fn a_subagent_child_never_publishes_or_clears_the_parent_session_anchor() 
     // anchor out from under it.
     cyrup_ext_subagents::publish_parent_session_anchor("root-session-anchor");
     let _ = child
-        .on_event(&HostEvent::SessionShutdown { reason: "exit".to_string(), target_session_file: None }, &ctx)
+        .on_event(
+            &HostEvent::SessionShutdown {
+                reason: "exit".to_string(),
+                target_session_file: None,
+            },
+            &ctx,
+        )
         .await;
     assert_eq!(
         cyrup_ext_subagents::background::parent_anchor::published_parent_session_anchor()
@@ -197,7 +223,10 @@ impl HostServices for WatcherHost {
 async fn parent_ext(
     dir: &Path,
     session: &str,
-) -> (tokio::sync::MutexGuard<'static, ()>, PermissionSystemExtension) {
+) -> (
+    tokio::sync::MutexGuard<'static, ()>,
+    PermissionSystemExtension,
+) {
     let guard = ANCHOR_REGISTER_LOCK.lock().await;
     let agent_dir = dir.join("agent");
     std::fs::create_dir_all(&agent_dir).unwrap();
@@ -219,8 +248,7 @@ fn a_fresh_extension_holds_no_watcher_config_handles() {
     let dir = tempfile::tempdir().unwrap();
     let agent_dir = dir.path().join("agent");
     std::fs::create_dir_all(&agent_dir).unwrap();
-    let ext =
-        PermissionSystemExtension::new_forwarding_parent(agent_dir, dir.path().to_path_buf());
+    let ext = PermissionSystemExtension::new_forwarding_parent(agent_dir, dir.path().to_path_buf());
     assert_eq!(
         ext.live_watcher_task_count(),
         0,
@@ -237,8 +265,19 @@ async fn repeated_hooks_yield_exactly_one_forwarding_watcher() {
     let (_anchor_guard, ext) = parent_ext(dir.path(), "perm005-idem").await;
     let ctx = ui_ctx(dir.path());
 
-    let _ = ext.on_event(&HostEvent::SessionStart { reason: "startup".into(), previous_session_file: None }, &ctx).await;
-    assert!(ext.has_live_forwarding_watcher(), "SessionStart must arm the watcher");
+    let _ = ext
+        .on_event(
+            &HostEvent::SessionStart {
+                reason: "startup".into(),
+                previous_session_file: None,
+            },
+            &ctx,
+        )
+        .await;
+    assert!(
+        ext.has_live_forwarding_watcher(),
+        "SessionStart must arm the watcher"
+    );
 
     // Ten more turns' worth of hooks — the exact re-entry pi performs.
     for _ in 0..10 {
@@ -255,12 +294,15 @@ async fn repeated_hooks_yield_exactly_one_forwarding_watcher() {
             )
             .await;
         let _ = ext
-            .on_event(&HostEvent::Input {
-                text: "hello".into(),
-                images: Vec::new(),
-                source: cyrup_ext::InputEventSource::Interactive,
-                streaming_behavior: None,
-            }, &ctx)
+            .on_event(
+                &HostEvent::Input {
+                    text: "hello".into(),
+                    images: Vec::new(),
+                    source: cyrup_ext::InputEventSource::Interactive,
+                    streaming_behavior: None,
+                },
+                &ctx,
+            )
             .await;
         let _ = ext
             .on_event(
@@ -274,7 +316,10 @@ async fn repeated_hooks_yield_exactly_one_forwarding_watcher() {
             .await;
     }
 
-    assert!(ext.has_live_forwarding_watcher(), "the watcher must still be live");
+    assert!(
+        ext.has_live_forwarding_watcher(),
+        "the watcher must still be live"
+    );
     assert_eq!(
         ext.live_watcher_task_count(),
         1,
@@ -296,7 +341,10 @@ async fn a_later_hook_arms_the_watcher_a_headless_session_start_could_not() {
 
     let _ = ext
         .on_event(
-            &HostEvent::SessionStart { reason: "startup".into(), previous_session_file: None },
+            &HostEvent::SessionStart {
+                reason: "startup".into(),
+                previous_session_file: None,
+            },
             &headless_ctx(dir.path()),
         )
         .await;
@@ -335,9 +383,18 @@ async fn a_detaching_ui_tears_the_forwarding_watcher_down() {
     let (_anchor_guard, ext) = parent_ext(dir.path(), "perm005-detach").await;
 
     let _ = ext
-        .on_event(&HostEvent::SessionStart { reason: "startup".into(), previous_session_file: None }, &ui_ctx(dir.path()))
+        .on_event(
+            &HostEvent::SessionStart {
+                reason: "startup".into(),
+                previous_session_file: None,
+            },
+            &ui_ctx(dir.path()),
+        )
         .await;
-    assert!(ext.has_live_forwarding_watcher(), "SessionStart with a UI arms the watcher");
+    assert!(
+        ext.has_live_forwarding_watcher(),
+        "SessionStart with a UI arms the watcher"
+    );
 
     let _ = ext
         .on_event(
@@ -367,8 +424,20 @@ async fn the_running_watcher_shares_the_extensions_live_config() {
     let (_anchor_guard, ext) = parent_ext(dir.path(), "perm005-config").await;
     let ctx = ui_ctx(dir.path());
 
-    let _ = ext.on_event(&HostEvent::SessionStart { reason: "startup".into(), previous_session_file: None }, &ctx).await;
-    assert_eq!(ext.live_watcher_task_count(), 1, "one watcher, holding the shared handle");
+    let _ = ext
+        .on_event(
+            &HostEvent::SessionStart {
+                reason: "startup".into(),
+                previous_session_file: None,
+            },
+            &ctx,
+        )
+        .await;
+    assert_eq!(
+        ext.live_watcher_task_count(),
+        1,
+        "one watcher, holding the shared handle"
+    );
 
     // The watcher's handle IS the extension's handle: a write here is visible to the task.
     assert!(!guard(&ext.config).yolo_mode);

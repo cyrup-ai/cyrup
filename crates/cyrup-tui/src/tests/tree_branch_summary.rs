@@ -16,25 +16,30 @@
 //! faux-provider-backed `AgentSession`, and assert observable effects: which selector is open, what
 //! `AppAction` an Escape produces, and whether a `branch_summary` entry actually lands in the
 //! session JSONL.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use cyrup_core::{Content, EntryId, Message, StopReason};
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider, FauxResponseStep};
-use cyrup_provider::Provider;
-use cyrup_session_svc::{
-    AgentSession, NavigateTreeOutcome, SessionBuilder, SessionConfig, Settings,
-};
+use super::harness::*;
 use crate::crossterm::event::KeyCode;
 use crate::{
     Action, App, AppAction, AppCommand, Entry, IndicatorKind, Key, SelectAction, SelectorKind,
     TreeNavMsg, UiTheme,
 };
+use cyrup_core::{Content, EntryId, Message, StopReason};
+use cyrup_provider::Provider;
+use cyrup_provider::faux::{FauxProvider, FauxResponseStep, faux_assistant_message, faux_text};
+use cyrup_session_svc::{
+    AgentSession, NavigateTreeOutcome, SessionBuilder, SessionConfig, Settings,
+};
 use ratatui::backend::TestBackend;
 use tempfile::TempDir;
-use super::harness::*;
 
 fn app() -> App<TestBackend> {
     App::new(TestBackend::new(100, 30), UiTheme::dark()).unwrap()
@@ -52,12 +57,18 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 /// Concatenate the text of a core `user` message (the branch summarizer's prompt lives here).
 fn user_text(m: &Message) -> Option<String> {
-    let Message::User { content, .. } = m else { return None };
+    let Message::User { content, .. } = m else {
+        return None;
+    };
     Some(
         content
             .iter()
@@ -84,8 +95,14 @@ async fn two_turn_session_with(
     let cap = captured.clone();
     let faux = Arc::new(FauxProvider::new());
     faux.set_response_steps(vec![
-        FauxResponseStep::from(faux_assistant_message(vec![faux_text("a1")], StopReason::Stop)),
-        FauxResponseStep::from(faux_assistant_message(vec![faux_text("a2")], StopReason::Stop)),
+        FauxResponseStep::from(faux_assistant_message(
+            vec![faux_text("a1")],
+            StopReason::Stop,
+        )),
+        FauxResponseStep::from(faux_assistant_message(
+            vec![faux_text("a2")],
+            StopReason::Stop,
+        )),
         // Any further call is the branch summarizer; record its prompt and answer deterministically.
         FauxResponseStep::factory(move |ctx, _o, _s, _m| {
             if let Some(t) = ctx.messages.iter().find_map(user_text) {
@@ -97,8 +114,13 @@ async fn two_turn_session_with(
     let provider: Arc<dyn Provider> = faux;
     let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
     cfg.trust_override = Some(true);
-    let session =
-        Arc::new(SessionBuilder::new(provider, cfg).cli_settings(cli).build().await.unwrap());
+    let session = Arc::new(
+        SessionBuilder::new(provider, cfg)
+            .cli_settings(cli)
+            .build()
+            .await
+            .unwrap(),
+    );
     let _ = session.prompt("first").await.unwrap();
     session.wait_for_idle().await;
     let _ = session.prompt("second").await.unwrap();
@@ -134,7 +156,10 @@ fn branch_summaries(app: &App<TestBackend>) -> Vec<String> {
 }
 
 fn confirm_tree(target: &EntryId) -> AppCommand {
-    AppCommand::ConfirmSelection { kind: SelectorKind::Tree, value: target.to_string() }
+    AppCommand::ConfirmSelection {
+        kind: SelectorKind::Tree,
+        value: target.to_string(),
+    }
 }
 
 /// Answer the OPEN selector the way a user does — move the highlight `down` rows and press Enter —
@@ -170,7 +195,8 @@ async fn tree_confirm_opens_the_summarize_branch_prompt_instead_of_navigating() 
     let mut app = app();
     let _rx = app.install_tree_nav_channel();
 
-    app.execute_command(confirm_tree(&first), &session, None).await;
+    app.execute_command(confirm_tree(&first), &session, None)
+        .await;
 
     assert_eq!(
         app.active_selector_kind(),
@@ -185,7 +211,10 @@ async fn tree_confirm_opens_the_summarize_branch_prompt_instead_of_navigating() 
     // The three options Pi offers, in Pi's order (`:4756-4759`).
     let screen = rendered(&mut app);
     for opt in ["No summary", "Summarize", "Summarize with custom prompt"] {
-        assert!(screen.contains(opt), "prompt offers {opt:?}; screen:\n{screen}");
+        assert!(
+            screen.contains(opt),
+            "prompt offers {opt:?}; screen:\n{screen}"
+        );
     }
 }
 
@@ -217,21 +246,34 @@ async fn no_summary_navigates_without_summarizing() {
     let mut app = app();
     let mut rx = app.install_tree_nav_channel();
 
-    app.execute_command(confirm_tree(&first), &session, None).await;
+    app.execute_command(confirm_tree(&first), &session, None)
+        .await;
     let cmd = pick(&mut app, PICK_NO_SUMMARY);
     app.execute_command(cmd, &session, None).await;
 
-    assert!(!app.state().branch_summary_in_flight(), "no summarization was started");
+    assert!(
+        !app.state().branch_summary_in_flight(),
+        "no summarization was started"
+    );
     let msg = rx.recv().await.expect("the navigation settled");
-    assert!(app.apply_tree_nav_outcome(msg).is_none(), "a clean navigation asks for nothing more");
+    assert!(
+        app.apply_tree_nav_outcome(msg).is_none(),
+        "a clean navigation asks for nothing more"
+    );
     assert!(
         statuses(&app).iter().any(|s| s == "navigated session tree"),
         "{:?}",
         statuses(&app)
     );
-    assert!(captured.lock().unwrap().is_empty(), "the summarizer was never called");
+    assert!(
+        captured.lock().unwrap().is_empty(),
+        "the summarizer was never called"
+    );
     let jsonl = session.export_to_jsonl(None).await.unwrap().expect("jsonl");
-    assert!(!jsonl.contains("branch_summary"), "no branch summary was appended");
+    assert!(
+        !jsonl.contains("branch_summary"),
+        "no branch summary was appended"
+    );
 }
 
 /// "Summarize" runs the REAL branch summarizer through `navigate_tree(.., summarize: true)` and the
@@ -244,7 +286,8 @@ async fn summarize_choice_runs_the_summarizer_and_records_the_entry() {
     let mut app = app();
     let mut rx = app.install_tree_nav_channel();
 
-    app.execute_command(confirm_tree(&first), &session, None).await;
+    app.execute_command(confirm_tree(&first), &session, None)
+        .await;
     let cmd = pick(&mut app, PICK_SUMMARIZE);
     app.execute_command(cmd, &session, None).await;
 
@@ -255,15 +298,26 @@ async fn summarize_choice_runs_the_summarizer_and_records_the_entry() {
     let msg = rx.recv().await.expect("the navigation settled");
     assert!(app.apply_tree_nav_outcome(msg).is_none());
 
-    assert_eq!(captured.lock().unwrap().len(), 1, "exactly one summarizer call");
+    assert_eq!(
+        captured.lock().unwrap().len(),
+        1,
+        "exactly one summarizer call"
+    );
     let summaries = branch_summaries(&app);
-    assert_eq!(summaries.len(), 1, "one branch summary block: {summaries:?}");
+    assert_eq!(
+        summaries.len(),
+        1,
+        "one branch summary block: {summaries:?}"
+    );
     assert!(
         summaries[0].contains("BRANCH-BODY"),
         "the produced summary reaches the transcript: {summaries:?}"
     );
     let jsonl = session.export_to_jsonl(None).await.unwrap().expect("jsonl");
-    assert!(jsonl.contains("branch_summary"), "the branch summary is persisted");
+    assert!(
+        jsonl.contains("branch_summary"),
+        "the branch summary is persisted"
+    );
     // The indicator/Escape rebind are torn down in Pi's `finally` (`:4830-4833`).
     assert!(!app.state().branch_summary_in_flight());
     assert_eq!(app.state().indicator.kind(), IndicatorKind::Idle);
@@ -278,7 +332,8 @@ async fn custom_prompt_choice_opens_the_editor_and_threads_the_instructions() {
     let mut app = app();
     let mut rx = app.install_tree_nav_channel();
 
-    app.execute_command(confirm_tree(&first), &session, None).await;
+    app.execute_command(confirm_tree(&first), &session, None)
+        .await;
     let cmd = pick(&mut app, PICK_CUSTOM);
     app.execute_command(cmd, &session, None).await;
     assert_eq!(
@@ -326,20 +381,37 @@ async fn the_instructions_editor_hint_names_the_users_own_keys() {
     let mut app = app();
     let _rx = app.install_tree_nav_channel();
 
-    app.execute_command(confirm_tree(&first), &session, None).await;
+    app.execute_command(confirm_tree(&first), &session, None)
+        .await;
     let cmd = pick(&mut app, PICK_CUSTOM);
     // Rebind AFTER the prompt is answered and BEFORE the dialog is constructed, so the labels can
     // only be right if the dialog resolved them itself. (`pick` presses Enter, which is what is
     // being rebound — doing this earlier would break the prompt, not the assertion.)
-    app.state_mut().select_keymap.set_action(SelectAction::Confirm, vec![Key::ctrl('s')]);
-    app.state_mut().keymap.set_action(Action::ExternalEditor, vec![Key::ctrl('x')]);
+    app.state_mut()
+        .select_keymap
+        .set_action(SelectAction::Confirm, vec![Key::ctrl('s')]);
+    app.state_mut()
+        .keymap
+        .set_action(Action::ExternalEditor, vec![Key::ctrl('x')]);
     app.execute_command(cmd, &session, None).await;
-    assert_eq!(app.active_selector_kind(), Some(SelectorKind::BranchSummaryInstructions));
+    assert_eq!(
+        app.active_selector_kind(),
+        Some(SelectorKind::BranchSummaryInstructions)
+    );
 
     let screen = rendered(&mut app);
-    assert!(screen.contains("ctrl+s submit"), "U5: the rebound confirm key:\n{screen}");
-    assert!(screen.contains("ctrl+x external editor"), "U5: the rebound external key:\n{screen}");
-    assert!(!screen.contains("enter submit"), "U5: the stock label must be gone:\n{screen}");
+    assert!(
+        screen.contains("ctrl+s submit"),
+        "U5: the rebound confirm key:\n{screen}"
+    );
+    assert!(
+        screen.contains("ctrl+x external editor"),
+        "U5: the rebound external key:\n{screen}"
+    );
+    assert!(
+        !screen.contains("enter submit"),
+        "U5: the stock label must be gone:\n{screen}"
+    );
     assert!(
         screen.contains("shift+enter/ctrl+j newline"),
         "U4: `keyText` joins every key bound to `tui.input.newLine`:\n{screen}"
@@ -357,7 +429,8 @@ async fn escape_on_the_summary_prompt_reshows_the_tree() {
     let mut app = app();
     let _rx = app.install_tree_nav_channel();
 
-    app.execute_command(confirm_tree(&first), &session, None).await;
+    app.execute_command(confirm_tree(&first), &session, None)
+        .await;
     let action = app.handle_input(&key(KeyCode::Esc));
     assert_eq!(
         action,
@@ -366,10 +439,14 @@ async fn escape_on_the_summary_prompt_reshows_the_tree() {
     );
 
     // …and the re-shown tree lands on the SAME entry Pi re-selects.
-    app.execute_command(AppCommand::OpenSelector(SelectorKind::Tree), &session, None).await;
+    app.execute_command(AppCommand::OpenSelector(SelectorKind::Tree), &session, None)
+        .await;
     assert_eq!(app.active_selector_kind(), Some(SelectorKind::Tree));
     let screen = rendered(&mut app);
-    assert!(screen.contains("first"), "the tree is back on screen:\n{screen}");
+    assert!(
+        screen.contains("first"),
+        "the tree is back on screen:\n{screen}"
+    );
 }
 
 /// Escaping the custom-instructions editor loops back to the PROMPT (Pi's `continue`, `:4770-4773`),
@@ -381,10 +458,14 @@ async fn escape_in_the_instructions_editor_returns_to_the_prompt() {
     let mut app = app();
     let mut rx = app.install_tree_nav_channel();
 
-    app.execute_command(confirm_tree(&first), &session, None).await;
+    app.execute_command(confirm_tree(&first), &session, None)
+        .await;
     let cmd = pick(&mut app, PICK_CUSTOM);
     app.execute_command(cmd, &session, None).await;
-    assert_eq!(app.active_selector_kind(), Some(SelectorKind::BranchSummaryInstructions));
+    assert_eq!(
+        app.active_selector_kind(),
+        Some(SelectorKind::BranchSummaryInstructions)
+    );
 
     let action = app.handle_input(&key(KeyCode::Esc));
     assert_eq!(action, AppAction::Redraw, "the loop stays in-crate");
@@ -397,7 +478,10 @@ async fn escape_in_the_instructions_editor_returns_to_the_prompt() {
     // The pending target survived the loop: answering now still navigates that same entry.
     let cmd = pick(&mut app, PICK_NO_SUMMARY);
     app.execute_command(cmd, &session, None).await;
-    let msg = rx.recv().await.expect("the navigation settled after the editor loop");
+    let msg = rx
+        .recv()
+        .await
+        .expect("the navigation settled after the editor loop");
     app.apply_tree_nav_outcome(msg);
     assert!(
         statuses(&app).iter().any(|s| s == "navigated session tree"),
@@ -417,11 +501,16 @@ async fn escape_during_a_branch_summarization_aborts_the_summary() {
     let mut app = app();
     let mut rx = app.install_tree_nav_channel();
 
-    app.execute_command(confirm_tree(&first), &session, None).await;
+    app.execute_command(confirm_tree(&first), &session, None)
+        .await;
     let cmd = pick(&mut app, PICK_SUMMARIZE);
     app.execute_command(cmd, &session, None).await;
     assert!(app.state().branch_summary_in_flight());
-    assert_eq!(app.active_selector_kind(), None, "the prompt closed on confirm");
+    assert_eq!(
+        app.active_selector_kind(),
+        None,
+        "the prompt closed on confirm"
+    );
 
     assert_eq!(
         app.handle_input(&key(KeyCode::Esc)),
@@ -444,7 +533,11 @@ async fn escape_during_a_branch_summarization_aborts_the_summary() {
 #[test]
 fn an_aborted_summarization_reshows_the_tree_rather_than_reporting_a_cancellation() {
     let mut app = app();
-    let aborted = NavigateTreeOutcome { cancelled: true, aborted: true, ..Default::default() };
+    let aborted = NavigateTreeOutcome {
+        cancelled: true,
+        aborted: true,
+        ..Default::default()
+    };
     let follow_up = app.apply_tree_nav_outcome(TreeNavMsg::new("e7", Ok(aborted)));
 
     assert_eq!(
@@ -452,7 +545,10 @@ fn an_aborted_summarization_reshows_the_tree_rather_than_reporting_a_cancellatio
         Some(AppCommand::OpenSelector(SelectorKind::Tree)),
         "Pi re-shows the tree on `result.aborted` (interactive-mode.ts:4807)"
     );
-    assert_eq!(statuses(&app), vec!["Branch summarization cancelled".to_string()]);
+    assert_eq!(
+        statuses(&app),
+        vec!["Branch summarization cancelled".to_string()]
+    );
 }
 
 /// A plain (non-aborted) cancellation still reports a cancellation and does NOT re-show the tree —
@@ -460,8 +556,14 @@ fn an_aborted_summarization_reshows_the_tree_rather_than_reporting_a_cancellatio
 #[test]
 fn a_plain_cancellation_reports_and_stops() {
     let mut app = app();
-    let cancelled = NavigateTreeOutcome { cancelled: true, ..Default::default() };
-    assert_eq!(app.apply_tree_nav_outcome(TreeNavMsg::new("e7", Ok(cancelled))), None);
+    let cancelled = NavigateTreeOutcome {
+        cancelled: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        app.apply_tree_nav_outcome(TreeNavMsg::new("e7", Ok(cancelled))),
+        None
+    );
     assert_eq!(statuses(&app), vec!["Navigation cancelled".to_string()]);
 }
 
@@ -477,19 +579,31 @@ async fn skip_prompt_setting_navigates_without_asking() {
     let cli = Settings::parse(r#"{"branchSummary":{"skipPrompt":true}}"#).unwrap();
     let (session, first, captured) = two_turn_session_with(&fx, cli).await;
     assert!(
-        session.services().settings.effective().branch_summary_skip_prompt(),
+        session
+            .services()
+            .settings
+            .effective()
+            .branch_summary_skip_prompt(),
         "the fixture really did set branchSummary.skipPrompt"
     );
     let mut app = app();
     let mut rx = app.install_tree_nav_channel();
 
-    app.execute_command(confirm_tree(&first), &session, None).await;
+    app.execute_command(confirm_tree(&first), &session, None)
+        .await;
     assert_eq!(app.active_selector_kind(), None, "no prompt is shown");
 
     let msg = rx.recv().await.expect("the navigation settled");
     app.apply_tree_nav_outcome(msg);
-    assert!(statuses(&app).iter().any(|s| s == "navigated session tree"), "{:?}", statuses(&app));
-    assert!(captured.lock().unwrap().is_empty(), "skipPrompt implies wantsSummary = false");
+    assert!(
+        statuses(&app).iter().any(|s| s == "navigated session tree"),
+        "{:?}",
+        statuses(&app)
+    );
+    assert!(
+        captured.lock().unwrap().is_empty(),
+        "skipPrompt implies wantsSummary = false"
+    );
 }
 
 // -------------------------------------------------------------- re-selection on re-show ---------
@@ -507,7 +621,15 @@ fn tree_selector_can_be_reselected_at_a_given_entry() {
     let mut tree = TreeSelector::new(nodes);
     assert_eq!(tree.selected_id().as_deref(), Some("e0"));
     tree.select_id("e2");
-    assert_eq!(tree.selected_id().as_deref(), Some("e2"), "re-shown at the confirmed entry");
+    assert_eq!(
+        tree.selected_id().as_deref(),
+        Some("e2"),
+        "re-shown at the confirmed entry"
+    );
     tree.select_id("nope");
-    assert_eq!(tree.selected_id().as_deref(), Some("e2"), "an unknown id is a no-op, not a panic");
+    assert_eq!(
+        tree.selected_id().as_deref(),
+        Some("e2"),
+        "an unknown id is a no-op, not a panic"
+    );
 }

@@ -23,7 +23,7 @@
 ## ⚠️ ARCHITECTURE CORRECTION — read before §3
 
 **One home: `crates/cyrup-flux`.** Everything — the 15 prompt templates, the `flux` skill, the
-reference docs, the three native renderers, the `ctrl+f` overlay and the `ask_user_question` tool
+reference docs, the three native renderers, the `ctrl+alt+f` overlay and the `ask_user_question` tool
 — lives in a single crate inside the cyrup workspace, and reaches sessions through the
 extension's `ResourcesDiscover` contribution.
 
@@ -127,6 +127,17 @@ not a tool). The `subagent` tool (foreground/background/parallel fan-out, chains
 
 `review.md` also carries `run_in_background: false` wording for `invoke_agent` — port as
 "foreground `subagent` calls" (see §3.3 rule 4).
+
+**The `invoke_agent` → `subagent` row renames onto a tool with a DIFFERENT availability** (gap-analysis
+`FLUX-002`): `invoke_agent` is a core code-puppy tool (`code_puppy/tools/__init__.py` `TOOL_REGISTRY`),
+always present, whereas `subagent` is registered only behind `cyrup-ext-subagents`' opt-in
+`is_installed` gate (`CYRUP_SUBAGENTS` truthy, or a `subagents/config.json` at user/project scope) —
+and this crate is default-on (§2.4). The four renamed templates therefore carry an availability
+pre-condition upstream never needed: check the tool list for `subagent` BEFORE calling it and, when it
+is absent, tell the user once and take the sequential single-task path (`exec`/`aug`/`qa`) or review the
+groups in-line (`review`). Arming subagents from flux was rejected: it would have a default-on extension
+silently flip the gate on an OS-process-spawning subsystem. Pinned by
+`crates/cyrup-flux/tests/flux_002_subagent_fallback.rs`.
 
 ### 0.4 Extension surfaces (verified)
 
@@ -573,7 +584,7 @@ impl NativeExtension for FluxExtension {
         api.register_command("flux/status", cmd("Flux pipeline status panel (todo/done/review)"));
         api.register_command("flux/cheatsheet", cmd("Flux pipeline cheatsheet (stages A–D)"));
         api.register_command("flux/about", cmd("About the Flux pipeline"));
-        api.register_shortcut("ctrl+f", Some("Flux status overlay".into()));
+        api.register_shortcut(STATUS_OVERLAY_SHORTCUT, Some("Flux status overlay".into()));
         api.register_tool(Arc::new(crate::ask_tool::AskUserQuestionTool::new(
             Arc::clone(&self.host_services),
         )));
@@ -616,7 +627,7 @@ impl NativeExtension for FluxExtension {
 
     async fn execute_shortcut(&self, key: &str, ctx: &HostCtx) -> Result<(), ExtError> {
         ctx.require_command_tier()?;
-        if key == "ctrl+f" {
+        if key == STATUS_OVERLAY_SHORTCUT {
             crate::overlay::open_status_overlay(&self.host_services);
         }
         Ok(())
@@ -627,6 +638,15 @@ impl NativeExtension for FluxExtension {
 `bundled_dir()` mirrors
 [`bundled_resources_dir()`](../crates/cyrup-ext-subagents/src/registration/resources.rs):
 `env!("CARGO_MANIFEST_DIR").join("resources")` behind a `CYRUP_FLUX_RESOURCES_DIR` env override.
+
+> **Superseded by FLUX-001 (`docs/gap-analysis/14-cyrup-flux.md`).** `CARGO_MANIFEST_DIR` is the
+> build machine's source path, so a binary run anywhere else lost every template silently. The
+> tree is now EMBEDDED at build time (`build.rs` → `src/bundle.rs`) and materialised under
+> `<agent_dir>/flux/resources/` by `src/install.rs`, a port of upstream's `installer.py` (the
+> copy/manifest/version-gate/`.bak`/flock the row below said was deleted). `resources.rs` decides
+> `BundledRoot::{Vendored, Managed}` once at construction; `CYRUP_FLUX_RESOURCES_DIR` still names a
+> vendored tree that is read as-is, and a miss on either root is now a `notify` warning naming the
+> path, never a silent `Noop`.
 
 **Bundling = single source of truth.** The 15 templates + `_docs/` + skill live in the crate's
 `resources/` tree and are contributed at `ResourceScope::Discovered` (rank 6 — a floor, never
@@ -687,7 +707,7 @@ model and layout **function-for-function** into `state.rs` + `render_status.rs`:
   name → self-issued Error notify + `Ok(None)` (the `execute_command` output-channel contract,
   §0.2). Empty/missing base dir → the `(no flux state at <base>)` line.
 
-#### 3.4.3 `/flux/cheatsheet`, `/flux/about`, and the `ctrl+f` overlay
+#### 3.4.3 `/flux/cheatsheet`, `/flux/about`, and the `ctrl+alt+f` overlay
 
 - **`/flux/cheatsheet`** — port
   [`flux_cheatsheet.py`](../tmp/code-puppy/flux_bootstrap/bundled/scripts/flux_cheatsheet.py):
@@ -704,7 +724,12 @@ model and layout **function-for-function** into `state.rs` + `render_status.rs`:
   embeds the same body via `include_str!` from `resources/` and applies the same two
   transforms, returning plain text (no Rich — the glyph/table layout is already terminal
   markdown; the notification channel shows it as-is).
-- **`ctrl+f` overlay** — `overlay.rs` implements
+- **`ctrl+alt+f` overlay** (gap-analysis `FLUX-004`: the chord was `ctrl+f` until it was found to be
+  `tui.editor.cursorRight`'s default on both sides — pi `packages/tui/src/keybindings.ts:86-89`
+  @v0.84.4, cyrup `EditorKeymap::default()` — and the extension-shortcut tier fires before the
+  editor, so it silently took forward-char away; `flux_bootstrap` registers no keybinding, so the
+  chord is a cyrup choice, now the single constant `extension::STATUS_OVERLAY_SHORTCUT`, pinned
+  against every default keymap by `tests/flux_004_status_shortcut.rs`) — `overlay.rs` implements
   [`InteractiveOverlay`](../crates/cyrup-ext/src/host/overlay.rs) rendering the same status
   model with themed colors (the subagents fleet modal,
   `cyrup-ext-subagents/src/background/fleet_view.rs`, is the pattern to copy). The shortcut
@@ -840,11 +865,11 @@ Every row's source is under
 | `commands/flux/rebase.md` | `prompts/flux/rebase.md` | template | heaviest git user; GAP×5 (confirmations) |
 | `commands/flux/squash-commits.md` | `prompts/flux/squash-commits.md` | template | GAP×7 (confirmations) |
 | `commands/flux/config.md` | `prompts/flux/config.md` | template | writes `config.env`; GAP×3 (new-file flow writes immediately, no questions) |
-| `commands/flux/status.md` + `scripts/flux_status.py` | `/flux/status` native command + `ctrl+f` overlay | **cyrup-ext-flux** | §3.4.2, §3.4.3 |
+| `commands/flux/status.md` + `scripts/flux_status.py` | `/flux/status` native command + `ctrl+alt+f` overlay | **cyrup-ext-flux** | §3.4.2, §3.4.3 |
 | `commands/flux/cheatsheet.md` + `flux_cheatsheet.py` | `/flux/cheatsheet` native command | **cyrup-ext-flux** | §3.4.3 — parses embedded `pipeline.md` |
 | `commands/flux/about.md` + `flux_about.py` | `/flux/about` native command | **cyrup-ext-flux** | §3.4.3 — embeds about body |
 | `commands/flux/_docs/*` | `prompts/flux/_docs/` + `skills/flux/` | content | §3.3 rule 8 |
-| `installer.py` + `register_callbacks.py` | **deleted** | replaced by `cyrup install` (Phase 1) + built-in registration (Phase 2) | no copy/manifest/version-gate |
+| `installer.py` + `register_callbacks.py` | ~~**deleted**~~ `src/install.rs` + `extension.rs::materialise_bundle` (FLUX-001) | ~~replaced by `cyrup install` (Phase 1) + built-in registration (Phase 2)~~ — `cyrup install` is the EXTENSION installer and never vendored this tree; ported after all | copy/manifest/version-gate/`.bak`/flock kept; marker = crate version + bundle sha256; target `<agent_dir>/flux/resources/` not the scanned `prompts/` root; no mode bits; no command-cache rescan |
 | `customizable_commands.py` (dispatch) | **n/a** | cyrup-resources prompt templates already provide it (§0.1) | |
 
 ---
@@ -876,7 +901,7 @@ Every row's source is under
    (per-project pipeline customization); the Phase 2 bundled resources are rank-6
    `Discovered`, so they are always the floor, never an override (§0.4).
 8. **ANSI stripping** — the TUI strips ANSI from external text (§0.4), so the native renderers
-   return glyph-bearing plain text; themed color lives only in the `ctrl+f` overlay, which
+   return glyph-bearing plain text; themed color lives only in the `ctrl+alt+f` overlay, which
    draws ratatui lines natively. Do not emit ANSI into `Ok(Some(text))`.
 
 ---
@@ -897,7 +922,7 @@ Every row's source is under
 | 3 | ~~`cyrup.toml` manifest~~ → crate scaffold + workspace registration | `crates/cyrup-flux` | S | 01 |
 | 4 | State model + status/cheatsheet/about renderers (§3.4.1–3.4.3) | `crates/cyrup-flux` | M | 07–08 |
 | 5 | `ask_user_question` native tool + `FLUX-GAP` sweep (§3.4.4) | `crates/cyrup-flux` | S | 10–11 |
-| 6 | `ctrl+f` status overlay (§3.4.3) | `crates/cyrup-flux` | S | 09 |
+| 6 | `ctrl+alt+f` status overlay (§3.4.3) | `crates/cyrup-flux` | S | 09 |
 | 7 | Wire extension in `main.rs` (×3 arms) + workspace manifests (§3.4.5) | `crates/cyrup` | XS | 01 |
 | 8 | Bundle prompts/skill as built-in resources — **directory contribution** (§3.4.1) | `crates/cyrup-flux` | S | 01 |
 | 9 | Parallel-exec alignment with `subagent` semantics (§3.5) | bundled prompts | S | 12 |
@@ -926,7 +951,7 @@ No cyrup core changes remain.
   §3.4.1); `/flux/status` prints the aligned glyph table reflecting a hand-built
   `~/.flux/<dir>` fixture (todo rows, session-grouped done rows, severity-dot review grid,
   `(no todos)` and `(no flux state at …)` paths); `/flux/cheatsheet` and `/flux/about` print
-  their rendered bodies; `ctrl+f` opens and ESC closes the status overlay in the TUI;
+  their rendered bodies; `ctrl+alt+f` opens and ESC closes the status overlay in the TUI;
   `ask_user_question` appears in the model's tool list and a `/flux/ask` run uses it (no
   `FLUX-GAP` markers remain in the bundled templates).
 - **Parallel exec**: `/flux/exec 2` on a two-task fixture runs both tasks via foreground

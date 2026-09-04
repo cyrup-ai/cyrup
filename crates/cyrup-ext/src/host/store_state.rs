@@ -27,19 +27,37 @@ impl HostState {
     /// a mechanism that does not exist and implied a grant path that, until EXT-054, was inert.
     pub fn new(limits: StoreLimits) -> Self {
         let ctx = WasiCtxBuilder::new().build();
-        Self { ctx, table: ResourceTable::new(), limits, guest: None }
+        Self {
+            ctx,
+            table: ResourceTable::new(),
+            limits,
+            guest: None,
+        }
     }
 
     /// Build with the guest import backing wired in (the loaded-extension path).
     pub fn with_guest(limits: StoreLimits, guest: Arc<GuestState>) -> Self {
         let ctx = WasiCtxBuilder::new().build();
-        Self { ctx, table: ResourceTable::new(), limits, guest: Some(guest) }
+        Self {
+            ctx,
+            table: ResourceTable::new(),
+            limits,
+            guest: Some(guest),
+        }
     }
 
     /// Build with stdout/stderr inherited (used by test fixtures that print diagnostics).
     pub fn with_inherited_stdio(limits: StoreLimits) -> Self {
-        let ctx = WasiCtxBuilder::new().inherit_stdout().inherit_stderr().build();
-        Self { ctx, table: ResourceTable::new(), limits, guest: None }
+        let ctx = WasiCtxBuilder::new()
+            .inherit_stdout()
+            .inherit_stderr()
+            .build();
+        Self {
+            ctx,
+            table: ResourceTable::new(),
+            limits,
+            guest: None,
+        }
     }
 
     /// The guest import backing, or an error if this store was not built for a loaded extension.
@@ -52,6 +70,9 @@ impl HostState {
 
 impl WasiView for HostState {
     fn ctx(&mut self) -> WasiCtxView<'_> {
-        WasiCtxView { ctx: &mut self.ctx, table: &mut self.table }
+        WasiCtxView {
+            ctx: &mut self.ctx,
+            table: &mut self.table,
+        }
     }
 }

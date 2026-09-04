@@ -14,9 +14,7 @@ use anyhow::Context;
 use cyrup_config::ConfigDirs;
 use cyrup_resources::theme::ThemeWatcher;
 use cyrup_sdk::core::CancelToken;
-use cyrup_session_svc::{
-    AgentSession, AgentSessionRuntime, InputSource, SessionLayout, UserInput,
-};
+use cyrup_session_svc::{AgentSession, AgentSessionRuntime, InputSource, SessionLayout, UserInput};
 use cyrup_tui::{App, StdinTerminalProbe, ThemeController, UiTheme, crossterm_input_stream};
 
 use crate::input::Inputs;
@@ -61,7 +59,8 @@ pub async fn print_resume_hint(dirs: &ConfigDirs, session: &AgentSession) {
         session_dir: session.session_dir(),
         default_session_dir: &default_session_dir,
     };
-    let Some(command) = cyrup_tui::format_resume_command(&target, std::io::stdout().is_tty()) else {
+    let Some(command) = cyrup_tui::format_resume_command(&target, std::io::stdout().is_tty())
+    else {
         return;
     };
     let mut out = std::io::stdout();
@@ -125,7 +124,13 @@ fn build_startup_report(session: &AgentSession, verbose: bool) -> cyrup_tui::Sta
                 )
             })
             .collect(),
-        skills: services.resources.skills.all().iter().map(|s| s.name.clone()).collect(),
+        skills: services
+            .resources
+            .skills
+            .all()
+            .iter()
+            .map(|s| s.name.clone())
+            .collect(),
         // Prompt templates list as their slash command (Pi `/${template.name}`, `:1596`).
         prompts: services
             .resources
@@ -134,7 +139,12 @@ fn build_startup_report(session: &AgentSession, verbose: bool) -> cyrup_tui::Sta
             .iter()
             .map(|p| format!("/{}", p.name))
             .collect(),
-        extensions: services.ext_host.loaded_ids().iter().map(|id| id.to_string()).collect(),
+        extensions: services
+            .ext_host
+            .loaded_ids()
+            .iter()
+            .map(|id| id.to_string())
+            .collect(),
         // Built-ins are excluded — Pi lists only themes with a `sourcePath` (`:1615`).
         themes: services
             .resources
@@ -194,6 +204,10 @@ pub async fn run_interactive(
     // the `tuiMode` SETTING decides — the precedence ADR-0005 §B-14 fixes and `cli/enums.rs`
     // documents: the flag wins when given, else the setting, else `regular`.
     tui_mode: Option<cyrup_config::settings::TuiMode>,
+    // TUI-037 — pi's `InteractiveModeOptions.autoTrustOnReloadCwd` (`interactive-mode.ts:344`
+    // @v0.84.4), computed at the composition root (`main.ts:701-704`) and handed in here exactly
+    // as `migratedProviders` is: the session cwd when its trust was granted implicitly at boot.
+    auto_trust_on_reload_cwd: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     // Boot the render theme from `settings.theme` + the terminal background/color-depth (feature #4:
     // the `ThemeController`), instead of the hardwired dark boot the audit flagged (theme.rs #4). An
@@ -211,8 +225,8 @@ pub async fn run_interactive(
     // not be entered (a terminal that rejected the escape, a backend rebuild that failed), and the
     // session continues inline rather than dying — upstream's own posture, and the reason
     // `install_renderer` returns a bool rather than propagating.
-    let effective_tui_mode = tui_mode
-        .unwrap_or_else(|| session.services().settings.effective().tui_mode());
+    let effective_tui_mode =
+        tui_mode.unwrap_or_else(|| session.services().settings.effective().tui_mode());
     if effective_tui_mode == cyrup_config::settings::TuiMode::Fullscreen {
         let outcome = app.switch_tui_mode(
             cyrup_tui::TuiRenderMode::Fullscreen,
@@ -225,7 +239,12 @@ pub async fn run_interactive(
         // pi documents the `/settings` row as having "no effect in regular mode", and the setter is
         // a no-op inline for the same reason.
         app.set_fullscreen_scrollbar(
-            match session.services().settings.effective().fullscreen_scrollbar() {
+            match session
+                .services()
+                .settings
+                .effective()
+                .fullscreen_scrollbar()
+            {
                 cyrup_config::settings::FullscreenScrollbar::Always => {
                     cyrup_tui::ScrollbarMode::Always
                 }
@@ -322,6 +341,9 @@ pub async fn run_interactive(
     // `Vec<String>`, so the description an extension registered was dropped one call from the
     // renderer and `/hotkeys` printed the key id as its own label.
     app.set_extension_shortcuts(session.services().ext_host.shortcut_specs());
+    // TUI-037 — arm the implicit-trust save `/reload` performs (pi stores the option at
+    // `interactive-mode.ts:572` @v0.84.4; the consumer is `App::maybe_save_implicit_project_trust`).
+    app.set_auto_trust_on_reload_cwd(auto_trust_on_reload_cwd);
 
     // Theme hot-reload (feature #1; Pi `ThemeWatcher`, theme.ts watch path): when the active theme
     // resolves to an on-disk file, watch it so `/theme` edits repaint live. The watcher must outlive
@@ -360,7 +382,9 @@ pub async fn run_interactive(
     // Use /login …" (auth-guidance.ts:14-16), the instruction that turns a modelless launch
     // (SEAM-075) into a working session. The `Warning: ` prefix was missing at this call site.
     if let Some(msg) = runtime.model_fallback_message().await {
-        app.state_mut().transcript.push_warning(format!("Warning: {msg}"));
+        app.state_mut()
+            .transcript
+            .push_warning(format!("Warning: {msg}"));
     }
 
     let input_stream = crossterm_input_stream(cancel.clone());
@@ -380,8 +404,11 @@ pub async fn run_interactive(
     // `showCacheMissNotices` gates the derived notices below, and `App::seed_session_ui` — which
     // caches it — does not run until `App::run` takes over, so seed it here or a `--resume` would
     // replay with the boot default rather than the persisted value.
-    app.state_mut().show_cache_miss_notices =
-        session.services().settings.effective().show_cache_miss_notices();
+    app.state_mut().show_cache_miss_notices = session
+        .services()
+        .settings
+        .effective()
+        .show_cache_miss_notices();
     // `replay_items` is `raw_context_messages` plus the cache-miss and compaction-cost notices pi
     // re-derives on every rebuild (`interactive-mode.ts:3694-3696`, `:3788-3794`); neither is
     // persisted, so this is the only way a resumed transcript carries them.
@@ -390,7 +417,8 @@ pub async fn run_interactive(
         // X11 — WITH the loaded extensions: Pi resolves `getMessageRenderer(message.customType)` on
         // the replay walk (`interactive-mode.ts:3471`) exactly as it does on the live
         // `addMessageToChat` path, so a `--resume`d session keeps the extension rendering it had.
-        app.replay_items_with_extensions(&restored, &session.services().ext_host).await;
+        app.replay_items_with_extensions(&restored, &session.services().ext_host)
+            .await;
     }
 
     if !inputs.is_empty() {
@@ -466,8 +494,14 @@ async fn seed_footer<B: cyrup_tui::RebuildBackend>(
     // seeds an empty model — which `cyrup_tui::status` already renders as `no-model` (status.rs:394)
     // — and no provider, instead of a fabricated `provider/model` pair.
     let model = session.model();
-    let provider = model.as_ref().map(|m| m.provider.as_str().to_string()).unwrap_or_default();
-    let model_id = model.as_ref().map(|m| m.model.as_str().to_string()).unwrap_or_default();
+    let provider = model
+        .as_ref()
+        .map(|m| m.provider.as_str().to_string())
+        .unwrap_or_default();
+    let model_id = model
+        .as_ref()
+        .map(|m| m.model.as_str().to_string())
+        .unwrap_or_default();
     let status = app.status_mut();
     status.set_model(match model.as_ref() {
         Some(_) => format!("{provider}/{model_id}"),

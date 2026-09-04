@@ -10,7 +10,12 @@
 //! `HostServices` trait had no state accessors, and `grep shutdown wit/world.wit` found only the
 //! INBOUND `on-session-shutdown`. These tests drive a real guest across the wasm boundary and
 //! assert the HOST observed the call — not that the guest's binding returned `Ok`.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use crate::fixture;
 
@@ -39,7 +44,9 @@ async fn abort_from_an_event_handler_reaches_the_host() {
     let bytes = std::fs::read(fixture::component()).expect("read fixture component bytes");
     let host = cyrup_ext::ExtensionHost::with_wasm(fixture::cfg()).expect("host with wasm runtime");
     let svc = services();
-    host.load_wasm("demo".into(), &bytes, svc.clone()).await.expect("load + init");
+    host.load_wasm("demo".into(), &bytes, svc.clone())
+        .await
+        .expect("load + init");
 
     let cancel = CancelToken::new();
     let reduced = host
@@ -53,10 +60,15 @@ async fn abort_from_an_event_handler_reaches_the_host() {
             &cancel,
         )
         .await;
-    assert!(matches!(reduced, Reduced::Blocked { .. }), "the guest handler ran");
+    assert!(
+        matches!(reduced, Reduced::Blocked { .. }),
+        "the guest handler ran"
+    );
 
     assert!(
-        svc.control_ops().iter().any(|op| matches!(op, ControlOp::Abort)),
+        svc.control_ops()
+            .iter()
+            .any(|op| matches!(op, ControlOp::Abort)),
         "an event-tier ctx.abort() must reach the host control sink, got {:?}",
         svc.control_ops()
     );
@@ -67,7 +79,9 @@ async fn abort_from_an_event_handler_reaches_the_host() {
     );
     let notes = svc.notify_calls();
     assert!(
-        notes.iter().any(|(m, _)| m.contains("abort requested from a tool_call handler")),
+        notes
+            .iter()
+            .any(|(m, _)| m.contains("abort requested from a tool_call handler")),
         "the guest observed abort() succeeding: {notes:?}"
     );
 }
@@ -78,7 +92,9 @@ async fn shutdown_from_an_event_handler_reaches_the_host() {
     let bytes = std::fs::read(fixture::component()).expect("read fixture component bytes");
     let host = cyrup_ext::ExtensionHost::with_wasm(fixture::cfg()).expect("host with wasm runtime");
     let svc = services();
-    host.load_wasm("demo".into(), &bytes, svc.clone()).await.expect("load + init");
+    host.load_wasm("demo".into(), &bytes, svc.clone())
+        .await
+        .expect("load + init");
 
     let cancel = CancelToken::new();
     let _ = host
@@ -94,13 +110,17 @@ async fn shutdown_from_an_event_handler_reaches_the_host() {
         .await;
 
     assert!(
-        svc.control_ops().iter().any(|op| matches!(op, ControlOp::Shutdown)),
+        svc.control_ops()
+            .iter()
+            .any(|op| matches!(op, ControlOp::Shutdown)),
         "an event-tier ctx.shutdown() must reach the host control sink, got {:?}",
         svc.control_ops()
     );
     let notes = svc.notify_calls();
     assert!(
-        notes.iter().any(|(m, _)| m.contains("shutdown requested from a tool_call handler")),
+        notes
+            .iter()
+            .any(|(m, _)| m.contains("shutdown requested from a tool_call handler")),
         "the guest observed shutdown() succeeding: {notes:?}"
     );
 }
@@ -113,10 +133,16 @@ async fn the_guest_reads_live_ctx_state_from_the_host() {
     let bytes = std::fs::read(fixture::component()).expect("read fixture component bytes");
     let host = cyrup_ext::ExtensionHost::with_wasm(fixture::cfg()).expect("host with wasm runtime");
     let svc = services();
-    let ext = host.load_wasm("demo".into(), &bytes, svc).await.expect("load + init");
+    let ext = host
+        .load_wasm("demo".into(), &bytes, svc)
+        .await
+        .expect("load + init");
 
     let cancel = CancelToken::new();
-    let out = ext.execute_command("ctxstate", "", &cancel).await.expect("ctxstate runs");
+    let out = ext
+        .execute_command("ctxstate", "", &cancel)
+        .await
+        .expect("ctxstate runs");
     assert_eq!(
         out.as_deref(),
         Some("idle=false pending=true trusted=true prompt=SYSTEM-PROMPT-FROM-HOST"),

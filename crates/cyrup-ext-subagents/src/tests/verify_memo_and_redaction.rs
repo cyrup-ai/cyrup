@@ -160,7 +160,7 @@ fn the_sensitive_key_pattern_matches_upstreams_words_at_underscore_boundaries_on
         "TOKEN",
         "GITHUB_TOKEN",
         "TOKEN_FILE",
-        "token",                  // the `i` flag
+        "token", // the `i` flag
         "MY_SECRET",
         "DB_PASSWORD",
         "SSH_PASS",
@@ -168,12 +168,15 @@ fn the_sensitive_key_pattern_matches_upstreams_words_at_underscore_boundaries_on
         "SERVICE_CREDENTIAL_X",
         "COOKIE_JAR",
         "SESSION_ID",
-        "PRIVATE_KEY_PEM",        // via PRIVATE
+        "PRIVATE_KEY_PEM", // via PRIVATE
         "OPENAI_API_KEY",
         "AWS_SECRET_ACCESS_KEY",
     ];
     for key in matching {
-        let redacted = model::redact_verify_env("value=supersecretvalue", Some(&env_of(&[(key, "supersecretvalue")])));
+        let redacted = model::redact_verify_env(
+            "value=supersecretvalue",
+            Some(&env_of(&[(key, "supersecretvalue")])),
+        );
         assert_eq!(
             redacted, "value=[REDACTED]",
             "`{key}` must be treated as sensitive (acceptance.ts:974)"
@@ -181,17 +184,20 @@ fn the_sensitive_key_pattern_matches_upstreams_words_at_underscore_boundaries_on
     }
 
     let not_matching = [
-        "TOKENIZER",     // TOKEN not followed by `_` or end
-        "PASSAGE",       // PASS not followed by `_` or end
+        "TOKENIZER", // TOKEN not followed by `_` or end
+        "PASSAGE",   // PASS not followed by `_` or end
         "AUTHORITY",
         "SESSIONS",
         "PATH",
-        "APIKEY",        // upstream requires the underscore: API_KEY
+        "APIKEY", // upstream requires the underscore: API_KEY
         "HOME",
         "CARGO_TARGET_DIR",
     ];
     for key in not_matching {
-        let redacted = model::redact_verify_env("value=supersecretvalue", Some(&env_of(&[(key, "supersecretvalue")])));
+        let redacted = model::redact_verify_env(
+            "value=supersecretvalue",
+            Some(&env_of(&[(key, "supersecretvalue")])),
+        );
         assert_eq!(
             redacted, "value=supersecretvalue",
             "`{key}` is NOT in upstream's pattern and must not blanket-redact its value"
@@ -255,7 +261,8 @@ async fn the_live_gate_runner_redacts_a_leaked_secret_out_of_the_captured_output
         &[("DEPLOY_TOKEN", "tok_live_9f3a2b7c")],
     );
 
-    let results = run_verify_commands_memoized(std::slice::from_ref(&command), dir.path(), None).await;
+    let results =
+        run_verify_commands_memoized(std::slice::from_ref(&command), dir.path(), None).await;
 
     assert_eq!(results.len(), 1);
     let tail = output_tail(&results[0]);
@@ -293,8 +300,14 @@ async fn the_live_model_runner_redacts_both_stdout_and_stderr() {
         !stdout.contains("hunter2hunter2") && !stderr.contains("hunter2hunter2"),
         "stdout={stdout:?} stderr={stderr:?} still carry the credential"
     );
-    assert_eq!(stdout, "out [REDACTED]", "stdout redacted (acceptance.ts:1194)");
-    assert_eq!(stderr, "err [REDACTED]", "stderr redacted (acceptance.ts:1195)");
+    assert_eq!(
+        stdout, "out [REDACTED]",
+        "stdout redacted (acceptance.ts:1194)"
+    );
+    assert_eq!(
+        stderr, "err [REDACTED]",
+        "stderr redacted (acceptance.ts:1195)"
+    );
     assert!(
         result.memoized.is_none() && result.cache_key.is_none(),
         "with no memo context the result carries no memoization evidence at all: {result:?}"
@@ -414,10 +427,18 @@ async fn the_live_gate_replays_a_memoized_verify_result_instead_of_re_running_th
         AcceptanceStatus::Verified,
         "an exit-0 verify command reaches verified: {first:?}"
     );
-    assert_eq!(execution_count(&marker), 1, "the first evaluation really ran it");
+    assert_eq!(
+        execution_count(&marker),
+        1,
+        "the first evaluation really ran it"
+    );
 
     // The memo artifact upstream writes (`acceptance.ts:1113-1126`).
-    let cache_dir = artifacts.path().join("acceptance").join("verify").join("run-A");
+    let cache_dir = artifacts
+        .path()
+        .join("acceptance")
+        .join("verify")
+        .join("run-A");
     let entries: Vec<_> = std::fs::read_dir(&cache_dir)
         .expect("the memo directory is created")
         .filter_map(Result::ok)
@@ -452,10 +473,21 @@ async fn the_live_gate_replays_a_memoized_verify_result_instead_of_re_running_th
     // except that it announces itself as a replay. The executed one carries `memoized: false`
     // (`:1112`). Before the two verify-result shapes collapsed onto upstream's one, the live gate's
     // shape had no `memoized` field at all, so this compared equal by having nothing to compare.
-    assert_eq!(first.verify_results[0].memoized, Some(false), "the first run EXECUTED");
-    assert_eq!(second.verify_results[0].memoized, Some(true), "the second run REPLAYED");
     assert_eq!(
-        model::AcceptanceVerifyResult { memoized: Some(false), ..second.verify_results[0].clone() },
+        first.verify_results[0].memoized,
+        Some(false),
+        "the first run EXECUTED"
+    );
+    assert_eq!(
+        second.verify_results[0].memoized,
+        Some(true),
+        "the second run REPLAYED"
+    );
+    assert_eq!(
+        model::AcceptanceVerifyResult {
+            memoized: Some(false),
+            ..second.verify_results[0].clone()
+        },
         first.verify_results[0],
         "apart from the `memoized` flag a replayed result is the recorded one verbatim, down to \
          the recorded `duration_ms`, `cache_key`, `env_hash` and `workspace_state` \
@@ -487,7 +519,11 @@ async fn editing_a_tracked_file_invalidates_the_memo_and_the_command_runs_again(
         .await;
         assert_eq!(ledger.status, AcceptanceStatus::Verified);
     }
-    assert_eq!(execution_count(&marker), 1, "premise: the second was a memo hit");
+    assert_eq!(
+        execution_count(&marker),
+        1,
+        "premise: the second was a memo hit"
+    );
 
     std::fs::write(repo.path().join("tracked.txt"), "one\ntwo\n").expect("edit tracked file");
 
@@ -594,7 +630,11 @@ async fn outside_a_git_working_tree_nothing_is_memoized() {
         assert_eq!(ledger.status, AcceptanceStatus::Verified);
     }
 
-    assert_eq!(execution_count(&marker), 2, "a non-git cwd is never memoized");
+    assert_eq!(
+        execution_count(&marker),
+        2,
+        "a non-git cwd is never memoized"
+    );
     assert!(
         !artifacts.path().join("acceptance").exists(),
         "and no memo artifact is written for it"
@@ -641,7 +681,11 @@ async fn a_failing_verify_result_is_memoized_and_still_rejects_on_replay() {
         AcceptanceStatus::Rejected,
         "a replayed FAILURE must still reject: {second:?}"
     );
-    assert_eq!(execution_count(&marker), 1, "the failure was replayed, not re-run");
+    assert_eq!(
+        execution_count(&marker),
+        1,
+        "the failure was replayed, not re-run"
+    );
     assert_eq!(second.verify_results[0].exit_code, Some(3));
 }
 
@@ -682,7 +726,11 @@ async fn a_changed_declared_env_value_invalidates_the_memo() {
     );
 
     // And the credential itself must not be sitting in the artifact directory.
-    let cache_dir = artifacts.path().join("acceptance").join("verify").join("run-E");
+    let cache_dir = artifacts
+        .path()
+        .join("acceptance")
+        .join("verify")
+        .join("run-E");
     for entry in std::fs::read_dir(&cache_dir).expect("memo dir").flatten() {
         let text = std::fs::read_to_string(entry.path()).expect("readable artifact");
         assert!(
@@ -746,7 +794,11 @@ async fn the_model_runner_stamps_upstreams_memoization_evidence_onto_the_result(
         Some(true),
         "the second call replays (`acceptance.ts:1106`): {replayed:?}"
     );
-    assert_eq!(execution_count(&marker), 1, "nothing was spawned the second time");
+    assert_eq!(
+        execution_count(&marker),
+        1,
+        "nothing was spawned the second time"
+    );
     assert_eq!(replayed.exit_code, fresh.exit_code);
     assert_eq!(replayed.status, fresh.status);
     assert_eq!(replayed.cache_key, fresh.cache_key);
@@ -778,9 +830,12 @@ async fn an_unwritable_artifact_path_sets_artifact_error_and_clears_artifact_pat
         allow_failure: None,
     };
 
-    let result =
-        model::run_memoized_verify_command(&command, repo.path(), Some(memo(&artifacts_root, "run-G")))
-            .await;
+    let result = model::run_memoized_verify_command(
+        &command,
+        repo.path(),
+        Some(memo(&artifacts_root, "run-G")),
+    )
+    .await;
 
     assert_eq!(
         result.status,
@@ -817,7 +872,10 @@ async fn a_corrupt_memo_artifact_is_a_miss_not_a_failure() {
     let ctx = memo(artifacts.path(), "run-H");
 
     let fresh = model::run_memoized_verify_command(&command, repo.path(), Some(ctx)).await;
-    let artifact = fresh.artifact_path.clone().expect("an artifact was written");
+    let artifact = fresh
+        .artifact_path
+        .clone()
+        .expect("an artifact was written");
     std::fs::write(&artifact, "{ this is not json").expect("corrupt the artifact");
 
     let after = model::run_memoized_verify_command(&command, repo.path(), Some(ctx)).await;
@@ -949,12 +1007,22 @@ async fn the_live_gate_ledger_carries_every_memoization_evidence_field() {
         "artifactPath must name an artifact that actually exists: {artifact_path}"
     );
     assert!(
-        artifact_path.starts_with(&artifacts.path().join("acceptance/verify/run-EV").display().to_string()),
+        artifact_path.starts_with(
+            &artifacts
+                .path()
+                .join("acceptance/verify/run-EV")
+                .display()
+                .to_string()
+        ),
         "the artifact lives under <artifactsDir>/acceptance/verify/<runId>/ \
          (acceptance.ts:1102): {artifact_path}"
     );
     let cache_key = run.cache_key.as_deref().expect("cacheKey");
-    assert_eq!(cache_key.len(), 64, "a hex sha256 (acceptance.ts:1034-1036)");
+    assert_eq!(
+        cache_key.len(),
+        64,
+        "a hex sha256 (acceptance.ts:1034-1036)"
+    );
     assert!(artifact_path.ends_with(&format!("{cache_key}.json")));
     assert_eq!(run.memoized, Some(false), "this one EXECUTED");
     assert_eq!(
@@ -987,7 +1055,10 @@ async fn the_live_gate_ledger_carries_every_memoization_evidence_field() {
         "workspaceState",
         "evidence_status",
     ] {
-        assert!(wire.contains(key), "the serialized ledger must carry {key}: {wire}");
+        assert!(
+            wire.contains(key),
+            "the serialized ledger must carry {key}: {wire}"
+        );
     }
     let round_tripped: crate::exec::acceptance::AcceptanceLedger =
         serde_json::from_str(&wire).expect("the ledger round-trips");

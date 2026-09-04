@@ -24,10 +24,13 @@ impl IntercomTool {
         // list is missing this session entirely.
         let self_id = client.session_id();
         let sessions = client.list_sessions().await.map_err(to_tool_err)?;
-        let current_session =
-            self_id.as_deref().and_then(|id| sessions.iter().find(|s| s.id == id));
+        let current_session = self_id
+            .as_deref()
+            .and_then(|id| sessions.iter().find(|s| s.id == id));
         let Some(current_session) = current_session else {
-            return Err(ToolError::new("Current session is missing from intercom session list."));
+            return Err(ToolError::new(
+                "Current session is missing from intercom session list.",
+            ));
         };
         let current_cwd = current_session.cwd.clone();
         // `v0.10.1 index.ts:1872`: the addressable column is a DISTINGUISHING prefix
@@ -37,11 +40,19 @@ impl IntercomTool {
         // told to address them by.
         let prefixes = crate::identity::session_id_prefixes(sessions.iter().map(|s| s.id.as_str()));
         let id_prefix = |s: &SessionInfo| {
-            prefixes.get(&s.id).cloned().unwrap_or_else(|| short_session_id(&s.id))
+            prefixes
+                .get(&s.id)
+                .cloned()
+                .unwrap_or_else(|| short_session_id(&s.id))
         };
         let current_section = format!(
             "**Current session:**\n{}",
-            format_session_list_row(current_session, &current_cwd, true, &id_prefix(current_session))
+            format_session_list_row(
+                current_session,
+                &current_cwd,
+                true,
+                &id_prefix(current_session)
+            )
         );
         let other_sessions: Vec<&SessionInfo> = sessions
             .iter()

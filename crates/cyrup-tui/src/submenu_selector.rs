@@ -16,24 +16,26 @@
 //! model step (`:611`) and nothing on its level step, which is the only reason the search box is
 //! optional here.
 
+use ratatui::Frame;
 use ratatui::crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use crate::fuzzy;
 use crate::keymap::{EditorKeymap, SelectAction, SelectKeymap};
 use crate::select_list::{ColumnLayout, SelectItem, SelectList};
-use crate::selector::{border_rule_line, input_line_spans, Selector, SelectorOutcome};
+use crate::selector::{Selector, SelectorOutcome, border_rule_line, input_line_spans};
 use crate::text_input::{Input, InputOutcome};
 use crate::theme::UiTheme;
 
 /// `MODEL_PICKER_LAYOUT` (`settings-selector.ts:27`) — the wider primary column the model step
 /// overrides `SUBMENU_SELECT_LIST_LAYOUT` (`settings-submenu.ts:15-18`) with, so
 /// `provider/long-model-id` labels are not clipped at 32 columns.
-pub(crate) const MODEL_PICKER_LAYOUT: ColumnLayout =
-    ColumnLayout { primary_min: 12, primary_max: 46 };
+pub(crate) const MODEL_PICKER_LAYOUT: ColumnLayout = ColumnLayout {
+    primary_min: 12,
+    primary_max: 46,
+};
 
 /// One step of a `/settings` submenu.
 pub struct SubmenuSelector {
@@ -87,7 +89,11 @@ impl SubmenuSelector {
     /// of the filtered set on every keystroke — unlike `thinking-selector.ts:115`, which preserves
     /// it. Reproduced rather than unified: the two upstream components genuinely differ here.
     fn rebuild(&mut self) {
-        let query = self.input.as_ref().map(|i| i.value().to_string()).unwrap_or_default();
+        let query = self
+            .input
+            .as_ref()
+            .map(|i| i.value().to_string())
+            .unwrap_or_default();
         let indices: Vec<usize> = if query.is_empty() {
             (0..self.all.len()).collect()
         } else {
@@ -98,7 +104,10 @@ impl SubmenuSelector {
                 .iter()
                 .map(|(_, label, desc)| format!("{label} {}", desc.as_deref().unwrap_or("")))
                 .collect();
-            fuzzy::filter(&haystacks, &query, String::as_str).into_iter().map(|m| m.index).collect()
+            fuzzy::filter(&haystacks, &query, String::as_str)
+                .into_iter()
+                .map(|m| m.index)
+                .collect()
         };
         let mut values = Vec::with_capacity(indices.len());
         let mut items = Vec::with_capacity(indices.len());
@@ -109,7 +118,10 @@ impl SubmenuSelector {
             }
         }
         let mut list = SelectList::new(items, self.layout).with_no_match("No matches".to_string());
-        let window = values.len().min(self.max_visible).clamp(1, usize::from(u16::MAX)) as u16;
+        let window = values
+            .len()
+            .min(self.max_visible)
+            .clamp(1, usize::from(u16::MAX)) as u16;
         list.set_max_visible(window);
         self.values = values;
         self.list = list;
@@ -131,11 +143,16 @@ impl SubmenuSelector {
         lines.push(border_rule_line(width, theme));
         lines.push(Line::from(Span::styled(
             self.title.clone(),
-            theme.accent_style().add_modifier(ratatui::style::Modifier::BOLD),
+            theme
+                .accent_style()
+                .add_modifier(ratatui::style::Modifier::BOLD),
         ))); // :59
         if !self.description.is_empty() {
             lines.push(Line::from("")); // :63
-            lines.push(Line::from(Span::styled(self.description.clone(), theme.muted_style())));
+            lines.push(Line::from(Span::styled(
+                self.description.clone(),
+                theme.muted_style(),
+            )));
             // :64
         }
         if let Some(input) = &self.input {
@@ -165,7 +182,9 @@ impl SubmenuSelector {
 
 impl Selector for SubmenuSelector {
     fn desired_height(&self, width: u16) -> u16 {
-        self.lines(width, UiTheme::default_ref()).len().clamp(0, usize::from(u16::MAX)) as u16
+        self.lines(width, UiTheme::default_ref())
+            .len()
+            .clamp(0, usize::from(u16::MAX)) as u16
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {

@@ -29,18 +29,23 @@
 //! addressed to a different session (`isForwardedPermissionRequestForSession`,
 //! `index.ts:1397-1403`) — so nothing here depends on a sleep racing the scan.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use cyrup_ext::HostServices;
 use crate::{
-    forwarding::{forwarding_location, ProcessForwardedOptions, FORWARDING_AGENT_DIR_ENV},
-    process_forwarded_requests, spawn_forwarding_watcher, ExtensionConfig,
-    ForwardedPermissionRequest,
+    ExtensionConfig, ForwardedPermissionRequest,
+    forwarding::{FORWARDING_AGENT_DIR_ENV, ProcessForwardedOptions, forwarding_location},
+    process_forwarded_requests, spawn_forwarding_watcher,
 };
+use cyrup_ext::HostServices;
 
 /// A `HostServices` that publishes a fixed session id — the only thing the watcher's attach phase
 /// needs (`services.session_id()`), and the id every spool path is derived from.
@@ -108,7 +113,9 @@ async fn the_parent_watcher_preserves_its_spool_across_a_drained_scan() {
         agent_dir.path().to_path_buf(),
         Arc::clone(&services),
         Arc::clone(&config),
-        Arc::new(crate::logging::AuditTrail::detached(agent_dir.path().join("logs"))),
+        Arc::new(crate::logging::AuditTrail::detached(
+            agent_dir.path().join("logs"),
+        )),
         // PERM-031: a UI is present for this test, which is the precondition for the spool being
         // serviced at all.
         Arc::new(std::sync::atomic::AtomicBool::new(true)),
@@ -159,7 +166,10 @@ async fn the_parent_watcher_preserves_its_spool_across_a_drained_scan() {
     // And it must STAY preserved across the later wakes (the ticker + watch loop), not just the
     // startup scan.
     let vanished = wait_until(Duration::from_secs(2), || !location.requests_dir.is_dir()).await;
-    assert!(!vanished, "the spool must survive every subsequent scan, not only the first");
+    assert!(
+        !vanished,
+        "the spool must survive every subsequent scan, not only the first"
+    );
 
     watcher.abort();
 }
@@ -171,7 +181,11 @@ async fn the_default_option_bag_still_cleans_up_an_empty_spool() {
     let agent_dir = tempfile::tempdir().expect("tempdir");
     let session_id = "parent-session-cleanup";
     let location = forwarding_location(agent_dir.path(), session_id).expect("derives a location");
-    for dir in [&location.session_root, &location.requests_dir, &location.responses_dir] {
+    for dir in [
+        &location.session_root,
+        &location.requests_dir,
+        &location.responses_dir,
+    ] {
         std::fs::create_dir_all(dir).expect("creates the spool dirs");
     }
 

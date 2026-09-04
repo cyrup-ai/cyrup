@@ -151,7 +151,9 @@ pub fn drain_stdin_before_exit() -> usize {
 fn stdin_is_drainable() -> bool {
     use ratatui::crossterm::terminal::is_raw_mode_enabled;
     use ratatui::crossterm::tty::IsTty;
-    std::io::stdin().is_tty() && std::io::stdout().is_tty() && is_raw_mode_enabled().unwrap_or(false)
+    std::io::stdin().is_tty()
+        && std::io::stdout().is_tty()
+        && is_raw_mode_enabled().unwrap_or(false)
 }
 
 /// The production [`InputDrain`]: `poll(2)` the real stdin fd for readiness, then read and throw the
@@ -195,7 +197,12 @@ impl InputDrain for StdinDrain {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use std::sync::Mutex;
 
@@ -209,7 +216,9 @@ mod tests {
     /// Take [`DRAIN_LOCK`], ignoring poisoning: a sibling that panicked has already reported its own
     /// failure, and refusing the lock here would turn that into a second, misleading one.
     fn lock_drains() -> std::sync::MutexGuard<'static, ()> {
-        DRAIN_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        DRAIN_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// A scripted queue: each `consume_ready` hands back the next chunk size, `0` once the script is
@@ -229,7 +238,10 @@ mod tests {
 
     impl Scripted {
         fn new(chunks: &[usize]) -> Self {
-            Scripted { chunks: chunks.iter().copied().collect(), timeouts: Vec::new() }
+            Scripted {
+                chunks: chunks.iter().copied().collect(),
+                timeouts: Vec::new(),
+            }
         }
     }
 
@@ -273,8 +285,15 @@ mod tests {
             }
         }
         let started = Instant::now();
-        let drained = drain_input(&mut Endless, Duration::from_millis(120), Duration::from_millis(20));
-        assert!(drained > 0, "an endlessly-ready source is drained, not skipped");
+        let drained = drain_input(
+            &mut Endless,
+            Duration::from_millis(120),
+            Duration::from_millis(20),
+        );
+        assert!(
+            drained > 0,
+            "an endlessly-ready source is drained, not skipped"
+        );
         // Only an upper bound is asserted, and a very loose one: under contention the sleeps
         // overshoot arbitrarily, but the loop must never keep *starting* new waits past `max`.
         assert!(

@@ -59,7 +59,10 @@ pub(crate) fn live_text(app: &App<TestBackend>) -> String {
 /// Row `y` as text, with **no** trailing newline — one row, not a range.
 pub(crate) fn row_text(app: &App<TestBackend>, y: u16) -> String {
     let buf = app.terminal().backend().buffer();
-    (0..buf.area.width).filter_map(|x| buf.cell((x, y))).map(|c| c.symbol()).collect()
+    (0..buf.area.width)
+        .filter_map(|x| buf.cell((x, y)))
+        .map(|c| c.symbol())
+        .collect()
 }
 
 /// The index of the first row whose text contains `needle`.
@@ -80,7 +83,9 @@ pub(crate) fn row_with(app: &App<TestBackend>, needle: &str) -> (u16, String) {
 /// `↑`/`↓`/`·`/`…`, so the two are not the same number — indexing the buffer with the byte offset
 /// samples the wrong cell.
 pub(crate) fn col_of(row: &str, needle: &str) -> u16 {
-    let byte = row.find(needle).unwrap_or_else(|| panic!("{needle:?} not in [{row}]"));
+    let byte = row
+        .find(needle)
+        .unwrap_or_else(|| panic!("{needle:?} not in [{row}]"));
     row.get(..byte).map_or(0, |p| p.chars().count()) as u16
 }
 

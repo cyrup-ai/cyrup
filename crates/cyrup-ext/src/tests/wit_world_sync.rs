@@ -12,7 +12,12 @@
 //! — exactly the failure the version gate exists to turn into a typed `ExtError::WorldVersion`.
 //! So the tests below tie `HOST_WORLD` to the `package cyrup:ext@…` line of both copies, and tie the
 //! header's event-count claim to the exports actually declared.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::{Path, PathBuf};
 
@@ -31,7 +36,14 @@ fn read(path: &Path) -> String {
 /// Extract the `package cyrup:ext@MAJOR.MINOR.PATCH;` declaration.
 fn package_version(src: &str, path: &Path) -> String {
     src.lines()
-        .find_map(|l| Some(l.trim().strip_prefix("package ")?.trim_end_matches(';').trim()))
+        .find_map(|l| {
+            Some(
+                l.trim()
+                    .strip_prefix("package ")?
+                    .trim_end_matches(';')
+                    .trim(),
+            )
+        })
         .unwrap_or_else(|| panic!("no `package ...;` line in {}", path.display()))
         .to_string()
 }
@@ -73,9 +85,12 @@ fn the_host_and_guest_wit_world_copies_are_identical() {
 fn host_world_matches_the_wit_package_version_in_both_copies() {
     for path in [host_wit(), guest_wit()] {
         let declared = package_version(&read(&path), &path);
-        let (pkg, ver) = declared
-            .split_once('@')
-            .unwrap_or_else(|| panic!("`package {declared};` is not `name@version` in {}", path.display()));
+        let (pkg, ver) = declared.split_once('@').unwrap_or_else(|| {
+            panic!(
+                "`package {declared};` is not `name@version` in {}",
+                path.display()
+            )
+        });
         let mut parts = ver.split('.');
         let major = parts.next().unwrap_or("");
         let minor = parts.next().unwrap_or("");
@@ -136,7 +151,11 @@ fn the_header_event_count_matches_the_declared_event_exports() {
         .take_while(|l| *l != "}")
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(!body.is_empty(), "no `interface events {{` block in {}", path.display());
+    assert!(
+        !body.is_empty(),
+        "no `interface events {{` block in {}",
+        path.display()
+    );
 
     let declared = body
         .lines()
@@ -152,10 +171,16 @@ fn the_header_event_count_matches_the_declared_event_exports() {
             let (_, rest) = l.split_once("interface exports ")?;
             rest.split_whitespace().next()?.parse().ok()
         })
-        .unwrap_or_else(|| panic!("no `The `events` interface exports N …` claim in {}", path.display()));
+        .unwrap_or_else(|| {
+            panic!(
+                "no `The `events` interface exports N …` claim in {}",
+                path.display()
+            )
+        });
 
     assert_eq!(
-        claimed, declared,
+        claimed,
+        declared,
         "the world header claims {claimed} `on-*` event exports but {} declares {declared}",
         path.display(),
     );
@@ -181,7 +206,9 @@ fn the_cache_key_tracks_the_wit_and_sdk_sources_outside_the_extension_crate() {
         );
     }
     assert!(
-        files.iter().any(|f| f.ends_with("cyrup-ext-sdk/src/guest.rs")),
+        files
+            .iter()
+            .any(|f| f.ends_with("cyrup-ext-sdk/src/guest.rs")),
         "the cyrup-ext-sdk guest crate must be fingerprinted; got {files:?}"
     );
 
@@ -195,8 +222,14 @@ fn the_cache_key_tracks_the_wit_and_sdk_sources_outside_the_extension_crate() {
     );
 
     let id = crate::build::world_abi_id();
-    assert!(id.starts_with(crate::HOST_WORLD), "the world identity leads with HOST_WORLD: {id}");
-    assert!(id.ends_with(&recomputed), "the world identity carries the ABI fingerprint: {id}");
+    assert!(
+        id.starts_with(crate::HOST_WORLD),
+        "the world identity leads with HOST_WORLD: {id}"
+    );
+    assert!(
+        id.ends_with(&recomputed),
+        "the world identity carries the ABI fingerprint: {id}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -262,7 +295,9 @@ fn cited_files() -> Vec<PathBuf> {
 fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
     let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display()));
     for entry in entries {
-        let path = entry.unwrap_or_else(|e| panic!("read {}: {e}", dir.display())).path();
+        let path = entry
+            .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+            .path();
         if path.is_dir() {
             collect_rs(&path, out);
         } else if path.extension().is_some_and(|x| x == "rs") {
@@ -273,37 +308,95 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// A gap-analysis id on the SAME line marks a deliberate quotation of a struck value — the
 /// "do-not-restore" note. Anything else carrying one of these numbers is a live citation.
-const CORRECTIVE_MARKERS: &[&str] =
-    &["EXT-036", "EXT-048", "EXT-060", "EXT-072", "EXT-073", "EXT-074"];
+const CORRECTIVE_MARKERS: &[&str] = &[
+    "EXT-036", "EXT-048", "EXT-060", "EXT-072", "EXT-073", "EXT-074",
+];
 
 /// Values re-derived against `v0.83.0` this pass and found to resolve to an unrelated symbol. Each
 /// entry is `(the citation text, what that line actually is upstream)`; the second half is not
 /// asserted on, it is the reason, kept here so a reader who hits this test learns why rather than
 /// deleting the entry.
 const STRUCK_CITATIONS: &[(&str, &str)] = &[
-    ("types.ts:1145", "blank line (tool_call subscribes at :1228)"),
-    ("types.ts:1146", "`MessageRenderer` (tool_result subscribes at :1229)"),
-    ("types.ts:1144", "a closing brace (context subscribes at :1207)"),
-    ("types.ts:1143", "`expanded: boolean` (message_end subscribes at :1222)"),
-    ("types.ts:1135", "blank line (before_agent_start subscribes at :1214)"),
-    ("types.ts:1158", "the Command Registration banner (input subscribes at :1231)"),
-    ("types.ts:1159", "the Command Registration banner (user_bash subscribes at :1230)"),
-    ("types.ts:1160", "a banner rule (before_provider_request subscribes at :1209)"),
-    ("types.ts:1161", "blank line (after_provider_response subscribes at :1213)"),
-    ("types.ts:1108", "`cancel?: boolean` (getArgumentCompletions is :1166)"),
-    ("types.ts:1109", "`skipConversationRestore` (RegisteredCommand.handler is :1167)"),
-    ("types.ts:1105", "a closing brace (registerCommand is :1247)"),
-    ("types.ts:218", "`getEditorText`'s doc line (addAutocompleteProvider is :225)"),
-    ("types.ts:1373", "an `@example` JSDoc line inside `registerProvider`"),
-    ("types.ts:1257", "wrong surface; getActiveTools/getAllTools/setActiveTools/getCommands are :1320-:1329"),
-    ("types.ts:117", "a `WorkingIndicatorOptions` doc line (AutocompleteProviderFactory is :124)"),
-    ("types.ts:1337", "blank line (registerProvider(name, config) is :1401)"),
+    (
+        "types.ts:1145",
+        "blank line (tool_call subscribes at :1228)",
+    ),
+    (
+        "types.ts:1146",
+        "`MessageRenderer` (tool_result subscribes at :1229)",
+    ),
+    (
+        "types.ts:1144",
+        "a closing brace (context subscribes at :1207)",
+    ),
+    (
+        "types.ts:1143",
+        "`expanded: boolean` (message_end subscribes at :1222)",
+    ),
+    (
+        "types.ts:1135",
+        "blank line (before_agent_start subscribes at :1214)",
+    ),
+    (
+        "types.ts:1158",
+        "the Command Registration banner (input subscribes at :1231)",
+    ),
+    (
+        "types.ts:1159",
+        "the Command Registration banner (user_bash subscribes at :1230)",
+    ),
+    (
+        "types.ts:1160",
+        "a banner rule (before_provider_request subscribes at :1209)",
+    ),
+    (
+        "types.ts:1161",
+        "blank line (after_provider_response subscribes at :1213)",
+    ),
+    (
+        "types.ts:1108",
+        "`cancel?: boolean` (getArgumentCompletions is :1166)",
+    ),
+    (
+        "types.ts:1109",
+        "`skipConversationRestore` (RegisteredCommand.handler is :1167)",
+    ),
+    (
+        "types.ts:1105",
+        "a closing brace (registerCommand is :1247)",
+    ),
+    (
+        "types.ts:218",
+        "`getEditorText`'s doc line (addAutocompleteProvider is :225)",
+    ),
+    (
+        "types.ts:1373",
+        "an `@example` JSDoc line inside `registerProvider`",
+    ),
+    (
+        "types.ts:1257",
+        "wrong surface; getActiveTools/getAllTools/setActiveTools/getCommands are :1320-:1329",
+    ),
+    (
+        "types.ts:117",
+        "a `WorkingIndicatorOptions` doc line (AutocompleteProviderFactory is :124)",
+    ),
+    (
+        "types.ts:1337",
+        "blank line (registerProvider(name, config) is :1401)",
+    ),
     // EXT-074's own citations, struck by the verification pass that closed it. `:342-345` and
     // `:352-354` correspond to NO tag: at v0.83.0 they are the `getAllTools` and `getCommands`
     // bindings, at v0.82.1 `setModel`/`setThinkingLevel` are :359/:369 and at v0.84.x they are
     // :383/:393. The claim they support (pi gates neither) is correct; only the lines were wrong.
-    ("loader.ts:342-345", "the `getAllTools` binding (`setModel` is :359-362 @v0.83.0)"),
-    ("loader.ts:352-354", "the `getCommands` binding (`setThinkingLevel` is :369-372 @v0.83.0)"),
+    (
+        "loader.ts:342-345",
+        "the `getAllTools` binding (`setModel` is :359-362 @v0.83.0)",
+    ),
+    (
+        "loader.ts:352-354",
+        "the `getCommands` binding (`setThinkingLevel` is :369-372 @v0.83.0)",
+    ),
 ];
 
 /// EXT-072/EXT-073: a struck citation may appear ONLY on a line that also names the item that
@@ -399,22 +492,34 @@ fn every_subscribed_at_citation_names_the_event_pi_subscribes_on_that_line() {
         let src = read(&path);
         let lines: Vec<&str> = src.lines().collect();
         for (i, line) in lines.iter().enumerate() {
-            let Some(rest) = line.split("subscribed at").nth(1) else { continue };
+            let Some(rest) = line.split("subscribed at").nth(1) else {
+                continue;
+            };
             let next = lines.get(i + 1).copied().unwrap_or_default();
             // A wrapped citation puts the number on the continuation line.
-            let joined =
-                if rest.trim().is_empty() || !rest.contains(':') { format!("{rest} {next}") } else { rest.to_string() };
+            let joined = if rest.trim().is_empty() || !rest.contains(':') {
+                format!("{rest} {next}")
+            } else {
+                rest.to_string()
+            };
             let Some(num) = joined
                 .split(':')
                 .nth(1)
-                .map(|t| t.chars().take_while(char::is_ascii_digit).collect::<String>())
+                .map(|t| {
+                    t.chars()
+                        .take_while(char::is_ascii_digit)
+                        .collect::<String>()
+                })
                 .and_then(|d| d.parse::<u32>().ok())
             else {
                 continue;
             };
             // The comment the citation belongs to: the line itself plus one either side, which is as
             // far as any of these wrap.
-            let window = format!("{} {line} {next}", lines.get(i.saturating_sub(1)).copied().unwrap_or_default());
+            let window = format!(
+                "{} {line} {next}",
+                lines.get(i.saturating_sub(1)).copied().unwrap_or_default()
+            );
             match PI_EVENT_SUBSCRIPTION_LINES.iter().find(|(_, l)| *l == num) {
                 Some((event, _)) if window.contains(event) => {}
                 Some((event, _)) => wrong.push(format!(

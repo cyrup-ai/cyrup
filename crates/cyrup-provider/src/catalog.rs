@@ -66,7 +66,10 @@ mod tests {
         );
         // Providers that the retired 2-model seed stub could never answer for.
         for expected in ["google", "mistral", "groq", "openrouter", "together"] {
-            assert!(providers.contains(expected), "{expected} missing from the registry catalog");
+            assert!(
+                providers.contains(expected),
+                "{expected} missing from the registry catalog"
+            );
         }
         let sonnet = catalog
             .iter()

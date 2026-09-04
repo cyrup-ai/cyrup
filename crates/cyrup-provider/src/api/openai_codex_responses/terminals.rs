@@ -6,7 +6,12 @@ use cyrup_core::{ApiId, AssistantMessage, CancelToken, StopReason};
 
 /// A terminal error carrying pi's exact thrown message. Like pi's own catch block (`:489-499`) the
 /// content is empty: nothing had been accumulated when the failure occurred on these paths.
-pub(super) fn error_event(model: &Model, api: &ApiId, message: String, aborted: bool) -> StreamEvent {
+pub(super) fn error_event(
+    model: &Model,
+    api: &ApiId,
+    message: String,
+    aborted: bool,
+) -> StreamEvent {
     let msg = AssistantMessage::errored(
         model.provider.clone(),
         model.id.as_str(),

@@ -8,14 +8,19 @@
 //!
 //! This asserts the WIRING: the agent's live overlay changes when the model changes.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use cyrup_provider::faux::FauxProvider;
-use cyrup_provider::Provider;
 use crate::{SessionBuilder, SessionConfig};
+use cyrup_provider::Provider;
+use cyrup_provider::faux::FauxProvider;
 use tempfile::TempDir;
 
 struct Fixture {
@@ -30,7 +35,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -49,7 +58,10 @@ fn base_config(fx: &Fixture) -> SessionConfig {
 async fn a_cross_provider_model_switch_repoints_the_attribution_headers() {
     let fx = fixture();
     let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
-    let session = SessionBuilder::new(provider, base_config(&fx)).build().await.expect("build");
+    let session = SessionBuilder::new(provider, base_config(&fx))
+        .build()
+        .await
+        .expect("build");
 
     let catalog = session.available_model_catalog();
     // Find two models whose attribution genuinely DIFFERS — the merge is host-matched, so an
@@ -73,14 +85,28 @@ async fn a_cross_provider_model_switch_repoints_the_attribution_headers() {
         return;
     };
 
-    session.set_model_resolved(from.clone()).await.expect("select the first model");
+    session
+        .set_model_resolved(from.clone())
+        .await
+        .expect("select the first model");
     let before = session.agent_headers().await;
-    assert_eq!(before, session.attribution_headers(&from), "overlay tracks the first model");
+    assert_eq!(
+        before,
+        session.attribution_headers(&from),
+        "overlay tracks the first model"
+    );
 
-    session.set_model_resolved(to.clone()).await.expect("switch model");
+    session
+        .set_model_resolved(to.clone())
+        .await
+        .expect("switch model");
     let after = session.agent_headers().await;
 
-    assert_eq!(after, session.attribution_headers(&to), "overlay tracks the NEW model");
+    assert_eq!(
+        after,
+        session.attribution_headers(&to),
+        "overlay tracks the NEW model"
+    );
     assert_ne!(
         after, before,
         "a cross-provider switch must repoint the attribution headers, not keep the previous \
@@ -94,10 +120,16 @@ async fn a_cross_provider_model_switch_repoints_the_attribution_headers() {
 async fn the_agents_header_overlay_is_live_and_model_derived() {
     let fx = fixture();
     let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
-    let session = SessionBuilder::new(provider, base_config(&fx)).build().await.expect("build");
+    let session = SessionBuilder::new(provider, base_config(&fx))
+        .build()
+        .await
+        .expect("build");
 
     let models = session.available_model_catalog();
-    assert!(!models.is_empty(), "the faux provider offers at least one model");
+    assert!(
+        !models.is_empty(),
+        "the faux provider offers at least one model"
+    );
 
     // Whatever the active model's attribution is, the agent's live overlay must EQUAL it. Before the
     // fix the agent held a build-time snapshot with no way to be updated, so this could only ever

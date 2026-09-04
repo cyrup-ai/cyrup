@@ -26,7 +26,12 @@
 //! MUTATED process env — `unsafe { std::env::set_var("CYRUP_SUBAGENT_CHILD", "1") }`, never restored
 //! — and [`super`]'s doc barred that from this directory. It no longer mutates anything: the anchor
 //! is a THREAD-LOCAL [`crate::envx`] pin, so the module is an ordinary unit-test module.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::path::Path;
 use std::sync::Arc;
@@ -91,7 +96,11 @@ impl AskChannel for CountingOnceChannel {
 #[allow(clippy::unwrap_used)]
 fn block_on<F: std::future::Future>(body: F) -> F::Output {
     let _pin = crate::envx::pin(CHILD_ENV_VAR, Some("1"));
-    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(body)
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(body)
 }
 
 fn write(path: &Path, body: &str) {
@@ -122,7 +131,9 @@ async fn ext_with_counting_channel(
     let ext = PermissionSystemExtension::from_parts(
         paths,
         ExtensionConfig::default(),
-        Arc::new(CountingOnceChannel { prompts: Arc::clone(&prompts) }),
+        Arc::new(CountingOnceChannel {
+            prompts: Arc::clone(&prompts),
+        }),
     );
     ext.set_host_services(Arc::new(RegistryServices));
     let mut api = InitApi::new();
@@ -192,7 +203,11 @@ async fn reemitted_skill_read_reuses_the_cached_decision_with_no_second_prompt_b
         matches!(first, HookOutcome::Noop),
         "the human allowed the skill read once → it must proceed; got {first:?}"
     );
-    assert_eq!(prompts.load(Ordering::SeqCst), 1, "the first skill-read ask surfaced one dialog");
+    assert_eq!(
+        prompts.load(Ordering::SeqCst),
+        1,
+        "the first skill-read ask surfaced one dialog"
+    );
 
     // The IDENTICAL tool_call, re-emitted. pi reuses the cached decision (collapsed to Allow-Once)
     // and renders ZERO additional prompts.
@@ -226,12 +241,18 @@ async fn reemitted_external_directory_read_reuses_the_cached_decision_with_no_se
     let agent_dir = cwd_dir.path();
     // `read` itself is allowed, so the ONLY gate that prompts is the external-directory guard; an
     // approved-Once falls through to the (allowed) main check.
-    let (ext, prompts) =
-        ext_with_counting_channel(agent_dir, r#"{ "read": "allow", "external_directory": "ask" }"#)
-            .await;
+    let (ext, prompts) = ext_with_counting_channel(
+        agent_dir,
+        r#"{ "read": "allow", "external_directory": "ask" }"#,
+    )
+    .await;
 
     let cwd = agent_dir.to_path_buf();
-    let outside_path = outside_dir.path().join("secret.txt").to_string_lossy().into_owned();
+    let outside_path = outside_dir
+        .path()
+        .join("secret.txt")
+        .to_string_lossy()
+        .into_owned();
     let call = read_call("call-ext-1", &outside_path);
 
     let first = ext.on_event(&call, &ctx(&cwd)).await;
@@ -349,7 +370,10 @@ async fn two_concurrent_identical_asks_collapse_to_one_prompt_body() {
             mcp_server_names_override: None,
         },
         ExtensionConfig::default(),
-        Arc::new(GatedChannel { prompts: Arc::clone(&prompts), gate: gate_rx }),
+        Arc::new(GatedChannel {
+            prompts: Arc::clone(&prompts),
+            gate: gate_rx,
+        }),
     ));
     ext.set_host_services(Arc::new(RegistryServices));
     let mut api = InitApi::new();
@@ -369,7 +393,11 @@ async fn two_concurrent_identical_asks_collapse_to_one_prompt_body() {
     // Run the leader up to its suspension point — inside the open dialog — so the follower cannot
     // simply lose the race. No timing involved: `settle` yields, it does not sleep.
     settle().await;
-    assert_eq!(prompts.load(Ordering::SeqCst), 1, "the leader must have opened exactly one prompt");
+    assert_eq!(
+        prompts.load(Ordering::SeqCst),
+        1,
+        "the leader must have opened exactly one prompt"
+    );
 
     // FOLLOWER: the SAME call_id and the SAME input ⇒ the same dedup key, while the leader's
     // decision is still unsettled.
@@ -393,10 +421,17 @@ async fn two_concurrent_identical_asks_collapse_to_one_prompt_body() {
     gate_tx.send(true).unwrap();
     let leader = leader.await.unwrap();
     let follower = follower.await.unwrap();
-    assert!(matches!(leader, HookOutcome::Noop), "the leader's approval lets the call proceed");
+    assert!(
+        matches!(leader, HookOutcome::Noop),
+        "the leader's approval lets the call proceed"
+    );
     assert!(
         matches!(follower, HookOutcome::Noop),
         "the follower must receive the LEADER's decision, collapsed to Allow-Once"
     );
-    assert_eq!(prompts.load(Ordering::SeqCst), 1, "exactly one prompt, total");
+    assert_eq!(
+        prompts.load(Ordering::SeqCst),
+        1,
+        "exactly one prompt, total"
+    );
 }

@@ -17,10 +17,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 
-use crate::{event_type, RpcClient, RpcClientError};
+use crate::{RpcClient, RpcClientError, event_type};
 
 // ---------------------------------------------------------------------------------------------
 // A scripted host — the other half of the protocol, spoken by hand
@@ -48,7 +48,10 @@ impl ScriptedHost {
     /// Write one raw line (LF-framed, as `serializeJsonLine` does).
     async fn write_line(&mut self, value: &Value) {
         let line = format!("{value}\n");
-        self.out.write_all(line.as_bytes()).await.expect("host write");
+        self.out
+            .write_all(line.as_bytes())
+            .await
+            .expect("host write");
         self.out.flush().await.expect("host flush");
     }
 
@@ -147,13 +150,23 @@ async fn concurrent_requests_resolve_out_of_order_by_id() {
     assert_eq!(second["type"], json!("get_session_stats"));
 
     // Answer the SECOND one first.
-    host.respond_ok(&second["id"], "get_session_stats", json!({"which": "stats"}))
-        .await;
+    host.respond_ok(
+        &second["id"],
+        "get_session_stats",
+        json!({"which": "stats"}),
+    )
+    .await;
     host.respond_ok(&first["id"], "get_state", json!({"which": "state"}))
         .await;
 
-    assert_eq!(b.await.expect("join b").expect("stats")["which"], json!("stats"));
-    assert_eq!(a.await.expect("join a").expect("state")["which"], json!("state"));
+    assert_eq!(
+        b.await.expect("join b").expect("stats")["which"],
+        json!("stats")
+    );
+    assert_eq!(
+        a.await.expect("join a").expect("state")["which"],
+        json!("state")
+    );
 }
 
 /// Pi `getData` rethrows the response's own `error` string (`rpc-client.ts:591-594`), so the client's
@@ -493,7 +506,11 @@ async fn host_eof_fails_the_in_flight_request_instead_of_waiting_out_the_timeout
         matches!(error, RpcClientError::ProcessExited { .. }),
         "unexpected error: {error}"
     );
-    assert!(error.to_string().starts_with("Agent process exited (code=null signal=null)."));
+    assert!(
+        error
+            .to_string()
+            .starts_with("Agent process exited (code=null signal=null).")
+    );
 }
 
 /// Pi's `send` re-throws the latched `exitError` BEFORE touching stdin (`rpc-client.ts:545-547`), so
@@ -509,14 +526,20 @@ async fn a_request_after_the_host_is_gone_is_pre_empted_by_the_latched_exit_erro
         .await
         .expect("EOF must fail the request promptly")
         .expect_err("must be an error");
-    assert!(matches!(first, RpcClientError::ProcessExited { .. }), "unexpected: {first}");
+    assert!(
+        matches!(first, RpcClientError::ProcessExited { .. }),
+        "unexpected: {first}"
+    );
 
     // The SECOND request is pre-empted by the latched error rather than written and awaited.
     let second = tokio::time::timeout(Duration::from_millis(500), client.get_state())
         .await
         .expect("the latched exit error must pre-empt the write, not wait for a response")
         .expect_err("must be an error");
-    assert!(matches!(second, RpcClientError::ProcessExited { .. }), "unexpected: {second}");
+    assert!(
+        matches!(second, RpcClientError::ProcessExited { .. }),
+        "unexpected: {second}"
+    );
     assert_eq!(
         client.pending_count(),
         0,
@@ -532,7 +555,10 @@ async fn a_request_after_the_host_is_gone_is_pre_empted_by_the_latched_exit_erro
 /// against `rpc-client.ts:75`, `:459`, `:480`, `:529`, `:543`, `:554`, `:565`.
 #[test]
 fn error_strings_are_pis_verbatim() {
-    assert_eq!(RpcClientError::AlreadyStarted.to_string(), "Client already started");
+    assert_eq!(
+        RpcClientError::AlreadyStarted.to_string(),
+        "Client already started"
+    );
     assert_eq!(RpcClientError::NotStarted.to_string(), "Client not started");
     assert_eq!(
         RpcClientError::ProcessExited {
@@ -544,7 +570,11 @@ fn error_strings_are_pis_verbatim() {
         "Agent process exited (code=1 signal=null). Stderr: boom"
     );
     assert_eq!(
-        RpcClientError::ProcessError { message: "EPIPE".into(), stderr: "s".into() }.to_string(),
+        RpcClientError::ProcessError {
+            message: "EPIPE".into(),
+            stderr: "s".into()
+        }
+        .to_string(),
         "Agent process error: EPIPE. Stderr: s"
     );
     assert_eq!(
@@ -552,7 +582,11 @@ fn error_strings_are_pis_verbatim() {
         "Agent process stdin is not writable. Stderr: s"
     );
     assert_eq!(
-        RpcClientError::RequestTimeout { command: "prompt".into(), stderr: "s".into() }.to_string(),
+        RpcClientError::RequestTimeout {
+            command: "prompt".into(),
+            stderr: "s".into()
+        }
+        .to_string(),
         "Timeout waiting for response to prompt. Stderr: s"
     );
     assert_eq!(
@@ -591,4 +625,47 @@ fn rpc_response_round_trips_through_the_new_deserialize() {
     assert_eq!(failed.id, None);
     assert!(!failed.success);
     assert_eq!(failed.error.as_deref(), Some("nope"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// SEAM-116 — `clearQueue` (pi `rpc-client.ts:226-229` @v0.84.4)
+// ---------------------------------------------------------------------------------------------
+
+/// Pi's `clearQueue()` sends a bare `{ type: "clear_queue" }` and returns `getData(response)` —
+/// the `{ steering, followUp }` object the host built from `session.clearQueue()`. The client
+/// writes no other key, and the reply lands typed with the wire's camelCase `followUp` read into
+/// `follow_up`.
+#[tokio::test]
+async fn clear_queue_sends_a_bare_command_and_returns_the_typed_steering_follow_up_pair() {
+    let (client, mut host) = connect();
+
+    let call = tokio::spawn(async move {
+        let cleared = client.clear_queue().await.expect("clear_queue");
+        (cleared, client)
+    });
+
+    let command = host.next_command().await;
+    assert_eq!(command["type"], json!("clear_queue"));
+    let keys: Vec<&String> = command.as_object().expect("object").keys().collect();
+    assert_eq!(
+        keys.len(),
+        2,
+        "only `type` + `id` go on the wire: {command}"
+    );
+    assert!(command.get("id").is_some(), "{command}");
+
+    host.respond_ok(
+        &command["id"],
+        "clear_queue",
+        json!({"steering": ["Change direction"], "followUp": ["Summarize when finished"]}),
+    )
+    .await;
+
+    let (cleared, client) = call.await.expect("join");
+    assert_eq!(cleared.steering, vec!["Change direction".to_string()]);
+    assert_eq!(
+        cleared.follow_up,
+        vec!["Summarize when finished".to_string()]
+    );
+    assert_eq!(client.pending_count(), 0);
 }

@@ -10,7 +10,10 @@ fn renders_standalone_html_document_with_entries() {
         {\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"hello world\"}]}}\n\
         {\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"hi there\"}]}}\n";
     let html = session_jsonl_to_html(jsonl);
-    assert!(html.starts_with("<!doctype html>"), "must be a full document");
+    assert!(
+        html.starts_with("<!doctype html>"),
+        "must be a full document"
+    );
     assert!(html.contains("<title>My Session</title>"));
     assert!(html.contains("/home/dev/proj"));
     assert!(html.contains("hello world"));
@@ -27,7 +30,10 @@ fn escapes_html_significant_characters() {
     let html = session_jsonl_to_html(jsonl);
     assert!(html.contains("&lt;script&gt;"), "angle brackets escaped");
     assert!(html.contains("&amp;"), "ampersand escaped");
-    assert!(!html.contains("<script>"), "no raw script tag leaks through");
+    assert!(
+        !html.contains("<script>"),
+        "no raw script tag leaks through"
+    );
 }
 
 #[test]

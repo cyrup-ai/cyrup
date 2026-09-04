@@ -13,7 +13,12 @@
 //! had no way to call it. This test does not assert that registration returned `Ok` — it drives the
 //! guest's registration through a real `session_start` dispatch and then EXECUTES the tool across
 //! the wasm boundary, asserting the guest's own code ran.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use crate::fixture;
 
@@ -35,7 +40,10 @@ async fn a_tool_registered_from_a_session_start_handler_is_executable() {
     assert!(
         !before.iter().any(|t| t.name() == "demo_late"),
         "demo_late must not exist before session_start: {:?}",
-        before.iter().map(|t| t.name().to_string()).collect::<Vec<_>>()
+        before
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect::<Vec<_>>()
     );
 
     let cancel = CancelToken::new();
@@ -43,7 +51,13 @@ async fn a_tool_registered_from_a_session_start_handler_is_executable() {
     // Drive the REAL lifecycle event. The guest's `session_start` handler calls
     // `ctx.register_tool(...)` across the `registration.register-tool` import.
     host.dispatcher()
-        .dispatch_notify(&HostEvent::SessionStart { reason: "startup".into(), previous_session_file: None }, &cancel)
+        .dispatch_notify(
+            &HostEvent::SessionStart {
+                reason: "startup".into(),
+                previous_session_file: None,
+            },
+            &cancel,
+        )
         .await;
 
     // The host must now surface it as an EXECUTABLE tool, not just a descriptor.
@@ -54,7 +68,10 @@ async fn a_tool_registered_from_a_session_start_handler_is_executable() {
         .unwrap_or_else(|| {
             panic!(
                 "a tool registered from session_start never reached the agent's tool set: {:?}",
-                active.iter().map(|t| t.name().to_string()).collect::<Vec<_>>()
+                active
+                    .iter()
+                    .map(|t| t.name().to_string())
+                    .collect::<Vec<_>>()
             )
         })
         .clone();
@@ -68,12 +85,20 @@ async fn a_tool_registered_from_a_session_start_handler_is_executable() {
     // The load-bearing assertion: the agent can CALL it, and the GUEST's code runs.
     let sink: cyrup_core::ToolUpdateSink = Box::new(|_| {});
     let result = late
-        .execute("late-1".into(), json!({ "text": "hi" }), cancel.clone(), sink)
+        .execute(
+            "late-1".into(),
+            json!({ "text": "hi" }),
+            cancel.clone(),
+            sink,
+        )
         .await
         .expect("the late-registered guest tool executes across the wasm boundary");
     match result.content.first() {
         Some(Content::Text { text, .. }) => {
-            assert_eq!(text, "late: hi", "the GUEST's late-registered executor produced the result")
+            assert_eq!(
+                text, "late: hi",
+                "the GUEST's late-registered executor produced the result"
+            )
         }
         other => panic!("unexpected late tool result content: {other:?}"),
     }
@@ -95,12 +120,20 @@ async fn a_tool_registered_from_a_session_start_handler_is_executable() {
 async fn a_second_extension_does_not_steal_the_first_ones_tools() {
     let bytes = std::fs::read(fixture::component()).expect("read fixture component bytes");
     let host = cyrup_ext::ExtensionHost::with_wasm(fixture::cfg()).expect("host with wasm runtime");
-    host.load_wasm("demo-a".into(), &bytes, Arc::new(DenyServices)).await.expect("load a");
-    host.load_wasm("demo-b".into(), &bytes, Arc::new(DenyServices)).await.expect("load b");
+    host.load_wasm("demo-a".into(), &bytes, Arc::new(DenyServices))
+        .await
+        .expect("load a");
+    host.load_wasm("demo-b".into(), &bytes, Arc::new(DenyServices))
+        .await
+        .expect("load b");
 
     let cancel = CancelToken::new();
     let active = host.active_tools(&[]).expect("active tools");
-    let echo = active.iter().find(|t| t.name() == "demo_echo").expect("demo_echo surfaced").clone();
+    let echo = active
+        .iter()
+        .find(|t| t.name() == "demo_echo")
+        .expect("demo_echo surfaced")
+        .clone();
     let sink: cyrup_core::ToolUpdateSink = Box::new(|_| {});
     let result = echo
         .execute("tc".into(), json!({ "text": "ok" }), cancel, sink)

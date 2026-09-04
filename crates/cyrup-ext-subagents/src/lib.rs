@@ -34,9 +34,9 @@ pub mod fork_context;
 /// The crate's single port of pi's `shared/formatters.ts` (`formatTokens`,
 /// `formatModelThinking`, the run-mode label) — see [`formatters`].
 pub mod formatters;
-pub mod native_supervisor;
 pub mod jsonl;
 pub mod missions;
+pub mod native_supervisor;
 /// The crate's single port of pi's `shared/utils.ts` path helpers: the `CYRUP_HOME` -> `HOME` ->
 /// tempdir home ladder, `getAgentDir()` and `getProjectConfigDir()`. See [`paths`].
 pub mod paths;
@@ -71,7 +71,17 @@ mod tests;
 // sole consumer — `cyrup-permission-system`, in its PARENT role — is what publishes into it. These
 // two re-exports are that publish/clear pair.
 pub use background::control::{
-    validate_contains_root, validate_safe_token, watch_control_inbox, CONTROL_INBOX_POLL_INTERVAL,
+    CONTROL_INBOX_POLL_INTERVAL, validate_contains_root, validate_safe_token, watch_control_inbox,
 };
 pub use background::parent_anchor::{clear_parent_session_anchor, publish_parent_session_anchor};
 pub use exec::{AGENT_NAME_ENV_VAR, PARENT_SESSION_ENV_VAR};
+
+// SUBA-084 — pi `src/api/agents.ts:2,12` @v0.64.0 re-exports the runtime agent registration
+// surface (`registerAgent` + its `RuntimeAgentDefinition`/`RuntimeAgentRegistration` types) at
+// the package's public API root. The entry point itself is a method
+// (`extension::SubagentsExtension::register_agent` / `SubagentExecutor::register_agent`) because
+// the registry is owned per extension instance rather than process-global; the types an embedder
+// needs to call it are re-exported here so it never has to spell the module path.
+pub use discovery::runtime_registry::{
+    RuntimeAgentDefinition, RuntimeAgentRegistration, RuntimeAgentRegistry, RuntimeThinking,
+};

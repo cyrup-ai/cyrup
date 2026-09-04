@@ -69,7 +69,7 @@
 //! (which is a `BTreeMap` under this workspace's feature set and would silently sort both).
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::{Component, Path, PathBuf, MAIN_SEPARATOR, MAIN_SEPARATOR_STR};
+use std::path::{Component, MAIN_SEPARATOR, MAIN_SEPARATOR_STR, Path, PathBuf};
 use std::sync::LazyLock;
 
 use indexmap::IndexMap;
@@ -506,7 +506,10 @@ fn read_plugin_manifest(
         return None;
     }
 
-    let name = fields.get("name").and_then(Value::as_str).unwrap_or_default();
+    let name = fields
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     if !is_valid_plugin_name(name) {
         skips.push(warn_skip(
             format!("Agent Plugin at {root_display} is invalid: plugin.json name is invalid"),
@@ -685,7 +688,9 @@ fn translate_plugin_mcp_config(
         // `!mcpConfig.mcpServers` — an absent or `null` map. A non-object one already failed the
         // parse above and was re-classified to this same message.
         skips.push(warn_skip(
-            format!("Agent Plugin {plugin_name} has invalid MCP config: mcpServers must be an object"),
+            format!(
+                "Agent Plugin {plugin_name} has invalid MCP config: mcpServers must be an object"
+            ),
             SkipReason::UnreadableMcpConfig,
         ));
         return Vec::new();
@@ -787,7 +792,10 @@ fn translate_stdio_server(
         }
     }
 
-    let command = raw.get("command").and_then(RawJson::as_str).unwrap_or_default();
+    let command = raw
+        .get("command")
+        .and_then(RawJson::as_str)
+        .unwrap_or_default();
     if command.is_empty() {
         return Err((
             skip_message(
@@ -976,11 +984,7 @@ fn translate_env(
     };
     let Some(fields) = value.as_object() else {
         return Err((
-            skip_message(
-                plugin_name,
-                server_name,
-                "env must be an object of strings",
-            ),
+            skip_message(plugin_name, server_name, "env must be an object of strings"),
             SkipReason::InvalidEnv,
         ));
     };
@@ -1046,11 +1050,7 @@ fn translate_headers(
         let normalized = key.to_lowercase();
         if !seen.insert(normalized) {
             return Err((
-                skip_message(
-                    plugin_name,
-                    server_name,
-                    &format!("duplicate header {key}"),
-                ),
+                skip_message(plugin_name, server_name, &format!("duplicate header {key}")),
                 SkipReason::DuplicateHeader(key.clone()),
             ));
         }
@@ -1552,14 +1552,23 @@ mod tests {
             lexical_normalize(Path::new("/a/b/../../../../c")),
             PathBuf::from("/c")
         );
-        assert_eq!(lexical_normalize(Path::new("/a/./b/")), PathBuf::from("/a/b"));
+        assert_eq!(
+            lexical_normalize(Path::new("/a/./b/")),
+            PathBuf::from("/a/b")
+        );
     }
 
     #[test]
     fn lexical_relative_matches_node() {
         assert_eq!(lexical_relative(Path::new("/a"), Path::new("/a")), "");
-        assert_eq!(lexical_relative(Path::new("/a"), Path::new("/a/b/c")), "b/c");
-        assert_eq!(lexical_relative(Path::new("/a/b"), Path::new("/a/c")), "../c");
+        assert_eq!(
+            lexical_relative(Path::new("/a"), Path::new("/a/b/c")),
+            "b/c"
+        );
+        assert_eq!(
+            lexical_relative(Path::new("/a/b"), Path::new("/a/c")),
+            "../c"
+        );
     }
 
     #[test]
@@ -1615,8 +1624,14 @@ mod tests {
     fn server_name_normalisation_collapses_runs() {
         assert_eq!(format_plugin_server_name("acme", "db"), "acme__db");
         // Both of these normalise onto one key, which is what makes first-writer-wins observable.
-        assert_eq!(format_plugin_server_name("acme", "tools.db"), "acme__tools_db");
-        assert_eq!(format_plugin_server_name("acme", "tools_db"), "acme__tools_db");
+        assert_eq!(
+            format_plugin_server_name("acme", "tools.db"),
+            "acme__tools_db"
+        );
+        assert_eq!(
+            format_plugin_server_name("acme", "tools_db"),
+            "acme__tools_db"
+        );
         assert_eq!(format_plugin_server_name("acme", "  "), "acme__server");
         assert_eq!(format_plugin_server_name("...", "x"), "plugin__x");
     }
@@ -1742,7 +1757,9 @@ mod tests {
         let dirs = fixture.dirs();
         let (servers, _) = load_agent_plugins_in(std::slice::from_ref(&path), &dirs);
         assert_eq!(servers.len(), 1, "expected exactly one server");
-        let Some(server) = servers.first() else { return };
+        let Some(server) = servers.first() else {
+            return;
+        };
 
         let root = PathBuf::from(&path);
         let data = dirs.agent_plugin_data("acme");
@@ -1772,7 +1789,11 @@ mod tests {
         );
         // The pair that makes env interpolation inert, and the pair it injects.
         assert_eq!(server.entry.literal_env, Some(true));
-        let env = server.entry.env.as_deref().map_or_else(BTreeMap::new, Clone::clone);
+        let env = server
+            .entry
+            .env
+            .as_deref()
+            .map_or_else(BTreeMap::new, Clone::clone);
         assert_eq!(
             env.get(PLUGIN_ROOT_VAR).map(String::as_str),
             Some(root.to_string_lossy().as_ref())
@@ -1809,7 +1830,10 @@ mod tests {
         let (Some(remote), Some(bare)) = (servers.first(), servers.get(1)) else {
             return;
         };
-        assert_eq!(remote.entry.http_transport, Some(HttpTransport::StreamableHttp));
+        assert_eq!(
+            remote.entry.http_transport,
+            Some(HttpTransport::StreamableHttp)
+        );
         assert_eq!(
             remote
                 .entry
@@ -1909,7 +1933,9 @@ mod tests {
         assert!(servers.is_empty() && skips.is_empty());
         let summaries = agent_plugin_summaries(&[no_mcp], &dirs);
         assert_eq!(summaries.len(), 1, "expected one summary");
-        let Some(summary) = summaries.first() else { return };
+        let Some(summary) = summaries.first() else {
+            return;
+        };
         assert_eq!(summary.name.as_deref(), Some("no-mcp"));
         assert_eq!(summary.server_count, 0);
     }
@@ -1936,7 +1962,9 @@ mod tests {
             load_agent_plugins_in(std::slice::from_ref(&collision), &fixture.dirs());
         assert_eq!(names(&servers), vec!["collision-plugin__tools_db"]);
         assert_eq!(
-            servers.first().and_then(|server| server.entry.args.as_ref()),
+            servers
+                .first()
+                .and_then(|server| server.entry.args.as_ref()),
             Some(&vec!["first.js".to_owned()])
         );
         assert_eq!(
@@ -1959,7 +1987,9 @@ mod tests {
         let (servers, skips) = load_agent_plugins_in(&[collision, second], &fixture.dirs());
         assert_eq!(names(&servers), vec!["collision-plugin__tools_db"]);
         assert_eq!(
-            servers.first().and_then(|server| server.entry.args.as_ref()),
+            servers
+                .first()
+                .and_then(|server| server.entry.args.as_ref()),
             Some(&vec!["first.js".to_owned()])
         );
         assert!(reasons(&skips).contains(&SkipReason::DuplicateServer(
@@ -2060,9 +2090,11 @@ mod tests {
         };
         let (servers, skips) = load_agent_plugins_in(&[bad_servers], &dirs);
         assert!(servers.is_empty());
-        assert!(skips
-            .iter()
-            .any(|skip| skip.0.contains("mcpServers must be an object")));
+        assert!(
+            skips
+                .iter()
+                .any(|skip| skip.0.contains("mcpServers must be an object"))
+        );
 
         // A path that is not a plugin at all.
         let missing = fixture.cwd.join("nope").to_string_lossy().into_owned();
@@ -2108,8 +2140,9 @@ mod tests {
             return;
         };
         let (_, skips) = load_agent_plugins_in(&[path], &fixture.dirs());
-        assert!(skips.iter().any(|skip| skip
-            .0
-            .contains("normalized server name collision-plugin__tools_db already exists")));
+        assert!(skips.iter().any(|skip| {
+            skip.0
+                .contains("normalized server name collision-plugin__tools_db already exists")
+        }));
     }
 }

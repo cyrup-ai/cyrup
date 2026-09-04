@@ -103,9 +103,21 @@ pub fn render(base: &Path, todo: bool, done: bool, review: bool) -> String {
         return format!("(no flux state at {})", base.display());
     }
 
-    let todos = if todo { state::collect_todos(base) } else { Vec::new() };
-    let done_groups = if done { state::collect_done(base) } else { Vec::new() };
-    let reviews = if review { state::collect_reviews(base) } else { Vec::new() };
+    let todos = if todo {
+        state::collect_todos(base)
+    } else {
+        Vec::new()
+    };
+    let done_groups = if done {
+        state::collect_done(base)
+    } else {
+        Vec::new()
+    };
+    let reviews = if review {
+        state::collect_reviews(base)
+    } else {
+        Vec::new()
+    };
 
     let mut names: Vec<&str> = Vec::new();
     for (n, _, _) in &todos {
@@ -194,9 +206,12 @@ pub fn render(base: &Path, todo: bool, done: bool, review: bool) -> String {
             head.push_str(&ljust(&sev.to_uppercase(), sev_col_width(sev)));
         }
         lines.push(head);
-        let review_w =
-            (name_w + state::SEVERITIES.iter().map(|s| sev_col_width(s)).sum::<usize>())
-                .max(MIN_PANEL_W);
+        let review_w = (name_w
+            + state::SEVERITIES
+                .iter()
+                .map(|s| sev_col_width(s))
+                .sum::<usize>())
+        .max(MIN_PANEL_W);
         lines.push("\u{2500}".repeat(review_w));
         for (name, sev) in &reviews {
             let mut row = ljust(name, name_w);

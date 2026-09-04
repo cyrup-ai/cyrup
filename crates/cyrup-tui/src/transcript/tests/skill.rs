@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use crate::transcript::*;
 
@@ -34,11 +39,11 @@ fn plain_text_is_not_a_skill_block() {
 #[test]
 fn push_user_splits_a_skill_block_into_two_entries() {
     let mut view = TranscriptView::new();
-    view.push_user(
-        "<skill name=\"deploy\" location=\"/s/d.md\">\nbody\n</skill>\n\nrun it",
-    );
+    view.push_user("<skill name=\"deploy\" location=\"/s/d.md\">\nbody\n</skill>\n\nrun it");
     let entries = view.pending();
-    assert!(matches!(entries.first(), Some(Entry::SkillInvocation { name, .. }) if name == "deploy"));
+    assert!(
+        matches!(entries.first(), Some(Entry::SkillInvocation { name, .. }) if name == "deploy")
+    );
     assert!(matches!(entries.get(1), Some(Entry::User { text, .. }) if text == "run it"));
 }
 

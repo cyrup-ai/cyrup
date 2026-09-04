@@ -14,12 +14,12 @@
     clippy::indexing_slicing
 )]
 
-use cyrup_core::{ModelThinkingLevel, ThinkingLevel};
 use crate::Model;
 use crate::api::compat::thinking_level_key;
 use crate::collection::{
     EXTENDED_THINKING_LEVELS, clamp_thinking_level, get_supported_thinking_levels,
 };
+use cyrup_core::{ModelThinkingLevel, ThinkingLevel};
 fn model(provider: &str, id: &str) -> Model {
     crate::all_providers()
         .into_iter()
@@ -227,12 +227,17 @@ fn token_budget_providers_clamp_max_to_high() {
 
 /// Every embedded catalog is `include_str!` + `serde_json::from_str(...).unwrap_or_default()`, so a
 /// malformed edit yields an EMPTY provider instead of an error. Nothing asserted that before; this
-/// makes a bad catalog edit fail loudly.
+/// makes a bad catalog edit fail loudly. The providers that ship no embedded catalog BY DESIGN
+/// (`catalog_data::DYNAMIC_ONLY_PROVIDERS`, PROV-014) are skipped here and pinned in both
+/// directions by `catalog_data::every_registered_provider_has_a_non_empty_catalog`.
 #[test]
 fn every_embedded_catalog_parses_non_empty() {
     let providers = crate::all_providers();
     assert!(providers.len() >= 31, "got {} providers", providers.len());
     for p in providers {
+        if super::catalog_data::DYNAMIC_ONLY_PROVIDERS.contains(&p.id().as_str()) {
+            continue;
+        }
         assert!(
             !p.models().is_empty(),
             "provider `{}` has an EMPTY catalog — its embedded JSON almost certainly failed to \

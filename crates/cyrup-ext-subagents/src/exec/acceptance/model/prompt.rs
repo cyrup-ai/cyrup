@@ -167,7 +167,6 @@ mod tests {
     use crate::exec::acceptance::model::types::AcceptanceLedgerStatus;
     use crate::exec::acceptance::model::types::CriterionInput;
 
-
     // ---- formatAcceptancePrompt ----
 
     #[test]
@@ -191,7 +190,6 @@ mod tests {
         assert!(prompt.contains("array fields contain strings"));
         assert!(prompt.contains("\"reviewFindings\": [\n    \"blocker:"));
     }
-
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn report_optional_still_records_a_check_when_the_policy_needs_a_report() {
@@ -232,7 +230,6 @@ mod tests {
         assert_eq!(ledger.evidence_status, AcceptanceEvidenceStatus::Rejected);
     }
 
-
     #[test]
     fn report_optional_suppresses_the_contract_prompt_only_when_no_report_is_required() {
         // `formatAcceptancePrompt`'s own `reportOptional` guard (`acceptance.ts:409`).
@@ -259,5 +256,4 @@ mod tests {
             "a policy that declares criteria is always prompted, reportOptional or not"
         );
     }
-
 }

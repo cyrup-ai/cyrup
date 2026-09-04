@@ -61,9 +61,9 @@ impl ProxyMessageBuilder {
         event: ProxyAssistantMessageEvent,
     ) -> Result<Option<StreamEvent>, String> {
         match event {
-            ProxyAssistantMessageEvent::Start => {
-                Ok(Some(StreamEvent::Start { partial: self.shared() }))
-            }
+            ProxyAssistantMessageEvent::Start => Ok(Some(StreamEvent::Start {
+                partial: self.shared(),
+            })),
 
             ProxyAssistantMessageEvent::TextStart { content_index } => {
                 self.set_content(content_index, Content::text(""));
@@ -72,7 +72,10 @@ impl ProxyMessageBuilder {
                     partial: self.shared(),
                 }))
             }
-            ProxyAssistantMessageEvent::TextDelta { content_index, delta } => {
+            ProxyAssistantMessageEvent::TextDelta {
+                content_index,
+                delta,
+            } => {
                 match self.partial.content.get_mut(content_index) {
                     Some(Content::Text { text, .. }) => text.push_str(&delta),
                     _ => return Err("Received text_delta for non-text content".into()),
@@ -83,9 +86,15 @@ impl ProxyMessageBuilder {
                     partial: self.shared(),
                 }))
             }
-            ProxyAssistantMessageEvent::TextEnd { content_index, content_signature } => {
+            ProxyAssistantMessageEvent::TextEnd {
+                content_index,
+                content_signature,
+            } => {
                 let text = match self.partial.content.get_mut(content_index) {
-                    Some(Content::Text { text, text_signature }) => {
+                    Some(Content::Text {
+                        text,
+                        text_signature,
+                    }) => {
                         *text_signature = content_signature;
                         text.to_string()
                     }
@@ -105,7 +114,10 @@ impl ProxyMessageBuilder {
                     partial: self.shared(),
                 }))
             }
-            ProxyAssistantMessageEvent::ThinkingDelta { content_index, delta } => {
+            ProxyAssistantMessageEvent::ThinkingDelta {
+                content_index,
+                delta,
+            } => {
                 match self.partial.content.get_mut(content_index) {
                     Some(Content::Thinking { thinking, .. }) => thinking.push_str(&delta),
                     _ => return Err("Received thinking_delta for non-thinking content".into()),
@@ -116,9 +128,16 @@ impl ProxyMessageBuilder {
                     partial: self.shared(),
                 }))
             }
-            ProxyAssistantMessageEvent::ThinkingEnd { content_index, content_signature } => {
+            ProxyAssistantMessageEvent::ThinkingEnd {
+                content_index,
+                content_signature,
+            } => {
                 let thinking = match self.partial.content.get_mut(content_index) {
-                    Some(Content::Thinking { thinking, thinking_signature, .. }) => {
+                    Some(Content::Thinking {
+                        thinking,
+                        thinking_signature,
+                        ..
+                    }) => {
                         *thinking_signature = content_signature;
                         thinking.to_string()
                     }
@@ -131,7 +150,11 @@ impl ProxyMessageBuilder {
                 }))
             }
 
-            ProxyAssistantMessageEvent::ToolCallStart { content_index, id, tool_name } => {
+            ProxyAssistantMessageEvent::ToolCallStart {
+                content_index,
+                id,
+                tool_name,
+            } => {
                 self.set_content(
                     content_index,
                     Content::ToolCall(ToolCall {
@@ -147,7 +170,10 @@ impl ProxyMessageBuilder {
                     partial: self.shared(),
                 }))
             }
-            ProxyAssistantMessageEvent::ToolCallDelta { content_index, delta } => {
+            ProxyAssistantMessageEvent::ToolCallDelta {
+                content_index,
+                delta,
+            } => {
                 let arguments = match self.partial.content.get(content_index) {
                     Some(Content::ToolCall(_)) => {
                         // Pi re-parses `content.partialJson` on every delta
@@ -190,13 +216,23 @@ impl ProxyMessageBuilder {
             ProxyAssistantMessageEvent::Done { reason, usage } => {
                 self.partial.stop_reason = reason.into();
                 self.partial.usage = usage;
-                Ok(Some(StreamEvent::Done { reason, message: self.shared() }))
+                Ok(Some(StreamEvent::Done {
+                    reason,
+                    message: self.shared(),
+                }))
             }
-            ProxyAssistantMessageEvent::Error { reason, error_message, usage } => {
+            ProxyAssistantMessageEvent::Error {
+                reason,
+                error_message,
+                usage,
+            } => {
                 self.partial.stop_reason = reason.into();
                 self.partial.error_message = error_message;
                 self.partial.usage = usage;
-                Ok(Some(StreamEvent::Error { reason, error: self.shared() }))
+                Ok(Some(StreamEvent::Error {
+                    reason,
+                    error: self.shared(),
+                }))
             }
         }
     }
@@ -239,7 +275,12 @@ fn empty_partial(model: &ModelRef) -> AssistantMessage {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::proxy::{ev, model, usage_json};
@@ -296,17 +337,32 @@ mod tests {
     #[test]
     fn rebuilds_text_block_across_start_delta_end() {
         let mut b = ProxyMessageBuilder::new(&model());
-        assert!(matches!(b.process(ev(serde_json::json!({"type": "start"}))).unwrap(), Some(StreamEvent::Start { .. })));
-        b.process(ev(serde_json::json!({"type": "text_start", "contentIndex": 0}))).unwrap();
-        b.process(ev(serde_json::json!({"type": "text_delta", "contentIndex": 0, "delta": "Hel"}))).unwrap();
-        b.process(ev(serde_json::json!({"type": "text_delta", "contentIndex": 0, "delta": "lo"}))).unwrap();
+        assert!(matches!(
+            b.process(ev(serde_json::json!({"type": "start"}))).unwrap(),
+            Some(StreamEvent::Start { .. })
+        ));
+        b.process(ev(
+            serde_json::json!({"type": "text_start", "contentIndex": 0}),
+        ))
+        .unwrap();
+        b.process(ev(
+            serde_json::json!({"type": "text_delta", "contentIndex": 0, "delta": "Hel"}),
+        ))
+        .unwrap();
+        b.process(ev(
+            serde_json::json!({"type": "text_delta", "contentIndex": 0, "delta": "lo"}),
+        ))
+        .unwrap();
         let end = b.process(ev(serde_json::json!({"type": "text_end", "contentIndex": 0, "contentSignature": "sig"}))).unwrap();
         match end {
             Some(StreamEvent::TextEnd { content, .. }) => assert_eq!(content, "Hello"),
             other => panic!("expected text_end, got {other:?}"),
         }
         match b.partial().content.first() {
-            Some(Content::Text { text, text_signature }) => {
+            Some(Content::Text {
+                text,
+                text_signature,
+            }) => {
                 assert_eq!(text, "Hello");
                 assert_eq!(text_signature.as_deref(), Some("sig"));
             }
@@ -317,11 +373,21 @@ mod tests {
     #[test]
     fn rebuilds_thinking_block_with_signature() {
         let mut b = ProxyMessageBuilder::new(&model());
-        b.process(ev(serde_json::json!({"type": "thinking_start", "contentIndex": 0}))).unwrap();
-        b.process(ev(serde_json::json!({"type": "thinking_delta", "contentIndex": 0, "delta": "ponder"}))).unwrap();
+        b.process(ev(
+            serde_json::json!({"type": "thinking_start", "contentIndex": 0}),
+        ))
+        .unwrap();
+        b.process(ev(
+            serde_json::json!({"type": "thinking_delta", "contentIndex": 0, "delta": "ponder"}),
+        ))
+        .unwrap();
         b.process(ev(serde_json::json!({"type": "thinking_end", "contentIndex": 0, "contentSignature": "ts"}))).unwrap();
         match b.partial().content.first() {
-            Some(Content::Thinking { thinking, thinking_signature, .. }) => {
+            Some(Content::Thinking {
+                thinking,
+                thinking_signature,
+                ..
+            }) => {
                 assert_eq!(thinking, "ponder");
                 assert_eq!(thinking_signature.as_deref(), Some("ts"));
             }
@@ -341,13 +407,23 @@ mod tests {
         } else {
             panic!("expected tool call");
         }
-        b.process(ev(serde_json::json!({"type": "toolcall_delta", "contentIndex": 0, "delta": "txt\"}"}))).unwrap();
-        let end = b.process(ev(serde_json::json!({"type": "toolcall_end", "contentIndex": 0}))).unwrap();
+        b.process(ev(
+            serde_json::json!({"type": "toolcall_delta", "contentIndex": 0, "delta": "txt\"}"}),
+        ))
+        .unwrap();
+        let end = b
+            .process(ev(
+                serde_json::json!({"type": "toolcall_end", "contentIndex": 0}),
+            ))
+            .unwrap();
         match end {
             Some(StreamEvent::ToolCallEnd { tool_call, .. }) => {
                 assert_eq!(tool_call.id.as_str(), "call_1");
                 assert_eq!(tool_call.name, "read_file");
-                assert_eq!(tool_call.arguments.get("path").and_then(Value::as_str), Some("a.txt"));
+                assert_eq!(
+                    tool_call.arguments.get("path").and_then(Value::as_str),
+                    Some("a.txt")
+                );
             }
             other => panic!("expected toolcall_end, got {other:?}"),
         }
@@ -356,24 +432,45 @@ mod tests {
     #[test]
     fn content_type_mismatch_returns_err_like_pi_throw() {
         let mut b = ProxyMessageBuilder::new(&model());
-        b.process(ev(serde_json::json!({"type": "text_start", "contentIndex": 0}))).unwrap();
+        b.process(ev(
+            serde_json::json!({"type": "text_start", "contentIndex": 0}),
+        ))
+        .unwrap();
         // A toolcall_delta against a text slot: Pi throws; cyrup returns Err with the same message.
-        let r = b.process(ev(serde_json::json!({"type": "toolcall_delta", "contentIndex": 0, "delta": "x"})));
-        assert_eq!(r, Err("Received toolcall_delta for non-toolCall content".to_string()));
+        let r = b.process(ev(
+            serde_json::json!({"type": "toolcall_delta", "contentIndex": 0, "delta": "x"}),
+        ));
+        assert_eq!(
+            r,
+            Err("Received toolcall_delta for non-toolCall content".to_string())
+        );
     }
 
     #[test]
     fn toolcall_end_on_non_toolcall_slot_returns_none() {
         // Pi returns `undefined` (no throw) for this case (proxy.ts:347).
         let mut b = ProxyMessageBuilder::new(&model());
-        b.process(ev(serde_json::json!({"type": "text_start", "contentIndex": 0}))).unwrap();
-        assert_eq!(b.process(ev(serde_json::json!({"type": "toolcall_end", "contentIndex": 0}))).unwrap(), None);
+        b.process(ev(
+            serde_json::json!({"type": "text_start", "contentIndex": 0}),
+        ))
+        .unwrap();
+        assert_eq!(
+            b.process(ev(
+                serde_json::json!({"type": "toolcall_end", "contentIndex": 0})
+            ))
+            .unwrap(),
+            None
+        );
     }
 
     #[test]
     fn done_event_sets_stop_reason_and_usage() {
         let mut b = ProxyMessageBuilder::new(&model());
-        let done = b.process(ev(serde_json::json!({"type": "done", "reason": "stop", "usage": usage_json()}))).unwrap();
+        let done = b
+            .process(ev(
+                serde_json::json!({"type": "done", "reason": "stop", "usage": usage_json()}),
+            ))
+            .unwrap();
         match done {
             Some(StreamEvent::Done { reason, message }) => {
                 assert_eq!(reason, DoneReason::Stop);

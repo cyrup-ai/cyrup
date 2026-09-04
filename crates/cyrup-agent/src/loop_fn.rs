@@ -22,8 +22,8 @@ use crate::state::{GenerationConfig, StateInner};
 use crate::stream_fn::{ApiKeyResolver, StreamFn};
 use crate::subscriber::EventSubscriber;
 use cyrup_core::{
-    finalizing_channel, CancelToken, FinalizingStream, ModelRef, ModelThinkingLevel, RunCancel,
-    SessionId, Tool,
+    CancelToken, FinalizingStream, ModelRef, ModelThinkingLevel, RunCancel, SessionId, Tool,
+    finalizing_channel,
 };
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -113,7 +113,11 @@ fn build_run_ctx(
     cancel: RunCancel,
     stream_fn: Arc<dyn StreamFn>,
 ) -> RunCtx {
-    let AgentContext { system_prompt, messages, tools } = context;
+    let AgentContext {
+        system_prompt,
+        messages,
+        tools,
+    } = context;
     // The loop's working copy (Pi `currentContext.messages`, a `.slice()` of the supplied snapshot)
     // is kept distinct from the throwaway reducer `state.messages` so a `prepare_next_turn` context
     // override updates only the working copy — matching the high-level agent (agent-loop.ts:104-107).
@@ -175,7 +179,11 @@ pub async fn run_agent_loop(
     stream_fn: Arc<dyn StreamFn>,
 ) -> Vec<AgentMessage> {
     let mut rc = build_run_ctx(context, config, sink, cancel, stream_fn);
-    rc.run(RunEntry::Prompt { messages: prompts, source: PromptSource::Fresh }).await
+    rc.run(RunEntry::Prompt {
+        messages: prompts,
+        source: PromptSource::Fresh,
+    })
+    .await
 }
 
 /// Continue an agent loop from the current context WITHOUT adding a new message (Pi

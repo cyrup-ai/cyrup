@@ -9,25 +9,25 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use cyrup_core::{CancelToken, ModelRef, RunCancel, ModelThinkingLevel};
+use cyrup_config::trust::{TrustEntry, TrustOption, TrustStore, trust_options};
 use cyrup_config::{
-    decide_trust_with_extension, has_trust_requiring_resources, AppMode, AuthStore,
-    ExtensionTrust, InMemorySettingsStore,
-    ModelResolver, Settings, SettingsManager, SettingsStore, TrustInputs, TrustOutcome,
+    AppMode, AuthStore, ExtensionTrust, InMemorySettingsStore, ModelResolver, Settings,
+    SettingsManager, SettingsStore, TrustInputs, TrustOutcome, decide_trust_with_extension,
+    has_trust_requiring_resources,
 };
-use cyrup_config::trust::{trust_options, TrustEntry, TrustOption, TrustStore};
+use cyrup_core::{CancelToken, ModelRef, ModelThinkingLevel, RunCancel};
 use cyrup_ext::{EventKind, ExtMode, ExtensionHost, HostConfig, HostEvent, NativeExtension};
 use cyrup_provider::{Model, Provider};
 use cyrup_resources::{
-    discover, ConfiguredPackage, DiscoveryConfig, InstallScope, InstalledPackages, PackageFilter,
-    PackageStore, ResourceOverrides, SkillPointer,
+    ConfiguredPackage, DiscoveryConfig, InstallScope, InstalledPackages, PackageFilter,
+    PackageStore, ResourceOverrides, SkillPointer, discover,
 };
+use cyrup_session::SessionLayout;
 use cyrup_session::manager::{NewSessionOpts, SessionManager};
 use cyrup_session::prompt::{
     ContextFile, ContextFileLoader, ContextSnapshot, DocsPointers, PromptInputs, ResolvedOverride,
     SystemPromptBuilder, ToolPromptContribution,
 };
-use cyrup_session::SessionLayout;
 use cyrup_tools::{
     Availability, Backend, BashOpts, PermissionPolicy, ProtectedFs, ProtectedPaths, ToolRegistry,
     ToolsOptions, TraversalFs,
@@ -40,8 +40,6 @@ use crate::provider_swap::{ProviderResolver, ProviderSwap};
 use crate::services::AgentSessionServices;
 use crate::session::AgentSession;
 use crate::subscriber::{Fanout, SvcSubscriber};
-
-
 
 /// Which session to start (arch-11 §3.3, `SessionStartEvent` analogue).
 #[derive(Clone, Debug, Default)]
@@ -477,7 +475,8 @@ pub type TrustPromptFn = Arc<
     dyn for<'a> Fn(
             &'a [TrustOption],
             &'a Option<TrustEntry>,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<bool>> + Send + 'a>>
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<bool>> + Send + 'a>>
         + Send
         + Sync,
 >;
@@ -621,11 +620,10 @@ impl SessionBuilder {
     async fn load_persisted_catalog_overlay(
         agent_dir: &std::path::Path,
     ) -> Option<Arc<cyrup_provider::CatalogOverlay>> {
-        let store: Arc<dyn cyrup_provider::ModelsStore> = Arc::new(
-            cyrup_config::models_store::FileModelsStore::new(
+        let store: Arc<dyn cyrup_provider::ModelsStore> =
+            Arc::new(cyrup_config::models_store::FileModelsStore::new(
                 agent_dir.join(cyrup_config::models_store::MODELS_STORE_FILE_NAME),
-            ),
-        );
+            ));
         let catalog = cyrup_provider::RemoteCatalog::new(store)
             .with_local_generated_at(cyrup_provider::builtin_model_data_generated_at());
         let ids: Vec<String> = cyrup_provider::all_providers()
@@ -636,7 +634,6 @@ impl SessionBuilder {
         let overlay = catalog.load_overlay(&refs).await;
         (!overlay.is_empty()).then(|| Arc::new(overlay))
     }
-
 
     /// Assemble the wired [`AgentSession`] (arch-11 §3.3). Async: discovery + context load + native
     /// extension `init` run here.
@@ -708,7 +705,10 @@ impl SessionBuilder {
         };
         let outcome = decide_trust_with_extension(
             inputs,
-            ext_trust.map(|d| ExtensionTrust { trusted: d.trusted, remember: d.remember }),
+            ext_trust.map(|d| ExtensionTrust {
+                trusted: d.trusted,
+                remember: d.remember,
+            }),
         );
         let trusted = match outcome {
             TrustOutcome::Trusted => true,
@@ -846,17 +846,26 @@ impl SessionBuilder {
         // `role:"bashExecution"` message entries could split the two, which is its own row.
         let has_existing_session = !existing.messages.is_empty();
         // Pi `hasThinkingEntry` (sdk.ts:189): does the resumed branch carry a thinking_level_change?
-        let has_thinking_entry = manager
-            .branch_path(None)
-            .iter()
-            .any(|e| matches!(e, cyrup_session::Entry::Known(
-                cyrup_session::entry::KnownEntry::ThinkingLevelChange { .. })));
+        let has_thinking_entry = manager.branch_path(None).iter().any(|e| {
+            matches!(
+                e,
+                cyrup_session::Entry::Known(
+                    cyrup_session::entry::KnownEntry::ThinkingLevelChange { .. }
+                )
+            )
+        });
 
         // ---- 3. model resolution (cyrup-config + cyrup-provider) -------------------------------
         // Restore the model + thinking level from the resumed session, seeding a fallback message
         // when the saved model is no longer resolvable (Pi sdk.ts:191-242).
-        let (resolved_model, model_ref, thinking, model_fallback_message) =
-            resolve_model(&*self.provider, &cfg, &settings, &existing, has_existing_session, has_thinking_entry)?;
+        let (resolved_model, model_ref, thinking, model_fallback_message) = resolve_model(
+            &*self.provider,
+            &cfg,
+            &settings,
+            &existing,
+            has_existing_session,
+            has_thinking_entry,
+        )?;
 
         // ---- 4. tools + isolation + policy (cyrup-tools) --------------------------------------
         // `shellPath`/`shellCommandPrefix` settings (Pi `getShellPath`/`getShellCommandPrefix`,
@@ -888,7 +897,10 @@ impl SessionBuilder {
                 ProtectedPaths::defaults(),
             ));
         }
-        let backend = Backend { fs, proc: base.proc.clone() };
+        let backend = Backend {
+            fs,
+            proc: base.proc.clone(),
+        };
         // The live session metadata every `bash` child gets as `CYRUP_*` (Pi's `resolveSpawnContext`
         // reads the same five values off the per-call `ExtensionContext`, bash.ts:171-181). Pi's
         // values are "resolved when each command starts" (docs/environment-variables.md:27), so this
@@ -903,10 +915,12 @@ impl SessionBuilder {
         // A modelless session (SEAM-075) has no declared modalities to seed from; `read` then keeps
         // its `supports_images_now()` default until the first `/model` re-pushes the real value.
         let read_model_vision = cyrup_tools::config::ModelVisionHandle::new(
-            resolved_model.as_ref().is_none_or(cyrup_provider::Model::supports_image_input),
+            resolved_model
+                .as_ref()
+                .is_none_or(cyrup_provider::Model::supports_image_input),
         );
-        let bash_session_env = cyrup_tools::config::SessionEnvHandle::new(
-            cyrup_tools::config::SessionEnvInfo {
+        let bash_session_env =
+            cyrup_tools::config::SessionEnvHandle::new(cyrup_tools::config::SessionEnvInfo {
                 session_id: Some(session_id.to_string()),
                 // `None` for an ephemeral/in-memory session — Pi leaves `PI_SESSION_FILE` unset
                 // rather than empty in that case (bash.ts:173-174).
@@ -917,8 +931,7 @@ impl SessionBuilder {
                 provider: model_ref.as_ref().map(|m| m.provider.to_string()),
                 model: model_ref.as_ref().map(|m| m.model.to_string()),
                 reasoning_level: Some(thinking_level_to_str(thinking)),
-            },
-        );
+            });
         let registry = ToolRegistry::with_builtins(
             cwd.clone(),
             backend,
@@ -1002,7 +1015,11 @@ impl SessionBuilder {
         // can merge extension-contributed skill/prompt/theme paths into the registry the skill
         // pointers + system prompt are then derived from.
         let (mode, has_ui) = ext_mode(cfg.app_mode);
-        let host_config = HostConfig { mode, has_ui, cwd: cwd.clone() };
+        let host_config = HostConfig {
+            mode,
+            has_ui,
+            cwd: cwd.clone(),
+        };
         // With `wasm-host`, spin up the Wasmtime engine so live wasm extensions can be loaded with
         // `LiveHostServices` injected (the seam below); otherwise a native-only host (the default).
         #[cfg(feature = "wasm-host")]
@@ -1054,7 +1071,10 @@ impl SessionBuilder {
         let is_subagent_child = std::env::var_os(SUBAGENT_CHILD_ENV).is_some();
         for ext in natives_to_load(self.native_extensions, cfg.no_extensions, is_subagent_child) {
             let id = ext.id();
-            if let Err(e) = host.load_native_with_services(ext, native_services.clone()).await {
+            if let Err(e) = host
+                .load_native_with_services(ext, native_services.clone())
+                .await
+            {
                 tracing::error!(extension = %id, error = %e, "native extension failed to load");
                 native_load_errors.push(crate::services::ExtensionLoadDiagnostic {
                     // A native built-in has no on-disk path; its id is the display key the panel
@@ -1125,7 +1145,8 @@ impl SessionBuilder {
         // resolves each entry to a working tree (package-manager.ts:891-901). cyrup read only its own
         // `packages.json` install registry, so a package DECLARED in settings contributed nothing.
         // Project entries are pushed first so they win the shared package precedence rank (:887-893).
-        let (configured_packages, package_errors) = configured_packages_from_settings(&settings, &cwd, &cfg.agent_dir);
+        let (configured_packages, package_errors) =
+            configured_packages_from_settings(&settings, &cwd, &cfg.agent_dir);
         disc.configured_packages = configured_packages;
         // CFG-003: pi's session path calls `packageManager.resolve()` with NO `onMissing`
         // (resource-loader.ts:403 and :549 @v0.83.0), so a declared git package with no working tree
@@ -1149,11 +1170,13 @@ impl SessionBuilder {
         // A malformed `packages` entry never takes the settings document (or the session) down; it
         // is reported alongside the discovery diagnostics.
         for message in package_errors {
-            startup_diagnostics.resources.push(cyrup_resources::ResourceDiagnostic::error(
-                cyrup_resources::ResourceKind::Package,
-                cfg.agent_dir.join("settings.json"),
-                message,
-            ));
+            startup_diagnostics
+                .resources
+                .push(cyrup_resources::ResourceDiagnostic::error(
+                    cyrup_resources::ResourceKind::Package,
+                    cfg.agent_dir.join("settings.json"),
+                    message,
+                ));
         }
 
         // CFG-002: `<agent_dir>/models.json` — the user's custom-provider / custom-model file. Pi
@@ -1212,27 +1235,33 @@ impl SessionBuilder {
         // silently did not mean what it says. `cfg.extra_extension_paths` — the real `-e` tier — is
         // still merged by `extension_discovery_roots` either way.
         if !cfg.no_extensions {
-            ext_roots.configured.extend(report.registry.ext_crate_paths.iter().cloned());
+            ext_roots
+                .configured
+                .extend(report.registry.ext_crate_paths.iter().cloned());
         }
         #[cfg(feature = "wasm-host")]
         {
             // Inject the session's OWN `host_services` (built at 4a) so a disk-discovered guest's
             // `control` capability reaches the same queue `apply_pending_control` drains.
-            let host_services_for_load: Arc<dyn cyrup_ext::host::HostServices> = host_services.clone();
+            let host_services_for_load: Arc<dyn cyrup_ext::host::HostServices> =
+                host_services.clone();
             // The per-path `errors` (Pi `LoadExtensionsResult.errors` → "Failed to load extension"
             // diagnostics, main.ts:679-682) are retained on `startup_diagnostics` so the TUI can
             // render Pi's `[Extension issues]` block (TUI-006) instead of dropping them here. Each
             // carries its `fatal` flag through unchanged, so a genuine load fault also reaches the
             // bin's exit-1 checkpoint while the project-trust skip does not (`LoadError::fatal`).
-            let load_result =
-                ext_host.discover_and_load(&ext_roots, trusted, host_services_for_load).await;
-            startup_diagnostics.extensions.extend(load_result.errors.iter().map(|e| {
-                crate::services::ExtensionLoadDiagnostic {
-                    path: e.path.clone(),
-                    error: e.error.clone(),
-                    fatal: e.fatal,
-                }
-            }));
+            let load_result = ext_host
+                .discover_and_load(&ext_roots, trusted, host_services_for_load)
+                .await;
+            startup_diagnostics
+                .extensions
+                .extend(load_result.errors.iter().map(|e| {
+                    crate::services::ExtensionLoadDiagnostic {
+                        path: e.path.clone(),
+                        error: e.error.clone(),
+                        fatal: e.fatal,
+                    }
+                }));
         }
         #[cfg(not(feature = "wasm-host"))]
         let _ = &ext_roots;
@@ -1264,7 +1293,9 @@ impl SessionBuilder {
             // `--flag` produced no message and no non-zero exit. Pi merges them into
             // `services.diagnostics` (:182), which becomes `runtime.diagnostics` and is reported +
             // `process.exit(1)`-ed at main.ts:843-848.
-            startup_diagnostics.flags.extend(ext_host.apply_extension_flag_values(&overrides)?);
+            startup_diagnostics
+                .flags
+                .extend(ext_host.apply_extension_flag_values(&overrides)?);
         }
 
         // Bind the shared model-registry sink and FLUSH any provider registrations queued while native
@@ -1272,7 +1303,9 @@ impl SessionBuilder {
         // `Arc` is the `ext_host` sink (future `registerProvider`s upsert live) and the session's read
         // view (its catalog is UNIONed into the model registry, and its provider installed on select).
         let guest_providers = Arc::new(crate::guest_providers::GuestProviderRegistry::new());
-        ext_host.registry().bind_model_registry(guest_providers.clone())?;
+        ext_host
+            .registry()
+            .bind_model_registry(guest_providers.clone())?;
         // extendResourcesFromExtensions("startup") (Pi agent-session.ts:2109-2135): fold every
         // `resources_discover` handler's contributed skill/prompt/theme paths into the registry
         // BEFORE the skill pointers + system prompt are derived. An empty aggregate (no handlers, or
@@ -1286,20 +1319,32 @@ impl SessionBuilder {
             // (no handlers, no CLI paths) leaves the discovered registry untouched.
             // The aggregate now attributes each path to its extension (gap-08 #15); for registry
             // discovery we take the path strings in concatenated load order.
-            let mut skill_paths: Vec<PathBuf> =
-                agg.skill_paths.iter().map(|p| PathBuf::from(&p.path)).collect();
-            let mut prompt_paths: Vec<PathBuf> =
-                agg.prompt_paths.iter().map(|p| PathBuf::from(&p.path)).collect();
-            let mut theme_paths: Vec<PathBuf> =
-                agg.theme_paths.iter().map(|p| PathBuf::from(&p.path)).collect();
+            let mut skill_paths: Vec<PathBuf> = agg
+                .skill_paths
+                .iter()
+                .map(|p| PathBuf::from(&p.path))
+                .collect();
+            let mut prompt_paths: Vec<PathBuf> = agg
+                .prompt_paths
+                .iter()
+                .map(|p| PathBuf::from(&p.path))
+                .collect();
+            let mut theme_paths: Vec<PathBuf> = agg
+                .theme_paths
+                .iter()
+                .map(|p| PathBuf::from(&p.path))
+                .collect();
             skill_paths.extend(cfg.extra_skill_paths.iter().cloned());
             prompt_paths.extend(cfg.extra_prompt_paths.iter().cloned());
             theme_paths.extend(cfg.extra_theme_paths.iter().cloned());
             if skill_paths.is_empty() && prompt_paths.is_empty() && theme_paths.is_empty() {
                 report.registry
             } else {
-                let extra =
-                    cyrup_resources::DiscoveredPaths { skill_paths, prompt_paths, theme_paths };
+                let extra = cyrup_resources::DiscoveredPaths {
+                    skill_paths,
+                    prompt_paths,
+                    theme_paths,
+                };
                 report.registry.extend(&extra)
             }
         };
@@ -1327,7 +1372,12 @@ impl SessionBuilder {
         );
         let context_store = Arc::new(cyrup_session::prompt::ContextStore::new());
         context_store
-            .reload(&cancel, loader, Arc::from(skills), ResolvedOverride::default())
+            .reload(
+                &cancel,
+                loader,
+                Arc::from(skills),
+                ResolvedOverride::default(),
+            )
             .await?;
         // Synthetic context-file injection (Pi `agentsFilesOverride`, resource-loader.ts:474):
         // transform the loaded `AGENTS.md`/`CLAUDE.md` set before the system prompt reads it.
@@ -1396,9 +1446,7 @@ impl SessionBuilder {
         let discovered_system_prompt = cfg
             .system_prompt
             .is_none()
-            .then(|| {
-                cyrup_resources::discover_system_prompt_file(&cwd, &cfg.agent_dir, trusted)
-            })
+            .then(|| cyrup_resources::discover_system_prompt_file(&cwd, &cfg.agent_dir, trusted))
             .flatten()
             .and_then(|p| read_discovered_prompt(&p, "system prompt"));
         // pi REPLACES rather than accumulates: `let appendSources = this.appendSystemPromptSource;
@@ -1463,12 +1511,17 @@ impl SessionBuilder {
         for tool in &cfg.custom_tools {
             ext_host.register_native_tool_renderer(tool.clone());
         }
-        registry_tools.extend(cfg.custom_tools.iter().map(|t| ext_host.wrap_tool(t.clone())));
+        registry_tools.extend(
+            cfg.custom_tools
+                .iter()
+                .map(|t| ext_host.wrap_tool(t.clone())),
+        );
         registry_tools.extend(active_tools.iter().cloned());
-        let contributions: std::collections::BTreeMap<String, ToolPromptContribution> = registry_tools
-            .iter()
-            .map(|t| (t.name().to_string(), tool_contribution(t)))
-            .collect();
+        let contributions: std::collections::BTreeMap<String, ToolPromptContribution> =
+            registry_tools
+                .iter()
+                .map(|t| (t.name().to_string(), tool_contribution(t)))
+                .collect();
         // The rebuilder base = the prompt inputs with the per-run tool fields cleared (re-derived
         // from the active set on each `setActiveToolsByName`).
         let mut rebuild_base = prompt_inputs.clone();
@@ -1559,7 +1612,9 @@ impl SessionBuilder {
         // Provider attribution + opencode session headers (Pi sdk.ts:323-330, #20). Telemetry is the
         // env override (`CYRUP_TELEMETRY`/`PI_TELEMETRY`) else the `enableInstallTelemetry` setting.
         let env = cyrup_config::EnvVars::from_process();
-        let telemetry_enabled = env.telemetry.unwrap_or_else(|| eff.enable_install_telemetry());
+        let telemetry_enabled = env
+            .telemetry
+            .unwrap_or_else(|| eff.enable_install_telemetry());
         // No model ⇒ no provider to attribute to; the headers are recomputed on the first
         // `/model` anyway (`apply_model_change`).
         let attribution_headers = resolved_model.as_ref().and_then(|m| {
@@ -1574,8 +1629,10 @@ impl SessionBuilder {
         // and the (optional) resolver seam so a cross-provider `/model` select can install a new
         // provider in place without rebuilding the agent (Pi live model+provider switch). The SAME
         // `Arc` is handed to the agent (as its `StreamFn`) and to the session (to mutate on select).
-        let provider_swap =
-            Arc::new(ProviderSwap::new(self.provider.clone(), self.provider_resolver.clone()));
+        let provider_swap = Arc::new(ProviderSwap::new(
+            self.provider.clone(),
+            self.provider_resolver.clone(),
+        ));
         // Transport selection (Pi `AgentOptions.streamFn`, sdk.ts:301): an embedder-supplied custom
         // `StreamFn` (e.g. `ProxyStreamFn`) becomes THE transport the agent loop streams through;
         // absent one, the provider-backed `ProviderSwap` is used (the default live-swappable path).
@@ -1584,22 +1641,22 @@ impl SessionBuilder {
             None => provider_swap.clone(),
         };
         let mut agent_builder = cyrup_agent::AgentBuilder::new(agent_stream_fn)
-        .system_prompt(system_prompt.clone())
-        .thinking_level(thinking)
-        .tools(active_tools)
-        .messages(seed)
-        .hooks(policy_hooks)
-        .session_id(session_id.clone())
-        // Settings→Agent wiring (Pi sdk.ts:356-360): queue modes + transport + custom thinking budgets.
-        .steering_mode(parse_queue_mode(&eff.steering_mode()))
-        .follow_up_mode(parse_queue_mode(&eff.follow_up_mode()))
-        // `transport` (Pi sdk.ts:357 `transport: settingsManager.getTransport()`). The setting was
-        // parsed, migrated from the legacy `websockets` boolean and offered in the `/settings` grid,
-        // but never reached the agent — so `AgentBuilder::transport` had no non-test caller and the
-        // value died in the config layer. It now rides `StreamOptions.transport` into every
-        // `StreamFn::stream` call (agent.rs `gen_config.transport`), which is the seam an
-        // embedder-supplied `StreamFn` (e.g. `ProxyStreamFn`) and every wire API read from.
-        .transport(parse_transport(&eff.transport()));
+            .system_prompt(system_prompt.clone())
+            .thinking_level(thinking)
+            .tools(active_tools)
+            .messages(seed)
+            .hooks(policy_hooks)
+            .session_id(session_id.clone())
+            // Settings→Agent wiring (Pi sdk.ts:356-360): queue modes + transport + custom thinking budgets.
+            .steering_mode(parse_queue_mode(&eff.steering_mode()))
+            .follow_up_mode(parse_queue_mode(&eff.follow_up_mode()))
+            // `transport` (Pi sdk.ts:357 `transport: settingsManager.getTransport()`). The setting was
+            // parsed, migrated from the legacy `websockets` boolean and offered in the `/settings` grid,
+            // but never reached the agent — so `AgentBuilder::transport` had no non-test caller and the
+            // value died in the config layer. It now rides `StreamOptions.transport` into every
+            // `StreamFn::stream` call (agent.rs `gen_config.transport`), which is the seam an
+            // embedder-supplied `StreamFn` (e.g. `ProxyStreamFn`) and every wire API read from.
+            .transport(parse_transport(&eff.transport()));
         // SEAM-075 — pi's agent holds `Model | undefined` (`AgentSession.model` is a straight read
         // of `this.agent.state.model`, agent-session.ts:890-892): a modelless session builds an
         // agent with NO model, and the first `/model` sets it through `agent.set_model`. Every
@@ -1690,11 +1747,14 @@ impl SessionBuilder {
             agent_builder = agent_builder.on_payload(Arc::new(move |payload, _model| {
                 let h = h.clone();
                 Box::pin(async move {
-                    if h.dispatcher().no_subscribers(EventKind::BeforeProviderRequest) {
+                    if h.dispatcher()
+                        .no_subscribers(EventKind::BeforeProviderRequest)
+                    {
                         return None;
                     }
-                    let out =
-                        h.emit_before_provider_request(payload.clone(), &CancelToken::new()).await;
+                    let out = h
+                        .emit_before_provider_request(payload.clone(), &CancelToken::new())
+                        .await;
                     (out != payload).then_some(out)
                 })
             }));
@@ -1702,7 +1762,9 @@ impl SessionBuilder {
             agent_builder = agent_builder.on_response(Arc::new(move |resp, _model| {
                 let h = h.clone();
                 Box::pin(async move {
-                    if h.dispatcher().no_subscribers(EventKind::AfterProviderResponse) {
+                    if h.dispatcher()
+                        .no_subscribers(EventKind::AfterProviderResponse)
+                    {
                         return;
                     }
                     let headers = serde_json::to_value(&resp.headers).unwrap_or_default();
@@ -1899,7 +1961,12 @@ pub(crate) fn thinking_level_from_str(s: &str) -> Option<ModelThinkingLevel> {
 
 /// What [`resolve_model`] hands back: the resolved catalog `Model` and its address (both `None` on
 /// a modelless launch, see below), the clamped thinking level, and pi's `modelFallbackMessage`.
-type ResolvedModel = (Option<Model>, Option<ModelRef>, ModelThinkingLevel, Option<String>);
+type ResolvedModel = (
+    Option<Model>,
+    Option<ModelRef>,
+    ModelThinkingLevel,
+    Option<String>,
+);
 
 /// Resolve `(Option<Model>, Option<ModelRef>, ModelThinkingLevel, modelFallbackMessage)` from the
 /// explicit pattern, the resumed session, settings, and finally the catalog (Pi sdk.ts:191-242;
@@ -1968,9 +2035,9 @@ fn resolve_model(
         && has_existing_session
         && let Some(saved) = existing.model.as_ref()
     {
-        let restored = available.iter().find(|m| {
-            m.provider == saved.provider && m.id == saved.model
-        });
+        let restored = available
+            .iter()
+            .find(|m| m.provider == saved.provider && m.id == saved.model);
         match restored {
             Some(m) => model = Some(m.clone()),
             None => {
@@ -1997,7 +2064,11 @@ fn resolve_model(
         match resolved.or_else(|| available.first().cloned()) {
             Some(m) => {
                 if let Some(msg) = fallback.as_mut() {
-                    msg.push_str(&format!(". Using {}/{}", m.provider.as_str(), m.id.as_str()));
+                    msg.push_str(&format!(
+                        ". Using {}/{}",
+                        m.provider.as_str(),
+                        m.id.as_str()
+                    ));
                 }
                 model = Some(m);
             }
@@ -2033,7 +2104,9 @@ fn resolve_model(
     // at the one-size default. Only consulted when nothing more specific already decided.
     let thinking = thinking.or_else(|| {
         model.as_ref().and_then(|m| {
-            settings.effective().model_thinking_level(m.provider.as_str(), m.id.as_str())
+            settings
+                .effective()
+                .model_thinking_level(m.provider.as_str(), m.id.as_str())
         })
     });
     let thinking = thinking.unwrap_or_else(settings_default);
@@ -2068,15 +2141,19 @@ fn fallback_model(
 ) -> Option<(Model, Option<ModelThinkingLevel>)> {
     let provider_id = provider.id();
     let prefix = format!("{}/", provider_id.as_str());
-    let has_matching_prefix =
-        pattern.to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase());
+    let has_matching_prefix = pattern
+        .to_ascii_lowercase()
+        .starts_with(&prefix.to_ascii_lowercase());
     if !cfg.cli_provider_explicit && !has_matching_prefix {
         return None;
     }
     // Strip the provider prefix (Pi `pattern = cliModel.substring(slashIndex + 1)`), then peel a
     // trailing `:level` thinking suffix when `--thinking` was not explicitly set.
-    let stripped: &str =
-        if has_matching_prefix { pattern.get(prefix.len()..).unwrap_or(pattern) } else { pattern };
+    let stripped: &str = if has_matching_prefix {
+        pattern.get(prefix.len()..).unwrap_or(pattern)
+    } else {
+        pattern
+    };
     let (base_id, level): (&str, Option<ModelThinkingLevel>) = if cfg.thinking_level.is_some() {
         (stripped, None)
     } else if let Some(idx) = stripped.rfind(':') {
@@ -2097,7 +2174,8 @@ fn fallback_model(
     // helper that mirrors that curated pick exactly. NOTE: `ModelResolver::provider_default` is the
     // WRONG base here — it is alias-preferred + raw-byte-descending (anthropic -> `claude-sonnet-5`),
     // which diverges the cloned model's cost (~2.5x) and compat flags from Pi.
-    let model = cyrup_config::build_fallback_model(provider_id.as_str(), base_id, provider.models())?;
+    let model =
+        cyrup_config::build_fallback_model(provider_id.as_str(), base_id, provider.models())?;
     Some((model, level))
 }
 
@@ -2110,7 +2188,12 @@ pub(crate) fn tool_contribution(tool: &Arc<dyn cyrup_core::Tool>) -> ToolPromptC
     ToolPromptContribution {
         tool: Arc::<str>::from(tool.name()),
         snippet: tool.prompt_snippet().map(Arc::<str>::from),
-        guidelines: tool.prompt_guidelines().iter().copied().map(Arc::<str>::from).collect(),
+        guidelines: tool
+            .prompt_guidelines()
+            .iter()
+            .copied()
+            .map(Arc::<str>::from)
+            .collect(),
     }
 }
 
@@ -2160,7 +2243,11 @@ async fn pre_trust_extension_verdict(
     #[cfg(not(feature = "wasm-host"))]
     let _ = global_extension_patterns;
     let (mode, has_ui) = ext_mode(cfg.app_mode);
-    let host_config = HostConfig { mode, has_ui, cwd: cwd.to_path_buf() };
+    let host_config = HostConfig {
+        mode,
+        has_ui,
+        cwd: cwd.to_path_buf(),
+    };
     #[cfg(feature = "wasm-host")]
     let host = ExtensionHost::with_wasm(host_config).ok()?;
     #[cfg(not(feature = "wasm-host"))]
@@ -2226,8 +2313,11 @@ const SUBAGENT_CHILD_ENV: &str = "CYRUP_SUBAGENT_CHILD";
 /// so gating these three in a child would drop what pi explicitly keeps — and for
 /// `cyrup-permission-system` that is a permission gate failing OPEN, which is worse than the
 /// unfiltered load SEAM-071 was filed about.
-const SUBAGENT_CHILD_RUNTIME_NATIVES: [&str; 3] =
-    ["cyrup-permission-system", "subagent-prompt-runtime", "subagents"];
+const SUBAGENT_CHILD_RUNTIME_NATIVES: [&str; 3] = [
+    "cyrup-permission-system",
+    "subagent-prompt-runtime",
+    "subagents",
+];
 
 /// Whether a native built-in survives `--no-extensions` (SEAM-071).
 ///
@@ -2484,7 +2574,12 @@ fn today() -> time::Date {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::{ALL_BUILTIN_TOOLS, DEFAULT_BUILTIN_TOOLS, http_proxy_overlay};
     use std::path::Path;
@@ -2541,10 +2636,7 @@ mod tests {
         fn is_ambient(&self) -> bool {
             self.1
         }
-        async fn init(
-            &self,
-            _api: &mut cyrup_ext::InitApi,
-        ) -> Result<(), cyrup_ext::ExtError> {
+        async fn init(&self, _api: &mut cyrup_ext::InitApi) -> Result<(), cyrup_ext::ExtError> {
             Ok(())
         }
         async fn on_event(
@@ -2631,8 +2723,12 @@ mod tests {
         let inline_double = |id: &str| -> std::sync::Arc<dyn cyrup_ext::NativeExtension> {
             std::sync::Arc::new(StubNative(cyrup_core::ExtensionId::from(id), false))
         };
-        for id in ["subagents", "cyrup-permission-system", "cyrup-intercom", "subagent-prompt-runtime"]
-        {
+        for id in [
+            "subagents",
+            "cyrup-permission-system",
+            "cyrup-intercom",
+            "subagent-prompt-runtime",
+        ] {
             for child in [false, true] {
                 assert!(
                     super::native_survives_no_extensions(&inline_double(id), child),
@@ -2661,7 +2757,10 @@ mod tests {
             ],
             "load order preserved, intercom dropped"
         );
-        assert!(!kept.contains(&"cyrup-intercom".to_string()), "pi re-injects no intercom");
+        assert!(
+            !kept.contains(&"cyrup-intercom".to_string()),
+            "pi re-injects no intercom"
+        );
     }
 
     /// The exemption is CHILD-only. A root session that happens to have the permission system
@@ -2682,7 +2781,10 @@ mod tests {
                 "{id} drops at the root"
             );
         }
-        assert!(!super::native_survives_no_extensions(&one("cyrup-intercom"), true));
+        assert!(!super::native_survives_no_extensions(
+            &one("cyrup-intercom"),
+            true
+        ));
     }
 
     /// CFG-010 (dedupe half) — Pi's `dedupePackages` keeps BOTH entries, delta first, when a
@@ -2705,7 +2807,11 @@ mod tests {
         store.seed(SettingsScope::Global, r#"{"packages":["npm:pi-tools"]}"#);
         let mgr = SettingsManager::load(store, true);
 
-        let (pkgs, errors) = super::configured_packages_from_settings(&mgr, Path::new("/proj"), Path::new("/home/u/.cyrup/agent"));
+        let (pkgs, errors) = super::configured_packages_from_settings(
+            &mgr,
+            Path::new("/proj"),
+            Path::new("/home/u/.cyrup/agent"),
+        );
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(
             pkgs.len(),
@@ -2736,7 +2842,11 @@ mod tests {
         store.seed(SettingsScope::Global, r#"{"packages":["npm:pi-tools"]}"#);
         let mgr = SettingsManager::load(store, true);
 
-        let (pkgs, _) = super::configured_packages_from_settings(&mgr, Path::new("/proj"), Path::new("/home/u/.cyrup/agent"));
+        let (pkgs, _) = super::configured_packages_from_settings(
+            &mgr,
+            Path::new("/proj"),
+            Path::new("/home/u/.cyrup/agent"),
+        );
         assert_eq!(pkgs.len(), 1, "{pkgs:?}");
         assert_eq!(pkgs[0].scope, InstallScope::Project);
     }
@@ -2788,7 +2898,10 @@ mod tests {
         store.seed(SettingsScope::Project, r#"{"packages":["/shared/pack"]}"#);
         // A different SPELLING of the same absolute path: `resolvePath` normalizes `.`/`..` before
         // the comparison, which a string key cannot do.
-        store.seed(SettingsScope::Global, r#"{"packages":["/shared/sub/../pack"]}"#);
+        store.seed(
+            SettingsScope::Global,
+            r#"{"packages":["/shared/sub/../pack"]}"#,
+        );
         let mgr = SettingsManager::load(store, true);
 
         let (pkgs, _) = super::configured_packages_from_settings(
@@ -2833,7 +2946,10 @@ mod tests {
         use cyrup_core::ModelThinkingLevel;
 
         assert_eq!(thinking_level_to_str(ModelThinkingLevel::Max), "max");
-        assert_eq!(thinking_level_from_str("max"), Some(ModelThinkingLevel::Max));
+        assert_eq!(
+            thinking_level_from_str("max"),
+            Some(ModelThinkingLevel::Max)
+        );
         for level in [
             ModelThinkingLevel::Off,
             ModelThinkingLevel::Minimal,
@@ -2857,8 +2973,14 @@ mod tests {
         // Pi `applyHttpProxySettings` (http-dispatcher.ts:42-47): a non-empty setting sets both
         // HTTP_PROXY and HTTPS_PROXY (so the provider proxy resolver routes through it).
         let overlay = http_proxy_overlay(Some("http://proxy.local:8080")).expect("an overlay");
-        assert_eq!(overlay.get("HTTP_PROXY").map(String::as_str), Some("http://proxy.local:8080"));
-        assert_eq!(overlay.get("HTTPS_PROXY").map(String::as_str), Some("http://proxy.local:8080"));
+        assert_eq!(
+            overlay.get("HTTP_PROXY").map(String::as_str),
+            Some("http://proxy.local:8080")
+        );
+        assert_eq!(
+            overlay.get("HTTPS_PROXY").map(String::as_str),
+            Some("http://proxy.local:8080")
+        );
         // A blank / whitespace / absent setting yields no overlay (ambient env unchanged).
         assert!(http_proxy_overlay(Some("   ")).is_none());
         assert!(http_proxy_overlay(Some("")).is_none());
@@ -2879,7 +3001,10 @@ mod tests {
     fn apply_http_proxy_settings_installs_the_process_global_not_just_the_overlay() {
         let overlay = super::apply_http_proxy_settings(Some("http://proxy.local:8080".to_string()))
             .expect("a non-empty setting still yields pi's second-layer overlay");
-        assert_eq!(overlay.get("HTTPS_PROXY").map(String::as_str), Some("http://proxy.local:8080"));
+        assert_eq!(
+            overlay.get("HTTPS_PROXY").map(String::as_str),
+            Some("http://proxy.local:8080")
+        );
         assert_eq!(
             cyrup_provider::configured_http_proxy().as_deref(),
             Some("http://proxy.local:8080"),
@@ -2902,13 +3027,19 @@ mod tests {
     // an assembled two-model anthropic catalog (opus cost 15/75 vs sonnet 6/30).
     #[test]
     fn fallback_model_clones_curated_default_not_alias_preferred_base() {
-        use super::{fallback_model, SessionConfig};
-        use cyrup_provider::faux::{FauxConfig, FauxModelDefinition, FauxProvider};
+        use super::{SessionConfig, fallback_model};
         use cyrup_provider::ModelCost;
+        use cyrup_provider::faux::{FauxConfig, FauxModelDefinition, FauxProvider};
 
         let mk = |id: &str, input: f64, output: f64| {
             let mut d = FauxModelDefinition::new(id);
-            d.cost = ModelCost { input, output, cache_read: 0.0, cache_write: 0.0, tiers: None };
+            d.cost = ModelCost {
+                input,
+                output,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                tiers: None,
+            };
             d
         };
         // Order the alias-preferred pick FIRST (byte-descending `s` > `o` -> sonnet), so the naive
@@ -2916,7 +3047,10 @@ mod tests {
         let provider = FauxProvider::with_config(FauxConfig {
             provider: "anthropic".into(),
             api: "anthropic".into(),
-            models: vec![mk("claude-sonnet-5", 6.0, 30.0), mk("claude-opus-4-8", 15.0, 75.0)],
+            models: vec![
+                mk("claude-sonnet-5", 6.0, 30.0),
+                mk("claude-opus-4-8", 15.0, 75.0),
+            ],
             ..Default::default()
         });
         let mut cfg = SessionConfig::new("/tmp", "/tmp/agent");

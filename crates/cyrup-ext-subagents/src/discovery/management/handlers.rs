@@ -6,28 +6,102 @@
 use std::collections::HashMap;
 
 use super::super::types::{
-    AgentDefinition, AgentSource, ChainDefinition, ChainDiscoveryDiagnostic, ChainStepConfig,
-    SystemPromptMode,
+    AgentDefinition, AgentDiscoveryDiagnostic, AgentSource, ChainDefinition,
+    ChainDiscoveryDiagnostic, ChainStepConfig, SystemPromptMode,
 };
-use super::super::{discover_agents_all, AgentDiscoveryConfig};
-use super::agent_crud::{create_agent, delete_agent, rename_agent, update_agent, AgentFields, AgentMutationOutcome};
+use super::super::{AgentDiscoveryConfig, discover_agents_all, find_blocking_agent_diagnostic};
+use super::agent_crud::{
+    AgentFields, AgentMutationOutcome, create_agent, delete_agent, rename_agent, update_agent,
+};
 use super::chain_crud::{create_chain_with_steps, delete_chain, update_chain_full};
-use super::config_parse::{apply_agent_config, config_object, parse_package_config, parse_step_list};
-use super::helpers::{disambiguation_scope, normalize_list_scope, pick_scope_dir, sanitize_name, source_str};
+use super::config_parse::{
+    apply_agent_config, config_object, parse_package_config, parse_step_list,
+};
+use super::helpers::{
+    disambiguation_scope, normalize_list_scope, pick_scope_dir, sanitize_name, source_str,
+};
 use super::lookup::{
-    available_agent_names, available_chain_names, distinct_agent_names, find_agents, find_chains,
-    name_exists_in_scope, resolve_target, unknown_chain_agents, TargetKind,
+    TargetKind, available_agent_names, available_chain_names, distinct_agent_names, find_agents,
+    find_chains, name_exists_in_scope, resolve_target, unknown_chain_agents,
 };
 use super::render::{format_agent_detail, format_chain_detail, format_model_source};
-use super::{ManagementOutcome, ManagementRequest, BUILTIN_AGENT_NAMES};
+use super::{BUILTIN_AGENT_NAMES, ManagementOutcome, ManagementRequest};
 use crate::error::SubagentError;
 
+/// Builtin/Package agents are visible under every list scope; SUBA-084 adds Runtime to that set —
+/// pi `effectiveAgentsForScope` (`agent-management.ts:132-141` @v0.64.0) merges the runtime agents
+/// into the scope-narrowed list unconditionally (`mergeRuntimeAgents(owner, { agents },
+/// allAgents(d))`), so a `user`/`project` listing still shows them.
 fn agent_in_list_scope(source: AgentSource, scope: Option<AgentSource>) -> bool {
-    scope.is_none() || matches!(source, AgentSource::Builtin | AgentSource::Package) || Some(source) == scope
+    scope.is_none()
+        || matches!(
+            source,
+            AgentSource::Builtin | AgentSource::Package | AgentSource::Runtime
+        )
+        || Some(source) == scope
 }
 
 fn chain_in_list_scope(source: AgentSource, scope: Option<AgentSource>) -> bool {
     scope.is_none() || source == AgentSource::Package || Some(source) == scope
+}
+
+/// SUBA-086 — pi `diagnosticsForScope` (`agent-management.ts:177-181` @v0.64.0): `both` keeps
+/// everything; `user` drops PROJECT-sourced diagnostics and `project` drops USER-sourced ones
+/// (builtin/package/runtime diagnostics survive either named scope).
+fn diagnostics_for_scope(
+    diagnostics: &[AgentDiscoveryDiagnostic],
+    scope: Option<AgentSource>,
+) -> Vec<AgentDiscoveryDiagnostic> {
+    let excluded = match scope {
+        None => return diagnostics.to_vec(),
+        Some(AgentSource::User) => AgentSource::Project,
+        Some(_) => AgentSource::User,
+    };
+    diagnostics
+        .iter()
+        .filter(|d| d.source != excluded)
+        .cloned()
+        .collect()
+}
+
+/// SUBA-086 — pi `appendAgentDiagnosticLines` (`agent-management.ts:818-825` @v0.64.0;
+/// `:760-764` @v0.57.0): nothing when empty, else a blank separator, `Invalid agent
+/// definitions:` and one `- <name ?? filePath> (<source>): <error>` line per diagnostic.
+fn append_agent_diagnostic_lines(
+    lines: &mut Vec<String>,
+    diagnostics: &[AgentDiscoveryDiagnostic],
+) {
+    if diagnostics.is_empty() {
+        return;
+    }
+    lines.push(String::new());
+    lines.push("Invalid agent definitions:".to_string());
+    for d in diagnostics {
+        lines.push(format!(
+            "- {} ({}): {}",
+            d.label(),
+            source_str(d.source),
+            d.error
+        ));
+    }
+}
+
+/// SUBA-086 — the two-probe lookup `get`/`models` run before their ambiguity/not-found branches
+/// (`agent-management.ts:985-989,1084-1089` @v0.64.0): the raw name first, then — only when it
+/// differs — the `sanitizeName`d spelling.
+fn blocking_diagnostic_for_request<'a>(
+    requested: &str,
+    matches: &[AgentDefinition],
+    diagnostics: &'a [AgentDiscoveryDiagnostic],
+) -> Option<&'a AgentDiscoveryDiagnostic> {
+    let candidates: Vec<&AgentDefinition> = matches.iter().collect();
+    let raw = requested.trim();
+    let sanitized = sanitize_name(raw);
+    find_blocking_agent_diagnostic(raw, &candidates, diagnostics).or_else(|| {
+        (sanitized != raw)
+            .then(|| find_blocking_agent_diagnostic(&sanitized, &candidates, diagnostics))
+            .flatten()
+    })
 }
 
 /// pi's name-sensitive create defaults (`agents.ts:36-45`): `delegate` -> `Append`/inherit-context,
@@ -87,7 +161,10 @@ pub(crate) fn editable_base(target: &AgentDefinition) -> AgentDefinition {
 /// deleted `companionSuggestionLines` from `handleList`'s `ManagementContext` and from its rendered
 /// lines in `3ac0ef5` ("Make supervisor coordination native", 2026-07-03), together with the whole
 /// `extension/companion-suggestions.ts` module.
-pub(crate) fn handle_list(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<ManagementOutcome, SubagentError> {
+pub(crate) fn handle_list(
+    cfg: &AgentDiscoveryConfig,
+    req: &ManagementRequest,
+) -> Result<ManagementOutcome, SubagentError> {
     let scope = normalize_list_scope(req.agent_scope);
     let d = discover_agents_all(cfg)?;
 
@@ -145,9 +222,19 @@ pub(crate) fn handle_list(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -
         lines.push("- (none)".to_string());
     } else {
         for c in &chains {
-            lines.push(format!("- {} ({}): {}", c.name, source_str(c.source), c.description));
+            lines.push(format!(
+                "- {} ({}): {}",
+                c.name,
+                source_str(c.source),
+                c.description
+            ));
         }
     }
+    // SUBA-086 — pi `handleList` (`agent-management.ts:946-947` @v0.64.0) appends the agent
+    // diagnostics BEFORE the proactive suggestions, and hands it `d.agentDiagnostics` UNFILTERED
+    // (unlike `get`/`models`, which go through `diagnosticsForScope`) — so a `user`-scoped
+    // listing still shows a broken project file. Ported as written.
+    append_agent_diagnostic_lines(&mut lines, &d.agent_diagnostics);
     // pi `agent-management.ts:765-770,784` @v0.43.0: the proactive suggestions are computed from the same
     // filtered `agents`/`chains` this listing rendered, and spliced in after `Chains:` and before
     // `Chain diagnostics:` — with a leading blank line, and only when non-empty.
@@ -186,9 +273,14 @@ pub(crate) fn handle_list(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -
 }
 
 /// pi `handleGet` (`agent-management.ts:871-906`).
-pub(crate) fn handle_get(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<ManagementOutcome, SubagentError> {
+pub(crate) fn handle_get(
+    cfg: &AgentDiscoveryConfig,
+    req: &ManagementRequest,
+) -> Result<ManagementOutcome, SubagentError> {
     if req.agent.is_none() && req.chain_name.is_none() {
-        return Ok(ManagementOutcome::err("Specify 'agent' or 'chainName' for get."));
+        return Ok(ManagementOutcome::err(
+            "Specify 'agent' or 'chainName' for get.",
+        ));
     }
     let has_both = req.agent.is_some() && req.chain_name.is_some();
     let d = discover_agents_all(cfg)?;
@@ -196,10 +288,28 @@ pub(crate) fn handle_get(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) ->
     let mut any_found = false;
     if let Some(agent_name) = req.agent {
         let matches = find_agents(&d, agent_name, None);
-        // pi `handleGet` @ v0.43.0 (`agent-management.ts:871-885`) checks AMBIGUITY first: a match
-        // set spanning several distinct canonical names is refused before the not-found branch.
+        // SUBA-086 — pi `handleGet` (`agent-management.ts:1084-1089` @v0.64.0) consults the
+        // blocking diagnostic BEFORE the ambiguity and not-found branches, so a name whose only
+        // (or outranking) definition is malformed reports the parse error by name instead of
+        // `not found`. `get` takes no `agentScope` here, so the diagnostics are unscoped like
+        // the `find_agents(.., None)` match set beside them.
+        let diagnostics = diagnostics_for_scope(&d.agent_diagnostics, None);
         let distinct = distinct_agent_names(&matches);
-        if distinct.len() > 1 {
+        if let Some(diagnostic) =
+            blocking_diagnostic_for_request(agent_name, &matches, &diagnostics)
+        {
+            let msg = format!(
+                "Agent '{agent_name}' has invalid configuration: {}",
+                diagnostic.error
+            );
+            if !has_both {
+                return Ok(ManagementOutcome::err(msg));
+            }
+            blocks.push(msg);
+        } else if distinct.len() > 1 {
+            // pi `handleGet` @ v0.43.0 (`agent-management.ts:871-885`) checks AMBIGUITY next: a
+            // match set spanning several distinct canonical names is refused before the not-found
+            // branch.
             let msg = format!(
                 "Ambiguous agent alias or name '{}': {}",
                 agent_name,
@@ -214,7 +324,11 @@ pub(crate) fn handle_get(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) ->
             let msg = format!(
                 "Agent '{}' not found. Available: {}.",
                 agent_name,
-                if avail.is_empty() { "none".to_string() } else { avail.join(", ") }
+                if avail.is_empty() {
+                    "none".to_string()
+                } else {
+                    avail.join(", ")
+                }
             );
             if !has_both {
                 return Ok(ManagementOutcome::err(msg));
@@ -234,7 +348,11 @@ pub(crate) fn handle_get(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) ->
             let msg = format!(
                 "Chain '{}' not found. Available: {}.",
                 chain_name,
-                if avail.is_empty() { "none".to_string() } else { avail.join(", ") }
+                if avail.is_empty() {
+                    "none".to_string()
+                } else {
+                    avail.join(", ")
+                }
             );
             if !has_both {
                 return Ok(ManagementOutcome::err(msg));
@@ -247,7 +365,10 @@ pub(crate) fn handle_get(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) ->
             }
         }
     }
-    Ok(ManagementOutcome { text: blocks.join("\n\n"), is_error: !any_found })
+    Ok(ManagementOutcome {
+        text: blocks.join("\n\n"),
+        is_error: !any_found,
+    })
 }
 
 /// pi `handleModels` (`agent-management.ts:802-869`): the live parent session model is now threaded
@@ -260,7 +381,10 @@ pub(crate) fn handle_get(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) ->
 /// [`crate::extension::SubagentExecutor::run_models_report`] (which has its own `HostServices`
 /// handle); this handler is the management-layer twin, reached via
 /// [`super::handle_management_action`] and this crate's tests.
-pub(crate) fn handle_models(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<ManagementOutcome, SubagentError> {
+pub(crate) fn handle_models(
+    cfg: &AgentDiscoveryConfig,
+    req: &ManagementRequest,
+) -> Result<ManagementOutcome, SubagentError> {
     let requested = req.agent.map(str::trim).filter(|s| !s.is_empty());
     if let Some(name) = requested
         && !BUILTIN_AGENT_NAMES.contains(&name)
@@ -280,7 +404,9 @@ pub(crate) fn handle_models(cfg: &AgentDiscoveryConfig, req: &ManagementRequest)
 
     if let Some(name) = requested {
         let Some(agent) = builtin_by_name.get(name) else {
-            return Ok(ManagementOutcome::err(format!("Builtin agent '{name}' not found.")));
+            return Ok(ManagementOutcome::err(format!(
+                "Builtin agent '{name}' not found."
+            )));
         };
         let resolved = agent
             .model
@@ -294,7 +420,10 @@ pub(crate) fn handle_models(cfg: &AgentDiscoveryConfig, req: &ManagementRequest)
             format!("Agent: {name}"),
             "Effective model:".to_string(),
             format!("  {resolved}"),
-            format!("Source: {}", format_model_source(agent, req.current_session_model)),
+            format!(
+                "Source: {}",
+                format_model_source(agent, req.current_session_model)
+            ),
         ];
         if let Some(info) = &agent.override_info {
             lines.push("Override file:".to_string());
@@ -304,7 +433,10 @@ pub(crate) fn handle_models(cfg: &AgentDiscoveryConfig, req: &ManagementRequest)
             lines.push("Disabled: true".to_string());
         }
         lines.push("Current session model:".to_string());
-        lines.push(format!("  {}", req.current_session_model.unwrap_or("(unavailable)")));
+        lines.push(format!(
+            "  {}",
+            req.current_session_model.unwrap_or("(unavailable)")
+        ));
         return Ok(ManagementOutcome::ok(lines.join("\n")));
     }
 
@@ -334,7 +466,11 @@ pub(crate) fn handle_models(cfg: &AgentDiscoveryConfig, req: &ManagementRequest)
                 let source = format!(
                     "{}{}",
                     format_model_source(agent, req.current_session_model),
-                    if agent.disabled == Some(true) { "; disabled" } else { "" }
+                    if agent.disabled == Some(true) {
+                        "; disabled"
+                    } else {
+                        ""
+                    }
                 );
                 lines.push(name.to_string());
                 lines.push("  model:".to_string());
@@ -344,6 +480,14 @@ pub(crate) fn handle_models(cfg: &AgentDiscoveryConfig, req: &ManagementRequest)
             }
         }
     }
+    // SUBA-086 — pi `handleModels` (`agent-management.ts:1074` @v0.64.0): `if (!requestedAgent)
+    // appendAgentDiagnosticLines(lines, diagnosticsForScope(discovered.agentDiagnostics, scope))`
+    // — only the all-builtins listing carries the block (a requested agent is answered above).
+    // cyrup's `models` takes no `agentScope`, so the filter is the `both` identity.
+    append_agent_diagnostic_lines(
+        &mut lines,
+        &diagnostics_for_scope(&d.agent_diagnostics, None),
+    );
     Ok(ManagementOutcome::ok(lines.join("\n")))
 }
 
@@ -351,7 +495,10 @@ pub(crate) fn handle_models(cfg: &AgentDiscoveryConfig, req: &ManagementRequest)
 /// (see `discovery/management.rs`'s own C3 section header, preserved on
 /// [`crate::discovery::management::handle_management_action`]); the create + name-collision +
 /// shadow-note + unknown-agent warnings are faithful.
-pub(crate) fn handle_create(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<ManagementOutcome, SubagentError> {
+pub(crate) fn handle_create(
+    cfg: &AgentDiscoveryConfig,
+    req: &ManagementRequest,
+) -> Result<ManagementOutcome, SubagentError> {
     use serde_json::Value;
     let cfg_map = match config_object(req.config) {
         Ok(Some(map)) => map,
@@ -361,18 +508,24 @@ pub(crate) fn handle_create(cfg: &AgentDiscoveryConfig, req: &ManagementRequest)
     let name_raw = match cfg_map.get("name").and_then(Value::as_str) {
         Some(s) if !s.trim().is_empty() => s.to_string(),
         _ => {
-            return Ok(ManagementOutcome::err("config.name is required and must be a non-empty string."))
+            return Ok(ManagementOutcome::err(
+                "config.name is required and must be a non-empty string.",
+            ));
         }
     };
     let description = match cfg_map.get("description").and_then(Value::as_str) {
         Some(s) if !s.trim().is_empty() => s.trim().to_string(),
         _ => {
-            return Ok(ManagementOutcome::err("config.description is required and must be a non-empty string."))
+            return Ok(ManagementOutcome::err(
+                "config.description is required and must be a non-empty string.",
+            ));
         }
     };
     let local_name = sanitize_name(&name_raw);
     if local_name.is_empty() {
-        return Ok(ManagementOutcome::err("config.name is invalid after sanitization. Use letters, numbers, spaces, or hyphens."));
+        return Ok(ManagementOutcome::err(
+            "config.name is invalid after sanitization. Use letters, numbers, spaces, or hyphens.",
+        ));
     }
     let package_name = match parse_package_config(cfg_map.get("package")) {
         Ok(pkg) => pkg,
@@ -383,7 +536,11 @@ pub(crate) fn handle_create(cfg: &AgentDiscoveryConfig, req: &ManagementRequest)
         None => AgentSource::User,
         Some(Value::String(s)) if s == "user" => AgentSource::User,
         Some(Value::String(s)) if s == "project" => AgentSource::Project,
-        _ => return Ok(ManagementOutcome::err("config.scope must be 'user' or 'project'.")),
+        _ => {
+            return Ok(ManagementOutcome::err(
+                "config.scope must be 'user' or 'project'.",
+            ));
+        }
     };
     let is_chain = cfg_map.contains_key("steps");
     let d = discover_agents_all(cfg)?;
@@ -409,7 +566,9 @@ pub(crate) fn handle_create(cfg: &AgentDiscoveryConfig, req: &ManagementRequest)
             .iter()
             .any(|a| a.source == AgentSource::Builtin && a.name == runtime_name)
     {
-        warnings.push(format!("Note: this shadows the builtin agent '{runtime_name}'."));
+        warnings.push(format!(
+            "Note: this shadows the builtin agent '{runtime_name}'."
+        ));
     }
 
     if is_chain {
@@ -456,7 +615,9 @@ pub(crate) fn handle_create(cfg: &AgentDiscoveryConfig, req: &ManagementRequest)
     let Some(created) = create_agent(&scope_dir, scope, &local_name, &description, &fields)? else {
         // Pre-validated above via `parse_package_config`, so the low-level silent-skip path is
         // unreachable in practice; surface pi's own invalid-package text rather than panicking.
-        return Ok(ManagementOutcome::err("config.package is invalid after sanitization."));
+        return Ok(ManagementOutcome::err(
+            "config.package is invalid after sanitization.",
+        ));
     };
     let mut lines = vec![format!(
         "Created agent '{runtime_name}' at {}.",
@@ -469,13 +630,20 @@ pub(crate) fn handle_create(cfg: &AgentDiscoveryConfig, req: &ManagementRequest)
 /// pi `handleUpdate` (`agent-management.ts:977-1088`). Model/fallback/skills registry warnings are
 /// deferred; rename, package repackaging, unknown-agent warnings, and the still-referenced-after-
 /// rename warning are faithful.
-pub(crate) fn handle_update(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<ManagementOutcome, SubagentError> {
+pub(crate) fn handle_update(
+    cfg: &AgentDiscoveryConfig,
+    req: &ManagementRequest,
+) -> Result<ManagementOutcome, SubagentError> {
     use serde_json::Value;
     if req.agent.is_none() && req.chain_name.is_none() {
-        return Ok(ManagementOutcome::err("Specify 'agent' or 'chainName' for update."));
+        return Ok(ManagementOutcome::err(
+            "Specify 'agent' or 'chainName' for update.",
+        ));
     }
     if req.agent.is_some() && req.chain_name.is_some() {
-        return Ok(ManagementOutcome::err("Specify either 'agent' or 'chainName', not both."));
+        return Ok(ManagementOutcome::err(
+            "Specify either 'agent' or 'chainName', not both.",
+        ));
     }
     let cfg_map = match config_object(req.config) {
         Ok(Some(map)) => map,
@@ -488,26 +656,38 @@ pub(crate) fn handle_update(cfg: &AgentDiscoveryConfig, req: &ManagementRequest)
         let d = discover_agents_all(cfg)?;
         let matches = find_agents(&d, agent_name, scope_hint);
         let available = available_agent_names(&d);
-        let target = match resolve_target(TargetKind::Agent, agent_name, matches, &available, req.agent_scope) {
+        let target = match resolve_target(
+            TargetKind::Agent,
+            agent_name,
+            matches,
+            &available,
+            req.agent_scope,
+        ) {
             Ok(t) => t,
             Err(outcome) => return Ok(outcome),
         };
         if cfg_map.contains_key("name")
             && !matches!(cfg_map.get("name").and_then(Value::as_str), Some(s) if !s.trim().is_empty())
         {
-            return Ok(ManagementOutcome::err("config.name must be a non-empty string when provided."));
+            return Ok(ManagementOutcome::err(
+                "config.name must be a non-empty string when provided.",
+            ));
         }
         if cfg_map.contains_key("description")
             && !matches!(cfg_map.get("description").and_then(Value::as_str), Some(s) if !s.trim().is_empty())
         {
-            return Ok(ManagementOutcome::err("config.description must be a non-empty string when provided."));
+            return Ok(ManagementOutcome::err(
+                "config.description must be a non-empty string when provided.",
+            ));
         }
         let old_name = target.name.clone();
         let mut new_local = target.local_name.clone();
         if cfg_map.contains_key("name") {
             new_local = sanitize_name(cfg_map.get("name").and_then(Value::as_str).unwrap_or(""));
             if new_local.is_empty() {
-                return Ok(ManagementOutcome::err("config.name is invalid after sanitization."));
+                return Ok(ManagementOutcome::err(
+                    "config.name is invalid after sanitization.",
+                ));
             }
         }
         let mut new_pkg = target.package_name.clone();
@@ -535,7 +715,9 @@ pub(crate) fn handle_update(cfg: &AgentDiscoveryConfig, req: &ManagementRequest)
         }
         let base = editable_base(&target);
         let Some(updated) = update_agent(&base, &fields)? else {
-            return Ok(ManagementOutcome::err("config.package is invalid after sanitization."));
+            return Ok(ManagementOutcome::err(
+                "config.package is invalid after sanitization.",
+            ));
         };
         let new_runtime = updated.definition.name.clone();
         let final_outcome: AgentMutationOutcome = if new_runtime != old_name {
@@ -548,7 +730,11 @@ pub(crate) fn handle_update(cfg: &AgentDiscoveryConfig, req: &ManagementRequest)
             let refs: Vec<String> = discover_agents_all(cfg)?
                 .chains
                 .iter()
-                .filter(|c| c.steps.iter().any(|s| s.agent.as_deref() == Some(old_name.as_str())))
+                .filter(|c| {
+                    c.steps
+                        .iter()
+                        .any(|s| s.agent.as_deref() == Some(old_name.as_str()))
+                })
                 .map(|c| format!("{} ({})", c.name, source_str(c.source)))
                 .collect();
             if !refs.is_empty() {
@@ -559,7 +745,10 @@ pub(crate) fn handle_update(cfg: &AgentDiscoveryConfig, req: &ManagementRequest)
             }
         }
         let headline = if new_runtime == old_name {
-            format!("Updated agent '{new_runtime}' at {}.", final_outcome.file_path.display())
+            format!(
+                "Updated agent '{new_runtime}' at {}.",
+                final_outcome.file_path.display()
+            )
         } else {
             format!(
                 "Updated agent '{old_name}' to '{new_runtime}' at {}.",
@@ -576,26 +765,38 @@ pub(crate) fn handle_update(cfg: &AgentDiscoveryConfig, req: &ManagementRequest)
     let d = discover_agents_all(cfg)?;
     let matches = find_chains(&d, chain_name, scope_hint);
     let available = available_chain_names(&d);
-    let target = match resolve_target(TargetKind::Chain, chain_name, matches, &available, req.agent_scope) {
+    let target = match resolve_target(
+        TargetKind::Chain,
+        chain_name,
+        matches,
+        &available,
+        req.agent_scope,
+    ) {
         Ok(t) => t,
         Err(outcome) => return Ok(outcome),
     };
     if cfg_map.contains_key("name")
         && !matches!(cfg_map.get("name").and_then(Value::as_str), Some(s) if !s.trim().is_empty())
     {
-        return Ok(ManagementOutcome::err("config.name must be a non-empty string when provided."));
+        return Ok(ManagementOutcome::err(
+            "config.name must be a non-empty string when provided.",
+        ));
     }
     if cfg_map.contains_key("description")
         && !matches!(cfg_map.get("description").and_then(Value::as_str), Some(s) if !s.trim().is_empty())
     {
-        return Ok(ManagementOutcome::err("config.description must be a non-empty string when provided."));
+        return Ok(ManagementOutcome::err(
+            "config.description must be a non-empty string when provided.",
+        ));
     }
     let old_name = target.name.clone();
     let mut new_local = target.local_name.clone();
     if cfg_map.contains_key("name") {
         new_local = sanitize_name(cfg_map.get("name").and_then(Value::as_str).unwrap_or(""));
         if new_local.is_empty() {
-            return Ok(ManagementOutcome::err("config.name is invalid after sanitization."));
+            return Ok(ManagementOutcome::err(
+                "config.name is invalid after sanitization.",
+            ));
         }
     }
     let mut new_pkg = target.package_name.clone();
@@ -636,9 +837,19 @@ pub(crate) fn handle_update(cfg: &AgentDiscoveryConfig, req: &ManagementRequest)
         }
         None => target.steps.clone(),
     };
-    let updated = update_chain_full(&target, &new_local, new_pkg.clone(), &new_description, steps)?;
+    let updated = update_chain_full(
+        &target,
+        &new_local,
+        new_pkg.clone(),
+        &new_description,
+        steps,
+    )?;
     let headline = if updated.name == old_name {
-        format!("Updated chain '{}' at {}.", updated.name, updated.file_path.display())
+        format!(
+            "Updated chain '{}' at {}.",
+            updated.name,
+            updated.file_path.display()
+        )
     } else {
         format!(
             "Updated chain '{old_name}' to '{}' at {}.",
@@ -652,19 +863,32 @@ pub(crate) fn handle_update(cfg: &AgentDiscoveryConfig, req: &ManagementRequest)
 }
 
 /// pi `handleDelete` (`agent-management.ts:1090-1109`).
-pub(crate) fn handle_delete(cfg: &AgentDiscoveryConfig, req: &ManagementRequest) -> Result<ManagementOutcome, SubagentError> {
+pub(crate) fn handle_delete(
+    cfg: &AgentDiscoveryConfig,
+    req: &ManagementRequest,
+) -> Result<ManagementOutcome, SubagentError> {
     if req.agent.is_none() && req.chain_name.is_none() {
-        return Ok(ManagementOutcome::err("Specify 'agent' or 'chainName' for delete."));
+        return Ok(ManagementOutcome::err(
+            "Specify 'agent' or 'chainName' for delete.",
+        ));
     }
     if req.agent.is_some() && req.chain_name.is_some() {
-        return Ok(ManagementOutcome::err("Specify either 'agent' or 'chainName', not both."));
+        return Ok(ManagementOutcome::err(
+            "Specify either 'agent' or 'chainName', not both.",
+        ));
     }
     let scope_hint = disambiguation_scope(req.agent_scope);
     if let Some(agent_name) = req.agent {
         let d = discover_agents_all(cfg)?;
         let matches = find_agents(&d, agent_name, scope_hint);
         let available = available_agent_names(&d);
-        let target = match resolve_target(TargetKind::Agent, agent_name, matches, &available, req.agent_scope) {
+        let target = match resolve_target(
+            TargetKind::Agent,
+            agent_name,
+            matches,
+            &available,
+            req.agent_scope,
+        ) {
             Ok(t) => t,
             Err(outcome) => return Ok(outcome),
         };
@@ -672,10 +896,18 @@ pub(crate) fn handle_delete(cfg: &AgentDiscoveryConfig, req: &ManagementRequest)
         let refs: Vec<String> = discover_agents_all(cfg)?
             .chains
             .iter()
-            .filter(|c| c.steps.iter().any(|s| s.agent.as_deref() == Some(target.name.as_str())))
+            .filter(|c| {
+                c.steps
+                    .iter()
+                    .any(|s| s.agent.as_deref() == Some(target.name.as_str()))
+            })
             .map(|c| format!("{} ({})", c.name, source_str(c.source)))
             .collect();
-        let mut lines = vec![format!("Deleted agent '{}' at {}.", target.name, target.file_path.display())];
+        let mut lines = vec![format!(
+            "Deleted agent '{}' at {}.",
+            target.name,
+            target.file_path.display()
+        )];
         if !refs.is_empty() {
             lines.push(format!(
                 "Warning: chains reference deleted agent '{}': {}.",
@@ -689,7 +921,13 @@ pub(crate) fn handle_delete(cfg: &AgentDiscoveryConfig, req: &ManagementRequest)
     let d = discover_agents_all(cfg)?;
     let matches = find_chains(&d, chain_name, scope_hint);
     let available = available_chain_names(&d);
-    let target = match resolve_target(TargetKind::Chain, chain_name, matches, &available, req.agent_scope) {
+    let target = match resolve_target(
+        TargetKind::Chain,
+        chain_name,
+        matches,
+        &available,
+        req.agent_scope,
+    ) {
         Ok(t) => t,
         Err(outcome) => return Ok(outcome),
     };
@@ -707,9 +945,9 @@ mod tests {
 
     use std::path::PathBuf;
 
-    use super::*;
     use super::super::frontmatter_write::serialize_agent;
     use super::super::test_support::sample_agent;
+    use super::*;
 
     /// G101: an `extensions` list that came from `subagents.defaultExtensions` is NOT the agent's
     /// own data. `editable_base` (pi `editableAgentConfig`, `agent-management.ts:243`) must drop it
@@ -722,7 +960,10 @@ mod tests {
         agent.extensions_from_default = true;
 
         let base = editable_base(&agent);
-        assert_eq!(base.extensions, None, "a defaulted list must not survive into the edit base");
+        assert_eq!(
+            base.extensions, None,
+            "a defaulted list must not survive into the edit base"
+        );
         assert!(!base.extensions_from_default);
         assert!(
             !serialize_agent(&base, None).contains("extensions:"),
@@ -733,7 +974,10 @@ mod tests {
         let mut own = sample_agent(AgentSource::User, PathBuf::from("/seer.md"));
         own.extensions = Some(vec!["own-ext".to_string()]);
         own.extensions_from_default = false;
-        assert_eq!(editable_base(&own).extensions, Some(vec!["own-ext".to_string()]));
+        assert_eq!(
+            editable_base(&own).extensions,
+            Some(vec!["own-ext".to_string()])
+        );
         assert!(serialize_agent(&editable_base(&own), None).contains("extensions: own-ext"));
     }
 }

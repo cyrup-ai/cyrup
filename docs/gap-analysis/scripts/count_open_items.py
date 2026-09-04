@@ -363,13 +363,24 @@ def parse_09a(path):
             }
         )
 
-    # The eight "Carried — NOT adversarially verified" rows: no table, listed
-    # in prose in the '## Summary — confirmed items' block's own trailing
+    # The "Carried — NOT adversarially verified" rows: no table, listed in
+    # prose in the '## Summary — confirmed items' block's own trailing
     # paragraph and in the '## Carried — NOT adversarially verified' section.
     # Hand-enumerated here (ids + severities are stable, cited in-file) rather
     # than prose-parsed, since the prose format is not table-shaped.
-    carried_high = ["SUBA-082", "SUBA-084", "SUBA-086"]
-    carried_medium = ["SUBA-087", "SUBA-088", "SUBA-089", "SUBA-090", "SUBA-091"]
+    #
+    # 2026-09-04: the three carried highs (SUBA-082, SUBA-084, SUBA-086) were
+    # promoted into the '## Summary — confirmed items' table as CLOSED rows
+    # (each now has a full '## ~~SUBA-0xx~~' section in the confirmed set).
+    # They are therefore counted from the table above, and MUST NOT also be
+    # listed here, or each would count a second time as an open carried row.
+    # 2026-09-04 (batch 2): the five carried mediums (SUBA-087..SUBA-091) were
+    # promoted and closed / partially closed the same way, so both lists are
+    # now empty and every 09a row is table-derived. '## Carried' holds only
+    # pointer lines. Re-populate a list ONLY for an id that is prose-only
+    # again (no table row), never for one that has a table row.
+    carried_high = []
+    carried_medium = []
     for cid in carried_high:
         parsed.append({"id": cid, "line": None, "closed": False, "severity": "high",
                         "kind": "upstream-drift", "raw_severity_cell": "(carried, not adversarially verified)"})

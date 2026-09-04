@@ -24,15 +24,20 @@
 // always true here. Re-spelled in cyrup-it it would name THIS crate's `wasm-host`, which
 // `--features it` does not enable, and every test below would SILENTLY not compile in.
 // See the `[[test]]` note in crates/cyrup-it/Cargo.toml.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use cyrup_core::{ExtensionId, StopReason};
 use cyrup_ext::{EventKind, Extension};
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 use cyrup_provider::Provider;
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
 use cyrup_session_svc::{SessionBuilder, SessionConfig};
 use tempfile::TempDir;
 
@@ -56,7 +61,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -120,7 +129,8 @@ async fn wasm_guest_compaction_override_lands_through_agent_session_compact() {
     // so the assembled host's `emit_before_compact` will actually dispatch to it (not short-circuit
     // on `no_subscribers`).
     assert!(
-        ext.subscriptions().contains(EventKind::SessionBeforeCompact),
+        ext.subscriptions()
+            .contains(EventKind::SessionBeforeCompact),
         "the live wasm guest subscribed to SessionBeforeCompact"
     );
 
@@ -171,5 +181,9 @@ async fn wasm_guest_compaction_override_lands_through_agent_session_compact() {
 #[test]
 fn fixture_component_exists() {
     let p = bins::component();
-    assert!(Path::new(&p).exists(), "fixture component missing at {}", p.display());
+    assert!(
+        Path::new(&p).exists(),
+        "fixture component missing at {}",
+        p.display()
+    );
 }

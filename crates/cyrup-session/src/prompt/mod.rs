@@ -26,13 +26,13 @@ pub mod overrides;
 pub mod skills_inject;
 pub mod tool_prompts;
 
-pub use builder::{DocsPointers, PromptInputs, SystemPromptBuilder, DEFAULT_SELECTED_TOOLS};
+pub use builder::{DEFAULT_SELECTED_TOOLS, DocsPointers, PromptInputs, SystemPromptBuilder};
 pub use cache::{ContextError, ContextSnapshot, ContextStore};
 pub use context_files::{
     ContextDiagnostic, ContextFile, ContextFileLoader, ContextScope, TrustQuery,
 };
 pub use hook::{
-    apply_before_agent_start, BeforeAgentStartHook, BeforeAgentStartInput, BeforeAgentStartOutput,
+    BeforeAgentStartHook, BeforeAgentStartInput, BeforeAgentStartOutput, apply_before_agent_start,
 };
 pub use overrides::ResolvedOverride;
 pub use tool_prompts::ToolPromptContribution;

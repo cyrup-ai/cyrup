@@ -322,8 +322,16 @@ pub fn validate_credential_print_args(
             "Auth commands only accept --provider and --model",
         ));
     }
-    let provider = cli.provider.as_deref().map(str::trim).filter(|p| !p.is_empty());
-    let model = cli.model.as_deref().map(str::trim).filter(|m| !m.is_empty());
+    let provider = cli
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty());
+    let model = cli
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty());
     if provider.is_none() && model.is_none() {
         return Err(CredentialPrintError::msg(match kind {
             // Pi `:108-110`.
@@ -362,7 +370,9 @@ fn to_provider_credential(cred: cyrup_config::Credential) -> cyrup_provider::Cre
 /// Extract the token from an `Authorization: Bearer <token>` header value (Pi
 /// `/^Bearer\s+(.+)$/iu`, credential-print.ts:127).
 fn strip_bearer(value: &str) -> Option<String> {
-    value.get(..6).filter(|p| p.eq_ignore_ascii_case("Bearer"))?;
+    value
+        .get(..6)
+        .filter(|p| p.eq_ignore_ascii_case("Bearer"))?;
     let tail = value.get(6..)?;
     if !tail.starts_with(char::is_whitespace) {
         return None;
@@ -414,9 +424,8 @@ pub async fn resolve_credential_for_print(
         cyrup_config::load_models_file_reporting(&dirs.agent_dir.join("models.json"));
     let registry = crate::provider::registry_with_credentials(&models_json, store);
     let all = registry.get_models(None);
-    let has_configured_auth = |m: &Model| {
-        cyrup_config::provider_is_configured(&auth, &models_json, &m.provider, None)
-    };
+    let has_configured_auth =
+        |m: &Model| cyrup_config::provider_is_configured(&auth, &models_json, &m.provider, None);
 
     // Pi's `--provider` value is the TRIMMED one `validateAuthCommandArgs` returns
     // (`auth-command.ts:97-98` @v0.84.1: `args.provider?.trim() || undefined`), and
@@ -445,7 +454,12 @@ pub async fn resolve_credential_for_print(
                 "Unknown provider \"{provider}\". Use --list-models to see available providers."
             )));
         }
-        match cli.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+        match cli
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        {
             // Pi `:33-38` — a `--model` alongside `--provider` must resolve, and a failure is fatal.
             Some(model_pattern) => {
                 let resolved = cyrup_config::resolve_cli_model(
@@ -672,7 +686,12 @@ pub async fn run_auth_check(
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .map(str::to_string);
-    if let Some(model_pattern) = cli.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+    if let Some(model_pattern) = cli
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
         let resolved = cyrup_config::resolve_cli_model(
             cli.provider.as_deref(),
             Some(model_pattern),
@@ -692,7 +711,9 @@ pub async fn run_auth_check(
     }
     // Pi `:35` — `if (!provider) throw new AuthCommandError("Unable to resolve an auth provider");`
     let Some(provider) = provider else {
-        return Err(CredentialPrintError::msg("Unable to resolve an auth provider"));
+        return Err(CredentialPrintError::msg(
+            "Unable to resolve an auth provider",
+        ));
     };
 
     // Tier 3 — `modelRuntime.getError()` (`:37-39`).
@@ -751,7 +772,11 @@ pub async fn run_auth_check(
         Some(model) => registry
             .get_auth_with(
                 model,
-                AuthOverrides { api_key: None, env: None, min_oauth_validity_ms: None },
+                AuthOverrides {
+                    api_key: None,
+                    env: None,
+                    min_oauth_validity_ms: None,
+                },
             )
             .await
             .map_err(|_| CredentialPrintError::Opaque)?,
@@ -779,7 +804,10 @@ pub async fn run_auth_check(
         // answers with its STORED `access` token; otherwise the resolved request auth's api key,
         // else the `Bearer` half of its `Authorization` header (`getAuthCredential`, `:118-125`).
         let credential = if !refresh && stored == Some(CredentialType::Oauth) {
-            match auth.read(&cyrup_sdk::core::ProviderId::from(result.provider.as_str())).await {
+            match auth
+                .read(&cyrup_sdk::core::ProviderId::from(result.provider.as_str()))
+                .await
+            {
                 Ok(Some(cyrup_config::Credential::Oauth { access, .. })) => Some(access),
                 _ => None,
             }
@@ -1020,7 +1048,10 @@ mod tests {
             .take(12)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(block.contains("v0.83.0"), "the delta must name the ported baseline too: {block}");
+        assert!(
+            block.contains("v0.83.0"),
+            "the delta must name the ported baseline too: {block}"
+        );
         for owed in ["verb", "requires --model", "print-api-key"] {
             assert!(
                 block.contains(owed),
@@ -1035,7 +1066,10 @@ mod tests {
     /// which pi accepts. Also pins pi's per-command unknown-option message (`auth-command.ts:99-102`).
     #[test]
     fn auth_arg_validation_matches_v0_84_1() {
-        let cli = Cli { provider: Some("openai".to_string()), ..Cli::default() };
+        let cli = Cli {
+            provider: Some("openai".to_string()),
+            ..Cli::default()
+        };
         assert!(validate_credential_print_args(&cli, CredentialPrintKind::ApiKey).is_ok());
         assert!(validate_credential_print_args(&cli, CredentialPrintKind::Check).is_ok());
 
@@ -1053,7 +1087,10 @@ mod tests {
             "Credential printing requires --provider <provider> or --model <model>"
         );
 
-        let mut unknown = Cli { provider: Some("openai".to_string()), ..Cli::default() };
+        let mut unknown = Cli {
+            provider: Some("openai".to_string()),
+            ..Cli::default()
+        };
         unknown.extension_flags = vec![crate::cli::ExtensionFlag {
             name: "bogus".to_string(),
             value: crate::cli::ExtFlagValue::Bool(true),
@@ -1094,13 +1131,9 @@ mod tests {
         assert_eq!(cmd.args, v(&["--model", "gpt-5.5"]));
         assert_eq!(cmd.min_expiry_ms, Some(2_700_000));
 
-        let err = parse_credential_print_command(&v(&[
-            "auth",
-            "print-api-key",
-            "--min-expiry",
-            "45m",
-        ]))
-        .unwrap_err();
+        let err =
+            parse_credential_print_command(&v(&["auth", "print-api-key", "--min-expiry", "45m"]))
+                .unwrap_err();
         assert_eq!(err, "--min-expiry is only supported by print-bearer-token");
 
         let err =

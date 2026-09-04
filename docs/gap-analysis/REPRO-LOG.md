@@ -305,6 +305,66 @@ bands, and `cyrup-session-svc/src/session.rs` in 65. Re-find the symbol, or dele
 
 ---
 
+## 0e. AMENDMENT 2026-09-04 — the two live-use highs the sixth edition kept alive were DRIVEN, and both close
+
+> **A measurement, at cyrup HEAD `a4805955`.** The five code commits that followed the same day
+> (`5e3aa1c8` … `275c1f85`) touch only `crates/cyrup-ext-subagents` and `crates/cyrup-it` fixtures;
+> neither binary path below runs through them. Debug build, isolated `CYRUP_HOME`, no network. Two
+> instruments, the same two §0c and §3 used: **tmux 3.4 on a real pty** for the TUI row, and
+> **`--mode rpc` over a pipe** for the session row. Artifacts (pane captures at T+1/2/4/7s, full
+> `capture-pane -p -S -` scrollbacks, the fake server's `requests.jsonl`, every run's stderr) were
+> kept in the run's scratchpad, not committed; the load-bearing lines are quoted in the area rows.
+
+### `TUI-091` — reasoning blocks: **RENDERED, live and committed, in seven variants. CLOSED as a duplicate of `TUI-090`.** (area 07)
+
+The owner's exact launch, `--provider together --model moonshotai/Kimi-K3 --thinking high`, was
+reproduced without the network: a local python3 SSE server on `127.0.0.1:18931` speaking
+`openai-completions` with reasoning deltas, reached through a `models.json` `together` `baseUrl`
+overlay. tmux 120×40. Prompt `say hello`. **Pane at T+1s (mid-stream):** ` say hello` /
+` THINKHEAD The user wants a greeting. Let me reason carefully about the best short reply. I should
+keep it` / ` ⠹ Working...` / footer `0.0%/1.0M (auto)   together/moonshotai/Kimi-K3 • high`.
+**Pane at T+2s (committed):** the same, continuing ` friendly. Considering tone, length and clarity.
+THINKTAIL` / ` FINALANSWER Hello there, this is the final answer text.` / footer `↑10 ↓50 $0.001 …`.
+**Scrollback:** line 70 ` say hello`, 80-81 `THINKHEAD…THINKTAIL`, 83 `FINALANSWER` — the reasoning
+committed once, above the answer. Server-side the request carried `model: moonshotai/Kimi-K3,
+reasoning: {enabled: True}, stream: True`. Six more variants, identical verdict: Together's alternative
+`reasoning` delta field; **LONG** — 90 reasoning lines, taller than the screen — committed
+`THINKLINE001` at scrollback 148 through `THINKLINE090` at 237, `FINALANSWER` at 239, **0 of 90
+missing**; **TOOL** — scrollback 73 ` THINKHEAD1 … THINKTAIL1`, 82 ` $ echo TOOLCANARY`, 84
+` TOOLCANARY`, 95 ` THINKHEAD2 … THINKTAIL2`, 97 ` FINALANSWER2 …`, and the replay request carried
+`reasoning_content` on the assistant message; `--tui-mode fullscreen`; `hideThinkingBlock: true` —
+pane ` Thinking...` / ` FINALANSWER …`, footer `… • high (hidden)`; `--continue` replay of a saved
+session. All six `tui_*.stderr` files 0 bytes; the four saved JSONLs carry 1/2/1/1 non-empty
+`type: thinking` blocks. A headless `--mode json -p "say hello" < /dev/null` control emitted 28
+`thinking_delta` updates and a `message_end` with content types `['thinking','text']`,
+`thinkingSignature: reasoning_content`. **Timeline:** `TUI-091` filed `7e2e60cc` 2026-08-15 16:26
+−0700; `TUI-090` fixed `45da9d3b` 19:50 the same day, its body naming the stale-full-viewport
+`insert_before` flush and flagging `TUI-091` as the likely duplicate. **Not measured:** a pre-`TUI-090`
+binary (`a6ea9ddd`) was still building when the pass ended. **Two things seen and NOT filed, recorded
+as leads in the area row:** the LONG run shows the live reasoning's tail once as scrolled-off live
+frames and again in the committed block (121 rows for 90 lines) — cosmetic; and the 2026-08-19
+"lost interior rows" harness byproduct did not reproduce on a real pty (0 rows lost). **Instrument
+caveats, again:** `pkill -f <script>` kills the invoking shell; `-p` blocks on an inherited open
+non-TTY stdin (pi-faithful) — use `< /dev/null`.
+
+### `SEAM-113` — `/model` persistence: **the symptom REPRODUCES and is pi v0.84.4's contract; the ledger's "input permanently empty" claim is REFUTED by seeding. CLOSED as stale under ADR-0006.** (area 08)
+
+`--mode rpc`, isolated `CYRUP_HOME`. (1) RPC `set_model` to a configured anthropic catalog model →
+`OK`; **no `settings.json` written** — matches pi `modes/rpc/rpc-mode.ts:472-478` @v0.84.4, which
+never persists. (2) Fresh relaunch → resolved `amazon-bedrock`: the owner's symptom, reproduced, and
+exactly what v0.84.4's opt-in contract prescribes (`core/agent-session.ts:1657-1677` persists only
+under `options.persist`; only the picker's Ctrl+S sets it). (3) Seeded
+`{"defaultProvider":"anthropic","defaultModel":"<that id>"}` into `<CYRUP_HOME>/.cyrup/agent/settings.json`
+→ fresh relaunch resolved that pair. So `resolve_default_launch_model`
+(`crates/cyrup/src/bootstrap.rs:247-275`) reads the keys back and the row's "rank 4 input is
+permanently empty" claim is false at HEAD; the only path that writes them is cyrup's Ctrl+S
+`ConfirmSelectionAsDefault` (`crates/cyrup-tui/src/app/execute_misc.rs:416-458`) — which is upstream's
+only path too. The `--default` flag the row named as a residual was checked in the clone rather than
+driven: `git -C tmp/pi grep -e parseDefaultFlagArgs -e '\-\-default' v0.84.4` is empty; the flag
+lived one day (`496185f6e`/`2ff8ba622` → `5133c9284`, all inside v0.84.3) and never shipped.
+
+---
+
 ## Header — what was run, where, and with what honesty about scope
 
 | | |

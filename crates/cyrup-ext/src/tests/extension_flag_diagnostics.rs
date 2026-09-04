@@ -19,7 +19,12 @@
 //!
 //! No wasm needed: `ExtensionRegistry::set_flag` is the same store a guest's `registerFlag` writes,
 //! so the registered-flag arms can be driven directly against the assembled `ExtensionHost`.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use crate::{ExtensionFlagOverride, ExtensionHost, HostConfig};
 use serde_json::json;
@@ -39,7 +44,10 @@ fn an_unregistered_flag_produces_pis_unknown_option_error() {
         )])
         .expect("apply");
     // Pi `:120-123`: singular form, `--` re-prefixed.
-    assert_eq!(diags, vec!["Unknown option: --dangerously-skip".to_string()]);
+    assert_eq!(
+        diags,
+        vec!["Unknown option: --dangerously-skip".to_string()]
+    );
 }
 
 /// Pi aggregates EVERY unknown into ONE pluralized message, joined with `", "`, in capture order —
@@ -70,7 +78,10 @@ fn a_valueless_string_flag_reports_requires_a_value_and_stores_nothing() {
         .apply_extension_flag_values(&[("persona".to_string(), ExtensionFlagOverride::Bool(true))])
         .expect("apply");
 
-    assert_eq!(diags, vec!["Extension flag \"--persona\" requires a value".to_string()]);
+    assert_eq!(
+        diags,
+        vec!["Extension flag \"--persona\" requires a value".to_string()]
+    );
     assert_eq!(
         host.registry().flag_value("persona").expect("read"),
         None,
@@ -83,7 +94,9 @@ fn a_valueless_string_flag_reports_requires_a_value_and_stores_nothing() {
 #[test]
 fn requires_a_value_errors_precede_the_aggregated_unknown_option_error() {
     let host = host();
-    host.registry().set_flag("persona", json!({"type": "string"})).expect("register");
+    host.registry()
+        .set_flag("persona", json!({"type": "string"}))
+        .expect("register");
 
     let diags = host
         .apply_extension_flag_values(&[
@@ -106,18 +119,34 @@ fn requires_a_value_errors_precede_the_aggregated_unknown_option_error() {
 #[test]
 fn registered_flags_still_resolve_with_no_diagnostics() {
     let host = host();
-    host.registry().set_flag("verbose-ext", json!({"type": "boolean"})).expect("register");
-    host.registry().set_flag("persona", json!({"type": "string"})).expect("register");
+    host.registry()
+        .set_flag("verbose-ext", json!({"type": "boolean"}))
+        .expect("register");
+    host.registry()
+        .set_flag("persona", json!({"type": "string"}))
+        .expect("register");
 
     let diags = host
         .apply_extension_flag_values(&[
             // Pi `:105-108`: a boolean flag stores `true` REGARDLESS of the captured token value.
-            ("verbose-ext".to_string(), ExtensionFlagOverride::Str("whatever".into())),
-            ("persona".to_string(), ExtensionFlagOverride::Str("critic".into())),
+            (
+                "verbose-ext".to_string(),
+                ExtensionFlagOverride::Str("whatever".into()),
+            ),
+            (
+                "persona".to_string(),
+                ExtensionFlagOverride::Str("critic".into()),
+            ),
         ])
         .expect("apply");
 
     assert!(diags.is_empty(), "clean apply must not diagnose: {diags:?}");
-    assert_eq!(host.registry().flag_value("verbose-ext").expect("read"), Some(json!(true)));
-    assert_eq!(host.registry().flag_value("persona").expect("read"), Some(json!("critic")));
+    assert_eq!(
+        host.registry().flag_value("verbose-ext").expect("read"),
+        Some(json!(true))
+    );
+    assert_eq!(
+        host.registry().flag_value("persona").expect("read"),
+        Some(json!("critic"))
+    );
 }

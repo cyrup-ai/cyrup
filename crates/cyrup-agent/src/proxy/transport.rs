@@ -1,12 +1,12 @@
 //! Transport (Pi `streamProxy`, proxy.ts:116-233).
 
 use super::builder::ProxyMessageBuilder;
-use super::options::{build_proxy_request_options, model_wire, ProxyStreamOptions};
+use super::options::{ProxyStreamOptions, build_proxy_request_options, model_wire};
 use super::proxy_error_message;
 use super::wire::ProxyAssistantMessageEvent;
 use cyrup_core::{CancelToken, EventStream, ModelRef};
 use cyrup_provider::stream::ErrorReason;
-use cyrup_provider::{open_sse, Context, SseRequest, StreamEvent};
+use cyrup_provider::{Context, SseRequest, StreamEvent, open_sse};
 use futures::StreamExt;
 
 /// Stream a model call through an auth-managing proxy server (1:1 port of Pi `streamProxy`,
@@ -73,7 +73,9 @@ async fn run_proxy(
     {
         Ok(c) => c,
         Err(e) => {
-            let _ = tx.send(error_terminal(&builder, &cancel, e.to_string())).await;
+            let _ = tx
+                .send(error_terminal(&builder, &cancel, e.to_string()))
+                .await;
             return;
         }
     };
@@ -100,7 +102,9 @@ async fn run_proxy(
         // arm — connect failure, TLS, connect-time cancel — is one pi surfaces through its outer
         // catch as the raw thrown message, which `proxy_error_message` passes through unchanged.
         Err(e) => {
-            let _ = tx.send(error_terminal(&builder, &cancel, proxy_error_message(&e))).await;
+            let _ = tx
+                .send(error_terminal(&builder, &cancel, proxy_error_message(&e)))
+                .await;
             return;
         }
     };
@@ -114,7 +118,9 @@ async fn run_proxy(
             // bare `Display`. Non-abort variants are unaffected: only `Http` and `Aborted` have
             // arms, and `Http` cannot arise once the response headers are already accepted.
             Err(e) => {
-                let _ = tx.send(error_terminal(&builder, &cancel, proxy_error_message(&e))).await;
+                let _ = tx
+                    .send(error_terminal(&builder, &cancel, proxy_error_message(&e)))
+                    .await;
                 return;
             }
         };
@@ -127,7 +133,9 @@ async fn run_proxy(
             Ok(ev) => ev,
             // A malformed frame: Pi's `JSON.parse` throws into the outer catch (proxy.ts:199,214).
             Err(e) => {
-                let _ = tx.send(error_terminal(&builder, &cancel, e.to_string())).await;
+                let _ = tx
+                    .send(error_terminal(&builder, &cancel, e.to_string()))
+                    .await;
                 return;
             }
         };
@@ -156,7 +164,11 @@ async fn run_proxy(
     // by this check.
     if cancel.is_cancelled() {
         let _ = tx
-            .send(error_terminal(&builder, &cancel, "Request aborted by user".to_string()))
+            .send(error_terminal(
+                &builder,
+                &cancel,
+                "Request aborted by user".to_string(),
+            ))
             .await;
     }
     // Clean end: the `done`/`error` event already carried the terminal (proxy.ts:213). Dropping `tx`
@@ -172,8 +184,11 @@ fn error_terminal(
     cancel: &CancelToken,
     message: String,
 ) -> StreamEvent {
-    let reason =
-        if cancel.is_cancelled() { ErrorReason::Aborted } else { ErrorReason::Error };
+    let reason = if cancel.is_cancelled() {
+        ErrorReason::Aborted
+    } else {
+        ErrorReason::Error
+    };
     let mut error = builder.partial().clone();
     error.stop_reason = reason.into();
     error.error_message = Some(message);
@@ -184,7 +199,12 @@ fn error_terminal(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::proxy::model;
@@ -206,7 +226,10 @@ mod tests {
             last = Some(ev);
         }
         match last {
-            Some(StreamEvent::Error { reason: ErrorReason::Error, error }) => {
+            Some(StreamEvent::Error {
+                reason: ErrorReason::Error,
+                error,
+            }) => {
                 assert!(error.error_message.is_some());
                 assert_eq!(error.provider.as_str(), "anthropic");
             }
@@ -231,7 +254,10 @@ mod tests {
         }
         // A cancelled token → Pi's `signal?.aborted ? "aborted" : "error"` → aborted (proxy.ts:216).
         match last {
-            Some(StreamEvent::Error { reason: ErrorReason::Aborted, error }) => {
+            Some(StreamEvent::Error {
+                reason: ErrorReason::Aborted,
+                error,
+            }) => {
                 assert_eq!(error.stop_reason, StopReason::Aborted);
             }
             other => panic!("expected aborted terminal event, got {other:?}"),

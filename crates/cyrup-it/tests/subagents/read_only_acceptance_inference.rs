@@ -43,18 +43,15 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-
 use cyrup_core::{CancelToken, ModelId};
 use cyrup_ext_subagents::discovery::types::{OutputMode, SystemPromptMode};
-use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::exec::acceptance::{AcceptanceContract, AcceptanceStatus};
 use cyrup_ext_subagents::exec::fallback::ModelOverride;
 use cyrup_ext_subagents::exec::output::OutputCap;
 use cyrup_ext_subagents::exec::{AgentConfig, RunOptions, SingleResult, run_sync};
 use cyrup_ext_subagents::fork_context::ForkContext;
+use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::spawn::depth::DepthEnvelope;
-
-
 
 fn fixture_binary_path() -> PathBuf {
     crate::support::bins::subagent_fixture()
@@ -85,8 +82,11 @@ fn message_end_line(text: &str) -> String {
 
 fn agent_config(name: &str) -> AgentConfig {
     AgentConfig {
+        acceptance_role: None, // SUBA-082: no declared role, the name decides
+        default_acceptance: None,
         name: name.to_string(),
         model: Some(ModelId::from("fixture-model")),
+        model_provider: None,
         fallback_models: Vec::new(),
         thinking: None,
         system_prompt_mode: SystemPromptMode::Replace,
@@ -94,6 +94,8 @@ fn agent_config(name: &str) -> AgentConfig {
         tools: None,
         extensions: None,
         subagent_only_extensions: Vec::new(),
+        exclude_tools: Vec::new(),
+        allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
         inherit_skills: true,
@@ -182,7 +184,10 @@ async fn run_fixture(dir: &Path, agent: &str, task: &str, output: &str) -> Singl
     let mut opts = run_options(dir);
     opts.spawn_command = Some(SpawnCommand {
         binary: fixture,
-        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
     });
 
     tokio::time::timeout(

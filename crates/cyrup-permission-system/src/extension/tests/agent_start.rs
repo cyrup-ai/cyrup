@@ -40,7 +40,13 @@ fn repeated_before_agent_start_applies_the_active_tool_set_once() {
         // A session_start invalidates the whole cache (pi `invalidateAgentStartCache`,
         // `index.ts:1823`), so the next turn re-applies.
         let _ = ext
-            .on_event(&HostEvent::SessionStart { reason: "startup".to_string(), previous_session_file: None }, &ctx)
+            .on_event(
+                &HostEvent::SessionStart {
+                    reason: "startup".to_string(),
+                    previous_session_file: None,
+                },
+                &ctx,
+            )
             .await;
         let _ = ext.on_event(&before_agent_start("SYSTEM"), &ctx).await;
         assert_eq!(
@@ -73,7 +79,13 @@ fn a_mid_session_policy_edit_re_applies_the_shaped_tool_set() {
         // The manager is rebuilt at session_start / resources_discover, matching pi — a policy
         // edit takes effect through the same reload path an operator triggers.
         let _ = ext
-            .on_event(&HostEvent::SessionStart { reason: "reload".to_string(), previous_session_file: None }, &ctx)
+            .on_event(
+                &HostEvent::SessionStart {
+                    reason: "reload".to_string(),
+                    previous_session_file: None,
+                },
+                &ctx,
+            )
             .await;
         let _ = ext.on_event(&before_agent_start("SYSTEM"), &ctx).await;
         assert_eq!(

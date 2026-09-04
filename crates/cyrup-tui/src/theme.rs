@@ -6,7 +6,7 @@
 //! the per-component `Style`s the widgets read. A `generation` counter is bumped on every
 //! hot-reload so render caches can be invalidated (R-10-026).
 
-use cyrup_resources::theme::{builtin_themes, ColorSpec, ResolvedTheme, ThemeData};
+use cyrup_resources::theme::{ColorSpec, ResolvedTheme, ThemeData, builtin_themes};
 use ratatui::style::{Color, Modifier, Style};
 
 /// The terminal color-depth the [`UiTheme`] projects its RGB roles into (Pi `ColorMode`, v0.84.1
@@ -76,7 +76,9 @@ impl ColorMode {
     /// colors are already depth-safe); the transform is the single **style-projection boundary** the
     /// whole TUI passes its role colors through (mirrors Pi `fgAnsi`/`bgAnsi`, `theme.ts:260-288`).
     pub fn project(self, color: Color) -> Color {
-        let Color::Rgb(r, g, b) = color else { return color };
+        let Color::Rgb(r, g, b) = color else {
+            return color;
+        };
         match self {
             ColorMode::TrueColor => color,
             ColorMode::Ansi256 => Color::Indexed(rgb_to_256(r, g, b)),
@@ -177,7 +179,11 @@ impl UiTheme {
     }
 
     /// Project a `ResolvedTheme` (color roles already resolved through `vars`) into a `UiTheme`.
-    pub fn from_resolved(name: impl Into<String>, resolved: &ResolvedTheme, generation: u64) -> Self {
+    pub fn from_resolved(
+        name: impl Into<String>,
+        resolved: &ResolvedTheme,
+        generation: u64,
+    ) -> Self {
         let role = |key: &str| resolved.roles.get(key).copied().and_then(color_of);
         let roles = resolved
             .roles
@@ -266,7 +272,11 @@ impl UiTheme {
     /// mirroring `Theme::resolve`, so the watcher's `Arc<ThemeData>` can be applied without first
     /// reconstructing a `Theme`. Bad/empty values inherit the terminal default (no panic).
     pub fn from_theme_data(data: &ThemeData, generation: u64) -> Self {
-        let role = |key: &str| data.colors.get(key).and_then(|raw| resolve_value(raw, &data.vars));
+        let role = |key: &str| {
+            data.colors
+                .get(key)
+                .and_then(|raw| resolve_value(raw, &data.vars))
+        };
         let roles = data
             .colors
             .keys()
@@ -372,7 +382,9 @@ impl UiTheme {
 
     /// Style for the user's own messages (bold accent label).
     pub fn user_style(&self) -> Style {
-        Style::default().fg(self.accent.unwrap_or(Color::Cyan)).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(self.accent.unwrap_or(Color::Cyan))
+            .add_modifier(Modifier::BOLD)
     }
 
     /// Style for assistant message text.
@@ -602,7 +614,11 @@ impl UiTheme {
     /// theme is *required* to define — had no effect on screen. `text` is the fallback only when the
     /// theme omits the role.
     pub fn user_message_bg_style(&self) -> Style {
-        let fg = self.roles.get("userMessageText").copied().or(self.foreground);
+        let fg = self
+            .roles
+            .get("userMessageText")
+            .copied()
+            .or(self.foreground);
         let base = match fg {
             Some(c) => Style::default().fg(c),
             None => Style::default(),
@@ -772,7 +788,11 @@ impl UiTheme {
 
     /// Pick the member of a `(dark, light)` hex-fallback pair that matches this palette.
     fn palette_hex<'a>(&self, dark_hex: &'a str, light_hex: &'a str) -> &'a str {
-        if self.is_light_palette() { light_hex } else { dark_hex }
+        if self.is_light_palette() {
+            light_hex
+        } else {
+            dark_hex
+        }
     }
 
     /// [`Self::role_color`] with a **theme-aware** hex fallback pair.
@@ -803,11 +823,17 @@ impl UiTheme {
 
     /// Markdown heading — `mdHeading`, bold (`markdown.ts:336-362`).
     pub fn md_heading_style(&self) -> Style {
-        self.role_style("mdHeading", "#f0c674", "#9a7326").add_modifier(Modifier::BOLD)
+        self.role_style("mdHeading", "#f0c674", "#9a7326")
+            .add_modifier(Modifier::BOLD)
     }
     /// Inline code span — `mdCode` (= accent), no backticks (`markdown.ts:512-516`).
     pub fn md_code_style(&self) -> Style {
-        Style::default().fg(self.roles.get("mdCode").copied().or(self.accent).unwrap_or(Color::Cyan))
+        Style::default().fg(self
+            .roles
+            .get("mdCode")
+            .copied()
+            .or(self.accent)
+            .unwrap_or(Color::Cyan))
     }
     /// Flat (unknown-language) fenced-code body — `mdCodeBlock` (`markdown.ts:378-398`).
     pub fn md_code_block_style(&self) -> Style {
@@ -827,11 +853,13 @@ impl UiTheme {
     /// NOTE this is a different thing from [`ThinkingTheme`], which is the per-reasoning-**level**
     /// editor-border palette (`thinkingOff`…`thinkingXhigh`).
     pub fn thinking_text_style(&self) -> Style {
-        self.role_style("thinkingText", "#808080", "#6c6c6c").add_modifier(Modifier::ITALIC)
+        self.role_style("thinkingText", "#808080", "#6c6c6c")
+            .add_modifier(Modifier::ITALIC)
     }
     /// Blockquote body — `mdQuote`, italic (`markdown.ts:414-461`).
     pub fn md_quote_style(&self) -> Style {
-        self.role_style("mdQuote", "#808080", "#6c6c6c").add_modifier(Modifier::ITALIC)
+        self.role_style("mdQuote", "#808080", "#6c6c6c")
+            .add_modifier(Modifier::ITALIC)
     }
     /// Blockquote `│ ` border — `mdQuoteBorder` (`markdown.ts:414-461`).
     pub fn md_quote_border_style(&self) -> Style {
@@ -850,13 +878,16 @@ impl UiTheme {
     pub fn md_list_bullet_style(&self) -> Style {
         match self.roles.get("mdListBullet").copied() {
             Some(c) => Style::default().fg(c),
-            None if self.is_light_palette() => self.role_style("mdListBullet", "#588458", "#588458"),
+            None if self.is_light_palette() => {
+                self.role_style("mdListBullet", "#588458", "#588458")
+            }
             None => Style::default().fg(self.accent.unwrap_or(Color::Cyan)),
         }
     }
     /// Link text — `mdLink`, underlined (`markdown.ts:537-556`).
     pub fn md_link_style(&self) -> Style {
-        self.role_style("mdLink", "#81a2be", "#547da7").add_modifier(Modifier::UNDERLINED)
+        self.role_style("mdLink", "#81a2be", "#547da7")
+            .add_modifier(Modifier::UNDERLINED)
     }
     /// Trailing ` (url)` after a markdown link — `mdLinkUrl`, **colour only**.
     ///
@@ -968,7 +999,8 @@ impl UiTheme {
             (Some(("syntaxString", "#CE9178", "#A31515")), None)
         } else if scope.starts_with("constant.numeric") {
             (Some(("syntaxNumber", "#B5CEA8", "#098658")), None)
-        } else if scope.starts_with("entity.name.function") || scope.starts_with("support.function") {
+        } else if scope.starts_with("entity.name.function") || scope.starts_with("support.function")
+        {
             (Some(("syntaxFunction", "#DCDCAA", "#795E26")), None)
         } else if scope.starts_with("entity.name.type")
             || scope.starts_with("support.type")
@@ -1195,7 +1227,11 @@ fn rgb_to_16(r: u8, g: u8, b: u8) -> u8 {
     let mut best = 0u8;
     let mut best_d = i64::MAX;
     for (i, &(cr, cg, cb)) in ANSI16_RGB.iter().enumerate() {
-        let (dr, dg, db) = ((r - cr as i32) as i64, (g - cg as i32) as i64, (b - cb as i32) as i64);
+        let (dr, dg, db) = (
+            (r - cr as i32) as i64,
+            (g - cg as i32) as i64,
+            (b - cb as i32) as i64,
+        );
         let d = dr * dr * 299 + dg * dg * 587 + db * db * 114;
         if d < best_d {
             best_d = d;
@@ -1576,7 +1612,11 @@ fn colorfgbg_background_index(colorfgbg: &str) -> Option<u8> {
 fn relative_luminance(r: u8, g: u8, b: u8) -> f64 {
     let lin = |c: u8| {
         let v = c as f64 / 255.0;
-        if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+        if v <= 0.03928 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
     };
     0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
 }
@@ -1856,7 +1896,10 @@ mod tests {
         assert_eq!(ColorMode::None.project(rgb), Color::Reset);
         // Named/indexed colors are already depth-safe and pass through unchanged.
         assert_eq!(ColorMode::Ansi256.project(Color::Cyan), Color::Cyan);
-        assert_eq!(ColorMode::Ansi256.project(Color::Indexed(42)), Color::Indexed(42));
+        assert_eq!(
+            ColorMode::Ansi256.project(Color::Indexed(42)),
+            Color::Indexed(42)
+        );
     }
 
     #[test]
@@ -1864,7 +1907,11 @@ mod tests {
         let dark = UiTheme::dark().with_color_mode(ColorMode::Ansi256);
         // Foreground is now an indexed color, never RGB.
         assert!(matches!(dark.foreground, Some(Color::Indexed(_))));
-        assert!(dark.roles.values().all(|c| !matches!(c, Color::Rgb(_, _, _))));
+        assert!(
+            dark.roles
+                .values()
+                .all(|c| !matches!(c, Color::Rgb(_, _, _)))
+        );
         // Re-applying the same mode changes nothing (idempotent for a projected theme).
         let again = dark.clone().with_color_mode(ColorMode::Ansi256);
         assert_eq!(again.foreground, dark.foreground);
@@ -1890,8 +1937,14 @@ mod tests {
             Some("solarized-dark".to_string())
         );
         // A bare name passes through; an unresolvable slash value ⇒ None (caller falls back).
-        assert_eq!(resolve_theme_setting(Some("nord"), TerminalTheme::Light), Some("nord".to_string()));
-        assert_eq!(resolve_theme_setting(Some("a/b/c"), TerminalTheme::Dark), None);
+        assert_eq!(
+            resolve_theme_setting(Some("nord"), TerminalTheme::Light),
+            Some("nord".to_string())
+        );
+        assert_eq!(
+            resolve_theme_setting(Some("a/b/c"), TerminalTheme::Dark),
+            None
+        );
         assert_eq!(resolve_theme_setting(None, TerminalTheme::Light), None);
     }
 

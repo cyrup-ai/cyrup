@@ -16,15 +16,20 @@
 // always true here. Re-spelled in cyrup-it it would name THIS crate's `wasm-host`, which
 // `--features it` does not enable, and every test below would SILENTLY not compile in.
 // See the `[[test]]` note in crates/cyrup-it/Cargo.toml.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use cyrup_core::{ExtensionId, Message, StopReason};
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 use cyrup_provider::Provider;
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
 use cyrup_session_svc::{SessionBuilder, SessionConfig};
 use tempfile::TempDir;
 
@@ -48,7 +53,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -61,7 +70,10 @@ fn base_config(fx: &Fixture) -> SessionConfig {
 
 fn faux_with_ok() -> Arc<FauxProvider> {
     let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("ok")],
+        StopReason::Stop,
+    )]);
     faux
 }
 
@@ -112,12 +124,22 @@ async fn wasm_guest_slash_command_executes_through_the_run_path() {
 
     // The guest's `init` registered `/greet` (cyrup-ext-sdk example/commands_session.rs).
     assert!(
-        session.services().ext_host.registry().command_names().unwrap().iter().any(|n| n == "greet"),
+        session
+            .services()
+            .ext_host
+            .registry()
+            .command_names()
+            .unwrap()
+            .iter()
+            .any(|n| n == "greet"),
         "the guest-registered `/greet` command is in the host command registry"
     );
     // Nothing has invoked the handler yet.
     assert!(
-        !ext.guest().notifications().iter().any(|n| n.contains("greet command ran")),
+        !ext.guest()
+            .notifications()
+            .iter()
+            .any(|n| n.contains("greet command ran")),
         "guest handler has not run before the prompt"
     );
 
@@ -129,7 +151,10 @@ async fn wasm_guest_slash_command_executes_through_the_run_path() {
     // The GUEST handler ran across the wasm boundary: its `ctx.ui().notify("greet command ran")`
     // was recorded host-side in the live extension's guest state.
     assert!(
-        ext.guest().notifications().iter().any(|n| n.contains("greet command ran")),
+        ext.guest()
+            .notifications()
+            .iter()
+            .any(|n| n.contains("greet command ran")),
         "the wasm guest command handler executed end-to-end: {:?}",
         ext.guest().notifications()
     );
@@ -137,7 +162,9 @@ async fn wasm_guest_slash_command_executes_through_the_run_path() {
     // The slash command short-circuited the prompt: no `/greet` user message was sent/persisted
     // (Pi `_tryExecuteExtensionCommand` returns `true` ⇒ the prompt is consumed).
     assert!(
-        user_texts(&session.messages().await).iter().all(|t| !t.contains("/greet")),
+        user_texts(&session.messages().await)
+            .iter()
+            .all(|t| !t.contains("/greet")),
         "the wasm slash command was consumed — no user message went to the model"
     );
 
@@ -146,7 +173,9 @@ async fn wasm_guest_slash_command_executes_through_the_run_path() {
     let _ = session.prompt("/unknown please run").await.unwrap();
     session.wait_for_idle().await;
     assert!(
-        user_texts(&session.messages().await).iter().any(|t| t.contains("/unknown please run")),
+        user_texts(&session.messages().await)
+            .iter()
+            .any(|t| t.contains("/unknown please run")),
         "an unmatched slash command falls through to normal prompt handling"
     );
 }
@@ -196,10 +225,15 @@ async fn wasm_guest_state_mutations_fire_against_the_live_session() {
     // Baseline: no `demoNote` entry yet, and the default (unnamed) session.
     let before = session.entries_json().await;
     assert!(
-        !before.iter().any(|e| e.get("customType").and_then(|v| v.as_str()) == Some("demoNote")),
+        !before
+            .iter()
+            .any(|e| e.get("customType").and_then(|v| v.as_str()) == Some("demoNote")),
         "no guest-appended entry before the command"
     );
-    assert_ne!(session.session_name().await.as_deref(), Some("renamed-by-guest"));
+    assert_ne!(
+        session.session_name().await.as_deref(),
+        Some("renamed-by-guest")
+    );
 
     // Observe the fan-out: a persistent subscription must receive `entry_appended`.
     let mut sub = session.subscribe();
@@ -215,14 +249,23 @@ async fn wasm_guest_state_mutations_fire_against_the_live_session() {
         .iter()
         .find(|e| e.get("customType").and_then(|v| v.as_str()) == Some("demoNote"))
         .expect("the guest-appended `demoNote` custom entry is in the tree");
-    assert_eq!(appended.get("type").and_then(|v| v.as_str()), Some("custom"));
     assert_eq!(
-        appended.get("data").and_then(|d| d.get("note")).and_then(|v| v.as_str()),
+        appended.get("type").and_then(|v| v.as_str()),
+        Some("custom")
+    );
+    assert_eq!(
+        appended
+            .get("data")
+            .and_then(|d| d.get("note"))
+            .and_then(|v| v.as_str()),
         Some("from guest"),
         "the guest's entry payload persisted verbatim"
     );
-    let appended_id =
-        appended.get("id").and_then(|v| v.as_str()).expect("appended entry has an id").to_string();
+    let appended_id = appended
+        .get("id")
+        .and_then(|v| v.as_str())
+        .expect("appended entry has an id")
+        .to_string();
 
     // (2) The session was renamed by the guest.
     assert_eq!(
@@ -244,7 +287,11 @@ async fn wasm_guest_state_mutations_fire_against_the_live_session() {
     let tree = session.tree_json().await;
     fn find_label(nodes: &[serde_json::Value], id: &str) -> Option<String> {
         for n in nodes {
-            if n.get("entry").and_then(|e| e.get("id")).and_then(|v| v.as_str()) == Some(id) {
+            if n.get("entry")
+                .and_then(|e| e.get("id"))
+                .and_then(|v| v.as_str())
+                == Some(id)
+            {
                 return n.get("label").and_then(|v| v.as_str()).map(str::to_string);
             }
             if let Some(children) = n.get("children").and_then(|c| c.as_array())
@@ -279,7 +326,11 @@ async fn wasm_guest_state_mutations_fire_against_the_live_session() {
 #[test]
 fn fixture_component_exists() {
     let p = bins::component();
-    assert!(Path::new(&p).exists(), "fixture component missing at {}", p.display());
+    assert!(
+        Path::new(&p).exists(),
+        "fixture component missing at {}",
+        p.display()
+    );
 }
 
 /// SEAM-005 across the WIT boundary: the `events.on-agent-settled` EXPORT this change added to
@@ -313,7 +364,10 @@ async fn wasm_guest_receives_agent_settled_across_the_wit_boundary() {
         .expect("load + init the live wasm extension");
 
     assert!(
-        !ext.guest().notifications().iter().any(|n| n.contains("agent settled")),
+        !ext.guest()
+            .notifications()
+            .iter()
+            .any(|n| n.contains("agent settled")),
         "nothing settled before the run"
     );
 
@@ -322,7 +376,10 @@ async fn wasm_guest_receives_agent_settled_across_the_wit_boundary() {
 
     let notes = ext.guest().notifications();
     assert_eq!(
-        notes.iter().filter(|n| n.contains("demo: agent settled")).count(),
+        notes
+            .iter()
+            .filter(|n| n.contains("demo: agent settled"))
+            .count(),
         1,
         "the guest's on-agent-settled export was invoked exactly once for the run: {notes:?}"
     );

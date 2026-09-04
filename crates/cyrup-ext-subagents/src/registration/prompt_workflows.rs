@@ -104,7 +104,10 @@ pub struct PromptWorkflow {
 /// package tier which [`prompt_files`] takes from the bundled manifest instead):
 /// `<agentDir>/prompts`, then `<cwd>/.cyrup/prompts`.
 fn user_and_project_prompt_dirs(cwd: &Path) -> Vec<PathBuf> {
-    vec![crate::paths::agent_dir().join("prompts"), cwd.join(".cyrup").join("prompts")]
+    vec![
+        crate::paths::agent_dir().join("prompts"),
+        cwd.join(".cyrup").join("prompts"),
+    ]
 }
 
 /// Every candidate prompt file, package tier first (`readPromptFiles`, `:49-63`). Package files
@@ -185,7 +188,9 @@ fn load_prompt_workflow(file_path: &Path) -> Option<PromptWorkflow> {
     // `:109-110` — `inheritContext`/`fork` select FORK, `fresh` selects FRESH, and upstream spreads
     // the fresh clause SECOND, so an explicit `fresh: true` wins over `fork: true` on one file.
     let mut context = None;
-    if boolean_field(field("inheritContext")) == Some(true) || boolean_field(field("fork")) == Some(true) {
+    if boolean_field(field("inheritContext")) == Some(true)
+        || boolean_field(field("fork")) == Some(true)
+    {
         context = Some(ContextMode::Fork);
     }
     if boolean_field(field("fresh")) == Some(true) {
@@ -235,7 +240,10 @@ pub fn discover_prompt_workflows(cwd: &Path) -> Vec<PromptWorkflow> {
 
 /// pi `findWorkflow` (`:251-253`): exact-name lookup.
 #[must_use]
-pub fn find_workflow<'a>(workflows: &'a [PromptWorkflow], name: &str) -> Option<&'a PromptWorkflow> {
+pub fn find_workflow<'a>(
+    workflows: &'a [PromptWorkflow],
+    name: &str,
+) -> Option<&'a PromptWorkflow> {
     workflows.iter().find(|w| w.name == name)
 }
 
@@ -247,7 +255,12 @@ pub fn format_workflow_list(workflows: &[PromptWorkflow]) -> String {
     }
     let mut out = vec!["Prompt workflows:".to_string()];
     for w in workflows {
-        out.push(format!("- {}: {} ({})", w.name, w.description, w.file_path.display()));
+        out.push(format!(
+            "- {}: {} ({})",
+            w.name,
+            w.description,
+            w.file_path.display()
+        ));
     }
     out.join("\n")
 }
@@ -376,7 +389,9 @@ fn replace_bare_positionals(input: &str, args: &[String]) -> String {
         }
         let index = digits.parse::<usize>().unwrap_or(0);
         out.push_str(positional(args, index));
-        rest = tail.get(digits.len().saturating_add(1)..).unwrap_or_default();
+        rest = tail
+            .get(digits.len().saturating_add(1)..)
+            .unwrap_or_default();
     }
     out.push_str(rest);
     out
@@ -497,7 +512,10 @@ pub fn workflow_params(
     runtime: &RuntimeOptions,
 ) -> WorkflowRun {
     WorkflowRun {
-        agent: runtime.agent_override.clone().unwrap_or_else(|| workflow.agent.clone()),
+        agent: runtime
+            .agent_override
+            .clone()
+            .unwrap_or_else(|| workflow.agent.clone()),
         task: substitute_args(&workflow.body, args).trim().to_string(),
         context: if runtime.fork {
             Some(ContextMode::Fork)
@@ -571,7 +589,12 @@ pub fn build_chain_steps(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
 
     use super::*;
 
@@ -595,7 +618,10 @@ mod tests {
             "parallel-review",
             "review-loop",
         ] {
-            assert!(names.contains(&expected), "expected {expected:?} in {names:?}");
+            assert!(
+                names.contains(&expected),
+                "expected {expected:?} in {names:?}"
+            );
         }
         // Sorted by name (`:125`).
         let mut sorted = names.clone();
@@ -626,7 +652,10 @@ mod tests {
         assert_eq!(found.description, "project override");
         assert_eq!(found.agent, "reviewer");
         assert_eq!(
-            workflows.iter().filter(|w| w.name == "parallel-review").count(),
+            workflows
+                .iter()
+                .filter(|w| w.name == "parallel-review")
+                .count(),
             1,
             "shadowing replaces, never duplicates"
         );
@@ -675,7 +704,11 @@ mod tests {
             "fallback",
             "an EMPTY supplied argument still takes the fallback (JS `||`)"
         );
-        assert_eq!(substitute_args("cost: $5.00", &args), "cost: .00", "`$5` is a positional");
+        assert_eq!(
+            substitute_args("cost: $5.00", &args),
+            "cost: .00",
+            "`$5` is a positional"
+        );
         assert_eq!(substitute_args("plain $ text", &args), "plain $ text");
     }
 
@@ -690,16 +723,25 @@ mod tests {
         assert!(!opts.fresh);
 
         assert_eq!(
-            parse_runtime_options(&words("--subagent=worker")).agent_override.as_deref(),
+            parse_runtime_options(&words("--subagent=worker"))
+                .agent_override
+                .as_deref(),
             Some("worker")
         );
         assert_eq!(
-            parse_runtime_options(&words("--subagent:worker")).agent_override.as_deref(),
+            parse_runtime_options(&words("--subagent:worker"))
+                .agent_override
+                .as_deref(),
             Some("worker")
         );
-        assert!(parse_runtime_options(&words("--async")).bg, "--async is an alias of --bg");
         assert!(
-            parse_runtime_options(&words("x --subagent")).agent_override.is_none(),
+            parse_runtime_options(&words("--async")).bg,
+            "--async is an alias of --bg"
+        );
+        assert!(
+            parse_runtime_options(&words("x --subagent"))
+                .agent_override
+                .is_none(),
             "a trailing bare --subagent leaves the recipe's own agent in place"
         );
     }
@@ -739,10 +781,20 @@ mod tests {
         let plain = workflow_params(&w, &args, &RuntimeOptions::default());
         assert_eq!(plain.task, "Do it");
         assert_eq!(plain.agent, "planner");
-        assert_eq!(plain.context, Some(ContextMode::Fork), "the recipe's own context stands");
+        assert_eq!(
+            plain.context,
+            Some(ContextMode::Fork),
+            "the recipe's own context stands"
+        );
 
-        let fresh = RuntimeOptions { fresh: true, ..RuntimeOptions::default() };
-        assert_eq!(workflow_params(&w, &args, &fresh).context, Some(ContextMode::Fresh));
+        let fresh = RuntimeOptions {
+            fresh: true,
+            ..RuntimeOptions::default()
+        };
+        assert_eq!(
+            workflow_params(&w, &args, &fresh).context,
+            Some(ContextMode::Fresh)
+        );
 
         let over = RuntimeOptions {
             agent_override: Some("other".to_string()),
@@ -760,12 +812,21 @@ mod tests {
     #[test]
     fn a_chain_step_carries_no_per_step_context_or_async() {
         let w = workflow("w");
-        let runtime = RuntimeOptions { fork: true, bg: true, worktree: true, ..RuntimeOptions::default() };
+        let runtime = RuntimeOptions {
+            fork: true,
+            bg: true,
+            worktree: true,
+            ..RuntimeOptions::default()
+        };
         let step = workflow_chain_step(&w, &[], &runtime);
         assert_eq!(step.context, None);
         assert!(!step.worktree);
         assert!(!step.background);
-        assert_eq!(step.model.as_deref(), Some("m"), "model/skill/cwd DO survive");
+        assert_eq!(
+            step.model.as_deref(),
+            Some("m"),
+            "model/skill/cwd DO survive"
+        );
         assert_eq!(step.cwd.as_deref(), Some("sub"));
     }
 
@@ -773,8 +834,14 @@ mod tests {
     fn an_unknown_chain_step_reports_pis_exact_message() {
         let workflows = vec![workflow("a")];
         let names = vec!["a".to_string(), "missing".to_string()];
-        let err = build_chain_steps(&workflows, &names, &[], &RuntimeOptions::default(), Some("outer"))
-            .expect_err("an unknown step must fail the whole expansion");
+        let err = build_chain_steps(
+            &workflows,
+            &names,
+            &[],
+            &RuntimeOptions::default(),
+            Some("outer"),
+        )
+        .expect_err("an unknown step must fail the whole expansion");
         assert_eq!(err, "Unknown prompt workflow in chain 'outer': missing");
         let err = build_chain_steps(&workflows, &names, &[], &RuntimeOptions::default(), None)
             .expect_err("the /chain-prompts wording differs");
@@ -788,7 +855,10 @@ mod tests {
             "No prompt workflows found in package, user, or project prompts."
         );
         let rendered = format_workflow_list(&[workflow("w")]);
-        assert!(rendered.starts_with("Prompt workflows:\n- w: d (/tmp/x.md)"), "{rendered}");
+        assert!(
+            rendered.starts_with("Prompt workflows:\n- w: d (/tmp/x.md)"),
+            "{rendered}"
+        );
     }
 
     #[test]

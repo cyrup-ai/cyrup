@@ -133,7 +133,6 @@ mod tests {
     use super::*;
     use crate::exec::acceptance::lattice::contract::AcceptanceContract;
 
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn self_report_floor_distinguishes_claimed_from_attested() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -167,7 +166,6 @@ mod tests {
         let _ = dir; // no subprocess needed in this particular test; tempdir kept for symmetry.
     }
 
-
     // --------------------------------------------------------------------------------------
     // G82: `parseAcceptanceReportSources` (`acceptance.ts:753-772`), enum-lattice side
     // --------------------------------------------------------------------------------------
@@ -180,10 +178,8 @@ mod tests {
     /// answer no matter which way they are written.
     #[test]
     fn the_authoritative_file_is_searched_first_and_a_primary_defect_is_never_papered_over() {
-        let file_report =
-            "artifact\n```acceptance-report\n{\"criteriaSatisfied\": [], \"diffSummary\": \"from-file\"}\n```";
-        let text_report =
-            "receipt\n```acceptance-report\n{\"criteriaSatisfied\": [], \"diffSummary\": \"from-text\"}\n```";
+        let file_report = "artifact\n```acceptance-report\n{\"criteriaSatisfied\": [], \"diffSummary\": \"from-file\"}\n```";
+        let text_report = "receipt\n```acceptance-report\n{\"criteriaSatisfied\": [], \"diffSummary\": \"from-text\"}\n```";
         let path = Path::new("out.md");
 
         // Not authoritative: the assistant output is primary. It has no report, so the file — the
@@ -229,7 +225,8 @@ mod tests {
 
         // A MALFORMED report in the primary source is a defect to surface, not a miss to paper
         // over with the secondary — only a genuinely absent report falls through.
-        let malformed = "receipt\n```acceptance-report\n{\"criteriaSatisfied\": [{\"id\": \"c1\"}]}\n```";
+        let malformed =
+            "receipt\n```acceptance-report\n{\"criteriaSatisfied\": [{\"id\": \"c1\"}]}\n```";
         assert_eq!(
             select_acceptance_report_source(
                 Some(malformed),
@@ -243,7 +240,6 @@ mod tests {
             "a defective primary must not be replaced by the secondary"
         );
     }
-
 
     /// The full truth table for [`select_acceptance_report_source`], because the case above leaves
     /// three of its inputs unexercised and each hides an independent rule:
@@ -260,10 +256,8 @@ mod tests {
     /// reinterpret every row below it.
     #[test]
     fn the_report_source_truth_table_is_exhaustive_over_authoritative_and_parse_outcome() {
-        const VALID_TEXT: &str =
-            "receipt\n```acceptance-report\n{\"criteriaSatisfied\": [], \"diffSummary\": \"from-text\"}\n```";
-        const VALID_FILE: &str =
-            "artifact\n```acceptance-report\n{\"criteriaSatisfied\": [], \"diffSummary\": \"from-file\"}\n```";
+        const VALID_TEXT: &str = "receipt\n```acceptance-report\n{\"criteriaSatisfied\": [], \"diffSummary\": \"from-text\"}\n```";
+        const VALID_FILE: &str = "artifact\n```acceptance-report\n{\"criteriaSatisfied\": [], \"diffSummary\": \"from-file\"}\n```";
         const DEFECTIVE: &str =
             "artifact\n```acceptance-report\n{\"criteriaSatisfied\": [{\"id\": \"c1\"}]}\n```";
         const ABSENT_TEXT: &str = "no report in the assistant output";
@@ -272,7 +266,9 @@ mod tests {
         // --- the three parse classifications the selection rule discriminates on ---
         for valid in [VALID_TEXT, VALID_FILE] {
             assert!(
-                crate::exec::acceptance::model::parse_acceptance_report(valid).report.is_some(),
+                crate::exec::acceptance::model::parse_acceptance_report(valid)
+                    .report
+                    .is_some(),
                 "fixture must parse to a report: {valid:?}"
             );
         }
@@ -285,7 +281,9 @@ mod tests {
         );
         for absent in [ABSENT_TEXT, ABSENT_FILE] {
             assert_eq!(
-                crate::exec::acceptance::model::parse_acceptance_report(absent).error.as_deref(),
+                crate::exec::acceptance::model::parse_acceptance_report(absent)
+                    .error
+                    .as_deref(),
                 Some(crate::exec::acceptance::model::ACCEPTANCE_REPORT_NOT_FOUND),
                 "fixture must be a genuine MISS: {absent:?}"
             );
@@ -361,5 +359,4 @@ mod tests {
             Some(ABSENT_FILE)
         );
     }
-
 }

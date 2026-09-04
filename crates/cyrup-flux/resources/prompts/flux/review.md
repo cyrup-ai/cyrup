@@ -106,6 +106,8 @@ Group files by: key modules, logical areas, high-risk changes (security, perform
 
 ## STEP 6: Spawn code review sub-agents
 
+**Availability pre-condition — check BEFORE launching.** The `subagent` tool is provided by cyrup's opt-in subagents extension and is NOT in the tool list on a default install. If the `subagent` tool is NOT in your tool list: do NOT call it and do NOT substitute another tool; tell the user ONCE, in one sentence, that the `subagent` tool is not available (it is enabled with `CYRUP_SUBAGENTS=1` or a `subagents/config.json` at user or project scope) so the review will run in-line, then perform each group's review yourself, one group at a time, following the sub-agent prompt template below verbatim for each group — and in STEP 7 move the review files yourself instead of launching sub-agents. Continue with the launch below ONLY when `subagent` IS in your tool list.
+
 Launch with the `subagent` tool — foreground calls only; NEVER background.
 
 **Agent count:**
@@ -187,7 +189,7 @@ mkdir -p "$FLUX_BASE/review/critical" "$FLUX_BASE/review/high" "$FLUX_BASE/revie
 echo "FLUX_BASE=$FLUX_BASE"
 ```
 
-Launch sub-agents (groups of 10) to move `$FLUX_BASE/review/*.md` to the appropriate severity subdirectory.
+Launch sub-agents (groups of 10) to move `$FLUX_BASE/review/*.md` to the appropriate severity subdirectory — or, when the `subagent` tool is not in your tool list (STEP 6's pre-condition), move them yourself.
 
 | Severity | Criteria                                                            |
 | -------- | ------------------------------------------------------------------- |

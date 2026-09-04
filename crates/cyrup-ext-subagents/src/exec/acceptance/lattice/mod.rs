@@ -33,7 +33,9 @@ use self::contract::AcceptanceContract;
 /// `Checked`") MUST use [`AcceptanceStatus::satisfies`] rather than raw `>=` comparison against
 /// `Rejected`, since `Rejected` is a sink, not "the highest achieved level" (see that method's own
 /// doc comment for the precise rule).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum AcceptanceStatus {
     /// No acceptance contract applies to this task at all — the default when no explicit
@@ -101,14 +103,24 @@ impl AcceptanceStatus {
     #[must_use]
     pub fn evidence_status(self) -> crate::exec::acceptance::model::AcceptanceEvidenceStatus {
         match self {
-            AcceptanceStatus::NotRequired => crate::exec::acceptance::model::AcceptanceEvidenceStatus::NotRequired,
-            AcceptanceStatus::Claimed => crate::exec::acceptance::model::AcceptanceEvidenceStatus::Claimed,
-            AcceptanceStatus::Attested => crate::exec::acceptance::model::AcceptanceEvidenceStatus::Attested,
-            AcceptanceStatus::Checked => crate::exec::acceptance::model::AcceptanceEvidenceStatus::Checked,
+            AcceptanceStatus::NotRequired => {
+                crate::exec::acceptance::model::AcceptanceEvidenceStatus::NotRequired
+            }
+            AcceptanceStatus::Claimed => {
+                crate::exec::acceptance::model::AcceptanceEvidenceStatus::Claimed
+            }
+            AcceptanceStatus::Attested => {
+                crate::exec::acceptance::model::AcceptanceEvidenceStatus::Attested
+            }
+            AcceptanceStatus::Checked => {
+                crate::exec::acceptance::model::AcceptanceEvidenceStatus::Checked
+            }
             AcceptanceStatus::Verified | AcceptanceStatus::Reviewed => {
                 crate::exec::acceptance::model::AcceptanceEvidenceStatus::Verified
             }
-            AcceptanceStatus::Rejected => crate::exec::acceptance::model::AcceptanceEvidenceStatus::Rejected,
+            AcceptanceStatus::Rejected => {
+                crate::exec::acceptance::model::AcceptanceEvidenceStatus::Rejected
+            }
         }
     }
 }
@@ -202,7 +214,9 @@ pub fn build_timed_out_acceptance_ledger(contract: &AcceptanceContract) -> Accep
             // `buildSkippedAcceptanceLedger` writes ONE `status` to both fields
             // (`acceptance.ts:1342-1345` @v0.43.0).
             evidence_status: crate::exec::acceptance::model::AcceptanceEvidenceStatus::Rejected,
-            detail: Some("Acceptance was not evaluated because the subagent timed out.".to_string()),
+            detail: Some(
+                "Acceptance was not evaluated because the subagent timed out.".to_string(),
+            ),
             verify_results: Vec::new(),
         }
     }
@@ -234,7 +248,6 @@ mod tests {
 
     use super::*;
 
-
     // ---------------------------------------------------------------------------------------
     // AcceptanceStatus: lattice ordering and satisfies()
     // ---------------------------------------------------------------------------------------
@@ -248,7 +261,6 @@ mod tests {
         assert!(AcceptanceStatus::Verified < AcceptanceStatus::Reviewed);
     }
 
-
     #[test]
     fn satisfies_is_reflexive_and_monotone() {
         assert!(AcceptanceStatus::Verified.satisfies(AcceptanceStatus::Verified));
@@ -256,7 +268,6 @@ mod tests {
         assert!(!AcceptanceStatus::Checked.satisfies(AcceptanceStatus::Verified));
         assert!(AcceptanceStatus::Claimed.satisfies(AcceptanceStatus::NotRequired));
     }
-
 
     #[test]
     fn rejected_never_satisfies_anything_despite_deriving_greatest_ord() {
@@ -266,7 +277,6 @@ mod tests {
         assert!(!AcceptanceStatus::Rejected.satisfies(AcceptanceStatus::NotRequired));
         assert!(!AcceptanceStatus::Rejected.satisfies(AcceptanceStatus::Verified));
     }
-
 
     #[test]
     fn wire_strings_round_trip_through_serde_kebab_case() {
@@ -283,5 +293,4 @@ mod tests {
             assert_eq!(json, format!("\"{}\"", status.as_wire_str()));
         }
     }
-
 }

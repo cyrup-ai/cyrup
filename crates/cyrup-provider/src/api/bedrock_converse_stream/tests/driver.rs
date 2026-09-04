@@ -36,7 +36,10 @@ async fn spawn_mock_sequence(
             };
             let n = counter.fetch_add(1, Ordering::SeqCst);
             let body = responses.get(n).copied().unwrap_or_else(|| {
-                responses.last().copied().unwrap_or(b"HTTP/1.1 500 x\r\n\r\n")
+                responses
+                    .last()
+                    .copied()
+                    .unwrap_or(b"HTTP/1.1 500 x\r\n\r\n")
             });
             let mut buf = [0u8; 2048];
             let _ = sock.read(&mut buf).await;
@@ -203,7 +206,12 @@ fn diagnostic_values_are_normalized_not_guessed() {
         Some("req-1")
     );
     assert_eq!(normalize_diagnostic_value("   "), None);
-    assert_eq!(normalize_diagnostic_value(&"x".repeat(200)).as_deref().map(str::len), Some(200));
+    assert_eq!(
+        normalize_diagnostic_value(&"x".repeat(200))
+            .as_deref()
+            .map(str::len),
+        Some(200)
+    );
     // 201 chars is DROPPED, not truncated: a truncated request id is not a request id.
     assert_eq!(normalize_diagnostic_value(&"x".repeat(201)), None);
 
@@ -216,7 +224,11 @@ fn diagnostic_values_are_normalized_not_guessed() {
     // case is what distinguishes the two measures — an ASCII string can never separate them.
     let astral_101 = "\u{1F600}".repeat(101);
     assert_eq!(astral_101.chars().count(), 101, "under the cap in SCALARS");
-    assert_eq!(astral_101.encode_utf16().count(), 202, "over the cap in UTF-16 UNITS");
+    assert_eq!(
+        astral_101.encode_utf16().count(),
+        202,
+        "over the cap in UTF-16 UNITS"
+    );
     assert_eq!(
         normalize_diagnostic_value(&astral_101),
         None,
@@ -227,7 +239,10 @@ fn diagnostic_values_are_normalized_not_guessed() {
     // This pins the boundary from below — a fix that simply dropped everything non-ASCII
     // would fail here.
     let astral_100 = "\u{1F600}".repeat(100);
-    assert_eq!(astral_100.encode_utf16().count(), MAX_BEDROCK_DIAGNOSTIC_VALUE_CHARS);
+    assert_eq!(
+        astral_100.encode_utf16().count(),
+        MAX_BEDROCK_DIAGNOSTIC_VALUE_CHARS
+    );
     assert_eq!(
         normalize_diagnostic_value(&astral_100).as_deref(),
         Some(astral_100.as_str()),

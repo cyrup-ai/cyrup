@@ -111,7 +111,9 @@ const ASSIGNING_FLAGS: [&[&str]; 3] = [&["--models"], &["--tools", "-t"], &["--e
 /// `--tools read --tools=bash` would keep both.
 fn assigning_family(arg: &str) -> Option<usize> {
     let name = arg.split('=').next().unwrap_or(arg);
-    ASSIGNING_FLAGS.iter().position(|names| names.contains(&name))
+    ASSIGNING_FLAGS
+        .iter()
+        .position(|names| names.contains(&name))
 }
 
 /// Apply Pi's lenient arg handling over `argv` (program name already stripped, short-aliases already
@@ -376,7 +378,11 @@ pub async fn report_runtime(runtime: &cyrup_session_svc::AgentSessionRuntime) ->
         }
     }
     // Pi `main.ts:844-846`: matched on the message text, over ALL diagnostics, not just the errors.
-    if fatal && diagnostics.iter().any(|d| d.message.contains(EXTENSION_LOAD_FAILURE_MARKER)) {
+    if fatal
+        && diagnostics
+            .iter()
+            .any(|d| d.message.contains(EXTENSION_LOAD_FAILURE_MARKER))
+    {
         eprintln!("{EXTENSION_LOAD_FAILURE_HINT}");
     }
     fatal
@@ -445,7 +451,11 @@ mod tests {
         assert!(diags.is_empty(), "{diags:?}");
         // …and the advertised value list names it.
         let (_, diags) = apply_arg_leniency(&v(&["--thinking", "ultra"]));
-        assert!(diags[0].message.ends_with("xhigh, max"), "{}", diags[0].message);
+        assert!(
+            diags[0].message.ends_with("xhigh, max"),
+            "{}",
+            diags[0].message
+        );
     }
 
     #[test]
@@ -469,7 +479,10 @@ mod tests {
     #[test]
     fn bare_single_dash_is_an_unknown_option_not_a_prompt() {
         let (clean, diags) = apply_arg_leniency(&v(&["-"]));
-        assert!(clean.is_empty(), "a bare `-` must not survive as a message: {clean:?}");
+        assert!(
+            clean.is_empty(),
+            "a bare `-` must not survive as a message: {clean:?}"
+        );
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].level, DiagnosticLevel::Error);
         assert_eq!(diags[0].message, "Unknown option: -");
@@ -522,8 +535,7 @@ mod tests {
         assert_eq!(clean, v(&["--tools", "bash"]));
         let (clean, _) = apply_arg_leniency(&v(&["--models", "a", "--models", "b"]));
         assert_eq!(clean, v(&["--models", "b"]));
-        let (clean, _) =
-            apply_arg_leniency(&v(&["--exclude-tools", "x", "--exclude-tools", "y"]));
+        let (clean, _) = apply_arg_leniency(&v(&["--exclude-tools", "x", "--exclude-tools", "y"]));
         assert_eq!(clean, v(&["--exclude-tools", "y"]));
 
         // `-t` is pi's own alias for `--tools` in the SAME arm (`arg === "--tools" || arg === "-t"`),
@@ -539,7 +551,15 @@ mod tests {
 
         // Three families are independent, and the surrounding argv is preserved in order.
         let (clean, _) = apply_arg_leniency(&v(&[
-            "--tools", "read", "--models", "a", "hello", "--tools", "bash", "--models", "b",
+            "--tools",
+            "read",
+            "--models",
+            "a",
+            "hello",
+            "--tools",
+            "bash",
+            "--models",
+            "b",
             "--verbose",
         ]));
         assert_eq!(
@@ -559,7 +579,10 @@ mod tests {
             let (clean, diags) = apply_arg_leniency(&v(&[flag, "---weird"]));
             assert_eq!(
                 clean,
-                vec![flag.to_string(), format!("{ESCAPED_MESSAGE_PREFIX}---weird")],
+                vec![
+                    flag.to_string(),
+                    format!("{ESCAPED_MESSAGE_PREFIX}---weird")
+                ],
                 "the `---` token must be marked as a positional, not left to the flag capture"
             );
             assert!(diags.is_empty(), "{diags:?}");

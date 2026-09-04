@@ -13,7 +13,12 @@
 //! against the [`HostConfig`] the host was built with — the same struct `cyrup-session-svc`'s
 //! builder fills from the app mode (`builder.rs:739-740`). Two configurations are checked in
 //! opposite directions, so neither can be satisfied by a hard-coded default.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use cyrup_core::{CancelToken, ExtensionId};
 use cyrup_ext::{CannedResponses, ExtMode, ExtensionHost, HostConfig, RecordingServices};
@@ -56,7 +61,10 @@ async fn a_guest_reads_the_tui_host_mode_and_ui_availability() {
         cwd: cwd.clone(),
     })
     .await;
-    assert_eq!(out, "mode=tui has_ui=true", "the guest read the host's configured mode/hasUI");
+    assert_eq!(
+        out, "mode=tui has_ui=true",
+        "the guest read the host's configured mode/hasUI"
+    );
 }
 
 /// A headless print-mode host — Pi's `mode: "print"`, `hasUI: false`. Both values differ from the
@@ -81,9 +89,10 @@ async fn a_guest_reads_a_headless_print_host_mode_and_ui_availability() {
 /// reachable, not just the two the other tests pin.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_ext_mode_variant_crosses_the_boundary() {
-    for (mode, expected) in
-        [(ExtMode::Rpc, "mode=rpc has_ui=true"), (ExtMode::Json, "mode=json has_ui=false")]
-    {
+    for (mode, expected) in [
+        (ExtMode::Rpc, "mode=rpc has_ui=true"),
+        (ExtMode::Json, "mode=json has_ui=false"),
+    ] {
         let has_ui = mode == ExtMode::Rpc; // Pi: dialogs exist in TUI and RPC modes.
         let out = hostmode_as_seen_by_the_guest(HostConfig {
             mode,

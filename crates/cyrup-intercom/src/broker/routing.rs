@@ -53,12 +53,18 @@ mod tests {
 
     #[test]
     fn exact_id_wins() {
-        assert_eq!(find_session_ids(&entries(), "abc123"), vec!["abc123".to_string()]);
+        assert_eq!(
+            find_session_ids(&entries(), "abc123"),
+            vec!["abc123".to_string()]
+        );
     }
 
     #[test]
     fn case_insensitive_name_match() {
-        assert_eq!(find_session_ids(&entries(), "alice"), vec!["abc123".to_string()]);
+        assert_eq!(
+            find_session_ids(&entries(), "alice"),
+            vec!["abc123".to_string()]
+        );
     }
 
     #[test]
@@ -70,7 +76,10 @@ mod tests {
 
     #[test]
     fn unique_prefix_resolves() {
-        assert_eq!(find_session_ids(&entries(), "zzz"), vec!["zzz999".to_string()]);
+        assert_eq!(
+            find_session_ids(&entries(), "zzz"),
+            vec!["zzz999".to_string()]
+        );
     }
 
     #[test]

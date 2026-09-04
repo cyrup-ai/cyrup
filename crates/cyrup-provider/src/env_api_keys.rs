@@ -52,6 +52,11 @@ pub fn api_key_env_vars(provider: &str) -> Option<&'static [&'static str]> {
         // order here so the two maps stay diffable.
         "qwen-token-plan" => Some(&["QWEN_TOKEN_PLAN_API_KEY"]),
         "qwen-token-plan-cn" => Some(&["QWEN_TOKEN_PLAN_CN_API_KEY"]),
+        // VERSION LAG (v0.83.0 → v0.84.4): `"qwen-token-plan-individual": "QWEN_TOKEN_PLAN_API_KEY"`
+        // (env-api-keys.ts:83 @v0.84.4) — deliberately the SAME variable as `qwen-token-plan`
+        // (`qwen-token-plan-models.test.ts:121-125`: "reuses the international Token Plan
+        // environment variable"). PROV-014.
+        "qwen-token-plan-individual" => Some(&["QWEN_TOKEN_PLAN_API_KEY"]),
         "openai" => Some(&["OPENAI_API_KEY"]),
         "azure-openai-responses" => Some(&["AZURE_OPENAI_API_KEY"]),
         "nvidia" => Some(&["NVIDIA_API_KEY"]),
@@ -248,6 +253,10 @@ mod tests {
             "xiaomi-token-plan-cn",
             "xiaomi-token-plan-ams",
             "xiaomi-token-plan-sgp",
+            "qwen-token-plan",
+            "qwen-token-plan-cn",
+            "qwen-token-plan-individual",
+            "radius",
         ] {
             assert!(
                 api_key_env_vars(p).is_some(),
@@ -255,6 +264,26 @@ mod tests {
             );
         }
         assert!(api_key_env_vars("does-not-exist").is_none());
+    }
+
+    /// PROV-014 — the three Qwen Token Plan rows and radius, key for key against
+    /// `env-api-keys.ts:81-83`,`:93` @v0.84.4. The Individual plan shares the international
+    /// variable (`qwen-token-plan-models.test.ts:121-125` @v0.84.4).
+    #[test]
+    fn qwen_token_plan_and_radius_rows_match_upstream() {
+        assert_eq!(
+            api_key_env_vars("qwen-token-plan"),
+            Some(&["QWEN_TOKEN_PLAN_API_KEY"][..])
+        );
+        assert_eq!(
+            api_key_env_vars("qwen-token-plan-cn"),
+            Some(&["QWEN_TOKEN_PLAN_CN_API_KEY"][..])
+        );
+        assert_eq!(
+            api_key_env_vars("qwen-token-plan-individual"),
+            Some(&["QWEN_TOKEN_PLAN_API_KEY"][..])
+        );
+        assert_eq!(api_key_env_vars("radius"), Some(&["RADIUS_API_KEY"][..]));
     }
 
     #[tokio::test]

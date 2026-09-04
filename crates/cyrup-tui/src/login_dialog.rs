@@ -51,12 +51,12 @@
 //! * **Secrets are not masked**, matching upstream — pi's dialog uses a plain `Input` for every
 //!   prompt kind including `secret` (`login-dialog.ts:54`, `:154-172`).
 
+use ratatui::Frame;
 use ratatui::crossterm::event::KeyEvent;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
-use ratatui::Frame;
 
 use cyrup_core::CancelToken;
 use cyrup_provider::auth::oauth::{
@@ -65,7 +65,7 @@ use cyrup_provider::auth::oauth::{
 
 use crate::keymap::{SelectAction, SelectKeymap};
 use crate::selector::{
-    border_rule, search_input_spans, title_lines, title_wrapped_height, Selector, SelectorOutcome,
+    Selector, SelectorOutcome, border_rule, search_input_spans, title_lines, title_wrapped_height,
 };
 use crate::theme::UiTheme;
 
@@ -271,8 +271,10 @@ impl LoginDialog {
     pub fn show_manual_input(&mut self, prompt: &str) {
         self.spacer();
         self.push(LoginLineKind::Dim, prompt);
-        self.input =
-            Some(LoginInput { input: crate::text_input::Input::new(), placeholder: None });
+        self.input = Some(LoginInput {
+            input: crate::text_input::Input::new(),
+            placeholder: None,
+        });
         self.select = None;
     }
 
@@ -285,7 +287,10 @@ impl LoginDialog {
         if let Some(hint) = placeholder.as_deref().filter(|s| !s.is_empty()) {
             self.push(LoginLineKind::Dim, format!("e.g., {hint}"));
         }
-        self.input = Some(LoginInput { input: crate::text_input::Input::new(), placeholder });
+        self.input = Some(LoginInput {
+            input: crate::text_input::Input::new(),
+            placeholder,
+        });
         self.select = None;
     }
 
@@ -308,7 +313,12 @@ impl LoginDialog {
     }
 
     /// `showInfo(message, links, showCloseHint)` (`login-dialog.ts:185-201`).
-    pub fn show_info(&mut self, message: &str, links: &[(String, Option<String>)], close_hint: bool) {
+    pub fn show_info(
+        &mut self,
+        message: &str,
+        links: &[(String, Option<String>)],
+        close_hint: bool,
+    ) {
         self.spacer();
         self.push(LoginLineKind::Text, message);
         for (url, label) in links {
@@ -396,8 +406,10 @@ impl LoginDialog {
             // S31: `LoginDialogComponent` adds its `Input` to `contentContainer` as a bare child
             // (`login-dialog.ts:140`, `:160`) — no `Text` wrapper — so the row is `Input.render`'s
             // shared, unstyled `"> "` at column 0 (`input.ts:380`). cyrup drew an accent `" > "`.
-            let mut spans =
-                vec![Span::styled(crate::selector::INPUT_PROMPT, style(UiTheme::base_style))];
+            let mut spans = vec![Span::styled(
+                crate::selector::INPUT_PROMPT,
+                style(UiTheme::base_style),
+            )];
             match input.placeholder.as_deref().filter(|s| !s.is_empty()) {
                 Some(hint) if input.input.value().is_empty() => {
                     spans.push(Span::styled(hint.to_string(), style(UiTheme::muted_style)));
@@ -483,10 +495,7 @@ impl Selector for LoginDialog {
                 .wrap(Wrap { trim: false }),
             title_area,
         );
-        frame.render_widget(
-            Paragraph::new(body).wrap(Wrap { trim: false }),
-            body_area,
-        );
+        frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), body_area);
         frame.render_widget(border_rule(bottom.width, theme), bottom);
     }
 
@@ -530,7 +539,9 @@ impl Selector for LoginDialog {
         // hands the key straight to the `Input`). `Left`/`Right`/`Home`/`End`/`Delete`/`Backspace`
         // still resolve here — they are `EditorKeymap::default()`'s `Key::plain(...)` bindings —
         // alongside the word motion, kill ring, undo and paste they never had.
-        let Some(field) = self.input.as_mut() else { return SelectorOutcome::Ignored };
+        let Some(field) = self.input.as_mut() else {
+            return SelectorOutcome::Ignored;
+        };
         match field.input.handle_key(key) {
             crate::text_input::InputOutcome::Ignored => SelectorOutcome::Ignored,
             _ => SelectorOutcome::Redraw,
@@ -548,7 +559,9 @@ impl Selector for LoginDialog {
     }
 
     fn handle_paste(&mut self, text: &str) -> SelectorOutcome {
-        let Some(field) = self.input.as_mut() else { return SelectorOutcome::Ignored };
+        let Some(field) = self.input.as_mut() else {
+            return SelectorOutcome::Ignored;
+        };
         field.input.paste(text);
         SelectorOutcome::Redraw
     }
@@ -611,10 +624,7 @@ pub struct TuiAuthInteraction {
 
 impl TuiAuthInteraction {
     /// Bind an interaction to the run loop's login channel and the dialog's cancel token.
-    pub fn new(
-        tx: tokio::sync::mpsc::UnboundedSender<LoginUiMsg>,
-        cancel: CancelToken,
-    ) -> Self {
+    pub fn new(tx: tokio::sync::mpsc::UnboundedSender<LoginUiMsg>, cancel: CancelToken) -> Self {
         TuiAuthInteraction { tx, cancel }
     }
 }
@@ -633,7 +643,10 @@ impl AuthInteraction for TuiAuthInteraction {
     async fn prompt(&self, prompt: AuthPrompt) -> Result<String, OAuthError> {
         let prompt_cancel = prompt.cancel.clone();
         // `if (prompt.signal.aborted) throw new Error("Login cancelled")` (`:5334`).
-        if prompt_cancel.as_ref().is_some_and(CancelToken::is_cancelled) || self.cancel.is_cancelled()
+        if prompt_cancel
+            .as_ref()
+            .is_some_and(CancelToken::is_cancelled)
+            || self.cancel.is_cancelled()
         {
             return Err(OAuthError::Cancelled);
         }
@@ -726,8 +739,8 @@ mod tests {
     )]
 
     use super::*;
-    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
     use cyrup_provider::auth::oauth::{AuthInfoLink, AuthSelectOption};
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::crossterm::event::{KeyEventKind, KeyEventState};
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -836,7 +849,10 @@ mod tests {
         d.show_prompt("Key?", None);
         let km = SelectKeymap::default();
         for c in "sk-1".chars() {
-            assert_eq!(d.handle(&key(KeyCode::Char(c)), &km), SelectorOutcome::Redraw);
+            assert_eq!(
+                d.handle(&key(KeyCode::Char(c)), &km),
+                SelectorOutcome::Redraw
+            );
         }
         assert_eq!(d.input_text(), Some("sk-1"));
         assert_eq!(
@@ -918,9 +934,7 @@ mod tests {
     async fn interaction_prompt_round_trips_through_the_channel() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let interaction = TuiAuthInteraction::new(tx, CancelToken::new());
-        let task = tokio::spawn(async move {
-            interaction.prompt(AuthPrompt::text("Key?")).await
-        });
+        let task = tokio::spawn(async move { interaction.prompt(AuthPrompt::text("Key?")).await });
         let msg = rx.recv().await.expect("prompt reaches the loop");
         match msg {
             LoginUiMsg::Prompt { prompt, reply } => {
@@ -947,7 +961,10 @@ mod tests {
         let msg = rx.recv().await.expect("prompt reaches the loop");
         assert!(matches!(msg, LoginUiMsg::Prompt { .. }));
         prompt_cancel.cancel();
-        let err = task.await.unwrap().expect_err("prompt-level cancel rejects");
+        let err = task
+            .await
+            .unwrap()
+            .expect_err("prompt-level cancel rejects");
         assert!(matches!(err, OAuthError::Cancelled), "{err}");
     }
 

@@ -7,8 +7,8 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -193,7 +193,9 @@ impl HttpCaps {
     /// manually via [`decode_buffered`]/[`decode_stream`], so the caller sees the decompressed body
     /// AND the untouched original headers.
     pub fn new() -> Self {
-        let client = client_builder().build().unwrap_or_else(|_| reqwest::Client::new());
+        let client = client_builder()
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self::with_client(client)
     }
 
@@ -219,25 +221,40 @@ impl HttpCaps {
     /// flake this test must not be sensitive to.
     #[cfg(test)]
     fn with_max_open_streams(max_open_streams: usize) -> Self {
-        let client =
-            client_builder().pool_max_idle_per_host(0).build().unwrap_or_else(|_| reqwest::Client::new());
-        Self { max_open_streams, ..Self::with_client(client) }
+        let client = client_builder()
+            .pool_max_idle_per_host(0)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self {
+            max_open_streams,
+            ..Self::with_client(client)
+        }
     }
 
     /// Build with a caller-supplied fallback request timeout (tests only; production always gets the
     /// real [`DEFAULT_REQUEST_TIMEOUT`] via [`Self::new`]/[`Self::with_client`]) — L4 review §6.
     #[cfg(test)]
     fn with_request_timeout(request_timeout: Duration) -> Self {
-        let client = client_builder().build().unwrap_or_else(|_| reqwest::Client::new());
-        Self { request_timeout, ..Self::with_client(client) }
+        let client = client_builder()
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self {
+            request_timeout,
+            ..Self::with_client(client)
+        }
     }
 
     /// Build with a caller-supplied per-poll idle timeout (tests only; production always gets the
     /// real [`HTTP_POLL_IDLE_TIMEOUT`] via [`Self::new`]/[`Self::with_client`]) — L4 review §6.
     #[cfg(test)]
     fn with_poll_idle_timeout(poll_idle_timeout: Duration) -> Self {
-        let client = client_builder().build().unwrap_or_else(|_| reqwest::Client::new());
-        Self { poll_idle_timeout, ..Self::with_client(client) }
+        let client = client_builder()
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self {
+            poll_idle_timeout,
+            ..Self::with_client(client)
+        }
     }
 
     /// Shared request-building: method parse + headers + optional body + optional timeout.
@@ -354,17 +371,27 @@ impl HttpCaps {
         let method = reqwest::Method::from_bytes(req.method.as_bytes())
             .map_err(|e| format!("invalid HTTP method `{}`: {e}", req.method))?;
         let mut builder = client.request(method, req.url.as_str());
-        let has_accept_encoding =
-            req.headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("accept-encoding"));
+        let has_accept_encoding = req
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("accept-encoding"));
         if !has_accept_encoding {
-            let has_range = req.headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("range"));
+            let has_range = req
+                .headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("range"));
             let default_accept_encoding = if has_range {
                 // Real `fetch()` step 18 (index.js:1552-1555): a `Range` request always gets
                 // `Accept-Encoding: identity` — a compressed byte-range response cannot be resumed/
                 // sliced meaningfully, so the real consumer refuses to negotiate compression at all
                 // for this request, regardless of scheme.
                 "identity"
-            } else if req.url.parse::<reqwest::Url>().map(|u| u.scheme() == "https").unwrap_or(false) {
+            } else if req
+                .url
+                .parse::<reqwest::Url>()
+                .map(|u| u.scheme() == "https")
+                .unwrap_or(false)
+            {
                 // Real `fetch()` step 19, HTTPS arm (index.js:1561-1563): `"br, gzip, deflate"` — no
                 // `zstd` (undici's own outbound default never advertises it, even though its decoder
                 // still handles a server that sends it unprompted, index.js:2296-2299 — mirrored by
@@ -422,8 +449,11 @@ impl HttpCaps {
             // above is intentional, redundant-but-harmless belt-and-suspenders — see
             // [`Self::build_request`]'s doc for why [`Self::request_stream`] below must NOT do this.
             let client = self.client_for(req.url.as_str()).await?;
-            let resp =
-                self.build_request(&client, req, true)?.send().await.map_err(|e| e.to_string())?;
+            let resp = self
+                .build_request(&client, req, true)?
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
             let status = resp.status().as_u16();
             let headers = collect_headers(resp.headers());
             let encoding = content_encoding_of(resp.headers());
@@ -445,7 +475,11 @@ impl HttpCaps {
             resolve_codings(coding_encoding)?;
             let raw = read_bounded_body(resp).await?;
             let body = decode_buffered(coding_encoding, raw).await?;
-            Ok(HttpResponse { status, headers, body })
+            Ok(HttpResponse {
+                status,
+                headers,
+                body,
+            })
         })
         .await
         .unwrap_or_else(|_| Err(format!("request: timed out after {effective_timeout:?}")))
@@ -464,7 +498,10 @@ impl HttpCaps {
         // Reject BEFORE spending a real network round-trip if already at the cap (checked again,
         // atomically with the insert, below — this is a fast up-front rejection, not the only gate).
         {
-            let g = self.streams.lock().map_err(|_| "http stream registry lock poisoned".to_string())?;
+            let g = self
+                .streams
+                .lock()
+                .map_err(|_| "http stream registry lock poisoned".to_string())?;
             if g.len() >= self.max_open_streams {
                 return Err(format!(
                     "too many open http streams ({} already open) — close some via close-stream \
@@ -508,8 +545,10 @@ impl HttpCaps {
         };
         let stream: ChunkStream = decode_stream(coding_encoding, resp.bytes_stream())?;
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
-        let mut g =
-            self.streams.lock().map_err(|_| "http stream registry lock poisoned".to_string())?;
+        let mut g = self
+            .streams
+            .lock()
+            .map_err(|_| "http stream registry lock poisoned".to_string())?;
         // Re-checked atomically with the insert (the up-front check above is a fast-path only — a
         // concurrent `request_stream` could have raced past it in between): dropping `stream` here
         // (never inserted) cancels the connection we just opened, same as `close_stream` would.
@@ -521,7 +560,11 @@ impl HttpCaps {
             ));
         }
         g.insert(handle, StreamSlot::Idle(stream));
-        Ok(HttpStreamResponse { handle, status, headers })
+        Ok(HttpStreamResponse {
+            handle,
+            status,
+            headers,
+        })
     }
 
     /// Drain the next chunk of an open stream (the WIT `poll-stream-chunk`); `Ok(None)` = EOF. A
@@ -604,7 +647,11 @@ impl HttpCaps {
             }
         }
 
-        let mut finalizer = PollFinalizer { caps: self, handle, next: None };
+        let mut finalizer = PollFinalizer {
+            caps: self,
+            handle,
+            next: None,
+        };
         // L4 review §6: bound THIS SINGLE poll's wait, never the stream's overall lifetime — a
         // legitimate long-lived SSE/StreamableHTTP connection (the real consumer's actual protocol
         // need, MCP SDK `streamableHttp.js:75-105`) can go quiet between server-pushed messages for a
@@ -714,7 +761,11 @@ async fn read_bounded_body(resp: reqwest::Response) -> Result<Vec<u8>, String> {
 fn collect_headers(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
     headers
         .iter()
-        .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.as_str().to_string(), s.to_string())))
+        .filter_map(|(k, v)| {
+            v.to_str()
+                .ok()
+                .map(|s| (k.as_str().to_string(), s.to_string()))
+        })
         .collect()
 }
 
@@ -735,7 +786,12 @@ fn client_builder() -> reqwest::ClientBuilder {
     // It does NOT disable the proxy [`HttpCaps::client_through`] installs: `no_proxy()` clears the
     // proxies added BEFORE it and turns off auto system-proxy detection, and that builder adds its
     // `.proxy(..)` after this call.
-    reqwest::Client::builder().no_gzip().no_brotli().no_deflate().no_zstd().no_proxy()
+    reqwest::Client::builder()
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .no_zstd()
+        .no_proxy()
 }
 
 /// The response's `Content-Encoding` value, verbatim (original casing preserved — this is also the
@@ -746,7 +802,10 @@ fn client_builder() -> reqwest::ClientBuilder {
 /// `contentEncoding.toLowerCase().split(',')`) — done separately, on a lowercase COPY, by
 /// [`decode_buffered`]/[`decode_stream`], never here.
 fn content_encoding_of(headers: &reqwest::header::HeaderMap) -> Option<String> {
-    headers.get(reqwest::header::CONTENT_ENCODING).and_then(|v| v.to_str().ok()).map(str::to_owned)
+    headers
+        .get(reqwest::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
 }
 
 /// The status codes that NEVER carry a body (real consumer:
@@ -846,7 +905,9 @@ impl Coding {
 /// the split, exactly mirrored here. The ORIGINAL `encoding` (and the untouched header this crate
 /// hands back to the guest, [`content_encoding_of`]) is never itself modified.
 fn resolve_codings(encoding: Option<&str>) -> Result<Vec<Coding>, String> {
-    let Some(encoding) = encoding else { return Ok(Vec::new()) };
+    let Some(encoding) = encoding else {
+        return Ok(Vec::new());
+    };
     let lower = encoding.to_lowercase();
     let tokens: Vec<&str> = lower.split(',').collect();
     if tokens.len() > MAX_CONTENT_ENCODINGS {
@@ -899,11 +960,21 @@ async fn decode_buffered_one(coding: Coding, raw: Vec<u8>) -> Result<Vec<u8>, St
         Coding::Gzip => {
             read_capped(async_compression::tokio::bufread::GzipDecoder::new(reader)).await
         }
-        Coding::Br => read_capped(async_compression::tokio::bufread::BrotliDecoder::new(reader)).await,
-        Coding::Deflate => {
-            read_capped(async_compression::tokio::bufread::DeflateDecoder::new(reader)).await
+        Coding::Br => {
+            read_capped(async_compression::tokio::bufread::BrotliDecoder::new(
+                reader,
+            ))
+            .await
         }
-        Coding::Zstd => read_capped(async_compression::tokio::bufread::ZstdDecoder::new(reader)).await,
+        Coding::Deflate => {
+            read_capped(async_compression::tokio::bufread::DeflateDecoder::new(
+                reader,
+            ))
+            .await
+        }
+        Coding::Zstd => {
+            read_capped(async_compression::tokio::bufread::ZstdDecoder::new(reader)).await
+        }
     }
 }
 
@@ -1027,7 +1098,8 @@ impl std::error::Error for NetworkStreamError {
 /// this to decide whether a chunk-stream error must stay a hard failure (network) or should degrade
 /// to a lenient clean EOF (decoder — undici's Z_SYNC_FLUSH-style leniency, [`read_capped`]'s doc).
 fn is_network_stream_error(e: &std::io::Error) -> bool {
-    e.get_ref().is_some_and(|inner| inner.downcast_ref::<NetworkStreamError>().is_some())
+    e.get_ref()
+        .is_some_and(|inner| inner.downcast_ref::<NetworkStreamError>().is_some())
 }
 
 /// Wrap `raw` through the decoder for a SINGLE [`Coding`] (one stage of [`decode_stream`]'s chain,
@@ -1060,7 +1132,12 @@ fn decode_stream_one(coding: Coding, raw: ChunkStream) -> ChunkStream {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
     use super::*;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1112,7 +1189,9 @@ mod tests {
     /// observes them as distinct reads, proving genuine incremental delivery — no external network
     /// dependency). Returns the server's `http://127.0.0.1:<port>/path` URL.
     async fn spawn_mock(status_line: &'static str, headers: String, parts: Vec<Vec<u8>>) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
         tokio::spawn(async move {
             if let Ok((mut sock, _)) = listener.accept().await {
@@ -1135,11 +1214,18 @@ mod tests {
     async fn request_returns_the_real_status_and_body() {
         let _serial = proxy_setting_guard().await;
         let body = b"hello from the mock server".to_vec();
-        let headers = format!("Content-Type: text/plain\r\nContent-Length: {}\r\n", body.len());
+        let headers = format!(
+            "Content-Type: text/plain\r\nContent-Length: {}\r\n",
+            body.len()
+        );
         let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![body.clone()]).await;
 
         let caps = HttpCaps::new();
-        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let req = HttpRequest {
+            method: "GET".into(),
+            url,
+            ..Default::default()
+        };
         let resp = caps.request(&req).await.expect("request succeeds");
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body, body);
@@ -1164,11 +1250,7 @@ mod tests {
 
     /// [`compress`] at an explicit level. `Level::Best` is the `-9` the decompression-bomb test
     /// needs to build a genuinely small wire form.
-    async fn compress_at(
-        coding: Coding,
-        level: async_compression::Level,
-        input: &[u8],
-    ) -> Vec<u8> {
+    async fn compress_at(coding: Coding, level: async_compression::Level, input: &[u8]) -> Vec<u8> {
         use async_compression::tokio::write::{
             BrotliEncoder, DeflateEncoder, GzipEncoder, ZstdEncoder,
         };
@@ -1176,22 +1258,30 @@ mod tests {
         match coding {
             Coding::Gzip => {
                 let mut enc = GzipEncoder::with_quality(&mut out, level);
-                enc.write_all(input).await.expect("gzip-encode the plaintext");
+                enc.write_all(input)
+                    .await
+                    .expect("gzip-encode the plaintext");
                 enc.shutdown().await.expect("finish the gzip stream");
             }
             Coding::Br => {
                 let mut enc = BrotliEncoder::with_quality(&mut out, level);
-                enc.write_all(input).await.expect("brotli-encode the plaintext");
+                enc.write_all(input)
+                    .await
+                    .expect("brotli-encode the plaintext");
                 enc.shutdown().await.expect("finish the brotli stream");
             }
             Coding::Deflate => {
                 let mut enc = DeflateEncoder::with_quality(&mut out, level);
-                enc.write_all(input).await.expect("deflate-encode the plaintext");
+                enc.write_all(input)
+                    .await
+                    .expect("deflate-encode the plaintext");
                 enc.shutdown().await.expect("finish the deflate stream");
             }
             Coding::Zstd => {
                 let mut enc = ZstdEncoder::with_quality(&mut out, level);
-                enc.write_all(input).await.expect("zstd-encode the plaintext");
+                enc.write_all(input)
+                    .await
+                    .expect("zstd-encode the plaintext");
                 enc.shutdown().await.expect("finish the zstd stream");
             }
         }
@@ -1216,7 +1306,10 @@ mod tests {
             hello decompression world, hello decompression world"
             .to_vec();
         let gzipped = compress(Coding::Gzip, &plaintext).await;
-        assert_ne!(gzipped, plaintext, "sanity: the compressed wire bytes differ from the plaintext");
+        assert_ne!(
+            gzipped, plaintext,
+            "sanity: the compressed wire bytes differ from the plaintext"
+        );
 
         let headers = format!(
             "Content-Type: text/plain\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n",
@@ -1225,7 +1318,11 @@ mod tests {
         let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![gzipped.clone()]).await;
 
         let caps = HttpCaps::new();
-        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let req = HttpRequest {
+            method: "GET".into(),
+            url,
+            ..Default::default()
+        };
         let resp = caps.request(&req).await.expect("request succeeds");
         assert_eq!(resp.status, 200);
         assert_eq!(
@@ -1233,7 +1330,10 @@ mod tests {
             "the body must come back as the DECOMPRESSED plaintext, matching a real fetch() client"
         );
         let get = |name: &str| {
-            resp.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+            resp.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
         };
         assert_eq!(
             get("content-encoding"),
@@ -1271,14 +1371,21 @@ mod tests {
         let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![gzipped.clone()]).await;
 
         let caps = HttpCaps::new();
-        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let req = HttpRequest {
+            method: "GET".into(),
+            url,
+            ..Default::default()
+        };
         let resp = caps.request(&req).await.expect("request succeeds");
         assert_eq!(
             resp.body, plaintext,
             "an uppercase `GZIP` Content-Encoding must still be decompressed, matching real fetch()"
         );
         let get = |name: &str| {
-            resp.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+            resp.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
         };
         assert_eq!(
             get("content-encoding"),
@@ -1306,7 +1413,11 @@ mod tests {
         let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![gzipped.clone()]).await;
 
         let caps = HttpCaps::new();
-        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let req = HttpRequest {
+            method: "GET".into(),
+            url,
+            ..Default::default()
+        };
         let resp = caps.request(&req).await.expect("request succeeds");
         assert_eq!(
             resp.body, plaintext,
@@ -1331,11 +1442,19 @@ mod tests {
         let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![gzipped]).await;
 
         let caps = HttpCaps::new();
-        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let req = HttpRequest {
+            method: "GET".into(),
+            url,
+            ..Default::default()
+        };
         let opened = caps.request_stream(&req).await.expect("stream opens");
 
         let mut collected = Vec::new();
-        while let Some(chunk) = caps.poll_stream_chunk(opened.handle).await.expect("poll succeeds") {
+        while let Some(chunk) = caps
+            .poll_stream_chunk(opened.handle)
+            .await
+            .expect("poll succeeds")
+        {
             collected.extend_from_slice(&chunk);
         }
         assert_eq!(
@@ -1361,7 +1480,11 @@ mod tests {
         let url = spawn_mock("HTTP/1.1 304 Not Modified", headers, vec![]).await;
 
         let caps = HttpCaps::new();
-        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let req = HttpRequest {
+            method: "GET".into(),
+            url,
+            ..Default::default()
+        };
         let resp = caps
             .request(&req)
             .await
@@ -1373,7 +1496,10 @@ mod tests {
             "a null-body status must return the empty body untouched, not attempt to decode it"
         );
         let get = |name: &str| {
-            resp.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+            resp.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
         };
         assert_eq!(
             get("content-encoding"),
@@ -1392,14 +1518,24 @@ mod tests {
         let url = spawn_mock("HTTP/1.1 304 Not Modified", headers, vec![]).await;
 
         let caps = HttpCaps::new();
-        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let req = HttpRequest {
+            method: "GET".into(),
+            url,
+            ..Default::default()
+        };
         let opened = caps
             .request_stream(&req)
             .await
             .expect("a 304 with a stale Content-Encoding must not fail to open the stream");
         assert_eq!(opened.status, 304);
-        let chunk = caps.poll_stream_chunk(opened.handle).await.expect("poll succeeds");
-        assert_eq!(chunk, None, "a null-body status drains straight to EOF with no decode attempted");
+        let chunk = caps
+            .poll_stream_chunk(opened.handle)
+            .await
+            .expect("poll succeeds");
+        assert_eq!(
+            chunk, None,
+            "a null-body status drains straight to EOF with no decode attempted"
+        );
     }
 
     /// Same finding, the HEAD case: real servers echo the `Content-Encoding` a matching `GET` would
@@ -1409,16 +1545,27 @@ mod tests {
     #[tokio::test]
     async fn request_head_with_a_content_encoding_header_returns_the_empty_body_undecoded() {
         let _serial = proxy_setting_guard().await;
-        let headers = "Content-Type: text/plain\r\nContent-Encoding: gzip\r\nContent-Length: 12345\r\n"
-            .to_string();
+        let headers =
+            "Content-Type: text/plain\r\nContent-Encoding: gzip\r\nContent-Length: 12345\r\n"
+                .to_string();
         let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![]).await;
 
         let caps = HttpCaps::new();
-        let req = HttpRequest { method: "HEAD".into(), url, ..Default::default() };
-        let resp =
-            caps.request(&req).await.expect("a HEAD response must not fail decompression either");
+        let req = HttpRequest {
+            method: "HEAD".into(),
+            url,
+            ..Default::default()
+        };
+        let resp = caps
+            .request(&req)
+            .await
+            .expect("a HEAD response must not fail decompression either");
         assert_eq!(resp.status, 200);
-        assert_eq!(resp.body, Vec::<u8>::new(), "a HEAD response body must come back empty, undecoded");
+        assert_eq!(
+            resp.body,
+            Vec::<u8>::new(),
+            "a HEAD response body must come back empty, undecoded"
+        );
     }
 
     /// L4 round-12 finding #2b: `Content-Encoding` may CHAIN multiple codings (RFC 9110 §8.4.1 — "the
@@ -1448,7 +1595,11 @@ mod tests {
         let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![double_compressed.clone()]).await;
 
         let caps = HttpCaps::new();
-        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let req = HttpRequest {
+            method: "GET".into(),
+            url,
+            ..Default::default()
+        };
         let resp = caps.request(&req).await.expect("request succeeds");
         assert_eq!(resp.status, 200);
         assert_eq!(
@@ -1456,7 +1607,10 @@ mod tests {
             "both chained layers (gzip, then br) must be undone, matching real fetch()'s chained decode"
         );
         let get = |name: &str| {
-            resp.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+            resp.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
         };
         assert_eq!(
             get("content-encoding"),
@@ -1470,7 +1624,8 @@ mod tests {
     /// `gzip, br` `Content-Encoding` must decompress correctly while draining chunks, not just the
     /// buffered `request` path.
     #[tokio::test]
-    async fn request_stream_transparently_decodes_a_real_chained_gzip_then_brotli_content_encoding() {
+    async fn request_stream_transparently_decodes_a_real_chained_gzip_then_brotli_content_encoding()
+    {
         let _serial = proxy_setting_guard().await;
         let plaintext = b"streaming chained decompression world, repeated for a real ratio: \
             streaming chained decompression world, streaming chained decompression world"
@@ -1489,16 +1644,33 @@ mod tests {
         let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![double_compressed.clone()]).await;
 
         let caps = HttpCaps::new();
-        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let req = HttpRequest {
+            method: "GET".into(),
+            url,
+            ..Default::default()
+        };
         let opened = caps.request_stream(&req).await.expect("stream opens");
         assert_eq!(opened.status, 200);
         let get = |name: &str| {
-            opened.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+            opened
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
         };
-        assert_eq!(get("content-encoding"), Some("gzip, br"), "headers: {:?}", opened.headers);
+        assert_eq!(
+            get("content-encoding"),
+            Some("gzip, br"),
+            "headers: {:?}",
+            opened.headers
+        );
 
         let mut collected = Vec::new();
-        while let Some(chunk) = caps.poll_stream_chunk(opened.handle).await.expect("poll succeeds") {
+        while let Some(chunk) = caps
+            .poll_stream_chunk(opened.handle)
+            .await
+            .expect("poll succeeds")
+        {
             collected.extend_from_slice(&chunk);
         }
         assert_eq!(
@@ -1518,7 +1690,8 @@ mod tests {
     /// proving this is a real end-to-end behavior over a real mock server + real gzip binary, not
     /// merely a unit check of the resolver function.
     #[tokio::test]
-    async fn request_with_an_unrecognized_content_encoding_token_discards_the_whole_chain_not_just_that_stage() {
+    async fn request_with_an_unrecognized_content_encoding_token_discards_the_whole_chain_not_just_that_stage()
+     {
         let _serial = proxy_setting_guard().await;
         let plaintext = b"this must NOT be gzip-decoded when an unknown token poisons the chain";
         let gzipped = compress(Coding::Gzip, plaintext).await;
@@ -1530,8 +1703,15 @@ mod tests {
         let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![gzipped.clone()]).await;
 
         let caps = HttpCaps::new();
-        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
-        let resp = caps.request(&req).await.expect("request succeeds (an unknown token is not itself an error)");
+        let req = HttpRequest {
+            method: "GET".into(),
+            url,
+            ..Default::default()
+        };
+        let resp = caps
+            .request(&req)
+            .await
+            .expect("request succeeds (an unknown token is not itself an error)");
         assert_eq!(resp.status, 200);
         assert_eq!(
             resp.body, gzipped,
@@ -1546,9 +1726,11 @@ mod tests {
     /// coding, so the reverse-order walk hits it FIRST, before `gzip` is ever even inspected. Same
     /// real-server, real-gzip proof; same expected fully-raw result.
     #[tokio::test]
-    async fn request_with_a_trailing_unrecognized_content_encoding_token_also_discards_the_whole_chain() {
+    async fn request_with_a_trailing_unrecognized_content_encoding_token_also_discards_the_whole_chain()
+     {
         let _serial = proxy_setting_guard().await;
-        let plaintext = b"an outermost unknown coding must poison the chain before gzip is even seen";
+        let plaintext =
+            b"an outermost unknown coding must poison the chain before gzip is even seen";
         let gzipped = compress(Coding::Gzip, plaintext).await;
 
         let headers = format!(
@@ -1558,7 +1740,11 @@ mod tests {
         let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![gzipped.clone()]).await;
 
         let caps = HttpCaps::new();
-        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let req = HttpRequest {
+            method: "GET".into(),
+            url,
+            ..Default::default()
+        };
         let resp = caps.request(&req).await.expect("request succeeds");
         assert_eq!(
             resp.body, gzipped,
@@ -1573,7 +1759,8 @@ mod tests {
     #[tokio::test]
     async fn request_stream_with_an_unrecognized_content_encoding_token_discards_the_whole_chain() {
         let _serial = proxy_setting_guard().await;
-        let plaintext = b"streaming: this must NOT be gzip-decoded when an unknown token is present";
+        let plaintext =
+            b"streaming: this must NOT be gzip-decoded when an unknown token is present";
         let gzipped = compress(Coding::Gzip, plaintext).await;
 
         let headers = format!(
@@ -1583,12 +1770,20 @@ mod tests {
         let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![gzipped.clone()]).await;
 
         let caps = HttpCaps::new();
-        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let req = HttpRequest {
+            method: "GET".into(),
+            url,
+            ..Default::default()
+        };
         let opened = caps.request_stream(&req).await.expect("stream opens");
         assert_eq!(opened.status, 200);
 
         let mut collected = Vec::new();
-        while let Some(chunk) = caps.poll_stream_chunk(opened.handle).await.expect("poll succeeds") {
+        while let Some(chunk) = caps
+            .poll_stream_chunk(opened.handle)
+            .await
+            .expect("poll succeeds")
+        {
             collected.extend_from_slice(&chunk);
         }
         assert_eq!(
@@ -1737,14 +1932,22 @@ mod tests {
                 .map(str::to_string)
         };
 
-        let req = HttpRequest { method: "GET".into(), url: "https://example.invalid/x".into(), ..Default::default() };
+        let req = HttpRequest {
+            method: "GET".into(),
+            url: "https://example.invalid/x".into(),
+            ..Default::default()
+        };
         assert_eq!(
             get_accept_encoding(&req).as_deref(),
             Some("br, gzip, deflate"),
             "https:// must default to br,gzip,deflate — never zstd"
         );
 
-        let req = HttpRequest { method: "GET".into(), url: "http://example.invalid/x".into(), ..Default::default() };
+        let req = HttpRequest {
+            method: "GET".into(),
+            url: "http://example.invalid/x".into(),
+            ..Default::default()
+        };
         assert_eq!(
             get_accept_encoding(&req).as_deref(),
             Some("gzip, deflate"),
@@ -1792,7 +1995,11 @@ mod tests {
         let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![b"abc".to_vec()]).await;
 
         let caps = HttpCaps::new();
-        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let req = HttpRequest {
+            method: "GET".into(),
+            url,
+            ..Default::default()
+        };
         let err = caps
             .request(&req)
             .await
@@ -1815,7 +2022,9 @@ mod tests {
         let headers = "Content-Type: application/octet-stream\r\n\
             Content-Encoding: gzip, br, deflate, zstd, gzip, br\r\n"
             .to_string();
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
         tokio::spawn(async move {
             if let Ok((mut sock, _)) = listener.accept().await {
@@ -1832,7 +2041,11 @@ mod tests {
         let url = format!("http://{addr}/probe");
 
         let caps = HttpCaps::new();
-        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let req = HttpRequest {
+            method: "GET".into(),
+            url,
+            ..Default::default()
+        };
         let err = tokio::time::timeout(std::time::Duration::from_secs(2), caps.request(&req))
             .await
             .expect(
@@ -1859,7 +2072,11 @@ mod tests {
         let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![b"abc".to_vec()]).await;
 
         let caps = HttpCaps::new();
-        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let req = HttpRequest {
+            method: "GET".into(),
+            url,
+            ..Default::default()
+        };
         let err = caps
             .request_stream(&req)
             .await
@@ -1881,7 +2098,10 @@ mod tests {
             streaming zstd decompression world, streaming zstd decompression world"
             .to_vec();
         let compressed = compress(Coding::Zstd, &plaintext).await;
-        assert_ne!(compressed, plaintext, "sanity: the compressed wire bytes differ from the plaintext");
+        assert_ne!(
+            compressed, plaintext,
+            "sanity: the compressed wire bytes differ from the plaintext"
+        );
 
         let headers = format!(
             "Content-Type: application/octet-stream\r\nContent-Encoding: zstd\r\nContent-Length: {}\r\n",
@@ -1890,13 +2110,26 @@ mod tests {
         let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![compressed.clone()]).await;
 
         let caps = HttpCaps::new();
-        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let req = HttpRequest {
+            method: "GET".into(),
+            url,
+            ..Default::default()
+        };
         let opened = caps.request_stream(&req).await.expect("stream opens");
         assert_eq!(opened.status, 200);
         let get = |name: &str| {
-            opened.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+            opened
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
         };
-        assert_eq!(get("content-encoding"), Some("zstd"), "headers: {:?}", opened.headers);
+        assert_eq!(
+            get("content-encoding"),
+            Some("zstd"),
+            "headers: {:?}",
+            opened.headers
+        );
         assert_eq!(
             get("content-length"),
             Some(compressed.len().to_string().as_str()),
@@ -1905,7 +2138,11 @@ mod tests {
         );
 
         let mut collected = Vec::new();
-        while let Some(chunk) = caps.poll_stream_chunk(opened.handle).await.expect("poll succeeds") {
+        while let Some(chunk) = caps
+            .poll_stream_chunk(opened.handle)
+            .await
+            .expect("poll succeeds")
+        {
             collected.extend_from_slice(&chunk);
         }
         assert_eq!(
@@ -1943,7 +2180,11 @@ mod tests {
         let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![truncated]).await;
 
         let caps = HttpCaps::new();
-        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let req = HttpRequest {
+            method: "GET".into(),
+            url,
+            ..Default::default()
+        };
         let resp = caps
             .request(&req)
             .await
@@ -1983,7 +2224,11 @@ mod tests {
         let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![truncated]).await;
 
         let caps = HttpCaps::new();
-        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let req = HttpRequest {
+            method: "GET".into(),
+            url,
+            ..Default::default()
+        };
         let resp = caps
             .request(&req)
             .await
@@ -2016,7 +2261,11 @@ mod tests {
         let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![truncated]).await;
 
         let caps = HttpCaps::new();
-        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let req = HttpRequest {
+            method: "GET".into(),
+            url,
+            ..Default::default()
+        };
         let opened = caps.request_stream(&req).await.expect("stream opens");
         assert_eq!(opened.status, 200);
 
@@ -2056,7 +2305,11 @@ mod tests {
         let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![b"0123456789".to_vec()]).await;
 
         let caps = HttpCaps::new();
-        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let req = HttpRequest {
+            method: "GET".into(),
+            url,
+            ..Default::default()
+        };
         let opened = caps.request_stream(&req).await.expect("stream opens");
         let mut saw_hard_err = false;
         loop {
@@ -2100,8 +2353,15 @@ mod tests {
         let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![gzipped]).await;
 
         let caps = HttpCaps::new();
-        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
-        let err = caps.request(&req).await.expect_err("a decompression bomb must be rejected");
+        let req = HttpRequest {
+            method: "GET".into(),
+            url,
+            ..Default::default()
+        };
+        let err = caps
+            .request(&req)
+            .await
+            .expect_err("a decompression bomb must be rejected");
         assert!(
             err.contains("cap"),
             "the error must explain the decompressed-size cap was hit: {err}"
@@ -2111,16 +2371,27 @@ mod tests {
     #[tokio::test]
     async fn request_stream_yields_real_chunks_in_order_then_eof() {
         let _serial = proxy_setting_guard().await;
-        let parts: Vec<Vec<u8>> =
-            vec![b"chunk-one-".to_vec(), b"chunk-two-".to_vec(), b"chunk-three".to_vec()];
+        let parts: Vec<Vec<u8>> = vec![
+            b"chunk-one-".to_vec(),
+            b"chunk-two-".to_vec(),
+            b"chunk-three".to_vec(),
+        ];
         let total: usize = parts.iter().map(Vec::len).sum();
-        let headers = format!("Content-Type: application/octet-stream\r\nContent-Length: {total}\r\n");
+        let headers =
+            format!("Content-Type: application/octet-stream\r\nContent-Length: {total}\r\n");
         let url = spawn_mock("HTTP/1.1 200 OK", headers, parts.clone()).await;
 
         let caps = HttpCaps::new();
-        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let req = HttpRequest {
+            method: "GET".into(),
+            url,
+            ..Default::default()
+        };
         let opened = caps.request_stream(&req).await.expect("stream opens");
-        assert_eq!(opened.status, 200, "the initiating response's real status is captured");
+        assert_eq!(
+            opened.status, 200,
+            "the initiating response's real status is captured"
+        );
         let handle = opened.handle;
 
         let mut collected = Vec::new();
@@ -2130,11 +2401,22 @@ mod tests {
             collected.extend_from_slice(&chunk);
         }
         let expected: Vec<u8> = parts.concat();
-        assert_eq!(collected, expected, "chunks concatenate back to the real body, in order");
-        assert!(chunk_count >= 2, "the delayed writes arrived as multiple distinct chunks: {chunk_count}");
+        assert_eq!(
+            collected, expected,
+            "chunks concatenate back to the real body, in order"
+        );
+        assert!(
+            chunk_count >= 2,
+            "the delayed writes arrived as multiple distinct chunks: {chunk_count}"
+        );
 
         // EOF is sticky: polling again still returns `Ok(None)`, never re-erroring.
-        assert_eq!(caps.poll_stream_chunk(handle).await.expect("poll after EOF"), None);
+        assert_eq!(
+            caps.poll_stream_chunk(handle)
+                .await
+                .expect("poll after EOF"),
+            None
+        );
     }
 
     /// THE HIGH finding this closes: `request_stream`'s explicit non-zero `timeout_ms` used to ALSO
@@ -2149,14 +2431,15 @@ mod tests {
     #[tokio::test]
     async fn request_stream_survives_a_slow_body_past_an_explicit_non_zero_timeout_ms() {
         let _serial = proxy_setting_guard().await;
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
         tokio::spawn(async move {
             if let Ok((mut sock, _)) = listener.accept().await {
                 let mut buf = [0u8; 1024];
                 let _ = sock.read(&mut buf).await;
-                let head =
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 10\r\n\r\n";
+                let head = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 10\r\n\r\n";
                 let _ = sock.write_all(head.as_bytes()).await;
                 let _ = sock.write_all(b"AAAAA").await;
                 let _ = sock.flush().await;
@@ -2211,11 +2494,21 @@ mod tests {
         let url = spawn_mock("HTTP/1.1 401 Unauthorized", headers, vec![body.clone()]).await;
 
         let caps = HttpCaps::new();
-        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
-        let opened = caps.request_stream(&req).await.expect("stream opens even on non-2xx status");
+        let req = HttpRequest {
+            method: "GET".into(),
+            url,
+            ..Default::default()
+        };
+        let opened = caps
+            .request_stream(&req)
+            .await
+            .expect("stream opens even on non-2xx status");
 
         // Status+headers are already available here — no chunk has been polled yet.
-        assert_eq!(opened.status, 401, "the real non-2xx status is surfaced, not swallowed");
+        assert_eq!(
+            opened.status, 401,
+            "the real non-2xx status is surfaced, not swallowed"
+        );
         let content_type = opened
             .headers
             .iter()
@@ -2227,11 +2520,19 @@ mod tests {
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("mcp-session-id"))
             .map(|(_, v)| v.as_str());
-        assert_eq!(session_id, Some("sess-42"), "the real mcp-session-id header round-trips");
+        assert_eq!(
+            session_id,
+            Some("sess-42"),
+            "the real mcp-session-id header round-trips"
+        );
 
         // The body is still fully drainable afterward — status/headers cost nothing extra.
         let mut collected = Vec::new();
-        while let Some(chunk) = caps.poll_stream_chunk(opened.handle).await.expect("poll succeeds") {
+        while let Some(chunk) = caps
+            .poll_stream_chunk(opened.handle)
+            .await
+            .expect("poll succeeds")
+        {
             collected.extend_from_slice(&chunk);
         }
         assert_eq!(collected, body);
@@ -2242,10 +2543,17 @@ mod tests {
         let _serial = proxy_setting_guard().await;
         let url = spawn_mock("HTTP/1.1 200 OK", "Content-Length: 0\r\n".into(), vec![]).await;
         let caps = HttpCaps::new();
-        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let req = HttpRequest {
+            method: "GET".into(),
+            url,
+            ..Default::default()
+        };
         let opened = caps.request_stream(&req).await.expect("stream opens");
         caps.close_stream(opened.handle);
-        let err = caps.poll_stream_chunk(opened.handle).await.expect_err("closed handle is unknown");
+        let err = caps
+            .poll_stream_chunk(opened.handle)
+            .await
+            .expect_err("closed handle is unknown");
         assert!(err.contains("no open http stream"), "got: {err}");
     }
 
@@ -2262,7 +2570,9 @@ mod tests {
         let _serial = proxy_setting_guard().await;
         let body = b"the one real chunk".to_vec();
         let server_body = body.clone();
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
         tokio::spawn(async move {
             if let Ok((mut sock, _)) = listener.accept().await {
@@ -2281,7 +2591,11 @@ mod tests {
         let url = format!("http://{addr}/probe");
 
         let caps = Arc::new(HttpCaps::new());
-        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let req = HttpRequest {
+            method: "GET".into(),
+            url,
+            ..Default::default()
+        };
         let opened = caps.request_stream(&req).await.expect("stream opens");
         let handle = opened.handle;
 
@@ -2296,14 +2610,24 @@ mod tests {
 
         // The in-flight poll still returns the REAL chunk it was already fetching — closing doesn't
         // retroactively fail an already-started read.
-        let polled = poll_task.await.expect("poll task joins").expect("poll succeeds");
-        assert_eq!(polled, Some(body), "the in-flight poll still returns the real chunk it fetched");
+        let polled = poll_task
+            .await
+            .expect("poll task joins")
+            .expect("poll succeeds");
+        assert_eq!(
+            polled,
+            Some(body),
+            "the in-flight poll still returns the real chunk it fetched"
+        );
 
         // THE fix: the handle must NOT have been resurrected by the poll's post-await re-insert —
         // it must stay genuinely closed (`Err`, matching `close_stream_invalidates_the_handle`
         // above), never silently degrade to `Ok(None)` (which would mean the registry entry came
         // back to life).
-        let err = caps.poll_stream_chunk(handle).await.expect_err("closed handle stays closed");
+        let err = caps
+            .poll_stream_chunk(handle)
+            .await
+            .expect_err("closed handle stays closed");
         assert!(
             err.contains("no open http stream"),
             "the handle must stay closed after racing with an in-flight poll, got: {err}"
@@ -2323,13 +2647,18 @@ mod tests {
         let _serial = proxy_setting_guard().await;
         let body = b"the delayed chunk".to_vec();
         let server_body = body.clone();
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
         tokio::spawn(async move {
             if let Ok((mut sock, _)) = listener.accept().await {
                 let mut buf = [0u8; 1024];
                 let _ = sock.read(&mut buf).await;
-                let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", server_body.len());
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                    server_body.len()
+                );
                 let _ = sock.write_all(head.as_bytes()).await;
                 let _ = sock.flush().await;
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -2340,8 +2669,15 @@ mod tests {
         let url = format!("http://{addr}/probe");
 
         let caps = Arc::new(HttpCaps::with_max_open_streams(1));
-        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
-        let opened = caps.request_stream(&req).await.expect("first stream opens under the cap of 1");
+        let req = HttpRequest {
+            method: "GET".into(),
+            url,
+            ..Default::default()
+        };
+        let opened = caps
+            .request_stream(&req)
+            .await
+            .expect("first stream opens under the cap of 1");
         let handle = opened.handle;
 
         // Start the poll — it immediately blocks on `stream.next().await` for ~200ms.
@@ -2357,17 +2693,27 @@ mod tests {
         // flight — a second `request_stream` must still be rejected by the cap of 1, proving the
         // accounting slot was NOT freed early.
         let second_url = spawn_persistent_mock().await;
-        let second_req = HttpRequest { method: "GET".into(), url: second_url, ..Default::default() };
-        let err = caps
-            .request_stream(&second_req)
-            .await
-            .expect_err("the cap slot must stay held while the closed stream's poll is still in flight");
+        let second_req = HttpRequest {
+            method: "GET".into(),
+            url: second_url,
+            ..Default::default()
+        };
+        let err = caps.request_stream(&second_req).await.expect_err(
+            "the cap slot must stay held while the closed stream's poll is still in flight",
+        );
         assert!(err.contains("too many open http streams"), "got: {err}");
 
         // Let the in-flight poll actually finish — it observes the close and releases the slot for
         // real at that point, not before.
-        let polled = poll_task.await.expect("poll task joins").expect("poll succeeds");
-        assert_eq!(polled, Some(body), "the in-flight poll still returns the real chunk it fetched");
+        let polled = poll_task
+            .await
+            .expect("poll task joins")
+            .expect("poll succeeds");
+        assert_eq!(
+            polled,
+            Some(body),
+            "the in-flight poll still returns the real chunk it fetched"
+        );
 
         // NOW the slot is genuinely free: a fresh request_stream succeeds.
         caps.request_stream(&second_req)
@@ -2379,15 +2725,21 @@ mod tests {
     /// answered with a small keep-nothing-open response — needed to open enough concurrent streams
     /// to actually reach [`MAX_OPEN_STREAMS`] in a test.
     async fn spawn_persistent_mock() -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
         tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
                 tokio::spawn(async move {
                     let mut buf = [0u8; 1024];
                     let _ = sock.read(&mut buf).await;
-                    let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                        .await;
                     let _ = sock.flush().await;
                 });
             }
@@ -2410,11 +2762,18 @@ mod tests {
         const SMALL_CAP: usize = 4;
         let url = spawn_persistent_mock().await;
         let caps = HttpCaps::with_max_open_streams(SMALL_CAP);
-        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let req = HttpRequest {
+            method: "GET".into(),
+            url,
+            ..Default::default()
+        };
 
         let mut handles = Vec::with_capacity(SMALL_CAP);
         for _ in 0..SMALL_CAP {
-            let opened = caps.request_stream(&req).await.expect("stream opens under the cap");
+            let opened = caps
+                .request_stream(&req)
+                .await
+                .expect("stream opens under the cap");
             handles.push(opened.handle);
         }
         assert_eq!(handles.len(), SMALL_CAP);
@@ -2428,14 +2787,18 @@ mod tests {
         // Close exactly one, freeing a slot — a fresh stream must now succeed again.
         let freed = handles.pop().expect("at least one handle to close");
         caps.close_stream(freed);
-        caps.request_stream(&req).await.expect("a stream opens again once a slot is freed by closing");
+        caps.request_stream(&req)
+            .await
+            .expect("a stream opens again once a slot is freed by closing");
     }
 
     /// A mock server that answers ONE connection with headers only and then holds the socket open
     /// forever, so a `poll_stream_chunk` against it is genuinely pending — with no data ever
     /// arriving, and therefore no timing dependence in the test that uses it.
     async fn spawn_quiet_mock() -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
         tokio::spawn(async move {
             if let Ok((mut sock, _)) = listener.accept().await {
@@ -2443,7 +2806,9 @@ mod tests {
                 let _ = sock.read(&mut buf).await;
                 // No Content-Length and no body: the response never completes, so the client's body
                 // stream stays open and quiet.
-                let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n").await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+                    .await;
                 let _ = sock.flush().await;
                 // Park forever holding the socket — a oneshot whose sender is dropped here would
                 // close it, so keep both halves alive in this frame.
@@ -2475,14 +2840,25 @@ mod tests {
         use futures::FutureExt;
 
         let caps = HttpCaps::with_max_open_streams(1);
-        let req =
-            HttpRequest { method: "GET".into(), url: spawn_quiet_mock().await, ..Default::default() };
-        let handle = caps.request_stream(&req).await.expect("first stream opens under the cap").handle;
+        let req = HttpRequest {
+            method: "GET".into(),
+            url: spawn_quiet_mock().await,
+            ..Default::default()
+        };
+        let handle = caps
+            .request_stream(&req)
+            .await
+            .expect("first stream opens under the cap")
+            .handle;
 
         // PRESENCE first: the cap really is 1 and really is held by this open stream, so the
         // release assertion below cannot pass vacuously.
         let second_url = spawn_persistent_mock().await;
-        let second_req = HttpRequest { method: "GET".into(), url: second_url, ..Default::default() };
+        let second_req = HttpRequest {
+            method: "GET".into(),
+            url: second_url,
+            ..Default::default()
+        };
         assert!(
             caps.request_stream(&second_req)
                 .await
@@ -2498,7 +2874,9 @@ mod tests {
 
         // The handle is terminal rather than stuck mid-poll...
         assert_eq!(
-            caps.poll_stream_chunk(handle).await.expect("a known handle is not an error"),
+            caps.poll_stream_chunk(handle)
+                .await
+                .expect("a known handle is not an error"),
             None,
             "a handle whose poll was dropped reads as EOF, not as an unknown handle"
         );
@@ -2521,10 +2899,20 @@ mod tests {
         let headers = format!("Content-Length: {}\r\n", MAX_RESPONSE_BODY_BYTES as u64 + 1);
         let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![b"short".to_vec()]).await;
         let caps = HttpCaps::new();
-        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
-        let err = caps.request(&req).await.expect_err("oversized Content-Length is rejected");
+        let req = HttpRequest {
+            method: "GET".into(),
+            url,
+            ..Default::default()
+        };
+        let err = caps
+            .request(&req)
+            .await
+            .expect_err("oversized Content-Length is rejected");
         assert!(err.contains("exceeds"), "got: {err}");
-        assert!(err.contains("Content-Length"), "the early, header-only path reports why: {err}");
+        assert!(
+            err.contains("Content-Length"),
+            "the early, header-only path reports why: {err}"
+        );
     }
 
     /// Same finding, the harder path: NO `Content-Length` header at all (real chunked/streamed
@@ -2536,7 +2924,11 @@ mod tests {
         let oversized = vec![b'x'; MAX_RESPONSE_BODY_BYTES + 4096];
         let url = spawn_mock("HTTP/1.1 200 OK", String::new(), vec![oversized]).await;
         let caps = HttpCaps::new();
-        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let req = HttpRequest {
+            method: "GET".into(),
+            url,
+            ..Default::default()
+        };
         let err = caps
             .request(&req)
             .await
@@ -2548,14 +2940,22 @@ mod tests {
     async fn a_transport_failure_is_an_err_not_a_panic() {
         let _serial = proxy_setting_guard().await;
         // Bind then immediately drop to get a refused-connection address (no server listening).
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
         drop(listener);
 
         let caps = HttpCaps::new();
-        let req =
-            HttpRequest { method: "GET".into(), url: format!("http://{addr}/nope"), ..Default::default() };
-        let err = caps.request(&req).await.expect_err("connection refused surfaces as Err");
+        let req = HttpRequest {
+            method: "GET".into(),
+            url: format!("http://{addr}/nope"),
+            ..Default::default()
+        };
+        let err = caps
+            .request(&req)
+            .await
+            .expect_err("connection refused surfaces as Err");
         assert!(!err.is_empty());
     }
 
@@ -2567,7 +2967,9 @@ mod tests {
     async fn request_falls_back_to_a_bounded_timeout_when_the_guest_gives_none() {
         let _serial = proxy_setting_guard().await;
         let caps = HttpCaps::with_request_timeout(Duration::from_millis(100));
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
         // Accept the connection but never write a response — genuinely hangs from the client's
         // perspective, exactly the stalled-server scenario the fallback ceiling exists for.
@@ -2583,9 +2985,15 @@ mod tests {
         };
 
         let started = tokio::time::Instant::now();
-        let err = caps.request(&req).await.expect_err("a stalled server with no timeout_ms still fails");
+        let err = caps
+            .request(&req)
+            .await
+            .expect_err("a stalled server with no timeout_ms still fails");
         let elapsed = started.elapsed();
-        assert!(err.contains("timed out"), "the error must identify itself as a timeout: {err}");
+        assert!(
+            err.contains("timed out"),
+            "the error must identify itself as a timeout: {err}"
+        );
         assert!(
             elapsed < Duration::from_secs(2),
             "the fallback timeout must fire — this must NEVER hang forever: got {elapsed:?}"
@@ -2605,7 +3013,9 @@ mod tests {
     async fn request_timeout_ms_zero_falls_back_to_the_bounded_timeout_not_an_instant_one() {
         let _serial = proxy_setting_guard().await;
         let caps = HttpCaps::with_request_timeout(Duration::from_millis(150));
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
         tokio::spawn(async move {
             if let Ok((_sock, _)) = listener.accept().await {
@@ -2625,7 +3035,10 @@ mod tests {
             .await
             .expect_err("a stalled server with timeout_ms:0 still fails eventually");
         let elapsed = started.elapsed();
-        assert!(err.contains("timed out"), "the error must identify itself as a timeout: {err}");
+        assert!(
+            err.contains("timed out"),
+            "the error must identify itself as a timeout: {err}"
+        );
         assert!(
             elapsed >= Duration::from_millis(100),
             "timeout_ms:0 must wait for the REAL fallback ceiling, not short-circuit to an instant \
@@ -2638,7 +3051,9 @@ mod tests {
     async fn request_stream_timeout_ms_zero_falls_back_to_the_bounded_timeout_not_an_instant_one() {
         let _serial = proxy_setting_guard().await;
         let caps = HttpCaps::with_request_timeout(Duration::from_millis(150));
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
         tokio::spawn(async move {
             if let Ok((_sock, _)) = listener.accept().await {
@@ -2658,7 +3073,10 @@ mod tests {
             .await
             .expect_err("a stalled server with timeout_ms:0 still fails eventually");
         let elapsed = started.elapsed();
-        assert!(err.contains("timed out"), "the error must identify itself as a timeout: {err}");
+        assert!(
+            err.contains("timed out"),
+            "the error must identify itself as a timeout: {err}"
+        );
         assert!(
             elapsed >= Duration::from_millis(100),
             "timeout_ms:0 must wait for the REAL fallback ceiling, not short-circuit to an instant \
@@ -2671,7 +3089,9 @@ mod tests {
     async fn request_stream_falls_back_to_a_bounded_timeout_when_the_guest_gives_none() {
         let _serial = proxy_setting_guard().await;
         let caps = HttpCaps::with_request_timeout(Duration::from_millis(100));
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
         tokio::spawn(async move {
             if let Ok((_sock, _)) = listener.accept().await {
@@ -2690,7 +3110,10 @@ mod tests {
             .await
             .expect_err("a stalled server with no timeout_ms still fails");
         let elapsed = started.elapsed();
-        assert!(err.contains("timed out"), "the error must identify itself as a timeout: {err}");
+        assert!(
+            err.contains("timed out"),
+            "the error must identify itself as a timeout: {err}"
+        );
         assert!(
             elapsed < Duration::from_secs(2),
             "the fallback timeout must fire — this must NEVER hang forever: got {elapsed:?}"
@@ -2707,13 +3130,17 @@ mod tests {
         idle_for: Duration,
         second: &'static [u8],
     ) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
         tokio::spawn(async move {
             if let Ok((mut sock, _)) = listener.accept().await {
                 let mut buf = [0u8; 1024];
                 let _ = sock.read(&mut buf).await;
-                let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n").await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+                    .await;
                 let _ = sock.write_all(first).await;
                 let _ = sock.flush().await;
                 tokio::time::sleep(idle_for).await;
@@ -2735,21 +3162,33 @@ mod tests {
         let _serial = proxy_setting_guard().await;
         let caps = HttpCaps::with_poll_idle_timeout(Duration::from_millis(80));
         let url = spawn_idle_then_chunk_mock(b"first", Duration::from_millis(400), b"second").await;
-        let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
+        let req = HttpRequest {
+            method: "GET".into(),
+            url,
+            ..Default::default()
+        };
         let resp = caps.request_stream(&req).await.expect("stream opens");
 
-        let first =
-            caps.poll_stream_chunk(resp.handle).await.expect("first chunk arrives immediately");
+        let first = caps
+            .poll_stream_chunk(resp.handle)
+            .await
+            .expect("first chunk arrives immediately");
         assert_eq!(first, Some(b"first".to_vec()));
 
         // The server goes silent for 400ms; the idle timeout is 80ms, so this poll must return
         // QUICKLY — bounding the real OS thread `block_in_place` would otherwise pin — rather than
         // blocking for the server's full silence.
         let started = tokio::time::Instant::now();
-        let err = caps.poll_stream_chunk(resp.handle).await.expect_err("an idle poll times out");
+        let err = caps
+            .poll_stream_chunk(resp.handle)
+            .await
+            .expect_err("an idle poll times out");
         let elapsed = started.elapsed();
-        assert!(err.contains("no chunk within"), "the error must identify itself as an idle timeout, \
-                 not a terminal failure: {err}");
+        assert!(
+            err.contains("no chunk within"),
+            "the error must identify itself as an idle timeout, \
+                 not a terminal failure: {err}"
+        );
         assert!(
             elapsed < Duration::from_millis(300),
             "the idle timeout must fire promptly, not block for the server's full silence: {elapsed:?}"

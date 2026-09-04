@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use cyrup_core::{
-    TerminateHint,CancelToken, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
+    CancelToken, TerminateHint, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink,
+};
 
 use crate::extension::executor::SubagentExecutor;
 

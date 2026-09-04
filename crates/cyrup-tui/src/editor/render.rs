@@ -12,7 +12,11 @@ impl InputEditor {
         // the reverse-video soft-cursor cell drawn in `render` (Pi `editor.ts:545-551`).
         let map = self.visual_line_map();
         let vi = self.current_visual_line(&map);
-        let vl = map.get(vi).copied().unwrap_or(VisualLine { logical: 0, start: 0, len: 0 });
+        let vl = map.get(vi).copied().unwrap_or(VisualLine {
+            logical: 0,
+            start: 0,
+            len: 0,
+        });
         let vcol = self.col.saturating_sub(vl.start);
         // The caret's COLUMN is the visible width of the text before it, not its char count. Pi never
         // does this arithmetic — it emits a zero-width `CURSOR_MARKER` *inside* the row string
@@ -74,7 +78,9 @@ pub(super) fn style_zones(
 ) -> [Option<(usize, usize, Style)>; 3] {
     let plain = [Some((0usize, seg_len, base)), None, None];
     // Only logical line 0 ever carries a command token.
-    let Some(tok) = token.filter(|_| vl.logical == 0) else { return plain };
+    let Some(tok) = token.filter(|_| vl.logical == 0) else {
+        return plain;
+    };
     let win_start = vl.start;
     let win_end = win_start.saturating_add(seg_len);
     let lo = tok.start.max(win_start);
@@ -115,8 +121,11 @@ pub(super) fn spans_for_segment(
         let end = start.saturating_add(len);
         match cursor.filter(|c| *c >= start && *c < end) {
             Some(c) => {
-                let before: String =
-                    seg.iter().skip(start).take(c.saturating_sub(start)).collect();
+                let before: String = seg
+                    .iter()
+                    .skip(start)
+                    .take(c.saturating_sub(start))
+                    .collect();
                 if !before.is_empty() {
                     spans.push(Span::styled(before, style));
                 }
@@ -323,9 +332,11 @@ impl Component for InputEditor {
         } else if cursor_vl >= self.scroll_offset.saturating_add(max_visible) {
             self.scroll_offset = cursor_vl.saturating_add(1).saturating_sub(max_visible);
         }
-        self.scroll_offset = self.scroll_offset.min(map.len().saturating_sub(max_visible));
+        self.scroll_offset = self
+            .scroll_offset
+            .min(map.len().saturating_sub(max_visible));
         let mut lines: Vec<Line> = Vec::with_capacity(max_visible);
-        let highlight = self.command_highlight();          // computed ONCE per frame
+        let highlight = self.command_highlight(); // computed ONCE per frame
         let accent = theme.accent_style();
         let dim = theme.dim_style();
         let last_vi = map.len().saturating_sub(1);
@@ -335,15 +346,27 @@ impl Component for InputEditor {
         // `area.width - 2 * pad` because the Block carries `Borders::TOP | BOTTOM` only — no side
         // border steals a column — and `Padding::horizontal(pad)` with `pad = effective_padding(...)`.
         let inner_w = usize::from(area.width.saturating_sub(pad.saturating_mul(2))).max(1);
-        for (vi, vl) in map.iter().enumerate().skip(self.scroll_offset).take(max_visible) {
+        for (vi, vl) in map
+            .iter()
+            .enumerate()
+            .skip(self.scroll_offset)
+            .take(max_visible)
+        {
             // The chars this visual line slices out of its logical line.
             let seg: Vec<char> = self
                 .lines
                 .get(vl.logical)
                 .map(|l| l.iter().skip(vl.start).take(vl.len).copied().collect())
                 .unwrap_or_default();
-            let zones = style_zones(vl, seg.len(), highlight.as_ref().map(|h| &h.token), base, accent);
-            let cursor = (vi == cursor_vl).then(|| self.col.saturating_sub(vl.start).min(seg.len()));
+            let zones = style_zones(
+                vl,
+                seg.len(),
+                highlight.as_ref().map(|h| &h.token),
+                base,
+                accent,
+            );
+            let cursor =
+                (vi == cursor_vl).then(|| self.col.saturating_sub(vl.start).min(seg.len()));
             let mut spans = spans_for_segment(&seg, &zones, cursor, cursor_style, base);
             // The ghost trails the buffer's LAST visual line, after the real content and AFTER the
             // caret cell. It is not buffer content, so it never joins the cursor split and the cursor
@@ -374,10 +397,20 @@ impl Component for InputEditor {
         // (both are exactly `width` columns).
         if self.scroll_offset > 0 && area.height >= 1 {
             let text = scroll_border('↑', self.scroll_offset, area.width);
-            let row = Rect { x: area.x, y: area.y, width: area.width, height: 1 };
-            frame.render_widget(Paragraph::new(Line::from(Span::styled(text, rule_style))), row);
+            let row = Rect {
+                x: area.x,
+                y: area.y,
+                width: area.width,
+                height: 1,
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(text, rule_style))),
+                row,
+            );
         }
-        let below = map.len().saturating_sub(self.scroll_offset.saturating_add(shown));
+        let below = map
+            .len()
+            .saturating_sub(self.scroll_offset.saturating_add(shown));
         if below > 0 && area.height >= 2 {
             let text = scroll_border('↓', below, area.width);
             let row = Rect {
@@ -386,7 +419,10 @@ impl Component for InputEditor {
                 width: area.width,
                 height: 1,
             };
-            frame.render_widget(Paragraph::new(Line::from(Span::styled(text, rule_style))), row);
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(text, rule_style))),
+                row,
+            );
         }
         // Pi hides the terminal's real cursor unless `showHardwareCursor` is on (`tui.ts:1659-1663`
         // `if (this.showHardwareCursor) showCursor() else hideCursor()`); ratatui's `Terminal::draw`

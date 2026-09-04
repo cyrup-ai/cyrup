@@ -20,7 +20,12 @@
 //! `mod wasm_ext` half DOES drive a real `wasm32-wasip2` component and moved to
 //! `crates/cyrup-it/tests/session_svc/install_noop.rs`; the small helpers the two halves shared
 //! (`write`, `Fx`, `fixture`) are duplicated across the split rather than exported.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -50,15 +55,24 @@ fn full_theme_json(name: &str) -> String {
         .iter()
         .map(|tok| format!("\"{tok}\":\"#000000\""))
         .collect();
-    format!("{{\"name\":\"{name}\",\"vars\":{{}},\"colors\":{{{}}}}}", parts.join(","))
+    format!(
+        "{{\"name\":\"{name}\",\"vars\":{{}},\"colors\":{{{}}}}}",
+        parts.join(",")
+    )
 }
 
 /// A package tree with one skill (`alpha`), one prompt (`greet`), one theme (`midnight`), and one
 /// declared extension dir (`extensions/deploy`) — mirrors cyrup-resources' own `make_package_tree`.
 fn make_package_tree(dir: &Path) {
-    write(&dir.join("skills/alpha/SKILL.md"), &skill_md("alpha", "alpha skill"));
+    write(
+        &dir.join("skills/alpha/SKILL.md"),
+        &skill_md("alpha", "alpha skill"),
+    );
     write(&dir.join("prompts/greet.md"), "Hello {{who}}");
-    write(&dir.join("themes/midnight.json"), &full_theme_json("midnight"));
+    write(
+        &dir.join("themes/midnight.json"),
+        &full_theme_json("midnight"),
+    );
     std::fs::create_dir_all(dir.join("extensions/deploy")).unwrap();
     write(
         &dir.join("cyrup.toml"),
@@ -83,7 +97,12 @@ fn fixture() -> Fx {
     let package_dir = agent_dir.join("packages");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fx { _tmp: tmp, cwd, agent_dir, package_dir }
+    Fx {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+        package_dir,
+    }
 }
 
 /// THE headline proof: a GLOBAL-scope package recorded by the real `install` path surfaces its
@@ -103,7 +122,9 @@ async fn installed_global_package_resources_load_in_assembled_session() {
     let store = PackageStore::new(fx.package_dir.clone(), Some(fx.cwd.clone()));
     let mgr = PackageManager::new(store);
     mgr.install(
-        PackageSource::Path { path: pkg_src.clone() },
+        PackageSource::Path {
+            path: pkg_src.clone(),
+        },
         InstallScope::Global,
         true,
         CancelToken::new(),
@@ -124,8 +145,14 @@ async fn installed_global_package_resources_load_in_assembled_session() {
         "installed package skill must load into the live session (found {} skills)",
         res.skills.len()
     );
-    assert!(res.prompts.contains("greet"), "installed package prompt must load into the live session");
-    assert!(res.themes.contains("midnight"), "installed package theme must load into the live session");
+    assert!(
+        res.prompts.contains("greet"),
+        "installed package prompt must load into the live session"
+    );
+    assert!(
+        res.themes.contains("midnight"),
+        "installed package theme must load into the live session"
+    );
     assert!(
         res.ext_crate_paths.iter().any(|p| p.ends_with("deploy")),
         "installed package's declared extension dir must be collected for the loader: {:?}",

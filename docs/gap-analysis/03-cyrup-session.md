@@ -306,7 +306,7 @@ audit, plus SESS-044 from the 2026-08-12 repair pass. `SESS-039` is burned and `
 | SESS-046 | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | **FILED AND CLOSED IN THE SAME PASS (sweep 2), and STRIKE the matching bullet from `## Coverage → Rejected, with reason`** — the entry reading "Sort-order divergence in computeFileLists … judged below the filing bar; **not confirmed unreachable**, so it is a candidate" is resolved: it was real. pi's `computeFileLists` sorts with a bare `Array.prototype.sort()`, which ECMA-262 defines as UTF-16 code-unit order; cyrup collected out of a `BTreeSet<String>`, i.e. UTF-8 byte order. These are DIFFERENT relations — UTF-16 encodes a supplementary-plane code point as a surrogate pair starting at 0xD800, below every code point in U+E000..=U+FFFF, while UTF-8 sorts it above — so a path with an emoji next to a path with a private-use / CJK-compatibility character lands in the opposite order. Not an internal detail: the lists are joined into the `<read-files>`/`<modified-files>` blocks that `format_file_operations` appends to every persisted compaction and branch summary, and that text is fed back into the next summarization prompt. Fixed with a documented `utf16_cmp` in `compaction/files.rs`. |
 | SESS-047 | ~~low~~ **CLOSED 2026-08-14** | cyrup-original | S | **FILED AND CLOSED IN THE SAME PASS (sweep 2), and STRIKE the matching bullet from `## Coverage → Rejected, with reason`** ("`compute_max_tokens_frac` applies a `.max(1)` floor pi does not have … Only reachable with `reserve_tokens == 0`. Not filed.") **and CORRECT its reachability claim**: it also fires at `reserve_tokens == 1` for both fractions (floor(0.8·1)=0, floor(0.5·1)=0), and `CompactionSettings.reserve_tokens` is a plain deserialized `u32` with no minimum, so a settings file reaches it. pi is `Math.min(Math.floor(frac * reserveTokens), maxTokens > 0 ? maxTokens : Infinity)` at compaction.ts:637-640 and :937-940, with no lower bound. Clamp removed. |
 | SESS-048 | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | **FILED AND CLOSED IN THE SAME PASS (sweep 2), found by the migrate.rs blind-spot walk.** `convert_first_kept_index` matched on `Value::as_u64`, so it returned EARLY for a NEGATIVE or FRACTIONAL index and left the dead v1 `firstKeptEntryIndex` key on the entry — which the migration rewrite then PERSISTED into the file. pi's guard is `typeof comp.firstKeptEntryIndex === "number"`, true for both shapes, and the `delete` inside it runs for every one of them (session-manager.ts:245-255). Second half of the same gap: `entries[comp.firstKeptEntryIndex]` is a JS property access, so the index is stringified — `String(2.0) === "2"` and pi RESOLVES a fractional-but-integral index to the same element, where cyrup resolved nothing. Now reads the value as `f64`, resolves only when non-negative and integral, and always strips the key. **CORRECTS THE SESS-015 RECORD:** the refuter's note that `convert_first_kept_index` is "behaviourally equivalent … for idx 0, out-of-range, forward-reference, negative and float indices" is right about the id assignment and WRONG about the field deletion for the negative and float cases. |
-| SESS-049 | medium | upstream-drift | S | **NEW 2026-09-04, from the `v0.84.1..v0.84.4` delta.** All three cyrup summarization call sites (`summarize.rs::generate_summary`, `::generate_turn_prefix_summary`, `branch.rs::generate_branch_summary_with_instructions`) still treat a token-cap (`StopReason::Length`) response, and one carrying a tool-call block, as a complete summary — matching pi v0.84.1, which this file's own comments cite. pi v0.84.2 added `getSummarizationFailure` (rejects `Length` too) and a toolCall check to all three of its matching functions; cyrup never picked it up. See the item. |
+| ~~SESS-049~~ | ~~medium~~ **CLOSED 2026-09-04** | upstream-drift | S | **NEW 2026-09-04, from the `v0.84.1..v0.84.4` delta.** All three cyrup summarization call sites (`summarize.rs::generate_summary`, `::generate_turn_prefix_summary`, `branch.rs::generate_branch_summary_with_instructions`) treated a token-cap (`StopReason::Length`) response, and one carrying a tool-call block, as a complete summary — matching pi v0.84.1. **CLOSED 2026-09-04 in `23abca0f`.** **Two corrections to the filing first:** (a) the change is first tagged at **v0.84.4**, not v0.84.2 — `git -C tmp/pi tag --contains 97fa14e39` ("fix(coding-agent): reject truncated compaction summaries closes #7048") lists only `v0.84.4`, and the CHANGELOG entry sits under `## [0.84.4] - 2026-08-28` (`packages/coding-agent/CHANGELOG.md:112`); (b) there were **four** cyrup sites, not three — the `/tree` op does not call cyrup-session's branch function but its own copy, `cyrup-session-svc/src/session/forking.rs::generate_branch_summary_with_instructions`, which carried the same `Stop \| Length \| ToolUse => Ok` arm. **Fix:** one pure gate, `cyrup_session::compaction::check_summarization_response(&resp, label) -> Result<(), CompactionError>` (`crates/cyrup-session/src/compaction/summarize.rs`, re-exported from `compaction/mod.rs`), ports pi's `getSummarizationFailure` (`v0.84.4 compaction.ts:541-553`: `error` OR `length` fails) plus the `content.some(toolCall)` check pi runs right after it at every site (`compaction.ts:715-721`, `:1000-1006`; `branch-summarization.ts:357-363`), keeping cyrup's stricter `Pending`/`Deferred` refusal and the `Aborted` mapping; all four sites now call it and the four hand-copied `match`es are gone. Messages: `Length` → `CompactionError::Summarization(INCOMPLETE_SUMMARY)` displaying as `summarization failed: generation hit the token cap and the summary is incomplete` (pi: `Summarization failed: generation hit the token cap and the summary is incomplete`); tool call → `summarization failed: {label} attempted to call a tool` with pi's per-site label. **Tests** (red-before, behaviourally — HEAD returned `SummaryOutput { text: "## Goal\nThe user wants to refactor the" }` for the `Length` stub): `cyrup-session/src/tests/compaction.rs` `a_token_capped_summarization_is_rejected_at_all_three_call_sites`, `a_summarization_that_emits_a_tool_call_is_rejected_at_all_three_call_sites`, `check_summarization_response_pins_pi_s_acceptance_rules` (also pins that a `toolUse` stop with no tool-call block is still accepted — pi tests the blocks, not the stop reason); `cyrup-session-svc/src/tests/round5.rs` `navigate_tree_refuses_a_token_capped_branch_summary` (the fourth site: `navigate_tree` returns `SessionServiceError::Compaction(Summarization(..))` and no `branch_summary` entry reaches the file). **Residual (cosmetic, below filing bar):** the `Length` message carries no per-site label because `CompactionError::Summarization`'s `Display` supplies the `summarization failed:` prefix, so the turn-prefix and branch sites read `summarization failed: generation hit …` where pi says `Turn prefix summarization failed: …`; the `error` arm keeps cyrup's existing empty-string fallback rather than pi's `"Unknown error"`. |
 | SESS-050 | low | not-ported | M | **NEW 2026-09-04, from the same delta.** pi v0.84.2 added the `session_compact_failed` extension event (fired from 5 call sites on a failed/cancelled compaction, manual and auto); cyrup ported the success sibling `session_compact` but has no counterpart for the failure event anywhere in `HostEvent` or its dispatch sites. See the item. |
 
 ## SESS-040 — Compaction cannot be cancelled from the shipped binary: the Escape rebind was never ported, `AbortCompaction` has zero callers, and the indicator advertises "(esc to cancel)"
@@ -852,6 +852,63 @@ the second copy was written.
 ## SESS-049 — All three summarization call sites treat a token-cap (`Length`) stop, and a tool-call block, as a valid finished summary; pi v0.84.2+ rejects both
 
 **Kind** upstream-drift · **Severity** medium · **Effort** S · **Confidence** high (both sides read; three cyrup call sites, three matching pi call sites)
+
+> **CLOSED 2026-09-04** in `23abca0f`. The port landed as ONE pure gate
+> rather than three (four — see below) edited `match`es: `cyrup_session::compaction::check_summarization_response`
+> (`crates/cyrup-session/src/compaction/summarize.rs`, re-exported from `compaction/mod.rs`) is pi
+> v0.84.4 `getSummarizationFailure` (`packages/coding-agent/src/core/compaction/compaction.ts:541-553`)
+> plus the `response.content.some(block => block.type === "toolCall")` check pi runs immediately after it
+> at every site (`compaction.ts:715-721`, `:1000-1006`; `branch-summarization.ts:357-363`), with cyrup's
+> pre-existing `Pending`/`Deferred` refusal and `Aborted` mapping folded in. Call sites at HEAD:
+> `summarize.rs::generate_summary` (`check_summarization_response(&resp, "Summarization")?`),
+> `summarize.rs::generate_turn_prefix_summary` (`"Turn prefix summarization"`),
+> `branch.rs::generate_branch_summary_with_instructions` (`"Branch summarization"`), and — a fourth
+> site this item did not name — `crates/cyrup-session-svc/src/session/forking.rs::generate_branch_summary_with_instructions`,
+> the copy `navigate_tree` actually runs for `/tree`, which carried the same
+> `Stop | Length | ToolUse => Ok` arm. `rg -n 'StopReason::Length' crates/cyrup-session/src/compaction crates/cyrup-session-svc/src/session/forking.rs crates/cyrup-session-svc/src/session/auto_compaction.rs`
+> now hits only the gate (`summarize.rs:62`, and its doc comment at `:29`) and the unrelated
+> auto-compaction retry predicate (`auto_compaction.rs:421`). Widening the second path to the whole
+> `crates/cyrup-session-svc/src/session` tree adds one more production hit, `run.rs:310` —
+> `on_assistant_message_end`'s overflow-recovery reset — which is not a summarization site, plus
+> test fixtures under `crates/cyrup-session/src/tests/` (`compaction.rs:3570`, `:3634`; `sessions.rs:514`).
+>
+> **Correction to the filing:** the upstream change is first tagged at **v0.84.4**, not v0.84.2.
+> `git -C tmp/pi log -S getSummarizationFailure -- packages/coding-agent/src/core/compaction/` gives one
+> commit, `97fa14e39` "fix(coding-agent): reject truncated compaction summaries closes #7048";
+> `git -C tmp/pi tag --contains 97fa14e39` lists `v0.84.4` only, `git grep -c getSummarizationFailure v0.84.2`
+> / `v0.84.3` are empty, and the CHANGELOG entry ("Fixed truncated compaction and branch summaries being
+> persisted when generation reaches its output token limit (#7048)") sits under `## [0.84.4] - 2026-08-28`
+> (`packages/coding-agent/CHANGELOG.md:112`). The `v0.84.1..v0.84.4` window claim, and everything else in
+> the item, stands.
+>
+> **Design decision (recorded in the code commit body):** Functional-core gate over the settled
+> response, `fn(&AssistantMessage, &str) -> Result<(), CompactionError>`, because the defect WAS the
+> duplication — four hand-copied matches that all kept the v0.84.1 shape. Rejected: (i) editing the two
+> arms into each of the four matches line-for-line (leaves the drift mechanism in place); (ii) a
+> `SummarizationLabel` enum for pi's string label (no invariant, only ceremony); (iii) new
+> `CompactionError` variants for `Incomplete`/`ToolCall` (pi models every refusal as one thrown `Error`
+> distinguished by text, every cyrup consumer treats `Summarization(_)` uniformly, and a new variant
+> would widen matches in cyrup-session-svc for no behavioural gain).
+>
+> **Tests** — red-before established behaviourally (the gate unit test was held aside for the red run so
+> the failure was HEAD's actual output, `SummaryOutput { text: "## Goal\nThe user wants to refactor the", .. }`,
+> not a missing symbol): `crates/cyrup-session/src/tests/compaction.rs`
+> `a_token_capped_summarization_is_rejected_at_all_three_call_sites`,
+> `a_summarization_that_emits_a_tool_call_is_rejected_at_all_three_call_sites` (pins pi's three per-site
+> labels), `check_summarization_response_pins_pi_s_acceptance_rules` (pins both pi texts through
+> `Display`, that a `toolUse` stop with NO tool-call block is still accepted — pi tests the content
+> blocks, never `stopReason` — and that the `error`/`aborted` arms are unchanged);
+> `crates/cyrup-session-svc/src/tests/round5.rs` `navigate_tree_refuses_a_token_capped_branch_summary`
+> (fourth site: `navigate_tree` returns `SessionServiceError::Compaction(Summarization(..))`, no
+> `branch_summary` entry and no partial text reach the exported JSONL).
+>
+> **Residual, cosmetic, below the filing bar:** `CompactionError::Summarization`'s `Display` is the fixed
+> `summarization failed: {0}`, so the `length` refusal reads `summarization failed: generation hit the token
+> cap and the summary is incomplete` at every site — byte-equal to pi (modulo case) for the compaction site,
+> but pi's turn-prefix/branch sites say `Turn prefix summarization failed: …` / `Branch summarization
+> failed: …`; the tool-call refusal DOES carry the label. The `error` arm keeps cyrup's existing
+> empty-string fallback where pi says `"Unknown error"`. SESS-050 (`session_compact_failed`) is the
+> consumer that would make these strings extension-visible and is unchanged by this item.
 
 > **New 2026-09-04, from the `v0.84.1..v0.84.4` delta this area's task scope names.** This area's own
 > baseline table (top of file) measured only `v0.83.0..v0.84.1`, over which `core/compaction/*` was

@@ -13,7 +13,12 @@
 //! `/prompt-workflow …` (`crates/cyrup-session-svc/src/session.rs:958`). A test that called
 //! `discover_prompt_workflows` directly would prove nothing that was not already true.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::path::Path;
 use std::sync::Arc;
@@ -21,8 +26,8 @@ use std::sync::Arc;
 use cyrup_core::CancelToken;
 use cyrup_ext::{ExtMode, ExtensionHost, HostConfig};
 use cyrup_ext_subagents::extension::SubagentsExtension;
-use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
+use cyrup_ext_subagents::spawn::SpawnCommand;
 
 // MIGRATION: the original `#[cfg(feature = "test-fixtures")]` here named
 // cyrup-ext-subagents' own bin-gating feature. In cyrup-it that spelling names THIS crate's
@@ -115,7 +120,10 @@ async fn prompt_workflow_list_names_every_bundled_recipe() {
 
     // pi `:275` — a BARE `/prompt-workflow` lists too, it does not error.
     let bare = slash(&host, "prompt-workflow", "").await;
-    assert_eq!(bare, output, "a bare invocation lists exactly as `list` does");
+    assert_eq!(
+        bare, output,
+        "a bare invocation lists exactly as `list` does"
+    );
 
     // pi `:308-310` — `/chain-prompts` with an empty declaration lists the same set.
     let chain_list = slash(&host, "chain-prompts", "").await;
@@ -172,7 +180,12 @@ async fn an_unknown_recipe_name_is_refused() {
 async fn chain_prompts_refuses_a_chain_containing_an_unknown_recipe() {
     let dir = tempfile::tempdir().unwrap();
     let host = host_at(dir.path(), None).await;
-    let output = slash(&host, "chain-prompts", "parallel-research -> no-such -- do it").await;
+    let output = slash(
+        &host,
+        "chain-prompts",
+        "parallel-research -> no-such -- do it",
+    )
+    .await;
     assert!(
         output.contains("Unknown prompt workflow: no-such"),
         "got: {output}"
@@ -193,7 +206,6 @@ async fn chain_prompts_refuses_a_chain_containing_an_unknown_recipe() {
 // is now a build-script postcondition. See this target's main.rs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_recipe_runs_through_a_real_child_process() {
-
     let dir = tempfile::tempdir().unwrap();
 
     // The persona the recipe names, discovered through the real project-scope pipeline.
@@ -235,7 +247,6 @@ async fn a_recipe_runs_through_a_real_child_process() {
     let host = host_at(dir.path(), Some(&script_path)).await;
     let output = slash(&host, "prompt-workflow", "fixture-flow the backlog").await;
 
-
     assert!(
         output.contains("RECIPE_CHILD_RAN"),
         "the recipe must have reached a real child process: {output}"
@@ -252,7 +263,6 @@ async fn a_recipe_runs_through_a_real_child_process() {
 // is now a build-script postcondition. See this target's main.rs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn chain_prompts_runs_every_recipe_as_one_native_chain() {
-
     let dir = tempfile::tempdir().unwrap();
     let agents = dir.path().join(".cyrup").join("agents");
     std::fs::create_dir_all(&agents).unwrap();
@@ -294,7 +304,6 @@ async fn chain_prompts_runs_every_recipe_as_one_native_chain() {
     // SAFETY: as above.
     let host = host_at(dir.path(), Some(&script_path)).await;
     let output = slash(&host, "chain-prompts", "flow-a -> flow-b -- the backlog").await;
-
 
     assert_eq!(
         output.matches("CHAINED_RECIPE_RAN").count(),

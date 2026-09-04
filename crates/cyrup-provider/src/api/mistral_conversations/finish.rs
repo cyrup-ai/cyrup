@@ -1,12 +1,12 @@
 //! Response decoding — usage folding, the prefix-cache accounting, the `finishReason` table
 //! and the terminal error (Pi mistral-conversations.ts:92-101,333-345,662-677).
 
+use super::decoder::Decoder;
 use crate::api::EventSink;
 use crate::model::Model;
 use crate::stream::StreamEvent;
 use cyrup_core::{ApiId, StopReason, Usage};
 use serde_json::Value;
-use super::decoder::Decoder;
 
 /// Apply Mistral `usage` (Pi mistral-conversations.ts:333-345).
 pub(super) fn apply_usage(usage: &mut Usage, raw: &Value) {

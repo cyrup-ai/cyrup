@@ -15,18 +15,21 @@
 //! The load-bearing assertion is `a_retried_compaction_appends_exactly_one_compaction_entry`: the
 //! session JSONL is append-only, so a retry that re-ran the append would be unrecoverable
 //! corruption.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::{AgentSessionEvent, BashOptions, NavigateTreeOptions, SessionBuilder, SessionConfig};
 use cyrup_core::StopReason;
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider, FauxResponseStep};
 use cyrup_provider::Provider;
-use crate::{
-    AgentSessionEvent, BashOptions, NavigateTreeOptions, SessionBuilder, SessionConfig,
-};
+use cyrup_provider::faux::{FauxProvider, FauxResponseStep, faux_assistant_message, faux_text};
 use futures::StreamExt;
 use tempfile::TempDir;
 
@@ -42,7 +45,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -61,8 +68,11 @@ fn retryable_compaction_settings() -> cyrup_config::Settings {
         serde_json::json!({"enabled": true, "keepRecentTokens": 0, "reserveTokens": 0}),
     )
     .unwrap();
-    cli.set_field("retry", serde_json::json!({"enabled": true, "maxRetries": 3, "baseDelayMs": 0}))
-        .unwrap();
+    cli.set_field(
+        "retry",
+        serde_json::json!({"enabled": true, "maxRetries": 3, "baseDelayMs": 0}),
+    )
+    .unwrap();
     cli
 }
 
@@ -121,11 +131,18 @@ async fn settle(seen: &Arc<Mutex<Vec<AgentSessionEvent>>>) {
         }
         tokio::task::yield_now().await;
     }
-    panic!("the event collector never went quiescent: {:?}", kinds(seen));
+    panic!(
+        "the event collector never went quiescent: {:?}",
+        kinds(seen)
+    );
 }
 
 fn kinds(seen: &Arc<Mutex<Vec<AgentSessionEvent>>>) -> Vec<String> {
-    seen.lock().unwrap().iter().map(|e| e.kind().to_string()).collect()
+    seen.lock()
+        .unwrap()
+        .iter()
+        .map(|e| e.kind().to_string())
+        .collect()
 }
 
 /// Build a two-turn session whose compaction summarization drops once and then succeeds.
@@ -169,7 +186,10 @@ async fn a_retried_compaction_appends_exactly_one_compaction_entry() {
     let seen = collect(&session);
 
     let before = session.entries_json().await.len();
-    let result = session.compact(None).await.expect("the drop is retried and the compaction lands");
+    let result = session
+        .compact(None)
+        .await
+        .expect("the drop is retried and the compaction lands");
     settle(&seen).await;
 
     // The SUCCEEDING attempt's text is what got stored — not the failed attempt's empty body.
@@ -199,13 +219,18 @@ async fn a_retried_compaction_appends_exactly_one_compaction_entry() {
         "exactly one terminal compaction_end, never one per attempt: {k:?}"
     );
     assert_eq!(
-        k.iter().filter(|s| *s == "summarization_retry_finished").count(),
+        k.iter()
+            .filter(|s| *s == "summarization_retry_finished")
+            .count(),
         1,
         "onRetryFinished fires exactly once per summarization loop (retry.ts:176/183/188): {k:?}"
     );
 
     // Re-read the persisted JSONL: the on-disk truth must agree with the in-memory tree.
-    let path = session.session_file().await.expect("a persisted session file");
+    let path = session
+        .session_file()
+        .await
+        .expect("a persisted session file");
     let compaction_lines = std::fs::read_to_string(&path)
         .expect("session file")
         .lines()
@@ -218,7 +243,8 @@ async fn a_retried_compaction_appends_exactly_one_compaction_entry() {
         })
         .count();
     assert_eq!(
-        compaction_lines, 1,
+        compaction_lines,
+        1,
         "exactly one `compaction` record on disk at {}",
         path.display()
     );
@@ -235,11 +261,18 @@ async fn a_dropped_summarization_emits_the_retry_events_in_pi_order() {
     let session = session_with_a_dropping_summarization(&fx).await;
     let seen = collect(&session);
 
-    session.compact(None).await.expect("compaction lands after the retry");
+    session
+        .compact(None)
+        .await
+        .expect("compaction lands after the retry");
     settle(&seen).await;
 
     let k = kinds(&seen);
-    let idx = |name: &str| k.iter().position(|s| s == name).unwrap_or_else(|| panic!("{name} missing from {k:?}"));
+    let idx = |name: &str| {
+        k.iter()
+            .position(|s| s == name)
+            .unwrap_or_else(|| panic!("{name} missing from {k:?}"))
+    };
     let (start, sched, attempt, fin, end) = (
         idx("compaction_start"),
         idx("summarization_retry_scheduled"),
@@ -264,11 +297,18 @@ async fn the_retry_events_serialize_to_pi_s_exact_shapes() {
     let session = session_with_a_dropping_summarization(&fx).await;
     let seen = collect(&session);
 
-    session.compact(None).await.expect("compaction lands after the retry");
+    session
+        .compact(None)
+        .await
+        .expect("compaction lands after the retry");
     settle(&seen).await;
 
-    let json: Vec<serde_json::Value> =
-        seen.lock().unwrap().iter().map(|e| serde_json::to_value(e).unwrap()).collect();
+    let json: Vec<serde_json::Value> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|e| serde_json::to_value(e).unwrap())
+        .collect();
     let of = |t: &str| {
         json.iter()
             .find(|v| v["type"] == t)
@@ -283,7 +323,11 @@ async fn the_retry_events_serialize_to_pi_s_exact_shapes() {
         serde_json::json!(3),
         "the settings budget (`retry.maxRetries`), NOT an invented bound"
     );
-    assert_eq!(sched["delayMs"], serde_json::json!(0), "baseDelayMs * 2^(attempt-1) = 0 * 1");
+    assert_eq!(
+        sched["delayMs"],
+        serde_json::json!(0),
+        "baseDelayMs * 2^(attempt-1) = 0 * 1"
+    );
     assert_eq!(
         sched["errorMessage"], "terminated",
         "the transient provider error verbatim, so the UI can show WHY it is retrying"
@@ -294,7 +338,10 @@ async fn the_retry_events_serialize_to_pi_s_exact_shapes() {
         attempt["source"], "compaction",
         "`source` is a SIBLING of `type` (Pi's discriminated union member), not a nested object"
     );
-    assert_eq!(attempt["reason"], "manual", "a manual /compact carries reason:\"manual\"");
+    assert_eq!(
+        attempt["reason"], "manual",
+        "a manual /compact carries reason:\"manual\""
+    );
 
     let fin = of("summarization_retry_finished");
     assert_eq!(
@@ -338,7 +385,10 @@ async fn a_first_try_success_emits_no_retry_events_at_all() {
         !k.iter().any(|s| s.starts_with("summarization_retry")),
         "a summarization that succeeds on its first attempt emits NO retry events: {k:?}"
     );
-    assert!(k.iter().any(|s| s == "compaction_end"), "…but the compaction still settled: {k:?}");
+    assert!(
+        k.iter().any(|s| s == "compaction_end"),
+        "…but the compaction still settled: {k:?}"
+    );
 }
 
 /// The retry is BOUNDED and the bound is observable: with a provider that never recovers, the
@@ -373,15 +423,22 @@ async fn an_unrecoverable_drop_stops_after_exactly_max_retries() {
         .expect_err("an unrecoverable summarization fails the compaction");
     settle(&seen).await;
 
-    assert!(err.to_string().contains("terminated"), "the final provider error surfaces: {err}");
+    assert!(
+        err.to_string().contains("terminated"),
+        "the final provider error surfaces: {err}"
+    );
     let k = kinds(&seen);
     assert_eq!(
-        k.iter().filter(|s| *s == "summarization_retry_scheduled").count(),
+        k.iter()
+            .filter(|s| *s == "summarization_retry_scheduled")
+            .count(),
         3,
         "exactly `retry.maxRetries` (3) retries scheduled, matching Pi's bound — not more: {k:?}"
     );
     assert_eq!(
-        k.iter().filter(|s| *s == "summarization_retry_finished").count(),
+        k.iter()
+            .filter(|s| *s == "summarization_retry_finished")
+            .count(),
         1,
         "one terminal event for the whole exhausted loop: {k:?}"
     );
@@ -440,13 +497,18 @@ async fn aborting_during_the_retry_backoff_returns_promptly() {
     });
     // Wait until the retry is provably armed (scheduled fires BEFORE the sleep), then abort.
     for _ in 0..200 {
-        if kinds(&seen).iter().any(|s| s == "summarization_retry_scheduled") {
+        if kinds(&seen)
+            .iter()
+            .any(|s| s == "summarization_retry_scheduled")
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert!(
-        kinds(&seen).iter().any(|s| s == "summarization_retry_scheduled"),
+        kinds(&seen)
+            .iter()
+            .any(|s| s == "summarization_retry_scheduled"),
         "the retry must be armed before we test cancelling it: {:?}",
         kinds(&seen)
     );
@@ -456,7 +518,10 @@ async fn aborting_during_the_retry_backoff_returns_promptly() {
         .await
         .expect("abort must cut through the 30s backoff sleep, not wait it out")
         .expect("join");
-    assert!(outcome.is_err(), "an aborted compaction is a refusal, not a result");
+    assert!(
+        outcome.is_err(),
+        "an aborted compaction is a refusal, not a result"
+    );
     settle(&seen).await;
     assert_eq!(
         session.entries_json().await.len(),
@@ -519,15 +584,21 @@ async fn a_dropped_branch_summarization_emits_retry_events_tagged_branch_summary
         .expect("the drop is retried and the branch summary still lands");
     settle(&seen).await;
 
-    let entry = outcome.summary_entry.expect("a branch summary entry was appended");
+    let entry = outcome
+        .summary_entry
+        .expect("a branch summary entry was appended");
     assert!(
         entry.summary.contains("BRANCH-BODY"),
         "the retried (succeeding) call is what lands: {}",
         entry.summary
     );
 
-    let json: Vec<serde_json::Value> =
-        seen.lock().unwrap().iter().map(|e| serde_json::to_value(e).unwrap()).collect();
+    let json: Vec<serde_json::Value> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|e| serde_json::to_value(e).unwrap())
+        .collect();
     let attempt = json
         .iter()
         .find(|v| v["type"] == "summarization_retry_attempt_start")
@@ -541,14 +612,20 @@ async fn a_dropped_branch_summarization_emits_retry_events_tagged_branch_summary
         "`reason` belongs to the compaction arm ONLY (agent-session.ts:173 vs :174-178): {attempt}"
     );
     assert_eq!(
-        json.iter().filter(|v| v["type"] == "summarization_retry_finished").count(),
+        json.iter()
+            .filter(|v| v["type"] == "summarization_retry_finished")
+            .count(),
         1,
         "one terminal event for the branch summarization loop"
     );
 
     // Same append-idempotency bar as compaction: exactly one branch_summary entry, not one per
     // attempt. `navigate_tree` also re-roots the leaf, so count the branch_summary records only.
-    let jsonl = session.export_to_jsonl(None).await.expect("export").expect("jsonl");
+    let jsonl = session
+        .export_to_jsonl(None)
+        .await
+        .expect("export")
+        .expect("jsonl");
     assert_eq!(
         jsonl.matches("branch_summary").count(),
         1,
@@ -598,8 +675,12 @@ async fn branch_with_summary_also_emits_the_retry_events() {
         summary.is_some_and(|s| s.contains("BRANCH-BODY")),
         "the retried call's body is what lands"
     );
-    let json: Vec<serde_json::Value> =
-        seen.lock().unwrap().iter().map(|e| serde_json::to_value(e).unwrap()).collect();
+    let json: Vec<serde_json::Value> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|e| serde_json::to_value(e).unwrap())
+        .collect();
     let attempt = json
         .iter()
         .find(|v| v["type"] == "summarization_retry_attempt_start")
@@ -626,14 +707,21 @@ async fn execute_bash_emits_bash_execution_update_even_with_no_chunk_sink() {
     let result = session
         .execute_bash(
             "printf 'alpha\\n'",
-            BashOptions { exclude_from_context: false, id: Some("rpc-7".to_string()), operations: None },
+            BashOptions {
+                exclude_from_context: false,
+                id: Some("rpc-7".to_string()),
+                operations: None,
+            },
             // No sink — exactly what `rpc.rs`'s `SessionCommand::Bash` arm passes.
             None,
         )
         .await
         .expect("bash runs");
     settle(&seen).await;
-    assert!(result.output.contains("alpha"), "sanity: the command produced output");
+    assert!(
+        result.output.contains("alpha"),
+        "sanity: the command produced output"
+    );
 
     let updates: Vec<serde_json::Value> = seen
         .lock()
@@ -642,9 +730,15 @@ async fn execute_bash_emits_bash_execution_update_even_with_no_chunk_sink() {
         .filter(|e| e.kind() == "bash_execution_update")
         .map(|e| serde_json::to_value(e).unwrap())
         .collect();
-    assert!(!updates.is_empty(), "at least one delta was emitted: {:?}", kinds(&seen));
     assert!(
-        updates.iter().any(|v| v["delta"].as_str().is_some_and(|d| d.contains("alpha"))),
+        !updates.is_empty(),
+        "at least one delta was emitted: {:?}",
+        kinds(&seen)
+    );
+    assert!(
+        updates
+            .iter()
+            .any(|v| v["delta"].as_str().is_some_and(|d| d.contains("alpha"))),
         "the deltas carry the real output: {updates:?}"
     );
     assert!(
@@ -668,7 +762,11 @@ async fn bash_execution_update_omits_id_when_the_caller_supplied_none() {
     session
         .execute_bash(
             "printf 'beta\\n'",
-            BashOptions { exclude_from_context: false, id: None, operations: None },
+            BashOptions {
+                exclude_from_context: false,
+                id: None,
+                operations: None,
+            },
             None,
         )
         .await
@@ -715,7 +813,11 @@ async fn immediate_bash_carries_the_agent_identity_markers() {
     let result = session
         .execute_bash(
             r#"printf '[%s][%s]\n' "${PI_CODING_AGENT-}" "${AI_AGENT-}""#,
-            BashOptions { exclude_from_context: false, id: None, operations: None },
+            BashOptions {
+                exclude_from_context: false,
+                id: None,
+                operations: None,
+            },
             None,
         )
         .await
@@ -747,10 +849,14 @@ fn the_forward_ported_ai_agent_marker_names_its_key_and_its_tag() {
     );
 
     let push = r#"env.push(("AI_AGENT".to_string(), "cyrup".to_string()));"#;
-    let at = src.find(push).expect("`AI_AGENT` is pushed into the immediate-bash child env");
+    let at = src
+        .find(push)
+        .expect("`AI_AGENT` is pushed into the immediate-bash child env");
     // The annotation is the comment block immediately above the push.
     let annotation = &src[..at];
-    let annotation = &annotation[annotation.rfind("[CYRUP-DELTA").expect("a delta annotation")..];
+    let annotation = &annotation[annotation
+        .rfind("[CYRUP-DELTA")
+        .expect("a delta annotation")..];
 
     assert!(
         annotation.contains("@v0.84.1"),

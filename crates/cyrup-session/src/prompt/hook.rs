@@ -65,12 +65,16 @@ pub struct BeforeAgentStartOutput {
 impl BeforeAgentStartOutput {
     /// A no-op result (leaves the prompt unchanged).
     pub fn keep() -> Self {
-        Self { system_prompt: None }
+        Self {
+            system_prompt: None,
+        }
     }
 
     /// Replace the prompt with `prompt`.
     pub fn replace(prompt: impl Into<String>) -> Self {
-        Self { system_prompt: Some(prompt.into()) }
+        Self {
+            system_prompt: Some(prompt.into()),
+        }
     }
 }
 

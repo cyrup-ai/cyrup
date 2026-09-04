@@ -39,7 +39,6 @@
 // letting warnings accumulate. This covers only what rustdoc visits by default: the private
 // `src/ctx/*` submodules need `cargo doc --document-private-items` (see `ctx`'s module doc).
 #![deny(rustdoc::broken_intra_doc_links, rustdoc::private_intra_doc_links)]
-
 // An undocumented public item draws no rustdoc warning at all, so without this lint the count grows
 // unobserved, which is how this crate accumulated its backlog. Unlike the two rustdoc lints above,
 // `missing_docs` is a RUSTC lint: `cargo check` enforces it over every module the compiler sees —
@@ -110,7 +109,8 @@ pub mod prelude {
     };
     pub use crate::ctx::{
         CommandCtx, Ctx, ExecResult, ExtMode, HttpRequest, HttpResponse, HttpStreamResponse,
-        Models, NotifyKind, ProcSpawnOptions, ReplacedSessionContext, Session, Signal, ToolCall, Ui,
+        Models, NotifyKind, ProcSpawnOptions, ReplacedSessionContext, Session, Signal, ToolCall,
+        Ui,
     };
     pub use crate::descriptor::{
         CommandDescriptor, CompactOptions, ConstrainedSampling, ConstrainedSamplingConfig,
@@ -124,13 +124,13 @@ pub mod prelude {
         StreamSimple,
     };
     pub use crate::tool_factory::define_tool;
-    pub use crate::widget::WidgetPlacement;
     /// The serialized widget tree a renderer returns (EXT-006). Exported as a MODULE, not flat
     /// names, so `widget::text(..)` reads at the call site and cannot collide with the `text`
     /// field/method names an extension author already has in scope. The crate root needs no
     /// `pub use` twin for this one: `pub mod widget;` already makes `cyrup_ext_sdk::widget`
     /// nameable there.
     pub use crate::widget;
+    pub use crate::widget::WidgetPlacement;
 }
 
 /// The factory the wasm guest `init` calls to build the extension (arch-08 §3.6). This crate ships

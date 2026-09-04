@@ -9,7 +9,10 @@ use serde_json::Value;
 /// Every arm that yields [`StopReason::Error`] must also yield a message: Pi surfaces it as
 /// `throw new Error(output.errorMessage || "An unknown error occurred")`
 /// (anthropic-messages.ts:755), so a `None` here silently degrades to that generic fallback.
-pub(super) fn map_stop_reason(reason: &str, stop_details: Option<&Value>) -> (StopReason, Option<String>) {
+pub(super) fn map_stop_reason(
+    reason: &str,
+    stop_details: Option<&Value>,
+) -> (StopReason, Option<String>) {
     match reason {
         "end_turn" => (StopReason::Stop, None),
         "max_tokens" => (StopReason::Length, None),

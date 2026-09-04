@@ -40,7 +40,7 @@
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use serde_json::{json, Map as JsonMap, Value};
+use serde_json::{Map as JsonMap, Value, json};
 
 use cyrup_core::{CancelToken, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
 
@@ -50,7 +50,7 @@ use crate::owner::McpRuntimeOwner;
 use crate::proxy::error_vocab::McpErrorCode;
 use crate::proxy::results::text_result;
 use crate::proxy::{
-    execute_call, ApprovalOrigin, InitPhase, McpTool, ProxyCtx, ProxyInitGate, INIT_WAIT_TIMEOUT_MS,
+    ApprovalOrigin, INIT_WAIT_TIMEOUT_MS, InitPhase, McpTool, ProxyCtx, ProxyInitGate, execute_call,
 };
 use crate::registration::{DirectToolSpec, McpToolDispatch};
 
@@ -108,14 +108,23 @@ impl McpDispatch {
     /// call through — the precise write the fence exists to refuse.
     async fn gate(&self) -> Gate {
         let Some(extension) = self.extension.upgrade() else {
-            return Gate { owner: None, outcome: GateOutcome::NotInitialized };
+            return Gate {
+                owner: None,
+                outcome: GateOutcome::NotInitialized,
+            };
         };
         let owner = extension.owner();
         if let Some(ctx) = extension.proxy_ctx() {
-            return Gate { owner, outcome: GateOutcome::Ready(ctx) };
+            return Gate {
+                owner,
+                outcome: GateOutcome::Ready(ctx),
+            };
         }
         let Some(task) = extension.init_task() else {
-            return Gate { owner, outcome: GateOutcome::NotInitialized };
+            return Gate {
+                owner,
+                outcome: GateOutcome::NotInitialized,
+            };
         };
         let waited = tokio::time::timeout(
             Duration::from_millis(INIT_WAIT_TIMEOUT_MS),
@@ -235,7 +244,10 @@ fn init_timeout_result() -> ToolResult {
         Value::String(McpErrorCode::InitTimeout.as_str().to_string()),
     );
     map.insert("timeoutMs".to_string(), json!(INIT_WAIT_TIMEOUT_MS));
-    text_result("MCP initialization is still in progress. Try again shortly.", map)
+    text_result(
+        "MCP initialization is still in progress. Try again shortly.",
+        map,
+    )
 }
 
 /// `index.ts:917` — the rejected-build envelope, reporting the message rather than throwing it.
@@ -320,7 +332,9 @@ impl McpToolDispatch for McpDispatch {
         // The generation fence — a call that outlived its generation aborts rather than writing
         // into a restarted session.
         if let Some(owner) = gate.owner.as_ref() {
-            owner.throw_if_inactive().map_err(|error| ToolError::new(error.to_string()))?;
+            owner
+                .throw_if_inactive()
+                .map_err(|error| ToolError::new(error.to_string()))?;
         }
 
         execute_call(
@@ -343,7 +357,11 @@ impl McpToolDispatch for McpDispatch {
             &spec.prefixed_name,
             // The provider always sends an object for a tool call; anything else carries no
             // arguments rather than an argument that is not a record.
-            if params.is_object() { Some(&params) } else { None },
+            if params.is_object() {
+                Some(&params)
+            } else {
+                None
+            },
             // The server hint that pins phases 1 and 3 and skips 2, 4 and 5.
             Some(&spec.server_name),
             &cancel,
@@ -367,12 +385,19 @@ impl McpToolDispatch for McpDispatch {
         cancel: CancelToken,
         on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
-        self.gateway_router().execute(call_id, params, cancel, on_update).await
+        self.gateway_router()
+            .execute(call_id, params, cancel, on_update)
+            .await
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 
@@ -430,7 +455,13 @@ mod tests {
         assert_eq!(error_code(&result).as_deref(), Some("not_initialized"));
         assert_eq!(text(&result), "MCP not initialized");
         // The three init envelopes carry no `mode` key.
-        assert!(result.details.as_ref().and_then(|d| d.get("mode")).is_none());
+        assert!(
+            result
+                .details
+                .as_ref()
+                .and_then(|d| d.get("mode"))
+                .is_none()
+        );
     }
 
     /// The gateway's answer is the same, and it comes from the same gate the nine modes sit behind.
@@ -480,7 +511,10 @@ mod tests {
             result.details.as_ref().and_then(|d| d.get("timeoutMs")),
             Some(&json!(INIT_WAIT_TIMEOUT_MS))
         );
-        assert_eq!(text(&result), "MCP initialization is still in progress. Try again shortly.");
+        assert_eq!(
+            text(&result),
+            "MCP initialization is still in progress. Try again shortly."
+        );
     }
 
     /// `init_failed` reports the rejection message in both the text and `details.message`.
@@ -492,6 +526,9 @@ mod tests {
             result.details.as_ref().and_then(|d| d.get("message")),
             Some(&json!("config parse failed"))
         );
-        assert_eq!(text(&result), "MCP initialization failed: config parse failed");
+        assert_eq!(
+            text(&result),
+            "MCP initialization failed: config parse failed"
+        );
     }
 }

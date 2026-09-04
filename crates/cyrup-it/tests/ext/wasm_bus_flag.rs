@@ -14,7 +14,12 @@
 //! Both drive the REAL production entry points (`load_wasm` + `run_command` + the two new host
 //! methods) against a live `wasm32-wasip2` COMPONENT — the assembled-product discipline the audit
 //! demands, not a hand-built stub.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use cyrup_core::CancelToken;
 use cyrup_ext::{DenyServices, ExtMode, ExtensionFlagOverride, ExtensionHost, HostConfig};
@@ -30,7 +35,11 @@ fn fixture_component() -> PathBuf {
 }
 
 fn cfg() -> HostConfig {
-    HostConfig { mode: ExtMode::Tui, has_ui: true, cwd: PathBuf::from(".") }
+    HostConfig {
+        mode: ExtMode::Tui,
+        has_ui: true,
+        cwd: PathBuf::from("."),
+    }
 }
 
 /// (A) The inter-extension event bus: emit from guest A reaches a subscribed handler in guest B.
@@ -42,26 +51,41 @@ async fn cross_extension_bus_emit_reaches_a_subscribed_handler() {
 
     // Two DISTINCT loaded extensions from the same component: A ("pub") and B ("sub"). Both declared
     // `bus.subscribe("demo:bus")` during their own `init` (the demo's `on_bus` handler).
-    let ext_a =
-        host.load_wasm("pub".into(), &bytes, Arc::new(DenyServices)).await.expect("load guest A");
-    let ext_b =
-        host.load_wasm("sub".into(), &bytes, Arc::new(DenyServices)).await.expect("load guest B");
+    let ext_a = host
+        .load_wasm("pub".into(), &bytes, Arc::new(DenyServices))
+        .await
+        .expect("load guest A");
+    let ext_b = host
+        .load_wasm("sub".into(), &bytes, Arc::new(DenyServices))
+        .await
+        .expect("load guest B");
 
     // Guest A emits `demo:bus` by running its `/buspub` command DIRECTLY on the A handle (bypassing
     // `run_command`'s tail drain) so we can observe the pre-delivery state — exactly the pre-fix
     // behavior where emit was the only thing that happened.
-    let out = ext_a.execute_command("buspub", "hello", &cancel).await.expect("buspub ran");
+    let out = ext_a
+        .execute_command("buspub", "hello", &cancel)
+        .await
+        .expect("buspub ran");
     assert_eq!(out.as_deref(), Some("emitted demo:bus: hello"));
 
     // The emit genuinely fired (recorded in guest A's own per-guest log) ...
     assert!(
-        ext_a.guest().bus_emits().iter().any(|(t, _)| t == "demo:bus"),
+        ext_a
+            .guest()
+            .bus_emits()
+            .iter()
+            .any(|(t, _)| t == "demo:bus"),
         "guest A actually emitted demo:bus"
     );
     // ... but WITHOUT the host fan-out step, guest B has received NOTHING — the dead-but-advertised
     // state: a published event reaches no subscriber (RED).
     assert!(
-        !ext_b.guest().notifications().iter().any(|n| n.contains("bus recv")),
+        !ext_b
+            .guest()
+            .notifications()
+            .iter()
+            .any(|n| n.contains("bus recv")),
         "RED: guest B must NOT have received the bus event before delivery, got {:?}",
         ext_b.guest().notifications()
     );
@@ -100,10 +124,14 @@ async fn run_command_auto_delivers_bus_events() {
     let host = ExtensionHost::with_wasm(cfg()).expect("host with wasm runtime");
     let cancel = CancelToken::new();
 
-    let ext_a =
-        host.load_wasm("pub".into(), &bytes, Arc::new(DenyServices)).await.expect("load guest A");
-    let ext_b =
-        host.load_wasm("sub".into(), &bytes, Arc::new(DenyServices)).await.expect("load guest B");
+    let ext_a = host
+        .load_wasm("pub".into(), &bytes, Arc::new(DenyServices))
+        .await
+        .expect("load guest A");
+    let ext_b = host
+        .load_wasm("sub".into(), &bytes, Arc::new(DenyServices))
+        .await
+        .expect("load guest B");
 
     // Pin the disambiguation itself before using it, so a regression that reinstates the old
     // last-registration-wins raw-name fallback fails HERE rather than silently making the drain
@@ -116,13 +144,19 @@ async fn run_command_auto_delivers_bus_events() {
     );
 
     // Production slash-command path: no explicit drain call.
-    let out = host.run_command("buspub:1", "ping", &cancel).await.expect("run_command buspub:1");
+    let out = host
+        .run_command("buspub:1", "ping", &cancel)
+        .await
+        .expect("run_command buspub:1");
     assert_eq!(out.as_deref(), Some("emitted demo:bus: ping"));
 
     // BOTH guests (all subscribers, Pi delivers to every listener incl. the emitter) received it.
     for (label, ext) in [("A", &ext_a), ("B", &ext_b)] {
         assert!(
-            ext.guest().notifications().iter().any(|n| n == "bus recv demo:bus: ping"),
+            ext.guest()
+                .notifications()
+                .iter()
+                .any(|n| n == "bus recv demo:bus: ping"),
             "guest {label} received the auto-delivered bus event, got {:?}",
             ext.guest().notifications()
         );
@@ -137,10 +171,15 @@ async fn get_flag_reflects_the_applied_cli_override() {
     let host = ExtensionHost::with_wasm(cfg()).expect("host with wasm runtime");
     let cancel = CancelToken::new();
 
-    host.load_wasm("flagger".into(), &bytes, Arc::new(DenyServices)).await.expect("load guest");
+    host.load_wasm("flagger".into(), &bytes, Arc::new(DenyServices))
+        .await
+        .expect("load guest");
 
     // RED: no override applied — the guest's getFlag reads the registered default "off".
-    let out = host.run_command("flagdemo", "", &cancel).await.expect("flagdemo ran");
+    let out = host
+        .run_command("flagdemo", "", &cancel)
+        .await
+        .expect("flagdemo ran");
     assert_eq!(
         out.as_deref(),
         Some("flag demo-flag = off"),
@@ -153,14 +192,24 @@ async fn get_flag_reflects_the_applied_cli_override() {
         ExtensionFlagOverride::Str("x".into()),
     )])
     .expect("apply ignores an unregistered flag");
-    let out = host.run_command("flagdemo", "", &cancel).await.expect("flagdemo ran");
-    assert_eq!(out.as_deref(), Some("flag demo-flag = off"), "an unregistered flag has no effect");
+    let out = host
+        .run_command("flagdemo", "", &cancel)
+        .await
+        .expect("flagdemo ran");
+    assert_eq!(
+        out.as_deref(),
+        Some("flag demo-flag = off"),
+        "an unregistered flag has no effect"
+    );
 
     // A bare `--demo-flag` (no value) on a STRING-typed flag is skipped (Pi's "requires a value"):
     // the registered default still stands.
     host.apply_extension_flag_values(&[("demo-flag".into(), ExtensionFlagOverride::Bool(true))])
         .expect("apply a bare bool on a string flag");
-    let out = host.run_command("flagdemo", "", &cancel).await.expect("flagdemo ran");
+    let out = host
+        .run_command("flagdemo", "", &cancel)
+        .await
+        .expect("flagdemo ran");
     assert_eq!(
         out.as_deref(),
         Some("flag demo-flag = off"),
@@ -168,9 +217,15 @@ async fn get_flag_reflects_the_applied_cli_override() {
     );
 
     // GREEN: `--demo-flag=on` overrides the default; the guest's getFlag now reads "on".
-    host.apply_extension_flag_values(&[("demo-flag".into(), ExtensionFlagOverride::Str("on".into()))])
-        .expect("apply the string override");
-    let out = host.run_command("flagdemo", "", &cancel).await.expect("flagdemo ran");
+    host.apply_extension_flag_values(&[(
+        "demo-flag".into(),
+        ExtensionFlagOverride::Str("on".into()),
+    )])
+    .expect("apply the string override");
+    let out = host
+        .run_command("flagdemo", "", &cancel)
+        .await
+        .expect("flagdemo ran");
     assert_eq!(
         out.as_deref(),
         Some("flag demo-flag = on"),

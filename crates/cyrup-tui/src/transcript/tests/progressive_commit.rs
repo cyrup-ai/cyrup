@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use crate::transcript::*;
 
@@ -23,7 +28,10 @@ fn finished_tools_commit_progressively_and_content_height_stays_bounded() {
         // Simulate 20 finished tool calls arriving one at a time (the reported storm).
         for i in 0..20u32 {
             let name = format!("read_{i}");
-            view.push_tool_start(name.clone(), serde_json::json!({ "path": format!("file_{i}.md") }));
+            view.push_tool_start(
+                name.clone(),
+                serde_json::json!({ "path": format!("file_{i}.md") }),
+            );
             view.push_tool_end(
                 name,
                 false,
@@ -35,10 +43,21 @@ fn finished_tools_commit_progressively_and_content_height_stays_bounded() {
         view.content_height(80, &theme)
     };
     // All 20 committed to `pending` (headed for native scrollback), none left live.
-    assert_eq!(view.active_tools().len(), 0, "finished tools must not accumulate live");
-    assert_eq!(tool_names(view.pending()).len(), 20, "all finished tools should be committed");
+    assert_eq!(
+        view.active_tools().len(),
+        0,
+        "finished tools must not accumulate live"
+    );
+    assert_eq!(
+        tool_names(view.pending()).len(),
+        20,
+        "all finished tools should be committed"
+    );
     // The live region measured near-empty (no tail): bounded, not full-screen.
-    assert!(tall_before <= 1, "content_height ballooned to {tall_before}; must stay bounded");
+    assert!(
+        tall_before <= 1,
+        "content_height ballooned to {tall_before}; must stay bounded"
+    );
     // Commit order equals call order in scrollback.
     assert_eq!(tool_names(view.pending()).first().copied(), Some("read_0"));
     assert_eq!(tool_names(view.pending()).last().copied(), Some("read_19"));
@@ -55,13 +74,24 @@ fn only_leading_finished_run_commits_running_tool_blocks() {
     // `b` finishes first, but `a` is still running ahead of it.
     view.push_tool_end("b", false, Some("b-result".into()));
     view.commit_finished_leading_tools();
-    assert!(view.pending().is_empty(), "nothing commits while the leading tool `a` runs");
-    assert_eq!(view.active_tools().len(), 3, "all three stay live until `a` finishes");
+    assert!(
+        view.pending().is_empty(),
+        "nothing commits while the leading tool `a` runs"
+    );
+    assert_eq!(
+        view.active_tools().len(),
+        3,
+        "all three stay live until `a` finishes"
+    );
 
     // `a` finishes → the leading run `a`, `b` commits (in order), `c` stays live.
     view.push_tool_end("a", false, Some("a-result".into()));
     view.commit_finished_leading_tools();
-    assert_eq!(tool_names(view.pending()), vec!["a", "b"], "leading finished run commits in order");
+    assert_eq!(
+        tool_names(view.pending()),
+        vec!["a", "b"],
+        "leading finished run commits in order"
+    );
     assert_eq!(view.active_tools().len(), 1, "still-running `c` stays live");
     assert_eq!(view.active_tools()[0].name, "c");
 }
@@ -75,8 +105,15 @@ fn streaming_partial_blocks_tool_commit() {
     view.push_tool_start("read", Value::Null);
     view.push_tool_end("read", false, Some("result".into()));
     view.commit_finished_leading_tools();
-    assert!(view.pending().is_empty(), "tool must not commit while assistant text is streaming");
-    assert_eq!(view.active_tools().len(), 1, "the finished tool stays live behind the stream");
+    assert!(
+        view.pending().is_empty(),
+        "tool must not commit while assistant text is streaming"
+    );
+    assert_eq!(
+        view.active_tools().len(),
+        1,
+        "the finished tool stays live behind the stream"
+    );
 
     // Once the assistant text commits (streaming cleared), the tool is free to commit after it.
     view.commit_assistant(None);
@@ -85,5 +122,9 @@ fn streaming_partial_blocks_tool_commit() {
         matches!(view.pending().first(), Some(Entry::Assistant(_))),
         "assistant text commits before the tool row"
     );
-    assert_eq!(tool_names(view.pending()), vec!["read"], "the tool commits after the stream");
+    assert_eq!(
+        tool_names(view.pending()),
+        vec!["read"],
+        "the tool commits after the stream"
+    );
 }

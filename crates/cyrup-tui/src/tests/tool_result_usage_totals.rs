@@ -15,12 +15,17 @@
 //!
 //! Note the deliberate asymmetry, which these tests pin: upstream writes `latestCacheHitRate`
 //! ONLY inside the assistant branch, so a `toolResult` must not restate the footer's `CH` segment.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
+use crate::{App, UiTheme};
 use cyrup_agent::{AgentMessage, ToolResultMessage};
 use cyrup_core::{Content, ToolCallId, Usage};
 use cyrup_session_svc::AgentSessionEvent;
-use crate::{App, UiTheme};
 use ratatui::backend::TestBackend;
 
 fn new_app() -> App<TestBackend> {
@@ -53,7 +58,9 @@ fn tool_result(usage: Option<Usage>) -> AgentMessage {
 #[test]
 fn a_tool_result_usage_joins_the_cumulative_footer_totals() {
     let mut app = new_app();
-    app.ingest_event(&AgentSessionEvent::MessageEnd { message: tool_result(Some(usage(30, 7, 5))) });
+    app.ingest_event(&AgentSessionEvent::MessageEnd {
+        message: tool_result(Some(usage(30, 7, 5))),
+    });
 
     let u = &app.state().status.usage;
     assert_eq!(u.input, 30, "tool input tokens counted");
@@ -65,8 +72,12 @@ fn a_tool_result_usage_joins_the_cumulative_footer_totals() {
 #[test]
 fn tool_results_accumulate_across_calls() {
     let mut app = new_app();
-    app.ingest_event(&AgentSessionEvent::MessageEnd { message: tool_result(Some(usage(10, 1, 0))) });
-    app.ingest_event(&AgentSessionEvent::MessageEnd { message: tool_result(Some(usage(20, 2, 0))) });
+    app.ingest_event(&AgentSessionEvent::MessageEnd {
+        message: tool_result(Some(usage(10, 1, 0))),
+    });
+    app.ingest_event(&AgentSessionEvent::MessageEnd {
+        message: tool_result(Some(usage(20, 2, 0))),
+    });
     assert_eq!(app.state().status.usage.input, 30);
     assert_eq!(app.state().status.usage.output, 3);
 }
@@ -74,8 +85,14 @@ fn tool_results_accumulate_across_calls() {
 #[test]
 fn a_tool_result_without_usage_changes_nothing() {
     let mut app = new_app();
-    app.ingest_event(&AgentSessionEvent::MessageEnd { message: tool_result(None) });
-    assert_eq!(app.state().status.usage, Usage::default(), "absent usage adds nothing");
+    app.ingest_event(&AgentSessionEvent::MessageEnd {
+        message: tool_result(None),
+    });
+    assert_eq!(
+        app.state().status.usage,
+        Usage::default(),
+        "absent usage adds nothing"
+    );
 }
 
 /// Upstream sets `latestCacheHitRate` only in the ASSISTANT branch. A tool result must leave the
@@ -87,9 +104,15 @@ fn a_tool_result_does_not_restate_the_latest_cache_hit_rate() {
     // An assistant turn establishes the reading: 25 cache-read out of a 100-token prompt.
     app.status_mut().add_usage(&usage(75, 4, 25));
     let established = app.state().status.latest_cache_hit;
-    assert_eq!(established, Some(25.0), "the assistant turn set the CH reading");
+    assert_eq!(
+        established,
+        Some(25.0),
+        "the assistant turn set the CH reading"
+    );
 
-    app.ingest_event(&AgentSessionEvent::MessageEnd { message: tool_result(Some(usage(0, 9, 0))) });
+    app.ingest_event(&AgentSessionEvent::MessageEnd {
+        message: tool_result(Some(usage(0, 9, 0))),
+    });
 
     assert_eq!(
         app.state().status.latest_cache_hit,

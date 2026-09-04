@@ -35,9 +35,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::AppMode;
-use crate::provider::{
-    mode_refreshes_catalogs, spawn_model_catalog_refresh_with,
-};
+use crate::provider::{mode_refreshes_catalogs, spawn_model_catalog_refresh_with};
 use cyrup_config::policy::NetworkPolicy;
 use cyrup_provider::auth::AuthContext;
 use cyrup_provider::models_store::{InMemoryModelsStore, ModelsStore};
@@ -71,7 +69,9 @@ impl MockOrigin {
                 // 404 is Pi's "this provider has no remote catalog" branch: it clears the overlay
                 // and is explicitly NOT an error, so the task always completes cleanly.
                 let _ = sock
-                    .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    )
                     .await;
                 let _ = sock.flush().await;
             }
@@ -244,6 +244,37 @@ async fn update_models_forces_a_fetch_for_every_configured_provider() {
         origin.accept_count(),
         3,
         "`cyrup update --models` must bypass the 4h window (RefreshOptions::forced)"
+    );
+}
+
+/// PROV-014 — `radius` is never fetched from pi.dev (`model-runtime.ts:183-189` @v0.84.4:
+/// `provider.id === "radius" ? provider : withRemoteCatalog(…)`): a configured radius alongside a
+/// configured groq issues exactly ONE request, and a lone radius issues none.
+#[tokio::test]
+async fn update_models_never_fetches_radius_from_pi_dev() {
+    let origin = MockOrigin::spawn().await;
+    let catalog = catalog(&origin.base_url);
+
+    crate::provider::refresh_model_catalogs_with(
+        catalog.clone(),
+        vec!["radius".to_string(), "groq".to_string()],
+    )
+    .await
+    .expect("radius is skipped, groq's 404 is pi's no-remote-catalog branch");
+    assert_eq!(origin.accept_count(), 1, "only groq reaches pi.dev");
+
+    crate::provider::refresh_model_catalogs_with(catalog, vec!["radius".to_string()])
+        .await
+        .expect("a radius-only set is a successful no-op");
+    assert_eq!(origin.accept_count(), 1, "radius alone issues no request");
+
+    assert_eq!(
+        crate::provider::pi_dev_catalog_providers(&[
+            "radius".to_string(),
+            "openai".to_string(),
+            "radius".to_string()
+        ]),
+        vec!["openai".to_string()]
     );
 }
 

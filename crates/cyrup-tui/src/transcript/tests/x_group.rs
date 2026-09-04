@@ -95,7 +95,9 @@ fn x6_expanded_read_of_a_rust_file_is_highlighted() {
     // the first line.
     let decl = row(&lines, "fn main");
     assert!(
-        decl.spans.iter().any(|s| s.style == theme.syntax_style_for_scope("keyword").unwrap()),
+        decl.spans
+            .iter()
+            .any(|s| s.style == theme.syntax_style_for_scope("keyword").unwrap()),
         "`fn` takes the syntaxKeyword role:\n{}",
         joined(&lines)
     );
@@ -144,7 +146,11 @@ fn x6_tabs_are_replaced_with_three_spaces() {
         false,
         ImageOpts::default(),
     );
-    assert!(joined(&w).contains("a   b"), "write preview too:\n{}", joined(&w));
+    assert!(
+        joined(&w).contains("a   b"),
+        "write preview too:\n{}",
+        joined(&w)
+    );
 }
 
 // --- X7 -------------------------------------------------------------------------------------
@@ -157,8 +163,17 @@ fn x6_tabs_are_replaced_with_three_spaces() {
 fn x7_collapsed_read_of_a_skill_md_uses_the_compact_header() {
     let theme = UiTheme::dark();
     let cwd = std::path::Path::new("/home/u/.cyrup");
-    let opts = ImageOpts { cwd: Some(cwd), ..ImageOpts::default() };
-    let lines = run_lines("read", json!({ "path": "skills/commit-helper/SKILL.md" }), None, false, opts);
+    let opts = ImageOpts {
+        cwd: Some(cwd),
+        ..ImageOpts::default()
+    };
+    let lines = run_lines(
+        "read",
+        json!({ "path": "skills/commit-helper/SKILL.md" }),
+        None,
+        false,
+        opts,
+    );
     let header = row(&lines, "[skill]");
     assert_eq!(
         txt(header).trim_end(),
@@ -175,11 +190,21 @@ fn x7_collapsed_read_of_a_skill_md_uses_the_compact_header() {
         theme.custom_message_text_style(),
         "`theme.fg(\"customMessageText\", label)` (read.ts:154)"
     );
-    assert!(!joined(&lines).contains("SKILL.md"), "the raw path is gone:\n{}", joined(&lines));
+    assert!(
+        !joined(&lines).contains("SKILL.md"),
+        "the raw path is gone:\n{}",
+        joined(&lines)
+    );
 
     // MIRROR 1: EXPANDING the same read falls back to the plain `read <path>` header —
     // `!context.expanded ? getCompactReadClassification(...) : undefined` (read.ts:336).
-    let expanded = run_lines("read", json!({ "path": "skills/commit-helper/SKILL.md" }), None, true, opts);
+    let expanded = run_lines(
+        "read",
+        json!({ "path": "skills/commit-helper/SKILL.md" }),
+        None,
+        true,
+        opts,
+    );
     assert!(
         joined(&expanded).contains("read skills/commit-helper/SKILL.md"),
         "expanded ⇒ plain header:\n{}",
@@ -189,8 +214,15 @@ fn x7_collapsed_read_of_a_skill_md_uses_the_compact_header() {
 
     // MIRROR 2: an ordinary source file classifies as nothing and keeps the plain header.
     let plain = run_lines("read", json!({ "path": "src/main.rs" }), None, false, opts);
-    assert!(joined(&plain).contains("read src/main.rs"), "{}", joined(&plain));
-    assert!(!joined(&plain).contains("to expand"), "no compact hint on a plain read");
+    assert!(
+        joined(&plain).contains("read src/main.rs"),
+        "{}",
+        joined(&plain)
+    );
+    assert!(
+        !joined(&plain).contains("to expand"),
+        "no compact hint on a plain read"
+    );
 }
 
 /// **X7 — `AGENTS.md`/`CLAUDE.md` classify as `resource`, labelled relative to the cwd.**
@@ -201,17 +233,47 @@ fn x7_collapsed_read_of_a_skill_md_uses_the_compact_header() {
 fn x7_agents_md_is_a_compact_resource_read() {
     let theme = UiTheme::dark();
     let cwd = std::path::Path::new("/w/project");
-    let opts = ImageOpts { cwd: Some(cwd), ..ImageOpts::default() };
-    let lines = run_lines("read", json!({ "path": "docs/AGENTS.md" }), None, false, opts);
+    let opts = ImageOpts {
+        cwd: Some(cwd),
+        ..ImageOpts::default()
+    };
+    let lines = run_lines(
+        "read",
+        json!({ "path": "docs/AGENTS.md" }),
+        None,
+        false,
+        opts,
+    );
     let header = row(&lines, "read resource");
-    assert_eq!(txt(header).trim_end(), " read resource docs/AGENTS.md (ctrl+o to expand)");
+    assert_eq!(
+        txt(header).trim_end(),
+        " read resource docs/AGENTS.md (ctrl+o to expand)"
+    );
     assert_eq!(header.spans[1].style, theme.tool_title_style());
-    assert_eq!(header.spans[3].style, theme.accent_style(), "`fg(\"accent\", label)`");
+    assert_eq!(
+        header.spans[3].style,
+        theme.accent_style(),
+        "`fg(\"accent\", label)`"
+    );
 
     // MIRROR: the set is matched case-sensitively on the BASENAME, so `agents.md` is not in it.
-    let lower = run_lines("read", json!({ "path": "docs/agents.md" }), None, false, opts);
-    assert!(!joined(&lower).contains("read resource"), "{}", joined(&lower));
-    assert!(joined(&lower).contains("read docs/agents.md"), "{}", joined(&lower));
+    let lower = run_lines(
+        "read",
+        json!({ "path": "docs/agents.md" }),
+        None,
+        false,
+        opts,
+    );
+    assert!(
+        !joined(&lower).contains("read resource"),
+        "{}",
+        joined(&lower)
+    );
+    assert!(
+        joined(&lower).contains("read docs/agents.md"),
+        "{}",
+        joined(&lower)
+    );
 }
 
 /// **X7b — a read under the SHIPPED asset root is a `docs` read, not a resource read.**
@@ -223,14 +285,26 @@ fn x7b_reads_under_the_asset_root_classify_as_docs() {
     // Tier 3: in a test binary this is the workspace root.
     let root = cyrup_config::asset_dir().expect("asset_dir resolves in a test binary");
     // A cwd deliberately OUTSIDE the asset root, so nothing here can pass by cwd-relative accident.
-    let opts = ImageOpts { cwd: Some(std::path::Path::new("/w/project")), ..ImageOpts::default() };
+    let opts = ImageOpts {
+        cwd: Some(std::path::Path::new("/w/project")),
+        ..ImageOpts::default()
+    };
     let read = |p: std::path::PathBuf| {
-        run_lines("read", json!({ "path": p.to_string_lossy() }), None, false, opts)
+        run_lines(
+            "read",
+            json!({ "path": p.to_string_lossy() }),
+            None,
+            false,
+            opts,
+        )
     };
 
     // `label === "README.md"` (`:117`).
     let lines = read(root.join("README.md"));
-    assert_eq!(txt(row(&lines, "read docs")).trim_end(), " read docs README.md (ctrl+o to expand)");
+    assert_eq!(
+        txt(row(&lines, "read docs")).trim_end(),
+        " read docs README.md (ctrl+o to expand)"
+    );
 
     // `label.startsWith("docs/")` — a nested path keeps its posix-joined relative label.
     let lines = read(root.join("docs/guide/x.md"));
@@ -246,11 +320,18 @@ fn x7b_reads_under_the_asset_root_classify_as_docs() {
         txt(row(&lines, "read docs")).trim_end(),
         " read docs docs/AGENTS.md (ctrl+o to expand)"
     );
-    assert!(!joined(&lines).contains("read resource"), "{}", joined(&lines));
+    assert!(
+        !joined(&lines).contains("read resource"),
+        "{}",
+        joined(&lines)
+    );
 
     // `resolveToCwd` normalizes lexically, so `docs/../docs/x.md` is the same read as `docs/x.md`.
     let lines = read(root.join("docs/../docs/x.md"));
-    assert_eq!(txt(row(&lines, "read docs")).trim_end(), " read docs docs/x.md (ctrl+o to expand)");
+    assert_eq!(
+        txt(row(&lines, "read docs")).trim_end(),
+        " read docs docs/x.md (ctrl+o to expand)"
+    );
 }
 
 /// **X7c — the `docs/` guard requires the separator, and a non-docs sibling is not a docs read.**
@@ -260,14 +341,32 @@ fn x7b_reads_under_the_asset_root_classify_as_docs() {
 #[test]
 fn x7c_the_docs_guard_needs_the_separator() {
     let root = cyrup_config::asset_dir().expect("asset_dir resolves in a test binary");
-    let opts = ImageOpts { cwd: Some(std::path::Path::new("/w/project")), ..ImageOpts::default() };
+    let opts = ImageOpts {
+        cwd: Some(std::path::Path::new("/w/project")),
+        ..ImageOpts::default()
+    };
     for path in [root.join("docs"), root.join("CHANGELOG.md")] {
-        let lines = run_lines("read", json!({ "path": path.to_string_lossy() }), None, false, opts);
+        let lines = run_lines(
+            "read",
+            json!({ "path": path.to_string_lossy() }),
+            None,
+            false,
+            opts,
+        );
         let out = joined(&lines);
-        assert!(!out.contains("read docs "), "generic header expected:\n{out}");
-        assert!(!out.contains("read resource"), "generic header expected:\n{out}");
+        assert!(
+            !out.contains("read docs "),
+            "generic header expected:\n{out}"
+        );
+        assert!(
+            !out.contains("read resource"),
+            "generic header expected:\n{out}"
+        );
         // A generic (non-compact) read carries no expand hint — `x_group.rs` MIRROR 2.
-        assert!(!out.contains("to expand"), "generic header expected:\n{out}");
+        assert!(
+            !out.contains("to expand"),
+            "generic header expected:\n{out}"
+        );
     }
 }
 
@@ -279,14 +378,20 @@ fn x7c_the_docs_guard_needs_the_separator() {
 #[test]
 fn x7d_a_resource_read_outside_the_cwd_keeps_one_leading_slash() {
     let cwd = std::path::Path::new("/w/project");
-    let opts = ImageOpts { cwd: Some(cwd), ..ImageOpts::default() };
+    let opts = ImageOpts {
+        cwd: Some(cwd),
+        ..ImageOpts::default()
+    };
     let header = |raw: &str| {
         let lines = run_lines("read", json!({ "path": raw }), None, false, opts);
         txt(row(&lines, "read resource")).trim_end().to_string()
     };
 
     // A plain absolute path outside the cwd.
-    assert_eq!(header("/etc/cyrup/AGENTS.md"), " read resource /etc/cyrup/AGENTS.md (ctrl+o to expand)");
+    assert_eq!(
+        header("/etc/cyrup/AGENTS.md"),
+        " read resource /etc/cyrup/AGENTS.md (ctrl+o to expand)"
+    );
 
     // A `file://` URL — resolved by `resolve_to_cwd`, so it too takes the fallback.
     assert_eq!(
@@ -297,9 +402,17 @@ fn x7d_a_resource_read_outside_the_cwd_keeps_one_leading_slash() {
     // A `~`-expanded path. The home dir is environment-dependent, so derive the expectation from
     // the same resolver the renderer uses and assert the LABEL SHAPE explicitly.
     let expected = cyrup_tools::path::resolve_to_cwd("~/.cyrup/AGENTS.md", cwd);
-    let expected = expected.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
-    assert_eq!(header("~/.cyrup/AGENTS.md"), format!(" read resource {expected} (ctrl+o to expand)"));
-    assert!(!expected.contains("//"), "sanity: the fixture itself must not be doubled");
+    let expected = expected
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    assert_eq!(
+        header("~/.cyrup/AGENTS.md"),
+        format!(" read resource {expected} (ctrl+o to expand)")
+    );
+    assert!(
+        !expected.contains("//"),
+        "sanity: the fixture itself must not be doubled"
+    );
     assert!(
         !header("~/.cyrup/AGENTS.md").contains("//"),
         "the doubled-separator regression: {}",
@@ -326,7 +439,10 @@ fn x7d_a_resource_read_outside_the_cwd_keeps_one_leading_slash() {
 #[test]
 fn x7e_a_resource_read_of_the_cwd_itself_renders_a_dot() {
     let cwd = std::path::Path::new("/w/AGENTS.md");
-    let opts = ImageOpts { cwd: Some(cwd), ..ImageOpts::default() };
+    let opts = ImageOpts {
+        cwd: Some(cwd),
+        ..ImageOpts::default()
+    };
     let header = |raw: &str| {
         let lines = run_lines("read", json!({ "path": raw }), None, false, opts);
         txt(row(&lines, "read resource")).trim_end().to_string()
@@ -334,9 +450,11 @@ fn x7e_a_resource_read_of_the_cwd_itself_renders_a_dot() {
 
     // Both spellings that resolve ONTO the cwd: the relative `.` and the absolute path itself.
     assert_eq!(header("."), " read resource . (ctrl+o to expand)");
-    assert_eq!(header("/w/AGENTS.md"), " read resource . (ctrl+o to expand)");
+    assert_eq!(
+        header("/w/AGENTS.md"),
+        " read resource . (ctrl+o to expand)"
+    );
 }
-
 
 // --- X8 -------------------------------------------------------------------------------------
 
@@ -359,7 +477,10 @@ fn x8_edit_tint_follows_the_preview_not_done() {
     let lines = tool_lines(&run, false, 60, &theme, ImageOpts::default());
     let success = theme.tool_bg_style(Style::default(), true, false);
     let pending = theme.tool_bg_style(Style::default(), false, false);
-    assert_ne!(success, pending, "the dark theme distinguishes the two tints");
+    assert_ne!(
+        success, pending,
+        "the dark theme distinguishes the two tints"
+    );
     assert_eq!(
         lines[1].style, success,
         "a computed preview greens the pending block (edit.ts:244-248)"
@@ -386,11 +507,20 @@ fn x8_edit_tint_follows_the_preview_not_done() {
     let mut v3 = TranscriptView::new();
     v3.push_tool_start("edit", json!({ "path": "a.rs" }));
     let r3 = v3.active_tools()[0].clone();
-    assert_eq!(tool_lines(&r3, false, 60, &theme, ImageOpts::default())[1].style, pending);
+    assert_eq!(
+        tool_lines(&r3, false, 60, &theme, ImageOpts::default())[1].style,
+        pending
+    );
 
     // MIRROR 3: every OTHER tool keeps the `done`/`is_error` keying — `getEditHeaderBg` is
     // `edit`-only, and a pending `read` must stay neutral.
-    let r4 = run_lines("read", json!({ "path": "a.rs" }), None, false, ImageOpts::default());
+    let r4 = run_lines(
+        "read",
+        json!({ "path": "a.rs" }),
+        None,
+        false,
+        ImageOpts::default(),
+    );
     assert_eq!(r4[1].style, pending, "pending read is untouched by X8");
 }
 
@@ -402,8 +532,11 @@ fn x8_edit_tint_follows_the_preview_not_done() {
 #[test]
 fn x9_more_lines_hint_splits_dim_key_from_muted_words() {
     let theme = UiTheme::dark();
-    let body: String =
-        (0..30).map(|i| format!("line {i}\n")).collect::<String>().trim_end().to_string();
+    let body: String = (0..30)
+        .map(|i| format!("line {i}\n"))
+        .collect::<String>()
+        .trim_end()
+        .to_string();
     // A collapsed `read` renders no body at all (`read.ts:178-180`), so the hint is exercised
     // through `grep`, whose head-15 collapse uses the very same `more_lines_hint` (`grep.ts:111`
     // is byte-identical to `read.ts:192`).
@@ -415,16 +548,31 @@ fn x9_more_lines_hint_splits_dim_key_from_muted_words() {
         ImageOpts::default(),
     );
     let hint = row(&g, "more lines");
-    let spans: Vec<(&str, Style)> =
-        hint.spans.iter().map(|s| (s.content.as_ref(), s.style)).collect();
+    let spans: Vec<(&str, Style)> = hint
+        .spans
+        .iter()
+        .map(|s| (s.content.as_ref(), s.style))
+        .collect();
     // [0] is the Box's paddingX margin.
     assert_eq!(spans[1].0, "... (15 more lines,");
     assert_eq!(spans[1].1, theme.muted_style());
     assert_eq!(spans[3].0, "ctrl+o", "the key label is its own span");
-    assert_eq!(spans[3].1, theme.dim_style(), "`theme.fg(\"dim\", keyText(...))`");
+    assert_eq!(
+        spans[3].1,
+        theme.dim_style(),
+        "`theme.fg(\"dim\", keyText(...))`"
+    );
     assert_eq!(spans[4].0, " to expand");
-    assert_eq!(spans[4].1, theme.muted_style(), "the description run is `muted`");
-    assert_ne!(theme.dim_style(), theme.muted_style(), "the two roles differ in this theme");
+    assert_eq!(
+        spans[4].1,
+        theme.muted_style(),
+        "the description run is `muted`"
+    );
+    assert_ne!(
+        theme.dim_style(),
+        theme.muted_style(),
+        "the two roles differ in this theme"
+    );
 
     // MIRROR 1: a REBOUND `app.tools.expand` reaches the hint — the whole point of `keyText`.
     let rebound = run_lines(
@@ -432,11 +580,18 @@ fn x9_more_lines_hint_splits_dim_key_from_muted_words() {
         json!({ "pattern": "x" }),
         Some(text_result(&body, json!(null))),
         false,
-        ImageOpts { expand_key: "ctrl+e/f4", ..ImageOpts::default() },
+        ImageOpts {
+            expand_key: "ctrl+e/f4",
+            ..ImageOpts::default()
+        },
     );
     let h2 = row(&rebound, "more lines");
     assert_eq!(h2.spans[3].content.as_ref(), "ctrl+e/f4");
-    assert!(!txt(h2).contains("ctrl+o"), "the literal is gone: {:?}", txt(h2));
+    assert!(
+        !txt(h2).contains("ctrl+o"),
+        "the literal is gone: {:?}",
+        txt(h2)
+    );
 
     // MIRROR 2: the same two-tone shape on the bash tool's `… earlier lines` hint
     // (`bash.ts:281-284`), which had the identical defect.
@@ -445,12 +600,19 @@ fn x9_more_lines_hint_splits_dim_key_from_muted_words() {
         json!({ "command": "ls" }),
         Some(text_result(&body, json!(null))),
         false,
-        ImageOpts { expand_key: "ctrl+e", ..ImageOpts::default() },
+        ImageOpts {
+            expand_key: "ctrl+e",
+            ..ImageOpts::default()
+        },
     );
     let hb = row(&b, "earlier lines");
     assert_eq!(hb.spans[1].content.as_ref(), "... (25 earlier lines,");
     assert_eq!(hb.spans[1].style, theme.muted_style());
-    assert_eq!(hb.spans[3].content.as_ref(), "ctrl+e", "resolved, not the `ctrl+o` literal");
+    assert_eq!(
+        hb.spans[3].content.as_ref(),
+        "ctrl+e",
+        "resolved, not the `ctrl+o` literal"
+    );
     assert_eq!(hb.spans[3].style, theme.dim_style());
     assert_eq!(hb.spans[4].content.as_ref(), " to expand");
     assert_eq!(hb.spans[4].style, theme.muted_style());
@@ -475,8 +637,16 @@ fn x11_extension_rendered_message_is_not_forced_dim() {
     // The old code was `Line::styled(l, theme.dim_style())`, which parks the colour on the ROW,
     // so both the row style and every span style have to be checked — asserting only on
     // `spans[0]` would pass against the defect.
-    assert_ne!(r.style, theme.dim_style(), "the host must not repaint the renderer's output");
-    assert_eq!(r.style, Style::default(), "added as-is ⇒ no row-level host styling");
+    assert_ne!(
+        r.style,
+        theme.dim_style(),
+        "the host must not repaint the renderer's output"
+    );
+    assert_eq!(
+        r.style,
+        Style::default(),
+        "added as-is ⇒ no row-level host styling"
+    );
     assert!(
         r.spans.iter().all(|s| s.style == Style::default()),
         "…and none on the spans either: {:?}",
@@ -514,13 +684,20 @@ fn x15_a_throwing_renderer_draws_the_failure_box() {
     assert_eq!(txt(&lines[0]), "", "`custom-entry.ts:59`'s Spacer(1)");
     let r = row(&lines, "renderer failed");
     assert_eq!(txt(r).trim_end(), " [demo] renderer failed: boom");
-    assert_eq!(r.spans[1].style.fg, theme.error_style().fg, "`theme.fg(\"error\", …)`");
+    assert_eq!(
+        r.spans[1].style.fg,
+        theme.error_style().fg,
+        "`theme.fg(\"error\", …)`"
+    );
     assert_eq!(
         r.style.bg,
         theme.custom_message_bg_style().bg,
         "inside a `Box(1, 1, customMessageBg)`"
     );
-    assert!(!joined(&lines).contains("unused"), "the default body is not also drawn");
+    assert!(
+        !joined(&lines).contains("unused"),
+        "the default body is not also drawn"
+    );
 }
 
 // --- X14 ------------------------------------------------------------------------------------
@@ -531,8 +708,9 @@ fn x15_a_throwing_renderer_draws_the_failure_box() {
 #[test]
 fn x14_collapsed_branch_summary_is_one_hint_row() {
     let theme = UiTheme::dark();
-    let entry =
-        Entry::BranchSummary { summary: "tried the async rewrite, abandoned it".to_string() };
+    let entry = Entry::BranchSummary {
+        summary: "tried the async rewrite, abandoned it".to_string(),
+    };
     let lines = entry_lines(&entry, &theme, 60, 1, ImageOpts::default());
     assert!(joined(&lines).contains("[branch]"), "{}", joined(&lines));
     let hint = row(&lines, "Branch summary");
@@ -542,7 +720,11 @@ fn x14_collapsed_branch_summary_is_one_hint_row() {
         theme.custom_message_text_style(),
         "`fg(\"customMessageText\", \"Branch summary (\")` — NOT muted (`:49`)"
     );
-    assert_eq!(hint.spans[2].style, theme.dim_style(), "`fg(\"dim\", keyText(...))` (`:50`)");
+    assert_eq!(
+        hint.spans[2].style,
+        theme.dim_style(),
+        "`fg(\"dim\", keyText(...))` (`:50`)"
+    );
     assert!(
         !joined(&lines).contains("async rewrite"),
         "the body is withheld:\n{}",
@@ -555,20 +737,36 @@ fn x14_collapsed_branch_summary_is_one_hint_row() {
         &theme,
         60,
         1,
-        ImageOpts { expand_key: "f2", ..ImageOpts::default() },
+        ImageOpts {
+            expand_key: "f2",
+            ..ImageOpts::default()
+        },
     );
-    assert!(joined(&rebound).contains("Branch summary (f2 to expand)"), "{}", joined(&rebound));
+    assert!(
+        joined(&rebound).contains("Branch summary (f2 to expand)"),
+        "{}",
+        joined(&rebound)
+    );
 
     // MIRROR 2: expanded still renders the full markdown body + `**Branch Summary**` header.
     let open = entry_lines(
-        &Entry::BranchSummary { summary: "tried the async rewrite, abandoned it".to_string() },
+        &Entry::BranchSummary {
+            summary: "tried the async rewrite, abandoned it".to_string(),
+        },
         &theme,
         60,
         1,
-        ImageOpts { tools_expanded: true, ..ImageOpts::default() },
+        ImageOpts {
+            tools_expanded: true,
+            ..ImageOpts::default()
+        },
     );
     assert!(joined(&open).contains("async rewrite"), "{}", joined(&open));
-    assert!(joined(&open).contains("Branch Summary"), "{}", joined(&open));
+    assert!(
+        joined(&open).contains("Branch Summary"),
+        "{}",
+        joined(&open)
+    );
 
     // MIRROR 3: the compaction variant keeps its grouped token count in the collapsed lead
     // (`compaction-summary-message.ts:50`).
@@ -621,16 +819,30 @@ fn x14_toggling_tools_expanded_reveals_an_already_pushed_summary_body() {
                     &theme,
                     60,
                     1,
-                    ImageOpts { tools_expanded: view.tool_expanded(), ..ImageOpts::default() },
+                    ImageOpts {
+                        tools_expanded: view.tool_expanded(),
+                        ..ImageOpts::default()
+                    },
                 )
             })
-            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect::<String>())
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
             .collect::<Vec<_>>()
             .join("\n")
     };
     let collapsed = render(&view, &entries);
-    assert!(collapsed.contains("Branch summary (ctrl+o to expand)"), "{collapsed}");
-    assert!(collapsed.contains("Compacted from 1,234 tokens (ctrl+o to expand)"), "{collapsed}");
+    assert!(
+        collapsed.contains("Branch summary (ctrl+o to expand)"),
+        "{collapsed}"
+    );
+    assert!(
+        collapsed.contains("Compacted from 1,234 tokens (ctrl+o to expand)"),
+        "{collapsed}"
+    );
     assert!(!collapsed.contains("we merged the spike"), "{collapsed}");
     assert!(!collapsed.contains("condensed history"), "{collapsed}");
 
@@ -645,13 +857,22 @@ fn x14_toggling_tools_expanded_reveals_an_already_pushed_summary_body() {
         expanded.contains("condensed history"),
         "the compaction body is reachable after the toggle:\n{expanded}"
     );
-    assert!(!expanded.contains("to expand"), "and the collapsed hints are gone:\n{expanded}");
+    assert!(
+        !expanded.contains("to expand"),
+        "and the collapsed hints are gone:\n{expanded}"
+    );
 
     // MIRROR: toggling back re-collapses the same entries — the flag is read, not latched.
     assert!(view.set_tool_expanded(false));
     let recollapsed = render(&view, &entries);
-    assert!(!recollapsed.contains("we merged the spike"), "{recollapsed}");
-    assert!(recollapsed.contains("Branch summary (ctrl+o to expand)"), "{recollapsed}");
+    assert!(
+        !recollapsed.contains("we merged the spike"),
+        "{recollapsed}"
+    );
+    assert!(
+        recollapsed.contains("Branch summary (ctrl+o to expand)"),
+        "{recollapsed}"
+    );
 }
 
 /// **X7 — `language_from_path` is the `getLanguageFromPath` table verbatim
@@ -660,10 +881,18 @@ fn x14_toggling_tools_expanded_reveals_an_already_pushed_summary_body() {
 fn x6_language_from_path_matches_pis_table() {
     use crate::theme::language_from_path as lang;
     assert_eq!(lang("a.rs"), Some("rust"));
-    assert_eq!(lang("a.TSX"), Some("typescript"), "the extension is lower-cased");
+    assert_eq!(
+        lang("a.TSX"),
+        Some("typescript"),
+        "the extension is lower-cased"
+    );
     assert_eq!(lang("a.zsh"), Some("bash"));
     assert_eq!(lang("a.hpp"), Some("cpp"));
     assert_eq!(lang("a.yml"), Some("yaml"));
-    assert_eq!(lang("nodots"), None, "`split(\".\").pop()` yields the whole name ⇒ no match");
+    assert_eq!(
+        lang("nodots"),
+        None,
+        "`split(\".\").pop()` yields the whole name ⇒ no match"
+    );
     assert_eq!(lang("a.nope"), None);
 }

@@ -39,15 +39,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-
-use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::extension::SubagentsExtension;
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 use cyrup_ext_subagents::spawn::SpawnCommand;
-use cyrup_test_support::harness::{create_harness_with_extensions, HarnessOptions};
+use cyrup_test_support::harness::{HarnessOptions, create_harness_with_extensions};
 use cyrup_test_support::response::FauxResponse;
-
-
 
 /// Path to the real, already-built `cyrup-subagent-fixture` binary.
 ///
@@ -115,7 +112,6 @@ fn message_end_line(text: &str) -> String {
 ///    it or hanging the run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn subagent_tool_call_spawns_a_real_child_process_and_returns_its_output_end_to_end() {
-
     let work_dir = tempfile::tempdir().expect("real tempdir for the fixture persona + cwd");
     write_fixture_persona(work_dir.path(), "worker");
 
@@ -174,7 +170,9 @@ async fn subagent_tool_call_spawns_a_real_child_process_and_returns_its_output_e
     .await
     .expect("harness builds a real, fully-wired AgentSession with the extension loaded");
 
-    let events = harness.run("please delegate this to the worker subagent").await;
+    let events = harness
+        .run("please delegate this to the worker subagent")
+        .await;
 
     let events = events.expect("the turn completes without a transport/session-level error");
 
@@ -211,7 +209,11 @@ async fn subagent_tool_call_spawns_a_real_child_process_and_returns_its_output_e
             _ => None,
         })
         .collect();
-    assert_eq!(tool_ends.len(), 1, "expected exactly one tool_execution_end; got: {events:#?}");
+    assert_eq!(
+        tool_ends.len(),
+        1,
+        "expected exactly one tool_execution_end; got: {events:#?}"
+    );
     let (tool_name, result, is_error) = tool_ends[0];
     assert_eq!(tool_name, "subagent");
     assert!(
@@ -235,7 +237,9 @@ async fn subagent_tool_call_spawns_a_real_child_process_and_returns_its_output_e
     );
     let assistant_texts = harness.assistant_texts().await;
     assert!(
-        assistant_texts.iter().any(|t| t.contains("acknowledged the subagent's output")),
+        assistant_texts
+            .iter()
+            .any(|t| t.contains("acknowledged the subagent's output")),
         "the follow-up assistant turn (scripted response 2) must be present in the persisted \
          transcript: {assistant_texts:?}"
     );
@@ -288,15 +292,22 @@ async fn subagent_tool_call_against_an_unknown_agent_fails_before_any_subprocess
     let tool_ends: Vec<(bool, &serde_json::Value)> = events
         .iter()
         .filter_map(|e| match e {
-            cyrup_session_svc::AgentSessionEvent::ToolExecutionEnd { is_error, result, .. } => {
-                Some((*is_error, result))
-            }
+            cyrup_session_svc::AgentSessionEvent::ToolExecutionEnd {
+                is_error, result, ..
+            } => Some((*is_error, result)),
             _ => None,
         })
         .collect();
-    assert_eq!(tool_ends.len(), 1, "expected exactly one tool_execution_end; got: {events:#?}");
+    assert_eq!(
+        tool_ends.len(),
+        1,
+        "expected exactly one tool_execution_end; got: {events:#?}"
+    );
     let (is_error, result) = tool_ends[0];
-    assert!(is_error, "an unresolvable agent name must surface as a tool error, got: {result:#?}");
+    assert!(
+        is_error,
+        "an unresolvable agent name must surface as a tool error, got: {result:#?}"
+    );
 }
 
 /// T3 group C — a FAILED single run surfaces as a tool ERROR whose content carries the failure
@@ -307,7 +318,6 @@ async fn subagent_tool_call_against_an_unknown_agent_fails_before_any_subprocess
 /// stderr is surfaced into the model-facing content, not buried in `details` JSON.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn subagent_tool_call_with_a_failing_child_surfaces_is_error_with_the_error_text() {
-
     let work_dir = tempfile::tempdir().expect("real tempdir for the fixture persona + cwd");
     write_fixture_persona(work_dir.path(), "worker");
 
@@ -361,20 +371,26 @@ async fn subagent_tool_call_with_a_failing_child_surfaces_is_error_with_the_erro
     .await
     .expect("harness builds a real, fully-wired AgentSession with the extension loaded");
 
-    let events = harness.run("delegate the change to the worker subagent").await;
+    let events = harness
+        .run("delegate the change to the worker subagent")
+        .await;
 
     let events = events.expect("the turn completes even though the tool call itself fails");
 
     let tool_ends: Vec<(bool, &serde_json::Value)> = events
         .iter()
         .filter_map(|e| match e {
-            cyrup_session_svc::AgentSessionEvent::ToolExecutionEnd { is_error, result, .. } => {
-                Some((*is_error, result))
-            }
+            cyrup_session_svc::AgentSessionEvent::ToolExecutionEnd {
+                is_error, result, ..
+            } => Some((*is_error, result)),
             _ => None,
         })
         .collect();
-    assert_eq!(tool_ends.len(), 1, "expected exactly one tool_execution_end; got: {events:#?}");
+    assert_eq!(
+        tool_ends.len(),
+        1,
+        "expected exactly one tool_execution_end; got: {events:#?}"
+    );
     let (is_error, result) = tool_ends[0];
     assert!(
         is_error,
@@ -387,7 +403,8 @@ async fn subagent_tool_call_with_a_failing_child_surfaces_is_error_with_the_erro
          CONTENT, not buried in details JSON — got: {result_text}"
     );
     assert!(
-        result_text.contains("Output:") && result_text.contains("partial progress before the crash"),
+        result_text.contains("Output:")
+            && result_text.contains("partial progress before the crash"),
         "formatFailedSingleRunOutput must include the partial Output block: {result_text}"
     );
 }

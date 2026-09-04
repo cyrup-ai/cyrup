@@ -86,14 +86,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::Child;
-use tokio::sync::oneshot;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-use crate::rpc::types::RpcResponse;
+use crate::rpc::types::{ClearedQueue, RpcResponse};
 
 // ---------------------------------------------------------------------------------------------
 // Constants — pi's literals
@@ -717,6 +717,14 @@ impl RpcClient {
         self.send(command("abort", [], None)).await.map(|_| ())
     }
 
+    /// pi `clearQueue` (`rpc-client.ts:226-229` **@v0.84.4** — the verb does not exist at the
+    /// v0.83.0 baseline the rest of this surface cites; SEAM-116): drain the steering + follow-up
+    /// queues and get their text back, so it can be restored into the editor before an `abort`.
+    pub async fn clear_queue(&self) -> Result<ClearedQueue, RpcClientError> {
+        let data = self.data(command("clear_queue", [], None)).await?;
+        Ok(serde_json::from_value(data)?)
+    }
+
     /// pi `newSession` (`:227`) — `{ cancelled }` when an extension vetoed the new session.
     pub async fn new_session(&self, parent_session: Option<&str>) -> Result<bool, RpcClientError> {
         // pi spreads `parentSession` in unconditionally; `undefined` is dropped by JSON.stringify,
@@ -736,11 +744,7 @@ impl RpcClient {
     }
 
     /// pi `setModel` (`:243`).
-    pub async fn set_model(
-        &self,
-        provider: &str,
-        model_id: &str,
-    ) -> Result<Value, RpcClientError> {
+    pub async fn set_model(&self, provider: &str, model_id: &str) -> Result<Value, RpcClientError> {
         self.data(command(
             "set_model",
             [("provider", json!(provider)), ("modelId", json!(model_id))],
@@ -758,17 +762,19 @@ impl RpcClient {
 
     /// pi `getAvailableModels` (`:263`) — unwraps `{ models }`.
     pub async fn get_available_models(&self) -> Result<Vec<ModelInfo>, RpcClientError> {
-        let data = self
-            .data(command("get_available_models", [], None))
-            .await?;
+        let data = self.data(command("get_available_models", [], None)).await?;
         Ok(serde_json::from_value(field(data, "models"))?)
     }
 
     /// pi `setThinkingLevel` (`:271`).
     pub async fn set_thinking_level(&self, level: &str) -> Result<(), RpcClientError> {
-        self.send(command("set_thinking_level", [("level", json!(level))], None))
-            .await
-            .map(|_| ())
+        self.send(command(
+            "set_thinking_level",
+            [("level", json!(level))],
+            None,
+        ))
+        .await
+        .map(|_| ())
     }
 
     /// pi `cycleThinkingLevel` (`:278`).
@@ -836,7 +842,9 @@ impl RpcClient {
 
     /// pi `abortRetry` (`:330`).
     pub async fn abort_retry(&self) -> Result<(), RpcClientError> {
-        self.send(command("abort_retry", [], None)).await.map(|_| ())
+        self.send(command("abort_retry", [], None))
+            .await
+            .map(|_| ())
     }
 
     /// pi `bash` (`:337`).
@@ -922,10 +930,7 @@ impl RpcClient {
         let data = self
             .data(command("get_last_assistant_text", [], None))
             .await?;
-        Ok(data
-            .get("text")
-            .and_then(Value::as_str)
-            .map(str::to_string))
+        Ok(data.get("text").and_then(Value::as_str).map(str::to_string))
     }
 
     /// pi `setSessionName` (`:427`).
@@ -1046,9 +1051,7 @@ impl RpcClient {
     async fn data(&self, body: Map<String, Value>) -> Result<Value, RpcClientError> {
         let response = self.send(body).await?;
         if !response.success {
-            return Err(RpcClientError::Command(
-                response.error.unwrap_or_default(),
-            ));
+            return Err(RpcClientError::Command(response.error.unwrap_or_default()));
         }
         Ok(response.data.unwrap_or(Value::Null))
     }
@@ -1198,11 +1201,7 @@ fn field(data: Value, key: &str) -> Value {
 /// pi's `T | null` returns (`cycleModel`, `cycleThinkingLevel`): the host answers `data: null` when
 /// there is nothing to report.
 fn nullable(data: Value) -> Option<Value> {
-    if data.is_null() {
-        None
-    } else {
-        Some(data)
-    }
+    if data.is_null() { None } else { Some(data) }
 }
 
 /// pi `createProcessExitError` (`rpc-client.ts:528-530`), with JS's `null` rendering for an absent

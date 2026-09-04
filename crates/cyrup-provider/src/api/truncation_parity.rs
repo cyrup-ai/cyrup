@@ -105,7 +105,9 @@ impl Wire {
             Wire::Google => "Google stream ended without a finish reason",
             Wire::Mistral => "Mistral stream ended without a finish reason",
             Wire::OpenAiCompletions => "Stream ended without finish_reason",
-            Wire::OpenAiResponses => "OpenAI Responses stream ended before a terminal response event",
+            Wire::OpenAiResponses => {
+                "OpenAI Responses stream ended before a terminal response event"
+            }
         }
     }
 
@@ -203,7 +205,12 @@ async fn events(wire: Wire, raw: &str) -> Vec<StreamEvent> {
         match wire {
             Wire::Anthropic => {
                 crate::api::anthropic_messages::decode_stream(
-                    frames, &model, &api, &sink, false, &[],
+                    frames,
+                    &model,
+                    &api,
+                    &sink,
+                    false,
+                    &[],
                 )
                 .await
             }
@@ -387,7 +394,8 @@ async fn in_flight_partials_report_pending_on_the_wire() {
         // `finishReason` in a single chunk, so its later partials legitimately settle mid-stream,
         // exactly as Pi's `output.stopReason` does once the candidate is processed.)
         let truncated = events(wire, wire.truncated()).await;
-        let truncated_partials: Vec<_> = truncated.iter().filter_map(StreamEvent::partial).collect();
+        let truncated_partials: Vec<_> =
+            truncated.iter().filter_map(StreamEvent::partial).collect();
         assert!(
             !truncated_partials.is_empty(),
             "{wire:?}: truncated fixture produced no non-terminal events"
@@ -409,7 +417,10 @@ async fn in_flight_partials_report_pending_on_the_wire() {
 fn pending_can_never_reach_a_done_terminal() {
     // 1. The narrowing itself refuses it, with `error` (not `aborted`) — Pi's catch sets
     //    `output.stopReason = "error"` for the non-abort throw (anthropic-messages.ts:765).
-    assert_eq!(DoneReason::try_from(StopReason::Pending), Err(ErrorReason::Error));
+    assert_eq!(
+        DoneReason::try_from(StopReason::Pending),
+        Err(ErrorReason::Error)
+    );
 
     // 2. `terminal()` normalizes rather than propagating, so a `Pending` value cannot survive into
     //    `message_end` / the settled transcript / a session file even if a caller bypasses
@@ -473,7 +484,11 @@ fn end_of_stream_treats_an_explicit_pending_like_no_reason_at_all() {
             StreamEvent::Error { reason, error } => {
                 assert_eq!(reason, ErrorReason::Error, "{delivered:?}");
                 assert_eq!(error.stop_reason, StopReason::Error, "{delivered:?}");
-                assert_eq!(error.error_message.as_deref(), Some("boom"), "{delivered:?}");
+                assert_eq!(
+                    error.error_message.as_deref(),
+                    Some("boom"),
+                    "{delivered:?}"
+                );
             }
             other => panic!("{delivered:?}: expected error terminal, got {other:?}"),
         }
@@ -497,7 +512,11 @@ fn stop_reason_wire_shape_is_additive_and_accepts_pi_pending() {
         (StopReason::Error, "error"),
         (StopReason::Aborted, "aborted"),
     ] {
-        assert_eq!(serde_json::to_value(reason).unwrap(), wire, "serialize {reason:?}");
+        assert_eq!(
+            serde_json::to_value(reason).unwrap(),
+            wire,
+            "serialize {reason:?}"
+        );
         let back: StopReason = serde_json::from_value(serde_json::json!(wire)).unwrap();
         assert_eq!(back, reason, "deserialize {wire:?}");
     }

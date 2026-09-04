@@ -237,14 +237,12 @@ fn lexical_normalize(base: &Path, relative: &Path) -> PathBuf {
     for comp in joined.components() {
         match comp {
             std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                match out.last() {
-                    Some(std::path::Component::Normal(_)) => {
-                        out.pop();
-                    }
-                    _ => out.push(comp),
+            std::path::Component::ParentDir => match out.last() {
+                Some(std::path::Component::Normal(_)) => {
+                    out.pop();
                 }
-            }
+                _ => out.push(comp),
+            },
             other => out.push(other),
         }
     }
@@ -301,9 +299,10 @@ fn resolve_worktree_base_dir(
         ));
     }
 
-    let expanded: PathBuf = trimmed
-        .strip_prefix("~/")
-        .map_or_else(|| PathBuf::from(trimmed), |rest| crate::paths::home_dir().join(rest));
+    let expanded: PathBuf = trimmed.strip_prefix("~/").map_or_else(
+        || PathBuf::from(trimmed),
+        |rest| crate::paths::home_dir().join(rest),
+    );
     let resolved = if expanded.is_absolute() {
         expanded
     } else {
@@ -334,7 +333,11 @@ async fn resolve_repo_cwd_relative(cwd: &Path) -> Result<String, SubagentError> 
     }
     let normalized = lexical_normalize(Path::new(""), Path::new(stripped));
     let normalized = normalized.to_string_lossy().into_owned();
-    Ok(if normalized == "." { String::new() } else { normalized })
+    Ok(if normalized == "." {
+        String::new()
+    } else {
+        normalized
+    })
 }
 
 /// pi `resolveExpectedWorktreeAgentCwd`: compute (without creating anything) the `agent_cwd` a
@@ -493,9 +496,10 @@ fn resolve_worktree_setup_hook(
         ));
     }
 
-    let expanded: PathBuf = hook_path
-        .strip_prefix("~/")
-        .map_or_else(|| PathBuf::from(hook_path), |rest| crate::paths::home_dir().join(rest));
+    let expanded: PathBuf = hook_path.strip_prefix("~/").map_or_else(
+        || PathBuf::from(hook_path),
+        |rest| crate::paths::home_dir().join(rest),
+    );
 
     let resolved_path = if expanded.is_absolute() {
         expanded
@@ -632,7 +636,9 @@ async fn run_worktree_setup_hook(
 ) -> Result<Vec<String>, SubagentError> {
     let timeout = Duration::from_millis(hook.timeout_ms);
     let payload = serde_json::to_vec(input).map_err(|err| {
-        SubagentError::WorktreeSetup(format!("failed to serialize worktree setup hook input: {err}"))
+        SubagentError::WorktreeSetup(format!(
+            "failed to serialize worktree setup hook input: {err}"
+        ))
     })?;
     let worktree_path = input.worktree_path;
 
@@ -642,11 +648,16 @@ async fn run_worktree_setup_hook(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|err| SubagentError::WorktreeSetup(format!("worktree setup hook failed: {err}")))?;
+        .map_err(|err| {
+            SubagentError::WorktreeSetup(format!("worktree setup hook failed: {err}"))
+        })?;
 
     let call = async {
         if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(&payload).await.map_err(SubagentError::Spawn)?;
+            stdin
+                .write_all(&payload)
+                .await
+                .map_err(SubagentError::Spawn)?;
             stdin.shutdown().await.map_err(SubagentError::Spawn)?;
             drop(stdin);
         }
@@ -798,7 +809,12 @@ async fn create_single_worktree(
         Err(err) => {
             let _ = run_git(
                 toplevel,
-                &["worktree", "remove", "--force", &worktree_path.to_string_lossy()],
+                &[
+                    "worktree",
+                    "remove",
+                    "--force",
+                    &worktree_path.to_string_lossy(),
+                ],
             )
             .await;
             let _ = run_git(toplevel, &["branch", "-D", &branch]).await;
@@ -954,8 +970,7 @@ pub async fn capture_worktree_diff(
     .await?
     .trim()
     .to_string();
-    let patch =
-        run_git_checked(&worktree.path, &["diff", "--cached", &setup.base_commit]).await?;
+    let patch = run_git_checked(&worktree.path, &["diff", "--cached", &setup.base_commit]).await?;
     let numstat = run_git_checked(
         &worktree.path,
         &["diff", "--cached", "--numstat", &setup.base_commit],
@@ -965,7 +980,12 @@ pub async fn capture_worktree_diff(
     std::fs::write(patch_path, &patch).map_err(SubagentError::Spawn)?;
 
     if patch.trim().is_empty() {
-        return Ok(empty_diff(worktree.index, agent, &worktree.branch, patch_path));
+        return Ok(empty_diff(
+            worktree.index,
+            agent,
+            &worktree.branch,
+            patch_path,
+        ));
     }
 
     let (files_changed, insertions, deletions) = parse_numstat(&numstat);
@@ -1026,7 +1046,12 @@ pub async fn cleanup_worktrees(setup: &WorktreeSetup) {
     for worktree in setup.worktrees.iter().rev() {
         let _ = run_git(
             &setup.cwd,
-            &["worktree", "remove", "--force", &worktree.path.to_string_lossy()],
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                &worktree.path.to_string_lossy(),
+            ],
         )
         .await;
         let _ = run_git(&setup.cwd, &["branch", "-D", &worktree.branch]).await;
@@ -1151,14 +1176,12 @@ pub async fn setup_worktree_group(
         .iter()
         .map(|c| c.map(|p| p.to_string_lossy().into_owned()))
         .collect();
-    let tasks: Vec<(&str, Option<&str>)> = owned_cwds
-        .iter()
-        .map(|c| ("task", c.as_deref()))
-        .collect();
+    let tasks: Vec<(&str, Option<&str>)> =
+        owned_cwds.iter().map(|c| ("task", c.as_deref())).collect();
     if let Some(conflict) = find_worktree_task_cwd_conflict(&tasks, repo_cwd) {
-        return Err(SubagentError::WorktreeSetup(format_worktree_task_cwd_conflict(
-            &conflict, repo_cwd,
-        )));
+        return Err(SubagentError::WorktreeSetup(
+            format_worktree_task_cwd_conflict(&conflict, repo_cwd),
+        ));
     }
 
     let setup_hook = config.setup_hook.map(|hook| WorktreeSetupHookConfig {
@@ -1232,7 +1255,11 @@ mod tests {
             .args(args)
             .output()
             .expect("git runs");
-        assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
@@ -1331,7 +1358,10 @@ mod tests {
             .await
             .expect("create");
         assert_eq!(setup.worktrees.len(), 2);
-        assert_eq!(setup.cwd, PathBuf::from(git(repo.path(), &["rev-parse", "--show-toplevel"])));
+        assert_eq!(
+            setup.cwd,
+            PathBuf::from(git(repo.path(), &["rev-parse", "--show-toplevel"]))
+        );
         for (i, wt) in setup.worktrees.iter().enumerate() {
             assert_eq!(wt.branch, format!("cyrup-parallel-structure-{i}"));
             assert_eq!(wt.index, u32::try_from(i).unwrap());
@@ -1352,7 +1382,9 @@ mod tests {
         git(repo.path(), &["add", "-A"]);
         git(repo.path(), &["commit", "-q", "-m", "add nested"]);
 
-        let setup = create_worktrees(&nested, "subdir", 1, None).await.expect("create");
+        let setup = create_worktrees(&nested, "subdir", 1, None)
+            .await
+            .expect("create");
         assert_eq!(
             setup.worktrees[0].agent_cwd,
             setup.worktrees[0].path.join("packages").join("app")
@@ -1372,7 +1404,10 @@ mod tests {
         let setup = create_worktrees(repo.path(), "base-dir", 1, Some(&options))
             .await
             .expect("create");
-        assert_eq!(setup.worktrees[0].path, base_dir.join("cyrup-worktree-base-dir-0"));
+        assert_eq!(
+            setup.worktrees[0].path,
+            base_dir.join("cyrup-worktree-base-dir-0")
+        );
         assert!(base_dir.exists());
         cleanup_worktrees(&setup).await;
     }
@@ -1384,7 +1419,9 @@ mod tests {
         let err = create_worktrees(repo.path(), "dirty", 1, None)
             .await
             .expect_err("dirty rejects");
-        let SubagentError::WorktreeSetup(msg) = err else { panic!("wrong variant") };
+        let SubagentError::WorktreeSetup(msg) = err else {
+            panic!("wrong variant")
+        };
         assert!(msg.contains("clean git working tree"), "{msg}");
         // No worktree was created.
         let list = git(repo.path(), &["worktree", "list", "--porcelain"]);
@@ -1396,11 +1433,13 @@ mod tests {
     #[test]
     fn conflict_allows_omitted_or_matching_task_cwd() {
         let shared = Path::new("/tmp/repo");
-        assert!(find_worktree_task_cwd_conflict(
-            &[("worker-a", None), ("worker-b", Some("/tmp/repo"))],
-            shared
-        )
-        .is_none());
+        assert!(
+            find_worktree_task_cwd_conflict(
+                &[("worker-a", None), ("worker-b", Some("/tmp/repo"))],
+                shared
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1413,7 +1452,10 @@ mod tests {
     fn conflict_returns_first_divergent_task_cwd() {
         let shared = Path::new("/tmp/repo");
         let conflict = find_worktree_task_cwd_conflict(
-            &[("worker-a", Some("/tmp/repo")), ("worker-b", Some("/tmp/repo/packages/app"))],
+            &[
+                ("worker-a", Some("/tmp/repo")),
+                ("worker-b", Some("/tmp/repo/packages/app")),
+            ],
             shared,
         )
         .expect("conflict");
@@ -1444,8 +1486,11 @@ mod tests {
 
         // Each worktree does distinct work: committed, modified, and new files.
         for (i, wt) in setup.worktrees.iter().enumerate() {
-            std::fs::write(wt.path.join("committed.ts"), format!("export const c{i} = true;\n"))
-                .unwrap();
+            std::fs::write(
+                wt.path.join("committed.ts"),
+                format!("export const c{i} = true;\n"),
+            )
+            .unwrap();
             git(&wt.path, &["add", "committed.ts"]);
             git(&wt.path, &["commit", "-q", "-m", "committed change"]);
             std::fs::write(wt.path.join("tracked.txt"), format!("modified-{i}\n")).unwrap();
@@ -1459,7 +1504,11 @@ mod tests {
         assert_eq!(diffs.len(), 2);
         for (i, diff) in diffs.iter().enumerate() {
             assert_eq!(diff.agent, agents[i]);
-            assert_eq!(diff.files_changed, 3, "3 files per worktree, got {}", diff.files_changed);
+            assert_eq!(
+                diff.files_changed, 3,
+                "3 files per worktree, got {}",
+                diff.files_changed
+            );
             assert!(diff.insertions > 0);
             assert!(diff.patch_path.exists(), "per-task patch file must exist");
             let patch = std::fs::read_to_string(&diff.patch_path).unwrap();
@@ -1467,7 +1516,10 @@ mod tests {
             assert!(patch.contains("tracked.txt"));
             assert!(patch.contains("new-file.ts"));
             // node_modules symlink was stripped before diffing — never leaks in.
-            assert!(!patch.contains("diff --git a/node_modules b/node_modules"), "{patch}");
+            assert!(
+                !patch.contains("diff --git a/node_modules b/node_modules"),
+                "{patch}"
+            );
         }
 
         let summary = format_worktree_diff_summary(&diffs);
@@ -1479,7 +1531,11 @@ mod tests {
         let branches: Vec<String> = setup.worktrees.iter().map(|w| w.branch.clone()).collect();
         cleanup_worktrees(&setup).await;
         for path in &paths {
-            assert!(!path.exists(), "worktree {} must be removed", path.display());
+            assert!(
+                !path.exists(),
+                "worktree {} must be removed",
+                path.display()
+            );
         }
         for branch in &branches {
             let listed = git(repo.path(), &["branch", "--list", branch]);
@@ -1508,9 +1564,17 @@ mod tests {
             .await
             .expect("create");
         assert!(setup.worktrees[0].node_modules_linked);
-        assert_eq!(setup.worktrees[0].synthetic_paths, vec!["node_modules".to_string()]);
+        assert_eq!(
+            setup.worktrees[0].synthetic_paths,
+            vec!["node_modules".to_string()]
+        );
         let link = setup.worktrees[0].path.join("node_modules");
-        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         cleanup_worktrees(&setup).await;
     }
 
@@ -1535,7 +1599,8 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&hook_in_repo, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&hook_in_repo, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
         }
         // SUBA-069: this hook is copied into every worktree by git, but the CONTENT is what macOS
         // verifies, so warming the committed copy warms every worktree's copy too.
@@ -1559,7 +1624,11 @@ mod tests {
         let setup = create_worktrees(repo.path(), "hook-rel", 1, Some(&options))
             .await
             .expect("create");
-        assert!(setup.worktrees[0].synthetic_paths.contains(&".venv".to_string()));
+        assert!(
+            setup.worktrees[0]
+                .synthetic_paths
+                .contains(&".venv".to_string())
+        );
         cleanup_worktrees(&setup).await;
     }
 
@@ -1693,8 +1762,13 @@ mod tests {
         let err = create_worktrees(repo.path(), "hook-bare", 1, Some(&options))
             .await
             .expect_err("bare command rejected");
-        let SubagentError::WorktreeSetup(msg) = err else { panic!("wrong variant") };
-        assert!(msg.contains("absolute path or a repo-relative path"), "{msg}");
+        let SubagentError::WorktreeSetup(msg) = err else {
+            panic!("wrong variant")
+        };
+        assert!(
+            msg.contains("absolute path or a repo-relative path"),
+            "{msg}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1703,7 +1777,8 @@ mod tests {
             return;
         }
         let repo = make_real_git_repo();
-        let (_d, hook) = write_hook_script("cat > /dev/null; printf '{\"syntheticPaths\":[\"tracked.txt\"]}'");
+        let (_d, hook) =
+            write_hook_script("cat > /dev/null; printf '{\"syntheticPaths\":[\"tracked.txt\"]}'");
         let base = tempfile::tempdir().unwrap();
         let options = CreateWorktreesOptions {
             setup_hook: Some(WorktreeSetupHookConfig {
@@ -1719,8 +1794,13 @@ mod tests {
         let err = create_worktrees(repo.path(), "hook-tracked", 1, Some(&options))
             .await
             .expect_err("tracked synthetic rejected");
-        let SubagentError::WorktreeSetup(msg) = err else { panic!("wrong variant") };
-        assert!(msg.contains("cannot mark tracked paths as synthetic"), "{msg}");
+        let SubagentError::WorktreeSetup(msg) = err else {
+            panic!("wrong variant")
+        };
+        assert!(
+            msg.contains("cannot mark tracked paths as synthetic"),
+            "{msg}"
+        );
         // Rollback ran — nothing left under the base dir.
         let remaining: Vec<_> = std::fs::read_dir(base.path()).unwrap().collect();
         assert!(remaining.is_empty(), "rollback must clean up");
@@ -1750,11 +1830,23 @@ mod tests {
         let setup = create_worktrees(repo.path(), "hook-diff", 1, Some(&options))
             .await
             .expect("create");
-        std::fs::write(setup.worktrees[0].path.join("tracked.txt"), "modified-by-agent\n").unwrap();
-        let diffs = diff_worktrees(&setup, &["agent-a".to_string()], &repo.path().join("hook-diff")).await;
+        std::fs::write(
+            setup.worktrees[0].path.join("tracked.txt"),
+            "modified-by-agent\n",
+        )
+        .unwrap();
+        let diffs = diff_worktrees(
+            &setup,
+            &["agent-a".to_string()],
+            &repo.path().join("hook-diff"),
+        )
+        .await;
         let patch = std::fs::read_to_string(&diffs[0].patch_path).unwrap();
         assert!(patch.contains("tracked.txt"));
-        assert!(!patch.contains(".env.local"), "synthetic hook file must be excluded: {patch}");
+        assert!(
+            !patch.contains(".env.local"),
+            "synthetic hook file must be excluded: {patch}"
+        );
         cleanup_worktrees(&setup).await;
     }
 
@@ -1784,8 +1876,14 @@ mod tests {
             .await
             .expect_err("second hook fails");
         assert!(matches!(err, SubagentError::WorktreeSetup(_)));
-        let branches = git(repo.path(), &["branch", "--list", "cyrup-parallel-hook-cleanup-*"]);
-        assert!(branches.trim().is_empty(), "temp branches must be cleaned up: {branches}");
+        let branches = git(
+            repo.path(),
+            &["branch", "--list", "cyrup-parallel-hook-cleanup-*"],
+        );
+        assert!(
+            branches.trim().is_empty(),
+            "temp branches must be cleaned up: {branches}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1809,7 +1907,11 @@ mod tests {
             .await
             .expect_err("timeout");
         assert!(matches!(err, SubagentError::WorktreeSetup(_)));
-        assert!(started.elapsed() < Duration::from_secs(5), "must be bounded: {:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "must be bounded: {:?}",
+            started.elapsed()
+        );
     }
 
     // ---- preview ----
@@ -1834,7 +1936,10 @@ mod tests {
         .expect("preview");
         assert_eq!(
             previewed,
-            base.path().join("cyrup-worktree-preview-2").join("packages").join("app")
+            base.path()
+                .join("cyrup-worktree-preview-2")
+                .join("packages")
+                .join("app")
         );
     }
 
@@ -1851,7 +1956,9 @@ mod tests {
             setup_hook_timeout_ms: None,
         };
         let overrides: Vec<Option<&Path>> = vec![None, None];
-        let plan = setup_worktree_group(repo.path(), &overrides, &config).await.expect("group");
+        let plan = setup_worktree_group(repo.path(), &overrides, &config)
+            .await
+            .expect("group");
         assert_eq!(plan.task_count(), 2);
         for a in &plan.assignments {
             assert!(a.path.is_dir());
@@ -1874,5 +1981,4 @@ mod tests {
         };
         cleanup_worktrees(&setup).await;
     }
-
 }

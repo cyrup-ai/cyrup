@@ -16,6 +16,8 @@ use super::super::types::{AgentDefinition, AgentSource, ChainDefinition, SystemP
 pub(crate) fn sample_agent(source: AgentSource, file_path: PathBuf) -> AgentDefinition {
     AgentDefinition {
         default_turn_budget: None,
+        default_acceptance: None,
+        acceptance_role: None,
         permission_rules: None,
         runner: None,
         name: "reviewer".to_string(),
@@ -27,6 +29,8 @@ pub(crate) fn sample_agent(source: AgentSource, file_path: PathBuf) -> AgentDefi
         extensions: None,
         extensions_from_default: false,
         subagent_only_extensions: Vec::new(),
+        exclude_tools: None,
+        allow_nested_subagents: None,
         model: None,
         fallback_models: Vec::new(),
         thinking: None,
@@ -53,6 +57,7 @@ pub(crate) fn sample_agent(source: AgentSource, file_path: PathBuf) -> AgentDefi
         extra_fields: BTreeMap::new(),
         override_info: None,
         model_source: None,
+        model_provider: None,
     }
 }
 

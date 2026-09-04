@@ -158,7 +158,7 @@ cargo clippy --workspace --all-targets -- -D warnings  # REQUIRED — the no-pan
 cargo clippy -p cyrup-ext-sdk --target wasm32-wasip2   # the guest SDK — --workspace does not reach it
 cargo clippy -p cyrup-it --features it                 # the gated harness — likewise
 cargo nextest run --workspace           # the everyday gate: 8,255 tests (8 skipped)
-cargo run -p xtask -- feature-matrix    # the non-default feature combinations (--fast skips cyrup-it)
+cargo run -p xtask -- feature-matrix    # non-default feature combos + RUNS the gated cyrup-it seam suite (--fast skips it)
 cargo doc --workspace --no-deps --bins  # rustdoc links are denied, not warned — `--bins` or the binary is skipped
 ```
 

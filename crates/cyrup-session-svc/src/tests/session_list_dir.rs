@@ -9,20 +9,28 @@
 //!
 //! Re-deriving `<agent_dir>/sessions/--<encoded-cwd>--` instead leaves the picker blind under
 //! `--session-dir` — the live session is not even in its own list.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use cyrup_core::StopReason;
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
-use cyrup_provider::Provider;
 use crate::{SessionBuilder, SessionConfig};
+use cyrup_core::StopReason;
+use cyrup_provider::Provider;
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
 use tempfile::TempDir;
 
 fn faux() -> Arc<FauxProvider> {
     let f = Arc::new(FauxProvider::new());
-    f.set_responses(vec![faux_assistant_message(vec![faux_text("an answer")], StopReason::Stop)]);
+    f.set_responses(vec![faux_assistant_message(
+        vec![faux_text("an answer")],
+        StopReason::Stop,
+    )]);
     f
 }
 
@@ -41,16 +49,31 @@ async fn list_sessions_reads_the_explicit_session_dir() {
     let mut cfg = SessionConfig::new(cwd.clone(), agent_dir.clone());
     cfg.trust_override = Some(true);
     cfg.session_dir = Some(custom.clone()); // explicit --session-dir
-    let session = SessionBuilder::new(provider, cfg).build().await.expect("build");
+    let session = SessionBuilder::new(provider, cfg)
+        .build()
+        .await
+        .expect("build");
 
     let _ = session.prompt("port the editor").await.expect("prompt");
     session.wait_for_idle().await;
 
     let file = session.session_file().await.expect("persisted file");
-    assert_eq!(file.parent().unwrap(), custom, "precondition: the file is in the custom dir");
-    assert_eq!(session.session_dir(), custom, "getSessionDir() is the explicit dir");
+    assert_eq!(
+        file.parent().unwrap(),
+        custom,
+        "precondition: the file is in the custom dir"
+    );
+    assert_eq!(
+        session.session_dir(),
+        custom,
+        "getSessionDir() is the explicit dir"
+    );
 
-    let paths: Vec<PathBuf> = session.list_sessions().iter().map(|s| s.path.clone()).collect();
+    let paths: Vec<PathBuf> = session
+        .list_sessions()
+        .iter()
+        .map(|s| s.path.clone())
+        .collect();
     assert!(
         paths.contains(&file),
         "the /resume picker must list the session's own dir; got {paths:#?}"
@@ -73,7 +96,8 @@ async fn list_sessions_filters_a_shared_dir_by_cwd() {
     std::fs::create_dir_all(&custom).unwrap();
 
     // Another project's session, dropped into the same shared directory.
-    let foreign = custom.join("2026-01-01T00-00-00-000Z_0193f0e1-0000-7000-8000-0000000000ff.jsonl");
+    let foreign =
+        custom.join("2026-01-01T00-00-00-000Z_0193f0e1-0000-7000-8000-0000000000ff.jsonl");
     std::fs::write(
         &foreign,
         format!(
@@ -93,14 +117,24 @@ async fn list_sessions_filters_a_shared_dir_by_cwd() {
     let mut cfg = SessionConfig::new(cwd.clone(), agent_dir.clone());
     cfg.trust_override = Some(true);
     cfg.session_dir = Some(custom.clone());
-    let session = SessionBuilder::new(provider, cfg).build().await.expect("build");
+    let session = SessionBuilder::new(provider, cfg)
+        .build()
+        .await
+        .expect("build");
 
     let _ = session.prompt("port the editor").await.expect("prompt");
     session.wait_for_idle().await;
 
     let file = session.session_file().await.expect("persisted file");
-    let paths: Vec<PathBuf> = session.list_sessions().iter().map(|s| s.path.clone()).collect();
-    assert!(paths.contains(&file), "this project's session must be listed; got {paths:#?}");
+    let paths: Vec<PathBuf> = session
+        .list_sessions()
+        .iter()
+        .map(|s| s.path.clone())
+        .collect();
+    assert!(
+        paths.contains(&file),
+        "this project's session must be listed; got {paths:#?}"
+    );
     assert!(
         !paths.contains(&foreign),
         "another project's session in a shared --session-dir must be filtered out; got {paths:#?}"
@@ -120,17 +154,29 @@ async fn list_sessions_still_uses_the_encoded_default_dir() {
     let provider: Arc<dyn Provider> = faux();
     let mut cfg = SessionConfig::new(cwd.clone(), agent_dir.clone());
     cfg.trust_override = Some(true);
-    let session = SessionBuilder::new(provider, cfg).build().await.expect("build");
+    let session = SessionBuilder::new(provider, cfg)
+        .build()
+        .await
+        .expect("build");
 
     let _ = session.prompt("port the editor").await.expect("prompt");
     session.wait_for_idle().await;
 
     let file = session.session_file().await.expect("persisted file");
     assert!(
-        session.session_dir().starts_with(agent_dir.join("sessions")),
+        session
+            .session_dir()
+            .starts_with(agent_dir.join("sessions")),
         "default dir lives under the sessions root: {:?}",
         session.session_dir()
     );
-    let paths: Vec<PathBuf> = session.list_sessions().iter().map(|s| s.path.clone()).collect();
-    assert!(paths.contains(&file), "the default listing must still find the session; got {paths:#?}");
+    let paths: Vec<PathBuf> = session
+        .list_sessions()
+        .iter()
+        .map(|s| s.path.clone())
+        .collect();
+    assert!(
+        paths.contains(&file),
+        "the default listing must still find the session; got {paths:#?}"
+    );
 }

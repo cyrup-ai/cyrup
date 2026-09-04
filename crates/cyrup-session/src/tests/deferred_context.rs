@@ -19,15 +19,20 @@
 //!
 //! Workspace clippy DENIES `unwrap_used`/`expect_used`/`panic`/`indexing_slicing`, hence the
 //! file-level allow.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::io::Write;
 
-use cyrup_core::Message;
 use crate::agent_message::MessageRole;
 use crate::context::context_message_role;
 use crate::entry::Entry;
 use crate::manager::SessionManager;
+use cyrup_core::Message;
 
 const HEADER: &str = r#"{"type":"session","version":3,"id":"01890000-0000-7000-8000-000000000002","timestamp":"2026-08-08T00:00:00.000Z","cwd":"/tmp/pi-session"}"#;
 
@@ -121,7 +126,10 @@ fn deferred_entry_is_context_invisible_to_the_cut_point_classifier() {
         .expect("deferred entry present in the tree");
 
     // Still a first-class, INTERPRETED entry — not an opaque preserved blob.
-    assert!(matches!(deferred, Entry::Known(_)), "deferred entry must parse as a known entry");
+    assert!(
+        matches!(deferred, Entry::Known(_)),
+        "deferred entry must parse as a known entry"
+    );
     assert_eq!(deferred.type_tag().as_deref(), Some("message"));
 
     assert_eq!(

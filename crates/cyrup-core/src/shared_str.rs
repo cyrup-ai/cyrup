@@ -50,7 +50,10 @@ impl SharedStr {
     /// An empty string with no shared writer.
     #[must_use]
     pub fn new() -> Self {
-        Self { shared: None, flat: OnceLock::new() }
+        Self {
+            shared: None,
+            flat: OnceLock::new(),
+        }
     }
 
     /// The flat `&str`, building and caching it on first call.
@@ -170,7 +173,10 @@ impl Clone for SharedStr {
         if let Some(f) = self.flat.get() {
             let _ = flat.set(Arc::clone(f));
         }
-        Self { shared: self.shared.clone(), flat }
+        Self {
+            shared: self.shared.clone(),
+            flat,
+        }
     }
 }
 
@@ -363,9 +369,17 @@ mod tests {
     /// The wire must not move: `SharedStr` is `String` in both directions, byte for byte.
     #[test]
     fn serde_is_byte_identical_to_string() {
-        for s in ["", "plain", "quote\"back\\slash", "unicode ✓ 𝄞", "line\nbreak\ttab", "\u{1}ctl"] {
+        for s in [
+            "",
+            "plain",
+            "quote\"back\\slash",
+            "unicode ✓ 𝄞",
+            "line\nbreak\ttab",
+            "\u{1}ctl",
+        ] {
             let as_string = serde_json::to_string(&s.to_string()).expect("serialize String");
-            let as_shared = serde_json::to_string(&SharedStr::from(s)).expect("serialize SharedStr");
+            let as_shared =
+                serde_json::to_string(&SharedStr::from(s)).expect("serialize SharedStr");
             assert_eq!(as_string, as_shared, "serialize {s:?}");
             let back: SharedStr = serde_json::from_str(&as_shared).expect("deserialize");
             assert_eq!(back.as_str(), s);
@@ -382,7 +396,11 @@ mod tests {
     fn cloning_is_o1_for_a_standalone_handle_too() {
         let big: String = std::iter::repeat_n('x', 4 * 1024 * 1024).collect();
         let finished = SharedStr::from(big.clone());
-        assert_eq!(finished.as_str().len(), big.len(), "read it, as a consumer would");
+        assert_eq!(
+            finished.as_str().len(),
+            big.len(),
+            "read it, as a consumer would"
+        );
         assert!(finished.is_materialised());
 
         // 2000 clones of a materialised 4 MB standalone. Each one is DROPPED before the next is
@@ -397,7 +415,11 @@ mod tests {
         }
         let elapsed = t.elapsed();
         assert_eq!(bytes_seen, big.len() * 2000);
-        assert_eq!(finished.clone().as_str(), big.as_str(), "a clone reads what the original does");
+        assert_eq!(
+            finished.clone().as_str(),
+            big.as_str(),
+            "a clone reads what the original does"
+        );
         assert!(
             elapsed < std::time::Duration::from_millis(200),
             "2000 clones of a materialised 4 MB handle took {elapsed:?} — the flat form is being \
@@ -415,10 +437,16 @@ mod tests {
         assert_eq!(snap.len(), 7, "length is answered without materialising");
         assert!(!snap.is_materialised());
         let read_once = snap.clone();
-        assert!(!read_once.is_materialised(), "a clone of an unread handle carries nothing");
+        assert!(
+            !read_once.is_materialised(),
+            "a clone of an unread handle carries nothing"
+        );
         assert_eq!(read_once.as_str(), "payload");
         assert!(read_once.is_materialised());
-        assert!(!snap.is_materialised(), "reading one handle does not materialise its siblings");
+        assert!(
+            !snap.is_materialised(),
+            "reading one handle does not materialise its siblings"
+        );
         // A clone taken AFTER the read does inherit the flat — that is the O(1) path — and it must
         // still read the same bytes.
         let inheriting = read_once.clone();

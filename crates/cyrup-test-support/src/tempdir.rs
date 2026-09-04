@@ -24,7 +24,10 @@ impl TestTempDir {
     pub fn with_prefix(prefix: &str) -> std::io::Result<Self> {
         let inner = tempfile::Builder::new().prefix(prefix).tempdir()?;
         let path = inner.path().to_path_buf();
-        Ok(Self { inner: Some(inner), path })
+        Ok(Self {
+            inner: Some(inner),
+            path,
+        })
     }
 
     /// The directory path.

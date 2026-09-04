@@ -29,8 +29,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cyrup_mcp::McpExtension;
-use cyrup_provider::faux::FauxProvider;
 use cyrup_provider::Provider;
+use cyrup_provider::faux::FauxProvider;
 use cyrup_session_svc::{SessionBuilder, SessionConfig};
 use tempfile::TempDir;
 
@@ -145,7 +145,14 @@ fn build(
     )
     .unwrap();
 
-    Fixture { _tmp: tmp, cwd, agent_dir, handshook, initialize, sampling_response }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+        handshook,
+        initialize,
+        sampling_response,
+    }
 }
 
 async fn start(fx: &Fixture) -> Arc<McpExtension> {
@@ -162,14 +169,11 @@ async fn start_in(fx: &Fixture, mode: cyrup_session_svc::AppMode) -> Arc<McpExte
     let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
     cfg.trust_override = Some(true);
     cfg.app_mode = mode;
-    let session = SessionBuilder::new(
-        Arc::new(FauxProvider::new()) as Arc<dyn Provider>,
-        cfg,
-    )
-    .with_native_extension(Arc::clone(&ext) as Arc<dyn cyrup_ext::NativeExtension>)
-    .build()
-    .await
-    .unwrap();
+    let session = SessionBuilder::new(Arc::new(FauxProvider::new()) as Arc<dyn Provider>, cfg)
+        .with_native_extension(Arc::clone(&ext) as Arc<dyn cyrup_ext::NativeExtension>)
+        .build()
+        .await
+        .unwrap();
     session.bind_extensions().await;
     ext
 }
@@ -178,9 +182,12 @@ async fn await_connected(ext: &Arc<McpExtension>) -> Arc<cyrup_mcp::state::McpSt
     let poll = async {
         loop {
             if let Some(state) = ext.state()
-                && state.manager.get_connection(SERVER).is_some_and(|connection| {
-                    connection.status() == cyrup_mcp::lifecycle::ConnectionStatus::Connected
-                })
+                && state
+                    .manager
+                    .get_connection(SERVER)
+                    .is_some_and(|connection| {
+                        connection.status() == cyrup_mcp::lifecycle::ConnectionStatus::Connected
+                    })
                 && ext.init_task().is_none()
             {
                 return state;
@@ -200,7 +207,10 @@ async fn await_exists(path: &std::path::Path, why: &str) {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     };
-    if tokio::time::timeout(Duration::from_secs(15), poll).await.is_err() {
+    if tokio::time::timeout(Duration::from_secs(15), poll)
+        .await
+        .is_err()
+    {
         panic!("{why} — `{}` never appeared", path.display());
     }
 }
@@ -209,10 +219,10 @@ async fn await_exists(path: &std::path::Path, why: &str) {
 async fn await_file(path: &std::path::Path, why: &str) -> String {
     let poll = async {
         loop {
-            if let Ok(text) = std::fs::read_to_string(path) {
-                if !text.trim().is_empty() {
-                    return text;
-                }
+            if let Ok(text) = std::fs::read_to_string(path)
+                && !text.trim().is_empty()
+            {
+                return text;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -226,8 +236,11 @@ async fn await_file(path: &std::path::Path, why: &str) -> String {
 async fn sampling_answer(fx: &Fixture, ext: &Arc<McpExtension>) -> serde_json::Value {
     await_connected(ext).await;
     await_exists(&fx.handshook, "the handshake never completed").await;
-    let raw =
-        await_file(&fx.sampling_response, "the client never answered the sampling request").await;
+    let raw = await_file(
+        &fx.sampling_response,
+        "the client never answered the sampling request",
+    )
+    .await;
     serde_json::from_str(&raw).expect("the client's answer is JSON-RPC")
 }
 
@@ -409,7 +422,11 @@ async fn a_traced_server_writes_the_real_handshake_to_a_real_file() {
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str(line).expect("each line is JSON"))
         .collect();
-    assert!(lines.len() >= 2, "expected both directions, got {}", lines.len());
+    assert!(
+        lines.len() >= 2,
+        "expected both directions, got {}",
+        lines.len()
+    );
 
     // Every line carries the schema version and this server's name.
     for line in &lines {
@@ -438,9 +455,11 @@ async fn a_traced_server_writes_the_real_handshake_to_a_real_file() {
 
     // And the server's answer came back in, classified as a response.
     assert!(
-        lines.iter().any(|line| line["direction"].as_str() == Some("inbound")
-            && line["kind"].as_str() == Some("response")
-            && line["status"].as_str() == Some("received")),
+        lines
+            .iter()
+            .any(|line| line["direction"].as_str() == Some("inbound")
+                && line["kind"].as_str() == Some("response")
+                && line["status"].as_str() == Some("received")),
         "the inbound half was traced too; got {lines:#?}"
     );
 }

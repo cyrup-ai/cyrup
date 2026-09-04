@@ -40,7 +40,11 @@ pub struct ToolPromptContribution {
 impl ToolPromptContribution {
     /// Convenience constructor: a tool with a one-line snippet and no extra guidelines.
     pub fn snippet(tool: impl Into<Arc<str>>, snippet: impl Into<Arc<str>>) -> Self {
-        Self { tool: tool.into(), snippet: Some(snippet.into()), guidelines: Vec::new() }
+        Self {
+            tool: tool.into(),
+            snippet: Some(snippet.into()),
+            guidelines: Vec::new(),
+        }
     }
 
     /// Add a tool-specific guideline bullet (chainable).

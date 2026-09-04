@@ -1,7 +1,6 @@
 //! Response decoding — per-event block handling and event emission.
 
 use super::blocks::{Block, Decoder};
-use std::sync::Arc;
 use super::claude_code::remap_decoded_tool_name;
 use crate::api::EventSink;
 use crate::model::Model;
@@ -9,6 +8,7 @@ use crate::stream::StreamEvent;
 use crate::utils::json_parse::parse_streaming_json_object;
 use cyrup_core::{ApiId, AssistantMessage, SharedStr, StopReason, ToolCall, ToolCallId};
 use serde_json::Value;
+use std::sync::Arc;
 
 pub(super) async fn process_block_start(
     event: &Value,
@@ -47,7 +47,11 @@ pub(super) async fn process_block_start(
             // open event (and never as a `signature_delta`) must not have it discarded.
             dec.push_block(Block::Thinking {
                 index,
-                thinking: cb.get("thinking").and_then(Value::as_str).unwrap_or("").into(),
+                thinking: cb
+                    .get("thinking")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .into(),
                 signature: cb
                     .get("signature")
                     .and_then(Value::as_str)

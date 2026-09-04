@@ -165,10 +165,7 @@ impl ApiImpl for PiMessagesApi {
         {
             Some(k) => k.to_string(),
             None => {
-                let msg = format!(
-                    "No API key provided for provider \"{}\"",
-                    model.provider
-                );
+                let msg = format!("No API key provided for provider \"{}\"", model.provider);
                 sink.send(error_event(model, &self.api, msg, false, None))
                     .await;
                 return;
@@ -184,8 +181,8 @@ impl ApiImpl for PiMessagesApi {
 
         // gap-08 #2: `before_provider_request` may inspect/replace the outbound body (Pi
         // `options?.onPayload?.(payload, model)`, pi-messages.ts:377-380).
-        let body = crate::stream::apply_on_payload(opts, model, build_payload(model, ctx, opts))
-            .await;
+        let body =
+            crate::stream::apply_on_payload(opts, model, build_payload(model, ctx, opts)).await;
         let req = SseRequest {
             method: reqwest::Method::POST,
             url: url.clone(),
@@ -231,8 +228,7 @@ impl ApiImpl for PiMessagesApi {
                 // (pi-messages.ts:396-399): the terminal carries the formatted status line AND a
                 // redacted `pi_messages_response_failure` diagnostic.
                 capture.fire(opts, model).await;
-                let (text, diagnostic) =
-                    response_error(model, &url, status, &message);
+                let (text, diagnostic) = response_error(model, &url, status, &message);
                 sink.send(error_event(model, &self.api, text, false, Some(diagnostic)))
                     .await;
                 return;
@@ -262,7 +258,11 @@ impl ApiImpl for PiMessagesApi {
 pub fn messages_url(base: &str, debug: bool) -> String {
     let trimmed = base.trim_end_matches('/');
     let path = format!("{trimmed}/messages");
-    if debug { format!("{path}?debug=1") } else { path }
+    if debug {
+        format!("{path}?debug=1")
+    } else {
+        path
+    }
 }
 
 /// The `debug` flag for this request.
@@ -292,10 +292,7 @@ pub(crate) fn build_headers(opts: &StreamOptions, api_key: &str) -> HeaderMap {
         "authorization".to_string(),
         Some(format!("Bearer {api_key}")),
     );
-    headers.insert(
-        "accept".to_string(),
-        Some("text/event-stream".to_string()),
-    );
+    headers.insert("accept".to_string(), Some("text/event-stream".to_string()));
     headers.insert(
         "content-type".to_string(),
         Some("application/json".to_string()),
@@ -393,7 +390,11 @@ fn truncate_diagnostic_string(value: &str) -> String {
 fn parse_error_body(body: &str) -> Option<Value> {
     let parsed: Value = serde_json::from_str(body).ok()?;
     let error = parsed.get("error")?;
-    if error.is_object() { Some(error.clone()) } else { None }
+    if error.is_object() {
+        Some(error.clone())
+    } else {
+        None
+    }
 }
 
 /// The HTTP `statusText` for a status code.
@@ -447,16 +448,13 @@ fn response_error(
             details.insert("error".to_string(), e.clone());
         }
         None => {
-            details.insert(
-                "body".to_string(),
-                json!(truncate_diagnostic_string(body)),
-            );
+            details.insert("body".to_string(), json!(truncate_diagnostic_string(body)));
         }
     }
     details.insert("timestampMs".to_string(), json!(now_millis()));
 
-    let mut info = DiagnosticErrorInfo::from_message(text.clone())
-        .with_name("PiMessagesResponseError");
+    let mut info =
+        DiagnosticErrorInfo::from_message(text.clone()).with_name("PiMessagesResponseError");
     if let Some(c) = code {
         info = info.with_code(DiagnosticCode::Str(c.to_string()));
     }
@@ -1544,7 +1542,10 @@ mod tests {
         assert!(req.starts_with("POST /v1/messages HTTP/1.1"), "{req}");
         assert!(req.to_lowercase().contains("authorization: bearer sk-live"));
         assert!(req.to_lowercase().contains("accept: text/event-stream"));
-        assert!(req.to_lowercase().contains("content-type: application/json"));
+        assert!(
+            req.to_lowercase()
+                .contains("content-type: application/json")
+        );
         let body = req.split("\r\n\r\n").nth(1).unwrap_or_default();
         let sent: Value = serde_json::from_str(body).expect("json body");
         assert_eq!(sent["model"], "radius-1");

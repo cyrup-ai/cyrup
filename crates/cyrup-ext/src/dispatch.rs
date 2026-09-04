@@ -108,7 +108,11 @@ impl Dispatcher {
         if exclude.is_some() {
             return;
         }
-        let drain = self.bus_drain.read().ok().and_then(|g| g.as_ref().and_then(|w| w.upgrade()));
+        let drain = self
+            .bus_drain
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().and_then(|w| w.upgrade()));
         if let Some(drain) = drain {
             drain.drain_bus(cancel).await;
         }
@@ -162,8 +166,11 @@ impl Dispatcher {
             disposition,
             "extension call fault contained"
         );
-        let payload =
-            ExtensionError { extension: id.clone(), event, error: err.to_string() };
+        let payload = ExtensionError {
+            extension: id.clone(),
+            event,
+            error: err.to_string(),
+        };
         if let Ok(g) = self.error_listeners.read() {
             for l in g.iter() {
                 l(&payload);
@@ -211,10 +218,9 @@ impl Dispatcher {
     /// crossing, which is what R-08-034 / R-ARCH-EXT-014 actually require.
     fn aggregate(&self) -> Subscriptions {
         match self.lock_read() {
-            Ok(g) => g
-                .exts
-                .iter()
-                .fold(Subscriptions::empty(), |acc, e| acc.union(e.subscriptions())),
+            Ok(g) => g.exts.iter().fold(Subscriptions::empty(), |acc, e| {
+                acc.union(e.subscriptions())
+            }),
             Err(_) => {
                 self.note_poisoned();
                 // poisoned => behave as if nothing subscribed (never crash)
@@ -233,7 +239,10 @@ impl Dispatcher {
     /// system into a silent, total no-op — indistinguishable from "nobody subscribed". The latch
     /// keeps the diagnostic off the per-dispatch hot path while making the state observable.
     fn note_poisoned(&self) {
-        if !self.poison_reported.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        if !self
+            .poison_reported
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
             tracing::error!(
                 "extension dispatcher lock poisoned; no extension events will be delivered for \
                  the rest of this process"
@@ -244,7 +253,8 @@ impl Dispatcher {
     /// Whether the poisoned-lock diagnostic has already been latched (tests).
     #[cfg(test)]
     pub(crate) fn poison_reported(&self) -> bool {
-        self.poison_reported.load(std::sync::atomic::Ordering::Acquire)
+        self.poison_reported
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The cheap gate (R-08-034): true iff NO loaded extension subscribes to `kind`. Callers skip
@@ -270,7 +280,12 @@ impl Dispatcher {
 
     fn subscribers_for(&self, kind: EventKind) -> Vec<Arc<dyn Extension>> {
         match self.lock_read() {
-            Ok(g) => g.exts.iter().filter(|e| e.subscriptions().contains(kind)).cloned().collect(),
+            Ok(g) => g
+                .exts
+                .iter()
+                .filter(|e| e.subscriptions().contains(kind))
+                .cloned()
+                .collect(),
             Err(_) => {
                 self.note_poisoned();
                 Vec::new()
@@ -467,11 +482,13 @@ impl Dispatcher {
             };
             match outcome {
                 HookOutcome::Block { reason, terminate } => {
-                    return Reduced::Blocked { reason, terminate, by: ext.id().clone() }
+                    return Reduced::Blocked {
+                        reason,
+                        terminate,
+                        by: ext.id().clone(),
+                    };
                 }
-                HookOutcome::Handled(HandledValue(v)) => {
-                    return Reduced::Handled(HandledValue(v))
-                }
+                HookOutcome::Handled(HandledValue(v)) => return Reduced::Handled(HandledValue(v)),
                 HookOutcome::Mutate(patch) => ev.apply_patch(patch),
                 HookOutcome::Noop => {}
             }
@@ -541,7 +558,10 @@ impl Dispatcher {
     /// Poison the inner lock the only way a lock can be poisoned — a panic taken while the write
     /// guard is held — so the fail-soft degradation and its latched diagnostic are testable.
     #[cfg(test)]
-    #[allow(clippy::panic, reason = "a panic under the write guard is the only way to poison it")]
+    #[allow(
+        clippy::panic,
+        reason = "a panic under the write guard is the only way to poison it"
+    )]
     pub(crate) fn poison_for_test(&self) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _g = self.inner.write();
@@ -550,10 +570,14 @@ impl Dispatcher {
     }
 
     fn lock_read(&self) -> Result<std::sync::RwLockReadGuard<'_, DispatchInner>, ExtError> {
-        self.inner.read().map_err(|_| ExtError::Io("dispatcher lock poisoned".into()))
+        self.inner
+            .read()
+            .map_err(|_| ExtError::Io("dispatcher lock poisoned".into()))
     }
 
     fn lock_write(&self) -> Result<std::sync::RwLockWriteGuard<'_, DispatchInner>, ExtError> {
-        self.inner.write().map_err(|_| ExtError::Io("dispatcher lock poisoned".into()))
+        self.inner
+            .write()
+            .map_err(|_| ExtError::Io("dispatcher lock poisoned".into()))
     }
 }

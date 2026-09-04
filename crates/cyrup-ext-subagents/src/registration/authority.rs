@@ -249,8 +249,14 @@ mod tests {
             AuthorityAction::ScheduleCreate.default_decision(),
             AuthorityDecision::Auto
         );
-        assert_eq!(AuthorityAction::StopRun.default_decision(), AuthorityDecision::Auto);
-        assert_eq!(AuthorityAction::SteerRun.default_decision(), AuthorityDecision::Auto);
+        assert_eq!(
+            AuthorityAction::StopRun.default_decision(),
+            AuthorityDecision::Auto
+        );
+        assert_eq!(
+            AuthorityAction::SteerRun.default_decision(),
+            AuthorityDecision::Auto
+        );
     }
 
     /// The tool-verb → policy-key mapping pi performs at `subagent-executor.ts:4412`. Anything else
@@ -270,7 +276,14 @@ mod tests {
             AuthorityAction::for_tool_action("schedule.create"),
             Some(AuthorityAction::ScheduleCreate)
         );
-        for ungated in ["status", "interrupt", "resume", "append-step", "list", "delete"] {
+        for ungated in [
+            "status",
+            "interrupt",
+            "resume",
+            "append-step",
+            "list",
+            "delete",
+        ] {
             assert_eq!(AuthorityAction::for_tool_action(ungated), None, "{ungated}");
         }
     }
@@ -335,11 +348,8 @@ mod tests {
         );
 
         assert_eq!(
-            validate_authority_policy(
-                Some(&serde_json::json!([])),
-                "config.authorityPolicy"
-            )
-            .expect_err("an array is not an object"),
+            validate_authority_policy(Some(&serde_json::json!([])), "config.authorityPolicy")
+                .expect_err("an array is not an object"),
             "config.authorityPolicy must be a JSON object"
         );
         assert_eq!(

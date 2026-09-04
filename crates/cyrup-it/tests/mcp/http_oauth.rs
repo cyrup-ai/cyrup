@@ -95,7 +95,12 @@
 //! `StoredCredentialAuth` correctly refuses to read that as "you have never logged in", and every
 //! `auth: "oauth"` HTTP server fails its connect outright.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -103,12 +108,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cyrup_core::{Message, StopReason};
-use cyrup_mcp::credentials::{AuthStorageOptions, McpAuthStore, MemorySecretStore};
 use cyrup_mcp::McpExtension;
-use cyrup_provider::faux::{
-    faux_assistant_message, faux_text, faux_tool_call, FauxProvider, FauxResponseStep,
-};
+use cyrup_mcp::credentials::{AuthStorageOptions, McpAuthStore, MemorySecretStore};
 use cyrup_provider::Provider;
+use cyrup_provider::faux::{
+    FauxProvider, FauxResponseStep, faux_assistant_message, faux_text, faux_tool_call,
+};
 use cyrup_session_svc::{
     AgentSession, AppMode, NotifyKind, SessionBuilder, SessionConfig, UiEffect,
 };
@@ -196,7 +201,9 @@ struct HttpMcpFixture {
 
 impl HttpMcpFixture {
     async fn start() -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
         let addr = listener.local_addr().expect("addr");
         let issuer = format!("http://{addr}");
         let log: Arc<Mutex<Vec<Recorded>>> = Arc::new(Mutex::new(Vec::new()));
@@ -217,24 +224,41 @@ impl HttpMcpFixture {
                 });
             }
         });
-        Self { url: format!("http://{addr}/mcp"), issuer, log, _task: task }
+        Self {
+            url: format!("http://{addr}/mcp"),
+            issuer,
+            log,
+            _task: task,
+        }
     }
 
     fn requests(&self) -> Vec<Recorded> {
-        self.log.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        self.log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Every request the fixture answered `401` to. The load-bearing count for journey A.
     fn unauthorized(&self) -> Vec<Recorded> {
-        self.requests().into_iter().filter(|recorded| recorded.status == 401).collect()
+        self.requests()
+            .into_iter()
+            .filter(|recorded| recorded.status == 401)
+            .collect()
     }
 
     fn initializes(&self) -> Vec<Recorded> {
-        self.requests().into_iter().filter(|recorded| recorded.is_method_call("initialize")).collect()
+        self.requests()
+            .into_iter()
+            .filter(|recorded| recorded.is_method_call("initialize"))
+            .collect()
     }
 
     fn hits(&self, path: &str) -> Vec<Recorded> {
-        self.requests().into_iter().filter(|recorded| recorded.path == path).collect()
+        self.requests()
+            .into_iter()
+            .filter(|recorded| recorded.path == path)
+            .collect()
     }
 }
 
@@ -247,7 +271,9 @@ async fn serve(mut socket: tokio::net::TcpStream, issuer: &str, sink: &Arc<Mutex
     };
     let (status, response) = route(&recorded, issuer);
     recorded.status = status;
-    sink.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(recorded);
+    sink.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(recorded);
     let _ = socket.write_all(response.as_bytes()).await;
     let _ = socket.shutdown().await;
 }
@@ -334,13 +360,17 @@ fn route(recorded: &Recorded, issuer: &str) -> (u16, String) {
     // ── the MCP resource ──────────────────────────────────────────────────────────────────────
     if recorded.method == "GET" || recorded.method == "DELETE" {
         // No server-initiated stream and no session teardown. Both are optional in streamable HTTP.
-        return (405, "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string());
+        return (
+            405,
+            "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string(),
+        );
     }
 
-    let authorized = recorded
-        .all("authorization")
-        .iter()
-        .any(|value| value.trim() == format!("Bearer {GOOD_TOKEN}") || value.trim() == format!("Bearer {REFRESHED_TOKEN}"));
+    let authorized = recorded.all("authorization").iter().any(|value| {
+        value.trim() == format!("Bearer {GOOD_TOKEN}")
+            || value.trim() == format!("Bearer {REFRESHED_TOKEN}")
+    });
     if !authorized {
         // THE GATE. `resource_metadata` points the ladder at this same origin, which is what makes
         // journey B's discovery walk reachable from the challenge alone.
@@ -383,10 +413,15 @@ fn route(recorded: &Recorded, issuer: &str) -> (u16, String) {
     }
     if recorded.body.contains("\"id\":") {
         let id = json_id(&recorded.body);
-        return ok_json(&format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{}}}}"));
+        return ok_json(&format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{}}}}"
+        ));
     }
     // A notification.
-    (202, "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string())
+    (
+        202,
+        "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+    )
 }
 
 async fn read_request(socket: &mut tokio::net::TcpStream) -> Option<Recorded> {
@@ -428,7 +463,13 @@ async fn read_request(socket: &mut tokio::net::TcpStream) -> Option<Recorded> {
         raw.extend_from_slice(buffer.get(..read)?);
     }
     let body = String::from_utf8_lossy(raw.get(head_end..)?).into_owned();
-    Some(Recorded { method, path, headers, body, status: 0 })
+    Some(Recorded {
+        method,
+        path,
+        headers,
+        body,
+        status: 0,
+    })
 }
 
 // =================================================================================================
@@ -502,8 +543,11 @@ fn harness_sharing(
     }
     entry.insert("directTools".to_string(), Value::Bool(true));
     let config = serde_json::json!({ "mcpServers": { SERVER: Value::Object(entry) } });
-    std::fs::write(agent_dir.join("mcp.json"), serde_json::to_string_pretty(&config).unwrap())
-        .unwrap();
+    std::fs::write(
+        agent_dir.join("mcp.json"),
+        serde_json::to_string_pretty(&config).unwrap(),
+    )
+    .unwrap();
 
     // `with_backends` with a stub environment: no `$MCP_OAUTH_DIR`, no `…_TEST_AUTH_STORE`, no
     // `…_CACHE_DISABLED` — so the base dir is exactly the one named here and the entry cache is on,
@@ -518,7 +562,12 @@ fn harness_sharing(
         )
     });
 
-    Harness { _tmp: tmp, cwd, agent_dir, store }
+    Harness {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+        store,
+    }
 }
 
 fn session_config(hx: &Harness) -> SessionConfig {
@@ -542,10 +591,7 @@ fn adapter(hx: &Harness) -> Arc<McpExtension> {
         .into_arc()
 }
 
-async fn start_session(
-    hx: &Harness,
-    faux: Arc<FauxProvider>,
-) -> (AgentSession, Arc<McpExtension>) {
+async fn start_session(hx: &Harness, faux: Arc<FauxProvider>) -> (AgentSession, Arc<McpExtension>) {
     let ext = adapter(hx);
     let session = SessionBuilder::new(faux as Arc<dyn Provider>, session_config(hx))
         .with_native_extension(Arc::clone(&ext) as Arc<dyn cyrup_ext::NativeExtension>)
@@ -573,16 +619,23 @@ async fn await_settled(ext: &Arc<McpExtension>) -> Arc<cyrup_mcp::state::McpStat
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     };
-    tokio::time::timeout(Duration::from_secs(30), poll).await.unwrap_or_else(|_| {
-        panic!(
-            "the session start never committed a generation: either `on_session_start` did not \
+    tokio::time::timeout(Duration::from_secs(30), poll)
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the session start never committed a generation: either `on_session_start` did not \
              call `start_initialization`, or the memoised `init_task` was never polled"
-        )
-    })
+            )
+        })
 }
 
-fn status(state: &Arc<cyrup_mcp::state::McpState>) -> Option<cyrup_mcp::lifecycle::ConnectionStatus> {
-    state.manager.get_connection(SERVER).map(|connection| connection.status())
+fn status(
+    state: &Arc<cyrup_mcp::state::McpState>,
+) -> Option<cyrup_mcp::lifecycle::ConnectionStatus> {
+    state
+        .manager
+        .get_connection(SERVER)
+        .map(|connection| connection.status())
 }
 
 /// One tool result as the transcript holds it, plus the tool arrays the agent handed the model.
@@ -604,7 +657,9 @@ impl Answer {
     }
 
     fn was_offered(&self, name: &str) -> bool {
-        self.offered.iter().any(|turn| turn.iter().any(|tool| tool == name))
+        self.offered
+            .iter()
+            .any(|turn| turn.iter().any(|tool| tool == name))
     }
 }
 
@@ -634,24 +689,38 @@ impl Driver {
             let offered = Arc::clone(&self.offered);
             let tool = (*tool).to_string();
             let args = args.clone();
-            steps.push(FauxResponseStep::factory(move |ctx, _opts, _state, _model| {
-                offered.lock().unwrap().push(ctx.tools.iter().map(|t| t.name.clone()).collect());
-                faux_assistant_message(
-                    vec![faux_tool_call(&tool, args.clone())],
-                    StopReason::ToolUse,
-                )
-            }));
+            steps.push(FauxResponseStep::factory(
+                move |ctx, _opts, _state, _model| {
+                    offered
+                        .lock()
+                        .unwrap()
+                        .push(ctx.tools.iter().map(|t| t.name.clone()).collect());
+                    faux_assistant_message(
+                        vec![faux_tool_call(&tool, args.clone())],
+                        StopReason::ToolUse,
+                    )
+                },
+            ));
         }
         {
             let offered = Arc::clone(&self.offered);
-            steps.push(FauxResponseStep::factory(move |ctx, _opts, _state, _model| {
-                offered.lock().unwrap().push(ctx.tools.iter().map(|t| t.name.clone()).collect());
-                faux_assistant_message(vec![faux_text("done")], StopReason::Stop)
-            }));
+            steps.push(FauxResponseStep::factory(
+                move |ctx, _opts, _state, _model| {
+                    offered
+                        .lock()
+                        .unwrap()
+                        .push(ctx.tools.iter().map(|t| t.name.clone()).collect());
+                    faux_assistant_message(vec![faux_text("done")], StopReason::Stop)
+                },
+            ));
         }
         self.faux.set_response_steps(steps);
 
-        let _stream = self.session.prompt("use the mcp surface").await.expect("prompt accepted");
+        let _stream = self
+            .session
+            .prompt("use the mcp surface")
+            .await
+            .expect("prompt accepted");
         self.session.wait_for_idle().await;
 
         let captured = self.offered.lock().unwrap().clone();
@@ -663,26 +732,30 @@ impl Driver {
                 .enumerate()
                 .skip(self.cursor)
                 .find_map(|(index, message)| match message {
-                    Message::ToolResult { tool_name, content, is_error, details, .. }
-                        if tool_name == tool =>
-                    {
-                        Some((
-                            index,
-                            Answer {
-                                text: content
-                                    .iter()
-                                    .filter_map(|block| match block {
-                                        cyrup_core::Content::Text { text, .. } => Some(text.to_string()),
-                                        _ => None,
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join("\n"),
-                                is_error: *is_error,
-                                details: details.clone(),
-                                offered: captured.clone(),
-                            },
-                        ))
-                    }
+                    Message::ToolResult {
+                        tool_name,
+                        content,
+                        is_error,
+                        details,
+                        ..
+                    } if tool_name == tool => Some((
+                        index,
+                        Answer {
+                            text: content
+                                .iter()
+                                .filter_map(|block| match block {
+                                    cyrup_core::Content::Text { text, .. } => {
+                                        Some(text.to_string())
+                                    }
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                            is_error: *is_error,
+                            details: details.clone(),
+                            offered: captured.clone(),
+                        },
+                    )),
                     _ => None,
                 })
                 .unwrap_or_else(|| {
@@ -704,9 +777,20 @@ impl Driver {
 async fn driver(hx: &Harness) -> (Driver, Arc<McpExtension>) {
     let faux = Arc::new(FauxProvider::new());
     // A closing text turn, so a session awaited before the first round still settles.
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ready")], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("ready")],
+        StopReason::Stop,
+    )]);
     let (session, ext) = start_session(hx, Arc::clone(&faux)).await;
-    (Driver { session, faux, offered: Arc::new(Mutex::new(Vec::new())), cursor: 0 }, ext)
+    (
+        Driver {
+            session,
+            faux,
+            offered: Arc::new(Mutex::new(Vec::new())),
+            cursor: 0,
+        },
+        ext,
+    )
 }
 
 /// The request log as one line per request — the diagnostic every count assertion prints, because
@@ -772,7 +856,10 @@ fn seed_credential(store: &McpAuthStore, url: &str, token: &str, expires_at: i64
 /// arithmetic and with no clock injection anywhere.
 async fn seed_expired_credential(store: &McpAuthStore, url: &str, token: &str) {
     seed_credential(store, url, token, now_secs());
-    store.auth_entry_async(SERVER).await.expect("the migrating read");
+    store
+        .auth_entry_async(SERVER)
+        .await
+        .expect("the migrating read");
     // Past the second boundary the migration stamped, so `expires_at < now_secs()` holds.
     tokio::time::sleep(Duration::from_millis(1_200)).await;
 }
@@ -850,7 +937,11 @@ async fn a_stored_credential_connects_an_http_server_with_no_prompt() {
         status(&state),
         Some(cyrup_mcp::lifecycle::ConnectionStatus::Connected),
         "the stored credential connected the server; failure message: {:?}",
-        state.failure_messages.lock().ok().and_then(|m| m.get(SERVER).cloned())
+        state
+            .failure_messages
+            .lock()
+            .ok()
+            .and_then(|m| m.get(SERVER).cloned())
     );
 
     // (2) THE ASSERTION THAT FAILS WITHOUT THE PROVIDER. `auth: "oauth"` is the explicit arm, so the
@@ -860,13 +951,21 @@ async fn a_stored_credential_connects_an_http_server_with_no_prompt() {
         "a returning user must not be challenged: {:#?}",
         fixture.unauthorized()
     );
-    assert_eq!(fixture.initializes().len(), 1, "one handshake, no retry: {:#?}", fixture.requests());
+    assert_eq!(
+        fixture.initializes().len(),
+        1,
+        "one handshake, no retry: {:#?}",
+        fixture.requests()
+    );
 
     // (3) Exactly ONE Authorization header, carrying the stored token — on every request the
     //     connection made, not merely the handshake. Two values would be the header-collision
     //     regression `http_attempt`'s custom-header clause exists to prevent.
-    let mcp_requests: Vec<Recorded> =
-        fixture.requests().into_iter().filter(|r| r.path == "/mcp").collect();
+    let mcp_requests: Vec<Recorded> = fixture
+        .requests()
+        .into_iter()
+        .filter(|r| r.path == "/mcp")
+        .collect();
     assert!(!mcp_requests.is_empty());
     for recorded in &mcp_requests {
         assert_eq!(
@@ -884,9 +983,16 @@ async fn a_stored_credential_connects_an_http_server_with_no_prompt() {
     //     which is the fixture's own view of "nothing went looking for a login".
     no_oauth_flow_ran().await;
     assert!(
-        fixture.requests().iter().all(|r| r.path.starts_with("/mcp")),
+        fixture
+            .requests()
+            .iter()
+            .all(|r| r.path.starts_with("/mcp")),
         "a returning user's session touches only the MCP endpoint: {:#?}",
-        fixture.requests().iter().map(|r| r.path.clone()).collect::<Vec<_>>()
+        fixture
+            .requests()
+            .iter()
+            .map(|r| r.path.clone())
+            .collect::<Vec<_>>()
     );
 
     // (5) The server's catalog reached the model, by name, with the server's own description and
@@ -894,16 +1000,26 @@ async fn a_stored_credential_connects_an_http_server_with_no_prompt() {
     // Scoped, so the `std::sync::MutexGuard` is provably gone before the `await` below.
     {
         let metadata = state.tool_metadata.lock().unwrap();
-        let entries =
-            metadata.get(SERVER).unwrap_or_else(|| panic!("`tool_metadata[\"{SERVER}\"]`"));
-        assert_eq!(entries.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), vec![DIRECT_TOOL]);
+        let entries = metadata
+            .get(SERVER)
+            .unwrap_or_else(|| panic!("`tool_metadata[\"{SERVER}\"]`"));
+        assert_eq!(
+            entries.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            vec![DIRECT_TOOL]
+        );
         assert_eq!(entries[0].original_name, REMOTE_TOOL);
         assert_eq!(entries[0].description, "echo back");
     }
 
     // (6) THE DELIVERABLE. The model called the tool and the SERVER's own bytes came back.
-    let answer = model.call(DIRECT_TOOL, serde_json::json!({ "text": "pong" })).await;
-    assert!(answer.was_offered(DIRECT_TOOL), "the tool reached the model's array: {:?}", answer.offered);
+    let answer = model
+        .call(DIRECT_TOOL, serde_json::json!({ "text": "pong" }))
+        .await;
+    assert!(
+        answer.was_offered(DIRECT_TOOL),
+        "the tool reached the model's array: {:?}",
+        answer.offered
+    );
     assert!(
         answer.text.contains(SERVER_ANSWER),
         "the server's real `tools/call` result reached the model over an OAuth-authorized HTTP \
@@ -911,7 +1027,11 @@ async fn a_stored_credential_connects_an_http_server_with_no_prompt() {
     );
     assert!(!answer.is_error, "{answer:#?}");
     assert_eq!(answer.detail("error"), None, "{answer:#?}");
-    assert_eq!(answer.detail_str("tool"), Some(REMOTE_TOOL), "the WIRE name reached the server");
+    assert_eq!(
+        answer.detail_str("tool"),
+        Some(REMOTE_TOOL),
+        "the WIRE name reached the server"
+    );
 
     // …and the tool call itself was authorized too — the `tools/call` POST is the last request and
     // it carries the same one header.
@@ -920,8 +1040,15 @@ async fn a_stored_credential_connects_an_http_server_with_no_prompt() {
         .into_iter()
         .find(|r| r.is_method_call("tools/call"))
         .expect("the model's call reached the server");
-    assert_eq!(call.all("authorization"), vec![format!("Bearer {GOOD_TOKEN}")]);
-    assert!(fixture.unauthorized().is_empty(), "still no 401, after the call: {:#?}", fixture.unauthorized());
+    assert_eq!(
+        call.all("authorization"),
+        vec![format!("Bearer {GOOD_TOKEN}")]
+    );
+    assert!(
+        fixture.unauthorized().is_empty(),
+        "still no 401, after the call: {:#?}",
+        fixture.unauthorized()
+    );
 
     model.session.dispose("quit").await;
 }
@@ -960,7 +1087,11 @@ async fn an_unauthenticated_http_server_ends_at_needs_auth() {
         "the startup pass and the direct-tools bootstrap, each once, neither retrying: {:#?}",
         request_summary(&fixture)
     );
-    assert_eq!(fixture.unauthorized().len(), 2, "every attempt was challenged");
+    assert_eq!(
+        fixture.unauthorized().len(),
+        2,
+        "every attempt was challenged"
+    );
     for recorded in fixture.initializes() {
         assert_eq!(
             recorded.header("authorization"),
@@ -980,13 +1111,24 @@ async fn an_unauthenticated_http_server_ends_at_needs_auth() {
     // The byte-exact line the startup pass records — the one the user is told to run. Reworded, it
     // is a support burden; missing, journey B has no entry point.
     assert_eq!(
-        state.failure_messages.lock().ok().and_then(|m| m.get(SERVER).cloned()),
-        Some(format!("OAuth authentication required. Run /mcp-auth {SERVER}.")),
+        state
+            .failure_messages
+            .lock()
+            .ok()
+            .and_then(|m| m.get(SERVER).cloned()),
+        Some(format!(
+            "OAuth authentication required. Run /mcp-auth {SERVER}."
+        )),
     );
 
     // No tool from an unauthenticated server reaches the model.
     assert!(
-        state.tool_metadata.lock().unwrap().get(SERVER).is_none_or(Vec::is_empty),
+        state
+            .tool_metadata
+            .lock()
+            .unwrap()
+            .get(SERVER)
+            .is_none_or(Vec::is_empty),
         "a needs-auth server contributes no catalog"
     );
     model.session.dispose("quit").await;
@@ -1007,7 +1149,12 @@ async fn an_unauthenticated_http_server_ends_at_needs_auth() {
 async fn a_wrong_stored_token_fails_loudly_rather_than_connecting_empty() {
     let fixture = HttpMcpFixture::start().await;
     let hx = harness(&fixture, true);
-    seed_credential(&hx.store, &fixture.url, "not-the-right-token", now_secs() + 3600);
+    seed_credential(
+        &hx.store,
+        &fixture.url,
+        "not-the-right-token",
+        now_secs() + 3600,
+    );
 
     let (mut model, ext) = driver(&hx).await;
     let state = await_settled(&ext).await;
@@ -1015,7 +1162,12 @@ async fn a_wrong_stored_token_fails_loudly_rather_than_connecting_empty() {
     // The token WAS presented — this is not the empty-vault case. Two attempts, for the reason
     // [`an_unauthenticated_http_server_ends_at_needs_auth`] spells out, and BOTH carried the stored
     // value: MCP-116's cache eviction fires once and the re-read finds the same wrong credential.
-    assert_eq!(fixture.initializes().len(), 2, "{:#?}", request_summary(&fixture));
+    assert_eq!(
+        fixture.initializes().len(),
+        2,
+        "{:#?}",
+        request_summary(&fixture)
+    );
     for recorded in fixture.initializes() {
         assert_eq!(
             recorded.all("authorization"),
@@ -1033,7 +1185,12 @@ async fn a_wrong_stored_token_fails_loudly_rather_than_connecting_empty() {
         "a rejected credential is `needs-auth`, never `Connected`"
     );
     assert!(
-        state.tool_metadata.lock().unwrap().get(SERVER).is_none_or(Vec::is_empty),
+        state
+            .tool_metadata
+            .lock()
+            .unwrap()
+            .get(SERVER)
+            .is_none_or(Vec::is_empty),
         "no catalog — and, crucially, the server is not sitting on the surface pretending to have one"
     );
 
@@ -1041,7 +1198,11 @@ async fn a_wrong_stored_token_fails_loudly_rather_than_connecting_empty() {
     // server as connected with zero tools; this shows it as needing authentication.
     let answer = model.call(PROXY_TOOL, serde_json::json!({})).await;
     assert_eq!(answer.detail_str("mode"), Some("status"), "{answer:#?}");
-    let servers = answer.detail("servers").and_then(Value::as_array).cloned().unwrap_or_default();
+    let servers = answer
+        .detail("servers")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let row = servers
         .iter()
         .find(|row| row.get("name").and_then(Value::as_str) == Some(SERVER))
@@ -1085,10 +1246,19 @@ async fn an_implicit_oauth_server_retries_once_with_the_stored_token() {
         status(&state),
         Some(cyrup_mcp::lifecycle::ConnectionStatus::Connected),
         "the retry carried the stored token; failure: {:?}",
-        state.failure_messages.lock().ok().and_then(|m| m.get(SERVER).cloned())
+        state
+            .failure_messages
+            .lock()
+            .ok()
+            .and_then(|m| m.get(SERVER).cloned())
     );
     let initializes = fixture.initializes();
-    assert_eq!(initializes.len(), 2, "one 401, then one authorized attempt: {:#?}", fixture.requests());
+    assert_eq!(
+        initializes.len(),
+        2,
+        "one 401, then one authorized attempt: {:#?}",
+        fixture.requests()
+    );
     assert_eq!(
         initializes[0].header("authorization"),
         None,
@@ -1099,7 +1269,11 @@ async fn an_implicit_oauth_server_retries_once_with_the_stored_token() {
         vec![format!("Bearer {GOOD_TOKEN}")],
         "the retry carries the stored credential"
     );
-    assert_eq!(fixture.unauthorized().len(), 1, "exactly one challenge, and it was answered");
+    assert_eq!(
+        fixture.unauthorized().len(),
+        1,
+        "exactly one challenge, and it was answered"
+    );
     no_oauth_flow_ran().await;
     model.session.dispose("quit").await;
 }
@@ -1128,16 +1302,28 @@ async fn an_expired_credential_is_refreshed_at_connect_time() {
         status(&state),
         Some(cyrup_mcp::lifecycle::ConnectionStatus::Connected),
         "an expired credential with a refresh token still connects; failure: {:?}",
-        state.failure_messages.lock().ok().and_then(|m| m.get(SERVER).cloned())
+        state
+            .failure_messages
+            .lock()
+            .ok()
+            .and_then(|m| m.get(SERVER).cloned())
     );
     let token_hits = fixture.hits("/token");
-    assert_eq!(token_hits.len(), 1, "exactly one refresh exchange: {:#?}", fixture.requests());
+    assert_eq!(
+        token_hits.len(),
+        1,
+        "exactly one refresh exchange: {:#?}",
+        fixture.requests()
+    );
     assert!(
         token_hits[0].body.contains("grant_type=refresh_token"),
         "…and it was a refresh, not a fresh authorization: {:#?}",
         token_hits[0]
     );
-    assert!(fixture.unauthorized().is_empty(), "no 401: the refreshed token was used from attempt one");
+    assert!(
+        fixture.unauthorized().is_empty(),
+        "no 401: the refreshed token was used from attempt one"
+    );
     assert_eq!(
         fixture.initializes()[0].all("authorization"),
         vec![format!("Bearer {REFRESHED_TOKEN}")],
@@ -1209,12 +1395,12 @@ fn query_params(url: &str) -> HashMap<String, String> {
 /// port here is testing a coincidence.
 fn browser_redirect(authorization_url: &str) -> String {
     let params = query_params(authorization_url);
-    let redirect_uri = params
-        .get("redirect_uri")
-        .unwrap_or_else(|| panic!("the authorization URL carries a redirect_uri: {authorization_url}"));
-    let state = params
-        .get("state")
-        .unwrap_or_else(|| panic!("the authorization URL carries a CSRF state: {authorization_url}"));
+    let redirect_uri = params.get("redirect_uri").unwrap_or_else(|| {
+        panic!("the authorization URL carries a redirect_uri: {authorization_url}")
+    });
+    let state = params.get("state").unwrap_or_else(|| {
+        panic!("the authorization URL carries a CSRF state: {authorization_url}")
+    });
     assert!(
         params.contains_key("code_challenge"),
         "the flow is PKCE — a missing challenge would mean the exchange below proves less than it \
@@ -1258,15 +1444,29 @@ async fn a_first_login_stores_a_token_and_the_next_session_connects_silently() {
         Some(cyrup_mcp::lifecycle::ConnectionStatus::NeedsAuth),
         "the first session has nothing to authenticate with"
     );
-    assert!(!vault_holds(&hx.store, &fixture.url).await, "the vault starts empty");
+    assert!(
+        !vault_holds(&hx.store, &fixture.url).await,
+        "the vault starts empty"
+    );
     let after_startup = fixture.requests().len();
 
     // ── phase 2 — the model starts the manual flow ────────────────────────────────────────────
     let started = model
-        .call(PROXY_TOOL, serde_json::json!({ "action": "auth-start", "server": SERVER }))
+        .call(
+            PROXY_TOOL,
+            serde_json::json!({ "action": "auth-start", "server": SERVER }),
+        )
         .await;
-    assert_eq!(started.detail_str("mode"), Some("auth-start"), "{started:#?}");
-    assert_eq!(started.detail("error"), None, "the flow started: {started:#?}");
+    assert_eq!(
+        started.detail_str("mode"),
+        Some("auth-start"),
+        "{started:#?}"
+    );
+    assert_eq!(
+        started.detail("error"),
+        None,
+        "the flow started: {started:#?}"
+    );
     let authorization_url = started
         .detail_str("authorizationUrl")
         .unwrap_or_else(|| panic!("an authorization URL: {started:#?}"))
@@ -1317,9 +1517,18 @@ async fn a_first_login_stores_a_token_and_the_next_session_connects_silently() {
         None,
         "the exchange succeeded: {completed:#?}"
     );
-    assert_eq!(completed.detail("authenticated"), Some(&serde_json::json!(true)), "{completed:#?}");
+    assert_eq!(
+        completed.detail("authenticated"),
+        Some(&serde_json::json!(true)),
+        "{completed:#?}"
+    );
     let token_hits = fixture.hits("/token");
-    assert_eq!(token_hits.len(), 1, "one token exchange: {:#?}", request_summary(&fixture));
+    assert_eq!(
+        token_hits.len(),
+        1,
+        "one token exchange: {:#?}",
+        request_summary(&fixture)
+    );
     assert!(
         token_hits[0].body.contains("grant_type=authorization_code"),
         "…and it was the authorization-code grant: {:#?}",
@@ -1348,13 +1557,18 @@ async fn a_first_login_stores_a_token_and_the_next_session_connects_silently() {
                 tokens.access_token == GOOD_TOKEN,
                 "the vault holds the token the fixture's /token endpoint minted"
             );
-            assert!(tokens.refresh_token.is_some(), "…and the refresh token beside it");
+            assert!(
+                tokens.refresh_token.is_some(),
+                "…and the refresh token beside it"
+            );
         }
         other => panic!("the token landed in the generation's vault, got {other:?}"),
     }
 
     // ── phase 5 — reconnect with the new token ────────────────────────────────────────────────
-    let connected = model.call(PROXY_TOOL, serde_json::json!({ "connect": SERVER })).await;
+    let connected = model
+        .call(PROXY_TOOL, serde_json::json!({ "connect": SERVER }))
+        .await;
     assert_eq!(
         connected.detail_str("mode"),
         Some("list"),
@@ -1378,7 +1592,9 @@ async fn a_first_login_stores_a_token_and_the_next_session_connects_silently() {
     );
 
     // ── phase 6 — the model calls the server's tool ───────────────────────────────────────────
-    let echoed = model.call(DIRECT_TOOL, serde_json::json!({ "text": "pong" })).await;
+    let echoed = model
+        .call(DIRECT_TOOL, serde_json::json!({ "text": "pong" }))
+        .await;
     assert!(
         echoed.text.contains(SERVER_ANSWER),
         "the server's own bytes, over a transport authorized by a token this test logged in for: \
@@ -1409,7 +1625,9 @@ async fn a_first_login_stores_a_token_and_the_next_session_connects_silently() {
         status(&next_state).is_none(),
         "a warm metadata cache means no startup connect — the surface comes from the cache"
     );
-    let again = next.call(DIRECT_TOOL, serde_json::json!({ "text": "pong" })).await;
+    let again = next
+        .call(DIRECT_TOOL, serde_json::json!({ "text": "pong" }))
+        .await;
     assert!(
         again.was_offered(DIRECT_TOOL),
         "the cached catalog put the server's tool on the model's surface with nothing contacted: \
@@ -1448,7 +1666,11 @@ async fn a_first_login_stores_a_token_and_the_next_session_connects_silently() {
         status(&cold_state),
         Some(cyrup_mcp::lifecycle::ConnectionStatus::Connected),
         "a cold start on the stored credential connects at session start; failure: {:?}",
-        cold_state.failure_messages.lock().ok().and_then(|m| m.get(SERVER).cloned())
+        cold_state
+            .failure_messages
+            .lock()
+            .ok()
+            .and_then(|m| m.get(SERVER).cloned())
     );
     assert_eq!(
         fixture.unauthorized().len(),
@@ -1457,7 +1679,9 @@ async fn a_first_login_stores_a_token_and_the_next_session_connects_silently() {
         request_summary(&fixture)
     );
     no_oauth_flow_ran().await;
-    let cold_answer = cold_model.call(DIRECT_TOOL, serde_json::json!({ "text": "pong" })).await;
+    let cold_answer = cold_model
+        .call(DIRECT_TOOL, serde_json::json!({ "text": "pong" }))
+        .await;
     assert!(cold_answer.text.contains(SERVER_ANSWER), "{cold_answer:#?}");
 
     cold_model.session.dispose("quit").await;
@@ -1478,10 +1702,16 @@ async fn a_redirect_with_the_wrong_state_is_refused_and_no_token_is_exchanged() 
 
     let (mut model, ext) = driver(&hx).await;
     let state = await_settled(&ext).await;
-    assert_eq!(status(&state), Some(cyrup_mcp::lifecycle::ConnectionStatus::NeedsAuth));
+    assert_eq!(
+        status(&state),
+        Some(cyrup_mcp::lifecycle::ConnectionStatus::NeedsAuth)
+    );
 
     let started = model
-        .call(PROXY_TOOL, serde_json::json!({ "action": "auth-start", "server": SERVER }))
+        .call(
+            PROXY_TOOL,
+            serde_json::json!({ "action": "auth-start", "server": SERVER }),
+        )
         .await;
     let authorization_url = started
         .detail_str("authorizationUrl")
@@ -1577,7 +1807,10 @@ async fn an_unreadable_vault_fails_the_connect_rather_than_asking_for_a_login() 
         Some(cyrup_mcp::lifecycle::ConnectionStatus::NeedsAuth),
         "…and must not be recorded as `needs-auth`"
     );
-    assert_ne!(status(&state), Some(cyrup_mcp::lifecycle::ConnectionStatus::Connected));
+    assert_ne!(
+        status(&state),
+        Some(cyrup_mcp::lifecycle::ConnectionStatus::Connected)
+    );
     assert!(
         fixture.requests().is_empty(),
         "nothing was sent: the vault is read before the first byte reaches the socket: {:#?}",
@@ -1656,7 +1889,9 @@ impl Notices {
         };
         tokio::time::timeout(STEP_TIMEOUT, poll)
             .await
-            .unwrap_or_else(|_| panic!("no notification containing {needle:?} within {STEP_TIMEOUT:?}"))
+            .unwrap_or_else(|_| {
+                panic!("no notification containing {needle:?} within {STEP_TIMEOUT:?}")
+            })
     }
 
     /// Every notification already queued, in order.
@@ -1710,11 +1945,13 @@ fn authorization_url_in(notice: &str) -> String {
         .split_whitespace()
         .filter_map(|token| {
             // Take the segment after the FIRST OSC-8 introducer — that is the link target — then
-            // everything up to the ESC that terminates it. `nth(1)`, not `rsplit().next()`: the
-            // sequence has a closing `ESC]8;;` too, so taking the last segment yields the trailing
-            // terminator rather than the URL. A bare URL has no introducer and `nth(1)` is `None`,
-            // so it passes through untouched.
-            let after = token.splitn(2, "\u{1b}]8;;").nth(1).unwrap_or(token);
+            // everything up to the ESC that terminates it. `split_once`, not `rsplit().next()`:
+            // the sequence has a closing `ESC]8;;` too, so taking the last segment yields the
+            // trailing terminator rather than the URL. A bare URL has no introducer and
+            // `split_once` is `None`, so it passes through untouched.
+            let after = token
+                .split_once("\u{1b}]8;;")
+                .map_or(token, |(_, after)| after);
             let candidate = after.split('\u{1b}').next().unwrap_or(after);
             (candidate.starts_with("http://") && candidate.contains("/authorize?"))
                 .then_some(candidate)
@@ -1735,9 +1972,9 @@ fn browser_denial(authorization_url: &str) -> String {
     let redirect_uri = params.get("redirect_uri").unwrap_or_else(|| {
         panic!("the authorization URL carries a redirect_uri: {authorization_url}")
     });
-    let state = params
-        .get("state")
-        .unwrap_or_else(|| panic!("the authorization URL carries a CSRF state: {authorization_url}"));
+    let state = params.get("state").unwrap_or_else(|| {
+        panic!("the authorization URL carries a CSRF state: {authorization_url}")
+    });
     let separator = if redirect_uri.contains('?') { '&' } else { '?' };
     format!("{redirect_uri}{separator}error=access_denied&state={state}")
 }
@@ -1774,9 +2011,15 @@ async fn loopback_get(callback_url: &str) -> u16 {
         });
     let request =
         format!("GET {target} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
-    socket.write_all(request.as_bytes()).await.expect("write the callback request");
+    socket
+        .write_all(request.as_bytes())
+        .await
+        .expect("write the callback request");
     let mut response = Vec::new();
-    socket.read_to_end(&mut response).await.expect("read the callback reply");
+    socket
+        .read_to_end(&mut response)
+        .await
+        .expect("read the callback reply");
     let head = String::from_utf8_lossy(response.get(..response.len().min(64)).unwrap_or_default())
         .into_owned();
     head.split_whitespace()
@@ -1809,7 +2052,10 @@ async fn start_ui_session(hx: &Harness) -> (AgentSession, Arc<McpExtension>, Not
     let faux = Arc::new(FauxProvider::new());
     // `/mcp-auth` is serviced by `prepare` before any turn is assembled, so the provider is never
     // called on this route; the step is here so an accidental turn settles instead of hanging.
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ready")], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("ready")],
+        StopReason::Stop,
+    )]);
     let ext = adapter(hx);
     let session = SessionBuilder::new(faux as Arc<dyn Provider>, ui_session_config(hx))
         .with_native_extension(Arc::clone(&ext) as Arc<dyn cyrup_ext::NativeExtension>)
@@ -1830,7 +2076,10 @@ async fn start_ui_session(hx: &Harness) -> (AgentSession, Arc<McpExtension>, Not
 /// would bite), and dispatched to `NativeExtension::execute_command` with a command-tier `HostCtx`.
 /// Calling `execute_native_command` directly would skip the first two links.
 async fn slash(session: &AgentSession, line: &str) {
-    let _stream = session.prompt(line).await.expect("the submission was accepted");
+    let _stream = session
+        .prompt(line)
+        .await
+        .expect("the submission was accepted");
 }
 
 /// **`/mcp-auth fixture` logs in for real, over the loopback callback, and leaves a usable
@@ -1870,9 +2119,15 @@ async fn the_mcp_auth_command_logs_in_against_a_real_server_and_stores_a_usable_
         Some(cyrup_mcp::lifecycle::ConnectionStatus::NeedsAuth),
         "the session starts with an empty vault, so the startup connect ends at needs-auth"
     );
-    assert!(!vault_holds(&hx.store, &fixture.url).await, "the vault starts empty");
+    assert!(
+        !vault_holds(&hx.store, &fixture.url).await,
+        "the vault starts empty"
+    );
     let after_startup = fixture.requests().len();
-    assert!(fixture.hits("/register").is_empty(), "no login has been attempted yet");
+    assert!(
+        fixture.hits("/register").is_empty(),
+        "no login has been attempted yet"
+    );
 
     // ── phase 2 — the command, and the browser, at the same time ──────────────────────────────
     //
@@ -1977,7 +2232,10 @@ async fn the_mcp_auth_command_logs_in_against_a_real_server_and_stores_a_usable_
                 "the vault holds the token the fixture's /token endpoint minted, not a value this \
                  test put there"
             );
-            assert!(tokens.refresh_token.is_some(), "…and the refresh token beside it");
+            assert!(
+                tokens.refresh_token.is_some(),
+                "…and the refresh token beside it"
+            );
         }
         other => panic!("`/mcp-auth` stored a token in the generation's vault, got {other:?}"),
     }
@@ -2019,7 +2277,11 @@ async fn the_mcp_auth_command_logs_in_against_a_real_server_and_stores_a_usable_
         status(&cold_state),
         Some(cyrup_mcp::lifecycle::ConnectionStatus::Connected),
         "the next session connects at startup on the stored credential; failure: {:?}",
-        cold_state.failure_messages.lock().ok().and_then(|m| m.get(SERVER).cloned())
+        cold_state
+            .failure_messages
+            .lock()
+            .ok()
+            .and_then(|m| m.get(SERVER).cloned())
     );
     assert_eq!(
         fixture.unauthorized().len(),
@@ -2028,7 +2290,9 @@ async fn the_mcp_auth_command_logs_in_against_a_real_server_and_stores_a_usable_
         request_summary(&fixture)
     );
     no_oauth_flow_ran().await;
-    let echoed = cold_model.call(DIRECT_TOOL, serde_json::json!({ "text": "pong" })).await;
+    let echoed = cold_model
+        .call(DIRECT_TOOL, serde_json::json!({ "text": "pong" }))
+        .await;
     assert!(
         echoed.text.contains(SERVER_ANSWER),
         "the server's own bytes, over a transport authorized by a credential `/mcp-auth` logged in \
@@ -2069,7 +2333,10 @@ async fn a_denied_authorization_is_reported_as_a_failure_and_leaves_the_vault_em
         // The listener answers 200 and serves the error page: the callback is well-formed and the
         // state is one it knows — it is the AUTHORIZATION that was refused, not the callback.
         let status = loopback_get(&browser_denial(&authorization_url)).await;
-        assert_eq!(status, 200, "the listener recognised the state and served the refusal");
+        assert_eq!(
+            status, 200,
+            "the listener recognised the state and served the refusal"
+        );
     };
     tokio::time::timeout(
         STEP_TIMEOUT,
@@ -2164,7 +2431,10 @@ async fn the_mcp_auth_command_refuses_a_server_that_is_not_configured() {
         "nothing reached the network: {:#?}",
         request_summary(&fixture)
     );
-    assert!(!vault_holds(&hx.store, &fixture.url).await, "and the vault is untouched");
+    assert!(
+        !vault_holds(&hx.store, &fixture.url).await,
+        "and the vault is untouched"
+    );
     no_oauth_flow_ran().await;
 
     session.dispose("quit").await;
@@ -2192,7 +2462,10 @@ async fn the_mcp_auth_command_refuses_a_headless_session_rather_than_pretending(
     // attached anyway: the sink is the mode's drain and is independent of `has_ui`, which is what
     // lets the return-channel branch be observed at all.
     let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ready")], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("ready")],
+        StopReason::Stop,
+    )]);
     let ext = adapter(&hx);
     let session = SessionBuilder::new(faux as Arc<dyn Provider>, session_config(&hx))
         .with_native_extension(Arc::clone(&ext) as Arc<dyn cyrup_ext::NativeExtension>)

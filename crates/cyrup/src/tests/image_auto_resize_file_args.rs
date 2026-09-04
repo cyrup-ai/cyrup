@@ -17,8 +17,8 @@
     clippy::indexing_slicing
 )]
 
-use base64::Engine;
 use crate::{Cli, Inputs, build_inputs};
+use base64::Engine;
 use cyrup_sdk::core::Content;
 
 /// Wider than the 2000px edge so the resize branch is unambiguously reachable, and a smooth gradient
@@ -35,9 +35,12 @@ struct Fx {
 fn fixture() -> Fx {
     let dir = tempfile::tempdir().unwrap();
     let img: image::ImageBuffer<image::Rgb<u8>, Vec<u8>> =
-        image::ImageBuffer::from_fn(W, H, |x, y| image::Rgb([(x % 251) as u8, (y % 241) as u8, 0]));
+        image::ImageBuffer::from_fn(W, H, |x, y| {
+            image::Rgb([(x % 251) as u8, (y % 241) as u8, 0])
+        });
     let path = dir.path().join("shot.png");
-    img.save_with_format(&path, image::ImageFormat::Png).unwrap();
+    img.save_with_format(&path, image::ImageFormat::Png)
+        .unwrap();
     let raw = std::fs::read(&path).unwrap();
     Fx { dir, raw }
 }

@@ -5,16 +5,24 @@
 
 use std::collections::BTreeMap;
 
-use serde_json::{json, Map as JsonMap, Value};
+use serde_json::{Map as JsonMap, Value, json};
 
-use cyrup_core::{ToolResult};
+use cyrup_core::ToolResult;
 
 use crate::config::ServerEntry;
-use crate::proxy::constants::{INSTRUCTIONS_PREVIEW_LENGTH, MAX_REGEX_SEARCH_QUERY_LENGTH, REGEX_DFA_SIZE_LIMIT, REGEX_SIZE_LIMIT};
+use crate::proxy::constants::{
+    INSTRUCTIONS_PREVIEW_LENGTH, MAX_REGEX_SEARCH_QUERY_LENGTH, REGEX_DFA_SIZE_LIMIT,
+    REGEX_SIZE_LIMIT,
+};
 use crate::proxy::env::{ConnectionStatus, ProxyCtx};
 use crate::proxy::error_vocab::McpErrorCode;
-use crate::proxy::ranking::{RankedToolMatch, paginate, rank_collate, rank_tool_matches, resolve_search_keywords};
-use crate::proxy::results::{ambiguous_tool_result, details, details_err, disabled_result, get_enabled_tool_matches, not_found_result, text_result};
+use crate::proxy::ranking::{
+    RankedToolMatch, paginate, rank_collate, rank_tool_matches, resolve_search_keywords,
+};
+use crate::proxy::results::{
+    ambiguous_tool_result, details, details_err, disabled_result, get_enabled_tool_matches,
+    not_found_result, text_result,
+};
 use crate::proxy::tool_metadata::{ToolMetadata, find_tool_by_name, truncate_at_word};
 
 // ==================================================================================================
@@ -44,14 +52,23 @@ pub fn execute_status(ctx: &ProxyCtx) -> ToolResult {
     let mut servers: Vec<Row> = Vec::new();
     for name in ctx.config().mcp_servers.keys() {
         let disabled = ctx.is_disabled(name);
-        let connection = if disabled { None } else { ctx.env.get_connection(name) };
+        let connection = if disabled {
+            None
+        } else {
+            ctx.env.get_connection(name)
+        };
         let tool_count = if disabled {
             0
         } else {
-            ctx.with_metadata(|metadata| metadata.get(name).map(Vec::len)).unwrap_or(0)
+            ctx.with_metadata(|metadata| metadata.get(name).map(Vec::len))
+                .unwrap_or(0)
         };
         let has_metadata = !disabled && ctx.with_metadata(|metadata| metadata.contains_key(name));
-        let failed_ago = if disabled { None } else { ctx.env.failure_age_seconds(name) };
+        let failed_ago = if disabled {
+            None
+        } else {
+            ctx.env.failure_age_seconds(name)
+        };
 
         let status = if disabled {
             "disabled"
@@ -67,15 +84,27 @@ pub fn execute_status(ctx: &ProxyCtx) -> ToolResult {
             "not connected"
         };
 
-        servers.push(Row { name: name.clone(), status, tool_count, failed_ago, disabled });
+        servers.push(Row {
+            name: name.clone(),
+            status,
+            tool_count,
+            failed_ago,
+            disabled,
+        });
     }
 
     let disabled_count = servers.iter().filter(|row| row.disabled).count();
     let enabled: Vec<&Row> = servers.iter().filter(|row| !row.disabled).collect();
     let total_tools: usize = enabled.iter().map(|row| row.tool_count).sum();
-    let connected_count = enabled.iter().filter(|row| row.status == "connected").count();
+    let connected_count = enabled
+        .iter()
+        .filter(|row| row.status == "connected")
+        .count();
 
-    let mut text = format!("MCP: {connected_count}/{} servers, {total_tools} tools", enabled.len());
+    let mut text = format!(
+        "MCP: {connected_count}/{} servers, {total_tools} tools",
+        enabled.len()
+    );
     if disabled_count > 0 {
         text.push_str(&format!(" ({disabled_count} disabled)"));
     }
@@ -91,13 +120,18 @@ pub fn execute_status(ctx: &ProxyCtx) -> ToolResult {
             "needs-auth" => text.push_str(&format!("⚠ {name} (needs auth)\n")),
             "cached" => text.push_str(&format!("○ {name} ({} tools, cached)\n", row.tool_count)),
             "failed" => {
-                text.push_str(&format!("✗ {name} (failed {}s ago)\n", row.failed_ago.unwrap_or(0)));
+                text.push_str(&format!(
+                    "✗ {name} (failed {}s ago)\n",
+                    row.failed_ago.unwrap_or(0)
+                ));
             }
             _ => text.push_str(&format!("○ {name} (not connected)\n")),
         }
     }
     if !servers.is_empty() {
-        text.push_str("\nmcp({ server: \"name\" }) to list tools, mcp({ search: \"...\" }) to search");
+        text.push_str(
+            "\nmcp({ server: \"name\" }) to list tools, mcp({ search: \"...\" }) to search",
+        );
     }
 
     let rows: Vec<Value> = servers
@@ -147,21 +181,26 @@ pub fn execute_list(ctx: &ProxyCtx, server: &str) -> ToolResult {
         return disabled_result("list", server);
     }
 
-    let metadata: Option<Vec<ToolMetadata>> =
-        ctx.with_metadata(|map| map.get(server).cloned());
-    let tool_names: Vec<String> =
-        metadata.as_ref().map(|tools| tools.iter().map(|tool| tool.name.clone()).collect()).unwrap_or_default();
+    let metadata: Option<Vec<ToolMetadata>> = ctx.with_metadata(|map| map.get(server).cloned());
+    let tool_names: Vec<String> = metadata
+        .as_ref()
+        .map(|tools| tools.iter().map(|tool| tool.name.clone()).collect())
+        .unwrap_or_default();
     let connection = ctx.env.get_connection(server);
     // `Boolean(instructions)` — an empty string is falsy upstream, so it neither renders the
     // preview block nor sets `hasInstructions`.
-    let instructions = ctx.server_instructions(server).filter(|text| !text.is_empty());
+    let instructions = ctx
+        .server_instructions(server)
+        .filter(|text| !text.is_empty());
 
     let mut instructions_text = String::new();
     if let Some(instructions) = instructions.as_ref() {
         let preview = truncate_at_word(instructions, INSTRUCTIONS_PREVIEW_LENGTH);
         instructions_text = format!("\n\nServer instructions:\n{preview}");
         if &preview != instructions {
-            instructions_text.push_str(&format!("\nUse mcp({{ instructions: \"{server}\" }}) for the full text."));
+            instructions_text.push_str(&format!(
+                "\nUse mcp({{ instructions: \"{server}\" }}) for the full text."
+            ));
         }
     }
     let has_instructions = instructions.is_some();
@@ -173,7 +212,10 @@ pub fn execute_list(ctx: &ProxyCtx, server: &str) -> ToolResult {
             map.insert("tools".to_string(), Value::Array(Vec::new()));
             map.insert("count".to_string(), json!(0));
             map.insert("hasInstructions".to_string(), Value::Bool(has_instructions));
-            return text_result(format!("Server \"{server}\" has no tools.{instructions_text}"), map);
+            return text_result(
+                format!("Server \"{server}\" has no tools.{instructions_text}"),
+                map,
+            );
         }
         if metadata.is_some() {
             let mut map = details("list");
@@ -183,7 +225,9 @@ pub fn execute_list(ctx: &ProxyCtx, server: &str) -> ToolResult {
             map.insert("cached".to_string(), Value::Bool(true));
             map.insert("hasInstructions".to_string(), Value::Bool(has_instructions));
             return text_result(
-                format!("Server \"{server}\" has no cached tools (not connected).{instructions_text}"),
+                format!(
+                    "Server \"{server}\" has no cached tools (not connected).{instructions_text}"
+                ),
                 map,
             );
         }
@@ -193,19 +237,33 @@ pub fn execute_list(ctx: &ProxyCtx, server: &str) -> ToolResult {
         map.insert("count".to_string(), json!(0));
         map.insert("hasInstructions".to_string(), Value::Bool(has_instructions));
         return text_result(
-            format!("Server \"{server}\" is configured but not connected. Use mcp({{ connect: \"{server}\" }}) or /mcp reconnect {server} to retry.{instructions_text}"),
+            format!(
+                "Server \"{server}\" is configured but not connected. Use mcp({{ connect: \"{server}\" }}) or /mcp reconnect {server} to retry.{instructions_text}"
+            ),
             map,
         );
     }
 
-    let cached_note = if connection == Some(ConnectionStatus::Connected) { "" } else { " (not connected, cached)" };
+    let cached_note = if connection == Some(ConnectionStatus::Connected) {
+        ""
+    } else {
+        " (not connected, cached)"
+    };
     let mut text = format!("{server} ({} tools{cached_note}):\n\n", tool_names.len());
     let descriptions: BTreeMap<String, String> = metadata
         .as_ref()
-        .map(|tools| tools.iter().map(|tool| (tool.name.clone(), tool.description.clone())).collect())
+        .map(|tools| {
+            tools
+                .iter()
+                .map(|tool| (tool.name.clone(), tool.description.clone()))
+                .collect()
+        })
         .unwrap_or_default();
     for tool in &tool_names {
-        let description = descriptions.get(tool).map(String::as_str).unwrap_or_default();
+        let description = descriptions
+            .get(tool)
+            .map(String::as_str)
+            .unwrap_or_default();
         let truncated = truncate_at_word(description, 50);
         text.push_str(&format!("- {tool}"));
         if !truncated.is_empty() {
@@ -219,7 +277,12 @@ pub fn execute_list(ctx: &ProxyCtx, server: &str) -> ToolResult {
     map.insert("server".to_string(), Value::String(server.to_string()));
     map.insert(
         "tools".to_string(),
-        Value::Array(tool_names.iter().map(|name| Value::String(name.clone())).collect()),
+        Value::Array(
+            tool_names
+                .iter()
+                .map(|name| Value::String(name.clone()))
+                .collect(),
+        ),
     );
     map.insert("count".to_string(), json!(tool_names.len()));
     map.insert("hasInstructions".to_string(), Value::Bool(has_instructions));
@@ -241,7 +304,10 @@ pub fn execute_instructions(ctx: &ProxyCtx, server: &str) -> ToolResult {
         return disabled_result("instructions", server);
     }
 
-    if let Some(instructions) = ctx.server_instructions(server).filter(|text| !text.is_empty()) {
+    if let Some(instructions) = ctx
+        .server_instructions(server)
+        .filter(|text| !text.is_empty())
+    {
         let mut map = details("instructions");
         map.insert("server".to_string(), Value::String(server.to_string()));
         // JS `.length` is UTF-16 code units; `chars().count()` is the closest honest analogue and
@@ -253,13 +319,18 @@ pub fn execute_instructions(ctx: &ProxyCtx, server: &str) -> ToolResult {
     if ctx.env.get_connection(server) == Some(ConnectionStatus::Connected) {
         let mut map = details_err("instructions", McpErrorCode::NoInstructions);
         map.insert("server".to_string(), Value::String(server.to_string()));
-        return text_result(format!("Server \"{server}\" does not provide instructions."), map);
+        return text_result(
+            format!("Server \"{server}\" does not provide instructions."),
+            map,
+        );
     }
 
     let mut map = details_err("instructions", McpErrorCode::NotConnected);
     map.insert("server".to_string(), Value::String(server.to_string()));
     text_result(
-        format!("No instructions cached for \"{server}\". Use mcp({{ connect: \"{server}\" }}) to connect and refresh."),
+        format!(
+            "No instructions cached for \"{server}\". Use mcp({{ connect: \"{server}\" }}) to connect and refresh."
+        ),
         map,
     )
 }
@@ -298,8 +369,15 @@ pub fn execute_describe(ctx: &ProxyCtx, tool_name: &str) -> ToolResult {
 
         if tool_meta.is_none() {
             for (server, tools) in metadata {
-                let Some(found) = find_tool_by_name(tools, tool_name) else { continue };
-                if ctx.config().mcp_servers.get(server).is_some_and(ServerEntry::is_disabled) {
+                let Some(found) = find_tool_by_name(tools, tool_name) else {
+                    continue;
+                };
+                if ctx
+                    .config()
+                    .mcp_servers
+                    .get(server)
+                    .is_some_and(ServerEntry::is_disabled)
+                {
                     // `??=` — the FIRST disabled hit is remembered and the scan continues.
                     disabled_match.get_or_insert_with(|| server.clone());
                     continue;
@@ -328,18 +406,31 @@ pub fn execute_describe(ctx: &ProxyCtx, tool_name: &str) -> ToolResult {
             format!(" Did you mean: {}", suggestions.join(", "))
         };
         let mut map = details_err("describe", McpErrorCode::ToolNotFound);
-        map.insert("requestedTool".to_string(), Value::String(tool_name.to_string()));
+        map.insert(
+            "requestedTool".to_string(),
+            Value::String(tool_name.to_string()),
+        );
         map.insert(
             "suggestions".to_string(),
-            Value::Array(suggestions.iter().map(|name| Value::String(name.clone())).collect()),
+            Value::Array(
+                suggestions
+                    .iter()
+                    .map(|name| Value::String(name.clone()))
+                    .collect(),
+            ),
         );
         return text_result(
-            format!("Tool \"{tool_name}\" not found. Use mcp({{ search: \"...\" }}) to search.{suggestion_text}"),
+            format!(
+                "Tool \"{tool_name}\" not found. Use mcp({{ search: \"...\" }}) to search.{suggestion_text}"
+            ),
             map,
         );
     };
 
-    let approval_marker = if ctx.env.is_tool_call_approval_required(&server_name, &tool_meta) {
+    let approval_marker = if ctx
+        .env
+        .is_tool_call_approval_required(&server_name, &tool_meta)
+    {
         " (requires approval)"
     } else {
         ""
@@ -349,14 +440,23 @@ pub fn execute_describe(ctx: &ProxyCtx, tool_name: &str) -> ToolResult {
     if let Some(uri) = tool_meta.resource_uri.as_ref() {
         text.push_str(&format!("Type: Resource (reads from {uri})\n"));
     }
-    let description =
-        if tool_meta.description.is_empty() { "(no description)" } else { tool_meta.description.as_str() };
+    let description = if tool_meta.description.is_empty() {
+        "(no description)"
+    } else {
+        tool_meta.description.as_str()
+    };
     text.push_str(&format!("\n{description}\n"));
 
-    match (tool_meta.input_schema.as_ref(), tool_meta.resource_uri.as_ref()) {
+    match (
+        tool_meta.input_schema.as_ref(),
+        tool_meta.resource_uri.as_ref(),
+    ) {
         (Some(schema), None) => match ctx.env.render_ts_shape(schema) {
             // `renderTsShape` returning null is the fork to the long-form printer.
-            None => text.push_str(&format!("\nParameters:\n{}", ctx.env.format_schema(schema, "  "))),
+            None => text.push_str(&format!(
+                "\nParameters:\n{}",
+                ctx.env.format_schema(schema, "  ")
+            )),
             Some(shape) => text.push_str(&format!("\nShape:\n{shape}")),
         },
         (_, Some(_)) => text.push_str("\nNo parameters required (resource tool)."),
@@ -417,9 +517,14 @@ pub fn execute_search(
         if query.chars().count() > MAX_REGEX_SEARCH_QUERY_LENGTH {
             let mut map = details_err("search", McpErrorCode::QueryTooLong);
             map.insert("query".to_string(), Value::String(query.to_string()));
-            map.insert("maxLength".to_string(), json!(MAX_REGEX_SEARCH_QUERY_LENGTH));
+            map.insert(
+                "maxLength".to_string(),
+                json!(MAX_REGEX_SEARCH_QUERY_LENGTH),
+            );
             return text_result(
-                format!("Regex query is too long; maximum length is {MAX_REGEX_SEARCH_QUERY_LENGTH} characters."),
+                format!(
+                    "Regex query is too long; maximum length is {MAX_REGEX_SEARCH_QUERY_LENGTH} characters."
+                ),
                 map,
             );
         }
@@ -460,9 +565,14 @@ pub fn execute_search(
                     // `resolveSearchKeywords` via `resolveToolPrefix`.
                     let matched = pattern.is_match(&tool.name)
                         || pattern.is_match(&tool.description)
-                        || resolve_search_keywords(definition, &tool.original_name, server_name, global_prefix)
-                            .iter()
-                            .any(|keyword| pattern.is_match(keyword));
+                        || resolve_search_keywords(
+                            definition,
+                            &tool.original_name,
+                            server_name,
+                            global_prefix,
+                        )
+                        .iter()
+                        .any(|keyword| pattern.is_match(keyword));
                     if matched {
                         matches.push(RankedToolMatch {
                             server: server_name.clone(),
@@ -539,7 +649,11 @@ pub fn execute_search(
             ),
             _ => format!(
                 " Servers {} are still connecting; retry in a moment.",
-                connecting.iter().map(|name| format!("\"{name}\"")).collect::<Vec<_>>().join(", ")
+                connecting
+                    .iter()
+                    .map(|name| format!("\"{name}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
         };
         let mut map = details("search");
@@ -551,16 +665,27 @@ pub fn execute_search(
         if !connecting.is_empty() {
             map.insert(
                 "connectingServers".to_string(),
-                Value::Array(connecting.iter().map(|name| Value::String(name.clone())).collect()),
+                Value::Array(
+                    connecting
+                        .iter()
+                        .map(|name| Value::String(name.clone()))
+                        .collect(),
+                ),
             );
         }
         return text_result(format!("{base}{hint}"), map);
     }
 
     let plural = if page.total == 1 { "" } else { "s" };
-    let mut text = format!("Found {} tool{plural} matching \"{query}\":\n\n", page.total);
+    let mut text = format!(
+        "Found {} tool{plural} matching \"{query}\":\n\n",
+        page.total
+    );
     for entry in &page.items {
-        let approval_marker = if ctx.env.is_tool_call_approval_required(&entry.server, &entry.tool) {
+        let approval_marker = if ctx
+            .env
+            .is_tool_call_approval_required(&entry.server, &entry.tool)
+        {
             " (requires approval)"
         } else {
             ""
@@ -573,7 +698,10 @@ pub fn execute_search(
                 entry.tool.description.as_str()
             };
             text.push_str(&format!("  {description}\n"));
-            match (entry.tool.input_schema.as_ref(), entry.tool.resource_uri.as_ref()) {
+            match (
+                entry.tool.input_schema.as_ref(),
+                entry.tool.resource_uri.as_ref(),
+            ) {
                 (Some(schema), None) => match ctx.env.render_ts_shape(schema) {
                     None => text.push_str(&format!(
                         "\n  Parameters:\n{}\n",
@@ -595,7 +723,10 @@ pub fn execute_search(
         } else {
             text.push_str(&format!("- {}{approval_marker}", entry.tool.name));
             if !entry.tool.description.is_empty() {
-                text.push_str(&format!(" - {}", truncate_at_word(&entry.tool.description, 50)));
+                text.push_str(&format!(
+                    " - {}",
+                    truncate_at_word(&entry.tool.description, 50)
+                ));
             }
             text.push('\n');
         }
@@ -634,7 +765,12 @@ pub fn execute_search(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::proxy::testsupport::{FakeEnv, config_with, ctx_with, http, stdio, text_of};
@@ -675,7 +811,10 @@ mod tests {
 
     #[test]
     fn status_renders_all_six_rungs_with_their_glyphs() {
-        let disabled = ServerEntry { disabled: Some(true), ..ServerEntry::default() };
+        let disabled = ServerEntry {
+            disabled: Some(true),
+            ..ServerEntry::default()
+        };
         let config = config_with(&[
             ("live", stdio("a")),
             ("waiting", http("https://a.example")),
@@ -691,7 +830,13 @@ mod tests {
         let (ctx, _) = ctx_with(
             config,
             &[
-                ("live", vec![ToolMetadata::new("live_a", "a", ""), ToolMetadata::new("live_b", "b", "")]),
+                (
+                    "live",
+                    vec![
+                        ToolMetadata::new("live_a", "a", ""),
+                        ToolMetadata::new("live_b", "b", ""),
+                    ],
+                ),
                 ("warm", vec![ToolMetadata::new("warm_a", "a", "")]),
             ],
             &[],
@@ -701,7 +846,10 @@ mod tests {
         let result = execute_status(&ctx);
         let text = text_of(&result);
         // The header counts ENABLED servers only, and totals only their tools.
-        assert!(text.starts_with("MCP: 1/5 servers, 3 tools (1 disabled)\n\n"), "{text}");
+        assert!(
+            text.starts_with("MCP: 1/5 servers, 3 tools (1 disabled)\n\n"),
+            "{text}"
+        );
         assert!(text.contains("✓ live (2 tools)\n"), "{text}");
         assert!(text.contains("⚠ waiting (needs auth)\n"), "{text}");
         assert!(text.contains("✗ broken (failed 12s ago)\n"), "{text}");
@@ -719,8 +867,14 @@ mod tests {
         assert_eq!(details["disabledCount"], json!(1));
         let rows = details["servers"].as_array().expect("servers");
         // Insertion order, not alphabetical.
-        let names: Vec<&str> = rows.iter().map(|row| row["name"].as_str().unwrap()).collect();
-        assert_eq!(names, vec!["live", "waiting", "broken", "warm", "cold", "off"]);
+        let names: Vec<&str> = rows
+            .iter()
+            .map(|row| row["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["live", "waiting", "broken", "warm", "cold", "off"]
+        );
         // `disabled` is present ONLY when true.
         assert!(rows[0].get("disabled").is_none());
         assert_eq!(rows[5]["disabled"], json!(true));
@@ -732,7 +886,10 @@ mod tests {
 
     #[test]
     fn list_covers_its_five_outcomes() {
-        let disabled = ServerEntry { disabled: Some(true), ..ServerEntry::default() };
+        let disabled = ServerEntry {
+            disabled: Some(true),
+            ..ServerEntry::default()
+        };
         let config = config_with(&[
             ("empty_live", stdio("a")),
             ("empty_cached", stdio("b")),
@@ -762,28 +919,49 @@ mod tests {
 
         // 1 · unknown server.
         let unknown = execute_list(&ctx, "nope");
-        assert_eq!(unknown.details.clone().unwrap()["error"], json!("not_found"));
+        assert_eq!(
+            unknown.details.clone().unwrap()["error"],
+            json!("not_found")
+        );
         // 2 · disabled.
-        assert_eq!(execute_list(&ctx, "off").details.clone().unwrap()["error"], json!("server_disabled"));
+        assert_eq!(
+            execute_list(&ctx, "off").details.clone().unwrap()["error"],
+            json!("server_disabled")
+        );
         // 4a · connected with zero tools, plus a short instructions preview and NO pointer.
         let live = execute_list(&ctx, "empty_live");
-        assert_eq!(text_of(&live), "Server \"empty_live\" has no tools.\n\nServer instructions:\nShort note.");
+        assert_eq!(
+            text_of(&live),
+            "Server \"empty_live\" has no tools.\n\nServer instructions:\nShort note."
+        );
         let details = live.details.clone().unwrap();
         assert_eq!(details["count"], json!(0));
         assert_eq!(details["hasInstructions"], json!(true));
         assert!(details.get("error").is_none());
         // 4b · metadata present but not connected.
         let cached = execute_list(&ctx, "empty_cached");
-        assert_eq!(text_of(&cached), "Server \"empty_cached\" has no cached tools (not connected).");
+        assert_eq!(
+            text_of(&cached),
+            "Server \"empty_cached\" has no cached tools (not connected)."
+        );
         assert_eq!(cached.details.clone().unwrap()["cached"], json!(true));
         // 4c · no metadata at all.
         let never = execute_list(&ctx, "never");
-        assert_eq!(never.details.clone().unwrap()["error"], json!("not_connected"));
+        assert_eq!(
+            never.details.clone().unwrap()["error"],
+            json!("not_connected")
+        );
         // 5 · the listing, with the pointer BECAUSE the 300-char preview truncated.
         let full = execute_list(&ctx, "full");
         let text = text_of(&full);
-        assert!(text.starts_with("full (2 tools):\n\n- full_a - Does a thing\n- full_b\n"), "{text}");
-        assert!(text.contains("\nUse mcp({ instructions: \"full\" }) for the full text."), "{text}");
+        assert!(
+            text.starts_with("full (2 tools):\n\n- full_a - Does a thing\n- full_b\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\nUse mcp({ instructions: \"full\" }) for the full text."),
+            "{text}"
+        );
         let details = full.details.clone().unwrap();
         assert_eq!(details["tools"], json!(["full_a", "full_b"]));
         assert_eq!(details["count"], json!(2));
@@ -798,14 +976,20 @@ mod tests {
             &[],
             FakeEnv::default(),
         );
-        assert!(text_of(&execute_list(&ctx, "srv")).starts_with("srv (1 tools (not connected, cached)):"));
+        assert!(
+            text_of(&execute_list(&ctx, "srv"))
+                .starts_with("srv (1 tools (not connected, cached)):")
+        );
     }
 
     // ---- MCP-156 · `executeInstructions` --------------------------------------------------------------
 
     #[test]
     fn cached_instructions_win_even_for_a_disconnected_server() {
-        let disabled = ServerEntry { disabled: Some(true), ..ServerEntry::default() };
+        let disabled = ServerEntry {
+            disabled: Some(true),
+            ..ServerEntry::default()
+        };
         let config = config_with(&[
             ("cached", stdio("a")),
             ("live", stdio("b")),
@@ -816,7 +1000,10 @@ mod tests {
         let (ctx, _) = ctx_with(config, &[], &[("cached", "Use the API key.")], env);
 
         assert_eq!(
-            execute_instructions(&ctx, "missing").details.clone().unwrap()["error"],
+            execute_instructions(&ctx, "missing")
+                .details
+                .clone()
+                .unwrap()["error"],
             json!("not_found")
         );
         assert_eq!(
@@ -860,7 +1047,10 @@ mod tests {
 
     #[test]
     fn describe_reports_a_disabled_only_match_as_server_disabled() {
-        let disabled = ServerEntry { disabled: Some(true), ..ServerEntry::default() };
+        let disabled = ServerEntry {
+            disabled: Some(true),
+            ..ServerEntry::default()
+        };
         let config = config_with(&[("off", disabled)]);
         let (ctx, _) = ctx_with(
             config,
@@ -869,7 +1059,10 @@ mod tests {
             FakeEnv::default(),
         );
         let result = execute_describe(&ctx, "off_thing");
-        assert_eq!(result.details.clone().unwrap()["error"], json!("server_disabled"));
+        assert_eq!(
+            result.details.clone().unwrap()["error"],
+            json!("server_disabled")
+        );
     }
 
     #[test]
@@ -892,7 +1085,9 @@ mod tests {
         let details = miss.details.clone().unwrap();
         assert_eq!(details["error"], json!("tool_not_found"));
         assert_eq!(details["requestedTool"], json!("totally_absent"));
-        assert!(text_of(&miss).starts_with("Tool \"totally_absent\" not found. Use mcp({ search: \"...\" }) to search."));
+        assert!(text_of(&miss).starts_with(
+            "Tool \"totally_absent\" not found. Use mcp({ search: \"...\" }) to search."
+        ));
     }
 
     #[test]
@@ -901,7 +1096,12 @@ mod tests {
         let mut with_schema = ToolMetadata::new("srv_run", "run", "Run it");
         with_schema.input_schema = Some(json!({"type": "object"}));
         let plain = ToolMetadata::new("srv_ping", "ping", "");
-        let (ctx, _) = ctx_with(config, &[("srv", vec![with_schema, plain])], &[], FakeEnv::default());
+        let (ctx, _) = ctx_with(
+            config,
+            &[("srv", vec![with_schema, plain])],
+            &[],
+            FakeEnv::default(),
+        );
 
         // `renderTsShape` returned a shape, so the `Shape:` arm is taken.
         assert!(text_of(&execute_describe(&ctx, "srv_run")).ends_with("\nShape:\n{ a: string }"));
@@ -921,7 +1121,13 @@ mod tests {
         let (ctx, _) = ctx_with(
             config,
             &[
-                ("zeta", vec![ToolMetadata::new("z_two", "two", ""), ToolMetadata::new("z_one", "one", "")]),
+                (
+                    "zeta",
+                    vec![
+                        ToolMetadata::new("z_two", "two", ""),
+                        ToolMetadata::new("z_one", "one", ""),
+                    ],
+                ),
                 ("alpha", vec![ToolMetadata::new("a_one", "one", "")]),
             ],
             &[],
@@ -929,11 +1135,21 @@ mod tests {
         );
         let result = execute_search(&ctx, "_", Some(true), None, Some(false), None, None);
         let details = result.details.clone().unwrap();
-        let names: Vec<&str> =
-            details["matches"].as_array().unwrap().iter().map(|m| m["tool"].as_str().unwrap()).collect();
+        let names: Vec<&str> = details["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["tool"].as_str().unwrap())
+            .collect();
         assert_eq!(names, vec!["z_two", "z_one", "a_one"]);
         // Every regex match scores 0.
-        assert!(details["matches"].as_array().unwrap().iter().all(|m| m["score"] == json!(0)));
+        assert!(
+            details["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| m["score"] == json!(0))
+        );
     }
 
     #[test]
@@ -952,10 +1168,16 @@ mod tests {
         );
 
         let malformed = execute_search(&ctx, "(a", Some(true), None, None, None, None);
-        assert_eq!(malformed.details.clone().unwrap()["error"], json!("invalid_pattern"));
+        assert_eq!(
+            malformed.details.clone().unwrap()["error"],
+            json!("invalid_pattern")
+        );
         // A non-regex search is unaffected by the cap.
         let plain = execute_search(&ctx, &long, None, None, None, None, None);
-        assert_ne!(plain.details.clone().unwrap()["error"], json!("query_too_long"));
+        assert_ne!(
+            plain.details.clone().unwrap()["error"],
+            json!("query_too_long")
+        );
     }
 
     #[test]
@@ -965,20 +1187,30 @@ mod tests {
             config,
             &[(
                 "srv",
-                vec![ToolMetadata::new("Zeta", "Zeta", ""), ToolMetadata::new("alpha", "alpha", "")],
+                vec![
+                    ToolMetadata::new("Zeta", "Zeta", ""),
+                    ToolMetadata::new("alpha", "alpha", ""),
+                ],
             )],
             &[],
             FakeEnv::default(),
         );
         // `search: ""` REACHES the mode (dispatch tests `!== undefined`).
         let empty = execute_search(&ctx, "", None, None, None, None, None);
-        assert_eq!(empty.details.clone().unwrap()["error"], json!("empty_query"));
+        assert_eq!(
+            empty.details.clone().unwrap()["error"],
+            json!("empty_query")
+        );
         assert_eq!(text_of(&empty), "Search query cannot be empty");
 
         let scoped = execute_search(&ctx, "  ", None, Some("srv"), Some(false), None, None);
         let details = scoped.details.clone().unwrap();
-        let names: Vec<&str> =
-            details["matches"].as_array().unwrap().iter().map(|m| m["tool"].as_str().unwrap()).collect();
+        let names: Vec<&str> = details["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["tool"].as_str().unwrap())
+            .collect();
         // ICU root collation, not byte order: `alpha` before `Zeta`.
         assert_eq!(names, vec!["alpha", "Zeta"]);
     }
@@ -986,21 +1218,30 @@ mod tests {
     #[test]
     fn zero_results_report_connecting_servers_singular_and_plural() {
         let config = config_with(&[("one", stdio("a")), ("two", stdio("b"))]);
-        let (ctx, env) =
-            ctx_with(config.clone(), &[], &[], FakeEnv::default().with_connecting("one"));
+        let (ctx, env) = ctx_with(
+            config.clone(),
+            &[],
+            &[],
+            FakeEnv::default().with_connecting("one"),
+        );
         let single = execute_search(&ctx, "nothing", None, None, None, None, None);
         assert_eq!(
             text_of(&single),
             "No tools matching \"nothing\" Server \"one\" is still connecting; retry in a moment."
         );
-        assert_eq!(single.details.clone().unwrap()["connectingServers"], json!(["one"]));
+        assert_eq!(
+            single.details.clone().unwrap()["connectingServers"],
+            json!(["one"])
+        );
         drop(env);
 
         let (ctx, _) = ctx_with(
             config,
             &[],
             &[],
-            FakeEnv::default().with_connecting("one").with_connecting("two"),
+            FakeEnv::default()
+                .with_connecting("one")
+                .with_connecting("two"),
         );
         let many = execute_search(&ctx, "nothing", None, None, None, None, None);
         assert_eq!(
@@ -1010,21 +1251,50 @@ mod tests {
         // A filtered search names only the filtered server, and the key is absent when empty.
         let filtered = execute_search(&ctx, "nothing", None, Some("one"), None, None, None);
         assert!(text_of(&filtered).starts_with("No tools matching \"nothing\" in \"one\""));
-        let (ctx, _) = ctx_with(config_with(&[("one", stdio("a"))]), &[], &[], FakeEnv::default());
+        let (ctx, _) = ctx_with(
+            config_with(&[("one", stdio("a"))]),
+            &[],
+            &[],
+            FakeEnv::default(),
+        );
         let quiet = execute_search(&ctx, "nothing", None, None, None, None, None);
-        assert!(quiet.details.clone().unwrap().get("connectingServers").is_none());
+        assert!(
+            quiet
+                .details
+                .clone()
+                .unwrap()
+                .get("connectingServers")
+                .is_none()
+        );
     }
 
     #[test]
     fn search_paginates_with_an_em_dash_footer() {
         let config = config_with(&[("srv", stdio("a"))]);
         let tools: Vec<ToolMetadata> = (0..5)
-            .map(|index| ToolMetadata::new(format!("srv_report_{index}"), format!("report_{index}"), "Reporting"))
+            .map(|index| {
+                ToolMetadata::new(
+                    format!("srv_report_{index}"),
+                    format!("report_{index}"),
+                    "Reporting",
+                )
+            })
             .collect();
         let (ctx, _) = ctx_with(config, &[("srv", tools)], &[], FakeEnv::default());
-        let page = execute_search(&ctx, "report", None, None, Some(false), Some(2.0), Some(0.0));
+        let page = execute_search(
+            &ctx,
+            "report",
+            None,
+            None,
+            Some(false),
+            Some(2.0),
+            Some(0.0),
+        );
         let text = text_of(&page);
-        assert!(text.starts_with("Found 5 tools matching \"report\":\n\n"), "{text}");
+        assert!(
+            text.starts_with("Found 5 tools matching \"report\":\n\n"),
+            "{text}"
+        );
         assert!(text.ends_with("2 of 5 — offset: 2 for more"), "{text}");
         let details = page.details.clone().unwrap();
         assert_eq!(details["hasMore"], json!(true));
@@ -1032,8 +1302,20 @@ mod tests {
         assert_eq!(details["count"], json!(5));
 
         // Singular header, and no footer, on the last page.
-        let last = execute_search(&ctx, "report_4", None, None, Some(false), Some(12.0), Some(0.0));
-        assert!(text_of(&last).starts_with("Found 1 tool matching"), "{}", text_of(&last));
+        let last = execute_search(
+            &ctx,
+            "report_4",
+            None,
+            None,
+            Some(false),
+            Some(12.0),
+            Some(0.0),
+        );
+        assert!(
+            text_of(&last).starts_with("Found 1 tool matching"),
+            "{}",
+            text_of(&last)
+        );
         assert_eq!(last.details.clone().unwrap()["nextOffset"], Value::Null);
     }
 
@@ -1044,12 +1326,18 @@ mod tests {
         tool.input_schema = Some(json!({"type": "object"}));
         let (ctx, _) = ctx_with(config, &[("srv", vec![tool])], &[], FakeEnv::default());
         let text = text_of(&execute_search(&ctx, "run", None, None, None, None, None));
-        assert!(text.contains("srv_run\n  Run it\n\n  Shape:\n    { a: string }"), "{text}");
+        assert!(
+            text.contains("srv_run\n  Run it\n\n  Shape:\n    { a: string }"),
+            "{text}"
+        );
     }
 
     #[test]
     fn a_disabled_server_filter_short_circuits_search() {
-        let disabled = ServerEntry { disabled: Some(true), ..ServerEntry::default() };
+        let disabled = ServerEntry {
+            disabled: Some(true),
+            ..ServerEntry::default()
+        };
         let config = config_with(&[("off", disabled)]);
         let (ctx, _) = ctx_with(config, &[], &[], FakeEnv::default());
         assert_eq!(
@@ -1059,5 +1347,4 @@ mod tests {
             json!("server_disabled")
         );
     }
-
 }

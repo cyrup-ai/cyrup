@@ -109,6 +109,14 @@ in areas 07 and 08.
 
 ## Open items
 
+> **RECOUNTED 2026-09-04, batch 2 (ledger audit); authoritative over the paragraph below.** Counted set
+> **0 critical, 0 high, 0 medium, 1 low = 1 open** (`FLUX-007`), 6 closed (`scripts/count_open_items.py`). Four
+> closures on landed code, each independently reviewed: `FLUX-001` (`03f3add0`, bundle embedded and
+> materialised under the agent dir), `FLUX-002` (`c7d21bbb`, fan-out gated on `subagent` availability),
+> `FLUX-003` (`4bb3569c`, 37 tests whose expectations are the upstream Python's output, six defects fixed
+> on the way), `FLUX-004` (`c846ff97`, overlay chord moved to `ctrl+alt+f`); `FLUX-005` PARTIALLY CLOSED
+> with `FLUX-003` and re-rated low; review fixes in `16edcde2`. The paragraph below is the filing-time count.
+>
 > **Counted set: 0 critical, 0 high, 4 medium, 3 low = 7.** No trackers. Every row was filed from
 > reading both sides at the named revisions; none is inherited, and none is a sweep digest routed
 > here. **`FLUX-001` is the one to schedule first** — it is the only row that can make the whole
@@ -117,19 +125,103 @@ in areas 07 and 08.
 
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
-| FLUX-001 | **medium** | cyrup-original | S | The bundled prompt/skill tree is resolved through a build-machine `CARGO_MANIFEST_DIR` path, so a binary without an intact source tree loses all 15 `/flux/*` templates and the skill — silently, while the three native commands, `ctrl+f` and `ask_user_question` still register |
-| FLUX-002 | **medium** | parity-bug | S | Four templates instruct the model to call the `subagent` tool, which is default-OFF, while Flux itself is default-ON — the rename `invoke_agent` → `subagent` ported the name and dropped the availability |
-| FLUX-003 | **medium** | test-defect | M | The crate has zero tests at 1,513 lines — a state parser, three renderers, an overlay and a tool with no red-before evidence for anything, and no pin on the cross-harness state contract the port calls a requirement |
-| FLUX-004 | **medium** | cyrup-original | S | `ctrl+f` silently takes the editor's `tui.editor.cursorRight` away from the user, with no diagnostic and no rebind path — the first LIVE instance of `EXT-039`'s open residual |
-| FLUX-005 | low | cyrup-original | S | The four `_docs/*.md` reference files are byte-identical duplicates of `skills/flux/reference/*.md` with no sync mechanism, and one of them is additionally compiled into `/flux/cheatsheet` |
-| FLUX-006 | low | parity-bug | S | `parse_frontmatter` is UTF-8-strict where the Python is `errors="replace"`, so one bad byte turns a task file's whole frontmatter into an empty map instead of a parsed one |
+| ~~FLUX-001~~ | ~~medium~~ **CLOSED 2026-09-04** | cyrup-original | S | The bundled prompt/skill tree is resolved through a build-machine `CARGO_MANIFEST_DIR` path, so a binary without an intact source tree loses all 15 `/flux/*` templates and the skill — silently, while the three native commands, `ctrl+f` and `ask_user_question` still register. **CLOSED 2026-09-04, cyrup `03f3add0`.** Landed as the row's **Fix (a)** with **(b)** on top: `crates/cyrup-flux/build.rs` embeds `resources/**` as a generated `include_bytes!` table (`src/bundle.rs` `bundled_files`/`bundled_file`/`bundle_fingerprint`); `src/install.rs` is the port of upstream's `installer.py` (`decide` → `FileAction`, `install_pass`, `ensure_installed` → `InstallOutcome::{UpToDate, Installed, SkippedLocked}`, SHA-256 manifest `.flux_bootstrap_manifest.json`, marker `.flux_bootstrap_version`, unique `.bak`/`.bak.N`, atomic tmp+rename, `fs4` non-blocking flock on `.flux_bootstrap.lock`); `src/resources.rs` replaces `bundled_dir()` with `BundledRoot::{Vendored(CYRUP_FLUX_RESOURCES_DIR), Managed(<agent_dir>/flux/resources)}` resolved once at construction (`resolve_from`, `managed_root`), and the `CARGO_MANIFEST_DIR` fallback is gone; `src/extension.rs::materialise_bundle` runs on every `ResourcesDiscover` before the contribution (upstream `register_callbacks.py:47-68`, notice wording kept — except that the install-failed Warning is `Flux bootstrap skipped (install failed): <root> (<err>)`, where `:68` prints `{exc}` alone; the root path is a labelled cyrup addition so the operator can see which tree failed) and a miss on either root is now a `notify` Warning naming the path instead of `HookOutcome::Noop`; `lib.rs` `flux_extension(agent_dir)` / `flux_extension_for_env(agent_dir)` / `flux_extension_with_root`, wired at `crates/cyrup/src/session_launch.rs:138` with the same `agent_dir` MCP and the permission system receive. Upstream re-read at **v0.0.40** (`flux_bootstrap/` byte-identical to v0.0.6): `installer.py:9-20` (goals), `:47`, `:113-127`, `:139-149`, `:152-167`, `:170-222`, `:225-256`; `register_callbacks.py:47-71`. **Tests (red before / green after):** `crates/cyrup-flux/tests/flux_001_embedded_bundle.rs`, 12 tests — a probe of `resources_discover_contributes_the_managed_root_not_the_build_tree` against the pre-change crate failed with `contributed the build-machine source tree: /home/user/cyrup/crates/cyrup-flux/resources/prompts`; `cargo nextest run -p cyrup-flux` 18/18 after (FLUX-002's 6 re-pointed at the embedded bundle, assertions unchanged). **Residual (medium, unfiled here):** the three sibling `CARGO_MANIFEST_DIR` resolvers this row names in `cyrup-ext-subagents` (`registration/resources.rs:46`, `extension/…builtin_agents_dir`) and `cyrup-intercom` (`resources.rs:41`) are NOT touched — other tracks own those crates this batch; the mechanism is reusable as-is. **Residual (low):** the row's full Verify (release binary moved off-tree, `/flux/new` resolves, `/skill:flux` loads) was not executed live; the unit-level Verify it names is `a_fresh_install_materialises_every_file_then_is_a_no_op`. Labelled inference: the marker is `<crate version>+<bundle sha256>`, not the version alone as upstream (`register_callbacks.py:38-44`), so a same-version rebuild with an edited template re-installs. |
+| ~~FLUX-002~~ | ~~medium~~ **CLOSED 2026-09-04** | parity-bug | S | Four templates instruct the model to call the `subagent` tool, which is default-OFF, while Flux itself is default-ON — the rename `invoke_agent` → `subagent` ported the name and dropped the availability. **CLOSED 2026-09-04, cyrup `c7d21bbb`.** Landed as the row's prescribed template fix, not the rejected gate-arming: each of the four multi-task branches now opens with an availability pre-condition — check the tool list for `subagent` BEFORE calling it; if absent, do NOT call it or substitute another tool, tell the user ONCE (naming the `CYRUP_SUBAGENTS=1` / `subagents/config.json` opt-in) and take the sequential single-task path — at `resources/prompts/flux/exec.md:48-49` (dispatch `ELSE:`) + `:181` (MULTI-TASK MODE), `aug.md:50-51` + `:158`, `qa.md:48-49` + `:163`, and `review.md:109` (STEP 6, degrade = review each group in-line, extended to STEP 7's second launch at `:192`); the skill's `N` row (`resources/skills/flux/SKILL.md:56`), `docs/guide/extensions/flux.md:61-64` and `spec/flux.md` §0.3 (next to the rename map, as the row required) record the same. The armed path is unchanged (one `subagent` call, `tasks:[]`, `concurrency: $ARGUMENTS`). The gate itself is untouched: `crates/cyrup-ext-subagents/src/extension/host/registration.rs:99-129` `is_installed`/`is_installed_with`, tool name at `extension/mod.rs:104`; flux still attaches unconditionally at `crates/cyrup/src/session_launch.rs:138` (the `main.rs:726/930/1060` seams this row cited have since moved there). Upstream re-read at **v0.0.40** (ADR-0006; `flux_bootstrap/` is byte-identical to v0.0.6): `bundled/commands/flux/exec.md:181`, `aug.md:158`, `qa.md:163`, `review.md:110` name `invoke_agent` unconditionally, which is correct there because it is a core `TOOL_REGISTRY` tool. **Tests (red before / green after):** `crates/cyrup-flux/tests/flux_002_subagent_fallback.rs` — 4 of 6 failed against the unedited templates (`every_multi_task_template_checks_tool_availability_before_calling_subagent`, `the_three_n_argument_templates_route_a_missing_tool_to_the_sequential_path_in_dispatch`, `review_degrades_in_line_and_covers_its_second_subagent_launch_in_step_7`, `the_skill_tells_the_model_the_n_mode_needs_the_subagent_tool`), 6/6 after; the two that held both times pin the armed path and the four-template census. **Residual (low):** the row's Verify is a live-model observation (`/flux/exec 3` on a three-todo fixture with the gate off completing sequentially with one notice) and was NOT executed — what is pinned is the prompt contract, and whether a given model honours a tool-list check is not testable here; the harness has no template-time signal of tool availability (prompt templates are static files contributed via `ResourcesDiscover`), so a wiring-level degrade would need a new seam and is not filed. |
+| ~~FLUX-003~~ | ~~medium~~ **CLOSED 2026-09-04** | test-defect | M | The crate has zero tests at 1,513 lines — a state parser, three renderers, an overlay and a tool with no red-before evidence for anything, and no pin on the cross-harness state contract the port calls a requirement. **CLOSED 2026-09-04, cyrup `4bb3569c`.** Three test binaries, 37 tests, every expectation produced by RUNNING the upstream Python at **v0.0.40** (`git -C tmp/code_puppy_core_plugins show v0.0.40:code_puppy_core_plugins/flux_bootstrap/bundled/scripts/{flux_status,flux_cheatsheet,flux_about}.py`; `flux_bootstrap/` is byte-identical v0.0.6..v0.0.40, so no tag drift), with the fixture trees and regeneration commands in each file's header: `crates/cyrup-flux/tests/flux_003_state_and_status.rs` (14 — minimum-set items (1)-(6): `flatten_cwd` 13-row table incl. leading/trailing/consecutive separators and non-ASCII; `format_timestamp`; `parse_frontmatter` on missing/no-frontmatter/unterminated/`a: b: c`/BOM/CRLF/NBSP-terminator, on invalid UTF-8, and on `str.splitlines` boundaries; `collect_todos`/`collect_done`/`collect_reviews` on a 19-file tree; `derive_base_from`; `parse_sections`; and the item-(5) GOLDEN — `render()` byte-equal to `flux_status.py --no-color` for the full panel, six section subsets, `--sections ""`, an empty base, a 57-char name past the `min(name_w, 50)` cap and the missing-base line), `tests/flux_003_renderers.rs` (9 — `PIPELINE_HEADING` 18-row and `SLASH_CMD` tables, `parse_arg`, `render_doc` goldens on a synthetic `pipeline.md` hitting every `parse_pipelines` branch plus both empty-state lines, the VENDORED `pipeline.md` golden, `SLASH_CMD_RE` 19-row table, the `/flux/about` body, and item (8) — the four `_docs`/`reference` pairs byte-equal), `tests/flux_003_host_surfaces.rs` (14 — overlay text == `/flux/status` text line-for-line, span colours, `tick`/ESC, `open_status_overlay`'s three outcomes, `ask_user_question` metadata/refusals/single/multi/pre-cancelled, `execute_command` routing incl. both Python error wordings). Item (7) was already pinned by FLUX-001's `flux_001_embedded_bundle.rs`. Seams added, no behaviour change: `state::derive_base_from(env, cwd)` (`derive_base` is now the shell), `overlay::FluxStatusOverlay::with_base`, `render_cheatsheet::render_doc` + `match_pipeline_heading`/`strip_slashes` `pub`, `render_about::normalize_slash_cmd` `pub`. **Six defects the pins exposed, fixed in the same commit — 6 of 59 red at the pre-fix tree (seams in, fixes out), 59/59 after, three consecutive runs, no LEAK:** (a) FLUX-006 — `parse_frontmatter` now `fs::read` + `from_utf8_lossy` (`flux_status.py:100` `errors="replace"`); (b) `state::splitlines` ports `str.splitlines()`'s boundary table (`:105`; `\r`, `\x0b`, `\x0c`, `\x1c`-`\x1e`, U+0085, U+2028/9) — a lone-`\r` task file parsed to `{}` here and to a full map upstream; (c) `render_about::is_word` was ASCII where Python `\w` is Unicode (`//é`/`é//x` inverted); (d) `/flux/cheatsheet`'s error printed `"e"` where `flux_cheatsheet.py:208` `{...!r}` prints `'e'` (matched for plain strings only — Python `repr` switches to double quotes when the argument itself contains `'` and escapes backslashes/control characters, so `/flux/cheatsheet it's` prints `"it's"` upstream and `'it's'` here; an edge, not pinned); (e) the overlay padded review rows to full width where `flux_status.py:267` `rstrip()`s — it now stops at the dot, same text as `/flux/status` span-for-span; (f) **FLUX-005 had already materialised**: `f239fc3d` (2026-09-04, after this file's re-audit) edited `_docs/README.md:140` and not `skills/flux/reference/README.md:140` — re-synced here; the byte-equality test is what caught it. Upstream lines: `flux_status.py:84-86`, `:89-93`, `:96-112`, `:129-178`, `:181-270`, `:309-338`; `flux_cheatsheet.py:64-65`, `:76-82`, `:85-131`, `:144-164`, `:203-241`; `flux_about.py:53`, `:58-61`. **Residual (low):** `/flux/status`'s valid path and `flux_extension_for_env` read the process environment (`derive_base()`, `CYRUP_SUBAGENT_CHILD`) and are pinned through their pure seams, not end-to-end (edition-2024 `set_var` is unsafe and the workspace forbids it); the `ask_user_question` lock HOLD across a dialog (a second prompt must wait) is not exercised; `\s`/`\w`/`str.strip()` are approximated by `char::is_whitespace`/`is_alphanumeric`/`trim`, which agree with Python on every table value but not on every code point (U+001C-U+001F are `isspace()` in Python, not `White_Space`). `cyrup-sdk` (940 lines) remains the workspace's one untested crate — not this area's. |
+| ~~FLUX-004~~ | ~~medium~~ **CLOSED 2026-09-04** | cyrup-original | S | `ctrl+f` silently takes the editor's `tui.editor.cursorRight` away from the user, with no diagnostic and no rebind path — the first LIVE instance of `EXT-039`'s open residual. **CLOSED 2026-09-04, cyrup `c846ff97`.** Landed as the row's **Fix (2)**, the in-crate half: the overlay chord is now `ctrl+alt+f`, held in ONE constant `crates/cyrup-flux/src/extension.rs` `STATUS_OVERLAY_SHORTCUT` (+ `STATUS_OVERLAY_SHORTCUT_DESCRIPTION`) that both `FluxExtension::init`'s `register_shortcut` and `execute_shortcut`'s match read, so the two sites cannot drift. `flux_bootstrap/` @v0.0.40 registers no keybinding (the chord is a cyrup design choice — labelled inference), so the invariant is "bound by no default keymap" and it is pinned against the REAL tables, not a copied list: `crates/cyrup-flux/tests/flux_004_status_shortcut.rs` (4 tests; `cyrup-tui` added as a DEV-dependency only) parses the constant with `Key::parse` (the same filter `App::set_extension_shortcuts` applies) and asserts `Keymap`/`EditorKeymap`/`SelectKeymap`/`AutocompleteKeymap`/`ModelsKeymap`/`SessionKeymap`/`TreeKeymap`/`AltScreenKeymap` `::default().action_for(..)` are all `None`, that `ExtensionRegistry::resolve_shortcuts` against `tui.editor.cursorLeft/Right`'s pi defaults yields no diagnostic, that `ExtensionHost::load_native` registers exactly the constant with its `/hotkeys` description, and that `execute_shortcut` opens the overlay for the constant and ignores the retired `ctrl+f`. **Red before / green after:** the constant was introduced at the OLD value first, so 3 of 4 failed as assertions (`EditorKeymap::default() already binds "ctrl+f" to Some(CursorRight)`; the registry's own rule-3 text `'ctrl+f' is built-in shortcut for tui.editor.cursorRight and cyrup-flux. Using cyrup-flux.`; the retired chord reaching the overlay); `cargo nextest run -p cyrup-flux` 22/22 after. Why `ctrl+alt+f`: no cyrup default table binds any `ctrl+alt+<letter>`; pi v0.84.4's only `ctrl+alt` default is `ctrl+alt+]` (`packages/tui/src/keybindings.ts:110-112`); `ctrl+shift+f` rejected because it IS pi's `tui.altScreen.search` (`:192-195`; `core/keybindings.ts:88-91` makes it plain `ctrl+f` under `windowsKeybindings`) and needs the kitty protocol, while `ctrl+alt+f` arrives as `ESC 0x06` on a legacy terminal like the `alt+b`/`alt+f` motions already do. Docs follow (`docs/guide/extensions/flux.md`, `spec/flux.md` §3.4.3). **Residual — NOT re-filed here (medium, `EXT-039`, areas 06/07):** **Fix (1)** is untouched — `resolve_shortcuts` still has no production caller (`crates/cyrup/src/interactive.rs` `set_extension_shortcuts(..shortcut_specs())`, `crates/cyrup-tui/src/app/run_arms.rs` swap arm), so the next bundled extension can still take a key silently; this row's **Verify** line belongs to that half and was not executed. **Observation (not this crate's, since resolved):** at closure time `cargo clippy -p cyrup-flux --all-targets -- -D warnings` checked `cyrup-tui` too and tripped a pre-existing HEAD lint, `crates/cyrup-tui/src/app/input_reader.rs:443` `clippy::redundant_closure`; with only that lint allowed (`-A clippy::redundant_closure`) the same deny-mode command was clean, `cargo clippy -p cyrup-flux --lib -- -D warnings` was clean, and `cargo check -p cyrup` (the sole consumer) built. `9cd2d6f0` (TUI-081) cleared that lint; at HEAD the plain `--all-targets -- -D warnings` command is clean with no `-A`. |
+| ~~FLUX-005~~ | ~~low~~ **PARTIALLY CLOSED 2026-09-04** | cyrup-original | S | The four `_docs/*.md` reference files are byte-identical duplicates of `skills/flux/reference/*.md` with no sync mechanism, and one of them is additionally compiled into `/flux/cheatsheet`. **PARTIALLY CLOSED 2026-09-04, cyrup `4bb3569c` (with FLUX-003).** The row's "cheapest credible version" landed: `crates/cyrup-flux/tests/flux_003_renderers.rs::the_four_docs_reference_pairs_are_byte_identical` asserts the four pairs byte-equal through the embedded bundle (`bundle::bundled_file`) and pins the census (`_docs` = 5 files, `reference` = 4, `about.md` the odd one). It was RED on its first run: the pairs were NOT identical any more — `f239fc3d` (2026-09-04, after this file's 2026-09-04 re-audit said "still byte-identical") edited `_docs/README.md:140` alone ("No tests, no benchmarks" -> "Tests are in scope"); `skills/flux/reference/README.md:140` is now re-synced to the `_docs` text, so `/skill:flux` and the installed tree say the same thing again. Verify satisfied: a one-character difference in either copy fails the test. **Open (low):** the duplication itself stands (no build-time mirror; the test is the sync mechanism), and the fifth-file note the Fix asks for (`about.md`'s missing twin, next to the `reference/` tree line at `spec/flux.md:452-453`) was not written. |
+| ~~FLUX-006~~ | ~~low~~ **CLOSED 2026-09-04** | parity-bug | S | `parse_frontmatter` is UTF-8-strict where the Python is `errors="replace"`, so one bad byte turns a task file's whole frontmatter into an empty map instead of a parsed one. **CLOSED 2026-09-04, cyrup `4bb3569c` (with FLUX-003).** Exactly the row's one-line Fix: `crates/cyrup-flux/src/state.rs` `parse_frontmatter` now reads bytes (`std::fs::read`) and decodes with `String::from_utf8_lossy` — `flux_status.py:100` `errors="replace"` @v0.0.40 (byte-identical to the v0.0.6 line cited below). The row's Verify is `tests/flux_003_state_and_status.rs::parse_frontmatter_decodes_invalid_utf8_lossily_like_errors_replace` (a bad byte inside the block -> `caf\u{fffd}`, a bad byte after the block leaves both keys intact, a truncated multi-byte sequence -> one U+FFFD; every expected value is the Python's), red before (`{}`) / green after. The same table exposed a second tolerance gap the row did not name — `str::lines` vs `str.splitlines()` (`:105`) — closed in the same commit by `state::splitlines`, pinned by `parse_frontmatter_splits_lines_where_python_splitlines_does`. |
 | FLUX-007 | low | tooling | S | The crate still records no upstream baseline version in-source, and its four `tmp/code-puppy` doc-comment links still resolve nowhere — confirmed this pass to be wrong on two axes (directory name and a missing path segment) even now that both upstreams are cloned in-workspace — and 13 `FLUX_NN`/`§5.6` citations still point at spec files that do not exist |
 
 ---
 
-## FLUX-001 — The bundled prompt/skill tree resolves through a build-machine path, so a distributed binary silently ships half a feature
+## ~~FLUX-001~~ — The bundled prompt/skill tree resolves through a build-machine path, so a distributed binary silently ships half a feature — **CLOSED 2026-09-04**
 
-**Kind** cyrup-original · **Severity** medium · **Effort** S · **Confidence** confirmed
+**Kind** cyrup-original · **Severity** ~~medium~~ · **Effort** S · **Confidence** confirmed
+**CLOSED 2026-09-04, cyrup `03f3add0`** (`fix(flux): FLUX-001 embed the bundled prompt/skill tree and materialise it under the agent dir`).
+Landed as **Fix (a)** below — embed, then materialise on first `ResourcesDiscover` — with **(b)** layered on
+top rather than instead, exactly as the row prescribes. **Embed:** `crates/cyrup-flux/build.rs` walks
+`resources/` at build time (no hand-maintained list; `rerun-if-changed` on the directory and every file)
+and generates `$OUT_DIR/bundled.rs`, which `src/bundle.rs` includes as `BUNDLED_FILES: &[BundledFile
+{rel, bytes}]`, sorted; `bundled_files()`, `bundled_file(rel)`, `sha256_hex`, `bundle_fingerprint()`
+(sha256 over every rel+payload, once per process). **Materialise:** `src/install.rs` is the port of
+`code_puppy_core_plugins/flux_bootstrap/installer.py` @v0.0.40 that `spec/flux.md` §0 had recorded as
+"deleted, replaced by `cyrup install`" — `decide(current, recorded, payload) -> FileAction {Install,
+Unchanged, PreserveForeign, Overwrite, BackupThenOverwrite}` is the pure per-file table of `:186-218`;
+`install_pass(root, files, marker)` is `_install_pass` (`:170-222`) with tmp+rename atomic writes
+(`:83-91`, `:94-110`), `unique_backup_path` (`:113-127`), manifest `.flux_bootstrap_manifest.json`
+(`:139-149`) and marker `.flux_bootstrap_version` (`:152-167`) written last; `ensure_installed(root)
+-> InstallOutcome {UpToDate, Installed(InstallReport), SkippedLocked}` is `install_bundled_commands`
+(`:225-256`) plus the `needs_install` gate its caller applies, with an `fs4` non-blocking flock on
+`.flux_bootstrap.lock` (`:244-256`); `InstallReport::summary()` keeps `:68-72`'s wording. **Resolve
+once:** `src/resources.rs` replaces `bundled_dir()` / `bundled_prompts_dir()` / `bundled_skill_md()`
+with `BundledRoot::{Vendored(PathBuf), Managed(PathBuf)}` decided at construction by `resolve_from(agent_dir,
+env)` — `CYRUP_FLUX_RESOURCES_DIR` (non-blank) names a vendored tree read as-is and never written;
+otherwise `managed_root(agent_dir) = <agent_dir>/flux/resources`, an extension-owned sibling of
+`<agent_dir>/intercom` and `<agent_dir>/subagents`, deliberately NOT the scanned `<agent_dir>/prompts`
++ `skills` (upstream's literal config-dir-root layout) because cyrup's user-scope loader already walks
+those and every template would register twice. The `CARGO_MANIFEST_DIR` fallback no longer exists in
+this crate. **Loud miss:** `src/extension.rs` `on_event(ResourcesDiscover)` now calls
+`materialise_bundle()` first (`register_callbacks.py:47-68` `_install_flux_commands`, notices
+"Flux commands installed -> …" Info / "Backed up locally-modified Flux files (see *.bak): …" Warning /
+"Flux bootstrap skipped (install failed): …" Warning — this last one prefixed with the root path,
+`… (install failed): <root> (<err>)`, where `:68` prints `{exc}` alone: a labelled cyrup addition, not
+upstream wording — minus the command-cache rescan `:64-66` which has no cyrup counterpart), then contributes the prompt DIRECTORY and skill FILE as before — and when either
+is missing it emits a Warning naming the path tried (`flux: bundled prompt templates not found at …`,
+`flux: bundled skill not found at …`) instead of the silent `Noop` cited below. **Seam:** `lib.rs`
+`flux_extension(agent_dir)`, `flux_extension_for_env(agent_dir)`, `flux_extension_with_root(root)`;
+`crates/cyrup/src/session_launch.rs:138` passes `dirs.agent_dir` — the same value `cyrup_mcp` and
+`cyrup_permission_system` receive at `:130`/`:134` — so no second home/agent-dir ladder was added.
+**Upstream** re-read at **v0.0.40** (ADR-0006; `git -C tmp/code_puppy_core_plugins diff --stat v0.0.6
+v0.0.40 -- code_puppy_core_plugins/flux_bootstrap/` is empty, so every `installer.py` citation below
+holds at both tags). **Design decisions** (recorded in the commit body): invariant = the contributed
+directory comes from exactly one of two rules whose inputs are known at construction → `BundledRoot`
+enum at the boundary; per-file decision as a pure domain enum (FC/IS); `InstallOutcome` names what
+upstream encodes as an early return and an empty report. Rejected: (b) alone; installing into the
+scanned `prompts/`/`skills/` roots; a hand-listed `include_str!` table; a typestate over on-disk
+state; a runtime `include_dir` dependency. **Labelled inference, not an upstream rule:** the marker is
+`<CARGO_PKG_VERSION>+<bundle sha256>` rather than the version string alone
+(`register_callbacks.py:38-44`) — same steady-state cost, and a same-version rebuild with an edited
+template (every from-source development build) re-installs. Mode-bit preservation (`:94-110`) has no
+counterpart (markdown only, embedded bytes carry no mode). **Tests, red before / green after:**
+`crates/cyrup-flux/tests/flux_001_embedded_bundle.rs` (12) —
+`the_embedded_bundle_is_exactly_the_on_disk_resources_tree` (byte-equal to `resources/**`, sorted; the
+one place a test still reads `CARGO_MANIFEST_DIR`, as the reference not the runtime),
+`the_embedded_bundle_holds_fifteen_templates_and_the_skill`,
+`the_root_is_managed_under_the_agent_dir_unless_a_vendored_tree_is_named` (incl. blank override, vendored
+never written), `the_per_file_decision_matches_installer_py`,
+`a_fresh_install_materialises_every_file_then_is_a_no_op` (the row's cheaper Verify: 15 `.md` under
+`prompts/flux/` + `skills/flux/SKILL.md` resolved with no reference to the build tree; manifest + marker;
+`UpToDate` on the second run; idempotent forced pass),
+`a_hand_edited_managed_file_is_backed_up_and_a_foreign_file_is_preserved` (`.bak` then `.bak.1`; foreign
+file never claimed), `a_changed_bundle_overwrites_untouched_managed_files_without_backups`,
+`a_held_install_lock_skips_the_pass_instead_of_racing`,
+`resources_discover_contributes_the_managed_root_not_the_build_tree` (one Info notice, then steady-state
+with none), `a_missing_vendored_tree_is_reported_not_silently_dropped` (Noop + two Warnings naming the
+path), `an_unwritable_managed_root_is_reported_and_the_session_survives`,
+`a_subagent_child_still_gets_no_flux_extension` (as first landed this only asserted the top-level
+`Some`; the 2026-09-04 review-fixes commit added `lib.rs` `flux_extension_for_env_from(agent_dir, env)`
+— the child gate as a pure rule over an injected environment, the `BundledRoot::resolve_from` shape,
+with `flux_extension_for_env` as its shell — and the test now pins `CYRUP_SUBAGENT_CHILD=1` → `None`,
+unset/blank/`0`/`true` → the managed root, and the vendored override through the same environment;
+red with the gate disabled, green with it). Red before: a probe of the seam test against the
+pre-change crate (old `flux_extension()`, same event, same assertion) failed with `contributed the
+build-machine source tree: /home/user/cyrup/crates/cyrup-flux/resources/prompts`; the rest name types
+that did not exist. Green after: `cargo nextest run -p cyrup-flux` **18/18** (12 new + FLUX-002's 6,
+whose helpers now read `bundle::bundled_file` — assertions unchanged). `cargo fmt --all -- --check`,
+`cargo clippy -p cyrup-flux --all-targets -- -D warnings`, `cargo clippy -p cyrup --no-deps
+--all-targets -- -D warnings` and `RUSTDOCFLAGS='-D warnings' cargo doc -p cyrup-flux --no-deps` all
+clean (the full-deps `cyrup` clippy fails only on a concurrent track's
+`crates/cyrup-tui/src/app/input_reader.rs:443`, untouched here). `spec/flux.md` (the `bundled_dir()`
+note and the installer row of the rename map) and `docs/guide/extensions/flux.md` record the change.
+**Residual (medium — the WORKSPACE-WIDE CLASS below, still unfiled elsewhere):** the three sibling
+resolvers in `cyrup-ext-subagents` and `cyrup-intercom` are untouched — other tracks own those crates
+this batch; the build.rs table + `install.rs` shape is reusable for them as-is, so "one mechanism
+closes all four" remains available but is not claimed. **Residual (low):** the row's full **Verify**
+(release binary moved off-tree, `/flux/new` resolves, `/skill:flux` loads) was not executed live; what
+is pinned is the extension seam's contributed path plus the materialised tree's content. Note the
+`CYRUP_FLUX_RESOURCES_DIR` census below is now stale by design: `resources.rs` still declares it, and
+it is now the `Vendored` arm.
 **cyrup** — `crates/cyrup-flux/src/resources.rs:19-23` — `bundled_dir()` reads
 `CYRUP_FLUX_RESOURCES_DIR` (`:14`) and otherwise falls back to
 `PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources")`, i.e. **the absolute path of the source
@@ -191,9 +283,50 @@ anywhere above it, unset `CYRUP_FLUX_RESOURCES_DIR`, run it, and assert `/flux/n
 15 `.md` files and `bundled_skill_md()` to an existing file with the env var unset and the manifest
 dir renamed. Neither test exists today — see `FLUX-003`.
 
-## FLUX-002 — Four templates instruct a tool that is off by default, in an extension that is on by default
+## ~~FLUX-002~~ — Four templates instruct a tool that is off by default, in an extension that is on by default — **CLOSED 2026-09-04**
 
-**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** confirmed
+**Kind** parity-bug · **Severity** ~~medium~~ · **Effort** S · **Confidence** confirmed
+**CLOSED 2026-09-04, cyrup `c7d21bbb`** (`fix(flux): FLUX-002 gate the multi-task fan-out on `subagent` tool availability`).
+Landed exactly as **Fix** below prescribes — the four-file template edit — and the alternative it says to
+REJECT (arming subagents from flux) was rejected. What each template now says, first, in its multi-task
+branch: check the tool list for `subagent` BEFORE calling it; if it is absent, do NOT call it and do NOT
+substitute another tool, tell the user ONCE that it is not available (naming the opt-in:
+`CYRUP_SUBAGENTS=1` or a `subagents/config.json` at user or project scope), then run every
+`$FLUX_BASE/todo/*.md` task in SINGLE-TASK MODE one after another exactly as `all` does
+(`exec`/`aug`/`qa`) or review each group in-line, one group at a time, with the same sub-agent prompt
+template (`review`, whose STEP 7 second launch is covered too). The dispatch block's pure-integer `ELSE:`
+branch carries the same condition so the model never commits to fan-out before checking. Landed lines:
+`crates/cyrup-flux/resources/prompts/flux/exec.md:48-49` + `:181`, `aug.md:50-51` + `:158`,
+`qa.md:48-49` + `:163`, `review.md:109` + `:192`; `resources/skills/flux/SKILL.md:56` (the system-prompt
+table's `N` row); `docs/guide/extensions/flux.md:61-64`; `spec/flux.md` §0.3 (the note the **Fix** asks
+for, next to the rename map). The armed path — one `subagent` call with `tasks: [...]` and
+`concurrency: $ARGUMENTS` — is unchanged. Nothing in the wiring moved: `is_installed` /
+`is_installed_with` at `crates/cyrup-ext-subagents/src/extension/host/registration.rs:99-129`,
+`TOOL_NAME = "subagent"` at `extension/mod.rs:104`, and flux still attaches unconditionally — the seam
+is now `crates/cyrup/src/session_launch.rs:138` (`attach_native_extensions`, item 7 of its doc comment),
+not the three `main.rs` lines cited below, which moved in the interim. **Upstream re-read at v0.0.40**
+(ADR-0006; `flux_bootstrap/` is byte-identical to the v0.0.6 baseline): `code_puppy_core_plugins/`
+`flux_bootstrap/bundled/commands/flux/exec.md:181`, `aug.md:158`, `qa.md:163`, `review.md:110` name
+`invoke_agent` with no availability check, which is correct there and only there. **Tests, red before /
+green after:** `crates/cyrup-flux/tests/flux_002_subagent_fallback.rs` (read through `bundle::bundled_file`, the
+embedded bundle `ResourcesDiscover` materialises and contributes — originally through
+`resources::bundled_prompts_dir()` / `bundled_skill_md()`, which FLUX-001 `03f3add0` removed) —
+against the unedited templates 4 of 6 failed:
+`every_multi_task_template_checks_tool_availability_before_calling_subagent` (the shared trigger
+sentence, the once-only notice, the no-call/no-substitute rule, the named opt-in),
+`the_three_n_argument_templates_route_a_missing_tool_to_the_sequential_path_in_dispatch`,
+`review_degrades_in_line_and_covers_its_second_subagent_launch_in_step_7`,
+`the_skill_tells_the_model_the_n_mode_needs_the_subagent_tool`; 6/6 after. The two that passed both
+times — `every_multi_task_template_still_names_the_subagent_tool_for_the_armed_path` and
+`only_the_four_multi_task_templates_name_the_subagent_tool` (the `4 — aug, exec, qa, review` census) — are
+regression pins, not closure evidence. `cargo nextest run -p cyrup-flux` 6/6, clippy `--all-targets -D
+warnings` and `RUSTDOCFLAGS='-D warnings' cargo doc` clean, `cargo check -p cyrup` clean. This is the
+crate's first test binary; `FLUX-003` is NOT claimed by it. **Residual (low):** the **Verify** below is a
+live-model observation and was not executed — what is pinned is the prompt contract; whether a given
+model honours a tool-list check is not testable here. A harness-level degrade (flux observing the
+subagent gate and rewriting or selecting templates) would need a new seam — prompt templates are static
+files contributed by directory via `ResourcesDiscover` — and is not filed: the row's own **Fix** names the
+template edit as the correct shape.
 **cyrup** — Flux attaches unconditionally at all three `AppMode` seams:
 `crates/cyrup/src/main.rs:726`, `:930`, `:1060`, each `if let Some(ext) =
 cyrup_flux::flux_extension_for_env()`, whose only `None` is a subagent CHILD
@@ -240,9 +373,33 @@ with three todo files must complete all three sequentially and emit one notice e
 degrade — not attempt a `subagent` call. With the gate armed, the same command must issue exactly one
 `subagent` call carrying `tasks: [...]` and `concurrency: 3`.
 
-## FLUX-003 — The crate has no tests: 1,513 lines, nine modules, and nothing pinning the cross-harness state contract the port calls a requirement
+## ~~FLUX-003~~ — The crate has no tests: 1,513 lines, nine modules, and nothing pinning the cross-harness state contract the port calls a requirement — **CLOSED 2026-09-04**
 
-**Kind** test-defect · **Severity** medium · **Effort** M · **Confidence** confirmed
+**Kind** test-defect · **Severity** ~~medium~~ · **Effort** M · **Confidence** confirmed
+**CLOSED 2026-09-04, cyrup `4bb3569c`** (`test(flux): FLUX-003 pin the crate against the upstream Python
+and fix what the pins exposed`). The minimum set below landed as three test binaries (37 tests) whose
+every expected value is the OUTPUT of the upstream scripts at **v0.0.40** — extracted with `git -C
+tmp/code_puppy_core_plugins show v0.0.40:code_puppy_core_plugins/flux_bootstrap/bundled/scripts/<name>.py`
+and run (`--no-color`, `--base`/`--docs` at the fixture trees the tests write) or imported (the pure
+tables); each file's header carries the regeneration recipe. Items: (1)-(6) in
+`crates/cyrup-flux/tests/flux_003_state_and_status.rs`, with (5) — the one the Verify says to write
+first — as `render_status_matches_flux_status_py_no_color_on_the_small_tree` (+ the 50-cap, empty-base
+and missing-base goldens); (6) also covers the cheatsheet's `parse_arg`; (7) was already pinned by
+FLUX-001's `flux_001_embedded_bundle.rs` (`BundledRoot::resolve_from`); (8) in
+`tests/flux_003_renderers.rs` (`the_four_docs_reference_pairs_are_byte_identical`), which is where
+FLUX-005 turned out to have ALREADY materialised (`f239fc3d`, see its row). The overlay and the tool —
+named in the title, not in the list — are in `tests/flux_003_host_surfaces.rs` through a scripted
+`HostServices`. Testability seams (no behaviour change): `state::derive_base_from(env, cwd)`,
+`overlay::FluxStatusOverlay::with_base`, `render_cheatsheet::render_doc` (+ `match_pipeline_heading`,
+`strip_slashes` `pub`), `render_about::normalize_slash_cmd` `pub`. **Red before / green after:** with the
+seams present and the fixes absent, 6 of 59 tests failed — FLUX-006 (`read_to_string`), `str::lines` vs
+`str.splitlines()`, ASCII `is_word` vs Unicode `\w`, the `"e"`/`'e'` cheatsheet wording (plain-string `repr` only; a `'` inside the argument still differs), the overlay's
+un-`rstrip()`ped review rows, and the diverged README pair — and every one is fixed in the same commit
+(details in the `## Open items` row); 59/59 after, three consecutive `cargo nextest run -p cyrup-flux`
+runs, no LEAK. `cargo test -p cyrup-flux` now runs a non-zero number of tests, as the Verify asks.
+**Residual (low):** see the row — the two env-reading paths are pinned through pure seams only, the
+interaction-lock hold is not exercised, and the `\s`/`\w`/`strip()` approximations agree on every
+table value but not on every code point.
 **cyrup** — `grep -rn '#\[cfg(test)\]\|#\[test\]\|#\[tokio::test\]' crates/cyrup-flux/` returns
 **0**; there is no `crates/cyrup-flux/tests/` directory; and `crates/cyrup-it/tests/` (120 files
 across 8 subdirectories) has no flux entry. Counting files containing a test per crate,
@@ -266,7 +423,7 @@ state into two trees. Nothing pins any of it, and nothing pins the interop contr
 states as the crate's purpose ("State on disk (`~/.flux/<flattened-cwd>/`) stays byte-identical to
 code-puppy's so one project's task tree is readable by both harnesses"). `FLUX-005` and `FLUX-006`
 below are both defects a single table test would have caught.
-**Fix** — `spec/flux/README.md:73` says "**No tests to be written** — another team owns tests", and
+**Fix** — `spec/flux/README.md:73` said "**No tests to be written** — another team owns tests" *(quoted as filed; that line was retracted by `f239fc3d` on 2026-09-04 — no such team exists, tests are in scope for every task, and `:73` now says so)*, and
 `:76` makes every definition of done manual ("one manual run-through, not a test suite"), which
 `spec/flux.md:920-933` then spells out as a list of things a human types. **That is a disclosure, not
 a closure**, and it is exactly the class `00-residual-ledger.md` calls out: a deferral nobody signed
@@ -284,9 +441,74 @@ byte-equality of the four `_docs` / `skills/flux/reference` pairs (`FLUX-005`).
 merge gate. Item (5) is the one that matters most and the one to write first: it is the only test
 that can fail when the hand-ported layout arithmetic drifts from the Python.
 
-## FLUX-004 — `ctrl+f` silently takes the editor's forward-char away, with no diagnostic and no rebind path
+## ~~FLUX-004~~ — `ctrl+f` silently takes the editor's forward-char away, with no diagnostic and no rebind path — **CLOSED 2026-09-04**
 
-**Kind** cyrup-original · **Severity** medium · **Effort** S · **Confidence** confirmed
+**Kind** cyrup-original · **Severity** ~~medium~~ · **Effort** S · **Confidence** confirmed
+**CLOSED 2026-09-04, cyrup `c846ff97`** (`fix(flux): FLUX-004 move the status overlay off the editor's ctrl+f onto ctrl+alt+f`).
+Landed as **Fix (2)** below — the in-crate half — and NOT **Fix (1)**, which is `EXT-039`'s residual in
+areas 06/07 and which this row itself says must not be re-filed here. **What changed:** the chord is
+`ctrl+alt+f`, held in one constant, `crates/cyrup-flux/src/extension.rs` `STATUS_OVERLAY_SHORTCUT` (and
+`STATUS_OVERLAY_SHORTCUT_DESCRIPTION`, the EXT-040 `/hotkeys` label), read by both
+`FluxExtension::init`'s `api.register_shortcut(..)` and `execute_shortcut`'s `if key ==
+STATUS_OVERLAY_SHORTCUT` — the register site and the dispatch site can no longer drift, which the
+two `"ctrl+f"` literals cited below could. `crates/cyrup-flux/src/overlay.rs` and `build.rs` doc
+comments point at the constant; `docs/guide/extensions/flux.md:21`/`:92` and `spec/flux.md` (§3.4.3
+bullet, which records the reason) name the new chord. **Design decision** (cyrup-original row; the
+brief's design guidance applied): `flux_bootstrap/` @v0.0.40 registers no keybinding at all (`git -C
+tmp/code_puppy_core_plugins grep -i 'ctrl\|keybind\|shortcut\|hotkey' v0.0.40 -- flux_bootstrap` is
+empty), so the chord is a cyrup choice and the invariant is "bound by no default keymap", first known
+at chord-choice time — a compile-time constant, checked by a test against the real tables. Rejected:
+a validated-chord newtype in `cyrup-ext` refusing built-in collisions (pi's rule 3 is warn-and-accept
+by design, `extensions/runner.ts:517-522` @v0.83.0 — `:524-528` is rule 4, extension-vs-extension — ported at `registry.rs` `resolve_shortcuts`; a
+type-level refusal would change what the user sees, and that seam is `EXT-039`'s); consulting the
+keymap from the extension at `init` (it has no keymap access — that is the host's job, Fix (1));
+changing the literal alone (captures nothing). What still rests on a test, not the compiler: the
+cross-crate "not a default binding" property itself. Migration cost: none (additive constant; no
+call site outside the crate names the chord); `cyrup-tui` is a DEV-dependency only, respecting the
+production crate-boundary rule `cyrup-ext-subagents/Cargo.toml` states. **Why `ctrl+alt+f`**
+(labelled inference — a design choice, not an upstream rule): keeps the mnemonic; no cyrup default
+table binds any `ctrl+alt+<letter>` (`crates/cyrup-tui/src/keymap.rs`, every `impl Default`); pi
+v0.84.4's only `ctrl+alt` default is `ctrl+alt+]` (`tui.editor.jumpBackward`,
+`packages/tui/src/keybindings.ts:110-112`), so a later port cannot collide; `ctrl+shift+f` was
+rejected because it IS pi's `tui.altScreen.search` (`packages/tui/src/keybindings.ts:192-195`;
+`core/keybindings.ts:88-91`, where `windowsKeybindings` makes it plain `ctrl+f`) — unported today,
+the next collision tomorrow — and because it is invisible without the kitty protocol, whereas
+`ctrl+alt+f` arrives as `ESC 0x06` (CONTROL|ALT + `f`) on a legacy terminal, the path the `alt+b`/
+`alt+f` word motions already rely on; it is also the chord the workspace's EXT-035 fixture models
+(`crates/cyrup-ext/src/tests/native_dispatch.rs:1328`). **Upstream re-read at v0.84.4** for the
+collision itself: `packages/tui/src/keybindings.ts:82-89` (`tui.editor.cursorLeft` `["left",
+"ctrl+b"]`, `tui.editor.cursorRight` `["right", "ctrl+f"]`), ported at `crates/cyrup-tui/src/keymap.rs`
+`impl Default for EditorKeymap` (`ctrl('b') => CursorLeft`, `ctrl('f') => CursorRight`); the tier
+order is unchanged at `crates/cyrup-tui/src/app/input.rs` (extension shortcuts "before the editor
+(so the key never leaks in as text)"). **Tests, red before / green after:**
+`crates/cyrup-flux/tests/flux_004_status_shortcut.rs`, 4 tests. The constant was introduced at the
+OLD value `"ctrl+f"` first so the failures are assertions, not a missing symbol — 3 of 4 failed:
+`the_status_shortcut_is_bound_by_no_default_keymap` (`EditorKeymap::default() already binds "ctrl+f"
+to Some(CursorRight)`), `the_status_shortcut_resolves_with_no_conflict_against_the_editor_defaults`
+(the registry's own rule-3 diagnostic, `Extension shortcut conflict: 'ctrl+f' is built-in shortcut for
+tui.editor.cursorRight and cyrup-flux. Using cyrup-flux.` — i.e. exactly the `[Extension issues]`
+line this row's **Verify** predicts, produced by the registry the host does not yet call), and
+`execute_shortcut_routes_the_constant_and_ignores_the_retired_chord` (the retired chord reached the
+overlay's `notify` fallback); `the_extension_registers_exactly_the_constant_chord` (real
+`ExtensionHost::load_native` → `shortcut_specs()`) passes on both values and pins the contract.
+After the flip: `cargo nextest run -p cyrup-flux` **22/22** (the 18 existing untouched);
+`cargo fmt --all -- --check` clean; `RUSTDOCFLAGS='-D warnings' cargo doc -p cyrup-flux --no-deps`
+clean. **Observation, not this crate's:** `cargo clippy -p cyrup-flux --all-targets -- -D warnings`
+now lints `cyrup-tui` too (dev-dep) and trips a PRE-EXISTING HEAD lint there,
+`crates/cyrup-tui/src/app/input_reader.rs:443` `clippy::redundant_closure` (last touched by the
+workspace rustfmt commit; untouched here); cyrup-flux's own lib and test targets produce no
+diagnostic: `cargo clippy -p cyrup-flux --lib -- -D warnings` is clean, and `cargo clippy -p
+cyrup-flux --all-targets -- -D warnings -A clippy::redundant_closure` (only that foreign lint allowed)
+is clean. `cargo check -p cyrup` (the sole consumer, `crates/cyrup/src/session_launch.rs`, which
+names no chord) builds; the change is API-additive (one `pub const`, no signature change). Since
+resolved: `9cd2d6f0` (TUI-081) cleared that `cyrup-tui` lint, and at HEAD the plain
+`cargo clippy -p cyrup-flux --all-targets -- -D warnings` is clean with no `-A`. **Residual — NOT re-filed here (medium; it is `EXT-039`, areas 06/07):** **Fix (1)**
+is untouched: `resolve_shortcuts` still has no production caller — the install sites are now
+`crates/cyrup/src/interactive.rs` (`app.set_extension_shortcuts(session.services().ext_host.shortcut_specs())`)
+and `crates/cyrup-tui/src/app/run_arms.rs` (the swap arm's `set_extension_shortcuts`), not the
+`main.rs:2017` / `run_arms.rs:276-277` lines cited below, which moved — so the next bundled extension
+can still take a key silently and nothing reaches `[Extension issues]`; this row's **Verify** line
+belongs to that half and was not executed.
 **cyrup** — `crates/cyrup-flux/src/extension.rs:53` — `api.register_shortcut("ctrl+f", Some("Flux
 status overlay".into()))`, in an extension that attaches unconditionally (`main.rs:726`/`:930`/`:1060`).
 cyrup binds the same chord to `EditorAction::CursorRight` at
@@ -345,9 +567,18 @@ non-reserved built-in collision the extension wins. What is missing is an assert
 CALLS it — a structural test over `main.rs`/`run_arms.rs` in the shape of
 `crates/cyrup-tui/src/tests/run_loop_swap_arm_reachable.rs`.
 
-## FLUX-005 — The four reference docs are shipped twice, byte-identical, with nothing keeping them in sync
+## ~~FLUX-005~~ — The four reference docs are shipped twice, byte-identical, with nothing keeping them in sync — **PARTIALLY CLOSED 2026-09-04**
 
-**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** confirmed
+**Kind** cyrup-original · **Severity** ~~low~~ · **Effort** S · **Confidence** confirmed
+**PARTIALLY CLOSED 2026-09-04, cyrup `4bb3569c` (with FLUX-003).** The Fix's "cheapest credible version"
+— item (8) of FLUX-003's set — is `crates/cyrup-flux/tests/flux_003_renderers.rs::the_four_docs_reference_pairs_are_byte_identical`,
+and its first run was RED: the "byte-identical pairs at HEAD" this section and the 2026-09-04 re-audit
+note both record were no longer true, because `f239fc3d` had edited `_docs/README.md:140` without its
+`reference/` twin — precisely the Impact paragraph's scenario, with `/skill:flux` and the installed
+`_docs` disagreeing on whether tests are in scope. The reference copy is re-synced in the same commit.
+Verify holds (a one-character difference in either copy fails the test). **Still open (low):** the
+duplication itself, and the fifth-file note for `about.md` next to the `reference/` tree line at
+`spec/flux.md:452-453`.
 **cyrup** — `crates/cyrup-flux/resources/prompts/flux/_docs/{README,pipeline,cheatsheet,synopsis}.md`
 and `crates/cyrup-flux/resources/skills/flux/reference/{README,pipeline,cheatsheet,synopsis}.md` are
 **byte-identical pairs at HEAD** (verified with `diff -q` on all four). The `_docs` copy carries a
@@ -381,9 +612,17 @@ test. While there, resolve the fifth file: either give `about.md` a `reference/`
 **Verify** — A test asserting all four pairs are byte-equal must exist and pass; introducing a
 one-character difference in either copy must fail it.
 
-## FLUX-006 — `parse_frontmatter` is UTF-8-strict where the Python is `errors="replace"`, so one bad byte empties a whole task file's frontmatter
+## ~~FLUX-006~~ — `parse_frontmatter` is UTF-8-strict where the Python is `errors="replace"`, so one bad byte empties a whole task file's frontmatter — **CLOSED 2026-09-04**
 
-**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
+**Kind** parity-bug · **Severity** ~~low~~ · **Effort** S · **Confidence** confirmed
+**CLOSED 2026-09-04, cyrup `4bb3569c` (with FLUX-003).** Landed as the one-line Fix below —
+`std::fs::read` + `String::from_utf8_lossy` at `crates/cyrup-flux/src/state.rs` `parse_frontmatter`
+(the cited `state.rs:67` moved down with the new `derive_base_from` seam above it) — and the Verify's
+table test is `tests/flux_003_state_and_status.rs::parse_frontmatter_decodes_invalid_utf8_lossily_like_errors_replace`,
+red (`{}`) before, green after, with the Python's own output as the expected values. Re-read at
+**v0.0.40**: `flux_status.py:96-112` is byte-identical to the v0.0.6 lines cited below. One more
+tolerance gap in the same function, not named here, closed alongside: `:105` is `str.splitlines()`,
+not `str::lines` — `state::splitlines` ports its boundary table.
 **cyrup** — `crates/cyrup-flux/src/state.rs:67` — `let Ok(text) = std::fs::read_to_string(path) else
 { return data };`. `read_to_string` returns `Err(InvalidData)` on any byte sequence that is not valid
 UTF-8, so the whole function returns the empty map. Every other tolerance in the port is faithful:

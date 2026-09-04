@@ -15,16 +15,18 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use crate::run_rpc;
 use cyrup_core::{ExtensionId, StopReason};
 use cyrup_ext::host::{ControlOp, HostServices};
-use cyrup_ext::{CommandDescriptor, ExtError, HostCtx, HostEvent, HookOutcome, InitApi, NativeExtension};
-use crate::run_rpc;
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
+use cyrup_ext::{
+    CommandDescriptor, ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension,
+};
 use cyrup_provider::Provider;
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
 use cyrup_session_svc::{AgentSessionRuntime, SessionFactory};
 use tokio::io::{AsyncWriteExt, BufReader};
 
-use super::support::{base_config_no_ext, create_runtime, fixture, parse_lines, type_of, Fixture};
+use super::support::{Fixture, base_config_no_ext, create_runtime, fixture, parse_lines, type_of};
 
 /// A native built-in exposing `/quitnow`, which calls the base-context `ctx.shutdown()` (Pi
 /// `ctx.shutdown()`, extensions/types.ts:344 → `runner.shutdown()`, runner.ts:656-662).
@@ -53,7 +55,10 @@ impl NativeExtension for QuitExt {
         api.subscribe(&[cyrup_ext::EventKind::MessageEnd]);
         for (name, description) in [
             ("quitnow", "request a graceful host shutdown"),
-            ("armquit", "request the shutdown from the NEXT run's message_end handler"),
+            (
+                "armquit",
+                "request the shutdown from the NEXT run's message_end handler",
+            ),
         ] {
             api.register_command(
                 name,
@@ -82,12 +87,15 @@ impl NativeExtension for QuitExt {
         _args: &str,
         _ctx: &HostCtx,
     ) -> Result<Option<String>, ExtError> {
-        let svc = self.svc().ok_or_else(|| ExtError::Component("no host services".into()))?;
+        let svc = self
+            .svc()
+            .ok_or_else(|| ExtError::Component("no host services".into()))?;
         if name == "armquit" {
             self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
             return Ok(Some(String::new()));
         }
-        svc.control(ControlOp::Shutdown).map_err(ExtError::Component)?;
+        svc.control(ControlOp::Shutdown)
+            .map_err(ExtError::Component)?;
         Ok(Some(String::new()))
     }
 }
@@ -107,10 +115,7 @@ fn faux_ok() -> Arc<FauxProvider> {
     faux
 }
 
-async fn runtime_with(
-    fx: &Fixture,
-    ext: Option<Arc<QuitExt>>,
-) -> Arc<AgentSessionRuntime> {
+async fn runtime_with(fx: &Fixture, ext: Option<Arc<QuitExt>>) -> Arc<AgentSessionRuntime> {
     let provider: Arc<dyn Provider> = faux_ok();
     let cfg = base_config_no_ext(fx);
     let target = cfg.target.clone();
@@ -130,13 +135,23 @@ async fn rpc_emits_agent_settled_after_the_run() {
     let input = concat!(r#"{"type":"prompt","id":"1","message":"hello"}"#, "\n");
     let reader = std::io::Cursor::new(input.as_bytes().to_vec());
     let mut out: Vec<u8> = Vec::new();
-    run_rpc(&runtime, reader, &mut out).await.expect("rpc mode runs");
+    run_rpc(&runtime, reader, &mut out)
+        .await
+        .expect("rpc mode runs");
 
     let lines = parse_lines(&out);
     let types: Vec<&str> = lines.iter().map(type_of).collect();
-    let settled: Vec<usize> =
-        types.iter().enumerate().filter(|(_, t)| **t == "agent_settled").map(|(i, _)| i).collect();
-    assert_eq!(settled.len(), 1, "exactly one agent_settled on the wire: {types:?}");
+    let settled: Vec<usize> = types
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| **t == "agent_settled")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        settled.len(),
+        1,
+        "exactly one agent_settled on the wire: {types:?}"
+    );
     let last_end = types
         .iter()
         .enumerate()
@@ -144,7 +159,10 @@ async fn rpc_emits_agent_settled_after_the_run() {
         .map(|(i, _)| i)
         .next_back()
         .expect("an agent_end on the wire");
-    assert!(settled[0] > last_end, "agent_settled follows the run's last agent_end: {types:?}");
+    assert!(
+        settled[0] > last_end,
+        "agent_settled follows the run's last agent_end: {types:?}"
+    );
 }
 
 /// A loaded extension's `ctx.shutdown()` terminates `run_rpc` at the next SETTLE point, with the
@@ -198,7 +216,10 @@ async fn extension_shutdown_ends_rpc_at_the_next_settle_point() {
     );
     finished.expect("rpc mode runs");
 
-    let types: Vec<String> = parse_lines(&out).iter().map(|v| type_of(v).to_string()).collect();
+    let types: Vec<String> = parse_lines(&out)
+        .iter()
+        .map(|v| type_of(v).to_string())
+        .collect();
     assert!(
         types.iter().any(|t| t == "agent_settled"),
         "the settle point the shutdown was honoured at is on the wire: {types:?}"
@@ -251,7 +272,10 @@ async fn extension_shutdown_from_a_command_ends_rpc_without_any_run() {
         )
         .expect("rpc mode runs");
 
-    let types: Vec<String> = parse_lines(&out).iter().map(|v| type_of(v).to_string()).collect();
+    let types: Vec<String> = parse_lines(&out)
+        .iter()
+        .map(|v| type_of(v).to_string())
+        .collect();
     assert!(
         !types.iter().any(|t| t == "agent_settled"),
         "no run happened, so there is no settle point — the exit came from the command tail: {types:?}"

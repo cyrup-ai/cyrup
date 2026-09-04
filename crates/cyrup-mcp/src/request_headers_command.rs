@@ -85,8 +85,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read as _;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -147,8 +147,7 @@ pub const CLEANUP_TOKEN_ENV: &str = "CYRUP_MCP_REQUEST_HEADERS_CLEANUP_TOKEN";
 /// `PI_MCP_ADAPTER_TEST_FAIL_PS` (`request-headers-command.ts:17`) — the fault injector upstream's
 /// suite uses to prove the fail-closed preflight. Dual-read `CYRUP_MCP_*` first, the convention
 /// [`crate::credentials`] documents (MCP-282).
-const TEST_FAIL_PS_ENV: [&str; 2] =
-    ["CYRUP_MCP_TEST_FAIL_PS", "PI_MCP_ADAPTER_TEST_FAIL_PS"];
+const TEST_FAIL_PS_ENV: [&str; 2] = ["CYRUP_MCP_TEST_FAIL_PS", "PI_MCP_ADAPTER_TEST_FAIL_PS"];
 
 // ===================================================================================================
 // 2 · Errors
@@ -163,7 +162,9 @@ fn command_error(message: impl Into<String>) -> McpError {
 /// `` `HTTP request headers command cleanup failed: ${reason}` `` — the prefix shared by the four
 /// cleanup arms (`request-headers-command.ts:26`, `:45`, `:76`, `:130`).
 fn cleanup_failed(reason: &str) -> McpError {
-    command_error(format!("HTTP request headers command cleanup failed: {reason}"))
+    command_error(format!(
+        "HTTP request headers command cleanup failed: {reason}"
+    ))
 }
 
 /// `${code ?? "unknown"}` for a process that may have died on a signal.
@@ -240,7 +241,12 @@ pub fn resolve_request_headers_command(
 
     Ok(ResolvedRequestHeadersCommand {
         command: interpolate_env_vars(command),
-        args: config.args.iter().flatten().map(|arg| interpolate_env_vars(arg)).collect(),
+        args: config
+            .args
+            .iter()
+            .flatten()
+            .map(|arg| interpolate_env_vars(arg))
+            .collect(),
         env: config
             .env
             .as_deref()
@@ -482,8 +488,10 @@ fn freeze_descendant_tree(
     for _ in 0..STABILISATION_PASSES {
         let mut candidates = collect_posix_descendant_pids(child_pid)?;
         candidates.extend(collect_posix_cleanup_token_pids(cleanup_token)?);
-        let fresh: Vec<i32> =
-            candidates.into_iter().filter(|pid| !frozen.contains(pid)).collect();
+        let fresh: Vec<i32> = candidates
+            .into_iter()
+            .filter(|pid| !frozen.contains(pid))
+            .collect();
 
         if fresh.is_empty() {
             stable_passes += 1;
@@ -601,9 +609,10 @@ fn parse_derived_headers(stdout: &[u8]) -> McpResult<Vec<(HeaderName, HeaderValu
         let value = value.as_str().unwrap_or_default();
         // `new Headers(...)`'s own validation: a name that is not an HTTP token, or a value carrying
         // NUL/CR/LF, throws. `HeaderName`/`HeaderValue`'s `TryFrom` reject the same inputs.
-        let (Ok(name), Ok(value)) =
-            (HeaderName::try_from(name.as_str()), HeaderValue::try_from(value))
-        else {
+        let (Ok(name), Ok(value)) = (
+            HeaderName::try_from(name.as_str()),
+            HeaderValue::try_from(value),
+        ) else {
             return Err(command_error(
                 "HTTP request headers command returned an invalid header",
             ));
@@ -645,9 +654,8 @@ pub fn invoke_request_headers_command(
     // `JSON.stringify(envelope)` cannot fail for this shape; the arm exists because the crate denies
     // `unwrap`, and "we could not hand the child its input" is the same class of failure as "the
     // child never started".
-    let payload = serde_json::to_vec(envelope).map_err(|_| {
-        command_error("HTTP request headers command failed to start")
-    })?;
+    let payload = serde_json::to_vec(envelope)
+        .map_err(|_| command_error("HTTP request headers command failed to start"))?;
 
     let cleanup_token = uuid::Uuid::now_v7().to_string();
     let mut command = std::process::Command::new(&resolved.command);
@@ -746,7 +754,7 @@ pub fn invoke_request_headers_command(
             Err(_) => {
                 break Err(command_error(
                     "HTTP request headers command failed to start",
-                ))
+                ));
             }
         }
         if started.elapsed() >= resolved.timeout {
@@ -849,7 +857,11 @@ impl<C> RequestHeadersCommandClient<C> {
         cancel: Option<CancelToken>,
     ) -> McpResult<Self> {
         let _ = resolve_request_headers_command(&config)?;
-        Ok(Self { inner, config: Arc::new(config), cancel })
+        Ok(Self {
+            inner,
+            config: Arc::new(config),
+            cancel,
+        })
     }
 
     /// Run the command for one request and return the headers it derived.
@@ -939,7 +951,10 @@ where
         // client sends `request.json(&message)`, i.e. `serde_json::to_vec(&message)`, so this is the
         // same document byte for byte.
         let body = serde_json::to_vec(&message).map_err(StreamableHttpError::Deserialize)?;
-        let derived = self.derive("POST", &uri, &body).await.map_err(transport_error)?;
+        let derived = self
+            .derive("POST", &uri, &body)
+            .await
+            .map_err(transport_error)?;
         apply_derived(&mut custom_headers, &mut auth_header, derived);
         self.inner
             .post_message(uri, message, session_id, auth_header, custom_headers)
@@ -956,7 +971,10 @@ where
         max_sse_event_size: usize,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
         let body = serde_json::to_vec(&message).map_err(StreamableHttpError::Deserialize)?;
-        let derived = self.derive("POST", &uri, &body).await.map_err(transport_error)?;
+        let derived = self
+            .derive("POST", &uri, &body)
+            .await
+            .map_err(transport_error)?;
         apply_derived(&mut custom_headers, &mut auth_header, derived);
         self.inner
             .post_message_with_max_sse_event_size(
@@ -978,7 +996,10 @@ where
         mut auth_header: Option<String>,
         mut custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<Self::Error>> {
-        let derived = self.derive("GET", &uri, &[]).await.map_err(transport_error)?;
+        let derived = self
+            .derive("GET", &uri, &[])
+            .await
+            .map_err(transport_error)?;
         apply_derived(&mut custom_headers, &mut auth_header, derived);
         self.inner
             .get_stream(uri, session_id, last_event_id, auth_header, custom_headers)
@@ -994,7 +1015,10 @@ where
         mut custom_headers: HashMap<HeaderName, HeaderValue>,
         max_sse_event_size: usize,
     ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<Self::Error>> {
-        let derived = self.derive("GET", &uri, &[]).await.map_err(transport_error)?;
+        let derived = self
+            .derive("GET", &uri, &[])
+            .await
+            .map_err(transport_error)?;
         apply_derived(&mut custom_headers, &mut auth_header, derived);
         self.inner
             .get_stream_with_max_sse_event_size(
@@ -1015,9 +1039,14 @@ where
         mut auth_header: Option<String>,
         mut custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<(), StreamableHttpError<Self::Error>> {
-        let derived = self.derive("DELETE", &uri, &[]).await.map_err(transport_error)?;
+        let derived = self
+            .derive("DELETE", &uri, &[])
+            .await
+            .map_err(transport_error)?;
         apply_derived(&mut custom_headers, &mut auth_header, derived);
-        self.inner.delete_session(uri, session_id, auth_header, custom_headers).await
+        self.inner
+            .delete_session(uri, session_id, auth_header, custom_headers)
+            .await
     }
 }
 
@@ -1056,7 +1085,8 @@ mod tests {
         // Absent is the same arm as blank: `typeof config.command !== "string"`.
         assert_eq!(
             message(
-                &resolve_request_headers_command(&HttpRequestHeadersCommand::default()).unwrap_err()
+                &resolve_request_headers_command(&HttpRequestHeadersCommand::default())
+                    .unwrap_err()
             ),
             "HTTP request headers command requires a non-empty command"
         );
@@ -1084,7 +1114,9 @@ mod tests {
             assert!(resolve_request_headers_command(&entry).is_ok());
         }
         assert_eq!(
-            resolve_request_headers_command(&config("node", &[])).unwrap().timeout,
+            resolve_request_headers_command(&config("node", &[]))
+                .unwrap()
+                .timeout,
             Duration::from_millis(10_000)
         );
     }
@@ -1126,7 +1158,10 @@ mod tests {
             serde_json::to_string(&envelope).unwrap(),
             r#"{"version":1,"method":"POST","url":"https://a.example/mcp","bodyBase64":"ZXhhY3Q="}"#
         );
-        assert_eq!(HttpRequestCommandEnvelope::new("GET", "u", b"").body_base64, "");
+        assert_eq!(
+            HttpRequestCommandEnvelope::new("GET", "u", b"").body_base64,
+            ""
+        );
     }
 
     // -- the four output-shape rejections (`request-headers-command.ts:272-296`) -----------------
@@ -1164,7 +1199,11 @@ mod tests {
 
         let headers = parse_derived_headers(br#"{"x-derived":"ok","x-other":"2"}"#).unwrap();
         assert_eq!(headers.len(), 2);
-        assert!(headers.iter().any(|(name, value)| name == "x-derived" && value == "ok"));
+        assert!(
+            headers
+                .iter()
+                .any(|(name, value)| name == "x-derived" && value == "ok")
+        );
     }
 
     // -- the subprocess, end to end -------------------------------------------------------------
@@ -1206,9 +1245,7 @@ mod tests {
     fn fails_closed_when_the_command_exits_unsuccessfully() {
         let envelope = HttpRequestCommandEnvelope::new("POST", "https://a.example/mcp", b"");
         assert_eq!(
-            message(
-                &invoke_request_headers_command(&sh("exit 7"), &envelope, None).unwrap_err()
-            ),
+            message(&invoke_request_headers_command(&sh("exit 7"), &envelope, None).unwrap_err()),
             "HTTP request headers command exited with code 7"
         );
     }
@@ -1286,7 +1323,10 @@ mod tests {
         assert_eq!(headers.len(), 1);
 
         std::thread::sleep(Duration::from_millis(900));
-        assert!(!marker.exists(), "a detached helper survived the request that spawned it");
+        assert!(
+            !marker.exists(),
+            "a detached helper survived the request that spawned it"
+        );
     }
 
     #[cfg(unix)]

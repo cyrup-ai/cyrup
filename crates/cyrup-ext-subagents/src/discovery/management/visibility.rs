@@ -85,11 +85,14 @@ mod tests {
 
     use std::path::PathBuf;
 
-    use super::*;
     use super::super::test_support::sample_agent;
+    use super::*;
 
     fn agent_named(name: &str, disabled: Option<bool>) -> AgentDefinition {
-        let mut a = sample_agent(AgentSource::Project, PathBuf::from(format!("/proj/{name}.md")));
+        let mut a = sample_agent(
+            AgentSource::Project,
+            PathBuf::from(format!("/proj/{name}.md")),
+        );
         a.name = name.to_string();
         a.local_name = name.to_string();
         a.disabled = disabled;
@@ -104,7 +107,11 @@ mod tests {
             agent_named("explicitly-enabled", Some(false)),
         ];
         let visible = AgentVisibility::management(&agents);
-        assert_eq!(visible.len(), 3, "management view MUST include disabled agents");
+        assert_eq!(
+            visible.len(),
+            3,
+            "management view MUST include disabled agents"
+        );
         assert!(visible.iter().any(|a| a.name == "disabled-one"));
     }
 
@@ -116,7 +123,11 @@ mod tests {
             agent_named("explicitly-enabled", Some(false)),
         ];
         let visible = AgentVisibility::delegation(&agents);
-        assert_eq!(visible.len(), 2, "delegation view MUST exclude disabled agents");
+        assert_eq!(
+            visible.len(),
+            2,
+            "delegation view MUST exclude disabled agents"
+        );
         assert!(!visible.iter().any(|a| a.name == "disabled-one"));
         assert!(visible.iter().any(|a| a.name == "enabled-one"));
         assert!(visible.iter().any(|a| a.name == "explicitly-enabled"));

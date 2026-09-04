@@ -156,7 +156,10 @@ fn collect_skill_files(dir: &Path, root_level: bool, out: &mut Vec<PathBuf>) {
 
 /// A dot-entry or `node_modules` directory the resource walks skip.
 fn is_skippable_entry(path: &Path) -> bool {
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
     name.starts_with('.') || name == "node_modules"
 }
 
@@ -224,7 +227,11 @@ mod tests {
     #[test]
     fn the_pi_subagents_skill_is_present_and_discoverable() {
         let files = bundled_skill_files();
-        assert_eq!(files.len(), 1, "exactly one bundled skill (pi-subagents/SKILL.md)");
+        assert_eq!(
+            files.len(),
+            1,
+            "exactly one bundled skill (pi-subagents/SKILL.md)"
+        );
         let skill = &files[0];
         assert!(skill.ends_with("pi-subagents/SKILL.md"), "got {skill:?}");
         assert!(skill.is_file(), "SKILL.md must exist on disk");

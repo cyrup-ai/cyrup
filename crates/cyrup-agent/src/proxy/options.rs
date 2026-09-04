@@ -137,7 +137,12 @@ pub(super) fn model_wire(model: &ModelRef) -> Value {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 
@@ -150,7 +155,10 @@ mod tests {
             cache_retention: Some(CacheRetention::Long),
             session_id: Some("sess-1".into()),
             transport: Some(Transport::Sse),
-            thinking_budgets: Some(ThinkingBudgets { medium: Some(5000), ..ThinkingBudgets::default() }),
+            thinking_budgets: Some(ThinkingBudgets {
+                medium: Some(5000),
+                ..ThinkingBudgets::default()
+            }),
             max_retry_delay_ms: Some(2000),
             auth_token: "secret".into(),
             proxy_url: "https://proxy.example".into(),
@@ -174,7 +182,9 @@ mod tests {
 
     #[test]
     fn request_body_omits_unset_fields() {
-        let body = serde_json::to_value(build_proxy_request_options(&ProxyStreamOptions::default())).unwrap();
+        let body =
+            serde_json::to_value(build_proxy_request_options(&ProxyStreamOptions::default()))
+                .unwrap();
         assert_eq!(body, serde_json::json!({}));
     }
 }

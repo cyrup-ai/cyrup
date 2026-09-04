@@ -126,7 +126,10 @@ impl AgentSession {
     /// the completed turn (Pi `_runAgentPrompt`, agent-session.ts:973-985). An unbound by-value session
     /// keeps the legacy behavior: start the run and let the subscriber terminate the run-scoped streams
     /// on `agent_end` (the post-run loop does not run).
-    pub(super) async fn spawn_run(&self, messages: Vec<AgentMessage>) -> Result<(), SessionServiceError> {
+    pub(super) async fn spawn_run(
+        &self,
+        messages: Vec<AgentMessage>,
+    ) -> Result<(), SessionServiceError> {
         match self.handle.get() {
             Some(this) => {
                 // Flag the loop active BEFORE returning so an immediate `wait_for_idle` waits for the
@@ -229,7 +232,9 @@ impl AgentSession {
     /// sequence, run a post-run threshold/overflow compaction, or continue for `agent_end`-queued
     /// messages. Returns `true` when the driver should `agent.continue()`.
     async fn handle_post_agent_run(&self) -> bool {
-        let Some(msg) = Self::lock(&self.last_assistant).take() else { return false };
+        let Some(msg) = Self::lock(&self.last_assistant).take() else {
+            return false;
+        };
         // Retryable transient error → backoff + continue (Pi :991-993).
         if self.is_retryable_error(&msg) && self.prepare_retry(&msg).await {
             return true;
@@ -258,7 +263,9 @@ impl AgentSession {
     /// as the agent drains the queue.
     pub(crate) async fn on_user_message_start(&self, message: &AgentMessage) {
         *Self::lock(&self.overflow_recovery_attempted) = false;
-        let Some(text) = agent_user_text(message) else { return };
+        let Some(text) = agent_user_text(message) else {
+            return;
+        };
         let mut drained = false;
         {
             let mut steer = Self::lock(&self.steering_messages);
@@ -351,7 +358,11 @@ impl AgentSession {
         //    `transform` handler rewrites `ui` (text/images) in place before continuing. The handler
         //    sees `streamingBehavior` only while streaming (Pi `this.isStreaming ? ... : undefined`,
         //    agent-session.ts:1022).
-        let handler_behavior = if streaming { options.streaming_behavior } else { None };
+        let handler_behavior = if streaming {
+            options.streaming_behavior
+        } else {
+            None
+        };
         if matches!(
             self.emit_input_event(&mut ui, handler_behavior).await,
             InputDisposition::Handled
@@ -393,7 +404,12 @@ impl AgentSession {
         ui: &mut UserInput,
         streaming_behavior: Option<StreamingBehavior>,
     ) -> InputDisposition {
-        if self.services.ext_host.dispatcher().no_subscribers(cyrup_ext::EventKind::Input) {
+        if self
+            .services
+            .ext_host
+            .dispatcher()
+            .no_subscribers(cyrup_ext::EventKind::Input)
+        {
             return InputDisposition::Continue;
         }
         let cancel = self.session_cancel.child_token();
@@ -500,12 +516,20 @@ impl AgentSession {
     /// `/skill:name args` → the skill block (Pi `_expandSkillCommand`, agent-session.ts:1174). Unknown
     /// skills / read failures pass the text through unchanged.
     fn expand_skill_command(&self, text: &str) -> String {
-        let Some(rest) = text.strip_prefix("/skill:") else { return text.to_string() };
+        let Some(rest) = text.strip_prefix("/skill:") else {
+            return text.to_string();
+        };
         let (name, args) = match rest.find(char::is_whitespace) {
             Some(i) => (&rest[..i], rest[i..].trim()),
             None => (rest, ""),
         };
-        let Some(skill) = self.services.resources.skills.winners().find(|s| s.name == name) else {
+        let Some(skill) = self
+            .services
+            .resources
+            .skills
+            .winners()
+            .find(|s| s.name == name)
+        else {
             return text.to_string();
         };
         let Ok(content) = std::fs::read_to_string(&skill.skill_md) else {
@@ -529,10 +553,14 @@ impl AgentSession {
     /// The most recent assistant message on the current branch as a full [`AssistantMessage`] (for
     /// the compaction/retry checks), or `None`.
     async fn last_assistant_message(&self) -> Option<AssistantMessage> {
-        self.messages().await.into_iter().rev().find_map(|m| match m {
-            Message::Assistant(a) => Some(a),
-            _ => None,
-        })
+        self.messages()
+            .await
+            .into_iter()
+            .rev()
+            .find_map(|m| match m {
+                Message::Assistant(a) => Some(a),
+                _ => None,
+            })
     }
 
     /// Run the `before_agent_start` extension hook and assemble the run's input messages (R-06-014;
@@ -554,7 +582,11 @@ impl AgentSession {
         // `refresh_extension_tools` rebuild this session performed.
         let base = self.base_system_prompt();
         // Fast path: no extension listens for `before_agent_start` — keep the assembled base prompt.
-        if self.services.ext_host.dispatcher().no_subscribers(cyrup_ext::EventKind::BeforeAgentStart)
+        if self
+            .services
+            .ext_host
+            .dispatcher()
+            .no_subscribers(cyrup_ext::EventKind::BeforeAgentStart)
         {
             // No handler ran, so there is nothing to override with — pi's `else` branch
             // (agent-session.ts:1251 @v0.83.0) clears the slot for exactly this reason, and a stale
@@ -573,7 +605,12 @@ impl AgentSession {
             injected: Vec::new(),
         };
         let cancel = self.session_cancel.child_token();
-        let reduced = self.services.ext_host.dispatcher().dispatch_block_mutate(event, &cancel).await;
+        let reduced = self
+            .services
+            .ext_host
+            .dispatcher()
+            .dispatch_block_mutate(event, &cancel)
+            .await;
 
         let mut messages = vec![user_msg];
         messages.extend(pending);
@@ -592,7 +629,11 @@ impl AgentSession {
             self.agent.set_tools(tools).await;
         }
         if let Reduced::Pass(ev) = reduced
-            && let HostEvent::BeforeAgentStart { system_prompt, injected, .. } = *ev
+            && let HostEvent::BeforeAgentStart {
+                system_prompt,
+                injected,
+                ..
+            } = *ev
         {
             // Apply the (possibly handler-replaced / sanitized) system prompt; reset to base
             // otherwise. Pi's two branches are `if (result?.systemPrompt !== undefined) {
@@ -641,7 +682,10 @@ impl AgentSession {
 
     /// Enqueue a steering message (delivered after the current tool batch, func-02 §9). Mirrors the
     /// text into the facade queue + emits `queue_update` (Pi `_queueSteer`, agent-session.ts:1249).
-    pub async fn steer(&self, input: impl Into<UserInput>) -> Result<PromptAccepted, SessionServiceError> {
+    pub async fn steer(
+        &self,
+        input: impl Into<UserInput>,
+    ) -> Result<PromptAccepted, SessionServiceError> {
         let mut ui = input.into();
         // Pi agent-session.ts:1242-1252: error on an extension command, then expand skill/template
         // BEFORE queueing — the queued text and the mirror must carry the expanded content.
@@ -678,10 +722,20 @@ impl AgentSession {
     /// agent-session.ts:1312-1321): extension commands cannot be queued via `steer`/`follow_up`.
     /// Only `/`-prefixed text is checked; the registry covers native + wasm commands.
     fn throw_if_extension_command(&self, text: &str) -> Result<(), SessionServiceError> {
-        let Some(body) = text.strip_prefix('/') else { return Ok(()) };
+        let Some(body) = text.strip_prefix('/') else {
+            return Ok(());
+        };
         let name = body.split_once(' ').map_or(body, |(n, _)| n);
-        if self.services.ext_host.registry().has_command(name).unwrap_or(false) {
-            return Err(SessionServiceError::ExtensionCommandNotQueueable(name.to_string()));
+        if self
+            .services
+            .ext_host
+            .registry()
+            .has_command(name)
+            .unwrap_or(false)
+        {
+            return Err(SessionServiceError::ExtensionCommandNotQueueable(
+                name.to_string(),
+            ));
         }
         Ok(())
     }
@@ -690,13 +744,19 @@ impl AgentSession {
 /// Strip a leading `---\n…\n---` YAML frontmatter block (Pi `stripFrontmatter`); returns the body
 /// after it, or the original text when no frontmatter is present.
 fn strip_frontmatter(content: &str) -> &str {
-    let Some(rest) = content.strip_prefix("---\n").or_else(|| content.strip_prefix("---\r\n")) else {
+    let Some(rest) = content
+        .strip_prefix("---\n")
+        .or_else(|| content.strip_prefix("---\r\n"))
+    else {
         return content;
     };
     // Find the closing `---` line.
     if let Some(idx) = rest.find("\n---") {
         let after = &rest[idx + 4..];
-        after.strip_prefix('\n').or_else(|| after.strip_prefix("\r\n")).unwrap_or(after)
+        after
+            .strip_prefix('\n')
+            .or_else(|| after.strip_prefix("\r\n"))
+            .unwrap_or(after)
     } else {
         content
     }

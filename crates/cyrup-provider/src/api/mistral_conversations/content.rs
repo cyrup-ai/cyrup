@@ -1,15 +1,15 @@
 //! Response decoding — one `CompletionChunk`: the `delta.content` walk over string / `text` /
 //! `thinking` chunks (Pi mistral-conversations.ts:325-416).
 
-use crate::api::compat::sanitize_surrogates;
+use super::blocks::{close_current, process_tool_call};
+use super::decoder::{CurrentKind, Decoder};
+use super::finish::{apply_usage, map_chat_stop_reason};
 use crate::api::EventSink;
+use crate::api::compat::sanitize_surrogates;
 use crate::model::Model;
 use crate::stream::StreamEvent;
 use cyrup_core::{ApiId, Content};
 use serde_json::Value;
-use super::blocks::{close_current, process_tool_call};
-use super::decoder::{CurrentKind, Decoder};
-use super::finish::{apply_usage, map_chat_stop_reason};
 
 /// Process one decoded `CompletionChunk`. Returns `false` if the consumer dropped the stream.
 pub(super) async fn process_chunk(

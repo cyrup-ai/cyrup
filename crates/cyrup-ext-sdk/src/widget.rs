@@ -22,7 +22,7 @@
 //! ]);
 //! ```
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// `Text` — a single (possibly multi-line) run of text. The shape virtually every Pi renderer
 /// returns (`new Text(str, 0, 0)`).
@@ -88,7 +88,12 @@ impl WidgetPlacement {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
     use super::*;
 
     /// The tags are a WIRE CONTRACT with `cyrup-tui`'s flattener — pin them so a rename here that
@@ -97,7 +102,10 @@ mod tests {
     #[test]
     fn the_constructors_emit_the_documented_tags() {
         assert_eq!(text("hi"), json!({ "widget": "text", "text": "hi" }));
-        assert_eq!(markdown("**b**"), json!({ "widget": "markdown", "text": "**b**" }));
+        assert_eq!(
+            markdown("**b**"),
+            json!({ "widget": "markdown", "text": "**b**" })
+        );
         assert_eq!(
             truncated_text("long"),
             json!({ "widget": "truncated-text", "text": "long" })

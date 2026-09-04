@@ -54,9 +54,15 @@ impl IntercomTool {
                     .take(80)
                     .collect();
                 let elapsed = now.saturating_sub(c.received_at) / 1000;
-                format!("- {} · {} · {}s ago · {}", who, c.message.id, elapsed, preview)
+                format!(
+                    "- {} · {} · {}s ago · {}",
+                    who, c.message.id, elapsed, preview
+                )
             })
             .collect();
-        Ok(text_result(format!("**Pending asks:**\n{}", rows.join("\n"))))
+        Ok(text_result(format!(
+            "**Pending asks:**\n{}",
+            rows.join("\n")
+        )))
     }
 }

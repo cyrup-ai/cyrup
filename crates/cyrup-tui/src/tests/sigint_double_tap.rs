@@ -1,11 +1,16 @@
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 mod ctrl_c_tests {
+    use crate::InputEvent;
+    use crate::UiTheme;
     use crate::app::*;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use crate::InputEvent;
-    use crate::UiTheme;
 
     fn ctrl_c() -> InputEvent {
         InputEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
@@ -21,11 +26,23 @@ mod ctrl_c_tests {
         // "exit when already empty" mis-statement by showing the inverse: contents don't force a clear
         // vs exit choice, timing does.
         app.editor_mut().set_text("some draft text");
-        assert_eq!(app.handle_input(&ctrl_c()), AppAction::Redraw, "first Ctrl+C clears, never exits");
-        assert_eq!(app.state().editor.text(), "", "first Ctrl+C cleared the buffer");
+        assert_eq!(
+            app.handle_input(&ctrl_c()),
+            AppAction::Redraw,
+            "first Ctrl+C clears, never exits"
+        );
+        assert_eq!(
+            app.state().editor.text(),
+            "",
+            "first Ctrl+C cleared the buffer"
+        );
         assert!(!app.state().should_quit, "one press must not exit");
         // Immediate second press (well within 500 ms) → exit.
-        assert_eq!(app.handle_input(&ctrl_c()), AppAction::Quit, "second Ctrl+C within 500 ms exits");
+        assert_eq!(
+            app.handle_input(&ctrl_c()),
+            AppAction::Quit,
+            "second Ctrl+C within 500 ms exits"
+        );
         assert!(app.state().should_quit, "double-tap sets the quit flag");
     }
 
@@ -35,13 +52,23 @@ mod ctrl_c_tests {
     fn single_or_stale_ctrl_c_does_not_exit() {
         let mut app = App::new(TestBackend::new(80, 24), UiTheme::dark()).unwrap();
         // Empty editor, single press → clear/record, NOT exit (the mis-stated rule would have exited).
-        assert_eq!(app.handle_input(&ctrl_c()), AppAction::Redraw, "empty single Ctrl+C must not exit");
+        assert_eq!(
+            app.handle_input(&ctrl_c()),
+            AppAction::Redraw,
+            "empty single Ctrl+C must not exit"
+        );
         assert!(!app.state().should_quit);
         // Age the recorded press beyond the 500 ms window; the next press is a fresh first tap.
         app.state_mut().last_sigint =
             Some(std::time::Instant::now() - std::time::Duration::from_millis(600));
-        assert_eq!(app.handle_input(&ctrl_c()), AppAction::Redraw, "a >500 ms-later Ctrl+C re-arms");
-        assert!(!app.state().should_quit, "outside the window is not a double-tap");
+        assert_eq!(
+            app.handle_input(&ctrl_c()),
+            AppAction::Redraw,
+            "a >500 ms-later Ctrl+C re-arms"
+        );
+        assert!(
+            !app.state().should_quit,
+            "outside the window is not a double-tap"
+        );
     }
 }
-

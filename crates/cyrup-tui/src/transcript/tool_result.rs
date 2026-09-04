@@ -138,7 +138,10 @@ pub(super) fn format_duration(ms: u64) -> String {
 /// read `renderResult` truncation footer (read.ts:190-199).
 pub(super) fn push_read_truncation(result: &Value, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
     let Some(t) = truncation(result) else { return };
-    let max_bytes = t.get("maxBytes").and_then(Value::as_u64).unwrap_or(DEFAULT_MAX_BYTES);
+    let max_bytes = t
+        .get("maxBytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_MAX_BYTES);
     let msg = if t.get("firstLineExceedsLimit") == Some(&Value::Bool(true)) {
         format!("[First line exceeds {} limit]", format_size(max_bytes))
     } else if t.get("truncatedBy").and_then(Value::as_str) == Some("lines") {
@@ -149,7 +152,11 @@ pub(super) fn push_read_truncation(result: &Value, theme: &UiTheme, out: &mut Ve
             tnum(t, "maxLines"),
         )
     } else {
-        format!("[Truncated: {} lines shown ({} limit)]", tnum(t, "outputLines"), format_size(max_bytes))
+        format!(
+            "[Truncated: {} lines shown ({} limit)]",
+            tnum(t, "outputLines"),
+            format_size(max_bytes)
+        )
     };
     out.push(Line::styled(msg, theme.warning_style()));
 }
@@ -157,7 +164,10 @@ pub(super) fn push_read_truncation(result: &Value, theme: &UiTheme, out: &mut Ve
 /// Strip the `\n\n[Showing lines … Full output: <path>]` footer bash bakes into the text but re-renders
 /// as a warning (bash.ts:226-231): only when finished + truncated + a `fullOutputPath` is present.
 pub(super) fn strip_bash_footer(output: &str, result: &Value, done: bool) -> String {
-    let full = result.get("details").and_then(|d| d.get("fullOutputPath")).and_then(Value::as_str);
+    let full = result
+        .get("details")
+        .and_then(|d| d.get("fullOutputPath"))
+        .and_then(Value::as_str);
     if done
         && truncation(result).is_some()
         && let Some(path) = full
@@ -173,7 +183,10 @@ pub(super) fn strip_bash_footer(output: &str, result: &Value, done: bool) -> Str
 
 /// bash `renderResult` truncation + full-output warnings (bash.ts:267-282).
 pub(super) fn push_bash_warnings(result: &Value, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
-    let full = result.get("details").and_then(|d| d.get("fullOutputPath")).and_then(Value::as_str);
+    let full = result
+        .get("details")
+        .and_then(|d| d.get("fullOutputPath"))
+        .and_then(Value::as_str);
     let trunc = truncation(result);
     if trunc.is_none() && full.is_none() {
         return;
@@ -184,24 +197,44 @@ pub(super) fn push_bash_warnings(result: &Value, theme: &UiTheme, out: &mut Vec<
     }
     if let Some(t) = trunc {
         if t.get("truncatedBy").and_then(Value::as_str) == Some("lines") {
-            warns.push(format!("Truncated: showing {} of {} lines", tnum(t, "outputLines"), tnum(t, "totalLines")));
+            warns.push(format!(
+                "Truncated: showing {} of {} lines",
+                tnum(t, "outputLines"),
+                tnum(t, "totalLines")
+            ));
         } else {
-            let max_bytes = t.get("maxBytes").and_then(Value::as_u64).unwrap_or(DEFAULT_MAX_BYTES);
-            warns.push(format!("Truncated: {} lines shown ({} limit)", tnum(t, "outputLines"), format_size(max_bytes)));
+            let max_bytes = t
+                .get("maxBytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(DEFAULT_MAX_BYTES);
+            warns.push(format!(
+                "Truncated: {} lines shown ({} limit)",
+                tnum(t, "outputLines"),
+                format_size(max_bytes)
+            ));
         }
     }
     // X10 — `bash.ts:311` is `new Text(`\n${theme.fg("warning", …)}`, 0, 0)`; the leading `\n` makes
     // `wrapTextWithAnsi` emit an empty first row (`utils.ts:839` splits on it), so the warning row
     // is always preceded by a blank.
     out.push(Line::default());
-    out.push(Line::styled(format!("[{}]", warns.join(". ")), theme.warning_style()));
+    out.push(Line::styled(
+        format!("[{}]", warns.join(". ")),
+        theme.warning_style(),
+    ));
 }
 
 /// grep `renderResult` warnings (grep.ts:110-119).
-pub(super) fn push_grep_warnings(result: Option<&Value>, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
+pub(super) fn push_grep_warnings(
+    result: Option<&Value>,
+    theme: &UiTheme,
+    out: &mut Vec<Line<'static>>,
+) {
     let Some(result) = result else { return };
     let details = result.get("details");
-    let match_limit = details.and_then(|d| d.get("matchLimitReached")).and_then(Value::as_u64);
+    let match_limit = details
+        .and_then(|d| d.get("matchLimitReached"))
+        .and_then(Value::as_u64);
     let lines_trunc = details.and_then(|d| d.get("linesTruncated")) == Some(&Value::Bool(true));
     let trunc = truncation(result);
     if match_limit.is_none() && trunc.is_none() && !lines_trunc {
@@ -212,19 +245,35 @@ pub(super) fn push_grep_warnings(result: Option<&Value>, theme: &UiTheme, out: &
         warns.push(format!("{n} matches limit"));
     }
     if let Some(t) = trunc {
-        warns.push(format!("{} limit", format_size(t.get("maxBytes").and_then(Value::as_u64).unwrap_or(DEFAULT_MAX_BYTES))));
+        warns.push(format!(
+            "{} limit",
+            format_size(
+                t.get("maxBytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(DEFAULT_MAX_BYTES)
+            )
+        ));
     }
     if lines_trunc {
         warns.push("some lines truncated".to_string());
     }
-    out.push(Line::styled(format!("[Truncated: {}]", warns.join(", ")), theme.warning_style()));
+    out.push(Line::styled(
+        format!("[Truncated: {}]", warns.join(", ")),
+        theme.warning_style(),
+    ));
 }
 
 /// find `renderResult` warnings (find.ts:98-105).
-pub(super) fn push_find_warnings(result: Option<&Value>, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
+pub(super) fn push_find_warnings(
+    result: Option<&Value>,
+    theme: &UiTheme,
+    out: &mut Vec<Line<'static>>,
+) {
     let Some(result) = result else { return };
-    let result_limit =
-        result.get("details").and_then(|d| d.get("resultLimitReached")).and_then(Value::as_u64);
+    let result_limit = result
+        .get("details")
+        .and_then(|d| d.get("resultLimitReached"))
+        .and_then(Value::as_u64);
     let trunc = truncation(result);
     if result_limit.is_none() && trunc.is_none() {
         return;
@@ -234,16 +283,32 @@ pub(super) fn push_find_warnings(result: Option<&Value>, theme: &UiTheme, out: &
         warns.push(format!("{n} results limit"));
     }
     if let Some(t) = trunc {
-        warns.push(format!("{} limit", format_size(t.get("maxBytes").and_then(Value::as_u64).unwrap_or(DEFAULT_MAX_BYTES))));
+        warns.push(format!(
+            "{} limit",
+            format_size(
+                t.get("maxBytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(DEFAULT_MAX_BYTES)
+            )
+        ));
     }
-    out.push(Line::styled(format!("[Truncated: {}]", warns.join(", ")), theme.warning_style()));
+    out.push(Line::styled(
+        format!("[Truncated: {}]", warns.join(", ")),
+        theme.warning_style(),
+    ));
 }
 
 /// ls `renderResult` warnings (ls.ts:84-91).
-pub(super) fn push_ls_warnings(result: Option<&Value>, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
+pub(super) fn push_ls_warnings(
+    result: Option<&Value>,
+    theme: &UiTheme,
+    out: &mut Vec<Line<'static>>,
+) {
     let Some(result) = result else { return };
-    let entry_limit =
-        result.get("details").and_then(|d| d.get("entryLimitReached")).and_then(Value::as_u64);
+    let entry_limit = result
+        .get("details")
+        .and_then(|d| d.get("entryLimitReached"))
+        .and_then(Value::as_u64);
     let trunc = truncation(result);
     if entry_limit.is_none() && trunc.is_none() {
         return;
@@ -253,9 +318,19 @@ pub(super) fn push_ls_warnings(result: Option<&Value>, theme: &UiTheme, out: &mu
         warns.push(format!("{n} entries limit"));
     }
     if let Some(t) = trunc {
-        warns.push(format!("{} limit", format_size(t.get("maxBytes").and_then(Value::as_u64).unwrap_or(DEFAULT_MAX_BYTES))));
+        warns.push(format!(
+            "{} limit",
+            format_size(
+                t.get("maxBytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(DEFAULT_MAX_BYTES)
+            )
+        ));
     }
-    out.push(Line::styled(format!("[Truncated: {}]", warns.join(", ")), theme.warning_style()));
+    out.push(Line::styled(
+        format!("[Truncated: {}]", warns.join(", ")),
+        theme.warning_style(),
+    ));
 }
 
 /// `shortenPath` (render-utils.ts:10-17): replace a leading `$HOME` with `~`.

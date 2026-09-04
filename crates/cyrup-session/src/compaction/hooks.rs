@@ -193,7 +193,9 @@ impl BeforeTreeDecision {
     /// `Proceed` with no overrides — the common case, and what a hook that does not subscribe
     /// returns.
     pub fn proceed() -> Self {
-        BeforeTreeDecision::Proceed { overrides: BeforeTreeOverrides::default() }
+        BeforeTreeDecision::Proceed {
+            overrides: BeforeTreeOverrides::default(),
+        }
     }
 }
 

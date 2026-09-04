@@ -2,6 +2,10 @@
 //! walk over text / thinking parts and `functionCall` parts
 //! (Pi google-generative-ai.ts:106-210).
 
+use super::TOOL_CALL_COUNTER;
+use super::decoder::{CurrentKind, Decoder};
+use super::finish::{apply_usage, close_current, retain_signature};
+use super::stop_reason::map_stop_reason;
 use crate::api::EventSink;
 use crate::model::Model;
 use crate::stream::StreamEvent;
@@ -9,10 +13,6 @@ use crate::utils::provider_plumbing::now_millis;
 use cyrup_core::{ApiId, Content, StopReason, ToolCall, ToolCallId};
 use serde_json::Value;
 use std::sync::atomic::Ordering;
-use super::TOOL_CALL_COUNTER;
-use super::decoder::{CurrentKind, Decoder};
-use super::finish::{apply_usage, close_current, retain_signature};
-use super::stop_reason::map_stop_reason;
 
 /// Process one decoded `GenerateContentResponse` chunk. Returns `false` if the consumer dropped.
 pub(super) async fn process_chunk(
@@ -242,8 +242,7 @@ async fn process_function_call(
     {
         return false;
     }
-    let delta = serde_json::to_string(&tool_call.arguments)
-        .unwrap_or_else(|_| "{}".to_string());
+    let delta = serde_json::to_string(&tool_call.arguments).unwrap_or_else(|_| "{}".to_string());
     let partial = dec.snapshot(model, api);
     if !sink
         .send(StreamEvent::ToolCallDelta {

@@ -271,7 +271,12 @@ impl JobTracker {
     /// consumed. `spawn_confirmed_at` is always `None` for a restored job — this tracker has no
     /// record of when hop-1 confirmed the spawn for a run it only learned about after the fact,
     /// exactly like a fresh [`JobTracker::track`] call with no such reference.
-    pub async fn track_restored(self: &Arc<Self>, run_id: RunId, paths: RunPaths, events_cursor: u64) {
+    pub async fn track_restored(
+        self: &Arc<Self>,
+        run_id: RunId,
+        paths: RunPaths,
+        events_cursor: u64,
+    ) {
         {
             let mut jobs = self
                 .jobs
@@ -461,9 +466,10 @@ impl JobTracker {
         // parse-tolerance property it demonstrates in tests.
 
         // Step (b): stale-run reconciliation (R-SA-088..092).
-        let reconciled = reconcile::reconcile_now(&job_snapshot.paths, job_snapshot.spawn_confirmed_at)
-            .await
-            .ok();
+        let reconciled =
+            reconcile::reconcile_now(&job_snapshot.paths, job_snapshot.spawn_confirmed_at)
+                .await
+                .ok();
 
         let mut jobs = self
             .jobs
@@ -622,7 +628,10 @@ async fn tail_new_lines(
     let mut file = match tokio::fs::File::open(path).await {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(TailOutcome { lines: Vec::new(), new_cursor: cursor });
+            return Ok(TailOutcome {
+                lines: Vec::new(),
+                new_cursor: cursor,
+            });
         }
         Err(e) => return Err(e),
     };
@@ -632,7 +641,10 @@ async fn tail_new_lines(
 
     if start >= metadata_len {
         // Nothing new since the last tick.
-        return Ok(TailOutcome { lines: Vec::new(), new_cursor: start });
+        return Ok(TailOutcome {
+            lines: Vec::new(),
+            new_cursor: start,
+        });
     }
 
     file.seek(SeekFrom::Start(start)).await?;
@@ -656,7 +668,10 @@ async fn tail_new_lines(
         // newline within it). Either way, the cursor does not advance: the same bytes are re-read,
         // whole, on a later tick once more content (including the eventual newline) has been
         // appended.
-        return Ok(TailOutcome { lines: Vec::new(), new_cursor: start });
+        return Ok(TailOutcome {
+            lines: Vec::new(),
+            new_cursor: start,
+        });
     };
 
     // `last_newline` is a valid in-bounds index into `buf` by construction (`rposition` only ever
@@ -736,7 +751,10 @@ mod tests {
     fn running_status(run_id: RunId, pid: u32) -> RunStatus {
         let mut status = RunStatus::queued(run_id, RunMode::Single, Some(pid));
         status.state = RunState::Running;
-        status.steps = vec![StepStatus { status: StepState::Running, ..StepStatus::pending("researcher") }];
+        status.steps = vec![StepStatus {
+            status: StepState::Running,
+            ..StepStatus::pending("researcher")
+        }];
         status
     }
 
@@ -760,7 +778,10 @@ mod tests {
         tracker.track(run_id, paths, None).await;
 
         assert_eq!(tracker.tracked_count(), 1);
-        assert!(tracker.is_polling().await, "first track() call must start the shared poller");
+        assert!(
+            tracker.is_polling().await,
+            "first track() call must start the shared poller"
+        );
     }
 
     #[tokio::test]
@@ -826,9 +847,14 @@ mod tests {
     async fn tail_new_lines_reads_nothing_for_a_missing_file() {
         let dir = tempfile::tempdir().expect("real tempdir");
         let path = dir.path().join("events.jsonl");
-        let outcome = tail_new_lines(&path, 0, DEFAULT_MAX_READ_CHUNK_BYTES, DEFAULT_MAX_LINE_BYTES)
-            .await
-            .expect("missing file is not an error");
+        let outcome = tail_new_lines(
+            &path,
+            0,
+            DEFAULT_MAX_READ_CHUNK_BYTES,
+            DEFAULT_MAX_LINE_BYTES,
+        )
+        .await
+        .expect("missing file is not an error");
         assert!(outcome.lines.is_empty());
         assert_eq!(outcome.new_cursor, 0);
     }
@@ -838,20 +864,31 @@ mod tests {
         let dir = tempfile::tempdir().expect("real tempdir");
         let path = dir.path().join("events.jsonl");
 
-        tokio::fs::write(&path, b"{\"kind\":\"run.paused\"}\n{\"kind\":\"run.repaired_stale\"}\n")
-            .await
-            .expect("seed two complete lines");
+        tokio::fs::write(
+            &path,
+            b"{\"kind\":\"run.paused\"}\n{\"kind\":\"run.repaired_stale\"}\n",
+        )
+        .await
+        .expect("seed two complete lines");
 
-        let outcome = tail_new_lines(&path, 0, DEFAULT_MAX_READ_CHUNK_BYTES, DEFAULT_MAX_LINE_BYTES)
-            .await
-            .expect("tail succeeds");
+        let outcome = tail_new_lines(
+            &path,
+            0,
+            DEFAULT_MAX_READ_CHUNK_BYTES,
+            DEFAULT_MAX_LINE_BYTES,
+        )
+        .await
+        .expect("tail succeeds");
 
         assert_eq!(outcome.lines.len(), 2);
         assert_eq!(outcome.lines[0]["kind"], "run.paused");
         assert_eq!(outcome.lines[1]["kind"], "run.repaired_stale");
 
         let full_len = tokio::fs::metadata(&path).await.expect("stat").len();
-        assert_eq!(outcome.new_cursor, full_len, "cursor must advance past every fully-read byte");
+        assert_eq!(
+            outcome.new_cursor, full_len,
+            "cursor must advance past every fully-read byte"
+        );
     }
 
     #[tokio::test]
@@ -863,9 +900,14 @@ mod tests {
             .await
             .expect("one complete line + one incomplete trailing line");
 
-        let outcome = tail_new_lines(&path, 0, DEFAULT_MAX_READ_CHUNK_BYTES, DEFAULT_MAX_LINE_BYTES)
-            .await
-            .expect("tail succeeds");
+        let outcome = tail_new_lines(
+            &path,
+            0,
+            DEFAULT_MAX_READ_CHUNK_BYTES,
+            DEFAULT_MAX_LINE_BYTES,
+        )
+        .await
+        .expect("tail succeeds");
 
         assert_eq!(outcome.lines.len(), 1, "only the complete line is returned");
         assert_eq!(outcome.lines[0]["kind"], "a");
@@ -902,15 +944,27 @@ mod tests {
         let dir = tempfile::tempdir().expect("real tempdir");
         let path = dir.path().join("events.jsonl");
 
-        tokio::fs::write(&path, b"{\"kind\":\"a\"}\nnot valid json at all\n{\"kind\":\"c\"}\n")
-            .await
-            .expect("seed a malformed middle line");
+        tokio::fs::write(
+            &path,
+            b"{\"kind\":\"a\"}\nnot valid json at all\n{\"kind\":\"c\"}\n",
+        )
+        .await
+        .expect("seed a malformed middle line");
 
-        let outcome = tail_new_lines(&path, 0, DEFAULT_MAX_READ_CHUNK_BYTES, DEFAULT_MAX_LINE_BYTES)
-            .await
-            .expect("tail succeeds despite the malformed line");
+        let outcome = tail_new_lines(
+            &path,
+            0,
+            DEFAULT_MAX_READ_CHUNK_BYTES,
+            DEFAULT_MAX_LINE_BYTES,
+        )
+        .await
+        .expect("tail succeeds despite the malformed line");
 
-        assert_eq!(outcome.lines.len(), 2, "the malformed line is skipped, not fatal");
+        assert_eq!(
+            outcome.lines.len(),
+            2,
+            "the malformed line is skipped, not fatal"
+        );
         assert_eq!(outcome.lines[0]["kind"], "a");
         assert_eq!(outcome.lines[1]["kind"], "c");
     }
@@ -957,9 +1011,14 @@ mod tests {
             .await
             .expect("rotate to shorter content");
 
-        let outcome = tail_new_lines(&path, full_len, DEFAULT_MAX_READ_CHUNK_BYTES, DEFAULT_MAX_LINE_BYTES)
-            .await
-            .expect("tail succeeds after rotation");
+        let outcome = tail_new_lines(
+            &path,
+            full_len,
+            DEFAULT_MAX_READ_CHUNK_BYTES,
+            DEFAULT_MAX_LINE_BYTES,
+        )
+        .await
+        .expect("tail succeeds after rotation");
 
         assert_eq!(outcome.lines.len(), 1);
         assert_eq!(outcome.lines[0]["kind"], "fresh");
@@ -976,7 +1035,9 @@ mod tests {
         for _ in 0..10 {
             content.extend_from_slice(line);
         }
-        tokio::fs::write(&path, &content).await.expect("seed ten lines");
+        tokio::fs::write(&path, &content)
+            .await
+            .expect("seed ten lines");
 
         // Cap the read chunk at just enough for 3 lines.
         let chunk_cap = line.len() * 3;
@@ -997,8 +1058,14 @@ mod tests {
             }
         }
 
-        assert_eq!(total_lines, 10, "every line is eventually observed across bounded-chunk ticks");
-        assert!(ticks >= 4, "a bounded chunk cap must force multiple ticks to drain all ten lines, got {ticks}");
+        assert_eq!(
+            total_lines, 10,
+            "every line is eventually observed across bounded-chunk ticks"
+        );
+        assert!(
+            ticks >= 4,
+            "a bounded chunk cap must force multiple ticks to drain all ten lines, got {ticks}"
+        );
         assert_eq!(cursor, content.len() as u64);
     }
 
@@ -1010,7 +1077,8 @@ mod tests {
     // ---------------------------------------------------------------------------------------
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn tracker_detects_a_simulated_runners_state_changes_and_self_stops_when_no_jobs_remain() {
+    async fn tracker_detects_a_simulated_runners_state_changes_and_self_stops_when_no_jobs_remain()
+    {
         let tracker = fast_tracker();
         let (_dir, paths) = temp_paths();
         let run_id = paths_run_id(&paths);
@@ -1021,7 +1089,9 @@ mod tests {
         write_status(&paths, &status).await;
         append_event_line(&paths.events, br#"{"kind":"run.started"}"#).await;
 
-        tracker.track(run_id.clone(), paths.clone(), Some(SystemTime::now())).await;
+        tracker
+            .track(run_id.clone(), paths.clone(), Some(SystemTime::now()))
+            .await;
         assert!(tracker.is_polling().await);
 
         // Give the poller a few ticks to observe the Running state and tail the first event.
@@ -1038,8 +1108,14 @@ mod tests {
         .await;
 
         let job_after_running = tracker.get(&run_id).expect("still tracked while Running");
-        assert!(job_after_running.events_cursor > 0, "the poller must have tailed the appended event");
-        assert!(job_after_running.terminal_since.is_none(), "a Running job is not yet terminal");
+        assert!(
+            job_after_running.events_cursor > 0,
+            "the poller must have tailed the appended event"
+        );
+        assert!(
+            job_after_running.terminal_since.is_none(),
+            "a Running job is not yet terminal"
+        );
 
         // Simulated runner, phase 2: the run pauses (a soft interrupt, R-SA-084) — still not
         // terminal.
@@ -1059,7 +1135,11 @@ mod tests {
         })
         .await;
         assert!(
-            tracker.get(&run_id).expect("still tracked").terminal_since.is_none(),
+            tracker
+                .get(&run_id)
+                .expect("still tracked")
+                .terminal_since
+                .is_none(),
             "Paused must never be treated as terminal (R-SA-084)"
         );
 
@@ -1067,7 +1147,9 @@ mod tests {
         // ResultFile, exactly mirroring R-SA-077's real write ordering.
         status.state = RunState::Running;
         write_status(&paths, &status).await;
-        status.advance_state(RunState::Complete).expect("Running -> Complete is legal");
+        status
+            .advance_state(RunState::Complete)
+            .expect("Running -> Complete is legal");
         write_status(&paths, &status).await;
         let result = crate::background::ResultFile {
             id: run_id.clone(),
@@ -1116,7 +1198,11 @@ mod tests {
         assert_eq!(tracker.tracked_count(), 1);
 
         tracker.untrack(&run_id);
-        assert_eq!(tracker.tracked_count(), 0, "untrack must remove the job immediately");
+        assert_eq!(
+            tracker.tracked_count(),
+            0,
+            "untrack must remove the job immediately"
+        );
     }
 
     #[tokio::test]
@@ -1197,7 +1283,10 @@ mod tests {
             if condition().await {
                 return;
             }
-            assert!(Instant::now() < deadline, "condition did not become true within {timeout:?}");
+            assert!(
+                Instant::now() < deadline,
+                "condition did not become true within {timeout:?}"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }

@@ -17,14 +17,19 @@
 //! real `LiveHostServices`, which is what `live.rs` calls — never through the mirror or the access
 //! handle directly, so an unattached seam fails them exactly as it failed in production.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::sync::Arc;
 
 use cyrup_ext::host::HostServices;
-use cyrup_provider::faux::FauxProvider;
 use cyrup_provider::Provider;
-use cyrup_resources::{builtin_themes, ResourceRegistry, ResourceSet, Theme};
+use cyrup_provider::faux::FauxProvider;
+use cyrup_resources::{ResourceRegistry, ResourceSet, Theme, builtin_themes};
 use cyrup_session_svc::LiveHostServices;
 use ratatui::backend::TestBackend;
 
@@ -51,8 +56,11 @@ fn registry() -> Arc<ResourceRegistry> {
 
 /// An app + the seams installed exactly as `App::run` installs them, returning the switch channel
 /// the run loop's `theme_switch_rx` arm would drain.
-fn wired() -> (App<TestBackend>, Arc<LiveHostServices>, tokio::sync::mpsc::UnboundedReceiver<Theme>)
-{
+fn wired() -> (
+    App<TestBackend>,
+    Arc<LiveHostServices>,
+    tokio::sync::mpsc::UnboundedReceiver<Theme>,
+) {
     let mut app = App::new(TestBackend::new(80, 24), UiTheme::dark()).unwrap();
     let svc = services();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Theme>();
@@ -91,7 +99,8 @@ fn a_guest_reads_the_live_editor_buffer() {
 #[test]
 fn the_buffer_a_guest_reads_has_pastes_expanded() {
     let (mut app, svc, _rx) = wired();
-    app.editor_mut().handle_paste("line one\nline two\nline three\nline four\nline five\nline six");
+    app.editor_mut()
+        .handle_paste("line one\nline two\nline three\nline four\nline five\nline six");
     app.draw().unwrap();
 
     let seen = HostServices::editor_text(svc.as_ref());
@@ -124,7 +133,10 @@ fn a_guest_reads_back_the_text_it_just_wrote() {
 
     svc.set_editor_text("guest wrote this", false);
     let readback = HostServices::editor_text(svc.as_ref());
-    assert_eq!(readback, "guest wrote this", "read-after-write must not lose the write");
+    assert_eq!(
+        readback, "guest wrote this",
+        "read-after-write must not lose the write"
+    );
 
     // …and the read-modify-write that motivates the whole seam round-trips intact.
     svc.set_editor_text(&format!("{readback} — appended by the extension"), false);
@@ -182,11 +194,18 @@ fn a_guest_lists_every_available_theme_with_its_path() {
     let listed = HostServices::theme_list(svc.as_ref());
     let rows = listed.as_array().expect("theme_list is an array");
     let names: Vec<&str> = rows.iter().filter_map(|r| r["name"].as_str()).collect();
-    assert_eq!(names, vec!["dark", "light"], "name-sorted, like `theme.ts:519`'s localeCompare");
+    assert_eq!(
+        names,
+        vec!["dark", "light"],
+        "name-sorted, like `theme.ts:519`'s localeCompare"
+    );
     // [CYRUP-DELTA] `theme.ts:506-508` synthesizes `<themesDir>/<name>.json` for a built-in; cyrup's
     // built-ins are compiled-in constants with no file, so `null` (the EXT-021 contract) is the only
     // honest answer — and it is what distinguishes them from a file-backed theme.
-    assert!(rows.iter().all(|r| r["path"].is_null()), "compiled-in built-ins carry no path");
+    assert!(
+        rows.iter().all(|r| r["path"].is_null()),
+        "compiled-in built-ins carry no path"
+    );
 }
 
 /// pi `getTheme(name): Theme | undefined` (`core/extensions/types.ts:272`) — load a theme WITHOUT
@@ -247,7 +266,9 @@ fn a_guest_switches_the_theme_and_a_bad_name_reports_pis_error() {
     app.draw().unwrap();
 
     assert_eq!(HostServices::set_theme(svc.as_ref(), "light"), Ok(()));
-    let switched = rx.try_recv().expect("the resolved theme reaches the run loop");
+    let switched = rx
+        .try_recv()
+        .expect("the resolved theme reaches the run loop");
     assert_eq!(switched.key.as_str(), "light");
 
     assert_eq!(
@@ -255,7 +276,10 @@ fn a_guest_switches_the_theme_and_a_bad_name_reports_pis_error() {
         Err("Theme not found: no-such-theme".to_string()),
         "pi `theme.ts:622`, caught into `{{success: false, error}}` by `setTheme`"
     );
-    assert!(rx.try_recv().is_err(), "a rejected name never reaches the run loop, so nothing repaints");
+    assert!(
+        rx.try_recv().is_err(),
+        "a rejected name never reaches the run loop, so nothing repaints"
+    );
 }
 
 /// The mode policy for the theme family, preserved: unattached, all four are pi's headless answers
@@ -271,7 +295,10 @@ fn a_guest_switches_the_theme_and_a_bad_name_reports_pis_error() {
 fn an_unattached_theme_seam_keeps_pis_headless_answers() {
     let svc = services();
     assert_eq!(HostServices::theme(svc.as_ref()), None);
-    assert_eq!(HostServices::theme_list(svc.as_ref()), serde_json::json!([]));
+    assert_eq!(
+        HostServices::theme_list(svc.as_ref()),
+        serde_json::json!([])
+    );
     assert_eq!(HostServices::theme_by_name(svc.as_ref(), "dark"), None);
     assert_eq!(
         HostServices::set_theme(svc.as_ref(), "dark"),

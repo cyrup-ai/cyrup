@@ -11,21 +11,18 @@ use std::time::Duration;
 use cyrup_core::{ModelId, Usage};
 
 use crate::exec::acceptance::AcceptanceContract;
-use crate::exec::fallback::{
-    AttemptRunner, AttemptSignal, StartupEvidence, StartupOutcome,
-    StartupRetryWait,
-};
-use crate::exec::output::{
-    EMPTY_OUTPUT_ERROR, INTERRUPTED_FINAL_OUTPUT, detect_subagent_error,
-    extract_final_output,
-    trailing_assistant_error,
-};
-use crate::spawn::SpawnedChild;
 use crate::exec::agent_config::{AgentConfig, RunOptions};
 use crate::exec::drive_attempt::{DriveOutcome, drive_attempt};
+use crate::exec::fallback::{
+    AttemptRunner, AttemptSignal, StartupEvidence, StartupOutcome, StartupRetryWait,
+};
+use crate::exec::output::{
+    EMPTY_OUTPUT_ERROR, INTERRUPTED_FINAL_OUTPUT, detect_subagent_error, extract_final_output,
+    message_error_messages, trailing_assistant_error,
+};
 use crate::exec::progress::AgentProgress;
 use crate::exec::spawn_plan::{build_attempt_spawn_plan_with_read_requirement, build_task_text};
-
+use crate::spawn::SpawnedChild;
 
 /// The production [`AttemptRunner`] implementation: spawns a REAL child OS process per
 /// model-fallback attempt via [`SpawnedChild::spawn`] (func-SA §1.1's mandated mechanism),
@@ -118,8 +115,14 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
             .opts
             .deadline_at
             .map(|instant| tokio::time::sleep_until(tokio::time::Instant::from_std(instant)));
-        let outcome =
-            drive_attempt(child, &mut progress, self.opts, deadline_sleep, &mut control).await;
+        let outcome = drive_attempt(
+            child,
+            &mut progress,
+            self.opts,
+            deadline_sleep,
+            &mut control,
+        )
+        .await;
 
         // pi returns from `runSingleAttempt` on an interrupt BEFORE any exit-code re-diagnosis, so
         // this branch stays ahead of every diagnosis below.
@@ -181,6 +184,11 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
                 // NDJSON showed a blocking `contact_supervisor` ask (surfaced via `spawn_clarify`),
                 // which bypasses acceptance/completion-guard/truncation and stops the ladder.
                 detached: outcome.detached,
+                // SUBA-089: pi `isRetryableModelFailureAttempt({..., messages: result.messages})`
+                // (`execution.ts:2144` @v0.64.0) — every `message_end`'s `errorMessage`, so the
+                // ladder can tell a provider failure the child reported from raw stderr after
+                // real activity.
+                message_errors: message_error_messages(&progress.message_end_events),
                 startup: build_startup_evidence(
                     &progress,
                     &outcome,
@@ -329,8 +337,13 @@ impl SpawnedChildAttemptRunner<'_> {
             crate::time::now_epoch_millis(),
         );
 
-        let task_text =
-            build_task_text(self.agent, self.task, self.opts, self.contract, &self.skill_injection);
+        let task_text = build_task_text(
+            self.agent,
+            self.task,
+            self.opts,
+            self.contract,
+            &self.skill_injection,
+        );
 
         // R-SA-054/055/056 (SAFETY-CRITICAL, C15): the CHILD about to be spawned is one recursion
         // hop deeper than THIS process, so its env overlay MUST carry the incremented envelope —
@@ -544,6 +557,7 @@ fn attempt_setup_failure(
             usage: Usage::default(),
             timed_out: false,
             detached: false,
+            message_errors: Vec::new(), // nothing ran, so no message ever carried one
             startup: StartupEvidence::default(),
         },
         AttemptRecord {
@@ -574,6 +588,7 @@ fn interrupted_attempt(
             usage: progress.usage.clone(),
             timed_out: false,
             detached: outcome.detached,
+            message_errors: message_error_messages(&progress.message_end_events),
             startup: StartupEvidence::default(),
         },
         AttemptRecord {
@@ -606,6 +621,7 @@ fn timed_out_attempt(
             usage: progress.usage.clone(),
             timed_out: true,
             detached: outcome.detached,
+            message_errors: message_error_messages(&progress.message_end_events),
             startup: StartupEvidence::default(),
         },
         AttemptRecord {
@@ -666,9 +682,8 @@ fn diagnose_attempt_error(
     //     error and hide the cause. The file exists only when something was actually missing
     //     (the child DELETES it otherwise), so this is silent on every healthy run.
     if error.is_none() {
-        error = crate::exec::tool_availability::read_child_tool_diagnostic_error(
-            tool_diagnostic_path,
-        );
+        error =
+            crate::exec::tool_availability::read_child_tool_diagnostic_error(tool_diagnostic_path);
     }
     if error.is_none() {
         error = trailing_assistant_error(&progress.all_events);
@@ -734,7 +749,6 @@ fn process_signal_name(_status: &std::process::ExitStatus) -> Option<String> {
     None
 }
 
-
 /// pi's `missingStructuredOutput` analog (`execution.ts:1189-1191`) for the empty-output
 /// (cold-start) gate: is the child's structured output ABSENT from its event stream? Returns
 /// `true` when NO structured-output schema was requested at all (pi's `!options.structuredOutput`
@@ -780,7 +794,6 @@ mod tests {
 
     use super::*;
 
-
     /// SUBA-023 (consumer half): the signal name published on a run record must come from the
     /// crate's ONE mapping (`spawn::signal::signal_name_of`, which also fills
     /// `TerminationOutcome::signal_name`), not from a local three-entry table.
@@ -809,7 +822,10 @@ mod tests {
         }
 
         // A normal exit names no signal at all (pi's `if (signal) result.processSignal = signal`).
-        assert_eq!(process_signal_name(&std::process::ExitStatus::from_raw(0)), None);
+        assert_eq!(
+            process_signal_name(&std::process::ExitStatus::from_raw(0)),
+            None
+        );
 
         // …and a signal the shared table does not name still falls back to the numeric form rather
         // than disappearing, so nothing previously reported is lost.
@@ -818,7 +834,6 @@ mod tests {
             Some("SIG64")
         );
     }
-
 
     /// SUBA-S01 residual — the per-attempt cold-start gate's presence test is pi's `existsSync` on
     /// the CAPTURE FILE (`execution.ts:1189-1191`) and nothing else.
@@ -843,8 +858,9 @@ mod tests {
 
         // Declared WITH a runtime: strictly the capture file's existence, both ways. Asserting the
         // present case first keeps the absent assertion from passing vacuously.
-        let runtime = crate::exec::structured::create_structured_output_runtime(&schema, dir.path())
-            .expect("runtime is created");
+        let runtime =
+            crate::exec::structured::create_structured_output_runtime(&schema, dir.path())
+                .expect("runtime is created");
         assert!(
             structured_output_absent(Some(&schema), Some(&runtime)),
             "no capture file written yet => absent"
@@ -855,5 +871,4 @@ mod tests {
             "a written capture file => present, even with no prose at all"
         );
     }
-
 }

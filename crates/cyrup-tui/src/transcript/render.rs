@@ -105,7 +105,9 @@ pub(crate) fn entry_lines(
                 *hidden,
                 width.saturating_sub(output_pad * 2),
                 theme,
-                images.hidden_thinking_label.unwrap_or(HIDDEN_THINKING_LABEL),
+                images
+                    .hidden_thinking_label
+                    .unwrap_or(HIDDEN_THINKING_LABEL),
             );
             if out.is_empty() {
                 return out;
@@ -145,7 +147,11 @@ pub(crate) fn entry_lines(
             full.set_expanded(images.tools_expanded);
             full.render_lines(width, theme, None, None)
         }
-        Entry::SkillInvocation { name, content, lead_spacer } => {
+        Entry::SkillInvocation {
+            name,
+            content,
+            lead_spacer,
+        } => {
             // `[skill]` label + bold name header, full content as markdown (the committed/expanded
             // form — `skill-invocation-message.ts` expanded branch). The leading spacer is the gated
             // `interactive-mode.ts:3500` one (see [`Entry::SkillInvocation`]).
@@ -159,7 +165,11 @@ pub(crate) fn entry_lines(
                 width,
             )
         }
-        Entry::Custom { label, body, rendered } => match rendered {
+        Entry::Custom {
+            label,
+            body,
+            rendered,
+        } => match rendered {
             // X15 — the renderer THREW. Pi does not silently drop the entry: `CustomEntryComponent`
             // catches and draws a failure box in its place (`components/custom-entry.ts:47-52`):
             //
@@ -183,7 +193,12 @@ pub(crate) fn entry_lines(
                 let text = format!("[{label}] renderer failed: {message}");
                 // `new Text(…, 0, 0)` inside a `Box(1, 1)`: paddingX 0, so the row wraps at the
                 // box's own content width (`box.ts:79`) with no further margin.
-                let children = text_lines(&text, width.saturating_sub(2).max(1), 0, theme.error_style());
+                let children = text_lines(
+                    &text,
+                    width.saturating_sub(2).max(1),
+                    0,
+                    theme.error_style(),
+                );
                 let mut out = box_lines(children, width, 1, 1, fill);
                 if !out.is_empty() {
                     out.insert(0, Line::default());
@@ -257,16 +272,27 @@ pub(crate) fn entry_lines(
                     width,
                 )
             } else {
-                collapsed_summary_lines("branch", "Branch summary (", images.expand_key, theme, width)
+                collapsed_summary_lines(
+                    "branch",
+                    "Branch summary (",
+                    images.expand_key,
+                    theme,
+                    width,
+                )
             }
         }
-        Entry::CompactionSummary { tokens_before, summary } => {
+        Entry::CompactionSummary {
+            tokens_before,
+            summary,
+        } => {
             // X14 — the same collapsed form (and the same LIVE `toolOutputExpanded` read), with the
             // token count in the lead (`compaction-summary-message.ts:48-56`):
             // `fg("customMessageText", `Compacted from ${tokenStr} tokens (`) + fg("dim", keyText(…)) + fg("customMessageText", " to expand)")`.
             if !images.tools_expanded {
-                let lead =
-                    format!("Compacted from {} tokens (", group_thousands(*tokens_before));
+                let lead = format!(
+                    "Compacted from {} tokens (",
+                    group_thousands(*tokens_before)
+                );
                 return collapsed_summary_lines(
                     "compaction",
                     &lead,
@@ -275,7 +301,10 @@ pub(crate) fn entry_lines(
                     width,
                 );
             }
-            let header = format!("**Compacted from {} tokens**", group_thousands(*tokens_before));
+            let header = format!(
+                "**Compacted from {} tokens**",
+                group_thousands(*tokens_before)
+            );
             // `interactive-mode.ts:3484` is UNgated too.
             labeled_message_lines("compaction", &header, summary, true, true, theme, width)
         }
@@ -367,7 +396,9 @@ pub(crate) fn entry_lines(
             // edge to edge.
             let w = width.max(1);
             let rule = "─".repeat(w);
-            let bold = theme.accent_style().add_modifier(ratatui::style::Modifier::BOLD);
+            let bold = theme
+                .accent_style()
+                .add_modifier(ratatui::style::Modifier::BOLD);
             let mut out: Vec<Line<'static>> = vec![
                 Line::default(),
                 Line::styled(rule.clone(), theme.border_style()),

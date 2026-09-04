@@ -18,11 +18,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::{AgentSession, SessionBuilder, SessionConfig};
-use cyrup_core::message::Message;
 use cyrup_core::StopReason;
-use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call, FauxProvider};
+use cyrup_core::message::Message;
 use cyrup_provider::Provider;
-use serde_json::{json, Value};
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text, faux_tool_call};
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 struct Fixture {
@@ -37,7 +37,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 /// A session whose provider issues `calls` as ONE assistant message — so the loop takes the
@@ -46,7 +50,10 @@ async fn session_issuing(fx: &Fixture, calls: Vec<(&str, Value)>) -> AgentSessio
     let faux = Arc::new(FauxProvider::new());
     faux.set_responses(vec![
         faux_assistant_message(
-            calls.into_iter().map(|(name, args)| faux_tool_call(name, args)).collect(),
+            calls
+                .into_iter()
+                .map(|(name, args)| faux_tool_call(name, args))
+                .collect(),
             StopReason::ToolUse,
         ),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
@@ -55,7 +62,10 @@ async fn session_issuing(fx: &Fixture, calls: Vec<(&str, Value)>) -> AgentSessio
     let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
     cfg.trust_override = Some(true);
     cfg.no_extensions = true;
-    SessionBuilder::new(provider, cfg).build().await.expect("build")
+    SessionBuilder::new(provider, cfg)
+        .build()
+        .await
+        .expect("build")
 }
 
 /// Every tool result in the transcript as `(tool_name, is_error)`, in transcript order.
@@ -63,9 +73,11 @@ fn tool_results(messages: &[Message]) -> Vec<(String, bool)> {
     messages
         .iter()
         .filter_map(|m| match m {
-            Message::ToolResult { tool_name, is_error, .. } => {
-                Some((tool_name.clone(), *is_error))
-            }
+            Message::ToolResult {
+                tool_name,
+                is_error,
+                ..
+            } => Some((tool_name.clone(), *is_error)),
             _ => None,
         })
         .collect()
@@ -91,7 +103,11 @@ async fn write_then_write_to_one_path_leaves_the_second_payload() {
     )
     .await;
 
-    assert_eq!(results.len(), 2, "both calls must produce a tool result: {results:?}");
+    assert_eq!(
+        results.len(),
+        2,
+        "both calls must produce a tool result: {results:?}"
+    );
     assert!(
         results.iter().all(|(_, is_error)| !*is_error),
         "a mutation failed, so the content assertion below would prove nothing: {results:?}"
@@ -120,7 +136,11 @@ async fn three_writes_to_one_path_leave_the_last_payload() {
     )
     .await;
 
-    assert_eq!(results.len(), 3, "all three calls must produce a tool result: {results:?}");
+    assert_eq!(
+        results.len(),
+        3,
+        "all three calls must produce a tool result: {results:?}"
+    );
     assert!(
         results.iter().all(|(_, is_error)| !*is_error),
         "a mutation failed, so the content assertion below would prove nothing: {results:?}"
@@ -155,7 +175,11 @@ async fn write_then_edit_of_one_path_applies_the_edit_to_the_write() {
     )
     .await;
 
-    assert_eq!(results.len(), 2, "both calls must produce a tool result: {results:?}");
+    assert_eq!(
+        results.len(),
+        2,
+        "both calls must produce a tool result: {results:?}"
+    );
     let edit = results
         .iter()
         .find(|(name, _)| name == "edit")

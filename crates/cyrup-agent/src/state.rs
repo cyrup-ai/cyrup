@@ -205,6 +205,7 @@ pub(crate) fn reduce(st: &mut StateInner, ev: &AgentEvent) {
         AgentEvent::AgentEnd { .. } => {
             st.streaming_message = None;
         }
-        AgentEvent::AgentStart | AgentEvent::TurnStart | AgentEvent::ToolExecutionUpdate { .. } => {}
+        AgentEvent::AgentStart | AgentEvent::TurnStart | AgentEvent::ToolExecutionUpdate { .. } => {
+        }
     }
 }

@@ -374,7 +374,10 @@ mod tests {
     fn strips_osc_with_either_terminator() {
         assert_eq!(strip_ansi("\u{1b}]0;title\u{07}body"), "body");
         assert_eq!(strip_ansi("\u{1b}]0;title\u{1b}\\body"), "body");
-        assert_eq!(strip_ansi("\u{1b}]8;;http://x\u{07}link\u{1b}]8;;\u{07}"), "link");
+        assert_eq!(
+            strip_ansi("\u{1b}]8;;http://x\u{07}link\u{1b}]8;;\u{07}"),
+            "link"
+        );
     }
 
     #[test]
@@ -397,9 +400,21 @@ mod tests {
         // gives back digits until one serves as the final byte. Verified against the vendored
         // pattern itself, not merely reasoned about.
         assert_eq!(strip_ansi("\u{1b}[31"), "", "params `3`, final byte `1`");
-        assert_eq!(strip_ansi("\u{1b}[1;31"), "", "a truncated SGR is still stripped");
-        assert_eq!(strip_ansi("\u{1b}[3abc"), "abc", "params empty, final byte `3`");
-        assert_eq!(strip_ansi("\u{1b}7abc"), "abc", "no intermediates, final byte `7`");
+        assert_eq!(
+            strip_ansi("\u{1b}[1;31"),
+            "",
+            "a truncated SGR is still stripped"
+        );
+        assert_eq!(
+            strip_ansi("\u{1b}[3abc"),
+            "abc",
+            "params empty, final byte `3`"
+        );
+        assert_eq!(
+            strip_ansi("\u{1b}7abc"),
+            "abc",
+            "no intermediates, final byte `7`"
+        );
         // Four digits is the `\d{1,4}` ceiling, so the fifth digit is the final byte and `99m`
         // survives — cyrup and pi already agreed here, which is what makes it a useful control.
         assert_eq!(strip_ansi("\u{1b}[99999999m"), "999m");
@@ -427,9 +442,15 @@ mod tests {
     fn binary_filter_keeps_whitespace_drops_controls_and_format_chars() {
         assert_eq!(sanitize_binary_output("a\tb\nc\rd"), "a\tb\nc\rd");
         assert_eq!(sanitize_binary_output("a\u{0}b\u{7}c\u{1f}d"), "abcd");
-        assert_eq!(sanitize_binary_output("a\u{fff9}b\u{fffa}c\u{fffb}d"), "abcd");
+        assert_eq!(
+            sanitize_binary_output("a\u{fff9}b\u{fffa}c\u{fffb}d"),
+            "abcd"
+        );
         // U+FFF8 and U+FFFC are outside the filtered range and must survive.
-        assert_eq!(sanitize_binary_output("\u{fff8}\u{fffc}"), "\u{fff8}\u{fffc}");
+        assert_eq!(
+            sanitize_binary_output("\u{fff8}\u{fffc}"),
+            "\u{fff8}\u{fffc}"
+        );
     }
 
     #[test]

@@ -27,7 +27,11 @@ impl Finalized {
     /// message's tool-call list; `result_value` is derived here so it can never disagree with
     /// `message` (Pi emits `result: finalized.result` verbatim, `emitToolExecutionEnd`,
     /// `agent-loop.ts:763-771`).
-    pub(super) fn new(source_index: usize, message: ToolResultMessage, terminate: TerminateHint) -> Self {
+    pub(super) fn new(
+        source_index: usize,
+        message: ToolResultMessage,
+        terminate: TerminateHint,
+    ) -> Self {
         let result_value = result_value_of(
             &message.content,
             &message.details,
@@ -35,7 +39,12 @@ impl Finalized {
             &message.added_tool_names,
             terminate,
         );
-        Self { source_index, terminate, result_value, message }
+        Self {
+            source_index,
+            terminate,
+            result_value,
+            message,
+        }
     }
 
     pub(super) fn source_index(&self) -> usize {

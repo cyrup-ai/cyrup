@@ -14,8 +14,6 @@ use async_trait::async_trait;
 use cyrup_core::{CancelToken, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
 
 use crate::error::SubagentError;
-use crate::spawn::depth::resolve_effective_depth;
-use crate::spawn::parallel::DispatchGuard;
 use crate::extension::TOOL_NAME;
 use crate::extension::executor::SubagentExecutor;
 use crate::extension::tool::mission::{
@@ -23,11 +21,15 @@ use crate::extension::tool::mission::{
     prepare_mission_binding_for_dispatch,
 };
 use crate::extension::tool::params::{
-    normalize_public_subagent_execution, validate_execution_acceptance, SubagentToolParams,
+    SubagentToolParams, normalize_public_subagent_execution, validate_execution_acceptance,
 };
 use crate::extension::tool::schema::subagent_tool_parameters;
 use crate::extension::tool::task_items::count_requested_subagent_spawns;
-use crate::extension::tool::text::{CHILD_SAFE_SUBAGENT_TOOL_DESCRIPTION, SUBAGENT_TOOL_DESCRIPTION};
+use crate::extension::tool::text::{
+    CHILD_SAFE_SUBAGENT_TOOL_DESCRIPTION, SUBAGENT_TOOL_DESCRIPTION,
+};
+use crate::spawn::depth::resolve_effective_depth;
+use crate::spawn::parallel::DispatchGuard;
 
 /// The `subagent` LLM-facing tool (R-SA-128). Dispatches over pi's full discriminated-union
 /// parameter surface (C8): a present `action` routes to a management/control action, `tasks[]` to
@@ -300,7 +302,9 @@ impl Tool for SubagentTool {
         // alias is rewritten to the agent's canonical name HERE so every downstream surface (persona
         // maps, chain bookkeeping, status rows, result summaries) names the real agent; an ambiguous
         // alias aborts the whole dispatch.
-        let canonicalized = self.canonicalize_execution_params(&parsed, &effective_cwd).await?;
+        let canonicalized = self
+            .canonicalize_execution_params(&parsed, &effective_cwd)
+            .await?;
         let parsed: &SubagentToolParams = canonicalized.as_ref().unwrap_or(&parsed);
 
         // DURABLE MISSIONS (pi `subagent-executor.ts:5100-5127` @v0.43.0): resolve or create the
@@ -318,12 +322,16 @@ impl Tool for SubagentTool {
             &parsed.mission_launch_params(),
             &effective_cwd,
             mission_config.as_ref(),
-            self.executor.host_services().and_then(|s| s.session_id()).as_deref(),
+            self.executor
+                .host_services()
+                .and_then(|s| s.session_id())
+                .as_deref(),
             explicit_mission,
         )?;
 
         let outcome = if has_tasks {
-            self.route_parallel_mode(parsed, &effective_cwd, cancel).await
+            self.route_parallel_mode(parsed, &effective_cwd, cancel)
+                .await
         } else if has_chain {
             self.route_chain_mode(parsed, &effective_cwd, cancel).await
         } else {
@@ -333,16 +341,27 @@ impl Tool for SubagentTool {
             // progress only on completion; streaming their fan-out is the remaining live-progress
             // work (their per-child folds would multiplex through the same
             // `SubagentUpdatePayload.progress[]`).
-            self.route_single(parsed, &effective_cwd, on_update, cancel).await
+            self.route_single(parsed, &effective_cwd, on_update, cancel)
+                .await
         };
 
-        attach_mission_to_tool_outcome(outcome, mission_binding.as_ref(), mission_warning, explicit_mission)
+        attach_mission_to_tool_outcome(
+            outcome,
+            mission_binding.as_ref(),
+            mission_warning,
+            explicit_mission,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
 
@@ -381,12 +400,12 @@ mod tests {
         );
         // The three read-only verbs still answer (with "runtime is unavailable", since this tool
         // has no watchdog bound) rather than being refused for being child-safe.
-        for action in ["watchdog.status", "watchdog.check", "watchdog.recommend-model"] {
-            let outcome = child_safe.route_watchdog_action(
-                action,
-                &empty_params(),
-                dir.path(),
-            );
+        for action in [
+            "watchdog.status",
+            "watchdog.check",
+            "watchdog.recommend-model",
+        ] {
+            let outcome = child_safe.route_watchdog_action(action, &empty_params(), dir.path());
             let text = match outcome {
                 Ok(result) => format!("{:?}", result.content),
                 Err(error) => error.to_string(),
@@ -404,7 +423,10 @@ mod tests {
             Ok(result) => format!("{:?}", result.content),
             Err(error) => error.to_string(),
         };
-        assert!(!full_text.contains("child-safe subagent fanout mode"), "{full_text}");
+        assert!(
+            !full_text.contains("child-safe subagent fanout mode"),
+            "{full_text}"
+        );
     }
 
     /// Both variants of the subagent tool must carry pi's `label: "Subagent"`
@@ -433,5 +455,4 @@ mod tests {
             "the label must be the display form, not the wire name the default falls back to"
         );
     }
-
 }

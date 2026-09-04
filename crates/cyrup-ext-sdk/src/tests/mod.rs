@@ -14,8 +14,8 @@
 //! Assertions are unchanged from the integration-test originals; only the crate self-reference
 //! moved (`cyrup_ext_sdk::X` -> `crate::X`).
 
-mod payload_fidelity;
 mod dialog_options_timeout;
-mod world_import_coverage;
 mod ergonomic;
+mod payload_fidelity;
 mod prelude_export_parity;
+mod world_import_coverage;

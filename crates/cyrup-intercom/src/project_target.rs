@@ -56,7 +56,11 @@ pub fn format_session_refs(sessions: &[&SessionInfo]) -> String {
     sessions
         .iter()
         .map(|session| {
-            let name = session.name.as_deref().filter(|n| !n.is_empty()).unwrap_or("Unnamed session");
+            let name = session
+                .name
+                .as_deref()
+                .filter(|n| !n.is_empty())
+                .unwrap_or("Unnamed session");
             let short: String = session.id.chars().take(8).collect();
             format!("{name} ({short})")
         })
@@ -87,15 +91,20 @@ pub fn resolve_target_in_cwd(
     target_cwd: &str,
     to: Option<&str>,
 ) -> Result<ProjectTargetResolution, String> {
-    let in_cwd: Vec<&SessionInfo> =
-        sessions.iter().filter(|session| same_cwd(&session.cwd, target_cwd)).collect();
+    let in_cwd: Vec<&SessionInfo> = sessions
+        .iter()
+        .filter(|session| same_cwd(&session.cwd, target_cwd))
+        .collect();
     // `const target = input.to?.trim();` then `if (!target)` — a whitespace-only `to` is falsy and
     // takes the no-target branch, it does not fall through to a doomed exact-id lookup.
     let target = to.map(str::trim).filter(|t| !t.is_empty());
 
     let Some(target) = target else {
-        let candidates: Vec<&SessionInfo> =
-            in_cwd.iter().copied().filter(|session| session.id != current_session_id).collect();
+        let candidates: Vec<&SessionInfo> = in_cwd
+            .iter()
+            .copied()
+            .filter(|session| session.id != current_session_id)
+            .collect();
         return match candidates.as_slice() {
             [only] => Ok(ProjectTargetResolution::Found {
                 session: Box::new((*only).clone()),
@@ -125,7 +134,12 @@ pub fn resolve_target_in_cwd(
     let by_name: Vec<&SessionInfo> = in_cwd
         .iter()
         .copied()
-        .filter(|session| session.name.as_ref().is_some_and(|n| n.to_lowercase() == lower_name))
+        .filter(|session| {
+            session
+                .name
+                .as_ref()
+                .is_some_and(|n| n.to_lowercase() == lower_name)
+        })
         .collect();
     match by_name.as_slice() {
         [only] => {
@@ -143,8 +157,11 @@ pub fn resolve_target_in_cwd(
         }
     }
 
-    let by_prefix: Vec<&SessionInfo> =
-        in_cwd.iter().copied().filter(|session| session.id.starts_with(target)).collect();
+    let by_prefix: Vec<&SessionInfo> = in_cwd
+        .iter()
+        .copied()
+        .filter(|session| session.id.starts_with(target))
+        .collect();
     match by_prefix.as_slice() {
         [only] => {
             return Ok(ProjectTargetResolution::Found {
@@ -204,8 +221,10 @@ pub async fn wait_for_project_session(
         if cancel.is_cancelled() {
             return Err("Cancelled".to_string());
         }
-        let sessions =
-            client.list_sessions_with_timeout(list_timeout).await.map_err(|e| e.to_string())?;
+        let sessions = client
+            .list_sessions_with_timeout(list_timeout)
+            .await
+            .map_err(|e| e.to_string())?;
 
         // `:272-282` — with an explicit `to`, reuse the SAME resolver the non-launch path uses, so
         // the id/name/prefix ladder cannot drift between the two. A resolver ERROR here (one of the
@@ -248,7 +267,12 @@ pub async fn wait_for_project_session(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
     use super::*;
     use crate::transport::protocol::now_ms;
 
@@ -334,12 +358,18 @@ mod tests {
         let by_name = resolve_target_in_cwd(&sessions, "me", "/w/proj", Some("reviewer"));
         assert!(matches!(by_name, Ok(ProjectTargetResolution::Found { .. })));
         let by_prefix = resolve_target_in_cwd(&sessions, "me", "/w/proj", Some("aaaaaaaa"));
-        assert!(matches!(by_prefix, Ok(ProjectTargetResolution::Found { .. })));
+        assert!(matches!(
+            by_prefix,
+            Ok(ProjectTargetResolution::Found { .. })
+        ));
         // A whitespace-only `to` is JS-falsy (`input.to?.trim()`), so it takes the NO-target branch
         // and finds the sole peer rather than failing an exact-id lookup on "  ".
-        let blank = resolve_target_in_cwd(&sessions, "me", "/w/proj", Some("   ")).expect("resolves");
+        let blank =
+            resolve_target_in_cwd(&sessions, "me", "/w/proj", Some("   ")).expect("resolves");
         match blank {
-            ProjectTargetResolution::Found { session, .. } => assert_eq!(session.id, "aaaaaaaa-1111"),
+            ProjectTargetResolution::Found { session, .. } => {
+                assert_eq!(session.id, "aaaaaaaa-1111")
+            }
             other => panic!("a blank `to` must take the no-target branch, got {other:?}"),
         }
     }
@@ -373,14 +403,18 @@ mod tests {
     /// names both the target and the directory.
     #[test]
     fn an_unmatched_explicit_target_is_missing_not_an_error() {
-        let sessions = vec![session("me", None, "/w/proj"), session("peer", Some("x"), "/w/other")];
+        let sessions = vec![
+            session("me", None, "/w/proj"),
+            session("peer", Some("x"), "/w/other"),
+        ];
         let resolved =
             resolve_target_in_cwd(&sessions, "me", "/w/proj", Some("ghost")).expect("resolves");
         assert_eq!(
             resolved,
             ProjectTargetResolution::Missing {
                 target_cwd: "/w/proj".to_string(),
-                reason: "No intercom session matching \"ghost\" is connected in /w/proj.".to_string(),
+                reason: "No intercom session matching \"ghost\" is connected in /w/proj."
+                    .to_string(),
             }
         );
     }

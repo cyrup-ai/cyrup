@@ -2,23 +2,23 @@
 //! `agent-session.ts:2704-2895` `navigateTree`): re-editing a user message, the no-op short-circuit,
 //! branch summarization with custom instructions, label attachment, the `session_before_tree` veto,
 //! and the `SessionCommand::NavigateTree` seam.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use cyrup_core::{
-    TerminateHint,Content, EntryId, ExtensionId, Message, StopReason};
-use cyrup_ext::{
-    EventKind, ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension,
-};
-use cyrup_provider::faux::{
-    faux_assistant_message, faux_text, FauxProvider, FauxResponseStep,
-};
-use cyrup_provider::Provider;
 use crate::{
     NavigateTreeOptions, SessionBuilder, SessionCommand, SessionCommandOutput, SessionConfig,
 };
+use cyrup_core::{Content, EntryId, ExtensionId, Message, StopReason, TerminateHint};
+use cyrup_ext::{EventKind, ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension};
+use cyrup_provider::Provider;
+use cyrup_provider::faux::{FauxProvider, FauxResponseStep, faux_assistant_message, faux_text};
 use tempfile::TempDir;
 
 struct Fixture {
@@ -33,7 +33,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -44,7 +48,9 @@ fn base_config(fx: &Fixture) -> SessionConfig {
 
 /// Concatenate the text of a core `user` message (the faux summary call's prompt lives here).
 fn user_text(m: &Message) -> Option<String> {
-    let Message::User { content, .. } = m else { return None };
+    let Message::User { content, .. } = m else {
+        return None;
+    };
     Some(
         content
             .iter()
@@ -70,7 +76,10 @@ async fn navigate_tree_reedit_user_message_returns_editor_text_and_truncates() {
         faux_assistant_message(vec![faux_text("a2")], StopReason::Stop),
     ]);
     let provider: Arc<dyn Provider> = faux.clone();
-    let session = SessionBuilder::new(provider, base_config(&fx)).build().await.unwrap();
+    let session = SessionBuilder::new(provider, base_config(&fx))
+        .build()
+        .await
+        .unwrap();
 
     let _ = session.prompt("first").await.unwrap();
     session.wait_for_idle().await;
@@ -85,17 +94,38 @@ async fn navigate_tree_reedit_user_message_returns_editor_text_and_truncates() {
 
     // Navigate to the SECOND user message → re-edit it: leaf moves to its parent (a1).
     let outcome = session
-        .navigate_tree(u2, NavigateTreeOptions { summarize: false, ..Default::default() })
+        .navigate_tree(
+            u2,
+            NavigateTreeOptions {
+                summarize: false,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     assert!(!outcome.cancelled);
     assert!(!outcome.aborted);
-    assert!(outcome.summary_entry.is_none(), "no summary when summarize=false");
-    assert_eq!(outcome.editor_text.as_deref(), Some("second"), "the target text is re-editable");
+    assert!(
+        outcome.summary_entry.is_none(),
+        "no summary when summarize=false"
+    );
+    assert_eq!(
+        outcome.editor_text.as_deref(),
+        Some("second"),
+        "the target text is re-editable"
+    );
 
     // The transcript is truncated to [u1, a1] and the agent's in-memory state mirrors it.
-    assert_eq!(session.messages().await.len(), 2, "u2/a2 are off the active branch");
-    assert_eq!(session.agent_messages().await.len(), 2, "agent transcript rebuilt from context");
+    assert_eq!(
+        session.messages().await.len(),
+        2,
+        "u2/a2 are off the active branch"
+    );
+    assert_eq!(
+        session.agent_messages().await.len(),
+        2,
+        "agent transcript rebuilt from context"
+    );
 }
 
 // ====================================================================== #15 navigate_tree: no-op ==
@@ -106,9 +136,15 @@ async fn navigate_tree_reedit_user_message_returns_editor_text_and_truncates() {
 async fn navigate_tree_to_current_leaf_is_noop() {
     let fx = fixture();
     let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text("a1")], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("a1")],
+        StopReason::Stop,
+    )]);
     let provider: Arc<dyn Provider> = faux.clone();
-    let session = SessionBuilder::new(provider, base_config(&fx)).build().await.unwrap();
+    let session = SessionBuilder::new(provider, base_config(&fx))
+        .build()
+        .await
+        .unwrap();
 
     let _ = session.prompt("first").await.unwrap();
     session.wait_for_idle().await;
@@ -122,7 +158,11 @@ async fn navigate_tree_to_current_leaf_is_noop() {
     assert!(!outcome.cancelled, "no-op is not a cancellation");
     assert!(outcome.editor_text.is_none());
     assert!(outcome.summary_entry.is_none());
-    assert_eq!(session.messages().await.len(), before, "transcript unchanged");
+    assert_eq!(
+        session.messages().await.len(),
+        before,
+        "transcript unchanged"
+    );
 }
 
 // ================================================ #15 navigate_tree: summarize + customInstructions ==
@@ -137,8 +177,14 @@ async fn navigate_tree_with_summary_appends_entry_and_threads_custom_instruction
 
     let faux = Arc::new(FauxProvider::new());
     faux.set_response_steps(vec![
-        FauxResponseStep::from(faux_assistant_message(vec![faux_text("a1")], StopReason::Stop)),
-        FauxResponseStep::from(faux_assistant_message(vec![faux_text("a2")], StopReason::Stop)),
+        FauxResponseStep::from(faux_assistant_message(
+            vec![faux_text("a1")],
+            StopReason::Stop,
+        )),
+        FauxResponseStep::from(faux_assistant_message(
+            vec![faux_text("a2")],
+            StopReason::Stop,
+        )),
         // The third provider call is the branch summarizer; capture its prompt.
         FauxResponseStep::factory(move |ctx, _o, _s, _m| {
             if let Some(t) = ctx.messages.iter().find_map(user_text) {
@@ -148,7 +194,10 @@ async fn navigate_tree_with_summary_appends_entry_and_threads_custom_instruction
         }),
     ]);
     let provider: Arc<dyn Provider> = faux.clone();
-    let session = SessionBuilder::new(provider, base_config(&fx)).build().await.unwrap();
+    let session = SessionBuilder::new(provider, base_config(&fx))
+        .build()
+        .await
+        .unwrap();
 
     let _ = session.prompt("first").await.unwrap();
     session.wait_for_idle().await;
@@ -174,8 +223,14 @@ async fn navigate_tree_with_summary_appends_entry_and_threads_custom_instruction
     assert!(!outcome.cancelled);
     assert!(!outcome.aborted);
     assert_eq!(outcome.editor_text.as_deref(), Some("first"));
-    let entry = outcome.summary_entry.expect("a branch summary entry was appended");
-    assert!(entry.summary.contains("BRANCH-BODY"), "summary wraps the model body: {}", entry.summary);
+    let entry = outcome
+        .summary_entry
+        .expect("a branch summary entry was appended");
+    assert!(
+        entry.summary.contains("BRANCH-BODY"),
+        "summary wraps the model body: {}",
+        entry.summary
+    );
 
     // The summarizer prompt carried the custom instruction as an "Additional focus".
     {
@@ -190,7 +245,10 @@ async fn navigate_tree_with_summary_appends_entry_and_threads_custom_instruction
 
     // The appended summary is durable in the exported JSONL.
     let jsonl = session.export_to_jsonl(None).await.unwrap().expect("jsonl");
-    assert!(jsonl.contains("branch_summary"), "the branch summary is persisted");
+    assert!(
+        jsonl.contains("branch_summary"),
+        "the branch summary is persisted"
+    );
 }
 
 // ==================================================================== #15 navigate_tree: label ====
@@ -206,7 +264,10 @@ async fn navigate_tree_label_attaches_to_target() {
         faux_assistant_message(vec![faux_text("a2")], StopReason::Stop),
     ]);
     let provider: Arc<dyn Provider> = faux.clone();
-    let session = SessionBuilder::new(provider, base_config(&fx)).build().await.unwrap();
+    let session = SessionBuilder::new(provider, base_config(&fx))
+        .build()
+        .await
+        .unwrap();
 
     let _ = session.prompt("first").await.unwrap();
     session.wait_for_idle().await;
@@ -230,8 +291,14 @@ async fn navigate_tree_label_attaches_to_target() {
     assert!(!outcome.cancelled);
 
     let jsonl = session.export_to_jsonl(None).await.unwrap().expect("jsonl");
-    assert!(jsonl.contains("checkpoint-alpha"), "the label is persisted on the target");
-    assert!(jsonl.contains("\"type\":\"label\""), "a label entry was appended");
+    assert!(
+        jsonl.contains("checkpoint-alpha"),
+        "the label is persisted on the target"
+    );
+    assert!(
+        jsonl.contains("\"type\":\"label\""),
+        "a label entry was appended"
+    );
 }
 
 // ============================================================== #15 navigate_tree: before_tree veto ==
@@ -250,9 +317,10 @@ impl NativeExtension for TreeVeto {
     }
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         match ev {
-            HostEvent::SessionBeforeTree { .. } => {
-                HookOutcome::Block { reason: Some("vetoed".into()), terminate: TerminateHint::Unspecified }
-            }
+            HostEvent::SessionBeforeTree { .. } => HookOutcome::Block {
+                reason: Some("vetoed".into()),
+                terminate: TerminateHint::Unspecified,
+            },
             _ => HookOutcome::Noop,
         }
     }
@@ -283,12 +351,25 @@ async fn navigate_tree_before_tree_veto_cancels() {
     let before = session.messages().await.len();
 
     let outcome = session
-        .navigate_tree(u1, NavigateTreeOptions { summarize: false, ..Default::default() })
+        .navigate_tree(
+            u1,
+            NavigateTreeOptions {
+                summarize: false,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
-    assert!(outcome.cancelled, "the before_tree veto cancels the navigation");
+    assert!(
+        outcome.cancelled,
+        "the before_tree veto cancels the navigation"
+    );
     assert!(outcome.editor_text.is_none());
-    assert_eq!(session.messages().await.len(), before, "vetoed navigation leaves the leaf intact");
+    assert_eq!(
+        session.messages().await.len(),
+        before,
+        "vetoed navigation leaves the leaf intact"
+    );
 }
 
 // ============================================================ #15 navigate_tree: SessionCommand seam ==
@@ -303,7 +384,10 @@ async fn navigate_tree_via_command_seam() {
         faux_assistant_message(vec![faux_text("a2")], StopReason::Stop),
     ]);
     let provider: Arc<dyn Provider> = faux.clone();
-    let session = SessionBuilder::new(provider, base_config(&fx)).build().await.unwrap();
+    let session = SessionBuilder::new(provider, base_config(&fx))
+        .build()
+        .await
+        .unwrap();
 
     let _ = session.prompt("first").await.unwrap();
     session.wait_for_idle().await;
@@ -316,7 +400,10 @@ async fn navigate_tree_via_command_seam() {
     let out = session
         .execute(SessionCommand::NavigateTree {
             target: u2,
-            options: NavigateTreeOptions { summarize: false, ..Default::default() },
+            options: NavigateTreeOptions {
+                summarize: false,
+                ..Default::default()
+            },
         })
         .await
         .unwrap();
@@ -352,8 +439,14 @@ async fn branch_summarization_does_not_hold_the_manager_lock() {
 
     let faux = Arc::new(FauxProvider::new());
     faux.set_response_steps(vec![
-        FauxResponseStep::from(faux_assistant_message(vec![faux_text("a1")], StopReason::Stop)),
-        FauxResponseStep::from(faux_assistant_message(vec![faux_text("a2")], StopReason::Stop)),
+        FauxResponseStep::from(faux_assistant_message(
+            vec![faux_text("a1")],
+            StopReason::Stop,
+        )),
+        FauxResponseStep::from(faux_assistant_message(
+            vec![faux_text("a2")],
+            StopReason::Stop,
+        )),
         // The branch summarizer: announce, then block until the test releases the gate.
         FauxResponseStep::factory(move |_ctx, _o, _s, _m| {
             let _ = entered_tx.send(());
@@ -362,18 +455,31 @@ async fn branch_summarization_does_not_hold_the_manager_lock() {
         }),
     ]);
     let provider: Arc<dyn Provider> = faux;
-    let session = Arc::new(SessionBuilder::new(provider, base_config(&fx)).build().await.unwrap());
+    let session = Arc::new(
+        SessionBuilder::new(provider, base_config(&fx))
+            .build()
+            .await
+            .unwrap(),
+    );
 
     let _ = session.prompt("first").await.unwrap();
     session.wait_for_idle().await;
     let _ = session.prompt("second").await.unwrap();
     session.wait_for_idle().await;
-    let u1: EntryId = session.user_messages_for_forking().await[0].entry_id.clone();
+    let u1: EntryId = session.user_messages_for_forking().await[0]
+        .entry_id
+        .clone();
 
     let nav_session = session.clone();
     let nav = tokio::spawn(async move {
         nav_session
-            .navigate_tree(u1, NavigateTreeOptions { summarize: true, ..Default::default() })
+            .navigate_tree(
+                u1,
+                NavigateTreeOptions {
+                    summarize: true,
+                    ..Default::default()
+                },
+            )
             .await
     });
 
@@ -394,5 +500,79 @@ async fn branch_summarization_does_not_hold_the_manager_lock() {
 
     let _ = gate_tx.send(());
     let outcome = nav.await.unwrap().unwrap();
-    assert!(outcome.summary_entry.is_some(), "the summary still lands once the gate opens");
+    assert!(
+        outcome.summary_entry.is_some(),
+        "the summary still lands once the gate opens"
+    );
+}
+
+// ================================ SESS-049: navigate_tree refuses a token-capped branch summary ==
+
+/// The `/tree` op's branch summarizer is this crate's own copy of
+/// `generate_branch_summary_with_instructions` (`session/forking.rs`), so the pi v0.84.4
+/// `getSummarizationFailure` rule (branch-summarization.ts:357-363) has to hold HERE too: a
+/// `length` stop is an error, nothing is appended, and the partial text never becomes an entry.
+#[tokio::test]
+async fn navigate_tree_refuses_a_token_capped_branch_summary() {
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_response_steps(vec![
+        FauxResponseStep::from(faux_assistant_message(
+            vec![faux_text("a1")],
+            StopReason::Stop,
+        )),
+        FauxResponseStep::from(faux_assistant_message(
+            vec![faux_text("a2")],
+            StopReason::Stop,
+        )),
+        // The branch summarizer hits its output cap mid-sentence.
+        FauxResponseStep::from(faux_assistant_message(
+            vec![faux_text("## Goal\nThe user wanted to")],
+            StopReason::Length,
+        )),
+    ]);
+    let provider: Arc<dyn Provider> = faux.clone();
+    let session = SessionBuilder::new(provider, base_config(&fx))
+        .build()
+        .await
+        .unwrap();
+
+    let _ = session.prompt("first").await.unwrap();
+    session.wait_for_idle().await;
+    let _ = session.prompt("second").await.unwrap();
+    session.wait_for_idle().await;
+
+    let anchors = session.user_messages_for_forking().await;
+    let u1: EntryId = anchors[0].entry_id.clone();
+    let err = session
+        .navigate_tree(
+            u1,
+            NavigateTreeOptions {
+                summarize: true,
+                custom_instructions: None,
+                replace_instructions: false,
+                label: None,
+            },
+        )
+        .await
+        .expect_err("a token-capped branch summary is refused, not persisted");
+    assert!(
+        matches!(
+            &err,
+            crate::SessionServiceError::Compaction(
+                cyrup_session::compaction::CompactionError::Summarization(m)
+            ) if m == "generation hit the token cap and the summary is incomplete"
+        ),
+        "got {err:?}"
+    );
+
+    let jsonl = session.export_to_jsonl(None).await.unwrap().expect("jsonl");
+    assert!(
+        !jsonl.contains("branch_summary"),
+        "no branch summary entry may be persisted from a partial summary"
+    );
+    assert!(
+        !jsonl.contains("The user wanted to"),
+        "the partial text must not reach the session file"
+    );
 }

@@ -2,17 +2,22 @@
 //! key (arch-08 §4.2 / §6.4, R-ARCH-EXT-016), plus toolchain detection (R-ARCH-EXT-015).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use crate::build::{cache_key, detect_toolchain, world_abi_id, ArtifactCache};
+use crate::build::{ArtifactCache, cache_key, detect_toolchain, world_abi_id};
 use crate::{ExtensionManifest, HOST_WORLD};
 
 /// `HOST_WORLD` with its MINOR decremented — a guest built against the world one revision back.
 /// Derived rather than hard-coded so this stays a real "previous world" after the next bump.
 fn one_minor_behind_host() -> String {
-    let (pkg, ver) = HOST_WORLD.split_once('@').expect("HOST_WORLD is `name@version`");
+    let (pkg, ver) = HOST_WORLD
+        .split_once('@')
+        .expect("HOST_WORLD is `name@version`");
     let mut parts = ver.split('.');
     let major = parts.next().unwrap_or("0");
     let minor: u32 = parts.next().and_then(|m| m.parse().ok()).unwrap_or(0);
-    assert!(minor > 0, "HOST_WORLD minor must be > 0 for a previous world to exist: {HOST_WORLD}");
+    assert!(
+        minor > 0,
+        "HOST_WORLD minor must be > 0 for a previous world to exist: {HOST_WORLD}"
+    );
     format!("{pkg}@{major}.{}", minor - 1)
 }
 
@@ -48,7 +53,10 @@ fn world_version_compatible_same_major_and_at_least_the_host_minor() {
 
     // A guest built against a NEWER minor is accepted: it may want imports this host lacks, and
     // that failure is specific and reportable. The reverse (below) is not.
-    let ahead = ExtensionManifest { world: "cyrup:ext@0.99".into(), ..m.clone() };
+    let ahead = ExtensionManifest {
+        world: "cyrup:ext@0.99".into(),
+        ..m.clone()
+    };
     assert!(ahead.check_world(HOST_WORLD).is_ok());
 }
 
@@ -136,11 +144,21 @@ fn cache_key_is_deterministic_and_input_sensitive() {
 #[test]
 fn the_build_loop_keys_on_the_world_identity_not_the_bare_world_string() {
     let id = world_abi_id();
-    assert!(id.starts_with(HOST_WORLD), "world identity leads with HOST_WORLD: {id}");
-    assert_ne!(id, HOST_WORLD, "the bare world string alone must not be the cache input");
+    assert!(
+        id.starts_with(HOST_WORLD),
+        "world identity leads with HOST_WORLD: {id}"
+    );
+    assert_ne!(
+        id, HOST_WORLD,
+        "the bare world string alone must not be the cache input"
+    );
 
     let fingerprint = id.rsplit("+abi:").next().unwrap_or_default();
-    assert_eq!(fingerprint.len(), 64, "the ABI fingerprint is a blake3 hex digest: {id}");
+    assert_eq!(
+        fingerprint.len(),
+        64,
+        "the ABI fingerprint is a blake3 hex digest: {id}"
+    );
     assert!(
         fingerprint.chars().all(|c| c.is_ascii_hexdigit()),
         "the ABI fingerprint is hex, not the build.rs `unknown` sentinel: {id}"
@@ -164,7 +182,10 @@ fn artifact_cache_store_and_hit() {
     assert!(!cache.is_hit(&key));
     let path = cache.store(&key, b"\0asm-component-bytes").unwrap();
     assert!(path.is_file());
-    assert!(cache.is_hit(&key), "stored artifact is a cache hit (skips cargo)");
+    assert!(
+        cache.is_hit(&key),
+        "stored artifact is a cache hit (skips cargo)"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -175,7 +196,10 @@ fn toolchain_detection_reports_status_without_crashing() {
     let tc = detect_toolchain();
     assert_eq!(tc.target, "wasm32-wasip2");
     if !tc.status.is_ready() {
-        assert!(tc.status.actionable().is_some(), "a miss must surface an actionable message");
+        assert!(
+            tc.status.actionable().is_some(),
+            "a miss must surface an actionable message"
+        );
     }
     // toolchain id folds rustc version + target (busts the cache on change).
     assert!(tc.id().contains("wasm32-wasip2"));

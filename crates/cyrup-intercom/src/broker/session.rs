@@ -64,9 +64,12 @@ impl BrokerState {
 
         let previous_conn = self.sessions.get(&id).map(|s| s.conn_id);
         if previous_conn.is_none() && self.sessions.len() >= MAX_SESSIONS {
-            send_msg(self_tx, &BrokerMessage::Error {
-                error: "Too many registered intercom sessions".to_string(),
-            });
+            send_msg(
+                self_tx,
+                &BrokerMessage::Error {
+                    error: "Too many registered intercom sessions".to_string(),
+                },
+            );
             return FrameResult::close_self();
         }
         if previous_conn.is_some() {
@@ -132,14 +135,17 @@ impl BrokerState {
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
         let namespaces: Vec<String> = extensions.iter().map(|e| e.namespace.clone()).collect();
-        self.insert_session(id.clone(), ConnectedSession {
-            conn_id,
-            info: info.clone(),
-            tx: self_tx.clone(),
-            last_presence_broadcast_at: now,
-            owner_order,
-            extensions,
-        });
+        self.insert_session(
+            id.clone(),
+            ConnectedSession {
+                conn_id,
+                info: info.clone(),
+                tx: self_tx.clone(),
+                last_presence_broadcast_at: now,
+                owner_order,
+                extensions,
+            },
+        );
         // `this.disconnectedSessions.delete(id)` (`v0.10.1 broker/broker.ts:377`): this identity is
         // live again, so it must no longer be a mailbox TARGET — only a mailbox recipient.
         self.disconnected_sessions.remove(&id);
@@ -159,10 +165,15 @@ impl BrokerState {
         // (`v0.9.2 broker/client.ts:648,817-819`), so the broker could not advertise it until the
         // effects existed. v0.9.2 advertises this one value only: `EXACT_SEND_FEATURE` is a v0.12.0
         // addition whose behaviour is not ported, so advertising it would be a lie.
-        send_msg(self_tx, &BrokerMessage::Registered {
-            session_id: id.clone(),
-            features: Some(vec![crate::transport::protocol::EXTENSION_BUS_FEATURE.to_string()]),
-        });
+        send_msg(
+            self_tx,
+            &BrokerMessage::Registered {
+                session_id: id.clone(),
+                features: Some(vec![
+                    crate::transport::protocol::EXTENSION_BUS_FEATURE.to_string(),
+                ]),
+            },
+        );
         self.broadcast(&BrokerMessage::SessionJoined { session: info }, Some(&id));
         // pi's order: AFTER `session_joined` and BEFORE the mailbox flush (`:509-510`).
         self.recompute_namespace_owners();
@@ -198,7 +209,12 @@ impl BrokerState {
             }
             self.remove_session(&sid);
             self.clear_message_receipt_routes_for_session(&sid);
-            self.broadcast(&BrokerMessage::SessionLeft { session_id: sid.clone() }, Some(&sid));
+            self.broadcast(
+                &BrokerMessage::SessionLeft {
+                    session_id: sid.clone(),
+                },
+                Some(&sid),
+            );
             // `this.recomputeNamespaceOwners()` (`v0.9.2 broker/broker.ts:544`) — the departing
             // session may have been a namespace owner.
             self.recompute_namespace_owners();
@@ -210,7 +226,11 @@ impl BrokerState {
         // the same oldest-eviction pass pi's `armRegistrationTimeout` runs on this transition
         // (`broker.ts:189-195,223-230,399`).
         self.mark_unregistered(conn_id);
-        FrameResult { outcome: FrameOutcome::Continue, schedule_shutdown: schedule, rearmed_registration: true }
+        FrameResult {
+            outcome: FrameOutcome::Continue,
+            schedule_shutdown: schedule,
+            rearmed_registration: true,
+        }
     }
 
     pub(super) fn handle_list(
@@ -221,22 +241,24 @@ impl BrokerState {
         let Some(request_id) = value.get("requestId").and_then(|v| v.as_str()) else {
             return FrameResult::protocol_error();
         };
-        send_msg(self_tx, &BrokerMessage::Sessions {
-            request_id: request_id.to_string(),
-            sessions: self.session_infos(),
-        });
+        send_msg(
+            self_tx,
+            &BrokerMessage::Sessions {
+                request_id: request_id.to_string(),
+                sessions: self.session_infos(),
+            },
+        );
         FrameResult::cont()
     }
-
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
-    use super::super::limits::MAX_UNREGISTERED_CONNECTIONS;
-    use std::sync::Arc;
     use super::super::frame::FrameOutcome;
+    use super::super::limits::MAX_UNREGISTERED_CONNECTIONS;
     use super::super::test_support::{make_state, make_tx, register};
+    use std::sync::Arc;
     use tokio::sync::Notify;
 
     /// Regression test: pi's `armRegistrationTimeout` re-runs `evictOldestUnregisteredConnections`

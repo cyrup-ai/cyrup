@@ -72,13 +72,16 @@ updated: <YYYY-MM-DD HH:MM>
 - Clear definition of done
 - Research notes and locations of relevant docs/source code
 
-### 3.3 No tests
+### 3.3 Tests are in scope
 
-Another team owns tests. Writing any test code makes their work harder. Each task file must explicitly state: no tests to be written.
+There is no separate team that owns tests. Every task that changes behaviour must name the tests
+that pin it — each one failing before the change and passing after — and the task's definition of
+done includes those tests passing. Each task file must state explicitly which tests it adds or
+extends. (Deliberate divergence from the upstream template, which delegated tests to another team.)
 
-### 3.4 No benchmarks
+### 3.4 Benchmarks
 
-Another team owns benchmarks. Writing any benchmark code makes their work harder. Each task file must explicitly state: no benchmarks to be written.
+Write a benchmark only when the task is performance-scoped; otherwise say "no benchmarks" and why.
 
 ## STEP 4: Preserve the original task file
 

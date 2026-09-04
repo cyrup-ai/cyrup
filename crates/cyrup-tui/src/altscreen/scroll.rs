@@ -55,10 +55,10 @@
 
 use std::time::{Duration, Instant};
 
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
-use ratatui::Frame;
 
 use crate::theme::UiTheme;
 

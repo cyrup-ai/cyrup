@@ -67,7 +67,7 @@ use cyrup_ext::{CommandDescriptor, EventKind};
 use indexmap::{IndexMap, IndexSet};
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::config::{
     BoolOrList, McpConfig, McpSettings, ServerEntry, ToolPrefix, ToolResultRendering,
@@ -220,7 +220,11 @@ pub fn server_prefix(server_name: &str, mode: ToolPrefix) -> String {
         ToolPrefix::None => String::new(),
         ToolPrefix::Short => {
             let short = sanitize_server_prefix(strip_mcp_suffix(server_name), true);
-            if short.is_empty() { "mcp".to_string() } else { short }
+            if short.is_empty() {
+                "mcp".to_string()
+            } else {
+                short
+            }
         }
         ToolPrefix::Mcp => format!("mcp__{}", sanitize_server_prefix(server_name, true)),
         ToolPrefix::Server => sanitize_server_prefix(server_name, true),
@@ -237,7 +241,11 @@ pub fn server_prefix(server_name: &str, mode: ToolPrefix) -> String {
 pub fn format_tool_name(tool_name: &str, server_name: &str, prefix: ToolPrefix) -> String {
     let p = server_prefix(server_name, prefix);
     let sanitized = tool_name.replace('.', "_");
-    if p.is_empty() { sanitized } else { format!("{p}_{sanitized}") }
+    if p.is_empty() {
+        sanitized
+    } else {
+        format!("{p}_{sanitized}")
+    }
 }
 
 /// `types.ts` `resolveToolPrefix` — `definition.toolPrefix ?? globalPrefix ?? "server"`.
@@ -247,7 +255,9 @@ pub fn format_tool_name(tool_name: &str, server_name: &str, prefix: ToolPrefix) 
 /// falls through to the global mode rather than being unrepresentable.
 #[must_use]
 pub fn resolve_tool_prefix(definition: Option<&ServerEntry>, global: ToolPrefix) -> ToolPrefix {
-    definition.and_then(|entry| entry.tool_prefix).unwrap_or(global)
+    definition
+        .and_then(|entry| entry.tool_prefix)
+        .unwrap_or(global)
 }
 
 /// `types.ts` `resolveServerFromToolName(toolName, serverNames, prefix)` — the inverse of
@@ -324,7 +334,11 @@ fn legacy_server_prefix(server_name: &str, mode: ToolPrefix) -> String {
         ToolPrefix::None => String::new(),
         ToolPrefix::Short => {
             let short = sanitize_server_prefix(strip_mcp_suffix(server_name), false);
-            if short.is_empty() { "mcp".to_string() } else { short }
+            if short.is_empty() {
+                "mcp".to_string()
+            } else {
+                short
+            }
         }
         ToolPrefix::Mcp => format!("mcp__{}", sanitize_server_prefix(server_name, false)),
         ToolPrefix::Server => sanitize_server_prefix(server_name, false),
@@ -334,9 +348,15 @@ fn legacy_server_prefix(server_name: &str, mode: ToolPrefix) -> String {
 /// `types.ts` `formatLegacyToolName` — note the tool name loses **hyphens as well as dots** here.
 fn format_legacy_tool_name(tool_name: &str, server_name: &str, prefix: ToolPrefix) -> String {
     let p = legacy_server_prefix(server_name, prefix);
-    let sanitized: String =
-        tool_name.chars().map(|c| if c == '.' || c == '-' { '_' } else { c }).collect();
-    if p.is_empty() { sanitized } else { format!("{p}_{sanitized}") }
+    let sanitized: String = tool_name
+        .chars()
+        .map(|c| if c == '.' || c == '-' { '_' } else { c })
+        .collect();
+    if p.is_empty() {
+        sanitized
+    } else {
+        format!("{p}_{sanitized}")
+    }
 }
 
 /// `types.ts` `getToolNameCandidates` (MCP-201) — every name a user might plausibly have written in
@@ -533,7 +553,12 @@ impl CandidateIndex {
         // Destructured so the memo tables can be borrowed mutably while `all_current` and the
         // additional set are borrowed shared — they are disjoint fields, which a `self.` path
         // cannot express.
-        let Self { all_current, additional_by_tool, matcher, matching_count } = self;
+        let Self {
+            all_current,
+            additional_by_tool,
+            matcher,
+            matching_count,
+        } = self;
         let additional = additional_by_tool.get(tool_name);
         let has_candidate = |candidate: &str| {
             all_current.contains(candidate)
@@ -544,17 +569,24 @@ impl CandidateIndex {
             return has_candidate(pattern) && !current_candidates.contains(pattern);
         }
 
-        let matcher =
-            matcher.entry(pattern.to_string()).or_insert_with(|| glob_to_regex(pattern)).as_ref();
+        let matcher = matcher
+            .entry(pattern.to_string())
+            .or_insert_with(|| glob_to_regex(pattern))
+            .as_ref();
         let Some(matcher) = matcher else {
             return false;
         };
         // Only the whole-index count is memoised, exactly as upstream memoises it: the additional
         // set is per-tool, so folding it into `matchingCountByPattern` would poison the memo for
         // the next tool that reuses the same pattern.
-        let mut total = *matching_count.entry(pattern.to_string()).or_insert_with(|| {
-            all_current.iter().filter(|candidate| matcher.is_match(candidate)).count()
-        });
+        let mut total = *matching_count
+            .entry(pattern.to_string())
+            .or_insert_with(|| {
+                all_current
+                    .iter()
+                    .filter(|candidate| matcher.is_match(candidate))
+                    .count()
+            });
         if let Some(additional) = additional {
             total = total.saturating_add(
                 additional
@@ -628,9 +660,13 @@ pub fn is_tool_allowed(
 ) -> bool {
     let included = match include_tools.filter(|p| !p.is_empty()) {
         None => true,
-        Some(patterns) => {
-            matches_tool_selector(tool_name, server_name, prefix, patterns, index.as_deref_mut())
-        }
+        Some(patterns) => matches_tool_selector(
+            tool_name,
+            server_name,
+            prefix,
+            patterns,
+            index.as_deref_mut(),
+        ),
     };
     if !included {
         return false;
@@ -907,9 +943,7 @@ pub struct CachedPromptArgument {
 pub fn is_ui_tool_visible_to_model(ui_visibility: Option<&Value>) -> bool {
     match ui_visibility {
         None | Some(Value::Null) => true,
-        Some(Value::Array(entries)) => {
-            entries.iter().any(|entry| entry.as_str() == Some("model"))
-        }
+        Some(Value::Array(entries)) => entries.iter().any(|entry| entry.as_str() == Some("model")),
         Some(_) => false,
     }
 }
@@ -977,12 +1011,17 @@ pub fn default_server_hasher(definition: &ServerEntry) -> Option<String> {
 
 /// The installed hasher, or [`default_server_hasher`].
 fn server_hasher() -> ServerHasher {
-    SERVER_HASHER.get().copied().unwrap_or(default_server_hasher as ServerHasher)
+    SERVER_HASHER
+        .get()
+        .copied()
+        .unwrap_or(default_server_hasher as ServerHasher)
 }
 
 fn now_ms() -> f64 {
     #[allow(clippy::cast_precision_loss)]
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_millis() as f64)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_millis() as f64)
 }
 
 /// `metadata-cache.ts` `loadMetadataCache` — **never fails**: a missing file, unreadable bytes,
@@ -1033,7 +1072,10 @@ pub fn is_server_cache_valid(
         return false;
     }
     // `!entry.cachedAt` is falsy-testing a number, so `0` is rejected alongside absent.
-    let Some(cached_at) = entry.cached_at.filter(|value| value.is_finite() && *value != 0.0) else {
+    let Some(cached_at) = entry
+        .cached_at
+        .filter(|value| value.is_finite() && *value != 0.0)
+    else {
         return false;
     };
     if max_age_ms > 0.0 && now_ms() - cached_at > max_age_ms {
@@ -1084,7 +1126,10 @@ pub fn parse_direct_tool_selectors(selectors: &[String]) -> DirectToolSelection 
             let server = parts.next().unwrap_or("");
             let tool = parts.next().unwrap_or("");
             if !server.is_empty() && !tool.is_empty() {
-                out.tools.entry(server.to_string()).or_default().insert(tool.to_string());
+                out.tools
+                    .entry(server.to_string())
+                    .or_default()
+                    .insert(tool.to_string());
             } else if !server.is_empty() {
                 out.servers.insert(server.to_string());
             }
@@ -1228,8 +1273,14 @@ pub fn direct_tool_fingerprint(spec: &DirectToolSpec) -> String {
 /// Whether this server needs the expensive cross-server candidate index at all — upstream builds it
 /// lazily, and only when the server actually carries `includeTools`/`excludeTools`.
 fn has_tool_filters(definition: &ServerEntry) -> bool {
-    definition.include_tools.as_ref().is_some_and(|v| !v.is_empty())
-        || definition.exclude_tools.as_ref().is_some_and(|v| !v.is_empty())
+    definition
+        .include_tools
+        .as_ref()
+        .is_some_and(|v| !v.is_empty())
+        || definition
+            .exclude_tools
+            .as_ref()
+            .is_some_and(|v| !v.is_empty())
 }
 
 /// The `getOtherCurrentCandidates` builder shared by `resolveDirectTools` and
@@ -1251,7 +1302,12 @@ fn build_candidate_index(
             if !is_ui_tool_visible_to_model(tool.ui_visibility.as_ref()) {
                 continue;
             }
-            candidates.extend(tool_name_candidates(&tool.name, other_name, other_prefix, false));
+            candidates.extend(tool_name_candidates(
+                &tool.name,
+                other_name,
+                other_prefix,
+                false,
+            ));
         }
         if other_definition.expose_resources != Some(false) {
             for resource in entry.resources() {
@@ -1298,8 +1354,7 @@ pub fn resolve_direct_tools(
         let Some(entry) = valid_entry(Some(cache), server_name, definition) else {
             continue;
         };
-        let filter =
-            resolve_tool_filter(server_name, definition, settings, env_selection.as_ref());
+        let filter = resolve_tool_filter(server_name, definition, settings, env_selection.as_ref());
         if filter == ToolFilter::Off {
             continue;
         }
@@ -1336,7 +1391,9 @@ pub fn resolve_direct_tools(
             }
             let prefixed_name = format_tool_name(&tool.name, server_name, effective_prefix);
             if BUILTIN_NAMES.contains(&prefixed_name.as_str()) {
-                tracing::warn!("MCP: skipping direct tool \"{prefixed_name}\" (collides with builtin)");
+                tracing::warn!(
+                    "MCP: skipping direct tool \"{prefixed_name}\" (collides with builtin)"
+                );
                 continue;
             }
             if seen_names.contains(&prefixed_name) {
@@ -1483,7 +1540,9 @@ fn ui_resource_uri_is_invalid(meta: Option<&serde_json::Map<String, Value>>) -> 
     let Some(resource_uri) = nested.or_else(|| meta.get(RESOURCE_URI_META_KEY)) else {
         return false;
     };
-    !resource_uri.as_str().is_some_and(|text| text.starts_with("ui://"))
+    !resource_uri
+        .as_str()
+        .is_some_and(|text| text.starts_with("ui://"))
 }
 
 /// A cached `uiVisibility` in the shape [`ToolMetadata`] stores.
@@ -1496,9 +1555,12 @@ fn ui_resource_uri_is_invalid(meta: Option<&serde_json::Map<String, Value>>) -> 
 fn cached_ui_visibility(value: Option<&Value>) -> Option<Vec<String>> {
     match value {
         None | Some(Value::Null) => None,
-        Some(Value::Array(entries)) => {
-            Some(entries.iter().filter_map(|entry| entry.as_str().map(str::to_string)).collect())
-        }
+        Some(Value::Array(entries)) => Some(
+            entries
+                .iter()
+                .filter_map(|entry| entry.as_str().map(str::to_string))
+                .collect(),
+        ),
         Some(_) => Some(Vec::new()),
     }
 }
@@ -1643,7 +1705,10 @@ pub fn build_tool_metadata(
                     None => {}
                 }
             }
-            Some(CandidateIndex::with_additional(candidates, additional_by_tool))
+            Some(CandidateIndex::with_additional(
+                candidates,
+                additional_by_tool,
+            ))
         }
         _ => None,
     };
@@ -1720,7 +1785,10 @@ pub fn build_tool_metadata(
         }
     }
 
-    BuiltToolMetadata { metadata, failed_tools }
+    BuiltToolMetadata {
+        metadata,
+        failed_tools,
+    }
 }
 
 /// `metadata-cache.ts:185` `reconstructToolMetadata(...)` (MCP-207) — [`build_tool_metadata`]'s
@@ -1912,7 +1980,9 @@ pub fn build_proxy_description(
     // 2. Direct tools, grouped by server in first-appearance order (a JS `Map`).
     let mut direct_by_server: IndexMap<&str, usize> = IndexMap::new();
     for spec in direct_specs {
-        *direct_by_server.entry(spec.server_name.as_str()).or_insert(0) += 1;
+        *direct_by_server
+            .entry(spec.server_name.as_str())
+            .or_insert(0) += 1;
     }
     if !direct_by_server.is_empty() {
         let parts: Vec<String> = direct_by_server
@@ -1980,7 +2050,10 @@ pub fn build_proxy_description(
         if total_items == 0 {
             continue;
         }
-        let direct_count = direct_by_server.get(server_name.as_str()).copied().unwrap_or(0);
+        let direct_count = direct_by_server
+            .get(server_name.as_str())
+            .copied()
+            .unwrap_or(0);
         let proxy_count = total_items.saturating_sub(direct_count);
         if proxy_count > 0 {
             server_summaries.push(format!("{server_name} ({proxy_count} tools)"));
@@ -2010,15 +2083,18 @@ pub fn build_proxy_description(
         if definition.is_disabled() {
             continue;
         }
-        let Some(instructions) =
-            valid_entry(cache, server_name, definition).and_then(|entry| entry.instructions.as_ref())
+        let Some(instructions) = valid_entry(cache, server_name, definition)
+            .and_then(|entry| entry.instructions.as_ref())
         else {
             continue;
         };
         if instructions.is_empty() {
             continue;
         }
-        let collapsed = instructions.split_whitespace().collect::<Vec<_>>().join(" ");
+        let collapsed = instructions
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         let snippet = truncate_at_word(&collapsed, INSTRUCTIONS_SNIPPET_LENGTH);
         instruction_summaries.push(format!("  {server_name}: {snippet}"));
     }
@@ -2034,10 +2110,16 @@ pub fn build_proxy_description(
     desc.push_str("\nUsage:\n");
     desc.push_str("  mcp({ })                              → Show server status\n");
     desc.push_str("  mcp({ server: \"name\" })               → List tools from server\n");
-    desc.push_str("  mcp({ search: \"query\" })              → Search MCP tools by name/description\n");
+    desc.push_str(
+        "  mcp({ search: \"query\" })              → Search MCP tools by name/description\n",
+    );
     desc.push_str("  mcp({ describe: \"tool_name\" })        → Show tool details and parameters\n");
-    desc.push_str("  mcp({ instructions: \"name\" })         → Show full server usage instructions\n");
-    desc.push_str("  mcp({ connect: \"server-name\" })       → Connect to a server and refresh metadata\n");
+    desc.push_str(
+        "  mcp({ instructions: \"name\" })         → Show full server usage instructions\n",
+    );
+    desc.push_str(
+        "  mcp({ connect: \"server-name\" })       → Connect to a server and refresh metadata\n",
+    );
     desc.push_str("  mcp({ tool: \"name\", args: { key: \"value\" } })         → Call a tool (object args; JSON string also accepted)\n");
     desc.push_str("  mcp({ action: \"auth-start\", server: \"name\" })      → Start manual OAuth and get a browser URL\n");
     desc.push_str("  mcp({ action: \"auth-complete\", server: \"name\", args: { redirectUrl: \"...\" } }) → Complete manual OAuth\n");
@@ -2117,7 +2199,9 @@ pub struct ToolDispatch {
 
 impl std::fmt::Debug for ToolDispatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ToolDispatch").field("installed", &self.is_installed()).finish()
+        f.debug_struct("ToolDispatch")
+            .field("installed", &self.is_installed())
+            .finish()
     }
 }
 
@@ -2215,7 +2299,15 @@ impl DirectTool {
             snippet
         };
         let parameters = normalize_direct_tool_input_schema(spec.input_schema.as_ref());
-        Self { spec, label, description, prompt_snippet, parameters, render_kind, dispatch }
+        Self {
+            spec,
+            label,
+            description,
+            prompt_snippet,
+            parameters,
+            render_kind,
+            dispatch,
+        }
     }
 
     /// The spec this tool was built from — the executor's entire input besides the call arguments.
@@ -2255,7 +2347,9 @@ impl Tool for DirectTool {
     ) -> Result<ToolResult, ToolError> {
         match self.dispatch.get() {
             Some(dispatch) => {
-                dispatch.call_direct(&self.spec, call_id, params, cancel, on_update).await
+                dispatch
+                    .call_direct(&self.spec, call_id, params, cancel, on_update)
+                    .await
             }
             None => Ok(not_initialized_result()),
         }
@@ -2277,7 +2371,12 @@ impl ProxyTool {
         render_kind: ToolRenderKind,
         dispatch: Arc<ToolDispatch>,
     ) -> Self {
-        Self { description, parameters: proxy_tool_parameters(), render_kind, dispatch }
+        Self {
+            description,
+            parameters: proxy_tool_parameters(),
+            render_kind,
+            dispatch,
+        }
     }
 }
 
@@ -2392,7 +2491,11 @@ impl Tool for ProxyTool {
         on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
         match self.dispatch.get() {
-            Some(dispatch) => dispatch.call_proxy(call_id, params, cancel, on_update).await,
+            Some(dispatch) => {
+                dispatch
+                    .call_proxy(call_id, params, cancel, on_update)
+                    .await
+            }
             None => Ok(not_initialized_result()),
         }
     }
@@ -2571,9 +2674,12 @@ pub fn prompt_command_description(spec: &PromptCommandSpec) -> String {
             _ => fallback.as_str(),
         }
     };
-    let described =
-        truncate_at_word(&format!("MCP: {base}"), PROMPT_COMMAND_DESCRIPTION_LENGTH);
-    if described.is_empty() { fallback } else { described }
+    let described = truncate_at_word(&format!("MCP: {base}"), PROMPT_COMMAND_DESCRIPTION_LENGTH);
+    if described.is_empty() {
+        fallback
+    } else {
+        described
+    }
 }
 
 /// `/mcp`'s descriptor. The description is `index.ts`'s literal.
@@ -2592,7 +2698,14 @@ pub fn mcp_command_descriptor() -> CommandDescriptor {
     CommandDescriptor {
         description: "Show MCP server status".to_string(),
         completions: [
-            "reconnect", "tools", "prompts", "setup", "logout", "disable", "enable", "status",
+            "reconnect",
+            "tools",
+            "prompts",
+            "setup",
+            "logout",
+            "disable",
+            "enable",
+            "status",
         ]
         .iter()
         .map(|value| (*value).to_string())
@@ -2799,8 +2912,10 @@ pub fn register_surface<S: SurfaceSink + ?Sized>(
     // an empty slot nothing could install.
     dispatch: Arc<ToolDispatch>,
 ) -> RegisteredSurface {
-    let mut surface =
-        RegisteredSurface { dispatch: Arc::clone(&dispatch), ..RegisteredSurface::default() };
+    let mut surface = RegisteredSurface {
+        dispatch: Arc::clone(&dispatch),
+        ..RegisteredSurface::default()
+    };
     api.subscribe(SUBSCRIBED_EVENTS);
 
     // `loadMetadataCache()` — `readFileSync`, defensive, `null` on anything unexpected.
@@ -2817,8 +2932,11 @@ pub fn register_surface<S: SurfaceSink + ?Sized>(
     // `getMissingConfiguredDirectToolServers` is passed `undefined` for BOTH "unset" and the
     // sentinel — that is what makes `__none__` suppress direct tools while still keeping the proxy
     // tool honest about servers that wanted them.
-    let missing_override: Option<&[String]> =
-        if env_raw.is_none() || env_is_none_sentinel { None } else { env_selectors.as_deref() };
+    let missing_override: Option<&[String]> = if env_raw.is_none() || env_is_none_sentinel {
+        None
+    } else {
+        env_selectors.as_deref()
+    };
 
     let render_kind = tool_render_kind(config.settings.as_ref());
 
@@ -2871,7 +2989,12 @@ pub fn register_surface<S: SurfaceSink + ?Sized>(
     let direct_specs = if env_is_none_sentinel {
         Vec::new()
     } else {
-        resolve_direct_tools(config, cache.as_ref(), config.tool_prefix(), env_selectors.as_deref())
+        resolve_direct_tools(
+            config,
+            cache.as_ref(),
+            config.tool_prefix(),
+            env_selectors.as_deref(),
+        )
     };
     for spec in &direct_specs {
         let fingerprint = direct_tool_fingerprint(spec);
@@ -2934,16 +3057,27 @@ fn prompt_command_descriptor(spec: &PromptCommandSpec) -> CommandDescriptor {
 // ---------------------------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 
     fn entry(direct: bool) -> ServerEntry {
-        ServerEntry { direct_tools: Some(BoolOrList::All(direct)), ..ServerEntry::default() }
+        ServerEntry {
+            direct_tools: Some(BoolOrList::All(direct)),
+            ..ServerEntry::default()
+        }
     }
 
     fn cached_tool(name: &str) -> CachedTool {
-        CachedTool { name: name.to_string(), ..CachedTool::default() }
+        CachedTool {
+            name: name.to_string(),
+            ..CachedTool::default()
+        }
     }
 
     /// A cache entry with a **placeholder** `configHash`; [`cache_of`] overwrites it with the real
@@ -2969,7 +3103,10 @@ mod tests {
     /// An entry whose `config_hash` a test already set (a deliberate mismatch) is left alone, so
     /// "this entry is stale" stays expressible.
     fn cache_of(config: &McpConfig, servers: &[(&str, ServerCacheEntry)]) -> MetadataCache {
-        let mut cache = MetadataCache { version: METADATA_CACHE_VERSION, ..Default::default() };
+        let mut cache = MetadataCache {
+            version: METADATA_CACHE_VERSION,
+            ..Default::default()
+        };
         for (name, entry) in servers {
             let mut entry = entry.clone();
             if entry.config_hash.is_none() {
@@ -2986,7 +3123,9 @@ mod tests {
     fn config_of(servers: &[(&str, ServerEntry)]) -> McpConfig {
         let mut config = McpConfig::default();
         for (name, definition) in servers {
-            config.mcp_servers.insert((*name).to_string(), definition.clone());
+            config
+                .mcp_servers
+                .insert((*name).to_string(), definition.clone());
         }
         config
     }
@@ -3006,15 +3145,24 @@ mod tests {
     fn the_four_prefix_modes() {
         assert_eq!(server_prefix("github-mcp", ToolPrefix::None), "");
         assert_eq!(server_prefix("github-mcp", ToolPrefix::Short), "github");
-        assert_eq!(server_prefix("github-mcp", ToolPrefix::Server), "github-mcp");
-        assert_eq!(server_prefix("github-mcp", ToolPrefix::Mcp), "mcp__github-mcp");
+        assert_eq!(
+            server_prefix("github-mcp", ToolPrefix::Server),
+            "github-mcp"
+        );
+        assert_eq!(
+            server_prefix("github-mcp", ToolPrefix::Mcp),
+            "mcp__github-mcp"
+        );
         // `-?mcp$` eats the whole name, and the empty short prefix falls back to the literal.
         assert_eq!(server_prefix("mcp", ToolPrefix::Short), "mcp");
     }
 
     #[test]
     fn format_tool_name_replaces_dots_only() {
-        assert_eq!(format_tool_name("list-sims", "x-mcp", ToolPrefix::Short), "x_list-sims");
+        assert_eq!(
+            format_tool_name("list-sims", "x-mcp", ToolPrefix::Short),
+            "x_list-sims"
+        );
         assert_eq!(format_tool_name("a.b", "s", ToolPrefix::Server), "s_a_b");
         assert_eq!(format_tool_name("a.b", "s", ToolPrefix::None), "a_b");
         // mcp mode is ONE underscore between server and tool.
@@ -3059,7 +3207,10 @@ mod tests {
     #[test]
     fn glob_and_exact_selectors() {
         let candidates = tool_name_candidates("list_sims", "x", ToolPrefix::Server, false);
-        assert!(matches_tool_pattern(&candidates, &["x_list_sims".to_string()]));
+        assert!(matches_tool_pattern(
+            &candidates,
+            &["x_list_sims".to_string()]
+        ));
         assert!(matches_tool_pattern(&candidates, &["x_*".to_string()]));
         assert!(!matches_tool_pattern(&candidates, &["y_*".to_string()]));
         assert!(!matches_tool_pattern(&candidates, &[]));
@@ -3169,11 +3320,21 @@ mod tests {
         let mut definition = entry(true);
         definition.tool_prefix = Some(ToolPrefix::None);
         let config = config_of(&[("s", definition)]);
-        let cache = cache_of(&config, &[("s", cache_entry(vec![cached_tool("read"), cached_tool("ok")]))]);
+        let cache = cache_of(
+            &config,
+            &[(
+                "s",
+                cache_entry(vec![cached_tool("read"), cached_tool("ok")]),
+            )],
+        );
 
         let specs = resolve_direct_tools(&config, Some(&cache), ToolPrefix::None, None);
         let names: Vec<&str> = specs.iter().map(|s| s.prefixed_name.as_str()).collect();
-        assert_eq!(names, vec!["ok"], "the builtin-colliding name must never be registered");
+        assert_eq!(
+            names,
+            vec!["ok"],
+            "the builtin-colliding name must never be registered"
+        );
     }
 
     #[test]
@@ -3195,10 +3356,13 @@ mod tests {
         let mut b = entry(true);
         b.tool_prefix = Some(ToolPrefix::None);
         let config = config_of(&[("a", a), ("b", b)]);
-        let cache = cache_of(&config, &[
-            ("a", cache_entry(vec![cached_tool("dup")])),
-            ("b", cache_entry(vec![cached_tool("dup")])),
-        ]);
+        let cache = cache_of(
+            &config,
+            &[
+                ("a", cache_entry(vec![cached_tool("dup")])),
+                ("b", cache_entry(vec![cached_tool("dup")])),
+            ],
+        );
 
         let specs = resolve_direct_tools(&config, Some(&cache), ToolPrefix::None, None);
         assert_eq!(specs.len(), 1);
@@ -3225,8 +3389,13 @@ mod tests {
         hidden.ui_visibility = Some(json!(["app"]));
         let mut malformed = cached_tool("malformed");
         malformed.ui_visibility = Some(json!("model"));
-        let cache =
-            cache_of(&config, &[("s", cache_entry(vec![hidden, malformed, cached_tool("visible")]))]);
+        let cache = cache_of(
+            &config,
+            &[(
+                "s",
+                cache_entry(vec![hidden, malformed, cached_tool("visible")]),
+            )],
+        );
 
         let specs = resolve_direct_tools(&config, Some(&cache), ToolPrefix::Server, None);
         let names: Vec<&str> = specs.iter().map(|s| s.prefixed_name.as_str()).collect();
@@ -3256,7 +3425,13 @@ mod tests {
         let mut definition = entry(true);
         definition.exclude_tools = Some(vec!["s_gone".to_string()]);
         let config = config_of(&[("s", definition)]);
-        let cache = cache_of(&config, &[("s", cache_entry(vec![cached_tool("gone"), cached_tool("kept")]))]);
+        let cache = cache_of(
+            &config,
+            &[(
+                "s",
+                cache_entry(vec![cached_tool("gone"), cached_tool("kept")]),
+            )],
+        );
 
         let specs = resolve_direct_tools(&config, Some(&cache), ToolPrefix::Server, None);
         let names: Vec<&str> = specs.iter().map(|s| s.prefixed_name.as_str()).collect();
@@ -3271,7 +3446,6 @@ mod tests {
         let cache = cache_of(&config, &[("s", stale)]);
         assert!(resolve_direct_tools(&config, Some(&cache), ToolPrefix::Server, None).is_empty());
     }
-
 
     // --- MCP-145: the hash comparison, the throw arm, and the two `cachedAt` rules -------------
 
@@ -3291,16 +3465,28 @@ mod tests {
 
         let mut fresh = cache_entry(vec![cached_tool("t")]);
         fresh.config_hash = default_server_hasher(&definition);
-        assert!(is_server_cache_valid(&fresh, &definition, METADATA_CACHE_MAX_AGE_MS));
+        assert!(is_server_cache_valid(
+            &fresh,
+            &definition,
+            METADATA_CACHE_MAX_AGE_MS
+        ));
 
         // …and it tracks the definition: adding an identity field evicts the entry.
         let mut edited = definition.clone();
         edited.include_tools = Some(vec!["a".to_string()]);
-        assert!(!is_server_cache_valid(&fresh, &edited, METADATA_CACHE_MAX_AGE_MS));
+        assert!(!is_server_cache_valid(
+            &fresh,
+            &edited,
+            METADATA_CACHE_MAX_AGE_MS
+        ));
         // …while a runtime-only field does not.
         let mut noisy = definition.clone();
         noisy.debug = Some(true);
-        assert!(is_server_cache_valid(&fresh, &noisy, METADATA_CACHE_MAX_AGE_MS));
+        assert!(is_server_cache_valid(
+            &fresh,
+            &noisy,
+            METADATA_CACHE_MAX_AGE_MS
+        ));
     }
 
     /// The throw arm — upstream's `try { computeServerHash } catch { return false }`, and the sole
@@ -3317,18 +3503,28 @@ mod tests {
             direct_tools: Some(BoolOrList::All(true)),
             ..ServerEntry::default()
         };
-        assert!(default_server_hasher(&definition).is_none(), "the hash must throw");
+        assert!(
+            default_server_hasher(&definition).is_none(),
+            "the hash must throw"
+        );
 
         let mut anything = cache_entry(vec![cached_tool("t")]);
         anything.config_hash = Some("0".repeat(64));
-        assert!(!is_server_cache_valid(&anything, &definition, METADATA_CACHE_MAX_AGE_MS));
+        assert!(!is_server_cache_valid(
+            &anything,
+            &definition,
+            METADATA_CACHE_MAX_AGE_MS
+        ));
         // Even `maxAgeMs = 0`, which disables the age check, cannot rescue it: the throw is first.
         assert!(!is_server_cache_valid(&anything, &definition, 0.0));
 
         // And the server therefore reports as MISSING a cache entry, which is what keeps the proxy
         // tool registered for it (MCP-218).
         let config = config_of(&[("u", definition)]);
-        let mut cache = MetadataCache { version: METADATA_CACHE_VERSION, ..Default::default() };
+        let mut cache = MetadataCache {
+            version: METADATA_CACHE_VERSION,
+            ..Default::default()
+        };
         cache.servers.insert("u".to_string(), anything);
         assert_eq!(
             missing_configured_direct_tool_servers(&config, Some(&cache), None),
@@ -3358,7 +3554,11 @@ mod tests {
         let mut ancient = cache_entry(vec![cached_tool("t")]);
         ancient.config_hash = hash;
         ancient.cached_at = Some(now_ms() - METADATA_CACHE_MAX_AGE_MS * 52.0);
-        assert!(!is_server_cache_valid(&ancient, &definition, METADATA_CACHE_MAX_AGE_MS));
+        assert!(!is_server_cache_valid(
+            &ancient,
+            &definition,
+            METADATA_CACHE_MAX_AGE_MS
+        ));
         assert!(
             is_server_cache_valid(&ancient, &definition, 0.0),
             "`maxAgeMs = 0` disables the age check entirely"
@@ -3396,7 +3596,10 @@ mod tests {
         let dirs = McpDirs::new(agent_dir, temp.path().to_path_buf());
         let cache = load_metadata_cache(&dirs).expect("the file still loads");
         assert_eq!(cache.servers.len(), 2);
-        assert!(cache.servers["bad"].cached_at.is_none(), "a JSON string is not a number");
+        assert!(
+            cache.servers["bad"].cached_at.is_none(),
+            "a JSON string is not a number"
+        );
 
         let config = config_of(&[("bad", definition.clone()), ("good", definition)]);
         let specs = resolve_direct_tools(&config, Some(&cache), ToolPrefix::Server, None);
@@ -3423,10 +3626,13 @@ mod tests {
     #[test]
     fn the_env_override_outranks_the_config() {
         let config = config_of(&[("a", entry(false)), ("b", entry(false))]);
-        let cache = cache_of(&config, &[
-            ("a", cache_entry(vec![cached_tool("t")])),
-            ("b", cache_entry(vec![cached_tool("t")])),
-        ]);
+        let cache = cache_of(
+            &config,
+            &[
+                ("a", cache_entry(vec![cached_tool("t")])),
+                ("b", cache_entry(vec![cached_tool("t")])),
+            ],
+        );
         let override_selectors = vec!["a".to_string()];
         let specs = resolve_direct_tools(
             &config,
@@ -3472,8 +3678,10 @@ mod tests {
         assert!(!config.settings_or_default().warn_on_large_direct_tools());
 
         // `!== false`, not `=== true`: a present-and-`true` key is still loud.
-        config.settings =
-            Some(McpSettings { warn_on_large_direct_tools: Some(true), ..McpSettings::default() });
+        config.settings = Some(McpSettings {
+            warn_on_large_direct_tools: Some(true),
+            ..McpSettings::default()
+        });
         assert!(config.settings_or_default().warn_on_large_direct_tools());
     }
 
@@ -3481,14 +3689,31 @@ mod tests {
 
     #[test]
     fn proxy_description_golden_for_two_servers() {
-        let disabled = ServerEntry { disabled: Some(true), ..ServerEntry::default() };
-        let config = config_of(&[("alpha", entry(true)), ("beta", entry(false)), ("off", disabled)]);
+        let disabled = ServerEntry {
+            disabled: Some(true),
+            ..ServerEntry::default()
+        };
+        let config = config_of(&[
+            ("alpha", entry(true)),
+            ("beta", entry(false)),
+            ("off", disabled),
+        ]);
         let mut alpha = cache_entry(vec![cached_tool("one"), cached_tool("two")]);
         alpha.instructions = Some("  Use   alpha   carefully.  ".to_string());
-        let cache = cache_of(&config, &[
-            ("alpha", alpha),
-            ("beta", cache_entry(vec![cached_tool("b1"), cached_tool("b2"), cached_tool("b3")])),
-        ]);
+        let cache = cache_of(
+            &config,
+            &[
+                ("alpha", alpha),
+                (
+                    "beta",
+                    cache_entry(vec![
+                        cached_tool("b1"),
+                        cached_tool("b2"),
+                        cached_tool("b3"),
+                    ]),
+                ),
+            ],
+        );
         let specs = resolve_direct_tools(&config, Some(&cache), ToolPrefix::Server, None);
         assert_eq!(specs.len(), 2, "{specs:?}");
 
@@ -3520,11 +3745,14 @@ mod tests {
     #[test]
     fn proxy_description_is_deterministic() {
         let config = config_of(&[("a", entry(true)), ("b", entry(true)), ("c", entry(true))]);
-        let cache = cache_of(&config, &[
-            ("a", cache_entry(vec![cached_tool("t1"), cached_tool("t2")])),
-            ("b", cache_entry(vec![cached_tool("t3")])),
-            ("c", cache_entry(vec![cached_tool("t4")])),
-        ]);
+        let cache = cache_of(
+            &config,
+            &[
+                ("a", cache_entry(vec![cached_tool("t1"), cached_tool("t2")])),
+                ("b", cache_entry(vec![cached_tool("t3")])),
+                ("c", cache_entry(vec![cached_tool("t4")])),
+            ],
+        );
         let specs = resolve_direct_tools(&config, Some(&cache), ToolPrefix::Server, None);
         let distinct: HashSet<String> = (0..100)
             .map(|_| build_proxy_description(&config, Some(&cache), &specs))
@@ -3537,8 +3765,10 @@ mod tests {
     #[test]
     fn the_proxy_survives_a_cold_cache_even_when_disabled() {
         let mut config = config_of(&[("s", entry(true))]);
-        config.settings =
-            Some(McpSettings { disable_proxy_tool: Some(true), ..McpSettings::default() });
+        config.settings = Some(McpSettings {
+            disable_proxy_tool: Some(true),
+            ..McpSettings::default()
+        });
 
         // Cold cache: no direct specs at all.
         assert!(should_register_proxy_tool(&config, None, &[], None));
@@ -3547,7 +3777,12 @@ mod tests {
         let cache = cache_of(&config, &[("s", cache_entry(vec![cached_tool("t")]))]);
         let specs = resolve_direct_tools(&config, Some(&cache), ToolPrefix::Server, None);
         assert_eq!(specs.len(), 1);
-        assert!(!should_register_proxy_tool(&config, Some(&cache), &specs, None));
+        assert!(!should_register_proxy_tool(
+            &config,
+            Some(&cache),
+            &specs,
+            None
+        ));
     }
 
     #[test]
@@ -3572,13 +3807,19 @@ mod tests {
             input_schema: None,
             resource_uri: None,
         };
-        let tool =
-            DirectTool::new(spec, ToolRenderKind::SelfRendered, Arc::new(ToolDispatch::default()));
+        let tool = DirectTool::new(
+            spec,
+            ToolRenderKind::SelfRendered,
+            Arc::new(ToolDispatch::default()),
+        );
         assert_eq!(tool.name(), "srv_orig");
         assert_eq!(tool.label(), Some("MCP: orig"));
         assert_eq!(tool.description(), "(no description)");
         assert_eq!(tool.prompt_snippet(), Some("MCP tool from srv"));
-        assert_eq!(tool.parameters(), &json!({ "type": "object", "properties": {} }));
+        assert_eq!(
+            tool.parameters(),
+            &json!({ "type": "object", "properties": {} })
+        );
     }
 
     #[test]
@@ -3604,7 +3845,10 @@ mod tests {
         let params = proxy_tool_parameters();
         let properties = params.get("properties").and_then(Value::as_object).unwrap();
         for name in ["tool", "server", "connect", "describe", "search"] {
-            assert!(properties.contains_key(name), "{name} drives a permission target");
+            assert!(
+                properties.contains_key(name),
+                "{name} drives a permission target"
+            );
         }
         assert_eq!(properties.len(), 12);
         assert!(params.get("required").is_none(), "all twelve are optional");
@@ -3624,8 +3868,10 @@ mod tests {
         assert_eq!(tool.label(), Some("MCP"));
         assert_eq!(tool.prompt_guidelines(), vec![PROXY_TOOL_PROMPT_GUIDELINE]);
         // The sanitizer normalises with `split_whitespace().join(" ").to_lowercase()`.
-        let normalized =
-            PROXY_TOOL_PROMPT_GUIDELINE.split_whitespace().collect::<Vec<_>>().join(" ");
+        let normalized = PROXY_TOOL_PROMPT_GUIDELINE
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         assert_eq!(normalized.to_lowercase(), PROXY_TOOL_PROMPT_GUIDELINE);
     }
 
@@ -3670,14 +3916,24 @@ mod tests {
                 description: Some("Summarise a PR".to_string()),
                 ..CachedPrompt::default()
             },
-            CachedPrompt { name: String::new(), ..CachedPrompt::default() },
+            CachedPrompt {
+                name: String::new(),
+                ..CachedPrompt::default()
+            },
         ]);
         let cache = cache_of(&config, &[("gh-mcp", server)]);
 
         let prompts = resolve_cached_prompts(&config, Some(&cache));
-        assert_eq!(prompts.len(), 1, "a nameless prompt is skipped, not registered");
+        assert_eq!(
+            prompts.len(),
+            1,
+            "a nameless prompt is skipped, not registered"
+        );
         assert_eq!(prompts[0].command_name, "mcp__gh-mcp__summarize");
-        assert_eq!(prompt_command_description(&prompts[0]), "MCP: Summarise a PR");
+        assert_eq!(
+            prompt_command_description(&prompts[0]),
+            "MCP: Summarise a PR"
+        );
     }
 
     #[test]
@@ -3690,8 +3946,14 @@ mod tests {
             description: String::new(),
             arguments: Vec::new(),
         };
-        assert_eq!(prompt_command_description(&spec), "MCP: MCP prompt from srv");
-        let titled = PromptCommandSpec { title: Some("Title".to_string()), ..spec };
+        assert_eq!(
+            prompt_command_description(&spec),
+            "MCP: MCP prompt from srv"
+        );
+        let titled = PromptCommandSpec {
+            title: Some("Title".to_string()),
+            ..spec
+        };
         assert_eq!(prompt_command_description(&titled), "MCP: Title");
     }
 
@@ -3713,7 +3975,10 @@ mod tests {
             Arc::new(ToolDispatch::default()),
         );
 
-        assert!(surface.direct_tools.is_empty(), "a corrupt cache means no direct tools");
+        assert!(
+            surface.direct_tools.is_empty(),
+            "a corrupt cache means no direct tools"
+        );
         assert_eq!(surface.tool_names, vec![PROXY_TOOL_NAME.to_string()]);
         assert!(surface.proxy_description.is_some());
         assert_eq!(
@@ -3752,12 +4017,15 @@ mod tests {
         let dirs = McpDirs::new(agent_dir, temp.path().to_path_buf());
 
         let mut api = InitApi::new();
-        let surface =
-            register_surface(&mut api, &dirs, &config, Arc::new(ToolDispatch::default()));
+        let surface = register_surface(&mut api, &dirs, &config, Arc::new(ToolDispatch::default()));
 
         assert_eq!(
             surface.tool_names,
-            vec!["srv_one".to_string(), "srv_two".to_string(), PROXY_TOOL_NAME.to_string()],
+            vec![
+                "srv_one".to_string(),
+                "srv_two".to_string(),
+                PROXY_TOOL_NAME.to_string()
+            ],
             "direct tools in config order, then the gateway"
         );
         assert_eq!(surface.direct_tool_fingerprints.len(), 2);
@@ -3785,8 +4053,14 @@ mod tests {
         };
         let first = direct_tool_fingerprint(&spec);
         assert_eq!(first, direct_tool_fingerprint(&spec));
-        assert!(!first.contains("resourceUri"), "undefined keys are dropped, as JSON.stringify does");
-        let changed = DirectToolSpec { description: "two".to_string(), ..spec };
+        assert!(
+            !first.contains("resourceUri"),
+            "undefined keys are dropped, as JSON.stringify does"
+        );
+        let changed = DirectToolSpec {
+            description: "two".to_string(),
+            ..spec
+        };
         assert_ne!(first, direct_tool_fingerprint(&changed));
     }
     /// The gateway tool's description is built twice — from the disk cache here, and from live
@@ -3865,13 +4139,20 @@ mod tests {
             false,
         );
 
-        let names: Vec<&str> = built.metadata.iter().map(|meta| meta.name.as_str()).collect();
+        let names: Vec<&str> = built
+            .metadata
+            .iter()
+            .map(|meta| meta.name.as_str())
+            .collect();
         assert_eq!(names, vec!["srv_a_b", "srv_bad"]);
         assert_eq!(built.metadata[0].original_name, "a_b");
         assert_eq!(built.metadata[0].description, "visible");
         // `tool.description ?? ""`.
         assert_eq!(built.metadata[1].description, "");
-        assert_eq!(built.failed_tools, vec!["(unnamed)".to_string(), "bad".to_string()]);
+        assert_eq!(
+            built.failed_tools,
+            vec!["(unnamed)".to_string(), "bad".to_string()]
+        );
     }
 
     /// `state.toolMetadata` is not the direct-tool surface: the live walk applies **no**
@@ -3900,8 +4181,16 @@ mod tests {
             false,
         );
         assert_eq!(
-            built.metadata.iter().map(|meta| meta.name.clone()).collect::<Vec<_>>(),
-            vec!["read".to_string(), "read_notes".to_string(), "read_described".to_string()]
+            built
+                .metadata
+                .iter()
+                .map(|meta| meta.name.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                "read".to_string(),
+                "read_notes".to_string(),
+                "read_described".to_string()
+            ]
         );
         assert_eq!(built.metadata[1].description, "Read resource: file:///a");
         assert_eq!(built.metadata[1].resource_uri.as_deref(), Some("file:///a"));
@@ -3920,7 +4209,11 @@ mod tests {
             false,
         );
         assert_eq!(
-            built.metadata.iter().map(|meta| meta.name.clone()).collect::<Vec<_>>(),
+            built
+                .metadata
+                .iter()
+                .map(|meta| meta.name.clone())
+                .collect::<Vec<_>>(),
             vec!["read".to_string()]
         );
     }
@@ -4029,9 +4322,21 @@ mod tests {
             cached_tool(""),
         ]);
         entry_for_cache.resources = Some(vec![
-            CachedResource { uri: "file:///a".to_string(), name: "notes".to_string(), description: None },
-            CachedResource { uri: String::new(), name: "nouri".to_string(), description: None },
-            CachedResource { uri: "file:///c".to_string(), name: String::new(), description: None },
+            CachedResource {
+                uri: "file:///a".to_string(),
+                name: "notes".to_string(),
+                description: None,
+            },
+            CachedResource {
+                uri: String::new(),
+                name: "nouri".to_string(),
+                description: None,
+            },
+            CachedResource {
+                uri: "file:///c".to_string(),
+                name: String::new(),
+                description: None,
+            },
         ]);
         let cache = cache_of(&config, &[("srv", entry_for_cache)]);
         let stored = cache.servers.get("srv").expect("entry");
@@ -4045,7 +4350,10 @@ mod tests {
             Some(&cache),
         );
         assert_eq!(
-            metadata.iter().map(|meta| meta.name.clone()).collect::<Vec<_>>(),
+            metadata
+                .iter()
+                .map(|meta| meta.name.clone())
+                .collect::<Vec<_>>(),
             // `read` survives: the builtin collision is `resolve_direct_tools`' rule, not this one.
             vec!["read".to_string(), "read_notes".to_string()]
         );
@@ -4085,7 +4393,11 @@ mod tests {
         // The nameless argument is dropped, the named one survives.
         assert_eq!(
             specs[0].arguments,
-            vec![CachedPromptArgument { name: "day".to_string(), description: None, required: None }]
+            vec![CachedPromptArgument {
+                name: "day".to_string(),
+                description: None,
+                required: None
+            }]
         );
 
         let cached = vec![CachedPrompt {

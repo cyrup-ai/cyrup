@@ -4,9 +4,9 @@
 //! extension tools implement it in `cyrup-ext` (arch-08). Tools signal failure by returning
 //! `Err(ToolError)` (never error text — func-02 R-02-024).
 
+use crate::ToolCallId;
 use crate::cancel::CancelToken;
 use crate::message::Content;
-use crate::ToolCallId;
 
 /// Per-tool execution mode (func-02 R-02-014).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -100,7 +100,11 @@ impl TerminateHint {
     /// said", never an explicit [`Self::Continue`], so the wire it produces (key absent) is
     /// byte-identical to before this type existed.
     pub const fn from_guest_bool(b: bool) -> Self {
-        if b { Self::Terminate } else { Self::Unspecified }
+        if b {
+            Self::Terminate
+        } else {
+            Self::Unspecified
+        }
     }
 
     /// A JSON `Option<bool>` (a tool-update chunk, a guest patch) maps 1:1 — here `Some(false)`
@@ -139,7 +143,9 @@ pub struct ToolError {
 
 impl ToolError {
     pub fn new(message: impl Into<String>) -> Self {
-        Self { message: message.into() }
+        Self {
+            message: message.into(),
+        }
     }
 }
 
@@ -298,7 +304,12 @@ pub trait Tool: Send + Sync {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 
@@ -329,7 +340,9 @@ mod tests {
 
     #[tokio::test]
     async fn defaulted_surface_preserves_behavior() {
-        let t = BareTool { params: serde_json::json!({}) };
+        let t = BareTool {
+            params: serde_json::json!({}),
+        };
         assert_eq!(t.description(), "");
         assert_eq!(t.label(), None);
         assert_eq!(t.prompt_snippet(), None);
@@ -408,8 +421,11 @@ mod tests {
 mod terminate_hint_tests {
     use super::TerminateHint;
 
-    const ALL: [TerminateHint; 3] =
-        [TerminateHint::Unspecified, TerminateHint::Terminate, TerminateHint::Continue];
+    const ALL: [TerminateHint; 3] = [
+        TerminateHint::Unspecified,
+        TerminateHint::Terminate,
+        TerminateHint::Continue,
+    ];
 
     /// The wire table is the whole point of the type: `Unspecified` puts NO key on the wire,
     /// `Terminate` an explicit `true`, `Continue` an explicit `false`.
@@ -427,15 +443,24 @@ mod terminate_hint_tests {
         for hint in ALL {
             assert_eq!(TerminateHint::from_wire(hint.wire()), hint, "{hint:?}");
         }
-        assert_eq!(TerminateHint::from_wire(Some(false)), TerminateHint::Continue);
+        assert_eq!(
+            TerminateHint::from_wire(Some(false)),
+            TerminateHint::Continue
+        );
     }
 
     /// The WIT `bool` mapping is NOT the wire mapping: a guest `false` is "nothing said", so the
     /// key stays absent exactly as it did before the type existed.
     #[test]
     fn guest_bool_false_is_unspecified_not_continue() {
-        assert_eq!(TerminateHint::from_guest_bool(false), TerminateHint::Unspecified);
-        assert_eq!(TerminateHint::from_guest_bool(true), TerminateHint::Terminate);
+        assert_eq!(
+            TerminateHint::from_guest_bool(false),
+            TerminateHint::Unspecified
+        );
+        assert_eq!(
+            TerminateHint::from_guest_bool(true),
+            TerminateHint::Terminate
+        );
         assert_eq!(TerminateHint::from_guest_bool(false).wire(), None);
     }
 

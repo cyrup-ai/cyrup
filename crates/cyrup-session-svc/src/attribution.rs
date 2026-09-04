@@ -73,7 +73,10 @@ fn is_vercel_gateway(model: &Model) -> bool {
 
 /// Telemetry-gated default attribution headers (Pi `getDefaultAttributionHeaders`,
 /// provider-attribution.ts:40-77). Returns `None` when telemetry is disabled or no host matches.
-fn default_attribution_headers(model: &Model, telemetry_enabled: bool) -> Option<Vec<(&'static str, &'static str)>> {
+fn default_attribution_headers(
+    model: &Model,
+    telemetry_enabled: bool,
+) -> Option<Vec<(&'static str, &'static str)>> {
     if !telemetry_enabled {
         return None;
     }
@@ -97,7 +100,10 @@ fn default_attribution_headers(model: &Model, telemetry_enabled: bool) -> Option
 }
 
 /// Opencode session-affinity headers (Pi `getSessionHeaders`, provider-attribution.ts:79-88).
-fn session_headers(model: &Model, session_id: Option<&SessionId>) -> Option<Vec<(&'static str, String)>> {
+fn session_headers(
+    model: &Model,
+    session_id: Option<&SessionId>,
+) -> Option<Vec<(&'static str, String)>> {
     let sid = session_id?;
     let is_opencode = matches!(model.provider.as_str(), "opencode" | "opencode-go")
         || matches_host(&model.base_url, OPENCODE_HOST);
@@ -174,7 +180,10 @@ mod tests {
         assert!(merge_provider_attribution_headers(&m, false, None, &[]).is_none());
         let h = merge_provider_attribution_headers(&m, true, None, &[]).unwrap();
         assert_eq!(h.get("X-OpenRouter-Title"), Some(&Some("pi".to_string())));
-        assert_eq!(h.get("HTTP-Referer"), Some(&Some("https://pi.dev".to_string())));
+        assert_eq!(
+            h.get("HTTP-Referer"),
+            Some(&Some("https://pi.dev".to_string()))
+        );
     }
 
     #[test]
@@ -182,7 +191,10 @@ mod tests {
         let m = model("opencode", "https://opencode.ai/v1");
         let sid = SessionId::from("sess-42");
         let h = merge_provider_attribution_headers(&m, false, Some(&sid), &[]).unwrap();
-        assert_eq!(h.get("x-opencode-session"), Some(&Some("sess-42".to_string())));
+        assert_eq!(
+            h.get("x-opencode-session"),
+            Some(&Some("sess-42".to_string()))
+        );
         assert_eq!(h.get("x-opencode-client"), Some(&Some("pi".to_string())));
     }
 
@@ -191,7 +203,10 @@ mod tests {
         // Provider id differs but the base_url host matches → attribution still applies.
         let m = model("custom", "https://integrate.api.nvidia.com/v1");
         let h = merge_provider_attribution_headers(&m, true, None, &[]).unwrap();
-        assert_eq!(h.get("X-BILLING-INVOKE-ORIGIN"), Some(&Some("Pi".to_string())));
+        assert_eq!(
+            h.get("X-BILLING-INVOKE-ORIGIN"),
+            Some(&Some("Pi".to_string()))
+        );
     }
 
     #[test]

@@ -1,12 +1,21 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
-use crate::editor::*;
 use crate::editor::render::style_zones;
+use crate::editor::*;
 
 // ---- style_zones ------------------------------------------------------------------------
 
 fn vl(logical: usize, start: usize, len: usize) -> VisualLine {
-    VisualLine { logical, start, len }
+    VisualLine {
+        logical,
+        start,
+        len,
+    }
 }
 
 #[test]

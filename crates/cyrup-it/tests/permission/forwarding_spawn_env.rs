@@ -24,7 +24,12 @@
 //!   then watches the child fail-CLOSE. This is the file-level proof the ask crossed.
 //! - [`spawn_env_alone_lets_the_parents_human_answer_a_child_ask`] — the full round trip: the REAL
 //!   `spawn_forwarding_watcher` + a scripted human ALLOW, and the child's tool then proceeds.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -38,17 +43,21 @@ use cyrup_ext::{
 };
 use cyrup_ext_subagents::discovery::types::{OutputMode, SystemPromptMode};
 use cyrup_ext_subagents::exec::output::OutputCap;
-use cyrup_ext_subagents::exec::{build_attempt_spawn_plan, AgentConfig, RunModelOverride, RunOptions};
+use cyrup_ext_subagents::exec::{
+    AgentConfig, RunModelOverride, RunOptions, build_attempt_spawn_plan,
+};
 use cyrup_ext_subagents::fork_context::ForkContext;
 use cyrup_ext_subagents::spawn::depth::DepthEnvelope;
 use cyrup_permission_system::forwarding::{forwarding_location, read_request};
-use cyrup_permission_system::{permission_extension_for_env, spawn_forwarding_watcher, ExtensionConfig};
+use cyrup_permission_system::{
+    ExtensionConfig, permission_extension_for_env, spawn_forwarding_watcher,
+};
 
 // The scripted parent-side host, the ASK policy and the child reaper are shared with
 // `forwarding_subprocess.rs` — see `forwarding_common.rs`. `spawn_child` is NOT shared: this file's
 // whole point is that its child env comes from the production spawn planner.
 use crate::forwarding_common::{
-    wait_child, write_policy, ScriptedHost, EXIT_ALLOWED, EXIT_BLOCKED, EXIT_UNEXPECTED,
+    EXIT_ALLOWED, EXIT_BLOCKED, EXIT_UNEXPECTED, ScriptedHost, wait_child, write_policy,
 };
 
 // ---- env contract between the parent test and the re-exec'd child role ----
@@ -138,8 +147,11 @@ fn spawn_env_child_role_entry() {
 /// the persona name all come out of the same assembly a real `subagent` tool call performs.
 fn production_child_env(cwd: &Path, parent_id: &str) -> std::collections::HashMap<String, String> {
     let agent = AgentConfig {
+        acceptance_role: None, // SUBA-082: no declared role, the name decides
+        default_acceptance: None,
         name: CHILD_AGENT_NAME.to_string(),
         model: Some(ModelId::from("m1")),
+        model_provider: None,
         fallback_models: Vec::new(),
         thinking: None,
         system_prompt_mode: SystemPromptMode::Replace,
@@ -147,6 +159,9 @@ fn production_child_env(cwd: &Path, parent_id: &str) -> std::collections::HashMa
         tools: None,
         extensions: None,
         subagent_only_extensions: Vec::new(),
+        // SUBA-092: no `excludeTools`, no nested-delegation grant — the planner's defaults.
+        exclude_tools: Vec::new(),
+        allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
         inherit_skills: true,
@@ -154,7 +169,10 @@ fn production_child_env(cwd: &Path, parent_id: &str) -> std::collections::HashMa
         completion_guard: Some(false),
         max_output: OutputCap::default(),
         max_subagent_depth: None,
-        depth: DepthEnvelope { current_depth: 0, max_depth: 5 },
+        depth: DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        },
         // G95 `memory:` / G89 `toolBudget:` — this fixture declares neither.
         memory: None,
         tool_budget: None,
@@ -225,7 +243,10 @@ fn production_child_env(cwd: &Path, parent_id: &str) -> std::collections::HashMa
         &ModelId::from("m1"),
         "review the diff",
         &opts,
-        DepthEnvelope { current_depth: 1, max_depth: 5 },
+        DepthEnvelope {
+            current_depth: 1,
+            max_depth: 5,
+        },
         cwd,
         // SUBA-S01: no `outputSchema` declared here — this test asserts the PERMISSION
         // forwarding env, and a structured-output runtime would add two unrelated vars to the
@@ -238,10 +259,20 @@ fn production_child_env(cwd: &Path, parent_id: &str) -> std::collections::HashMa
 
 /// Spawn the child role, applying the PRODUCTION spawn overlay to it the way
 /// `SpawnedChild::spawn` does — over the inherited environment, no `env_clear`.
-fn spawn_child(agent_dir: &Path, parent_id: &str, sentinel: &Path, child_wait_ms: u64) -> std::process::Child {
+fn spawn_child(
+    agent_dir: &Path,
+    parent_id: &str,
+    sentinel: &Path,
+    child_wait_ms: u64,
+) -> std::process::Child {
     let exe = std::env::current_exe().expect("current test exe");
     let mut cmd = Command::new(exe);
-    cmd.args(["--exact", CHILD_TEST_NAME, "--nocapture", "--test-threads=1"]);
+    cmd.args([
+        "--exact",
+        CHILD_TEST_NAME,
+        "--nocapture",
+        "--test-threads=1",
+    ]);
     cmd.env(CHILD_ROLE_ENV, "1");
     cmd.env(CHILD_AGENT_DIR_ENV, agent_dir);
     cmd.env(CHILD_SENTINEL_ENV, sentinel);
@@ -252,7 +283,10 @@ fn spawn_child(agent_dir: &Path, parent_id: &str, sentinel: &Path, child_wait_ms
 
     // Bound the child's blocking wait so a wiring bug fails fast instead of hanging on the 10-minute
     // production default. (Not a spawn-env key — an ops override this crate owns.)
-    cmd.env("CYRUP_PERMISSION_FORWARDING_TIMEOUT_MS", child_wait_ms.to_string());
+    cmd.env(
+        "CYRUP_PERMISSION_FORWARDING_TIMEOUT_MS",
+        child_wait_ms.to_string(),
+    );
     cmd.spawn().expect("spawn child role subprocess")
 }
 
@@ -309,7 +343,8 @@ async fn spawn_env_alone_carries_a_child_ask_into_the_parent_spool() {
 
     // The PARENT's own inbox, resolved the way the parent watcher resolves it: from the parent's
     // session id. The child must independently arrive at this same directory from the anchor env.
-    let location = forwarding_location(agent_dir.path(), &parent_id).expect("parent spool location");
+    let location =
+        forwarding_location(agent_dir.path(), &parent_id).expect("parent spool location");
 
     // PERM-022: the child's ask must still be SPOOLED when the 15 s poll below gives up, so its
     // own bound has to outlive that window by construction — 8 s did not, and the test could pass
@@ -337,7 +372,10 @@ async fn spawn_env_alone_carries_a_child_ask_into_the_parent_spool() {
         "the forwarded prompt must describe the child's actual tool call, got: {}",
         request.message
     );
-    assert!(!request.response_nonce.is_empty(), "the request must carry its response-binding nonce");
+    assert!(
+        !request.response_nonce.is_empty(),
+        "the request must carry its response-binding nonce"
+    );
 
     let code = wait_child(child, Duration::from_secs(30)).await;
     assert_eq!(
@@ -390,7 +428,10 @@ async fn spawn_env_alone_lets_the_parents_human_answer_a_child_ask() {
         "the parent human's ALLOW must reach the child spawned with the production env and let its \
          tool proceed"
     );
-    assert!(sentinel.exists(), "the child's tool must have run after the cross-process allow");
+    assert!(
+        sentinel.exists(),
+        "the child's tool must have run after the cross-process allow"
+    );
     assert!(
         selects.load(Ordering::SeqCst) >= 1,
         "the PARENT must have surfaced a prompt written by the CHILD process (boundary crossed)"

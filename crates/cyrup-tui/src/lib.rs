@@ -114,60 +114,62 @@ mod tests;
 
 pub use altscreen::{AltScreen, PointerOutcome, ScrollbarMode, TuiRenderMode, ViewportRenderer};
 pub use app::{
-    crossterm_input_stream, extension_render, gist_id_from_url, reanchor_inline_region, render,
-    share_viewer_url, share_viewer_url_from, should_honor_extension_shutdown, tree_node_from_dag,
-    App, AppAction, AppCommand, AppState, CompactionQueued, ExtensionWidget, InlineBackend,
-    LifecycleEffects, LifecycleOutcome, LoginProviderSource, MainScreenRenderState, ModeSwitch,
-    ModeSwitchOptions, QueueDrain, QueueDrainReason, RebuildBackend, TreeNavMsg,
+    App, AppAction, AppCommand, AppState, CompactionQueued, ExtensionWidget, ImplicitTrustReload,
+    InlineBackend, LifecycleEffects, LifecycleOutcome, LoginProviderSource, MainScreenRenderState,
+    ModeSwitch, ModeSwitchOptions, QueueDrain, QueueDrainReason, RebuildBackend, TreeNavMsg,
+    crossterm_input_stream, extension_render, gist_id_from_url, implicit_trust_after_reload,
+    reanchor_inline_region, render, share_viewer_url, share_viewer_url_from,
+    should_honor_extension_shutdown, tree_node_from_dag,
 };
 pub use auth_select::{
-    format_auth_selector_provider_type, format_status_indicator, login_selector_rows,
-    provider_display_name, provider_rows, status_indicator_runs, AuthState, StatusTone,
+    AuthState, StatusTone, format_auth_selector_provider_type, format_status_indicator,
+    login_selector_rows, provider_display_name, provider_rows, status_indicator_runs,
 };
 pub use autocomplete::{
-    list_files as mention_list_files, mention_autocomplete, mention_query, Applied, Autocomplete,
-    ArgumentSources, Completion, CompletionContext, ExtensionCompletions, LoginProviderArgument,
-    ModelArgument,
+    Applied, ArgumentSources, Autocomplete, Completion, CompletionContext, ExtensionCompletions,
+    LoginProviderArgument, ModelArgument, list_files as mention_list_files, mention_autocomplete,
+    mention_query,
 };
 pub use bash::{BashExecution, BashStatus, PREVIEW_LINES};
-pub use overlay::{Overlay, OverlayOutcome};
-pub use panic_hook::{install_panic_hook, restore_terminal_best_effort};
-pub use resume_hint::{
-    format_resume_command, quote_if_needed, resume_hint_line, ResumeTarget, APP_NAME,
+pub use chrome::{
+    BorderedLoader, COMPACT_HINT_ROWS, STARTUP_ONBOARDING, VisualTruncate, compact_hint_height,
+    compact_hints, compact_onboarding, format_key_text, key_hint_line, key_hint_spans,
+    render_compact_hints, truncate_to_visual_lines,
 };
 pub use commands::{
-    dynamic_commands_from_catalog, dynamic_commands_from_catalog_gated, ArgumentCompleter,
-    CommandRegistry, CommandSource, Dispatch, SlashCommand, BUILTIN_SLASH_COMMANDS, HIDDEN_COMMANDS,
+    ArgumentCompleter, BUILTIN_SLASH_COMMANDS, CommandRegistry, CommandSource, Dispatch,
+    HIDDEN_COMMANDS, SlashCommand, dynamic_commands_from_catalog,
+    dynamic_commands_from_catalog_gated,
 };
 pub use component::{Component, InputEvent};
+pub use config_selector::{
+    ConfigKind, ConfigRow, ConfigScope, ConfigSelector, ConfigToggle, ConfigWriteScope,
+    ProjectOverrideState,
+};
 pub use diff::render_diff;
 pub use drain::{
-    drain_count, drain_input, drain_stdin_before_exit, InputDrain, DRAIN_IDLE, DRAIN_MAX,
-};
-pub use chrome::{
-    compact_hint_height, compact_hints, compact_onboarding, format_key_text, key_hint_line,
-    key_hint_spans, render_compact_hints, truncate_to_visual_lines, BorderedLoader, VisualTruncate,
-    COMPACT_HINT_ROWS, STARTUP_ONBOARDING,
+    DRAIN_IDLE, DRAIN_MAX, InputDrain, drain_count, drain_input, drain_stdin_before_exit,
 };
 pub use editor::{CommandHighlight, EditorOutcome, InputEditor, VisualLine};
-pub use footer_data::{
-    find_git_paths, resolve_branch as resolve_git_branch, FooterGitBranch, GitPaths,
-    POLL_INTERVAL as GIT_BRANCH_POLL_INTERVAL,
-};
-pub use export::session_jsonl_to_html;
 pub use error::TuiError;
-pub use fuzzy::{filter as fuzzy_filter, fuzzy_match, score as fuzzy_score, Match};
+pub use export::session_jsonl_to_html;
+pub use footer_data::{
+    FooterGitBranch, GitPaths, POLL_INTERVAL as GIT_BRANCH_POLL_INTERVAL, find_git_paths,
+    resolve_branch as resolve_git_branch,
+};
+pub use fuzzy::{Match, filter as fuzzy_filter, fuzzy_match, score as fuzzy_score};
 pub use image::{
-    cached_capabilities, detect_capabilities, detect_capabilities_from,
-    detect_capabilities_on_platform, detect_capabilities_with_overrides, hyperlinks_supported,
-    image_fallback_text, reset_capabilities_cache, seed_capabilities, seed_hyperlink_support,
-    set_capabilities, ImageBlock, ImageProtocol, ImageRenderer, TerminalCapabilities,
+    ImageBlock, ImageProtocol, ImageRenderer, TerminalCapabilities, cached_capabilities,
+    detect_capabilities, detect_capabilities_from, detect_capabilities_on_platform,
+    detect_capabilities_with_overrides, hyperlinks_supported, image_fallback_text,
+    reset_capabilities_cache, seed_capabilities, seed_hyperlink_support, set_capabilities,
 };
 pub use keyboard_protocol::{
-    current as keyboard_protocol, decide as decide_keyboard_protocol, find_kitty_flags,
-    is_negotiation_prefix, negotiate as negotiate_keyboard_protocol, parse_negotiation_sequence,
-    set_current as set_keyboard_protocol, KeyboardProtocol, NegotiationSequence,
-    KITTY_FLAGS_QUERY, MODIFY_OTHER_KEYS_DISABLE, MODIFY_OTHER_KEYS_ENABLE, NEGOTIATION_TIMEOUT,
+    KITTY_FLAGS_QUERY, KeyboardProtocol, MODIFY_OTHER_KEYS_DISABLE, MODIFY_OTHER_KEYS_ENABLE,
+    NEGOTIATION_TIMEOUT, NegotiationSequence, current as keyboard_protocol,
+    decide as decide_keyboard_protocol, find_kitty_flags, is_negotiation_prefix,
+    negotiate as negotiate_keyboard_protocol, parse_negotiation_sequence,
+    set_current as set_keyboard_protocol,
 };
 pub use keymap::{
     Action, AltScreenAction, AltScreenKeymap, AutocompleteAction, AutocompleteKeymap, EditorAction,
@@ -175,8 +177,8 @@ pub use keymap::{
     SelectKeymap, SessionAction, SessionKeymap, TreeAction, TreeKeymap,
 };
 pub use login_dialog::{
-    notify_auth_dialog, show_auth_prompt, LoginDialog, LoginFinished, LoginLineKind, LoginUiMsg,
-    TuiAuthInteraction,
+    LoginDialog, LoginFinished, LoginLineKind, LoginUiMsg, TuiAuthInteraction, notify_auth_dialog,
+    show_auth_prompt,
 };
 pub use markdown::{
     render as render_markdown, render_with_hyperlink_support as render_markdown_with_hyperlinks,
@@ -184,72 +186,71 @@ pub use markdown::{
 };
 pub use model_selector::{ModelEntry, ModelSelector};
 pub use native_modifiers::{
-    clear_native_modifier_probe, host_platform, is_apple_terminal_session,
-    is_native_modifier_pressed, normalize_native_shift_enter, rescue_native_shift_enter,
-    set_native_modifier_probe, should_detect_native_shift_enter,
-    ModifierKey, ModifierProbe,
-};
-pub use select_list::{ColumnLayout, SelectItem, SelectList, DEFAULT_MAX_VISIBLE};
-pub use config_selector::{
-    ConfigKind, ConfigRow, ConfigScope, ConfigSelector, ConfigToggle, ConfigWriteScope,
-    ProjectOverrideState,
+    ModifierKey, ModifierProbe, clear_native_modifier_probe, host_platform,
+    is_apple_terminal_session, is_native_modifier_pressed, normalize_native_shift_enter,
+    rescue_native_shift_enter, set_native_modifier_probe, should_detect_native_shift_enter,
 };
 pub use oauth_selector::{OAuthMode, OAuthSelector};
-pub use selector::{
-    input_line_spans, search_input_spans, CheckboxSelector, ListSelector, Selector, SelectorKind,
-    SelectorOutcome, INPUT_PROMPT, SCOPED_MODELS_ALL,
+pub use overlay::{Overlay, OverlayOutcome};
+pub use panic_hook::{install_panic_hook, restore_terminal_best_effort};
+pub use resume_hint::{
+    APP_NAME, ResumeTarget, format_resume_command, quote_if_needed, resume_hint_line,
 };
-pub use submenu_selector::SubmenuSelector;
-pub use thinking_selector::ThinkingSelector;
-pub use user_message_selector::{UserMessageRow, UserMessageSelector};
+pub use select_list::{ColumnLayout, DEFAULT_MAX_VISIBLE, SelectItem, SelectList};
+pub use selector::{
+    CheckboxSelector, INPUT_PROMPT, ListSelector, SCOPED_MODELS_ALL, Selector, SelectorKind,
+    SelectorOutcome, input_line_spans, search_input_spans,
+};
 pub use session_search::{
+    NameFilter, ParsedSearchQuery, QueryMode, SearchRow, SearchToken, SortMode, TokenKind,
     filter_and_sort as filter_and_sort_sessions, match_text as match_session_text,
-    parse_search_query, NameFilter, ParsedSearchQuery, QueryMode, SearchRow, SearchToken, SortMode,
-    TokenKind,
+    parse_search_query,
 };
 pub use session_selector::{SessionRow, SessionSelector, SessionSelectorOutcome};
-pub use settings_selector::{SettingRow, SettingsSelector, TrustSelector, FIELD_SEP};
+pub use settings_selector::{FIELD_SEP, SettingRow, SettingsSelector, TrustSelector};
+pub use startup::{
+    DiagnosticCollision, DiagnosticSeverity, StartupDiagnostic, StartupLine, StartupReport,
+    StartupRole, StartupSpan, build_startup_lines, display_path, extension_diagnostics,
+    resource_diagnostics,
+};
 pub use startup_selector::run_startup_selector;
 pub use status::{
-    experimental_features_enabled, experimental_features_enabled_from, format_tokens, StatusLine,
+    StatusLine, experimental_features_enabled, experimental_features_enabled_from, format_tokens,
 };
-pub use text_input::{Input, InputOutcome, TextInputSelector};
-pub use tree_selector::{FilterMode, TreeEntryRole, TreeKind, TreeNode, TreeSelector};
 pub use status_indicator::{
-    IndicatorKind, StatusIndicator, WorkingIndicator, SPINNER_FRAMES, SPINNER_INTERVAL,
+    IndicatorKind, SPINNER_FRAMES, SPINNER_INTERVAL, StatusIndicator, WorkingIndicator,
 };
-pub use startup::{
-    build_startup_lines, display_path, extension_diagnostics, resource_diagnostics,
-    DiagnosticCollision, DiagnosticSeverity, StartupDiagnostic, StartupLine, StartupReport,
-    StartupRole, StartupSpan,
+pub use submenu_selector::SubmenuSelector;
+pub use terminal_progress::{
+    TERMINAL_PROGRESS_ACTIVE_SEQUENCE, TERMINAL_PROGRESS_CLEAR_SEQUENCE,
+    TERMINAL_PROGRESS_KEEPALIVE, TerminalProgress, progress_is_armed, write_terminal_progress,
 };
 pub use terminal_query::{
-    find_cell_size_report, find_color_scheme_report, find_osc11_background_color,
-    parse_cell_size_report, parse_color_scheme_report, parse_osc11_background_color,
-    saw_device_attributes, NoTerminalProbe, StdinTerminalProbe, TerminalProbe, CELL_SIZE_QUERY,
-    CELL_SIZE_TIMEOUT, COLOR_SCHEME_QUERY, OSC11_BACKGROUND_QUERY,
+    CELL_SIZE_QUERY, CELL_SIZE_TIMEOUT, COLOR_SCHEME_QUERY, NoTerminalProbe,
+    OSC11_BACKGROUND_QUERY, StdinTerminalProbe, TerminalProbe, find_cell_size_report,
+    find_color_scheme_report, find_osc11_background_color, parse_cell_size_report,
+    parse_color_scheme_report, parse_osc11_background_color, saw_device_attributes,
 };
-pub use terminal_progress::{
-    progress_is_armed, write_terminal_progress, TerminalProgress,
-    TERMINAL_PROGRESS_ACTIVE_SEQUENCE, TERMINAL_PROGRESS_CLEAR_SEQUENCE,
-    TERMINAL_PROGRESS_KEEPALIVE,
-};
-pub use terminal_title::{session_terminal_title, APP_TITLE};
+pub use terminal_title::{APP_TITLE, session_terminal_title};
+pub use text_input::{Input, InputOutcome, TextInputSelector};
 pub use theme::{
-    color_of, detect_terminal_background_from_env, detect_terminal_background_theme,
-    detect_terminal_theme_for_auto, rgb_to_256, theme_for_rgb, BackgroundTheme, ColorMode,
-    DetectionConfidence, TerminalTheme, TerminalThemeDetection, TerminalThemeSource,
-    ThemeController, ThinkingTheme, UiTheme,
+    BackgroundTheme, ColorMode, DetectionConfidence, TerminalTheme, TerminalThemeDetection,
+    TerminalThemeSource, ThemeController, ThinkingTheme, UiTheme, color_of,
+    detect_terminal_background_from_env, detect_terminal_background_theme,
+    detect_terminal_theme_for_auto, rgb_to_256, theme_for_rgb,
 };
+pub use thinking_selector::ThinkingSelector;
 pub use tmux::{
+    EXTENDED_KEYS_FORMAT_WARNING, EXTENDED_KEYS_OFF_WARNING, TMUX_QUERY_TIMEOUT,
     check_keyboard_setup as check_tmux_keyboard_setup, in_tmux,
-    keyboard_warning as tmux_keyboard_warning, EXTENDED_KEYS_FORMAT_WARNING,
-    EXTENDED_KEYS_OFF_WARNING, TMUX_QUERY_TIMEOUT,
+    keyboard_warning as tmux_keyboard_warning,
 };
 pub use transcript::{
-    content_text, parse_skill_block, thinking_text, Entry, ParsedSkillBlock, ResultImage,
-    TranscriptView, DEFAULT_IMAGE_WIDTH_CELLS, HIDDEN_THINKING_LABEL,
+    DEFAULT_IMAGE_WIDTH_CELLS, Entry, HIDDEN_THINKING_LABEL, ParsedSkillBlock, ResultImage,
+    TranscriptView, content_text, parse_skill_block, thinking_text,
 };
+pub use tree_selector::{FilterMode, TreeEntryRole, TreeKind, TreeNode, TreeSelector};
+pub use user_message_selector::{UserMessageRow, UserMessageSelector};
 
 /// Re-export the exact crossterm ratatui uses (version-matched; ADR-0001 — never add a direct
 /// crossterm dep). Front-ends and tests build key events through this path.

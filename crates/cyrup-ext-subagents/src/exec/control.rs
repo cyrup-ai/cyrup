@@ -99,8 +99,7 @@ impl Default for ResolvedControlConfig {
             active_notice_after_ms: DEFAULT_ACTIVE_NOTICE_AFTER_MS,
             active_notice_after_turns: None,
             active_notice_after_tokens: None,
-            failed_tool_attempts_before_attention:
-                DEFAULT_FAILED_TOOL_ATTEMPTS_BEFORE_ATTENTION,
+            failed_tool_attempts_before_attention: DEFAULT_FAILED_TOOL_ATTEMPTS_BEFORE_ATTENTION,
             notify_on: vec![
                 ControlEventType::ActiveLongRunning,
                 ControlEventType::NeedsAttention,
@@ -181,11 +180,15 @@ pub fn resolve_control_config(
         parse_positive_count(call_override.and_then(|c| c.active_notice_after_tokens))
             .or_else(|| parse_positive_count(global.and_then(|c| c.active_notice_after_tokens)));
     let failed_tool_attempts_before_attention = parse_positive_count(
-        call_override.and_then(|c| c.failed_tool_attempts_before_attention).map(u64::from),
+        call_override
+            .and_then(|c| c.failed_tool_attempts_before_attention)
+            .map(u64::from),
     )
     .or_else(|| {
         parse_positive_count(
-            global.and_then(|c| c.failed_tool_attempts_before_attention).map(u64::from),
+            global
+                .and_then(|c| c.failed_tool_attempts_before_attention)
+                .map(u64::from),
         )
     })
     .and_then(|n| u32::try_from(n).ok())
@@ -574,7 +577,11 @@ pub fn format_long_running_facts(event: &ControlEvent) -> Option<String> {
     if let Some(path) = &event.current_path {
         facts.push(format!("path {path}"));
     }
-    if facts.is_empty() { None } else { Some(facts.join(" | ")) }
+    if facts.is_empty() {
+        None
+    } else {
+        Some(facts.join(" | "))
+    }
 }
 
 /// pi `formatControlNoticeMessage` (`subagent-control.ts:165-212`) — the three notice bodies
@@ -763,7 +770,10 @@ pub fn next_long_running_trigger(
     if config.active_notice_after_turns.is_some_and(|t| turns >= t) {
         return Some(LongRunningTrigger::TurnThreshold);
     }
-    if config.active_notice_after_tokens.is_some_and(|t| tokens >= t) {
+    if config
+        .active_notice_after_tokens
+        .is_some_and(|t| tokens >= t)
+    {
         return Some(LongRunningTrigger::TokenThreshold);
     }
     None
@@ -1274,13 +1284,8 @@ impl ControlMonitor {
             }
             return self.emit_needs_attention(now, NeedsAttentionInput::default());
         }
-        match next_long_running_trigger(
-            &self.config,
-            self.started_at,
-            now,
-            self.turns,
-            self.tokens,
-        ) {
+        match next_long_running_trigger(&self.config, self.started_at, now, self.turns, self.tokens)
+        {
             Some(trigger) => self.emit_active_long_running(now, trigger),
             None => false,
         }
@@ -1338,8 +1343,8 @@ impl ControlMonitor {
                 if !snapshot.mutates {
                     return;
                 }
-                let text = crate::exec::output::extract_tool_result_text(result)
-                    .unwrap_or_default();
+                let text =
+                    crate::exec::output::extract_tool_result_text(result).unwrap_or_default();
                 // A wire-level `is_error` is an unambiguous failure; the source has no such flag
                 // on `tool_result_end` and can only sniff the text, so the text test is kept as
                 // the primary and `is_error` widens it rather than replacing it.
@@ -1620,7 +1625,9 @@ mod tests {
         let event = sample_event(ControlEventType::NeedsAttention);
         let mut seen = HashSet::new();
         assert!(claim_control_notification(&config, &event, &mut seen, None));
-        assert!(!claim_control_notification(&config, &event, &mut seen, None));
+        assert!(!claim_control_notification(
+            &config, &event, &mut seen, None
+        ));
     }
 
     #[test]
@@ -1628,7 +1635,10 @@ mod tests {
         let mut event = sample_event(ControlEventType::NeedsAttention);
         event.index = Some(0);
         let text = format_control_notice_message(&event, Some("child-1"));
-        assert!(text.starts_with("Subagent needs attention: scout\n"), "{text}");
+        assert!(
+            text.starts_with("Subagent needs attention: scout\n"),
+            "{text}"
+        );
         assert!(text.contains("Run: run1 step 1"), "{text}");
         assert!(text.contains("subagent({ action: \"steer\", id: \"run1\", index: 0, message:"));
         assert!(text.contains("Direct intercom target: child-1"));
@@ -1642,7 +1652,10 @@ mod tests {
         let mut guard = sample_event(ControlEventType::NeedsAttention);
         guard.reason = Some(ControlEventReason::CompletionGuard);
         let guard_text = format_control_notice_message(&guard, None);
-        assert!(guard_text.starts_with("Subagent failed: scout\n"), "{guard_text}");
+        assert!(
+            guard_text.starts_with("Subagent failed: scout\n"),
+            "{guard_text}"
+        );
         assert!(guard_text.contains("Next: read the output artifact"));
     }
 
@@ -1718,18 +1731,27 @@ mod tests {
         );
         // The capturing case: `\S+` starts at the very next byte after `>`.
         assert_eq!(
-            resolve_current_path("bash", &serde_json::json!({ "command": "echo hi >out.txt" })),
+            resolve_current_path(
+                "bash",
+                &serde_json::json!({ "command": "echo hi >out.txt" })
+            ),
             Some("out.txt".to_string())
         );
         // pi's real answer for a SPACED redirect is `undefined`, not the path.
         assert_eq!(
-            resolve_current_path("bash", &serde_json::json!({ "command": "echo hi > out.txt" })),
+            resolve_current_path(
+                "bash",
+                &serde_json::json!({ "command": "echo hi > out.txt" })
+            ),
             None,
             "`\\S+` cannot match the space after `>`, and no later position matches either"
         );
         // `>` wins the alternation at the first `>` of a `>>`, so the capture is the SECOND `>`.
         assert_eq!(
-            resolve_current_path("bash", &serde_json::json!({ "command": "echo hi >> out.txt" })),
+            resolve_current_path(
+                "bash",
+                &serde_json::json!({ "command": "echo hi >> out.txt" })
+            ),
             Some(">".to_string())
         );
         assert_eq!(
@@ -1738,7 +1760,10 @@ mod tests {
         );
         // `tee\s+` consumes the whole whitespace run before the capture (greedy `\s+`).
         assert_eq!(
-            resolve_current_path("bash", &serde_json::json!({ "command": "cat x | tee  log.txt" })),
+            resolve_current_path(
+                "bash",
+                &serde_json::json!({ "command": "cat x | tee  log.txt" })
+            ),
             Some("log.txt".to_string())
         );
         assert_eq!(
@@ -1878,7 +1903,10 @@ mod tests {
             m.events()[0].event_type,
             ControlEventType::ActiveLongRunning
         );
-        assert_eq!(m.events()[0].reason, Some(ControlEventReason::TimeThreshold));
+        assert_eq!(
+            m.events()[0].reason,
+            Some(ControlEventReason::TimeThreshold)
+        );
     }
 
     #[test]

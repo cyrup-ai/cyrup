@@ -26,4 +26,3 @@ fn codex_url_completes_without_doubling_segments() {
         "https://example.test/backend-api/codex/responses"
     );
 }
-

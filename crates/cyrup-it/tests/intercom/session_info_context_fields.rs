@@ -35,7 +35,12 @@
 //! Every rejection case here is paired with a positive control: the well-formed frames a real pi
 //! peer sends must still be served, and the numbers must come out the far side intact.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -44,10 +49,10 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
+use crate::common::Broker;
 use cyrup_intercom::transport::client::{InboundEvent, IntercomClient};
 use cyrup_intercom::transport::framing::{FrameReader, encode_json};
 use cyrup_intercom::transport::protocol::{SessionRegistration, now_ms};
-use crate::common::Broker;
 
 /// The three keys, as one list, so no test can silently cover two of them.
 const CONTEXT_KEYS: [&str; 3] = ["contextPct", "contextTokens", "contextWindow"];
@@ -82,7 +87,9 @@ struct RawClient {
 impl RawClient {
     async fn connect(socket: &Path) -> Self {
         Self {
-            stream: UnixStream::connect(socket).await.expect("connect to the broker socket"),
+            stream: UnixStream::connect(socket)
+                .await
+                .expect("connect to the broker socket"),
             reader: FrameReader::new(),
             queued: VecDeque::new(),
             buf: vec![0u8; 16 * 1024],
@@ -104,9 +111,13 @@ impl RawClient {
                 Ok(Ok(0) | Err(_)) => return None,
                 Ok(Ok(n)) => n,
             };
-            let frames = self.reader.push(&self.buf[..n]).expect("broker frames are well-formed");
+            let frames = self
+                .reader
+                .push(&self.buf[..n])
+                .expect("broker frames are well-formed");
             for payload in frames {
-                self.queued.push_back(serde_json::from_slice(&payload).expect("broker frames are JSON"));
+                self.queued
+                    .push_back(serde_json::from_slice(&payload).expect("broker frames are JSON"));
             }
         }
     }
@@ -136,7 +147,10 @@ impl RawClient {
             },
         }))
         .await;
-        assert_eq!(self.expect_frame("registered").await["sessionId"], session_id);
+        assert_eq!(
+            self.expect_frame("registered").await["sessionId"],
+            session_id
+        );
     }
 
     /// Assert the broker destroyed this connection. A `list` is queued first so a broker that
@@ -159,15 +173,20 @@ impl RawClient {
     /// Assert the broker did NOT destroy this connection — the half a blanket "reject everything"
     /// fix would fail.
     async fn assert_alive(&mut self, what: &str) {
-        self.send(&serde_json::json!({ "type": "list", "requestId": "alive" })).await;
+        self.send(&serde_json::json!({ "type": "list", "requestId": "alive" }))
+            .await;
         let frame = self.expect_frame("sessions").await;
-        assert_eq!(frame["requestId"], "alive", "the broker must keep serving after {what}");
+        assert_eq!(
+            frame["requestId"], "alive",
+            "the broker must keep serving after {what}"
+        );
     }
 
     /// The `sessions[]` entry for `session_id` from a fresh `list` — the third of the four broker
     /// tags that carry a `SessionInfo`.
     async fn list_entry(&mut self, session_id: &str) -> serde_json::Value {
-        self.send(&serde_json::json!({ "type": "list", "requestId": "entry" })).await;
+        self.send(&serde_json::json!({ "type": "list", "requestId": "entry" }))
+            .await;
         let frame = self.expect_frame("sessions").await;
         frame["sessions"]
             .as_array()
@@ -193,7 +212,8 @@ async fn presence_with_a_non_numeric_context_field_destroys_the_connection() {
             let mut frame = serde_json::json!({ "type": "presence" });
             frame[key] = bad.clone();
             c.send(&frame).await;
-            c.assert_destroyed(&format!("`presence.{key}` = {bad}")).await;
+            c.assert_destroyed(&format!("`presence.{key}` = {bad}"))
+                .await;
         }
     }
 }
@@ -220,7 +240,10 @@ async fn presence_context_fields_are_set_cleared_and_relayed_to_peers() {
         .await;
     let update = beta.expect_frame("presence_update").await;
     assert_eq!(update["session"]["id"], "alpha-session");
-    assert_eq!(update["session"]["contextPct"], 42, "a number must SET the field");
+    assert_eq!(
+        update["session"]["contextPct"], 42,
+        "a number must SET the field"
+    );
     assert_eq!(
         update["session"]["contextTokens"], 128000,
         "an integer must survive the relay as an integer, not as 128000.0"
@@ -235,7 +258,9 @@ async fn presence_context_fields_are_set_cleared_and_relayed_to_peers() {
 
     // An ABSENT key must leave the field untouched — pi's `!== undefined` arm. A status change
     // gives the broadcast something to carry.
-    alpha.send(&serde_json::json!({ "type": "presence", "status": "thinking" })).await;
+    alpha
+        .send(&serde_json::json!({ "type": "presence", "status": "thinking" }))
+        .await;
     let update = beta.expect_frame("presence_update").await;
     assert_eq!(update["session"]["status"], "thinking");
     assert_eq!(
@@ -245,7 +270,9 @@ async fn presence_context_fields_are_set_cleared_and_relayed_to_peers() {
 
     // An explicit `null` must CLEAR — the key is gone, not present-and-null
     // (`delete session.info.contextPct`, `v0.9.2 broker/broker.ts:923`).
-    alpha.send(&serde_json::json!({ "type": "presence", "contextPct": null })).await;
+    alpha
+        .send(&serde_json::json!({ "type": "presence", "contextPct": null }))
+        .await;
     let update = beta.expect_frame("presence_update").await;
     assert!(
         update["session"].get("contextPct").is_none(),
@@ -255,7 +282,9 @@ async fn presence_context_fields_are_set_cleared_and_relayed_to_peers() {
         update["session"]["contextTokens"], 128000,
         "clearing one context field must not disturb its siblings"
     );
-    alpha.assert_alive("a `presence` carrying an explicit null context field").await;
+    alpha
+        .assert_alive("a `presence` carrying an explicit null context field")
+        .await;
 }
 
 /// The two rules must not be collapsed into one. `null` is FATAL inside `isSessionInfo`
@@ -303,7 +332,10 @@ async fn register_ignores_context_fields_instead_of_rejecting_them() {
         },
     }))
     .await;
-    assert_eq!(c.expect_frame("registered").await["sessionId"], "junk-context-session");
+    assert_eq!(
+        c.expect_frame("registered").await["sessionId"],
+        "junk-context-session"
+    );
 
     // …and none of it may leak into the broadcast SessionInfo, or every pi peer on this broker
     // would destroy its own socket on the resulting `session_joined`.
@@ -350,11 +382,15 @@ impl HostileBroker {
             let mut reader = FrameReader::new();
             let mut buf = vec![0u8; 16 * 1024];
             loop {
-                let Ok(n) = stream.read(&mut buf).await else { return };
+                let Ok(n) = stream.read(&mut buf).await else {
+                    return;
+                };
                 if n == 0 {
                     return;
                 }
-                let Ok(got) = reader.push(&buf[..n]) else { return };
+                let Ok(got) = reader.push(&buf[..n]) else {
+                    return;
+                };
                 if !got.is_empty() {
                     break;
                 }
@@ -374,7 +410,11 @@ impl HostileBroker {
             // Hold the socket open so a client disconnect can only come from the client itself.
             std::future::pending::<()>().await;
         });
-        Self { _dir: dir, socket, release }
+        Self {
+            _dir: dir,
+            socket,
+            release,
+        }
     }
 }
 
@@ -421,7 +461,10 @@ async fn client_events_on(frame: serde_json::Value) -> Vec<InboundEvent> {
 }
 
 async fn client_disconnects_on(frame: serde_json::Value) -> bool {
-    client_events_on(frame).await.iter().any(|e| matches!(e, InboundEvent::Disconnected(_)))
+    client_events_on(frame)
+        .await
+        .iter()
+        .any(|e| matches!(e, InboundEvent::Disconnected(_)))
 }
 
 fn good_session() -> serde_json::Value {
@@ -494,11 +537,14 @@ async fn the_client_accepts_and_surfaces_well_typed_context_fields() {
     )
     .await;
     assert!(
-        !events.iter().any(|e| matches!(e, InboundEvent::Disconnected(_))),
+        !events
+            .iter()
+            .any(|e| matches!(e, InboundEvent::Disconnected(_))),
         "well-typed context fields must not disconnect the client; got {events:?}"
     );
-    let Some(InboundEvent::SessionJoined(info)) =
-        events.iter().find(|e| matches!(e, InboundEvent::SessionJoined(_)))
+    let Some(InboundEvent::SessionJoined(info)) = events
+        .iter()
+        .find(|e| matches!(e, InboundEvent::SessionJoined(_)))
     else {
         panic!("no `session_joined` event surfaced; got {events:?}");
     };
@@ -514,11 +560,14 @@ async fn the_client_accepts_and_surfaces_well_typed_context_fields() {
     assert_eq!(serde_json::to_value(info).unwrap(), session);
 
     // Absent is also what pi accepts (all three are optional, `v0.9.2 types.ts:19-21`).
-    let events =
-        client_events_on(serde_json::json!({ "type": "session_joined", "session": good_session() }))
-            .await;
+    let events = client_events_on(
+        serde_json::json!({ "type": "session_joined", "session": good_session() }),
+    )
+    .await;
     assert!(
-        !events.iter().any(|e| matches!(e, InboundEvent::Disconnected(_))),
+        !events
+            .iter()
+            .any(|e| matches!(e, InboundEvent::Disconnected(_))),
         "absent context fields must not disconnect the client; got {events:?}"
     );
 }

@@ -34,11 +34,16 @@ fn permission_decision_scope_trims_the_first_three_and_not_the_last_two() {
         tool_name: Some("bash".to_string()),
         ..DedupDetails::default()
     };
-    assert_eq!(PermissionSystemExtension::permission_decision_scope(&blank), json!("bash"));
+    assert_eq!(
+        PermissionSystemExtension::permission_decision_scope(&blank),
+        json!("bash")
+    );
 
     // `toolName` is NOT run through `getNonEmptyString` upstream, so its padding survives.
-    let raw_tool =
-        DedupDetails { tool_name: Some("  bash  ".to_string()), ..DedupDetails::default() };
+    let raw_tool = DedupDetails {
+        tool_name: Some("  bash  ".to_string()),
+        ..DedupDetails::default()
+    };
     assert_eq!(
         PermissionSystemExtension::permission_decision_scope(&raw_tool),
         json!("  bash  "),
@@ -62,12 +67,17 @@ async fn registry_gate_fails_closed_with_no_attached_registry() {
     let dir = tempfile::tempdir().unwrap();
     let agent_dir = dir.path().to_path_buf();
     // Global policy allows bash everywhere — a fail-OPEN gate would let this proceed (Noop).
-    write_file(&agent_dir.join(POLICY_FILE), r#"{ "bash": { "*": "allow" } }"#);
+    write_file(
+        &agent_dir.join(POLICY_FILE),
+        r#"{ "bash": { "*": "allow" } }"#,
+    );
     let ext = PermissionSystemExtension::new(agent_dir.clone(), agent_dir.clone());
     init_ext(&ext).await;
     // Deliberately never call `set_host_services` — the registry cannot be enumerated.
 
-    let outcome = ext.on_event(&bash_call("call-1"), &event_ctx(agent_dir)).await;
+    let outcome = ext
+        .on_event(&bash_call("call-1"), &event_ctx(agent_dir))
+        .await;
     assert!(
         matches!(outcome, HookOutcome::Block { .. }),
         "an unenumerable registry must fail CLOSED, never silently let the tool through"
@@ -84,13 +94,20 @@ async fn registry_gate_fails_closed_with_no_attached_registry() {
 async fn ask_fails_fast_without_ui_subagent_or_yolo() {
     let dir = tempfile::tempdir().unwrap();
     let agent_dir = dir.path().to_path_buf();
-    write_file(&agent_dir.join(POLICY_FILE), r#"{ "bash": { "*": "ask" } }"#);
+    write_file(
+        &agent_dir.join(POLICY_FILE),
+        r#"{ "bash": { "*": "ask" } }"#,
+    );
     let ext = PermissionSystemExtension::new(agent_dir.clone(), agent_dir.clone());
     init_ext(&ext).await;
-    ext.set_host_services(Arc::new(FakeRegistry { names: vec!["bash".to_string()] }));
+    ext.set_host_services(Arc::new(FakeRegistry {
+        names: vec!["bash".to_string()],
+    }));
 
     // has_ui=false, no `CYRUP_SUBAGENT_CHILD` env, config.yolo_mode default false ⇒ the
     // pre-check must fail CLOSED immediately, never touching the lock/dialog machinery.
-    let outcome = ext.on_event(&bash_call("call-1"), &event_ctx(agent_dir)).await;
+    let outcome = ext
+        .on_event(&bash_call("call-1"), &event_ctx(agent_dir))
+        .await;
     assert!(matches!(outcome, HookOutcome::Block { .. }));
 }

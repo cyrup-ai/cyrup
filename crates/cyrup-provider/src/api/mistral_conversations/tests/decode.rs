@@ -94,9 +94,9 @@ async fn decodes_thinking_chunks() {
     let m = model_with("magistral-small", true);
     let events = collect(raw.as_bytes().to_vec(), &m).await;
     assert!(
-        events.iter().any(
-            |e| matches!(e, StreamEvent::ThinkingDelta { delta, .. } if delta == "ponder")
-        )
+        events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::ThinkingDelta { delta, .. } if delta == "ponder"))
     );
     assert!(
         events

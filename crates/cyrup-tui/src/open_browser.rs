@@ -58,7 +58,10 @@ pub(crate) fn browser_command(os: &str, target: &str) -> (&'static str, Vec<Stri
         // change what rundll32 parses.
         "windows" => (
             "rundll32",
-            vec!["url.dll,FileProtocolHandler".to_string(), target.to_string()],
+            vec![
+                "url.dll,FileProtocolHandler".to_string(),
+                target.to_string(),
+            ],
         ),
         // `["xdg-open", [target]]` (`open-browser.ts:16`).
         _ => ("xdg-open", vec![target.to_string()]),

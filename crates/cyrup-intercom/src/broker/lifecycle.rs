@@ -143,12 +143,17 @@ pub async fn run() -> std::io::Result<()> {
     // that names neither the limit's cause nor the path. Naming both here is what makes the parent's
     // captured-stderr message (`transport::spawn::BrokerStderrTail`) actionable.
     let endpoint = describe_listen_target(&listen_target);
-    let mut listener = listener::BrokerListener::bind(&listen_target).await.map_err(|e| {
-        std::io::Error::new(
-            e.kind(),
-            format!("failed to bind the intercom broker endpoint at {endpoint} ({} bytes): {e}", endpoint.len()),
-        )
-    })?;
+    let mut listener = listener::BrokerListener::bind(&listen_target)
+        .await
+        .map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "failed to bind the intercom broker endpoint at {endpoint} ({} bytes): {e}",
+                    endpoint.len()
+                ),
+            )
+        })?;
     // `onListening` (`broker.ts:127-146`): the string arm restricts the socket; the TCP arm
     // publishes the endpoint the kernel actually gave it, credentialled with this run's
     // `BROKER_STATE_ID`, into `broker.port.json` — the file `broker_connect_target` validates
@@ -199,7 +204,7 @@ pub async fn run() -> std::io::Result<()> {
             shutdown.clone(),
             paths::extension_state_dir_path(&intercom_dir),
         )
-            .with_listen_endpoint(listener.is_trusted_local(), endpoint_state_id),
+        .with_listen_endpoint(listener.is_trusted_local(), endpoint_state_id),
     ));
     let mut next_conn_id: u64 = 0;
 
@@ -266,9 +271,7 @@ impl TerminateSignal {
         #[cfg(unix)]
         {
             Ok(Self {
-                sigterm: tokio::signal::unix::signal(
-                    tokio::signal::unix::SignalKind::terminate(),
-                )?,
+                sigterm: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
             })
         }
         #[cfg(windows)]
@@ -299,12 +302,12 @@ impl TerminateSignal {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+    use super::super::state::BrokerState;
+    use super::super::state::lock;
+    use super::*;
     use serde_json::json;
     use std::sync::Arc;
     use std::sync::Mutex;
-    use super::*;
-    use super::super::state::BrokerState;
-    use super::super::state::lock;
     use tokio::sync::Notify;
 
     /// ICOM-005 — `register` must NULL the pending auto-shutdown handle
@@ -313,12 +316,11 @@ mod tests {
     /// early-returned and the re-arm was lost, leaving an idle broker alive forever.
     #[tokio::test]
     async fn a_register_clears_the_pending_shutdown_so_a_later_disconnect_can_re_arm() {
-        let state: Arc<Mutex<BrokerState>> =
-            Arc::new(Mutex::new(BrokerState::new(
-                30_000,
-                Arc::new(Notify::new()),
-                super::super::test_support::test_extension_state_dir(),
-            )));
+        let state: Arc<Mutex<BrokerState>> = Arc::new(Mutex::new(BrokerState::new(
+            30_000,
+            Arc::new(Notify::new()),
+            super::super::test_support::test_extension_state_dir(),
+        )));
         // t=0: the last session left → a check is armed.
         schedule_shutdown_check(&state);
         assert!(lock(&state).shutdown_scheduled, "armed");
@@ -336,7 +338,10 @@ mod tests {
             &mut sid,
             1_000,
         );
-        assert!(!lock(&state).shutdown_scheduled, "a register cancels the pending check");
+        assert!(
+            !lock(&state).shutdown_scheduled,
+            "a register cancels the pending check"
+        );
         assert!(lock(&state).shutdown_task.is_none(), "and drops its handle");
 
         // t=2: that session disconnects → the check must arm AGAIN.

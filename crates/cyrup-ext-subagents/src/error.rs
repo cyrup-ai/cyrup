@@ -50,6 +50,21 @@ pub enum SubagentError {
     #[error("agent not found: {0}")]
     AgentNotFound(String),
 
+    /// SUBA-086 — the requested name is claimed by a definition file that failed frontmatter
+    /// validation and OUTRANKS every definition that did resolve, so the launch is refused with
+    /// the parse error instead of silently running a lower-tier same-named agent or reporting
+    /// "not found". pi's wording verbatim (`subagent-executor.ts:2340`, `preflight.ts:268`,
+    /// `slash-commands.ts:896`, `agent-management.ts:1089` @v0.64.0):
+    /// `Agent '<name>' has invalid configuration: <error>`.
+    #[error("Agent '{name}' has invalid configuration: {error}")]
+    InvalidAgentConfiguration {
+        /// The name exactly as requested (pi interpolates the caller's string, not the trimmed
+        /// one).
+        name: String,
+        /// [`crate::discovery::types::AgentDiscoveryDiagnostic::error`].
+        error: String,
+    },
+
     /// No saved chain definition matched the requested name (`/run-chain`, R-SA-129), applying
     /// the identical exact-string-equality convention R-SA-008 mandates for agent names.
     #[error("chain not found: {0}")]

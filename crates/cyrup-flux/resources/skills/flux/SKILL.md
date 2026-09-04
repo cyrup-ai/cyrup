@@ -53,7 +53,7 @@ end-to-end from one prompt, pausing only at `/flux/ask` for clarifying questions
 | Argument | Mode | Behavior |
 | --- | --- | --- |
 | filename (e.g. `NOTIFS`) | Single-task | Process that one task file; path/`.md` inferred |
-| `N` (a bare integer > 1) | Multi-task | Spawn `N` parallel subagents over `todo/*.md` |
+| `N` (a bare integer > 1) | Multi-task | Spawn `N` parallel subagents over `todo/*.md` — needs the `subagent` tool (the opt-in subagents extension: `CYRUP_SUBAGENTS=1` or a `subagents/config.json`); without it the command says so once and runs the tasks sequentially |
 | `1` or `all` | Sequential | Process every task file one after another, no subagents |
 | (empty) | Interactive | List `todo/*.md` and ask which to process |
 

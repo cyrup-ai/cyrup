@@ -4,25 +4,33 @@
 //! mock. This is the child↔supervisor path the `contact_supervisor` tool + the seam channels ride
 //! on (the port doc §7.4).
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::common::registration;
 use cyrup_ext_subagents::background::RunId;
 use cyrup_ext_subagents::tui::intercom::{DeliveryChannel, IntercomPayload, SubagentResultStatus};
 use cyrup_intercom::config::IntercomConfig;
 use cyrup_intercom::seams::IntercomDeliveryChannel;
 use cyrup_intercom::session_state::SharedIntercomState;
-use cyrup_intercom::transport::client::{IntercomClient, InboundEvent, SendOptions};
+use cyrup_intercom::transport::client::{InboundEvent, IntercomClient, SendOptions};
 use cyrup_intercom::transport::spawn::wait_for_broker;
-use crate::common::registration;
 
 /// Wait for the next `Message` inbound event on `rx`, with a bound.
 async fn next_message(
     rx: &mut tokio::sync::broadcast::Receiver<InboundEvent>,
-) -> (cyrup_intercom::transport::protocol::SessionInfo, cyrup_intercom::transport::protocol::Message) {
+) -> (
+    cyrup_intercom::transport::protocol::SessionInfo,
+    cyrup_intercom::transport::protocol::Message,
+) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -64,7 +72,10 @@ async fn child_to_broker_to_supervisor_round_trip_over_the_real_socket() {
     )
     .await
     .expect("supervisor registers");
-    assert_eq!(supervisor.session_id().as_deref(), Some("supervisor-session"));
+    assert_eq!(
+        supervisor.session_id().as_deref(),
+        Some("supervisor-session")
+    );
     let mut supervisor_events = supervisor.subscribe();
 
     // Child connects.
@@ -87,7 +98,10 @@ async fn child_to_broker_to_supervisor_round_trip_over_the_real_socket() {
         )
         .await
         .expect("child send routes through the broker");
-    assert!(send_result.delivered, "the broker delivered the ask to the supervisor: {send_result:?}");
+    assert!(
+        send_result.delivered,
+        "the broker delivered the ask to the supervisor: {send_result:?}"
+    );
 
     // 2) Supervisor RECEIVES the ask, child→broker→supervisor.
     let (from, ask) = next_message(&mut supervisor_events).await;
@@ -109,7 +123,10 @@ async fn child_to_broker_to_supervisor_round_trip_over_the_real_socket() {
         )
         .await
         .expect("supervisor reply routes through the broker");
-    assert!(reply_result.delivered, "the reply was delivered to the still-connected child");
+    assert!(
+        reply_result.delivered,
+        "the reply was delivered to the still-connected child"
+    );
 
     // 4) The child RECEIVES the answer — the full round trip closes.
     let (reply_from, reply) = next_message(&mut child_events).await;
@@ -146,22 +163,35 @@ async fn delivery_channel_relays_a_grouped_result_to_the_supervisor_over_the_bro
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawn broker");
-    wait_for_broker(&socket_path, Duration::from_secs(5)).await.expect("broker up");
+    wait_for_broker(&socket_path, Duration::from_secs(5))
+        .await
+        .expect("broker up");
 
     // The supervisor (the delivery target).
-    let supervisor =
-        IntercomClient::connect(&socket_path, registration("supervisor"), Some("supervisor-session".to_string()))
-            .await
-            .expect("supervisor registers");
+    let supervisor = IntercomClient::connect(
+        &socket_path,
+        registration("supervisor"),
+        Some("supervisor-session".to_string()),
+    )
+    .await
+    .expect("supervisor registers");
     let mut supervisor_events = supervisor.subscribe();
 
     // The orchestrator's own client + shared state, with its supervisor target set.
     let orchestrator = Arc::new(
-        IntercomClient::connect(&socket_path, registration("orchestrator"), Some("orch-session".to_string()))
-            .await
-            .expect("orchestrator registers"),
+        IntercomClient::connect(
+            &socket_path,
+            registration("orchestrator"),
+            Some("orch-session".to_string()),
+        )
+        .await
+        .expect("orchestrator registers"),
     );
-    let state = Arc::new(SharedIntercomState::new(IntercomConfig::default(), 600_000, PathBuf::from("/w")));
+    let state = Arc::new(SharedIntercomState::new(
+        IntercomConfig::default(),
+        600_000,
+        PathBuf::from("/w"),
+    ));
     state.set_client(Some(orchestrator.clone()));
     let delivery = IntercomDeliveryChannel::new(state, Some("supervisor-session".to_string()));
 
@@ -175,8 +205,14 @@ async fn delivery_channel_relays_a_grouped_result_to_the_supervisor_over_the_bro
         summary: "1 completed".to_string(),
         child_statuses: vec![SubagentResultStatus::Completed],
     };
-    let delivered = delivery.send(payload).await.expect("delivery returns a verdict");
-    assert!(delivered, "the delivery channel relayed the result to the supervisor over the broker");
+    let delivered = delivery
+        .send(payload)
+        .await
+        .expect("delivery returns a verdict");
+    assert!(
+        delivered,
+        "the delivery channel relayed the result to the supervisor over the broker"
+    );
 
     // The supervisor receives the allowlisted relay body.
     let (from, message) = next_message(&mut supervisor_events).await;
@@ -204,7 +240,9 @@ async fn broker_refuses_a_mutual_ask() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawn broker");
-    wait_for_broker(&socket_path, Duration::from_secs(5)).await.expect("broker up");
+    wait_for_broker(&socket_path, Duration::from_secs(5))
+        .await
+        .expect("broker up");
 
     let a = IntercomClient::connect(&socket_path, registration("a"), Some("sess-a".to_string()))
         .await
@@ -216,7 +254,15 @@ async fn broker_refuses_a_mutual_ask() {
     // a asks b (records edge a→b).
     let q1 = uuid::Uuid::new_v4().to_string();
     let r1 = a
-        .send("sess-b", SendOptions { text: "q".to_string(), expects_reply: Some(true), message_id: Some(q1), ..Default::default() })
+        .send(
+            "sess-b",
+            SendOptions {
+                text: "q".to_string(),
+                expects_reply: Some(true),
+                message_id: Some(q1),
+                ..Default::default()
+            },
+        )
         .await
         .expect("a→b ask");
     assert!(r1.delivered);
@@ -224,12 +270,23 @@ async fn broker_refuses_a_mutual_ask() {
     // b tries to ask a back while a's ask is open → mutual-ask refusal (broker.ts:460-469).
     let q2 = uuid::Uuid::new_v4().to_string();
     let r2 = b
-        .send("sess-a", SendOptions { text: "q2".to_string(), expects_reply: Some(true), message_id: Some(q2), ..Default::default() })
+        .send(
+            "sess-a",
+            SendOptions {
+                text: "q2".to_string(),
+                expects_reply: Some(true),
+                message_id: Some(q2),
+                ..Default::default()
+            },
+        )
         .await
         .expect("b→a ask returns a broker verdict");
     assert!(!r2.delivered, "a mutual ask must be refused");
     assert!(
-        r2.reason.as_deref().unwrap_or_default().contains("Mutual ask refused"),
+        r2.reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Mutual ask refused"),
         "reason: {:?}",
         r2.reason
     );

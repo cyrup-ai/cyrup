@@ -90,8 +90,7 @@ pub const GLOBAL_HOST: &str = "https://aiplatform.googleapis.com";
 pub const GLOBAL_LOCATION: &str = "global";
 
 /// pi `resolveProject`'s throw (`google-vertex.ts:399-403`), verbatim.
-pub const MISSING_PROJECT_MESSAGE: &str =
-    "Vertex AI requires a project ID. Set GOOGLE_CLOUD_PROJECT/GCLOUD_PROJECT or pass project in options.";
+pub const MISSING_PROJECT_MESSAGE: &str = "Vertex AI requires a project ID. Set GOOGLE_CLOUD_PROJECT/GCLOUD_PROJECT or pass project in options.";
 
 /// pi `resolveLocation`'s throw (`google-vertex.ts:411`), verbatim.
 pub const MISSING_LOCATION_MESSAGE: &str =
@@ -198,17 +197,13 @@ impl ApiImpl for GoogleVertexApi {
             body: Some(body),
         };
 
-        let client = match build_client_for_target(
-            &req.url,
-            &auth_ctx,
-            auth.env.as_ref(),
-            opts.timeout_ms,
-        )
-        .await
-        {
-            Ok(c) => c,
-            Err(e) => fail!(e),
-        };
+        let client =
+            match build_client_for_target(&req.url, &auth_ctx, auth.env.as_ref(), opts.timeout_ms)
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => fail!(e),
+            };
 
         let capture = crate::stream::ResponseCapture::default();
         let on_resp = capture.sse_hook(opts);
@@ -249,10 +244,7 @@ pub fn resolve_api_key(api_key: Option<&str>) -> Option<&str> {
 /// pi `isPlaceholderApiKey` (`google-vertex.ts:396-398`): `/^<[^>]+>$/`. Hand-rolled rather than
 /// regex-driven because the pattern is anchored, three-token and total.
 fn is_placeholder_api_key(api_key: &str) -> bool {
-    let Some(inner) = api_key
-        .strip_prefix('<')
-        .and_then(|s| s.strip_suffix('>'))
-    else {
+    let Some(inner) = api_key.strip_prefix('<').and_then(|s| s.strip_suffix('>')) else {
         return false;
     };
     !inner.is_empty() && !inner.contains('>')
@@ -498,7 +490,11 @@ mod tests {
     #[test]
     fn angle_bracket_placeholders_are_not_api_keys() {
         assert_eq!(resolve_api_key(Some("<YOUR_API_KEY>")), None);
-        assert_eq!(resolve_api_key(Some("<>")), Some("<>"), "`[^>]+` needs one char");
+        assert_eq!(
+            resolve_api_key(Some("<>")),
+            Some("<>"),
+            "`[^>]+` needs one char"
+        );
         assert_eq!(
             resolve_api_key(Some("<a>b>")),
             Some("<a>b>"),
@@ -588,7 +584,10 @@ mod tests {
         let mut model = vertex_model("gemini-2.5-pro");
         model.base_url = "https://proxy.internal/vertex".to_string();
         let url = regional_url(&model, &keyless(), "p", "us-east1").unwrap();
-        assert!(url.starts_with("https://proxy.internal/vertex/v1/projects/p/"), "got: {url}");
+        assert!(
+            url.starts_with("https://proxy.internal/vertex/v1/projects/p/"),
+            "got: {url}"
+        );
 
         // pi clears `apiVersion` when the base url already names one (`:355-357`), so `/v1` must
         // NOT be appended twice.
@@ -667,7 +666,10 @@ mod tests {
         opts.headers = Some(opt_headers);
 
         let headers = build_headers(&model, &opts, None, Some("tok"));
-        assert_eq!(headers.get("x-tenant").cloned().flatten().as_deref(), Some("b"));
+        assert_eq!(
+            headers.get("x-tenant").cloned().flatten().as_deref(),
+            Some("b")
+        );
         assert_eq!(headers.get("content-type"), Some(&None));
     }
 

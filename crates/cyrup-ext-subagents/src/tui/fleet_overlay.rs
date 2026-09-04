@@ -180,12 +180,16 @@ impl InteractiveOverlay for FleetOverlay {
         // component learns how tall the terminal is. Before the seam existed this stayed at its
         // `32` default forever, so the roster never grew or shrank with the window.
         self.component.set_terminal_rows(height);
-        let frame = self.component.render(width, crate::time::now_epoch_millis());
+        let frame = self
+            .component
+            .render(width, crate::time::now_epoch_millis());
         fleet_theme::to_overlay_lines(&frame)
     }
 
     fn handle_key(&mut self, key: OverlayKey) -> OverlayOutcome {
-        let Some(mapped) = to_fleet_key(key) else { return OverlayOutcome::Ignored };
+        let Some(mapped) = to_fleet_key(key) else {
+            return OverlayOutcome::Ignored;
+        };
         match self.component.handle_input(mapped) {
             FleetInputOutcome::Ignored => OverlayOutcome::Ignored,
             FleetInputOutcome::Rerender => OverlayOutcome::Redraw,
@@ -218,7 +222,11 @@ async fn run_fleet_action(
     action: FleetPendingAction,
 ) -> FleetActionResult {
     match action {
-        FleetPendingAction::Steer { target, message, mode } => {
+        FleetPendingAction::Steer {
+            target,
+            message,
+            mode,
+        } => {
             // SUBA-049: `fleet.rs` delta 1 is CLOSED. The `Tab` cycle's mode used to be logged and
             // then dropped — `control_steer` had no delivery-mode argument, so all three settings
             // delivered identically and the prompt lied about what it was about to do. It is now
@@ -250,7 +258,12 @@ async fn run_fleet_action(
             let fallback = format!("Failed to stop async run {}.", target.run_id);
             super::fleet::action_result_from_control(
                 executor
-                    .control_stop(cwd, Some(target.run_id.as_str()), target.async_dir.to_str())
+                    .control_stop(
+                        cwd,
+                        Some(target.run_id.as_str()),
+                        target.async_dir.to_str(),
+                        None,
+                    )
                     .await,
                 &fallback,
             )
@@ -323,15 +336,42 @@ mod tests {
     #[test]
     fn every_key_upstream_binds_crosses_the_seam() {
         assert_eq!(to_fleet_key(plain(OverlayKeyCode::Up)), Some(FleetKey::Up));
-        assert_eq!(to_fleet_key(plain(OverlayKeyCode::Down)), Some(FleetKey::Down));
-        assert_eq!(to_fleet_key(plain(OverlayKeyCode::Home)), Some(FleetKey::Home));
-        assert_eq!(to_fleet_key(plain(OverlayKeyCode::End)), Some(FleetKey::End));
-        assert_eq!(to_fleet_key(plain(OverlayKeyCode::PageUp)), Some(FleetKey::PageUp));
-        assert_eq!(to_fleet_key(plain(OverlayKeyCode::PageDown)), Some(FleetKey::PageDown));
-        assert_eq!(to_fleet_key(plain(OverlayKeyCode::Enter)), Some(FleetKey::Enter));
-        assert_eq!(to_fleet_key(plain(OverlayKeyCode::Escape)), Some(FleetKey::Escape));
-        assert_eq!(to_fleet_key(plain(OverlayKeyCode::Tab)), Some(FleetKey::Tab));
-        assert_eq!(to_fleet_key(plain(OverlayKeyCode::Backspace)), Some(FleetKey::Backspace));
+        assert_eq!(
+            to_fleet_key(plain(OverlayKeyCode::Down)),
+            Some(FleetKey::Down)
+        );
+        assert_eq!(
+            to_fleet_key(plain(OverlayKeyCode::Home)),
+            Some(FleetKey::Home)
+        );
+        assert_eq!(
+            to_fleet_key(plain(OverlayKeyCode::End)),
+            Some(FleetKey::End)
+        );
+        assert_eq!(
+            to_fleet_key(plain(OverlayKeyCode::PageUp)),
+            Some(FleetKey::PageUp)
+        );
+        assert_eq!(
+            to_fleet_key(plain(OverlayKeyCode::PageDown)),
+            Some(FleetKey::PageDown)
+        );
+        assert_eq!(
+            to_fleet_key(plain(OverlayKeyCode::Enter)),
+            Some(FleetKey::Enter)
+        );
+        assert_eq!(
+            to_fleet_key(plain(OverlayKeyCode::Escape)),
+            Some(FleetKey::Escape)
+        );
+        assert_eq!(
+            to_fleet_key(plain(OverlayKeyCode::Tab)),
+            Some(FleetKey::Tab)
+        );
+        assert_eq!(
+            to_fleet_key(plain(OverlayKeyCode::Backspace)),
+            Some(FleetKey::Backspace)
+        );
     }
 
     #[test]
@@ -341,7 +381,10 @@ mod tests {
             Some(FleetKey::Char('K')),
             "Shift+k must remain the detail-scroll binding, not the selection one"
         );
-        assert_eq!(to_fleet_key(plain(OverlayKeyCode::Char('k'))), Some(FleetKey::Char('k')));
+        assert_eq!(
+            to_fleet_key(plain(OverlayKeyCode::Char('k'))),
+            Some(FleetKey::Char('k'))
+        );
     }
 
     #[test]
@@ -376,9 +419,18 @@ mod tests {
             OverlayKeyCode::Insert,
             OverlayKeyCode::F(5),
         ] {
-            assert_eq!(to_fleet_key(plain(code)), None, "{code:?} is unbound upstream");
+            assert_eq!(
+                to_fleet_key(plain(code)),
+                None,
+                "{code:?} is unbound upstream"
+            );
         }
-        let alt = OverlayKey { code: OverlayKeyCode::Char('x'), ctrl: false, alt: true, shift: false };
+        let alt = OverlayKey {
+            code: OverlayKeyCode::Char('x'),
+            ctrl: false,
+            alt: true,
+            shift: false,
+        };
         assert_eq!(to_fleet_key(alt), None);
     }
 
@@ -446,11 +498,19 @@ mod tests {
         let tall = InteractiveOverlay::render(&mut overlay, 80, 60);
         assert_eq!(short.len(), 24 * 85 / 100);
         assert_eq!(tall.len(), 60 * 85 / 100);
-        assert_ne!(short.len(), tall.len(), "the frame must track the terminal height");
+        assert_ne!(
+            short.len(),
+            tall.len(),
+            "the frame must track the terminal height"
+        );
 
         // Style crosses the seam structurally, not as text.
         let corner = &tall[0].spans[0];
-        assert!(corner.text.starts_with('╭'), "first row is the box top: {:?}", corner.text);
+        assert!(
+            corner.text.starts_with('╭'),
+            "first row is the box top: {:?}",
+            corner.text
+        );
         assert_eq!(
             corner.fg,
             Some(cyrup_ext::OverlayColor::DarkGray),
@@ -461,14 +521,20 @@ mod tests {
             .iter()
             .find(|s| s.text.contains("Subagent fleet inspector"))
             .expect("the title row");
-        assert!(title.bold, "the title keeps its bold crossing the overlay seam");
+        assert!(
+            title.bold,
+            "the title keeps its bold crossing the overlay seam"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn refresh_ms_is_upstreams_cadence_and_a_tick_applies_a_refreshed_state() {
         let dir = tempfile::tempdir().unwrap();
         let mut overlay = overlay_over(super::FleetState::default(), dir.path().to_path_buf());
-        assert_eq!(InteractiveOverlay::refresh_ms(&overlay), crate::tui::fleet::REFRESH_MS);
+        assert_eq!(
+            InteractiveOverlay::refresh_ms(&overlay),
+            crate::tui::fleet::REFRESH_MS
+        );
 
         // The first tick has nothing to apply yet — it STARTS the scan (pi's `setInterval` body is
         // `invalidate()` + `requestRender()`; cyrup's scan is async, so it lands a tick later).
@@ -485,7 +551,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_steer_keystroke_dispatches_a_control_op_and_its_answer_reaches_the_component() {
         let dir = tempfile::tempdir().unwrap();
-        let mut overlay = overlay_over(background_state("ovlrun00001", "coder"), dir.path().to_path_buf());
+        let mut overlay = overlay_over(
+            background_state("ovlrun00001", "coder"),
+            dir.path().to_path_buf(),
+        );
         assert!(overlay.component().action_notice().is_none());
 
         // `s` opens the steer draft, characters type into it, Enter dispatches — every one of these
@@ -496,10 +565,16 @@ mod tests {
         );
         assert_eq!(overlay.component().steer_draft(), Some(""));
         for c in "go".chars() {
-            assert_eq!(overlay.handle_key(plain(OverlayKeyCode::Char(c))), OverlayOutcome::Redraw);
+            assert_eq!(
+                overlay.handle_key(plain(OverlayKeyCode::Char(c))),
+                OverlayOutcome::Redraw
+            );
         }
         assert_eq!(overlay.component().steer_draft(), Some("go"));
-        assert_eq!(overlay.handle_key(plain(OverlayKeyCode::Enter)), OverlayOutcome::Redraw);
+        assert_eq!(
+            overlay.handle_key(plain(OverlayKeyCode::Enter)),
+            OverlayOutcome::Redraw
+        );
 
         // The control op runs off-thread; its answer lands through `finish_action` on a later tick.
         for _ in 0..400 {
@@ -508,8 +583,14 @@ mod tests {
                 // The run does not exist on disk, so the honest answer is an error notice — what
                 // matters is that an answer arrived at all and the busy latch cleared.
                 let notice = overlay.component().action_notice().expect("notice");
-                assert!(notice.is_error, "an unknown run must answer with an error notice");
-                assert!(overlay.component().steer_draft().is_none(), "the draft is reset");
+                assert!(
+                    notice.is_error,
+                    "an unknown run must answer with an error notice"
+                );
+                assert!(
+                    overlay.component().steer_draft().is_none(),
+                    "the draft is reset"
+                );
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -520,9 +601,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn escape_closes_and_an_unbound_key_is_ignored() {
         let dir = tempfile::tempdir().unwrap();
-        let mut overlay = overlay_over(background_state("ovlrun00002", "coder"), dir.path().to_path_buf());
-        assert_eq!(overlay.handle_key(plain(OverlayKeyCode::Insert)), OverlayOutcome::Ignored);
-        assert_eq!(overlay.handle_key(plain(OverlayKeyCode::Escape)), OverlayOutcome::Close);
+        let mut overlay = overlay_over(
+            background_state("ovlrun00002", "coder"),
+            dir.path().to_path_buf(),
+        );
+        assert_eq!(
+            overlay.handle_key(plain(OverlayKeyCode::Insert)),
+            OverlayOutcome::Ignored
+        );
+        assert_eq!(
+            overlay.handle_key(plain(OverlayKeyCode::Escape)),
+            OverlayOutcome::Close
+        );
     }
 
     #[tokio::test]
@@ -542,6 +632,9 @@ mod tests {
         )
         .await;
         assert!(result.is_error);
-        assert_eq!(result.text, "Failed to open Herdr inspector for async run abc123.");
+        assert_eq!(
+            result.text,
+            "Failed to open Herdr inspector for async run abc123."
+        );
     }
 }

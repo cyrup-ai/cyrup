@@ -23,7 +23,6 @@
 //! Keep it that way. A second test in this file re-creates the race, and no lock fixes it.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
-
 // Exempt from the workspace `disallowed-methods` guard: this file proves `detect` IGNORES
 // `CYRUP_SHELL`, so the variable must really be set in the process — no injected lookup can prove
 // the ABSENCE of a read. Sound because this binary holds one `#[test]`, so no other thread in the
@@ -67,8 +66,7 @@ fn detect_ignores_cyrup_shell_env_var() {
         } else {
             // No `/bin/bash`: either `which bash` found one, or the `sh` fallback fired.
             assert!(
-                cfg.program == *"sh"
-                    || cfg.program.file_name().is_some_and(|n| n == "bash"),
+                cfg.program == *"sh" || cfg.program.file_name().is_some_and(|n| n == "bash"),
                 "got {:?}",
                 cfg.program
             );

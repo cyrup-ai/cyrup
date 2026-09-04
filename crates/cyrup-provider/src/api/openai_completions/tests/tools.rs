@@ -24,7 +24,10 @@ fn kimi_deferred_tools_move_from_the_tools_array_into_an_inline_system_message()
     }
     fn transcript() -> Vec<Message> {
         vec![
-            Message::User { content: vec![Content::text("go")], timestamp: 0 },
+            Message::User {
+                content: vec![Content::text("go")],
+                timestamp: 0,
+            },
             Message::Assistant(AssistantMessage {
                 content: vec![Content::ToolCall(ToolCall {
                     id: ToolCallId::from("c1"),
@@ -67,7 +70,10 @@ fn kimi_deferred_tools_move_from_the_tools_array_into_an_inline_system_message()
     // ---- WITHOUT the flag: today's behaviour, and the control that keeps the assertions
     // below from passing vacuously.
     let plain = build_body(&model(), &ctx, &StreamOptions::default());
-    let plain_tools = plain.get("tools").and_then(Value::as_array).expect("tools array");
+    let plain_tools = plain
+        .get("tools")
+        .and_then(Value::as_array)
+        .expect("tools array");
     assert_eq!(
         plain_tools.len(),
         2,
@@ -92,16 +98,26 @@ fn kimi_deferred_tools_move_from_the_tools_array_into_an_inline_system_message()
     let body = build_body(&kimi_model, &ctx, &StreamOptions::default());
 
     // `late` is gone from the top-level array; `early` (never deferred) stays.
-    let tools = body.get("tools").and_then(Value::as_array).expect("tools array");
+    let tools = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .expect("tools array");
     let names: Vec<&str> = tools
         .iter()
         .filter_map(|t| t.pointer("/function/name").and_then(Value::as_str))
         .collect();
-    assert_eq!(names, vec!["early"], "a deferred tool must not be repeated in `tools`");
+    assert_eq!(
+        names,
+        vec!["early"],
+        "a deferred tool must not be repeated in `tools`"
+    );
 
     // …and appears exactly once, inline, in a `{role: "system", tools: [...]}` message with no
     // `content` key, positioned after the tool-result run that introduced it.
-    let messages = body.get("messages").and_then(Value::as_array).expect("messages");
+    let messages = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .expect("messages");
     let inline_at = messages
         .iter()
         .position(|m| m.get("tools").is_some())

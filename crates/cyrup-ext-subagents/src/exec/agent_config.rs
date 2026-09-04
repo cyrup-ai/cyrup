@@ -12,13 +12,10 @@ use crate::discovery::types::{
     AgentDefinition, AgentReadScope, OutputMode, OutputSpec, SystemPromptMode, ToolRef,
 };
 use crate::exec::acceptance::AcceptanceContract;
-use crate::exec::fallback::{
-    ModelOverride,
-};
+use crate::exec::fallback::ModelOverride;
 use crate::exec::output::OutputCap;
 use crate::fork_context::{ContextMode, ForkContext};
 use crate::spawn::depth::DepthEnvelope;
-
 
 // ================================================================================================
 // AgentConfig / RunOptions / SingleResult (arch-SA §3.4)
@@ -34,6 +31,12 @@ pub struct AgentConfig {
     /// `agent` classification input and [`crate::exec::acceptance::AcceptanceContract::heuristic_default`].
     pub name: String,
     pub model: Option<ModelId>,
+    /// SUBA-088 — pi `AgentConfig.modelProvider` (`agents.ts:144` @v0.64.0), copied off
+    /// [`AgentDefinition::model_provider`]: the provider this agent's BARE model ids resolve
+    /// against, consumed by `run_sync`'s ladder as `agent.modelProvider ??
+    /// options.preferredModelProvider` (`runs/foreground/execution.ts:1885`) — see
+    /// [`RunOptions::preferred_provider`] for the second rung.
+    pub model_provider: Option<ProviderId>,
     pub fallback_models: Vec<ModelId>,
     /// The agent's frontmatter reasoning level (func-SA §4.1 `AgentDefinition::thinking`) as pi's
     /// OPEN string, applied to the child's `--model` argument as a `:<value>` suffix at spawn time via
@@ -46,6 +49,16 @@ pub struct AgentConfig {
     pub system_prompt_mode: SystemPromptMode,
     pub system_prompt_body: String,
     pub tools: Option<Vec<ToolRef>>,
+    /// SUBA-092 — the agent's `excludeTools` (pi `ResolvePiLaunchToolPlanInput.excludeTools`,
+    /// `runs/shared/pi-args.ts:301` @v0.64.0), flattened from
+    /// [`AgentDefinition::exclude_tools`]'s `Option` exactly as pi's `input.excludeTools ?? []`
+    /// (`:502`) does. Subtracted from the child's declared builtin set and direct-MCP names at
+    /// spawn time, or emitted as `--exclude-tools` when nothing pins an allowlist.
+    pub exclude_tools: Vec<String>,
+    /// SUBA-092 — pi `ResolvePiLaunchToolPlanInput.allowNestedSubagents` (`pi-args.ts:302`): the
+    /// independent nested-delegation grant folded into `fanoutAuthorized` (`:505-509`). Only
+    /// `Some(true)` counts (`input.allowNestedSubagents === true`).
+    pub allow_nested_subagents: Option<bool>,
     /// Extension-allowlist tri-state (func-SA §4.1 `AgentDefinition::extensions`): `Some(list)`
     /// emits `--no-extensions` plus an explicit `--extension` for each entry (discovery off, exact
     /// allowlist); `None` leaves the child's own extension discovery on (pi `runs/shared/pi-args.ts:128-137`).
@@ -101,6 +114,19 @@ pub struct AgentConfig {
     /// [`crate::exec::run_sync`] fires identically on every dispatch path. `None` and
     /// `Some(AgentRunnerConfig::Pi)` both mean the native child this crate spawns.
     pub runner: Option<crate::runner::AgentRunnerConfig>,
+    /// SUBA-082 — the agent's declared acceptance role
+    /// ([`AgentDefinition::acceptance_role`]), read by `run_sync`'s acceptance resolution
+    /// (`resolve_run_acceptance`) exactly where pi reads `agent.acceptanceRole`
+    /// (`runs/foreground/execution.ts:1834` @v0.64.0). `None` = no role declared, so the
+    /// agent-name alternations decide.
+    pub acceptance_role: Option<crate::exec::acceptance::model::AcceptanceRole>,
+    /// SUBA-082 — the agent's validated `acceptance:` launch default
+    /// ([`AgentDefinition::default_acceptance`]). Carried for the same reason `runner` is
+    /// (so the projection is a faithful copy of the definition), but NOT consulted by
+    /// `run_sync`: pi applies it only to a SINGLE-agent launch's params
+    /// (`applySingleAgentLaunchDefaults`, `subagent-executor.ts:2690-2692` @v0.64.0), which this
+    /// crate does in `extension/tool/routing.rs::route_single` before `RunOptions` exist.
+    pub default_acceptance: Option<serde_json::Value>,
 }
 
 impl AgentConfig {
@@ -112,11 +138,14 @@ impl AgentConfig {
         Self {
             name: agent.local_name.clone(),
             model: agent.model.clone(),
+            model_provider: agent.model_provider.clone(),
             fallback_models: agent.fallback_models.clone(),
             thinking: agent.thinking.clone(),
             system_prompt_mode: agent.system_prompt_mode,
             system_prompt_body: agent.system_prompt_body.clone(),
             tools: agent.tools.clone(),
+            exclude_tools: agent.exclude_tools.clone().unwrap_or_default(),
+            allow_nested_subagents: agent.allow_nested_subagents,
             extensions: agent.extensions.clone(),
             subagent_only_extensions: agent.subagent_only_extensions.clone(),
             output: agent.output.clone(),
@@ -130,6 +159,8 @@ impl AgentConfig {
             memory: agent.memory.clone(),
             tool_budget: agent.tool_budget.clone(),
             runner: agent.runner.clone(),
+            acceptance_role: agent.acceptance_role,
+            default_acceptance: agent.default_acceptance.clone(),
         }
     }
 }
@@ -163,6 +194,12 @@ pub struct ResolvedAgentPersona {
     /// The agent's local (unqualified) name — exactly [`AgentConfig::name`].
     pub name: String,
     pub model: Option<ModelId>,
+    /// SUBA-088 — the persona's `modelProvider` (see [`AgentConfig::model_provider`]), carried
+    /// across the runner-config hand-off so a background/chain step qualifies its bare ids the
+    /// same way the single-run path does. `#[serde(default)]` keeps an older on-disk config
+    /// deserializable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<ProviderId>,
     pub fallback_models: Vec<ModelId>,
     /// The agent's own frontmatter reasoning level (pi's OPEN string), carried on the resolved persona
     /// so a chain/parallel/background step applies the SAME `:<value>` `--model` suffix the single-run
@@ -173,6 +210,16 @@ pub struct ResolvedAgentPersona {
     pub system_prompt_mode: SystemPromptMode,
     pub system_prompt_body: String,
     pub tools: Option<Vec<ToolRef>>,
+    /// SUBA-092 — the agent's own `excludeTools`, carried so a chain/parallel/background step
+    /// subtracts the SAME tools the single-run path does (pi threads `agentConfig.excludeTools`
+    /// into every launch, `runs/background/async-execution.ts:948,1011,1741` @v0.64.0).
+    /// `#[serde(default)]` keeps the runner-config hand-off backward compatible.
+    #[serde(default)]
+    pub exclude_tools: Vec<String>,
+    /// SUBA-092 — the agent's own `allowNestedSubagents` grant, carried for the same reason
+    /// (`async-execution.ts:949,1012,1742`). `#[serde(default)]` keeps the hand-off compatible.
+    #[serde(default)]
+    pub allow_nested_subagents: Option<bool>,
     /// The agent's own extension allowlist tri-state, carried so a chain/parallel/background step
     /// threads `--no-extensions`/`--extension` identically to the single-run path (T4 inherit
     /// flags). `#[serde(default)]` keeps the runner-config hand-off backward compatible.
@@ -233,6 +280,19 @@ pub struct ResolvedAgentPersona {
     /// single-run path does. `#[serde(default)]` keeps an older on-disk config deserializable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner: Option<crate::runner::AgentRunnerConfig>,
+    /// SUBA-082 — the agent's declared acceptance role, carried across the hop-2 process
+    /// boundary so a chain/parallel/background step infers its acceptance level from the SAME
+    /// role the single-run path does (pi threads `acceptanceRole: a.acceptanceRole` into every
+    /// background launch, `runs/background/async-execution.ts:978,1036,1044,1122,1130,1768,1799`
+    /// @v0.64.0). `#[serde(default)]` keeps an older on-disk config deserializable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance_role: Option<crate::exec::acceptance::model::AcceptanceRole>,
+    /// SUBA-082 — the agent's validated `acceptance:` launch default, carried so the persona is a
+    /// faithful copy of the definition (see [`AgentConfig::default_acceptance`] for why no
+    /// chain/parallel/background step ever APPLIES it). `#[serde(default)]` keeps an older
+    /// on-disk config deserializable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_acceptance: Option<serde_json::Value>,
 }
 
 impl ResolvedAgentPersona {
@@ -245,11 +305,14 @@ impl ResolvedAgentPersona {
         Self {
             name: agent.local_name.clone(),
             model: agent.model.clone(),
+            model_provider: agent.model_provider.clone(),
             fallback_models: agent.fallback_models.clone(),
             thinking: agent.thinking.clone(),
             system_prompt_mode: agent.system_prompt_mode,
             system_prompt_body: agent.system_prompt_body.clone(),
             tools: agent.tools.clone(),
+            exclude_tools: agent.exclude_tools.clone().unwrap_or_default(),
+            allow_nested_subagents: agent.allow_nested_subagents,
             extensions: agent.extensions.clone(),
             subagent_only_extensions: agent.subagent_only_extensions.clone(),
             output: agent.output.clone(),
@@ -262,6 +325,8 @@ impl ResolvedAgentPersona {
             memory: agent.memory.clone(),
             tool_budget: agent.tool_budget.clone(),
             runner: agent.runner.clone(),
+            acceptance_role: agent.acceptance_role,
+            default_acceptance: agent.default_acceptance.clone(),
         }
     }
 
@@ -274,11 +339,14 @@ impl ResolvedAgentPersona {
         AgentConfig {
             name: self.name.clone(),
             model: self.model.clone(),
+            model_provider: self.model_provider.clone(),
             fallback_models: self.fallback_models.clone(),
             thinking: self.thinking.clone(),
             system_prompt_mode: self.system_prompt_mode,
             system_prompt_body: self.system_prompt_body.clone(),
             tools: self.tools.clone(),
+            exclude_tools: self.exclude_tools.clone(),
+            allow_nested_subagents: self.allow_nested_subagents,
             extensions: self.extensions.clone(),
             subagent_only_extensions: self.subagent_only_extensions.clone(),
             output: self.output.clone(),
@@ -292,6 +360,8 @@ impl ResolvedAgentPersona {
             memory: self.memory.clone(),
             tool_budget: self.tool_budget.clone(),
             runner: self.runner.clone(),
+            acceptance_role: self.acceptance_role,
+            default_acceptance: self.default_acceptance.clone(),
         }
     }
 }
@@ -359,6 +429,14 @@ pub struct RunOptions {
     /// cross-session default inside [`crate::exec::run_sync`]; a caller wanting that global-default behavior
     /// resolves it explicitly before constructing this struct.
     pub model_override: ModelOverride,
+    /// SUBA-088 — pi `preferredModelProvider: currentProvider` (`subagent-executor.ts:3825`
+    /// @v0.64.0, `currentProvider = parentModel?.provider` at `:3648`; the async runner's
+    /// `ctx.currentModelProvider`, `:1297`): the PARENT session's provider, the second rung of
+    /// `agent.modelProvider ?? options.preferredModelProvider` (`execution.ts:1885`) under which
+    /// `run_sync` qualifies a BARE candidate id before spawn
+    /// ([`crate::exec::fallback::build_model_candidates`]). Derived from the remembered parent
+    /// model with [`crate::exec::fallback::provider_of`]; `None` (headless / no live session)
+    /// leaves a bare id for the child to resolve, exactly as before this field was consumed.
     pub preferred_provider: Option<ProviderId>,
     pub available_models: Vec<ModelId>,
     /// Hard-abort cancellation, raced independently of `interrupt` (arch-SA §5.1).
@@ -703,7 +781,6 @@ mod tests {
 
     use super::*;
 
-
     // ---- T0.1 (C13): ResolvedAgentPersona is the serializable plan-time projection that lets a
     // chain/parallel/background step dispatch the REAL named persona instead of a placeholder. ----
 
@@ -712,11 +789,14 @@ mod tests {
         let persona = ResolvedAgentPersona {
             name: "reviewer".to_string(),
             model: Some(ModelId::from("reviewer-model")),
+            model_provider: None,
             fallback_models: vec![ModelId::from("backup-model")],
             thinking: Some("high".to_string()),
             system_prompt_mode: SystemPromptMode::Append,
             system_prompt_body: "You are the REVIEWER persona.".to_string(),
             tools: Some(vec![ToolRef::Builtin("read".to_string())]),
+            exclude_tools: vec!["bash".to_string()],
+            allow_nested_subagents: Some(true),
             extensions: Some(vec!["./allowed-ext.ts".to_string()]),
             subagent_only_extensions: vec!["./child-tool.ts".to_string()],
             output: None,
@@ -737,23 +817,30 @@ mod tests {
                     capabilities: None,
                 },
             )),
+            acceptance_role: None,
+            default_acceptance: None,
         };
         let json = serde_json::to_string(&persona).expect("serialize");
         let back: ResolvedAgentPersona = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back, persona, "the persona must survive a RunnerConfig JSON round-trip intact");
+        assert_eq!(
+            back, persona,
+            "the persona must survive a RunnerConfig JSON round-trip intact"
+        );
     }
-
 
     #[test]
     fn to_agent_config_stamps_the_live_depth_and_reproduces_the_persona() {
         let persona = ResolvedAgentPersona {
             name: "reviewer".to_string(),
             model: Some(ModelId::from("reviewer-model")),
+            model_provider: None,
             fallback_models: vec![ModelId::from("backup-model")],
             thinking: Some("high".to_string()),
             system_prompt_mode: SystemPromptMode::Append,
             system_prompt_body: "You are the REVIEWER persona.".to_string(),
             tools: Some(vec![ToolRef::Builtin("read".to_string())]),
+            exclude_tools: vec!["bash".to_string()],
+            allow_nested_subagents: Some(true),
             extensions: Some(vec!["./allowed-ext.ts".to_string()]),
             subagent_only_extensions: vec!["./child-tool.ts".to_string()],
             output: None,
@@ -774,6 +861,8 @@ mod tests {
                     capabilities: None,
                 },
             )),
+            acceptance_role: None,
+            default_acceptance: None,
         };
         let live_depth = DepthEnvelope {
             current_depth: 1,
@@ -787,14 +876,20 @@ mod tests {
         assert_eq!(cfg.name, "reviewer");
         assert_eq!(cfg.system_prompt_body, "You are the REVIEWER persona.");
         assert_eq!(cfg.system_prompt_mode, SystemPromptMode::Append);
-        assert_eq!(cfg.model.as_ref().map(ModelId::as_str), Some("reviewer-model"));
+        assert_eq!(
+            cfg.model.as_ref().map(ModelId::as_str),
+            Some("reviewer-model")
+        );
         assert_eq!(cfg.fallback_models, vec![ModelId::from("backup-model")]);
         assert_eq!(cfg.completion_guard, Some(true));
         assert_eq!(cfg.tools, Some(vec![ToolRef::Builtin("read".to_string())]));
         assert_eq!(cfg.max_subagent_depth, Some(1));
         assert_eq!(cfg.thinking, Some("high".to_string()));
         assert_eq!(cfg.extensions, Some(vec!["./allowed-ext.ts".to_string()]));
-        assert_eq!(cfg.subagent_only_extensions, vec!["./child-tool.ts".to_string()]);
+        assert_eq!(
+            cfg.subagent_only_extensions,
+            vec!["./child-tool.ts".to_string()]
+        );
         assert_eq!(cfg.runner, persona.runner);
         assert!(cfg.inherit_project_context);
         assert!(!cfg.inherit_skills);
@@ -804,5 +899,4 @@ mod tests {
         // The depth is the caller-stamped live envelope, not a plan-time value.
         assert_eq!(cfg.depth, live_depth);
     }
-
 }

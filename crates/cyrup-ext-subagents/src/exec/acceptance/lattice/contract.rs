@@ -233,15 +233,33 @@ impl AcceptanceContract {
     /// `dynamic fanout context` escalation is reachable there rather than lost outright.
     #[must_use]
     pub fn heuristic_default(agent_local_name: &str, task: &str) -> Self {
-        let inferred = crate::exec::acceptance::model::resolve_effective_acceptance(&crate::exec::acceptance::model::AcceptanceResolveInput {
-            explicit: None,
-            agent_name: agent_local_name.to_string(),
-            task: Some(task.to_string()),
-            mode: None,
-            is_async: false,
-            dynamic: false,
-            dynamic_group: false,
-        });
+        Self::heuristic_default_for_role(agent_local_name, None, task)
+    }
+
+    /// [`Self::heuristic_default`] with the agent's DECLARED acceptance role (SUBA-082) — pi
+    /// threads `acceptanceRole: agent.acceptanceRole` into every `resolveEffectiveAcceptance`
+    /// call it makes from an already-resolved agent config (`runs/foreground/execution.ts:1834`,
+    /// `runs/background/async-execution.ts:978,1036,1044,1122,1130,1768,1799` @v0.64.0). `None`
+    /// is upstream's `undefined`: the agent-NAME alternations decide, exactly as the two-argument
+    /// form above.
+    #[must_use]
+    pub fn heuristic_default_for_role(
+        agent_local_name: &str,
+        acceptance_role: Option<crate::exec::acceptance::model::AcceptanceRole>,
+        task: &str,
+    ) -> Self {
+        let inferred = crate::exec::acceptance::model::resolve_effective_acceptance(
+            &crate::exec::acceptance::model::AcceptanceResolveInput {
+                explicit: None,
+                agent_name: agent_local_name.to_string(),
+                acceptance_role,
+                task: Some(task.to_string()),
+                mode: None,
+                is_async: false,
+                dynamic: false,
+                dynamic_group: false,
+            },
+        );
         Self {
             // `resolve_effective_acceptance` with no explicit input returns `inferred.level`
             // verbatim, and `infer_level` only ever yields `attested`/`checked` (v0.43.0 removed
@@ -250,11 +268,17 @@ impl AcceptanceContract {
             // unreachable and map to the nearest real level rather than reintroducing a silent
             // no-op contract.
             required_level: match inferred.level {
-                crate::exec::acceptance::model::AcceptanceLevel::Verified => AcceptanceStatus::Verified,
-                crate::exec::acceptance::model::AcceptanceLevel::Checked => AcceptanceStatus::Checked,
+                crate::exec::acceptance::model::AcceptanceLevel::Verified => {
+                    AcceptanceStatus::Verified
+                }
+                crate::exec::acceptance::model::AcceptanceLevel::Checked => {
+                    AcceptanceStatus::Checked
+                }
                 crate::exec::acceptance::model::AcceptanceLevel::Attested
                 | crate::exec::acceptance::model::AcceptanceLevel::Auto
-                | crate::exec::acceptance::model::AcceptanceLevel::None => AcceptanceStatus::Attested,
+                | crate::exec::acceptance::model::AcceptanceLevel::None => {
+                    AcceptanceStatus::Attested
+                }
             },
             // Nothing was explicitly declared to run: `inferLevel` never produces `verify[]`
             // commands (only an authored policy can), and `stopRules` is likewise explicit-only.
@@ -307,12 +331,22 @@ impl AcceptanceContract {
     /// (`acceptance.ts:283-292`); an explicit policy that declares none of the three therefore
     /// gates on nothing rather than on `requiredEvidenceForLevel(level)`.
     #[must_use]
-    pub fn resolve_effective(
+    pub fn resolve_effective(explicit: Option<Self>, agent_local_name: &str, task: &str) -> Self {
+        Self::resolve_effective_for_role(explicit, agent_local_name, None, task)
+    }
+
+    /// [`Self::resolve_effective`] with the agent's DECLARED acceptance role (SUBA-082) threaded
+    /// into the inferred half — pi `resolveEffectiveAcceptance`'s own `acceptanceRole` input
+    /// (`runs/shared/acceptance.ts:412-421` @v0.64.0). The combination rule is unchanged: the
+    /// role only moves the INFERRED floor, and the explicit contract still wins by rank.
+    #[must_use]
+    pub fn resolve_effective_for_role(
         explicit: Option<Self>,
         agent_local_name: &str,
+        acceptance_role: Option<crate::exec::acceptance::model::AcceptanceRole>,
         task: &str,
     ) -> Self {
-        let inferred = Self::heuristic_default(agent_local_name, task);
+        let inferred = Self::heuristic_default_for_role(agent_local_name, acceptance_role, task);
         let Some(mut contract) = explicit else {
             return inferred;
         };
@@ -423,17 +457,12 @@ mod tests {
     use crate::exec::acceptance::lattice::testsupport::vc;
     use crate::exec::acceptance::lattice::testsupport::vc_timeout;
 
-
     use std::time::Duration;
-
-
-
 
     /// The ONE verify runner (`crate::exec::acceptance::model::run_verify_command`, upstream `runVerifyCommand`) under the
     /// short local name the single-command tests below used when this module carried a second copy
     /// of it. There is no second copy any more; only the alias survives.
     use crate::exec::acceptance::model::run_verify_command as run_one_verify_command;
-
 
     /// The combined capture the retired `VerifyCommandResult.output_tail` held, reassembled from
     /// upstream's separate `stdout`/`stderr` in the same order the old field concatenated them.
@@ -444,7 +473,6 @@ mod tests {
             result.stderr.as_deref().unwrap_or_default()
         )
     }
-
 
     // ---------------------------------------------------------------------------------------
     // AcceptanceContract construction
@@ -457,7 +485,6 @@ mod tests {
         assert!(!contract.explicit);
         assert!(contract.verify.is_empty());
     }
-
 
     /// pi `inferLevel`'s read-only branch (`acceptance.ts:107-116` @v0.34.0): read-only TASK
     /// WORDING infers `attested` with the findings criterion and the review-findings evidence
@@ -482,7 +509,6 @@ mod tests {
             ]
         );
     }
-
 
     /// The read-only AGENT branch of the same tree — `reviewer|oracle|scout|researcher|analyst`
     /// (`acceptance.ts:99` @ v0.43.0) — reached by agent name alone, with no read-only wording in
@@ -533,7 +559,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn heuristic_default_attests_a_research_agent_on_neutral_task_wording() {
         let contract = AcceptanceContract::heuristic_default("researcher", "Investigate the bug");
@@ -546,7 +571,6 @@ mod tests {
             ]
         );
     }
-
 
     /// `inferLevel`'s final fallthrough (`acceptance.ts:118-124`): an agent and a task that match
     /// no branch at all still attest, with the lightweight manual-notes evidence pair.
@@ -567,18 +591,13 @@ mod tests {
         );
     }
 
-
     #[test]
     fn explicit_contract_is_marked_explicit_and_carries_verify_commands() {
-        let contract = AcceptanceContract::explicit(
-            AcceptanceStatus::Verified,
-            vec![vc("true")],
-        );
+        let contract = AcceptanceContract::explicit(AcceptanceStatus::Verified, vec![vc("true")]);
         assert!(contract.explicit);
         assert_eq!(contract.required_level, AcceptanceStatus::Verified);
         assert_eq!(contract.verify, vec!["true".to_string()]);
     }
-
 
     #[test]
     /// The clamp target is `Verified`, not `Reviewed`: v0.43.0 removed `reviewed` from
@@ -588,7 +607,6 @@ mod tests {
         let contract = AcceptanceContract::explicit(AcceptanceStatus::Rejected, vec![]);
         assert_eq!(contract.required_level, AcceptanceStatus::Verified);
     }
-
 
     // ---------------------------------------------------------------------------------------
     // resolve_effective: pi `resolveEffectiveAcceptance`'s combination rule
@@ -602,7 +620,11 @@ mod tests {
     #[test]
     fn an_explicit_level_below_the_inferred_one_is_raised_to_the_inferred_floor() {
         let inferred = AcceptanceContract::heuristic_default("worker", "Implement the fix");
-        assert_eq!(inferred.required_level, AcceptanceStatus::Checked, "premise");
+        assert_eq!(
+            inferred.required_level,
+            AcceptanceStatus::Checked,
+            "premise"
+        );
 
         let effective = AcceptanceContract::resolve_effective(
             Some(AcceptanceContract::explicit_floor(
@@ -624,7 +646,6 @@ mod tests {
         );
     }
 
-
     /// The other side of the same expression: an explicit level ABOVE the inferred one wins, and
     /// its declared `verify[]` commands survive the combination.
     #[test]
@@ -641,16 +662,16 @@ mod tests {
         assert_eq!(effective.verify, vec!["true".to_string()]);
     }
 
-
     /// `explicit == None` is pi's `explicitLevel === "auto"` branch: the inferred contract, whole.
     #[test]
     fn no_explicit_contract_yields_the_inferred_one() {
-        let effective =
-            AcceptanceContract::resolve_effective(None, "worker", "Implement the fix");
+        let effective = AcceptanceContract::resolve_effective(None, "worker", "Implement the fix");
         assert_eq!(effective.required_level, AcceptanceStatus::Checked);
-        assert!(!effective.explicit, "an inferred contract never arms R-SA-033");
+        assert!(
+            !effective.explicit,
+            "an inferred contract never arms R-SA-033"
+        );
     }
-
 
     /// An in-process caller that builds `AcceptanceContract::explicit(NotRequired, …)` directly in
     /// Rust (as several of this crate's own callers and tests do) has stated its intent with no
@@ -669,7 +690,6 @@ mod tests {
         assert!(effective.is_no_op());
     }
 
-
     #[test]
     fn with_reviewer_result_raises_required_level_to_at_least_reviewed() {
         let contract = AcceptanceContract::explicit(AcceptanceStatus::Checked, vec![])
@@ -679,7 +699,6 @@ mod tests {
             });
         assert_eq!(contract.required_level, AcceptanceStatus::Reviewed);
     }
-
 
     // ---------------------------------------------------------------------------------------
     // run_verify_commands / run_one_verify_command: REAL subprocess execution (no mocks)
@@ -691,10 +710,15 @@ mod tests {
         let result = run_one_verify_command(&vc("exit 0"), dir.path()).await;
         assert!(passed(&result));
         assert_eq!(result.exit_code, Some(0));
-        assert_eq!(result.status, crate::exec::acceptance::model::VerifyRunStatus::Passed);
-        assert_eq!(result.stderr, None, "a clean command reports no diagnostic text");
+        assert_eq!(
+            result.status,
+            crate::exec::acceptance::model::VerifyRunStatus::Passed
+        );
+        assert_eq!(
+            result.stderr, None,
+            "a clean command reports no diagnostic text"
+        );
     }
-
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_real_command_that_exits_nonzero_is_recorded_as_failed_with_real_exit_code() {
@@ -703,7 +727,6 @@ mod tests {
         assert!(!passed(&result));
         assert_eq!(result.exit_code, Some(7));
     }
-
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn output_tail_captures_real_combined_stdout_and_stderr() {
@@ -717,37 +740,54 @@ mod tests {
         // Upstream keeps the two streams SEPARATE (`stdout`/`stderr`, `acceptance.ts:1194-1195`),
         // so this asserts each marker landed on its own stream — strictly more than the retired
         // combined `output_tail` could say.
-        assert!(result.stdout.as_deref().unwrap_or_default().contains("out-marker"));
-        assert!(result.stderr.as_deref().unwrap_or_default().contains("err-marker"));
+        assert!(
+            result
+                .stdout
+                .as_deref()
+                .unwrap_or_default()
+                .contains("out-marker")
+        );
+        assert!(
+            result
+                .stderr
+                .as_deref()
+                .unwrap_or_default()
+                .contains("err-marker")
+        );
         assert!(output_tail(&result).contains("out-marker"));
         assert!(output_tail(&result).contains("err-marker"));
     }
-
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn command_runs_in_the_declared_working_directory() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("marker.txt"), "hi").expect("seed file");
-        let result =
-            run_one_verify_command(&vc("test -f marker.txt"), dir.path()).await;
+        let result = run_one_verify_command(&vc("test -f marker.txt"), dir.path()).await;
         assert!(passed(&result), "the file must be visible relative to cwd");
     }
-
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_hanging_command_times_out_and_is_recorded_as_failed() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let result = run_one_verify_command(&vc_timeout("sleep 5", Duration::from_millis(100)), dir.path())
-            .await;
+        let result = run_one_verify_command(
+            &vc_timeout("sleep 5", Duration::from_millis(100)),
+            dir.path(),
+        )
+        .await;
         assert!(!passed(&result));
-        assert_eq!(result.status, crate::exec::acceptance::model::VerifyRunStatus::TimedOut);
+        assert_eq!(
+            result.status,
+            crate::exec::acceptance::model::VerifyRunStatus::TimedOut
+        );
         // `stderr: trimOutput(redactVerifyEnv(stderr || abortMessage || "Acceptance verification
         // timed out.", …))` (`acceptance.ts:1174`) — the command printed nothing, so upstream's
         // literal fallback is what the ledger carries. Was cyrup's own invented
         // "verify command exceeded its 100ms timeout and was terminated".
-        assert_eq!(result.stderr.as_deref(), Some(crate::exec::acceptance::model::VERIFY_TIMED_OUT_MESSAGE));
+        assert_eq!(
+            result.stderr.as_deref(),
+            Some(crate::exec::acceptance::model::VERIFY_TIMED_OUT_MESSAGE)
+        );
     }
-
 
     // ---------------------------------------------------------------------------------------
     // SUBA-027 regression: a timed-out verify[] command must be KILLED, never abandoned.
@@ -778,7 +818,6 @@ mod tests {
         }
     }
 
-
     /// Poll for `path` to contain a parseable pid, up to `timeout`.
     #[cfg(unix)]
     async fn wait_for_published_pid(path: &std::path::Path, timeout: Duration) -> i32 {
@@ -797,7 +836,6 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
-
 
     /// The headline SUBA-027 assertion: after the timeout elapses, the command's own OS process
     /// is gone. `exec` is load-bearing in the fixture — a shell that merely *forks* `sleep` would
@@ -822,7 +860,6 @@ mod tests {
              timed-out command has to be killed, not abandoned"
         );
     }
-
 
     /// SUBA-028 — a CANCELLED run's acceptance verification stops now, not after a full
     /// per-command `timeoutMs` (pi's `options.signal` → `abortVerification`,
@@ -857,13 +894,24 @@ mod tests {
         };
 
         let started = std::time::Instant::now();
-        let result =
-            crate::exec::acceptance::model::run_verify_command_with_cancel(&command, dir.path(), &cancel).await;
+        let result = crate::exec::acceptance::model::run_verify_command_with_cancel(
+            &command,
+            dir.path(),
+            &cancel,
+        )
+        .await;
         let elapsed = started.elapsed();
         let pid = canceller.await.expect("canceller task");
 
-        assert!(!passed(&result), "an aborted command never passes: {result:?}");
-        assert_eq!(result.status, crate::exec::acceptance::model::VerifyRunStatus::TimedOut, "{result:?}");
+        assert!(
+            !passed(&result),
+            "an aborted command never passes: {result:?}"
+        );
+        assert_eq!(
+            result.status,
+            crate::exec::acceptance::model::VerifyRunStatus::TimedOut,
+            "{result:?}"
+        );
         assert!(
             elapsed < Duration::from_secs(10),
             "the cancel must end the command promptly, not at its own 30s deadline: {elapsed:?}"
@@ -874,7 +922,6 @@ mod tests {
              its timeout path"
         );
     }
-
 
     /// Group targeting is the whole reason `send_signal` negates the pid: the command's own
     /// descendants must die with it. Here the shell stays alive in `wait` while a background
@@ -887,7 +934,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let descendant_pid_file = dir.path().join("descendant");
         let result = run_one_verify_command(
-            &vc_timeout("sleep 300 & echo $! > descendant; wait", Duration::from_millis(200)),
+            &vc_timeout(
+                "sleep 300 & echo $! > descendant; wait",
+                Duration::from_millis(200),
+            ),
             dir.path(),
         )
         .await;
@@ -900,7 +950,6 @@ mod tests {
              targets the command's process GROUP, not just its direct pid"
         );
     }
-
 
     /// SUBA-027 regression: a verify command that EXITS PROMPTLY but leaves a backgrounded
     /// descendant holding the inherited stdout/stderr must still return inside its own timeout.
@@ -945,7 +994,10 @@ mod tests {
             "a command whose pipes outlive its own timeout is reported as a timeout, exactly as \
              upstream's abortVerification does, never as a pass"
         );
-        assert_eq!(result.status, crate::exec::acceptance::model::VerifyRunStatus::TimedOut);
+        assert_eq!(
+            result.status,
+            crate::exec::acceptance::model::VerifyRunStatus::TimedOut
+        );
         let error = result.stderr.clone().unwrap_or_default();
         assert_eq!(
             error,
@@ -966,7 +1018,6 @@ mod tests {
             .args(["-KILL", &pid.to_string()])
             .status();
     }
-
 
     /// The hard `SIGKILL` rung really fires: a command that traps and ignores `SIGTERM` cannot be
     /// stopped by upstream's first `child.kill(\"SIGTERM\")`, only by the 1000 ms-later
@@ -1003,7 +1054,6 @@ mod tests {
         );
     }
 
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_declared_cwd_resolves_against_the_run_level_cwd() {
         // `command.cwd ? path.resolve(defaultCwd, command.cwd) : defaultCwd` (`acceptance.ts:1137`).
@@ -1027,7 +1077,6 @@ mod tests {
         assert!(!passed(&undeclared));
     }
 
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn declared_env_is_layered_over_the_inherited_environment() {
         // `env: { ...process.env, ...(command.env ?? {}) }` (`acceptance.ts:724`) — the declared
@@ -1046,9 +1095,11 @@ mod tests {
 
         let undeclared =
             run_one_verify_command(&vc(r#"test "$CYRUP_VERIFY_MARKER" = 1"#), dir.path()).await;
-        assert!(!passed(&undeclared), "the marker must come from the declared env, not the harness");
+        assert!(
+            !passed(&undeclared),
+            "the marker must come from the declared env, not the harness"
+        );
     }
-
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_declared_timeout_ms_bounds_the_command_instead_of_the_default() {
@@ -1062,14 +1113,16 @@ mod tests {
         let result = run_one_verify_command(&declared, dir.path()).await;
         let elapsed = started.elapsed();
 
-        assert_eq!(result.status, crate::exec::acceptance::model::VerifyRunStatus::TimedOut);
+        assert_eq!(
+            result.status,
+            crate::exec::acceptance::model::VerifyRunStatus::TimedOut
+        );
         assert!(
             elapsed < Duration::from_secs(20),
             "a declared 150ms timeoutMs must bound the command, not DEFAULT_VERIFY_TIMEOUT — took \
              {elapsed:?}"
         );
     }
-
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn allow_failure_maps_a_nonzero_exit_to_allowed_failure_and_does_not_reject() {
@@ -1083,12 +1136,21 @@ mod tests {
         };
         let result = run_one_verify_command(&declared, dir.path()).await;
 
-        assert_eq!(result.exit_code, Some(1), "the real exit code is still observed");
+        assert_eq!(
+            result.exit_code,
+            Some(1),
+            "the real exit code is still observed"
+        );
         assert!(!passed(&result), "the raw exit observation stays false");
-        assert_eq!(result.status, crate::exec::acceptance::model::VerifyRunStatus::AllowedFailure);
-        assert!(!result.rejects(), "an allowed-failure command must not reject the run");
+        assert_eq!(
+            result.status,
+            crate::exec::acceptance::model::VerifyRunStatus::AllowedFailure
+        );
+        assert!(
+            !result.rejects(),
+            "an allowed-failure command must not reject the run"
+        );
     }
-
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn allow_failure_never_rescues_a_timed_out_command() {
@@ -1103,17 +1165,23 @@ mod tests {
         };
         let result = run_one_verify_command(&declared, dir.path()).await;
 
-        assert_eq!(result.status, crate::exec::acceptance::model::VerifyRunStatus::TimedOut);
-        assert!(result.rejects(), "a timeout rejects regardless of allowFailure");
+        assert_eq!(
+            result.status,
+            crate::exec::acceptance::model::VerifyRunStatus::TimedOut
+        );
+        assert!(
+            result.rejects(),
+            "a timeout rejects regardless of allowFailure"
+        );
     }
-
 
     /// Inference tops out at `Checked` now that `reviewed` is not a level — the escalation lives on
     /// the contract's `review` gate instead. A risky/write task must therefore still arm a REAL
     /// gate, not silently drop to a weaker one.
     #[test]
     fn heuristic_inference_tops_out_at_checked_with_a_required_review_gate() {
-        let contract = AcceptanceContract::heuristic_default("worker", "Prepare the security release");
+        let contract =
+            AcceptanceContract::heuristic_default("worker", "Prepare the security release");
         assert_eq!(contract.required_level, AcceptanceStatus::Checked);
         assert!(matches!(
             &contract.review,
@@ -1121,5 +1189,4 @@ mod tests {
                 && gate.agent.as_deref() == Some("reviewer")
         ));
     }
-
 }

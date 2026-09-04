@@ -1,7 +1,7 @@
 //! Every fixed string the `subagent` tool advertises or refuses with, plus the action table and
 //! the fuzzy-match used to suggest a near-miss action.
 
-use crate::background::{run_status, RunState};
+use crate::background::{RunState, run_status};
 
 /// The `subagent` tool's full multi-section description (R-SA-128, C8) — ported verbatim from
 /// pi-subagents' registered tool description (`src/extension/index.ts:461-495`), the string the LLM
@@ -87,7 +87,8 @@ pub(crate) const STOP_NESTED_RUN_REFUSAL: &str =
 /// is restored here with `run_status::resolve_run_id` — an id that resolves to nothing in this
 /// session's async namespace is upstream's "no target", and an id that resolves but reconciles
 /// non-actionable is upstream's "not running or queued".
-pub(crate) const STOP_NO_STOPPABLE_RUN_REFUSAL: &str = "No stoppable async run found in this session.";
+pub(crate) const STOP_NO_STOPPABLE_RUN_REFUSAL: &str =
+    "No stoppable async run found in this session.";
 
 /// SUBA-057 — pi's *"is `<state>`, not running."* refusal, which
 /// `dismissRecoveredWorkflow` spells THREE times with identical text
@@ -172,7 +173,8 @@ pub(crate) const STEER_ACK_TIMEOUT: std::time::Duration = std::time::Duration::f
 /// How often the ack wait re-reads the directory. Deliberately finer than the child's own 250 ms
 /// write cadence so the answer is reported in the poll after it lands rather than up to a full
 /// child-interval later.
-pub(crate) const STEER_ACK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+pub(crate) const STEER_ACK_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(25);
 
 /// Read-only accessor for [`SUBAGENT_ACTIONS`], so other modules can assert against the ONE list
 /// without it becoming writable or duplicable. Added for SUBA-055's
@@ -221,6 +223,10 @@ pub(crate) const SUBAGENT_ACTIONS: &[&str] = &[
     "mission.list",
     "mission.show",
     "mission.update",
+    // SUBA-085 — pi's own position for this verb (`shared/types.ts:2715` @v0.64.0: `…
+    // "mission.update", "mission.resolve-decision", "mission.attach-run", …`). Dispatched by the
+    // `mission.*` arm through `MissionAction::ResolveDecision`.
+    "mission.resolve-decision",
     "mission.attach-run",
     "mission.close",
     "watchdog.status",
@@ -346,7 +352,9 @@ pub(crate) fn unknown_subagent_action_message(action: &str) -> String {
     let valid_actions = format!("Valid: {}.", SUBAGENT_ACTIONS.join(", "));
     match suggestion {
         Some(candidate) => {
-            format!("Unknown action: {action}. Did you mean {candidate}? {next_step} {valid_actions}")
+            format!(
+                "Unknown action: {action}. Did you mean {candidate}? {next_step} {valid_actions}"
+            )
         }
         None => format!("Unknown action: {action}. {next_step} {valid_actions}"),
     }
@@ -360,7 +368,12 @@ pub(crate) const BLANK_ACTION_REFUSAL: &str = "action must be a non-empty manage
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
     use crate::extension::executor::SubagentExecutor;
@@ -448,10 +461,19 @@ mod tests {
     fn the_unknown_action_message_suggests_safely() {
         // A near miss on a SAFE verb is suggested.
         let statu = unknown_subagent_action_message("statu");
-        assert!(statu.starts_with("Unknown action: statu. Did you mean status?"), "{statu}");
+        assert!(
+            statu.starts_with("Unknown action: statu. Did you mean status?"),
+            "{statu}"
+        );
         // …and the message always carries the next-step hint and the full valid list.
-        assert!(statu.contains(r#"Use subagent({ action: "status" }) to inspect runs"#), "{statu}");
-        assert!(statu.ends_with(&format!("Valid: {}.", SUBAGENT_ACTIONS.join(", "))), "{statu}");
+        assert!(
+            statu.contains(r#"Use subagent({ action: "status" }) to inspect runs"#),
+            "{statu}"
+        );
+        assert!(
+            statu.ends_with(&format!("Valid: {}.", SUBAGENT_ACTIONS.join(", "))),
+            "{statu}"
+        );
 
         // A transposition Levenshtein scores 2 is still caught, on a safe verb.
         let statsu = unknown_subagent_action_message("statsu");
@@ -496,7 +518,13 @@ mod tests {
             .iter()
             .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
             .collect();
-        assert_eq!(advertised, SUBAGENT_ACTIONS.iter().map(|a| (*a).to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            advertised,
+            SUBAGENT_ACTIONS
+                .iter()
+                .map(|a| (*a).to_string())
+                .collect::<Vec<_>>()
+        );
     }
 
     /// SUBA-065's two primitives, pinned against upstream's own algorithms so a later refactor of
@@ -514,7 +542,10 @@ mod tests {
 
         assert!(has_single_adjacent_transposition("statsu", "status"));
         assert!(!has_single_adjacent_transposition("status", "status"));
-        assert!(!has_single_adjacent_transposition("statu", "status"), "different lengths");
+        assert!(
+            !has_single_adjacent_transposition("statu", "status"),
+            "different lengths"
+        );
         // `acb` and `abc` differ only by the adjacent swap at index 1.
         assert!(has_single_adjacent_transposition("acb", "abc"));
         // A mismatch at the FINAL index has no adjacent partner to swap with.
@@ -539,9 +570,12 @@ mod tests {
         let tool = scoped_tool(dir.path()).await;
 
         // An id naming NOTHING: upstream's `stopAsyncRun` → `null` fallback (`:4812`).
-        let err = dispatch_tool(&tool, serde_json::json!({ "action": "stop", "id": "nosuchrun001" }))
-            .await
-            .expect_err("an unknown run must be refused");
+        let err = dispatch_tool(
+            &tool,
+            serde_json::json!({ "action": "stop", "id": "nosuchrun001" }),
+        )
+        .await
+        .expect_err("an unknown run must be refused");
         assert!(
             err.to_string().contains(STOP_NO_STOPPABLE_RUN_REFUSAL),
             "an id that resolves to no run at all never reaches `stopAsyncRun`'s running/queued \
@@ -583,7 +617,8 @@ mod tests {
             .await
             .expect_err("a selector-less stop must be refused, never defaulted");
         assert!(
-            err.to_string().contains("action='stop' requires id or dir."),
+            err.to_string()
+                .contains("action='stop' requires id or dir."),
             "a stop is unrecoverable; guessing a target is exactly what upstream refuses: {err}"
         );
     }
@@ -604,7 +639,10 @@ mod tests {
             .iter()
             .position(|v| *v == "stop")
             .expect("`stop` must be an advertised action");
-        let steer_at = action_values.iter().position(|v| *v == "steer").expect("steer");
+        let steer_at = action_values
+            .iter()
+            .position(|v| *v == "steer")
+            .expect("steer");
         let append_at = action_values
             .iter()
             .position(|v| *v == "append-step")
@@ -658,9 +696,8 @@ mod tests {
     #[test]
     fn the_advertised_description_honours_the_configured_mode_and_the_file_override() {
         use crate::registration::tool_description::{
-            build_subagent_tool_description, ToolDescriptionOptions,
             COMPACT_SUBAGENT_TOOL_DESCRIPTION, CUSTOM_TOOL_DESCRIPTION_FILE,
-            SUBAGENT_SAFETY_GUIDANCE,
+            SUBAGENT_SAFETY_GUIDANCE, ToolDescriptionOptions, build_subagent_tool_description,
         };
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -686,7 +723,10 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "toolDescriptionMode": "compact" }))
                 .expect("config parses");
         assert_eq!(
-            config.tool_description_mode.as_ref().and_then(|v| v.as_str()),
+            config
+                .tool_description_mode
+                .as_ref()
+                .and_then(|v| v.as_str()),
             Some("compact")
         );
 
@@ -818,13 +858,25 @@ mod tests {
         )
         .await
         .expect_err("a blank message must be refused");
-        assert!(blank.to_string().contains("action='steer' requires message."), "{blank}");
+        assert!(
+            blank
+                .to_string()
+                .contains("action='steer' requires message."),
+            "{blank}"
+        );
 
-        let no_target =
-            dispatch_tool(&tool, serde_json::json!({ "action": "steer", "message": "go" }))
-                .await
-                .expect_err("no id and no dir must be refused");
-        assert!(no_target.to_string().contains("action='steer' requires id or dir."), "{no_target}");
+        let no_target = dispatch_tool(
+            &tool,
+            serde_json::json!({ "action": "steer", "message": "go" }),
+        )
+        .await
+        .expect_err("no id and no dir must be refused");
+        assert!(
+            no_target
+                .to_string()
+                .contains("action='steer' requires id or dir."),
+            "{no_target}"
+        );
 
         let out_of_range = dispatch_tool(
             &tool,
@@ -848,7 +900,9 @@ mod tests {
         .await
         .expect_err("an unresolvable run must be refused");
         assert!(
-            missing.to_string().contains("No async run found for 'nosuchrun0001'."),
+            missing
+                .to_string()
+                .contains("No async run found for 'nosuchrun0001'."),
             "an unresolvable id must be reported as NOT FOUND, not as a run whose directory went \
              missing; got: {missing}"
         );
@@ -856,7 +910,8 @@ mod tests {
         // `steerAsyncRun:3580` — the id DOES resolve (its run directory exists) but the run has
         // neither a status nor a result file, so there is nothing live to steer. This is the case
         // the message quoted below actually describes, and the only one it should ever cover.
-        let hollow = default_async_root_in(&crate::paths::Roots::from_env(), dir.path()).join("hollowrun0001");
+        let hollow = default_async_root_in(&crate::paths::Roots::from_env(), dir.path())
+            .join("hollowrun0001");
         std::fs::create_dir_all(&hollow).expect("mkdir hollow run dir");
         let no_dir = dispatch_tool(
             &tool,
@@ -865,7 +920,9 @@ mod tests {
         .await
         .expect_err("a resolvable run with no live state must be refused");
         assert!(
-            no_dir.to_string().contains("has no live run directory to steer."),
+            no_dir
+                .to_string()
+                .contains("has no live run directory to steer."),
             "{no_dir}"
         );
 
@@ -910,5 +967,4 @@ mod tests {
              interrupt/resume — not a claim that the run does not exist"
         );
     }
-
 }

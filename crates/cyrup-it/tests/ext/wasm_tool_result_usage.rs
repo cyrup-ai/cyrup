@@ -12,7 +12,12 @@
 //!   * the guest OBSERVES the usage it was handed (and observes its absence as `none`), and
 //!   * the guest PATCHES it back — Pi `ToolResultEventResult.usage` (types.ts:1085-1090) replaces
 //!     the recorded usage wholesale — with a value DERIVED from what it received.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use crate::fixture;
 
@@ -22,7 +27,12 @@ use serde_json::json;
 use std::sync::Arc;
 
 fn probe_usage() -> Usage {
-    Usage { input: 5, output: 7, total_tokens: 12, ..Default::default() }
+    Usage {
+        input: 5,
+        output: 7,
+        total_tokens: 12,
+        ..Default::default()
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -74,8 +84,14 @@ async fn the_live_guest_reads_and_patches_the_re_signed_tool_result_usage() {
         Reduced::Pass(ev) => match *ev {
             HostEvent::ToolResult { usage, .. } => {
                 let usage = usage.expect("the guest's usage patch is applied, not dropped");
-                assert_eq!(usage.output, 14, "the guest doubled the `output` it received");
-                assert_eq!(usage.input, 5, "the rest of the echoed payload survived the round trip");
+                assert_eq!(
+                    usage.output, 14,
+                    "the guest doubled the `output` it received"
+                );
+                assert_eq!(
+                    usage.input, 5,
+                    "the rest of the echoed payload survived the round trip"
+                );
             }
             other => panic!("expected a ToolResult event back, got {other:?}"),
         },
@@ -103,7 +119,9 @@ async fn the_live_guest_reads_and_patches_the_re_signed_tool_result_usage() {
 
     let notes = ext.guest().notifications();
     assert!(
-        notes.iter().any(|n| n.contains("tool_result read usage=none")),
+        notes
+            .iter()
+            .any(|n| n.contains("tool_result read usage=none")),
         "an absent usage-json reaches the guest as absent: {notes:?}"
     );
     match reduced {

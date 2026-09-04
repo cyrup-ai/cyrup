@@ -66,7 +66,11 @@ impl Platform {
     /// The platform this binary was compiled for (pi's `process.platform` default parameter).
     #[must_use]
     pub const fn current() -> Self {
-        if cfg!(windows) { Self::Windows } else { Self::Unix }
+        if cfg!(windows) {
+            Self::Windows
+        } else {
+            Self::Unix
+        }
     }
 
     /// Whether this is pi's `"win32"`.
@@ -104,7 +108,10 @@ impl BrokerTcpEndpoint {
         if let Some(state_id) = &self.state_id
             && let Some(obj) = value.as_object_mut()
         {
-            obj.insert("stateId".to_string(), serde_json::Value::String(state_id.clone()));
+            obj.insert(
+                "stateId".to_string(),
+                serde_json::Value::String(state_id.clone()),
+            );
         }
         format!("{value}\n")
     }
@@ -173,7 +180,11 @@ fn sanitize_pipe_segment(value: &str) -> String {
         }
     }
     let out = out.to_lowercase();
-    if out.is_empty() { "default".to_string() } else { out }
+    if out.is_empty() {
+        "default".to_string()
+    } else {
+        out
+    }
 }
 
 /// `shouldUseWindowsTcpTransport` (`paths.ts:44-59`): TCP is Windows-only **and** opt-in —
@@ -266,7 +277,9 @@ pub fn broker_connect_target_in(
         let parsed: serde_json::Value = serde_json::from_str(&raw)?;
         return parse_tcp_endpoint(&parsed, &endpoint_file).map(BrokerConnectTarget::Tcp);
     }
-    Ok(BrokerConnectTarget::Socket(broker_socket_path_for(platform, agent_dir)))
+    Ok(BrokerConnectTarget::Socket(broker_socket_path_for(
+        platform, agent_dir,
+    )))
 }
 
 /// [`broker_connect_target_in`] with `intercom_dir` derived from `agent_dir`, mirroring upstream's
@@ -317,7 +330,10 @@ pub fn broker_listen_target(agent_dir: &Path) -> BrokerConnectTarget {
 }
 
 /// The `broker.port.json` validation ladder (`paths.ts:85-100`), error text byte-for-byte.
-fn parse_tcp_endpoint(parsed: &serde_json::Value, endpoint_file: &Path) -> Result<BrokerTcpEndpoint> {
+fn parse_tcp_endpoint(
+    parsed: &serde_json::Value,
+    endpoint_file: &Path,
+) -> Result<BrokerTcpEndpoint> {
     // `typeof parsed !== "object" || parsed === null || Array.isArray(parsed)` (paths.ts:85).
     let Some(endpoint) = parsed.as_object() else {
         return Err(IntercomError::Broker(format!(
@@ -332,7 +348,11 @@ fn parse_tcp_endpoint(parsed: &serde_json::Value, endpoint_file: &Path) -> Resul
         ))
     };
 
-    if endpoint.get("transport").and_then(serde_json::Value::as_str) != Some("tcp") {
+    if endpoint
+        .get("transport")
+        .and_then(serde_json::Value::as_str)
+        != Some("tcp")
+    {
         return Err(invalid());
     }
     // `endpoint.host !== INTERCOM_TCP_HOST` (paths.ts:91) — loopback only; a routable host is a
@@ -366,18 +386,29 @@ fn parse_tcp_endpoint(parsed: &serde_json::Value, endpoint_file: &Path) -> Resul
         _ => return Err(invalid()),
     };
 
-    Ok(BrokerTcpEndpoint { host: host.to_string(), port, state_id: Some(state_id) })
+    Ok(BrokerTcpEndpoint {
+        host: host.to_string(),
+        port,
+        state_id: Some(state_id),
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
     use super::*;
 
     /// The env-closure form of pi's plain `{ ... }` env object literal.
     fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
-        let owned: Vec<(String, String)> =
-            pairs.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect();
+        let owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
         move |key: &str| owned.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
     }
 
@@ -433,7 +464,10 @@ mod tests {
             Platform::Unix,
             env_of(&[(ENV_INTERCOM_TRANSPORT, "tcp")])
         ));
-        assert!(!should_use_windows_tcp_transport(Platform::Unix, env_of(&[(ENV_INTERCOM_TCP, "1")])));
+        assert!(!should_use_windows_tcp_transport(
+            Platform::Unix,
+            env_of(&[(ENV_INTERCOM_TCP, "1")])
+        ));
     }
 
     /// `paths.ts:52,57-58` — both gates `.trim().toLowerCase()`, and the legacy var accepts only
@@ -548,13 +582,34 @@ mod tests {
         let port_file = broker_port_file_path(&intercom_dir);
 
         let cases: &[(&str, &str)] = &[
-            ("wrong transport", r#"{"transport":"pipe","host":"127.0.0.1","port":1,"stateId":"s"}"#),
-            ("port 0", r#"{"transport":"tcp","host":"127.0.0.1","port":0,"stateId":"s"}"#),
-            ("port too large", r#"{"transport":"tcp","host":"127.0.0.1","port":65536,"stateId":"s"}"#),
-            ("port not an integer", r#"{"transport":"tcp","host":"127.0.0.1","port":1.5,"stateId":"s"}"#),
-            ("port as string", r#"{"transport":"tcp","host":"127.0.0.1","port":"41234","stateId":"s"}"#),
-            ("missing stateId", r#"{"transport":"tcp","host":"127.0.0.1","port":41234}"#),
-            ("empty stateId", r#"{"transport":"tcp","host":"127.0.0.1","port":41234,"stateId":""}"#),
+            (
+                "wrong transport",
+                r#"{"transport":"pipe","host":"127.0.0.1","port":1,"stateId":"s"}"#,
+            ),
+            (
+                "port 0",
+                r#"{"transport":"tcp","host":"127.0.0.1","port":0,"stateId":"s"}"#,
+            ),
+            (
+                "port too large",
+                r#"{"transport":"tcp","host":"127.0.0.1","port":65536,"stateId":"s"}"#,
+            ),
+            (
+                "port not an integer",
+                r#"{"transport":"tcp","host":"127.0.0.1","port":1.5,"stateId":"s"}"#,
+            ),
+            (
+                "port as string",
+                r#"{"transport":"tcp","host":"127.0.0.1","port":"41234","stateId":"s"}"#,
+            ),
+            (
+                "missing stateId",
+                r#"{"transport":"tcp","host":"127.0.0.1","port":41234}"#,
+            ),
+            (
+                "empty stateId",
+                r#"{"transport":"tcp","host":"127.0.0.1","port":41234,"stateId":""}"#,
+            ),
         ];
         for (label, body) in cases {
             std::fs::write(&port_file, body).unwrap();
@@ -574,8 +629,11 @@ mod tests {
         }
 
         // MIRROR (stays green): the same ladder accepts the one well-formed body.
-        std::fs::write(&port_file, r#"{"transport":"tcp","host":"127.0.0.1","port":65535,"stateId":"s"}"#)
-            .unwrap();
+        std::fs::write(
+            &port_file,
+            r#"{"transport":"tcp","host":"127.0.0.1","port":65535,"stateId":"s"}"#,
+        )
+        .unwrap();
         assert!(
             broker_connect_target_in(
                 Platform::Windows,
@@ -629,8 +687,15 @@ mod tests {
             root.path(),
         )
         .expect("the unix branch never fails");
-        assert_eq!(target, BrokerConnectTarget::Socket(intercom_dir.join("broker.sock")));
-        assert_eq!(target.state_id(), None, "a socket target never carries a stateId");
+        assert_eq!(
+            target,
+            BrokerConnectTarget::Socket(intercom_dir.join("broker.sock"))
+        );
+        assert_eq!(
+            target.state_id(),
+            None,
+            "a socket target never carries a stateId"
+        );
         assert!(target.is_trusted_local(Platform::Unix), "broker.ts:196");
     }
 
@@ -644,12 +709,18 @@ mod tests {
             state_id: Some("state-1".to_string()),
         };
         let body = endpoint.to_port_file_body();
-        assert!(body.ends_with('\n'), "broker.ts:79 writes a trailing newline");
+        assert!(
+            body.ends_with('\n'),
+            "broker.ts:79 writes a trailing newline"
+        );
         let value: serde_json::Value = serde_json::from_str(body.trim_end()).unwrap();
         assert_eq!(value["transport"], "tcp");
         assert_eq!(value["host"], "127.0.0.1");
         assert_eq!(value["port"], 41234);
         assert_eq!(value["stateId"], "state-1");
-        assert_eq!(parse_tcp_endpoint(&value, Path::new("/x")).unwrap(), endpoint);
+        assert_eq!(
+            parse_tcp_endpoint(&value, Path::new("/x")).unwrap(),
+            endpoint
+        );
     }
 }

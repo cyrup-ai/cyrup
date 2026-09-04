@@ -186,7 +186,12 @@ impl Ui {
     /// Text input dialog with a placeholder and a [`DialogOptions`] bag (Pi
     /// `input(title, placeholder, {timeout, signal})`, rpc-types.ts:241-248 @v0.83.0); forwarded live to the
     /// renderer. `placeholder = None` omits the wire field entirely, matching Pi's optional field.
-    pub fn input_with(&self, prompt: &str, placeholder: Option<&str>, opts: &DialogOptions) -> Option<String> {
+    pub fn input_with(
+        &self,
+        prompt: &str,
+        placeholder: Option<&str>,
+        opts: &DialogOptions,
+    ) -> Option<String> {
         let opts_json = serde_json::to_string(opts).unwrap_or_else(|_| "{}".into());
         #[cfg(target_arch = "wasm32")]
         {
@@ -204,12 +209,21 @@ impl Ui {
         self.select_with(prompt, options, &DialogOptions::default())
     }
     /// Single-choice select with a [`DialogOptions`] bag (Pi `select(title, options, {timeout, signal})`).
-    pub fn select_with(&self, prompt: &str, options: &[&str], opts: &DialogOptions) -> Option<String> {
+    pub fn select_with(
+        &self,
+        prompt: &str,
+        options: &[&str],
+        opts: &DialogOptions,
+    ) -> Option<String> {
         let options_json = serde_json::to_string(options).unwrap_or_else(|_| "[]".into());
         let opts_json = serde_json::to_string(opts).unwrap_or_else(|_| "{}".into());
         #[cfg(target_arch = "wasm32")]
         {
-            return crate::guest::bindings::cyrup::ext::ui::select(prompt, &options_json, &opts_json);
+            return crate::guest::bindings::cyrup::ext::ui::select(
+                prompt,
+                &options_json,
+                &opts_json,
+            );
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -419,7 +433,8 @@ impl Ui {
     pub fn theme_by_name(&self, name: &str) -> Option<Value> {
         #[cfg(target_arch = "wasm32")]
         {
-            return crate::guest::bindings::cyrup::ext::ui::theme_get_by_name(name).map(super::parse_json);
+            return crate::guest::bindings::cyrup::ext::ui::theme_get_by_name(name)
+                .map(super::parse_json);
         }
         #[cfg(not(target_arch = "wasm32"))]
         {

@@ -14,15 +14,15 @@
 
 use std::io::{self, Stdout};
 
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::crossterm::ExecutableCommand;
 use ratatui::crossterm::cursor::Show;
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use ratatui::crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use ratatui::crossterm::ExecutableCommand;
 use ratatui::layout::Rect;
-use ratatui::Terminal;
 
 use crate::error::TuiError;
 use crate::keymap::SelectKeymap;
@@ -99,7 +99,12 @@ async fn run_loop(
                 // window correct across a resize; it is a no-op for every other selector.
                 inner.set_terminal_height(area.height);
                 let height = inner.desired_height(area.width).min(area.height).max(1);
-                let slot = Rect { x: area.x, y: area.y, width: area.width, height };
+                let slot = Rect {
+                    x: area.x,
+                    y: area.y,
+                    width: area.width,
+                    height,
+                };
                 inner.render(frame, slot, theme);
             })
             .map_err(|e| TuiError::Backend(e.to_string()))?;

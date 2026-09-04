@@ -1,14 +1,14 @@
 //! Response decoding — streamed tool-call deltas and block finalization (Pi
 //! mistral-conversations.ts:418-482).
 
+use super::decoder::{CurrentKind, Decoder};
+use super::tool_call_id::derive_mistral_tool_call_id;
 use crate::api::EventSink;
 use crate::model::Model;
 use crate::stream::StreamEvent;
 use crate::utils::json_parse::parse_streaming_json_object;
 use cyrup_core::{ApiId, Content, ToolCall, ToolCallId};
 use serde_json::{Map, Value};
-use super::decoder::{CurrentKind, Decoder};
-use super::tool_call_id::derive_mistral_tool_call_id;
 
 /// Handle one streamed tool-call delta (Pi mistral-conversations.ts:418-464).
 pub(super) async fn process_tool_call(
@@ -87,7 +87,12 @@ pub(super) async fn process_tool_call(
 }
 
 /// Emit the `*_end` for the in-progress text/thinking block, if any.
-pub(super) async fn close_current(dec: &mut Decoder, model: &Model, api: &ApiId, sink: &EventSink) -> bool {
+pub(super) async fn close_current(
+    dec: &mut Decoder,
+    model: &Model,
+    api: &ApiId,
+    sink: &EventSink,
+) -> bool {
     let Some(kind) = dec.current.take() else {
         return true;
     };

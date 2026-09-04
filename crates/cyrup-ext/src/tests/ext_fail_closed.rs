@@ -18,26 +18,30 @@
 //! flag is still `false`. The final test pins the other direction — a handler that DECLINED to block
 //! (returned `Noop`) is not a fault and the tool still runs.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use cyrup_agent::{Agent, AgentEvent, AgentMessage, EventSubscriber, ProviderStreamFn, StreamFn};
-use cyrup_core::{
-    TerminateHint,
-    CancelToken, Content, ExtensionId, ModelRef, StopReason, Tool, ToolCallId, ToolError,
-    ToolResult, ToolUpdateSink,
-};
 use crate::{
-    Dispatcher, EventKind, ExtError, ExtHooks, ExtMode, Extension, ExtKind, ExtensionError,
+    Dispatcher, EventKind, ExtError, ExtHooks, ExtKind, ExtMode, Extension, ExtensionError,
     ExtensionHost, HookOutcome, HostConfig, HostCtx, HostEvent, InitApi, NativeExtension,
     NativeHandle, Reduced, Subscriptions,
 };
-use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call, FauxProvider};
+use cyrup_agent::{Agent, AgentEvent, AgentMessage, EventSubscriber, ProviderStreamFn, StreamFn};
+use cyrup_core::{
+    CancelToken, Content, ExtensionId, ModelRef, StopReason, TerminateHint, Tool, ToolCallId,
+    ToolError, ToolResult, ToolUpdateSink,
+};
 use cyrup_provider::Provider;
-use serde_json::{json, Value};
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text, faux_tool_call};
+use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
 // Harness: a tool that records whether it ran, plus a scripted one-tool-call agent turn.
@@ -54,7 +58,13 @@ impl TripwireTool {
     fn new() -> (Arc<Self>, Arc<AtomicBool>) {
         let ran = Arc::new(AtomicBool::new(false));
         let params = json!({ "type": "object", "properties": {}, "additionalProperties": true });
-        (Arc::new(Self { params, ran: ran.clone() }), ran)
+        (
+            Arc::new(Self {
+                params,
+                ran: ran.clone(),
+            }),
+            ran,
+        )
     }
 }
 
@@ -74,7 +84,12 @@ impl Tool for TripwireTool {
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
         self.ran.store(true, Ordering::SeqCst);
-        Ok(ToolResult { content: vec![Content::text("executed")], details: None, terminate: TerminateHint::Unspecified, ..Default::default() })
+        Ok(ToolResult {
+            content: vec![Content::text("executed")],
+            details: None,
+            terminate: TerminateHint::Unspecified,
+            ..Default::default()
+        })
     }
 }
 
@@ -99,9 +114,9 @@ impl Recorder {
         events
             .iter()
             .find_map(|e| match e {
-                AgentEvent::MessageStart { message: AgentMessage::ToolResult(t) } => {
-                    Some(t.clone())
-                }
+                AgentEvent::MessageStart {
+                    message: AgentMessage::ToolResult(t),
+                } => Some(t.clone()),
                 _ => None,
             })
             .expect("a tool-result message")
@@ -109,14 +124,21 @@ impl Recorder {
 }
 
 fn model_ref() -> ModelRef {
-    ModelRef { provider: "faux".into(), api: Some("faux".into()), model: "faux-1".into() }
+    ModelRef {
+        provider: "faux".into(),
+        api: Some("faux".into()),
+        model: "faux-1".into(),
+    }
 }
 
 /// Script one assistant turn that calls `danger`, then a plain text turn so the loop terminates.
 fn one_tool_call_stream_fn() -> Arc<dyn StreamFn> {
     let faux = Arc::new(FauxProvider::new());
     faux.set_responses(vec![
-        faux_assistant_message(vec![faux_tool_call("danger", json!({}))], StopReason::ToolUse),
+        faux_assistant_message(
+            vec![faux_tool_call("danger", json!({}))],
+            StopReason::ToolUse,
+        ),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
     ]);
     let provider: Arc<dyn Provider> = faux;
@@ -139,11 +161,18 @@ async fn run_with_hooks(hooks: Arc<dyn cyrup_agent::Hooks>) -> (bool, Arc<Record
 }
 
 fn cfg() -> HostConfig {
-    HostConfig { mode: ExtMode::Tui, has_ui: true, cwd: std::path::PathBuf::from(".") }
+    HostConfig {
+        mode: ExtMode::Tui,
+        has_ui: true,
+        cwd: std::path::PathBuf::from("."),
+    }
 }
 
 fn assert_blocked(result: &cyrup_agent::ToolResultMessage) {
-    assert!(result.is_error, "a fault-blocked call yields an isError tool result");
+    assert!(
+        result.is_error,
+        "a fault-blocked call yields an isError tool result"
+    );
     let text = match &result.content[0] {
         Content::Text { text, .. } => text.to_string(),
         other => panic!("expected text content, got {other:?}"),
@@ -181,7 +210,10 @@ async fn ext001_panicking_tool_call_handler_blocks_the_tool() {
 
     let (tool_ran, recorder) = run_with_hooks(host.hooks()).await;
 
-    assert!(!tool_ran, "EXT-001: a panicking tool_call gate must NOT let the tool execute");
+    assert!(
+        !tool_ran,
+        "EXT-001: a panicking tool_call gate must NOT let the tool execute"
+    );
     assert_blocked(&recorder.tool_result());
 }
 
@@ -230,7 +262,10 @@ async fn ext001_erroring_tool_call_handler_blocks_the_tool() {
     let hooks: Arc<dyn cyrup_agent::Hooks> = Arc::new(ExtHooks::new(dispatcher));
     let (tool_ran, recorder) = run_with_hooks(hooks).await;
 
-    assert!(!tool_ran, "EXT-001: a trapping tool_call gate must NOT let the tool execute");
+    assert!(
+        !tool_ran,
+        "EXT-001: a trapping tool_call gate must NOT let the tool execute"
+    );
     assert_blocked(&recorder.tool_result());
 }
 
@@ -255,7 +290,10 @@ impl NativeExtension for RunawayGate {
     async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         // No human-wait guard held ⇒ a cooperative runaway, not a sanctioned human wait (P-3).
         tokio::time::sleep(self.wait).await;
-        HookOutcome::Block { reason: Some("never observed — budget fires first".into()), terminate: TerminateHint::Unspecified }
+        HookOutcome::Block {
+            reason: Some("never observed — budget fires first".into()),
+            terminate: TerminateHint::Unspecified,
+        }
     }
 }
 
@@ -266,7 +304,9 @@ async fn ext001_budget_exhausted_tool_call_handler_blocks_the_tool() {
     let ctx = HostCtx::event(ExtMode::Tui, true, std::path::PathBuf::from("."));
     dispatcher
         .add(Arc::new(NativeHandle::new(
-            Arc::new(RunawayGate { wait: Duration::from_millis(600) }),
+            Arc::new(RunawayGate {
+                wait: Duration::from_millis(600),
+            }),
             Subscriptions::empty().with(EventKind::ToolCall),
             ctx,
         )))
@@ -275,7 +315,10 @@ async fn ext001_budget_exhausted_tool_call_handler_blocks_the_tool() {
     let hooks: Arc<dyn cyrup_agent::Hooks> = Arc::new(ExtHooks::new(dispatcher));
     let (tool_ran, recorder) = run_with_hooks(hooks).await;
 
-    assert!(!tool_ran, "EXT-001: a budget-timed-out tool_call gate must NOT let the tool execute");
+    assert!(
+        !tool_ran,
+        "EXT-001: a budget-timed-out tool_call gate must NOT let the tool execute"
+    );
     assert_blocked(&recorder.tool_result());
 }
 
@@ -299,14 +342,22 @@ async fn ext001_fault_is_reported_and_blocked() {
     let reduced = host
         .dispatcher()
         .dispatch_block_mutate(
-            HostEvent::ToolCall { call_id: "t".into(), name: "danger".into(), input: json!({}) },
+            HostEvent::ToolCall {
+                call_id: "t".into(),
+                name: "danger".into(),
+                input: json!({}),
+            },
             &CancelToken::new(),
         )
         .await;
 
     match reduced {
         Reduced::Blocked { reason, by, .. } => {
-            assert_eq!(by.to_string(), "panicking-gate", "attributed to the faulting extension");
+            assert_eq!(
+                by.to_string(),
+                "panicking-gate",
+                "attributed to the faulting extension"
+            );
             let reason = reason.expect("a block reason");
             assert!(
                 reason.contains("Extension failed, blocking execution"),
@@ -317,7 +368,11 @@ async fn ext001_fault_is_reported_and_blocked() {
     }
 
     let got = captured.lock().unwrap().clone();
-    assert_eq!(got.len(), 1, "the fault is still reported to error listeners (R-08-036)");
+    assert_eq!(
+        got.len(),
+        1,
+        "the fault is still reported to error listeners (R-08-036)"
+    );
     assert_eq!(got[0].0, "panicking-gate");
     assert_eq!(got[0].1, "tool_call");
 }
@@ -350,8 +405,14 @@ async fn ext001_declining_to_block_still_executes_the_tool() {
 
     let (tool_ran, recorder) = run_with_hooks(host.hooks()).await;
 
-    assert!(tool_ran, "a gate that DECLINED to block is not a fault — the tool proceeds");
-    assert!(!recorder.tool_result().is_error, "and the result is not an error");
+    assert!(
+        tool_ran,
+        "a gate that DECLINED to block is not a fault — the tool proceeds"
+    );
+    assert!(
+        !recorder.tool_result().is_error,
+        "and the result is not an error"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -394,7 +455,12 @@ async fn a_faulting_context_handler_still_fails_open() {
 
     let reduced = host
         .dispatcher()
-        .dispatch_block_mutate(HostEvent::Context { messages: Vec::new() }, &CancelToken::new())
+        .dispatch_block_mutate(
+            HostEvent::Context {
+                messages: Vec::new(),
+            },
+            &CancelToken::new(),
+        )
         .await;
 
     assert!(

@@ -174,8 +174,10 @@ pub const KEYRING_HELPER_SUBCOMMAND: &str = "__mcp-keyring-helper";
 
 /// `PI_MCP_ADAPTER_TEST_AUTH_STORE` — the backend override, matched by **exact** string equality
 /// against `memory` | `sizelimited` | `unavailable` | `keyrevoked`.
-pub const TEST_AUTH_STORE_ENV: [&str; 2] =
-    ["CYRUP_MCP_TEST_AUTH_STORE", "PI_MCP_ADAPTER_TEST_AUTH_STORE"];
+pub const TEST_AUTH_STORE_ENV: [&str; 2] = [
+    "CYRUP_MCP_TEST_AUTH_STORE",
+    "PI_MCP_ADAPTER_TEST_AUTH_STORE",
+];
 
 /// `PI_MCP_ADAPTER_DISABLE_AUTH_CACHE` — `== "1"` disables. Any other value (`"true"`, `"0"`, empty)
 /// leaves the cache **enabled** (MCP-259).
@@ -382,7 +384,9 @@ pub enum AuthStoreError {
     /// `parseAuthEntryPayload`'s second throw — valid JSON, wrong shape. A wrong-typed *optional*
     /// field poisons the whole entry, a missing *required* field does the same, and a JSON array is
     /// rejected exactly as a scalar is (MCP-250).
-    #[error("Failed to parse OAuth credentials for {server} from {source_label}: invalid credential shape")]
+    #[error(
+        "Failed to parse OAuth credentials for {server} from {source_label}: invalid credential shape"
+    )]
     ParseShape {
         /// The `mcpServers` key.
         server: String,
@@ -565,7 +569,9 @@ impl fmt::Debug for StoredClientInfo {
 /// array yields "omit the field", **not** "reject the entry", because upstream's `stringArray` never
 /// returns `null`. This one field degrades silently, and reproducing that is the whole reason for a
 /// custom deserializer rather than a plain `Option<Vec<String>>`.
-fn deserialize_lenient_string_array<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+fn deserialize_lenient_string_array<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -1533,7 +1539,7 @@ fn run_recovery_operation(
             Err(error) => {
                 return Err(AuthSecretStoreError::Recovery(format!(
                     "Linux keyring recovery helper could not start: {error}"
-                )))
+                )));
             }
         }
     };
@@ -1546,7 +1552,7 @@ fn run_recovery_operation(
         Some(Ok(Err(message))) => {
             return Err(AuthSecretStoreError::Recovery(format!(
                 "Linux keyring recovery helper could not start: {message}"
-            )))
+            )));
         }
         _ => Vec::new(),
     };
@@ -1683,7 +1689,10 @@ impl AuthSecretStore for LinuxKeyringRecoveryStore {
 /// Returns the process exit code. **1 on every error reply**, matching the `.cjs`'s
 /// `process.exitCode = 1`, so the parent's rung 2 keeps winning: a helper that exited 0 on error
 /// would silently change the message the user sees.
-pub fn run_keyring_helper<R: std::io::Read, W: std::io::Write>(stdin: &mut R, stdout: &mut W) -> i32 {
+pub fn run_keyring_helper<R: std::io::Read, W: std::io::Write>(
+    stdin: &mut R,
+    stdout: &mut W,
+) -> i32 {
     match keyring_helper_exchange(stdin) {
         Ok(response) => {
             write_helper_response(stdout, &response);
@@ -1715,7 +1724,9 @@ fn write_helper_response<W: std::io::Write>(stdout: &mut W, response: &KeyringHe
 /// Read, validate, perform. Validation order and messages are upstream's, exactly:
 /// `request too large` (>1 MiB), `invalid request`, `invalid operation`, `invalid service`,
 /// `invalid account`, `invalid payload`.
-fn keyring_helper_exchange<R: std::io::Read>(stdin: &mut R) -> Result<KeyringHelperResponse, String> {
+fn keyring_helper_exchange<R: std::io::Read>(
+    stdin: &mut R,
+) -> Result<KeyringHelperResponse, String> {
     let mut buffer = Vec::new();
     let mut chunk = [0_u8; 8192];
     loop {
@@ -1968,11 +1979,7 @@ fn translate_legacy_entry(legacy: LegacyAuthEntry, now: f64) -> Option<AuthEntry
         state,
         server_url: legacy.server_url,
     };
-    if entry.is_empty() {
-        None
-    } else {
-        Some(entry)
-    }
+    if entry.is_empty() { None } else { Some(entry) }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2354,12 +2361,11 @@ impl McpAuthStore {
         entry: &AuthEntry,
     ) -> Result<(), AuthStoreError> {
         let account = auth_entry_account(server_name);
-        let payload =
-            serde_json::to_string(entry).map_err(|source| AuthStoreError::ParseJson {
-                server: server_name.to_string(),
-                source_label: STORE_SOURCE.to_string(),
-                source,
-            })?;
+        let payload = serde_json::to_string(entry).map_err(|source| AuthStoreError::ParseJson {
+            server: server_name.to_string(),
+            source_label: STORE_SOURCE.to_string(),
+            source,
+        })?;
         debug_assert!(
             !payload.contains('\n'),
             "a stored secret must never contain a newline (MCP-275)"
@@ -2590,14 +2596,13 @@ impl McpAuthStore {
         behavior: ReadBehavior,
     ) -> Result<Option<AuthEntry>, AuthStoreError> {
         let account = auth_entry_account(server_name);
-        let payload =
-            store
-                .read(&account)
-                .map_err(|source| AuthStoreError::Unavailable {
-                    operation: StoreOp::Read,
-                    server: server_name.to_string(),
-                    source,
-                })?;
+        let payload = store
+            .read(&account)
+            .map_err(|source| AuthStoreError::Unavailable {
+                operation: StoreOp::Read,
+                server: server_name.to_string(),
+                source,
+            })?;
 
         if let Some(payload) = payload {
             let value = parse_json_payload(server_name, &payload, STORE_SOURCE)?;
@@ -2675,10 +2680,8 @@ impl McpAuthStore {
         recovery: bool,
     ) -> Result<Option<AuthEntry>, AuthStoreError> {
         if recovery {
-            let store = LinuxKeyringRecoveryStore::new(
-                AUTH_SECRET_SERVICE,
-                Arc::clone(&self.inner.env),
-            );
+            let store =
+                LinuxKeyringRecoveryStore::new(AUTH_SECRET_SERVICE, Arc::clone(&self.inner.env));
             self.read_auth_entry_from_store(&store, server_name, behavior)
         } else {
             self.read_auth_entry_from_store(&*self.inner.backend, server_name, behavior)
@@ -2697,8 +2700,10 @@ impl McpAuthStore {
                 if !should_attempt_recovery(&self.inner.env, &error) {
                     return Err(error);
                 }
-                let store =
-                    LinuxKeyringRecoveryStore::new(AUTH_SECRET_SERVICE, Arc::clone(&self.inner.env));
+                let store = LinuxKeyringRecoveryStore::new(
+                    AUTH_SECRET_SERVICE,
+                    Arc::clone(&self.inner.env),
+                );
                 self.write_secure_auth_entry_to_store(&store, server_name, entry)
             }
         }
@@ -2832,8 +2837,10 @@ impl McpAuthStore {
                 if !should_attempt_recovery(&self.inner.env, &error) {
                     return Err(error);
                 }
-                let store =
-                    LinuxKeyringRecoveryStore::new(AUTH_SECRET_SERVICE, Arc::clone(&self.inner.env));
+                let store = LinuxKeyringRecoveryStore::new(
+                    AUTH_SECRET_SERVICE,
+                    Arc::clone(&self.inner.env),
+                );
                 self.remove_auth_entry_from_store(&store, server_name)
             }
         }?;
@@ -3177,11 +3184,7 @@ impl rmcp::transport::auth::CredentialStore for McpCredentialStore {
 
     async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
         self.store
-            .update_credentials_async(
-                &self.server_name,
-                credentials,
-                self.server_url.as_deref(),
-            )
+            .update_credentials_async(&self.server_name, credentials, self.server_url.as_deref())
             .await
             .map_err(|error| store_error_to_auth_error(&error))
     }
@@ -3467,7 +3470,10 @@ pub fn missing_env_vars(value: &str, env: &EnvFn) -> Vec<String> {
     };
     let mut missing: Vec<String> = Vec::new();
     for captures in pattern.captures_iter(value) {
-        let Some(name) = (1..=3).find_map(|group| captures.get(group)).map(|m| m.as_str()) else {
+        let Some(name) = (1..=3)
+            .find_map(|group| captures.get(group))
+            .map(|m| m.as_str())
+        else {
             continue;
         };
         if env(name).is_none() && !missing.iter().any(|seen| seen == name) {
@@ -3672,8 +3678,9 @@ mod tests {
 
     /// A store over an injectable memory backend, rooted in a scratch dir so the legacy-file paths
     /// are real.
-    fn test_store(fault: SimulatedFault) -> (McpAuthStore, Arc<MemorySecretStore>, tempfile::TempDir)
-    {
+    fn test_store(
+        fault: SimulatedFault,
+    ) -> (McpAuthStore, Arc<MemorySecretStore>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let backend = Arc::new(MemorySecretStore::with_fault(fault));
         let dirs = McpDirs::new(dir.path().to_path_buf(), dir.path().to_path_buf());
@@ -3708,7 +3715,13 @@ mod tests {
     #[test]
     fn hostile_server_names_stay_inside_the_base_dir() {
         let (store, _backend, dir) = test_store(SimulatedFault::None);
-        for name in ["Cloudflare Workers", "сервер", "../escape", "@scope/name", ""] {
+        for name in [
+            "Cloudflare Workers",
+            "сервер",
+            "../escape",
+            "@scope/name",
+            "",
+        ] {
             let path = store.auth_entry_file_path(name);
             let relative = path.strip_prefix(store.auth_base_dir()).unwrap();
             let text = relative.to_string_lossy().replace('\\', "/");
@@ -3716,7 +3729,10 @@ mod tests {
             assert_eq!(tail, "tokens.json", "{name}");
             let hex = head.strip_prefix("sha256-").unwrap();
             assert_eq!(hex.len(), 64, "{name}");
-            assert!(hex.chars().all(|c| c.is_ascii_digit() || matches!(c, 'a'..='f')));
+            assert!(
+                hex.chars()
+                    .all(|c| c.is_ascii_digit() || matches!(c, 'a'..='f'))
+            );
             assert!(!text.starts_with(".."), "{name}");
             assert!(!Path::new(&text).is_absolute(), "{name}");
             // `<authDir>/../escape/tokens.json` never exists.
@@ -3744,7 +3760,10 @@ mod tests {
         );
         // Different configured oauthDirs, same keychain account: two projects configuring a server
         // named `github` share one entry.
-        assert_ne!(one.auth_entry_file_path("github"), two.auth_entry_file_path("github"));
+        assert_ne!(
+            one.auth_entry_file_path("github"),
+            two.auth_entry_file_path("github")
+        );
         assert_eq!(auth_entry_account("github"), auth_entry_account("github"));
     }
 
@@ -3827,7 +3846,10 @@ mod tests {
             "verifier-secret",
             "refresh",
         ] {
-            assert!(!rendered.contains(secret), "{secret} leaked into {rendered}");
+            assert!(
+                !rendered.contains(secret),
+                "{secret} leaked into {rendered}"
+            );
         }
         assert!(rendered.contains("[REDACTED]"));
         // The server URL is not a secret and stays legible — it is what makes a Debug useful.
@@ -3875,21 +3897,34 @@ mod tests {
             state: None,
             server_url: Some("https://x.example/mcp".to_string()),
         };
-        store.save_auth_entry("srv", &mut entry, Some("https://x.example/mcp")).unwrap();
+        store
+            .save_auth_entry("srv", &mut entry, Some("https://x.example/mcp"))
+            .unwrap();
 
         let account = auth_entry_account("srv");
         let entries = backend.entries();
         // Exactly one non-`.chunk.` entry, at the base account.
-        let base: Vec<_> = entries.iter().filter(|(k, _)| !k.contains(".chunk.")).collect();
+        let base: Vec<_> = entries
+            .iter()
+            .filter(|(k, _)| !k.contains(".chunk."))
+            .collect();
         assert_eq!(base.len(), 1);
         assert_eq!(base[0].0, account);
         // Every stored value is under the Windows ceiling, and none contains a newline (MCP-275).
         for (key, value) in &entries {
-            assert!(value.len() <= AUTH_SECRET_VALUE_LIMIT, "{key} is {} bytes", value.len());
+            assert!(
+                value.len() <= AUTH_SECRET_VALUE_LIMIT,
+                "{key} is {} bytes",
+                value.len()
+            );
             assert!(!value.contains('\n'), "{key} contains a newline");
         }
         // The manifest's key order is the emitted order.
-        assert!(base[0].1.starts_with(r#"{"__piMcpAdapterOAuthChunked":1,"chunkCount":"#));
+        assert!(
+            base[0]
+                .1
+                .starts_with(r#"{"__piMcpAdapterOAuthChunked":1,"chunkCount":"#)
+        );
 
         let read = store.auth_entry("srv").unwrap().unwrap();
         assert!(read.credentials.is_some());
@@ -3901,7 +3936,10 @@ mod tests {
         // Non-ASCII with no upstream twin: upstream slices UTF-16 units while hashing UTF-8 bytes.
         let payload = "é".repeat(2000);
         let manifest = AuthEntryChunkManifest::for_payload(&payload);
-        assert_eq!(manifest.chunk_count, payload.len().div_ceil(AUTH_SECRET_CHUNK_SIZE));
+        assert_eq!(
+            manifest.chunk_count,
+            payload.len().div_ceil(AUTH_SECRET_CHUNK_SIZE)
+        );
         let chunks = split_payload(&payload, manifest.chunk_count);
         assert_eq!(chunks.len(), manifest.chunk_count);
         for chunk in &chunks {
@@ -3953,7 +3991,9 @@ mod tests {
             state: None,
             server_url: Some("https://x.example/mcp".to_string()),
         };
-        store.save_auth_entry("srv", &mut entry, Some("https://x.example/mcp")).unwrap();
+        store
+            .save_auth_entry("srv", &mut entry, Some("https://x.example/mcp"))
+            .unwrap();
         store.reset_cache();
 
         let victim = backend
@@ -3963,7 +4003,10 @@ mod tests {
             .expect("a chunk at index 1");
         backend.remove_entry(&victim.0);
 
-        match store.inspect_auth_for_url("srv", "https://x.example/mcp").unwrap() {
+        match store
+            .inspect_auth_for_url("srv", "https://x.example/mcp")
+            .unwrap()
+        {
             OAuthCredentialStatus::Unavailable { message } => {
                 assert!(message.starts_with("OAuth credential store unavailable"));
             }
@@ -3979,7 +4022,9 @@ mod tests {
         backend.seed(&auth_entry_account("srv"), "{not json");
 
         // Read path: the parse runs *outside* the wrapping, so inspect propagates.
-        let error = store.inspect_auth_for_url("srv", "https://x.example").unwrap_err();
+        let error = store
+            .inspect_auth_for_url("srv", "https://x.example")
+            .unwrap_err();
         assert!(!error.is_store_unavailable(), "{error}");
         assert_eq!(
             error.to_string(),
@@ -4010,11 +4055,15 @@ mod tests {
             credentials: Some(credentials(&"a".repeat(3000))),
             ..AuthEntry::default()
         };
-        store.save_auth_entry("srv", &mut entry, Some("https://x.example")).unwrap();
+        store
+            .save_auth_entry("srv", &mut entry, Some("https://x.example"))
+            .unwrap();
         // A rewrite with different content changes the digest, so cleanup of the previous chunks is
         // attempted — and refused. The write still returns Ok.
         entry.credentials = Some(credentials(&"b".repeat(3000)));
-        store.save_auth_entry("srv", &mut entry, Some("https://x.example")).unwrap();
+        store
+            .save_auth_entry("srv", &mut entry, Some("https://x.example"))
+            .unwrap();
     }
 
     #[test]
@@ -4032,7 +4081,9 @@ mod tests {
             credentials: Some(credentials(&"a".repeat(5000))),
             ..AuthEntry::default()
         };
-        store.save_auth_entry("srv", &mut entry, Some("https://x.example")).unwrap();
+        store
+            .save_auth_entry("srv", &mut entry, Some("https://x.example"))
+            .unwrap();
 
         let error = store.remove_auth_entry("srv").unwrap_err();
         assert_eq!(error.operation(), Some(StoreOp::Remove));
@@ -4057,20 +4108,36 @@ mod tests {
                 state: Some(state("old-csrf")),
                 server_url: Some("https://old.example/mcp".to_string()),
             };
-            store.save_auth_entry("srv", &mut entry, Some("https://old.example/mcp")).unwrap();
+            store
+                .save_auth_entry("srv", &mut entry, Some("https://old.example/mcp"))
+                .unwrap();
         };
 
         seed(&store);
-        store.update_credentials("srv", credentials("new"), Some("https://new.example/mcp")).unwrap();
+        store
+            .update_credentials("srv", credentials("new"), Some("https://new.example/mcp"))
+            .unwrap();
         let entry = store.auth_entry("srv").unwrap().unwrap();
         assert!(entry.credentials.is_some());
-        assert!(entry.client.is_none(), "a stale DCR record must not survive a rebinding");
-        assert!(entry.state.is_none(), "a PKCE verifier must never cross authorization contexts");
+        assert!(
+            entry.client.is_none(),
+            "a stale DCR record must not survive a rebinding"
+        );
+        assert!(
+            entry.state.is_none(),
+            "a PKCE verifier must never cross authorization contexts"
+        );
         assert_eq!(entry.server_url.as_deref(), Some("https://new.example/mcp"));
 
         store.remove_auth_entry("srv").unwrap();
         seed(&store);
-        store.update_client_info("srv", StoredClientInfo::new("new-client"), Some("https://new.example/mcp")).unwrap();
+        store
+            .update_client_info(
+                "srv",
+                StoredClientInfo::new("new-client"),
+                Some("https://new.example/mcp"),
+            )
+            .unwrap();
         let entry = store.auth_entry("srv").unwrap().unwrap();
         assert!(entry.credentials.is_none());
         assert_eq!(entry.client.unwrap().client_id, "new-client");
@@ -4078,7 +4145,9 @@ mod tests {
 
         store.remove_auth_entry("srv").unwrap();
         seed(&store);
-        store.update_state("srv", state("new-csrf"), Some("https://new.example/mcp")).unwrap();
+        store
+            .update_state("srv", state("new-csrf"), Some("https://new.example/mcp"))
+            .unwrap();
         let entry = store.auth_entry("srv").unwrap().unwrap();
         assert!(entry.credentials.is_none());
         assert!(entry.client.is_none());
@@ -4094,8 +4163,12 @@ mod tests {
             state: Some(state("csrf")),
             server_url: Some("https://x.example/mcp".to_string()),
         };
-        store.save_auth_entry("srv", &mut entry, Some("https://x.example/mcp")).unwrap();
-        store.update_credentials("srv", credentials("new"), Some("https://x.example/mcp")).unwrap();
+        store
+            .save_auth_entry("srv", &mut entry, Some("https://x.example/mcp"))
+            .unwrap();
+        store
+            .update_credentials("srv", credentials("new"), Some("https://x.example/mcp"))
+            .unwrap();
         let entry = store.auth_entry("srv").unwrap().unwrap();
         assert!(entry.client.is_some());
         assert!(entry.state.is_some());
@@ -4108,10 +4181,22 @@ mod tests {
             credentials: Some(credentials("t")),
             ..AuthEntry::default()
         };
-        store.save_auth_entry("srv", &mut entry, Some("https://x.example/mcp")).unwrap();
-        assert!(store.auth_for_url("srv", "https://x.example/mcp").unwrap().is_some());
+        store
+            .save_auth_entry("srv", &mut entry, Some("https://x.example/mcp"))
+            .unwrap();
+        assert!(
+            store
+                .auth_for_url("srv", "https://x.example/mcp")
+                .unwrap()
+                .is_some()
+        );
         // A trailing-slash change invalidates the credential: no normalization, ever.
-        assert!(store.auth_for_url("srv", "https://x.example/mcp/").unwrap().is_none());
+        assert!(
+            store
+                .auth_for_url("srv", "https://x.example/mcp/")
+                .unwrap()
+                .is_none()
+        );
 
         // An entry with no stored URL predates the binding and is invalid.
         let mut bare = AuthEntry {
@@ -4120,7 +4205,12 @@ mod tests {
         };
         store.save_auth_entry("other", &mut bare, None).unwrap();
         assert!(store.auth_entry("other").unwrap().is_some());
-        assert!(store.auth_for_url("other", "https://x.example/mcp").unwrap().is_none());
+        assert!(
+            store
+                .auth_for_url("other", "https://x.example/mcp")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -4132,7 +4222,9 @@ mod tests {
             state: Some(state("csrf")),
             server_url: Some("https://x.example/mcp".to_string()),
         };
-        store.save_auth_entry("srv", &mut entry, Some("https://x.example/mcp")).unwrap();
+        store
+            .save_auth_entry("srv", &mut entry, Some("https://x.example/mcp"))
+            .unwrap();
         store.clear_credentials("srv").unwrap();
         let entry = store.auth_entry("srv").unwrap().unwrap();
         assert!(entry.credentials.is_none());
@@ -4178,7 +4270,9 @@ mod tests {
             credentials: Some(credentials("t")),
             ..AuthEntry::default()
         };
-        store.save_auth_entry("srv", &mut entry, Some("https://x.example")).unwrap();
+        store
+            .save_auth_entry("srv", &mut entry, Some("https://x.example"))
+            .unwrap();
         let before = backend.read_count();
         // A write publishes, so the next read serves the written value with zero backend reads.
         assert!(store.auth_entry("srv").unwrap().is_some());
@@ -4193,11 +4287,17 @@ mod tests {
             credentials: Some(credentials("t")),
             ..AuthEntry::default()
         };
-        store.save_auth_entry("srv", &mut entry, Some("https://x.example")).unwrap();
+        store
+            .save_auth_entry("srv", &mut entry, Some("https://x.example"))
+            .unwrap();
 
         let before = backend.read_count();
-        let _ = store.inspect_auth_for_url("srv", "https://x.example").unwrap();
-        let _ = store.inspect_auth_for_url("srv", "https://x.example").unwrap();
+        let _ = store
+            .inspect_auth_for_url("srv", "https://x.example")
+            .unwrap();
+        let _ = store
+            .inspect_auth_for_url("srv", "https://x.example")
+            .unwrap();
         // Two inspections cost two backend reads even though an ordinary read warmed the cache.
         assert_eq!(backend.read_count(), before + 2);
         // …and an ordinary read still costs nothing.
@@ -4212,8 +4312,12 @@ mod tests {
             credentials: Some(credentials("t")),
             ..AuthEntry::default()
         };
-        store.save_auth_entry("a", &mut entry, Some("https://a.example")).unwrap();
-        store.save_auth_entry("b", &mut entry, Some("https://b.example")).unwrap();
+        store
+            .save_auth_entry("a", &mut entry, Some("https://a.example"))
+            .unwrap();
+        store
+            .save_auth_entry("b", &mut entry, Some("https://b.example"))
+            .unwrap();
         let _ = store.auth_entry("a").unwrap();
         let before = backend.read_count();
 
@@ -4233,11 +4337,20 @@ mod tests {
             client: Some(client),
             ..AuthEntry::default()
         };
-        store.save_auth_entry("srv", &mut entry, Some("https://x.example")).unwrap();
+        store
+            .save_auth_entry("srv", &mut entry, Some("https://x.example"))
+            .unwrap();
 
         let mut first = store.auth_entry("srv").unwrap().unwrap();
         first.client.as_mut().unwrap().issuer = Some("mutated".to_string());
-        first.client.as_mut().unwrap().redirect_uris.as_mut().unwrap().push("x".to_string());
+        first
+            .client
+            .as_mut()
+            .unwrap()
+            .redirect_uris
+            .as_mut()
+            .unwrap()
+            .push("x".to_string());
         first.credentials = None;
 
         let second = store.auth_entry("srv").unwrap().unwrap();
@@ -4259,10 +4372,9 @@ mod tests {
     fn the_disable_switch_is_read_per_call_and_only_honours_the_literal_one() {
         for (value, expected_reads) in [("1", 2_u64), ("true", 1), ("0", 1), ("", 1)] {
             let owned = value.to_string();
-            let (store, backend, _dir) =
-                store_with_env(Arc::new(move |key: &str| {
-                    (key == AUTH_CACHE_DISABLED_ENV[1]).then(|| owned.clone())
-                }));
+            let (store, backend, _dir) = store_with_env(Arc::new(move |key: &str| {
+                (key == AUTH_CACHE_DISABLED_ENV[1]).then(|| owned.clone())
+            }));
             assert!(store.auth_entry("srv").unwrap().is_none());
             assert!(store.auth_entry("srv").unwrap().is_none());
             assert_eq!(backend.read_count(), expected_reads, "value = {value:?}");
@@ -4287,12 +4399,18 @@ mod tests {
             credentials: Some(credentials("t")),
             ..AuthEntry::default()
         };
-        store.save_auth_entry("srv", &mut entry, Some("https://x.example")).unwrap();
+        store
+            .save_auth_entry("srv", &mut entry, Some("https://x.example"))
+            .unwrap();
         assert!(store.auth_entry("srv").unwrap().is_some());
         store.remove_auth_entry("srv").unwrap();
         let before = backend.read_count();
         assert!(store.auth_entry("srv").unwrap().is_none());
-        assert_eq!(backend.read_count(), before + 1, "the read must reach the backend");
+        assert_eq!(
+            backend.read_count(),
+            before + 1,
+            "the read must reach the backend"
+        );
     }
 
     #[test]
@@ -4301,9 +4419,17 @@ mod tests {
         let _ = store.auth_entry("srv").unwrap();
         assert_eq!(backend.read_count(), 1);
         store.reset_cache();
-        assert_eq!(backend.read_count(), 1, "resetAuthEntryCache must not reset the counter");
+        assert_eq!(
+            backend.read_count(),
+            1,
+            "resetAuthEntryCache must not reset the counter"
+        );
         backend.reset();
-        assert_eq!(backend.read_count(), 0, "resetTestAuthSecretStore resets both");
+        assert_eq!(
+            backend.read_count(),
+            0,
+            "resetTestAuthSecretStore resets both"
+        );
     }
 
     #[test]
@@ -4349,9 +4475,9 @@ mod tests {
         };
         assert!(!cause_chain_contains_key_revoked(&generic));
         // `NoEntry` has no source at all — the walk terminates immediately.
-        assert!(!cause_chain_contains_key_revoked(&AuthSecretStoreError::Keyring(
-            keyring::Error::NoEntry
-        )));
+        assert!(!cause_chain_contains_key_revoked(
+            &AuthSecretStoreError::Keyring(keyring::Error::NoEntry)
+        ));
     }
 
     #[test]
@@ -4449,7 +4575,11 @@ mod tests {
             account: "sha256-aa".to_string(),
             payload: Some("value".to_string()),
         };
-        assert!(serde_json::to_string(&write).unwrap().contains(r#""payload":"value""#));
+        assert!(
+            serde_json::to_string(&write)
+                .unwrap()
+                .contains(r#""payload":"value""#)
+        );
     }
 
     #[test]
@@ -4457,9 +4587,18 @@ mod tests {
         for (request, message) in [
             ("[1,2]", "invalid request"),
             ("{not json", "invalid request"),
-            (r#"{"operation":"nope","service":"s","account":"a"}"#, "invalid operation"),
-            (r#"{"operation":"read","service":"","account":"a"}"#, "invalid service"),
-            (r#"{"operation":"read","service":"s","account":""}"#, "invalid account"),
+            (
+                r#"{"operation":"nope","service":"s","account":"a"}"#,
+                "invalid operation",
+            ),
+            (
+                r#"{"operation":"read","service":"","account":"a"}"#,
+                "invalid service",
+            ),
+            (
+                r#"{"operation":"read","service":"s","account":""}"#,
+                "invalid account",
+            ),
         ] {
             let mut stdin = std::io::Cursor::new(request.as_bytes().to_vec());
             let mut stdout = Vec::new();
@@ -4500,7 +4639,10 @@ mod tests {
             found: Some(false),
             ..KeyringHelperResponse::default()
         };
-        assert_eq!(serde_json::to_string(&missing).unwrap(), r#"{"ok":true,"found":false}"#);
+        assert_eq!(
+            serde_json::to_string(&missing).unwrap(),
+            r#"{"ok":true,"found":false}"#
+        );
         let done = KeyringHelperResponse {
             ok: true,
             ..KeyringHelperResponse::default()
@@ -4534,7 +4676,10 @@ mod tests {
 
         let credentials = legacy_credentials(&base(Some(now + 60.0)), "client", now).unwrap();
         assert_eq!(credentials.client_id, "client");
-        assert_eq!(credentials.granted_scopes, vec!["read".to_string(), "write".to_string()]);
+        assert_eq!(
+            credentials.granted_scopes,
+            vec!["read".to_string(), "write".to_string()]
+        );
         assert_eq!(credentials.token_received_at, Some(now as u64));
     }
 
@@ -4569,10 +4714,19 @@ mod tests {
 
         let entry = store.auth_entry("srv").unwrap().expect("imported");
         assert!(entry.credentials.is_some());
-        assert_eq!(entry.client.as_ref().unwrap().client_secret.as_deref(), Some("s"));
-        assert!(!path.exists(), "the plaintext file must not survive a successful import");
+        assert_eq!(
+            entry.client.as_ref().unwrap().client_secret.as_deref(),
+            Some("s")
+        );
+        assert!(
+            !path.exists(),
+            "the plaintext file must not survive a successful import"
+        );
         assert!(!path.parent().unwrap().exists(), "its directory goes too");
-        assert!(!backend.entries().is_empty(), "the record is in the keychain");
+        assert!(
+            !backend.entries().is_empty(),
+            "the record is in the keychain"
+        );
         drop(dir);
     }
 
@@ -4591,7 +4745,9 @@ mod tests {
         )
         .unwrap();
 
-        let status = store.inspect_auth_for_url("srv", "https://x.example/mcp").unwrap();
+        let status = store
+            .inspect_auth_for_url("srv", "https://x.example/mcp")
+            .unwrap();
         assert!(matches!(status, OAuthCredentialStatus::Present(_)));
         assert!(path.exists(), "a status read must not migrate or delete");
         assert!(backend.entries().is_empty(), "and must not write");
@@ -4663,7 +4819,9 @@ mod tests {
             server_url: Some("https://x.example/mcp".to_string()),
             ..AuthEntry::default()
         };
-        store.save_auth_entry("srv", &mut seed, Some("https://x.example/mcp")).unwrap();
+        store
+            .save_auth_entry("srv", &mut seed, Some("https://x.example/mcp"))
+            .unwrap();
 
         let mut tasks = Vec::new();
         for index in 0..8 {
@@ -4683,7 +4841,10 @@ mod tests {
         }
 
         let entry = store.auth_entry_async("srv").await.unwrap().unwrap();
-        assert!(entry.credentials.is_some(), "the final entry is one write, intact");
+        assert!(
+            entry.credentials.is_some(),
+            "the final entry is one write, intact"
+        );
         let account = auth_entry_account("srv");
         let bases: Vec<_> = backend
             .entries()
@@ -4702,8 +4863,7 @@ mod tests {
 
         let (store, _backend, _dir) = test_store(SimulatedFault::None);
         let url = "https://x.example/mcp".to_string();
-        let credential_store =
-            McpCredentialStore::new(store.clone(), "srv", Some(url.clone()));
+        let credential_store = McpCredentialStore::new(store.clone(), "srv", Some(url.clone()));
         let state_store = McpStateStore::new(store.clone(), "srv", Some(url.clone()));
 
         assert!(credential_store.load().await.unwrap().is_none());
@@ -4772,7 +4932,10 @@ mod tests {
         stub.issuer = Some("https://issuer.example".to_string());
         stub.config_pre_registered = Some(true);
         assert!(stub.is_pre_registered_stub());
-        assert!(stub.to_oauth_client_config("http://127.0.0.1/callback").is_none());
+        assert!(
+            stub.to_oauth_client_config("http://127.0.0.1/callback")
+                .is_none()
+        );
 
         // The legacy shape `{clientId, issuer}` with no secret is a stub too.
         let mut legacy = StoredClientInfo::new("configured");
@@ -4831,7 +4994,10 @@ mod tests {
             Some("from-env/from-env/from-env/")
         );
         // `bearerTokenEnv` falls back correctly, and an empty name is not truthy.
-        assert_eq!(resolve_bearer_token(None, Some("TOKEN"), &env).as_deref(), Some("from-env"));
+        assert_eq!(
+            resolve_bearer_token(None, Some("TOKEN"), &env).as_deref(),
+            Some("from-env")
+        );
         assert_eq!(resolve_bearer_token(None, Some(""), &env), None);
         assert_eq!(resolve_bearer_token(None, Some("MISSING"), &env), None);
         assert_eq!(resolve_bearer_token(None, None, &env), None);
@@ -4952,7 +5118,9 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                resolve_server_url(Some(url), &env).expect_err(url).to_string(),
+                resolve_server_url(Some(url), &env)
+                    .expect_err(url)
+                    .to_string(),
                 message,
                 "{url}"
             );
@@ -4961,13 +5129,22 @@ mod tests {
         // The parser is WHATWG on both sides: measured against node's `new URL`, these four are
         // accepted and these two are rejected.
         for accepted in ["unix:///tmp/s.sock", "x:y", "mailto:a@b", "ws://x"] {
-            assert!(resolve_server_url(Some(accepted), &env).is_ok(), "{accepted}");
+            assert!(
+                resolve_server_url(Some(accepted), &env).is_ok(),
+                "{accepted}"
+            );
         }
         for rejected in ["//x/y", "/abs/path"] {
-            assert!(resolve_server_url(Some(rejected), &env).is_err(), "{rejected}");
+            assert!(
+                resolve_server_url(Some(rejected), &env).is_err(),
+                "{rejected}"
+            );
         }
 
-        assert_eq!(missing_env_vars("no placeholders", &env), Vec::<String>::new());
+        assert_eq!(
+            missing_env_vars("no placeholders", &env),
+            Vec::<String>::new()
+        );
         assert_eq!(
             missing_env_vars("{env:B}/${A}", &env),
             vec!["B".to_string(), "A".to_string()],
@@ -4994,7 +5171,13 @@ mod tests {
         let entry = store.get_auth_for_url("srv", url).await.unwrap().unwrap();
         assert!(entry.credentials.is_some());
         // The binding is exact-string: a different URL reads as absent, never as present.
-        assert!(store.get_auth_for_url("srv", "https://y.example/mcp").await.unwrap().is_none());
+        assert!(
+            store
+                .get_auth_for_url("srv", "https://y.example/mcp")
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         // `clearTokens` takes no URL (`mcp-auth.ts:994`), so the sibling client record survives.
         store
@@ -5016,7 +5199,10 @@ mod tests {
         store.save_credentials("srv", url, None).await.unwrap();
         let entry = store.load("srv").await.unwrap().unwrap();
         assert!(entry.credentials.is_none());
-        assert!(entry.client.is_some(), "clearTokens must not purge the client record");
+        assert!(
+            entry.client.is_some(),
+            "clearTokens must not purge the client record"
+        );
 
         assert_eq!(store.base_dir(), store.auth_base_dir());
         store.clear_all("srv").await.unwrap();
@@ -5032,7 +5218,9 @@ mod tests {
         // Section 07's refresh driver rethrows the store class and swallows everything else into
         // `None`; misclassifying here is an infinite silent re-auth loop.
         assert!(error.is_credential_store_failure(), "{error}");
-        assert!(matches!(&error, crate::errors::McpError::CredentialStore(inner)
-            if inner.is_store_unavailable()));
+        assert!(
+            matches!(&error, crate::errors::McpError::CredentialStore(inner)
+            if inner.is_store_unavailable())
+        );
     }
 }

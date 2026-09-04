@@ -323,18 +323,21 @@ pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
     let mut props = serde_json::Map::new();
     props.insert("agent".to_string(), serde_json::json!({ "type": "string", "description": "Agent name (SINGLE mode) or target for management get/update/delete" }));
     props.insert("task".to_string(), serde_json::json!({ "type": "string", "description": "Task (SINGLE mode, optional for self-contained agents)" }));
-    props.insert("action".to_string(), serde_json::json!({
-        "type": "string",
-        // G77: `stop` sits between `steer` and `append-step`, upstream's own position in
-        // `SUBAGENT_ACTIONS` (`shared/types.ts:1885` @v0.43.0: `… "interrupt", "resume", "steer",
-        // "stop", "append-step", …`). Advertised together with its `route_control_action` dispatch
-        // arm (`SubagentExecutor::control_stop`) in this same change, per the crate's
-        // advertise-vs-dispatch invariant.
-        // SUBA-038: derived from [`SUBAGENT_ACTIONS`], not hand-written — a hand-written copy is
-        // exactly what let the two unknown-action messages drift away from what dispatches.
-        "enum": SUBAGENT_ACTIONS,
-        "description": "Management/control action. Omit for execution mode."
-    }));
+    props.insert(
+        "action".to_string(),
+        serde_json::json!({
+            "type": "string",
+            // G77: `stop` sits between `steer` and `append-step`, upstream's own position in
+            // `SUBAGENT_ACTIONS` (`shared/types.ts:1885` @v0.43.0: `… "interrupt", "resume", "steer",
+            // "stop", "append-step", …`). Advertised together with its `route_control_action` dispatch
+            // arm (`SubagentExecutor::control_stop`) in this same change, per the crate's
+            // advertise-vs-dispatch invariant.
+            // SUBA-038: derived from [`SUBAGENT_ACTIONS`], not hand-written — a hand-written copy is
+            // exactly what let the two unknown-action messages drift away from what dispatches.
+            "enum": SUBAGENT_ACTIONS,
+            "description": "Management/control action. Omit for execution mode."
+        }),
+    );
     // G90 (advertise-vs-dispatch, the OTHER direction): these three, plus `message` below, are the
     // schema properties `action='steer'` is addressed through, and all four dropped pi's own
     // `action='steer'` clause (`extension/schemas.ts:224,227,230,238` @v0.34.0, descriptions
@@ -352,6 +355,9 @@ pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
     props.insert("runId".to_string(), serde_json::json!({ "type": "string", "description": "Target run ID for action='interrupt', action='stop', action='resume', action='steer', or action='append-step'. Defaults to the most recently active controllable run for interrupt. Prefer id for new calls." }));
     props.insert("dir".to_string(), serde_json::json!({ "type": "string", "description": "Async run directory for action='status', action='stop', action='resume', or action='steer'." }));
     props.insert("index".to_string(), serde_json::json!({ "type": "integer", "minimum": 0, "description": "Zero-based child index for actions that target a specific child or transcript." }));
+    // SUBA-087 — pi `extension/schemas.ts:306` @v0.64.0, description VERBATIM. Advertised because
+    // the `stop` dispatch arm threads it into `control_stop`'s resolver in this same change.
+    props.insert("childId".to_string(), serde_json::json!({ "type": "string", "minLength": 1, "maxLength": 256, "description": "Stable child identity for child-scoped stop requests." }));
     // G92: `view` + `lines` (pi `extension/schemas.ts:233-237` @v0.34.0, descriptions VERBATIM).
     // Both are read by `route_control_action`'s `status` arm — `view` selects
     // `background::fleet_view::format_fleet` / `format_async_run_transcript`, `lines` is the
@@ -499,7 +505,10 @@ pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
     // `crate::missions::handle_mission_action`, and `missionId`/`mission` additionally bind an
     // EXECUTION call to a mission via `SubagentTool::execute`'s launch binding. Descriptions are
     // upstream's own, verbatim.
-    props.insert("missionId".to_string(), serde_json::json!({ "type": "string", "description": "Mission id." }));
+    props.insert(
+        "missionId".to_string(),
+        serde_json::json!({ "type": "string", "description": "Mission id." }),
+    );
     props.insert("mission".to_string(), serde_json::json!({
         "anyOf": [
             { "type": "object", "additionalProperties": true },
@@ -512,11 +521,23 @@ pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
         "additionalProperties": true,
         "description": "Mission update: objective, goal false or {paused:boolean}, budget, summary, labels, decisions, artifacts, or delivery receipts."
     }));
-    props.insert("missionStatus".to_string(), serde_json::json!({ "type": "string", "description": "Mission status." }));
+    props.insert(
+        "missionStatus".to_string(),
+        serde_json::json!({ "type": "string", "description": "Mission status." }),
+    );
     props.insert("missionScope".to_string(), serde_json::json!({ "type": "string", "description": "Mission list scope: project (default) or global pointer index." }));
-    props.insert("runMode".to_string(), serde_json::json!({ "type": "string", "description": "Attached run mode." }));
-    props.insert("runStatus".to_string(), serde_json::json!({ "type": "string", "description": "Attached run status." }));
-    props.insert("summary".to_string(), serde_json::json!({ "type": "string", "description": "Mission close summary." }));
+    props.insert(
+        "runMode".to_string(),
+        serde_json::json!({ "type": "string", "description": "Attached run mode." }),
+    );
+    props.insert(
+        "runStatus".to_string(),
+        serde_json::json!({ "type": "string", "description": "Attached run status." }),
+    );
+    props.insert(
+        "summary".to_string(),
+        serde_json::json!({ "type": "string", "description": "Mission close summary." }),
+    );
 
     serde_json::json!({
         "type": "object",
@@ -527,7 +548,12 @@ pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
     use crate::extension::executor::SubagentExecutor;
@@ -579,10 +605,38 @@ mod tests {
         // Every top-level pi `SubagentParamsSchema` property (schemas.ts:195-263), in source
         // order. As of SUBA-N06 there are no withholds: the list is pi's, entire.
         let expected_properties = [
-            "agent", "task", "action", "id", "runId", "dir", "index", "message", "chainName",
-            "config", "tasks", "concurrency", "worktree", "chain", "context", "chainDir", "async",
-            "timeoutMs", "maxRuntimeMs", "agentScope", "cwd", "artifacts", "includeProgress",
-            "share", "sessionDir", "clarify", "control", "output", "outputMode", "skill", "model",
+            "agent",
+            "task",
+            "action",
+            "id",
+            "runId",
+            "dir",
+            "index",
+            "childId",
+            "message",
+            "chainName",
+            "config",
+            "tasks",
+            "concurrency",
+            "worktree",
+            "chain",
+            "context",
+            "chainDir",
+            "async",
+            "timeoutMs",
+            "maxRuntimeMs",
+            "agentScope",
+            "cwd",
+            "artifacts",
+            "includeProgress",
+            "share",
+            "sessionDir",
+            "clarify",
+            "control",
+            "output",
+            "outputMode",
+            "skill",
+            "model",
             "acceptance",
         ];
         for name in expected_properties {
@@ -672,7 +726,10 @@ mod tests {
             );
             assert_eq!(control_props[field]["minimum"], serde_json::json!(minimum));
         }
-        assert_eq!(control_props["enabled"]["type"], serde_json::json!("boolean"));
+        assert_eq!(
+            control_props["enabled"]["type"],
+            serde_json::json!("boolean")
+        );
         assert_eq!(
             control_props["notifyOn"]["items"]["enum"],
             serde_json::json!(["active_long_running", "needs_attention"])
@@ -707,11 +764,36 @@ mod tests {
                 // "create", …` (`shared/types.ts:2084` @v0.47.1). `children.list` is NOT ported —
                 // it lists retained children under a `parentWorkflowRunId` that this build has no
                 // concept of — so `guide` follows `models` directly here.
-                "list", "get", "models", "guide", "create", "update", "delete", "eject", "disable",
-                "enable", "reset", "status", "grant-spawn-budget", "interrupt", "resume", "steer",
-                "stop", "dismiss", "append-step", "doctor", "mission.create", "mission.list",
-                "mission.show", "mission.update", "mission.attach-run", "mission.close",
-                "watchdog.status", "watchdog.check", "watchdog.configure",
+                "list",
+                "get",
+                "models",
+                "guide",
+                "create",
+                "update",
+                "delete",
+                "eject",
+                "disable",
+                "enable",
+                "reset",
+                "status",
+                "grant-spawn-budget",
+                "interrupt",
+                "resume",
+                "steer",
+                "stop",
+                "dismiss",
+                "append-step",
+                "doctor",
+                "mission.create",
+                "mission.list",
+                "mission.show",
+                "mission.update",
+                "mission.resolve-decision",
+                "mission.attach-run",
+                "mission.close",
+                "watchdog.status",
+                "watchdog.check",
+                "watchdog.configure",
                 "watchdog.recommend-model"
             ],
             "the action enum must be pi's SUBAGENT_ACTIONS in pi's own order, for the verbs cyrup \
@@ -748,13 +830,24 @@ mod tests {
         assert_eq!(props["timeoutMs"]["minimum"], serde_json::json!(1));
         assert_eq!(props["maxRuntimeMs"]["minimum"], serde_json::json!(1));
         assert_eq!(props["index"]["minimum"], serde_json::json!(0));
+        // SUBA-087 — `schemas.ts:306` @v0.64.0.
+        assert_eq!(props["childId"]["minLength"], serde_json::json!(1));
+        assert_eq!(props["childId"]["maxLength"], serde_json::json!(256));
 
         // tasks[] per-task fields the description advertises (output/outputMode/reads/progress),
         // plus count's minimum.
         let task_props = props["tasks"]["items"]["properties"]
             .as_object()
             .expect("tasks[].items has a properties object");
-        for per_task in ["agent", "task", "count", "output", "outputMode", "reads", "progress"] {
+        for per_task in [
+            "agent",
+            "task",
+            "count",
+            "output",
+            "outputMode",
+            "reads",
+            "progress",
+        ] {
             assert!(
                 task_props.contains_key(per_task),
                 "tasks[] items must carry the per-task field '{per_task}'"
@@ -762,7 +855,10 @@ mod tests {
         }
         assert_eq!(task_props["count"]["minimum"], serde_json::json!(1));
         assert_eq!(task_props["progress"]["type"], serde_json::json!("boolean"));
-        assert_eq!(props["tasks"]["items"]["required"], serde_json::json!(["agent", "task"]));
+        assert_eq!(
+            props["tasks"]["items"]["required"],
+            serde_json::json!(["agent", "task"])
+        );
 
         // chain[] items must be an additionalProperties:false object with the flattened
         // sequential/parallel/dynamic surface (schemas.ts:190-229).
@@ -772,7 +868,15 @@ mod tests {
         let chain_props = chain_item["properties"]
             .as_object()
             .expect("chain[].items has a properties object");
-        for chain_field in ["agent", "parallel", "expand", "collect", "concurrency", "failFast", "worktree"] {
+        for chain_field in [
+            "agent",
+            "parallel",
+            "expand",
+            "collect",
+            "concurrency",
+            "failFast",
+            "worktree",
+        ] {
             assert!(
                 chain_props.contains_key(chain_field),
                 "chain[] items must carry '{chain_field}'"
@@ -780,10 +884,22 @@ mod tests {
         }
 
         // config/output/skill/acceptance are provider-friendly anyOf unions (no bare top-level type).
-        assert!(props["config"].get("anyOf").is_some(), "config must be an anyOf union");
-        assert!(props["output"].get("anyOf").is_some(), "output must be an anyOf union");
-        assert!(props["skill"].get("anyOf").is_some(), "skill must be an anyOf union");
-        assert!(props["acceptance"].get("anyOf").is_some(), "acceptance must be an anyOf union");
+        assert!(
+            props["config"].get("anyOf").is_some(),
+            "config must be an anyOf union"
+        );
+        assert!(
+            props["output"].get("anyOf").is_some(),
+            "output must be an anyOf union"
+        );
+        assert!(
+            props["skill"].get("anyOf").is_some(),
+            "skill must be an anyOf union"
+        );
+        assert!(
+            props["acceptance"].get("anyOf").is_some(),
+            "acceptance must be an anyOf union"
+        );
 
         // SUBA-041: the control fragment is no longer inserted into the advertised schema (no
         // `resolveControlConfig`/notice pipeline in this port), but it is KEPT as the shape record
@@ -793,7 +909,10 @@ mod tests {
         let control_props = control_fragment["properties"]
             .as_object()
             .expect("control has a properties object");
-        assert_eq!(control_props["needsAttentionAfterMs"]["minimum"], serde_json::json!(1));
+        assert_eq!(
+            control_props["needsAttentionAfterMs"]["minimum"],
+            serde_json::json!(1)
+        );
         assert_eq!(
             control_props["notifyOn"]["items"]["enum"],
             serde_json::json!(["active_long_running", "needs_attention"])
@@ -1193,10 +1312,19 @@ mod tests {
             ("sessionDir", serde_json::json!({ "sessionDir": "~/x" })),
             ("artifacts", serde_json::json!({ "artifacts": false })),
             ("acceptance", serde_json::json!({ "acceptance": "checked" })),
-            ("control", serde_json::json!({ "control": { "needsAttentionAfterMs": 5000 } })),
-            ("includeProgress", serde_json::json!({ "includeProgress": true })),
+            (
+                "control",
+                serde_json::json!({ "control": { "needsAttentionAfterMs": 5000 } }),
+            ),
+            (
+                "includeProgress",
+                serde_json::json!({ "includeProgress": true }),
+            ),
             ("timeoutMs", serde_json::json!({ "timeoutMs": 60_000 })),
-            ("maxRuntimeMs", serde_json::json!({ "maxRuntimeMs": 60_000 })),
+            (
+                "maxRuntimeMs",
+                serde_json::json!({ "maxRuntimeMs": 60_000 }),
+            ),
         ];
 
         for (name, extra) in &cases {
@@ -1267,7 +1395,10 @@ mod tests {
         }
         // pi `extension/schemas.ts:116-120`: `hard` is REQUIRED and the object is closed.
         assert_eq!(props["toolBudget"]["required"], serde_json::json!(["hard"]));
-        assert_eq!(props["toolBudget"]["additionalProperties"], serde_json::json!(false));
+        assert_eq!(
+            props["toolBudget"]["additionalProperties"],
+            serde_json::json!(false)
+        );
         // pi gives the top-level `outputSchema` no description of its own, and the shape is the
         // same open `JsonSchemaObject` the `tasks[]` item schema already used.
         assert_eq!(props["outputSchema"], sj_json_schema_object());
@@ -1306,13 +1437,28 @@ mod tests {
             .as_object()
             .expect("properties object")
             .clone();
-        assert!(props.contains_key("turnBudget"), "the enforced param must be advertised");
+        assert!(
+            props.contains_key("turnBudget"),
+            "the enforced param must be advertised"
+        );
         // pi `extension/schemas.ts:104-107` @v0.43.0: `maxTurns` REQUIRED, `graceTurns` optional
         // and >= 0 (NOT >= 1 — a zero grace is legal and means "abort at maxTurns"), object closed.
-        assert_eq!(props["turnBudget"]["required"], serde_json::json!(["maxTurns"]));
-        assert_eq!(props["turnBudget"]["additionalProperties"], serde_json::json!(false));
-        assert_eq!(props["turnBudget"]["properties"]["maxTurns"]["minimum"], serde_json::json!(1));
-        assert_eq!(props["turnBudget"]["properties"]["graceTurns"]["minimum"], serde_json::json!(0));
+        assert_eq!(
+            props["turnBudget"]["required"],
+            serde_json::json!(["maxTurns"])
+        );
+        assert_eq!(
+            props["turnBudget"]["additionalProperties"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            props["turnBudget"]["properties"]["maxTurns"]["minimum"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            props["turnBudget"]["properties"]["graceTurns"]["minimum"],
+            serde_json::json!(0)
+        );
         assert_eq!(
             props["turnBudget"]["description"],
             serde_json::json!(
@@ -1330,7 +1476,10 @@ mod tests {
             parsed.turn_budget,
             Some(serde_json::json!({ "maxTurns": 4, "graceTurns": 2 }))
         );
-        assert!(parsed.provided_keys().contains(&"turnBudget"), "{:?}", parsed.provided_keys());
+        assert!(
+            parsed.provided_keys().contains(&"turnBudget"),
+            "{:?}",
+            parsed.provided_keys()
+        );
     }
-
 }

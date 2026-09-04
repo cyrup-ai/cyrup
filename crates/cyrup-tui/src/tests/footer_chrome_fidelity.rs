@@ -23,21 +23,21 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
-use cyrup_provider::Provider;
-use cyrup_session_svc::{AgentSession, AgentSessionEvent, SessionBuilder, SessionConfig};
+use super::harness::*;
 use crate::{
-    compact_onboarding, format_tokens, Action, App, BorderedLoader, IndicatorKind, Key, Keymap,
-    LoginDialog, SelectAction, SelectKeymap, StatusIndicator, StatusLine, UiTheme,
-    COMPACT_HINT_ROWS, STARTUP_ONBOARDING,
+    Action, App, BorderedLoader, COMPACT_HINT_ROWS, IndicatorKind, Key, Keymap, LoginDialog,
+    STARTUP_ONBOARDING, SelectAction, SelectKeymap, StatusIndicator, StatusLine, UiTheme,
+    compact_onboarding, format_tokens,
 };
+use cyrup_provider::Provider;
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
+use cyrup_session_svc::{AgentSession, AgentSessionEvent, SessionBuilder, SessionConfig};
+use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
-use ratatui::Terminal;
 use tempfile::TempDir;
 use tokio_stream::StreamExt;
-use super::harness::*;
 
 // ------------------------------------------------------------------------------ helpers ----
 
@@ -56,7 +56,9 @@ fn fg_of_row(app: &App<TestBackend>, y: u16) -> Option<Color> {
 
 /// [`col_of`] for the LAST occurrence.
 fn rcol_of(row: &str, needle: &str) -> u16 {
-    let byte = row.rfind(needle).unwrap_or_else(|| panic!("{needle:?} not in [{row}]"));
+    let byte = row
+        .rfind(needle)
+        .unwrap_or_else(|| panic!("{needle:?} not in [{row}]"));
     row.get(..byte).map_or(0, |p| p.chars().count()) as u16
 }
 
@@ -91,11 +93,18 @@ fn c1_context_segment_renders_even_when_nothing_ever_set_it() {
 #[test]
 fn c1_unknown_occupancy_renders_the_question_mark_branch() {
     let mut app = app(100, 12);
-    app.status_mut().set_context_usage(None, Some(200_000), true);
+    app.status_mut()
+        .set_context_usage(None, Some(200_000), true);
     app.draw().unwrap();
     let text = buf_text(&app);
-    assert!(text.contains("?/200k (auto)"), "post-compaction `?` branch missing:\n{text}");
-    assert!(!text.contains("0.0%/200k"), "an unknown count must not read as 0%:\n{text}");
+    assert!(
+        text.contains("?/200k (auto)"),
+        "post-compaction `?` branch missing:\n{text}"
+    );
+    assert!(
+        !text.contains("0.0%/200k"),
+        "an unknown count must not read as 0%:\n{text}"
+    );
 }
 
 /// **C1 — the user action.** Send a message and let the turn finish; the footer must then show the
@@ -153,7 +162,10 @@ async fn c1_a_finished_turn_puts_the_live_context_usage_in_the_footer() {
     let text = buf_text(&app);
     // The faux model declares a 128k window (`faux.rs:61 DEFAULT_CONTEXT_WINDOW`), so the segment
     // must name it — the un-wired footer could only ever have said `0`.
-    assert!(text.contains("%/128k"), "live context segment missing after a real turn:\n{text}");
+    assert!(
+        text.contains("%/128k"),
+        "live context segment missing after a real turn:\n{text}"
+    );
     assert_eq!(
         app.state().status.context_window,
         Some(128_000),
@@ -174,7 +186,11 @@ fn c1_mirror_context_colour_bands_still_resolve() {
     for (fraction, want, label) in [
         (0.95_f64, theme.error_style().fg, "above 90% is error"),
         (0.80, theme.warning_style().fg, "above 70% is warning"),
-        (0.40, theme.dim_style().fg, "below 70% inherits the outer dim wrapper"),
+        (
+            0.40,
+            theme.dim_style().fg,
+            "below 70% inherits the outer dim wrapper",
+        ),
     ] {
         let mut app = app(100, 12);
         app.status_mut().set_context(fraction, 200_000, true);
@@ -196,10 +212,15 @@ fn c1_mirror_context_colour_bands_still_resolve() {
 #[test]
 fn c1_context_percent_is_not_clamped_at_one_hundred() {
     let mut over_budget = app(100, 12);
-    over_budget.status_mut().set_context_usage(Some(1.123), Some(200_000), false);
+    over_budget
+        .status_mut()
+        .set_context_usage(Some(1.123), Some(200_000), false);
     over_budget.draw().unwrap();
     let text = buf_text(&over_budget);
-    assert!(text.contains("112.3%/200k"), "an over-budget context reads over 100%:\n{text}");
+    assert!(
+        text.contains("112.3%/200k"),
+        "an over-budget context reads over 100%:\n{text}"
+    );
     assert!(!text.contains("100.0%/200k"), "…not pinned at 100:\n{text}");
 
     // The same through `set_context`, the other setter, and the colour must be the >90% error band.
@@ -208,7 +229,11 @@ fn c1_context_percent_is_not_clamped_at_one_hundred() {
     app2.draw().unwrap();
     let y = find_row(&app2, "150.0%/200k");
     let x = row_text(&app2, y).find("150.0%").unwrap() as u16;
-    assert_eq!(fg_at(&app2, x, y), UiTheme::dark().error_style().fg, "over 90% is `error`");
+    assert_eq!(
+        fg_at(&app2, x, y),
+        UiTheme::dark().error_style().fg,
+        "over 90% is `error`"
+    );
 
     // …and the session-side figure it is fed from is unclamped too
     // (`cyrup-session-svc/src/state.rs` `ContextUsage::from_last_assistant`), or the footer would
@@ -238,7 +263,10 @@ fn c1_narrow_truncation_keeps_the_per_segment_colour() {
             cache_read: 88_000,
             cache_write: 2_100,
             total_tokens: 106_500,
-            cost: cyrup_core::Cost { total: 0.214, ..cyrup_core::Cost::default() },
+            cost: cyrup_core::Cost {
+                total: 0.214,
+                ..cyrup_core::Cost::default()
+            },
             ..cyrup_core::Usage::default()
         });
         status.set_context(0.95, 200_000, true);
@@ -247,7 +275,10 @@ fn c1_narrow_truncation_keeps_the_per_segment_colour() {
 
     let y = find_row(&wide_cluster, "↑12k");
     let row = row_text(&wide_cluster, y);
-    assert!(row.ends_with("..."), "the cluster must actually be truncated: [{row}]");
+    assert!(
+        row.ends_with("..."),
+        "the cluster must actually be truncated: [{row}]"
+    );
     // The first segment keeps `dim`, and the ellipsis is `dim` too (it is inside pi's
     // `theme.fg("dim", statsLeft)` wrapper at `footer.ts:225`).
     let up = col_of(&row, "↑");
@@ -257,7 +288,11 @@ fn c1_narrow_truncation_keeps_the_per_segment_colour() {
         "an uncoloured segment stays `dim`: [{row}]"
     );
     let ell = rcol_of(&row, "...");
-    assert_eq!(fg_at(&wide_cluster, ell, y), Some(DIM_DARK), "the ellipsis is `dim`: [{row}]");
+    assert_eq!(
+        fg_at(&wide_cluster, ell, y),
+        Some(DIM_DARK),
+        "the ellipsis is `dim`: [{row}]"
+    );
 
     // THE POINT OF THE TEST: a width whose cut lands INSIDE the context segment, so part of the
     // coloured run is on screen and part is not. The cluster is `↑12k 95.0%/200k` (15 columns); at
@@ -276,7 +311,10 @@ fn c1_narrow_truncation_keeps_the_per_segment_colour() {
     cut_inside.draw().unwrap();
     let y2 = find_row(&cut_inside, "95.0");
     let row2 = row_text(&cut_inside, y2);
-    assert_eq!(row2, "↑12k 95.0...", "the cut must land inside the context segment: [{row2}]");
+    assert_eq!(
+        row2, "↑12k 95.0...",
+        "the cut must land inside the context segment: [{row2}]"
+    );
     let pct = col_of(&row2, "95.0");
     assert_eq!(
         fg_at(&cut_inside, pct, y2),
@@ -284,8 +322,16 @@ fn c1_narrow_truncation_keeps_the_per_segment_colour() {
         "the >90% error red must survive truncation: [{row2}]"
     );
     // …and the segments on the other side of the cut keep their own styles, not one flat colour.
-    assert_eq!(fg_at(&cut_inside, col_of(&row2, "↑"), y2), Some(DIM_DARK), "[{row2}]");
-    assert_eq!(fg_at(&cut_inside, rcol_of(&row2, "..."), y2), Some(DIM_DARK), "[{row2}]");
+    assert_eq!(
+        fg_at(&cut_inside, col_of(&row2, "↑"), y2),
+        Some(DIM_DARK),
+        "[{row2}]"
+    );
+    assert_eq!(
+        fg_at(&cut_inside, rcol_of(&row2, "..."), y2),
+        Some(DIM_DARK),
+        "[{row2}]"
+    );
 
     // The >70% warning band survives the same cut.
     let mut warn = app(12, 12);
@@ -330,11 +376,15 @@ async fn c1_auto_compact_has_its_own_refresh_independent_of_the_event_predicate(
     let mut app = app(100, 12);
     session.set_auto_compaction_enabled(true);
     app.refresh_auto_compact(&session);
-    assert!(app.state().status.auto_compact, "the toggle reaches the footer with no event at all");
+    assert!(
+        app.state().status.auto_compact,
+        "the toggle reaches the footer with no event at all"
+    );
 
     // Toggling it back and folding an event that is NOT in the context predicate still updates it.
     session.set_auto_compaction_enabled(false);
-    app.ingest_session_event(&AgentSessionEvent::AgentStart, &session).await;
+    app.ingest_session_event(&AgentSessionEvent::AgentStart, &session)
+        .await;
     assert!(
         !app.state().status.auto_compact,
         "`agent_start` is not a context-usage event, but the flag still refreshes"
@@ -356,13 +406,25 @@ fn c2_footer_lines_one_and_two_carry_the_dim_token() {
     app.draw().unwrap();
 
     let loc = find_row(&app, "~/src/cyrup");
-    assert_eq!(fg_of_row(&app, loc), Some(DIM_DARK), "footer line 1 must be the `dim` token");
-    assert_ne!(fg_of_row(&app, loc), Some(MUTED_DARK), "…and specifically not `muted`");
+    assert_eq!(
+        fg_of_row(&app, loc),
+        Some(DIM_DARK),
+        "footer line 1 must be the `dim` token"
+    );
+    assert_ne!(
+        fg_of_row(&app, loc),
+        Some(MUTED_DARK),
+        "…and specifically not `muted`"
+    );
 
     // Line 2: the right-aligned model name is inside pi's `dimRemainder` (`footer.ts:226-227`).
     let stats = find_row(&app, "claude-opus-4-8");
     let x = row_text(&app, stats).find("claude").unwrap() as u16;
-    assert_eq!(fg_at(&app, x, stats), Some(DIM_DARK), "the model cluster must be `dim`");
+    assert_eq!(
+        fg_at(&app, x, stats),
+        Some(DIM_DARK),
+        "the model cluster must be `dim`"
+    );
 }
 
 // ====================================================== C3 — the extension-status line ======
@@ -375,12 +437,16 @@ fn c2_footer_lines_one_and_two_carry_the_dim_token() {
 #[test]
 fn c3_extension_status_row_is_unstyled_and_only_its_ellipsis_is_dim() {
     let mut app = app(24, 12);
-    app.status_mut().set_extension_status("a", "rust-analyzer is indexing the workspace now");
+    app.status_mut()
+        .set_extension_status("a", "rust-analyzer is indexing the workspace now");
     app.draw().unwrap();
 
     let y = find_row(&app, "rust-analyzer");
     let row = row_text(&app, y);
-    assert!(row.contains("..."), "a 24-column footer must truncate this status: [{row}]");
+    assert!(
+        row.contains("..."),
+        "a 24-column footer must truncate this status: [{row}]"
+    );
 
     let body_x = row.find("rust").unwrap() as u16;
     assert_eq!(
@@ -388,10 +454,18 @@ fn c3_extension_status_row_is_unstyled_and_only_its_ellipsis_is_dim() {
         UiTheme::dark().base_style().fg,
         "the status text itself carries no theme call upstream: [{row}]"
     );
-    assert_ne!(fg_at(&app, body_x, y), Some(DIM_DARK), "…so it must not be dimmed: [{row}]");
+    assert_ne!(
+        fg_at(&app, body_x, y),
+        Some(DIM_DARK),
+        "…so it must not be dimmed: [{row}]"
+    );
 
     let ell_x = row.rfind("...").unwrap() as u16;
-    assert_eq!(fg_at(&app, ell_x, y), Some(DIM_DARK), "the ellipsis IS `theme.fg(\"dim\", \"...\")`");
+    assert_eq!(
+        fg_at(&app, ell_x, y),
+        Some(DIM_DARK),
+        "the ellipsis IS `theme.fg(\"dim\", \"...\")`"
+    );
 }
 
 /// MIRROR: an untruncated status row emits no stray ellipsis.
@@ -401,7 +475,10 @@ fn c3_mirror_short_status_row_has_no_ellipsis() {
     app.status_mut().set_extension_status("a", "ok");
     app.draw().unwrap();
     let row = row_text(&app, find_row(&app, "ok"));
-    assert!(!row.contains("..."), "nothing to truncate, so no ellipsis: [{row}]");
+    assert!(
+        !row.contains("..."),
+        "nothing to truncate, so no ellipsis: [{row}]"
+    );
 }
 
 // ================================================= C4/C5/C12 — the working status band ======
@@ -425,11 +502,26 @@ fn c4_c5_c12_working_band_is_inset_ascii_and_carries_no_cancel_suffix() {
     let lines = ind.lines_at(Duration::ZERO, &theme, Some("escape"));
     let msg: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
 
-    assert!(msg.starts_with(' '), "paddingX 1 left inset missing: [{msg}]");
-    assert!(msg.ends_with(' '), "paddingX 1 right margin missing: [{msg}]");
-    assert!(msg.contains("Working..."), "ASCII `...`, not U+2026: [{msg}]");
-    assert!(!msg.contains('…'), "U+2026 is 1 column where pi draws 3: [{msg}]");
-    assert!(!msg.contains("to cancel"), "Working takes no cancel suffix: [{msg}]");
+    assert!(
+        msg.starts_with(' '),
+        "paddingX 1 left inset missing: [{msg}]"
+    );
+    assert!(
+        msg.ends_with(' '),
+        "paddingX 1 right margin missing: [{msg}]"
+    );
+    assert!(
+        msg.contains("Working..."),
+        "ASCII `...`, not U+2026: [{msg}]"
+    );
+    assert!(
+        !msg.contains('…'),
+        "U+2026 is 1 column where pi draws 3: [{msg}]"
+    );
+    assert!(
+        !msg.contains("to cancel"),
+        "Working takes no cancel suffix: [{msg}]"
+    );
 }
 
 /// MIRROR (C5): the three states whose upstream constructors DO bake the hint into their copy —
@@ -437,12 +529,19 @@ fn c4_c5_c12_working_band_is_inset_ascii_and_carries_no_cancel_suffix() {
 #[test]
 fn c5_mirror_the_other_three_states_still_carry_the_cancel_suffix() {
     let theme = UiTheme::dark();
-    for kind in [IndicatorKind::Retry, IndicatorKind::Compaction, IndicatorKind::BranchSummary] {
+    for kind in [
+        IndicatorKind::Retry,
+        IndicatorKind::Compaction,
+        IndicatorKind::BranchSummary,
+    ] {
         let mut ind = StatusIndicator::new();
         ind.set(kind, None);
         let lines = ind.lines_at(Duration::ZERO, &theme, Some("escape"));
         let msg: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(msg.contains("(escape to cancel)"), "{kind:?} must keep its hint: [{msg}]");
+        assert!(
+            msg.contains("(escape to cancel)"),
+            "{kind:?} must keep its hint: [{msg}]"
+        );
     }
 }
 
@@ -467,10 +566,19 @@ fn c8_retry_message_counts_down_once_per_second() {
             .map(|s| s.content.as_ref())
             .collect()
     };
-    assert!(at(&ind, 0).contains("Retrying (1/3) in 30s..."), "start = ceil(delayMs/1000)");
-    assert!(at(&ind, 1).contains("in 29s..."), "the timer ticks every 1000 ms");
+    assert!(
+        at(&ind, 0).contains("Retrying (1/3) in 30s..."),
+        "start = ceil(delayMs/1000)"
+    );
+    assert!(
+        at(&ind, 1).contains("in 29s..."),
+        "the timer ticks every 1000 ms"
+    );
     assert!(at(&ind, 25).contains("in 5s..."), "…all the way down");
-    assert!(at(&ind, 30).contains("in 0s..."), "reaches 0, then the timer disposes");
+    assert!(
+        at(&ind, 30).contains("in 0s..."),
+        "reaches 0, then the timer disposes"
+    );
     assert!(at(&ind, 99).contains("in 0s..."), "and never goes negative");
     // The suffix is still pi's, from the live keymap (`status-indicator.ts:47`).
     assert!(at(&ind, 0).contains("(escape to cancel)"));
@@ -497,7 +605,10 @@ fn c8_a_second_retry_restarts_the_countdown_from_the_top() {
     let mut ind = StatusIndicator::new();
 
     ind.set_retry(1, 3, 5_000);
-    assert_eq!(ind.retry_message().as_deref(), Some("Retrying (1/3) in 5s..."));
+    assert_eq!(
+        ind.retry_message().as_deref(),
+        Some("Retrying (1/3) in 5s...")
+    );
 
     std::thread::sleep(Duration::from_millis(1_200));
     assert_eq!(
@@ -518,7 +629,10 @@ fn c8_a_second_retry_restarts_the_countdown_from_the_top() {
         .iter()
         .map(|s| s.content.as_ref())
         .collect();
-    assert!(rendered.contains("in 20s..."), "…and the band renders the same number: [{rendered}]");
+    assert!(
+        rendered.contains("in 20s..."),
+        "…and the band renders the same number: [{rendered}]"
+    );
 }
 
 /// MIRROR: a non-retry state has no countdown and keeps the message it was given verbatim.
@@ -526,18 +640,30 @@ fn c8_a_second_retry_restarts_the_countdown_from_the_top() {
 fn c8_mirror_a_plain_message_is_not_rewritten_over_time() {
     let theme = UiTheme::dark();
     let mut ind = StatusIndicator::new();
-    ind.set(IndicatorKind::Compaction, Some("Auto-compacting...".to_string()));
+    ind.set(
+        IndicatorKind::Compaction,
+        Some("Auto-compacting...".to_string()),
+    );
     // Span 0 is the spinner (which DOES advance); span 1 is the message.
     let msg = |secs: u64| -> String {
-        ind.lines_at(Duration::from_secs(secs), &theme, None)[1].spans[1].content.to_string()
+        ind.lines_at(Duration::from_secs(secs), &theme, None)[1].spans[1]
+            .content
+            .to_string()
     };
-    assert_eq!(msg(0), msg(42), "only a retry backoff re-derives its message");
+    assert_eq!(
+        msg(0),
+        msg(42),
+        "only a retry backoff re-derives its message"
+    );
     assert_eq!(msg(0), "Auto-compacting...");
     // …and entering a new state drops any countdown that was running.
     let mut ind2 = StatusIndicator::new();
     ind2.set_retry(1, 3, 30_000);
     ind2.set(IndicatorKind::Working, None);
-    assert!(ind2.retry_message().is_none(), "`set` disposes the timer (status-indicator.ts:67-71)");
+    assert!(
+        ind2.retry_message().is_none(),
+        "`set` disposes the timer (status-indicator.ts:67-71)"
+    );
 }
 
 // ============================================================ C6/C7/C11 — BorderedLoader ====
@@ -553,27 +679,60 @@ fn c8_mirror_a_plain_message_is_not_rewritten_over_time() {
 fn c6_c7_bordered_loader_row_count_and_message_colour() {
     let theme = UiTheme::dark();
     let loader = BorderedLoader::cancellable("Creating gist...", "escape/ctrl+c");
-    assert_eq!(loader.height(), 7, "1 + 2 + 1 + 1 + 1 + 1 (bordered-loader.ts:16-39)");
+    assert_eq!(
+        loader.height(),
+        7,
+        "1 + 2 + 1 + 1 + 1 + 1 (bordered-loader.ts:16-39)"
+    );
 
     let mut terminal = Terminal::new(TestBackend::new(40, 7)).unwrap();
-    terminal.draw(|f| loader.render(f, Rect::new(0, 0, 40, 7), &theme, 0)).unwrap();
+    terminal
+        .draw(|f| loader.render(f, Rect::new(0, 0, 40, 7), &theme, 0))
+        .unwrap();
     let buf = terminal.backend().buffer().clone();
     let row = |y: u16| -> String {
-        (0..buf.area.width).filter_map(|x| buf.cell((x, y))).map(|c| c.symbol()).collect()
+        (0..buf.area.width)
+            .filter_map(|x| buf.cell((x, y)))
+            .map(|c| c.symbol())
+            .collect()
     };
 
-    assert!(row(0).contains('─'), "row 0 is the top DynamicBorder: [{}]", row(0));
+    assert!(
+        row(0).contains('─'),
+        "row 0 is the top DynamicBorder: [{}]",
+        row(0)
+    );
     assert!(
         row(1).trim().is_empty(),
         "row 1 is the Loader's own leading blank — `[\"\", ...super.render(width)]` \
          (loader.ts:44): [{}]",
         row(1)
     );
-    assert!(row(2).contains("Creating gist..."), "row 2 is the spinner line: [{}]", row(2));
-    assert!(row(3).trim().is_empty(), "row 3 is Spacer(1) (bordered-loader.ts:35): [{}]", row(3));
-    assert!(row(4).contains("cancel"), "row 4 is the key hint: [{}]", row(4));
-    assert!(row(5).trim().is_empty(), "row 5 is Spacer(1) (bordered-loader.ts:38): [{}]", row(5));
-    assert!(row(6).contains('─'), "row 6 is the closing DynamicBorder: [{}]", row(6));
+    assert!(
+        row(2).contains("Creating gist..."),
+        "row 2 is the spinner line: [{}]",
+        row(2)
+    );
+    assert!(
+        row(3).trim().is_empty(),
+        "row 3 is Spacer(1) (bordered-loader.ts:35): [{}]",
+        row(3)
+    );
+    assert!(
+        row(4).contains("cancel"),
+        "row 4 is the key hint: [{}]",
+        row(4)
+    );
+    assert!(
+        row(5).trim().is_empty(),
+        "row 5 is Spacer(1) (bordered-loader.ts:38): [{}]",
+        row(5)
+    );
+    assert!(
+        row(6).contains('─'),
+        "row 6 is the closing DynamicBorder: [{}]",
+        row(6)
+    );
 
     let msg_x = row(2).find("Creating").unwrap() as u16;
     assert_eq!(
@@ -597,16 +756,24 @@ fn c7_mirror_plain_loader_is_five_rows_with_no_hint() {
     let loader = BorderedLoader::plain("Loading...");
     assert_eq!(loader.height(), 5);
     let mut terminal = Terminal::new(TestBackend::new(40, 5)).unwrap();
-    terminal.draw(|f| loader.render(f, Rect::new(0, 0, 40, 5), &theme, 0)).unwrap();
+    terminal
+        .draw(|f| loader.render(f, Rect::new(0, 0, 40, 5), &theme, 0))
+        .unwrap();
     let buf = terminal.backend().buffer().clone();
     let text: String = (0..5)
         .map(|y| -> String {
-            (0..buf.area.width).filter_map(|x| buf.cell((x, y))).map(|c| c.symbol()).collect()
+            (0..buf.area.width)
+                .filter_map(|x| buf.cell((x, y)))
+                .map(|c| c.symbol())
+                .collect()
         })
         .collect::<Vec<_>>()
         .join("\n");
     assert!(text.contains("Loading..."));
-    assert!(!text.contains("cancel"), "no hint row when not cancellable:\n{text}");
+    assert!(
+        !text.contains("cancel"),
+        "no hint row when not cancellable:\n{text}"
+    );
 }
 
 /// **C11.** `keyHint("tui.select.cancel", "cancel")` (`bordered-loader.ts:36`) resolves through
@@ -627,7 +794,10 @@ fn c11_select_cancel_hint_joins_every_bound_key() {
     // A rebind flows through, which is the whole point of resolving it from the live keymap.
     let mut rebound = SelectKeymap::default();
     rebound.set_action(SelectAction::Cancel, vec![Key::parse("ctrl+q").unwrap()]);
-    assert_eq!(rebound.keys_label(SelectAction::Cancel).as_deref(), Some("ctrl+q"));
+    assert_eq!(
+        rebound.keys_label(SelectAction::Cancel).as_deref(),
+        Some("ctrl+q")
+    );
     // An unbound action is upstream's `keys.length === 0` → no hint.
     let mut unbound = SelectKeymap::default();
     unbound.set_action(SelectAction::Cancel, Vec::new());
@@ -639,7 +809,9 @@ fn c11_select_cancel_hint_joins_every_bound_key() {
 #[test]
 fn c11_mirror_first_key_label_still_returns_a_single_key() {
     assert_eq!(
-        SelectKeymap::default().key_label(SelectAction::Cancel).as_deref(),
+        SelectKeymap::default()
+            .key_label(SelectAction::Cancel)
+            .as_deref(),
         Some("escape"),
         "the single-key accessor is unchanged apart from C10's spelling"
     );
@@ -656,9 +828,21 @@ fn c11_mirror_first_key_label_still_returns_a_single_key() {
 fn c9_token_counts_round_rather_than_truncate() {
     assert_eq!(format_tokens(45_600), "46k", "Math.round(45.6) === 46");
     assert_eq!(format_tokens(10_900), "11k", "Math.round(10.9) === 11");
-    assert_eq!(format_tokens(10_500), "11k", "Math.round(10.5) === 11 — half rounds up");
-    assert_eq!(format_tokens(999_600), "1000k", "the `<1000000` branch still owns this");
-    assert_eq!(format_tokens(10_500_000), "11M", "Math.round(10.5) === 11 in the M branch too");
+    assert_eq!(
+        format_tokens(10_500),
+        "11k",
+        "Math.round(10.5) === 11 — half rounds up"
+    );
+    assert_eq!(
+        format_tokens(999_600),
+        "1000k",
+        "the `<1000000` branch still owns this"
+    );
+    assert_eq!(
+        format_tokens(10_500_000),
+        "11M",
+        "Math.round(10.5) === 11 in the M branch too"
+    );
 }
 
 /// MIRROR (C9): the four thresholds and the two `toFixed(1)` branches are unchanged
@@ -666,11 +850,23 @@ fn c9_token_counts_round_rather_than_truncate() {
 #[test]
 fn c9_mirror_thresholds_and_one_decimal_branches_are_unchanged() {
     assert_eq!(format_tokens(0), "0");
-    assert_eq!(format_tokens(999), "999", "`count < 1000` prints the raw number");
+    assert_eq!(
+        format_tokens(999),
+        "999",
+        "`count < 1000` prints the raw number"
+    );
     assert_eq!(format_tokens(1_000), "1.0k", "`count < 10000` → toFixed(1)");
     assert_eq!(format_tokens(4_100), "4.1k");
-    assert_eq!(format_tokens(45_400), "45k", "rounding DOWN is still rounding");
-    assert_eq!(format_tokens(1_000_000), "1.0M", "`count < 10000000` → toFixed(1)");
+    assert_eq!(
+        format_tokens(45_400),
+        "45k",
+        "rounding DOWN is still rounding"
+    );
+    assert_eq!(
+        format_tokens(1_000_000),
+        "1.0M",
+        "`count < 10000000` → toFixed(1)"
+    );
 }
 
 /// **C9 — the rounding fix must not introduce a panic.** The `M` branch was written
@@ -685,7 +881,11 @@ fn c9_mirror_thresholds_and_one_decimal_branches_are_unchanged() {
 #[test]
 fn c9_the_rounding_fix_is_total_at_the_top_of_the_range() {
     assert_eq!(format_tokens(u64::MAX), "18446744073710M");
-    assert_eq!(format_tokens(u64::MAX - 500_000), "18446744073709M", "just below the round-up");
+    assert_eq!(
+        format_tokens(u64::MAX - 500_000),
+        "18446744073709M",
+        "just below the round-up"
+    );
     assert_eq!(format_tokens(u64::MAX / 2), "9223372036855M");
     // The `k` branch is bounded by its own `< 1_000_000` guard, but assert the boundary anyway.
     assert_eq!(format_tokens(999_999), "1000k");
@@ -716,9 +916,18 @@ fn c10_c13_startup_hint_block_is_framed_inset_and_names_the_expand_key() {
 
     let hints = find_row(&app, "interrupt");
     let row = row_text(&app, hints);
-    assert!(row.starts_with(' '), "paddingX 1 left inset missing: [{row}]");
-    assert!(row.contains("escape interrupt"), "C10 — the key spells out as `escape`: [{row}]");
-    assert!(!row.contains("esc interrupt"), "…never abbreviated: [{row}]");
+    assert!(
+        row.starts_with(' '),
+        "paddingX 1 left inset missing: [{row}]"
+    );
+    assert!(
+        row.contains("escape interrupt"),
+        "C10 — the key spells out as `escape`: [{row}]"
+    );
+    assert!(
+        !row.contains("esc interrupt"),
+        "…never abbreviated: [{row}]"
+    );
 
     // `compactOnboarding` sits on the line directly below (`interactive-mode.ts:943-946`, `:952`).
     let onboarding = row_text(&app, hints + 1);
@@ -726,10 +935,16 @@ fn c10_c13_startup_hint_block_is_framed_inset_and_names_the_expand_key() {
         onboarding.contains("Press ctrl+o to show full startup help and loaded resources."),
         "C13 — the only line telling a new user the expanded help exists: [{onboarding}]"
     );
-    assert!(onboarding.starts_with(' '), "the onboarding line is inset too: [{onboarding}]");
+    assert!(
+        onboarding.starts_with(' '),
+        "the onboarding line is inset too: [{onboarding}]"
+    );
 
     // …then the body's own `\n\n` blank, then `onboarding` (`:947-950`), rebranded pi→cyrup.
-    assert!(row_text(&app, hints + 2).trim().is_empty(), "the body's `\\n\\n` blank is missing");
+    assert!(
+        row_text(&app, hints + 2).trim().is_empty(),
+        "the body's `\\n\\n` blank is missing"
+    );
     let closing = row_text(&app, hints + 3);
     assert!(
         closing.contains(
@@ -745,8 +960,14 @@ fn c10_c13_startup_hint_block_is_framed_inset_and_names_the_expand_key() {
     );
 
     // `Spacer(1)` on each side of the block (`:960-962`).
-    assert!(row_text(&app, hints - 1).trim().is_empty(), "no framing blank above the block");
-    assert!(row_text(&app, hints + 4).trim().is_empty(), "no framing blank below the block");
+    assert!(
+        row_text(&app, hints - 1).trim().is_empty(),
+        "no framing blank above the block"
+    );
+    assert!(
+        row_text(&app, hints + 4).trim().is_empty(),
+        "no framing blank below the block"
+    );
     assert_eq!(
         COMPACT_HINT_ROWS, 6,
         "Spacer + compactInstructions + compactOnboarding + blank + onboarding + Spacer"
@@ -767,34 +988,56 @@ fn c13_short_terminal_gives_up_the_edges_and_keeps_the_hint_bar() {
     let render = |rows: u16| -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(100, rows)).unwrap();
         terminal
-            .draw(|f| {
-                crate::render_compact_hints(f, Rect::new(0, 0, 100, rows), &theme, &keymap)
-            })
+            .draw(|f| crate::render_compact_hints(f, Rect::new(0, 0, 100, rows), &theme, &keymap))
             .unwrap();
         let buf = terminal.backend().buffer().clone();
         (0..rows)
             .map(|y| -> String {
-                (0..buf.area.width).filter_map(|x| buf.cell((x, y))).map(|c| c.symbol()).collect()
+                (0..buf.area.width)
+                    .filter_map(|x| buf.cell((x, y)))
+                    .map(|c| c.symbol())
+                    .collect()
             })
             .collect()
     };
 
     let one = render(1);
-    assert!(one[0].contains("escape interrupt"), "one row must BE the hint bar: {one:?}");
+    assert!(
+        one[0].contains("escape interrupt"),
+        "one row must BE the hint bar: {one:?}"
+    );
 
     let two = render(2);
-    assert!(two[0].contains("escape interrupt"), "the bar comes first at two rows: {two:?}");
-    assert!(two[1].contains("Press ctrl+o"), "…then compactOnboarding: {two:?}");
+    assert!(
+        two[0].contains("escape interrupt"),
+        "the bar comes first at two rows: {two:?}"
+    );
+    assert!(
+        two[1].contains("Press ctrl+o"),
+        "…then compactOnboarding: {two:?}"
+    );
 
     let three = render(3);
-    assert!(three[0].contains("escape interrupt"), "three rows: {three:?}");
+    assert!(
+        three[0].contains("escape interrupt"),
+        "three rows: {three:?}"
+    );
     assert!(three[1].contains("Press ctrl+o"), "three rows: {three:?}");
-    assert!(three[2].trim().is_empty(), "the body's inner blank outlives `onboarding`: {three:?}");
+    assert!(
+        three[2].trim().is_empty(),
+        "the body's inner blank outlives `onboarding`: {three:?}"
+    );
 
     // Five rows gives up only the TRAILING blank; the leading one is still there.
     let five = render(5);
-    assert!(five[0].trim().is_empty(), "leading Spacer survives at five rows: {five:?}");
-    assert!(five[4].contains("Cyrup can explain"), "…and the block ends on `onboarding`: {five:?}");
+    assert!(
+        five[0].trim().is_empty(),
+        "leading Spacer survives at five rows: {five:?}"
+    );
+    assert!(
+        five[4].contains("Cyrup can explain"),
+        "…and the block ends on `onboarding`: {five:?}"
+    );
 
     // Four gives up the leading blank too, so the bar is on row 0 and the block still ends on
     // `onboarding` — the two outermost rows go before any text does.
@@ -833,8 +1076,14 @@ fn c13_narrow_terminal_wraps_the_block_instead_of_clipping_it() {
     let mut app = app(80, 24);
     app.draw().unwrap();
     let text = buf_text(&app);
-    assert!(text.contains("ctrl+o"), "the tail of the bar must survive:\n{text}");
-    assert!(text.contains("more"), "…including the word past the wrap point:\n{text}");
+    assert!(
+        text.contains("ctrl+o"),
+        "the tail of the bar must survive:\n{text}"
+    );
+    assert!(
+        text.contains("more"),
+        "…including the word past the wrap point:\n{text}"
+    );
     assert!(
         text.contains("extend Cyrup."),
         "and the tail of the 91-column onboarding line:\n{text}"
@@ -850,19 +1099,34 @@ fn c13_narrow_terminal_wraps_the_block_instead_of_clipping_it() {
 #[test]
 fn c11_app_keymap_keys_label_joins_every_bound_key() {
     let mut km = Keymap::default();
-    assert_eq!(km.keys_label(Action::Interrupt).as_deref(), Some("escape"), "one stock key");
-    km.set_action(Action::Interrupt, vec![Key::parse("escape").unwrap(), Key::ctrl('q')]);
+    assert_eq!(
+        km.keys_label(Action::Interrupt).as_deref(),
+        Some("escape"),
+        "one stock key"
+    );
+    km.set_action(
+        Action::Interrupt,
+        vec![Key::parse("escape").unwrap(), Key::ctrl('q')],
+    );
     assert_eq!(
         km.keys_label(Action::Interrupt).as_deref(),
         Some("escape/ctrl+q"),
         "`formatKeyText(keys.join(\"/\"))` (keybinding-hints.ts:31)"
     );
-    assert_eq!(km.key_label(Action::Interrupt).as_deref(), Some("escape"), "first-key form intact");
+    assert_eq!(
+        km.key_label(Action::Interrupt).as_deref(),
+        Some("escape"),
+        "first-key form intact"
+    );
 
     // …and it reaches the hint bar and the onboarding sentence, which are `hint(…)`/`keyText(…)`.
     let mut expand = Keymap::default();
     expand.set_action(Action::ToolsExpand, vec![Key::ctrl('o'), Key::ctrl('e')]);
-    assert_eq!(crate::compact_hints(&expand)[4].0, "ctrl+o/ctrl+e", "the `more` hint");
+    assert_eq!(
+        crate::compact_hints(&expand)[4].0,
+        "ctrl+o/ctrl+e",
+        "the `more` hint"
+    );
     assert_eq!(
         compact_onboarding(&expand),
         "Press ctrl+o/ctrl+e to show full startup help and loaded resources."
@@ -871,7 +1135,9 @@ fn c11_app_keymap_keys_label_joins_every_bound_key() {
     // The band's cancel hint is `keyText("app.interrupt")` too (`status-indicator.ts:47,78,100`).
     let mut app = app(100, 16);
     app.state_mut().keymap = km;
-    app.state_mut().indicator.set(IndicatorKind::Compaction, None);
+    app.state_mut()
+        .indicator
+        .set(IndicatorKind::Compaction, None);
     app.draw().unwrap();
     let text = buf_text(&app);
     assert!(
@@ -883,8 +1149,12 @@ fn c11_app_keymap_keys_label_joins_every_bound_key() {
     // (`login-dialog.ts:141`, `:163`, `:199`, `:210`) — the fourth site, on the SELECT tier.
     let mut dialog = LoginDialog::new("Login to anthropic", &SelectKeymap::default());
     dialog.show_waiting("Waiting for the browser…");
-    let rendered =
-        dialog.lines().iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>().join("\n");
+    let rendered = dialog
+        .lines()
+        .iter()
+        .map(|(_, t)| t.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         rendered.contains("(escape/ctrl+c to cancel)"),
         "the stock cancel set is `[\"escape\", \"ctrl+c\"]` (tui/src/keybindings.ts:149-152):\n\
@@ -942,15 +1212,31 @@ fn right_cluster_marks_thinking_hidden_and_is_unchanged_when_visible() {
     let mut status = StatusLine::new("anthropic/claude-opus-5");
     status.set_reasoning(true);
     status.set_thinking_level("max");
-    assert!(status.text().contains("• max"), "baseline: [{}]", status.text());
-    assert!(!status.text().contains("hidden"), "clean when visible: [{}]", status.text());
+    assert!(
+        status.text().contains("• max"),
+        "baseline: [{}]",
+        status.text()
+    );
+    assert!(
+        !status.text().contains("hidden"),
+        "clean when visible: [{}]",
+        status.text()
+    );
 
     status.set_thinking_hidden(true);
-    assert!(status.text().contains("• max (hidden)"), "marked: [{}]", status.text());
+    assert!(
+        status.text().contains("• max (hidden)"),
+        "marked: [{}]",
+        status.text()
+    );
 
     // Back off again — the marker is not sticky.
     status.set_thinking_hidden(false);
-    assert!(!status.text().contains("hidden"), "not sticky: [{}]", status.text());
+    assert!(
+        !status.text().contains("hidden"),
+        "not sticky: [{}]",
+        status.text()
+    );
 }
 
 /// MIRROR (C14): every segment pi DOES build is still there, in pi's order
@@ -965,13 +1251,25 @@ fn c14_mirror_the_segments_pi_does_build_are_all_present_and_ordered() {
         cache_read: 88_000,
         cache_write: 2_100,
         total_tokens: 106_500,
-        cost: Cost { total: 0.214, ..Cost::default() },
+        cost: Cost {
+            total: 0.214,
+            ..Cost::default()
+        },
         ..Usage::default()
     });
     status.set_context(0.412, 200_000, true);
     status.set_experimental(true);
     let cluster = status.usage_cluster();
-    let want = ["↑12k", "↓4.1k", "R88k", "W2.1k", "CH", "$0.214", "41.2%/200k (auto)", "• xp"];
+    let want = [
+        "↑12k",
+        "↓4.1k",
+        "R88k",
+        "W2.1k",
+        "CH",
+        "$0.214",
+        "41.2%/200k (auto)",
+        "• xp",
+    ];
     let mut at = 0usize;
     for seg in want {
         let found = cluster[at..]

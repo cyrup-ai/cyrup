@@ -23,7 +23,11 @@ fn opencode_responses_rows_never_emit_a_session_id_header() {
         .into_iter()
         .filter(|m| m.api.as_str() == "openai-responses")
         .collect();
-    assert_eq!(rows.len(), 19, "scope must be the whole api, not a fixed id list");
+    assert_eq!(
+        rows.len(),
+        19,
+        "scope must be the whole api, not a fixed id list"
+    );
 
     for m in &rows {
         let h = build_headers(m, &Context::default(), &auth(), &opts, "sk");

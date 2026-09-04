@@ -106,7 +106,10 @@ fn guide_body(topic: &str) -> Option<&'static str> {
 /// string with the valid list in it does not.
 #[must_use]
 pub fn read_subagent_guide(topic: Option<&str>) -> String {
-    let topic = topic.map(str::trim).filter(|t| !t.is_empty()).unwrap_or(DEFAULT_GUIDE_TOPIC);
+    let topic = topic
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .unwrap_or(DEFAULT_GUIDE_TOPIC);
     match guide_body(topic) {
         Some(body) => body.to_string(),
         None => format!(

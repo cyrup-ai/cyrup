@@ -92,10 +92,10 @@
 
 use std::io::Write;
 
+use ratatui::Frame;
 use ratatui::crossterm::queue;
 use ratatui::crossterm::style::Print;
 use ratatui::layout::Rect;
-use ratatui::Frame;
 
 use crate::image::{ImageBlock, ImageProtocol, ImageRenderer, TerminalCapabilities};
 use crate::theme::UiTheme;
@@ -124,8 +124,7 @@ const DELETE_ALL_KITTY_PLACEMENTS: &str = "\x1b_Ga=d,d=a,q=2\x1b\\";
 
 /// [`DELETE_ALL_KITTY_PLACEMENTS`] in tmux's passthrough, for the reason
 /// [`DELETE_ALL_KITTY_IMAGES_TMUX`] gives.
-const DELETE_ALL_KITTY_PLACEMENTS_TMUX: &str =
-    "\x1bPtmux;\x1b\x1b_Ga=d,d=a,q=2\x1b\x1b\\\x1b\\";
+const DELETE_ALL_KITTY_PLACEMENTS_TMUX: &str = "\x1bPtmux;\x1b\x1b_Ga=d,d=a,q=2\x1b\x1b\\\x1b\\";
 
 /// [`DELETE_ALL_KITTY_IMAGES`] wrapped in tmux's passthrough (`\x1bPtmux;` … `\x1b\\`, with every
 /// inner `ESC` doubled) — the same wrapping `ratatui-image` applies to the transmissions this
@@ -330,7 +329,12 @@ impl ImageLifecycle {
     pub(super) fn new(out: super::out::Out) -> Self {
         // Field-by-field rather than `..Self::default()`: this type implements `Drop`, so struct
         // update syntax cannot move out of the placeholder (E0509).
-        Self { protocol: None, saved: None, placements: PlacementRegistry::default(), out }
+        Self {
+            protocol: None,
+            saved: None,
+            placements: PlacementRegistry::default(),
+            out,
+        }
     }
 
     /// Latch the terminal's protocol and suppress iterm2 images — pi's `beforeTerminalStart` image
@@ -451,8 +455,11 @@ impl ImageLifecycle {
         if preserve_screen || !kitty {
             return;
         }
-        let sequence =
-            if wraps_for_tmux() { DELETE_ALL_KITTY_IMAGES_TMUX } else { DELETE_ALL_KITTY_IMAGES };
+        let sequence = if wraps_for_tmux() {
+            DELETE_ALL_KITTY_IMAGES_TMUX
+        } else {
+            DELETE_ALL_KITTY_IMAGES
+        };
         let _ = queue!(self.out, Print(sequence));
         let _ = self.out.flush();
     }
@@ -556,15 +563,24 @@ pub(super) fn place(
         }
         let want = strip.renderer.cell_size(block, width).1.max(1);
         let height = want.min(bottom.saturating_sub(y));
-        let cell = Rect { x: area.x, y, width, height };
-        strip.renderer.render(frame, cell, block, strip.theme, graphics);
+        let cell = Rect {
+            x: area.x,
+            y,
+            width,
+            height,
+        };
+        strip
+            .renderer
+            .render(frame, cell, block, strip.theme, graphics);
         if track {
             let id = PlacementId {
                 label: block.label().to_string(),
                 dimensions: block.dimensions(),
                 cells: (cell.width, cell.height),
             };
-            lifecycle.placements.touch(id, (cell.width, cell.height), cell_px, generation);
+            lifecycle
+                .placements
+                .touch(id, (cell.width, cell.height), cell_px, generation);
         }
         y = y.saturating_add(height);
     }

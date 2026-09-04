@@ -104,8 +104,8 @@ use ratatui::text::Line;
 
 use crate::altscreen::captured_text;
 use crate::keymap::AltScreenKeymap;
-use crate::transcript::{Entry, ImageOpts, TranscriptView};
 use crate::theme::UiTheme;
+use crate::transcript::{Entry, ImageOpts, TranscriptView};
 use crate::{AltScreen, PointerOutcome, ScrollbarMode, TuiRenderMode, ViewportRenderer};
 
 // ---------------------------------------------------------------------------------------------
@@ -140,7 +140,13 @@ fn viewport(alt: &mut AltScreen<TestBackend>) -> Vec<String> {
         .buffer()
         .content
         .chunks(width)
-        .map(|row| row.iter().map(ratatui::buffer::Cell::symbol).collect::<String>().trim_end().to_owned())
+        .map(|row| {
+            row.iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        })
         .collect()
 }
 
@@ -158,7 +164,12 @@ fn last_column_styles(alt: &mut AltScreen<TestBackend>) -> Vec<ratatui::style::S
 
 /// `terminal.sendInput("\x1b[<64;…M")` — a wheel-up notch over the document (`:73`).
 fn wheel(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
-    MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE }
+    MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -174,19 +185,34 @@ fn wheel(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
 fn enter_and_teardown_write_pi_s_escape_order() {
     let (mut alt, captured, _) = screen(20, 4, 10);
     let entry = captured_text(&captured);
-    assert!(entry.contains("\x1b[?1049h"), "enter must switch to the alternate screen");
-    assert!(entry.contains("\x1b[?7l"), "autowrap off on entry (`tui-alt-screen.ts:53`)");
-    assert!(entry.contains("\x1b[?25l"), "cursor hidden on entry (`:293`)");
+    assert!(
+        entry.contains("\x1b[?1049h"),
+        "enter must switch to the alternate screen"
+    );
+    assert!(
+        entry.contains("\x1b[?7l"),
+        "autowrap off on entry (`tui-alt-screen.ts:53`)"
+    );
+    assert!(
+        entry.contains("\x1b[?25l"),
+        "cursor hidden on entry (`:293`)"
+    );
     assert!(!entry.contains("\x1b[?1049l"), "nothing has torn down yet");
 
     alt.stop(false);
     let full = captured_text(&captured);
-    assert!(full.contains("\x1b[?1049l"), "teardown leaves the alternate screen");
+    assert!(
+        full.contains("\x1b[?1049l"),
+        "teardown leaves the alternate screen"
+    );
     assert!(full.contains("\x1b[?7h"), "autowrap restored (`:327`)");
     assert!(full.contains("\x1b[?25h"), "cursor shown (`:315`)");
     let enter_at = full.find("\x1b[?1049h").unwrap();
     let leave_at = full.find("\x1b[?1049l").unwrap();
-    assert!(enter_at < leave_at, "the excursion must open before it closes");
+    assert!(
+        enter_at < leave_at,
+        "the excursion must open before it closes"
+    );
 }
 
 /// pi `:181` — "uses button-motion tracking inside terminal multiplexers".
@@ -202,9 +228,15 @@ fn mouse_enable_is_multiplexer_aware() {
     let text = captured_text(&captured);
     assert!(text.contains("\x1b[?1000h"), "normal tracking");
     assert!(text.contains("\x1b[?1002h"), "button-event tracking");
-    assert!(text.contains("\x1b[?1004h"), "focus reporting — the selection cancel depends on it");
+    assert!(
+        text.contains("\x1b[?1004h"),
+        "focus reporting — the selection cancel depends on it"
+    );
     assert!(text.contains("\x1b[?1006h"), "SGR extended coordinates");
-    assert!(!text.contains("\x1b[?1015h"), "urxvt coordinates are never enabled");
+    assert!(
+        !text.contains("\x1b[?1015h"),
+        "urxvt coordinates are never enabled"
+    );
 }
 
 /// Mouse reporting is reset on the way out, ahead of leaving the screen (`:306`).
@@ -213,9 +245,15 @@ fn teardown_disables_mouse_before_leaving_the_screen() {
     let (mut alt, captured, _) = screen(20, 4, 4);
     alt.stop(false);
     let text = captured_text(&captured);
-    let disable_at = text.find("\x1b[?1000l").or_else(|| text.find("\x1b[?1002l")).unwrap();
+    let disable_at = text
+        .find("\x1b[?1000l")
+        .or_else(|| text.find("\x1b[?1002l"))
+        .unwrap();
     let leave_at = text.find("\x1b[?1049l").unwrap();
-    assert!(disable_at < leave_at, "the reset belongs inside the teardown bracket");
+    assert!(
+        disable_at < leave_at,
+        "the reset belongs inside the teardown bracket"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -231,14 +269,27 @@ fn teardown_disables_mouse_before_leaving_the_screen() {
 fn renders_the_tail_and_a_wheel_notch_breaks_follow() {
     let (mut alt, _captured, area) = screen(20, 4, 10);
     alt.draw(None).unwrap();
-    assert_eq!(viewport(&mut alt), ["line 7", "line 8", "line 9", "line 10"]);
-    assert!(alt.is_following_output(), "a fresh document follows its tail (`:70`)");
+    assert_eq!(
+        viewport(&mut alt),
+        ["line 7", "line 8", "line 9", "line 10"]
+    );
+    assert!(
+        alt.is_following_output(),
+        "a fresh document follows its tail (`:70`)"
+    );
 
     alt.handle_mouse(&wheel(MouseEventKind::ScrollUp, 1, 1), area);
     alt.draw(None).unwrap();
     assert_eq!(viewport(&mut alt), ["line 6", "line 7", "line 8", "line 9"]);
-    assert_eq!(alt.viewport_top(), 5, "pi asserts `tui.viewportTop === 5` (`:78`)");
-    assert!(!alt.is_following_output(), "and `isFollowingOutput === false` (`:79`)");
+    assert_eq!(
+        alt.viewport_top(),
+        5,
+        "pi asserts `tui.viewportTop === 5` (`:78`)"
+    );
+    assert!(
+        !alt.is_following_output(),
+        "and `isFollowingOutput === false` (`:79`)"
+    );
 
     // `text.setText(... 12 lines ...)` (`:81`) — the parked reader must not be dragged forward.
     alt.set_document_for_test(doc(12), row_starts(12));
@@ -253,7 +304,11 @@ fn horizontal_wheel_is_ignored() {
     let before = alt.viewport_top();
     alt.handle_mouse(&wheel(MouseEventKind::ScrollLeft, 1, 1), area);
     alt.handle_mouse(&wheel(MouseEventKind::ScrollRight, 1, 1), area);
-    assert_eq!(alt.viewport_top(), before, "horizontal notches move nothing");
+    assert_eq!(
+        alt.viewport_top(),
+        before,
+        "horizontal notches move nothing"
+    );
 }
 
 /// The programmatic viewport controls behind `ViewportRenderer` — pi's `scrollToTop`/`scrollToEnd`
@@ -269,11 +324,22 @@ fn scroll_controls_clamp_to_the_document() {
     assert_eq!(alt.viewport_top(), 0, "clamped at the head");
 
     alt.scroll_to_bottom();
-    assert_eq!(alt.viewport_top(), alt.max_scroll_top_for_test(), "the tail is the largest offset");
-    assert!(alt.is_following_output(), "scrolling to the end re-arms the follow");
+    assert_eq!(
+        alt.viewport_top(),
+        alt.max_scroll_top_for_test(),
+        "the tail is the largest offset"
+    );
+    assert!(
+        alt.is_following_output(),
+        "scrolling to the end re-arms the follow"
+    );
 
     alt.scroll_by(100);
-    assert_eq!(alt.viewport_top(), alt.max_scroll_top_for_test(), "clamped at the tail");
+    assert_eq!(
+        alt.viewport_top(),
+        alt.max_scroll_top_for_test(),
+        "clamped at the tail"
+    );
 }
 
 /// A document shorter than the viewport has nothing to scroll — `max_scroll_top` is zero and the
@@ -304,17 +370,28 @@ fn scrollbar_mode_selects_the_reserved_column() {
 
     alt.set_scrollbar_mode(ScrollbarMode::Always);
     assert_eq!(alt.scrollbar_mode_for_test(), ScrollbarMode::Always);
-    assert_eq!(alt.content_width_for_test(area.width), area.width - 1, "`always` reserves a column");
+    assert_eq!(
+        alt.content_width_for_test(area.width),
+        area.width - 1,
+        "`always` reserves a column"
+    );
     alt.draw(None).unwrap();
     let painted = last_column_styles(&mut alt);
 
     alt.set_scrollbar_mode(ScrollbarMode::Hidden);
     assert_eq!(alt.scrollbar_mode_for_test(), ScrollbarMode::Hidden);
-    assert_eq!(alt.content_width_for_test(area.width), area.width, "`hidden` reserves nothing");
+    assert_eq!(
+        alt.content_width_for_test(area.width),
+        area.width,
+        "`hidden` reserves nothing"
+    );
     alt.draw(None).unwrap();
     let bare = last_column_styles(&mut alt);
 
-    assert_ne!(painted, bare, "an `always` bar paints the reserved column where `hidden` does not");
+    assert_ne!(
+        painted, bare,
+        "an `always` bar paints the reserved column where `hidden` does not"
+    );
 }
 
 /// pi `:776-784` — a report the scrollbar CLAIMS clears every selection field, because the pointer
@@ -331,9 +408,15 @@ fn a_scrollbar_grab_cancels_an_in_flight_selection() {
 
     // Then grab the thumb in the reserved last column.
     let bar_col = area.width.saturating_sub(1);
-    alt.handle_mouse(&wheel(MouseEventKind::Down(MouseButton::Left), bar_col, 1), area);
+    alt.handle_mouse(
+        &wheel(MouseEventKind::Down(MouseButton::Left), bar_col, 1),
+        area,
+    );
 
-    assert!(alt.selection_text().is_none(), "the thumb grab dropped the selection");
+    assert!(
+        alt.selection_text().is_none(),
+        "the thumb grab dropped the selection"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -352,14 +435,20 @@ fn a_drag_and_release_yields_the_selected_text() {
 
     alt.handle_mouse(&wheel(MouseEventKind::Down(MouseButton::Left), 0, 0), area);
     alt.handle_mouse(&wheel(MouseEventKind::Drag(MouseButton::Left), 6, 0), area);
-    assert!(alt.selection_text().is_some(), "a live drag has selected text");
+    assert!(
+        alt.selection_text().is_some(),
+        "a live drag has selected text"
+    );
 
     let outcome = alt.handle_mouse(&wheel(MouseEventKind::Up(MouseButton::Left), 6, 0), area);
     let copied = match outcome {
         PointerOutcome::Copy(text) => text,
         _ => String::new(),
     };
-    assert!(!copied.is_empty(), "the release yields PointerOutcome::Copy with the payload");
+    assert!(
+        !copied.is_empty(),
+        "the release yields PointerOutcome::Copy with the payload"
+    );
 }
 
 /// pi `:1170` — "clears an active visible selection on focus loss", and `:1200` — a COMPLETED
@@ -373,14 +462,20 @@ fn focus_loss_clears_an_in_flight_selection_only() {
     alt.handle_mouse(&wheel(MouseEventKind::Down(MouseButton::Left), 0, 0), area);
     alt.handle_mouse(&wheel(MouseEventKind::Drag(MouseButton::Left), 6, 0), area);
     alt.handle_focus_lost();
-    assert!(alt.selection_text().is_none(), "an in-flight drag does not survive focus loss");
+    assert!(
+        alt.selection_text().is_none(),
+        "an in-flight drag does not survive focus loss"
+    );
 
     // Completed: pressed, dragged, released.
     alt.handle_mouse(&wheel(MouseEventKind::Down(MouseButton::Left), 0, 0), area);
     alt.handle_mouse(&wheel(MouseEventKind::Drag(MouseButton::Left), 6, 0), area);
     let _ = alt.handle_mouse(&wheel(MouseEventKind::Up(MouseButton::Left), 6, 0), area);
     alt.handle_focus_lost();
-    assert!(alt.selection_text().is_some(), "a completed selection survives (`:1200`)");
+    assert!(
+        alt.selection_text().is_some(),
+        "a completed selection survives (`:1200`)"
+    );
 }
 
 /// pi `:1088` — "selects whole words on double click … and selects lines on triple click".
@@ -391,10 +486,7 @@ fn focus_loss_clears_an_in_flight_selection_only() {
 #[test]
 fn click_count_widens_the_selection_granularity() {
     let (mut alt, _captured, area) = screen(30, 6, 6);
-    alt.set_document_for_test(
-        vec![Line::from("alpha beta gamma delta"); 6],
-        row_starts(6),
-    );
+    alt.set_document_for_test(vec![Line::from("alpha beta gamma delta"); 6], row_starts(6));
     alt.draw(None).unwrap();
 
     let press = |alt: &mut AltScreen<TestBackend>| {
@@ -409,7 +501,10 @@ fn click_count_widens_the_selection_granularity() {
     press(&mut alt);
     let triple = alt.selection_text().unwrap_or_default().len();
 
-    assert!(double > single, "a double click selects the word, not the character");
+    assert!(
+        double > single,
+        "a double click selects the word, not the character"
+    );
     assert!(triple > double, "a triple click selects the whole line");
 }
 
@@ -419,7 +514,10 @@ fn click_count_widens_the_selection_granularity() {
 fn a_press_below_the_document_is_not_a_selection() {
     let (mut alt, _captured, area) = screen(20, 4, 2);
     alt.draw(None).unwrap();
-    let outcome = alt.handle_mouse(&wheel(MouseEventKind::Down(MouseButton::Left), 0, area.height + 5), area);
+    let outcome = alt.handle_mouse(
+        &wheel(MouseEventKind::Down(MouseButton::Left), 0, area.height + 5),
+        area,
+    );
     assert!(matches!(outcome, PointerOutcome::Ignored));
 }
 
@@ -432,13 +530,22 @@ fn a_press_below_the_document_is_not_a_selection() {
 #[test]
 fn a_flash_paints_and_arms_a_deadline() {
     let (mut alt, _captured, _) = screen(30, 6, 4);
-    assert!(alt.next_deadline().is_none(), "an idle renderer arms nothing");
+    assert!(
+        alt.next_deadline().is_none(),
+        "an idle renderer arms nothing"
+    );
 
     alt.flash("saved", Some(Duration::from_secs(30)));
-    assert!(alt.next_deadline().is_some(), "a live notice is a wake reason");
+    assert!(
+        alt.next_deadline().is_some(),
+        "a live notice is a wake reason"
+    );
 
     alt.draw(None).unwrap();
-    assert!(viewport(&mut alt).iter().any(|row| row.contains("saved")), "the notice is painted");
+    assert!(
+        viewport(&mut alt).iter().any(|row| row.contains("saved")),
+        "the notice is painted"
+    );
 }
 
 /// pi's `dispose()` (`components/alt-screen-flash.ts:38-41`) at `tui-alt-screen.ts:303` — a notice
@@ -466,12 +573,18 @@ fn viewport_keys_scroll_and_unmatched_keys_fall_through() {
     alt.scroll_to_top();
 
     let page_down = KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE);
-    assert!(alt.handle_key(&page_down, &keys, &[]), "PageDown is a viewport binding");
+    assert!(
+        alt.handle_key(&page_down, &keys, &[]),
+        "PageDown is a viewport binding"
+    );
     assert!(alt.viewport_top() > 0, "and it moved the viewport");
 
     // An ordinary character is not a viewport binding: the renderer declines so the editor sees it.
     let typed = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
-    assert!(!alt.handle_key(&typed, &keys, &[]), "unmatched keys fall through to the editor");
+    assert!(
+        !alt.handle_key(&typed, &keys, &[]),
+        "unmatched keys fall through to the editor"
+    );
 }
 
 /// pi `:608` — "jumps between OSC 133 semantic prompt markers".
@@ -490,11 +603,20 @@ fn prompt_navigation_jumps_between_user_entries() {
     // Users sit at entry indices 0, 2, 4 -> prompt rows 5, 15, 25. The interleaved non-user
     // entries are what prove the `Entry::User` filter rather than just the map.
     let entries = vec![
-        Entry::User { text: "first".into(), lead_spacer: false },
+        Entry::User {
+            text: "first".into(),
+            lead_spacer: false,
+        },
         Entry::Assistant("reply".into()),
-        Entry::User { text: "second".into(), lead_spacer: true },
+        Entry::User {
+            text: "second".into(),
+            lead_spacer: true,
+        },
         Entry::Status("note".into()),
-        Entry::User { text: "third".into(), lead_spacer: true },
+        Entry::User {
+            text: "third".into(),
+            lead_spacer: true,
+        },
         Entry::Assistant("tail".into()),
     ];
     alt.set_document_for_test(doc(40), vec![5, 10, 15, 20, 25, 30]);
@@ -503,21 +625,40 @@ fn prompt_navigation_jumps_between_user_entries() {
     let next = KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL);
 
     alt.scroll_to_row_for_test(20);
-    assert!(alt.handle_key(&prev, &keys, &entries), "the chord is consumed either way");
-    assert_eq!(alt.viewport_top(), 15, "the nearest user entry strictly ABOVE row 20");
+    assert!(
+        alt.handle_key(&prev, &keys, &entries),
+        "the chord is consumed either way"
+    );
+    assert_eq!(
+        alt.viewport_top(),
+        15,
+        "the nearest user entry strictly ABOVE row 20"
+    );
 
     alt.scroll_to_row_for_test(20);
     assert!(alt.handle_key(&next, &keys, &entries));
-    assert_eq!(alt.viewport_top(), 25, "the nearest user entry strictly BELOW row 20");
+    assert_eq!(
+        alt.viewport_top(),
+        25,
+        "the nearest user entry strictly BELOW row 20"
+    );
 
     // Both comparisons are strict, so sitting exactly on a prompt row is not a candidate.
     alt.scroll_to_row_for_test(25);
     assert!(alt.handle_key(&next, &keys, &entries));
-    assert_eq!(alt.viewport_top(), 25, "no prompt past the last one — a no-op, with no clamp");
+    assert_eq!(
+        alt.viewport_top(),
+        25,
+        "no prompt past the last one — a no-op, with no clamp"
+    );
 
     alt.scroll_to_row_for_test(0);
     assert!(alt.handle_key(&prev, &keys, &entries));
-    assert_eq!(alt.viewport_top(), 0, "nothing above row 0 — upstream's loop refuses to start");
+    assert_eq!(
+        alt.viewport_top(),
+        0,
+        "nothing above row 0 — upstream's loop refuses to start"
+    );
 }
 
 /// The walk over an empty transcript is inert — upstream's `if (!this.currentLayout) return`
@@ -532,7 +673,11 @@ fn prompt_navigation_over_an_empty_transcript_is_inert() {
     for code in [KeyCode::Up, KeyCode::Down] {
         assert!(alt.handle_key(&KeyEvent::new(code, KeyModifiers::CONTROL), &keys, &[]));
     }
-    assert_eq!(alt.viewport_top(), 8, "no entries means no prompt to jump to");
+    assert_eq!(
+        alt.viewport_top(),
+        8,
+        "no entries means no prompt to jump to"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -548,12 +693,22 @@ fn prompt_navigation_over_an_empty_transcript_is_inert() {
 #[test]
 fn resize_is_a_full_redraw_for_images() {
     let (mut alt, captured, _) = screen(20, 6, 10);
-    assert!(alt.image_protocol_for_test().is_none(), "the test terminal negotiates no graphics");
+    assert!(
+        alt.image_protocol_for_test().is_none(),
+        "the test terminal negotiates no graphics"
+    );
     let before = captured_text(&captured).len();
     alt.handle_resize();
     let after = captured_text(&captured);
-    assert_eq!(after.len(), before, "no protocol means no delete escape (`deleteKittyImages` = \"\")");
-    assert!(!after.contains("\x1b_Ga=d"), "and certainly no kitty delete");
+    assert_eq!(
+        after.len(),
+        before,
+        "no protocol means no delete escape (`deleteKittyImages` = \"\")"
+    );
+    assert!(
+        !after.contains("\x1b_Ga=d"),
+        "and certainly no kitty delete"
+    );
 }
 
 /// The teardown delete is likewise gated on the protocol (`:336-338`), and the registry is emptied
@@ -562,8 +717,15 @@ fn resize_is_a_full_redraw_for_images() {
 fn teardown_clears_the_placement_registry() {
     let (mut alt, captured, _) = screen(20, 6, 10);
     alt.stop(false);
-    assert_eq!(alt.tracked_images_for_test(), 0, "the registry is empty after teardown");
-    assert!(!captured_text(&captured).contains("\x1b_Ga=d"), "no kitty delete on a non-kitty terminal");
+    assert_eq!(
+        alt.tracked_images_for_test(),
+        0,
+        "the registry is empty after teardown"
+    );
+    assert!(
+        !captured_text(&captured).contains("\x1b_Ga=d"),
+        "no kitty delete on a non-kitty terminal"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -583,11 +745,18 @@ fn the_real_document_hand_over_reconciles_against_the_transcript() {
 
     alt.set_document(&transcript, doc(10), row_starts(10));
     alt.draw(None).unwrap();
-    assert_eq!(viewport(&mut alt), ["line 7", "line 8", "line 9", "line 10"]);
+    assert_eq!(
+        viewport(&mut alt),
+        ["line 7", "line 8", "line 9", "line 10"]
+    );
 
     alt.scroll_to_top();
     alt.set_document(&transcript, doc(12), row_starts(12));
-    assert_eq!(alt.viewport_top(), 0, "an untrimmed rebuild leaves a parked reader where it was");
+    assert_eq!(
+        alt.viewport_top(),
+        0,
+        "an untrimmed rebuild leaves a parked reader where it was"
+    );
 }
 
 /// `sync_document` builds the document from the transcript itself — pi's implicit document
@@ -608,7 +777,10 @@ fn syncing_a_populated_transcript_renders_its_entries() {
     transcript.push_user("hello there");
     transcript.commit_assistant(Some("general kenobi".into()));
     let drained = transcript.drain_committed();
-    assert!(!drained.is_empty(), "the fixture actually committed something");
+    assert!(
+        !drained.is_empty(),
+        "the fixture actually committed something"
+    );
     assert!(!transcript.document().is_empty(), "and retention kept it");
 
     alt.sync_document(&transcript, &theme, ImageOpts::default());
@@ -616,9 +788,18 @@ fn syncing_a_populated_transcript_renders_its_entries() {
 
     let rows = viewport(&mut alt);
     let painted = rows.join("\n");
-    assert!(painted.contains("hello there"), "the user submission reaches a rendered row");
-    assert!(painted.contains("general kenobi"), "and so does the assistant reply");
-    assert!(alt.is_following_output(), "a freshly synced document follows its tail");
+    assert!(
+        painted.contains("hello there"),
+        "the user submission reaches a rendered row"
+    );
+    assert!(
+        painted.contains("general kenobi"),
+        "and so does the assistant reply"
+    );
+    assert!(
+        alt.is_following_output(),
+        "a freshly synced document follows its tail"
+    );
 }
 
 /// An empty transcript renders an empty document and the renderer survives drawing one — the
@@ -631,7 +812,10 @@ fn syncing_an_empty_transcript_renders_an_empty_document() {
     let theme = UiTheme::dark();
     alt.sync_document(&transcript, &theme, ImageOpts::default());
     alt.draw(None).unwrap();
-    assert!(viewport(&mut alt).iter().all(|row| row.is_empty()), "nothing to paint");
+    assert!(
+        viewport(&mut alt).iter().all(|row| row.is_empty()),
+        "nothing to paint"
+    );
     assert_eq!(alt.viewport_top(), 0);
 }
 
@@ -647,11 +831,17 @@ fn teardown_repaints_the_document_into_scrollback() {
     alt.draw(None).unwrap();
     alt.stop(false);
     let text = captured_text(&captured);
-    assert!(text.contains("line 1"), "the repaint writes rows the viewport had scrolled past");
+    assert!(
+        text.contains("line 1"),
+        "the repaint writes rows the viewport had scrolled past"
+    );
     assert!(text.contains("line 6"), "through to the last row");
     let leave_at = text.find("\x1b[?1049l").unwrap();
     let first_row_at = text.find("line 1").unwrap();
-    assert!(leave_at < first_row_at, "the repaint lands on the MAIN screen, after leaving");
+    assert!(
+        leave_at < first_row_at,
+        "the repaint lands on the MAIN screen, after leaving"
+    );
 }
 
 /// The other half of the same contract: `preserve_screen: true` is the unwind branch, and it must
@@ -666,7 +856,10 @@ fn preserving_the_screen_skips_the_repaint_entirely() {
     alt.draw(None).unwrap();
     alt.stop(true);
     let text = captured_text(&captured);
-    assert!(text.contains("\x1b[?1049l"), "it still leaves the alternate screen");
+    assert!(
+        text.contains("\x1b[?1049l"),
+        "it still leaves the alternate screen"
+    );
     assert!(!text.contains("line 1"), "but writes no document row");
     assert!(!text.contains("line 6"), "not the last one either");
 }
@@ -691,5 +884,9 @@ fn teardown_is_idempotent() {
     alt.stop(false);
     let once = captured_text(&captured);
     alt.stop(false);
-    assert_eq!(captured_text(&captured), once, "a second teardown writes nothing");
+    assert_eq!(
+        captured_text(&captured),
+        once,
+        "a second teardown writes nothing"
+    );
 }

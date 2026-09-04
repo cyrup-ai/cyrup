@@ -25,13 +25,19 @@
 //! real `IntercomClient`s over the real Unix socket, the real `spawn_inbound_loop` and the real
 //! `IntercomTool` dispatch, observed through a `HostServices` that records `inject_message`.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::common::registration;
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolUpdateSink};
 use cyrup_ext::HostServices;
 use cyrup_intercom::config::IntercomConfig;
@@ -41,7 +47,6 @@ use cyrup_intercom::tools::intercom::IntercomTool;
 use cyrup_intercom::transport::client::{IntercomClient, SendOptions};
 use cyrup_intercom::transport::protocol::now_ms;
 use cyrup_intercom::transport::spawn::wait_for_broker;
-use crate::common::registration;
 
 /// A `HostServices` with a SETTABLE `is_idle` (the live run-in-flight signal `decide_inbound_policy`
 /// reads) that records every `inject_message` — so the delivery COUNT is directly observable rather
@@ -53,13 +58,19 @@ struct IdleControlledHost {
 
 impl IdleControlledHost {
     fn new(idle: bool) -> Self {
-        Self { idle: AtomicBool::new(idle), injected: Mutex::new(Vec::new()) }
+        Self {
+            idle: AtomicBool::new(idle),
+            injected: Mutex::new(Vec::new()),
+        }
     }
     fn set_idle(&self, idle: bool) {
         self.idle.store(idle, Ordering::SeqCst);
     }
     fn injected(&self) -> Vec<String> {
-        self.injected.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.injected
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
@@ -67,7 +78,11 @@ impl HostServices for IdleControlledHost {
     fn is_idle(&self) -> bool {
         self.idle.load(Ordering::SeqCst)
     }
-    fn append_entry(&self, _custom_type: &str, _data: &serde_json::Value) -> Result<String, String> {
+    fn append_entry(
+        &self,
+        _custom_type: &str,
+        _data: &serde_json::Value,
+    ) -> Result<String, String> {
         Ok("entry-1".to_string())
     }
     fn inject_message(
@@ -78,7 +93,10 @@ impl HostServices for IdleControlledHost {
         _details: Option<&serde_json::Value>,
         _trigger_turn: bool,
     ) -> Result<(), String> {
-        self.injected.lock().unwrap_or_else(|e| e.into_inner()).push(content.to_string());
+        self.injected
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(content.to_string());
         Ok(())
     }
 }
@@ -117,9 +135,13 @@ async fn replying_mid_run_dismisses_the_pending_ask_and_never_redelivers() {
 
     // THIS session — busy (a run is in flight) and interactive, so an inbound message is STEERED.
     let agent_client = Arc::new(
-        IntercomClient::connect(&socket_path, registration("agent"), Some("agent-session".into()))
-            .await
-            .expect("agent session connects"),
+        IntercomClient::connect(
+            &socket_path,
+            registration("agent"),
+            Some("agent-session".into()),
+        )
+        .await
+        .expect("agent session connects"),
     );
     let host = Arc::new(IdleControlledHost::new(false));
     let state = Arc::new(SharedIntercomState::new(
@@ -137,20 +159,29 @@ async fn replying_mid_run_dismisses_the_pending_ask_and_never_redelivers() {
     // The PEER stays connected for the whole test — the `reply` below only dismisses on a CONFIRMED
     // delivery, so dropping the peer early would make this pass for the wrong reason.
     let peer_client = Arc::new(
-        IntercomClient::connect(&socket_path, registration("peer"), Some("peer-session".into()))
-            .await
-            .expect("peer session connects"),
+        IntercomClient::connect(
+            &socket_path,
+            registration("peer"),
+            Some("peer-session".into()),
+        )
+        .await
+        .expect("peer session connects"),
     );
-    let agent_id = agent_client.session_id().expect("agent has a broker-assigned id");
+    let agent_id = agent_client
+        .session_id()
+        .expect("agent has a broker-assigned id");
     peer_client
-        .send(&agent_id, SendOptions {
-            text: "should we ship it?".to_string(),
-            attachments: None,
-            reply_to: None,
-            expects_reply: Some(true),
-            message_id: None,
-            ..Default::default()
-        })
+        .send(
+            &agent_id,
+            SendOptions {
+                text: "should we ship it?".to_string(),
+                attachments: None,
+                reply_to: None,
+                expects_reply: Some(true),
+                message_id: None,
+                ..Default::default()
+            },
+        )
         .await
         .expect("peer's ask is accepted by the broker");
 
@@ -191,13 +222,21 @@ async fn replying_mid_run_dismisses_the_pending_ask_and_never_redelivers() {
             _ => None,
         })
         .collect();
-    assert!(out_text.contains("Reply sent"), "the reply reports delivery: {out_text}");
+    assert!(
+        out_text.contains("Reply sent"),
+        "the reply reports delivery: {out_text}"
+    );
 
     // THE CONTRACT: `dismissIncomingAsk` drops the ANSWERED ask from the tracker's pending set
     // (`v0.10.1 index.ts:529-531`, called from the delivered-`reply` arm at `:2226`). Without it
     // the agent's own `intercom{list}` keeps advertising a question it has already answered.
     assert!(
-        state.tracker.lock().unwrap().list_pending(now_ms()).is_empty(),
+        state
+            .tracker
+            .lock()
+            .unwrap()
+            .list_pending(now_ms())
+            .is_empty(),
         "the answered inbound ask must be dismissed from the reply tracker's pending asks"
     );
 

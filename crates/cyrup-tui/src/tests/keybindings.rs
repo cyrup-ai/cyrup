@@ -1,5 +1,10 @@
 //! JSON keybindings loader tests (spec/tui/07 §3.9; `core/keybindings.ts:14-262`).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::{
@@ -15,7 +20,8 @@ fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
 fn keymap_merge_json_rebinds_global_actions() {
     let mut km = Keymap::default();
     // Default: Esc → Interrupt. Rebind interrupt to ctrl+g and exit to a two-key set.
-    km.merge_json(r#"{ "app.interrupt": "ctrl+g", "app.exit": ["ctrl+x", "ctrl+q"] }"#).unwrap();
+    km.merge_json(r#"{ "app.interrupt": "ctrl+g", "app.exit": ["ctrl+x", "ctrl+q"] }"#)
+        .unwrap();
 
     // Esc no longer interrupts (the old key was dropped on rebind).
     assert_eq!(km.action_for(&key(KeyCode::Esc, KeyModifiers::NONE)), None);
@@ -24,8 +30,14 @@ fn keymap_merge_json_rebinds_global_actions() {
         Some(Action::Interrupt)
     );
     // Both exit keys resolve.
-    assert_eq!(km.action_for(&key(KeyCode::Char('x'), KeyModifiers::CONTROL)), Some(Action::Quit));
-    assert_eq!(km.action_for(&key(KeyCode::Char('q'), KeyModifiers::CONTROL)), Some(Action::Quit));
+    assert_eq!(
+        km.action_for(&key(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+        Some(Action::Quit)
+    );
+    assert_eq!(
+        km.action_for(&key(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+        Some(Action::Quit)
+    );
     // Untouched defaults survive (Ctrl+Z → Suspend).
     assert_eq!(
         km.action_for(&key(KeyCode::Char('z'), KeyModifiers::CONTROL)),
@@ -49,7 +61,10 @@ fn select_and_editor_maps_merge_their_own_ids_only() {
         Some(SelectAction::Confirm)
     );
     // The app id is ignored by the select map (no panic, no spurious binding).
-    assert_eq!(sk.action_for(&key(KeyCode::Char('g'), KeyModifiers::CONTROL)), None);
+    assert_eq!(
+        sk.action_for(&key(KeyCode::Char('g'), KeyModifiers::CONTROL)),
+        None
+    );
 
     let mut ek = EditorKeymap::default();
     ek.merge_json(doc).unwrap();
@@ -67,7 +82,10 @@ fn editor_keymap_merges_tui_input_copy() {
     // Bound to nothing by default, deliberately: cyrup's editor map claims no `ctrl+c`, so the
     // chord already reaches the app tier and upstream's default entry would change nothing here.
     let stock = EditorKeymap::default();
-    assert_eq!(stock.action_for(&key(KeyCode::Char('q'), KeyModifiers::CONTROL)), None);
+    assert_eq!(
+        stock.action_for(&key(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+        None
+    );
     assert_eq!(stock.key_label(EditorAction::PassThrough), None);
 
     let mut ek = EditorKeymap::default();
@@ -85,8 +103,14 @@ fn editor_keymap_merges_tui_input_copy() {
         legacy.action_for(&key(KeyCode::Char('q'), KeyModifiers::CONTROL)),
         Some(EditorAction::PassThrough)
     );
-    assert_eq!(EditorAction::from_id("tui.input.copy"), Some(EditorAction::PassThrough));
-    assert_eq!(EditorAction::from_id("copy"), Some(EditorAction::PassThrough));
+    assert_eq!(
+        EditorAction::from_id("tui.input.copy"),
+        Some(EditorAction::PassThrough)
+    );
+    assert_eq!(
+        EditorAction::from_id("copy"),
+        Some(EditorAction::PassThrough)
+    );
 }
 
 #[test]
@@ -104,8 +128,14 @@ fn models_keymap_merges_app_models_ids_only() {
         mk.action_for(&key(KeyCode::Enter, KeyModifiers::CONTROL)),
         Some(ModelsAction::Save)
     );
-    assert_eq!(mk.action_for(&key(KeyCode::Char('s'), KeyModifiers::CONTROL)), None);
-    assert_eq!(mk.action_for(&key(KeyCode::Up, KeyModifiers::SHIFT)), Some(ModelsAction::ReorderUp));
+    assert_eq!(
+        mk.action_for(&key(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+        None
+    );
+    assert_eq!(
+        mk.action_for(&key(KeyCode::Up, KeyModifiers::SHIFT)),
+        Some(ModelsAction::ReorderUp)
+    );
     // Defaults untouched by the doc survive (Ctrl+A → enableAll).
     assert_eq!(
         mk.action_for(&key(KeyCode::Char('a'), KeyModifiers::CONTROL)),
@@ -124,7 +154,10 @@ fn key_label_round_trips_through_parse() {
     assert_eq!(Key::parse("escape").unwrap().label(), "escape");
     assert_eq!(Key::parse("shift+tab").unwrap().label(), "shift+tab");
     // The default interrupt key surfaces as the `escape` cancel hint (spec/tui/01 §6.1).
-    assert_eq!(Keymap::default().key_label(Action::Interrupt).as_deref(), Some("escape"));
+    assert_eq!(
+        Keymap::default().key_label(Action::Interrupt).as_deref(),
+        Some("escape")
+    );
 }
 
 #[test]
@@ -139,12 +172,22 @@ fn hotkey_cells_match_pis_key_text_for_shift_tab_and_the_page_keys() {
     // fix the cell read `Shift+Tab/Shift+Shift+Tab/Shift+Tab`, whose middle entry is not a
     // chord any terminal sends and which `Key::parse` reads back as plain `Tab`+SHIFT.
     let km = Keymap::default();
-    assert_eq!(km.keys_label(Action::ThinkingCycle).as_deref(), Some("shift+tab"));
+    assert_eq!(
+        km.keys_label(Action::ThinkingCycle).as_deref(),
+        Some("shift+tab")
+    );
     assert_eq!(
         crate::chrome::format_key_text(&km.keys_label(Action::ThinkingCycle).unwrap(), true),
         "Shift+Tab"
     );
-    assert_eq!(Key { code: KeyCode::BackTab, mods: KeyModifiers::SHIFT }.label(), "shift+tab");
+    assert_eq!(
+        Key {
+            code: KeyCode::BackTab,
+            mods: KeyModifiers::SHIFT
+        }
+        .label(),
+        "shift+tab"
+    );
 
     // `tui.editor.pageUp` / `pageDown` are camelCase `KeyId`s upstream
     // (`tui/src/keybindings.ts:89-90` @v0.83.0) and `formatKeyPart` upper-cases only the first
@@ -153,7 +196,12 @@ fn hotkey_cells_match_pis_key_text_for_shift_tab_and_the_page_keys() {
     assert_eq!(Key::plain(KeyCode::PageUp).label(), "pageUp");
     assert_eq!(Key::plain(KeyCode::PageDown).label(), "pageDown");
     assert_eq!(Key::parse("pageUp").unwrap(), Key::plain(KeyCode::PageUp));
-    assert_eq!(Key::parse(&Key::plain(KeyCode::PageDown).label()).unwrap().code, KeyCode::PageDown);
+    assert_eq!(
+        Key::parse(&Key::plain(KeyCode::PageDown).label())
+            .unwrap()
+            .code,
+        KeyCode::PageDown
+    );
     assert_eq!(crate::chrome::format_key_text("pageUp", true), "PageUp");
     assert_eq!(km.keys_label(Action::PageUp).as_deref(), Some("pageUp"));
 }
@@ -161,17 +209,33 @@ fn hotkey_cells_match_pis_key_text_for_shift_tab_and_the_page_keys() {
 #[test]
 fn malformed_keybindings_json_errors_cleanly() {
     let mut km = Keymap::default();
-    assert!(km.merge_json("not json").is_err(), "garbage json should error");
-    assert!(km.merge_json("[1,2,3]").is_err(), "a non-object document should error");
+    assert!(
+        km.merge_json("not json").is_err(),
+        "garbage json should error"
+    );
+    assert!(
+        km.merge_json("[1,2,3]").is_err(),
+        "a non-object document should error"
+    );
     // CFG-038 — an invalid key SPEC is no longer a document-level error. Pi cannot fail one here at
     // all: a `KeyId` is a plain string, so `"ctrl+nope+bad+"` survives into `keysById` and simply
     // never matches (`packages/tui/src/keybindings.ts:198-204` @v0.83.0). The action ends up
     // unbound, and the entry is REPORTED rather than thrown.
-    let issues = km.merge_json(r#"{ "app.exit": "ctrl+nope+bad+" }"#).unwrap();
-    assert_eq!(issues.len(), 1, "the bad spec is reported, not thrown: {issues:?}");
+    let issues = km
+        .merge_json(r#"{ "app.exit": "ctrl+nope+bad+" }"#)
+        .unwrap();
+    assert_eq!(
+        issues.len(),
+        1,
+        "the bad spec is reported, not thrown: {issues:?}"
+    );
     assert_eq!(issues[0].id, "app.exit");
     // Unknown ids are silently ignored (forward-compat), not an error and not an issue.
-    assert_eq!(km.merge_json(r#"{ "some.future.binding": "ctrl+a" }"#).unwrap(), Vec::new());
+    assert_eq!(
+        km.merge_json(r#"{ "some.future.binding": "ctrl+a" }"#)
+            .unwrap(),
+        Vec::new()
+    );
 }
 
 /// CFG-038 — one unusable entry must not discard the rest of the document, and must not be
@@ -209,7 +273,10 @@ fn one_bad_entry_does_not_discard_or_half_apply_the_document() {
         .unwrap();
 
     // The entry BEFORE the bad one, in sorted order, applied.
-    assert_eq!(km.action_for(&key(KeyCode::Char('x'), KeyModifiers::CONTROL)), Some(Action::Quit));
+    assert_eq!(
+        km.action_for(&key(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+        Some(Action::Quit)
+    );
     // ...and so did the one AFTER it — the half-application this item names.
     assert_eq!(
         km.action_for(&key(KeyCode::Char('w'), KeyModifiers::CONTROL)),
@@ -282,7 +349,11 @@ fn pis_canonical_editor_and_input_ids_resolve() {
         ("tui.input.submit", EditorAction::Submit),
         ("tui.input.tab", EditorAction::Tab),
     ] {
-        assert_eq!(EditorAction::from_id(id), Some(want), "pi's id `{id}` must resolve");
+        assert_eq!(
+            EditorAction::from_id(id),
+            Some(want),
+            "pi's id `{id}` must resolve"
+        );
     }
 }
 
@@ -291,9 +362,15 @@ fn pis_canonical_editor_and_input_ids_resolve() {
 /// migrates them forward on every load (`migrateKeybindingsConfig`, `:289-309`).
 #[test]
 fn pis_legacy_bare_names_resolve_too() {
-    assert_eq!(EditorAction::from_id("cursorUp"), Some(EditorAction::CursorUp));
+    assert_eq!(
+        EditorAction::from_id("cursorUp"),
+        Some(EditorAction::CursorUp)
+    );
     assert_eq!(EditorAction::from_id("pageUp"), Some(EditorAction::PageUp));
-    assert_eq!(EditorAction::from_id("newLine"), Some(EditorAction::NewLine));
+    assert_eq!(
+        EditorAction::from_id("newLine"),
+        Some(EditorAction::NewLine)
+    );
 }
 
 /// The shipped-cyrup `editor.*` spellings stay accepted, so a config written against cyrup's own
@@ -301,15 +378,22 @@ fn pis_legacy_bare_names_resolve_too() {
 /// table makes.
 #[test]
 fn cyrups_shipped_editor_ids_stay_accepted_as_aliases() {
-    assert_eq!(EditorAction::from_id("editor.cursorLeft"), Some(EditorAction::CursorLeft));
-    assert_eq!(EditorAction::from_id("editor.submit"), Some(EditorAction::Submit));
+    assert_eq!(
+        EditorAction::from_id("editor.cursorLeft"),
+        Some(EditorAction::CursorLeft)
+    );
+    assert_eq!(
+        EditorAction::from_id("editor.submit"),
+        Some(EditorAction::Submit)
+    );
 }
 
 /// A `tui.editor.*` rebind actually takes effect through `merge_json`, end to end.
 #[test]
 fn a_tui_editor_id_rebinds_the_live_editor_map() {
     let mut ek = EditorKeymap::default();
-    ek.merge_json(r#"{"tui.editor.cursorWordLeft": "alt+h"}"#).unwrap();
+    ek.merge_json(r#"{"tui.editor.cursorWordLeft": "alt+h"}"#)
+        .unwrap();
     assert_eq!(
         ek.action_for(&key(KeyCode::Char('h'), KeyModifiers::ALT)),
         Some(EditorAction::CursorWordLeft)
@@ -324,14 +408,26 @@ fn a_tui_editor_id_rebinds_the_live_editor_map() {
 #[test]
 fn the_autocomplete_popup_resolves_through_pis_select_ids() {
     use crate::AutocompleteAction;
-    assert_eq!(AutocompleteAction::from_id("tui.select.up"), Some(AutocompleteAction::Previous));
-    assert_eq!(AutocompleteAction::from_id("tui.select.down"), Some(AutocompleteAction::Next));
-    assert_eq!(AutocompleteAction::from_id("tui.input.tab"), Some(AutocompleteAction::Accept));
+    assert_eq!(
+        AutocompleteAction::from_id("tui.select.up"),
+        Some(AutocompleteAction::Previous)
+    );
+    assert_eq!(
+        AutocompleteAction::from_id("tui.select.down"),
+        Some(AutocompleteAction::Next)
+    );
+    assert_eq!(
+        AutocompleteAction::from_id("tui.input.tab"),
+        Some(AutocompleteAction::Accept)
+    );
     assert_eq!(
         AutocompleteAction::from_id("tui.select.confirm"),
         Some(AutocompleteAction::AcceptSubmit)
     );
-    assert_eq!(AutocompleteAction::from_id("tui.select.cancel"), Some(AutocompleteAction::Cancel));
+    assert_eq!(
+        AutocompleteAction::from_id("tui.select.cancel"),
+        Some(AutocompleteAction::Cancel)
+    );
     // The invented spellings stay as aliases.
     assert_eq!(
         AutocompleteAction::from_id("tui.autocomplete.previous"),
@@ -348,7 +444,10 @@ fn the_history_ids_resolve_and_are_unbound_by_default() {
         EditorAction::from_id("tui.editor.historyPrevious"),
         Some(EditorAction::HistoryPrevious)
     );
-    assert_eq!(EditorAction::from_id("tui.editor.historyNext"), Some(EditorAction::HistoryNext));
+    assert_eq!(
+        EditorAction::from_id("tui.editor.historyNext"),
+        Some(EditorAction::HistoryNext)
+    );
     let ek = EditorKeymap::default();
     for code in [KeyCode::Char('p'), KeyCode::Char('n')] {
         assert!(
@@ -372,12 +471,17 @@ fn a_bound_history_action_recalls_from_the_middle_of_a_multi_line_buffer() {
     use crate::{EditorOutcome, InputEditor};
     let mut ed = InputEditor::new();
     ed.push_history("earlier prompt");
-    ed.merge_keybindings_json(r#"{"tui.editor.historyPrevious": "ctrl+p"}"#).unwrap();
+    ed.merge_keybindings_json(r#"{"tui.editor.historyPrevious": "ctrl+p"}"#)
+        .unwrap();
     // A two-line buffer with the caret on the SECOND line: Up would move the caret, not recall.
     ed.set_text("one\ntwo");
     let out = ed.handle_key(&key(KeyCode::Char('p'), KeyModifiers::CONTROL));
     assert!(matches!(out, EditorOutcome::Edited));
-    assert_eq!(ed.text(), "earlier prompt", "the history action must browse regardless of caret");
+    assert_eq!(
+        ed.text(),
+        "earlier prompt",
+        "the history action must browse regardless of caret"
+    );
 }
 
 /// TUI-051 — `/reload` must actually re-read `<agent_dir>/keybindings.json`, and must RESTORE the
@@ -403,7 +507,9 @@ fn reload_rereads_the_file_and_restores_a_deleted_entrys_default() {
     std::fs::write(&path, r#"{"app.tools.expand": "ctrl+e"}"#).unwrap();
     app.reload_keybindings_from(dir.path()).unwrap();
     assert_eq!(
-        app.state().keymap.action_for(&key(KeyCode::Char('e'), KeyModifiers::CONTROL)),
+        app.state()
+            .keymap
+            .action_for(&key(KeyCode::Char('e'), KeyModifiers::CONTROL)),
         Some(Action::ToolsExpand)
     );
 
@@ -411,11 +517,15 @@ fn reload_rereads_the_file_and_restores_a_deleted_entrys_default() {
     std::fs::write(&path, r#"{"app.tools.expand": "ctrl+y"}"#).unwrap();
     app.reload_keybindings_from(dir.path()).unwrap();
     assert_eq!(
-        app.state().keymap.action_for(&key(KeyCode::Char('y'), KeyModifiers::CONTROL)),
+        app.state()
+            .keymap
+            .action_for(&key(KeyCode::Char('y'), KeyModifiers::CONTROL)),
         Some(Action::ToolsExpand)
     );
     assert_ne!(
-        app.state().keymap.action_for(&key(KeyCode::Char('e'), KeyModifiers::CONTROL)),
+        app.state()
+            .keymap
+            .action_for(&key(KeyCode::Char('e'), KeyModifiers::CONTROL)),
         Some(Action::ToolsExpand),
         "the previous user chord must not survive"
     );
@@ -424,7 +534,9 @@ fn reload_rereads_the_file_and_restores_a_deleted_entrys_default() {
     std::fs::write(&path, "{}").unwrap();
     app.reload_keybindings_from(dir.path()).unwrap();
     assert_eq!(
-        app.state().keymap.action_for(&key(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+        app.state()
+            .keymap
+            .action_for(&key(KeyCode::Char('o'), KeyModifiers::CONTROL)),
         Some(Action::ToolsExpand),
         "a removed entry must fall back to its default, not keep its last user chord"
     );
@@ -437,9 +549,12 @@ fn reload_with_no_keybindings_file_leaves_the_defaults_in_place() {
     use ratatui::backend::TestBackend;
     let dir = tempfile::tempdir().unwrap();
     let mut app = App::new(TestBackend::new(40, 10), UiTheme::dark()).unwrap();
-    app.reload_keybindings_from(dir.path()).expect("a missing file is not an error");
+    app.reload_keybindings_from(dir.path())
+        .expect("a missing file is not an error");
     assert_eq!(
-        app.state().keymap.action_for(&key(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+        app.state()
+            .keymap
+            .action_for(&key(KeyCode::Char('o'), KeyModifiers::CONTROL)),
         Some(Action::ToolsExpand)
     );
 }
@@ -483,7 +598,10 @@ fn legacy_keybinding_ids_bind_at_read_time_without_an_on_disk_migration() {
     );
     // Same vacuous-pass guard as above: `yankPop`'s stock `alt+y` must be GONE, which is what
     // proves the migrated entry was applied rather than merely appended alongside the default.
-    assert_eq!(ek.action_for(&key(KeyCode::Char('y'), KeyModifiers::ALT)), None);
+    assert_eq!(
+        ek.action_for(&key(KeyCode::Char('y'), KeyModifiers::ALT)),
+        None
+    );
 
     // And pin the shadowing itself, so the agreement with upstream above is a fact of this suite
     // rather than a coincidence of `EditorKeymap`'s vector order: rebinding `yankPop` onto `yank`'s
@@ -507,10 +625,14 @@ fn legacy_keybinding_ids_bind_at_read_time_without_an_on_disk_migration() {
 #[test]
 fn a_modern_id_beats_its_legacy_twin_regardless_of_map_order() {
     let mut km = Keymap::default();
-    km.merge_json(r#"{ "interrupt": "ctrl+q", "app.interrupt": "ctrl+e" }"#).unwrap();
+    km.merge_json(r#"{ "interrupt": "ctrl+q", "app.interrupt": "ctrl+e" }"#)
+        .unwrap();
     assert_eq!(
         km.action_for(&key(KeyCode::Char('e'), KeyModifiers::CONTROL)),
         Some(Action::Interrupt)
     );
-    assert_eq!(km.action_for(&key(KeyCode::Char('q'), KeyModifiers::CONTROL)), None);
+    assert_eq!(
+        km.action_for(&key(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+        None
+    );
 }

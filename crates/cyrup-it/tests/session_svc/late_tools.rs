@@ -21,14 +21,19 @@
 // always true here. Re-spelled in cyrup-it it would name THIS crate's `wasm-host`, which
 // `--features it` does not enable, and every test below would SILENTLY not compile in.
 // See the `[[test]]` note in crates/cyrup-it/Cargo.toml.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use cyrup_core::{ExtensionId, StopReason};
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider, FauxResponseStep};
 use cyrup_provider::Provider;
+use cyrup_provider::faux::{FauxProvider, FauxResponseStep, faux_assistant_message, faux_text};
 use cyrup_session_svc::{SessionBuilder, SessionConfig};
 use tempfile::TempDir;
 
@@ -52,7 +57,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -124,12 +133,17 @@ async fn a_tool_registered_from_session_start_reaches_the_live_agent() {
         "a tool registered from `session_start` joined the ACTIVE set: {after:?}"
     );
     assert!(
-        session.tool_definition("demo_late").is_some_and(|t| t.active),
+        session
+            .tool_definition("demo_late")
+            .is_some_and(|t| t.active),
         "the late tool is enable-able AND active in the session's registry"
     );
     // Nothing was lost: the built-ins the session started with are still active.
     for kept in &before {
-        assert!(after.contains(kept), "the refresh kept `{kept}` active: {after:?}");
+        assert!(
+            after.contains(kept),
+            "the refresh kept `{kept}` active: {after:?}"
+        );
     }
 
     // (2) THE LIVE PROOF: drive a real turn and read the tool array the AGENT handed the model.
@@ -138,7 +152,10 @@ async fn a_tool_registered_from_session_start_reaches_the_live_agent() {
     session.wait_for_idle().await;
 
     let turns = captured.lock().unwrap().clone();
-    assert!(!turns.is_empty(), "the agent drove at least one real turn against the provider");
+    assert!(
+        !turns.is_empty(),
+        "the agent drove at least one real turn against the provider"
+    );
     let (tools, prompt) = turns.last().unwrap().clone();
     assert!(
         tools.iter().any(|t| t == "demo_late"),

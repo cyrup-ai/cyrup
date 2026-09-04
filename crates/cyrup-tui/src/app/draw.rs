@@ -147,11 +147,16 @@ impl<B: Backend> App<B> {
             // reconstruction rather than getting stuck believing it already happened.
             match self.resize_viewport(desired) {
                 Ok(()) => self.viewport_height = desired,
-                Err(e) => self.state.transcript.push_status(format!("viewport resize failed: {e}")),
+                Err(e) => self
+                    .state
+                    .transcript
+                    .push_status(format!("viewport resize failed: {e}")),
             }
         }
         self.flush_committed()?;
-        let App { terminal, state, .. } = self;
+        let App {
+            terminal, state, ..
+        } = self;
         terminal
             .draw(|frame| render(frame, state))
             .map_err(|e| TuiError::Backend(e.to_string()))?;
@@ -198,8 +203,12 @@ impl<B: Backend> App<B> {
         // Destructured for the disjoint borrows: `sync_document` reads the transcript and the theme
         // while the renderer it hands them to is mutably borrowed out of the same `self` — the
         // shape `app/draw.rs:89` and `altscreen/mod.rs`'s rule 1 both already use.
-        let App { altscreen, state, .. } = self;
-        let Some(alt) = altscreen.as_mut() else { return Ok(()) };
+        let App {
+            altscreen, state, ..
+        } = self;
+        let Some(alt) = altscreen.as_mut() else {
+            return Ok(());
+        };
         alt.sync_document(&state.transcript, &state.theme, image_opts(state, None));
         // §B-12's strip, built from the same two `AppState` fields the inline path renders from, so
         // an attachment cannot look different across a mode switch.
@@ -228,12 +237,16 @@ impl<B: Backend> App<B> {
         let size = self.terminal.backend().size().ok();
         let term_h = size.map(|s| s.height).unwrap_or(height).max(1);
         let old_h = self.viewport_height;
-        self.terminal.backend_mut().reanchor_inline(term_h, old_h, height);
+        self.terminal
+            .backend_mut()
+            .reanchor_inline(term_h, old_h, height);
 
         let backend = self.terminal.backend().rebuild();
         let terminal = Terminal::with_options(
             backend,
-            TerminalOptions { viewport: Viewport::Inline(height.max(1)) },
+            TerminalOptions {
+                viewport: Viewport::Inline(height.max(1)),
+            },
         )
         .map_err(|e| TuiError::Backend(e.to_string()))?;
         self.terminal = terminal;

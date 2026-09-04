@@ -133,7 +133,9 @@ mod tests {
     /// Take [`HOOK_LOCK`], ignoring poisoning: a sibling test that panicked already reported its own
     /// failure, and refusing the lock here would turn that into a second, misleading one.
     fn lock_hook() -> std::sync::MutexGuard<'static, ()> {
-        HOOK_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        HOOK_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// The chaining property: the panic message must still be produced. A hook that restored the

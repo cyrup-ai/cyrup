@@ -17,7 +17,11 @@ pub struct StoreLimits {
 impl Default for StoreLimits {
     fn default() -> Self {
         // 64 MiB default per-extension cap (bounded memory, R-00-002).
-        Self { max_memory: 64 * 1024 * 1024, max_tables: 10_000, max_instances: 100 }
+        Self {
+            max_memory: 64 * 1024 * 1024,
+            max_tables: 10_000,
+            max_instances: 100,
+        }
     }
 }
 

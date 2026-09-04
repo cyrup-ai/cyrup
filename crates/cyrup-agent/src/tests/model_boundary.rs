@@ -15,13 +15,12 @@ use crate::{
     StreamFn, TurnUpdate,
 };
 use cyrup_core::{
-    TerminateHint,
-    CancelToken, Content, ModelRef, ModelThinkingLevel, StopReason, Tool, ToolCallId, ToolError,
-    ToolResult, ToolUpdateSink,
+    CancelToken, Content, ModelRef, ModelThinkingLevel, StopReason, TerminateHint, Tool,
+    ToolCallId, ToolError, ToolResult, ToolUpdateSink,
 };
 use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_thinking, faux_tool_call};
 use cyrup_provider::{CacheRetention, Transport};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::support::{self, *};
 
@@ -56,7 +55,11 @@ fn recording_stream_fn(
     responses: Vec<cyrup_core::AssistantMessage>,
 ) -> (Arc<dyn StreamFn>, Arc<Mutex<Vec<Captured>>>) {
     support::recording_stream_fn(responses, |model, ctx, opts| Captured {
-        tools: ctx.tools.iter().map(|t| (t.name.clone(), t.description.clone())).collect(),
+        tools: ctx
+            .tools
+            .iter()
+            .map(|t| (t.name.clone(), t.description.clone()))
+            .collect(),
         reasoning: opts.reasoning,
         temperature: opts.temperature,
         max_tokens: opts.max_tokens,
@@ -102,7 +105,9 @@ impl Tool for DescribedTool {
         Some("Echo")
     }
     async fn prepare_arguments(&self, mut args: Value) -> Value {
-        if self.inject && let Value::Object(ref mut m) = args {
+        if self.inject
+            && let Value::Object(ref mut m) = args
+        {
             m.insert("injected".into(), json!(true));
         }
         args
@@ -116,7 +121,12 @@ impl Tool for DescribedTool {
     ) -> Result<ToolResult, ToolError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         *self.seen.lock().unwrap() = Some(params);
-        Ok(ToolResult { content: vec![Content::text("ok")], details: None, terminate: TerminateHint::Unspecified, ..Default::default() })
+        Ok(ToolResult {
+            content: vec![Content::text("ok")],
+            details: None,
+            terminate: TerminateHint::Unspecified,
+            ..Default::default()
+        })
     }
 }
 
@@ -141,7 +151,12 @@ impl Tool for TerminateTool {
         _cancel: CancelToken,
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
-        Ok(ToolResult { content: vec![Content::text("bye")], details: None, terminate: TerminateHint::Terminate, ..Default::default() })
+        Ok(ToolResult {
+            content: vec![Content::text("bye")],
+            details: None,
+            terminate: TerminateHint::Terminate,
+            ..Default::default()
+        })
     }
 }
 
@@ -182,8 +197,10 @@ async fn gap1_tool_description_forwarded_to_provider() {
 
 #[tokio::test]
 async fn gap3_5_6_8_generation_params_forwarded() {
-    let (sf, captured) =
-        recording_stream_fn(vec![faux_assistant_message(vec![faux_text("hi")], StopReason::Stop)]);
+    let (sf, captured) = recording_stream_fn(vec![faux_assistant_message(
+        vec![faux_text("hi")],
+        StopReason::Stop,
+    )]);
     let agent = Agent::builder(model_ref(), sf)
         .system_prompt("sys")
         .thinking_level(ModelThinkingLevel::Medium)
@@ -198,7 +215,11 @@ async fn gap3_5_6_8_generation_params_forwarded() {
 
     let cap = captured.lock().unwrap();
     let c = &cap[0];
-    assert_eq!(c.reasoning, ModelThinkingLevel::Medium, "thinking level must forward as reasoning");
+    assert_eq!(
+        c.reasoning,
+        ModelThinkingLevel::Medium,
+        "thinking level must forward as reasoning"
+    );
     assert_eq!(c.temperature, Some(0.25));
     assert_eq!(c.max_tokens, Some(512));
     assert_eq!(c.cache_retention, Some(CacheRetention::Long));
@@ -213,11 +234,19 @@ async fn provider_env_overlay_and_timeout_forward_to_stream_options() {
     // The HTTP-proxy overlay + idle timeout (Pi `applyHttpProxySettings`/`configureHttpDispatcher`,
     // main.ts:744-745) must reach `StreamOptions.env`/`timeout_ms` so the provider's proxy resolver
     // honors the configured proxy.
-    let (sf, captured) =
-        recording_stream_fn(vec![faux_assistant_message(vec![faux_text("hi")], StopReason::Stop)]);
+    let (sf, captured) = recording_stream_fn(vec![faux_assistant_message(
+        vec![faux_text("hi")],
+        StopReason::Stop,
+    )]);
     let mut overlay = cyrup_provider::ProviderEnv::new();
-    overlay.insert("HTTP_PROXY".to_string(), "http://proxy.local:8080".to_string());
-    overlay.insert("HTTPS_PROXY".to_string(), "http://proxy.local:8080".to_string());
+    overlay.insert(
+        "HTTP_PROXY".to_string(),
+        "http://proxy.local:8080".to_string(),
+    );
+    overlay.insert(
+        "HTTPS_PROXY".to_string(),
+        "http://proxy.local:8080".to_string(),
+    );
     let agent = Agent::builder(model_ref(), sf)
         .provider_env(overlay)
         .timeout_ms(120_000)
@@ -226,16 +255,27 @@ async fn provider_env_overlay_and_timeout_forward_to_stream_options() {
 
     let cap = captured.lock().unwrap();
     let c = &cap[0];
-    let env = c.env.as_ref().expect("the provider env overlay must forward");
-    assert_eq!(env.get("HTTP_PROXY").map(String::as_str), Some("http://proxy.local:8080"));
-    assert_eq!(env.get("HTTPS_PROXY").map(String::as_str), Some("http://proxy.local:8080"));
+    let env = c
+        .env
+        .as_ref()
+        .expect("the provider env overlay must forward");
+    assert_eq!(
+        env.get("HTTP_PROXY").map(String::as_str),
+        Some("http://proxy.local:8080")
+    );
+    assert_eq!(
+        env.get("HTTPS_PROXY").map(String::as_str),
+        Some("http://proxy.local:8080")
+    );
     assert_eq!(c.timeout_ms, Some(120_000));
 }
 
 #[tokio::test]
 async fn transport_defaults_to_auto_like_pi() {
-    let (sf, captured) =
-        recording_stream_fn(vec![faux_assistant_message(vec![faux_text("hi")], StopReason::Stop)]);
+    let (sf, captured) = recording_stream_fn(vec![faux_assistant_message(
+        vec![faux_text("hi")],
+        StopReason::Stop,
+    )]);
     let agent = Agent::builder(model_ref(), sf).build();
     agent.prompt("go").await.unwrap().finished().await;
     assert_eq!(captured.lock().unwrap()[0].transport, Some(Transport::Auto));
@@ -247,11 +287,16 @@ async fn transport_defaults_to_auto_like_pi() {
 
 #[tokio::test]
 async fn gap21_static_api_key_fallback() {
-    let (sf, captured) =
-        recording_stream_fn(vec![faux_assistant_message(vec![faux_text("hi")], StopReason::Stop)]);
+    let (sf, captured) = recording_stream_fn(vec![faux_assistant_message(
+        vec![faux_text("hi")],
+        StopReason::Stop,
+    )]);
     let agent = Agent::builder(model_ref(), sf).api_key("sk-static").build();
     agent.prompt("go").await.unwrap().finished().await;
-    assert_eq!(captured.lock().unwrap()[0].api_key.as_deref(), Some("sk-static"));
+    assert_eq!(
+        captured.lock().unwrap()[0].api_key.as_deref(),
+        Some("sk-static")
+    );
 }
 
 // ----------------------------------------------------------------------------
@@ -264,7 +309,11 @@ struct BumpThinkingHook {
 
 #[async_trait::async_trait]
 impl Hooks for BumpThinkingHook {
-    async fn prepare_next_turn(&self, _ctx: PostTurn<'_>, _cancel: CancelToken) -> Result<Option<TurnUpdate>, HookError> {
+    async fn prepare_next_turn(
+        &self,
+        _ctx: PostTurn<'_>,
+        _cancel: CancelToken,
+    ) -> Result<Option<TurnUpdate>, HookError> {
         // Only override once (turn 0 → turn 1).
         if self.bumped.fetch_add(1, Ordering::SeqCst) == 0 {
             Ok(Some(TurnUpdate {
@@ -275,7 +324,11 @@ impl Hooks for BumpThinkingHook {
             Ok(None)
         }
     }
-    async fn should_stop_after_turn(&self, ctx: PostTurn<'_>, _cancel: CancelToken) -> Result<bool, HookError> {
+    async fn should_stop_after_turn(
+        &self,
+        ctx: PostTurn<'_>,
+        _cancel: CancelToken,
+    ) -> Result<bool, HookError> {
         // Stop after the second assistant turn.
         Ok(ctx.turn_index >= 2)
     }
@@ -299,14 +352,24 @@ async fn gap3_turn_update_thinking_level_overrides_next_request() {
     let agent = Agent::builder(model_ref(), sf)
         .thinking_level(ModelThinkingLevel::Low)
         .tools(vec![tool])
-        .hooks(Arc::new(BumpThinkingHook { bumped: Arc::new(AtomicUsize::new(0)) }))
+        .hooks(Arc::new(BumpThinkingHook {
+            bumped: Arc::new(AtomicUsize::new(0)),
+        }))
         .build();
     agent.prompt("go").await.unwrap().finished().await;
 
     let cap = captured.lock().unwrap();
     assert_eq!(cap.len(), 2, "two provider requests");
-    assert_eq!(cap[0].reasoning, ModelThinkingLevel::Low, "turn 1 uses the run default");
-    assert_eq!(cap[1].reasoning, ModelThinkingLevel::High, "turn 2 uses the TurnUpdate override");
+    assert_eq!(
+        cap[0].reasoning,
+        ModelThinkingLevel::Low,
+        "turn 1 uses the run default"
+    );
+    assert_eq!(
+        cap[1].reasoning,
+        ModelThinkingLevel::High,
+        "turn 2 uses the TurnUpdate override"
+    );
 }
 
 // ----------------------------------------------------------------------------
@@ -318,7 +381,11 @@ async fn gap9_10_11_streaming_partial_keeps_distinct_blocks() {
     // A response that streams thinking, then text, then a tool call.
     let (sf, _captured) = recording_stream_fn(vec![
         faux_assistant_message(
-            vec![faux_thinking("let me think"), faux_text("answer"), faux_tool_call("echo", json!({}))],
+            vec![
+                faux_thinking("let me think"),
+                faux_text("answer"),
+                faux_tool_call("echo", json!({})),
+            ],
             StopReason::ToolUse,
         ),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
@@ -341,7 +408,11 @@ async fn gap9_10_11_streaming_partial_keeps_distinct_blocks() {
     let mut saw_text_block = false;
     let mut saw_toolcall_block = false;
     for ev in rec.snapshot() {
-        if let AgentEvent::MessageUpdate { message: AgentMessage::Assistant(a), .. } = ev {
+        if let AgentEvent::MessageUpdate {
+            message: AgentMessage::Assistant(a),
+            ..
+        } = ev
+        {
             for c in &a.content {
                 match c {
                     Content::Thinking { thinking, .. } if !thinking.is_empty() => {
@@ -354,9 +425,15 @@ async fn gap9_10_11_streaming_partial_keeps_distinct_blocks() {
             }
         }
     }
-    assert!(saw_thinking_block, "partial must carry a distinct Thinking block (not merged into text)");
+    assert!(
+        saw_thinking_block,
+        "partial must carry a distinct Thinking block (not merged into text)"
+    );
     assert!(saw_text_block, "partial must carry a Text block");
-    assert!(saw_toolcall_block, "streaming tool call must appear in the partial (was never shown)");
+    assert!(
+        saw_toolcall_block,
+        "streaming tool call must appear in the partial (was never shown)"
+    );
 }
 
 // ----------------------------------------------------------------------------
@@ -374,7 +451,10 @@ async fn gap18_prepare_arguments_runs_before_execute() {
         calls: Arc::new(AtomicUsize::new(0)),
     });
     let (sf, _captured) = recording_stream_fn(vec![
-        faux_assistant_message(vec![faux_tool_call("echo", json!({"a": 1}))], StopReason::ToolUse),
+        faux_assistant_message(
+            vec![faux_tool_call("echo", json!({"a": 1}))],
+            StopReason::ToolUse,
+        ),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
     ]);
     let agent = Agent::builder(model_ref(), sf).tools(vec![tool]).build();
@@ -382,7 +462,11 @@ async fn gap18_prepare_arguments_runs_before_execute() {
 
     let got = seen.lock().unwrap().clone().expect("tool executed");
     assert_eq!(got["a"], json!(1), "original arg preserved");
-    assert_eq!(got["injected"], json!(true), "prepare_arguments injected a default before execute");
+    assert_eq!(
+        got["injected"],
+        json!(true),
+        "prepare_arguments injected a default before execute"
+    );
 }
 
 // ----------------------------------------------------------------------------
@@ -443,10 +527,23 @@ async fn gap15_before_tool_call_context_enriched() {
         .build();
     agent.prompt("go").await.unwrap().finished().await;
 
-    assert_eq!(hook.saw_tool_call_name.lock().unwrap().as_deref(), Some("echo"));
-    assert!(*hook.saw_assistant_has_call.lock().unwrap(), "assistant_message carries the tool call");
-    assert_eq!(hook.saw_system_prompt.lock().unwrap().as_deref(), Some("the-sys-prompt"));
-    assert_eq!(*hook.saw_tool_count.lock().unwrap(), 1, "context view exposes the tools");
+    assert_eq!(
+        hook.saw_tool_call_name.lock().unwrap().as_deref(),
+        Some("echo")
+    );
+    assert!(
+        *hook.saw_assistant_has_call.lock().unwrap(),
+        "assistant_message carries the tool call"
+    );
+    assert_eq!(
+        hook.saw_system_prompt.lock().unwrap().as_deref(),
+        Some("the-sys-prompt")
+    );
+    assert_eq!(
+        *hook.saw_tool_count.lock().unwrap(),
+        1,
+        "context view exposes the tools"
+    );
 }
 
 // ----------------------------------------------------------------------------
@@ -455,7 +552,10 @@ async fn gap15_before_tool_call_context_enriched() {
 
 #[tokio::test]
 async fn gap26_tool_execution_end_result_includes_terminate() {
-    let tool = Arc::new(TerminateTool { name: "stop".into(), params: obj_schema() });
+    let tool = Arc::new(TerminateTool {
+        name: "stop".into(),
+        params: obj_schema(),
+    });
     let (sf, _captured) = recording_stream_fn(vec![faux_assistant_message(
         vec![faux_tool_call("stop", json!({}))],
         StopReason::ToolUse,
@@ -473,7 +573,11 @@ async fn gap26_tool_execution_end_result_includes_terminate() {
             _ => None,
         })
         .expect("a tool_execution_end");
-    assert_eq!(end["terminate"], json!(true), "result must include the terminate hint");
+    assert_eq!(
+        end["terminate"],
+        json!(true),
+        "result must include the terminate hint"
+    );
 }
 
 // ----------------------------------------------------------------------------
@@ -490,10 +594,9 @@ async fn gap19_continue_from_assistant_skips_initial_steering_poll() {
         faux_assistant_message(vec![faux_text("a2")], StopReason::Stop),
     ]);
     let agent = Agent::builder(model_ref(), sf)
-        .messages(vec![AgentMessage::Assistant(Arc::new(faux_assistant_message(
-            vec![faux_text("seed")],
-            StopReason::Stop,
-        )))])
+        .messages(vec![AgentMessage::Assistant(Arc::new(
+            faux_assistant_message(vec![faux_text("seed")], StopReason::Stop),
+        ))])
         .build();
     agent.steer(AgentMessage::user_text("steer-1"));
     agent.steer(AgentMessage::user_text("steer-2"));
@@ -521,16 +624,19 @@ async fn gap19_continue_from_assistant_skips_initial_steering_poll() {
                 Some("steer-2") => steer2_at.get_or_insert(i),
                 _ => continue,
             },
-            AgentEvent::MessageEnd { message: AgentMessage::Assistant(_) } => {
-                first_assistant_end_at.get_or_insert(i)
-            }
+            AgentEvent::MessageEnd {
+                message: AgentMessage::Assistant(_),
+            } => first_assistant_end_at.get_or_insert(i),
             _ => continue,
         };
     }
     let s1 = steer1_at.expect("steer-1 processed");
     let s2 = steer2_at.expect("steer-2 processed");
     let a_end = first_assistant_end_at.expect("an assistant completed");
-    assert!(s1 < a_end, "first steering message is the prompt (before the first assistant)");
+    assert!(
+        s1 < a_end,
+        "first steering message is the prompt (before the first assistant)"
+    );
     assert!(
         s2 > a_end,
         "second steering message must be deferred past the first assistant turn (skip flag)"
@@ -543,9 +649,13 @@ async fn gap19_continue_from_assistant_skips_initial_steering_poll() {
 
 #[tokio::test]
 async fn gap20_run_failure_emits_synthetic_closing_sequence() {
-    let (sf, _captured) =
-        recording_stream_fn(vec![faux_assistant_message(vec![faux_text("a1")], StopReason::Stop)]);
-    let agent = Agent::builder(model_ref(), sf).hooks(Arc::new(PanicHook::new("hook exploded"))).build();
+    let (sf, _captured) = recording_stream_fn(vec![faux_assistant_message(
+        vec![faux_text("a1")],
+        StopReason::Stop,
+    )]);
+    let agent = Agent::builder(model_ref(), sf)
+        .hooks(Arc::new(PanicHook::new("hook exploded")))
+        .build();
     let rec = Arc::new(EventRecorder::default());
     agent.subscribe(rec.clone());
     let new = agent.prompt("go").await.unwrap().finished().await;
@@ -561,7 +671,11 @@ async fn gap20_run_failure_emits_synthetic_closing_sequence() {
         AgentMessage::Assistant(a) => Some(a.stop_reason == StopReason::Error),
         _ => None,
     });
-    assert_eq!(last_assistant_errored, Some(true), "synthetic assistant carries stop_reason error");
+    assert_eq!(
+        last_assistant_errored,
+        Some(true),
+        "synthetic assistant carries stop_reason error"
+    );
     // wait_for_idle must not deadlock after a failed run.
     agent.wait_for_idle().await;
 }
@@ -572,13 +686,18 @@ async fn gap20_run_failure_emits_synthetic_closing_sequence() {
 
 #[tokio::test]
 async fn gap23_24_signal_and_has_queued_messages() {
-    let (sf, _captured) =
-        recording_stream_fn(vec![faux_assistant_message(vec![faux_text("hi")], StopReason::Stop)]);
+    let (sf, _captured) = recording_stream_fn(vec![faux_assistant_message(
+        vec![faux_text("hi")],
+        StopReason::Stop,
+    )]);
     let agent = Agent::builder(model_ref(), sf).build();
     assert!(agent.signal().is_none(), "no signal before a run");
     assert!(!agent.has_queued_messages());
     agent.follow_up(AgentMessage::user_text("later"));
-    assert!(agent.has_queued_messages(), "queued follow-up is observable");
+    assert!(
+        agent.has_queued_messages(),
+        "queued follow-up is observable"
+    );
 }
 
 /// AGENT-023 changed the CONTRACT this used to pin: `reset()` is refused under a live run, matching
@@ -587,8 +706,10 @@ async fn gap23_24_signal_and_has_queued_messages() {
 /// half is `agent023_reset_is_refused_while_a_run_is_in_flight` in `area02_backlog`.
 #[tokio::test]
 async fn gap25_reset_clears_transcript_and_queues_when_idle() {
-    let (sf, _captured) =
-        recording_stream_fn(vec![faux_assistant_message(vec![faux_text("hi")], StopReason::Stop)]);
+    let (sf, _captured) = recording_stream_fn(vec![faux_assistant_message(
+        vec![faux_text("hi")],
+        StopReason::Stop,
+    )]);
     let agent = Agent::builder(model_ref(), sf)
         .messages(vec![AgentMessage::user_text("seed")])
         .build();
@@ -601,10 +722,15 @@ async fn gap25_reset_clears_transcript_and_queues_when_idle() {
 
 #[tokio::test]
 async fn gap22_prompt_with_images_builds_multimodal_user_message() {
-    let (sf, _captured) =
-        recording_stream_fn(vec![faux_assistant_message(vec![faux_text("hi")], StopReason::Stop)]);
+    let (sf, _captured) = recording_stream_fn(vec![faux_assistant_message(
+        vec![faux_text("hi")],
+        StopReason::Stop,
+    )]);
     let agent = Agent::builder(model_ref(), sf).build();
-    let image = Content::Image { data: "aGk=".into(), mime_type: "image/png".into() };
+    let image = Content::Image {
+        data: "aGk=".into(),
+        mime_type: "image/png".into(),
+    };
     let new = agent
         .prompt_with_images("look at this", vec![image])
         .await
@@ -616,7 +742,10 @@ async fn gap22_prompt_with_images_builds_multimodal_user_message() {
         _ => None,
     });
     let content = user.expect("a user message");
-    assert!(matches!(content.first(), Some(Content::Text { .. })), "text first");
+    assert!(
+        matches!(content.first(), Some(Content::Text { .. })),
+        "text first"
+    );
     assert!(
         content.iter().any(|c| matches!(c, Content::Image { .. })),
         "image attached after the text"
@@ -642,22 +771,33 @@ async fn set_headers_repoints_the_next_requests_header_overlay() {
     ]);
 
     let mut built = cyrup_provider::HeaderMap::new();
-    built.insert("x-attribution".to_string(), Some("first-provider".to_string()));
-    let agent = Agent::builder(model_ref(), sf).headers(built.clone()).build();
+    built.insert(
+        "x-attribution".to_string(),
+        Some("first-provider".to_string()),
+    );
+    let agent = Agent::builder(model_ref(), sf)
+        .headers(built.clone())
+        .build();
 
     agent.prompt("go").await.expect("first turn");
     agent.wait_for_idle().await;
 
     // The builder value reaches the first request.
     assert_eq!(
-        captured.lock().unwrap()[0].headers.as_ref().and_then(|h| h.get("x-attribution")),
+        captured.lock().unwrap()[0]
+            .headers
+            .as_ref()
+            .and_then(|h| h.get("x-attribution")),
         Some(&Some("first-provider".to_string())),
         "the build-time overlay reaches the first request"
     );
 
     // Now repoint it, as a `/model` switch does.
     let mut switched = cyrup_provider::HeaderMap::new();
-    switched.insert("x-attribution".to_string(), Some("second-provider".to_string()));
+    switched.insert(
+        "x-attribution".to_string(),
+        Some("second-provider".to_string()),
+    );
     agent.set_headers(Some(switched)).await;
 
     agent.prompt("go again").await.expect("second turn");
@@ -666,7 +806,10 @@ async fn set_headers_repoints_the_next_requests_header_overlay() {
     let seen = captured.lock().unwrap();
     assert_eq!(seen.len(), 2, "two requests were made");
     assert_eq!(
-        seen[1].headers.as_ref().and_then(|h| h.get("x-attribution")),
+        seen[1]
+            .headers
+            .as_ref()
+            .and_then(|h| h.get("x-attribution")),
         Some(&Some("second-provider".to_string())),
         "the SECOND request must carry the repointed overlay, not the pinned build-time one"
     );
@@ -694,7 +837,11 @@ async fn set_headers_repoints_the_next_requests_header_overlay() {
 // ----------------------------------------------------------------------------
 
 fn other_model_ref() -> ModelRef {
-    ModelRef { provider: "faux2".into(), api: Some("faux2".into()), model: "faux-2".into() }
+    ModelRef {
+        provider: "faux2".into(),
+        api: Some("faux2".into()),
+        model: "faux-2".into(),
+    }
 }
 
 /// A hook that retargets the model exactly once, after turn 1 — the shape `TurnUpdate::model` is for
@@ -712,7 +859,10 @@ impl Hooks for SwitchModelOnce {
         _cancel: CancelToken,
     ) -> Result<Option<TurnUpdate>, HookError> {
         if self.fired.fetch_add(1, Ordering::SeqCst) == 0 {
-            return Ok(Some(TurnUpdate { model: Some(self.to.clone()), ..Default::default() }));
+            return Ok(Some(TurnUpdate {
+                model: Some(self.to.clone()),
+                ..Default::default()
+            }));
         }
         Ok(None)
     }
@@ -734,7 +884,10 @@ async fn agent029_a_per_turn_model_override_recomputes_the_header_overlay() {
 
     // The STATIC overlay: what the previous provider's attribution looked like when it was latched.
     let mut stale = cyrup_provider::HeaderMap::new();
-    stale.insert("x-attribution".to_string(), Some("provider-of-model-faux-1".to_string()));
+    stale.insert(
+        "x-attribution".to_string(),
+        Some("provider-of-model-faux-1".to_string()),
+    );
 
     let agent = Agent::builder(model_ref(), sf)
         .tools(vec![echo])
@@ -748,7 +901,10 @@ async fn agent029_a_per_turn_model_override_recomputes_the_header_overlay() {
     // cyrup's `transformHeaders`: attribution is a FUNCTION of the model the request is going to.
     agent.set_header_fn(Some(Arc::new(|m: &ModelRef| {
         let mut h = cyrup_provider::HeaderMap::new();
-        h.insert("x-attribution".to_string(), Some(format!("provider-of-model-{}", m.model)));
+        h.insert(
+            "x-attribution".to_string(),
+            Some(format!("provider-of-model-{}", m.model)),
+        );
         Some(h)
     })));
 
@@ -757,9 +913,15 @@ async fn agent029_a_per_turn_model_override_recomputes_the_header_overlay() {
 
     let seen = captured.lock().unwrap();
     assert_eq!(seen.len(), 2, "two turns were dispatched: {}", seen.len());
-    assert_eq!(seen[0].model.as_ref().map(|m| m.model.as_str()), Some("faux-1"));
     assert_eq!(
-        seen[0].headers.as_ref().and_then(|h| h.get("x-attribution")),
+        seen[0].model.as_ref().map(|m| m.model.as_str()),
+        Some("faux-1")
+    );
+    assert_eq!(
+        seen[0]
+            .headers
+            .as_ref()
+            .and_then(|h| h.get("x-attribution")),
         Some(&Some("provider-of-model-faux-1".to_string())),
         "turn 1 carries turn 1's model's attribution"
     );
@@ -772,7 +934,10 @@ async fn agent029_a_per_turn_model_override_recomputes_the_header_overlay() {
     );
     // ...and the headers followed it, instead of the previous provider's riding along.
     assert_eq!(
-        seen[1].headers.as_ref().and_then(|h| h.get("x-attribution")),
+        seen[1]
+            .headers
+            .as_ref()
+            .and_then(|h| h.get("x-attribution")),
         Some(&Some("provider-of-model-faux-2".to_string())),
         "turn 2 must carry the NEW model's attribution, not the latched overlay"
     );
@@ -798,7 +963,10 @@ async fn agent029_without_a_resolver_the_static_overlay_still_applies() {
     agent.wait_for_idle().await;
 
     assert_eq!(
-        captured.lock().unwrap()[0].headers.as_ref().and_then(|h| h.get("x-attribution")),
+        captured.lock().unwrap()[0]
+            .headers
+            .as_ref()
+            .and_then(|h| h.get("x-attribution")),
         Some(&Some("static".to_string()))
     );
 }

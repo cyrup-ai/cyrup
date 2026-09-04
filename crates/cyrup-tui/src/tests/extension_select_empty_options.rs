@@ -7,23 +7,34 @@
 //! real key routing, matching this crate's live-render discipline (a bare `Selector`/`SelectList`
 //! unit test wouldn't catch the app-level short-circuit at all — it never reaches either).
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
-use cyrup_ext::host::DialogOptions;
-use cyrup_session_svc::{UiKind, UiReply, UiRequest};
+use super::harness::*;
 use crate::crossterm::event::KeyCode;
 use crate::{App, SelectorKind, UiTheme};
+use cyrup_ext::host::DialogOptions;
+use cyrup_session_svc::{UiKind, UiReply, UiRequest};
 use ratatui::backend::TestBackend;
-use super::harness::*;
 
-fn select_request(reply: tokio::sync::oneshot::Sender<UiReply>, options: serde_json::Value) -> UiRequest {
+fn select_request(
+    reply: tokio::sync::oneshot::Sender<UiReply>,
+    options: serde_json::Value,
+) -> UiRequest {
     UiRequest {
         kind: UiKind::Select,
         prompt: "Pick one".to_string(),
         options,
         message: String::new(),
         placeholder: None,
-        opts: DialogOptions { timeout_ms: None, signal_id: None },
+        opts: DialogOptions {
+            timeout_ms: None,
+            signal_id: None,
+        },
         reply,
     }
 }
@@ -40,7 +51,10 @@ fn ui_select_with_empty_options_still_opens_the_dialog() {
         Some(SelectorKind::ExtensionSelect),
         "an empty options list must still open the selector, not short-circuit before it opens"
     );
-    assert!(rx.try_recv().is_err(), "no reply sent yet — the guest is still suspended");
+    assert!(
+        rx.try_recv().is_err(),
+        "no reply sent yet — the guest is still suspended"
+    );
     // A real frame renders without panicking (`SelectList`'s empty-state path).
     app.draw().unwrap();
 }
@@ -64,8 +78,14 @@ fn ui_select_with_empty_options_esc_cancels_to_none() {
 fn ui_select_with_real_options_still_confirms_the_picked_value() {
     let mut app = App::new(TestBackend::new(80, 24), UiTheme::dark()).unwrap();
     let (tx, mut rx) = tokio::sync::oneshot::channel();
-    app.open_extension_dialog(select_request(tx, serde_json::json!(["alpha", "beta", "gamma"])));
-    assert_eq!(app.active_selector_kind(), Some(SelectorKind::ExtensionSelect));
+    app.open_extension_dialog(select_request(
+        tx,
+        serde_json::json!(["alpha", "beta", "gamma"]),
+    ));
+    assert_eq!(
+        app.active_selector_kind(),
+        Some(SelectorKind::ExtensionSelect)
+    );
     app.handle_input(&key(KeyCode::Down));
     app.handle_input(&key(KeyCode::Down));
     app.handle_input(&key(KeyCode::Enter));

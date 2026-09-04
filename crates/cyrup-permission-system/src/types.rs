@@ -148,7 +148,9 @@ pub struct OrderedRules {
 impl OrderedRules {
     #[must_use]
     pub fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     /// Insert or overwrite `pattern` with `state`, preserving first-seen position (JS object-key
@@ -175,7 +177,9 @@ impl OrderedRules {
     /// True when any entry's state is `allow` (pi `Object.values(...).some(state => state === "allow")`).
     #[must_use]
     pub fn any_allow(&self) -> bool {
-        self.entries.iter().any(|(_, s)| *s == PermissionState::Allow)
+        self.entries
+            .iter()
+            .any(|(_, s)| *s == PermissionState::Allow)
     }
 
     #[must_use]

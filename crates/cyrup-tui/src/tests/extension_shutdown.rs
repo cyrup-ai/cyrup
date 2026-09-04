@@ -16,20 +16,25 @@
 //! through the real command path on a real session, and
 //! [`should_honor_extension_shutdown`] — the single predicate both run-loop call sites use — says
 //! exit. Nothing here asserts that `HostServices::control(...)` returned `Ok`.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use crate::should_honor_extension_shutdown;
 use cyrup_core::{ExtensionId, StopReason};
 use cyrup_ext::host::{ControlOp, HostServices};
 use cyrup_ext::{
-    CommandDescriptor, ExtError, HostCtx, HostEvent, HookOutcome, InitApi, NativeExtension,
+    CommandDescriptor, ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension,
 };
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 use cyrup_provider::Provider;
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
 use cyrup_session_svc::{SessionBuilder, SessionConfig};
-use crate::should_honor_extension_shutdown;
 use tempfile::TempDir;
 
 /// A native built-in whose `/quitnow` command calls the base-context `ctx.shutdown()`
@@ -79,7 +84,8 @@ impl NativeExtension for QuitExt {
             .ok()
             .and_then(|g| g.clone())
             .ok_or_else(|| ExtError::Component("no host services".into()))?;
-        svc.control(ControlOp::Shutdown).map_err(ExtError::Component)?;
+        svc.control(ControlOp::Shutdown)
+            .map_err(ExtError::Component)?;
         Ok(Some(String::new()))
     }
 }
@@ -96,7 +102,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -108,7 +118,10 @@ fn base_config(fx: &Fixture) -> SessionConfig {
 
 fn faux_ok() -> Arc<dyn Provider> {
     let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("ok")],
+        StopReason::Stop,
+    )]);
     faux
 }
 
@@ -167,7 +180,12 @@ async fn a_shutdown_requested_mid_run_waits_for_the_settle_point() {
     // Ask for the shutdown directly through the capability seam (as a mid-run event handler would),
     // then assert the NON-settle check refuses to act while the session is busy.
     let _ = session.prompt("hello").await.unwrap();
-    let svc = ext.services.lock().unwrap().clone().expect("the native captured the backend");
+    let svc = ext
+        .services
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the native captured the backend");
     svc.control(ControlOp::Shutdown).unwrap();
     if !session.is_idle() {
         assert!(
@@ -206,7 +224,12 @@ async fn a_shutdown_requested_with_no_turn_boundary_left_is_still_observed() {
         .unwrap()
         .into_shared();
 
-    let svc = ext.services.lock().unwrap().clone().expect("the native captured the backend");
+    let svc = ext
+        .services
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the native captured the backend");
     assert!(!session.shutdown_requested(), "nothing requested yet");
 
     // No prompt, no run, no settle — nothing in this test will EVER drain the control queue.

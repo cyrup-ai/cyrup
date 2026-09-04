@@ -19,16 +19,21 @@
 //! The user action: the model issues a `subagent` tool call in an interactive session. The call row
 //! and the result row are both drawn by this extension.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::path::Path;
 use std::sync::Arc;
 
 use cyrup_ext::{ExtMode, ExtensionHost, HostConfig};
 use cyrup_ext_subagents::extension::{RegistrationMode, SubagentsExtension};
-use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
-use serde_json::{json, Value};
+use cyrup_ext_subagents::spawn::SpawnCommand;
+use serde_json::{Value, json};
 
 /// Missions are ON by default, and a task-bearing dispatch auto-creates one
 /// (`missions/lifecycle.rs::prepare_mission_launch`). Its cross-project POINTER INDEX defaults to
@@ -40,7 +45,11 @@ fn scoped_config(root: &std::path::Path) -> SubagentExtensionConfig {
     SubagentExtensionConfig {
         missions: Some(cyrup_ext_subagents::missions::MissionStoreConfig {
             global_index_dir: Some(
-                root.join("agent").join("missions").join("index").to_string_lossy().into_owned(),
+                root.join("agent")
+                    .join("missions")
+                    .join("index")
+                    .to_string_lossy()
+                    .into_owned(),
             ),
             ..Default::default()
         }),
@@ -123,11 +132,21 @@ async fn the_call_row_renders_every_pi_branch() {
     let host = host_at(dir.path()).await;
     let draw = |args: Value| {
         let host = host.clone();
-        async move { flatten(&host.render_tool_call("subagent", &args).await.expect("rendered")) }
+        async move {
+            flatten(
+                &host
+                    .render_tool_call("subagent", &args)
+                    .await
+                    .expect("rendered"),
+            )
+        }
     };
 
     // `:488-492` — a single run names its persona.
-    assert_eq!(draw(json!({"agent": "researcher"})).await, "subagent researcher");
+    assert_eq!(
+        draw(json!({"agent": "researcher"})).await,
+        "subagent researcher"
+    );
     // `:489` — `?` when no persona was given.
     assert_eq!(draw(json!({})).await, "subagent ?");
     // `:475` — the async badge.
@@ -218,11 +237,25 @@ async fn a_settled_single_result_draws_the_compact_row() {
         "terminate": false
     });
 
-    let drawn = flatten(&host.render_tool_result("subagent", &result).await.expect("rendered"));
-    assert!(drawn.contains("researcher"), "the header names the agent: {drawn}");
+    let drawn = flatten(
+        &host
+            .render_tool_result("subagent", &result)
+            .await
+            .expect("rendered"),
+    );
+    assert!(
+        drawn.contains("researcher"),
+        "the header names the agent: {drawn}"
+    );
     assert!(drawn.contains("[fork]"), "the fork badge renders: {drawn}");
-    assert!(drawn.contains("2 tools"), "tool count comes off the result: {drawn}");
-    assert!(drawn.contains("128 tokens"), "tokens are input + output: {drawn}");
+    assert!(
+        drawn.contains("2 tools"),
+        "tool count comes off the result: {drawn}"
+    );
+    assert!(
+        drawn.contains("128 tokens"),
+        "tokens are input + output: {drawn}"
+    );
     assert!(
         !drawn.contains("the delivered output"),
         "the compact row is the derived summary, not an echo of the content block: {drawn}"
@@ -241,7 +274,12 @@ async fn an_async_start_draws_the_content_text_with_the_fork_prefix() {
         "details": {"mode": "single", "runId": "run-1", "context": "fork", "results": [], "asyncId": "run-1"},
         "terminate": false
     });
-    let drawn = flatten(&host.render_tool_result("subagent", &result).await.expect("rendered"));
+    let drawn = flatten(
+        &host
+            .render_tool_result("subagent", &result)
+            .await
+            .expect("rendered"),
+    );
     assert_eq!(drawn, "[fork] Async: researcher [run-1]");
 
     // No fork → no prefix; no content at all → pi's literal `(no output)` (`:1415`).
@@ -272,7 +310,12 @@ async fn a_management_result_draws_its_report_text() {
         "details": {"mode": "management", "results": []},
         "terminate": false
     });
-    let drawn = flatten(&host.render_tool_result("subagent", &result).await.expect("rendered"));
+    let drawn = flatten(
+        &host
+            .render_tool_result("subagent", &result)
+            .await
+            .expect("rendered"),
+    );
     assert_eq!(drawn, "line one\nline two");
 }
 
@@ -296,7 +339,6 @@ async fn a_management_result_draws_its_report_text() {
 // is now a build-script postcondition. See this target's main.rs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_real_tool_result_renders_through_the_settled_branch() {
-
     use cyrup_core::{CancelToken, Tool, ToolCallId};
 
     let dir = tempfile::tempdir().unwrap();
@@ -331,13 +373,13 @@ async fn a_real_tool_result_renders_through_the_settled_branch() {
     let mut config = scoped_config(dir.path());
     config.spawn_command = Some(SpawnCommand {
         binary: crate::support::bins::subagent_fixture(),
-        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
     });
 
-    let ext = SubagentsExtension::with_config_and_cwd(
-        config,
-        dir.path().to_path_buf(),
-    );
+    let ext = SubagentsExtension::with_config_and_cwd(config, dir.path().to_path_buf());
     let tool_result = ext
         .subagent_tool()
         .execute(
@@ -349,30 +391,55 @@ async fn a_real_tool_result_renders_through_the_settled_branch() {
         .await
         .expect("the tool call succeeds");
 
-    let details = tool_result.details.clone().expect("a settled single run carries details");
+    let details = tool_result
+        .details
+        .clone()
+        .expect("a settled single run carries details");
     assert_eq!(
         details.get("mode").and_then(Value::as_str),
         Some("single"),
         "pi's Details carries `mode` at the ROOT: {details}"
     );
     assert_eq!(
-        details.get("results").and_then(Value::as_array).map(Vec::len),
+        details
+            .get("results")
+            .and_then(Value::as_array)
+            .map(Vec::len),
         Some(1),
         "the SingleResult must be WRAPPED under `results`, not spread at the root: {details}"
     );
-    assert!(details.get("runId").is_some(), "pi carries runId too: {details}");
+    assert!(
+        details.get("runId").is_some(),
+        "pi carries runId too: {details}"
+    );
 
-    // `cyrup-agent`'s exact `tool_execution_end.result` projection.
-    let wire = json!({
-        "content": tool_result.content,
-        "details": details,
-        "terminate": tool_result.terminate,
-    });
+    // `cyrup-agent`'s exact `tool_execution_end.result` projection
+    // (`crates/cyrup-agent/src/agent/message.rs` `result_value_of`): `terminate` is three-valued
+    // (`cyrup_core::TerminateHint`), and the key is emitted iff `wire()` is `Some` — never as a
+    // null, exactly as pi's `JSON.stringify` drops an `undefined` `terminate`.
+    let mut wire = serde_json::Map::new();
+    wire.insert("content".to_string(), json!(tool_result.content));
+    wire.insert("details".to_string(), details);
+    if let Some(t) = tool_result.terminate.wire() {
+        wire.insert("terminate".to_string(), Value::Bool(t));
+    }
+    let wire = Value::Object(wire);
 
     let host = host_at(dir.path()).await;
-    let drawn = flatten(&host.render_tool_result("subagent", &wire).await.expect("rendered"));
-    assert!(drawn.contains("renderer-worker"), "the compact row names the persona: {drawn}");
+    let drawn = flatten(
+        &host
+            .render_tool_result("subagent", &wire)
+            .await
+            .expect("rendered"),
+    );
+    assert!(
+        drawn.contains("renderer-worker"),
+        "the compact row names the persona: {drawn}"
+    );
     // (The `[fork]` badge is covered by `a_settled_single_result_draws_the_compact_row`;
     // driving a real fork here would need a live session leaf to branch from.)
-    assert!(drawn.contains("12 tokens"), "the child's real usage renders: {drawn}");
+    assert!(
+        drawn.contains("12 tokens"),
+        "the child's real usage renders: {drawn}"
+    );
 }

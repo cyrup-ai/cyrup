@@ -3,12 +3,12 @@
 
 use super::util::lock;
 use super::{Agent, AgentBuilder, HeaderFn};
+use crate::error::{AgentError, BusyEntry};
 use crate::event::AgentMessage;
 use crate::queue::QueueMode;
 use crate::state::AgentStateSnapshot;
 use crate::stream_fn::StreamFn;
 use crate::subscriber::EventSubscriber;
-use crate::error::{AgentError, BusyEntry};
 use cyrup_core::{AssistantMessage, CancelToken, ModelRef, ModelThinkingLevel, Tool};
 use std::sync::{Arc, Mutex};
 
@@ -61,7 +61,10 @@ impl Agent {
     /// `:732-733`), which is unsubscribed on every rebind and at shutdown.
     pub fn subscribe(&self, s: Arc<dyn EventSubscriber>) -> Subscription {
         lock(&self.subscribers).push(s.clone());
-        Subscription { subscribers: Arc::downgrade(&self.subscribers), subscriber: s }
+        Subscription {
+            subscribers: Arc::downgrade(&self.subscribers),
+            subscriber: s,
+        }
     }
 
     pub async fn snapshot(&self) -> AgentStateSnapshot {
@@ -196,7 +199,10 @@ impl Agent {
 
     #[must_use]
     pub fn drain_queues_for_restore(&self) -> (Vec<AgentMessage>, Vec<AgentMessage>) {
-        (lock(&self.steering).take_all(), lock(&self.follow_up).take_all())
+        (
+            lock(&self.steering).take_all(),
+            lock(&self.follow_up).take_all(),
+        )
     }
 
     // --- lifecycle (R-02-045..047) ---

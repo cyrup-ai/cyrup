@@ -11,26 +11,30 @@
 //!     `!`/`!!` handler and the JSON-RPC `bash` command go through — while the bare `execute_bash`
 //!     executor stays emission-free, matching Pi's placement of `emitUserBash` at the callers
 //!     (`interactive-mode.ts:6010-6060`, `rpc-mode.ts:558-579`) and not inside `executeBash`.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::{
+    AgentSessionEvent, BashOptions, InputSource, SessionBuilder, SessionConfig,
+    SessionServiceError, UserInput,
+};
 use cyrup_core::{
-    TerminateHint,
-    Content, ExtensionId, StopReason, Tool, ToolError, ToolResult, ToolUpdateSink,
+    Content, ExtensionId, StopReason, TerminateHint, Tool, ToolError, ToolResult, ToolUpdateSink,
 };
 use cyrup_ext::{
-    CommandDescriptor, EventKind, EventPatch, ExtError, HostCtx, HostEvent, HookOutcome, InitApi,
+    CommandDescriptor, EventKind, EventPatch, ExtError, HookOutcome, HostCtx, HostEvent, InitApi,
     NativeExtension,
 };
-use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call, FauxProvider};
 use cyrup_provider::Provider;
-use crate::{
-    AgentSessionEvent, BashOptions, InputSource, SessionBuilder, SessionConfig, SessionServiceError,
-    UserInput,
-};
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text, faux_tool_call};
 use futures::StreamExt;
 use tempfile::TempDir;
 use tokio::sync::Notify;
@@ -50,7 +54,12 @@ fn fixture() -> Fixture {
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
     std::fs::create_dir_all(&home).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir, home }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+        home,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -61,7 +70,10 @@ fn base_config(fx: &Fixture) -> SessionConfig {
 
 fn faux_ok() -> Arc<FauxProvider> {
     let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("ok")],
+        StopReason::Stop,
+    )]);
     faux
 }
 
@@ -131,13 +143,34 @@ async fn compaction_end_carries_full_pi_payload() {
     assert_eq!(v["type"], "compaction_end");
     assert_eq!(v["reason"], "manual");
     assert_eq!(v["aborted"], serde_json::json!(false));
-    assert_eq!(v["willRetry"], serde_json::json!(false), "manual compaction never retries");
-    assert!(v.get("errorMessage").is_none(), "no errorMessage on a clean compaction: {v}");
-    let r = v.get("result").expect("result present on a successful compaction");
-    assert!(r.get("summary").and_then(|s| s.as_str()).is_some(), "result.summary present: {r}");
-    assert!(r.get("firstKeptEntryId").is_some(), "result.firstKeptEntryId present: {r}");
-    assert!(r.get("tokensBefore").is_some(), "result.tokensBefore present: {r}");
-    assert!(r.get("estimatedTokensAfter").is_some(), "result.estimatedTokensAfter present: {r}");
+    assert_eq!(
+        v["willRetry"],
+        serde_json::json!(false),
+        "manual compaction never retries"
+    );
+    assert!(
+        v.get("errorMessage").is_none(),
+        "no errorMessage on a clean compaction: {v}"
+    );
+    let r = v
+        .get("result")
+        .expect("result present on a successful compaction");
+    assert!(
+        r.get("summary").and_then(|s| s.as_str()).is_some(),
+        "result.summary present: {r}"
+    );
+    assert!(
+        r.get("firstKeptEntryId").is_some(),
+        "result.firstKeptEntryId present: {r}"
+    );
+    assert!(
+        r.get("tokensBefore").is_some(),
+        "result.tokensBefore present: {r}"
+    );
+    assert!(
+        r.get("estimatedTokensAfter").is_some(),
+        "result.estimatedTokensAfter present: {r}"
+    );
 }
 
 /// check_compaction Case-2 (threshold, direct-usage) + A.7: a real BOUND run whose assistant usage
@@ -156,7 +189,10 @@ async fn real_run_threshold_compaction_emits_threshold_end() {
 
     let faux = Arc::new(FauxProvider::new());
     faux.set_responses(vec![
-        faux_assistant_message(vec![faux_text("a real answer worth some tokens")], StopReason::Stop),
+        faux_assistant_message(
+            vec![faux_text("a real answer worth some tokens")],
+            StopReason::Stop,
+        ),
         faux_assistant_message(vec![faux_text("THRESHOLD SUMMARY")], StopReason::Stop),
     ]);
     let provider: Arc<dyn Provider> = faux.clone();
@@ -167,7 +203,10 @@ async fn real_run_threshold_compaction_emits_threshold_end() {
         .expect("build")
         .into_shared();
 
-    let stream = session.prompt(UserInput::text("go", InputSource::Sdk)).await.expect("prompt");
+    let stream = session
+        .prompt(UserInput::text("go", InputSource::Sdk))
+        .await
+        .expect("prompt");
     session.wait_for_idle().await;
     let events: Vec<AgentSessionEvent> = stream.collect().await;
 
@@ -177,7 +216,11 @@ async fn real_run_threshold_compaction_emits_threshold_end() {
         .filter(|v| v["type"] == "compaction_start")
         .filter_map(|v| v["reason"].as_str().map(str::to_string))
         .collect();
-    assert_eq!(starts, vec!["threshold".to_string()], "exactly one threshold compaction from the run");
+    assert_eq!(
+        starts,
+        vec!["threshold".to_string()],
+        "exactly one threshold compaction from the run"
+    );
 
     let end = events
         .iter()
@@ -185,7 +228,11 @@ async fn real_run_threshold_compaction_emits_threshold_end() {
         .find(|v| v["type"] == "compaction_end")
         .expect("compaction_end must fire from the real run");
     assert_eq!(end["reason"], "threshold");
-    assert_eq!(end["willRetry"], serde_json::json!(false), "a threshold compaction does not retry");
+    assert_eq!(
+        end["willRetry"],
+        serde_json::json!(false),
+        "a threshold compaction does not retry"
+    );
 }
 
 // ================================================================= A.8 steer expansion + guard ====
@@ -200,7 +247,10 @@ impl NativeExtension for GreetCommand {
     async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
         api.register_command(
             "greet",
-            CommandDescriptor { description: "greet".into(), completions: vec![] },
+            CommandDescriptor {
+                description: "greet".into(),
+                completions: vec![],
+            },
         );
         Ok(())
     }
@@ -220,7 +270,10 @@ async fn steer_and_follow_up_reject_extension_commands() {
         .await
         .expect("build");
 
-    let err = session.steer("/greet hi").await.expect_err("an extension command cannot be steered");
+    let err = session
+        .steer("/greet hi")
+        .await
+        .expect_err("an extension command cannot be steered");
     assert!(
         matches!(&err, SessionServiceError::ExtensionCommandNotQueueable(n) if n == "greet"),
         "steer rejects the extension command by name, got: {err}"
@@ -229,11 +282,20 @@ async fn steer_and_follow_up_reject_extension_commands() {
         .follow_up("/greet hi")
         .await
         .expect_err("an extension command cannot be followed-up");
-    assert!(matches!(err, SessionServiceError::ExtensionCommandNotQueueable(_)));
+    assert!(matches!(
+        err,
+        SessionServiceError::ExtensionCommandNotQueueable(_)
+    ));
 
     // A non-command message queues normally.
-    session.steer("just a plain steer").await.expect("plain steer queues");
-    assert_eq!(session.steering_messages(), vec!["just a plain steer".to_string()]);
+    session
+        .steer("just a plain steer")
+        .await
+        .expect("plain steer queues");
+    assert_eq!(
+        session.steering_messages(),
+        vec!["just a plain steer".to_string()]
+    );
 }
 
 /// A.8: `steer` EXPANDS a `/skill:<name>` command before queueing (Pi `_expandSkillCommand`,
@@ -252,14 +314,35 @@ async fn steer_expands_skill_command_before_queueing() {
 
     let mut cfg = base_config(&fx);
     cfg.home = fx.home.clone();
-    let session = SessionBuilder::new(faux_ok() as Arc<dyn Provider>, cfg).build().await.expect("build");
+    let session = SessionBuilder::new(faux_ok() as Arc<dyn Provider>, cfg)
+        .build()
+        .await
+        .expect("build");
 
-    session.steer("/skill:foo trailing args").await.expect("steer queues");
+    session
+        .steer("/skill:foo trailing args")
+        .await
+        .expect("steer queues");
     let queued = session.steering_messages();
-    assert_eq!(queued.len(), 1, "the steer mirror has the one queued message");
-    assert!(queued[0].contains("SKILL_BODY_MARKER"), "skill body expanded into the queued text: {:?}", queued[0]);
-    assert!(queued[0].contains("trailing args"), "the trailing args ride along: {:?}", queued[0]);
-    assert!(!queued[0].starts_with("/skill:"), "the raw command was replaced by its expansion");
+    assert_eq!(
+        queued.len(),
+        1,
+        "the steer mirror has the one queued message"
+    );
+    assert!(
+        queued[0].contains("SKILL_BODY_MARKER"),
+        "skill body expanded into the queued text: {:?}",
+        queued[0]
+    );
+    assert!(
+        queued[0].contains("trailing args"),
+        "the trailing args ride along: {:?}",
+        queued[0]
+    );
+    assert!(
+        !queued[0].starts_with("/skill:"),
+        "the raw command was replaced by its expansion"
+    );
 }
 
 // ================================================================= A.4 queue-drain → queue_update ==
@@ -289,7 +372,12 @@ impl Tool for BlockTool {
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
         self.gate.notified().await;
-        Ok(ToolResult { content: vec![Content::text("released")], details: None, terminate: TerminateHint::Unspecified, ..Default::default() })
+        Ok(ToolResult {
+            content: vec![Content::text("released")],
+            details: None,
+            terminate: TerminateHint::Unspecified,
+            ..Default::default()
+        })
     }
 }
 struct BlockExt {
@@ -324,7 +412,10 @@ async fn queue_drain_emits_queue_update_from_a_real_run() {
     let faux = Arc::new(FauxProvider::new());
     // Turn 1 parks on the block tool; after release the steered user message drives turn 2; turn 3 stops.
     faux.set_responses(vec![
-        faux_assistant_message(vec![faux_tool_call("block", serde_json::json!({}))], StopReason::ToolUse),
+        faux_assistant_message(
+            vec![faux_tool_call("block", serde_json::json!({}))],
+            StopReason::ToolUse,
+        ),
         faux_assistant_message(vec![faux_text("after tool")], StopReason::Stop),
         faux_assistant_message(vec![faux_text("after steer")], StopReason::Stop),
     ]);
@@ -336,7 +427,10 @@ async fn queue_drain_emits_queue_update_from_a_real_run() {
         .expect("build")
         .into_shared();
 
-    let stream = session.prompt(UserInput::text("kick off", InputSource::Sdk)).await.expect("prompt");
+    let stream = session
+        .prompt(UserInput::text("kick off", InputSource::Sdk))
+        .await
+        .expect("prompt");
 
     // Wait until the run is actually streaming (parked on the tool), then steer.
     let mut streaming = false;
@@ -350,7 +444,11 @@ async fn queue_drain_emits_queue_update_from_a_real_run() {
     assert!(streaming, "the block tool must hold the agent streaming");
 
     session.steer("steered").await.expect("steer accepted");
-    assert_eq!(session.steering_messages(), vec!["steered".to_string()], "mirror holds the queued steer");
+    assert_eq!(
+        session.steering_messages(),
+        vec!["steered".to_string()],
+        "mirror holds the queued steer"
+    );
 
     // Release the tool so the steered message is delivered as a new user turn.
     gate.notify_one();
@@ -359,7 +457,10 @@ async fn queue_drain_emits_queue_update_from_a_real_run() {
 
     // The steered message was delivered as a user turn (draining the mirror), so the provider was hit
     // again beyond the initial tool-call turn.
-    assert!(faux.call_count() >= 2, "the run continued past the parked tool turn");
+    assert!(
+        faux.call_count() >= 2,
+        "the run continued past the parked tool turn"
+    );
 
     // A queue_update with the steer ENQUEUED (mirror=["steered"]) and a later one DRAINED (mirror=[]).
     let queue_updates: Vec<Vec<String>> = events
@@ -370,7 +471,9 @@ async fn queue_drain_emits_queue_update_from_a_real_run() {
         })
         .collect();
     assert!(
-        queue_updates.iter().any(|s| s == &vec!["steered".to_string()]),
+        queue_updates
+            .iter()
+            .any(|s| s == &vec!["steered".to_string()]),
         "an enqueue queue_update carried the steered message: {queue_updates:?}"
     );
     assert!(
@@ -378,9 +481,18 @@ async fn queue_drain_emits_queue_update_from_a_real_run() {
         "a drain queue_update fired with the mirror emptied: {queue_updates:?}"
     );
     // The drain is observed AFTER the enqueue (the queue shrank).
-    let enqueue_pos = queue_updates.iter().position(|s| s == &vec!["steered".to_string()]).unwrap();
-    let drain_pos = queue_updates.iter().rposition(std::vec::Vec::is_empty).unwrap();
-    assert!(drain_pos > enqueue_pos, "the drain follows the enqueue: {queue_updates:?}");
+    let enqueue_pos = queue_updates
+        .iter()
+        .position(|s| s == &vec!["steered".to_string()])
+        .unwrap();
+    let drain_pos = queue_updates
+        .iter()
+        .rposition(std::vec::Vec::is_empty)
+        .unwrap();
+    assert!(
+        drain_pos > enqueue_pos,
+        "the drain follows the enqueue: {queue_updates:?}"
+    );
 }
 
 // ===================================================================== B/user_bash live values ====
@@ -399,8 +511,16 @@ impl NativeExtension for UserBashProbe {
         Ok(())
     }
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
-        if let HostEvent::UserBash { command, exclude_from_context, cwd } = ev {
-            self.0.lock().unwrap().push((command.clone(), *exclude_from_context, cwd.clone()));
+        if let HostEvent::UserBash {
+            command,
+            exclude_from_context,
+            cwd,
+        } = ev
+        {
+            self.0
+                .lock()
+                .unwrap()
+                .push((command.clone(), *exclude_from_context, cwd.clone()));
         }
         HookOutcome::Noop
     }
@@ -426,7 +546,11 @@ async fn execute_bash_with_user_event_emits_user_bash_with_live_values() {
     let _ = session
         .execute_bash_with_user_event(
             "echo hello",
-            BashOptions { exclude_from_context: true, id: None, operations: None },
+            BashOptions {
+                exclude_from_context: true,
+                id: None,
+                operations: None,
+            },
             None,
         )
         .await;
@@ -434,8 +558,15 @@ async fn execute_bash_with_user_event_emits_user_bash_with_live_values() {
     let seen = probe.lock().unwrap().clone();
     assert_eq!(seen.len(), 1, "the user_bash handler fired exactly once");
     assert_eq!(seen[0].0, "echo hello", "the live command is delivered");
-    assert!(seen[0].1, "the !!-prefix excludeFromContext flag is delivered");
-    assert_eq!(seen[0].2, fx.cwd.display().to_string(), "the agent cwd is delivered");
+    assert!(
+        seen[0].1,
+        "the !!-prefix excludeFromContext flag is delivered"
+    );
+    assert_eq!(
+        seen[0].2,
+        fx.cwd.display().to_string(),
+        "the agent cwd is delivered"
+    );
 }
 
 /// B/user_bash (executor placement): the bare `execute_bash` — the raw out-of-loop executor, NOT a
@@ -461,7 +592,15 @@ async fn bare_execute_bash_executor_emits_no_user_bash() {
         .expect("build");
 
     let _ = session
-        .execute_bash("echo hello", BashOptions { exclude_from_context: true, id: None, operations: None }, None)
+        .execute_bash(
+            "echo hello",
+            BashOptions {
+                exclude_from_context: true,
+                id: None,
+                operations: None,
+            },
+            None,
+        )
         .await;
 
     let seen = probe.lock().unwrap().clone();
@@ -492,7 +631,11 @@ impl NativeExtension for CompactionOverrider {
     }
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         match ev {
-            HostEvent::SessionBeforeCompact { preparation, reason, .. } => {
+            HostEvent::SessionBeforeCompact {
+                preparation,
+                reason,
+                ..
+            } => {
                 self.seen.lock().unwrap().push(preparation.clone());
                 // Derive the override summary from the REAL preparation so the assertion proves the
                 // typed payload was read, not fabricated.
@@ -543,11 +686,24 @@ async fn compaction_before_compact_override_lands_in_entry() {
 
     // The extension read a REAL preparation: it carries the Pi `CompactionPreparation` fields.
     let observed = seen.lock().unwrap().clone();
-    assert_eq!(observed.len(), 1, "the before_compact hook fired exactly once");
+    assert_eq!(
+        observed.len(),
+        1,
+        "the before_compact hook fired exactly once"
+    );
     let prep = &observed[0];
-    assert!(prep.get("firstKeptEntryId").is_some(), "typed preparation carries firstKeptEntryId: {prep}");
-    assert!(prep.get("messagesToSummarize").is_some(), "typed preparation carries messagesToSummarize: {prep}");
-    assert!(prep.get("tokensBefore").is_some(), "typed preparation carries tokensBefore: {prep}");
+    assert!(
+        prep.get("firstKeptEntryId").is_some(),
+        "typed preparation carries firstKeptEntryId: {prep}"
+    );
+    assert!(
+        prep.get("messagesToSummarize").is_some(),
+        "typed preparation carries messagesToSummarize: {prep}"
+    );
+    assert!(
+        prep.get("tokensBefore").is_some(),
+        "typed preparation carries tokensBefore: {prep}"
+    );
 
     // The override summary landed in the resulting compaction entry (fromExtension), replacing the
     // default model summary.
@@ -559,8 +715,14 @@ async fn compaction_before_compact_override_lands_in_entry() {
 
     // And it is durable in the exported JSONL as a compaction entry.
     let jsonl = session.export_to_jsonl(None).await.unwrap().expect("jsonl");
-    assert!(jsonl.contains("ext-summary[manual"), "the override summary is persisted: {jsonl}");
-    assert!(jsonl.contains("\"type\":\"compaction\""), "a compaction entry was appended");
+    assert!(
+        jsonl.contains("ext-summary[manual"),
+        "the override summary is persisted: {jsonl}"
+    );
+    assert!(
+        jsonl.contains("\"type\":\"compaction\""),
+        "a compaction entry was appended"
+    );
 }
 
 // ===========================================================================================
@@ -590,11 +752,10 @@ impl cyrup_tools::ops::BashOperations for RecordingBashOps {
         cwd: &std::path::Path,
         opts: cyrup_tools::ops::BashExecOptions<'_>,
     ) -> Result<cyrup_tools::ExitStatus, ToolError> {
-        self.seen.lock().unwrap().push((
-            command.to_string(),
-            cwd.to_path_buf(),
-            opts.env.clone(),
-        ));
+        self.seen
+            .lock()
+            .unwrap()
+            .push((command.to_string(), cwd.to_path_buf(), opts.env.clone()));
         (opts.on_data)(b"REMOTE-SENTINEL\x1b[0m\n");
         Ok(cyrup_tools::ExitStatus::Exited(7))
     }
@@ -618,7 +779,9 @@ async fn execute_bash_routes_through_an_operations_override_instead_of_the_local
         .await
         .expect("build");
 
-    let ops = Arc::new(RecordingBashOps { seen: Mutex::new(Vec::new()) });
+    let ops = Arc::new(RecordingBashOps {
+        seen: Mutex::new(Vec::new()),
+    });
     let streamed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let sink_out = streamed.clone();
 
@@ -639,17 +802,32 @@ async fn execute_bash_routes_through_an_operations_override_instead_of_the_local
 
     // PRESENCE — the override actually executed and its result is what came back.
     let seen = ops.seen.lock().unwrap().clone();
-    assert_eq!(seen.len(), 1, "exactly one exec reached the override backend");
+    assert_eq!(
+        seen.len(),
+        1,
+        "exactly one exec reached the override backend"
+    );
     assert_eq!(
         seen[0].0, "echo LOCAL_SHELL_RAN",
         "pi hands `executeBashWithOperations` the RESOLVED command verbatim (bash-executor.ts)"
     );
-    assert_eq!(seen[0].1, fx.cwd, "and the session cwd (`this.sessionManager.getCwd()`, :2781)");
-    assert_eq!(result.exit_code, Some(7), "the override's exit code is the reported one");
+    assert_eq!(
+        seen[0].1, fx.cwd,
+        "and the session cwd (`this.sessionManager.getCwd()`, :2781)"
+    );
+    assert_eq!(
+        result.exit_code,
+        Some(7),
+        "the override's exit code is the reported one"
+    );
 
     // The shared pipeline still ran: the ANSI escape the backend emitted is stripped, exactly as it
     // is on the local branch, because pi's `onChunk` wrapper is built once for both.
-    assert!(result.output.contains("REMOTE-SENTINEL"), "got: {:?}", result.output);
+    assert!(
+        result.output.contains("REMOTE-SENTINEL"),
+        "got: {:?}",
+        result.output
+    );
     assert!(
         !result.output.contains('\x1b'),
         "an overriding backend's bytes go through the SAME sanitizer as the local branch — pi \
@@ -659,7 +837,10 @@ async fn execute_bash_routes_through_an_operations_override_instead_of_the_local
     );
     // …and the caller's streaming sink saw it, so the override is not a buffered special case.
     let deltas = streamed.lock().unwrap().concat();
-    assert!(deltas.contains("REMOTE-SENTINEL"), "the on_chunk sink streams the override's output: {deltas:?}");
+    assert!(
+        deltas.contains("REMOTE-SENTINEL"),
+        "the on_chunk sink streams the override's output: {deltas:?}"
+    );
 
     // The env vector this seam builds is handed to the override too — `getShellEnv()` is inside
     // `createLocalBashOperations`' options upstream, but cyrup's per-child agent-identity stamping
@@ -692,7 +873,11 @@ async fn execute_bash_without_an_operations_override_still_runs_on_the_local_she
     let result = session
         .execute_bash(
             "echo LOCAL_SHELL_RAN",
-            BashOptions { exclude_from_context: false, id: None, operations: None },
+            BashOptions {
+                exclude_from_context: false,
+                id: None,
+                operations: None,
+            },
             None,
         )
         .await
@@ -724,7 +909,9 @@ async fn execute_bash_with_user_event_forwards_the_operations_override_to_the_ex
         .await
         .expect("build");
 
-    let ops = Arc::new(RecordingBashOps { seen: Mutex::new(Vec::new()) });
+    let ops = Arc::new(RecordingBashOps {
+        seen: Mutex::new(Vec::new()),
+    });
     let result = session
         .execute_bash_with_user_event(
             "echo LOCAL_SHELL_RAN",
@@ -738,7 +925,19 @@ async fn execute_bash_with_user_event_forwards_the_operations_override_to_the_ex
         .await
         .expect("the override backend succeeds");
 
-    assert_eq!(ops.seen.lock().unwrap().len(), 1, "the wrapper forwarded the override");
-    assert!(result.output.contains("REMOTE-SENTINEL"), "got: {:?}", result.output);
-    assert!(!result.output.contains("LOCAL_SHELL_RAN"), "got: {:?}", result.output);
+    assert_eq!(
+        ops.seen.lock().unwrap().len(),
+        1,
+        "the wrapper forwarded the override"
+    );
+    assert!(
+        result.output.contains("REMOTE-SENTINEL"),
+        "got: {:?}",
+        result.output
+    );
+    assert!(
+        !result.output.contains("LOCAL_SHELL_RAN"),
+        "got: {:?}",
+        result.output
+    );
 }

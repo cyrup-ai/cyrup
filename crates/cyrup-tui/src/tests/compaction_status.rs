@@ -23,14 +23,21 @@
 //! on the run loop's task.** With the channel installed, `execute_command` returns having mutated
 //! nothing, and the outcome arrives separately — which is what leaves every other `select!` arm,
 //! including the event stream and the spinner, free to run.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::sync::Arc;
 
-use cyrup_provider::faux::FauxProvider;
-use cyrup_provider::Provider;
-use cyrup_session_svc::{AgentSession, AgentSessionEvent, CompactionReason, SessionBuilder, SessionConfig};
 use crate::{App, AppCommand, UiTheme};
+use cyrup_provider::Provider;
+use cyrup_provider::faux::FauxProvider;
+use cyrup_session_svc::{
+    AgentSession, AgentSessionEvent, CompactionReason, SessionBuilder, SessionConfig,
+};
 use ratatui::backend::TestBackend;
 
 fn new_app() -> App<TestBackend> {
@@ -74,7 +81,8 @@ async fn compact_does_not_run_on_the_run_loops_task() {
     // What `App::run` does once at startup.
     let mut compact_rx = app.install_compact_channel();
 
-    app.execute_command(AppCommand::Compact(None), &session, None).await;
+    app.execute_command(AppCommand::Compact(None), &session, None)
+        .await;
 
     // The spawned task holds no reference to `AppState`, so this is deterministic rather than a
     // race: nothing the compaction produces can have been applied yet.
@@ -87,7 +95,10 @@ async fn compact_does_not_run_on_the_run_loops_task() {
     );
 
     // …and it arrives over the channel the run loop services, alongside every other arm.
-    let outcome = compact_rx.recv().await.expect("the spawned compaction must answer");
+    let outcome = compact_rx
+        .recv()
+        .await
+        .expect("the spawned compaction must answer");
     app.apply_compact_outcome(outcome);
     app.draw().unwrap();
     let after = screen(&app);
@@ -102,12 +113,17 @@ async fn compact_does_not_run_on_the_run_loops_task() {
 #[tokio::test]
 async fn the_band_is_armed_for_the_whole_compaction_window() {
     let mut app = new_app();
-    app.ingest_event(&AgentSessionEvent::CompactionStart { reason: CompactionReason::Manual });
+    app.ingest_event(&AgentSessionEvent::CompactionStart {
+        reason: CompactionReason::Manual,
+    });
     // Every frame in the window — the live run sampled 50 of them and found the band empty in all.
     for _ in 0..5 {
         app.draw().unwrap();
         let s = screen(&app);
-        assert!(s.contains("Compacting context..."), "band missing mid-compaction:\n{s}");
+        assert!(
+            s.contains("Compacting context..."),
+            "band missing mid-compaction:\n{s}"
+        );
         // SESS-040's Verify line: the band does not merely appear, it must carry the affordance it
         // advertises — `Compacting context... (${keyText("app.interrupt")} to cancel)`
         // (`status-indicator.ts:78-82`), built from the LIVE keymap. Asserting only the message
@@ -126,7 +142,10 @@ async fn the_band_is_armed_for_the_whole_compaction_window() {
         error_message: None,
     });
     app.draw().unwrap();
-    assert!(!screen(&app).contains("Compacting context..."), "the band clears at compaction_end");
+    assert!(
+        !screen(&app).contains("Compacting context..."),
+        "the band clears at compaction_end"
+    );
 }
 
 /// The no-run-loop fallback stays correct: an embedder (or a test) driving `execute_command`
@@ -137,7 +156,8 @@ async fn without_a_channel_the_outcome_is_still_applied_inline() {
     let session = session(dir.path()).await;
     let mut app = new_app();
 
-    app.execute_command(AppCommand::Compact(None), &session, None).await;
+    app.execute_command(AppCommand::Compact(None), &session, None)
+        .await;
 
     app.draw().unwrap();
     let s = screen(&app);
@@ -170,8 +190,14 @@ async fn a_failed_or_cancelled_compaction_is_not_announced_as_complete() {
     });
     app.draw().unwrap();
     let s = screen(&app);
-    assert!(!s.contains("compaction complete"), "a cancelled compaction claimed success:\n{s}");
-    assert!(s.contains("Auto-compaction cancelled"), "pi's cancel copy is missing:\n{s}");
+    assert!(
+        !s.contains("compaction complete"),
+        "a cancelled compaction claimed success:\n{s}"
+    );
+    assert!(
+        s.contains("Auto-compaction cancelled"),
+        "pi's cancel copy is missing:\n{s}"
+    );
 
     // (b) A failure renders its own message, not a success line.
     let mut app = new_app();
@@ -184,8 +210,14 @@ async fn a_failed_or_cancelled_compaction_is_not_announced_as_complete() {
     });
     app.draw().unwrap();
     let s = screen(&app);
-    assert!(!s.contains("compaction complete"), "a failed compaction claimed success:\n{s}");
-    assert!(s.contains("summarization failed"), "the failure message is not rendered:\n{s}");
+    assert!(
+        !s.contains("compaction complete"),
+        "a failed compaction claimed success:\n{s}"
+    );
+    assert!(
+        s.contains("summarization failed"),
+        "the failure message is not rendered:\n{s}"
+    );
 
     // (c) A manual compaction is rendered by the command path (`apply_compact_outcome`), so the
     // event arm must stay silent rather than adding a second, contradictory line.
@@ -199,7 +231,10 @@ async fn a_failed_or_cancelled_compaction_is_not_announced_as_complete() {
     });
     app.draw().unwrap();
     let s = screen(&app);
-    assert!(!s.contains("compaction complete"), "manual failure claimed success:\n{s}");
+    assert!(
+        !s.contains("compaction complete"),
+        "manual failure claimed success:\n{s}"
+    );
 
     // (d) SESS-040 — and the manual path that DOES render must not call the user's own cancel an
     // error. pi's manual branches are `showError("Compaction cancelled")` when `aborted`
@@ -212,7 +247,10 @@ async fn a_failed_or_cancelled_compaction_is_not_announced_as_complete() {
     app.apply_compact_outcome(Err("Compaction cancelled".to_string()));
     app.draw().unwrap();
     let s = screen(&app);
-    assert!(s.contains("Compaction cancelled"), "pi's bare cancel copy is missing:\n{s}");
+    assert!(
+        s.contains("Compaction cancelled"),
+        "pi's bare cancel copy is missing:\n{s}"
+    );
     assert!(
         !s.contains("compact error"),
         "a deliberate cancel must not be prefixed as an error:\n{s}"
@@ -228,5 +266,8 @@ async fn a_failed_or_cancelled_compaction_is_not_announced_as_complete() {
         s.contains("Compaction failed: Nothing to compact (session too small)"),
         "pi's manual failure copy (agent-session.ts:1908-1917) is missing:\n{s}"
     );
-    assert!(!s.contains("compact error"), "the cyrup-only prefix is still rendered:\n{s}");
+    assert!(
+        !s.contains("compact error"),
+        "the cyrup-only prefix is still rendered:\n{s}"
+    );
 }

@@ -2,15 +2,12 @@
 //!
 //! See [`crate::proxy`] for the module overview.
 
-
 use indexmap::IndexMap;
 use serde_json::{Map as JsonMap, Value};
 
 use cyrup_core::{Content, ToolResult};
 
-use crate::config::{
-    McpConfig, McpSettings, ServerEntry,
-};
+use crate::config::{McpConfig, McpSettings, ServerEntry};
 use crate::proxy::env::format_auth_required_message;
 use crate::proxy::error_vocab::McpErrorCode;
 use crate::proxy::tool_metadata::ToolMetadata;
@@ -25,7 +22,10 @@ pub(crate) fn text_result(
     details: JsonMap<String, Value>,
 ) -> ToolResult {
     ToolResult {
-        content: vec![Content::Text { text: text.into(), text_signature: None }],
+        content: vec![Content::Text {
+            text: text.into(),
+            text_signature: None,
+        }],
         details: Some(Value::Object(details)),
         ..Default::default()
     }
@@ -41,7 +41,10 @@ pub(crate) fn details(mode: &str) -> JsonMap<String, Value> {
 /// A `details` builder seeded with `{mode, error}`.
 pub(crate) fn details_err(mode: &str, code: McpErrorCode) -> JsonMap<String, Value> {
     let mut map = details(mode);
-    map.insert("error".to_string(), Value::String(code.as_str().to_string()));
+    map.insert(
+        "error".to_string(),
+        Value::String(code.as_str().to_string()),
+    );
     map
 }
 
@@ -55,7 +58,10 @@ pub(crate) fn details_err(mode: &str, code: McpErrorCode) -> JsonMap<String, Val
 pub fn ambiguous_tool_result(mode: &str, tool_name: &str) -> ToolResult {
     let message = format!("Tool \"{tool_name}\" matches multiple servers. Specify a server.");
     let mut map = details_err(mode, McpErrorCode::AmbiguousTool);
-    map.insert("requestedTool".to_string(), Value::String(tool_name.to_string()));
+    map.insert(
+        "requestedTool".to_string(),
+        Value::String(tool_name.to_string()),
+    );
     map.insert("message".to_string(), Value::String(message.clone()));
     text_result(message, map)
 }
@@ -90,7 +96,11 @@ pub(crate) fn not_found_result(mode: &str, server_name: &str) -> ToolResult {
 /// here rather than being returned directly.
 #[must_use]
 pub fn get_auth_required_message(settings: &McpSettings, server_name: &str) -> String {
-    format_auth_required_message(settings, server_name, &default_auth_required_message(server_name))
+    format_auth_required_message(
+        settings,
+        server_name,
+        &default_auth_required_message(server_name),
+    )
 }
 
 /// The literal default `getAuthRequiredMessage` is declared with.
@@ -123,12 +133,22 @@ pub fn get_auth_failed_message(settings: &McpSettings, server_name: &str, messag
 ///
 /// `exact` compares `tool.name` verbatim; the fuzzy form compares with all `-` replaced by `_` on
 /// **both** sides.
-pub(crate) fn get_tool_matches<'a>(metadata: &'a [ToolMetadata], tool_name: &str, exact: bool) -> Vec<&'a ToolMetadata> {
+pub(crate) fn get_tool_matches<'a>(
+    metadata: &'a [ToolMetadata],
+    tool_name: &str,
+    exact: bool,
+) -> Vec<&'a ToolMetadata> {
     if exact {
-        return metadata.iter().filter(|tool| tool.name == tool_name).collect();
+        return metadata
+            .iter()
+            .filter(|tool| tool.name == tool_name)
+            .collect();
     }
     let normalized = tool_name.replace('-', "_");
-    metadata.iter().filter(|tool| tool.name.replace('-', "_") == normalized).collect()
+    metadata
+        .iter()
+        .filter(|tool| tool.name.replace('-', "_") == normalized)
+        .collect()
 }
 
 /// `proxy-modes.ts:46` `getEnabledToolMatches(state, toolName, exact)` — flat-mapped over
@@ -141,7 +161,11 @@ pub(crate) fn get_enabled_tool_matches(
 ) -> Vec<(String, ToolMetadata)> {
     let mut matches = Vec::new();
     for (server, tools) in metadata {
-        if config.mcp_servers.get(server).is_some_and(ServerEntry::is_disabled) {
+        if config
+            .mcp_servers
+            .get(server)
+            .is_some_and(ServerEntry::is_disabled)
+        {
             continue;
         }
         for tool in get_tool_matches(tools, tool_name, exact) {
@@ -169,17 +193,30 @@ pub enum SingleMatch {
 /// look. `>1` in whichever set was consulted is [`SingleMatch::Ambiguous`].
 #[must_use]
 pub fn get_single_tool_match(metadata: Option<&Vec<ToolMetadata>>, tool_name: &str) -> SingleMatch {
-    let Some(metadata) = metadata else { return SingleMatch::None };
+    let Some(metadata) = metadata else {
+        return SingleMatch::None;
+    };
     let exact = get_tool_matches(metadata, tool_name, true);
-    let matches = if exact.is_empty() { get_tool_matches(metadata, tool_name, false) } else { exact };
+    let matches = if exact.is_empty() {
+        get_tool_matches(metadata, tool_name, false)
+    } else {
+        exact
+    };
     if matches.len() > 1 {
         return SingleMatch::Ambiguous;
     }
-    matches.first().map_or(SingleMatch::None, |tool| SingleMatch::One((*tool).clone()))
+    matches
+        .first()
+        .map_or(SingleMatch::None, |tool| SingleMatch::One((*tool).clone()))
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::proxy::testsupport::{config_with, metadata_with};
@@ -189,7 +226,10 @@ mod tests {
 
     #[test]
     fn insertion_order_decides_the_disabled_server_named_first() {
-        let disabled = ServerEntry { disabled: Some(true), ..ServerEntry::default() };
+        let disabled = ServerEntry {
+            disabled: Some(true),
+            ..ServerEntry::default()
+        };
         let config = config_with(&[("zeta", disabled.clone()), ("alpha", disabled)]);
         let metadata = metadata_with(&[
             ("zeta", vec![ToolMetadata::new("t", "t", "")]),
@@ -200,7 +240,12 @@ mod tests {
         assert!(get_enabled_tool_matches(&config, &metadata, "t", true).is_empty());
         let first_disabled = metadata
             .keys()
-            .find(|server| config.mcp_servers.get(*server).is_some_and(ServerEntry::is_disabled))
+            .find(|server| {
+                config
+                    .mcp_servers
+                    .get(*server)
+                    .is_some_and(ServerEntry::is_disabled)
+            })
             .cloned();
         assert_eq!(first_disabled, Some("zeta".to_string()));
     }
@@ -213,7 +258,10 @@ mod tests {
             ToolMetadata::new("create_issue", "create_issue", "a"),
             ToolMetadata::new("create_issue", "create_issue", "b"),
         ];
-        assert_eq!(get_single_tool_match(Some(&duplicates), "create_issue"), SingleMatch::Ambiguous);
+        assert_eq!(
+            get_single_tool_match(Some(&duplicates), "create_issue"),
+            SingleMatch::Ambiguous
+        );
 
         // A single exact match beats an earlier normalized fallback.
         let mixed = vec![
@@ -233,7 +281,10 @@ mod tests {
             ToolMetadata::new("cre-ate_issue", "cre-ate_issue", "a"),
             ToolMetadata::new("cre_ate_issue", "cre_ate_issue", "b"),
         ];
-        assert_eq!(get_single_tool_match(Some(&normalized), "cre-ate-issue"), SingleMatch::Ambiguous);
+        assert_eq!(
+            get_single_tool_match(Some(&normalized), "cre-ate-issue"),
+            SingleMatch::Ambiguous
+        );
         // …and an exact hit against one of the two is NOT ambiguous.
         match get_single_tool_match(Some(&normalized), "cre_ate_issue") {
             SingleMatch::One(found) => assert_eq!(found.description, "b"),
@@ -261,5 +312,4 @@ mod tests {
             json!("Server \"gh\" is disabled. Run /mcp enable gh and /reload to enable it.")
         );
     }
-
 }

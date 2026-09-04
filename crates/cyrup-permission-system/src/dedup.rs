@@ -179,8 +179,7 @@ impl PendingOwner {
     /// see [`Lookup::Ready`]; every follower's [`Pending::wait`] wakes with the collapsed decision.
     pub fn resolve(self, cache: &mut DedupCache, decision: PermissionPromptDecision) {
         if let Some(entry) = cache.entries.iter_mut().find(|e| e.key == self.key) {
-            let is_this_registration =
-                matches!(&entry.slot, Slot::Pending { token, .. } if Arc::ptr_eq(token, &self.token));
+            let is_this_registration = matches!(&entry.slot, Slot::Pending { token, .. } if Arc::ptr_eq(token, &self.token));
             if is_this_registration {
                 entry.slot = Slot::Ready(decision.clone());
             }
@@ -212,7 +211,9 @@ pub struct DedupCache {
 impl DedupCache {
     #[must_use]
     pub fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     /// pi `getCachedPermissionPromptDecision` (`index.ts:758-774`): a live entry — resolved OR still
@@ -237,21 +238,22 @@ impl DedupCache {
         // MISS, so this caller opens its own fresh prompt instead of joining a decision that will
         // never arrive. (Followers ALREADY parked in [`Pending::wait`] fail CLOSED, which is pi's
         // rejection propagating to every awaiter.)
-        let orphaned = self
-            .entries
-            .get(pos)
-            .is_some_and(|e| matches!(&e.slot, Slot::Pending { rx, .. } if rx.has_changed().is_err()));
+        let orphaned = self.entries.get(pos).is_some_and(
+            |e| matches!(&e.slot, Slot::Pending { rx, .. } if rx.has_changed().is_err()),
+        );
         if orphaned {
             self.entries.remove(pos);
             return None;
         }
         match self.entries.get(pos) {
-            Some(Entry { slot: Slot::Ready(decision), .. }) => {
-                Some(Lookup::Ready(create_duplicate_decision(decision)))
-            }
-            Some(Entry { slot: Slot::Pending { rx, .. }, .. }) => {
-                Some(Lookup::Pending(Pending { rx: rx.clone() }))
-            }
+            Some(Entry {
+                slot: Slot::Ready(decision),
+                ..
+            }) => Some(Lookup::Ready(create_duplicate_decision(decision))),
+            Some(Entry {
+                slot: Slot::Pending { rx, .. },
+                ..
+            }) => Some(Lookup::Pending(Pending { rx: rx.clone() })),
             None => None,
         }
     }
@@ -275,7 +277,11 @@ impl DedupCache {
     /// (`index.ts:1890-1895`).
     pub fn remember(&mut self, key: &str, decision: PermissionPromptDecision) {
         self.entries.retain(|e| e.key != key);
-        self.entries.push(Entry { key: key.to_string(), cached_at: Instant::now(), slot: Slot::Ready(decision) });
+        self.entries.push(Entry {
+            key: key.to_string(),
+            cached_at: Instant::now(),
+            slot: Slot::Ready(decision),
+        });
         self.prune();
     }
 
@@ -294,15 +300,23 @@ impl DedupCache {
         self.entries.push(Entry {
             key: key.to_string(),
             cached_at: Instant::now(),
-            slot: Slot::Pending { rx, token: Arc::clone(&token) },
+            slot: Slot::Pending {
+                rx,
+                token: Arc::clone(&token),
+            },
         });
         self.prune();
-        PendingOwner { key: key.to_string(), tx, token }
+        PendingOwner {
+            key: key.to_string(),
+            tx,
+            token,
+        }
     }
 
     fn prune(&mut self) {
         let now = Instant::now();
-        self.entries.retain(|e| now.duration_since(e.cached_at) <= CACHE_TTL);
+        self.entries
+            .retain(|e| now.duration_since(e.cached_at) <= CACHE_TTL);
         while self.entries.len() > CACHE_MAX_ENTRIES {
             self.entries.remove(0);
         }
@@ -334,7 +348,12 @@ pub fn create_duplicate_decision(decision: &PermissionPromptDecision) -> Permiss
 mod tests {
     // The allow-set this workspace's test modules carry; the crate denies these at lib.rs:69
     // and the `_ => panic!("expected an in-flight (Pending) hit")` arm below IS the test failure.
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
     use super::*;
 
     fn approved_always() -> PermissionPromptDecision {
@@ -348,7 +367,11 @@ mod tests {
     #[test]
     fn same_key_reuses_collapsed_decision_new_key_misses() {
         let mut cache = DedupCache::new();
-        let d1 = DedupDetails { request_id: "call-1".into(), command: Some("x".into()), ..Default::default() };
+        let d1 = DedupDetails {
+            request_id: "call-1".into(),
+            command: Some("x".into()),
+            ..Default::default()
+        };
         let k1 = d1.cache_key().unwrap();
         assert!(cache.get(&k1).is_none(), "cold miss");
         cache.remember(&k1, approved_always());
@@ -357,14 +380,21 @@ mod tests {
         assert!(hit.approved);
         assert_eq!(hit.state, PermissionDecisionState::Approved);
         // A different toolCallId → fresh, independent (miss).
-        let d2 = DedupDetails { request_id: "call-2".into(), command: Some("x".into()), ..Default::default() };
+        let d2 = DedupDetails {
+            request_id: "call-2".into(),
+            command: Some("x".into()),
+            ..Default::default()
+        };
         let k2 = d2.cache_key().unwrap();
         assert!(cache.get(&k2).is_none());
     }
 
     #[test]
     fn empty_request_id_is_uncacheable() {
-        let d = DedupDetails { request_id: "  ".into(), ..Default::default() };
+        let d = DedupDetails {
+            request_id: "  ".into(),
+            ..Default::default()
+        };
         assert!(d.cache_key().is_none());
     }
 
@@ -380,7 +410,11 @@ mod tests {
     #[tokio::test]
     async fn concurrent_duplicate_awaits_same_pending_decision_collapsed() {
         let mut cache = DedupCache::new();
-        let d = DedupDetails { request_id: "call-concurrent".into(), command: Some("rm -rf".into()), ..Default::default() };
+        let d = DedupDetails {
+            request_id: "call-concurrent".into(),
+            command: Some("rm -rf".into()),
+            ..Default::default()
+        };
         let key = d.cache_key().unwrap();
 
         assert!(cache.lookup(&key).is_none(), "cold miss");
@@ -390,7 +424,10 @@ mod tests {
         // Second, concurrent, IDENTICAL request: must observe the SAME in-flight decision (one
         // dialog), not a cache miss that would open a second one.
         let lookup = cache.lookup(&key);
-        assert!(matches!(lookup, Some(Lookup::Pending(_))), "expected an in-flight (Pending) hit");
+        assert!(
+            matches!(lookup, Some(Lookup::Pending(_))),
+            "expected an in-flight (Pending) hit"
+        );
         let follower = match lookup {
             Some(Lookup::Pending(p)) => p,
             _ => unreachable!("checked above"),
@@ -417,7 +454,11 @@ mod tests {
     #[tokio::test]
     async fn pending_forgotten_on_error_fails_closed_for_waiters_and_clears_entry() {
         let mut cache = DedupCache::new();
-        let d = DedupDetails { request_id: "call-err".into(), command: Some("y".into()), ..Default::default() };
+        let d = DedupDetails {
+            request_id: "call-err".into(),
+            command: Some("y".into()),
+            ..Default::default()
+        };
         let key = d.cache_key().unwrap();
 
         let owner = cache.begin_pending(&key);
@@ -453,7 +494,11 @@ mod tests {
     #[tokio::test]
     async fn dropping_owner_without_settling_unblocks_waiters_and_yields_a_fresh_prompt() {
         let mut cache = DedupCache::new();
-        let d = DedupDetails { request_id: "call-cancelled".into(), command: Some("z".into()), ..Default::default() };
+        let d = DedupDetails {
+            request_id: "call-cancelled".into(),
+            command: Some("z".into()),
+            ..Default::default()
+        };
         let key = d.cache_key().unwrap();
 
         let owner = cache.begin_pending(&key);
@@ -466,11 +511,17 @@ mod tests {
         // The owner's future is cancelled: no `resolve`, no `forget`, just a drop.
         drop(owner);
         let decision = waiter.await.unwrap();
-        assert!(!decision.approved, "a cancelled prompt must never grant access");
+        assert!(
+            !decision.approved,
+            "a cancelled prompt must never grant access"
+        );
         assert_eq!(decision.state, PermissionDecisionState::Reject);
 
         // And the orphaned registration must not latch the key: the next identical request has to
         // raise its OWN prompt (pi's forgotten-entry behavior), not join the dead one.
-        assert!(cache.lookup(&key).is_none(), "an orphaned in-flight entry must read as a miss");
+        assert!(
+            cache.lookup(&key).is_none(),
+            "an orphaned in-flight entry must read as a miss"
+        );
     }
 }

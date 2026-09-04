@@ -51,28 +51,33 @@ pub use differential::{
 };
 pub use golden::{normalize_value, snapshot, verify as verify_golden, verify_snapshot};
 pub use harness::{
-    create_harness, create_harness_with_extensions, create_test_session, message_text, Harness,
-    HarnessError, HarnessOptions, TestSession, TestSessionOptions,
+    Harness, HarnessError, HarnessOptions, TestSession, TestSessionOptions, create_harness,
+    create_harness_with_extensions, create_test_session, message_text,
 };
-pub use interop::{assert_jsonl_roundtrip, import_export, InteropError};
+pub use interop::{InteropError, assert_jsonl_roundtrip, import_export};
 pub use messages::{assistant_msg, create_assistant_message, create_user_message, user_msg};
 pub use response::{
-    build_assistant_message, build_usage, faux_model, faux_model_from_def,
-    faux_model_with_context_window, FauxResponse, FauxToolCall, ModelOverride, UsageOverride,
+    FauxResponse, FauxToolCall, ModelOverride, UsageOverride, build_assistant_message, build_usage,
+    faux_model, faux_model_from_def, faux_model_with_context_window,
 };
 pub use scripted::{
-    create_faux_stream_fn, create_faux_stream_fn_queued, create_faux_stream_fn_with_model,
-    create_faux_stream_fn_with_models, FauxStreamFnState, ScriptedProvider,
+    FauxStreamFnState, ScriptedProvider, create_faux_stream_fn, create_faux_stream_fn_queued,
+    create_faux_stream_fn_with_model, create_faux_stream_fn_with_models,
 };
 // Re-export the declarative multi-model definition (Pi `FauxModelDefinition`) so harness callers can
 // build `HarnessOptions::models` without reaching into `cyrup_provider::faux`.
 pub use cyrup_provider::faux::FauxModelDefinition;
 pub use tempdir::TestTempDir;
 pub use tool_ext::{SyntheticCall, SyntheticTool, ToolExtension};
-pub use tree::{build_test_tree, TreeError, TreeMessage, TreeRole, TreeStructure};
+pub use tree::{TreeError, TreeMessage, TreeRole, TreeStructure, build_test_tree};
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 mod smoke {
     use super::*;
     use cyrup_provider::StreamEvent;
@@ -97,10 +102,8 @@ mod smoke {
     #[tokio::test]
     async fn scripted_provider_cycles() {
         use cyrup_provider::{Context, Provider, StreamOptions};
-        let (provider, _state) = create_faux_stream_fn(vec![
-            FauxResponse::text("a"),
-            FauxResponse::text("b"),
-        ]);
+        let (provider, _state) =
+            create_faux_stream_fn(vec![FauxResponse::text("a"), FauxResponse::text("b")]);
         let model = response::faux_model();
         let texts: Vec<String> = {
             let mut out = Vec::new();
@@ -112,6 +115,34 @@ mod smoke {
             out
         };
         assert_eq!(texts, vec!["a", "b", "a"]);
+    }
+
+    /// `Harness::run` returns only once the session is IDLE, not merely once the run stream has
+    /// ended. On an unbound session the run-scoped stream is closed inside the agent's `agent_end`
+    /// emit (`cyrup-session-svc/src/subscriber.rs` `end_run`), which is BEFORE the agent's own
+    /// `SettlementGuard::drop` releases its `running` latch — so a caller that prompts again the
+    /// instant the stream ends can be refused with `StreamingNeedsBehavior` (`session/run.rs`
+    /// `prompt`, via `is_run_active`). pi's multi-turn tests never do that: every one of them
+    /// does `await session.prompt(...)` and then `await session.waitForIdle()`
+    /// (`core/agent-session.ts:1626` @v0.84.4). The window is nanoseconds unloaded and
+    /// milliseconds under load (`cyrup-agent/src/tests/settlement_latch.rs`), which is exactly how
+    /// it surfaced: one two-turn seam test lost it once in a loaded full-suite run and passed 3/3
+    /// re-run alone. Many turns on the multi-thread runtime widen the odds; the assertion is the
+    /// guarantee `run` now makes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn run_returns_only_once_the_session_is_idle() {
+        let harness = create_harness(HarnessOptions::with_responses(vec![FauxResponse::text(
+            "done",
+        )]))
+        .await
+        .expect("build harness");
+        for turn in 0..40 {
+            harness.run(format!("turn {turn}")).await.expect("run");
+            assert!(
+                harness.session().is_idle(),
+                "turn {turn}: `run` returned while the session still reported a run in flight"
+            );
+        }
     }
 
     /// The full session harness drives a turn and captures the ordered event sequence.
@@ -129,7 +160,10 @@ mod smoke {
         // SEAM-005: the session-layer stream closes with `agent_settled` (the WHOLE run is done),
         // immediately after the run's last `agent_end`.
         assert_eq!(kinds.last().map(String::as_str), Some("agent_settled"));
-        assert_eq!(kinds.iter().rev().nth(1).map(String::as_str), Some("agent_end"));
+        assert_eq!(
+            kinds.iter().rev().nth(1).map(String::as_str),
+            Some("agent_end")
+        );
         assert!(kinds.iter().any(|k| k == "message_start"));
         assert!(kinds.iter().any(|k| k == "message_end"));
 
@@ -138,15 +172,20 @@ mod smoke {
 
         // The assistant text reached the transcript.
         let texts = harness.assistant_texts().await;
-        assert!(texts.iter().any(|t| t.contains("the answer is 42")), "got {texts:?}");
+        assert!(
+            texts.iter().any(|t| t.contains("the answer is 42")),
+            "got {texts:?}"
+        );
     }
 
     /// Differential runner: the harness's emitted kinds match an expected Pi-shaped sequence.
     #[tokio::test]
     async fn differential_runner_matches_expected_kinds() {
-        let harness = create_harness(HarnessOptions::with_responses(vec![FauxResponse::text("hi")]))
-            .await
-            .expect("build harness");
+        let harness = create_harness(HarnessOptions::with_responses(vec![FauxResponse::text(
+            "hi",
+        )]))
+        .await
+        .expect("build harness");
         let events = harness.run("hello").await.expect("run");
         let kinds = event_kind_sequence(&events);
         // Diff against itself ⇒ no diff.
@@ -163,7 +202,9 @@ mod smoke {
         let dir = TestTempDir::new().unwrap();
         let path = dir.path().join("events.jsonl");
         let events = vec![
-            StreamEvent::Start { partial: faux_partial() },
+            StreamEvent::Start {
+                partial: faux_partial(),
+            },
             StreamEvent::TextDelta {
                 content_index: 0,
                 delta: "hi".into(),
@@ -175,7 +216,9 @@ mod smoke {
         // Re-verify ⇒ match.
         verify_golden(&path, &snapshot(&events)).unwrap();
         // A change ⇒ a unified diff error.
-        let changed = vec![StreamEvent::Start { partial: faux_partial() }];
+        let changed = vec![StreamEvent::Start {
+            partial: faux_partial(),
+        }];
         assert!(verify_golden(&path, &snapshot(&changed)).is_err());
     }
 
@@ -240,24 +283,55 @@ mod smoke {
     #[tokio::test]
     async fn create_test_session_builds_over_a_provider() {
         use std::sync::Arc;
-        let provider = Arc::new(scripted::ScriptedProvider::new(vec![FauxResponse::text("hi")]));
+        let provider = Arc::new(scripted::ScriptedProvider::new(vec![FauxResponse::text(
+            "hi",
+        )]));
         let ts = create_test_session(provider, TestSessionOptions::default())
             .await
             .expect("build test session");
         // The session resolved a model and can report its current address.
-        assert_eq!(ts.session().model().expect("session must have a resolved model").provider.as_str(), "faux");
+        assert_eq!(
+            ts.session()
+                .model()
+                .expect("session must have a resolved model")
+                .provider
+                .as_str(),
+            "faux"
+        );
     }
 
     /// Harness threads a model `contextWindow` override (Pi `HarnessOptions.contextWindow`) onto the
     /// resolved session model — making compaction-threshold scenarios reproducible.
     #[tokio::test]
     async fn harness_threads_context_window_override() {
-        let opts = HarnessOptions { context_window: Some(2_048), ..Default::default() };
+        let opts = HarnessOptions {
+            context_window: Some(2_048),
+            ..Default::default()
+        };
         let harness = create_harness(opts).await.expect("build harness");
-        assert_eq!(harness.session().services().model.as_ref().expect("session must have a resolved model").context_window, 2_048);
+        assert_eq!(
+            harness
+                .session()
+                .services()
+                .model
+                .as_ref()
+                .expect("session must have a resolved model")
+                .context_window,
+            2_048
+        );
         // Default (no override) keeps the faux model's 128000.
-        let dflt = create_harness(HarnessOptions::default()).await.expect("build harness");
-        assert_eq!(dflt.session().services().model.as_ref().expect("session must have a resolved model").context_window, 128_000);
+        let dflt = create_harness(HarnessOptions::default())
+            .await
+            .expect("build harness");
+        assert_eq!(
+            dflt.session()
+                .services()
+                .model
+                .as_ref()
+                .expect("session must have a resolved model")
+                .context_window,
+            128_000
+        );
     }
 
     /// Harness threads CLI settings overrides (Pi `HarnessOptions.settings`: retry/compaction/etc.)
@@ -266,9 +340,15 @@ mod smoke {
     async fn harness_threads_settings_override() {
         let mut settings = cyrup_config::Settings::new();
         settings
-            .set_field("retry", serde_json::json!({ "enabled": true, "maxRetries": 7 }))
+            .set_field(
+                "retry",
+                serde_json::json!({ "enabled": true, "maxRetries": 7 }),
+            )
             .expect("set retry");
-        let opts = HarnessOptions { settings, ..Default::default() };
+        let opts = HarnessOptions {
+            settings,
+            ..Default::default()
+        };
         let harness = create_harness(opts).await.expect("build harness");
         let retry = harness
             .session()
@@ -301,8 +381,14 @@ mod smoke {
         let harness = create_harness(opts).await.expect("build harness");
         let events = harness.run("use the tool").await.expect("run");
         let kinds = event_kind_sequence(&events);
-        assert!(kinds.iter().any(|k| k == "tool_execution_start"), "got {kinds:?}");
-        assert!(kinds.iter().any(|k| k == "tool_execution_end"), "got {kinds:?}");
+        assert!(
+            kinds.iter().any(|k| k == "tool_execution_start"),
+            "got {kinds:?}"
+        );
+        assert!(
+            kinds.iter().any(|k| k == "tool_execution_end"),
+            "got {kinds:?}"
+        );
         let recorded = calls.lock().unwrap();
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].params, serde_json::json!({ "x": 1 }));
@@ -319,11 +405,26 @@ mod smoke {
         };
         let harness = create_harness(opts).await.expect("build harness");
         // No stored/runtime credential for the faux provider.
-        let provider = harness.session().model().expect("session must have a resolved model").provider.clone();
-        assert!(harness.session().services().auth.runtime_api_key(&provider).is_none());
+        let provider = harness
+            .session()
+            .model()
+            .expect("session must have a resolved model")
+            .provider
+            .clone();
+        assert!(
+            harness
+                .session()
+                .services()
+                .auth
+                .runtime_api_key(&provider)
+                .is_none()
+        );
         // The turn still completes (the faux provider requires no auth).
         let events = harness.run("hello").await.expect("run");
-        assert_eq!(event_kind_sequence(&events).last().map(String::as_str), Some("agent_settled"));
+        assert_eq!(
+            event_kind_sequence(&events).last().map(String::as_str),
+            Some("agent_settled")
+        );
     }
 
     /// `initialActiveToolNames` (Pi suite/harness.ts:68,184) seeds the visible/active tool set when
@@ -337,7 +438,10 @@ mod smoke {
         let harness = create_harness(opts).await.expect("build harness");
         // The session builds with only the read tool active; a turn still completes.
         let events = harness.run("hi").await.expect("run");
-        assert_eq!(event_kind_sequence(&events).first().map(String::as_str), Some("agent_start"));
+        assert_eq!(
+            event_kind_sequence(&events).first().map(String::as_str),
+            Some("agent_start")
+        );
     }
 
     /// Differential anchor (func-00 R-00-012): the harness's emitted session-event ordering for a
@@ -359,9 +463,11 @@ mod smoke {
         let expected = crate::differential::value_type_sequence(&pi_events);
         assert_eq!(expected.len(), 11, "Pi-captured fixture event count");
 
-        let harness = create_harness(HarnessOptions::with_responses(vec![FauxResponse::text("hi")]))
-            .await
-            .expect("build harness");
+        let harness = create_harness(HarnessOptions::with_responses(vec![FauxResponse::text(
+            "hi",
+        )]))
+        .await
+        .expect("build harness");
         let events = harness.run("hello").await.expect("run");
         // The fixture is a capture of Pi's own `agentLoop()` (see its `_note`), so it contains only
         // agent-loop events. cyrup's harness records SESSION events, whose superset includes
@@ -369,8 +475,9 @@ mod smoke {
         // (agent-session.ts:581-588), never from the loop. Compare the agent-loop subset; padding
         // the EXPECTED side would falsely assert Pi's loop emits it.
         let actual = crate::differential::agent_loop_kinds(&event_kind_sequence(&events));
-        assert_event_kinds(&expected, &actual)
-            .expect("cyrup text-turn ordering diverges from the REAL Pi-captured agent-loop sequence");
+        assert_event_kinds(&expected, &actual).expect(
+            "cyrup text-turn ordering diverges from the REAL Pi-captured agent-loop sequence",
+        );
     }
 
     /// The faux core tool-call id matches Pi's `tool:<ts>:<rand>` shape (deterministic [CYRUP-DELTA]).
@@ -387,7 +494,8 @@ mod smoke {
             _ => panic!("expected tool call"),
         }
         // Explicit id is honored (Pi `options.id`).
-        let tc2 = faux::faux_tool_call_with_id("echo", serde_json::json!({}), Some("custom-id".into()));
+        let tc2 =
+            faux::faux_tool_call_with_id("echo", serde_json::json!({}), Some("custom-id".into()));
         match tc2 {
             Content::ToolCall(call) => assert_eq!(call.id.as_str(), "custom-id"),
             _ => panic!("expected tool call"),
@@ -414,7 +522,10 @@ mod smoke {
     #[tokio::test]
     async fn harness_advertises_multiple_models_and_looks_up_by_id() {
         let opts = HarnessOptions {
-            models: vec![FauxModelDefinition::new("m-a"), FauxModelDefinition::new("m-b")],
+            models: vec![
+                FauxModelDefinition::new("m-a"),
+                FauxModelDefinition::new("m-b"),
+            ],
             ..Default::default()
         };
         let harness = create_harness(opts).await.expect("build harness");
@@ -423,9 +534,22 @@ mod smoke {
         assert!(harness.get_model("m-b").is_some());
         assert!(harness.get_model("nope").is_none());
         // The session resolves the default (first) model, and a turn completes.
-        assert_eq!(harness.session().services().model.as_ref().expect("session must have a resolved model").id.as_str(), "m-a");
+        assert_eq!(
+            harness
+                .session()
+                .services()
+                .model
+                .as_ref()
+                .expect("session must have a resolved model")
+                .id
+                .as_str(),
+            "m-a"
+        );
         let events = harness.run("hi").await.expect("run");
-        assert_eq!(event_kind_sequence(&events).last().map(String::as_str), Some("agent_settled"));
+        assert_eq!(
+            event_kind_sequence(&events).last().map(String::as_str),
+            Some("agent_settled")
+        );
     }
 
     /// Queue-consuming harness flavour (Pi `registerFauxProvider`/`suite/harness.ts`): responses are
@@ -474,7 +598,10 @@ mod smoke {
         ))
         .await;
         assert_eq!(m2.stop_reason, cyrup_core::StopReason::Error);
-        assert_eq!(m2.error_message.as_deref(), Some("No more faux responses queued"));
+        assert_eq!(
+            m2.error_message.as_deref(),
+            Some("No more faux responses queued")
+        );
     }
 
     /// Queue-exhaustion EVENT ORDERING — byte/behaviour-diff anchor against Pi faux.ts:451-461.
@@ -518,7 +645,9 @@ mod smoke {
         }
         // Explicit guard against the [start, error] regression.
         assert!(
-            !events.iter().any(|e| matches!(e, StreamEvent::Start { .. })),
+            !events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Start { .. })),
             "exhaustion must not emit a leading `start` (Pi pushes only the `error` event)"
         );
     }
@@ -537,7 +666,10 @@ mod smoke {
 
         // Empty queue ⇒ the first call is the no-step exhaustion path.
         let (provider, _state) = create_faux_stream_fn_queued(vec![], vec![faux_model()]);
-        let ctx = Context { messages: vec![user_msg("hello")], ..Default::default() };
+        let ctx = Context {
+            messages: vec![user_msg("hello")],
+            ..Default::default()
+        };
         let m = cyrup_provider::collect_message(provider.stream(
             &faux_model(),
             &ctx,
@@ -545,7 +677,10 @@ mod smoke {
         ))
         .await;
         assert_eq!(m.stop_reason, cyrup_core::StopReason::Error);
-        assert_eq!(m.error_message.as_deref(), Some("No more faux responses queued"));
+        assert_eq!(
+            m.error_message.as_deref(),
+            Some("No more faux responses queued")
+        );
         // Re-derived expected bytes from Pi's withUsageEstimate (faux.ts:235-247).
         let expected = Usage {
             input: 3,
@@ -557,7 +692,10 @@ mod smoke {
             total_tokens: 3,
             cost: Cost::default(),
         };
-        assert_eq!(m.usage, expected, "exhaustion usage must match Pi withUsageEstimate");
+        assert_eq!(
+            m.usage, expected,
+            "exhaustion usage must match Pi withUsageEstimate"
+        );
     }
 
     /// Arbitrary `Model` override (Pi `createHarness({ model })`, test-harness.ts:324,369-370): an
@@ -582,10 +720,18 @@ mod smoke {
             compat: None,
             headers: None,
         };
-        let opts = HarnessOptions { model: Some(custom), ..Default::default() };
+        let opts = HarnessOptions {
+            model: Some(custom),
+            ..Default::default()
+        };
         let harness = create_harness(opts).await.expect("build harness");
         assert_eq!(harness.model().map(|m| m.id.as_str()), Some("custom-1"));
-        let resolved = harness.session().services().model.clone().expect("session must have a resolved model");
+        let resolved = harness
+            .session()
+            .services()
+            .model
+            .clone()
+            .expect("session must have a resolved model");
         assert_eq!(resolved.id.as_str(), "custom-1");
         assert_eq!(resolved.context_window, 4_096);
         assert!(resolved.reasoning);
@@ -601,8 +747,11 @@ mod smoke {
         provider.set_response_steps(vec![faux::FauxResponseStep::async_factory(
             |_ctx, opts, state, _model| async move {
                 tokio::task::yield_now().await;
-                let sid =
-                    opts.session_id.as_ref().map(|s| s.as_str().to_string()).unwrap_or_default();
+                let sid = opts
+                    .session_id
+                    .as_ref()
+                    .map(|s| s.as_str().to_string())
+                    .unwrap_or_default();
                 faux::faux_assistant_message(
                     vec![faux::faux_text(format!("c{}-sid{sid}", state.call_count))],
                     cyrup_core::StopReason::Stop,
@@ -627,7 +776,11 @@ mod smoke {
         let expected = std::env::var("ANTHROPIC_OAUTH_TOKEN")
             .ok()
             .filter(|s| !s.is_empty())
-            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok().filter(|s| !s.is_empty()));
+            .or_else(|| {
+                std::env::var("ANTHROPIC_API_KEY")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+            });
         assert_eq!(api_key(), expected);
         assert_eq!(has_api_key(), expected.is_some());
     }
@@ -642,7 +795,10 @@ mod smoke {
     // missing golden is written into the source tree (golden recorder); thereafter it is asserted.
 
     fn fixture_path(name: &str) -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures").join("pi").join(name)
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("pi")
+            .join(name)
     }
 
     async fn drain(stream: cyrup_core::EventStream<StreamEvent>) -> Vec<StreamEvent> {
@@ -664,10 +820,13 @@ mod smoke {
             cyrup_core::StopReason::Stop,
         )]);
         let model = provider.model().clone();
-        let events = drain(provider.stream(&model, &Context::default(), &StreamOptions::default()))
-            .await;
-        verify_golden(fixture_path("thinking-stream.events.jsonl"), &snapshot(&events))
-            .expect("thinking-stream golden");
+        let events =
+            drain(provider.stream(&model, &Context::default(), &StreamOptions::default())).await;
+        verify_golden(
+            fixture_path("thinking-stream.events.jsonl"),
+            &snapshot(&events),
+        )
+        .expect("thinking-stream golden");
         let types = stream_event_type_sequence(&events);
         assert_eq!(types.first().map(String::as_str), Some("start"));
         assert!(types.iter().any(|t| t == "thinking_start"));
@@ -692,10 +851,14 @@ mod smoke {
         use cyrup_provider::{Context, Provider, StreamOptions};
 
         // The real-Pi capture (skips the `{"_note":…}` provenance line).
-        let jsonl = std::fs::read_to_string(fixture_path("thinking-stream.pi-captured.events.jsonl"))
-            .expect("read Pi-captured fixture");
+        let jsonl =
+            std::fs::read_to_string(fixture_path("thinking-stream.pi-captured.events.jsonl"))
+                .expect("read Pi-captured fixture");
         let pi_events = crate::differential::pi_fixture_events(&jsonl);
-        assert!(!pi_events.is_empty(), "Pi-captured fixture has no typed events");
+        assert!(
+            !pi_events.is_empty(),
+            "Pi-captured fixture has no typed events"
+        );
 
         // cyrup's live faux stream for the identical scenario.
         let provider = faux::FauxProvider::new();
@@ -710,7 +873,10 @@ mod smoke {
         // (1) type + ordering — R-00-012's exact contract, fully cross-impl.
         let pi_types = crate::differential::value_type_sequence(&pi_events);
         let cy_types = stream_event_type_sequence(&cy_events);
-        assert_eq!(pi_types, cy_types, "Pi vs cyrup event type+ordering mismatch");
+        assert_eq!(
+            pi_types, cy_types,
+            "Pi vs cyrup event type+ordering mismatch"
+        );
         assert_eq!(pi_types.first().map(String::as_str), Some("start"));
         assert_eq!(pi_types.last().map(String::as_str), Some("done"));
 
@@ -751,10 +917,13 @@ mod smoke {
             cyrup_core::StopReason::ToolUse,
         )]);
         let model = provider.model().clone();
-        let events = drain(provider.stream(&model, &Context::default(), &StreamOptions::default()))
-            .await;
-        verify_golden(fixture_path("tool-call-stream.events.jsonl"), &snapshot(&events))
-            .expect("tool-call-stream golden");
+        let events =
+            drain(provider.stream(&model, &Context::default(), &StreamOptions::default())).await;
+        verify_golden(
+            fixture_path("tool-call-stream.events.jsonl"),
+            &snapshot(&events),
+        )
+        .expect("tool-call-stream golden");
         let types = stream_event_type_sequence(&events);
         assert_eq!(types.first().map(String::as_str), Some("start"));
         assert!(types.iter().any(|t| t == "toolcall_start"));
@@ -769,13 +938,19 @@ mod smoke {
         provider.set_responses(vec![faux::faux_assistant_message_with(
             Vec::new(),
             cyrup_core::StopReason::Error,
-            faux::FauxMessageOptions { error_message: Some("boom".into()), ..Default::default() },
+            faux::FauxMessageOptions {
+                error_message: Some("boom".into()),
+                ..Default::default()
+            },
         )]);
         let model = provider.model().clone();
-        let events = drain(provider.stream(&model, &Context::default(), &StreamOptions::default()))
-            .await;
-        verify_golden(fixture_path("error-stream.events.jsonl"), &snapshot(&events))
-            .expect("error-stream golden");
+        let events =
+            drain(provider.stream(&model, &Context::default(), &StreamOptions::default())).await;
+        verify_golden(
+            fixture_path("error-stream.events.jsonl"),
+            &snapshot(&events),
+        )
+        .expect("error-stream golden");
         let types = stream_event_type_sequence(&events);
         assert_eq!(types.first().map(String::as_str), Some("start"));
         assert_eq!(types.last().map(String::as_str), Some("error"));
@@ -792,10 +967,14 @@ mod smoke {
         let model = provider.model().clone();
         let mut events =
             drain(provider.stream(&model, &Context::default(), &StreamOptions::default())).await;
-        events
-            .extend(drain(provider.stream(&model, &Context::default(), &StreamOptions::default())).await);
-        verify_golden(fixture_path("multi-turn-stream.events.jsonl"), &snapshot(&events))
-            .expect("multi-turn-stream golden");
+        events.extend(
+            drain(provider.stream(&model, &Context::default(), &StreamOptions::default())).await,
+        );
+        verify_golden(
+            fixture_path("multi-turn-stream.events.jsonl"),
+            &snapshot(&events),
+        )
+        .expect("multi-turn-stream golden");
         // Two complete turns: two `start` and two `done` terminals.
         let types = stream_event_type_sequence(&events);
         assert_eq!(types.iter().filter(|t| *t == "start").count(), 2);

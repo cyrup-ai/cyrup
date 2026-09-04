@@ -22,7 +22,9 @@ impl Signal {
     /// [`ToolCall::new`] already does this for the call it builds, so a tool `execute` body reads
     /// [`ToolCall::signal`] rather than constructing one.
     pub fn new(call_id: impl Into<String>) -> Self {
-        Self { call_id: call_id.into() }
+        Self {
+            call_id: call_id.into(),
+        }
     }
     /// Whether cancellation has been requested for this tool call (Pi `signal.aborted`).
     pub fn is_aborted(&self) -> bool {
@@ -56,7 +58,12 @@ impl ToolCall {
     /// id.
     pub fn new(call_id: impl Into<String>, params: Value) -> Self {
         let call_id = call_id.into();
-        Self { signal: Signal::new(call_id.clone()), call_id, params, ctx: Ctx }
+        Self {
+            signal: Signal::new(call_id.clone()),
+            call_id,
+            params,
+            ctx: Ctx,
+        }
     }
     /// The cancellation signal for this call (Pi `signal` param).
     pub fn signal(&self) -> &Signal {
@@ -76,7 +83,10 @@ impl ToolCall {
             Ok(c) => c,
             Err(e) => {
                 self.ctx.ui().notify_with(
-                    &format!("emit_update({}): chunk dropped, failed to encode: {e}", self.call_id),
+                    &format!(
+                        "emit_update({}): chunk dropped, failed to encode: {e}",
+                        self.call_id
+                    ),
                     crate::ctx::NotifyKind::Error,
                 );
                 return;

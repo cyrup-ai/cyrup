@@ -181,8 +181,7 @@ pub async fn resolve_startup_ui(
                     .map(|s| s.cwd.clone())
                     .unwrap_or_default();
                 if crate::session_cwd_is_missing(&stored_cwd) {
-                    let body =
-                        crate::format_missing_session_cwd_prompt(&stored_cwd, &dirs.cwd);
+                    let body = crate::format_missing_session_cwd_prompt(&stored_cwd, &dirs.cwd);
                     let choice =
                         crate::run_missing_cwd_prompt(&theme, &keymaps.0, &body, &dirs.cwd).await?;
                     match choice {
@@ -239,7 +238,8 @@ pub fn trust_prompt_callback(dirs: &ConfigDirs) -> cyrup_session_svc::TrustPromp
     let theme = crate::startup_theme(dirs);
     let (keymap, _) = crate::startup_keymaps(dirs);
     Arc::new(move |options, saved| {
-        let (theme, keymap, cwd, store) = (theme.clone(), keymap.clone(), cwd.clone(), store.clone());
+        let (theme, keymap, cwd, store) =
+            (theme.clone(), keymap.clone(), cwd.clone(), store.clone());
         Box::pin(async move {
             match crate::run_trust_prompt(&theme, &keymap, &cwd, options, saved, &store).await {
                 Ok(choice) => choice,

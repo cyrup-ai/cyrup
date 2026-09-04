@@ -26,7 +26,9 @@ pub fn evaluate(tool: &str, command: &str, rulesets: &[&[PatternRule]]) -> Evalu
     let rules: Vec<&PatternRule> = rulesets.iter().flat_map(|rs| rs.iter()).collect();
 
     for index in (0..rules.len()).rev() {
-        let Some(rule) = rules.get(index) else { continue };
+        let Some(rule) = rules.get(index) else {
+            continue;
+        };
         let tool_pat = wildcard::compile(&rule.tool, ());
         if !tool_pat.is_match(tool) {
             continue;
@@ -42,7 +44,11 @@ pub fn evaluate(tool: &str, command: &str, rulesets: &[&[PatternRule]]) -> Evalu
         };
     }
 
-    Evaluation { action: PermissionState::Ask, matched_pattern: None, matched_tool: None }
+    Evaluation {
+        action: PermissionState::Ask,
+        matched_pattern: None,
+        matched_tool: None,
+    }
 }
 
 #[cfg(test)]
@@ -51,7 +57,11 @@ mod tests {
     use super::*;
 
     fn rule(tool: &str, pattern: &str, action: PermissionState) -> PatternRule {
-        PatternRule { tool: tool.into(), pattern: pattern.into(), action }
+        PatternRule {
+            tool: tool.into(),
+            pattern: pattern.into(),
+            action,
+        }
     }
 
     #[test]

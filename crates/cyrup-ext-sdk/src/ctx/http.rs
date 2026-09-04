@@ -91,11 +91,19 @@ pub struct HttpRequest {
 impl HttpRequest {
     /// A bare `GET` to `url`.
     pub fn get(url: impl Into<String>) -> Self {
-        Self { method: "GET".into(), url: url.into(), ..Default::default() }
+        Self {
+            method: "GET".into(),
+            url: url.into(),
+            ..Default::default()
+        }
     }
     /// A `method` request to `url`.
     pub fn new(method: impl Into<String>, url: impl Into<String>) -> Self {
-        Self { method: method.into(), url: url.into(), ..Default::default() }
+        Self {
+            method: method.into(),
+            url: url.into(),
+            ..Default::default()
+        }
     }
     /// Append a request header (builder-style).
     #[must_use]
@@ -144,7 +152,11 @@ pub struct HttpResponse {
 impl HttpResponse {
     #[cfg(target_arch = "wasm32")]
     fn from_wit(wit: crate::guest::bindings::cyrup::ext::http_client::HttpResponse) -> Self {
-        Self { status: wit.status, headers: wit.headers, body: wit.body }
+        Self {
+            status: wit.status,
+            headers: wit.headers,
+            body: wit.body,
+        }
     }
 }
 
@@ -167,6 +179,10 @@ pub struct HttpStreamResponse {
 impl HttpStreamResponse {
     #[cfg(target_arch = "wasm32")]
     fn from_wit(wit: crate::guest::bindings::cyrup::ext::http_client::HttpStreamResponse) -> Self {
-        Self { handle: wit.handle, status: wit.status, headers: wit.headers }
+        Self {
+            handle: wit.handle,
+            status: wit.status,
+            headers: wit.headers,
+        }
     }
 }

@@ -2,9 +2,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
-use crate::exec::completion_guard::CompletionMutationGuardResult;
 use crate::exec::acceptance::lattice::contract::VerifyCommand;
 use crate::exec::acceptance::lattice::gate::CleanCompletionGate;
+use crate::exec::completion_guard::CompletionMutationGuardResult;
 use std::time::Duration;
 
 /// A `verify[]` entry declaring nothing but its shell command — the run-level `cwd`, the
@@ -12,7 +12,6 @@ use std::time::Duration;
 pub(crate) fn vc(command: &str) -> VerifyCommand {
     VerifyCommand::shell(command)
 }
-
 
 /// The raw exit observation the retired `VerifyCommandResult.passed` field carried:
 /// `exit_code == Some(0)`, verbatim (that field's own doc: "Whether this command counts as
@@ -25,7 +24,6 @@ pub(crate) fn passed(result: &crate::exec::acceptance::model::AcceptanceVerifyRe
     result.exit_code == Some(0)
 }
 
-
 /// A `verify[]` entry declaring its own `timeoutMs`, for the timeout/kill-ladder tests that
 /// must not wait out [`crate::exec::acceptance::model::DEFAULT_VERIFY_TIMEOUT_MS`].
 pub(crate) fn vc_timeout(command: &str, timeout: Duration) -> VerifyCommand {
@@ -36,7 +34,6 @@ pub(crate) fn vc_timeout(command: &str, timeout: Duration) -> VerifyCommand {
         ..VerifyCommand::shell(command)
     }
 }
-
 
 // ---------------------------------------------------------------------------------------
 // evaluate_acceptance: THE load-bearing DI-SA-5 distinction — a real executed verify[]
@@ -51,7 +48,6 @@ pub(crate) fn clean_gate() -> CleanCompletionGate {
         timed_out: false,
     }
 }
-
 
 pub(crate) fn no_guard_trigger() -> CompletionMutationGuardResult {
     CompletionMutationGuardResult {

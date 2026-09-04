@@ -3,14 +3,13 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::background::{run_status, RunId, RunPaths, RunState};
+use crate::background::{RunId, RunPaths, RunState, run_status};
 use crate::extension::executor::SubagentExecutor;
 use crate::extension::executor::paths::{default_async_root_in, default_results_dir_in};
 use crate::extension::executor::requests::StatusViewSelector;
 use crate::extension::host::native_impl::read_nested_children;
 
 impl SubagentExecutor {
-
     /// Resume background-run tracking from disk (R-SA-093's "resume on session start" note in
     /// `on_event`'s own doc): re-discover any run directories still present under this cwd's
     /// `AsyncRoot` from a prior process and re-track them, so a restarted orchestrator does not
@@ -121,7 +120,8 @@ impl SubagentExecutor {
         dir: Option<&str>,
         child_safe: bool,
     ) -> Result<String, String> {
-        self.control_status_view(cwd, id, dir, child_safe, StatusViewSelector::default()).await
+        self.control_status_view(cwd, id, dir, child_safe, StatusViewSelector::default())
+            .await
     }
 
     /// G92: `action: "status"` with pi's optional `view`/`lines`/`index` selectors
@@ -214,7 +214,9 @@ impl SubagentExecutor {
 
         let mut tracked_jobs: Vec<AsyncRunView> = Vec::new();
         for job in self.tracker.snapshot() {
-            let Some(status) = job.last_status else { continue };
+            let Some(status) = job.last_status else {
+                continue;
+            };
             // pi `nestedChildren` (`fleet-status.ts:193,212`), resolved from the ids each step
             // records. One level, read-only — see this method's doc.
             let nested_children = read_nested_children(&job.paths, &status).await;
@@ -229,12 +231,22 @@ impl SubagentExecutor {
             });
         }
 
+        let cfg = self.config_snapshot().await;
         let mut state = FleetState {
             // SUBA-048 / pi `state.artifactDirPreference` (`extension/index.ts:375`), seeded from
             // `config.artifactDir` and read by `fleetArtifactsRoot` (`fleet.ts:334-340`).
-            artifact_dir_preference: self.config_snapshot().await.artifact_dir_preference(),
+            artifact_dir_preference: cfg.artifact_dir_preference(),
             base_cwd: cwd.to_path_buf(),
             current_session_id,
+            // SUBA-091 / pi `state.trustedSessionRoots` (`extension/index.ts:895-898` @v0.64.0):
+            // `config.defaultSessionDir` (tilde-expanded, resolved) plus the parent session's
+            // subagent session root — the roots `asyncDetail`'s session-transcript fallback
+            // (`tui/fleet.ts:557`) is confined to. Before this field the fleet passed `[]` and
+            // every such read was refused.
+            trusted_session_roots: super::paths::trusted_session_roots(
+                cfg.default_session_dir.as_deref(),
+                parent_session_file.as_deref(),
+            ),
             parent_session_file,
             foreground_controls,
             foreground_runs: Vec::new(),
@@ -244,7 +256,7 @@ impl SubagentExecutor {
             scan_error: None,
         };
         if include_history {
-            let roots = self.config_snapshot().await.roots;
+            let roots = cfg.roots;
             let async_root = default_async_root_in(&roots, cwd);
             let results_dir = default_results_dir_in(&roots, cwd);
             match crate::tui::fleet::collect_fleet_history(
@@ -285,13 +297,19 @@ impl SubagentExecutor {
             && view != "fleet"
             && view != "transcript"
         {
-            return Err(format!("Unknown status view: {view}. Valid: fleet, transcript."));
+            return Err(format!(
+                "Unknown status view: {view}. Valid: fleet, transcript."
+            ));
         }
         // (2) pi `run-status.ts:200`.
         if view == Some("fleet") {
-            let runs = run_status::list_active_runs(&async_root, &results_dir, self.current_session_id().as_deref())
-                .await
-                .map_err(|e| e.to_string())?;
+            let runs = run_status::list_active_runs(
+                &async_root,
+                &results_dir,
+                self.current_session_id().as_deref(),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
             return crate::background::fleet_view::format_fleet(
                 &self.foreground_fleet_entries(),
                 &runs,
@@ -310,9 +328,13 @@ impl SubagentExecutor {
                         .to_string(),
                 );
             }
-            let runs = run_status::list_active_runs(&async_root, &results_dir, self.current_session_id().as_deref())
-                .await
-                .map_err(|e| e.to_string())?;
+            let runs = run_status::list_active_runs(
+                &async_root,
+                &results_dir,
+                self.current_session_id().as_deref(),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
             if !transcript {
                 return Ok(run_status::format_run_list(&runs));
             }
@@ -372,12 +394,14 @@ impl SubagentExecutor {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut entries: Vec<_> = controls
             .iter()
-            .map(|(run_id, entry)| crate::background::fleet_view::ForegroundFleetEntry {
-                run_id: run_id.clone(),
-                current_agent: entry.current_agent.clone(),
-                current_index: entry.current_index,
-                activity_state: entry.current_activity_state,
-            })
+            .map(
+                |(run_id, entry)| crate::background::fleet_view::ForegroundFleetEntry {
+                    run_id: run_id.clone(),
+                    current_agent: entry.current_agent.clone(),
+                    current_index: entry.current_index,
+                    activity_state: entry.current_activity_state,
+                },
+            )
             .collect();
         // pi sorts by `updatedAt` descending (`fleet-view.ts:236`); cyrup's registry carries no
         // per-entry timestamp, so run id gives the same STABLE ordering a `HashMap` iteration
@@ -403,7 +427,12 @@ impl SubagentExecutor {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
 
@@ -416,6 +445,29 @@ mod tests {
     // full per-run rendering + primitive behavior is covered by `background::run_status`'s own tests
     // against explicit temp roots.
     // ---------------------------------------------------------------------------------------
+
+    /// SUBA-091 — `fleet_state` seeds pi's `state.trustedSessionRoots`
+    /// (`extension/index.ts:895-898` @v0.64.0) from the configured `default_session_dir`. With no
+    /// host services bound there is no parent session file, so that rung is the only one; with
+    /// nothing configured the list is pi's initial `[]` (`:447`). Pre-fix the field did not exist
+    /// and the fleet inspector passed a literal empty slice regardless of configuration.
+    #[tokio::test]
+    async fn fleet_state_seeds_trusted_session_roots_from_the_configured_default_session_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let configured = dir.path().join("subagent-sessions");
+        let executor =
+            SubagentExecutor::with_config(crate::registration::SubagentExtensionConfig {
+                default_session_dir: Some(configured.clone()),
+                ..crate::registration::SubagentExtensionConfig::default()
+            });
+        let state = executor.fleet_state(dir.path(), false, false).await;
+        assert_eq!(state.trusted_session_roots, vec![configured]);
+
+        let bare = SubagentExecutor::new()
+            .fleet_state(dir.path(), false, false)
+            .await;
+        assert!(bare.trusted_session_roots.is_empty());
+    }
 
     #[tokio::test]
     async fn control_status_no_id_over_a_fresh_cwd_lists_no_active_runs() {
@@ -457,5 +509,4 @@ mod tests {
             "Child-safe subagent status requires an id when no foreground run is active."
         );
     }
-
 }

@@ -121,14 +121,23 @@ async fn a_queued_steer_message_is_delivered_into_the_childs_live_turn() {
     std::fs::create_dir_all(&run_dir).expect("mkdir run dir");
 
     // --- hop 1: the PARENT queues guidance (pi `requestAsyncSteer`) ---------------------------
-    control::request_async_steer(&run_dir, "  focus on the failing test only  ", None, Some("steer-action"))
-        .await
-        .expect("the parent writes a steer request");
+    control::request_async_steer(
+        &run_dir,
+        "  focus on the failing test only  ",
+        None,
+        Some("steer-action"),
+    )
+    .await
+    .expect("the parent writes a steer request");
 
     // --- hop 2: the RUNNER drains the run-level queue and routes to child 0 --------------------
     // The exact pair upstream's `onSteer` handler calls.
     let drained = control::consume_steer_requests(&run_dir).await;
-    assert_eq!(drained.len(), 1, "the runner must see exactly the one queued request");
+    assert_eq!(
+        drained.len(),
+        1,
+        "the runner must see exactly the one queued request"
+    );
     assert_eq!(
         drained[0].message, "focus on the failing test only",
         "the message is trimmed once, at the parent"
@@ -168,7 +177,15 @@ async fn a_queued_steer_message_is_delivered_into_the_childs_live_turn() {
     }
 
     let ctx = ctx(dir.path());
-    child.on_event(&HostEvent::SessionStart { reason: "start".to_string(), previous_session_file: None }, &ctx).await;
+    child
+        .on_event(
+            &HostEvent::SessionStart {
+                reason: "start".to_string(),
+                previous_session_file: None,
+            },
+            &ctx,
+        )
+        .await;
 
     // Nothing may be delivered before the session has a turn to steer (pi's `canSteer` gate).
     assert!(
@@ -177,7 +194,14 @@ async fn a_queued_steer_message_is_delivered_into_the_childs_live_turn() {
     );
 
     // ...and the first turn-lifecycle event flushes it.
-    child.on_event(&HostEvent::MessageStart { message: serde_json::json!({"role": "assistant"}) }, &ctx).await;
+    child
+        .on_event(
+            &HostEvent::MessageStart {
+                message: serde_json::json!({"role": "assistant"}),
+            },
+            &ctx,
+        )
+        .await;
 
     let injected = services.injected.lock().unwrap().clone();
     assert_eq!(
@@ -185,7 +209,12 @@ async fn a_queued_steer_message_is_delivered_into_the_childs_live_turn() {
         1,
         "the queued guidance must reach the child's model exactly once; got {injected:?}"
     );
-    let Injection { content, custom_type, display, trigger_turn } = &injected[0];
+    let Injection {
+        content,
+        custom_type,
+        display,
+        trigger_turn,
+    } = &injected[0];
     assert_eq!(
         content,
         "Mid-run steering from the parent orchestrator:\n\n\
@@ -202,7 +231,10 @@ async fn a_queued_steer_message_is_delivered_into_the_childs_live_turn() {
          message the model must answer. A custom type would make it a non-LLM message the model \
          never sees — the dead letter, one layer further in."
     );
-    assert!(*display, "the operator watching the child's transcript must see the guidance arrive");
+    assert!(
+        *display,
+        "the operator watching the child's transcript must see the guidance arrive"
+    );
     assert!(
         *trigger_turn,
         "an IDLE child must actually act on the guidance rather than parking it until its next \
@@ -210,14 +242,29 @@ async fn a_queued_steer_message_is_delivered_into_the_childs_live_turn() {
     );
 
     // The request is consumed: a second flush must not re-deliver it.
-    child.on_event(&HostEvent::MessageStart { message: serde_json::json!({"role": "assistant"}) }, &ctx).await;
+    child
+        .on_event(
+            &HostEvent::MessageStart {
+                message: serde_json::json!({"role": "assistant"}),
+            },
+            &ctx,
+        )
+        .await;
     assert_eq!(
         services.injected.lock().unwrap().len(),
         1,
         "a delivered request must never be re-delivered"
     );
 
-    child.on_event(&HostEvent::SessionShutdown { reason: "end".to_string(), target_session_file: None }, &ctx).await;
+    child
+        .on_event(
+            &HostEvent::SessionShutdown {
+                reason: "end".to_string(),
+                target_session_file: None,
+            },
+            &ctx,
+        )
+        .await;
 }
 
 /// The lossless half (pi `:214-217`): a failed injection writes the undelivered requests BACK to
@@ -235,7 +282,9 @@ async fn a_failed_injection_returns_the_undelivered_guidance_to_the_inbox() {
             .expect("queued");
     }
     for request in control::consume_steer_requests(&run_dir).await {
-        control::enqueue_step_steer(&run_dir, 0, &request).await.expect("routed");
+        control::enqueue_step_steer(&run_dir, 0, &request)
+            .await
+            .expect("routed");
     }
     let inbox = control::step_steer_inbox_dir(&run_dir, 0);
 
@@ -245,8 +294,23 @@ async fn a_failed_injection_returns_the_undelivered_guidance_to_the_inbox() {
     child.set_host_services(services.clone() as Arc<dyn cyrup_ext::host::HostServices>);
 
     let ctx = ctx(dir.path());
-    child.on_event(&HostEvent::SessionStart { reason: "start".to_string(), previous_session_file: None }, &ctx).await;
-    child.on_event(&HostEvent::MessageStart { message: serde_json::json!({"role": "assistant"}) }, &ctx).await;
+    child
+        .on_event(
+            &HostEvent::SessionStart {
+                reason: "start".to_string(),
+                previous_session_file: None,
+            },
+            &ctx,
+        )
+        .await;
+    child
+        .on_event(
+            &HostEvent::MessageStart {
+                message: serde_json::json!({"role": "assistant"}),
+            },
+            &ctx,
+        )
+        .await;
 
     assert!(
         services.injected.lock().unwrap().is_empty(),
@@ -263,7 +327,14 @@ async fn a_failed_injection_returns_the_undelivered_guidance_to_the_inbox() {
     // than upstream, since a request the host has already rejected once would be delivered late and
     // out of order behind guidance the parent sent afterwards.
     *services.fail.lock().unwrap() = false;
-    child.on_event(&HostEvent::MessageStart { message: serde_json::json!({"role": "assistant"}) }, &ctx).await;
+    child
+        .on_event(
+            &HostEvent::MessageStart {
+                message: serde_json::json!({"role": "assistant"}),
+            },
+            &ctx,
+        )
+        .await;
     let delivered: Vec<String> = services
         .injected
         .lock()
@@ -301,9 +372,15 @@ fn child_runtime_with_return_path(
     run_dir: &std::path::Path,
     index: usize,
 ) -> Arc<dyn NativeExtension> {
-    let inbox = control::step_steer_inbox_dir(run_dir, index).display().to_string();
-    let acks = control::steer_acks_dir(run_dir, index).display().to_string();
-    let capability = control::steer_capability_path(run_dir, index).display().to_string();
+    let inbox = control::step_steer_inbox_dir(run_dir, index)
+        .display()
+        .to_string();
+    let acks = control::steer_acks_dir(run_dir, index)
+        .display()
+        .to_string();
+    let capability = control::steer_capability_path(run_dir, index)
+        .display()
+        .to_string();
     let index = index.to_string();
     crate::prompt_runtime::prompt_runtime_extension_from(&move |key: &str| {
         if key == STEER_INBOX_ENV {
@@ -355,7 +432,9 @@ async fn a_full_follow_up_queue_is_refused_with_pis_exact_text() {
             Some(control::SteerDeliveryMode::FollowUp),
             "a non-default mode must survive the wire — it is what selects the queue at all"
         );
-        control::enqueue_step_steer(&run_dir, 0, &request).await.expect("routed");
+        control::enqueue_step_steer(&run_dir, 0, &request)
+            .await
+            .expect("routed");
     }
 
     let child = child_runtime_with_return_path(&run_dir, 0);
@@ -363,10 +442,21 @@ async fn a_full_follow_up_queue_is_refused_with_pis_exact_text() {
     child.set_host_services(services.clone() as Arc<dyn cyrup_ext::host::HostServices>);
     let ctx = ctx(dir.path());
     child
-        .on_event(&HostEvent::SessionStart { reason: "start".to_string(), previous_session_file: None }, &ctx)
+        .on_event(
+            &HostEvent::SessionStart {
+                reason: "start".to_string(),
+                previous_session_file: None,
+            },
+            &ctx,
+        )
         .await;
     child
-        .on_event(&HostEvent::MessageStart { message: serde_json::json!({"role": "assistant"}) }, &ctx)
+        .on_event(
+            &HostEvent::MessageStart {
+                message: serde_json::json!({"role": "assistant"}),
+            },
+            &ctx,
+        )
         .await;
 
     assert!(
@@ -395,7 +485,11 @@ async fn a_full_follow_up_queue_is_refused_with_pis_exact_text() {
         control::MAX_STEER_QUEUE_SIZE,
         "exactly the cap may be parked (pi `MAX_STEER_QUEUE_SIZE`, `control-channel.ts:99`)"
     );
-    assert_eq!(failed.len(), 1, "exactly the overflowing one is refused; got {failed:?}");
+    assert_eq!(
+        failed.len(),
+        1,
+        "exactly the overflowing one is refused; got {failed:?}"
+    );
     assert_eq!(
         failed[0].message, "Follow-up queue is full (20 messages).",
         "upstream's refusal sentence, byte for byte (`subagent-prompt-runtime.ts:378` @v0.43.0)"
@@ -430,7 +524,9 @@ async fn a_follow_up_steer_is_held_until_the_next_turn_boundary() {
     .await
     .expect("queued");
     for request in control::consume_steer_requests(&run_dir).await {
-        control::enqueue_step_steer(&run_dir, 0, &request).await.expect("routed");
+        control::enqueue_step_steer(&run_dir, 0, &request)
+            .await
+            .expect("routed");
     }
 
     let child = child_runtime_with_return_path(&run_dir, 0);
@@ -438,18 +534,36 @@ async fn a_follow_up_steer_is_held_until_the_next_turn_boundary() {
     child.set_host_services(services.clone() as Arc<dyn cyrup_ext::host::HostServices>);
     let ctx = ctx(dir.path());
     child
-        .on_event(&HostEvent::SessionStart { reason: "start".to_string(), previous_session_file: None }, &ctx)
+        .on_event(
+            &HostEvent::SessionStart {
+                reason: "start".to_string(),
+                previous_session_file: None,
+            },
+            &ctx,
+        )
         .await;
 
     // A turn is now IN FLIGHT. The request is consumed and parked, not injected — and it is parked
     // NOT-ready, so this very turn cannot deliver it.
-    child.on_event(&HostEvent::TurnStart { turn_index: 0, timestamp: 0 }, &ctx).await;
+    child
+        .on_event(
+            &HostEvent::TurnStart {
+                turn_index: 0,
+                timestamp: 0,
+            },
+            &ctx,
+        )
+        .await;
     assert!(
         services.injected.lock().unwrap().is_empty(),
         "a `follow_up` steer must not land inside the turn that was already running"
     );
     let acks = control::take_steer_acks(&run_dir, None).await;
-    assert_eq!(acks.len(), 1, "the park is acknowledged immediately; got {acks:?}");
+    assert_eq!(
+        acks.len(),
+        1,
+        "the park is acknowledged immediately; got {acks:?}"
+    );
     assert_eq!(acks[0].state, control::SteerAckState::Queued);
     assert_eq!(
         acks[0].delivery_status,
@@ -458,20 +572,40 @@ async fn a_follow_up_steer_is_held_until_the_next_turn_boundary() {
     );
 
     // The turn ends: the parked follow-up becomes eligible.
-    child.on_event(&HostEvent::TurnEnd {
-        turn_index: 0,
-        message: cyrup_agent::AgentMessage::User { content: Vec::new(), timestamp: None },
-        tool_results: Vec::new(),
-    }, &ctx).await;
+    child
+        .on_event(
+            &HostEvent::TurnEnd {
+                turn_index: 0,
+                message: cyrup_agent::AgentMessage::User {
+                    content: Vec::new(),
+                    timestamp: None,
+                },
+                tool_results: Vec::new(),
+            },
+            &ctx,
+        )
+        .await;
     assert!(
         services.injected.lock().unwrap().is_empty(),
         "turn_end makes it READY, it does not deliver it — delivery is the next turn's job"
     );
 
     // ...and the NEXT turn boundary delivers it.
-    child.on_event(&HostEvent::TurnStart { turn_index: 0, timestamp: 0 }, &ctx).await;
+    child
+        .on_event(
+            &HostEvent::TurnStart {
+                turn_index: 0,
+                timestamp: 0,
+            },
+            &ctx,
+        )
+        .await;
     let injected = services.injected.lock().unwrap().clone();
-    assert_eq!(injected.len(), 1, "delivered exactly once at the boundary; got {injected:?}");
+    assert_eq!(
+        injected.len(),
+        1,
+        "delivered exactly once at the boundary; got {injected:?}"
+    );
     assert!(
         injected[0].content.contains("prefer the smaller refactor"),
         "{:?}",
@@ -482,7 +616,11 @@ async fn a_follow_up_steer_is_held_until_the_next_turn_boundary() {
         "a follow-up released INTO a turn that is starting must not start a second one"
     );
     let acks = control::take_steer_acks(&run_dir, None).await;
-    assert_eq!(acks.len(), 1, "the delivery is acknowledged in its turn; got {acks:?}");
+    assert_eq!(
+        acks.len(),
+        1,
+        "the delivery is acknowledged in its turn; got {acks:?}"
+    );
     assert_eq!(acks[0].state, control::SteerAckState::Delivered);
     assert_eq!(
         acks[0].message, "Cyrup delivered the queued follow-up at a turn boundary.",
@@ -505,7 +643,9 @@ async fn a_child_publishes_its_steering_capability_and_a_delivered_steer_is_ackn
         .await
         .expect("queued");
     for request in control::consume_steer_requests(&run_dir).await {
-        control::enqueue_step_steer(&run_dir, 2, &request).await.expect("routed");
+        control::enqueue_step_steer(&run_dir, 2, &request)
+            .await
+            .expect("routed");
     }
 
     let child = child_runtime_with_return_path(&run_dir, 2);
@@ -513,16 +653,30 @@ async fn a_child_publishes_its_steering_capability_and_a_delivered_steer_is_ackn
     child.set_host_services(services.clone() as Arc<dyn cyrup_ext::host::HostServices>);
     let ctx = ctx(dir.path());
     child
-        .on_event(&HostEvent::SessionStart { reason: "start".to_string(), previous_session_file: None }, &ctx)
+        .on_event(
+            &HostEvent::SessionStart {
+                reason: "start".to_string(),
+                previous_session_file: None,
+            },
+            &ctx,
+        )
         .await;
     child
-        .on_event(&HostEvent::MessageStart { message: serde_json::json!({"role": "assistant"}) }, &ctx)
+        .on_event(
+            &HostEvent::MessageStart {
+                message: serde_json::json!({"role": "assistant"}),
+            },
+            &ctx,
+        )
         .await;
 
     let capability = control::read_steer_capability(&run_dir, 2)
         .await
         .expect("the child must publish a capability record once it is live");
-    assert_eq!(capability.index, 2, "the record names the child it describes");
+    assert_eq!(
+        capability.index, 2,
+        "the record names the child it describes"
+    );
     assert_eq!(
         capability.pid,
         std::process::id(),
@@ -535,7 +689,11 @@ async fn a_child_publishes_its_steering_capability_and_a_delivered_steer_is_ackn
     assert!(capability.ready_at > 0);
 
     let acks = control::take_steer_acks(&run_dir, None).await;
-    assert_eq!(acks.len(), 1, "one request, one acknowledgment; got {acks:?}");
+    assert_eq!(
+        acks.len(),
+        1,
+        "one request, one acknowledgment; got {acks:?}"
+    );
     assert_eq!(acks[0].state, control::SteerAckState::Delivered);
     assert_eq!(acks[0].index, 2);
     assert_eq!(
@@ -557,17 +715,30 @@ async fn a_child_that_cannot_inject_refuses_the_steer_instead_of_dropping_it() {
         .await
         .expect("queued");
     for request in control::consume_steer_requests(&run_dir).await {
-        control::enqueue_step_steer(&run_dir, 0, &request).await.expect("routed");
+        control::enqueue_step_steer(&run_dir, 0, &request)
+            .await
+            .expect("routed");
     }
 
     // NO `set_host_services` call — this is the headless / never-bound backend.
     let child = child_runtime_with_return_path(&run_dir, 0);
     let ctx = ctx(dir.path());
     child
-        .on_event(&HostEvent::SessionStart { reason: "start".to_string(), previous_session_file: None }, &ctx)
+        .on_event(
+            &HostEvent::SessionStart {
+                reason: "start".to_string(),
+                previous_session_file: None,
+            },
+            &ctx,
+        )
         .await;
     child
-        .on_event(&HostEvent::MessageStart { message: serde_json::json!({"role": "assistant"}) }, &ctx)
+        .on_event(
+            &HostEvent::MessageStart {
+                message: serde_json::json!({"role": "assistant"}),
+            },
+            &ctx,
+        )
         .await;
 
     let acks = control::take_steer_acks(&run_dir, None).await;
@@ -675,8 +846,7 @@ async fn the_default_delivery_mode_is_omitted_from_the_wire_record() {
 #[test]
 fn a_child_with_no_steer_inbox_gets_no_steering_surface() {
     assert!(
-        crate::prompt_runtime::prompt_runtime_extension_from(&|_key: &str| None)
-            .is_none(),
+        crate::prompt_runtime::prompt_runtime_extension_from(&|_key: &str| None).is_none(),
         "a process with none of the child env vars must get no runtime at all"
     );
     assert!(

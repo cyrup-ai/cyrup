@@ -2,14 +2,14 @@
 //! ([`Agent::prompt`], [`Agent::continue_run`], [`Agent::reset`]), the handle they hand back, and
 //! the settlement guard + post-unwind failure emission that close a run out.
 
+use super::Agent;
 use super::message::errored_assistant;
 use super::prompt::PromptInput;
 use super::run::{PromptSource, ResumePoint, RunBaseline, RunCtx, RunEntry, RunShared};
 use super::util::{lock, panic_message};
-use super::Agent;
 use crate::error::{AgentError, BusyEntry, ContinueSurface};
 use crate::event::{AgentEvent, AgentMessage};
-use crate::state::{reduce, GenerationConfig, StateInner};
+use crate::state::{GenerationConfig, StateInner, reduce};
 use crate::subscriber::EventSubscriber;
 use cyrup_core::{Content, RunCancel, SharedStr, StopReason};
 use futures::future::FutureExt;
@@ -45,8 +45,9 @@ pub(super) async fn emit_standalone(
     for s in subs.iter() {
         // This IS the post-unwind failure path (pi's `handleRunFailure`), so a subscriber that
         // fails here has nowhere further to unwind; the panic is contained deliberately.
-        let _ =
-            std::panic::AssertUnwindSafe(s.on_event(&ev, cancel.child())).catch_unwind().await;
+        let _ = std::panic::AssertUnwindSafe(s.on_event(&ev, cancel.child()))
+            .catch_unwind()
+            .await;
     }
 }
 
@@ -145,7 +146,10 @@ impl Agent {
         let input = input.into();
         let (baseline, guard, cancel) = self.claim_and_snapshot()?;
         self.spawn_run(
-            RunEntry::Prompt { messages: input.messages, source: PromptSource::Fresh },
+            RunEntry::Prompt {
+                messages: input.messages,
+                source: PromptSource::Fresh,
+            },
             baseline,
             guard,
             cancel,
@@ -205,20 +209,26 @@ impl Agent {
                     messages: steering.clone(),
                     source: PromptSource::SteeringDrain,
                 };
-                return self.spawn_run(entry, baseline, guard, cancel).inspect_err(|_| {
-                    lock(&self.steering).push_front(steering);
-                });
+                return self
+                    .spawn_run(entry, baseline, guard, cancel)
+                    .inspect_err(|_| {
+                        lock(&self.steering).push_front(steering);
+                    });
             }
             // Pi `:391-401`: then follow-up; with neither queued, the continuation is refused.
             let follow = lock(&self.follow_up).drain();
             if follow.is_empty() {
                 return Err(AgentError::ContinueFromAssistant);
             }
-            let entry =
-                RunEntry::Prompt { messages: follow.clone(), source: PromptSource::FollowUpDrain };
-            return self.spawn_run(entry, baseline, guard, cancel).inspect_err(|_| {
-                lock(&self.follow_up).push_front(follow);
-            });
+            let entry = RunEntry::Prompt {
+                messages: follow.clone(),
+                source: PromptSource::FollowUpDrain,
+            };
+            return self
+                .spawn_run(entry, baseline, guard, cancel)
+                .inspect_err(|_| {
+                    lock(&self.follow_up).push_front(follow);
+                });
         }
         let proof = ResumePoint::check(&baseline.messages, ContinueSurface::Agent)?;
         self.spawn_run(RunEntry::Continue(proof), baseline, guard, cancel)
@@ -306,7 +316,10 @@ impl Agent {
                 system_prompt: st.system_prompt.clone(),
                 model,
                 thinking_level: st.thinking_level,
-                gen_config: GenerationConfig { transport: st.transport, ..self.gen_config.clone() },
+                gen_config: GenerationConfig {
+                    transport: st.transport,
+                    ..self.gen_config.clone()
+                },
                 tools: st.tools.clone(),
                 messages: st.messages.clone(),
             }
@@ -342,15 +355,21 @@ impl Agent {
         tokio::spawn(async move {
             // `guard` settles the run on EVERY exit — normal completion, a `RunFailure` the loop
             // converted into a terminal assistant message, or a panic caught below.
-            match std::panic::AssertUnwindSafe(rc.run(entry)).catch_unwind().await {
+            match std::panic::AssertUnwindSafe(rc.run(entry))
+                .catch_unwind()
+                .await
+            {
                 Ok(new) => guard.complete(new),
                 Err(payload) => {
                     // Pi reads `this._state.model` (agent.ts:500-502); with `Option` the run's own
                     // baseline is the fallback for a model cleared mid-run — never an empty address.
                     let model = { lock(&fail_state).model.clone() }.unwrap_or(fail_model);
                     let aborted = fail_cancel.is_cancelled();
-                    let stop_reason =
-                        if aborted { StopReason::Aborted } else { StopReason::Error };
+                    let stop_reason = if aborted {
+                        StopReason::Aborted
+                    } else {
+                        StopReason::Error
+                    };
                     // Pi `handleRunFailure` synthesizes an errored assistant message and emits the
                     // full terminal sequence so no subscriber is left mid-turn.
                     let error_message = panic_message(payload.as_ref());
@@ -366,28 +385,37 @@ impl Agent {
                         &fail_subs,
                         &fail_state,
                         &fail_cancel,
-                        AgentEvent::MessageStart { message: fm.clone() },
+                        AgentEvent::MessageStart {
+                            message: fm.clone(),
+                        },
                     )
                     .await;
                     emit_standalone(
                         &fail_subs,
                         &fail_state,
                         &fail_cancel,
-                        AgentEvent::MessageEnd { message: fm.clone() },
+                        AgentEvent::MessageEnd {
+                            message: fm.clone(),
+                        },
                     )
                     .await;
                     emit_standalone(
                         &fail_subs,
                         &fail_state,
                         &fail_cancel,
-                        AgentEvent::TurnEnd { message: fm.clone(), tool_results: Vec::new() },
+                        AgentEvent::TurnEnd {
+                            message: fm.clone(),
+                            tool_results: Vec::new(),
+                        },
                     )
                     .await;
                     emit_standalone(
                         &fail_subs,
                         &fail_state,
                         &fail_cancel,
-                        AgentEvent::AgentEnd { messages: vec![Arc::new(fm.clone())] },
+                        AgentEvent::AgentEnd {
+                            messages: vec![Arc::new(fm.clone())],
+                        },
                     )
                     .await;
                     guard.complete(vec![fm]);

@@ -45,8 +45,13 @@ impl BrokerState {
     /// keeps being mutated by presence frames; the Rust `SessionInfo` is moved/cloned in, so the
     /// same isolation is structural here.
     pub(super) fn remember_disconnected_session(&mut self, info: SessionInfo, now: u64) {
-        self.disconnected_sessions
-            .insert(info.id.clone(), DisconnectedSession { info, disconnected_at: now });
+        self.disconnected_sessions.insert(
+            info.id.clone(),
+            DisconnectedSession {
+                info,
+                disconnected_at: now,
+            },
+        );
         self.prune_disconnected_sessions(now);
     }
 
@@ -65,7 +70,10 @@ impl BrokerState {
         let mut expired: Vec<(String, bool)> = Vec::new();
         self.mailbox_messages.retain(|entry| {
             if now.saturating_sub(entry.queued_at) > MAILBOX_MESSAGE_RETENTION_MS {
-                expired.push((entry.message.id.clone(), entry.message.expects_reply == Some(true)));
+                expired.push((
+                    entry.message.id.clone(),
+                    entry.message.expects_reply == Some(true),
+                ));
                 return false;
             }
             true
@@ -126,9 +134,15 @@ impl BrokerState {
     /// well as `undefined`, and `info.runtimeFallbackAlias` is falsy when the flag is `false`.
     /// [`js_truthy_alias`] and the `is_empty` filter reproduce that, so an empty name can never
     /// become a mailbox identity every unnamed session shares.
-    pub(super) fn find_live_sessions_sharing_mailbox_identity(&self, info: &SessionInfo) -> Vec<String> {
-        let Some(lower_name) =
-            info.name.as_deref().map(str::to_lowercase).filter(|n| !n.is_empty())
+    pub(super) fn find_live_sessions_sharing_mailbox_identity(
+        &self,
+        info: &SessionInfo,
+    ) -> Vec<String> {
+        let Some(lower_name) = info
+            .name
+            .as_deref()
+            .map(str::to_lowercase)
+            .filter(|n| !n.is_empty())
         else {
             return Vec::new();
         };
@@ -167,7 +181,11 @@ impl BrokerState {
 
     /// `findDisconnectedSessions` (`v0.10.1 broker/broker.ts:1010-1024`) — the same exact-id →
     /// exact-name → id-prefix ladder `findSessions` uses, over the disconnected map.
-    pub(super) fn find_disconnected_session_ids(&mut self, name_or_id: &str, now: u64) -> Vec<String> {
+    pub(super) fn find_disconnected_session_ids(
+        &mut self,
+        name_or_id: &str,
+        now: u64,
+    ) -> Vec<String> {
         self.prune_disconnected_sessions(now);
         let entries: Vec<(String, Option<String>)> = self
             .disconnected_sessions
@@ -191,14 +209,22 @@ impl BrokerState {
         };
         let info = session.info.clone();
         let tx = session.tx.clone();
-        let session_name = info.name.as_deref().map(str::to_lowercase).filter(|n| !n.is_empty());
-        let unique_mailbox_identity =
-            self.find_live_sessions_sharing_mailbox_identity(&info).len() == 1;
+        let session_name = info
+            .name
+            .as_deref()
+            .map(str::to_lowercase)
+            .filter(|n| !n.is_empty());
+        let unique_mailbox_identity = self
+            .find_live_sessions_sharing_mailbox_identity(&info)
+            .len()
+            == 1;
 
         let mut index = 0;
         while index < self.mailbox_messages.len() {
             let (matches_id, matches_unique_name) = {
-                let Some(entry) = self.mailbox_messages.get(index) else { break };
+                let Some(entry) = self.mailbox_messages.get(index) else {
+                    break;
+                };
                 let matches_id = entry.target.id == info.id;
                 let matches_sender_identity = session_name.as_deref().is_some_and(|name| {
                     entry.from.name.as_deref().map(str::to_lowercase).as_deref() == Some(name)
@@ -207,7 +233,12 @@ impl BrokerState {
                 let matches_unique_name = unique_mailbox_identity
                     && session_name.as_deref().is_some_and(|name| {
                         !matches_sender_identity
-                            && entry.target.name.as_deref().map(str::to_lowercase).as_deref()
+                            && entry
+                                .target
+                                .name
+                                .as_deref()
+                                .map(str::to_lowercase)
+                                .as_deref()
                                 == Some(name)
                             && crate::cwd::same_cwd(&entry.target.cwd, &info.cwd)
                     });
@@ -230,28 +261,36 @@ impl BrokerState {
             }
             let mut delivered = entry.message.clone();
             delivered.broker_delivered_at = Some(now_ms().into());
-            send_msg(&tx, &BrokerMessage::Message { from: entry.from.clone(), message: delivered });
-            self.message_receipt_routes.insert(entry.message.id.clone(), MessageReceiptRoute {
-                from: entry.from.id.clone(),
-                to: info.id.clone(),
-                created_at: entry
-                    .message
-                    .broker_received_at
-                    .as_ref()
-                    .and_then(serde_json::Number::as_u64)
-                    .unwrap_or(entry.queued_at),
-            });
+            send_msg(
+                &tx,
+                &BrokerMessage::Message {
+                    from: entry.from.clone(),
+                    message: delivered,
+                },
+            );
+            self.message_receipt_routes.insert(
+                entry.message.id.clone(),
+                MessageReceiptRoute {
+                    from: entry.from.id.clone(),
+                    to: info.id.clone(),
+                    created_at: entry
+                        .message
+                        .broker_received_at
+                        .as_ref()
+                        .and_then(serde_json::Number::as_u64)
+                        .unwrap_or(entry.queued_at),
+                },
+            );
         }
     }
-
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
-    use serde_json::json;
-    use super::*;
     use super::super::test_support::{make_state, payloads, register_named, send_frame};
+    use super::*;
+    use serde_json::json;
 
     /// ICOM-010 — the broker mailbox (`v0.10.1 broker/broker.ts:890-953`). Before this landed, a
     /// message sent during a peer's reconnect gap was answered `Session not found` and DROPPED;
@@ -284,7 +323,10 @@ mod tests {
         );
         let acks = payloads(&mut a_rx);
         assert_eq!(acks.len(), 1, "the sender is acked exactly once");
-        assert_eq!(acks[0]["type"], "delivered", "parked mail is ACKED, not refused: {acks:?}");
+        assert_eq!(
+            acks[0]["type"], "delivered",
+            "parked mail is ACKED, not refused: {acks:?}"
+        );
         assert_eq!(state.mailbox_messages.len(), 1);
 
         // b comes back on a new connection with the same id.
@@ -300,10 +342,19 @@ mod tests {
         assert_eq!(message["message"]["content"]["text"], "while you were out");
         assert_eq!(message["from"]["id"], "a");
         // `registered` and `session_joined` precede it (`:383-392`).
-        assert_eq!(delivered.first().map(|p| p["type"].clone()), Some(json!("registered")));
-        assert!(state.mailbox_messages.is_empty(), "the entry is consumed, not copied");
+        assert_eq!(
+            delivered.first().map(|p| p["type"].clone()),
+            Some(json!("registered"))
+        );
+        assert!(
+            state.mailbox_messages.is_empty(),
+            "the entry is consumed, not copied"
+        );
         // The flush records where the message went, so a receipt can be routed home (`:945-952`).
-        assert_eq!(state.message_receipt_routes.get("m1").map(|r| r.to.clone()), Some("b".into()));
+        assert_eq!(
+            state.message_receipt_routes.get("m1").map(|r| r.to.clone()),
+            Some("b".into())
+        );
     }
     /// `flushMailboxForSession`'s `matchesUniqueName` arm (`:919-931`) and the identity guard it
     /// rests on (`:1039-1048`): mail parked for a disconnected `bob` in `/w` is inherited by a
@@ -317,7 +368,9 @@ mod tests {
         let mut a_sid = None;
         let mut b_sid = None;
         register_named(&mut state, 1, &mut a_sid, &a_tx, "a", "alice", "/w", 1_000);
-        register_named(&mut state, 2, &mut b_sid, &b_tx, "b-old", "bob", "/w", 1_000);
+        register_named(
+            &mut state, 2, &mut b_sid, &b_tx, "b-old", "bob", "/w", 1_000,
+        );
         state.on_connection_closed(2, &b_sid, 1_500);
         let _ = payloads(&mut a_rx);
         send_frame(
@@ -334,9 +387,20 @@ mod tests {
         // NEGATIVE FIRST: same name, different directory — no inheritance.
         let (other_tx, mut other_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut other_sid = None;
-        register_named(&mut state, 3, &mut other_sid, &other_tx, "b-elsewhere", "bob", "/elsewhere", 3_000);
+        register_named(
+            &mut state,
+            3,
+            &mut other_sid,
+            &other_tx,
+            "b-elsewhere",
+            "bob",
+            "/elsewhere",
+            3_000,
+        );
         assert!(
-            !payloads(&mut other_rx).iter().any(|p| p["type"] == "message"),
+            !payloads(&mut other_rx)
+                .iter()
+                .any(|p| p["type"] == "message"),
             "a same-named peer in another directory must not inherit the mailbox"
         );
         assert_eq!(state.mailbox_messages.len(), 1, "the entry stays parked");
@@ -344,7 +408,16 @@ mod tests {
         // Now the genuine relaunch: same name, same cwd, new id.
         let (b2_tx, mut b2_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut b2_sid = None;
-        register_named(&mut state, 4, &mut b2_sid, &b2_tx, "b-new", "bob", "/w", 4_000);
+        register_named(
+            &mut state,
+            4,
+            &mut b2_sid,
+            &b2_tx,
+            "b-new",
+            "bob",
+            "/w",
+            4_000,
+        );
         assert!(
             payloads(&mut b2_rx).iter().any(|p| p["type"] == "message"),
             "a relaunch with the same name in the same directory inherits its mail"
@@ -363,11 +436,22 @@ mod tests {
         let mut a_sid = None;
         let mut b_sid = None;
         register_named(&mut state, 1, &mut a_sid, &a_tx, "a", "alice", "/w", 1_000);
-        register_named(&mut state, 2, &mut b_sid, &b_tx, "b-old", "bob", "/w", 1_000);
+        register_named(
+            &mut state, 2, &mut b_sid, &b_tx, "b-old", "bob", "/w", 1_000,
+        );
         state.on_connection_closed(2, &b_sid, 1_500);
         let (b2_tx, mut b2_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut b2_sid = None;
-        register_named(&mut state, 3, &mut b2_sid, &b2_tx, "b-new", "bob", "/w", 2_000);
+        register_named(
+            &mut state,
+            3,
+            &mut b2_sid,
+            &b2_tx,
+            "b-new",
+            "bob",
+            "/w",
+            2_000,
+        );
         let _ = payloads(&mut a_rx);
         let _ = payloads(&mut b2_rx);
 
@@ -380,13 +464,20 @@ mod tests {
             json!({ "id": "m1", "timestamp": 1, "content": { "text": "hi" } }),
             3_000,
         );
-        assert!(state.mailbox_messages.is_empty(), "a live identity holder takes it immediately");
+        assert!(
+            state.mailbox_messages.is_empty(),
+            "a live identity holder takes it immediately"
+        );
         let got = payloads(&mut b2_rx);
         assert!(
-            got.iter().any(|p| p["type"] == "message" && p["message"]["id"] == "m1"),
+            got.iter()
+                .any(|p| p["type"] == "message" && p["message"]["id"] == "m1"),
             "the relaunched session receives it: {got:?}"
         );
-        assert_eq!(state.message_receipt_routes.get("m1").map(|r| r.to.clone()), Some("b-new".into()));
+        assert_eq!(
+            state.message_receipt_routes.get("m1").map(|r| r.to.clone()),
+            Some("b-new".into())
+        );
     }
     /// `MAX_MAILBOX_MESSAGES` head-eviction (`:892-898`): the cap drops the OLDEST parked entry, so
     /// the newest 256 survive.
@@ -412,7 +503,10 @@ mod tests {
             );
         }
         assert_eq!(state.mailbox_messages.len(), MAX_MAILBOX_MESSAGES);
-        assert_eq!(state.mailbox_messages.first().map(|e| e.message.id.clone()), Some("m3".into()));
+        assert_eq!(
+            state.mailbox_messages.first().map(|e| e.message.id.clone()),
+            Some("m3".into())
+        );
         assert_eq!(
             state.mailbox_messages.last().map(|e| e.message.id.clone()),
             Some(format!("m{}", MAX_MAILBOX_MESSAGES + 2))
@@ -456,11 +550,24 @@ mod tests {
                 json!({ "id": "m1", "timestamp": 1, "content": { "text": "hi" } }),
                 2_000,
             );
-            assert_eq!(state.mailbox_messages.len(), 1, "m1 is parked for the disconnected b");
+            assert_eq!(
+                state.mailbox_messages.len(),
+                1,
+                "m1 is parked for the disconnected b"
+            );
 
             let (b2_tx, mut b2_rx) = tokio::sync::mpsc::unbounded_channel();
             let mut b2_sid = None;
-            register_named(&mut state, 3, &mut b2_sid, &b2_tx, "b", "bob", "/w", rejoin_at);
+            register_named(
+                &mut state,
+                3,
+                &mut b2_sid,
+                &b2_tx,
+                "b",
+                "bob",
+                "/w",
+                rejoin_at,
+            );
             let flushed = payloads(&mut b2_rx)
                 .into_iter()
                 .filter(|p| p["type"] == "message")
@@ -472,13 +579,20 @@ mod tests {
         // `now - entry.queuedAt > MAILBOX_MESSAGE_RETENTION_MS` (`:880`) is STRICT: at exactly the
         // retention the entry is still live, and the rejoin flushes it.
         let (flushed, left) = park_then_rejoin(2_000 + MAILBOX_MESSAGE_RETENTION_MS);
-        assert_eq!(flushed, vec!["m1".to_string()], "at exactly the retention it still flushes");
+        assert_eq!(
+            flushed,
+            vec!["m1".to_string()],
+            "at exactly the retention it still flushes"
+        );
         assert_eq!(left, 0, "and the flush consumed it");
 
         // One millisecond past it, `register`'s prune (`:342`) drops it before the flush loop ever
         // sees it, so the rejoining session receives nothing at all.
         let (flushed, left) = park_then_rejoin(2_000 + MAILBOX_MESSAGE_RETENTION_MS + 1);
-        assert!(flushed.is_empty(), "one ms later it is pruned, not redelivered: {flushed:?}");
+        assert!(
+            flushed.is_empty(),
+            "one ms later it is pruned, not redelivered: {flushed:?}"
+        );
         assert_eq!(left, 0, "and it is gone from the mailbox");
 
         // The disconnected identity's own retention, on the `send` path.
@@ -518,7 +632,10 @@ mod tests {
             .unwrap_or_default();
         // `findDisconnectedSessions` prunes first (`:1005`), so the retained identity is gone and
         // the ladder falls through to the empty-targets arm rather than queueing forever.
-        assert_eq!(reason, "Session not found", "the retained identity expired too");
+        assert_eq!(
+            reason, "Session not found",
+            "the retained identity expired too"
+        );
         assert_eq!(
             state.mailbox_messages.len(),
             1,

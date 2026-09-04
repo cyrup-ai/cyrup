@@ -75,7 +75,8 @@ fn kimi_coding_catalog_rows_send_adaptive_thinking_and_no_interleaved_beta() {
     for m in &models {
         let body = build_body(m, &user_ctx("think"), &opts);
         assert_eq!(
-            body["thinking"]["type"], "adaptive",
+            body["thinking"]["type"],
+            "adaptive",
             "kimi-coding/{} sends a non-adaptive thinking block to an upstream pi flags as \
              requiring the adaptive format",
             m.id.as_str()
@@ -188,7 +189,10 @@ fn copilot_uses_bearer_and_dynamic_headers_not_x_api_key() {
 
     // PROV-028: the dynamic headers, on top of the static `model.headers` identity.
     assert_eq!(
-        headers.get("X-Initiator").and_then(|v| v.clone()).as_deref(),
+        headers
+            .get("X-Initiator")
+            .and_then(|v| v.clone())
+            .as_deref(),
         Some("user"),
         "the last turn is a user turn (github-copilot-headers.ts:5-8)"
     );
@@ -229,7 +233,10 @@ fn copilot_uses_bearer_and_dynamic_headers_not_x_api_key() {
     });
     let headers = build_headers(&m, &agent_ctx, &auth, &StreamOptions::default(), false);
     assert_eq!(
-        headers.get("X-Initiator").and_then(|v| v.clone()).as_deref(),
+        headers
+            .get("X-Initiator")
+            .and_then(|v| v.clone())
+            .as_deref(),
         Some("agent")
     );
     assert_eq!(

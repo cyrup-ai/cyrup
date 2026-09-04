@@ -7,10 +7,10 @@
 use crate::contract::Reduced;
 use crate::dispatch::Dispatcher;
 use crate::event::HostEvent;
+use cyrup_agent::HookError;
 use cyrup_agent::{
     AfterOutcome, AfterOverride, AfterToolCall, AgentMessage, BeforeOutcome, BeforeToolCall, Hooks,
 };
-use cyrup_agent::HookError;
 use cyrup_core::{CancelToken, TerminateHint};
 use std::sync::Arc;
 
@@ -53,9 +53,9 @@ impl Hooks for ExtHooks {
             // EXT-049: `terminate` rides the block through to the finalized error result, where
             // the agent's every()-rule (`shouldTerminateToolBatch`,
             // packages/agent/src/agent-loop.ts:583 @v0.84.1) decides whether the BATCH ends.
-            Reduced::Blocked { reason, terminate, .. } => {
-                BeforeOutcome::Block { reason, terminate }
-            }
+            Reduced::Blocked {
+                reason, terminate, ..
+            } => BeforeOutcome::Block { reason, terminate },
             Reduced::Pass(ev) => {
                 if let HostEvent::ToolCall { input, .. } = *ev {
                     *ctx.args = input; // mutated args execute as-is, WITHOUT re-validation (R-02-022)
@@ -69,11 +69,7 @@ impl Hooks for ExtHooks {
 
     /// Patch the tool result (R-08-011). Replace-not-merge: only fields a handler changed are
     /// returned as `Some(_)` (func-02 R-02-025).
-    async fn after_tool_call(
-        &self,
-        ctx: AfterToolCall<'_>,
-        cancel: CancelToken,
-    ) -> AfterOutcome {
+    async fn after_tool_call(&self, ctx: AfterToolCall<'_>, cancel: CancelToken) -> AfterOutcome {
         let orig_content = ctx.content.to_vec();
         let orig_is_error = ctx.is_error;
         let orig_details = ctx.details.cloned();
@@ -96,7 +92,14 @@ impl Hooks for ExtHooks {
         };
         match self.dispatcher.dispatch_block_mutate(ev, &cancel).await {
             Reduced::Pass(ev) => {
-                let HostEvent::ToolResult { content, details, is_error, usage, terminate, .. } = *ev
+                let HostEvent::ToolResult {
+                    content,
+                    details,
+                    is_error,
+                    usage,
+                    terminate,
+                    ..
+                } = *ev
                 else {
                     return AfterOutcome::Keep;
                 };
@@ -128,7 +131,11 @@ impl Hooks for ExtHooks {
                     over.terminate = Some(terminate);
                     changed = true;
                 }
-                if changed { AfterOutcome::Override(over) } else { AfterOutcome::Keep }
+                if changed {
+                    AfterOutcome::Override(over)
+                } else {
+                    AfterOutcome::Keep
+                }
             }
             // A block on a result is not meaningful; keep the original.
             _ => AfterOutcome::Keep,
@@ -145,7 +152,9 @@ impl Hooks for ExtHooks {
         // gate inside `dispatch_block_mutate`, so every turn paid a whole-transcript deep copy
         // here even with no `context`-subscribing extension wired. Do not "fix" a type mismatch
         // at this line by unwrapping the handles — that restores exactly that copy.
-        let ev = HostEvent::Context { messages: msgs.clone() };
+        let ev = HostEvent::Context {
+            messages: msgs.clone(),
+        };
         match self.dispatcher.dispatch_block_mutate(ev, &cancel).await {
             Reduced::Pass(ev) => match *ev {
                 HostEvent::Context { messages } => Ok(messages),

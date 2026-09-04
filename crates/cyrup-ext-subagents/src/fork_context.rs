@@ -309,10 +309,15 @@ fn find_model_info(
         return Some(exact);
     }
 
-    let matches: Vec<&'static cyrup_provider::Model> =
-        models.iter().filter(|m| m.id.as_str() == base_model).collect();
+    let matches: Vec<&'static cyrup_provider::Model> = models
+        .iter()
+        .filter(|m| m.id.as_str() == base_model)
+        .collect();
     if let Some(preferred) = preferred_provider
-        && let Some(hit) = matches.iter().copied().find(|m| m.provider.as_str() == preferred)
+        && let Some(hit) = matches
+            .iter()
+            .copied()
+            .find(|m| m.provider.as_str() == preferred)
     {
         return Some(hit);
     }
@@ -337,7 +342,12 @@ fn find_model_info(
 /// Takes the three message fields rather than `&AssistantMessage` because its only caller runs it
 /// inside a `Vec::retain` over `content`, which holds that field mutably borrowed for the closure.
 fn is_unsafe_thinking_block(provider: &str, api: &str, model: &str, block: &Content) -> bool {
-    let Content::Thinking { thinking_signature, redacted, .. } = block else {
+    let Content::Thinking {
+        thinking_signature,
+        redacted,
+        ..
+    } = block
+    else {
         return false;
     };
     if *redacted {
@@ -346,7 +356,10 @@ fn is_unsafe_thinking_block(provider: &str, api: &str, model: &str, block: &Cont
     let is_anthropic = provider.eq_ignore_ascii_case("anthropic")
         || api.eq_ignore_ascii_case("anthropic-messages")
         || model.to_lowercase().starts_with("anthropic/");
-    is_anthropic && thinking_signature.as_deref().is_some_and(|sig| !sig.is_empty())
+    is_anthropic
+        && thinking_signature
+            .as_deref()
+            .is_some_and(|sig| !sig.is_empty())
 }
 
 /// One line of a branched session file, carried as BOTH its original text and its parsed form.
@@ -380,7 +393,13 @@ fn sanitize_unsafe_thinking_blocks(lines: &mut [BranchLine]) -> bool {
         };
         // Destructured so `content`'s mutable borrow and the three read-only fields the predicate
         // needs are disjoint field borrows rather than two borrows of the whole message.
-        let AssistantMessage { content, provider, api, model, .. } = assistant;
+        let AssistantMessage {
+            content,
+            provider,
+            api,
+            model,
+            ..
+        } = assistant;
         let before = content.len();
         content.retain(|block| {
             !is_unsafe_thinking_block(provider.as_str(), api.as_str(), model, block)
@@ -471,7 +490,10 @@ fn read_session_entries(path: &Path) -> Result<(String, Vec<BranchLine>), Subage
     let entries = lines
         .map(|line| {
             serde_json::from_str::<Entry>(line)
-                .map(|entry| BranchLine { raw: Some(line.to_string()), entry })
+                .map(|entry| BranchLine {
+                    raw: Some(line.to_string()),
+                    entry,
+                })
                 .map_err(|_| SubagentError::ForkFailed)
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -492,7 +514,12 @@ fn write_session_entries(
     for line in lines {
         match &line.raw {
             Some(raw) => buf.push_str(raw),
-            None => buf.push_str(&line.entry.to_line().map_err(|_| SubagentError::ForkFailed)?),
+            None => buf.push_str(
+                &line
+                    .entry
+                    .to_line()
+                    .map_err(|_| SubagentError::ForkFailed)?,
+            ),
         }
         buf.push('\n');
     }
@@ -744,13 +771,25 @@ mod tests {
     #[test]
     fn an_inherited_fork_preference_downgrades_to_fresh_when_no_branch_can_be_cut() {
         assert_eq!(
-            resolved(resolve_effective_context(None, "worker", Some(ContextMode::Fork), None, false)),
+            resolved(resolve_effective_context(
+                None,
+                "worker",
+                Some(ContextMode::Fork),
+                None,
+                false
+            )),
             ContextMode::Fresh,
             "an agent author's `defaultContext: fork` must never turn a working launch into a \
              failed one"
         );
         assert_eq!(
-            resolved(resolve_effective_context(None, "worker", Some(ContextMode::Fork), None, true)),
+            resolved(resolve_effective_context(
+                None,
+                "worker",
+                Some(ContextMode::Fork),
+                None,
+                true
+            )),
             ContextMode::Fork,
             "...and with a persisted parent and a leaf, it forks as asked"
         );
@@ -772,7 +811,13 @@ mod tests {
             "config `fresh` must overrule an agent declaring fork, even with a branch available"
         );
         assert_eq!(
-            resolved(resolve_effective_context(None, "worker", None, Some(ContextMode::Fork), true)),
+            resolved(resolve_effective_context(
+                None,
+                "worker",
+                None,
+                Some(ContextMode::Fork),
+                true
+            )),
             ContextMode::Fork,
             "config `fork` applies to an agent that declares nothing"
         );
@@ -821,18 +866,42 @@ mod tests {
     /// impossible rather than merely untested.
     #[test]
     fn resolve_effective_context_resolves_each_sibling_in_one_batch_independently() {
-        let a = resolved(resolve_effective_context(None, "a", Some(ContextMode::Fresh), None, true));
-        let b = resolved(resolve_effective_context(None, "b", Some(ContextMode::Fork), None, true));
+        let a = resolved(resolve_effective_context(
+            None,
+            "a",
+            Some(ContextMode::Fresh),
+            None,
+            true,
+        ));
+        let b = resolved(resolve_effective_context(
+            None,
+            "b",
+            Some(ContextMode::Fork),
+            None,
+            true,
+        ));
         assert_eq!(a, ContextMode::Fresh);
         assert_eq!(b, ContextMode::Fork);
 
         // Order independence: resolving B first yields the identical pair.
         assert_eq!(
-            resolved(resolve_effective_context(None, "b", Some(ContextMode::Fork), None, true)),
+            resolved(resolve_effective_context(
+                None,
+                "b",
+                Some(ContextMode::Fork),
+                None,
+                true
+            )),
             ContextMode::Fork
         );
         assert_eq!(
-            resolved(resolve_effective_context(None, "a", Some(ContextMode::Fresh), None, true)),
+            resolved(resolve_effective_context(
+                None,
+                "a",
+                Some(ContextMode::Fresh),
+                None,
+                true
+            )),
             ContextMode::Fresh
         );
     }
@@ -846,8 +915,14 @@ mod tests {
         let leaf = EntryId::from("abc12345");
 
         assert!(can_prefer_fork_from_snapshot(Some(&real), Some(&leaf)));
-        assert!(!can_prefer_fork_from_snapshot(Option::None, Some(&leaf)), "no session file");
-        assert!(!can_prefer_fork_from_snapshot(Some(&real), Option::None), "no leaf to branch from");
+        assert!(
+            !can_prefer_fork_from_snapshot(Option::None, Some(&leaf)),
+            "no session file"
+        );
+        assert!(
+            !can_prefer_fork_from_snapshot(Some(&real), Option::None),
+            "no leaf to branch from"
+        );
         assert!(
             !can_prefer_fork_from_snapshot(Some(&dir.path().join("missing.jsonl")), Some(&leaf)),
             "a path that does not exist is not a branchable parent"
@@ -857,7 +932,10 @@ mod tests {
     /// pi `validateConfig` (`extension/config.ts:140-142`) THROWS here rather than ignoring.
     #[test]
     fn the_config_default_accepts_only_fresh_or_fork() {
-        assert_eq!(resolve_default_subagent_context(Option::None), Ok(Option::None));
+        assert_eq!(
+            resolve_default_subagent_context(Option::None),
+            Ok(Option::None)
+        );
         assert_eq!(
             resolve_default_subagent_context(Some(&serde_json::json!("fresh"))),
             Ok(Some(ContextMode::Fresh))
@@ -1079,7 +1157,9 @@ mod tests {
     const AMBIGUOUS_BARE: &str = "deepseek-v4-flash";
 
     fn catalog_entry(qualified: &str) -> &'static cyrup_provider::Model {
-        let (provider, id) = qualified.split_once('/').expect("fixture is provider-qualified");
+        let (provider, id) = qualified
+            .split_once('/')
+            .expect("fixture is provider-qualified");
         let found = crate::extension::models::registry_models()
             .iter()
             .find(|m| m.provider.as_str() == provider && m.id.as_str() == id);
@@ -1146,9 +1226,11 @@ mod tests {
             })
             .flatten()
             .filter_map(|block| match block {
-                Content::Thinking { thinking_signature, redacted, .. } => {
-                    Some((thinking_signature.clone(), *redacted))
-                }
+                Content::Thinking {
+                    thinking_signature,
+                    redacted,
+                    ..
+                } => Some((thinking_signature.clone(), *redacted)),
                 _ => None,
             })
             .collect()
@@ -1172,7 +1254,11 @@ mod tests {
     #[test]
     fn thinking_off_is_required_for_a_model_on_either_anthropic_axis() {
         let anthropic = catalog_entry(ANTHROPIC_QUALIFIED);
-        assert_eq!(anthropic.provider.as_str(), "anthropic", "fixture precondition");
+        assert_eq!(
+            anthropic.provider.as_str(),
+            "anthropic",
+            "fixture precondition"
+        );
         assert!(
             forked_child_requires_thinking_off(Some(ANTHROPIC_QUALIFIED), None),
             "an `anthropic` provider model must force the sanitized branch to thinking-off"
@@ -1183,8 +1269,16 @@ mod tests {
         // provider check alone would leave this one thinking-on and its inherited signed blocks
         // would be sent straight back to an Anthropic endpoint.
         let gateway = catalog_entry(ANTHROPIC_API_OTHER_PROVIDER);
-        assert_ne!(gateway.provider.as_str(), "anthropic", "fixture precondition");
-        assert_eq!(gateway.api.as_str(), "anthropic-messages", "fixture precondition");
+        assert_ne!(
+            gateway.provider.as_str(),
+            "anthropic",
+            "fixture precondition"
+        );
+        assert_eq!(
+            gateway.api.as_str(),
+            "anthropic-messages",
+            "fixture precondition"
+        );
         assert!(forked_child_requires_thinking_off(
             Some(ANTHROPIC_API_OTHER_PROVIDER),
             None
@@ -1195,7 +1289,11 @@ mod tests {
     fn thinking_off_is_not_required_for_a_model_on_neither_anthropic_axis() {
         let entry = catalog_entry(NON_ANTHROPIC_QUALIFIED);
         assert_ne!(entry.provider.as_str(), "anthropic", "fixture precondition");
-        assert_ne!(entry.api.as_str(), "anthropic-messages", "fixture precondition");
+        assert_ne!(
+            entry.api.as_str(),
+            "anthropic-messages",
+            "fixture precondition"
+        );
         assert!(
             !forked_child_requires_thinking_off(Some(NON_ANTHROPIC_QUALIFIED), None),
             "a model on neither Anthropic axis keeps its reasoning; forcing it off would cost \
@@ -1207,8 +1305,14 @@ mod tests {
     /// unresolvable model is not assumed safe.
     #[test]
     fn thinking_off_is_required_when_the_model_cannot_be_resolved() {
-        assert!(forked_child_requires_thinking_off(None, None), "absent model");
-        assert!(forked_child_requires_thinking_off(Some(""), None), "empty model");
+        assert!(
+            forked_child_requires_thinking_off(None, None),
+            "absent model"
+        );
+        assert!(
+            forked_child_requires_thinking_off(Some(""), None),
+            "empty model"
+        );
         assert!(
             forked_child_requires_thinking_off(Some("no-such-provider/no-such-model"), None),
             "a model absent from the catalog is unknown, and unknown is conservative"
@@ -1247,16 +1351,16 @@ mod tests {
     #[test]
     fn the_gate_strips_a_known_thinking_suffix_before_resolving_but_leaves_other_colons() {
         assert!(
-            forked_child_requires_thinking_off(
-                Some(&format!("{ANTHROPIC_QUALIFIED}:high")),
-                None
-            ),
+            forked_child_requires_thinking_off(Some(&format!("{ANTHROPIC_QUALIFIED}:high")), None),
             "`:high` is a recognized level and must be stripped before the catalog lookup"
         );
         // `amazon.nova-pro-v1:0` ends in a colon segment that is NOT a thinking level. If the
         // split were unconditional the id would be truncated, resolve to nothing, and this would
         // come back conservatively `true`.
-        assert!(!forked_child_requires_thinking_off(Some(NON_ANTHROPIC_QUALIFIED), None));
+        assert!(!forked_child_requires_thinking_off(
+            Some(NON_ANTHROPIC_QUALIFIED),
+            None
+        ));
     }
 
     // ---- sanitization over a real fork -----------------------------------------------------
@@ -1315,7 +1419,10 @@ mod tests {
         assert!(
             matches!(
                 lines.last(),
-                Some(BranchLine { entry: Entry::Known(KnownEntry::ThinkingLevelChange { .. }), .. })
+                Some(BranchLine {
+                    entry: Entry::Known(KnownEntry::ThinkingLevelChange { .. }),
+                    ..
+                })
             ),
             "the level change is appended, not spliced mid-history"
         );
@@ -1348,7 +1455,10 @@ mod tests {
         let path = resolved.session_file_path.clone().expect("branch path");
         let (_, lines) = read_session_entries(&path).expect("branch parses");
 
-        assert!(surviving_thinking(&lines).is_empty(), "stripping is unconditional");
+        assert!(
+            surviving_thinking(&lines).is_empty(),
+            "stripping is unconditional"
+        );
         assert_eq!(
             thinking_off_entries(&lines),
             0,
@@ -1457,8 +1567,14 @@ mod tests {
         )
         .await;
 
-        let first = resolver.resolve(ContextMode::Fork, 3, true).await.expect("first");
-        let second = resolver.resolve(ContextMode::Fork, 3, true).await.expect("second");
+        let first = resolver
+            .resolve(ContextMode::Fork, 3, true)
+            .await
+            .expect("first");
+        let second = resolver
+            .resolve(ContextMode::Fork, 3, true)
+            .await
+            .expect("second");
         assert_eq!(first, second, "a cached resolution must replay in full");
         assert_eq!(second.thinking_override.as_deref(), Some("off"));
     }
@@ -1501,12 +1617,21 @@ mod tests {
         .to_line()
         .expect("assistant entry serializes");
 
-        std::fs::write(&path, format!("{header_line}\n{foreign_line}\n{assistant_line}\n"))
-            .expect("seed");
+        std::fs::write(
+            &path,
+            format!("{header_line}\n{foreign_line}\n{assistant_line}\n"),
+        )
+        .expect("seed");
 
         let (header, mut lines) = read_session_entries(&path).expect("read");
         assert!(
-            matches!(lines.first(), Some(BranchLine { entry: Entry::Unknown(_), .. })),
+            matches!(
+                lines.first(),
+                Some(BranchLine {
+                    entry: Entry::Unknown(_),
+                    ..
+                })
+            ),
             "an unmodelled entry must land in `Unknown`, not be dropped"
         );
         assert!(
@@ -1517,7 +1642,11 @@ mod tests {
 
         let rewritten = std::fs::read_to_string(&path).expect("reread");
         let mut written = rewritten.lines();
-        assert_eq!(written.next(), Some(header_line), "header must be echoed verbatim");
+        assert_eq!(
+            written.next(),
+            Some(header_line),
+            "header must be echoed verbatim"
+        );
         assert_eq!(
             written.next(),
             Some(foreign_line),
@@ -1528,9 +1657,11 @@ mod tests {
             !rewritten.contains("thinkingSignature"),
             "the entry that WAS touched must be re-encoded without its unsafe block"
         );
-        assert!(rewritten.contains("kept"), "and with the rest of its content intact");
+        assert!(
+            rewritten.contains("kept"),
+            "and with the rest of its content intact"
+        );
     }
-
 
     /// Repeated resolution for the SAME batch-step index returns the SAME branched session file
     /// (idempotent caching), rather than creating a second, divergent branch on every call.

@@ -81,12 +81,14 @@ fn read_settings_file_strict(path: &Path) -> Result<Map<String, Value>, Subagent
 async fn lock_settings_file(path: &Path) -> Result<cyrup_config::lock::FileLock, SubagentError> {
     // `None`: this crate holds no `CancelToken` at these sites, and every non-`models_store`
     // caller of `FileLock::acquire` passes `None` for the same reason.
-    cyrup_config::lock::FileLock::acquire(path, None).await.map_err(|e| {
-        SubagentError::MalformedSettings(format!(
-            "Failed to lock settings file '{}': {e}",
-            path.display()
-        ))
-    })
+    cyrup_config::lock::FileLock::acquire(path, None)
+        .await
+        .map_err(|e| {
+            SubagentError::MalformedSettings(format!(
+                "Failed to lock settings file '{}': {e}",
+                path.display()
+            ))
+        })
 }
 
 /// pi `writeSettingsFile` (`agents.ts:706-709`): `mkdir -p` the parent, then write
@@ -111,7 +113,11 @@ fn write_settings_file(path: &Path, settings: &Map<String, Value>) -> Result<(),
 
 /// Borrow `settings.subagents.agentOverrides` as an object, if all three levels are objects.
 fn overrides_of(settings: &Map<String, Value>) -> Option<&Map<String, Value>> {
-    settings.get("subagents")?.as_object()?.get("agentOverrides")?.as_object()
+    settings
+        .get("subagents")?
+        .as_object()?
+        .get("agentOverrides")?
+        .as_object()
 }
 
 /// Re-attach a (possibly now-empty) `agentOverrides` map under `subagents`, pruning empties exactly
@@ -159,7 +165,11 @@ pub async fn merge_builtin_agent_override(
     let _lock = lock_settings_file(path).await?;
     let mut settings = read_settings_file_strict(path)?;
     let mut next_overrides = overrides_of(&settings).cloned().unwrap_or_default();
-    let mut entry = next_overrides.get(name).and_then(Value::as_object).cloned().unwrap_or_default();
+    let mut entry = next_overrides
+        .get(name)
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
     for (key, value) in fields {
         entry.insert(key.clone(), value.clone());
     }
@@ -246,7 +256,12 @@ pub async fn remove_builtin_agent_override_fields(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 mod tests {
     use super::*;
 
@@ -318,11 +333,16 @@ mod tests {
         let path = dir.path().join("nested").join("settings.json");
         let mut fields = Map::new();
         fields.insert("disabled".to_string(), Value::Bool(true));
-        merge_builtin_agent_override(&path, "scout", &fields).await.expect("write");
+        merge_builtin_agent_override(&path, "scout", &fields)
+            .await
+            .expect("write");
 
         let raw = std::fs::read_to_string(&path).expect("written");
         assert!(raw.ends_with("}\n"), "trailing newline required: {raw:?}");
-        assert!(raw.contains("\n  \"subagents\": {"), "two-space indent required: {raw}");
+        assert!(
+            raw.contains("\n  \"subagents\": {"),
+            "two-space indent required: {raw}"
+        );
         // The parent directory is created on demand, as `mkdir -p` does.
         assert!(path.parent().is_some_and(std::path::Path::is_dir));
     }
@@ -341,8 +361,13 @@ mod tests {
     async fn merge_creates_every_missing_level_in_an_absent_file() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("nested").join("settings.json");
-        merge_builtin_agent_override(&path, "scout", &field("disabled", Value::Bool(true))).await.unwrap();
-        assert_eq!(read(&path)["subagents"]["agentOverrides"]["scout"]["disabled"], Value::Bool(true));
+        merge_builtin_agent_override(&path, "scout", &field("disabled", Value::Bool(true)))
+            .await
+            .unwrap();
+        assert_eq!(
+            read(&path)["subagents"]["agentOverrides"]["scout"]["disabled"],
+            Value::Bool(true)
+        );
     }
 
     #[tokio::test]
@@ -354,27 +379,46 @@ mod tests {
             r#"{"theme":"dark","mcpServers":{"a":{"command":"x"}},"subagents":{"defaultModel":"anthropic/m","unknownFutureKey":42,"agentOverrides":{"worker":{"model":"anthropic/w"}}}}"#,
         )
         .unwrap();
-        merge_builtin_agent_override(&path, "scout", &field("disabled", Value::Bool(true))).await.unwrap();
+        merge_builtin_agent_override(&path, "scout", &field("disabled", Value::Bool(true)))
+            .await
+            .unwrap();
         let after = read(&path);
         // The whole rest of the document survives — this is the failure mode a typed round-trip has.
         assert_eq!(after["theme"], Value::String("dark".to_string()));
-        assert_eq!(after["mcpServers"]["a"]["command"], Value::String("x".to_string()));
-        assert_eq!(after["subagents"]["defaultModel"], Value::String("anthropic/m".to_string()));
-        assert_eq!(after["subagents"]["unknownFutureKey"], Value::Number(42.into()));
+        assert_eq!(
+            after["mcpServers"]["a"]["command"],
+            Value::String("x".to_string())
+        );
+        assert_eq!(
+            after["subagents"]["defaultModel"],
+            Value::String("anthropic/m".to_string())
+        );
+        assert_eq!(
+            after["subagents"]["unknownFutureKey"],
+            Value::Number(42.into())
+        );
         assert_eq!(
             after["subagents"]["agentOverrides"]["worker"]["model"],
             Value::String("anthropic/w".to_string())
         );
-        assert_eq!(after["subagents"]["agentOverrides"]["scout"]["disabled"], Value::Bool(true));
+        assert_eq!(
+            after["subagents"]["agentOverrides"]["scout"]["disabled"],
+            Value::Bool(true)
+        );
     }
 
     #[tokio::test]
     async fn merge_is_shallow_and_keeps_the_entrys_other_fields() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("settings.json");
-        std::fs::write(&path, r#"{"subagents":{"agentOverrides":{"scout":{"model":"anthropic/x"}}}}"#)
+        std::fs::write(
+            &path,
+            r#"{"subagents":{"agentOverrides":{"scout":{"model":"anthropic/x"}}}}"#,
+        )
+        .unwrap();
+        merge_builtin_agent_override(&path, "scout", &field("disabled", Value::Bool(true)))
+            .await
             .unwrap();
-        merge_builtin_agent_override(&path, "scout", &field("disabled", Value::Bool(true))).await.unwrap();
         let entry = &read(&path)["subagents"]["agentOverrides"]["scout"];
         assert_eq!(entry["model"], Value::String("anthropic/x".to_string()));
         assert_eq!(entry["disabled"], Value::Bool(true));
@@ -389,7 +433,11 @@ mod tests {
             r#"{"subagents":{"agentOverrides":{"scout":{"disabled":true,"model":"anthropic/x"}}}}"#,
         )
         .unwrap();
-        assert!(remove_builtin_agent_override_fields(&path, "scout", &["disabled"]).await.unwrap());
+        assert!(
+            remove_builtin_agent_override_fields(&path, "scout", &["disabled"])
+                .await
+                .unwrap()
+        );
         let entry = &read(&path)["subagents"]["agentOverrides"]["scout"];
         assert_eq!(entry["model"], Value::String("anthropic/x".to_string()));
         assert!(entry.get("disabled").is_none());
@@ -399,12 +447,22 @@ mod tests {
     async fn remove_last_field_prunes_entry_overrides_and_subagents() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("settings.json");
-        std::fs::write(&path, r#"{"theme":"dark","subagents":{"agentOverrides":{"scout":{"disabled":true}}}}"#)
-            .unwrap();
-        assert!(remove_builtin_agent_override_fields(&path, "scout", &["disabled"]).await.unwrap());
+        std::fs::write(
+            &path,
+            r#"{"theme":"dark","subagents":{"agentOverrides":{"scout":{"disabled":true}}}}"#,
+        )
+        .unwrap();
+        assert!(
+            remove_builtin_agent_override_fields(&path, "scout", &["disabled"])
+                .await
+                .unwrap()
+        );
         let after = read(&path);
         assert_eq!(after["theme"], Value::String("dark".to_string()));
-        assert!(after.get("subagents").is_none(), "empty subagents block must be pruned: {after}");
+        assert!(
+            after.get("subagents").is_none(),
+            "empty subagents block must be pruned: {after}"
+        );
     }
 
     #[tokio::test]
@@ -427,12 +485,30 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("settings.json");
         assert!(!remove_builtin_agent_override(&path, "scout").await.unwrap());
-        assert!(!remove_builtin_agent_override_fields(&path, "scout", &["disabled"]).await.unwrap());
-        assert!(!path.exists(), "a no-op removal must not create a settings file");
+        assert!(
+            !remove_builtin_agent_override_fields(&path, "scout", &["disabled"])
+                .await
+                .unwrap()
+        );
+        assert!(
+            !path.exists(),
+            "a no-op removal must not create a settings file"
+        );
 
-        std::fs::write(&path, r#"{"subagents":{"agentOverrides":{"scout":{"model":"m"}}}}"#).unwrap();
-        assert!(!remove_builtin_agent_override_fields(&path, "scout", &["disabled"]).await.unwrap());
-        assert_eq!(read(&path)["subagents"]["agentOverrides"]["scout"]["model"], Value::String("m".to_string()));
+        std::fs::write(
+            &path,
+            r#"{"subagents":{"agentOverrides":{"scout":{"model":"m"}}}}"#,
+        )
+        .unwrap();
+        assert!(
+            !remove_builtin_agent_override_fields(&path, "scout", &["disabled"])
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            read(&path)["subagents"]["agentOverrides"]["scout"]["model"],
+            Value::String("m".to_string())
+        );
     }
 
     #[tokio::test]
@@ -440,8 +516,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("settings.json");
         std::fs::write(&path, "{ not json").unwrap();
-        let err = merge_builtin_agent_override(&path, "scout", &field("disabled", Value::Bool(true)))
-            .await.expect_err("malformed settings must abort");
+        let err =
+            merge_builtin_agent_override(&path, "scout", &field("disabled", Value::Bool(true)))
+                .await
+                .expect_err("malformed settings must abort");
         assert!(matches!(err, SubagentError::MalformedSettings(_)), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
     }
@@ -450,7 +528,9 @@ mod tests {
     async fn written_file_uses_two_space_indent_and_a_trailing_newline() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("settings.json");
-        merge_builtin_agent_override(&path, "scout", &field("disabled", Value::Bool(true))).await.unwrap();
+        merge_builtin_agent_override(&path, "scout", &field("disabled", Value::Bool(true)))
+            .await
+            .unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(raw.ends_with("}\n"), "{raw:?}");
         assert!(raw.contains("\n  \"subagents\""), "{raw:?}");

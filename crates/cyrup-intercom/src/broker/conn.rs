@@ -59,10 +59,16 @@ fn process_frame_payload(
 ) -> PayloadOutcome {
     // Rate limit BEFORE handling (broker.ts:218-222).
     if !bucket.consume(now_ms()) {
-        send_msg(self_tx, &BrokerMessage::Error {
-            error: "Intercom broker rate limit exceeded".to_string(),
-        });
-        return PayloadOutcome { keep_going: false, rearm_registration: false };
+        send_msg(
+            self_tx,
+            &BrokerMessage::Error {
+                error: "Intercom broker rate limit exceeded".to_string(),
+            },
+        );
+        return PayloadOutcome {
+            keep_going: false,
+            rearm_registration: false,
+        };
     }
     // JS-lenient: an overflowing numeric literal must not kill the whole frame — see
     // `framing::from_frame_slice`.
@@ -75,7 +81,10 @@ fn process_frame_payload(
                 error = %crate::transport::framing::FrameError::Parse { message: e.to_string() },
                 "intercom broker: dropping connection"
             );
-            return PayloadOutcome { keep_going: false, rearm_registration: false };
+            return PayloadOutcome {
+                keep_going: false,
+                rearm_registration: false,
+            };
         }
     };
     let was_registered = session_id.is_some();
@@ -88,7 +97,10 @@ fn process_frame_payload(
         schedule_shutdown_check(state);
     }
     let rearm = result.rearmed_registration && was_registered && session_id.is_none();
-    PayloadOutcome { keep_going: matches!(result.outcome, FrameOutcome::Continue), rearm_registration: rearm }
+    PayloadOutcome {
+        keep_going: matches!(result.outcome, FrameOutcome::Continue),
+        rearm_registration: rearm,
+    }
 }
 
 /// The per-connection reader task: read chunks, reassemble frames, rate-limit, and dispatch each to
@@ -191,12 +203,12 @@ pub(super) fn spawn_connection(
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+    use super::super::state::BrokerState;
+    use super::super::test_support::{make_state, make_tx};
+    use super::*;
     use serde_json::json;
     use std::sync::Arc;
     use std::sync::Mutex;
-    use super::*;
-    use super::super::state::BrokerState;
-    use super::super::test_support::{make_state, make_tx};
 
     /// Regression test for the framing.rs dossier item ("frames already reassembled before an
     /// oversize frame in the same `push()` call are discarded"): pi's reader delivers every complete
@@ -225,7 +237,9 @@ mod tests {
         chunk.extend_from_slice(&bad_len.to_be_bytes());
 
         let mut reader = FrameReader::new();
-        let err = reader.push(&chunk).expect_err("oversize declared length must error");
+        let err = reader
+            .push(&chunk)
+            .expect_err("oversize declared length must error");
         assert_eq!(
             err.frames.len(),
             1,
@@ -233,8 +247,12 @@ mod tests {
         );
 
         for payload in &err.frames {
-            let outcome = process_frame_payload(payload, 1, &self_tx, &state, &mut bucket, &mut session_id);
-            assert!(outcome.keep_going, "a valid register frame must not itself trip a teardown");
+            let outcome =
+                process_frame_payload(payload, 1, &self_tx, &state, &mut bucket, &mut session_id);
+            assert!(
+                outcome.keep_going,
+                "a valid register frame must not itself trip a teardown"
+            );
         }
         assert_eq!(
             session_id.as_deref(),

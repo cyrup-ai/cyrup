@@ -60,8 +60,14 @@ impl Broker {
             .kill_on_drop(true)
             .spawn()
             .expect("spawn the real intercom broker subprocess");
-        wait_for_broker(&socket, Duration::from_secs(5)).await.expect("broker is health-connectable");
-        Self { _dir: dir, socket, child }
+        wait_for_broker(&socket, Duration::from_secs(5))
+            .await
+            .expect("broker is health-connectable");
+        Self {
+            _dir: dir,
+            socket,
+            child,
+        }
     }
 }
 
@@ -123,6 +129,9 @@ pub fn write_broker_command(intercom_dir: &Path) {
         "brokerCommand": broker_bin().to_string_lossy(),
         "brokerArgs": [],
     });
-    std::fs::write(config_path(intercom_dir), serde_json::to_string(&body).expect("serialize config"))
-        .expect("write config.json");
+    std::fs::write(
+        config_path(intercom_dir),
+        serde_json::to_string(&body).expect("serialize config"),
+    )
+    .expect("write config.json");
 }

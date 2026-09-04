@@ -1,16 +1,21 @@
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 mod tui092_wedge_watchdog_tests {
     //! Unit coverage for the TUI-092 escape-hatch machinery: the escalate-chord recogniser, the
     //! press-driven [`Escalation`] ladder, and the [`ArmGuard`] overrun recorder. The chord #3
     //! hard-exit leg (`presses >= PANIC_PRESSES` → `std::process::exit(130)`) is deliberately NOT
     //! exercised in-process — it would terminate the test runner; the task file's definition of
     //! done verifies it in a real terminal.
-    use std::time::Duration;
-    use cyrup_core::CancelToken;
-    use ratatui::crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
     use crate::app::*;
+    use cyrup_core::CancelToken;
     use ratatui::crossterm::event::KeyEvent;
+    use ratatui::crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+    use std::time::Duration;
 
     /// Serialises every test that touches the process-global watchdog state (`INPUT_SERVICED`,
     /// `TERMINAL_RELEASED`, `ACTIVE_ARM`, `OVER_BUDGET_ARM`) — the test harness runs this module's
@@ -19,7 +24,9 @@ mod tui092_wedge_watchdog_tests {
     static GLOBAL_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn global_state_lock() -> std::sync::MutexGuard<'static, ()> {
-        GLOBAL_STATE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        GLOBAL_STATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn ctrl(code: KeyCode, kind: KeyEventKind) -> Event {
@@ -40,8 +47,14 @@ mod tui092_wedge_watchdog_tests {
 
     #[test]
     fn ctrl_c_and_ctrl_d_presses_are_escalate_chords() {
-        assert!(is_escalate_chord(&ctrl(KeyCode::Char('c'), KeyEventKind::Press)));
-        assert!(is_escalate_chord(&ctrl(KeyCode::Char('d'), KeyEventKind::Press)));
+        assert!(is_escalate_chord(&ctrl(
+            KeyCode::Char('c'),
+            KeyEventKind::Press
+        )));
+        assert!(is_escalate_chord(&ctrl(
+            KeyCode::Char('d'),
+            KeyEventKind::Press
+        )));
     }
 
     #[test]
@@ -49,9 +62,18 @@ mod tui092_wedge_watchdog_tests {
         // Load-bearing on Windows, where crossterm populates `kind` unconditionally: one physical
         // press arrives as a press AND a release, and counting both would burn two of
         // PANIC_PRESSES on a single chord.
-        assert!(!is_escalate_chord(&ctrl(KeyCode::Char('c'), KeyEventKind::Release)));
-        assert!(!is_escalate_chord(&ctrl(KeyCode::Char('d'), KeyEventKind::Release)));
-        assert!(!is_escalate_chord(&ctrl(KeyCode::Char('c'), KeyEventKind::Repeat)));
+        assert!(!is_escalate_chord(&ctrl(
+            KeyCode::Char('c'),
+            KeyEventKind::Release
+        )));
+        assert!(!is_escalate_chord(&ctrl(
+            KeyCode::Char('d'),
+            KeyEventKind::Release
+        )));
+        assert!(!is_escalate_chord(&ctrl(
+            KeyCode::Char('c'),
+            KeyEventKind::Repeat
+        )));
     }
 
     #[test]
@@ -62,7 +84,10 @@ mod tui092_wedge_watchdog_tests {
             KeyModifiers::NONE
         ))));
         // CONTROL, but a different key.
-        assert!(!is_escalate_chord(&ctrl(KeyCode::Char('x'), KeyEventKind::Press)));
+        assert!(!is_escalate_chord(&ctrl(
+            KeyCode::Char('x'),
+            KeyEventKind::Press
+        )));
         assert!(!is_escalate_chord(&ctrl(KeyCode::Esc, KeyEventKind::Press)));
         // Not a key event at all.
         assert!(!is_escalate_chord(&Event::Resize(80, 24)));
@@ -87,7 +112,10 @@ mod tui092_wedge_watchdog_tests {
         // Chord #1 carries its own HEAD meaning (clear / forward-delete / quit) and must not be a
         // stage: no cancel, presses = 1, ladder armed against the CURRENT serviced count.
         assert!(!cancel.is_cancelled());
-        let Escalation::Armed { serviced, presses, .. } = next else {
+        let Escalation::Armed {
+            serviced, presses, ..
+        } = next
+        else {
             panic!("expected the ladder to arm, got {next:?}");
         };
         assert_eq!(presses, 1);
@@ -104,7 +132,10 @@ mod tui092_wedge_watchdog_tests {
         mark_input_serviced();
         let next = before.on_press(&cancel);
         assert!(!cancel.is_cancelled());
-        let Escalation::Armed { serviced, presses, .. } = next else {
+        let Escalation::Armed {
+            serviced, presses, ..
+        } = next
+        else {
             panic!("expected the ladder to re-arm at the bottom, got {next:?}");
         };
         assert_eq!(presses, 1);
@@ -151,8 +182,7 @@ mod tui092_wedge_watchdog_tests {
         let _released = TerminalReleased::enter();
         // A by-design block (Ctrl+G editor / Ctrl+Z suspend) is indistinguishable from a wedge by
         // observation alone; the flag is what stops a working chord becoming an escalation.
-        let next = armed_unserviced(PANIC_MIN_GAP + Duration::from_millis(50), 2)
-            .on_press(&cancel);
+        let next = armed_unserviced(PANIC_MIN_GAP + Duration::from_millis(50), 2).on_press(&cancel);
         assert!(!cancel.is_cancelled());
         assert!(matches!(next, Escalation::Idle));
     }
@@ -194,27 +224,39 @@ mod tui092_wedge_watchdog_tests {
     fn an_in_budget_arm_is_recorded_while_active_and_cleared_on_drop() {
         let _lock = global_state_lock();
         // Start from a clean slate in case a neighbour left residue.
-        let _ = OVER_BUDGET_ARM.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        let _ = OVER_BUDGET_ARM
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         {
             let _arm = ArmGuard::enter("test_arm");
-            let slot = ACTIVE_ARM.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let slot = ACTIVE_ARM
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let Some((arm, _since)) = *slot else {
                 panic!("expected ACTIVE_ARM to name the entered arm");
             };
             assert_eq!(arm, "test_arm");
         }
         // Drop cleared the active slot, and an arm inside ARM_BUDGET records no overrun.
-        let slot = ACTIVE_ARM.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let slot = ACTIVE_ARM
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(slot.is_none());
         drop(slot);
-        let over = OVER_BUDGET_ARM.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let over = OVER_BUDGET_ARM
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(over.is_none());
     }
 
     #[test]
     fn an_over_budget_arm_is_recorded_on_drop_for_the_next_loop_iteration() {
         let _lock = global_state_lock();
-        let _ = OVER_BUDGET_ARM.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        let _ = OVER_BUDGET_ARM
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         {
             // Constructed directly (rather than via `enter`) so the start instant can be backdated
             // past ARM_BUDGET without an 8-second sleep; `enter`'s ACTIVE_ARM write is not the
@@ -224,7 +266,9 @@ mod tui092_wedge_watchdog_tests {
                 std::time::Instant::now() - ARM_BUDGET - Duration::from_secs(1),
             );
         }
-        let mut over = OVER_BUDGET_ARM.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut over = OVER_BUDGET_ARM
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(over.take(), Some("over_budget_test_arm"));
     }
 }

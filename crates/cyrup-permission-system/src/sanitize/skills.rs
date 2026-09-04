@@ -11,7 +11,7 @@
 use serde_json::json;
 
 use crate::manager::PermissionManager;
-use crate::skill::{resolved_entry, SkillPromptEntry};
+use crate::skill::{SkillPromptEntry, resolved_entry};
 use crate::types::PermissionState;
 
 const AVAILABLE_SKILLS_OPEN_TAG: &str = "<available_skills>";
@@ -85,15 +85,21 @@ fn parse_skill_entries(section_body: &str) -> Vec<ParsedSkillEntry> {
     let mut cursor = 0usize;
     while let Some(rel_open) = section_body.get(cursor..).and_then(|s| s.find("<skill>")) {
         let block_start = cursor + rel_open + "<skill>".len();
-        let Some(rest) = section_body.get(block_start..) else { break };
-        let Some(rel_close) = rest.find("</skill>") else { break };
+        let Some(rest) = section_body.get(block_start..) else {
+            break;
+        };
+        let Some(rel_close) = rest.find("</skill>") else {
+            break;
+        };
         let block = rest.get(..rel_close).unwrap_or("");
         cursor = block_start + rel_close + "</skill>".len();
 
         // pi requires all three tags present (`:63`); name + location must be non-empty (`:71`).
-        let (Some(name_raw), Some(description_raw), Some(location_raw)) =
-            (extract_tag(block, "name"), extract_tag(block, "description"), extract_tag(block, "location"))
-        else {
+        let (Some(name_raw), Some(description_raw), Some(location_raw)) = (
+            extract_tag(block, "name"),
+            extract_tag(block, "description"),
+            extract_tag(block, "location"),
+        ) else {
             continue;
         };
         let name = decode_xml(name_raw.trim());
@@ -102,7 +108,11 @@ fn parse_skill_entries(section_body: &str) -> Vec<ParsedSkillEntry> {
         if name.is_empty() || location.is_empty() {
             continue;
         }
-        entries.push(ParsedSkillEntry { name, description, location });
+        entries.push(ParsedSkillEntry {
+            name,
+            description,
+            location,
+        });
     }
     entries
 }
@@ -113,17 +123,26 @@ fn parse_skill_entries(section_body: &str) -> Vec<ParsedSkillEntry> {
 fn parse_all_skill_prompt_sections(prompt: &str) -> Vec<SkillPromptSection> {
     let mut sections: Vec<SkillPromptSection> = Vec::new();
     let mut search_start = 0usize;
-    while let Some(rel_open) =
-        prompt.get(search_start..).and_then(|s| s.find(AVAILABLE_SKILLS_OPEN_TAG))
+    while let Some(rel_open) = prompt
+        .get(search_start..)
+        .and_then(|s| s.find(AVAILABLE_SKILLS_OPEN_TAG))
     {
         let start = search_start + rel_open;
         let body_start = start + AVAILABLE_SKILLS_OPEN_TAG.len();
-        let Some(rest) = prompt.get(body_start..) else { break };
-        let Some(rel_close) = rest.find(AVAILABLE_SKILLS_CLOSE_TAG) else { break };
+        let Some(rest) = prompt.get(body_start..) else {
+            break;
+        };
+        let Some(rel_close) = rest.find(AVAILABLE_SKILLS_CLOSE_TAG) else {
+            break;
+        };
         let close_start = body_start + rel_close;
         let end = close_start + AVAILABLE_SKILLS_CLOSE_TAG.len();
         let body = prompt.get(body_start..close_start).unwrap_or("");
-        sections.push(SkillPromptSection { start, end, entries: parse_skill_entries(body) });
+        sections.push(SkillPromptSection {
+            start,
+            end,
+            entries: parse_skill_entries(body),
+        });
         search_start = end;
     }
     sections
@@ -137,8 +156,14 @@ fn render_available_skills_section(entries: &[&ParsedSkillEntry]) -> String {
     for e in entries {
         lines.push("  <skill>".to_string());
         lines.push(format!("    <name>{}</name>", encode_xml(&e.name)));
-        lines.push(format!("    <description>{}</description>", encode_xml(&e.description)));
-        lines.push(format!("    <location>{}</location>", encode_xml(&e.location)));
+        lines.push(format!(
+            "    <description>{}</description>",
+            encode_xml(&e.description)
+        ));
+        lines.push(format!(
+            "    <location>{}</location>",
+            encode_xml(&e.location)
+        ));
         lines.push("  </skill>".to_string());
     }
     lines.push(AVAILABLE_SKILLS_CLOSE_TAG.to_string());
@@ -180,7 +205,9 @@ fn line_contains_backticked_hidden_skill(line: &str, hidden: &[String]) -> bool 
     let mut rest = line;
     while let Some(open) = rest.find('`') {
         let after_open = rest.get(open + 1..).unwrap_or("");
-        let Some(close) = after_open.find('`') else { break };
+        let Some(close) = after_open.find('`') else {
+            break;
+        };
         if close == 0 {
             // Empty span: `[^`]+` cannot match. pi's engine retries from the NEXT character, so the
             // second backtick becomes a candidate OPEN delimiter rather than being consumed.
@@ -238,7 +265,10 @@ pub fn resolve_skill_prompt_entries(
 ) -> SkillPromptResolution {
     let sections = parse_all_skill_prompt_sections(prompt);
     if sections.is_empty() {
-        return SkillPromptResolution { prompt: prompt.to_string(), entries: Vec::new() };
+        return SkillPromptResolution {
+            prompt: prompt.to_string(),
+            entries: Vec::new(),
+        };
     }
 
     let mut cache: Vec<(String, PermissionState)> = Vec::new();
@@ -260,7 +290,12 @@ pub fn resolve_skill_prompt_entries(
                     s
                 }
             };
-            enforcement.push(resolved_entry(entry.name.clone(), &entry.location, state, cwd));
+            enforcement.push(resolved_entry(
+                entry.name.clone(),
+                &entry.location,
+                state,
+                cwd,
+            ));
             if state == PermissionState::Allow {
                 visible.push(entry);
             } else if !hidden_names.iter().any(|n| n == &entry.name) {
@@ -292,7 +327,10 @@ pub fn resolve_skill_prompt_entries(
     }
     sanitized = prune_hidden_structured_skill_references(&sanitized, &hidden_names);
 
-    SkillPromptResolution { prompt: sanitized, entries: enforcement }
+    SkillPromptResolution {
+        prompt: sanitized,
+        entries: enforcement,
+    }
 }
 
 #[cfg(test)]
@@ -345,8 +383,16 @@ mod tests {
         let out = resolve_skill_prompt_entries(&prompt, &mut m, None, "/x");
         // BOTH skills survive as enforcement entries...
         assert_eq!(out.entries.len(), 2);
-        assert!(out.entries.iter().any(|e| e.name == "deploy" && e.state == PermissionState::Allow));
-        assert!(out.entries.iter().any(|e| e.name == "secret" && e.state == PermissionState::Deny));
+        assert!(
+            out.entries
+                .iter()
+                .any(|e| e.name == "deploy" && e.state == PermissionState::Allow)
+        );
+        assert!(
+            out.entries
+                .iter()
+                .any(|e| e.name == "secret" && e.state == PermissionState::Deny)
+        );
     }
 
     #[test]
@@ -363,7 +409,11 @@ mod tests {
         );
         let out = resolve_skill_prompt_entries(&prompt, &mut m, None, "/x");
         // ...but only the ALLOW skill stays advertised in the sanitized prompt.
-        assert!(out.prompt.contains("<name>deploy</name>"), "allowed skill visible:\n{}", out.prompt);
+        assert!(
+            out.prompt.contains("<name>deploy</name>"),
+            "allowed skill visible:\n{}",
+            out.prompt
+        );
         assert!(
             !out.prompt.contains("<name>secret</name>"),
             "denied skill must be hidden from <available_skills>:\n{}",
@@ -381,7 +431,11 @@ mod tests {
             skill_block("deploy", "/x/skills/deploy/SKILL.md"),
         );
         let out = resolve_skill_prompt_entries(&prompt, &mut m, None, "/x");
-        assert!(!out.prompt.contains("<available_skills>"), "emptied block removed:\n{}", out.prompt);
+        assert!(
+            !out.prompt.contains("<available_skills>"),
+            "emptied block removed:\n{}",
+            out.prompt
+        );
         assert!(out.prompt.contains("before") && out.prompt.contains("after"));
         // Enforcement entry still tracked.
         assert_eq!(out.entries.len(), 1);
@@ -401,7 +455,11 @@ mod tests {
             skill_block("secret", "/x/skills/secret/SKILL.md"),
         );
         let out = resolve_skill_prompt_entries(&prompt, &mut m, None, "/x");
-        assert!(out.prompt.contains("`deploy`"), "allowed skill row kept:\n{}", out.prompt);
+        assert!(
+            out.prompt.contains("`deploy`"),
+            "allowed skill row kept:\n{}",
+            out.prompt
+        );
         assert!(
             !out.prompt.contains("`secret`"),
             "the structured list item referencing the hidden skill must be pruned:\n{}",
@@ -422,10 +480,19 @@ mod tests {
             "an earlier doubled backtick must not hide the later `secret` span"
         );
         // The un-drifted cases still behave.
-        assert!(line_contains_backticked_hidden_skill("- `secret` leaks", &hidden));
-        assert!(!line_contains_backticked_hidden_skill("- `deploy` deploys", &hidden));
+        assert!(line_contains_backticked_hidden_skill(
+            "- `secret` leaks",
+            &hidden
+        ));
+        assert!(!line_contains_backticked_hidden_skill(
+            "- `deploy` deploys",
+            &hidden
+        ));
         // An unterminated span matches nothing, as pi's regex does.
-        assert!(!line_contains_backticked_hidden_skill("- `secret leaks", &hidden));
+        assert!(!line_contains_backticked_hidden_skill(
+            "- `secret leaks",
+            &hidden
+        ));
         // ...and the whole prune path sees it.
         let dir = tempfile::tempdir().unwrap();
         let mut m = manager_with_global(
@@ -438,7 +505,11 @@ mod tests {
             skill_block("secret", "/x/skills/secret/SKILL.md"),
         );
         let out = resolve_skill_prompt_entries(&prompt, &mut m, None, "/x");
-        assert!(!out.prompt.contains("`secret`"), "row must be pruned:\n{}", out.prompt);
+        assert!(
+            !out.prompt.contains("`secret`"),
+            "row must be pruned:\n{}",
+            out.prompt
+        );
     }
 
     #[test]

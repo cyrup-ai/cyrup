@@ -25,17 +25,22 @@
 //! variants itself would pass against the unfixed tree, because the break was in the four
 //! `HostServices` overrides that never existed.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::sync::Arc;
 
 use cyrup_ext::host::HostServices;
-use cyrup_provider::faux::FauxProvider;
 use cyrup_provider::Provider;
+use cyrup_provider::faux::FauxProvider;
 use cyrup_session_svc::{AgentSessionEvent, LiveHostServices, UiEffect, UiRequest};
 use ratatui::backend::TestBackend;
 
-use crate::{App, UiTheme, SPINNER_FRAMES};
+use crate::{App, SPINNER_FRAMES, UiTheme};
 
 /// A backend plus the effect channel the interactive run loop drains, wired exactly as
 /// `App::install_ui_sinks` wires them in production.
@@ -101,20 +106,35 @@ impl Wired {
 fn a_working_message_replaces_the_band_copy_live_and_none_restores_the_default() {
     let mut w = wired();
     w.app.ingest_event(&AgentSessionEvent::AgentStart);
-    assert!(w.screen().contains("Working..."), "fixture: the default band is up");
+    assert!(
+        w.screen().contains("Working..."),
+        "fixture: the default band is up"
+    );
 
     w.svc.set_working_message(Some("indexing 412 files"));
     w.pump();
     let after = w.screen();
-    assert!(after.contains("indexing 412 files"), "the extension's copy must replace it:\n{after}");
-    assert!(!after.contains("Working..."), "…and the default must be gone:\n{after}");
+    assert!(
+        after.contains("indexing 412 files"),
+        "the extension's copy must replace it:\n{after}"
+    );
+    assert!(
+        !after.contains("Working..."),
+        "…and the default must be gone:\n{after}"
+    );
 
     // Upstream's no-argument call restores `defaultWorkingMessage` (`?? this.defaultWorkingMessage`).
     w.svc.set_working_message(None);
     w.pump();
     let restored = w.screen();
-    assert!(restored.contains("Working..."), "`None` restores the default:\n{restored}");
-    assert!(!restored.contains("indexing 412 files"), "…and drops the override:\n{restored}");
+    assert!(
+        restored.contains("Working..."),
+        "`None` restores the default:\n{restored}"
+    );
+    assert!(
+        !restored.contains("indexing 412 files"),
+        "…and drops the override:\n{restored}"
+    );
 }
 
 /// **`setWorkingMessage` persists across turns.** Upstream seeds every new `WorkingStatusIndicator`
@@ -129,12 +149,21 @@ fn a_working_message_survives_the_turn_it_was_set_in() {
     w.pump();
     // Set while IDLE: nothing is on screen yet, and the next turn must pick it up.
     w.app.ingest_event(&AgentSessionEvent::AgentStart);
-    assert!(w.screen().contains("waiting on the build"), "seeded into the next turn's band");
+    assert!(
+        w.screen().contains("waiting on the build"),
+        "seeded into the next turn's band"
+    );
 
-    w.app.ingest_event(&AgentSessionEvent::AgentEnd { messages: vec![], will_retry: false });
+    w.app.ingest_event(&AgentSessionEvent::AgentEnd {
+        messages: vec![],
+        will_retry: false,
+    });
     w.app.ingest_event(&AgentSessionEvent::AgentStart);
     let second = w.screen();
-    assert!(second.contains("waiting on the build"), "and into the one after that:\n{second}");
+    assert!(
+        second.contains("waiting on the build"),
+        "and into the one after that:\n{second}"
+    );
 }
 
 /// **`setWorkingVisible`.** Pi: `false` ⇒ `clearStatusIndicator("working")`; a later `agent_start`
@@ -152,19 +181,31 @@ fn working_visible_false_takes_the_band_down_and_keeps_it_down_next_turn() {
     w.svc.set_working_visible(false);
     w.pump();
     let hidden = w.screen();
-    assert!(!hidden.contains("Working..."), "the band must come down at once:\n{hidden}");
+    assert!(
+        !hidden.contains("Working..."),
+        "the band must come down at once:\n{hidden}"
+    );
 
     // The flag is session state, not a one-shot: the NEXT turn must not resurrect the band.
-    w.app.ingest_event(&AgentSessionEvent::AgentEnd { messages: vec![], will_retry: false });
+    w.app.ingest_event(&AgentSessionEvent::AgentEnd {
+        messages: vec![],
+        will_retry: false,
+    });
     w.app.ingest_event(&AgentSessionEvent::AgentStart);
     let next = w.screen();
-    assert!(!next.contains("Working..."), "…and stay down for the next turn:\n{next}");
+    assert!(
+        !next.contains("Working..."),
+        "…and stay down for the next turn:\n{next}"
+    );
 
     // Re-showing mid-turn mounts it again (`if (isStreaming && kind !== "working")`, `:2099`).
     w.svc.set_working_visible(true);
     w.pump();
     let back = w.screen();
-    assert!(back.contains("Working..."), "`true` mid-stream brings it back:\n{back}");
+    assert!(
+        back.contains("Working..."),
+        "`true` mid-stream brings it back:\n{back}"
+    );
 }
 
 /// MIRROR (the kind filter): hiding the working row must not blank a RETRY countdown, because
@@ -180,12 +221,18 @@ fn working_visible_false_leaves_a_retry_band_alone() {
         delay_ms: 30_000,
         error_message: "429".to_string(),
     });
-    assert!(w.screen().contains("Retrying (1/3)"), "fixture: a retry band is live");
+    assert!(
+        w.screen().contains("Retrying (1/3)"),
+        "fixture: a retry band is live"
+    );
 
     w.svc.set_working_visible(false);
     w.pump();
     let after = w.screen();
-    assert!(after.contains("Retrying (1/3)"), "the retry countdown must survive:\n{after}");
+    assert!(
+        after.contains("Retrying (1/3)"),
+        "the retry countdown must survive:\n{after}"
+    );
 }
 
 /// **`setWorkingIndicator`.** Pi's `Loader.setIndicator` swaps the frame list and the interval
@@ -206,18 +253,26 @@ fn a_custom_working_indicator_replaces_the_frames_and_empty_frames_hide_the_glyp
 
     // A single frame never animates upstream (`restartAnimation`'s `frames.length <= 1` early
     // return, `loader.ts:74-76`), so it is stable to assert on without a clock.
-    w.svc.set_working_indicator(Some(&serde_json::json!({"frames": ["<*>"]})));
+    w.svc
+        .set_working_indicator(Some(&serde_json::json!({"frames": ["<*>"]})));
     w.pump();
     let custom = w.screen();
-    assert!(custom.contains("<*>"), "the extension's frame must draw:\n{custom}");
+    assert!(
+        custom.contains("<*>"),
+        "the extension's frame must draw:\n{custom}"
+    );
     assert!(
         !SPINNER_FRAMES.iter().any(|f| custom.contains(f)),
         "…and the built-in Braille frames must be gone:\n{custom}"
     );
-    assert!(custom.contains("Working..."), "the MESSAGE is independent of the glyph:\n{custom}");
+    assert!(
+        custom.contains("Working..."),
+        "the MESSAGE is independent of the glyph:\n{custom}"
+    );
 
     // `frames: []` — no glyph at all, message intact.
-    w.svc.set_working_indicator(Some(&serde_json::json!({"frames": []})));
+    w.svc
+        .set_working_indicator(Some(&serde_json::json!({"frames": []})));
     w.pump();
     let bare = w.screen();
     assert!(!bare.contains("<*>"), "the previous frame is gone:\n{bare}");
@@ -225,7 +280,10 @@ fn a_custom_working_indicator_replaces_the_frames_and_empty_frames_hide_the_glyp
         !SPINNER_FRAMES.iter().any(|f| bare.contains(f)),
         "`frames: []` draws no spinner at all:\n{bare}"
     );
-    assert!(bare.contains("Working..."), "…but the band and its message stay:\n{bare}");
+    assert!(
+        bare.contains("Working..."),
+        "…but the band and its message stay:\n{bare}"
+    );
 
     // `None` restores the built-in animated spinner (`indicator?.frames !== undefined ? … :
     // DEFAULT_FRAMES`, `loader.ts:66`).
@@ -250,21 +308,40 @@ fn a_custom_working_indicator_replaces_the_frames_and_empty_frames_hide_the_glyp
 fn a_hidden_thinking_label_replaces_the_collapsed_placeholder_retroactively() {
     let mut w = wired();
     w.app.state_mut().transcript.set_hide_thinking_block(true);
-    w.app.state_mut().transcript.push_thinking_delta("chain of thought");
-    assert!(w.screen().contains("Thinking..."), "fixture: the default placeholder is up");
+    w.app
+        .state_mut()
+        .transcript
+        .push_thinking_delta("chain of thought");
+    assert!(
+        w.screen().contains("Thinking..."),
+        "fixture: the default placeholder is up"
+    );
 
     // Set AFTER the block is already on screen: upstream re-labels what is already mounted.
-    w.svc.set_hidden_thinking_label(Some("[reasoning withheld]"));
+    w.svc
+        .set_hidden_thinking_label(Some("[reasoning withheld]"));
     w.pump();
     let after = w.screen();
-    assert!(after.contains("[reasoning withheld]"), "the override must apply:\n{after}");
-    assert!(!after.contains("Thinking..."), "…and replace the default:\n{after}");
-    assert!(!after.contains("chain of thought"), "the body stays collapsed either way:\n{after}");
+    assert!(
+        after.contains("[reasoning withheld]"),
+        "the override must apply:\n{after}"
+    );
+    assert!(
+        !after.contains("Thinking..."),
+        "…and replace the default:\n{after}"
+    );
+    assert!(
+        !after.contains("chain of thought"),
+        "the body stays collapsed either way:\n{after}"
+    );
 
     w.svc.set_hidden_thinking_label(None);
     w.pump();
     let restored = w.screen();
-    assert!(restored.contains("Thinking..."), "`None` restores the default:\n{restored}");
+    assert!(
+        restored.contains("Thinking..."),
+        "`None` restores the default:\n{restored}"
+    );
 }
 
 /// **`resetExtensionUI`.** Pi resets all four in one block on a session swap /extension reload:
@@ -277,8 +354,10 @@ fn a_hidden_thinking_label_replaces_the_collapsed_placeholder_retroactively() {
 #[test]
 fn a_session_swap_restores_every_working_default() {
     let mut w = wired();
-    w.svc.set_working_message(Some("owned by the outgoing session"));
-    w.svc.set_working_indicator(Some(&serde_json::json!({"frames": ["ZQX"]})));
+    w.svc
+        .set_working_message(Some("owned by the outgoing session"));
+    w.svc
+        .set_working_indicator(Some(&serde_json::json!({"frames": ["ZQX"]})));
     w.svc.set_hidden_thinking_label(Some("[withheld]"));
     w.svc.set_working_visible(false);
     w.pump();
@@ -288,8 +367,14 @@ fn a_session_swap_restores_every_working_default() {
     w.app.state_mut().transcript.push_thinking_delta("secret");
     w.app.ingest_event(&AgentSessionEvent::AgentStart);
     let before = w.screen();
-    assert!(!before.contains("Working..."), "pre-swap: the band is hidden:\n{before}");
-    assert!(before.contains("[withheld]"), "pre-swap: the label is overridden:\n{before}");
+    assert!(
+        !before.contains("Working..."),
+        "pre-swap: the band is hidden:\n{before}"
+    );
+    assert!(
+        before.contains("[withheld]"),
+        "pre-swap: the label is overridden:\n{before}"
+    );
 
     w.app.rebind_session();
 
@@ -298,12 +383,21 @@ fn a_session_swap_restores_every_working_default() {
     w.app.state_mut().transcript.push_thinking_delta("secret");
     w.app.ingest_event(&AgentSessionEvent::AgentStart);
     let after = w.screen();
-    assert!(after.contains("Working..."), "visibility and message reset:\n{after}");
+    assert!(
+        after.contains("Working..."),
+        "visibility and message reset:\n{after}"
+    );
     assert!(!after.contains("ZQX"), "the custom frame is gone:\n{after}");
     assert!(
         SPINNER_FRAMES.iter().any(|f| after.contains(f)),
         "the built-in spinner is back:\n{after}"
     );
-    assert!(after.contains("Thinking..."), "the hidden-thinking label reset:\n{after}");
-    assert!(!after.contains("[withheld]"), "…and the override is gone:\n{after}");
+    assert!(
+        after.contains("Thinking..."),
+        "the hidden-thinking label reset:\n{after}"
+    );
+    assert!(
+        !after.contains("[withheld]"),
+        "…and the override is gone:\n{after}"
+    );
 }

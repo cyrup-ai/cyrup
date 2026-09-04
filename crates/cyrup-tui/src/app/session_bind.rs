@@ -94,7 +94,7 @@ impl<B: Backend> App<B> {
     /// notices pi re-injects on a rebuild, so a caller that wants them asks the session for the
     /// full stream ([`cyrup_session_svc::AgentSession::replay_items`]) instead.
     pub fn replay_session(&mut self, messages: &[cyrup_session_svc::agent_message::AgentMessage]) {
-        self.replay_session_rendered(&as_replay_items(messages), &std::collections::HashMap::new());
+        self.replay_session_rendered(&as_replay_items(messages), &ReplayRenders::default());
     }
 
     /// TUI-N04 — the second statement of Pi's `renderInitialMessages()`, immediately after the
@@ -136,7 +136,9 @@ impl<B: Backend> App<B> {
         // No `Warning: ` prefix: pi's trust banner is a RAW `Text` in the warning colour (`:3505`),
         // not a `showWarning` call, so — unlike `interactive-mode.ts:3884-3888`'s
         // `Warning: ${warningMessage}` — there is no prefix to carry (TUI-062).
-        self.state.transcript.push_warning(PROJECT_UNTRUSTED_WARNING);
+        self.state
+            .transcript
+            .push_warning(PROJECT_UNTRUSTED_WARNING);
     }
 
     /// Reload [`AppState::known_tool_definitions`] from the bound session's tool registry — Pi's
@@ -149,8 +151,13 @@ impl<B: Backend> App<B> {
     /// per-tool-start lookup there cannot answer for them and they would all fall back to
     /// `formatToolExecution`'s full argument dump.
     pub fn refresh_known_tool_definitions(&mut self, session: &Arc<AgentSession>) {
-        self.state.known_tool_definitions =
-            session.all_tools().into_iter().map(|t| t.name).collect();
+        // The definition's `renderShell` rides along (EXT-024): `getRenderShell()` reads it off the
+        // same `getToolDefinition(name)` answer (`tool-execution.ts:108-116`).
+        self.state.known_tool_definitions = session
+            .all_tools()
+            .into_iter()
+            .map(|t| (t.name, t.render_kind))
+            .collect();
     }
 
     /// [`Self::replay_session`], first resolving each displayed `custom` message's registered
@@ -165,7 +172,8 @@ impl<B: Backend> App<B> {
         messages: &[cyrup_session_svc::agent_message::AgentMessage],
         ext_host: &Arc<cyrup_ext::ExtensionHost>,
     ) {
-        self.replay_items_with_extensions(&as_replay_items(messages), ext_host).await;
+        self.replay_items_with_extensions(&as_replay_items(messages), ext_host)
+            .await;
     }
 
     /// [`Self::replay_session_with_extensions`] over the FULL replay stream — the messages plus the
@@ -181,25 +189,80 @@ impl<B: Backend> App<B> {
         items: &[cyrup_session_svc::ReplayItem],
         ext_host: &Arc<cyrup_ext::ExtensionHost>,
     ) {
+        use cyrup_core::{Content, Message};
         use cyrup_session_svc::agent_message::AgentMessage;
-        let mut rendered: std::collections::HashMap<usize, crate::transcript::Rendered> =
-            std::collections::HashMap::new();
-        // MESSAGE-relative, matching the walk below: `rendered` is keyed by the index a message has
-        // among messages, not among items, so an interleaved notice cannot shift a custom
-        // message's renderer onto its neighbour.
+        use serde_json::Value;
+        let mut rendered = ReplayRenders::default();
+        // MESSAGE-relative, matching the walk below: `rendered.messages` is keyed by the index a
+        // message has among messages, not among items, so an interleaved notice cannot shift a
+        // custom message's renderer onto its neighbour.
         for (i, message) in replay_messages(items).enumerate() {
-            // `if (message.display)` (`:3470`) gates the whole arm, lookup included.
-            let AgentMessage::Custom(c) = message else { continue };
-            if !c.display {
-                continue;
-            }
-            let payload = serde_json::to_value(message).unwrap_or(serde_json::Value::Null);
-            // Carried WHOLE. `has_content()` is the "did a renderer claim this" question the old
-            // `if let Some(text)` was asking, and it stays true for a LIVE component, which
-            // `Rendered::into_text()` would have dropped.
-            let r = extension_render_message(ext_host, &c.custom_type, &payload).await;
-            if r.has_content() {
-                rendered.insert(i, r);
+            match message {
+                AgentMessage::Custom(c) => {
+                    // `if (message.display)` (`:3470`) gates the whole arm, lookup included.
+                    if !c.display {
+                        continue;
+                    }
+                    let payload = serde_json::to_value(message).unwrap_or(Value::Null);
+                    // Carried WHOLE. `has_content()` is the "did a renderer claim this" question
+                    // the old `if let Some(text)` was asking, and it stays true for a LIVE
+                    // component, which `Rendered::into_text()` would have dropped.
+                    let r = extension_render_message(ext_host, &c.custom_type, &payload).await;
+                    if r.has_content() {
+                        rendered.messages.insert(i, r);
+                    }
+                }
+                // EXT-041 — the TOOL surface. Pi's replay builds a `ToolExecutionComponent` for
+                // every replayed `toolCall` with `this.getRegisteredToolDefinition(content.name)`
+                // (`interactive-mode.ts:3729-3741` @v0.84.4) — the definition that carries the
+                // extension's `renderCall`/`renderResult` — exactly as the live
+                // `tool_execution_start` arm does (`:3340-3351`). The custom-message arm above is
+                // this arm's sibling, not a superset: a `/resume` used to draw every
+                // extension-rendered tool row with the built-in framing the live turn had replaced.
+                // Keyed by TOOL-CALL id, which is how pi files the component
+                // (`renderedPendingTools.set(content.id, component)`, `:3760`) and how the result
+                // finds it back (`:3770`) — two `bash` calls in one turn are indistinguishable by
+                // name.
+                AgentMessage::Core(Message::Assistant(m)) => {
+                    for call in m.content.iter().filter_map(|c| match c {
+                        Content::ToolCall(call) => Some(call),
+                        _ => None,
+                    }) {
+                        let args = Value::Object((*call.arguments).clone());
+                        // A tool ROW is a string surface (see the live fold): `into_text` flattens
+                        // exactly as `events_fold.rs` does, and a fault already collapsed to `None`.
+                        if let Some(text) = extension_render_tool_call(ext_host, &call.name, &args)
+                            .await
+                            .into_text()
+                        {
+                            rendered
+                                .tool_calls
+                                .insert(call.id.as_str().to_string(), text);
+                        }
+                    }
+                }
+                AgentMessage::Core(Message::ToolResult {
+                    tool_call_id,
+                    tool_name,
+                    content,
+                    details,
+                    ..
+                }) => {
+                    // The SAME `{content, details}` value the walk hands the built-in renderer,
+                    // which is also what pi's `ToolExecutionComponent` passes its `renderResult`
+                    // (`tool-execution.ts:307-308`: `{ content: this.result.content, details:
+                    // this.result.details }`).
+                    let result = tool_result_payload(content, details.as_ref());
+                    if let Some(text) = extension_render_tool_result(ext_host, tool_name, &result)
+                        .await
+                        .into_text()
+                    {
+                        rendered
+                            .tool_results
+                            .insert(tool_call_id.as_str().to_string(), text);
+                    }
+                }
+                _ => {}
             }
         }
         // EXT-019 — the commit frontier before the walk, for the transform pass below.
@@ -211,20 +274,24 @@ impl<B: Backend> App<B> {
         // Upstream cannot have it: pi rebuilds real `UserMessage`/`AssistantMessage` components on
         // replay (`renderSessionEntries`, `interactive-mode.ts:3781-3796`), each with its own
         // `createMarkdownTransform`.
-        self.apply_markdown_transformers(ext_host, first_pending).await;
+        self.apply_markdown_transformers(ext_host, first_pending)
+            .await;
     }
 
     /// The replay walk itself — pi `renderSessionItems` (`interactive-mode.ts:3705-3775`), over the
     /// same union of items: raw-context messages interleaved with the re-derived cache-miss and
     /// compaction-cost notices.
     ///
-    /// `rendered` maps a MESSAGE index (not an item index) to the text an extension's registered
-    /// renderer produced for it (X11); an absent entry draws the built-in framing, which is Pi's
-    /// `getMessageRenderer(...) === undefined` outcome.
+    /// `rendered.messages` maps a MESSAGE index (not an item index) to the text an extension's
+    /// registered renderer produced for it (X11); `rendered.tool_calls`/`.tool_results` map a
+    /// TOOL-CALL id to the extension's call header / result body (EXT-041). An absent entry draws
+    /// the built-in framing, which is Pi's `getMessageRenderer(...) === undefined` outcome for a
+    /// message and `getCallRenderer()`/`getResultRenderer()` resolving to the built-in definition
+    /// (`tool-execution.ts:84-101`) for a tool row.
     fn replay_session_rendered(
         &mut self,
         items: &[cyrup_session_svc::ReplayItem],
-        rendered: &std::collections::HashMap<usize, crate::transcript::Rendered>,
+        rendered: &ReplayRenders,
     ) {
         use cyrup_core::{Content, Message};
         use cyrup_session_svc::ReplayItem;
@@ -295,18 +362,21 @@ impl<B: Backend> App<B> {
                         // interactive-mode.ts:3473) so the `toolResult` below resolves to the exact
                         // call that produced it — two `read`s in one turn are indistinguishable by
                         // name.
-                        // `hasRendererDefinition()` (tool-execution.ts:103-105) for a replayed
-                        // call: the bind refreshed the whole registry into
-                        // [`AppState::known_tool_definitions`] just above, which is the only place
-                        // this walk can ask — it holds messages, not a session.
-                        let has_definition =
-                            self.state.known_tool_definitions.contains(&call.name);
+                        // `hasRendererDefinition()` (tool-execution.ts:103-105) and
+                        // `getRenderShell()` (`:108-116`) for a replayed call: the bind refreshed
+                        // the whole registry into [`AppState::known_tool_definitions`] just above,
+                        // which is the only place this walk can ask — it holds messages, not a
+                        // session.
+                        let definition = self.state.known_tool_definitions.get(&call.name).copied();
                         self.state.transcript.push_tool_start_defined(
                             call.name.clone(),
                             Some(call.id.as_str().to_string()),
                             Value::Object((*call.arguments).clone()),
-                            None,
-                            has_definition,
+                            // EXT-041 — the extension's call header, resolved in the pre-pass
+                            // above; `None` keeps the built-in per-tool dispatch, as on the live
+                            // path.
+                            rendered.tool_calls.get(call.id.as_str()).cloned(),
+                            definition,
                         );
                     }
                     if let Some(notice) = stop_reason_notice(m) {
@@ -321,23 +391,18 @@ impl<B: Backend> App<B> {
                     details,
                     ..
                 }) => {
-                    // The shape every per-tool `renderResult` reads (`{content, details}`).
-                    let mut result = serde_json::Map::new();
-                    result.insert(
-                        "content".to_string(),
-                        serde_json::to_value(content).unwrap_or(Value::Null),
-                    );
-                    if let Some(d) = details {
-                        result.insert("details".to_string(), d.clone());
-                    }
+                    // The shape every per-tool `renderResult` reads (`{content, details}`) — the
+                    // built-in's and the extension's alike, so the pre-pass built the same value.
+                    let result = tool_result_payload(content, details.as_ref());
                     // `renderedPendingTools.get(message.toolCallId)` (`:3483`) — an exact id lookup,
                     // never a name scan.
                     self.state.transcript.push_tool_end_rendered(
                         tool_name.clone(),
                         Some(tool_call_id.as_str()),
                         *is_error,
-                        Some(Value::Object(result)),
-                        None,
+                        Some(result),
+                        // EXT-041 — the extension's result body for THIS call id, or the built-in.
+                        rendered.tool_results.get(tool_call_id.as_str()).cloned(),
                     );
                     // Keep call order in scrollback: commit the finished leading run now instead of
                     // deferring every tool of the whole replay to the end.
@@ -368,7 +433,7 @@ impl<B: Backend> App<B> {
                         // it performs the identical lookup, so a resumed session keeps the
                         // extension rendering the live session had. Absent an entry the built-in
                         // `[type] body` framing draws — `getMessageRenderer` returning `undefined`.
-                        let rendered = rendered.get(&index).cloned().unwrap_or_default();
+                        let rendered = rendered.messages.get(&index).cloned().unwrap_or_default();
                         self.state.transcript.push_custom_message_rendered(
                             c.custom_type.clone(),
                             custom_message_text(&c.content),
@@ -399,7 +464,9 @@ impl<B: Backend> App<B> {
     /// but nothing rendered it. Push it before the first draw so it lands at the top of scrollback,
     /// ahead of the conversation.
     pub fn push_loaded_resources(&mut self, report: &crate::startup::StartupReport) {
-        self.state.transcript.push_loaded_resources(crate::startup::build_startup_lines(report));
+        self.state
+            .transcript
+            .push_loaded_resources(crate::startup::build_startup_lines(report));
     }
 
     /// Put already-queued steering/follow-up text back into the editor — the buffer half of Pi's
@@ -428,6 +495,44 @@ impl<B: Backend> App<B> {
         self.state.editor.set_text(&combined);
         queued.len()
     }
+}
+
+/// Everything the extension-renderer pre-pass resolved for one replay, handed to the sync walk
+/// ([`App::replay_session_rendered`]). Three surfaces, three keys, because pi resolves them at
+/// three different places: a custom message by its position in the stream (`getMessageRenderer`,
+/// `interactive-mode.ts:3610` @v0.84.4), a tool call by `content.id` (`:3760`) and a tool result by
+/// `message.toolCallId` (`:3770`). A key with no entry draws the built-in framing.
+///
+/// The two tool maps hold flattened text rather than [`crate::transcript::Rendered`] because a
+/// tool row is a string surface — the live fold flattens with `into_text()` at the push
+/// (`events_fold.rs`), and the replay must not carry a tier the row cannot draw.
+#[derive(Default)]
+struct ReplayRenders {
+    /// MESSAGE index → the custom-message renderer's output (X11 / EXT-006).
+    messages: std::collections::HashMap<usize, crate::transcript::Rendered>,
+    /// Tool-call id → the extension's `renderCall` text (EXT-041).
+    tool_calls: std::collections::HashMap<String, String>,
+    /// Tool-call id → the extension's `renderResult` text (EXT-041).
+    tool_results: std::collections::HashMap<String, String>,
+}
+
+/// The `{content, details}` value a persisted `toolResult` message presents to a `renderResult`
+/// — pi's `{ content: this.result.content, details: this.result.details }`
+/// (`components/tool-execution.ts:307-308` @v0.84.4). Built ONCE per shape so the extension
+/// renderer in the pre-pass and the built-in renderer in the walk see the same value.
+fn tool_result_payload(
+    content: &[cyrup_core::Content],
+    details: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let mut result = serde_json::Map::new();
+    result.insert(
+        "content".to_string(),
+        serde_json::to_value(content).unwrap_or(serde_json::Value::Null),
+    );
+    if let Some(d) = details {
+        result.insert("details".to_string(), d.clone());
+    }
+    serde_json::Value::Object(result)
 }
 
 /// The messages of a replay stream, in order, with the derived notices skipped — the projection an

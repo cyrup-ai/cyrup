@@ -24,7 +24,12 @@
 //!
 //! Property 2 runs against a synthetic `crates/`-shaped tree, not the repo: mutating the real
 //! `world.wit` would race every other test in this binary and dirty the working tree.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use cyrup_ext::HOST_WORLD;
 use cyrup_ext::build::abi::{ABI_SOURCE_ROOTS, abi_source_files, hash_abi_sources};
@@ -54,9 +59,18 @@ fn synthetic_crates_tree() -> tempfile::TempDir {
         .tempdir()
         .expect("a temp dir for the synthetic crates tree");
     let root = td.path();
-    write(&root.join("cyrup-ext/wit/world.wit"), "package cyrup:ext@0.6.0;\n");
-    write(&root.join("cyrup-ext-sdk/wit/world.wit"), "package cyrup:ext@0.6.0;\n");
-    write(&root.join("cyrup-ext-sdk/Cargo.toml"), "[package]\nname = \"cyrup-ext-sdk\"\n");
+    write(
+        &root.join("cyrup-ext/wit/world.wit"),
+        "package cyrup:ext@0.6.0;\n",
+    );
+    write(
+        &root.join("cyrup-ext-sdk/wit/world.wit"),
+        "package cyrup:ext@0.6.0;\n",
+    );
+    write(
+        &root.join("cyrup-ext-sdk/Cargo.toml"),
+        "[package]\nname = \"cyrup-ext-sdk\"\n",
+    );
     write(&root.join("cyrup-ext-sdk/src/guest.rs"), "// guest\n");
     td
 }
@@ -103,7 +117,11 @@ fn build_rs_tracks_both_on_disk_world_wit_copies() {
         ABI_FINGERPRINT, "unknown",
         "build.rs failed to resolve the workspace crates/ dir; the ABI fingerprint is inert"
     );
-    assert_eq!(ABI_FINGERPRINT.len(), 64, "blake3 hex is 64 chars: {ABI_FINGERPRINT}");
+    assert_eq!(
+        ABI_FINGERPRINT.len(),
+        64,
+        "blake3 hex is 64 chars: {ABI_FINGERPRINT}"
+    );
 }
 
 /// Property 2 — an edit to EITHER copy moves the fingerprint, and the copies are distinguishable.
@@ -179,7 +197,10 @@ fn a_moved_abi_fingerprint_turns_a_stored_tier1_artifact_into_a_cache_miss() {
     // Two fingerprints that differ ONLY because a `world.wit` copy was edited (property 2's tree).
     let tree = synthetic_crates_tree();
     let before = hash_abi_sources(tree.path());
-    write(&tree.path().join("cyrup-ext/wit/world.wit"), "package cyrup:ext@0.7.0;\n");
+    write(
+        &tree.path().join("cyrup-ext/wit/world.wit"),
+        "package cyrup:ext@0.7.0;\n",
+    );
     let after = hash_abi_sources(tree.path());
     assert_ne!(before, after);
 
@@ -194,8 +215,16 @@ fn a_moved_abi_fingerprint_turns_a_stored_tier1_artifact_into_a_cache_miss() {
     let source_tree_hash = [0x5a_u8; 32];
     let toolchain_id = "cargo 1.96.0 wasm32-wasip2";
 
-    let key_before = cache_key(&source_tree_hash, toolchain_id, &format!("{HOST_WORLD}+abi:{before}"));
-    let key_after = cache_key(&source_tree_hash, toolchain_id, &format!("{HOST_WORLD}+abi:{after}"));
+    let key_before = cache_key(
+        &source_tree_hash,
+        toolchain_id,
+        &format!("{HOST_WORLD}+abi:{before}"),
+    );
+    let key_after = cache_key(
+        &source_tree_hash,
+        toolchain_id,
+        &format!("{HOST_WORLD}+abi:{after}"),
+    );
     assert_ne!(
         key_before, key_after,
         "the world identity is folded into the cache key; a `world.wit` edit must move it"
@@ -204,12 +233,18 @@ fn a_moved_abi_fingerprint_turns_a_stored_tier1_artifact_into_a_cache_miss() {
     // A component built against the OLD world, stored under the OLD key. The preamble is the one
     // `build::validate_component` accepts, so this is a plausible stored artifact and not a blob.
     cache
-        .store(&key_before, &[0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00])
+        .store(
+            &key_before,
+            &[0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00],
+        )
         .expect("store the pre-edit artifact");
 
     // Assert the PRESENCE before asserting the absence: an `is_hit` that is false because nothing
     // was ever written would pass this test while proving nothing.
-    assert!(cache.is_hit(&key_before), "the pre-edit artifact is a hit under its own key");
+    assert!(
+        cache.is_hit(&key_before),
+        "the pre-edit artifact is a hit under its own key"
+    );
     assert!(
         !cache.is_hit(&key_after),
         "a component built against the OLD world was served from cache after a world.wit edit \

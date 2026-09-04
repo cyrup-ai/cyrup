@@ -23,7 +23,12 @@
 //! (`background::run_artifact_roots`) are derived from it — without that a developer's real
 //! background runs would leak into these assertions.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::sync::Mutex;
 
@@ -31,8 +36,8 @@ use cyrup_ext::HostServices;
 use cyrup_ext::event::HostEvent;
 use cyrup_ext::host::{WidgetEffect, WidgetPlacement};
 use cyrup_ext::native::{ExtMode, HostCtx, NativeExtension};
-use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::extension::SubagentsExtension;
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 use cyrup_ext_subagents::tui::fleet_status::FLEET_STATUS_WIDGET_KEY;
 
@@ -50,11 +55,14 @@ struct RecordingWidgetServices {
 
 impl HostServices for RecordingWidgetServices {
     fn set_widget(&self, key: &str, lines: Option<&[String]>, placement: WidgetPlacement) {
-        self.widgets.lock().expect("widget lock").push(WidgetEffect {
-            key: key.to_string(),
-            lines: lines.map(<[String]>::to_vec),
-            placement,
-        });
+        self.widgets
+            .lock()
+            .expect("widget lock")
+            .push(WidgetEffect {
+                key: key.to_string(),
+                lines: lines.map(<[String]>::to_vec),
+                placement,
+            });
     }
     fn session_id(&self) -> Option<String> {
         Some(TEST_SESSION_ID.to_string())
@@ -114,29 +122,42 @@ impl OverlayHostServices {
 }
 
 fn flatten(lines: &[cyrup_ext::OverlayLine]) -> String {
-    lines.iter().map(cyrup_ext::OverlayLine::plain_text).collect::<Vec<_>>().join("\n")
+    lines
+        .iter()
+        .map(cyrup_ext::OverlayLine::plain_text)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 impl HostServices for OverlayHostServices {
     fn set_widget(&self, key: &str, lines: Option<&[String]>, placement: WidgetPlacement) {
-        self.widgets.lock().expect("widget lock").push(WidgetEffect {
-            key: key.to_string(),
-            lines: lines.map(<[String]>::to_vec),
-            placement,
-        });
+        self.widgets
+            .lock()
+            .expect("widget lock")
+            .push(WidgetEffect {
+                key: key.to_string(),
+                lines: lines.map(<[String]>::to_vec),
+                placement,
+            });
     }
     fn session_id(&self) -> Option<String> {
         Some(TEST_SESSION_ID.to_string())
     }
     fn open_overlay(&self, mut overlay: Box<dyn cyrup_ext::InteractiveOverlay>) -> bool {
         let first = overlay.render(self.width, self.rows);
-        self.frames.lock().expect("frames lock").push(flatten(&first));
+        self.frames
+            .lock()
+            .expect("frames lock")
+            .push(flatten(&first));
         let script = std::mem::take(&mut *self.script.lock().expect("script lock"));
         for key in script {
             let outcome = overlay.handle_key(key);
             self.outcomes.lock().expect("outcomes lock").push(outcome);
             let frame = overlay.render(self.width, self.rows);
-            self.frames.lock().expect("frames lock").push(flatten(&frame));
+            self.frames
+                .lock()
+                .expect("frames lock")
+                .push(flatten(&frame));
         }
         true
     }
@@ -159,7 +180,9 @@ fn write_status_json(
     );
     status.state = cyrup_ext_subagents::background::RunState::Running;
     status.session_id = session_id.map(str::to_string);
-    status.steps = vec![cyrup_ext_subagents::background::StepStatus::pending(agent.to_string())];
+    status.steps = vec![cyrup_ext_subagents::background::StepStatus::pending(
+        agent.to_string(),
+    )];
     std::fs::write(
         run_dir.join("status.json"),
         serde_json::to_vec(&status).expect("serialize status"),
@@ -233,7 +256,10 @@ async fn subagents_fleet_with_a_ui_renders_the_interactive_inspector_frame() {
 
     // pi's `ctx.ui.custom<undefined>` resolves with no value; the modal already said everything on
     // screen, so the command itself returns nothing to surface as a notification.
-    assert_eq!(out, "", "a hosted overlay must not ALSO return text, got:\n{out}");
+    assert_eq!(
+        out, "",
+        "a hosted overlay must not ALSO return text, got:\n{out}"
+    );
 
     // The frame, its title, its empty-roster state and its footer — all from
     // `SubagentFleetComponent::render` (pi `tui/fleet.ts:788-830`), now painted BY THE HOST.
@@ -256,8 +282,14 @@ async fn the_hosted_inspector_sizes_its_body_from_the_hosts_reported_rows() {
     let home = sandbox_home();
     let dir = tempfile::tempdir().expect("tempdir");
     let cwd = dir.path();
-    let roots = cyrup_ext_subagents::background::run_artifact_roots_in(&Roots::sandboxed(home.path()), cwd);
-    write_status_json(&roots.async_root, "fleetrun001", "historian", Some(TEST_SESSION_ID));
+    let roots =
+        cyrup_ext_subagents::background::run_artifact_roots_in(&Roots::sandboxed(home.path()), cwd);
+    write_status_json(
+        &roots.async_root,
+        "fleetrun001",
+        "historian",
+        Some(TEST_SESSION_ID),
+    );
 
     let mut heights = Vec::new();
     for rows in [24usize, 60usize] {
@@ -272,7 +304,11 @@ async fn the_hosted_inspector_sizes_its_body_from_the_hosts_reported_rows() {
     }
     // pi `bodyHeight = max(2, floor(rows * 0.85) - 6)` + 6 chrome rows (`fleet.ts:792`), i.e. the
     // whole frame is `floor(rows * 0.85)` tall.
-    assert_eq!(heights, vec![24 * 85 / 100, 60 * 85 / 100], "frames: {heights:?}");
+    assert_eq!(
+        heights,
+        vec![24 * 85 / 100, 60 * 85 / 100],
+        "frames: {heights:?}"
+    );
 }
 
 /// Keystrokes reach `handle_input` through the host, and `Esc` closes — the whole interactive half
@@ -282,9 +318,20 @@ async fn keystrokes_move_the_selection_and_escape_closes_the_hosted_inspector() 
     let home = sandbox_home();
     let dir = tempfile::tempdir().expect("tempdir");
     let cwd = dir.path();
-    let roots = cyrup_ext_subagents::background::run_artifact_roots_in(&Roots::sandboxed(home.path()), cwd);
-    write_status_json(&roots.async_root, "fleetrun001", "historian", Some(TEST_SESSION_ID));
-    write_status_json(&roots.async_root, "fleetrun002", "archivist", Some(TEST_SESSION_ID));
+    let roots =
+        cyrup_ext_subagents::background::run_artifact_roots_in(&Roots::sandboxed(home.path()), cwd);
+    write_status_json(
+        &roots.async_root,
+        "fleetrun001",
+        "historian",
+        Some(TEST_SESSION_ID),
+    );
+    write_status_json(
+        &roots.async_root,
+        "fleetrun002",
+        "archivist",
+        Some(TEST_SESSION_ID),
+    );
 
     use cyrup_ext::{OverlayKey, OverlayKeyCode, OverlayOutcome};
     let ext = extension(cwd, home.path());
@@ -305,17 +352,36 @@ async fn keystrokes_move_the_selection_and_escape_closes_the_hosted_inspector() 
 
     assert_eq!(
         host.outcomes(),
-        vec![OverlayOutcome::Redraw, OverlayOutcome::Redraw, OverlayOutcome::Close],
+        vec![
+            OverlayOutcome::Redraw,
+            OverlayOutcome::Redraw,
+            OverlayOutcome::Close
+        ],
         "Down and x redraw; Esc closes (pi `fleet.ts:660-663,666-667,708-712`)"
     );
     let frames = host.frames();
-    assert_eq!(frames.len(), 4, "one frame before the script and one after each key");
+    assert_eq!(
+        frames.len(),
+        4,
+        "one frame before the script and one after each key"
+    );
     // Both runs are on the roster, and the selection cursor moved from the first to the second.
     assert!(frames[0].contains("historian"), "got:\n{}", frames[0]);
     assert!(frames[0].contains("archivist"), "got:\n{}", frames[0]);
-    assert!(frames[0].contains("1/2"), "the position readout starts at 1/2:\n{}", frames[0]);
-    assert!(frames[1].contains("2/2"), "Down must move the selection:\n{}", frames[1]);
-    assert_ne!(frames[0], frames[1], "a moved selection must change the painted frame");
+    assert!(
+        frames[0].contains("1/2"),
+        "the position readout starts at 1/2:\n{}",
+        frames[0]
+    );
+    assert!(
+        frames[1].contains("2/2"),
+        "Down must move the selection:\n{}",
+        frames[1]
+    );
+    assert_ne!(
+        frames[0], frames[1],
+        "a moved selection must change the painted frame"
+    );
 }
 
 /// The command's registered description must be v0.43.0's, since its handler is now v0.43.0's.
@@ -325,7 +391,10 @@ fn the_registered_description_is_the_v0_43_0_text() {
         .iter()
         .find(|d| d.name.as_str() == "subagents-fleet")
         .expect("subagents-fleet is registered");
-    assert_eq!(descriptor.description, "Open the live subagent fleet inspector");
+    assert_eq!(
+        descriptor.description,
+        "Open the live subagent fleet inspector"
+    );
 }
 
 // =================================================================================================
@@ -345,7 +414,13 @@ async fn the_fleet_status_widget_is_published_and_cleared_through_live_host_serv
     // An `AgentEnd` edge with NO active subagents publishes nothing (pi's `entries.length === 0`
     // early return, `tui/fleet-status.ts:315-325`, which never registers the widget in the first
     // place).
-    ext.on_event(&HostEvent::AgentEnd { messages: Vec::new() }, &ctx).await;
+    ext.on_event(
+        &HostEvent::AgentEnd {
+            messages: Vec::new(),
+        },
+        &ctx,
+    )
+    .await;
     assert!(
         services.widgets.lock().expect("lock").is_empty(),
         "an idle fleet must not publish a widget"
@@ -353,14 +428,15 @@ async fn the_fleet_status_widget_is_published_and_cleared_through_live_host_serv
 
     // Shutdown always clears the key, so the host can never be left holding a stale widget.
     ext.on_event(
-        &HostEvent::SessionShutdown { reason: "test".into(), target_session_file: None },
+        &HostEvent::SessionShutdown {
+            reason: "test".into(),
+            target_session_file: None,
+        },
         &ctx,
     )
     .await;
     let widgets = services.widgets.lock().expect("lock").clone();
-    let clear = widgets
-        .last()
-        .expect("shutdown publishes a clear");
+    let clear = widgets.last().expect("shutdown publishes a clear");
     assert_eq!(clear.key, FLEET_STATUS_WIDGET_KEY);
     // EXT-047: the removal is pi's `setWidget(key, undefined)` — an absent `content` ARGUMENT
     // (`tui/fleet-status.ts:309,320`) — not a `{"content": null}` blob. `lines: None` is the only
@@ -381,8 +457,14 @@ async fn a_real_status_json_under_the_async_root_becomes_a_roster_row() {
     // Write the exact record the detached hop-2 runner writes: `<async_root>/<run-id>/status.json`,
     // stamped with THIS session — pi's `listAsyncRuns({ sessionId })` filter (`async-status.ts:432`)
     // compares that field against the caller's session and drops everything else.
-    let roots = cyrup_ext_subagents::background::run_artifact_roots_in(&Roots::sandboxed(home.path()), cwd);
-    write_status_json(&roots.async_root, "fleetrun001", "historian", Some(TEST_SESSION_ID));
+    let roots =
+        cyrup_ext_subagents::background::run_artifact_roots_in(&Roots::sandboxed(home.path()), cwd);
+    write_status_json(
+        &roots.async_root,
+        "fleetrun001",
+        "historian",
+        Some(TEST_SESSION_ID),
+    );
 
     let ext = extension(cwd, home.path());
     let host = std::sync::Arc::new(OverlayHostServices::new(100, 32, Vec::new()));
@@ -393,7 +475,10 @@ async fn a_real_status_json_under_the_async_root_becomes_a_roster_row() {
         .expect("command dispatched");
 
     let out = host.first_frame();
-    assert!(out.contains("historian"), "the roster must list the on-disk run, got:\n{out}");
+    assert!(
+        out.contains("historian"),
+        "the roster must list the on-disk run, got:\n{out}"
+    );
     assert!(!out.contains("No tracked children"), "got:\n{out}");
     assert!(out.contains("1/1"), "got:\n{out}");
 
@@ -419,9 +504,20 @@ async fn the_history_scan_keeps_only_this_sessions_runs() {
     let home = sandbox_home();
     let dir = tempfile::tempdir().expect("tempdir");
     let cwd = dir.path();
-    let roots = cyrup_ext_subagents::background::run_artifact_roots_in(&Roots::sandboxed(home.path()), cwd);
-    write_status_json(&roots.async_root, "runmine0001", "mine", Some(TEST_SESSION_ID));
-    write_status_json(&roots.async_root, "runtheirs01", "theirs", Some("another-session"));
+    let roots =
+        cyrup_ext_subagents::background::run_artifact_roots_in(&Roots::sandboxed(home.path()), cwd);
+    write_status_json(
+        &roots.async_root,
+        "runmine0001",
+        "mine",
+        Some(TEST_SESSION_ID),
+    );
+    write_status_json(
+        &roots.async_root,
+        "runtheirs01",
+        "theirs",
+        Some("another-session"),
+    );
     write_status_json(&roots.async_root, "runnosess01", "untagged", None);
 
     let ext = extension(cwd, home.path());
@@ -433,7 +529,10 @@ async fn the_history_scan_keeps_only_this_sessions_runs() {
         .expect("command dispatched");
 
     let out = host.first_frame();
-    assert!(out.contains("mine"), "this session's run must be listed, got:\n{out}");
+    assert!(
+        out.contains("mine"),
+        "this session's run must be listed, got:\n{out}"
+    );
     assert!(
         !out.contains("theirs"),
         "another session's run must be dropped, got:\n{out}"
@@ -442,7 +541,10 @@ async fn the_history_scan_keeps_only_this_sessions_runs() {
         !out.contains("untagged"),
         "an untagged run loses to a present filter (undefined !== id), got:\n{out}"
     );
-    assert!(out.contains("1/1"), "exactly one roster row survives, got:\n{out}");
+    assert!(
+        out.contains("1/1"),
+        "exactly one roster row survives, got:\n{out}"
+    );
 }
 
 // =================================================================================================
@@ -455,14 +557,30 @@ async fn the_history_scan_keeps_only_this_sessions_runs() {
 async fn fleet_view_false_publishes_no_widget_at_all() {
     let home = sandbox_home();
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = SubagentExtensionConfig { fleet_view: false, ..SubagentExtensionConfig::default() };
+    let config = SubagentExtensionConfig {
+        fleet_view: false,
+        ..SubagentExtensionConfig::default()
+    };
     let ext = extension_with(dir.path(), home.path(), config);
     let services = std::sync::Arc::new(RecordingWidgetServices::default());
     ext.set_host_services(services.clone());
     let ctx = HostCtx::event(ExtMode::Tui, true, dir.path().to_path_buf());
 
-    ext.on_event(&HostEvent::SessionStart { reason: "test".into(), previous_session_file: None }, &ctx).await;
-    ext.on_event(&HostEvent::AgentEnd { messages: Vec::new() }, &ctx).await;
+    ext.on_event(
+        &HostEvent::SessionStart {
+            reason: "test".into(),
+            previous_session_file: None,
+        },
+        &ctx,
+    )
+    .await;
+    ext.on_event(
+        &HostEvent::AgentEnd {
+            messages: Vec::new(),
+        },
+        &ctx,
+    )
+    .await;
     assert!(
         services.widgets.lock().expect("lock").is_empty(),
         "fleetView:false must publish nothing"
@@ -472,7 +590,9 @@ async fn fleet_view_false_publishes_no_widget_at_all() {
 /// pi `resolveFleetViewPlacement(config.fleetViewPlacement)` — only the exact string moves it up.
 #[test]
 fn fleet_view_placement_is_resolved_from_config() {
-    use cyrup_ext_subagents::tui::fleet_status::{FleetViewPlacement, resolve_fleet_view_placement};
+    use cyrup_ext_subagents::tui::fleet_status::{
+        FleetViewPlacement, resolve_fleet_view_placement,
+    };
     let config = SubagentExtensionConfig {
         fleet_view_placement: Some("aboveEditor".to_string()),
         ..SubagentExtensionConfig::default()
@@ -482,7 +602,11 @@ fn fleet_view_placement_is_resolved_from_config() {
         FleetViewPlacement::AboveEditor
     );
     assert_eq!(
-        resolve_fleet_view_placement(SubagentExtensionConfig::default().fleet_view_placement.as_deref()),
+        resolve_fleet_view_placement(
+            SubagentExtensionConfig::default()
+                .fleet_view_placement
+                .as_deref()
+        ),
         FleetViewPlacement::BelowEditor
     );
 }

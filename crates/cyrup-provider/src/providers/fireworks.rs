@@ -163,7 +163,12 @@ mod tests {
         for m in &models {
             if !m.id.as_str().contains("glm-5p2") {
                 let c = m.compat.as_ref().expect("compat");
-                assert_eq!(c.supports_store, None, "{} took openAICompat", m.id.as_str());
+                assert_eq!(
+                    c.supports_store,
+                    None,
+                    "{} took openAICompat",
+                    m.id.as_str()
+                );
             }
         }
     }

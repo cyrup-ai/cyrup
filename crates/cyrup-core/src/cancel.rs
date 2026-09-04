@@ -17,7 +17,9 @@ pub struct RunCancel {
 
 impl RunCancel {
     pub fn new() -> Self {
-        Self { root: CancelToken::new() }
+        Self {
+            root: CancelToken::new(),
+        }
     }
 
     /// A clone of the root token (cancelled together with the run).

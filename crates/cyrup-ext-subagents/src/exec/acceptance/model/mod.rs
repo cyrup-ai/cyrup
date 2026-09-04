@@ -53,34 +53,36 @@ pub mod verify;
 
 // Every name below kept its pre-split path `crate::exec::acceptance::model::<name>`;
 // these re-exports are what hold that surface across the split.
-pub use aggregate::{
-    aggregate_acceptance_report, AggregateChild,
-};
-pub use checks::{
-    check_criteria_satisfied, run_structural_checks,
-};
-pub use evaluate::{
-    acceptance_failure_message, evaluate_acceptance, EvaluateAcceptanceInput,
-};
+pub use aggregate::{AggregateChild, aggregate_acceptance_report};
+pub use checks::{check_criteria_satisfied, run_structural_checks};
+pub use evaluate::{EvaluateAcceptanceInput, acceptance_failure_message, evaluate_acceptance};
 pub use level::{
-    normalize_acceptance_input, normalize_criteria, resolve_effective_acceptance, unique_evidence, AcceptanceResolveInput, SubagentRunMode,
+    AcceptanceResolveInput, SubagentRunMode, normalize_acceptance_input, normalize_criteria,
+    resolve_effective_acceptance, unique_evidence,
 };
-pub use prompt::{
-    acceptance_requires_child_report, format_acceptance_prompt,
-};
+pub use prompt::{acceptance_requires_child_report, format_acceptance_prompt};
 pub use report::parse::{
-    parse_acceptance_report, parse_acceptance_report_sources, strip_acceptance_report, strip_acceptance_report_from_message_text, ACCEPTANCE_REPORT_NOT_FOUND, ParsedAcceptanceReport,
+    ACCEPTANCE_REPORT_NOT_FOUND, ParsedAcceptanceReport, parse_acceptance_report,
+    parse_acceptance_report_sources, strip_acceptance_report,
+    strip_acceptance_report_from_message_text,
 };
 pub use types::{
-    AcceptanceConfig, AcceptanceEvidenceKind, AcceptanceEvidenceStatus, AcceptanceGate, AcceptanceInput, AcceptanceLedger, AcceptanceLedgerStatus, AcceptanceLevel, AcceptanceReport, AcceptanceReviewGate, AcceptanceReviewResult, AcceptanceRuntimeCheck, AcceptanceVerifyCommand, AcceptanceVerifyResult, CommandRunReport, CommandRunResult, CriterionInput, CriterionReport, CriterionStatus, GateSeverity, ResolvedAcceptanceConfig, ResolvedAcceptanceGate, ReviewFinding, ReviewFindingSeverity, ReviewResultStatus, ReviewSetting, RuntimeCheckStatus, SerializableGate, VerifyRunStatus, VerifyWorkspaceKind, VerifyWorkspaceState,
+    AcceptanceConfig, AcceptanceEvidenceKind, AcceptanceEvidenceStatus, AcceptanceGate,
+    AcceptanceInput, AcceptanceLedger, AcceptanceLedgerStatus, AcceptanceLevel, AcceptanceReport,
+    AcceptanceReviewGate, AcceptanceReviewResult, AcceptanceRole, AcceptanceRuntimeCheck,
+    AcceptanceVerifyCommand, AcceptanceVerifyResult, CommandRunReport, CommandRunResult,
+    CriterionInput, CriterionReport, CriterionStatus, GateSeverity, ResolvedAcceptanceConfig,
+    ResolvedAcceptanceGate, ReviewFinding, ReviewFindingSeverity, ReviewResultStatus,
+    ReviewSetting, RuntimeCheckStatus, SerializableGate, VerifyRunStatus, VerifyWorkspaceKind,
+    VerifyWorkspaceState,
 };
-pub use validate_input::{
-    validate_acceptance_input, EXPLICIT_REVIEWED_UNAVAILABLE,
-};
+pub use validate_input::{EXPLICIT_REVIEWED_UNAVAILABLE, validate_acceptance_input};
 pub use verify::memo::{
-    read_verify_workspace_state, run_memoized_verify_command, run_memoized_verify_command_with_cancel, VerifyMemoContext,
+    VerifyMemoContext, read_verify_workspace_state, run_memoized_verify_command,
+    run_memoized_verify_command_with_cancel,
 };
 pub use verify::redact::redact_verify_env;
 pub use verify::run::{
-    run_verify_command, run_verify_command_with_cancel, DEFAULT_VERIFY_TIMEOUT_MS, VERIFY_TIMED_OUT_HELD_PIPES_MESSAGE, VERIFY_TIMED_OUT_MESSAGE,
+    DEFAULT_VERIFY_TIMEOUT_MS, VERIFY_TIMED_OUT_HELD_PIPES_MESSAGE, VERIFY_TIMED_OUT_MESSAGE,
+    run_verify_command, run_verify_command_with_cancel,
 };

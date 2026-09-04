@@ -2,13 +2,13 @@
 //! Gemma-4 `thinkingLevel` split and the token-budget table (Pi `streamSimple` +
 //! `getGoogleBudget`, google-generative-ai.ts:294-318,408-455).
 
+use super::capabilities::{is_gemini3_flash, is_gemini3_pro, is_gemma4};
+use super::options::GoogleThinking;
 use crate::collection::clamp_thinking_level;
 use crate::model::Model;
 use crate::utils::simple_options::ThinkingBudgets;
 use cyrup_core::{ModelThinkingLevel, ThinkingLevel};
 use serde_json::{Map, Value, json};
-use super::capabilities::{is_gemini3_flash, is_gemini3_pro, is_gemma4};
-use super::options::GoogleThinking;
 
 /// Build `thinkingConfig` (Pi `buildParams` thinking branch + `streamSimple`,
 /// google-generative-ai.ts:373-384,294-318). `None` omits the field entirely.

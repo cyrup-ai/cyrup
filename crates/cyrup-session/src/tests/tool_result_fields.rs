@@ -6,12 +6,17 @@
 //!   * NEW code reading an OLD file (keys absent) re-exports the file byte-identically.
 //!   * OLD code reading a NEW file parses the entry (no `deny_unknown_fields` anywhere on the
 //!     path), so the line never demotes to `Entry::Unknown` — it just drops the two keys.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::io::Write;
 
-use cyrup_core::{Content, Message, Usage};
 use crate::{NewSessionOpts, SessionManager};
+use cyrup_core::{Content, Message, Usage};
 
 fn tool_result(usage: Option<Usage>, added: &[&str]) -> Message {
     Message::ToolResult {
@@ -27,7 +32,12 @@ fn tool_result(usage: Option<Usage>, added: &[&str]) -> Message {
 }
 
 fn usage() -> Usage {
-    Usage { input: 11, output: 22, total_tokens: 33, ..Usage::default() }
+    Usage {
+        input: 11,
+        output: 22,
+        total_tokens: 33,
+        ..Usage::default()
+    }
 }
 
 fn export(m: &SessionManager) -> String {
@@ -46,8 +56,11 @@ fn values(jsonl: &str) -> Vec<serde_json::Value> {
 }
 
 fn import(jsonl: &str) -> SessionManager {
-    let mut f =
-        tempfile::Builder::new().prefix("cyrup-trf-").suffix(".jsonl").tempfile().unwrap();
+    let mut f = tempfile::Builder::new()
+        .prefix("cyrup-trf-")
+        .suffix(".jsonl")
+        .tempfile()
+        .unwrap();
     f.write_all(jsonl.as_bytes()).unwrap();
     f.flush().unwrap();
     SessionManager::import_jsonl(f.path()).unwrap()
@@ -58,7 +71,8 @@ fn import(jsonl: &str) -> SessionManager {
 fn usage_and_added_tool_names_survive_the_session_file_round_trip() {
     let cwd = std::env::temp_dir();
     let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
-    m.append_message(tool_result(Some(usage()), &["late"])).unwrap();
+    m.append_message(tool_result(Some(usage()), &["late"]))
+        .unwrap();
 
     let first = export(&m);
     assert!(first.contains(r#""addedToolNames":["late"]"#), "{first}");
@@ -82,9 +96,17 @@ fn usage_and_added_tool_names_survive_the_session_file_round_trip() {
         .collect();
     assert_eq!(recovered.len(), 1);
     match &recovered[0] {
-        Message::ToolResult { usage: u, added_tool_names, .. } => {
+        Message::ToolResult {
+            usage: u,
+            added_tool_names,
+            ..
+        } => {
             assert_eq!(u.as_ref(), Some(&usage()), "usage recovered from disk");
-            assert_eq!(added_tool_names, &vec!["late".to_string()], "anchor recovered from disk");
+            assert_eq!(
+                added_tool_names,
+                &vec!["late".to_string()],
+                "anchor recovered from disk"
+            );
         }
         other => panic!("expected a tool result, got {other:?}"),
     }
@@ -114,7 +136,11 @@ fn pre_change_session_file_re_exports_unchanged() {
     assert!(!old_file.contains("addedToolNames"));
 
     let reimported = import(&old_file);
-    assert_eq!(export(&reimported), old_file, "old file re-exports byte-identically");
+    assert_eq!(
+        export(&reimported),
+        old_file,
+        "old file re-exports byte-identically"
+    );
 }
 
 /// FORWARD — old code reading a new file. The pre-change reader is modelled by parsing each entry
@@ -125,7 +151,8 @@ fn pre_change_session_file_re_exports_unchanged() {
 fn new_file_read_by_pre_change_shape_stays_a_known_entry() {
     let cwd = std::env::temp_dir();
     let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
-    m.append_message(tool_result(Some(usage()), &["late"])).unwrap();
+    m.append_message(tool_result(Some(usage()), &["late"]))
+        .unwrap();
     let new_file = export(&m);
 
     // What a pre-change writer would have produced from the same session.
@@ -154,7 +181,11 @@ fn new_file_read_by_pre_change_shape_stays_a_known_entry() {
     // Compare as JSON values, not bytes: the downgrade step above rebuilt each line through
     // `serde_json::Value` (a BTreeMap), which alphabetizes keys. The claim under test is that no
     // DATA is lost, not that a hand-rewritten line keeps cyrup's key order.
-    assert_eq!(values(&export(&reimported)), values(&downgraded), "and re-exports losslessly");
+    assert_eq!(
+        values(&export(&reimported)),
+        values(&downgraded),
+        "and re-exports losslessly"
+    );
 
     // The NEW reader recovers defaults, not garbage.
     let tr = reimported
@@ -162,16 +193,18 @@ fn new_file_read_by_pre_change_shape_stays_a_known_entry() {
         .iter()
         .find_map(|e| match e {
             crate::Entry::Known(crate::KnownEntry::Message {
-                message: crate::agent_message::AgentMessage::Core(
-                    c @ Message::ToolResult { .. },
-                ),
+                message: crate::agent_message::AgentMessage::Core(c @ Message::ToolResult { .. }),
                 ..
             }) => Some(c.clone()),
             _ => None,
         })
         .expect("the tool result survived");
     match tr {
-        Message::ToolResult { usage: u, added_tool_names, .. } => {
+        Message::ToolResult {
+            usage: u,
+            added_tool_names,
+            ..
+        } => {
             assert_eq!(u, None);
             assert!(added_tool_names.is_empty());
         }
@@ -184,7 +217,11 @@ fn new_file_read_by_pre_change_shape_stays_a_known_entry() {
 /// A byte-exact replica of the PRE-CHANGE `Message::ToolResult` arm — same serde attributes, minus
 /// the two new fields, and (as in the real type) with no `deny_unknown_fields`.
 #[derive(serde::Deserialize)]
-#[serde(tag = "role", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "role",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 enum OldMessage {
     ToolResult {
         tool_name: String,
@@ -199,7 +236,11 @@ enum OldMessage {
 /// The pre-change `KnownEntry::Message` arm, so the forward-compat claim is tested at the ENTRY
 /// level (where the `Entry::Unknown` demotion decision is actually made), not just the message level.
 #[derive(serde::Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 enum OldKnownEntry {
     Message { id: String, message: OldMessage },
 }
@@ -213,23 +254,37 @@ enum OldKnownEntry {
 fn a_new_code_entry_still_parses_under_the_pre_change_entry_schema() {
     let cwd = std::env::temp_dir();
     let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
-    m.append_message(tool_result(Some(usage()), &["late"])).unwrap();
+    m.append_message(tool_result(Some(usage()), &["late"]))
+        .unwrap();
     let jsonl = export(&m);
 
-    let line = jsonl.lines().find(|l| l.contains("addedToolNames")).unwrap();
+    let line = jsonl
+        .lines()
+        .find(|l| l.contains("addedToolNames"))
+        .unwrap();
     // Sanity: the line really does carry both new keys.
     assert!(line.contains(r#""usage""#), "{line}");
 
-    let old: OldKnownEntry = serde_json::from_str(line)
-        .unwrap_or_else(|e| panic!("the pre-change entry schema rejected a new-code line: {e}\n{line}"));
+    let old: OldKnownEntry = serde_json::from_str(line).unwrap_or_else(|e| {
+        panic!("the pre-change entry schema rejected a new-code line: {e}\n{line}")
+    });
     let OldKnownEntry::Message {
         id,
-        message: OldMessage::ToolResult { tool_name, is_error, details, timestamp },
+        message:
+            OldMessage::ToolResult {
+                tool_name,
+                is_error,
+                details,
+                timestamp,
+            },
     } = old;
     // Every field the old reader DID model still arrives intact — the widening cost it exactly the
     // two keys it never knew about, and nothing else.
     assert!(!id.is_empty(), "the entry id survived");
-    assert_eq!(tool_name, "loader", "the old reader still sees the real payload");
+    assert_eq!(
+        tool_name, "loader",
+        "the old reader still sees the real payload"
+    );
     assert!(!is_error);
     assert_eq!(details, None);
     assert_eq!(timestamp, 7);
@@ -244,7 +299,8 @@ fn a_new_code_entry_still_parses_under_the_pre_change_entry_schema() {
 fn an_unknown_entry_and_a_widened_tool_result_share_a_file_losslessly() {
     let cwd = std::env::temp_dir();
     let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
-    m.append_message(tool_result(Some(usage()), &["late"])).unwrap();
+    m.append_message(tool_result(Some(usage()), &["late"]))
+        .unwrap();
     let base = export(&m);
 
     // Splice in an entry with a `type` no cyrup build knows, carrying a nested object so a
@@ -271,7 +327,10 @@ fn an_unknown_entry_and_a_widened_tool_result_share_a_file_losslessly() {
     );
     // And the entry the reader DOES understand kept both new keys through the same round trip.
     let anchored = out.lines().find(|l| l.contains("addedToolNames")).unwrap();
-    assert!(anchored.contains(r#""addedToolNames":["late"]"#), "{anchored}");
+    assert!(
+        anchored.contains(r#""addedToolNames":["late"]"#),
+        "{anchored}"
+    );
     assert!(anchored.contains(r#""usage""#), "{anchored}");
     assert_eq!(values(&out), values(&spliced), "nothing else moved either");
 }

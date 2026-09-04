@@ -89,20 +89,28 @@ pub(crate) fn region_constraints(state: &mut AppState, width: u16, avail: u16) -
     let want_popup = if state.selector.is_some() || state.loader.is_some() {
         0
     } else {
-        state.editor.autocomplete().map(|ac| ac.list.rendered_height()).unwrap_or(0)
+        state
+            .editor
+            .autocomplete()
+            .map(|ac| ac.list.rendered_height())
+            .unwrap_or(0)
     };
-    let footer_max: u16 = if state.status.has_extension_statuses() { 3 } else { 2 };
+    let footer_max: u16 = if state.status.has_extension_statuses() {
+        3
+    } else {
+        2
+    };
     let want_status = state.indicator.is_active() || state.reserve_status_rows;
     let want_images: u16 =
         if state.selector.is_some() || state.loader.is_some() || state.pending_images.is_empty() {
-        0
-    } else {
-        state
-            .pending_images
-            .iter()
-            .map(|b| state.image_renderer.cell_size(b, width).1)
-            .fold(0u16, |a, h| a.saturating_add(h))
-    };
+            0
+        } else {
+            state
+                .pending_images
+                .iter()
+                .map(|b| state.image_renderer.cell_size(b, width).1)
+                .fold(0u16, |a, h| a.saturating_add(h))
+        };
 
     // L7 — the editor's MINIMUM HEIGHT. Pi docks the two bottom regions with explicit floors
     // (`interactive-mode.ts:876-883`):
@@ -171,21 +179,32 @@ pub(crate) fn region_constraints(state: &mut AppState, width: u16, avail: u16) -
     remaining = remaining.saturating_sub(header);
     // The message region = the active turn's content, plus the startup-hint block at idle, capped
     // to whatever rows remain (so the inline viewport stays content-sized, not full-screen).
-    let active = state.transcript.content_height(width as usize, &state.theme).min(u16::MAX as usize)
-        as u16;
+    let active = state
+        .transcript
+        .content_height(width as usize, &state.theme)
+        .min(u16::MAX as usize) as u16;
     // …at the block's WRAPPED height (`Text.render` wraps at `contentWidth = width - paddingX * 2`,
     // `tui/src/components/text.ts:64-67`), so a narrow terminal reserves the extra rows the block
     // grows into instead of clipping them off.
-    let hint = if state.show_startup_hints
-        && state.selector.is_none()
-        && !state.transcript.has_active()
-    {
-        crate::chrome::compact_hint_height(&state.theme, &state.keymap, width)
-    } else {
-        0
-    };
+    let hint =
+        if state.show_startup_hints && state.selector.is_none() && !state.transcript.has_active() {
+            crate::chrome::compact_hint_height(&state.theme, &state.keymap, width)
+        } else {
+            0
+        };
     let msg = active.max(hint).min(remaining);
-    [header, msg, pending, band, images, widgets_above, slot, popup, widgets_below, footer]
+    [
+        header,
+        msg,
+        pending,
+        band,
+        images,
+        widgets_above,
+        slot,
+        popup,
+        widgets_below,
+        footer,
+    ]
 }
 
 /// The inline-viewport height = the sum of the live-region rows (audit #1). Driven by
@@ -198,6 +217,8 @@ pub(crate) fn live_region_height(state: &mut AppState, width: u16, term_height: 
     if !state.overlays.is_empty() {
         return term_height.max(1);
     }
-    region_constraints(state, width, term_height).iter().copied().fold(0u16, u16::saturating_add)
+    region_constraints(state, width, term_height)
+        .iter()
+        .copied()
+        .fold(0u16, u16::saturating_add)
 }
-

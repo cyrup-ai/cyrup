@@ -96,7 +96,6 @@ impl ProviderConfig {
             .and_then(Value::as_bool)
             .unwrap_or(false)
     }
-
 }
 
 /// One long-context pricing tier for a registered model (Pi `ModelCostTier`, ai/types.ts:750-753).
@@ -232,8 +231,11 @@ impl ProviderRegistration {
     /// model-registry.ts:621-622). A model that resolves no `api` or `baseUrl` is skipped (Pi rejects
     /// such a registration at `validateProviderConfig`; here it is dropped rather than panicking).
     pub fn build_provider(&self) -> std::sync::Arc<dyn cyrup_provider::Provider> {
-        let name =
-            if self.config.name.is_empty() { self.id.clone() } else { self.config.name.clone() };
+        let name = if self.config.name.is_empty() {
+            self.id.clone()
+        } else {
+            self.config.name.clone()
+        };
         cyrup_provider::ConfigProvider::new(
             self.id.clone(),
             name,
@@ -276,7 +278,10 @@ impl ProviderRegistration {
                 .thinking_level_map
                 .as_ref()
                 .and_then(|v| serde_json::from_value(v.clone()).ok());
-            let compat = m.compat.as_ref().and_then(|v| serde_json::from_value(v.clone()).ok());
+            let compat = m
+                .compat
+                .as_ref()
+                .and_then(|v| serde_json::from_value(v.clone()).ok());
             let headers = Self::merge_headers(&self.config.headers, &m.headers);
 
             out.push(Model {
@@ -441,7 +446,11 @@ impl ProviderHub {
             config.name = id.clone();
         }
         let resolved_api_key = resolve_api_key(config.api_key.as_deref())?;
-        let reg = ProviderRegistration { id: id.clone(), config, resolved_api_key };
+        let reg = ProviderRegistration {
+            id: id.clone(),
+            config,
+            resolved_api_key,
+        };
 
         // Replace an existing registration with the same id (Pi "replaces all models").
         self.registrations.retain(|r| r.id != id);

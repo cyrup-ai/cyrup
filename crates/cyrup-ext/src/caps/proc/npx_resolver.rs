@@ -125,7 +125,9 @@ pub(super) fn resolve_npx_binary(command: &str, args: &[String]) -> Option<NpxRe
     if let Some(cached) = load_cache().and_then(|c| c.entries.get(&cache_key).cloned())
         && cache_entry_is_usable(
             &cached,
-            package_spec.as_ref().and_then(|spec| spec.exact_version.as_deref()),
+            package_spec
+                .as_ref()
+                .and_then(|spec| spec.exact_version.as_deref()),
             now_ms(),
         )
     {
@@ -223,13 +225,21 @@ fn parse_npx_args(args: &[String]) -> Option<ParsedInvocation> {
         let package_spec = package_spec?;
         let mut extra_args = positionals.get(1..).unwrap_or(&[]).to_vec();
         extra_args.extend(after.iter().cloned());
-        return Some(ParsedInvocation { package_spec, bin_name: Some(bin_name), extra_args });
+        return Some(ParsedInvocation {
+            package_spec,
+            bin_name: Some(bin_name),
+            extra_args,
+        });
     }
 
     let package_positional = positionals.first()?.clone();
     let mut extra_args = positionals.get(1..).unwrap_or(&[]).to_vec();
     extra_args.extend(after.iter().cloned());
-    Some(ParsedInvocation { package_spec: package_positional, bin_name: None, extra_args })
+    Some(ParsedInvocation {
+        package_spec: package_positional,
+        bin_name: None,
+        extra_args,
+    })
 }
 
 /// `npx-resolver.ts:123-158` `parseNpmExecArgs`.
@@ -282,7 +292,11 @@ fn parse_npm_exec_args(args: &[String]) -> Option<ParsedInvocation> {
     let bin_name = after.first()?.clone();
     let package_spec = package_spec?;
     let extra_args = after.get(1..).unwrap_or(&[]).to_vec();
-    Some(ParsedInvocation { package_spec, bin_name: Some(bin_name), extra_args })
+    Some(ParsedInvocation {
+        package_spec,
+        bin_name: Some(bin_name),
+        extra_args,
+    })
 }
 
 /// `npx-resolver.ts:160-227` `resolveFromNpmCache`. Thin wrapper over
@@ -353,9 +367,12 @@ fn resolve_from_npm_cache_at(
     let bin_rel = bin_rel?;
 
     let node_modules_dir = find_node_modules_dir(&package_dir);
-    let bin_link = chosen_bin_name.as_ref().map(|n| node_modules_dir.join(".bin").join(n));
-    let mut resolved_bin =
-        bin_link.filter(|p| p.exists()).and_then(|p| fs::canonicalize(&p).ok());
+    let bin_link = chosen_bin_name
+        .as_ref()
+        .map(|n| node_modules_dir.join(".bin").join(n));
+    let mut resolved_bin = bin_link
+        .filter(|p| p.exists())
+        .and_then(|p| fs::canonicalize(&p).ok());
     if resolved_bin.is_none() {
         let candidate = package_dir.join(&bin_rel);
         if !candidate.exists() {
@@ -394,7 +411,16 @@ enum BinField {
 /// [`resolve_npx_binary`] returns `None`, falling back to running `npx`/`npm` unresolved.
 fn force_npx_cache(package_spec: &str) {
     let spawned = Command::new("npm")
-        .args(["exec", "--yes", "--package", package_spec, "--", "node", "-e", "1"])
+        .args([
+            "exec",
+            "--yes",
+            "--package",
+            package_spec,
+            "--",
+            "node",
+            "-e",
+            "1",
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -440,7 +466,10 @@ fn build_bin_candidates(package_name: &str, explicit_bin: Option<&str>) -> Vec<S
     }
 
     let mut seen = std::collections::HashSet::new();
-    candidates.into_iter().filter(|c| !c.is_empty() && seen.insert(c.clone())).collect()
+    candidates
+        .into_iter()
+        .filter(|c| !c.is_empty() && seen.insert(c.clone()))
+        .collect()
 }
 
 /// `npx-resolver.ts:60-66` — the cache-hit predicate, as a pure function so it can be asserted
@@ -573,8 +602,11 @@ fn find_cached_package_dir(
         return None;
     }
 
-    let package_path_parts: Vec<&str> =
-        if package_name.starts_with('@') { package_name.split('/').collect() } else { vec![package_name] };
+    let package_path_parts: Vec<&str> = if package_name.starts_with('@') {
+        package_name.split('/').collect()
+    } else {
+        vec![package_name]
+    };
 
     let mut candidates: Vec<(PathBuf, SystemTime)> = fs::read_dir(&npx_dir)
         .ok()?
@@ -582,7 +614,10 @@ fn find_cached_package_dir(
         .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
         .map(|e| {
             let full = e.path();
-            let mtime = full.metadata().and_then(|m| m.modified()).unwrap_or(UNIX_EPOCH);
+            let mtime = full
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(UNIX_EPOCH);
             (full, mtime)
         })
         .collect();
@@ -636,9 +671,13 @@ fn detect_js_binary(bin_path: &Path) -> bool {
             return true;
         }
     }
-    let Ok(mut file) = fs::File::open(bin_path) else { return false };
+    let Ok(mut file) = fs::File::open(bin_path) else {
+        return false;
+    };
     let mut buf = [0u8; 256];
-    let Ok(n) = file.read(&mut buf) else { return false };
+    let Ok(n) = file.read(&mut buf) else {
+        return false;
+    };
     let text = String::from_utf8_lossy(buf.get(..n).unwrap_or(&[]));
     let first_line = text.split('\n').next().unwrap_or("");
     first_line.starts_with("#!") && first_line.contains("node")
@@ -656,12 +695,19 @@ fn get_npm_cache_dir() -> Option<PathBuf> {
             {
                 return Some(PathBuf::from(configured));
             }
-            let output = Command::new("npm").args(["config", "get", "cache"]).output().ok()?;
+            let output = Command::new("npm")
+                .args(["config", "get", "cache"])
+                .output()
+                .ok()?;
             if !output.status.success() {
                 return None;
             }
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if path.is_empty() { None } else { Some(PathBuf::from(path)) }
+            if path.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(path))
+            }
         })
         .clone()
 }
@@ -731,18 +777,24 @@ fn save_cache_entry_at(path: &Path, key: &str, entry: &NpxCacheEntry) {
     // A poisoned lock (only reachable if a prior holder panicked mid-cycle, which nothing in this
     // body does) degrades to skipping this save — the SAME graceful "just don't persist" fallback
     // already used for every I/O failure below, never a panic of our own.
-    let Ok(_guard) = SAVE_CACHE_LOCK.lock() else { return };
+    let Ok(_guard) = SAVE_CACHE_LOCK.lock() else {
+        return;
+    };
 
     let Some(dir) = path.parent() else { return };
     if fs::create_dir_all(dir).is_err() {
         return;
     }
 
-    let mut merged =
-        load_cache_at(path).unwrap_or_else(|| NpxCache { version: CACHE_VERSION, entries: HashMap::new() });
+    let mut merged = load_cache_at(path).unwrap_or_else(|| NpxCache {
+        version: CACHE_VERSION,
+        entries: HashMap::new(),
+    });
     merged.entries.insert(key.to_string(), entry.clone());
 
-    let Ok(serialized) = serde_json::to_string_pretty(&merged) else { return };
+    let Ok(serialized) = serde_json::to_string_pretty(&merged) else {
+        return;
+    };
     let tmp_path = PathBuf::from(format!("{}.{}.tmp", path.display(), std::process::id()));
     if fs::write(&tmp_path, serialized).is_err() {
         return;
@@ -785,8 +837,8 @@ mod tests {
 
     #[test]
     fn parse_npx_args_with_extra_args_and_separator() {
-        let parsed =
-            parse_npx_args(&args(&["-y", "@foo/bar", "serve", "--", "--port", "3000"])).expect("parses");
+        let parsed = parse_npx_args(&args(&["-y", "@foo/bar", "serve", "--", "--port", "3000"]))
+            .expect("parses");
         assert_eq!(parsed.package_spec, "@foo/bar");
         assert_eq!(parsed.extra_args, vec!["serve", "--port", "3000"]);
     }
@@ -830,8 +882,15 @@ mod tests {
 
     #[test]
     fn parse_npm_exec_args_ok() {
-        let parsed =
-            parse_npm_exec_args(&args(&["exec", "--package", "@foo/bar", "--", "mybin", "x"])).expect("parses");
+        let parsed = parse_npm_exec_args(&args(&[
+            "exec",
+            "--package",
+            "@foo/bar",
+            "--",
+            "mybin",
+            "x",
+        ]))
+        .expect("parses");
         assert_eq!(parsed.package_spec, "@foo/bar");
         assert_eq!(parsed.bin_name.as_deref(), Some("mybin"));
         assert_eq!(parsed.extra_args, vec!["x"]);
@@ -895,7 +954,11 @@ mod tests {
             ("pkg@=v1.2.3", Some("pkg"), Some("1.2.3")),
             ("pkg@1.2.3-beta.1", Some("pkg"), Some("1.2.3-beta.1")),
             ("pkg@1.2.3+build.5", Some("pkg"), Some("1.2.3+build.5")),
-            ("pkg@1.2.3-rc.1+build.5", Some("pkg"), Some("1.2.3-rc.1+build.5")),
+            (
+                "pkg@1.2.3-rc.1+build.5",
+                Some("pkg"),
+                Some("1.2.3-rc.1+build.5"),
+            ),
             ("pkg@1.2", Some("pkg"), None),
             ("pkg@latest", Some("pkg"), None),
             ("pkg@", Some("pkg"), None),
@@ -981,11 +1044,18 @@ mod tests {
         // A different pin rejects. THIS is the arm that did not exist before MCP-105.
         assert!(!cache_entry_is_usable(&entry, Some("1.0.0"), 1_000));
         // An entry with no recorded version can never satisfy a pin.
-        let unversioned = NpxCacheEntry { package_version: None, ..entry.clone() };
+        let unversioned = NpxCacheEntry {
+            package_version: None,
+            ..entry.clone()
+        };
         assert!(cache_entry_is_usable(&unversioned, None, 1_000));
         assert!(!cache_entry_is_usable(&unversioned, Some("1.0.0"), 1_000));
         // And the TTL still governs, pin or no pin.
-        assert!(!cache_entry_is_usable(&entry, Some("2.0.0"), 1_000 + CACHE_TTL_MS));
+        assert!(!cache_entry_is_usable(
+            &entry,
+            Some("2.0.0"),
+            1_000 + CACHE_TTL_MS
+        ));
     }
 
     #[test]
@@ -1038,8 +1108,11 @@ mod tests {
             r#"{"name":"cowsay","version":"1.0.0","bin":{"cowsay":"cli.js"}}"#,
         )
         .expect("write package.json");
-        fs::write(pkg_dir.join("cli.js"), "#!/usr/bin/env node\nconsole.log('moo');\n")
-            .expect("write cli.js");
+        fs::write(
+            pkg_dir.join("cli.js"),
+            "#!/usr/bin/env node\nconsole.log('moo');\n",
+        )
+        .expect("write cli.js");
         let bin_dir = hash_dir.join("node_modules").join(".bin");
         fs::create_dir_all(&bin_dir).expect("mkdir .bin");
         #[cfg(unix)]
@@ -1068,11 +1141,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_exact_version_pins_past_a_newer_wrong_one() {
-        let root = std::env::temp_dir().join(format!(
-            "cyrup-npx-pin-{}-{}",
-            std::process::id(),
-            now_ms()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("cyrup-npx-pin-{}-{}", std::process::id(), now_ms()));
 
         let install = |hash: &str, version: &str| {
             let hash_dir = root.join("_npx").join(hash);
@@ -1123,8 +1193,11 @@ mod tests {
 
     #[test]
     fn detect_js_binary_by_extension() {
-        let tmp = std::env::temp_dir()
-            .join(format!("cyrup-npx-detect-{}-{}.mjs", std::process::id(), now_ms()));
+        let tmp = std::env::temp_dir().join(format!(
+            "cyrup-npx-detect-{}-{}.mjs",
+            std::process::id(),
+            now_ms()
+        ));
         fs::write(&tmp, "export {}\n").expect("write");
         assert!(detect_js_binary(&tmp));
         let _ = fs::remove_file(&tmp);
@@ -1132,8 +1205,11 @@ mod tests {
 
     #[test]
     fn detect_js_binary_by_shebang() {
-        let tmp = std::env::temp_dir()
-            .join(format!("cyrup-npx-detect-shebang-{}-{}", std::process::id(), now_ms()));
+        let tmp = std::env::temp_dir().join(format!(
+            "cyrup-npx-detect-shebang-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
         fs::write(&tmp, "#!/usr/bin/env node\nconsole.log(1)\n").expect("write");
         assert!(detect_js_binary(&tmp));
         let _ = fs::remove_file(&tmp);
@@ -1141,8 +1217,11 @@ mod tests {
 
     #[test]
     fn detect_js_binary_non_js_shebang_is_false() {
-        let tmp = std::env::temp_dir()
-            .join(format!("cyrup-npx-detect-sh-{}-{}", std::process::id(), now_ms()));
+        let tmp = std::env::temp_dir().join(format!(
+            "cyrup-npx-detect-sh-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
         fs::write(&tmp, "#!/bin/sh\necho hi\n").expect("write");
         assert!(!detect_js_binary(&tmp));
         let _ = fs::remove_file(&tmp);
@@ -1197,7 +1276,10 @@ mod tests {
             cache.entries.keys().collect::<Vec<_>>()
         );
         for i in 0..N {
-            assert!(cache.entries.contains_key(&format!("key-{i}")), "missing key-{i}");
+            assert!(
+                cache.entries.contains_key(&format!("key-{i}")),
+                "missing key-{i}"
+            );
         }
 
         let _ = fs::remove_file(&tmp);

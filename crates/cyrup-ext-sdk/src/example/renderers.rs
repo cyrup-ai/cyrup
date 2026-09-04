@@ -38,7 +38,9 @@ impl MessageRenderer for DemoToolRenderer {
         ]))
     }
     fn render_result(&self, result: &Value, _ctx: &crate::Ctx) -> Option<Value> {
-        Some(crate::widget::text(format!("guest-rendered echo result: {result}")))
+        Some(crate::widget::text(format!(
+            "guest-rendered echo result: {result}"
+        )))
     }
 }
 
@@ -48,7 +50,9 @@ impl MessageRenderer for DemoToolRenderer {
 struct DemoEntryRenderer;
 impl MessageRenderer for DemoEntryRenderer {
     fn render_call(&self, entry: &Value, _ctx: &crate::Ctx) -> Option<Value> {
-        Some(crate::widget::text(format!("guest-rendered entry card: {entry}")))
+        Some(crate::widget::text(format!(
+            "guest-rendered entry card: {entry}"
+        )))
     }
 }
 

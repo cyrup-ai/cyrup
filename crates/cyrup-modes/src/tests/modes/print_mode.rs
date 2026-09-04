@@ -5,11 +5,11 @@
 use std::sync::Arc;
 
 use super::support::{build_runtime, fixture};
-use crate::{run_print, PrintOptions};
+use crate::{PrintOptions, run_print};
 use cyrup_core::StopReason;
 use cyrup_provider::faux::{
-    faux_assistant_message, faux_assistant_message_with, faux_text, FauxMessageOptions,
-    FauxProvider,
+    FauxMessageOptions, FauxProvider, faux_assistant_message, faux_assistant_message_with,
+    faux_text,
 };
 use cyrup_session_svc::{InputSource, UserInput};
 
@@ -36,8 +36,14 @@ async fn print_mode_emits_final_assistant_text() {
     .expect("print mode runs");
 
     let text = String::from_utf8(out).unwrap();
-    assert!(text.contains("the final answer"), "final assistant text missing:\n{text}");
-    assert!(String::from_utf8(err).unwrap().is_empty(), "a clean turn writes nothing to stderr");
+    assert!(
+        text.contains("the final answer"),
+        "final assistant text missing:\n{text}"
+    );
+    assert!(
+        String::from_utf8(err).unwrap().is_empty(),
+        "a clean turn writes nothing to stderr"
+    );
 }
 
 /// G3 — PRINT mode prints ONLY the final assistant message of a multi-message turn, exactly once,
@@ -71,9 +77,18 @@ async fn print_mode_prints_only_the_final_message_of_a_turn() {
     .expect("print mode runs");
 
     let text = String::from_utf8(out).unwrap();
-    assert_eq!(text, "second answer\n", "only the FINAL message prints, exactly once (G3): {text:?}");
-    assert!(!text.contains("first answer"), "an intermediate message must NOT print (G3): {text:?}");
-    assert!(String::from_utf8(err).unwrap().is_empty(), "a clean turn writes nothing to stderr");
+    assert_eq!(
+        text, "second answer\n",
+        "only the FINAL message prints, exactly once (G3): {text:?}"
+    );
+    assert!(
+        !text.contains("first answer"),
+        "an intermediate message must NOT print (G3): {text:?}"
+    );
+    assert!(
+        String::from_utf8(err).unwrap().is_empty(),
+        "a clean turn writes nothing to stderr"
+    );
 }
 
 /// G4 — a failed final turn: Pi writes `errorMessage` to stderr and suppresses the assistant stdout
@@ -107,8 +122,14 @@ async fn print_mode_routes_a_failed_turn_to_stderr_and_suppresses_stdout() {
 
     let stdout = String::from_utf8(out).unwrap();
     let stderr = String::from_utf8(err).unwrap();
-    assert!(stdout.is_empty(), "a failed turn suppresses assistant stdout (G4): {stdout:?}");
-    assert_eq!(stderr, "the model exploded\n", "the error message goes to stderr (G4): {stderr:?}");
+    assert!(
+        stdout.is_empty(),
+        "a failed turn suppresses assistant stdout (G4): {stdout:?}"
+    );
+    assert_eq!(
+        stderr, "the model exploded\n",
+        "the error message goes to stderr (G4): {stderr:?}"
+    );
 }
 
 /// SEAM-016 — `run_print` returns pi's `exitCode`, decided inside the terminal output block from
@@ -172,7 +193,10 @@ async fn print_mode_aborted_turn_without_message_uses_the_request_reason_fallbac
     .await
     .expect("print mode runs");
 
-    assert!(String::from_utf8(out).unwrap().is_empty(), "aborted turn suppresses stdout (G4)");
+    assert!(
+        String::from_utf8(out).unwrap().is_empty(),
+        "aborted turn suppresses stdout (G4)"
+    );
     assert_eq!(
         String::from_utf8(err).unwrap(),
         "Request aborted\n",

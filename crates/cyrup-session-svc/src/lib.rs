@@ -27,8 +27,8 @@ mod event;
 pub mod export;
 mod factory;
 mod guest_providers;
-mod host_services;
 mod hooks;
+mod host_services;
 mod provider_swap;
 mod runtime;
 mod services;
@@ -45,24 +45,31 @@ pub use attribution::merge_provider_attribution_headers;
 // output (the interactive TUI does) has to name it to build the sink.
 pub use bash::{BashChunkSink, BashOptions, BashResult};
 pub use builder::{
-    extension_discovery_roots, ExtensionFlagValue, NoTools, SessionBuilder, SessionConfig,
-    SessionTarget, TrustPromptFn,
+    ExtensionFlagValue, NoTools, SessionBuilder, SessionConfig, SessionTarget, TrustPromptFn,
+    extension_discovery_roots,
 };
 pub use command::{SessionCommand, SessionCommandOutput};
-pub use error::SessionServiceError;
-pub use export::session_jsonl_to_html;
-pub use event::{
-    AgentSessionEvent, DeliverAs, InputSource, PromptAccepted, PromptOptions, StreamingBehavior,
-    SummarizationRetrySource, UserInput,
-};
+/// The message carried on [`AgentSessionEvent::MessageStart`] / [`AgentSessionEvent::MessageUpdate`]
+/// / [`AgentSessionEvent::MessageEnd`]. Re-exported for the same reason as [`StreamEvent`]: it is
+/// already part of this crate's public surface, and a consumer that needs to distinguish the
+/// assistant arm — `cyrup-modes`' wire projection reads `message.usage` off `message_update`, as pi
+/// `toJsonEvent` does (`modes/json-event.ts:58` @v0.84.4) — could otherwise not match on it without
+/// a direct `cyrup-agent` dependency.
+pub use cyrup_agent::AgentMessage;
+pub use cyrup_ext::NotifyKind;
 /// The streaming delta carried on [`AgentSessionEvent::MessageUpdate`]. Re-exported because it is
 /// already part of this crate's public surface (the variant's `assistant_message_event` payload) —
 /// without it a consumer cannot match on the seam's own event without taking a direct
 /// `cyrup-provider` dependency. `cyrup-modes`' wire projection is the first such consumer.
 pub use cyrup_provider::StreamEvent;
+pub use error::SessionServiceError;
+pub use event::{
+    AgentSessionEvent, DeliverAs, InputSource, PromptAccepted, PromptOptions, StreamingBehavior,
+    SummarizationRetrySource, UserInput,
+};
+pub use export::session_jsonl_to_html;
 pub use factory::SessionFactory;
 pub use guest_providers::GuestProviderRegistry;
-pub use cyrup_ext::NotifyKind;
 pub use host_services::{
     ControlSink, EditorTextMirror, InjectMessage, InjectSink, LiveHostServices, OverlayRequest,
     OverlaySink, ThemeAccess, UiEffect, UiEffectSink, UiKind, UiReply, UiRequest, UiSink,
@@ -79,8 +86,7 @@ pub use session::{
     ScopedModel, SessionDagKind, SessionDagNode, delete_session_file_at, rename_session_file_at,
 };
 pub use state::{
-    CompactionResult, ContextUsage, SessionStateView, SessionStats, StatsContextUsage,
-    StatsTokens,
+    CompactionResult, ContextUsage, SessionStateView, SessionStats, StatsContextUsage, StatsTokens,
 };
 pub use tools::ToolInfo;
 // The compaction `reason` carried by `AgentSessionEvent::Compaction{Start,End}` (so a front-end can
@@ -88,8 +94,17 @@ pub use tools::ToolInfo;
 pub use cyrup_session::compaction::CompactionReason;
 
 // Load-bearing re-exports so embedders need not depend on every subsystem directly.
-pub use cyrup_core::EventStream;
+/// Re-exported so front-ends (`cyrup-modes` RPC `set_steering_mode`/`set_follow_up_mode`) can name
+/// the queue-drain mode [`AgentSession::set_steering_mode`] takes without a direct `cyrup-agent` dep.
+pub use cyrup_agent::QueueMode;
+/// Re-exported so an embedder can name the custom-transport seam types
+/// ([`SessionBuilder::stream_fn`]/[`SessionBuilder::key_resolver`], Pi `AgentOptions.streamFn`) and
+/// the built-in proxy transport ([`ProxyStreamFn`]) without a direct `cyrup-agent` dependency.
+pub use cyrup_agent::{ApiKeyResolver, ProxyStreamFn, ProxyStreamOptions, StreamFn};
 pub use cyrup_config::AppMode;
+/// Re-exported because it is the argument type of [`SessionBuilder::cli_settings`] — an embedder (or
+/// a front-end test) cannot name that seam's input without a direct `cyrup-config` dependency.
+pub use cyrup_config::Settings;
 /// Re-exported so the TUI `/settings` selector can name the write scope for [`AgentSession::persist_setting`]
 /// without a direct `cyrup-config` dependency (the additive L6↔L5 settings-write seam).
 pub use cyrup_config::SettingsScope;
@@ -99,12 +114,14 @@ pub use cyrup_config::trust::{TrustDecision, TrustEntry, TrustOption};
 /// Re-exported so the TUI `/settings` selector can read the merged config + the default-trust enum
 /// for its grid rows without a direct `cyrup-config` dependency.
 pub use cyrup_config::{DefaultProjectTrust, EffectiveSettings, EnvVars};
-/// Re-exported because it is the argument type of [`SessionBuilder::cli_settings`] — an embedder (or
-/// a front-end test) cannot name that seam's input without a direct `cyrup-config` dependency.
-pub use cyrup_config::Settings;
-/// Re-exported so the TUI `/resume` selector can name the session-list rows
-/// [`AgentSession::list_sessions`] returns without a direct `cyrup-session` dependency.
-pub use cyrup_session::listing::SessionInfo;
+pub use cyrup_core::EventStream;
+/// Re-exported so front-ends can name the thinking level [`AgentSession::set_thinking_level`] takes
+/// and the entry id the RPC `fork` targets without a direct `cyrup-core` dependency.
+pub use cyrup_core::{Content, EntryId, ModelThinkingLevel};
+/// Re-exported so an embedder can name the synthetic-resource override closures' element types
+/// ([`SessionBuilder::skills_override`]/[`SessionBuilder::context_files_override`]) without a direct
+/// `cyrup-resources`/`cyrup-session` dependency.
+pub use cyrup_resources::SkillPointer;
 /// Re-exported so a front-end can walk the ROLE-tagged context
 /// [`AgentSession::raw_context_messages`] returns — Pi's `AgentMessage` union
 /// (`messages.ts:26-77`), whose `bashExecution`/`custom`/`branchSummary`/`compactionSummary` arms
@@ -112,33 +129,22 @@ pub use cyrup_session::listing::SessionInfo;
 /// what lets the TUI replay a resumed session into its per-role components instead of the
 /// LLM-flattened `user` text (interactive-mode.ts:3506-3516).
 pub use cyrup_session::agent_message;
-/// Re-exported so the CLI bin can resolve `--session`/`--fork` partial-UUID + global-cross-project
-/// references (Pi `resolveSessionPath`, main.ts:163-189) without a direct `cyrup-session` dependency:
-/// [`list_in_dir`] lists a cwd's sessions and [`list_all`] scans every project under the root.
-pub use cyrup_session::layout::{encode_cwd, SessionLayout, SessionsRoot};
-/// SESS-013: the ONE `findGitPaths` (pi `footer-data-provider.ts:16-48`, imported by both
-/// consumers at `resource-loader.ts:19`). Re-exported so `cyrup-tui`'s footer reads the shared
-/// definition instead of carrying a second copy of the same walk.
-pub use cyrup_session::git_paths::{find_git_paths, GitPaths};
-pub use cyrup_session::listing::{list_all, list_in_dir};
 /// Re-exported so the bin's signal handlers and the TUI's wedge-escalation path can drain the
 /// session fsync queue before a hard `process::exit` without a direct `cyrup-session`
 /// dependency (PERF-004 §3.5). A courtesy, not a correctness requirement: the bytes are
 /// already in the page cache, so only power-loss durability is outstanding.
 pub use cyrup_session::flush_session_writes;
-pub use cyrup_tools::{Availability, PermissionPolicy};
-/// Re-exported so front-ends (`cyrup-modes` RPC `set_steering_mode`/`set_follow_up_mode`) can name
-/// the queue-drain mode [`AgentSession::set_steering_mode`] takes without a direct `cyrup-agent` dep.
-pub use cyrup_agent::QueueMode;
-/// Re-exported so an embedder can name the custom-transport seam types
-/// ([`SessionBuilder::stream_fn`]/[`SessionBuilder::key_resolver`], Pi `AgentOptions.streamFn`) and
-/// the built-in proxy transport ([`ProxyStreamFn`]) without a direct `cyrup-agent` dependency.
-pub use cyrup_agent::{ApiKeyResolver, ProxyStreamFn, ProxyStreamOptions, StreamFn};
-/// Re-exported so an embedder can name the synthetic-resource override closures' element types
-/// ([`SessionBuilder::skills_override`]/[`SessionBuilder::context_files_override`]) without a direct
-/// `cyrup-resources`/`cyrup-session` dependency.
-pub use cyrup_resources::SkillPointer;
+/// SESS-013: the ONE `findGitPaths` (pi `footer-data-provider.ts:16-48`, imported by both
+/// consumers at `resource-loader.ts:19`). Re-exported so `cyrup-tui`'s footer reads the shared
+/// definition instead of carrying a second copy of the same walk.
+pub use cyrup_session::git_paths::{GitPaths, find_git_paths};
+/// Re-exported so the CLI bin can resolve `--session`/`--fork` partial-UUID + global-cross-project
+/// references (Pi `resolveSessionPath`, main.ts:163-189) without a direct `cyrup-session` dependency:
+/// [`list_in_dir`] lists a cwd's sessions and [`list_all`] scans every project under the root.
+pub use cyrup_session::layout::{SessionLayout, SessionsRoot, encode_cwd};
+/// Re-exported so the TUI `/resume` selector can name the session-list rows
+/// [`AgentSession::list_sessions`] returns without a direct `cyrup-session` dependency.
+pub use cyrup_session::listing::SessionInfo;
+pub use cyrup_session::listing::{list_all, list_in_dir};
 pub use cyrup_session::prompt::{ContextFile, ContextScope};
-/// Re-exported so front-ends can name the thinking level [`AgentSession::set_thinking_level`] takes
-/// and the entry id the RPC `fork` targets without a direct `cyrup-core` dependency.
-pub use cyrup_core::{Content, EntryId, ModelThinkingLevel};
+pub use cyrup_tools::{Availability, PermissionPolicy};

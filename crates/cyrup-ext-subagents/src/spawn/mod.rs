@@ -21,15 +21,15 @@
 //! (R-SA-049/050/051/066/069); [`chain_graph`] and [`worktree`] are siblings built on top of
 //! those same primitives.
 
+pub mod chain_graph;
 pub mod depth;
+pub mod dynamic_fanout;
+pub mod intercom_target;
+pub mod nested_events;
+pub mod nested_path;
 pub mod parallel;
 pub mod signal;
 pub mod worktree;
-pub mod nested_path;
-pub mod nested_events;
-pub mod chain_graph;
-pub mod intercom_target;
-pub mod dynamic_fanout;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -55,6 +55,81 @@ use crate::jsonl::BoundedJsonlWriter;
 /// as an `@<tempfile>` argv reference instead of a literal argument, to stay well clear of OS
 /// argv-length limits (R-SA-047; func-SA target: 8000 characters).
 pub const TASK_ARGV_INLINE_THRESHOLD: usize = 8000;
+
+/// pi `SUBAGENT_TASK_DELIVERY_ENV = "PI_SUBAGENT_TASK_DELIVERY"` (`runs/shared/pi-args.ts:83`
+/// @v0.64.0, added at v0.48.0) in this crate's `CYRUP_` naming family — the operator's override
+/// for HOW the task text reaches the child. Upstream's rationale (`pi-args.ts:76-82`): endpoint
+/// protection (EDR) pre-execution command-line scanning may deny exec of a child whose argv embeds
+/// a long natural-language task, which surfaces as an immediate zero-activity SIGKILL; file
+/// delivery keeps the task out of argv entirely.
+pub const TASK_DELIVERY_ENV: &str = "CYRUP_SUBAGENT_TASK_DELIVERY";
+
+/// The upstream spelling of [`TASK_DELIVERY_ENV`], honoured as a read-side compatibility alias
+/// (the same convention `exec/spawn_budget.rs` and `exec/capability_ceiling.rs` document).
+pub const TASK_DELIVERY_ENV_PI_ALIAS: &str = "PI_SUBAGENT_TASK_DELIVERY";
+
+/// pi `SubagentTaskDelivery = "auto" | "file"` (`pi-args.ts:85`): the two delivery modes the env
+/// override can select. Any value other than (case-insensitive, trimmed) `file` is `Auto`, as
+/// upstream's `resolveSubagentTaskDelivery` (`:87-93`) — there is no third mode and no error path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TaskDelivery {
+    /// Literal argv when short enough, a `0600` spill file otherwise (the pre-existing rule).
+    #[default]
+    Auto,
+    /// Always the spill file, regardless of length.
+    File,
+}
+
+/// pi `resolveSubagentTaskDelivery(env)` (`pi-args.ts:87-93`): `env[...]?.trim().toLowerCase()
+/// === "file" ? "file" : "auto"`, over an injected lookup so the decision is testable without
+/// touching process env. [`TASK_DELIVERY_ENV`] wins; [`TASK_DELIVERY_ENV_PI_ALIAS`] is consulted
+/// only when the `CYRUP_` spelling is unset.
+#[must_use]
+pub fn resolve_task_delivery(get: &dyn Fn(&str) -> Option<String>) -> TaskDelivery {
+    let raw = get(TASK_DELIVERY_ENV).or_else(|| get(TASK_DELIVERY_ENV_PI_ALIAS));
+    match raw {
+        Some(value) if value.trim().eq_ignore_ascii_case("file") => TaskDelivery::File,
+        _ => TaskDelivery::Auto,
+    }
+}
+
+/// The host-platform input to [`should_deliver_task_via_file`] — pi's `platform: NodeJS.Platform`
+/// argument narrowed to the one distinction the rule draws (`platform === "darwin"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskDeliveryHost {
+    /// macOS: every task is file-delivered (pi `c68611d9` @v0.63.0, "keep macOS subagent tasks
+    /// out of argv").
+    MacOs,
+    /// Any other platform: only the length rule applies.
+    Other,
+}
+
+impl TaskDeliveryHost {
+    /// The platform this binary was compiled for.
+    #[must_use]
+    pub const fn current() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::MacOs
+        } else {
+            Self::Other
+        }
+    }
+}
+
+/// pi `shouldDeliverTaskViaFile(task, delivery, platform)` (`pi-args.ts:95-102` @v0.64.0):
+/// `delivery === "file" || platform === "darwin" || task.length > TASK_ARG_LIMIT`. The length
+/// leg is this crate's pre-existing [`TASK_ARGV_INLINE_THRESHOLD`] rule (counted in `char`s, as
+/// it always was here, where pi counts UTF-16 units).
+#[must_use]
+pub fn should_deliver_task_via_file(
+    task: &str,
+    delivery: TaskDelivery,
+    host: TaskDeliveryHost,
+) -> bool {
+    delivery == TaskDelivery::File
+        || host == TaskDeliveryHost::MacOs
+        || task.chars().count() > TASK_ARGV_INLINE_THRESHOLD
+}
 
 /// Bounded wait for a child that has emitted a final message but neither exits nor releases
 /// stdio promptly afterward (R-SA-068) — long enough to absorb ordinary process-teardown latency
@@ -213,8 +288,14 @@ pub struct ChildSpawnSpec {
 impl ChildSpawnSpec {
     /// Resolves `task` into its final argv form per R-SA-047: a literal argument when short
     /// enough, or an `@<tempfile>` reference (writing `task` to a freshly created temp file
-    /// registered in `temp_files`) when `task.chars().count()` exceeds
-    /// [`TASK_ARGV_INLINE_THRESHOLD`].
+    /// registered in `temp_files`) when [`should_deliver_task_via_file`] says so — the task
+    /// exceeds [`TASK_ARGV_INLINE_THRESHOLD`], the host is macOS, or the operator set
+    /// [`TASK_DELIVERY_ENV`] to `file`.
+    ///
+    /// This is the imperative shell: it reads the delivery override from the process environment
+    /// and the host from the build target, then delegates to [`Self::resolve_task_arg_with`], which
+    /// takes both as explicit inputs (pi `pi-args.ts:822`: `input.taskDelivery ??
+    /// resolveSubagentTaskDelivery()`).
     ///
     /// `temp_dir` is the directory the temp file is created in (callers normally pass a
     /// per-run scratch directory so cleanup can be verified/scoped independently of the OS-wide
@@ -227,7 +308,22 @@ impl ChildSpawnSpec {
         task: &str,
         temp_dir: &Path,
     ) -> Result<(String, Option<PathBuf>), SubagentError> {
-        if task.chars().count() <= TASK_ARGV_INLINE_THRESHOLD {
+        let delivery = resolve_task_delivery(&|name| std::env::var(name).ok());
+        Self::resolve_task_arg_with(task, temp_dir, delivery, TaskDeliveryHost::current())
+    }
+
+    /// [`Self::resolve_task_arg`] with the delivery mode and host platform passed in explicitly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubagentError::Spawn`] if the temp file cannot be created or written.
+    pub fn resolve_task_arg_with(
+        task: &str,
+        temp_dir: &Path,
+        delivery: TaskDelivery,
+        host: TaskDeliveryHost,
+    ) -> Result<(String, Option<PathBuf>), SubagentError> {
+        if !should_deliver_task_via_file(task, delivery, host) {
             return Ok((task.to_string(), None));
         }
         let file_name = format!("subagent-task-{}.txt", uuid::Uuid::now_v7().as_simple());
@@ -915,7 +1011,9 @@ impl CapturedStderr {
         // failed run's error, so an unbounded buffer here would let a chatty child grow the
         // parent's heap by exactly as much as it wrote — the same hole the stdout cap closes, on
         // the stream far likelier to be spammed.
-        let tail = Arc::new(AsyncMutex::new(BoundedByteTail::new(MAX_CHILD_STDERR_BYTES)));
+        let tail = Arc::new(AsyncMutex::new(BoundedByteTail::new(
+            MAX_CHILD_STDERR_BYTES,
+        )));
         let pump_tail = Arc::clone(&tail);
         let pump = tokio::spawn(async move {
             let mut reader = stderr;
@@ -924,7 +1022,7 @@ impl CapturedStderr {
             let mut buf = vec![0u8; STDERR_PUMP_CHUNK_BYTES];
             loop {
                 let read = match reader.read(&mut buf).await {
-                    Ok(0) => break,                       // EOF: the child closed its write end
+                    Ok(0) => break, // EOF: the child closed its write end
                     Ok(read) => read,
                     Err(_) => break, // a broken stderr pipe is diagnostic-only; never fails the run
                 };
@@ -1075,7 +1173,10 @@ mod tests {
     fn resolve_spawn_command_carries_base_args_from_the_companion_var() {
         let vars = StdHashMap::from([
             (SUBAGENT_BINARY_ENV_VAR, "/opt/wrapper/shim"),
-            (SUBAGENT_BINARY_ARGS_ENV_VAR, r#"["--launch","a b","x,y","say \"hi\""]"#),
+            (
+                SUBAGENT_BINARY_ARGS_ENV_VAR,
+                r#"["--launch","a b","x,y","say \"hi\""]"#,
+            ),
         ]);
         let resolved = resolve_spawn_command_from(lookup_from(vars), || {
             Ok(PathBuf::from("/should/not/be/used"))
@@ -1172,8 +1273,13 @@ mod tests {
     #[test]
     fn resolve_task_arg_passes_a_short_task_through_literally() {
         let dir = tempfile::tempdir().expect("real tempdir");
-        let (arg, temp_file) = ChildSpawnSpec::resolve_task_arg("do the thing", dir.path())
-            .expect("short task resolves");
+        let (arg, temp_file) = ChildSpawnSpec::resolve_task_arg_with(
+            "do the thing",
+            dir.path(),
+            TaskDelivery::Auto,
+            TaskDeliveryHost::Other,
+        )
+        .expect("short task resolves");
         assert_eq!(arg, "do the thing");
         assert!(
             temp_file.is_none(),
@@ -1185,8 +1291,13 @@ mod tests {
     fn resolve_task_arg_writes_a_long_task_to_a_tempfile_reference() {
         let dir = tempfile::tempdir().expect("real tempdir");
         let long_task = "x".repeat(TASK_ARGV_INLINE_THRESHOLD + 1);
-        let (arg, temp_file) =
-            ChildSpawnSpec::resolve_task_arg(&long_task, dir.path()).expect("long task resolves");
+        let (arg, temp_file) = ChildSpawnSpec::resolve_task_arg_with(
+            &long_task,
+            dir.path(),
+            TaskDelivery::Auto,
+            TaskDeliveryHost::Other,
+        )
+        .expect("long task resolves");
         assert!(
             arg.starts_with('@'),
             "a task over the threshold must become an @<tempfile> reference, got {arg}"
@@ -1214,8 +1325,13 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().expect("real tempdir");
         let long_task = "s3cr3t ".repeat(TASK_ARGV_INLINE_THRESHOLD);
-        let (_, temp_file) =
-            ChildSpawnSpec::resolve_task_arg(&long_task, dir.path()).expect("long task resolves");
+        let (_, temp_file) = ChildSpawnSpec::resolve_task_arg_with(
+            &long_task,
+            dir.path(),
+            TaskDelivery::Auto,
+            TaskDeliveryHost::Other,
+        )
+        .expect("long task resolves");
         let temp_file = temp_file.expect("a temp file must have been created");
         let mode = std::fs::metadata(&temp_file)
             .expect("spilled task file exists")
@@ -1233,12 +1349,135 @@ mod tests {
     fn resolve_task_arg_boundary_is_inclusive_of_the_threshold() {
         let dir = tempfile::tempdir().expect("real tempdir");
         let exactly_at_threshold = "y".repeat(TASK_ARGV_INLINE_THRESHOLD);
-        let (_, temp_file) = ChildSpawnSpec::resolve_task_arg(&exactly_at_threshold, dir.path())
-            .expect("boundary-length task resolves");
+        let (_, temp_file) = ChildSpawnSpec::resolve_task_arg_with(
+            &exactly_at_threshold,
+            dir.path(),
+            TaskDelivery::Auto,
+            TaskDeliveryHost::Other,
+        )
+        .expect("boundary-length task resolves");
         assert!(
             temp_file.is_none(),
             "a task exactly AT the threshold must still be passed literally, not tempfile'd"
         );
+    }
+
+    // ---- CFG-067: PI_SUBAGENT_TASK_DELIVERY (`pi-args.ts:83-102` @v0.64.0) ----
+
+    fn env_of(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |key| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| (*v).to_string())
+        }
+    }
+
+    /// pi `resolveSubagentTaskDelivery` (`pi-args.ts:87-93`): `?.trim().toLowerCase() === "file"`
+    /// — case-insensitive, whitespace-tolerant, and every other value (including `auto` and
+    /// garbage) is `Auto`.
+    #[test]
+    fn task_delivery_is_file_only_for_the_trimmed_lowercased_word_file() {
+        assert_eq!(
+            resolve_task_delivery(&env_of(&[(TASK_DELIVERY_ENV, "file")])),
+            TaskDelivery::File
+        );
+        assert_eq!(
+            resolve_task_delivery(&env_of(&[(TASK_DELIVERY_ENV, "  FILE\n")])),
+            TaskDelivery::File
+        );
+        assert_eq!(
+            resolve_task_delivery(&env_of(&[(TASK_DELIVERY_ENV, "auto")])),
+            TaskDelivery::Auto
+        );
+        assert_eq!(
+            resolve_task_delivery(&env_of(&[(TASK_DELIVERY_ENV, "files")])),
+            TaskDelivery::Auto
+        );
+        assert_eq!(resolve_task_delivery(&env_of(&[])), TaskDelivery::Auto);
+    }
+
+    /// The `PI_` spelling is a fallback, never an override: consulted only when the `CYRUP_`
+    /// spelling is unset.
+    #[test]
+    fn the_pi_alias_is_consulted_only_when_the_cyrup_spelling_is_unset() {
+        assert_eq!(
+            resolve_task_delivery(&env_of(&[(TASK_DELIVERY_ENV_PI_ALIAS, "file")])),
+            TaskDelivery::File
+        );
+        assert_eq!(
+            resolve_task_delivery(&env_of(&[
+                (TASK_DELIVERY_ENV, "auto"),
+                (TASK_DELIVERY_ENV_PI_ALIAS, "file"),
+            ])),
+            TaskDelivery::Auto
+        );
+    }
+
+    /// pi `shouldDeliverTaskViaFile` (`pi-args.ts:95-102`): three independent legs — explicit
+    /// `file`, macOS, or over-threshold — any one of which forces the spill.
+    #[test]
+    fn should_deliver_task_via_file_has_upstreams_three_legs() {
+        let short = "do the thing";
+        let long = "x".repeat(TASK_ARGV_INLINE_THRESHOLD + 1);
+        assert!(!should_deliver_task_via_file(
+            short,
+            TaskDelivery::Auto,
+            TaskDeliveryHost::Other
+        ));
+        assert!(should_deliver_task_via_file(
+            short,
+            TaskDelivery::File,
+            TaskDeliveryHost::Other
+        ));
+        assert!(should_deliver_task_via_file(
+            short,
+            TaskDelivery::Auto,
+            TaskDeliveryHost::MacOs
+        ));
+        assert!(should_deliver_task_via_file(
+            &long,
+            TaskDelivery::Auto,
+            TaskDeliveryHost::Other
+        ));
+    }
+
+    /// THE USER ACTION: an operator whose EDR kills children over long argv sets the delivery
+    /// override to `file`; a task well under the argv threshold must now reach the child as a
+    /// `0600` spill file rather than a literal argument. Before this port `resolve_task_arg` had
+    /// only the length rule (`resolve_task_arg_resolves_short_task_literally` above was the whole
+    /// behaviour), so there was nothing an operator could set.
+    #[test]
+    fn file_delivery_spills_even_a_short_task() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let (arg, temp_file) = ChildSpawnSpec::resolve_task_arg_with(
+            "do the thing",
+            dir.path(),
+            TaskDelivery::File,
+            TaskDeliveryHost::Other,
+        )
+        .expect("short task resolves under file delivery");
+        let temp_file = temp_file.expect("file delivery must create the spill file");
+        assert_eq!(arg, format!("@{}", temp_file.display()));
+        assert_eq!(
+            std::fs::read_to_string(&temp_file).expect("spill readable"),
+            "do the thing"
+        );
+    }
+
+    /// pi `c68611d9` @v0.63.0 ("keep macOS subagent tasks out of argv"): on macOS every task is
+    /// file-delivered, whatever its length or the env says.
+    #[test]
+    fn macos_spills_every_task_regardless_of_length_or_env() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let (arg, temp_file) = ChildSpawnSpec::resolve_task_arg_with(
+            "short",
+            dir.path(),
+            TaskDelivery::Auto,
+            TaskDeliveryHost::MacOs,
+        )
+        .expect("resolves");
+        assert!(temp_file.is_some(), "macOS must spill; got literal {arg}");
     }
 
     // ---- ChildSpawnSpec::build_argv ordering ----
@@ -1295,7 +1534,9 @@ mod tests {
             ..
         } = ev
         else {
-            panic!("a real `tool_execution_start` line must parse to the tool-start variant, got {ev:?}");
+            panic!(
+                "a real `tool_execution_start` line must parse to the tool-start variant, got {ev:?}"
+            );
         };
         assert_eq!(
             tool_call_id.as_str(),

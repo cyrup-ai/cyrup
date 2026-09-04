@@ -14,12 +14,12 @@ use std::sync::Arc;
 use cyrup_core::ExtensionId;
 use cyrup_ext::native::HostCtx;
 
-use crate::registration::SubagentExtensionConfig;
-use crate::watchdog::register_main::{watchdog_config_dirs, watchdog_model_info};
 use crate::extension::EXTENSION_ID;
 use crate::extension::executor::SubagentExecutor;
 use crate::extension::host::registration::RegistrationMode;
 use crate::extension::tool::SubagentTool;
+use crate::registration::SubagentExtensionConfig;
+use crate::watchdog::register_main::{watchdog_config_dirs, watchdog_model_info};
 
 /// The SubAgents extension's `NativeExtension` facade (arch-SA §3.1). In [`RegistrationMode::Full`]
 /// registers the `subagent` tool + all 12 slash commands at [`cyrup_ext::NativeExtension::init`], resumes
@@ -131,7 +131,11 @@ impl SubagentsExtension {
     /// [`RegistrationMode::ChildSafe`] one for a fanout-authorized child. See
     /// [`crate::extension::host::registration::subagent_extension_for`]/[`crate::extension::host::registration::subagent_extension_for_env`] for the callers.
     #[must_use]
-    pub fn with_mode(config: SubagentExtensionConfig, cwd: PathBuf, mode: RegistrationMode) -> Self {
+    pub fn with_mode(
+        config: SubagentExtensionConfig,
+        cwd: PathBuf,
+        mode: RegistrationMode,
+    ) -> Self {
         Self::with_mode_and_channels(config, cwd, mode, None)
     }
 
@@ -244,7 +248,7 @@ impl SubagentsExtension {
     /// the extension's, not the runtime's.
     fn execute_watchdog_command(&self, args: &str, ctx: &HostCtx) -> Option<String> {
         use crate::watchdog::register_main::{
-            handle_watchdog_command, WatchdogCommandContext, WatchdogCommandOutcome,
+            WatchdogCommandContext, WatchdogCommandOutcome, handle_watchdog_command,
         };
         let services = self.executor.host_services();
         let registry = crate::watchdog::model_selection::BuiltinWatchdogModelRegistry::new(
@@ -315,6 +319,27 @@ impl SubagentsExtension {
         &self.executor
     }
 
+    /// SUBA-084 — pi's public `registerAgent` (`src/api/agents.ts:2` @v0.64.0, the re-export of
+    /// `registerRuntimeAgent`): define an agent IN-PROCESS for this extension's session. The
+    /// returned handle's `dispose()` removes it again; a `SessionShutdown` clears every runtime
+    /// agent (`clearRuntimeAgentsForPi`, `extension/index.ts:971`). Delegates to
+    /// [`SubagentExecutor::register_agent`] — the registry is executor-owned so every discovery
+    /// the tool, the slash commands and the management actions run sees the same agents.
+    ///
+    /// # Errors
+    ///
+    /// See [`SubagentExecutor::register_agent`].
+    pub fn register_agent(
+        &self,
+        name: &str,
+        definition: &crate::discovery::runtime_registry::RuntimeAgentDefinition,
+    ) -> Result<
+        crate::discovery::runtime_registry::RuntimeAgentRegistration,
+        crate::error::SubagentError,
+    > {
+        self.executor.register_agent(name, definition)
+    }
+
     /// Construct the same [`SubagentTool`] `init` registers with the host, bound to this
     /// extension's own executor and cwd — exposed so an integration test (or a future non-`InitApi`
     /// caller) can drive the real `cyrup_core::Tool::execute` dispatch (the `tasks[]`/`chain[]`
@@ -334,11 +359,14 @@ impl Default for SubagentsExtension {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
-    use cyrup_core::Tool;
-    use cyrup_ext::native::NativeExtension;
     use crate::background::RunMode;
     use crate::error::SubagentError;
     use crate::extension::testsupport::bare_single_step;
@@ -350,9 +378,11 @@ mod tests {
     use crate::registration::slash_commands::SlashCommandName;
     use crate::spawn::chain_graph::RunnerStep;
     use cyrup_core::CancelToken;
+    use cyrup_core::Tool;
     use cyrup_core::ToolCallId;
     use cyrup_core::ToolError;
     use cyrup_core::ToolResult;
+    use cyrup_ext::native::NativeExtension;
 
     #[test]
     fn id_is_stable() {
@@ -456,7 +486,11 @@ mod tests {
              granted 1; grant allowance 0)"
         );
         assert_eq!(
-            granted.details.as_ref().and_then(|d| d.get("spawnBudget")).and_then(|b| b.get("limit")),
+            granted
+                .details
+                .as_ref()
+                .and_then(|d| d.get("spawnBudget"))
+                .and_then(|b| b.get("limit")),
             Some(&serde_json::json!(2)),
             "the snapshot rides along in details.spawnBudget: {:?}",
             granted.details
@@ -553,7 +587,10 @@ mod tests {
         );
         let tool = ext.subagent_tool();
 
-        async fn dispatch(tool: &SubagentTool, params: serde_json::Value) -> Result<ToolResult, ToolError> {
+        async fn dispatch(
+            tool: &SubagentTool,
+            params: serde_json::Value,
+        ) -> Result<ToolResult, ToolError> {
             tool.execute(
                 ToolCallId::from("t"),
                 params,
@@ -566,9 +603,12 @@ mod tests {
         // Call 1: a 2-task fan-out exactly fills the 2-spawn budget (pi's comparison is a STRICT
         // `used + requested > maxSpawns`, so landing on the cap is admitted). It is admitted, and
         // therefore fails downstream on the unresolvable agent — NOT on the budget.
-        let admitted = dispatch(&tool, serde_json::json!({
-            "tasks": [{ "agent": "ghost", "task": "a" }, { "agent": "ghost", "task": "b" }]
-        }))
+        let admitted = dispatch(
+            &tool,
+            serde_json::json!({
+                "tasks": [{ "agent": "ghost", "task": "a" }, { "agent": "ghost", "task": "b" }]
+            }),
+        )
         .await
         .expect_err("an unresolvable agent still fails after the reservation is granted");
         assert!(
@@ -650,35 +690,47 @@ mod tests {
         //
         // A sequential step (1) + a static parallel step of width 3 (3) + a dynamic-parallel step
         // with its own `expand.maxItems: 5` (5) == 9 requested.
-        let explicit = reject_text(&tool, serde_json::json!({ "chain": [
-            { "agent": "ghost", "task": "a", "as": "targets" },
-            { "parallel": [
-                { "agent": "ghost", "task": "b" },
-                { "agent": "ghost", "task": "c" },
-                { "agent": "ghost", "task": "d" }
-            ] },
-            {
-                "expand": { "from": { "output": "targets", "path": "/items" }, "maxItems": 5 },
-                "collect": { "as": "gathered" },
-                "parallel": { "agent": "ghost", "task": "Handle {item}" }
-            }
-        ]}))
+        let explicit = reject_text(
+            &tool,
+            serde_json::json!({ "chain": [
+                { "agent": "ghost", "task": "a", "as": "targets" },
+                { "parallel": [
+                    { "agent": "ghost", "task": "b" },
+                    { "agent": "ghost", "task": "c" },
+                    { "agent": "ghost", "task": "d" }
+                ] },
+                {
+                    "expand": { "from": { "output": "targets", "path": "/items" }, "maxItems": 5 },
+                    "collect": { "as": "gathered" },
+                    "parallel": { "agent": "ghost", "task": "Handle {item}" }
+                }
+            ]}),
+        )
         .await;
-        assert!(explicit.contains("(0/1 used, 9 requested)"), "got: {explicit}");
+        assert!(
+            explicit.contains("(0/1 used, 9 requested)"),
+            "got: {explicit}"
+        );
 
         // With `expand.maxItems` omitted the dynamic step falls back to the CONFIGURED
         // `chain.dynamicFanout.maxItems` (7 here), so 1 + 7 == 8 requested.
         ext.executor().reset_spawn_budget();
-        let configured = reject_text(&tool, serde_json::json!({ "chain": [
-            { "agent": "ghost", "task": "a", "as": "targets" },
-            {
-                "expand": { "from": { "output": "targets", "path": "/items" } },
-                "collect": { "as": "gathered" },
-                "parallel": { "agent": "ghost", "task": "Handle {item}" }
-            }
-        ]}))
+        let configured = reject_text(
+            &tool,
+            serde_json::json!({ "chain": [
+                { "agent": "ghost", "task": "a", "as": "targets" },
+                {
+                    "expand": { "from": { "output": "targets", "path": "/items" } },
+                    "collect": { "as": "gathered" },
+                    "parallel": { "agent": "ghost", "task": "Handle {item}" }
+                }
+            ]}),
+        )
         .await;
-        assert!(configured.contains("(0/1 used, 8 requested)"), "got: {configured}");
+        assert!(
+            configured.contains("(0/1 used, 8 requested)"),
+            "got: {configured}"
+        );
     }
 
     /// SUBA-002 regression: the per-SESSION spawn budget covers the SLASH surface, not the
@@ -754,7 +806,12 @@ mod tests {
         // budget, not a blanket slash-path rejection.
         ext.executor().reset_spawn_budget();
         let after_reset = ext
-            .dispatch_slash(SlashCommandName::Run, "ghost do the thing", dir.path(), false)
+            .dispatch_slash(
+                SlashCommandName::Run,
+                "ghost do the thing",
+                dir.path(),
+                false,
+            )
             .await
             .expect_err("post-reset the call is admitted and fails only on the agent");
         assert!(
@@ -898,14 +955,21 @@ mod tests {
             .await
             .expect_err("an unresolvable agent still fails after the reservation is granted");
         assert!(
-            !admitted.to_string().contains("Subagent spawn limit reached"),
+            !admitted
+                .to_string()
+                .contains("Subagent spawn limit reached"),
             "a 3-wide chain must fit exactly inside a 3-spawn budget: {admitted}"
         );
 
         // Exactly 3 charged, so `used` reads 3/3 (a double charge would have overflowed the cap
         // during the dispatch above and reported 6 requested against it).
         let exhausted = ext
-            .dispatch_slash(SlashCommandName::Run, "ghost do the thing", dir.path(), false)
+            .dispatch_slash(
+                SlashCommandName::Run,
+                "ghost do the thing",
+                dir.path(),
+                false,
+            )
             .await
             .expect_err("the session's spawn budget is now exactly exhausted");
         assert_eq!(
@@ -1005,7 +1069,9 @@ mod tests {
         )
         .await;
         assert!(
-            text.contains("- solo-skill via reviewer (referenced by 1 configured agents/chains; agent:solo)"),
+            text.contains(
+                "- solo-skill via reviewer (referenced by 1 configured agents/chains; agent:solo)"
+            ),
             "`minReferences: 1` from config.json must admit a once-referenced skill that the \
              default of 2 excludes:\n{text}"
         );
@@ -1113,26 +1179,28 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let ext = SubagentsExtension::with_config_and_cwd(cfg, dir.path().to_path_buf());
 
-        let graph = vec![RunnerStep::SingleStep(crate::spawn::chain_graph::SingleStepSpec {
-            skills: None,
-            session_dir: None,
-            agent: "worker".to_string(),
-            task: "do something".to_string(),
-            cwd: None,
-            model: None,
-            tools: None,
-            extensions: None,
-            session_file: None,
-            max_depth_override: None,
-            structured_output_schema: None,
-            output: None,
-            output_path: None,
-            output_mode: None,
-            reads: None,
-            acceptance: None,
-            context: None,
-            agent_scope: None,
-        })];
+        let graph = vec![RunnerStep::SingleStep(
+            crate::spawn::chain_graph::SingleStepSpec {
+                skills: None,
+                session_dir: None,
+                agent: "worker".to_string(),
+                task: "do something".to_string(),
+                cwd: None,
+                model: None,
+                tools: None,
+                extensions: None,
+                session_file: None,
+                max_depth_override: None,
+                structured_output_schema: None,
+                output: None,
+                output_path: None,
+                output_mode: None,
+                reads: None,
+                acceptance: None,
+                context: None,
+                agent_scope: None,
+            },
+        )];
 
         for background in [false, true] {
             let err = ext
@@ -1176,5 +1244,4 @@ mod tests {
         assert!(text.starts_with("Subagent fleet: 1 active"), "{text}");
         assert!(text.contains("- slashfleet01 | running"), "{text}");
     }
-
 }

@@ -98,7 +98,11 @@ impl InputEditor {
     /// hand-typed `[paste #1 see the file above]` matched and [`expanded_text`](Self::expanded_text)
     /// silently replaced the user's own words with the stored paste (TUI-049). The id must also be
     /// live in [`pastes`](Self::pastes) — pi's `validIds` gate (`segmentWithMarkers`, `:44`).
-    pub(super) fn marker_at<'a>(&'a self, chars: &[char], i: usize) -> Option<(u32, &'a str, usize)> {
+    pub(super) fn marker_at<'a>(
+        &'a self,
+        chars: &[char],
+        i: usize,
+    ) -> Option<(u32, &'a str, usize)> {
         let (id, _, end) = marker_span_at(chars, i)?;
         let content = self.pastes.get(&id)?;
         Some((id, content.as_str(), end))
@@ -155,7 +159,12 @@ impl InputEditor {
     pub(super) fn drop_paste(&mut self, target: u32) {
         self.pastes.remove(&target);
         self.paste_counter = self.paste_counter.saturating_sub(1);
-        let higher: Vec<u32> = self.pastes.keys().copied().filter(|&id| id > target).collect();
+        let higher: Vec<u32> = self
+            .pastes
+            .keys()
+            .copied()
+            .filter(|&id| id > target)
+            .collect();
         for id in higher {
             if let Some(content) = self.pastes.remove(&id) {
                 self.pastes.insert(id.saturating_sub(1), content);
@@ -177,7 +186,9 @@ fn read_digits(chars: &[char], from: usize) -> Option<(u32, usize)> {
     let mut value: u32 = 0;
     let mut count = 0usize;
     while let Some(&c) = chars.get(j).filter(|c| c.is_ascii_digit()) {
-        value = value.saturating_mul(10).saturating_add(c.to_digit(10).unwrap_or(0));
+        value = value
+            .saturating_mul(10)
+            .saturating_add(c.to_digit(10).unwrap_or(0));
         j += 1;
         count += 1;
     }
@@ -220,8 +231,11 @@ fn marker_span_at(chars: &[char], i: usize) -> Option<(u32, usize, usize)> {
     }
     let (_, after) = read_digits(chars, j)?;
     j = after;
-    let tail: &[char] =
-        if plus { &[' ', 'l', 'i', 'n', 'e', 's', ']'] } else { &[' ', 'c', 'h', 'a', 'r', 's', ']'] };
+    let tail: &[char] = if plus {
+        &[' ', 'l', 'i', 'n', 'e', 's', ']']
+    } else {
+        &[' ', 'c', 'h', 'a', 'r', 's', ']']
+    };
     for (n, tc) in tail.iter().enumerate() {
         if chars.get(j + n) != Some(tc) {
             return None;

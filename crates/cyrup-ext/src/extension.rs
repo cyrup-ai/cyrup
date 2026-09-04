@@ -47,9 +47,7 @@ pub trait Extension: Send + Sync {
     /// DOES block on a human (the permission gate) returns its ctx's gate so the dispatcher's budget
     /// watchdog is suspended for the duration of the wait instead of failing OPEN. See
     /// [`crate::native::HumanWaitGate`].
-    fn human_wait_gate(
-        &self,
-    ) -> Option<std::sync::Arc<crate::native::HumanWaitGate>> {
+    fn human_wait_gate(&self) -> Option<std::sync::Arc<crate::native::HumanWaitGate>> {
         None
     }
 }

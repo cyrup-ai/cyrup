@@ -98,7 +98,11 @@ fn normalize_guideline_text(line: &str) -> String {
         Some(rest) if rest.starts_with(char::is_whitespace) => rest.trim_start(),
         _ => trimmed,
     };
-    stripped.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    stripped
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 /// pi `isTopLevelSectionHeader` (`:72-75`): a non-empty trimmed line ending in `:` and not a `-`
@@ -114,7 +118,10 @@ fn find_section(lines: &[String], header: &str) -> Option<LineSection> {
     let start = lines.iter().position(|l| l.trim() == header)?;
     let mut end = lines.len();
     for index in (start + 1)..lines.len() {
-        if lines.get(index).is_some_and(|l| is_top_level_section_header(l)) {
+        if lines
+            .get(index)
+            .is_some_and(|l| is_top_level_section_header(l))
+        {
             end = index;
             break;
         }
@@ -205,7 +212,8 @@ pub fn sanitize_available_tools_section(
 
     let (after_tools, removed_tools) =
         remove_line_section(&lines, find_section(&lines, AVAILABLE_TOOLS_SECTION_HEADER));
-    let (after_guidelines, removed_guidelines) = sanitize_guidelines_section(&after_tools, &allowed);
+    let (after_guidelines, removed_guidelines) =
+        sanitize_guidelines_section(&after_tools, &allowed);
 
     let removed = removed_tools || removed_guidelines;
     SanitizeSystemPromptResult {
@@ -260,7 +268,11 @@ mod tests {
         let prompt = "Head:\nx\n\nGuidelines:\n- use bash for file operations like ls, rg, find\n- use write only for new files or complete rewrites\n";
         let out = sanitize_available_tools_section(prompt, &allowed(&["read"]));
         assert!(out.removed);
-        assert!(!out.prompt.contains("Guidelines:"), "empty guidelines section removed:\n{}", out.prompt);
+        assert!(
+            !out.prompt.contains("Guidelines:"),
+            "empty guidelines section removed:\n{}",
+            out.prompt
+        );
         assert!(out.prompt.contains("Head:"));
     }
 
@@ -322,7 +334,11 @@ mod tests {
         let prompt = "Guidelines:\n- always be polite\n- use write only for new files or complete rewrites\n";
         let out = sanitize_available_tools_section(prompt, &allowed(&["read"]));
         assert!(out.removed);
-        assert!(out.prompt.contains("always be polite"), "unrelated bullet kept:\n{}", out.prompt);
+        assert!(
+            out.prompt.contains("always be polite"),
+            "unrelated bullet kept:\n{}",
+            out.prompt
+        );
         assert!(!out.prompt.contains("use write only"));
     }
 }

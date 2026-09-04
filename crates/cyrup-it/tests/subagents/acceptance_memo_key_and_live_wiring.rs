@@ -36,14 +36,17 @@
 //!
 //! Gated on `test-fixtures` for the fixture binary, matching every sibling integration test.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-
 use cyrup_core::{CancelToken, Content, ModelId, Tool, ToolCallId};
-use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::artifacts::project_artifacts_dir;
 use cyrup_ext_subagents::background::atomic::write_atomic_json;
 use cyrup_ext_subagents::background::runner_main::{RunnerConfig, RunnerOverrides, run_with};
@@ -52,6 +55,7 @@ use cyrup_ext_subagents::discovery::types::SystemPromptMode;
 use cyrup_ext_subagents::exec::ResolvedAgentPersona;
 use cyrup_ext_subagents::exec::acceptance::model;
 use cyrup_ext_subagents::extension::SubagentsExtension;
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::spawn::chain_graph::{RunnerStep, SingleStepSpec};
@@ -59,8 +63,6 @@ use cyrup_ext_subagents::spawn::chain_graph::{RunnerStep, SingleStepSpec};
 // ------------------------------------------------------------------------------------------------
 // Fixtures
 // ------------------------------------------------------------------------------------------------
-
-
 
 fn fixture_binary_path() -> PathBuf {
     crate::support::bins::subagent_fixture()
@@ -203,11 +205,17 @@ async fn the_cache_key_covers_the_repo_relative_cwd() {
     assert_eq!(first.command, second.command);
     assert_eq!(first.env_hash, second.env_hash);
     assert_eq!(
-        first.workspace_state.as_ref().map(|w| w.cwd_relative.clone()),
+        first
+            .workspace_state
+            .as_ref()
+            .map(|w| w.cwd_relative.clone()),
         Some(".".to_string())
     );
     assert_eq!(
-        second.workspace_state.as_ref().map(|w| w.cwd_relative.clone()),
+        second
+            .workspace_state
+            .as_ref()
+            .map(|w| w.cwd_relative.clone()),
         Some("sub".to_string())
     );
     assert_eq!(
@@ -351,7 +359,11 @@ async fn a_memo_hit_reports_the_current_criterion_id_not_the_recorded_one() {
         Some(true),
         "the id is not in the key, so this must be a HIT: {replayed:?}"
     );
-    assert_eq!(execution_count(&marker), 1, "nothing was spawned the second time");
+    assert_eq!(
+        execution_count(&marker),
+        1,
+        "nothing was spawned the second time"
+    );
     assert_eq!(
         replayed.id, "cargo-test",
         "a renamed criterion must report under its NEW name, not the recorded one"
@@ -376,7 +388,12 @@ async fn a_memo_hit_re_stamps_command_and_cwd_over_whatever_the_artifact_recorde
     let cmd = command("unit", &counting_command(&marker));
 
     let recorded = model::run_memoized_verify_command(&cmd, repo.path(), Some(ctx)).await;
-    let artifact = PathBuf::from(recorded.artifact_path.clone().expect("an artifact was written"));
+    let artifact = PathBuf::from(
+        recorded
+            .artifact_path
+            .clone()
+            .expect("an artifact was written"),
+    );
 
     // Rewrite ONLY the nested `result`'s identity fields; `cacheKey`/`resultShape` stay valid so the
     // artifact is still a HIT.
@@ -394,9 +411,16 @@ async fn a_memo_hit_re_stamps_command_and_cwd_over_whatever_the_artifact_recorde
 
     let replayed = model::run_memoized_verify_command(&cmd, repo.path(), Some(ctx)).await;
 
-    assert_eq!(replayed.memoized, Some(true), "premise: still a hit: {replayed:?}");
+    assert_eq!(
+        replayed.memoized,
+        Some(true),
+        "premise: still a hit: {replayed:?}"
+    );
     assert_eq!(execution_count(&marker), 1, "premise: nothing re-ran");
-    assert_eq!(replayed.id, "unit", "`id` is re-stamped from the CURRENT command");
+    assert_eq!(
+        replayed.id, "unit",
+        "`id` is re-stamped from the CURRENT command"
+    );
     assert_eq!(
         replayed.command, cmd.command,
         "`command` is re-stamped from the CURRENT command, never replayed"
@@ -433,19 +457,19 @@ async fn the_sensitive_key_pattern_requires_the_left_boundary_too() {
     let value = "supersecretvalue";
 
     let left_boundary_only = [
-        "MYTOKEN",        // TOKEN at index 2, right boundary is end-of-string
-        "XSECRET",        // SECRET at index 1
-        "MYPASSWORD",     // PASSWORD at index 2
-        "NOPASS",         // PASS at index 2
-        "UNAUTH",         // AUTH at index 2
+        "MYTOKEN",    // TOKEN at index 2, right boundary is end-of-string
+        "XSECRET",    // SECRET at index 1
+        "MYPASSWORD", // PASSWORD at index 2
+        "NOPASS",     // PASS at index 2
+        "UNAUTH",     // AUTH at index 2
         "XCREDENTIAL",
         "ACOOKIE",
         "MYSESSION",
         "SUBPRIVATE",
-        "DEVAPI_KEY",     // API_KEY at index 3
-        "PREACCESS_KEY",  // ACCESS_KEY at index 3
-        "NOTAUTH_MODE",   // AUTH at index 3, right boundary is the `_` — left is `T`
-        "MYTOKEN_FILE",   // TOKEN at index 2, right boundary is the `_`
+        "DEVAPI_KEY",    // API_KEY at index 3
+        "PREACCESS_KEY", // ACCESS_KEY at index 3
+        "NOTAUTH_MODE",  // AUTH at index 3, right boundary is the `_` — left is `T`
+        "MYTOKEN_FILE",  // TOKEN at index 2, right boundary is the `_`
     ];
     for key in left_boundary_only {
         assert_eq!(
@@ -484,7 +508,10 @@ async fn the_sensitive_key_pattern_requires_the_left_boundary_too() {
     // anything where the capture actually happens.
     let dir = tempfile::tempdir().expect("tempdir");
     let leaky = model::AcceptanceVerifyCommand {
-        env: Some(env_of(&[("MYTOKEN", "production"), ("MY_TOKEN", "tok_live_a1b2")])),
+        env: Some(env_of(&[
+            ("MYTOKEN", "production"),
+            ("MY_TOKEN", "tok_live_a1b2"),
+        ])),
         ..command(
             "boundary",
             "echo \"built for $MYTOKEN with $MY_TOKEN\"; exit 0",
@@ -573,7 +600,6 @@ fn tool_result_text(result: &cyrup_core::ToolResult) -> String {
 /// written — which is exactly what the `artifacts: false` half of this pair asserts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_subagent_tools_single_run_memoizes_its_verify_commands_under_the_run_artifacts_dir() {
-
     let work_dir = tempfile::tempdir().expect("tempdir for the fixture persona + cwd");
     let home_dir = tempfile::tempdir().expect("tempdir to isolate CYRUP_HOME artifacts");
     init_repo(work_dir.path());
@@ -662,9 +688,7 @@ async fn the_subagent_tools_single_run_memoizes_its_verify_commands_under_the_ru
             .expect("the artifact is JSON");
     assert_eq!(
         stored.get("cacheKey").and_then(serde_json::Value::as_str),
-        artifacts[0]
-            .file_stem()
-            .and_then(|s| s.to_str()),
+        artifacts[0].file_stem().and_then(|s| s.to_str()),
         "the artifact is filed under its own cache key (acceptance.ts:1102,1117)"
     );
     assert_eq!(
@@ -683,7 +707,6 @@ async fn the_subagent_tools_single_run_memoizes_its_verify_commands_under_the_ru
 /// recorded anywhere.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn artifacts_false_disarms_verify_memoization_along_with_the_quadruple() {
-
     let work_dir = tempfile::tempdir().expect("tempdir");
     let home_dir = tempfile::tempdir().expect("tempdir for CYRUP_HOME");
     init_repo(work_dir.path());
@@ -757,8 +780,11 @@ async fn artifacts_false_disarms_verify_memoization_along_with_the_quadruple() {
 
 fn fixture_persona(name: &str) -> ResolvedAgentPersona {
     ResolvedAgentPersona {
+        acceptance_role: None, // SUBA-082: no declared role, the name decides
+        default_acceptance: None,
         name: name.to_string(),
         model: Some(ModelId::from("fixture-model")),
+        model_provider: None,
         fallback_models: Vec::new(),
         thinking: None,
         system_prompt_mode: SystemPromptMode::Replace,
@@ -766,6 +792,8 @@ fn fixture_persona(name: &str) -> ResolvedAgentPersona {
         tools: None,
         extensions: None,
         subagent_only_extensions: Vec::new(),
+        exclude_tools: Vec::new(),
+        allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
         inherit_skills: true,
@@ -857,12 +885,20 @@ async fn run_hop2(dir: &Path, config: RunnerConfig) {
 
     let async_root = dir.join("async");
     let results_dir = dir.join("results");
-    tokio::fs::create_dir_all(&async_root).await.expect("mkdir async_root");
-    tokio::fs::create_dir_all(&results_dir).await.expect("mkdir results_dir");
+    tokio::fs::create_dir_all(&async_root)
+        .await
+        .expect("mkdir async_root");
+    tokio::fs::create_dir_all(&results_dir)
+        .await
+        .expect("mkdir results_dir");
     let run_paths = RunPaths::for_run(&async_root, &results_dir, &config.run_id);
-    tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run_dir");
+    tokio::fs::create_dir_all(&run_paths.run_dir)
+        .await
+        .expect("mkdir run_dir");
     let cfg_path = run_paths.run_dir.join("runner-config.json");
-    write_atomic_json(&cfg_path, &config).await.expect("write runner config");
+    write_atomic_json(&cfg_path, &config)
+        .await
+        .expect("write runner config");
 
     // Driving the runner IN-PROCESS, so the fixture is handed down directly.
     let outcome = run_with(
@@ -871,10 +907,13 @@ async fn run_hop2(dir: &Path, config: RunnerConfig) {
         RunnerOverrides {
             spawn_command: Some(SpawnCommand {
                 binary: fixture,
-                base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+                base_args: vec![
+                    "--fixture-script".to_string(),
+                    script_path.display().to_string(),
+                ],
             }),
             ..Default::default()
-            },
+        },
     )
     .await;
     outcome.expect("run() itself never returns Err");
@@ -890,7 +929,6 @@ async fn run_hop2(dir: &Path, config: RunnerConfig) {
 /// `artifacts_dir` disarms it — pi's own two-term gate (`subagent-runner.ts:1192`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_background_hop_memoizes_its_steps_verify_commands() {
-
     let dir = tempfile::tempdir().expect("tempdir");
     init_repo(dir.path());
     let artifacts_dir = dir.path().join("arts");
@@ -931,7 +969,6 @@ async fn the_background_hop_memoizes_its_steps_verify_commands() {
 /// (`RunnerConfig::artifacts_dir`'s own doc), which must leave verify memoization off.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_background_hop_writes_no_memo_when_the_run_disabled_artifacts() {
-
     let dir = tempfile::tempdir().expect("tempdir");
     init_repo(dir.path());
     let artifacts_dir = dir.path().join("arts");
@@ -981,7 +1018,6 @@ async fn the_background_hop_writes_no_memo_when_the_run_disabled_artifacts() {
 /// told not to use.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_background_hop_writes_no_memo_when_the_config_is_disabled_despite_a_real_dir() {
-
     let dir = tempfile::tempdir().expect("tempdir");
     init_repo(dir.path());
     let artifacts_dir = dir.path().join("arts");

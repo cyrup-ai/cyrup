@@ -23,13 +23,22 @@ fn caller_headers_are_injected_but_reserved_ones_are_skipped_case_insensitively(
 
     apply_custom_headers(&mut headers, Some(&caller), None);
 
-    assert_eq!(headers.get("authorization").map(String::as_str), Some("real-auth"));
-    assert_eq!(headers.get("x-amz-date").map(String::as_str), Some("real-date"));
+    assert_eq!(
+        headers.get("authorization").map(String::as_str),
+        Some("real-auth")
+    );
+    assert_eq!(
+        headers.get("x-amz-date").map(String::as_str),
+        Some("real-date")
+    );
     assert_eq!(headers.get("host").map(String::as_str), Some("real-host"));
     assert_eq!(headers.get("x-allowed").map(String::as_str), Some("ok"));
     // No mixed-case leak (pi's VC2 key-set assertion).
     let keys: Vec<&str> = headers.keys().map(String::as_str).collect();
-    assert_eq!(keys, vec!["authorization", "host", "x-allowed", "x-amz-date"]);
+    assert_eq!(
+        keys,
+        vec!["authorization", "host", "x-allowed", "x-amz-date"]
+    );
 }
 
 #[test]

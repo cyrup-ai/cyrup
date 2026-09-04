@@ -53,15 +53,14 @@
 
 use std::collections::VecDeque;
 
-use cyrup_core::{
-    TerminateHint,Content, ToolUpdate};
+use cyrup_core::{Content, TerminateHint, ToolUpdate};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde::{Deserialize, Serialize};
 
 use crate::background::{ActivityState, RunId, RunMode, RunState, RunStatus};
-use crate::exec::ndjson::{parse_line, SubagentEvent};
 use crate::exec::SingleResult;
+use crate::exec::ndjson::{SubagentEvent, parse_line};
 use crate::fork_context::ContextMode;
 use crate::tui::render::{render_background_region, render_run_header_line};
 use crate::tui::{RunSource, SubagentProgressSnapshot};
@@ -430,7 +429,9 @@ impl LiveProgressFold {
             return false;
         };
         match &event {
-            SubagentEvent::ToolExecutionStart { tool_name, args, .. } => {
+            SubagentEvent::ToolExecutionStart {
+                tool_name, args, ..
+            } => {
                 self.tool_count = self.tool_count.saturating_add(1);
                 self.current_tool = Some(tool_name.clone());
                 // pi `progress.currentToolArgs = extractToolArgsPreview(toolArgs)`
@@ -449,8 +450,7 @@ impl LiveProgressFold {
                     self.recent_tools.push_back(RecentToolCall {
                         tool,
                         args: std::mem::take(&mut self.current_tool_args),
-                        end_ms: u64::try_from(crate::time::now_epoch_millis())
-                            .unwrap_or(0),
+                        end_ms: u64::try_from(crate::time::now_epoch_millis()).unwrap_or(0),
                     });
                 }
                 self.current_tool_args.clear();
@@ -458,15 +458,18 @@ impl LiveProgressFold {
                 true
             }
             SubagentEvent::MessageEnd { message } => {
-                let is_assistant = message.get("role").and_then(serde_json::Value::as_str)
-                    == Some("assistant");
+                let is_assistant =
+                    message.get("role").and_then(serde_json::Value::as_str) == Some("assistant");
                 if is_assistant {
                     self.turn_count = self.turn_count.saturating_add(1);
                     if let Some(usage) = event.assistant_usage() {
                         self.input_tokens = self.input_tokens.saturating_add(usage.input);
                         self.output_tokens = self.output_tokens.saturating_add(usage.output);
                     }
-                    let text = message.get("content").map(extract_event_text).unwrap_or_default();
+                    let text = message
+                        .get("content")
+                        .map(extract_event_text)
+                        .unwrap_or_default();
                     self.push_output(&text);
                 }
                 is_assistant
@@ -665,7 +668,11 @@ impl SubagentUpdatePayload {
     #[must_use]
     pub fn into_tool_update(self, text: String) -> ToolUpdate {
         let details = serde_json::to_value(&self).ok();
-        ToolUpdate { content: vec![Content::text(text)], details, terminate: TerminateHint::Unspecified }
+        ToolUpdate {
+            content: vec![Content::text(text)],
+            details,
+            terminate: TerminateHint::Unspecified,
+        }
     }
 }
 
@@ -712,7 +719,10 @@ pub fn render_inline_result(payload: &SubagentUpdatePayload, tick: usize) -> Vec
             .cloned()
             .unwrap_or_else(|| LiveProgressSnapshot::from_settled_result(result));
         let label = if result.agent.is_empty() {
-            entry.agent.clone().unwrap_or_else(|| "subagent".to_string())
+            entry
+                .agent
+                .clone()
+                .unwrap_or_else(|| "subagent".to_string())
         } else {
             result.agent.clone()
         };
@@ -777,7 +787,11 @@ impl AsyncJobSnapshot {
     /// `context` are supplied by the caller (the tracker knows the run's originating persona and
     /// resolved context, which `status.json` itself does not always carry).
     #[must_use]
-    pub fn from_run_status(status: &RunStatus, agent: Option<String>, context: ContextMode) -> Self {
+    pub fn from_run_status(
+        status: &RunStatus,
+        agent: Option<String>,
+        context: ContextMode,
+    ) -> Self {
         let clamp_u32 = |value: u64| u32::try_from(value).unwrap_or(u32::MAX);
         let clamp_usize = |value: usize| u32::try_from(value).unwrap_or(u32::MAX);
         Self {
@@ -791,7 +805,12 @@ impl AsyncJobSnapshot {
             current_tool: status.telemetry.current_tool.clone(),
             tool_count: status.telemetry.tool_count.map(clamp_u32).unwrap_or(0),
             turn_count: status.telemetry.turn_count.map(clamp_u32).unwrap_or(0),
-            tokens: status.telemetry.total_tokens.as_ref().map(|t| t.total).unwrap_or(0),
+            tokens: status
+                .telemetry
+                .total_tokens
+                .as_ref()
+                .map(|t| t.total)
+                .unwrap_or(0),
             recent_output: Vec::new(),
         }
     }
@@ -844,13 +863,20 @@ pub struct AsyncJobsPayload {
 /// painting step.
 #[must_use]
 pub fn render_async_jobs_widget(jobs: &[AsyncJobSnapshot], tick: usize) -> Vec<Line<'static>> {
-    let snapshots: Vec<SubagentProgressSnapshot> =
-        jobs.iter().map(AsyncJobSnapshot::to_progress_snapshot).collect();
+    let snapshots: Vec<SubagentProgressSnapshot> = jobs
+        .iter()
+        .map(AsyncJobSnapshot::to_progress_snapshot)
+        .collect();
     render_background_region(&snapshots, tick)
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 mod tests {
     use super::*;
     use crate::tui::render::lines_to_plain_text;
@@ -904,9 +930,20 @@ mod tests {
         assert_eq!(snap.tool_count, 1);
         assert_eq!(snap.turn_count, 1);
         assert_eq!(snap.tokens, 59, "tokens must be input + output");
-        assert_eq!(snap.current_tool, None, "tool_execution_end clears the current tool");
-        assert!(snap.recent_output.iter().any(|l| l.contains("Implemented the fix.")));
-        assert!(snap.recent_output.iter().any(|l| l.contains("wrote 3 lines")));
+        assert_eq!(
+            snap.current_tool, None,
+            "tool_execution_end clears the current tool"
+        );
+        assert!(
+            snap.recent_output
+                .iter()
+                .any(|l| l.contains("Implemented the fix."))
+        );
+        assert!(
+            snap.recent_output
+                .iter()
+                .any(|l| l.contains("wrote 3 lines"))
+        );
         assert_eq!(snap.status, LiveProgressStatus::Complete);
     }
 
@@ -917,7 +954,10 @@ mod tests {
             fold.record_line(&message_end(&format!("line-{i}"), 1, 1));
         }
         let snap = fold.snapshot(LiveProgressStatus::Running);
-        assert!(snap.recent_output.len() <= RECENT_OUTPUT_CAP, "recent_output must stay bounded");
+        assert!(
+            snap.recent_output.len() <= RECENT_OUTPUT_CAP,
+            "recent_output must stay bounded"
+        );
     }
 
     #[test]
@@ -961,19 +1001,35 @@ mod tests {
         let payload = SubagentUpdatePayload::single_live(ContextMode::Fork, progress);
         let lines = render_inline_result(&payload, 0);
         let plain = lines_to_plain_text(&lines);
-        assert!(plain.iter().any(|l| l.contains("researcher")), "header must name the agent: {plain:?}");
-        assert!(plain.iter().any(|l| l.contains("[fork]")), "fork context must render the badge: {plain:?}");
-        assert!(plain.iter().any(|l| l.contains("1 tools")), "stats line must render counts: {plain:?}");
+        assert!(
+            plain.iter().any(|l| l.contains("researcher")),
+            "header must name the agent: {plain:?}"
+        );
+        assert!(
+            plain.iter().any(|l| l.contains("[fork]")),
+            "fork context must render the badge: {plain:?}"
+        );
+        assert!(
+            plain.iter().any(|l| l.contains("1 tools")),
+            "stats line must render counts: {plain:?}"
+        );
     }
 
     #[test]
     fn async_job_snapshot_bridges_to_render_background_region() {
         let status = RunStatus::queued(RunId::new(), RunMode::Chain, Some(4321));
-        let job = AsyncJobSnapshot::from_run_status(&status, Some("planner".to_string()), ContextMode::Fresh);
+        let job = AsyncJobSnapshot::from_run_status(
+            &status,
+            Some("planner".to_string()),
+            ContextMode::Fresh,
+        );
         assert_eq!(job.mode, RunMode::Chain);
         assert_eq!(job.agent.as_deref(), Some("planner"));
         let lines = render_async_jobs_widget(std::slice::from_ref(&job), 0);
         let plain = lines_to_plain_text(&lines);
-        assert!(plain.iter().any(|l| l.contains("planner")), "widget row must name the agent: {plain:?}");
+        assert!(
+            plain.iter().any(|l| l.contains("planner")),
+            "widget row must name the agent: {plain:?}"
+        );
     }
 }

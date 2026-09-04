@@ -181,12 +181,18 @@ impl FleetActionResult {
     /// A success notice.
     #[must_use]
     pub fn ok(text: impl Into<String>) -> Self {
-        Self { text: text.into(), is_error: false }
+        Self {
+            text: text.into(),
+            is_error: false,
+        }
     }
     /// An error notice.
     #[must_use]
     pub fn error(text: impl Into<String>) -> Self {
-        Self { text: text.into(), is_error: true }
+        Self {
+            text: text.into(),
+            is_error: true,
+        }
     }
 }
 
@@ -238,7 +244,10 @@ pub struct FleetViewOptions {
 
 impl Default for FleetViewOptions {
     fn default() -> Self {
-        Self { refresh_ms: REFRESH_MS, limit: MAX_RECENT_ASYNC_RUNS }
+        Self {
+            refresh_ms: REFRESH_MS,
+            limit: MAX_RECENT_ASYNC_RUNS,
+        }
     }
 }
 
@@ -263,8 +272,7 @@ pub fn belongs_to_current_session(
 #[must_use]
 pub fn order_fleet_async_runs(runs: &[AsyncRunView], terminal_limit: usize) -> Vec<AsyncRunView> {
     let mut active: Vec<AsyncRunView> = runs.iter().filter(|r| r.is_active()).cloned().collect();
-    let mut terminal: Vec<AsyncRunView> =
-        runs.iter().filter(|r| !r.is_active()).cloned().collect();
+    let mut terminal: Vec<AsyncRunView> = runs.iter().filter(|r| !r.is_active()).cloned().collect();
     active.sort_by_key(|run| std::cmp::Reverse(run.updated_at()));
     terminal.sort_by_key(|run| std::cmp::Reverse(run.updated_at()));
     terminal.truncate(terminal_limit);
@@ -280,7 +288,10 @@ pub fn async_items(run: &AsyncRunView) -> Vec<FleetItem> {
     if run.status.steps.is_empty() {
         return vec![FleetItem {
             key: format!("async:{}", run.status.run_id.as_str()),
-            kind: FleetItemKind::Async { run: Box::new(run.clone()), step_index: None },
+            kind: FleetItemKind::Async {
+                run: Box::new(run.clone()),
+                step_index: None,
+            },
             run_id: run.status.run_id.as_str().to_string(),
             index: None,
             agent: crate::background::run_status::run_mode_label(run.status.mode).to_string(),
@@ -353,12 +364,9 @@ pub fn collect_fleet_snapshot(state: &FleetState, options: &FleetViewOptions) ->
             },
             run_id: control.run_id.clone(),
             index: control.current_index,
-            agent: control
-                .current_agent
-                .clone()
-                .unwrap_or_else(|| {
-                    crate::background::run_status::run_mode_label(control.mode).to_string()
-                }),
+            agent: control.current_agent.clone().unwrap_or_else(|| {
+                crate::background::run_status::run_mode_label(control.mode).to_string()
+            }),
             state: "running".to_string(),
             updated_at: control.updated_at,
             description: control.description.clone(),
@@ -370,7 +378,10 @@ pub fn collect_fleet_snapshot(state: &FleetState, options: &FleetViewOptions) ->
         .tracked_jobs
         .iter()
         .filter(|job| {
-            belongs_to_current_session(job.session_id.as_deref(), state.current_session_id.as_deref())
+            belongs_to_current_session(
+                job.session_id.as_deref(),
+                state.current_session_id.as_deref(),
+            )
         })
         .cloned()
         .collect();
@@ -431,7 +442,10 @@ pub fn collect_fleet_snapshot(state: &FleetState, options: &FleetViewOptions) ->
         }
     }
 
-    FleetSnapshot { items, error: state.scan_error.clone() }
+    FleetSnapshot {
+        items,
+        error: state.scan_error.clone(),
+    }
 }
 
 /// pi's `listAsyncRuns(options.asyncDirRoot, { ...(state.currentSessionId ? { sessionId:
@@ -477,14 +491,20 @@ pub async fn collect_fleet_history(
     // upstream's `isNotFoundError ⇒ undefined` filter does.
     let mut candidates: Vec<(i128, RunPaths)> = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
-        let Ok(file_type) = entry.file_type().await else { continue };
+        let Ok(file_type) = entry.file_type().await else {
+            continue;
+        };
         if !file_type.is_dir() {
             continue;
         }
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else { continue };
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
         let run_id = crate::background::RunId::from_token(name);
         let paths = RunPaths::for_run(async_root, results_dir, &run_id);
-        let Ok(meta) = tokio::fs::metadata(&paths.status).await else { continue };
+        let Ok(meta) = tokio::fs::metadata(&paths.status).await else {
+            continue;
+        };
         let mtime = meta
             .modified()
             .ok()
@@ -497,8 +517,12 @@ pub async fn collect_fleet_history(
 
     let mut runs: Vec<AsyncRunView> = Vec::new();
     for (_, paths) in candidates {
-        let Ok(bytes) = tokio::fs::read(&paths.status).await else { continue };
-        let Ok(status) = serde_json::from_slice::<RunStatus>(&bytes) else { continue };
+        let Ok(bytes) = tokio::fs::read(&paths.status).await else {
+            continue;
+        };
+        let Ok(status) = serde_json::from_slice::<RunStatus>(&bytes) else {
+            continue;
+        };
         // pi `async-status.ts:432` — `if (options.sessionId && status.sessionId !==
         // options.sessionId) continue;`. The comparison is against the sessionId recorded ON THE
         // RUN ([`crate::background::RunStatus::session_id`], stamped by the detached runner from
@@ -611,7 +635,10 @@ pub fn item_stats(item: &FleetItem, now: i64) -> Vec<String> {
     let tools: Option<u64>;
     let duration_ms: Option<i64>;
     match &item.kind {
-        FleetItemKind::ForegroundActive { control, active_child_index } => {
+        FleetItemKind::ForegroundActive {
+            control,
+            active_child_index,
+        } => {
             let child = active_child_index
                 .and_then(|i| control.active_children.iter().find(|c| c.index == i));
             let (m, t, tc, started) = match child {
@@ -645,7 +672,8 @@ pub fn item_stats(item: &FleetItem, now: i64) -> Vec<String> {
         FleetItemKind::Async { run, step_index } => {
             let step = step_index.and_then(|i| run.status.steps.get(i));
             model = format_model_thinking_opt(
-                step.and_then(|s| s.model.as_ref()).map(cyrup_core::ModelId::as_str),
+                step.and_then(|s| s.model.as_ref())
+                    .map(cyrup_core::ModelId::as_str),
                 step.and_then(|s| s.telemetry.thinking.as_deref()),
             );
             tokens = step
@@ -657,16 +685,22 @@ pub fn item_stats(item: &FleetItem, now: i64) -> Vec<String> {
                         None
                     }
                 });
-            tools = step
-                .and_then(|s| s.telemetry.tool_count)
-                .or_else(|| {
-                    if item.index.is_none() { run.status.telemetry.tool_count } else { None }
-                });
+            tools = step.and_then(|s| s.telemetry.tool_count).or_else(|| {
+                if item.index.is_none() {
+                    run.status.telemetry.tool_count
+                } else {
+                    None
+                }
+            });
             let terminal_run = !is_actionable_async_state(&item.state);
             let end_time = run
                 .status
                 .ended_at
-                .or(if terminal_run { Some(run.status.last_update) } else { None })
+                .or(if terminal_run {
+                    Some(run.status.last_update)
+                } else {
+                    None
+                })
                 .unwrap_or(now);
             duration_ms = step
                 .and_then(|s| match (s.started_at, s.ended_at) {
@@ -733,7 +767,10 @@ fn foreground_active_detail(
         format!("Run: {}", item.run_id),
         "Source: foreground".to_string(),
         "State: running".to_string(),
-        format!("Mode: {}", crate::background::run_status::run_mode_label(control.mode)),
+        format!(
+            "Mode: {}",
+            crate::background::run_status::run_mode_label(control.mode)
+        ),
         match item.index {
             Some(index) => format!("Child: {index} ({})", item.agent),
             None => format!("Agent: {}", item.agent),
@@ -785,10 +822,15 @@ fn foreground_recent_detail(
         format!("Run: {}", item.run_id),
         "Source: foreground".to_string(),
         format!("State: {}", child.status),
-        format!("Mode: {}", crate::background::run_status::run_mode_label(run.mode)),
+        format!(
+            "Mode: {}",
+            crate::background::run_status::run_mode_label(run.mode)
+        ),
         format!("Child: {} ({}){context}", child.index, child.agent),
     ];
-    if let Some(model) = format_model_thinking_opt(child.model.as_deref(), child.thinking.as_deref()) {
+    if let Some(model) =
+        format_model_thinking_opt(child.model.as_deref(), child.thinking.as_deref())
+    {
         lines.push(format!("Model: {model}"));
     }
     lines.push(format!(
@@ -832,9 +874,29 @@ fn foreground_recent_detail(
     lines
 }
 
-/// pi `asyncDetail(item)` (`fleet.ts:289-307`): the full transcript body when the run's status is
-/// still readable, else pi's small "(status is no longer available)" block.
-fn async_detail(item: &FleetItem, run: &AsyncRunView, step_index: Option<usize>) -> Vec<String> {
+/// pi `asyncDetail(item, state)` (`fleet.ts:551-585` @v0.64.0; `:289-307` @v0.43.0): the full
+/// transcript body when the run's status is still readable, else pi's small "(status is no longer
+/// available)" block.
+///
+/// SUBA-091 — the transcript call passes `sessionRoots: uniquePaths([...(state.trustedSessionRoots
+/// ?? []), trackedJob?.sessionRoot])` (`fleet.ts:557`, landed as `9ceb5650` #1174): the roots the
+/// session-JSONL fallback is confined to. Before that commit the call omitted them, and this port
+/// passed a literal `&[]`, so the fallback refused every read. cyrup's tracked job carries no
+/// `sessionRoot` of its own ([`crate::background::tracker::TrackedJob`] has no such field — its
+/// session root is always the configured `default_session_dir` rung the state already lists), so
+/// [`FleetState::trusted_session_roots`] is the sole source here.
+///
+/// **[CYRUP-DELTA]** pi additionally passes `trustedSessionFiles: [item.step?.sessionFile ??
+/// item.run.sessionFile]` and `trustedSessionFileRoot: state.trustedSessionFileRoot` (`:558-559`,
+/// v0.57.0+), a second containment rung under `<agentDir>/sessions`.
+/// [`crate::background::fleet_view::format_async_run_transcript`] has no such parameters yet;
+/// that rung is recorded as a residual, not folded into `session_roots`.
+fn async_detail(
+    item: &FleetItem,
+    run: &AsyncRunView,
+    step_index: Option<usize>,
+    state: &FleetState,
+) -> Vec<String> {
     // pi calls `readStatus(item.run.asyncDir)` here; cyrup's [`AsyncRunView`] already carries the
     // reconciled status it would return, so the read is not repeated. A run whose directory has
     // gone away is the `None` case below, driven by the caller dropping it from the snapshot.
@@ -844,7 +906,14 @@ fn async_detail(item: &FleetItem, run: &AsyncRunView, step_index: Option<usize>)
             &run.paths,
             step_index,
             Some(TRANSCRIPT_LINES as i64),
-            &[],
+            &unique_paths(
+                state
+                    .trusted_session_roots
+                    .iter()
+                    .cloned()
+                    .map(Some)
+                    .collect(),
+            ),
         )
     {
         return text.split('\n').map(str::to_string).collect();
@@ -866,7 +935,10 @@ fn async_detail(item: &FleetItem, run: &AsyncRunView, step_index: Option<usize>)
         },
     ];
     if let Some(index) = item.index {
-        lines.push(format!("Output: {}", run.paths.step_output_log(index).display()));
+        lines.push(format!(
+            "Output: {}",
+            run.paths.step_output_log(index).display()
+        ));
     }
     let session = step_index
         .and_then(|i| run.status.steps.get(i))
@@ -881,15 +953,19 @@ fn async_detail(item: &FleetItem, run: &AsyncRunView, step_index: Option<usize>)
     lines
 }
 
-/// pi `detailLines(item, error)` (`fleet.ts:309-318`).
+/// pi `detailLines(item, error, state)` (`fleet.ts:309-318` @v0.43.0; the `state` argument since
+/// `9ceb5650`, `fleet.ts:588-599` @v0.64.0) — `state` reaches only the async arm, for its trusted
+/// session roots.
 #[must_use]
-pub fn detail_lines(item: Option<&FleetItem>, error: Option<&str>) -> Vec<String> {
+pub fn detail_lines(
+    item: Option<&FleetItem>,
+    error: Option<&str>,
+    state: &FleetState,
+) -> Vec<String> {
     let Some(item) = item else {
         return vec![
             error.map_or_else(
-                || {
-                    "No current-session foreground or recent async children.".to_string()
-                },
+                || "No current-session foreground or recent async children.".to_string(),
                 |e| format!("Fleet scan failed: {e}"),
             ),
             String::new(),
@@ -897,13 +973,14 @@ pub fn detail_lines(item: Option<&FleetItem>, error: Option<&str>) -> Vec<String
         ];
     };
     let mut lines = match &item.kind {
-        FleetItemKind::ForegroundActive { control, active_child_index } => {
-            foreground_active_detail(item, control, *active_child_index)
-        }
+        FleetItemKind::ForegroundActive {
+            control,
+            active_child_index,
+        } => foreground_active_detail(item, control, *active_child_index),
         FleetItemKind::ForegroundRecent { run, child } => {
             foreground_recent_detail(item, run, child)
         }
-        FleetItemKind::Async { run, step_index } => async_detail(item, run, *step_index),
+        FleetItemKind::Async { run, step_index } => async_detail(item, run, *step_index, state),
     };
     if let Some(error) = error {
         lines.insert(0, String::new());
@@ -989,7 +1066,10 @@ pub fn fleet_artifacts_root(state: &FleetState, cwd: &Path) -> PathBuf {
 pub fn transcript_target(item: &FleetItem, state: &FleetState) -> Option<TranscriptTarget> {
     match &item.kind {
         FleetItemKind::ForegroundActive { control, .. } => {
-            let cwd = control.cwd.clone().unwrap_or_else(|| state.base_cwd.clone());
+            let cwd = control
+                .cwd
+                .clone()
+                .unwrap_or_else(|| state.base_cwd.clone());
             let artifacts_root = fleet_artifacts_root(state, &cwd);
             // Delta 3 of `fleet_transcript`: pi's fifth `ArtifactPaths` field `transcriptPath` has
             // no cyrup analogue, and the `.jsonl` event stream is the artifact cyrup writes in its
@@ -1022,7 +1102,11 @@ pub fn transcript_target(item: &FleetItem, state: &FleetState) -> Option<Transcr
         }
         FleetItemKind::Async { run, step_index } => {
             // pi: the named step, else the sole step of a one-step run (`fleet.ts:363`).
-            let index = step_index.or(if run.status.steps.len() == 1 { Some(0) } else { None })?;
+            let index = step_index.or(if run.status.steps.len() == 1 {
+                Some(0)
+            } else {
+                None
+            })?;
             let step = run.status.steps.get(index)?;
             // cyrup's step records its output log rather than a separate transcript file.
             let transcript_path = step.telemetry.output_file.clone()?;
@@ -1104,7 +1188,10 @@ pub fn structured_header(
         th::raw(" "),
         th::fg(Role::Dim, format!("· {conversation_state}")),
     ]));
-    lines.into_iter().map(|line| th::clip(&line, width)).collect()
+    lines
+        .into_iter()
+        .map(|line| th::clip(&line, width))
+        .collect()
 }
 
 // =================================================================================================
@@ -1432,8 +1519,7 @@ impl SubagentFleetComponent {
                     .to_string(),
             );
         };
-        if !is_actionable_async_state(run.state_label())
-            || !is_actionable_async_state(&item.state)
+        if !is_actionable_async_state(run.state_label()) || !is_actionable_async_state(&item.state)
         {
             return Err(format!(
                 "Selected child is {}; controls require a running or queued async child.",
@@ -1598,10 +1684,7 @@ impl SubagentFleetComponent {
                     if self.has_actions && self.has_inspect {
                         Ok(target)
                     } else {
-                        Err(
-                            "Herdr inspector controls are unavailable in this context."
-                                .to_string(),
-                        )
+                        Err("Herdr inspector controls are unavailable in this context.".to_string())
                     }
                 });
                 match resolved {
@@ -1677,7 +1760,11 @@ impl SubagentFleetComponent {
                  returns · Esc cancels",
             )]));
         } else if let Some(notice) = self.action_notice.as_ref() {
-            let role = if notice.is_error { Role::Error } else { Role::Success };
+            let role = if notice.is_error {
+                Role::Error
+            } else {
+                Role::Success
+            };
             lines.push(Line::from(vec![th::fg(role, notice.text.clone())]));
         }
         lines
@@ -1800,7 +1887,11 @@ impl SubagentFleetComponent {
     /// pi `wrappedDetail(width)` (`fleet.ts:746-786`) — the transcript-backed form when the
     /// selected child has readable events, else the structured fallback with pi's per-prefix
     /// styling.
-    fn wrapped_detail(&mut self, width: usize, now: i64) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
+    fn wrapped_detail(
+        &mut self,
+        width: usize,
+        now: i64,
+    ) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
         let selected = self.snapshot.items.get(self.selected).cloned();
         let mut transcript_warning: Option<String> = None;
         if let Some(item) = selected.as_ref()
@@ -1820,7 +1911,9 @@ impl SubagentFleetComponent {
                     );
                 }
                 let conversation_state = match transcript.events.last() {
-                    Some(FleetTranscriptEvent::Assistant { .. }) => "assistant response".to_string(),
+                    Some(FleetTranscriptEvent::Assistant { .. }) => {
+                        "assistant response".to_string()
+                    }
                     Some(FleetTranscriptEvent::User { .. }) => "supervisor message".to_string(),
                     Some(FleetTranscriptEvent::Tool(tool)) => format!(
                         "{} · {}",
@@ -1838,7 +1931,11 @@ impl SubagentFleetComponent {
             }
         }
 
-        let mut raw = detail_lines(selected.as_ref(), self.snapshot.error.as_deref());
+        let mut raw = detail_lines(
+            selected.as_ref(),
+            self.snapshot.error.as_deref(),
+            &self.state,
+        );
         if let Some(warning) = transcript_warning {
             raw.insert(0, String::new());
             raw.insert(0, format!("Transcript preview warning: {warning}"));
@@ -1974,8 +2071,7 @@ impl SubagentFleetComponent {
              {position}"
         );
         let mut footer_row = vec![th::fg(Role::Border, "│")];
-        footer_row
-            .extend(th::fit(&Line::from(vec![th::fg(Role::Dim, footer)]), inner_width).spans);
+        footer_row.extend(th::fit(&Line::from(vec![th::fg(Role::Dim, footer)]), inner_width).spans);
         footer_row.push(th::fg(Role::Border, "│"));
         lines.push(Line::from(footer_row));
         lines.push(Line::from(vec![th::fg(
@@ -1994,8 +2090,7 @@ fn style_detail_line(line: &str) -> Line<'static> {
     const BOLD_PREFIXES: [&str; 6] = ["Run:", "State:", "Mode:", "Source:", "Child:", "Agent:"];
     const BOLD_PREFIX_MODEL: &str = "Model:";
     const ACCENT_PREFIXES: [&str; 2] = ["Transcript", "Result transcript tail"];
-    const MUTED_PREFIXES: [&str; 4] =
-        ["Output:", "Session:", "Transcript file:", "Artifacts:"];
+    const MUTED_PREFIXES: [&str; 4] = ["Output:", "Session:", "Transcript file:", "Artifacts:"];
     // The BRANCH ORDER is load-bearing and is upstream's, not a tidier one. `fleet.ts:773-781` is a
     // single nested ternary evaluated top-down: bold, then `/^(Transcript|Result transcript tail)/`,
     // then the muted set, then `/^Transcript preview warning:/`. Because the accent test is a bare
@@ -2090,7 +2185,10 @@ pub fn open_subagent_fleet(
 /// result onto a [`FleetActionResult`]. cyrup's control ops return `Result<String, String>`, whose
 /// `Err` IS pi's `isError: true` (the convention `background/fleet_view.rs` already documents).
 #[must_use]
-pub fn action_result_from_control(result: Result<String, String>, fallback: &str) -> FleetActionResult {
+pub fn action_result_from_control(
+    result: Result<String, String>,
+    fallback: &str,
+) -> FleetActionResult {
     match result {
         Ok(text) if text.trim().is_empty() => FleetActionResult::error(fallback),
         Ok(text) => FleetActionResult::ok(text),
@@ -2120,7 +2218,12 @@ mod tests {
         )
     }
 
-    fn async_run(id: &str, state: RunState, steps: Vec<StepStatus>, last_update: i64) -> AsyncRunView {
+    fn async_run(
+        id: &str,
+        state: RunState,
+        steps: Vec<StepStatus>,
+        last_update: i64,
+    ) -> AsyncRunView {
         let mut status = RunStatus::queued(RunId::from_token(id.to_string()), RunMode::Chain, None);
         status.state = state;
         status.steps = steps;
@@ -2161,7 +2264,12 @@ mod tests {
     fn snapshot_orders_foreground_newest_first_then_background_then_settled() {
         let state = FleetState {
             foreground_controls: vec![control("fg-old", "a", 100), control("fg-new", "b", 900)],
-            tracked_jobs: vec![async_run("bg", RunState::Running, vec![step("s0", StepState::Running)], 500)],
+            tracked_jobs: vec![async_run(
+                "bg",
+                RunState::Running,
+                vec![step("s0", StepState::Running)],
+                500,
+            )],
             foreground_runs: vec![ForegroundResumeRunView {
                 run_id: "settled".into(),
                 updated_at: 50,
@@ -2177,7 +2285,11 @@ mod tests {
         };
         let snapshot = collect_fleet_snapshot(&state, &FleetViewOptions::default());
         assert_eq!(
-            snapshot.items.iter().map(|i| i.key.as_str()).collect::<Vec<_>>(),
+            snapshot
+                .items
+                .iter()
+                .map(|i| i.key.as_str())
+                .collect::<Vec<_>>(),
             vec![
                 "foreground-active:fg-new:0",
                 "foreground-active:fg-old:0",
@@ -2213,13 +2325,30 @@ mod tests {
     fn active_children_expand_into_one_row_each_sorted_by_index() {
         let mut c = control("fan", "a", 100);
         c.active_children = vec![
-            ForegroundChildView { index: 2, agent: "c".into(), updated_at: 5, ..Default::default() },
-            ForegroundChildView { index: 0, agent: "a".into(), updated_at: 5, ..Default::default() },
+            ForegroundChildView {
+                index: 2,
+                agent: "c".into(),
+                updated_at: 5,
+                ..Default::default()
+            },
+            ForegroundChildView {
+                index: 0,
+                agent: "a".into(),
+                updated_at: 5,
+                ..Default::default()
+            },
         ];
-        let state = FleetState { foreground_controls: vec![c], ..FleetState::default() };
+        let state = FleetState {
+            foreground_controls: vec![c],
+            ..FleetState::default()
+        };
         let snapshot = collect_fleet_snapshot(&state, &FleetViewOptions::default());
         assert_eq!(
-            snapshot.items.iter().map(|i| i.agent.as_str()).collect::<Vec<_>>(),
+            snapshot
+                .items
+                .iter()
+                .map(|i| i.agent.as_str())
+                .collect::<Vec<_>>(),
             vec!["a", "c"]
         );
     }
@@ -2245,7 +2374,9 @@ mod tests {
             ..FleetState::default()
         };
         assert_eq!(
-            collect_fleet_snapshot(&no_session, &FleetViewOptions::default()).items.len(),
+            collect_fleet_snapshot(&no_session, &FleetViewOptions::default())
+                .items
+                .len(),
             2
         );
     }
@@ -2262,7 +2393,11 @@ mod tests {
         };
         let snapshot = collect_fleet_snapshot(&state, &FleetViewOptions::default());
         assert_eq!(
-            snapshot.items.iter().map(|i| i.run_id.as_str()).collect::<Vec<_>>(),
+            snapshot
+                .items
+                .iter()
+                .map(|i| i.run_id.as_str())
+                .collect::<Vec<_>>(),
             vec!["r", "other"]
         );
     }
@@ -2272,12 +2407,24 @@ mod tests {
         let history: Vec<AsyncRunView> = (0..5)
             .map(|i| async_run(&format!("t{i}"), RunState::Complete, Vec::new(), i))
             .collect();
-        let state = FleetState { history_jobs: history, ..FleetState::default() };
-        let snapshot =
-            collect_fleet_snapshot(&state, &FleetViewOptions { limit: 2, ..Default::default() });
+        let state = FleetState {
+            history_jobs: history,
+            ..FleetState::default()
+        };
+        let snapshot = collect_fleet_snapshot(
+            &state,
+            &FleetViewOptions {
+                limit: 2,
+                ..Default::default()
+            },
+        );
         // Newest first, capped at two.
         assert_eq!(
-            snapshot.items.iter().map(|i| i.run_id.as_str()).collect::<Vec<_>>(),
+            snapshot
+                .items
+                .iter()
+                .map(|i| i.run_id.as_str())
+                .collect::<Vec<_>>(),
             vec!["t4", "t3"]
         );
     }
@@ -2287,13 +2434,23 @@ mod tests {
         let run = async_run(
             "chain",
             RunState::Running,
-            vec![step("a", StepState::Complete), step("b", StepState::Running)],
+            vec![
+                step("a", StepState::Complete),
+                step("b", StepState::Running),
+            ],
             100,
         );
-        let state = FleetState { tracked_jobs: vec![run], ..FleetState::default() };
+        let state = FleetState {
+            tracked_jobs: vec![run],
+            ..FleetState::default()
+        };
         let snapshot = collect_fleet_snapshot(&state, &FleetViewOptions::default());
         assert_eq!(
-            snapshot.items.iter().map(|i| (i.key.as_str(), i.state.as_str())).collect::<Vec<_>>(),
+            snapshot
+                .items
+                .iter()
+                .map(|i| (i.key.as_str(), i.state.as_str()))
+                .collect::<Vec<_>>(),
             vec![("async:chain:0", "complete"), ("async:chain:1", "running")]
         );
     }
@@ -2309,7 +2466,10 @@ mod tests {
         assert_eq!(th::line_text(&Line::from(status_glyph("completed"))), "✓");
         assert_eq!(th::line_text(&Line::from(status_glyph("detached"))), "■");
         assert_eq!(th::line_text(&Line::from(status_glyph("failed"))), "✗");
-        assert_eq!(th::line_text(&Line::from(status_glyph("anything else"))), "✗");
+        assert_eq!(
+            th::line_text(&Line::from(status_glyph("anything else"))),
+            "✗"
+        );
     }
 
     #[test]
@@ -2324,15 +2484,24 @@ mod tests {
     #[test]
     fn iso8601_matches_the_javascript_form() {
         assert_eq!(format_iso8601(0), "1970-01-01T00:00:00.000Z");
-        assert_eq!(format_iso8601(1_700_000_000_123), "2023-11-14T22:13:20.123Z");
+        assert_eq!(
+            format_iso8601(1_700_000_000_123),
+            "2023-11-14T22:13:20.123Z"
+        );
     }
 
     #[test]
     fn empty_snapshot_detail_reads_upstreams_two_sentences() {
-        let lines = detail_lines(None, None);
-        assert_eq!(lines[0], "No current-session foreground or recent async children.");
-        assert_eq!(lines[2], "New runs appear here automatically while this inspector remains open.");
-        let failed = detail_lines(None, Some("boom"));
+        let lines = detail_lines(None, None, &FleetState::default());
+        assert_eq!(
+            lines[0],
+            "No current-session foreground or recent async children."
+        );
+        assert_eq!(
+            lines[2],
+            "New runs appear here automatically while this inspector remains open."
+        );
+        let failed = detail_lines(None, Some("boom"), &FleetState::default());
         assert_eq!(failed[0], "Fleet scan failed: boom");
     }
 
@@ -2345,7 +2514,11 @@ mod tests {
             ..FleetState::default()
         };
         let snapshot = collect_fleet_snapshot(&state, &FleetViewOptions::default());
-        assert_eq!(snapshot.items.len(), 1, "the live half must survive a failed scan");
+        assert_eq!(
+            snapshot.items.len(),
+            1,
+            "the live half must survive a failed scan"
+        );
         assert_eq!(snapshot.error.as_deref(), Some("permission denied"));
     }
 
@@ -2356,10 +2529,125 @@ mod tests {
             ..FleetState::default()
         };
         let snapshot = collect_fleet_snapshot(&state, &FleetViewOptions::default());
-        let lines = detail_lines(snapshot.items.first(), Some("scan blew up"));
+        let lines = detail_lines(snapshot.items.first(), Some("scan blew up"), &state);
         assert_eq!(lines[0], "Fleet scan warning: scan blew up");
         assert_eq!(lines[1], "");
         assert_eq!(lines[2], "Run: r");
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // SUBA-091 — asyncDetail's session-transcript fallback and its trusted roots
+    // (pi `fleet.ts:551-560` @v0.64.0, landed as `9ceb5650` #1174)
+    // -----------------------------------------------------------------------------------------
+
+    /// A background run that recorded ONLY a session file — no `output-<i>.log` on disk and an
+    /// empty `recentOutput` ring — so `format_async_run_transcript`'s third rung (the session
+    /// JSONL tail) is the only source left.
+    fn session_only_run(root: &Path, session_file: &Path) -> AsyncRunView {
+        let id = RunId::from_token("sessfallback".to_string());
+        let paths = RunPaths::for_run(root, root, &id);
+        std::fs::create_dir_all(&paths.run_dir).expect("run dir");
+        let mut status = RunStatus::queued(id, RunMode::Single, Some(1));
+        status.state = RunState::Complete;
+        status.session_file = Some(session_file.to_path_buf());
+        let mut worker = step("worker", StepState::Complete);
+        worker.session_file = Some(session_file.to_path_buf());
+        status.steps = vec![worker];
+        AsyncRunView {
+            paths,
+            status,
+            session_id: None,
+            description: None,
+            context: None,
+            nested_children: Vec::new(),
+        }
+    }
+
+    fn write_session_line(session_file: &Path, text: &str) {
+        std::fs::create_dir_all(session_file.parent().expect("parent")).expect("sessions dir");
+        std::fs::write(
+            session_file,
+            format!(
+                "{}\n",
+                serde_json::json!({ "role": "assistant", "content": text })
+            ),
+        )
+        .expect("write session file");
+    }
+
+    /// pi `test/unit/fleet.test.ts` "passes current-session trusted roots to async session
+    /// transcript fallback" (added by `9ceb5650`): with the session file inside one of
+    /// `state.trustedSessionRoots`, the detail pane shows the session tail and carries neither
+    /// refusal. Pre-fix the fleet passed a literal empty slice, so this rendered `Warnings:` +
+    /// `Refusing to read session transcript path without a trusted root` instead.
+    #[test]
+    fn async_detail_reads_the_session_transcript_tail_inside_a_trusted_session_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessions = dir.path().join("sessions");
+        let session_file = sessions.join("worker.jsonl");
+        write_session_line(&session_file, "TRUSTED SESSION FALLBACK");
+        let state = FleetState {
+            tracked_jobs: vec![session_only_run(dir.path(), &session_file)],
+            trusted_session_roots: vec![sessions],
+            ..FleetState::default()
+        };
+        let snapshot = collect_fleet_snapshot(&state, &FleetViewOptions::default());
+        let text = detail_lines(snapshot.items.first(), None, &state).join("\n");
+        assert!(
+            text.contains("assistant: TRUSTED SESSION FALLBACK"),
+            "the session tail must be rendered: {text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "Session transcript tail from {}",
+                session_file.display()
+            )),
+            "{text}"
+        );
+        assert!(
+            !text.contains("without a trusted root") && !text.contains("Session read failed"),
+            "no refusal may remain: {text}"
+        );
+    }
+
+    /// The containment gate is unchanged by the fix: a recorded session file OUTSIDE every trusted
+    /// root is still refused (it is data a child wrote), and an empty root list still refuses
+    /// outright — pi's `[]` default at `extension/index.ts:447`.
+    #[test]
+    fn async_detail_still_refuses_a_session_file_outside_every_trusted_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let session_file = elsewhere.path().join("worker.jsonl");
+        write_session_line(&session_file, "MUST NOT LEAK");
+        let run = session_only_run(dir.path(), &session_file);
+
+        let outside = FleetState {
+            tracked_jobs: vec![run.clone()],
+            trusted_session_roots: vec![dir.path().join("sessions")],
+            ..FleetState::default()
+        };
+        let snapshot = collect_fleet_snapshot(&outside, &FleetViewOptions::default());
+        let text = detail_lines(snapshot.items.first(), None, &outside).join("\n");
+        assert!(!text.contains("MUST NOT LEAK"), "{text}");
+        assert!(
+            text.contains("Warnings:")
+                && text.contains("Session read failed for")
+                && text.contains("outside trusted roots"),
+            "{text}"
+        );
+        assert!(
+            text.contains("(no transcript lines available yet)"),
+            "{text}"
+        );
+
+        let no_roots = FleetState {
+            tracked_jobs: vec![run],
+            ..FleetState::default()
+        };
+        let snapshot = collect_fleet_snapshot(&no_roots, &FleetViewOptions::default());
+        let text = detail_lines(snapshot.items.first(), None, &no_roots).join("\n");
+        assert!(!text.contains("MUST NOT LEAK"), "{text}");
+        assert!(text.contains("without a trusted root"), "{text}");
     }
 
     #[test]
@@ -2374,11 +2662,17 @@ mod tests {
             description: Some("do   the\nthing".into()),
             ..Default::default()
         }];
-        let state = FleetState { foreground_controls: vec![c], ..FleetState::default() };
+        let state = FleetState {
+            foreground_controls: vec![c],
+            ..FleetState::default()
+        };
         let snapshot = collect_fleet_snapshot(&state, &FleetViewOptions::default());
         let header = structured_header(&snapshot.items[0], 100, "assistant response", 10_000);
         let text = th::lines_text(&header);
-        assert!(text.contains("foreground · live · abcdefgh · child 2 · single"), "{text}");
+        assert!(
+            text.contains("foreground · live · abcdefgh · child 2 · single"),
+            "{text}"
+        );
         assert!(text.contains("Task  do the thing"), "{text}");
         assert!(text.contains("Conversation · assistant response"), "{text}");
     }
@@ -2421,7 +2715,10 @@ mod tests {
             assert_eq!(span.content.as_ref(), glyph, "{state} glyph");
             let line = Line::from(vec![span]);
             assert!(
-                th::paints_as(th::painted_style(std::slice::from_ref(&line), 4, glyph), role),
+                th::paints_as(
+                    th::painted_style(std::slice::from_ref(&line), 4, glyph),
+                    role
+                ),
                 "{state} must paint as {role:?}"
             );
         }
@@ -2445,8 +2742,15 @@ mod tests {
         );
         // The title itself is bold and UNCOLOURED — a colour here would be a repaint.
         let title = th::painted_style(&frame, 100, "Subagent fleet inspector");
-        assert!(title.add_modifier.contains(Modifier::BOLD), "the title is bold");
-        assert_eq!(title.fg, Some(ratatui::style::Color::Reset), "the title takes no colour");
+        assert!(
+            title.add_modifier.contains(Modifier::BOLD),
+            "the title is bold"
+        );
+        assert_eq!(
+            title.fg,
+            Some(ratatui::style::Color::Reset),
+            "the title takes no colour"
+        );
     }
 
     #[test]
@@ -2503,8 +2807,14 @@ mod tests {
             false,
         );
         let frame = c.render(100, 10_000);
-        assert!(th::paints_as(th::painted_style(&frame, 100, "No tracked children"), Role::Dim));
-        assert!(th::paints_as(th::painted_style(&frame, 100, "no children"), Role::Dim));
+        assert!(th::paints_as(
+            th::painted_style(&frame, 100, "No tracked children"),
+            Role::Dim
+        ));
+        assert!(th::paints_as(
+            th::painted_style(&frame, 100, "no children"),
+            Role::Dim
+        ));
     }
 
     #[test]
@@ -2514,7 +2824,10 @@ mod tests {
         c.handle_input(FleetKey::Char('s'));
         let frame = c.render(100, 10_000);
         assert!(
-            th::paints_as(th::painted_style(&frame, 100, "Steer message"), Role::Accent),
+            th::paints_as(
+                th::painted_style(&frame, 100, "Steer message"),
+                Role::Accent
+            ),
             "the steer prompt is accent"
         );
         assert!(
@@ -2527,7 +2840,10 @@ mod tests {
         c.handle_input(FleetKey::Char('D'));
         let frame = c.render(100, 10_000);
         assert!(
-            th::paints_as(th::painted_style(&frame, 100, "Confirm stop"), Role::Warning),
+            th::paints_as(
+                th::painted_style(&frame, 100, "Confirm stop"),
+                Role::Warning
+            ),
             "the stop confirmation is WARNING, not accent — same pane, different colour"
         );
     }
@@ -2537,12 +2853,18 @@ mod tests {
         let mut c = component();
         c.finish_action(FleetActionResult::ok("steered"));
         let frame = c.render(100, 10_000);
-        assert!(th::paints_as(th::painted_style(&frame, 100, "steered"), Role::Success));
+        assert!(th::paints_as(
+            th::painted_style(&frame, 100, "steered"),
+            Role::Success
+        ));
 
         let mut c = component();
         c.finish_action(FleetActionResult::error("nope"));
         let frame = c.render(100, 10_000);
-        assert!(th::paints_as(th::painted_style(&frame, 100, "nope"), Role::Error));
+        assert!(th::paints_as(
+            th::painted_style(&frame, 100, "nope"),
+            Role::Error
+        ));
     }
 
     #[test]
@@ -2550,33 +2872,57 @@ mod tests {
         let mut c = component();
         assert_eq!(c.handle_input(FleetKey::Escape), FleetInputOutcome::Close);
         assert_eq!(c.handle_input(FleetKey::CtrlC), FleetInputOutcome::Close);
-        assert_eq!(c.handle_input(FleetKey::Char('q')), FleetInputOutcome::Close);
+        assert_eq!(
+            c.handle_input(FleetKey::Char('q')),
+            FleetInputOutcome::Close
+        );
     }
 
     #[test]
     fn selection_moves_and_clamps_at_both_ends() {
         let mut c = component();
-        assert_eq!(c.selected_item().map(|i| i.key.clone()), Some("foreground-active:fg:0".into()));
+        assert_eq!(
+            c.selected_item().map(|i| i.key.clone()),
+            Some("foreground-active:fg:0".into())
+        );
         c.handle_input(FleetKey::Down);
-        assert_eq!(c.selected_item().map(|i| i.key.clone()), Some("async:bg:0".into()));
+        assert_eq!(
+            c.selected_item().map(|i| i.key.clone()),
+            Some("async:bg:0".into())
+        );
         c.handle_input(FleetKey::Down);
-        assert_eq!(c.selected_item().map(|i| i.key.clone()), Some("async:bg:0".into()));
+        assert_eq!(
+            c.selected_item().map(|i| i.key.clone()),
+            Some("async:bg:0".into())
+        );
         c.handle_input(FleetKey::Home);
-        assert_eq!(c.selected_item().map(|i| i.key.clone()), Some("foreground-active:fg:0".into()));
+        assert_eq!(
+            c.selected_item().map(|i| i.key.clone()),
+            Some("foreground-active:fg:0".into())
+        );
         c.handle_input(FleetKey::End);
-        assert_eq!(c.selected_item().map(|i| i.key.clone()), Some("async:bg:0".into()));
+        assert_eq!(
+            c.selected_item().map(|i| i.key.clone()),
+            Some("async:bg:0".into())
+        );
     }
 
     #[test]
     fn selection_survives_a_refresh_that_reorders_the_roster() {
         let mut c = component();
         c.handle_input(FleetKey::Down);
-        assert_eq!(c.selected_item().map(|i| i.key.clone()), Some("async:bg:0".into()));
+        assert_eq!(
+            c.selected_item().map(|i| i.key.clone()),
+            Some("async:bg:0".into())
+        );
         let mut next = busy_state();
         next.foreground_controls.push(control("fg2", "other", 900));
         c.set_state(next);
         c.invalidate();
-        assert_eq!(c.selected_item().map(|i| i.key.clone()), Some("async:bg:0".into()));
+        assert_eq!(
+            c.selected_item().map(|i| i.key.clone()),
+            Some("async:bg:0".into())
+        );
     }
 
     #[test]
@@ -2631,7 +2977,11 @@ mod tests {
         let outcome = c.handle_input(FleetKey::Enter);
         match outcome {
             FleetInputOutcome::RunAction(action) => match *action {
-                FleetPendingAction::Steer { message, mode, target } => {
+                FleetPendingAction::Steer {
+                    message,
+                    mode,
+                    target,
+                } => {
                     assert_eq!(message, "hi");
                     assert_eq!(mode, SteerDeliveryMode::Steer);
                     assert_eq!(target.run_id, "bg");
@@ -2643,7 +2993,10 @@ mod tests {
         }
         c.finish_action(FleetActionResult::ok("steered"));
         assert!(c.steer_draft().is_none());
-        assert_eq!(c.action_notice().map(|n| n.text.clone()), Some("steered".into()));
+        assert_eq!(
+            c.action_notice().map(|n| n.text.clone()),
+            Some("steered".into())
+        );
     }
 
     #[test]
@@ -2654,7 +3007,10 @@ mod tests {
         c.handle_input(FleetKey::Char(' '));
         assert_eq!(c.handle_input(FleetKey::Enter), FleetInputOutcome::Rerender);
         assert!(c.action_notice().unwrap().is_error);
-        assert_eq!(c.action_notice().unwrap().text, "Steer message cannot be empty.");
+        assert_eq!(
+            c.action_notice().unwrap().text,
+            "Steer message cannot be empty."
+        );
     }
 
     #[test]
@@ -2758,7 +3114,10 @@ mod tests {
             true,
             false,
         );
-        assert_eq!(c.selected_item().map(|i| i.key.clone()), Some("async:bg:0".into()));
+        assert_eq!(
+            c.selected_item().map(|i| i.key.clone()),
+            Some("async:bg:0".into())
+        );
     }
 
     // -----------------------------------------------------------------------------------------
@@ -2792,7 +3151,10 @@ mod tests {
         assert!(text.contains("Subagent fleet inspector"), "{text}");
         assert!(text.contains("· live controls"), "{text}");
         assert!(text.contains("› ● coder"), "{text}");
-        assert!(text.contains("↑↓/jk agent · H Herdr · s steer · D stop"), "{text}");
+        assert!(
+            text.contains("↑↓/jk agent · H Herdr · s steer · D stop"),
+            "{text}"
+        );
         assert!(text.contains("1/2"), "{text}");
         // Every rendered row is exactly the frame width.
         for line in &lines {
@@ -2890,7 +3252,10 @@ mod tests {
             true,
             false,
         ) {
-            FleetOpenOutcome::Opened { component, clear_widget_key } => {
+            FleetOpenOutcome::Opened {
+                component,
+                clear_widget_key,
+            } => {
                 assert_eq!(clear_widget_key, FLEET_STATUS_WIDGET_KEY);
                 assert_eq!(component.snapshot().items.len(), 2);
             }
@@ -2916,11 +3281,19 @@ mod tests {
 
     #[test]
     fn transcript_target_for_a_background_step_trusts_the_run_dir() {
-        let mut run = async_run("bg", RunState::Running, vec![step("a", StepState::Running)], 100);
+        let mut run = async_run(
+            "bg",
+            RunState::Running,
+            vec![step("a", StepState::Running)],
+            100,
+        );
         if let Some(first) = run.status.steps.first_mut() {
             first.telemetry.output_file = Some(PathBuf::from("output-0.log"));
         }
-        let state = FleetState { tracked_jobs: vec![run], ..FleetState::default() };
+        let state = FleetState {
+            tracked_jobs: vec![run],
+            ..FleetState::default()
+        };
         let snapshot = collect_fleet_snapshot(&state, &FleetViewOptions::default());
         let target = transcript_target(&snapshot.items[0], &state).unwrap();
         assert!(target.path.ends_with("output-0.log"));
@@ -2968,7 +3341,15 @@ mod tests {
     /// The branches the reordering above must NOT have disturbed.
     #[test]
     fn the_remaining_detail_prefixes_keep_their_upstream_roles() {
-        for bold in ["Run: x", "State: x", "Mode: x", "Source: x", "Child: x", "Agent: x", "Model: x"] {
+        for bold in [
+            "Run: x",
+            "State: x",
+            "Mode: x",
+            "Source: x",
+            "Child: x",
+            "Agent: x",
+            "Model: x",
+        ] {
             assert_eq!(
                 only_style(&style_detail_line(bold)),
                 Style::default().add_modifier(Modifier::BOLD),
@@ -2976,13 +3357,20 @@ mod tests {
             );
         }
         for muted in ["Output: x", "Session: x", "Artifacts: x"] {
-            assert_eq!(only_style(&style_detail_line(muted)), th::style(Role::Muted), "{muted}");
+            assert_eq!(
+                only_style(&style_detail_line(muted)),
+                th::style(Role::Muted),
+                "{muted}"
+            );
         }
         assert_eq!(
             only_style(&style_detail_line("Result transcript tail")),
             th::style(Role::Accent)
         );
         // Anything unmatched stays unstyled.
-        assert_eq!(only_style(&style_detail_line("plain text")), Style::default());
+        assert_eq!(
+            only_style(&style_detail_line("plain text")),
+            Style::default()
+        );
     }
 }

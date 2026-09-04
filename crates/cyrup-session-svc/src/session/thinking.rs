@@ -38,7 +38,9 @@ impl AgentSession {
     /// agent-session.ts:1729-1731).
     pub fn supports_thinking(&self) -> bool {
         // Pi `return !!this.model?.reasoning;` (agent-session.ts:1730) — false with no model.
-        Self::lock(&self.compaction_model).as_ref().is_some_and(|m| m.reasoning)
+        Self::lock(&self.compaction_model)
+            .as_ref()
+            .is_some_and(|m| m.reasoning)
     }
 
     /// Set the thinking level, clamping to the model's capabilities, persisting a
@@ -67,17 +69,21 @@ impl AgentSession {
             return Ok(effective);
         }
         let level_str = crate::builder::thinking_level_to_str(effective);
-        self.manager.lock().await.append_thinking_level_change(&level_str)?;
+        self.manager
+            .lock()
+            .await
+            .append_thinking_level_change(&level_str)?;
         // Only with a model installed: a guest's `ctx.model` stays `undefined` on a modelless
         // session (pi's `ExtensionContext.model` is the optional `session.model`).
         if let (Some(mr), Some(m)) = (Self::lock(&self.model).clone(), model.as_ref()) {
-            self.services.host_services.update_model(
-                mr,
-                m.context_window,
-                Some(level_str.clone()),
-            );
+            self.services
+                .host_services
+                .update_model(mr, m.context_window, Some(level_str.clone()));
         }
-        self.fanout_emit(AgentSessionEvent::ThinkingLevelChanged { level: level_str.clone() }).await;
+        self.fanout_emit(AgentSessionEvent::ThinkingLevelChanged {
+            level: level_str.clone(),
+        })
+        .await;
         let cancel = self.session_cancel.child_token();
         self.services
             .ext_host
@@ -123,7 +129,9 @@ impl AgentSession {
 
     /// Cycle to the next thinking level (Pi `cycleThinkingLevel`, agent-session.ts:1551). Returns
     /// `None` when the model does not support thinking.
-    pub async fn cycle_thinking_level(&self) -> Result<Option<ModelThinkingLevel>, SessionServiceError> {
+    pub async fn cycle_thinking_level(
+        &self,
+    ) -> Result<Option<ModelThinkingLevel>, SessionServiceError> {
         if !self.supports_thinking() {
             return Ok(None);
         }

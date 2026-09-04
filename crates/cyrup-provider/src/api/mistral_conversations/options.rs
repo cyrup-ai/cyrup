@@ -2,7 +2,6 @@
 //! direct `promptMode` / `reasoningEffort` overrides (Pi `MistralOptions`,
 //! mistral-conversations.ts:41-48).
 
-
 /// Mistral `promptMode` (Pi `MistralOptions.promptMode`, mistral-conversations.ts:41). The only
 /// value Pi defines is `"reasoning"`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

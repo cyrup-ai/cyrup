@@ -77,9 +77,7 @@ pub(crate) fn effective_verify_env(
     env: Option<&std::collections::BTreeMap<String, String>>,
 ) -> std::collections::BTreeMap<String, String> {
     let mut merged: std::collections::BTreeMap<String, String> = std::env::vars_os()
-        .filter_map(|(key, value)| {
-            Some((key.into_string().ok()?, value.into_string().ok()?))
-        })
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
         .collect();
     if let Some(declared) = env {
         for (key, value) in declared {
@@ -98,9 +96,7 @@ pub(crate) fn effective_verify_env(
 /// the ASCII every real credential is made of, and both are monotone in string size, so the
 /// longest-first ordering below is preserved either way.
 #[must_use]
-fn verify_redaction_env(
-    env: Option<&std::collections::BTreeMap<String, String>>,
-) -> Vec<String> {
+fn verify_redaction_env(env: Option<&std::collections::BTreeMap<String, String>>) -> Vec<String> {
     effective_verify_env(env)
         .into_iter()
         .filter(|(key, value)| value.len() >= 4 && is_sensitive_env_key(key))

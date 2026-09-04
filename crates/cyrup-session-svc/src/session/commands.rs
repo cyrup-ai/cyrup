@@ -22,7 +22,12 @@ impl AgentSession {
         }
         let cancel = self.session_cancel.child_token();
         // NATIVE built-ins first (R-08-016): route to the owning native extension.
-        match self.services.ext_host.execute_native_command(name, args, &cancel).await {
+        match self
+            .services
+            .ext_host
+            .execute_native_command(name, args, &cancel)
+            .await
+        {
             // A native extension owned + serviced the command (Pi short-circuits regardless of the
             // handler's own Ok/Err — the command was "handled").
             Ok(Some(payload)) => {
@@ -126,7 +131,10 @@ impl AgentSession {
         // matches on `invocationName` (`core/extensions/runner.ts:648`); the bare last-wins
         // `command_owner` did not, so an advertised `check:2` was unreachable.
         if !matches!(
-            self.services.ext_host.registry().resolved_command_owner(name),
+            self.services
+                .ext_host
+                .registry()
+                .resolved_command_owner(name),
             Ok(Some(_))
         ) {
             return false;
@@ -253,7 +261,10 @@ impl AgentSession {
                 // `CommandDescriptor.description` is a non-optional `String` whose empty value is
                 // this port's representation of that absent field, so empty is omitted here.
                 if !cmd.descriptor.description.is_empty() {
-                    entry.insert("description".into(), serde_json::Value::from(cmd.descriptor.description));
+                    entry.insert(
+                        "description".into(),
+                        serde_json::Value::from(cmd.descriptor.description),
+                    );
                 }
                 entry.insert("source".into(), serde_json::Value::from("extension"));
                 // EXT-062 / TUI-012 — cyrup's analog of pi carrying the CALLBACK itself onto the
@@ -269,8 +280,7 @@ impl AgentSession {
                 // Extension rows ONLY. pi wires the callback in the extension-command arm alone;
                 // prompt templates (`:739-743`) and skills (`:758-766`) never get one, so those two
                 // arms below deliberately omit the key.
-                if autocomplete_opt_in
-                    .contains(&(cmd.owner.as_str().to_string(), cmd.name.clone()))
+                if autocomplete_opt_in.contains(&(cmd.owner.as_str().to_string(), cmd.name.clone()))
                 {
                     entry.insert("argumentCompletions".into(), serde_json::Value::Bool(true));
                 }

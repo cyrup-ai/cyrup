@@ -36,26 +36,26 @@
 
 pub mod acceptance;
 pub mod agent_refinements;
+pub mod capability_ceiling;
 pub mod child_protocol;
 pub mod completion_guard;
 pub mod control;
-pub mod mcp_direct_tools;
 pub mod fallback;
+pub mod mcp_direct_tools;
 pub mod model_scope;
 pub mod ndjson;
 pub mod output;
+pub mod permissions;
+pub mod spawn_budget;
 pub mod structured;
 pub mod task_intent;
-pub mod tool_call_summary;
-pub mod tool_budget;
-pub mod turn_budget;
-pub mod capability_ceiling;
 /// SUBA-078 — the `subagents.maxThinking` reasoning-level ceiling.
 pub mod thinking_ceiling;
-pub mod permissions;
-pub mod usage_budget;
-pub mod spawn_budget;
 pub mod tool_availability;
+pub mod tool_budget;
+pub mod tool_call_summary;
+pub mod turn_budget;
+pub mod usage_budget;
 
 /// The static, execution-ready "what to run and how" input surface: [`AgentConfig`],
 /// [`ResolvedAgentPersona`], [`resolve_step_agent_config`], [`RunOptions`], [`LiveEventSink`]
@@ -104,15 +104,15 @@ use std::path::PathBuf;
 
 use cyrup_core::{ModelId, Usage};
 
-use crate::discovery::types::{
-    AgentDefinition, OutputMode,
-};
+use crate::discovery::types::{AgentDefinition, OutputMode};
 use crate::error::SubagentError;
 use crate::exec::acceptance::{
     AcceptanceContract, CleanCompletionGate, apply_post_hoc_correction,
     build_timed_out_acceptance_ledger,
 };
-use crate::exec::completion_guard::{CompletionMutationGuardResult, evaluate_completion_mutation_guard};
+use crate::exec::completion_guard::{
+    CompletionMutationGuardResult, evaluate_completion_mutation_guard,
+};
 use crate::exec::fallback::{AttemptSignal, run_fallback_ladder};
 use crate::exec::output::{
     resolve_output_handoff, snapshot_output_file, truncate_output, validate_file_only_requires_path,
@@ -213,13 +213,34 @@ pub const DEFAULT_FOREGROUND_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 /// explicit and inferred were mutually exclusive, so `acceptance: "attested"` on a write-capable
 /// task ran a weaker gate than the same policy does under pi, silently. The combination rule
 /// itself lives on [`AcceptanceContract::resolve_effective`]; this function only supplies
-/// `run_sync`'s three inputs to it.
+/// `run_sync`'s inputs to it.
+///
+/// SUBA-082 — two of those inputs now come off the agent itself:
+///
+/// * `agent.acceptance_role` is threaded into the inferred half exactly as pi passes
+///   `acceptanceRole: agent.acceptanceRole` to `resolveEffectiveAcceptance`
+///   (`runs/foreground/execution.ts:1834` @v0.64.0), so a declared `read-only`/`writer` replaces
+///   the agent-NAME guess on every dispatch path that reaches `run_sync` (single, chain/parallel
+///   step, background hop-2 — the persona carries it across the process boundary).
+/// * `agent.default_acceptance` — the agent file's `acceptance:` launch default — is NOT applied
+///   here. pi applies it in `applySingleAgentLaunchDefaults` (`subagent-executor.ts:2690-2692`
+///   @v0.64.0), which bails for any `chain`/`tasks` launch; `run_sync` is this crate's shared
+///   chokepoint for chain/parallel steps too, so the default is folded into the single-agent
+///   call's own params upstream of here (`extension/tool/routing.rs::route_single`), where it
+///   reaches `opts.acceptance` through the ordinary explicit-policy lowering. Applying it at this
+///   seam would leak an agent-level default into chain/parallel steps, which pi keeps as
+///   task/step configuration (`docs/agents.md:326` @v0.64.0).
 fn resolve_run_acceptance(
     opts: &RunOptions,
     agent: &AgentConfig,
     task: &str,
 ) -> AcceptanceContract {
-    AcceptanceContract::resolve_effective(opts.acceptance.clone(), &agent.name, task)
+    AcceptanceContract::resolve_effective_for_role(
+        opts.acceptance.clone(),
+        &agent.name,
+        agent.acceptance_role,
+        task,
+    )
 }
 
 /// Run one subagent task to completion, synchronously, against `agent`/`opts` (func-SA §5.2;
@@ -304,7 +325,8 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
     }
 
     // Step 1 (R-SA-025): fail fast before any subprocess spawns.
-    if let Some(err) = validate_file_only_requires_path(opts.output_mode, opts.output_path.as_deref())
+    if let Some(err) =
+        validate_file_only_requires_path(opts.output_mode, opts.output_path.as_deref())
     {
         return pre_spawn_failure(agent, task, err.to_string());
     }
@@ -314,8 +336,8 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
 
     let candidates = resolve_model_candidates(agent, opts);
     if candidates.is_empty() {
-        let error =
-            "no candidate model available for this subagent run (empty fallback ladder)".to_string();
+        let error = "no candidate model available for this subagent run (empty fallback ladder)"
+            .to_string();
         return pre_spawn_failure(agent, task, error);
     }
 
@@ -335,12 +357,13 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
     // the operator's bound excluded, would both hide the misconfiguration.
     // Fail-CLOSED on BOTH steps: a malformed inherited ceiling, and an unrankable level in the
     // fold itself, are each an error rather than "unbounded".
-    let folded = crate::exec::thinking_ceiling::inherited_thinking_ceiling().and_then(|inherited| {
-        crate::exec::thinking_ceiling::intersect_thinking_ceilings(&[
-            opts.thinking_ceiling.as_deref(),
-            inherited.as_deref(),
-        ])
-    });
+    let folded =
+        crate::exec::thinking_ceiling::inherited_thinking_ceiling().and_then(|inherited| {
+            crate::exec::thinking_ceiling::intersect_thinking_ceilings(&[
+                opts.thinking_ceiling.as_deref(),
+                inherited.as_deref(),
+            ])
+        });
     let thinking_ceiling = match folded {
         Ok(ceiling) => ceiling,
         Err(error) => return pre_spawn_failure(agent, task, error),
@@ -369,7 +392,9 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         Err(failure) => return *failure,
     };
     let mut structured_guard = setup.structured_guard;
-    let structured_runtime = structured_guard.as_ref().map(|guard| guard.runtime().clone());
+    let structured_runtime = structured_guard
+        .as_ref()
+        .map(|guard| guard.runtime().clone());
 
     let outcome = drive_fallback_ladder(
         agent,
@@ -402,21 +427,44 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         .as_ref()
         .map(|record| record.turn_budget.clone())
         .unwrap_or_default();
-    let final_output =
-        apply_terminal_preamble(final_output, timed_out, opts.timeout_ms, &turn_budget_tracker);
+    let final_output = apply_terminal_preamble(
+        final_output,
+        timed_out,
+        opts.timeout_ms,
+        &turn_budget_tracker,
+    );
 
-    let (final_output, full_output_for_reference, saved_output_path) =
-        resolve_saved_output(opts, exit_code, final_output, setup.output_snapshot, &mut error);
+    let (final_output, full_output_for_reference, saved_output_path) = resolve_saved_output(
+        opts,
+        exit_code,
+        final_output,
+        setup.output_snapshot,
+        &mut error,
+    );
 
     let (progress, mut control) = winning_attempt_state(last_attempt);
 
-    let mut gates = GateState { exit_code, error, detached, interrupted, timed_out };
+    let mut gates = GateState {
+        exit_code,
+        error,
+        detached,
+        interrupted,
+        timed_out,
+    };
     let structured_output = gates.apply_structured_output(structured_runtime.as_ref(), opts);
     let guard_result = gates.apply_completion_guard(agent, task, &progress, &mut control);
     let acceptance_ledger = gates
-        .apply_acceptance(&contract, &progress, opts, final_output.as_deref(), guard_result)
+        .apply_acceptance(
+            &contract,
+            &progress,
+            opts,
+            final_output.as_deref(),
+            guard_result,
+        )
         .await;
-    let GateState { exit_code, error, .. } = gates;
+    let GateState {
+        exit_code, error, ..
+    } = gates;
 
     let (final_output, output_truncated) = finalize_delivered_output(
         final_output,
@@ -520,12 +568,21 @@ fn depth_guard_failure(agent: &AgentConfig, task: &str) -> Option<SingleResult> 
 /// warns (never filters) for out-of-scope FALLBACK candidates. The ladder returned is identical
 /// either way — an out-of-scope fallback is still attempted, exactly as upstream, because
 /// dropping it would silently change which model ran.
+///
+/// SUBA-088: the provider rung is pi's `agent.modelProvider ?? options.preferredModelProvider`
+/// (`runs/foreground/execution.ts:1885` @v0.64.0) — the agent's own `subagents.defaultProvider`
+/// stamp, else the parent session's provider — under which a bare candidate id is qualified to
+/// `provider/id` before it reaches `--model`.
 fn resolve_model_candidates(agent: &AgentConfig, opts: &RunOptions) -> Vec<ModelId> {
     let (candidates, _scope_warnings) = crate::exec::fallback::build_model_candidates_scoped(
         &opts.model_override,
         agent.model.as_ref(),
         &agent.fallback_models,
         &opts.available_models,
+        agent
+            .model_provider
+            .as_ref()
+            .or(opts.preferred_provider.as_ref()),
         opts.model_scope.as_ref(),
     );
     candidates
@@ -621,10 +678,15 @@ fn resolve_terminal_usage_budget(
     opts: &RunOptions,
     aggregate_usage: &Usage,
     error: Option<String>,
-) -> (Option<crate::exec::usage_budget::UsageBudgetState>, Option<String>) {
+) -> (
+    Option<crate::exec::usage_budget::UsageBudgetState>,
+    Option<String>,
+) {
     let usage_budget = crate::exec::usage_budget::usage_budget_state(
         opts.usage_budget,
-        Some(crate::exec::usage_budget::UsageTotals::from(aggregate_usage)),
+        Some(crate::exec::usage_budget::UsageTotals::from(
+            aggregate_usage,
+        )),
     );
     let error = match (&error, usage_budget.as_ref()) {
         (None, Some(state)) if state.exhausted => Some(
@@ -681,7 +743,8 @@ struct LadderSetup {
     resolved_skill_names: Option<Vec<String>>,
     /// The output file's pre-ladder state (R-SA-031).
     output_snapshot: Option<crate::exec::output::OutputFileSnapshot>,
-    /// This run's private scratch directory.
+    /// This run's private scratch directory — [`crate::background::attempt_scratch_dir`]
+    /// (`<run_scratch>/scratch/<cwd_key>`), never a path under the project `cwd` (SUBA-072).
     scratch_dir: PathBuf,
     /// The structured-output capture runtime, RAII-scoped (SUBA-S01).
     structured_guard: Option<crate::exec::structured::StructuredOutputCleanupGuard>,
@@ -754,7 +817,14 @@ async fn prepare_ladder(
     // snapshot_output_file`'s own doc note for why re-snapshotting per attempt is unnecessary).
     let output_snapshot = snapshot_output_file(opts.output_path.as_deref());
 
-    let scratch_dir = opts.cwd.join(".cyrup-subagent-scratch");
+    // SUBA-072: the per-attempt raw-stdout tee and the structured-output capture file live under
+    // the crate's ONE run-scratch root, keyed by `cwd` — `<temp_root_dir>/scratch/<cwd_key>` —
+    // beside the async/results/artifacts/chain-runs trees, NOT under `opts.cwd` itself. This was
+    // the single call site in the crate that wrote run scratch into the project's working tree;
+    // pi has no such path: every per-spawn scratch file it creates is `os.tmpdir()`-rooted
+    // (`runs/shared/pi-args.ts:787`, `:802`, `:826`, `:841`, `:855` @v0.64.0) and every persisted
+    // run tree hangs off `TEMP_ROOT_DIR` (`shared/types.ts:2689-2695` @v0.64.0).
+    let scratch_dir = crate::background::attempt_scratch_dir(&opts.cwd);
     if let Err(err) = std::fs::create_dir_all(&scratch_dir) {
         return Err(Box::new(pre_spawn_failure(
             agent,
@@ -782,7 +852,11 @@ async fn prepare_ladder(
     if let Some(acks) = opts.steer_ack_dir.as_deref() {
         let _ = std::fs::create_dir_all(acks);
     }
-    if let Some(parent) = opts.steer_capability_path.as_deref().and_then(std::path::Path::parent) {
+    if let Some(parent) = opts
+        .steer_capability_path
+        .as_deref()
+        .and_then(std::path::Path::parent)
+    {
         let _ = std::fs::create_dir_all(parent);
     }
 
@@ -855,7 +929,9 @@ impl SettledAttempt {
                 interrupted: record.interrupted,
                 detached: signal.detached,
                 process_signal: signal.startup.process_signal.clone(),
-                exit_code: signal.exit_code.unwrap_or(if signal.success { 0 } else { 1 }),
+                exit_code: signal
+                    .exit_code
+                    .unwrap_or(if signal.success { 0 } else { 1 }),
                 error: signal.error.clone(),
                 final_output: record.final_output.clone(),
             },
@@ -1365,6 +1441,8 @@ fn build_progress_snapshot(
 pub(crate) fn completion_guard_projection(agent: &AgentConfig) -> AgentDefinition {
     AgentDefinition {
         default_turn_budget: None,
+        default_acceptance: agent.default_acceptance.clone(),
+        acceptance_role: agent.acceptance_role,
         permission_rules: None,
         runner: None,
         name: agent.name.clone(),
@@ -1376,6 +1454,8 @@ pub(crate) fn completion_guard_projection(agent: &AgentConfig) -> AgentDefinitio
         extensions: None,
         extensions_from_default: false,
         subagent_only_extensions: Vec::new(),
+        exclude_tools: None,
+        allow_nested_subagents: None,
         model: agent.model.clone(),
         fallback_models: agent.fallback_models.clone(),
         thinking: None,
@@ -1402,6 +1482,7 @@ pub(crate) fn completion_guard_projection(agent: &AgentConfig) -> AgentDefinitio
         extra_fields: std::collections::BTreeMap::new(),
         override_info: None,
         model_source: None,
+        model_provider: None,
     }
 }
 
@@ -1453,7 +1534,9 @@ pub async fn plan_batch(
         // SUBA-075: upstream's `forceThinkingOffForIndex?.(index) ?? true` fallback. A
         // [`BatchForkRequest`] names a step's context mode and index only — it carries no model
         // ladder — so the batch planner cannot answer the gate and takes the conservative arm.
-        let ctx = resolver.resolve(request.requested, request.index, true).await?;
+        let ctx = resolver
+            .resolve(request.requested, request.index, true)
+            .await?;
         resolved.push(ctx);
     }
     Ok(resolved)
@@ -1473,6 +1556,64 @@ mod tests {
     use crate::exec::testsupport::{base_opts, sample_agent_config};
     use crate::spawn::depth::DepthEnvelope;
 
+    // ---- SUBA-088: a bare model id is qualified by the provider preference before spawn ----
+
+    /// The launch chain `run_sync` drives — `resolve_model_candidates` (pi `buildModelCandidates`
+    /// with `agent.modelProvider ?? options.preferredModelProvider`, `execution.ts:1885`
+    /// @v0.64.0) into `build_attempt_spawn_plan` — must put `openai-codex/gpt-5` on the child's
+    /// `--model` for a persona whose `model: gpt-5` is bare and whose provider comes from
+    /// `subagents.defaultProvider` (stamped as `model_provider`). Before SUBA-088 the ladder had
+    /// no provider input and the argv carried bare `gpt-5`, leaving the child's own default
+    /// provider to decide.
+    #[test]
+    fn a_bare_persona_model_spawns_qualified_by_the_agents_provider_then_the_parents() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+
+        // (a) `subagents.defaultProvider` stamp on the agent wins over the parent's provider.
+        let mut agent = sample_agent_config("gpt-5", &["gpt-5-mini"]);
+        agent.model_provider = Some(cyrup_core::ProviderId::from("openai-codex"));
+        let mut opts = base_opts(dir.path(), &["gpt-5", "gpt-5-mini"]);
+        opts.preferred_provider = Some(cyrup_core::ProviderId::from("anthropic"));
+        let candidates = resolve_model_candidates(&agent, &opts);
+        assert_eq!(
+            candidates,
+            vec![
+                ModelId::from("openai-codex/gpt-5"),
+                ModelId::from("openai-codex/gpt-5-mini")
+            ],
+            "agent.modelProvider is the first rung; every bare rung is qualified by it"
+        );
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &candidates[0],
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
+        let argv = plan.spec.build_argv();
+        let idx = argv
+            .iter()
+            .position(|a| a == "--model")
+            .expect("--model present");
+        assert_eq!(argv[idx + 1], "openai-codex/gpt-5");
+
+        // (b) with no agent provider, the PARENT session's provider (pi `currentProvider`) applies.
+        let agent = sample_agent_config("gpt-5", &[]);
+        let candidates = resolve_model_candidates(&agent, &opts);
+        assert_eq!(candidates, vec![ModelId::from("anthropic/gpt-5")]);
+
+        // (c) with neither, the id ships exactly as written — the pre-SUBA-088 argv.
+        opts.preferred_provider = None;
+        let candidates = resolve_model_candidates(&agent, &opts);
+        assert_eq!(candidates, vec![ModelId::from("gpt-5")]);
+    }
 
     // ---- SUBA-075: the progress snapshot reports the model the child REALLY launched with ----
 
@@ -1497,7 +1638,17 @@ mod tests {
         let winning = ModelId::from("m1");
 
         let snapshot = build_progress_snapshot(
-            &progress, &opts, &agent, "task", None, Some(&winning), &control, false, true, 0, None,
+            &progress,
+            &opts,
+            &agent,
+            "task",
+            None,
+            Some(&winning),
+            &control,
+            false,
+            true,
+            0,
+            None,
         )
         .expect("progress was requested");
         assert_eq!(
@@ -1512,7 +1663,17 @@ mod tests {
             thinking_override: Some("off".to_string()),
         };
         let snapshot = build_progress_snapshot(
-            &progress, &opts, &agent, "task", None, Some(&winning), &control, false, true, 0, None,
+            &progress,
+            &opts,
+            &agent,
+            "task",
+            None,
+            Some(&winning),
+            &control,
+            false,
+            true,
+            0,
+            None,
         )
         .expect("progress was requested");
         assert_eq!(
@@ -1564,6 +1725,53 @@ mod tests {
         assert!(resolve_run_acceptance(&opts, &agent, "Implement the fix").is_no_op());
     }
 
+    // ---- SUBA-082: the agent's DECLARED role reaches the inferred floor at this seam ----
+
+    /// `resolveEffectiveAcceptance({ …, acceptanceRole: agent.acceptanceRole, … })`
+    /// (`runs/foreground/execution.ts:1834` @v0.64.0): the same agent name, task and (absent)
+    /// explicit policy resolve to a DIFFERENT floor once the agent config carries a role. A
+    /// `reviewer` that declares `writer` is a writer; a `worker` that declares `read-only` on
+    /// neutral wording is not.
+    #[test]
+    fn run_sync_threads_the_agents_declared_acceptance_role_into_the_inferred_floor() {
+        use crate::exec::acceptance::model::AcceptanceRole;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        // `base_opts` disarms the gate for the spawn tests; this seam is about the INFERRED half.
+        opts.acceptance = None;
+
+        let mut reviewer = sample_agent_config("m1", &[]);
+        reviewer.name = "reviewer".to_string();
+        assert_eq!(
+            resolve_run_acceptance(&opts, &reviewer, "Handle the authentication flow")
+                .required_level,
+            AcceptanceStatus::Attested,
+            "control: the NAME alternation still decides when no role is declared"
+        );
+        reviewer.acceptance_role = Some(AcceptanceRole::Writer);
+        assert_eq!(
+            resolve_run_acceptance(&opts, &reviewer, "Handle the authentication flow")
+                .required_level,
+            AcceptanceStatus::Checked,
+            "a declared `writer` role replaces the reviewer-name guess"
+        );
+
+        let mut worker = sample_agent_config("m1", &[]);
+        worker.acceptance_role = Some(AcceptanceRole::ReadOnly);
+        assert_eq!(
+            resolve_run_acceptance(&opts, &worker, "Explore the authentication flow")
+                .required_level,
+            AcceptanceStatus::Attested,
+            "a declared `read-only` role replaces the worker-name guess"
+        );
+        assert_eq!(
+            resolve_run_acceptance(&opts, &worker, "Implement the authentication fix")
+                .required_level,
+            AcceptanceStatus::Checked,
+            "explicit task mutation intent still wins over a declared read-only role"
+        );
+    }
 
     // ---- SUBA-074: an unsupported runner refuses the RUN, before the model ladder ----
 
@@ -1587,7 +1795,10 @@ mod tests {
 
         let result = run_sync(&agent, "do something", &opts).await;
 
-        assert_eq!(result.exit_code, 1, "an unsupported runner must fail the run: {result:?}");
+        assert_eq!(
+            result.exit_code, 1,
+            "an unsupported runner must fail the run: {result:?}"
+        );
         let error = result.error.as_deref().unwrap_or_default();
         assert!(error.contains("runner.type='external-cli'"), "{error}");
         assert!(error.contains("full-capability native child"), "{error}");
@@ -1610,7 +1821,11 @@ mod tests {
         let result = run_sync(&agent, "do something", &opts).await;
 
         assert!(
-            !result.error.as_deref().unwrap_or_default().contains("not yet supported by cyrup"),
+            !result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not yet supported by cyrup"),
             "a `pi` runner is the native child and must never hit the SUBA-074 refusal: {result:?}"
         );
     }
@@ -1631,7 +1846,10 @@ mod tests {
 
         let result = run_sync(&agent, "do something", &opts).await;
 
-        assert_eq!(result.exit_code, 1, "a blocked depth attempt must report failure: {result:?}");
+        assert_eq!(
+            result.exit_code, 1,
+            "a blocked depth attempt must report failure: {result:?}"
+        );
         assert!(
             result
                 .error
@@ -1641,18 +1859,20 @@ mod tests {
             "expected a DepthExceeded-shaped error message, got: {:?}",
             result.error
         );
-        assert!(result.attempted_models.is_empty(), "no model attempt may ever be made");
+        assert!(
+            result.attempted_models.is_empty(),
+            "no model attempt may ever be made"
+        );
         assert!(result.model_attempts.is_empty());
         assert_eq!(result.usage, Usage::default(), "no usage can have accrued");
         // The load-bearing proof that this rejection happens BEFORE any spawn setup: `run_sync`'s
         // scratch-directory creation (the very first filesystem side effect any subsequent spawn
         // attempt would need) must never have run at all.
         assert!(
-            !dir.path().join(".cyrup-subagent-scratch").exists(),
+            !crate::background::attempt_scratch_dir(dir.path()).exists(),
             "the depth guard must reject before the spawn-scratch directory is ever created"
         );
     }
-
 
     #[tokio::test]
     async fn run_sync_rejects_when_depth_has_defensively_exceeded_the_ceiling() {
@@ -1670,9 +1890,8 @@ mod tests {
         let result = run_sync(&agent, "do something", &opts).await;
 
         assert_eq!(result.exit_code, 1);
-        assert!(!dir.path().join(".cyrup-subagent-scratch").exists());
+        assert!(!crate::background::attempt_scratch_dir(dir.path()).exists());
     }
-
 
     #[tokio::test]
     async fn run_sync_proceeds_normally_when_strictly_below_the_depth_ceiling() {
@@ -1705,7 +1924,6 @@ mod tests {
         );
     }
 
-
     // ---- run_sync: pre-spawn fail-fast (R-SA-025) ----
 
     #[tokio::test]
@@ -1726,9 +1944,49 @@ mod tests {
                 .contains("output path")
         );
         // No scratch dir should have been created since this fails before any spawn setup.
-        assert!(!dir.path().join(".cyrup-subagent-scratch").exists());
+        assert!(!crate::background::attempt_scratch_dir(dir.path()).exists());
     }
 
+    /// SUBA-072: `prepare_ladder` makes the run's scratch directory under the crate's run-scratch
+    /// root, keyed by `cwd` — and leaves NOTHING behind in the project working tree. Before the
+    /// fix this was `<cwd>/.cyrup-subagent-scratch`, the one run-scratch path in the crate rooted
+    /// in the project; pi's per-spawn scratch is `os.tmpdir()`-rooted
+    /// (`runs/shared/pi-args.ts:787` @v0.64.0).
+    #[tokio::test]
+    async fn prepare_ladder_makes_the_scratch_dir_under_the_run_scratch_root_not_the_project_tree()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = sample_agent_config("m1", &[]);
+        let opts = base_opts(dir.path(), &["m1"]);
+
+        let setup = prepare_ladder(&agent, "task", &opts)
+            .await
+            .unwrap_or_else(|failure| panic!("prepare_ladder must succeed: {failure:?}"));
+
+        let expected = crate::background::attempt_scratch_dir(dir.path());
+        assert_eq!(setup.scratch_dir, expected);
+        assert!(
+            setup.scratch_dir.exists(),
+            "the scratch dir is created by prepare_ladder"
+        );
+        assert!(
+            !setup.scratch_dir.starts_with(dir.path()),
+            "the scratch dir must not be under the project cwd: {:?}",
+            setup.scratch_dir
+        );
+        assert!(
+            !dir.path().join(".cyrup-subagent-scratch").exists(),
+            "no `.cyrup-subagent-scratch` may be written into the project working tree"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "prepare_ladder must leave the project working tree untouched"
+        );
+        // This test's cwd key is unique to its TempDir, so the leaf it created is its own to
+        // remove; production never sweeps this tree (the tee is the run's persisted record).
+        let _ = std::fs::remove_dir_all(&setup.scratch_dir);
+    }
 
     #[tokio::test]
     async fn run_sync_fails_with_empty_ladder_when_no_model_is_resolvable() {
@@ -1740,7 +1998,6 @@ mod tests {
         assert_eq!(result.exit_code, 1);
         assert!(result.attempted_models.is_empty());
     }
-
 
     // ---- SUBA-078: the maxThinking ceiling refuses the RUN, before any child spawns ----
 
@@ -1855,8 +2112,11 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         let cwd = PathBuf::from("/proj/plan-batch-test");
         let layout = cyrup_session::SessionLayout::new(root.path().to_path_buf(), cwd.clone());
-        let manager = cyrup_session::SessionManager::in_memory(&cwd, cyrup_session::NewSessionOpts::default())
-            .expect("create in-memory session");
+        let manager = cyrup_session::SessionManager::in_memory(
+            &cwd,
+            cyrup_session::NewSessionOpts::default(),
+        )
+        .expect("create in-memory session");
         let manager = std::sync::Arc::new(tokio::sync::Mutex::new(manager));
         let resolver = ForkContextResolver::new(manager, layout);
 
@@ -1875,15 +2135,17 @@ mod tests {
         assert!(resolved.iter().all(|ctx| ctx.mode == ContextMode::Fresh));
     }
 
-
     #[tokio::test]
     async fn plan_batch_aborts_whole_batch_on_first_fork_failure_zero_side_effects() {
         let root = tempfile::tempdir().expect("tempdir");
         let cwd = PathBuf::from("/proj/plan-batch-abort-test");
         let layout = cyrup_session::SessionLayout::new(root.path().to_path_buf(), cwd.clone());
         // Unpersisted in-memory session: any Fork request must fail hard (R-SA-137/DI-SA-2).
-        let manager = cyrup_session::SessionManager::in_memory(&cwd, cyrup_session::NewSessionOpts::default())
-            .expect("create in-memory session");
+        let manager = cyrup_session::SessionManager::in_memory(
+            &cwd,
+            cyrup_session::NewSessionOpts::default(),
+        )
+        .expect("create in-memory session");
         let manager = std::sync::Arc::new(tokio::sync::Mutex::new(manager));
         let resolver = ForkContextResolver::new(manager, layout);
 
@@ -1916,5 +2178,4 @@ mod tests {
             .unwrap_or(false);
         assert!(!any_files);
     }
-
 }

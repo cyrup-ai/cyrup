@@ -87,6 +87,25 @@ fn all_provider_ids() -> Vec<String> {
         .collect()
 }
 
+/// The providers whose catalogs are fetched from pi.dev — every configured built-in EXCEPT
+/// `radius` (PROV-014).
+///
+/// Pi wraps each built-in in `withRemoteCatalog` with one exclusion:
+/// `provider.id === "radius" ? provider : withRemoteCatalog(provider, …)`
+/// (`packages/coding-agent/src/core/model-runtime.ts:183-189` @v0.84.4). Radius's store entry is
+/// owned by its OWN refresh (the gateway's `/v1/config`, `cyrup_provider::RadiusProvider`), and
+/// the pi.dev route has no catalog for it: the `404` branch would rewrite the entry's
+/// `lastModified` to `0` and the overlay loader's staleness guard would then discard the gateway
+/// catalog on the next start. The exclusion is applied to the FETCH list only; `load_overlay`
+/// still reads the radius entry back, which is the restore half of `radius.ts:36-48`.
+pub fn pi_dev_catalog_providers(configured: &[String]) -> Vec<String> {
+    configured
+        .iter()
+        .filter(|id| id.as_str() != cyrup_provider::RADIUS_PROVIDER_ID)
+        .cloned()
+        .collect()
+}
+
 /// **Phase 1 of the runtime model catalog (DRIFT-007) — disk only, awaited, no network.**
 ///
 /// `<agent_dir>/models-store.json` is loaded and installed, so the composed registry immediately
@@ -185,6 +204,7 @@ pub fn spawn_model_catalog_refresh_with(
         return None;
     }
     let all_ids = all_provider_ids();
+    let configured_providers = pi_dev_catalog_providers(&configured_providers);
     Some(tokio::spawn(async move {
         let refs: Vec<&str> = configured_providers.iter().map(String::as_str).collect();
         // Best-effort: per-provider errors are collected, not propagated, and are deliberately not
@@ -251,6 +271,7 @@ pub async fn refresh_model_catalogs_with(
     configured: Vec<String>,
 ) -> Result<(), String> {
     let errors = {
+        let configured = pi_dev_catalog_providers(&configured);
         let refs: Vec<&str> = configured.iter().map(String::as_str).collect();
         match tokio::time::timeout(
             MODELS_REFRESH_TIMEOUT,

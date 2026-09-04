@@ -273,7 +273,10 @@ fn extract_message_text(content: &ContentBlock) -> String {
             if resource.name.is_empty() {
                 format!("[resource_link {}]", resource.uri)
             } else {
-                format!("[resource_link {} \u{2014} {}]", resource.uri, resource.name)
+                format!(
+                    "[resource_link {} \u{2014} {}]",
+                    resource.uri, resource.name
+                )
             }
         }
         ContentBlock::Image(image) => {
@@ -282,7 +285,11 @@ fn extract_message_text(content: &ContentBlock) -> String {
             } else {
                 image.mime_type.as_str()
             };
-            let embedded = if image.data.is_empty() { "" } else { " (embedded)" };
+            let embedded = if image.data.is_empty() {
+                ""
+            } else {
+                " (embedded)"
+            };
             format!("[image {mime}{embedded}]")
         }
         ContentBlock::Audio(audio) => {
@@ -352,8 +359,12 @@ mod tests {
     fn an_explicit_empty_value_still_fails_a_required_argument() {
         let declared = [arg("topic", true)];
         let parsed = parse_prompt_args("topic=");
-        let usage = resolve_prompt_args(&declared, "cmd", &parsed).expect_err("required rejects it");
-        assert_eq!(usage, "Missing required argument: topic.\nUsage: /cmd <topic>");
+        let usage =
+            resolve_prompt_args(&declared, "cmd", &parsed).expect_err("required rejects it");
+        assert_eq!(
+            usage,
+            "Missing required argument: topic.\nUsage: /cmd <topic>"
+        );
     }
 
     /// Undeclared named arguments are forwarded UNFILTERED — the MCP spec allows arbitrary string
@@ -517,7 +528,10 @@ mod tests {
     #[test]
     fn image_blocks_report_unknown_mime_and_flag_embedded_data() {
         let bare = rmcp::model::ImageContent::new(String::new(), String::new());
-        assert_eq!(extract_message_text(&ContentBlock::Image(bare)), "[image unknown]");
+        assert_eq!(
+            extract_message_text(&ContentBlock::Image(bare)),
+            "[image unknown]"
+        );
         let embedded = rmcp::model::ImageContent::new("AAA".to_string(), "image/png".to_string());
         assert_eq!(
             extract_message_text(&ContentBlock::Image(embedded)),

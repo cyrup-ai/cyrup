@@ -368,11 +368,7 @@ pub async fn load_meta_tree_from_dir(
     let already_inline: HashSet<Option<String>> =
         meta.children.iter().map(|c| c.agent.clone()).collect();
 
-    while let Some(entry) = entries
-        .next_entry()
-        .await
-        .map_err(SubagentError::Spawn)?
-    {
+    while let Some(entry) = entries.next_entry().await.map_err(SubagentError::Spawn)? {
         let path = entry.path();
         let is_dir = entry
             .file_type()
@@ -510,7 +506,12 @@ async fn accumulate_one_nested_run(
                     nested_paths.status.display()
                 ))
             })?;
-            Box::pin(accumulate_run_status_into(&nested_status, &nested_paths, acc)).await?;
+            Box::pin(accumulate_run_status_into(
+                &nested_status,
+                &nested_paths,
+                acc,
+            ))
+            .await?;
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // Pruned/never-materialized nested run directory: contributes zero, not an error
@@ -620,11 +621,7 @@ pub async fn find_latest_session_file_by_mtime(
     };
 
     let mut latest: Option<(PathBuf, std::time::SystemTime)> = None;
-    while let Some(entry) = entries
-        .next_entry()
-        .await
-        .map_err(SubagentError::Spawn)?
-    {
+    while let Some(entry) = entries.next_entry().await.map_err(SubagentError::Spawn)? {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
@@ -829,9 +826,10 @@ fn details_from_session_entry(entry: &Entry) -> Option<Vec<TranscriptChild>> {
             parse_subagent_details(inner)
         }
         Entry::Known(KnownEntry::Message {
-            message: AgentMessage::Core(Message::ToolResult {
-                tool_name, details, ..
-            }),
+            message:
+                AgentMessage::Core(Message::ToolResult {
+                    tool_name, details, ..
+                }),
             ..
         }) if tool_name == "subagent" => parse_subagent_details(details.as_ref()?),
         _ => None,
@@ -1065,8 +1063,14 @@ mod tests {
         let expected_cost = 0.02 + 0.004 + 0.001;
         let expected_turns = 5 + 2 + 1;
 
-        assert_eq!(acc.input, expected_input, "grandchild input must be included");
-        assert_eq!(acc.output, expected_output, "grandchild output must be included");
+        assert_eq!(
+            acc.input, expected_input,
+            "grandchild input must be included"
+        );
+        assert_eq!(
+            acc.output, expected_output,
+            "grandchild output must be included"
+        );
         assert!(
             (acc.cost - expected_cost).abs() < 1e-9,
             "grandchild cost must be included: got {}, expected {}",
@@ -1228,6 +1232,9 @@ mod tests {
             nested_run_ids: Vec::new(),
             started_at: Some(0),
             ended_at: Some(1),
+            stop_requested: false,
+            stop_requested_at: None,
+            stopped: false,
             telemetry: crate::background::StepTelemetry::default(),
         }
     }
@@ -1285,8 +1292,7 @@ mod tests {
 
         // Grandchild: leaf run, no further nesting.
         let grandchild_step = step_with_usage("fact-checker", usage_c.0, usage_c.1, usage_c.2);
-        let grandchild_status =
-            run_status_single_step(grandchild_id.clone(), grandchild_step);
+        let grandchild_status = run_status_single_step(grandchild_id.clone(), grandchild_step);
         tokio::fs::create_dir_all(&grandchild_paths.run_dir)
             .await
             .expect("mkdir grandchild run dir");
@@ -1535,10 +1541,14 @@ mod tests {
         let older = dir.path().join("z-old.jsonl");
         let newer = dir.path().join("a-new.jsonl");
 
-        tokio::fs::write(&older, b"{}\n").await.expect("write older");
+        tokio::fs::write(&older, b"{}\n")
+            .await
+            .expect("write older");
         // Ensure a real, observable mtime gap on filesystems with coarse mtime resolution.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        tokio::fs::write(&newer, b"{}\n").await.expect("write newer");
+        tokio::fs::write(&newer, b"{}\n")
+            .await
+            .expect("write newer");
 
         let found = find_latest_session_file_by_mtime(dir.path())
             .await
@@ -1631,7 +1641,13 @@ mod tests {
 
     /// A `cyrup_core::Usage` (camelCase, nested `cost.total`) JSON value, the shape a real session
     /// stores for both an assistant message's own usage and a subagent child result's usage.
-    fn usage_json(input: u64, output: u64, cache_read: u64, cache_write: u64, cost: f64) -> serde_json::Value {
+    fn usage_json(
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+        cost: f64,
+    ) -> serde_json::Value {
         serde_json::json!({
             "input": input,
             "output": output,
@@ -1700,7 +1716,11 @@ mod tests {
                 "timestamp": "2026-01-01T00:00:00.000Z",
                 "message": { "role": "user", "content": [{ "type": "text", "text": "go" }], "timestamp": 0 },
             })),
-            assistant_entry("a0000001", Some("u0000001"), usage_json(200, 100, 0, 0, 0.02)),
+            assistant_entry(
+                "a0000001",
+                Some("u0000001"),
+                usage_json(200, 100, 0, 0, 0.02),
+            ),
             subagent_tool_result_entry(
                 "t0000001",
                 Some("a0000001"),
@@ -1731,9 +1751,15 @@ mod tests {
         assert!(report.contains("Children: ↑80 ↓40"), "report: {report}");
         assert!(report.contains("Total: ↑280 ↓140"), "report: {report}");
         // Grand total cost 0.02 + 0.005 + 0.003 = 0.028, rendered to 4 dp.
-        assert!(report.contains("$0.0280"), "grand total cost must sum parent+children: {report}");
+        assert!(
+            report.contains("$0.0280"),
+            "grand total cost must sum parent+children: {report}"
+        );
         // Parent turn count folds in as 1 turn (assistantUsageFromMessage's `turns: 1`).
-        assert!(report.contains("(1 turn)"), "parent turn count must render: {report}");
+        assert!(
+            report.contains("(1 turn)"),
+            "parent turn count must render: {report}"
+        );
     }
 
     #[test]
@@ -1780,7 +1806,10 @@ mod tests {
             report.contains("No subagent child usage found in this session."),
             "a non-subagent toolResult and a zero-usage subagent child must both be ignored: {report}"
         );
-        assert!(!report.contains("nope"), "the `read` tool result must not be counted: {report}");
+        assert!(
+            !report.contains("nope"),
+            "the `read` tool result must not be counted: {report}"
+        );
     }
 
     #[test]
@@ -1811,6 +1840,4 @@ mod tests {
         assert!(report.contains("Child 1 (scout)"), "report: {report}");
         assert!(report.contains("Children: ↑12 ↓8"), "report: {report}");
     }
-
 }
-

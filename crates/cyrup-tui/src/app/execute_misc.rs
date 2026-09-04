@@ -41,17 +41,19 @@ impl<B: Backend> App<B> {
         }
         // Widen the LIVE set first (`:1662`), so the model is cyclable this session even when the
         // scope is flag-driven and nothing gets written below.
-        let Some(model) =
-            session
-                .available_model_catalog()
-                .iter()
-                .find(|m| m.provider.as_str() == provider && m.id.as_str() == id)
-                .cloned()
+        let Some(model) = session
+            .available_model_catalog()
+            .iter()
+            .find(|m| m.provider.as_str() == provider && m.id.as_str() == id)
+            .cloned()
         else {
             return;
         };
         let mut widened = scoped;
-        widened.push(cyrup_session_svc::ScopedModel { model, thinking_level: None });
+        widened.push(cyrup_session_svc::ScopedModel {
+            model,
+            thinking_level: None,
+        });
         session.set_scoped_models(widened);
 
         let existing = session.services().settings.effective().enabled_models();
@@ -72,7 +74,9 @@ impl<B: Backend> App<B> {
             )
             .await
         {
-            self.state.transcript.push_status(format!("settings error: {e}"));
+            self.state
+                .transcript
+                .push_status(format!("settings error: {e}"));
         }
     }
 }
@@ -115,7 +119,12 @@ impl<B: Backend> App<B> {
     /// catalog, so a late one is never wrong, only redundant. Rebuilding is a map walk over an
     /// already-materialised `Vec`, which is why this is not worth debouncing.
     pub(crate) fn on_commands_changed(&mut self, ctx: &super::run::RunCtx) {
-        let gate = ctx.session.services().settings.effective().enable_skill_commands();
+        let gate = ctx
+            .session
+            .services()
+            .settings
+            .effective()
+            .enable_skill_commands();
         let session = std::sync::Arc::clone(&ctx.session);
         self.rebuild_command_registry(&session, gate);
     }
@@ -223,7 +232,10 @@ impl<B: Backend> App<B> {
         // `auth_select::provider_rows` (`:115`) already uses for the very same provider list —
         // identical for the ASCII ids every provider actually has.
         login_providers.sort_by(|a, b| {
-            a.name.to_lowercase().cmp(&b.name.to_lowercase()).then_with(|| a.id.cmp(&b.id))
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then_with(|| a.id.cmp(&b.id))
         });
 
         // `session.getAvailableThinkingLevels()` (`core/agent-session.ts:1816-1819`): the current
@@ -241,12 +253,14 @@ impl<B: Backend> App<B> {
 
         // `extension_completions` is NOT part of this snapshot — it is fetched per keystroke by
         // [`Self::refresh_extension_completions`] and carried across by `set_argument_sources`.
-        self.state.editor.set_argument_sources(crate::autocomplete::ArgumentSources {
-            models,
-            login_providers,
-            thinking_levels,
-            ..crate::autocomplete::ArgumentSources::default()
-        });
+        self.state
+            .editor
+            .set_argument_sources(crate::autocomplete::ArgumentSources {
+                models,
+                login_providers,
+                thinking_levels,
+                ..crate::autocomplete::ArgumentSources::default()
+            });
     }
 
     /// The async half of an EXTENSION command's argument completion — pi's
@@ -273,9 +287,12 @@ impl<B: Backend> App<B> {
             self.state.extension_completion_query = None;
             return;
         };
-        if self.state.extension_completion_query.as_ref().is_some_and(|(c, a)| {
-            c == &name && a == &argument
-        }) {
+        if self
+            .state
+            .extension_completion_query
+            .as_ref()
+            .is_some_and(|(c, a)| c == &name && a == &argument)
+        {
             return;
         }
         self.state.extension_completion_query = Some((name.clone(), argument.clone()));
@@ -289,13 +306,19 @@ impl<B: Backend> App<B> {
         // across the await, so no key can be serviced while it is in flight — the pair it answers
         // for is by construction still the pair on screen. The cost is that a slow completer
         // delays the frame; the epoch deadline is what bounds that.
-        self.state.editor.set_extension_completions(&name, &argument, items);
+        self.state
+            .editor
+            .set_extension_completions(&name, &argument, items);
         self.state.editor.refresh_autocomplete();
     }
 
     /// The remaining [`Self::execute_command`] arms (§7.1): login, model/thinking cycling,
     /// settings writes, and the small session conveniences. Arm bodies moved verbatim.
-    pub(crate) async fn execute_misc_command(&mut self, cmd: AppCommand, session: &Arc<AgentSession>) {
+    pub(crate) async fn execute_misc_command(
+        &mut self,
+        cmd: AppCommand,
+        session: &Arc<AgentSession>,
+    ) {
         use AppCommand as C;
         match cmd {
             C::LoginCommand(arg) => self.handle_login_command(session, arg).await,
@@ -317,7 +340,11 @@ impl<B: Backend> App<B> {
                     scoped
                         .iter()
                         .map(|sm| {
-                            (sm.model.id.to_string(), sm.model.provider.to_string(), sm.model.name.clone())
+                            (
+                                sm.model.id.to_string(),
+                                sm.model.provider.to_string(),
+                                sm.model.name.clone(),
+                            )
                         })
                         .collect()
                 } else {
@@ -328,8 +355,11 @@ impl<B: Backend> App<B> {
                         .collect()
                 };
                 if cycle.len() <= 1 {
-                    let msg =
-                        if scoped_active { "Only one model in scope" } else { "Only one model available" };
+                    let msg = if scoped_active {
+                        "Only one model in scope"
+                    } else {
+                        "Only one model available"
+                    };
                     self.state.transcript.push_status(msg);
                 } else {
                     let current = session.model();
@@ -339,9 +369,9 @@ impl<B: Backend> App<B> {
                     // starts at the head exactly as pi's `findIndex === -1 ⇒ 0` does
                     // (agent-session.ts:1650-1653).
                     let cur = cycle.iter().position(|(id, prov, _)| {
-                        current.as_ref().is_some_and(|c| {
-                            id == c.model.as_str() && prov == c.provider.as_str()
-                        })
+                        current
+                            .as_ref()
+                            .is_some_and(|c| id == c.model.as_str() && prov == c.provider.as_str())
                     });
                     let next = match direction {
                         CycleDirection::Forward => cur.map_or(0, |i| (i + 1) % n),
@@ -349,8 +379,14 @@ impl<B: Backend> App<B> {
                     };
                     if let Some((id, _prov, name)) = cycle.get(next) {
                         match session.set_model(id).await {
-                            Ok(_) => self.state.transcript.push_status(format!("Switched to {name}")),
-                            Err(e) => self.state.transcript.push_status(format!("model error: {e}")),
+                            Ok(_) => self
+                                .state
+                                .transcript
+                                .push_status(format!("Switched to {name}")),
+                            Err(e) => self
+                                .state
+                                .transcript
+                                .push_status(format!("model error: {e}")),
                         }
                     }
                 }
@@ -367,7 +403,9 @@ impl<B: Backend> App<B> {
                 // surface Pi's `Thinking level: {level}` status line.
                 match session.cycle_thinking_level().await {
                     Ok(None) => {
-                        self.state.transcript.push_status("Current model does not support thinking");
+                        self.state
+                            .transcript
+                            .push_status("Current model does not support thinking");
                     }
                     Ok(Some(level)) => {
                         let label = match level {
@@ -379,9 +417,14 @@ impl<B: Backend> App<B> {
                             ModelThinkingLevel::Xhigh => "xhigh",
                             ModelThinkingLevel::Max => "max",
                         };
-                        self.state.transcript.push_status(format!("Thinking level: {label}"));
+                        self.state
+                            .transcript
+                            .push_status(format!("Thinking level: {label}"));
                     }
-                    Err(e) => self.state.transcript.push_status(format!("thinking error: {e}")),
+                    Err(e) => self
+                        .state
+                        .transcript
+                        .push_status(format!("thinking error: {e}")),
                 }
             }
             // TUI-032 — the `/settings` → `Thinking level` submenu's confirm. Pi's
@@ -389,18 +432,20 @@ impl<B: Backend> App<B> {
             // `session.setThinkingLevel(level)`, which clamps to the model's capabilities and emits
             // `ThinkingLevelChanged`; the footer + editor rule re-color off that event exactly as
             // they do for Shift+Tab.
-
             C::SetThinking(level) => {
                 let parsed = parse_thinking_level(&level);
                 match parsed {
                     Some(l) => match session.set_thinking_level(l).await {
                         Ok(applied) => {
                             let label = thinking_level_str(applied);
-                            self.state.transcript.push_status(format!("Thinking level: {label}"));
+                            self.state
+                                .transcript
+                                .push_status(format!("Thinking level: {label}"));
                         }
-                        Err(e) => {
-                            self.state.transcript.push_status(format!("thinking error: {e}"))
-                        }
+                        Err(e) => self
+                            .state
+                            .transcript
+                            .push_status(format!("thinking error: {e}")),
                     },
                     None => self
                         .state
@@ -413,7 +458,10 @@ impl<B: Backend> App<B> {
             // bucket lists `OpenSelector | ConfirmSelection | SetEntryLabel` only, so this
             // variant reaches the `_` arm and lands in this file. Its `Thinking` sibling is
             // directly below; both must stay here or the dispatcher silently drops them.
-            C::ConfirmSelectionAsDefault { kind: SelectorKind::Model, value } => {
+            C::ConfirmSelectionAsDefault {
+                kind: SelectorKind::Model,
+                value,
+            } => {
                 // Pi `selectModel(model, true)` → `setModel(model, { persist: true })`
                 // (`interactive-mode.ts:4999` → `agent-session.ts:1630-1650`). ORDER IS THE
                 // CONTRACT: the session set runs FIRST and a failure returns without writing
@@ -422,7 +470,9 @@ impl<B: Backend> App<B> {
                 // `NoConfiguredAuth` first (`model.rs:44-50`), so the same guard falls out of
                 // sequencing the persist after a successful set.
                 if let Err(e) = session.set_model(&value).await {
-                    self.state.transcript.push_status(format!("model error: {e}"));
+                    self.state
+                        .transcript
+                        .push_status(format!("model error: {e}"));
                     return;
                 }
                 // `setDefaultModelAndProvider(provider, id)` writes BOTH keys together
@@ -445,7 +495,9 @@ impl<B: Backend> App<B> {
                     .await
                 {
                     Ok(()) => {
-                        session.persist_setting(scope, "defaultModel", serde_json::json!(id)).await
+                        session
+                            .persist_setting(scope, "defaultModel", serde_json::json!(id))
+                            .await
                     }
                     Err(e) => Err(e),
                 };
@@ -456,13 +508,20 @@ impl<B: Backend> App<B> {
                         .state
                         .transcript
                         .push_status(format!("Default model: {provider}/{id}")),
-                    Err(e) => self.state.transcript.push_status(format!("settings error: {e}")),
+                    Err(e) => self
+                        .state
+                        .transcript
+                        .push_status(format!("settings error: {e}")),
                 }
                 self.state.default_model = Some((provider.clone(), id.clone()));
-                self.add_persisted_default_to_non_empty_scope(session, &provider, &id).await;
+                self.add_persisted_default_to_non_empty_scope(session, &provider, &id)
+                    .await;
             }
 
-            C::ConfirmSelectionAsDefault { kind: SelectorKind::Thinking, value } => {
+            C::ConfirmSelectionAsDefault {
+                kind: SelectorKind::Thinking,
+                value,
+            } => {
                 // Pi `selectLevel(level, true)` → `setThinkingLevel(level, { persist: true })`
                 // (`interactive-mode.ts:4813` → `:4788`). Same ordering contract as the model
                 // path: apply to the session first, and persist only if that succeeded.
@@ -473,7 +532,9 @@ impl<B: Backend> App<B> {
                     return;
                 };
                 if let Err(e) = session.set_thinking_level(parsed).await {
-                    self.state.transcript.push_status(format!("thinking error: {e}"));
+                    self.state
+                        .transcript
+                        .push_status(format!("thinking error: {e}"));
                     return;
                 }
                 // THE REQUESTED LEVEL, NOT THE CLAMPED ONE. `setThinkingLevel` clamps to what the
@@ -497,7 +558,10 @@ impl<B: Backend> App<B> {
                             .transcript
                             .push_status(format!("Default thinking level: {value}"));
                     }
-                    Err(e) => self.state.transcript.push_status(format!("settings error: {e}")),
+                    Err(e) => self
+                        .state
+                        .transcript
+                        .push_status(format!("settings error: {e}")),
                 }
             }
 
@@ -507,8 +571,12 @@ impl<B: Backend> App<B> {
                 // The picker's ladder is the session's, not a hardcoded seven
                 // (`interactive-mode.ts:4792`). Re-seeded here because this is the primary route
                 // in and the snapshot that normally fills it may predate a model switch.
-                self.state.available_thinking_levels =
-                    levels.iter().copied().map(thinking_level_str).map(str::to_string).collect();
+                self.state.available_thinking_levels = levels
+                    .iter()
+                    .copied()
+                    .map(thinking_level_str)
+                    .map(str::to_string)
+                    .collect();
                 let Some(term) = arg else {
                     // No argument → the picker. Seed the persisted default first so the row can be
                     // badged and `Ctrl+S` offered — this is the second route in (the other is
@@ -551,9 +619,14 @@ impl<B: Backend> App<B> {
                         self.state.thinking_level = label.to_string();
                         self.state.status.set_thinking_level(label);
                         self.state.editor.set_thinking_level(label);
-                        self.state.transcript.push_status(format!("Thinking level: {label}"));
+                        self.state
+                            .transcript
+                            .push_status(format!("Thinking level: {label}"));
                     }
-                    Err(e) => self.state.transcript.push_status(format!("thinking error: {e}")),
+                    Err(e) => self
+                        .state
+                        .transcript
+                        .push_status(format!("thinking error: {e}")),
                 }
             }
 
@@ -571,7 +644,11 @@ impl<B: Backend> App<B> {
                 // (`:804`). The whole map is therefore read, modified, and written back under the
                 // single un-dotted key `modelThinkingLevels`, which is the same end state Pi
                 // reaches and is dot-safe by construction.
-                let eff_map = session.services().settings.effective().all_model_thinking_levels();
+                let eff_map = session
+                    .services()
+                    .settings
+                    .effective()
+                    .all_model_thinking_levels();
                 let mut map: serde_json::Map<String, serde_json::Value> = eff_map
                     .into_iter()
                     .filter_map(|(k, v)| serde_json::to_value(v).ok().map(|v| (k, v)))
@@ -579,7 +656,9 @@ impl<B: Backend> App<B> {
                 if level == CLEAR_MODEL_THINKING {
                     map.remove(&model);
                 } else if let Some(parsed) = parse_thinking_level(&level) {
-                    let Ok(v) = serde_json::to_value(parsed) else { return };
+                    let Ok(v) = serde_json::to_value(parsed) else {
+                        return;
+                    };
                     map.insert(model.clone(), v);
                 } else {
                     self.state
@@ -638,7 +717,10 @@ impl<B: Backend> App<B> {
                             );
                         }
                     }
-                    Err(e) => self.state.transcript.push_status(format!("settings error: {e}")),
+                    Err(e) => self
+                        .state
+                        .transcript
+                        .push_status(format!("settings error: {e}")),
                 }
             }
 
@@ -698,7 +780,9 @@ impl<B: Backend> App<B> {
                 // The image rows are live too (Pi re-reads them per `ToolExecutionComponent`).
                 if id == "terminal.showImages" {
                     self.state.show_images = value == "true";
-                    self.state.transcript.set_show_images(self.state.show_images);
+                    self.state
+                        .transcript
+                        .set_show_images(self.state.show_images);
                 }
                 // `terminal.showTerminalProgress` is live in Pi by construction — its gate is
                 // `getShowTerminalProgress()` re-read at every call site, so a flip takes effect on
@@ -765,9 +849,15 @@ impl<B: Backend> App<B> {
                 if id == "transport" {
                     session.set_transport(&value).await;
                 }
-                match session.persist_setting(cyrup_session_svc::SettingsScope::Global, &id, json).await {
+                match session
+                    .persist_setting(cyrup_session_svc::SettingsScope::Global, &id, json)
+                    .await
+                {
                     Ok(()) => self.state.transcript.push_status(format!("{id} → {value}")),
-                    Err(e) => self.state.transcript.push_status(format!("settings error: {e}")),
+                    Err(e) => self
+                        .state
+                        .transcript
+                        .push_status(format!("settings error: {e}")),
                 }
             }
             // TUI-055 — SPAWNED when a run loop is servicing `compact_tx`. `session.compact` is a
@@ -777,7 +867,6 @@ impl<B: Backend> App<B> {
             // screen for the entire operation (`interactive-mode.ts:3075-3087`); this is what lets
             // cyrup's reach the frame. The outcome comes back over the channel and is applied by
             // [`Self::apply_compact_outcome`], which the inline fallback below also uses.
-
             C::SetName(name) => match session.set_session_name(&name).await {
                 Ok(()) => {
                     let stored = session.session_name().await;
@@ -786,25 +875,30 @@ impl<B: Backend> App<B> {
                             "Session name was normalized from {} to {}",
                             serde_json::to_string(&name).unwrap_or_else(|_| format!("{name:?}")),
                             match &stored {
-                                Some(s) => serde_json::to_string(s)
-                                    .unwrap_or_else(|_| format!("{s:?}")),
+                                Some(s) =>
+                                    serde_json::to_string(s).unwrap_or_else(|_| format!("{s:?}")),
                                 None => "null".to_string(),
                             },
                         ));
                     }
                     let shown = stored.unwrap_or(name);
-                    self.state.transcript.push_status(format!("Session name set: {shown}"));
+                    self.state
+                        .transcript
+                        .push_status(format!("Session name set: {shown}"));
                 }
-                Err(e) => self.state.transcript.push_status(format!("name error: {e}")),
+                Err(e) => self
+                    .state
+                    .transcript
+                    .push_status(format!("name error: {e}")),
             },
             // TUI-080 / TUI-084 — the getter, and pi's severity CHANNEL for the usage line: a
             // `showWarning` (`interactive-mode.ts:5638`), not a neutral status, and pi's exact
             // string `Usage: /name <name>` rather than cyrup's `usage: /name <session name>`.
-
             C::ShowName => match session.session_name().await {
-                Some(name) => {
-                    self.state.transcript.push_status(format!("Session name: {name}"))
-                }
+                Some(name) => self
+                    .state
+                    .transcript
+                    .push_status(format!("Session name: {name}")),
                 None => self.state.transcript.push_warning("Usage: /name <name>"),
             },
 
@@ -814,15 +908,25 @@ impl<B: Backend> App<B> {
             // selection when it answers yes. This arm was specified in B-11 and never wired, which
             // is what left `selection::has_selection` dead: selecting text and running `/copy`
             // silently copied the wrong thing.
-            C::Copy if self.altscreen.as_ref().and_then(AltScreen::selection_text).is_some() => {
+            C::Copy
+                if self
+                    .altscreen
+                    .as_ref()
+                    .and_then(AltScreen::selection_text)
+                    .is_some() =>
+            {
                 let Some(text) = self.altscreen.as_ref().and_then(AltScreen::selection_text) else {
                     return;
                 };
                 let n = text.chars().count();
                 if crate::clipboard::copy_to_clipboard(&text).await {
-                    self.state.transcript.push_status(format!("copied selection ({n} chars)"));
+                    self.state
+                        .transcript
+                        .push_status(format!("copied selection ({n} chars)"));
                 } else {
-                    self.state.transcript.push_error("Failed to copy to clipboard");
+                    self.state
+                        .transcript
+                        .push_error("Failed to copy to clipboard");
                 }
             }
 
@@ -840,10 +944,15 @@ impl<B: Backend> App<B> {
                     } else {
                         // The message Pi throws when every branch failed (`clipboard.ts:171-173`),
                         // surfaced through the same error channel as its `showError`.
-                        self.state.transcript.push_error("Failed to copy to clipboard");
+                        self.state
+                            .transcript
+                            .push_error("Failed to copy to clipboard");
                     }
                 }
-                None => self.state.transcript.push_status("no assistant message to copy"),
+                None => self
+                    .state
+                    .transcript
+                    .push_status("no assistant message to copy"),
             },
 
             // `app.message.copy` inside `/tree` — pi's `selector.onCopy` consumer
@@ -862,12 +971,15 @@ impl<B: Backend> App<B> {
                         } else {
                             // The message pi throws when every clipboard branch failed
                             // (`clipboard.ts:171-173`), reaching `showError` via the `catch`.
-                            self.state.transcript.push_error("Failed to copy to clipboard");
+                            self.state
+                                .transcript
+                                .push_error("Failed to copy to clipboard");
                         }
                     }
-                    None => {
-                        self.state.transcript.push_error("Selected entry has no text to copy")
-                    }
+                    None => self
+                        .state
+                        .transcript
+                        .push_error("Selected entry has no text to copy"),
                 }
             }
 
@@ -901,17 +1013,23 @@ impl<B: Backend> App<B> {
         let html = match session.export_to_jsonl(None).await {
             Ok(Some(jsonl)) => crate::export::session_jsonl_to_html(&jsonl),
             Ok(None) => {
-                self.state.transcript.push_status("nothing to share (empty session)");
+                self.state
+                    .transcript
+                    .push_status("nothing to share (empty session)");
                 return;
             }
             Err(e) => {
-                self.state.transcript.push_status(format!("share export error: {e}"));
+                self.state
+                    .transcript
+                    .push_status(format!("share export error: {e}"));
                 return;
             }
         };
         let tmp = std::env::temp_dir().join(format!("cyrup-session-{}.html", session.session_id()));
         if let Err(e) = std::fs::write(&tmp, html.as_bytes()) {
-            self.state.transcript.push_status(format!("share write error: {e}"));
+            self.state
+                .transcript
+                .push_status(format!("share write error: {e}"));
             return;
         }
         // pi's `gh auth status` pre-check, run BEFORE the loader is mounted
@@ -995,16 +1113,25 @@ impl<B: Backend> App<B> {
             // pi's `catch` around the whole promise (`:198-203`) — reported through the same arms
             // the settled result uses.
             Err(e) => {
-                self.apply_share_outcome(ShareMsg { result: Err(e), tmp });
+                self.apply_share_outcome(ShareMsg {
+                    result: Err(e),
+                    tmp,
+                });
                 return;
             }
         };
         let waiter_tmp = tmp.clone();
         let waiter = tokio::spawn(async move {
             let result = child.wait_with_output().await;
-            let _ = tx.send(ShareMsg { result, tmp: waiter_tmp });
+            let _ = tx.send(ShareMsg {
+                result,
+                tmp: waiter_tmp,
+            });
         });
-        self.state.share_in_flight = Some(ShareInFlight { task: waiter.abort_handle(), tmp });
+        self.state.share_in_flight = Some(ShareInFlight {
+            task: waiter.abort_handle(),
+            tmp,
+        });
     }
 
     /// Finish a settled `/share` on the run loop's task — pi's post-`await` tail
@@ -1066,14 +1193,22 @@ impl<B: Backend> App<B> {
             Ok(out) => {
                 let err = String::from_utf8_lossy(&out.stderr);
                 let msg = err.trim();
-                let detail = if msg.is_empty() { "gh gist create failed" } else { msg };
-                self.state.transcript.push_status(format!("share error: {detail}"));
+                let detail = if msg.is_empty() {
+                    "gh gist create failed"
+                } else {
+                    msg
+                };
+                self.state
+                    .transcript
+                    .push_status(format!("share error: {detail}"));
             }
             // No `ErrorKind::NotFound` arm: a missing `gh` is reported by the `gh auth status`
             // pre-check above, which runs first and returns — this path is only ever reached with a
             // `gh` that exists.
-            Err(e) => self.state.transcript.push_status(format!("share error: {e}")),
+            Err(e) => self
+                .state
+                .transcript
+                .push_status(format!("share error: {e}")),
         }
     }
-
 }

@@ -154,8 +154,14 @@ async fn toolcall_arguments_done_reprojects_the_replaced_buffer() {
 
     // Shape 1: `arguments` equals the concatenated deltas. The `done` frame emits nothing (the
     // remainder is empty), so only the delta frames' partials exist — all of them correct.
-    let partials = tool_call_partials(&[r#"{"path":"a.txt","#, r#""content":"hi"}"#], r#"{"path":"a.txt","content":"hi"}"#).await;
-    let last = partials.last().expect("at least one toolcall_delta partial");
+    let partials = tool_call_partials(
+        &[r#"{"path":"a.txt","#, r#""content":"hi"}"#],
+        r#"{"path":"a.txt","content":"hi"}"#,
+    )
+    .await;
+    let last = partials
+        .last()
+        .expect("at least one toolcall_delta partial");
     let args = match last.content.first() {
         Some(Content::ToolCall(tc)) => tc.arguments.clone(),
         other => panic!("expected a tool call, got {other:?}"),
@@ -170,7 +176,9 @@ async fn toolcall_arguments_done_reprojects_the_replaced_buffer() {
     // `ToolCallDelta`. Its partial must reflect the authoritative buffer, not the accumulated one.
     let full = r#"{"path":"a.txt","content":"hi","mode":"append"}"#;
     let partials = tool_call_partials(&[r#"{"path":"a.txt","#, r#""content":"hi""#], full).await;
-    let last = partials.last().expect("the done frame must emit a toolcall_delta");
+    let last = partials
+        .last()
+        .expect("the done frame must emit a toolcall_delta");
     let args = match last.content.first() {
         Some(Content::ToolCall(tc)) => tc.arguments.clone(),
         other => panic!("expected a tool call, got {other:?}"),

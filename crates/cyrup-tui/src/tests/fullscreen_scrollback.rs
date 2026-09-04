@@ -45,7 +45,12 @@
 //! the original bug for anyone quitting the app. Extracting that shutdown tail into something
 //! callable is the change that would close it.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use ratatui::backend::TestBackend;
 
@@ -64,9 +69,12 @@ fn new_app() -> App<TestBackend> {
 #[test]
 fn quitting_fullscreen_carries_the_excursion_out() {
     let mut app = new_app();
-    app.transcript_mut().push_status("a turn from inside the excursion");
+    app.transcript_mut()
+        .push_status("a turn from inside the excursion");
 
-    let captured = app.enter_fullscreen_captured().expect("the capture renderer builds");
+    let captured = app
+        .enter_fullscreen_captured()
+        .expect("the capture renderer builds");
     app.draw().unwrap();
 
     // The precondition that makes the repaint load-bearing: the fullscreen frame has taken the
@@ -83,9 +91,16 @@ fn quitting_fullscreen_carries_the_excursion_out() {
         text.contains("a turn from inside the excursion"),
         "the excursion's history did not survive the teardown:\n{text}"
     );
-    let leave_at = text.find("\x1b[?1049l").expect("the teardown leaves the alternate screen");
-    let row_at = text.find("a turn from inside").expect("the row was just asserted present");
-    assert!(leave_at < row_at, "the rows must land on the MAIN screen, after leaving:\n{text}");
+    let leave_at = text
+        .find("\x1b[?1049l")
+        .expect("the teardown leaves the alternate screen");
+    let row_at = text
+        .find("a turn from inside")
+        .expect("the row was just asserted present");
+    assert!(
+        leave_at < row_at,
+        "the rows must land on the MAIN screen, after leaving:\n{text}"
+    );
 }
 
 /// The same contract on the live switch back to inline, which had no coverage at all.
@@ -95,15 +110,29 @@ fn quitting_fullscreen_carries_the_excursion_out() {
 #[test]
 fn switching_back_to_inline_carries_the_excursion_out() {
     let mut app = new_app();
-    app.transcript_mut().push_status("a turn the switch must not eat");
+    app.transcript_mut()
+        .push_status("a turn the switch must not eat");
 
-    let captured = app.enter_fullscreen_captured().expect("the capture renderer builds");
+    let captured = app
+        .enter_fullscreen_captured()
+        .expect("the capture renderer builds");
     app.draw().unwrap();
-    assert_eq!(app.render_mode(), TuiRenderMode::Fullscreen, "the excursion is live");
+    assert_eq!(
+        app.render_mode(),
+        TuiRenderMode::Fullscreen,
+        "the excursion is live"
+    );
 
     let outcome = app.switch_tui_mode(TuiRenderMode::Regular, ModeSwitchOptions::default());
-    assert!(outcome.accepted(), "the switch back to inline was refused: {outcome:?}");
-    assert_eq!(app.render_mode(), TuiRenderMode::Regular, "the inline renderer is live again");
+    assert!(
+        outcome.accepted(),
+        "the switch back to inline was refused: {outcome:?}"
+    );
+    assert_eq!(
+        app.render_mode(),
+        TuiRenderMode::Regular,
+        "the inline renderer is live again"
+    );
 
     let text = captured_text(&captured);
     assert!(

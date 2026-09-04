@@ -25,7 +25,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
-use cyrup_core::ModelId;
+use cyrup_core::{ModelId, ProviderId};
 
 use crate::fork_context::ContextMode;
 
@@ -40,6 +40,15 @@ use crate::fork_context::ContextMode;
 /// (R-SA-001). Only `User`/`Project` are writable via management actions (R-SA-014) — a
 /// create/update/delete/rename targeting a `Builtin`- or `Package`-sourced agent MUST fail with
 /// a read-only error (enforced in `management.rs`, not here).
+///
+/// SUBA-084 — `Runtime` is pi's fifth `AgentSource` (`agents.ts:30` @v0.64.0: `"builtin" |
+/// "package" | "user" | "project" | "runtime"`): an agent registered IN-PROCESS through
+/// [`crate::discovery::runtime_registry::RuntimeAgentRegistry`], with `file_path` `runtime:<name>`
+/// and no file behind it. It takes NO part in the four-tier precedence merge — a runtime agent
+/// whose name or alias collides with any configured agent FAILS discovery closed
+/// (`runtime-agent-registry.ts:408-421`) instead of shadowing or being shadowed — and is
+/// appended after the merged result (`:428`). Where a name-resolution rank IS consulted
+/// (`effectiveAgentMatch`'s `sourceRank`, `agents.ts:687`), runtime outranks project.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AgentSource {
@@ -47,6 +56,7 @@ pub enum AgentSource {
     Package,
     User,
     Project,
+    Runtime,
 }
 
 impl AgentSource {
@@ -55,9 +65,14 @@ impl AgentSource {
     /// `cyrup_resources::scope::ResourceScope::precedence_rank` (an explicit method rather than a
     /// derived `Ord`) without reusing that enum's 9-variant, symmetric-precedence semantics
     /// (R-SA-021; see module doc above).
+    ///
+    /// `Runtime` shares `Project`'s rank 0 only so the "lower wins" contract stays total over the
+    /// enum; `merge.rs` never sees a `Runtime` agent (they are merged AFTER the four tiers by
+    /// `runtime_registry::merge_runtime_agents`, which fails closed on a collision rather than
+    /// ranking one). See [`AgentSource`]'s own doc.
     pub fn precedence_rank(self) -> u8 {
         match self {
-            AgentSource::Project => 0,
+            AgentSource::Project | AgentSource::Runtime => 0,
             AgentSource::User => 1,
             AgentSource::Package => 2,
             AgentSource::Builtin => 3,
@@ -541,23 +556,27 @@ pub struct AgentOverrideInfo {
 /// §4.1). Every field below is exactly one field of pi's `BuiltinAgentOverrideConfig`
 /// (`agents.ts:80-103`), under the same JSON key.
 ///
-/// **This is NOT the complete set.** pi declares 22 override keys; the 18 fields below model 18 of
-/// them, and 4 are unmodeled. An earlier revision of this doc claimed field-for-field completeness —
-/// it was wrong, and the claim is retracted rather than softened, because "pi has no others" is
-/// exactly the sentence that stops a reader from checking. Keep the arithmetic here honest: a wrong
-/// census misleads in the same way the completeness claim did.
+/// **This is NOT the complete set.** pi declares 22 override keys at v0.43.0; the fields below model
+/// 19 of them, plus the two keys pi added in v0.62.0 (`excludeTools`/`allowNestedSubagents`,
+/// SUBA-092), and 3 are unmodeled. An earlier revision of this doc claimed field-for-field
+/// completeness — it was wrong, and the claim is retracted rather than softened, because "pi has no
+/// others" is exactly the sentence that stops a reader from checking. Keep the arithmetic here
+/// honest: a wrong census misleads in the same way the completeness claim did. (`defaultProvider`
+/// left this list with SUBA-088 — see [`Self::default_provider`].)
 ///
-/// THREE of the four are unmodeled because this crate's [`AgentDefinition`] has no field for them to
+/// TWO of the three are unmodeled because this crate's [`AgentDefinition`] has no field for them to
 /// land in, and modeling them anyway would produce a settings key that parses and is then silently
 /// dropped — which, for an override delta, is indistinguishable from the setting not working at all:
 ///
-/// - `defaultProvider?: string | false` — pi `AgentConfig.modelProvider`; no counterpart here
-///   (this crate resolves a provider from the [`cyrup_core::ModelId`] itself).
 /// - `fast?: boolean` — pi `AgentConfig.fast`; no counterpart here.
-/// - `acceptanceRole?: AcceptanceRole | false` — pi `AgentConfig.acceptanceRole`; no counterpart
-///   here (acceptance roles are resolved by `exec/acceptance/`, not carried on the definition).
+/// - `acceptanceRole?: AcceptanceRole | false` — pi `AgentConfig.acceptanceRole`. The definition
+///   DOES carry it now ([`AgentDefinition::acceptance_role`], SUBA-082's frontmatter half), but
+///   the settings-override delta for it is still unmodeled here (SUBA-081's remainder): pi's
+///   `agentOverrides.<name>.acceptanceRole` accepts `false` to CLEAR the agent's declared role
+///   (`applyAgentOverride`, `agents.ts` @v0.64.0), and that three-state (`unset`/`role`/`false`)
+///   needs its own field.
 ///
-/// The FOURTH, `outputMode?: OutputMode`, is a different case: it IS representable — this crate
+/// The THIRD, `outputMode?: OutputMode`, is a different case: it IS representable — this crate
 /// merges pi's independent `output` (a path string) and `outputMode` fields into a single
 /// [`OutputSpec`], so its target is [`OutputSpec::mode`] — and is unmodeled only because it fell
 /// outside the scope that added the other five. Note the consequence for [`Self::output`], which is
@@ -619,6 +638,15 @@ pub struct AgentOverrideConfig {
     pub model: OverrideField<String>,
     #[serde(skip_serializing_if = "OverrideField::is_unset")]
     pub fallback_models: OverrideField<Vec<String>>,
+    /// SUBA-088 — pi `defaultProvider?: string | false` (`agents.ts:90` @v0.64.0), parsed at
+    /// `agents.ts:1086-1089` (a non-empty string, trimmed, or the literal `false`; anything else
+    /// aborts the read — that gate lives in [`crate::discovery::parse_subagent_settings`], since
+    /// serde's derive would silently accept `""`). Applied at `agents.ts:1387-1390`: a string SETS
+    /// [`AgentDefinition::model_provider`], a `false` DELETES it — including one stamped by
+    /// `subagents.defaultProvider`, which runs first. Note the key asymmetry: the settings key is
+    /// `defaultProvider`, the definition field it lands in is pi's `modelProvider`.
+    #[serde(skip_serializing_if = "OverrideField::is_unset")]
+    pub default_provider: OverrideField<String>,
     /// pi's `subagents.overrides.<name>.thinking` (`agents.ts:64,596,1011` @v0.43.0) is a `string | false`:
     /// an OPEN reasoning-level string (`"off"`, `"high"`, or any future/provider-specific value),
     /// or the literal `false` (explicit-clear). Modeled as `OverrideField<String>` — NOT a closed
@@ -656,6 +684,21 @@ pub struct AgentOverrideConfig {
     /// why `false` and `"inherit"` must not be collapsed.
     #[serde(skip_serializing_if = "ToolsOverrideField::is_unset")]
     pub tools: ToolsOverrideField,
+    /// SUBA-092 — pi `excludeTools?: string[] | false` (`agents.ts:104` @v0.64.0), parsed upstream
+    /// by `parseOverrideStringArrayOrFalse` (`agents.ts:1097`): an array of strings (trimmed,
+    /// empties dropped) or a JSON `false` to clear. Lands in [`AgentDefinition::exclude_tools`];
+    /// a clear is pi's `delete next.excludeTools` (`agents.ts:1404`), i.e. `None`. The trim/drop
+    /// normalization is applied where the list is consumed
+    /// ([`crate::exec::build_attempt_spawn_plan`], mirroring `pi-args.ts:502`), so the raw
+    /// settings value is carried here verbatim like `skills`/`extensions` are.
+    #[serde(skip_serializing_if = "OverrideField::is_unset")]
+    pub exclude_tools: OverrideField<Vec<String>>,
+    /// SUBA-092 — pi `allowNestedSubagents?: boolean` (`agents.ts:105` @v0.64.0; parsed at
+    /// `agents.ts:1099-1102`, applied at `:1405`). A plain boolean toggle with NO `| false` clear
+    /// form — as with `inheritSkills`, `OverrideField<bool>`'s `Value` arm accepts `false`, so a
+    /// JSON `false` is a real `Value(false)` and [`OverrideField::ExplicitClear`] is unreachable.
+    #[serde(skip_serializing_if = "OverrideField::is_unset")]
+    pub allow_nested_subagents: OverrideField<bool>,
     /// pi `extensions?: string[] | false` (`agents.ts:99`) — the extension allowlist. Lands in
     /// [`AgentDefinition::extensions`], where `None` means "all extensions visible" and
     /// `Some(vec![])` means "none"; a clear restores `None`, matching pi's `delete next.extensions`
@@ -695,6 +738,7 @@ impl AgentOverrideConfig {
             || self.default_reads.is_present()
             || self.model.is_present()
             || self.fallback_models.is_present()
+            || self.default_provider.is_present()
             || self.thinking.is_present()
             || self.system_prompt_mode.is_present()
             || self.inherit_project_context.is_present()
@@ -704,6 +748,8 @@ impl AgentOverrideConfig {
             || self.system_prompt.is_present()
             || self.skills.is_present()
             || self.tools.is_present()
+            || self.exclude_tools.is_present()
+            || self.allow_nested_subagents.is_present()
             || self.extensions.is_present()
             || self.subagent_only_extensions.is_present()
             || self.completion_guard.is_present()
@@ -725,6 +771,15 @@ pub struct SubagentSettings {
     pub overrides: BTreeMap<String, AgentOverrideConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    /// SUBA-088 — pi's `subagents.defaultProvider` (`agents.ts:192` @v0.64.0): the provider a
+    /// subagent's BARE model id (one with no `provider/` prefix) is resolved against, stamped as
+    /// [`AgentDefinition::model_provider`] onto every agent that has not pinned its own
+    /// (`applySubagentDefaultModel`, `agents.ts:1266-1279` — including agents that DO pin a
+    /// `model`). Project scope wins outright over user scope (`resolveSubagentDefaultProvider`,
+    /// `agents.ts:1242-1249`). Validated as a NON-EMPTY string and stored trimmed
+    /// (`agents.ts:1147-1153`); a malformed value MUST abort discovery (R-SA-009).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_provider: Option<String>,
     /// pi's `subagents.defaultThinking` (`agents.ts:164`) — a crate-wide reasoning-level default
     /// filled into every agent whose own `thinking` is unset (`applySubagentDefaultThinking`,
     /// `agents.ts:955-964`). Validated as a NON-EMPTY string and stored trimmed
@@ -811,7 +866,10 @@ impl LayeredOverrideSettings {
     /// else the user scope applies, else there is no policy and enforcement is off.
     #[must_use]
     pub fn model_scope(&self) -> Option<crate::exec::model_scope::ModelScopeConfig> {
-        self.project.model_scope.clone().or_else(|| self.user.model_scope.clone())
+        self.project
+            .model_scope
+            .clone()
+            .or_else(|| self.user.model_scope.clone())
     }
 
     /// SUBA-078 — the effective `subagents.maxThinking` ceiling for this cwd, pi
@@ -820,7 +878,10 @@ impl LayeredOverrideSettings {
     /// [`Self::model_scope`].
     #[must_use]
     pub fn max_thinking(&self) -> Option<String> {
-        self.project.max_thinking.clone().or_else(|| self.user.max_thinking.clone())
+        self.project
+            .max_thinking
+            .clone()
+            .or_else(|| self.user.max_thinking.clone())
     }
 }
 
@@ -965,6 +1026,26 @@ pub struct AgentDefinition {
     /// tools; `Some(populated)` = exactly this allowlist. Distinct from `extensions` below, which
     /// has an independently-meaningful `None`/empty/populated tri-state (func-SA §4.1).
     pub tools: Option<Vec<ToolRef>>,
+    /// SUBA-092 — pi `AgentConfig.excludeTools?: string[]` (`agents.ts:140` @v0.64.0), from the
+    /// `excludeTools:` frontmatter key (`agents.ts:1988`, `parseFrontmatterList`) or a settings
+    /// override ([`AgentOverrideConfig::exclude_tools`]). A SUBTRACTIVE per-agent tool constraint,
+    /// applied at spawn time AFTER [`Self::tools`] and any capability ceiling have produced the
+    /// declared builtin set (`runs/shared/pi-args.ts:502-504` `effectiveDeclaredBuiltinTools`) —
+    /// so it narrows an explicit `tools:` allowlist AND, for an agent that declared no `tools:` at
+    /// all, the ambient set (emitted to the child as `--exclude-tools`, `pi-args.ts:776-777`).
+    ///
+    /// `None` = the key was absent (pi's `undefined`); `Some(list)` = whatever the list parser
+    /// produced, entries untrimmed and undeduplicated here — `pi-args.ts:502` trims, drops empties
+    /// and de-duplicates at the consumer, and so does [`crate::exec::build_attempt_spawn_plan`].
+    pub exclude_tools: Option<Vec<String>>,
+    /// SUBA-092 — pi `AgentConfig.allowNestedSubagents?: boolean` (`agents.ts:141` @v0.64.0), from
+    /// the `allowNestedSubagents:` frontmatter key (strictly `true`/`false`, `agents.ts:2061-2066`)
+    /// or a settings override. An INDEPENDENT grant of nested delegation for an agent that declares
+    /// no explicit `tools:` allowlist naming `subagent`: `pi-args.ts:505-509`'s `fanoutAuthorized`
+    /// is `effectiveDeclaredBuiltinTools.includes("subagent") || (allowNestedSubagents === true &&
+    /// !excludedToolSet.has("subagent") && (!allowedToolSet || allowedToolSet.has("subagent")))`.
+    /// `None`/`Some(false)` both mean "no independent grant" (only `=== true` counts upstream).
+    pub allow_nested_subagents: Option<bool>,
     /// `None` = all extensions visible; `Some(vec![])` = none; `Some(populated)` = allowlist
     /// (func-SA §4.1).
     pub extensions: Option<Vec<String>>,
@@ -982,6 +1063,17 @@ pub struct AgentDefinition {
     /// orchestrator itself.
     pub subagent_only_extensions: Vec<String>,
     pub model: Option<ModelId>,
+    /// SUBA-088 — pi `AgentConfig.modelProvider?: string` (`agents.ts:144` @v0.64.0): the provider
+    /// this agent's BARE model ids (`model`/`fallbackModels` entries with no `provider/` prefix,
+    /// and a bare per-call override) resolve against. NOT a frontmatter key — pi's agent-file
+    /// parser never reads it; it arrives only from `subagents.defaultProvider`
+    /// (`applySubagentDefaultModel`, `agents.ts:1266-1279`, which stamps it even onto an agent that
+    /// pins its own `model`) or a per-agent `agentOverrides.<name>.defaultProvider` (`:1387-1390`,
+    /// where `false` clears it). Consumed as `agent.modelProvider ?? options.preferredModelProvider`
+    /// at the ladder (`runs/foreground/execution.ts:1885`) — see
+    /// [`crate::exec::fallback::build_model_candidates`] — and by the `models` report
+    /// (`agent-management.ts:1012`). `None` defers to the parent session's provider.
+    pub model_provider: Option<ProviderId>,
     pub fallback_models: Vec<ModelId>,
     /// The agent's own frontmatter `thinking` value, held as pi's OPEN reasoning-level string
     /// (`AgentConfig.thinking?: string`, `agents.ts:64,86,126` @v0.43.0) rather than a closed
@@ -1052,6 +1144,27 @@ pub struct AgentDefinition {
     /// (`subagent-executor.ts:1940-1942`), and the extension-config `subagents.turnBudget` sits
     /// below it in the same chain.
     pub default_turn_budget: Option<crate::exec::turn_budget::ResolvedTurnBudget>,
+    /// SUBA-082 — pi `AgentConfig.defaultAcceptance?: AcceptanceInput` (`agents.ts:144`
+    /// @v0.57.0, `:156` @v0.64.0), from the `acceptance:` frontmatter key: the RAW acceptance
+    /// input (`"checked"`, `false`, or a `{ level, criteria, evidence, verify, review, stopRules,
+    /// reason }` object), YAML-parsed and already validated by
+    /// [`crate::exec::acceptance::model::validate_acceptance_input`] at parse time
+    /// (`parseAgentAcceptanceFrontmatter`, `agents.ts:1873-1884` @v0.57.0). Held as the raw
+    /// [`serde_json::Value`] — the same shape as a chain step's `acceptance` — so the single
+    /// lowering [`crate::exec::acceptance::lower_acceptance_input`] applies at the launch seam.
+    ///
+    /// A LAUNCH DEFAULT for SINGLE-agent launches only, fill-unset-only
+    /// (`applySingleAgentLaunchDefaults`, `subagent-executor.ts:2690-2692` @v0.64.0:
+    /// `params.acceptance === undefined && agent.defaultAcceptance !== undefined`): an explicit
+    /// call-site `acceptance` wins, and a chain/parallel step never inherits it
+    /// (`docs/agents.md:326` @v0.64.0).
+    pub default_acceptance: Option<serde_json::Value>,
+    /// SUBA-082 — pi `AgentConfig.acceptanceRole?: AcceptanceRole` (`agents.ts:145` @v0.57.0,
+    /// `:157` @v0.64.0), from the `acceptanceRole:` frontmatter key (strictly `read-only` or
+    /// `writer`, `agents.ts:2011-2014` @v0.57.0). The PRIMARY input to acceptance-level inference
+    /// — see [`crate::exec::acceptance::model::AcceptanceRole`]. `None` (upstream's `undefined`)
+    /// is the branch on which `inferLevel` falls back to agent-NAME guessing.
+    pub acceptance_role: Option<crate::exec::acceptance::model::AcceptanceRole>,
     /// SUBA-073 — this agent's own `permission:`/`permissions:` frontmatter, already validated
     /// (`discovery/frontmatter.rs`). Merged with the global `config.permissions` rung at run time
     /// via [`crate::exec::permissions::resolve_permission_rules`] — this field alone is NOT the
@@ -1249,6 +1362,61 @@ pub struct ChainDiscoveryDiagnostic {
     pub message: String,
 }
 
+/// SUBA-086 — one malformed AGENT definition file, reported by name instead of silently dropped.
+/// Port of pi `AgentDiscoveryDiagnostic` (`agents.ts:238-249` @v0.64.0; `:229-234` @v0.57.0):
+///
+/// ```text
+/// interface ChainDiscoveryDiagnostic { source; filePath; error }
+/// interface AgentDiscoveryDiagnostic extends ChainDiscoveryDiagnostic {
+///   name?: string; runtimeName?: string; packageSpecified?: boolean; discoveryPriority?: number;
+/// }
+/// ```
+///
+/// Produced by [`crate::discovery::frontmatter::parse_agent_file_checked`] for every validation
+/// pi THROWS on inside `loadAgentsFromDefinitionFiles`' per-file `try { … } catch` (`:1959-2154`,
+/// catch at `:2149-2151`) — a bad `package`, `async`, `timeoutMs`, `toolTimeoutMs`, `outputMode`,
+/// `fast`, `allowNestedSubagents`, `acceptance`, `acceptanceRole`, `toolBudget`, `turnBudget`,
+/// `permission`/`permissions`, `runner` or reserved-profile squat. A file missing `name`/
+/// `description` is NOT a diagnostic (pi `continue`s at `:1970-1972`; R-SA-005's silent skip).
+///
+/// Carried on [`crate::discovery::AgentDiscoveryResult::agent_diagnostics`], rendered under
+/// `Invalid agent definitions:` by `list`/`models`, by `/subagents-doctor`, and consulted by
+/// [`crate::discovery::find_blocking_agent_diagnostic`] so a broken definition BLOCKS resolution
+/// of its own name with its parse error instead of falling through to a lower-tier same-named
+/// agent or to "not found".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentDiscoveryDiagnostic {
+    pub source: AgentSource,
+    pub file_path: PathBuf,
+    /// The exact message pi's throw carries (`error instanceof Error ? error.message : …`).
+    pub error: String,
+    /// The file's LOCAL `name:` — `None` only when the failure preceded reading it (never the
+    /// case today: `package` is validated after `name`, exactly as upstream, `:1974-1979`).
+    pub name: Option<String>,
+    /// The `{package}.{name}` runtime name, set only when it differs from `name` (pi `:2151`
+    /// `runtimeName && runtimeName !== name`).
+    pub runtime_name: Option<String>,
+    /// pi `packageSpecified = parsedPackage.packageName !== undefined || parsedPackage.error !==
+    /// undefined` (`:1976`): a non-blank `package:` was declared, valid or not.
+    pub package_specified: bool,
+    /// pi's per-directory ordinal within a tier (`:2471,2476`). Always `None` here: cyrup's
+    /// [`AgentDefinition`] carries no matching ordinal, so a stamped value on the diagnostic side
+    /// alone would outrank a same-tier surviving definition upstream ties with. Blocking therefore
+    /// reduces to source rank, which is exact for every cross-tier collision.
+    pub discovery_priority: Option<u32>,
+}
+
+impl AgentDiscoveryDiagnostic {
+    /// pi's `diagnostic.name ?? diagnostic.filePath` label (`agent-management.ts:823`,
+    /// `doctor.ts:149` @v0.64.0).
+    #[must_use]
+    pub fn label(&self) -> String {
+        self.name
+            .clone()
+            .unwrap_or_else(|| self.file_path.display().to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
@@ -1326,6 +1494,8 @@ mod tests {
     fn sample_agent(tools: Option<Vec<ToolRef>>) -> AgentDefinition {
         AgentDefinition {
             default_turn_budget: None,
+            default_acceptance: None,
+            acceptance_role: None,
             permission_rules: None,
             runner: None,
             name: "reviewer".to_string(),
@@ -1334,6 +1504,8 @@ mod tests {
             description: "reviews things".to_string(),
             aliases: Vec::new(),
             tools,
+            exclude_tools: None,
+            allow_nested_subagents: None,
             extensions: None,
             extensions_from_default: false,
             subagent_only_extensions: Vec::new(),
@@ -1363,6 +1535,7 @@ mod tests {
             extra_fields: BTreeMap::new(),
             override_info: None,
             model_source: None,
+            model_provider: None,
         }
     }
 
@@ -1402,7 +1575,8 @@ mod tests {
         // pi settings `tools`/override lists are plain strings: `"bash"` / `"mcp:x"`.
         let builtin: ToolRef = serde_json::from_str("\"bash\"").expect("string builtin");
         assert_eq!(builtin, ToolRef::Builtin("bash".to_string()));
-        let mcp: ToolRef = serde_json::from_str("\"mcp:xcodebuild_list_sims\"").expect("string mcp");
+        let mcp: ToolRef =
+            serde_json::from_str("\"mcp:xcodebuild_list_sims\"").expect("string mcp");
         assert_eq!(mcp, ToolRef::Mcp("xcodebuild_list_sims".to_string()));
     }
 
@@ -1460,12 +1634,21 @@ mod tests {
         assert_eq!(settings.default_model.as_deref(), Some("deepseek-v4-flash"));
         assert_eq!(settings.disable_builtins, Some(true));
 
-        let reviewer = settings.overrides.get("reviewer").expect("reviewer override");
-        assert_eq!(reviewer.model, OverrideField::Value("openai/gpt-5.4".to_string()));
+        let reviewer = settings
+            .overrides
+            .get("reviewer")
+            .expect("reviewer override");
+        assert_eq!(
+            reviewer.model,
+            OverrideField::Value("openai/gpt-5.4".to_string())
+        );
         assert_eq!(reviewer.thinking, OverrideField::Value("xhigh".to_string()));
         assert_eq!(reviewer.completion_guard, OverrideField::Value(false));
 
-        let implementer = settings.overrides.get("implementer").expect("implementer override");
+        let implementer = settings
+            .overrides
+            .get("implementer")
+            .expect("implementer override");
         assert_eq!(
             implementer.tools,
             ToolsOverrideField::Value(vec![
@@ -1492,8 +1675,14 @@ mod tests {
         .expect("six-field override deserializes");
         assert_eq!(full.inherit_project_context, OverrideField::Value(true));
         assert_eq!(full.inherit_skills, OverrideField::Value(false));
-        assert_eq!(full.default_context, OverrideField::Value(ContextMode::Fork));
-        assert_eq!(full.system_prompt, OverrideField::Value("Base prompt".to_string()));
+        assert_eq!(
+            full.default_context,
+            OverrideField::Value(ContextMode::Fork)
+        );
+        assert_eq!(
+            full.system_prompt,
+            OverrideField::Value("Base prompt".to_string())
+        );
         assert_eq!(
             full.skills,
             OverrideField::Value(vec!["tdd".to_string(), "safe-bash".to_string()])
@@ -1512,7 +1701,10 @@ mod tests {
         .expect("cleared override deserializes");
         assert_eq!(cleared.default_context, OverrideField::ExplicitClear);
         assert_eq!(cleared.skills, OverrideField::ExplicitClear);
-        assert_eq!(cleared.subagent_only_extensions, OverrideField::ExplicitClear);
+        assert_eq!(
+            cleared.subagent_only_extensions,
+            OverrideField::ExplicitClear
+        );
     }
 
     #[test]
@@ -1527,7 +1719,8 @@ mod tests {
                 "c": { "thinking": false }
             }
         });
-        let settings: SubagentSettings = serde_json::from_value(raw).expect("open thinking settings");
+        let settings: SubagentSettings =
+            serde_json::from_value(raw).expect("open thinking settings");
         assert_eq!(
             settings.overrides.get("a").expect("a").thinking,
             OverrideField::Value("off".to_string()),

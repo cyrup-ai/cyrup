@@ -27,6 +27,10 @@
 //! Everything here goes through `model::resolve_effective_acceptance`, the same function
 //! `AcceptanceContract::heuristic_default` calls on the live inference path — no reimplementation of
 //! the classifier, and no private item reached around.
+//!
+//! Every input here leaves `acceptance_role` at `None`, upstream's `acceptanceRole === undefined`:
+//! the alternation is consulted ONLY on that branch. The DECLARED-role branch (SUBA-082) is
+//! pinned separately in `tests/acceptance_role_inference.rs`.
 
 #![allow(
     clippy::unwrap_used,
@@ -51,6 +55,8 @@ fn infer(agent: &str, task: &str) -> ResolvedAcceptanceConfig {
     resolve_effective_acceptance(&AcceptanceResolveInput {
         explicit: None,
         agent_name: agent.to_string(),
+        // The `acceptanceRole === undefined` branch — the ONLY branch this file pins.
+        acceptance_role: None,
         task: Some(task.to_string()),
         mode: None,
         is_async: false,

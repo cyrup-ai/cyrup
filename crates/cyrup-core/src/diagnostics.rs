@@ -37,7 +37,12 @@ pub struct DiagnosticErrorInfo {
 impl DiagnosticErrorInfo {
     /// A bare info record with just a `message` (Pi `{ message }`).
     pub fn from_message(message: impl Into<String>) -> Self {
-        Self { name: None, message: message.into(), stack: None, code: None }
+        Self {
+            name: None,
+            message: message.into(),
+            stack: None,
+            code: None,
+        }
     }
 
     #[must_use]
@@ -108,7 +113,12 @@ pub fn create_assistant_message_diagnostic_from(
     error: Option<DiagnosticErrorInfo>,
     details: Option<serde_json::Value>,
 ) -> AssistantMessageDiagnostic {
-    AssistantMessageDiagnostic { r#type: r#type.into(), timestamp: now_millis(), error, details }
+    AssistantMessageDiagnostic {
+        r#type: r#type.into(),
+        timestamp: now_millis(),
+        error,
+        details,
+    }
 }
 
 /// Append a diagnostic to any message that carries a `diagnostics` vector (Pi

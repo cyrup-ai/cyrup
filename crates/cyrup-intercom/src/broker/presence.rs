@@ -7,7 +7,6 @@
 //! absent/`null`/number tri-state that decides whether a field is left alone, cleared, or set — and
 //! whether that counts as a change worth broadcasting.
 
-
 use crate::transport::protocol::BrokerMessage;
 
 use super::frame::FrameResult;
@@ -31,7 +30,11 @@ impl BrokerState {
         // type checks first killed a superseded socket's late malformed frame as a protocol error;
         // the reconnect ladder deliberately re-offers the previous session id, so takeover races are
         // a live path, not a theoretical one.
-        let Some(session) = self.sessions.get_mut(&current_id).filter(|s| s.conn_id == conn_id) else {
+        let Some(session) = self
+            .sessions
+            .get_mut(&current_id)
+            .filter(|s| s.conn_id == conn_id)
+        else {
             return FrameResult::cont();
         };
         // A wrong type IS fatal for the owner (`v0.9.2 broker/broker.ts:892-894`, `:901-903`,
@@ -87,7 +90,9 @@ impl BrokerState {
         // `v0.10.1 broker/broker.ts:779-787` — additive at v0.10.0 (`126875e`). The flag tells a
         // peer a chosen name from a synthesized alias, and the mailbox identity guard reads it
         // (`:1039-1047`).
-        if let Some(alias) = value.get("runtimeFallbackAlias").and_then(serde_json::Value::as_bool)
+        if let Some(alias) = value
+            .get("runtimeFallbackAlias")
+            .and_then(serde_json::Value::as_bool)
             && session.info.runtime_fallback_alias != Some(alias)
         {
             session.info.runtime_fallback_alias = Some(alias);
@@ -96,15 +101,20 @@ impl BrokerState {
         // `v0.9.2 broker/broker.ts:921-950`, one arm per field. Kept as three explicit calls (not a
         // loop) because Rust cannot index a struct by name; the helper carries the whole tri-state.
         changed |= apply_presence_context(&mut session.info.context_pct, value.get("contextPct"));
-        changed |= apply_presence_context(&mut session.info.context_tokens, value.get("contextTokens"));
-        changed |= apply_presence_context(&mut session.info.context_window, value.get("contextWindow"));
+        changed |=
+            apply_presence_context(&mut session.info.context_tokens, value.get("contextTokens"));
+        changed |=
+            apply_presence_context(&mut session.info.context_window, value.get("contextWindow"));
         session.info.last_activity = now.into();
-        let should_broadcast =
-            changed || now.saturating_sub(session.last_presence_broadcast_at) >= PRESENCE_HEARTBEAT_MS;
+        let should_broadcast = changed
+            || now.saturating_sub(session.last_presence_broadcast_at) >= PRESENCE_HEARTBEAT_MS;
         if should_broadcast {
             session.last_presence_broadcast_at = now;
             let info = session.info.clone();
-            self.broadcast(&BrokerMessage::PresenceUpdate { session: info }, Some(&current_id));
+            self.broadcast(
+                &BrokerMessage::PresenceUpdate { session: info },
+                Some(&current_id),
+            );
         }
         FrameResult::cont()
     }
@@ -150,11 +160,11 @@ fn apply_presence_context(
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
-    use serde_json::json;
-    use std::sync::Arc;
-    use super::*;
     use super::super::frame::FrameOutcome;
     use super::super::state::BrokerState;
+    use super::*;
+    use serde_json::json;
+    use std::sync::Arc;
     use tokio::sync::Notify;
 
     /// R4 — the `presence` tri-state, arm by arm (`v0.9.2 broker/broker.ts:921-950`). The
@@ -251,10 +261,10 @@ mod tests {
     #[test]
     fn a_non_owning_socket_s_malformed_presence_is_ignored_not_fatal() {
         let mut state = BrokerState::new(
-                30_000,
-                Arc::new(Notify::new()),
-                super::super::test_support::test_extension_state_dir(),
-            );
+            30_000,
+            Arc::new(Notify::new()),
+            super::super::test_support::test_extension_state_dir(),
+        );
         let (tx_owner, _rx_owner) = tokio::sync::mpsc::unbounded_channel();
         let (tx_loser, _rx_loser) = tokio::sync::mpsc::unbounded_channel();
 
@@ -271,14 +281,24 @@ mod tests {
         // The loser still believes it is `s1`, and sends a malformed presence.
         let bad = json!({ "type": "presence", "name": 5 });
         assert!(
-            matches!(state.handle_frame(1, &tx_loser, &bad, &mut sid_loser, 2_000).outcome, FrameOutcome::Continue),
+            matches!(
+                state
+                    .handle_frame(1, &tx_loser, &bad, &mut sid_loser, 2_000)
+                    .outcome,
+                FrameOutcome::Continue
+            ),
             "a non-owning socket's malformed presence must be ignored, not a protocol error"
         );
 
         // POSITIVE CONTROL: the OWNER sending the same frame is still fatal
         // (`v0.10.1 broker/broker.ts:766-768`).
         assert!(
-            matches!(state.handle_frame(2, &tx_owner, &bad, &mut sid_owner, 2_001).outcome, FrameOutcome::ProtocolError),
+            matches!(
+                state
+                    .handle_frame(2, &tx_owner, &bad, &mut sid_owner, 2_001)
+                    .outcome,
+                FrameOutcome::ProtocolError
+            ),
             "the owner's malformed presence is still fatal"
         );
     }
@@ -287,10 +307,10 @@ mod tests {
     #[test]
     fn presence_carries_runtime_fallback_alias() {
         let mut state = BrokerState::new(
-                30_000,
-                Arc::new(Notify::new()),
-                super::super::test_support::test_extension_state_dir(),
-            );
+            30_000,
+            Arc::new(Notify::new()),
+            super::super::test_support::test_extension_state_dir(),
+        );
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut sid = None;
         state.handle_frame(
@@ -306,7 +326,10 @@ mod tests {
         );
         // `v0.10.1 broker/broker.ts:358` copies it off the registration.
         assert_eq!(
-            state.sessions.get("s1").and_then(|s| s.info.runtime_fallback_alias),
+            state
+                .sessions
+                .get("s1")
+                .and_then(|s| s.info.runtime_fallback_alias),
             Some(true),
             "register must carry the flag onto the stored SessionInfo"
         );
@@ -314,16 +337,34 @@ mod tests {
         // A presence frame flips it (`:779-787`).
         assert!(matches!(
             state
-                .handle_frame(1, &tx, &json!({ "type": "presence", "runtimeFallbackAlias": false }), &mut sid, 2_000)
+                .handle_frame(
+                    1,
+                    &tx,
+                    &json!({ "type": "presence", "runtimeFallbackAlias": false }),
+                    &mut sid,
+                    2_000
+                )
                 .outcome,
             FrameOutcome::Continue
         ));
-        assert_eq!(state.sessions.get("s1").and_then(|s| s.info.runtime_fallback_alias), Some(false));
+        assert_eq!(
+            state
+                .sessions
+                .get("s1")
+                .and_then(|s| s.info.runtime_fallback_alias),
+            Some(false)
+        );
 
         // A non-boolean is fatal, like every other presence type check.
         assert!(matches!(
             state
-                .handle_frame(1, &tx, &json!({ "type": "presence", "runtimeFallbackAlias": "yes" }), &mut sid, 3_000)
+                .handle_frame(
+                    1,
+                    &tx,
+                    &json!({ "type": "presence", "runtimeFallbackAlias": "yes" }),
+                    &mut sid,
+                    3_000
+                )
                 .outcome,
             FrameOutcome::ProtocolError
         ));

@@ -71,12 +71,17 @@ pub fn is_installed(agent_dir: &Path, cwd: &Path) -> bool {
     if env_truthy(INSTALL_ENV_VAR) {
         return true;
     }
-    let project_dir = PROJECT_AGENT_SUBDIR.iter().fold(cwd.to_path_buf(), |acc, seg| acc.join(seg));
+    let project_dir = PROJECT_AGENT_SUBDIR
+        .iter()
+        .fold(cwd.to_path_buf(), |acc, seg| acc.join(seg));
     // PERM-025: the GLOBAL policy file is probed at the same relocatable root
     // `manager_paths_for` enforces from, so the probe and the engine can never inspect two
     // different trees (the PERM-018 property, one rung up).
     let policy_dir = policy_agent_dir(agent_dir);
-    if [policy_dir.join(POLICY_FILE), project_dir.join(POLICY_FILE)].iter().any(|p| p.exists()) {
+    if [policy_dir.join(POLICY_FILE), project_dir.join(POLICY_FILE)]
+        .iter()
+        .any(|p| p.exists())
+    {
         return true;
     }
     // PERM-023: agent-scoped `permission:` frontmatter is an ENFORCED policy layer —
@@ -90,7 +95,10 @@ pub fn is_installed(agent_dir: &Path, cwd: &Path) -> bool {
     // "Non-empty", not "exists": neither directory is ever written by this crate (unlike
     // `config.json`, whose auto-materialization produced PERM-002's latch), but an empty
     // `agents/` left behind by another tool is not an authored policy.
-    if [policy_dir.join("agents"), project_dir.join("agents")].iter().any(|p| dir_has_entry(p)) {
+    if [policy_dir.join("agents"), project_dir.join("agents")]
+        .iter()
+        .any(|p| dir_has_entry(p))
+    {
         return true;
     }
     // The RESOLVED path, not the raw default: `CYRUP_PERMISSION_SYSTEM_CONFIG_PATH` can point the

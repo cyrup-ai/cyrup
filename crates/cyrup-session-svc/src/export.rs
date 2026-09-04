@@ -74,7 +74,11 @@ pub fn session_jsonl_to_html(jsonl: &str) -> String {
     let header: Option<Value> = lines.next().and_then(|l| serde_json::from_str(l).ok());
     let title = header
         .as_ref()
-        .and_then(|h| h.get("name").or_else(|| h.get("title")).and_then(Value::as_str))
+        .and_then(|h| {
+            h.get("name")
+                .or_else(|| h.get("title"))
+                .and_then(Value::as_str)
+        })
         .unwrap_or("Session")
         .to_string();
     let cwd = header
@@ -85,7 +89,9 @@ pub fn session_jsonl_to_html(jsonl: &str) -> String {
 
     let mut body = String::new();
     for line in lines {
-        let Ok(value) = serde_json::from_str::<Value>(line) else { continue };
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
         let role = entry_role(&value);
         let mut texts = Vec::new();
         collect_text(&value, &mut texts);

@@ -119,7 +119,10 @@ impl FrameReader {
                 self.buffer.clear();
                 return Err(FrameReadError {
                     frames: out,
-                    error: FrameError::Oversize { length, max: MAX_FRAME_BYTES },
+                    error: FrameError::Oversize {
+                        length,
+                        max: MAX_FRAME_BYTES,
+                    },
                 });
             }
             if self.buffer.len() < 4 + length {
@@ -225,7 +228,12 @@ fn null_out_overflowing_numbers(payload: &[u8]) -> Option<Vec<u8>> {
             let start = i;
             let mut end = i;
             while let Some(&c) = payload.get(end) {
-                if c == b'-' || c == b'+' || c == b'.' || c == b'e' || c == b'E' || c.is_ascii_digit()
+                if c == b'-'
+                    || c == b'+'
+                    || c == b'.'
+                    || c == b'e'
+                    || c == b'E'
+                    || c.is_ascii_digit()
                 {
                     end += 1;
                 } else {
@@ -273,7 +281,10 @@ mod tests {
         // Feed the header one byte at a time, then the payload in two halves.
         for i in 0..full.len() - 1 {
             let got = reader.push(&full[i..=i]).expect("no oversize");
-            assert!(got.is_empty(), "no complete frame until the final byte arrives");
+            assert!(
+                got.is_empty(),
+                "no complete frame until the final byte arrives"
+            );
         }
         let got = reader.push(&full[full.len() - 1..]).expect("no oversize");
         assert_eq!(got.len(), 1);
@@ -299,11 +310,19 @@ mod tests {
         let bad_len = (MAX_FRAME_BYTES as u32) + 1;
         oversize.extend_from_slice(&bad_len.to_be_bytes());
         let mut reader = FrameReader::new();
-        let err = reader.push(&oversize).expect_err("must reject over-cap length");
-        assert!(err.frames.is_empty(), "no frames were reassembled before the oversize header");
+        let err = reader
+            .push(&oversize)
+            .expect_err("must reject over-cap length");
+        assert!(
+            err.frames.is_empty(),
+            "no frames were reassembled before the oversize header"
+        );
         assert_eq!(
             err.error,
-            FrameError::Oversize { length: MAX_FRAME_BYTES + 1, max: MAX_FRAME_BYTES }
+            FrameError::Oversize {
+                length: MAX_FRAME_BYTES + 1,
+                max: MAX_FRAME_BYTES
+            }
         );
     }
 
@@ -323,13 +342,18 @@ mod tests {
         chunk.extend_from_slice(&bad_len.to_be_bytes());
 
         let mut reader = FrameReader::new();
-        let err = reader.push(&chunk).expect_err("must reject the oversize third frame");
+        let err = reader
+            .push(&chunk)
+            .expect_err("must reject the oversize third frame");
 
         // The two frames reassembled before the oversize header must NOT be discarded.
         assert_eq!(err.frames, vec![b"first".to_vec(), b"second".to_vec()]);
         assert_eq!(
             err.error,
-            FrameError::Oversize { length: MAX_FRAME_BYTES + 1, max: MAX_FRAME_BYTES }
+            FrameError::Oversize {
+                length: MAX_FRAME_BYTES + 1,
+                max: MAX_FRAME_BYTES
+            }
         );
     }
 
@@ -341,14 +365,21 @@ mod tests {
     // byte faithful to pi wherever it's used.
     #[test]
     fn parse_and_handler_error_messages_match_pi_wording_exactly() {
-        let parse_err = FrameError::Parse { message: "Unexpected token o in JSON".to_string() };
+        let parse_err = FrameError::Parse {
+            message: "Unexpected token o in JSON".to_string(),
+        };
         assert_eq!(
             parse_err.to_string(),
             "Failed to parse intercom message: Unexpected token o in JSON"
         );
 
-        let handler_err = FrameError::Handler { message: "boom".to_string() };
-        assert_eq!(handler_err.to_string(), "Failed to handle intercom message: boom");
+        let handler_err = FrameError::Handler {
+            message: "boom".to_string(),
+        };
+        assert_eq!(
+            handler_err.to_string(),
+            "Failed to handle intercom message: boom"
+        );
     }
 
     #[test]

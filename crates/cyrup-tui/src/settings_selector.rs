@@ -13,17 +13,17 @@
 //! the chosen option (writing the trust store) and closes. Both occupy the input slot exactly like the
 //! [`ListSelector`](crate::selector::ListSelector), delimited by the full-width `DynamicBorder`.
 
+use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use crate::keymap::{SelectAction, SelectKeymap};
 use crate::selector::{
-    border_rule, border_rule_line, centered_window, input_line_spans, stack_rows, Selector,
-    SelectorOutcome,
+    Selector, SelectorOutcome, border_rule, border_rule_line, centered_window, input_line_spans,
+    stack_rows,
 };
 use crate::text_width::{str_width, truncate_line_to_width, truncate_to_width};
 use crate::theme::UiTheme;
@@ -289,7 +289,10 @@ impl SettingsSelector {
         // `:98-104` — no rows at all. NOT truncated upstream (only the "no matching" arm is), and
         // the hint follows because search is enabled.
         if self.rows.is_empty() {
-            lines.push(Line::from(Span::styled("  No settings available", theme.dim_style())));
+            lines.push(Line::from(Span::styled(
+                "  No settings available",
+                theme.dim_style(),
+            )));
             self.push_hint_line(&mut lines, width, theme);
             return lines;
         }
@@ -321,12 +324,18 @@ impl SettingsSelector {
         let value_max = width.saturating_sub(used).saturating_sub(2);
 
         for i in start..end {
-            let Some(row) = display.get(i).and_then(|r| self.rows.get(*r)) else { continue };
+            let Some(row) = display.get(i).and_then(|r| self.rows.get(*r)) else {
+                continue;
+            };
             let is_sel = i == self.selected;
             // `theme.cursor` is `theme.fg("accent", "→ ")` (`theme/theme.ts:1313`); the unselected
             // prefix is two plain spaces (`:129`).
             let prefix = if is_sel { "→ " } else { "  " };
-            let prefix_style = if is_sel { theme.accent_style() } else { theme.base_style() };
+            let prefix_style = if is_sel {
+                theme.accent_style()
+            } else {
+                theme.base_style()
+            };
             // `:133` — pad the label to the column with `visibleWidth`-measured spaces. A label
             // wider than the clamp is NOT truncated upstream; `Math.max(0, …)` just pads by zero
             // and the row-level `truncateToWidth` at `:143` handles the overflow.
@@ -335,8 +344,16 @@ impl SettingsSelector {
             // `getSettingsListTheme` (`theme/theme.ts:1310-1311`): the label is accent when
             // selected and otherwise UNSTYLED; the value is accent when selected and muted
             // otherwise.
-            let label_style = if is_sel { theme.accent_style() } else { theme.base_style() };
-            let value_style = if is_sel { theme.accent_style() } else { theme.muted_style() };
+            let label_style = if is_sel {
+                theme.accent_style()
+            } else {
+                theme.base_style()
+            };
+            let value_style = if is_sel {
+                theme.accent_style()
+            } else {
+                theme.muted_style()
+            };
             // `:141` truncates the value with an EMPTY ellipsis; `:143` truncates the whole row
             // with the default `"..."`.
             let value = truncate_to_width(&row.value, value_max, "");
@@ -412,7 +429,11 @@ impl SettingsSelector {
         if len == 0 {
             return;
         }
-        self.selected = if self.selected == 0 { len - 1 } else { self.selected - 1 };
+        self.selected = if self.selected == 0 {
+            len - 1
+        } else {
+            self.selected - 1
+        };
     }
 
     fn select_down(&mut self) {
@@ -420,7 +441,11 @@ impl SettingsSelector {
         if len == 0 {
             return;
         }
-        self.selected = if self.selected + 1 >= len { 0 } else { self.selected + 1 };
+        self.selected = if self.selected + 1 >= len {
+            0
+        } else {
+            self.selected + 1
+        };
     }
 }
 
@@ -428,8 +453,10 @@ impl Selector for SettingsSelector {
     fn desired_height(&self, width: u16) -> u16 {
         // `DynamicBorder`(:765) + the `SettingsList`'s own natural lines + `DynamicBorder`(:874).
         // Measured from the real `lines()` so the height can never disagree with the render.
-        let body =
-            self.lines(width, UiTheme::default_ref()).len().min(usize::from(u16::MAX)) as u16;
+        let body = self
+            .lines(width, UiTheme::default_ref())
+            .len()
+            .min(usize::from(u16::MAX)) as u16;
         body.saturating_add(2)
     }
 
@@ -497,7 +524,9 @@ impl Selector for SettingsSelector {
             // a literal space typed into the query.
             KeyCode::Char(' ')
                 if self.input.value().is_empty()
-                    && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 if let Some(id) = self.current().and_then(|r| r.submenu.clone()) {
                     return SelectorOutcome::OpenSubmenu(id);
@@ -626,7 +655,11 @@ impl TrustSelector {
         lines.push(Line::from(Span::styled(
             format!(
                 " Current session: {}",
-                if self.session_trusted { "trusted" } else { "untrusted" }
+                if self.session_trusted {
+                    "trusted"
+                } else {
+                    "untrusted"
+                }
             ),
             theme.muted_style(),
         )));
@@ -648,7 +681,11 @@ impl TrustSelector {
             .map(|(i, label)| {
                 let selected = i == self.selected;
                 let prefix = if selected { "→ " } else { "  " };
-                let style = if selected { theme.accent_style() } else { theme.base_style() };
+                let style = if selected {
+                    theme.accent_style()
+                } else {
+                    theme.base_style()
+                };
                 // `new Text(`${prefix}${label}${checkmark}`, 1, 0)` (`trust-selector.ts:113`) —
                 // `paddingX = 1`, so the option rows carry the SAME one-column left margin the
                 // header and hint rows already do (`text.ts:70-76`). cyrup started them at column 0,

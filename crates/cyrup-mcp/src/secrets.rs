@@ -467,12 +467,13 @@ pub fn resolve_http_secrets(
         .any(|(_, value)| crate::credentials::is_command_secret(value));
 
     // Step 3.
-    let mut headers: Vec<(String, String)> = resolve_command_secrets_record(entry.headers.as_deref(), |key| {
-        format!("MCP server \"{server_name}\" HTTP header \"{key}\"")
-    })?
-    .unwrap_or_default()
-    .into_iter()
-    .collect::<Vec<(String, String)>>();
+    let mut headers: Vec<(String, String)> =
+        resolve_command_secrets_record(entry.headers.as_deref(), |key| {
+            format!("MCP server \"{server_name}\" HTTP header \"{key}\"")
+        })?
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<Vec<(String, String)>>();
 
     // Step 4.
     let command_bearer = entry
@@ -580,11 +581,14 @@ mod tests {
 
     #[test]
     fn the_record_form_resolves_every_value_and_names_the_failing_key() {
-        let resolved = resolve_command_secrets_record(Some(&record(&[
-            ("A", "!printf one"),
-            ("B", "!!literal"),
-            ("C", "plain"),
-        ])), |key| format!("ctx \"{key}\""))
+        let resolved = resolve_command_secrets_record(
+            Some(&record(&[
+                ("A", "!printf one"),
+                ("B", "!!literal"),
+                ("C", "plain"),
+            ])),
+            |key| format!("ctx \"{key}\""),
+        )
         .unwrap()
         .unwrap();
         assert_eq!(resolved.get("A").map(String::as_str), Some("one"));
@@ -596,9 +600,11 @@ mod tests {
         assert_eq!(resolved.get("C").map(String::as_str), Some("plain"));
 
         // `undefined` in, `undefined` out — the arm both upstream call sites `??`/`?:` against.
-        assert!(resolve_command_secrets_record(None, |key| key.to_string())
-            .unwrap()
-            .is_none());
+        assert!(
+            resolve_command_secrets_record(None, |key| key.to_string())
+                .unwrap()
+                .is_none()
+        );
 
         // The context string is built from the KEY, and the whole record fails closed.
         let err = resolve_command_secrets_record(Some(&record(&[("K", "!exit 3")])), |key| {
@@ -606,7 +612,10 @@ mod tests {
         })
         .unwrap_err()
         .to_string();
-        assert_eq!(err, "Failed to resolve ctx \"K\": command exited with code 3");
+        assert_eq!(
+            err,
+            "Failed to resolve ctx \"K\": command exited with code 3"
+        );
     }
 
     #[test]
@@ -614,7 +623,11 @@ mod tests {
         // `B` fails; nothing partially-resolved may escape, and `C` must not be handed an empty
         // string. Upstream's `map` throws out of the whole `Object.fromEntries`.
         let outcome = resolve_command_secrets_record(
-            Some(&record(&[("A", "!printf ok"), ("B", "!exit 1"), ("C", "!printf ok")])),
+            Some(&record(&[
+                ("A", "!printf ok"),
+                ("B", "!exit 1"),
+                ("C", "!printf ok"),
+            ])),
             |key| format!("ctx \"{key}\""),
         );
         assert!(outcome.is_err(), "an unresolvable secret is never a value");
@@ -624,8 +637,9 @@ mod tests {
 
     #[test]
     fn resolve_env_layers_over_the_base_and_uses_the_stdio_env_context() {
-        let base: HashMap<String, String> =
-            [("HOST_ONLY".to_string(), "kept".to_string())].into_iter().collect();
+        let base: HashMap<String, String> = [("HOST_ONLY".to_string(), "kept".to_string())]
+            .into_iter()
+            .collect();
 
         let resolved = resolve_env(
             Some(&record(&[("TOKEN", "!printf hunter2"), ("PLAIN", "x")])),
@@ -704,21 +718,29 @@ mod tests {
         let mut entry = http_entry(&[]);
         entry.bearer_token_env = Some("TOK".to_string());
         assert_eq!(
-            resolve_http_secrets(&entry, "srv", &env).unwrap().bearer_token,
+            resolve_http_secrets(&entry, "srv", &env)
+                .unwrap()
+                .bearer_token,
             None,
             "`auth` absent means no Authorization header at all"
         );
 
         entry.auth = Some(AuthMode::Named(AuthKind::Bearer));
         assert_eq!(
-            resolve_http_secrets(&entry, "srv", &env).unwrap().bearer_token.as_deref(),
+            resolve_http_secrets(&entry, "srv", &env)
+                .unwrap()
+                .bearer_token
+                .as_deref(),
             Some("from-env")
         );
 
         // `!!x` is an escaped literal on the static ladder: unescaped, never executed.
         entry.bearer_token = Some("!!literal".to_string());
         assert_eq!(
-            resolve_http_secrets(&entry, "srv", &env).unwrap().bearer_token.as_deref(),
+            resolve_http_secrets(&entry, "srv", &env)
+                .unwrap()
+                .bearer_token
+                .as_deref(),
             Some("!literal")
         );
 
@@ -727,7 +749,10 @@ mod tests {
         entry.bearer_token = None;
         let hostile = env_of(&[("TOK", "!touch /nonexistent/cyrup-mcp-should-never-run")]);
         assert_eq!(
-            resolve_http_secrets(&entry, "srv", &hostile).unwrap().bearer_token.as_deref(),
+            resolve_http_secrets(&entry, "srv", &hostile)
+                .unwrap()
+                .bearer_token
+                .as_deref(),
             Some("!touch /nonexistent/cyrup-mcp-should-never-run")
         );
     }
@@ -788,7 +813,10 @@ mod tests {
             Some("!touch /nonexistent/cyrup-mcp-should-never-run"),
             "a command marker survives hashing VERBATIM and unexecuted"
         );
-        assert_eq!(resolved.get("ESCAPED").map(String::as_str), Some("!/home/u"));
+        assert_eq!(
+            resolved.get("ESCAPED").map(String::as_str),
+            Some("!/home/u")
+        );
         assert_eq!(resolved.get("PLAIN").map(String::as_str), Some("/home/u/x"));
         assert!(interpolate_env_record(None, &env).is_none());
     }
@@ -816,12 +844,18 @@ mod tests {
 
         assert_eq!(resolved.bearer_token.as_deref(), Some("tok"));
         assert!(
-            !resolved.headers.iter().any(|(n, _)| n.eq_ignore_ascii_case("authorization")),
+            !resolved
+                .headers
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case("authorization")),
             "the configured Authorization must be evicted, got {:?}",
             resolved.headers
         );
         // Eviction is surgical: every other configured header survives untouched.
-        assert_eq!(resolved.headers, vec![("X-Keep".to_string(), "yes".to_string())]);
+        assert_eq!(
+            resolved.headers,
+            vec![("X-Keep".to_string(), "yes".to_string())]
+        );
     }
 
     /// The eviction is conditional on a token actually resolving. `auth: "bearer"` with an empty
@@ -847,5 +881,4 @@ mod tests {
             vec![("Authorization".to_string(), "Basic keepme".to_string())]
         );
     }
-
 }

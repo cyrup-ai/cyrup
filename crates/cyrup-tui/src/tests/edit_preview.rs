@@ -8,14 +8,19 @@
 //! emits `ToolExecutionStart` before `prepare` — i.e. before the `before_tool_call` permission gate
 //! (`cyrup-agent/src/agent.rs:1181/1334`) — so this is what a user reads while deciding whether to
 //! approve the write.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
+use crate::{App, Component, TranscriptView, UiTheme};
 use cyrup_core::ToolCallId;
 use cyrup_session_svc::AgentSessionEvent;
-use crate::{App, Component, TranscriptView, UiTheme};
+use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
-use ratatui::Terminal;
 use serde_json::json;
 
 const BEFORE: &str = "alpha\nbravo\ncharlie\ndelta\n";
@@ -107,9 +112,18 @@ fn edit_diff_is_rendered_before_the_write_lands() {
     );
 
     let text = viewport(&app);
-    assert!(text.contains("edit hello.txt"), "call header missing:\n{text}");
-    assert!(has_diff_row(&text, '-', "bravo"), "removed line not previewed:\n{text}");
-    assert!(has_diff_row(&text, '+', "BRAVO"), "added line not previewed:\n{text}");
+    assert!(
+        text.contains("edit hello.txt"),
+        "call header missing:\n{text}"
+    );
+    assert!(
+        has_diff_row(&text, '-', "bravo"),
+        "removed line not previewed:\n{text}"
+    );
+    assert!(
+        has_diff_row(&text, '+', "BRAVO"),
+        "added line not previewed:\n{text}"
+    );
     // The whole point: nothing has been written. The preview came from `computeEditsDiff`, which
     // reads the file and applies the edits in memory only.
     assert_eq!(
@@ -136,7 +150,10 @@ fn edit_preview_accepts_the_legacy_single_edit_shape() {
     );
 
     let text = viewport(&app);
-    assert!(has_diff_row(&text, '+', "CHARLIE"), "legacy-shape preview missing:\n{text}");
+    assert!(
+        has_diff_row(&text, '+', "CHARLIE"),
+        "legacy-shape preview missing:\n{text}"
+    );
 }
 
 /// The preview is visible while pending, and the settled `details.diff` REPLACES it rather than
@@ -157,7 +174,10 @@ fn settled_result_replaces_the_preview_instead_of_duplicating_it() {
     );
 
     let pending = viewport(&app);
-    assert!(has_diff_row(&pending, '+', "BRAVO"), "no preview while pending:\n{pending}");
+    assert!(
+        has_diff_row(&pending, '+', "BRAVO"),
+        "no preview while pending:\n{pending}"
+    );
 
     // The tool runs and reports the same diff its own core produced — byte-identical, because the
     // preview went through `apply_edits_to_normalized_content` + `generate_diff_string` too.
@@ -167,7 +187,10 @@ fn settled_result_replaces_the_preview_instead_of_duplicating_it() {
         &mut app,
         "call-2",
         false,
-        text_result("Successfully replaced 1 block(s) in hello.txt.", json!({ "diff": diff })),
+        text_result(
+            "Successfully replaced 1 block(s) in hello.txt.",
+            json!({ "diff": diff }),
+        ),
     );
 
     let settled = history(&app);
@@ -197,7 +220,10 @@ fn unmatchable_edit_previews_its_error_and_the_result_does_not_repeat_it() {
     // `err_not_found` (edit_diff.rs) — the message the tool itself would have produced.
     let expected = "Could not find the exact text in hello.txt.";
     let pending = viewport(&app);
-    assert!(pending.contains(expected), "preview error not shown while pending:\n{pending}");
+    assert!(
+        pending.contains(expected),
+        "preview error not shown while pending:\n{pending}"
+    );
 
     end_edit(
         &mut app,
@@ -211,7 +237,10 @@ fn unmatchable_edit_previews_its_error_and_the_result_does_not_repeat_it() {
     );
     let settled = history(&app);
     let occurrences = settled.matches("Could not find the exact text").count();
-    assert_eq!(occurrences, 1, "preview error repeated by the result body:\n{settled}");
+    assert_eq!(
+        occurrences, 1,
+        "preview error repeated by the result body:\n{settled}"
+    );
 }
 
 /// MIRROR — stays green with or without the preview. A run that never got one (a replayed history
@@ -235,7 +264,8 @@ fn mirror_post_write_diff_still_renders_without_any_preview() {
     let (w, h) = (72u16, 12u16);
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
     let theme = UiTheme::dark();
-    term.draw(|f| view.render(f, Rect::new(0, 0, w, h), &theme)).unwrap();
+    term.draw(|f| view.render(f, Rect::new(0, 0, w, h), &theme))
+        .unwrap();
     let buf = term.backend().buffer().clone();
     let mut text = String::new();
     for y in 0..h {
@@ -248,8 +278,14 @@ fn mirror_post_write_diff_still_renders_without_any_preview() {
     }
 
     assert!(text.contains("edit hello.txt"), "header missing:\n{text}");
-    assert!(has_diff_row(&text, '-', "bravo"), "post-write removed line missing:\n{text}");
-    assert!(has_diff_row(&text, '+', "BRAVO"), "post-write added line missing:\n{text}");
+    assert!(
+        has_diff_row(&text, '-', "bravo"),
+        "post-write removed line missing:\n{text}"
+    );
+    assert!(
+        has_diff_row(&text, '+', "BRAVO"),
+        "post-write added line missing:\n{text}"
+    );
 }
 
 /// [CYRUP-DELTA] A partial batch previews as `Ok` — the survivors' diff — plus one line per edit

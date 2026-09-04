@@ -19,18 +19,21 @@
 // The allow-set every other test module in this workspace carries. The crate denies
 // `expect_used` at lib.rs:69, so without this `cargo clippy -p cyrup-permission-system
 // --all-targets` is RED on eight sites in this file alone.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::Path;
 use std::sync::Arc;
 
 use cyrup_ext::{DialogOptions, HostServices};
 
-use crate::forwarding::{
-    forwarding_location, process_forwarded_requests, ProcessForwardedOptions,
-};
-use crate::logging::AuditTrail;
 use crate::ExtensionConfig;
+use crate::forwarding::{ProcessForwardedOptions, forwarding_location, process_forwarded_requests};
+use crate::logging::AuditTrail;
 
 /// A backend that resolves its own session id and REFUSES to be asked anything. Reaching `select`
 /// at all is the defect this file pins, so it is an assertion failure rather than a scripted answer.
@@ -40,14 +43,23 @@ impl HostServices for NoDialogServices {
     fn session_id(&self) -> Option<String> {
         Some(self.0.clone())
     }
-    fn select(&self, _title: &str, _options: &serde_json::Value, _opts: &DialogOptions) -> Option<String> {
+    fn select(
+        &self,
+        _title: &str,
+        _options: &serde_json::Value,
+        _opts: &DialogOptions,
+    ) -> Option<String> {
         unreachable!("a scan with no UI must never open the forwarded-permission dialog")
     }
 }
 
 fn seed_request(agent_dir: &Path, session_id: &str) -> std::path::PathBuf {
     let location = forwarding_location(agent_dir, session_id).expect("derives a location");
-    for dir in [&location.session_root, &location.requests_dir, &location.responses_dir] {
+    for dir in [
+        &location.session_root,
+        &location.requests_dir,
+        &location.responses_dir,
+    ] {
         std::fs::create_dir_all(dir).expect("creates the spool dirs");
     }
     let path = location.requests_dir.join("req-1.json");

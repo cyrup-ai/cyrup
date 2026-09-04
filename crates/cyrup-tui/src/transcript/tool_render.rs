@@ -34,7 +34,7 @@ pub(crate) fn tool_lines(
     // definition, so either rendered side implies one; the rest is what the session's own
     // `getToolDefinition(name)` answered when the run started ([`ToolRun::has_definition`]).
     let has_definition =
-        run.has_definition || run.rendered_call.is_some() || run.rendered_result.is_some();
+        run.definition.is_some() || run.rendered_call.is_some() || run.rendered_result.is_some();
     if builtin.is_none() && !has_definition {
         // The `else` of `hasRendererDefinition()`: the unbounded `formatToolExecution()`
         // (`tool-execution.ts:330-333`). Nothing at all is known about this tool name.
@@ -59,9 +59,7 @@ pub(crate) fn tool_lines(
                 Some(kind) => render_builtin_result(kind, run, expanded, theme, images, &mut block),
                 // `createResultFallback()` (`:141-155`, selected at `:298-304`). Upstream reaches
                 // it only inside `if (this.result)` (`:295`); the fallback makes the same check.
-                None => {
-                    render_result_fallback(run, expanded, theme, images.expand_key, &mut block)
-                }
+                None => render_result_fallback(run, expanded, theme, images.expand_key, &mut block),
             },
         }
     }
@@ -95,21 +93,103 @@ pub(crate) fn tool_lines(
     for line in &mut block {
         normalize_line(line);
     }
-    // The block is state-tinted (bg-only); a leading untinted blank stands in for the component Spacer.
+    // EXT-024 — `getRenderShell()` (`tool-execution.ts:108-116` @v0.84.4):
     //
-    // X8 — `edit` is the one tool whose tint is NOT the shared `done`/`is_error` one. Pi gives it
-    // `getEditHeaderBg(component.preview, component.settledError)` (`edit.ts:239-253`, applied at
-    // `:262`), which tests the PREVIEW first and never looks at `done`: a preview diff computed from
-    // the streamed arguments greens the block while the call is still pending, and a preview that
-    // failed reds it.
-    let bg = if run.name == "edit" && run.rendered_call.is_none() && run.rendered_result.is_none() {
-        theme.edit_bg_style(Style::default(), edit_header_preview(run), run.is_error)
-    } else {
-        theme.tool_bg_style(Style::default(), run.done, run.is_error)
+    // ```ts
+    // if (!this.builtInToolDefinition) return this.toolDefinition?.renderShell ?? "default";
+    // if (!this.toolDefinition) return this.builtInToolDefinition.renderShell ?? "default";
+    // return this.toolDefinition.renderShell ?? this.builtInToolDefinition.renderShell ?? "default";
+    // ```
+    //
+    // `run.definition` is the session registry's answer (`getToolDefinition(name)`), which in
+    // cyrup already merges the built-ins with every custom and extension tool, so the first tier
+    // is one read. The second tier — `builtInToolDefinition.renderShell` — is reached only when
+    // no registry was asked (the id-less constructors, a result whose start was missed), and the
+    // built-in table answers it: `edit` is the one built-in that declares `renderShell: "self"`
+    // (`core/tools/edit.ts:330`; `cyrup-tools/src/tools/edit.rs` `render_kind`), every other
+    // built-in leaves it unset.
+    let shell = match run.definition {
+        Some(kind) => kind,
+        None => match builtin {
+            Some(Builtin::Edit) => ToolRenderKind::SelfRendered,
+            _ => ToolRenderKind::Default,
+        },
     };
+    // `if (this.hasRendererDefinition() && this.getRenderShell() === "self")` (`:237`) — the
+    // `hasRendererDefinition()` half is implied: `shell` can only be `SelfRendered` through a
+    // definition or the built-in table, each of which satisfies it.
+    if shell == ToolRenderKind::SelfRendered {
+        return self_rendered_lines(run, builtin, block, inline, width, theme, images);
+    }
+    // The DEFAULT shell: `this.contentBox = new Box(1, 1, bgFn)` (`:71`), tinted by execution
+    // state (`updateDisplay`, `:265-269` — `toolPendingBg` while partial, else `toolErrorBg` /
+    // `toolSuccessBg`), preceded by the untinted `Spacer(1)` the constructor adds (`:66`).
+    let bg = theme.tool_bg_style(Style::default(), run.done, run.is_error);
     let mut out = vec![Line::default()];
     out.extend(finalize_block(block, width, bg));
     if inline {
+        out.extend(image_raster_lines(run, width, images.width_cells));
+    }
+    out
+}
+
+/// The `renderShell: "self"` block — `ToolExecutionComponent.render()`'s first branch
+/// (`tool-execution.ts:237-259` @v0.84.4):
+///
+/// ```ts
+/// if (this.hasRendererDefinition() && this.getRenderShell() === "self") {
+///     const contentLines = this.selfRenderContainer.render(width);
+///     if (contentLines.length === 0 && this.imageComponents.length === 0) return [];
+///     const lines: string[] = [];
+///     if (contentLines.length > 0) { lines.push(""); lines.push(...contentLines); }
+///     for (…) { lines.push(...spacer.render(width)); lines.push(...imageComponent.render(width)); }
+///     return lines;
+/// }
+/// ```
+///
+/// `selfRenderContainer` is a bare `Container` (`:73`), so `updateDisplay`'s `if (renderContainer
+/// instanceof Box) renderContainer.setBgFn(bgFn)` (`:275-277`) skips it: **no** padding column,
+/// **no** state tint, and no blank row when the renderers drew nothing. The tool owns its framing.
+///
+/// The one built-in that declares `"self"` is `edit`, and its framing is the `EditCallRenderComponent`
+/// itself — a `Box(1, 1)` whose fill is `getEditHeaderBg(preview, settledError)` (`edit.ts:258-273`,
+/// applied at `:281`), which tests the PREVIEW first and never looks at `done`: a diff computed from
+/// the streamed arguments greens the block while the call is still pending, and a preview that
+/// failed reds it (X8). cyrup's built-in `edit` renderers push bare rows, so that component's box
+/// is drawn here, around them — the same rows the shell tail used to paint under the `edit`
+/// special case, now attributed to the renderer that owns them. An extension renderer that takes
+/// `edit` over (`rendered_call`/`rendered_result`) replaces the component, box and all, exactly as
+/// `toolDefinition.renderCall ?? builtInToolDefinition.renderCall` (`:84-92`) would.
+fn self_rendered_lines(
+    run: &ToolRun,
+    builtin: Option<Builtin>,
+    block: Vec<Line<'static>>,
+    inline: bool,
+    width: usize,
+    theme: &UiTheme,
+    images: ImageOpts,
+) -> Vec<Line<'static>> {
+    let own_edit_component = builtin == Some(Builtin::Edit)
+        && run.rendered_call.is_none()
+        && run.rendered_result.is_none();
+    let content: Vec<Line<'static>> = if own_edit_component {
+        let bg = theme.edit_bg_style(Style::default(), edit_header_preview(run), run.is_error);
+        box_lines(block, width, 1, 1, bg)
+    } else {
+        // `Container.render(width)`: each child at the full width, wrapped as `Text` wraps
+        // (`text.ts:60-87`), with nothing added around it.
+        block.iter().flat_map(|l| wrap_line(l, width)).collect()
+    };
+    if content.is_empty() && !inline {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(content.len() + 1);
+    if !content.is_empty() {
+        out.push(Line::default());
+        out.extend(content);
+    }
+    if inline {
+        // `image_raster_lines` emits the per-image `Spacer(1)` + raster pair (`:248-257`).
         out.extend(image_raster_lines(run, width, images.width_cells));
     }
     out

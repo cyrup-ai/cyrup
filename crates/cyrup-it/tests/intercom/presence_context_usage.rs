@@ -56,12 +56,18 @@
 //! numbers back off a SEPARATE, REAL peer client over a REAL broker's `list` — i.e. what a user
 //! actually sees in that peer's `/intercom` picker and `intercom({action:"list"})` output.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::common::{registration, spawn_broker, within, write_broker_command};
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolUpdate, ToolUpdateSink};
 use cyrup_ext::{ExtMode, HostCtx, HostEvent, HostServices, NativeExtension};
 use cyrup_intercom::config::load_config;
@@ -72,7 +78,6 @@ use cyrup_intercom::transport::client::IntercomClient;
 use cyrup_intercom::transport::protocol::SessionInfo;
 use cyrup_intercom::transport::spawn::wait_for_broker;
 use serde_json::Value;
-use crate::common::{registration, spawn_broker, within, write_broker_command};
 
 const MY_SESSION_ID: &str = "session-aaaabbbbccccdddd";
 const PEER_SESSION_ID: &str = "session-1111222233334444";
@@ -90,16 +95,20 @@ impl UsageSink {
     /// `used`/`window` in cyrup's spelling; `fraction` is computed exactly as the live backend does
     /// (`host_services.rs:692-696`), including its clamp to `[0, 1]`.
     fn new(used: u64, window: u64) -> Arc<Self> {
-        let sink = Arc::new(Self { usage: Mutex::new(Value::Null) });
+        let sink = Arc::new(Self {
+            usage: Mutex::new(Value::Null),
+        });
         sink.set(used, window);
         sink
     }
 
     fn set(&self, used: u64, window: u64) {
-        let fraction =
-            if window == 0 { 0.0 } else { (used as f64 / window as f64).clamp(0.0, 1.0) };
-        *self.usage.lock().unwrap() =
-            serde_json::json!({ "usedTokens": used, "contextWindow": window, "fraction": fraction });
+        let fraction = if window == 0 {
+            0.0
+        } else {
+            (used as f64 / window as f64).clamp(0.0, 1.0)
+        };
+        *self.usage.lock().unwrap() = serde_json::json!({ "usedTokens": used, "contextWindow": window, "fraction": fraction });
     }
 
     /// The trait default — an EMPTY object, i.e. no session backend has anything to say
@@ -121,7 +130,11 @@ impl HostServices for UsageSink {
 /// What the PEER sees for this session, over a real `list` round trip. `None` while the broker has
 /// not published the row yet.
 async fn peer_view(peer: &IntercomClient, my_id: &str) -> Option<SessionInfo> {
-    peer.list_sessions().await.ok()?.into_iter().find(|s| s.id == my_id)
+    peer.list_sessions()
+        .await
+        .ok()?
+        .into_iter()
+        .find(|s| s.id == my_id)
 }
 
 /// Poll the peer's view until `predicate` holds, then return the row it held on.
@@ -153,18 +166,30 @@ fn num(field: Option<&serde_json::Number>) -> Option<u64> {
 async fn live_pair(
     agent_dir: &Path,
     sink: Arc<UsageSink>,
-) -> (Arc<IntercomExtension>, HostCtx, Arc<IntercomClient>, String, tokio::process::Child) {
+) -> (
+    Arc<IntercomExtension>,
+    HostCtx,
+    Arc<IntercomClient>,
+    String,
+    tokio::process::Child,
+) {
     let intercom_dir = intercom_dir_path(agent_dir);
     write_broker_command(&intercom_dir);
     let socket = broker_socket_path(&intercom_dir);
 
     let broker = spawn_broker(agent_dir);
-    wait_for_broker(&socket, Duration::from_secs(20)).await.expect("broker up");
+    wait_for_broker(&socket, Duration::from_secs(20))
+        .await
+        .expect("broker up");
 
     let peer = Arc::new(
-        IntercomClient::connect(&socket, registration(PEER_NAME), Some(PEER_SESSION_ID.to_string()))
-            .await
-            .expect("the peer registers"),
+        IntercomClient::connect(
+            &socket,
+            registration(PEER_NAME),
+            Some(PEER_SESSION_ID.to_string()),
+        )
+        .await
+        .expect("the peer registers"),
     );
 
     let ext = Arc::new(
@@ -178,13 +203,27 @@ async fn live_pair(
     );
     ext.set_host_services(sink);
     let ctx = HostCtx::command(ExtMode::Tui, true, agent_dir.to_path_buf());
-    let _ = ext.on_event(&HostEvent::SessionStart { reason: "test".to_string(), previous_session_file: None }, &ctx).await;
+    let _ = ext
+        .on_event(
+            &HostEvent::SessionStart {
+                reason: "test".to_string(),
+                previous_session_file: None,
+            },
+            &ctx,
+        )
+        .await;
     let state = ext.state().clone();
     assert!(
-        within(Duration::from_secs(30), || state.client().is_some_and(|c| c.is_connected())).await,
+        within(Duration::from_secs(30), || state
+            .client()
+            .is_some_and(|c| c.is_connected()))
+        .await,
         "the session connects on SessionStart"
     );
-    let my_id = state.client().and_then(|c| c.session_id()).expect("registered session id");
+    let my_id = state
+        .client()
+        .and_then(|c| c.session_id())
+        .expect("registered session id");
     (ext, ctx, peer, my_id, broker)
 }
 
@@ -206,11 +245,20 @@ async fn agent_end_publishes_live_context_usage_to_peers() {
     let (ext, ctx, peer, my_id, mut broker) = live_pair(agent_dir.path(), sink.clone()).await;
 
     // --- The turn ends. This is the production dispatch, not a call into the helper. ---
-    let _ = ext.on_event(&HostEvent::AgentEnd { messages: Vec::new() }, &ctx).await;
+    let _ = ext
+        .on_event(
+            &HostEvent::AgentEnd {
+                messages: Vec::new(),
+            },
+            &ctx,
+        )
+        .await;
 
-    let info = peer_view_until(&peer, &my_id, Duration::from_secs(20), |s| s.context_pct.is_some())
-        .await
-        .expect("the peer sees this session in its list");
+    let info = peer_view_until(&peer, &my_id, Duration::from_secs(20), |s| {
+        s.context_pct.is_some()
+    })
+    .await
+    .expect("the peer sees this session in its list");
 
     assert_eq!(
         num(info.context_pct.as_ref()),
@@ -263,20 +311,34 @@ async fn unknown_token_count_clears_a_peers_stale_percentage_instead_of_freezing
     let (ext, ctx, peer, my_id, mut broker) = live_pair(agent_dir.path(), sink.clone()).await;
 
     // Establish the stale-high value first.
-    let _ = ext.on_event(&HostEvent::AgentEnd { messages: Vec::new() }, &ctx).await;
-    let before =
-        peer_view_until(&peer, &my_id, Duration::from_secs(20), |s| s.context_pct.is_some())
-            .await
-            .expect("the peer sees this session");
-    assert_eq!(num(before.context_pct.as_ref()), Some(72), "precondition: 72% is published");
+    let _ = ext
+        .on_event(
+            &HostEvent::AgentEnd {
+                messages: Vec::new(),
+            },
+            &ctx,
+        )
+        .await;
+    let before = peer_view_until(&peer, &my_id, Duration::from_secs(20), |s| {
+        s.context_pct.is_some()
+    })
+    .await
+    .expect("the peer sees this session");
+    assert_eq!(
+        num(before.context_pct.as_ref()),
+        Some(72),
+        "precondition: 72% is published"
+    );
 
     // A compaction lands: the window is still known, the occupancy is not.
     sink.set(0, 200_000);
     let _ = ext.on_event(&HostEvent::AgentStart, &ctx).await;
 
-    let after = peer_view_until(&peer, &my_id, Duration::from_secs(20), |s| s.context_pct.is_none())
-        .await
-        .expect("the peer sees this session");
+    let after = peer_view_until(&peer, &my_id, Duration::from_secs(20), |s| {
+        s.context_pct.is_none()
+    })
+    .await
+    .expect("the peer sees this session");
     assert_eq!(
         num(after.context_pct.as_ref()),
         None,
@@ -314,12 +376,24 @@ async fn a_backend_with_no_usage_omits_the_keys_rather_than_nulling_them() {
     let sink = UsageSink::new(144_000, 200_000);
     let (ext, ctx, peer, my_id, mut broker) = live_pair(agent_dir.path(), sink.clone()).await;
 
-    let _ = ext.on_event(&HostEvent::AgentEnd { messages: Vec::new() }, &ctx).await;
-    let before =
-        peer_view_until(&peer, &my_id, Duration::from_secs(20), |s| s.context_pct.is_some())
-            .await
-            .expect("the peer sees this session");
-    assert_eq!(num(before.context_pct.as_ref()), Some(72), "precondition: 72% is published");
+    let _ = ext
+        .on_event(
+            &HostEvent::AgentEnd {
+                messages: Vec::new(),
+            },
+            &ctx,
+        )
+        .await;
+    let before = peer_view_until(&peer, &my_id, Duration::from_secs(20), |s| {
+        s.context_pct.is_some()
+    })
+    .await
+    .expect("the peer sees this session");
+    assert_eq!(
+        num(before.context_pct.as_ref()),
+        Some(72),
+        "precondition: 72% is published"
+    );
 
     // No model / no usage at all.
     sink.clear();
@@ -335,10 +409,11 @@ async fn a_backend_with_no_usage_omits_the_keys_rather_than_nulling_them() {
         .await;
 
     // The status DID change, which proves the heartbeat went out; the context fields did not.
-    let after =
-        peer_view_until(&peer, &my_id, Duration::from_secs(20), |s| s.status.as_deref() == Some("tool:bash"))
-            .await
-            .expect("the peer sees this session");
+    let after = peer_view_until(&peer, &my_id, Duration::from_secs(20), |s| {
+        s.status.as_deref() == Some("tool:bash")
+    })
+    .await
+    .expect("the peer sees this session");
     assert_eq!(
         after.status.as_deref(),
         Some("tool:bash"),
@@ -350,8 +425,16 @@ async fn a_backend_with_no_usage_omits_the_keys_rather_than_nulling_them() {
         "omitting the key leaves the broker's copy untouched — an absent backend must not wipe it \
          ({after:?})"
     );
-    assert_eq!(num(after.context_tokens.as_ref()), Some(144_000), "{after:?}");
-    assert_eq!(num(after.context_window.as_ref()), Some(200_000), "{after:?}");
+    assert_eq!(
+        num(after.context_tokens.as_ref()),
+        Some(144_000),
+        "{after:?}"
+    );
+    assert_eq!(
+        num(after.context_window.as_ref()),
+        Some(200_000),
+        "{after:?}"
+    );
 
     peer.disconnect();
     if let Some(c) = ext.state().client() {
@@ -374,10 +457,19 @@ async fn an_over_window_session_reports_more_than_one_hundred_percent() {
     let sink = UsageSink::new(208_000, 200_000);
     let (ext, ctx, peer, my_id, mut broker) = live_pair(agent_dir.path(), sink.clone()).await;
 
-    let _ = ext.on_event(&HostEvent::AgentEnd { messages: Vec::new() }, &ctx).await;
-    let info = peer_view_until(&peer, &my_id, Duration::from_secs(20), |s| s.context_pct.is_some())
-        .await
-        .expect("the peer sees this session");
+    let _ = ext
+        .on_event(
+            &HostEvent::AgentEnd {
+                messages: Vec::new(),
+            },
+            &ctx,
+        )
+        .await;
+    let info = peer_view_until(&peer, &my_id, Duration::from_secs(20), |s| {
+        s.context_pct.is_some()
+    })
+    .await
+    .expect("the peer sees this session");
 
     assert_eq!(
         num(info.context_pct.as_ref()),
@@ -430,7 +522,9 @@ async fn a_peers_intercom_list_renders_this_sessions_context_usage() {
     write_broker_command(&intercom_dir);
     let socket = broker_socket_path(&intercom_dir);
     let mut broker = spawn_broker(agent_dir.path());
-    wait_for_broker(&socket, Duration::from_secs(20)).await.expect("broker up");
+    wait_for_broker(&socket, Duration::from_secs(20))
+        .await
+        .expect("broker up");
 
     let build = |services: Arc<dyn HostServices>| {
         let ext = Arc::new(
@@ -450,22 +544,52 @@ async fn a_peers_intercom_list_renders_this_sessions_context_usage() {
     // Session A — the one whose context usage is under observation.
     let sink = UsageSink::new(144_000, 200_000);
     let a = build(sink.clone());
-    let _ = a.on_event(&HostEvent::SessionStart { reason: "test".to_string(), previous_session_file: None }, &ctx).await;
+    let _ = a
+        .on_event(
+            &HostEvent::SessionStart {
+                reason: "test".to_string(),
+                previous_session_file: None,
+            },
+            &ctx,
+        )
+        .await;
     // Session B — the observer, with no context usage of its own.
     let b = build(Arc::new(PlainSink(OBSERVER_SESSION_ID)));
-    let _ = b.on_event(&HostEvent::SessionStart { reason: "test".to_string(), previous_session_file: None }, &ctx).await;
+    let _ = b
+        .on_event(
+            &HostEvent::SessionStart {
+                reason: "test".to_string(),
+                previous_session_file: None,
+            },
+            &ctx,
+        )
+        .await;
 
     for (label, ext) in [("A", &a), ("B", &b)] {
         let state = ext.state().clone();
         assert!(
-            within(Duration::from_secs(30), || state.client().is_some_and(|c| c.is_connected())).await,
+            within(Duration::from_secs(30), || state
+                .client()
+                .is_some_and(|c| c.is_connected()))
+            .await,
             "session {label} connects on SessionStart"
         );
     }
-    let a_id = a.state().client().and_then(|c| c.session_id()).expect("A registered");
+    let a_id = a
+        .state()
+        .client()
+        .and_then(|c| c.session_id())
+        .expect("A registered");
 
     // --- Session A finishes a turn. ---
-    let _ = a.on_event(&HostEvent::AgentEnd { messages: Vec::new() }, &ctx).await;
+    let _ = a
+        .on_event(
+            &HostEvent::AgentEnd {
+                messages: Vec::new(),
+            },
+            &ctx,
+        )
+        .await;
 
     // --- Session B's model calls `intercom({ action: "list" })`. ---
     let b_tool = IntercomTool::new(b.state().clone());

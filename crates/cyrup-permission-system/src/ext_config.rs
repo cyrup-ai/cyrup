@@ -186,8 +186,9 @@ impl ExtensionConfig {
                         // "using default extension config")` (`jsonc-config.ts:37-52`): a parse
                         // error is never an ENOENT, so it always gets the fallback suffix appended
                         // — unless `ensureResult.warning` already won (`extension-config.ts:133`).
-                        let warning =
-                            ensure.warning.unwrap_or_else(|| format!("{err}; using default extension config."));
+                        let warning = ensure
+                            .warning
+                            .unwrap_or_else(|| format!("{err}; using default extension config."));
                         eprintln!("cyrup-permission-system: warning: {warning}");
                         ExtensionConfigLoadResult {
                             config: ExtensionConfig::default(),
@@ -217,7 +218,11 @@ impl ExtensionConfig {
                 if let Some(ref w) = warning {
                     eprintln!("cyrup-permission-system: warning: {w}");
                 }
-                ExtensionConfigLoadResult { config: ExtensionConfig::default(), created: ensure.created, warning }
+                ExtensionConfigLoadResult {
+                    config: ExtensionConfig::default(),
+                    created: ensure.created,
+                    warning,
+                }
             }
         }
     }
@@ -227,7 +232,10 @@ impl ExtensionConfig {
     /// trailing newline, leaving a real, editable template file on disk.
     fn ensure_on_disk(path: &Path) -> EnsureResult {
         if path.exists() {
-            return EnsureResult { created: false, warning: None };
+            return EnsureResult {
+                created: false,
+                warning: None,
+            };
         }
 
         let write_result: std::io::Result<()> = (|| {
@@ -238,7 +246,10 @@ impl ExtensionConfig {
         })();
 
         match write_result {
-            Ok(()) => EnsureResult { created: true, warning: None },
+            Ok(()) => EnsureResult {
+                created: true,
+                warning: None,
+            },
             Err(err) => EnsureResult {
                 created: false,
                 warning: Some(format!(
@@ -282,8 +293,7 @@ impl ExtensionConfig {
     /// Frozen as a `const` rather than regenerated from an older `Default`: the whole point is
     /// that it must keep describing the bytes that build actually wrote, however the current
     /// defaults later change.
-    pub(crate) const LEGACY_DEFAULT_CONFIG_CONTENT: &str =
-        "{\n  \"debug\": false,\n  \"yoloMode\": false,\n  \"forwardedPromptTimeoutSeconds\": 30\n}\n";
+    pub(crate) const LEGACY_DEFAULT_CONFIG_CONTENT: &str = "{\n  \"debug\": false,\n  \"yoloMode\": false,\n  \"forwardedPromptTimeoutSeconds\": 30\n}\n";
 
     /// Whether `path` currently holds a BYTE-EXACT pristine template
     /// [`Self::ensure_on_disk`] auto-materializes — i.e. nothing has edited it since this crate
@@ -334,10 +344,13 @@ impl ExtensionConfig {
         let Ok(actual) = jsonc::parse_config(&text, &path.display().to_string(), "config") else {
             return false;
         };
-        [Self::default_config_content(), Self::LEGACY_DEFAULT_CONFIG_CONTENT.to_string()]
-            .iter()
-            .filter_map(|template| jsonc::parse_config(template, "<template>", "config").ok())
-            .any(|template| template == actual)
+        [
+            Self::default_config_content(),
+            Self::LEGACY_DEFAULT_CONFIG_CONTENT.to_string(),
+        ]
+        .iter()
+        .filter_map(|template| jsonc::parse_config(template, "<template>", "config").ok())
+        .any(|template| template == actual)
     }
 
     /// pi `normalizePermissionSystemConfig` (v0.8.0 `extension-config.ts:76-93`).
@@ -347,8 +360,14 @@ impl ExtensionConfig {
         // pi `enabled: record.enabled !== false` (`:88`). NOT `as_bool().unwrap_or(true)`: that
         // would also disable on a non-boolean, where pi disables only on the literal `false`.
         let enabled = value.get("enabled") != Some(&serde_json::Value::Bool(false));
-        let debug = value.get("debug").and_then(serde_json::Value::as_bool).unwrap_or(false);
-        let yolo_mode = value.get("yoloMode").and_then(serde_json::Value::as_bool).unwrap_or(false);
+        let debug = value
+            .get("debug")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let yolo_mode = value
+            .get("yoloMode")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
 
         let forwarded = match value.get("forwardedPromptTimeoutSeconds") {
             // `null` / `false` → indefinite.
@@ -364,7 +383,12 @@ impl ExtensionConfig {
             None => default.forwarded_prompt_timeout_seconds,
         };
 
-        ExtensionConfig { enabled, debug, yolo_mode, forwarded_prompt_timeout_seconds: forwarded }
+        ExtensionConfig {
+            enabled,
+            debug,
+            yolo_mode,
+            forwarded_prompt_timeout_seconds: forwarded,
+        }
     }
 
     /// The three extension-managed fields as a JSON object, so [`Self::save`] can run them back
@@ -497,7 +521,10 @@ impl ExtensionConfig {
         })();
 
         match write_result {
-            Ok(()) => ExtensionConfigSaveResult { success: true, error: None },
+            Ok(()) => ExtensionConfigSaveResult {
+                success: true,
+                error: None,
+            },
             Err(err) => {
                 // pi `:273-285`: best-effort temp cleanup; the primary error is what's reported.
                 let _ = std::fs::remove_file(&tmp_path);
@@ -814,7 +841,9 @@ mod tests {
             "// generated\n{{\"yoloMode\":{}, \"debug\":{},\n  \"forwardedPromptTimeoutSeconds\": {},\n\"enabled\": {}}}",
             default.yolo_mode,
             default.debug,
-            default.forwarded_prompt_timeout_seconds.map_or("null".to_string(), |s| s.to_string()),
+            default
+                .forwarded_prompt_timeout_seconds
+                .map_or("null".to_string(), |s| s.to_string()),
             default.enabled,
         );
         std::fs::write(&path, &reordered).unwrap();
@@ -856,7 +885,9 @@ mod tests {
         assert!(!ExtensionConfig::is_pristine_default_file(&path));
 
         // Absent ⇒ false; callers test existence separately (unchanged).
-        assert!(!ExtensionConfig::is_pristine_default_file(&dir.path().join("missing.json")));
+        assert!(!ExtensionConfig::is_pristine_default_file(
+            &dir.path().join("missing.json")
+        ));
     }
 
     #[test]
@@ -878,7 +909,10 @@ mod tests {
 
         let result = ExtensionConfig::load_with_result(&path);
 
-        assert!(result.created, "first load of an absent config must report created: true");
+        assert!(
+            result.created,
+            "first load of an absent config must report created: true"
+        );
         assert!(result.warning.is_none());
         assert_eq!(result.config, ExtensionConfig::default());
         assert!(path.exists(), "config.json must now exist on disk");
@@ -911,14 +945,26 @@ mod tests {
         assert!(!enabled_of(serde_json::json!({"enabled": false})));
 
         // Everything else stays enabled.
-        assert!(enabled_of(serde_json::json!({})), "a missing key is enabled (v0.7.1 files)");
+        assert!(
+            enabled_of(serde_json::json!({})),
+            "a missing key is enabled (v0.7.1 files)"
+        );
         assert!(enabled_of(serde_json::json!({"enabled": true})));
         assert!(enabled_of(serde_json::json!({"enabled": null})));
-        assert!(enabled_of(serde_json::json!({"enabled": 0})), "JS `0` is falsy but is not `false`");
-        assert!(enabled_of(serde_json::json!({"enabled": "false"})), "the STRING is not `false`");
+        assert!(
+            enabled_of(serde_json::json!({"enabled": 0})),
+            "JS `0` is falsy but is not `false`"
+        );
+        assert!(
+            enabled_of(serde_json::json!({"enabled": "false"})),
+            "the STRING is not `false`"
+        );
         assert!(enabled_of(serde_json::json!({"enabled": ""})));
         assert!(enabled_of(serde_json::json!({"enabled": []})));
-        assert!(ExtensionConfig::default().enabled, "pi `DEFAULT_EXTENSION_CONFIG.enabled` (`:30`)");
+        assert!(
+            ExtensionConfig::default().enabled,
+            "pi `DEFAULT_EXTENSION_CONFIG.enabled` (`:30`)"
+        );
     }
 
     #[test]
@@ -950,7 +996,6 @@ mod tests {
     // first `/permission-system` toggle REWROTE the operator's `45.5` to `45` on disk.
     #[test]
     fn a_fractional_timeout_survives_normalize_and_a_save_round_trip() {
-
         // 1. normalize keeps it verbatim.
         assert_eq!(
             ExtensionConfig::normalize(&serde_json::json!({"forwardedPromptTimeoutSeconds": 45.5}))
@@ -968,7 +1013,11 @@ mod tests {
         assert_eq!(loaded.forwarded_prompt_timeout_seconds, Some(45.5));
 
         // A `debug` toggle is what the human actually does; the timeout must ride along untouched.
-        let saved = ExtensionConfig { debug: true, ..loaded }.save(&path);
+        let saved = ExtensionConfig {
+            debug: true,
+            ..loaded
+        }
+        .save(&path);
         assert!(saved.success, "save failed: {:?}", saved.error);
 
         let text = std::fs::read_to_string(&path).unwrap();
@@ -992,7 +1041,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
 
-        let saved = ExtensionConfig { debug: true, ..ExtensionConfig::default() }.save(&path);
+        let saved = ExtensionConfig {
+            debug: true,
+            ..ExtensionConfig::default()
+        }
+        .save(&path);
         assert!(saved.success, "save failed: {:?}", saved.error);
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -1022,13 +1075,21 @@ mod tests {
         let result = ExtensionConfig::load_with_result(&path);
 
         assert_eq!(result.config, ExtensionConfig::default());
-        assert!(!result.created, "a pre-existing file must not be reported as created");
-        let warning = result.warning.expect("malformed JSON must produce a warning");
+        assert!(
+            !result.created,
+            "a pre-existing file must not be reported as created"
+        );
+        let warning = result
+            .warning
+            .expect("malformed JSON must produce a warning");
         assert!(
             warning.starts_with("Failed to parse permission-system config at"),
             "unexpected warning: {warning}"
         );
-        assert!(warning.ends_with("using default extension config."), "unexpected warning: {warning}");
+        assert!(
+            warning.ends_with("using default extension config."),
+            "unexpected warning: {warning}"
+        );
     }
 
     // Regression test for pi's ENOENT-only suppression in `formatJsoncConfigLoadWarning`
@@ -1048,8 +1109,13 @@ mod tests {
 
         assert_eq!(result.config, ExtensionConfig::default());
         assert!(!result.created);
-        let warning = result.warning.expect("a non-ENOENT read failure must produce a warning, not silence");
-        assert!(warning.contains("using default extension config."), "unexpected warning: {warning}");
+        let warning = result
+            .warning
+            .expect("a non-ENOENT read failure must produce a warning, not silence");
+        assert!(
+            warning.contains("using default extension config."),
+            "unexpected warning: {warning}"
+        );
     }
 
     // Regression test for pi `getPermissionSystemConfigPath` (`extension-config.ts:51-53`):
@@ -1071,8 +1137,14 @@ mod tests {
             ExtensionConfig::load(&default_path)
         };
 
-        assert!(result.debug, "env-var override path must win over the caller-supplied default");
-        assert!(!default_path.exists(), "the un-used default path must not be touched");
+        assert!(
+            result.debug,
+            "env-var override path must win over the caller-supplied default"
+        );
+        assert!(
+            !default_path.exists(),
+            "the un-used default path must not be touched"
+        );
     }
 
     // ---------------------------------------------------------------------------------------
@@ -1118,19 +1190,35 @@ mod tests {
         std::fs::write(&path, CONFIG_WITH_PERMISSIONS).unwrap();
 
         let loaded = ExtensionConfig::load(&path);
-        let saved = ExtensionConfig { debug: true, ..loaded }.save(&path);
-        assert_eq!(saved, ExtensionConfigSaveResult { success: true, error: None });
+        let saved = ExtensionConfig {
+            debug: true,
+            ..loaded
+        }
+        .save(&path);
+        assert_eq!(
+            saved,
+            ExtensionConfigSaveResult {
+                success: true,
+                error: None
+            }
+        );
 
         let raw = read_saved(&path);
         // The extension's own key was updated...
         assert_eq!(raw["debug"], serde_json::json!(true));
         // ...and every key the extension does NOT own survived, values intact.
         assert_eq!(raw["defaultPolicy"], serde_json::json!("ask"));
-        assert_eq!(raw["$schema"], serde_json::json!("https://example.invalid/permissions.json"));
+        assert_eq!(
+            raw["$schema"],
+            serde_json::json!("https://example.invalid/permissions.json")
+        );
         assert_eq!(raw["bash"]["git *"], serde_json::json!("allow"));
         assert_eq!(raw["bash"]["rm -rf /"], serde_json::json!("deny"));
         assert_eq!(raw["tools"]["read"], serde_json::json!("allow"));
-        assert_eq!(raw["aFutureKey"], serde_json::json!([1, "two", {"three": true}]));
+        assert_eq!(
+            raw["aFutureKey"],
+            serde_json::json!([1, "two", {"three": true}])
+        );
 
         // And the operator's key ORDER is unchanged: `debug` was updated in place (position 6),
         // not moved to the end and not re-alphabetized (v0.8.0
@@ -1168,7 +1256,11 @@ mod tests {
         let corrupt = "{\n  \"defaultPolicy\": \"ask\"\n  \"bash\": { \"git *\": \"allow\" }\n}\n";
         std::fs::write(&path, corrupt).unwrap();
 
-        let saved = ExtensionConfig { debug: true, ..ExtensionConfig::default() }.save(&path);
+        let saved = ExtensionConfig {
+            debug: true,
+            ..ExtensionConfig::default()
+        }
+        .save(&path);
 
         assert!(!saved.success, "a corrupt config must not be saved over");
         let error = saved.error.expect("a refusal must carry an explanation");
@@ -1181,7 +1273,10 @@ mod tests {
             corrupt,
             "the corrupt file must be left byte-for-byte alone for manual repair"
         );
-        assert!(!path.with_extension("json.tmp").exists(), "no temp file may be left behind");
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "no temp file may be left behind"
+        );
     }
 
     // Regression test for pi `resolveWriteTarget` (`:223-238`) and v0.8.0
@@ -1197,15 +1292,26 @@ mod tests {
         std::fs::write(&real, CONFIG_WITH_PERMISSIONS).unwrap();
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
-        let saved = ExtensionConfig { debug: true, ..ExtensionConfig::default() }.save(&link);
+        let saved = ExtensionConfig {
+            debug: true,
+            ..ExtensionConfig::default()
+        }
+        .save(&link);
         assert!(saved.success, "save failed: {:?}", saved.error);
 
         assert!(
-            std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
             "config.json must still be a symlink after save"
         );
         let raw = read_saved(&real);
-        assert_eq!(raw["debug"], serde_json::json!(true), "the link TARGET must be updated");
+        assert_eq!(
+            raw["debug"],
+            serde_json::json!(true),
+            "the link TARGET must be updated"
+        );
         assert_eq!(
             raw["defaultPolicy"],
             serde_json::json!("ask"),
@@ -1228,7 +1334,11 @@ mod tests {
         )
         .unwrap();
 
-        let saved = ExtensionConfig { debug: true, ..ExtensionConfig::default() }.save(&path);
+        let saved = ExtensionConfig {
+            debug: true,
+            ..ExtensionConfig::default()
+        }
+        .save(&path);
         assert!(saved.success, "save failed: {:?}", saved.error);
 
         let raw = read_saved(&path);
@@ -1248,7 +1358,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("config.json");
 
-        let saved = ExtensionConfig { yolo_mode: true, ..ExtensionConfig::default() }.save(&path);
+        let saved = ExtensionConfig {
+            yolo_mode: true,
+            ..ExtensionConfig::default()
+        }
+        .save(&path);
         assert!(saved.success, "save failed: {:?}", saved.error);
 
         assert_eq!(
@@ -1271,7 +1385,11 @@ mod tests {
         )
         .unwrap();
 
-        let saved = ExtensionConfig { debug: true, ..ExtensionConfig::default() }.save(&path);
+        let saved = ExtensionConfig {
+            debug: true,
+            ..ExtensionConfig::default()
+        }
+        .save(&path);
         assert!(saved.success, "save failed: {:?}", saved.error);
 
         let raw = read_saved(&path);
@@ -1286,7 +1404,11 @@ mod tests {
         let path = dir.path().join("config.json");
         std::fs::write(&path, format!("\u{feff}{CONFIG_WITH_PERMISSIONS}")).unwrap();
 
-        let saved = ExtensionConfig { debug: true, ..ExtensionConfig::default() }.save(&path);
+        let saved = ExtensionConfig {
+            debug: true,
+            ..ExtensionConfig::default()
+        }
+        .save(&path);
         assert!(saved.success, "save failed: {:?}", saved.error);
         assert_eq!(read_saved(&path)["defaultPolicy"], serde_json::json!("ask"));
     }
@@ -1306,13 +1428,22 @@ mod tests {
         }
         .save(&path);
         assert!(saved.success, "save failed: {:?}", saved.error);
-        assert_eq!(read_saved(&path)["forwardedPromptTimeoutSeconds"], serde_json::json!(30));
+        assert_eq!(
+            read_saved(&path)["forwardedPromptTimeoutSeconds"],
+            serde_json::json!(30)
+        );
 
         // `None` is a legitimate value (indefinite) and must round-trip as JSON `null`.
-        let saved = ExtensionConfig { forwarded_prompt_timeout_seconds: None, ..ExtensionConfig::default() }
-            .save(&path);
+        let saved = ExtensionConfig {
+            forwarded_prompt_timeout_seconds: None,
+            ..ExtensionConfig::default()
+        }
+        .save(&path);
         assert!(saved.success, "save failed: {:?}", saved.error);
-        assert_eq!(read_saved(&path)["forwardedPromptTimeoutSeconds"], serde_json::Value::Null);
+        assert_eq!(
+            read_saved(&path)["forwardedPromptTimeoutSeconds"],
+            serde_json::Value::Null
+        );
         assert_eq!(
             ExtensionConfig::load(&path).forwarded_prompt_timeout_seconds,
             None,
@@ -1332,11 +1463,21 @@ mod tests {
         let saved = {
             let _pin =
                 crate::envx::pin(CONFIG_PATH_ENV_KEY, Some(&overridden.display().to_string()));
-            ExtensionConfig { debug: true, ..ExtensionConfig::default() }.save(&default_path)
+            ExtensionConfig {
+                debug: true,
+                ..ExtensionConfig::default()
+            }
+            .save(&default_path)
         };
 
         assert!(saved.success, "save failed: {:?}", saved.error);
-        assert!(overridden.exists(), "the override path must be the one written");
-        assert!(!default_path.exists(), "the un-used default path must not be touched");
+        assert!(
+            overridden.exists(),
+            "the override path must be the one written"
+        );
+        assert!(
+            !default_path.exists(),
+            "the un-used default path must not be touched"
+        );
     }
 }

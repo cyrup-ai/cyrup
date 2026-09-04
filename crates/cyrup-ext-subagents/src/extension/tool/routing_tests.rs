@@ -7,11 +7,16 @@
 //! `extension::tool::routing::tests` — so every test still lives in the module whose code it
 //! exercises.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use super::*;
-use cyrup_core::Tool;
 use crate::background::control;
+use crate::extension::SubagentExecutor;
 use crate::extension::testsupport::arm_scoped_missions;
 use crate::extension::testsupport::dispatch_tool;
 use crate::extension::testsupport::scoped_missions;
@@ -19,6 +24,7 @@ use crate::extension::testsupport::scoped_tool;
 use crate::extension::testsupport::seed_running_run;
 use crate::extension::testsupport::tool_text;
 use crate::registration::SubagentExtensionConfig;
+use cyrup_core::Tool;
 use cyrup_core::ToolCallId;
 use std::sync::Arc;
 
@@ -48,9 +54,7 @@ async fn chain_tool_call_rejects_duplicate_as_names_before_any_agent_resolution(
             Box::new(|_u: cyrup_core::ToolUpdate| {}),
         )
         .await
-        .expect_err(
-            "a duplicate `as` name across two chain[] steps must be rejected up front",
-        );
+        .expect_err("a duplicate `as` name across two chain[] steps must be rejected up front");
     let message = err.to_string();
     assert!(
         message.contains("Duplicate chain output name 'shared'"),
@@ -107,8 +111,7 @@ async fn the_child_safe_registration_refuses_the_fleet_view_through_the_dispatch
     let executor = Arc::new(SubagentExecutor::new());
     let call = serde_json::json!({ "action": "status", "view": "fleet" });
 
-    let child_safe =
-        SubagentTool::new_child_safe(executor.clone(), dir.path().to_path_buf());
+    let child_safe = SubagentTool::new_child_safe(executor.clone(), dir.path().to_path_buf());
     let refused = child_safe
         .execute(
             ToolCallId::from("fleet-child"),
@@ -122,7 +125,8 @@ async fn the_child_safe_registration_refuses_the_fleet_view_through_the_dispatch
          parent's entire async root",
     );
     assert!(
-        err.to_string().contains("Child-safe subagent fleet view is unavailable"),
+        err.to_string()
+            .contains("Child-safe subagent fleet view is unavailable"),
         "the refusal must be pi's own child-safe fleet text, not some other failure; got: {err}"
     );
 
@@ -167,7 +171,9 @@ async fn tool_list_renders_the_proactive_skill_subagent_suggestions_end_to_end()
     for name in ["auditor-one", "auditor-two"] {
         std::fs::write(
             agents_dir.join(format!("{name}.md")),
-            format!("---\nname: {name}\ndescription: An auditor\nskills: audit-trail\n---\nBody.\n"),
+            format!(
+                "---\nname: {name}\ndescription: An auditor\nskills: audit-trail\n---\nBody.\n"
+            ),
         )
         .expect("write agent");
     }
@@ -219,7 +225,10 @@ async fn tool_execute_routes_each_mode_to_its_dispatch_arm() {
     let dir = tempfile::tempdir().expect("tempdir");
     let tool = scoped_tool(dir.path()).await;
 
-    async fn dispatch(tool: &SubagentTool, params: serde_json::Value) -> Result<ToolResult, ToolError> {
+    async fn dispatch(
+        tool: &SubagentTool,
+        params: serde_json::Value,
+    ) -> Result<ToolResult, ToolError> {
         tool.execute(
             ToolCallId::from("t"),
             params,
@@ -247,9 +256,12 @@ async fn tool_execute_routes_each_mode_to_its_dispatch_arm() {
 
     // Control action → now wired (C5): an unknown run id fails with the not-found notice,
     // proving the dispatch reached the real control arm rather than a stub.
-    let control_err = dispatch(&tool, serde_json::json!({ "action": "status", "id": "run1" }))
-        .await
-        .expect_err("control action routes to real status, which fails on the unknown id");
+    let control_err = dispatch(
+        &tool,
+        serde_json::json!({ "action": "status", "id": "run1" }),
+    )
+    .await
+    .expect_err("control action routes to real status, which fails on the unknown id");
     assert!(
         control_err.to_string().contains("Async run not found"),
         "got: {control_err}"
@@ -258,18 +270,24 @@ async fn tool_execute_routes_each_mode_to_its_dispatch_arm() {
     // PARALLEL (tasks[]) → parallel arm. Now routes through the REAL plan-execution path, so an
     // unresolvable agent fails at plan-time persona resolution (`AgentNotFound`) BEFORE any
     // spawn — proving the dispatch reached the parallel arm and its real routing, not a stub.
-    let parallel_err = dispatch(&tool, serde_json::json!({ "tasks": [{ "agent": "x", "task": "y" }] }))
-        .await
-        .expect_err("tasks[] routes to real parallel execution, which fails on the unknown agent");
+    let parallel_err = dispatch(
+        &tool,
+        serde_json::json!({ "tasks": [{ "agent": "x", "task": "y" }] }),
+    )
+    .await
+    .expect_err("tasks[] routes to real parallel execution, which fails on the unknown agent");
     assert!(
         parallel_err.to_string().contains("agent not found: x"),
         "got: {parallel_err}"
     );
 
     // CHAIN (chain[]) → chain arm, likewise failing at plan-time persona resolution.
-    let chain_err = dispatch(&tool, serde_json::json!({ "chain": [{ "agent": "x", "task": "y" }] }))
-        .await
-        .expect_err("chain[] routes to real chain execution, which fails on the unknown agent");
+    let chain_err = dispatch(
+        &tool,
+        serde_json::json!({ "chain": [{ "agent": "x", "task": "y" }] }),
+    )
+    .await
+    .expect_err("chain[] routes to real chain execution, which fails on the unknown agent");
     assert!(
         chain_err.to_string().contains("agent not found: x"),
         "got: {chain_err}"
@@ -283,7 +301,9 @@ async fn tool_execute_routes_each_mode_to_its_dispatch_arm() {
     // `subagent-executor.ts:195-208` @v0.47.1), not cyrup's former
     // "unknown subagent action '…'; valid actions are …".
     assert!(
-        unknown_err.to_string().starts_with("Unknown action: frobnicate."),
+        unknown_err
+            .to_string()
+            .starts_with("Unknown action: frobnicate."),
         "got: {unknown_err}"
     );
     // The unknown-action message must enumerate the actions that DO dispatch, so a model that
@@ -339,10 +359,8 @@ async fn tool_execute_routes_the_four_suba_005_actions_to_their_real_handlers() 
 #[tokio::test]
 async fn child_safe_tool_blocks_all_seven_mutating_management_actions() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let child = SubagentTool::new_child_safe(
-        Arc::new(SubagentExecutor::new()),
-        dir.path().to_path_buf(),
-    );
+    let child =
+        SubagentTool::new_child_safe(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
 
     for action in crate::discovery::management::MUTATING_MANAGEMENT_ACTIONS {
         let result = child
@@ -397,10 +415,10 @@ async fn a_forbidding_authority_policy_refuses_stop_before_it_dispatches() {
     let dir = tempfile::tempdir().expect("tempdir");
     let executor = Arc::new(SubagentExecutor::new());
     *executor.config_cell().lock().await = SubagentExtensionConfig {
-            authority_policy: Some(crate::registration::authority::AuthorityPolicyConfig {
-                stop_run: Some(crate::registration::authority::AuthorityDecision::Forbid),
-                ..crate::registration::authority::AuthorityPolicyConfig::default()
-            }),
+        authority_policy: Some(crate::registration::authority::AuthorityPolicyConfig {
+            stop_run: Some(crate::registration::authority::AuthorityDecision::Forbid),
+            ..crate::registration::authority::AuthorityPolicyConfig::default()
+        }),
         ..SubagentExtensionConfig::default()
     };
     let tool = SubagentTool::new(Arc::clone(&executor), dir.path().to_path_buf());
@@ -417,9 +435,12 @@ async fn a_forbidding_authority_policy_refuses_stop_before_it_dispatches() {
     // The mirror, and the half that proves the gate is not simply refusing everything: an
     // UNGATED control verb is untouched by the same policy and still reaches dispatch (which
     // fails on the unknown run, not on authority).
-    let untouched = dispatch_tool(&tool, serde_json::json!({ "action": "interrupt", "id": "nope" }))
-        .await
-        .expect_err("the run does not exist");
+    let untouched = dispatch_tool(
+        &tool,
+        serde_json::json!({ "action": "interrupt", "id": "nope" }),
+    )
+    .await
+    .expect_err("the run does not exist");
     assert!(
         !untouched.to_string().contains("Authority policy"),
         "`interrupt` is not one of pi's AUTHORITY_ACTIONS: {untouched}"
@@ -446,10 +467,10 @@ async fn a_confirming_authority_policy_refuses_when_the_session_has_no_ui() {
     let dir = tempfile::tempdir().expect("tempdir");
     let executor = Arc::new(SubagentExecutor::new());
     *executor.config_cell().lock().await = SubagentExtensionConfig {
-            authority_policy: Some(crate::registration::authority::AuthorityPolicyConfig {
-                steer_run: Some(crate::registration::authority::AuthorityDecision::Confirm),
-                ..crate::registration::authority::AuthorityPolicyConfig::default()
-            }),
+        authority_policy: Some(crate::registration::authority::AuthorityPolicyConfig {
+            steer_run: Some(crate::registration::authority::AuthorityDecision::Confirm),
+            ..crate::registration::authority::AuthorityPolicyConfig::default()
+        }),
         ..SubagentExtensionConfig::default()
     };
     let tool = SubagentTool::new(Arc::clone(&executor), dir.path().to_path_buf());
@@ -670,7 +691,10 @@ async fn subagent_tool_rejects_empty_tasks_and_chain_arrays_as_no_mode_selected(
     let dir = tempfile::tempdir().expect("tempdir");
     let tool = scoped_tool(dir.path()).await;
 
-    async fn dispatch(tool: &SubagentTool, params: serde_json::Value) -> Result<ToolResult, ToolError> {
+    async fn dispatch(
+        tool: &SubagentTool,
+        params: serde_json::Value,
+    ) -> Result<ToolResult, ToolError> {
         tool.execute(
             ToolCallId::from("t"),
             params,
@@ -682,9 +706,13 @@ async fn subagent_tool_rejects_empty_tasks_and_chain_arrays_as_no_mode_selected(
 
     let empty_tasks_err = dispatch(&tool, serde_json::json!({ "tasks": [] }))
         .await
-        .expect_err("an explicit empty tasks[] must error rather than run as an empty parallel group");
+        .expect_err(
+            "an explicit empty tasks[] must error rather than run as an empty parallel group",
+        );
     assert!(
-        empty_tasks_err.to_string().starts_with("Provide exactly one mode. Agents:"),
+        empty_tasks_err
+            .to_string()
+            .starts_with("Provide exactly one mode. Agents:"),
         "got: {empty_tasks_err}"
     );
 
@@ -692,7 +720,9 @@ async fn subagent_tool_rejects_empty_tasks_and_chain_arrays_as_no_mode_selected(
         .await
         .expect_err("an explicit empty chain[] must error rather than run as an empty chain");
     assert!(
-        empty_chain_err.to_string().starts_with("Provide exactly one mode. Agents:"),
+        empty_chain_err
+            .to_string()
+            .starts_with("Provide exactly one mode. Agents:"),
         "got: {empty_chain_err}"
     );
 }
@@ -729,7 +759,8 @@ async fn control_status_action_uses_run_id_when_id_is_absent() {
 #[tokio::test]
 async fn child_safe_tool_status_with_no_id_hard_errors_instead_of_listing() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let tool = SubagentTool::new_child_safe(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+    let tool =
+        SubagentTool::new_child_safe(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
     let err = tool
         .execute(
             ToolCallId::from("t"),
@@ -764,7 +795,10 @@ async fn subagent_tool_cwd_param_is_resolved_and_threaded_into_dispatch() {
 
     let tool = scoped_tool(dir_a.path()).await;
 
-    async fn dispatch(tool: &SubagentTool, params: serde_json::Value) -> Result<ToolResult, ToolError> {
+    async fn dispatch(
+        tool: &SubagentTool,
+        params: serde_json::Value,
+    ) -> Result<ToolResult, ToolError> {
         tool.execute(
             ToolCallId::from("t"),
             params,
@@ -776,10 +810,16 @@ async fn subagent_tool_cwd_param_is_resolved_and_threaded_into_dispatch() {
 
     // Without an explicit `cwd`, discovery runs over the tool's construction-time `self.cwd`
     // (dirA), which has no "beta" agent.
-    let without_cwd = dispatch(&tool, serde_json::json!({ "action": "get", "agent": "beta" }))
-        .await
-        .expect_err("dirA has no 'beta' agent, so 'get' must fail absent an explicit cwd");
-    assert!(without_cwd.to_string().contains("not found"), "got: {without_cwd}");
+    let without_cwd = dispatch(
+        &tool,
+        serde_json::json!({ "action": "get", "agent": "beta" }),
+    )
+    .await
+    .expect_err("dirA has no 'beta' agent, so 'get' must fail absent an explicit cwd");
+    assert!(
+        without_cwd.to_string().contains("not found"),
+        "got: {without_cwd}"
+    );
 
     // With an explicit `cwd` pointing at dirB, discovery must run over dirB instead — finding
     // "beta". Pre-fix, `cwd` was parsed and discarded, so this would ALSO have failed exactly
@@ -838,8 +878,10 @@ async fn mission_actions_are_dispatched_from_a_real_tool_call() {
     assert!(text.starts_with("Created mission "), "{text}");
     assert!(text.ends_with(": Ship the port"), "{text}");
     let details = created.details.as_ref().expect("details");
-    let mission_id =
-        details["missionId"].as_str().expect("missionId on details").to_string();
+    let mission_id = details["missionId"]
+        .as_str()
+        .expect("missionId on details")
+        .to_string();
     assert_eq!(details["mode"], "management");
     assert_eq!(details["mission"]["objective"], "finish the mission port");
     // The record really landed on disk, under the rebranded project directory.
@@ -855,7 +897,11 @@ async fn mission_actions_are_dispatched_from_a_real_tool_call() {
     let listed = dispatch_tool(&tool, serde_json::json!({ "action": "mission.list" }))
         .await
         .expect("mission.list must dispatch");
-    assert!(tool_text(&listed).contains(&mission_id), "{}", tool_text(&listed));
+    assert!(
+        tool_text(&listed).contains(&mission_id),
+        "{}",
+        tool_text(&listed)
+    );
 
     let shown = dispatch_tool(
         &tool,
@@ -863,7 +909,11 @@ async fn mission_actions_are_dispatched_from_a_real_tool_call() {
     )
     .await
     .expect("mission.show must dispatch");
-    assert!(tool_text(&shown).contains("Title: Ship the port"), "{}", tool_text(&shown));
+    assert!(
+        tool_text(&shown).contains("Title: Ship the port"),
+        "{}",
+        tool_text(&shown)
+    );
 
     let updated = dispatch_tool(
         &tool,
@@ -875,7 +925,11 @@ async fn mission_actions_are_dispatched_from_a_real_tool_call() {
     )
     .await
     .expect("mission.update must dispatch");
-    assert!(tool_text(&updated).contains("Summary: half done"), "{}", tool_text(&updated));
+    assert!(
+        tool_text(&updated).contains("Summary: half done"),
+        "{}",
+        tool_text(&updated)
+    );
 
     let attached = dispatch_tool(
         &tool,
@@ -904,7 +958,10 @@ async fn mission_actions_are_dispatched_from_a_real_tool_call() {
     )
     .await
     .expect("mission.close must dispatch");
-    assert_eq!(tool_text(&closed), format!("Closed mission {mission_id} as completed."));
+    assert_eq!(
+        tool_text(&closed),
+        format!("Closed mission {mission_id} as completed.")
+    );
 }
 
 /// A mission action's validation failure surfaces as cyrup's error channel (`Err(ToolError)`)
@@ -927,20 +984,107 @@ async fn a_mission_action_validation_failure_is_a_tool_error_with_upstreams_text
     )
     .await
     .expect_err("an unknown scope must refuse");
-    assert_eq!(err.to_string(), "missionScope must be \"project\" or \"global\"");
+    assert_eq!(
+        err.to_string(),
+        "missionScope must be \"project\" or \"global\""
+    );
 }
 
-/// T6 child-safe restriction (pi `subagent-executor.ts:4379-4386`, over the four mission
-/// actions in `MUTATING_MANAGEMENT_ACTIONS` at `:151`): a fanout child may LIST and SHOW
-/// missions but may not create/update/attach/close one.
+/// SUBA-085 — `mission.resolve-decision` dispatches end to end through the tool
+/// (pi `actions.ts:391-397` @v0.64.0): a decision recorded by `mission.update` is closed by id
+/// with the resolution taken from `summary`, the receipt is upstream's `Resolved decision …`
+/// line over the re-rendered mission, and an empty summary is refused with upstream's text.
+/// Pre-fix `mission.resolve-decision` landed on the unknown-action arm.
+#[tokio::test]
+async fn mission_resolve_decision_dispatches_and_closes_the_decision() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tool = scoped_tool(dir.path()).await;
+    let created = dispatch_tool(
+        &tool,
+        serde_json::json!({ "action": "mission.create", "mission": { "title": "Decide" } }),
+    )
+    .await
+    .expect("mission.create must dispatch");
+    let mission_id = created.details.as_ref().expect("details")["missionId"]
+        .as_str()
+        .expect("missionId")
+        .to_string();
+    let updated = dispatch_tool(
+        &tool,
+        serde_json::json!({
+            "action": "mission.update",
+            "missionId": mission_id,
+            "missionUpdate": { "decisions": [{ "title": "Ship?" }] },
+        }),
+    )
+    .await
+    .expect("mission.update must dispatch");
+    let decision_id = updated.details.as_ref().expect("details")["mission"]["decisions"][0]["id"]
+        .as_str()
+        .expect("decision id")
+        .to_string();
+
+    let err = dispatch_tool(
+        &tool,
+        serde_json::json!({
+            "action": "mission.resolve-decision",
+            "missionId": mission_id,
+            "id": decision_id,
+            "summary": "   ",
+        }),
+    )
+    .await
+    .expect_err("an empty summary must refuse");
+    assert_eq!(
+        err.to_string(),
+        "mission.resolve-decision requires a non-empty summary"
+    );
+
+    let resolved = dispatch_tool(
+        &tool,
+        serde_json::json!({
+            "action": "mission.resolve-decision",
+            "missionId": mission_id,
+            "id": decision_id,
+            "summary": "yes, ship it",
+        }),
+    )
+    .await
+    .expect("mission.resolve-decision must dispatch");
+    let text = tool_text(&resolved);
+    assert!(
+        text.starts_with(&format!(
+            "Resolved decision {decision_id} for mission {mission_id}.\n\n"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "  {decision_id}: resolved — Ship?; resolution: yes, ship it"
+        )),
+        "{text}"
+    );
+    let decision = &resolved.details.as_ref().expect("details")["mission"]["decisions"][0];
+    assert_eq!(decision["status"], "resolved");
+    assert_eq!(decision["resolution"], "yes, ship it");
+    assert!(decision["resolvedAt"].is_string());
+}
+
+/// T6 child-safe restriction (pi `subagent-executor.ts:4379-4386`, over the five mission
+/// actions in `MUTATING_MANAGEMENT_ACTIONS` at `:197` @v0.64.0): a fanout child may LIST and
+/// SHOW missions but may not create/update/resolve/attach/close one.
 #[tokio::test]
 async fn child_safe_mission_gating_matches_upstreams_mutating_set() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let child = SubagentTool::new_child_safe(
-        Arc::new(SubagentExecutor::new()),
-        dir.path().to_path_buf(),
-    );
-    for action in ["mission.create", "mission.update", "mission.attach-run", "mission.close"] {
+    let child =
+        SubagentTool::new_child_safe(Arc::new(SubagentExecutor::new()), dir.path().to_path_buf());
+    for action in [
+        "mission.create",
+        "mission.update",
+        "mission.resolve-decision",
+        "mission.attach-run",
+        "mission.close",
+    ] {
         let err = dispatch_tool(
             &child,
             serde_json::json!({ "action": action, "missionId": "m", "runId": "r",
@@ -996,7 +1140,12 @@ async fn an_execution_call_with_an_explicit_mission_binds_before_the_run_and_set
     assert_eq!(record.title, "Bound");
     assert_eq!(record.objective, "prove the binding");
     assert_eq!(record.status, crate::missions::MissionStatus::Failed);
-    assert!(record.summary.as_deref().is_some_and(|s| s.contains("no-such-agent-anywhere")));
+    assert!(
+        record
+            .summary
+            .as_deref()
+            .is_some_and(|s| s.contains("no-such-agent-anywhere"))
+    );
 }
 
 /// `mission: false` is the explicit per-call opt-out (`missions/lifecycle.ts:63`): no mission
@@ -1040,7 +1189,11 @@ async fn an_explicit_missing_mission_id_fails_the_call_before_the_run() {
     )
     .await
     .expect_err("a missing explicit mission must fail the call");
-    assert!(err.to_string().starts_with("Mission 'does-not-exist' was not found in "), "{err}");
+    assert!(
+        err.to_string()
+            .starts_with("Mission 'does-not-exist' was not found in "),
+        "{err}"
+    );
 }
 
 /// `missionId` and `mission` together are refused before anything runs.
@@ -1070,9 +1223,12 @@ async fn status_view_fleet_renders_the_fleet_surface_not_the_plain_active_run_li
     seed_running_run(dir.path(), "fleetrun0001", &["scout"]);
     let tool = scoped_tool(dir.path()).await;
 
-    let out = dispatch_tool(&tool, serde_json::json!({ "action": "status", "view": "fleet" }))
-        .await
-        .expect("view=fleet must render");
+    let out = dispatch_tool(
+        &tool,
+        serde_json::json!({ "action": "status", "view": "fleet" }),
+    )
+    .await
+    .expect("view=fleet must render");
     let text = tool_text(&out);
     assert!(text.starts_with("Subagent fleet: 1 active"), "{text}");
     assert!(text.contains("Async runs:"), "{text}");
@@ -1133,17 +1289,32 @@ async fn the_stop_action_dispatches_and_writes_a_real_stop_request() {
     let paths = seed_running_run(dir.path(), "stoptool0001", &["scout"]);
     let tool = scoped_tool(dir.path()).await;
 
-    let out = dispatch_tool(&tool, serde_json::json!({ "action": "stop", "id": "stoptool0001" }))
-        .await
-        .expect("action='stop' must dispatch");
-    assert_eq!(tool_text(&out), "Stop requested for async run stoptool0001.");
+    let out = dispatch_tool(
+        &tool,
+        serde_json::json!({ "action": "stop", "id": "stoptool0001" }),
+    )
+    .await
+    .expect("action='stop' must dispatch");
+    assert_eq!(
+        tool_text(&out),
+        "Stop requested for async run stoptool0001."
+    );
 
-    let request = crate::background::control::stop_request_path(&paths.run_dir);
-    assert!(request.exists(), "a real stop request must land at {}", request.display());
+    let pending = crate::background::control::pending_stop_request_paths(&paths.run_dir).await;
+    assert_eq!(
+        pending.len(),
+        1,
+        "a real stop request must land under {}",
+        crate::background::control::stop_requests_dir(&paths.run_dir).display()
+    );
     let raw: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&request).expect("read")).expect("valid json");
+        serde_json::from_slice(&std::fs::read(&pending[0]).expect("read")).expect("valid json");
     assert_eq!(raw["type"], serde_json::json!("stop"));
     assert_eq!(raw["source"], serde_json::json!("stop-action"));
+    assert!(
+        raw.get("targetIndex").is_none(),
+        "a plain stop is whole-run"
+    );
 }
 
 /// G77 — a unique run-id PREFIX stops the run it names, and the confirmation cites the run's
@@ -1161,16 +1332,19 @@ async fn a_run_id_prefix_stops_the_run_it_names_and_the_confirmation_uses_the_fu
     let paths = seed_running_run(dir.path(), "stopprefix01", &["scout"]);
     let tool = scoped_tool(dir.path()).await;
 
-    let out = dispatch_tool(&tool, serde_json::json!({ "action": "stop", "id": "stoppre" }))
-        .await
-        .expect("a unique prefix must resolve, not be reported missing");
+    let out = dispatch_tool(
+        &tool,
+        serde_json::json!({ "action": "stop", "id": "stoppre" }),
+    )
+    .await
+    .expect("a unique prefix must resolve, not be reported missing");
     assert_eq!(
         tool_text(&out),
         "Stop requested for async run stopprefix01.",
         "the confirmation names the RESOLVED run, never the abbreviation the caller typed"
     );
     assert!(
-        crate::background::control::stop_request_path(&paths.run_dir).exists(),
+        crate::background::control::has_pending_stop_request(&paths.run_dir).await,
         "and the request lands in the resolved run's own control inbox"
     );
 }
@@ -1199,17 +1373,23 @@ async fn child_safe_mode_still_dispatches_the_unadvertised_stop_action() {
     )
     .await
     .expect("a fanout child may stop a run even though the description does not offer it");
-    assert_eq!(tool_text(&out), "Stop requested for async run childsafestop.");
+    assert_eq!(
+        tool_text(&out),
+        "Stop requested for async run childsafestop."
+    );
     assert!(
-        crate::background::control::stop_request_path(&paths.run_dir).exists(),
+        crate::background::control::has_pending_stop_request(&paths.run_dir).await,
         "the child-safe dispatch must write the SAME real control request the root one does"
     );
 
     // …and the mutating actions the description DOES name are still refused, so the test above
     // is not passing because the child-safe gate stopped working altogether.
-    let err = dispatch_tool(&child_safe, serde_json::json!({ "action": "delete", "agent": "x" }))
-        .await
-        .expect_err("a fanout child must not delete an agent");
+    let err = dispatch_tool(
+        &child_safe,
+        serde_json::json!({ "action": "delete", "agent": "x" }),
+    )
+    .await
+    .expect_err("a fanout child must not delete an agent");
     // SUBA-038: pi's exact text, asserted by equality.
     assert_eq!(
         err.to_string(),
@@ -1232,7 +1412,8 @@ async fn an_unknown_status_view_is_rejected_with_pis_message() {
     .await
     .expect_err("an unknown view must be refused");
     assert!(
-        err.to_string().contains("Unknown status view: flee. Valid: fleet, transcript."),
+        err.to_string()
+            .contains("Unknown status view: flee. Valid: fleet, transcript."),
         "{err}"
     );
 }
@@ -1247,17 +1428,23 @@ async fn no_id_transcript_resolves_a_lone_run_and_refuses_an_ambiguous_fleet() {
     let tool = scoped_tool(dir.path()).await;
 
     let text = tool_text(
-        &dispatch_tool(&tool, serde_json::json!({ "action": "status", "view": "transcript" }))
-            .await
-            .expect("a lone active run resolves without an id"),
+        &dispatch_tool(
+            &tool,
+            serde_json::json!({ "action": "status", "view": "transcript" }),
+        )
+        .await
+        .expect("a lone active run resolves without an id"),
     );
     assert!(text.contains("Run: lonerun00001"), "{text}");
     assert!(text.contains("  only line"), "{text}");
 
     seed_running_run(dir.path(), "otherrun0001", &["scout"]);
-    let err = dispatch_tool(&tool, serde_json::json!({ "action": "status", "view": "transcript" }))
-        .await
-        .expect_err("two active runs cannot be disambiguated");
+    let err = dispatch_tool(
+        &tool,
+        serde_json::json!({ "action": "status", "view": "transcript" }),
+    )
+    .await
+    .expect_err("two active runs cannot be disambiguated");
     assert!(
         err.to_string()
             .contains("Transcript view requires an id when 2 active async runs exist."),
@@ -1344,8 +1531,7 @@ async fn a_control_action_refuses_a_malformed_acceptance_with_pis_own_prefix() {
         .expect_err("a malformed appended-step acceptance must be refused")
         .to_string();
     assert_eq!(
-        appended,
-        "Cannot append step: chain[0].acceptance has invalid level 'nonsense'.",
+        appended, "Cannot append step: chain[0].acceptance has invalid level 'nonsense'.",
         "pi's own prefix and per-site path label, and it must fire before the run lookup"
     );
 
@@ -1368,4 +1554,168 @@ async fn a_control_action_refuses_a_malformed_acceptance_with_pis_own_prefix() {
         resumed,
         "Cannot resume: chain[0].acceptance.bogus is not supported."
     );
+}
+
+/// SUBA-086 — pi `canonicalizeAgentName` (`subagent-executor.ts:2336-2344` @v0.64.0) consults
+/// `findBlockingAgentDiagnostic` BEFORE the ambiguity/unknown branches, so a dispatch naming an
+/// agent whose highest-ranked definition is malformed is refused with the parse error — never
+/// silently routed to the lower-tier (here: bundled builtin) `worker`, and never reported as
+/// "not found" when the broken file is the ONLY definition.
+#[tokio::test]
+async fn dispatch_refuses_an_agent_whose_outranking_definition_is_malformed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let project_agents = dir.path().join(".cyrup").join("agents");
+    std::fs::create_dir_all(&project_agents).expect("mkdir");
+    std::fs::write(
+        project_agents.join("worker.md"),
+        "---\nname: worker\ndescription: d\ntimeoutMs: 30s\n---\n\nBody\n",
+    )
+    .expect("write broken worker");
+    std::fs::write(
+        project_agents.join("ghost.md"),
+        "---\nname: ghost\ndescription: d\nfast: yes\n---\n\nBody\n",
+    )
+    .expect("write broken ghost");
+    let tool = scoped_tool(dir.path()).await;
+
+    let worker = dispatch_tool(
+        &tool,
+        serde_json::json!({ "agent": "worker", "task": "do it" }),
+    )
+    .await
+    .expect_err("the broken project worker outranks the builtin worker")
+    .to_string();
+    assert!(
+        worker.contains(
+            "Agent 'worker' has invalid configuration: Agent 'worker' has invalid timeoutMs frontmatter; expected a positive integer."
+        ),
+        "got: {worker}"
+    );
+
+    let ghost = dispatch_tool(
+        &tool,
+        serde_json::json!({ "agent": "ghost", "task": "do it" }),
+    )
+    .await
+    .expect_err("a name with only a broken definition is refused")
+    .to_string();
+    assert!(
+        ghost.contains("Agent 'ghost' has invalid configuration: Agent 'ghost' has invalid fast frontmatter; expected true or false."),
+        "must be the invalid-configuration error, not `agent not found`: {ghost}"
+    );
+
+    // The per-site location suffix pi appends for everything but the top-level `agent`.
+    let tasks = dispatch_tool(
+        &tool,
+        serde_json::json!({ "tasks": [
+            { "agent": "scout", "task": "a" },
+            { "agent": "ghost", "task": "b" }
+        ] }),
+    )
+    .await
+    .expect_err("a broken task agent aborts the whole dispatch")
+    .to_string();
+    assert!(
+        tasks.contains("Agent 'ghost' has invalid configuration:") && tasks.contains("(task 2)"),
+        "got: {tasks}"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// SUBA-087 — child-scoped stop (`childId`), pi `async-stop-action.ts:48-77` @v0.64.0 dispatched
+// from `subagent-executor.ts:6163,6184`, schema `extension/schemas.ts:306`.
+// -------------------------------------------------------------------------------------------
+
+/// A `childId` reaches `control_stop`'s resolver and writes a TARGETED request — not a whole-run
+/// one — and the receipt names the resolved child (`async-stop-action.ts:68,75`).
+///
+/// Before this change `SubagentToolParams` had no `child_id` field and no `deny_unknown_fields`,
+/// so this exact call silently stopped the WHOLE run and answered with the whole-run receipt.
+#[tokio::test]
+async fn stop_with_child_id_reaches_control_stop_and_writes_a_targeted_request() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let paths = seed_running_run(dir.path(), "childstoptool", &["scout", "reviewer"]);
+    let tool = scoped_tool(dir.path()).await;
+
+    let out = dispatch_tool(
+        &tool,
+        serde_json::json!({ "action": "stop", "id": "childstoptool", "childId": "step:1" }),
+    )
+    .await
+    .expect("a child-scoped stop must dispatch");
+    assert_eq!(
+        tool_text(&out),
+        "Stop requested for child step:1 in async run childstoptool."
+    );
+
+    let requests = crate::background::control::consume_child_stop_requests(&paths.run_dir).await;
+    assert_eq!(requests.len(), 1, "exactly one TARGETED request lands");
+    assert_eq!(requests[0].target_index, Some(1));
+    assert_eq!(requests[0].child_id.as_deref(), Some("step:1"));
+    assert_eq!(requests[0].source, "stop-action");
+    assert!(
+        crate::background::control::check_stop_inbox_now(&paths)
+            .await
+            .expect("probe")
+            .is_none(),
+        "no whole-run stop request may be written by a child-scoped stop"
+    );
+}
+
+/// pi `async-stop-action.ts:59-65`: a child that is not `pending`/`running` is refused with the
+/// exact sentence, and nothing is written.
+#[tokio::test]
+async fn stop_refuses_a_child_that_is_not_pending_or_running_with_upstreams_text() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let paths = seed_running_run(dir.path(), "childstopdone", &["scout", "reviewer"]);
+    // Settle step 0 as complete in the seeded status.
+    let mut status: crate::background::RunStatus =
+        serde_json::from_slice(&std::fs::read(&paths.status).expect("read status"))
+            .expect("parse status");
+    status.steps[0].status = crate::background::StepState::Complete;
+    status.steps[1].status = crate::background::StepState::Running;
+    status.current_step = Some(1);
+    std::fs::write(
+        &paths.status,
+        serde_json::to_string(&status).expect("serialize"),
+    )
+    .expect("write status");
+    let tool = scoped_tool(dir.path()).await;
+
+    let err = dispatch_tool(
+        &tool,
+        serde_json::json!({ "action": "stop", "id": "childstopdone", "childId": "step:0" }),
+    )
+    .await
+    .expect_err("a completed child cannot be stopped");
+    assert_eq!(
+        err.to_string(),
+        "Child 'step:0' in async run 'childstopdone' is complete; stop only supports pending or \
+         running children."
+    );
+    assert!(
+        !crate::background::control::has_pending_stop_request(&paths.run_dir).await,
+        "a refused child stop writes nothing"
+    );
+}
+
+/// pi `child-identity.ts:46` via `async-stop-action.ts:51-57`: an unknown child answers with the
+/// resolver's own not-found sentence — never the whole-run receipt.
+#[tokio::test]
+async fn stop_reports_an_unknown_child_with_upstreams_not_found_text() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let paths = seed_running_run(dir.path(), "childstopnone", &["scout"]);
+    let tool = scoped_tool(dir.path()).await;
+
+    let err = dispatch_tool(
+        &tool,
+        serde_json::json!({ "action": "stop", "id": "childstopnone", "childId": "step:7" }),
+    )
+    .await
+    .expect_err("an unknown child is an error");
+    assert_eq!(
+        err.to_string(),
+        "Child 'step:7' was not found under async run 'childstopnone'."
+    );
+    assert!(!crate::background::control::has_pending_stop_request(&paths.run_dir).await);
 }

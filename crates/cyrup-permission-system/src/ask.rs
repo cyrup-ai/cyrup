@@ -137,7 +137,10 @@ impl AskChannel for LocalAskChannel {
         // pi passes `{timeout}` only when a positive, finite timeout is set (`permission-dialog.ts:122`);
         // otherwise the select blocks until the human answers.
         let dialog_opts = DialogOptions {
-            timeout_ms: opts.timeout.and_then(|d| u64::try_from(d.as_millis()).ok()).filter(|ms| *ms > 0),
+            timeout_ms: opts
+                .timeout
+                .and_then(|d| u64::try_from(d.as_millis()).ok())
+                .filter(|ms| *ms > 0),
             signal_id: None,
         };
         let selected = self.services.select(&prompt, &options, &dialog_opts);
@@ -186,23 +189,41 @@ impl AskChannel for LocalAskChannel {
 /// pi `splitPromptLines` (`permission-dialog.ts:37-39`): split on `/\r\n|\r|\n/` — each of `\r\n`,
 /// `\r`, `\n` is ONE boundary (so `\r\n` yields no spurious empty line between the two chars).
 fn split_prompt_lines(value: &str) -> Vec<String> {
-    value.replace("\r\n", "\n").replace('\r', "\n").split('\n').map(str::to_string).collect()
+    value
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .split('\n')
+        .map(str::to_string)
+        .collect()
 }
 
 /// pi `formatPromptCompactionNotice` (`permission-dialog.ts:41-49`).
 fn format_prompt_compaction_notice(omitted_lines: usize, omitted_characters: usize) -> String {
     let mut parts: Vec<String> = Vec::new();
     if omitted_lines > 0 {
-        parts.push(format!("{omitted_lines} {}", if omitted_lines == 1 { "line" } else { "lines" }));
+        parts.push(format!(
+            "{omitted_lines} {}",
+            if omitted_lines == 1 { "line" } else { "lines" }
+        ));
     }
     if omitted_characters > 0 {
         parts.push(format!(
             "{omitted_characters} {}",
-            if omitted_characters == 1 { "character" } else { "characters" }
+            if omitted_characters == 1 {
+                "character"
+            } else {
+                "characters"
+            }
         ));
     }
-    let summary = if parts.is_empty() { "content".to_string() } else { parts.join(" and ") };
-    format!("[Permission prompt compacted: omitted {summary} to keep the permission dialog usable.]")
+    let summary = if parts.is_empty() {
+        "content".to_string()
+    } else {
+        parts.join(" and ")
+    };
+    format!(
+        "[Permission prompt compacted: omitted {summary} to keep the permission dialog usable.]"
+    )
 }
 
 /// JS `String.prototype.length` — UTF-16 CODE UNITS, not Unicode scalars and not UTF-8 bytes.
@@ -267,9 +288,15 @@ fn compact_permission_prompt_for_select(value: &str) -> String {
 
         if utf16_len(&prefix) <= max_prefix_characters {
             let trimmed = prefix.trim_end();
-            return if trimmed.is_empty() { notice } else { format!("{trimmed}\n{notice}") };
+            return if trimmed.is_empty() {
+                notice
+            } else {
+                format!("{trimmed}\n{notice}")
+            };
         }
-        prefix = slice_utf16(&prefix, max_prefix_characters).trim_end().to_string();
+        prefix = slice_utf16(&prefix, max_prefix_characters)
+            .trim_end()
+            .to_string();
     }
 
     let omitted_characters = utf16_len(value).saturating_sub(utf16_len(&prefix));
@@ -325,7 +352,12 @@ impl ForwardingAskChannel {
         host_services: Arc<OnceLock<Arc<dyn HostServices>>>,
         audit: Arc<crate::logging::AuditTrail>,
     ) -> Self {
-        Self { agent_dir, timeout, host_services, audit }
+        Self {
+            agent_dir,
+            timeout,
+            host_services,
+            audit,
+        }
     }
 }
 
@@ -371,7 +403,12 @@ impl AskChannel for ForwardingAskChannel {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
     use super::*;
 
     // ---------------- PERM-030 sibling: `permission-dialog.ts` counts UTF-16 code units too
@@ -388,10 +425,18 @@ mod tests {
         // more emoji and pi is OVER (2 202) while `chars().count()` (1 101) is still far under.
         let at_cap = "\u{1F600}".repeat(1_100);
         assert_eq!(utf16_len(&at_cap), PERMISSION_DIALOG_MAX_VISIBLE_CHARACTERS);
-        assert_eq!(compact_permission_prompt_for_select(&at_cap), at_cap, "at the cap: unchanged");
+        assert_eq!(
+            compact_permission_prompt_for_select(&at_cap),
+            at_cap,
+            "at the cap: unchanged"
+        );
 
         let over_cap = "\u{1F600}".repeat(1_101);
-        assert_eq!(over_cap.chars().count(), 1_101, "scalars stay far under the 2 200 cap");
+        assert_eq!(
+            over_cap.chars().count(),
+            1_101,
+            "scalars stay far under the 2 200 cap"
+        );
         assert!(utf16_len(&over_cap) > PERMISSION_DIALOG_MAX_VISIBLE_CHARACTERS);
         let out = compact_permission_prompt_for_select(&over_cap);
         assert_ne!(out, over_cap, "pi compacts here; the scalar count did not");
@@ -427,10 +472,20 @@ mod tests {
     struct EscHostServices;
 
     impl HostServices for EscHostServices {
-        fn select(&self, _title: &str, _options: &serde_json::Value, _opts: &DialogOptions) -> Option<String> {
+        fn select(
+            &self,
+            _title: &str,
+            _options: &serde_json::Value,
+            _opts: &DialogOptions,
+        ) -> Option<String> {
             None
         }
-        fn input(&self, _title: &str, _placeholder: Option<&str>, _opts: &DialogOptions) -> Option<String> {
+        fn input(
+            &self,
+            _title: &str,
+            _placeholder: Option<&str>,
+            _opts: &DialogOptions,
+        ) -> Option<String> {
             None
         }
     }
@@ -443,9 +498,19 @@ mod tests {
         // the fix, `LocalAskChannel::confirm`'s catch-all hardcoded `denial_reason: None`, so this
         // would fail (`d.denial_reason` would be `None` instead of `Some(reason)`).
         let ch = LocalAskChannel::new(Arc::new(EscHostServices));
-        let reason = "permission_timeout: forwarded permission prompt was not answered within 30 seconds.";
-        let opts = PromptOpts { timeout: None, timeout_denial_reason: Some(reason.to_string()) };
-        let out = ch.confirm("Permission Required (Subagent)", "run bash 'rm -rf /'?", opts).await;
+        let reason =
+            "permission_timeout: forwarded permission prompt was not answered within 30 seconds.";
+        let opts = PromptOpts {
+            timeout: None,
+            timeout_denial_reason: Some(reason.to_string()),
+        };
+        let out = ch
+            .confirm(
+                "Permission Required (Subagent)",
+                "run bash 'rm -rf /'?",
+                opts,
+            )
+            .await;
         match out {
             AskOutcome::Decided(d) => {
                 assert!(!d.approved);
@@ -461,7 +526,13 @@ mod tests {
         // The complementary case: no `timeout_denial_reason` configured (e.g. a bare local ask) ⇒
         // pi's plain `{approved:false,state:"reject"}` with no `denialReason` at all.
         let ch = LocalAskChannel::new(Arc::new(EscHostServices));
-        let out = ch.confirm("Permission Required", "run bash 'rm -rf /'?", PromptOpts::default()).await;
+        let out = ch
+            .confirm(
+                "Permission Required",
+                "run bash 'rm -rf /'?",
+                PromptOpts::default(),
+            )
+            .await;
         match out {
             AskOutcome::Decided(d) => {
                 assert!(!d.approved);
@@ -496,17 +567,27 @@ mod tests {
             dir.path().to_path_buf(),
             Duration::from_millis(200),
             Arc::new(OnceLock::new()),
-            Arc::new(crate::logging::AuditTrail::detached(dir.path().join("logs"))),
+            Arc::new(crate::logging::AuditTrail::detached(
+                dir.path().join("logs"),
+            )),
         );
         // The anchor is pinned UNSET by the caller's `envx::pin`, so an ambient value in the
         // developer's shell cannot leak in and no other test's thread can see the pin.
-        let out = ch.confirm("Permission Required", "run bash 'rm -rf /'?", PromptOpts::default()).await;
+        let out = ch
+            .confirm(
+                "Permission Required",
+                "run bash 'rm -rf /'?",
+                PromptOpts::default(),
+            )
+            .await;
         match out {
             AskOutcome::Decided(d) => {
                 assert!(!d.approved, "no parent anchor must fail-CLOSE to deny");
                 assert_eq!(d.state, PermissionDecisionState::Denied);
             }
-            AskOutcome::NoLiveChannel => panic!("forwarding resolves a decision, never NoLiveChannel"),
+            AskOutcome::NoLiveChannel => {
+                panic!("forwarding resolves a decision, never NoLiveChannel")
+            }
         }
     }
 }

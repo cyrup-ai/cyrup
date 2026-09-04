@@ -21,17 +21,15 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-
 use cyrup_core::{CancelToken, ModelId};
 use cyrup_ext_subagents::discovery::types::{OutputMode, SystemPromptMode};
-use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::exec::acceptance::{AcceptanceContract, AcceptanceStatus};
 use cyrup_ext_subagents::exec::fallback::ModelOverride;
 use cyrup_ext_subagents::exec::output::OutputCap;
 use cyrup_ext_subagents::exec::{AgentConfig, RunOptions, ToolCallSummary};
 use cyrup_ext_subagents::fork_context::ForkContext;
+use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::spawn::depth::DepthEnvelope;
-
 
 /// Path to the real, already-built `cyrup-subagent-fixture` binary.
 ///
@@ -54,8 +52,11 @@ fn write_script(dir: &std::path::Path, name: &str, script_json: &serde_json::Val
 
 fn base_agent_config(model: &str) -> AgentConfig {
     AgentConfig {
+        acceptance_role: None, // SUBA-082: no declared role, the name decides
+        default_acceptance: None,
         name: "worker".to_string(),
         model: Some(ModelId::from(model)),
+        model_provider: None,
         fallback_models: Vec::new(),
         thinking: None,
         system_prompt_mode: SystemPromptMode::Replace,
@@ -63,6 +64,8 @@ fn base_agent_config(model: &str) -> AgentConfig {
         tools: None,
         extensions: None,
         subagent_only_extensions: Vec::new(),
+        exclude_tools: Vec::new(),
+        allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
         inherit_skills: true,
@@ -111,7 +114,10 @@ fn base_run_options(cwd: &std::path::Path, model: &str) -> RunOptions {
         runtime_cwd: None,
         include_progress: None,
         agent_scope: None,
-        acceptance: Some(AcceptanceContract::explicit(AcceptanceStatus::NotRequired, vec![])),
+        acceptance: Some(AcceptanceContract::explicit(
+            AcceptanceStatus::NotRequired,
+            vec![],
+        )),
         fork_context: ForkContext::fresh(),
         live_events: None,
         parent_session_id: None,
@@ -191,16 +197,21 @@ async fn run_sync_end_to_end_against_the_scripted_fixture_extracts_output_and_re
     });
     let script_path = write_script(dir.path(), "script.json", &script);
 
-
     let agent = base_agent_config("fixture-model");
     let mut opts = base_run_options(dir.path(), "fixture-model");
     // The fixture named for THIS run rather than moved into the process
     // environment every concurrently-running test in this binary shares.
     opts.spawn_command = Some(SpawnCommand {
         binary: fixture_binary_path(),
-        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
     });
-    opts.acceptance = Some(AcceptanceContract::explicit(AcceptanceStatus::Checked, vec![]));
+    opts.acceptance = Some(AcceptanceContract::explicit(
+        AcceptanceStatus::Checked,
+        vec![],
+    ));
 
     let result = tokio::time::timeout(
         Duration::from_secs(10),
@@ -209,10 +220,19 @@ async fn run_sync_end_to_end_against_the_scripted_fixture_extracts_output_and_re
     .await
     .expect("run_sync must not hang against a fast, well-behaved fixture child");
 
-
-    assert_eq!(result.exit_code, 0, "clean run must report exit code 0: {result:?}");
-    assert_eq!(result.model.as_ref().map(ModelId::as_str), Some("fixture-model"));
-    assert_eq!(result.attempted_models.len(), 1, "no fallback should have been needed");
+    assert_eq!(
+        result.exit_code, 0,
+        "clean run must report exit code 0: {result:?}"
+    );
+    assert_eq!(
+        result.model.as_ref().map(ModelId::as_str),
+        Some("fixture-model")
+    );
+    assert_eq!(
+        result.attempted_models.len(),
+        1,
+        "no fallback should have been needed"
+    );
     assert!(!result.timed_out);
     assert!(!result.detached);
     assert!(!result.interrupted);
@@ -226,7 +246,10 @@ async fn run_sync_end_to_end_against_the_scripted_fixture_extracts_output_and_re
         output, "I implemented the fix.",
         "the trailing acceptance-report fence must be stripped from the delivered output, got: {output}"
     );
-    assert!(!output.contains("acceptance-report"), "report fence must not leak into output: {output}");
+    assert!(
+        !output.contains("acceptance-report"),
+        "report fence must not leak into output: {output}"
+    );
     assert!(!output.contains("criteriaSatisfied"));
 
     // R-SA-027: usage must have been accumulated from the child's message_end event.
@@ -247,7 +270,9 @@ async fn run_sync_end_to_end_against_the_scripted_fixture_extracts_output_and_re
 
     // R-SA-032: acceptance ledger reached at least Checked given the real (non-triggered)
     // completion-mutation guard and the self-reported acceptance-report block.
-    let ledger = result.acceptance.expect("acceptance ledger must be populated");
+    let ledger = result
+        .acceptance
+        .expect("acceptance ledger must be populated");
     assert!(
         ledger.status.satisfies(AcceptanceStatus::Checked),
         "expected at least Checked, got {:?}",
@@ -283,14 +308,16 @@ async fn run_sync_survives_a_real_child_emitting_more_than_fifty_lines() {
     let script = serde_json::json!({"steps": steps, "exit_code": 0});
     let script_path = write_script(dir.path(), "script-many-lines.json", &script);
 
-
     let agent = base_agent_config("fixture-model");
     let mut opts = base_run_options(dir.path(), "fixture-model");
     // The fixture named for THIS run rather than moved into the process
     // environment every concurrently-running test in this binary shares.
     opts.spawn_command = Some(SpawnCommand {
         binary: fixture_binary_path(),
-        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
     });
 
     let result = tokio::time::timeout(
@@ -299,7 +326,6 @@ async fn run_sync_survives_a_real_child_emitting_more_than_fifty_lines() {
     )
     .await
     .expect("run_sync must not hang draining 80+ lines");
-
 
     assert_eq!(result.exit_code, 0, "{result:?}");
     assert_eq!(
@@ -331,7 +357,6 @@ async fn run_sync_timeout_terminates_the_ladder_without_advancing_to_a_fallback_
     });
     let script_path = write_script(dir.path(), "script-hang.json", &script);
 
-
     let mut agent = base_agent_config("primary-model");
     agent.fallback_models = vec![ModelId::from("fallback-model")]; // must NEVER be attempted
     let mut opts = base_run_options(dir.path(), "primary-model");
@@ -339,9 +364,15 @@ async fn run_sync_timeout_terminates_the_ladder_without_advancing_to_a_fallback_
     // environment every concurrently-running test in this binary shares.
     opts.spawn_command = Some(SpawnCommand {
         binary: fixture_binary_path(),
-        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
     });
-    opts.available_models = vec![ModelId::from("primary-model"), ModelId::from("fallback-model")];
+    opts.available_models = vec![
+        ModelId::from("primary-model"),
+        ModelId::from("fallback-model"),
+    ];
     opts.deadline_at = Some(std::time::Instant::now() + Duration::from_millis(300));
 
     let result = tokio::time::timeout(
@@ -350,7 +381,6 @@ async fn run_sync_timeout_terminates_the_ladder_without_advancing_to_a_fallback_
     )
     .await
     .expect("run_sync itself must return once the real signal escalation confirms termination");
-
 
     assert!(result.timed_out, "expected timed_out: true, got {result:?}");
     assert_eq!(
@@ -383,7 +413,6 @@ async fn run_sync_rejects_a_blocked_depth_without_spawning_the_real_fixture_chil
     });
     let script_path = write_script(dir.path(), "script-depth-blocked.json", &script);
 
-
     let mut agent = base_agent_config("fixture-model");
     // current_depth == max_depth: is_blocked() must be true.
     agent.depth = DepthEnvelope {
@@ -395,7 +424,10 @@ async fn run_sync_rejects_a_blocked_depth_without_spawning_the_real_fixture_chil
     // environment every concurrently-running test in this binary shares.
     opts.spawn_command = Some(SpawnCommand {
         binary: fixture_binary_path(),
-        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
     });
 
     let result = tokio::time::timeout(
@@ -405,8 +437,10 @@ async fn run_sync_rejects_a_blocked_depth_without_spawning_the_real_fixture_chil
     .await
     .expect("a depth-blocked run_sync call must return near-instantly, never hang");
 
-
-    assert_eq!(result.exit_code, 1, "a blocked depth attempt must report failure: {result:?}");
+    assert_eq!(
+        result.exit_code, 1,
+        "a blocked depth attempt must report failure: {result:?}"
+    );
     assert!(
         result
             .error
@@ -429,7 +463,7 @@ async fn run_sync_rejects_a_blocked_depth_without_spawning_the_real_fixture_chil
     // directory (the first filesystem side effect ANY spawn attempt, real or fixture, would ever
     // create) must never have been created.
     assert!(
-        !dir.path().join(".cyrup-subagent-scratch").exists(),
+        !cyrup_ext_subagents::background::attempt_scratch_dir(dir.path()).exists(),
         "the depth guard must reject before the spawn-scratch directory is ever created, i.e. \
          before any child process attempt"
     );
@@ -478,14 +512,16 @@ async fn run_sync_validates_a_schema_valid_structured_output_and_populates_the_f
     });
     let script_path = write_script(dir.path(), "script-structured-valid.json", &script);
 
-
     let agent = base_agent_config("fixture-model");
     let mut opts = base_run_options(dir.path(), "fixture-model");
     // The fixture named for THIS run rather than moved into the process
     // environment every concurrently-running test in this binary shares.
     opts.spawn_command = Some(SpawnCommand {
         binary: fixture_binary_path(),
-        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
     });
     opts.structured_output_schema = Some(sample_structured_output_schema());
 
@@ -496,8 +532,10 @@ async fn run_sync_validates_a_schema_valid_structured_output_and_populates_the_f
     .await
     .expect("run_sync must not hang against a fast, well-behaved fixture child");
 
-
-    assert_eq!(result.exit_code, 0, "a schema-valid structured output must not fail the run: {result:?}");
+    assert_eq!(
+        result.exit_code, 0,
+        "a schema-valid structured output must not fail the run: {result:?}"
+    );
     assert!(result.error.is_none(), "got: {:?}", result.error);
     assert_eq!(
         result.structured_output,
@@ -528,14 +566,16 @@ async fn run_sync_rejects_a_schema_invalid_structured_output_and_fails_the_run()
     });
     let script_path = write_script(dir.path(), "script-structured-invalid.json", &script);
 
-
     let agent = base_agent_config("fixture-model");
     let mut opts = base_run_options(dir.path(), "fixture-model");
     // The fixture named for THIS run rather than moved into the process
     // environment every concurrently-running test in this binary shares.
     opts.spawn_command = Some(SpawnCommand {
         binary: fixture_binary_path(),
-        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
     });
     opts.structured_output_schema = Some(sample_structured_output_schema());
 
@@ -545,7 +585,6 @@ async fn run_sync_rejects_a_schema_invalid_structured_output_and_fails_the_run()
     )
     .await
     .expect("run_sync must not hang against a fast, well-behaved fixture child");
-
 
     assert_ne!(
         result.exit_code, 0,
@@ -557,7 +596,9 @@ async fn run_sync_rejects_a_schema_invalid_structured_output_and_fails_the_run()
         "an invalid value must never be surfaced as the validated structured_output, got {:?}",
         result.structured_output
     );
-    let error = result.error.expect("a clear validation-error message must be present");
+    let error = result
+        .error
+        .expect("a clear validation-error message must be present");
     assert!(
         error.contains("structured output validation failed") && error.contains("count"),
         "expected a clear validation-error message naming the offending field, got: {error}"
@@ -591,7 +632,6 @@ async fn run_sync_accepts_a_structured_only_child_that_produced_no_prose_at_all(
     });
     let script_path = write_script(dir.path(), "script-structured-only.json", &script);
 
-
     let mut agent = base_agent_config("primary-model");
     agent.fallback_models = vec![ModelId::from("fallback-model")];
     let mut opts = base_run_options(dir.path(), "primary-model");
@@ -599,9 +639,15 @@ async fn run_sync_accepts_a_structured_only_child_that_produced_no_prose_at_all(
     // environment every concurrently-running test in this binary shares.
     opts.spawn_command = Some(SpawnCommand {
         binary: fixture_binary_path(),
-        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
     });
-    opts.available_models = vec![ModelId::from("primary-model"), ModelId::from("fallback-model")];
+    opts.available_models = vec![
+        ModelId::from("primary-model"),
+        ModelId::from("fallback-model"),
+    ];
     opts.structured_output_schema = Some(sample_structured_output_schema());
 
     let result = tokio::time::timeout(
@@ -610,7 +656,6 @@ async fn run_sync_accepts_a_structured_only_child_that_produced_no_prose_at_all(
     )
     .await
     .expect("run_sync must not hang against a fast, well-behaved fixture child");
-
 
     assert_eq!(
         result.exit_code, 0,
@@ -649,8 +694,11 @@ async fn run_sync_missing_structured_output_fails_the_run_even_with_prose() {
         ],
         "exit_code": 0
     });
-    let script_path = write_script(dir.path(), "script-structured-missing-with-prose.json", &script);
-
+    let script_path = write_script(
+        dir.path(),
+        "script-structured-missing-with-prose.json",
+        &script,
+    );
 
     let agent = base_agent_config("fixture-model");
     let mut opts = base_run_options(dir.path(), "fixture-model");
@@ -658,7 +706,10 @@ async fn run_sync_missing_structured_output_fails_the_run_even_with_prose() {
     // environment every concurrently-running test in this binary shares.
     opts.spawn_command = Some(SpawnCommand {
         binary: fixture_binary_path(),
-        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
     });
     opts.structured_output_schema = Some(sample_structured_output_schema());
 
@@ -669,13 +720,14 @@ async fn run_sync_missing_structured_output_fails_the_run_even_with_prose() {
     .await
     .expect("run_sync must not hang against a fast, well-behaved fixture child");
 
-
     assert_ne!(
         result.exit_code, 0,
         "a declared schema with no structured value MUST fail even though prose was produced: {result:?}"
     );
     assert!(result.structured_output.is_none());
-    let error = result.error.expect("a missing-structured-output error must be present");
+    let error = result
+        .error
+        .expect("a missing-structured-output error must be present");
     assert!(
         error.contains("must finish by calling structured_output"),
         "expected the pi 'Missing structured_output call' message, got: {error}"
@@ -747,7 +799,6 @@ async fn run_sync_re_diagnoses_a_trailing_tool_failure_after_a_zero_exit_and_doe
     });
     let script_path = write_script(dir.path(), "script-trailing-error.json", &script);
 
-
     let mut agent = base_agent_config("primary-model");
     agent.fallback_models = vec![ModelId::from("fallback-model")]; // must NEVER be attempted
     let mut opts = base_run_options(dir.path(), "primary-model");
@@ -755,9 +806,15 @@ async fn run_sync_re_diagnoses_a_trailing_tool_failure_after_a_zero_exit_and_doe
     // environment every concurrently-running test in this binary shares.
     opts.spawn_command = Some(SpawnCommand {
         binary: fixture_binary_path(),
-        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
     });
-    opts.available_models = vec![ModelId::from("primary-model"), ModelId::from("fallback-model")];
+    opts.available_models = vec![
+        ModelId::from("primary-model"),
+        ModelId::from("fallback-model"),
+    ];
 
     let result = tokio::time::timeout(
         Duration::from_secs(10),
@@ -765,7 +822,6 @@ async fn run_sync_re_diagnoses_a_trailing_tool_failure_after_a_zero_exit_and_doe
     )
     .await
     .expect("run_sync must not hang against a fast fixture child");
-
 
     assert_eq!(
         result.exit_code, 127,
@@ -804,14 +860,16 @@ async fn run_sync_soft_interrupt_returns_a_paused_success_not_an_exit_1_failure(
     });
     let script_path = write_script(dir.path(), "script-interrupt.json", &script);
 
-
     let agent = base_agent_config("fixture-model");
     let mut opts = base_run_options(dir.path(), "fixture-model");
     // The fixture named for THIS run rather than moved into the process
     // environment every concurrently-running test in this binary shares.
     opts.spawn_command = Some(SpawnCommand {
         binary: fixture_binary_path(),
-        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
     });
     let interrupt = CancelToken::new();
     opts.interrupt = interrupt.clone();
@@ -833,13 +891,18 @@ async fn run_sync_soft_interrupt_returns_a_paused_success_not_an_exit_1_failure(
     .expect("run_sync must return once the interrupt terminates the child");
     let _ = canceller.await;
 
-
     assert_eq!(
         result.exit_code, 0,
         "a soft interrupt is a PAUSED SUCCESS (exit 0), not an exit-1 failure: {result:?}"
     );
-    assert!(result.interrupted, "the interrupted flag must be set: {result:?}");
-    assert!(!result.timed_out, "an interrupt must not be reported as a timeout: {result:?}");
+    assert!(
+        result.interrupted,
+        "the interrupted flag must be set: {result:?}"
+    );
+    assert!(
+        !result.timed_out,
+        "an interrupt must not be reported as a timeout: {result:?}"
+    );
     assert!(
         result.error.is_none(),
         "a paused-success interrupt must clear the error, got: {:?}",
@@ -875,7 +938,6 @@ async fn run_sync_empty_output_is_a_retryable_failure_that_advances_the_fallback
     });
     let script_path = write_script(dir.path(), "script-empty-output.json", &script);
 
-
     let mut agent = base_agent_config("primary-model");
     agent.fallback_models = vec![ModelId::from("fallback-model")];
     let mut opts = base_run_options(dir.path(), "primary-model");
@@ -883,9 +945,15 @@ async fn run_sync_empty_output_is_a_retryable_failure_that_advances_the_fallback
     // environment every concurrently-running test in this binary shares.
     opts.spawn_command = Some(SpawnCommand {
         binary: fixture_binary_path(),
-        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
     });
-    opts.available_models = vec![ModelId::from("primary-model"), ModelId::from("fallback-model")];
+    opts.available_models = vec![
+        ModelId::from("primary-model"),
+        ModelId::from("fallback-model"),
+    ];
 
     let result = tokio::time::timeout(
         Duration::from_secs(15),
@@ -893,7 +961,6 @@ async fn run_sync_empty_output_is_a_retryable_failure_that_advances_the_fallback
     )
     .await
     .expect("run_sync must not hang against fast fixture children");
-
 
     assert_eq!(
         result.attempted_models.len(),
@@ -904,7 +971,10 @@ async fn run_sync_empty_output_is_a_retryable_failure_that_advances_the_fallback
     );
     assert_eq!(
         result.attempted_models,
-        vec![ModelId::from("primary-model"), ModelId::from("fallback-model")]
+        vec![
+            ModelId::from("primary-model"),
+            ModelId::from("fallback-model")
+        ]
     );
     assert_eq!(result.model_attempts.len(), 2);
     assert!(
@@ -912,8 +982,13 @@ async fn run_sync_empty_output_is_a_retryable_failure_that_advances_the_fallback
         "both empty-output attempts must be recorded as failures: {:?}",
         result.model_attempts
     );
-    assert_ne!(result.exit_code, 0, "the whole run fails once every attempt is empty: {result:?}");
-    let error = result.error.expect("a cold-start/empty-output error must be surfaced");
+    assert_ne!(
+        result.exit_code, 0,
+        "the whole run fails once every attempt is empty: {result:?}"
+    );
+    let error = result
+        .error
+        .expect("a cold-start/empty-output error must be surfaced");
     assert!(
         error.to_lowercase().contains("no output") || error.to_lowercase().contains("cold-start"),
         "expected the empty-output/cold-start error message, got: {error}"
@@ -941,7 +1016,6 @@ async fn run_sync_empty_output_with_a_declared_schema_but_no_structured_value_is
     });
     let script_path = write_script(dir.path(), "script-empty-structured.json", &script);
 
-
     let mut agent = base_agent_config("primary-model");
     agent.fallback_models = vec![ModelId::from("fallback-model")];
     let mut opts = base_run_options(dir.path(), "primary-model");
@@ -949,9 +1023,15 @@ async fn run_sync_empty_output_with_a_declared_schema_but_no_structured_value_is
     // environment every concurrently-running test in this binary shares.
     opts.spawn_command = Some(SpawnCommand {
         binary: fixture_binary_path(),
-        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
     });
-    opts.available_models = vec![ModelId::from("primary-model"), ModelId::from("fallback-model")];
+    opts.available_models = vec![
+        ModelId::from("primary-model"),
+        ModelId::from("fallback-model"),
+    ];
     opts.structured_output_schema = Some(sample_structured_output_schema());
 
     let result = tokio::time::timeout(
@@ -960,7 +1040,6 @@ async fn run_sync_empty_output_with_a_declared_schema_but_no_structured_value_is
     )
     .await
     .expect("run_sync must not hang against fast fixture children");
-
 
     assert_eq!(
         result.attempted_models.len(),
@@ -971,10 +1050,18 @@ async fn run_sync_empty_output_with_a_declared_schema_but_no_structured_value_is
     );
     assert_eq!(
         result.attempted_models,
-        vec![ModelId::from("primary-model"), ModelId::from("fallback-model")]
+        vec![
+            ModelId::from("primary-model"),
+            ModelId::from("fallback-model")
+        ]
     );
-    assert_ne!(result.exit_code, 0, "the whole run still fails once every attempt is empty: {result:?}");
-    let error = result.error.expect("a cold-start/empty-output error must be surfaced");
+    assert_ne!(
+        result.exit_code, 0,
+        "the whole run still fails once every attempt is empty: {result:?}"
+    );
+    let error = result
+        .error
+        .expect("a cold-start/empty-output error must be surfaced");
     assert!(
         error.to_lowercase().contains("no output") || error.to_lowercase().contains("cold-start"),
         "expected the RETRYABLE empty-output/cold-start error (not a non-retryable \
@@ -1004,18 +1091,23 @@ async fn run_sync_timeout_yields_a_rejected_acceptance_ledger_and_a_timeout_mess
     });
     let script_path = write_script(dir.path(), "script-timeout-ledger.json", &script);
 
-
     let agent = base_agent_config("fixture-model");
     let mut opts = base_run_options(dir.path(), "fixture-model");
     // The fixture named for THIS run rather than moved into the process
     // environment every concurrently-running test in this binary shares.
     opts.spawn_command = Some(SpawnCommand {
         binary: fixture_binary_path(),
-        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
     });
     // A contract that REQUIRES acceptance (Checked) — so a timed-out run is `rejected`, not
     // `not-required`. Both the nominal budget (for the message) and the wall-clock deadline are set.
-    opts.acceptance = Some(AcceptanceContract::explicit(AcceptanceStatus::Checked, vec![]));
+    opts.acceptance = Some(AcceptanceContract::explicit(
+        AcceptanceStatus::Checked,
+        vec![],
+    ));
     opts.timeout_ms = Some(300);
     opts.deadline_at = Some(std::time::Instant::now() + Duration::from_millis(300));
 
@@ -1025,7 +1117,6 @@ async fn run_sync_timeout_yields_a_rejected_acceptance_ledger_and_a_timeout_mess
     )
     .await
     .expect("run_sync must return once the real signal escalation confirms termination");
-
 
     assert!(result.timed_out, "expected timed_out: true, got {result:?}");
     assert_ne!(result.exit_code, 0, "a timed-out run must fail: {result:?}");
@@ -1050,7 +1141,9 @@ async fn run_sync_timeout_yields_a_rejected_acceptance_ledger_and_a_timeout_mess
     );
 
     // The delivered output leads with the timeout message (nominal budget), pi `formatTimeoutMessage`.
-    let output = result.final_output.expect("a timed-out run still delivers a message");
+    let output = result
+        .final_output
+        .expect("a timed-out run still delivers a message");
     assert!(
         output.contains("timed out after 300ms"),
         "the delivered output must lead with the timeout message: {output}"
@@ -1078,7 +1171,6 @@ async fn run_sync_surfaces_a_failed_childs_stderr_into_the_result_error() {
     });
     let script_path = write_script(dir.path(), "script-stderr.json", &script);
 
-
     let agent = base_agent_config("fixture-model");
     // Single model, no fallback — the failure must not advance a ladder; assert on the one attempt.
     let mut opts = base_run_options(dir.path(), "fixture-model");
@@ -1086,7 +1178,10 @@ async fn run_sync_surfaces_a_failed_childs_stderr_into_the_result_error() {
     // environment every concurrently-running test in this binary shares.
     opts.spawn_command = Some(SpawnCommand {
         binary: fixture_binary_path(),
-        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
     });
 
     let result = tokio::time::timeout(
@@ -1095,7 +1190,6 @@ async fn run_sync_surfaces_a_failed_childs_stderr_into_the_result_error() {
     )
     .await
     .expect("run_sync must not hang against a fast, non-zero-exit fixture child");
-
 
     assert_ne!(result.exit_code, 0, "the child exited non-zero: {result:?}");
     let error = result
@@ -1157,7 +1251,10 @@ async fn run_progress_fixture(
     // concurrently-running test in this binary shares.
     opts.spawn_command = Some(SpawnCommand {
         binary: fixture_binary_path(),
-        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
     });
     opts.include_progress = include_progress;
     // A stable child index + skill list, so the snapshot's launch-context fields are assertable
@@ -1177,7 +1274,10 @@ async fn include_progress_true_returns_a_compacted_pi_shaped_snapshot() {
     let dir = tempfile::tempdir().expect("tempdir");
     let result = run_progress_fixture(dir.path(), "script-progress-on.json", Some(true)).await;
 
-    assert_eq!(result.exit_code, 0, "the fixture child exits clean: {result:?}");
+    assert_eq!(
+        result.exit_code, 0,
+        "the fixture child exits clean: {result:?}"
+    );
     let progress = result
         .progress
         .clone()
@@ -1243,7 +1343,10 @@ async fn include_progress_omitted_or_false_is_byte_identical_to_the_pre_flag_res
     let explicit_false =
         run_progress_fixture(dir.path(), "script-progress-false.json", Some(false)).await;
 
-    assert!(omitted.progress.is_none(), "an omitted flag populates nothing");
+    assert!(
+        omitted.progress.is_none(),
+        "an omitted flag populates nothing"
+    );
     assert!(
         explicit_false.progress.is_none(),
         "pi's gate is truthiness — `includeProgress: false` is the same as omitting it"
@@ -1304,14 +1407,16 @@ async fn include_progress_on_an_interrupt_paused_run_keeps_pis_uncompacted_runni
     let script = serde_json::json!({ "steps": steps, "exit_code": 0 });
     let script_path = write_script(dir.path(), "script-progress-interrupt.json", &script);
 
-
     let agent = base_agent_config("fixture-model");
     let mut opts = base_run_options(dir.path(), "fixture-model");
     // The fixture named for THIS run rather than moved into the process
     // environment every concurrently-running test in this binary shares.
     opts.spawn_command = Some(SpawnCommand {
         binary: fixture_binary_path(),
-        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
     });
     opts.include_progress = Some(true);
     let interrupt = CancelToken::new();
@@ -1332,8 +1437,10 @@ async fn include_progress_on_an_interrupt_paused_run_keeps_pis_uncompacted_runni
     .expect("run_sync must return once the interrupt terminates the child");
     let _ = canceller.await;
 
-
-    assert!(result.interrupted, "the run must be interrupt-paused: {result:?}");
+    assert!(
+        result.interrupted,
+        "the run must be interrupt-paused: {result:?}"
+    );
     let progress = result
         .progress
         .expect("includeProgress: true must populate progress even on a paused run");
@@ -1358,7 +1465,8 @@ async fn include_progress_on_an_interrupt_paused_run_keeps_pis_uncompacted_runni
     for line in &progress.recent_output {
         assert!(
             line.chars().count()
-                <= cyrup_ext_subagents::exec::RECENT_OUTPUT_LINE_CHARS + "… [truncated]".chars().count(),
+                <= cyrup_ext_subagents::exec::RECENT_OUTPUT_LINE_CHARS
+                    + "… [truncated]".chars().count(),
             "no single recentOutput line may exceed the per-line cap: {} chars",
             line.chars().count()
         );
@@ -1368,7 +1476,10 @@ async fn include_progress_on_an_interrupt_paused_run_keeps_pis_uncompacted_runni
         );
     }
     assert!(
-        progress.recent_output.iter().any(|l| l.starts_with("chatter line ")),
+        progress
+            .recent_output
+            .iter()
+            .any(|l| l.starts_with("chatter line ")),
         "the child's own extracted text must be what survived: {:?}",
         progress.recent_output
     );
@@ -1423,14 +1534,16 @@ async fn a_turn_budget_wraps_up_at_max_turns_and_aborts_the_child_after_the_grac
     });
     let script_path = write_script(dir.path(), "turn-budget.json", &script);
 
-
     let agent = base_agent_config("fixture-model");
     let mut opts = base_run_options(dir.path(), "fixture-model");
     // The fixture named for THIS run rather than moved into the process
     // environment every concurrently-running test in this binary shares.
     opts.spawn_command = Some(SpawnCommand {
         binary: fixture_binary_path(),
-        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
     });
     opts.turn_budget = Some(cyrup_ext_subagents::exec::turn_budget::ResolvedTurnBudget {
         max_turns: 2,
@@ -1444,20 +1557,27 @@ async fn a_turn_budget_wraps_up_at_max_turns_and_aborts_the_child_after_the_grac
     .await
     .expect("the turn-budget abort must end the run well inside the child's 30s sleep");
 
-
     // pi `result.turnBudgetExceeded = true` + `turnBudgetState(budget, turnCount, true)`
     // (`execution.ts:737-739`).
     assert!(
         result.turn_budget_exceeded,
         "the third assistant turn crosses maxTurns(2)+graceTurns(1) and must abort: {result:?}"
     );
-    assert!(result.wrap_up_requested, "the soft limit was reached, so wrap-up was requested");
-    let state = result.turn_budget.expect("an aborted run must publish its budget state");
+    assert!(
+        result.wrap_up_requested,
+        "the soft limit was reached, so wrap-up was requested"
+    );
+    let state = result
+        .turn_budget
+        .expect("an aborted run must publish its budget state");
     assert_eq!(
         state.outcome,
         cyrup_ext_subagents::exec::turn_budget::TurnBudgetOutcome::Exceeded
     );
-    assert_eq!(state.turn_count, 3, "the abort fires ON the third assistant turn");
+    assert_eq!(
+        state.turn_count, 3,
+        "the abort fires ON the third assistant turn"
+    );
     assert_eq!(state.max_turns, 2);
     assert_eq!(state.grace_turns, 1);
     // `wrapUpRequestedAtTurn` is the THRESHOLD (pi's literal `budget.maxTurns`), while
@@ -1472,13 +1592,21 @@ async fn a_turn_budget_wraps_up_at_max_turns_and_aborts_the_child_after_the_grac
         Some("Subagent exceeded turn budget after 3 assistant turns (soft limit 2 + grace 1)."),
         "the abort message must be upstream's, and must outrank every other diagnosis: {result:?}"
     );
-    assert_ne!(result.exit_code, 0, "a budget abort is a failure, not a clean exit");
-    assert!(!result.timed_out, "this is a budget abort, not the orchestrator's deadline");
+    assert_ne!(
+        result.exit_code, 0,
+        "a budget abort is a failure, not a clean exit"
+    );
+    assert!(
+        !result.timed_out,
+        "this is a budget abort, not the orchestrator's deadline"
+    );
     assert!(!result.interrupted);
 
     // pi `formatTurnBudgetOutput(message, fullOutput)` (`execution.ts:1252`): the message leads,
     // and whatever the child DID produce follows under upstream's own heading.
-    let output = result.final_output.expect("an aborted run still delivers its partial output");
+    let output = result
+        .final_output
+        .expect("an aborted run still delivers its partial output");
     assert!(
         output.starts_with("Subagent exceeded turn budget after 3 assistant turns"),
         "the abort message must lead the delivered output: {output}"
@@ -1514,14 +1642,16 @@ async fn a_child_that_finishes_inside_its_turn_budget_is_untouched() {
     });
     let script_path = write_script(dir.path(), "within-budget.json", &script);
 
-
     let agent = base_agent_config("fixture-model");
     let mut opts = base_run_options(dir.path(), "fixture-model");
     // The fixture named for THIS run rather than moved into the process
     // environment every concurrently-running test in this binary shares.
     opts.spawn_command = Some(SpawnCommand {
         binary: fixture_binary_path(),
-        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
     });
     opts.turn_budget = Some(cyrup_ext_subagents::exec::turn_budget::ResolvedTurnBudget {
         max_turns: 2,
@@ -1535,8 +1665,10 @@ async fn a_child_that_finishes_inside_its_turn_budget_is_untouched() {
     .await
     .expect("run_sync must not hang");
 
-
-    assert_eq!(result.exit_code, 0, "an in-budget run is untouched: {result:?}");
+    assert_eq!(
+        result.exit_code, 0,
+        "an in-budget run is untouched: {result:?}"
+    );
     assert!(!result.turn_budget_exceeded);
     assert!(!result.wrap_up_requested);
     assert_eq!(result.error, None);

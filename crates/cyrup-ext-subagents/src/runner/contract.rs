@@ -23,8 +23,7 @@ pub const CODE_OWNED_ADAPTER_IDS: [&str; 6] = [
 /// `CODE_OWNED_EXTERNAL_CLI_ADAPTER_LABEL` — each id single-quoted, comma-joined. A `const` string
 /// rather than a computed join so the refusal text cannot drift from the array above without the
 /// accompanying assertion failing.
-pub const CODE_OWNED_ADAPTER_LABEL: &str =
-    "'codex-exec', 'codex-exec-writer', 'claude-code', 'claude-code-writer', 'cursor-agent', 'cursor-agent-writer'";
+pub const CODE_OWNED_ADAPTER_LABEL: &str = "'codex-exec', 'codex-exec-writer', 'claude-code', 'claude-code-writer', 'cursor-agent', 'cursor-agent-writer'";
 
 /// `isCodeOwnedExternalCliAdapterId` (`:38-40`).
 #[must_use]
@@ -74,7 +73,10 @@ pub fn parse_capability_narrowing(
         .filter(|key| !CAPABILITY_KEYS.contains(key))
         .collect();
     if !unknown.is_empty() {
-        return Err(format!("{label} has unsupported fields: {}.", unknown.join(", ")));
+        return Err(format!(
+            "{label} has unsupported fields: {}.",
+            unknown.join(", ")
+        ));
     }
     let mut narrowed = ExternalCliCapabilityNarrowing::new();
     for (key, setting) in object {

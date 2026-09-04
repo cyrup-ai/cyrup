@@ -5,7 +5,10 @@
 use std::path::Path;
 
 use super::report::normalize::normalized_token;
-use super::types::{AcceptanceEvidenceKind, AcceptanceReport, AcceptanceRuntimeCheck, CriterionReport, CriterionStatus, GateSeverity, ResolvedAcceptanceGate, RuntimeCheckStatus};
+use super::types::{
+    AcceptanceEvidenceKind, AcceptanceReport, AcceptanceRuntimeCheck, CriterionReport,
+    CriterionStatus, GateSeverity, ResolvedAcceptanceGate, RuntimeCheckStatus,
+};
 
 // --------------------------------------------------------------------------------------------
 // Report-driven runtime checks (acceptance.ts:922-978 @v0.57.0)
@@ -58,7 +61,10 @@ fn report_evidence_status(
             passed_or_failed(report.commands_run.as_ref().is_some_and(|v| !v.is_empty()))
         }
         AcceptanceEvidenceKind::ValidationOutput => passed_or_failed(
-            report.validation_output.as_ref().is_some_and(|v| !v.is_empty()),
+            report
+                .validation_output
+                .as_ref()
+                .is_some_and(|v| !v.is_empty()),
         ),
         // pi `isStringArray(report.residualRisks)` with NO length test — an empty list passes.
         AcceptanceEvidenceKind::ResidualRisks => passed_or_failed(report.residual_risks.is_some()),
@@ -66,10 +72,15 @@ fn report_evidence_status(
             passed_or_failed(report.no_staged_files == Some(true))
         }
         AcceptanceEvidenceKind::DiffSummary => passed_or_failed(
-            report.diff_summary.as_deref().is_some_and(|s| !s.trim().is_empty()),
+            report
+                .diff_summary
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty()),
         ),
         // Likewise `isStringArray` only.
-        AcceptanceEvidenceKind::ReviewFindings => passed_or_failed(report.review_findings.is_some()),
+        AcceptanceEvidenceKind::ReviewFindings => {
+            passed_or_failed(report.review_findings.is_some())
+        }
         AcceptanceEvidenceKind::ManualNotes => passed_or_failed(
             report
                 .manual_notes
@@ -114,10 +125,7 @@ pub fn check_criteria_satisfied(
                 Option::None => AcceptanceRuntimeCheck {
                     id,
                     status: RuntimeCheckStatus::Failed,
-                    message: format!(
-                        "Required criterion '{}' was not reported.",
-                        criterion.id
-                    ),
+                    message: format!("Required criterion '{}' was not reported.", criterion.id),
                 },
                 Some(item) if item.status != CriterionStatus::Satisfied => AcceptanceRuntimeCheck {
                     id,
@@ -178,8 +186,7 @@ async fn check_no_staged_files(cwd: &Path) -> AcceptanceRuntimeCheck {
         .filter(|line| {
             let mut chars = line.chars();
             let first = chars.next();
-            line.chars().count() >= 2
-                && !matches!(first, Some(' ') | Some('?'))
+            line.chars().count() >= 2 && !matches!(first, Some(' ') | Some('?'))
         })
         .collect();
     if staged.is_empty() {
@@ -308,7 +315,8 @@ mod tests {
                 let check = find(&checks, &format!("evidence:{}", kind.as_str()))
                     .expect("the requested evidence kind must produce a check");
                 assert_eq!(
-                    check.status, expected_status,
+                    check.status,
+                    expected_status,
                     "{} with {value:?} must score {expected_status:?}; got {check:?}",
                     kind.as_str()
                 );
@@ -327,12 +335,9 @@ mod tests {
             changed_files: Some(Vec::new()),
             ..AcceptanceReport::default()
         };
-        let checks = run_structural_checks(
-            &[AcceptanceEvidenceKind::ChangedFiles],
-            &report,
-            dir.path(),
-        )
-        .await;
+        let checks =
+            run_structural_checks(&[AcceptanceEvidenceKind::ChangedFiles], &report, dir.path())
+                .await;
         assert!(
             !checks
                 .iter()
@@ -371,10 +376,8 @@ mod tests {
         // check's own business and depends on the worktree, but the skip must leave no evidence
         // failure behind for the ledger to reject on.
         assert!(
-            !checks
-                .iter()
-                .any(|check| check.id.starts_with("evidence:")
-                    && check.status == RuntimeCheckStatus::Failed),
+            !checks.iter().any(|check| check.id.starts_with("evidence:")
+                && check.status == RuntimeCheckStatus::Failed),
             "{checks:?}"
         );
     }
@@ -396,7 +399,9 @@ mod tests {
         .await;
 
         assert_eq!(
-            find(&checks, "evidence:no-staged-files").expect("not skipped").status,
+            find(&checks, "evidence:no-staged-files")
+                .expect("not skipped")
+                .status,
             RuntimeCheckStatus::Failed,
             "{checks:?}"
         );

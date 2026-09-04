@@ -1,9 +1,14 @@
 //! Extension discovery + trust-split tests (arch-08 §6.2; Pi `discoverAndLoadExtensions`). Pure
 //! filesystem scan — no wasm runtime — exercising the three-root scan, dedup, manifest parsing,
 //! origin attribution, and the pre/post-trust eligibility split (R-08-002).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
-use crate::loader::{discover, DiscoveryRoots, ExtOrigin};
+use crate::loader::{DiscoveryRoots, ExtOrigin, discover};
 use std::path::{Path, PathBuf};
 
 fn unique_dir(tag: &str) -> PathBuf {
@@ -23,8 +28,7 @@ fn write_ext(base: &Path, name: &str, with_wasm: bool) -> PathBuf {
     // EXT-028: interpolate `HOST_WORLD` rather than a literal — a fixture pinned to a stale world
     // string silently stops exercising the load path the moment the world is bumped.
     let world = crate::HOST_WORLD;
-    let manifest =
-        format!(r#"{{ "id": "{name}", "version": "1.0.0", "world": "{world}" }}"#);
+    let manifest = format!(r#"{{ "id": "{name}", "version": "1.0.0", "world": "{world}" }}"#);
     std::fs::write(dir.join("extension.json"), manifest).unwrap();
     if with_wasm {
         // a stand-in component artifact (discovery does not validate bytes).
@@ -66,7 +70,11 @@ fn discovers_three_roots_with_origins_and_dedup() {
     assert!(ids.contains(&"global-ext".to_string()));
     assert!(ids.contains(&"cfg-ext".to_string()));
     // global-ext appears once despite being reachable via both the agent root and a configured path.
-    assert_eq!(ids.iter().filter(|i| *i == "global-ext").count(), 1, "dedup by canonical path");
+    assert_eq!(
+        ids.iter().filter(|i| *i == "global-ext").count(),
+        1,
+        "dedup by canonical path"
+    );
 
     let origin = |id: &str| found.iter().find(|d| d.manifest.id == id).map(|d| d.origin);
     assert_eq!(origin("proj-ext"), Some(ExtOrigin::Project));
@@ -96,7 +104,10 @@ fn trust_split_pre_and_post() {
     };
     let found = discover(&roots);
     let proj = found.iter().find(|d| d.manifest.id == "proj-ext").unwrap();
-    let global = found.iter().find(|d| d.manifest.id == "global-ext").unwrap();
+    let global = found
+        .iter()
+        .find(|d| d.manifest.id == "global-ext")
+        .unwrap();
 
     // Untrusted project: the project-local ext is NOT eligible; the global one always is.
     assert!(!proj.is_trusted(false), "project-local is post-trust");
@@ -125,7 +136,10 @@ fn bare_wasm_without_manifest_is_discovered() {
         disabled: Vec::new(),
     };
     let found = discover(&roots);
-    let bare = found.iter().find(|d| d.manifest.id == "mytool").expect("bare wasm discovered");
+    let bare = found
+        .iter()
+        .find(|d| d.manifest.id == "mytool")
+        .expect("bare wasm discovered");
     assert!(bare.wasm.is_some());
     assert_eq!(bare.origin, ExtOrigin::Global);
 

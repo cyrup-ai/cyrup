@@ -97,7 +97,6 @@ mod read_only_acceptance_inference;
 #[cfg(unix)]
 mod acceptance_memo_key_and_live_wiring;
 
-
 // ---- installation: discovery, registration, the opt-in gate, end-to-end attach ----
 mod discovery_project_root_wiring_integration;
 mod extension_end_to_end_smoke;

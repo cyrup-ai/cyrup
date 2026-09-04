@@ -1,7 +1,12 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
-use crate::editor::*;
 use crate::editor::wrap::{display_width, word_wrap_line};
+use crate::editor::*;
 
 /// `word_wrap_line` over a `&str`, as `(chunk text)` — the shape `wordWrapLine` returns
 /// (`editor.ts:114-206` yields `{ text, startIndex, endIndex }`).
@@ -20,7 +25,10 @@ fn assert_tiles(s: &str, width: usize) {
     let segs = word_wrap_line(&chars, width);
     let mut at = 0usize;
     for (start, len) in &segs {
-        assert_eq!(*start, at, "chunk {segs:?} of {s:?}@{width} is not contiguous");
+        assert_eq!(
+            *start, at,
+            "chunk {segs:?} of {s:?}@{width} is not contiguous"
+        );
         at += len;
     }
     assert_eq!(at, chars.len(), "chunks {segs:?} do not cover {s:?}");
@@ -36,7 +44,11 @@ fn a_line_that_fits_is_one_chunk() {
     assert_eq!(wrap("hello", 10), vec!["hello"]);
     // "fits" is measured in COLUMNS: 5 ideographs are 10 of them.
     assert_eq!(wrap("日本語です", 10), vec!["日本語です"]);
-    assert_eq!(wrap("日本語です", 9).len(), 2, "…and 9 columns is one short");
+    assert_eq!(
+        wrap("日本語です", 9).len(),
+        2,
+        "…and 9 columns is one short"
+    );
 }
 
 /// Whitespace is the primary wrap opportunity, and the break lands AFTER the space run so the
@@ -44,7 +56,11 @@ fn a_line_that_fits_is_one_chunk() {
 #[test]
 fn wrapping_breaks_after_the_last_space_that_fits() {
     assert_eq!(wrap("aaa bbb ccc", 5), vec!["aaa ", "bbb ", "ccc"]);
-    assert_eq!(wrap("aaa  bbb", 5), vec!["aaa  ", "bbb"], "a run of spaces joins (`:187`)");
+    assert_eq!(
+        wrap("aaa  bbb", 5),
+        vec!["aaa  ", "bbb"],
+        "a run of spaces joins (`:187`)"
+    );
     // And it is GREEDY, not balanced: at width 7 the tail `"bbb ccc"` is exactly 7 columns, so
     // the backtrack at the second space finds it already fits and never fires
     // (`currentWidth - wrapOppWidth + gWidth <= maxWidth`, `editor.ts:147`).
@@ -70,7 +86,11 @@ fn cjk_is_measured_and_broken_in_columns() {
     let cjk: String = "日本語".chars().cycle().take(24).collect();
     let rows = wrap(&cjk, 39);
     assert_eq!(rows.len(), 2, "48 columns do not fit 39: {rows:?}");
-    assert_eq!(rows[0].chars().count(), 19, "19 ideographs are 38 columns; a 20th would be 40");
+    assert_eq!(
+        rows[0].chars().count(),
+        19,
+        "19 ideographs are 38 columns; a 20th would be 40"
+    );
     assert_eq!(rows.concat(), cjk);
     assert_tiles(&cjk, 39);
     for r in &rows {
@@ -86,7 +106,11 @@ fn a_latin_cjk_boundary_is_a_wrap_opportunity() {
     // `d`→`日` boundary is what puts `word` on a row of its own; the two that follow come from
     // the CJK-to-CJK opportunities.
     let rows = wrap("word日本語", 4);
-    assert_eq!(rows, vec!["word", "日本", "語"], "the boundary breaks: {rows:?}");
+    assert_eq!(
+        rows,
+        vec!["word", "日本", "語"],
+        "the boundary breaks: {rows:?}"
+    );
     assert_tiles("word日本語", 4);
     // Contrast: an all-Latin run of the same length has NO opportunity anywhere, so it
     // force-breaks mid-"word" instead.
@@ -99,7 +123,11 @@ fn a_cluster_is_never_split() {
     const FAMILY: &str = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}";
     let line = format!("{}{FAMILY}", "a".repeat(38));
     let rows = wrap(&line, 39);
-    assert_eq!(rows, vec!["a".repeat(38), FAMILY.to_string()], "torn cluster: {rows:?}");
+    assert_eq!(
+        rows,
+        vec!["a".repeat(38), FAMILY.to_string()],
+        "torn cluster: {rows:?}"
+    );
     assert_tiles(&line, 39);
 
     // …including when the cluster ALONE is wider than the width: it is indivisible, so it takes

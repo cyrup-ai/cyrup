@@ -142,10 +142,17 @@ fn extract_ansi_code_len(chars: &[char], pos: usize) -> Option<usize> {
     match chars.get(pos + 1) {
         Some('[') => {
             let mut j = pos + 2;
-            while chars.get(j).is_some_and(|c| !matches!(c, 'm' | 'G' | 'K' | 'H' | 'J')) {
+            while chars
+                .get(j)
+                .is_some_and(|c| !matches!(c, 'm' | 'G' | 'K' | 'H' | 'J'))
+            {
                 j += 1;
             }
-            if j < chars.len() { Some(j + 1 - pos) } else { None }
+            if j < chars.len() {
+                Some(j + 1 - pos)
+            } else {
+                None
+            }
         }
         Some(']') | Some('_') => {
             let mut j = pos + 2;
@@ -204,7 +211,11 @@ fn next_grapheme_cluster(chars: &[char], start: usize) -> (String, usize, usize)
     }
     let mut i = start + 1;
     let mut forced_wide = is_regional_indicator(base);
-    if forced_wide && chars.get(i).is_some_and(|&next| is_regional_indicator(next)) {
+    if forced_wide
+        && chars
+            .get(i)
+            .is_some_and(|&next| is_regional_indicator(next))
+    {
         i += 1; // Consume the flag's second half.
     }
     loop {
@@ -233,7 +244,9 @@ fn next_grapheme_cluster(chars: &[char], start: usize) -> (String, usize, usize)
         }
     }
     let width = if forced_wide { 2 } else { char_width(base) };
-    let cluster = chars.get(start..i).map_or_else(String::new, |slice| slice.iter().collect());
+    let cluster = chars
+        .get(start..i)
+        .map_or_else(String::new, |slice| slice.iter().collect());
     (cluster, width, i)
 }
 

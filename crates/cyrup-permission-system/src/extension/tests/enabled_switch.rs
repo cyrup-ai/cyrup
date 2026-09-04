@@ -30,7 +30,10 @@ fn enabled_false_attaches_nothing_even_with_a_policy_file_present() {
         let config_path = agent_dir.join(CONFIG_DIR).join(CONFIG_FILE);
 
         // An unambiguous, operator-authored install signal.
-        write_file(&agent_dir.join(POLICY_FILE), r#"{ "bash": { "*": "deny" } }"#);
+        write_file(
+            &agent_dir.join(POLICY_FILE),
+            r#"{ "bash": { "*": "deny" } }"#,
+        );
         assert!(
             permission_extension_for_env(agent_dir.clone(), cwd.clone()).is_some(),
             "precondition: a policy file installs the gate"
@@ -52,9 +55,11 @@ fn enabled_false_attaches_nothing_even_with_a_policy_file_present() {
         // disables (pi `record.enabled !== false`, `extension-config.ts:88`) — an explicit
         // `true`, a non-boolean, and a file with no `enabled` key at all (i.e. every config
         // written before v0.8.0) all keep the gate attached.
-        for still_enabled in
-            ["{\n  \"enabled\": true\n}\n", "{\n  \"enabled\": 0\n}\n", "{\n  \"yoloMode\": true\n}\n"]
-        {
+        for still_enabled in [
+            "{\n  \"enabled\": true\n}\n",
+            "{\n  \"enabled\": 0\n}\n",
+            "{\n  \"yoloMode\": true\n}\n",
+        ] {
             write_file(&config_path, still_enabled);
             assert!(
                 permission_extension_for_env(agent_dir.clone(), cwd.clone()).is_some(),
@@ -123,7 +128,10 @@ fn a_legacy_three_key_config_template_still_reads_as_pristine() {
                 !ExtensionConfig::is_pristine_default_file(&config_path),
                 "hand-edited config {edited:?} must not read as pristine"
             );
-            assert!(is_installed(&agent_dir, &cwd), "...and must still install the gate");
+            assert!(
+                is_installed(&agent_dir, &cwd),
+                "...and must still install the gate"
+            );
         }
     });
 }
@@ -187,7 +195,10 @@ fn the_install_probe_reads_the_same_resolved_config_as_the_enabled_switch() {
             );
 
             // Same file, switch ON: the two gates agree in the other direction too.
-            write_file(&override_path, "{\n  \"enabled\": true,\n  \"yoloMode\": true\n}\n");
+            write_file(
+                &override_path,
+                "{\n  \"enabled\": true,\n  \"yoloMode\": true\n}\n",
+            );
             assert!(is_installed(&agent_dir, &cwd));
             assert!(
                 permission_extension_for_env(agent_dir.clone(), cwd.clone()).is_some(),
@@ -233,12 +244,18 @@ fn attaching_the_gate_loads_the_extension_config_exactly_once() {
         std::fs::create_dir_all(&agent_dir).unwrap();
         std::fs::create_dir_all(&cwd).unwrap();
         // An install signal that is NOT the config file, so the probe itself performs no load.
-        write_file(&agent_dir.join(POLICY_FILE), r#"{ "bash": { "*": "deny" } }"#);
+        write_file(
+            &agent_dir.join(POLICY_FILE),
+            r#"{ "bash": { "*": "deny" } }"#,
+        );
 
         crate::ext_config::reset_load_count();
         let attached = permission_extension_for_env(agent_dir.clone(), cwd.clone());
         let loads = crate::ext_config::load_count();
-        assert!(attached.is_some(), "precondition: the policy file installs the gate");
+        assert!(
+            attached.is_some(),
+            "precondition: the policy file installs the gate"
+        );
         assert_eq!(
             loads, 1,
             "the session build must read config.json once, not once for the `enabled` switch \
@@ -247,7 +264,10 @@ fn attaching_the_gate_loads_the_extension_config_exactly_once() {
 
         // MIRROR (must stay green): declining to attach still reads it once — the `enabled`
         // switch has to open the file to answer at all, and the constructor never runs.
-        write_file(&agent_dir.join(CONFIG_DIR).join(CONFIG_FILE), "{\n  \"enabled\": false\n}\n");
+        write_file(
+            &agent_dir.join(CONFIG_DIR).join(CONFIG_FILE),
+            "{\n  \"enabled\": false\n}\n",
+        );
         crate::ext_config::reset_load_count();
         assert!(permission_extension_for_env(agent_dir.clone(), cwd.clone()).is_none());
         assert_eq!(crate::ext_config::load_count(), 1);

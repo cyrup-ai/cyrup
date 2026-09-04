@@ -13,15 +13,20 @@
 //! `App::install_ui_sinks` that `App::run` and its session-swap arm call, and the real
 //! `App::apply_ui_effect` the run loop's drain arm calls.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::sync::Arc;
 
-use cyrup_ext::host::HostServices;
-use cyrup_provider::faux::FauxProvider;
-use cyrup_provider::Provider;
-use cyrup_session_svc::{LiveHostServices, NotifyKind, UiEffect, UiRequest};
 use crate::{App, UiTheme};
+use cyrup_ext::host::HostServices;
+use cyrup_provider::Provider;
+use cyrup_provider::faux::FauxProvider;
+use cyrup_session_svc::{LiveHostServices, NotifyKind, UiEffect, UiRequest};
 use ratatui::backend::TestBackend;
 
 fn services() -> Arc<LiveHostServices> {
@@ -54,7 +59,10 @@ fn without_a_sink_every_fire_and_forget_ui_call_is_discarded() {
     svc.set_editor_text("x", false);
     svc.set_tools_expanded(true);
 
-    assert!(effect_rx.try_recv().is_err(), "nothing can arrive without an installed sink");
+    assert!(
+        effect_rx.try_recv().is_err(),
+        "nothing can arrive without an installed sink"
+    );
 }
 
 /// The wiring itself: `App::install_ui_sinks` is the one call `App::run` (and its session-swap arm)
@@ -88,17 +96,32 @@ fn install_ui_sinks_delivers_all_eight_fire_and_forget_capabilities() {
     assert_eq!(
         got,
         vec![
-            UiEffect::Notify { message: "note".into(), kind: NotifyKind::Warning },
-            UiEffect::SetStatus { key: "ext".into(), text: Some("busy".into()) },
+            UiEffect::Notify {
+                message: "note".into(),
+                kind: NotifyKind::Warning
+            },
+            UiEffect::SetStatus {
+                key: "ext".into(),
+                text: Some("busy".into())
+            },
             UiEffect::SetWidget {
                 widget: serde_json::json!({
                     "key": "w", "lines": ["a"], "placement": "aboveEditor",
                 }),
             },
-            UiEffect::SetHeader { content: "H".into() },
-            UiEffect::SetFooter { content: "F".into() },
-            UiEffect::SetTitle { title: "cyrup — repo".into() },
-            UiEffect::SetEditorText { text: "typed".into(), is_paste: false },
+            UiEffect::SetHeader {
+                content: "H".into()
+            },
+            UiEffect::SetFooter {
+                content: "F".into()
+            },
+            UiEffect::SetTitle {
+                title: "cyrup — repo".into()
+            },
+            UiEffect::SetEditorText {
+                text: "typed".into(),
+                is_paste: false
+            },
             UiEffect::SetToolsExpanded { expanded: true },
         ],
         "these eight ui.* mutators must reach the interactive run loop, in call order. TUI-030 \
@@ -128,10 +151,19 @@ fn notify_reaches_the_transcript_with_pi_severity_routing() {
     }
 
     let text = rendered(&mut app);
-    assert!(text.contains("indexing finished"), "info notify must show: {text}");
+    assert!(
+        text.contains("indexing finished"),
+        "info notify must show: {text}"
+    );
     // Pi's `showWarning`/`showError` prefix the copy (`interactive-mode.ts:3950-3960`).
-    assert!(text.contains("Warning: stale cache"), "warning notify must show: {text}");
-    assert!(text.contains("Error: token refresh failed"), "error notify must show: {text}");
+    assert!(
+        text.contains("Warning: stale cache"),
+        "warning notify must show: {text}"
+    );
+    assert!(
+        text.contains("Error: token refresh failed"),
+        "error notify must show: {text}"
+    );
 }
 
 /// `setStatus` reaches the footer's extension-status line (Pi `setExtensionStatus` →
@@ -147,12 +179,22 @@ fn set_status_reaches_the_footer_and_clears() {
     let mut app = app();
     svc.set_status("lsp", Some("rust-analyzer: indexing"));
     drain(&mut app, &mut effect_rx);
-    assert_eq!(app.state().status.extension_status_text(), "rust-analyzer: indexing");
-    assert!(rendered(&mut app).contains("rust-analyzer: indexing"), "must reach the rendered footer");
+    assert_eq!(
+        app.state().status.extension_status_text(),
+        "rust-analyzer: indexing"
+    );
+    assert!(
+        rendered(&mut app).contains("rust-analyzer: indexing"),
+        "must reach the rendered footer"
+    );
 
     svc.set_status("lsp", None);
     drain(&mut app, &mut effect_rx);
-    assert_eq!(app.state().status.extension_status_text(), "", "None must clear the key");
+    assert_eq!(
+        app.state().status.extension_status_text(),
+        "",
+        "None must clear the key"
+    );
 }
 
 /// `setEditorText` and `pasteToEditor`: Pi routes the first through `editor.setText` and the second
@@ -186,7 +228,10 @@ fn set_tools_expanded_flips_the_transcript_and_echoes_pi_status() {
     App::<TestBackend>::install_ui_sinks(&svc, ui_tx, effect_tx);
 
     let mut app = app();
-    assert!(!app.state().transcript.tool_expanded, "collapsed by default");
+    assert!(
+        !app.state().transcript.tool_expanded,
+        "collapsed by default"
+    );
 
     svc.set_tools_expanded(true);
     drain(&mut app, &mut effect_rx);
@@ -197,7 +242,10 @@ fn set_tools_expanded_flips_the_transcript_and_echoes_pi_status() {
     let before = rendered(&mut app).matches("Tool output: expanded").count();
     svc.set_tools_expanded(true);
     drain(&mut app, &mut effect_rx);
-    assert_eq!(rendered(&mut app).matches("Tool output: expanded").count(), before);
+    assert_eq!(
+        rendered(&mut app).matches("Tool output: expanded").count(),
+        before
+    );
 }
 
 /// `setTitle`/`setWidget`/`setHeader`/`setFooter` now ARRIVE and are retained. TUI-014 (widgets
@@ -222,7 +270,10 @@ fn title_widget_header_footer_arrive_and_are_rendered() {
     svc.set_footer("FOOTER-LINE");
     drain(&mut app, &mut effect_rx);
 
-    assert_eq!(app.state().terminal_title.as_deref(), Some("cyrup — my-repo"));
+    assert_eq!(
+        app.state().terminal_title.as_deref(),
+        Some("cyrup — my-repo")
+    );
     assert_eq!(app.state().extension_widgets.len(), 1);
     assert_eq!(app.state().extension_widgets[0].key, "todo");
     assert_eq!(app.state().extension_header.as_deref(), Some("HEADER-LINE"));
@@ -235,10 +286,22 @@ fn title_widget_header_footer_arrive_and_are_rendered() {
     // (`interactive-mode.ts:1920-1960`), `setExtensionHeader` (`:2262-2290`) and
     // `setExtensionFooter` (`:2235-2257`).
     let text = rendered(&mut app);
-    assert!(text.contains("HEADER-LINE"), "the extension header must paint:\n{text}");
-    assert!(text.contains("FOOTER-LINE"), "the extension footer must paint:\n{text}");
-    assert!(text.contains("WIDGET-A"), "the extension widget must paint:\n{text}");
-    assert!(text.contains("WIDGET-B"), "every widget row must paint:\n{text}");
+    assert!(
+        text.contains("HEADER-LINE"),
+        "the extension header must paint:\n{text}"
+    );
+    assert!(
+        text.contains("FOOTER-LINE"),
+        "the extension footer must paint:\n{text}"
+    );
+    assert!(
+        text.contains("WIDGET-A"),
+        "the extension widget must paint:\n{text}"
+    );
+    assert!(
+        text.contains("WIDGET-B"),
+        "every widget row must paint:\n{text}"
+    );
 }
 
 /// The footer is REPLACED, not overlaid, and clearing it restores the built-in — Pi's
@@ -249,17 +312,36 @@ async fn an_extension_footer_swaps_the_built_in_one_out_and_back() {
     let mut app = app();
     app.state_mut().status.set_model("BUILTINMODEL");
     let before = rendered(&mut app);
-    assert!(before.contains("BUILTINMODEL"), "the built-in footer paints first:\n{before}");
+    assert!(
+        before.contains("BUILTINMODEL"),
+        "the built-in footer paints first:\n{before}"
+    );
 
-    app.apply_ui_effect(UiEffect::SetFooter { content: "EXTFOOTER".to_string() });
+    app.apply_ui_effect(UiEffect::SetFooter {
+        content: "EXTFOOTER".to_string(),
+    });
     let swapped = rendered(&mut app);
-    assert!(swapped.contains("EXTFOOTER"), "the extension footer paints:\n{swapped}");
-    assert!(!swapped.contains("BUILTINMODEL"), "the built-in must be swapped OUT:\n{swapped}");
+    assert!(
+        swapped.contains("EXTFOOTER"),
+        "the extension footer paints:\n{swapped}"
+    );
+    assert!(
+        !swapped.contains("BUILTINMODEL"),
+        "the built-in must be swapped OUT:\n{swapped}"
+    );
 
-    app.apply_ui_effect(UiEffect::SetFooter { content: String::new() });
+    app.apply_ui_effect(UiEffect::SetFooter {
+        content: String::new(),
+    });
     let restored = rendered(&mut app);
-    assert!(restored.contains("BUILTINMODEL"), "clearing restores the built-in:\n{restored}");
-    assert!(!restored.contains("EXTFOOTER"), "the extension footer is gone:\n{restored}");
+    assert!(
+        restored.contains("BUILTINMODEL"),
+        "clearing restores the built-in:\n{restored}"
+    );
+    assert!(
+        !restored.contains("EXTFOOTER"),
+        "the extension footer is gone:\n{restored}"
+    );
 }
 
 /// A second `setWidget` under the same key REPLACES rather than appends — Pi removes the key from
@@ -273,9 +355,16 @@ async fn a_second_widget_with_the_same_key_replaces_the_first() {
     app.apply_ui_effect(UiEffect::SetWidget {
         widget: serde_json::json!({"key": "todo", "lines": ["SECOND"], "placement": "aboveEditor"}),
     });
-    assert_eq!(app.state().extension_widgets.len(), 1, "same key must not append");
+    assert_eq!(
+        app.state().extension_widgets.len(),
+        1,
+        "same key must not append"
+    );
     let text = rendered(&mut app);
-    assert!(text.contains("SECOND") && !text.contains("FIRST"), "replaced, not appended:\n{text}");
+    assert!(
+        text.contains("SECOND") && !text.contains("FIRST"),
+        "replaced, not appended:\n{text}"
+    );
 }
 
 /// `content === undefined` REMOVES the widget (`interactive-mode.ts:1935-1938`). TUI-014.
@@ -285,15 +374,25 @@ async fn a_widget_with_no_content_is_removed() {
     app.apply_ui_effect(UiEffect::SetWidget {
         widget: serde_json::json!({"key": "todo", "lines": ["GONE"], "placement": "aboveEditor"}),
     });
-    assert_eq!(app.state().extension_widgets.len(), 1, "mounted before the removal");
+    assert_eq!(
+        app.state().extension_widgets.len(),
+        1,
+        "mounted before the removal"
+    );
     // `lines: null` is what `LiveHostServices::set_widget` emits for pi's `content: undefined`
     // (`host_services.rs:730-737`); an absent key reads the same.
     app.apply_ui_effect(UiEffect::SetWidget {
         widget: serde_json::json!({"key": "todo", "lines": null, "placement": "aboveEditor"}),
     });
-    assert!(app.state().extension_widgets.is_empty(), "an empty content list removes the widget");
+    assert!(
+        app.state().extension_widgets.is_empty(),
+        "an empty content list removes the widget"
+    );
     let text = rendered(&mut app);
-    assert!(!text.contains("GONE"), "the removed widget must not paint:\n{text}");
+    assert!(
+        !text.contains("GONE"),
+        "the removed widget must not paint:\n{text}"
+    );
 }
 
 /// `MAX_WIDGET_LINES = 10` with pi's own truncation row (`interactive-mode.ts:1945-1950`, `:2008`).
@@ -323,14 +422,12 @@ fn placement_below_editor_is_recovered_from_the_payload() {
     assert!(!above.below, "the default is `aboveEditor`");
     // A carrier with no placement at all still reads as pi's documented default
     // (`extensions/types.ts:107-110` @v0.83.0, `interactive-mode.ts:1925`).
-    let implicit = crate::ExtensionWidget::from_json(&serde_json::json!({"key": "k", "lines": ["x"]}));
+    let implicit =
+        crate::ExtensionWidget::from_json(&serde_json::json!({"key": "k", "lines": ["x"]}));
     assert!(!implicit.below, "an absent placement is `aboveEditor`");
 }
 
-fn drain(
-    app: &mut App<TestBackend>,
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<UiEffect>,
-) {
+fn drain(app: &mut App<TestBackend>, rx: &mut tokio::sync::mpsc::UnboundedReceiver<UiEffect>) {
     while let Ok(effect) = rx.try_recv() {
         app.apply_ui_effect(effect);
     }

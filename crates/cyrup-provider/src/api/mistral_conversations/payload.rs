@@ -1,6 +1,11 @@
 //! Request encoding — the `/v1/chat/completions` request body (Pi `buildChatPayload`,
 //! mistral-conversations.ts:230-270).
 
+use super::endpoint::should_use_prompt_caching;
+use super::messages::to_chat_messages;
+use super::reasoning::lower_reasoning;
+use super::tool_call_id::MistralToolCallIdNormalizer;
+use super::tools::{map_tool_choice, to_function_tools};
 use crate::api::compat::sanitize_surrogates;
 use crate::api::openai_completions::transform_messages_with;
 use crate::context::Context;
@@ -8,11 +13,6 @@ use crate::model::{Modality, Model};
 use crate::stream::StreamOptions;
 use crate::utils::constrained_sampling::ConstrainedSamplingError;
 use serde_json::{Map, Value, json};
-use super::endpoint::should_use_prompt_caching;
-use super::messages::to_chat_messages;
-use super::reasoning::lower_reasoning;
-use super::tool_call_id::MistralToolCallIdNormalizer;
-use super::tools::{map_tool_choice, to_function_tools};
 
 /// Test-only convenience wrapper for [`build_chat_payload`].
 #[cfg(test)]

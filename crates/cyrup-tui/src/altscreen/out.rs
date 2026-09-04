@@ -103,5 +103,8 @@ impl Write for Out {
 /// carried invalid UTF-8.
 #[cfg(test)]
 pub(crate) fn captured_text(buf: &Captured) -> String {
-    buf.lock().map_or_else(|_| String::new(), |held| String::from_utf8_lossy(&held).into_owned())
+    buf.lock().map_or_else(
+        |_| String::new(),
+        |held| String::from_utf8_lossy(&held).into_owned(),
+    )
 }

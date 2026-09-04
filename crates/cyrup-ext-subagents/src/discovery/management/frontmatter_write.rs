@@ -38,7 +38,10 @@ pub(crate) fn write_agent_file(
     Ok(())
 }
 
-pub(crate) fn serialize_agent(def: &AgentDefinition, preserve_fields: Option<&HashSet<String>>) -> String {
+pub(crate) fn serialize_agent(
+    def: &AgentDefinition,
+    preserve_fields: Option<&HashSet<String>>,
+) -> String {
     // `preserve(&[..])` mirrors pi's `preserve(...fields)` (true iff any listed key is in the set);
     // `preserving_existing` mirrors `preservingExistingFrontmatter` (`Some` == an UPDATE that must
     // round-trip the file's existing field set; `None` == a CREATE emitting the default field set).
@@ -60,10 +63,16 @@ pub(crate) fn serialize_agent(def: &AgentDefinition, preserve_fields: Option<&Ha
     // silently DELETING an author's `alias:`/`aliases:` (the extra-fields loop skips known keys);
     // an author who wrote the singular `alias:` gets the plural back, exactly as upstream does.
     {
-        let aliases_value =
-            if def.aliases.is_empty() { None } else { Some(def.aliases.join(", ")) };
+        let aliases_value = if def.aliases.is_empty() {
+            None
+        } else {
+            Some(def.aliases.join(", "))
+        };
         if aliases_value.is_some() || preserve(&["alias", "aliases"]) {
-            lines.push(format!("aliases: {}", aliases_value.as_deref().unwrap_or("")));
+            lines.push(format!(
+                "aliases: {}",
+                aliases_value.as_deref().unwrap_or("")
+            ));
         }
     }
 
@@ -85,8 +94,39 @@ pub(crate) fn serialize_agent(def: &AgentDefinition, preserve_fields: Option<&Ha
         lines.push(format!("tools: {}", tools_value.as_deref().unwrap_or("")));
     }
 
+    // SUBA-092 excludeTools (`agent-serializer.ts:74-75` @v0.64.0): `joinComma(config.excludeTools)`
+    // — `undefined` for an absent OR empty list — emitted when truthy or under preserve. Same
+    // silent-deletion trap as `toolBudget`/`turnBudget` below: the key is in `KNOWN_FIELDS`, so
+    // without this arm the first management rewrite would delete an author's exclusion list.
+    let exclude_tools_value = def
+        .exclude_tools
+        .as_ref()
+        .filter(|list| !list.is_empty())
+        .map(|list| list.join(", "));
+    if exclude_tools_value.is_some() || preserve(&["excludeTools"]) {
+        lines.push(format!(
+            "excludeTools: {}",
+            exclude_tools_value.as_deref().unwrap_or("")
+        ));
+    }
+    // SUBA-092 allowNestedSubagents (`agent-serializer.ts:76-78` @v0.64.0): emitted only when
+    // `=== true` or under preserve, and under preserve an unset value is written as an EMPTY value
+    // (never as `false`) while an explicit `false` is written back as `false`.
+    if def.allow_nested_subagents == Some(true) || preserve(&["allowNestedSubagents"]) {
+        let value = match def.allow_nested_subagents {
+            None => "",
+            Some(true) => "true",
+            Some(false) => "false",
+        };
+        lines.push(format!("allowNestedSubagents: {value}"));
+    }
+
     if def.model.is_some() || preserve(&["model"]) {
-        let model_str = def.model.as_ref().map(ToString::to_string).unwrap_or_default();
+        let model_str = def
+            .model
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
         lines.push(format!("model: {model_str}"));
     }
 
@@ -222,6 +262,35 @@ pub(crate) fn serialize_agent(def: &AgentDefinition, preserve_fields: Option<&Ha
             .default_timeout_ms
             .map_or_else(String::new, |ms| ms.to_string());
         lines.push(format!("timeoutMs: {value}"));
+    }
+
+    // SUBA-082 acceptance / acceptanceRole (`agent-serializer.ts:103-110` @v0.64.0):
+    //
+    //   if (config.defaultAcceptance !== undefined || preserve("acceptance")) {
+    //     lines.push(`acceptance: ${config.defaultAcceptance === undefined ? ""
+    //       : typeof config.defaultAcceptance === "object" ? JSON.stringify(config.defaultAcceptance)
+    //       : String(config.defaultAcceptance)}`);
+    //   }
+    //   if (config.acceptanceRole || preserve("acceptanceRole")) lines.push(`acceptanceRole: ${config.acceptanceRole ?? ""}`);
+    //
+    // An object is emitted as compact JSON (which the YAML-parsing reader accepts back, JSON
+    // being YAML); a scalar (`checked`, `false`) is emitted bare, exactly as `String(value)`
+    // renders it. Same silent-deletion trap as `toolBudget`/`turnBudget` below, now that both
+    // keys are in `KNOWN_FIELDS`.
+    if def.default_acceptance.is_some() || preserve(&["acceptance"]) {
+        let value = match &def.default_acceptance {
+            None => String::new(),
+            Some(serde_json::Value::String(text)) => text.clone(),
+            Some(value @ serde_json::Value::Object(_)) => {
+                serde_json::to_string(value).unwrap_or_default()
+            }
+            Some(other) => other.to_string(),
+        };
+        lines.push(format!("acceptance: {value}"));
+    }
+    if def.acceptance_role.is_some() || preserve(&["acceptanceRole"]) {
+        let value = def.acceptance_role.map_or("", |role| role.as_str());
+        lines.push(format!("acceptanceRole: {value}"));
     }
 
     // toolBudget (`agent-serializer.ts:91-93` @ v0.34.0): emitted as compact JSON when set, or as
@@ -373,7 +442,10 @@ pub(crate) fn preserved_frontmatter_fields(
     }
     if fields.thinking.is_some() {
         set.remove("thinking");
-        if matches!(fields.thinking.as_ref().and_then(|o| o.as_deref()), Some("off")) {
+        if matches!(
+            fields.thinking.as_ref().and_then(|o| o.as_deref()),
+            Some("off")
+        ) {
             set.insert("thinking".to_string());
         }
     }
@@ -427,8 +499,8 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
-    use super::*;
     use super::super::test_support::sample_agent;
+    use super::*;
     use crate::discovery::types::AgentSource;
 
     /// A `memory:`/`toolBudget:` agent must survive a serialize -> re-parse round-trip. This is
@@ -541,6 +613,80 @@ mod tests {
         );
     }
 
+    /// SUBA-082 — the same silent-deletion trap for `acceptance`/`acceptanceRole`
+    /// (`agent-serializer.ts:103-110` @v0.64.0): both are `KNOWN_FIELDS` now, so a rewrite that
+    /// never emitted them would delete an author's declared role and launch default on the first
+    /// management update. An object default is emitted as compact JSON, a scalar bare, and a
+    /// preserved-but-unset key as an empty value that re-parses to an absence.
+    #[test]
+    fn serialize_agent_round_trips_acceptance_and_acceptance_role() {
+        use crate::discovery::frontmatter::parse_agent_file;
+        use crate::exec::acceptance::model::AcceptanceRole;
+
+        let mut def = sample_agent(AgentSource::Project, PathBuf::from("/w.md"));
+        def.local_name = "editor".to_string();
+        def.name = "editor".to_string();
+        def.description = "Edits things".to_string();
+        def.system_prompt_body = "Do work".to_string();
+        def.acceptance_role = Some(AcceptanceRole::Writer);
+        def.default_acceptance = Some(serde_json::json!({ "level": "checked" }));
+
+        let serialized = serialize_agent(&def, None);
+        assert!(
+            serialized.contains("acceptance: {\"level\":\"checked\"}"),
+            "an object default is emitted as compact JSON (`JSON.stringify`):\n{serialized}"
+        );
+        assert!(
+            serialized.contains("acceptanceRole: writer"),
+            "the role is emitted under its wire spelling:\n{serialized}"
+        );
+
+        let reparsed = parse_agent_file(&serialized, AgentSource::Project, Path::new("/w.md"))
+            .expect("round-trips back through the parser");
+        assert_eq!(reparsed.acceptance_role, Some(AcceptanceRole::Writer));
+        assert_eq!(reparsed.default_acceptance, def.default_acceptance);
+        assert!(!reparsed.extra_fields.contains_key("acceptance"));
+        assert!(!reparsed.extra_fields.contains_key("acceptanceRole"));
+
+        // A scalar default is emitted bare (`String(value)`), never quoted.
+        def.default_acceptance = Some(serde_json::json!("checked"));
+        def.acceptance_role = Some(AcceptanceRole::ReadOnly);
+        let serialized = serialize_agent(&def, None);
+        assert!(
+            serialized.contains("\nacceptance: checked\n"),
+            "{serialized}"
+        );
+        assert!(
+            serialized.contains("\nacceptanceRole: read-only\n"),
+            "{serialized}"
+        );
+        let reparsed = parse_agent_file(&serialized, AgentSource::Project, Path::new("/w.md"))
+            .expect("round-trips");
+        assert_eq!(
+            reparsed.default_acceptance,
+            Some(serde_json::json!("checked"))
+        );
+        assert_eq!(reparsed.acceptance_role, Some(AcceptanceRole::ReadOnly));
+
+        // Neither set: nothing emitted on CREATE; on UPDATE with the keys preserved, both are
+        // written empty (`config.acceptanceRole ?? ""`) and re-parse to an absence.
+        def.default_acceptance = None;
+        def.acceptance_role = None;
+        let created = serialize_agent(&def, None);
+        assert!(!created.contains("acceptance"), "{created}");
+        let preserve: HashSet<String> = ["acceptance", "acceptanceRole"]
+            .iter()
+            .map(|k| k.to_string())
+            .collect();
+        let preserved = serialize_agent(&def, Some(&preserve));
+        assert!(preserved.contains("\nacceptance: \n"), "{preserved}");
+        assert!(preserved.contains("\nacceptanceRole: \n"), "{preserved}");
+        let reparsed = parse_agent_file(&preserved, AgentSource::Project, Path::new("/w.md"))
+            .expect("empty preserved values are absences, not errors");
+        assert_eq!(reparsed.default_acceptance, None);
+        assert_eq!(reparsed.acceptance_role, None);
+    }
+
     /// SUBA-073 — the same silent-deletion trap for `permission`/`permissions`: now that both
     /// spellings are `KNOWN_FIELDS`, a management rewrite that never emits them would otherwise
     /// silently delete an author's policy on the first `update_agent` call.
@@ -611,8 +757,9 @@ mod tests {
 
         let serialized = serialize_agent(&def, None);
         assert!(
-            serialized
-                .contains(r#"runner: {"type":"external-cli","adapter":"claude-code","command":"claude"}"#),
+            serialized.contains(
+                r#"runner: {"type":"external-cli","adapter":"claude-code","command":"claude"}"#
+            ),
             "the runner must be emitted as compact JSON in upstream's key order:\n{serialized}"
         );
 
@@ -712,7 +859,10 @@ mod tests {
             ),
             "block-valued extra field must round-trip as an indented block:\n{serialized}"
         );
-        assert!(serialized.contains("customVendorField: some-value"), "{serialized}");
+        assert!(
+            serialized.contains("customVendorField: some-value"),
+            "{serialized}"
+        );
         assert!(
             serialized.contains("disabled: true"),
             "disabled must round-trip as an extra field, not vanish:\n{serialized}"
@@ -725,16 +875,28 @@ mod tests {
         let reparsed = parse_agent_file(&serialized, AgentSource::Project, Path::new("/w.md"))
             .expect("re-parses");
         assert_eq!(
-            reparsed.extra_fields.get("customVendorField").map(String::as_str),
+            reparsed
+                .extra_fields
+                .get("customVendorField")
+                .map(String::as_str),
             Some("some-value")
         );
         assert_eq!(
-            reparsed.extra_fields.get("vendorPolicy").map(String::as_str),
+            reparsed
+                .extra_fields
+                .get("vendorPolicy")
+                .map(String::as_str),
             Some("\"*\": ask\nread: allow\nbash:\n  \"*\": ask\n  \"git *\": allow"),
             "the block value must round-trip byte-for-byte"
         );
-        assert_eq!(reparsed.extra_fields.get("disabled").map(String::as_str), Some("true"));
-        assert_eq!(reparsed.disabled, None, "disabled: in a file is never an honored flag");
+        assert_eq!(
+            reparsed.extra_fields.get("disabled").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            reparsed.disabled, None,
+            "disabled: in a file is never an honored flag"
+        );
         assert_eq!(reparsed.thinking, Some("off".to_string()));
     }
 
@@ -764,5 +926,81 @@ mod tests {
         // An agent with no aliases emits no line at all on a CREATE (pi's `if (aliasesValue || ...)`).
         def.aliases.clear();
         assert!(!serialize_agent(&def, None).contains("aliases:"));
+    }
+
+    /// SUBA-092 — the same silent-deletion trap as `toolBudget`/`turnBudget` above, for the two keys
+    /// `b26da18e` added to `KNOWN_FIELDS` (`agent-serializer.ts:12-13,74-78` @v0.64.0). Both halves
+    /// are asserted: the emit arms, and the round-trip back through the parser.
+    #[test]
+    fn serialize_agent_round_trips_exclude_tools_and_allow_nested_subagents() {
+        use crate::discovery::frontmatter::parse_agent_file;
+
+        let mut def = sample_agent(AgentSource::Project, PathBuf::from("/w.md"));
+        def.local_name = "worker".to_string();
+        def.name = "worker".to_string();
+        def.description = "Works".to_string();
+        def.system_prompt_body = "Do work".to_string();
+        def.exclude_tools = Some(vec!["bash".to_string(), "write".to_string()]);
+        def.allow_nested_subagents = Some(true);
+
+        let serialized = serialize_agent(&def, None);
+        assert!(
+            serialized.contains("\nexcludeTools: bash, write\n"),
+            "excludeTools must be emitted as a comma list:\n{serialized}"
+        );
+        assert!(
+            serialized.contains("\nallowNestedSubagents: true\n"),
+            "allowNestedSubagents: true must be emitted:\n{serialized}"
+        );
+
+        let reparsed = parse_agent_file(&serialized, AgentSource::Project, Path::new("/w.md"))
+            .expect("round-trips back through the parser");
+        assert_eq!(
+            reparsed.exclude_tools, def.exclude_tools,
+            "excludeTools lost on round trip"
+        );
+        assert_eq!(
+            reparsed.allow_nested_subagents,
+            Some(true),
+            "allowNestedSubagents lost on round trip"
+        );
+        assert!(!reparsed.extra_fields.contains_key("excludeTools"));
+        assert!(!reparsed.extra_fields.contains_key("allowNestedSubagents"));
+    }
+
+    /// `agent-serializer.ts:74-78` @v0.64.0, the non-truthy arms: an empty/absent `excludeTools` and
+    /// an unset or `false` `allowNestedSubagents` are NOT emitted on a fresh serialize; under
+    /// preserve, an absent value is written as an EMPTY value and an explicit `false` as `false`.
+    #[test]
+    fn serialize_agent_emits_the_two_suba092_keys_only_when_truthy_or_preserved() {
+        let mut def = sample_agent(AgentSource::Project, PathBuf::from("/w.md"));
+        def.exclude_tools = Some(Vec::new());
+        def.allow_nested_subagents = Some(false);
+        let fresh = serialize_agent(&def, None);
+        assert!(
+            !fresh.contains("excludeTools") && !fresh.contains("allowNestedSubagents"),
+            "neither key is truthy, so neither is emitted on a create:\n{fresh}"
+        );
+
+        let preserve: HashSet<String> = ["excludeTools", "allowNestedSubagents"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let preserved = serialize_agent(&def, Some(&preserve));
+        assert!(
+            preserved.contains("\nexcludeTools: \n"),
+            "empty value under preserve:\n{preserved}"
+        );
+        assert!(
+            preserved.contains("\nallowNestedSubagents: false\n"),
+            "an explicit false is written back as false under preserve:\n{preserved}"
+        );
+
+        def.allow_nested_subagents = None;
+        let preserved = serialize_agent(&def, Some(&preserve));
+        assert!(
+            preserved.contains("\nallowNestedSubagents: \n"),
+            "an UNSET value under preserve is an empty value, never `false`:\n{preserved}"
+        );
     }
 }

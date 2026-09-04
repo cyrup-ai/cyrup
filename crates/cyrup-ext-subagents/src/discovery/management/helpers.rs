@@ -10,9 +10,9 @@
 
 use std::path::PathBuf;
 
+use super::super::AgentDiscoveryConfig;
 use super::super::package_name::{collapse_repeated_char, is_valid_package_identifier};
 use super::super::types::{AgentSource, OverrideScope};
-use super::super::AgentDiscoveryConfig;
 use crate::fork_context::ContextMode;
 
 /// Normalize + validate a caller-supplied package identifier exactly per R-SA-006's grammar:
@@ -80,6 +80,9 @@ pub(crate) fn source_str(source: AgentSource) -> &'static str {
         AgentSource::Package => "package",
         AgentSource::User => "user",
         AgentSource::Project => "project",
+        // SUBA-084 — the `- <name> (runtime, …)` list label (`agent-management.ts:849` @v0.64.0
+        // `["runtime", "Runtime agents"]`; `runtime-agent-registration.test.ts:229`).
+        AgentSource::Runtime => "runtime",
     }
 }
 

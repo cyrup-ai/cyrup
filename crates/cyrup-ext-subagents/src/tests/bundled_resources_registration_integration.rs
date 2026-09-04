@@ -23,15 +23,20 @@
 //! or a `cyrup-subagents` config file). The orchestrator's system prompt then lists the
 //! `pi-subagents` skill, and the model opens it with `read`.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use cyrup_core::CancelToken;
-use cyrup_ext::{ExtMode, ExtensionHost, HostConfig};
 use crate::extension::{RegistrationMode, SubagentsExtension};
 use crate::registration::SubagentExtensionConfig;
+use cyrup_core::CancelToken;
+use cyrup_ext::{ExtMode, ExtensionHost, HostConfig};
 use cyrup_resources::{DiscoveredPaths, ResourceRegistry};
 
 async fn host_at(cwd: &Path) -> Arc<ExtensionHost> {
@@ -59,7 +64,9 @@ async fn the_bundled_pi_subagents_skill_reaches_the_session_resource_registry() 
 
     let agg = host.aggregate_resources(&CancelToken::new()).await;
     assert!(
-        agg.skill_paths.iter().any(|p| p.path.ends_with("skills/pi-subagents/SKILL.md")),
+        agg.skill_paths
+            .iter()
+            .any(|p| p.path.ends_with("skills/pi-subagents/SKILL.md")),
         "the extension must contribute its bundled SKILL.md: {:?}",
         agg.skill_paths
     );
@@ -74,8 +81,16 @@ async fn the_bundled_pi_subagents_skill_reaches_the_session_resource_registry() 
 
     // The builder's own fold, verbatim (`builder.rs:988-1002`).
     let extra = DiscoveredPaths {
-        skill_paths: agg.skill_paths.iter().map(|p| PathBuf::from(&p.path)).collect(),
-        prompt_paths: agg.prompt_paths.iter().map(|p| PathBuf::from(&p.path)).collect(),
+        skill_paths: agg
+            .skill_paths
+            .iter()
+            .map(|p| PathBuf::from(&p.path))
+            .collect(),
+        prompt_paths: agg
+            .prompt_paths
+            .iter()
+            .map(|p| PathBuf::from(&p.path))
+            .collect(),
         theme_paths: Vec::new(),
     };
     let registry = ResourceRegistry::default().extend(&extra);
@@ -87,8 +102,16 @@ async fn the_bundled_pi_subagents_skill_reaches_the_session_resource_registry() 
     );
 
     // Upstream declares `prompts` in the SAME package.json block, so the recipes register too.
-    let prompt_names: Vec<&str> = registry.prompts.winners().map(|p| p.name.as_str()).collect();
-    for recipe in ["parallel-review", "review-loop", "gather-context-and-clarify"] {
+    let prompt_names: Vec<&str> = registry
+        .prompts
+        .winners()
+        .map(|p| p.name.as_str())
+        .collect();
+    for recipe in [
+        "parallel-review",
+        "review-loop",
+        "gather-context-and-clarify",
+    ] {
         assert!(
             prompt_names.contains(&recipe),
             "the bundled recipe {recipe:?} must register as a prompt template: {prompt_names:?}"

@@ -3,7 +3,12 @@
 //! filtered to CONFIGURED providers (`modelRegistry.getAvailable()`), NOT just the single injected
 //! provider, and selecting a model from a DIFFERENT provider must swap the session's owning provider
 //! live (Pi model+provider switch).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -50,7 +55,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -61,7 +70,10 @@ fn base_config(fx: &Fixture) -> SessionConfig {
 
 fn two_model_faux() -> Arc<FauxProvider> {
     let cfg = FauxConfig {
-        models: vec![FauxModelDefinition::new("faux-1"), FauxModelDefinition::new("faux-2")],
+        models: vec![
+            FauxModelDefinition::new("faux-1"),
+            FauxModelDefinition::new("faux-2"),
+        ],
         ..FauxConfig::default()
     };
     Arc::new(FauxProvider::with_config(cfg))
@@ -78,8 +90,8 @@ impl ProviderResolver for RegistryResolver {
             auth_context: None,
             catalog_overlay: None,
         })
-            .get_provider(provider_id)
-            .ok_or_else(|| format!("no built-in provider '{provider_id}'"))
+        .get_provider(provider_id)
+        .ok_or_else(|| format!("no built-in provider '{provider_id}'"))
     }
 }
 
@@ -99,7 +111,11 @@ async fn selector_lists_configured_non_faux_provider_and_hides_unconfigured() {
     auth.set_runtime_api_key(ProviderId::from("together"), "sk-together-test".to_string());
     let mut cfg = base_config(&fx);
     cfg.model_pattern = Some("faux-1".to_string());
-    let session = SessionBuilder::new(provider, cfg).auth(auth).build().await.unwrap();
+    let session = SessionBuilder::new(provider, cfg)
+        .auth(auth)
+        .build()
+        .await
+        .unwrap();
 
     let catalog = session.available_model_catalog();
     assert!(
@@ -139,8 +155,20 @@ async fn selecting_a_different_provider_swaps_the_session_provider() {
         .unwrap();
 
     // Starts on the injected faux provider.
-    assert_eq!(session.model().expect("session must have a resolved model").provider.as_str(), "faux");
-    assert!(session.model_catalog().iter().all(|m| m.provider.as_str() == "faux"));
+    assert_eq!(
+        session
+            .model()
+            .expect("session must have a resolved model")
+            .provider
+            .as_str(),
+        "faux"
+    );
+    assert!(
+        session
+            .model_catalog()
+            .iter()
+            .all(|m| m.provider.as_str() == "faux")
+    );
 
     // Target a real together model (the fully-qualified `provider/id` the selector confirms).
     let target = session
@@ -150,10 +178,31 @@ async fn selecting_a_different_provider_swaps_the_session_provider() {
         .expect("a together model is available");
     let pattern = format!("{}/{}", target.provider.as_str(), target.id.as_str());
 
-    let new_ref = session.set_model(&pattern).await.expect("cross-provider set_model succeeds");
-    assert_eq!(new_ref.provider.as_str(), "together", "active model switched to together");
-    assert_eq!(session.model().expect("session must have a resolved model").provider.as_str(), "together");
-    assert_eq!(session.model().expect("session must have a resolved model").model.as_str(), target.id.as_str());
+    let new_ref = session
+        .set_model(&pattern)
+        .await
+        .expect("cross-provider set_model succeeds");
+    assert_eq!(
+        new_ref.provider.as_str(),
+        "together",
+        "active model switched to together"
+    );
+    assert_eq!(
+        session
+            .model()
+            .expect("session must have a resolved model")
+            .provider
+            .as_str(),
+        "together"
+    );
+    assert_eq!(
+        session
+            .model()
+            .expect("session must have a resolved model")
+            .model
+            .as_str(),
+        target.id.as_str()
+    );
 
     // The injected provider was swapped: the current catalog is together's, faux is gone.
     let catalog = session.model_catalog();
@@ -180,11 +229,18 @@ async fn guest_registered_provider_is_selectable_and_installed() {
     let auth = Arc::new(AuthStore::at(fx.agent_dir.join("auth.json")));
     let mut cfg = base_config(&fx);
     cfg.model_pattern = Some("faux-1".to_string());
-    let session = SessionBuilder::new(provider, cfg).auth(auth).build().await.unwrap();
+    let session = SessionBuilder::new(provider, cfg)
+        .auth(auth)
+        .build()
+        .await
+        .unwrap();
 
     // Before registration, the guest model is absent.
     assert!(
-        !session.available_model_catalog().iter().any(|m| m.provider.as_str() == "acme"),
+        !session
+            .available_model_catalog()
+            .iter()
+            .any(|m| m.provider.as_str() == "acme"),
         "no guest provider registered yet"
     );
 
@@ -222,20 +278,46 @@ async fn guest_registered_provider_is_selectable_and_installed() {
     assert_eq!(target.context_window, 64000);
 
     // Starts on the injected faux provider.
-    assert_eq!(session.model().expect("session must have a resolved model").provider.as_str(), "faux");
+    assert_eq!(
+        session
+            .model()
+            .expect("session must have a resolved model")
+            .provider
+            .as_str(),
+        "faux"
+    );
 
     // set_model resolves the guest model AND installs the guest provider in place (no resolver seam
     // needed — the guest provider is a realized `Provider`).
-    let new_ref = session.set_model("acme/acme-fast").await.expect("guest set_model succeeds");
+    let new_ref = session
+        .set_model("acme/acme-fast")
+        .await
+        .expect("guest set_model succeeds");
     assert_eq!(new_ref.provider.as_str(), "acme");
-    assert_eq!(session.model().expect("session must have a resolved model").provider.as_str(), "acme");
-    assert_eq!(session.model().expect("session must have a resolved model").model.as_str(), "acme-fast");
+    assert_eq!(
+        session
+            .model()
+            .expect("session must have a resolved model")
+            .provider
+            .as_str(),
+        "acme"
+    );
+    assert_eq!(
+        session
+            .model()
+            .expect("session must have a resolved model")
+            .model
+            .as_str(),
+        "acme-fast"
+    );
 
     // STREAMABLE: the installed provider is the guest one, exposing the registered model in its
     // catalog (what `ProviderStreamFn` resolves against when the agent loop streams).
     let catalog = session.model_catalog();
     assert!(
-        catalog.iter().any(|m| m.provider.as_str() == "acme" && m.id.as_str() == "acme-fast"),
+        catalog
+            .iter()
+            .any(|m| m.provider.as_str() == "acme" && m.id.as_str() == "acme-fast"),
         "the installed (guest) provider exposes the registered model"
     );
     assert!(
@@ -255,7 +337,11 @@ async fn cross_provider_select_without_resolver_errors() {
     let mut cfg = base_config(&fx);
     cfg.model_pattern = Some("faux-1".to_string());
     // No `.provider_resolver(...)` wired.
-    let session = SessionBuilder::new(provider, cfg).auth(auth).build().await.unwrap();
+    let session = SessionBuilder::new(provider, cfg)
+        .auth(auth)
+        .build()
+        .await
+        .unwrap();
 
     let target = session
         .available_model_catalog()
@@ -268,5 +354,12 @@ async fn cross_provider_select_without_resolver_errors() {
         "a cross-provider select with no resolver must error, not mis-stream"
     );
     // The active provider is unchanged.
-    assert_eq!(session.model().expect("session must have a resolved model").provider.as_str(), "faux");
+    assert_eq!(
+        session
+            .model()
+            .expect("session must have a resolved model")
+            .provider
+            .as_str(),
+        "faux"
+    );
 }

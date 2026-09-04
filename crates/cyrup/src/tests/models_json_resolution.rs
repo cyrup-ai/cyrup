@@ -63,14 +63,21 @@ fn a_models_json_provider_can_be_launched_by_model_prefix() {
 /// into a silent fallback (this crate's stated "intentionally no silent fallback").
 #[test]
 fn an_undeclared_provider_still_errors_clearly() {
-    let err = match select_provider(None, Some("mycorp/mycorp-large"), None, &ModelFile::default())
-    {
+    let err = match select_provider(
+        None,
+        Some("mycorp/mycorp-large"),
+        None,
+        &ModelFile::default(),
+    ) {
         Err(e) => e.to_string(),
         Ok(_) => panic!("an undeclared provider must still be an error"),
     };
     assert!(err.contains("mycorp"), "{err}");
     assert!(err.contains("not a known provider"), "{err}");
-    assert!(err.contains("models.json"), "the error points at the fix: {err}");
+    assert!(
+        err.contains("models.json"),
+        "the error points at the fix: {err}"
+    );
 }
 
 /// `cyrup --list-models` (Pi `modelRegistry.getAvailable()`, list-models.ts:35).

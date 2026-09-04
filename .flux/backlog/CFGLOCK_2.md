@@ -247,9 +247,9 @@ rather than rewriting it.
 
 ## No tests
 
-Another team owns tests. **Do not write any new test code.** The `.await` and `#[tokio::test]`
+Tests are in scope (the earlier "another team owns tests" line was wrong). Add tests for any behaviour this task changes. The `.await` and `#[tokio::test]`
 migration quantified above is mechanical and in scope; anything beyond mechanical is not — flag it.
 
 ## No benchmarks
 
-Another team owns benchmarks. **Do not write any benchmark code.**
+No benchmarks: this task is not performance-scoped.

@@ -15,10 +15,16 @@ impl Ctx {
     pub fn active_tools(&self) -> Vec<String> {
         #[cfg(target_arch = "wasm32")]
         {
-            return super::parse_json(crate::guest::bindings::cyrup::ext::ext_tools::get_active_tools())
-                .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-                .unwrap_or_default();
+            return super::parse_json(
+                crate::guest::bindings::cyrup::ext::ext_tools::get_active_tools(),
+            )
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
         }
         #[cfg(not(target_arch = "wasm32"))]
         Vec::new()
@@ -31,7 +37,9 @@ impl Ctx {
     pub fn all_tools(&self) -> Value {
         #[cfg(target_arch = "wasm32")]
         {
-            return super::parse_json(crate::guest::bindings::cyrup::ext::ext_tools::get_all_tools());
+            return super::parse_json(
+                crate::guest::bindings::cyrup::ext::ext_tools::get_all_tools(),
+            );
         }
         #[cfg(not(target_arch = "wasm32"))]
         Value::Array(vec![])

@@ -49,7 +49,10 @@ impl ToolCallSummary {
 pub fn format_tool_call(name: &str, args: &serde_json::Value, expanded: bool) -> String {
     match name {
         "bash" => {
-            let command = args.get("command").and_then(serde_json::Value::as_str).unwrap_or("");
+            let command = args
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
             let max_length = if expanded { 240 } else { 60 };
             format!("$ {}", truncate_with_ellipsis(command, max_length))
         }
@@ -180,8 +183,17 @@ pub fn extract_tool_args_preview(args: &serde_json::Value) -> String {
     // pi `previewKeys` (`utils.ts:559`), in pi's own order. Note pi's guard here is
     // `args[key] && typeof args[key] === "string"` — non-EMPTY, but NOT trim-checked, so a
     // whitespace-only value wins this rung where it would have lost the named rungs above.
-    for key in ["command", "path", "file_path", "pattern", "query", "url", "task", "describe", "search"]
-    {
+    for key in [
+        "command",
+        "path",
+        "file_path",
+        "pattern",
+        "query",
+        "url",
+        "task",
+        "describe",
+        "search",
+    ] {
         if let Some(value) = map.get(key).and_then(serde_json::Value::as_str)
             && !value.is_empty()
         {

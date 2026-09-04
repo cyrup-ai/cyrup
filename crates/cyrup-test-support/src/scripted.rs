@@ -12,11 +12,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cyrup_core::{EventStream, ProviderId};
-use cyrup_provider::faux::{faux_event_stream, usage_estimate, ChunkConfig};
+use cyrup_provider::faux::{ChunkConfig, faux_event_stream, usage_estimate};
 use cyrup_provider::{Context, Model, Provider, StreamEvent, StreamOptions};
 use futures::StreamExt;
 
-use crate::response::{build_assistant_message, build_usage, faux_model, FauxResponse};
+use crate::response::{FauxResponse, build_assistant_message, build_usage, faux_model};
 
 /// Inspectable state of a scripted stream fn (Pi `FauxStreamFnState`, test-harness.ts:266-271).
 #[derive(Clone, Debug, Default)]
@@ -83,7 +83,11 @@ impl ScriptedProvider {
     }
 
     fn build(responses: Vec<FauxResponse>, models: Vec<Model>, queue_mode: bool) -> Self {
-        let models = if models.is_empty() { vec![faux_model()] } else { models };
+        let models = if models.is_empty() {
+            vec![faux_model()]
+        } else {
+            models
+        };
         let id = models
             .first()
             .map(|m| m.provider.clone())
@@ -169,9 +173,18 @@ impl Provider for ScriptedProvider {
                 }
             } else {
                 // Cycling flavour: wrap around (Pi `index = callCount % responses.length`).
-                let index =
-                    if responses.is_empty() { 0 } else { state.call_count % responses.len() };
-                (responses.get(index).cloned().unwrap_or_else(|| FauxResponse::text("ok")), false)
+                let index = if responses.is_empty() {
+                    0
+                } else {
+                    state.call_count % responses.len()
+                };
+                (
+                    responses
+                        .get(index)
+                        .cloned()
+                        .unwrap_or_else(|| FauxResponse::text("ok")),
+                    false,
+                )
             };
             state.call_count += 1;
             resolved
@@ -184,8 +197,7 @@ impl Provider for ScriptedProvider {
             // promptCache)`, NOT the fixed `buildUsage` defaults. So the stamped usage is
             // output:0 (empty content ⇒ `assistantContentToText([]) === ""`), input = the serialized
             // -context estimate, and cacheRead/cacheWrite per the session prompt-cache (faux.ts:213-251).
-            message.usage =
-                usage_estimate(&self.prompt_cache, &message.content, context, options);
+            message.usage = usage_estimate(&self.prompt_cache, &message.content, context, options);
         } else {
             // Normal scripted step: Pi `buildUsage` fixed defaults (input:100/output:50), NOT the
             // prompt-cache estimator (test-harness.ts:159).

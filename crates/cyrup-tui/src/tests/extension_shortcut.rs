@@ -5,7 +5,12 @@
 //! an [`AppAction::ExtensionShortcut`] carrying the key-id, which the run loop hands to
 //! `ExtensionHost::run_shortcut` → `LiveExtension::execute_shortcut`. The guest-execution tail is
 //! wasm-toolchain-gated (ledger 09 #13); the dispatch decision is closed and asserted here.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::{App, AppAction, InputEvent, UiTheme};
@@ -98,5 +103,8 @@ fn hotkeys_renders_the_registered_shortcut_description() {
     );
     // `description ?? extensionPath` — with no description the id is the fallback, which is what
     // cyrup has in place of pi's `extensionPath`.
-    assert!(body.contains("alt+k"), "an undescribed shortcut still lists, labelled by its id: {body}");
+    assert!(
+        body.contains("alt+k"),
+        "an undescribed shortcut still lists, labelled by its id: {body}"
+    );
 }

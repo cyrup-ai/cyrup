@@ -17,7 +17,12 @@
 //! because it MUTATED process env — `unsafe { std::env::set_var("CYRUP_SUBAGENT_CHILD", "1") }` —
 //! and [`super`]'s doc barred that from this directory. It no longer mutates anything: the anchor is
 //! a THREAD-LOCAL [`crate::envx`] pin, so the module is an ordinary unit-test module.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -85,8 +90,11 @@ async fn forwarded_allow_always_persists_a_child_session_rule_body() {
     let agent_dir = tempfile::tempdir().expect("tempdir");
     // Default is ASK; make bash explicitly ASK so both calls hit the forwarding channel unless a
     // session rule already promotes them to allow.
-    std::fs::write(agent_dir.path().join("cyrup-permissions.jsonc"), r#"{ "bash": { "*": "ask" } }"#)
-        .unwrap();
+    std::fs::write(
+        agent_dir.path().join("cyrup-permissions.jsonc"),
+        r#"{ "bash": { "*": "ask" } }"#,
+    )
+    .unwrap();
 
     let paths = ManagerPaths {
         global_config_path: agent_dir.path().join("cyrup-permissions.jsonc"),
@@ -101,7 +109,9 @@ async fn forwarded_allow_always_persists_a_child_session_rule_body() {
     let ext = PermissionSystemExtension::from_parts(
         paths,
         ExtensionConfig::default(),
-        Arc::new(AlwaysChannel { invocations: invocations.clone() }),
+        Arc::new(AlwaysChannel {
+            invocations: invocations.clone(),
+        }),
     );
     ext.set_host_services(Arc::new(RegistryServices));
 
@@ -114,13 +124,23 @@ async fn forwarded_allow_always_persists_a_child_session_rule_body() {
 
     // FIRST identical bash call: forwards (channel invoked once) and persists an always session rule.
     let first = ext.on_event(&bash_call("call-1", "echo hi"), &ctx).await;
-    assert!(matches!(first, HookOutcome::Noop), "the forwarded Allow-Always must let the call proceed");
-    assert_eq!(invocations.load(Ordering::SeqCst), 1, "the first call forwarded exactly once");
+    assert!(
+        matches!(first, HookOutcome::Noop),
+        "the forwarded Allow-Always must let the call proceed"
+    );
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        1,
+        "the first call forwarded exactly once"
+    );
 
     // SECOND identical bash call, DIFFERENT tool_call_id ⇒ a dedup MISS. It must auto-ALLOW via the
     // persisted session rule, WITHOUT a second forward.
     let second = ext.on_event(&bash_call("call-2", "echo hi"), &ctx).await;
-    assert!(matches!(second, HookOutcome::Noop), "the second identical call must auto-allow");
+    assert!(
+        matches!(second, HookOutcome::Noop),
+        "the second identical call must auto-allow"
+    );
     assert_eq!(
         invocations.load(Ordering::SeqCst),
         1,

@@ -32,7 +32,10 @@ async fn resources_discover_reloads_config_and_invalidates_skill_cache_body() {
     init_ext(&ext).await;
 
     // The constructor auto-materializes the default config (yolo_mode: false).
-    assert!(!guard(&ext.config).yolo_mode, "default config starts with yolo off");
+    assert!(
+        !guard(&ext.config).yolo_mode,
+        "default config starts with yolo off"
+    );
 
     // Seed the agent-start skill cache as `before_agent_start` would.
     *guard(&ext.active_skill_entries) = vec![SkillPromptEntry {
@@ -44,18 +47,26 @@ async fn resources_discover_reloads_config_and_invalidates_skill_cache_body() {
 
     // Flip yoloMode on disk directly (simulating an external edit to config.json betwen the
     // extension's construction and a later `resources_discover` reload).
-    write_file(&agent_dir.join(CONFIG_DIR).join(CONFIG_FILE), r#"{ "yoloMode": true }"#);
+    write_file(
+        &agent_dir.join(CONFIG_DIR).join(CONFIG_FILE),
+        r#"{ "yoloMode": true }"#,
+    );
 
-    let outcome = ext.on_event(
-        &HostEvent::ResourcesDiscover {
-            cwd: agent_dir.display().to_string(),
-            reason: "reload".to_string(),
-        },
-        &event_ctx(agent_dir),
-    ).await;
+    let outcome = ext
+        .on_event(
+            &HostEvent::ResourcesDiscover {
+                cwd: agent_dir.display().to_string(),
+                reason: "reload".to_string(),
+            },
+            &event_ctx(agent_dir),
+        )
+        .await;
     assert!(matches!(outcome, HookOutcome::Noop));
 
-    assert!(guard(&ext.config).yolo_mode, "resources_discover reload must re-read config.json");
+    assert!(
+        guard(&ext.config).yolo_mode,
+        "resources_discover reload must re-read config.json"
+    );
     assert!(
         guard(&ext.active_skill_entries).is_empty(),
         "resources_discover reload must invalidate the agent-start skill cache"
@@ -72,26 +83,41 @@ async fn session_start_rebuilds_manager_from_current_session_cwd() {
     let dir = tempfile::tempdir().unwrap();
     let agent_dir = dir.path().to_path_buf();
     // Global policy: bash is allowed everywhere by default.
-    write_file(&agent_dir.join(POLICY_FILE), r#"{ "bash": { "*": "allow" } }"#);
+    write_file(
+        &agent_dir.join(POLICY_FILE),
+        r#"{ "bash": { "*": "allow" } }"#,
+    );
 
     // The extension is CONSTRUCTED against `cwd1`, which has no project-level override.
     let cwd1 = dir.path().join("cwd1");
     std::fs::create_dir_all(&cwd1).unwrap();
     let ext = PermissionSystemExtension::new(agent_dir.clone(), cwd1);
     init_ext(&ext).await;
-    ext.set_host_services(Arc::new(FakeRegistry { names: vec!["bash".to_string()] }));
+    ext.set_host_services(Arc::new(FakeRegistry {
+        names: vec!["bash".to_string()],
+    }));
 
     // A NEW session starts under `cwd2`, which HAS a project-scoped override denying bash.
     let cwd2 = dir.path().join("cwd2");
     std::fs::create_dir_all(&cwd2).unwrap();
     write_file(
-        &PROJECT_AGENT_SUBDIR.iter().fold(cwd2.clone(), |acc, seg| acc.join(seg)).join(POLICY_FILE),
+        &PROJECT_AGENT_SUBDIR
+            .iter()
+            .fold(cwd2.clone(), |acc, seg| acc.join(seg))
+            .join(POLICY_FILE),
         r#"{ "bash": { "*": "deny" } }"#,
     );
 
     let start_ctx = event_ctx(cwd2);
-    let start_outcome =
-        ext.on_event(&HostEvent::SessionStart { reason: "startup".to_string(), previous_session_file: None }, &start_ctx).await;
+    let start_outcome = ext
+        .on_event(
+            &HostEvent::SessionStart {
+                reason: "startup".to_string(),
+                previous_session_file: None,
+            },
+            &start_ctx,
+        )
+        .await;
     assert!(matches!(start_outcome, HookOutcome::Noop));
 
     // A bash call now, under `cwd2`, must be DENIED by the project override the rebuilt manager
@@ -124,9 +150,18 @@ fn before_agent_start_re_reads_config_json() {
         init_ext(&ext).await;
         let ctx = event_ctx(agent_dir.clone());
         let _ = ext
-            .on_event(&HostEvent::SessionStart { reason: "startup".to_string(), previous_session_file: None }, &ctx)
+            .on_event(
+                &HostEvent::SessionStart {
+                    reason: "startup".to_string(),
+                    previous_session_file: None,
+                },
+                &ctx,
+            )
             .await;
-        assert!(!ext.yolo_mode(), "control: the session started with yolo off");
+        assert!(
+            !ext.yolo_mode(),
+            "control: the session started with yolo off"
+        );
 
         write_file(&config_path, r#"{"yoloMode": true}"#);
         let _ = ext.on_event(&before_agent_start("SYSTEM"), &ctx).await;
@@ -156,7 +191,13 @@ fn a_resources_discover_reload_re_syncs_the_yolo_pill() {
         ext.set_host_services(host.clone());
         let ctx = event_ctx(agent_dir.clone());
         let _ = ext
-            .on_event(&HostEvent::SessionStart { reason: "startup".to_string(), previous_session_file: None }, &ctx)
+            .on_event(
+                &HostEvent::SessionStart {
+                    reason: "startup".to_string(),
+                    previous_session_file: None,
+                },
+                &ctx,
+            )
             .await;
         assert_eq!(
             guard(&host.statuses).last().cloned(),
@@ -190,7 +231,10 @@ fn reload_surfaces_write_lifecycle_reload_debug_entries() {
     block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let agent_dir = dir.path().to_path_buf();
-        write_file(&agent_dir.join(CONFIG_DIR).join(CONFIG_FILE), r#"{"debug": true}"#);
+        write_file(
+            &agent_dir.join(CONFIG_DIR).join(CONFIG_FILE),
+            r#"{"debug": true}"#,
+        );
 
         let ext = PermissionSystemExtension::new(agent_dir.clone(), agent_dir.clone());
         init_ext(&ext).await;
@@ -198,12 +242,24 @@ fn reload_surfaces_write_lifecycle_reload_debug_entries() {
 
         // A STARTUP session writes no lifecycle line (pi gates on `event.reason === "reload"`).
         let _ = ext
-            .on_event(&HostEvent::SessionStart { reason: "startup".to_string(), previous_session_file: None }, &ctx)
+            .on_event(
+                &HostEvent::SessionStart {
+                    reason: "startup".to_string(),
+                    previous_session_file: None,
+                },
+                &ctx,
+            )
             .await;
         assert_eq!(lifecycle_reload_entries(&agent_dir).len(), 0);
 
         let _ = ext
-            .on_event(&HostEvent::SessionStart { reason: "reload".to_string(), previous_session_file: None }, &ctx)
+            .on_event(
+                &HostEvent::SessionStart {
+                    reason: "reload".to_string(),
+                    previous_session_file: None,
+                },
+                &ctx,
+            )
             .await;
         let _ = ext
             .on_event(
@@ -221,7 +277,10 @@ fn reload_surfaces_write_lifecycle_reload_debug_entries() {
             .collect();
         assert_eq!(
             triggers,
-            vec!["session_start".to_string(), "resources_discover".to_string()],
+            vec![
+                "session_start".to_string(),
+                "resources_discover".to_string()
+            ],
             "both reload surfaces must name themselves in the trail"
         );
     });
@@ -229,9 +288,7 @@ fn reload_surfaces_write_lifecycle_reload_debug_entries() {
 
 /// Read every `lifecycle.reload` record out of the debug JSONL this extension writes.
 fn lifecycle_reload_entries(agent_dir: &Path) -> Vec<Value> {
-    let path = crate::logging::debug_path(
-        &PermissionSystemExtension::logs_dir_for(agent_dir),
-    );
+    let path = crate::logging::debug_path(&PermissionSystemExtension::logs_dir_for(agent_dir));
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
@@ -271,21 +328,33 @@ async fn malformed_policy_and_config_files_notify_the_host_body() {
     ext.set_host_services(host.clone());
 
     let ctx = event_ctx(agent_dir.clone());
-    let start = ext.on_event(&HostEvent::SessionStart { reason: "startup".to_string(), previous_session_file: None }, &ctx).await;
+    let start = ext
+        .on_event(
+            &HostEvent::SessionStart {
+                reason: "startup".to_string(),
+                previous_session_file: None,
+            },
+            &ctx,
+        )
+        .await;
     assert!(matches!(start, HookOutcome::Noop));
     // A real tool call is what forces the policy layers to be read.
     let _ = ext.on_event(&bash_call("call-1"), &ctx).await;
 
     let warnings = host.warnings();
     assert!(
-        warnings.iter().any(|w| w.starts_with("Failed to parse permission config at")
-            && w.contains(POLICY_FILE)
-            && w.ends_with("using ask fallback.")),
+        warnings
+            .iter()
+            .any(|w| w.starts_with("Failed to parse permission config at")
+                && w.contains(POLICY_FILE)
+                && w.ends_with("using ask fallback.")),
         "the unparseable policy file must reach the host as a warning; got {warnings:?}"
     );
     assert!(
-        warnings.iter().any(|w| w.starts_with("Failed to parse permission-system config at")
-            && w.ends_with("using default extension config.")),
+        warnings.iter().any(
+            |w| w.starts_with("Failed to parse permission-system config at")
+                && w.ends_with("using default extension config.")
+        ),
         "the unparseable extension config must reach the host as a warning; got {warnings:?}"
     );
 
@@ -294,7 +363,11 @@ async fn malformed_policy_and_config_files_notify_the_host_body() {
     // tool-call cycle must not duplicate anything already shown.
     let before = warnings.len();
     let _ = ext.on_event(&bash_call("call-2"), &ctx).await;
-    assert_eq!(host.warnings().len(), before, "warnings must be deduped within a session");
+    assert_eq!(
+        host.warnings().len(),
+        before,
+        "warnings must be deduped within a session"
+    );
 
     // ...and a NEW session re-arms them (pi `resetShownWarnings`, `index.ts:1819`), so a file
     // that is still broken is reported again rather than silently suppressed forever.
@@ -309,17 +382,29 @@ async fn malformed_policy_and_config_files_notify_the_host_body() {
     // likewise reports a still-broken `config.json` once per PROCESS. The sibling test below
     // covers the config channel through the clean-load-then-corrupt sequence that legitimately
     // clears that memo.
-    let _ = ext.on_event(&HostEvent::SessionStart { reason: "startup".to_string(), previous_session_file: None }, &ctx).await;
+    let _ = ext
+        .on_event(
+            &HostEvent::SessionStart {
+                reason: "startup".to_string(),
+                previous_session_file: None,
+            },
+            &ctx,
+        )
+        .await;
     let _ = ext.on_event(&bash_call("call-3"), &ctx).await;
     let after = host.warnings();
     let delta = after.get(before..).unwrap_or_default();
     assert!(
-        delta.iter().any(|w| w.starts_with("Failed to parse permission config at")
-            && w.contains(POLICY_FILE)),
+        delta
+            .iter()
+            .any(|w| w.starts_with("Failed to parse permission config at")
+                && w.contains(POLICY_FILE)),
         "a new session must re-report the still-broken POLICY file; delta was {delta:?}"
     );
     assert!(
-        !delta.iter().any(|w| w.starts_with("Failed to parse permission-system config at")),
+        !delta
+            .iter()
+            .any(|w| w.starts_with("Failed to parse permission-system config at")),
         "the CONFIG warning is memoized per-process by `last_config_warning` (pi              `index.ts:1370-1374`); a re-report here would mean that memo stopped working"
     );
 }
@@ -349,16 +434,35 @@ async fn a_config_warning_re_arms_after_a_clean_load_clears_the_memo_body() {
     let host = Arc::new(NotifyRecorder::new());
     ext.set_host_services(host.clone());
     let ctx = event_ctx(agent_dir.clone());
-    let _ = ext.on_event(&HostEvent::SessionStart { reason: "startup".to_string(), previous_session_file: None }, &ctx).await;
+    let _ = ext
+        .on_event(
+            &HostEvent::SessionStart {
+                reason: "startup".to_string(),
+                previous_session_file: None,
+            },
+            &ctx,
+        )
+        .await;
     assert!(
-        !host.warnings().iter().any(|w| w.starts_with("Failed to parse permission-system config at")),
+        !host
+            .warnings()
+            .iter()
+            .any(|w| w.starts_with("Failed to parse permission-system config at")),
         "a valid config must not warn; got {:?}",
         host.warnings()
     );
 
     // Now corrupt it and reload. The memo is `None`, so the warning is NEW and must surface.
     write_file(&config_path, "{ not json");
-    let _ = ext.on_event(&HostEvent::SessionStart { reason: "startup".to_string(), previous_session_file: None }, &ctx).await;
+    let _ = ext
+        .on_event(
+            &HostEvent::SessionStart {
+                reason: "startup".to_string(),
+                previous_session_file: None,
+            },
+            &ctx,
+        )
+        .await;
     assert!(
         host.warnings().iter().any(|w| w
             .starts_with("Failed to parse permission-system config at")

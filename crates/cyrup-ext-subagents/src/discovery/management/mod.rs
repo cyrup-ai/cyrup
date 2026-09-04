@@ -154,10 +154,16 @@ pub struct ManagementOutcome {
 
 impl ManagementOutcome {
     fn ok(text: impl Into<String>) -> Self {
-        Self { text: text.into(), is_error: false }
+        Self {
+            text: text.into(),
+            is_error: false,
+        }
     }
     fn err(text: impl Into<String>) -> Self {
-        Self { text: text.into(), is_error: true }
+        Self {
+            text: text.into(),
+            is_error: true,
+        }
     }
 }
 
@@ -175,8 +181,9 @@ pub const MANAGEMENT_ACTIONS: [&str; 10] = [
 /// SUBA-005 additions (`eject` writes an agent file, `disable`/`enable`/`reset` write
 /// `settings.json`) are mutations exactly as much as `create`/`update`/`delete` are, so they join
 /// the same denylist rather than sneaking through as "just management".
-pub const MUTATING_MANAGEMENT_ACTIONS: [&str; 7] =
-    ["create", "update", "delete", "eject", "disable", "enable", "reset"];
+pub const MUTATING_MANAGEMENT_ACTIONS: [&str; 7] = [
+    "create", "update", "delete", "eject", "disable", "enable", "reset",
+];
 
 /// pi's `handleManagementAction` (`agent-management.ts:1242-1256`): dispatch a management `action` to
 /// its handler. Discovery is re-run per call inside each handler (R-SA-019), never cached across a
@@ -215,7 +222,7 @@ mod tests {
 
     use std::path::{Path, PathBuf};
 
-    use super::agent_crud::{create_agent, AgentFields};
+    use super::agent_crud::{AgentFields, create_agent};
     use super::*;
     use crate::discovery::types::AgentSource;
 
@@ -255,7 +262,9 @@ mod tests {
 
     /// Two user agents that both name the same skill, so the skill clears the default
     /// `minReferences: 2`. Returns the request-side availability list that makes it recommendable.
-    fn seed_two_agents_sharing_a_skill(cfg: &AgentDiscoveryConfig) -> Vec<crate::discovery::skills::AvailableSkill> {
+    fn seed_two_agents_sharing_a_skill(
+        cfg: &AgentDiscoveryConfig,
+    ) -> Vec<crate::discovery::skills::AvailableSkill> {
         write_agent_md(
             &cfg.user_agent_dirs[0],
             "auditor-one.md",
@@ -286,7 +295,9 @@ mod tests {
             setting: None, // pi's `undefined` — defaults on
             available_skills: &available,
         });
-        let out = handle_management_action(&cfg, "list", &req).await.expect("list ok");
+        let out = handle_management_action(&cfg, "list", &req)
+            .await
+            .expect("list ok");
         assert!(!out.is_error, "{}", out.text);
         let t = out.text;
 
@@ -303,8 +314,13 @@ mod tests {
             "the guardrails footer must ship with the block:\n{t}"
         );
         let chains_at = t.find("Chains:").unwrap_or(usize::MAX);
-        let block_at = t.find("Proactive skill subagent suggestions:").unwrap_or(usize::MIN);
-        assert!(chains_at < block_at, "the block must follow `Chains:`:\n{t}");
+        let block_at = t
+            .find("Proactive skill subagent suggestions:")
+            .unwrap_or(usize::MIN);
+        assert!(
+            chains_at < block_at,
+            "the block must follow `Chains:`:\n{t}"
+        );
         assert!(
             t.contains("\n\nProactive skill subagent suggestions:"),
             "upstream prepends one blank line to the block:\n{t}"
@@ -326,7 +342,9 @@ mod tests {
             setting: Some(&disabled),
             available_skills: &available,
         });
-        let out = handle_management_action(&cfg, "list", &req).await.expect("list ok");
+        let out = handle_management_action(&cfg, "list", &req)
+            .await
+            .expect("list ok");
         assert!(
             !out.text.contains("Proactive skill subagent suggestions:"),
             "an explicit `false` must suppress the block:\n{}",
@@ -343,7 +361,9 @@ mod tests {
         let cfg = mgmt_cfg(tmp.path());
         let _available = seed_two_agents_sharing_a_skill(&cfg);
 
-        let out = handle_management_action(&cfg, "list", &mreq(None, None, None, None)).await.expect("list ok");
+        let out = handle_management_action(&cfg, "list", &mreq(None, None, None, None))
+            .await
+            .expect("list ok");
         assert!(
             !out.text.contains("Proactive skill subagent suggestions:"),
             "{}",
@@ -356,7 +376,9 @@ mod tests {
             setting: None,
             available_skills: &empty,
         });
-        let out = handle_management_action(&cfg, "list", &req).await.expect("list ok");
+        let out = handle_management_action(&cfg, "list", &req)
+            .await
+            .expect("list ok");
         assert!(
             !out.text.contains("Proactive skill subagent suggestions:"),
             "{}",
@@ -384,9 +406,12 @@ mod tests {
             setting: None,
             available_skills: &empty,
         });
-        let with_scan = handle_management_action(&cfg, "list", &asked).await.expect("list ok");
-        let without_scan =
-            handle_management_action(&cfg, "list", &mreq(None, None, None, None)).await.expect("list ok");
+        let with_scan = handle_management_action(&cfg, "list", &asked)
+            .await
+            .expect("list ok");
+        let without_scan = handle_management_action(&cfg, "list", &mreq(None, None, None, None))
+            .await
+            .expect("list ok");
 
         assert_eq!(
             with_scan.text, without_scan.text,
@@ -407,7 +432,9 @@ mod tests {
             "{ this is not json",
         )
         .expect("write broken chain");
-        let with_diags = handle_management_action(&cfg, "list", &asked).await.expect("list ok");
+        let with_diags = handle_management_action(&cfg, "list", &asked)
+            .await
+            .expect("list ok");
         assert!(
             with_diags.text.contains("\n\nChain diagnostics:"),
             "the diagnostics block keeps its single leading blank line:\n{}",
@@ -479,7 +506,9 @@ mod tests {
             setting: None, // pi's `undefined` — `minReferences` defaults to 2
             available_skills: &available,
         });
-        let out = handle_management_action(&cfg, "list", &req).await.expect("list ok");
+        let out = handle_management_action(&cfg, "list", &req)
+            .await
+            .expect("list ok");
         assert!(!out.is_error, "{}", out.text);
         let t = out.text;
 
@@ -548,7 +577,11 @@ mod tests {
             resolve_proactive_skill_subagents_config,
         };
 
-        for (min, max) in [(Some(0), Some(0)), (Some(-1), Some(-7)), (Some(-100), Some(0))] {
+        for (min, max) in [
+            (Some(0), Some(0)),
+            (Some(-1), Some(-7)),
+            (Some(-100), Some(0)),
+        ] {
             let setting = ProactiveSkillSubagentsSetting::Config(ProactiveSkillSubagentsConfig {
                 enabled: None,
                 min_references: min,
@@ -595,14 +628,28 @@ mod tests {
     async fn list_includes_builtins_and_discovered_with_pi_shape() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = mgmt_cfg(tmp.path());
-        create_agent(&cfg.user_agent_dirs[0], AgentSource::User, "my-user-agent", "A user agent", &AgentFields::default())
-            .expect("no error")
-            .expect("not skipped");
-        create_agent(&cfg.project_agent_dirs[0], AgentSource::Project, "my-project-agent", "A project agent", &AgentFields::default())
-            .expect("no error")
-            .expect("not skipped");
+        create_agent(
+            &cfg.user_agent_dirs[0],
+            AgentSource::User,
+            "my-user-agent",
+            "A user agent",
+            &AgentFields::default(),
+        )
+        .expect("no error")
+        .expect("not skipped");
+        create_agent(
+            &cfg.project_agent_dirs[0],
+            AgentSource::Project,
+            "my-project-agent",
+            "A project agent",
+            &AgentFields::default(),
+        )
+        .expect("no error")
+        .expect("not skipped");
 
-        let out = handle_management_action(&cfg, "list", &mreq(None, None, None, None)).await.expect("list ok");
+        let out = handle_management_action(&cfg, "list", &mreq(None, None, None, None))
+            .await
+            .expect("list ok");
         assert!(!out.is_error);
         let t = out.text;
         // pi list header shape (`agent-management.ts:553-560`).
@@ -613,7 +660,10 @@ mod tests {
         assert!(t.contains("- scout (builtin"), "{t}");
         // Discovered user/project agents render with the exact pi line shape.
         assert!(t.contains("- my-user-agent (user): A user agent"), "{t}");
-        assert!(t.contains("- my-project-agent (project): A project agent"), "{t}");
+        assert!(
+            t.contains("- my-project-agent (project): A project agent"),
+            "{t}"
+        );
         // No chains authored -> the empty-chains sentinel.
         assert!(t.contains("Chains:\n- (none)"), "{t}");
         // Agents section precedes the chains section.
@@ -626,15 +676,34 @@ mod tests {
     async fn list_scope_filter_narrows_to_project_but_keeps_builtins() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = mgmt_cfg(tmp.path());
-        create_agent(&cfg.user_agent_dirs[0], AgentSource::User, "my-user-agent", "A user agent", &AgentFields::default())
-            .expect("ok").expect("not skipped");
-        create_agent(&cfg.project_agent_dirs[0], AgentSource::Project, "my-project-agent", "A project agent", &AgentFields::default())
-            .expect("ok").expect("not skipped");
+        create_agent(
+            &cfg.user_agent_dirs[0],
+            AgentSource::User,
+            "my-user-agent",
+            "A user agent",
+            &AgentFields::default(),
+        )
+        .expect("ok")
+        .expect("not skipped");
+        create_agent(
+            &cfg.project_agent_dirs[0],
+            AgentSource::Project,
+            "my-project-agent",
+            "A project agent",
+            &AgentFields::default(),
+        )
+        .expect("ok")
+        .expect("not skipped");
 
-        let out = handle_management_action(&cfg, "list", &mreq(None, None, Some("project"), None)).await.expect("list ok");
+        let out = handle_management_action(&cfg, "list", &mreq(None, None, Some("project"), None))
+            .await
+            .expect("list ok");
         let t = out.text;
         assert!(t.contains("- my-project-agent (project)"), "{t}");
-        assert!(!t.contains("- my-user-agent (user)"), "project scope must hide user agents: {t}");
+        assert!(
+            !t.contains("- my-user-agent (user)"),
+            "project scope must hide user agents: {t}"
+        );
         // Builtins remain visible under any named scope (they are orthogonal to the user/project axis).
         assert!(t.contains("- reviewer (builtin"), "{t}");
     }
@@ -650,32 +719,78 @@ mod tests {
             "systemPrompt": "Inspect the tree.",
             "tools": "read, grep, ls"
         });
-        let created = handle_management_action(&cfg, "create", &mreq(None, None, None, Some(&create_cfg))).await.expect("create ok");
+        let created =
+            handle_management_action(&cfg, "create", &mreq(None, None, None, Some(&create_cfg)))
+                .await
+                .expect("create ok");
         assert!(!created.is_error, "{}", created.text);
-        assert!(created.text.starts_with("Created agent 'recon-scout' at "), "{}", created.text);
+        assert!(
+            created.text.starts_with("Created agent 'recon-scout' at "),
+            "{}",
+            created.text
+        );
         let file = cfg.user_agent_dirs[0].join("recon-scout.md");
         assert!(file.exists());
 
-        let got = handle_management_action(&cfg, "get", &mreq(Some("recon-scout"), None, None, None)).await.expect("get ok");
+        let got =
+            handle_management_action(&cfg, "get", &mreq(Some("recon-scout"), None, None, None))
+                .await
+                .expect("get ok");
         assert!(!got.is_error, "{}", got.text);
-        assert!(got.text.contains("Agent: recon-scout (user)"), "{}", got.text);
+        assert!(
+            got.text.contains("Agent: recon-scout (user)"),
+            "{}",
+            got.text
+        );
         assert!(got.text.contains("Description: Fast recon"), "{}", got.text);
         assert!(got.text.contains("Tools: read, grep, ls"), "{}", got.text);
-        assert!(got.text.contains("System prompt mode: replace"), "{}", got.text);
-        assert!(got.text.contains("System Prompt:\nInspect the tree."), "{}", got.text);
+        assert!(
+            got.text.contains("System prompt mode: replace"),
+            "{}",
+            got.text
+        );
+        assert!(
+            got.text.contains("System Prompt:\nInspect the tree."),
+            "{}",
+            got.text
+        );
 
         let update_cfg = serde_json::json!({ "description": "Faster recon" });
-        let updated = handle_management_action(&cfg, "update", &mreq(Some("recon-scout"), None, None, Some(&update_cfg))).await.expect("update ok");
+        let updated = handle_management_action(
+            &cfg,
+            "update",
+            &mreq(Some("recon-scout"), None, None, Some(&update_cfg)),
+        )
+        .await
+        .expect("update ok");
         assert!(!updated.is_error, "{}", updated.text);
-        assert!(updated.text.starts_with("Updated agent 'recon-scout' at "), "{}", updated.text);
-        let got2 = handle_management_action(&cfg, "get", &mreq(Some("recon-scout"), None, None, None)).await.expect("get ok");
-        assert!(got2.text.contains("Description: Faster recon"), "{}", got2.text);
+        assert!(
+            updated.text.starts_with("Updated agent 'recon-scout' at "),
+            "{}",
+            updated.text
+        );
+        let got2 =
+            handle_management_action(&cfg, "get", &mreq(Some("recon-scout"), None, None, None))
+                .await
+                .expect("get ok");
+        assert!(
+            got2.text.contains("Description: Faster recon"),
+            "{}",
+            got2.text
+        );
         // The un-touched tools survive the merge-update (field-level patch, not a full replace).
         assert!(got2.text.contains("Tools: read, grep, ls"), "{}", got2.text);
 
-        let deleted = handle_management_action(&cfg, "delete", &mreq(Some("recon-scout"), None, None, None)).await.expect("delete ok");
+        let deleted =
+            handle_management_action(&cfg, "delete", &mreq(Some("recon-scout"), None, None, None))
+                .await
+                .expect("delete ok");
         assert!(!deleted.is_error, "{}", deleted.text);
-        assert!(deleted.text.starts_with("Deleted agent 'recon-scout' at "), "{}", deleted.text);
+        assert!(
+            deleted.text.starts_with("Deleted agent 'recon-scout' at "),
+            "{}",
+            deleted.text
+        );
         assert!(!file.exists());
     }
 
@@ -684,17 +799,30 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = mgmt_cfg(tmp.path());
         let create_cfg = serde_json::json!({ "name": "proj-only", "description": "Project agent", "scope": "project" });
-        let created = handle_management_action(&cfg, "create", &mreq(None, None, None, Some(&create_cfg))).await.expect("create ok");
+        let created =
+            handle_management_action(&cfg, "create", &mreq(None, None, None, Some(&create_cfg)))
+                .await
+                .expect("create ok");
         assert!(!created.is_error, "{}", created.text);
         let file = cfg.project_agent_dirs[0].join("proj-only.md");
         assert!(file.exists());
 
         // Re-create is rejected (name already exists in the same scope).
-        let again = handle_management_action(&cfg, "create", &mreq(None, None, None, Some(&create_cfg))).await.expect("no discovery error");
+        let again =
+            handle_management_action(&cfg, "create", &mreq(None, None, None, Some(&create_cfg)))
+                .await
+                .expect("no discovery error");
         assert!(again.is_error);
-        assert!(again.text.contains("already exists in project scope"), "{}", again.text);
+        assert!(
+            again.text.contains("already exists in project scope"),
+            "{}",
+            again.text
+        );
 
-        let deleted = handle_management_action(&cfg, "delete", &mreq(Some("proj-only"), None, None, None)).await.expect("delete ok");
+        let deleted =
+            handle_management_action(&cfg, "delete", &mreq(Some("proj-only"), None, None, None))
+                .await
+                .expect("delete ok");
         assert!(!deleted.is_error, "{}", deleted.text);
         assert!(!file.exists());
     }
@@ -704,15 +832,38 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = mgmt_cfg(tmp.path());
         let upd_cfg = serde_json::json!({ "description": "hijack" });
-        let upd = handle_management_action(&cfg, "update", &mreq(Some("reviewer"), None, None, Some(&upd_cfg))).await.expect("no discovery error");
+        let upd = handle_management_action(
+            &cfg,
+            "update",
+            &mreq(Some("reviewer"), None, None, Some(&upd_cfg)),
+        )
+        .await
+        .expect("no discovery error");
         assert!(upd.is_error);
-        assert!(upd.text.contains("Agent 'reviewer' is read-only and cannot be modified"), "{}", upd.text);
+        assert!(
+            upd.text
+                .contains("Agent 'reviewer' is read-only and cannot be modified"),
+            "{}",
+            upd.text
+        );
 
-        let del = handle_management_action(&cfg, "delete", &mreq(Some("reviewer"), None, None, None)).await.expect("no discovery error");
+        let del =
+            handle_management_action(&cfg, "delete", &mreq(Some("reviewer"), None, None, None))
+                .await
+                .expect("no discovery error");
         assert!(del.is_error);
-        assert!(del.text.contains("Agent 'reviewer' is read-only and cannot be modified"), "{}", del.text);
+        assert!(
+            del.text
+                .contains("Agent 'reviewer' is read-only and cannot be modified"),
+            "{}",
+            del.text
+        );
         // The bundled builtin file was NOT removed.
-        assert!(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/agents/reviewer.md").exists());
+        assert!(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("resources/agents/reviewer.md")
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -720,9 +871,15 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = mgmt_cfg(tmp.path());
         let bad = serde_json::json!({ "name": "Scout", "package": "!!!", "description": "x", "scope": "project" });
-        let out = handle_management_action(&cfg, "create", &mreq(None, None, None, Some(&bad))).await.expect("no discovery error");
+        let out = handle_management_action(&cfg, "create", &mreq(None, None, None, Some(&bad)))
+            .await
+            .expect("no discovery error");
         assert!(out.is_error);
-        assert!(out.text.contains("config.package is invalid"), "{}", out.text);
+        assert!(
+            out.text.contains("config.package is invalid"),
+            "{}",
+            out.text
+        );
     }
 
     #[tokio::test]
@@ -730,9 +887,16 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = mgmt_cfg(tmp.path());
         let bad = serde_json::json!({ "name": "test-runner", "description": "Run tests", "scope": "project", "completionGuard": "false" });
-        let out = handle_management_action(&cfg, "create", &mreq(None, None, None, Some(&bad))).await.expect("no discovery error");
+        let out = handle_management_action(&cfg, "create", &mreq(None, None, None, Some(&bad)))
+            .await
+            .expect("no discovery error");
         assert!(out.is_error);
-        assert!(out.text.contains("config.completionGuard must be a boolean"), "{}", out.text);
+        assert!(
+            out.text
+                .contains("config.completionGuard must be a boolean"),
+            "{}",
+            out.text
+        );
     }
 
     #[tokio::test]
@@ -740,9 +904,15 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = mgmt_cfg(tmp.path());
         let bad = serde_json::json!("{\"name\":");
-        let out = handle_management_action(&cfg, "create", &mreq(None, None, None, Some(&bad))).await.expect("no discovery error");
+        let out = handle_management_action(&cfg, "create", &mreq(None, None, None, Some(&bad)))
+            .await
+            .expect("no discovery error");
         assert!(out.is_error);
-        assert!(out.text.contains("config must be valid JSON:"), "{}", out.text);
+        assert!(
+            out.text.contains("config must be valid JSON:"),
+            "{}",
+            out.text
+        );
     }
 
     #[tokio::test]
@@ -750,15 +920,37 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = mgmt_cfg(tmp.path());
         let c = serde_json::json!({ "name": "delegate", "description": "Delegate helper", "scope": "project" });
-        let created = handle_management_action(&cfg, "create", &mreq(None, None, None, Some(&c))).await.expect("create ok");
+        let created = handle_management_action(&cfg, "create", &mreq(None, None, None, Some(&c)))
+            .await
+            .expect("create ok");
         assert!(!created.is_error, "{}", created.text);
-        assert!(created.text.contains("shadows the builtin agent 'delegate'"), "{}", created.text);
+        assert!(
+            created
+                .text
+                .contains("shadows the builtin agent 'delegate'"),
+            "{}",
+            created.text
+        );
 
-        let got = handle_management_action(&cfg, "get", &mreq(Some("delegate"), None, None, None)).await.expect("get ok");
+        let got = handle_management_action(&cfg, "get", &mreq(Some("delegate"), None, None, None))
+            .await
+            .expect("get ok");
         // The custom project delegate wins over the builtin and shows delegate's name-sensitive defaults.
-        assert!(got.text.contains("Agent: delegate (project)"), "{}", got.text);
-        assert!(got.text.contains("System prompt mode: append"), "{}", got.text);
-        assert!(got.text.contains("Inherit project context: true"), "{}", got.text);
+        assert!(
+            got.text.contains("Agent: delegate (project)"),
+            "{}",
+            got.text
+        );
+        assert!(
+            got.text.contains("System prompt mode: append"),
+            "{}",
+            got.text
+        );
+        assert!(
+            got.text.contains("Inherit project context: true"),
+            "{}",
+            got.text
+        );
         assert!(got.text.contains("Inherit skills: false"), "{}", got.text);
     }
 
@@ -766,10 +958,20 @@ mod tests {
     async fn get_unknown_agent_is_a_not_found_error_listing_available() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = mgmt_cfg(tmp.path());
-        let out = handle_management_action(&cfg, "get", &mreq(Some("nope"), None, None, None)).await.expect("no discovery error");
+        let out = handle_management_action(&cfg, "get", &mreq(Some("nope"), None, None, None))
+            .await
+            .expect("no discovery error");
         assert!(out.is_error);
-        assert!(out.text.contains("Agent 'nope' not found. Available: "), "{}", out.text);
-        assert!(out.text.contains("reviewer"), "available list must include the builtins: {}", out.text);
+        assert!(
+            out.text.contains("Agent 'nope' not found. Available: "),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text.contains("reviewer"),
+            "available list must include the builtins: {}",
+            out.text
+        );
     }
 
     #[tokio::test]
@@ -785,18 +987,40 @@ mod tests {
                 { "agent": "reviewer", "task": "Review {previous}", "model": "fast" }
             ]
         });
-        let created = handle_management_action(&cfg, "create", &mreq(None, None, None, Some(&chain_cfg))).await.expect("create ok");
+        let created =
+            handle_management_action(&cfg, "create", &mreq(None, None, None, Some(&chain_cfg)))
+                .await
+                .expect("create ok");
         assert!(!created.is_error, "{}", created.text);
-        assert!(created.text.starts_with("Created chain 'review-flow' at "), "{}", created.text);
+        assert!(
+            created.text.starts_with("Created chain 'review-flow' at "),
+            "{}",
+            created.text
+        );
         // scout + reviewer are builtins, so no unknown-agent warning is appended.
         assert!(!created.text.contains("unknown agents"), "{}", created.text);
 
-        let listed = handle_management_action(&cfg, "list", &mreq(None, None, None, None)).await.expect("list ok");
-        assert!(listed.text.contains("- review-flow (project): Scout then review"), "{}", listed.text);
+        let listed = handle_management_action(&cfg, "list", &mreq(None, None, None, None))
+            .await
+            .expect("list ok");
+        assert!(
+            listed
+                .text
+                .contains("- review-flow (project): Scout then review"),
+            "{}",
+            listed.text
+        );
 
-        let got = handle_management_action(&cfg, "get", &mreq(None, Some("review-flow"), None, None)).await.expect("get ok");
+        let got =
+            handle_management_action(&cfg, "get", &mreq(None, Some("review-flow"), None, None))
+                .await
+                .expect("get ok");
         assert!(!got.is_error, "{}", got.text);
-        assert!(got.text.contains("Chain: review-flow (project)"), "{}", got.text);
+        assert!(
+            got.text.contains("Chain: review-flow (project)"),
+            "{}",
+            got.text
+        );
         assert!(got.text.contains("1. scout"), "{}", got.text);
         assert!(got.text.contains("   Task: Find targets"), "{}", got.text);
         assert!(got.text.contains("2. reviewer"), "{}", got.text);
@@ -813,24 +1037,47 @@ mod tests {
             "scope": "user",
             "steps": [ { "agent": "ghost-agent", "task": "boo" } ]
         });
-        let created = handle_management_action(&cfg, "create", &mreq(None, None, None, Some(&chain_cfg))).await.expect("create ok");
+        let created =
+            handle_management_action(&cfg, "create", &mreq(None, None, None, Some(&chain_cfg)))
+                .await
+                .expect("create ok");
         assert!(!created.is_error, "{}", created.text);
-        assert!(created.text.contains("Warning: chain steps reference unknown agents: ghost-agent."), "{}", created.text);
+        assert!(
+            created
+                .text
+                .contains("Warning: chain steps reference unknown agents: ghost-agent."),
+            "{}",
+            created.text
+        );
     }
 
     #[tokio::test]
     async fn models_lists_builtin_mapping_without_a_live_session_degrades_to_unavailable() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = mgmt_cfg(tmp.path());
-        let out = handle_management_action(&cfg, "models", &mreq(None, None, None, None)).await.expect("models ok");
+        let out = handle_management_action(&cfg, "models", &mreq(None, None, None, None))
+            .await
+            .expect("models ok");
         assert!(!out.is_error, "{}", out.text);
-        assert!(out.text.starts_with("Builtin subagent models"), "{}", out.text);
+        assert!(
+            out.text.starts_with("Builtin subagent models"),
+            "{}",
+            out.text
+        );
         for name in BUILTIN_AGENT_NAMES {
-            assert!(out.text.contains(name), "missing builtin {name}: {}", out.text);
+            assert!(
+                out.text.contains(name),
+                "missing builtin {name}: {}",
+                out.text
+            );
         }
         // (d) No live session model bound (`current_session_model: None`) ⇒ the genuine no-host
         // degrade, exactly as before this seam existed.
-        assert!(out.text.contains("Current session model:\n  (unavailable)"), "{}", out.text);
+        assert!(
+            out.text.contains("Current session model:\n  (unavailable)"),
+            "{}",
+            out.text
+        );
     }
 
     #[tokio::test]
@@ -849,10 +1096,13 @@ mod tests {
             current_session_model: Some(model),
             proactive_skills: None,
         };
-        let out = handle_management_action(&cfg, "models", &req).await.expect("models ok");
+        let out = handle_management_action(&cfg, "models", &req)
+            .await
+            .expect("models ok");
         assert!(!out.is_error, "{}", out.text);
         assert!(
-            out.text.contains(&format!("Current session model:\n  {model}")),
+            out.text
+                .contains(&format!("Current session model:\n  {model}")),
             "the live inherited model must render instead of (unavailable): {}",
             out.text
         );
@@ -867,9 +1117,19 @@ mod tests {
     async fn models_rejects_unknown_builtin_filter() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = mgmt_cfg(tmp.path());
-        let out = handle_management_action(&cfg, "models", &mreq(Some("not-a-builtin"), None, None, None)).await.expect("no discovery error");
+        let out = handle_management_action(
+            &cfg,
+            "models",
+            &mreq(Some("not-a-builtin"), None, None, None),
+        )
+        .await
+        .expect("no discovery error");
         assert!(out.is_error);
-        assert!(out.text.contains("Builtin agent 'not-a-builtin' not found"), "{}", out.text);
+        assert!(
+            out.text.contains("Builtin agent 'not-a-builtin' not found"),
+            "{}",
+            out.text
+        );
     }
 
     // -----------------------------------------------------------------------------------------
@@ -893,11 +1153,17 @@ mod tests {
         );
 
         let config = serde_json::json!({ "description": "Sees further" });
-        let out = handle_management_action(&cfg, "update", &mreq(Some("seer"), None, None, Some(&config)))
-            .await.expect("update ok");
+        let out = handle_management_action(
+            &cfg,
+            "update",
+            &mreq(Some("seer"), None, None, Some(&config)),
+        )
+        .await
+        .expect("update ok");
         assert!(!out.is_error, "{}", out.text);
 
-        let written = std::fs::read_to_string(cfg.user_agent_dirs[0].join("seer.md")).expect("read");
+        let written =
+            std::fs::read_to_string(cfg.user_agent_dirs[0].join("seer.md")).expect("read");
         assert!(
             written.contains("aliases: prophet"),
             "an update that never mentioned aliases must not drop them:\n{written}"
@@ -918,10 +1184,13 @@ mod tests {
 
         // String (CSV) form, with the agent's own name filtered out.
         let set = serde_json::json!({ "aliases": "prophet, seer , oracle-lite" });
-        let out = handle_management_action(&cfg, "update", &mreq(Some("seer"), None, None, Some(&set)))
-            .await.expect("update ok");
+        let out =
+            handle_management_action(&cfg, "update", &mreq(Some("seer"), None, None, Some(&set)))
+                .await
+                .expect("update ok");
         assert!(!out.is_error, "{}", out.text);
-        let written = std::fs::read_to_string(cfg.user_agent_dirs[0].join("seer.md")).expect("read");
+        let written =
+            std::fs::read_to_string(cfg.user_agent_dirs[0].join("seer.md")).expect("read");
         assert!(
             written.contains("aliases: prophet, oracle-lite"),
             "the agent's own name must be filtered out of its aliases:\n{written}"
@@ -930,8 +1199,10 @@ mod tests {
         // Array form, de-duplicated.
         let arr = serde_json::json!({ "aliases": ["prophet", "prophet", " diviner "] });
         handle_management_action(&cfg, "update", &mreq(Some("seer"), None, None, Some(&arr)))
-            .await.expect("update ok");
-        let written = std::fs::read_to_string(cfg.user_agent_dirs[0].join("seer.md")).expect("read");
+            .await
+            .expect("update ok");
+        let written =
+            std::fs::read_to_string(cfg.user_agent_dirs[0].join("seer.md")).expect("read");
         assert!(written.contains("aliases: prophet, diviner"), "{written}");
 
         // `false` clears. pi's serializer emits the line only when there IS a value or when the
@@ -939,10 +1210,19 @@ mod tests {
         // spellings for an update that set `aliases` (`agent-management.ts:287`) — so a clear drops
         // the line entirely rather than writing an empty one.
         let clear = serde_json::json!({ "aliases": false });
-        handle_management_action(&cfg, "update", &mreq(Some("seer"), None, None, Some(&clear)))
-            .await.expect("update ok");
-        let written = std::fs::read_to_string(cfg.user_agent_dirs[0].join("seer.md")).expect("read");
-        assert!(!written.contains("aliases:"), "a cleared alias list writes no line:\n{written}");
+        handle_management_action(
+            &cfg,
+            "update",
+            &mreq(Some("seer"), None, None, Some(&clear)),
+        )
+        .await
+        .expect("update ok");
+        let written =
+            std::fs::read_to_string(cfg.user_agent_dirs[0].join("seer.md")).expect("read");
+        assert!(
+            !written.contains("aliases:"),
+            "a cleared alias list writes no line:\n{written}"
+        );
         let reparsed = crate::discovery::frontmatter::parse_agent_file(
             &written,
             AgentSource::User,
@@ -953,8 +1233,10 @@ mod tests {
 
         // Wrong type -> pi's exact validation message.
         let bad = serde_json::json!({ "aliases": 7 });
-        let out = handle_management_action(&cfg, "update", &mreq(Some("seer"), None, None, Some(&bad)))
-            .await.expect("no discovery error");
+        let out =
+            handle_management_action(&cfg, "update", &mreq(Some("seer"), None, None, Some(&bad)))
+                .await
+                .expect("no discovery error");
         assert!(out.is_error);
         assert_eq!(
             out.text,
@@ -974,18 +1256,31 @@ mod tests {
             "---\nname: seer\ndescription: Sees\naliases: prophet, diviner\n---\n\nBody\n",
         );
 
-        let list = handle_management_action(&cfg, "list", &mreq(None, None, None, None)).await.expect("list ok");
+        let list = handle_management_action(&cfg, "list", &mreq(None, None, None, None))
+            .await
+            .expect("list ok");
         assert!(
-            list.text.contains("- seer (user, aliases: prophet, diviner): Sees"),
+            list.text
+                .contains("- seer (user, aliases: prophet, diviner): Sees"),
             "{}",
             list.text
         );
 
-        let by_alias = handle_management_action(&cfg, "get", &mreq(Some("prophet"), None, None, None))
-            .await.expect("get ok");
+        let by_alias =
+            handle_management_action(&cfg, "get", &mreq(Some("prophet"), None, None, None))
+                .await
+                .expect("get ok");
         assert!(!by_alias.is_error, "{}", by_alias.text);
-        assert!(by_alias.text.contains("Agent: seer (user)"), "{}", by_alias.text);
-        assert!(by_alias.text.contains("Aliases: prophet, diviner"), "{}", by_alias.text);
+        assert!(
+            by_alias.text.contains("Agent: seer (user)"),
+            "{}",
+            by_alias.text
+        );
+        assert!(
+            by_alias.text.contains("Aliases: prophet, diviner"),
+            "{}",
+            by_alias.text
+        );
     }
 
     /// Two agents claiming the SAME alias make every management path that would have to pick one
@@ -1006,22 +1301,37 @@ mod tests {
         );
 
         let get = handle_management_action(&cfg, "get", &mreq(Some("prophet"), None, None, None))
-            .await.expect("no discovery error");
+            .await
+            .expect("no discovery error");
         assert!(get.is_error);
-        assert_eq!(get.text, "Ambiguous agent alias or name 'prophet': augur, seer");
+        assert_eq!(
+            get.text,
+            "Ambiguous agent alias or name 'prophet': augur, seer"
+        );
 
         let config = serde_json::json!({ "description": "changed" });
-        let update =
-            handle_management_action(&cfg, "update", &mreq(Some("prophet"), None, None, Some(&config)))
-                .await.expect("no discovery error");
+        let update = handle_management_action(
+            &cfg,
+            "update",
+            &mreq(Some("prophet"), None, None, Some(&config)),
+        )
+        .await
+        .expect("no discovery error");
         assert!(update.is_error);
-        assert_eq!(update.text, "Ambiguous agent alias or name 'prophet': augur, seer");
+        assert_eq!(
+            update.text,
+            "Ambiguous agent alias or name 'prophet': augur, seer"
+        );
 
         // `disable` goes through `resolve_effective_agent`, whose ambiguity message is
         // `resolveAgentName`'s own (`agents.ts:526`), surfaced verbatim.
-        let disable =
-            handle_management_action(&cfg, "disable", &mreq(Some("prophet"), None, Some("user"), None))
-                .await.expect("no discovery error");
+        let disable = handle_management_action(
+            &cfg,
+            "disable",
+            &mreq(Some("prophet"), None, Some("user"), None),
+        )
+        .await
+        .expect("no discovery error");
         assert!(disable.is_error);
         assert_eq!(disable.text, "Ambiguous agent alias 'prophet': augur, seer");
         assert!(
@@ -1044,8 +1354,13 @@ mod tests {
             "---\nname: seer\ndescription: Sees\naliases: prophet\n---\n\nBody\n",
         );
 
-        let out = handle_management_action(&cfg, "disable", &mreq(Some("prophet"), None, Some("user"), None))
-            .await.expect("no discovery error");
+        let out = handle_management_action(
+            &cfg,
+            "disable",
+            &mreq(Some("prophet"), None, Some("user"), None),
+        )
+        .await
+        .expect("no discovery error");
         assert!(!out.is_error, "{}", out.text);
         assert!(out.text.contains("Disabled agent 'seer'"), "{}", out.text);
 
@@ -1078,7 +1393,8 @@ mod tests {
             "steps": [{ "agent": "prophet", "task": "look ahead" }],
         });
         let out = handle_management_action(&cfg, "create", &mreq(None, None, None, Some(&config)))
-            .await.expect("create ok");
+            .await
+            .expect("create ok");
         assert!(!out.is_error, "{}", out.text);
         assert!(
             !out.text.contains("unknown agents"),
@@ -1095,9 +1411,11 @@ mod tests {
             "steps": [{ "agent": "ghost-agent", "task": "boo" }],
         });
         let out = handle_management_action(&cfg, "create", &mreq(None, None, None, Some(&ghost)))
-            .await.expect("create ok");
+            .await
+            .expect("create ok");
         assert!(
-            out.text.contains("Warning: chain steps reference unknown agents: ghost-agent."),
+            out.text
+                .contains("Warning: chain steps reference unknown agents: ghost-agent."),
             "{}",
             out.text
         );
@@ -1116,15 +1434,28 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = mgmt_cfg(tmp.path());
         let out = handle_management_action(&cfg, "models", &mreq(None, None, None, None))
-            .await.expect("models ok");
+            .await
+            .expect("models ok");
         assert!(!out.is_error, "{}", out.text);
 
         assert_eq!(
             BUILTIN_AGENT_NAMES,
-            ["advisor", "delegate", "oracle", "researcher", "reviewer", "scout", "worker"]
+            [
+                "advisor",
+                "delegate",
+                "oracle",
+                "researcher",
+                "reviewer",
+                "scout",
+                "worker"
+            ]
         );
         for name in BUILTIN_AGENT_NAMES {
-            assert!(out.text.contains(&format!("\n{name}\n")), "{name} row missing:\n{}", out.text);
+            assert!(
+                out.text.contains(&format!("\n{name}\n")),
+                "{name} row missing:\n{}",
+                out.text
+            );
         }
         for gone in ["planner", "context-builder"] {
             assert!(
@@ -1134,13 +1465,16 @@ mod tests {
             );
         }
         assert!(
-            out.text.contains("advisor\n  model:\n    (builtin definition not found)\n  source: missing"),
+            out.text.contains(
+                "advisor\n  model:\n    (builtin definition not found)\n  source: missing"
+            ),
             "advisor ships no file of its own and must render the missing row:\n{}",
             out.text
         );
         // The six roles that DO ship a file resolve to a real definition.
         assert!(
-            !out.text.contains("oracle\n  model:\n    (builtin definition not found)"),
+            !out.text
+                .contains("oracle\n  model:\n    (builtin definition not found)"),
             "{}",
             out.text
         );
@@ -1150,9 +1484,15 @@ mod tests {
     async fn unknown_action_is_reported() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = mgmt_cfg(tmp.path());
-        let out = handle_management_action(&cfg, "frobnicate", &mreq(None, None, None, None)).await.expect("no discovery error");
+        let out = handle_management_action(&cfg, "frobnicate", &mreq(None, None, None, None))
+            .await
+            .expect("no discovery error");
         assert!(out.is_error);
-        assert!(out.text.contains("Unknown action: frobnicate"), "{}", out.text);
+        assert!(
+            out.text.contains("Unknown action: frobnicate"),
+            "{}",
+            out.text
+        );
     }
 
     #[tokio::test]
@@ -1165,13 +1505,119 @@ mod tests {
             "description": "Fast recon",
             "scope": "project"
         });
-        let created = handle_management_action(&cfg, "create", &mreq(None, None, None, Some(&create_cfg))).await.expect("create ok");
+        let created =
+            handle_management_action(&cfg, "create", &mreq(None, None, None, Some(&create_cfg)))
+                .await
+                .expect("create ok");
         assert!(!created.is_error, "{}", created.text);
-        assert!(created.text.starts_with("Created agent 'code-analysis.scout' at "), "{}", created.text);
+        assert!(
+            created
+                .text
+                .starts_with("Created agent 'code-analysis.scout' at "),
+            "{}",
+            created.text
+        );
 
-        let got = handle_management_action(&cfg, "get", &mreq(Some("code-analysis.scout"), None, None, None)).await.expect("get ok");
-        assert!(got.text.contains("Agent: code-analysis.scout (project)"), "{}", got.text);
+        let got = handle_management_action(
+            &cfg,
+            "get",
+            &mreq(Some("code-analysis.scout"), None, None, None),
+        )
+        .await
+        .expect("get ok");
+        assert!(
+            got.text.contains("Agent: code-analysis.scout (project)"),
+            "{}",
+            got.text
+        );
         assert!(got.text.contains("Local name: scout"), "{}", got.text);
         assert!(got.text.contains("Package: code-analysis"), "{}", got.text);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // SUBA-086: `list`/`models` render `Invalid agent definitions:`; `get` refuses a blocked name
+    // -----------------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn list_and_models_render_invalid_agent_definitions_and_get_refuses_a_blocked_name() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = mgmt_cfg(tmp.path());
+        std::fs::create_dir_all(&cfg.project_agent_dirs[0]).expect("mkdir project agents");
+        // `worker` also exists as a bundled builtin — the broken project file must OUTRANK it.
+        std::fs::write(
+            cfg.project_agent_dirs[0].join("worker.md"),
+            "---\nname: worker\ndescription: d\ntimeoutMs: 30s\n---\n\nBody\n",
+        )
+        .expect("write broken worker");
+        // `ghost` exists ONLY as a broken file.
+        std::fs::write(
+            cfg.project_agent_dirs[0].join("ghost.md"),
+            "---\nname: ghost\ndescription: d\noutputMode: file\n---\n\nBody\n",
+        )
+        .expect("write broken ghost");
+
+        let listed = handle_management_action(&cfg, "list", &mreq(None, None, None, None))
+            .await
+            .expect("list ok");
+        assert!(!listed.is_error);
+        assert!(
+            listed.text.contains(
+                "\n\nInvalid agent definitions:\n- ghost (project): Agent 'ghost' has invalid outputMode frontmatter; expected 'inline' or 'file-only'.\n- worker (project): Agent 'worker' has invalid timeoutMs frontmatter; expected a positive integer."
+            ),
+            "{}",
+            listed.text
+        );
+        let executable = listed
+            .text
+            .split("\n\nChains:")
+            .next()
+            .expect("the agents section");
+        assert!(
+            executable.contains("- worker (builtin") && !executable.contains("- worker (project"),
+            "the broken project file must not be listed as an executable agent (the bundled \
+             builtin still is):\n{executable}"
+        );
+        // pi `handleList` (`agent-management.ts:946` @v0.64.0) hands the block `d.agentDiagnostics`
+        // UNFILTERED, so a user-scoped listing still reports the broken project file.
+        let user_listed =
+            handle_management_action(&cfg, "list", &mreq(None, None, Some("user"), None))
+                .await
+                .expect("list ok");
+        assert!(
+            user_listed.text.contains("Invalid agent definitions:"),
+            "{}",
+            user_listed.text
+        );
+
+        let got = handle_management_action(&cfg, "get", &mreq(Some("worker"), None, None, None))
+            .await
+            .expect("get ok");
+        assert!(got.is_error, "{}", got.text);
+        assert_eq!(
+            got.text,
+            "Agent 'worker' has invalid configuration: Agent 'worker' has invalid timeoutMs frontmatter; expected a positive integer."
+        );
+        let ghost = handle_management_action(&cfg, "get", &mreq(Some("ghost"), None, None, None))
+            .await
+            .expect("get ok");
+        assert!(ghost.is_error);
+        assert!(
+            ghost
+                .text
+                .starts_with("Agent 'ghost' has invalid configuration:"),
+            "a name with ONLY a broken definition is invalid, not `not found`: {}",
+            ghost.text
+        );
+
+        let models = handle_management_action(&cfg, "models", &mreq(None, None, None, None))
+            .await
+            .expect("models ok");
+        assert!(
+            models.text.ends_with(
+                "Invalid agent definitions:\n- ghost (project): Agent 'ghost' has invalid outputMode frontmatter; expected 'inline' or 'file-only'.\n- worker (project): Agent 'worker' has invalid timeoutMs frontmatter; expected a positive integer."
+            ),
+            "{}",
+            models.text
+        );
     }
 }

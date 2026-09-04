@@ -448,11 +448,19 @@ mod tests {
         let mut acc = OutputAccumulator::new("cyrup-test", 2000, 1024);
         acc.append(b"\xEF\xBB\xBFhi\n");
         acc.finish();
-        assert_eq!(acc.total_bytes(), 3, "decoded totals exclude the stream-head BOM");
+        assert_eq!(
+            acc.total_bytes(),
+            3,
+            "decoded totals exclude the stream-head BOM"
+        );
         assert_eq!(acc.total_lines(), 1);
         assert_eq!(acc.last_line_bytes(), 0, "chunk ends on a newline");
         // The model-visible clause: assert the STRING, not just the length.
-        assert_eq!(acc.tail_string(), "hi\n", "preview tail must not contain U+FEFF");
+        assert_eq!(
+            acc.tail_string(),
+            "hi\n",
+            "preview tail must not contain U+FEFF"
+        );
         assert_eq!(acc.total_raw_bytes, 6, "raw path keeps the BOM (pi :69)");
         assert!(acc.finalize(2000, 1024).is_none());
 
@@ -480,7 +488,10 @@ mod tests {
             acc.finish();
             assert_eq!(acc.tail_string(), "hi", "split at {split}");
             assert_eq!(acc.total_bytes(), 2, "split at {split}");
-            assert_eq!(acc.total_raw_bytes, 5, "split at {split}: raw is split-invariant");
+            assert_eq!(
+                acc.total_raw_bytes, 5,
+                "split at {split}: raw is split-invariant"
+            );
             assert!(acc.finalize(2000, 1024).is_none(), "split at {split}");
         }
 
@@ -503,7 +514,11 @@ mod tests {
         mid.append("\u{feff}a\u{feff}b".as_bytes()); // 8 raw bytes
         mid.finish();
         assert_eq!(mid.tail_string(), "a\u{feff}b");
-        assert_eq!(mid.total_bytes(), 5, "3 stripped, the interior U+FEFF's 3 bytes kept");
+        assert_eq!(
+            mid.total_bytes(),
+            5,
+            "3 stripped, the interior U+FEFF's 3 bytes kept"
+        );
         assert_eq!(mid.total_raw_bytes, 8);
         assert!(mid.finalize(2000, 1024).is_none());
 
@@ -511,7 +526,11 @@ mod tests {
         let mut double = OutputAccumulator::new("cyrup-test", 2000, 1024);
         double.append(b"\xEF\xBB\xBF\xEF\xBB\xBFx");
         double.finish();
-        assert_eq!(double.tail_string(), "\u{feff}x", "the second BOM is real text");
+        assert_eq!(
+            double.tail_string(),
+            "\u{feff}x",
+            "the second BOM is real text"
+        );
         assert_eq!(double.total_bytes(), 4);
         assert!(double.finalize(2000, 1024).is_none());
     }
@@ -544,7 +563,11 @@ mod tests {
         two.append(b"\xEF\xBB");
         two.finish();
         assert_eq!(two.tail_string(), "\u{FFFD}");
-        assert_eq!(two.total_bytes(), 3, "one U+FFFD for the incomplete sequence");
+        assert_eq!(
+            two.total_bytes(),
+            3,
+            "one U+FFFD for the incomplete sequence"
+        );
         assert_eq!(two.total_raw_bytes, 2);
         assert!(two.finalize(2000, 1024).is_none());
 
@@ -553,8 +576,15 @@ mod tests {
         // dropped, `BF BD` would decode to garbage instead of one clean character.
         let mut fffd = OutputAccumulator::new("cyrup-test", 2000, 1024);
         fffd.append(b"\xEF\xBF\xBD");
-        assert!(fffd.pending.is_empty(), "decoded as one complete char, nothing carried");
-        assert_eq!(fffd.buf, vec![0xEF, 0xBF, 0xBD], "withheld byte re-emitted verbatim");
+        assert!(
+            fffd.pending.is_empty(),
+            "decoded as one complete char, nothing carried"
+        );
+        assert_eq!(
+            fffd.buf,
+            vec![0xEF, 0xBF, 0xBD],
+            "withheld byte re-emitted verbatim"
+        );
         fffd.finish();
         assert_eq!(fffd.tail_string(), "\u{FFFD}");
         assert_eq!(fffd.total_bytes(), 3);
@@ -573,7 +603,11 @@ mod tests {
         assert_eq!(acc.total_bytes(), 20, "decoded side still excludes the BOM");
         let p = acc.finalize(2000, 16).unwrap();
         let bytes = std::fs::read(&p).unwrap();
-        assert_eq!(&bytes[..3], &UTF8_BOM[..], "spill file must start with EF BB BF");
+        assert_eq!(
+            &bytes[..3],
+            &UTF8_BOM[..],
+            "spill file must start with EF BB BF"
+        );
         assert_eq!(bytes, b"\xEF\xBB\xBF0123456789abcdefghij".to_vec());
         let _ = std::fs::remove_file(&p);
 
@@ -582,7 +616,10 @@ mod tests {
         let mut edge = OutputAccumulator::new("cyrup-test", 2000, 16);
         edge.append(b"\xEF\xBB\xBF0123456789abcd");
         assert_eq!(edge.total_bytes(), 14, "decoded is under the limit");
-        assert_eq!(edge.total_raw_bytes, 17, "raw is over it, only because of the BOM");
+        assert_eq!(
+            edge.total_raw_bytes, 17,
+            "raw is over it, only because of the BOM"
+        );
         assert!(edge.is_truncated(), "raw count alone must trip the spill");
         let p = edge.finalize(2000, 16).unwrap();
         let bytes = std::fs::read(&p).unwrap();
@@ -601,10 +638,21 @@ mod tests {
         assert_eq!(acc.total_bytes(), 3);
         assert_eq!(acc.buf.len(), 1);
         acc.finish();
-        assert_eq!(acc.total_bytes(), 3, "second finish must not emit another U+FFFD");
-        assert_eq!(acc.buf.len(), 1, "second finish must not re-release the prefix");
+        assert_eq!(
+            acc.total_bytes(),
+            3,
+            "second finish must not emit another U+FFFD"
+        );
+        assert_eq!(
+            acc.buf.len(),
+            1,
+            "second finish must not re-release the prefix"
+        );
         assert_eq!(acc.tail_string(), "\u{FFFD}");
-        assert!(acc.finalize(2000, 1024).is_none(), "finalize's internal finish is also a no-op");
+        assert!(
+            acc.finalize(2000, 1024).is_none(),
+            "finalize's internal finish is also a no-op"
+        );
         assert_eq!(acc.total_bytes(), 3);
     }
 
@@ -617,7 +665,10 @@ mod tests {
         acc.finish();
         assert_eq!(acc.tail_string(), "hello\n");
         assert_eq!(acc.total_bytes(), 6);
-        assert_eq!(acc.total_raw_bytes, 6, "raw and decoded agree when there is no BOM");
+        assert_eq!(
+            acc.total_raw_bytes, 6,
+            "raw and decoded agree when there is no BOM"
+        );
         assert_eq!(acc.total_lines(), 1);
         assert!(acc.finalize(2000, 1024).is_none());
     }

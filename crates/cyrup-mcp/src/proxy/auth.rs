@@ -3,20 +3,20 @@
 //!
 //! See [`crate::proxy`] for the module overview.
 
-
 use serde_json::Value;
 
 use cyrup_core::{CancelToken, ToolResult};
 
 use crate::abort::{is_abort_error, throw_if_aborted};
-use crate::config::{
-    OAuthGrantType, OAuthSetting,
-};
+use crate::config::{OAuthGrantType, OAuthSetting};
 use crate::errors::{McpError, McpResult};
 use crate::proxy::discovery::execute_list;
 use crate::proxy::env::{ConnectOutcome, ConnectionStatus, ProxyCtx};
 use crate::proxy::error_vocab::McpErrorCode;
-use crate::proxy::results::{details, details_err, disabled_result, get_auth_failed_message, get_auth_required_message, not_found_result, text_result};
+use crate::proxy::results::{
+    details, details_err, disabled_result, get_auth_failed_message, get_auth_required_message,
+    not_found_result, text_result,
+};
 
 // ==================================================================================================
 // 9 · Manual OAuth modes (MCP-167, MCP-168)
@@ -84,9 +84,16 @@ pub fn format_manual_auth_instructions(server_name: &str, authorization_url: &st
 /// The manual-OAuth block is a copy-paste protocol for remote/headless sessions: the model prints an
 /// authorization URL and instructs the human to paste back the redirect URL. `startAuth` returning
 /// no `authorizationUrl` means the flow completed synchronously (client-credentials).
-pub async fn execute_auth_start(ctx: &ProxyCtx, server_name: &str, cancel: &CancelToken) -> McpResult<ToolResult> {
+pub async fn execute_auth_start(
+    ctx: &ProxyCtx,
+    server_name: &str,
+    cancel: &CancelToken,
+) -> McpResult<ToolResult> {
     let owned = ctx.owned_signal(cancel);
-    throw_if_aborted(&owned, ctx.owner().stop_reason().as_deref().map(String::as_str))?;
+    throw_if_aborted(
+        &owned,
+        ctx.owner().stop_reason().as_deref().map(String::as_str),
+    )?;
 
     let Some(definition) = ctx.config().mcp_servers.get(server_name).cloned() else {
         return Ok(not_found_result("auth-start", server_name));
@@ -103,7 +110,10 @@ pub async fn execute_auth_start(ctx: &ProxyCtx, server_name: &str, cancel: &Canc
         if !ctx.env.supports_oauth(&definition) {
             return Ok(None);
         }
-        ctx.env.start_auth(server_name, &server_url, &definition, &owned).await.map(Some)
+        ctx.env
+            .start_auth(server_name, &server_url, &definition, &owned)
+            .await
+            .map(Some)
     }
     .await;
 
@@ -113,25 +123,40 @@ pub async fn execute_auth_start(ctx: &ProxyCtx, server_name: &str, cancel: &Canc
             let mut map = details_err("auth-start", McpErrorCode::AuthStartFailed);
             map.insert("server".to_string(), Value::String(server_name.to_string()));
             map.insert("message".to_string(), Value::String(message.clone()));
-            Ok(text_result(format!("Failed to start OAuth for \"{server_name}\": {message}"), map))
+            Ok(text_result(
+                format!("Failed to start OAuth for \"{server_name}\": {message}"),
+                map,
+            ))
         }
         // A falsy URL or `!supportsOAuth(definition)` — one message, one code.
         Ok(None) => {
             let mut map = details_err("auth-start", McpErrorCode::OauthNotSupported);
             map.insert("server".to_string(), Value::String(server_name.to_string()));
-            Ok(text_result(format!("Server \"{server_name}\" is not configured for OAuth over HTTP."), map))
+            Ok(text_result(
+                format!("Server \"{server_name}\" is not configured for OAuth over HTTP."),
+                map,
+            ))
         }
         Ok(Some(None)) => {
             let mut map = details("auth-start");
             map.insert("server".to_string(), Value::String(server_name.to_string()));
             map.insert("authenticated".to_string(), Value::Bool(true));
-            Ok(text_result(format!("OAuth authentication successful for \"{server_name}\"."), map))
+            Ok(text_result(
+                format!("OAuth authentication successful for \"{server_name}\"."),
+                map,
+            ))
         }
         Ok(Some(Some(authorization_url))) => {
             let mut map = details("auth-start");
             map.insert("server".to_string(), Value::String(server_name.to_string()));
-            map.insert("authorizationUrl".to_string(), Value::String(authorization_url.clone()));
-            Ok(text_result(format_manual_auth_instructions(server_name, &authorization_url), map))
+            map.insert(
+                "authorizationUrl".to_string(),
+                Value::String(authorization_url.clone()),
+            );
+            Ok(text_result(
+                format_manual_auth_instructions(server_name, &authorization_url),
+                map,
+            ))
         }
     }
 }
@@ -147,7 +172,10 @@ pub async fn execute_auth_complete(
     cancel: &CancelToken,
 ) -> McpResult<ToolResult> {
     let owned = ctx.owned_signal(cancel);
-    throw_if_aborted(&owned, ctx.owner().stop_reason().as_deref().map(String::as_str))?;
+    throw_if_aborted(
+        &owned,
+        ctx.owner().stop_reason().as_deref().map(String::as_str),
+    )?;
 
     let Some(definition) = ctx.config().mcp_servers.get(server_name) else {
         return Ok(not_found_result("auth-complete", server_name));
@@ -156,19 +184,29 @@ pub async fn execute_auth_complete(
         return Ok(disabled_result("auth-complete", server_name));
     }
 
-    match ctx.env.complete_auth_from_input(server_name, input, &owned).await {
+    match ctx
+        .env
+        .complete_auth_from_input(server_name, input, &owned)
+        .await
+    {
         Err(error) => {
             let message = error.to_string();
             let mut map = details_err("auth-complete", McpErrorCode::AuthCompleteFailed);
             map.insert("server".to_string(), Value::String(server_name.to_string()));
             map.insert("message".to_string(), Value::String(message.clone()));
-            Ok(text_result(format!("Failed to complete OAuth for \"{server_name}\": {message}"), map))
+            Ok(text_result(
+                format!("Failed to complete OAuth for \"{server_name}\": {message}"),
+                map,
+            ))
         }
         Ok(status) if status != "authenticated" => {
             let mut map = details_err("auth-complete", McpErrorCode::NotAuthenticated);
             map.insert("server".to_string(), Value::String(server_name.to_string()));
             map.insert("status".to_string(), Value::String(status));
-            Ok(text_result(format!("OAuth authentication did not complete for \"{server_name}\"."), map))
+            Ok(text_result(
+                format!("OAuth authentication did not complete for \"{server_name}\"."),
+                map,
+            ))
         }
         Ok(_) => {
             ctx.env.close(server_name).await;
@@ -178,7 +216,9 @@ pub async fn execute_auth_complete(
             map.insert("server".to_string(), Value::String(server_name.to_string()));
             map.insert("authenticated".to_string(), Value::Bool(true));
             Ok(text_result(
-                format!("OAuth authentication successful for \"{server_name}\". Run mcp({{ connect: \"{server_name}\" }}) to connect with the new token."),
+                format!(
+                    "OAuth authentication successful for \"{server_name}\". Run mcp({{ connect: \"{server_name}\" }}) to connect with the new token."
+                ),
                 map,
             ))
         }
@@ -246,16 +286,23 @@ pub async fn attempt_auto_auth(
     };
 
     let grant_type = match definition.oauth.as_ref() {
-        Some(OAuthSetting::Config(config)) => {
-            config.grant_type.unwrap_or(OAuthGrantType::AuthorizationCode)
-        }
+        Some(OAuthSetting::Config(config)) => config
+            .grant_type
+            .unwrap_or(OAuthGrantType::AuthorizationCode),
         _ => OAuthGrantType::AuthorizationCode,
     };
     if !ctx.has_ui() && grant_type != OAuthGrantType::ClientCredentials {
-        return Ok(AutoAuthResult::Failed(get_auth_required_message(ctx.settings(), server_name)));
+        return Ok(AutoAuthResult::Failed(get_auth_required_message(
+            ctx.settings(),
+            server_name,
+        )));
     }
 
-    match ctx.env.authenticate(server_name, &server_url, &definition, cancel).await {
+    match ctx
+        .env
+        .authenticate(server_name, &server_url, &definition, cancel)
+        .await
+    {
         Ok(()) => Ok(AutoAuthResult::Success),
         Err(error) => {
             if is_abort_error(&error, Some(cancel)) {
@@ -281,9 +328,16 @@ pub async fn attempt_auto_auth(
 /// instructions set-or-**delete**, cache write, notify with reason `"proxy-connect"`, keep-alive
 /// mark, clear failure, status bar — and finally **[`execute_list`]'s output**, so a successful
 /// connect reports `details.mode === "list"`.
-pub async fn execute_connect(ctx: &ProxyCtx, server_name: &str, cancel: &CancelToken) -> McpResult<ToolResult> {
+pub async fn execute_connect(
+    ctx: &ProxyCtx,
+    server_name: &str,
+    cancel: &CancelToken,
+) -> McpResult<ToolResult> {
     let owned = ctx.owned_signal(cancel);
-    throw_if_aborted(&owned, ctx.owner().stop_reason().as_deref().map(String::as_str))?;
+    throw_if_aborted(
+        &owned,
+        ctx.owner().stop_reason().as_deref().map(String::as_str),
+    )?;
 
     if !ctx.config().mcp_servers.contains_key(server_name) {
         let mut map = details_err("connect", McpErrorCode::NotFound);
@@ -312,7 +366,10 @@ pub async fn execute_connect(ctx: &ProxyCtx, server_name: &str, cancel: &CancelT
                 }
                 AutoAuthResult::Success => {
                     ctx.env.close(server_name).await;
-                    throw_if_aborted(&owned, ctx.owner().stop_reason().as_deref().map(String::as_str))?;
+                    throw_if_aborted(
+                        &owned,
+                        ctx.owner().stop_reason().as_deref().map(String::as_str),
+                    )?;
                     connection = ctx.env.connect(server_name, &owned).await?;
                 }
                 AutoAuthResult::Skipped => {}
@@ -348,11 +405,18 @@ pub async fn execute_connect(ctx: &ProxyCtx, server_name: &str, cancel: &CancelT
                 ctx.env.record_failure(server_name, &message);
             }
             ctx.env.update_status_bar();
-            let code = if aborted { McpErrorCode::Aborted } else { McpErrorCode::ConnectFailed };
+            let code = if aborted {
+                McpErrorCode::Aborted
+            } else {
+                McpErrorCode::ConnectFailed
+            };
             let mut map = details_err("connect", code);
             map.insert("server".to_string(), Value::String(server_name.to_string()));
             map.insert("message".to_string(), Value::String(message.clone()));
-            return Ok(text_result(format!("Failed to connect to \"{server_name}\": {message}"), map));
+            return Ok(text_result(
+                format!("Failed to connect to \"{server_name}\": {message}"),
+                map,
+            ));
         }
     };
 
@@ -364,7 +428,11 @@ pub async fn execute_connect(ctx: &ProxyCtx, server_name: &str, cancel: &CancelT
         ctx.env.commit_prompt_metadata(server_name);
     }
     if let Ok(mut instructions) = ctx.state.server_instructions.lock() {
-        match connection.instructions.as_ref().filter(|text| !text.is_empty()) {
+        match connection
+            .instructions
+            .as_ref()
+            .filter(|text| !text.is_empty())
+        {
             // `state.serverInstructions.set(...)` / `.delete(...)` — the delete arm is what keeps a
             // server that dropped its instructions from showing yesterday's.
             Some(text) => {
@@ -376,7 +444,8 @@ pub async fn execute_connect(ctx: &ProxyCtx, server_name: &str, cancel: &CancelT
         }
     }
     ctx.env.update_metadata_cache(server_name);
-    ctx.state.notify_tool_metadata_updated(server_name, "proxy-connect");
+    ctx.state
+        .notify_tool_metadata_updated(server_name, "proxy-connect");
     ctx.env.mark_keep_alive_after_connect(server_name);
     ctx.env.clear_failure(server_name);
     ctx.env.update_status_bar();
@@ -386,20 +455,28 @@ pub async fn execute_connect(ctx: &ProxyCtx, server_name: &str, cancel: &CancelT
 /// The `\0auth_required\0<message>` marker [`execute_connect`]'s inner future uses to distinguish an
 /// auth refusal from a connect failure. A NUL is chosen because it cannot occur in a server message.
 fn strip_auth_required_marker(error: &McpError) -> Option<String> {
-    let McpError::Other(text) = error else { return None };
-    text.strip_prefix("\u{0}auth_required\u{0}").map(str::to_string)
+    let McpError::Other(text) = error else {
+        return None;
+    };
+    text.strip_prefix("\u{0}auth_required\u{0}")
+        .map(str::to_string)
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
-    use crate::proxy::testsupport::{FakeEnv, config_with, ctx_with, http, stdio, text_of};
-    use crate::proxy::env::ProxyEnv;
-    use serde_json::json;
     use crate::config::{McpConfig, McpSettings, ServerEntry};
     use crate::proxy::call::execute_call;
+    use crate::proxy::env::ProxyEnv;
     use crate::proxy::results::default_auth_required_message;
+    use crate::proxy::testsupport::{FakeEnv, config_with, ctx_with, http, stdio, text_of};
+    use serde_json::json;
     use std::sync::atomic::Ordering;
 
     // ---- MCP-167 · manual OAuth text -----------------------------------------------------------------
@@ -410,9 +487,12 @@ mod tests {
             "linear",
             "https://auth.example.com/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A8976%2Fcallback",
         );
-        assert_eq!(get_redirect_port(
-            "https://auth.example.com/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A8976%2Fcallback"
-        ), Some(8976));
+        assert_eq!(
+            get_redirect_port(
+                "https://auth.example.com/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A8976%2Fcallback"
+            ),
+            Some(8976)
+        );
         assert!(with_port.starts_with("MCP OAuth required for \"linear\".\n"));
         // `portNote` begins with `\n`, so the rendered text carries a BLANK LINE before it.
         assert!(
@@ -424,8 +504,12 @@ mod tests {
         ));
 
         // No parseable port ⇒ the last two lines are absent entirely.
-        let without_port = format_manual_auth_instructions("linear", "https://auth.example.com/authorize");
-        assert_eq!(get_redirect_port("https://auth.example.com/authorize"), None);
+        let without_port =
+            format_manual_auth_instructions("linear", "https://auth.example.com/authorize");
+        assert_eq!(
+            get_redirect_port("https://auth.example.com/authorize"),
+            None
+        );
         assert!(!without_port.contains("local port"));
         assert!(without_port.ends_with("JSON-string args remain supported."));
         // A default-port redirect is normalised away by both `new URL().port` and `Url::port()`.
@@ -451,7 +535,10 @@ mod tests {
     }
 
     fn auto_auth_on(mut config: McpConfig) -> McpConfig {
-        config.settings = Some(McpSettings { auto_auth: Some(true), ..McpSettings::default() });
+        config.settings = Some(McpSettings {
+            auto_auth: Some(true),
+            ..McpSettings::default()
+        });
         config
     }
 
@@ -462,16 +549,33 @@ mod tests {
     /// model is told how to start the flow manually.
     #[tokio::test]
     async fn headless_browser_auth_fails_fast_without_calling_authenticate() {
-        let config = auto_auth_on(config_with(&[("linear", http("https://linear.example/mcp"))]));
+        let config = auto_auth_on(config_with(&[(
+            "linear",
+            http("https://linear.example/mcp"),
+        )]));
         let env = FakeEnv::default()
             .with_connection("linear", ConnectionStatus::NeedsAuth)
             .with_oauth("linear.example");
         let (ctx, env) = ctx_with(config, &[], &[], env);
-        let result = execute_call(&ctx, "issues", None, Some("linear"), &CancelToken::new(), None)
-            .await
-            .unwrap();
-        assert_eq!(result.details.clone().unwrap()["error"], json!("auth_required"));
-        assert_eq!(env.authenticate_calls.load(Ordering::SeqCst), 0, "no browser, no attempt");
+        let result = execute_call(
+            &ctx,
+            "issues",
+            None,
+            Some("linear"),
+            &CancelToken::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.details.clone().unwrap()["error"],
+            json!("auth_required")
+        );
+        assert_eq!(
+            env.authenticate_calls.load(Ordering::SeqCst),
+            0,
+            "no browser, no attempt"
+        );
         assert_eq!(text_of(&result), default_auth_required_message("linear"));
     }
 
@@ -480,7 +584,10 @@ mod tests {
     /// [`get_auth_required_message`] rather than being returned directly.
     #[tokio::test]
     async fn a_configured_auth_required_message_wins_over_the_headless_default() {
-        let mut config = auto_auth_on(config_with(&[("linear", http("https://linear.example/mcp"))]));
+        let mut config = auto_auth_on(config_with(&[(
+            "linear",
+            http("https://linear.example/mcp"),
+        )]));
         config.settings = Some(McpSettings {
             auto_auth: Some(true),
             auth_required_message: Some("Ask an admin to authorise ${server}.".to_string()),
@@ -490,9 +597,16 @@ mod tests {
             .with_connection("linear", ConnectionStatus::NeedsAuth)
             .with_oauth("linear.example");
         let (ctx, _) = ctx_with(config, &[], &[], env);
-        let result = execute_call(&ctx, "issues", None, Some("linear"), &CancelToken::new(), None)
-            .await
-            .unwrap();
+        let result = execute_call(
+            &ctx,
+            "issues",
+            None,
+            Some("linear"),
+            &CancelToken::new(),
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(text_of(&result), "Ask an admin to authorise linear.");
     }
 
@@ -500,15 +614,25 @@ mod tests {
     /// through [`get_auth_failed_message`].
     #[tokio::test]
     async fn a_failed_auto_auth_reports_the_failure_message() {
-        let config = auto_auth_on(config_with(&[("linear", machine_oauth("https://linear.example/mcp"))]));
+        let config = auto_auth_on(config_with(&[(
+            "linear",
+            machine_oauth("https://linear.example/mcp"),
+        )]));
         let env = FakeEnv::default()
             .with_connection("linear", ConnectionStatus::NeedsAuth)
             .with_oauth("linear.example")
             .with_authenticate_failure("token exchange refused");
         let (ctx, env) = ctx_with(config, &[], &[], env);
-        let result = execute_call(&ctx, "issues", None, Some("linear"), &CancelToken::new(), None)
-            .await
-            .unwrap();
+        let result = execute_call(
+            &ctx,
+            "issues",
+            None,
+            Some("linear"),
+            &CancelToken::new(),
+            None,
+        )
+        .await
+        .unwrap();
         let details = result.details.clone().unwrap();
         assert_eq!(details["error"], json!("auth_required"));
         assert_eq!(details["server"], json!("linear"));
@@ -537,12 +661,20 @@ mod tests {
             .with_connection("foo_bar", ConnectionStatus::NeedsAuth)
             .with_oauth("foo.example");
         let (ctx, env) = ctx_with(config, &[], &[], env);
-        let result =
-            execute_call(&ctx, "foo_bar_thing", None, None, &CancelToken::new(), None).await.unwrap();
+        let result = execute_call(&ctx, "foo_bar_thing", None, None, &CancelToken::new(), None)
+            .await
+            .unwrap();
         // Neither candidate ever connects, so the call ends unresolved…
-        assert_eq!(result.details.clone().unwrap()["error"], json!("tool_not_found"));
+        assert_eq!(
+            result.details.clone().unwrap()["error"],
+            json!("tool_not_found")
+        );
         // …and `authenticate` ran ONCE across both of them.
-        assert_eq!(env.authenticate_calls.load(Ordering::SeqCst), 1, "the latch is single-shot");
+        assert_eq!(
+            env.authenticate_calls.load(Ordering::SeqCst),
+            1,
+            "the latch is single-shot"
+        );
     }
 
     /// `autoAuth` is opt-in, not opt-out: unset means the ladder is never entered.
@@ -553,10 +685,20 @@ mod tests {
             .with_connection("linear", ConnectionStatus::NeedsAuth)
             .with_oauth("linear.example");
         let (ctx, env) = ctx_with(config, &[], &[], env);
-        let result = execute_call(&ctx, "issues", None, Some("linear"), &CancelToken::new(), None)
-            .await
-            .unwrap();
-        assert_eq!(result.details.clone().unwrap()["error"], json!("auth_required"));
+        let result = execute_call(
+            &ctx,
+            "issues",
+            None,
+            Some("linear"),
+            &CancelToken::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.details.clone().unwrap()["error"],
+            json!("auth_required")
+        );
         assert_eq!(env.authenticate_calls.load(Ordering::SeqCst), 0);
         assert_eq!(text_of(&result), default_auth_required_message("linear"));
     }
@@ -568,12 +710,19 @@ mod tests {
         let config = config_with(&[("srv", stdio("a"))]);
         let env = FakeEnv::default().with_connection("srv", ConnectionStatus::Connected);
         let (ctx, _) = ctx_with(config, &[], &[], env);
-        let result = execute_connect(&ctx, "srv", &CancelToken::new()).await.unwrap();
+        let result = execute_connect(&ctx, "srv", &CancelToken::new())
+            .await
+            .unwrap();
         // `details.mode === "list"` — a successful connect renders as a listing.
         assert_eq!(result.details.clone().unwrap()["mode"], json!("list"));
 
         assert_eq!(
-            execute_connect(&ctx, "missing", &CancelToken::new()).await.unwrap().details.clone().unwrap()["error"],
+            execute_connect(&ctx, "missing", &CancelToken::new())
+                .await
+                .unwrap()
+                .details
+                .clone()
+                .unwrap()["error"],
             json!("not_found")
         );
     }
@@ -583,9 +732,14 @@ mod tests {
         let config = config_with(&[("srv", stdio("a"))]);
         let env = FakeEnv::default().with_connection("srv", ConnectionStatus::Connected);
         let (ctx, _) = ctx_with(config, &[], &[("srv", "stale text")], env);
-        assert_eq!(ctx.server_instructions("srv").as_deref(), Some("stale text"));
+        assert_eq!(
+            ctx.server_instructions("srv").as_deref(),
+            Some("stale text")
+        );
         // `ConnectOutcome::instructions` is `None`, which is `state.serverInstructions.delete(...)`.
-        execute_connect(&ctx, "srv", &CancelToken::new()).await.unwrap();
+        execute_connect(&ctx, "srv", &CancelToken::new())
+            .await
+            .unwrap();
         assert_eq!(ctx.server_instructions("srv"), None);
     }
 
@@ -598,37 +752,65 @@ mod tests {
             .with_connection("linear", ConnectionStatus::NeedsAuth)
             .with_failure("linear", 5);
         let (ctx, env) = ctx_with(config, &[], &[], env);
-        let result = execute_auth_complete(&ctx, "linear", "http://localhost:8976/cb?code=x", &CancelToken::new())
-            .await
-            .unwrap();
-        assert_eq!(result.details.clone().unwrap()["authenticated"], json!(true));
+        let result = execute_auth_complete(
+            &ctx,
+            "linear",
+            "http://localhost:8976/cb?code=x",
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.details.clone().unwrap()["authenticated"],
+            json!(true)
+        );
         assert_eq!(
             text_of(&result),
             "OAuth authentication successful for \"linear\". Run mcp({ connect: \"linear\" }) to connect with the new token."
         );
-        assert_eq!(env.get_connection("linear"), None, "the connection is closed");
-        assert_eq!(env.failure_age_seconds("linear"), None, "the failure record is cleared");
+        assert_eq!(
+            env.get_connection("linear"),
+            None,
+            "the connection is closed"
+        );
+        assert_eq!(
+            env.failure_age_seconds("linear"),
+            None,
+            "the failure record is cleared"
+        );
     }
 
     // ---- MCP-167 · `executeAuthStart` ------------------------------------------------------------------------
 
     #[tokio::test]
     async fn auth_start_rejects_non_oauth_servers_and_renders_instructions_otherwise() {
-        let config = config_with(&[("stdio_srv", stdio("a")), ("linear", http("https://linear.example/mcp"))]);
+        let config = config_with(&[
+            ("stdio_srv", stdio("a")),
+            ("linear", http("https://linear.example/mcp")),
+        ]);
         let env = FakeEnv::default().with_oauth("linear.example");
         let (ctx, _) = ctx_with(config, &[], &[], env);
 
-        let rejected = execute_auth_start(&ctx, "stdio_srv", &CancelToken::new()).await.unwrap();
-        assert_eq!(rejected.details.clone().unwrap()["error"], json!("oauth_not_supported"));
+        let rejected = execute_auth_start(&ctx, "stdio_srv", &CancelToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            rejected.details.clone().unwrap()["error"],
+            json!("oauth_not_supported")
+        );
         assert_eq!(
             text_of(&rejected),
             "Server \"stdio_srv\" is not configured for OAuth over HTTP."
         );
 
-        let started = execute_auth_start(&ctx, "linear", &CancelToken::new()).await.unwrap();
+        let started = execute_auth_start(&ctx, "linear", &CancelToken::new())
+            .await
+            .unwrap();
         let details = started.details.clone().unwrap();
-        assert_eq!(details["authorizationUrl"], json!("https://auth.example.com/authorize"));
+        assert_eq!(
+            details["authorizationUrl"],
+            json!("https://auth.example.com/authorize")
+        );
         assert!(text_of(&started).starts_with("MCP OAuth required for \"linear\"."));
     }
-
 }

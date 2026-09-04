@@ -22,15 +22,15 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use cyrup_core::StopReason;
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider, FauxResponseStep};
-use cyrup_provider::Provider;
-use cyrup_session_svc::{AgentSession, SessionBuilder, SessionConfig, Settings};
+use super::harness::*;
 use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::{App, AppCommand, InputEvent, SelectorKind, UiTheme};
+use cyrup_core::StopReason;
+use cyrup_provider::Provider;
+use cyrup_provider::faux::{FauxProvider, FauxResponseStep, faux_assistant_message, faux_text};
+use cyrup_session_svc::{AgentSession, SessionBuilder, SessionConfig, Settings};
 use ratatui::backend::TestBackend;
 use tempfile::TempDir;
-use super::harness::*;
 
 fn app() -> App<TestBackend> {
     App::new(TestBackend::new(110, 34), UiTheme::dark()).unwrap()
@@ -48,7 +48,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 /// A session backed by the offline faux provider (no network, no paid tokens).
@@ -61,7 +65,13 @@ async fn session(fx: &Fixture) -> Arc<AgentSession> {
     let provider: Arc<dyn Provider> = faux;
     let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
     cfg.trust_override = Some(true);
-    Arc::new(SessionBuilder::new(provider, cfg).cli_settings(Settings::new()).build().await.unwrap())
+    Arc::new(
+        SessionBuilder::new(provider, cfg)
+            .cli_settings(Settings::new())
+            .build()
+            .await
+            .unwrap(),
+    )
 }
 
 /// One completed turn, so the running session is persisted and `list_sessions()` can see it.
@@ -100,7 +110,11 @@ fn write_child_session(dir: &std::path::Path, cwd: &std::path::Path, parent: &st
     });
     // Written AFTER the parent, so its mtime is the newer one and `buildSessionTree`'s
     // `latestActivity` sort (`session-selector.ts:231-251`) keeps the pair together.
-    std::fs::write(dir.join(format!("{id}.jsonl")), format!("{header}\n{message}\n")).unwrap();
+    std::fs::write(
+        dir.join(format!("{id}.jsonl")),
+        format!("{header}\n{message}\n"),
+    )
+    .unwrap();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -127,11 +141,19 @@ async fn resume_draws_tree_connectors_for_a_forked_session_on_disk() {
     write_child_session(session.session_dir(), &fx.cwd, &parent);
 
     let mut app = app();
-    app.execute_command(AppCommand::OpenSelector(SelectorKind::Session), &session, None).await;
+    app.execute_command(
+        AppCommand::OpenSelector(SelectorKind::Session),
+        &session,
+        None,
+    )
+    .await;
     assert_eq!(app.active_selector_kind(), Some(SelectorKind::Session));
     app.draw().unwrap();
     let text = buf_text(&app);
-    assert!(text.contains("forked child"), "both sessions are listed:\n{text}");
+    assert!(
+        text.contains("forked child"),
+        "both sessions are listed:\n{text}"
+    );
     assert!(
         text.contains("└─ ") || text.contains("├─ "),
         "the child must hang off its parent (`buildTreePrefix`, :522-530):\n{text}"
@@ -149,10 +171,19 @@ async fn resume_accents_the_row_of_the_session_you_are_in() {
     let fx = fixture();
     let session = session(&fx).await;
     one_turn(&session).await;
-    write_child_session(session.session_dir(), &fx.cwd, std::path::Path::new("/nowhere.jsonl"));
+    write_child_session(
+        session.session_dir(),
+        &fx.cwd,
+        std::path::Path::new("/nowhere.jsonl"),
+    );
 
     let mut app = app();
-    app.execute_command(AppCommand::OpenSelector(SelectorKind::Session), &session, None).await;
+    app.execute_command(
+        AppCommand::OpenSelector(SelectorKind::Session),
+        &session,
+        None,
+    )
+    .await;
     app.draw().unwrap();
     let theme = UiTheme::dark();
     // The running session's row carries its first user message; the hand-written one does not.
@@ -182,20 +213,45 @@ async fn a_rebound_session_key_reaches_both_the_resume_hint_row_and_its_handler(
     one_turn(&session).await;
 
     let mut app = app();
-    app.load_keybindings_json(r#"{ "app.session.delete": "ctrl+k" }"#).unwrap();
-    app.execute_command(AppCommand::OpenSelector(SelectorKind::Session), &session, None).await;
+    app.load_keybindings_json(r#"{ "app.session.delete": "ctrl+k" }"#)
+        .unwrap();
+    app.execute_command(
+        AppCommand::OpenSelector(SelectorKind::Session),
+        &session,
+        None,
+    )
+    .await;
     app.draw().unwrap();
     let text = buf_text(&app);
-    assert!(text.contains("ctrl+k delete"), "the hint names the user's key:\n{text}");
-    assert!(!text.contains("ctrl+d delete"), "and not the stock one:\n{text}");
+    assert!(
+        text.contains("ctrl+k delete"),
+        "the hint names the user's key:\n{text}"
+    );
+    assert!(
+        !text.contains("ctrl+d delete"),
+        "and not the stock one:\n{text}"
+    );
 
     // The handler moved with it: the old key does nothing, the new one opens the confirmation.
-    app.handle_input(&InputEvent::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)));
+    app.handle_input(&InputEvent::Key(KeyEvent::new(
+        KeyCode::Char('d'),
+        KeyModifiers::CONTROL,
+    )));
     app.draw().unwrap();
-    assert!(!buf_text(&app).contains("Delete session?"), "ctrl+d is unbound now");
-    app.handle_input(&InputEvent::Key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL)));
+    assert!(
+        !buf_text(&app).contains("Delete session?"),
+        "ctrl+d is unbound now"
+    );
+    app.handle_input(&InputEvent::Key(KeyEvent::new(
+        KeyCode::Char('k'),
+        KeyModifiers::CONTROL,
+    )));
     app.draw().unwrap();
-    assert!(buf_text(&app).contains("Delete session?"), "ctrl+k is bound: {}", buf_text(&app));
+    assert!(
+        buf_text(&app).contains("Delete session?"),
+        "ctrl+k is bound: {}",
+        buf_text(&app)
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -214,12 +270,20 @@ async fn settings_shows_the_highlighted_rows_description_block() {
     let session = session(&fx).await;
 
     let mut app = app();
-    app.execute_command(AppCommand::OpenSelector(SelectorKind::Settings), &session, None).await;
+    app.execute_command(
+        AppCommand::OpenSelector(SelectorKind::Settings),
+        &session,
+        None,
+    )
+    .await;
     assert_eq!(app.active_selector_kind(), Some(SelectorKind::Settings));
     app.draw().unwrap();
     let text = buf_text(&app);
     // Row 0 is "Theme" (`settings-selector.ts:646-653`).
-    assert!(text.contains("Color theme for the interface"), "row 0's description:\n{text}");
+    assert!(
+        text.contains("Color theme for the interface"),
+        "row 0's description:\n{text}"
+    );
 
     // Moving the highlight swaps the block for the new row's text (`:152-160` reads
     // `displayItems[selectedIndex]`).
@@ -230,7 +294,10 @@ async fn settings_shows_the_highlighted_rows_description_block() {
         text.contains("Automatically compact context when it gets too large"),
         "row 1's description (`settings-selector.ts:498`):\n{text}"
     );
-    assert!(!text.contains("Color theme for the interface"), "only ONE block at a time:\n{text}");
+    assert!(
+        !text.contains("Color theme for the interface"),
+        "only ONE block at a time:\n{text}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -246,20 +313,30 @@ async fn settings_shows_the_highlighted_rows_description_block() {
 #[test]
 fn scoped_models_footer_names_the_users_own_keys() {
     let mut app = App::new(TestBackend::new(110, 30), UiTheme::dark()).unwrap();
-    app.load_keybindings_json(
-        r#"{ "tui.select.confirm": "space", "app.models.save": "ctrl+w" }"#,
-    )
-    .unwrap();
+    app.load_keybindings_json(r#"{ "tui.select.confirm": "space", "app.models.save": "ctrl+w" }"#)
+        .unwrap();
     app.open_checkbox_selector(
         vec![("m0".into(), "Model Zero".into(), "openai".into(), None)],
         Some(vec!["m0".into()]),
     );
     app.draw().unwrap();
     let text = buf_text(&app);
-    assert!(text.contains("space toggle"), "the confirm key comes from the merged table:\n{text}");
-    assert!(text.contains("ctrl+w save"), "and so do the app.models.* keys:\n{text}");
-    assert!(!text.contains("enter toggle"), "not the stock default:\n{text}");
-    assert!(!text.contains("ctrl+s save"), "not the stock default:\n{text}");
+    assert!(
+        text.contains("space toggle"),
+        "the confirm key comes from the merged table:\n{text}"
+    );
+    assert!(
+        text.contains("ctrl+w save"),
+        "and so do the app.models.* keys:\n{text}"
+    );
+    assert!(
+        !text.contains("enter toggle"),
+        "not the stock default:\n{text}"
+    );
+    assert!(
+        !text.contains("ctrl+s save"),
+        "not the stock default:\n{text}"
+    );
 }
 
 /// **`ModelSelector::set_editor_keymap`.** `getScopeHintText` is
@@ -272,7 +349,8 @@ fn scoped_models_footer_names_the_users_own_keys() {
 #[test]
 fn model_scope_hint_names_the_users_own_tab_key() {
     let mut app = App::new(TestBackend::new(110, 30), UiTheme::dark()).unwrap();
-    app.load_keybindings_json(r#"{ "editor.tab": "ctrl+i" }"#).unwrap();
+    app.load_keybindings_json(r#"{ "editor.tab": "ctrl+i" }"#)
+        .unwrap();
     app.open_model_selector(
         vec![
             crate::ModelEntry {
@@ -294,8 +372,14 @@ fn model_scope_hint_names_the_users_own_tab_key() {
     );
     app.draw().unwrap();
     let text = buf_text(&app);
-    assert!(text.contains("ctrl+i scope (all/scoped)"), "the live tab binding:\n{text}");
-    assert!(!text.contains("tab scope"), "not the stock default:\n{text}");
+    assert!(
+        text.contains("ctrl+i scope (all/scoped)"),
+        "the live tab binding:\n{text}"
+    );
+    assert!(
+        !text.contains("tab scope"),
+        "not the stock default:\n{text}"
+    );
 }
 
 /// **`TrustSelector::with_hints`.** `keyHint("tui.select.confirm", "save")` /
@@ -310,12 +394,24 @@ async fn trust_hint_row_names_the_users_own_keys_on_the_first_paint() {
     let session = session(&fx).await;
 
     let mut app = app();
-    app.load_keybindings_json(r#"{ "tui.select.confirm": "ctrl+y" }"#).unwrap();
-    app.execute_command(AppCommand::OpenSelector(SelectorKind::Trust), &session, None).await;
+    app.load_keybindings_json(r#"{ "tui.select.confirm": "ctrl+y" }"#)
+        .unwrap();
+    app.execute_command(
+        AppCommand::OpenSelector(SelectorKind::Trust),
+        &session,
+        None,
+    )
+    .await;
     assert_eq!(app.active_selector_kind(), Some(SelectorKind::Trust));
     // NO key is pressed before this draw — that is the whole point.
     app.draw().unwrap();
     let text = buf_text(&app);
-    assert!(text.contains("ctrl+y save"), "the live confirm binding on paint 1:\n{text}");
-    assert!(!text.contains("enter save"), "not the stock default:\n{text}");
+    assert!(
+        text.contains("ctrl+y save"),
+        "the live confirm binding on paint 1:\n{text}"
+    );
+    assert!(
+        !text.contains("enter save"),
+        "not the stock default:\n{text}"
+    );
 }

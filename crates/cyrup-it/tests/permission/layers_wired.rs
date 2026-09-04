@@ -12,7 +12,12 @@
 //!   proceeds even though the `read` TOOL is denied.
 //! - **external-directory guard** (pi `index.ts:2310-2414`): a `read` targeting a path OUTSIDE the
 //!   working directory is blocked by the `external_directory` policy.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -20,7 +25,7 @@ use std::sync::Arc;
 use cyrup_core::ToolCallId;
 use cyrup_ext::{ExtMode, HookOutcome, HostCtx, HostEvent, HostServices, InitApi, NativeExtension};
 use cyrup_permission_system::PermissionSystemExtension;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// A scripted [`HostServices`] whose ONLY override is [`HostServices::all_tool_names`] — the full
 /// registry the registry / unknown-tool gate checks against (pi `pi.getAllTools()`).
@@ -58,7 +63,11 @@ fn ctx(cwd: PathBuf) -> HostCtx {
 }
 
 fn tool_call(name: &str, input: Value) -> HostEvent {
-    HostEvent::ToolCall { call_id: ToolCallId::from("call-1"), name: name.to_string(), input }
+    HostEvent::ToolCall {
+        call_id: ToolCallId::from("call-1"),
+        name: name.to_string(),
+        input,
+    }
 }
 
 fn block_reason(o: &HookOutcome) -> Option<&str> {
@@ -77,7 +86,10 @@ async fn agent_scoped_rule_enforces_for_named_agent_only() {
     let dir = tempfile::tempdir().unwrap();
     let agent_dir = dir.path();
     // Global allows every bash command; the `coder` persona's OWN frontmatter denies `secret *`.
-    write(&agent_dir.join("agents/coder.md"), "---\npermission:\n  bash:\n    \"secret *\": deny\n---\nbody");
+    write(
+        &agent_dir.join("agents/coder.md"),
+        "---\npermission:\n  bash:\n    \"secret *\": deny\n---\nbody",
+    );
 
     let cwd = agent_dir.to_path_buf();
     let ev = tool_call("bash", json!({ "command": "secret leak" }));
@@ -85,19 +97,24 @@ async fn agent_scoped_rule_enforces_for_named_agent_only() {
     // Named persona `coder`: the agent-layer deny ENFORCES.
     let coder = ext_with_global(agent_dir, r#"{ "bash": { "*": "allow" } }"#)
         .with_agent_name(Some("coder".to_string()));
-    coder.set_host_services(Arc::new(RegistryServices { names: vec!["bash".into()] }));
+    coder.set_host_services(Arc::new(RegistryServices {
+        names: vec!["bash".into()],
+    }));
     init(&coder).await;
     let coder_out = coder.on_event(&ev, &ctx(cwd.clone())).await;
     assert!(
-        block_reason(&coder_out).is_some_and(|r| r.contains("Agent 'coder'")
-            && r.contains("is not permitted to run 'bash'")),
+        block_reason(&coder_out).is_some_and(
+            |r| r.contains("Agent 'coder'") && r.contains("is not permitted to run 'bash'")
+        ),
         "agent-scoped deny must block the named persona; got {coder_out:?}"
     );
 
     // A DIFFERENT persona `writer` (no `writer.md`): the agent layer is empty → global allow wins.
     let writer = ext_with_global(agent_dir, r#"{ "bash": { "*": "allow" } }"#)
         .with_agent_name(Some("writer".to_string()));
-    writer.set_host_services(Arc::new(RegistryServices { names: vec!["bash".into()] }));
+    writer.set_host_services(Arc::new(RegistryServices {
+        names: vec!["bash".into()],
+    }));
     init(&writer).await;
     let writer_out = writer.on_event(&ev, &ctx(cwd)).await;
     assert!(
@@ -115,13 +132,20 @@ async fn unknown_tool_is_blocked_before_permission_check() {
     let dir = tempfile::tempdir().unwrap();
     let agent_dir = dir.path();
     // Even a permissive global policy cannot save an UNREGISTERED tool — the registry gate runs first.
-    let ext = ext_with_global(agent_dir, r#"{ "defaultPolicy": { "tools": "allow", "bash": "allow" } }"#);
-    ext.set_host_services(Arc::new(RegistryServices { names: vec!["bash".into(), "read".into()] }));
+    let ext = ext_with_global(
+        agent_dir,
+        r#"{ "defaultPolicy": { "tools": "allow", "bash": "allow" } }"#,
+    );
+    ext.set_host_services(Arc::new(RegistryServices {
+        names: vec!["bash".into(), "read".into()],
+    }));
     init(&ext).await;
     let cwd = agent_dir.to_path_buf();
 
     // An unregistered tool → blocked with the unknown-tool reason (pi `formatUnknownToolReason`).
-    let unknown = ext.on_event(&tool_call("frobnicate", json!({})), &ctx(cwd.clone())).await;
+    let unknown = ext
+        .on_event(&tool_call("frobnicate", json!({})), &ctx(cwd.clone()))
+        .await;
     assert!(
         block_reason(&unknown)
             .is_some_and(|r| r.contains("Tool 'frobnicate' is not registered in this runtime")),
@@ -129,7 +153,9 @@ async fn unknown_tool_is_blocked_before_permission_check() {
     );
 
     // A registered tool (`bash`) sails past the registry gate (allowed by the permissive policy).
-    let known = ext.on_event(&tool_call("bash", json!({ "command": "ls" })), &ctx(cwd)).await;
+    let known = ext
+        .on_event(&tool_call("bash", json!({ "command": "ls" })), &ctx(cwd))
+        .await;
     assert!(
         matches!(known, HookOutcome::Noop),
         "a registered tool must pass the registry gate; got {known:?}"
@@ -149,7 +175,9 @@ async fn allowed_skill_read_bypasses_read_tool_deny() {
         agent_dir,
         r#"{ "tools": { "read": "deny" }, "skills": { "deploy": "allow" } }"#,
     );
-    ext.set_host_services(Arc::new(RegistryServices { names: vec!["read".into()] }));
+    ext.set_host_services(Arc::new(RegistryServices {
+        names: vec!["read".into()],
+    }));
     init(&ext).await;
     let cwd = agent_dir.to_path_buf();
     let cwd_str = cwd.to_string_lossy().into_owned();
@@ -169,7 +197,12 @@ async fn allowed_skill_read_bypasses_read_tool_deny() {
     let _ = ext.on_event(&bas, &ctx(cwd.clone())).await;
 
     // Reading the allowed skill's file PROCEEDS despite the read-tool deny (the bypass).
-    let skill_read = ext.on_event(&tool_call("read", json!({ "path": skill_file })), &ctx(cwd.clone())).await;
+    let skill_read = ext
+        .on_event(
+            &tool_call("read", json!({ "path": skill_file })),
+            &ctx(cwd.clone()),
+        )
+        .await;
     assert!(
         matches!(skill_read, HookOutcome::Noop),
         "an allowed skill's file must be readable despite the read-tool deny; got {skill_read:?}"
@@ -177,7 +210,9 @@ async fn allowed_skill_read_bypasses_read_tool_deny() {
 
     // A NON-skill read is still governed by the (denied) read tool.
     let other = format!("{cwd_str}/notes/other.txt");
-    let plain_read = ext.on_event(&tool_call("read", json!({ "path": other })), &ctx(cwd)).await;
+    let plain_read = ext
+        .on_event(&tool_call("read", json!({ "path": other })), &ctx(cwd))
+        .await;
     assert!(
         block_reason(&plain_read).is_some_and(|r| r.contains("is not permitted to run 'read'")),
         "a non-skill read must still hit the read-tool deny; got {plain_read:?}"
@@ -194,14 +229,28 @@ async fn read_outside_working_directory_is_guarded() {
     let outside_dir = tempfile::tempdir().unwrap();
     let agent_dir = cwd_dir.path();
     // `read` is allowed generally, but external-directory access is denied.
-    let ext = ext_with_global(agent_dir, r#"{ "read": "allow", "external_directory": "deny" }"#);
-    ext.set_host_services(Arc::new(RegistryServices { names: vec!["read".into()] }));
+    let ext = ext_with_global(
+        agent_dir,
+        r#"{ "read": "allow", "external_directory": "deny" }"#,
+    );
+    ext.set_host_services(Arc::new(RegistryServices {
+        names: vec!["read".into()],
+    }));
     init(&ext).await;
     let cwd = agent_dir.to_path_buf();
 
     // A path OUTSIDE the working directory → blocked by the external-directory guard.
-    let outside_path = outside_dir.path().join("secret.txt").to_string_lossy().into_owned();
-    let out = ext.on_event(&tool_call("read", json!({ "path": outside_path })), &ctx(cwd.clone())).await;
+    let outside_path = outside_dir
+        .path()
+        .join("secret.txt")
+        .to_string_lossy()
+        .into_owned();
+    let out = ext
+        .on_event(
+            &tool_call("read", json!({ "path": outside_path })),
+            &ctx(cwd.clone()),
+        )
+        .await;
     assert!(
         block_reason(&out).is_some_and(|r| r.contains("outside working directory")),
         "a read outside the working directory must be guarded; got {out:?}"
@@ -209,7 +258,12 @@ async fn read_outside_working_directory_is_guarded() {
 
     // A path INSIDE the working directory → the guard does not fire; the (allowed) read proceeds.
     let inside_path = cwd.join("inside.txt").to_string_lossy().into_owned();
-    let inside = ext.on_event(&tool_call("read", json!({ "path": inside_path })), &ctx(cwd)).await;
+    let inside = ext
+        .on_event(
+            &tool_call("read", json!({ "path": inside_path })),
+            &ctx(cwd),
+        )
+        .await;
     assert!(
         matches!(inside, HookOutcome::Noop),
         "a read inside the working directory must proceed; got {inside:?}"
@@ -226,13 +280,27 @@ async fn non_builtin_filesystem_tool_outside_working_directory_is_guarded() {
     let cwd_dir = tempfile::tempdir().unwrap();
     let outside_dir = tempfile::tempdir().unwrap();
     let agent_dir = cwd_dir.path();
-    let ext = ext_with_global(agent_dir, r#"{ "read_file": "allow", "external_directory": "deny" }"#);
-    ext.set_host_services(Arc::new(RegistryServices { names: vec!["read_file".into()] }));
+    let ext = ext_with_global(
+        agent_dir,
+        r#"{ "read_file": "allow", "external_directory": "deny" }"#,
+    );
+    ext.set_host_services(Arc::new(RegistryServices {
+        names: vec!["read_file".into()],
+    }));
     init(&ext).await;
     let cwd = agent_dir.to_path_buf();
 
-    let outside_path = outside_dir.path().join("secret.txt").to_string_lossy().into_owned();
-    let out = ext.on_event(&tool_call("read_file", json!({ "path": outside_path })), &ctx(cwd)).await;
+    let outside_path = outside_dir
+        .path()
+        .join("secret.txt")
+        .to_string_lossy()
+        .into_owned();
+    let out = ext
+        .on_event(
+            &tool_call("read_file", json!({ "path": outside_path })),
+            &ctx(cwd),
+        )
+        .await;
     assert!(
         block_reason(&out).is_some_and(|r| r.contains("outside working directory")),
         "a non-builtin FS tool (read_file) outside the working directory must be guarded; got {out:?}"

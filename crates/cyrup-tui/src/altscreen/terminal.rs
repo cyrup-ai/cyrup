@@ -45,6 +45,7 @@
 
 use std::io::Write;
 
+use ratatui::Terminal;
 use ratatui::backend::Backend;
 use ratatui::crossterm::cursor::{Hide, MoveTo, Show};
 use ratatui::crossterm::queue;
@@ -54,7 +55,6 @@ use ratatui::crossterm::terminal::{
     EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::text::Line;
-use ratatui::Terminal;
 
 use crate::error::TuiError;
 
@@ -208,7 +208,12 @@ impl TerminalSetup {
         // `ENABLE_AUTOWRAP` + `END_SYNCHRONIZED_OUTPUT`. The two omitted middles belong to units
         // that emit them from their own modules immediately before this call; neither produces a
         // glyph, so their being a separate write does not weaken the bracket.
-        let _ = queue!(out, BeginSynchronizedUpdate, EnableLineWrap, EndSynchronizedUpdate);
+        let _ = queue!(
+            out,
+            BeginSynchronizedUpdate,
+            EnableLineWrap,
+            EndSynchronizedUpdate
+        );
 
         // ---- pi `afterTerminalStop` (`:314-329`) --------------------------------------------
         let _ = queue!(out, BeginSynchronizedUpdate, LeaveAlternateScreen);

@@ -30,12 +30,20 @@ impl InputEditor {
             .iter()
             .position(|c| c.is_whitespace())
             .or_else(|| (self.lines.len() > 1).then_some(line0.len()));
-        let head: String = line0.iter().take(boundary.unwrap_or(line0.len())).skip(1).collect();
+        let head: String = line0
+            .iter()
+            .take(boundary.unwrap_or(line0.len()))
+            .skip(1)
+            .collect();
         match boundary {
             // Still typing the name: highlight while it is an honest prefix. No ghost — the popup is
             // open and already showing the full hint + description.
-            None => crate::autocomplete::is_command_prefix(&self.registry, &head)
-                .then_some(CommandHighlight { token: 0..line0.len(), ghost: None }),
+            None => crate::autocomplete::is_command_prefix(&self.registry, &head).then_some(
+                CommandHighlight {
+                    token: 0..line0.len(),
+                    ghost: None,
+                },
+            ),
             // Whitespace follows: the highlight FREEZES on `/name` iff that name is an EXACT registered
             // command — `registry.get`, NOT `match_command`/`dispatch_names`, which hold builtins plus
             // `HIDDEN_COMMANDS` only (`commands.rs:189-197`, `:297-312`, `:429-434`) and would drop
@@ -49,9 +57,15 @@ impl InputEditor {
                 // buffer — line 0 past the token, and every later (soft-newline) line. Whitespace-only
                 // is still empty, so `/model  ` with two spaces keeps its ghost.
                 let zone_empty = line0.iter().skip(i).all(|c| c.is_whitespace())
-                    && self.lines.iter().skip(1).all(|l| l.iter().all(|c| c.is_whitespace()));
-                let ghost =
-                    zone_empty.then_some(cmd.argument_hint.as_deref()).flatten().map(str::to_string);
+                    && self
+                        .lines
+                        .iter()
+                        .skip(1)
+                        .all(|l| l.iter().all(|c| c.is_whitespace()));
+                let ghost = zone_empty
+                    .then_some(cmd.argument_hint.as_deref())
+                    .flatten()
+                    .map(str::to_string);
                 Some(CommandHighlight { token: 0..i, ghost })
             }
         }
@@ -106,7 +120,9 @@ impl InputEditor {
 
     /// The text left of the cursor on the current line (the autocomplete context window).
     pub(super) fn before_cursor(&self) -> String {
-        self.lines.get(self.row).map_or(String::new(), |line| line.iter().take(self.col).collect())
+        self.lines
+            .get(self.row)
+            .map_or(String::new(), |line| line.iter().take(self.col).collect())
     }
 
     /// Compute the `@`-mention popup for the current cursor, lazily enumerating the tree on first use
@@ -159,7 +175,9 @@ impl InputEditor {
     /// Apply the selected popup item to the buffer (Tab/Enter accept). Leaves the popup state to the
     /// caller (Tab keeps editing + recomputes; Enter on a slash item submits).
     pub(super) fn accept_completion(&mut self) {
-        let Some(ac) = self.autocomplete.as_ref() else { return };
+        let Some(ac) = self.autocomplete.as_ref() else {
+            return;
+        };
         if let Some(applied) = ac.apply(&self.lines_as_strings(), self.row, self.col) {
             self.lines = applied.lines.iter().map(|s| s.chars().collect()).collect();
             if self.lines.is_empty() {

@@ -145,7 +145,10 @@ pub fn ensure_intercom_runtime_dir(intercom_dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(intercom_dir, std::fs::Permissions::from_mode(INTERCOM_DIR_MODE))?;
+        std::fs::set_permissions(
+            intercom_dir,
+            std::fs::Permissions::from_mode(INTERCOM_DIR_MODE),
+        )?;
     }
     Ok(())
 }
@@ -273,7 +276,10 @@ mod tests {
     fn restrict_runtime_file_propagates_set_permissions_failure() {
         let missing = PathBuf::from("/nonexistent/does/not/exist/broker.sock");
         let result = restrict_intercom_runtime_file(&missing);
-        assert!(result.is_err(), "expected chmod-on-missing-file to surface an Err, not swallow it");
+        assert!(
+            result.is_err(),
+            "expected chmod-on-missing-file to surface an Err, not swallow it"
+        );
     }
 
     #[test]

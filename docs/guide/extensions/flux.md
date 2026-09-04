@@ -18,10 +18,19 @@ focused task doesn't inherit fifteen pipeline commands and a skill for a workflo
   command list, plus a bundled skill that explains the pipeline to the model.
 - **Three native commands** that render deterministically with no model call:
   `/flux/status`, `/flux/cheatsheet`, `/flux/about`.
-- **A `ctrl+f` overlay** — the same status panel as `/flux/status`, drawn with real colour inside
-  the TUI instead of plain text.
+- **A `ctrl+alt+f` overlay** — the same status panel as `/flux/status`, drawn with real colour
+  inside the TUI instead of plain text. (The chord is `ctrl+alt+f`, not `ctrl+f`: `ctrl+f` is the
+  editor's forward-char motion, and an extension shortcut would take it away from you.)
 - **A structured `ask_user_question` tool** the pipeline templates use to ask you clarifying
   questions one at a time mid-task, with single- or multi-select options.
+
+The fifteen templates and the skill are compiled into the binary and copied out to
+`<agent dir>/flux/resources/` (by default `~/.cyrup/agent/flux/resources/`) the first time a
+session starts, and again whenever a new cyrup build ships different content. The copy is
+non-destructive: a template you have edited there is kept as `<name>.bak` before the fresh one
+lands, and a file of your own that was there first is never touched. Set `CYRUP_FLUX_RESOURCES_DIR`
+to point at a tree you maintain yourself instead; if either location is missing at startup you
+get a warning naming the path rather than a silent loss of the `/flux/*` commands.
 
 All pipeline state lives under `~/.flux/<flattened-cwd>/`, where `<flattened-cwd>` is your current
 working directory with every run of non-alphanumeric characters collapsed to a single `-`. That
@@ -49,7 +58,10 @@ new -> ask -> split -> aug -> exec -> qa -> tests -> commit -> create-pr
 `aug`, `exec` and `qa` share one argument grammar: a filename processes that one task, a bare
 integer `N` fans the work out across `N` parallel subagents over every file in `todo/`, `1` or
 `all` processes every task file sequentially, and no argument at all lists `todo/*.md` and asks
-which to run.
+which to run. The `N` form needs the `subagent` tool, which only the opt-in
+[subagents](subagents.md) extension provides (`CYRUP_SUBAGENTS=1` or a `subagents/config.json`);
+Flux itself is always on, so without that opt-in `N` tells you once that subagents are not
+available and runs the tasks sequentially instead.
 
 Three more pipelines exist alongside the core one:
 
@@ -78,7 +90,7 @@ if you don't plan to use `/flux/tests` yet — every other stage works without i
 /flux/status done review  # any combination of todo / done / review
 ```
 
-Or press `ctrl+f` for the same information as a colour overlay without leaving your current view.
+Or press `ctrl+alt+f` for the same information as a colour overlay without leaving your current view.
 
 `/flux/cheatsheet` prints the full command table shown above (optionally filtered to one pipeline
 with `/flux/cheatsheet A`, `B`, `C` or `D`), and `/flux/about` prints a short description of the

@@ -17,18 +17,26 @@
 //!
 //! No network / tokens: the transport is either a scripted [`FauxProvider`]-backed spy or a local
 //! `std::net` SSE server on a loopback port.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use cyrup_agent::{ProviderStreamFn, StreamFn};
 use cyrup_core::{EventStream, ModelRef, ProviderId, StopReason};
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
 use cyrup_provider::{Context, Provider, StreamEvent, StreamOptions};
-use cyrup_sdk::{ApiKeyResolver, ContextFile, ContextScope, Cyrup, ProxyStreamFn, Session, SessionConfig, SkillPointer};
+use cyrup_sdk::{
+    ApiKeyResolver, ContextFile, ContextScope, Cyrup, ProxyStreamFn, Session, SessionConfig,
+    SkillPointer,
+};
 use tempfile::TempDir;
 
 // ----------------------------------------------------------------------------------------------
@@ -47,7 +55,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn config(fx: &Fixture) -> SessionConfig {
@@ -59,7 +71,10 @@ fn config(fx: &Fixture) -> SessionConfig {
 /// A [`FauxProvider`] scripted with a single one-shot assistant text reply.
 fn scripted_provider(text: &str) -> Arc<FauxProvider> {
     let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text(text)], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text(text)],
+        StopReason::Stop,
+    )]);
     faux
 }
 
@@ -93,10 +108,12 @@ async fn injected_stream_fn_serves_the_turn_not_the_provider() {
     let fx = fixture();
 
     // The provider that resolves the model catalog — scripted with a reply we must NOT see.
-    let provider: Arc<dyn Provider> = scripted_provider("REPLY FROM THE PROVIDER (must not appear)");
+    let provider: Arc<dyn Provider> =
+        scripted_provider("REPLY FROM THE PROVIDER (must not appear)");
 
     // The injected transport — scripted with the reply we MUST see.
-    let injected_backing: Arc<dyn Provider> = scripted_provider("reply from the injected transport");
+    let injected_backing: Arc<dyn Provider> =
+        scripted_provider("reply from the injected transport");
     let hits = Arc::new(AtomicUsize::new(0));
     let injected: Arc<dyn StreamFn> = Arc::new(RecordingStreamFn {
         inner: ProviderStreamFn::new(injected_backing),
@@ -115,7 +132,11 @@ async fn injected_stream_fn_serves_the_turn_not_the_provider() {
         text, "reply from the injected transport",
         "the injected StreamFn must serve the turn, not the provider"
     );
-    assert_eq!(hits.load(Ordering::SeqCst), 1, "the injected transport must have run exactly once");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "the injected transport must have run exactly once"
+    );
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -180,7 +201,8 @@ async fn proxy_stream_fn_streams_a_live_turn_over_the_wire() {
     ];
     let proxy_url = spawn_proxy_server(frames);
 
-    let provider: Arc<dyn Provider> = scripted_provider("REPLY FROM THE PROVIDER (must not appear)");
+    let provider: Arc<dyn Provider> =
+        scripted_provider("REPLY FROM THE PROVIDER (must not appear)");
     let proxy: Arc<dyn StreamFn> = Arc::new(ProxyStreamFn::new(proxy_url, "test-token"));
 
     let session = Cyrup::builder()
@@ -189,7 +211,10 @@ async fn proxy_stream_fn_streams_a_live_turn_over_the_wire() {
         .await
         .expect("build session with ProxyStreamFn");
 
-    let text = session.run("ping the proxy").await.expect("run completes over the proxy");
+    let text = session
+        .run("ping the proxy")
+        .await
+        .expect("run completes over the proxy");
     assert_eq!(
         text, "streamed via the proxy",
         "ProxyStreamFn must stream the live turn over the wire"
@@ -218,8 +243,7 @@ async fn key_resolver_is_consulted_on_a_live_turn() {
     let fx = fixture();
     let provider: Arc<dyn Provider> = scripted_provider("ok");
     let hits = Arc::new(AtomicUsize::new(0));
-    let resolver: Arc<dyn ApiKeyResolver> =
-        Arc::new(RecordingKeyResolver { hits: hits.clone() });
+    let resolver: Arc<dyn ApiKeyResolver> = Arc::new(RecordingKeyResolver { hits: hits.clone() });
 
     let session = Cyrup::builder()
         .key_resolver(resolver)
@@ -293,8 +317,8 @@ async fn resource_overrides_appear_in_the_system_prompt() {
 /// working built-in provider with no manual provider/auth wiring; an unknown provider errors.
 #[test]
 fn zero_config_provider_resolves_builtins_and_errors_on_unknown() {
-    let anthropic =
-        cyrup_sdk::zero_config_provider("anthropic/claude-opus-4-8").expect("anthropic is built-in");
+    let anthropic = cyrup_sdk::zero_config_provider("anthropic/claude-opus-4-8")
+        .expect("anthropic is built-in");
     assert_eq!(anthropic.id().as_str(), "anthropic");
 
     // A bare provider id resolves too.
@@ -302,7 +326,12 @@ fn zero_config_provider_resolves_builtins_and_errors_on_unknown() {
     assert_eq!(openai.id().as_str(), "openai");
 
     // An unknown provider yields a clear error listing what is available.
-    let err = cyrup_sdk::zero_config_provider("nope/whatever").err().expect("unknown provider errors");
+    let err = cyrup_sdk::zero_config_provider("nope/whatever")
+        .err()
+        .expect("unknown provider errors");
     let msg = err.to_string();
-    assert!(msg.contains("no built-in provider 'nope'"), "unexpected error: {msg}");
+    assert!(
+        msg.contains("no built-in provider 'nope'"),
+        "unexpected error: {msg}"
+    );
 }

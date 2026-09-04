@@ -22,16 +22,18 @@
 //! `this.filteredProviders[this.selectedIndex]` (`:199`) is.
 
 use cyrup_config::login::LoginProviderOption;
+use ratatui::Frame;
 use ratatui::crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
-use crate::auth_select::{format_auth_selector_provider_type, status_indicator_runs, StatusTone};
+use crate::auth_select::{StatusTone, format_auth_selector_provider_type, status_indicator_runs};
 use crate::keymap::{SelectAction, SelectKeymap};
-use crate::selector::{border_rule_line, centered_window, input_line_spans, Selector, SelectorOutcome};
+use crate::selector::{
+    Selector, SelectorOutcome, border_rule_line, centered_window, input_line_spans,
+};
 use crate::text_input::{Input, InputOutcome};
 use crate::text_width::truncate_line_to_width;
 use crate::theme::UiTheme;
@@ -116,9 +118,8 @@ impl OAuthSelector {
                 };
                 ProviderRow {
                     name: o.name.clone(),
-                    auth_type_label: show_auth_type_labels.then(|| {
-                        format!(" [{}]", format_auth_selector_provider_type(o.auth_type))
-                    }),
+                    auth_type_label: show_auth_type_labels
+                        .then(|| format!(" [{}]", format_auth_selector_provider_type(o.auth_type))),
                     status: status_indicator_runs(o),
                     search_text: format!(
                         "{} {} {auth_type} {}",
@@ -206,7 +207,9 @@ impl OAuthSelector {
         let (start, end) = self.window();
         let mut lines = Vec::with_capacity(end.saturating_sub(start).saturating_add(1));
         for i in start..end {
-            let Some(row) = self.filtered.get(i).and_then(|r| self.rows.get(*r)) else { continue };
+            let Some(row) = self.filtered.get(i).and_then(|r| self.rows.get(*r)) else {
+                continue;
+            };
             let is_selected = i == self.selected;
             // `:135-142`: the prefix and the NAME take the accent on the highlighted row; the
             // badge and the status keep their own colours either way.
@@ -216,7 +219,10 @@ impl OAuthSelector {
                     Span::styled(row.name.clone(), theme.accent_style()),
                 ]
             } else {
-                vec![Span::raw("  "), Span::styled(row.name.clone(), theme.base_style())]
+                vec![
+                    Span::raw("  "),
+                    Span::styled(row.name.clone(), theme.base_style()),
+                ]
             };
             if let Some(label) = &row.auth_type_label {
                 spans.push(Span::styled(label.clone(), theme.muted_style()));
@@ -275,7 +281,12 @@ impl Selector for OAuthSelector {
             Line::from(""),
             self.title_line(area.width, theme),
             Line::from(""),
-            Line::from(input_line_spans(self.input.value(), self.input.cursor(), area.width, theme)),
+            Line::from(input_line_spans(
+                self.input.value(),
+                self.input.cursor(),
+                area.width,
+                theme,
+            )),
             Line::from(""),
         ];
         lines.extend(self.body_lines(area.width, theme));
@@ -302,8 +313,10 @@ impl Selector for OAuthSelector {
             }
             Some(SelectAction::Down) | Some(SelectAction::PageDown) => {
                 if !self.filtered.is_empty() {
-                    self.selected =
-                        self.selected.saturating_add(1).min(self.filtered.len().saturating_sub(1));
+                    self.selected = self
+                        .selected
+                        .saturating_add(1)
+                        .min(self.filtered.len().saturating_sub(1));
                 }
                 SelectorOutcome::Redraw
             }

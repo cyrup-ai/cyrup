@@ -51,12 +51,11 @@
 
 use std::path::Path;
 
-
 use cyrup_core::{CancelToken, Tool, ToolCallId};
-use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::discovery::types::AgentReadScope;
 use cyrup_ext_subagents::error::SubagentError;
 use cyrup_ext_subagents::extension::{SubagentExecutor, SubagentsExtension};
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 
 const EXTRA_DIRS_ENV_VAR: &str = "CYRUP_SUBAGENT_EXTRA_AGENT_DIRS";
@@ -80,7 +79,9 @@ impl HomeSandbox {
              User tier and make this test's discovery result non-hermetic. Unset it to run this \
              suite."
         );
-        Self { home: tempfile::tempdir().expect("home tempdir") }
+        Self {
+            home: tempfile::tempdir().expect("home tempdir"),
+        }
     }
 
     fn path(&self) -> &Path {
@@ -102,8 +103,11 @@ fn write_agent(dir: &Path, name: &str, frontmatter_extra: &str) {
 fn write_project_settings(root: &Path, subagents_json: &str) {
     let dir = root.join(".cyrup").join("agents");
     std::fs::create_dir_all(&dir).expect("mkdir .cyrup/agents");
-    std::fs::write(dir.join("settings.json"), format!("{{\"subagents\":{subagents_json}}}"))
-        .expect("write settings.json");
+    std::fs::write(
+        dir.join("settings.json"),
+        format!("{{\"subagents\":{subagents_json}}}"),
+    )
+    .expect("write settings.json");
 }
 
 /// The two-candidate repository this file's G101 tests run against:
@@ -154,14 +158,24 @@ async fn git_root_resolution_moves_both_the_agent_dirs_and_the_settings_file() {
 
     // Half A — the READ DIRS came from the git root: its agent is visible...
     let repo_agent = executor
-        .resolve_agent(&app, "repo-agent", AgentReadScope::Both, &Roots::sandboxed(sandbox.path()))
+        .resolve_agent(
+            &app,
+            "repo-agent",
+            AgentReadScope::Both,
+            &Roots::sandboxed(sandbox.path()),
+        )
         .expect("the repo-root project agent must be discoverable from the nested cwd");
     assert_eq!(repo_agent.name, "repo-agent");
 
     // ...and the nearest candidate's own agent dir is NOT scanned at all, which is what proves the
     // root MOVED rather than merely widened.
     let missed = executor
-        .resolve_agent(&app, "app-agent", AgentReadScope::Both, &Roots::sandboxed(sandbox.path()))
+        .resolve_agent(
+            &app,
+            "app-agent",
+            AgentReadScope::Both,
+            &Roots::sandboxed(sandbox.path()),
+        )
         .expect_err("git-root resolution must stop scanning the nearest candidate's agent dir");
     assert!(
         matches!(missed, SubagentError::AgentNotFound(_)),
@@ -196,12 +210,22 @@ async fn nearest_resolution_pins_both_the_agent_dirs_and_the_settings_file_at_th
     let executor = SubagentExecutor::new();
 
     let app_agent = executor
-        .resolve_agent(&app, "app-agent", AgentReadScope::Both, &Roots::sandboxed(sandbox.path()))
+        .resolve_agent(
+            &app,
+            "app-agent",
+            AgentReadScope::Both,
+            &Roots::sandboxed(sandbox.path()),
+        )
         .expect("the nearest candidate's own agent must be discoverable");
     assert_eq!(app_agent.name, "app-agent");
 
     let missed = executor
-        .resolve_agent(&app, "repo-agent", AgentReadScope::Both, &Roots::sandboxed(sandbox.path()))
+        .resolve_agent(
+            &app,
+            "repo-agent",
+            AgentReadScope::Both,
+            &Roots::sandboxed(sandbox.path()),
+        )
         .expect_err("nearest resolution must not reach out to the repository root's agents");
     assert!(
         matches!(missed, SubagentError::AgentNotFound(_)),
@@ -260,7 +284,10 @@ async fn an_ambiguous_alias_in_a_task_list_aborts_the_live_tool_dispatch_with_it
     let cwd = tempfile::tempdir().expect("tempdir");
     write_ambiguous_alias_pair(cwd.path());
 
-    let err = dispatch(cwd.path(), sandbox.path(), serde_json::json!({
+    let err = dispatch(
+        cwd.path(),
+        sandbox.path(),
+        serde_json::json!({
             "tasks": [
                 { "agent": "seer", "task": "a" },
                 { "agent": "prophet", "task": "b" }
@@ -284,7 +311,10 @@ async fn an_ambiguous_alias_in_a_chain_parallel_step_aborts_the_live_tool_dispat
     let cwd = tempfile::tempdir().expect("tempdir");
     write_ambiguous_alias_pair(cwd.path());
 
-    let err = dispatch(cwd.path(), sandbox.path(), serde_json::json!({
+    let err = dispatch(
+        cwd.path(),
+        sandbox.path(),
+        serde_json::json!({
             "chain": [
                 { "agent": "seer", "task": "first" },
                 { "parallel": [
@@ -312,7 +342,10 @@ async fn an_ambiguous_top_level_alias_aborts_the_live_tool_dispatch_without_a_lo
     let cwd = tempfile::tempdir().expect("tempdir");
     write_ambiguous_alias_pair(cwd.path());
 
-    let err = dispatch(cwd.path(), sandbox.path(), serde_json::json!({ "agent": "prophet", "task": "decide" }),
+    let err = dispatch(
+        cwd.path(),
+        sandbox.path(),
+        serde_json::json!({ "agent": "prophet", "task": "decide" }),
     )
     .await
     .expect_err("an ambiguous alias must abort the dispatch");

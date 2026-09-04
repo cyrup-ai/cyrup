@@ -21,21 +21,26 @@
 //!
 //! Both tests assert an OBSERVABLE effect — a truncated provider conversation, and the values a
 //! handler actually read back — never that `HostServices::control(...)` returned `Ok`.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::{SessionBuilder, SessionConfig};
 use cyrup_core::{ExtensionId, StopReason};
 use cyrup_ext::{
-    ControlOp, ExtError, HostCtx, HostEvent, HookOutcome, HostServices, InitApi, NativeExtension,
-};
-use cyrup_provider::faux::{
-    faux_assistant_message, faux_text, faux_tool_call, FauxProvider, FauxResponseStep,
+    ControlOp, ExtError, HookOutcome, HostCtx, HostEvent, HostServices, InitApi, NativeExtension,
 };
 use cyrup_provider::Provider;
-use crate::{SessionBuilder, SessionConfig};
+use cyrup_provider::faux::{
+    FauxProvider, FauxResponseStep, faux_assistant_message, faux_text, faux_tool_call,
+};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -51,7 +56,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -118,7 +127,10 @@ fn faux_tool_then_more(turns: &Arc<AtomicUsize>) -> Arc<FauxProvider> {
     let b = turns.clone();
     let rest = FauxResponseStep::factory(move |_ctx, _o, _s, _m| {
         b.fetch_add(1, Ordering::SeqCst);
-        faux_assistant_message(vec![faux_text("continued after the tool")], StopReason::Stop)
+        faux_assistant_message(
+            vec![faux_text("continued after the tool")],
+            StopReason::Stop,
+        )
     });
     let faux = Arc::new(FauxProvider::new());
     faux.set_response_steps(vec![first, rest.clone(), rest]);
@@ -135,19 +147,28 @@ async fn ctx_abort_from_an_event_handler_stops_the_in_flight_run() {
     let ext = Arc::new(AbortOnToolCall::default());
     let fired = ext.fired.clone();
 
-    let session =
-        SessionBuilder::new(faux_tool_then_more(&turns) as Arc<dyn Provider>, base_config(&fx))
-            .with_native_extension(ext as Arc<dyn NativeExtension>)
-            .build()
-            .await
-            .unwrap()
-            .into_shared();
+    let session = SessionBuilder::new(
+        faux_tool_then_more(&turns) as Arc<dyn Provider>,
+        base_config(&fx),
+    )
+    .with_native_extension(ext as Arc<dyn NativeExtension>)
+    .build()
+    .await
+    .unwrap()
+    .into_shared();
 
     let _ = session.prompt("use a tool please").await.unwrap();
     session.wait_for_idle().await;
 
-    assert_eq!(fired.load(Ordering::SeqCst), 1, "the tool_call handler ran exactly once");
-    assert!(turns.load(Ordering::SeqCst) >= 1, "the model was asked at least once");
+    assert_eq!(
+        fired.load(Ordering::SeqCst),
+        1,
+        "the tool_call handler ran exactly once"
+    );
+    assert!(
+        turns.load(Ordering::SeqCst) >= 1,
+        "the model was asked at least once"
+    );
 
     let transcript = session
         .messages()
@@ -237,26 +258,43 @@ async fn the_ctx_state_accessors_answer_from_the_live_session() {
     let ext = Arc::new(StateProbe::default());
     let observed = ext.observed.clone();
 
-    let session =
-        SessionBuilder::new(faux_tool_then_more(&turns) as Arc<dyn Provider>, base_config(&fx))
-            .with_native_extension(ext as Arc<dyn NativeExtension>)
-            .build()
-            .await
-            .unwrap()
-            .into_shared();
+    let session = SessionBuilder::new(
+        faux_tool_then_more(&turns) as Arc<dyn Provider>,
+        base_config(&fx),
+    )
+    .with_native_extension(ext as Arc<dyn NativeExtension>)
+    .build()
+    .await
+    .unwrap()
+    .into_shared();
 
     // A follow-up queued BEFORE the run makes `hasPendingMessages` observably true mid-run
     // (Pi `pendingMessageCount > 0`).
-    let _ = session.follow_up("queued while the run is going").await.unwrap();
+    let _ = session
+        .follow_up("queued while the run is going")
+        .await
+        .unwrap();
     let _ = session.prompt("use a tool please").await.unwrap();
     session.wait_for_idle().await;
 
-    let (is_idle, has_pending, trusted, prompt) =
-        observed.lock().unwrap().clone().expect("the tool_call handler observed the ctx state");
+    let (is_idle, has_pending, trusted, prompt) = observed
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the tool_call handler observed the ctx state");
 
-    assert!(!is_idle, "a handler dispatched mid-run must observe the session as NOT idle");
-    assert!(has_pending, "the queued follow-up is visible as a pending message");
-    assert!(trusted, "this session was built with trust_override = Some(true)");
+    assert!(
+        !is_idle,
+        "a handler dispatched mid-run must observe the session as NOT idle"
+    );
+    assert!(
+        has_pending,
+        "the queued follow-up is visible as a pending message"
+    );
+    assert!(
+        trusted,
+        "this session was built with trust_override = Some(true)"
+    );
     assert!(
         prompt.contains("coding assistant"),
         "the handler read the session's REAL system prompt, not an empty default: {prompt:?}"

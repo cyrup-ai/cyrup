@@ -13,7 +13,12 @@
 //! subprocess (the same `cyrup-intercom-broker` fixture binary `broker_roundtrip.rs` uses) with an
 //! invalid ask-timeout env var and asserts NEITHER the socket NOR the pid file is ever created.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::time::Duration;
 
@@ -40,7 +45,10 @@ async fn invalid_ask_timeout_env_fails_before_any_socket_or_pid_file_exists() {
         .expect("the broker must exit promptly on an invalid ask-timeout env var, not hang")
         .expect("wait succeeds");
 
-    assert!(!status.success(), "an invalid ask-timeout env var must be a hard startup failure");
+    assert!(
+        !status.success(),
+        "an invalid ask-timeout env var must be a hard startup failure"
+    );
     assert!(
         !socket_path.exists(),
         "the socket must never be bound before the ask-timeout env var is validated"

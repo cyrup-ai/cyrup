@@ -5,8 +5,8 @@
 //! func-10 component contract (state + render + invalidate) as the stable surface while ratatui
 //! does the cell-level diffing underneath.
 
-use ratatui::layout::Rect;
 use ratatui::Frame;
+use ratatui::layout::Rect;
 
 use crate::theme::UiTheme;
 

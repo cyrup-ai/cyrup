@@ -38,13 +38,13 @@ use serde_json::Value;
 use sha2::Digest as _;
 
 use super::{
+    GlobalMissionIndexRecord, GlobalMissionListResult, MISSION_SCHEMA_VERSION, MISSION_STATUSES,
     MissionArtifact, MissionArtifactKind, MissionCreateInput, MissionDecision,
     MissionDecisionStatus, MissionError, MissionGoal, MissionGoalStatus, MissionGoalUpdate,
-    MissionIndexEntry, MissionListResult, MissionReceipt, MissionReceiptKind,
-    MissionReceiptStatus, MissionRecord, MissionResult, MissionRunLink, MissionRunMode,
-    MissionStatus, MissionStoreConfig, MissionStoreLocation, MissionTokenBudget, MissionTokenUsage,
-    MissionUpdateInput, GlobalMissionIndexRecord, GlobalMissionListResult, MISSION_SCHEMA_VERSION,
-    MISSION_STATUSES,
+    MissionIndexEntry, MissionListResult, MissionReceipt, MissionReceiptKind, MissionReceiptStatus,
+    MissionRecord, MissionResult, MissionRunLink, MissionRunMode, MissionStatus,
+    MissionStoreConfig, MissionStoreLocation, MissionTokenBudget, MissionTokenUsage,
+    MissionUpdateInput,
 };
 
 /// pi `MISSION_ID_PATTERN` (`store.ts:32`): `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`. Implemented as a
@@ -79,7 +79,10 @@ pub const DEFAULT_TERMINAL_MISSION_RETENTION: u64 = 200;
 // =================================================================================================
 
 /// pi `asObject` (`store.ts:41-44`).
-fn as_object<'a>(value: &'a Value, label: &str) -> MissionResult<&'a serde_json::Map<String, Value>> {
+fn as_object<'a>(
+    value: &'a Value,
+    label: &str,
+) -> MissionResult<&'a serde_json::Map<String, Value>> {
     value
         .as_object()
         .ok_or_else(|| MissionError::invalid(format!("{label} must be a JSON object")))
@@ -90,7 +93,9 @@ fn as_object<'a>(value: &'a Value, label: &str) -> MissionResult<&'a serde_json:
 fn required_string<'a>(value: Option<&'a Value>, label: &str) -> MissionResult<&'a str> {
     match value.and_then(Value::as_str) {
         Some(s) if !s.trim().is_empty() => Ok(s),
-        _ => Err(MissionError::invalid(format!("{label} must be a non-empty string"))),
+        _ => Err(MissionError::invalid(format!(
+            "{label} must be a non-empty string"
+        ))),
     }
 }
 
@@ -114,7 +119,9 @@ fn optional_string<'a>(value: Option<&'a Value>, label: &str) -> MissionResult<O
 fn parse_timestamp<'a>(value: Option<&'a Value>, label: &str) -> MissionResult<&'a str> {
     let raw = required_string(value, label)?;
     if !is_iso8601_datetime(raw.trim()) {
-        return Err(MissionError::invalid(format!("{label} must be an ISO timestamp")));
+        return Err(MissionError::invalid(format!(
+            "{label} must be an ISO timestamp"
+        )));
     }
     Ok(raw)
 }
@@ -127,9 +134,14 @@ fn is_iso8601_datetime(value: &str) -> bool {
         return false;
     }
     let digits = |range: std::ops::Range<usize>| -> bool {
-        bytes.get(range).is_some_and(|s| s.iter().all(u8::is_ascii_digit))
+        bytes
+            .get(range)
+            .is_some_and(|s| s.iter().all(u8::is_ascii_digit))
     };
-    if !digits(0..4) || bytes.get(4) != Some(&b'-') || !digits(5..7) || bytes.get(7) != Some(&b'-')
+    if !digits(0..4)
+        || bytes.get(4) != Some(&b'-')
+        || !digits(5..7)
+        || bytes.get(7) != Some(&b'-')
         || !digits(8..10)
     {
         return false;
@@ -144,7 +156,10 @@ fn is_iso8601_datetime(value: &str) -> bool {
     // Split off the trailing offset (`Z`, `+HH:MM`, `-HHMM`) before validating the clock part.
     let (clock, offset) = match time.rfind(['+', '-']) {
         // A leading sign would mean there is no clock part at all.
-        Some(idx) if idx > 0 => (time.get(..idx).unwrap_or_default(), time.get(idx..).unwrap_or_default()),
+        Some(idx) if idx > 0 => (
+            time.get(..idx).unwrap_or_default(),
+            time.get(idx..).unwrap_or_default(),
+        ),
         _ => match time.strip_suffix('Z').or_else(|| time.strip_suffix('z')) {
             Some(clock) => (clock, ""),
             None => (time, ""),
@@ -160,7 +175,11 @@ fn is_iso8601_datetime(value: &str) -> bool {
     let (Some(hh), Some(mm)) = (parts.next(), parts.next()) else {
         return false;
     };
-    if hh.len() != 2 || mm.len() != 2 || !hh.bytes().all(|b| b.is_ascii_digit()) || !mm.bytes().all(|b| b.is_ascii_digit()) {
+    if hh.len() != 2
+        || mm.len() != 2
+        || !hh.bytes().all(|b| b.is_ascii_digit())
+        || !mm.bytes().all(|b| b.is_ascii_digit())
+    {
         return false;
     }
     match parts.next() {
@@ -186,13 +205,19 @@ fn parse_mission_status(value: Option<&Value>, label: &str) -> MissionResult<Mis
     value
         .and_then(Value::as_str)
         .and_then(MissionStatus::from_wire)
-        .ok_or_else(|| MissionError::invalid(format!("{label} must be one of {}", mission_status_list())))
+        .ok_or_else(|| {
+            MissionError::invalid(format!("{label} must be one of {}", mission_status_list()))
+        })
 }
 
 /// `MISSION_STATUSES.join(", ")` — the exact tail of two upstream error messages
 /// (`store.ts:64`, `actions.ts:101`).
 pub(super) fn mission_status_list() -> String {
-    MISSION_STATUSES.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+    MISSION_STATUSES
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// JS `Number.isSafeInteger(value)` for a `serde_json` number: an integral value within
@@ -206,7 +231,9 @@ fn as_safe_integer(value: Option<&Value>) -> Option<i64> {
 fn positive_token_count(value: Option<&Value>, label: &str) -> MissionResult<u64> {
     match as_safe_integer(value) {
         Some(n) if n >= 1 => Ok(n.unsigned_abs()),
-        _ => Err(MissionError::invalid(format!("{label} must be a positive integer"))),
+        _ => Err(MissionError::invalid(format!(
+            "{label} must be a positive integer"
+        ))),
     }
 }
 
@@ -214,7 +241,9 @@ fn positive_token_count(value: Option<&Value>, label: &str) -> MissionResult<u64
 fn non_negative_token_count(value: Option<&Value>, label: &str) -> MissionResult<u64> {
     match as_safe_integer(value) {
         Some(n) if n >= 0 => Ok(n.unsigned_abs()),
-        _ => Err(MissionError::invalid(format!("{label} must be a non-negative integer"))),
+        _ => Err(MissionError::invalid(format!(
+            "{label} must be a non-negative integer"
+        ))),
     }
 }
 
@@ -228,9 +257,15 @@ struct StoredGoal {
 fn parse_stored_goal(value: &Value, label: &str) -> MissionResult<StoredGoal> {
     if value.is_string() {
         let s = required_string(Some(value), label)?;
-        return Ok(StoredGoal { goal: None, legacy_objective: Some(s.trim().to_string()) });
+        return Ok(StoredGoal {
+            goal: None,
+            legacy_objective: Some(s.trim().to_string()),
+        });
     }
-    Ok(StoredGoal { goal: Some(parse_goal(value, label)?), legacy_objective: None })
+    Ok(StoredGoal {
+        goal: Some(parse_goal(value, label)?),
+        legacy_objective: None,
+    })
 }
 
 /// pi `parseGoal` (`store.ts:84-88`).
@@ -263,13 +298,15 @@ fn parse_usage(value: &Value, label: &str) -> MissionResult<MissionTokenUsage> {
 /// pi `stringArray` (`store.ts:100-104`): every element a non-empty string, TRIMMED, then
 /// de-duplicated with `[...new Set(result)]` — which preserves FIRST-occurrence order.
 fn parse_string_array(value: &Value, label: &str) -> MissionResult<Vec<String>> {
-    let items = value
-        .as_array()
-        .ok_or_else(|| MissionError::invalid(format!("{label} must be an array of non-empty strings")))?;
+    let items = value.as_array().ok_or_else(|| {
+        MissionError::invalid(format!("{label} must be an array of non-empty strings"))
+    })?;
     let mut seen = BTreeSet::new();
     let mut out = Vec::with_capacity(items.len());
     for (index, item) in items.iter().enumerate() {
-        let trimmed = required_string(Some(item), &format!("{label}[{index}]"))?.trim().to_string();
+        let trimmed = required_string(Some(item), &format!("{label}[{index}]"))?
+            .trim()
+            .to_string();
         if seen.insert(trimmed.clone()) {
             out.push(trimmed);
         }
@@ -296,7 +333,9 @@ pub fn validate_mission_id(value: Option<&Value>, label: &str) -> MissionResult<
 /// As [`validate_mission_id`].
 pub fn validate_mission_id_str(id: &str, label: &str) -> MissionResult<String> {
     if id.trim().is_empty() {
-        return Err(MissionError::invalid(format!("{label} must be a non-empty string")));
+        return Err(MissionError::invalid(format!(
+            "{label} must be a non-empty string"
+        )));
     }
     if !matches_mission_id_pattern(id) || id.contains("..") {
         return Err(MissionError::invalid(format!(
@@ -410,7 +449,9 @@ fn parse_receipt(value: &Value, label: &str) -> MissionResult<MissionReceipt> {
         .ok_or_else(|| MissionError::invalid(format!("{label}.status is invalid")))?;
     let url = required_string(input.get("url"), &format!("{label}.url"))?;
     if !is_absolute_url(url) {
-        return Err(MissionError::invalid(format!("{label}.url must be an absolute URL")));
+        return Err(MissionError::invalid(format!(
+            "{label}.url must be an absolute URL"
+        )));
     }
     Ok(MissionReceipt {
         kind,
@@ -442,7 +483,9 @@ pub fn parse_mission_record(value: &Value, source: &str) -> MissionResult<Missio
     let input = as_object(value, source)?;
     if input.get("schemaVersion").and_then(Value::as_u64) != Some(u64::from(MISSION_SCHEMA_VERSION))
     {
-        return Err(MissionError::invalid(format!("{source}.schemaVersion must be 1")));
+        return Err(MissionError::invalid(format!(
+            "{source}.schemaVersion must be 1"
+        )));
     }
     let runs = input
         .get("runs")
@@ -464,7 +507,10 @@ pub fn parse_mission_record(value: &Value, source: &str) -> MissionResult<Missio
             .as_slice(),
     };
     let parsed_goal = match input.get("goal") {
-        None | Some(Value::Null) => StoredGoal { goal: None, legacy_objective: None },
+        None | Some(Value::Null) => StoredGoal {
+            goal: None,
+            legacy_objective: None,
+        },
         Some(v) => parse_stored_goal(v, &format!("{source}.goal"))?,
     };
     let budget = match input.get("budget") {
@@ -601,13 +647,19 @@ pub fn validate_mission_store_config(
     let enabled = match input.get("enabled") {
         None => None,
         Some(Value::Bool(b)) => Some(*b),
-        Some(_) => return Err(MissionError::invalid(format!("{label}.enabled must be boolean"))),
+        Some(_) => {
+            return Err(MissionError::invalid(format!(
+                "{label}.enabled must be boolean"
+            )));
+        }
     };
     let global_index = match input.get("globalIndex") {
         None => None,
         Some(Value::Bool(b)) => Some(*b),
         Some(_) => {
-            return Err(MissionError::invalid(format!("{label}.globalIndex must be boolean")));
+            return Err(MissionError::invalid(format!(
+                "{label}.globalIndex must be boolean"
+            )));
         }
     };
     let retain_terminal = match input.get("retainTerminal") {
@@ -622,8 +674,10 @@ pub fn validate_mission_store_config(
         },
     };
     let directory = optional_string(input.get("directory"), &format!("{label}.directory"))?;
-    let global_index_dir =
-        optional_string(input.get("globalIndexDir"), &format!("{label}.globalIndexDir"))?;
+    let global_index_dir = optional_string(
+        input.get("globalIndexDir"),
+        &format!("{label}.globalIndexDir"),
+    )?;
     Ok(Some(MissionStoreConfig {
         enabled,
         directory: directory.map(str::to_string),
@@ -662,7 +716,9 @@ pub fn resolve_mission_store_location(
     let project_root = normalize_lexically(&if project_root.is_absolute() {
         project_root.to_path_buf()
     } else {
-        std::env::current_dir().unwrap_or_default().join(project_root)
+        std::env::current_dir()
+            .unwrap_or_default()
+            .join(project_root)
     });
     let mission_dir = match config.and_then(|c| c.directory.as_deref()) {
         Some(dir) => expand_configured_path(dir, &project_root),
@@ -704,7 +760,9 @@ fn parse_index_entry(value: &Value, source: &str) -> MissionResult<MissionIndexE
     let input = as_object(value, source)?;
     if input.get("schemaVersion").and_then(Value::as_u64) != Some(u64::from(MISSION_SCHEMA_VERSION))
     {
-        return Err(MissionError::invalid(format!("{source}.schemaVersion must be 1")));
+        return Err(MissionError::invalid(format!(
+            "{source}.schemaVersion must be 1"
+        )));
     }
     Ok(MissionIndexEntry {
         schema_version: MISSION_SCHEMA_VERSION,
@@ -826,7 +884,9 @@ pub fn create_mission(
         )?
         .trim()
         .to_string(),
-        goal: goal_enabled.then_some(MissionGoal { status: MissionGoalStatus::Active }),
+        goal: goal_enabled.then_some(MissionGoal {
+            status: MissionGoalStatus::Active,
+        }),
         budget: match &input.budget {
             None => None,
             Some(budget) => Some(parse_budget(
@@ -942,22 +1002,26 @@ pub fn list_missions(location: &MissionStoreLocation) -> MissionListResult {
     MissionListResult { records, warnings }
 }
 
-/// pi `updateMission` (`store.ts:406-475`) — the merge core of the whole subsystem.
+/// pi `updateMission` (`store.ts:439-547` @v0.64.0; `:406-475` @v0.43.0) — the merge core of the
+/// whole subsystem.
 ///
 /// The four `add*` lists are UPSERTS, each with its own identity:
 /// * runs on `(runId, childIndex)`, merged field-by-field over the existing link;
 /// * artifacts on `(kind, resolved path)`, likewise merged;
 /// * receipts on `(kind, url)`, replaced but KEEPING the original `createdAt`;
-/// * decisions are always appended as NEW, open decisions with fresh ids.
+/// * decisions are always appended as NEW, open decisions with fresh ids — and then
+///   `resolve_decision` (SUBA-085) flips exactly one existing open decision to `resolved`.
 ///
 /// Usage is RECOMPUTED from `runs[].usage` unless explicitly supplied, and goal status then
-/// transitions to `budget-exhausted` (or back to `active`) against the budget.
+/// transitions to `budget-exhausted` (or back to `active`) against the budget. The mission status
+/// is gated on open decisions (`store.ts:521-529` @v0.64.0): see the inline note at the gate.
 ///
 /// # Errors
 ///
 /// [`MissionError::NotFound`] when the record is missing, [`MissionError::Invalid`] for any
-/// failed validation (including "budget is required when enabling a goal mission"), or
-/// [`MissionError::Io`] when the merged record cannot be persisted.
+/// failed validation (including "budget is required when enabling a goal mission", an unknown
+/// or already-resolved decision id), or [`MissionError::Io`] when the merged record cannot be
+/// persisted.
 pub fn update_mission(
     location: &MissionStoreLocation,
     mission_id: &str,
@@ -972,8 +1036,7 @@ pub fn update_mission(
     let mut runs = current.runs.clone();
     for candidate in &update.add_runs {
         let run = parse_run_link(
-            &serde_json::to_value(candidate)
-                .map_err(|e| MissionError::invalid(e.to_string()))?,
+            &serde_json::to_value(candidate).map_err(|e| MissionError::invalid(e.to_string()))?,
             "mission.update.addRuns[]",
         )?;
         match runs
@@ -993,8 +1056,7 @@ pub fn update_mission(
     let mut artifacts = current.artifacts.clone();
     for candidate in &update.add_artifacts {
         let artifact = parse_artifact(
-            &serde_json::to_value(candidate)
-                .map_err(|e| MissionError::invalid(e.to_string()))?,
+            &serde_json::to_value(candidate).map_err(|e| MissionError::invalid(e.to_string()))?,
             "mission.update.addArtifacts[]",
         )?;
         let resolved = resolve_for_comparison(&artifact.path);
@@ -1032,7 +1094,10 @@ pub fn update_mission(
             Some(index) => {
                 if let Some(existing) = receipts.get_mut(index) {
                     let original_created_at = existing.created_at.clone();
-                    *existing = MissionReceipt { created_at: original_created_at, ..receipt };
+                    *existing = MissionReceipt {
+                        created_at: original_created_at,
+                        ..receipt
+                    };
                 }
             }
         }
@@ -1084,6 +1149,37 @@ pub fn update_mission(
         });
     }
 
+    // ---- resolve ONE open decision (SUBA-085, `store.ts:497-508` @v0.64.0) --------------------
+    // Runs AFTER the append loop, over the merged list, exactly as upstream does. Both refusals
+    // are upstream's verbatim text; the resolution is validated as a non-empty string and stored
+    // trimmed, and `resolvedAt` is the same `createdAt` stamp the rest of this update carries.
+    if let Some(resolve) = &update.resolve_decision {
+        let decision_id =
+            validate_mission_id_str(&resolve.id, "mission.update.resolveDecision.id")?;
+        let Some(decision) = decisions
+            .iter_mut()
+            .find(|decision| decision.id == decision_id)
+        else {
+            return Err(MissionError::invalid(format!(
+                "Decision '{decision_id}' was not found in mission '{mission_id}'"
+            )));
+        };
+        if decision.status == MissionDecisionStatus::Resolved {
+            return Err(MissionError::invalid(format!(
+                "Decision '{decision_id}' is already resolved"
+            )));
+        }
+        let resolution = required_string(
+            Some(&Value::String(resolve.resolution.clone())),
+            "mission.update.resolveDecision.resolution",
+        )?
+        .trim()
+        .to_string();
+        decision.status = MissionDecisionStatus::Resolved;
+        decision.resolved_at = Some(created_at.clone());
+        decision.resolution = Some(resolution);
+    }
+
     // ---- budget / usage / goal ----------------------------------------------------------------
     let budget = match &update.budget {
         Some(b) => Some(parse_budget(
@@ -1098,7 +1194,10 @@ pub fn update_mission(
             "mission.update.usage",
         )?,
         None => MissionTokenUsage {
-            tokens: runs.iter().filter_map(|run| run.usage.map(|u| u.tokens)).sum(),
+            tokens: runs
+                .iter()
+                .filter_map(|run| run.usage.map(|u| u.tokens))
+                .sum(),
         },
     };
     let mut goal = match update.goal {
@@ -1116,13 +1215,52 @@ pub fn update_mission(
     }
     if let (Some(current_goal), Some(budget)) = (goal, budget) {
         goal = Some(if usage.tokens >= budget.tokens {
-            MissionGoal { status: MissionGoalStatus::BudgetExhausted }
+            MissionGoal {
+                status: MissionGoalStatus::BudgetExhausted,
+            }
         } else if current_goal.status == MissionGoalStatus::BudgetExhausted {
-            MissionGoal { status: MissionGoalStatus::Active }
+            MissionGoal {
+                status: MissionGoalStatus::Active,
+            }
         } else {
             current_goal
         });
     }
+
+    // ---- status: the decision gate (SUBA-085, `store.ts:521-529` @v0.64.0) -------------------
+    // Entered at v0.47.1 with `resolveDecision` (`1dec33dd`); v0.43.0 wrote
+    // `update.status ?? current.status` and nothing else. An explicit `status` is always the
+    // candidate. Otherwise appending a decision to an ACTIVE mission gates it as `needs_decision`,
+    // and resolving the LAST open decision of a `needs_decision` mission returns it to `active`
+    // (a `planned`/`waiting` mission keeps its lifecycle status either way). Then, whatever the
+    // candidate, an `active`/`completed` mission that still has an open decision is held at
+    // `needs_decision` — which is also why `mission.close` cannot complete a mission over an
+    // unresolved decision.
+    let has_open_decisions = decisions
+        .iter()
+        .any(|decision| decision.status == MissionDecisionStatus::Open);
+    let candidate_status = match update.status {
+        Some(requested) => requested,
+        None if !update.add_decisions.is_empty() && current.status == MissionStatus::Active => {
+            MissionStatus::NeedsDecision
+        }
+        None if update.resolve_decision.is_some()
+            && current.status == MissionStatus::NeedsDecision
+            && !has_open_decisions =>
+        {
+            MissionStatus::Active
+        }
+        None => current.status,
+    };
+    let status = if has_open_decisions
+        && matches!(
+            candidate_status,
+            MissionStatus::Active | MissionStatus::Completed
+        ) {
+        MissionStatus::NeedsDecision
+    } else {
+        candidate_status
+    };
 
     // ---- assemble ------------------------------------------------------------------------------
     // pi spreads `...current` first, so every field not named below is carried over verbatim; note
@@ -1145,8 +1283,12 @@ pub fn update_mission(
         },
         goal,
         budget,
-        usage: if goal.is_some() { Some(usage) } else { current.usage },
-        status: update.status.unwrap_or(current.status),
+        usage: if goal.is_some() {
+            Some(usage)
+        } else {
+            current.usage
+        },
+        status,
         updated_at: created_at,
         runs,
         decisions,
@@ -1187,12 +1329,21 @@ fn merge_run_link(existing: &MissionRunLink, incoming: &MissionRunLink) -> Missi
     MissionRunLink {
         run_id: incoming.run_id.clone(),
         mode: incoming.mode,
-        async_dir: incoming.async_dir.clone().or_else(|| existing.async_dir.clone()),
+        async_dir: incoming
+            .async_dir
+            .clone()
+            .or_else(|| existing.async_dir.clone()),
         child_index: incoming.child_index.or(existing.child_index),
         agent: incoming.agent.clone().or_else(|| existing.agent.clone()),
         status: incoming.status.clone().or_else(|| existing.status.clone()),
-        started_at: incoming.started_at.clone().or_else(|| existing.started_at.clone()),
-        completed_at: incoming.completed_at.clone().or_else(|| existing.completed_at.clone()),
+        started_at: incoming
+            .started_at
+            .clone()
+            .or_else(|| existing.started_at.clone()),
+        completed_at: incoming
+            .completed_at
+            .clone()
+            .or_else(|| existing.completed_at.clone()),
         usage: incoming.usage.or(existing.usage),
     }
 }
@@ -1202,7 +1353,10 @@ fn merge_artifact(existing: &MissionArtifact, incoming: &MissionArtifact) -> Mis
     MissionArtifact {
         kind: incoming.kind,
         path: incoming.path.clone(),
-        description: incoming.description.clone().or_else(|| existing.description.clone()),
+        description: incoming
+            .description
+            .clone()
+            .or_else(|| existing.description.clone()),
     }
 }
 
@@ -1242,8 +1396,9 @@ pub fn list_global_missions(global_index_dir: &Path) -> GlobalMissionListResult 
         let entry = match parsed {
             Ok(entry) => entry,
             Err(e) => {
-                warnings
-                    .push(format!("Skipped corrupt global mission index entry '{display}': {e}"));
+                warnings.push(format!(
+                    "Skipped corrupt global mission index entry '{display}': {e}"
+                ));
                 continue;
             }
         };
@@ -1311,7 +1466,7 @@ mod tests {
     )]
 
     use super::*;
-    use crate::missions::MissionDecisionInput;
+    use crate::missions::{MissionDecisionInput, MissionDecisionResolution};
 
     fn location(root: &Path) -> MissionStoreLocation {
         MissionStoreLocation {
@@ -1339,7 +1494,9 @@ mod tests {
 
     #[test]
     fn mission_id_pattern_rejects_traversal_and_accepts_a_uuid() {
-        assert!(validate_mission_id_str(&uuid::Uuid::new_v4().hyphenated().to_string(), "id").is_ok());
+        assert!(
+            validate_mission_id_str(&uuid::Uuid::new_v4().hyphenated().to_string(), "id").is_ok()
+        );
         assert!(validate_mission_id_str("a.b_c-d", "id").is_ok());
         let err = validate_mission_id_str("../escape", "missionId").unwrap_err();
         assert_eq!(
@@ -1370,7 +1527,10 @@ mod tests {
         let record = create(&loc, "Ship it");
         assert_eq!(record.status, MissionStatus::Planned);
         assert_eq!(record.title, "Ship it");
-        assert_eq!(record.cwd.as_deref(), Some(tmp.path().to_string_lossy().as_ref()));
+        assert_eq!(
+            record.cwd.as_deref(),
+            Some(tmp.path().to_string_lossy().as_ref())
+        );
 
         let read_back = read_mission(&loc, &record.id).unwrap();
         assert_eq!(read_back, record);
@@ -1397,7 +1557,10 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert_eq!(err.to_string(), "mission.budget is required when mission.goal is true");
+        assert_eq!(
+            err.to_string(),
+            "mission.budget is required when mission.goal is true"
+        );
     }
 
     #[test]
@@ -1406,7 +1569,10 @@ mod tests {
         let loc = location(tmp.path());
         let err = read_mission(&loc, "missing-mission").unwrap_err();
         assert!(matches!(err, MissionError::NotFound { .. }), "{err}");
-        assert!(err.to_string().starts_with("Mission 'missing-mission' was not found in "));
+        assert!(
+            err.to_string()
+                .starts_with("Mission 'missing-mission' was not found in ")
+        );
     }
 
     #[test]
@@ -1428,7 +1594,10 @@ mod tests {
         let after_first = update_mission(
             &loc,
             &record.id,
-            &MissionUpdateInput { add_runs: vec![base.clone()], ..Default::default() },
+            &MissionUpdateInput {
+                add_runs: vec![base.clone()],
+                ..Default::default()
+            },
             1000,
             None,
         )
@@ -1462,7 +1631,10 @@ mod tests {
             &loc,
             &record.id,
             &MissionUpdateInput {
-                add_runs: vec![MissionRunLink { child_index: Some(1), ..base }],
+                add_runs: vec![MissionRunLink {
+                    child_index: Some(1),
+                    ..base
+                }],
                 ..Default::default()
             },
             3000,
@@ -1513,7 +1685,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(updated.usage.unwrap().tokens, 120);
-        assert_eq!(updated.goal.unwrap().status, MissionGoalStatus::BudgetExhausted);
+        assert_eq!(
+            updated.goal.unwrap().status,
+            MissionGoalStatus::BudgetExhausted
+        );
     }
 
     #[test]
@@ -1531,7 +1706,10 @@ mod tests {
         let first = update_mission(
             &loc,
             &record.id,
-            &MissionUpdateInput { add_receipts: vec![receipt.clone()], ..Default::default() },
+            &MissionUpdateInput {
+                add_receipts: vec![receipt.clone()],
+                ..Default::default()
+            },
             1000,
             None,
         )
@@ -1555,7 +1733,10 @@ mod tests {
         .unwrap();
         assert_eq!(second.receipts.len(), 1);
         assert_eq!(second.receipts[0].status, MissionReceiptStatus::Succeeded);
-        assert_eq!(second.receipts[0].created_at, created_at, "createdAt must be preserved");
+        assert_eq!(
+            second.receipts[0].created_at, created_at,
+            "createdAt must be preserved"
+        );
 
         let err = update_mission(
             &loc,
@@ -1574,7 +1755,10 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert_eq!(err.to_string(), "mission.update.addReceipts[].url must be an absolute URL");
+        assert_eq!(
+            err.to_string(),
+            "mission.update.addReceipts[].url must be an absolute URL"
+        );
     }
 
     #[test]
@@ -1599,8 +1783,193 @@ mod tests {
         .unwrap();
         assert_eq!(updated.decisions.len(), 1);
         assert_eq!(updated.decisions[0].status, MissionDecisionStatus::Open);
-        assert_eq!(updated.decisions[0].recommendation.as_deref(), Some("postgres"));
+        assert_eq!(
+            updated.decisions[0].recommendation.as_deref(),
+            Some("postgres")
+        );
         assert!(validate_mission_id_str(&updated.decisions[0].id, "id").is_ok());
+    }
+
+    fn open_decision(loc: &MissionStoreLocation, mission_id: &str, title: &str) -> MissionRecord {
+        update_mission(
+            loc,
+            mission_id,
+            &MissionUpdateInput {
+                add_decisions: vec![MissionDecisionInput {
+                    title: title.to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            1000,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn resolve(
+        loc: &MissionStoreLocation,
+        mission_id: &str,
+        decision_id: &str,
+        text: &str,
+    ) -> MissionResult<MissionRecord> {
+        update_mission(
+            loc,
+            mission_id,
+            &MissionUpdateInput {
+                resolve_decision: Some(MissionDecisionResolution {
+                    id: decision_id.to_string(),
+                    resolution: text.to_string(),
+                }),
+                ..Default::default()
+            },
+            2000,
+            None,
+        )
+    }
+
+    /// SUBA-085 / pi `store.ts:497-508` @v0.64.0: `resolveDecision` flips exactly the named
+    /// decision to `resolved`, stamps `resolvedAt` with this update's `createdAt`, stores the
+    /// resolution TRIMMED, and leaves every other decision alone. Pre-fix
+    /// `MissionUpdateInput` had no such field and `Resolved` was produced only by the parser.
+    #[test]
+    fn resolve_decision_marks_only_the_named_decision_resolved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loc = location(tmp.path());
+        let record = create(&loc, "m");
+        open_decision(&loc, &record.id, "first");
+        let with_two = open_decision(&loc, &record.id, "second");
+        let target = with_two.decisions[1].id.clone();
+        let resolved = resolve(&loc, &record.id, &target, "  go with B  ").unwrap();
+        assert_eq!(resolved.decisions[0].status, MissionDecisionStatus::Open);
+        assert_eq!(resolved.decisions[0].resolution, None);
+        assert_eq!(
+            resolved.decisions[1].status,
+            MissionDecisionStatus::Resolved
+        );
+        assert_eq!(
+            resolved.decisions[1].resolution.as_deref(),
+            Some("go with B")
+        );
+        assert_eq!(
+            resolved.decisions[1].resolved_at.as_deref(),
+            Some(resolved.updated_at.as_str())
+        );
+        // Read back from disk: the parser's `Resolved` arm is now reached by a real write.
+        let reread = read_mission(&loc, &record.id).unwrap();
+        assert_eq!(reread.decisions[1].status, MissionDecisionStatus::Resolved);
+    }
+
+    /// The store's own refusals (`store.ts:498-501` @v0.64.0), verbatim: a malformed id, an id
+    /// that is not on the mission, an already-resolved decision, and an empty resolution.
+    #[test]
+    fn resolve_decision_refuses_unknown_resolved_and_malformed_inputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loc = location(tmp.path());
+        let record = create(&loc, "m");
+        let with_one = open_decision(&loc, &record.id, "only");
+        let target = with_one.decisions[0].id.clone();
+        assert_eq!(
+            resolve(&loc, &record.id, "a..b", "x")
+                .unwrap_err()
+                .to_string(),
+            "mission.update.resolveDecision.id must contain only letters, numbers, '.', '_', or \
+             '-' and cannot contain '..'"
+        );
+        assert_eq!(
+            resolve(&loc, &record.id, "missing", "x")
+                .unwrap_err()
+                .to_string(),
+            format!(
+                "Decision 'missing' was not found in mission '{}'",
+                record.id
+            )
+        );
+        assert_eq!(
+            resolve(&loc, &record.id, &target, "   ")
+                .unwrap_err()
+                .to_string(),
+            "mission.update.resolveDecision.resolution must be a non-empty string"
+        );
+        // A refused update must not have been persisted.
+        assert_eq!(
+            read_mission(&loc, &record.id).unwrap().decisions[0].status,
+            MissionDecisionStatus::Open
+        );
+        resolve(&loc, &record.id, &target, "done").unwrap();
+        assert_eq!(
+            resolve(&loc, &record.id, &target, "again")
+                .unwrap_err()
+                .to_string(),
+            format!("Decision '{target}' is already resolved")
+        );
+    }
+
+    /// The decision gate (`store.ts:521-529` @v0.64.0, entered at v0.47.1 with `1dec33dd`):
+    /// appending a decision to an ACTIVE mission gates it as `needs_decision`; an `active` or
+    /// `completed` status requested while a decision is still open is held at `needs_decision`;
+    /// resolving the LAST open decision of a `needs_decision` mission returns it to `active`.
+    /// Pre-fix the status was `update.status ?? current.status` with no gate at all.
+    #[test]
+    fn open_decisions_gate_the_mission_status_and_resolving_the_last_one_reopens_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loc = location(tmp.path());
+        let record = create(&loc, "m");
+        let active = update_mission(
+            &loc,
+            &record.id,
+            &MissionUpdateInput {
+                status: Some(MissionStatus::Active),
+                ..Default::default()
+            },
+            1,
+            None,
+        )
+        .unwrap();
+        assert_eq!(active.status, MissionStatus::Active);
+        let gated = open_decision(&loc, &record.id, "first");
+        assert_eq!(gated.status, MissionStatus::NeedsDecision);
+        let gated = open_decision(&loc, &record.id, "second");
+        assert_eq!(gated.status, MissionStatus::NeedsDecision);
+        // An explicit `completed` (what `mission.close` sends) is held while a decision is open.
+        let held = update_mission(
+            &loc,
+            &record.id,
+            &MissionUpdateInput {
+                status: Some(MissionStatus::Completed),
+                ..Default::default()
+            },
+            2,
+            None,
+        )
+        .unwrap();
+        assert_eq!(held.status, MissionStatus::NeedsDecision);
+        // Resolving one of two leaves the mission gated; resolving the last reopens it.
+        let first = gated.decisions[0].id.clone();
+        let second = gated.decisions[1].id.clone();
+        assert_eq!(
+            resolve(&loc, &record.id, &first, "a").unwrap().status,
+            MissionStatus::NeedsDecision
+        );
+        assert_eq!(
+            resolve(&loc, &record.id, &second, "b").unwrap().status,
+            MissionStatus::Active
+        );
+    }
+
+    /// The other half of the gate: a `planned` (or `waiting`) mission keeps its lifecycle
+    /// status when a decision is added and when it is resolved — only `active` is gated, and
+    /// only a `needs_decision` mission is returned to `active` by a resolution.
+    #[test]
+    fn a_planned_mission_keeps_its_status_across_a_decision_lifecycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loc = location(tmp.path());
+        let record = create(&loc, "m");
+        assert_eq!(record.status, MissionStatus::Planned);
+        let with_one = open_decision(&loc, &record.id, "later");
+        assert_eq!(with_one.status, MissionStatus::Planned);
+        let resolved = resolve(&loc, &record.id, &with_one.decisions[0].id, "ok").unwrap();
+        assert_eq!(resolved.status, MissionStatus::Planned);
     }
 
     #[test]
@@ -1643,7 +2012,11 @@ mod tests {
         assert_eq!(listed.records.len(), 1);
         assert_eq!(listed.records[0].id, good.id);
         assert_eq!(listed.warnings.len(), 1);
-        assert!(listed.warnings[0].starts_with("Skipped corrupt mission '"), "{:?}", listed.warnings);
+        assert!(
+            listed.warnings[0].starts_with("Skipped corrupt mission '"),
+            "{:?}",
+            listed.warnings
+        );
     }
 
     #[test]
@@ -1657,7 +2030,11 @@ mod tests {
         assert_eq!(listed.warnings.len(), 1);
         assert!(listed.warnings[0].starts_with("Removed stale global mission pointer '"));
         // The pointer file itself is gone, so a second listing is silent.
-        assert!(list_global_missions(&loc.global_index_dir).warnings.is_empty());
+        assert!(
+            list_global_missions(&loc.global_index_dir)
+                .warnings
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1666,12 +2043,20 @@ mod tests {
         let mut loc = location(tmp.path());
         loc.write_global_index = false;
         create(&loc, "m");
-        assert!(list_global_missions(&loc.global_index_dir).entries.is_empty());
+        assert!(
+            list_global_missions(&loc.global_index_dir)
+                .entries
+                .is_empty()
+        );
     }
 
     #[test]
     fn validate_mission_store_config_rejects_unknown_keys_and_bad_types() {
-        assert!(validate_mission_store_config(None, "config.missions").unwrap().is_none());
+        assert!(
+            validate_mission_store_config(None, "config.missions")
+                .unwrap()
+                .is_none()
+        );
         let ok = validate_mission_store_config(
             Some(&serde_json::json!({"enabled": false, "retainTerminal": 5})),
             "config.missions",
@@ -1681,11 +2066,9 @@ mod tests {
         assert_eq!(ok.enabled, Some(false));
         assert_eq!(ok.retain_terminal, Some(5));
 
-        let err = validate_mission_store_config(
-            Some(&serde_json::json!({"nope": 1})),
-            "config.missions",
-        )
-        .unwrap_err();
+        let err =
+            validate_mission_store_config(Some(&serde_json::json!({"nope": 1})), "config.missions")
+                .unwrap_err();
         assert_eq!(err.to_string(), "config.missions.nope is unknown");
 
         let err = validate_mission_store_config(
@@ -1700,15 +2083,24 @@ mod tests {
             "config.missions",
         )
         .unwrap_err();
-        assert_eq!(err.to_string(), "config.missions.retainTerminal must be a positive integer");
+        assert_eq!(
+            err.to_string(),
+            "config.missions.retainTerminal must be a positive integer"
+        );
     }
 
     #[test]
     fn resolve_location_defaults_to_the_rebranded_project_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let resolved = resolve_mission_store_location(tmp.path(), None, Some(Path::new("/agent")));
-        assert_eq!(resolved.mission_dir, tmp.path().join(".cyrup-subagents").join("missions"));
-        assert_eq!(resolved.global_index_dir, Path::new("/agent").join("missions").join("index"));
+        assert_eq!(
+            resolved.mission_dir,
+            tmp.path().join(".cyrup-subagents").join("missions")
+        );
+        assert_eq!(
+            resolved.global_index_dir,
+            Path::new("/agent").join("missions").join("index")
+        );
         assert!(resolved.write_global_index);
     }
 

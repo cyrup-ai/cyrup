@@ -73,7 +73,13 @@ impl PanelCallbacks {
         ctx: HostCtx,
         dirs: McpDirs,
     ) -> Self {
-        Self { ext, state, ctx, dirs, auth_status_failures: Mutex::new(IndexMap::new()) }
+        Self {
+            ext,
+            state,
+            ctx,
+            dirs,
+            auth_status_failures: Mutex::new(IndexMap::new()),
+        }
     }
 
     /// Record a per-open diagnostic and answer `failed`.
@@ -157,7 +163,12 @@ impl McpPanelCallbacks for PanelCallbacks {
 
         // `crate::lifecycle::ConnectionStatus`, the three-variant one `ServerConnection::status()`
         // returns — NOT this function's own six-variant return type, which shares its name.
-        match self.state.manager.get_connection(server).map(|c| c.status()) {
+        match self
+            .state
+            .manager
+            .get_connection(server)
+            .map(|c| c.status())
+        {
             Some(crate::lifecycle::ConnectionStatus::NeedsAuth) => ConnectionStatus::NeedsAuth,
             Some(crate::lifecycle::ConnectionStatus::Connected) => ConnectionStatus::Connected,
             _ if crate::live::failure_age_seconds(&self.state, server).is_some() => {
@@ -300,8 +311,7 @@ impl SetupCallbacks {
     /// (upstream's `pi.getFlag("mcp-config")`, re-read per call).
     fn context(&self) -> crate::config::ConfigContext {
         let explicit = crate::config::config_path_from_argv(std::env::args()).map(PathBuf::from);
-        let mut context =
-            crate::config::ConfigContext::new(self.dirs.clone(), explicit.as_deref());
+        let mut context = crate::config::ConfigContext::new(self.dirs.clone(), explicit.as_deref());
         if let Some(home) = self.home.clone() {
             context = context.with_home(home);
         }
@@ -324,7 +334,11 @@ impl SetupCallbacks {
             .mcp_discovery_summary(self.include_host_configs, &mut diagnostics);
         let repo_prompt = discovery.repo_prompt;
         // All three or none: upstream's `!entry || !targetPath || !serverName` refuses as one.
-        Some((repo_prompt.target_path?, repo_prompt.server_name?, repo_prompt.entry?))
+        Some((
+            repo_prompt.target_path?,
+            repo_prompt.server_name?,
+            repo_prompt.entry?,
+        ))
     }
 }
 
@@ -339,7 +353,9 @@ impl SetupPanelCallbacks for SetupCallbacks {
 
     fn preview_repo_prompt(&self) -> Option<ConfigWritePreview> {
         let (path, name, entry) = self.repo_prompt()?;
-        Some(crate::config::preview_shared_server_entry(&path, &name, &entry))
+        Some(crate::config::preview_shared_server_entry(
+            &path, &name, &entry,
+        ))
     }
 
     /// `previewKnownServer(preset)` — always against the PROJECT file, never the discovered path a
@@ -368,15 +384,19 @@ impl SetupPanelCallbacks for SetupCallbacks {
             if !result.added.is_empty() {
                 changed.store(true, Ordering::Release);
             }
-            Ok(AdoptImportsOutcome { added: result.added, path: result.path })
+            Ok(AdoptImportsOutcome {
+                added: result.added,
+                path: result.path,
+            })
         })
     }
 
     fn scaffold_project_config(&self) -> BoxFuture<'static, Result<PathBuf, String>> {
         let (context, changed) = (self.context(), Arc::clone(&self.config_changed));
         Box::pin(async move {
-            let path =
-                context.write_starter_project_config().map_err(|error| error.to_string())?;
+            let path = context
+                .write_starter_project_config()
+                .map_err(|error| error.to_string())?;
             changed.store(true, Ordering::Release);
             Ok(path)
         })
@@ -394,7 +414,10 @@ impl SetupPanelCallbacks for SetupCallbacks {
             let written = crate::config::write_shared_server_entry(&path, &server_name, &entry)
                 .map_err(|error| error.to_string())?;
             changed.store(true, Ordering::Release);
-            Ok(AddServerOutcome { path: written, server_name })
+            Ok(AddServerOutcome {
+                path: written,
+                server_name,
+            })
         })
     }
 
@@ -415,7 +438,10 @@ impl SetupPanelCallbacks for SetupCallbacks {
             )
             .map_err(|error| error.to_string())?;
             changed.store(true, Ordering::Release);
-            Ok(AddServerOutcome { path, server_name: preset.name.to_string() })
+            Ok(AddServerOutcome {
+                path,
+                server_name: preset.name.to_string(),
+            })
         })
     }
 

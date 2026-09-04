@@ -134,8 +134,8 @@ pub mod agent_plugin;
 pub mod commands;
 pub mod config;
 pub mod credentials;
-pub mod dispatch;
 pub mod dirs;
+pub mod dispatch;
 pub mod elicitation;
 pub mod errors;
 pub mod extension;
@@ -150,8 +150,8 @@ pub(crate) mod panel_host;
 pub mod prompts;
 pub mod proxy;
 pub mod registration;
-pub mod request_headers_command;
 pub mod renderers;
+pub mod request_headers_command;
 pub mod runtime;
 pub mod sampling;
 pub mod schema;
@@ -162,7 +162,7 @@ pub mod trace;
 pub mod ui;
 
 pub use errors::{CleanupErrors, McpError, McpResult};
-pub use extension::{mcp_extension_for_env, McpExtension, EXTENSION_ID};
+pub use extension::{EXTENSION_ID, McpExtension, mcp_extension_for_env};
 pub use state::McpState;
 
 // -------------------------------------------------------------------------------------------------
@@ -175,20 +175,12 @@ pub use state::McpState;
 pub use credentials::{AuthEntry, AuthStoreError, McpAuthStore, OAuthCredentialStatus};
 /// The OAuth flow runtime (13g) — `oauth.ts` / `mcp-auth-flow.ts`.
 pub use oauth::{
+    AuthStatus, AuthenticateOptions, HttpAuthProviderState, McpOAuthRuntime, McpOAuthStorage,
     authenticate, complete_auth, complete_auth_from_input, create_oauth_runtime, get_auth_status,
     get_valid_token, has_pending_auth, remove_auth, shutdown_oauth, start_auth, supports_oauth,
-    AuthStatus, AuthenticateOptions, HttpAuthProviderState, McpOAuthRuntime, McpOAuthStorage,
-};
-/// Environment interpolation and the `!`/`!!` command-secret grammar (13b, MCP-082/MCP-083) —
-/// `utils.ts`. `resolve_command_secret` is the ONLY function in the crate that spawns a shell for a
-/// configured value, and it is reachable only from a connect/auth path; every other caller wants
-/// `interpolate_env_record`, which unescapes `!!` and leaves `!` unexecuted.
-pub use secrets::{
-    interpolate_env_record, resolve_command_secret, resolve_command_secrets_record, resolve_env,
-    resolve_http_secrets, resolve_stdio_env, ResolvedHttpSecrets,
 };
 /// The `mcp` gateway tool and its nine modes (13d) — `proxy-modes.ts` / `mcp-tool.ts`.
-pub use proxy::{McpErrorCode, McpTool, ProxyCtx, ProxyEnv, MCP_TOOL_NAME};
+pub use proxy::{MCP_TOOL_NAME, McpErrorCode, McpTool, ProxyCtx, ProxyEnv};
 /// The inverse of the tool-name grammar (MCP-073) — `types.ts` `resolveServerFromToolName`. The
 /// forward direction lives on [`registration`] with the rest of the grammar.
 ///
@@ -202,11 +194,19 @@ pub use registration::resolve_server_from_tool_name;
 /// Tool-result rendering and the MCP output guard (13e/13h) — `tool-result-renderer.ts`,
 /// `mcp-output-guard.ts`, `tool-registrar.ts`.
 pub use renderers::{
-    guard_mcp_output, render_call, render_result, GuardedMcpOutput, MaterializedResources,
-    McpContentBlock, McpOutputGuardOptions, McpToolRenderOptions,
+    GuardedMcpOutput, MaterializedResources, McpContentBlock, McpOutputGuardOptions,
+    McpToolRenderOptions, guard_mcp_output, render_call, render_result,
+};
+/// Environment interpolation and the `!`/`!!` command-secret grammar (13b, MCP-082/MCP-083) —
+/// `utils.ts`. `resolve_command_secret` is the ONLY function in the crate that spawns a shell for a
+/// configured value, and it is reachable only from a connect/auth path; every other caller wants
+/// `interpolate_env_record`, which unescapes `!!` and leaves `!` unexecuted.
+pub use secrets::{
+    ResolvedHttpSecrets, interpolate_env_record, resolve_command_secret,
+    resolve_command_secrets_record, resolve_env, resolve_http_secrets, resolve_stdio_env,
 };
 /// The `/mcp` panel and the setup panel (13h) — `mcp-panel.ts` / `mcp-setup-panel.ts`.
 pub use ui::{
-    open_mcp_panel, open_mcp_setup_panel, DirectToolsChange, McpPanelModel, McpPanelResult,
-    McpSetupPanelModel,
+    DirectToolsChange, McpPanelModel, McpPanelResult, McpSetupPanelModel, open_mcp_panel,
+    open_mcp_setup_panel,
 };

@@ -66,8 +66,15 @@ fn unsupported_evidence_kind_message(path_label: &str, item: &Value) -> String {
     )
 }
 
-const ACCEPTANCE_CONFIG_KEYS: &[&str] =
-    &["level", "criteria", "evidence", "verify", "review", "stopRules", "reason"];
+const ACCEPTANCE_CONFIG_KEYS: &[&str] = &[
+    "level",
+    "criteria",
+    "evidence",
+    "verify",
+    "review",
+    "stopRules",
+    "reason",
+];
 const ACCEPTANCE_GATE_KEYS: &[&str] = &["id", "must", "evidence", "severity"];
 const ACCEPTANCE_VERIFY_KEYS: &[&str] =
     &["id", "command", "timeoutMs", "cwd", "env", "allowFailure"];
@@ -122,24 +129,31 @@ pub fn validate_acceptance_input(input: &Value, path_label: &str) -> Vec<String>
     }
     // `acceptance.ts:195-199` @v0.43.0.
     if map.get("level").and_then(Value::as_str) == Some("reviewed") {
-        errors.push(format!("{path_label}.level {EXPLICIT_REVIEWED_UNAVAILABLE}"));
+        errors.push(format!(
+            "{path_label}.level {EXPLICIT_REVIEWED_UNAVAILABLE}"
+        ));
     } else if let Some(level) = map.get("level")
-        && !level.as_str().is_some_and(|l| VALID_LEVELS.contains(&l)) {
-            errors.push(format!(
-                "{path_label}.level must be one of auto, none, attested, checked, verified."
-            ));
-        }
+        && !level.as_str().is_some_and(|l| VALID_LEVELS.contains(&l))
+    {
+        errors.push(format!(
+            "{path_label}.level must be one of auto, none, attested, checked, verified."
+        ));
+    }
     if map.get("level").and_then(Value::as_str) == Some("none")
         && map
             .get("reason")
-            .and_then(Value::as_str).is_none_or(|r| r.trim().is_empty())
+            .and_then(Value::as_str)
+            .is_none_or(|r| r.trim().is_empty())
     {
-        errors.push(format!("{path_label}.reason is required when level is none."));
+        errors.push(format!(
+            "{path_label}.reason is required when level is none."
+        ));
     }
     if let Some(reason) = map.get("reason")
-        && !reason.is_string() {
-            errors.push(format!("{path_label}.reason must be a string."));
-        }
+        && !reason.is_string()
+    {
+        errors.push(format!("{path_label}.reason must be a string."));
+    }
     validate_criteria_input(&mut errors, map.get("criteria"), path_label);
     // `acceptance.ts:239-247` @v0.43.0 — both arms now carry the guidance suffix.
     match map.get("evidence") {
@@ -147,7 +161,8 @@ pub fn validate_acceptance_input(input: &Value, path_label: &str) -> Vec<String>
             for (index, item) in items.iter().enumerate() {
                 if item
                     .as_str()
-                    .and_then(AcceptanceEvidenceKind::from_wire).is_none()
+                    .and_then(AcceptanceEvidenceKind::from_wire)
+                    .is_none()
                 {
                     errors.push(unsupported_evidence_kind_message(
                         &format!("{path_label}.evidence[{index}]"),
@@ -230,7 +245,11 @@ fn validate_criteria_input(errors: &mut Vec<String>, criteria: Option<&Value>, p
                     }
                 }
                 // `acceptance.ts:218-224` @v0.43.0.
-                match gate.get("id").and_then(Value::as_str).filter(|i| !i.trim().is_empty()) {
+                match gate
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|i| !i.trim().is_empty())
+                {
                     Option::None => errors.push(format!("{cpath}.id is required.")),
                     Some(id) => {
                         let normalized_id = normalized_token(id);
@@ -242,14 +261,22 @@ fn validate_criteria_input(errors: &mut Vec<String>, criteria: Option<&Value>, p
                         criterion_ids.insert(normalized_id);
                     }
                 }
-                if gate.get("must").and_then(Value::as_str).is_none_or(|m| m.trim().is_empty()) {
+                if gate
+                    .get("must")
+                    .and_then(Value::as_str)
+                    .is_none_or(|m| m.trim().is_empty())
+                {
                     errors.push(format!("{cpath}.must is required."));
                 }
                 // `acceptance.ts:226-233` @v0.43.0 — both arms carry the guidance suffix.
                 match gate.get("evidence") {
                     Some(Value::Array(evs)) => {
                         for (ei, item) in evs.iter().enumerate() {
-                            if item.as_str().and_then(AcceptanceEvidenceKind::from_wire).is_none() {
+                            if item
+                                .as_str()
+                                .and_then(AcceptanceEvidenceKind::from_wire)
+                                .is_none()
+                            {
                                 errors.push(unsupported_evidence_kind_message(
                                     &format!("{cpath}.evidence[{ei}]"),
                                     item,
@@ -264,9 +291,10 @@ fn validate_criteria_input(errors: &mut Vec<String>, criteria: Option<&Value>, p
                     Option::None => {}
                 }
                 if let Some(sev) = gate.get("severity")
-                    && !matches!(sev.as_str(), Some("required") | Some("recommended")) {
-                        errors.push(format!("{cpath}.severity must be required or recommended."));
-                    }
+                    && !matches!(sev.as_str(), Some("required") | Some("recommended"))
+                {
+                    errors.push(format!("{cpath}.severity must be required or recommended."));
+                }
             }
         }
         Some(_) => errors.push(format!("{path_label}.criteria must be an array.")),
@@ -296,10 +324,18 @@ fn validate_verify_input(
                         errors.push(format!("{vpath}.{key} is not supported."));
                     }
                 }
-                if cmd.get("id").and_then(Value::as_str).is_none_or(|i| i.trim().is_empty()) {
+                if cmd
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_none_or(|i| i.trim().is_empty())
+                {
                     errors.push(format!("{vpath}.id is required."));
                 }
-                if cmd.get("command").and_then(Value::as_str).is_none_or(|c| c.trim().is_empty()) {
+                if cmd
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .is_none_or(|c| c.trim().is_empty())
+                {
                     errors.push(format!("{vpath}.command is required."));
                 }
                 if let Some(timeout) = cmd.get("timeoutMs") {
@@ -312,9 +348,10 @@ fn validate_verify_input(
                     }
                 }
                 if let Some(cwd) = cmd.get("cwd")
-                    && !cwd.is_string() {
-                        errors.push(format!("{vpath}.cwd must be a string."));
-                    }
+                    && !cwd.is_string()
+                {
+                    errors.push(format!("{vpath}.cwd must be a string."));
+                }
                 match cmd.get("env") {
                     Some(Value::Object(env)) => {
                         for (env_key, env_value) in env {
@@ -327,9 +364,10 @@ fn validate_verify_input(
                     Option::None => {}
                 }
                 if let Some(allow) = cmd.get("allowFailure")
-                    && !allow.is_boolean() {
-                        errors.push(format!("{vpath}.allowFailure must be a boolean."));
-                    }
+                    && !allow.is_boolean()
+                {
+                    errors.push(format!("{vpath}.allowFailure must be a boolean."));
+                }
             }
         }
         Some(_) if report_shape_errors => {
@@ -349,17 +387,20 @@ fn validate_review_input(errors: &mut Vec<String>, review: Option<&Value>, path_
                 }
             }
             if let Some(agent) = map.get("agent")
-                && !agent.is_string() {
-                    errors.push(format!("{path_label}.review.agent must be a string."));
-                }
+                && !agent.is_string()
+            {
+                errors.push(format!("{path_label}.review.agent must be a string."));
+            }
             if let Some(focus) = map.get("focus")
-                && !focus.is_string() {
-                    errors.push(format!("{path_label}.review.focus must be a string."));
-                }
+                && !focus.is_string()
+            {
+                errors.push(format!("{path_label}.review.focus must be a string."));
+            }
             if let Some(required) = map.get("required")
-                && !required.is_boolean() {
-                    errors.push(format!("{path_label}.review.required must be a boolean."));
-                }
+                && !required.is_boolean()
+            {
+                errors.push(format!("{path_label}.review.required must be a boolean."));
+            }
         }
         Some(_) => errors.push(format!("{path_label}.review must be false or an object.")),
     }
@@ -371,7 +412,6 @@ mod tests {
 
     use super::*;
     use serde_json::json;
-
 
     #[test]
     fn duplicate_normalized_criterion_ids_are_rejected() {
@@ -418,23 +458,39 @@ mod tests {
         );
     }
 
-
     // ---- validateAcceptanceInput ----
 
     #[test]
     fn validates_invalid_disable_and_verify_shapes() {
         let v = |value: Value| validate_acceptance_input(&value, "acceptance");
-        assert_eq!(v(json!({"level": "none"})), vec!["acceptance.reason is required when level is none.".to_string()]);
-        assert_eq!(v(json!({"verify": [{"id": "missing-command"}]})), vec!["acceptance.verify[0].command is required.".to_string()]);
+        assert_eq!(
+            v(json!({"level": "none"})),
+            vec!["acceptance.reason is required when level is none.".to_string()]
+        );
+        assert_eq!(
+            v(json!({"verify": [{"id": "missing-command"}]})),
+            vec!["acceptance.verify[0].command is required.".to_string()]
+        );
         assert_eq!(
             v(json!({"verify": [{"id": "fractional", "command": "npm test", "timeoutMs": 1.5}]})),
             vec!["acceptance.verify[0].timeoutMs must be an integer >= 1.".to_string()]
         );
         assert!(v(json!(false)).is_empty());
         assert!(v(json!("checked")).is_empty());
-        assert!(v(json!({"criteria": ["ship the fix"], "review": false, "stopRules": ["stay scoped"]})).is_empty());
-        assert!(v(json!({"criteria": [{"id": "missing-must"}]})).iter().any(|e| e.contains("acceptance.criteria[0].must is required")));
-        assert!(v(json!({"criteria": [123]})).iter().any(|e| e.contains("acceptance.criteria[0] must be a string or an object")));
+        assert!(
+            v(json!({"criteria": ["ship the fix"], "review": false, "stopRules": ["stay scoped"]}))
+                .is_empty()
+        );
+        assert!(
+            v(json!({"criteria": [{"id": "missing-must"}]}))
+                .iter()
+                .any(|e| e.contains("acceptance.criteria[0].must is required"))
+        );
+        assert!(
+            v(json!({"criteria": [123]}))
+                .iter()
+                .any(|e| e.contains("acceptance.criteria[0] must be a string or an object"))
+        );
         // v0.43.0 routes this through `unsupportedEvidenceKindMessage` (`acceptance.ts:171-174`),
         // which ECHOES the offending value and appends `ACCEPTANCE_EVIDENCE_HELP` (`:48`).
         // Asserted whole rather than by substring so the guidance cannot silently regress.
@@ -450,15 +506,28 @@ mod tests {
         );
         // A NON-string entry gets the same message with no echo (`typeof item === "string" ?
         // ` "${item}"` : ""`, `acceptance.ts:172`).
+        assert!(v(json!({"evidence": [7]})).iter().any(|e| e.starts_with(
+            "acceptance.evidence[0] is not a supported evidence kind. Supported evidence kinds: "
+        )));
         assert!(
-            v(json!({"evidence": [7]}))
+            v(json!({"review": true}))
                 .iter()
-                .any(|e| e.starts_with("acceptance.evidence[0] is not a supported evidence kind. Supported evidence kinds: "))
+                .any(|e| e.contains("acceptance.review must be false or an object"))
         );
-        assert!(v(json!({"review": true})).iter().any(|e| e.contains("acceptance.review must be false or an object")));
-        assert!(v(json!({"review": {"required": "yes"}})).iter().any(|e| e.contains("acceptance.review.required must be a boolean")));
-        assert!(v(json!({"stopRules": [123]})).iter().any(|e| e.contains("acceptance.stopRules[0] must be a string")));
-        assert!(v(json!({"surprise": true})).iter().any(|e| e.contains("acceptance.surprise is not supported")));
+        assert!(
+            v(json!({"review": {"required": "yes"}}))
+                .iter()
+                .any(|e| e.contains("acceptance.review.required must be a boolean"))
+        );
+        assert!(
+            v(json!({"stopRules": [123]}))
+                .iter()
+                .any(|e| e.contains("acceptance.stopRules[0] must be a string"))
+        );
+        assert!(
+            v(json!({"surprise": true}))
+                .iter()
+                .any(|e| e.contains("acceptance.surprise is not supported"))
+        );
     }
-
 }

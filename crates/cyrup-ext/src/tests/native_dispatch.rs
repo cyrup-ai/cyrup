@@ -1,23 +1,33 @@
 //! Native built-in dispatch/registration/seam/containment contracts (arch-08 §11). These drive the
 //! FULL extension surface WITHOUT any wasm — native built-in extensions exercise every contract.
 //! Maps to acceptance criteria A-08-1..5, R-08-034 (gated dispatch), and R-08-036 (containment).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
-use cyrup_agent::{
-    AfterToolCall, AgentContextView, AgentEvent, AgentMessage, BeforeOutcome, BeforeToolCall,
-};
-use cyrup_core::{
-    TerminateHint,CancelToken, Content, ExtensionId, Tool, ToolCallId, ToolError, ToolResult};
 use crate::{
     CommandDescriptor, EventKind, ExtMode, ExtensionError, ExtensionHost, HookOutcome, HostConfig,
     HostCtx, HostEvent, InitApi, NativeExtension, Reduced,
 };
-use serde_json::{json, Value};
+use cyrup_agent::{
+    AfterToolCall, AgentContextView, AgentEvent, AgentMessage, BeforeOutcome, BeforeToolCall,
+};
+use cyrup_core::{
+    CancelToken, Content, ExtensionId, TerminateHint, Tool, ToolCallId, ToolError, ToolResult,
+};
+use serde_json::{Value, json};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 fn cfg() -> HostConfig {
-    HostConfig { mode: ExtMode::Tui, has_ui: true, cwd: std::path::PathBuf::from(".") }
+    HostConfig {
+        mode: ExtMode::Tui,
+        has_ui: true,
+        cwd: std::path::PathBuf::from("."),
+    }
 }
 
 /// Build the triggering assistant message + standalone `ToolCall` (same id/name/arguments as the
@@ -58,7 +68,11 @@ fn tool_call_msg(
 
 /// An empty read-only context view (no system prompt / messages / tools) for hook-context fields.
 fn empty_view() -> AgentContextView<'static> {
-    AgentContextView { system_prompt: "", messages: &[], tools: &[] }
+    AgentContextView {
+        system_prompt: "",
+        messages: &[],
+        tools: &[],
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -81,7 +95,9 @@ impl NativeExtension for ProbeExt {
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         let label = match ev {
             HostEvent::AgentStart => "agent_start".to_string(),
-            HostEvent::ToolExecEnd { call_id, is_error, .. } => {
+            HostEvent::ToolExecEnd {
+                call_id, is_error, ..
+            } => {
                 format!("tool_exec_end:{call_id}:{is_error}")
             }
             other => format!("other:{:?}", std::mem::discriminant(other)),
@@ -95,21 +111,29 @@ impl NativeExtension for ProbeExt {
 async fn a08_1_event_fires_with_payload_notify() {
     let host = ExtensionHost::new(cfg());
     let seen = Arc::new(Mutex::new(Vec::new()));
-    host.load_native(Arc::new(ProbeExt { id: "probe".into(), seen: seen.clone() }))
-        .await
-        .unwrap();
+    host.load_native(Arc::new(ProbeExt {
+        id: "probe".into(),
+        seen: seen.clone(),
+    }))
+    .await
+    .unwrap();
 
     let sub = host.subscriber();
-    sub.on_event(&AgentEvent::AgentStart, CancelToken::new()).await;
-    sub.on_event(&AgentEvent::ToolExecutionEnd {
-        tool_call_id: "tc1".into(),
-        tool_name: "bash".into(),
-        result: json!({"ok": true}),
-        is_error: false,
-    }, CancelToken::new())
+    sub.on_event(&AgentEvent::AgentStart, CancelToken::new())
+        .await;
+    sub.on_event(
+        &AgentEvent::ToolExecutionEnd {
+            tool_call_id: "tc1".into(),
+            tool_name: "bash".into(),
+            result: json!({"ok": true}),
+            is_error: false,
+        },
+        CancelToken::new(),
+    )
     .await;
     // An event the probe did NOT subscribe to must not be delivered.
-    sub.on_event(&AgentEvent::TurnStart, CancelToken::new()).await;
+    sub.on_event(&AgentEvent::TurnStart, CancelToken::new())
+        .await;
 
     let got = seen.lock().unwrap().clone();
     assert_eq!(got, vec!["agent_start", "tool_exec_end:tc1:false"]);
@@ -141,8 +165,14 @@ impl NativeExtension for TurnProbe {
     }
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         match ev {
-            HostEvent::TurnStart { turn_index, timestamp } => {
-                self.seen.lock().unwrap().push(("turn_start", *turn_index, *timestamp));
+            HostEvent::TurnStart {
+                turn_index,
+                timestamp,
+            } => {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(("turn_start", *turn_index, *timestamp));
             }
             HostEvent::TurnEnd { turn_index, .. } => {
                 self.seen.lock().unwrap().push(("turn_end", *turn_index, 0));
@@ -157,9 +187,12 @@ impl NativeExtension for TurnProbe {
 async fn a08_1b_turn_index_is_derived_and_resets_per_agent_run() {
     let host = ExtensionHost::new(cfg());
     let seen = Arc::new(Mutex::new(Vec::new()));
-    host.load_native(Arc::new(TurnProbe { id: "turns".into(), seen: seen.clone() }))
-        .await
-        .unwrap();
+    host.load_native(Arc::new(TurnProbe {
+        id: "turns".into(),
+        seen: seen.clone(),
+    }))
+    .await
+    .unwrap();
 
     let sub = host.subscriber();
 
@@ -167,15 +200,23 @@ async fn a08_1b_turn_index_is_derived_and_resets_per_agent_run() {
     // subscribed to agent_start, but the counter must still reset (the gate runs AFTER the counter).
     let turn_end = || {
         let (msg, _tc) = tool_call_msg("read", &"tc".into(), &json!({}));
-        AgentEvent::TurnEnd { message: AgentMessage::Assistant(Arc::new(msg)), tool_results: vec![] }
+        AgentEvent::TurnEnd {
+            message: AgentMessage::Assistant(Arc::new(msg)),
+            tool_results: vec![],
+        }
     };
-    sub.on_event(&AgentEvent::AgentStart, CancelToken::new()).await;
-    sub.on_event(&AgentEvent::TurnStart, CancelToken::new()).await;
+    sub.on_event(&AgentEvent::AgentStart, CancelToken::new())
+        .await;
+    sub.on_event(&AgentEvent::TurnStart, CancelToken::new())
+        .await;
     sub.on_event(&turn_end(), CancelToken::new()).await;
-    sub.on_event(&AgentEvent::TurnStart, CancelToken::new()).await;
+    sub.on_event(&AgentEvent::TurnStart, CancelToken::new())
+        .await;
     sub.on_event(&turn_end(), CancelToken::new()).await;
-    sub.on_event(&AgentEvent::AgentStart, CancelToken::new()).await; // reset back to 0
-    sub.on_event(&AgentEvent::TurnStart, CancelToken::new()).await;
+    sub.on_event(&AgentEvent::AgentStart, CancelToken::new())
+        .await; // reset back to 0
+    sub.on_event(&AgentEvent::TurnStart, CancelToken::new())
+        .await;
 
     let got = seen.lock().unwrap().clone();
     // start+end of a turn share the index; it increments after each end; agent_start resets it.
@@ -193,7 +234,10 @@ async fn a08_1b_turn_index_is_derived_and_resets_per_agent_run() {
     // Every turn_start carries a real wall-clock timestamp (Pi `Date.now()`), never 0.
     for (label, _, ts) in &got {
         if *label == "turn_start" {
-            assert!(*ts > 0, "turn_start timestamp must be a real wall-clock ms value");
+            assert!(
+                *ts > 0,
+                "turn_start timestamp must be a real wall-clock ms value"
+            );
         }
     }
 }
@@ -216,9 +260,13 @@ impl NativeExtension for BashGate {
     }
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         if let HostEvent::ToolCall { name, .. } = ev
-            && name == "bash" {
-                return HookOutcome::Block { reason: Some("bash is not allowed".into()), terminate: TerminateHint::Unspecified };
-            }
+            && name == "bash"
+        {
+            return HookOutcome::Block {
+                reason: Some("bash is not allowed".into()),
+                terminate: TerminateHint::Unspecified,
+            };
+        }
         HookOutcome::Noop
     }
 }
@@ -226,7 +274,9 @@ impl NativeExtension for BashGate {
 #[tokio::test]
 async fn a08_2_tool_call_blocks_bash_with_reason() {
     let host = ExtensionHost::new(cfg());
-    host.load_native(Arc::new(BashGate { id: "gate".into() })).await.unwrap();
+    host.load_native(Arc::new(BashGate { id: "gate".into() }))
+        .await
+        .unwrap();
     let hooks = host.hooks();
 
     let mut args = json!({"command": "rm -rf /"});
@@ -243,7 +293,9 @@ async fn a08_2_tool_call_blocks_bash_with_reason() {
     };
     let outcome = hooks.before_tool_call(ctx, CancelToken::new()).await;
     match outcome {
-        BeforeOutcome::Block { reason, .. } => assert_eq!(reason.as_deref(), Some("bash is not allowed")),
+        BeforeOutcome::Block { reason, .. } => {
+            assert_eq!(reason.as_deref(), Some("bash is not allowed"))
+        }
         BeforeOutcome::Proceed | BeforeOutcome::Failed(_) => panic!("expected block"),
     }
 
@@ -296,12 +348,20 @@ impl NativeExtension for ArgMutator {
 #[tokio::test]
 async fn tool_call_mutate_chains_in_load_order() {
     let host = ExtensionHost::new(cfg());
-    host.load_native(Arc::new(ArgMutator { id: "m1".into(), key: "a".into(), val: "1".into() }))
-        .await
-        .unwrap();
-    host.load_native(Arc::new(ArgMutator { id: "m2".into(), key: "b".into(), val: "2".into() }))
-        .await
-        .unwrap();
+    host.load_native(Arc::new(ArgMutator {
+        id: "m1".into(),
+        key: "a".into(),
+        val: "1".into(),
+    }))
+    .await
+    .unwrap();
+    host.load_native(Arc::new(ArgMutator {
+        id: "m2".into(),
+        key: "b".into(),
+        val: "2".into(),
+    }))
+    .await
+    .unwrap();
     let hooks = host.hooks();
 
     let mut args = json!({});
@@ -363,12 +423,18 @@ impl NativeExtension for ResultAppender {
 #[tokio::test]
 async fn a08_3_tool_result_patch_chains() {
     let host = ExtensionHost::new(cfg());
-    host.load_native(Arc::new(ResultAppender { id: "r1".into(), suffix: "-A".into() }))
-        .await
-        .unwrap();
-    host.load_native(Arc::new(ResultAppender { id: "r2".into(), suffix: "-B".into() }))
-        .await
-        .unwrap();
+    host.load_native(Arc::new(ResultAppender {
+        id: "r1".into(),
+        suffix: "-A".into(),
+    }))
+    .await
+    .unwrap();
+    host.load_native(Arc::new(ResultAppender {
+        id: "r2".into(),
+        suffix: "-B".into(),
+    }))
+    .await
+    .unwrap();
     let hooks = host.hooks();
 
     let id: ToolCallId = "tc1".into();
@@ -465,7 +531,9 @@ impl NativeExtension for ReadOverrideExt {
         self.id.clone()
     }
     async fn init(&self, api: &mut InitApi) -> Result<(), crate::ExtError> {
-        api.register_tool(Arc::new(FakeRead { schema: json!({"type": "object"}) }));
+        api.register_tool(Arc::new(FakeRead {
+            schema: json!({"type": "object"}),
+        }));
         Ok(())
     }
     async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
@@ -476,10 +544,15 @@ impl NativeExtension for ReadOverrideExt {
 #[tokio::test]
 async fn a08_4_registered_tool_overrides_builtin_read() {
     let host = ExtensionHost::new(cfg());
-    host.load_native(Arc::new(ReadOverrideExt { id: "override".into() })).await.unwrap();
+    host.load_native(Arc::new(ReadOverrideExt {
+        id: "override".into(),
+    }))
+    .await
+    .unwrap();
 
-    let builtins: Vec<Arc<dyn Tool>> =
-        vec![Arc::new(BuiltinRead { schema: json!({"type": "object"}) })];
+    let builtins: Vec<Arc<dyn Tool>> = vec![Arc::new(BuiltinRead {
+        schema: json!({"type": "object"}),
+    })];
     let active = host.active_tools(&builtins).unwrap();
     assert_eq!(active.len(), 1, "override does not add a second `read`");
     let read = active.iter().find(|t| t.name() == "read").unwrap();
@@ -513,8 +586,11 @@ impl NativeExtension for DropAssistant {
     }
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         if let HostEvent::Context { messages } = ev {
-            let filtered: Vec<Arc<AgentMessage>> =
-                messages.iter().filter(|m| !m.is_assistant()).cloned().collect();
+            let filtered: Vec<Arc<AgentMessage>> = messages
+                .iter()
+                .filter(|m| !m.is_assistant())
+                .cloned()
+                .collect();
             return HookOutcome::Mutate(crate::EventPatch::Context { messages: filtered });
         }
         HookOutcome::Noop
@@ -524,7 +600,9 @@ impl NativeExtension for DropAssistant {
 #[tokio::test]
 async fn a08_5_context_hook_filters_messages() {
     let host = ExtensionHost::new(cfg());
-    host.load_native(Arc::new(DropAssistant { id: "ctx".into() })).await.unwrap();
+    host.load_native(Arc::new(DropAssistant { id: "ctx".into() }))
+        .await
+        .unwrap();
     let hooks = host.hooks();
 
     let msgs = vec![
@@ -538,7 +616,10 @@ async fn a08_5_context_hook_filters_messages() {
         ))),
         AgentMessage::user_text("bye"),
     ];
-    let out = hooks.transform_context(msgs.into_iter().map(Arc::new).collect(), CancelToken::new()).await.unwrap();
+    let out = hooks
+        .transform_context(msgs.into_iter().map(Arc::new).collect(), CancelToken::new())
+        .await
+        .unwrap();
     assert_eq!(out.len(), 2);
     assert!(out.iter().all(|m| !m.is_assistant()));
 }
@@ -569,9 +650,12 @@ impl NativeExtension for CountingExt {
 async fn r08_034_subscription_gated_dispatch() {
     let host = ExtensionHost::new(cfg());
     let calls = Arc::new(AtomicUsize::new(0));
-    host.load_native(Arc::new(CountingExt { id: "c".into(), calls: calls.clone() }))
-        .await
-        .unwrap();
+    host.load_native(Arc::new(CountingExt {
+        id: "c".into(),
+        calls: calls.clone(),
+    }))
+    .await
+    .unwrap();
 
     // Nobody subscribes to ToolExecUpdate -> the cheap gate returns true (single bitset test).
     assert!(host.dispatcher().no_subscribers(EventKind::ToolExecUpdate));
@@ -579,16 +663,20 @@ async fn r08_034_subscription_gated_dispatch() {
 
     let sub = host.subscriber();
     // High-frequency event with no subscriber: handler not invoked.
-    sub.on_event(&AgentEvent::ToolExecutionUpdate {
-        tool_call_id: "tc1".into(),
-        tool_name: "bash".into(),
-        args: json!({}),
-        partial_result: json!({}),
-    }, CancelToken::new())
+    sub.on_event(
+        &AgentEvent::ToolExecutionUpdate {
+            tool_call_id: "tc1".into(),
+            tool_name: "bash".into(),
+            args: json!({}),
+            partial_result: json!({}),
+        },
+        CancelToken::new(),
+    )
     .await;
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 
-    sub.on_event(&AgentEvent::AgentStart, CancelToken::new()).await;
+    sub.on_event(&AgentEvent::AgentStart, CancelToken::new())
+        .await;
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
@@ -616,8 +704,12 @@ impl NativeExtension for PanicExt {
 async fn r08_036_panicking_handler_is_contained() {
     let host = ExtensionHost::new(cfg());
     // Panicking gate first, then a real gate after it: the chain must continue past the panic.
-    host.load_native(Arc::new(PanicExt { id: "panic".into() })).await.unwrap();
-    host.load_native(Arc::new(BashGate { id: "gate".into() })).await.unwrap();
+    host.load_native(Arc::new(PanicExt { id: "panic".into() }))
+        .await
+        .unwrap();
+    host.load_native(Arc::new(BashGate { id: "gate".into() }))
+        .await
+        .unwrap();
     let hooks = host.hooks();
 
     let mut args = json!({});
@@ -645,7 +737,9 @@ async fn r08_036_panicking_handler_is_contained() {
 #[tokio::test]
 async fn error_listener_captures_contained_fault() {
     let host = ExtensionHost::new(cfg());
-    host.load_native(Arc::new(PanicExt { id: "panic".into() })).await.unwrap();
+    host.load_native(Arc::new(PanicExt { id: "panic".into() }))
+        .await
+        .unwrap();
 
     let captured: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = captured.clone();
@@ -660,7 +754,11 @@ async fn error_listener_captures_contained_fault() {
     let reduced = host
         .dispatcher()
         .dispatch_block_mutate(
-            HostEvent::ToolCall { call_id: "t".into(), name: "bash".into(), input: json!({}) },
+            HostEvent::ToolCall {
+                call_id: "t".into(),
+                name: "bash".into(),
+                input: json!({}),
+            },
             &CancelToken::new(),
         )
         .await;
@@ -672,7 +770,10 @@ async fn error_listener_captures_contained_fault() {
     let got = captured.lock().unwrap().clone();
     assert_eq!(got.len(), 1, "one fault captured");
     assert_eq!(got[0].0, "panic", "attributed to the faulting extension");
-    assert_eq!(got[0].1, "tool_call", "carries the event name (Pi ExtensionError.event)");
+    assert_eq!(
+        got[0].1, "tool_call",
+        "carries the event name (Pi ExtensionError.event)"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -704,16 +805,25 @@ async fn r08_036_looping_handler_is_budget_contained() {
 
     let subs = Subscriptions::empty().with(EventKind::AgentStart);
     let ctx = HostCtx::event(ExtMode::Tui, true, std::path::PathBuf::from("."));
-    let handle = Arc::new(NativeHandle::new(Arc::new(LoopExt { id: "loop".into() }), subs, ctx));
+    let handle = Arc::new(NativeHandle::new(
+        Arc::new(LoopExt { id: "loop".into() }),
+        subs,
+        ctx,
+    ));
 
     let dispatcher = Dispatcher::with_budget(Duration::from_millis(80));
     dispatcher.add(handle).unwrap();
 
     let start = Instant::now();
-    dispatcher.dispatch_notify(&HostEvent::AgentStart, &CancelToken::new()).await;
+    dispatcher
+        .dispatch_notify(&HostEvent::AgentStart, &CancelToken::new())
+        .await;
     let elapsed = start.elapsed();
     // Returned (host alive) shortly after the budget, not hung.
-    assert!(elapsed < Duration::from_secs(2), "dispatch should be budget-contained, took {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "dispatch should be budget-contained, took {elapsed:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -730,7 +840,10 @@ impl NativeExtension for CmdExt {
     async fn init(&self, api: &mut InitApi) -> Result<(), crate::ExtError> {
         api.register_command(
             "todo",
-            CommandDescriptor { description: "manage todos".into(), completions: vec![] },
+            CommandDescriptor {
+                description: "manage todos".into(),
+                completions: vec![],
+            },
         );
         Ok(())
     }
@@ -742,7 +855,9 @@ impl NativeExtension for CmdExt {
 #[tokio::test]
 async fn command_registration_visible() {
     let host = ExtensionHost::new(cfg());
-    host.load_native(Arc::new(CmdExt { id: "cmd".into() })).await.unwrap();
+    host.load_native(Arc::new(CmdExt { id: "cmd".into() }))
+        .await
+        .unwrap();
     assert!(host.registry().has_command("todo").unwrap());
     assert!(!host.registry().has_command("missing").unwrap());
 }
@@ -753,8 +868,13 @@ async fn command_registration_visible() {
 #[tokio::test]
 async fn duplicate_id_rejected() {
     let host = ExtensionHost::new(cfg());
-    host.load_native(Arc::new(CmdExt { id: "dup".into() })).await.unwrap();
-    let err = host.load_native(Arc::new(CmdExt { id: "dup".into() })).await.unwrap_err();
+    host.load_native(Arc::new(CmdExt { id: "dup".into() }))
+        .await
+        .unwrap();
+    let err = host
+        .load_native(Arc::new(CmdExt { id: "dup".into() }))
+        .await
+        .unwrap_err();
     assert!(matches!(err, crate::ExtError::DuplicateId(_)));
 }
 
@@ -764,7 +884,10 @@ async fn duplicate_id_rejected() {
 #[test]
 fn r08_008_deadlock_guard_on_event_tier() {
     let ev = HostCtx::event(ExtMode::Tui, true, std::path::PathBuf::from("."));
-    assert!(matches!(ev.require_command_tier(), Err(crate::ExtError::Deadlock)));
+    assert!(matches!(
+        ev.require_command_tier(),
+        Err(crate::ExtError::Deadlock)
+    ));
     let cmd = HostCtx::command(ExtMode::Tui, true, std::path::PathBuf::from("."));
     assert!(cmd.require_command_tier().is_ok());
 }
@@ -795,7 +918,10 @@ impl NativeExtension for HumanGateExt {
         // Enter a sanctioned human wait: the dispatch budget is suspended while the guard is held.
         let _human_wait = ctx.begin_human_wait();
         tokio::time::sleep(self.wait).await; // a "slow human" — longer than the budget
-        HookOutcome::Block { reason: Some("human rejected".to_string()), terminate: TerminateHint::Unspecified }
+        HookOutcome::Block {
+            reason: Some("human rejected".to_string()),
+            terminate: TerminateHint::Unspecified,
+        }
     }
 }
 
@@ -815,7 +941,10 @@ impl NativeExtension for SlowNoGateExt {
     }
     async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         tokio::time::sleep(self.wait).await;
-        HookOutcome::Block { reason: Some("should never be observed (budget-timed-out)".to_string()), terminate: TerminateHint::Unspecified }
+        HookOutcome::Block {
+            reason: Some("should never be observed (budget-timed-out)".to_string()),
+            terminate: TerminateHint::Unspecified,
+        }
     }
 }
 
@@ -828,7 +957,10 @@ async fn p3_human_wait_forgives_the_dispatch_budget() {
     let ctx = HostCtx::event(ExtMode::Tui, true, std::path::PathBuf::from("."));
     // The handler waits 400ms — WAY past the 80ms budget — while holding the human-wait guard.
     let handle = Arc::new(NativeHandle::new(
-        Arc::new(HumanGateExt { id: "human-gate".into(), wait: Duration::from_millis(400) }),
+        Arc::new(HumanGateExt {
+            id: "human-gate".into(),
+            wait: Duration::from_millis(400),
+        }),
         subs,
         ctx,
     ));
@@ -841,11 +973,17 @@ async fn p3_human_wait_forgives_the_dispatch_budget() {
         name: "bash".into(),
         input: json!({ "command": "rm -rf /" }),
     };
-    let reduced = dispatcher.dispatch_block_mutate(ev, &CancelToken::new()).await;
+    let reduced = dispatcher
+        .dispatch_block_mutate(ev, &CancelToken::new())
+        .await;
     // FORGIVEN: the slow human decision is honored (Blocked), NOT skipped-and-passed (fail-open).
     match reduced {
         Reduced::Blocked { reason, .. } => {
-            assert_eq!(reason.as_deref(), Some("human rejected"), "the human decision reached the gate");
+            assert_eq!(
+                reason.as_deref(),
+                Some("human rejected"),
+                "the human decision reached the gate"
+            );
         }
         other => panic!("expected the slow human decision to Block, got {other:?}"),
     }
@@ -859,7 +997,10 @@ async fn p3_no_human_wait_is_still_budget_contained() {
     let ctx = HostCtx::event(ExtMode::Tui, true, std::path::PathBuf::from("."));
     // Same 400ms wait, but NO human-wait guard: a cooperative runaway → budget-contained + skipped.
     let handle = Arc::new(NativeHandle::new(
-        Arc::new(SlowNoGateExt { id: "slow-no-gate".into(), wait: Duration::from_millis(400) }),
+        Arc::new(SlowNoGateExt {
+            id: "slow-no-gate".into(),
+            wait: Duration::from_millis(400),
+        }),
         subs,
         ctx,
     ));
@@ -872,7 +1013,9 @@ async fn p3_no_human_wait_is_still_budget_contained() {
         name: "bash".into(),
         input: json!({ "command": "echo hi" }),
     };
-    let reduced = dispatcher.dispatch_block_mutate(ev, &CancelToken::new()).await;
+    let reduced = dispatcher
+        .dispatch_block_mutate(ev, &CancelToken::new())
+        .await;
     // EXT-032: the wall-clock assertion that used to sit here
     // (`assert!(elapsed < Duration::from_millis(300), …)`, a 220ms margin on an 80ms budget
     // against a 400ms sleep) is GONE. It could only fail spuriously: it pinned the scheduler's
@@ -886,7 +1029,10 @@ async fn p3_no_human_wait_is_still_budget_contained() {
     // silently allowing the call it was meant to gate.
     match reduced {
         Reduced::Blocked { reason, .. } => assert!(
-            reason.as_deref().unwrap_or_default().contains("Extension failed, blocking execution"),
+            reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Extension failed, blocking execution"),
             "the budget timeout is reported as pi's blocking fault: {reason:?}"
         ),
         other => panic!("a budget-timed-out tool_call handler must Block, got {other:?}"),
@@ -955,11 +1101,26 @@ async fn ext002_message_end_handler_runs_once_per_finalized_message() {
     let agent_msg = AgentMessage::user_text("hello");
 
     // Seam 1 — the notify subscriber attached at builder.rs (`agent.subscribe(ext_subscriber)`).
-    sub.on_event(&AgentEvent::MessageStart { message: agent_msg.clone() }, CancelToken::new()).await;
-    sub.on_event(&AgentEvent::MessageEnd { message: agent_msg.clone() }, CancelToken::new()).await;
+    sub.on_event(
+        &AgentEvent::MessageStart {
+            message: agent_msg.clone(),
+        },
+        CancelToken::new(),
+    )
+    .await;
+    sub.on_event(
+        &AgentEvent::MessageEnd {
+            message: agent_msg.clone(),
+        },
+        CancelToken::new(),
+    )
+    .await;
     // Seam 2 — `SvcSubscriber`'s re-dispatch of the SAME finalized message through the mutating
     // facade (`cyrup-session-svc/src/subscriber.rs`).
-    let core = cyrup_core::Message::User { content: vec![Content::text("hello")], timestamp: 0 };
+    let core = cyrup_core::Message::User {
+        content: vec![Content::text("hello")],
+        timestamp: 0,
+    };
     assert!(
         host.emit_message_end(core, &cancel).await.is_none(),
         "a Noop handler leaves the message unmodified"
@@ -971,7 +1132,11 @@ async fn ext002_message_end_handler_runs_once_per_finalized_message() {
         "message_end must reach a subscribed handler exactly once per finalized message (Pi \
          emitMessageEnd is the single dispatch point)"
     );
-    assert_eq!(starts.load(Ordering::SeqCst), 1, "the notify seam still delivers other kinds");
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        1,
+        "the notify seam still delivers other kinds"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -997,7 +1162,8 @@ impl NativeExtension for BusEmitterOnEvent {
     }
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         if matches!(ev, HostEvent::MessageStart { .. }) {
-            self.bus.emit("demo:bus".into(), json!({"from": "event-handler"}));
+            self.bus
+                .emit("demo:bus".into(), json!({"from": "event-handler"}));
         }
         HookOutcome::Noop
     }
@@ -1028,7 +1194,11 @@ impl NativeExtension for BusListener {
     ) -> Result<(), crate::ExtError> {
         assert_eq!(topic, "demo:bus");
         // A bus listener is not a command: it must run at the EVENT tier.
-        assert_eq!(ctx.tier(), crate::native::CtxTier::Event, "bus delivery uses an event-tier ctx");
+        assert_eq!(
+            ctx.tier(),
+            crate::native::CtxTier::Event,
+            "bus delivery uses an event-tier ctx"
+        );
         self.seen.lock().unwrap().push(payload.clone());
         Ok(())
     }
@@ -1045,12 +1215,23 @@ impl NativeExtension for BusListener {
 async fn ext034_bus_emit_from_an_event_handler_is_delivered_without_a_manual_drain() {
     let host = ExtensionHost::new(cfg());
     let seen = Arc::new(Mutex::new(Vec::new()));
-    host.load_native(Arc::new(BusListener { seen: seen.clone() })).await.unwrap();
-    host.load_native(Arc::new(BusEmitterOnEvent { bus: host.bus().clone() })).await.unwrap();
+    host.load_native(Arc::new(BusListener { seen: seen.clone() }))
+        .await
+        .unwrap();
+    host.load_native(Arc::new(BusEmitterOnEvent {
+        bus: host.bus().clone(),
+    }))
+    .await
+    .unwrap();
 
     let sub = host.subscriber();
-    sub.on_event(&AgentEvent::MessageStart { message: AgentMessage::user_text("hi") }, CancelToken::new())
-        .await;
+    sub.on_event(
+        &AgentEvent::MessageStart {
+            message: AgentMessage::user_text("hi"),
+        },
+        CancelToken::new(),
+    )
+    .await;
 
     let got = seen.lock().unwrap().clone();
     assert_eq!(
@@ -1060,7 +1241,11 @@ async fn ext034_bus_emit_from_an_event_handler_is_delivered_without_a_manual_dra
          queued until the next slash command"
     );
     assert_eq!(got[0], json!({"from": "event-handler"}));
-    assert_eq!(host.bus().pending_len(), 0, "the queue is empty after the dispatch seam drains");
+    assert_eq!(
+        host.bus().pending_len(),
+        0,
+        "the queue is empty after the dispatch seam drains"
+    );
 }
 
 /// The same emit on the block/mutate seam (`tool_call` — the permission gate's own event), whose
@@ -1082,7 +1267,10 @@ impl NativeExtension for BusEmitterOnBlock {
     }
     async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         self.bus.emit("demo:bus".into(), json!({"from": "gate"}));
-        HookOutcome::Block { reason: Some("denied".into()), terminate: TerminateHint::Unspecified }
+        HookOutcome::Block {
+            reason: Some("denied".into()),
+            terminate: TerminateHint::Unspecified,
+        }
     }
 }
 
@@ -1090,8 +1278,14 @@ impl NativeExtension for BusEmitterOnBlock {
 async fn ext034_bus_emit_survives_the_first_block_short_circuit() {
     let host = ExtensionHost::new(cfg());
     let seen = Arc::new(Mutex::new(Vec::new()));
-    host.load_native(Arc::new(BusListener { seen: seen.clone() })).await.unwrap();
-    host.load_native(Arc::new(BusEmitterOnBlock { bus: host.bus().clone() })).await.unwrap();
+    host.load_native(Arc::new(BusListener { seen: seen.clone() }))
+        .await
+        .unwrap();
+    host.load_native(Arc::new(BusEmitterOnBlock {
+        bus: host.bus().clone(),
+    }))
+    .await
+    .unwrap();
 
     let reduced = host
         .dispatcher()
@@ -1104,7 +1298,10 @@ async fn ext034_bus_emit_survives_the_first_block_short_circuit() {
             &CancelToken::new(),
         )
         .await;
-    assert!(matches!(reduced, Reduced::Blocked { .. }), "the gate blocked");
+    assert!(
+        matches!(reduced, Reduced::Blocked { .. }),
+        "the gate blocked"
+    );
     assert_eq!(
         seen.lock().unwrap().len(),
         1,
@@ -1129,7 +1326,10 @@ impl NativeExtension for FullRegistrar {
     }
     async fn init(&self, api: &mut InitApi) -> Result<(), crate::ExtError> {
         api.register_shortcut("ctrl+alt+f", Some("Show the fleet".into()));
-        api.register_flag("fleet", json!({"type": "boolean", "description": "fleet mode"}));
+        api.register_flag(
+            "fleet",
+            json!({"type": "boolean", "description": "fleet mode"}),
+        );
         // pi's `ProviderConfig.models` is `ProviderModelConfig[]` — OBJECTS carrying
         // `id`/`name`/`reasoning`/`input`/`cost`/`contextWindow`/`maxTokens`, never bare id strings
         // (`pi/packages/coding-agent/src/core/extensions/types.ts:1443` and `:1467-1492` @v0.83.0),
@@ -1174,7 +1374,11 @@ impl NativeExtension for FullRegistrar {
 async fn ext035_a_native_registered_shortcut_actually_fires() {
     let host = ExtensionHost::new(cfg());
     let fired = Arc::new(AtomicUsize::new(0));
-    host.load_native(Arc::new(FullRegistrar { fired: fired.clone() })).await.unwrap();
+    host.load_native(Arc::new(FullRegistrar {
+        fired: fired.clone(),
+    }))
+    .await
+    .unwrap();
 
     assert!(
         host.shortcut_keys().contains(&"ctrl+alt+f".to_string()),
@@ -1190,11 +1394,18 @@ async fn ext035_a_native_registered_shortcut_actually_fires() {
         "EXT-040: /hotkeys renders `shortcut.description ?? extensionPath`, never the key id"
     );
 
-    host.run_shortcut("ctrl+alt+f", &CancelToken::new()).await.expect("the native handler runs");
+    host.run_shortcut("ctrl+alt+f", &CancelToken::new())
+        .await
+        .expect("the native handler runs");
     assert_eq!(fired.load(Ordering::SeqCst), 1);
 
     // The other two EXT-035 surfaces reached the registry from the same `init`.
-    assert!(host.registry().provider_ids().unwrap().contains(&"fleet-provider".to_string()));
+    assert!(
+        host.registry()
+            .provider_ids()
+            .unwrap()
+            .contains(&"fleet-provider".to_string())
+    );
     assert!(host.registry().get_flag("fleet").unwrap().is_some());
 }
 
@@ -1203,7 +1414,10 @@ async fn ext035_a_native_registered_shortcut_actually_fires() {
 #[tokio::test]
 async fn ext035_an_unhandled_shortcut_is_a_typed_error_not_a_silent_success() {
     let host = ExtensionHost::new(cfg());
-    let err = host.run_shortcut("ctrl+q", &CancelToken::new()).await.unwrap_err();
+    let err = host
+        .run_shortcut("ctrl+q", &CancelToken::new())
+        .await
+        .unwrap_err();
     assert!(format!("{err}").contains("no such shortcut"), "{err}");
 }
 
@@ -1250,10 +1464,22 @@ impl NativeExtension for MarkTransformer {
 #[tokio::test]
 async fn ext019_markdown_transformers_fold_in_load_order_with_pis_context_fields() {
     let host = ExtensionHost::new(cfg());
-    host.load_native(Arc::new(MarkTransformer { id: "first", marker: "-A" })).await.unwrap();
-    host.load_native(Arc::new(MarkTransformer { id: "second", marker: "-B" })).await.unwrap();
+    host.load_native(Arc::new(MarkTransformer {
+        id: "first",
+        marker: "-A",
+    }))
+    .await
+    .unwrap();
+    host.load_native(Arc::new(MarkTransformer {
+        id: "second",
+        marker: "-B",
+    }))
+    .await
+    .unwrap();
 
-    let out = host.transform_markdown("body", "assistant-thinking", true, 80).await;
+    let out = host
+        .transform_markdown("body", "assistant-thinking", true, 80)
+        .await;
     assert_eq!(
         out, "body-A[assistant-thinking|true|80]-B[assistant-thinking|true|80]",
         "each transformer's output is the next one's input, in LOAD order"
@@ -1269,7 +1495,11 @@ async fn ext019_markdown_transformers_fold_in_load_order_with_pis_context_fields
 #[tokio::test]
 async fn ext019_no_registered_transformer_is_the_identity() {
     let host = ExtensionHost::new(cfg());
-    assert_eq!(host.transform_markdown("as-is", "assistant", false, 10).await, "as-is");
+    assert_eq!(
+        host.transform_markdown("as-is", "assistant", false, 10)
+            .await,
+        "as-is"
+    );
 }
 
 /// A PANICKING transformer is contained and SKIPPED: its input passes through unchanged, and the
@@ -1298,10 +1528,19 @@ impl NativeExtension for PanickingTransformer {
 #[tokio::test]
 async fn ext019_a_panicking_transformer_is_contained_and_the_text_survives() {
     let host = ExtensionHost::new(cfg());
-    host.load_native(Arc::new(PanickingTransformer)).await.unwrap();
-    host.load_native(Arc::new(MarkTransformer { id: "after", marker: "-B" })).await.unwrap();
+    host.load_native(Arc::new(PanickingTransformer))
+        .await
+        .unwrap();
+    host.load_native(Arc::new(MarkTransformer {
+        id: "after",
+        marker: "-B",
+    }))
+    .await
+    .unwrap();
 
-    let out = host.transform_markdown("keep", "assistant", false, 20).await;
+    let out = host
+        .transform_markdown("keep", "assistant", false, 20)
+        .await;
     assert_eq!(
         out, "keep-B[assistant|false|20]",
         "the panicking step passes its input through untouched and the chain continues"
@@ -1337,7 +1576,10 @@ impl NativeExtension for InputWatcher {
     fn on_terminal_input(&self, data: &str) -> Option<crate::TerminalInputResult> {
         self.seen.lock().unwrap().push(data.to_string());
         if self.consume_on_bang && data.contains('!') {
-            return Some(crate::TerminalInputResult { consume: Some(true), data: None });
+            return Some(crate::TerminalInputResult {
+                consume: Some(true),
+                data: None,
+            });
         }
         Some(crate::TerminalInputResult {
             consume: None,
@@ -1375,7 +1617,10 @@ async fn ext021_terminal_input_handlers_fold_in_load_order_and_each_sees_the_rew
     .unwrap();
 
     let decision = host.terminal_input("k").await;
-    assert_eq!(decision, crate::TerminalInputDecision::Deliver("k-A-B".into()));
+    assert_eq!(
+        decision,
+        crate::TerminalInputDecision::Deliver("k-A-B".into())
+    );
     assert_eq!(first_seen.lock().unwrap().as_slice(), ["k"]);
     assert_eq!(
         second_seen.lock().unwrap().as_slice(),
@@ -1421,10 +1666,16 @@ async fn ext021_consume_stops_the_fold_and_drops_the_keystroke() {
     .unwrap();
 
     // A non-bang chunk still reaches both, so the assertion below is not vacuous.
-    assert_eq!(host.terminal_input("q").await, crate::TerminalInputDecision::Deliver("q-A-B".into()));
+    assert_eq!(
+        host.terminal_input("q").await,
+        crate::TerminalInputDecision::Deliver("q-A-B".into())
+    );
     assert_eq!(second_seen.lock().unwrap().len(), 1);
 
-    assert_eq!(host.terminal_input("!").await, crate::TerminalInputDecision::Consume);
+    assert_eq!(
+        host.terminal_input("!").await,
+        crate::TerminalInputDecision::Consume
+    );
     assert_eq!(
         second_seen.lock().unwrap().len(),
         1,
@@ -1492,7 +1743,10 @@ impl NativeExtension for BlankingWatcher {
         HookOutcome::Noop
     }
     fn on_terminal_input(&self, _data: &str) -> Option<crate::TerminalInputResult> {
-        Some(crate::TerminalInputResult { consume: None, data: Some(String::new()) })
+        Some(crate::TerminalInputResult {
+            consume: None,
+            data: Some(String::new()),
+        })
     }
 }
 
@@ -1500,7 +1754,10 @@ impl NativeExtension for BlankingWatcher {
 async fn ext021_a_fold_that_ends_empty_drops_the_keystroke_without_consume() {
     let host = ExtensionHost::new(cfg());
     host.load_native(Arc::new(BlankingWatcher)).await.unwrap();
-    assert_eq!(host.terminal_input("x").await, crate::TerminalInputDecision::Consume);
+    assert_eq!(
+        host.terminal_input("x").await,
+        crate::TerminalInputDecision::Consume
+    );
 }
 
 /// EXT-034, the re-entrancy half. A `Some(exclude)` on a dispatch means a guest is SUSPENDED inside
@@ -1520,15 +1777,20 @@ async fn ext021_a_fold_that_ends_empty_drops_the_keystroke_without_consume() {
 async fn ext034_an_excluded_seam_defers_the_drain_instead_of_re_entering() {
     let host = ExtensionHost::new(cfg());
     let seen = Arc::new(Mutex::new(Vec::new()));
-    host.load_native(Arc::new(BusListener { seen: seen.clone() })).await.unwrap();
+    host.load_native(Arc::new(BusListener { seen: seen.clone() }))
+        .await
+        .unwrap();
 
     // Queue an event as if a guest had emitted from inside its own import.
-    host.bus().emit("demo:bus".into(), json!({"from": "suspended-guest"}));
+    host.bus()
+        .emit("demo:bus".into(), json!({"from": "suspended-guest"}));
 
     // An EXCLUDED dispatch must not drain: the excluded guest is mid-import.
     host.dispatcher()
         .dispatch_notify_excluding(
-            &HostEvent::MessageStart { message: json!({"role": "user"}) },
+            &HostEvent::MessageStart {
+                message: json!({"role": "user"}),
+            },
             &CancelToken::new(),
             Some(&ExtensionId::from("suspended")),
         )
@@ -1538,12 +1800,18 @@ async fn ext034_an_excluded_seam_defers_the_drain_instead_of_re_entering() {
         0,
         "an excluded seam must leave the queue alone — draining there re-enters a held store"
     );
-    assert_eq!(host.bus().pending_len(), 1, "the event is still queued, not dropped");
+    assert_eq!(
+        host.bus().pending_len(),
+        1,
+        "the event is still queued, not dropped"
+    );
 
     // The next ORDINARY seam delivers it.
     host.dispatcher()
         .dispatch_notify(
-            &HostEvent::MessageStart { message: json!({"role": "user"}) },
+            &HostEvent::MessageStart {
+                message: json!({"role": "user"}),
+            },
             &CancelToken::new(),
         )
         .await;

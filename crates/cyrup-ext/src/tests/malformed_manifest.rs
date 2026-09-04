@@ -20,9 +20,14 @@
 //! silence and cyrup cannot: Pi's `pi.extensions` manifest is a pointer list, so its fallback yields
 //! the same extension at the same path-derived identity with the same (total) privileges, whereas
 //! cyrup's `extension.json` also carries the id and the capability grant.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
-use crate::loader::{discover, discover_with_diagnostics, DiscoveryRoots};
+use crate::loader::{DiscoveryRoots, discover, discover_with_diagnostics};
 use std::path::{Path, PathBuf};
 
 /// A stand-in artifact. Discovery never inspects the bytes.
@@ -33,8 +38,10 @@ fn unique_dir(tag: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let dir = std::env::temp_dir()
-        .join(format!("cyrup-ext-badmanifest-{tag}-{nanos}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "cyrup-ext-badmanifest-{tag}-{nanos}-{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -71,18 +78,33 @@ fn project_roots(cwd: &Path) -> DiscoveryRoots {
 /// would otherwise have to infer (the id it actually loaded under, and the empty grant).
 #[test]
 fn a_malformed_manifest_beside_an_artifact_is_reported_and_falls_back() {
-    let cwd = project_with("broken", Some(r#"{ "id": "declared","#), Some("payload.wasm"));
+    let cwd = project_with(
+        "broken",
+        Some(r#"{ "id": "declared","#),
+        Some("payload.wasm"),
+    );
     let (found, diags) = discover_with_diagnostics(&project_roots(&cwd));
 
     // Pi's outcome, unchanged: the fallback extension exists and is loadable.
-    assert_eq!(found.len(), 1, "the fallback still discovers the artifact: {found:?}");
-    assert_eq!(found[0].manifest.id, "payload", "id came from the artifact stem, not the manifest");
+    assert_eq!(
+        found.len(),
+        1,
+        "the fallback still discovers the artifact: {found:?}"
+    );
+    assert_eq!(
+        found[0].manifest.id, "payload",
+        "id came from the artifact stem, not the manifest"
+    );
     assert_eq!(
         found[0].manifest.capabilities,
         crate::Capabilities::none(),
         "a manifest nobody could read grants nothing"
     );
-    assert_eq!(discover(&project_roots(&cwd)).len(), 1, "`discover` behaves identically");
+    assert_eq!(
+        discover(&project_roots(&cwd)).len(),
+        1,
+        "`discover` behaves identically"
+    );
 
     // The part that used to be missing entirely.
     assert_eq!(diags.len(), 1, "exactly one diagnostic: {diags:?}");
@@ -97,7 +119,10 @@ fn a_malformed_manifest_beside_an_artifact_is_reported_and_falls_back() {
     );
     let msg = &diags[0].error;
     assert!(msg.contains("extension.json"), "names the file, got: {msg}");
-    assert!(msg.contains("payload"), "names the id it actually loaded under, got: {msg}");
+    assert!(
+        msg.contains("payload"),
+        "names the id it actually loaded under, got: {msg}"
+    );
     assert!(
         msg.contains("NO declared capabilities"),
         "states the capability consequence, got: {msg}"
@@ -136,9 +161,16 @@ fn a_directory_with_no_manifest_at_all_produces_no_diagnostic() {
     let cwd = project_with("plain", None, Some("plain.wasm"));
     let (found, diags) = discover_with_diagnostics(&project_roots(&cwd));
 
-    assert_eq!(found.len(), 1, "the manifest-less rule still works: {found:?}");
+    assert_eq!(
+        found.len(),
+        1,
+        "the manifest-less rule still works: {found:?}"
+    );
     assert_eq!(found[0].manifest.id, "plain");
-    assert!(diags.is_empty(), "an absent manifest is not an error: {diags:?}");
+    assert!(
+        diags.is_empty(),
+        "an absent manifest is not an error: {diags:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&cwd);
 }
@@ -156,7 +188,10 @@ fn a_valid_manifest_produces_no_diagnostic_and_keeps_its_declared_id() {
     let (found, diags) = discover_with_diagnostics(&project_roots(&cwd));
 
     assert_eq!(found.len(), 1);
-    assert_eq!(found[0].manifest.id, "declared", "the declared id wins when the manifest parses");
+    assert_eq!(
+        found[0].manifest.id, "declared",
+        "the declared id wins when the manifest parses"
+    );
     assert!(diags.is_empty(), "a valid manifest is silent: {diags:?}");
 
     let _ = std::fs::remove_dir_all(&cwd);
@@ -176,20 +211,37 @@ async fn the_diagnostic_reaches_discover_and_load_without_becoming_fatal() {
     use crate::{DenyServices, ExtMode, ExtensionHost, HostConfig};
     use std::sync::Arc;
 
-    let cwd = project_with("reaches", Some(r#"{ "id": "declared","#), Some("payload.wasm"));
-    let cfg = HostConfig { mode: ExtMode::Tui, has_ui: true, cwd: cwd.clone() };
+    let cwd = project_with(
+        "reaches",
+        Some(r#"{ "id": "declared","#),
+        Some("payload.wasm"),
+    );
+    let cfg = HostConfig {
+        mode: ExtMode::Tui,
+        has_ui: true,
+        cwd: cwd.clone(),
+    };
     let host = ExtensionHost::with_wasm(cfg).expect("host with wasm");
     let services: Arc<dyn crate::host::HostServices> = Arc::new(DenyServices);
 
-    let res = host.discover_and_load(&project_roots(&cwd), true, services).await;
+    let res = host
+        .discover_and_load(&project_roots(&cwd), true, services)
+        .await;
 
-    assert!(res.loaded.is_empty(), "the garbage artifact does not instantiate: {:?}", res.loaded);
+    assert!(
+        res.loaded.is_empty(),
+        "the garbage artifact does not instantiate: {:?}",
+        res.loaded
+    );
     let manifest_diag = res
         .errors
         .iter()
         .find(|e| e.error.contains("extension.json"))
         .expect("the manifest diagnostic reached LoadExtensionsResult.errors");
-    assert!(!manifest_diag.fatal, "a malformed manifest is not an exit-1 startup abort");
+    assert!(
+        !manifest_diag.fatal,
+        "a malformed manifest is not an exit-1 startup abort"
+    );
     assert!(
         res.errors.iter().any(|e| e.fatal),
         "and the genuine load fault beside it still IS fatal: {:?}",

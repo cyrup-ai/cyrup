@@ -169,15 +169,24 @@ pub struct ConnectSupervisor {
 
 impl ConnectSupervisor {
     fn params(&self) -> Option<Arc<ConnectParams>> {
-        self.params.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.params
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     fn last_error(&self) -> Option<String> {
-        self.last_error.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.last_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     fn last_session_id(&self) -> Option<String> {
-        self.last_session_id.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.last_session_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Install (or, with `None`, clear) the reconnect timer, ABORTING whichever task it replaces —
@@ -239,7 +248,10 @@ impl ConnectSupervisor {
     }
 
     fn runtime_session_id(&self) -> Option<String> {
-        self.runtime_session_id.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.runtime_session_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
@@ -282,7 +294,8 @@ impl ConnectSupervisor {
 #[must_use]
 pub fn is_live_at(state: &SharedIntercomState, generation: u64) -> bool {
     let sup = &state.connect;
-    if sup.shutting_down.load(Ordering::SeqCst) || sup.generation.load(Ordering::SeqCst) != generation
+    if sup.shutting_down.load(Ordering::SeqCst)
+        || sup.generation.load(Ordering::SeqCst) != generation
     {
         return false;
     }
@@ -329,8 +342,11 @@ pub fn begin_runtime(state: &Arc<SharedIntercomState>, params: ConnectParams) {
     *sup.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
     // `currentSessionId = ctx.sessionManager.getSessionId()` (`v0.10.1 index.ts:1266`) — captured
     // here, read only by `is_live_at`.
-    *sup.runtime_session_id.lock().unwrap_or_else(|e| e.into_inner()) =
-        state.host_services().and_then(|services| services.session_id());
+    *sup.runtime_session_id
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = state
+        .host_services()
+        .and_then(|services| services.session_id());
     *sup.params.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(params));
 }
 
@@ -352,7 +368,9 @@ pub fn shutdown(state: &Arc<SharedIntercomState>) {
     );
     sup.generation.fetch_add(1, Ordering::SeqCst);
     sup.set_timer(None);
-    *sup.runtime_session_id.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *sup.runtime_session_id
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
     *sup.params.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
@@ -418,7 +436,9 @@ pub async fn ensure_connected(
         return Ok(client);
     }
     let Some(params) = sup.params() else {
-        return Err(IntercomError::Client("Intercom runtime not initialized".to_string()));
+        return Err(IntercomError::Client(
+            "Intercom runtime not initialized".to_string(),
+        ));
     };
     let generation = sup.generation.load(Ordering::SeqCst);
     // `clearReconnectTimer()` (index.ts:824): we are about to attempt now, so a pending rung is
@@ -438,10 +458,13 @@ pub async fn ensure_connected(
         // shared `reconnectPromise` hands every queued caller the same rejection, instead of
         // stacking a second connect per caller.
         return Err(IntercomError::Client(
-            sup.last_error().unwrap_or_else(|| "intercom connect failed".to_string()),
+            sup.last_error()
+                .unwrap_or_else(|| "intercom connect failed".to_string()),
         ));
     }
-    if sup.shutting_down.load(Ordering::SeqCst) || sup.generation.load(Ordering::SeqCst) != generation {
+    if sup.shutting_down.load(Ordering::SeqCst)
+        || sup.generation.load(Ordering::SeqCst) != generation
+    {
         return Err(IntercomError::Client("Intercom shutting down".to_string()));
     }
 
@@ -535,9 +558,15 @@ async fn connect_once(
         // `Intercom runtime no longer active` (index.ts:837-840): never leave a registered client
         // behind for a session that has moved on.
         client.disconnect();
-        return Err(IntercomError::Client("Intercom runtime no longer active".to_string()));
+        return Err(IntercomError::Client(
+            "Intercom runtime no longer active".to_string(),
+        ));
     }
-    *state.connect.last_session_id.lock().unwrap_or_else(|e| e.into_inner()) = client.session_id();
+    *state
+        .connect
+        .last_session_id
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = client.session_id();
     state.set_client(Some(client.clone()));
     spawn_inbound_loop(state.clone(), client.clone());
     Ok(client)
@@ -548,7 +577,11 @@ async fn connect_once(
 ///
 /// The identity check mirrors pi's `if (client !== nextClient) return;`: a late `Disconnected` from
 /// a SUPERSEDED connection must not clear the client a newer attempt already installed.
-pub fn handle_disconnect(state: &Arc<SharedIntercomState>, client: &Arc<IntercomClient>, reason: &str) {
+pub fn handle_disconnect(
+    state: &Arc<SharedIntercomState>,
+    client: &Arc<IntercomClient>,
+    reason: &str,
+) {
     match state.client() {
         Some(live) if Arc::ptr_eq(&live, client) => {}
         _ => return,
@@ -556,7 +589,9 @@ pub fn handle_disconnect(state: &Arc<SharedIntercomState>, client: &Arc<Intercom
     // Reject BEFORE nulling the client (index.ts:783-784) so a blocking ask fails on the drop edge
     // instead of hanging until its 10-minute ask timeout, across a reconnect that can never carry
     // the answer (the broker has no mailbox — see the module docs).
-    state.waiter.fail_pending(&format!("Disconnected while waiting for reply: {reason}"));
+    state
+        .waiter
+        .fail_pending(&format!("Disconnected while waiting for reply: {reason}"));
     state.set_client(None);
     let sup = &state.connect;
     if sup.shutting_down.load(Ordering::SeqCst) || !sup.started.load(Ordering::SeqCst) {
@@ -578,11 +613,17 @@ pub fn handle_disconnect(state: &Arc<SharedIntercomState>, client: &Arc<Intercom
 ///      the two independently-produced strings match at the broker.
 ///   3. else the `CYRUP_INTERCOM_SESSION_ID`-derived alias (refined post-register).
 #[must_use]
-pub fn build_registration(state: &SharedIntercomState, params: &ConnectParams) -> SessionRegistration {
+pub fn build_registration(
+    state: &SharedIntercomState,
+    params: &ConnectParams,
+) -> SessionRegistration {
     let identity = presence_identity(state, params.metadata.as_ref());
     SessionRegistration {
         // `{ ...identity }` (`v0.10.1 index.ts:772-774`) — name AND the alias flag.
-        runtime_fallback_alias: identity.name.as_ref().map(|_| identity.runtime_fallback_alias),
+        runtime_fallback_alias: identity
+            .name
+            .as_ref()
+            .map(|_| identity.runtime_fallback_alias),
         name: identity.name,
         cwd: state.cwd.to_string_lossy().to_string(),
         model: params.model.clone().unwrap_or_else(|| "cyrup".to_string()),
@@ -655,7 +696,10 @@ pub fn presence_identity(
     // A launcher-assigned child label is a CHOSEN name, not a synthesized one, so it clears the
     // flag exactly as a `/name` would.
     if let Some(name) = metadata.and_then(|m| m.session_name.clone()) {
-        return PresenceIdentity { name: Some(name), runtime_fallback_alias: false };
+        return PresenceIdentity {
+            name: Some(name),
+            runtime_fallback_alias: false,
+        };
     }
     if let Some(services) = state.host_services()
         && let Some(id) = services.session_id().filter(|id| !id.is_empty())
@@ -668,16 +712,22 @@ pub fn presence_identity(
     }
     // No live host: the id-derived alias is by construction synthesized.
     match std::env::var(ENV_INTERCOM_SESSION_ID).ok() {
-        Some(id) => {
-            PresenceIdentity { name: Some(presence_name(None, &id)), runtime_fallback_alias: true }
-        }
+        Some(id) => PresenceIdentity {
+            name: Some(presence_name(None, &id)),
+            runtime_fallback_alias: true,
+        },
         None => PresenceIdentity::default(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
     use super::*;
     use crate::config::IntercomConfig;
 
@@ -702,7 +752,10 @@ mod tests {
     }
 
     fn error_text<T>(result: Result<T>) -> String {
-        result.err().map(|e| e.to_string()).unwrap_or_else(|| "<ok>".to_string())
+        result
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "<ok>".to_string())
     }
 
     /// pi `getReconnectDelayMs` (`index.ts:564-567`) verbatim, including the saturating ceiling that
@@ -737,10 +790,16 @@ mod tests {
         let state = state();
         begin_runtime(&state, unreachable_params(&dir));
         schedule_reconnect(&state);
-        assert!(state.connect.reconnect_armed(), "a started runtime arms the ladder");
+        assert!(
+            state.connect.reconnect_armed(),
+            "a started runtime arms the ladder"
+        );
 
         shutdown(&state);
-        assert!(!state.connect.reconnect_armed(), "shutdown aborts the pending backoff task");
+        assert!(
+            !state.connect.reconnect_armed(),
+            "shutdown aborts the pending backoff task"
+        );
 
         // And it stays disarmed: a disconnect edge after shutdown is a no-op.
         schedule_reconnect(&state);
@@ -763,7 +822,11 @@ mod tests {
             schedule_reconnect(&state);
         }
         assert!(state.connect.reconnect_armed());
-        assert_eq!(state.connect.attempt(), attempt_before, "no rung is consumed by re-scheduling");
+        assert_eq!(
+            state.connect.attempt(),
+            attempt_before,
+            "no rung is consumed by re-scheduling"
+        );
         shutdown(&state);
     }
 
@@ -789,7 +852,11 @@ mod tests {
 
         tokio::time::advance(Duration::from_millis(300)).await;
         tokio::task::yield_now().await;
-        assert_eq!(state.connect.attempt(), 0, "rung 0 must not fire before its 1000ms backoff");
+        assert_eq!(
+            state.connect.attempt(),
+            0,
+            "rung 0 must not fire before its 1000ms backoff"
+        );
 
         tokio::time::advance(Duration::from_millis(1000)).await;
         tokio::task::yield_now().await;
@@ -798,7 +865,11 @@ mod tests {
 
         tokio::time::advance(Duration::from_millis(700)).await;
         tokio::task::yield_now().await;
-        assert_eq!(state.connect.attempt(), 1, "rung 1 backs off 2000ms; it does not retry immediately");
+        assert_eq!(
+            state.connect.attempt(),
+            1,
+            "rung 1 backs off 2000ms; it does not retry immediately"
+        );
         shutdown(&state);
     }
 

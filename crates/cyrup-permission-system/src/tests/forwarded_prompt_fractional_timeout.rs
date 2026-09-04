@@ -18,14 +18,14 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use cyrup_ext::{DialogOptions, HostServices};
 use crate::{
-    forwarding::{
-        forwarding_location, process_forwarded_requests, ProcessForwardedOptions,
-        FORWARDING_AGENT_DIR_ENV,
-    },
     ExtensionConfig, ForwardedPermissionRequest, ForwardedPermissionResponse,
+    forwarding::{
+        FORWARDING_AGENT_DIR_ENV, ProcessForwardedOptions, forwarding_location,
+        process_forwarded_requests,
+    },
 };
+use cyrup_ext::{DialogOptions, HostServices};
 
 /// What the parent actually handed the UI for the forwarded prompt.
 #[derive(Debug, Clone, Default)]
@@ -56,7 +56,10 @@ impl HostServices for RecordingServices {
         self.calls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(SelectCall { prompt: prompt.to_string(), timeout_ms: opts.timeout_ms });
+            .push(SelectCall {
+                prompt: prompt.to_string(),
+                timeout_ms: opts.timeout_ms,
+            });
         None
     }
 }
@@ -120,8 +123,15 @@ async fn drive(
     )
     .await;
 
-    let recorded = calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-    assert_eq!(recorded.len(), 1, "the forwarded prompt must reach `select` exactly once");
+    let recorded = calls
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "the forwarded prompt must reach `select` exactly once"
+    );
     let call = recorded.into_iter().next().expect("just asserted one call");
 
     let response_text =
@@ -150,9 +160,8 @@ async fn a_fractional_forwarded_timeout_reaches_the_dialog_unrounded() {
 
     // The value an operator put in `config.json`, taken through the real normalizer so this pins
     // `normalize` too: upstream keeps any finite positive number as-is (`extension-config.ts:84`).
-    let config = ExtensionConfig::normalize(
-        &serde_json::json!({ "forwardedPromptTimeoutSeconds": 45.5 }),
-    );
+    let config =
+        ExtensionConfig::normalize(&serde_json::json!({ "forwardedPromptTimeoutSeconds": 45.5 }));
     assert_eq!(
         config.forwarded_prompt_timeout_seconds,
         Some(45.5),
@@ -177,7 +186,9 @@ async fn a_fractional_forwarded_timeout_reaches_the_dialog_unrounded() {
     // pi `timeoutDenialReason` (`index.ts:1204`), carried onto the reject decision.
     assert_eq!(
         response.denial_reason.as_deref(),
-        Some("permission_timeout: forwarded permission prompt was not answered within 45.5 seconds."),
+        Some(
+            "permission_timeout: forwarded permission prompt was not answered within 45.5 seconds."
+        ),
         "the denial reason must name the fractional timeout"
     );
 }
@@ -223,9 +234,13 @@ async fn a_null_forwarded_timeout_still_waits_indefinitely() {
 
     let (call, response) = drive(agent_dir.path(), session_id, "req-null", &config).await;
 
-    assert_eq!(call.timeout_ms, None, "an indefinite wait must set no dialog timeout");
+    assert_eq!(
+        call.timeout_ms, None,
+        "an indefinite wait must set no dialog timeout"
+    );
     assert!(
-        call.prompt.contains("will wait indefinitely until answered"),
+        call.prompt
+            .contains("will wait indefinitely until answered"),
         "got:\n{}",
         call.prompt
     );

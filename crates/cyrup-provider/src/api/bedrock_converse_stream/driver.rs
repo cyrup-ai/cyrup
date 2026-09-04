@@ -60,8 +60,9 @@ pub(super) async fn run_inner(
 
     // `cacheRetention` + payload (pi `:228-241`).
     let cache_retention = resolve_cache_retention(opts.cache_retention, &env);
-    let payload = build_params(model, ctx, opts, &bedrock, cache_retention, &env)
-        .map_err(|e| BedrockFailure::errored(dec.snapshot_owned(model, api), format_bedrock_error(&e)))?;
+    let payload = build_params(model, ctx, opts, &bedrock, cache_retention, &env).map_err(|e| {
+        BedrockFailure::errored(dec.snapshot_owned(model, api), format_bedrock_error(&e))
+    })?;
 
     // `onPayload` may replace the whole command input, including `modelId` (pi `:242-245`).
     let payload = crate::stream::apply_on_payload(opts, model, payload).await;
@@ -94,7 +95,10 @@ pub(super) async fn run_inner(
     )
     .await
     .map_err(|e| {
-        BedrockFailure::errored(dec.snapshot_owned(model, api), format_bedrock_error(&e.to_string()))
+        BedrockFailure::errored(
+            dec.snapshot_owned(model, api),
+            format_bedrock_error(&e.to_string()),
+        )
     })?;
 
     // PROV-043. pi builds `new BedrockRuntimeClient(config)` (`bedrock-converse-stream.ts:223`)
@@ -167,8 +171,8 @@ pub(super) async fn run_inner(
 
         let retry_index = max_retries.saturating_sub(retries_remaining);
         retries_remaining = retries_remaining.saturating_sub(1);
-        let delay = retry_delay_ms(retry_headers.as_ref(), &message, retry_index, retry)
-            .map_err(|e| {
+        let delay =
+            retry_delay_ms(retry_headers.as_ref(), &message, retry_index, retry).map_err(|e| {
                 BedrockFailure::errored(
                     dec.snapshot_owned(model, api),
                     format_bedrock_error(&e.to_string()),
@@ -314,12 +318,7 @@ pub(super) async fn run_inner(
         Some(r) if r != StopReason::Pending && r != StopReason::Error
     );
     if settles_on_error {
-        append_bedrock_failure_diagnostic(
-            &mut message,
-            None,
-            None,
-            response_request_id.as_deref(),
-        );
+        append_bedrock_failure_diagnostic(&mut message, None, None, response_request_id.as_deref());
     }
     sink.send(StreamEvent::end_of_stream(
         message,

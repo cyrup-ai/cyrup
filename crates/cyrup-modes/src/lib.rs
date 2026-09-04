@@ -39,11 +39,11 @@ mod tests;
 
 pub use error::ModesError;
 pub use json::run_json;
-pub use json_event::{is_upstream_wire_event, to_json_event, JsonAgentSessionEvent};
-pub use print::{run_print, PrintOptions};
-pub use raw_stdout::{flush_raw_stdout, write_raw_stdout, RAW_STDOUT_RETRY_DELAY_MS};
-pub use rpc::{run_rpc, QueueModeArg, RpcOut, RpcResponse, SessionCommand};
+pub use json_event::{JsonAgentSessionEvent, is_upstream_wire_event, to_json_event};
+pub use print::{PrintOptions, run_print};
+pub use raw_stdout::{RAW_STDOUT_RETRY_DELAY_MS, flush_raw_stdout, write_raw_stdout};
+pub use rpc::{ClearedQueue, QueueModeArg, RpcOut, RpcResponse, SessionCommand, run_rpc};
 pub use rpc_client::{
-    event_type, EventSubscription, ForkMessage, ModelInfo, RpcClient, RpcClientError,
-    RpcClientOptions, DEFAULT_CLI_PATH, DEFAULT_IDLE_TIMEOUT_MS, REQUEST_TIMEOUT_MS,
+    DEFAULT_CLI_PATH, DEFAULT_IDLE_TIMEOUT_MS, EventSubscription, ForkMessage, ModelInfo,
+    REQUEST_TIMEOUT_MS, RpcClient, RpcClientError, RpcClientOptions, event_type,
 };

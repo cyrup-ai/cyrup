@@ -1030,10 +1030,7 @@ mod tests {
         // (2) No embedded catalog row sets the key, so the resolver can never see `Some(false)`.
         for model in crate::catalog::builtin_catalog() {
             assert_eq!(
-                model
-                    .compat
-                    .as_ref()
-                    .and_then(|c| c.supports_finish_reason),
+                model.compat.as_ref().and_then(|c| c.supports_finish_reason),
                 None,
                 "{}/{} sets supportsFinishReason — a v0.84.1-only flag with no v0.83.0 warrant \
                  (PROV-063). Carry the item forward before shipping it.",
@@ -1114,7 +1111,10 @@ mod tests {
         // value for value. (Key ORDER differs from the old `Value` path — see the type's doc — so
         // this compares parsed values, which is what the OpenRouter API actually consumes.)
         let back = serde_json::to_value(&routing).expect("serializes");
-        assert_eq!(back, json, "the typed shape must be wire-identical to the JSON it came from");
+        assert_eq!(
+            back, json,
+            "the typed shape must be wire-identical to the JSON it came from"
+        );
     }
 
     /// PROV-066 (b) — the whole point: a misspelled key is a config error, not a silent
@@ -1289,13 +1289,23 @@ mod tests {
     /// guarded by `OPENAI_RESPONSES_APIS.has(model.api)` (`:74`, `:78`).
     #[test]
     fn a_reasoning_model_on_another_api_is_untouched() {
-        let m = temp_model(crate::known_api::OPENAI_COMPLETIONS, "openai", "gpt-5", true);
+        let m = temp_model(
+            crate::known_api::OPENAI_COMPLETIONS,
+            "openai",
+            "gpt-5",
+            true,
+        );
         assert_eq!(unsupported_temperature_reason(&m), None);
     }
 
     #[test]
     fn an_ordinary_responses_model_is_untouched() {
-        let m = temp_model(crate::known_api::OPENAI_RESPONSES, "openai", "gpt-4o", false);
+        let m = temp_model(
+            crate::known_api::OPENAI_RESPONSES,
+            "openai",
+            "gpt-4o",
+            false,
+        );
         assert_eq!(unsupported_temperature_reason(&m), None);
         assert!(temperature_is_supported(&m));
     }

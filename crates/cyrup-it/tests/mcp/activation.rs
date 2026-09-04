@@ -37,9 +37,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use cyrup_mcp::{McpExtension, EXTENSION_ID};
-use cyrup_provider::faux::FauxProvider;
+use cyrup_mcp::{EXTENSION_ID, McpExtension};
 use cyrup_provider::Provider;
+use cyrup_provider::faux::FauxProvider;
 use cyrup_session_svc::{SessionBuilder, SessionConfig};
 use tempfile::TempDir;
 
@@ -93,7 +93,11 @@ fn fixture() -> Fixture {
         ),
     )
     .unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 /// `SessionConfig::new` already sets `home = agent_dir`, so the session and the adapter agree on
@@ -115,8 +119,9 @@ fn config(fx: &Fixture, no_extensions: bool) -> SessionConfig {
 /// take the unbound branch and pass for the wrong reason.
 fn adapter(fx: &Fixture) -> Arc<dyn cyrup_ext::NativeExtension> {
     let dirs = cyrup_mcp::dirs::McpDirs::new(fx.agent_dir.clone(), fx.cwd.clone());
-    McpExtension::with_config(dirs, None).with_home(fx.agent_dir.clone()).into_arc()
-        as Arc<dyn cyrup_ext::NativeExtension>
+    McpExtension::with_config(dirs, None)
+        .with_home(fx.agent_dir.clone())
+        .into_arc() as Arc<dyn cyrup_ext::NativeExtension>
 }
 
 /// Build a real session with the adapter attached and return its FULL registered tool set
@@ -130,8 +135,10 @@ async fn tool_registry(fx: &Fixture, no_extensions: bool) -> (Vec<String>, Optio
         .unwrap();
     let all = session.all_tools();
     let names = all.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
-    let proxy_description =
-        all.iter().find(|t| t.name == PROXY_TOOL).map(|t| t.description.clone());
+    let proxy_description = all
+        .iter()
+        .find(|t| t.name == PROXY_TOOL)
+        .map(|t| t.description.clone());
     (names, proxy_description)
 }
 
@@ -146,7 +153,10 @@ fn assert_no_socket_or_pidfile(dir: &Path) {
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "sock" || x == "pid"))
         .collect();
-    assert!(stray.is_empty(), "the adapter connected nothing at load: {stray:?}");
+    assert!(
+        stray.is_empty(),
+        "the adapter connected nothing at load: {stray:?}"
+    );
 }
 
 // ================================================================================================
@@ -214,7 +224,10 @@ async fn the_mcp_tool_is_absent_under_no_extensions() {
         !names.iter().any(|n| n == PROXY_TOOL),
         "`--no-extensions` must switch the ambient MCP adapter off; got: {names:?}"
     );
-    assert!(description.is_none(), "no `mcp` tool means no `mcp` description");
+    assert!(
+        description.is_none(),
+        "no `mcp` tool means no `mcp` description"
+    );
     for builtin in ["read", "bash"] {
         assert!(
             names.iter().any(|n| n == builtin),

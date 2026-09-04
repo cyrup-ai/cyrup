@@ -168,7 +168,10 @@ impl PermissionSystemExtension {
         // learns a human is being asked while they are still being asked, which is the whole point
         // of the `waiting` state.
         self.emit_permission_state_event(details, "waiting");
-        let human_lock = self.host_services.get().and_then(|s| s.human_interaction_lock());
+        let human_lock = self
+            .host_services
+            .get()
+            .and_then(|s| s.human_interaction_lock());
         let _human_guard = match human_lock {
             Some(lock) => Some(lock.acquire().await),
             None => None,
@@ -179,7 +182,9 @@ impl PermissionSystemExtension {
         };
         let outcome = {
             let _human_wait = ctx.begin_human_wait();
-            channel.confirm("Permission Required", message, PromptOpts::default()).await
+            channel
+                .confirm("Permission Required", message, PromptOpts::default())
+                .await
         };
 
         // pi `index.ts:1855-1868`: the resolved decision, with the "Allow Always" session-persist
@@ -188,7 +193,11 @@ impl PermissionSystemExtension {
             let always = d.state == PermissionDecisionState::Always;
             let scope = Self::permission_decision_scope(details);
             self.review_permission_decision(
-                if d.approved { "permission_request.approved" } else { "permission_request.denied" },
+                if d.approved {
+                    "permission_request.approved"
+                } else {
+                    "permission_request.denied"
+                },
                 details,
                 json!({
                     "resolution": decision_state_str(d.state),
@@ -203,7 +212,10 @@ impl PermissionSystemExtension {
             );
             // PERM-011 half B / pi `emitPermissionStateEvent(details, decision.approved ?
             // "approved" : "denied")` (`index.ts:1626`).
-            self.emit_permission_state_event(details, if d.approved { "approved" } else { "denied" });
+            self.emit_permission_state_event(
+                details,
+                if d.approved { "approved" } else { "denied" },
+            );
             // pi `:1637` — the `decisionPromise` settles, so the entry registered above flips from
             // pending to resolved and BOTH the next identical request and any concurrent follower
             // already awaiting it see this decision.
@@ -254,7 +266,10 @@ impl PermissionSystemExtension {
                     &details,
                     json!({ "source": "tool_call", "resolution": "confirmation_unavailable" }),
                 );
-                return HookOutcome::Block { reason: Some(gate::format_ask_unavailable_reason(check)), terminate: TerminateHint::Unspecified };
+                return HookOutcome::Block {
+                    reason: Some(gate::format_ask_unavailable_reason(check)),
+                    terminate: TerminateHint::Unspecified,
+                };
             }
         };
 
@@ -295,7 +310,10 @@ impl PermissionSystemExtension {
     ) -> HookOutcome {
         if !decision.approved {
             return HookOutcome::Block {
-                reason: Some(gate::format_user_denied_reason(check, decision.denial_reason.as_deref())),
+                reason: Some(gate::format_user_denied_reason(
+                    check,
+                    decision.denial_reason.as_deref(),
+                )),
                 terminate: TerminateHint::Unspecified,
             };
         }

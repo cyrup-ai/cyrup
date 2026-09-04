@@ -15,10 +15,10 @@
 //! now carried in eight separate measurements. A CJK label measured half its true column count and
 //! a ZWJ family emoji or a combining mark could be cut in half, corrupting the row.
 
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use crate::component::Component;
 use crate::selector::centered_window;
@@ -63,11 +63,17 @@ pub struct SelectItem {
 
 impl SelectItem {
     pub fn new(label: impl Into<String>, description: Option<String>) -> Self {
-        SelectItem { label: label.into(), description }
+        SelectItem {
+            label: label.into(),
+            description,
+        }
     }
     /// A label-only row.
     pub fn label(label: impl Into<String>) -> Self {
-        SelectItem { label: label.into(), description: None }
+        SelectItem {
+            label: label.into(),
+            description: None,
+        }
     }
 }
 
@@ -82,9 +88,15 @@ pub struct ColumnLayout {
 
 impl ColumnLayout {
     /// Auto-sizing default (min 0, max 32).
-    pub const DEFAULT: ColumnLayout = ColumnLayout { primary_min: 0, primary_max: DEFAULT_PRIMARY_COLUMN_MAX };
+    pub const DEFAULT: ColumnLayout = ColumnLayout {
+        primary_min: 0,
+        primary_max: DEFAULT_PRIMARY_COLUMN_MAX,
+    };
     /// Slash-command layout: primary column pinned to `[12, 32]`.
-    pub const SLASH: ColumnLayout = ColumnLayout { primary_min: 12, primary_max: DEFAULT_PRIMARY_COLUMN_MAX };
+    pub const SLASH: ColumnLayout = ColumnLayout {
+        primary_min: 12,
+        primary_max: DEFAULT_PRIMARY_COLUMN_MAX,
+    };
 }
 
 /// A windowed select list with a centered selection and a `(i/N)` scroll indicator.
@@ -101,7 +113,13 @@ pub struct SelectList {
 impl SelectList {
     /// A new list over `items` with the given column layout.
     pub fn new(items: Vec<SelectItem>, layout: ColumnLayout) -> Self {
-        SelectList { items, selected: 0, max_visible: DEFAULT_MAX_VISIBLE, layout, no_match: "No matches".to_string() }
+        SelectList {
+            items,
+            selected: 0,
+            max_visible: DEFAULT_MAX_VISIBLE,
+            layout,
+            no_match: "No matches".to_string(),
+        }
     }
 
     /// Set the empty-state text.
@@ -158,7 +176,11 @@ impl SelectList {
         if self.items.is_empty() {
             return;
         }
-        self.selected = if self.selected == 0 { self.items.len() - 1 } else { self.selected - 1 };
+        self.selected = if self.selected == 0 {
+            self.items.len() - 1
+        } else {
+            self.selected - 1
+        };
     }
 
     /// Move selection down one row, wrapping top↔bottom (`select-list.ts:120-123`).
@@ -166,7 +188,11 @@ impl SelectList {
         if self.items.is_empty() {
             return;
         }
-        self.selected = if self.selected + 1 >= self.items.len() { 0 } else { self.selected + 1 };
+        self.selected = if self.selected + 1 >= self.items.len() {
+            0
+        } else {
+            self.selected + 1
+        };
     }
 
     fn clamp_selection(&mut self) {
@@ -180,7 +206,11 @@ impl SelectList {
     /// The visible window `[start, end)` centered on the selection
     /// (`select-list.ts:86-90`): `start = clamp(selected - maxVisible/2, 0, len - maxVisible)`.
     fn window(&self) -> (usize, usize) {
-        centered_window(self.selected, self.items.len(), usize::from(self.max_visible))
+        centered_window(
+            self.selected,
+            self.items.len(),
+            usize::from(self.max_visible),
+        )
     }
 
     /// The number of rendered rows (visible rows + optional indicator), for live-region height math.
@@ -201,7 +231,10 @@ impl SelectList {
     /// remainder (dropped if under [`MIN_DESCRIPTION_WIDTH`]).
     pub fn lines(&self, width: u16, theme: &UiTheme) -> Vec<Line<'static>> {
         if self.items.is_empty() {
-            return vec![Line::from(Span::styled(format!("  {}", self.no_match), theme.muted_style()))];
+            return vec![Line::from(Span::styled(
+                format!("  {}", self.no_match),
+                theme.muted_style(),
+            ))];
         }
         let width = width as usize;
         let (start, end) = self.window();
@@ -307,7 +340,9 @@ impl SelectList {
             && width > 40
         {
             // `effectivePrimaryColumnWidth = max(1, min(primaryColumnWidth, width - prefix - 4))`.
-            let effective = primary_w.min(width.saturating_sub(prefix_w).saturating_sub(4)).max(1);
+            let effective = primary_w
+                .min(width.saturating_sub(prefix_w).saturating_sub(4))
+                .max(1);
             let max_primary = effective.saturating_sub(PRIMARY_COLUMN_GAP).max(1);
             let label = truncate(&item.label, max_primary);
             let label_w = str_width(&label);
@@ -340,8 +375,15 @@ impl SelectList {
         // Single-column arm (`:169-175`): `maxWidth = width - prefixWidth - 2`.
         let avail = width.saturating_sub(prefix_w).saturating_sub(2);
         let label = truncate(&item.label, avail);
-        let style = if is_sel { sel_style } else { theme.base_style() };
-        Line::from(vec![Span::styled(prefix.to_string(), style), Span::styled(label, style)])
+        let style = if is_sel {
+            sel_style
+        } else {
+            theme.base_style()
+        };
+        Line::from(vec![
+            Span::styled(prefix.to_string(), style),
+            Span::styled(label, style),
+        ])
     }
 }
 

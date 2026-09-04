@@ -23,13 +23,13 @@
 
 use std::sync::Arc;
 
-use cyrup_core::CancelToken;
 use crate::error::SubagentError;
 use crate::spawn::chain_graph::{
     ChainRunContext, DynamicGroupSpec, OnEmpty, OutputRegistry, RunnerStep, SingleStepExecutor,
     SingleStepSpec, StepResult, walk_chain,
 };
 use crate::spawn::parallel::GlobalConcurrencyLimit;
+use cyrup_core::CancelToken;
 
 /// A [`SingleStepExecutor`] that succeeds every child with a fixed final output. The walker's
 /// acceptance gate is a pure function of the group's settled outcome, so a child that simply
@@ -106,10 +106,7 @@ fn run_ctx() -> ChainRunContext {
 }
 
 /// Drive one dynamic step over `source` and return its step results.
-async fn walk(
-    acceptance: Option<serde_json::Value>,
-    source: serde_json::Value,
-) -> Vec<StepResult> {
+async fn walk(acceptance: Option<serde_json::Value>, source: serde_json::Value) -> Vec<StepResult> {
     let graph = vec![RunnerStep::DynamicGroup(dynamic_step(acceptance))];
     let executor: Arc<dyn SingleStepExecutor> = Arc::new(AlwaysSucceeds);
     let mut registry = OutputRegistry::new();

@@ -6,7 +6,10 @@ use super::*;
 fn the_event_stream_decoder_handles_split_and_coalesced_chunks() {
     let bytes = [
         event("messageStart", "{\"role\":\"assistant\"}"),
-        event("contentBlockDelta", "{\"contentBlockIndex\":0,\"delta\":{\"text\":\"hi\"}}"),
+        event(
+            "contentBlockDelta",
+            "{\"contentBlockIndex\":0,\"delta\":{\"text\":\"hi\"}}",
+        ),
     ]
     .concat();
 
@@ -60,6 +63,9 @@ fn non_string_header_values_do_not_desynchronise_the_walk() {
     header_bytes.extend_from_slice(b"metadata");
 
     let parsed = parse_event_headers(&header_bytes).unwrap();
-    assert_eq!(parsed.get(":event-type").map(String::as_str), Some("metadata"));
+    assert_eq!(
+        parsed.get(":event-type").map(String::as_str),
+        Some("metadata")
+    );
     assert!(!parsed.contains_key("when"));
 }

@@ -241,9 +241,10 @@ impl McpExtension {
         // new tools wrote them to `mcp-cache.json`, and that file is the whole input to
         // `resolve_direct_tools`. Reusing the captured early config would resolve the surface the
         // session started with, which is the bug this method exists to fix.
-        let config = self.programmatic_config.clone().unwrap_or_else(|| {
-            self.config_context().load().config
-        });
+        let config = self
+            .programmatic_config
+            .clone()
+            .unwrap_or_else(|| self.config_context().load().config);
 
         // Seed the sink with what the model is CURRENTLY shown, so the pass registers only
         // differences. These three slots are the extension's memory of the last pass.
@@ -254,7 +255,11 @@ impl McpExtension {
                 .lock()
                 .map(|g| g.clone())
                 .unwrap_or_default(),
-            known_proxy: self.proxy_tool_description.lock().ok().and_then(|g| g.clone()),
+            known_proxy: self
+                .proxy_tool_description
+                .lock()
+                .ok()
+                .and_then(|g| g.clone()),
             known_commands: self
                 .registered_prompt_commands
                 .lock()
@@ -351,7 +356,9 @@ impl McpExtension {
         if names.is_empty() {
             return;
         }
-        let Some(services) = self.host_services() else { return };
+        let Some(services) = self.host_services() else {
+            return;
+        };
         let remove: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
         // `getActiveToolsIfReady()` returning undefined (`index.ts:176-184`, the "Action methods
         // cannot be called during extension loading" arm) is `active_tools() == None`, and
@@ -362,8 +369,11 @@ impl McpExtension {
             }
             return;
         };
-        let next: Vec<String> =
-            active.iter().filter(|name| !remove.contains(name.as_str())).cloned().collect();
+        let next: Vec<String> = active
+            .iter()
+            .filter(|name| !remove.contains(name.as_str()))
+            .cloned()
+            .collect();
         // `if (nextActiveTools.length !== activeTools.length)` — the fallback set is recorded ONLY
         // on this branch too (`index.ts:198-201`).
         if next.len() != active.len() {
@@ -393,8 +403,12 @@ impl McpExtension {
         if !removed {
             return;
         }
-        let Some(services) = self.host_services() else { return };
-        let Some(active) = services.active_tools() else { return };
+        let Some(services) = self.host_services() else {
+            return;
+        };
+        let Some(active) = services.active_tools() else {
+            return;
+        };
         if !active.iter().any(|entry| entry == name) {
             let mut next = active;
             next.push(name.to_string());
@@ -739,7 +753,11 @@ impl McpExtension {
         state.set_tool_metadata_listener(Some(Arc::new(move |server: &str, reason: &str| {
             let Some(ext) = weak.upgrade() else { return };
             if ext.sync_tool_surface() {
-                tracing::debug!(server, reason, "MCP: tool surface re-synced after metadata update");
+                tracing::debug!(
+                    server,
+                    reason,
+                    "MCP: tool surface re-synced after metadata update"
+                );
             }
         })));
     }
@@ -777,7 +795,6 @@ impl McpExtension {
     pub fn proxy_ctx(&self) -> Option<Arc<crate::proxy::ProxyCtx>> {
         self.proxy_ctx.lock().ok().and_then(|slot| slot.clone())
     }
-
 
     /// `startInitialization(ctx, owner, oauthRuntime, generation, staleReason)` (`index.ts:292`) —
     /// build this generation's runtime, memoise the build, and drive its commit (MCP-011).
@@ -958,9 +975,11 @@ impl McpExtension {
         // superseded.
         {
             let runtime = Arc::clone(&next_state.oauth_runtime);
-            next_state.lifecycle.set_pending_auth_check(Arc::new(move |server: &str| {
-                crate::oauth::has_pending_auth_sync(&runtime, server, None)
-            }));
+            next_state
+                .lifecycle
+                .set_pending_auth_check(Arc::new(move |server: &str| {
+                    crate::oauth::has_pending_auth_sync(&runtime, server, None)
+                }));
         }
 
         // 3 — the proxy context, BEFORE the dispatcher is installed. Reversed, a tool call landing
@@ -978,7 +997,9 @@ impl McpExtension {
         // next one correctly. An instance that had captured this `ProxyCtx` would route the next
         // generation's calls into this generation's dead state.
         if let Some(slot) = ext.dispatch() {
-            slot.install(Arc::new(crate::dispatch::McpDispatch::new(Arc::downgrade(&ext))));
+            slot.install(Arc::new(crate::dispatch::McpDispatch::new(Arc::downgrade(
+                &ext,
+            ))));
         }
 
         // 5 — `nextState.onToolMetadataUpdated = …` (`index.ts:307-316`): the listener that turns a
@@ -1095,7 +1116,11 @@ impl McpExtension {
         let previous = crate::lifecycle::PreviousGeneration {
             state: self.state.lock().ok().and_then(|mut slot| slot.take()),
             owner: self.owner.lock().ok().and_then(|mut slot| slot.take()),
-            oauth: self.oauth_runtime.lock().ok().and_then(|mut slot| slot.take()),
+            oauth: self
+                .oauth_runtime
+                .lock()
+                .ok()
+                .and_then(|mut slot| slot.take()),
         };
         if let Ok(mut slot) = self.init_task.lock() {
             *slot = None;
@@ -1244,7 +1269,11 @@ impl McpExtension {
         let previous = crate::lifecycle::PreviousGeneration {
             state: self.state.lock().ok().and_then(|mut slot| slot.take()),
             owner: self.owner.lock().ok().and_then(|mut slot| slot.take()),
-            oauth: self.oauth_runtime.lock().ok().and_then(|mut slot| slot.take()),
+            oauth: self
+                .oauth_runtime
+                .lock()
+                .ok()
+                .and_then(|mut slot| slot.take()),
         };
         if let Ok(mut slot) = self.init_task.lock() {
             *slot = None;
@@ -1376,7 +1405,10 @@ impl McpExtension {
                 Ok(None)
             }
             // No UI: both lines ride the one return channel rather than being dropped.
-            None => Ok(Some(join_lines(&authenticated.message, &reconnected.message))),
+            None => Ok(Some(join_lines(
+                &authenticated.message,
+                &reconnected.message,
+            ))),
         }
     }
 
@@ -1793,12 +1825,16 @@ impl McpExtension {
         };
         match ctx.env.get_connection(server_name) {
             Some(crate::proxy::ConnectionStatus::Connected) => {
-                let tools = ctx.state.tool_metadata.lock().map_or(0, |metadata| {
-                    metadata.get(server_name).map_or(0, Vec::len)
-                });
-                let resources = ctx.state.resource_counts.lock().map_or(0, |counts| {
-                    counts.get(server_name).copied().unwrap_or(0)
-                });
+                let tools = ctx
+                    .state
+                    .tool_metadata
+                    .lock()
+                    .map_or(0, |metadata| metadata.get(server_name).map_or(0, Vec::len));
+                let resources = ctx
+                    .state
+                    .resource_counts
+                    .lock()
+                    .map_or(0, |counts| counts.get(server_name).copied().unwrap_or(0));
                 AuthCommandOutcome::ok(format!(
                     "MCP: Reconnected to {server_name} ({tools} tools, {resources} resources)"
                 ))
@@ -1860,17 +1896,29 @@ pub(crate) struct AuthCommandOutcome {
 impl AuthCommandOutcome {
     /// A success, reported at `info`.
     fn ok(message: String) -> Self {
-        Self { ok: true, message, kind: cyrup_ext::NotifyKind::Info }
+        Self {
+            ok: true,
+            message,
+            kind: cyrup_ext::NotifyKind::Info,
+        }
     }
 
     /// A failure at the level upstream reports it.
     fn failed(message: String, kind: cyrup_ext::NotifyKind) -> Self {
-        Self { ok: false, message, kind }
+        Self {
+            ok: false,
+            message,
+            kind,
+        }
     }
 
     /// A failure with nothing to say — the user's own cancellation.
     fn silent() -> Self {
-        Self { ok: false, message: String::new(), kind: cyrup_ext::NotifyKind::Info }
+        Self {
+            ok: false,
+            message: String::new(),
+            kind: cyrup_ext::NotifyKind::Info,
+        }
     }
 }
 
@@ -1965,7 +2013,11 @@ fn connect_failure_message(result: &cyrup_core::ToolResult) -> Option<String> {
 ///
 /// The skip is [`AuthCommandOutcome::silent`]'s contract: a blank notification is a visible empty
 /// row in the transcript, which is worse than the silence the abort arm asked for.
-fn notify(services: &Arc<dyn cyrup_ext::host::HostServices>, message: &str, kind: cyrup_ext::NotifyKind) {
+fn notify(
+    services: &Arc<dyn cyrup_ext::host::HostServices>,
+    message: &str,
+    kind: cyrup_ext::NotifyKind,
+) {
     if message.is_empty() {
         return;
     }
@@ -2062,9 +2114,10 @@ impl NativeExtension for McpExtension {
     /// `mcp.json` or `mcp-cache.json` degrades to an empty surface here, never to an `Err`
     /// (MCP-003).
     async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
-        let config = self.programmatic_config.clone().unwrap_or_else(|| {
-            self.config_context().load().config
-        });
+        let config = self
+            .programmatic_config
+            .clone()
+            .unwrap_or_else(|| self.config_context().load().config);
 
         // A NEW generation gets a NEW executor: this pass mints fresh tool objects, and the
         // dispatch they read is installed once this generation's `McpState` exists.
@@ -2174,9 +2227,11 @@ impl NativeExtension for McpExtension {
             // direct port of `toolErrorOverride(details)`. Inlining the `matches!` here forked the
             // vocabulary: `error_vocab`'s copy is the one the code-table test pins, so a divergence
             // would have been invisible to it.
-            HostEvent::ToolResult { details: Some(details), is_error: false, .. }
-                if crate::proxy::error_vocab::tool_error_override(Some(details)) == Some(true) =>
-            {
+            HostEvent::ToolResult {
+                details: Some(details),
+                is_error: false,
+                ..
+            } if crate::proxy::error_vocab::tool_error_override(Some(details)) == Some(true) => {
                 // `content` / `details` / `usage` stay `None` so `apply_patch`
                 // (`contract.rs:96-113`) leaves them untouched — that is the whole reason the patch
                 // is four `Option`s rather than a replacement.
@@ -2235,7 +2290,9 @@ impl NativeExtension for McpExtension {
         if base == crate::registration::MCP_COMMAND {
             return self.on_mcp_command(args, ctx).await;
         }
-        Err(ExtError::Component(format!("native extension has no handler for command `{name}`")))
+        Err(ExtError::Component(format!(
+            "native extension has no handler for command `{name}`"
+        )))
     }
 
     /// `renderCall` for every name [`crate::registration::register_surface`] declared a renderer
@@ -2368,7 +2425,10 @@ mod tests {
         let direct = ext
             .render_call("linear_list_issues", &json!({ "state": "open" }))
             .expect("a direct tool must render its own call row");
-        assert!(direct.to_string().contains("linear_list_issues"), "{direct}");
+        assert!(
+            direct.to_string().contains("linear_list_issues"),
+            "{direct}"
+        );
 
         // The result side renders for both, and a headless build (no `HostServices`) collapses.
         assert!(
@@ -2396,7 +2456,10 @@ mod tests {
             dir.path().to_path_buf(),
         ));
         let mut api = InitApi::new();
-        assert!(ext.init(&mut api).await.is_ok(), "a stray `{{{{{{` must not crash cyrup");
+        assert!(
+            ext.init(&mut api).await.is_ok(),
+            "a stray `{{{{{{` must not crash cyrup"
+        );
     }
 
     /// `init` must ADOPT what it registered, not drop it. `dispatch` is the one that would be an
@@ -2417,13 +2480,21 @@ mod tests {
         ))
         .with_home(dir.path().to_path_buf());
 
-        assert!(ext.dispatch().is_none(), "nothing is adopted before the first pass");
+        assert!(
+            ext.dispatch().is_none(),
+            "nothing is adopted before the first pass"
+        );
 
         let mut api = InitApi::new();
         assert!(ext.init(&mut api).await.is_ok());
 
-        let dispatch = ext.dispatch().expect("the pass's executor slot survives `init`");
-        assert!(!dispatch.is_installed(), "…un-installed, which is MCP-214's job");
+        let dispatch = ext
+            .dispatch()
+            .expect("the pass's executor slot survives `init`");
+        assert!(
+            !dispatch.is_installed(),
+            "…un-installed, which is MCP-214's job"
+        );
         // The cold-cache surface is proxy-only, so the description slot is seeded and the
         // direct-tool fingerprint map is empty — both are what the next pass diffs against.
         let description = ext
@@ -2450,7 +2521,10 @@ mod tests {
     #[test]
     fn the_adapter_is_ambient_and_does_not_decide_project_trust() {
         let ext = extension();
-        assert!(ext.is_ambient(), "--no-extensions must switch the adapter off");
+        assert!(
+            ext.is_ambient(),
+            "--no-extensions must switch the adapter off"
+        );
         assert!(
             !ext.decides_project_trust(),
             "opting in would run this non-idempotent init twice on the same object"
@@ -2573,7 +2647,10 @@ mod tests {
     async fn every_dispatch_records_its_ctx_for_a_later_consent_dialog() {
         let ext = extension();
         // No committed state yet: the record is skipped, and the dispatch is unaffected.
-        assert!(matches!(ext.on_event(&input_event(), &event_ctx()).await, HookOutcome::Noop));
+        assert!(matches!(
+            ext.on_event(&input_event(), &event_ctx()).await,
+            HookOutcome::Noop
+        ));
 
         let owner = Arc::new(McpRuntimeOwner::new());
         let state = input_state(Arc::clone(&owner));
@@ -2587,7 +2664,12 @@ mod tests {
         let ctx = event_ctx();
         let _ = ext.on_event(&input_event(), &ctx).await;
 
-        let recorded = state.human_wait_ctx.lock().unwrap().clone().expect("the ctx is recorded");
+        let recorded = state
+            .human_wait_ctx
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the ctx is recorded");
         assert!(
             Arc::ptr_eq(&recorded.human_wait_gate(), &ctx.human_wait_gate()),
             "the recorded clone must carry the SAME `HumanWaitGate` the dispatcher polls, or the \
@@ -2697,9 +2779,7 @@ mod tests {
     }
 
     fn bind_services(ext: &McpExtension, services: &Arc<ToolSetServices>) {
-        ext.set_host_services(
-            Arc::clone(services) as Arc<dyn cyrup_ext::host::HostServices>
-        );
+        ext.set_host_services(Arc::clone(services) as Arc<dyn cyrup_ext::host::HostServices>);
     }
 
     /// `index.ts:194-202` — the `setActiveTools` fallback, the only branch cyrup has.
@@ -2795,7 +2875,10 @@ mod tests {
         *ext.proxy_tool_description().lock().unwrap() = None;
 
         assert!(!ext.sync_tool_surface());
-        assert_eq!(registrar.tools(), vec![crate::registration::PROXY_TOOL_NAME.to_string()]);
+        assert_eq!(
+            registrar.tools(),
+            vec![crate::registration::PROXY_TOOL_NAME.to_string()]
+        );
         assert!(services.notices().is_empty());
     }
 
@@ -2834,7 +2917,10 @@ mod tests {
     // ── `startInitialization` and the commit tail (`index.ts:292-350`, MCP-011) ───────────────
 
     fn session_start_event() -> HostEvent {
-        HostEvent::SessionStart { reason: "startup".to_string(), previous_session_file: None }
+        HostEvent::SessionStart {
+            reason: "startup".to_string(),
+            previous_session_file: None,
+        }
     }
 
     /// A memoised build that is already settled, so the commit tail can be driven directly.
@@ -2874,7 +2960,9 @@ mod tests {
         assert_eq!(ext.generation(), 1, "the handler bumps the generation");
         // Published BEFORE the drain await, so a call arriving mid-start fences against the
         // generation that is starting.
-        let owner = ext.owner().expect("the new generation's owner is published synchronously");
+        let owner = ext
+            .owner()
+            .expect("the new generation's owner is published synchronously");
         assert!(owner.is_active());
 
         let state = tokio::time::timeout(std::time::Duration::from_secs(15), async {
@@ -2903,7 +2991,10 @@ mod tests {
              `MCP not initialized` for the life of the generation"
         );
         // `initPromise = null`, and only after the surface sync.
-        assert!(ext.init_task().is_none(), "the memo is cleared once the build has committed");
+        assert!(
+            ext.init_task().is_none(),
+            "the memo is cleared once the build has committed"
+        );
         // MCP-471's producer for the first `SessionStart`: `on_event`'s tail cannot cover it,
         // because the state did not exist when that tail ran.
         assert!(
@@ -2917,7 +3008,10 @@ mod tests {
         assert_eq!(ext.generation(), 2);
         assert!(ext.state().is_none() && ext.owner().is_none() && ext.proxy_ctx().is_none());
         assert!(ext.oauth_runtime.lock().unwrap().is_none());
-        assert!(!owner.is_active(), "the generation's owner is stopped, not merely dropped");
+        assert!(
+            !owner.is_active(),
+            "the generation's owner is stopped, not merely dropped"
+        );
     }
 
     /// A real stdio MCP server, as an `sh` script — the same fixture runtime `runtime.rs`'s
@@ -3015,9 +3109,12 @@ done
         let state = tokio::time::timeout(std::time::Duration::from_secs(30), async {
             loop {
                 if let Some(state) = ext.state()
-                    && state.manager.get_connection("fixture").is_some_and(|connection| {
-                        connection.status() == crate::lifecycle::ConnectionStatus::Connected
-                    })
+                    && state
+                        .manager
+                        .get_connection("fixture")
+                        .is_some_and(|connection| {
+                            connection.status() == crate::lifecycle::ConnectionStatus::Connected
+                        })
                 {
                     return state;
                 }
@@ -3076,7 +3173,10 @@ done
         )
         .await;
         assert!(ext.state().is_none() && ext.proxy_ctx().is_none());
-        assert!(!owner.is_active(), "the orphaned runtime is torn down, not leaked");
+        assert!(
+            !owner.is_active(),
+            "the orphaned runtime is torn down, not leaked"
+        );
 
         // Clause 3 — a second build inside the SAME generation superseded the memo. This is the
         // clause an `Arc::ptr_eq` exists for: the two `Shared`s have equal *values* and different
@@ -3097,7 +3197,10 @@ done
             STALE_SESSION_START_STATE_REASON,
         )
         .await;
-        assert!(ext.state().is_none(), "the superseded build must not commit");
+        assert!(
+            ext.state().is_none(),
+            "the superseded build must not commit"
+        );
 
         // Clause 1 — the owner was stopped while the build ran.
         let owner = Arc::new(McpRuntimeOwner::new());
@@ -3151,24 +3254,33 @@ done
         let task = settled_task(&state);
         *ext.state.lock().unwrap() = Some(Arc::clone(&state));
         *ext.init_task.lock().unwrap() = Some(Arc::clone(&task));
-        ext.fail_initialization(&error, &owner, &oauth, ext.generation(), &task).await;
-        assert!(owner.is_active(), "a replacement build's failure must not kill the live session");
+        ext.fail_initialization(&error, &owner, &oauth, ext.generation(), &task)
+            .await;
+        assert!(
+            owner.is_active(),
+            "a replacement build's failure must not kill the live session"
+        );
         assert!(ext.init_task().is_none(), "`initPromise = null` still runs");
 
         // With no state, the generation is stopped and its OAuth runtime shut down.
         *ext.state.lock().unwrap() = None;
         let task = settled_task(&state);
         *ext.init_task.lock().unwrap() = Some(Arc::clone(&task));
-        ext.fail_initialization(&error, &owner, &oauth, ext.generation(), &task).await;
+        ext.fail_initialization(&error, &owner, &oauth, ext.generation(), &task)
+            .await;
         assert!(!owner.is_active());
 
         // A superseded generation reports nothing and touches nothing.
         let owner = Arc::new(McpRuntimeOwner::new());
         let task = settled_task(&state);
         *ext.init_task.lock().unwrap() = Some(Arc::clone(&task));
-        ext.fail_initialization(&error, &owner, &oauth, ext.generation() + 1, &task).await;
+        ext.fail_initialization(&error, &owner, &oauth, ext.generation() + 1, &task)
+            .await;
         assert!(owner.is_active());
-        assert!(ext.init_task().is_some(), "a stale failure must not clear the live memo");
+        assert!(
+            ext.init_task().is_some(),
+            "a stale failure must not clear the live memo"
+        );
     }
 
     /// `ContextSnapshot`'s `cwd` is the extension's own, never the ctx's: the servers' working
@@ -3190,9 +3302,11 @@ done
         );
 
         let tui = ext.context_snapshot(&event_ctx());
-        assert!(tui.has_ui && tui.is_tui_mode(), "URL elicitation is gated on exactly this");
+        assert!(
+            tui.has_ui && tui.is_tui_mode(),
+            "URL elicitation is gated on exactly this"
+        );
     }
-
 
     // ---------------------------------------------------------------------------------------
     // MCP-334 — `/mcp-auth`
@@ -3236,7 +3350,9 @@ done
     fn config_with(servers: &[(&str, crate::config::ServerEntry)]) -> McpConfig {
         let mut config = McpConfig::default();
         for (name, entry) in servers {
-            config.mcp_servers.insert((*name).to_string(), entry.clone());
+            config
+                .mcp_servers
+                .insert((*name).to_string(), entry.clone());
         }
         config
     }
@@ -3257,7 +3373,9 @@ done
     fn oauth_http(url: &str) -> crate::config::ServerEntry {
         crate::config::ServerEntry {
             url: Some(url.to_string()),
-            auth: Some(crate::config::AuthMode::Named(crate::config::AuthKind::Oauth)),
+            auth: Some(crate::config::AuthMode::Named(
+                crate::config::AuthKind::Oauth,
+            )),
             ..Default::default()
         }
     }
@@ -3296,7 +3414,10 @@ done
             .execute_command("mcp", "status", &command_ctx(false))
             .await
             .expect("`/mcp` is routed, not rejected");
-        assert_eq!(answer, None, "`/mcp` speaks through notifications, never the return channel");
+        assert_eq!(
+            answer, None,
+            "`/mcp` speaks through notifications, never the return channel"
+        );
     }
 
     /// SEAM-048 for `/mcp`, the same disambiguation `/mcp-auth` is pinned for below: a second
@@ -3346,7 +3467,9 @@ done
         bind_services(&ext, &services);
 
         assert_eq!(
-            ext.execute_command("mcp-auth", "   ", &command_ctx(false)).await.unwrap(),
+            ext.execute_command("mcp-auth", "   ", &command_ctx(false))
+                .await
+                .unwrap(),
             None,
             "the return channel stays empty"
         );
@@ -3362,7 +3485,9 @@ done
     async fn authenticate_server_refuses_without_an_interactive_session() {
         let ext = extension();
         let state = auth_state(config_with(&[("s", oauth_http("https://s/mcp"))]), false);
-        let outcome = ext.authenticate_server(&state, "s", &command_ctx(false)).await;
+        let outcome = ext
+            .authenticate_server(&state, "s", &command_ctx(false))
+            .await;
         assert!(!outcome.ok);
         assert_eq!(outcome.message, AUTH_REQUIRES_INTERACTIVE);
     }
@@ -3423,14 +3548,22 @@ done
             )]),
             true,
         );
-        let outcome = ext.authenticate_server(&state, "s", &command_ctx(true)).await;
+        let outcome = ext
+            .authenticate_server(&state, "s", &command_ctx(true))
+            .await;
         assert!(!outcome.ok);
         assert!(
-            outcome.message.starts_with("Failed to authenticate \"s\": "),
+            outcome
+                .message
+                .starts_with("Failed to authenticate \"s\": "),
             "{}",
             outcome.message
         );
-        assert!(outcome.message.contains("CYRUP_MCP_A_VARIABLE_NOTHING_DEFINES"));
+        assert!(
+            outcome
+                .message
+                .contains("CYRUP_MCP_A_VARIABLE_NOTHING_DEFINES")
+        );
     }
 
     /// The bare form's three early returns (`commands.ts:611-628`, `index.ts:659`).
@@ -3444,10 +3577,12 @@ done
         let ctx = command_ctx(true);
         // A real handle for the first two cases, so their refusals are shown to precede the
         // handle check rather than depending on it.
-        let services: Arc<dyn cyrup_ext::host::HostServices> =
-            Arc::new(ToolSetServices::default());
-        let outcome =
-            refusal(programmatic.pick_oauth_server(&state, &ctx, Some(&services)).await);
+        let services: Arc<dyn cyrup_ext::host::HostServices> = Arc::new(ToolSetServices::default());
+        let outcome = refusal(
+            programmatic
+                .pick_oauth_server(&state, &ctx, Some(&services))
+                .await,
+        );
         assert_eq!(outcome.message, PROGRAMMATIC_CONFIG_AUTH_HINT);
         assert_eq!(outcome.kind, cyrup_ext::NotifyKind::Info);
 
@@ -3456,7 +3591,10 @@ done
         let hidden = config_with(&[
             (
                 "off",
-                crate::config::ServerEntry { disabled: Some(true), ..oauth_http("https://off/mcp") },
+                crate::config::ServerEntry {
+                    disabled: Some(true),
+                    ..oauth_http("https://off/mcp")
+                },
             ),
             (
                 "stdio",
@@ -3466,8 +3604,10 @@ done
                 },
             ),
         ]);
-        let outcome =
-            refusal(ext.pick_oauth_server(&auth_state(hidden, true), &ctx, Some(&services)).await);
+        let outcome = refusal(
+            ext.pick_oauth_server(&auth_state(hidden, true), &ctx, Some(&services))
+                .await,
+        );
         assert_eq!(outcome.message, NO_OAUTH_CAPABLE_SERVERS);
         assert_eq!(outcome.kind, cyrup_ext::NotifyKind::Warning);
 
@@ -3481,7 +3621,10 @@ done
             )
             .await,
         );
-        assert_eq!(outcome.message, crate::ui::auth_panel_unavailable_message("tui"));
+        assert_eq!(
+            outcome.message,
+            crate::ui::auth_panel_unavailable_message("tui")
+        );
     }
 
     /// The notice a user actually sees is the whole reason `on_authorization_url` is installed: the
@@ -3511,7 +3654,10 @@ done
         // must not survive into the terminal. `terminal_hyperlink` sanitizes both halves BEFORE
         // building its own escape, so the smuggled target is stripped rather than re-emitted.
         assert!(!notice.contains("evil.invalid"), "{notice}");
-        assert!(!notice.contains('\u{7}'), "the injected BEL is stripped: {notice}");
+        assert!(
+            !notice.contains('\u{7}'),
+            "the injected BEL is stripped: {notice}"
+        );
 
         // What DID change (MCP-390): the notice now carries exactly ONE OSC-8 hyperlink of its own,
         // wrapping the sanitized URL — upstream's `terminalHyperlink(url, url)`. The blanket
@@ -3535,8 +3681,12 @@ done
     fn a_connect_failure_message_is_read_from_the_details_map() {
         let mut result = cyrup_core::ToolResult::default();
         assert_eq!(connect_failure_message(&result), None);
-        result.details = Some(serde_json::json!({"mode": "connect", "message": "no route to host"}));
-        assert_eq!(connect_failure_message(&result), Some("no route to host".to_string()));
+        result.details =
+            Some(serde_json::json!({"mode": "connect", "message": "no route to host"}));
+        assert_eq!(
+            connect_failure_message(&result),
+            Some("no route to host".to_string())
+        );
     }
 
     /// [`AuthCommandOutcome::silent`]'s contract, on both output channels: an aborted `/mcp-auth`

@@ -13,21 +13,25 @@
 //!
 //! The load-bearing assertion in every test here is the COUNT and the POSITION: it is trivial to
 //! emit an event, and worthless to emit it at the wrong moment.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use cyrup_core::{ExtensionId, StopReason};
-use cyrup_ext::{
-    EventKind, ExtError, HostCtx, HostEvent, HookOutcome, InitApi, NativeExtension,
-};
-use cyrup_provider::faux::{
-    faux_assistant_message, faux_assistant_message_with, faux_text, FauxMessageOptions, FauxProvider,
-};
-use cyrup_provider::Provider;
 use crate::{AgentSessionEvent, InputSource, SessionBuilder, SessionConfig, UserInput};
+use cyrup_core::{ExtensionId, StopReason};
+use cyrup_ext::{EventKind, ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension};
+use cyrup_provider::Provider;
+use cyrup_provider::faux::{
+    FauxMessageOptions, FauxProvider, faux_assistant_message, faux_assistant_message_with,
+    faux_text,
+};
 use futures::StreamExt;
 use tempfile::TempDir;
 
@@ -76,7 +80,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -88,8 +96,11 @@ fn base_config(fx: &Fixture) -> SessionConfig {
 
 fn fast_retry_settings() -> cyrup_config::Settings {
     let mut cli = cyrup_config::Settings::new();
-    cli.set_field("retry", serde_json::json!({"enabled": true, "maxRetries": 3, "baseDelayMs": 1}))
-        .unwrap();
+    cli.set_field(
+        "retry",
+        serde_json::json!({"enabled": true, "maxRetries": 3, "baseDelayMs": 1}),
+    )
+    .unwrap();
     cli
 }
 
@@ -113,7 +124,10 @@ async fn agent_settled_fires_once_per_run_and_last_even_across_an_auto_retry() {
         faux_assistant_message_with(
             Vec::new(),
             StopReason::Error,
-            FauxMessageOptions { error_message: Some("overloaded".into()), ..Default::default() },
+            FauxMessageOptions {
+                error_message: Some("overloaded".into()),
+                ..Default::default()
+            },
         ),
         faux_assistant_message(vec![faux_text("recovered")], StopReason::Stop),
     ]);
@@ -139,7 +153,11 @@ async fn agent_settled_fires_once_per_run_and_last_even_across_an_auto_retry() {
     let ks = kinds(&events);
 
     // The retry really happened (both scripted responses consumed).
-    assert_eq!(faux.call_count(), 2, "the auto-retry continuation ran: {ks:?}");
+    assert_eq!(
+        faux.call_count(),
+        2,
+        "the auto-retry continuation ran: {ks:?}"
+    );
     assert_eq!(
         ks.iter().filter(|k| **k == "agent_end").count(),
         2,
@@ -159,7 +177,11 @@ async fn agent_settled_fires_once_per_run_and_last_even_across_an_auto_retry() {
     );
 
     // (2) The EXTENSION was dispatched it too — the host actually called the subscribed handler.
-    assert_eq!(ended.load(Ordering::SeqCst), 2, "the extension saw both agent_end dispatches");
+    assert_eq!(
+        ended.load(Ordering::SeqCst),
+        2,
+        "the extension saw both agent_end dispatches"
+    );
     assert_eq!(
         settled.load(Ordering::SeqCst),
         1,
@@ -172,7 +194,10 @@ async fn agent_settled_fires_once_per_run_and_last_even_across_an_auto_retry() {
 async fn a_simple_run_settles_exactly_once_after_agent_end() {
     let fx = fixture();
     let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("ok")],
+        StopReason::Stop,
+    )]);
 
     let counter = Arc::new(SettleCounter::default());
     let settled = counter.settled.clone();
@@ -192,11 +217,28 @@ async fn a_simple_run_settles_exactly_once_after_agent_end() {
     let events: Vec<AgentSessionEvent> = stream.collect().await;
     let ks = kinds(&events);
 
-    let end_at = ks.iter().position(|k| *k == "agent_end").expect("agent_end: {ks:?}");
-    let settle_at = ks.iter().position(|k| *k == "agent_settled").expect("agent_settled: {ks:?}");
-    assert!(settle_at > end_at, "agent_settled follows agent_end: {ks:?}");
-    assert_eq!(ks.iter().filter(|k| **k == "agent_settled").count(), 1, "{ks:?}");
-    assert_eq!(settled.load(Ordering::SeqCst), 1, "the extension handler fired once");
+    let end_at = ks
+        .iter()
+        .position(|k| *k == "agent_end")
+        .expect("agent_end: {ks:?}");
+    let settle_at = ks
+        .iter()
+        .position(|k| *k == "agent_settled")
+        .expect("agent_settled: {ks:?}");
+    assert!(
+        settle_at > end_at,
+        "agent_settled follows agent_end: {ks:?}"
+    );
+    assert_eq!(
+        ks.iter().filter(|k| **k == "agent_settled").count(),
+        1,
+        "{ks:?}"
+    );
+    assert_eq!(
+        settled.load(Ordering::SeqCst),
+        1,
+        "the extension handler fired once"
+    );
 }
 
 /// Pi ALWAYS settles — `_emitAgentSettled` is in a `finally`. cyrup's UNBOUND (by-value) session has
@@ -209,7 +251,10 @@ async fn a_simple_run_settles_exactly_once_after_agent_end() {
 async fn an_unbound_session_settles_too() {
     let fx = fixture();
     let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("ok")],
+        StopReason::Stop,
+    )]);
 
     let counter = Arc::new(SettleCounter::default());
     let settled = counter.settled.clone();
@@ -238,7 +283,11 @@ async fn an_unbound_session_settles_too() {
         Some("agent_settled"),
         "…and it is the last event before the run-scoped stream ends: {ks:?}"
     );
-    assert_eq!(settled.load(Ordering::SeqCst), 1, "the extension handler fired on the unbound path");
+    assert_eq!(
+        settled.load(Ordering::SeqCst),
+        1,
+        "the extension handler fired on the unbound path"
+    );
 }
 
 /// The wire shape a front-end / RPC client sees (Pi `{ "type": "agent_settled" }`,

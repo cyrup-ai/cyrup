@@ -10,22 +10,27 @@
 //!   * #17b — `extendResourcesFromExtensions("startup")` (Pi agent-session.ts:2112-2135): the
 //!     skill/prompt/theme paths every `resources_discover` handler contributes are merged into the
 //!     resource registry BEFORE skill pointers + the system prompt are derived.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use cyrup_core::{Content, ExtensionId, Message, StopReason};
-use cyrup_ext::{
-    EventKind, EventPatch, ExtError, HandledValue, HostCtx, HostEvent, HookOutcome, InitApi,
-    NativeExtension,
-};
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
-use cyrup_provider::Provider;
 use crate::{
     AgentSessionRuntime, SessionBuilder, SessionConfig, SessionFactory, SessionTarget,
     SwitchSessionOptions,
 };
+use cyrup_core::{Content, ExtensionId, Message, StopReason};
+use cyrup_ext::{
+    EventKind, EventPatch, ExtError, HandledValue, HookOutcome, HostCtx, HostEvent, InitApi,
+    NativeExtension,
+};
+use cyrup_provider::Provider;
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
 use tempfile::TempDir;
 
 struct Fixture {
@@ -40,7 +45,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -80,9 +89,10 @@ impl NativeExtension for UppercaseInput {
     }
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         match ev {
-            HostEvent::Input { text, .. } => {
-                HookOutcome::Mutate(EventPatch::Input { text: text.to_uppercase(), images: None })
-            }
+            HostEvent::Input { text, .. } => HookOutcome::Mutate(EventPatch::Input {
+                text: text.to_uppercase(),
+                images: None,
+            }),
             _ => HookOutcome::Noop,
         }
     }
@@ -94,7 +104,10 @@ impl NativeExtension for UppercaseInput {
 async fn input_event_transform_rewrites_submission_text() {
     let fx = fixture();
     let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("ok")],
+        StopReason::Stop,
+    )]);
     let provider: Arc<dyn Provider> = faux.clone();
     let session = SessionBuilder::new(provider, base_config(&fx))
         .with_native_extension(Arc::new(UppercaseInput))
@@ -125,10 +138,15 @@ async fn switch_session_with_cwd_override_rebinds_manager_cwd_and_export_header(
     std::fs::create_dir_all(&cwd2).unwrap();
 
     let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("ok")],
+        StopReason::Stop,
+    )]);
     let provider: Arc<dyn Provider> = faux.clone();
     let factory = Arc::new(SessionFactory::new(provider, base_config(&fx)));
-    let runtime = AgentSessionRuntime::create(factory, SessionTarget::New).await.unwrap();
+    let runtime = AgentSessionRuntime::create(factory, SessionTarget::New)
+        .await
+        .unwrap();
 
     // Drive a turn so the session file flushes (its header cwd == fx.cwd).
     let session_file = {
@@ -143,7 +161,9 @@ async fn switch_session_with_cwd_override_rebinds_manager_cwd_and_export_header(
     let result = runtime
         .switch_session_with(
             session_file.clone(),
-            SwitchSessionOptions { cwd_override: Some(cwd2.clone()) },
+            SwitchSessionOptions {
+                cwd_override: Some(cwd2.clone()),
+            },
         )
         .await
         .unwrap();
@@ -151,7 +171,11 @@ async fn switch_session_with_cwd_override_rebinds_manager_cwd_and_export_header(
 
     // The exported JSONL header reports the override (Pi `cwd: sessionManager.getCwd()`).
     let session = runtime.session().await;
-    let jsonl = session.export_to_jsonl(None).await.unwrap().expect("jsonl text");
+    let jsonl = session
+        .export_to_jsonl(None)
+        .await
+        .unwrap()
+        .expect("jsonl text");
     let header: serde_json::Value =
         serde_json::from_str(jsonl.lines().next().expect("header line")).unwrap();
     assert_eq!(
@@ -189,9 +213,11 @@ impl NativeExtension for ResourceContributor {
     }
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         match ev {
-            HostEvent::ResourcesDiscover { .. } => HookOutcome::Handled(HandledValue(serde_json::json!({
-                "skillPaths": [self.skill_path.to_string_lossy()],
-            }))),
+            HostEvent::ResourcesDiscover { .. } => {
+                HookOutcome::Handled(HandledValue(serde_json::json!({
+                    "skillPaths": [self.skill_path.to_string_lossy()],
+                })))
+            }
             _ => HookOutcome::Noop,
         }
     }
@@ -214,7 +240,9 @@ async fn extension_contributed_skill_is_merged_into_resources_and_system_prompt(
 
     let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
     let session = SessionBuilder::new(faux, base_config(&fx))
-        .with_native_extension(Arc::new(ResourceContributor { skill_path: skill_md.clone() }))
+        .with_native_extension(Arc::new(ResourceContributor {
+            skill_path: skill_md.clone(),
+        }))
         .build()
         .await
         .unwrap();
@@ -235,7 +263,10 @@ async fn extension_contributed_skill_is_merged_into_resources_and_system_prompt(
 async fn no_extension_contribution_leaves_registry_untouched() {
     let fx = fixture();
     let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
-    let session = SessionBuilder::new(faux, base_config(&fx)).build().await.unwrap();
+    let session = SessionBuilder::new(faux, base_config(&fx))
+        .build()
+        .await
+        .unwrap();
     assert!(
         !session.resources().skills.contains("extskill"),
         "no contribution means no extension-supplied skill"

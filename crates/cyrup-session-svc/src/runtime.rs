@@ -13,7 +13,7 @@ use cyrup_core::CancelToken;
 use cyrup_ext::{HostEvent, Reduced};
 use cyrup_session::manager::SessionManager;
 use serde_json::Value;
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{RwLock, watch};
 
 use crate::builder::SessionTarget;
 use crate::error::SessionServiceError;
@@ -132,7 +132,11 @@ fn collect_diagnostics(session: &AgentSession) -> Vec<RuntimeDiagnostic> {
         }
         out.push(RuntimeDiagnostic {
             severity: "error".to_string(),
-            message: format!("Failed to load extension \"{}\": {}", ext.path.display(), ext.error),
+            message: format!(
+                "Failed to load extension \"{}\": {}",
+                ext.path.display(),
+                ext.error
+            ),
             source: Some("extension".to_string()),
         });
     }
@@ -163,8 +167,11 @@ pub trait RuntimeActions: Send + Sync {
     /// Pi `ctx.newSession(options)`. `opts` is the raw guest bag (`{parentSession, withSession}`).
     async fn new_session(&self, opts: &Value) -> Result<(), SessionServiceError>;
     /// Pi `ctx.switchSession(sessionPath, options)`.
-    async fn switch_session(&self, session_id: &str, opts: &Value)
-        -> Result<(), SessionServiceError>;
+    async fn switch_session(
+        &self,
+        session_id: &str,
+        opts: &Value,
+    ) -> Result<(), SessionServiceError>;
     /// Pi `ctx.fork(entryId, {position, withSession})`.
     async fn fork(&self, entry_id: &str, opts: &Value) -> Result<(), SessionServiceError>;
     /// Pi `ctx.reload()`.
@@ -181,7 +188,9 @@ struct RuntimeHostActions(Weak<AgentSessionRuntime>);
 
 impl RuntimeHostActions {
     fn runtime(&self, op: &'static str) -> Result<Arc<AgentSessionRuntime>, SessionServiceError> {
-        self.0.upgrade().ok_or(SessionServiceError::NoRuntimeHost(op))
+        self.0
+            .upgrade()
+            .ok_or(SessionServiceError::NoRuntimeHost(op))
     }
 }
 
@@ -205,9 +214,14 @@ impl RuntimeActions for RuntimeHostActions {
     ) -> Result<(), SessionServiceError> {
         let rt = self.runtime("switch_session")?;
         let options = SwitchSessionOptions {
-            cwd_override: opts.get("cwdOverride").and_then(Value::as_str).map(PathBuf::from),
+            cwd_override: opts
+                .get("cwdOverride")
+                .and_then(Value::as_str)
+                .map(PathBuf::from),
         };
-        rt.switch_session_with(PathBuf::from(session_id), options).await.map(|_| ())
+        rt.switch_session_with(PathBuf::from(session_id), options)
+            .await
+            .map(|_| ())
     }
 
     async fn fork(&self, entry_id: &str, opts: &Value) -> Result<(), SessionServiceError> {
@@ -218,7 +232,9 @@ impl RuntimeActions for RuntimeHostActions {
             Some("at") => ForkPosition::At,
             _ => ForkPosition::Before,
         };
-        rt.fork(cyrup_core::EntryId::from(entry_id), position).await.map(|_| ())
+        rt.fork(cyrup_core::EntryId::from(entry_id), position)
+            .await
+            .map(|_| ())
     }
 
     async fn reload(&self) -> Result<(), SessionServiceError> {
@@ -335,7 +351,12 @@ impl AgentSessionRuntime {
     /// `AgentSessionRuntime.modelFallbackMessage` getter, agent-session-runtime.ts:113). `None` when
     /// the resumed model resolved cleanly.
     pub async fn model_fallback_message(&self) -> Option<String> {
-        self.inner.read().await.session.model_fallback_message().map(str::to_string)
+        self.inner
+            .read()
+            .await
+            .session
+            .model_fallback_message()
+            .map(str::to_string)
     }
 
     /// Observe replacement generations; a change means the active session was swapped and any held
@@ -377,8 +398,11 @@ impl AgentSessionRuntime {
     /// Whether a `session_before_*` handler vetoes the replacement (Pi `emitBeforeSwitch`/Fork).
     async fn vetoed(&self, current: &AgentSession, event: HostEvent) -> bool {
         let cancel = CancelToken::new();
-        let reduced =
-            current.ext_host().dispatcher().dispatch_block_mutate(event, &cancel).await;
+        let reduced = current
+            .ext_host()
+            .dispatcher()
+            .dispatch_block_mutate(event, &cancel)
+            .await;
         matches!(reduced, Reduced::Blocked { .. })
     }
 
@@ -390,7 +414,8 @@ impl AgentSessionRuntime {
         reason: &str,
         previous_session_file: Option<String>,
     ) {
-        self.install_inner(next, reason, previous_session_file, None).await;
+        self.install_inner(next, reason, previous_session_file, None)
+            .await;
     }
 
     /// The replacement tail with an optional host pre-start hook run after install but before
@@ -426,7 +451,11 @@ impl AgentSessionRuntime {
             // outgoing one is torn down.
             let target_session_file = next.session_file().await.map(|p| p.display().to_string());
             current
-                .dispose_with(reason, self.before_invalidate_hook().await, target_session_file)
+                .dispose_with(
+                    reason,
+                    self.before_invalidate_hook().await,
+                    target_session_file,
+                )
                 .await;
             // Invalidate prior subscriptions with a terminal `SessionReplaced` (R-11-021).
             current.notify_replaced(new_gen).await;
@@ -486,7 +515,10 @@ impl AgentSessionRuntime {
         {
             return Ok(SwitchResult { cancelled: true });
         }
-        let previous = current.session_file().await.map(|p| p.display().to_string());
+        let previous = current
+            .session_file()
+            .await
+            .map(|p| p.display().to_string());
         drop(current);
         let next = self
             .factory
@@ -504,7 +536,8 @@ impl AgentSessionRuntime {
         &self,
         path: impl Into<PathBuf>,
     ) -> Result<SwitchResult, SessionServiceError> {
-        self.switch_session_with(path, SwitchSessionOptions::default()).await
+        self.switch_session_with(path, SwitchSessionOptions::default())
+            .await
     }
 
     /// Resume a session file, honoring the [`SwitchSessionOptions`] bag (Pi `switchSession` options,
@@ -539,12 +572,20 @@ impl AgentSessionRuntime {
             None => SessionManager::open(&path)?.cwd().to_path_buf(),
         };
         if !cwd.exists() {
-            return Err(SessionServiceError::MissingSessionCwd(cwd.display().to_string()));
+            return Err(SessionServiceError::MissingSessionCwd(
+                cwd.display().to_string(),
+            ));
         }
-        let previous = current.session_file().await.map(|p| p.display().to_string());
+        let previous = current
+            .session_file()
+            .await
+            .map(|p| p.display().to_string());
         drop(current);
-        let next =
-            self.factory.build(SessionTarget::Resume(path), Some(cwd)).await?.into_shared();
+        let next = self
+            .factory
+            .build(SessionTarget::Resume(path), Some(cwd))
+            .await?
+            .into_shared();
         self.install(next, "resume", previous).await;
         Ok(SwitchResult { cancelled: false })
     }
@@ -572,9 +613,15 @@ impl AgentSessionRuntime {
             )
             .await;
         if veto {
-            return Ok(RuntimeForkResult { cancelled: true, selected_text: None });
+            return Ok(RuntimeForkResult {
+                cancelled: true,
+                selected_text: None,
+            });
         }
-        let previous = current.session_file().await.map(|p| p.display().to_string());
+        let previous = current
+            .session_file()
+            .await
+            .map(|p| p.display().to_string());
         let session_file = current.session_file().await;
         let cwd = current.services().cwd.clone();
 
@@ -609,7 +656,10 @@ impl AgentSessionRuntime {
                 // — it is already fully resolved, so re-encoding it would nest the branch one
                 // level too deep (gap-analysis 05, Finding 1). Falls back to the cwd itself
                 // only if the file somehow has no parent.
-                let root = file.parent().map(Path::to_path_buf).unwrap_or_else(|| cwd.clone());
+                let root = file
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| cwd.clone());
                 let layout = cyrup_session::SessionLayout::literal(root, cwd);
                 mgr.create_branched_session(leaf, &layout)?;
                 self.factory.build_from_manager(mgr).await?.into_shared()
@@ -650,7 +700,10 @@ impl AgentSessionRuntime {
         };
         drop(current);
         self.install(next, "fork", previous).await;
-        Ok(RuntimeForkResult { cancelled: false, selected_text })
+        Ok(RuntimeForkResult {
+            cancelled: false,
+            selected_text,
+        })
     }
 
     /// Import a session JSONL file and switch the runtime to it (Pi `importFromJsonl`,
@@ -666,7 +719,9 @@ impl AgentSessionRuntime {
     ) -> Result<SwitchResult, SessionServiceError> {
         let resolved = input_path.into();
         if !resolved.exists() {
-            return Err(SessionServiceError::ImportFileNotFound(resolved.display().to_string()));
+            return Err(SessionServiceError::ImportFileNotFound(
+                resolved.display().to_string(),
+            ));
         }
         // Pi copies into `this.session.sessionManager.getSessionDir()`
         // (agent-session-runtime.ts:367) — the LIVE manager's OWN directory, which in the default
@@ -690,9 +745,9 @@ impl AgentSessionRuntime {
         };
         std::fs::create_dir_all(&session_dir)
             .map_err(|e| SessionServiceError::Io(e.to_string()))?;
-        let file_name = resolved
-            .file_name()
-            .ok_or_else(|| SessionServiceError::ImportFileNotFound(resolved.display().to_string()))?;
+        let file_name = resolved.file_name().ok_or_else(|| {
+            SessionServiceError::ImportFileNotFound(resolved.display().to_string())
+        })?;
         let destination = session_dir.join(file_name);
 
         // SEAM-012 — an import lands as a RESUME of the copied file (pi's `importFromJsonl` ends in
@@ -727,7 +782,9 @@ impl AgentSessionRuntime {
             None => SessionManager::open(&destination)?.cwd().to_path_buf(),
         };
         if !cwd.exists() {
-            return Err(SessionServiceError::MissingSessionCwd(cwd.display().to_string()));
+            return Err(SessionServiceError::MissingSessionCwd(
+                cwd.display().to_string(),
+            ));
         }
         let next = self
             .factory
@@ -751,7 +808,10 @@ impl AgentSessionRuntime {
         before_start: Option<Box<dyn FnOnce() + Send>>,
     ) -> Result<(), SessionServiceError> {
         let current = self.session().await;
-        let previous = current.session_file().await.map(|p| p.display().to_string());
+        let previous = current
+            .session_file()
+            .await
+            .map(|p| p.display().to_string());
         // Derive the current target so the rebuild re-opens the SAME session (a persisted file is
         // resumed; an ephemeral session has nothing to re-open).
         let target = match current.session_file().await {
@@ -761,7 +821,8 @@ impl AgentSessionRuntime {
         let cwd = current.services().cwd.clone();
         drop(current);
         let next = self.factory.build(target, Some(cwd)).await?.into_shared();
-        self.install_inner(next, "reload", previous, before_start).await;
+        self.install_inner(next, "reload", previous, before_start)
+            .await;
         Ok(())
     }
 

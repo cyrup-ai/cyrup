@@ -26,6 +26,19 @@ pub struct ToolInfo {
     pub prompt_snippet: Option<String>,
     /// Whether the tool is in the currently-active set (model-visible this turn).
     pub active: bool,
+    /// The definition's `renderShell` (pi `ToolDefinition.renderShell?: "default" | "self"`,
+    /// `extensions/types.ts:467` @v0.84.4), read off [`Tool::render_kind`] — what
+    /// `ToolExecutionComponent.getRenderShell()` resolves from `session.getToolDefinition(name)`
+    /// (`modes/interactive/components/tool-execution.ts:108-116`, definition handed in at
+    /// `interactive-mode.ts:2067-2069`) to decide whether the row gets the tinted `Box(1, 1)` shell
+    /// or the tool's own framing (EXT-024).
+    ///
+    /// `#[serde(skip)]`: pi's serialized `ToolInfo` is exactly `{name, description, parameters,
+    /// promptSnippet?, active?}` (`agent-session.ts:790-799`) and the guest-facing `getAllTools`
+    /// shape is pinned separately (EXT-038); this field is for the host's own renderer, not the
+    /// wire.
+    #[serde(skip)]
+    pub render_kind: cyrup_core::ToolRenderKind,
 }
 
 /// Captures the stable system-prompt inputs so the base prompt can be rebuilt when the active tool
@@ -40,8 +53,14 @@ pub(crate) struct PromptRebuilder {
 }
 
 impl PromptRebuilder {
-    pub(crate) fn new(base: PromptInputs, contributions: BTreeMap<String, ToolPromptContribution>) -> Self {
-        Self { base, contributions }
+    pub(crate) fn new(
+        base: PromptInputs,
+        contributions: BTreeMap<String, ToolPromptContribution>,
+    ) -> Self {
+        Self {
+            base,
+            contributions,
+        }
     }
 
     /// Record (or replace) a tool's prompt contribution so a tool registered AFTER the build
@@ -50,8 +69,10 @@ impl PromptRebuilder {
     /// agent-session.ts:2487-2506). Without this a late tool would reach the model's tool array
     /// with no prompt guidance at all.
     fn upsert_contribution(&mut self, tool: &Arc<dyn Tool>) {
-        self.contributions
-            .insert(tool.name().to_string(), crate::builder::tool_contribution(tool));
+        self.contributions.insert(
+            tool.name().to_string(),
+            crate::builder::tool_contribution(tool),
+        );
     }
 
     /// The base bag itself, serialized as pi's `BuildSystemPromptOptions` — what
@@ -87,13 +108,19 @@ impl PromptRebuilder {
 
         let mut bag = serde_json::Map::new();
         if let Some(custom) = self.base.custom_prompt.as_ref() {
-            bag.insert("customPrompt".into(), serde_json::Value::String(custom.to_string()));
+            bag.insert(
+                "customPrompt".into(),
+                serde_json::Value::String(custom.to_string()),
+            );
         }
         bag.insert("selectedTools".into(), serde_json::json!(active));
         bag.insert("toolSnippets".into(), serde_json::Value::Object(snippets));
         bag.insert("promptGuidelines".into(), serde_json::json!(guidelines));
         if let Some(append) = self.base.append_system_prompt.as_ref() {
-            bag.insert("appendSystemPrompt".into(), serde_json::Value::String(append.to_string()));
+            bag.insert(
+                "appendSystemPrompt".into(),
+                serde_json::Value::String(append.to_string()),
+            );
         }
         bag.insert("cwd".into(), serde_json::json!(self.base.cwd));
         bag.insert(
@@ -106,7 +133,10 @@ impl PromptRebuilder {
                     .collect::<Vec<_>>()
             ),
         );
-        bag.insert("skills".into(), serde_json::json!(self.base.skills.as_ref()));
+        bag.insert(
+            "skills".into(),
+            serde_json::json!(self.base.skills.as_ref()),
+        );
         serde_json::Value::Object(bag)
     }
 
@@ -138,10 +168,16 @@ impl DynamicToolState {
         active: Vec<Arc<dyn Tool>>,
         rebuilder: PromptRebuilder,
     ) -> Self {
-        let registry: BTreeMap<String, Arc<dyn Tool>> =
-            registry_tools.into_iter().map(|t| (t.name().to_string(), t)).collect();
+        let registry: BTreeMap<String, Arc<dyn Tool>> = registry_tools
+            .into_iter()
+            .map(|t| (t.name().to_string(), t))
+            .collect();
         let active = active.into_iter().map(|t| t.name().to_string()).collect();
-        Self { registry, active, rebuilder }
+        Self {
+            registry,
+            active,
+            rebuilder,
+        }
     }
 
     /// The base system-prompt options bag for the CURRENT active set (EXT-061) — pi
@@ -184,15 +220,13 @@ impl DynamicToolState {
             parameters: t.parameters().clone(),
             prompt_snippet: t.prompt_snippet().map(str::to_string),
             active: self.active.iter().any(|n| n == t.name()),
+            render_kind: t.render_kind(),
         }
     }
 
     /// Set the active set by name (Pi `setActiveToolsByName`): unknown names are ignored, the active
     /// list is replaced, and the new `(tools, system_prompt)` to push to the agent are returned.
-    pub(crate) fn set_active(
-        &mut self,
-        names: &[String],
-    ) -> (Vec<Arc<dyn Tool>>, String) {
+    pub(crate) fn set_active(&mut self, names: &[String]) -> (Vec<Arc<dyn Tool>>, String) {
         let mut active: Vec<String> = Vec::new();
         let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
         for name in names {
@@ -310,7 +344,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
     use super::*;
     use cyrup_core::{CancelToken, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     /// A tool double whose whole model-visible definition is settable, so a test can register a
     /// SECOND definition under the SAME name and prove the replacement reaches the agent.
@@ -395,15 +429,23 @@ mod tests {
     /// `AgentSession::refresh_extension_tools` (which has no `else` and no log) pushed nothing.
     #[test]
     fn merge_registered_pushes_a_replaced_definition() {
-        let mut st = state_with(vec![Fake::new("deploy", "v1").with_snippet("deploy: v1").arc()]);
+        let mut st = state_with(vec![
+            Fake::new("deploy", "v1").with_snippet("deploy: v1").arc(),
+        ]);
         assert_eq!(st.active_names(), vec!["deploy".to_string()]);
 
         let push = st
-            .merge_registered(vec![Fake::new("deploy", "v2").with_snippet("deploy: v2").arc()])
+            .merge_registered(vec![
+                Fake::new("deploy", "v2").with_snippet("deploy: v2").arc(),
+            ])
             .expect("a CHANGED definition for an existing name must still push");
         let (tools, prompt) = push;
 
-        assert_eq!(tools.len(), 1, "the rebuilt array still holds exactly the active set");
+        assert_eq!(
+            tools.len(),
+            1,
+            "the rebuilt array still holds exactly the active set"
+        );
         assert_eq!(
             tools[0].description(),
             "v2",
@@ -413,7 +455,10 @@ mod tests {
             prompt.contains("deploy: v2"),
             "the rebuilt system prompt carries the new snippet: {prompt}"
         );
-        assert!(!prompt.contains("deploy: v1"), "…and not the stale one: {prompt}");
+        assert!(
+            !prompt.contains("deploy: v1"),
+            "…and not the stale one: {prompt}"
+        );
         // The active set is untouched by a pure redefinition — only the definition moved.
         assert_eq!(st.active_names(), vec!["deploy".to_string()]);
     }
@@ -429,10 +474,14 @@ mod tests {
     /// no observable difference.
     #[test]
     fn merge_registered_skips_an_unchanged_set() {
-        let mut st = state_with(vec![Fake::new("deploy", "v1").with_snippet("deploy: v1").arc()]);
+        let mut st = state_with(vec![
+            Fake::new("deploy", "v1").with_snippet("deploy: v1").arc(),
+        ]);
         assert!(
-            st.merge_registered(vec![Fake::new("deploy", "v1").with_snippet("deploy: v1").arc()])
-                .is_none(),
+            st.merge_registered(vec![
+                Fake::new("deploy", "v1").with_snippet("deploy: v1").arc()
+            ])
+            .is_none(),
             "a definitionally identical re-registration costs no rebuild"
         );
     }
@@ -447,8 +496,14 @@ mod tests {
             .merge_registered(vec![Fake::new("audit", "new").arc()])
             .expect("a new name pushes");
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert!(names.contains(&"audit"), "the late tool is active: {names:?}");
-        assert!(names.contains(&"deploy"), "…without disturbing what was already active: {names:?}");
+        assert!(
+            names.contains(&"audit"),
+            "the late tool is active: {names:?}"
+        );
+        assert!(
+            names.contains(&"deploy"),
+            "…without disturbing what was already active: {names:?}"
+        );
     }
 
     /// A custom tool registered AFTER build must contribute its prompt guidance, exactly as the
@@ -461,19 +516,32 @@ mod tests {
     /// [`PromptRebuilder::upsert_contribution`]'s own doc describes.
     #[test]
     fn register_custom_contributes_prompt_guidance() {
-        let mut st = state_with(vec![Fake::new("read", "builtin").with_snippet("read: read files").arc()]);
-        st.register_custom(vec![Fake::new("deploy", "custom")
-            .with_snippet("deploy: ships the build")
-            .arc()]);
+        let mut st = state_with(vec![
+            Fake::new("read", "builtin")
+                .with_snippet("read: read files")
+                .arc(),
+        ]);
+        st.register_custom(vec![
+            Fake::new("deploy", "custom")
+                .with_snippet("deploy: ships the build")
+                .arc(),
+        ]);
 
         // Registered INERT — pi's build-time `customTools` are activated by selection, never
         // auto-activated. That half must not change.
-        assert_eq!(st.active_names(), vec!["read".to_string()], "custom tools register inert");
+        assert_eq!(
+            st.active_names(),
+            vec!["read".to_string()],
+            "custom tools register inert"
+        );
 
-        let (tools, prompt) =
-            st.set_active(&["read".to_string(), "deploy".to_string()]);
+        let (tools, prompt) = st.set_active(&["read".to_string(), "deploy".to_string()]);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert_eq!(names, ["read", "deploy"], "the custom tool is enable-able: {names:?}");
+        assert_eq!(
+            names,
+            ["read", "deploy"],
+            "the custom tool is enable-able: {names:?}"
+        );
         assert!(
             prompt.contains("deploy: ships the build"),
             "the custom tool's snippet reaches the model's system prompt: {prompt}"

@@ -26,12 +26,12 @@ use std::path::PathBuf;
 
 use unicode_segmentation::UnicodeSegmentation;
 
+use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};   // editor.rs:26 — CMDHINT_01 needs the named type
+use ratatui::style::{Modifier, Style}; // editor.rs:26 — CMDHINT_01 needs the named type
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
-use ratatui::Frame;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -62,7 +62,7 @@ mod tests;
 
 // The editor-internal helpers the submodules share. Re-bound here so every submodule reaches
 // them through its own `use super::*;`, the same way `crate::app` and `crate::transcript` do.
-use word_nav::{find_word_backward, find_word_forward, is_punctuation, WordSeg};
+use word_nav::{WordSeg, find_word_backward, find_word_forward, is_punctuation};
 use wrap::{display_width, grapheme_boundaries};
 
 /// Outcome of feeding a key to the editor.
@@ -277,4 +277,3 @@ pub struct CommandHighlight {
     /// non-whitespace char.
     pub ghost: Option<String>,
 }
-

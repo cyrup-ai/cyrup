@@ -6,14 +6,14 @@ mod stream;
 mod tools;
 mod turn;
 
+use super::HeaderFn;
 use super::message::errored_assistant;
 use super::util::{lock, panic_message};
-use super::HeaderFn;
-use crate::event::{AgentEvent, AgentMessage};
 use crate::error::{AgentError, ContinueSurface};
+use crate::event::{AgentEvent, AgentMessage};
 use crate::hooks::Hooks;
 use crate::queue::{PendingQueue, ToolExecution};
-use crate::state::{reduce, GenerationConfig, StateInner};
+use crate::state::{GenerationConfig, StateInner, reduce};
 use crate::stream_fn::{ApiKeyResolver, StreamFn};
 use crate::subscriber::EventSubscriber;
 use cyrup_core::{ModelRef, ModelThinkingLevel, RunCancel, SessionId, StopReason, Tool};
@@ -33,13 +33,22 @@ pub(crate) enum PromptSource {
 /// transcript may be resumed without a new message — so the precondition has one home and cannot
 /// be skipped.
 pub(crate) enum RunEntry {
-    Prompt { messages: Vec<AgentMessage>, source: PromptSource },
+    Prompt {
+        messages: Vec<AgentMessage>,
+        source: PromptSource,
+    },
     Continue(ResumePoint),
 }
 
 impl RunEntry {
     pub(crate) fn skip_initial_steering_poll(&self) -> bool {
-        matches!(self, RunEntry::Prompt { source: PromptSource::SteeringDrain, .. })
+        matches!(
+            self,
+            RunEntry::Prompt {
+                source: PromptSource::SteeringDrain,
+                ..
+            }
+        )
     }
 }
 
@@ -163,8 +172,14 @@ impl RunCtx {
             tool_execution,
             session_id,
         } = shared;
-        let RunBaseline { system_prompt, model, thinking_level, gen_config, tools, messages } =
-            baseline;
+        let RunBaseline {
+            system_prompt,
+            model,
+            thinking_level,
+            gen_config,
+            tools,
+            messages,
+        } = baseline;
         Self {
             state,
             subscribers,
@@ -234,10 +249,9 @@ impl RunCtx {
         }
         let subs = { lock(&self.subscribers).clone() };
         for s in subs.iter() {
-            if let Err(payload) =
-                std::panic::AssertUnwindSafe(s.on_event(&ev, self.cancel.child()))
-                    .catch_unwind()
-                    .await
+            if let Err(payload) = std::panic::AssertUnwindSafe(s.on_event(&ev, self.cancel.child()))
+                .catch_unwind()
+                .await
             {
                 // Pi stops iterating the listener set on the first throw; so do we.
                 return Err(RunFailure(panic_message(payload.as_ref())));
@@ -269,8 +283,11 @@ impl RunCtx {
         // mid-run.
         let model = { lock(&self.state).model.clone() }.unwrap_or_else(|| self.model.clone());
         // Pi `stopReason: aborted ? "aborted" : "error"` (agent.ts:504).
-        let stop_reason =
-            if self.cancel.is_cancelled() { StopReason::Aborted } else { StopReason::Error };
+        let stop_reason = if self.cancel.is_cancelled() {
+            StopReason::Aborted
+        } else {
+            StopReason::Error
+        };
         let failure = errored_assistant(
             model.provider.clone(),
             model.model.as_str(),
@@ -282,11 +299,27 @@ impl RunCtx {
         // This IS Pi's catch handler, so a subscriber that fails while it runs has nowhere further
         // to unwind (pi's throw would escape `runWithLifecycle` entirely and reach the caller of
         // `prompt()`); the closing quartet is emitted best-effort.
-        let _ = self.emit(AgentEvent::MessageStart { message: fm.clone() }).await;
-        let _ = self.emit(AgentEvent::MessageEnd { message: fm.clone() }).await;
-        let _ =
-            self.emit(AgentEvent::TurnEnd { message: fm.clone(), tool_results: Vec::new() }).await;
-        let _ = self.emit(AgentEvent::AgentEnd { messages: vec![Arc::new(fm.clone())] }).await;
+        let _ = self
+            .emit(AgentEvent::MessageStart {
+                message: fm.clone(),
+            })
+            .await;
+        let _ = self
+            .emit(AgentEvent::MessageEnd {
+                message: fm.clone(),
+            })
+            .await;
+        let _ = self
+            .emit(AgentEvent::TurnEnd {
+                message: fm.clone(),
+                tool_results: Vec::new(),
+            })
+            .await;
+        let _ = self
+            .emit(AgentEvent::AgentEnd {
+                messages: vec![Arc::new(fm.clone())],
+            })
+            .await;
         self.new_messages = vec![Arc::new(fm)];
     }
 
@@ -314,20 +347,21 @@ impl RunCtx {
         }
         // §6.5: the public return type stays `Vec<AgentMessage>`, so the handles are unwrapped
         // exactly once per run. Off the hot path, and every in-tree caller discards the value.
-        self.new_messages
-            .iter()
-            .map(|m| (**m).clone())
-            .collect()
+        self.new_messages.iter().map(|m| (**m).clone()).collect()
     }
 
     async fn run_entry(&mut self, entry: RunEntry) -> Result<(), RunFailure> {
         self.emit(AgentEvent::AgentStart).await?;
         match entry {
-            RunEntry::Prompt { messages: prompts, .. } => {
+            RunEntry::Prompt {
+                messages: prompts, ..
+            } => {
                 self.emit(AgentEvent::TurnStart).await?;
                 for p in prompts {
-                    self.emit(AgentEvent::MessageStart { message: p.clone() }).await?;
-                    self.emit(AgentEvent::MessageEnd { message: p.clone() }).await?;
+                    self.emit(AgentEvent::MessageStart { message: p.clone() })
+                        .await?;
+                    self.emit(AgentEvent::MessageEnd { message: p.clone() })
+                        .await?;
                     // Pi appends each prompt to the loop's working copy (`currentContext.messages`,
                     // agent-loop.ts:106/187) — the observable `state.messages` grows separately via
                     // the reducer on the `message_end` above.

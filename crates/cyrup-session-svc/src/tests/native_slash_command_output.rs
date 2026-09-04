@@ -30,20 +30,25 @@
 //! Deliberately native, not wasm: `tests/wasm_slash_command.rs` covers the guest route and pays a
 //! nested `cargo build` for it. A native `Arc<dyn NativeExtension>` needs no build step, so these
 //! run in milliseconds and add no fixture-target directory to `/tmp`.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use crate::{NotifyKind, SessionBuilder, SessionConfig, UiEffect};
 use cyrup_core::{ExtensionId, Message, StopReason};
 use cyrup_ext::{
-    CommandDescriptor, ExtError, HostCtx, HostEvent, HookOutcome, InitApi, NativeExtension,
+    CommandDescriptor, ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension,
 };
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 use cyrup_provider::Provider;
-use crate::{NotifyKind, SessionBuilder, SessionConfig, UiEffect};
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
 use tempfile::TempDir;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -134,7 +139,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -193,9 +202,16 @@ fn drain_notifies(rx: &mut UnboundedReceiver<UiEffect>) -> Vec<(String, NotifyKi
 async fn session_with(
     fx: &Fixture,
     commands: Vec<(&'static str, Reply)>,
-) -> (crate::AgentSession, UnboundedReceiver<UiEffect>, Arc<AtomicUsize>) {
+) -> (
+    crate::AgentSession,
+    UnboundedReceiver<UiEffect>,
+    Arc<AtomicUsize>,
+) {
     let ran = Arc::new(AtomicUsize::new(0));
-    let ext = Arc::new(ScriptedCommands { commands, ran: ran.clone() });
+    let ext = Arc::new(ScriptedCommands {
+        commands,
+        ran: ran.clone(),
+    });
     let session = SessionBuilder::new(faux_with_ok() as Arc<dyn Provider>, base_config(fx))
         .with_native_extension(ext)
         .build()
@@ -231,13 +247,21 @@ async fn native_command_output_reaches_the_ui_channel() {
             .any(|n| n == "report"),
         "the native-registered `/report` command is in the host command registry"
     );
-    assert_eq!(ran.load(Ordering::Acquire), 0, "the handler has not run before the prompt");
+    assert_eq!(
+        ran.load(Ordering::Acquire),
+        0,
+        "the handler has not run before the prompt"
+    );
 
     // Drive the REAL public entry point.
     let _ = session.prompt("/report weekly").await.unwrap();
     session.wait_for_idle().await;
 
-    assert_eq!(ran.load(Ordering::Acquire), 1, "the native command handler ran exactly once");
+    assert_eq!(
+        ran.load(Ordering::Acquire),
+        1,
+        "the native command handler ran exactly once"
+    );
 
     // ---- THE ASSERTION THE BUG BROKE: the handler's payload reached the user. ----
     let notifies = drain_notifies(&mut ui_rx);
@@ -260,7 +284,9 @@ async fn native_command_output_reaches_the_ui_channel() {
     // Still short-circuited: `/report weekly` never became a prompt (Pi returns `true`,
     // agent-session.ts:1300).
     assert!(
-        user_texts(&session.messages().await).iter().all(|t| !t.contains("/report")),
+        user_texts(&session.messages().await)
+            .iter()
+            .all(|t| !t.contains("/report")),
         "the native slash command was consumed — no user message went to the model"
     );
 }
@@ -274,7 +300,11 @@ async fn silent_native_command_emits_no_notification() {
     let fx = fixture();
     let (session, mut ui_rx, ran) = session_with(
         &fx,
-        vec![("quiet", Reply::Nothing), ("blank", Reply::Blank), ("loud", Reply::Text("SPEAKS"))],
+        vec![
+            ("quiet", Reply::Nothing),
+            ("blank", Reply::Blank),
+            ("loud", Reply::Text("SPEAKS")),
+        ],
     )
     .await;
 
@@ -301,13 +331,22 @@ async fn silent_native_command_emits_no_notification() {
     let _ = session.prompt("/loud").await.unwrap();
     session.wait_for_idle().await;
     let notifies = drain_notifies(&mut ui_rx);
-    assert_eq!(notifies.len(), 1, "the control command surfaced its output: {notifies:?}");
-    assert_eq!(notifies[0].0, "SPEAKS", "control output verbatim: {notifies:?}");
+    assert_eq!(
+        notifies.len(),
+        1,
+        "the control command surfaced its output: {notifies:?}"
+    );
+    assert_eq!(
+        notifies[0].0, "SPEAKS",
+        "control output verbatim: {notifies:?}"
+    );
 
     // Silent or not, all three were consumed as commands, never sent as prompts.
     let texts = user_texts(&session.messages().await);
     assert!(
-        texts.iter().all(|t| !t.contains("/quiet") && !t.contains("/blank") && !t.contains("/loud")),
+        texts
+            .iter()
+            .all(|t| !t.contains("/quiet") && !t.contains("/blank") && !t.contains("/loud")),
         "silent commands are still fully handled — none fell through to the model: {texts:?}"
     );
 }
@@ -324,11 +363,19 @@ async fn failing_native_command_surfaces_an_error_and_still_counts_as_handled() 
     let _ = session.prompt("/boom now").await.unwrap();
     session.wait_for_idle().await;
 
-    assert_eq!(ran.load(Ordering::Acquire), 1, "the failing handler actually ran");
+    assert_eq!(
+        ran.load(Ordering::Acquire),
+        1,
+        "the failing handler actually ran"
+    );
 
     // (a) the failure is visible, as an Error, attributed to the command.
     let notifies = drain_notifies(&mut ui_rx);
-    assert_eq!(notifies.len(), 1, "the handler error surfaced exactly once: {notifies:?}");
+    assert_eq!(
+        notifies.len(),
+        1,
+        "the handler error surfaced exactly once: {notifies:?}"
+    );
     assert_eq!(
         notifies[0].1,
         NotifyKind::Error,
@@ -356,7 +403,9 @@ async fn failing_native_command_surfaces_an_error_and_still_counts_as_handled() 
     let _ = session.prompt("/nosuchcommand please").await.unwrap();
     session.wait_for_idle().await;
     assert!(
-        user_texts(&session.messages().await).iter().any(|t| t.contains("/nosuchcommand please")),
+        user_texts(&session.messages().await)
+            .iter()
+            .any(|t| t.contains("/nosuchcommand please")),
         "an unregistered slash command still falls through to normal prompt handling"
     );
     assert_eq!(
@@ -374,7 +423,11 @@ async fn each_invocation_surfaces_its_own_output_in_order() {
     let fx = fixture();
     let (session, mut ui_rx, ran) = session_with(
         &fx,
-        vec![("alpha", Reply::Text("A")), ("beta", Reply::Text("B")), ("gamma", Reply::Nothing)],
+        vec![
+            ("alpha", Reply::Text("A")),
+            ("beta", Reply::Text("B")),
+            ("gamma", Reply::Nothing),
+        ],
     )
     .await;
 
@@ -382,7 +435,11 @@ async fn each_invocation_surfaces_its_own_output_in_order() {
         let _ = session.prompt(cmd).await.unwrap();
         session.wait_for_idle().await;
     }
-    assert_eq!(ran.load(Ordering::Acquire), 4, "all four invocations reached the handler");
+    assert_eq!(
+        ran.load(Ordering::Acquire),
+        4,
+        "all four invocations reached the handler"
+    );
 
     let notifies = drain_notifies(&mut ui_rx);
     let messages: Vec<String> = notifies.iter().map(|(m, _)| m.clone()).collect();
@@ -424,9 +481,15 @@ async fn headless_session_without_a_ui_sink_still_handles_the_command() {
     let _ = session.prompt("/report weekly").await.unwrap();
     session.wait_for_idle().await;
 
-    assert_eq!(ran.load(Ordering::Acquire), 1, "the handler ran under a headless session");
+    assert_eq!(
+        ran.load(Ordering::Acquire),
+        1,
+        "the handler ran under a headless session"
+    );
     assert!(
-        user_texts(&session.messages().await).iter().all(|t| !t.contains("/report")),
+        user_texts(&session.messages().await)
+            .iter()
+            .all(|t| !t.contains("/report")),
         "the command is still consumed with no ui sink attached"
     );
 }
@@ -444,7 +507,10 @@ async fn the_facade_layer_does_carry_the_payload() {
     let cancel = cyrup_core::CancelToken::new();
     let routed = tokio::time::timeout(
         Duration::from_secs(10),
-        session.services().ext_host.execute_native_command("report", "weekly", &cancel),
+        session
+            .services()
+            .ext_host
+            .execute_native_command("report", "weekly", &cancel),
     )
     .await
     .expect("execute_native_command settled")

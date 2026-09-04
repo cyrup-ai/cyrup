@@ -10,7 +10,10 @@
 //! 2. [`is_retryable_model_failure`] — R-SA-039's fixed retryable-failure pattern classifier
 //!    (rate limits, auth errors, 5xx, cold-start, empty response, etc.), a verbatim 1:1 port of
 //!    pi-subagents' `RETRYABLE_MODEL_FAILURE_PATTERNS`/`isRetryableModelFailure`
-//!    (`pi-subagents/src/runs/shared/model-fallback.ts:278-329`).
+//!    (`pi-subagents/src/runs/shared/model-fallback.ts:278-329`), and its per-ATTEMPT wrapper
+//!    [`is_retryable_model_failure_attempt`] (`isRetryableModelFailureAttempt`,
+//!    `model-fallback.ts:530-537` @v0.64.0, SUBA-089), which additionally refuses to re-dispatch
+//!    an attempt that already ran tools or whose recorded messages do not corroborate the error.
 //! 3. [`run_fallback_ladder`] — the attempt loop itself (R-SA-035/036/037/039/040), which drives
 //!    a caller-supplied single-attempt runner across the candidate ladder built by (1),
 //!    consulting (2) only after a **distinct, prior** timeout check (R-SA-036's load-bearing
@@ -40,7 +43,7 @@
 //! `MessageEnd` event), and per-attempt errors are plain `String`s (the orchestrator's own
 //! classification of a failed attempt, not a re-typed provider error).
 
-use cyrup_core::{ModelId, Usage};
+use cyrup_core::{ModelId, ProviderId, Usage};
 
 use crate::exec::model_scope::{
     ModelScopeConfig, ModelScopeSeverity, ModelScopeViolation, ModelSource, check_model_scope,
@@ -119,6 +122,22 @@ impl ModelOverride {
 /// provider catalog, which is not this function's concern; `available_models` here is assumed to
 /// already be the caller's fully resolved, non-empty-when-meaningful allowlist).
 ///
+/// **`preferred_provider` (SUBA-088)** — pi `buildModelCandidates`'s 4th parameter
+/// (`runs/shared/model-fallback.ts:412-418` @v0.64.0), which every caller passes as
+/// `agent.modelProvider ?? options.preferredModelProvider` (`runs/foreground/execution.ts:1885`,
+/// `runs/background/async-execution.ts:930`) — the agent's own `subagents.defaultProvider` stamp
+/// first, else the PARENT session's provider. Upstream threads it into
+/// `resolveSubagentModelCandidate` (`:207-218`), where a BARE id (no `provider/` prefix) that
+/// several registry providers offer resolves to the preferred provider's `fullId`. This crate's
+/// launch path holds no registry here — `available_models` is the persona's own list, and the
+/// bare id is forwarded verbatim as `--model <id>` for the CHILD to resolve — so the preference is
+/// applied the only way it can reach the child: each surviving bare candidate is QUALIFIED to
+/// `{provider}/{id}` by [`qualify_model_candidate`] before it is deduplicated. A candidate that
+/// already names a provider is never rewritten (upstream's "never switches providers for a
+/// qualified query"), and `None` leaves every id exactly as it was. The allowlist is consulted on
+/// BOTH spellings so a persona-derived list (bare) and an inherited parent model (qualified) each
+/// keep matching.
+///
 /// This function never fails and never panics: an empty result (e.g. no override, no agent model,
 /// empty fallback list, or every candidate filtered out by `available_models`) is a legitimate,
 /// representable outcome — [`run_fallback_ladder`]'s caller is responsible for treating an empty
@@ -129,6 +148,7 @@ pub fn build_model_candidates(
     agent_primary_model: Option<&ModelId>,
     agent_fallback_models: &[ModelId],
     available_models: &[ModelId],
+    preferred_provider: Option<&ProviderId>,
 ) -> Vec<ModelId> {
     let mut candidates: Vec<ModelId> = Vec::new();
 
@@ -142,15 +162,56 @@ pub fn build_model_candidates(
 
     let mut seen: Vec<ModelId> = Vec::with_capacity(candidates.len());
     for candidate in candidates {
-        if seen.contains(&candidate) {
+        let qualified = qualify_model_candidate(&candidate, preferred_provider);
+        if seen.contains(&qualified) {
             continue;
         }
-        if !available_models.contains(&candidate) {
+        if !available_models.contains(&candidate) && !available_models.contains(&qualified) {
             continue;
         }
-        seen.push(candidate);
+        seen.push(qualified);
     }
     seen
+}
+
+/// SUBA-088: the provider half of a `provider/id` model id, or `None` for a bare id (or one whose
+/// halves are not both non-empty — pi `normalizeParentModel`'s rule, `model-fallback.ts:33-39`,
+/// under which `""`, `"anthropic"`, `"/sonnet"` and `"anthropic/"` all yield no parent model).
+/// This is how the PARENT session's provider is derived for `preferredModelProvider` (pi
+/// `currentProvider = parentModel?.provider`, `subagent-executor.ts:3648,3825` @v0.64.0): cyrup's
+/// [`ModelId`] carries the joined `"{provider}/{id}"`, so the provider is split back off it.
+#[must_use]
+pub fn provider_of(model: &ModelId) -> Option<ProviderId> {
+    model
+        .as_str()
+        .split_once('/')
+        .filter(|(provider, id)| !provider.is_empty() && !id.is_empty())
+        .map(|(provider, _)| ProviderId::from(provider))
+}
+
+/// SUBA-088: qualify a BARE model id with `preferred_provider` — `gpt-5` under `openai-codex`
+/// becomes `openai-codex/gpt-5`; `gpt-5:high` keeps its thinking suffix
+/// (`openai-codex/gpt-5:high`). An id that already carries a `/` is returned unchanged (upstream
+/// treats a qualified query as pinned to its provider and never rewrites it), and so is every id
+/// when no provider is preferred. A pure decision over its two inputs; the launch shell applies it.
+///
+/// Documented inference, not upstream text: pi only treats a `/` prefix as a provider when that
+/// prefix is a REGISTERED provider (`splitQualifiedModelQuery`, `model-fallback.ts:95-113`), so a
+/// Hugging Face `owner/name` id with no registered `owner` would still be a bare id there. With no
+/// registry in hand this function treats any `/` as a provider prefix — the same convention the
+/// fork-thinking predicate and the `models` report already use for the parent model.
+#[must_use]
+pub fn qualify_model_candidate(
+    model: &ModelId,
+    preferred_provider: Option<&ProviderId>,
+) -> ModelId {
+    let raw = model.as_str();
+    match preferred_provider {
+        Some(provider) if !raw.contains('/') && !raw.trim().is_empty() => {
+            ModelId::from(format!("{}/{raw}", provider.as_str()))
+        }
+        _ => model.clone(),
+    }
 }
 
 /// [`build_model_candidates`] plus `subagents.modelScope` enforcement over the ladder's
@@ -176,6 +237,7 @@ pub fn build_model_candidates_scoped(
     agent_primary_model: Option<&ModelId>,
     agent_fallback_models: &[ModelId],
     available_models: &[ModelId],
+    preferred_provider: Option<&ProviderId>,
     scope: Option<&ModelScopeConfig>,
 ) -> (Vec<ModelId>, Vec<ModelScopeViolation>) {
     let candidates = build_model_candidates(
@@ -183,6 +245,7 @@ pub fn build_model_candidates_scoped(
         agent_primary_model,
         agent_fallback_models,
         available_models,
+        preferred_provider,
     );
     let mut violations = Vec::new();
     if scope.is_some_and(ModelScopeConfig::is_armed) {
@@ -340,9 +403,7 @@ pub fn resolve_model_inheritance(
     // resolved to NOTHING (a `"inherit"`/blank `model` with no live parent session) must not
     // shadow the agent's own configured model. Re-resolve against the persona model alone, at
     // `"inherited"` source so an out-of-scope agent default warns rather than refusing the run.
-    if explicit_present
-        && let Some(persona) = real_requested_model(persona_model)
-    {
+    if explicit_present && let Some(persona) = real_requested_model(persona_model) {
         if let Some(violation) =
             check_model_scope(Some(persona.as_str()), scope, ModelSource::Inherited)
         {
@@ -407,6 +468,11 @@ enum RetryPattern {
     /// Case-insensitive `first\s*second`: `first`, then zero or more whitespace, then `second`
     /// (pi `/rate\s*limit/i`).
     OptionalWsBetween(&'static str, &'static str),
+    /// Case-insensitive `first\s+(?:a|b|c)`: `first`, then AT LEAST one whitespace character,
+    /// then any of the alternatives (pi `/connection\s+(?:error|reset|closed|aborted)/i`, added
+    /// by `d8d1408d` inside v0.47.1..v0.57.0 — SUBA-089). Distinct from
+    /// [`Self::OptionalWsBetween`]: `connectionreset` is NOT a match.
+    WsThenAny(&'static str, &'static [&'static str]),
     /// Case-insensitive `first(?:middle)?second`: `first`, then an optional literal `middle`, then
     /// `second` (pi `/temporar(?:ily)? unavailable/i` → first=`temporar`, middle=`ily`,
     /// second=` unavailable`; pi `/timed? out/i` → first=`time`, middle=`d`, second=` out`).
@@ -422,7 +488,7 @@ const RETRYABLE_MODEL_FAILURE_PATTERNS: &[RetryPattern] = &[
     RetryPattern::Contains("quota"),
     RetryPattern::Contains("billing"),
     RetryPattern::Contains("credit"),
-    RetryPattern::Contains("auth"), // /auth(?:entication)?/i
+    RetryPattern::Contains("auth"),         // /auth(?:entication)?/i
     RetryPattern::Contains("unauthorized"), // /unauthori[sz]ed/i, US spelling
     RetryPattern::Contains("unauthorised"), // /unauthori[sz]ed/i, UK spelling
     RetryPattern::Contains("forbidden"),
@@ -437,6 +503,11 @@ const RETRYABLE_MODEL_FAILURE_PATTERNS: &[RetryPattern] = &[
     RetryPattern::Contains("overloaded"),
     RetryPattern::Contains("service unavailable"),
     RetryPattern::OptionalWordBetween("temporar", "ily", " unavailable"), // /temporar(?:ily)? unavailable/i
+    // SUBA-089 (`d8d1408d`, v0.57.0 `model-fallback.ts:428`; v0.64.0 `:496`): a dropped provider
+    // connection is a provider failure. The same commit narrowed the ladder gate to
+    // `isRetryableModelFailureAttempt` so this broader text never re-runs a child that already
+    // did work — the two halves ship together.
+    RetryPattern::WsThenAny("connection", &["error", "reset", "closed", "aborted"]), // /connection\s+(?:error|reset|closed|aborted)/i
     RetryPattern::Contains("connection refused"),
     RetryPattern::Contains("fetch failed"),
     RetryPattern::Contains("network error"),
@@ -447,9 +518,9 @@ const RETRYABLE_MODEL_FAILURE_PATTERNS: &[RetryPattern] = &[
     RetryPattern::Contains("upstream"),
     RetryPattern::OptionalWordBetween("time", "d", " out"), // /timed? out/i
     RetryPattern::Contains("timeout"),
-    RetryPattern::WordNumber("502"), // /\b502\b/
-    RetryPattern::WordNumber("503"), // /\b503\b/
-    RetryPattern::WordNumber("504"), // /\b504\b/
+    RetryPattern::WordNumber("502"),                    // /\b502\b/
+    RetryPattern::WordNumber("503"),                    // /\b503\b/
+    RetryPattern::WordNumber("504"),                    // /\b504\b/
     RetryPattern::OptionalCharBetween("cold", "start"), // /cold.?start/i
     RetryPattern::Contains("empty response"),
     RetryPattern::Contains("no output"),
@@ -503,9 +574,9 @@ fn line_matches(line: &str, pattern: &RetryPattern) -> bool {
             None => false,
         },
         RetryPattern::ThenAny(first, seconds) => match line.find(first) {
-            Some(pos) => line.get(pos + first.len()..).is_some_and(|rest| {
-                seconds.iter().any(|second| rest.contains(second))
-            }),
+            Some(pos) => line
+                .get(pos + first.len()..)
+                .is_some_and(|rest| seconds.iter().any(|second| rest.contains(second))),
             None => false,
         },
         RetryPattern::OptionalCharBetween(first, second) => {
@@ -532,6 +603,23 @@ fn line_matches(line: &str, pattern: &RetryPattern) -> bool {
                         .starts_with(second)
                 {
                     return true;
+                }
+                search = start + 1;
+            }
+            false
+        }
+        RetryPattern::WsThenAny(first, alternatives) => {
+            let mut search = 0;
+            while let Some(rel) = line.get(search..).and_then(|s| s.find(first)) {
+                let start = search + rel;
+                if let Some(rest) = line.get(start + first.len()..) {
+                    let after_ws = rest.trim_start_matches(char::is_whitespace);
+                    // `\s+`: the whitespace run must be non-empty.
+                    if after_ws.len() < rest.len()
+                        && alternatives.iter().any(|alt| after_ws.starts_with(alt))
+                    {
+                        return true;
+                    }
                 }
                 search = start + 1;
             }
@@ -583,7 +671,10 @@ fn is_tool_failure_prefix(error: &str) -> bool {
     if name_len == 0 {
         return false;
     }
-    let Some(rest) = trimmed.get(name_len..).and_then(|r| strip_prefix_ci(r, " failed ")) else {
+    let Some(rest) = trimmed
+        .get(name_len..)
+        .and_then(|r| strip_prefix_ci(r, " failed "))
+    else {
         return false;
     };
     let tail = if let Some(after) = strip_prefix_ci(rest, "(exit ") {
@@ -654,9 +745,83 @@ pub fn is_retryable_model_failure(error: Option<&str>) -> bool {
     // Per-line so the `.*`/`\s*`/`.?` constructs never cross a newline (JS `.`-no-newline). A
     // `Contains`/`WordNumber` needle can never straddle a `\n` either, so per-line evaluation is
     // equivalent to whole-string for those and correct for the sequence patterns.
-    haystack
-        .split('\n')
-        .any(|line| RETRYABLE_MODEL_FAILURE_PATTERNS.iter().any(|p| line_matches(line, p)))
+    haystack.split('\n').any(|line| {
+        RETRYABLE_MODEL_FAILURE_PATTERNS
+            .iter()
+            .any(|p| line_matches(line, p))
+    })
+}
+
+/// The prefix/suffix of pi's second empty-output sentinel — `Subagent produced no output after
+/// terminal assistant stopReason "<reason>".` (`formatEmptyTerminalAssistantResponseError`,
+/// `shared/utils.ts:472` @v0.64.0). Cyrup's own empty-output diagnosis emits only the cold-start
+/// form ([`crate::exec::output::EMPTY_OUTPUT_ERROR`]); this form is recognised so the predicate
+/// matches upstream's `/^Subagent produced no output after terminal assistant stopReason
+/// "[^"]+"\.$/` (`model-fallback.ts:533` @v0.64.0) the day cyrup produces it too.
+const EMPTY_OUTPUT_AFTER_STOP_REASON_PREFIX: &str =
+    "Subagent produced no output after terminal assistant stopReason \"";
+const EMPTY_OUTPUT_AFTER_STOP_REASON_SUFFIX: &str = "\".";
+
+/// `model-fallback.ts:533` @v0.64.0 — is `error` one of the two empty-output sentinels? Exact and
+/// untrimmed, like upstream's `===` and its anchored regex (`[^"]+` is any non-empty run of
+/// non-quote characters, newlines included; `$` is end of input).
+fn is_empty_output_sentinel(error: &str) -> bool {
+    if error == crate::exec::output::EMPTY_OUTPUT_ERROR {
+        return true;
+    }
+    error
+        .strip_prefix(EMPTY_OUTPUT_AFTER_STOP_REASON_PREFIX)
+        .and_then(|rest| rest.strip_suffix(EMPTY_OUTPUT_AFTER_STOP_REASON_SUFFIX))
+        .is_some_and(|stop_reason| !stop_reason.is_empty() && !stop_reason.contains('"'))
+}
+
+/// SUBA-089 — the per-ATTEMPT retry decision the ladder actually gates on
+/// (`isRetryableModelFailureAttempt({error, messages, toolCount})`, `model-fallback.ts:530-537`
+/// @v0.64.0; introduced by `d8d1408d` inside v0.47.1..v0.57.0, where the gate had been the bare
+/// [`is_retryable_model_failure`], `v0.47.1:execution.ts:1633`). Clause for clause, in upstream's
+/// order:
+///
+/// 1. `!isRetryableModelFailure(error)` → `false` — the text is not a model/provider failure.
+/// 2. `toolCount > 0` → `false` — the child already ran tools. **This is the load-bearing half**:
+///    a child that made ten edits and then hit `connection reset` must NOT be re-run from scratch
+///    on the next model, duplicating its side effects and its token spend.
+/// 3. The error is one of the two empty-output sentinels → `true` regardless of messages (a
+///    cold-start/empty response is retryable even when the transcript holds an assistant turn).
+/// 4. `toolCount === 0 && messages.length === 0` → `true` — nothing ran; the error can only be
+///    the provider's.
+/// 5. Otherwise `true` only if some recorded message's own `errorMessage` (trimmed) equals the
+///    error (trimmed): the transcript corroborates that the provider failed. Raw process stderr
+///    that merely *reads* retryable after real activity (upstream's test case, `test/unit/
+///    model-fallback.test.ts:342` @v0.64.0) stops the ladder.
+///
+/// Pure over the signal ([`AttemptSignal::error`], [`StartupEvidence::tool_count`],
+/// [`StartupEvidence::message_count`], [`AttemptSignal::message_errors`]); the ladder's
+/// timeout/detach/success/startup arms run before it, exactly as before (see
+/// [`run_fallback_ladder`]).
+#[must_use]
+pub fn is_retryable_model_failure_attempt(signal: &AttemptSignal) -> bool {
+    let error = signal.error.as_deref();
+    if !is_retryable_model_failure(error) {
+        return false;
+    }
+    let Some(error) = error else {
+        return false;
+    };
+    if signal.startup.tool_count > 0 {
+        return false;
+    }
+    if is_empty_output_sentinel(error) {
+        return true;
+    }
+    if signal.startup.tool_count == 0 && signal.startup.message_count == 0 {
+        return true;
+    }
+    let error = error.trim();
+    !error.is_empty()
+        && signal
+            .message_errors
+            .iter()
+            .any(|message_error| message_error.trim() == error)
 }
 
 /// Format the "prior attempt failed" note appended into the next attempt's initial
@@ -795,6 +960,18 @@ pub struct AttemptSignal {
     /// blocking. **Do not fabricate a synthetic trigger** from output-text heuristics — the trigger
     /// is a real `contact_supervisor` blocking-ask event on the child's own wire.
     pub detached: bool,
+    /// SUBA-089 — the `errorMessage` of every message the child emitted this attempt, in order
+    /// (pi `messageError(message)` over `result.messages`/`run.messages`, `model-fallback.ts:524-528`
+    /// @v0.64.0; every `message_end` message regardless of role, `execution.ts:1122,1190`). Read
+    /// by [`is_retryable_model_failure_attempt`]'s last clause: a retryable-looking error that the
+    /// child's own transcript never reported is raw process stderr after real activity, and is
+    /// NOT re-dispatched on another model.
+    ///
+    /// Deliberately on the signal rather than in [`StartupEvidence`]: that struct's contract is
+    /// "every field is a reason NOT to relaunch", and this list is the opposite — corroborating
+    /// evidence FOR advancing the ladder. Empty when no message carried one (pi's `messages?.some`
+    /// over an empty list is `false`).
+    pub message_errors: Vec<String>,
     /// Everything [`is_retryable_subagent_startup_failure`] needs beyond the fields above, to tell
     /// "the child never started" apart from "the child started and failed". See
     /// [`StartupEvidence`].
@@ -1087,8 +1264,12 @@ pub struct FallbackOutcome<A> {
 ///    the loop (R-SA-039: "If the error is retryable AND this is not the last candidate AND the
 ///    failure was not a timeout, the orchestrator MUST proceed to the next candidate model...
 ///    otherwise the ladder MUST stop"). Only past this point is
-///    [`is_retryable_model_failure`] ever actually consulted, and only for an attempt that has
-///    already been confirmed to be neither a timeout nor a detach.
+///    [`is_retryable_model_failure_attempt`] ever actually consulted, and only for an attempt
+///    that has already been confirmed to be neither a timeout nor a detach. SUBA-089: it is the
+///    per-attempt form, not the bare text classifier — an attempt that already ran tools, or
+///    whose transcript does not corroborate a retryable-looking error, stops the ladder here
+///    (pi `execution.ts:2144,2151` and `background/subagent-runner.ts:2090,2097` @v0.64.0; cyrup's
+///    background runner reaches this same loop through `exec::run_sync`).
 /// 4. Otherwise (retryable, not the last candidate, not a timeout, not a detach): format an
 ///    attempt note (R-SA-039) for the next iteration and continue the ladder.
 ///
@@ -1262,8 +1443,9 @@ pub async fn run_fallback_ladder<R: AttemptRunner + Send>(
             }
 
             // Only reached for a non-timeout, non-detached, non-last-candidate failure: NOW (and
-            // only now) is the retryable-pattern classifier consulted (R-SA-039).
-            if !is_retryable_model_failure(signal.error.as_deref()) {
+            // only now) is the retryable-pattern classifier consulted (R-SA-039) — in its
+            // per-attempt form (SUBA-089), so a child that already ran tools is never re-run.
+            if !is_retryable_model_failure_attempt(&signal) {
                 last_signal = Some(signal);
                 last_attempt = Some(attempt);
                 break 'ladder;
@@ -1333,6 +1515,7 @@ mod tests {
             Some(&model("a")),
             &[model("b")],
             &available,
+            None,
         );
         assert_eq!(
             candidates,
@@ -1349,6 +1532,7 @@ mod tests {
             Some(&model("a")),
             &[model("b")],
             &available,
+            None,
         );
         assert_eq!(candidates, vec![model("a"), model("b")]);
     }
@@ -1363,6 +1547,7 @@ mod tests {
             Some(&model("b")),
             &[model("a"), model("b")],
             &available,
+            None,
         );
         assert_eq!(
             candidates,
@@ -1379,6 +1564,7 @@ mod tests {
             Some(&model("a")),
             &[model("a"), model("b"), model("a"), model("c")],
             &available,
+            None,
         );
         assert_eq!(candidates, vec![model("a"), model("b"), model("c")]);
     }
@@ -1391,6 +1577,7 @@ mod tests {
             Some(&model("b")),
             &[model("c")],
             &available,
+            None,
         );
         assert_eq!(
             candidates,
@@ -1406,14 +1593,126 @@ mod tests {
             Some(&model("b")),
             &[model("c")],
             &[], // nothing available
+            None,
         );
         assert!(candidates.is_empty());
     }
 
     #[test]
     fn candidate_ladder_with_no_override_and_no_agent_model_is_empty() {
-        let candidates = build_model_candidates(&ModelOverride::Inherit, None, &[], &[model("a")]);
+        let candidates =
+            build_model_candidates(&ModelOverride::Inherit, None, &[], &[model("a")], None);
         assert!(candidates.is_empty());
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // SUBA-088: preferred provider qualifies BARE candidates (pi `buildModelCandidates`'s 4th
+    // parameter -> `resolveSubagentModelCandidate(model, available, preferredProvider)`)
+    // ---------------------------------------------------------------------------------------
+
+    /// pi `execution.ts:1885` `agent.modelProvider ?? options.preferredModelProvider`: the agent's
+    /// own provider is what the caller passes, and a bare id lands on the child as
+    /// `provider/id`. Fails before SUBA-088: the ladder had no provider input and forwarded `gpt-5`
+    /// verbatim.
+    #[test]
+    fn bare_candidate_is_qualified_by_the_preferred_provider() {
+        let available = vec![model("gpt-5"), model("gpt-5-mini:high")];
+        let provider = ProviderId::from("openai-codex");
+        let candidates = build_model_candidates(
+            &ModelOverride::Inherit,
+            Some(&model("gpt-5")),
+            &[model("gpt-5-mini:high")],
+            &available,
+            Some(&provider),
+        );
+        assert_eq!(
+            candidates,
+            vec![
+                model("openai-codex/gpt-5"),
+                model("openai-codex/gpt-5-mini:high")
+            ],
+            "every bare id is qualified; a thinking suffix rides along"
+        );
+    }
+
+    /// A qualified id is pinned to its provider (upstream never switches providers for a qualified
+    /// query), and with no preference nothing is rewritten — the pre-SUBA-088 ladder byte for byte.
+    #[test]
+    fn qualified_candidates_and_no_preference_are_left_untouched() {
+        let available = vec![model("anthropic/claude-opus-4-6"), model("gpt-5")];
+        let provider = ProviderId::from("openai-codex");
+        let candidates = build_model_candidates(
+            &ModelOverride::Inherit,
+            Some(&model("anthropic/claude-opus-4-6")),
+            &[model("gpt-5")],
+            &available,
+            Some(&provider),
+        );
+        assert_eq!(
+            candidates,
+            vec![
+                model("anthropic/claude-opus-4-6"),
+                model("openai-codex/gpt-5")
+            ]
+        );
+        let untouched = build_model_candidates(
+            &ModelOverride::Inherit,
+            Some(&model("anthropic/claude-opus-4-6")),
+            &[model("gpt-5")],
+            &available,
+            None,
+        );
+        assert_eq!(
+            untouched,
+            vec![model("anthropic/claude-opus-4-6"), model("gpt-5")]
+        );
+    }
+
+    /// Dedup runs on the QUALIFIED spelling (pi's `seen` set holds the normalized id), so an
+    /// explicit `openai-codex/gpt-5` override and the persona's bare `gpt-5` are one rung; and the
+    /// allowlist accepts either spelling so an inherited (qualified) parent model still passes.
+    #[test]
+    fn qualification_dedups_against_the_qualified_spelling_and_keeps_qualified_allowlist_entries() {
+        let provider = ProviderId::from("openai-codex");
+        let available = vec![model("gpt-5"), model("openai-codex/gpt-5")];
+        let candidates = build_model_candidates(
+            &ModelOverride::Explicit(model("openai-codex/gpt-5")),
+            Some(&model("gpt-5")),
+            &[],
+            &available,
+            Some(&provider),
+        );
+        assert_eq!(candidates, vec![model("openai-codex/gpt-5")]);
+    }
+
+    /// `provider_of` is pi `normalizeParentModel`'s two-non-empty-halves rule applied to the joined
+    /// `provider/id` form; `qualify_model_candidate` never touches a blank or qualified id.
+    #[test]
+    fn provider_of_and_qualify_follow_the_parent_model_rules() {
+        assert_eq!(
+            provider_of(&model("anthropic/claude-opus-4-6")),
+            Some(ProviderId::from("anthropic"))
+        );
+        assert_eq!(provider_of(&model("gpt-5")), None);
+        assert_eq!(provider_of(&model("/sonnet")), None);
+        assert_eq!(provider_of(&model("anthropic/")), None);
+        let provider = ProviderId::from("groq");
+        assert_eq!(
+            qualify_model_candidate(&model("llama-4"), Some(&provider)),
+            model("groq/llama-4")
+        );
+        assert_eq!(
+            qualify_model_candidate(&model("groq/llama-4"), Some(&provider)),
+            model("groq/llama-4")
+        );
+        assert_eq!(
+            qualify_model_candidate(&model(""), Some(&provider)),
+            model("")
+        );
+        assert_eq!(
+            qualify_model_candidate(&model("llama-4"), None),
+            model("llama-4")
+        );
     }
 
     // ---------------------------------------------------------------------------------------
@@ -1433,18 +1732,32 @@ mod tests {
         let persona_fallbacks: Vec<ModelId> = Vec::new();
 
         // available_models is built the way both call sites build it: fallbacks + persona model.
-        let mut available_models: Vec<ModelId> =
-            persona_fallbacks.iter().cloned().chain(persona_model.cloned()).collect();
-        let ov = resolve_model_inheritance(None, persona_model, Some(&inherited), &mut available_models, None)
-            .expect("no scope configured, so resolution cannot be refused");
+        let mut available_models: Vec<ModelId> = persona_fallbacks
+            .iter()
+            .cloned()
+            .chain(persona_model.cloned())
+            .collect();
+        let ov = resolve_model_inheritance(
+            None,
+            persona_model,
+            Some(&inherited),
+            &mut available_models,
+            None,
+        )
+        .expect("no scope configured, so resolution cannot be refused");
 
         assert_eq!(ov, ModelOverride::Explicit(inherited.clone()));
         assert!(
             available_models.contains(&inherited),
             "the inherited model must be added to available_models so the allowlist filter keeps it"
         );
-        let candidates =
-            build_model_candidates(&ov, persona_model, &persona_fallbacks, &available_models);
+        let candidates = build_model_candidates(
+            &ov,
+            persona_model,
+            &persona_fallbacks,
+            &available_models,
+            None,
+        );
         assert_eq!(
             candidates,
             vec![inherited],
@@ -1459,9 +1772,10 @@ mod tests {
         // threaded through resolve_model_inheritance, the same persona now resolves a candidate.
         let inherited = model("anthropic/claude-opus-4-8");
         let mut available_models: Vec<ModelId> = Vec::new();
-        let ov = resolve_model_inheritance(None, None, Some(&inherited), &mut available_models, None)
-            .expect("no scope configured");
-        let candidates = build_model_candidates(&ov, None, &[], &available_models);
+        let ov =
+            resolve_model_inheritance(None, None, Some(&inherited), &mut available_models, None)
+                .expect("no scope configured");
+        let candidates = build_model_candidates(&ov, None, &[], &available_models, None);
         assert!(!candidates.is_empty());
         assert_eq!(candidates, vec![inherited]);
     }
@@ -1472,12 +1786,21 @@ mod tests {
         let inherited = model("together/zai-org/GLM-5.2");
         let per_call = model("z");
         let mut available_models: Vec<ModelId> = vec![per_call.clone()];
-        let ov =
-            resolve_model_inheritance(Some(&per_call), None, Some(&inherited), &mut available_models, None)
-                .expect("no scope configured");
+        let ov = resolve_model_inheritance(
+            Some(&per_call),
+            None,
+            Some(&inherited),
+            &mut available_models,
+            None,
+        )
+        .expect("no scope configured");
         assert_eq!(ov, ModelOverride::Explicit(per_call.clone()));
-        let candidates = build_model_candidates(&ov, None, &[], &available_models);
-        assert_eq!(candidates.first(), Some(&per_call), "per-call override is candidate #0");
+        let candidates = build_model_candidates(&ov, None, &[], &available_models, None);
+        assert_eq!(
+            candidates.first(),
+            Some(&per_call),
+            "per-call override is candidate #0"
+        );
         assert!(
             !candidates.contains(&inherited),
             "inheritance must NOT be added when a per-call override is present"
@@ -1491,12 +1814,21 @@ mod tests {
         let inherited = model("together/zai-org/GLM-5.2");
         let persona = model("x");
         let mut available_models: Vec<ModelId> = vec![persona.clone()];
-        let ov =
-            resolve_model_inheritance(None, Some(&persona), Some(&inherited), &mut available_models, None)
-                .expect("no scope configured");
+        let ov = resolve_model_inheritance(
+            None,
+            Some(&persona),
+            Some(&inherited),
+            &mut available_models,
+            None,
+        )
+        .expect("no scope configured");
         assert_eq!(ov, ModelOverride::Inherit);
-        let candidates = build_model_candidates(&ov, Some(&persona), &[], &available_models);
-        assert_eq!(candidates.first(), Some(&persona), "persona model is candidate #0");
+        let candidates = build_model_candidates(&ov, Some(&persona), &[], &available_models, None);
+        assert_eq!(
+            candidates.first(),
+            Some(&persona),
+            "persona model is candidate #0"
+        );
         assert!(
             !candidates.contains(&inherited),
             "inheritance must NOT be added when the persona declares its own model"
@@ -1512,9 +1844,15 @@ mod tests {
         let ov = resolve_model_inheritance(None, None, None, &mut available_models, None)
             .expect("no scope configured");
         assert_eq!(ov, ModelOverride::Inherit);
-        assert_eq!(available_models, fallbacks, "no inherited model may be added when there is no host");
-        let candidates = build_model_candidates(&ov, None, &fallbacks, &available_models);
-        assert_eq!(candidates, fallbacks, "the ladder is exactly the persona fallback list");
+        assert_eq!(
+            available_models, fallbacks,
+            "no inherited model may be added when there is no host"
+        );
+        let candidates = build_model_candidates(&ov, None, &fallbacks, &available_models, None);
+        assert_eq!(
+            candidates, fallbacks,
+            "the ladder is exactly the persona fallback list"
+        );
 
         // ...and with neither a persona model nor fallbacks nor a host, the ladder stays empty (the
         // caller's genuine hard pre-spawn error) — never a spuriously-invented candidate.
@@ -1522,7 +1860,7 @@ mod tests {
         let ov = resolve_model_inheritance(None, None, None, &mut empty_avail, None)
             .expect("no scope configured");
         assert_eq!(ov, ModelOverride::Inherit);
-        assert!(build_model_candidates(&ov, None, &[], &empty_avail).is_empty());
+        assert!(build_model_candidates(&ov, None, &[], &empty_avail, None).is_empty());
     }
 
     // ---------------------------------------------------------------------------------------
@@ -1543,23 +1881,40 @@ mod tests {
     #[test]
     fn out_of_scope_fallback_candidates_warn_without_changing_the_ladder() {
         let primary = model("anthropic/claude-opus-4");
-        let fallbacks = vec![model("openai/gpt-5-nano"), model("anthropic/claude-haiku-4")];
-        let available: Vec<ModelId> =
-            std::iter::once(primary.clone()).chain(fallbacks.iter().cloned()).collect();
+        let fallbacks = vec![
+            model("openai/gpt-5-nano"),
+            model("anthropic/claude-haiku-4"),
+        ];
+        let available: Vec<ModelId> = std::iter::once(primary.clone())
+            .chain(fallbacks.iter().cloned())
+            .collect();
         let scope = armed_scope(&["anthropic/*"]);
 
-        let unpoliced =
-            build_model_candidates(&ModelOverride::Inherit, Some(&primary), &fallbacks, &available);
+        let unpoliced = build_model_candidates(
+            &ModelOverride::Inherit,
+            Some(&primary),
+            &fallbacks,
+            &available,
+            None,
+        );
         let (policed, violations) = build_model_candidates_scoped(
             &ModelOverride::Inherit,
             Some(&primary),
             &fallbacks,
             &available,
+            None,
             Some(&scope),
         );
 
-        assert_eq!(policed, unpoliced, "enforcement must never rewrite or shorten the ladder");
-        assert_eq!(violations.len(), 1, "exactly the one out-of-scope fallback: {violations:?}");
+        assert_eq!(
+            policed, unpoliced,
+            "enforcement must never rewrite or shorten the ladder"
+        );
+        assert_eq!(
+            violations.len(),
+            1,
+            "exactly the one out-of-scope fallback: {violations:?}"
+        );
         assert_eq!(violations[0].model, "openai/gpt-5-nano");
         assert_eq!(
             violations[0].severity,
@@ -1579,10 +1934,14 @@ mod tests {
             Some(&primary),
             &[],
             &available,
+            None,
             Some(&armed_scope(&["anthropic/*"])),
         );
         assert_eq!(candidates, vec![primary]);
-        assert!(violations.is_empty(), "index 0 is the other seam's business: {violations:?}");
+        assert!(
+            violations.is_empty(),
+            "index 0 is the other seam's business: {violations:?}"
+        );
     }
 
     /// The fail-closed half, at the decision boundary: an EXPLICIT out-of-scope model resolves to
@@ -1593,10 +1952,12 @@ mod tests {
         let out = model("openai/gpt-5-nano");
 
         let mut avail = vec![out.clone()];
-        let refused =
-            resolve_model_inheritance(Some(&out), None, None, &mut avail, Some(&scope));
+        let refused = resolve_model_inheritance(Some(&out), None, None, &mut avail, Some(&scope));
         let violation = refused.expect_err("an explicit out-of-scope model must be refused");
-        assert_eq!(violation.severity, crate::exec::model_scope::ModelScopeSeverity::Error);
+        assert_eq!(
+            violation.severity,
+            crate::exec::model_scope::ModelScopeSeverity::Error
+        );
         assert_eq!(
             violation.message,
             "Model 'openai/gpt-5-nano' is outside the configured subagent model scope. Allowed \
@@ -1665,6 +2026,10 @@ mod tests {
             "overloaded",
             "503 Service Unavailable",
             "temporarily unavailable",
+            // `d8d1408d` / `test/unit/model-fallback.test.ts:203-205` @v0.64.0 (SUBA-089)
+            "Connection error",
+            "APIConnectionError: Connection closed.",
+            "Connection reset by peer",
             "connection refused",
             "fetch failed",
             "network error",
@@ -1707,7 +2072,8 @@ mod tests {
     }
 
     #[test]
-    fn bare_http_status_codes_require_a_word_boundary_and_do_not_false_positive_on_larger_numbers() {
+    fn bare_http_status_codes_require_a_word_boundary_and_do_not_false_positive_on_larger_numbers()
+    {
         // pi `/\b429\b/` etc. — a status code embedded in a LARGER number is NOT a rate-limit/5xx
         // signal. The prior bare-substring port wrongly fired on all of these.
         for msg in [
@@ -1723,7 +2089,13 @@ mod tests {
             );
         }
         // ...but a genuine, word-bounded status code still is.
-        for msg in ["HTTP 429", "(429) Too Many", "got 502 from upstream", "-> 503", "504."] {
+        for msg in [
+            "HTTP 429",
+            "(429) Too Many",
+            "got 502 from upstream",
+            "-> 503",
+            "504.",
+        ] {
             assert!(
                 is_retryable_model_failure(Some(msg)),
                 "a word-bounded status code MUST be retryable: {msg}"
@@ -1775,7 +2147,10 @@ mod tests {
             "request timed out",
             "temporarily unavailable",
         ] {
-            assert!(is_retryable_model_failure(Some(msg)), "expected retryable: {msg}");
+            assert!(
+                is_retryable_model_failure(Some(msg)),
+                "expected retryable: {msg}"
+            );
         }
         // `temporar(?:ily)? unavailable` matches "temporarily"/"temporar unavailable" but NOT the
         // "temporary unavailable" spelling (faithful to pi's regex, which has no `y` branch).
@@ -1881,6 +2256,7 @@ mod tests {
             usage,
             timed_out: false,
             detached: false,
+            message_errors: Vec::new(),
             startup: StartupEvidence::default(),
         }
     }
@@ -1893,6 +2269,7 @@ mod tests {
             usage,
             timed_out: false,
             detached: false,
+            message_errors: Vec::new(),
             startup: StartupEvidence::default(),
         }
     }
@@ -1905,6 +2282,7 @@ mod tests {
             usage,
             timed_out: true,
             detached: false,
+            message_errors: Vec::new(),
             startup: StartupEvidence::default(),
         }
     }
@@ -1917,6 +2295,7 @@ mod tests {
             usage,
             timed_out: false,
             detached: true,
+            message_errors: Vec::new(),
             startup: StartupEvidence::default(),
         }
     }
@@ -2034,7 +2413,7 @@ mod tests {
             "the sentinel is a request, never an allowlisted model"
         );
         assert_eq!(
-            build_model_candidates(&resolved, Some(&persona), &[], &available),
+            build_model_candidates(&resolved, Some(&persona), &[], &available, None),
             vec![persona],
             "the child is spawned with `--model <the agent's model>`, never `--model inherit`"
         );
@@ -2059,7 +2438,7 @@ mod tests {
 
         assert_eq!(resolved, ModelOverride::Explicit(parent.clone()));
         assert_eq!(
-            build_model_candidates(&resolved, Some(&persona), &[], &available),
+            build_model_candidates(&resolved, Some(&persona), &[], &available, None),
             vec![parent, persona],
             "the parent model leads; the agent's own model stays as the next rung"
         );
@@ -2083,7 +2462,7 @@ mod tests {
 
         assert_eq!(resolved, ModelOverride::Explicit(persona.clone()));
         assert_eq!(
-            build_model_candidates(&resolved, Some(&persona), &[], &available),
+            build_model_candidates(&resolved, Some(&persona), &[], &available, None),
             vec![persona]
         );
     }
@@ -2113,6 +2492,7 @@ mod tests {
             Some(&sentinel),
             std::slice::from_ref(&fallback),
             &available,
+            None,
         );
         assert_eq!(ladder, vec![parent, fallback]);
         assert!(
@@ -2475,6 +2855,7 @@ mod tests {
             usage: Usage::default(),
             timed_out: false,
             detached: false,
+            message_errors: Vec::new(),
             startup: StartupEvidence {
                 duration_ms: Some(40),
                 error_is_placeholder: true,
@@ -2485,7 +2866,9 @@ mod tests {
 
     #[test]
     fn a_bare_zero_activity_non_zero_exit_is_a_startup_failure() {
-        assert!(is_retryable_subagent_startup_failure(&startup_failure_signal()));
+        assert!(is_retryable_subagent_startup_failure(
+            &startup_failure_signal()
+        ));
     }
 
     /// Every field is a REASON NOT TO RETRY: each of these mutations alone must disqualify it.
@@ -2495,8 +2878,14 @@ mod tests {
     fn any_single_piece_of_evidence_disqualifies_the_startup_retry() {
         type Mutate = Box<dyn Fn(&mut AttemptSignal)>;
         let cases: Vec<(&str, Mutate)> = vec![
-            ("a clean exit", Box::new(|s: &mut AttemptSignal| s.exit_code = Some(0))),
-            ("no exit code at all", Box::new(|s: &mut AttemptSignal| s.exit_code = None)),
+            (
+                "a clean exit",
+                Box::new(|s: &mut AttemptSignal| s.exit_code = Some(0)),
+            ),
+            (
+                "no exit code at all",
+                Box::new(|s: &mut AttemptSignal| s.exit_code = None),
+            ),
             (
                 "a real diagnostic",
                 Box::new(|s: &mut AttemptSignal| {
@@ -2504,9 +2893,18 @@ mod tests {
                     s.startup.error_is_placeholder = false;
                 }),
             ),
-            ("produced output", Box::new(|s: &mut AttemptSignal| s.startup.final_output_present = true)),
-            ("emitted a message", Box::new(|s: &mut AttemptSignal| s.startup.message_count = 1)),
-            ("ran a tool", Box::new(|s: &mut AttemptSignal| s.startup.tool_count = 1)),
+            (
+                "produced output",
+                Box::new(|s: &mut AttemptSignal| s.startup.final_output_present = true),
+            ),
+            (
+                "emitted a message",
+                Box::new(|s: &mut AttemptSignal| s.startup.message_count = 1),
+            ),
+            (
+                "ran a tool",
+                Box::new(|s: &mut AttemptSignal| s.startup.tool_count = 1),
+            ),
             (
                 "burned tokens",
                 Box::new(|s: &mut AttemptSignal| s.usage.input = 1),
@@ -2521,18 +2919,32 @@ mod tests {
                     s.startup.duration_ms = Some(MAX_SUBAGENT_STARTUP_FAILURE_DURATION_MS + 1);
                 }),
             ),
-            ("a protocol violation", Box::new(|s: &mut AttemptSignal| s.startup.protocol_error = true)),
+            (
+                "a protocol violation",
+                Box::new(|s: &mut AttemptSignal| s.startup.protocol_error = true),
+            ),
             (
                 "a signal other than SIGKILL",
-                Box::new(|s: &mut AttemptSignal| s.startup.process_signal = Some("SIGSEGV".to_string())),
+                Box::new(|s: &mut AttemptSignal| {
+                    s.startup.process_signal = Some("SIGSEGV".to_string())
+                }),
             ),
             (
                 "a mutation attempt",
                 Box::new(|s: &mut AttemptSignal| s.startup.observed_mutation_attempt = true),
             ),
-            ("a detach", Box::new(|s: &mut AttemptSignal| s.detached = true)),
-            ("a timeout", Box::new(|s: &mut AttemptSignal| s.timed_out = true)),
-            ("an explicit stop", Box::new(|s: &mut AttemptSignal| s.startup.stopped = true)),
+            (
+                "a detach",
+                Box::new(|s: &mut AttemptSignal| s.detached = true),
+            ),
+            (
+                "a timeout",
+                Box::new(|s: &mut AttemptSignal| s.timed_out = true),
+            ),
+            (
+                "an explicit stop",
+                Box::new(|s: &mut AttemptSignal| s.startup.stopped = true),
+            ),
             (
                 "an exhausted turn budget",
                 Box::new(|s: &mut AttemptSignal| s.startup.turn_budget_exceeded = true),
@@ -2575,5 +2987,223 @@ mod tests {
             "[startup-retry] m1 exited before model or tool activity (attempt 1/4). Retrying the \
              same model in 250ms."
         );
+    }
+
+    /// SUBA-089 — `/connection\s+(?:error|reset|closed|aborted)/i` (`d8d1408d`): `\s+` needs at
+    /// least one whitespace character, any amount is fine, and the alternative must follow the
+    /// run directly; `connection refused` stays its own separate pattern.
+    #[test]
+    fn a_dropped_provider_connection_is_retryable_but_only_across_real_whitespace() {
+        for msg in [
+            "connection   aborted",
+            "Provider: CONNECTION\tCLOSED unexpectedly",
+            "first connection ok, second connection error",
+        ] {
+            assert!(is_retryable_model_failure(Some(msg)), "{msg}");
+        }
+        for msg in [
+            "connectionreset",
+            "connection was reset",
+            "the connection is fine",
+        ] {
+            assert!(!is_retryable_model_failure(Some(msg)), "{msg}");
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // SUBA-089: is_retryable_model_failure_attempt (pi `isRetryableModelFailureAttempt`,
+    // `model-fallback.ts:530-537` @v0.64.0) — the per-attempt gate the ladder consults
+    // ---------------------------------------------------------------------------------------
+
+    /// A failed attempt with explicit activity evidence — the four inputs the upstream predicate
+    /// reads (`{error, messages, toolCount}`; `messages.length` and each `errorMessage`).
+    fn attempt_signal(
+        error: &str,
+        message_count: usize,
+        tool_count: u32,
+        message_errors: &[&str],
+    ) -> AttemptSignal {
+        let mut signal = failed_signal(error, Usage::default());
+        signal.startup.message_count = message_count;
+        signal.startup.tool_count = tool_count;
+        signal.message_errors = message_errors.iter().map(|s| (*s).to_string()).collect();
+        signal
+    }
+
+    /// Upstream's own four cases, verbatim (`test/unit/model-fallback.test.ts:342-345` @v0.64.0,
+    /// "does not retry raw process stderr after child activity").
+    #[test]
+    fn attempt_predicate_matches_upstreams_stderr_after_activity_cases() {
+        let error = "APIConnectionError: Connection closed.";
+        // :342 — a message ran but none reported this error: raw stderr after activity, stop.
+        assert!(!is_retryable_model_failure_attempt(&attempt_signal(
+            error,
+            1,
+            0,
+            &[]
+        )));
+        // :343 — the transcript corroborates the error: advance.
+        assert!(is_retryable_model_failure_attempt(&attempt_signal(
+            error,
+            1,
+            0,
+            &[error]
+        )));
+        // :344 — nothing ran at all: advance.
+        assert!(is_retryable_model_failure_attempt(&attempt_signal(
+            error,
+            0,
+            0,
+            &[]
+        )));
+        // :345 — corroborated, but a tool already ran: stop.
+        assert!(!is_retryable_model_failure_attempt(&attempt_signal(
+            error,
+            1,
+            1,
+            &[error]
+        )));
+    }
+
+    /// `:532` — `toolCount > 0` refuses BEFORE either sentinel or the no-activity clause can say
+    /// yes: even the cold-start sentinel does not re-dispatch a child that ran a tool.
+    #[test]
+    fn attempt_predicate_never_advances_once_a_tool_ran() {
+        for error in [
+            crate::exec::output::EMPTY_OUTPUT_ERROR,
+            "Subagent produced no output after terminal assistant stopReason \"length\".",
+            "429 rate limit",
+            "connection reset by peer",
+        ] {
+            assert!(
+                !is_retryable_model_failure_attempt(&attempt_signal(error, 0, 3, &[error])),
+                "{error}"
+            );
+        }
+    }
+
+    /// `:533` — both empty-output sentinels advance even when the transcript holds messages
+    /// that never reported them (the v0.64.0 form is the second regex; the v0.57.0 gate knew
+    /// only the first literal).
+    #[test]
+    fn attempt_predicate_empty_output_sentinels_advance_despite_messages() {
+        assert!(is_retryable_model_failure_attempt(&attempt_signal(
+            crate::exec::output::EMPTY_OUTPUT_ERROR,
+            2,
+            0,
+            &[]
+        )));
+        assert!(is_retryable_model_failure_attempt(&attempt_signal(
+            "Subagent produced no output after terminal assistant stopReason \"length\".",
+            2,
+            0,
+            &[]
+        )));
+        // The regex is anchored and exact: no trailing period, an empty reason, or a quote
+        // inside the reason is not the sentinel — and with messages present and no
+        // corroborating `errorMessage`, such a string stops the ladder.
+        for not_sentinel in [
+            "Subagent produced no output after terminal assistant stopReason \"length\"",
+            "Subagent produced no output after terminal assistant stopReason \"\".",
+            "Subagent produced no output after terminal assistant stopReason \"a\"b\".",
+            " Subagent produced no output (possible model cold-start or empty response).",
+        ] {
+            assert!(
+                !is_retryable_model_failure_attempt(&attempt_signal(not_sentinel, 2, 0, &[])),
+                "{not_sentinel}"
+            );
+        }
+    }
+
+    /// `:535-536` — the correlation clause trims both sides and ignores role/order; a different
+    /// `errorMessage` does not corroborate.
+    #[test]
+    fn attempt_predicate_correlates_a_trimmed_message_error_message() {
+        assert!(is_retryable_model_failure_attempt(&attempt_signal(
+            "  overloaded  ",
+            3,
+            0,
+            &["unrelated", "overloaded\n"]
+        )));
+        assert!(!is_retryable_model_failure_attempt(&attempt_signal(
+            "overloaded",
+            3,
+            0,
+            &["service unavailable"]
+        )));
+    }
+
+    /// `:531` — a non-retryable text is refused before any activity evidence is read, and an
+    /// absent error is never retryable (pi `isRetryableModelFailure(undefined) === false`).
+    #[test]
+    fn attempt_predicate_still_requires_a_retryable_text() {
+        assert!(!is_retryable_model_failure_attempt(&attempt_signal(
+            "assertion failed: expected 2, got 3",
+            0,
+            0,
+            &[]
+        )));
+        let mut absent = failed_signal("x", Usage::default());
+        absent.error = None;
+        assert!(!is_retryable_model_failure_attempt(&absent));
+    }
+
+    /// The behaviour gap SUBA-089 filed: a child that ran ten mutating tool calls and then hit a
+    /// transient provider error must NOT be re-run from scratch on the next model. RED before the
+    /// port — the ladder gated on the bare text classifier and advanced to `b`.
+    #[tokio::test]
+    async fn retryable_error_after_tools_ran_does_not_advance_the_ladder() {
+        let candidates = vec![model("a"), model("b")];
+        let mut failed = failed_signal("connection reset by peer", usage(10, 0, 0.0));
+        failed.startup.tool_count = 10;
+        failed.startup.message_count = 12;
+        failed.message_errors = vec!["connection reset by peer".to_string()];
+        let mut runner = ScriptedRunner::new(vec![
+            (failed, "attempt-a"),
+            (ok_signal(usage(1, 1, 0.0)), "attempt-b"), // must never be reached
+        ]);
+        let outcome = run_fallback_ladder(&candidates, &mut runner).await;
+
+        assert_eq!(outcome.attempted_models, vec![model("a")]);
+        assert_eq!(
+            runner.calls.len(),
+            1,
+            "a half-completed mutating run must not be re-dispatched on the next model"
+        );
+        let last = outcome.last_signal.expect("some outcome");
+        assert!(!last.success);
+        assert_eq!(last.error.as_deref(), Some("connection reset by peer"));
+    }
+
+    /// The other side of the same gate: a retryable-looking error the child's transcript never
+    /// reported (raw stderr after an assistant turn) also stops the ladder, while the corroborated
+    /// form still advances — so the port is the narrowed v0.64.0 gate, not a blanket refusal.
+    #[tokio::test]
+    async fn uncorroborated_retryable_text_after_messages_stops_but_corroborated_advances() {
+        let candidates = vec![model("a"), model("b")];
+
+        let mut uncorroborated =
+            failed_signal("APIConnectionError: Connection closed.", usage(1, 0, 0.0));
+        uncorroborated.startup.message_count = 1;
+        let mut runner = ScriptedRunner::new(vec![
+            (uncorroborated, "attempt-a"),
+            (ok_signal(usage(1, 1, 0.0)), "attempt-b"),
+        ]);
+        let outcome = run_fallback_ladder(&candidates, &mut runner).await;
+        assert_eq!(outcome.attempted_models, vec![model("a")]);
+        assert_eq!(runner.calls.len(), 1);
+
+        let mut corroborated =
+            failed_signal("APIConnectionError: Connection closed.", usage(1, 0, 0.0));
+        corroborated.startup.message_count = 1;
+        corroborated.message_errors = vec!["APIConnectionError: Connection closed.".to_string()];
+        let mut runner = ScriptedRunner::new(vec![
+            (corroborated, "attempt-a"),
+            (ok_signal(usage(1, 1, 0.0)), "attempt-b"),
+        ]);
+        let outcome = run_fallback_ladder(&candidates, &mut runner).await;
+        assert_eq!(outcome.attempted_models, vec![model("a"), model("b")]);
+        assert_eq!(runner.calls.len(), 2);
+        assert!(outcome.last_signal.expect("some outcome").success);
     }
 }

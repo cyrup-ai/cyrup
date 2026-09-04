@@ -138,7 +138,10 @@ impl OverlaySpan {
     /// An unstyled run.
     #[must_use]
     pub fn raw(text: impl Into<String>) -> Self {
-        Self { text: text.into(), ..Self::default() }
+        Self {
+            text: text.into(),
+            ..Self::default()
+        }
     }
 }
 
@@ -230,13 +233,23 @@ impl OverlayKey {
     /// An unmodified keystroke.
     #[must_use]
     pub fn plain(code: OverlayKeyCode) -> Self {
-        Self { code, ctrl: false, alt: false, shift: false }
+        Self {
+            code,
+            ctrl: false,
+            alt: false,
+            shift: false,
+        }
     }
 
     /// A `Ctrl`-modified keystroke.
     #[must_use]
     pub fn ctrl(code: OverlayKeyCode) -> Self {
-        Self { code, ctrl: true, alt: false, shift: false }
+        Self {
+            code,
+            ctrl: true,
+            alt: false,
+            shift: false,
+        }
     }
 }
 
@@ -277,7 +290,13 @@ pub struct OverlayOptions {
 
 impl Default for OverlayOptions {
     fn default() -> Self {
-        Self { width: None, width_pct: 95, min_width: 60, max_height_pct: 85, margin: 1 }
+        Self {
+            width: None,
+            width_pct: 95,
+            min_width: 60,
+            max_height_pct: 85,
+            margin: 1,
+        }
     }
 }
 
@@ -297,7 +316,6 @@ impl OverlayOptions {
         u16::try_from(capped).unwrap_or(u16::MAX).min(usable).max(1)
     }
 }
-
 
 /// An extension-owned, focus-capturing modal the host paints and feeds keystrokes to — cyrup's
 /// counterpart of pi's `ctx.ui.custom(factory, { overlay: true, … })` `Component`.
@@ -381,7 +399,10 @@ impl CustomOption {
     /// An id-only row.
     #[must_use]
     pub fn new(id: impl Into<String>) -> Self {
-        Self { id: id.into(), label: None }
+        Self {
+            id: id.into(),
+            label: None,
+        }
     }
 
     /// The display text — [`Self::label`] when set, else [`Self::id`].
@@ -468,7 +489,14 @@ impl CustomSpec {
     #[must_use]
     pub fn into_overlay(self) -> (SpecOverlay, Arc<Mutex<Option<String>>>) {
         let result = Arc::new(Mutex::new(None));
-        (SpecOverlay { spec: self, selected: 0, result: Arc::clone(&result) }, result)
+        (
+            SpecOverlay {
+                spec: self,
+                selected: 0,
+                result: Arc::clone(&result),
+            },
+            result,
+        )
     }
 }
 
@@ -485,7 +513,9 @@ pub struct SpecOverlay {
 impl InteractiveOverlay for SpecOverlay {
     fn render(&mut self, _width: usize, _height: usize) -> Vec<OverlayLine> {
         let mut out = Vec::with_capacity(
-            usize::from(self.spec.title.is_some()) + self.spec.lines.len() + self.spec.options.len(),
+            usize::from(self.spec.title.is_some())
+                + self.spec.lines.len()
+                + self.spec.options.len(),
         );
         if let Some(title) = &self.spec.title {
             out.push(OverlayLine::new(vec![OverlaySpan {
@@ -550,7 +580,12 @@ impl InteractiveOverlay for SpecOverlay {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 
@@ -580,7 +615,11 @@ mod tests {
     fn plain_text_concatenates_spans_in_order() {
         let line = OverlayLine::new(vec![
             OverlaySpan::raw("ab"),
-            OverlaySpan { text: "cd".into(), bold: true, ..OverlaySpan::default() },
+            OverlaySpan {
+                text: "cd".into(),
+                bold: true,
+                ..OverlaySpan::default()
+            },
         ]);
         assert_eq!(line.plain_text(), "abcd");
     }
@@ -598,9 +637,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(spec.options[0], CustomOption::new("staging"));
-        assert_eq!(spec.options[0].display(), "staging", "a bare string labels itself");
+        assert_eq!(
+            spec.options[0].display(),
+            "staging",
+            "a bare string labels itself"
+        );
         assert_eq!(spec.options[1].display(), "production");
-        assert_eq!(spec.options[1].id, "prod", "the ID is what comes back, not the label");
+        assert_eq!(
+            spec.options[1].id, "prod",
+            "the ID is what comes back, not the label"
+        );
     }
 
     #[test]
@@ -608,7 +654,10 @@ mod tests {
         // No error arm exists on the WIT return, so every unusable shape lands on the same value.
         for raw in ["null", "{}", "[1,2,3]", r#""just a string""#, "17"] {
             let v: serde_json::Value = serde_json::from_str(raw).unwrap();
-            assert!(CustomSpec::from_json(&v).is_empty(), "{raw} must be declined");
+            assert!(
+                CustomSpec::from_json(&v).is_empty(),
+                "{raw} must be declined"
+            );
         }
         assert!(!CustomSpec::from_json(&serde_json::json!({"lines": ["x"]})).is_empty());
     }
@@ -626,12 +675,22 @@ mod tests {
                 OverlayOutcome::Redraw
             );
         }
-        assert_eq!(ov.handle_key(OverlayKey::plain(OverlayKeyCode::Enter)), OverlayOutcome::Close);
+        assert_eq!(
+            ov.handle_key(OverlayKey::plain(OverlayKeyCode::Enter)),
+            OverlayOutcome::Close
+        );
         assert_eq!(result.lock().unwrap().as_deref(), Some("c"));
 
         let (mut ov, result) = spec.into_overlay();
-        assert_eq!(ov.handle_key(OverlayKey::plain(OverlayKeyCode::Escape)), OverlayOutcome::Close);
-        assert_eq!(result.lock().unwrap().as_deref(), None, "Esc is pi's `done(undefined)`");
+        assert_eq!(
+            ov.handle_key(OverlayKey::plain(OverlayKeyCode::Escape)),
+            OverlayOutcome::Close
+        );
+        assert_eq!(
+            result.lock().unwrap().as_deref(),
+            None,
+            "Esc is pi's `done(undefined)`"
+        );
     }
 
     #[test]
@@ -643,10 +702,20 @@ mod tests {
             OverlayOutcome::Ignored,
             "no options ⇒ nothing to move between"
         );
-        assert_eq!(ov.handle_key(OverlayKey::plain(OverlayKeyCode::Enter)), OverlayOutcome::Close);
-        assert_eq!(result.lock().unwrap().as_deref(), None, "there is no value to carry back");
         assert_eq!(
-            ov.render(40, 10).iter().map(OverlayLine::plain_text).collect::<Vec<_>>(),
+            ov.handle_key(OverlayKey::plain(OverlayKeyCode::Enter)),
+            OverlayOutcome::Close
+        );
+        assert_eq!(
+            result.lock().unwrap().as_deref(),
+            None,
+            "there is no value to carry back"
+        );
+        assert_eq!(
+            ov.render(40, 10)
+                .iter()
+                .map(OverlayLine::plain_text)
+                .collect::<Vec<_>>(),
             vec!["read me".to_string()]
         );
     }

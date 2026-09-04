@@ -896,7 +896,11 @@ fn resolve_step_task(
     task = task.replace("{chain_dir}", &chain_dir_str);
 
     // 5. Wrap in the reads/output/previous-summary instructions.
-    let previous_summary = if template_has_previous { None } else { Some(prev) };
+    let previous_summary = if template_has_previous {
+        None
+    } else {
+        Some(prev)
+    };
     let (prefix, suffix) = build_chain_instructions(
         spec.reads.as_deref(),
         spec.output_path.as_deref(),
@@ -1500,8 +1504,7 @@ async fn run_parallel_group(
     ctx: &ChainRunContext,
     group_results: &mut Vec<GroupStepResult>,
 ) -> Result<StepResult, SubagentError> {
-    let mut resolved_steps: Vec<SingleStepSpec> =
-        Vec::with_capacity(spec.steps.len());
+    let mut resolved_steps: Vec<SingleStepSpec> = Vec::with_capacity(spec.steps.len());
     for s in &spec.steps {
         let task = resolve_step_task(&s.task, registry, ctx, s)?;
         resolved_steps.push(SingleStepSpec {
@@ -1521,12 +1524,16 @@ async fn run_parallel_group(
     // build the aggregated {previous} text.
     let output_names: Vec<Option<String>> =
         resolved_steps.iter().map(|s| s.output.clone()).collect();
-    let agents: Vec<String> =
-        resolved_steps.iter().map(|s| s.agent.clone()).collect();
+    let agents: Vec<String> = resolved_steps.iter().map(|s| s.agent.clone()).collect();
 
-    let group_result =
-        dispatch_group(resolved_steps, spec.concurrency, spec.fail_fast, single, ctx)
-            .await;
+    let group_result = dispatch_group(
+        resolved_steps,
+        spec.concurrency,
+        spec.fail_fast,
+        single,
+        ctx,
+    )
+    .await;
     let collapsed = group_result.aggregate.clone();
     if collapsed.success {
         for (name, child) in output_names.iter().zip(group_result.children.iter()) {
@@ -1534,10 +1541,7 @@ async fn run_parallel_group(
                 register_single_output(registry, Some(name), child_result);
             }
         }
-        registry.set_previous(aggregate_group_previous(
-            &group_result.children,
-            &agents,
-        ));
+        registry.set_previous(aggregate_group_previous(&group_result.children, &agents));
     }
     group_results.push(group_result);
     Ok(collapsed)
@@ -1615,15 +1619,13 @@ async fn run_dynamic_group(
                 "Dynamic chain step {step_display} source array is empty."
             )));
         }
-        let collected: Vec<crate::spawn::dynamic_fanout::DynamicCollectedResult> =
-            Vec::new();
+        let collected: Vec<crate::spawn::dynamic_fanout::DynamicCollectedResult> = Vec::new();
         crate::spawn::dynamic_fanout::validate_dynamic_collection(
             spec.collect_schema.as_ref(),
             &collected,
         )
         .map_err(SubagentError::StructuredOutputInvalid)?;
-        let collected_value =
-            crate::spawn::dynamic_fanout::collected_results_to_value(&collected);
+        let collected_value = crate::spawn::dynamic_fanout::collected_results_to_value(&collected);
         registry.register(spec.collect.clone(), collected_value.clone());
         registry.set_previous("Dynamic fanout produced 0 results.");
         // Keep the one-group-result-per-group-step invariant callers rely on
@@ -1670,8 +1672,7 @@ async fn run_dynamic_group(
                 &entry.item,
             )
             .map_err(SubagentError::StructuredOutputInvalid)?;
-            let resolved =
-                resolve_step_task(&item_task, registry, ctx, spec.template.as_ref())?;
+            let resolved = resolve_step_task(&item_task, registry, ctx, spec.template.as_ref())?;
             expanded.push(SingleStepSpec {
                 skills: None,
                 session_dir: None,
@@ -1689,8 +1690,7 @@ async fn run_dynamic_group(
         // validator-accepted `failFast` key (`dynamic-fanout.ts:44`) silently inert and
         // spawn — and pay for — every remaining item after the first failure.
         let group_result =
-            dispatch_group(expanded, spec.concurrency, spec.fail_fast, single, ctx)
-                .await;
+            dispatch_group(expanded, spec.concurrency, spec.fail_fast, single, ctx).await;
 
         // Fold the per-child results into the ordered collect-record array (pi
         // `collectDynamicResults`, `dynamic-fanout.ts:263-287` @v0.34.0). Every field
@@ -1710,55 +1710,53 @@ async fn run_dynamic_group(
         // the registered `{outputs.<collect.as>}` array carries an explicit `-1`
         // marker per un-run item rather than a `null` exit code. A CANCELLED skip has
         // no upstream analog and is deliberately left as `None` (exit code `null`).
-        let child_inputs: Vec<
-            Option<crate::spawn::dynamic_fanout::CollectChildResult>,
-        > = group_result
-            .children
-            .iter()
-            .enumerate()
-            .map(|(index, child)| match child.as_ref() {
-                Some(sr) => Some(crate::spawn::dynamic_fanout::CollectChildResult {
-                    agent: Some(spec.template.agent.clone()),
-                    exit_code: Some(
-                        sr.exit_code
-                            .map_or_else(|| i64::from(!sr.success), i64::from),
-                    ),
-                    error: sr.error.clone(),
-                    timed_out: sr.timed_out,
-                    structured_output: sr.structured_output.clone(),
-                    artifact_paths: sr.artifact_paths.clone(),
-                    saved_output_path: sr.saved_output_path.clone(),
-                    output: None,
-                    final_output: sr.final_output.clone(),
-                }),
-                None if group_result
-                    .fail_fast_skipped
-                    .get(index)
-                    .copied()
-                    .unwrap_or(false) =>
-                {
-                    Some(crate::spawn::dynamic_fanout::CollectChildResult {
+        let child_inputs: Vec<Option<crate::spawn::dynamic_fanout::CollectChildResult>> =
+            group_result
+                .children
+                .iter()
+                .enumerate()
+                .map(|(index, child)| match child.as_ref() {
+                    Some(sr) => Some(crate::spawn::dynamic_fanout::CollectChildResult {
                         agent: Some(spec.template.agent.clone()),
-                        exit_code: Some(FAIL_FAST_SKIPPED_EXIT_CODE),
-                        error: Some(FAIL_FAST_SKIPPED_ERROR.to_string()),
-                        timed_out: false,
-                        structured_output: None,
-                        artifact_paths: None,
-                        saved_output_path: None,
+                        exit_code: Some(
+                            sr.exit_code
+                                .map_or_else(|| i64::from(!sr.success), i64::from),
+                        ),
+                        error: sr.error.clone(),
+                        timed_out: sr.timed_out,
+                        structured_output: sr.structured_output.clone(),
+                        artifact_paths: sr.artifact_paths.clone(),
+                        saved_output_path: sr.saved_output_path.clone(),
                         output: None,
-                        final_output: None,
-                    })
-                }
-                None => None,
-            })
-            .collect();
+                        final_output: sr.final_output.clone(),
+                    }),
+                    None if group_result
+                        .fail_fast_skipped
+                        .get(index)
+                        .copied()
+                        .unwrap_or(false) =>
+                    {
+                        Some(crate::spawn::dynamic_fanout::CollectChildResult {
+                            agent: Some(spec.template.agent.clone()),
+                            exit_code: Some(FAIL_FAST_SKIPPED_EXIT_CODE),
+                            error: Some(FAIL_FAST_SKIPPED_ERROR.to_string()),
+                            timed_out: false,
+                            structured_output: None,
+                            artifact_paths: None,
+                            saved_output_path: None,
+                            output: None,
+                            final_output: None,
+                        })
+                    }
+                    None => None,
+                })
+                .collect();
         let collected = crate::spawn::dynamic_fanout::collect_dynamic_results(
             &items,
             &child_inputs,
             &spec.template.agent,
         );
-        let collected_value =
-            crate::spawn::dynamic_fanout::collected_results_to_value(&collected);
+        let collected_value = crate::spawn::dynamic_fanout::collected_results_to_value(&collected);
 
         // The dynamic step's own aggregate output IS the collect-record array (pi
         // `outputs[collect.as] = { structured: collected }`), NOT the raw
@@ -1777,10 +1775,7 @@ async fn run_dynamic_group(
             )
             .map_err(SubagentError::StructuredOutputInvalid)?;
             registry.register(spec.collect.clone(), collected_value);
-            registry.set_previous(aggregate_group_previous(
-                &group_result.children,
-                &agents,
-            ));
+            registry.set_previous(aggregate_group_previous(&group_result.children, &agents));
             // SUBA-C14: the GROUP-level gate, run AFTER the collect output is
             // registered and only on the all-children-succeeded path — exactly pi's
             // ordering (`chain-execution.ts:1027-1055`: `outputs[step.collect.as] = …`,
@@ -1788,35 +1783,29 @@ async fn run_dynamic_group(
             // any-child-failed early return at `:998-1018` precedes both). A rejection
             // fails the whole chain with pi's `acceptanceFailureMessage` text, which
             // this walker expresses as a failed `StepResult` (C9 stop-on-failure).
-            let aggregate_children: Vec<
-                crate::exec::acceptance::model::AggregateChild,
-            > = group_result
-                .children
-                .iter()
-                .map(|child| crate::exec::acceptance::model::AggregateChild {
-                    agent: spec.template.agent.clone(),
-                    // The walker's narrow `StepResult` seam carries no per-child
-                    // acceptance ledger (that lives on `exec::SingleResult`, which
-                    // `SingleStepExecutor` deliberately does not surface here), so
-                    // every child reads as pi's `"unreported"` rather than a
-                    // fabricated status.
-                    acceptance: None,
-                    error: child.as_ref().and_then(|sr| sr.error.clone()),
-                    exit_code: child.as_ref().map_or(1, |sr| i32::from(!sr.success)),
-                })
-                .collect();
+            let aggregate_children: Vec<crate::exec::acceptance::model::AggregateChild> =
+                group_result
+                    .children
+                    .iter()
+                    .map(|child| crate::exec::acceptance::model::AggregateChild {
+                        agent: spec.template.agent.clone(),
+                        // The walker's narrow `StepResult` seam carries no per-child
+                        // acceptance ledger (that lives on `exec::SingleResult`, which
+                        // `SingleStepExecutor` deliberately does not surface here), so
+                        // every child reads as pi's `"unreported"` rather than a
+                        // fabricated status.
+                        acceptance: None,
+                        error: child.as_ref().and_then(|sr| sr.error.clone()),
+                        exit_code: child.as_ref().map_or(1, |sr| i32::from(!sr.success)),
+                    })
+                    .collect();
             let notes = format!(
                 "Dynamic fanout collected {} result(s) into {}.",
                 collected.len(),
                 spec.collect
             );
-            if let Some(message) = evaluate_dynamic_group_acceptance(
-                spec,
-                &aggregate_children,
-                &notes,
-                ctx,
-            )
-            .await
+            if let Some(message) =
+                evaluate_dynamic_group_acceptance(spec, &aggregate_children, &notes, ctx).await
             {
                 collapsed = StepResult::failure(message);
             }
@@ -1877,7 +1866,8 @@ async fn evaluate_dynamic_group_acceptance(
     } else {
         spec.template.task.as_str()
     };
-    let effective = AcceptanceContract::resolve_effective(Some(explicit), &spec.template.agent, task);
+    let effective =
+        AcceptanceContract::resolve_effective(Some(explicit), &spec.template.agent, task);
     if effective.is_no_op() {
         return None;
     }
@@ -1926,8 +1916,7 @@ async fn assign_worktree_cwds(
         )
     })?;
 
-    let overrides: Vec<Option<&std::path::Path>> =
-        steps.iter().map(|s| s.cwd.as_deref()).collect();
+    let overrides: Vec<Option<&std::path::Path>> = steps.iter().map(|s| s.cwd.as_deref()).collect();
     let group_id = uuid::Uuid::now_v7().as_simple().to_string();
     let config = crate::spawn::worktree::WorktreeGroupConfig {
         group_id: &group_id,
@@ -1936,8 +1925,7 @@ async fn assign_worktree_cwds(
         setup_hook_timeout_ms: None,
     };
 
-    let plan =
-        crate::spawn::worktree::setup_worktree_group(&ctx.cwd, &overrides, &config).await?;
+    let plan = crate::spawn::worktree::setup_worktree_group(&ctx.cwd, &overrides, &config).await?;
 
     for (step, assignment) in steps.iter_mut().zip(plan.assignments.iter()) {
         step.cwd = Some(assignment.path.clone());
@@ -2015,9 +2003,7 @@ fn collapse_fan_out(fan_out: FanOutResult<StepResult, SubagentError>) -> GroupSt
         })
         .collect();
 
-    let all_populated_and_successful = children
-        .iter()
-        .all(|c| matches!(c, Some(r) if r.success));
+    let all_populated_and_successful = children.iter().all(|c| matches!(c, Some(r) if r.success));
     let success = all_populated_and_successful && !fan_out.any_failed;
 
     let structured_output = Value::Array(
@@ -2034,7 +2020,10 @@ fn collapse_fan_out(fan_out: FanOutResult<StepResult, SubagentError>) -> GroupSt
     let error = if success {
         None
     } else {
-        let failed_or_skipped = children.iter().filter(|c| !matches!(c, Some(r) if r.success)).count();
+        let failed_or_skipped = children
+            .iter()
+            .filter(|c| !matches!(c, Some(r) if r.success))
+            .count();
         Some(format!(
             "{failed_or_skipped} of {} group step(s) failed or were skipped",
             children.len()
@@ -2077,7 +2066,12 @@ fn collapse_fan_out(fan_out: FanOutResult<StepResult, SubagentError>) -> GroupSt
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
 
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2288,8 +2282,14 @@ mod tests {
             .iter()
             .position(|c| c.starts_with("step-3"))
             .expect("present");
-        let p1_pos = calls.iter().position(|c| c.starts_with("p-1")).expect("present");
-        let p2_pos = calls.iter().position(|c| c.starts_with("p-2")).expect("present");
+        let p1_pos = calls
+            .iter()
+            .position(|c| c.starts_with("p-1"))
+            .expect("present");
+        let p2_pos = calls
+            .iter()
+            .position(|c| c.starts_with("p-2"))
+            .expect("present");
         assert!(step3_pos > p1_pos && step3_pos > p2_pos);
         assert!(calls[0].starts_with("step-1"));
     }
@@ -2318,7 +2318,11 @@ mod tests {
             .await
             .expect("walk succeeds");
 
-        assert_eq!(results.len(), 1, "the whole ParallelGroup is one RunnerStep");
+        assert_eq!(
+            results.len(),
+            1,
+            "the whole ParallelGroup is one RunnerStep"
+        );
         assert!(results[0].success);
         assert_eq!(groups.len(), 1);
         assert_eq!(
@@ -2326,7 +2330,12 @@ mod tests {
             3,
             "run_bounded must have produced one slot per group step"
         );
-        assert!(groups[0].children.iter().all(|c| matches!(c, Some(r) if r.success)));
+        assert!(
+            groups[0]
+                .children
+                .iter()
+                .all(|c| matches!(c, Some(r) if r.success))
+        );
 
         let mut calls = executor.calls.lock().expect("lock").clone();
         calls.sort();
@@ -2363,10 +2372,7 @@ mod tests {
                     _ => 0,
                 };
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                Ok(StepResult::success(
-                    Some(resolved_task.to_string()),
-                    None,
-                ))
+                Ok(StepResult::success(Some(resolved_task.to_string()), None))
             }
         }
 
@@ -2466,8 +2472,7 @@ mod tests {
             .expect_err("an unknown output reference must be a hard error");
         match err {
             SubagentError::ChainOutputInvalid(msg) => assert_eq!(
-                msg,
-                "Unknown chain output reference '{outputs.never_registered}'.",
+                msg, "Unknown chain output reference '{outputs.never_registered}'.",
                 "must carry pi's exact ChainOutputValidationError message"
             ),
             other => panic!("expected ChainOutputInvalid, got {other:?}"),
@@ -2479,8 +2484,10 @@ mod tests {
     /// exactly as pi refuses to run a chain with an unknown output binding.
     #[tokio::test]
     async fn walk_chain_fails_before_dispatch_on_an_unknown_output_reference() {
-        let graph: ChainGraph =
-            vec![RunnerStep::SingleStep(single_step("writer", "use {outputs.missing}"))];
+        let graph: ChainGraph = vec![RunnerStep::SingleStep(single_step(
+            "writer",
+            "use {outputs.missing}",
+        ))];
         let executor = Arc::new(RecordingExecutor::default());
         let executor_dyn: Arc<dyn SingleStepExecutor> = executor.clone();
         let cancel = CancelToken::new();
@@ -2538,10 +2545,7 @@ mod tests {
     async fn a_step_reads_previous_from_the_prior_step() {
         let step1 = single_step("step1", "produce output");
         let step2 = single_step("step2", "{previous}");
-        let graph: ChainGraph = vec![
-            RunnerStep::SingleStep(step1),
-            RunnerStep::SingleStep(step2),
-        ];
+        let graph: ChainGraph = vec![RunnerStep::SingleStep(step1), RunnerStep::SingleStep(step2)];
         let executor = Arc::new(RecordingExecutor::default());
         let executor_dyn: Arc<dyn SingleStepExecutor> = executor.clone();
         executor.final_output_for.lock().expect("lock").insert(
@@ -2578,10 +2582,7 @@ mod tests {
     async fn the_previous_summary_is_appended_when_the_template_has_no_previous_placeholder() {
         let step1 = single_step("step1", "produce");
         let step2 = single_step("step2", "do more work");
-        let graph: ChainGraph = vec![
-            RunnerStep::SingleStep(step1),
-            RunnerStep::SingleStep(step2),
-        ];
+        let graph: ChainGraph = vec![RunnerStep::SingleStep(step1), RunnerStep::SingleStep(step2)];
         let executor = Arc::new(RecordingExecutor::default());
         let executor_dyn: Arc<dyn SingleStepExecutor> = executor.clone();
         executor
@@ -2610,8 +2611,10 @@ mod tests {
     /// templates` — `chain-execution.test.ts:879-897`).
     #[tokio::test]
     async fn substitutes_task_placeholder_with_the_original_task() {
-        let graph: ChainGraph =
-            vec![RunnerStep::SingleStep(single_step("worker", "Review {task} carefully"))];
+        let graph: ChainGraph = vec![RunnerStep::SingleStep(single_step(
+            "worker",
+            "Review {task} carefully",
+        ))];
         let executor = Arc::new(RecordingExecutor::default());
         let executor_dyn: Arc<dyn SingleStepExecutor> = executor.clone();
         let cancel = CancelToken::new();
@@ -2635,8 +2638,10 @@ mod tests {
     #[tokio::test]
     async fn substitutes_chain_dir_placeholder() {
         let chain_dir = std::env::temp_dir().join("cyrup-chain-dir-marker");
-        let graph: ChainGraph =
-            vec![RunnerStep::SingleStep(single_step("worker", "Write to {chain_dir}"))];
+        let graph: ChainGraph = vec![RunnerStep::SingleStep(single_step(
+            "worker",
+            "Write to {chain_dir}",
+        ))];
         let executor = Arc::new(RecordingExecutor::default());
         let executor_dyn: Arc<dyn SingleStepExecutor> = executor.clone();
         let cancel = CancelToken::new();
@@ -2680,7 +2685,8 @@ mod tests {
 
         // No reads/output/previous → empty prefix and suffix, and a blank previous summary is
         // dropped (pi's `previousSummary.trim()` guard).
-        let (prefix, suffix) = build_chain_instructions(None, None, Path::new("/chain"), Some("   "));
+        let (prefix, suffix) =
+            build_chain_instructions(None, None, Path::new("/chain"), Some("   "));
         assert_eq!(prefix, "");
         assert_eq!(suffix, "");
     }
@@ -2716,7 +2722,10 @@ mod tests {
             chain_dir.path(),
             None,
         );
-        assert_eq!(none_exist, "", "an all-missing reads list emits no read line at all");
+        assert_eq!(
+            none_exist, "",
+            "an all-missing reads list emits no read line at all"
+        );
     }
 
     /// SUBA-053 — pi `expandHomePath` + `resolveChainPath` (`shared/settings.ts:341-354` @v0.47.1,
@@ -2786,9 +2795,16 @@ mod tests {
             .await
             .expect("walk itself returns Ok; the step failure is carried in the StepResult");
 
-        assert_eq!(results.len(), 1, "only step1 should have run before the chain halted");
+        assert_eq!(
+            results.len(),
+            1,
+            "only step1 should have run before the chain halted"
+        );
         assert!(!results[0].success, "step1's failure must be recorded");
-        assert!(results[0].error.is_some(), "the failed step carries its error summary");
+        assert!(
+            results[0].error.is_some(),
+            "the failed step carries its error summary"
+        );
         let calls = executor.calls.lock().expect("lock").clone();
         assert_eq!(calls.len(), 1);
         assert!(
@@ -3092,7 +3108,10 @@ mod tests {
         let executor_dyn: Arc<dyn SingleStepExecutor> = executor.clone();
         let ctx = run_ctx(CancelToken::new());
         let mut registry = OutputRegistry::new();
-        registry.register("targets", serde_json::json!([{ "path": "a" }, { "path": "b" }]));
+        registry.register(
+            "targets",
+            serde_json::json!([{ "path": "a" }, { "path": "b" }]),
+        );
 
         let err = walk_chain(&graph, &mut registry, &executor_dyn, &ctx)
             .await
@@ -3135,7 +3154,10 @@ mod tests {
             ..run_ctx(CancelToken::new())
         };
         let mut registry = OutputRegistry::new();
-        registry.register("targets", serde_json::json!([{ "path": "a" }, { "path": "b" }]));
+        registry.register(
+            "targets",
+            serde_json::json!([{ "path": "a" }, { "path": "b" }]),
+        );
 
         let err = walk_chain(&graph, &mut registry, &executor_dyn, &ctx)
             .await
@@ -3166,7 +3188,10 @@ mod tests {
         let executor_dyn: Arc<dyn SingleStepExecutor> = executor.clone();
         let ctx = run_ctx(CancelToken::new());
         let mut registry = OutputRegistry::new();
-        registry.register("targets", serde_json::json!([{ "path": "x" }, { "path": "x" }]));
+        registry.register(
+            "targets",
+            serde_json::json!([{ "path": "x" }, { "path": "x" }]),
+        );
 
         let err = walk_chain(&graph, &mut registry, &executor_dyn, &ctx)
             .await
@@ -3194,7 +3219,10 @@ mod tests {
         let ctx = run_ctx(CancelToken::new());
         let mut registry = OutputRegistry::new();
         // "a/b" and "a-b" are distinct keys that normalize to the same id.
-        registry.register("targets", serde_json::json!([{ "path": "a/b" }, { "path": "a-b" }]));
+        registry.register(
+            "targets",
+            serde_json::json!([{ "path": "a/b" }, { "path": "a-b" }]),
+        );
 
         let err = walk_chain(&graph, &mut registry, &executor_dyn, &ctx)
             .await
@@ -3259,7 +3287,10 @@ mod tests {
         let mut registry = OutputRegistry::new();
         // Two identical paths: over-limit (2 > 1) AND duplicate key AND colliding id — every
         // item-resolution diagnostic is also live, yet the template error must win.
-        registry.register("targets", serde_json::json!([{ "path": "x" }, { "path": "x" }]));
+        registry.register(
+            "targets",
+            serde_json::json!([{ "path": "x" }, { "path": "x" }]),
+        );
 
         let err = walk_chain(&graph, &mut registry, &executor_dyn, &ctx)
             .await
@@ -3305,11 +3336,16 @@ mod tests {
             .get("reviews")
             .and_then(|entry| entry.structured.clone())
             .expect("collect output registered as a structured value");
-        let records = collected.as_array().expect("collect output is a JSON array");
+        let records = collected
+            .as_array()
+            .expect("collect output is a JSON array");
         assert_eq!(records.len(), 2);
         assert_eq!(records[0]["key"], serde_json::json!("src/a.ts"));
         assert_eq!(records[0]["index"], serde_json::json!(0));
-        assert_eq!(records[0]["item"], serde_json::json!({ "path": "src/a.ts" }));
+        assert_eq!(
+            records[0]["item"],
+            serde_json::json!({ "path": "src/a.ts" })
+        );
         assert_eq!(records[0]["agent"], serde_json::json!("reviewer"));
         assert_eq!(records[0]["exitCode"], serde_json::json!(0));
         assert_eq!(records[0]["text"], serde_json::json!("ok"));
@@ -3603,7 +3639,9 @@ mod tests {
         registry.register("obj", serde_json::json!({ "k": 1 }));
         registry.register("s", serde_json::json!("hi"));
         assert_eq!(
-            registry.resolve("{outputs.obj} {outputs.s}").expect("registered"),
+            registry
+                .resolve("{outputs.obj} {outputs.s}")
+                .expect("registered"),
             "{\"k\":1} \"hi\""
         );
     }

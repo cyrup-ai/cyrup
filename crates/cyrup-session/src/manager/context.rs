@@ -8,9 +8,7 @@
 use cyrup_core::{EntryId, Message, ModelRef};
 
 use crate::agent_message::AgentMessage;
-use crate::context::{
-    build_context_agent_messages_tagged, build_context_messages, SessionContext,
-};
+use crate::context::{SessionContext, build_context_agent_messages_tagged, build_context_messages};
 use crate::entry::{Entry, KnownEntry};
 
 use super::SessionManager;
@@ -30,14 +28,19 @@ impl SessionManager {
                     KnownEntry::ThinkingLevelChange { thinking_level, .. } => {
                         thinking = thinking_level.clone();
                     }
-                    KnownEntry::ModelChange { provider, model_id, .. } => {
+                    KnownEntry::ModelChange {
+                        provider, model_id, ..
+                    } => {
                         model = Some(ModelRef {
                             provider: provider.clone(),
                             api: None,
                             model: model_id.clone(),
                         });
                     }
-                    KnownEntry::Message { message: AgentMessage::Core(Message::Assistant(a)), .. } => {
+                    KnownEntry::Message {
+                        message: AgentMessage::Core(Message::Assistant(a)),
+                        ..
+                    } => {
                         model = Some(a.model_ref());
                     }
                     _ => {}
@@ -46,7 +49,11 @@ impl SessionManager {
         }
 
         let messages = build_context_messages(&path);
-        SessionContext { messages, thinking_level: thinking, model }
+        SessionContext {
+            messages,
+            thinking_level: thinking,
+            model,
+        }
     }
 
     /// The active-path context with its **roles intact** — Pi's
@@ -67,7 +74,10 @@ impl SessionManager {
     /// drops it only in `convertToLlm`), which is why the user still sees their own `!!` command
     /// after a resume.
     pub fn build_context_raw(&self) -> Vec<AgentMessage> {
-        self.build_context_raw_tagged().into_iter().map(|(_, m)| m).collect()
+        self.build_context_raw_tagged()
+            .into_iter()
+            .map(|(_, m)| m)
+            .collect()
     }
 
     /// [`build_context_raw`](Self::build_context_raw), with each message paired with the

@@ -103,8 +103,8 @@ use crate::errors::{McpError, McpResult};
 // and so this section still reads as the place `utils.ts` landed.
 
 pub use crate::secrets::{
-    interpolate_env_vars, interpolate_env_vars_with, interpolate_secret_expression,
-    resolve_command_secret, COMMAND_SECRET_MAX_OUTPUT_BYTES, COMMAND_SECRET_TIMEOUT,
+    COMMAND_SECRET_MAX_OUTPUT_BYTES, COMMAND_SECRET_TIMEOUT, interpolate_env_vars,
+    interpolate_env_vars_with, interpolate_secret_expression, resolve_command_secret,
 };
 
 // ===================================================================================================
@@ -403,7 +403,10 @@ pub fn parse_oauth_redirect_uri(redirect_uri: &str) -> McpResult<RedirectEndpoin
         .map_err(|_| McpError::other(format!("Invalid OAuth redirectUri: {redirect_uri}")))?;
 
     let hostname = url.host_str().unwrap_or_default().to_lowercase();
-    let is_localhost = matches!(hostname.as_str(), "localhost" | "127.0.0.1" | "[::1]" | "::1");
+    let is_localhost = matches!(
+        hostname.as_str(),
+        "localhost" | "127.0.0.1" | "[::1]" | "::1"
+    );
     if url.scheme() != "http" || !is_localhost {
         return Err(McpError::other(
             "OAuth redirectUri must be an http:// localhost or loopback URI",
@@ -725,10 +728,8 @@ const LOOPBACK_BIND_HOST: &str = "127.0.0.1";
 /// `CYRUP_MCP_OAUTH_CALLBACK_PORT`, then `MCP_OAUTH_CALLBACK_PORT` — the workspace's standing
 /// rename convention for pi's env names (`cyrup_provider::auth::oauth::callback::callback_host`
 /// applies the identical two-name ladder).
-pub const CALLBACK_PORT_VARS: [&str; 2] = [
-    "CYRUP_MCP_OAUTH_CALLBACK_PORT",
-    "MCP_OAUTH_CALLBACK_PORT",
-];
+pub const CALLBACK_PORT_VARS: [&str; 2] =
+    ["CYRUP_MCP_OAUTH_CALLBACK_PORT", "MCP_OAUTH_CALLBACK_PORT"];
 
 /// `getConfiguredOAuthCallbackPort()` (`mcp-oauth-provider.ts:88`).
 ///
@@ -825,7 +826,10 @@ impl CallbackMaps {
     }
 
     fn pending_count(&self) -> usize {
-        self.inner.lock().map(|maps| maps.pending.len()).unwrap_or(0)
+        self.inner
+            .lock()
+            .map(|maps| maps.pending.len())
+            .unwrap_or(0)
     }
 }
 
@@ -907,9 +911,7 @@ impl cyrup_provider::auth::oauth::callback::CallbackHandler for CallbackMultiple
             // gets `?error=access_denied` on the headless path can retry the same state and still
             // be served by branch 7.
             let message = error_description.unwrap_or(error);
-            if is_pending
-                && let Ok(mut maps) = self.maps.inner.lock()
-            {
+            if is_pending && let Ok(mut maps) = self.maps.inner.lock() {
                 maps.reserved.remove(&state);
                 if let Some(pending) = maps.pending.remove(&state) {
                     // The rejection carries the RAW provider text; only the served HTML is
@@ -955,7 +957,9 @@ impl cyrup_provider::auth::oauth::callback::CallbackHandler for CallbackMultiple
         if let Ok(mut maps) = self.maps.inner.lock()
             && let Some(pending) = maps.pending.remove(&state)
         {
-            let _ = pending.sender.send(Ok(AuthorizationCodeInput { code, iss }));
+            let _ = pending
+                .sender
+                .send(Ok(AuthorizationCodeInput { code, iss }));
         }
         CallbackOutcome::Continue {
             reply: CallbackReply::new(200, html_success()),
@@ -1228,7 +1232,9 @@ pub fn release_callback_server(oauth_state: &str) {
 /// event loop open) where the flow-side abandon timer is. Here both are detached tokio tasks and
 /// neither holds the process open, which is the stronger of the two guarantees and the one
 /// MCP-308's process-exit test asserts.
-pub fn wait_for_callback(oauth_state: &str) -> oneshot::Receiver<McpResult<AuthorizationCodeInput>> {
+pub fn wait_for_callback(
+    oauth_state: &str,
+) -> oneshot::Receiver<McpResult<AuthorizationCodeInput>> {
     let runtime = callback_runtime();
     let (sender, receiver) = oneshot::channel();
     if let Ok(mut maps) = runtime.maps.inner.lock() {
@@ -1303,9 +1309,7 @@ pub async fn stop_callback_server() {
 
     future.await;
 
-    if is_owner
-        && let Ok(mut guard) = runtime.stopping.lock()
-    {
+    if is_owner && let Ok(mut guard) = runtime.stopping.lock() {
         *guard = None;
     }
 }
@@ -1515,7 +1519,11 @@ impl McpOAuthStorage for InMemoryOAuthStorage {
             return Ok(());
         };
         let entry = entries.entry(server_name.to_string()).or_default();
-        if entry.server_url.as_deref().is_some_and(|url| url != server_url) {
+        if entry
+            .server_url
+            .as_deref()
+            .is_some_and(|url| url != server_url)
+        {
             // The sibling-purge rule: a stale client record from a previous authorization server
             // must never be paired with a new one.
             entry.client = None;
@@ -1535,7 +1543,11 @@ impl McpOAuthStorage for InMemoryOAuthStorage {
             return Ok(());
         };
         let entry = entries.entry(server_name.to_string()).or_default();
-        if entry.server_url.as_deref().is_some_and(|url| url != server_url) {
+        if entry
+            .server_url
+            .as_deref()
+            .is_some_and(|url| url != server_url)
+        {
             entry.credentials = None;
         }
         entry.server_url = Some(server_url.to_string());
@@ -1692,9 +1704,7 @@ pub fn project_tokens(stored: &StoredCredentials) -> Option<McpTokens> {
         .get("scope")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
-        .or_else(|| {
-            (!stored.granted_scopes.is_empty()).then(|| stored.granted_scopes.join(" "))
-        });
+        .or_else(|| (!stored.granted_scopes.is_empty()).then(|| stored.granted_scopes.join(" ")));
     Some(McpTokens {
         access_token,
         refresh_token,
@@ -2333,7 +2343,9 @@ pub fn add_authorization_params(
 
     for (key, value) in params {
         let reserved = RESERVED_AUTHORIZATION_PARAMS.contains(&key.as_str());
-        let present = url.query_pairs().any(|(existing, _)| existing == key.as_str());
+        let present = url
+            .query_pairs()
+            .any(|(existing, _)| existing == key.as_str());
         if reserved || present {
             return Err(McpError::other(format!(
                 "OAuth authorizationParams.{key} cannot override an authorization flow parameter"
@@ -2953,8 +2965,14 @@ pub async fn start_auth(
             // Step 14 — the catch-all. Deactivate, then clear the pending auth; a failing cleanup
             // becomes an aggregate rather than hiding the primary error.
             release_callback_server(&bind_state);
-            if let Err(cleanup) =
-                clear_pending_auth(&runtime, server_name, Some(&bind_state), &base_dir, Some(&storage)).await
+            if let Err(cleanup) = clear_pending_auth(
+                &runtime,
+                server_name,
+                Some(&bind_state),
+                &base_dir,
+                Some(&storage),
+            )
+            .await
             {
                 return Err(aggregate_error(PHASE_STARTUP_CLEANUP, error, cleanup));
             }
@@ -3036,8 +3054,10 @@ async fn start_auth_inner(
     };
 
     // Step 12 — the URL rmcp built, decorated with the configured extras (MCP-316).
-    let authorization_url =
-        add_authorization_params(prepared.session.get_authorization_url(), config.authorization_params.as_ref())?;
+    let authorization_url = add_authorization_params(
+        prepared.session.get_authorization_url(),
+        config.authorization_params.as_ref(),
+    )?;
 
     // Persist the registration record rmcp's `StoredCredentials` drops (MCP-290/MCP-314). The
     // `redirect_uris` entry is what step 9's stale check reads on the next login.
@@ -3064,9 +3084,8 @@ async fn start_auth_inner(
     // The reservation moves from this module's nonce onto rmcp's CSRF token, which is what the
     // browser will actually send back. Nothing can arrive on either state in between: no browser
     // has been opened yet.
-    let oauth_state = csrf_token_of(&authorization_url).ok_or_else(|| {
-        McpError::other("OAuth authorization URL was not provided")
-    })?;
+    let oauth_state = csrf_token_of(&authorization_url)
+        .ok_or_else(|| McpError::other("OAuth authorization URL was not provided"))?;
     release_callback_server(bind_state);
     reserve_callback_server(&oauth_state);
 
@@ -3396,9 +3415,14 @@ pub async fn complete_auth(
     if keep_pending_for_retry {
         return outcome;
     }
-    let cleanup =
-        clear_pending_auth(&runtime, server_name, oauth_state.as_deref(), &base_dir, Some(&options.storage))
-            .await;
+    let cleanup = clear_pending_auth(
+        &runtime,
+        server_name,
+        oauth_state.as_deref(),
+        &base_dir,
+        Some(&options.storage),
+    )
+    .await;
     match (outcome, cleanup) {
         (Ok(status), Ok(())) => Ok(status),
         // The body succeeded and only the cleanup failed: rethrow the cleanup error alone.
@@ -3512,8 +3536,7 @@ async fn authenticate_inner(
     flow_options.runtime = Some(Arc::clone(runtime));
     flow_options.signal = Some(signal.clone());
 
-    let authorization_url =
-        start_auth(server_name, server_url, definition, &flow_options).await?;
+    let authorization_url = start_auth(server_name, server_url, definition, &flow_options).await?;
     if authorization_url.is_empty() {
         // An empty URL means a live refresh already sufficed.
         return Ok(AuthStatus::Authenticated);
@@ -3598,8 +3621,14 @@ async fn authenticate_inner(
             if let Some(state_value) = oauth_state.as_deref() {
                 cancel_pending_callback(state_value);
             }
-            if let Err(cleanup) =
-                clear_pending_auth(runtime, server_name, oauth_state.as_deref(), &base_dir, Some(&options.storage)).await
+            if let Err(cleanup) = clear_pending_auth(
+                runtime,
+                server_name,
+                oauth_state.as_deref(),
+                &base_dir,
+                Some(&options.storage),
+            )
+            .await
             {
                 return Err(aggregate_error(PHASE_CANCELLATION_CLEANUP, error, cleanup));
             }
@@ -3816,8 +3845,14 @@ pub async fn remove_auth(server_name: &str, options: &AuthenticateOptions) -> Mc
     if let Some(state_value) = oauth_state.as_deref() {
         cancel_pending_callback(state_value);
     }
-    clear_pending_auth(&runtime, server_name, oauth_state.as_deref(), &base_dir, Some(&options.storage))
-        .await?;
+    clear_pending_auth(
+        &runtime,
+        server_name,
+        oauth_state.as_deref(),
+        &base_dir,
+        Some(&options.storage),
+    )
+    .await?;
     throw_if_aborted(&signal, None)?;
     options.storage.clear_all(server_name).await?;
     clear_persisted_oauth_state(&options.storage, server_name).await?;
@@ -4041,7 +4076,10 @@ mod tests {
             "one/two/three"
         );
         // A missing variable expands to the empty string, in every form.
-        assert_eq!(interpolate_env_vars_with("[${Z}][$env:Z][{env:Z}]", lookup), "[][][]");
+        assert_eq!(
+            interpolate_env_vars_with("[${Z}][$env:Z][{env:Z}]", lookup),
+            "[][][]"
+        );
     }
 
     #[test]
@@ -4068,11 +4106,15 @@ mod tests {
             "hunter2"
         );
         assert_eq!(
-            resolve_command_secret("!false", "ctx").unwrap_err().to_string(),
+            resolve_command_secret("!false", "ctx")
+                .unwrap_err()
+                .to_string(),
             "Failed to resolve ctx: command exited with code 1"
         );
         assert_eq!(
-            resolve_command_secret("!true", "ctx").unwrap_err().to_string(),
+            resolve_command_secret("!true", "ctx")
+                .unwrap_err()
+                .to_string(),
             "Failed to resolve ctx: command returned empty output"
         );
         // stderr is discarded, so a stderr-only command reads as empty output and the text is
@@ -4164,7 +4206,10 @@ mod tests {
             ..OAuthConfig::default()
         });
         assert_eq!(
-            extract_oauth_config(&entry).unwrap().client_secret.as_deref(),
+            extract_oauth_config(&entry)
+                .unwrap()
+                .client_secret
+                .as_deref(),
             Some("!op read op://x/y")
         );
     }
@@ -4175,7 +4220,9 @@ mod tests {
         let mut block = IndexMap::new();
         block.insert("clientId".to_string(), RawJson::Number(7.into()));
         assert_eq!(
-            validate_oauth_block(&RawJson::Object(block)).unwrap_err().to_string(),
+            validate_oauth_block(&RawJson::Object(block))
+                .unwrap_err()
+                .to_string(),
             "OAuth clientId must be a string"
         );
 
@@ -4185,7 +4232,9 @@ mod tests {
             RawJson::Array(vec![RawJson::Bool(true)]),
         );
         assert_eq!(
-            validate_oauth_block(&RawJson::Object(block)).unwrap_err().to_string(),
+            validate_oauth_block(&RawJson::Object(block))
+                .unwrap_err()
+                .to_string(),
             "OAuth authorizationParams must be an object"
         );
 
@@ -4194,7 +4243,9 @@ mod tests {
         let mut block = IndexMap::new();
         block.insert("authorizationParams".to_string(), RawJson::Object(params));
         assert_eq!(
-            validate_oauth_block(&RawJson::Object(block)).unwrap_err().to_string(),
+            validate_oauth_block(&RawJson::Object(block))
+                .unwrap_err()
+                .to_string(),
             "OAuth authorizationParams.prompt must be a string"
         );
 
@@ -4204,7 +4255,9 @@ mod tests {
             RawJson::String("yes".to_string()),
         );
         assert_eq!(
-            validate_oauth_block(&RawJson::Object(block)).unwrap_err().to_string(),
+            validate_oauth_block(&RawJson::Object(block))
+                .unwrap_err()
+                .to_string(),
             "OAuth skipIssuerMetadataValidation must be a boolean"
         );
 
@@ -4260,7 +4313,9 @@ mod tests {
     #[test]
     fn redirect_uri_checks_run_in_upstream_order() {
         assert_eq!(
-            parse_oauth_redirect_uri("not a url").unwrap_err().to_string(),
+            parse_oauth_redirect_uri("not a url")
+                .unwrap_err()
+                .to_string(),
             "Invalid OAuth redirectUri: not a url"
         );
         // A non-loopback URL that ALSO carries a fragment reports the loopback error.
@@ -4390,9 +4445,11 @@ mod tests {
         assert_eq!(from_url.iss.as_deref(), Some("https://as"));
 
         // Fragment parameters are merged when the query does not already carry them.
-        let merged =
-            parse_authorization_redirect_input("http://localhost:1/cb?state=s1#code=frag", Some("s1"))
-                .unwrap();
+        let merged = parse_authorization_redirect_input(
+            "http://localhost:1/cb?state=s1#code=frag",
+            Some("s1"),
+        )
+        .unwrap();
         assert_eq!(merged.code, "frag");
 
         // A bare query string is accepted only when it looks like a callback.
@@ -4404,12 +4461,16 @@ mod tests {
         );
         // A bare code.
         assert_eq!(
-            parse_authorization_redirect_input("A1b2-c3_d4~e5.f6", None).unwrap().code,
+            parse_authorization_redirect_input("A1b2-c3_d4~e5.f6", None)
+                .unwrap()
+                .code,
             "A1b2-c3_d4~e5.f6"
         );
 
         assert_eq!(
-            parse_authorization_redirect_input("   ", None).unwrap_err().to_string(),
+            parse_authorization_redirect_input("   ", None)
+                .unwrap_err()
+                .to_string(),
             "Authorization code or redirect URL is required"
         );
         assert_eq!(
@@ -4826,8 +4887,11 @@ mod tests {
         assert!(body.contains("Invalid or expired state parameter"));
 
         // Branch 3 — an error for an unknown state does NOT reflect error_description.
-        let (status, body) =
-            get(port, "/callback?state=nope&error=bad&error_description=REFLECTED").await;
+        let (status, body) = get(
+            port,
+            "/callback?state=nope&error=bad&error_description=REFLECTED",
+        )
+        .await;
         assert_eq!(status, 400);
         assert!(!body.contains("REFLECTED"));
         assert!(body.contains("Invalid or expired state parameter"));
@@ -4843,8 +4907,7 @@ mod tests {
         assert!(body.contains("Authorization Received"));
 
         // Branch 4 against a merely reserved state: the reservation SURVIVES.
-        let (status, body) =
-            get(port, "/callback?state=reserved-1&error=access_denied").await;
+        let (status, body) = get(port, "/callback?state=reserved-1&error=access_denied").await;
         assert_eq!(status, 200);
         assert!(body.contains("access_denied"));
         let (status, _) = get(port, "/callback?state=reserved-1&code=abc").await;
@@ -4873,13 +4936,20 @@ mod tests {
         .await
         .unwrap_err()
         .to_string();
-        assert!(refused.contains("but callback path /other is required"), "{refused}");
+        assert!(
+            refused.contains("but callback path /other is required"),
+            "{refused}"
+        );
 
         // MCP-308 — promote the reservation, then branch 8.
         assert_eq!(pending_callback_count(), 0);
         let waiter = wait_for_callback("reserved-1");
         assert_eq!(pending_callback_count(), 1);
-        let (status, body) = get(port, "/callback?state=reserved-1&code=THE-CODE&iss=https%3A%2F%2Fas").await;
+        let (status, body) = get(
+            port,
+            "/callback?state=reserved-1&code=THE-CODE&iss=https%3A%2F%2Fas",
+        )
+        .await;
         assert_eq!(status, 200);
         assert!(body.contains("Authorization Successful"));
         assert!(body.contains("window.close()"));
@@ -4988,11 +5058,7 @@ mod tests {
         let storage: Arc<dyn McpOAuthStorage> =
             Arc::new(InMemoryOAuthStorage::new(PathBuf::from("/base")));
         storage
-            .save_client(
-                "acme",
-                "https://x/mcp",
-                Some(StoredClientInfo::new("cid")),
-            )
+            .save_client("acme", "https://x/mcp", Some(StoredClientInfo::new("cid")))
             .await
             .unwrap();
 

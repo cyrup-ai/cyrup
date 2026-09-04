@@ -25,11 +25,11 @@
 use std::sync::{Arc, Mutex};
 
 use cyrup_core::{
-    TerminateHint,
-    CancelToken, Content, Message, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink,
+    CancelToken, Content, Message, TerminateHint, Tool, ToolCallId, ToolError, ToolResult,
+    ToolUpdateSink,
 };
 use cyrup_permission_system::PermissionSystemExtension;
-use cyrup_test_support::{create_harness, FauxResponse, HarnessOptions, TestTempDir};
+use cyrup_test_support::{FauxResponse, HarnessOptions, TestTempDir, create_harness};
 
 /// A `bash` test double that records what it executed. Nothing should ever reach it here — every
 /// scenario below is denied by policy — but recording is the ground truth that the gate really
@@ -69,9 +69,15 @@ impl Tool for RecordingBash {
         _cancel: CancelToken,
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
-        let command =
-            params.get("command").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
-        self.executed.lock().unwrap_or_else(|e| e.into_inner()).push(command);
+        let command = params
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        self.executed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(command);
         Ok(ToolResult {
             content: vec![Content::text("EXECUTED")],
             details: None,
@@ -84,10 +90,7 @@ impl Tool for RecordingBash {
 /// Run one scripted `bash` tool call carrying `input` under `policy`, through a real session with
 /// the permission extension registered. Returns every `is_error` tool-result text the model saw,
 /// plus whatever the recording tool executed.
-async fn denied_reasons_for(
-    policy: &str,
-    input: serde_json::Value,
-) -> (Vec<String>, Vec<String>) {
+async fn denied_reasons_for(policy: &str, input: serde_json::Value) -> (Vec<String>, Vec<String>) {
     let agent_dir = TestTempDir::new().unwrap();
     std::fs::write(agent_dir.path().join("cyrup-permissions.jsonc"), policy).unwrap();
 
@@ -99,7 +102,10 @@ async fn denied_reasons_for(
     ));
 
     let options = HarnessOptions {
-        responses: vec![FauxResponse::tool_call("bash", input), FauxResponse::text("done")],
+        responses: vec![
+            FauxResponse::tool_call("bash", input),
+            FauxResponse::text("done"),
+        ],
         queue_responses: true,
         tools: vec![bash],
         native_extensions: vec![ext],
@@ -114,7 +120,11 @@ async fn denied_reasons_for(
         .await
         .iter()
         .filter_map(|m| match m {
-            Message::ToolResult { is_error: true, content, .. } => Some(
+            Message::ToolResult {
+                is_error: true,
+                content,
+                ..
+            } => Some(
                 content
                     .iter()
                     .filter_map(|c| match c {
@@ -149,7 +159,9 @@ async fn deny_reason_omits_an_empty_bash_command() {
     )
     .await;
     assert!(
-        control.iter().any(|r| r.contains("command 'curl http://evil.example'")),
+        control
+            .iter()
+            .any(|r| r.contains("command 'curl http://evil.example'")),
         "control: a non-empty bash command must still be named in the deny reason; got {control:?}"
     );
 
@@ -158,13 +170,18 @@ async fn deny_reason_omits_an_empty_bash_command() {
     let (reasons, executed) =
         denied_reasons_for(r#"{ "bash": { "*": "deny" } }"#, serde_json::json!({})).await;
 
-    assert!(executed.is_empty(), "the denied call must not execute; executed: {executed:?}");
+    assert!(
+        executed.is_empty(),
+        "the denied call must not execute; executed: {executed:?}"
+    );
     assert!(
         !reasons.is_empty(),
         "the deny must surface as an is_error tool result carrying a reason"
     );
     assert!(
-        reasons.iter().any(|r| r.contains("is not permitted to run 'bash'")),
+        reasons
+            .iter()
+            .any(|r| r.contains("is not permitted to run 'bash'")),
         "the deny reason must name the bash tool; got {reasons:?}"
     );
     for reason in &reasons {
@@ -183,9 +200,7 @@ async fn deny_reason_omits_an_empty_bash_command() {
 #[test]
 fn approval_subject_falls_back_to_the_tool_name_for_an_empty_command() {
     use cyrup_permission_system::gate::get_pattern_approval_subject;
-    use cyrup_permission_system::types::{
-        CheckSource, PermissionCheckResult, PermissionState,
-    };
+    use cyrup_permission_system::types::{CheckSource, PermissionCheckResult, PermissionState};
 
     let result = PermissionCheckResult {
         tool_name: "bash".to_string(),

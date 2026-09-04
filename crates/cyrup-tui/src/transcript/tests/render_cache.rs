@@ -4,12 +4,17 @@
 //! the private `render_cache` / `render_generation` fields: the poison-sentinel pattern proves
 //! a hit serves the STORED entry (no recompute), which no black-box observation can distinguish.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
-use crate::transcript::*;
 use crate::transcript::layout::wrap_all_owned;
-use ratatui::backend::TestBackend;
+use crate::transcript::*;
 use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 
 /// The impossible height planted into the cache to prove a hit serves the stored entry.
 const POISON_HEIGHT: usize = 4242;
@@ -32,8 +37,7 @@ fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
 /// Poison the cache with rows nothing could have produced, so a later read proves the cache was
 /// consulted rather than recomputed. `POISON_HEIGHT` rows, so `content_height` reports it.
 fn poison(view: &mut TranscriptView) {
-    view.render_cache.rows =
-        std::sync::Arc::new(vec![Line::from("POISON"); POISON_HEIGHT]);
+    view.render_cache.rows = std::sync::Arc::new(vec![Line::from("POISON"); POISON_HEIGHT]);
 }
 
 /// The core invariant, asserted after every step of a simulated turn: the cached entry equals a
@@ -48,8 +52,16 @@ fn assert_fresh(view: &mut TranscriptView, theme: &UiTheme, step: &str) {
     let fresh = view.lines(80, theme);
     let fresh_rows = wrap_all_owned(fresh, 80);
     let cache = view.cached_render(80, theme);
-    assert_eq!(cache.rows.as_slice(), fresh_rows.as_slice(), "stale cached rows after {step}");
-    assert_eq!(cache.rows.len(), fresh_rows.len(), "stale cached height after {step}");
+    assert_eq!(
+        cache.rows.as_slice(),
+        fresh_rows.as_slice(),
+        "stale cached rows after {step}"
+    );
+    assert_eq!(
+        cache.rows.len(),
+        fresh_rows.len(),
+        "stale cached height after {step}"
+    );
     assert_eq!(
         view.content_height(80, theme),
         fresh_rows.len(),
@@ -124,7 +136,10 @@ fn a_width_change_misses_and_recomputes() {
     let _ = view.content_height(80, &theme);
     poison(&mut view);
     let fresh = view.lines(81, &theme);
-    assert_eq!(view.content_height(81, &theme), wrap_all_owned(fresh, 81).len());
+    assert_eq!(
+        view.content_height(81, &theme),
+        wrap_all_owned(fresh, 81).len()
+    );
     assert_eq!(view.render_cache.width, 81);
 }
 
@@ -138,7 +153,10 @@ fn a_theme_generation_change_misses_and_recomputes() {
     let mut theme2 = theme.clone();
     theme2.generation = theme.generation.wrapping_add(1);
     let fresh = view.lines(80, &theme);
-    assert_eq!(view.content_height(80, &theme2), wrap_all_owned(fresh, 80).len());
+    assert_eq!(
+        view.content_height(80, &theme2),
+        wrap_all_owned(fresh, 80).len()
+    );
     assert_eq!(view.render_cache.theme_generation, theme2.generation);
 }
 
@@ -150,7 +168,11 @@ fn a_theme_generation_change_misses_and_recomputes() {
 /// `push_tool_end_rendered`) advance the generation more than once, so the assertion is `>`.
 #[test]
 fn every_bump_list_mutator_advances_the_generation() {
-    type Step = (&'static str, fn(&mut TranscriptView), fn(&mut TranscriptView));
+    type Step = (
+        &'static str,
+        fn(&mut TranscriptView),
+        fn(&mut TranscriptView),
+    );
     fn noop(_: &mut TranscriptView) {}
     fn live_bash(v: &mut TranscriptView) {
         v.start_bash("ls", false, None, None);
@@ -161,52 +183,94 @@ fn every_bump_list_mutator_advances_the_generation() {
     let steps: Vec<Step> = vec![
         ("set_output_pad", noop, |v| v.set_output_pad(2)),
         ("set_show_images", noop, |v| v.set_show_images(false)),
-        ("set_graphical_images", noop, |v| v.set_graphical_images(false)),
-        ("set_image_width_cells", noop, |v| v.set_image_width_cells(30)),
-        ("set_expand_hint", noop, |v| v.set_expand_hint(Some("ctrl+x".to_string()))),
-        ("set_cwd", noop, |v| v.set_cwd(Some(std::path::PathBuf::from("/tmp")))),
-        ("start_bash", noop, |v| v.start_bash("ls", false, None, None)),
+        ("set_graphical_images", noop, |v| {
+            v.set_graphical_images(false)
+        }),
+        ("set_image_width_cells", noop, |v| {
+            v.set_image_width_cells(30)
+        }),
+        ("set_expand_hint", noop, |v| {
+            v.set_expand_hint(Some("ctrl+x".to_string()))
+        }),
+        ("set_cwd", noop, |v| {
+            v.set_cwd(Some(std::path::PathBuf::from("/tmp")))
+        }),
+        ("start_bash", noop, |v| {
+            v.start_bash("ls", false, None, None)
+        }),
         ("bash_append", live_bash, |v| v.bash_append("chunk")),
-        ("bash_complete", live_bash, |v| v.bash_complete(Some(0), false, false, None)),
-        ("bash_complete_simple", live_bash, |v| v.bash_complete_simple(Some(0), false)),
+        ("bash_complete", live_bash, |v| {
+            v.bash_complete(Some(0), false, false, None)
+        }),
+        ("bash_complete_simple", live_bash, |v| {
+            v.bash_complete_simple(Some(0), false)
+        }),
         ("toggle_bash_expanded", live_bash, |v| {
             v.toggle_bash_expanded();
         }),
-        ("set_bash_expanded", live_bash, |v| v.set_bash_expanded(true)),
+        ("set_bash_expanded", live_bash, |v| {
+            v.set_bash_expanded(true)
+        }),
         ("commit_bash", live_bash, |v| v.commit_bash()),
         ("push_bash_execution", noop, |v| {
             v.push_bash_execution("ls", false, "out", Some(0), false, false, None);
         }),
         ("push_user", noop, |v| v.push_user("hi")),
-        ("push_assistant_delta", noop, |v| v.push_assistant_delta("a")),
-        ("commit_assistant", |v| v.push_assistant_delta("a"), |v| {
-            v.commit_assistant(None);
+        ("push_assistant_delta", noop, |v| {
+            v.push_assistant_delta("a")
         }),
-        ("discard_streaming", |v| v.push_assistant_delta("a"), |v| v.discard_streaming()),
+        (
+            "commit_assistant",
+            |v| v.push_assistant_delta("a"),
+            |v| {
+                v.commit_assistant(None);
+            },
+        ),
+        (
+            "discard_streaming",
+            |v| v.push_assistant_delta("a"),
+            |v| v.discard_streaming(),
+        ),
         ("push_thinking_delta", noop, |v| v.push_thinking_delta("t")),
-        ("commit_thinking", |v| v.push_thinking_delta("t"), |v| {
-            v.commit_thinking(None);
+        (
+            "commit_thinking",
+            |v| v.push_thinking_delta("t"),
+            |v| {
+                v.commit_thinking(None);
+            },
+        ),
+        ("set_hide_thinking_block", noop, |v| {
+            v.set_hide_thinking_block(true)
         }),
-        ("set_hide_thinking_block", noop, |v| v.set_hide_thinking_block(true)),
         ("set_hidden_thinking_label", noop, |v| {
             v.set_hidden_thinking_label(Some("L".to_string()));
         }),
-        ("push_tool_start", noop, |v| v.push_tool_start("read", serde_json::json!({}))),
+        ("push_tool_start", noop, |v| {
+            v.push_tool_start("read", serde_json::json!({}))
+        }),
         ("push_tool_start_rendered", noop, |v| {
             v.push_tool_start_rendered("read", None, serde_json::json!({}), None);
         }),
         ("push_tool_update", live_tool, |v| {
             v.push_tool_update(None, Some(serde_json::json!({ "content": [] })));
         }),
-        ("set_edit_preview", live_tool, |v| v.set_edit_preview(None, Ok("diff".to_string()))),
-        ("push_tool_end", noop, |v| v.push_tool_end("read", false, None)),
+        ("set_edit_preview", live_tool, |v| {
+            v.set_edit_preview(None, Ok("diff".to_string()))
+        }),
+        ("push_tool_end", noop, |v| {
+            v.push_tool_end("read", false, None)
+        }),
         ("push_tool_end_rendered", noop, |v| {
             v.push_tool_end_rendered("read", None, false, None, None);
         }),
         ("commit_tools", live_tool, |v| v.commit_tools()),
-        ("commit_finished_leading_tools", |v| v.push_tool_end("read", false, None), |v| {
-            v.commit_finished_leading_tools();
-        }),
+        (
+            "commit_finished_leading_tools",
+            |v| v.push_tool_end("read", false, None),
+            |v| {
+                v.commit_finished_leading_tools();
+            },
+        ),
         ("toggle_tool_expanded", noop, |v| {
             v.toggle_tool_expanded();
         }),
@@ -214,7 +278,11 @@ fn every_bump_list_mutator_advances_the_generation() {
             v.set_tool_expanded(true);
         }),
     ];
-    assert_eq!(steps.len(), 32, "the bump census is 32 mutators — update both together");
+    assert_eq!(
+        steps.len(),
+        32,
+        "the bump census is 32 mutators — update both together"
+    );
     for (name, setup, call) in steps {
         let mut view = TranscriptView::new();
         setup(&mut view);
@@ -232,14 +300,22 @@ fn every_bump_list_mutator_advances_the_generation() {
 /// PageUp/PageDown, every status line).
 #[test]
 fn exempt_methods_never_advance_the_generation() {
-    type Step = (&'static str, fn(&mut TranscriptView), fn(&mut TranscriptView));
+    type Step = (
+        &'static str,
+        fn(&mut TranscriptView),
+        fn(&mut TranscriptView),
+    );
     fn noop(_: &mut TranscriptView) {}
     let steps: Vec<Step> = vec![
         ("page_up", noop, |v| v.page_up(1)),
         ("page_down", |v| v.page_up(2), |v| v.page_down(1)),
-        ("drain_committed", |v| v.push_user("q"), |v| {
-            v.drain_committed();
-        }),
+        (
+            "drain_committed",
+            |v| v.push_user("q"),
+            |v| {
+                v.drain_committed();
+            },
+        ),
         ("push_status", noop, |v| v.push_status("s")),
         ("push_loaded_resources", noop, |v| {
             v.push_loaded_resources(vec![crate::startup::StartupLine::default()]);
@@ -247,16 +323,28 @@ fn exempt_methods_never_advance_the_generation() {
         ("push_error", noop, |v| v.push_error("e")),
         ("push_warning", noop, |v| v.push_warning("w")),
         ("push_block", noop, |v| v.push_block("t", "m")),
-        ("push_package_updates", noop, |v| v.push_package_updates(&["pkg".to_string()])),
-        ("push_skill_invocation", noop, |v| v.push_skill_invocation("n", "c")),
-        ("push_custom_message", noop, |v| v.push_custom_message("l", "b")),
+        ("push_package_updates", noop, |v| {
+            v.push_package_updates(&["pkg".to_string()])
+        }),
+        ("push_skill_invocation", noop, |v| {
+            v.push_skill_invocation("n", "c")
+        }),
+        ("push_custom_message", noop, |v| {
+            v.push_custom_message("l", "b")
+        }),
         ("push_custom_message_rendered", noop, |v| {
             v.push_custom_message_rendered("l", "b", Rendered::None);
         }),
         ("push_branch_summary", noop, |v| v.push_branch_summary("s")),
-        ("push_compaction_summary", noop, |v| v.push_compaction_summary(7, "s")),
+        ("push_compaction_summary", noop, |v| {
+            v.push_compaction_summary(7, "s")
+        }),
     ];
-    assert_eq!(steps.len(), 14, "the exemption census is 14 methods — update both together");
+    assert_eq!(
+        steps.len(),
+        14,
+        "the exemption census is 14 methods — update both together"
+    );
     for (name, setup, call) in steps {
         let mut view = TranscriptView::new();
         setup(&mut view);
@@ -280,7 +368,11 @@ fn exempt_methods_never_advance_the_generation() {
     view.push_custom_message_rendered("l", "b", Rendered::None);
     view.push_branch_summary("s");
     view.push_compaction_summary(7, "s");
-    assert_eq!(view.drain_committed().len(), 11, "every pending-pusher landed one entry");
+    assert_eq!(
+        view.drain_committed().len(),
+        11,
+        "every pending-pusher landed one entry"
+    );
 }
 
 #[test]
@@ -378,7 +470,10 @@ fn render_paints_the_cached_lines_not_a_recompute() {
         })
         .unwrap();
     let text = buffer_text(&terminal);
-    assert!(text.contains("SENTINEL-LINE"), "paint must come from the cache:\n{text}");
+    assert!(
+        text.contains("SENTINEL-LINE"),
+        "paint must come from the cache:\n{text}"
+    );
     assert!(
         !text.contains("real-streamed-text"),
         "a cache hit must not recompute the markdown:\n{text}"
@@ -417,7 +512,9 @@ fn go_no_go_frame_cost_at_the_largest_reachable_transcript() {
     let code: String = (0..2_000)
         .map(|i| format!("fn f{i}(x: u32) -> u32 {{ x + {i} }}\n"))
         .collect();
-    let body: String = (0..2_000).map(|i| format!("line {i} of a read result\n")).collect();
+    let body: String = (0..2_000)
+        .map(|i| format!("line {i} of a read result\n"))
+        .collect();
 
     // A turn that holds BOTH terms the cliff was made of: 2,000 lines of streaming code in a
     // fence, and a settled 2,000-line `read` whose body is collapsed to ten rows.

@@ -79,7 +79,8 @@ fn namespace_is_valid(ns: &str) -> bool {
     if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
         return false;
     }
-    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '/' | '-'))
+    chars
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '/' | '-'))
 }
 
 impl BrokerState {
@@ -100,7 +101,9 @@ impl BrokerState {
             let mut candidates: Vec<(String, u64, u64)> = self
                 .sessions_in_order()
                 .filter(|(_, s)| {
-                    s.extensions.iter().any(|e| e.namespace == namespace && e.owner_eligible)
+                    s.extensions
+                        .iter()
+                        .any(|e| e.namespace == namespace && e.owner_eligible)
                 })
                 .map(|(id, s)| (id.clone(), s.owner_order, s.conn_id))
                 .collect();
@@ -137,7 +140,10 @@ impl BrokerState {
             );
             self.notify_namespace_capable(
                 &namespace,
-                &ExtensionOwnerRef { owner_id: Some(winner_id), owner_epoch: Some(epoch) },
+                &ExtensionOwnerRef {
+                    owner_id: Some(winner_id),
+                    owner_epoch: Some(epoch),
+                },
             );
         }
     }
@@ -152,10 +158,13 @@ impl BrokerState {
     fn notify_namespace_capable(&self, namespace: &str, owner: &ExtensionOwnerRef) {
         for (_, session) in self.sessions_in_order() {
             if session.extensions.iter().any(|e| e.namespace == namespace) {
-                send_msg(&session.tx, &BrokerMessage::ExtensionOwner {
-                    namespace: namespace.to_string(),
-                    owner: owner.clone(),
-                });
+                send_msg(
+                    &session.tx,
+                    &BrokerMessage::ExtensionOwner {
+                        namespace: namespace.to_string(),
+                        owner: owner.clone(),
+                    },
+                );
             }
         }
     }
@@ -173,24 +182,30 @@ impl BrokerState {
         namespaces: &[String],
     ) {
         for namespace in namespaces {
-            let owner = self.namespace_owners.get(namespace).map_or_else(
-                ExtensionOwnerRef::default,
-                |o| ExtensionOwnerRef {
-                    owner_id: Some(o.session_id.clone()),
-                    owner_epoch: Some(o.epoch.clone()),
+            let owner =
+                self.namespace_owners
+                    .get(namespace)
+                    .map_or_else(ExtensionOwnerRef::default, |o| ExtensionOwnerRef {
+                        owner_id: Some(o.session_id.clone()),
+                        owner_epoch: Some(o.epoch.clone()),
+                    });
+            send_msg(
+                self_tx,
+                &BrokerMessage::ExtensionOwner {
+                    namespace: namespace.clone(),
+                    owner,
                 },
             );
-            send_msg(self_tx, &BrokerMessage::ExtensionOwner {
-                namespace: namespace.clone(),
-                owner,
-            });
             if let Some(state) = self.extension_state.load_state(namespace) {
                 let (revision, payload) = (state.revision, state.payload.clone());
-                send_msg(self_tx, &BrokerMessage::ExtensionState {
-                    namespace: namespace.clone(),
-                    revision,
-                    payload: Some(payload),
-                });
+                send_msg(
+                    self_tx,
+                    &BrokerMessage::ExtensionState {
+                        namespace: namespace.clone(),
+                        revision,
+                        payload: Some(payload),
+                    },
+                );
             }
         }
     }
@@ -265,7 +280,12 @@ impl BrokerState {
             return FrameResult::protocol_error();
         };
         let refuse = |error: &str| {
-            send_msg(self_tx, &BrokerMessage::Error { error: error.to_string() });
+            send_msg(
+                self_tx,
+                &BrokerMessage::Error {
+                    error: error.to_string(),
+                },
+            );
             FrameResult::cont()
         };
 
@@ -284,14 +304,19 @@ impl BrokerState {
         }
 
         // `typeof namespace !== "string" || !validateNamespace(namespace)` (`:1288-1291`).
-        let Some(namespace) =
-            value.get("namespace").and_then(|v| v.as_str()).filter(|ns| namespace_is_valid(ns))
+        let Some(namespace) = value
+            .get("namespace")
+            .and_then(|v| v.as_str())
+            .filter(|ns| namespace_is_valid(ns))
         else {
             return refuse("Invalid namespace");
         };
         // `audience !== "owner" && audience !== "capable"` (`:1293-1296`).
         let Ok(audience) = serde_json::from_value::<ExtensionAudience>(
-            value.get("audience").cloned().unwrap_or(serde_json::Value::Null),
+            value
+                .get("audience")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
         ) else {
             return refuse("Invalid audience");
         };
@@ -325,15 +350,20 @@ impl BrokerState {
         }
 
         // The join-ordered fan-out (`:1332-1355`).
-        let owner_ref = owner.as_ref().map_or_else(ExtensionOwnerRef::default, |o| {
-            ExtensionOwnerRef {
-                owner_id: Some(o.session_id.clone()),
-                owner_epoch: Some(o.epoch.clone()),
-            }
-        });
+        let owner_ref =
+            owner
+                .as_ref()
+                .map_or_else(ExtensionOwnerRef::default, |o| ExtensionOwnerRef {
+                    owner_id: Some(o.session_id.clone()),
+                    owner_epoch: Some(o.epoch.clone()),
+                });
         let payload = value.get("payload").cloned();
         for (id, recipient) in self.sessions_in_order() {
-            if !recipient.extensions.iter().any(|e| e.namespace == namespace) {
+            if !recipient
+                .extensions
+                .iter()
+                .any(|e| e.namespace == namespace)
+            {
                 continue;
             }
             // `shouldReceive` (`:1344-1348`). Note the publisher is NOT excluded from a `capable`
@@ -343,12 +373,15 @@ impl BrokerState {
                     .as_ref()
                     .is_some_and(|o| id == &o.session_id && recipient.conn_id == o.conn_id);
             if should_receive {
-                send_msg(&recipient.tx, &BrokerMessage::ExtensionMessage {
-                    namespace: namespace.to_string(),
-                    from_session_id: current_id.to_string(),
-                    owner: owner_ref.clone(),
-                    payload: payload.clone(),
-                });
+                send_msg(
+                    &recipient.tx,
+                    &BrokerMessage::ExtensionMessage {
+                        namespace: namespace.to_string(),
+                        from_session_id: current_id.to_string(),
+                        owner: owner_ref.clone(),
+                        payload: payload.clone(),
+                    },
+                );
             }
         }
         FrameResult::cont()
@@ -374,12 +407,15 @@ impl BrokerState {
         // `String(msg.namespace || "")`, which is not the same expression `:1394` uses.
         let echo_ns = js_string_or_empty(value.get("namespace"));
         let early_refuse = |reason: &str| {
-            send_msg(self_tx, &BrokerMessage::ExtensionStateResult {
-                namespace: echo_ns.clone(),
-                committed: false,
-                revision: 0,
-                reason: Some(reason.to_string()),
-            });
+            send_msg(
+                self_tx,
+                &BrokerMessage::ExtensionStateResult {
+                    namespace: echo_ns.clone(),
+                    committed: false,
+                    revision: 0,
+                    reason: Some(reason.to_string()),
+                },
+            );
             FrameResult::cont()
         };
         if !self.session_owns_connection(current_id, conn_id) {
@@ -396,15 +432,22 @@ impl BrokerState {
 
         // `:1394` writes `String(namespace)`, NOT `String(namespace || "")` — observably different
         // for `namespace: 0`, which echoes `"0"` here and `""` in the two branches above.
-        let Some(namespace) =
-            value.get("namespace").and_then(|v| v.as_str()).filter(|ns| namespace_is_valid(ns))
+        let Some(namespace) = value
+            .get("namespace")
+            .and_then(|v| v.as_str())
+            .filter(|ns| namespace_is_valid(ns))
         else {
-            send_msg(self_tx, &BrokerMessage::ExtensionStateResult {
-                namespace: value.get("namespace").map_or_else(String::new, js_to_string),
-                committed: false,
-                revision: 0,
-                reason: Some("Invalid namespace".to_string()),
-            });
+            send_msg(
+                self_tx,
+                &BrokerMessage::ExtensionStateResult {
+                    namespace: value
+                        .get("namespace")
+                        .map_or_else(String::new, js_to_string),
+                    committed: false,
+                    revision: 0,
+                    reason: Some("Invalid namespace".to_string()),
+                },
+            );
             return FrameResult::cont();
         };
         let namespace = namespace.to_string();
@@ -414,17 +457,23 @@ impl BrokerState {
         macro_rules! refuse_current {
             ($reason:expr) => {{
                 let revision = self.extension_state.current_revision(&namespace);
-                send_msg(self_tx, &BrokerMessage::ExtensionStateResult {
-                    namespace: namespace.clone(),
-                    committed: false,
-                    revision,
-                    reason: Some(($reason).to_string()),
-                });
+                send_msg(
+                    self_tx,
+                    &BrokerMessage::ExtensionStateResult {
+                        namespace: namespace.clone(),
+                        committed: false,
+                        revision,
+                        reason: Some(($reason).to_string()),
+                    },
+                );
                 return FrameResult::cont();
             }};
         }
 
-        let Some(owner_epoch) = value.get("ownerEpoch").and_then(|v| v.as_str()).map(str::to_string)
+        let Some(owner_epoch) = value
+            .get("ownerEpoch")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
         else {
             refuse_current!("Invalid ownerEpoch")
         };
@@ -442,7 +491,8 @@ impl BrokerState {
         let Some(owner) = self.namespace_owners.get(&namespace).cloned() else {
             refuse_current!("No owner for this namespace")
         };
-        if current_id != owner.session_id || conn_id != owner.conn_id || owner_epoch != owner.epoch {
+        if current_id != owner.session_id || conn_id != owner.conn_id || owner_epoch != owner.epoch
+        {
             refuse_current!("Owner validation failed")
         }
 
@@ -453,24 +503,34 @@ impl BrokerState {
             payload.as_ref(),
             now_ms(),
         );
-        send_msg(self_tx, &BrokerMessage::ExtensionStateResult {
-            namespace: namespace.clone(),
-            committed: result.committed,
-            revision: result.revision,
-            reason: result.reason.map(str::to_string),
-        });
+        send_msg(
+            self_tx,
+            &BrokerMessage::ExtensionStateResult {
+                namespace: namespace.clone(),
+                committed: result.committed,
+                revision: result.revision,
+                reason: result.reason.map(str::to_string),
+            },
+        );
         if !result.committed {
             return FrameResult::cont();
         }
         // The commit fan-out to every capable session in join order, the committer INCLUDED
         // (`:1484-1495`).
         for (_, recipient) in self.sessions_in_order() {
-            if recipient.extensions.iter().any(|e| e.namespace == namespace) {
-                send_msg(&recipient.tx, &BrokerMessage::ExtensionState {
-                    namespace: namespace.clone(),
-                    revision: result.revision,
-                    payload: payload.clone(),
-                });
+            if recipient
+                .extensions
+                .iter()
+                .any(|e| e.namespace == namespace)
+            {
+                send_msg(
+                    &recipient.tx,
+                    &BrokerMessage::ExtensionState {
+                        namespace: namespace.clone(),
+                        revision: result.revision,
+                        payload: payload.clone(),
+                    },
+                );
             }
         }
         FrameResult::cont()

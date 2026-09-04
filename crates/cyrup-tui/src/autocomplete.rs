@@ -184,7 +184,12 @@ impl Autocomplete {
 
     /// Apply the selected completion over `prefix` at the cursor (spec/tui/04 §3.6). Pure text
     /// transform; returns the rewritten buffer + new cursor.
-    pub fn apply(&self, lines: &[String], cursor_line: usize, cursor_col: usize) -> Option<Applied> {
+    pub fn apply(
+        &self,
+        lines: &[String],
+        cursor_line: usize,
+        cursor_col: usize,
+    ) -> Option<Applied> {
         let completion = self.selected()?;
         let line = lines.get(cursor_line).map(String::as_str).unwrap_or("");
         let before: Vec<char> = line.chars().take(cursor_col).collect();
@@ -211,9 +216,11 @@ impl Autocomplete {
             // `+2 for "/" and space`) and the `@`-mention branch (`:412-428`).
             CompletionContext::SlashArgument => (completion.value.clone(), "", 0),
             // Path: directories keep drilling (no space), files get a trailing space (`:408-425`).
-            CompletionContext::Path => {
-                (completion.value.clone(), if completion.is_dir { "" } else { " " }, 0)
-            }
+            CompletionContext::Path => (
+                completion.value.clone(),
+                if completion.is_dir { "" } else { " " },
+                0,
+            ),
             // Mention: `@{path}` — quote the path when it contains whitespace
             // (`buildCompletionValue`, `autocomplete.ts:106-120`, `@"…"`). A FILE closes the token
             // with a space; a DIRECTORY does not, so the user can keep autocompleting inside it —
@@ -224,7 +231,11 @@ impl Autocomplete {
             CompletionContext::Mention => {
                 let path = &completion.value;
                 let quoted = path.contains(char::is_whitespace);
-                let rendered = if quoted { format!("@\"{path}\"") } else { format!("@{path}") };
+                let rendered = if quoted {
+                    format!("@\"{path}\"")
+                } else {
+                    format!("@{path}")
+                };
                 let trailing = if completion.is_dir { "" } else { " " };
                 // `hasTrailingQuote` (`:422`) — only a quoted directory has one to sit inside.
                 (rendered, trailing, usize::from(completion.is_dir && quoted))
@@ -237,7 +248,11 @@ impl Autocomplete {
         if let Some(slot) = new_lines.get_mut(cursor_line) {
             *slot = new_line;
         }
-        Some(Applied { lines: new_lines, cursor_line, cursor_col })
+        Some(Applied {
+            lines: new_lines,
+            cursor_line,
+            cursor_col,
+        })
     }
 }
 
@@ -331,8 +346,16 @@ fn model_rows(
     let texts: Vec<String> = models
         .iter()
         .map(|m| {
-            let name = if m.name.is_empty() { String::new() } else { format!(" {}", m.name) };
-            format!("{id} {p} {p}/{id} {p} {id}{name}", id = m.id, p = m.provider)
+            let name = if m.name.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", m.name)
+            };
+            format!(
+                "{id} {p} {p}/{id} {p} {id}{name}",
+                id = m.id,
+                p = m.provider
+            )
         })
         .collect();
     let matches = fuzzy::filter(&texts, argument, String::as_str);
@@ -342,8 +365,13 @@ fn model_rows(
     let mut items = Vec::with_capacity(matches.len());
     let mut completions = Vec::with_capacity(matches.len());
     for m in &matches {
-        let Some(model) = models.get(m.index) else { continue };
-        items.push(SelectItem::new(model.id.clone(), Some(model.provider.clone())));
+        let Some(model) = models.get(m.index) else {
+            continue;
+        };
+        items.push(SelectItem::new(
+            model.id.clone(),
+            Some(model.provider.clone()),
+        ));
         completions.push(Completion {
             value: format!("{}/{}", model.provider, model.id),
             is_dir: false,
@@ -382,7 +410,9 @@ fn login_provider_rows(
     let mut items = Vec::with_capacity(matches.len());
     let mut completions = Vec::with_capacity(matches.len());
     for m in &matches {
-        let Some(provider) = providers.get(m.index) else { continue };
+        let Some(provider) = providers.get(m.index) else {
+            continue;
+        };
         let labels: Vec<&str> = provider
             .auth_types
             .iter()
@@ -396,7 +426,10 @@ fn login_provider_rows(
             format!("{} · {joined}", provider.name)
         };
         items.push(SelectItem::new(provider.id.clone(), Some(desc)));
-        completions.push(Completion { value: provider.id.clone(), is_dir: false });
+        completions.push(Completion {
+            value: provider.id.clone(),
+            is_dir: false,
+        });
     }
     Some((items, completions))
 }
@@ -438,17 +471,17 @@ fn extension_rows(
     let mut completions = Vec::with_capacity(selected.len());
     for value in selected {
         items.push(SelectItem::label(value.clone()));
-        completions.push(Completion { value: value.clone(), is_dir: false });
+        completions.push(Completion {
+            value: value.clone(),
+            is_dir: false,
+        });
     }
     Some((items, completions))
 }
 
 /// `/thinking` rows (`interactive-mode.ts:713-725` @v0.84.3): the level string is its own search
 /// text, label and value.
-fn thinking_rows(
-    levels: &[String],
-    argument: &str,
-) -> Option<(Vec<SelectItem>, Vec<Completion>)> {
+fn thinking_rows(levels: &[String], argument: &str) -> Option<(Vec<SelectItem>, Vec<Completion>)> {
     let matches = fuzzy::filter(levels, argument, String::as_str);
     if matches.is_empty() {
         return None;
@@ -456,9 +489,14 @@ fn thinking_rows(
     let mut items = Vec::with_capacity(matches.len());
     let mut completions = Vec::with_capacity(matches.len());
     for m in &matches {
-        let Some(level) = levels.get(m.index) else { continue };
+        let Some(level) = levels.get(m.index) else {
+            continue;
+        };
         items.push(SelectItem::label(level.clone()));
-        completions.push(Completion { value: level.clone(), is_dir: false });
+        completions.push(Completion {
+            value: level.clone(),
+            is_dir: false,
+        });
     }
     Some((items, completions))
 }
@@ -476,7 +514,9 @@ fn command_name_context(registry: &CommandRegistry, before: &str) -> Option<Auto
     let mut items = Vec::with_capacity(matches.len());
     let mut completions = Vec::with_capacity(matches.len());
     for m in &matches {
-        let Some(cmd) = commands.get(m.index) else { continue };
+        let Some(cmd) = commands.get(m.index) else {
+            continue;
+        };
         // Description composition (`:315-322`): hint ? (desc ? "{hint} — {desc}" : hint) : desc.
         let desc = match cmd.argument_hint.as_deref() {
             Some(hint) if !cmd.description.is_empty() => format!("{hint} — {}", cmd.description),
@@ -484,10 +524,18 @@ fn command_name_context(registry: &CommandRegistry, before: &str) -> Option<Auto
             None => cmd.description.to_string(),
         };
         items.push(SelectItem::new(cmd.name.to_string(), Some(desc)));
-        completions.push(Completion { value: cmd.name.to_string(), is_dir: false });
+        completions.push(Completion {
+            value: cmd.name.to_string(),
+            is_dir: false,
+        });
     }
     let list = SelectList::new(items, ColumnLayout::SLASH).with_no_match("No matching commands");
-    Some(Autocomplete { context: CompletionContext::Slash, prefix: before.to_string(), completions, list })
+    Some(Autocomplete {
+        context: CompletionContext::Slash,
+        prefix: before.to_string(),
+        completions,
+        list,
+    })
 }
 
 /// Whether `query` (the text after the leading `/`) is a real PREFIX of at least one registered
@@ -501,7 +549,11 @@ fn command_name_context(registry: &CommandRegistry, before: &str) -> Option<Auto
 /// bare `/`) is false — `fuzzy::filter` returns EVERYTHING for it (`:145-151`), which is correct for
 /// the popup and meaningless as a confirmation.
 pub fn is_command_prefix(registry: &CommandRegistry, query: &str) -> bool {
-    !query.is_empty() && registry.commands().iter().any(|c| c.name.as_ref().starts_with(query))
+    !query.is_empty()
+        && registry
+            .commands()
+            .iter()
+            .any(|c| c.name.as_ref().starts_with(query))
 }
 
 /// Path delimiters that bound the trailing token (`PATH_DELIMITERS`, `autocomplete.ts:7`).
@@ -513,7 +565,10 @@ fn path_context(before: &str, force: bool, cwd: &Path) -> Option<Autocomplete> {
     // `parsePathPrefix` (`autocomplete.ts:94-105`): the opening `"` of a quoted prefix is not part
     // of the path. TUI-013 — `trailing_token` now returns the whole `"my dir/fi` span.
     let quoted = raw_token.starts_with('"');
-    let token = raw_token.strip_prefix('"').unwrap_or(&raw_token).to_string();
+    let token = raw_token
+        .strip_prefix('"')
+        .unwrap_or(&raw_token)
+        .to_string();
     let looks_pathy =
         quoted || token.contains('/') || token.starts_with('.') || token.starts_with("~/");
     if !force && !looks_pathy {
@@ -521,7 +576,10 @@ fn path_context(before: &str, force: bool, cwd: &Path) -> Option<Autocomplete> {
     }
     // Split the token into a directory part + a filename prefix.
     let (dir_part, name_prefix) = match token.rfind('/') {
-        Some(idx) => (token.get(..=idx).unwrap_or(""), token.get(idx + 1..).unwrap_or("")),
+        Some(idx) => (
+            token.get(..=idx).unwrap_or(""),
+            token.get(idx + 1..).unwrap_or(""),
+        ),
         None => ("", token.as_str()),
     };
     let search_dir = resolve_dir(dir_part, cwd);
@@ -532,7 +590,11 @@ fn path_context(before: &str, force: bool, cwd: &Path) -> Option<Autocomplete> {
     let mut items = Vec::with_capacity(entries.len());
     let mut completions = Vec::with_capacity(entries.len());
     for (name, is_dir) in entries {
-        let display = if is_dir { format!("{name}/") } else { name.clone() };
+        let display = if is_dir {
+            format!("{name}/")
+        } else {
+            name.clone()
+        };
         // The inserted value re-prepends the directory part the user already typed.
         let value = format!("{dir_part}{display}");
         items.push(SelectItem::label(display.clone()));
@@ -541,7 +603,12 @@ fn path_context(before: &str, force: bool, cwd: &Path) -> Option<Autocomplete> {
     let list = SelectList::new(items, ColumnLayout::DEFAULT).with_no_match("No matching files");
     // The replaced span is the RAW token, quote included, so applying a completion overwrites the
     // opening quote the user typed rather than leaving it stranded.
-    Some(Autocomplete { context: CompletionContext::Path, prefix: raw_token, completions, list })
+    Some(Autocomplete {
+        context: CompletionContext::Path,
+        prefix: raw_token,
+        completions,
+        list,
+    })
 }
 
 /// `findUnclosedQuoteStart` (`packages/tui/src/autocomplete.ts:54-68` @v0.83.0): the byte index of
@@ -575,9 +642,7 @@ fn is_token_start(text: &str, index: usize) -> bool {
 fn extract_quoted_prefix(text: &str) -> Option<String> {
     let quote_start = find_unclosed_quote_start(text)?;
     // `@"my dir/fi` — the `@` belongs to the token (`:80-85`).
-    if quote_start > 0
-        && text.get(..quote_start).and_then(|s| s.chars().next_back()) == Some('@')
-    {
+    if quote_start > 0 && text.get(..quote_start).and_then(|s| s.chars().next_back()) == Some('@') {
         let at = quote_start - 1;
         if !is_token_start(text, at) {
             return None;
@@ -614,9 +679,10 @@ fn resolve_dir(dir_part: &str, cwd: &Path) -> PathBuf {
         return cwd.to_path_buf();
     }
     if let Some(rest) = dir_part.strip_prefix("~/")
-        && let Some(home) = home_dir() {
-            return home.join(rest);
-        }
+        && let Some(home) = home_dir()
+    {
+        return home.join(rest);
+    }
     let p = Path::new(dir_part);
     if p.is_absolute() {
         p.to_path_buf()
@@ -639,7 +705,10 @@ fn read_dir_sorted(dir: &Path, prefix: &str) -> Option<Vec<(String, bool)>> {
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         out.push((name, is_dir));
     }
-    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
+    out.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
+    });
     Some(out)
 }
 
@@ -707,14 +776,24 @@ pub fn mention_autocomplete(before: &str, candidates: &[String]) -> Option<Autoc
     let mut items = Vec::with_capacity(matches.len());
     let mut completions = Vec::with_capacity(matches.len());
     for m in &matches {
-        let Some(path) = candidates.get(m.index) else { continue };
+        let Some(path) = candidates.get(m.index) else {
+            continue;
+        };
         // `label = entryName + (isDirectory ? "/" : "")` (`:803`) comes for free: the candidate
         // string already carries the separator.
         items.push(SelectItem::label(path.clone()));
-        completions.push(Completion { value: path.clone(), is_dir: path.ends_with('/') });
+        completions.push(Completion {
+            value: path.clone(),
+            is_dir: path.ends_with('/'),
+        });
     }
     let list = SelectList::new(items, ColumnLayout::DEFAULT).with_no_match("No matching files");
-    Some(Autocomplete { context: CompletionContext::Mention, prefix: token, completions, list })
+    Some(Autocomplete {
+        context: CompletionContext::Mention,
+        prefix: token,
+        completions,
+        list,
+    })
 }
 
 /// List repo files AND directories for `@`-mention search (`autocomplete.ts:719-772`), capped at
@@ -741,8 +820,20 @@ pub fn list_files(cwd: &Path, limit: usize) -> Vec<String> {
 fn fd_list(cwd: &Path, limit: usize) -> Option<Vec<String>> {
     let output = std::process::Command::new("fd")
         .args([
-            "--type", "f", "--type", "d", "--follow", "--hidden", "--color", "never",
-            "--strip-cwd-prefix", "--exclude", ".git", "--exclude", ".git/*", "--exclude",
+            "--type",
+            "f",
+            "--type",
+            "d",
+            "--follow",
+            "--hidden",
+            "--color",
+            "never",
+            "--strip-cwd-prefix",
+            "--exclude",
+            ".git",
+            "--exclude",
+            ".git/*",
+            "--exclude",
             ".git/**",
         ])
         .current_dir(cwd)
@@ -780,7 +871,9 @@ fn walk_list(cwd: &Path, limit: usize) -> Vec<String> {
         if out.len() >= limit || visited >= visit_cap {
             break;
         }
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in rd.flatten() {
             visited += 1;
             if out.len() >= limit || visited >= visit_cap {
@@ -792,7 +885,10 @@ fn walk_list(cwd: &Path, limit: usize) -> Vec<String> {
             }
             let path = entry.path();
             let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            let rel = path.strip_prefix(cwd).ok().map(|r| r.to_string_lossy().replace('\\', "/"));
+            let rel = path
+                .strip_prefix(cwd)
+                .ok()
+                .map(|r| r.to_string_lossy().replace('\\', "/"));
             if is_dir {
                 if let Some(rel) = rel {
                     out.push(format!("{rel}/"));

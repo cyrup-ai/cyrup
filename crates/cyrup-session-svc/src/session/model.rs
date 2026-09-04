@@ -50,7 +50,8 @@ impl AgentSession {
         }
         self.install_owning_provider(&model)?;
         let previous = Self::lock(&self.model).clone();
-        self.apply_model_change(&model, previous.as_ref(), "set", None).await?;
+        self.apply_model_change(&model, previous.as_ref(), "set", None)
+            .await?;
         Ok(ModelRef {
             provider: model.provider.clone(),
             api: Some(model.api.clone()),
@@ -76,16 +77,22 @@ impl AgentSession {
         // (arch-08 §5.6); install it DIRECTLY so its models stream — the built-in
         // `ProviderResolver` seam (bin `select_provider`) knows only the Pi registry, not a guest
         // provider. Falls back to the resolver for a built-in cross-provider swap.
-        if let Some(guest) = self.services.guest_providers.provider(model.provider.as_str()) {
+        if let Some(guest) = self
+            .services
+            .guest_providers
+            .provider(model.provider.as_str())
+        {
             self.provider.store(guest);
         } else {
-            self.provider.resolve_and_store(model.provider.as_str()).map_err(|e| {
-                SessionServiceError::NoConfiguredAuth(format!(
-                    "{}/{}: {e}",
-                    model.provider.as_str(),
-                    model.id.as_str()
-                ))
-            })?;
+            self.provider
+                .resolve_and_store(model.provider.as_str())
+                .map_err(|e| {
+                    SessionServiceError::NoConfiguredAuth(format!(
+                        "{}/{}: {e}",
+                        model.provider.as_str(),
+                        model.id.as_str()
+                    ))
+                })?;
         }
         Ok(())
     }
@@ -104,7 +111,11 @@ impl AgentSession {
         // Pi `providerRequestConfigs`, model-registry.ts:659-662), so its models are always available
         // in the selector — exactly as Pi's `hasConfiguredAuth` returns true when a provider request
         // config supplies a key.
-        if self.services.guest_providers.has_provider(model.provider.as_str()) {
+        if self
+            .services
+            .guest_providers
+            .has_provider(model.provider.as_str())
+        {
             return true;
         }
         self.provider
@@ -195,7 +206,10 @@ impl AgentSession {
         // Guest-registered providers (Pi folds `registerProvider` models into the same `ModelRegistry`
         // that `find`/`getAvailable`/`setModel` read, model-registry.ts:917-940).
         for m in self.services.guest_providers.models() {
-            if !base.iter().any(|e| e.provider == m.provider && e.id == m.id) {
+            if !base
+                .iter()
+                .any(|e| e.provider == m.provider && e.id == m.id)
+            {
                 base.push(m);
             }
         }
@@ -208,7 +222,10 @@ impl AgentSession {
         })
         .get_models(None)
         {
-            if !base.iter().any(|e| e.provider == m.provider && e.id == m.id) {
+            if !base
+                .iter()
+                .any(|e| e.provider == m.provider && e.id == m.id)
+            {
                 base.push(m);
             }
         }
@@ -233,7 +250,10 @@ impl AgentSession {
     /// appears once `TOGETHER_API_KEY` is set), plus cyrup's offline-faux accommodation keeps the
     /// current provider's own catalog (the scripted faux default) selectable. Deduped by `provider/id`.
     pub fn available_model_catalog(&self) -> Vec<Model> {
-        self.full_model_registry().into_iter().filter(|m| self.has_configured_auth(m)).collect()
+        self.full_model_registry()
+            .into_iter()
+            .filter(|m| self.has_configured_auth(m))
+            .collect()
     }
 
     /// The provider-attribution + session-affinity headers this session attaches to provider requests
@@ -265,7 +285,10 @@ impl AgentSession {
         if let Some(cur) = current.as_ref().filter(|c| matches(c)) {
             return self.attribution_headers(cur);
         }
-        self.full_model_registry().into_iter().find(matches).and_then(|c| self.attribution_headers(&c))
+        self.full_model_registry()
+            .into_iter()
+            .find(matches)
+            .and_then(|c| self.attribution_headers(&c))
     }
 
     /// Emit the `model_select` extension event when the model actually changes (Pi `_emitModelSelect`,
@@ -292,9 +315,9 @@ impl AgentSession {
             "provider": next.provider.as_str(),
             "id": next.id.as_str(),
         });
-        let previous_model = previous.map(|p| {
-            serde_json::json!({ "provider": p.provider.as_str(), "id": p.model.as_str() })
-        });
+        let previous_model = previous.map(
+            |p| serde_json::json!({ "provider": p.provider.as_str(), "id": p.model.as_str() }),
+        );
         self.services
             .ext_host
             .dispatcher()
@@ -315,10 +338,15 @@ impl AgentSession {
         provider: ProviderId,
         model: ModelId,
     ) -> Result<(), SessionServiceError> {
-        let model_ref = ModelRef { provider: provider.clone(), api: None, model: model.clone() };
+        let model_ref = ModelRef {
+            provider: provider.clone(),
+            api: None,
+            model: model.clone(),
+        };
         self.agent.set_model(Some(model_ref.clone())).await;
         *Self::lock(&self.model) = Some(model_ref.clone());
-        self.bash_session_env.set_model(provider.to_string(), model.to_string());
+        self.bash_session_env
+            .set_model(provider.to_string(), model.to_string());
         // Same per-request attribution rule as `apply_model_change` (pi `sdk.ts:318-327`). This
         // path has only the `ModelRef`, so resolve the full `Model` to recompute; if it cannot be
         // resolved the overlay is cleared rather than left stale — sending the OLD provider's
@@ -333,7 +361,10 @@ impl AgentSession {
         self.agent
             .set_headers(resolved.as_ref().and_then(|m| self.attribution_headers(m)))
             .await;
-        self.manager.lock().await.append_model_change(provider, model)?;
+        self.manager
+            .lock()
+            .await
+            .append_model_change(provider, model)?;
         Ok(())
     }
 
@@ -400,8 +431,10 @@ impl AgentSession {
         forward: bool,
         scoped: &[ScopedModel],
     ) -> Result<Option<ModelCycleResult>, SessionServiceError> {
-        let candidates: Vec<&ScopedModel> =
-            scoped.iter().filter(|s| self.has_configured_auth(&s.model)).collect();
+        let candidates: Vec<&ScopedModel> = scoped
+            .iter()
+            .filter(|s| self.has_configured_auth(&s.model))
+            .collect();
         if candidates.len() <= 1 {
             return Ok(None);
         }
@@ -413,13 +446,17 @@ impl AgentSession {
             // `if (currentIndex === -1) currentIndex = 0` starts the cycle at the head
             // (agent-session.ts:1618-1621; the same shape at :1647-1650 for the available set).
             .position(|s| {
-                current.as_ref().is_some_and(|c| {
-                    s.model.provider == c.provider && s.model.id == c.model
-                })
+                current
+                    .as_ref()
+                    .is_some_and(|c| s.model.provider == c.provider && s.model.id == c.model)
             })
             .unwrap_or(0);
         let len = candidates.len();
-        let next_idx = if forward { (cur_idx + 1) % len } else { (cur_idx + len - 1) % len };
+        let next_idx = if forward {
+            (cur_idx + 1) % len
+        } else {
+            (cur_idx + len - 1) % len
+        };
         let Some(next) = candidates.get(next_idx).copied() else {
             return Ok(None);
         };
@@ -429,7 +466,11 @@ impl AgentSession {
         let new_level = self
             .apply_model_change(&next.model, current.as_ref(), "cycle", explicit)
             .await?;
-        Ok(Some(ModelCycleResult { model: next.model.clone(), thinking_level: new_level, is_scoped: true }))
+        Ok(Some(ModelCycleResult {
+            model: next.model.clone(),
+            thinking_level: new_level,
+            is_scoped: true,
+        }))
     }
 
     /// Cycle over the AUTH-FILTERED registry (Pi `_cycleAvailableModel`, agent-session.ts:1643-1670,
@@ -454,17 +495,29 @@ impl AgentSession {
             .iter()
             // Same `findIndex → -1 → 0` fallback as the scoped path (agent-session.ts:1647-1650).
             .position(|m| {
-                current.as_ref().is_some_and(|c| m.provider == c.provider && m.id == c.model)
+                current
+                    .as_ref()
+                    .is_some_and(|c| m.provider == c.provider && m.id == c.model)
             })
             .unwrap_or(0);
         let len = candidates.len();
-        let next_idx = if forward { (cur_idx + 1) % len } else { (cur_idx + len - 1) % len };
+        let next_idx = if forward {
+            (cur_idx + 1) % len
+        } else {
+            (cur_idx + len - 1) % len
+        };
         let Some(next) = candidates.get(next_idx).cloned() else {
             return Ok(None);
         };
         self.install_owning_provider(&next)?;
-        let new_level = self.apply_model_change(&next, current.as_ref(), "cycle", None).await?;
-        Ok(Some(ModelCycleResult { model: next, thinking_level: new_level, is_scoped: false }))
+        let new_level = self
+            .apply_model_change(&next, current.as_ref(), "cycle", None)
+            .await?;
+        Ok(Some(ModelCycleResult {
+            model: next,
+            thinking_level: new_level,
+            is_scoped: false,
+        }))
     }
 
     /// Apply a resolved model change: push to the agent, re-derive headers, persist, re-clamp/restore
@@ -485,10 +538,13 @@ impl AgentSession {
         self.agent.set_model(Some(model_ref.clone())).await;
         *Self::lock(&self.model) = Some(model_ref.clone());
         *Self::lock(&self.compaction_model) = Some(next.clone());
-        self.services.host_services.update_model(model_ref, next.context_window, None);
+        self.services
+            .host_services
+            .update_model(model_ref, next.context_window, None);
         // Republish `CYRUP_PROVIDER`/`CYRUP_MODEL` for the NEXT `bash` child (Pi re-reads `ctx.model`
         // on every `resolveSpawnContext`, bash.ts:175-178; docs/environment-variables.md:27).
-        self.bash_session_env.set_model(next.provider.to_string(), next.id.to_string());
+        self.bash_session_env
+            .set_model(next.provider.to_string(), next.id.to_string());
         // ...and re-push the new model's image capability for the same reason: `read`'s
         // non-vision warning must describe the model the NEXT read will actually run against,
         // not the one resolved at startup.
@@ -501,7 +557,10 @@ impl AgentSession {
         // session-affinity header. `attribution_headers()` existed and computed this correctly
         // per-model; it simply had no caller.
         self.agent.set_headers(self.attribution_headers(next)).await;
-        self.manager.lock().await.append_model_change(next.provider.clone(), next.id.clone())?;
+        self.manager
+            .lock()
+            .await
+            .append_model_change(next.provider.clone(), next.id.clone())?;
         // Re-clamp the thinking level for the new model. Pi
         // `_getThinkingLevelForModelSwitch(targetModel, explicitLevel)`
         // (`agent-session.ts:1828-1839`), in its exact precedence:

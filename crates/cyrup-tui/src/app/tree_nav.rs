@@ -52,8 +52,16 @@ impl<B: Backend> App<B> {
     /// [`AppCommand::ConfirmSelection`] rather than occupying the single extension-dialog reply slot.
     pub fn open_branch_summary_prompt(&mut self) {
         let rows = vec![
-            (BRANCH_SUMMARY_NONE.to_string(), "No summary".to_string(), None),
-            (BRANCH_SUMMARY_YES.to_string(), "Summarize".to_string(), None),
+            (
+                BRANCH_SUMMARY_NONE.to_string(),
+                "No summary".to_string(),
+                None,
+            ),
+            (
+                BRANCH_SUMMARY_YES.to_string(),
+                "Summarize".to_string(),
+                None,
+            ),
             (
                 BRANCH_SUMMARY_CUSTOM.to_string(),
                 "Summarize with custom prompt".to_string(),
@@ -63,10 +71,10 @@ impl<B: Backend> App<B> {
         let title = SelectorKind::BranchSummary.title().to_string();
         self.open_boxed_selector(
             SelectorKind::BranchSummary,
-            Box::new(ListSelector::prompt(title, rows, 0).with_upstream_chrome(
-                SelectorKind::BranchSummary,
-                &self.state.select_keymap,
-            )),
+            Box::new(
+                ListSelector::prompt(title, rows, 0)
+                    .with_upstream_chrome(SelectorKind::BranchSummary, &self.state.select_keymap),
+            ),
         );
     }
 
@@ -116,10 +124,14 @@ impl<B: Backend> App<B> {
             // against (see [`Self::queue_drain_tx`]).
             // Pi `:4781-4785` — `restoreQueuedMessagesToEditor()` then `session.abort()`.
             if session.is_streaming().await {
-                self.dispatch_queue_drain(session, QueueDrainReason::TreeNav).await;
+                self.dispatch_queue_drain(session, QueueDrainReason::TreeNav)
+                    .await;
                 session.abort();
             }
-            let outcome = session.navigate_tree(entry, opts).await.map_err(|e| e.to_string());
+            let outcome = session
+                .navigate_tree(entry, opts)
+                .await
+                .map_err(|e| e.to_string());
             self.apply_tree_nav_outcome(TreeNavMsg { target, outcome });
             return;
         };
@@ -127,9 +139,10 @@ impl<B: Backend> App<B> {
             // Pi shows the `BranchSummaryStatusIndicator` and rebinds Escape for the duration
             // (`:4796-4799`, `:4792-4795`); both are torn down in `apply_tree_nav_outcome`.
             self.state.branch_summary_in_flight = true;
-            self.state
-                .indicator
-                .set(IndicatorKind::BranchSummary, Some("Summarizing branch...".to_string()));
+            self.state.indicator.set(
+                IndicatorKind::BranchSummary,
+                Some("Summarizing branch...".to_string()),
+            );
         }
         let session = session.clone();
         // TUI-092 §5b.1 — Pi's pre-step (`:4781-4785`, "the user committed to navigating: stop the
@@ -152,7 +165,10 @@ impl<B: Backend> App<B> {
                 }
                 session.abort();
             }
-            let outcome = session.navigate_tree(entry, opts).await.map_err(|e| e.to_string());
+            let outcome = session
+                .navigate_tree(entry, opts)
+                .await
+                .map_err(|e| e.to_string());
             let _ = tx.send(TreeNavMsg { target, outcome });
         });
     }
@@ -187,7 +203,9 @@ impl<B: Backend> App<B> {
         match outcome {
             Ok(o) if o.aborted => {
                 // Pi `:4805-4808` — status, then re-show the tree at the same entry.
-                self.state.transcript.push_status("Branch summarization cancelled");
+                self.state
+                    .transcript
+                    .push_status("Branch summarization cancelled");
                 self.state.pending_tree_nav = Some(PendingTreeNav { target });
                 return Some(AppCommand::OpenSelector(SelectorKind::Tree));
             }
@@ -219,7 +237,10 @@ impl<B: Backend> App<B> {
                 }
                 self.state.transcript.push_status("navigated session tree");
             }
-            Err(e) => self.state.transcript.push_status(format!("tree error: {e}")),
+            Err(e) => self
+                .state
+                .transcript
+                .push_status(format!("tree error: {e}")),
         }
         None
     }

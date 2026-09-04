@@ -17,7 +17,12 @@
 //! The assertion is deliberately weak — *some* status must appear — because the point is
 //! reachability, not the message. A wrong message is a different bug; no message at all is this
 //! one.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::sync::Arc;
 
@@ -69,7 +74,10 @@ async fn status_after(kind: SelectorKind, value: &str) -> String {
         screen(&app)
     };
     app.execute_command(
-        AppCommand::ConfirmSelectionAsDefault { kind, value: value.to_string() },
+        AppCommand::ConfirmSelectionAsDefault {
+            kind,
+            value: value.to_string(),
+        },
         &session,
         None,
     )
@@ -118,7 +126,12 @@ async fn hide_thinking_refreshes_the_thinking_level_row_in_place() {
     let session = session(dir.path()).await;
     let mut app = App::new(TestBackend::new(100, 40), UiTheme::dark()).unwrap();
 
-    app.execute_command(AppCommand::OpenSelector(SelectorKind::Settings), &session, None).await;
+    app.execute_command(
+        AppCommand::OpenSelector(SelectorKind::Settings),
+        &session,
+        None,
+    )
+    .await;
     // The list windows 10 of 29 rows and `Thinking level` is not in the first page, so filter to
     // it through the real search box. `filtered` holds INDICES into `rows` (`apply_filter`), so a
     // row written through while a filter is active still shows — which is the property under test.
@@ -132,8 +145,14 @@ async fn hide_thinking_refreshes_the_thinking_level_row_in_place() {
     }
     app.draw().unwrap();
     let before = screen(&app);
-    assert!(before.contains("Thinking level"), "the row is not on screen at all:\n{before}");
-    assert!(!before.contains("(hidden)"), "clean before the flip:\n{before}");
+    assert!(
+        before.contains("Thinking level"),
+        "the row is not on screen at all:\n{before}"
+    );
+    assert!(
+        !before.contains("(hidden)"),
+        "clean before the flip:\n{before}"
+    );
 
     // The command BOTH writers dispatch: the row cycle via the `Apply` payload, and `Ctrl+T`.
     app.execute_command(
@@ -164,5 +183,8 @@ async fn hide_thinking_refreshes_the_thinking_level_row_in_place() {
     .await;
     app.draw().unwrap();
     let visible = screen(&app);
-    assert!(!visible.contains("(hidden)"), "a stale marker survived the flip back:\n{visible}");
+    assert!(
+        !visible.contains("(hidden)"),
+        "a stale marker survived the flip back:\n{visible}"
+    );
 }

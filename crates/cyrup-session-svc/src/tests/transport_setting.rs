@@ -17,15 +17,20 @@
 //! only consumer is `ai/src/api/openai-codex-responses.ts:300,1465`, which is one of the four
 //! unported wire APIs. So this proves the setting now reaches the provider boundary; making a
 //! provider ACT on it is provider-side work outside this crate.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use cyrup_core::StopReason;
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider, FauxResponseStep};
-use cyrup_provider::{Provider, Transport};
 use crate::{SessionBuilder, SessionConfig, Settings};
+use cyrup_core::StopReason;
+use cyrup_provider::faux::{FauxProvider, FauxResponseStep, faux_assistant_message, faux_text};
+use cyrup_provider::{Provider, Transport};
 use tempfile::TempDir;
 
 struct Fixture {
@@ -40,7 +45,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 /// Run one prompt through a real session built with `cli` as its settings layer, and return every
@@ -50,19 +59,27 @@ async fn transports_seen_with(cli: Settings) -> Vec<Option<Transport>> {
     let seen: Arc<Mutex<Vec<Option<Transport>>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = seen.clone();
     let faux = Arc::new(FauxProvider::new());
-    faux.set_response_steps(vec![FauxResponseStep::factory(move |_ctx, opts, _s, _m| {
-        sink.lock().unwrap().push(opts.transport);
-        faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)
-    })]);
+    faux.set_response_steps(vec![FauxResponseStep::factory(
+        move |_ctx, opts, _s, _m| {
+            sink.lock().unwrap().push(opts.transport);
+            faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)
+        },
+    )]);
     let provider: Arc<dyn Provider> = faux;
     let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
     cfg.trust_override = Some(true);
-    let session =
-        SessionBuilder::new(provider, cfg).cli_settings(cli).build().await.unwrap();
+    let session = SessionBuilder::new(provider, cfg)
+        .cli_settings(cli)
+        .build()
+        .await
+        .unwrap();
     let _ = session.prompt("hello").await.unwrap();
     session.wait_for_idle().await;
     let out = seen.lock().unwrap().clone();
-    assert!(!out.is_empty(), "the provider was never called — the run did not reach the stream seam");
+    assert!(
+        !out.is_empty(),
+        "the provider was never called — the run did not reach the stream seam"
+    );
     out
 }
 
@@ -80,8 +97,7 @@ async fn configured_transport_reaches_the_provider_stream_options() {
 /// round-trips (Pi's `Transport` is `"sse" | "websocket" | "websocket-cached" | "auto"`).
 #[tokio::test]
 async fn websocket_transport_round_trips_distinctly() {
-    let seen =
-        transports_seen_with(Settings::parse(r#"{"transport":"websocket"}"#).unwrap()).await;
+    let seen = transports_seen_with(Settings::parse(r#"{"transport":"websocket"}"#).unwrap()).await;
     assert!(
         seen.iter().all(|t| *t == Some(Transport::Websocket)),
         "`transport: websocket` must reach StreamOptions.transport, saw {seen:?}"

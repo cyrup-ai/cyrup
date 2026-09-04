@@ -4,13 +4,10 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::background::{RunId, RunMode, RunPaths};
 use crate::background::atomic::write_atomic_json;
+use crate::background::{RunId, RunMode, RunPaths};
 use crate::error::SubagentError;
 use crate::exec::ResolvedAgentPersona;
-use crate::fork_context::resolve_effective_context;
-use crate::spawn::chain_graph::{RunnerStep, SingleStepSpec};
-use crate::spawn::depth::resolve_effective_depth;
 use crate::extension::executor::SubagentExecutor;
 use crate::extension::executor::paths::resolve_background_storage_roots;
 use crate::extension::executor::requests::{BackgroundSingleRequest, BackgroundStepsSpec};
@@ -19,9 +16,11 @@ use crate::extension::tool::task_items::{
     normalize_single_output_override, parse_tool_output_mode, resolve_single_output_path,
     resolve_single_run_output_base_dir, resolve_single_run_session_root,
 };
+use crate::fork_context::resolve_effective_context;
+use crate::spawn::chain_graph::{RunnerStep, SingleStepSpec};
+use crate::spawn::depth::resolve_effective_depth;
 
 impl SubagentExecutor {
-
     // ---------------------------------------------------------------------------------------
     // Background dispatch (the tool's `bg: true` shape; genuine second, detached OS-process hop)
     // ---------------------------------------------------------------------------------------
@@ -158,7 +157,9 @@ impl SubagentExecutor {
         // `async-execution.ts:989`/`:1037`). Same defect as the foreground site: a hard-coded temp
         // root made the `artifactDir` preference, and upstream's `project` default, unreachable.
         let art_dir = crate::artifacts::resolve_artifacts_dir(
-            self.host_services().and_then(|s| s.session_file()).as_deref(),
+            self.host_services()
+                .and_then(|s| s.session_file())
+                .as_deref(),
             Some(cwd),
             cwd,
             cfg.artifact_dir_preference(),
@@ -410,7 +411,11 @@ impl SubagentExecutor {
         // detached hop-2 process cannot be handed a `std::time::Instant` (opaque, monotonic,
         // process-local), and computing the deadline on the far side would silently refund every
         // millisecond the hop-1 spawn and hop-2 startup consumed.
-        let deadline_at_ms = timeout_ms.map(|ms| u64::try_from(crate::time::now_epoch_millis()).unwrap_or(0).saturating_add(ms));
+        let deadline_at_ms = timeout_ms.map(|ms| {
+            u64::try_from(crate::time::now_epoch_millis())
+                .unwrap_or(0)
+                .saturating_add(ms)
+        });
 
         // pi `executeAsyncChain`/`executeAsyncSingle` (`async-execution.ts:631-634,890-893` @v0.34.0): a
         // background run started from WITHIN an already-nested run (this process inherited a nested
@@ -649,7 +654,11 @@ impl SubagentExecutor {
         }
 
         self.tracker
-            .track(run_id.clone(), run_paths, Some(std::time::SystemTime::now()))
+            .track(
+                run_id.clone(),
+                run_paths,
+                Some(std::time::SystemTime::now()),
+            )
             .await;
 
         Ok(run_id)
@@ -658,7 +667,12 @@ impl SubagentExecutor {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
     use crate::discovery::types::AgentReadScope;
@@ -713,8 +727,10 @@ mod tests {
             .await
             .expect("spawn_background should succeed for a resolvable builtin agent");
 
-        let crate::background::RunArtifactRoots { async_root, results_dir } =
-            crate::background::run_artifact_roots(dir.path());
+        let crate::background::RunArtifactRoots {
+            async_root,
+            results_dir,
+        } = crate::background::run_artifact_roots(dir.path());
         let run_paths = crate::background::RunPaths::for_run(&async_root, &results_dir, &run_id);
         let raw = std::fs::read_to_string(run_paths.run_dir.join("runner-config.json"))
             .expect("spawn_background must have written runner-config.json before spawning hop 1");
@@ -770,7 +786,11 @@ mod tests {
             "an explicit sessionDir becomes the ROOT verbatim and the child gets pi's `run-0` leaf"
         );
         // `share` — run-level.
-        assert_eq!(cfg.share, Some(true), "the `share` override must reach the runner config");
+        assert_eq!(
+            cfg.share,
+            Some(true),
+            "the `share` override must reach the runner config"
+        );
         // `artifacts` omitted => enabled (pi's `enabled: params.artifacts !== false`).
         assert!(
             cfg.artifacts_dir.is_some(),
@@ -838,8 +858,10 @@ mod tests {
             .await
             .expect("spawn_background should succeed for a resolvable builtin agent");
 
-        let crate::background::RunArtifactRoots { async_root, results_dir } =
-            crate::background::run_artifact_roots(dir.path());
+        let crate::background::RunArtifactRoots {
+            async_root,
+            results_dir,
+        } = crate::background::run_artifact_roots(dir.path());
         let run_paths = crate::background::RunPaths::for_run(&async_root, &results_dir, &run_id);
         let raw = std::fs::read_to_string(run_paths.run_dir.join("runner-config.json"))
             .expect("runner-config.json must exist");
@@ -912,8 +934,10 @@ mod tests {
                 .await
                 .expect("spawn_background should succeed for a resolvable builtin agent");
 
-            let crate::background::RunArtifactRoots { async_root, results_dir } =
-                crate::background::run_artifact_roots(dir.path());
+            let crate::background::RunArtifactRoots {
+                async_root,
+                results_dir,
+            } = crate::background::run_artifact_roots(dir.path());
             let run_paths =
                 crate::background::RunPaths::for_run(&async_root, &results_dir, &run_id);
             let raw = std::fs::read_to_string(run_paths.run_dir.join("runner-config.json"))
@@ -923,10 +947,17 @@ mod tests {
             let RunnerStep::SingleStep(step) = &cfg.steps[0] else {
                 panic!("expected one SingleStep");
             };
-            let output = step.output_path.clone().expect("output path must be resolved");
+            let output = step
+                .output_path
+                .clone()
+                .expect("output path must be resolved");
             // Strip the run-scoped leaf so the three runs' paths are comparable.
             let shape = output.replace(run_id.as_str(), "<runId>");
-            resolved.push((artifacts, shape, cfg.artifacts_dir.is_some() && cfg.artifact_config.enabled));
+            resolved.push((
+                artifacts,
+                shape,
+                cfg.artifacts_dir.is_some() && cfg.artifact_config.enabled,
+            ));
         }
 
         assert!(
@@ -993,8 +1024,10 @@ mod tests {
             .expect("spawn_background should succeed for a resolvable builtin agent");
         let after = u64::try_from(crate::time::now_epoch_millis()).unwrap_or(0);
 
-        let crate::background::RunArtifactRoots { async_root, results_dir } =
-            crate::background::run_artifact_roots(dir.path());
+        let crate::background::RunArtifactRoots {
+            async_root,
+            results_dir,
+        } = crate::background::run_artifact_roots(dir.path());
         let run_paths = crate::background::RunPaths::for_run(&async_root, &results_dir, &run_id);
         let raw = std::fs::read_to_string(run_paths.run_dir.join("runner-config.json"))
             .expect("runner-config.json must exist");
@@ -1116,8 +1149,10 @@ mod tests {
         );
         assert_ne!(a.as_str(), b.as_str(), "two runs must never share a run id");
 
-        let crate::background::RunArtifactRoots { async_root, results_dir } =
-            crate::background::run_artifact_roots(dir.path());
+        let crate::background::RunArtifactRoots {
+            async_root,
+            results_dir,
+        } = crate::background::run_artifact_roots(dir.path());
         let read_output = |run: &RunId| {
             let paths = crate::background::RunPaths::for_run(&async_root, &results_dir, run);
             let cfg: crate::background::runner_main::RunnerConfig = serde_json::from_str(
@@ -1128,7 +1163,9 @@ mod tests {
             let RunnerStep::SingleStep(step) = &cfg.steps[0] else {
                 panic!("expected one SingleStep");
             };
-            step.output_path.clone().expect("output path must be resolved")
+            step.output_path
+                .clone()
+                .expect("output path must be resolved")
         };
         let (out_a, out_b) = (read_output(&a), read_output(&b));
         assert_ne!(
@@ -1141,7 +1178,10 @@ mod tests {
         // surfaced as an error rather than a silent share.
         for run in [&a, &b] {
             let paths = crate::background::RunPaths::for_run(&async_root, &results_dir, run);
-            assert!(paths.run_dir.exists(), "each run's directory must be created before its write");
+            assert!(
+                paths.run_dir.exists(),
+                "each run's directory must be created before its write"
+            );
         }
     }
 
@@ -1222,8 +1262,10 @@ mod tests {
                 .await
                 .expect("spawn_background should succeed");
 
-            let crate::background::RunArtifactRoots { async_root, results_dir } =
-                crate::background::run_artifact_roots(dir.path());
+            let crate::background::RunArtifactRoots {
+                async_root,
+                results_dir,
+            } = crate::background::run_artifact_roots(dir.path());
             let run_paths =
                 crate::background::RunPaths::for_run(&async_root, &results_dir, &run_id);
             // Read back through the REAL file the detached process reads — not a Rust value handed
@@ -1254,9 +1296,15 @@ mod tests {
             // silent WEAKENING of exactly these three is the failure mode this test exists for.
             match (&lowered, &expected) {
                 (Some(l), Some(e)) => {
-                    assert_eq!(l.required_level, e.required_level, "required_level for {policy}");
+                    assert_eq!(
+                        l.required_level, e.required_level,
+                        "required_level for {policy}"
+                    );
                     assert_eq!(l.verify, e.verify, "verify[] commands for {policy}");
-                    assert!(l.explicit, "an explicitly declared policy stays explicit: {policy}");
+                    assert!(
+                        l.explicit,
+                        "an explicitly declared policy stays explicit: {policy}"
+                    );
                 }
                 (None, None) => {
                     // `"auto"` lowers to `None` — "infer heuristically", which is NOT a weaker
@@ -1307,8 +1355,10 @@ mod tests {
             .await
             .expect("spawn_background should succeed for a resolvable builtin agent");
 
-        let crate::background::RunArtifactRoots { async_root, results_dir } =
-            crate::background::run_artifact_roots(dir.path());
+        let crate::background::RunArtifactRoots {
+            async_root,
+            results_dir,
+        } = crate::background::run_artifact_roots(dir.path());
         let run_paths = crate::background::RunPaths::for_run(&async_root, &results_dir, &run_id);
         let cfg_path = run_paths.run_dir.join("runner-config.json");
         let raw = std::fs::read_to_string(&cfg_path)
@@ -1316,7 +1366,10 @@ mod tests {
         let cfg: crate::background::runner_main::RunnerConfig =
             serde_json::from_str(&raw).expect("runner-config.json must deserialize");
         let RunnerStep::SingleStep(step) = &cfg.steps[0] else {
-            panic!("a single-agent background run must produce exactly one SingleStep, got: {:?}", cfg.steps[0]);
+            panic!(
+                "a single-agent background run must produce exactly one SingleStep, got: {:?}",
+                cfg.steps[0]
+            );
         };
         assert_eq!(
             step.model.as_ref().map(cyrup_core::ModelId::as_str),
@@ -1371,8 +1424,10 @@ mod tests {
             .await
             .expect("spawn_background should succeed for a resolvable builtin agent");
 
-        let crate::background::RunArtifactRoots { async_root, results_dir } =
-            crate::background::run_artifact_roots(dir.path());
+        let crate::background::RunArtifactRoots {
+            async_root,
+            results_dir,
+        } = crate::background::run_artifact_roots(dir.path());
         let run_paths = crate::background::RunPaths::for_run(&async_root, &results_dir, &run_id);
         let raw = std::fs::read_to_string(run_paths.run_dir.join("runner-config.json"))
             .expect("spawn_background must have written runner-config.json before spawning hop 1");
@@ -1453,8 +1508,10 @@ mod tests {
             .await
             .expect("spawn_background should succeed for a resolvable builtin agent");
 
-        let crate::background::RunArtifactRoots { async_root, results_dir } =
-            crate::background::run_artifact_roots(dir.path());
+        let crate::background::RunArtifactRoots {
+            async_root,
+            results_dir,
+        } = crate::background::run_artifact_roots(dir.path());
         let run_paths = crate::background::RunPaths::for_run(&async_root, &results_dir, &run_id);
         let raw = std::fs::read_to_string(run_paths.run_dir.join("runner-config.json"))
             .expect("spawn_background must have written runner-config.json before spawning hop 1");
@@ -1476,7 +1533,9 @@ mod tests {
 
         let cfg: crate::background::runner_main::RunnerConfig =
             serde_json::from_str(&raw).expect("runner-config.json must deserialize");
-        let control = cfg.control.expect("the resolved control config must be present");
+        let control = cfg
+            .control
+            .expect("the resolved control config must be present");
         assert_eq!(control.needs_attention_after_ms, 1_234);
         assert_eq!(control.active_notice_after_ms, 22_000);
         assert_eq!(
@@ -1491,5 +1550,4 @@ mod tests {
             "and an entirely unmentioned field falls through to DEFAULT_CONTROL_CONFIG"
         );
     }
-
 }

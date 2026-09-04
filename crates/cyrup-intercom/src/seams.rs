@@ -35,7 +35,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use cyrup_ext::DialogOptions;
-use cyrup_ext_subagents::tui::intercom::{ClarifyChannel, ClarifyRequest, DeliveryChannel, IntercomPayload, SteerChannel};
+use cyrup_ext_subagents::tui::intercom::{
+    ClarifyChannel, ClarifyRequest, DeliveryChannel, IntercomPayload, SteerChannel,
+};
 
 use crate::relay::format_result_relay;
 use crate::session_state::SharedIntercomState;
@@ -71,12 +73,18 @@ impl IntercomDeliveryChannel {
     /// Build the channel over the shared state + this orchestrator's supervisor target (if any).
     #[must_use]
     pub fn new(state: Arc<SharedIntercomState>, supervisor_target: Option<String>) -> Self {
-        Self { state, supervisor_target }
+        Self {
+            state,
+            supervisor_target,
+        }
     }
 }
 
 impl DeliveryChannel for IntercomDeliveryChannel {
-    fn send(&self, payload: IntercomPayload) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
+    fn send(
+        &self,
+        payload: IntercomPayload,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
         Box::pin(async move {
             // Format ONLY the allowlisted fields into the relay body (R-SA-124 preserved).
             let text = format_result_relay(&payload);
@@ -96,7 +104,12 @@ impl DeliveryChannel for IntercomDeliveryChannel {
             // pi's relay path uses `ensureConnected("background")` (`index.ts:1000`), so a relay that
             // lands while the connection is down reconnects instead of degrading forever; a failure
             // here re-arms the reconnect ladder (background is the one reason that does).
-            let Ok(client) = crate::connect::ensure_connected(&self.state, crate::connect::ConnectReason::Background).await else {
+            let Ok(client) = crate::connect::ensure_connected(
+                &self.state,
+                crate::connect::ConnectReason::Background,
+            )
+            .await
+            else {
                 return Ok(false); // not connected → degrade (keep full inline).
             };
             let resolved = match self.state.resolve_target(&client, &target).await {
@@ -106,10 +119,22 @@ impl DeliveryChannel for IntercomDeliveryChannel {
             // `currentSessionTargetMatches(parsed.to, target, activeClient)`
             // (`v0.10.1 index.ts:1335`), the POST-resolution check: a name that resolved to this
             // session's own broker id is still self-delivery. Neither check subsumes the other.
-            if self.state.current_session_target_matches(&target, Some(&resolved)) {
+            if self
+                .state
+                .current_session_target_matches(&target, Some(&resolved))
+            {
                 return deliver_local_relay(&self.state, text);
             }
-            match client.send(&resolved, SendOptions { text, ..Default::default() }).await {
+            match client
+                .send(
+                    &resolved,
+                    SendOptions {
+                        text,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
                 Ok(result) => Ok(result.delivered),
                 Err(e) => Err(e.to_string()),
             }
@@ -175,7 +200,11 @@ fn deliver_local_relay(state: &SharedIntercomState, text: String) -> Result<bool
         timestamp: now.into(),
         reply_to: None,
         expects_reply: None,
-        content: MessageContent { text, attachments: None, ..Default::default() },
+        content: MessageContent {
+            text,
+            attachments: None,
+            ..Default::default()
+        },
         ..Default::default()
     };
     // Best-effort surface + trigger-turn: neither leg's failure changes "delivered
@@ -206,13 +235,22 @@ impl IntercomSteerChannel {
 }
 
 impl SteerChannel for IntercomSteerChannel {
-    fn steer(&self, target: String, text: String) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
+    fn steer(
+        &self,
+        target: String,
+        text: String,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
         Box::pin(async move {
             // Not connected → no registered receiver reachable (the genuine delivery-failed fallback,
             // pi's "intercom target is not registered" precondition), NOT a transport error. As with
             // the delivery channel, reconnect first (`ensureConnected("background")`, `index.ts:1000`)
             // so a dropped connection does not permanently disable steering.
-            let Ok(client) = crate::connect::ensure_connected(&self.state, crate::connect::ConnectReason::Background).await else {
+            let Ok(client) = crate::connect::ensure_connected(
+                &self.state,
+                crate::connect::ConnectReason::Background,
+            )
+            .await
+            else {
                 return Ok(false);
             };
             // Resolve the deterministic target (name) to a live session id when one is registered;
@@ -225,13 +263,25 @@ impl SteerChannel for IntercomSteerChannel {
             // (`v0.10.1 index.ts:1316`, `:1335`). Steering is the one seam that sends to an ARBITRARY
             // resolved target, so a target that names or resolves to this session would loop a steer
             // back into the very run it was meant to redirect.
-            if self.state.current_session_target_matches(&target, Some(&resolved)) {
+            if self
+                .state
+                .current_session_target_matches(&target, Some(&resolved))
+            {
                 return Ok(false);
             }
             // Unsolicited send (no `reply_to`/`expects_reply`) — same call shape as
             // `IntercomDeliveryChannel::send`. `delivered` is pi's `delivered === true` signal: a
             // registered child took delivery.
-            match client.send(&resolved, SendOptions { text, ..Default::default() }).await {
+            match client
+                .send(
+                    &resolved,
+                    SendOptions {
+                        text,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
                 Ok(result) => Ok(result.delivered),
                 Err(e) => Err(e.to_string()),
             }
@@ -271,18 +321,23 @@ impl IntercomClarifyChannel {
 }
 
 impl ClarifyChannel for IntercomClarifyChannel {
-    fn ask(&self, request: ClarifyRequest) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
+    fn ask(
+        &self,
+        request: ClarifyRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
         Box::pin(async move {
             // (1) Correlate to the child ask this orchestrator RECEIVED over the broker.
             let (child_target, question_id) = self.correlate(&request).ok_or_else(|| {
-                format!("no pending child ask correlates to run {}", request.run_id.as_str())
+                format!(
+                    "no pending child ask correlates to run {}",
+                    request.run_id.as_str()
+                )
             })?;
 
             // The live human source (P-1) + the broker client to route the answer back.
-            let services = self
-                .state
-                .host_services()
-                .ok_or_else(|| "no live host services (P-1 unbound): cannot surface the ask".to_string())?;
+            let services = self.state.host_services().ok_or_else(|| {
+                "no live host services (P-1 unbound): cannot surface the ask".to_string()
+            })?;
             // pi has NO bare `client` read on any send path — every one goes through
             // `ensureConnected(...)` (`v0.7.0 index.ts:805,959,1000,1231,1477,1827,1864`), and the
             // relay/clarify path specifically uses `"background"` (`:1000`). A bare read fails a
@@ -291,12 +346,14 @@ impl ClarifyChannel for IntercomClarifyChannel {
             // perspective — even though the ladder is already armed and about to reconnect. Its two
             // siblings in this file (`IntercomDeliveryChannel::send`, `IntercomSteerChannel::steer`)
             // already do this.
-            let client =
-                crate::connect::ensure_connected(&self.state, crate::connect::ConnectReason::Background)
-                    .await
-                    .map_err(|e| {
-                        format!("intercom not connected: cannot route the human answer to the child: {e}")
-                    })?;
+            let client = crate::connect::ensure_connected(
+                &self.state,
+                crate::connect::ConnectReason::Background,
+            )
+            .await
+            .map_err(|e| {
+                format!("intercom not connected: cannot route the human answer to the child: {e}")
+            })?;
 
             // C3 (reconciliation §1 / §4 step 6): acquire the ONE host-owned, session-scoped human-
             // interaction lock BEFORE surfacing the prompt, WAITING if the permission gate's `ask`
@@ -317,7 +374,11 @@ impl ClarifyChannel for IntercomClarifyChannel {
             //     so drive it on a blocking thread rather than this async task.
             let prompt = request.prompt.clone();
             let answer = tokio::task::spawn_blocking(move || {
-                services.input(&prompt, Some(CLARIFY_INPUT_PLACEHOLDER), &DialogOptions::default())
+                services.input(
+                    &prompt,
+                    Some(CLARIFY_INPUT_PLACEHOLDER),
+                    &DialogOptions::default(),
+                )
             })
             .await
             .map_err(|e| format!("clarify input task failed: {e}"))?;
@@ -332,11 +393,14 @@ impl ClarifyChannel for IntercomClarifyChannel {
             // (3) Route the answer back to the STILL-ALIVE child over the broker (reply_to =
             //     questionId), so the child's blocking `contact_supervisor` call unblocks.
             client
-                .send(&child_target, SendOptions {
-                    text: answer.clone(),
-                    reply_to: Some(question_id.clone()),
-                    ..Default::default()
-                })
+                .send(
+                    &child_target,
+                    SendOptions {
+                        text: answer.clone(),
+                        reply_to: Some(question_id.clone()),
+                        ..Default::default()
+                    },
+                )
                 .await
                 .map_err(|e| e.to_string())?;
 
@@ -356,7 +420,9 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
     use super::*;
     use crate::config::IntercomConfig;
-    use crate::identity::{ChildMessageKind, ChildOrchestratorMetadata, format_child_orchestrator_message};
+    use crate::identity::{
+        ChildMessageKind, ChildOrchestratorMetadata, format_child_orchestrator_message,
+    };
     use crate::transport::protocol::{Message, MessageContent, SessionInfo, now_ms};
 
     fn meta() -> ChildOrchestratorMetadata {
@@ -372,7 +438,11 @@ mod tests {
 
     #[test]
     fn clarify_correlates_child_ask_by_run_id() {
-        let state = Arc::new(SharedIntercomState::new(IntercomConfig::default(), 600_000, std::path::PathBuf::from("/w")));
+        let state = Arc::new(SharedIntercomState::new(
+            IntercomConfig::default(),
+            600_000,
+            std::path::PathBuf::from("/w"),
+        ));
         // Simulate the orchestrator having received the child's ask over the broker.
         let body = format_child_orchestrator_message(ChildMessageKind::Ask, &meta(), "Which DB?");
         let from = SessionInfo {
@@ -398,10 +468,18 @@ mod tests {
             timestamp: 0u64.into(),
             reply_to: None,
             expects_reply: Some(true),
-            content: MessageContent { text: body, attachments: None, ..Default::default() },
+            content: MessageContent {
+                text: body,
+                attachments: None,
+                ..Default::default()
+            },
             ..Default::default()
         };
-        state.tracker.lock().unwrap().record_incoming_message(from, msg, now_ms());
+        state
+            .tracker
+            .lock()
+            .unwrap()
+            .record_incoming_message(from, msg, now_ms());
 
         let channel = IntercomClarifyChannel::new(state);
         let request = ClarifyRequest {
@@ -409,14 +487,20 @@ mod tests {
             step_index: Some(0),
             prompt: "Which DB?".to_string(),
         };
-        let (child_target, question_id) = channel.correlate(&request).expect("correlates the child ask");
+        let (child_target, question_id) = channel
+            .correlate(&request)
+            .expect("correlates the child ask");
         assert_eq!(child_target, "child-session");
         assert_eq!(question_id, "question-123");
     }
 
     #[tokio::test]
     async fn clarify_ask_degrades_to_no_live_channel_without_host_services() {
-        let state = Arc::new(SharedIntercomState::new(IntercomConfig::default(), 600_000, std::path::PathBuf::from("/w")));
+        let state = Arc::new(SharedIntercomState::new(
+            IntercomConfig::default(),
+            600_000,
+            std::path::PathBuf::from("/w"),
+        ));
         // Record a matching pending child ask so correlation SUCCEEDS — the Err below is then
         // unambiguously the "no host services bound" (P-1 unbound) degrade, not a correlation miss.
         let body = format_child_orchestrator_message(ChildMessageKind::Ask, &meta(), "Which DB?");
@@ -443,10 +527,18 @@ mod tests {
             timestamp: 0u64.into(),
             reply_to: None,
             expects_reply: Some(true),
-            content: MessageContent { text: body, attachments: None, ..Default::default() },
+            content: MessageContent {
+                text: body,
+                attachments: None,
+                ..Default::default()
+            },
             ..Default::default()
         };
-        state.tracker.lock().unwrap().record_incoming_message(from, msg, now_ms());
+        state
+            .tracker
+            .lock()
+            .unwrap()
+            .record_incoming_message(from, msg, now_ms());
 
         let channel = IntercomClarifyChannel::new(state);
         let request = ClarifyRequest {
@@ -455,25 +547,44 @@ mod tests {
             prompt: "ok?".to_string(),
         };
         // No HostServices bound → Err (→ ClarifyOutcome::NoLiveChannel); never blocks/panics.
-        let err = channel.ask(request).await.expect_err("no human source (P4 unbound) → NoLiveChannel");
-        assert!(err.contains("host services"), "degrade Err names the unbound host services: {err}");
+        let err = channel
+            .ask(request)
+            .await
+            .expect_err("no human source (P4 unbound) → NoLiveChannel");
+        assert!(
+            err.contains("host services"),
+            "degrade Err names the unbound host services: {err}"
+        );
     }
 
     #[tokio::test]
     async fn steer_without_a_connected_client_reports_not_delivered() {
         // No broker client bound → the steer degrades to `Ok(false)` (the genuine "not registered"
         // delivery-failed fallback `control_resume` surfaces as pi's guidance), never `Err`/panic.
-        let state = Arc::new(SharedIntercomState::new(IntercomConfig::default(), 600_000, std::path::PathBuf::from("/w")));
+        let state = Arc::new(SharedIntercomState::new(
+            IntercomConfig::default(),
+            600_000,
+            std::path::PathBuf::from("/w"),
+        ));
         let channel = IntercomSteerChannel::new(state);
         assert_eq!(
-            channel.steer("subagent-worker-run-1-1".to_string(), "Follow-up".to_string()).await,
+            channel
+                .steer(
+                    "subagent-worker-run-1-1".to_string(),
+                    "Follow-up".to_string()
+                )
+                .await,
             Ok(false)
         );
     }
 
     #[tokio::test]
     async fn delivery_without_supervisor_target_reports_not_delivered() {
-        let state = Arc::new(SharedIntercomState::new(IntercomConfig::default(), 600_000, std::path::PathBuf::from("/w")));
+        let state = Arc::new(SharedIntercomState::new(
+            IntercomConfig::default(),
+            600_000,
+            std::path::PathBuf::from("/w"),
+        ));
         let channel = IntercomDeliveryChannel::new(state, None);
         let payload = IntercomPayload {
             run_id: cyrup_ext_subagents::background::RunId::from_token("run00000000000001"),
@@ -482,7 +593,9 @@ mod tests {
             outputs: vec!["done".to_string()],
             status: cyrup_ext_subagents::tui::intercom::SubagentResultStatus::Completed,
             summary: "1 completed".to_string(),
-            child_statuses: vec![cyrup_ext_subagents::tui::intercom::SubagentResultStatus::Completed],
+            child_statuses: vec![
+                cyrup_ext_subagents::tui::intercom::SubagentResultStatus::Completed,
+            ],
             total_tokens: 10,
         };
         // No supervisor + no host services → Ok(false) (degrade, keep full inline).
@@ -500,8 +613,15 @@ mod tests {
         injected: std::sync::Mutex<Vec<InjectedCall>>,
     }
     impl cyrup_ext::HostServices for SurfaceRecorder {
-        fn append_entry(&self, custom_type: &str, data: &serde_json::Value) -> std::result::Result<String, String> {
-            self.entries.lock().unwrap().push((custom_type.to_string(), data.clone()));
+        fn append_entry(
+            &self,
+            custom_type: &str,
+            data: &serde_json::Value,
+        ) -> std::result::Result<String, String> {
+            self.entries
+                .lock()
+                .unwrap()
+                .push((custom_type.to_string(), data.clone()));
             Ok("entry-1".to_string())
         }
         fn inject_message(
@@ -538,7 +658,11 @@ mod tests {
     async fn top_level_delivery_surfaces_locally_with_pi_attribution() {
         // D: a top-level orchestrator (no supervisor_target) with a live HostServices surfaces the
         // relay LOCALLY (append_entry + a trigger-turn inject_message) and reports delivered=true.
-        let state = Arc::new(SharedIntercomState::new(IntercomConfig::default(), 600_000, std::path::PathBuf::from("/w")));
+        let state = Arc::new(SharedIntercomState::new(
+            IntercomConfig::default(),
+            600_000,
+            std::path::PathBuf::from("/w"),
+        ));
         let rec = Arc::new(SurfaceRecorder::default());
         state.set_host_services(rec.clone());
         let channel = IntercomDeliveryChannel::new(state, None);
@@ -550,7 +674,9 @@ mod tests {
             total_tokens: 42,
             status: cyrup_ext_subagents::tui::intercom::SubagentResultStatus::Completed,
             summary: "1 completed".to_string(),
-            child_statuses: vec![cyrup_ext_subagents::tui::intercom::SubagentResultStatus::Completed],
+            child_statuses: vec![
+                cyrup_ext_subagents::tui::intercom::SubagentResultStatus::Completed,
+            ],
         };
         assert_eq!(channel.send(payload).await, Ok(true));
 
@@ -565,9 +691,14 @@ mod tests {
             entries[0].1["from"]["name"], "subagent-result",
             "the synthetic sender pi stamps (`index.ts:901-902`) reaches the durable surface"
         );
-        assert_eq!(entries[0].1["from"]["status"], "result", "pi `status: \"result\"`, `index.ts:1045`");
+        assert_eq!(
+            entries[0].1["from"]["status"], "result",
+            "pi `status: \"result\"`, `index.ts:1045`"
+        );
         assert!(
-            entries[0].1["bodyText"].as_str().is_some_and(|b| b.contains("run00000000000002")),
+            entries[0].1["bodyText"]
+                .as_str()
+                .is_some_and(|b| b.contains("run00000000000002")),
             "the appended body still carries the run id: {:?}",
             entries[0].1["bodyText"]
         );
@@ -575,7 +706,10 @@ mod tests {
         let injected = rec.injected.lock().unwrap();
         assert_eq!(injected.len(), 1, "a turn is triggered over the relay");
         let content = &injected[0].0;
-        assert!(content.contains("the answer"), "the relay body carries the output: {content:?}");
+        assert!(
+            content.contains("the answer"),
+            "the relay body carries the output: {content:?}"
+        );
         // THE ICOM-022 ASSERTION: the MODEL sees the attribution header, not a bare body.
         // `**From ${senderDisplay}** (${entry.from.cwd})…` (`v0.10.1 index.ts:891`). The `📨` was
         // dropped in v0.10.0 (`633e782`), and the `_{deliveryMetadata}_` line sits between the
@@ -597,7 +731,10 @@ mod tests {
         // `display: true` unconditionally. `HostServices::inject_message`'s `display` IS that flag
         // (`cyrup-ext/src/host/services.rs:333-344`), so it is true here exactly as it is on the
         // peer-message path, and the relay survives a transcript replay.
-        assert!(injected[0].2, "display=true, as on every `sendIncomingMessage` delivery");
+        assert!(
+            injected[0].2,
+            "display=true, as on every `sendIncomingMessage` delivery"
+        );
         assert!(
             injected[0].3,
             "trigger_turn is true (pi's `forceTrigger = true`, `v0.10.1 index.ts:1239`)"
@@ -611,7 +748,11 @@ mod tests {
     /// entirely, so this test fails against it.
     #[tokio::test]
     async fn top_level_delivery_queues_the_turn_context_like_pi() {
-        let state = Arc::new(SharedIntercomState::new(IntercomConfig::default(), 600_000, std::path::PathBuf::from("/w")));
+        let state = Arc::new(SharedIntercomState::new(
+            IntercomConfig::default(),
+            600_000,
+            std::path::PathBuf::from("/w"),
+        ));
         state.set_host_services(Arc::new(SurfaceRecorder::default()));
         let channel = IntercomDeliveryChannel::new(Arc::clone(&state), None);
         let payload = IntercomPayload {
@@ -622,7 +763,9 @@ mod tests {
             total_tokens: 7,
             status: cyrup_ext_subagents::tui::intercom::SubagentResultStatus::Completed,
             summary: "1 completed".to_string(),
-            child_statuses: vec![cyrup_ext_subagents::tui::intercom::SubagentResultStatus::Completed],
+            child_statuses: vec![
+                cyrup_ext_subagents::tui::intercom::SubagentResultStatus::Completed,
+            ],
         };
         assert_eq!(channel.send(payload).await, Ok(true));
 

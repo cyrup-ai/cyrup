@@ -159,7 +159,12 @@ impl AsyncWrite for BrokerStream {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
     use super::*;
     use crate::transport::target::{BrokerTcpEndpoint, INTERCOM_TCP_HOST};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -169,7 +174,9 @@ mod tests {
     /// network, no fixture socket file.
     #[tokio::test]
     async fn connect_opens_a_real_loopback_tcp_connection_for_the_tcp_target() {
-        let listener = tokio::net::TcpListener::bind((INTERCOM_TCP_HOST, 0)).await.unwrap();
+        let listener = tokio::net::TcpListener::bind((INTERCOM_TCP_HOST, 0))
+            .await
+            .unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = tokio::spawn(async move {
             let (mut stream, peer) = listener.accept().await.unwrap();
@@ -182,7 +189,9 @@ mod tests {
             port,
             state_id: Some("state-1".to_string()),
         });
-        let mut stream = BrokerStream::connect(&target).await.expect("connects over TCP");
+        let mut stream = BrokerStream::connect(&target)
+            .await
+            .expect("connects over TCP");
         let mut buf = [0u8; 4];
         stream.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"pong");
@@ -204,7 +213,9 @@ mod tests {
         });
 
         let target = BrokerConnectTarget::Socket(path);
-        let mut stream = BrokerStream::connect(&target).await.expect("connects over the socket");
+        let mut stream = BrokerStream::connect(&target)
+            .await
+            .expect("connects over the socket");
         let mut buf = [0u8; 4];
         stream.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"pong");
@@ -225,7 +236,9 @@ mod tests {
         // can fail it.
         let mut last: Option<Result<BrokerStream>> = None;
         for _ in 0..16 {
-            let listener = tokio::net::TcpListener::bind((INTERCOM_TCP_HOST, 0)).await.unwrap();
+            let listener = tokio::net::TcpListener::bind((INTERCOM_TCP_HOST, 0))
+                .await
+                .unwrap();
             let port = listener.local_addr().unwrap().port();
             drop(listener);
 
@@ -240,7 +253,10 @@ mod tests {
             }
             last = Some(outcome);
         }
-        panic!("a just-released ephemeral port was re-bound on all 16 attempts: {:?}", last.map(|r| r.is_ok()));
+        panic!(
+            "a just-released ephemeral port was re-bound on all 16 attempts: {:?}",
+            last.map(|r| r.is_ok())
+        );
     }
 
     // Unix-domain-socket specific (`UnixStream::pair()` / `UnixListener`): the transport-neutral
@@ -260,7 +276,10 @@ mod tests {
             buf
         });
         // With the read parked, this write must still land.
-        write_half.write_all(b"hi").await.expect("write is not starved by the parked read");
+        write_half
+            .write_all(b"hi")
+            .await
+            .expect("write is not starved by the parked read");
         let mut peer_buf = [0u8; 2];
         b.read_exact(&mut peer_buf).await.unwrap();
         assert_eq!(&peer_buf, b"hi");

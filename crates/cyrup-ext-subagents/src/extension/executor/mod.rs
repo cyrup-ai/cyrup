@@ -25,10 +25,10 @@ use std::sync::{Arc, OnceLock};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::background::tracker::JobTracker;
-use crate::registration::SubagentExtensionConfig;
 use crate::extension::executor::notices::ForegroundControlEntry;
 use crate::extension::executor::session_state::ParentModelMemory;
 use crate::extension::executor::spawn_budget::SpawnBudget;
+use crate::registration::SubagentExtensionConfig;
 
 /// The shared executor both the `subagent` tool and every slash-command handler dispatch through
 /// (R-SA-130: "single execution code path... both call sites are ordinary function calls into the
@@ -146,6 +146,12 @@ pub struct SubagentExecutor {
     /// P-1 `host_services` slot is bound (pi's `pi.sendMessage`), else the stderr
     /// [`crate::tui::notices::LoggingControlNoticeSink`] degradation.
     control_notice_sink_override: Option<Arc<dyn crate::tui::notices::ControlNoticeSink>>,
+    /// SUBA-084 — this executor's partition of pi's runtime agent registry
+    /// (`runtime-agent-registry.ts:71-74` @v0.64.0 keys records on the owning `ExtensionAPI`;
+    /// here the owner IS the executor). Read into every [`Self::discovery_config`] so a registered
+    /// agent reaches each discovery consumer; cleared by [`Self::teardown_session`]
+    /// (`clearRuntimeAgentsForPi`, `extension/index.ts:971`).
+    runtime_agents: Arc<crate::discovery::runtime_registry::RuntimeAgentRegistry>,
 }
 
 impl Default for SubagentExecutor {
@@ -172,9 +178,45 @@ impl SubagentExecutor {
             foreground_controls: Arc::new(std::sync::Mutex::new(HashMap::new())),
             spawn_budget: std::sync::Mutex::new(SpawnBudget::default()),
             parent_model_memory: std::sync::Mutex::new(ParentModelMemory::default()),
-            notices: Arc::new(AsyncMutex::new(crate::tui::notices::ControlNoticeState::new())),
+            notices: Arc::new(AsyncMutex::new(
+                crate::tui::notices::ControlNoticeState::new(),
+            )),
             control_notice_sink_override: None,
+            runtime_agents: Arc::new(
+                crate::discovery::runtime_registry::RuntimeAgentRegistry::new(),
+            ),
         }
+    }
+
+    /// SUBA-084 — pi's public `registerAgent({ pi, name, definition })` (`src/api/agents.ts:2`
+    /// re-exporting `registerRuntimeAgent`, `runtime-agent-registry.ts:371-398` @v0.64.0): define
+    /// an agent in-process, with no file and no settings write. It is visible to the very next
+    /// discovery (tool routing, `/run`, chains, the management `list`) and stays until the
+    /// returned handle's `dispose()` or this session's teardown. See
+    /// [`crate::discovery::runtime_registry`] for the validation and collision contract.
+    ///
+    /// # Errors
+    ///
+    /// Every upstream refusal (name/definition validation, a reserved code-owned selection name,
+    /// a builtin or runtime identity collision, the 200-per-owner cap) as
+    /// [`crate::error::SubagentError::Management`] with upstream's text.
+    pub fn register_agent(
+        &self,
+        name: &str,
+        definition: &crate::discovery::runtime_registry::RuntimeAgentDefinition,
+    ) -> Result<
+        crate::discovery::runtime_registry::RuntimeAgentRegistration,
+        crate::error::SubagentError,
+    > {
+        self.runtime_agents.register(name, definition)
+    }
+
+    /// SUBA-084 — this executor's runtime agent registry (the `pi`-keyed partition of
+    /// `runtime-agent-registry.ts:71-74`), for a caller that needs `list()`/`clear()` or the
+    /// untyped `register_value` path directly.
+    #[must_use]
+    pub fn runtime_agents(&self) -> &Arc<crate::discovery::runtime_registry::RuntimeAgentRegistry> {
+        &self.runtime_agents
     }
 
     /// Construct an executor whose background-completion notifications (C6) are delivered to
@@ -184,7 +226,10 @@ impl SubagentExecutor {
     /// [`crate::background::watch::HostServicesCompletionSink`] at install time (so a test's scripted sink is authoritative).
     #[must_use]
     pub fn with_completion_sink(sink: Arc<dyn crate::background::watch::CompletionSink>) -> Self {
-        Self { completion_sink_override: Some(sink), ..Self::new() }
+        Self {
+            completion_sink_override: Some(sink),
+            ..Self::new()
+        }
     }
 
     /// Construct an executor that starts from `config` rather than
@@ -194,7 +239,10 @@ impl SubagentExecutor {
     /// `with_*` shape [`Self::with_completion_sink`] already establishes.
     #[must_use]
     pub fn with_config(config: SubagentExtensionConfig) -> Self {
-        Self { config: Arc::new(AsyncMutex::new(config)), ..Self::new() }
+        Self {
+            config: Arc::new(AsyncMutex::new(config)),
+            ..Self::new()
+        }
     }
 
     /// Late-bind the live capability backend (P-1). Called by
@@ -312,7 +360,12 @@ impl SubagentExecutor {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
     use crate::extension::testsupport::FixedSessionHost;
@@ -442,7 +495,10 @@ mod tests {
         // A live host IS bound (so the mtime-scan fallback branch is not taken at all) but reports
         // NO session id (e.g. an unpersisted/ephemeral session) — exercises the
         // `services.session_id().or(cached_id)` fallback arm specifically.
-        executor.set_host_services(Arc::new(FixedSessionIdHost { id: None, file: None }));
+        executor.set_host_services(Arc::new(FixedSessionIdHost {
+            id: None,
+            file: None,
+        }));
         // Directly seed the state-held id pi's `state.currentSessionId` plays — in production this
         // is populated once at THIS orchestrator's own `SessionStart` via
         // `capture_parent_session_anchor` (same live `session_id()` call, just captured earlier).
@@ -469,7 +525,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let executor = SubagentExecutor::new();
         executor.set_host_services(Arc::new(FixedSessionHost("session-a")));
-        seed_orphaned_run(dir.path(), "run0alive000", Some("session-a"), Some(std::process::id()));
+        seed_orphaned_run(
+            dir.path(),
+            "run0alive000",
+            Some("session-a"),
+            Some(std::process::id()),
+        );
 
         let err = executor
             .control_dismiss(dir.path(), Some("run0alive000"))
@@ -485,7 +546,10 @@ mod tests {
             .control_status(dir.path(), None, None, false)
             .await
             .expect("status list");
-        assert!(listing.contains("run0alive000"), "a refused dismissal changes nothing: {listing}");
+        assert!(
+            listing.contains("run0alive000"),
+            "a refused dismissal changes nothing: {listing}"
+        );
     }
 
     /// pi `subagent-executor.ts:5865-5870`: `dismiss` is in upstream's
@@ -503,9 +567,12 @@ mod tests {
         seed_orphaned_run(dir.path(), "run0childsafe", Some("session-a"), None);
         let tool = SubagentTool::new_child_safe(executor.clone(), dir.path().to_path_buf());
 
-        let err = dispatch_tool(&tool, serde_json::json!({ "action": "dismiss", "id": "run0childsafe" }))
-            .await
-            .expect_err("a fanout child must be refused");
+        let err = dispatch_tool(
+            &tool,
+            serde_json::json!({ "action": "dismiss", "id": "run0childsafe" }),
+        )
+        .await
+        .expect_err("a fanout child must be refused");
         assert_eq!(
             err.to_string(),
             "Action 'dismiss' is not available from child-safe subagent fanout mode."
@@ -516,7 +583,10 @@ mod tests {
             .control_status(dir.path(), None, None, false)
             .await
             .expect("status list");
-        assert!(listing.contains("run0childsafe"), "the run must be untouched: {listing}");
+        assert!(
+            listing.contains("run0childsafe"),
+            "the run must be untouched: {listing}"
+        );
     }
 
     /// A non-goal mission, and a goal mission owned by a DIFFERENT session, raise nothing.
@@ -525,8 +595,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let executor = Arc::new(SubagentExecutor::new());
         arm_scoped_missions(&executor, dir.path()).await;
-        let services: Arc<dyn cyrup_ext::host::HostServices> =
-            Arc::new(FixedSessionIdHost { id: Some("mine".to_string()), file: None });
+        let services: Arc<dyn cyrup_ext::host::HostServices> = Arc::new(FixedSessionIdHost {
+            id: Some("mine".to_string()),
+            file: None,
+        });
         executor.set_host_services(services);
         let location = crate::missions::resolve_mission_store_location(
             dir.path(),
@@ -561,7 +633,9 @@ mod tests {
             None,
         )
         .expect("create");
-        assert_eq!(executor.raise_goal_continuation_notices(dir.path()).await, 0);
+        assert_eq!(
+            executor.raise_goal_continuation_notices(dir.path()).await,
+            0
+        );
     }
-
 }

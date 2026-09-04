@@ -231,7 +231,9 @@ async fn fork_target_copies_history_into_a_new_id() {
     src_cfg.persist = true;
     let src_target = src_cfg.target.clone();
     let src_factory = Arc::new(SessionFactory::new(provider, src_cfg));
-    let source = AgentSessionRuntime::create(src_factory, src_target).await.unwrap();
+    let source = AgentSessionRuntime::create(src_factory, src_target)
+        .await
+        .unwrap();
     let mut sink: Vec<u8> = Vec::new();
     run_print_dispatch(&source, &text("seed", &[]), &mut sink)
         .await
@@ -357,8 +359,9 @@ async fn rpc_dispatch_disposes_the_runtime_at_reader_eof() {
     let mut sub = runtime.session().await.subscribe();
 
     // A single command, then EOF.
-    let reader =
-        tokio::io::BufReader::new(std::io::Cursor::new(b"{\"type\":\"get_state\",\"id\":\"s\"}\n".to_vec()));
+    let reader = tokio::io::BufReader::new(std::io::Cursor::new(
+        b"{\"type\":\"get_state\",\"id\":\"s\"}\n".to_vec(),
+    ));
     let mut writer: Vec<u8> = Vec::new();
     crate::run::run_rpc_dispatch(&runtime, reader, &mut writer)
         .await
@@ -586,8 +589,10 @@ impl cyrup_ext::NativeExtension for NewSessionExt {
             .ok()
             .and_then(|g| g.clone())
             .ok_or_else(|| cyrup_ext::ExtError::Component("no host services".into()))?;
-        svc.control(cyrup_ext::ControlOp::NewSession { opts: serde_json::json!({}) })
-            .map_err(cyrup_ext::ExtError::Component)?;
+        svc.control(cyrup_ext::ControlOp::NewSession {
+            opts: serde_json::json!({}),
+        })
+        .map_err(cyrup_ext::ExtError::Component)?;
         Ok(Some(String::new()))
     }
 }
@@ -595,9 +600,9 @@ impl cyrup_ext::NativeExtension for NewSessionExt {
 /// Whether any assistant message in `ms` carries `needle` as text.
 fn transcript_has(ms: &[cyrup_sdk::core::Message], needle: &str) -> bool {
     ms.iter().any(|m| match m {
-        cyrup_sdk::core::Message::Assistant(a) => a.content.iter().any(|c| {
-            matches!(c, cyrup_sdk::core::Content::Text { text, .. } if text.contains(needle))
-        }),
+        cyrup_sdk::core::Message::Assistant(a) => a.content.iter().any(
+            |c| matches!(c, cyrup_sdk::core::Content::Text { text, .. } if text.contains(needle)),
+        ),
         _ => false,
     })
 }
@@ -616,9 +621,10 @@ async fn print_dispatch_gives_extension_control_ops_a_runtime_host() {
     config.persist = false;
     let target = config.target.clone();
     let factory = Arc::new(
-        SessionFactory::new(provider, config).with_native_extension(
-            Arc::new(NewSessionExt::default()) as Arc<dyn cyrup_ext::NativeExtension>,
-        ),
+        SessionFactory::new(provider, config)
+            .with_native_extension(
+                Arc::new(NewSessionExt::default()) as Arc<dyn cyrup_ext::NativeExtension>
+            ),
     );
     let runtime = AgentSessionRuntime::create(factory, target).await.unwrap();
     // Hold the ORIGINAL session so the test can prove the follow-up did NOT land on it. Asserting
@@ -680,9 +686,10 @@ async fn json_dispatch_gives_extension_control_ops_a_runtime_host() {
     config.persist = false;
     let target = config.target.clone();
     let factory = Arc::new(
-        SessionFactory::new(provider, config).with_native_extension(
-            Arc::new(NewSessionExt::default()) as Arc<dyn cyrup_ext::NativeExtension>,
-        ),
+        SessionFactory::new(provider, config)
+            .with_native_extension(
+                Arc::new(NewSessionExt::default()) as Arc<dyn cyrup_ext::NativeExtension>
+            ),
     );
     let runtime = AgentSessionRuntime::create(factory, target).await.unwrap();
     let first = runtime.session().await;
@@ -835,7 +842,9 @@ async fn unannounced_runtime_with_probe(
         SessionFactory::new(provider, config)
             .with_native_extension(probe as Arc<dyn cyrup_ext::NativeExtension>),
     );
-    let runtime = AgentSessionRuntime::create_unannounced(factory, target).await.unwrap();
+    let runtime = AgentSessionRuntime::create_unannounced(factory, target)
+        .await
+        .unwrap();
     (runtime, session_slot, seen, cwd, agent_dir)
 }
 
@@ -868,10 +877,12 @@ async fn create_unannounced_leaves_the_announcement_to_the_host() {
 /// handler must see a session that already carries them.
 #[tokio::test]
 async fn print_dispatch_announces_only_after_post_build_configuration() {
-    let (runtime, slot, seen, _cwd, _agent) = unannounced_runtime_with_probe(vec![
-        faux_assistant_message(vec![faux_text("ok")], StopReason::Stop),
-    ])
-    .await;
+    let (runtime, slot, seen, _cwd, _agent) =
+        unannounced_runtime_with_probe(vec![faux_assistant_message(
+            vec![faux_text("ok")],
+            StopReason::Stop,
+        )])
+        .await;
 
     // Exactly what `main.rs` does between `create_unannounced` and the dispatch call.
     let session = runtime.session().await;
@@ -882,17 +893,25 @@ async fn print_dispatch_announces_only_after_post_build_configuration() {
             .model_catalog()
             .into_iter()
             .take(1)
-            .map(|model| cyrup_session_svc::ScopedModel { model, thinking_level: None })
+            .map(|model| cyrup_session_svc::ScopedModel {
+                model,
+                thinking_level: None,
+            })
             .collect(),
     );
     let scoped = session.scoped_models().len();
 
     let mut buf: Vec<u8> = Vec::new();
-    run_print_dispatch(&runtime, &text("hi", &[]), &mut buf).await.unwrap();
+    run_print_dispatch(&runtime, &text("hi", &[]), &mut buf)
+        .await
+        .unwrap();
 
     assert_eq!(
         seen.lock().unwrap().clone(),
-        vec![format!("name={:?} scoped_models={scoped}", Some("configured-by-cli".to_string()))],
+        vec![format!(
+            "name={:?} scoped_models={scoped}",
+            Some("configured-by-cli".to_string())
+        )],
         "PRINT must announce the session only after --name/--models are applied \
          (Pi main.ts:650/:742-750 precede main.ts:793, and the announcement is later still at \
          print-mode.ts:119)"
@@ -903,10 +922,12 @@ async fn print_dispatch_announces_only_after_post_build_configuration() {
 /// header at print-mode.ts:112-118 and only then `await rebindSession()` at :119.
 #[tokio::test]
 async fn json_dispatch_announces_after_the_header_and_after_post_build_configuration() {
-    let (runtime, slot, seen, _cwd, _agent) = unannounced_runtime_with_probe(vec![
-        faux_assistant_message(vec![faux_text("ok")], StopReason::Stop),
-    ])
-    .await;
+    let (runtime, slot, seen, _cwd, _agent) =
+        unannounced_runtime_with_probe(vec![faux_assistant_message(
+            vec![faux_text("ok")],
+            StopReason::Stop,
+        )])
+        .await;
 
     let session = runtime.session().await;
     let _ = slot.set(Arc::clone(&session));
@@ -916,17 +937,25 @@ async fn json_dispatch_announces_after_the_header_and_after_post_build_configura
             .model_catalog()
             .into_iter()
             .take(1)
-            .map(|model| cyrup_session_svc::ScopedModel { model, thinking_level: None })
+            .map(|model| cyrup_session_svc::ScopedModel {
+                model,
+                thinking_level: None,
+            })
             .collect(),
     );
     let scoped = session.scoped_models().len();
 
     let mut buf: Vec<u8> = Vec::new();
-    run_json_dispatch(&runtime, &text("hi", &[]), &mut buf).await.unwrap();
+    run_json_dispatch(&runtime, &text("hi", &[]), &mut buf)
+        .await
+        .unwrap();
 
     assert_eq!(
         seen.lock().unwrap().clone(),
-        vec![format!("name={:?} scoped_models={scoped}", Some("configured-by-cli".to_string()))],
+        vec![format!(
+            "name={:?} scoped_models={scoped}",
+            Some("configured-by-cli".to_string())
+        )],
         "JSON must announce the session only after --name/--models are applied"
     );
 

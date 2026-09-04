@@ -31,7 +31,10 @@ async fn rpc_extension_ui_request_response_round_trips() {
 
     // A get_state first: its response proves the loop is up and the ui sink is installed (set before
     // the select! loop), so the following guest dialog cannot race the sink.
-    client_tx.write_all(b"{\"type\":\"get_state\",\"id\":\"boot\"}\n").await.unwrap();
+    client_tx
+        .write_all(b"{\"type\":\"get_state\",\"id\":\"boot\"}\n")
+        .await
+        .unwrap();
     let boot = read_json_line(&mut client_reader).await;
     assert_eq!(boot["command"], "get_state");
 
@@ -41,16 +44,26 @@ async fn rpc_extension_ui_request_response_round_trips() {
     //     with NO index translation anywhere in the round-trip.
     let hs = host_services.clone();
     let guest_select = tokio::spawn(async move {
-        hs.select("Pick one", &serde_json::json!(["alpha", "beta", "gamma"]), &DialogOptions::default())
+        hs.select(
+            "Pick one",
+            &serde_json::json!(["alpha", "beta", "gamma"]),
+            &DialogOptions::default(),
+        )
     });
     let req = read_json_line(&mut client_reader).await;
     assert_eq!(req["type"], "extension_ui_request");
     assert_eq!(req["method"], "select");
     assert_eq!(req["title"], "Pick one");
-    assert_eq!(req["options"], serde_json::json!(["alpha", "beta", "gamma"]));
+    assert_eq!(
+        req["options"],
+        serde_json::json!(["alpha", "beta", "gamma"])
+    );
     let id = req["id"].as_str().unwrap().to_string();
     client_tx
-        .write_all(format!("{{\"type\":\"extension_ui_response\",\"id\":\"{id}\",\"value\":\"gamma\"}}\n").as_bytes())
+        .write_all(
+            format!("{{\"type\":\"extension_ui_response\",\"id\":\"{id}\",\"value\":\"gamma\"}}\n")
+                .as_bytes(),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -64,7 +77,11 @@ async fn rpc_extension_ui_request_response_round_trips() {
     //     not hard-coded to `""`.
     let hs = host_services.clone();
     let guest_confirm = tokio::spawn(async move {
-        hs.confirm("Proceed?", "a large formatted body, distinct from the title", &DialogOptions::default())
+        hs.confirm(
+            "Proceed?",
+            "a large formatted body, distinct from the title",
+            &DialogOptions::default(),
+        )
     });
     let req = read_json_line(&mut client_reader).await;
     assert_eq!(req["method"], "confirm");
@@ -75,7 +92,10 @@ async fn rpc_extension_ui_request_response_round_trips() {
     );
     let id = req["id"].as_str().unwrap().to_string();
     client_tx
-        .write_all(format!("{{\"type\":\"extension_ui_response\",\"id\":\"{id}\",\"confirmed\":true}}\n").as_bytes())
+        .write_all(
+            format!("{{\"type\":\"extension_ui_response\",\"id\":\"{id}\",\"confirmed\":true}}\n")
+                .as_bytes(),
+        )
         .await
         .unwrap();
     assert!(guest_confirm.await.unwrap(), "confirm round-trips true");
@@ -84,7 +104,11 @@ async fn rpc_extension_ui_request_response_round_trips() {
     //     §2.7: the guest's `placeholder` reaches the wire (present, not dropped).
     let hs = host_services.clone();
     let guest_input = tokio::spawn(async move {
-        hs.input("Name?", Some("e.g. Ada Lovelace"), &DialogOptions::default())
+        hs.input(
+            "Name?",
+            Some("e.g. Ada Lovelace"),
+            &DialogOptions::default(),
+        )
     });
     let req = read_json_line(&mut client_reader).await;
     assert_eq!(req["method"], "input");
@@ -94,7 +118,10 @@ async fn rpc_extension_ui_request_response_round_trips() {
     );
     let id = req["id"].as_str().unwrap().to_string();
     client_tx
-        .write_all(format!("{{\"type\":\"extension_ui_response\",\"id\":\"{id}\",\"cancelled\":true}}\n").as_bytes())
+        .write_all(
+            format!("{{\"type\":\"extension_ui_response\",\"id\":\"{id}\",\"cancelled\":true}}\n")
+                .as_bytes(),
+        )
         .await
         .unwrap();
     assert_eq!(guest_input.await.unwrap(), None, "cancelled input -> None");
@@ -144,7 +171,10 @@ async fn rpc_malformed_extension_ui_response_is_swallowed_not_answered() {
 
     // A sentinel command AFTER them. Because the loop services stdin lines in order, the first line
     // the client reads back is the sentinel's response iff none of the three produced output.
-    client_tx.write_all(b"{\"type\":\"get_state\",\"id\":\"sentinel\"}\n").await.unwrap();
+    client_tx
+        .write_all(b"{\"type\":\"get_state\",\"id\":\"sentinel\"}\n")
+        .await
+        .unwrap();
     let first = read_json_line(&mut client_reader).await;
     assert_eq!(
         first["command"], "get_state",
@@ -176,20 +206,29 @@ async fn rpc_extension_ui_request_times_out_to_the_default_when_client_never_res
 
     let (mut client_tx, mut client_reader, rpc) = spawn_rpc_duplex(runtime);
 
-    client_tx.write_all(b"{\"type\":\"get_state\",\"id\":\"boot\"}\n").await.unwrap();
+    client_tx
+        .write_all(b"{\"type\":\"get_state\",\"id\":\"boot\"}\n")
+        .await
+        .unwrap();
     let boot = read_json_line(&mut client_reader).await;
     assert_eq!(boot["command"], "get_state");
 
     // Open a confirm dialog with a short live countdown; the guest call is driven on a blocking task
     // exactly as the wasm-suspended host import would be.
     let hs = host_services.clone();
-    let opts = DialogOptions { timeout_ms: Some(80), signal_id: None };
+    let opts = DialogOptions {
+        timeout_ms: Some(80),
+        signal_id: None,
+    };
     let guest_confirm = tokio::spawn(async move { hs.confirm("Proceed?", "body", &opts) });
 
     // The client sees the request, including Pi's `timeout` field — and simply never answers it.
     let req = read_json_line(&mut client_reader).await;
     assert_eq!(req["method"], "confirm");
-    assert_eq!(req["timeout"], 80, "the wire `timeout` field carries opts.timeout_ms verbatim");
+    assert_eq!(
+        req["timeout"], 80,
+        "the wire `timeout` field carries opts.timeout_ms verbatim"
+    );
 
     // The guest call must settle to the confirm default (`false`) on its own, well inside a generous
     // bound — proving the host, not the client, is what unblocks it.
@@ -197,14 +236,20 @@ async fn rpc_extension_ui_request_times_out_to_the_default_when_client_never_res
         .await
         .expect("the dialog must not hang past its timeout_ms")
         .expect("confirm task");
-    assert!(!resolved, "an unanswered confirm settles to Pi's `false` default on timeout");
+    assert!(
+        !resolved,
+        "an unanswered confirm settles to Pi's `false` default on timeout"
+    );
     // SEAM-030 — the `started.elapsed() < 2s` margin that used to follow is DELETED: it carried no
     // semantic content the `timeout(5s)` + `assert!(!resolved)` above does not already carry (the
     // dialog demonstrably settled on its own, unanswered), and it was the most flake-prone
     // assertion in the whole modes suite.
 
     // The loop is still alive and serving requests — the abandoned dialog never hung the session.
-    client_tx.write_all(b"{\"type\":\"get_state\",\"id\":\"after\"}\n").await.unwrap();
+    client_tx
+        .write_all(b"{\"type\":\"get_state\",\"id\":\"after\"}\n")
+        .await
+        .unwrap();
     let after = read_json_line(&mut client_reader).await;
     assert_eq!(after["command"], "get_state");
     assert_eq!(after["id"], "after");
@@ -235,22 +280,31 @@ async fn rpc_abort_does_not_force_resolve_a_pending_dialog() {
 
     let (mut client_tx, mut client_reader, rpc) = spawn_rpc_duplex(runtime);
 
-    client_tx.write_all(b"{\"type\":\"get_state\",\"id\":\"boot\"}\n").await.unwrap();
+    client_tx
+        .write_all(b"{\"type\":\"get_state\",\"id\":\"boot\"}\n")
+        .await
+        .unwrap();
     let boot = read_json_line(&mut client_reader).await;
     assert_eq!(boot["command"], "get_state");
 
     // Open a `select` dialog with NO timeout at all — nothing but a genuine response can unblock it.
     let hs = host_services.clone();
-    let mut guest_select =
-        tokio::spawn(async move {
-            hs.select("Pick one", &serde_json::json!(["a", "b"]), &DialogOptions::default())
-        });
+    let mut guest_select = tokio::spawn(async move {
+        hs.select(
+            "Pick one",
+            &serde_json::json!(["a", "b"]),
+            &DialogOptions::default(),
+        )
+    });
     let req = read_json_line(&mut client_reader).await;
     assert_eq!(req["method"], "select");
     let dialog_id = req["id"].as_str().unwrap().to_string();
 
     // The client never answers the dialog — it aborts the turn instead.
-    client_tx.write_all(b"{\"type\":\"abort\",\"id\":\"stop\"}\n").await.unwrap();
+    client_tx
+        .write_all(b"{\"type\":\"abort\",\"id\":\"stop\"}\n")
+        .await
+        .unwrap();
     let abort_resp = read_json_line(&mut client_reader).await;
     assert_eq!(abort_resp["command"], "abort");
     assert_eq!(abort_resp["success"], true);
@@ -264,19 +318,31 @@ async fn rpc_abort_does_not_force_resolve_a_pending_dialog() {
 
     // The loop is still alive, and the dialog is STILL answerable by a real `extension_ui_response`
     // after the abort — proving it was left genuinely pending, not silently dropped.
-    client_tx.write_all(b"{\"type\":\"get_state\",\"id\":\"after\"}\n").await.unwrap();
+    client_tx
+        .write_all(b"{\"type\":\"get_state\",\"id\":\"after\"}\n")
+        .await
+        .unwrap();
     let after = read_json_line(&mut client_reader).await;
     assert_eq!(after["command"], "get_state");
 
     client_tx
-        .write_all(format!("{{\"type\":\"extension_ui_response\",\"id\":\"{dialog_id}\",\"value\":\"a\"}}\n").as_bytes())
+        .write_all(
+            format!(
+                "{{\"type\":\"extension_ui_response\",\"id\":\"{dialog_id}\",\"value\":\"a\"}}\n"
+            )
+            .as_bytes(),
+        )
         .await
         .unwrap();
     let resolved = tokio::time::timeout(Duration::from_secs(2), guest_select)
         .await
         .expect("the dialog must still be answerable after an unrelated abort")
         .expect("select task");
-    assert_eq!(resolved.as_deref(), Some("a"), "a real response after abort still resumes the guest");
+    assert_eq!(
+        resolved.as_deref(),
+        Some("a"),
+        "a real response after abort still resumes the guest"
+    );
 
     drop(client_tx);
     rpc.await.unwrap();

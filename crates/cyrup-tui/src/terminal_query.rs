@@ -209,7 +209,11 @@ fn parse_osc11_value(value: &str) -> Option<(u8, u8, u8)> {
     if parts.next().is_some() {
         return None;
     }
-    Some((parse_osc_hex_channel(r)?, parse_osc_hex_channel(g)?, parse_osc_hex_channel(b)?))
+    Some((
+        parse_osc_hex_channel(r)?,
+        parse_osc_hex_channel(g)?,
+        parse_osc_hex_channel(b)?,
+    ))
 }
 
 /// Pi `parseOscHexChannel` (`terminal-colors.ts:17-25`): an arbitrary-width hex channel scaled onto
@@ -220,12 +224,18 @@ fn parse_osc_hex_channel(channel: &str) -> Option<u8> {
         return None;
     }
     let value = u64::from_str_radix(channel, 16).ok()?;
-    let max = 16u64.checked_pow(u32::try_from(channel.len()).ok()?)?.checked_sub(1)?;
+    let max = 16u64
+        .checked_pow(u32::try_from(channel.len()).ok()?)?
+        .checked_sub(1)?;
     if max == 0 {
         return None;
     }
     // Pi's `Math.round((v / max) * 255)`.
-    let scaled = (value.saturating_mul(255).saturating_mul(2).saturating_add(max)) / (max * 2);
+    let scaled = (value
+        .saturating_mul(255)
+        .saturating_mul(2)
+        .saturating_add(max))
+        / (max * 2);
     u8::try_from(scaled.min(255)).ok()
 }
 
@@ -370,9 +380,13 @@ pub fn find_color_scheme_report(buffer: &str) -> Option<TerminalTheme> {
     let mut last = None;
     let mut search = 0usize;
     while let Some(rest) = buffer.get(search..) {
-        let Some(offset) = rest.find(INTRODUCER) else { break };
+        let Some(offset) = rest.find(INTRODUCER) else {
+            break;
+        };
         let frame_start = search.saturating_add(offset);
-        let Some(frame) = buffer.get(frame_start..) else { break };
+        let Some(frame) = buffer.get(frame_start..) else {
+            break;
+        };
         // No terminator yet ⇒ the report is still arriving; Pi's anchor rejects the burst.
         let end = frame.find('n')?;
         last = Some(frame.get(..=end).and_then(parse_color_scheme_report)?);
@@ -415,7 +429,8 @@ pub fn saw_device_attributes(buffer: &[u8]) -> bool {
 /// Case-insensitive ASCII `strip_prefix`.
 fn strip_ascii_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
     let head = value.get(..prefix.len())?;
-    head.eq_ignore_ascii_case(prefix).then(|| value.get(prefix.len()..))?
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| value.get(prefix.len()..))?
 }
 
 // ============================================================================
@@ -451,7 +466,9 @@ impl TerminalProbe for StdinTerminalProbe {
 fn stdin_is_queryable() -> bool {
     use ratatui::crossterm::terminal::is_raw_mode_enabled;
     use ratatui::crossterm::tty::IsTty;
-    std::io::stdin().is_tty() && std::io::stdout().is_tty() && is_raw_mode_enabled().unwrap_or(false)
+    std::io::stdin().is_tty()
+        && std::io::stdout().is_tty()
+        && is_raw_mode_enabled().unwrap_or(false)
 }
 
 /// Write `request` (plus the DA1 sentinel) and collect whatever comes back within `timeout`.
@@ -522,12 +539,20 @@ fn read_reply(_timeout: Duration) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
     use super::*;
 
     #[test]
     fn osc11_hex_forms() {
-        assert_eq!(parse_osc11_background_color("\x1b]11;#1e1e1e\x07"), Some((30, 30, 30)));
+        assert_eq!(
+            parse_osc11_background_color("\x1b]11;#1e1e1e\x07"),
+            Some((30, 30, 30))
+        );
         // 16-bit channels scale down (`ffff` ⇒ 255), and ST terminates as well as BEL.
         assert_eq!(
             parse_osc11_background_color("\x1b]11;#ffffffffffff\x1b\\"),
@@ -541,13 +566,19 @@ mod tests {
             parse_osc11_background_color("\x1b]11;rgb:ffff/ffff/ffff\x07"),
             Some((255, 255, 255))
         );
-        assert_eq!(parse_osc11_background_color("\x1b]11;rgb:00/00/00\x07"), Some((0, 0, 0)));
+        assert_eq!(
+            parse_osc11_background_color("\x1b]11;rgb:00/00/00\x07"),
+            Some((0, 0, 0))
+        );
         // xterm's half-intensity `8080` rounds to 128, matching Pi's `Math.round`.
         assert_eq!(
             parse_osc11_background_color("\x1b]11;rgb:8080/8080/8080\x07"),
             Some((128, 128, 128))
         );
-        assert_eq!(parse_osc11_background_color("\x1b]11;RGBA:ff/00/00\x07"), Some((255, 0, 0)));
+        assert_eq!(
+            parse_osc11_background_color("\x1b]11;RGBA:ff/00/00\x07"),
+            Some((255, 0, 0))
+        );
     }
 
     #[test]
@@ -555,8 +586,16 @@ mod tests {
         assert_eq!(parse_osc11_background_color("\x1b]11;#zzzzzz\x07"), None);
         assert_eq!(parse_osc11_background_color("\x1b]11;#12345\x07"), None);
         assert_eq!(parse_osc11_background_color("\x1b]11;rgb:ff/00\x07"), None);
-        assert_eq!(parse_osc11_background_color("\x1b]10;#ffffff\x07"), None, "OSC 10 is not 11");
-        assert_eq!(parse_osc11_background_color("\x1b]11;#ffffff"), None, "unterminated");
+        assert_eq!(
+            parse_osc11_background_color("\x1b]10;#ffffff\x07"),
+            None,
+            "OSC 10 is not 11"
+        );
+        assert_eq!(
+            parse_osc11_background_color("\x1b]11;#ffffff"),
+            None,
+            "unterminated"
+        );
     }
 
     #[test]
@@ -569,18 +608,33 @@ mod tests {
         assert_eq!(parse_cell_size_report("\x1b[6;0;9t"), None);
         assert_eq!(parse_cell_size_report("\x1b[6;18;0t"), None);
         // Shape rejections: not a `6` report, a missing field, a non-numeric field, no terminator.
-        assert_eq!(parse_cell_size_report("\x1b[4;18;9t"), None, "CSI 4 t is the pixel SIZE report");
+        assert_eq!(
+            parse_cell_size_report("\x1b[4;18;9t"),
+            None,
+            "CSI 4 t is the pixel SIZE report"
+        );
         assert_eq!(parse_cell_size_report("\x1b[6;18t"), None);
         assert_eq!(parse_cell_size_report("\x1b[6;18;xt"), None);
         assert_eq!(parse_cell_size_report("\x1b[6;18;9"), None);
-        assert_eq!(parse_cell_size_report("\x1b[16t"), None, "the QUERY is not a report");
+        assert_eq!(
+            parse_cell_size_report("\x1b[16t"),
+            None,
+            "the QUERY is not a report"
+        );
     }
 
     #[test]
     fn cell_size_is_found_alongside_the_sentinel_answer() {
         // What a Kitty-class terminal sends back for `CSI 16 t` + `CSI c`, in one read.
-        assert_eq!(find_cell_size_report("\x1b[6;18;9t\x1b[?62;1;2c"), Some((9, 18)));
-        assert_eq!(find_cell_size_report("\x1b[?62;1;2c"), None, "DA1 only ⇒ no cell size");
+        assert_eq!(
+            find_cell_size_report("\x1b[6;18;9t\x1b[?62;1;2c"),
+            Some((9, 18))
+        );
+        assert_eq!(
+            find_cell_size_report("\x1b[?62;1;2c"),
+            None,
+            "DA1 only ⇒ no cell size"
+        );
         assert_eq!(find_cell_size_report(""), None);
     }
 
@@ -589,37 +643,94 @@ mod tests {
         // `CSI <row> ; <col> R` is ROW then COLUMN, 1-based; the tuple here is 0-based `(col, row)`
         // — the order `ratatui::layout::Position { x, y }` wants.
         assert_eq!(parse_cursor_position_report("\x1b[12;40R"), Some((39, 11)));
-        assert_eq!(parse_cursor_position_report("\x1b[1;1R"), Some((0, 0)), "top-left is (0, 0)");
+        assert_eq!(
+            parse_cursor_position_report("\x1b[1;1R"),
+            Some((0, 0)),
+            "top-left is (0, 0)"
+        );
         // DECXCPR's leading `?` is tolerated even though cyrup never sends the DECXCPR query.
         assert_eq!(parse_cursor_position_report("\x1b[?12;40R"), Some((39, 11)));
         // CPR coordinates are 1-based; a `0` is rejected rather than underflowed.
-        assert_eq!(parse_cursor_position_report("\x1b[0;5R"), None, "row 0 cannot underflow");
-        assert_eq!(parse_cursor_position_report("\x1b[5;0R"), None, "col 0 cannot underflow");
+        assert_eq!(
+            parse_cursor_position_report("\x1b[0;5R"),
+            None,
+            "row 0 cannot underflow"
+        );
+        assert_eq!(
+            parse_cursor_position_report("\x1b[5;0R"),
+            None,
+            "col 0 cannot underflow"
+        );
         // Shape rejections: no terminator, missing field, non-numeric field, wrong introducer.
-        assert_eq!(parse_cursor_position_report("\x1b[12;40"), None, "missing R terminator");
-        assert_eq!(parse_cursor_position_report("\x1b[12R"), None, "missing `;`");
-        assert_eq!(parse_cursor_position_report("\x1b[;40R"), None, "empty row field");
-        assert_eq!(parse_cursor_position_report("\x1b[12;R"), None, "empty col field");
-        assert_eq!(parse_cursor_position_report("\x1b[a;40R"), None, "non-digit row field");
-        assert_eq!(parse_cursor_position_report("12;40R"), None, "missing CSI introducer");
-        assert_eq!(parse_cursor_position_report("\x1b[6n"), None, "the QUERY is not a report");
+        assert_eq!(
+            parse_cursor_position_report("\x1b[12;40"),
+            None,
+            "missing R terminator"
+        );
+        assert_eq!(
+            parse_cursor_position_report("\x1b[12R"),
+            None,
+            "missing `;`"
+        );
+        assert_eq!(
+            parse_cursor_position_report("\x1b[;40R"),
+            None,
+            "empty row field"
+        );
+        assert_eq!(
+            parse_cursor_position_report("\x1b[12;R"),
+            None,
+            "empty col field"
+        );
+        assert_eq!(
+            parse_cursor_position_report("\x1b[a;40R"),
+            None,
+            "non-digit row field"
+        );
+        assert_eq!(
+            parse_cursor_position_report("12;40R"),
+            None,
+            "missing CSI introducer"
+        );
+        assert_eq!(
+            parse_cursor_position_report("\x1b[6n"),
+            None,
+            "the QUERY is not a report"
+        );
     }
 
     #[test]
     fn cursor_position_is_found_alongside_the_sentinel_answer() {
         // What a real xterm sends back for `CSI 6 n` + `CSI c`, in one read — the exact wire shape
         // `exchange(CURSOR_POSITION_QUERY, ..)` produces.
-        assert_eq!(find_cursor_position_report("\x1b[12;40R\x1b[?62;1;2c"), Some((39, 11)));
-        assert_eq!(find_cursor_position_report("\x1b[?62;1;2c"), None, "DA1 only ⇒ no position");
+        assert_eq!(
+            find_cursor_position_report("\x1b[12;40R\x1b[?62;1;2c"),
+            Some((39, 11))
+        );
+        assert_eq!(
+            find_cursor_position_report("\x1b[?62;1;2c"),
+            None,
+            "DA1 only ⇒ no position"
+        );
         assert_eq!(find_cursor_position_report(""), None);
     }
 
     #[test]
     fn color_scheme_report_forms() {
-        assert_eq!(parse_color_scheme_report("\x1b[?997;1n"), Some(TerminalTheme::Dark));
-        assert_eq!(parse_color_scheme_report("\x1b[?997;2n"), Some(TerminalTheme::Light));
+        assert_eq!(
+            parse_color_scheme_report("\x1b[?997;1n"),
+            Some(TerminalTheme::Dark)
+        );
+        assert_eq!(
+            parse_color_scheme_report("\x1b[?997;2n"),
+            Some(TerminalTheme::Light)
+        );
         assert_eq!(parse_color_scheme_report("\x1b[?997;3n"), None);
-        assert_eq!(parse_color_scheme_report("\x1b[?996n"), None, "the QUERY is not a report");
+        assert_eq!(
+            parse_color_scheme_report("\x1b[?996n"),
+            None,
+            "the QUERY is not a report"
+        );
     }
 
     /// Pi v0.84.1 `tui/test/terminal-colors.test.ts:118-122`, transcribed case for case.
@@ -651,9 +762,21 @@ mod tests {
             None,
             "a truncated trailing frame poisons the whole burst",
         );
-        assert_eq!(parse_color_scheme_report("x\x1b[?997;1n"), None, "test.ts:122 — leading junk");
-        assert_eq!(parse_color_scheme_report("\x1b[?997;1nx"), None, "trailing junk");
-        assert_eq!(parse_color_scheme_report(""), None, "`+` demands at least one frame");
+        assert_eq!(
+            parse_color_scheme_report("x\x1b[?997;1n"),
+            None,
+            "test.ts:122 — leading junk"
+        );
+        assert_eq!(
+            parse_color_scheme_report("\x1b[?997;1nx"),
+            None,
+            "trailing junk"
+        );
+        assert_eq!(
+            parse_color_scheme_report(""),
+            None,
+            "`+` demands at least one frame"
+        );
     }
 
     /// The same burst as it actually reaches cyrup: unsplit, with the DA1 sentinel riding along.
@@ -668,8 +791,15 @@ mod tests {
             Some(TerminalTheme::Dark),
         );
         // MIRROR: a lone report is unaffected, and a read with no report at all still yields None.
-        assert_eq!(find_color_scheme_report("\x1b[?997;1n\x1b[?62;c"), Some(TerminalTheme::Dark));
-        assert_eq!(find_color_scheme_report("\x1b[?62;1;2c"), None, "DA1 only ⇒ no scheme");
+        assert_eq!(
+            find_color_scheme_report("\x1b[?997;1n\x1b[?62;c"),
+            Some(TerminalTheme::Dark)
+        );
+        assert_eq!(
+            find_color_scheme_report("\x1b[?62;1;2c"),
+            None,
+            "DA1 only ⇒ no scheme"
+        );
         assert_eq!(find_color_scheme_report(""), None);
         // A truncated tail frame is rejected rather than falling back on its healthy neighbour.
         assert_eq!(find_color_scheme_report("\x1b[?997;1n\x1b[?997;"), None);
@@ -702,11 +832,26 @@ mod tests {
         // In the test harness stdin is not a raw-mode tty, so the live probe short-circuits before
         // writing anything — it must return immediately, never park on a read.
         let started = std::time::Instant::now();
-        assert_eq!(StdinTerminalProbe.query_background_color(Duration::from_secs(30)), None);
-        assert_eq!(StdinTerminalProbe.query_color_scheme(Duration::from_secs(30)), None);
-        assert_eq!(StdinTerminalProbe.query_cell_size(Duration::from_secs(30)), None);
-        assert_eq!(StdinTerminalProbe.query_cursor_position(Duration::from_secs(30)), None);
-        assert!(started.elapsed() < Duration::from_secs(1), "the probe must not block");
+        assert_eq!(
+            StdinTerminalProbe.query_background_color(Duration::from_secs(30)),
+            None
+        );
+        assert_eq!(
+            StdinTerminalProbe.query_color_scheme(Duration::from_secs(30)),
+            None
+        );
+        assert_eq!(
+            StdinTerminalProbe.query_cell_size(Duration::from_secs(30)),
+            None
+        );
+        assert_eq!(
+            StdinTerminalProbe.query_cursor_position(Duration::from_secs(30)),
+            None
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the probe must not block"
+        );
     }
 
     /// The trait's default [`TerminalProbe::query_cursor_position`] (TUI-093) answers `None`
@@ -715,7 +860,13 @@ mod tests {
     /// [`NoTerminalProbe`], which overrides none of the three and so calls the default directly.
     #[test]
     fn the_default_cursor_position_probe_answers_none() {
-        assert_eq!(NoTerminalProbe.query_cursor_position(Duration::from_millis(1)), None);
-        assert_eq!(NoTerminalProbe.query_cursor_position(Duration::from_secs(30)), None);
+        assert_eq!(
+            NoTerminalProbe.query_cursor_position(Duration::from_millis(1)),
+            None
+        );
+        assert_eq!(
+            NoTerminalProbe.query_cursor_position(Duration::from_secs(30)),
+            None
+        );
     }
 }

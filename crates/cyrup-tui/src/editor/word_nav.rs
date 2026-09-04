@@ -61,7 +61,9 @@ pub(crate) fn find_word_backward(
         segs.pop();
     }
     // `if (segments.length === 0) return newCursor` (`:40`).
-    let Some(&last) = segs.last() else { return new_cursor };
+    let Some(&last) = segs.last() else {
+        return new_cursor;
+    };
 
     if last.atomic {
         // "Skip one atomic segment" (`:44-46`).
@@ -111,7 +113,9 @@ pub(crate) fn find_word_forward(
         idx = idx.saturating_add(1);
     }
     // `if (next.done) return newCursor` (`:95`).
-    let Some(&next) = segs.get(idx) else { return new_cursor };
+    let Some(&next) = segs.get(idx) else {
+        return new_cursor;
+    };
 
     if next.atomic {
         new_cursor = new_cursor.saturating_add(next.len);
@@ -217,5 +221,7 @@ pub(crate) fn byte_seg_last_punct_end(text: &str, seg: &WordSeg) -> Option<usize
 /// segment holds none.
 pub(crate) fn byte_seg_first_punct(text: &str, seg: &WordSeg) -> Option<usize> {
     let s = text.get(seg.start..seg.start.saturating_add(seg.len))?;
-    s.char_indices().find(|&(_, c)| is_punctuation(c)).map(|(i, _)| i)
+    s.char_indices()
+        .find(|&(_, c)| is_punctuation(c))
+        .map(|(i, _)| i)
 }

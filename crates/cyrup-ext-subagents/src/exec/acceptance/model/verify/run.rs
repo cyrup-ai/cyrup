@@ -29,8 +29,7 @@ pub const VERIFY_TIMED_OUT_MESSAGE: &str = "Acceptance verification timed out.";
 /// EOF before the deadline. Upstream reaches the same `timed-out` verdict here (its `"close"`
 /// event likewise never fires) but cannot distinguish the case; naming it keeps a genuinely
 /// confusing failure diagnosable.
-pub const VERIFY_TIMED_OUT_HELD_PIPES_MESSAGE: &str =
-    "Acceptance verification timed out: the command exited, but a process it backgrounded \
+pub const VERIFY_TIMED_OUT_HELD_PIPES_MESSAGE: &str = "Acceptance verification timed out: the command exited, but a process it backgrounded \
          still holds its stdout/stderr.";
 
 /// `command.cwd ? path.resolve(defaultCwd, command.cwd) : defaultCwd`
@@ -130,8 +129,14 @@ pub async fn run_verify_command_with_cancel(
     // would drop the only `Child` handle and abandon a live process group. Drain the pipes on
     // their own tasks, keep the `Child`, and kill on expiry (`abortVerification`,
     // `acceptance.ts:1164-1178`).
-    let stdout_task = child.stdout.take().map(crate::exec::acceptance::lattice::verify::spawn_pipe_drain);
-    let stderr_task = child.stderr.take().map(crate::exec::acceptance::lattice::verify::spawn_pipe_drain);
+    let stdout_task = child
+        .stdout
+        .take()
+        .map(crate::exec::acceptance::lattice::verify::spawn_pipe_drain);
+    let stderr_task = child
+        .stderr
+        .take()
+        .map(crate::exec::acceptance::lattice::verify::spawn_pipe_drain);
 
     // ONE absolute deadline over exit AND output collection — see `crate::exec::acceptance::lattice::verify::drained_by` for why
     // the post-`wait()` drain must be inside it (upstream `acceptance.ts:742-759`).
@@ -268,7 +273,6 @@ mod tests {
     use super::*;
     use crate::exec::acceptance::model::testsupport::temp_dir;
 
-
     // ---- runVerifyCommand (acceptance.ts:713-767) — the SECOND copy of the runner ----
 
     /// SUBA-027 regression, mirror of
@@ -332,5 +336,4 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
-
 }

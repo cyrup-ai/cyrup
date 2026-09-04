@@ -94,8 +94,8 @@ use async_trait::async_trait;
 use cyrup_agent::AgentMessage;
 use cyrup_core::tool::ExecMode;
 use cyrup_core::{
-    TerminateHint,
-    CancelToken, Content, ExtensionId, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink,
+    CancelToken, Content, ExtensionId, TerminateHint, Tool, ToolCallId, ToolError, ToolResult,
+    ToolUpdateSink,
 };
 use cyrup_ext::native::{HostCtx, InitApi, NativeExtension};
 use cyrup_ext::{EventKind, EventPatch, ExtError, HookOutcome, HostEvent};
@@ -461,7 +461,13 @@ impl SteeringInbox {
                 .clone()
                 .is_some_and(|services| {
                     services
-                        .inject_message(&format_steer_message(&entry.request), None, true, None, false)
+                        .inject_message(
+                            &format_steer_message(&entry.request),
+                            None,
+                            true,
+                            None,
+                            false,
+                        )
                         .is_ok()
                 });
             if delivered {
@@ -574,8 +580,7 @@ impl SteeringInbox {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
 
-        let requests =
-            crate::background::control::consume_steer_requests_from_dir(&self.dir).await;
+        let requests = crate::background::control::consume_steer_requests_from_dir(&self.dir).await;
         for (index, request) in requests.iter().enumerate() {
             // SUBA-049 / pi `:370-372`. The `canSteer` half of upstream's guard is cyrup's
             // "`set_host_services` never bound a backend": both mean the child has no way to reach
@@ -628,7 +633,10 @@ impl SteeringInbox {
                     } else {
                         // Queued DURING a turn -> not eligible until that turn ends.
                         let ready = !state.in_turn;
-                        state.queued.push(QueuedFollowUp { request: request.clone(), ready });
+                        state.queued.push(QueuedFollowUp {
+                            request: request.clone(),
+                            ready,
+                        });
                         true
                     }
                 };
@@ -881,14 +889,20 @@ pub fn strip_subagent_orchestration_skill(prompt: &str) -> String {
     let mut out = String::with_capacity(prompt.len());
     let mut rest = prompt;
     while let Some(open_at) = rest.find(SKILL_OPEN) {
-        let Some(head) = rest.get(..open_at) else { break };
-        let Some(from_open) = rest.get(open_at..) else { break };
+        let Some(head) = rest.get(..open_at) else {
+            break;
+        };
+        let Some(from_open) = rest.get(open_at..) else {
+            break;
+        };
         let Some(close_rel) = from_open.find(SKILL_CLOSE) else {
             // An unterminated `<skill>` is not a block; emit the remainder verbatim.
             break;
         };
         let end = close_rel.saturating_add(SKILL_CLOSE.len());
-        let Some(block) = from_open.get(..end) else { break };
+        let Some(block) = from_open.get(..end) else {
+            break;
+        };
         out.push_str(head);
         if !block_names_orchestration_skill(block) {
             out.push_str(block);
@@ -946,7 +960,10 @@ fn block_names_orchestration_skill(block: &str) -> bool {
 /// run's flags select — not a stale `fanout` block from a run that was granted fanout.
 fn strip_child_boundary_instructions(prompt: &str) -> String {
     let mut rewritten = prompt.to_string();
-    for boundary in [CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS, CHILD_FANOUT_BOUNDARY_INSTRUCTIONS] {
+    for boundary in [
+        CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS,
+        CHILD_FANOUT_BOUNDARY_INSTRUCTIONS,
+    ] {
         rewritten = rewritten.replace(boundary, "");
     }
     trim_leading_blank_lines(&rewritten).to_string()
@@ -958,8 +975,13 @@ fn strip_child_boundary_instructions(prompt: &str) -> String {
 fn trim_leading_blank_lines(text: &str) -> &str {
     let mut rest = text;
     while let Some(line_end) = rest.find('\n') {
-        let Some(first_line) = rest.get(..line_end) else { break };
-        if !first_line.chars().all(|c| c == ' ' || c == '\t' || c == '\r') {
+        let Some(first_line) = rest.get(..line_end) else {
+            break;
+        };
+        if !first_line
+            .chars()
+            .all(|c| c == ' ' || c == '\t' || c == '\r')
+        {
             break;
         }
         match rest.get(line_end.saturating_add(1)..) {
@@ -1002,7 +1024,9 @@ pub fn rewrite_subagent_prompt(prompt: &str, opts: &PromptRewriteOptions) -> Str
 /// pi `isParentOnlySubagentMessage` (`:115-120`): a `custom` message whose type is parent-only.
 fn is_parent_only_custom(message: &AgentMessage) -> bool {
     match message {
-        AgentMessage::Custom { kind, .. } => PARENT_ONLY_CUSTOM_MESSAGE_TYPES.contains(&kind.as_str()),
+        AgentMessage::Custom { kind, .. } => {
+            PARENT_ONLY_CUSTOM_MESSAGE_TYPES.contains(&kind.as_str())
+        }
         _ => false,
     }
 }
@@ -1144,7 +1168,10 @@ fn rewrite_local_json_pointer_refs(
             } else if let Some(rest) = reference.strip_prefix('#')
                 && rest.starts_with('/')
             {
-                rewritten.insert(keyword.to_string(), format!("{pointer_prefix}{rest}").into());
+                rewritten.insert(
+                    keyword.to_string(),
+                    format!("{pointer_prefix}{rest}").into(),
+                );
             }
         }
     }
@@ -1206,7 +1233,10 @@ fn rewrite_local_json_pointer_refs(
                 (name.clone(), value)
             })
             .collect();
-        rewritten.insert("dependencies".to_string(), serde_json::Value::Object(mapped));
+        rewritten.insert(
+            "dependencies".to_string(),
+            serde_json::Value::Object(mapped),
+        );
     }
 
     serde_json::Value::Object(rewritten)
@@ -1313,12 +1343,14 @@ impl Tool for StructuredOutputTool {
         // tool error it can retry — the capture file is deliberately NOT written on an invalid
         // value, so the parent's read-back still reports "missing" rather than reading a value
         // that never passed validation.
-        validate_structured_output(&self.schema, &value)
-            .map_err(|message| ToolError::new(format!("Structured output validation failed: {message}")))?;
+        validate_structured_output(&self.schema, &value).map_err(|message| {
+            ToolError::new(format!("Structured output validation failed: {message}"))
+        })?;
 
         if let Some(dir) = self.output_path.parent() {
-            std::fs::create_dir_all(dir)
-                .map_err(|err| ToolError::new(format!("Failed to write structured output: {err}")))?;
+            std::fs::create_dir_all(dir).map_err(|err| {
+                ToolError::new(format!("Failed to write structured output: {err}"))
+            })?;
         }
         let encoded = serde_json::to_vec(&value)
             .map_err(|err| ToolError::new(format!("Failed to encode structured output: {err}")))?;
@@ -1330,10 +1362,8 @@ impl Tool for StructuredOutputTool {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
-                &self.output_path,
-                std::fs::Permissions::from_mode(0o600),
-            );
+            let _ =
+                std::fs::set_permissions(&self.output_path, std::fs::Permissions::from_mode(0o600));
         }
 
         Ok(ToolResult {
@@ -1491,9 +1521,8 @@ impl PermissionGate {
                     self.arbiter.as_ref(),
                 )
                 .await;
-                (!result.approved).then(|| {
-                    format!("Blocked by pi-subagents permission rule: {}", result.reason)
-                })
+                (!result.approved)
+                    .then(|| format!("Blocked by pi-subagents permission rule: {}", result.reason))
             }
         }
     }
@@ -1589,8 +1618,14 @@ impl SubagentPromptRuntime {
         capability_path: Option<PathBuf>,
         child_index: usize,
     ) -> Self {
-        self.steering = dir
-            .map(|dir| Arc::new(SteeringInbox::new(dir, ack_dir, capability_path, child_index)));
+        self.steering = dir.map(|dir| {
+            Arc::new(SteeringInbox::new(
+                dir,
+                ack_dir,
+                capability_path,
+                child_index,
+            ))
+        });
         self
     }
 
@@ -1935,12 +1970,19 @@ impl NativeExtension for SubagentPromptRuntime {
         if let Some(watchdog) = &self.watchdog {
             match ev {
                 HostEvent::SessionStart { .. } => watchdog.handle_session_start(&_ctx.cwd),
-                HostEvent::BeforeAgentStart { prompt, system_prompt, .. } => watchdog
-                    .handle_before_agent_start(
-                        &serde_json::json!({ "prompt": prompt, "systemPrompt": system_prompt }),
-                        &_ctx.cwd,
-                    ),
-                HostEvent::TurnEnd { message, tool_results, .. } => watchdog.handle_turn_end(
+                HostEvent::BeforeAgentStart {
+                    prompt,
+                    system_prompt,
+                    ..
+                } => watchdog.handle_before_agent_start(
+                    &serde_json::json!({ "prompt": prompt, "systemPrompt": system_prompt }),
+                    &_ctx.cwd,
+                ),
+                HostEvent::TurnEnd {
+                    message,
+                    tool_results,
+                    ..
+                } => watchdog.handle_turn_end(
                     &crate::watchdog::turn_delta::watchdog_turn_end_event(message, tool_results),
                     &_ctx.cwd,
                 ),
@@ -2055,7 +2097,10 @@ impl NativeExtension for SubagentPromptRuntime {
                     return HookOutcome::Noop;
                 };
                 let mut content = content.clone();
-                content.push(cyrup_core::Content::Text { text: nudge.into(), text_signature: None });
+                content.push(cyrup_core::Content::Text {
+                    text: nudge.into(),
+                    text_signature: None,
+                });
                 HookOutcome::Mutate(EventPatch::ToolResult {
                     content: Some(content),
                     details: None,
@@ -2066,8 +2111,10 @@ impl NativeExtension for SubagentPromptRuntime {
             }
             // pi `:317-321`.
             HostEvent::Context { messages } => {
-                match strip_parent_only_subagent_messages(messages, self.preserve_fanout_tool_history)
-                {
+                match strip_parent_only_subagent_messages(
+                    messages,
+                    self.preserve_fanout_tool_history,
+                ) {
                     Some(messages) => HookOutcome::Mutate(EventPatch::Context { messages }),
                     None => HookOutcome::Noop,
                 }
@@ -2126,29 +2173,30 @@ pub fn prompt_runtime_from_env(
     let inherit_skills = read_boolean_env(get, INHERIT_SKILLS_ENV);
     let fanout_child = read_boolean_env(get, FANOUT_CHILD_ENV);
     // pi `:333`: all three undefined => no rewrite at all.
-    let rewrite = (inherit_project_context.is_some()
-        || inherit_skills.is_some()
-        || fanout_child.is_some())
-    .then(|| PromptRewriteOptions {
-        inherit_project_context: inherit_project_context.unwrap_or(true),
-        inherit_skills: inherit_skills.unwrap_or(true),
-        fanout_child: fanout_child == Some(true),
-        // pi `:111` gates the appended instruction on the CAPTURE var alone.
-        structured_output: capture.is_some(),
-    });
+    let rewrite =
+        (inherit_project_context.is_some() || inherit_skills.is_some() || fanout_child.is_some())
+            .then(|| PromptRewriteOptions {
+                inherit_project_context: inherit_project_context.unwrap_or(true),
+                inherit_skills: inherit_skills.unwrap_or(true),
+                fanout_child: fanout_child == Some(true),
+                // pi `:111` gates the appended instruction on the CAPTURE var alone.
+                structured_output: capture.is_some(),
+            });
 
     // pi `registerNativeSupervisorClient` (`subagent-prompt-runtime.ts:240` →
     // `native-supervisor-channel.ts:294-311`): a child with a resolvable supervisor channel gets a
     // `contact_supervisor` that needs no broker, no socket and no intercom opt-in. See
     // [`crate::native_supervisor::native_child_client_should_register`] for why the second term
     // stands in for upstream's `!hasTool(pi, "contact_supervisor")`.
-    let agent_dir = crate::native_supervisor::intercom_agent_dir_from(get, std::env::current_dir().ok());
-    let child_metadata = crate::native_supervisor::read_child_metadata_from(get)
-        .filter(|_| {
-            crate::native_supervisor::native_child_client_should_register_from(get, &agent_dir)
-        });
+    let agent_dir =
+        crate::native_supervisor::intercom_agent_dir_from(get, std::env::current_dir().ok());
+    let child_metadata = crate::native_supervisor::read_child_metadata_from(get).filter(|_| {
+        crate::native_supervisor::native_child_client_should_register_from(get, &agent_dir)
+    });
     let supervisor_tool = child_metadata.clone().map(|metadata| {
-        Arc::new(crate::native_supervisor::NativeContactSupervisorTool::new(metadata))
+        Arc::new(crate::native_supervisor::NativeContactSupervisorTool::new(
+            metadata,
+        ))
     });
     // G106, upstream's SECOND child registration (`native-supervisor-channel.ts:305-321`), layered
     // ON TOP of `contact_supervisor` exactly as `registerNativeSupervisorFallbackOnce` layers it
@@ -2157,17 +2205,27 @@ pub fn prompt_runtime_from_env(
     // name (`:513`). A plain child gets `contact_supervisor` alone, as upstream.
     let intercom_fallback = child_metadata
         .filter(|_| {
-            crate::native_supervisor::native_child_intercom_fallback_should_register(get, &agent_dir)
+            crate::native_supervisor::native_child_intercom_fallback_should_register(
+                get, &agent_dir,
+            )
         })
-        .map(|metadata| Arc::new(crate::native_supervisor::NativeChildIntercomTool::new(metadata)));
+        .map(|metadata| {
+            Arc::new(crate::native_supervisor::NativeChildIntercomTool::new(
+                metadata,
+            ))
+        });
 
-    // pi `:263`: `registerToolBudget(pi, decodeToolBudgetEnv(process.env[TOOL_BUDGET_ENV]))`.
+    // pi `:693` @v0.64.0: `registerToolBudget(pi, decodeToolBudgetEnv(process.env[TOOL_BUDGET_ENV],
+    // { allowZero: process.env[TOOL_BUDGET_ZERO_AUTH_ENV] === "1" }))` — CFG-067: the zero-budget
+    // authorisation is read from the same env the budget arrives in, so a `hard: 0` payload is
+    // honoured only when the parent said so and rejected (below) otherwise.
     // A malformed payload is dropped rather than propagated: pi lets `decodeToolBudgetEnv` throw out
     // of module init, which here would take down a child whose budget the parent already validated.
     // The parent is the only writer of this var, so a malformed value means the environment was
     // tampered with mid-flight — running unbudgeted beats an unexplained child crash.
     let tool_budget = match crate::exec::tool_budget::decode_tool_budget_env(
         get(crate::exec::tool_budget::TOOL_BUDGET_ENV).as_deref(),
+        crate::exec::tool_budget::HardMinimum::from_env(get),
     ) {
         Ok(budget) => budget,
         Err(message) => {
@@ -2198,11 +2256,9 @@ pub fn prompt_runtime_from_env(
     // `process.env[CHILD_WATCHDOG_CONFIG_ENV]` itself. `None` for every child the orchestrator did
     // not arm, which is the default.
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let raw_watchdog_config =
-        non_empty(crate::watchdog::child_status::CHILD_WATCHDOG_CONFIG_ENV);
-    let services: Arc<
-        std::sync::Mutex<Option<Arc<dyn cyrup_ext::host::HostServices>>>,
-    > = Arc::new(std::sync::Mutex::new(None));
+    let raw_watchdog_config = non_empty(crate::watchdog::child_status::CHILD_WATCHDOG_CONFIG_ENV);
+    let services: Arc<std::sync::Mutex<Option<Arc<dyn cyrup_ext::host::HostServices>>>> =
+        Arc::new(std::sync::Mutex::new(None));
     let sink_services = Arc::clone(&services);
     // `review: createMainWatchdogReview(() => currentContext, { getThinkingLevel: () =>
     // pi.getThinkingLevel() })` (`register-child.ts:77`). Passing `None` here left the child on
@@ -2227,10 +2283,10 @@ pub fn prompt_runtime_from_env(
 
     // pi `registerPermissionGate(pi)` (`subagent-prompt-runtime.ts:475`), which reads
     // `process.env[PERMISSION_POLICY_ENV]` itself (`:285`).
-    let permission_policy =
-        non_empty(crate::watchdog::permission_arbiter::PERMISSION_POLICY_ENV);
+    let permission_policy = non_empty(crate::watchdog::permission_arbiter::PERMISSION_POLICY_ENV);
     let permission_audit_path =
-        non_empty(crate::watchdog::permission_arbiter::PERMISSION_AUDIT_PATH_ENV).map(PathBuf::from);
+        non_empty(crate::watchdog::permission_arbiter::PERMISSION_AUDIT_PATH_ENV)
+            .map(PathBuf::from);
 
     let runtime = SubagentPromptRuntime::from_parts(tool, rewrite, fanout_child == Some(true))
         .with_supervisor_tool(supervisor_tool)
@@ -2270,10 +2326,11 @@ fn child_watchdog_review(
     cwd: &Path,
     services: &Arc<std::sync::Mutex<Option<Arc<dyn cyrup_ext::host::HostServices>>>>,
 ) -> Arc<dyn crate::watchdog::runtime::WatchdogReview> {
-    let registry: Arc<dyn crate::watchdog::model_selection::WatchdogModelRegistry> =
-        Arc::new(crate::watchdog::model_selection::BuiltinWatchdogModelRegistry::new(
+    let registry: Arc<dyn crate::watchdog::model_selection::WatchdogModelRegistry> = Arc::new(
+        crate::watchdog::model_selection::BuiltinWatchdogModelRegistry::new(
             crate::watchdog::register_main::watchdog_config_dirs().as_ref(),
-        ));
+        ),
+    );
     let session_registry = Arc::clone(&registry);
     let session_services = Arc::clone(services);
     Arc::new(
@@ -2290,7 +2347,11 @@ fn child_watchdog_review(
                 .clone()?;
             let model = services.current_model().as_deref().and_then(|model| {
                 let info = crate::watchdog::register_main::watchdog_model_info(model)?;
-                Some(session_registry.find(&info.provider, &info.id).unwrap_or(info))
+                Some(
+                    session_registry
+                        .find(&info.provider, &info.id)
+                        .unwrap_or(info),
+                )
             });
             Some(crate::watchdog::review::WatchdogSessionContext {
                 model,
@@ -2302,7 +2363,12 @@ fn child_watchdog_review(
 
 #[cfg(test)]
 mod tool_budget_runtime_tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
     use cyrup_core::ToolCallId;
@@ -2382,10 +2448,19 @@ mod tool_budget_runtime_tests {
             }
         }
 
-        assert_eq!(nudges.len(), 1, "the soft nudge fires exactly once: {nudges:?}");
-        assert_eq!(nudges[0].0, 1, "it rides the result of the call that crossed soft");
+        assert_eq!(
+            nudges.len(),
+            1,
+            "the soft nudge fires exactly once: {nudges:?}"
+        );
+        assert_eq!(
+            nudges[0].0, 1,
+            "it rides the result of the call that crossed soft"
+        );
         assert!(
-            nudges[0].1.starts_with("Tool budget soft limit reached after 1 tool call (soft 1, hard 2)."),
+            nudges[0]
+                .1
+                .starts_with("Tool budget soft limit reached after 1 tool call (soft 1, hard 2)."),
             "nudge text: {}",
             nudges[0].1
         );
@@ -2424,6 +2499,53 @@ mod tool_budget_runtime_tests {
         ));
     }
 
+    /// CFG-067 / pi `subagent-prompt-runtime.ts:693` @v0.64.0: `decodeToolBudgetEnv(env, {
+    /// allowZero: env[TOOL_BUDGET_ZERO_AUTH_ENV] === "1" })`. THE USER ACTION end to end: the
+    /// parent ships `{"hard": 0}` — "this child may make no browsing calls at all" — and the
+    /// authorisation flag; the child's very first `read` is refused. Without the flag the same
+    /// payload is the malformed-budget case and the child runs unbudgeted (upstream's decode
+    /// throws; this crate's documented policy drops the budget instead). Before this port the
+    /// flag was not read anywhere, so the authorised branch could not be reached.
+    #[tokio::test]
+    async fn a_zero_budget_is_honoured_only_with_the_parents_authorisation() {
+        let encoded = "{\"hard\":0}".to_string();
+        let authorised = {
+            let encoded = encoded.clone();
+            prompt_runtime_extension_from(&move |key| {
+                if key == crate::exec::tool_budget::TOOL_BUDGET_ENV {
+                    Some(encoded.clone())
+                } else if key == crate::exec::tool_budget::TOOL_BUDGET_ZERO_AUTH_ENV {
+                    Some("1".to_string())
+                } else {
+                    None
+                }
+            })
+            .expect("an authorised zero budget builds the child runtime")
+        };
+        let ctx = ctx();
+        match authorised.on_event(&call(1, "read"), &ctx).await {
+            HookOutcome::Block { reason, .. } => assert!(
+                reason
+                    .unwrap_or_default()
+                    .starts_with("Tool budget hard limit reached after 1 tool call (hard 0)."),
+            ),
+            other => panic!("the first browsing call must be refused under hard 0: {other:?}"),
+        }
+
+        let unauthorised = prompt_runtime_extension_from(&move |key| {
+            (key == crate::exec::tool_budget::TOOL_BUDGET_ENV).then(|| encoded.clone())
+        });
+        if let Some(ext) = unauthorised {
+            assert!(
+                matches!(
+                    ext.on_event(&call(1, "read"), &ctx).await,
+                    HookOutcome::Noop
+                ),
+                "an unauthorised zero budget is dropped, never enforced"
+            );
+        }
+    }
+
     /// No budget in the env => no `tool_call` subscription and no interference at all.
     #[tokio::test]
     async fn a_child_with_no_budget_never_blocks_a_tool() {
@@ -2444,12 +2566,15 @@ mod tool_budget_runtime_tests {
 /// and `on_event` decides.
 #[cfg(test)]
 mod permission_gate_tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
-    use crate::watchdog::permission_arbiter::{
-        PERMISSION_AUDIT_PATH_ENV, PERMISSION_POLICY_ENV,
-    };
+    use crate::watchdog::permission_arbiter::{PERMISSION_AUDIT_PATH_ENV, PERMISSION_POLICY_ENV};
     use cyrup_core::ToolCallId;
     use cyrup_ext::native::ExtMode;
 
@@ -2510,10 +2635,7 @@ mod permission_gate_tests {
     async fn an_ask_tier_tool_fails_closed_and_writes_both_audit_records() {
         let dir = tempfile::tempdir().expect("tempdir");
         let audit = dir.path().join("permission-audit.jsonl");
-        let ext = env_extension(
-            "{\"write\":\"ask\"}",
-            Some(&audit.display().to_string()),
-        );
+        let ext = env_extension("{\"write\":\"ask\"}", Some(&audit.display().to_string()));
         let HookOutcome::Block { reason, .. } = ext.on_event(&call("write"), &ctx()).await else {
             panic!("an unanswerable ask must fail closed");
         };
@@ -2545,10 +2667,7 @@ mod permission_gate_tests {
     async fn bash_and_the_internal_coordination_tools_are_never_gated() {
         // The rules a parent could still ship for them (validation refuses to record these, but a
         // parent on another version could).
-        let ext = env_extension(
-            "{\"write\":\"deny\",\"read\":\"deny\"}",
-            None,
-        );
+        let ext = env_extension("{\"write\":\"deny\",\"read\":\"deny\"}", None);
         let ctx = ctx();
         for name in [
             "bash",
@@ -2572,7 +2691,10 @@ mod permission_gate_tests {
             panic!("an invalid policy must not fail open");
         };
         let reason = reason.expect("a reason");
-        assert!(reason.contains("the permission policy is invalid"), "{reason}");
+        assert!(
+            reason.contains("the permission policy is invalid"),
+            "{reason}"
+        );
         assert!(reason.contains("must be allow, ask, or deny"), "{reason}");
     }
 
@@ -2781,10 +2903,7 @@ mod tests {
             }
         };
 
-        async fn fire(
-            env: &dyn Fn(&str) -> Option<String>,
-            registry: Option<Vec<String>>,
-        ) {
+        async fn fire(env: &dyn Fn(&str) -> Option<String>, registry: Option<Vec<String>>) {
             let runtime =
                 SubagentPromptRuntime::from_parts(None, None, false).with_tool_diagnostic(env);
             runtime.set_host_services(Arc::new(RegistryHost(registry)));
@@ -2801,7 +2920,9 @@ mod tests {
         let reported = ta::read_child_tool_diagnostic_error(Some(&path))
             .expect("a missing tool must produce a reportable diagnostic");
         assert!(
-            reported.starts_with("Agent 'researcher' requested unavailable child tools: mcp__srv__gone."),
+            reported.starts_with(
+                "Agent 'researcher' requested unavailable child tools: mcp__srv__gone."
+            ),
             "{reported}"
         );
         assert!(
@@ -2824,7 +2945,10 @@ mod tests {
         //     though the required list and an empty-ish registry would otherwise report `read` and
         //     `mcp__srv__gone` as missing.
         fire(&env(false), Some(Vec::new())).await;
-        assert!(!path.exists(), "the handshake must stay off without its path env");
+        assert!(
+            !path.exists(),
+            "the handshake must stay off without its path env"
+        );
     }
 
     /// SUBA-045 — a backend that cannot answer `all_tool_names` (no live session bound) is "no
@@ -2937,7 +3061,10 @@ mod tests {
         let expected = serde_json::json!("#/properties/value/$defs/A");
         assert_eq!(value["anyOf"][0]["$ref"], expected);
         assert_eq!(value["items"][0]["$ref"], expected);
-        assert_eq!(value["items"][1]["$ref"], serde_json::json!("#/properties/value"));
+        assert_eq!(
+            value["items"][1]["$ref"],
+            serde_json::json!("#/properties/value")
+        );
         assert_eq!(value["additionalProperties"]["$ref"], expected);
         assert_eq!(value["not"]["$ref"], expected);
         assert_eq!(value["dependencies"]["shape"]["$ref"], expected);
@@ -3128,7 +3255,10 @@ mod tests {
             .await
             .expect("a schema-conforming value is captured");
 
-        assert!(result.terminate.requested(), "capturing the value terminates the step");
+        assert!(
+            result.terminate.requested(),
+            "capturing the value terminates the step"
+        );
         // The parent reads this file back; the nested dir must have been created for it.
         let written: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
@@ -3210,7 +3340,11 @@ mod tests {
         assert_eq!(val(Some("false")), Some(true), "pi does not parse words");
     }
 
-    fn opts(inherit_project_context: bool, inherit_skills: bool, fanout_child: bool) -> PromptRewriteOptions {
+    fn opts(
+        inherit_project_context: bool,
+        inherit_skills: bool,
+        fanout_child: bool,
+    ) -> PromptRewriteOptions {
         PromptRewriteOptions {
             inherit_project_context,
             inherit_skills,
@@ -3250,13 +3384,19 @@ mod tests {
     #[test]
     fn inherit_project_context_false_removes_the_project_context_section() {
         let out = rewrite_subagent_prompt(&assembled_prompt(), &opts(false, true, false));
-        assert!(!out.contains("NEVER commit to main."), "inherited AGENTS.md content must be gone");
+        assert!(
+            !out.contains("NEVER commit to main."),
+            "inherited AGENTS.md content must be gone"
+        );
         assert!(!out.contains(PROJECT_CONTEXT_OPEN));
         assert!(!out.contains(PROJECT_CONTEXT_CLOSE));
         // Everything AROUND the section survives — this is a cut, not a truncation.
         assert!(out.contains("You are a coding assistant operating inside cyrup."));
         assert!(out.contains("Current date: 2026-08-07"));
-        assert!(out.contains("<name>deploy</name>"), "skills were inherited and must remain");
+        assert!(
+            out.contains("<name>deploy</name>"),
+            "skills were inherited and must remain"
+        );
     }
 
     #[test]
@@ -3265,7 +3405,10 @@ mod tests {
         assert!(!out.contains("<name>deploy</name>"));
         assert!(!out.contains(SKILLS_OPEN));
         assert!(!out.contains(SKILLS_CLOSE));
-        assert!(out.contains("NEVER commit to main."), "project context was inherited");
+        assert!(
+            out.contains("NEVER commit to main."),
+            "project context was inherited"
+        );
         assert!(out.contains("Current date: 2026-08-07"));
     }
 
@@ -3297,7 +3440,12 @@ mod tests {
             !twice.contains(CHILD_FANOUT_BOUNDARY_INSTRUCTIONS),
             "a stale fanout grant must not survive a re-run: {twice}"
         );
-        assert_eq!(twice.matches("You are a child subagent, not the parent orchestrator.").count(), 1);
+        assert_eq!(
+            twice
+                .matches("You are a child subagent, not the parent orchestrator.")
+                .count(),
+            1
+        );
         assert!(twice.ends_with("\n\nBODY"));
     }
 
@@ -3305,7 +3453,10 @@ mod tests {
     fn a_declared_schema_appends_the_structured_output_instruction_under_the_boundary() {
         let out = rewrite_subagent_prompt(
             "BODY",
-            &PromptRewriteOptions { structured_output: true, ..opts(true, true, false) },
+            &PromptRewriteOptions {
+                structured_output: true,
+                ..opts(true, true, false)
+            },
         );
         assert!(out.starts_with(CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS));
         assert!(out.contains(STRUCTURED_OUTPUT_INSTRUCTION));
@@ -3344,12 +3495,22 @@ mod tests {
     #[test]
     fn the_orchestration_skill_entry_is_removed_and_others_survive() {
         let out = strip_subagent_orchestration_skill(&assembled_prompt_with_orchestration_skill());
-        assert!(!out.contains("pi-subagents"), "the orchestration entry must be gone: {out}");
+        assert!(
+            !out.contains("pi-subagents"),
+            "the orchestration entry must be gone: {out}"
+        );
         assert!(!out.contains("Orchestrate subagents"));
-        assert!(out.contains("<name>deploy</name>"), "the unrelated skill survives: {out}");
+        assert!(
+            out.contains("<name>deploy</name>"),
+            "the unrelated skill survives: {out}"
+        );
         assert!(out.contains("Ship a release"));
         assert!(out.contains("<available_skills>") && out.contains("</available_skills>"));
-        assert_eq!(out.matches("<skill>").count(), 1, "exactly one entry left: {out}");
+        assert_eq!(
+            out.matches("<skill>").count(),
+            1,
+            "exactly one entry left: {out}"
+        );
         assert!(out.contains("Current date: 2026-08-09"));
     }
 
@@ -3361,7 +3522,10 @@ mod tests {
             &assembled_prompt_with_orchestration_skill(),
             &opts(true, true, false),
         );
-        assert!(out.contains("<name>deploy</name>"), "skills were inherited: {out}");
+        assert!(
+            out.contains("<name>deploy</name>"),
+            "skills were inherited: {out}"
+        );
         assert!(
             !out.contains("pi-subagents"),
             "the parent's orchestration skill must never survive into a child: {out}"
@@ -3373,7 +3537,10 @@ mod tests {
     fn stripping_the_orchestration_skill_is_a_no_op_when_absent() {
         let input = assembled_prompt();
         assert_eq!(strip_subagent_orchestration_skill(&input), input);
-        assert_eq!(strip_subagent_orchestration_skill("no skills here"), "no skills here");
+        assert_eq!(
+            strip_subagent_orchestration_skill("no skills here"),
+            "no skills here"
+        );
     }
 
     /// Only an exact `<name>pi-subagents</name>` matches — a skill that merely MENTIONS the name in
@@ -3394,8 +3561,14 @@ mod tests {
 
     #[test]
     fn stripping_a_missing_section_is_a_no_op() {
-        assert_eq!(strip_project_context("no sections here"), "no sections here");
-        assert_eq!(strip_inherited_skills("no sections here"), "no sections here");
+        assert_eq!(
+            strip_project_context("no sections here"),
+            "no sections here"
+        );
+        assert_eq!(
+            strip_inherited_skills("no sections here"),
+            "no sections here"
+        );
     }
 
     fn custom(kind: &str) -> AgentMessage {
@@ -3461,7 +3634,10 @@ mod tests {
     fn a_plain_child_loses_the_parents_subagent_calls_and_results() {
         let messages = vec![
             AgentMessage::user_text("task"),
-            assistant(vec![Content::text("delegating"), tool_call_block("subagent")]),
+            assistant(vec![
+                Content::text("delegating"),
+                tool_call_block("subagent"),
+            ]),
             tool_result("subagent"),
             tool_result("bash"),
         ];
@@ -3497,9 +3673,13 @@ mod tests {
             tool_result("subagent"),
             custom("subagent-notify"),
         ];
-        let out = strip_parent_only_subagent_messages(&arcs(messages), true).expect("the notice changed it");
+        let out = strip_parent_only_subagent_messages(&arcs(messages), true)
+            .expect("the notice changed it");
         assert_eq!(out.len(), 2, "both subagent tool messages survive");
-        assert!(out.iter().all(|m| !matches!(m.as_ref(), AgentMessage::Custom { .. })));
+        assert!(
+            out.iter()
+                .all(|m| !matches!(m.as_ref(), AgentMessage::Custom { .. }))
+        );
     }
 
     /// Nothing to strip must report NO change, so the dispatcher leaves the list untouched rather

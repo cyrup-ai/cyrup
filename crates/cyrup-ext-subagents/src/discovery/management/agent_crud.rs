@@ -213,7 +213,8 @@ pub fn rename_agent(
 
     let mut renamed = existing.clone();
     renamed.local_name = new_local_name.to_string();
-    renamed.name = AgentDefinition::qualified_name(new_local_name, existing.package_name.as_deref());
+    renamed.name =
+        AgentDefinition::qualified_name(new_local_name, existing.package_name.as_deref());
     renamed.file_path = new_path.clone();
 
     // RENAME re-serializes the (content-unchanged) definition under the new path. Passing `None`
@@ -249,13 +250,20 @@ fn build_definition(
         description: description.to_string(),
         aliases: fields.aliases.clone().unwrap_or_default(),
         tools: fields.tools.clone().unwrap_or(None),
+        // SUBA-092: no management input field exists for either yet (upstream's `agentUpdate`
+        // handler accepts `config.excludeTools`, `agent-management.ts:487-497` @v0.64.0 — not
+        // ported here), so a CREATED agent declares neither.
+        exclude_tools: None,
+        allow_nested_subagents: None,
         extensions: fields.extensions.clone().unwrap_or(None),
         extensions_from_default: false,
         subagent_only_extensions: fields.subagent_only_extensions.clone().unwrap_or_default(),
         model: fields.model.clone().unwrap_or(None),
         fallback_models: fields.fallback_models.clone().unwrap_or_default(),
         thinking: fields.thinking.clone().unwrap_or(None),
-        system_prompt_mode: fields.system_prompt_mode.unwrap_or(SystemPromptMode::Replace),
+        system_prompt_mode: fields
+            .system_prompt_mode
+            .unwrap_or(SystemPromptMode::Replace),
         inherit_project_context: fields.inherit_project_context.unwrap_or(false),
         inherit_skills: fields.inherit_skills.unwrap_or(false),
         skills: fields.skills.clone().unwrap_or_default(),
@@ -275,6 +283,12 @@ fn build_definition(
         // SUBA-008: same rule as `toolBudget` — no management field exists for it, so a CREATED
         // agent declares none.
         default_turn_budget: None,
+        // SUBA-082: upstream's `agentCreate`/`agentUpdate` DO accept `config.acceptance` and
+        // `config.acceptanceRole` (`agent-management.ts:576-587` @v0.64.0); that management
+        // input is not ported here, so a CREATED agent declares neither (an author sets them by
+        // hand-editing the file's `acceptance:`/`acceptanceRole:` frontmatter).
+        default_acceptance: None,
+        acceptance_role: None,
         // SUBA-073: same rule — no management field exists for it, so a CREATED agent declares
         // none (an author sets it by hand-editing the agent file's `permissions:` frontmatter).
         permission_rules: None,
@@ -289,6 +303,7 @@ fn build_definition(
         extra_fields: BTreeMap::new(),
         override_info: None,
         model_source: None,
+        model_provider: None,
     }
 }
 
@@ -305,8 +320,18 @@ fn merge_fields(
         local_name: local_name.to_string(),
         package_name,
         description: description.to_string(),
-        aliases: fields.aliases.clone().unwrap_or_else(|| existing.aliases.clone()),
-        tools: fields.tools.clone().unwrap_or_else(|| existing.tools.clone()),
+        aliases: fields
+            .aliases
+            .clone()
+            .unwrap_or_else(|| existing.aliases.clone()),
+        tools: fields
+            .tools
+            .clone()
+            .unwrap_or_else(|| existing.tools.clone()),
+        // SUBA-092: preserved verbatim across an update so a management rewrite never strips an
+        // author's exclusion list or nested-delegation grant (`agent-management.ts:321,323`).
+        exclude_tools: existing.exclude_tools.clone(),
+        allow_nested_subagents: existing.allow_nested_subagents,
         extensions: fields
             .extensions
             .clone()
@@ -316,7 +341,10 @@ fn merge_fields(
             .subagent_only_extensions
             .clone()
             .unwrap_or_else(|| existing.subagent_only_extensions.clone()),
-        model: fields.model.clone().unwrap_or_else(|| existing.model.clone()),
+        model: fields
+            .model
+            .clone()
+            .unwrap_or_else(|| existing.model.clone()),
         fallback_models: fields
             .fallback_models
             .clone()
@@ -325,21 +353,31 @@ fn merge_fields(
             .thinking
             .clone()
             .unwrap_or_else(|| existing.thinking.clone()),
-        system_prompt_mode: fields.system_prompt_mode.unwrap_or(existing.system_prompt_mode),
+        system_prompt_mode: fields
+            .system_prompt_mode
+            .unwrap_or(existing.system_prompt_mode),
         inherit_project_context: fields
             .inherit_project_context
             .unwrap_or(existing.inherit_project_context),
         inherit_skills: fields.inherit_skills.unwrap_or(existing.inherit_skills),
-        skills: fields.skills.clone().unwrap_or_else(|| existing.skills.clone()),
+        skills: fields
+            .skills
+            .clone()
+            .unwrap_or_else(|| existing.skills.clone()),
         default_reads: fields
             .default_reads
             .clone()
             .unwrap_or_else(|| existing.default_reads.clone()),
         default_progress: fields.default_progress.unwrap_or(existing.default_progress),
-        output: fields.output.clone().unwrap_or_else(|| existing.output.clone()),
+        output: fields
+            .output
+            .clone()
+            .unwrap_or_else(|| existing.output.clone()),
         completion_guard: fields.completion_guard.unwrap_or(existing.completion_guard),
         interactive: fields.interactive.unwrap_or(existing.interactive),
-        max_subagent_depth: fields.max_subagent_depth.unwrap_or(existing.max_subagent_depth),
+        max_subagent_depth: fields
+            .max_subagent_depth
+            .unwrap_or(existing.max_subagent_depth),
         default_context: fields.default_context.unwrap_or(existing.default_context),
         // An UPDATE never edits these two (no management field exists for them) but must not
         // DROP them either — an agent file with a `memory:`/`toolBudget:` block that is renamed
@@ -350,6 +388,11 @@ fn merge_fields(
         tool_budget: existing.tool_budget.clone(),
         // SUBA-008: an UPDATE never edits it but must not DROP it either — see the note above.
         default_turn_budget: existing.default_turn_budget,
+        // SUBA-082: an UPDATE never edits them (no management field yet) but must not DROP them
+        // either — pi's `editableAgentConfig` copies both onto the edit base
+        // (`agent-management.ts:314-315` @v0.64.0).
+        default_acceptance: existing.default_acceptance.clone(),
+        acceptance_role: existing.acceptance_role,
         // SUBA-073: an UPDATE never edits it but must not DROP it either — see the note above.
         permission_rules: existing.permission_rules.clone(),
         // SUBA-074: an UPDATE never edits it but must not DROP it either — see the note above.
@@ -365,6 +408,7 @@ fn merge_fields(
         extra_fields: existing.extra_fields.clone(),
         override_info: existing.override_info.clone(),
         model_source: existing.model_source,
+        model_provider: existing.model_provider.clone(),
     }
 }
 
@@ -375,7 +419,10 @@ fn merge_fields(
 /// indicates an internal serialization bug in [`crate::discovery::management::frontmatter_write::write_agent_file`],
 /// surfaced as a `Spawn`-flavored I/O error rather than silently returning a definition that does
 /// not match what was written.
-fn reparse_agent_file(file_path: &Path, source: AgentSource) -> Result<AgentDefinition, SubagentError> {
+fn reparse_agent_file(
+    file_path: &Path,
+    source: AgentSource,
+) -> Result<AgentDefinition, SubagentError> {
     let content = std::fs::read_to_string(file_path).map_err(SubagentError::Spawn)?;
     crate::discovery::frontmatter::parse_agent_file(&content, source, file_path).ok_or_else(|| {
         SubagentError::Spawn(std::io::Error::other(format!(
@@ -389,8 +436,8 @@ fn reparse_agent_file(file_path: &Path, source: AgentSource) -> Result<AgentDefi
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
-    use super::*;
     use super::super::test_support::sample_agent;
+    use super::*;
 
     #[test]
     fn create_agent_rejects_builtin_source() {
@@ -597,7 +644,10 @@ mod tests {
         };
         let result = update_agent(&created.definition, &fields)
             .expect("must be Ok, not Err, per R-SA-006 silent-skip taxonomy");
-        assert!(result.is_none(), "invalid package identifier must produce Ok(None)");
+        assert!(
+            result.is_none(),
+            "invalid package identifier must produce Ok(None)"
+        );
 
         // Original file is untouched by the skipped update.
         let content = std::fs::read_to_string(&created.file_path).expect("read back");
@@ -615,7 +665,10 @@ mod tests {
         let outcome = create_agent(tmp.path(), AgentSource::User, "scout", "desc", &fields)
             .expect("no error")
             .expect("valid-after-normalization package identifier must not be skipped");
-        assert_eq!(outcome.definition.package_name, Some("code-analysis".to_string()));
+        assert_eq!(
+            outcome.definition.package_name,
+            Some("code-analysis".to_string())
+        );
         assert_eq!(outcome.definition.name, "code-analysis.scout");
     }
 
@@ -648,9 +701,15 @@ mod tests {
             ..AgentFields::default()
         };
 
-        let outcome = create_agent(tmp.path(), AgentSource::Project, "investigator", "Investigates", &fields)
-            .expect("no error")
-            .expect("not skipped");
+        let outcome = create_agent(
+            tmp.path(),
+            AgentSource::Project,
+            "investigator",
+            "Investigates",
+            &fields,
+        )
+        .expect("no error")
+        .expect("not skipped");
 
         assert_eq!(
             outcome.definition.tools,
@@ -659,9 +718,15 @@ mod tests {
                 ToolRef::Mcp("filesystem.list".to_string()),
             ])
         );
-        assert_eq!(outcome.definition.model, Some(ModelId::from("anthropic/claude-sonnet-4")));
+        assert_eq!(
+            outcome.definition.model,
+            Some(ModelId::from("anthropic/claude-sonnet-4"))
+        );
         assert_eq!(outcome.definition.thinking, Some("high".to_string()));
-        assert_eq!(outcome.definition.system_prompt_body, "You investigate things.");
+        assert_eq!(
+            outcome.definition.system_prompt_body,
+            "You investigate things."
+        );
     }
 
     #[test]
@@ -682,7 +747,10 @@ mod tests {
             &path,
         )
         .expect("parses");
-        assert_eq!(existing.extra_fields.get("vendorTag").map(String::as_str), Some("keep-me"));
+        assert_eq!(
+            existing.extra_fields.get("vendorTag").map(String::as_str),
+            Some("keep-me")
+        );
         assert_eq!(existing.thinking, Some("off".to_string()));
 
         let fields = AgentFields {
@@ -695,10 +763,19 @@ mod tests {
 
         let content = std::fs::read_to_string(&path).expect("read back");
         assert!(content.contains("description: Worker v2"), "{content}");
-        assert!(content.contains("vendorTag: keep-me"), "unknown key must survive update:\n{content}");
-        assert!(content.contains("thinking: off"), "explicit off preserved on update:\n{content}");
+        assert!(
+            content.contains("vendorTag: keep-me"),
+            "unknown key must survive update:\n{content}"
+        );
+        assert!(
+            content.contains("thinking: off"),
+            "explicit off preserved on update:\n{content}"
+        );
         // The file never declared systemPromptMode, so a preserve-aware update must not inject it.
-        assert!(!content.contains("systemPromptMode:"), "must not add absent default fields:\n{content}");
+        assert!(
+            !content.contains("systemPromptMode:"),
+            "must not add absent default fields:\n{content}"
+        );
     }
 
     #[test]
@@ -727,12 +804,24 @@ mod tests {
     #[test]
     fn rename_agent_fails_when_destination_already_exists() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let a = create_agent(tmp.path(), AgentSource::User, "a", "desc", &AgentFields::default())
-            .expect("no error")
-            .expect("not skipped");
-        create_agent(tmp.path(), AgentSource::User, "b", "desc", &AgentFields::default())
-            .expect("no error")
-            .expect("not skipped");
+        let a = create_agent(
+            tmp.path(),
+            AgentSource::User,
+            "a",
+            "desc",
+            &AgentFields::default(),
+        )
+        .expect("no error")
+        .expect("not skipped");
+        create_agent(
+            tmp.path(),
+            AgentSource::User,
+            "b",
+            "desc",
+            &AgentFields::default(),
+        )
+        .expect("no error")
+        .expect("not skipped");
 
         let result = rename_agent(&a.definition, "b");
         assert!(result.is_err(), "renaming onto an existing file must fail");

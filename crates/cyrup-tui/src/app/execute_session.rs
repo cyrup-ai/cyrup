@@ -36,9 +36,18 @@ impl<B: Backend> App<B> {
             C::RenameSession { path, name } => {
                 // `/resume` in-list rename (`onRenameSession`): persist a `session_info` name on the
                 // target file via the additive `rename_session_file` seam.
-                match session.rename_session_file(std::path::Path::new(&path), &name).await {
-                    Ok(()) => self.state.transcript.push_status(format!("renamed session → {name}")),
-                    Err(e) => self.state.transcript.push_status(format!("rename error: {e}")),
+                match session
+                    .rename_session_file(std::path::Path::new(&path), &name)
+                    .await
+                {
+                    Ok(()) => self
+                        .state
+                        .transcript
+                        .push_status(format!("renamed session → {name}")),
+                    Err(e) => self
+                        .state
+                        .transcript
+                        .push_status(format!("rename error: {e}")),
                 }
             }
 
@@ -57,8 +66,14 @@ impl<B: Backend> App<B> {
             },
 
             C::Clone => match session.clone_at(None).await {
-                Ok(id) => self.state.transcript.push_status(format!("cloned session → {id}")),
-                Err(e) => self.state.transcript.push_status(format!("clone error: {e}")),
+                Ok(id) => self
+                    .state
+                    .transcript
+                    .push_status(format!("cloned session → {id}")),
+                Err(e) => self
+                    .state
+                    .transcript
+                    .push_status(format!("clone error: {e}")),
             },
 
             C::Export(arg) => {
@@ -67,8 +82,9 @@ impl<B: Backend> App<B> {
                 // every other target (including no path) writes a styled HTML document — HTML is the
                 // default. cyrup renders the HTML body in-crate (`export::session_jsonl_to_html`) over
                 // the session's own JSONL; the rich tool-card renderer is the L5 residual.
-                let is_jsonl =
-                    arg.as_deref().is_some_and(|p| p.trim_end().to_ascii_lowercase().ends_with(".jsonl"));
+                let is_jsonl = arg
+                    .as_deref()
+                    .is_some_and(|p| p.trim_end().to_ascii_lowercase().ends_with(".jsonl"));
                 if is_jsonl {
                     let path = arg.as_deref().map(std::path::Path::new);
                     match session.export_to_jsonl(path).await {
@@ -82,7 +98,10 @@ impl<B: Backend> App<B> {
                                 .transcript
                                 .push_status(format!("Session exported to: {label}"));
                         }
-                        Err(e) => self.state.transcript.push_status(format!("export error: {e}")),
+                        Err(e) => self
+                            .state
+                            .transcript
+                            .push_status(format!("export error: {e}")),
                     }
                 } else {
                     // Pull the transcript as JSONL (no path ⇒ returned as text), render to HTML, write.
@@ -134,7 +153,10 @@ impl<B: Backend> App<B> {
                             }
                         }
                         Ok(None) => self.state.transcript.push_status("exported session"),
-                        Err(e) => self.state.transcript.push_status(format!("export error: {e}")),
+                        Err(e) => self
+                            .state
+                            .transcript
+                            .push_status(format!("export error: {e}")),
                     }
                 }
             }
@@ -143,7 +165,6 @@ impl<B: Backend> App<B> {
             // store normalizes, and echoing the input told the user a name was set that `/resume`
             // would not show. When the two differ upstream warns first (`:5648-5650`), verbatim
             // including the JSON quoting of both values.
-
             C::SessionInfo => {
                 // Pi's `/session` renderer (`handleSessionCommand`, interactive-mode.ts:5656-5717
                 // @v0.83.0) reads exactly these fields off `getSessionStats()`; cyrup renders them
@@ -215,7 +236,6 @@ impl<B: Backend> App<B> {
             // the active session + bumps the generation, and the run loop's generation-watch arm
             // re-binds the UI (re-subscribe + reset transcript) → `pending_swap_status`. Without a
             // runtime (SDK/embedder), surface the request so the path is real (no silent drop).
-
             C::NewSession => match runtime {
                 // `/new` (handleClearCommand): start a fresh session in the same cwd (Pi `newSession`).
                 //
@@ -249,21 +269,46 @@ impl<B: Backend> App<B> {
                 // reload FIRST, then `this.keybindings.reload()` — is preserved exactly.
                 Some(rt) => {
                     let agent_dir = session.services().agent_dir.clone();
+                    // TUI-037 — pi's `maybeSaveImplicitProjectTrustAfterReload()`
+                    // (`interactive-mode.ts:5995` @v0.84.4): persist a trust that was granted
+                    // implicitly at boot once the project has grown trust-requiring resources.
+                    // Run BEFORE the rebuild is dispatched, not after it as pi does — cyrup's
+                    // reload re-decides trust from the store (see `app/reload_trust.rs`'s
+                    // ordering note), so the write has to land where the rebuilt session reads it.
+                    let (saved_implicit_project_trust, trust_warning) =
+                        match self.maybe_save_implicit_project_trust(session).await {
+                            Ok(saved) => (saved, None),
+                            // pi's `catch` (`:4938-4940`): the reload proceeds, the status keeps
+                            // its plain variant, and `showWarning` frames the message
+                            // (`Warning: …`, `:4264-4266`). Surfaced post-swap via the effect.
+                            Err(e) => (
+                                false,
+                                Some(format!(
+                                    "Warning: Could not save project trust after reload: {e}"
+                                )),
+                            ),
+                        };
                     // TUI-025 — Pi's own sentence, `interactive-mode.ts:5418-5423` @v0.83.0.
                     // cyrup's `"reloaded resources"` said nothing about WHAT was reloaded, and the
                     // `/` menu's own help string for the command was a second, different wording.
-                    // The `; saved project trust` variant is TUI-037's — it needs the implicit-trust
-                    // write, which lives in `crates/cyrup`.
+                    // The `; saved project trust` variant is `interactive-mode.ts:6000-6003`
+                    // @v0.84.4, selected by the boolean above (TUI-037).
                     self.state.pending_swap_status = Some(SwapCaption::Status(
-                        "Reloaded keybindings, extensions, skills, prompts, themes, and \
-                         context files"
-                            .into(),
+                        if saved_implicit_project_trust {
+                            "Reloaded keybindings, extensions, skills, prompts, themes, and \
+                             context files; saved project trust"
+                        } else {
+                            "Reloaded keybindings, extensions, skills, prompts, themes, and \
+                             context files"
+                        }
+                        .into(),
                     ));
                     let rt = Arc::clone(rt);
                     self.dispatch_lifecycle(async move {
                         LifecycleOutcome(match rt.reload(None).await {
                             Ok(()) => Ok(LifecycleEffects {
                                 reload_keybindings_in: Some(agent_dir),
+                                warning: trust_warning,
                                 ..LifecycleEffects::default()
                             }),
                             Err(e) => Err(format!("reload error: {e}")),
@@ -278,29 +323,20 @@ impl<B: Backend> App<B> {
                 // `/import <path>` (handleImportCommand): copy + resume a JSONL session (Pi
                 // `importFromJsonl`, agent-session-runtime.ts:353).
                 //
-                // TUI-092 §5b.2 — SPAWNED: `import_from_jsonl` dispatches `HostEvent::SessionStart`
-                // to every live extension; see the `/fork` arm for the self-deadlock awaiting it on
-                // this task would reintroduce.
-                (Some(rt), Some(path)) => {
-                    self.state.pending_swap_status =
-                        Some(SwapCaption::Status(format!("imported session {path}")));
-                    let rt = Arc::clone(rt);
-                    self.dispatch_lifecycle(async move {
-                        LifecycleOutcome(match rt.import_from_jsonl(path, None).await {
-                            Ok(r) if r.cancelled => Err("import cancelled".to_string()),
-                            Ok(_) => Ok(LifecycleEffects::default()),
-                            Err(e) => Err(format!("import error: {e}")),
-                        })
-                    })
-                    .await;
-                }
+                // TUI-081 — pi asks FIRST: `await this.showExtensionConfirm("Import session",
+                // `Replace current session with ${inputPath}?`)` and shows `Import cancelled` on a
+                // decline (`interactive-mode.ts:6069-6072` @v0.84.4). The live session is only
+                // replaced from the confirm's `Yes` arm ([`Self::execute_session_switch`]); this arm
+                // opens the prompt and parks the path on `pending_import`.
+                (Some(_), Some(path)) => self.open_import_confirm(path),
                 // TUI-084 — pi's string and pi's CHANNEL: `Usage: /import <path.jsonl>` through
                 // `showError` (`interactive-mode.ts:5482` @v0.83.0). cyrup dropped the `.jsonl`
                 // constraint, lowercased the word, and routed a real error to the neutral status
                 // line, where it is neither coloured nor prefixed as a problem.
-                (Some(_), None) => {
-                    self.state.transcript.push_error("Usage: /import <path.jsonl>")
-                }
+                (Some(_), None) => self
+                    .state
+                    .transcript
+                    .push_error("Usage: /import <path.jsonl>"),
                 (None, p) => self
                     .state
                     .transcript
@@ -311,7 +347,10 @@ impl<B: Backend> App<B> {
             // lifecycle bucket; a variant it names there with no arm above lands here. Report it
             // rather than swallowing it — cc19b87 was exactly this, in `execute_misc_command`.
             other => {
-                debug_assert!(false, "unrouted command in execute_session_command: {other:?}");
+                debug_assert!(
+                    false,
+                    "unrouted command in execute_session_command: {other:?}"
+                );
                 self.state
                     .transcript
                     .push_error(format!("internal: unrouted command {other:?}"));
@@ -330,7 +369,36 @@ impl<B: Backend> App<B> {
     ) {
         use AppCommand as C;
         match cmd {
-            C::ConfirmSelection { kind: SelectorKind::UserMessage, value } => {
+            C::ConfirmSelection {
+                kind: SelectorKind::ImportConfirm,
+                value,
+            } => {
+                // TUI-081 — the answer to "Replace current session with {path}?"
+                // (`handleImportCommand`, `interactive-mode.ts:6069-6082` @v0.84.4). Only `Yes`
+                // reaches `importFromJsonl`; `No` is `showStatus("Import cancelled")` (`:6071`).
+                // The stashed path is taken either way so it cannot outlive this answer.
+                let Some(pending) = self.state.pending_import.take() else {
+                    return;
+                };
+                if value != CONFIRM_YES {
+                    self.state.transcript.push_status("Import cancelled");
+                    return;
+                }
+                let Some(rt) = runtime else {
+                    // The prompt only opens with a runtime; a swap-less embedder cannot get here,
+                    // but degrade to the same status the bare `/import` path shows without one.
+                    self.state
+                        .transcript
+                        .push_status(format!("importing session {}", pending.path));
+                    return;
+                };
+                self.dispatch_import(rt, pending.path).await;
+            }
+
+            C::ConfirmSelection {
+                kind: SelectorKind::UserMessage,
+                value,
+            } => {
                 // `/fork` (user-message-selector.ts): fork at the chosen entry. With the runtime
                 // threaded in, drive `AgentSessionRuntime::fork` so the runtime swaps to the new
                 // branched session and the UI re-binds on the generation bump (Pi `fork`,
@@ -360,12 +428,18 @@ impl<B: Backend> App<B> {
                     }
                     None => match session.fork_at_entry(&entry, ForkPosition::Before).await {
                         Ok(_) => self.state.transcript.push_status("forked from message"),
-                        Err(e) => self.state.transcript.push_status(format!("fork error: {e}")),
+                        Err(e) => self
+                            .state
+                            .transcript
+                            .push_status(format!("fork error: {e}")),
                     },
                 }
             }
 
-            C::ConfirmSelection { kind: SelectorKind::Session, value } => {
+            C::ConfirmSelection {
+                kind: SelectorKind::Session,
+                value,
+            } => {
                 // `/resume` swap (handleResumeSession, interactive-mode.ts): switch the runtime to the
                 // chosen session file (Pi `switchSession`, agent-session-runtime.ts:193). The runtime
                 // asserts the resumed cwd still exists, rebuilds cwd-bound services, and bumps the
@@ -400,7 +474,10 @@ impl<B: Backend> App<B> {
             // that arm without adding an arm here and the command vanishes silently — cc19b87's
             // shape, one level deeper. Report it instead.
             other => {
-                debug_assert!(false, "unrouted command in execute_session_switch: {other:?}");
+                debug_assert!(
+                    false,
+                    "unrouted command in execute_session_switch: {other:?}"
+                );
                 self.state
                     .transcript
                     .push_error(format!("internal: unrouted command {other:?}"));
@@ -418,7 +495,9 @@ impl<B: Backend> App<B> {
         // (`switch_session`) once the runtime is threaded into the run loop (residual gap #3).
         let sessions = session.list_sessions();
         if sessions.is_empty() {
-            self.state.transcript.push_status("no saved sessions to resume");
+            self.state
+                .transcript
+                .push_status("no saved sessions to resume");
         } else {
             let current = session.session_id().to_string();
             let rows: Vec<SessionRow> = sessions
@@ -483,5 +562,63 @@ impl<B: Backend> App<B> {
             self.open_boxed_selector(SelectorKind::Session, inner);
         }
     }
+}
 
+impl<B: Backend> App<B> {
+    /// TUI-081 — open pi's `/import` guard: `showExtensionConfirm("Import session", `Replace
+    /// current session with ${inputPath}?`)` (`interactive-mode.ts:6069` @v0.84.4), i.e.
+    /// `showExtensionSelector(`${title}\n${message}`, ["Yes", "No"])` (`:2557-2565`) — a Yes/No
+    /// [`ListSelector`] with `Yes` highlighted, under the `ExtensionSelectorComponent` chrome the
+    /// extension-driven confirm uses. The path is parked on [`AppState::pending_import`] until the
+    /// prompt is answered; the answer arrives as `ConfirmSelection { kind: ImportConfirm, .. }`
+    /// (`Enter`) or as the selector-cancel arm (`Escape`).
+    pub(crate) fn open_import_confirm(&mut self, path: String) {
+        let title = format!(
+            "{}\nReplace current session with {path}?",
+            SelectorKind::ImportConfirm.title()
+        );
+        self.state.pending_import = Some(PendingImport { path });
+        let rows = vec![
+            (CONFIRM_YES.to_string(), "Yes".to_string(), None),
+            ("no".to_string(), "No".to_string(), None),
+        ];
+        self.open_boxed_selector(
+            SelectorKind::ImportConfirm,
+            Box::new(
+                ListSelector::prompt(title, rows, 0)
+                    .with_upstream_chrome(SelectorKind::ImportConfirm, &self.state.select_keymap),
+            ),
+        );
+    }
+
+    /// TUI-081 — the decline half of the `/import` guard: drop the parked path and show pi's
+    /// `Import cancelled` (`interactive-mode.ts:6071` @v0.84.4). Reached from the confirm's `No`
+    /// row and from Escape on the prompt.
+    pub(crate) fn cancel_pending_import(&mut self) {
+        self.state.pending_import = None;
+        self.state.transcript.push_status("Import cancelled");
+    }
+
+    /// Run the confirmed `/import <path>` through the runtime (Pi `importFromJsonl`,
+    /// `agent-session-runtime.ts:353`). The swap caption is pi's `Session imported from:
+    /// ${inputPath}` (`interactive-mode.ts:6082` @v0.84.4); an extension veto of the switch
+    /// (`result.cancelled`) is pi's second `Import cancelled` (`:6079`).
+    ///
+    /// TUI-092 §5b.2 — SPAWNED: `import_from_jsonl` dispatches `HostEvent::SessionStart` to every
+    /// live extension; see the `/fork` arm for the self-deadlock awaiting it on this task would
+    /// reintroduce.
+    async fn dispatch_import(&mut self, rt: &Arc<AgentSessionRuntime>, path: String) {
+        self.state.pending_swap_status = Some(SwapCaption::Status(format!(
+            "Session imported from: {path}"
+        )));
+        let rt = Arc::clone(rt);
+        self.dispatch_lifecycle(async move {
+            LifecycleOutcome(match rt.import_from_jsonl(path, None).await {
+                Ok(r) if r.cancelled => Err("Import cancelled".to_string()),
+                Ok(_) => Ok(LifecycleEffects::default()),
+                Err(e) => Err(format!("import error: {e}")),
+            })
+        })
+        .await;
+    }
 }

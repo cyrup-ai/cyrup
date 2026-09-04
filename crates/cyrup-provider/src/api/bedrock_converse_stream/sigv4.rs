@@ -123,14 +123,15 @@ pub(super) fn sign_sigv4(
 
     // The canonical URI is the request path URI-encoded a SECOND time (every service but S3).
     let canonical_uri = uri_encode(url_path(url), true);
-    let canonical_request = format!(
-        "POST\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
-    );
+    let canonical_request =
+        format!("POST\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
 
     let scope = format!("{date}/{region}/{SIGV4_SERVICE}/aws4_request");
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
-        hex(&crate::auth::oauth::sha256::sha256(canonical_request.as_bytes()))
+        hex(&crate::auth::oauth::sha256::sha256(
+            canonical_request.as_bytes()
+        ))
     );
 
     let k_date = hmac_sha256(

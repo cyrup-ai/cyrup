@@ -51,8 +51,8 @@ use super::runtime::{
     WatchdogWarningEmitter,
 };
 use super::types::{
-    ResolvedWatchdogConfig, ThinkingSetting, WatchdogCategory, WatchdogConfidence, WatchdogSeverity,
-    WatchdogWarning, WatchdogWarningSource,
+    ResolvedWatchdogConfig, ThinkingSetting, WatchdogCategory, WatchdogConfidence,
+    WatchdogSeverity, WatchdogWarning, WatchdogWarningSource,
 };
 use crate::exec::split_known_thinking_suffix;
 
@@ -255,7 +255,10 @@ fn resolve_review_auth(
     model: &WatchdogModelInfo,
 ) -> Result<WatchdogReviewAuth, String> {
     auth.resolve(model).map_err(|error| {
-        format!("Watchdog model auth failed for {}: {error}", full_model_id(model))
+        format!(
+            "Watchdog model auth failed for {}: {error}",
+            full_model_id(model)
+        )
     })
 }
 
@@ -496,13 +499,18 @@ impl<'a> WatchdogWarnTool<'a> {
     pub fn execute(&self, params: &Value) -> Result<WatchdogWarnToolResult, String> {
         let warning = to_watchdog_warning(params)?;
         let accepted = self.emit_warning.emit(&warning);
-        Ok(WatchdogWarnToolResult { accepted, text: watchdog_warn_result_text(accepted) })
+        Ok(WatchdogWarnToolResult {
+            accepted,
+            text: watchdog_warn_result_text(accepted),
+        })
     }
 }
 
 impl std::fmt::Debug for WatchdogWarnTool<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WatchdogWarnTool").field("name", &self.name()).finish()
+        f.debug_struct("WatchdogWarnTool")
+            .field("name", &self.name())
+            .finish()
     }
 }
 
@@ -691,8 +699,7 @@ pub struct WatchdogSessionContext {
 /// changes across `session_start`/`session_before_switch`.
 ///
 /// `None` is upstream's absent context, which throws at `:257`.
-pub type WatchdogSessionContextFn =
-    Arc<dyn Fn() -> Option<WatchdogSessionContext> + Send + Sync>;
+pub type WatchdogSessionContextFn = Arc<dyn Fn() -> Option<WatchdogSessionContext> + Send + Sync>;
 
 /// `createMainWatchdogReview` (`review.ts:248-302`) — the [`WatchdogReview`] the main session binds.
 pub struct MainWatchdogReview {
@@ -832,10 +839,8 @@ impl WatchdogReview for MainWatchdogReview {
                 stop_reason: Some(ReviewStopReason::Aborted),
             }));
         }
-        let system_prompt = build_watchdog_system_prompt(
-            &self.cwd.to_string_lossy(),
-            request.has_scope,
-        );
+        let system_prompt =
+            build_watchdog_system_prompt(&self.cwd.to_string_lossy(), request.has_scope);
         let prompt = build_review_prompt(&request, &selection);
         let messages = self
             .agent
@@ -900,10 +905,15 @@ impl WatchdogReviewAgent for NoTurnReviewAgent {
 // `review_description` says "real model review" while no warning is ever emitted.
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 mod tests {
     use super::*;
-    use crate::watchdog::model_selection::{normalize_model_segment, WatchdogModelRegistry};
+    use crate::watchdog::model_selection::{WatchdogModelRegistry, normalize_model_segment};
     use crate::watchdog::settings::default_watchdog_config;
 
     struct FakeRegistry(Vec<WatchdogModelInfo>);
@@ -913,7 +923,10 @@ mod tests {
             self.0.clone()
         }
         fn find(&self, provider: &str, id: &str) -> Option<WatchdogModelInfo> {
-            self.0.iter().find(|m| m.provider == provider && m.id == id).cloned()
+            self.0
+                .iter()
+                .find(|m| m.provider == provider && m.id == id)
+                .cloned()
         }
         fn has_configured_auth(&self, model: &WatchdogModelInfo) -> bool {
             model.provider != "unauthenticated"
@@ -955,39 +968,56 @@ mod tests {
         assert!(!selection.explicit);
         assert_eq!(selection.thinking_level, "medium");
         // With no session thinking level at all it falls to `off`.
-        let bare =
-            resolve_watchdog_review_model(&ctx, &config, &AmbientReviewAuth, None).unwrap();
+        let bare = resolve_watchdog_review_model(&ctx, &config, &AmbientReviewAuth, None).unwrap();
         assert_eq!(bare.thinking_level, "off");
     }
 
     #[test]
     fn a_model_suffix_beats_the_configured_level_which_beats_the_context() {
         assert_eq!(
-            resolve_review_thinking("p/m:xhigh", Some(&ThinkingSetting::Level("low".into())), true, Some("high"))
-                .unwrap(),
+            resolve_review_thinking(
+                "p/m:xhigh",
+                Some(&ThinkingSetting::Level("low".into())),
+                true,
+                Some("high")
+            )
+            .unwrap(),
             "xhigh"
         );
         assert_eq!(
-            resolve_review_thinking("p/m", Some(&ThinkingSetting::Level("low".into())), true, Some("high"))
-                .unwrap(),
+            resolve_review_thinking(
+                "p/m",
+                Some(&ThinkingSetting::Level("low".into())),
+                true,
+                Some("high")
+            )
+            .unwrap(),
             "low"
         );
         assert_eq!(
-            resolve_review_thinking("p/m", Some(&ThinkingSetting::Off), true, Some("high")).unwrap(),
+            resolve_review_thinking("p/m", Some(&ThinkingSetting::Off), true, Some("high"))
+                .unwrap(),
             "off"
         );
         assert_eq!(
             resolve_review_thinking("p/m", None, true, Some("high")).unwrap(),
             "high"
         );
-        assert_eq!(resolve_review_thinking("p/m", None, false, Some("high")).unwrap(), "off");
+        assert_eq!(
+            resolve_review_thinking("p/m", None, false, Some("high")).unwrap(),
+            "off"
+        );
     }
 
     #[test]
     fn an_unrecognized_configured_level_is_reported_with_reviews_own_message() {
-        let err =
-            resolve_review_thinking("p/m", Some(&ThinkingSetting::Level("turbo".into())), false, None)
-                .unwrap_err();
+        let err = resolve_review_thinking(
+            "p/m",
+            Some(&ThinkingSetting::Level("turbo".into())),
+            false,
+            None,
+        )
+        .unwrap_err();
         assert_eq!(
             err,
             "Unsupported watchdog thinking level 'turbo' from watchdog config; expected off, \
@@ -999,9 +1029,13 @@ mod tests {
     fn no_session_model_and_no_configured_model_is_a_hard_failure() {
         let registry = registry();
         let ctx = WatchdogModelContext::new(&registry);
-        let err =
-            resolve_watchdog_review_model(&ctx, &default_watchdog_config(), &AmbientReviewAuth, None)
-                .unwrap_err();
+        let err = resolve_watchdog_review_model(
+            &ctx,
+            &default_watchdog_config(),
+            &AmbientReviewAuth,
+            None,
+        )
+        .unwrap_err();
         assert_eq!(
             err,
             "Main watchdog review cannot run because the current Pi session model is unavailable \
@@ -1052,9 +1086,18 @@ mod tests {
     #[test]
     fn a_blank_required_field_is_rejected_per_field() {
         for (field, payload) in [
-            ("summary", json!({ "severity": "concern", "summary": "  ", "evidence": "e", "recommendedAction": "a" })),
-            ("evidence", json!({ "severity": "concern", "summary": "s", "evidence": "", "recommendedAction": "a" })),
-            ("recommendedAction", json!({ "severity": "concern", "summary": "s", "evidence": "e", "recommendedAction": " " })),
+            (
+                "summary",
+                json!({ "severity": "concern", "summary": "  ", "evidence": "e", "recommendedAction": "a" }),
+            ),
+            (
+                "evidence",
+                json!({ "severity": "concern", "summary": "s", "evidence": "", "recommendedAction": "a" }),
+            ),
+            (
+                "recommendedAction",
+                json!({ "severity": "concern", "summary": "s", "evidence": "e", "recommendedAction": " " }),
+            ),
         ] {
             assert_eq!(
                 to_watchdog_warning(&payload).unwrap_err(),
@@ -1075,7 +1118,12 @@ mod tests {
         assert!(with.contains("use category='scope-drift'"));
         assert_eq!(with.lines().count(), 10);
         // The scope line sits fourth, immediately after the review-scope instruction.
-        assert!(with.lines().nth(3).unwrap().starts_with("When the review input includes"));
+        assert!(
+            with.lines()
+                .nth(3)
+                .unwrap()
+                .starts_with("When the review input includes")
+        );
     }
 
     #[test]
@@ -1122,12 +1170,18 @@ mod tests {
             "Review id: 7; epoch: 3; review model: anthropic/claude-opus-4-8; thinking: high."
         ));
         assert!(prompt.contains("<turn_delta>\n\nthe delta\n\n</turn_delta>"));
-        assert_eq!(normalize_model_segment(&selection.model.provider), "anthropic");
+        assert_eq!(
+            normalize_model_segment(&selection.model.provider),
+            "anthropic"
+        );
     }
 
     #[test]
     fn the_warn_result_text_tells_the_model_whether_it_landed() {
-        assert_eq!(watchdog_warn_result_text(true), "Watchdog warning recorded.");
+        assert_eq!(
+            watchdog_warn_result_text(true),
+            "Watchdog warning recorded."
+        );
         assert!(watchdog_warn_result_text(false).contains("stale, duplicate, or over budget"));
         assert!(watchdog_warn_tool_description().starts_with("Emit one actionable"));
         let schema = watchdog_warn_parameters_schema();
@@ -1153,7 +1207,10 @@ mod tests {
         // handed a duplicate of.
         assert!(WATCHDOG_ALLOWED_TOOL_NAMES.contains(&WATCHDOG_WARN_TOOL_NAME));
         assert!(!WATCHDOG_REVIEW_READ_ONLY_TOOL_NAMES.contains(&WATCHDOG_WARN_TOOL_NAME));
-        assert_eq!(watchdog_tool_call_block_reason(WATCHDOG_WARN_TOOL_NAME), None);
+        assert_eq!(
+            watchdog_tool_call_block_reason(WATCHDOG_WARN_TOOL_NAME),
+            None
+        );
     }
 
     /// Every field `createWatchdogWarnTool` sets (`:182-190`) must survive to a bound agent — the
@@ -1212,7 +1269,10 @@ mod tests {
         assert_eq!(seen[0].category, Some(WatchdogCategory::Other));
 
         // A malformed call is an Err and must NOT reach the emitter.
-        assert!(tool.execute(&json!({ "severity": "blocker", "summary": "  " })).is_err());
+        assert!(
+            tool.execute(&json!({ "severity": "blocker", "summary": "  " }))
+                .is_err()
+        );
         assert_eq!(seen.len(), 2);
     }
 
@@ -1244,12 +1304,23 @@ mod tests {
                         "recommendedAction": "r",
                     }))
                     .unwrap();
-                assert!(result.accepted, "the emitter this turn was built with accepts");
+                assert!(
+                    result.accepted,
+                    "the emitter this turn was built with accepts"
+                );
                 *self.0.lock().unwrap() = Some(SeenTurn {
                     warn_tool_name: turn.warn_tool.name().to_string(),
                     warn_tool_description: turn.warn_tool.description(),
-                    read_only_tools: turn.read_only_tools.iter().map(|t| (*t).to_string()).collect(),
-                    allowed_tools: turn.allowed_tools.iter().map(|t| (*t).to_string()).collect(),
+                    read_only_tools: turn
+                        .read_only_tools
+                        .iter()
+                        .map(|t| (*t).to_string())
+                        .collect(),
+                    allowed_tools: turn
+                        .allowed_tools
+                        .iter()
+                        .map(|t| (*t).to_string())
+                        .collect(),
                     sequential: turn.tool_execution_sequential,
                 });
                 // `beforeToolCall` is reachable from the turn, not only as a free function.
@@ -1291,9 +1362,15 @@ mod tests {
         let guard = captured.lock().unwrap();
         let seen = guard.as_ref().expect("the agent ran");
         assert_eq!(seen.warn_tool_name, "watchdog_warn");
-        assert!(seen.warn_tool_description.starts_with("Emit one actionable"));
+        assert!(
+            seen.warn_tool_description
+                .starts_with("Emit one actionable")
+        );
         assert_eq!(seen.read_only_tools, vec!["read", "grep", "find", "ls"]);
-        assert_eq!(seen.allowed_tools, vec!["read", "grep", "find", "ls", "watchdog_warn"]);
+        assert_eq!(
+            seen.allowed_tools,
+            vec!["read", "grep", "find", "ls", "watchdog_warn"]
+        );
         // `toolExecution: "sequential"` (`:288`), and the warn tool's own `executionMode`
         // (`:190`) — the turn must carry the SAME answer the descriptor's constant gives.
         assert_eq!(seen.sequential, WatchdogWarnTool::SEQUENTIAL);
@@ -1350,7 +1427,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(result.stop_reason, Some(ReviewStopReason::Stop));
-        assert!(result.warnings.is_empty(), "warnings stream through the emitter");
+        assert!(
+            result.warnings.is_empty(),
+            "warnings stream through the emitter"
+        );
     }
 
     fn default_request() -> WatchdogReviewRequest {
@@ -1454,7 +1534,10 @@ mod tests {
         unbound.review(default_request()).await.unwrap();
         let selection = seen.lock().unwrap().clone().expect("the turn ran");
         assert_eq!(selection.model.id, "claude-opus-4-8");
-        assert_eq!(selection.thinking_level, "high", "the fixed level was consulted");
+        assert_eq!(
+            selection.thinking_level, "high",
+            "the fixed level was consulted"
+        );
 
         // A provider that ANSWERS wins over both fixed values.
         let seen = Arc::new(std::sync::Mutex::new(None));
@@ -1474,8 +1557,14 @@ mod tests {
         }));
         bound.review(default_request()).await.unwrap();
         let selection = seen.lock().unwrap().clone().expect("the turn ran");
-        assert_eq!(selection.model.id, "claude-sonnet-4-5", "the live session beat the fixed model");
-        assert_eq!(selection.thinking_level, "low", "and the fixed thinking level too");
+        assert_eq!(
+            selection.model.id, "claude-sonnet-4-5",
+            "the live session beat the fixed model"
+        );
+        assert_eq!(
+            selection.thinking_level, "low",
+            "and the fixed thinking level too"
+        );
     }
 
     /// A bound provider that answers `None` is upstream's missing `ExtensionContext`

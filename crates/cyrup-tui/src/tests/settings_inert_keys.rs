@@ -21,20 +21,25 @@
 //! paths a user reaches (`/settings` cycle → `AppCommand::ApplySetting`; `/tree` open →
 //! `AppCommand::OpenSelector(SelectorKind::Tree)`) against a REAL faux-provider-backed
 //! `AgentSession`, and assert on the RENDERED frame / the live command registry.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use cyrup_core::StopReason;
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider, FauxResponseStep};
-use cyrup_provider::Provider;
-use cyrup_session_svc::{AgentSession, SessionBuilder, SessionConfig, Settings};
+use super::harness::{buf_text, key_event as key};
 use crate::crossterm::event::KeyCode;
 use crate::{App, AppCommand, SelectorKind, UiTheme};
+use cyrup_core::StopReason;
+use cyrup_provider::Provider;
+use cyrup_provider::faux::{FauxProvider, FauxResponseStep, faux_assistant_message, faux_text};
+use cyrup_session_svc::{AgentSession, SessionBuilder, SessionConfig, Settings};
 use ratatui::backend::TestBackend;
 use tempfile::TempDir;
-use super::harness::{buf_text, key_event as key};
 
 fn app() -> App<TestBackend> {
     App::new(TestBackend::new(100, 30), UiTheme::dark()).unwrap()
@@ -52,7 +57,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 /// Drop a real Agent-Skills `SKILL.md` into `<cwd>/.cyrup/skills/<name>/` so the session's resource
@@ -79,7 +88,13 @@ async fn session_with(fx: &Fixture, cli: Settings) -> Arc<AgentSession> {
     let provider: Arc<dyn Provider> = faux;
     let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
     cfg.trust_override = Some(true);
-    Arc::new(SessionBuilder::new(provider, cfg).cli_settings(cli).build().await.unwrap())
+    Arc::new(
+        SessionBuilder::new(provider, cfg)
+            .cli_settings(cli)
+            .build()
+            .await
+            .unwrap(),
+    )
 }
 
 /// One completed turn, so `session_dag()` has entries for `/tree` to open over.
@@ -133,7 +148,8 @@ async fn tree_opens_with_the_configured_filter_mode() {
     one_turn(&session).await;
 
     let mut app = app();
-    app.execute_command(AppCommand::OpenSelector(SelectorKind::Tree), &session, None).await;
+    app.execute_command(AppCommand::OpenSelector(SelectorKind::Tree), &session, None)
+        .await;
     assert_eq!(
         app.active_selector_kind(),
         Some(SelectorKind::Tree),
@@ -161,9 +177,13 @@ async fn tree_opens_on_default_when_the_setting_is_unset() {
     one_turn(&session).await;
 
     let mut app = app();
-    app.execute_command(AppCommand::OpenSelector(SelectorKind::Tree), &session, None).await;
+    app.execute_command(AppCommand::OpenSelector(SelectorKind::Tree), &session, None)
+        .await;
     app.draw().unwrap();
-    assert!(buf_text(&app).contains("Filter: default"), "unset must still mean `default`");
+    assert!(
+        buf_text(&app).contains("Filter: default"),
+        "unset must still mean `default`"
+    );
 }
 
 // --------------------------------------------------------------- enableSkillCommands ------------
@@ -183,15 +203,18 @@ async fn disabling_skill_commands_removes_skill_rows_from_the_slash_menu() {
     // The catalog the `/` menu is built from really does carry the skill.
     let catalog = session.slash_command_catalog();
     assert!(
-        catalog.iter().any(|r| r.get("name").and_then(|v| v.as_str()) == Some("skill:deploy")),
+        catalog
+            .iter()
+            .any(|r| r.get("name").and_then(|v| v.as_str()) == Some("skill:deploy")),
         "fixture skill never reached slash_command_catalog(): {catalog:?}"
     );
 
     let mut app = app();
     // Seed the registry the way the run loop's boot block does (default: skill commands ON).
-    app.editor_mut().set_registry(crate::CommandRegistry::with_dynamic(
-        crate::dynamic_commands_from_catalog_gated(&catalog, true),
-    ));
+    app.editor_mut()
+        .set_registry(crate::CommandRegistry::with_dynamic(
+            crate::dynamic_commands_from_catalog_gated(&catalog, true),
+        ));
     assert!(
         open_slash_menu(&mut app).contains("skill:deploy"),
         "baseline: the `/` menu must offer the skill before anything is toggled"
@@ -222,7 +245,10 @@ async fn disabling_skill_commands_removes_skill_rows_from_the_slash_menu() {
         app.draw().unwrap();
         buf_text(&app)
     };
-    assert!(builtins.contains("model"), "builtin commands must be untouched:\n{builtins}");
+    assert!(
+        builtins.contains("model"),
+        "builtin commands must be untouched:\n{builtins}"
+    );
 
     // Turning it back on restores them, rebuilt from the same catalog.
     app.execute_command(
@@ -258,10 +284,16 @@ async fn editor_padding_insets_the_prompt_row_on_the_next_frame() {
 
     let flush = prompt_line(&app, "hello");
     let flush_col = flush.find("hello").unwrap();
-    assert_eq!(flush_col, 0, "baseline (padding 0) must render the text flush at column 0");
+    assert_eq!(
+        flush_col, 0,
+        "baseline (padding 0) must render the text flush at column 0"
+    );
 
     app.execute_command(
-        AppCommand::ApplySetting { id: "editorPaddingX".to_string(), value: "3".to_string() },
+        AppCommand::ApplySetting {
+            id: "editorPaddingX".to_string(),
+            value: "3".to_string(),
+        },
         &session,
         None,
     )
@@ -325,7 +357,10 @@ async fn show_hardware_cursor_gates_the_terminal_cursor() {
     );
 
     app.execute_command(
-        AppCommand::ApplySetting { id: "showHardwareCursor".to_string(), value: "true".to_string() },
+        AppCommand::ApplySetting {
+            id: "showHardwareCursor".to_string(),
+            value: "true".to_string(),
+        },
         &session,
         None,
     )
@@ -364,13 +399,19 @@ async fn hardware_cursor_respects_editor_padding() {
     // silently prefixed" — the exact confusion that let the `› ` glyph ride along here.
     app.editor_mut().set_text("hello");
     app.execute_command(
-        AppCommand::ApplySetting { id: "showHardwareCursor".to_string(), value: "true".to_string() },
+        AppCommand::ApplySetting {
+            id: "showHardwareCursor".to_string(),
+            value: "true".to_string(),
+        },
         &session,
         None,
     )
     .await;
     app.execute_command(
-        AppCommand::ApplySetting { id: "editorPaddingX".to_string(), value: "2".to_string() },
+        AppCommand::ApplySetting {
+            id: "editorPaddingX".to_string(),
+            value: "2".to_string(),
+        },
         &session,
         None,
     )

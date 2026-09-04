@@ -28,8 +28,9 @@ use crate::common::{self, get_non_empty_string, to_record};
 use crate::jsonc;
 use crate::ordered::OrderedValue;
 use crate::types::{
-    AgentPermissions, Category, CheckSource, DefaultCategory, DefaultPolicy, GlobalPermissionConfig,
-    OrderedRules, PartialDefaultPolicy, PermissionCheckResult, PermissionState,
+    AgentPermissions, Category, CheckSource, DefaultCategory, DefaultPolicy,
+    GlobalPermissionConfig, OrderedRules, PartialDefaultPolicy, PermissionCheckResult,
+    PermissionState,
 };
 use crate::wildcard::{self, CompiledWildcard};
 
@@ -48,15 +49,28 @@ use crate::wildcard::{self, CompiledWildcard};
 ///
 /// `powershell` sits immediately after `bash`, mirroring `cyrup_tools::BUILTIN_NAMES`' rationale
 /// (`registry.rs:11-20`); order is irrelevant to `contains`, readability is not.
-const BUILT_IN_TOOL_NAMES: [&str; 8] =
-    ["bash", "powershell", "read", "write", "edit", "grep", "find", "ls"];
+const BUILT_IN_TOOL_NAMES: [&str; 8] = [
+    "bash",
+    "powershell",
+    "read",
+    "write",
+    "edit",
+    "grep",
+    "find",
+    "ls",
+];
 
 /// pi `onWarning` ctor option's callback shape (`permission-manager.ts:620,631,643`): notified with a
 /// human-readable message whenever a policy file exists but fails to load/parse.
 type WarningCallback = Arc<dyn Fn(&str) + Send + Sync>;
 const SPECIAL_KEYS: [&str; 2] = ["doom_loop", "external_directory"];
-const MCP_BASELINE_TARGETS: [&str; 5] =
-    ["mcp_status", "mcp_list", "mcp_search", "mcp_describe", "mcp_connect"];
+const MCP_BASELINE_TARGETS: [&str; 5] = [
+    "mcp_status",
+    "mcp_list",
+    "mcp_search",
+    "mcp_describe",
+    "mcp_connect",
+];
 
 fn is_built_in_tool(name: &str) -> bool {
     BUILT_IN_TOOL_NAMES.contains(&name)
@@ -140,7 +154,12 @@ pub struct PermissionManager {
 impl PermissionManager {
     #[must_use]
     pub fn new(paths: ManagerPaths) -> Self {
-        Self { paths, resolved_cache: HashMap::new(), mcp_names_cache: None, on_warning: None }
+        Self {
+            paths,
+            resolved_cache: HashMap::new(),
+            mcp_names_cache: None,
+            on_warning: None,
+        }
     }
 
     /// Register a warning callback (pi ctor's `onWarning` option, `permission-manager.ts:631,643`),
@@ -300,8 +319,10 @@ impl PermissionManager {
             let server_names = self.configured_mcp_server_names();
             let mut mcp_targets = create_mcp_permission_targets(input, &server_names);
             mcp_targets.push("mcp".to_string());
-            let fallback_target =
-                mcp_targets.first().cloned().unwrap_or_else(|| "mcp".to_string());
+            let fallback_target = mcp_targets
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "mcp".to_string());
             let default_mcp = default_state(&resolved.layers, DefaultCategory::Mcp)
                 .unwrap_or(PermissionState::Ask);
 
@@ -466,7 +487,10 @@ impl PermissionManager {
     // ------------------------------------------------------------------------------------- resolve
 
     fn resolve_permissions(&mut self, agent_name: Option<&str>) -> Arc<ResolvedPermissions> {
-        let cache_key = agent_name.filter(|n| !n.is_empty()).unwrap_or("__global__").to_string();
+        let cache_key = agent_name
+            .filter(|n| !n.is_empty())
+            .unwrap_or("__global__")
+            .to_string();
         let stamp = self.policy_cache_stamp(agent_name);
         if let Some((s, v)) = self.resolved_cache.get(&cache_key)
             && *s == stamp
@@ -495,7 +519,8 @@ impl PermissionManager {
             merged,
             layers,
         });
-        self.resolved_cache.insert(cache_key, (stamp, resolved.clone()));
+        self.resolved_cache
+            .insert(cache_key, (stamp, resolved.clone()));
         resolved
     }
 
@@ -553,7 +578,10 @@ impl PermissionManager {
         };
         let permissions = normalize_raw_permission(&value);
         let default_policy = normalize_policy(value.get("defaultPolicy"));
-        GlobalPermissionConfig { default_policy, permissions }
+        GlobalPermissionConfig {
+            default_policy,
+            permissions,
+        }
     }
 
     /// pi `loadProjectGlobalConfig` (`permission-manager.ts:687-717`): same read/parse-warning
@@ -723,10 +751,22 @@ fn build_layers(
     // `default_state` reads it uniformly across layers (pi's global layer is `GlobalPermissionConfig`).
     global_perms.default_policy = full_to_partial(global.default_policy);
     vec![
-        Layer { permissions: global_perms, trusted: true },
-        Layer { permissions: project, trusted: false },
-        Layer { permissions: agent, trusted: true },
-        Layer { permissions: project_agent, trusted: false },
+        Layer {
+            permissions: global_perms,
+            trusted: true,
+        },
+        Layer {
+            permissions: project,
+            trusted: false,
+        },
+        Layer {
+            permissions: agent,
+            trusted: true,
+        },
+        Layer {
+            permissions: project_agent,
+            trusted: false,
+        },
     ]
 }
 
@@ -737,7 +777,13 @@ fn compile_from_layers(category: Category, layers: &[Layer]) -> CompiledPatterns
     let mut entries: Vec<(String, LayeredState)> = Vec::new();
     for layer in layers {
         for (pattern, state) in layer.permissions.category(category).iter() {
-            entries.push((pattern.to_string(), LayeredState { state, trusted: layer.trusted }));
+            entries.push((
+                pattern.to_string(),
+                LayeredState {
+                    state,
+                    trusted: layer.trusted,
+                },
+            ));
         }
     }
     if entries.is_empty() {
@@ -747,9 +793,18 @@ fn compile_from_layers(category: Category, layers: &[Layer]) -> CompiledPatterns
 }
 
 fn merge_into(base: &mut AgentPermissions, other: &AgentPermissions) {
-    for cat in [Category::Tools, Category::Bash, Category::Mcp, Category::Skills, Category::Special] {
-        let src: Vec<(String, PermissionState)> =
-            other.category(cat).iter().map(|(p, s)| (p.to_string(), s)).collect();
+    for cat in [
+        Category::Tools,
+        Category::Bash,
+        Category::Mcp,
+        Category::Skills,
+        Category::Special,
+    ] {
+        let src: Vec<(String, PermissionState)> = other
+            .category(cat)
+            .iter()
+            .map(|(p, s)| (p.to_string(), s))
+            .collect();
         let dst = base_category_mut(base, cat);
         for (p, s) in src {
             dst.insert(p, s);
@@ -879,8 +934,11 @@ fn find_by_pattern_order_for_names(
     if patterns.is_empty() {
         return None;
     }
-    let normalized_names: Vec<String> =
-        names.iter().map(|n| n.trim().to_string()).filter(|n| !n.is_empty()).collect();
+    let normalized_names: Vec<String> = names
+        .iter()
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .collect();
     if normalized_names.is_empty() {
         return None;
     }
@@ -918,10 +976,15 @@ fn resolve_layered_value(
     let mut trusted_floor: Option<LayeredResolution> = None;
     for layer in layers {
         let Some(state) = select(layer) else { continue };
-        let candidate = LayeredResolution { state, trusted: layer.trusted };
+        let candidate = LayeredResolution {
+            state,
+            trusted: layer.trusted,
+        };
         if !candidate.trusted
             && candidate.state != PermissionState::Deny
-            && trusted_floor.map(|f| f.state == PermissionState::Deny).unwrap_or(false)
+            && trusted_floor
+                .map(|f| f.state == PermissionState::Deny)
+                .unwrap_or(false)
         {
             current = trusted_floor;
             continue;
@@ -935,8 +998,10 @@ fn resolve_layered_value(
 }
 
 fn default_state(layers: &[Layer], category: DefaultCategory) -> Option<PermissionState> {
-    resolve_layered_value(layers, |layer| layer.permissions.default_policy.get(category))
-        .map(|r| r.state)
+    resolve_layered_value(layers, |layer| {
+        layer.permissions.default_policy.get(category)
+    })
+    .map(|r| r.state)
 }
 
 // ---- input → targets (pi permission-manager.ts:513-528, 240-297) ----
@@ -947,7 +1012,11 @@ fn path_resource_from_input(input: &Value) -> Option<String> {
         .or_else(|| get_non_empty_string(record.get("file_path")))?;
     let cwd = get_non_empty_string(record.get("cwd")).unwrap_or_else(process_cwd);
     let resource = common::normalize_path_resource_for_permission(&path, &cwd);
-    if resource.is_empty() { None } else { Some(resource) }
+    if resource.is_empty() {
+        None
+    } else {
+        Some(resource)
+    }
 }
 
 fn create_action_resource_targets(action: &str, input: &Value) -> Vec<String> {
@@ -958,7 +1027,9 @@ fn create_action_resource_targets(action: &str, input: &Value) -> Vec<String> {
 }
 
 fn process_cwd() -> String {
-    std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default()
+    std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default()
 }
 
 // ---- mcp targets (pi permission-manager.ts:168-297) ----
@@ -1025,8 +1096,10 @@ fn push_mcp_tool_permission_targets(
     let resolved_server = server_hint
         .map(str::to_string)
         .or_else(|| qualified.as_ref().map(|(s, _)| s.clone()));
-    let resolved_tool =
-        qualified.as_ref().map(|(_, t)| t.clone()).unwrap_or_else(|| raw_reference.to_string());
+    let resolved_tool = qualified
+        .as_ref()
+        .map(|(_, t)| t.clone())
+        .unwrap_or_else(|| raw_reference.to_string());
 
     if let Some(server) = &resolved_server {
         push_unique(targets, &format!("{server}_{resolved_tool}"));
@@ -1106,7 +1179,10 @@ fn normalize_policy(value: Option<&OrderedValue>) -> DefaultPolicy {
 
 fn normalize_partial_policy(value: Option<&OrderedValue>) -> PartialDefaultPolicy {
     let get = |k: &str| {
-        value.and_then(|v| v.get(k)).and_then(OrderedValue::as_str).and_then(PermissionState::parse)
+        value
+            .and_then(|v| v.get(k))
+            .and_then(OrderedValue::as_str)
+            .and_then(PermissionState::parse)
     };
     PartialDefaultPolicy {
         tools: get("tools"),
@@ -1143,7 +1219,9 @@ fn normalize_raw_permission(raw: &OrderedValue) -> AgentPermissions {
     // Fold top-level built-in/special state keys into their category (pi `:150-163`).
     if let Some(entries) = raw.as_object() {
         for (key, val) in entries {
-            let Some(state) = val.as_str().and_then(PermissionState::parse) else { continue };
+            let Some(state) = val.as_str().and_then(PermissionState::parse) else {
+                continue;
+            };
             if is_built_in_tool(key) {
                 normalized.tools.insert(key.clone(), state);
             } else if is_special(key) {
@@ -1197,11 +1275,13 @@ mod tests {
             r#"{ "bash": { "echo *": "allow", "rm -rf *": "deny" } }"#,
         );
         assert_eq!(
-            m.check_permission("bash", &serde_json::json!({"command":"echo hi"}), None).state,
+            m.check_permission("bash", &serde_json::json!({"command":"echo hi"}), None)
+                .state,
             PermissionState::Allow
         );
         assert_eq!(
-            m.check_permission("bash", &serde_json::json!({"command":"rm -rf /"}), None).state,
+            m.check_permission("bash", &serde_json::json!({"command":"rm -rf /"}), None)
+                .state,
             PermissionState::Deny
         );
     }
@@ -1227,17 +1307,67 @@ mod tests {
 
         // (command, expected state, expected `command` field, what it pins)
         let cases: [(&str, PermissionState, &str, &str); 11] = [
-            ("echo hi", PermissionState::Allow, "echo hi", "single command unaffected"),
-            ("echo hi && rm -rf /", PermissionState::Deny, "rm -rf /", "THE CHAIN BYPASS"),
-            ("echo $(rm x)", PermissionState::Deny, "rm x", "command substitution"),
-            ("x=1 rm -rf /", PermissionState::Deny, "rm -rf /", "env-prefix strip"),
-            ("echo hi > $(rm x)", PermissionState::Deny, "rm x", "redirect as execution host"),
-            ("( echo a && rm b )", PermissionState::Deny, "rm b", "subshell descent"),
-            ("cat <<EOF\n$(rm e)\nEOF", PermissionState::Deny, "rm e", "heredoc interpolation"),
-            ("cat <<'EOF'\n$(rm e)\nEOF", PermissionState::Ask, "cat", "quoted heredoc does NOT interpolate"),
-            ("# comment", PermissionState::Ask, "# comment", "comment-only resolves whole"),
+            (
+                "echo hi",
+                PermissionState::Allow,
+                "echo hi",
+                "single command unaffected",
+            ),
+            (
+                "echo hi && rm -rf /",
+                PermissionState::Deny,
+                "rm -rf /",
+                "THE CHAIN BYPASS",
+            ),
+            (
+                "echo $(rm x)",
+                PermissionState::Deny,
+                "rm x",
+                "command substitution",
+            ),
+            (
+                "x=1 rm -rf /",
+                PermissionState::Deny,
+                "rm -rf /",
+                "env-prefix strip",
+            ),
+            (
+                "echo hi > $(rm x)",
+                PermissionState::Deny,
+                "rm x",
+                "redirect as execution host",
+            ),
+            (
+                "( echo a && rm b )",
+                PermissionState::Deny,
+                "rm b",
+                "subshell descent",
+            ),
+            (
+                "cat <<EOF\n$(rm e)\nEOF",
+                PermissionState::Deny,
+                "rm e",
+                "heredoc interpolation",
+            ),
+            (
+                "cat <<'EOF'\n$(rm e)\nEOF",
+                PermissionState::Ask,
+                "cat",
+                "quoted heredoc does NOT interpolate",
+            ),
+            (
+                "# comment",
+                PermissionState::Ask,
+                "# comment",
+                "comment-only resolves whole",
+            ),
             ("", PermissionState::Ask, "", "empty resolves whole"),
-            ("   ", PermissionState::Ask, "   ", "whitespace-only resolves whole"),
+            (
+                "   ",
+                PermissionState::Ask,
+                "   ",
+                "whitespace-only resolves whole",
+            ),
         ];
 
         for (command, want_state, want_command, pins) in cases {
@@ -1277,11 +1407,21 @@ mod tests {
         let input = serde_json::json!({ "command": command });
         let r = m.check_permission("bash", &input, None);
         assert_eq!(r.state, PermissionState::Ask);
-        assert_eq!(r.command.as_deref(), Some("echo hi"), "first-wins tie-break");
+        assert_eq!(
+            r.command.as_deref(),
+            Some("echo hi"),
+            "first-wins tie-break"
+        );
 
         let prompt = crate::gate::format_ask_prompt(&r, None, &input);
-        assert!(prompt.contains("git push --force"), "prompt hides what runs: {prompt}");
-        assert!(prompt.contains("echo hi"), "prompt drops the unit needing approval: {prompt}");
+        assert!(
+            prompt.contains("git push --force"),
+            "prompt hides what runs: {prompt}"
+        );
+        assert!(
+            prompt.contains("echo hi"),
+            "prompt drops the unit needing approval: {prompt}"
+        );
     }
 
     #[test]
@@ -1302,7 +1442,8 @@ mod tests {
         });
         // Untrusted project's allow cannot relax the trusted global deny.
         assert_eq!(
-            m.check_permission("bash", &serde_json::json!({"command":"curl x"}), None).state,
+            m.check_permission("bash", &serde_json::json!({"command":"curl x"}), None)
+                .state,
             PermissionState::Deny
         );
     }
@@ -1310,10 +1451,7 @@ mod tests {
     #[test]
     fn directory_resource_read_allow_does_not_grant_edit() {
         let dir = tempfile::tempdir().unwrap();
-        let mut m = manager_with_global(
-            dir.path(),
-            r#"{ "tools": { "read:/data/*": "allow" } }"#,
-        );
+        let mut m = manager_with_global(dir.path(), r#"{ "tools": { "read:/data/*": "allow" } }"#);
         let read = m.check_permission(
             "read",
             &serde_json::json!({"path":"/data/x","cwd":"/data"}),
@@ -1332,10 +1470,7 @@ mod tests {
     #[test]
     fn dotdot_traversal_canonicalizes_out_of_allowed_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let mut m = manager_with_global(
-            dir.path(),
-            r#"{ "tools": { "read:/data/*": "allow" } }"#,
-        );
+        let mut m = manager_with_global(dir.path(), r#"{ "tools": { "read:/data/*": "allow" } }"#);
         let r = m.check_permission(
             "read",
             &serde_json::json!({"path":"/data/../etc/passwd","cwd":"/data"}),
@@ -1358,16 +1493,24 @@ mod tests {
             "---\npermission:\n  bash:\n    constructor: allow\n    echo *: allow\n---\nbody\n",
         );
         assert_eq!(
-            m.check_permission("bash", &serde_json::json!({"command":"constructor"}), Some("coder"))
-                .state,
+            m.check_permission(
+                "bash",
+                &serde_json::json!({"command":"constructor"}),
+                Some("coder")
+            )
+            .state,
             PermissionState::Ask,
             "a `constructor` frontmatter key must be dropped, leaving the default ask"
         );
         // MIRROR: the sibling rule on the same map is untouched — the drop is key-scoped, not a
         // blanket rejection of the frontmatter block.
         assert_eq!(
-            m.check_permission("bash", &serde_json::json!({"command":"echo hi"}), Some("coder"))
-                .state,
+            m.check_permission(
+                "bash",
+                &serde_json::json!({"command":"echo hi"}),
+                Some("coder")
+            )
+            .state,
             PermissionState::Allow
         );
     }
@@ -1515,8 +1658,12 @@ mod tests {
             "---\npermission:\n  read: deny\n---\nbody\n",
         );
         assert_eq!(
-            m.check_permission("read", &serde_json::json!({"path":"/tmp/x"}), Some("reader"))
-                .state,
+            m.check_permission(
+                "read",
+                &serde_json::json!({"path":"/tmp/x"}),
+                Some("reader")
+            )
+            .state,
             PermissionState::Deny
         );
     }

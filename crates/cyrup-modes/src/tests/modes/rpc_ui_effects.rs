@@ -31,7 +31,10 @@ async fn rpc_fire_and_forget_ui_effects_reach_the_wire() {
     let (mut client_tx, mut client_reader, rpc) = spawn_rpc_duplex(runtime);
 
     // A get_state first proves the loop (and its effect sink) is up before any effect fires.
-    client_tx.write_all(b"{\"type\":\"get_state\",\"id\":\"boot\"}\n").await.unwrap();
+    client_tx
+        .write_all(b"{\"type\":\"get_state\",\"id\":\"boot\"}\n")
+        .await
+        .unwrap();
     let boot = read_json_line(&mut client_reader).await;
     assert_eq!(boot["command"], "get_state");
 
@@ -59,7 +62,10 @@ async fn rpc_fire_and_forget_ui_effects_reach_the_wire() {
     let req = read_json_line(&mut client_reader).await;
     assert_eq!(req["method"], "setStatus");
     assert_eq!(req["statusKey"], "git");
-    assert!(req.get("statusText").is_none(), "a cleared status must omit statusText: {req:?}");
+    assert!(
+        req.get("statusText").is_none(),
+        "a cleared status must omit statusText: {req:?}"
+    );
 
     // SEAM-028/SEAM-011 — the WIT now carries pi's three `setWidget` arguments separately, so this
     // case asserts pi's real member: `widgetKey: string; widgetLines: string[] | undefined;
@@ -96,7 +102,10 @@ async fn rpc_fire_and_forget_ui_effects_reach_the_wire() {
         req.get("widgetLines").is_none(),
         "a widget removal omits widgetLines rather than sending null: {req:?}"
     );
-    assert_eq!(req["widgetPlacement"], "belowEditor", "a non-default placement IS emitted: {req:?}");
+    assert_eq!(
+        req["widgetPlacement"], "belowEditor",
+        "a non-default placement IS emitted: {req:?}"
+    );
 
     // set_title → `{method:"setTitle", title}` (rpc-mode.ts:216-223).
     host_services.set_title("My Session");
@@ -120,7 +129,10 @@ async fn rpc_fire_and_forget_ui_effects_reach_the_wire() {
 
     // The loop is still alive and responsive after all six effects (proves the drain arm never
     // blocked the select! loop or consumed a client-facing response slot).
-    client_tx.write_all(b"{\"type\":\"get_state\",\"id\":\"after\"}\n").await.unwrap();
+    client_tx
+        .write_all(b"{\"type\":\"get_state\",\"id\":\"after\"}\n")
+        .await
+        .unwrap();
     let after = read_json_line(&mut client_reader).await;
     assert_eq!(after["command"], "get_state");
 
@@ -148,7 +160,10 @@ async fn rpc_header_footer_and_tools_expanded_effects_never_reach_the_wire() {
 
     let (mut client_tx, mut client_reader, rpc) = spawn_rpc_duplex(runtime);
 
-    client_tx.write_all(b"{\"type\":\"get_state\",\"id\":\"boot\"}\n").await.unwrap();
+    client_tx
+        .write_all(b"{\"type\":\"get_state\",\"id\":\"boot\"}\n")
+        .await
+        .unwrap();
     let boot = read_json_line(&mut client_reader).await;
     assert_eq!(boot["command"], "get_state");
 
@@ -164,7 +179,10 @@ async fn rpc_header_footer_and_tools_expanded_effects_never_reach_the_wire() {
     // defect — `extension_ui_effect_json` returns `None` for `SetHeader`/`SetFooter`/
     // `SetToolsExpanded`, so no request can ever be written regardless — but the sleep asserted
     // nothing and cost 50 ms per run.)
-    client_tx.write_all(b"{\"type\":\"get_state\",\"id\":\"after\"}\n").await.unwrap();
+    client_tx
+        .write_all(b"{\"type\":\"get_state\",\"id\":\"after\"}\n")
+        .await
+        .unwrap();
     let after = read_json_line(&mut client_reader).await;
     assert_eq!(
         after["command"], "get_state",

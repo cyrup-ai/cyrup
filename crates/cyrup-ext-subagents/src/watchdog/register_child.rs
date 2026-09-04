@@ -36,21 +36,21 @@
 //! the ones the parent explicitly armed install anything at all.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value;
 
 use super::child_status::{
-    decode_child_watchdog_config, ChildWatchdogConfig, ChildWatchdogPhase, ChildWatchdogStatusEvent,
-    CHILD_WATCHDOG_STATUS_EVENT,
+    CHILD_WATCHDOG_STATUS_EVENT, ChildWatchdogConfig, ChildWatchdogPhase, ChildWatchdogStatusEvent,
+    decode_child_watchdog_config,
 };
 use super::runtime::{MainWatchdogRuntime, MainWatchdogRuntimeOptions, WatchdogReview};
 use super::settings::default_watchdog_config;
 use super::types::{
-    ResolvedWatchdogConfig, WatchdogAutoFollowConfig, WatchdogEndpointConfig, WatchdogRuntimeStatus,
-    WatchdogSettingsResult, WatchdogSettingsScope, WatchdogSettingsSource, WatchdogWarningDetails,
-    WatchdogWarningSource, SUBAGENT_WATCHDOG_WARNING_TYPE,
+    ResolvedWatchdogConfig, SUBAGENT_WATCHDOG_WARNING_TYPE, WatchdogAutoFollowConfig,
+    WatchdogEndpointConfig, WatchdogRuntimeStatus, WatchdogSettingsResult, WatchdogSettingsScope,
+    WatchdogSettingsSource, WatchdogWarningDetails, WatchdogWarningSource,
 };
 use super::warning_format::create_watchdog_warning_message_from_details;
 
@@ -319,11 +319,11 @@ pub fn register_child_watchdog(
     clippy::panic
 )]
 mod tests {
-    use super::*;
     use super::super::types::{
         ThinkingSetting, WatchdogCategory, WatchdogLspConfig, WatchdogSeverity,
         WatchdogWarningState,
     };
+    use super::*;
     use std::sync::Mutex;
 
     fn config() -> ChildWatchdogConfig {
@@ -349,7 +349,10 @@ mod tests {
         }
     }
 
-    fn collecting_sink() -> (ChildWatchdogStatusSink, Arc<Mutex<Vec<ChildWatchdogStatusEvent>>>) {
+    fn collecting_sink() -> (
+        ChildWatchdogStatusSink,
+        Arc<Mutex<Vec<ChildWatchdogStatusEvent>>>,
+    ) {
         let events: Arc<Mutex<Vec<ChildWatchdogStatusEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let sink_events = Arc::clone(&events);
         (
@@ -445,62 +448,65 @@ mod tests {
 
     #[test]
     fn no_env_config_installs_nothing() {
-        assert!(register_child_watchdog(
-            None,
-            Path::new("/tmp"),
-            Arc::new(|| None),
-            None,
-            collecting_sink().0
-        )
-        .is_none());
-        assert!(register_child_watchdog(
-            Some(""),
-            Path::new("/tmp"),
-            Arc::new(|| None),
-            None,
-            collecting_sink().0
-        )
-        .is_none());
+        assert!(
+            register_child_watchdog(
+                None,
+                Path::new("/tmp"),
+                Arc::new(|| None),
+                None,
+                collecting_sink().0
+            )
+            .is_none()
+        );
+        assert!(
+            register_child_watchdog(
+                Some(""),
+                Path::new("/tmp"),
+                Arc::new(|| None),
+                None,
+                collecting_sink().0
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn an_explicitly_disabled_config_installs_nothing() {
         let raw = serde_json::json!({ "enabled": false }).to_string();
-        assert!(register_child_watchdog(
-            Some(&raw),
-            Path::new("/tmp"),
-            Arc::new(|| None),
-            None,
-            collecting_sink().0
-        )
-        .is_none());
+        assert!(
+            register_child_watchdog(
+                Some(&raw),
+                Path::new("/tmp"),
+                Arc::new(|| None),
+                None,
+                collecting_sink().0
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn a_malformed_config_declines_rather_than_failing_the_child() {
         let raw = "{ not json";
-        assert!(register_child_watchdog(
-            Some(raw),
-            Path::new("/tmp"),
-            Arc::new(|| None),
-            None,
-            collecting_sink().0
-        )
-        .is_none());
+        assert!(
+            register_child_watchdog(
+                Some(raw),
+                Path::new("/tmp"),
+                Arc::new(|| None),
+                None,
+                collecting_sink().0
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn an_armed_child_runs_an_always_enabled_runtime() {
         let raw = serde_json::to_string(&config()).expect("encode");
         let (sink, _events) = collecting_sink();
-        let child = register_child_watchdog(
-            Some(&raw),
-            Path::new("/tmp"),
-            Arc::new(|| None),
-            None,
-            sink,
-        )
-        .expect("armed");
+        let child =
+            register_child_watchdog(Some(&raw), Path::new("/tmp"), Arc::new(|| None), None, sink)
+                .expect("armed");
         let snapshot = child.runtime().get_snapshot(None);
         assert!(snapshot.enabled);
         assert_eq!(snapshot.config.agent_end_timeout_ms, 15_000);
@@ -516,14 +522,9 @@ mod tests {
     async fn the_status_events_are_strictly_ordered_across_the_lifecycle() {
         let raw = serde_json::to_string(&config()).expect("encode");
         let (sink, events) = collecting_sink();
-        let child = register_child_watchdog(
-            Some(&raw),
-            Path::new("/tmp"),
-            Arc::new(|| None),
-            None,
-            sink,
-        )
-        .expect("armed");
+        let child =
+            register_child_watchdog(Some(&raw), Path::new("/tmp"), Arc::new(|| None), None, sink)
+                .expect("armed");
 
         child.handle_session_start(Path::new("/tmp"));
         child.handle_agent_end(Path::new("/tmp")).await;
@@ -547,7 +548,11 @@ mod tests {
             assert_eq!(event.run_id.as_deref(), Some("run-1"));
             assert_eq!(event.agent.as_deref(), Some("reviewer"));
             assert_eq!(event.child_index, Some(2));
-            assert_eq!(event.step_index, Some(2), "both index spellings are emitted");
+            assert_eq!(
+                event.step_index,
+                Some(2),
+                "both index spellings are emitted"
+            );
             assert!(!event.follow_up_pending);
         }
     }

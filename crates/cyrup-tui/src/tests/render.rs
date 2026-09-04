@@ -10,11 +10,11 @@
     clippy::panic
 )]
 
-use cyrup_session_svc::AgentSessionEvent;
+use super::harness::*;
 use crate::{App, UiTheme};
+use cyrup_session_svc::AgentSessionEvent;
 use ratatui::backend::TestBackend;
 use ratatui::style::Color;
-use super::harness::*;
 
 /// Flatten only the **live region** — the bottom `viewport_height` rows the app repaints each frame
 /// (ADR-0001 #1). Committed history scrolls *above* this band into native scrollback, so this is what
@@ -59,7 +59,9 @@ fn footer_text(app: &App<TestBackend>) -> String {
 /// True if any non-blank cell carries the given foreground color.
 fn has_fg(app: &App<TestBackend>, color: Color) -> bool {
     let buf = app.terminal().backend().buffer();
-    buf.content().iter().any(|cell| cell.fg == color && cell.symbol() != " ")
+    buf.content()
+        .iter()
+        .any(|cell| cell.fg == color && cell.symbol() != " ")
 }
 
 #[test]
@@ -68,7 +70,8 @@ fn committed_entries_move_to_scrollback_and_only_active_turn_renders() {
     // viewport renders only the active streaming turn + editor + status.
     let mut app = App::new(TestBackend::new(50, 16), UiTheme::dark()).unwrap();
     app.transcript_mut().push_user("hello world");
-    app.transcript_mut().commit_assistant(Some("hi there".to_string()));
+    app.transcript_mut()
+        .commit_assistant(Some("hi there".to_string()));
     // A second, still-streaming assistant turn arrives as deltas (the active region).
     app.transcript_mut().push_assistant_delta("strea");
     app.transcript_mut().push_assistant_delta("ming…");
@@ -78,20 +81,44 @@ fn committed_entries_move_to_scrollback_and_only_active_turn_renders() {
     let sb = app.scrollback_text();
     // X1: no `you: ` / `assistant: ` labels — `user-message.ts:38-58` and
     // `assistant-message.ts:104-114` render the body alone.
-    assert!(sb.contains("hello world"), "scrollback missing user line:\n{sb}");
-    assert!(sb.contains("hi there"), "scrollback missing assistant line:\n{sb}");
-    assert!(!sb.contains("you:") && !sb.contains("assistant:"), "invented role label:\n{sb}");
+    assert!(
+        sb.contains("hello world"),
+        "scrollback missing user line:\n{sb}"
+    );
+    assert!(
+        sb.contains("hi there"),
+        "scrollback missing assistant line:\n{sb}"
+    );
+    assert!(
+        !sb.contains("you:") && !sb.contains("assistant:"),
+        "invented role label:\n{sb}"
+    );
 
     // (b) The live region no longer contains the committed text (it scrolled into native scrollback
     //     above the inline band, audit #1), but DOES show the active streaming turn + editor + footer.
     let text = live_region_text(&app);
-    assert!(!text.contains("hello world"), "committed user leaked into live region:\n{text}");
-    assert!(!text.contains("hi there"), "committed assistant leaked into live region:\n{text}");
-    assert!(text.contains("streaming…"), "active streaming turn missing from live region:\n{text}");
+    assert!(
+        !text.contains("hello world"),
+        "committed user leaked into live region:\n{text}"
+    );
+    assert!(
+        !text.contains("hi there"),
+        "committed assistant leaked into live region:\n{text}"
+    );
+    assert!(
+        text.contains("streaming…"),
+        "active streaming turn missing from live region:\n{text}"
+    );
     // The footer right cluster is the model (here unset → Pi's "no-model", footer.ts:170), never an
     // invented streaming/idle word; the active turn renders inline with NO box/title (footer.ts:84-93).
-    assert!(text.contains("no-model"), "footer model cluster missing from viewport:\n{text}");
-    assert!(!text.contains("conversation"), "streaming partial must not be boxed:\n{text}");
+    assert!(
+        text.contains("no-model"),
+        "footer model cluster missing from viewport:\n{text}"
+    );
+    assert!(
+        !text.contains("conversation"),
+        "streaming partial must not be boxed:\n{text}"
+    );
 }
 
 #[test]
@@ -105,8 +132,14 @@ fn footer_right_cluster_is_model_not_streaming_word() {
 
     let text = buf_text(&app);
     assert!(text.contains("anthropic/claude"), "missing model:\n{text}");
-    assert!(!text.contains("streaming"), "footer invented a streaming word:\n{text}");
-    assert!(!text.contains("idle"), "footer invented an idle word:\n{text}");
+    assert!(
+        !text.contains("streaming"),
+        "footer invented a streaming word:\n{text}"
+    );
+    assert!(
+        !text.contains("idle"),
+        "footer invented an idle word:\n{text}"
+    );
 }
 
 #[test]
@@ -117,14 +150,18 @@ fn footer_renders_usage_cluster_and_location() {
     app.status_mut().set_model("anthropic/claude-opus-4-8");
     app.status_mut().set_cwd("~/src/cyrup");
     app.status_mut().set_branch(Some("david/cyrup".to_string()));
-    app.status_mut().set_session_name(Some("my-session".to_string()));
+    app.status_mut()
+        .set_session_name(Some("my-session".to_string()));
     app.status_mut().add_usage(&Usage {
         input: 12_300,
         output: 4_100,
         cache_read: 88_000,
         cache_write: 2_100,
         total_tokens: 106_500,
-        cost: Cost { total: 0.214, ..Cost::default() },
+        cost: Cost {
+            total: 0.214,
+            ..Cost::default()
+        },
         ..Usage::default()
     });
     app.status_mut().set_context(0.412, 200_000, true);
@@ -132,14 +169,29 @@ fn footer_renders_usage_cluster_and_location() {
 
     let text = buf_text(&app);
     // formatTokens thresholds (footer.ts:22-29): 12300 ≥10k → "12k"; 4100 <10k → "4.1k"; 88k; 2.1k.
-    assert!(text.contains("↑12k"), "input tokens cluster missing:\n{text}");
-    assert!(text.contains("↓4.1k"), "output tokens cluster missing:\n{text}");
+    assert!(
+        text.contains("↑12k"),
+        "input tokens cluster missing:\n{text}"
+    );
+    assert!(
+        text.contains("↓4.1k"),
+        "output tokens cluster missing:\n{text}"
+    );
     assert!(text.contains("R88k"), "cache-read cluster missing:\n{text}");
     assert!(text.contains("$0.214"), "cost segment missing:\n{text}");
-    assert!(text.contains("41.2%/200k (auto)"), "context segment missing:\n{text}");
+    assert!(
+        text.contains("41.2%/200k (auto)"),
+        "context segment missing:\n{text}"
+    );
     // Location line.
-    assert!(text.contains("~/src/cyrup (david/cyrup) • my-session"), "location line missing:\n{text}");
-    assert!(text.contains("anthropic/claude-opus-4-8"), "model missing:\n{text}");
+    assert!(
+        text.contains("~/src/cyrup (david/cyrup) • my-session"),
+        "location line missing:\n{text}"
+    );
+    assert!(
+        text.contains("anthropic/claude-opus-4-8"),
+        "model missing:\n{text}"
+    );
 }
 
 #[test]
@@ -151,8 +203,13 @@ fn streaming_text_deltas_render_in_viewport_via_events() {
     use cyrup_session_svc::AgentSessionEvent;
 
     // A minimal partial assistant message to ride along with each delta event.
-    let partial =
-        AssistantMessage::errored(ProviderId::from("anthropic"), "claude", None, StopReason::Stop, "");
+    let partial = AssistantMessage::errored(
+        ProviderId::from("anthropic"),
+        "claude",
+        None,
+        StopReason::Stop,
+        "",
+    );
 
     let mut app = App::new(TestBackend::new(60, 14), UiTheme::dark()).unwrap();
     app.ingest_event(&AgentSessionEvent::AgentStart);
@@ -176,7 +233,10 @@ fn streaming_text_deltas_render_in_viewport_via_events() {
     }
     app.draw().unwrap();
     let text = buf_text(&app);
-    assert!(text.contains("The live stream"), "streamed deltas not in viewport:\n{text}");
+    assert!(
+        text.contains("The live stream"),
+        "streamed deltas not in viewport:\n{text}"
+    );
     // Still streaming → not yet committed to scrollback.
     assert!(
         !app.scrollback_text().contains("The live stream"),
@@ -192,11 +252,17 @@ fn streaming_text_deltas_render_in_viewport_via_events() {
     // nothing at all.
     let mut final_msg = partial.clone();
     final_msg.content = vec![Content::text("The live stream is done")];
-    final_msg.usage = Usage { total_tokens: 42, ..Usage::default() };
+    final_msg.usage = Usage {
+        total_tokens: 42,
+        ..Usage::default()
+    };
     app.ingest_event(&AgentSessionEvent::MessageEnd {
         message: AgentMessage::Assistant(std::sync::Arc::new(final_msg)),
     });
-    app.ingest_event(&AgentSessionEvent::AgentEnd { messages: vec![], will_retry: false });
+    app.ingest_event(&AgentSessionEvent::AgentEnd {
+        messages: vec![],
+        will_retry: false,
+    });
     app.draw().unwrap();
     assert!(
         app.scrollback_text().contains("The live stream is done"),
@@ -233,7 +299,11 @@ fn ingest_events_drive_status_and_transcript() {
     // and `xp` — there is no queue segment upstream under any name, and the extra segment pushed the
     // right-aligned model name over at narrow widths. This used to read `status.queued`, a counter
     // with no render site at all (ADR-0009 item 3); that field is gone.
-    assert_eq!(app.state().pending_messages.len(), 3, "queue depth not tracked");
+    assert_eq!(
+        app.state().pending_messages.len(),
+        3,
+        "queue depth not tracked"
+    );
     // Assert the FOOTER, not the whole screen. The old form was `!text.contains("queued")` over the
     // entire buffer, which was only ever a proxy for "no footer segment" — and it also asserted, in
     // its comment, that "pi surfaces queued messages in the transcript instead". That second claim is
@@ -242,15 +312,33 @@ fn ingest_events_drive_status_and_transcript() {
     // `↳ {key} to edit all queued messages`. So the screen now legitimately contains the word.
     // Tightened to the real invariant plus the row that was missing.
     let footer_rows = footer_text(&app);
-    assert!(!footer_rows.contains("queued"), "pi's footer has no queue segment:\n{footer_rows}");
+    assert!(
+        !footer_rows.contains("queued"),
+        "pi's footer has no queue segment:\n{footer_rows}"
+    );
     // …and the queue IS surfaced, where pi puts it (`TUI-016`).
-    assert!(text.contains("Steering: one"), "pending steering row missing:\n{text}");
-    assert!(text.contains("Follow-up: two"), "pending follow-up row missing:\n{text}");
-    assert!(text.contains("Follow-up: three"), "pending follow-up row missing:\n{text}");
-    assert!(text.contains("to edit all queued messages"), "dequeue hint missing:\n{text}");
+    assert!(
+        text.contains("Steering: one"),
+        "pending steering row missing:\n{text}"
+    );
+    assert!(
+        text.contains("Follow-up: two"),
+        "pending follow-up row missing:\n{text}"
+    );
+    assert!(
+        text.contains("Follow-up: three"),
+        "pending follow-up row missing:\n{text}"
+    );
+    assert!(
+        text.contains("to edit all queued messages"),
+        "dequeue hint missing:\n{text}"
+    );
     // The model-change notification is a committed entry: it lives in scrollback, not the live region.
     let sb = app.scrollback_text();
-    assert!(sb.contains("model → openai/gpt"), "model change not logged to scrollback:\n{sb}");
+    assert!(
+        sb.contains("model → openai/gpt"),
+        "model change not logged to scrollback:\n{sb}"
+    );
     assert!(
         !live_region_text(&app).contains("model → openai/gpt"),
         "status entry leaked into live region:\n{}",
@@ -258,11 +346,20 @@ fn ingest_events_drive_status_and_transcript() {
     );
 
     // AgentEnd clears the streaming flag; the footer keeps showing the model (no idle word).
-    app.ingest_event(&AgentSessionEvent::AgentEnd { messages: vec![], will_retry: false });
+    app.ingest_event(&AgentSessionEvent::AgentEnd {
+        messages: vec![],
+        will_retry: false,
+    });
     app.draw().unwrap();
     let after = buf_text(&app);
-    assert!(after.contains("openai/gpt"), "footer model lost after agent_end:\n{after}");
-    assert!(!after.contains("idle"), "footer invented an idle word after agent_end:\n{after}");
+    assert!(
+        after.contains("openai/gpt"),
+        "footer model lost after agent_end:\n{after}"
+    );
+    assert!(
+        !after.contains("idle"),
+        "footer invented an idle word after agent_end:\n{after}"
+    );
 }
 
 #[test]
@@ -280,7 +377,10 @@ fn theme_colors_reach_rendered_cells() {
     app.state_mut().indicator.working();
     app.transcript_mut().push_assistant_delta("colored");
     app.draw().unwrap();
-    assert!(has_fg(&app, accent), "dark accent color did not reach any cell");
+    assert!(
+        has_fg(&app, accent),
+        "dark accent color did not reach any cell"
+    );
 
     // A different theme yields a different accent on the cells (Pi light `accent` = teal #5a8080).
     let light_accent = Color::Rgb(0x5a, 0x80, 0x80);
@@ -288,7 +388,10 @@ fn theme_colors_reach_rendered_cells() {
     light.state_mut().indicator.working();
     light.transcript_mut().push_assistant_delta("colored");
     light.draw().unwrap();
-    assert!(has_fg(&light, light_accent), "light accent color did not reach any cell");
+    assert!(
+        has_fg(&light, light_accent),
+        "light accent color did not reach any cell"
+    );
 }
 
 #[test]
@@ -304,9 +407,18 @@ fn finalized_turn_via_events_flows_to_scrollback_and_clears_viewport() {
     // Mid-turn: the user line has committed to scrollback; the assistant is still active (live region).
     app.draw().unwrap();
     let mid = live_region_text(&app);
-    assert!(mid.contains("answer"), "active streaming turn missing from live region mid-turn:\n{mid}");
-    assert!(!mid.contains("question?"), "committed user leaked into live region:\n{mid}");
-    assert!(app.scrollback_text().contains("question?"), "user not flushed to scrollback");
+    assert!(
+        mid.contains("answer"),
+        "active streaming turn missing from live region mid-turn:\n{mid}"
+    );
+    assert!(
+        !mid.contains("question?"),
+        "committed user leaked into live region:\n{mid}"
+    );
+    assert!(
+        app.scrollback_text().contains("question?"),
+        "user not flushed to scrollback"
+    );
     // X1: the needle lost its `you: ` prefix, so assert the prefix is actually absent rather than
     // just unasserted (`user-message.ts:38-58` has no role label).
     assert!(
@@ -316,20 +428,44 @@ fn finalized_turn_via_events_flows_to_scrollback_and_clears_viewport() {
     );
 
     // AgentEnd finalizes the streaming assistant turn.
-    app.ingest_event(&AgentSessionEvent::AgentEnd { messages: vec![], will_retry: false });
+    app.ingest_event(&AgentSessionEvent::AgentEnd {
+        messages: vec![],
+        will_retry: false,
+    });
     app.draw().unwrap();
 
     let sb = app.scrollback_text();
-    assert!(sb.contains("question?"), "user missing from scrollback:\n{sb}");
-    assert!(sb.contains("answer"), "finalized assistant missing from scrollback:\n{sb}");
-    assert!(!sb.contains("you:"), "invented `you: ` label in scrollback:\n{sb}");
-    assert!(!sb.contains("assistant:"), "invented assistant label in scrollback:\n{sb}");
+    assert!(
+        sb.contains("question?"),
+        "user missing from scrollback:\n{sb}"
+    );
+    assert!(
+        sb.contains("answer"),
+        "finalized assistant missing from scrollback:\n{sb}"
+    );
+    assert!(
+        !sb.contains("you:"),
+        "invented `you: ` label in scrollback:\n{sb}"
+    );
+    assert!(
+        !sb.contains("assistant:"),
+        "invented assistant label in scrollback:\n{sb}"
+    );
 
     let view = live_region_text(&app);
-    assert!(!view.contains("answer"), "finalized assistant still in live region:\n{view}");
+    assert!(
+        !view.contains("answer"),
+        "finalized assistant still in live region:\n{view}"
+    );
     // The footer persists (model cluster present); no invented idle word (gap 22).
-    assert!(view.contains("no-model"), "footer missing from viewport after finalize:\n{view}");
-    assert!(!view.contains("idle"), "footer invented an idle word after finalize:\n{view}");
+    assert!(
+        view.contains("no-model"),
+        "footer missing from viewport after finalize:\n{view}"
+    );
+    assert!(
+        !view.contains("idle"),
+        "footer invented an idle word after finalize:\n{view}"
+    );
 }
 
 #[test]
@@ -349,7 +485,10 @@ fn committed_entries_flush_exactly_once() {
         "invented `you: ` label in scrollback:\n{}",
         app.scrollback_text()
     );
-    assert!(app.state().transcript.pending().is_empty(), "pending buffer not drained");
+    assert!(
+        app.state().transcript.pending().is_empty(),
+        "pending buffer not drained"
+    );
 }
 
 /// Render only the footer region (last 2 rows) of a width×3 backend and return its text + the buffer.
@@ -379,18 +518,29 @@ fn footer_right_cluster_shows_thinking_level_when_model_reasons() {
     app.status_mut().set_reasoning(true);
     app.status_mut().set_thinking_level("high");
     app.draw().unwrap();
-    assert!(buf_text(&app).contains("claude-opus-4-8 • high"), "thinking level missing:\n{}", buf_text(&app));
+    assert!(
+        buf_text(&app).contains("claude-opus-4-8 • high"),
+        "thinking level missing:\n{}",
+        buf_text(&app)
+    );
 
     app.status_mut().set_thinking_level("off");
     app.draw().unwrap();
-    assert!(buf_text(&app).contains("claude-opus-4-8 • thinking off"), "thinking-off missing:\n{}", buf_text(&app));
+    assert!(
+        buf_text(&app).contains("claude-opus-4-8 • thinking off"),
+        "thinking-off missing:\n{}",
+        buf_text(&app)
+    );
 
     // A non-reasoning model shows the bare id, no thinking suffix (footer.ts:184).
     app.status_mut().set_reasoning(false);
     app.draw().unwrap();
     let t = buf_text(&app);
     assert!(t.contains("claude-opus-4-8"), "model missing:\n{t}");
-    assert!(!t.contains("thinking"), "thinking shown for non-reasoning model:\n{t}");
+    assert!(
+        !t.contains("thinking"),
+        "thinking shown for non-reasoning model:\n{t}"
+    );
 }
 
 #[test]
@@ -402,7 +552,11 @@ fn footer_right_aligns_model_cluster_with_padding() {
     let row = last_row(&app);
     assert!(row.ends_with("gpt-4o"), "model not flush-right:\n[{row}]");
     // With no left cluster the right side fills from the left edge with padding before it (min 2 gap).
-    assert_eq!(visible_len(&row), 40, "row not padded to full width:\n[{row}]");
+    assert_eq!(
+        visible_len(&row),
+        40,
+        "row not padded to full width:\n[{row}]"
+    );
 }
 
 #[test]
@@ -419,7 +573,10 @@ fn footer_cache_hit_uses_latest_turn_full_prompt_denominator() {
     app.draw().unwrap();
     // 88000 / (12300+88000+2100) = 85.9375 → "85.9%" (NOT the old 88000/(88000+12300)=87.7%).
     let t = buf_text(&app);
-    assert!(t.contains("CH85.9%"), "cache-hit denominator wrong (expected latest-turn full prompt):\n{t}");
+    assert!(
+        t.contains("CH85.9%"),
+        "cache-hit denominator wrong (expected latest-turn full prompt):\n{t}"
+    );
 }
 
 #[test]
@@ -430,13 +587,19 @@ fn footer_usage_is_cumulative_across_turns() {
     app.status_mut().add_usage(&Usage {
         input: 1_000,
         output: 500,
-        cost: Cost { total: 0.10, ..Cost::default() },
+        cost: Cost {
+            total: 0.10,
+            ..Cost::default()
+        },
         ..Usage::default()
     });
     app.status_mut().add_usage(&Usage {
         input: 1_000,
         output: 1_500,
-        cost: Cost { total: 0.05, ..Cost::default() },
+        cost: Cost {
+            total: 0.05,
+            ..Cost::default()
+        },
         ..Usage::default()
     });
     app.draw().unwrap();
@@ -456,12 +619,24 @@ fn footer_shows_subscription_provider_and_experimental_markers() {
     app.status_mut().set_provider_count(3);
     app.status_mut().set_using_subscription(true);
     app.status_mut().set_experimental(true);
-    app.status_mut().add_usage(&Usage { cost: Cost { total: 0.0, ..Cost::default() }, ..Usage::default() });
+    app.status_mut().add_usage(&Usage {
+        cost: Cost {
+            total: 0.0,
+            ..Cost::default()
+        },
+        ..Usage::default()
+    });
     app.draw().unwrap();
     let t = buf_text(&app);
-    assert!(t.contains("$0.000 (sub)"), "subscription marker missing:\n{t}");
+    assert!(
+        t.contains("$0.000 (sub)"),
+        "subscription marker missing:\n{t}"
+    );
     assert!(t.contains("xp"), "experimental marker missing:\n{t}");
-    assert!(t.contains("(anthropic) claude-opus-4-8"), "provider prefix missing:\n{t}");
+    assert!(
+        t.contains("(anthropic) claude-opus-4-8"),
+        "provider prefix missing:\n{t}"
+    );
 }
 
 #[test]
@@ -479,8 +654,14 @@ fn footer_truncates_overlong_left_cluster_with_ellipsis() {
     app.status_mut().set_model("some-really-long-model-id");
     app.draw().unwrap();
     let row = last_row(&app);
-    assert!(row.contains("..."), "overlong left cluster not truncated with ellipsis:\n[{row}]");
-    assert!(visible_len(&row) <= 12, "truncated row exceeds width:\n[{row}]");
+    assert!(
+        row.contains("..."),
+        "overlong left cluster not truncated with ellipsis:\n[{row}]"
+    );
+    assert!(
+        visible_len(&row) <= 12,
+        "truncated row exceeds width:\n[{row}]"
+    );
 }
 
 /// Visible length of a rendered row (chars; the test footer text is all single-width).

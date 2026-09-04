@@ -48,8 +48,8 @@ use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
 use super::scroll::{
-    geometry, scroll_by, scroll_to_row, set_hover, viewport_height, ScrollState, ScrollbarGeom,
-    ScrollbarView,
+    ScrollState, ScrollbarGeom, ScrollbarView, geometry, scroll_by, scroll_to_row, set_hover,
+    viewport_height,
 };
 
 /// A live thumb drag — pi's `ScrollbarDrag` (`tui-alt-screen.ts:117-120`), held in the renderer's

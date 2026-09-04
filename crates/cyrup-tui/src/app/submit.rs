@@ -37,7 +37,9 @@ impl<B: Backend> App<B> {
                 // so they join every bound key (`keybinding-hints.ts:29-36`).
                 let cancel = self.state.keymap.keys_label(Action::Interrupt);
                 let expand = self.state.keymap.keys_label(Action::ToolsExpand);
-                self.state.transcript.start_bash(command.clone(), excluded, cancel, expand);
+                self.state
+                    .transcript
+                    .start_bash(command.clone(), excluded, cancel, expand);
                 AppAction::RunBash { command, excluded }
             }
         }
@@ -87,8 +89,14 @@ impl<B: Backend> App<B> {
             // which upstream REFUSES — was accepted as a path. A refusal arrives here as `None`,
             // which is already each arm's no-argument branch: usage for `/import`, and the
             // session-directory default for `/export`, exactly as upstream's `undefined` does.
-            "export" => cmd(C::Export(arg.as_deref().and_then(crate::commands::path_command_argument))),
-            "import" => cmd(C::Import(arg.as_deref().and_then(crate::commands::path_command_argument))),
+            "export" => cmd(C::Export(
+                arg.as_deref()
+                    .and_then(crate::commands::path_command_argument),
+            )),
+            "import" => cmd(C::Import(
+                arg.as_deref()
+                    .and_then(crate::commands::path_command_argument),
+            )),
             "share" => cmd(C::Share),
             "copy" => cmd(C::Copy),
             // TUI-080 — `/name` with no argument is a GETTER upstream, not a usage error. This arm
@@ -115,7 +123,9 @@ impl<B: Backend> App<B> {
                 AppAction::Redraw
             }
             "changelog" => {
-                self.state.transcript.push_block("What's New", "No changelog entries found.");
+                self.state
+                    .transcript
+                    .push_block("What's New", "No changelog entries found.");
                 AppAction::Redraw
             }
             "debug" => {
@@ -131,20 +141,25 @@ impl<B: Backend> App<B> {
             // half-block glyphs (the random CRT/glitch animation effects are non-deterministic chrome
             // and omitted; the art itself is a real rich render, not a status line).
             "arminsayshi" => {
-                self.state.transcript.push_block("Armin says hi!", armin_art());
+                self.state
+                    .transcript
+                    .push_block("Armin says hi!", armin_art());
                 AppAction::Redraw
             }
             // `/dementedelves` (`daxnuts.ts`): a themed banner block (the model-triggered animation is
             // chrome; the announcement is a real rich block).
             "dementedelves" => {
-                self.state
-                    .transcript
-                    .push_block("Demented Elves", "🧝 The demented elves have entered the chat.");
+                self.state.transcript.push_block(
+                    "Demented Elves",
+                    "🧝 The demented elves have entered the chat.",
+                );
                 AppAction::Redraw
             }
             // Any other unhandled recognized name: a status line.
             other => {
-                self.state.transcript.push_status(format!("command: /{other}"));
+                self.state
+                    .transcript
+                    .push_status(format!("command: /{other}"));
                 AppAction::Redraw
             }
         }
@@ -199,9 +214,13 @@ impl<B: Backend> App<B> {
     /// `Queued message for after compaction`. The editor was already cleared by the submit path, and
     /// history was already recorded, so only the queue + the two surfaces are left. TUI-031.
     pub(crate) fn queue_compaction_message(&mut self, text: String, follow_up: bool) {
-        self.state.compaction_queue.push(CompactionQueued { text, follow_up });
+        self.state
+            .compaction_queue
+            .push(CompactionQueued { text, follow_up });
         self.rebuild_pending_messages();
-        self.state.transcript.push_status("Queued message for after compaction");
+        self.state
+            .transcript
+            .push_status("Queued message for after compaction");
     }
 
     /// Take the whole compaction queue — Pi's `flushCompactionQueue` opens with

@@ -186,7 +186,13 @@ pub fn first_time_setup_theme_step(detected: TerminalTheme) -> FirstTimeSetupSte
         ),
         rows: THEME_OPTIONS
             .iter()
-            .map(|(value, label)| ((*value).theme_name().to_string(), (*label).to_string(), None))
+            .map(|(value, label)| {
+                (
+                    (*value).theme_name().to_string(),
+                    (*label).to_string(),
+                    None,
+                )
+            })
             .collect(),
         selected,
     }
@@ -246,7 +252,9 @@ pub async fn apply_first_time_setup(
     settings
         .set(SettingsScope::Global, "theme", result.theme.theme_name())
         .await?;
-    settings.set_enable_analytics(result.share_analytics).await?;
+    settings
+        .set_enable_analytics(result.share_analytics)
+        .await?;
     Ok(())
 }
 
@@ -364,7 +372,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dirs = dirs_under(root.path());
         assert_eq!(
-            dirs.project_config_dir().file_name().and_then(|s| s.to_str()),
+            dirs.project_config_dir()
+                .file_name()
+                .and_then(|s| s.to_str()),
             Some(CONFIG_DIR_NAME)
         );
     }

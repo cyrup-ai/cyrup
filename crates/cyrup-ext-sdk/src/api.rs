@@ -207,7 +207,11 @@ pub enum RawOutcome {
 
 /// A (text|image) content block in a tool result. Serializes 1:1 with `cyrup_core::Content`.
 #[derive(Clone, Debug, Serialize)]
-#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum ContentBlock {
     /// A text block; built by [`Self::text`].
     Text {
@@ -248,11 +252,18 @@ pub struct ToolOutput {
 impl ToolOutput {
     /// A plain successful text result.
     pub fn text(t: impl Into<String>) -> Self {
-        Self { content: vec![ContentBlock::text(t)], ..Self::default() }
+        Self {
+            content: vec![ContentBlock::text(t)],
+            ..Self::default()
+        }
     }
     /// An error result (surfaced to the model as `isError`).
     pub fn error(t: impl Into<String>) -> Self {
-        Self { content: vec![ContentBlock::text(t)], is_error: true, ..Self::default() }
+        Self {
+            content: vec![ContentBlock::text(t)],
+            is_error: true,
+            ..Self::default()
+        }
     }
     /// Attach the per-tool `details` blob. A value that fails to serialize leaves `details`
     /// unset rather than failing the tool.
@@ -429,7 +440,10 @@ impl MarkdownTransformContext {
                 .and_then(Value::as_str)
                 .unwrap_or("assistant")
                 .to_string(),
-            is_streaming: v.get("isStreaming").and_then(Value::as_bool).unwrap_or(false),
+            is_streaming: v
+                .get("isStreaming")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             available_width: v
                 .get("availableWidth")
                 .and_then(Value::as_u64)
@@ -474,13 +488,19 @@ pub struct TerminalInputResult {
 impl TerminalInputResult {
     /// Swallow this keystroke — pi's `{consume: true}`.
     pub fn consume() -> Self {
-        Self { consume: Some(true), data: None }
+        Self {
+            consume: Some(true),
+            data: None,
+        }
     }
 
     /// Rewrite this keystroke and let the remaining handlers (and the editor) see the new value —
     /// pi's `{data}`.
     pub fn rewrite(data: impl Into<String>) -> Self {
-        Self { consume: None, data: Some(data.into()) }
+        Self {
+            consume: None,
+            data: Some(data.into()),
+        }
     }
 }
 
@@ -575,11 +595,7 @@ fn json(s: &str) -> Value {
 /// Parse an OPTIONAL JSON arg: an empty string is Pi `undefined` (`None`); anything else parses
 /// (degrading to `Null`). Used for `option<string>` seam params (e.g. `tool_result.details`).
 fn opt_json(s: &str) -> Option<Value> {
-    if s.is_empty() {
-        None
-    } else {
-        Some(json(s))
-    }
+    if s.is_empty() { None } else { Some(json(s)) }
 }
 
 /// Parse an OPTIONAL string arg: empty = Pi `undefined` (`None`). Used for `streamingBehavior`.
@@ -610,7 +626,10 @@ impl ExtensionApi {
 
     /// Register a tool (overrides a built-in of the same name host-side, R-08-012).
     pub fn register_tool(&mut self, descriptor: ToolDescriptor, exec: impl ToolExec) {
-        self.tools.push(RegisteredTool { descriptor, exec: Box::new(exec) });
+        self.tools.push(RegisteredTool {
+            descriptor,
+            exec: Box::new(exec),
+        });
     }
 
     /// Register a pre-built tool (Pi `defineTool` output / `customTools` array entry, sdk gap #6).
@@ -629,7 +648,11 @@ impl ExtensionApi {
     ) {
         self.commands.push((
             name.into(),
-            RegisteredCommand { descriptor: desc, handler: Box::new(handler), completions: None },
+            RegisteredCommand {
+                descriptor: desc,
+                handler: Box::new(handler),
+                completions: None,
+            },
         ));
     }
 
@@ -759,7 +782,9 @@ impl ExtensionApi {
     /// Run this extension's terminal-input handler, if it registered one (the
     /// `on-terminal-input` export body). `None` — upstream's `undefined` — when it did not.
     pub fn handle_terminal_input(&self, data: &str) -> Option<TerminalInputResult> {
-        self.terminal_input_handler.as_ref().and_then(|h| h.on_input(data))
+        self.terminal_input_handler
+            .as_ref()
+            .and_then(|h| h.on_input(data))
     }
 
     /// Whether this extension subscribed to raw terminal input (drives the
@@ -821,8 +846,13 @@ impl ExtensionApi {
     /// included, matching Pi's EventEmitter — emits `topic` via [`Ctx::emit`]; it receives the topic
     /// and the emitted JSON payload. The topic is declared to the host (the `bus.subscribe` import)
     /// so the host knows to fan a matching emit out to this guest's `bus-deliver` export.
-    pub fn on_bus(&mut self, topic: impl Into<String>, handler: impl Fn(&str, Value, &Ctx) + 'static) {
-        self.bus_subscriptions.push((topic.into(), Box::new(handler)));
+    pub fn on_bus(
+        &mut self,
+        topic: impl Into<String>,
+        handler: impl Fn(&str, Value, &Ctx) + 'static,
+    ) {
+        self.bus_subscriptions
+            .push((topic.into(), Box::new(handler)));
     }
 
     // --- the 33 event subscriptions ---
@@ -838,87 +868,139 @@ impl ExtensionApi {
     /// seam (R-08-010), so a handler that traps, panics or exhausts its budget DENIES the call
     /// instead of silently allowing it (EXT-001).
     pub fn on_tool_call(&mut self, f: impl Fn(ToolCallEvent, &Ctx) -> Outcome + 'static) {
-        self.handlers.insert(kind::TOOL_CALL, Box::new(move |a, c| {
-            let ev = ToolCallEvent { call_id: arg(a, 0).into(), name: arg(a, 1).into(), input: json(arg(a, 2)) };
-            f(ev, c).into_raw()
-        }));
+        self.handlers.insert(
+            kind::TOOL_CALL,
+            Box::new(move |a, c| {
+                let ev = ToolCallEvent {
+                    call_id: arg(a, 0).into(),
+                    name: arg(a, 1).into(),
+                    input: json(arg(a, 2)),
+                };
+                f(ev, c).into_raw()
+            }),
+        );
     }
     /// `tool_result` — VETOABLE (returns [`Outcome`]): override result fields with
     /// [`Outcome::patch_tool_result`] (replace-not-merge, R-08-011). Payload [`ToolResultEvent`].
     pub fn on_tool_result(&mut self, f: impl Fn(ToolResultEvent, &Ctx) -> Outcome + 'static) {
-        self.handlers.insert(kind::TOOL_RESULT, Box::new(move |a, c| {
-            let ev = ToolResultEvent {
-                call_id: arg(a, 0).into(),
-                name: arg(a, 1).into(),
-                input: json(arg(a, 2)),
-                content: json(arg(a, 3)),
-                is_error: arg(a, 4) == "true",
-                details: opt_json(arg(a, 5)),
-                // pi `ToolResultEventBase.usage` (types.ts:920-921 @v0.83.0; `:919` is `isError`);
-                // empty arg = pi `undefined`.
-                usage: opt_json(arg(a, 6)),
-            };
-            f(ev, c).into_raw()
-        }));
+        self.handlers.insert(
+            kind::TOOL_RESULT,
+            Box::new(move |a, c| {
+                let ev = ToolResultEvent {
+                    call_id: arg(a, 0).into(),
+                    name: arg(a, 1).into(),
+                    input: json(arg(a, 2)),
+                    content: json(arg(a, 3)),
+                    is_error: arg(a, 4) == "true",
+                    details: opt_json(arg(a, 5)),
+                    // pi `ToolResultEventBase.usage` (types.ts:920-921 @v0.83.0; `:919` is `isError`);
+                    // empty arg = pi `undefined`.
+                    usage: opt_json(arg(a, 6)),
+                };
+                f(ev, c).into_raw()
+            }),
+        );
     }
     /// `context` — VETOABLE (returns [`Outcome`]): filter or replace the LLM message list with
     /// [`Outcome::replace_messages`]. Payload [`ContextEvent`].
     pub fn on_context(&mut self, f: impl Fn(ContextEvent, &Ctx) -> Outcome + 'static) {
-        self.handlers.insert(kind::CONTEXT, Box::new(move |a, c| {
-            f(ContextEvent { messages: json(arg(a, 0)) }, c).into_raw()
-        }));
+        self.handlers.insert(
+            kind::CONTEXT,
+            Box::new(move |a, c| {
+                f(
+                    ContextEvent {
+                        messages: json(arg(a, 0)),
+                    },
+                    c,
+                )
+                .into_raw()
+            }),
+        );
     }
     /// `message_end` — VETOABLE (returns [`Outcome`]): replace the just-finished message with
     /// [`Outcome::replace_message`] (same role enforced host-side). Payload [`MessageEndEvent`].
     pub fn on_message_end(&mut self, f: impl Fn(MessageEndEvent, &Ctx) -> Outcome + 'static) {
-        self.handlers.insert(kind::MESSAGE_END, Box::new(move |a, c| {
-            f(MessageEndEvent { message: json(arg(a, 0)) }, c).into_raw()
-        }));
+        self.handlers.insert(
+            kind::MESSAGE_END,
+            Box::new(move |a, c| {
+                f(
+                    MessageEndEvent {
+                        message: json(arg(a, 0)),
+                    },
+                    c,
+                )
+                .into_raw()
+            }),
+        );
     }
     /// `before_agent_start` — VETOABLE (returns [`Outcome`]): inject a message and/or replace the
     /// system prompt with [`Outcome::before_agent_start`]. Payload [`BeforeAgentStartEvent`].
-    pub fn on_before_agent_start(&mut self, f: impl Fn(BeforeAgentStartEvent, &Ctx) -> Outcome + 'static) {
-        self.handlers.insert(kind::BEFORE_AGENT_START, Box::new(move |a, c| {
-            let ev = BeforeAgentStartEvent {
-                prompt: arg(a, 0).into(),
-                images: json(arg(a, 1)),
-                system_prompt: arg(a, 2).into(),
-                options: json(arg(a, 3)),
-            };
-            f(ev, c).into_raw()
-        }));
+    pub fn on_before_agent_start(
+        &mut self,
+        f: impl Fn(BeforeAgentStartEvent, &Ctx) -> Outcome + 'static,
+    ) {
+        self.handlers.insert(
+            kind::BEFORE_AGENT_START,
+            Box::new(move |a, c| {
+                let ev = BeforeAgentStartEvent {
+                    prompt: arg(a, 0).into(),
+                    images: json(arg(a, 1)),
+                    system_prompt: arg(a, 2).into(),
+                    options: json(arg(a, 3)),
+                };
+                f(ev, c).into_raw()
+            }),
+        );
     }
     /// `input` — VETOABLE (returns [`Outcome`]): transform the submission, or service it outright
     /// with [`Outcome::handled`]. Payload [`InputEvent`].
     pub fn on_input(&mut self, f: impl Fn(InputEvent, &Ctx) -> Outcome + 'static) {
-        self.handlers.insert(kind::INPUT, Box::new(move |a, c| {
-            let ev = InputEvent {
-                text: arg(a, 0).into(),
-                images: opt_images(arg(a, 1)),
-                source: arg(a, 2).into(),
-                streaming_behavior: opt_str(arg(a, 3)),
-            };
-            f(ev, c).into_raw()
-        }));
+        self.handlers.insert(
+            kind::INPUT,
+            Box::new(move |a, c| {
+                let ev = InputEvent {
+                    text: arg(a, 0).into(),
+                    images: opt_images(arg(a, 1)),
+                    source: arg(a, 2).into(),
+                    streaming_behavior: opt_str(arg(a, 3)),
+                };
+                f(ev, c).into_raw()
+            }),
+        );
     }
     /// `user_bash` — VETOABLE (returns [`Outcome`]): block, transform or fully service a `!`/`!!`
     /// bash invocation ([`Outcome::handled`]). Payload [`UserBashEvent`].
     pub fn on_user_bash(&mut self, f: impl Fn(UserBashEvent, &Ctx) -> Outcome + 'static) {
-        self.handlers.insert(kind::USER_BASH, Box::new(move |a, c| {
-            let ev = UserBashEvent {
-                command: arg(a, 0).into(),
-                exclude_from_context: arg(a, 1) == "true",
-                cwd: arg(a, 2).into(),
-            };
-            f(ev, c).into_raw()
-        }));
+        self.handlers.insert(
+            kind::USER_BASH,
+            Box::new(move |a, c| {
+                let ev = UserBashEvent {
+                    command: arg(a, 0).into(),
+                    exclude_from_context: arg(a, 1) == "true",
+                    cwd: arg(a, 2).into(),
+                };
+                f(ev, c).into_raw()
+            }),
+        );
     }
     /// `before_provider_request` — VETOABLE (returns [`Outcome`]): mutate the outbound provider
     /// payload. Payload [`BeforeProviderRequestEvent`].
-    pub fn on_before_provider_request(&mut self, f: impl Fn(BeforeProviderRequestEvent, &Ctx) -> Outcome + 'static) {
-        self.handlers.insert(kind::BEFORE_PROVIDER_REQUEST, Box::new(move |a, c| {
-            f(BeforeProviderRequestEvent { payload: json(arg(a, 0)) }, c).into_raw()
-        }));
+    pub fn on_before_provider_request(
+        &mut self,
+        f: impl Fn(BeforeProviderRequestEvent, &Ctx) -> Outcome + 'static,
+    ) {
+        self.handlers.insert(
+            kind::BEFORE_PROVIDER_REQUEST,
+            Box::new(move |a, c| {
+                f(
+                    BeforeProviderRequestEvent {
+                        payload: json(arg(a, 0)),
+                    },
+                    c,
+                )
+                .into_raw()
+            }),
+        );
     }
     /// `before_provider_headers` (EXT-009) — VETOABLE-shaped: it returns [`Outcome`], not `()`.
     /// The reading the host gives that outcome is the header patch — return it via
@@ -929,16 +1011,32 @@ impl ExtensionApi {
         &mut self,
         f: impl Fn(BeforeProviderHeadersEvent, &Ctx) -> Outcome + 'static,
     ) {
-        self.handlers.insert(kind::BEFORE_PROVIDER_HEADERS, Box::new(move |a, c| {
-            f(BeforeProviderHeadersEvent { headers: json(arg(a, 0)) }, c).into_raw()
-        }));
+        self.handlers.insert(
+            kind::BEFORE_PROVIDER_HEADERS,
+            Box::new(move |a, c| {
+                f(
+                    BeforeProviderHeadersEvent {
+                        headers: json(arg(a, 0)),
+                    },
+                    c,
+                )
+                .into_raw()
+            }),
+        );
     }
     /// `session_info_changed` (EXT-011) — notify-only (returns `()`). Payload
     /// [`SessionInfoChangedEvent`].
     pub fn on_session_info_changed(&mut self, f: impl Fn(SessionInfoChangedEvent, &Ctx) + 'static) {
         self.handlers.insert(
             kind::SESSION_INFO_CHANGED,
-            notify(move |a, c| f(SessionInfoChangedEvent { name: opt_str(arg(a, 0)) }, c)),
+            notify(move |a, c| {
+                f(
+                    SessionInfoChangedEvent {
+                        name: opt_str(arg(a, 0)),
+                    },
+                    c,
+                )
+            }),
         );
     }
     /// `resources_discover` — VETOABLE (returns [`Outcome`]): contribute skill/prompt/theme paths
@@ -950,10 +1048,19 @@ impl ExtensionApi {
         // EXT-016: `cwd` + `reason` (pi extensions/types.ts:544-548 @v0.83.0) — a
         // resource-contributing extension could not tell which directory it was discovering for,
         // nor startup from `/reload`, so it could not scope or cache its contribution.
-        self.handlers.insert(kind::RESOURCES_DISCOVER, Box::new(move |a, c| {
-            f(ResourcesDiscoverEvent { cwd: arg(a, 0).into(), reason: arg(a, 1).into() }, c)
+        self.handlers.insert(
+            kind::RESOURCES_DISCOVER,
+            Box::new(move |a, c| {
+                f(
+                    ResourcesDiscoverEvent {
+                        cwd: arg(a, 0).into(),
+                        reason: arg(a, 1).into(),
+                    },
+                    c,
+                )
                 .into_raw()
-        }));
+            }),
+        );
     }
     /// `project_trust` — VETOABLE (returns [`Outcome`]): decide whether `cwd` is trusted. The
     /// answer shape is [`ProjectTrustResult`], whose `trusted` is pi's TRI-STATE — `undecided`
@@ -962,61 +1069,100 @@ impl ExtensionApi {
     pub fn on_project_trust(&mut self, f: impl Fn(ProjectTrustEvent, &Ctx) -> Outcome + 'static) {
         // EXT-043: `cwd` (pi extensions/types.ts:519-522 @v0.83.0) — the key the trust store is
         // keyed by, so `remember` has a well-defined meaning from the handler's point of view.
-        self.handlers.insert(kind::PROJECT_TRUST, Box::new(move |a, c| {
-            f(ProjectTrustEvent { cwd: arg(a, 0).into() }, c).into_raw()
-        }));
+        self.handlers.insert(
+            kind::PROJECT_TRUST,
+            Box::new(move |a, c| {
+                f(
+                    ProjectTrustEvent {
+                        cwd: arg(a, 0).into(),
+                    },
+                    c,
+                )
+                .into_raw()
+            }),
+        );
     }
     /// `session_before_switch` — VETOABLE (returns [`Outcome`]): [`Outcome::block`] refuses the
     /// switch. Payload [`SessionBeforeSwitchEvent`].
-    pub fn on_session_before_switch(&mut self, f: impl Fn(SessionBeforeSwitchEvent, &Ctx) -> Outcome + 'static) {
-        self.handlers.insert(kind::SESSION_BEFORE_SWITCH, Box::new(move |a, c| {
-            f(
-                SessionBeforeSwitchEvent {
-                    reason: arg(a, 0).into(),
-                    target_session_file: opt_str(arg(a, 1)),
-                },
-                c,
-            )
-            .into_raw()
-        }));
+    pub fn on_session_before_switch(
+        &mut self,
+        f: impl Fn(SessionBeforeSwitchEvent, &Ctx) -> Outcome + 'static,
+    ) {
+        self.handlers.insert(
+            kind::SESSION_BEFORE_SWITCH,
+            Box::new(move |a, c| {
+                f(
+                    SessionBeforeSwitchEvent {
+                        reason: arg(a, 0).into(),
+                        target_session_file: opt_str(arg(a, 1)),
+                    },
+                    c,
+                )
+                .into_raw()
+            }),
+        );
     }
     /// `session_before_fork` — VETOABLE (returns [`Outcome`]): [`Outcome::block`] refuses the fork.
     /// Payload [`SessionBeforeForkEvent`].
-    pub fn on_session_before_fork(&mut self, f: impl Fn(SessionBeforeForkEvent, &Ctx) -> Outcome + 'static) {
-        self.handlers.insert(kind::SESSION_BEFORE_FORK, Box::new(move |a, c| {
-            f(
-                SessionBeforeForkEvent {
-                    entry_id: arg(a, 0).into(),
-                    position: arg(a, 1).into(),
-                },
-                c,
-            )
-            .into_raw()
-        }));
+    pub fn on_session_before_fork(
+        &mut self,
+        f: impl Fn(SessionBeforeForkEvent, &Ctx) -> Outcome + 'static,
+    ) {
+        self.handlers.insert(
+            kind::SESSION_BEFORE_FORK,
+            Box::new(move |a, c| {
+                f(
+                    SessionBeforeForkEvent {
+                        entry_id: arg(a, 0).into(),
+                        position: arg(a, 1).into(),
+                    },
+                    c,
+                )
+                .into_raw()
+            }),
+        );
     }
     /// `session_before_compact` — VETOABLE (returns [`Outcome`]): [`Outcome::block`] refuses the
     /// compaction, or [`Outcome::compaction_override`] supplies the summary instead of the model.
     /// Payload [`SessionBeforeCompactEvent`].
-    pub fn on_session_before_compact(&mut self, f: impl Fn(SessionBeforeCompactEvent, &Ctx) -> Outcome + 'static) {
-        self.handlers.insert(kind::SESSION_BEFORE_COMPACT, Box::new(move |a, c| {
-            let ev = SessionBeforeCompactEvent {
-                preparation: json(arg(a, 0)),
-                branch_entries: json(arg(a, 1)),
-                custom_instructions: opt_str(arg(a, 2)),
-                reason: arg(a, 3).into(),
-                will_retry: arg(a, 4) == "true",
-            };
-            f(ev, c).into_raw()
-        }));
+    pub fn on_session_before_compact(
+        &mut self,
+        f: impl Fn(SessionBeforeCompactEvent, &Ctx) -> Outcome + 'static,
+    ) {
+        self.handlers.insert(
+            kind::SESSION_BEFORE_COMPACT,
+            Box::new(move |a, c| {
+                let ev = SessionBeforeCompactEvent {
+                    preparation: json(arg(a, 0)),
+                    branch_entries: json(arg(a, 1)),
+                    custom_instructions: opt_str(arg(a, 2)),
+                    reason: arg(a, 3).into(),
+                    will_retry: arg(a, 4) == "true",
+                };
+                f(ev, c).into_raw()
+            }),
+        );
     }
     /// `session_before_tree` — VETOABLE (returns [`Outcome`]): [`Outcome::block`] refuses the
     /// branch summarization, or [`Outcome::tree_override`] overrides its
     /// summary/instructions/label.
     /// Payload [`SessionBeforeTreeEvent`].
-    pub fn on_session_before_tree(&mut self, f: impl Fn(SessionBeforeTreeEvent, &Ctx) -> Outcome + 'static) {
-        self.handlers.insert(kind::SESSION_BEFORE_TREE, Box::new(move |a, c| {
-            f(SessionBeforeTreeEvent { preparation: json(arg(a, 0)) }, c).into_raw()
-        }));
+    pub fn on_session_before_tree(
+        &mut self,
+        f: impl Fn(SessionBeforeTreeEvent, &Ctx) -> Outcome + 'static,
+    ) {
+        self.handlers.insert(
+            kind::SESSION_BEFORE_TREE,
+            Box::new(move |a, c| {
+                f(
+                    SessionBeforeTreeEvent {
+                        preparation: json(arg(a, 0)),
+                    },
+                    c,
+                )
+                .into_raw()
+            }),
+        );
     }
 
     // --- notify-only subscriptions (return ignored) ---
@@ -1024,12 +1170,23 @@ impl ExtensionApi {
     /// `agent_start` — notify-only: the handler returns `()`, which the SDK lowers to
     /// [`RawOutcome::Noop`]. Carries no payload, so the handler receives only the [`Ctx`].
     pub fn on_agent_start(&mut self, f: impl Fn(&Ctx) + 'static) {
-        self.handlers.insert(kind::AGENT_START, notify(move |_a, c| f(c)));
+        self.handlers
+            .insert(kind::AGENT_START, notify(move |_a, c| f(c)));
     }
     /// `agent_end` — notify-only (the handler returns `()`; the SDK reports [`RawOutcome::Noop`]).
     /// Payload [`AgentEndEvent`], the full final message list.
     pub fn on_agent_end(&mut self, f: impl Fn(AgentEndEvent, &Ctx) + 'static) {
-        self.handlers.insert(kind::AGENT_END, notify(move |a, c| f(AgentEndEvent { messages: json(arg(a, 0)) }, c)));
+        self.handlers.insert(
+            kind::AGENT_END,
+            notify(move |a, c| {
+                f(
+                    AgentEndEvent {
+                        messages: json(arg(a, 0)),
+                    },
+                    c,
+                )
+            }),
+        );
     }
     /// `agent_settled` — notify-only (returns `()`), and payload-free like
     /// [`Self::on_agent_start`]: the handler receives only the [`Ctx`].
@@ -1039,75 +1196,123 @@ impl ExtensionApi {
     /// automatic retry / post-run compaction / queued continuation has finished — unlike
     /// [`Self::on_agent_end`], which fires once per `agent.prompt`/`agent.continue`.
     pub fn on_agent_settled(&mut self, f: impl Fn(&Ctx) + 'static) {
-        self.handlers.insert(kind::AGENT_SETTLED, notify(move |_a, c| f(c)));
+        self.handlers
+            .insert(kind::AGENT_SETTLED, notify(move |_a, c| f(c)));
     }
     /// `turn_start` — notify-only (returns `()`). Payload [`TurnStartEvent`].
     pub fn on_turn_start(&mut self, f: impl Fn(TurnStartEvent, &Ctx) + 'static) {
-        self.handlers.insert(kind::TURN_START, notify(move |a, c| {
-            f(TurnStartEvent { turn_index: arg(a, 0).parse().unwrap_or(0), timestamp: arg(a, 1).parse().unwrap_or(0) }, c)
-        }));
+        self.handlers.insert(
+            kind::TURN_START,
+            notify(move |a, c| {
+                f(
+                    TurnStartEvent {
+                        turn_index: arg(a, 0).parse().unwrap_or(0),
+                        timestamp: arg(a, 1).parse().unwrap_or(0),
+                    },
+                    c,
+                )
+            }),
+        );
     }
     /// `turn_end` — notify-only (returns `()`). Payload [`TurnEndEvent`]: the finalized assistant
     /// message AND the tool results produced this turn.
     pub fn on_turn_end(&mut self, f: impl Fn(TurnEndEvent, &Ctx) + 'static) {
-        self.handlers.insert(kind::TURN_END, notify(move |a, c| {
-            f(
-                TurnEndEvent {
-                    turn_index: arg(a, 0).parse().unwrap_or(0),
-                    message: json(arg(a, 1)),
-                    tool_results: json(arg(a, 2)),
-                },
-                c,
-            )
-        }));
+        self.handlers.insert(
+            kind::TURN_END,
+            notify(move |a, c| {
+                f(
+                    TurnEndEvent {
+                        turn_index: arg(a, 0).parse().unwrap_or(0),
+                        message: json(arg(a, 1)),
+                        tool_results: json(arg(a, 2)),
+                    },
+                    c,
+                )
+            }),
+        );
     }
     /// `message_start` — notify-only (returns `()`). Payload [`MessageStartEvent`].
     pub fn on_message_start(&mut self, f: impl Fn(MessageStartEvent, &Ctx) + 'static) {
-        self.handlers.insert(kind::MESSAGE_START, notify(move |a, c| f(MessageStartEvent { message: json(arg(a, 0)) }, c)));
+        self.handlers.insert(
+            kind::MESSAGE_START,
+            notify(move |a, c| {
+                f(
+                    MessageStartEvent {
+                        message: json(arg(a, 0)),
+                    },
+                    c,
+                )
+            }),
+        );
     }
     /// `message_update` — notify-only (returns `()`) and HIGH-FREQ. Payload
     /// [`MessageUpdateEvent`]: the full in-flight message AND the provider delta.
     pub fn on_message_update(&mut self, f: impl Fn(MessageUpdateEvent, &Ctx) + 'static) {
-        self.handlers.insert(kind::MESSAGE_UPDATE, notify(move |a, c| {
-            f(MessageUpdateEvent { message: json(arg(a, 0)), assistant_message_event: json(arg(a, 1)) }, c)
-        }));
+        self.handlers.insert(
+            kind::MESSAGE_UPDATE,
+            notify(move |a, c| {
+                f(
+                    MessageUpdateEvent {
+                        message: json(arg(a, 0)),
+                        assistant_message_event: json(arg(a, 1)),
+                    },
+                    c,
+                )
+            }),
+        );
     }
     /// `tool_execution_start` — notify-only (returns `()`). Payload [`ToolExecStartEvent`]; the
     /// vetoable seam for a tool invocation is [`Self::on_tool_call`].
     pub fn on_tool_exec_start(&mut self, f: impl Fn(ToolExecStartEvent, &Ctx) + 'static) {
-        self.handlers.insert(kind::TOOL_EXEC_START, notify(move |a, c| {
-            f(ToolExecStartEvent { call_id: arg(a, 0).into(), name: arg(a, 1).into(), args: json(arg(a, 2)) }, c)
-        }));
+        self.handlers.insert(
+            kind::TOOL_EXEC_START,
+            notify(move |a, c| {
+                f(
+                    ToolExecStartEvent {
+                        call_id: arg(a, 0).into(),
+                        name: arg(a, 1).into(),
+                        args: json(arg(a, 2)),
+                    },
+                    c,
+                )
+            }),
+        );
     }
     /// `tool_execution_update` — notify-only (returns `()`) and HIGH-FREQ. Payload
     /// [`ToolExecUpdateEvent`], which carries the streamed `chunk`.
     pub fn on_tool_exec_update(&mut self, f: impl Fn(ToolExecUpdateEvent, &Ctx) + 'static) {
-        self.handlers.insert(kind::TOOL_EXEC_UPDATE, notify(move |a, c| {
-            f(
-                ToolExecUpdateEvent {
-                    call_id: arg(a, 0).into(),
-                    name: arg(a, 1).into(),
-                    args: json(arg(a, 2)),
-                    chunk: json(arg(a, 3)),
-                },
-                c,
-            )
-        }));
+        self.handlers.insert(
+            kind::TOOL_EXEC_UPDATE,
+            notify(move |a, c| {
+                f(
+                    ToolExecUpdateEvent {
+                        call_id: arg(a, 0).into(),
+                        name: arg(a, 1).into(),
+                        args: json(arg(a, 2)),
+                        chunk: json(arg(a, 3)),
+                    },
+                    c,
+                )
+            }),
+        );
     }
     /// `tool_execution_end` — notify-only (returns `()`). Payload [`ToolExecEndEvent`]; the
     /// vetoable seam for the finished result is [`Self::on_tool_result`].
     pub fn on_tool_exec_end(&mut self, f: impl Fn(ToolExecEndEvent, &Ctx) + 'static) {
-        self.handlers.insert(kind::TOOL_EXEC_END, notify(move |a, c| {
-            f(
-                ToolExecEndEvent {
-                    call_id: arg(a, 0).into(),
-                    name: arg(a, 1).into(),
-                    result: json(arg(a, 2)),
-                    is_error: arg(a, 3) == "true",
-                },
-                c,
-            )
-        }));
+        self.handlers.insert(
+            kind::TOOL_EXEC_END,
+            notify(move |a, c| {
+                f(
+                    ToolExecEndEvent {
+                        call_id: arg(a, 0).into(),
+                        name: arg(a, 1).into(),
+                        result: json(arg(a, 2)),
+                        is_error: arg(a, 3) == "true",
+                    },
+                    c,
+                )
+            }),
+        );
     }
     /// `session_start` — notify-only (returns `()`). Payload [`SessionLifecycleEvent`], whose
     /// `reason` includes `"reload"` and whose `session_file` is pi's `previousSessionFile`.
@@ -1143,10 +1348,22 @@ impl ExtensionApi {
     }
     /// `after_provider_response` — notify-only (returns `()`). Payload
     /// [`AfterProviderResponseEvent`]: the HTTP status + response headers.
-    pub fn on_after_provider_response(&mut self, f: impl Fn(AfterProviderResponseEvent, &Ctx) + 'static) {
-        self.handlers.insert(kind::AFTER_PROVIDER_RESPONSE, notify(move |a, c| {
-            f(AfterProviderResponseEvent { status: arg(a, 0).parse().unwrap_or(0), headers: json(arg(a, 1)) }, c)
-        }));
+    pub fn on_after_provider_response(
+        &mut self,
+        f: impl Fn(AfterProviderResponseEvent, &Ctx) + 'static,
+    ) {
+        self.handlers.insert(
+            kind::AFTER_PROVIDER_RESPONSE,
+            notify(move |a, c| {
+                f(
+                    AfterProviderResponseEvent {
+                        status: arg(a, 0).parse().unwrap_or(0),
+                        headers: json(arg(a, 1)),
+                    },
+                    c,
+                )
+            }),
+        );
     }
     /// `model_select` — notify-only (returns `()`). Payload [`ModelSelectEvent`]: the new model,
     /// the previous one, and the `source` of the change.
@@ -1166,7 +1383,10 @@ impl ExtensionApi {
         );
     }
     /// `thinking_level_select` — notify-only (returns `()`). Payload [`ThinkingLevelSelectEvent`].
-    pub fn on_thinking_level_select(&mut self, f: impl Fn(ThinkingLevelSelectEvent, &Ctx) + 'static) {
+    pub fn on_thinking_level_select(
+        &mut self,
+        f: impl Fn(ThinkingLevelSelectEvent, &Ctx) + 'static,
+    ) {
         self.handlers.insert(
             kind::THINKING_LEVEL_SELECT,
             notify(move |a, c| {
@@ -1187,20 +1407,33 @@ impl ExtensionApi {
         // The host seam supplies the full Pi shape: the produced compaction entry, whether an
         // extension drove it, the trigger reason, and the retry flag (L4 gap #5, wired through the
         // cyrup-session-svc producer).
-        self.handlers.insert(kind::SESSION_COMPACT, notify(move |a, c| {
-            let ev = SessionCompactEvent {
-                compaction_entry: json(arg(a, 0)),
-                from_extension: arg(a, 1) == "true",
-                reason: arg(a, 2).into(),
-                will_retry: arg(a, 3) == "true",
-            };
-            f(ev, c)
-        }));
+        self.handlers.insert(
+            kind::SESSION_COMPACT,
+            notify(move |a, c| {
+                let ev = SessionCompactEvent {
+                    compaction_entry: json(arg(a, 0)),
+                    from_extension: arg(a, 1) == "true",
+                    reason: arg(a, 2).into(),
+                    will_retry: arg(a, 3) == "true",
+                };
+                f(ev, c)
+            }),
+        );
     }
     /// `session_tree` — notify-only (returns `()`). Payload [`SessionTreeEvent`]; the vetoable seam
     /// is [`Self::on_session_before_tree`].
     pub fn on_session_tree(&mut self, f: impl Fn(SessionTreeEvent, &Ctx) + 'static) {
-        self.handlers.insert(kind::SESSION_TREE, notify(move |a, c| f(SessionTreeEvent { tree: json(arg(a, 0)) }, c)));
+        self.handlers.insert(
+            kind::SESSION_TREE,
+            notify(move |a, c| {
+                f(
+                    SessionTreeEvent {
+                        tree: json(arg(a, 0)),
+                    },
+                    c,
+                )
+            }),
+        );
     }
 
     // --- dispatch + subscription bitset ---

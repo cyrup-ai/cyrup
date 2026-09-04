@@ -69,18 +69,18 @@
 //! *Provenance: upstream is `pi-mcp-adapter` v2.25.0; every citation below is `file:line` at that
 //! tag.*
 
-pub mod constants;
-pub mod error_vocab;
-pub mod tool_metadata;
-pub mod ranking;
-pub mod env;
-pub mod results;
-pub mod discovery;
+pub mod approval;
 pub mod auth;
 pub mod call;
+pub mod constants;
 pub mod description;
+pub mod discovery;
+pub mod env;
+pub mod error_vocab;
+pub mod ranking;
+pub mod results;
 pub mod tool;
-pub mod approval;
+pub mod tool_metadata;
 
 /// Fixtures shared by more than one submodule's tests (the crate's
 /// `exec/testsupport.rs` convention).
@@ -92,21 +92,26 @@ pub(crate) mod testsupport;
 // `build_proxy_description` and `extension.rs`'s `INIT_WAIT_TIMEOUT_MS` — so the split is
 // invisible outside this directory.
 
-pub use constants::*;
-pub use error_vocab::*;
-pub use tool_metadata::*;
-pub use ranking::*;
-pub use env::*;
-pub use results::*;
-pub use discovery::*;
+pub use approval::*;
 pub use auth::*;
 pub use call::*;
+pub use constants::*;
 pub use description::*;
+pub use discovery::*;
+pub use env::*;
+pub use error_vocab::*;
+pub use ranking::*;
+pub use results::*;
 pub use tool::*;
-pub use approval::*;
+pub use tool_metadata::*;
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 
@@ -127,12 +132,14 @@ mod tests {
 
         // `utils.ts:265-267` — `.length` / `.slice` are UTF-16 code units. An astral-plane
         // character is two units, so a four-unit budget takes exactly two emoji.
-        assert_eq!(truncate_at_word("\u{1f600}\u{1f600}\u{1f600}", 4), "\u{1f600}\u{1f600}...");
+        assert_eq!(
+            truncate_at_word("\u{1f600}\u{1f600}\u{1f600}", 4),
+            "\u{1f600}\u{1f600}..."
+        );
         // The `lastSpace > target * 0.6` word cut, and the below-threshold hard cut.
         assert_eq!(truncate_at_word("hello world again", 12), "hello world...");
         assert_eq!(truncate_at_word("a bbbbbbbbbbbb", 10), "a bbbbbbbb...");
         // Short enough is returned untouched, with no ellipsis.
         assert_eq!(truncate_at_word("short", 10), "short");
     }
-
 }

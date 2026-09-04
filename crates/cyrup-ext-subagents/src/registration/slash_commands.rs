@@ -137,9 +137,7 @@ impl SlashCommandName {
             SlashCommandName::SubagentsModels => "subagents-models",
             SlashCommandName::SubagentsProfiles => "subagents-profiles",
             SlashCommandName::SubagentsLoadProfile => "subagents-load-profile",
-            SlashCommandName::SubagentsRefreshProviderModels => {
-                "subagents-refresh-provider-models"
-            }
+            SlashCommandName::SubagentsRefreshProviderModels => "subagents-refresh-provider-models",
             SlashCommandName::SubagentsGenerateProfiles => "subagents-generate-profiles",
             SlashCommandName::SubagentsCheckProfile => "subagents-check-profile",
             SlashCommandName::PromptWorkflow => "prompt-workflow",
@@ -155,7 +153,10 @@ impl SlashCommandName {
     /// "exact string equality only, no fuzzy matching" convention applied here to command names).
     #[must_use]
     pub fn from_str_exact(name: &str) -> Option<Self> {
-        SLASH_COMMANDS.iter().find(|d| d.name.as_str() == name).map(|d| d.name)
+        SLASH_COMMANDS
+            .iter()
+            .find(|d| d.name.as_str() == name)
+            .map(|d| d.name)
     }
 }
 
@@ -657,7 +658,8 @@ fn match_quoted_trailing_task(token: &str) -> Option<(&str, Option<String>)> {
             continue;
         }
         let after_agent = token.get(agent_end..).unwrap_or_default().trim_start();
-        if !after_agent.starts_with(quote) || !after_agent.ends_with(quote) || after_agent.len() < 2 {
+        if !after_agent.starts_with(quote) || !after_agent.ends_with(quote) || after_agent.len() < 2
+        {
             continue;
         }
         let Some(inner) = after_agent.get(1..after_agent.len() - 1) else {
@@ -730,7 +732,10 @@ fn find_top_level_delimiter(input: &str, delimiter: &str) -> Option<usize> {
             b'\'' => in_single = true,
             b'"' => in_double = true,
             _ => {
-                if bytes.get(i..).is_some_and(|rest| rest.starts_with(delim_bytes)) {
+                if bytes
+                    .get(i..)
+                    .is_some_and(|rest| rest.starts_with(delim_bytes))
+                {
                     return Some(i);
                 }
             }
@@ -1057,7 +1062,10 @@ pub fn parse_group_segment(segment: &str) -> Result<ParsedChainElement, SlashPar
         ));
     }
     Ok(ParsedChainElement::Group {
-        tasks: raw_parts.iter().map(|p| parse_single_task_token(p)).collect(),
+        tasks: raw_parts
+            .iter()
+            .map(|p| parse_single_task_token(p))
+            .collect(),
         config,
     })
 }
@@ -1069,7 +1077,9 @@ pub fn parse_group_segment(segment: &str) -> Result<ParsedChainElement, SlashPar
 /// segment.
 #[must_use]
 pub fn has_group_syntax(input: &str) -> bool {
-    split_on_arrow(input).iter().any(|seg| seg.trim_start().starts_with('('))
+    split_on_arrow(input)
+        .iter()
+        .any(|seg| seg.trim_start().starts_with('('))
 }
 
 /// The fully parsed `/chain` expression: an ordered list of steps/groups (R-SA-129's `(a |
@@ -1380,9 +1390,7 @@ pub fn parse_agent_args(
         AgentArgsCommand::Parallel => {
             let any_step_has_task = steps.iter().any(|s| s.task.is_some());
             if !any_step_has_task && shared_task.is_empty() {
-                return Err(SlashParseError::new(
-                    "At least one step must have a task",
-                ));
+                return Err(SlashParseError::new("At least one step must have a task"));
             }
         }
     }
@@ -1430,8 +1438,7 @@ pub fn parse_chain_command(raw_args: &str) -> Result<ParsedChainCommand, SlashPa
             .iter()
             .enumerate()
             .map(|(i, step)| {
-                step_token_to_spec(step, fallback, i == 0, false)
-                    .map(RunnerStep::SingleStep)
+                step_token_to_spec(step, fallback, i == 0, false).map(RunnerStep::SingleStep)
             })
             .collect::<Result<Vec<_>, _>>()?;
         return Ok(ParsedChainCommand {
@@ -1465,9 +1472,10 @@ pub fn parse_chain_command(raw_args: &str) -> Result<ParsedChainCommand, SlashPa
     }
 
     let shared_task = match expression.elements.first() {
-        Some(ParsedChainElement::Group { tasks, .. }) => {
-            tasks.iter().find_map(|t| t.task.clone()).unwrap_or_default()
-        }
+        Some(ParsedChainElement::Group { tasks, .. }) => tasks
+            .iter()
+            .find_map(|t| t.task.clone())
+            .unwrap_or_default(),
         Some(ParsedChainElement::Step(step)) => step.task.clone().unwrap_or_default(),
         None => String::new(),
     };
@@ -1609,7 +1617,11 @@ pub fn parse_run_chain_command(raw_args: &str) -> Result<ParsedRunChainCommand, 
     let Some(delim_idx) = find_top_level_delimiter(&cleaned, " -- ") else {
         return Err(SlashParseError::new(usage));
     };
-    let chain_name = cleaned.get(..delim_idx).unwrap_or_default().trim().to_string();
+    let chain_name = cleaned
+        .get(..delim_idx)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     let task = cleaned
         .get(delim_idx + 4..)
         .unwrap_or_default()
@@ -2244,9 +2256,8 @@ mod tests {
 
     #[test]
     fn parse_group_segment_with_options_suffix() {
-        let group =
-            parse_group_segment("(scout \"a\" | writer \"b\")[concurrency=2,worktree]")
-                .expect("parses");
+        let group = parse_group_segment("(scout \"a\" | writer \"b\")[concurrency=2,worktree]")
+            .expect("parses");
         match group {
             ParsedChainElement::Group { config, .. } => {
                 assert_eq!(config.concurrency, Some(2));
@@ -2270,8 +2281,8 @@ mod tests {
 
     #[test]
     fn parse_group_segment_rejects_malformed_options_suffix() {
-        let err =
-            parse_group_segment("(scout \"a\" | writer \"b\") concurrency=2").expect_err("must fail");
+        let err = parse_group_segment("(scout \"a\" | writer \"b\") concurrency=2")
+            .expect_err("must fail");
         assert!(err.message.contains("wrapped in [...]"));
     }
 
@@ -2322,8 +2333,8 @@ mod tests {
 
     #[test]
     fn parse_chain_expression_group_first() {
-        let expr =
-            parse_chain_expression("(scout \"a\" | writer \"b\") -> reviewer \"c\"").expect("parses");
+        let expr = parse_chain_expression("(scout \"a\" | writer \"b\") -> reviewer \"c\"")
+            .expect("parses");
         assert_eq!(expr.elements.len(), 2);
         assert!(matches!(expr.elements[0], ParsedChainElement::Group { .. }));
     }
@@ -2496,10 +2507,9 @@ mod tests {
 
     #[test]
     fn parse_chain_command_with_inline_group_produces_parallel_group_step() {
-        let parsed = parse_chain_command(
-            "scout \"a\" -> (writer \"b\" | reviewer \"c\") -> planner \"d\"",
-        )
-        .expect("ok");
+        let parsed =
+            parse_chain_command("scout \"a\" -> (writer \"b\" | reviewer \"c\") -> planner \"d\"")
+                .expect("ok");
         assert_eq!(parsed.chain.len(), 3);
         assert!(matches!(parsed.chain[0], RunnerStep::SingleStep(_)));
         match &parsed.chain[1] {
@@ -2541,7 +2551,10 @@ mod tests {
     fn parse_chain_command_group_task_without_its_own_task_errors() {
         let err = parse_chain_command("scout \"a\" -> (writer \"b\" | reviewer)")
             .expect_err("reviewer has no task of its own inside the group");
-        assert!(err.message.contains("Each task in a parallel group needs a task"));
+        assert!(
+            err.message
+                .contains("Each task in a parallel group needs a task")
+        );
     }
 
     #[test]
@@ -2716,5 +2729,4 @@ mod tests {
             .expect_err("no provider given");
         assert!(err.message.starts_with("Usage:"));
     }
-
 }

@@ -68,7 +68,7 @@
 //! drains stderr, closes exactly once and leaves no surviving process.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -87,8 +87,9 @@ use crate::abort::{abortable, throw_if_aborted};
 use crate::config::ServerEntry;
 use crate::errors::{McpError, McpResult};
 use crate::lifecycle::{ConnectionHandle, ConnectionStatus, ServerConnectionRef};
-use crate::runtime::{append_stderr_tail, build_request_options, normalize_request_timeout_ms,
-    stderr_tail_detail};
+use crate::runtime::{
+    append_stderr_tail, build_request_options, normalize_request_timeout_ms, stderr_tail_detail,
+};
 
 // =================================================================================================
 // Byte-exact strings (`server-manager.ts`)
@@ -145,8 +146,10 @@ pub fn server_not_connected_message(name: &str) -> String {
 /// [`CONNECTION_CLEANUP_FAILED`] head with the thrown message as its single child, and
 /// `containsCleanupFailure` returns `true` for it and `false` for a plain `Error` carrying the same
 /// text.
-pub use crate::errors::{CONNECTION_ABORT_CLEANUP_FAILED, CONNECTION_CLEANUP_FAILED,
-    CONNECTION_SETUP_FAILED, HTTP_CONNECTION_CLEANUP_FAILED, MANAGER_CLEANUP_FAILED};
+pub use crate::errors::{
+    CONNECTION_ABORT_CLEANUP_FAILED, CONNECTION_CLEANUP_FAILED, CONNECTION_SETUP_FAILED,
+    HTTP_CONNECTION_CLEANUP_FAILED, MANAGER_CLEANUP_FAILED,
+};
 
 /// `MAX_CAPTURED_STDERR_BYTES` / `MAX_CAPTURED_STDERR_LINES` live in [`crate::runtime`]; re-exported
 /// so a reader of this file finds the tail policy the stderr pump enforces.
@@ -264,12 +267,12 @@ impl std::fmt::Display for ManagerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ManagerError::Mcp(error) => write!(f, "{error}"),
-            ManagerError::Aggregate { head, children } => f.write_str(
-                &crate::errors::render_aggregate_texts(
+            ManagerError::Aggregate { head, children } => {
+                f.write_str(&crate::errors::render_aggregate_texts(
                     head,
                     children.iter().map(std::string::ToString::to_string),
-                ),
-            ),
+                ))
+            }
         }
     }
 }
@@ -642,9 +645,9 @@ impl StdioChildConnection {
             let sink = Arc::clone(&tail);
             // `tokio::spawn` panics off-runtime and this crate denies `clippy::panic`; no runtime
             // means no drain, which degrades the tail rather than the connection.
-            tokio::runtime::Handle::try_current().ok().map(|handle| {
-                handle.spawn(async move { drain_stderr(stderr, sink).await })
-            })
+            tokio::runtime::Handle::try_current()
+                .ok()
+                .map(|handle| handle.spawn(async move { drain_stderr(stderr, sink).await }))
         });
         Arc::new(Self {
             process: tokio::sync::Mutex::new(Some(process)),
@@ -666,7 +669,9 @@ async fn drain_stderr(mut stderr: ChildStderr, tail: Arc<Mutex<VecDeque<u8>>>) {
         match stderr.read(&mut buffer).await {
             Ok(0) | Err(_) => return,
             Ok(read) => {
-                let Some(chunk) = buffer.get(..read) else { return };
+                let Some(chunk) = buffer.get(..read) else {
+                    return;
+                };
                 let mut tail = tail.lock().unwrap_or_else(PoisonError::into_inner);
                 append_stderr_tail(&mut tail, chunk);
             }
@@ -791,7 +796,9 @@ impl ConnectionResource for InertResource {
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 const STATUS_CONNECTED: u8 = 0;
@@ -1064,7 +1071,10 @@ impl ServerConnection {
 
     /// `connection.resources = resources`.
     pub fn set_resources(&self, resources: Vec<Resource>) {
-        *self.resources.lock().unwrap_or_else(PoisonError::into_inner) = resources;
+        *self
+            .resources
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = resources;
     }
 
     /// `connection.prompts`.
@@ -1547,11 +1557,17 @@ impl McpServerManager {
     /// the tuple is still a tuple: §5 replaces it with `ElicitationConfig` so the completion notice
     /// ([`url_elicitation_complete_notice`]) gets the `notify` route MCP-469 needs.
     pub fn set_elicitation_config(&self, elicitation: Option<crate::runtime::ElicitationConfig>) {
-        *self.elicitation.lock().unwrap_or_else(PoisonError::into_inner) = elicitation;
+        *self
+            .elicitation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = elicitation;
     }
 
     /// `setMetadataListChangedListener(listener)`.
-    pub fn set_metadata_list_changed_listener(&self, listener: Option<MetadataListChangedListener>) {
+    pub fn set_metadata_list_changed_listener(
+        &self,
+        listener: Option<MetadataListChangedListener>,
+    ) {
         *self
             .metadata_listener
             .lock()
@@ -1635,7 +1651,10 @@ impl McpServerManager {
     /// write one cache. Set once by [`crate::runtime::initialize_mcp`], beside the provider it
     /// builds from the same handle.
     pub fn set_auth_store(&self, store: crate::credentials::McpAuthStore) {
-        *self.auth_store.lock().unwrap_or_else(PoisonError::into_inner) = Some(store);
+        *self
+            .auth_store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(store);
     }
 
     /// The generation's credential vault, when one has been published.
@@ -1713,7 +1732,11 @@ impl McpServerManager {
     /// request by dropping its future — so it stays in the `abortable(..)` wrapper around each call.
     #[must_use]
     pub fn get_request_options(&self, name: &str) -> Option<PeerRequestOptions> {
-        let definition = self.tables().connections.get(name).map(|connection| Arc::clone(connection.definition()));
+        let definition = self
+            .tables()
+            .connections
+            .get(name)
+            .map(|connection| Arc::clone(connection.definition()));
         let global = *self
             .default_request_timeout_ms
             .lock()
@@ -1916,7 +1939,10 @@ impl McpServerManager {
                 let combined = crate::abort::combine(&runtime, Some(&scope));
                 (combined, SignalScope::new(Some(scope)))
             }
-            (Some(runtime), None) => (crate::abort::combine(&runtime, None), SignalScope::new(None)),
+            (Some(runtime), None) => (
+                crate::abort::combine(&runtime, None),
+                SignalScope::new(None),
+            ),
             (None, Some(cancel)) => (cancel.clone(), SignalScope::new(None)),
             (None, None) => (CancelToken::new(), SignalScope::new(None)),
         }
@@ -2071,10 +2097,11 @@ impl McpServerManager {
                 // `createConnection` with `false, true, true` — the flag rides on the connection
                 // record and is fed back in, so the credential cache is discarded at most once per
                 // episode.
-                let credentials_invalidated = tables.connections.get(name).is_some_and(|existing| {
-                    existing.status() == ConnectionStatus::NeedsAuth
-                        && existing.credentials_invalidated()
-                });
+                let credentials_invalidated =
+                    tables.connections.get(name).is_some_and(|existing| {
+                        existing.status() == ConnectionStatus::NeedsAuth
+                            && existing.credentials_invalidated()
+                    });
                 let generation = tables.close_generations.get(name).copied().unwrap_or(0);
 
                 let promise: ConnectFuture = {
@@ -2091,7 +2118,10 @@ impl McpServerManager {
                     let definition_for_record = Arc::clone(&definition);
                     async move {
                         let created = factory.create(request).await.map_err(ManagerError::mcp)?;
-                        Ok(ServerConnection::from_created(definition_for_record, created))
+                        Ok(ServerConnection::from_created(
+                            definition_for_record,
+                            created,
+                        ))
                     }
                     .boxed()
                     .shared()
@@ -2191,7 +2221,9 @@ impl McpServerManager {
                             crate::abort::ABORTED_FALLBACK_REASON.to_string(),
                         )));
                     }
-                    return Err(ManagerError::other(connection_closed_while_connecting(&name)));
+                    return Err(ManagerError::other(connection_closed_while_connecting(
+                        &name,
+                    )));
                 }
 
                 // MEASURED divergence, deliberate: upstream overwrites a `closed`/`needs-auth`
@@ -2426,7 +2458,10 @@ impl McpServerManager {
     /// Used by `connect_inner`'s tail, which disposes a connection belonging to a generation that
     /// has already been closed. Registering is the whole point: an unregistered dispose is
     /// invisible to `close_all`, which then returns `Ok` over a live child.
-    async fn dispose_registered(self: &Arc<Self>, connection: &Arc<ServerConnection>) -> ManagerResult<()> {
+    async fn dispose_registered(
+        self: &Arc<Self>,
+        connection: &Arc<ServerConnection>,
+    ) -> ManagerResult<()> {
         let ticket = self.close_ticket();
         let disposing: CloseFuture = {
             let manager = Arc::clone(self);
@@ -2441,7 +2476,9 @@ impl McpServerManager {
             .boxed()
             .shared()
         };
-        self.tables().tail_disposes.insert(ticket, disposing.clone());
+        self.tables()
+            .tail_disposes
+            .insert(ticket, disposing.clone());
         disposing.await
     }
 
@@ -2451,7 +2488,10 @@ impl McpServerManager {
         // between them slips through both fences.
         let attempt = {
             let mut tables = self.tables();
-            let generation = tables.close_generations.entry(name.to_string()).or_insert(0);
+            let generation = tables
+                .close_generations
+                .entry(name.to_string())
+                .or_insert(0);
             *generation = generation.saturating_add(1);
             tables.pending_metadata_publications.remove(name);
             tables.connect_attempts.get(name).map(Arc::clone)
@@ -2649,7 +2689,12 @@ impl McpServerManager {
             }
             let attempts: Vec<(String, Option<Arc<AbortHandle>>)> = names
                 .iter()
-                .map(|name| (name.clone(), tables.connect_attempts.get(name).map(Arc::clone)))
+                .map(|name| {
+                    (
+                        name.clone(),
+                        tables.connect_attempts.get(name).map(Arc::clone),
+                    )
+                })
                 .collect();
             let pending: Vec<ConnectFuture> = tables.connect_promises.values().cloned().collect();
             let current: Vec<String> = tables.connections.keys().cloned().collect();
@@ -2840,7 +2885,11 @@ impl McpServerManager {
     /// is named at [`crate::lifecycle::ManagerSupervisor`], whose `refresh_tools` arm fails closed
     /// until MCP-120 lands. Nothing is lost meanwhile, because the only queue-filler
     /// ([`Self::queue_metadata_publication`]) is itself unreachable.
-    pub fn retry_pending_metadata_publication(&self, name: &str, connection: &Arc<ServerConnection>) {
+    pub fn retry_pending_metadata_publication(
+        &self,
+        name: &str,
+        connection: &Arc<ServerConnection>,
+    ) {
         let (listener, reason) = {
             let tables = self.tables();
             let Some(pending) = tables.pending_metadata_publications.get(name) else {
@@ -2949,7 +2998,7 @@ impl McpServerManager {
                 Ok(result) => match result.action {
                     rmcp::model::ElicitationAction::Accept => {}
                     rmcp::model::ElicitationAction::Decline => {
-                        return UrlElicitationAction::Decline
+                        return UrlElicitationAction::Decline;
                     }
                     _ => return UrlElicitationAction::Cancel,
                 },
@@ -3074,8 +3123,10 @@ pub const CONNECTION_CLOSED_PROTOCOL_CODE: i32 = -32000;
 /// `SERVER_NOT_INITIALIZED_MCP_MESSAGES` (`session-recovery.ts:42-45`) — **two** members, and the
 /// 400 regex below matches only the longer one. MEASURED: a 400 whose body carries the short message
 /// is *not* a terminated session, while a `ProtocolError` carrying it *is*.
-pub const SERVER_NOT_INITIALIZED_MCP_MESSAGES: [&str; 2] =
-    ["Server not initialized", "Bad Request: Server not initialized"];
+pub const SERVER_NOT_INITIALIZED_MCP_MESSAGES: [&str; 2] = [
+    "Server not initialized",
+    "Bad Request: Server not initialized",
+];
 
 /// `/"code"\s*:\s*-32000/` and `/"message"\s*:\s*"Bad Request: Server not initialized"/`.
 static TERMINATED_400_MARKERS: std::sync::LazyLock<Option<(regex::Regex, regex::Regex)>> =
@@ -3130,7 +3181,10 @@ pub struct TerminatedSessionEvidence<'a> {
 /// The two arms are disjoint: MEASURED, `SdkHttpError` is **not** an `instanceof ProtocolError` in
 /// the SDK, so the protocol arm cannot catch an HTTP error that fell through the first.
 #[must_use]
-pub fn is_terminated_session(evidence: &TerminatedSessionEvidence<'_>, had_session_id: bool) -> bool {
+pub fn is_terminated_session(
+    evidence: &TerminatedSessionEvidence<'_>,
+    had_session_id: bool,
+) -> bool {
     if !had_session_id {
         return false;
     }
@@ -3235,7 +3289,9 @@ pub fn manager_handler_factory(manager: Weak<McpServerManager>) -> crate::runtim
             runtime_signal: runtime_signal.clone(),
             elicitation_mode: elicitation.as_ref().map(|config| config.mode),
             sampling,
-            elicitation: elicitation.as_ref().map(|config| Arc::clone(&config.handler)),
+            elicitation: elicitation
+                .as_ref()
+                .map(|config| Arc::clone(&config.handler)),
             list_changed: None,
             elicitation_complete: complete,
         })
@@ -3251,7 +3307,9 @@ const URL_ELICITATION_REQUIRED_CODE: i32 = -32042;
 /// A payload that does not parse yields an EMPTY list, which makes
 /// [`McpServerManager::handle_url_elicitation_required`] return `Accept` having opened nothing — the
 /// same answer upstream's empty `error.elicitations` gives.
-fn decode_url_elicitations(error: &rmcp::model::ErrorData) -> Vec<rmcp::model::ElicitRequestParams> {
+fn decode_url_elicitations(
+    error: &rmcp::model::ErrorData,
+) -> Vec<rmcp::model::ElicitRequestParams> {
     if error.code.0 != URL_ELICITATION_REQUIRED_CODE {
         return Vec::new();
     }
@@ -3282,7 +3340,6 @@ pub fn url_elicitation_complete_notice(server: &str) -> String {
     format!("MCP browser interaction for {server} completed. You can retry the tool now.")
 }
 
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -3303,7 +3360,11 @@ mod tests {
         // Negative control: nothing installed, so nothing is advertised and `create_message`
         // answers METHOD_NOT_FOUND.
         assert!(
-            factory("fixture", &token).info().capabilities.sampling.is_none(),
+            factory("fixture", &token)
+                .info()
+                .capabilities
+                .sampling
+                .is_none(),
             "an empty slot must advertise no sampling capability"
         );
 
@@ -3312,14 +3373,22 @@ mod tests {
         })));
 
         assert!(
-            factory("fixture", &token).info().capabilities.sampling.is_some(),
+            factory("fixture", &token)
+                .info()
+                .capabilities
+                .sampling
+                .is_some(),
             "the same factory must pick up a slot written after it was built"
         );
 
         // And back again — `close_all` nulls the slot, and a connect after it must not advertise.
         manager.set_sampling_config(None);
         assert!(
-            factory("fixture", &token).info().capabilities.sampling.is_none(),
+            factory("fixture", &token)
+                .info()
+                .capabilities
+                .sampling
+                .is_none(),
             "a nulled slot must stop advertising"
         );
     }
@@ -3338,7 +3407,11 @@ mod tests {
         };
         let token = CancelToken::new();
         assert!(
-            factory("fixture", &token).info().capabilities.sampling.is_none(),
+            factory("fixture", &token)
+                .info()
+                .capabilities
+                .sampling
+                .is_none(),
             "an upgrade failure must not advertise the dead generation's hooks"
         );
     }
@@ -3431,7 +3504,10 @@ mod tests {
     }
 
     impl ConnectionFactory for ScriptedFactory {
-        fn create(&self, request: CreateConnection) -> BoxFuture<'static, McpResult<NewConnection>> {
+        fn create(
+            &self,
+            request: CreateConnection,
+        ) -> BoxFuture<'static, McpResult<NewConnection>> {
             self.calls
                 .lock()
                 .unwrap()
@@ -3477,7 +3553,10 @@ mod tests {
     struct FailingCloseFactory;
 
     impl ConnectionFactory for FailingCloseFactory {
-        fn create(&self, _request: CreateConnection) -> BoxFuture<'static, McpResult<NewConnection>> {
+        fn create(
+            &self,
+            _request: CreateConnection,
+        ) -> BoxFuture<'static, McpResult<NewConnection>> {
             Box::pin(async move {
                 Ok(NewConnection {
                     resource: Arc::new(FailingResource),
@@ -3538,7 +3617,10 @@ mod tests {
             async move { manager.connect("s", &entry(), None).await }
         });
         settle().await;
-        assert!(manager.is_connecting("s"), "`isConnecting` is `connectPromises.has(name)`");
+        assert!(
+            manager.is_connecting("s"),
+            "`isConnecting` is `connectPromises.has(name)`"
+        );
         let b = tokio::spawn({
             let manager = Arc::clone(&manager);
             async move { manager.connect("s", &entry(), None).await }
@@ -3547,8 +3629,15 @@ mod tests {
         gate.open();
 
         let (a, b) = (a.await.unwrap().unwrap(), b.await.unwrap().unwrap());
-        assert_eq!(factory.call_count(), 1, "the second caller must be deduped, not raced");
-        assert!(Arc::ptr_eq(&a, &b), "both callers share one connection object");
+        assert_eq!(
+            factory.call_count(),
+            1,
+            "the second caller must be deduped, not raced"
+        );
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "both callers share one connection object"
+        );
         assert!(!manager.is_connecting("s"), "the `finally` clears the slot");
     }
 
@@ -3598,10 +3687,16 @@ mod tests {
             );
             let first = connections.first().unwrap();
             assert!(
-                connections.iter().all(|connection| Arc::ptr_eq(connection, first)),
+                connections
+                    .iter()
+                    .all(|connection| Arc::ptr_eq(connection, first)),
                 "round {round}: and every racer receives the same connection object"
             );
-            assert_eq!(factory.total_closes(), 0, "round {round}: nothing was built to throw away");
+            assert_eq!(
+                factory.total_closes(),
+                0,
+                "round {round}: nothing was built to throw away"
+            );
         }
     }
 
@@ -3629,14 +3724,21 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        assert!(manager.is_connecting("s"), "the winner registered its attempt");
+        assert!(
+            manager.is_connecting("s"),
+            "the winner registered its attempt"
+        );
 
         let deduped = tokio::spawn({
             let manager = Arc::clone(&manager);
             async move { manager.connect("s", &entry(), None).await }
         });
         settle().await;
-        assert_eq!(factory.call_count(), 1, "the second caller deduped onto the first attempt");
+        assert_eq!(
+            factory.call_count(),
+            1,
+            "the second caller deduped onto the first attempt"
+        );
 
         // Exactly what dropping a `connect` future does.
         winner.abort();
@@ -3683,9 +3785,19 @@ mod tests {
         assert_eq!(stale.in_flight(), 1);
 
         let handle: ConnectionHandle = Arc::clone(&stale) as ConnectionHandle;
-        let fresh = manager.reconnect("s", &entry(), &handle, None).await.unwrap();
-        assert!(!Arc::ptr_eq(&fresh, &stale), "a reconnect replaces the record");
-        assert_eq!(fresh.in_flight(), 1, "`raise_in_flight_to` carried the count forward");
+        let fresh = manager
+            .reconnect("s", &entry(), &handle, None)
+            .await
+            .unwrap();
+        assert!(
+            !Arc::ptr_eq(&fresh, &stale),
+            "a reconnect replaces the record"
+        );
+        assert_eq!(
+            fresh.in_flight(),
+            1,
+            "`raise_in_flight_to` carried the count forward"
+        );
 
         drop(guard);
         assert_eq!(
@@ -3716,7 +3828,10 @@ mod tests {
         }
 
         impl ConnectionFactory for RecordingFactory {
-            fn create(&self, request: CreateConnection) -> BoxFuture<'static, McpResult<NewConnection>> {
+            fn create(
+                &self,
+                request: CreateConnection,
+            ) -> BoxFuture<'static, McpResult<NewConnection>> {
                 self.tokens
                     .lock()
                     .unwrap()
@@ -3744,16 +3859,23 @@ mod tests {
         let caller = CancelToken::new();
         manager.connect("s", &entry(), Some(&caller)).await.unwrap();
 
-        let (attempt_signal, request_signal) = factory.tokens.lock().unwrap().first().cloned().unwrap();
+        let (attempt_signal, request_signal) =
+            factory.tokens.lock().unwrap().first().cloned().unwrap();
         for _ in 0..200 {
             if attempt_signal.is_cancelled() && request_signal.is_cancelled() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        assert!(attempt_signal.is_cancelled(), "the attempt joiner was reaped");
+        assert!(
+            attempt_signal.is_cancelled(),
+            "the attempt joiner was reaped"
+        );
         assert!(request_signal.is_cancelled(), "and so was `owned_signal`'s");
-        assert!(!runtime.is_cancelled(), "without cancelling the runtime signal");
+        assert!(
+            !runtime.is_cancelled(),
+            "without cancelling the runtime signal"
+        );
         assert!(!caller.is_cancelled(), "or the caller's own token");
         assert!(
             manager.get_connection("s").is_some(),
@@ -3783,9 +3905,19 @@ mod tests {
 
         let error = connecting.await.unwrap().expect_err("the close won");
         assert_eq!(error.to_string(), "MCP connection s was closed");
-        assert!(matches!(error, McpError::Aborted(_)), "it is an abort, not a connect failure");
-        closing.await.unwrap().expect("an ordinary connect failure is swallowed by close");
-        assert_eq!(factory.total_closes(), 1, "the fenced connection is disposed exactly once");
+        assert!(
+            matches!(error, McpError::Aborted(_)),
+            "it is an abort, not a connect failure"
+        );
+        closing
+            .await
+            .unwrap()
+            .expect("an ordinary connect failure is swallowed by close");
+        assert_eq!(
+            factory.total_closes(),
+            1,
+            "the fenced connection is disposed exactly once"
+        );
         assert!(manager.get_connection("s").is_none());
     }
 
@@ -3810,7 +3942,10 @@ mod tests {
         gate.open();
 
         let error = connecting.await.unwrap().expect_err("the generation moved");
-        assert_eq!(error.to_string(), "MCP connection for s was closed while connecting");
+        assert_eq!(
+            error.to_string(),
+            "MCP connection for s was closed while connecting"
+        );
         assert_eq!(factory.total_closes(), 1);
     }
 
@@ -3839,11 +3974,20 @@ mod tests {
         assert!(!manager.is_idle("s", Duration::from_secs(60)));
         assert!(manager.is_idle("s", Duration::ZERO) || connection.last_used_at() == now_ms());
         manager.increment_in_flight("s");
-        assert!(!manager.is_idle("s", Duration::ZERO), "in-flight work is never idle");
+        assert!(
+            !manager.is_idle("s", Duration::ZERO),
+            "in-flight work is never idle"
+        );
         manager.decrement_in_flight("s");
         connection.set_status(ConnectionStatus::Closed);
-        assert!(!manager.is_idle("s", Duration::ZERO), "a closed record is never idle");
-        assert!(!manager.is_idle("nope", Duration::ZERO), "an unknown name is never idle");
+        assert!(
+            !manager.is_idle("s", Duration::ZERO),
+            "a closed record is never idle"
+        );
+        assert!(
+            !manager.is_idle("nope", Duration::ZERO),
+            "an unknown name is never idle"
+        );
     }
 
     /// MEASURED: three decrements against one increment leave `0`, never a wrapped counter.
@@ -3863,9 +4007,17 @@ mod tests {
         let before = connection.last_used_at();
         {
             let (_connection, _guard) = manager.begin_request("s").unwrap();
-            assert_eq!(connection.in_flight(), 1, "the guard increments on construction");
+            assert_eq!(
+                connection.in_flight(),
+                1,
+                "the guard increments on construction"
+            );
         }
-        assert_eq!(connection.in_flight(), 0, "and decrements on drop, even through an early `?`");
+        assert_eq!(
+            connection.in_flight(),
+            0,
+            "and decrements on drop, even through an early `?`"
+        );
         assert!(connection.last_used_at() >= before, "the drop also touches");
     }
 
@@ -3879,7 +4031,10 @@ mod tests {
             "Server \"s\" is not connected"
         );
         manager.connect("s", &entry(), None).await.unwrap();
-        manager.get_connection("s").unwrap().set_status(ConnectionStatus::Closed);
+        manager
+            .get_connection("s")
+            .unwrap()
+            .set_status(ConnectionStatus::Closed);
         assert_eq!(
             manager.begin_request("s").unwrap_err().to_string(),
             "Server \"s\" is not connected"
@@ -3915,8 +4070,16 @@ mod tests {
             fresh.push(join.await.unwrap().unwrap());
         }
 
-        assert_eq!(factory.call_count(), 2, "one initial connect plus exactly one reconnect");
-        assert_eq!(factory.total_closes(), 1, "the stale connection is disposed once");
+        assert_eq!(
+            factory.call_count(),
+            2,
+            "one initial connect plus exactly one reconnect"
+        );
+        assert_eq!(
+            factory.total_closes(),
+            1,
+            "the stale connection is disposed once"
+        );
         let [first, second, third] = <[Arc<ServerConnection>; 3]>::try_from(fresh)
             .unwrap_or_else(|_| panic!("three reconnects, three results"));
         assert!(Arc::ptr_eq(&first, &second) && Arc::ptr_eq(&second, &third));
@@ -3948,9 +4111,16 @@ mod tests {
             .reconnect("s", &entry(), &stale_handle, None)
             .await
             .unwrap();
-        assert!(Arc::ptr_eq(&result, &winner), "the current connection is returned, not rebuilt");
+        assert!(
+            Arc::ptr_eq(&result, &winner),
+            "the current connection is returned, not rebuilt"
+        );
         assert_eq!(factory.call_count(), creates_before, "nothing was created");
-        assert_eq!(factory.total_closes(), closes_before, "and nothing was torn down");
+        assert_eq!(
+            factory.total_closes(),
+            closes_before,
+            "and nothing was torn down"
+        );
     }
 
     /// MEASURED upstream: `current ?? this.connect(...)` — an empty map runs a plain connect.
@@ -3965,7 +4135,10 @@ mod tests {
             false,
         ) as ConnectionHandle;
 
-        let fresh = manager.reconnect("s", &entry(), &orphan, None).await.unwrap();
+        let fresh = manager
+            .reconnect("s", &entry(), &orphan, None)
+            .await
+            .unwrap();
         assert_eq!(factory.call_count(), 1);
         assert_eq!(fresh.status(), ConnectionStatus::Connected);
     }
@@ -3993,7 +4166,11 @@ mod tests {
         );
 
         assert_eq!(
-            manager.connect("s2", &disabled_entry(), None).await.unwrap_err().to_string(),
+            manager
+                .connect("s2", &disabled_entry(), None)
+                .await
+                .unwrap_err()
+                .to_string(),
             "MCP server \"s2\" is disabled",
             "`connect` carries the identical string"
         );
@@ -4132,7 +4309,11 @@ mod tests {
                 1,
                 "round {round}: 32 closers must dispose the transport exactly once"
             );
-            assert_eq!(creates.load(Ordering::SeqCst), 2, "round {round}: the setup connect, then one after");
+            assert_eq!(
+                creates.load(Ordering::SeqCst),
+                2,
+                "round {round}: the setup connect, then one after"
+            );
         }
     }
 
@@ -4203,7 +4384,11 @@ mod tests {
         gate.open();
         closing.await.unwrap().unwrap();
         connecting.await.unwrap().unwrap();
-        assert_eq!(created.load(Ordering::SeqCst), 2, "and it proceeds once the close resolves");
+        assert_eq!(
+            created.load(Ordering::SeqCst),
+            2,
+            "and it proceeds once the close resolves"
+        );
     }
 
     /// MEASURED upstream: an ordinary connect failure is swallowed by a racing `close`; an
@@ -4226,7 +4411,10 @@ mod tests {
         settle().await;
         gate.open();
         assert!(connecting.await.unwrap().is_err());
-        closing.await.unwrap().expect("an ordinary connect failure never fails a close");
+        closing
+            .await
+            .unwrap()
+            .expect("an ordinary connect failure never fails a close");
 
         // A cleanup failure → re-raised, keeping its CLASS across the public boundary and
         // rendering the way `formatTerminalError` renders. Both halves are the MCP-124 fix:
@@ -4239,7 +4427,10 @@ mod tests {
         //   `false` for a genuine teardown failure — the blocker MCP-124 was filed to remove.
         let manager = manager_with_failing_close();
         manager.connect("s", &entry(), None).await.unwrap();
-        let error = manager.close("s").await.expect_err("the client close failed");
+        let error = manager
+            .close("s")
+            .await
+            .expect_err("the client close failed");
         assert_eq!(
             error.to_string(),
             "client close failed",
@@ -4286,9 +4477,20 @@ mod tests {
         stalled.open();
 
         closing.await.unwrap().unwrap();
-        assert!(pending.await.unwrap().is_err(), "the fenced connect fails rather than surviving");
-        assert_eq!(manager.get_all_connections().len(), 0, "nothing survives `closeAll`");
-        assert_eq!(factory.total_closes(), 2, "both transports are closed exactly once");
+        assert!(
+            pending.await.unwrap().is_err(),
+            "the fenced connect fails rather than surviving"
+        );
+        assert_eq!(
+            manager.get_all_connections().len(),
+            0,
+            "nothing survives `closeAll`"
+        );
+        assert_eq!(
+            factory.total_closes(),
+            2,
+            "both transports are closed exactly once"
+        );
         assert!(manager.is_stopped());
     }
 
@@ -4348,7 +4550,11 @@ mod tests {
         );
 
         manager.close_all().await.unwrap();
-        assert_eq!(late.close_count(), 1, "the late arrival is closed by the second sweep");
+        assert_eq!(
+            late.close_count(),
+            1,
+            "the late arrival is closed by the second sweep"
+        );
         assert_eq!(manager.get_all_connections().len(), 0);
     }
 
@@ -4361,7 +4567,11 @@ mod tests {
         manager.close_all().await.unwrap();
 
         assert_eq!(
-            manager.connect("s", &entry(), None).await.unwrap_err().to_string(),
+            manager
+                .connect("s", &entry(), None)
+                .await
+                .unwrap_err()
+                .to_string(),
             MANAGER_CLOSED
         );
         let orphan: ConnectionHandle = ServerConnection::new(
@@ -4371,7 +4581,11 @@ mod tests {
             false,
         ) as ConnectionHandle;
         assert_eq!(
-            manager.reconnect("s", &entry(), &orphan, None).await.unwrap_err().to_string(),
+            manager
+                .reconnect("s", &entry(), &orphan, None)
+                .await
+                .unwrap_err()
+                .to_string(),
             MANAGER_CLOSED
         );
     }
@@ -4381,7 +4595,10 @@ mod tests {
     async fn close_all_aggregates_only_cleanup_failures() {
         let failing = manager_with_failing_close();
         failing.connect("a", &entry(), None).await.unwrap();
-        let error = failing.close_all().await.expect_err("the client close failed");
+        let error = failing
+            .close_all()
+            .await
+            .expect_err("the client close failed");
         assert_eq!(
             error.to_string(),
             "client close failed",
@@ -4395,11 +4612,9 @@ mod tests {
         assert!(error.is_cleanup_failure());
         // The nesting survives too: `closeAll`'s children are `disposeConnection`'s aggregates.
         assert!(
-            error
-                .aggregate_children()
-                .is_some_and(|children| children
-                    .iter()
-                    .any(|child| matches!(child, McpError::ConnectionCleanupFailed(_)))),
+            error.aggregate_children().is_some_and(|children| children
+                .iter()
+                .any(|child| matches!(child, McpError::ConnectionCleanupFailed(_)))),
             "expected a nested `MCP connection cleanup failed`, got {error:?}"
         );
 
@@ -4407,7 +4622,10 @@ mod tests {
         let factory = ScriptedFactory::new(Script::FailOrdinary, None);
         let quiet = manager(factory as Arc<dyn ConnectionFactory>);
         assert!(quiet.connect("b", &entry(), None).await.is_err());
-        quiet.close_all().await.expect("an ordinary connect failure is not a cleanup failure");
+        quiet
+            .close_all()
+            .await
+            .expect("an ordinary connect failure is not a cleanup failure");
     }
 
     /// `close(name)` clears **only** that server's accepted-elicitation set; `closeAll` clears all.
@@ -4424,8 +4642,14 @@ mod tests {
         manager.close("s").await.unwrap();
         assert!(!manager.has_accepted_url_elicitation("s", "e1"));
         assert!(manager.has_accepted_url_elicitation("t", "e2"));
-        assert!(manager.forget_url_elicitation("t", "e2"), "the delete reports it removed one");
-        assert!(!manager.forget_url_elicitation("t", "e2"), "and reports false the second time");
+        assert!(
+            manager.forget_url_elicitation("t", "e2"),
+            "the delete reports it removed one"
+        );
+        assert!(
+            !manager.forget_url_elicitation("t", "e2"),
+            "and reports false the second time"
+        );
 
         manager.remember_url_elicitation("t", "e3");
         manager.close_all().await.unwrap();
@@ -4486,7 +4710,10 @@ mod tests {
         let second = manager.connect("s", &entry(), None).await.unwrap();
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(factory.call_count(), 1);
-        assert!(second.last_used_at() > 0, "`existing.lastUsedAt = Date.now()`");
+        assert!(
+            second.last_used_at() > 0,
+            "`existing.lastUsedAt = Date.now()`"
+        );
     }
 
     // ── request options (§3.13) ─────────────────────────────────────────────────────────────
@@ -4504,7 +4731,9 @@ mod tests {
         assert!(manager.get_request_options("nope").is_none());
         manager.set_default_request_timeout_ms(Some(1234.0));
         assert_eq!(
-            manager.get_request_options("nope").and_then(|options| options.timeout),
+            manager
+                .get_request_options("nope")
+                .and_then(|options| options.timeout),
             Some(Duration::from_millis(1234))
         );
 
@@ -4578,11 +4807,19 @@ mod tests {
 
         manager.queue_metadata_publication("s", &connection, "session-reconnect");
         manager.retry_pending_metadata_publication("s", &other);
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "a different connection does not drain it");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a different connection does not drain it"
+        );
         manager.retry_pending_metadata_publication("s", &connection);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         manager.retry_pending_metadata_publication("s", &connection);
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "and it is cleared after the retry");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "and it is cleared after the retry"
+        );
     }
 
     /// `close` drops any queued publication for that server (`server-manager.ts:1099`).
@@ -4648,10 +4885,18 @@ mod tests {
         );
         connection.dispose().await.unwrap();
         connection.dispose().await.unwrap();
-        assert_eq!(resource.close_count(), 1, "`dispose` is once-only on its own");
+        assert_eq!(
+            resource.close_count(),
+            1,
+            "`dispose` is once-only on its own"
+        );
         drop(connection);
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(resource.close_count(), 1, "and the drop-net does not re-run it");
+        assert_eq!(
+            resource.close_count(),
+            1,
+            "and the drop-net does not re-run it"
+        );
     }
 
     /// **BLOCKER regression: the once-only flag records that the close COMPLETED, not that it
@@ -4706,12 +4951,20 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        assert_eq!(resource.started.load(Ordering::SeqCst), 1, "the teardown is parked");
+        assert_eq!(
+            resource.started.load(Ordering::SeqCst),
+            1,
+            "the teardown is parked"
+        );
 
         // Exactly what `Self::race(..)` / `abort::abortable` do to a close future.
         disposing.abort();
         let _ = disposing.await;
-        assert_eq!(resource.finished.load(Ordering::SeqCst), 0, "and it never finished");
+        assert_eq!(
+            resource.finished.load(Ordering::SeqCst),
+            0,
+            "and it never finished"
+        );
 
         // The last handle goes: the drop-net is the only thing left that can close this transport.
         drop(connection);
@@ -4727,7 +4980,11 @@ mod tests {
             2,
             "the drop-net must fire for a dispose that did not finish"
         );
-        assert_eq!(resource.finished.load(Ordering::SeqCst), 1, "and this time it completes");
+        assert_eq!(
+            resource.finished.load(Ordering::SeqCst),
+            1,
+            "and this time it completes"
+        );
     }
 
     /// **A reconnect whose caller goes away must still finish reconnecting.**
@@ -4800,13 +5057,22 @@ mod tests {
         // The unrecoverable middle: `close_inner` has removed the record and is parked in the
         // transport teardown, and `connect_inner` has not been reached.
         for _ in 0..400 {
-            if manager.get_connection("s").is_none() && manager.tables().close_promises.contains_key("s") {
+            if manager.get_connection("s").is_none()
+                && manager.tables().close_promises.contains_key("s")
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        assert!(manager.get_connection("s").is_none(), "the stale record is gone");
-        assert_eq!(creates.load(Ordering::SeqCst), 1, "and the replacement has not been started");
+        assert!(
+            manager.get_connection("s").is_none(),
+            "the stale record is gone"
+        );
+        assert_eq!(
+            creates.load(Ordering::SeqCst),
+            1,
+            "and the replacement has not been started"
+        );
 
         running.abort();
         let _ = running.await;
@@ -4821,8 +5087,15 @@ mod tests {
         let fresh = manager
             .get_connection("s")
             .expect("the reconnect must finish even though its caller went away");
-        assert!(!Arc::ptr_eq(&fresh, &stale), "and it is the replacement, not the stale record");
-        assert_eq!(creates.load(Ordering::SeqCst), 2, "exactly one replacement was built");
+        assert!(
+            !Arc::ptr_eq(&fresh, &stale),
+            "and it is the replacement, not the stale record"
+        );
+        assert_eq!(
+            creates.load(Ordering::SeqCst),
+            2,
+            "exactly one replacement was built"
+        );
         assert!(
             manager.tables().reconnect_promises.is_empty(),
             "the identity-matched `finally` still clears the slot"
@@ -4889,7 +5162,7 @@ mod tests {
     #[cfg(unix)]
     mod child_process {
         use super::*;
-        use crate::runtime::{spawn_stdio_transport, StdioTransportSpec};
+        use crate::runtime::{StdioTransportSpec, spawn_stdio_transport};
 
         /// Alive means "exists and is not a zombie". A killed-but-unreaped child still has a
         /// `/proc/<pid>` entry, so a test that only checked for the directory would pass on a leak.
@@ -4902,7 +5175,10 @@ mod tests {
             let Some((_, rest)) = stat.rsplit_once(')') else {
                 return false;
             };
-            rest.trim_start().chars().next().is_some_and(|state| state != 'Z')
+            rest.trim_start()
+                .chars()
+                .next()
+                .is_some_and(|state| state != 'Z')
         }
 
         async fn wait_until_gone(pid: u32, budget: Duration) -> bool {
@@ -4923,9 +5199,12 @@ mod tests {
                 // A deliberately minimal child environment: this is the "replace, don't merge"
                 // semantics `StdioClientTransport`'s `env` option has, and it keeps the test
                 // hermetic.
-                env: [("PATH".to_string(), std::env::var("PATH").unwrap_or_default())]
-                    .into_iter()
-                    .collect(),
+                env: [(
+                    "PATH".to_string(),
+                    std::env::var("PATH").unwrap_or_default(),
+                )]
+                .into_iter()
+                .collect(),
                 cwd: None,
                 plugin_data_dir: None,
                 // `debug: false` ⇒ stderr is PIPED, which is the arm that needs the drain task.
@@ -4953,7 +5232,10 @@ mod tests {
                 started.elapsed() < Duration::from_secs(2),
                 "an EOF-honouring child must not need the hard-kill timer"
             );
-            assert!(wait_until_gone(pid, Duration::from_secs(2)).await, "pid {pid} survived close");
+            assert!(
+                wait_until_gone(pid, Duration::from_secs(2)).await,
+                "pid {pid} survived close"
+            );
         }
 
         /// The hard-kill arm, and the **named delta** against the TS SDK: rmcp uses one 3-second
@@ -4965,13 +5247,19 @@ mod tests {
             assert!(process_alive(pid));
 
             let started = std::time::Instant::now();
-            connection.close().await.expect("graceful shutdown escalates to a kill");
+            connection
+                .close()
+                .await
+                .expect("graceful shutdown escalates to a kill");
             let elapsed = started.elapsed();
             assert!(
                 elapsed >= Duration::from_secs(2) && elapsed < Duration::from_secs(8),
                 "expected the ~3 s MAX_WAIT_ON_DROP_SECS window, took {elapsed:?}"
             );
-            assert!(wait_until_gone(pid, Duration::from_secs(2)).await, "pid {pid} survived a kill");
+            assert!(
+                wait_until_gone(pid, Duration::from_secs(2)).await,
+                "pid {pid} survived a kill"
+            );
         }
 
         /// `close()` is idempotent — `close`, `closeAll`'s late sweep and the drop-net can all reach
@@ -5011,7 +5299,10 @@ mod tests {
                 async move { connection.close().await }
             });
             tokio::time::sleep(Duration::from_millis(300)).await;
-            assert!(process_alive(pid), "the first close is still inside the 3 s window");
+            assert!(
+                process_alive(pid),
+                "the first close is still inside the 3 s window"
+            );
 
             let started = std::time::Instant::now();
             connection.close().await.expect("second close");
@@ -5020,7 +5311,10 @@ mod tests {
                 "the second close returned in {:?} while the first was still killing the child",
                 started.elapsed()
             );
-            assert!(!process_alive(pid), "and by the time it returns the child is gone");
+            assert!(
+                !process_alive(pid),
+                "and by the time it returns the child is gone"
+            );
             first.await.expect("join").expect("first close");
         }
 
@@ -5053,7 +5347,9 @@ mod tests {
             assert!(wait_until_gone(pid, Duration::from_secs(2)).await);
 
             // And the tail is bounded: at most MAX_CAPTURED_STDERR_LINES joined with ` — `.
-            let detail = connection.stderr_detail().expect("some stderr was captured");
+            let detail = connection
+                .stderr_detail()
+                .expect("some stderr was captured");
             assert!(
                 detail.split(" — ").count() <= MAX_CAPTURED_STDERR_LINES,
                 "the tail keeps at most {MAX_CAPTURED_STDERR_LINES} lines, got {detail:?}"
@@ -5083,8 +5379,10 @@ mod tests {
             let unique = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |elapsed| elapsed.as_nanos());
-            let pidfile = std::env::temp_dir()
-                .join(format!("cyrup-mcp-grandchild-{}-{unique}.pid", std::process::id()));
+            let pidfile = std::env::temp_dir().join(format!(
+                "cyrup-mcp-grandchild-{}-{unique}.pid",
+                std::process::id()
+            ));
             let script = format!(
                 "sleep 300 > /dev/null 2>&1 < /dev/null & echo $! > {}; exec cat > /dev/null",
                 pidfile.display()
@@ -5104,7 +5402,10 @@ mod tests {
             assert_ne!(grandchild, 0, "the fixture never reported its grandchild");
 
             connection.close().await.expect("graceful shutdown");
-            assert!(wait_until_gone(child_pid, Duration::from_secs(2)).await, "the direct child dies");
+            assert!(
+                wait_until_gone(child_pid, Duration::from_secs(2)).await,
+                "the direct child dies"
+            );
 
             // The residual, stated as an assertion so it fails loudly the day it is fixed and this
             // test has to be inverted.
@@ -5120,7 +5421,10 @@ mod tests {
                 "a single-pid kill was expected to leave the grandchild running; if this now fails, \
                  the process-group fix landed and MCP-131's residual should be closed"
             );
-            assert!(wait_until_gone(grandchild, Duration::from_secs(2)).await, "test cleanup");
+            assert!(
+                wait_until_gone(grandchild, Duration::from_secs(2)).await,
+                "test cleanup"
+            );
         }
 
         /// A factory that spawns a real child per connect — the end-to-end shape MCP-126's
@@ -5194,8 +5498,16 @@ mod tests {
         async fn a_close_whose_caller_is_cancelled_still_reaps_the_child() {
             let factory = Arc::new(SpawningFactory::ignoring_eof());
             let manager = super::manager(Arc::clone(&factory) as Arc<dyn ConnectionFactory>);
-            manager.connect("s", &super::entry(), None).await.expect("connect");
-            let pid = *factory.pids.lock().unwrap().first().expect("a child was spawned");
+            manager
+                .connect("s", &super::entry(), None)
+                .await
+                .expect("connect");
+            let pid = *factory
+                .pids
+                .lock()
+                .unwrap()
+                .first()
+                .expect("a child was spawned");
             assert!(process_alive(pid), "the fixture child is up");
 
             let closing = tokio::spawn({
@@ -5207,7 +5519,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(400)).await;
             closing.abort();
             let _ = closing.await;
-            assert!(process_alive(pid), "the child cannot have exited on its own — it ignores EOF");
+            assert!(
+                process_alive(pid),
+                "the child cannot have exited on its own — it ignores EOF"
+            );
 
             assert!(
                 wait_until_gone(pid, Duration::from_secs(10)).await,
@@ -5231,7 +5546,10 @@ mod tests {
             }
             let pids = factory.pids.lock().unwrap().clone();
             assert_eq!(pids.len(), 5);
-            assert!(pids.iter().all(|pid| process_alive(*pid)), "all five children are up");
+            assert!(
+                pids.iter().all(|pid| process_alive(*pid)),
+                "all five children are up"
+            );
 
             manager.close_all().await.expect("closeAll");
             for pid in pids {
@@ -5289,32 +5607,69 @@ mod tests {
         // Positives.
         assert!(is_terminated_session(&http(404, "Not Found"), true));
         assert!(is_terminated_session(&http(400, both), true));
-        assert!(is_terminated_session(&http(400, spaced), true), "whitespace around the colons");
-        assert!(is_terminated_session(&protocol(-32000, "Server not initialized"), true));
-        assert!(is_terminated_session(&protocol(-32000, "Bad Request: Server not initialized"), true));
+        assert!(
+            is_terminated_session(&http(400, spaced), true),
+            "whitespace around the colons"
+        );
+        assert!(is_terminated_session(
+            &protocol(-32000, "Server not initialized"),
+            true
+        ));
+        assert!(is_terminated_session(
+            &protocol(-32000, "Bad Request: Server not initialized"),
+            true
+        ));
 
         // The absolute gate.
         assert!(!is_terminated_session(&http(404, "Not Found"), false));
         assert!(!is_terminated_session(&http(400, both), false));
-        assert!(!is_terminated_session(&protocol(-32000, "Server not initialized"), false));
+        assert!(!is_terminated_session(
+            &protocol(-32000, "Server not initialized"),
+            false
+        ));
 
         // Negatives that a plausible-looking port gets wrong.
-        assert!(!is_terminated_session(&http(400, r#"{"code":-32000}"#), true), "code marker alone");
         assert!(
-            !is_terminated_session(&http(400, r#"{"message":"Bad Request: Server not initialized"}"#), true),
+            !is_terminated_session(&http(400, r#"{"code":-32000}"#), true),
+            "code marker alone"
+        );
+        assert!(
+            !is_terminated_session(
+                &http(400, r#"{"message":"Bad Request: Server not initialized"}"#),
+                true
+            ),
             "message marker alone"
         );
         assert!(
-            !is_terminated_session(&http(400, r#"{"code":-32000,"message":"Server not initialized"}"#), true),
+            !is_terminated_session(
+                &http(400, r#"{"code":-32000,"message":"Server not initialized"}"#),
+                true
+            ),
             "the 400 regex names the LONG message only, while the ProtocolError set has both"
         );
-        assert!(!is_terminated_session(&http(400, "Bad Request"), true), "a generic 400");
-        assert!(!is_terminated_session(&http(500, both), true), "the status must be exactly 400");
-        assert!(!is_terminated_session(&protocol(-32000, "Connection closed"), true));
-        assert!(!is_terminated_session(&protocol(-32001, "Server not initialized"), true));
+        assert!(
+            !is_terminated_session(&http(400, "Bad Request"), true),
+            "a generic 400"
+        );
+        assert!(
+            !is_terminated_session(&http(500, both), true),
+            "the status must be exactly 400"
+        );
+        assert!(!is_terminated_session(
+            &protocol(-32000, "Connection closed"),
+            true
+        ));
+        assert!(!is_terminated_session(
+            &protocol(-32001, "Server not initialized"),
+            true
+        ));
         assert!(
             !is_terminated_session(
-                &TerminatedSessionEvidence { http_status: None, protocol_code: None, message: "aborted" },
+                &TerminatedSessionEvidence {
+                    http_status: None,
+                    protocol_code: None,
+                    message: "aborted"
+                },
                 true
             ),
             "cancellation is never a session failure"

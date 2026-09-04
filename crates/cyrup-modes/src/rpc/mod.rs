@@ -27,12 +27,12 @@ use std::sync::Arc;
 
 use cyrup_session_svc::{
     AgentSession, AgentSessionEvent, AgentSessionRuntime, BashOptions, Content, EntryId,
-    EventStream, ForkPosition, InputSource, NotifyKind, PromptAccepted,
-    PromptOptions, UiEffect, UiKind, UiReply, UiRequest, UserInput,
+    EventStream, ForkPosition, InputSource, NotifyKind, PromptAccepted, PromptOptions, UiEffect,
+    UiKind, UiReply, UiRequest, UserInput,
 };
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
 
@@ -43,7 +43,7 @@ pub(crate) mod types;
 
 use jsonl::{read_lines, write_out};
 use types::queue_mode_str;
-pub use types::{QueueModeArg, RpcOut, RpcResponse, SessionCommand};
+pub use types::{ClearedQueue, QueueModeArg, RpcOut, RpcResponse, SessionCommand};
 
 // ---------------------------------------------------------------------------------------------
 // Extension dialogs + run-loop support
@@ -213,7 +213,9 @@ pub(crate) fn extension_ui_effect_json(effect: &UiEffect) -> Option<Value> {
             "text": text,
         }),
         // Intentionally no wire shape — see this function's doc.
-        UiEffect::SetHeader { .. } | UiEffect::SetFooter { .. } | UiEffect::SetToolsExpanded { .. } => {
+        UiEffect::SetHeader { .. }
+        | UiEffect::SetFooter { .. }
+        | UiEffect::SetToolsExpanded { .. } => {
             return None;
         }
         // TUI-030, the working-indicator family — NOT forwarded, and that is upstream's own
@@ -260,9 +262,11 @@ fn map_ui_response(pending: &PendingUi, body: &Value) -> UiReply {
         return default_ui_reply(pending.kind);
     }
     match pending.kind {
-        UiKind::Confirm => {
-            UiReply::Confirm(body.get("confirmed").and_then(Value::as_bool).unwrap_or(false))
-        }
+        UiKind::Confirm => UiReply::Confirm(
+            body.get("confirmed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        ),
         UiKind::Input | UiKind::Editor | UiKind::Select => {
             UiReply::Text(body.get("value").and_then(Value::as_str).map(str::to_owned))
         }
@@ -299,9 +303,18 @@ async fn rebind_session(
 ) {
     *session = runtime.session().await;
     *events = session.subscribe();
-    session.services().host_services.set_ui_sink(sinks.ui.clone());
-    session.services().host_services.set_ui_effect_sink(sinks.ui_effect.clone());
-    session.services().ext_host.add_error_listener(error_listener(sinks.error.clone()));
+    session
+        .services()
+        .host_services
+        .set_ui_sink(sinks.ui.clone());
+    session
+        .services()
+        .host_services
+        .set_ui_effect_sink(sinks.ui_effect.clone());
+    session
+        .services()
+        .ext_host
+        .add_error_listener(error_listener(sinks.error.clone()));
     *in_flight = false;
 }
 
@@ -462,7 +475,10 @@ where
     // `setStatus`/`setWidget`/`setTitle`/`setEditorText` handlers, rpc-mode.ts:149-241). Installed +
     // re-installed on rebind exactly like `ui_tx` above.
     let (ui_effect_tx, mut ui_effect_rx) = mpsc::unbounded_channel::<UiEffect>();
-    session.services().host_services.set_ui_effect_sink(ui_effect_tx.clone());
+    session
+        .services()
+        .host_services
+        .set_ui_effect_sink(ui_effect_tx.clone());
 
     // The contained-extension-fault sink (Pi `bindExtensions({ onError })`, rpc-mode.ts:347-349):
     // every guest handler fault the dispatcher contains + skips (R-08-036) is surfaced to the client
@@ -471,8 +487,15 @@ where
     // (re)installed on the active session's extension host here and again on every rebind, exactly as
     // Pi re-binds `onError` inside `rebindSession()`.
     let (error_tx, mut error_rx) = mpsc::unbounded_channel::<Value>();
-    session.services().ext_host.add_error_listener(error_listener(error_tx.clone()));
-    let sinks = LoopSinks { ui: ui_tx, ui_effect: ui_effect_tx, error: error_tx };
+    session
+        .services()
+        .ext_host
+        .add_error_listener(error_listener(error_tx.clone()));
+    let sinks = LoopSinks {
+        ui: ui_tx,
+        ui_effect: ui_effect_tx,
+        error: error_tx,
+    };
 
     // SEAM-022: the replacement signal. `AgentSessionRuntime::install_inner` bumps this watch on
     // EVERY path that swaps the active session — the RPC verbs `new_session`/`switch_session`/
@@ -785,12 +808,8 @@ async fn dispatch(
         Ok(v) => v,
         Err(e) => {
             return Dispatched {
-                response: RpcResponse::err(
-                    "parse",
-                    None,
-                    format!("Failed to parse command: {e}"),
-                ),
-            }
+                response: RpcResponse::err("parse", None, format!("Failed to parse command: {e}")),
+            };
         }
     };
 
@@ -805,22 +824,26 @@ async fn dispatch(
         Ok(SessionCommand::Unknown) => {
             let name = type_str.unwrap_or_default();
             let message = format!("Unknown command: {name}");
-            Dispatched { response: RpcResponse::err(name, raw_id, message) }
+            Dispatched {
+                response: RpcResponse::err(name, raw_id, message),
+            }
         }
         Ok(cmd) => {
             // Whether this command REPLACED the active session is deliberately not inferred here
             // (SEAM-022): the runtime announces every replacement on its generation watch, which the
             // run loop observes directly.
-            Dispatched { response: handle(runtime, session, cmd, raw_id, in_flight).await }
+            Dispatched {
+                response: handle(runtime, session, cmd, raw_id, in_flight).await,
+            }
         }
         // A known `type` whose payload failed validation (missing/wrong-typed required field): echo
         // the real command name + the runtime error, NOT `"unknown"`. A missing/`null` `type` tag
         // (serde: "missing field `type`") has no command name to echo — fall back to Pi's default
         // `Unknown command` shaping so it still correlates.
         Err(e) => match type_str {
-            Some(name) => {
-                Dispatched { response: RpcResponse::err(name, raw_id, e.to_string()) }
-            }
+            Some(name) => Dispatched {
+                response: RpcResponse::err(name, raw_id, e.to_string()),
+            },
             None => Dispatched {
                 response: RpcResponse::err(String::new(), raw_id, "Unknown command: undefined"),
             },
@@ -864,10 +887,17 @@ async fn handle(
     // reply (string or number, preserved as-sent).
     match cmd {
         // -------------------------------------------------------------- Prompting ----
-        SessionCommand::Prompt { message, images, streaming_behavior } => {
+        SessionCommand::Prompt {
+            message,
+            images,
+            streaming_behavior,
+        } => {
             let id = raw_id.clone();
             let input = user_input(message, images);
-            match session.prompt_with(input, PromptOptions { streaming_behavior }).await {
+            match session
+                .prompt_with(input, PromptOptions { streaming_behavior })
+                .await
+            {
                 Ok(accepted) => {
                     if !matches!(accepted, PromptAccepted::Handled) {
                         *in_flight = true;
@@ -915,13 +945,33 @@ async fn handle(
             // open here settles only via a genuine `extension_ui_response` or its own `timeout_ms`.
             RpcResponse::ok("abort", raw_id.clone(), None)
         }
+        SessionCommand::ClearQueue => {
+            // SEAM-116: Pi is `return success(id, "clear_queue", session.clearQueue())`
+            // (rpc-mode.ts:433-435 @v0.84.4), and `clearQueue()` (agent-session.ts:1588-1596)
+            // snapshots both queues, empties them, emits `queue_update` and returns
+            // `{ steering, followUp }`. `drain_queue` is that method: both mirrors are taken under
+            // their guards in ONE pass, so a `steer`/`follow_up` racing this verb lands wholly in
+            // the reply or wholly in the queue, never both and never neither. Like `abort`, this
+            // owns no `in_flight` bookkeeping and dispatches concurrently.
+            let (steering, follow_up) = session.drain_queue().await;
+            let id = raw_id.clone();
+            match serde_json::to_value(ClearedQueue {
+                steering,
+                follow_up,
+            }) {
+                Ok(data) => RpcResponse::ok("clear_queue", id, Some(data)),
+                Err(e) => RpcResponse::err("clear_queue", id, e.to_string()),
+            }
+        }
         SessionCommand::NewSession { parent_session } => {
             let id = raw_id.clone();
             let options = cyrup_session_svc::NewSessionOptions { parent_session };
             match runtime.new_session_with(options).await {
-                Ok(result) => {
-                    RpcResponse::ok("new_session", id, Some(json!({ "cancelled": result.cancelled })))
-                }
+                Ok(result) => RpcResponse::ok(
+                    "new_session",
+                    id,
+                    Some(json!({ "cancelled": result.cancelled })),
+                ),
                 Err(e) => RpcResponse::err("new_session", id, e.to_string()),
             }
         }
@@ -1025,7 +1075,9 @@ async fn handle(
         }
 
         // ------------------------------------------------------------- Compaction ----
-        SessionCommand::Compact { custom_instructions } => {
+        SessionCommand::Compact {
+            custom_instructions,
+        } => {
             let id = raw_id.clone();
             match session.compact(custom_instructions).await {
                 Ok(result) => RpcResponse::ok(
@@ -1054,7 +1106,10 @@ async fn handle(
         }
 
         // ------------------------------------------------------------------- Bash ----
-        SessionCommand::Bash { command, exclude_from_context } => {
+        SessionCommand::Bash {
+            command,
+            exclude_from_context,
+        } => {
             let id = raw_id.clone();
             // A genuine backend failure (spawn error, missing cwd, …) must NOT be reported as a
             // success — Pi's `executeBashWithOperations` only catches the abort case; every other
@@ -1108,7 +1163,11 @@ async fn handle(
             match session
                 .execute_bash_with_user_event(
                     &command,
-                    BashOptions { exclude_from_context, id: bash_id, operations: None },
+                    BashOptions {
+                        exclude_from_context,
+                        id: bash_id,
+                        operations: None,
+                    },
                     None,
                 )
                 .await
@@ -1135,9 +1194,11 @@ async fn handle(
             let id = raw_id.clone();
             let path = output_path.map(std::path::PathBuf::from);
             match session.export_to_html(path.as_deref()).await {
-                Ok(out) => {
-                    RpcResponse::ok("export_html", id, Some(json!({ "path": out.display().to_string() })))
-                }
+                Ok(out) => RpcResponse::ok(
+                    "export_html",
+                    id,
+                    Some(json!({ "path": out.display().to_string() })),
+                ),
                 Err(e) => RpcResponse::err("export_html", id, e.to_string()),
             }
         }
@@ -1154,7 +1215,10 @@ async fn handle(
         }
         SessionCommand::Fork { entry_id } => {
             let id = raw_id.clone();
-            match runtime.fork(EntryId::from(entry_id.as_str()), ForkPosition::Before).await {
+            match runtime
+                .fork(EntryId::from(entry_id.as_str()), ForkPosition::Before)
+                .await
+            {
                 Ok(result) => RpcResponse::ok(
                     "fork",
                     id,
@@ -1173,11 +1237,9 @@ async fn handle(
                     "Cannot clone session: no current entry selected",
                 ),
                 Some(leaf) => match runtime.fork(leaf, ForkPosition::At).await {
-                    Ok(result) => RpcResponse::ok(
-                        "clone",
-                        id,
-                        Some(json!({ "cancelled": result.cancelled })),
-                    ),
+                    Ok(result) => {
+                        RpcResponse::ok("clone", id, Some(json!({ "cancelled": result.cancelled })))
+                    }
                     Err(e) => RpcResponse::err("clone", id, e.to_string()),
                 },
             }
@@ -1199,13 +1261,26 @@ async fn handle(
             let id = raw_id.clone();
             let mut entries = session.entries_json().await;
             if let Some(since) = since {
-                match entries.iter().position(|e| e.get("id").and_then(Value::as_str) == Some(since.as_str())) {
+                match entries
+                    .iter()
+                    .position(|e| e.get("id").and_then(Value::as_str) == Some(since.as_str()))
+                {
                     Some(idx) => entries = entries.split_off(idx + 1),
-                    None => return RpcResponse::err("get_entries", id, format!("Entry not found: {since}")),
+                    None => {
+                        return RpcResponse::err(
+                            "get_entries",
+                            id,
+                            format!("Entry not found: {since}"),
+                        );
+                    }
                 }
             }
             let leaf = session.leaf_id().await.map(|l| l.as_str().to_string());
-            RpcResponse::ok("get_entries", id, Some(json!({ "entries": entries, "leafId": leaf })))
+            RpcResponse::ok(
+                "get_entries",
+                id,
+                Some(json!({ "entries": entries, "leafId": leaf })),
+            )
         }
         SessionCommand::GetTree => {
             let tree = session.tree_json().await;
@@ -1292,7 +1367,12 @@ fn extension_ui_response_id(line: &str) -> Option<Option<String>> {
 
 /// Build an RPC-sourced [`UserInput`] from text + optional image content blocks.
 fn user_input(text: String, images: Vec<Content>) -> UserInput {
-    UserInput { text, images, source: InputSource::Rpc, expand_templates: true }
+    UserInput {
+        text,
+        images,
+        source: InputSource::Rpc,
+        expand_templates: true,
+    }
 }
 
 /// The full `get_state` snapshot (Pi `RpcSessionState`, rpc-types.ts:94-107).
@@ -1310,10 +1390,12 @@ async fn state_view(session: &AgentSession) -> Value {
             .iter()
             .find(|m| m.provider == model_ref.provider && m.id == model_ref.model)
             .and_then(|m| serde_json::to_value(m).ok())
-            .unwrap_or_else(|| json!({
-                "provider": model_ref.provider.as_str(),
-                "id": model_ref.model.as_str(),
-            }))
+            .unwrap_or_else(|| {
+                json!({
+                    "provider": model_ref.provider.as_str(),
+                    "id": model_ref.model.as_str(),
+                })
+            })
     });
     // SEAM-053 — the three OPTIONAL members (`model?`, `sessionFile?`, `sessionName?`,
     // rpc-types.ts:95/102/104) are built by insertion rather than by `json!`, because pi builds the
@@ -1330,7 +1412,10 @@ async fn state_view(session: &AgentSession) -> Value {
         "thinkingLevel".to_string(),
         json!(session.thinking_level().await),
     );
-    state.insert("isStreaming".to_string(), json!(session.is_streaming().await));
+    state.insert(
+        "isStreaming".to_string(),
+        json!(session.is_streaming().await),
+    );
     state.insert("isCompacting".to_string(), json!(session.is_compacting()));
     state.insert(
         "steeringMode".to_string(),
@@ -1418,9 +1503,17 @@ mod tests {
         let req = editor_request("edit the changelog", "## seed content");
         let wire = extension_ui_request_json("req-1", &req);
         assert_eq!(wire["method"], "editor");
-        assert_eq!(wire["title"], "edit the changelog", "the real guest title must reach the wire");
-        assert_ne!(wire["title"], "", "title must never be the pre-fix hardcoded empty string");
-        assert_eq!(wire["prefill"], "## seed content", "prefill carries the seed text, not the title");
+        assert_eq!(
+            wire["title"], "edit the changelog",
+            "the real guest title must reach the wire"
+        );
+        assert_ne!(
+            wire["title"], "",
+            "title must never be the pre-fix hardcoded empty string"
+        );
+        assert_eq!(
+            wire["prefill"], "## seed content",
+            "prefill carries the seed text, not the title"
+        );
     }
-
 }

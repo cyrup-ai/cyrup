@@ -1,13 +1,18 @@
 //! Chrome-tail tests (spec/tui/01; Pi `keybinding-hints.ts` / `visual-truncate.ts` /
 //! `bordered-loader.ts`) — TestBackend buffer assertions where rendered.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use crate::{
-    compact_hints, format_key_text, truncate_to_visual_lines, BorderedLoader, Keymap, UiTheme,
+    BorderedLoader, Keymap, UiTheme, compact_hints, format_key_text, truncate_to_visual_lines,
 };
+use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
-use ratatui::Terminal;
 
 fn buf_string(terminal: &Terminal<TestBackend>) -> String {
     let buf = terminal.backend().buffer();
@@ -49,7 +54,10 @@ fn compact_hints_source_keys_from_the_live_keymap() {
     let hints = compact_hints(&km);
     // Pi order: interrupt, clear/exit, /, !, more.
     let descs: Vec<&str> = hints.iter().map(|(_, d)| d.as_str()).collect();
-    assert_eq!(descs, vec!["interrupt", "clear/exit", "commands", "bash", "more"]);
+    assert_eq!(
+        descs,
+        vec!["interrupt", "clear/exit", "commands", "bash", "more"]
+    );
     // Defaults: Escape interrupt, Ctrl+C clear, Ctrl+D exit, Ctrl+O expand. The interrupt key spells
     // out as `escape`: upstream's id is `"app.interrupt": { defaultKeys: "escape" }` (v0.84.1
     // `coding-agent/src/core/keybindings.ts:66`) and `formatKeyText` (`keybinding-hints.ts:17-27`)
@@ -137,7 +145,10 @@ fn truncate_word_wraps_and_measures_in_columns_not_chars() {
     // Word boundaries only — no row may start or end mid-word.
     for row in &r.lines {
         assert!(row.len() <= 38, "row overflows: {row:?}");
-        assert!(!row.starts_with(' ') && !row.ends_with(' '), "untrimmed row: {row:?}");
+        assert!(
+            !row.starts_with(' ') && !row.ends_with(' '),
+            "untrimmed row: {row:?}"
+        );
     }
     let rejoined = r.lines.join(" ");
     assert_eq!(rejoined, text, "words were split: {:?}", r.lines);

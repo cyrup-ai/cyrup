@@ -11,13 +11,18 @@
 //! template (and every non-prompt row) omits the key entirely (`None` ⇒ absent, not `null`, mirroring
 //! pi's spread-if-truthy `...(cmd.argumentHint && { argumentHint: cmd.argumentHint })`,
 //! `interactive-mode.ts:685-689`).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use cyrup_provider::faux::FauxProvider;
 use cyrup_provider::Provider;
+use cyrup_provider::faux::FauxProvider;
 use tempfile::TempDir;
 
 use crate::{SessionBuilder, SessionConfig};
@@ -41,7 +46,11 @@ fn fixture() -> Fx {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fx { _tmp: tmp, cwd, agent_dir }
+    Fx {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 async fn build_session(fx: &Fx) -> crate::AgentSession {
@@ -68,7 +77,10 @@ async fn prompt_template_with_argument_hint_surfaces_it_in_the_catalog() {
         .iter()
         .find(|c| c.get("name").and_then(serde_json::Value::as_str) == Some("deploy"))
         .unwrap_or_else(|| panic!("no /deploy row in catalog: {catalog:?}"));
-    assert_eq!(row.get("source").and_then(serde_json::Value::as_str), Some("prompt"));
+    assert_eq!(
+        row.get("source").and_then(serde_json::Value::as_str),
+        Some("prompt")
+    );
     assert_eq!(
         row.get("argumentHint").and_then(serde_json::Value::as_str),
         Some("<env> [--dry-run]"),
@@ -81,7 +93,10 @@ async fn prompt_template_with_argument_hint_surfaces_it_in_the_catalog() {
 #[tokio::test]
 async fn prompt_template_without_argument_hint_omits_the_key() {
     let fx = fixture();
-    write(&fx.agent_dir.join("prompts/greet.md"), "---\ndescription: Say hello\n---\nHello $1");
+    write(
+        &fx.agent_dir.join("prompts/greet.md"),
+        "---\ndescription: Say hello\n---\nHello $1",
+    );
     let session = build_session(&fx).await;
 
     let catalog = session.slash_command_catalog();
@@ -89,7 +104,10 @@ async fn prompt_template_without_argument_hint_omits_the_key() {
         .iter()
         .find(|c| c.get("name").and_then(serde_json::Value::as_str) == Some("greet"))
         .unwrap_or_else(|| panic!("no /greet row in catalog: {catalog:?}"));
-    assert!(!row.as_object().unwrap().contains_key("argumentHint"), "row: {row:?}");
+    assert!(
+        !row.as_object().unwrap().contains_key("argumentHint"),
+        "row: {row:?}"
+    );
 }
 
 /// Scoping proof: even with a hinted prompt template present, extension and skill rows never carry
@@ -113,5 +131,8 @@ async fn skill_rows_never_carry_argument_hint() {
         .iter()
         .find(|c| c.get("name").and_then(serde_json::Value::as_str) == Some("skill:alpha"))
         .unwrap_or_else(|| panic!("no skill:alpha row in catalog: {catalog:?}"));
-    assert!(!skill_row.as_object().unwrap().contains_key("argumentHint"), "row: {skill_row:?}");
+    assert!(
+        !skill_row.as_object().unwrap().contains_key("argumentHint"),
+        "row: {skill_row:?}"
+    );
 }

@@ -426,22 +426,26 @@ impl AgentSession {
         // `Err` rather than panicking (workspace denies `panic`).
         let weak = Arc::downgrade(&arc);
         let runtime = tokio::runtime::Handle::try_current().ok();
-        arc.services.host_services.set_inject_sink(Arc::new(move |msg: InjectMessage| {
-            let session = weak.upgrade().ok_or("inject_message: session dropped")?;
-            let runtime = runtime.clone().ok_or("inject_message: no runtime to inject on")?;
-            runtime.spawn(async move {
-                let _ = session
-                    .inject_message(
-                        msg.content,
-                        msg.custom_type,
-                        msg.display,
-                        msg.details,
-                        msg.trigger_turn,
-                    )
-                    .await;
-            });
-            Ok(())
-        }));
+        arc.services
+            .host_services
+            .set_inject_sink(Arc::new(move |msg: InjectMessage| {
+                let session = weak.upgrade().ok_or("inject_message: session dropped")?;
+                let runtime = runtime
+                    .clone()
+                    .ok_or("inject_message: no runtime to inject on")?;
+                runtime.spawn(async move {
+                    let _ = session
+                        .inject_message(
+                            msg.content,
+                            msg.custom_type,
+                            msg.display,
+                            msg.details,
+                            msg.trigger_turn,
+                        )
+                        .await;
+                });
+                Ok(())
+            }));
         // EXT-005: give the capability backend a LIVE readback of run activity + a real interrupt,
         // so a guest's `ctx.isIdle()`/`ctx.hasPendingMessages()` answer from this session and its
         // `ctx.abort()` stops the run that is in flight (Pi binds all three straight to the session,

@@ -152,8 +152,7 @@ mod tests {
 
     #[test]
     fn nested_object_order_preserved() {
-        let v: OrderedValue =
-            serde_json::from_str(r#"{"bash":{"z":"deny","a":"allow"}}"#).unwrap();
+        let v: OrderedValue = serde_json::from_str(r#"{"bash":{"z":"deny","a":"allow"}}"#).unwrap();
         let bash = v.get("bash").unwrap().as_object().unwrap();
         assert_eq!(bash[0].0, "z");
         assert_eq!(bash[1].0, "a");

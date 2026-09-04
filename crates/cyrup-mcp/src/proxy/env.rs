@@ -10,16 +10,14 @@ use serde_json::{Map as JsonMap, Value};
 use cyrup_core::{CancelToken, Content};
 
 use crate::abort::combine;
-use crate::config::{
-    McpConfig, McpSettings, ServerEntry,
-};
+use crate::config::{McpConfig, McpSettings, ServerEntry};
 use crate::errors::{McpError, McpResult};
 use crate::owner::McpRuntimeOwner;
-use crate::state::McpState;
 use crate::proxy::approval::{ensure_tool_call_approved, is_tool_call_approval_required};
 use crate::proxy::call::AuthRecovery;
 use crate::proxy::ranking::rank_suggestions;
 use crate::proxy::tool_metadata::ToolMetadata;
+use crate::state::McpState;
 
 // ==================================================================================================
 // 4 · The collaborator seam — `ProxyEnv`, and the context every mode takes
@@ -381,7 +379,11 @@ pub trait ProxyEnv: Send + Sync {
 
     // --- mcp-output-guard.ts ---------------------------------------------------------------------
     /// `guardMcpOutput(content, {...resolveMcpOutputGuardOptions(settings), ...options})`.
-    async fn guard_mcp_output(&self, content: Vec<Content>, options: OutputGuardOptions) -> GuardedOutput;
+    async fn guard_mcp_output(
+        &self,
+        content: Vec<Content>,
+        options: OutputGuardOptions,
+    ) -> GuardedOutput;
 
     // --- pi.getAllTools() ------------------------------------------------------------------------
     /// `getPiTools?.()` — `HostServices::all_tool_names()`.
@@ -424,7 +426,10 @@ impl ProxyCtx {
 
     /// The one read path onto `state.toolMetadata`. A poisoned lock degrades to "no metadata",
     /// never to a panic (the crate denies `clippy::panic` and `init` must not fail).
-    pub(crate) fn with_metadata<R>(&self, f: impl FnOnce(&IndexMap<String, Vec<ToolMetadata>>) -> R) -> R {
+    pub(crate) fn with_metadata<R>(
+        &self,
+        f: impl FnOnce(&IndexMap<String, Vec<ToolMetadata>>) -> R,
+    ) -> R {
         match self.state.tool_metadata.lock() {
             Ok(guard) => f(&guard),
             Err(_) => f(&IndexMap::new()),
@@ -476,8 +481,15 @@ impl ProxyCtx {
     }
 
     /// The one write path onto `state.toolMetadata`.
-    pub(crate) fn with_metadata_mut<R>(&self, f: impl FnOnce(&mut IndexMap<String, Vec<ToolMetadata>>) -> R) -> Option<R> {
-        self.state.tool_metadata.lock().ok().map(|mut guard| f(&mut guard))
+    pub(crate) fn with_metadata_mut<R>(
+        &self,
+        f: impl FnOnce(&mut IndexMap<String, Vec<ToolMetadata>>) -> R,
+    ) -> Option<R> {
+        self.state
+            .tool_metadata
+            .lock()
+            .ok()
+            .map(|mut guard| f(&mut guard))
     }
 
     /// The resolved configuration this generation is running.
@@ -511,7 +523,9 @@ impl ProxyCtx {
     /// its default impl is a no-op, which degrades exactly the way upstream's `if (state.ui)` guard
     /// does — no gap.
     pub(crate) fn set_status(&self, message: &str) {
-        let Some(ui) = self.state.ui.as_ref() else { return };
+        let Some(ui) = self.state.ui.as_ref() else {
+            return;
+        };
         let text = format_mcp_status(self.config(), message);
         cyrup_ext::HostServices::set_status(ui.as_ref(), "mcp", text.as_deref());
     }
@@ -528,13 +542,20 @@ impl ProxyCtx {
 
     /// `state.serverInstructions.get(server)`.
     pub(crate) fn server_instructions(&self, server: &str) -> Option<String> {
-        self.state.server_instructions.lock().ok().and_then(|map| map.get(server).cloned())
+        self.state
+            .server_instructions
+            .lock()
+            .ok()
+            .and_then(|map| map.get(server).cloned())
     }
 
     /// `isServerDisabled(state.config.mcpServers[server])` — **only** the literal boolean `true`
     /// disables a server, and an *unknown* server is not disabled.
     pub(crate) fn is_disabled(&self, server: &str) -> bool {
-        self.config().mcp_servers.get(server).is_some_and(ServerEntry::is_disabled)
+        self.config()
+            .mcp_servers
+            .get(server)
+            .is_some_and(ServerEntry::is_disabled)
     }
 
     /// `rankSuggestions(state, name, limit)` against this context.

@@ -178,7 +178,10 @@ pub fn normalize_native_shift_enter(
     is_shift_pressed: bool,
 ) -> KeyEvent {
     if should_detect && is_shift_pressed {
-        return KeyEvent { modifiers: ev.modifiers | KeyModifiers::SHIFT, ..ev };
+        return KeyEvent {
+            modifiers: ev.modifiers | KeyModifiers::SHIFT,
+            ..ev
+        };
     }
     ev
 }
@@ -197,5 +200,9 @@ pub fn rescue_native_shift_enter(
     probe: impl Fn(ModifierKey) -> bool,
 ) -> KeyEvent {
     let should_detect = should_detect_native_shift_enter(&ev, platform, term_program);
-    normalize_native_shift_enter(ev, should_detect, should_detect && probe(ModifierKey::Shift))
+    normalize_native_shift_enter(
+        ev,
+        should_detect,
+        should_detect && probe(ModifierKey::Shift),
+    )
 }

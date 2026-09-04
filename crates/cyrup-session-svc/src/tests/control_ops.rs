@@ -13,22 +13,25 @@
 //! changed session id, a moved tree leaf, a persisted message, an aborted run — never on the fact
 //! that `HostServices::control(...)` returned `Ok`. That return already succeeded before this fix;
 //! asserting it would re-create exactly the bug being closed.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::{AgentSession, AgentSessionRuntime, SessionConfig, SessionFactory, SessionTarget};
 use cyrup_core::{ExtensionId, Message, StopReason};
 use cyrup_ext::{
-    CommandDescriptor, ControlOp, ExtError, HostCtx, HostEvent, HookOutcome, HostServices, InitApi,
+    CommandDescriptor, ControlOp, ExtError, HookOutcome, HostCtx, HostEvent, HostServices, InitApi,
     NativeExtension,
 };
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 use cyrup_provider::Provider;
-use crate::{
-    AgentSession, AgentSessionRuntime, SessionConfig, SessionFactory, SessionTarget,
-};
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -73,7 +76,13 @@ impl NativeExtension for ControlExt {
             "ctlfork",
             "ctlabort",
         ] {
-            api.register_command(name, CommandDescriptor { description: format!("control op {name}"), completions: Vec::new() });
+            api.register_command(
+                name,
+                CommandDescriptor {
+                    description: format!("control op {name}"),
+                    completions: Vec::new(),
+                },
+            );
         }
         Ok(())
     }
@@ -99,7 +108,8 @@ impl NativeExtension for ControlExt {
         // makes the first OBSERVABLE — if `WaitIdle` were discarded (pre-SEAM-003) neither op would
         // land, and if it stalled the drain the second would never be applied either.
         if name == "ctlwait" {
-            svc.control(ControlOp::WaitIdle).map_err(ExtError::Component)?;
+            svc.control(ControlOp::WaitIdle)
+                .map_err(ExtError::Component)?;
             svc.control(ControlOp::SendMessage {
                 message: json!({ "customType": "ctlAfterWait", "content": { "note": "after wait" } }),
                 opts: json!({}),
@@ -110,13 +120,22 @@ impl NativeExtension for ControlExt {
         let op = match name {
             "ctlnew" => ControlOp::NewSession { opts: json!({}) },
             "ctlreload" => ControlOp::Reload,
-            "ctlnavigate" => ControlOp::Navigate { entry_id: arg, opts: json!({}) },
+            "ctlnavigate" => ControlOp::Navigate {
+                entry_id: arg,
+                opts: json!({}),
+            },
             "ctlsend" => ControlOp::SendMessage {
                 message: json!({ "customType": "ctlNote", "content": { "note": "from control op" } }),
                 opts: json!({}),
             },
-            "ctlswitch" => ControlOp::Switch { session_id: arg, opts: json!({}) },
-            "ctlfork" => ControlOp::Fork { entry_id: arg, opts: json!({}) },
+            "ctlswitch" => ControlOp::Switch {
+                session_id: arg,
+                opts: json!({}),
+            },
+            "ctlfork" => ControlOp::Fork {
+                entry_id: arg,
+                opts: json!({}),
+            },
             "ctlabort" => ControlOp::Abort,
             other => return Err(ExtError::Component(format!("no such command {other}"))),
         };
@@ -124,8 +143,6 @@ impl NativeExtension for ControlExt {
         Ok(Some(String::new()))
     }
 }
-
-
 
 // ---------------------------------------------------------------------------------------------
 
@@ -141,7 +158,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -153,7 +174,10 @@ fn base_config(fx: &Fixture) -> SessionConfig {
 
 fn faux_ok() -> Arc<dyn Provider> {
     let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("ok")],
+        StopReason::Stop,
+    )]);
     faux
 }
 
@@ -163,7 +187,9 @@ async fn runtime_with(fx: &Fixture, ext: Arc<ControlExt>) -> Arc<AgentSessionRun
         SessionFactory::new(faux_ok(), base_config(fx))
             .with_native_extension(ext as Arc<dyn NativeExtension>),
     );
-    AgentSessionRuntime::create(factory, SessionTarget::New).await.unwrap()
+    AgentSessionRuntime::create(factory, SessionTarget::New)
+        .await
+        .unwrap()
 }
 
 async fn session_id_of(session: &AgentSession) -> String {
@@ -191,7 +217,10 @@ async fn control_new_session_actually_replaces_the_active_session() {
     let _ = session.prompt("/ctlnew").await.unwrap();
     session.wait_for_idle().await;
 
-    assert_eq!(before_gen, 0, "a freshly created runtime starts at generation 0");
+    assert_eq!(
+        before_gen, 0,
+        "a freshly created runtime starts at generation 0"
+    );
     assert_eq!(
         runtime.generation().await,
         1,
@@ -217,7 +246,10 @@ async fn control_reload_actually_rebuilds_the_session() {
     let _ = session.prompt("hello").await.unwrap();
     session.wait_for_idle().await;
     let file_before = session.session_file().await;
-    assert!(file_before.is_some(), "the session persisted a file to reload from");
+    assert!(
+        file_before.is_some(),
+        "the session persisted a file to reload from"
+    );
 
     let _ = session.prompt("/ctlreload").await.unwrap();
     session.wait_for_idle().await;
@@ -265,15 +297,11 @@ async fn control_switch_actually_resumes_the_named_session() {
         "ctx.switchSession(path) resumed the named session file"
     );
     assert!(
-        runtime
-            .session()
-            .await
-            .messages()
-            .await
-            .iter()
-            .any(|m| matches!(m, Message::User { content, .. }
+        runtime.session().await.messages().await.iter().any(
+            |m| matches!(m, Message::User { content, .. }
                 if content.iter().any(|c| matches!(c, cyrup_core::Content::Text { text, .. }
-                    if text.contains("first session"))))),
+                    if text.contains("first session"))))
+        ),
         "the resumed session carries session A's transcript"
     );
 }
@@ -304,7 +332,11 @@ async fn control_fork_actually_branches_and_switches() {
     let _ = session.prompt("/ctlfork").await.unwrap();
     session.wait_for_idle().await;
 
-    assert_eq!(runtime.generation().await, 1, "ctx.fork() replaced the active session");
+    assert_eq!(
+        runtime.generation().await,
+        1,
+        "ctx.fork() replaced the active session"
+    );
     assert_ne!(
         session_id_of(&*runtime.session().await).await,
         before_id,
@@ -367,7 +399,9 @@ async fn control_send_message_actually_reaches_the_session() {
 
     let entries = runtime.session().await.entries_json().await;
     assert!(
-        entries.iter().any(|e| e.get("customType").and_then(|v| v.as_str()) == Some("ctlNote")),
+        entries
+            .iter()
+            .any(|e| e.get("customType").and_then(|v| v.as_str()) == Some("ctlNote")),
         "ctx.sendMessage() persisted the custom message into the live session: {entries:?}"
     );
 }
@@ -388,11 +422,16 @@ async fn control_wait_idle_is_applied_without_stalling_the_drain() {
         session.wait_for_idle().await;
     })
     .await;
-    assert!(done.is_ok(), "a queued wait-idle control op must not hang the command path");
+    assert!(
+        done.is_ok(),
+        "a queued wait-idle control op must not hang the command path"
+    );
 
     let entries = runtime.session().await.entries_json().await;
     assert!(
-        entries.iter().any(|e| e.get("customType").and_then(|v| v.as_str()) == Some("ctlAfterWait")),
+        entries
+            .iter()
+            .any(|e| e.get("customType").and_then(|v| v.as_str()) == Some("ctlAfterWait")),
         "the op queued AFTER wait_idle was applied — the wait ran and the drain continued: {entries:?}"
     );
 

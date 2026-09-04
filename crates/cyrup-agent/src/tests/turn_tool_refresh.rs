@@ -22,9 +22,9 @@ use cyrup_core::{
     CancelToken, Content, EventStream, ModelRef, StopReason, Tool, ToolCallId, ToolError,
     ToolResult, ToolUpdateSink,
 };
-use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call, FauxProvider};
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text, faux_tool_call};
 use cyrup_provider::{Context, StreamEvent, StreamOptions};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::support::model_ref;
 
@@ -55,8 +55,10 @@ fn recording(responses: Vec<cyrup_core::AssistantMessage>) -> (Arc<dyn StreamFn>
     let faux = Arc::new(FauxProvider::new());
     faux.set_responses(responses);
     let seen: Requests = Arc::new(Mutex::new(Vec::new()));
-    let sf: Arc<dyn StreamFn> =
-        Arc::new(ToolRequestSpy { inner: Arc::new(crate::ProviderStreamFn::new(faux)), seen: seen.clone() });
+    let sf: Arc<dyn StreamFn> = Arc::new(ToolRequestSpy {
+        inner: Arc::new(crate::ProviderStreamFn::new(faux)),
+        seen: seen.clone(),
+    });
     (sf, seen)
 }
 
@@ -96,7 +98,10 @@ impl Tool for FlagTool {
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
         self.ran.store(true, Ordering::SeqCst);
-        Ok(ToolResult { content: vec![Content::text("ok")], ..Default::default() })
+        Ok(ToolResult {
+            content: vec![Content::text("ok")],
+            ..Default::default()
+        })
     }
 }
 
@@ -109,7 +114,11 @@ struct RefreshOnce {
 
 #[async_trait::async_trait]
 impl Hooks for RefreshOnce {
-    async fn prepare_next_turn(&self, _ctx: PostTurn<'_>, _cancel: CancelToken) -> Result<Option<TurnUpdate>, HookError> {
+    async fn prepare_next_turn(
+        &self,
+        _ctx: PostTurn<'_>,
+        _cancel: CancelToken,
+    ) -> Result<Option<TurnUpdate>, HookError> {
         if self.turns.fetch_add(1, Ordering::SeqCst) == 0 {
             Ok(Some(TurnUpdate {
                 tools: Some(self.tools.clone()),
@@ -155,20 +164,45 @@ async fn turn_update_tools_reach_the_next_request_and_stick() {
     assert_eq!(reqs.len(), 4, "four provider requests: {reqs:?}");
 
     // NOT BEFORE.
-    assert_eq!(reqs[0].0, vec!["echo".to_string()], "turn 1 runs on the run-start snapshot");
+    assert_eq!(
+        reqs[0].0,
+        vec!["echo".to_string()],
+        "turn 1 runs on the run-start snapshot"
+    );
     assert_eq!(reqs[0].1, "BASE", "turn 1 uses the run's system prompt");
 
     // FROM THE REFRESH ONWARD.
-    assert!(reqs[1].0.contains(&"late".to_string()), "turn 2 offers the refreshed tool: {:?}", reqs[1].0);
-    assert!(reqs[1].0.contains(&"echo".to_string()), "turn 2 kept the original tool: {:?}", reqs[1].0);
-    assert_eq!(reqs[1].1, "REFRESHED", "turn 2 uses the refreshed system prompt");
+    assert!(
+        reqs[1].0.contains(&"late".to_string()),
+        "turn 2 offers the refreshed tool: {:?}",
+        reqs[1].0
+    );
+    assert!(
+        reqs[1].0.contains(&"echo".to_string()),
+        "turn 2 kept the original tool: {:?}",
+        reqs[1].0
+    );
+    assert_eq!(
+        reqs[1].1, "REFRESHED",
+        "turn 2 uses the refreshed system prompt"
+    );
 
     // STICKY — the hook returned the update ONCE, and turn 3 still runs on it (agent-loop.ts:226-239).
-    assert!(reqs[2].0.contains(&"late".to_string()), "turn 3 keeps the refreshed tools: {:?}", reqs[2].0);
-    assert_eq!(reqs[2].1, "REFRESHED", "turn 3 keeps the refreshed system prompt");
+    assert!(
+        reqs[2].0.contains(&"late".to_string()),
+        "turn 3 keeps the refreshed tools: {:?}",
+        reqs[2].0
+    );
+    assert_eq!(
+        reqs[2].1, "REFRESHED",
+        "turn 3 keeps the refreshed system prompt"
+    );
 
     // CALLABLE, not merely advertised.
-    assert!(late_ran.load(Ordering::SeqCst), "the refreshed tool actually executed");
+    assert!(
+        late_ran.load(Ordering::SeqCst),
+        "the refreshed tool actually executed"
+    );
 }
 
 /// The absent case is a no-op: a `TurnUpdate` that leaves both fields `None` must not clear the
@@ -178,7 +212,11 @@ struct ModelOnlyUpdate;
 
 #[async_trait::async_trait]
 impl Hooks for ModelOnlyUpdate {
-    async fn prepare_next_turn(&self, _ctx: PostTurn<'_>, _cancel: CancelToken) -> Result<Option<TurnUpdate>, HookError> {
+    async fn prepare_next_turn(
+        &self,
+        _ctx: PostTurn<'_>,
+        _cancel: CancelToken,
+    ) -> Result<Option<TurnUpdate>, HookError> {
         Ok(Some(TurnUpdate::default()))
     }
 }
@@ -201,6 +239,13 @@ async fn a_turn_update_without_tools_leaves_the_run_baseline_alone() {
 
     let reqs = seen.lock().unwrap().clone();
     assert_eq!(reqs.len(), 2, "{reqs:?}");
-    assert_eq!(reqs[1].0, vec!["echo".to_string()], "the tool set survived an empty update");
-    assert_eq!(reqs[1].1, "BASE", "the system prompt survived an empty update");
+    assert_eq!(
+        reqs[1].0,
+        vec!["echo".to_string()],
+        "the tool set survived an empty update"
+    );
+    assert_eq!(
+        reqs[1].1, "BASE",
+        "the system prompt survived an empty update"
+    );
 }

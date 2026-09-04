@@ -4,8 +4,8 @@
 
 use std::io::Write;
 
-use cyrup_session::manager::SessionManager;
 use cyrup_session::error::SessionError;
+use cyrup_session::manager::SessionManager;
 
 use crate::golden::normalize_value;
 
@@ -21,7 +21,10 @@ pub enum InteropError {
 /// Import a Pi-shaped session JSONL (header line + entry lines) and re-export it, returning the
 /// exported JSONL. Round-trips through cyrup's [`SessionManager`].
 pub fn import_export(input: &str) -> Result<String, InteropError> {
-    let mut file = tempfile::Builder::new().prefix("cyrup-interop-").suffix(".jsonl").tempfile()?;
+    let mut file = tempfile::Builder::new()
+        .prefix("cyrup-interop-")
+        .suffix(".jsonl")
+        .tempfile()?;
     file.write_all(input.as_bytes())?;
     file.flush()?;
     let manager = SessionManager::import_jsonl(file.path())?;

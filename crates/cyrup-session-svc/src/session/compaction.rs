@@ -51,8 +51,10 @@ impl AgentSession {
         // The slot is installed BY the guard so the two can never be written apart — see
         // [`CompactionCancelGuard`] for why a hand-written clear at each `return` is not enough in
         // Rust, and why the ordered `clear()` calls below still stand.
-        let mut cancel_slot = CompactionCancelGuard::install(&self.compaction_cancel, cancel.clone());
-        self.fanout_emit(AgentSessionEvent::CompactionStart { reason }).await;
+        let mut cancel_slot =
+            CompactionCancelGuard::install(&self.compaction_cancel, cancel.clone());
+        self.fanout_emit(AgentSessionEvent::CompactionStart { reason })
+            .await;
 
         // Pi's very first statement inside `compact()`'s `try` is the model check —
         // `if (!this.model) { throw new Error(formatNoModelSelectedMessage()); }`
@@ -79,17 +81,22 @@ impl AgentSession {
         };
         // Pi: `this._summarizationRetryCallbacks({ source: "compaction", reason: "manual" })`
         // (agent-session.ts:1859).
-        let (retry_observer, retry_rx) = crate::compact::summarization_retry_channel(
-            SummarizationRetrySource::Compaction { reason },
-        );
+        let (retry_observer, retry_rx) =
+            crate::compact::summarization_retry_channel(SummarizationRetrySource::Compaction {
+                reason,
+            });
         let retry_pump = self.spawn_event_pump(retry_rx);
-        let summarizer =
-            DynSummarizer::new(self.provider.current(), model.clone(), self.summarization_retry())
-                .with_observer(retry_observer);
+        let summarizer = DynSummarizer::new(
+            self.provider.current(),
+            model.clone(),
+            self.summarization_retry(),
+        )
+        .with_observer(retry_observer);
         // Pi threads the session thinking level into every compaction summarization call
         // (`agent-session.ts:1855,2129`); `summarization_reasoning` applies the `model.reasoning`
         // gate before it reaches the request.
-        let compactor = Compactor::new(summarizer, NoHooks).with_thinking(self.thinking_level().await);
+        let compactor =
+            Compactor::new(summarizer, NoHooks).with_thinking(self.thinking_level().await);
         let settings = self.compaction_settings.clone();
 
         // Compute the REAL preparation BEFORE the extension hook (Pi computes `prepareCompaction`
@@ -499,13 +506,22 @@ fn compaction_preparation_value(prep: &CompactionPreparation) -> serde_json::Val
 /// into a [`CompactionOverride`]. A missing `summary` degrades to empty (never a panic).
 fn parse_compaction_override(v: &serde_json::Value) -> CompactionOverride {
     CompactionOverride {
-        summary: v.get("summary").and_then(|s| s.as_str()).unwrap_or_default().to_string(),
-        first_kept_entry_id: v.get("firstKeptEntryId").and_then(|s| s.as_str()).map(EntryId::from),
+        summary: v
+            .get("summary")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        first_kept_entry_id: v
+            .get("firstKeptEntryId")
+            .and_then(|s| s.as_str())
+            .map(EntryId::from),
         tokens_before: v.get("tokensBefore").and_then(serde_json::Value::as_u64),
         details: v.get("details").cloned(),
         // Pi threads `extensionCompaction.usage` straight into `appendCompaction`
         // (`agent-session.ts:1844,1872`); a malformed/absent bag simply records no usage.
-        usage: v.get("usage").and_then(|u| serde_json::from_value(u.clone()).ok()),
+        usage: v
+            .get("usage")
+            .and_then(|u| serde_json::from_value(u.clone()).ok()),
     }
 }
 

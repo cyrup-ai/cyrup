@@ -77,7 +77,11 @@ pub fn provider_display_name(id: &str) -> String {
         _ => {}
     }
     let mut out = String::with_capacity(id.len());
-    for (i, word) in id.split(['-', '_', ' ']).filter(|w| !w.is_empty()).enumerate() {
+    for (i, word) in id
+        .split(['-', '_', ' '])
+        .filter(|w| !w.is_empty())
+        .enumerate()
+    {
         if i > 0 {
             out.push(' ');
         }
@@ -92,11 +96,7 @@ pub fn provider_display_name(id: &str) -> String {
             }
         }
     }
-    if out.is_empty() {
-        id.to_string()
-    } else {
-        out
-    }
+    if out.is_empty() { id.to_string() } else { out }
 }
 
 /// Build the selector rows from `(provider_id, state)` entries (Pi `getLoginProviderOptions`/
@@ -112,7 +112,11 @@ pub fn provider_rows(entries: Vec<(String, AuthState)>) -> Vec<(String, String, 
             (id, name, Some(state.status_text().to_string()))
         })
         .collect();
-    rows.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()).then(a.0.cmp(&b.0)));
+    rows.sort_by(|a, b| {
+        a.1.to_lowercase()
+            .cmp(&b.1.to_lowercase())
+            .then(a.0.cmp(&b.0))
+    });
     rows
 }
 
@@ -266,15 +270,26 @@ pub fn login_selector_rows(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 mod tests {
     use super::*;
 
     #[test]
     fn auth_state_maps_store_status() {
         assert_eq!(AuthState::from_status(true, false), AuthState::Configured);
-        assert_eq!(AuthState::from_status(false, true), AuthState::EnvConfigured);
-        assert_eq!(AuthState::from_status(false, false), AuthState::Unconfigured);
+        assert_eq!(
+            AuthState::from_status(false, true),
+            AuthState::EnvConfigured
+        );
+        assert_eq!(
+            AuthState::from_status(false, false),
+            AuthState::Unconfigured
+        );
         // `configured` wins even if a source is also present (stored beats env).
         assert_eq!(AuthState::from_status(true, true), AuthState::Configured);
     }
@@ -292,7 +307,10 @@ mod tests {
         assert_eq!(provider_display_name("openai"), "OpenAI");
         assert_eq!(provider_display_name("xai"), "xAI");
         assert_eq!(provider_display_name("github-copilot"), "GitHub Copilot");
-        assert_eq!(provider_display_name("vercel-ai-gateway"), "Vercel AI Gateway");
+        assert_eq!(
+            provider_display_name("vercel-ai-gateway"),
+            "Vercel AI Gateway"
+        );
         assert_eq!(provider_display_name("moonshotai-cn"), "Moonshotai CN");
         assert_eq!(provider_display_name(""), "");
     }

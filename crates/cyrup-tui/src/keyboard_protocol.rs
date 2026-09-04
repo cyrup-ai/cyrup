@@ -115,7 +115,10 @@ pub fn parse_negotiation_sequence(sequence: &str) -> Option<NegotiationSequence>
         if flags.is_empty() || !flags.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
-        return flags.parse::<u32>().ok().map(NegotiationSequence::KittyFlags);
+        return flags
+            .parse::<u32>()
+            .ok()
+            .map(NegotiationSequence::KittyFlags);
     }
     if let Some(params) = body.strip_suffix('c') {
         // `[\d;]*` — Pi accepts an empty parameter list here.
@@ -134,7 +137,10 @@ pub fn parse_negotiation_sequence(sequence: &str) -> Option<NegotiationSequence>
 pub fn is_negotiation_prefix(sequence: &str) -> bool {
     sequence == "\x1b["
         || (sequence.starts_with("\x1b[?")
-            && sequence.bytes().skip(3).all(|b| b.is_ascii_digit() || b == b';'))
+            && sequence
+                .bytes()
+                .skip(3)
+                .all(|b| b.is_ascii_digit() || b == b';'))
 }
 
 /// Locate a `CSI ? <flags> u` report anywhere inside a raw read (which also carries the DA1 sentinel
@@ -148,7 +154,10 @@ pub fn find_kitty_flags(buffer: &str) -> Option<u32> {
     while let Some(start) = rest.find("\x1b[?") {
         let tail = rest.get(start..)?;
         // The frame ends at its CSI final byte; only `u` is a flags report.
-        if let Some(end) = tail.bytes().skip(3).position(|b| (0x40..=0x7e).contains(&b))
+        if let Some(end) = tail
+            .bytes()
+            .skip(3)
+            .position(|b| (0x40..=0x7e).contains(&b))
             && let Some(frame) = tail.get(..end + 4)
             && let Some(NegotiationSequence::KittyFlags(flags)) = parse_negotiation_sequence(frame)
         {
@@ -222,13 +231,24 @@ pub fn negotiate() -> KeyboardProtocol {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
     use super::*;
 
     #[test]
     fn parses_pis_two_recognized_frames() {
-        assert_eq!(parse_negotiation_sequence("\x1b[?1u"), Some(NegotiationSequence::KittyFlags(1)));
-        assert_eq!(parse_negotiation_sequence("\x1b[?0u"), Some(NegotiationSequence::KittyFlags(0)));
+        assert_eq!(
+            parse_negotiation_sequence("\x1b[?1u"),
+            Some(NegotiationSequence::KittyFlags(1))
+        );
+        assert_eq!(
+            parse_negotiation_sequence("\x1b[?0u"),
+            Some(NegotiationSequence::KittyFlags(0))
+        );
         assert_eq!(
             parse_negotiation_sequence("\x1b[?29u"),
             Some(NegotiationSequence::KittyFlags(29))
@@ -246,10 +266,26 @@ mod tests {
 
     #[test]
     fn rejects_everything_else() {
-        assert_eq!(parse_negotiation_sequence("\x1b[?u"), None, "the QUERY is not a report");
-        assert_eq!(parse_negotiation_sequence("\x1b[?997;2n"), None, "a color-scheme report");
-        assert_eq!(parse_negotiation_sequence("\x1b[1u"), None, "no `?` — not a flags report");
-        assert_eq!(parse_negotiation_sequence("\x1b[?1;2u"), None, "Pi's `\\d+` allows no `;`");
+        assert_eq!(
+            parse_negotiation_sequence("\x1b[?u"),
+            None,
+            "the QUERY is not a report"
+        );
+        assert_eq!(
+            parse_negotiation_sequence("\x1b[?997;2n"),
+            None,
+            "a color-scheme report"
+        );
+        assert_eq!(
+            parse_negotiation_sequence("\x1b[1u"),
+            None,
+            "no `?` — not a flags report"
+        );
+        assert_eq!(
+            parse_negotiation_sequence("\x1b[?1;2u"),
+            None,
+            "Pi's `\\d+` allows no `;`"
+        );
         assert_eq!(parse_negotiation_sequence("hello"), None);
     }
 
@@ -258,7 +294,10 @@ mod tests {
         assert!(is_negotiation_prefix("\x1b["));
         assert!(is_negotiation_prefix("\x1b[?"));
         assert!(is_negotiation_prefix("\x1b[?62;1"));
-        assert!(!is_negotiation_prefix("\x1b[?1u"), "a complete frame is not a prefix");
+        assert!(
+            !is_negotiation_prefix("\x1b[?1u"),
+            "a complete frame is not a prefix"
+        );
         assert!(!is_negotiation_prefix("a"));
     }
 
@@ -268,7 +307,11 @@ mod tests {
         assert_eq!(find_kitty_flags("\x1b[?1u\x1b[?62;c"), Some(1));
         // A terminal that reports the flags AFTER its DA1 answer is still read correctly.
         assert_eq!(find_kitty_flags("\x1b[?62;c\x1b[?7u"), Some(7));
-        assert_eq!(find_kitty_flags("\x1b[?62;1;2;6;9;15;22c"), None, "DA1 only");
+        assert_eq!(
+            find_kitty_flags("\x1b[?62;1;2;6;9;15;22c"),
+            None,
+            "DA1 only"
+        );
         assert_eq!(find_kitty_flags(""), None);
     }
 
@@ -283,7 +326,10 @@ mod tests {
         assert_eq!(decide("\x1b[?62;1;2;6;9;15;22c"), KeyboardProtocol::Legacy);
         // Silence ⇒ nothing is known (Pi simply never fires its handler).
         assert_eq!(decide(""), KeyboardProtocol::Unknown);
-        assert_eq!(decide("\x1b]11;rgb:2828/2828/2828\x07"), KeyboardProtocol::Unknown);
+        assert_eq!(
+            decide("\x1b]11;rgb:2828/2828/2828\x07"),
+            KeyboardProtocol::Unknown
+        );
     }
 
     #[test]
@@ -299,7 +345,10 @@ mod tests {
         // before writing anything: it must return immediately with nothing known.
         let started = std::time::Instant::now();
         assert_eq!(negotiate(), KeyboardProtocol::Unknown);
-        assert!(started.elapsed() < Duration::from_secs(1), "the probe must not block");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the probe must not block"
+        );
         // …and the recorded state is readable afterwards.
         assert_eq!(current(), KeyboardProtocol::Unknown);
     }

@@ -44,10 +44,10 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use image::DynamicImage;
+use ratatui::Frame;
 use ratatui::layout::{Rect, Size};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::Protocol;
 use ratatui_image::{FontSize, Image, Resize};
@@ -94,7 +94,10 @@ impl ImageRenderer {
     /// A renderer that always uses the Unicode half-block raster (`terminal-image.ts` fallback). Needs
     /// no terminal query — used by tests and as the safe default.
     pub fn halfblocks() -> Self {
-        ImageRenderer { picker: Picker::halfblocks(), protocol_cache: Mutex::new(HashMap::new()) }
+        ImageRenderer {
+            picker: Picker::halfblocks(),
+            protocol_cache: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Choose the image protocol from the **environment**, not an APC round-trip (feature #7; Pi
@@ -151,7 +154,10 @@ impl ImageRenderer {
             Some(ImageProtocol::Iterm2) => ProtocolType::Iterm2,
             None => ProtocolType::Halfblocks,
         });
-        ImageRenderer { picker, protocol_cache: Mutex::new(HashMap::new()) }
+        ImageRenderer {
+            picker,
+            protocol_cache: Mutex::new(HashMap::new()),
+        }
     }
 
     /// The font cell the geometry is computed against, in pixels (`(width, height)`) — the measured
@@ -190,7 +196,10 @@ impl ImageRenderer {
         } else {
             rows
         };
-        (cols.min(u32::from(u16::MAX)) as u16, rows.min(u32::from(u16::MAX)) as u16)
+        (
+            cols.min(u32::from(u16::MAX)) as u16,
+            rows.min(u32::from(u16::MAX)) as u16,
+        )
     }
 
     /// Render `block` into `area` (spec/tui/06 §6). When `show_images` is on the real protocol draws
@@ -232,7 +241,10 @@ impl ImageRenderer {
             Err(poisoned) => poisoned.into_inner(),
         };
         if !cache.contains_key(&key) {
-            match self.picker.new_protocol(block.image.clone(), size, Resize::Fit(None)) {
+            match self
+                .picker
+                .new_protocol(block.image.clone(), size, Resize::Fit(None))
+            {
                 Ok(protocol) => {
                     cache.insert(key.clone(), protocol);
                 }
@@ -265,7 +277,10 @@ impl std::fmt::Debug for ImageBlock {
     /// `{:?}` of a transcript entry.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let (w, h) = self.dimensions();
-        f.debug_struct("ImageBlock").field("label", &self.label).field("size", &(w, h)).finish()
+        f.debug_struct("ImageBlock")
+            .field("label", &self.label)
+            .field("size", &(w, h))
+            .finish()
     }
 }
 
@@ -285,7 +300,11 @@ impl ImageBlock {
     /// since the MIME reaches the user through Pi's `[Image: … [{mimeType}] …]` fallback line
     /// ([`image_fallback_text`], `terminal-image.ts:546-558`).
     pub fn new(image: DynamicImage, label: impl Into<String>) -> Self {
-        ImageBlock { image, label: label.into(), mime: "image/png".to_string() }
+        ImageBlock {
+            image,
+            label: label.into(),
+            mime: "image/png".to_string(),
+        }
     }
 
     /// Decode raw image `bytes` (PNG/JPEG/GIF/WebP/BMP — the workspace `image` feature set), labelled
@@ -297,7 +316,11 @@ impl ImageBlock {
         let mime = image::guess_format(bytes)
             .map(|f| f.to_mime_type().to_string())
             .unwrap_or_else(|_| "image/png".to_string());
-        Some(ImageBlock { image, label: label.into(), mime })
+        Some(ImageBlock {
+            image,
+            label: label.into(),
+            mime,
+        })
     }
 
     /// The image's MIME type, as it appears in Pi's `[Image: {name} [{mime}] {w}x{h}]` fallback.
@@ -394,14 +417,21 @@ impl ImageBlock {
             natural_rows.min(u32::from(u16::MAX)) as u16,
         );
 
-        let area = Rect { x: 0, y: 0, width: cols, height: rows };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: cols,
+            height: rows,
+        };
         let Ok(protocol) =
             picker.new_protocol(self.image.clone(), Size::new(cols, rows), Resize::Fit(None))
         else {
             return Vec::new();
         };
         let mut buf = Buffer::empty(area);
-        Image::new(&protocol).allow_clipping(true).render(area, &mut buf);
+        Image::new(&protocol)
+            .allow_clipping(true)
+            .render(area, &mut buf);
         buffer_to_lines(&buf)
     }
 }
@@ -418,7 +448,9 @@ fn buffer_to_lines(buf: &ratatui::buffer::Buffer) -> Vec<Line<'static>> {
         let mut run = String::new();
         let mut run_style: Option<ratatui::style::Style> = None;
         for x in area.x..area.x.saturating_add(area.width) {
-            let Some(cell) = buf.cell((x, y)) else { continue };
+            let Some(cell) = buf.cell((x, y)) else {
+                continue;
+            };
             let style = cell.style();
             if run_style != Some(style) {
                 if let Some(prev) = run_style.take()
@@ -474,7 +506,9 @@ pub fn image_fallback_text(
 
 /// `shortenImagePath` (terminal-image.ts:533-539): rewrite a `$HOME`-rooted absolute path to `~/…`.
 fn shorten_image_path(filename: &str) -> String {
-    let Some(home) = std::env::var_os("HOME") else { return filename.to_string() };
+    let Some(home) = std::env::var_os("HOME") else {
+        return filename.to_string();
+    };
     let home = home.to_string_lossy();
     if home.is_empty() {
         return filename.to_string();
@@ -517,7 +551,11 @@ impl TerminalCapabilities {
     /// The conservative default a headless / unidentified terminal gets: no inline images, no
     /// hyperlinks, truecolor only if `COLORTERM` hinted it (Pi terminal-image.ts:124).
     fn conservative(true_color: bool) -> Self {
-        TerminalCapabilities { images: None, true_color, hyperlinks: false }
+        TerminalCapabilities {
+            images: None,
+            true_color,
+            hyperlinks: false,
+        }
     }
 }
 
@@ -635,8 +673,7 @@ pub fn detect_capabilities_with_overrides(
 ///
 /// It is now a resettable cache over the whole [`TerminalCapabilities`] record, not just the one
 /// field, so `images` and `true_color` get the same seam.
-static CAPABILITIES: std::sync::RwLock<Option<TerminalCapabilities>> =
-    std::sync::RwLock::new(None);
+static CAPABILITIES: std::sync::RwLock<Option<TerminalCapabilities>> = std::sync::RwLock::new(None);
 
 /// Whether the controlling terminal forwards OSC-8 hyperlinks — Pi `getCapabilities().hyperlinks`,
 /// the gate on `markdown.ts:692`. Detected once and cached for the life of the process, exactly as
@@ -781,7 +818,11 @@ pub fn detect_capabilities_on_platform(
         };
     }
     if term.starts_with("screen") {
-        return TerminalCapabilities { images: None, true_color: has_true_color, hyperlinks: false };
+        return TerminalCapabilities {
+            images: None,
+            true_color: has_true_color,
+            hyperlinks: false,
+        };
     }
     // Positively-identified terminals (terminal-image.ts:83-118).
     if has("KITTY_WINDOW_ID") || term_program == "kitty" {
@@ -793,9 +834,7 @@ pub fn detect_capabilities_on_platform(
     if has("WEZTERM_PANE") || term_program == "wezterm" {
         return identified(Some(ImageProtocol::Kitty), true);
     }
-    if term_program == "warpterminal"
-        || has("WARP_SESSION_ID")
-        || has("WARP_TERMINAL_SESSION_UUID")
+    if term_program == "warpterminal" || has("WARP_SESSION_ID") || has("WARP_TERMINAL_SESSION_UUID")
     {
         return identified(Some(ImageProtocol::Kitty), true);
     }
@@ -816,7 +855,11 @@ pub fn detect_capabilities_on_platform(
     // Version lag, not a port bug: upstream added this in `fa07e7bd9` ("fix(tui): detect truecolor
     // for Windows consoles"), after the v0.83.0 baseline this crate was ported against.
     if is_windows_console {
-        return TerminalCapabilities { images: None, true_color: true, hyperlinks: false };
+        return TerminalCapabilities {
+            images: None,
+            true_color: true,
+            hyperlinks: false,
+        };
     }
     // Unknown terminal: conservative — OSC-8 off (an unforwarded hyperlink would vanish from output).
     TerminalCapabilities::conservative(has_true_color)

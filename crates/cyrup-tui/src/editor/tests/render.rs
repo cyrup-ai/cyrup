@@ -1,22 +1,32 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
-use crate::editor::*;
 use super::command_highlight::registry_with_hinted_dynamic;
+use crate::editor::*;
 
 // ---- assembled render: highlight + ghost actually reach the frame -----------------------
 
 #[test]
 fn render_paints_the_token_in_accent_and_the_ghost_in_dim() {
+    use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
-    use ratatui::Terminal;
 
     let theme = UiTheme::default();
     let mut ed = InputEditor::new();
     ed.set_text("/model ");
     let mut term = Terminal::new(TestBackend::new(40, 4)).unwrap();
     term.draw(|f| {
-        let area = Rect { x: 0, y: 0, width: 40, height: 4 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 4,
+        };
         ed.render(f, area, &theme);
     })
     .unwrap();
@@ -33,8 +43,13 @@ fn render_paints_the_token_in_accent_and_the_ghost_in_dim() {
         );
     }
     // Somewhere after the caret, the dim ghost text "<provider/model>" must appear.
-    let row1: String = (0..40).map(|x| buf.cell((x, 1)).unwrap().symbol().to_string()).collect();
-    assert!(row1.contains("<provider/model>"), "ghost text missing from row: {row1:?}");
+    let row1: String = (0..40)
+        .map(|x| buf.cell((x, 1)).unwrap().symbol().to_string())
+        .collect();
+    assert!(
+        row1.contains("<provider/model>"),
+        "ghost text missing from row: {row1:?}"
+    );
     // And at least one of the ghost's cells carries the dim foreground.
     let ghost_start = row1.find('<').expect("ghost text present");
     assert_eq!(
@@ -46,16 +61,21 @@ fn render_paints_the_token_in_accent_and_the_ghost_in_dim() {
 
 #[test]
 fn render_shows_no_highlight_or_ghost_for_an_unknown_command() {
+    use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
-    use ratatui::Terminal;
 
     let theme = UiTheme::default();
     let mut ed = InputEditor::new();
     ed.set_text("/bogus thing");
     let mut term = Terminal::new(TestBackend::new(40, 4)).unwrap();
     term.draw(|f| {
-        let area = Rect { x: 0, y: 0, width: 40, height: 4 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 4,
+        };
         ed.render(f, area, &theme);
     })
     .unwrap();
@@ -73,9 +93,9 @@ fn render_shows_no_highlight_or_ghost_for_an_unknown_command() {
 
 #[test]
 fn render_never_grows_a_row_for_a_clipped_ghost() {
+    use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
-    use ratatui::Terminal;
 
     let theme = UiTheme::default();
     let mut ed = InputEditor::new();
@@ -87,15 +107,27 @@ fn render_never_grows_a_row_for_a_clipped_ghost() {
     // A narrow area: the ghost must clip with "…" rather than wrap onto a second row.
     let mut term = Terminal::new(TestBackend::new(20, 4)).unwrap();
     term.draw(|f| {
-        let area = Rect { x: 0, y: 0, width: 20, height: 4 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 4,
+        };
         ed.render(f, area, &theme);
     })
     .unwrap();
     let buf = term.backend().buffer();
-    let row1: String = (0..20).map(|x| buf.cell((x, 1)).unwrap().symbol().to_string()).collect();
-    assert!(row1.trim_end().ends_with('…'), "the ghost should clip with an ellipsis: {row1:?}");
+    let row1: String = (0..20)
+        .map(|x| buf.cell((x, 1)).unwrap().symbol().to_string())
+        .collect();
+    assert!(
+        row1.trim_end().ends_with('…'),
+        "the ghost should clip with an ellipsis: {row1:?}"
+    );
     // Only ONE text row was used — the ghost did not push content onto row 2.
-    let row2: String = (0..20).map(|x| buf.cell((x, 2)).unwrap().symbol().to_string()).collect();
+    let row2: String = (0..20)
+        .map(|x| buf.cell((x, 2)).unwrap().symbol().to_string())
+        .collect();
     assert!(
         row2.trim().is_empty() || row2.trim_start_matches('─').trim().is_empty(),
         "the ghost must not grow the editor's row count: {row2:?}"

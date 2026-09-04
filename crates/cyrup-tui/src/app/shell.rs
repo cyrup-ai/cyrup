@@ -6,7 +6,9 @@ impl<B: Backend> App<B> {
     /// footer, so finished history flushes to native scrollback (`insert_before`) instead of the
     /// inline region swallowing the whole screen. No alternate screen is entered.
     pub fn new(backend: B, theme: UiTheme) -> Result<Self, TuiError> {
-        let size = backend.size().map_err(|e| TuiError::Backend(e.to_string()))?;
+        let size = backend
+            .size()
+            .map_err(|e| TuiError::Backend(e.to_string()))?;
         let mut state = AppState::new(theme);
         // Seeded here as well as in `draw`, because a `--resume`/`--continue` boot replays its whole
         // conversation BEFORE the first frame, and the markdown-transform pass that replay ends with
@@ -17,7 +19,9 @@ impl<B: Backend> App<B> {
         let height = live_region_height(&mut state, size.width, size.height.max(1));
         let terminal = Terminal::with_options(
             backend,
-            TerminalOptions { viewport: Viewport::Inline(height.max(1)) },
+            TerminalOptions {
+                viewport: Viewport::Inline(height.max(1)),
+            },
         )
         .map_err(|e| TuiError::Backend(e.to_string()))?;
         // Seed `0` so the first `draw` always rebuilds the viewport bottom-anchored (the constructed
@@ -300,7 +304,12 @@ impl<B: Backend> App<B> {
     /// reached native scrollback without driving a real terminal.
     #[cfg(any(test, feature = "scrollback-accumulator"))]
     pub fn scrollback_text(&self) -> String {
-        self.state.scrollback.iter().map(line_text).collect::<Vec<_>>().join("\n")
+        self.state
+            .scrollback
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Attach a decoded image to the next prompt (rendered inline above the editor, spec/tui/06 §6;
@@ -368,7 +377,10 @@ impl<B: Backend> App<B> {
     /// was pasted; `false` when the clipboard holds neither an image nor text, or on any
     /// clipboard/encode/IO error — so the caller still lets Ctrl+V fall through to the editor.
     pub(crate) fn try_paste_clipboard_image_path(&mut self) -> bool {
-        self.paste_from_clipboard(read_clipboard_image_to_temp, crate::clipboard::read_clipboard_text)
+        self.paste_from_clipboard(
+            read_clipboard_image_to_temp,
+            crate::clipboard::read_clipboard_text,
+        )
     }
 
     /// Clear all attached images (after the prompt is sent, or on `Esc`).
@@ -412,7 +424,8 @@ impl<B: Backend> App<B> {
         } else {
             None
         };
-        self.state.image_renderer = ImageRenderer::from_capabilities_with_cell_size(caps, cell_size);
+        self.state.image_renderer =
+            ImageRenderer::from_capabilities_with_cell_size(caps, cell_size);
         // TUI-N01 / TUI-036 — publish the capability where the two consumers can reach it: the
         // transcript's tool-result image gate (Pi `tool-execution.ts:331`) and the `/settings` grid
         // builder, which must not offer image rows on a terminal with no protocol
@@ -486,7 +499,6 @@ impl<B: Backend> App<B> {
         self.state.terminal_title = Some(title.clone());
         Some(title)
     }
-
 }
 
 /// The inline renderer's half of the ADR-0005 §B-2 renderer seam

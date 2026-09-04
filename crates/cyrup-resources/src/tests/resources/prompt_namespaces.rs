@@ -33,7 +33,10 @@ async fn npt_namespaced_names_case_and_expansion() {
         &root.join("global/prompts/flux/new.md"),
         "---\ndescription: make a new thing\n---\nSay $1 to the world.\n",
     );
-    write(&root.join("global/prompts/flux/sub/thing.md"), "Thing $1.\n");
+    write(
+        &root.join("global/prompts/flux/sub/thing.md"),
+        "Thing $1.\n",
+    );
     write(&root.join("global/prompts/flux/CamelCase.md"), "CC.\n");
     write(
         &root.join("global/prompts/flux-new.md"),
@@ -45,17 +48,26 @@ async fn npt_namespaced_names_case_and_expansion() {
     let prompts = &report.registry.prompts;
 
     // §7 compat: a top-level file relativizes to its own basename.
-    assert_eq!(prompts.get_name("review").expect("flat review").name, "review");
+    assert_eq!(
+        prompts.get_name("review").expect("flat review").name,
+        "review"
+    );
     // Namespaced names: segments joined with `/`, case preserved.
     let t = prompts.get_name("flux/new").expect("flux/new discovered");
     assert_eq!(t.name, "flux/new");
     assert_eq!(t.description, "make a new thing");
     assert_eq!(
-        prompts.get_name("flux/sub/thing").expect("deeper nesting").name,
+        prompts
+            .get_name("flux/sub/thing")
+            .expect("deeper nesting")
+            .name,
         "flux/sub/thing"
     );
     assert_eq!(
-        prompts.get_name("flux/CamelCase").expect("case preserved").name,
+        prompts
+            .get_name("flux/CamelCase")
+            .expect("case preserved")
+            .name,
         "flux/CamelCase"
     );
     // §3.5: `flux/new` and `flux-new` are DISTINCT keys and coexist.
@@ -97,9 +109,18 @@ async fn npt_skip_rules_dir_names_only() {
     let report = run_discover(&c).await;
     let prompts = &report.registry.prompts;
 
-    assert_eq!(prompts.get_name("_leaf").expect("_leaf file loads").name, "_leaf");
-    assert_eq!(prompts.get_name(".dot").expect(".dot file loads").name, ".dot");
-    assert_eq!(prompts.get_name("ok/fine").expect("ok/fine loads").name, "ok/fine");
+    assert_eq!(
+        prompts.get_name("_leaf").expect("_leaf file loads").name,
+        "_leaf"
+    );
+    assert_eq!(
+        prompts.get_name(".dot").expect(".dot file loads").name,
+        ".dot"
+    );
+    assert_eq!(
+        prompts.get_name("ok/fine").expect("ok/fine loads").name,
+        "ok/fine"
+    );
     assert_eq!(
         prompts.len(),
         3,
@@ -172,30 +193,57 @@ async fn npt_symlink_policy() {
     write(&root.join("global/target.txt"), "not markdown\n");
 
     // A file symlink to a regular `.md` file: followed (Pi parity, prompt-templates.ts:150-160).
-    std::os::unix::fs::symlink(prompts_root.join("real/inner.md"), prompts_root.join("linkfile.md")).unwrap();
+    std::os::unix::fs::symlink(
+        prompts_root.join("real/inner.md"),
+        prompts_root.join("linkfile.md"),
+    )
+    .unwrap();
     // Directory symlinks: never recursed — including one pointing back at the scan root.
     std::os::unix::fs::symlink(prompts_root.join("real"), prompts_root.join("linkdir")).unwrap();
     std::os::unix::fs::symlink(&prompts_root, prompts_root.join("loopy")).unwrap();
     // A broken link, and a link whose OWN name lacks the `.md` extension: both skipped.
-    std::os::unix::fs::symlink(prompts_root.join("missing.md"), prompts_root.join("broken.md")).unwrap();
-    std::os::unix::fs::symlink(root.join("global/target.txt"), prompts_root.join("wrongext")).unwrap();
+    std::os::unix::fs::symlink(
+        prompts_root.join("missing.md"),
+        prompts_root.join("broken.md"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        root.join("global/target.txt"),
+        prompts_root.join("wrongext"),
+    )
+    .unwrap();
 
     let c = cfg(root);
     let report = run_discover(&c).await;
     let prompts = &report.registry.prompts;
 
     assert_eq!(
-        prompts.get_name("linkfile").expect("file symlink followed").name,
+        prompts
+            .get_name("linkfile")
+            .expect("file symlink followed")
+            .name,
         "linkfile"
     );
     assert_eq!(
-        prompts.get_name("real/inner").expect("real file loads").name,
+        prompts
+            .get_name("real/inner")
+            .expect("real file loads")
+            .name,
         "real/inner"
     );
-    assert!(!prompts.contains("linkdir/inner"), "dir symlink never followed");
-    assert!(!prompts.contains("loopy/real/inner"), "self-loop link never followed");
+    assert!(
+        !prompts.contains("linkdir/inner"),
+        "dir symlink never followed"
+    );
+    assert!(
+        !prompts.contains("loopy/real/inner"),
+        "self-loop link never followed"
+    );
     assert!(!prompts.contains("broken"), "broken link skipped");
-    assert!(!prompts.contains("wrongext"), "extension judged by the link's own name");
+    assert!(
+        !prompts.contains("wrongext"),
+        "extension judged by the link's own name"
+    );
     assert_eq!(
         prompts.len(),
         2,
@@ -232,18 +280,33 @@ fn npt_load_with_root_derivation_edges() {
     assert_eq!(t.name, "flux/new");
 
     // `load` relativizes against the file's own parent — Pi's basename behavior exactly.
-    let t = PromptTemplate::load(&root.join("flux/new.md"), ResourceScope::Cli, ResourceOrigin::Builtin).unwrap();
+    let t = PromptTemplate::load(
+        &root.join("flux/new.md"),
+        ResourceScope::Cli,
+        ResourceOrigin::Builtin,
+    )
+    .unwrap();
     assert_eq!(t.name, "new");
 
     // Stem = `file_name` + `strip_suffix(".md")`: `foo.bar.md` -> `foo.bar`.
     write(&root.join("foo.bar.md"), "x\n");
-    let t = PromptTemplate::load(&root.join("foo.bar.md"), ResourceScope::Cli, ResourceOrigin::Builtin).unwrap();
+    let t = PromptTemplate::load(
+        &root.join("foo.bar.md"),
+        ResourceScope::Cli,
+        ResourceOrigin::Builtin,
+    )
+    .unwrap();
     assert_eq!(t.name, "foo.bar");
 
     // A file literally named `.md` has an empty stem -> the same Manifest error as the old
     // basename derivation (`file_stem` would wrongly yield `.md` here — dotfiles have no ext).
     write(&root.join(".md"), "x\n");
-    let err = PromptTemplate::load(&root.join(".md"), ResourceScope::Cli, ResourceOrigin::Builtin).unwrap_err();
+    let err = PromptTemplate::load(
+        &root.join(".md"),
+        ResourceScope::Cli,
+        ResourceOrigin::Builtin,
+    )
+    .unwrap_err();
     match err {
         ResourceError::Manifest(m) => {
             assert!(m.contains("prompt template has no usable name"), "{m}")
@@ -301,7 +364,12 @@ fn npt_load_with_root_non_utf8_components_error() {
     let bad_nested = bad_dir.join("leaf.md");
     fs::write(&bad_nested, "x\n").unwrap();
     assert!(matches!(
-        PromptTemplate::load_with_root(&bad_nested, root, ResourceScope::Cli, ResourceOrigin::Builtin),
+        PromptTemplate::load_with_root(
+            &bad_nested,
+            root,
+            ResourceScope::Cli,
+            ResourceOrigin::Builtin
+        ),
         Err(ResourceError::Manifest(_))
     ));
 }
@@ -352,9 +420,15 @@ async fn npt_precedence_shadowing_and_case_collision() {
     let report = run_discover(&c).await;
     let prompts = &report.registry.prompts;
 
-    let winner = prompts.get_name("flux/new").expect("one winner under the shared key");
+    let winner = prompts
+        .get_name("flux/new")
+        .expect("one winner under the shared key");
     assert_eq!(winner.name, "FLUX/NEW", "winner keeps its own case");
-    assert_eq!(winner.scope, ResourceScope::Project, "project shadows global");
+    assert_eq!(
+        winner.scope,
+        ResourceScope::Project,
+        "project shadows global"
+    );
     assert_eq!(winner.expand("body"), "project body\n");
     // Both candidates are retained for diagnostics (`all`), only one wins.
     assert_eq!(prompts.all().len(), 2);
@@ -408,7 +482,9 @@ async fn npt_all_directory_and_single_file_call_sites() {
     c.extra.prompt_paths.push(ext.clone());
     c.cli.prompts.push(clidir.clone());
     c.cli.prompts.push(root.join("one.md"));
-    c.global_overrides.prompts.push("extra/sfile.md".to_string());
+    c.global_overrides
+        .prompts
+        .push("extra/sfile.md".to_string());
 
     let report = run_discover(&c).await;
     let prompts = &report.registry.prompts;
@@ -416,27 +492,48 @@ async fn npt_all_directory_and_single_file_call_sites() {
     // Directory-scan call sites -> namespaced names.
     // ((1) the global root is covered by `npt_namespaced_names_case_and_expansion`.)
     assert_eq!(
-        prompts.get_name("flux/proj").expect("project walk namespaced").scope,
+        prompts
+            .get_name("flux/proj")
+            .expect("project walk namespaced")
+            .scope,
         ResourceScope::Project
     );
-    assert!(prompts.contains("flux/pkg"), "package manifest dir namespaced");
+    assert!(
+        prompts.contains("flux/pkg"),
+        "package manifest dir namespaced"
+    );
     assert_eq!(
-        prompts.get_name("flux/ext").expect("resources_discover dir namespaced").scope,
+        prompts
+            .get_name("flux/ext")
+            .expect("resources_discover dir namespaced")
+            .scope,
         ResourceScope::Discovered
     );
     assert_eq!(
-        prompts.get_name("flux/cli").expect("cli dir namespaced").scope,
+        prompts
+            .get_name("flux/cli")
+            .expect("cli dir namespaced")
+            .scope,
         ResourceScope::Cli
     );
     // Single-file call sites -> basenames.
-    assert!(prompts.contains("solo"), "package manifest single file -> basename");
-    assert!(!prompts.contains("pkg/solo"), "single file never namespaces");
+    assert!(
+        prompts.contains("solo"),
+        "package manifest single file -> basename"
+    );
+    assert!(
+        !prompts.contains("pkg/solo"),
+        "single file never namespaces"
+    );
     assert_eq!(
         prompts.get_name("one").expect("cli file -> basename").scope,
         ResourceScope::Cli
     );
     assert_eq!(
-        prompts.get_name("sfile").expect("settings file entry -> basename").scope,
+        prompts
+            .get_name("sfile")
+            .expect("settings file entry -> basename")
+            .scope,
         ResourceScope::GlobalSettings
     );
 }

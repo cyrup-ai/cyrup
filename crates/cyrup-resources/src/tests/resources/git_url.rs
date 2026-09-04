@@ -198,7 +198,11 @@ fn cfg052_a_github_shorthand_is_a_local_path_exactly_as_upstream_leaves_it() {
     assert_eq!(with_prefix.host, "github.com");
     assert_eq!(with_prefix.path, "owner/repo");
 
-    for shorthand in ["github:owner/repo", "gitlab:group/proj", "bitbucket:owner/repo"] {
+    for shorthand in [
+        "github:owner/repo",
+        "gitlab:group/proj",
+        "bitbucket:owner/repo",
+    ] {
         assert!(
             parse_git_url(shorthand).is_none(),
             "{shorthand}: pi's `parseGitUrl` returns null at git.ts:177-179 before reaching \

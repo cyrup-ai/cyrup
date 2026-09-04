@@ -12,14 +12,14 @@
     clippy::string_slice
 )]
 
+use super::harness::*;
 use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::{
-    App, AppAction, AppCommand, CheckboxSelector, InputEvent, Selector, SelectorKind, UiTheme,
-    SCOPED_MODELS_ALL,
+    App, AppAction, AppCommand, CheckboxSelector, InputEvent, SCOPED_MODELS_ALL, Selector,
+    SelectorKind, UiTheme,
 };
-use ratatui::backend::TestBackend;
 use ratatui::Terminal;
-use super::harness::*;
+use ratatui::backend::TestBackend;
 
 fn ctrl(c: char) -> InputEvent {
     InputEvent::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
@@ -28,18 +28,34 @@ fn ctrl(c: char) -> InputEvent {
 /// A 3-model catalog: ids `m0`,`m1`,`m2` across two providers.
 fn catalog() -> Vec<(String, String, String, Option<String>)> {
     vec![
-        ("m0".into(), "Model Zero".into(), "openai".into(), Some("openai".into())),
-        ("m1".into(), "Model One".into(), "openai".into(), Some("openai".into())),
-        ("m2".into(), "Model Two".into(), "anthropic".into(), Some("anthropic".into())),
+        (
+            "m0".into(),
+            "Model Zero".into(),
+            "openai".into(),
+            Some("openai".into()),
+        ),
+        (
+            "m1".into(),
+            "Model One".into(),
+            "openai".into(),
+            Some("openai".into()),
+        ),
+        (
+            "m2".into(),
+            "Model Two".into(),
+            "anthropic".into(),
+            Some("anthropic".into()),
+        ),
     ]
 }
 
 /// Pull the confirm value out of a `ConfirmSelection { ScopedModels, .. }` action.
 fn confirm_value(action: AppAction) -> String {
     match action {
-        AppAction::Command(AppCommand::ConfirmSelection { kind: SelectorKind::ScopedModels, value }) => {
-            value
-        }
+        AppAction::Command(AppCommand::ConfirmSelection {
+            kind: SelectorKind::ScopedModels,
+            value,
+        }) => value,
         other => panic!("expected ScopedModels confirm, got {other:?}"),
     }
 }
@@ -75,7 +91,9 @@ fn fg_at(buf: &ratatui::buffer::Buffer, x: u16, y: u16) -> Option<ratatui::style
 /// here carries `→`/`·`/`✓`, so a `str::find` byte offset would point at the wrong cell (the
 /// char-vs-column defect this crate has already had four times).
 fn col_of(row: &str, needle: &str) -> u16 {
-    let byte = row.find(needle).unwrap_or_else(|| panic!("{needle:?} not in {row:?}"));
+    let byte = row
+        .find(needle)
+        .unwrap_or_else(|| panic!("{needle:?} not in {row:?}"));
     row[..byte].chars().count() as u16
 }
 
@@ -96,11 +114,26 @@ fn app_mounted_render_shows_the_title_the_marker_rows_and_the_footer() {
     assert_eq!(app.active_selector_kind(), Some(SelectorKind::ScopedModels));
     app.draw().unwrap();
     let text = buf_text(&app);
-    assert!(text.contains("Model Configuration"), "title missing:\n{text}");
-    assert!(text.contains("m0 [openai] ✓"), "enabled row missing:\n{text}");
-    assert!(text.contains("m1 [openai] ✗"), "disabled row missing:\n{text}");
-    assert!(text.contains("enter toggle"), "footer hint missing (:154):\n{text}");
-    assert!(text.contains("ctrl+s save"), "footer hint missing (:154):\n{text}");
+    assert!(
+        text.contains("Model Configuration"),
+        "title missing:\n{text}"
+    );
+    assert!(
+        text.contains("m0 [openai] ✓"),
+        "enabled row missing:\n{text}"
+    );
+    assert!(
+        text.contains("m1 [openai] ✗"),
+        "disabled row missing:\n{text}"
+    );
+    assert!(
+        text.contains("enter toggle"),
+        "footer hint missing (:154):\n{text}"
+    );
+    assert!(
+        text.contains("ctrl+s save"),
+        "footer hint missing (:154):\n{text}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -120,16 +153,24 @@ fn enable_marker_follows_the_provider_badge_and_carries_its_colour() {
     let mut sel = selector(Some(vec!["m0".into()]));
     let theme = UiTheme::dark();
     let (rows, buf) = rows_of(&mut sel, 76);
-    assert_eq!(rows[7], "→ m0 [openai] ✓", "selected row (:248-259): {rows:?}");
+    assert_eq!(
+        rows[7], "→ m0 [openai] ✓",
+        "selected row (:248-259): {rows:?}"
+    );
     assert_eq!(rows[8], "  m1 [openai] ✗", "unselected row: {rows:?}");
     assert!(
-        rows.iter().all(|r| !r.starts_with("✓ ") && !r.starts_with("✗ ")),
+        rows.iter()
+            .all(|r| !r.starts_with("✓ ") && !r.starts_with("✗ ")),
         "no prepended marker survives: {rows:?}"
     );
     // The two markers are DIFFERENT colours, and neither is the row's base style.
     assert_ne!(theme.success_style().fg, theme.dim_style().fg);
     let tick = col_of(&rows[7], "✓");
-    assert_eq!(fg_at(&buf, tick, 7), theme.success_style().fg, "`✓` is success");
+    assert_eq!(
+        fg_at(&buf, tick, 7),
+        theme.success_style().fg,
+        "`✓` is success"
+    );
     let cross = col_of(&rows[8], "✗");
     assert_eq!(fg_at(&buf, cross, 8), theme.dim_style().fg, "`✗` is dim");
 }
@@ -141,8 +182,14 @@ fn all_enabled_draws_no_marker_and_says_so_in_the_footer() {
     let mut sel = selector(None);
     let (rows, _) = rows_of(&mut sel, 76);
     assert_eq!(rows[7], "→ m0 [openai]", "{rows:?}");
-    assert!(rows.iter().all(|r| !r.contains('✓') && !r.contains('✗')), "{rows:?}");
-    assert!(rows.iter().any(|r| r.ends_with("all enabled")), "countText (:194-196): {rows:?}");
+    assert!(
+        rows.iter().all(|r| !r.contains('✓') && !r.contains('✗')),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.ends_with("all enabled")),
+        "countText (:194-196): {rows:?}"
+    );
 }
 
 /// **S7.** Title `theme.fg("accent", theme.bold("Model Configuration"))` at `paddingX 0` (`:132`),
@@ -158,18 +205,40 @@ fn title_subtitle_badge_and_model_name_row() {
     let theme = UiTheme::dark();
     let (rows, buf) = rows_of(&mut sel, 76);
     assert_eq!(rows[2], "Model Configuration", "title (:132): {rows:?}");
-    assert!(rows.iter().all(|r| !r.contains("Scoped Models")), "old title is gone: {rows:?}");
+    assert!(
+        rows.iter().all(|r| !r.contains("Scoped Models")),
+        "old title is gone: {rows:?}"
+    );
     assert_eq!(
         rows[3], "Session-only. ctrl+s to save to settings.",
         "subtitle (:133-135): {rows:?}"
     );
-    assert_eq!(fg_at(&buf, 0, 2), theme.accent_style().fg, "title is accent");
-    assert_eq!(fg_at(&buf, 0, 3), theme.muted_style().fg, "subtitle is muted");
+    assert_eq!(
+        fg_at(&buf, 0, 2),
+        theme.accent_style().fg,
+        "title is accent"
+    );
+    assert_eq!(
+        fg_at(&buf, 0, 3),
+        theme.muted_style().fg,
+        "subtitle is muted"
+    );
     // The badge is adjacent to the id and muted — not a padded right-hand column.
-    assert_eq!(rows[7], "→ m0 [openai] ✓", "badge sits right after the id: {rows:?}");
+    assert_eq!(
+        rows[7], "→ m0 [openai] ✓",
+        "badge sits right after the id: {rows:?}"
+    );
     let badge_x = col_of(&rows[7], "[openai]");
-    assert_eq!(fg_at(&buf, badge_x, 7), theme.muted_style().fg, "badge is muted");
-    assert_eq!(fg_at(&buf, badge_x - 1, 7), theme.muted_style().fg, "so is its leading space");
+    assert_eq!(
+        fg_at(&buf, badge_x, 7),
+        theme.muted_style().fg,
+        "badge is muted"
+    );
+    assert_eq!(
+        fg_at(&buf, badge_x - 1, 7),
+        theme.muted_style().fg,
+        "so is its leading space"
+    );
     // `Model Name:` shows the NAME; the rows above show ids.
     assert_eq!(rows[11], "  Model Name: Model Zero", "(:272-278): {rows:?}");
 }
@@ -181,7 +250,10 @@ fn title_subtitle_badge_and_model_name_row() {
 fn footer_hint_names_every_key_plus_the_enabled_count() {
     let mut sel = selector(Some(vec!["m0".into()]));
     let (rows, _) = rows_of(&mut sel, 200);
-    let footer = rows.iter().find(|r| r.contains("toggle")).expect("footer missing");
+    let footer = rows
+        .iter()
+        .find(|r| r.contains("toggle"))
+        .expect("footer missing");
     assert_eq!(
         footer,
         "  enter toggle · ctrl+a all · ctrl+x clear · ctrl+p provider · \
@@ -199,8 +271,14 @@ fn unavailable_enabled_ids_get_a_row_and_their_own_count() {
     let (rows, _) = rows_of(&mut sel, 200);
     assert_eq!(rows[7], "→ gone [unavailable] ✗", "{rows:?}");
     assert_eq!(rows[12], "  Model unavailable", "(:274): {rows:?}");
-    let footer = rows.iter().find(|r| r.contains("toggle")).expect("footer missing");
-    assert!(footer.ends_with("1/3 enabled · 1 unavailable"), "{footer:?}");
+    let footer = rows
+        .iter()
+        .find(|r| r.contains("toggle"))
+        .expect("footer missing");
+    assert!(
+        footer.ends_with("1/3 enabled · 1 unavailable"),
+        "{footer:?}"
+    );
 }
 
 /// **S29.** `isDirty` (`:206-208`): a trailing space plus `theme.fg("warning", "(unsaved)")`.
@@ -209,17 +287,31 @@ fn a_mutation_appends_an_unsaved_warning_in_warning_colour() {
     let mut sel = selector(Some(vec!["m0".into()]));
     let theme = UiTheme::dark();
     let (clean, _) = rows_of(&mut sel, 200);
-    assert!(clean.iter().all(|r| !r.contains("(unsaved)")), "clean on open: {clean:?}");
+    assert!(
+        clean.iter().all(|r| !r.contains("(unsaved)")),
+        "clean on open: {clean:?}"
+    );
 
     let km = crate::SelectKeymap::default();
     sel.handle(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &km);
     let (rows, buf) = rows_of(&mut sel, 200);
-    let y = rows.iter().position(|r| r.contains("toggle")).expect("footer missing") as u16;
+    let y = rows
+        .iter()
+        .position(|r| r.contains("toggle"))
+        .expect("footer missing") as u16;
     let footer = &rows[y as usize];
     assert!(footer.ends_with("0/3 enabled (unsaved)"), "{footer:?}");
     let x = col_of(footer, "(unsaved)");
-    assert_eq!(fg_at(&buf, x, y), theme.warning_style().fg, "`(unsaved)` is warning");
-    assert_eq!(fg_at(&buf, x - 2, y), theme.dim_style().fg, "the rest of the run is dim");
+    assert_eq!(
+        fg_at(&buf, x, y),
+        theme.warning_style().fg,
+        "`(unsaved)` is warning"
+    );
+    assert_eq!(
+        fg_at(&buf, x - 2, y),
+        theme.dim_style().fg,
+        "the rest of the run is dim"
+    );
 }
 
 /// MIRROR — the per-component discipline this batch exists to keep. Every row above belongs to
@@ -232,21 +324,42 @@ fn none_of_this_leaks_into_the_shared_list_selector() {
     let mut sel = crate::ListSelector::prompt(
         "Pick one".to_string(),
         vec![
-            ("a".to_string(), "Alpha".to_string(), Some("anthropic".to_string())),
+            (
+                "a".to_string(),
+                "Alpha".to_string(),
+                Some("anthropic".to_string()),
+            ),
             ("b".to_string(), "Beta".to_string(), None),
         ],
         0,
     )
-    .with_upstream_chrome(SelectorKind::ExtensionSelect, &crate::SelectKeymap::default());
+    .with_upstream_chrome(
+        SelectorKind::ExtensionSelect,
+        &crate::SelectKeymap::default(),
+    );
     let theme = UiTheme::dark();
     let h = sel.desired_height(60);
     let mut term = Terminal::new(TestBackend::new(60, h)).unwrap();
     term.draw(|f| sel.render(f, f.area(), &theme)).unwrap();
-    let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
-    for needle in
-        ["Model Configuration", "Session-only.", "[anthropic]", "enabled", "(unsaved)", "✗"]
-    {
-        assert!(!text.contains(needle), "{needle:?} leaked into the shared engine:\n{text}");
+    let text: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    for needle in [
+        "Model Configuration",
+        "Session-only.",
+        "[anthropic]",
+        "enabled",
+        "(unsaved)",
+        "✗",
+    ] {
+        assert!(
+            !text.contains(needle),
+            "{needle:?} leaked into the shared engine:\n{text}"
+        );
     }
 }
 
@@ -256,14 +369,22 @@ fn enter_toggles_membership_and_ctrl_s_confirms() {
     app.open_checkbox_selector(catalog(), Some(vec![])); // start with nothing enabled
     // Highlight is on row0 (m0). Enter toggles it ON (does NOT confirm/close).
     app.handle_input(&key(KeyCode::Enter));
-    assert_eq!(app.active_selector_kind(), Some(SelectorKind::ScopedModels), "Enter must not close");
+    assert_eq!(
+        app.active_selector_kind(),
+        Some(SelectorKind::ScopedModels),
+        "Enter must not close"
+    );
     // Move down to m1, enable it too.
     app.handle_input(&key(KeyCode::Down));
     app.handle_input(&key(KeyCode::Enter));
     // Ctrl+S confirms with the ordered enabled set "m0\nm1".
     let action = app.handle_input(&ctrl('s'));
     assert_eq!(confirm_value(action), "m0\nm1");
-    assert_eq!(app.active_selector_kind(), None, "Ctrl+S closes the selector");
+    assert_eq!(
+        app.active_selector_kind(),
+        None,
+        "Ctrl+S closes the selector"
+    );
 }
 
 #[test]
@@ -282,7 +403,11 @@ fn ctrl_a_enables_all_sentinel_and_ctrl_x_clears() {
     app.open_checkbox_selector(catalog(), Some(vec!["m0".into()]));
     app.handle_input(&ctrl('a'));
     let action = app.handle_input(&ctrl('s'));
-    assert_eq!(confirm_value(action), SCOPED_MODELS_ALL, "Ctrl+A → all-enabled sentinel");
+    assert_eq!(
+        confirm_value(action),
+        SCOPED_MODELS_ALL,
+        "Ctrl+A → all-enabled sentinel"
+    );
 
     // Reopen and clear all → empty confirm value.
     app.open_checkbox_selector(catalog(), None);
@@ -299,8 +424,14 @@ fn ctrl_p_toggles_whole_provider() {
     app.handle_input(&ctrl('p'));
     let action = app.handle_input(&ctrl('s'));
     let value = confirm_value(action);
-    assert!(value.contains("m0") && value.contains("m1"), "provider enable failed: {value:?}");
-    assert!(!value.contains("m2"), "anthropic must stay disabled: {value:?}");
+    assert!(
+        value.contains("m0") && value.contains("m1"),
+        "provider enable failed: {value:?}"
+    );
+    assert!(
+        !value.contains("m2"),
+        "anthropic must stay disabled: {value:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -312,7 +443,12 @@ fn ctrl_p_toggles_whole_provider() {
 fn big_catalog(n: usize) -> Vec<(String, String, String, Option<String>)> {
     (0..n)
         .map(|i| {
-            (format!("m{i:02}"), format!("Model {i}"), "openai".into(), Some("openai".into()))
+            (
+                format!("m{i:02}"),
+                format!("Model {i}"),
+                "openai".into(),
+                Some("openai".into()),
+            )
         })
         .collect()
 }
@@ -329,15 +465,29 @@ fn scoped_models_reports_its_scroll_position_past_the_eight_row_window() {
         .iter()
         .position(|r| r.starts_with("  (1/12)"))
         .unwrap_or_else(|| panic!("no scroll row (:263-267): {rows:?}"));
-    assert_eq!(rows[y], "  (1/12)", "the counters are 1-based over the FILTERED list: {rows:?}");
-    assert_eq!(fg_at(&buf, 2, y as u16), theme.muted_style().fg, "muted (:264)");
+    assert_eq!(
+        rows[y], "  (1/12)",
+        "the counters are 1-based over the FILTERED list: {rows:?}"
+    );
+    assert_eq!(
+        fg_at(&buf, 2, y as u16),
+        theme.muted_style().fg,
+        "muted (:264)"
+    );
     // Only eight model rows are drawn, and the readout tracks the highlight.
-    assert_eq!(rows.iter().filter(|r| r.contains("[openai]")).count(), 8, "{rows:?}");
+    assert_eq!(
+        rows.iter().filter(|r| r.contains("[openai]")).count(),
+        8,
+        "{rows:?}"
+    );
 
     // A list that fits gets no readout at all (`startIndex > 0 || endIndex < len`).
     let mut small = CheckboxSelector::scoped_models(big_catalog(4), None);
     let (rows, _) = rows_of(&mut small, 60);
-    assert!(rows.iter().all(|r| !r.starts_with("  (")), "no readout when it fits: {rows:?}");
+    assert!(
+        rows.iter().all(|r| !r.starts_with("  (")),
+        "no readout when it fits: {rows:?}"
+    );
 }
 
 /// `config.refreshStatus` (`scoped-models-selector.ts:149-152`): a `muted` `  {status}` row between
@@ -348,7 +498,10 @@ fn scoped_models_draws_the_refresh_status_row_between_the_list_and_the_footer() 
     let mut sel = selector(Some(vec!["m0".into()]));
     let theme = UiTheme::dark();
     let (before, _) = rows_of(&mut sel, 76);
-    assert!(before.iter().all(|r| !r.contains("Refreshing")), "{before:?}");
+    assert!(
+        before.iter().all(|r| !r.contains("Refreshing")),
+        "{before:?}"
+    );
 
     sel.set_refresh_status("Refreshing model catalogs…");
     let (rows, buf) = rows_of(&mut sel, 76);
@@ -356,13 +509,27 @@ fn scoped_models_draws_the_refresh_status_row_between_the_list_and_the_footer() 
         .iter()
         .position(|r| r == "  Refreshing model catalogs…")
         .unwrap_or_else(|| panic!("no refresh row (:150-151): {rows:?}"));
-    assert_eq!(fg_at(&buf, 2, y as u16), theme.muted_style().fg, "muted (:151)");
-    assert_eq!(rows[y - 1], "", "the list's own Spacer(1) above it (:148): {rows:?}");
-    assert!(rows[y + 1].contains("toggle"), "the footer directly below it (:154): {rows:?}");
+    assert_eq!(
+        fg_at(&buf, 2, y as u16),
+        theme.muted_style().fg,
+        "muted (:151)"
+    );
+    assert_eq!(
+        rows[y - 1],
+        "",
+        "the list's own Spacer(1) above it (:148): {rows:?}"
+    );
+    assert!(
+        rows[y + 1].contains("toggle"),
+        "the footer directly below it (:154): {rows:?}"
+    );
 
     sel.set_refresh_status("");
     let (rows, _) = rows_of(&mut sel, 76);
-    assert!(rows.iter().all(|r| !r.contains("Refreshing")), "empty clears it: {rows:?}");
+    assert!(
+        rows.iter().all(|r| !r.contains("Refreshing")),
+        "empty clears it: {rows:?}"
+    );
 }
 
 /// `tui.select.up`/`down` WRAP here (`scoped-models-selector.ts:286-297`:
@@ -376,7 +543,11 @@ fn scoped_models_navigation_wraps_at_both_ends() {
     app.handle_input(&key(KeyCode::Up));
     app.handle_input(&key(KeyCode::Enter));
     let action = app.handle_input(&ctrl('s'));
-    assert_eq!(confirm_value(action), "m2", "Up at index 0 wrapped to the last row (:288)");
+    assert_eq!(
+        confirm_value(action),
+        "m2",
+        "Up at index 0 wrapped to the last row (:288)"
+    );
 
     // Down from the last row wraps back to the first.
     app.open_checkbox_selector(catalog(), Some(vec![]));
@@ -385,7 +556,11 @@ fn scoped_models_navigation_wraps_at_both_ends() {
     }
     app.handle_input(&key(KeyCode::Enter));
     let action = app.handle_input(&ctrl('s'));
-    assert_eq!(confirm_value(action), "m0", "Down at the last row wrapped to 0 (:294)");
+    assert_eq!(
+        confirm_value(action),
+        "m0",
+        "Down at the last row wrapped to 0 (:294)"
+    );
 }
 
 /// **S5 regression.** `matchesKey(data, Key.ctrl("c"))` (`scoped-models-selector.ts:378-387`)
@@ -407,8 +582,14 @@ fn ctrl_c_clears_a_non_empty_search_before_it_cancels() {
     );
     app.draw().unwrap();
     let text = buf_text(&app);
-    assert!(text.contains("m0 [openai]"), "the full catalog is back:\n{text}");
-    assert!(text.contains("m1 [openai]"), "the full catalog is back:\n{text}");
+    assert!(
+        text.contains("m0 [openai]"),
+        "the full catalog is back:\n{text}"
+    );
+    assert!(
+        text.contains("m1 [openai]"),
+        "the full catalog is back:\n{text}"
+    );
 
     let second = app.handle_input(&ctrl('c'));
     assert_eq!(
@@ -426,5 +607,9 @@ fn escape_cancels_even_with_a_non_empty_search() {
     app.open_checkbox_selector(catalog(), Some(vec![]));
     app.handle_input(&key(KeyCode::Char('m')));
     app.handle_input(&key(KeyCode::Esc));
-    assert_eq!(app.active_selector_kind(), None, "Esc always cancels (:390-392)");
+    assert_eq!(
+        app.active_selector_kind(),
+        None,
+        "Esc always cancels (:390-392)"
+    );
 }

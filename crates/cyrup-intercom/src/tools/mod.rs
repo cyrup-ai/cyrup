@@ -12,8 +12,7 @@ pub mod contact_supervisor;
 pub mod intercom;
 pub(crate) mod render;
 
-use cyrup_core::{
-    TerminateHint,Content, ToolResult};
+use cyrup_core::{Content, TerminateHint, ToolResult};
 
 /// Build a plain-text [`ToolResult`] carrying pi's **empty** `details: {}`.
 ///

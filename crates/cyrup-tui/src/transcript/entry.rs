@@ -91,7 +91,11 @@ pub enum Entry {
     /// component is added at `:3506`, inside that `if (textContent)` / `children.length > 0` block,
     /// so it is the component the gated spacer actually precedes when a submission opens with a
     /// `<skill>` block.
-    SkillInvocation { name: String, content: String, lead_spacer: bool },
+    SkillInvocation {
+        name: String,
+        content: String,
+        lead_spacer: bool,
+    },
     /// A custom (extension) message (`custom-message.ts`): a bracketed type `label` + a markdown
     /// `body`, styled distinctly from a plain user message.
     ///
@@ -99,7 +103,11 @@ pub enum Entry {
     /// custom type (EXT-006); when present it REPLACES the label+markdown framing, because the
     /// renderer already owns the presentation (Pi hands the resolved renderer to
     /// `CustomMessageComponent` instead of the default, interactive-mode.ts:3324-3336).
-    Custom { label: String, body: String, rendered: Rendered },
+    Custom {
+        label: String,
+        body: String,
+        rendered: Rendered,
+    },
     /// A branch-summary message (`branch-summary-message.ts`): a bold `[branch]` label + the
     /// `**Branch Summary**` markdown body produced when navigating away from a branch.
     ///
@@ -246,24 +254,33 @@ pub struct ToolRun {
     /// The RESULT text an extension's registered renderer produced (Pi `renderResult`,
     /// extensions/types.ts:475-481). See [`ToolRun::rendered_call`].
     pub rendered_result: Option<String>,
-    /// Whether the agent knows a tool DEFINITION for [`name`](ToolRun::name) — Pi
-    /// `ToolExecutionComponent.hasRendererDefinition()`, i.e. `builtInToolDefinition !== undefined
-    /// || toolDefinition !== undefined` (tool-execution.ts:103-105), sourced from the session's own
-    /// `getToolDefinition(name)` registry (agent-session.ts:806) and so true for an
-    /// extension-registered, SDK-registered or MCP-proxied tool as well as a built-in.
+    /// What the session's `getToolDefinition(name)` registry (agent-session.ts:806) answered for
+    /// [`name`](ToolRun::name) when the run started: `None` = no definition, `Some(shell)` = a
+    /// definition declaring that `renderShell`. Two of Pi's `ToolExecutionComponent` questions
+    /// read off it:
     ///
-    /// It is the branch upstream picks the whole block SHAPE by, and it is **not** "an extension
-    /// registered a renderer" — that is [`rendered_call`](ToolRun::rendered_call) /
-    /// [`rendered_result`](ToolRun::rendered_result), and a definition with no renderer is the
-    /// normal case for an MCP tool. A defined tool draws through its renderers, falling back
-    /// per-side to a bold name (`createCallFallback`, `:137-139`) and a ten-line output preview
-    /// (`createResultFallback`, `:141-155`); only a tool with NO definition reaches the unbounded
-    /// `formatToolExecution` (`:330-333`) that dumps the full argument JSON.
+    /// * `hasRendererDefinition()`, i.e. `builtInToolDefinition !== undefined || toolDefinition
+    ///   !== undefined` (tool-execution.ts:103-105) — `is_some()` here, and so true for an
+    ///   extension-registered, SDK-registered or MCP-proxied tool as well as a built-in. It is the
+    ///   branch upstream picks the whole block SHAPE by, and it is **not** "an extension
+    ///   registered a renderer" — that is [`rendered_call`](ToolRun::rendered_call) /
+    ///   [`rendered_result`](ToolRun::rendered_result), and a definition with no renderer is the
+    ///   normal case for an MCP tool. A defined tool draws through its renderers, falling back
+    ///   per-side to a bold name (`createCallFallback`, `:137-139`) and a ten-line output preview
+    ///   (`createResultFallback`, `:141-155`); only a tool with NO definition reaches the
+    ///   unbounded `formatToolExecution` (`:330-333`) that dumps the full argument JSON.
+    /// * `getRenderShell()`, i.e. `toolDefinition.renderShell ?? builtInToolDefinition.renderShell
+    ///   ?? "default"` (`:108-116`) — the payload. cyrup keeps ONE definition per name (the
+    ///   session registry merges built-ins, custom and extension tools), so the two-tier `??` is
+    ///   a single read of [`cyrup_core::Tool::render_kind`]; `None` is upstream's final
+    ///   `"default"`. [`ToolRenderKind::SelfRendered`] drops the tinted `Box(1, 1)` shell in
+    ///   favour of the tool's own framing (EXT-024; `:76`, `:237-259`, `:275-277`).
     ///
-    /// `false` on the id-less/legacy constructors — the shape-preserving value, since every
-    /// built-in name is answered by the built-in table before this flag is consulted, so it decides
-    /// only how an entirely UNKNOWN name draws.
-    pub has_definition: bool,
+    /// `None` on the id-less/legacy constructors — the shape-preserving value, since every
+    /// built-in name is answered by the built-in table before the first question is consulted, so
+    /// it decides only how an entirely UNKNOWN name draws — and the value under which every
+    /// built-in but `edit` keeps its shell.
+    pub definition: Option<ToolRenderKind>,
     /// `edit`'s **pre-execution** diff preview — Pi `EditCallRenderComponent.preview`
     /// (edit.ts:145-153), set by `setEditPreview` (`:263-280`) from the `computeEditsDiff` its
     /// `renderCall` fires the moment the streamed arguments are complete (`:377-386`).

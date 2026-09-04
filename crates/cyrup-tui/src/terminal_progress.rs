@@ -111,7 +111,9 @@ pub(crate) fn lock_progress_armed() -> std::sync::MutexGuard<'static, ()> {
     // Poisoning is recovered from rather than propagated: a sibling that panicked has already
     // reported its own failure, and refusing the lock here would turn that into a second,
     // misleading one. Same device as [`crate::panic_hook`]'s `HOOK_LOCK`.
-    GLOBAL_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    GLOBAL_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Write the OSC 9;4 progress sequence — Pi `ProcessTerminal.setProgress`
@@ -170,7 +172,11 @@ impl TerminalProgress {
     /// Seed the setting without producing a transition — used when a session binds and the
     /// effective settings are first read.
     pub fn with_enabled(enabled: bool) -> Self {
-        Self { enabled, active: false, pending: None }
+        Self {
+            enabled,
+            active: false,
+            pending: None,
+        }
     }
 
     /// Whether `terminal.showTerminalProgress` is on.
@@ -250,7 +256,12 @@ impl TerminalProgress {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
 
     use super::*;
 
@@ -259,8 +270,14 @@ mod tests {
     /// including the absence of the trailing `;` that v0.83.0 had and v0.84.1 removed.
     #[test]
     fn sequences_match_pi_byte_for_byte() {
-        assert_eq!(TERMINAL_PROGRESS_ACTIVE_SEQUENCE.as_bytes(), b"\x1b]9;4;3\x07");
-        assert_eq!(TERMINAL_PROGRESS_CLEAR_SEQUENCE.as_bytes(), b"\x1b]9;4;0\x07");
+        assert_eq!(
+            TERMINAL_PROGRESS_ACTIVE_SEQUENCE.as_bytes(),
+            b"\x1b]9;4;3\x07"
+        );
+        assert_eq!(
+            TERMINAL_PROGRESS_CLEAR_SEQUENCE.as_bytes(),
+            b"\x1b]9;4;0\x07"
+        );
         assert_eq!(TERMINAL_PROGRESS_KEEPALIVE, Duration::from_millis(1000));
     }
 
@@ -274,7 +291,11 @@ mod tests {
         assert!(!p.is_active());
         assert!(!p.keepalive());
         assert_eq!(p.set(false), None);
-        assert_eq!(p.take_pending(), None, "nothing may reach the terminal with the row off");
+        assert_eq!(
+            p.take_pending(),
+            None,
+            "nothing may reach the terminal with the row off"
+        );
     }
 
     /// A transition is parked for the run loop to write, and draining it yields it exactly ONCE —
@@ -285,7 +306,10 @@ mod tests {
         p.set(true);
         assert_eq!(p.take_pending(), Some(true));
         assert_eq!(p.take_pending(), None, "already written");
-        assert!(p.is_active(), "draining the write does not end the progress window");
+        assert!(
+            p.is_active(),
+            "draining the write does not end the progress window"
+        );
         p.set(false);
         assert_eq!(p.take_pending(), Some(false));
         assert_eq!(p.take_pending(), None);
@@ -299,7 +323,10 @@ mod tests {
         assert!(!p.keepalive(), "idle before the first transition");
         assert_eq!(p.set(true), Some(true));
         assert!(p.is_active());
-        assert!(p.keepalive(), "the 1s re-write runs for as long as progress is armed");
+        assert!(
+            p.keepalive(),
+            "the 1s re-write runs for as long as progress is armed"
+        );
         assert_eq!(p.set(false), Some(false));
         assert!(!p.is_active());
         assert!(!p.keepalive());
@@ -325,15 +352,31 @@ mod tests {
         let mut p = TerminalProgress::with_enabled(true);
         p.set(true);
         p.take_pending();
-        assert_eq!(p.set_enabled(false), Some(false), "a running indicator must be cleared");
-        assert_eq!(p.take_pending(), Some(false), "and the clear must reach the terminal");
+        assert_eq!(
+            p.set_enabled(false),
+            Some(false),
+            "a running indicator must be cleared"
+        );
+        assert_eq!(
+            p.take_pending(),
+            Some(false),
+            "and the clear must reach the terminal"
+        );
         assert!(!p.is_active());
 
         let mut idle = TerminalProgress::with_enabled(true);
-        assert_eq!(idle.set_enabled(false), None, "nothing was lit, so nothing to clear");
+        assert_eq!(
+            idle.set_enabled(false),
+            None,
+            "nothing was lit, so nothing to clear"
+        );
 
         let mut off = TerminalProgress::default();
-        assert_eq!(off.set_enabled(true), None, "turning the row on does not start a turn");
+        assert_eq!(
+            off.set_enabled(true),
+            None,
+            "turning the row on does not start a turn"
+        );
         assert!(!off.is_active());
     }
 
@@ -347,13 +390,19 @@ mod tests {
         let _g = crate::terminal_progress::lock_progress_armed();
         PROGRESS_ARMED.store(false, Ordering::Relaxed);
         let mut p = TerminalProgress::with_enabled(true);
-        assert!(!p.shutdown(), "a session that never armed progress emits no exit sequence");
+        assert!(
+            !p.shutdown(),
+            "a session that never armed progress emits no exit sequence"
+        );
 
         // Whatever the interactive-mode gate now says, an armed terminal gets its clear.
         PROGRESS_ARMED.store(true, Ordering::Relaxed);
         let mut off_but_lit = TerminalProgress::with_enabled(true);
         off_but_lit.set(true);
-        assert!(off_but_lit.shutdown(), "the row is off yet the terminal is lit — clear it");
+        assert!(
+            off_but_lit.shutdown(),
+            "the row is off yet the terminal is lit — clear it"
+        );
         assert_eq!(
             off_but_lit.take_pending(),
             None,
@@ -371,9 +420,11 @@ mod tests {
         write_terminal_progress(false);
         assert!(!progress_is_armed());
         write_terminal_progress(true);
-        assert!(progress_is_armed(), "the terminal now has an indicator we put there");
+        assert!(
+            progress_is_armed(),
+            "the terminal now has an indicator we put there"
+        );
         write_terminal_progress(false);
         assert!(!progress_is_armed());
     }
-
 }

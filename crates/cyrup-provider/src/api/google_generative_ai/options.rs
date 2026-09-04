@@ -2,7 +2,6 @@
 //! direct `thinkingConfig` override Pi reads in `buildParams` (google-generative-ai.ts:373-384)
 //! and the `GoogleThinkingLevel` wire strings (google-shared.ts:16).
 
-
 /// A Gemini `thinkingLevel` value (Pi `GoogleThinkingLevel`, google-shared.ts:16). Serialized to the
 /// exact wire string Pi passes through unchanged in `buildParams` (`options.thinking.level as any`,
 /// google-generative-ai.ts:377-378).

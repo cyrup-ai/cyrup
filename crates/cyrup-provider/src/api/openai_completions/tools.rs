@@ -35,7 +35,10 @@ pub(super) fn message_has_tool_use(msg: &Message) -> bool {
 pub(super) fn deferred_tool_names(messages: &[cyrup_core::Message]) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     for message in messages {
-        if let cyrup_core::Message::ToolResult { added_tool_names, .. } = message {
+        if let cyrup_core::Message::ToolResult {
+            added_tool_names, ..
+        } = message
+        {
             for name in added_tool_names {
                 if !names.iter().any(|n| n == name) {
                     names.push(name.clone());

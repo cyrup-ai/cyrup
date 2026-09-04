@@ -32,20 +32,29 @@
 //! `cyrup-session-svc/src/builder.rs:927`, whose `errors` become `StartupDiagnostics::extensions`
 //! and then `AgentSessionRuntime::diagnostics`). `ExtensionRegistry::register_flag` is the function
 //! the guest `registration.register-flag` import calls (`host/live.rs:107`).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
-use cyrup_core::{
-    CancelToken, Content, ExtensionId, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink,
-};
 use crate::{
     ExtError, ExtMode, ExtensionConflict, ExtensionHost, HookOutcome, HostConfig, HostCtx,
     HostEvent, InitApi, NativeExtension,
 };
-use serde_json::{json, Value};
+use cyrup_core::{
+    CancelToken, Content, ExtensionId, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink,
+};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 fn cfg() -> HostConfig {
-    HostConfig { mode: ExtMode::Tui, has_ui: false, cwd: std::path::PathBuf::from(".") }
+    HostConfig {
+        mode: ExtMode::Tui,
+        has_ui: false,
+        cwd: std::path::PathBuf::from("."),
+    }
 }
 
 /// A tool whose `execute` echoes a caller-chosen marker, so "which implementation ran" is an
@@ -82,7 +91,10 @@ impl Tool for MarkerTool {
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
         Ok(ToolResult {
-            content: vec![Content::Text { text: self.marker.clone().into(), text_signature: None }],
+            content: vec![Content::Text {
+                text: self.marker.clone().into(),
+                text_signature: None,
+            }],
             ..Default::default()
         })
     }
@@ -99,7 +111,10 @@ impl ToolExt {
     fn loaded(id: &str, tools: &[(&str, &str)]) -> Arc<dyn NativeExtension> {
         Arc::new(Self {
             id: id.into(),
-            tools: tools.iter().map(|(n, m)| ((*n).to_string(), (*m).to_string())).collect(),
+            tools: tools
+                .iter()
+                .map(|(n, m)| ((*n).to_string(), (*m).to_string()))
+                .collect(),
         })
     }
 }
@@ -150,12 +165,20 @@ async fn run(tool: &Arc<dyn Tool>) -> String {
 #[tokio::test]
 async fn first_loaded_extension_wins_the_tool_name_and_is_the_one_that_executes() {
     let host = ExtensionHost::new(cfg());
-    host.load_native(ToolExt::loaded("alpha", &[("shared", "alpha-ran")])).await.unwrap();
-    host.load_native(ToolExt::loaded("beta", &[("shared", "beta-ran")])).await.unwrap();
+    host.load_native(ToolExt::loaded("alpha", &[("shared", "alpha-ran")]))
+        .await
+        .unwrap();
+    host.load_native(ToolExt::loaded("beta", &[("shared", "beta-ran")]))
+        .await
+        .unwrap();
 
     // The execution seam: `ExtensionRegistry::tool(name)` is what `ExtensionHost` resolves a call
     // through (pi `getToolDefinition`, runner.ts:463-471).
-    let resolved = host.registry().tool("shared").unwrap().expect("`shared` is registered");
+    let resolved = host
+        .registry()
+        .tool("shared")
+        .unwrap()
+        .expect("`shared` is registered");
     assert_eq!(
         run(&resolved).await,
         "alpha-ran",
@@ -180,7 +203,11 @@ async fn first_loaded_extension_wins_the_tool_name_and_is_the_one_that_executes(
 fn a_guest_descriptor_cannot_displace_an_already_owned_tool_name() {
     use crate::{ExtensionRegistry, ToolDescriptor};
     let reg = ExtensionRegistry::new();
-    reg.register_tool("alpha".into(), Arc::new(MarkerTool::new("shared", "alpha-ran"))).unwrap();
+    reg.register_tool(
+        "alpha".into(),
+        Arc::new(MarkerTool::new("shared", "alpha-ran")),
+    )
+    .unwrap();
     reg.register_guest_tool(
         "beta".into(),
         ToolDescriptor {
@@ -220,10 +247,18 @@ fn a_guest_descriptor_cannot_displace_an_already_owned_tool_name() {
 fn first_extension_wins_a_flag_name() {
     let host = ExtensionHost::new(cfg());
     let reg = host.registry();
-    reg.register_flag("alpha".into(), "persona", json!({ "type": "string", "owner": "alpha" }))
-        .unwrap();
-    reg.register_flag("beta".into(), "persona", json!({ "type": "boolean", "owner": "beta" }))
-        .unwrap();
+    reg.register_flag(
+        "alpha".into(),
+        "persona",
+        json!({ "type": "string", "owner": "alpha" }),
+    )
+    .unwrap();
+    reg.register_flag(
+        "beta".into(),
+        "persona",
+        json!({ "type": "boolean", "owner": "beta" }),
+    )
+    .unwrap();
 
     assert_eq!(
         reg.get_flag("persona").unwrap(),
@@ -248,10 +283,15 @@ fn first_extension_wins_a_flag_name() {
 #[tokio::test]
 async fn a_tool_collision_produces_pis_conflict_diagnostic() {
     let host = ExtensionHost::new(cfg());
-    host.load_native(ToolExt::loaded("alpha", &[("shared", "alpha-ran")])).await.unwrap();
-    host.load_native(ToolExt::loaded("beta", &[("shared", "beta-ran"), ("beta-only", "b")]))
+    host.load_native(ToolExt::loaded("alpha", &[("shared", "alpha-ran")]))
         .await
         .unwrap();
+    host.load_native(ToolExt::loaded(
+        "beta",
+        &[("shared", "beta-ran"), ("beta-only", "b")],
+    ))
+    .await
+    .unwrap();
 
     assert_eq!(
         host.extension_conflicts(),
@@ -272,19 +312,31 @@ async fn a_tool_collision_produces_pis_conflict_diagnostic() {
 #[cfg(feature = "wasm-host")]
 #[tokio::test]
 async fn discover_and_load_reports_conflicts_in_its_errors_array() {
-    use crate::host::{DenyServices, HostServices};
     use crate::DiscoveryRoots;
+    use crate::host::{DenyServices, HostServices};
 
     let host = ExtensionHost::new(cfg());
-    host.load_native(ToolExt::loaded("alpha", &[("shared", "alpha-ran")])).await.unwrap();
-    host.load_native(ToolExt::loaded("beta", &[("shared", "beta-ran")])).await.unwrap();
+    host.load_native(ToolExt::loaded("alpha", &[("shared", "alpha-ran")]))
+        .await
+        .unwrap();
+    host.load_native(ToolExt::loaded("beta", &[("shared", "beta-ran")]))
+        .await
+        .unwrap();
 
     // An empty root set: nothing on disk to discover, so every error below is a CONFLICT error.
-    let roots = DiscoveryRoots { project_cwd: None, agent_dir: None, configured: vec![], disabled: vec![] };
+    let roots = DiscoveryRoots {
+        project_cwd: None,
+        agent_dir: None,
+        configured: vec![],
+        disabled: vec![],
+    };
     let services: Arc<dyn HostServices> = Arc::new(DenyServices);
     let result = host.discover_and_load(&roots, true, services).await;
 
-    assert!(result.loaded.is_empty(), "no disk extensions in this fixture");
+    assert!(
+        result.loaded.is_empty(),
+        "no disk extensions in this fixture"
+    );
     let messages: Vec<(String, String, bool)> = result
         .errors
         .iter()
@@ -313,11 +365,21 @@ async fn discover_and_load_reports_conflicts_in_its_errors_array() {
 #[tokio::test]
 async fn mirror_distinct_tool_names_from_two_extensions_all_resolve() {
     let host = ExtensionHost::new(cfg());
-    host.load_native(ToolExt::loaded("alpha", &[("a-tool", "alpha-ran")])).await.unwrap();
-    host.load_native(ToolExt::loaded("beta", &[("b-tool", "beta-ran")])).await.unwrap();
+    host.load_native(ToolExt::loaded("alpha", &[("a-tool", "alpha-ran")]))
+        .await
+        .unwrap();
+    host.load_native(ToolExt::loaded("beta", &[("b-tool", "beta-ran")]))
+        .await
+        .unwrap();
 
-    assert_eq!(run(&host.registry().tool("a-tool").unwrap().unwrap()).await, "alpha-ran");
-    assert_eq!(run(&host.registry().tool("b-tool").unwrap().unwrap()).await, "beta-ran");
+    assert_eq!(
+        run(&host.registry().tool("a-tool").unwrap().unwrap()).await,
+        "alpha-ran"
+    );
+    assert_eq!(
+        run(&host.registry().tool("b-tool").unwrap().unwrap()).await,
+        "beta-ran"
+    );
     assert_eq!(
         host.registry().all_registered_tool_names().unwrap(),
         vec!["a-tool".to_string(), "b-tool".to_string()]
@@ -336,9 +398,12 @@ async fn mirror_distinct_tool_names_from_two_extensions_all_resolve() {
 #[tokio::test]
 async fn mirror_same_extension_re_registering_a_name_still_overwrites() {
     let host = ExtensionHost::new(cfg());
-    host.load_native(ToolExt::loaded("alpha", &[("shared", "first"), ("shared", "second")]))
-        .await
-        .unwrap();
+    host.load_native(ToolExt::loaded(
+        "alpha",
+        &[("shared", "first"), ("shared", "second")],
+    ))
+    .await
+    .unwrap();
 
     assert_eq!(
         run(&host.registry().tool("shared").unwrap().unwrap()).await,
@@ -361,8 +426,15 @@ async fn mirror_same_extension_re_registering_a_name_still_overwrites() {
 #[test]
 fn mirror_ownerless_set_flag_is_unchanged() {
     let host = ExtensionHost::new(cfg());
-    host.registry().set_flag("persona", json!({ "type": "string" })).unwrap();
-    host.registry().set_flag("persona", json!({ "type": "boolean" })).unwrap();
-    assert_eq!(host.registry().get_flag("persona").unwrap(), Some(json!({ "type": "boolean" })));
+    host.registry()
+        .set_flag("persona", json!({ "type": "string" }))
+        .unwrap();
+    host.registry()
+        .set_flag("persona", json!({ "type": "boolean" }))
+        .unwrap();
+    assert_eq!(
+        host.registry().get_flag("persona").unwrap(),
+        Some(json!({ "type": "boolean" }))
+    );
     assert!(host.extension_conflicts().is_empty());
 }

@@ -12,13 +12,22 @@ pub(super) fn render_read_call(
     // `const classification = !context.expanded ? getCompactReadClassification(args, context.cwd) : undefined;`
     // so the compact `[skill] name` / `read resource <label>` form is COLLAPSED-only; expanding a
     // skill read falls back to the plain `read <path>` header plus the body.
-    let classification =
-        if expanded { None } else { compact_read_classification(&run.args, opts.cwd) };
+    let classification = if expanded {
+        None
+    } else {
+        compact_read_classification(&run.args, opts.cwd)
+    };
     match classification {
         Some(c) => out.push(compact_read_call(&c, &run.args, opts.expand_key, theme)),
         None => {
             let mut spans = vec![Span::styled("read ", theme.tool_title_style())];
-            spans.push(tool_path_span(&run.args, &["file_path", "path"], None, theme, opts));
+            spans.push(tool_path_span(
+                &run.args,
+                &["file_path", "path"],
+                None,
+                theme,
+                opts,
+            ));
             if let Some(range) = read_line_range(&run.args) {
                 spans.push(Span::styled(range, theme.warning_style()));
             }
@@ -84,7 +93,13 @@ pub(super) fn render_write_call(
     out: &mut Vec<Line<'static>>,
 ) {
     let mut spans = vec![Span::styled("write ", theme.tool_title_style())];
-    spans.push(tool_path_span(&run.args, &["file_path", "path"], None, theme, opts));
+    spans.push(tool_path_span(
+        &run.args,
+        &["file_path", "path"],
+        None,
+        theme,
+        opts,
+    ));
     out.push(Line::from(spans));
     match str_arg(&run.args, &["content"]) {
         StrArg::Invalid => {
@@ -122,7 +137,12 @@ pub(super) fn render_write_call(
             }
             let remaining = total.saturating_sub(shown);
             if remaining > 0 {
-                out.push(more_lines_hint(remaining, Some(total), opts.expand_key, theme));
+                out.push(more_lines_hint(
+                    remaining,
+                    Some(total),
+                    opts.expand_key,
+                    theme,
+                ));
             }
         }
     }
@@ -130,7 +150,9 @@ pub(super) fn render_write_call(
 
 /// `write`'s `renderResult` — output only on error (`formatWriteResult`, `write.ts:164-179`).
 pub(super) fn render_write_result(run: &ToolRun, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
-    if run.is_error && let Some(result) = &run.result {
+    if run.is_error
+        && let Some(result) = &run.result
+    {
         push_error_body(result, theme, out);
     }
 }
@@ -197,7 +219,13 @@ pub(super) fn render_edit_call(
     out: &mut Vec<Line<'static>>,
 ) {
     let mut spans = vec![Span::styled("edit ", theme.tool_title_style())];
-    spans.push(tool_path_span(&run.args, &["file_path", "path"], None, theme, opts));
+    spans.push(tool_path_span(
+        &run.args,
+        &["file_path", "path"],
+        None,
+        theme,
+        opts,
+    ));
     out.push(Line::from(spans));
 
     let preview_diff = match &run.preview {
@@ -265,7 +293,10 @@ pub(super) fn render_bash_call(
     match str_arg(&run.args, &["command"]) {
         StrArg::Invalid => {
             spans.push(Span::styled(format!("{prompt} "), title));
-            spans.push(Span::styled("[invalid arg]".to_string(), theme.error_style()));
+            spans.push(Span::styled(
+                "[invalid arg]".to_string(),
+                theme.error_style(),
+            ));
         }
         StrArg::Missing => {
             spans.push(Span::styled(format!("{prompt} "), title));
@@ -278,7 +309,10 @@ pub(super) fn render_bash_call(
     // it. `Value::as_f64` answered `None` for the string and boolean cases, so a `{"timeout":"30"}`
     // that renders ` (timeout 30s)` upstream rendered nothing here.
     if let Some(t) = run.args.get("timeout").filter(|v| js_truthy(v)) {
-        spans.push(Span::styled(format!(" (timeout {}s)", js_arg(t)), theme.muted_style()));
+        spans.push(Span::styled(
+            format!(" (timeout {}s)", js_arg(t)),
+            theme.muted_style(),
+        ));
     }
     out.push(Line::from(spans));
 }
@@ -364,7 +398,10 @@ pub(super) fn render_grep_call(run: &ToolRun, theme: &UiTheme, out: &mut Vec<Lin
     let outp = theme.tool_output_style();
     let mut spans = vec![Span::styled("grep ".to_string(), title)];
     match str_arg(&run.args, &["pattern"]) {
-        StrArg::Invalid => spans.push(Span::styled("[invalid arg]".to_string(), theme.error_style())),
+        StrArg::Invalid => spans.push(Span::styled(
+            "[invalid arg]".to_string(),
+            theme.error_style(),
+        )),
         StrArg::Missing => spans.push(Span::styled("//".to_string(), theme.accent_style())),
         StrArg::Value(p) => spans.push(Span::styled(format!("/{p}/"), theme.accent_style())),
     }
@@ -406,7 +443,10 @@ pub(super) fn render_find_call(run: &ToolRun, theme: &UiTheme, out: &mut Vec<Lin
     let outp = theme.tool_output_style();
     let mut spans = vec![Span::styled("find ".to_string(), title)];
     match str_arg(&run.args, &["pattern"]) {
-        StrArg::Invalid => spans.push(Span::styled("[invalid arg]".to_string(), theme.error_style())),
+        StrArg::Invalid => spans.push(Span::styled(
+            "[invalid arg]".to_string(),
+            theme.error_style(),
+        )),
         StrArg::Missing => {}
         StrArg::Value(p) => spans.push(Span::styled(p, theme.accent_style())),
     }
@@ -448,7 +488,10 @@ pub(super) fn render_ls_call(
     // (ls.ts:58/61-63, `formatLsCall`) — the same PRESENCE test and the same `js_arg`
     // (`String(v)`) fold as `render_grep`, whose comment carries the reasoning for all three.
     if let Some(limit) = run.args.get("limit") {
-        spans.push(Span::styled(format!(" (limit {})", js_arg(limit)), theme.tool_output_style()));
+        spans.push(Span::styled(
+            format!(" (limit {})", js_arg(limit)),
+            theme.tool_output_style(),
+        ));
     }
     out.push(Line::from(spans));
 }
@@ -488,7 +531,7 @@ pub(super) enum Builtin {
 }
 
 /// The built-in definition table (see [`Builtin`]). `None` = the name is not a built-in, so
-/// whether anything at all is known about it is [`ToolRun::has_definition`]'s question.
+/// whether anything at all is known about it is [`ToolRun::definition`]'s question.
 pub(super) fn builtin_kind(name: &str) -> Option<Builtin> {
     match name {
         "read" => Some(Builtin::Read),
@@ -617,7 +660,11 @@ pub(super) fn render_result_fallback(
     // `output.split("\n")`, then `this.expanded ? lines : lines.slice(0, FALLBACK_PREVIEW_LINES)`.
     // Taken with an iterator adapter rather than a slice, which `clippy::indexing_slicing` denies.
     let total = output.split('\n').count();
-    let shown = if expanded { total } else { total.min(FALLBACK_PREVIEW_LINES) };
+    let shown = if expanded {
+        total
+    } else {
+        total.min(FALLBACK_PREVIEW_LINES)
+    };
     for l in output.split('\n').take(shown) {
         out.push(Line::styled(
             normalize_terminal_output(l).into_owned(),

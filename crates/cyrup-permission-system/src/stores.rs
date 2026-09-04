@@ -79,9 +79,15 @@ impl SessionApprovalStore {
     pub fn evaluate(&self, tool: &str, command: &str) -> SessionEvaluation {
         let result = crate::evaluate::evaluate(tool, command, &[&self.rules]);
         if result.action == PermissionState::Allow {
-            SessionEvaluation { state: PermissionState::Allow, matched_pattern: result.matched_pattern }
+            SessionEvaluation {
+                state: PermissionState::Allow,
+                matched_pattern: result.matched_pattern,
+            }
         } else {
-            SessionEvaluation { state: PermissionState::Ask, matched_pattern: None }
+            SessionEvaluation {
+                state: PermissionState::Ask,
+                matched_pattern: None,
+            }
         }
     }
 

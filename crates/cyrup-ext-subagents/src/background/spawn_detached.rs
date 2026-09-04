@@ -237,7 +237,9 @@ pub fn spawn_detached_runner_with_command(
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        command.creation_flags(windows_flags::DETACHED_PROCESS | windows_flags::CREATE_NEW_PROCESS_GROUP);
+        command.creation_flags(
+            windows_flags::DETACHED_PROCESS | windows_flags::CREATE_NEW_PROCESS_GROUP,
+        );
     }
 
     let child = command.spawn().map_err(SubagentError::Spawn)?;
@@ -367,7 +369,10 @@ mod tests {
 
         let argv_out = dir.path().join("argv.txt");
         let mut overlay = BTreeMap::new();
-        overlay.insert("CYRUP_TEST_ARGV_OUT".to_string(), argv_out.display().to_string());
+        overlay.insert(
+            "CYRUP_TEST_ARGV_OUT".to_string(),
+            argv_out.display().to_string(),
+        );
         overlay.insert(
             crate::exec::PARENT_SESSION_ENV_VAR.to_string(),
             "session-detached-anchor".to_string(),

@@ -177,7 +177,9 @@ where
                       JS_MAX_SAFE_INTEGER check below — 2^53 is exactly representable in f64"
         )]
         if float > JS_MAX_SAFE_INTEGER as f64 {
-            return Err(D::Error::custom(format!("{raw} exceeds Number.MAX_SAFE_INTEGER")));
+            return Err(D::Error::custom(format!(
+                "{raw} exceeds Number.MAX_SAFE_INTEGER"
+            )));
         } else {
             float as u64
         }
@@ -189,7 +191,9 @@ where
         )));
     };
     if value > JS_MAX_SAFE_INTEGER {
-        return Err(D::Error::custom(format!("{value} exceeds Number.MAX_SAFE_INTEGER")));
+        return Err(D::Error::custom(format!(
+            "{value} exceeds Number.MAX_SAFE_INTEGER"
+        )));
     }
     Ok(value)
 }
@@ -240,7 +244,11 @@ pub struct SessionInfo {
     /// Broker-assigned session id (`v0.9.2 broker/client.ts:160`).
     pub id: String,
     /// Optional presence name (`v0.9.2 broker/client.ts:170-172`).
-    #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub name: Option<String>,
     /// `runtimeFallbackAlias` (`v0.10.1 types.ts:6-7`): "True only when the extension synthesized
     /// name for an unnamed runtime."
@@ -250,7 +258,11 @@ pub struct SessionInfo {
     /// the mailbox identity guard (`:1039-1047`, `if (!lowerName || info.runtimeFallbackAlias)
     /// return []`) that stops one unnamed session inheriting another's queued mail. A cyrup broker
     /// sitting between two pi v0.10 sessions must not strip it.
-    #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub runtime_fallback_alias: Option<bool>,
     /// The session's working directory (`v0.9.2 broker/client.ts:161`).
     pub cwd: String,
@@ -265,15 +277,27 @@ pub struct SessionInfo {
     pub last_activity: serde_json::Number,
     /// Optional lifecycle status string (`tool:<name>` | `thinking` | `idle` | custom suffix)
     /// (`v0.9.2 broker/client.ts:174-176`).
-    #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub status: Option<String>,
     /// Broker-owned peer uid (TCP only; never from `register`) — `[JS-NUMBER]`
     /// (`v0.9.2 broker/client.ts:178-180`).
-    #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub peer_uid: Option<serde_json::Number>,
     /// Broker-owned trust flag (`unix && !windows`; never from `register`)
     /// (`v0.9.2 broker/client.ts:188`, set at `v0.9.2 broker/broker.ts:481`).
-    #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub trusted_local: Option<bool>,
     /// Live context-window usage, 0..100 rounded — `[JS-NUMBER]` (`v0.9.2 types.ts:19`).
     ///
@@ -285,15 +309,27 @@ pub struct SessionInfo {
     /// Note the asymmetry with [`ClientMessage::Presence`]: `null` is **fatal** here
     /// (`typeof null === "object"`) and **legal** there. The two ladders are ported separately for
     /// that one reason.
-    #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub context_pct: Option<serde_json::Number>,
     /// Raw context token count — `[JS-NUMBER]` (`v0.9.2 types.ts:20`, guarded at
     /// `v0.9.2 broker/client.ts:182-186`).
-    #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub context_tokens: Option<serde_json::Number>,
     /// The model's context window in tokens — `[JS-NUMBER]` (`v0.9.2 types.ts:21`, guarded at
     /// `v0.9.2 broker/client.ts:182-186`).
-    #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub context_window: Option<serde_json::Number>,
     /// `tmuxPane` (`v0.12.0 types.ts:42`): the tmux pane id (e.g. `"%212"`) of the session's
     /// terminal, read from `$TMUX_PANE` at registration and copied onto the stored `SessionInfo` by
@@ -307,7 +343,11 @@ pub struct SessionInfo {
     /// `[NON-NULL]` — `isSessionInfo` guards it with
     /// `value.tmuxPane !== undefined && typeof value.tmuxPane !== "string"`
     /// (`v0.12.0 broker/protocol.ts:168`), so an explicit `null` is fatal, exactly as for `status`.
-    #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub tmux_pane: Option<String>,
     /// `[UNKNOWN-FIELDS]` + `[MAP-ONLY]`. A newer pi broker's additive keys survive a cyrup hop,
     /// and a JSON array can no longer fill this struct positionally.
@@ -361,36 +401,72 @@ pub struct Message {
     pub timestamp: serde_json::Number,
     /// The sender's monotonic per-connection counter — `[JS-NUMBER]`
     /// (`v0.9.2 types.ts:27`, guarded at `v0.9.2 broker/client.ts:117-121`).
-    #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub sender_sequence: Option<serde_json::Number>,
     /// Epoch-ms the broker accepted the `send` — broker-owned (`v0.9.2 broker/broker.ts:674`).
-    #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub broker_received_at: Option<serde_json::Number>,
     /// Epoch-ms the broker wrote it to the target — broker-owned
     /// (`v0.9.2 broker/broker.ts:675`).
-    #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub broker_delivered_at: Option<serde_json::Number>,
     /// Epoch-ms the receiver read it — `[JS-NUMBER]` (`v0.9.2 types.ts:30`).
-    #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub receiver_received_at: Option<serde_json::Number>,
     /// Epoch-ms the receiver injected it into its own turn — `[JS-NUMBER]`
     /// (`v0.9.2 types.ts:31`).
-    #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub injected_at: Option<serde_json::Number>,
     /// The message id this one replaces (`v0.9.2 types.ts:32`, guarded at
     /// `v0.9.2 broker/client.ts:123-125`).
-    #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub supersedes: Option<String>,
     /// The message id this one retries (`v0.9.2 types.ts:33`, guarded at
     /// `v0.9.2 broker/client.ts:127-129`).
-    #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub retry_of: Option<String>,
     /// The message id this is a reply to, if any (`v0.9.2 broker/client.ts:131-133`).
-    #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub reply_to: Option<String>,
     /// Whether the sender expects a reply (records an ask edge on the broker)
     /// (`v0.9.2 broker/client.ts:135-137`).
-    #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub expects_reply: Option<bool>,
     /// Who originated this message, when it was not the agent itself
     /// (`v0.12.0 types.ts:57`, guarded at `v0.12.0 broker/protocol.ts:114-116`).
@@ -399,7 +475,11 @@ pub struct Message {
     /// `isMessageProvenance(null)` fails and `isMessage` rejects the envelope. That is precisely
     /// what [`present_non_null`] reproduces. Until this field existed the key round-tripped through
     /// [`Message::extra`], which is why a v0.12.0 peer was tolerated but unattributable.
-    #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub provenance: Option<MessageProvenance>,
     /// The message body (`v0.9.2 broker/client.ts:139-141`).
     pub content: MessageContent,
@@ -443,7 +523,11 @@ pub struct MessageContent {
     pub text: String,
     /// Optional structured attachments (`v0.9.2 broker/client.ts:148-149`). Every element must pass
     /// `isAttachment`, so a bad one fails the whole message rather than being skipped.
-    #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub attachments: Option<Vec<Attachment>>,
     /// `[UNKNOWN-FIELDS]` + `[MAP-ONLY]` — the content object is spread along with its parent.
     #[serde(flatten)]
@@ -463,7 +547,11 @@ pub struct Attachment {
     /// The attachment content (`v0.9.2 broker/client.ts:99`).
     pub content: String,
     /// Optional language hint (for a `snippet`) (`v0.9.2 broker/client.ts:103`).
-    #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub language: Option<String>,
     /// `[UNKNOWN-FIELDS]` + `[MAP-ONLY]`.
     #[serde(flatten)]
@@ -544,7 +632,11 @@ pub struct MessageReceipt {
     /// Epoch-ms — `[JS-NUMBER]` (`v0.9.2 broker/client.ts:61`).
     pub timestamp: serde_json::Number,
     /// Free-form detail (`v0.9.2 broker/client.ts:64`).
-    #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub detail: Option<String>,
     /// `[UNKNOWN-FIELDS]` + `[MAP-ONLY]`. The array shape is not hypothetical: a positional
     /// `["m1","queued",1,null]` was confirmed to leave a cyrup broker alive and serving, where pi
@@ -576,10 +668,18 @@ pub struct MessageControl {
     /// Epoch-ms — `[JS-NUMBER]` (`v0.9.2 broker/client.ts:72`).
     pub timestamp: serde_json::Number,
     /// For `supersede`, the id of the replacement (`v0.9.2 broker/client.ts:78-80`).
-    #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub superseded_by: Option<String>,
     /// Free-form detail (`v0.9.2 broker/client.ts:81`).
-    #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub detail: Option<String>,
     /// `[UNKNOWN-FIELDS]` + `[MAP-ONLY]`.
     #[serde(flatten)]
@@ -645,10 +745,14 @@ impl<'de> serde::Deserialize<'de> for ExtensionOwnerRef {
         }
         let wire = Wire::deserialize(deserializer)?;
         match (wire.owner_id, wire.owner_epoch) {
-            (None, None) => Ok(Self { owner_id: None, owner_epoch: None }),
-            (Some(owner_id), Some(owner_epoch)) => {
-                Ok(Self { owner_id: Some(owner_id), owner_epoch: Some(owner_epoch) })
-            }
+            (None, None) => Ok(Self {
+                owner_id: None,
+                owner_epoch: None,
+            }),
+            (Some(owner_id), Some(owner_epoch)) => Ok(Self {
+                owner_id: Some(owner_id),
+                owner_epoch: Some(owner_epoch),
+            }),
             _ => Err(D::Error::custom(
                 "ownerId and ownerEpoch must both be present or both be absent",
             )),
@@ -686,7 +790,11 @@ pub enum ExtensionAudience {
 #[serde(rename_all = "camelCase")]
 pub struct SessionRegistration {
     /// Optional presence name (`v0.9.2 broker/broker.ts:207-209`).
-    #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub name: Option<String>,
     /// Whether `name` is a synthesized unnamed-runtime alias (`v0.10.1 types.ts:6-7`), carried on
     /// the registration by `buildRegistration`'s `...identity` spread
@@ -697,7 +805,11 @@ pub struct SessionRegistration {
     /// bad type is accepted-and-dropped there; modelled here because cyrup both SENDS it and copies
     /// it into the stored `SessionInfo`, and `present_non_null` keeps a `null` from being a decode
     /// failure.
-    #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub runtime_fallback_alias: Option<bool>,
     /// The session's working directory (`v0.9.2 broker/broker.ts:198`).
     pub cwd: String,
@@ -710,7 +822,11 @@ pub struct SessionRegistration {
     /// Epoch-ms of the most recent activity — `[JS-NUMBER]` (`v0.9.2 broker/broker.ts:202`).
     pub last_activity: serde_json::Number,
     /// Optional lifecycle status string (`v0.9.2 broker/broker.ts:211`).
-    #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub status: Option<String>,
     /// `[UNKNOWN-FIELDS]` + `[MAP-ONLY]`. Carries `extensions` and the context trio, both of which
     /// upstream reads (or ignores) without modelling them on this type. The `[MAP-ONLY]` half is
@@ -723,7 +839,11 @@ pub struct SessionRegistration {
     /// `isSessionRegistration` upstream (`v0.12.0 broker/protocol.ts:203`) — so modelling it with
     /// [`present_non_null`] puts cyrup neither looser nor stricter than pi: a non-string destroys
     /// the connection on both sides.
-    #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub tmux_pane: Option<String>,
     #[serde(flatten)]
     pub extra: UnknownFields,
@@ -735,7 +855,11 @@ pub struct SessionRegistration {
 /// the union is also the *acceptance* set: a tag missing from here is an `unknown variant` decode
 /// error, i.e. a destroyed connection, for a frame a conforming pi peer sends as a matter of course.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum ClientMessage {
     /// Register a session (optionally re-adopting a stable `session_id`)
     /// (`v0.9.2 types.ts:78`, handled at `v0.9.2 broker/broker.ts:429-533`).
@@ -744,7 +868,11 @@ pub enum ClientMessage {
         session: SessionRegistration,
         /// A stable session id to re-adopt (broker takeover), if any. Must be a non-blank string
         /// when present (`isSessionId`, `v0.9.2 broker/broker.ts:186-188`).
-        #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "present_non_null",
+            skip_serializing_if = "Option::is_none"
+        )]
         session_id: Option<String>,
         /// The opt-in-TCP endpoint credential (`stateId`, `v0.9.2 broker/client.ts:360`): the
         /// broker's per-run `BROKER_STATE_ID` from `broker.port.json`. Required over TCP
@@ -753,7 +881,11 @@ pub enum ClientMessage {
         /// socket / named pipe. Filled in by
         /// [`crate::transport::client::IntercomClient::connect_target`] from the resolved
         /// [`crate::transport::target::BrokerConnectTarget`].
-        #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "present_non_null",
+            skip_serializing_if = "Option::is_none"
+        )]
         state_id: Option<String>,
     },
     /// Unregister this session (`v0.9.2 types.ts:79`).
@@ -804,27 +936,55 @@ pub enum ClientMessage {
     /// would disconnect a peer pi serves.
     Presence {
         /// New presence name, if changed (`v0.9.2 broker/broker.ts:891-894`).
-        #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "present_non_null",
+            skip_serializing_if = "Option::is_none"
+        )]
         name: Option<String>,
         /// Whether the accompanying `name` is a synthesized unnamed-runtime alias
         /// (`v0.10.1 types.ts:88`, applied at `v0.10.1 broker/broker.ts:779-787`).
-        #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "present_non_null",
+            skip_serializing_if = "Option::is_none"
+        )]
         runtime_fallback_alias: Option<bool>,
         /// New status string, if changed (`v0.9.2 broker/broker.ts:900-903`).
-        #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "present_non_null",
+            skip_serializing_if = "Option::is_none"
+        )]
         status: Option<String>,
         /// New model ref, if changed (`v0.9.2 broker/broker.ts:909-912`).
-        #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "present_non_null",
+            skip_serializing_if = "Option::is_none"
+        )]
         model: Option<String>,
         /// Context-usage percentage: `None` omits, `Some(None)` clears, `Some(n)` sets
         /// (`v0.9.2 broker/broker.ts:921-930`).
-        #[serde(default, deserialize_with = "present_nullable", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "present_nullable",
+            skip_serializing_if = "Option::is_none"
+        )]
         context_pct: Option<Option<serde_json::Number>>,
         /// Context token count, same tri-state (`v0.9.2 broker/broker.ts:931-940`).
-        #[serde(default, deserialize_with = "present_nullable", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "present_nullable",
+            skip_serializing_if = "Option::is_none"
+        )]
         context_tokens: Option<Option<serde_json::Number>>,
         /// Context window size, same tri-state (`v0.9.2 broker/broker.ts:941-950`).
-        #[serde(default, deserialize_with = "present_nullable", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "present_nullable",
+            skip_serializing_if = "Option::is_none"
+        )]
         context_window: Option<Option<serde_json::Number>>,
     },
     /// Publish an extension-bus payload (`v0.9.2 types.ts:87-94`).
@@ -834,10 +994,18 @@ pub enum ClientMessage {
         /// Who receives it.
         audience: ExtensionAudience,
         /// The sender's claimed ownership epoch, when it claims to be the owner.
-        #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "present_non_null",
+            skip_serializing_if = "Option::is_none"
+        )]
         owner_epoch: Option<String>,
         /// Restrict delivery to the owner.
-        #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "present_non_null",
+            skip_serializing_if = "Option::is_none"
+        )]
         owner_only: Option<bool>,
         /// Opaque body (`unknown` upstream — never type-checked).
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -867,7 +1035,11 @@ pub enum ClientMessage {
 // decision, as `cyrup-session/src/entry.rs:50` and `:217`.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum BrokerMessage {
     /// Registration acknowledged; carries the broker-assigned session id
     /// (`v0.9.2 types.ts:104`, `v0.9.2 broker/client.ts:386-411`).
@@ -878,7 +1050,11 @@ pub enum BrokerMessage {
         /// [`EXTENSION_BUS_FEATURE`]. Absent is legal and is what cyrup always sends;
         /// `null` is not, and neither is a non-string element
         /// (`v0.9.2 broker/client.ts:395-400`).
-        #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "present_non_null",
+            skip_serializing_if = "Option::is_none"
+        )]
         features: Option<Vec<String>>,
     },
     /// A `list` response (`v0.9.2 broker/client.ts:414-428`).
@@ -990,7 +1166,11 @@ pub enum BrokerMessage {
         #[serde(deserialize_with = "js_safe_integer")]
         revision: u64,
         /// Why it was refused (`:590`).
-        #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "present_non_null",
+            skip_serializing_if = "Option::is_none"
+        )]
         reason: Option<String>,
     },
 }
@@ -999,7 +1179,11 @@ pub enum BrokerMessage {
 /// `ClientMessage`/`BrokerMessage` unions; used only by discovery (`transport::spawn`) and answered
 /// by the broker (`v0.9.2 broker/broker.ts:404-417`).
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum HealthMessage {
     /// A health probe.
     Health {
@@ -1009,7 +1193,11 @@ pub enum HealthMessage {
         /// terms as `register`'s: required over TCP (`v0.9.2 broker/broker.ts:408-410`), omitted
         /// over a socket / pipe. Filled in by
         /// [`crate::transport::spawn::check_target_connectable`].
-        #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "present_non_null",
+            skip_serializing_if = "Option::is_none"
+        )]
         state_id: Option<String>,
     },
     /// The broker's health response (`{type:"health_ok", requestId, protocol, version}`,
@@ -1152,17 +1340,13 @@ mod tests {
     #[test]
     fn every_guarded_payload_rejects_an_array() {
         assert!(
-            serde_json::from_str::<SessionRegistration>(
-                r#"[null,"/w","m",4242,0,0,null]"#
-            )
-            .is_err(),
+            serde_json::from_str::<SessionRegistration>(r#"[null,"/w","m",4242,0,0,null]"#)
+                .is_err(),
             "`v0.9.2 broker/broker.ts:191-193` bails on Array.isArray"
         );
         assert!(
-            serde_json::from_str::<SessionInfo>(
-                r#"["s",null,"/w","m",1,2,3,null,null,null]"#
-            )
-            .is_err()
+            serde_json::from_str::<SessionInfo>(r#"["s",null,"/w","m",1,2,3,null,null,null]"#)
+                .is_err()
         );
         assert!(
             serde_json::from_str::<Message>(
@@ -1171,9 +1355,7 @@ mod tests {
             .is_err()
         );
         assert!(serde_json::from_str::<MessageContent>(r#"["hi",null]"#).is_err());
-        assert!(
-            serde_json::from_str::<Attachment>(r#"["snippet","n","c",null]"#).is_err()
-        );
+        assert!(serde_json::from_str::<Attachment>(r#"["snippet","n","c",null]"#).is_err());
         assert!(
             serde_json::from_str::<MessageReceipt>(r#"["m1","queued",1,null]"#).is_err(),
             "`v0.9.2 broker/client.ts:57-59` bails on Array.isArray"
@@ -1202,9 +1384,15 @@ mod tests {
             r#"{"id":"s","cwd":"/w","model":"m","pid":1,"startedAt":2,"lastActivity":3}"#,
         )
         .expect("every optional field absent is the common case");
-        for key in
-            ["name", "status", "peerUid", "trustedLocal", "contextPct", "contextTokens", "contextWindow"]
-        {
+        for key in [
+            "name",
+            "status",
+            "peerUid",
+            "trustedLocal",
+            "contextPct",
+            "contextTokens",
+            "contextWindow",
+        ] {
             let raw = format!(
                 r#"{{"id":"s","cwd":"/w","model":"m","pid":1,"startedAt":2,"lastActivity":3,"{key}":null}}"#
             );
@@ -1224,9 +1412,8 @@ mod tests {
             "replyTo",
             "expectsReply",
         ] {
-            let raw = format!(
-                r#"{{"id":"m1","timestamp":1,"content":{{"text":"hi"}},"{key}":null}}"#
-            );
+            let raw =
+                format!(r#"{{"id":"m1","timestamp":1,"content":{{"text":"hi"}},"{key}":null}}"#);
             assert!(
                 serde_json::from_str::<Message>(&raw).is_err(),
                 "`message.{key}` = null must be rejected"
@@ -1252,7 +1439,10 @@ mod tests {
                 r#"{{"id":"s","cwd":"/w","model":"m","pid":{value},"startedAt":{value},"lastActivity":{value}}}"#
             );
             let decoded = serde_json::from_str::<SessionInfo>(&raw);
-            assert!(decoded.is_ok(), "pi accepts {value} as a number, got {decoded:?}");
+            assert!(
+                decoded.is_ok(),
+                "pi accepts {value} as a number, got {decoded:?}"
+            );
         }
         for value in ["\"1\"", "\"\"", "{}", "[]", "[1]", "true", "null"] {
             let raw = format!(
@@ -1284,8 +1474,7 @@ mod tests {
         )
         .expect("Number.isSafeInteger(2.0) is true");
         for bad in ["9007199254740992", "-1", "1.5", "\"1\"", "null"] {
-            let raw =
-                format!(r#"{{"type":"extension_state","namespace":"ns","revision":{bad}}}"#);
+            let raw = format!(r#"{{"type":"extension_state","namespace":"ns","revision":{bad}}}"#);
             assert!(
                 serde_json::from_str::<BrokerMessage>(&raw).is_err(),
                 "revision {bad} fails `Number.isSafeInteger(x) && x >= 0`"
@@ -1338,7 +1527,10 @@ mod tests {
             owner: ExtensionOwnerRef::default(),
         };
         let v = serde_json::to_value(&unowned).unwrap();
-        assert!(v.get("ownerId").is_none() && v.get("ownerEpoch").is_none(), "got {v}");
+        assert!(
+            v.get("ownerId").is_none() && v.get("ownerEpoch").is_none(),
+            "got {v}"
+        );
     }
 
     /// `registered.features` — absent and a string list are what a real broker sends; `null` and a
@@ -1353,7 +1545,10 @@ mod tests {
         .expect("pi's broker advertises exactly this");
         for bad in ["null", "[1,2]", "\"extension-bus-v1\"", "{}"] {
             let raw = format!(r#"{{"type":"registered","sessionId":"s1","features":{bad}}}"#);
-            assert!(serde_json::from_str::<BrokerMessage>(&raw).is_err(), "features {bad}");
+            assert!(
+                serde_json::from_str::<BrokerMessage>(&raw).is_err(),
+                "features {bad}"
+            );
         }
         // The advertised name is the one pi negotiates on.
         assert_eq!(EXTENSION_BUS_FEATURE, "extension-bus-v1");
@@ -1373,11 +1568,21 @@ mod tests {
             context_window: None,
         };
         let v = serde_json::to_value(&msg).unwrap();
-        assert_eq!(v["contextPct"], serde_json::Value::Null, "an explicit null CLEARS upstream");
+        assert_eq!(
+            v["contextPct"],
+            serde_json::Value::Null,
+            "an explicit null CLEARS upstream"
+        );
         assert_eq!(v["contextTokens"], 128_000);
-        assert!(v.get("contextWindow").is_none(), "absent leaves the field untouched upstream");
+        assert!(
+            v.get("contextWindow").is_none(),
+            "absent leaves the field untouched upstream"
+        );
         let back: ClientMessage = serde_json::from_value(v).unwrap();
-        assert_eq!(back, msg, "the tri-state must survive decoding, not collapse to None");
+        assert_eq!(
+            back, msg,
+            "the tri-state must survive decoding, not collapse to None"
+        );
     }
 
     /// The `[JS-NUMBER]` bargain's other half: the wire stays permissive, the *use* does not.
@@ -1390,11 +1595,18 @@ mod tests {
         assert_eq!(as_os_pid(&serde_json::Number::from(-1i64)), None);
         assert_eq!(as_os_pid(&serde_json::Number::from(0u64)), None);
         assert_eq!(as_os_pid(&serde_json::Number::from_f64(1.5).unwrap()), None);
-        assert_eq!(as_os_pid(&serde_json::Number::from(4_294_967_296u64)), None, "beyond u32");
+        assert_eq!(
+            as_os_pid(&serde_json::Number::from(4_294_967_296u64)),
+            None,
+            "beyond u32"
+        );
         assert_eq!(as_os_pid(&serde_json::Number::from(4321u64)), Some(4321));
 
         assert_eq!(as_epoch_ms(&serde_json::Number::from(-1i64)), None);
-        assert_eq!(as_epoch_ms(&serde_json::Number::from_f64(1.5).unwrap()), None);
+        assert_eq!(
+            as_epoch_ms(&serde_json::Number::from_f64(1.5).unwrap()),
+            None
+        );
         assert_eq!(as_epoch_ms(&serde_json::Number::from(0u64)), Some(0));
         assert_eq!(
             as_epoch_ms(&serde_json::Number::from(1_700_000_000_000u64)),

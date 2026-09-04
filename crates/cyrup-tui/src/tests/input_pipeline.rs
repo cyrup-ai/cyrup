@@ -31,17 +31,21 @@ fn input_pipeline(raw: Vec<Event>) -> Vec<InputEvent> {
     out
 }
 
-
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 mod stray_reply_pipeline_tests {
+    use super::input_pipeline;
+    use crate::InputEvent;
+    use crate::UiTheme;
     use crate::app::*;
     use ratatui::backend::TestBackend;
-    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use super::input_pipeline;
-    use crate::UiTheme;
-    use crate::InputEvent;
     use ratatui::crossterm::event::Event;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn ch(c: char) -> Event {
         Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
@@ -53,19 +57,32 @@ mod stray_reply_pipeline_tests {
     /// real reader-thread pipeline and then through the real editor, and assert the prompt is empty.
     #[test]
     fn a_late_osc11_reply_never_reaches_the_editor() {
-        let mut raw = vec![Event::Key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::ALT))];
+        let mut raw = vec![Event::Key(KeyEvent::new(
+            KeyCode::Char(']'),
+            KeyModifiers::ALT,
+        ))];
         raw.extend("11;rgb:0c0c/0b0b/1313".chars().map(ch));
         // BEL (0x07) reaches crossterm's C0 arm as Ctrl+G.
-        raw.push(Event::Key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)));
+        raw.push(Event::Key(KeyEvent::new(
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL,
+        )));
 
         let delivered = input_pipeline(raw);
-        assert!(delivered.is_empty(), "no input event may survive the frame, got {delivered:?}");
+        assert!(
+            delivered.is_empty(),
+            "no input event may survive the frame, got {delivered:?}"
+        );
 
         let mut app = App::new(TestBackend::new(80, 24), UiTheme::dark()).unwrap();
         for ev in &delivered {
             app.handle_input(ev);
         }
-        assert_eq!(app.state().editor.text(), "", "the prompt must be untouched");
+        assert_eq!(
+            app.state().editor.text(),
+            "",
+            "the prompt must be untouched"
+        );
     }
 
     /// TUI-045's own Verify, at the pipeline level: "drive `input_pipeline` with the two-chunk form
@@ -96,7 +113,11 @@ mod stray_reply_pipeline_tests {
         for ev in &delivered {
             app.handle_input(ev);
         }
-        assert_eq!(app.state().editor.text(), "", "no `[A` may be typed into the prompt");
+        assert_eq!(
+            app.state().editor.text(),
+            "",
+            "no `[A` may be typed into the prompt"
+        );
     }
 
     /// The safety half: the same pipeline must deliver ordinary typing byte-for-byte, including the
@@ -105,10 +126,17 @@ mod stray_reply_pipeline_tests {
     fn ordinary_typing_survives_the_pipeline_intact() {
         let mut raw: Vec<Event> = "hello 11; world".chars().map(ch).collect();
         raw.push(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
-        raw.push(Event::Key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::ALT)));
+        raw.push(Event::Key(KeyEvent::new(
+            KeyCode::Char(']'),
+            KeyModifiers::ALT,
+        )));
 
         let delivered = input_pipeline(raw.clone());
-        assert_eq!(delivered.len(), raw.len(), "every key must be delivered: {delivered:?}");
+        assert_eq!(
+            delivered.len(),
+            raw.len(),
+            "every key must be delivered: {delivered:?}"
+        );
         for (i, (got, want)) in delivered.iter().zip(raw.iter()).enumerate() {
             match (got, want) {
                 (InputEvent::Key(a), Event::Key(b)) => assert_eq!(a, b, "event {i} differs"),

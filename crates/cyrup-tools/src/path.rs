@@ -276,7 +276,11 @@ fn percent_decode(s: &str) -> String {
 pub fn path_to_file_url(path: &Path) -> String {
     const SAFE: &[u8] = b"-._~!$&'()*+,;=:@/";
     let raw = path.to_string_lossy();
-    let raw = if cfg!(windows) { raw.replace('\\', "/") } else { raw.into_owned() };
+    let raw = if cfg!(windows) {
+        raw.replace('\\', "/")
+    } else {
+        raw.into_owned()
+    };
     let mut out = String::from("file://");
     if !raw.starts_with('/') {
         out.push('/');
@@ -387,7 +391,12 @@ fn resolve_lexical(path: &Path, base: &Path) -> PathBuf {
     } else {
         // `nodeResolvePath(relativeBase, input)` prepends `process.cwd()` to the base. `unwrap_or_default`
         // rather than `unwrap`: `clippy::unwrap_used` is denied outside `mod tests`.
-        lexical_resolve(&std::env::current_dir().unwrap_or_default().join(base).join(path))
+        lexical_resolve(
+            &std::env::current_dir()
+                .unwrap_or_default()
+                .join(base)
+                .join(path),
+        )
     }
 }
 /// `strip_prefix`, with Windows's case-insensitive segment comparison.
@@ -411,7 +420,11 @@ fn strip_cwd_prefix<'a>(path: &'a Path, base: &Path) -> Option<&'a Path> {
         // OEM/ANSI case table, and every character that can differ in a drive letter or an ASCII
         // filename is covered. A non-ASCII segment still compares exactly, which is the
         // conservative direction — it can only fail to strip, never strip the wrong thing.
-        if !n.as_os_str().to_string_lossy().eq_ignore_ascii_case(&b.as_os_str().to_string_lossy()) {
+        if !n
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy())
+        {
             return None;
         }
     }
@@ -423,7 +436,6 @@ fn strip_cwd_prefix<'a>(path: &'a Path, base: &Path) -> Option<&'a Path> {
 fn strip_cwd_prefix<'a>(path: &'a Path, base: &Path) -> Option<&'a Path> {
     path.strip_prefix(base).ok()
 }
-
 
 /// Port of Pi's `getCwdRelativePath` (`utils/paths.ts:108-117`): the cwd-relative form of
 /// `file_path` when it is inside `cwd`, else `None`.
@@ -551,7 +563,10 @@ mod tests {
             Some(PathBuf::from("AGENTS.md"))
         );
         // A path genuinely outside the cwd is still outside it.
-        assert_eq!(cwd_relative_path(Path::new(r"C:\Bar\x"), Path::new(r"c:\foo")), None);
+        assert_eq!(
+            cwd_relative_path(Path::new(r"C:\Bar\x"), Path::new(r"c:\foo")),
+            None
+        );
     }
 
     use super::*;
@@ -580,7 +595,10 @@ mod tests {
     #[test]
     fn cwd_relative_path_keeps_dotted_names() {
         assert_eq!(
-            cwd_relative_path(Path::new("/w/project/..config/AGENTS.md"), Path::new("/w/project")),
+            cwd_relative_path(
+                Path::new("/w/project/..config/AGENTS.md"),
+                Path::new("/w/project")
+            ),
             Some(PathBuf::from("..config/AGENTS.md"))
         );
     }
@@ -592,11 +610,17 @@ mod tests {
     fn cwd_relative_path_rejects_parent_traversal() {
         assert!(cwd_relative_path(Path::new("/w/AGENTS.md"), Path::new("/w/project")).is_none());
         assert!(
-            cwd_relative_path(Path::new("/w/project/../AGENTS.md"), Path::new("/w/project"))
-                .is_none()
+            cwd_relative_path(
+                Path::new("/w/project/../AGENTS.md"),
+                Path::new("/w/project")
+            )
+            .is_none()
         );
         // A sibling whose name merely SHARES a prefix is outside too — the component-wise compare.
-        assert!(cwd_relative_path(Path::new("/w/project2/AGENTS.md"), Path::new("/w/project")).is_none());
+        assert!(
+            cwd_relative_path(Path::new("/w/project2/AGENTS.md"), Path::new("/w/project"))
+                .is_none()
+        );
     }
 
     /// `const resolvedCwd = resolvePath(cwd)` (`:109`) — the CWD side is resolved as well. A raw

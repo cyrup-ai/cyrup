@@ -168,8 +168,7 @@ const AUTH_URL_INSTRUCTIONS: &str = "A browser window should open. Complete logi
 const MANUAL_PROMPT_MESSAGE: &str =
     "Complete login in your browser, or paste the authorization code / redirect URL here:";
 /// `openai-codex.ts:190-192`.
-const DEVICE_NOT_ENABLED_MESSAGE: &str =
-    "OpenAI Codex device code login is not enabled for this server. Use browser login or verify the server URL.";
+const DEVICE_NOT_ENABLED_MESSAGE: &str = "OpenAI Codex device code login is not enabled for this server. Use browser login or verify the server URL.";
 /// `openai-codex.ts:496`.
 const SELECT_LOGIN_METHOD_MESSAGE: &str = "Select OpenAI Codex login method:";
 /// `openai-codex.ts:498`.
@@ -706,9 +705,7 @@ impl OpenAiCodexOAuthFlow {
         &self,
         cancel: Option<&CancelToken>,
     ) -> Result<DeviceAuthInfo, OAuthError> {
-        let client = self
-            .client(&self.endpoints.device_user_code_url)
-            .await?;
+        let client = self.client(&self.endpoints.device_user_code_url).await?;
         // `:182-188`
         let send = client
             .post(&self.endpoints.device_user_code_url)
@@ -930,7 +927,8 @@ impl OpenAiCodexOAuthFlow {
         } else if truthy(manual_input.as_deref()) {
             let parsed = parse_authorization_input(manual_input.as_deref().unwrap_or_default());
             // `:464` — a *present, non-empty* state that disagrees is fatal.
-            if truthy(parsed.state.as_deref()) && parsed.state.as_deref() != Some(auth.state.as_str())
+            if truthy(parsed.state.as_deref())
+                && parsed.state.as_deref() != Some(auth.state.as_str())
             {
                 return Err(OAuthError::Failed(STATE_MISMATCH_MESSAGE.to_string()));
             }
@@ -982,7 +980,9 @@ impl OpenAiCodexOAuthFlow {
         // `:427`
         let auth = self.create_authorization_flow()?;
         // `:428`
-        let server = self.start_local_oauth_server(&auth.state, interaction).await?;
+        let server = self
+            .start_local_oauth_server(&auth.state, interaction)
+            .await?;
         // `:429`
         let manual_abort = CancelToken::new();
 
@@ -1197,7 +1197,8 @@ mod tests {
     #[test]
     fn parse_authorization_input_covers_the_codex_branches() {
         // `:76-83` — a full redirect URL.
-        let parsed = parse_authorization_input("  http://localhost:1455/auth/callback?code=abc&state=st  ");
+        let parsed =
+            parse_authorization_input("  http://localhost:1455/auth/callback?code=abc&state=st  ");
         assert_eq!(parsed.code.as_deref(), Some("abc"));
         assert_eq!(parsed.state.as_deref(), Some("st"));
         // `:85-88` — `code#state`, with JS's truncating `split("#", 2)`.
@@ -1213,7 +1214,10 @@ mod tests {
         assert_eq!(parsed.code.as_deref(), Some("just-a-code"));
         assert_eq!(parsed.state, None);
         // `:74-75`
-        assert_eq!(parse_authorization_input("   "), ParsedAuthorizationInput::default());
+        assert_eq!(
+            parse_authorization_input("   "),
+            ParsedAuthorizationInput::default()
+        );
     }
 
     // -- JWT fixtures -------------------------------------------------------
@@ -1507,9 +1511,8 @@ mod tests {
     #[tokio::test]
     async fn device_auth_start_parses_a_numeric_and_a_string_interval() {
         for (raw, expected) in [(r#"5"#, 5.0), (r#""5""#, 5.0), (r#""  0 ""#, 0.0)] {
-            let body = format!(
-                r#"{{"device_auth_id":"dev-1","user_code":"WXYZ-1234","interval":{raw}}}"#
-            );
+            let body =
+                format!(r#"{{"device_auth_id":"dev-1","user_code":"WXYZ-1234","interval":{raw}}}"#);
             let mut server = FakeEndpoint::one(200, &body);
             let flow = flow_with_device_urls(&server.url("/usercode"), DEVICE_TOKEN_URL);
             let device = flow.start_device_auth(None).await.unwrap();
@@ -1526,7 +1529,8 @@ mod tests {
             let (head, payload) = &recorded[0];
             assert!(head.starts_with("POST /usercode HTTP/1.1"), "{head}");
             assert!(
-                head.to_lowercase().contains("content-type: application/json"),
+                head.to_lowercase()
+                    .contains("content-type: application/json"),
                 "{head}"
             );
             // openai-codex.ts:185
@@ -1647,7 +1651,11 @@ mod tests {
         );
         // `:258-261` — a nested `{ code }` object is unwrapped.
         assert_eq!(
-            poll_once(400, r#"{"error":{"code":"deviceauth_authorization_pending"}}"#).await,
+            poll_once(
+                400,
+                r#"{"error":{"code":"deviceauth_authorization_pending"}}"#
+            )
+            .await,
             DeviceCodePollResult::Pending
         );
         // `:268-270`
@@ -1763,13 +1771,17 @@ mod tests {
         // `:418-423` — the device exchange presents DEVICE_REDIRECT_URI, not REDIRECT_URI.
         let exchanged = token.recorded();
         assert!(
-            exchanged[0].1.contains(
-                "&redirect_uri=https%3A%2F%2Fauth.openai.com%2Fdeviceauth%2Fcallback"
-            ),
+            exchanged[0]
+                .1
+                .contains("&redirect_uri=https%3A%2F%2Fauth.openai.com%2Fdeviceauth%2Fcallback"),
             "{}",
             exchanged[0].1
         );
-        assert!(exchanged[0].1.contains("&code=ac-9&code_verifier=cv-9"), "{}", exchanged[0].1);
+        assert!(
+            exchanged[0].1.contains("&code=ac-9&code_verifier=cv-9"),
+            "{}",
+            exchanged[0].1
+        );
         // Both device round trips carry the same identifiers (`:230-234`).
         for (_, payload) in device_token.recorded() {
             assert_eq!(
@@ -1894,7 +1906,8 @@ mod tests {
             "grant_type=authorization_code\
              &client_id=app_EMoamEEZ73f0CkXaXp7hrann\
              &code=web-code\
-             &code_verifier=".to_string()
+             &code_verifier="
+                .to_string()
                 + &auth.verifier
                 + "&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback"
         );
@@ -1935,7 +1948,10 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(missing.contains("<p>Missing authorization code.</p>"), "{missing}");
+        assert!(
+            missing.contains("<p>Missing authorization code.</p>"),
+            "{missing}"
+        );
 
         // Mirror: the listener is still live, so a good redirect completes it.
         let good = tokio::task::spawn_blocking(move || {
@@ -1978,7 +1994,11 @@ mod tests {
             other => panic!("expected an oauth credential, got {other:?}"),
         }
         let exchanged = token.recorded();
-        assert!(exchanged[0].1.contains("&code=pasted-code&"), "{}", exchanged[0].1);
+        assert!(
+            exchanged[0].1.contains("&code=pasted-code&"),
+            "{}",
+            exchanged[0].1
+        );
     }
 
     /// `:464` / `:471` — a pasted redirect URL whose `state` disagrees is `"State mismatch"`,

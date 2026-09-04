@@ -29,32 +29,32 @@ pub mod migrate;
 pub mod prompt;
 pub mod store;
 
-pub use compaction::{
-    serialize_conversation, BranchSummarySettings, Compactor, CompactionError, CompactionHooks,
-    CompactionReason, CompactionSettings, NoHooks, Summarizer,
-};
 pub use agent_message::{
-    convert_to_llm, AgentMessage, BashExecutionMessage, BranchSummaryMessage,
-    CompactionSummaryMessage, CustomRoleMessage, MessageRole,
+    AgentMessage, BashExecutionMessage, BranchSummaryMessage, CompactionSummaryMessage,
+    CustomRoleMessage, MessageRole, convert_to_llm,
+};
+pub use compaction::{
+    BranchSummarySettings, CompactionError, CompactionHooks, CompactionReason, CompactionSettings,
+    Compactor, NoHooks, Summarizer, serialize_conversation,
 };
 pub use context::SessionContext;
 pub use entry::{Entry, EntryBase, KnownEntry};
 pub use error::SessionError;
-pub use git_paths::{canonicalize_path, find_git_paths, resolve_path, GitPaths};
-pub use header::{SessionHeader, CURRENT_VERSION};
-pub use layout::{encode_cwd, SessionLayout, SessionsRoot};
+pub use git_paths::{GitPaths, canonicalize_path, find_git_paths, resolve_path};
+pub use header::{CURRENT_VERSION, SessionHeader};
+pub use layout::{SessionLayout, SessionsRoot, encode_cwd};
 pub use listing::{
-    list, list_all, list_all_in_dir, list_all_with_progress, list_in_dir, newest_session, resolve,
-    SessionInfo, SessionListProgress, SessionSelector,
+    SessionInfo, SessionListProgress, SessionSelector, list, list_all, list_all_in_dir,
+    list_all_with_progress, list_in_dir, newest_session, resolve,
 };
 pub use manager::{NewSessionOpts, SessionManager, TreeNode};
 pub use prompt::{
-    apply_before_agent_start, BeforeAgentStartHook, BeforeAgentStartInput, BeforeAgentStartOutput,
-    ContextDiagnostic, ContextError, ContextFile, ContextFileLoader, ContextScope, ContextSnapshot,
-    ContextStore, DocsPointers, PromptInputs, ResolvedOverride, SkillPointer, SystemPromptBuilder,
-    ToolPromptContribution, TrustQuery, DEFAULT_SELECTED_TOOLS,
+    BeforeAgentStartHook, BeforeAgentStartInput, BeforeAgentStartOutput, ContextDiagnostic,
+    ContextError, ContextFile, ContextFileLoader, ContextScope, ContextSnapshot, ContextStore,
+    DEFAULT_SELECTED_TOOLS, DocsPointers, PromptInputs, ResolvedOverride, SkillPointer,
+    SystemPromptBuilder, ToolPromptContribution, TrustQuery, apply_before_agent_start,
 };
-pub use store::{flush_session_writes, DiskStore, MemStore, SessionStore};
+pub use store::{DiskStore, MemStore, SessionStore, flush_session_writes};
 
 #[cfg(test)]
 mod tests;

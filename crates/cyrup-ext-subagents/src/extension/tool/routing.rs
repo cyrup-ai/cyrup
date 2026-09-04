@@ -3,18 +3,12 @@
 
 use std::path::{Path, PathBuf};
 
-use cyrup_core::{
-    TerminateHint,CancelToken, ModelId, ToolError, ToolResult, ToolUpdateSink};
+use cyrup_core::{CancelToken, ModelId, TerminateHint, ToolError, ToolResult, ToolUpdateSink};
 
 use crate::background::{RunId, RunMode};
 use crate::discovery::discover_agents;
 use crate::exec::SingleResult;
 use crate::exec::acceptance::lower_acceptance_input as parse_single_acceptance;
-use crate::fork_context::{ContextMode, ContextRequest};
-use crate::spawn::chain_graph::{ParallelGroupSpec, RunnerStep, SingleStepSpec, StepResult};
-use crate::spawn::depth::resolve_effective_depth;
-use crate::watchdog::register_main::{watchdog_config_dirs, watchdog_model_info};
-use crate::extension::executor::SubagentExecutor;
 use crate::extension::executor::paths::async_launch_details;
 use crate::extension::executor::requests::{
     BackgroundSingleRequest, ForegroundRunRequest, GraphRunOutcome, SingleRunOverrides,
@@ -25,15 +19,19 @@ use crate::extension::host::slash_render::{
 };
 use crate::extension::tool::SubagentTool;
 use crate::extension::tool::params::{
-    foreground_timeout_default, format_failed_single_run_output, resolve_execution_agent_scope,
-    resolve_foreground_timeout, validate_execution_acceptance, SubagentToolParams,
-    WATCHDOG_MUTATING_ACTION,
+    SubagentToolParams, WATCHDOG_MUTATING_ACTION, foreground_timeout_default,
+    format_failed_single_run_output, resolve_execution_agent_scope, resolve_foreground_timeout,
+    validate_execution_acceptance,
 };
 use crate::extension::tool::task_items::{
     expand_top_level_task_counts, find_duplicate_parallel_output, normalize_skill_input,
     parse_tool_chain_items, parse_tool_task_items, render_parallel_tool_summary, tool_task_to_spec,
 };
 use crate::extension::tool::text::unknown_subagent_action_message;
+use crate::fork_context::{ContextMode, ContextRequest};
+use crate::spawn::chain_graph::{ParallelGroupSpec, RunnerStep, SingleStepSpec, StepResult};
+use crate::spawn::depth::resolve_effective_depth;
+use crate::watchdog::register_main::{watchdog_config_dirs, watchdog_model_info};
 
 /// The resolved SINGLE-mode call [`SubagentTool::route_single`]'s prologue hands to
 /// [`SubagentTool::route_single_background`].
@@ -45,7 +43,7 @@ use crate::extension::tool::text::unknown_subagent_action_message;
 /// travel as one struct because passing them positionally would put the helper over clippy's
 /// argument ceiling.
 struct SingleBackgroundDispatch<'a> {
-    /// This call's params, already carrying [`SubagentExecutor::single_agent_launch_defaults`]'
+    /// This call's params, already carrying [`crate::extension::SubagentExecutor::single_agent_launch_defaults`]'
     /// `async:` fallback (the rebind that decided this branch was taken at all).
     p: &'a SubagentToolParams,
     cwd: &'a Path,
@@ -60,13 +58,14 @@ struct SingleBackgroundDispatch<'a> {
 }
 
 impl SubagentTool {
-
     /// The comma-joined discovered agent names (or `"none"`) pi's "Provide exactly one mode. Agents:
     /// …" error lists (`subagent-executor.ts:1137`: `agents.map((a) => a.name).join(", ") ||
     /// "none"`). Discovery failures degrade to an empty list rather than propagating — this string
     /// is diagnostic-only context on an already-erroring path, never itself the primary failure.
     pub(crate) async fn discovered_agent_names_joined(&self, cwd: &Path) -> String {
-        let names: Vec<String> = SubagentExecutor::discovery_config(cwd, &self.executor.config_snapshot().await.roots)
+        let names: Vec<String> = self
+            .executor
+            .discovery_config(cwd, &self.executor.config_snapshot().await.roots)
             .and_then(|cfg| discover_agents(&cfg, None))
             .map(|result| result.agents.into_iter().map(|a| a.name).collect())
             .unwrap_or_default();
@@ -92,13 +91,22 @@ impl SubagentTool {
     /// per-site location pi appends (`(task 2)`, `(step 3, task 1)`) for everything except the
     /// top-level `agent`, which carries none.
     ///
+    /// SUBA-086 — pi `canonicalizeAgentName` (`subagent-executor.ts:2336-2344` @v0.64.0) checks
+    /// `findBlockingAgentDiagnostic` FIRST, before the ambiguity and unknown branches: a malformed
+    /// definition that outranks every candidate the name resolved to aborts the dispatch with
+    /// `Agent '<name>' has invalid configuration: <error>` (plus the same location suffix). That
+    /// is what stops a broken project-tier `worker.md` from silently launching the builtin
+    /// `worker`, and what turns a name with ONLY a broken definition into a real error instead of
+    /// "not found".
+    ///
     /// [CYRUP-DELTA — deliberate, narrow] pi's `canonicalizeAgentName` ALSO turns an unresolvable
-    /// name into `Unknown agent: <name>` right here. cyrup leaves an unresolvable name UNTOUCHED and
-    /// lets the existing per-mode resolution fail as it already does
-    /// ([`crate::error::SubagentError::AgentNotFound`] -> `agent not found: <name>`): the not-found WORDING is a
-    /// pre-existing, separate difference from pi that this crate's own tests pin, and changing it
-    /// here would be an unrelated behavioural edit smuggled into the alias port. The alias-resolution
-    /// and ambiguity-refusal halves — the parts this port owns — are complete.
+    /// name into `Unknown agent: <name>` right here. cyrup leaves an unresolvable name UNTOUCHED
+    /// (when no diagnostic claims it) and lets the existing per-mode resolution fail as it
+    /// already does ([`crate::error::SubagentError::AgentNotFound`] -> `agent not found: <name>`):
+    /// the not-found WORDING is a pre-existing, separate difference from pi that this crate's own
+    /// tests pin, and changing it here would be an unrelated behavioural edit smuggled into the
+    /// alias port. The alias-resolution and ambiguity-refusal halves — the parts this port owns —
+    /// are complete.
     pub(crate) async fn canonicalize_execution_params(
         &self,
         params: &SubagentToolParams,
@@ -112,7 +120,9 @@ impl SubagentTool {
         // discovery and surfaces the real error (a malformed `settings.json` MUST abort, R-SA-009,
         // and it will — one call later, with its own message). Degrading to "no canonicalization"
         // keeps this step from turning one error into two different ones.
-        let Ok(agents) = SubagentExecutor::discovery_config(cwd, &self.executor.config_snapshot().await.roots)
+        let Ok(discovered) = self
+            .executor
+            .discovery_config(cwd, &self.executor.config_snapshot().await.roots)
             // Same scope the mode arms resolve under (pi canonicalizes against the very
             // `discoverAgents(effectiveCwd, scope)` result the executor then uses,
             // `subagent-executor.ts:4921-4923`), so an alias can never resolve here to an agent the
@@ -123,22 +133,40 @@ impl SubagentTool {
                     Some(resolve_execution_agent_scope(params.agent_scope.as_deref())),
                 )
             })
-            .map(|result| result.agents)
         else {
             return Ok(None);
         };
+        let agents = &discovered.agents;
 
-        // `canonicalizeAgentName` + the `location` suffix (`subagent-executor.ts:1683-1690`).
+        // `canonicalizeAgentName` + the `location` suffix (`subagent-executor.ts:2336-2350`
+        // @v0.64.0): `result.error && location ? { error: `${result.error} (${location})` } :
+        // result`.
+        let with_location = |msg: String, location: Option<String>| match location {
+            Some(loc) => format!("{msg} ({loc})"),
+            None => msg,
+        };
         let resolve = |name: &str, location: Option<String>| -> Result<Option<String>, ToolError> {
-            match crate::discovery::resolve_agent_name(name, &agents) {
-                crate::discovery::AgentNameResolution::Found(agent) => {
-                    Ok(Some(agent.name.clone()))
-                }
+            let resolution = crate::discovery::resolve_agent_name(name, agents);
+            // SUBA-086: the blocking-diagnostic check comes BEFORE `resolved.error` /
+            // `!resolved.agent` (`subagent-executor.ts:2337-2341`).
+            let candidates = crate::discovery::blocking_candidates(name, agents, &resolution);
+            if let Some(diagnostic) = crate::discovery::find_blocking_agent_diagnostic(
+                name,
+                &candidates,
+                &discovered.agent_diagnostics,
+            ) {
+                return Err(ToolError::new(with_location(
+                    format!(
+                        "Agent '{name}' has invalid configuration: {}",
+                        diagnostic.error
+                    ),
+                    location,
+                )));
+            }
+            match resolution {
+                crate::discovery::AgentNameResolution::Found(agent) => Ok(Some(agent.name.clone())),
                 crate::discovery::AgentNameResolution::Ambiguous(msg) => {
-                    Err(ToolError::new(match location {
-                        Some(loc) => format!("{msg} ({loc})"),
-                        None => msg,
-                    }))
+                    Err(ToolError::new(with_location(msg, location)))
                 }
                 // See the CYRUP-DELTA above: pass through, do not manufacture a not-found here.
                 crate::discovery::AgentNameResolution::NotFound => Ok(None),
@@ -182,10 +210,13 @@ impl SubagentTool {
         if let Some(chain) = next.chain.as_mut() {
             for (index, step) in chain.iter_mut().enumerate() {
                 // Static-parallel step: `parallel` is an ARRAY of task objects.
-                if let Some(parallel) = step.get_mut("parallel").and_then(serde_json::Value::as_array_mut)
+                if let Some(parallel) = step
+                    .get_mut("parallel")
+                    .and_then(serde_json::Value::as_array_mut)
                 {
                     for (task_index, task) in parallel.iter_mut().enumerate() {
-                        let Some(name) = task.get("agent").and_then(serde_json::Value::as_str) else {
+                        let Some(name) = task.get("agent").and_then(serde_json::Value::as_str)
+                        else {
                             continue;
                         };
                         let name = name.to_string();
@@ -248,7 +279,7 @@ impl SubagentTool {
     }
 
     /// SINGLE mode (`{agent, task?}`) — the fully-wired shape (func-SA §5.2). Resolves the persona
-    /// through real discovery and drives [`SubagentExecutor::run_foreground`]/[`crate::extension::SubagentExecutor::spawn_background`]
+    /// through real discovery and drives [`crate::extension::SubagentExecutor::run_foreground`]/[`crate::extension::SubagentExecutor::spawn_background`]
     /// (`async: true`), each a genuine child OS process. `context` selects fork/fresh (an omitted
     /// value is `Fresh` in this tier); `model` is the per-call override.
     ///
@@ -282,8 +313,6 @@ impl SubagentTool {
         let context = p.context_override();
         let model = p.model.clone().map(ModelId::from);
 
-        let overrides = Self::single_run_overrides(p)?;
-
         // pi's own `validateFileOnlyOutputMode` gate (`single-output.ts:140-145`, applied at
         // `subagent-executor.ts:2883-2886`) fires AFTER the persona is resolved, because a persona's
         // own `output:` can satisfy `outputMode: "file-only"` on its own. cyrup already enforces the
@@ -304,14 +333,20 @@ impl SubagentTool {
         //  * neither applies to a chain/parallel launch (`:1930` bails on `chain`/`tasks`) — this
         //    is `route_single`, which is only ever reached for a single named agent;
         //  * an unresolvable agent name changes nothing (`:1932`), leaving the existing
-        //    "unknown agent" error path to report it.
+        //    "unknown agent" error path to report it;
+        //  * SUBA-082: `acceptance` applies ONLY when the call omitted `acceptance` entirely
+        //    (`subagent-executor.ts:2690-2692` @v0.64.0) — an explicit call-site policy, `"auto"`
+        //    included, beats the agent's `acceptance:` frontmatter default. It is folded into the
+        //    params HERE, before `single_run_overrides` lowers `p.acceptance`, so the default
+        //    reaches both the foreground and the background request through the ordinary
+        //    explicit-policy path and never touches chain/parallel steps.
         //
         // G98: the RESOLUTION now lives on the executor
-        // ([`SubagentExecutor::single_agent_launch_defaults`]) so the `/run` slash surface — an
+        // ([`crate::extension::SubagentExecutor::single_agent_launch_defaults`]) so the `/run` slash surface — an
         // independent entry point that never reaches this dispatcher — applies the same defaults.
         // Only the fill-unset-only APPLICATION rules stay here, where the "was it supplied?"
         // question can actually be asked of this call's params.
-        let launch_defaults = SubagentExecutor::single_agent_launch_defaults(
+        let launch_defaults = self.executor.single_agent_launch_defaults(
             cwd,
             agent,
             &self.executor.config_snapshot().await.roots,
@@ -326,16 +361,20 @@ impl SubagentTool {
         let cfg = self.executor.config_snapshot().await;
         let depth = resolve_effective_depth(cfg.max_subagent_depth).current_depth;
         let p_with_defaults;
-        let p: &SubagentToolParams = match launch_defaults.0 {
-            Some(default_async) if p.r#async.is_none() => {
-                p_with_defaults = SubagentToolParams {
-                    r#async: Some(default_async),
-                    ..(*p).clone()
-                };
-                &p_with_defaults
-            }
-            _ => p,
+        let fill_async = launch_defaults.0.filter(|_| p.r#async.is_none());
+        let fill_acceptance = launch_defaults.3.clone().filter(|_| p.acceptance.is_none());
+        let p: &SubagentToolParams = if fill_async.is_some() || fill_acceptance.is_some() {
+            p_with_defaults = SubagentToolParams {
+                r#async: fill_async.or(p.r#async),
+                acceptance: fill_acceptance.or_else(|| p.acceptance.clone()),
+                ..(*p).clone()
+            };
+            &p_with_defaults
+        } else {
+            p
         };
+
+        let overrides = Self::single_run_overrides(p)?;
         // SUBA-077: hoisted out of the `if` below because the timeout ladder needs it — the
         // foreground backstop is gated on this launch NOT being async.
         let background = p.is_background(&cfg, depth);
@@ -469,7 +508,10 @@ impl SubagentTool {
             // tolerantly (a wrong-typed threshold or an unknown `notifyOn` string degrades to
             // "that field was not supplied", exactly as `parsePositiveInt`/`parseControlList` do)
             // rather than hard-failing the call — see `parse_control_overrides`.
-            control: p.control.as_ref().map(crate::exec::control::parse_control_overrides),
+            control: p
+                .control
+                .as_ref()
+                .map(crate::exec::control::parse_control_overrides),
             // SUBA-N06 / pi `params.includeProgress`. Passed through untouched: `run_sync` applies
             // pi's own `? :` truthiness gate, so an explicit `false` behaves exactly like an
             // omitted flag.
@@ -488,7 +530,7 @@ impl SubagentTool {
     }
 
     /// [`Self::route_single`]'s background branch: hand the call to
-    /// [`SubagentExecutor::spawn_background`] and return pi's async-started receipt.
+    /// [`crate::extension::SubagentExecutor::spawn_background`] and return pi's async-started receipt.
     ///
     /// SUBA-N03 — there is NO foreground-only refusal on this branch any more, because
     /// every one of the nine advertised SINGLE-mode params now genuinely reaches hop 2.
@@ -614,9 +656,9 @@ impl SubagentTool {
         // `asyncId` === `runId` for a SINGLE run, pi's own async-run identity convention).
         // `asyncDir` is what binds this run to its mission — see [`async_dir_for_run`].
         Ok(ToolResult {
-            content: vec![cyrup_core::Content::text(format_async_started_message(&format!(
-                "Async: {agent} [{run_id}]"
-            )))],
+            content: vec![cyrup_core::Content::text(format_async_started_message(
+                &format!("Async: {agent} [{run_id}]"),
+            ))],
             details: Some(async_launch_details(
                 "single",
                 &run_id,
@@ -780,8 +822,10 @@ impl SubagentTool {
             result.exit_code == 0,
             result,
         );
-        if let crate::tui::intercom::DeliveryOutcome::Delivered =
-            self.executor.deliver_group_out_of_band(payload.clone()).await
+        if let crate::tui::intercom::DeliveryOutcome::Delivered = self
+            .executor
+            .deliver_group_out_of_band(payload.clone())
+            .await
         {
             let reduced = crate::tui::intercom::ReducedInlinePayload::from(&payload);
             let receipt = crate::tui::intercom::format_subagent_result_receipt(
@@ -807,7 +851,7 @@ impl SubagentTool {
     }
 
     /// Management/control action dispatch (pi: a present `action` puts the tool in management mode).
-    /// `doctor`/`models` (read-only) are wired to [`SubagentExecutor::run_doctor`]/`run_models_report`;
+    /// `doctor`/`models` (read-only) are wired to [`crate::extension::SubagentExecutor::run_doctor`]/`run_models_report`;
     /// the CRUD (`list`/`get`/`create`/`update`/`delete`, C3) routes to [`Self::route_management_action`]
     /// (the real [`crate::discovery::management`] handlers) and the background-control
     /// (`status`/`interrupt`/`resume`/`append-step`, C5) routes to [`Self::route_control_action`]
@@ -823,7 +867,10 @@ impl SubagentTool {
             // pi threads the call's own `sessionDir` override into the report (`buildDoctorReport`'s
             // `requestedSessionDir: paramsWithResolvedCwd.sessionDir`, `subagent-executor.ts:2828`).
             "doctor" => {
-                let report = self.executor.run_doctor(cwd, p.session_dir.as_deref()).await;
+                let report = self
+                    .executor
+                    .run_doctor(cwd, p.session_dir.as_deref())
+                    .await;
                 Ok(ToolResult {
                     content: vec![cyrup_core::Content::text(report)],
                     details: None,
@@ -879,20 +926,27 @@ impl SubagentTool {
             // The four `watchdog.*` actions (pi `WATCHDOG_TOOL_ACTIONS` /
             // `handleWatchdogToolAction`, dispatched at `subagent-executor.ts:4432`).
             watchdog_action
-                if crate::watchdog::tool_actions::WATCHDOG_TOOL_ACTIONS.contains(&watchdog_action) =>
+                if crate::watchdog::tool_actions::WATCHDOG_TOOL_ACTIONS
+                    .contains(&watchdog_action) =>
             {
                 self.route_watchdog_action(watchdog_action, p, cwd)
             }
-            // The six `mission.*` actions (pi `subagent-executor.ts:4397-4407` @v0.43.0), in the
-            // dispatch position upstream gives them: after the management/control arms, before the
-            // authority-policy arm. `MUTATING_MANAGEMENT_ACTIONS` (`:151`) lists four of the six —
-            // `mission.list`/`mission.show` are read-only — so a child-safe fanout tool refuses
-            // exactly those four, with upstream's own child-safe text (`:4381`).
-            mission_action if crate::missions::MissionAction::from_wire(mission_action).is_some() => {
-                let Some(mission_action) = crate::missions::MissionAction::from_wire(mission_action)
+            // The seven `mission.*` actions (pi `subagent-executor.ts:5723-5732` @v0.64.0;
+            // `:4397-4407` @v0.43.0 before SUBA-085's `mission.resolve-decision`), in the dispatch
+            // position upstream gives them: after the management/control arms, before the
+            // authority-policy arm. `MUTATING_MANAGEMENT_ACTIONS` (`:197` @v0.64.0) lists five of
+            // the seven — `mission.list`/`mission.show` are read-only — so a child-safe fanout
+            // tool refuses exactly those five, with upstream's own child-safe text.
+            mission_action
+                if crate::missions::MissionAction::from_wire(mission_action).is_some() =>
+            {
+                let Some(mission_action) =
+                    crate::missions::MissionAction::from_wire(mission_action)
                 else {
                     // Unreachable: the guard above already resolved it.
-                    return Err(ToolError::new(format!("unknown subagent action '{action}'")));
+                    return Err(ToolError::new(format!(
+                        "unknown subagent action '{action}'"
+                    )));
                 };
                 if !self.allow_mutating_management && mission_action.is_mutating() {
                     return Err(ToolError::new(format!(
@@ -965,7 +1019,10 @@ impl SubagentTool {
         // pi `if (deps.allowMutatingManagementActions === false || !ctx.hasUI)` (`:4458`). cyrup's
         // `hasUI` is "a live host-services surface is bound", the same equivalence the SUBA-064
         // authority gate already draws.
-        let Some(services) = self.executor.host_services().filter(|_| self.allow_mutating_management)
+        let Some(services) = self
+            .executor
+            .host_services()
+            .filter(|_| self.allow_mutating_management)
         else {
             return Err(ToolError::new(
                 "Action 'grant-spawn-budget' is available only from the root interactive parent \
@@ -997,8 +1054,8 @@ impl SubagentTool {
         // and comes back with the "requires additional to be a positive integer" message.
         let requested = p.additional.unwrap_or(0);
         let preview = self.executor.spawn_budget_snapshot(max_spawns);
-        let additional = budget_ops::preflight_spawn_budget_grant(&preview, requested)
-            .map_err(|error| {
+        let additional =
+            budget_ops::preflight_spawn_budget_grant(&preview, requested).map_err(|error| {
                 ToolError::new(format!(
                     "{error} {}",
                     budget_ops::format_spawn_budget(&preview)
@@ -1173,11 +1230,17 @@ impl SubagentTool {
                 "Action '{action}' is not available from child-safe subagent fanout mode."
             )));
         }
-        let cfg = SubagentExecutor::discovery_config(cwd, &self.executor.config_snapshot().await.roots).map_err(|e| ToolError::new(e.to_string()))?;
+        let cfg = self
+            .executor
+            .discovery_config(cwd, &self.executor.config_snapshot().await.roots)
+            .map_err(|e| ToolError::new(e.to_string()))?;
         // The live parent session model (pi `ctx.model`), so a `models` action routed through the
         // management layer renders the real inherited model rather than `(unavailable)`. Bound to a
         // local so the borrowed `&str` in `ManagementRequest` outlives the call.
-        let current_session_model = self.executor.inherited_session_model().map(|m| m.as_str().to_string());
+        let current_session_model = self
+            .executor
+            .inherited_session_model()
+            .map(|m| m.as_str().to_string());
 
         // pi `handleList` reads `ctx.config?.proactiveSkillSubagents` and passes a LAZY
         // `discoverAvailableSkills: () => discoverAvailableSkills(ctx.cwd)` closure
@@ -1192,7 +1255,9 @@ impl SubagentTool {
                 .await
                 .proactive_skill_subagents
                 .as_ref()
-                .map(crate::discovery::skills::ProactiveSkillSubagentsSetting::from_extension_config)
+                .map(
+                    crate::discovery::skills::ProactiveSkillSubagentsSetting::from_extension_config,
+                )
         } else {
             None
         };
@@ -1235,7 +1300,7 @@ impl SubagentTool {
     /// Tier-1 dispatch arm (C5): route `status`/`interrupt`/`resume`/`append-step` to the
     /// [`crate::background::control`] primitives + the [`crate::background::run_status`] report shape
     /// (including the no-id "list active runs" form) — pi `subagent-executor.ts:2845-2912` +
-    /// `run-status.ts:101-273`. Each arm delegates to the matching [`SubagentExecutor`] method (the
+    /// `run-status.ts:101-273`. Each arm delegates to the matching [`crate::extension::SubagentExecutor`] method (the
     /// SAME shared executor the slash commands route through, R-SA-130); a rendered report/list is
     /// returned as tool content, a user-facing failure (not-found, wrong-mode, no-transcript, …) as
     /// a [`ToolError`] (cyrup's error-result channel, since [`ToolResult`] carries no `isError`
@@ -1251,7 +1316,9 @@ impl SubagentTool {
         // →`scheduleCreate` once SUBA-016 lands). Every other control verb is ungated upstream and
         // must stay ungated here, which is why the mapping returns `None` for them rather than
         // this arm defaulting to "gated".
-        if let Some(policy_action) = crate::registration::authority::AuthorityAction::for_tool_action(action) {
+        if let Some(policy_action) =
+            crate::registration::authority::AuthorityAction::for_tool_action(action)
+        {
             use crate::registration::authority as auth;
             let policy = self.executor.config_snapshot().await.authority_policy;
             match auth::resolve_authority_decision(policy_action, policy.as_ref()) {
@@ -1277,7 +1344,9 @@ impl SubagentTool {
                         // declining is a choice, not a failure — so this is an Ok result, not an
                         // `Err`, and it is the one refusal on this path that is not a `ToolError`.
                         return Ok(ToolResult {
-                            content: vec![cyrup_core::Content::text(auth::declined_message(action))],
+                            content: vec![cyrup_core::Content::text(auth::declined_message(
+                                action,
+                            ))],
                             details: Some(serde_json::json!({ "mode": "management" })),
                             terminate: TerminateHint::Unspecified,
                             ..Default::default()
@@ -1302,7 +1371,11 @@ impl SubagentTool {
                         target,
                         p.dir.as_deref(),
                         !self.allow_mutating_management,
-                        StatusViewSelector { view: p.view.as_deref(), lines: p.lines, index },
+                        StatusViewSelector {
+                            view: p.view.as_deref(),
+                            lines: p.lines,
+                            index,
+                        },
                     )
                     .await
             }
@@ -1315,9 +1388,14 @@ impl SubagentTool {
             // advertise-vs-dispatch invariant — both land in this same change). pi reads
             // `targetRunId = params.runId ?? params.id` (`subagent-executor.ts:4772`), the SAME
             // `runId`-first precedence `interrupt` uses, and also accepts `dir` (`:4779-4787`).
+            // SUBA-087: `childId` (`subagent-executor.ts:6163,6184` @v0.64.0) rides along on both
+            // the `dir` and the id forms, so a child-scoped stop reaches `control_stop`'s resolver
+            // instead of being silently dropped by serde.
             "stop" => {
                 let target = p.run_id.as_deref().or(p.id.as_deref());
-                self.executor.control_stop(cwd, target, p.dir.as_deref()).await
+                self.executor
+                    .control_stop(cwd, target, p.dir.as_deref(), p.child_id.as_deref())
+                    .await
             }
             // SUBA-057: the `dismiss` dispatch arm the schema enum value is advertised against
             // (the advertise-vs-dispatch invariant — both land in this same change). pi reads
@@ -1415,7 +1493,7 @@ impl SubagentTool {
     /// tool's top-level PARALLEL shape (`tasks[]` + `concurrency`/`worktree`, per-task
     /// `count`/`output`/`outputMode`/`reads`/`model`) into a single [`RunnerStep::ParallelGroup`]
     /// and route it through the SAME shared plan-execution path
-    /// ([`SubagentExecutor::run_or_background_graph`]) the slash commands use — so each task's REAL
+    /// ([`crate::extension::SubagentExecutor::run_or_background_graph`]) the slash commands use — so each task's REAL
     /// persona (T0.1/C13) is resolved and dispatched through the faithful
     /// [`crate::spawn::parallel::run_bounded`] worker pool over real child processes.
     ///
@@ -1485,7 +1563,9 @@ impl SubagentTool {
                 // shares `ExecutionContextData.controlConfig` with every other mode
                 // (`subagent-executor.ts:3385` @v0.34.0 — one resolution at the shared `execute`
                 // entry, read by every path off `ExecutionContextData.controlConfig`).
-                p.control.as_ref().map(crate::exec::control::parse_control_overrides),
+                p.control
+                    .as_ref()
+                    .map(crate::exec::control::parse_control_overrides),
                 // SUBA-N06: `includeProgress` is likewise a top-level `SubagentParams` field, so it
                 // applies to PARALLEL/CHAIN exactly as it does to SINGLE — pi gates
                 // `details.progress` on it in `runParallelPath` (`subagent-executor.ts:3444`) and
@@ -1503,10 +1583,9 @@ impl SubagentTool {
             // length-1 chain of one parallel step, so `chainDesc` is just that group's own
             // `[a+b+c]` descriptor; the headline is `Async parallel: {chainDesc} [{id}]`.
             GraphRunOutcome::Background(run_id) => Ok(ToolResult {
-                content: vec![cyrup_core::Content::text(format_async_started_message(&format!(
-                    "Async parallel: [{}] [{run_id}]",
-                    agents.join("+")
-                )))],
+                content: vec![cyrup_core::Content::text(format_async_started_message(
+                    &format!("Async parallel: [{}] [{run_id}]", agents.join("+")),
+                ))],
                 // `asyncDir` per `async-execution.ts:1191` — see [`async_dir_for_run`].
                 details: Some(async_launch_details(
                     "parallel",
@@ -1535,7 +1614,10 @@ impl SubagentTool {
                         // in-addition-to). Uses the `NoTransportChannel` default (→ NotDelivered, full
                         // inline kept) until `with_channels` wires the real broker channel.
                         let success = ok == total && total > 0;
-                        let top_agent = agents.first().cloned().unwrap_or_else(|| "subagent".to_string());
+                        let top_agent = agents
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| "subagent".to_string());
                         // pi always cites the run's OWN real id in the payload/receipt
                         // (`result-intercom.ts:256,347` @v0.34.0) — never a fresh id minted only for this
                         // message, so a follow-up status/resume action can correlate on it.
@@ -1545,9 +1627,14 @@ impl SubagentTool {
                             success,
                             &group.children,
                         );
-                        match self.executor.deliver_group_out_of_band(payload.clone()).await {
+                        match self
+                            .executor
+                            .deliver_group_out_of_band(payload.clone())
+                            .await
+                        {
                             crate::tui::intercom::DeliveryOutcome::Delivered => {
-                                let reduced = crate::tui::intercom::ReducedInlinePayload::from(&payload);
+                                let reduced =
+                                    crate::tui::intercom::ReducedInlinePayload::from(&payload);
                                 // pi's `formatSubagentResultReceipt` (`result-intercom.ts:376-421`):
                                 // mode label + "Run: …" + "Children: {status counts}" + closing line.
                                 let receipt = crate::tui::intercom::format_subagent_result_receipt(
@@ -1590,7 +1677,7 @@ impl SubagentTool {
     /// Tier-1 dispatch arm (chain via tool): translate `chain[]` into a `Vec<RunnerStep>`
     /// (sequential steps + inline static parallel groups, each group's per-task `count` expanded via
     /// pi's `expandChainParallelCounts`) and route it through the SAME
-    /// [`SubagentExecutor::run_or_background_graph`] path the slash commands use. Dynamic fanout
+    /// [`crate::extension::SubagentExecutor::run_or_background_graph`] path the slash commands use. Dynamic fanout
     /// (`expand`/`collect`) is Tier-4 territory (C16) and is rejected with a clear message rather
     /// than silently mis-parsed.
     pub(crate) async fn route_chain_mode(
@@ -1647,7 +1734,9 @@ impl SubagentTool {
                 timeout_ms,
                 // SUBA-N05 (pi `runChainPath` -> `resolveControlConfig(deps.config.control,
                 // params.control)`, `subagent-executor.ts:1133` @v0.34.0).
-                p.control.as_ref().map(crate::exec::control::parse_control_overrides),
+                p.control
+                    .as_ref()
+                    .map(crate::exec::control::parse_control_overrides),
                 // SUBA-N06: `includeProgress` is likewise a top-level `SubagentParams` field, so it
                 // applies to PARALLEL/CHAIN exactly as it does to SINGLE — pi gates
                 // `details.progress` on it in `runParallelPath` (`subagent-executor.ts:3444`) and
@@ -1665,9 +1754,9 @@ impl SubagentTool {
             // [{id}]` followed by `formatAsyncStartedMessage`'s fixed guidance; `details` is
             // `{ mode: "chain", runId, results: [], asyncId }`.
             GraphRunOutcome::Background(run_id) => Ok(ToolResult {
-                content: vec![cyrup_core::Content::text(format_async_started_message(&format!(
-                    "Async chain: {chain_desc} [{run_id}]"
-                )))],
+                content: vec![cyrup_core::Content::text(format_async_started_message(
+                    &format!("Async chain: {chain_desc} [{run_id}]"),
+                ))],
                 // `asyncDir` per `async-execution.ts:1191` — see [`async_dir_for_run`].
                 details: Some(async_launch_details(
                     "chain",
@@ -1716,7 +1805,10 @@ impl SubagentTool {
                     success,
                     &children,
                 );
-                let (text, details) = match self.executor.deliver_group_out_of_band(payload.clone()).await
+                let (text, details) = match self
+                    .executor
+                    .deliver_group_out_of_band(payload.clone())
+                    .await
                 {
                     crate::tui::intercom::DeliveryOutcome::Delivered => {
                         let reduced = crate::tui::intercom::ReducedInlinePayload::from(&payload);

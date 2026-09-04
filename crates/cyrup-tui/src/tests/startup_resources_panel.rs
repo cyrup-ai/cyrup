@@ -17,16 +17,21 @@
 //! These tests push the panel through the real `App::push_loaded_resources` seam and read the
 //! committed scrollback — text AND the `warning`/`error` role colours — so they assert what the user
 //! actually sees.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::path::PathBuf;
 
+use crate::{
+    App, DiagnosticSeverity, StartupDiagnostic, StartupReport, UiTheme, extension_diagnostics,
+    resource_diagnostics,
+};
 use cyrup_resources::{ResourceDiagnostic, ResourceKind};
 use cyrup_session_svc::ExtensionLoadDiagnostic;
-use crate::{
-    extension_diagnostics, resource_diagnostics, App, DiagnosticSeverity, StartupDiagnostic,
-    StartupReport, UiTheme,
-};
 use ratatui::backend::TestBackend;
 use ratatui::style::Style;
 
@@ -71,10 +76,23 @@ fn loud_report() -> StartupReport {
 #[test]
 fn the_loaded_inventory_reaches_the_scrollback() {
     let (_app, out) = commit(&loud_report());
-    for needle in ["[Context]", "[Skills]", "[Prompts]", "[Extensions]", "[Themes]"] {
+    for needle in [
+        "[Context]",
+        "[Skills]",
+        "[Prompts]",
+        "[Extensions]",
+        "[Themes]",
+    ] {
         assert!(out.contains(needle), "`{needle}` section missing:\n{out}");
     }
-    for needle in ["review", "deploy", "/plan", "cyrup-subagents", "solarized", "AGENTS.md"] {
+    for needle in [
+        "review",
+        "deploy",
+        "/plan",
+        "cyrup-subagents",
+        "solarized",
+        "AGENTS.md",
+    ] {
         assert!(out.contains(needle), "`{needle}` not listed:\n{out}");
     }
 }
@@ -93,33 +111,66 @@ fn quiet_startup_hides_the_inventory_but_still_shows_load_failures() {
         ..loud_report()
     };
     let (app, out) = commit(&report);
-    assert!(!out.contains("[Skills]"), "quietStartup must hide the inventory:\n{out}");
-    assert!(out.contains("[Extension issues]"), "load failures survive quietStartup:\n{out}");
-    assert!(out.contains("~/.cyrup/extensions/todo"), "the failing path is named:\n{out}");
-    assert!(out.contains("world version mismatch"), "the reason is shown:\n{out}");
+    assert!(
+        !out.contains("[Skills]"),
+        "quietStartup must hide the inventory:\n{out}"
+    );
+    assert!(
+        out.contains("[Extension issues]"),
+        "load failures survive quietStartup:\n{out}"
+    );
+    assert!(
+        out.contains("~/.cyrup/extensions/todo"),
+        "the failing path is named:\n{out}"
+    );
+    assert!(
+        out.contains("world version mismatch"),
+        "the reason is shown:\n{out}"
+    );
     // Pi colours an `error`-type diagnostic with the `error` role (`:1470`).
-    assert!(styled(&app, "world version mismatch", UiTheme::dark().error_style()));
+    assert!(styled(
+        &app,
+        "world version mismatch",
+        UiTheme::dark().error_style()
+    ));
 }
 
 #[test]
 fn verbose_overrides_quiet_startup_exactly_as_the_help_text_claims() {
     // `cli.rs:818` — "Force verbose startup (overrides quietStartup setting)".
-    let report = StartupReport { quiet_startup: true, verbose: true, ..loud_report() };
+    let report = StartupReport {
+        quiet_startup: true,
+        verbose: true,
+        ..loud_report()
+    };
     let (_app, out) = commit(&report);
-    assert!(out.contains("[Skills]"), "--verbose must force the listing:\n{out}");
+    assert!(
+        out.contains("[Skills]"),
+        "--verbose must force the listing:\n{out}"
+    );
 }
 
 #[test]
 fn a_clean_quiet_startup_commits_nothing_at_all() {
-    let report = StartupReport { quiet_startup: true, ..Default::default() };
+    let report = StartupReport {
+        quiet_startup: true,
+        ..Default::default()
+    };
     let (_app, out) = commit(&report);
-    assert!(out.trim().is_empty(), "a silent boot must stay silent:\n{out:?}");
+    assert!(
+        out.trim().is_empty(),
+        "a silent boot must stay silent:\n{out:?}"
+    );
 }
 
 #[test]
 fn each_diagnostic_family_gets_pis_own_header() {
     let warn = |msg: &str| {
-        StartupDiagnostic::plain(DiagnosticSeverity::Warning, Some("/p".into()), msg.to_string())
+        StartupDiagnostic::plain(
+            DiagnosticSeverity::Warning,
+            Some("/p".into()),
+            msg.to_string(),
+        )
     };
     let report = StartupReport {
         quiet_startup: true,
@@ -131,11 +182,17 @@ fn each_diagnostic_family_gets_pis_own_header() {
     };
     let (app, out) = commit(&report);
     // All four, including `[Theme conflicts]` (`:1684-1690`).
-    for needle in
-        ["[Skill conflicts]", "[Prompt conflicts]", "[Extension issues]", "[Theme conflicts]"]
-    {
+    for needle in [
+        "[Skill conflicts]",
+        "[Prompt conflicts]",
+        "[Extension issues]",
+        "[Theme conflicts]",
+    ] {
         assert!(out.contains(needle), "`{needle}` block missing:\n{out}");
-        assert!(styled(&app, needle, UiTheme::dark().warning_style()), "`{needle}` warning-styled");
+        assert!(
+            styled(&app, needle, UiTheme::dark().warning_style()),
+            "`{needle}` warning-styled"
+        );
     }
 }
 
@@ -165,18 +222,35 @@ fn a_shadowed_skill_shows_the_winner_and_every_loser() {
         prompt_diagnostics: resource_diagnostics(&diagnostics, ResourceKind::Prompt, Some(&home)),
         ..Default::default()
     };
-    assert_eq!(report.skill_diagnostics.len(), 2, "diagnostics split by resource family");
+    assert_eq!(
+        report.skill_diagnostics.len(),
+        2,
+        "diagnostics split by resource family"
+    );
     assert_eq!(report.prompt_diagnostics.len(), 1);
 
     let (app, out) = commit(&report);
-    assert!(out.contains("\"review\" collision:"), "grouped by name:\n{out}");
+    assert!(
+        out.contains("\"review\" collision:"),
+        "grouped by name:\n{out}"
+    );
     assert!(
         out.contains("✓ ~/proj/.cyrup/skills/review/SKILL.md"),
         "the winner is marked, home-shortened:\n{out}"
     );
-    assert!(out.contains("✗ ~/.cyrup/skills/review/SKILL.md (skipped)"), "loser 1:\n{out}");
-    assert!(out.contains("✗ ~/pkg/skills/review/SKILL.md (skipped)"), "loser 2:\n{out}");
-    assert_eq!(out.matches("\"review\" collision:").count(), 1, "one group, not two:\n{out}");
+    assert!(
+        out.contains("✗ ~/.cyrup/skills/review/SKILL.md (skipped)"),
+        "loser 1:\n{out}"
+    );
+    assert!(
+        out.contains("✗ ~/pkg/skills/review/SKILL.md (skipped)"),
+        "loser 2:\n{out}"
+    );
+    assert_eq!(
+        out.matches("\"review\" collision:").count(),
+        1,
+        "one group, not two:\n{out}"
+    );
     // The prompt warning lands under its OWN header, not the skills one.
     assert!(out.contains("[Prompt conflicts]"), "{out}");
     assert!(out.contains("prompt path does not exist"), "{out}");
@@ -226,7 +300,10 @@ fn a_contained_native_init_failure_renders_under_extension_issues() {
     };
     let (_app, out) = commit(&report);
     assert!(out.contains("[Extension issues]"), "{out}");
-    assert!(out.contains("permission-system"), "the failing extension must be named:\n{out}");
+    assert!(
+        out.contains("permission-system"),
+        "the failing extension must be named:\n{out}"
+    );
     assert!(out.contains("policy file unreadable"), "{out}");
 }
 
@@ -275,9 +352,19 @@ fn startup_panel_rows_wrap_inside_the_frame() {
         );
     }
     // The wrap actually happened: the long path and the long message each occupy several rows.
-    assert!(lines.len() > 4, "nothing wrapped: {:?}", app.scrollback_text());
-    assert!(app.scrollback_text().contains("very-long-name.json"), "path lost in the wrap");
-    assert!(app.scrollback_text().contains("capability"), "message tail lost in the wrap");
+    assert!(
+        lines.len() > 4,
+        "nothing wrapped: {:?}",
+        app.scrollback_text()
+    );
+    assert!(
+        app.scrollback_text().contains("very-long-name.json"),
+        "path lost in the wrap"
+    );
+    assert!(
+        app.scrollback_text().contains("capability"),
+        "message tail lost in the wrap"
+    );
 
     // MIRROR — a short panel at a wide frame is untouched, margin and all: `[Skills]` still opens
     // at column `outputPad` and the indented list rows keep their own two-space inset.
@@ -285,10 +372,23 @@ fn startup_panel_rows_wrap_inside_the_frame() {
     wide.push_loaded_resources(&loud_report());
     wide.draw().unwrap();
     let text = wide.scrollback_text();
-    assert!(text.lines().any(|l| l.trim_start().starts_with("[Skills]")), "{text}");
-    assert!(text.lines().any(|l| l == "   deploy"), "list row lost its own inset:\n{text}");
-    assert!(text.lines().any(|l| l == "   review"), "list row lost its own inset:\n{text}");
+    assert!(
+        text.lines().any(|l| l.trim_start().starts_with("[Skills]")),
+        "{text}"
+    );
+    assert!(
+        text.lines().any(|l| l == "   deploy"),
+        "list row lost its own inset:\n{text}"
+    );
+    assert!(
+        text.lines().any(|l| l == "   review"),
+        "list row lost its own inset:\n{text}"
+    );
     for line in wide.scrollback_lines() {
-        assert!(line.width() <= 120, "wide frame overflow: {:?}", line.width());
+        assert!(
+            line.width() <= 120,
+            "wide frame overflow: {:?}",
+            line.width()
+        );
     }
 }

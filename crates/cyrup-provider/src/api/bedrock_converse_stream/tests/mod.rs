@@ -21,8 +21,8 @@ use super::config::*;
 use super::convert::*;
 use super::driver::*;
 use super::env::*;
-use super::events::*;
 use super::errors::*;
+use super::events::*;
 use super::failure::*;
 use super::framing::*;
 use super::headers::*;
@@ -76,7 +76,10 @@ fn sonnet_45() -> Model {
 }
 
 fn opus_48() -> Model {
-    model_with("global.anthropic.claude-opus-4-8-v1", "Claude Opus 4.8 (Global)")
+    model_with(
+        "global.anthropic.claude-opus-4-8-v1",
+        "Claude Opus 4.8 (Global)",
+    )
 }
 
 fn user_ctx(text: &str) -> Context {

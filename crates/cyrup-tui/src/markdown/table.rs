@@ -94,9 +94,7 @@ impl<'t> MdRenderer<'t> {
             // `zip` is the index-free spelling of upstream's `for (let i = 0; i < row.length; i++)`
             // (`:874`): a malformed row with more cells than the header has columns contributes
             // nothing past the last column, exactly as `naturalWidths[i]` would stay `undefined`.
-            for ((nat, minw), cell) in
-                natural.iter_mut().zip(min_word.iter_mut()).zip(row.iter())
-            {
+            for ((nat, minw), cell) in natural.iter_mut().zip(min_word.iter_mut()).zip(row.iter()) {
                 *nat = (*nat).max(spans_width(cell));
                 *minw = (*minw).max(longest_word_width(cell).min(MAX_UNBROKEN_WORD_WIDTH));
             }
@@ -121,7 +119,10 @@ impl<'t> MdRenderer<'t> {
                     .iter()
                     .map(|w| {
                         let weight = w.saturating_sub(1);
-                        weight.saturating_mul(remaining).checked_div(total_weight).unwrap_or(0)
+                        weight
+                            .saturating_mul(remaining)
+                            .checked_div(total_weight)
+                            .unwrap_or(0)
                     })
                     .collect();
                 for (m, g) in min_cols.iter_mut().zip(growth.iter()) {
@@ -147,19 +148,28 @@ impl<'t> MdRenderer<'t> {
         let total_natural: usize = natural.iter().sum();
         let widths: Vec<usize> = if total_natural <= avail_cells {
             // `columnWidths = naturalWidths.map((w, i) => Math.max(w, minColumnWidths[i]))` (`:919`).
-            natural.iter().zip(min_cols.iter()).map(|(n, m)| (*n).max(*m)).collect()
+            natural
+                .iter()
+                .zip(min_cols.iter())
+                .map(|(n, m)| (*n).max(*m))
+                .collect()
         } else {
             // Shrink toward `minColumnWidths`, NOT toward 1 (`:920-934`).
-            let grow_potential: usize =
-                natural.iter().zip(min_cols.iter()).map(|(n, m)| n.saturating_sub(*m)).sum();
+            let grow_potential: usize = natural
+                .iter()
+                .zip(min_cols.iter())
+                .map(|(n, m)| n.saturating_sub(*m))
+                .sum();
             let extra = avail_cells.saturating_sub(min_cells);
             let mut w: Vec<usize> = natural
                 .iter()
                 .zip(min_cols.iter())
                 .map(|(n, m)| {
                     let delta = n.saturating_sub(*m);
-                    let grow =
-                        delta.saturating_mul(extra).checked_div(grow_potential).unwrap_or(0);
+                    let grow = delta
+                        .saturating_mul(extra)
+                        .checked_div(grow_potential)
+                        .unwrap_or(0);
                     m.saturating_add(grow)
                 })
                 .collect();
@@ -241,8 +251,11 @@ impl<'t> MdRenderer<'t> {
     /// its escapes. A plain-`str` cell wrapper cannot preserve per-span styles at all.
     fn push_table_row(&mut self, cells: &[CellSpans], widths: &[usize], bold: bool, bar: char) {
         let bar_style = self.theme.assistant_style();
-        let pad_style =
-            if bold { bar_style.add_modifier(Modifier::BOLD) } else { bar_style };
+        let pad_style = if bold {
+            bar_style.add_modifier(Modifier::BOLD)
+        } else {
+            bar_style
+        };
         let empty: CellSpans = Vec::new();
         let wrapped: Vec<Vec<Line<'static>>> = widths
             .iter()
@@ -261,7 +274,11 @@ impl<'t> MdRenderer<'t> {
                 let text_w = row.map(Line::width).unwrap_or(0);
                 if let Some(row) = row {
                     spans.extend(row.spans.iter().map(|s| {
-                        let st = if bold { s.style.add_modifier(Modifier::BOLD) } else { s.style };
+                        let st = if bold {
+                            s.style.add_modifier(Modifier::BOLD)
+                        } else {
+                            s.style
+                        };
                         Span::styled(s.content.clone().into_owned(), st)
                     }));
                 }
@@ -295,7 +312,11 @@ fn cell_text(cell: &[Span<'static>]) -> String {
 /// `.min()` here so the `Math.max(1, …)` / `Math.max(prev, …)` asymmetry at `:871` vs `:877-880`
 /// stays visible at the call sites.
 fn longest_word_width(cell: &[Span<'static>]) -> usize {
-    cell_text(cell).split_whitespace().map(display_width).max().unwrap_or(0)
+    cell_text(cell)
+        .split_whitespace()
+        .map(display_width)
+        .max()
+        .unwrap_or(0)
 }
 
 /// `String::trim` lifted to a styled run: drop leading/trailing whitespace across span boundaries,

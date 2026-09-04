@@ -810,7 +810,10 @@ mod tests {
         let schema = json!({ "type": "boolean" });
         assert_eq!(validate_tool_call(&schema, json!(1)).unwrap(), json!(true));
         assert_eq!(validate_tool_call(&schema, json!(0)).unwrap(), json!(false));
-        assert_eq!(validate_tool_call(&schema, json!(1.0)).unwrap(), json!(true));
+        assert_eq!(
+            validate_tool_call(&schema, json!(1.0)).unwrap(),
+            json!(true)
+        );
         assert!(validate_tool_call(&schema, json!(2)).is_err());
     }
 
@@ -901,7 +904,10 @@ mod tests {
     #[test]
     fn boolean_string_coercion_is_exact() {
         let schema = json!({ "type": "boolean" });
-        assert_eq!(validate_tool_call(&schema, json!("true")).unwrap(), json!(true));
+        assert_eq!(
+            validate_tool_call(&schema, json!("true")).unwrap(),
+            json!(true)
+        );
         assert_eq!(
             validate_tool_call(&schema, json!("false")).unwrap(),
             json!(false)
@@ -915,7 +921,10 @@ mod tests {
         // The number/null arms are unchanged (`validation.ts:102-109`).
         assert_eq!(validate_tool_call(&schema, json!(1)).unwrap(), json!(true));
         assert_eq!(validate_tool_call(&schema, json!(0)).unwrap(), json!(false));
-        assert_eq!(validate_tool_call(&schema, json!(null)).unwrap(), json!(false));
+        assert_eq!(
+            validate_tool_call(&schema, json!(null)).unwrap(),
+            json!(false)
+        );
     }
 
     #[test]

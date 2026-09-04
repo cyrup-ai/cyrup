@@ -100,7 +100,12 @@ impl Capabilities {
     /// extension goes through [`crate::ExtensionHost::load_discovered`] and is capped by its own
     /// manifest instead.
     pub fn host_granted() -> Self {
-        Self { fs: Vec::new(), exec: true, net: true, ui: true }
+        Self {
+            fs: Vec::new(),
+            exec: true,
+            net: true,
+            ui: true,
+        }
     }
 
     /// Parse [`Self::fs`] into typed grants, refusing anything that would escape the project root.

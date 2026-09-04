@@ -9,7 +9,7 @@ use crate::manifest::Capabilities;
 use crate::native::{CtxTier, ExtMode};
 use crate::registry::ExtensionRegistry;
 use cyrup_core::{CancelToken, ExtensionId};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -100,10 +100,21 @@ impl DialogOptions {
 /// A command-tier session/runtime mutation requested via the `control` import (arch-08 §6.3).
 #[derive(Clone, Debug)]
 pub enum ControlOp {
-    NewSession { opts: Value },
-    Switch { session_id: String, opts: Value },
-    Fork { entry_id: String, opts: Value },
-    Navigate { entry_id: String, opts: Value },
+    NewSession {
+        opts: Value,
+    },
+    Switch {
+        session_id: String,
+        opts: Value,
+    },
+    Fork {
+        entry_id: String,
+        opts: Value,
+    },
+    Navigate {
+        entry_id: String,
+        opts: Value,
+    },
     Reload,
     /// Trigger a manual compaction (Pi `ctx.compact(options?)`, extensions/types.ts:344). Carries
     /// Pi's `CompactOptions.customInstructions` (types.ts:296-300) — the extra guidance handed to
@@ -114,8 +125,14 @@ pub enum ControlOp {
         custom_instructions: Option<String>,
     },
     WaitIdle,
-    SendMessage { message: Value, opts: Value },
-    SendUserMessage { content: String, opts: Value },
+    SendMessage {
+        message: Value,
+        opts: Value,
+    },
+    SendUserMessage {
+        content: String,
+        opts: Value,
+    },
     SetModel(Value),
     SetThinkingLevel(String),
     /// Abort the in-flight agent run (Pi `ctx.abort()`, extensions/types.ts:336 @v0.83.0, doc
@@ -164,7 +181,9 @@ impl HumanInteractionLock {
     /// A fresh, unheld lock (one permit).
     #[must_use]
     pub fn new() -> Self {
-        Self { slot: Arc::new(Semaphore::new(1)) }
+        Self {
+            slot: Arc::new(Semaphore::new(1)),
+        }
     }
 
     /// Acquire the single human-interaction slot, WAITING until any in-flight prompt finishes. Hold
@@ -172,7 +191,9 @@ impl HumanInteractionLock {
     /// never closed (nothing calls `Semaphore::close`), so acquisition cannot fail — the guard degrades
     /// to "unheld" in the impossible closed case rather than panicking (workspace no-panic policy).
     pub async fn acquire(&self) -> HumanInteractionGuard {
-        HumanInteractionGuard { _permit: Arc::clone(&self.slot).acquire_owned().await.ok() }
+        HumanInteractionGuard {
+            _permit: Arc::clone(&self.slot).acquire_owned().await.ok(),
+        }
     }
 }
 
@@ -197,7 +218,12 @@ pub trait HostServices: Send + Sync {
     }
     /// `placeholder` is Pi's `input(title, placeholder, opts)` optional field
     /// (`rpc-types.ts:241-248` @v0.83.0; EXT-036 corrected `:233-240`).
-    fn input(&self, _prompt: &str, _placeholder: Option<&str>, _opts: &DialogOptions) -> Option<String> {
+    fn input(
+        &self,
+        _prompt: &str,
+        _placeholder: Option<&str>,
+        _opts: &DialogOptions,
+    ) -> Option<String> {
         None
     }
     fn select(&self, _prompt: &str, _options: &Value, _opts: &DialogOptions) -> Option<String> {
@@ -795,7 +821,11 @@ impl Default for CannedResponses {
             editor: Some(String::new()),
             custom: None,
             exec: ExecOutput::default(),
-            http_response: HttpResponse { status: 200, headers: Vec::new(), body: Vec::new() },
+            http_response: HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
             http_stream_status: 200,
             http_stream_headers: Vec::new(),
             http_stream_chunks: Vec::new(),
@@ -875,81 +905,126 @@ struct RecordingState {
 
 impl RecordingServices {
     pub fn new(responses: CannedResponses) -> Self {
-        Self { responses, state: Mutex::new(RecordingState::default()) }
+        Self {
+            responses,
+            state: Mutex::new(RecordingState::default()),
+        }
     }
 
     /// The control ops requested via the `control` import (command tier).
     pub fn control_ops(&self) -> Vec<ControlOp> {
-        self.state.lock().map(|g| g.control_ops.clone()).unwrap_or_default()
+        self.state
+            .lock()
+            .map(|g| g.control_ops.clone())
+            .unwrap_or_default()
     }
 
     /// The `(cmd, args)` of each capability-scoped `exec.run`.
     pub fn exec_calls(&self) -> Vec<(String, Vec<String>)> {
-        self.state.lock().map(|g| g.exec_calls.clone()).unwrap_or_default()
+        self.state
+            .lock()
+            .map(|g| g.exec_calls.clone())
+            .unwrap_or_default()
     }
 
     /// Whether `cancel.is_cancelled()` was already true when each `exec` call arrived, in call order.
     pub fn exec_call_pre_cancelled(&self) -> Vec<bool> {
-        self.state.lock().map(|g| g.exec_call_pre_cancelled.clone()).unwrap_or_default()
+        self.state
+            .lock()
+            .map(|g| g.exec_call_pre_cancelled.clone())
+            .unwrap_or_default()
     }
 
     /// The requests recorded via `http_request`/`http_request_stream`.
     pub fn http_requests(&self) -> Vec<HttpRequest> {
-        self.state.lock().map(|g| g.http_requests.clone()).unwrap_or_default()
+        self.state
+            .lock()
+            .map(|g| g.http_requests.clone())
+            .unwrap_or_default()
     }
 
     /// The `(cmd, args)` of each `proc_spawn` grant.
     pub fn proc_spawns(&self) -> Vec<(String, Vec<String>)> {
-        self.state.lock().map(|g| g.proc_spawns.clone()).unwrap_or_default()
+        self.state
+            .lock()
+            .map(|g| g.proc_spawns.clone())
+            .unwrap_or_default()
     }
 
     /// The `cwd` each `proc_spawn` grant actually received, in call order.
     pub fn proc_spawn_cwds(&self) -> Vec<Option<PathBuf>> {
-        self.state.lock().map(|g| g.proc_spawn_cwds.clone()).unwrap_or_default()
+        self.state
+            .lock()
+            .map(|g| g.proc_spawn_cwds.clone())
+            .unwrap_or_default()
     }
 
     /// The `(handle, data)` of each `proc_write_stdin` call.
     pub fn proc_writes(&self) -> Vec<(u32, Vec<u8>)> {
-        self.state.lock().map(|g| g.proc_writes.clone()).unwrap_or_default()
+        self.state
+            .lock()
+            .map(|g| g.proc_writes.clone())
+            .unwrap_or_default()
     }
 
     /// The handles `proc_kill` was called on.
     pub fn proc_kills(&self) -> Vec<u32> {
-        self.state.lock().map(|g| g.proc_kills.clone()).unwrap_or_default()
+        self.state
+            .lock()
+            .map(|g| g.proc_kills.clone())
+            .unwrap_or_default()
     }
 
     /// The persisted custom entries (R-08-026).
     pub fn entries_persisted(&self) -> Vec<(String, Value)> {
-        self.state.lock().map(|g| g.entries.clone()).unwrap_or_default()
+        self.state
+            .lock()
+            .map(|g| g.entries.clone())
+            .unwrap_or_default()
     }
 
     /// The `(entry_id, label)` pairs set via `set_label` (Pi `setLabel`).
     pub fn labels_set(&self) -> Vec<(String, String)> {
-        self.state.lock().map(|g| g.labels.clone()).unwrap_or_default()
+        self.state
+            .lock()
+            .map(|g| g.labels.clone())
+            .unwrap_or_default()
     }
 
     /// The `(message, kind)` of each fire-and-forget `notify` call the `HostServices` boundary
     /// itself observed, in call order.
     pub fn notify_calls(&self) -> Vec<(String, NotifyKind)> {
-        self.state.lock().map(|g| g.notify_calls.clone()).unwrap_or_default()
+        self.state
+            .lock()
+            .map(|g| g.notify_calls.clone())
+            .unwrap_or_default()
     }
 
     /// The `(key, text)` of each fire-and-forget `set_status` call the `HostServices` boundary
     /// itself observed, in call order.
     pub fn set_status_calls(&self) -> Vec<(String, Option<String>)> {
-        self.state.lock().map(|g| g.set_status_calls.clone()).unwrap_or_default()
+        self.state
+            .lock()
+            .map(|g| g.set_status_calls.clone())
+            .unwrap_or_default()
     }
 
     /// The `message` body of each `confirm` call, in call order (L4 review §2.6 live proof: a guest
     /// `confirm_with(title, message, ..)` call's `message` reaches the host distinct from `title`).
     pub fn confirm_messages(&self) -> Vec<String> {
-        self.state.lock().map(|g| g.confirm_messages.clone()).unwrap_or_default()
+        self.state
+            .lock()
+            .map(|g| g.confirm_messages.clone())
+            .unwrap_or_default()
     }
 
     /// The `placeholder` of each `input` call, in call order (L4 review §2.7 live proof: a guest
     /// `input_with(title, placeholder, ..)` call's `placeholder` reaches the host).
     pub fn input_placeholders(&self) -> Vec<Option<String>> {
-        self.state.lock().map(|g| g.input_placeholders.clone()).unwrap_or_default()
+        self.state
+            .lock()
+            .map(|g| g.input_placeholders.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -961,7 +1036,8 @@ impl HostServices for RecordingServices {
     }
     fn set_status(&self, key: &str, text: Option<&str>) {
         if let Ok(mut g) = self.state.lock() {
-            g.set_status_calls.push((key.to_string(), text.map(str::to_string)));
+            g.set_status_calls
+                .push((key.to_string(), text.map(str::to_string)));
         }
     }
     fn confirm(&self, _prompt: &str, message: &str, _opts: &DialogOptions) -> bool {
@@ -970,7 +1046,12 @@ impl HostServices for RecordingServices {
         }
         self.responses.confirm
     }
-    fn input(&self, _prompt: &str, placeholder: Option<&str>, _opts: &DialogOptions) -> Option<String> {
+    fn input(
+        &self,
+        _prompt: &str,
+        placeholder: Option<&str>,
+        _opts: &DialogOptions,
+    ) -> Option<String> {
         if let Ok(mut g) = self.state.lock() {
             g.input_placeholders.push(placeholder.map(str::to_string));
         }
@@ -985,7 +1066,10 @@ impl HostServices for RecordingServices {
         _placeholder: Option<&str>,
         _allow_empty: bool,
     ) -> Result<String, String> {
-        self.responses.oauth_prompt.clone().ok_or_else(|| "oauth prompt cancelled".into())
+        self.responses
+            .oauth_prompt
+            .clone()
+            .ok_or_else(|| "oauth prompt cancelled".into())
     }
     fn oauth_select(&self, _message: &str, _options: &Value) -> Option<String> {
         self.responses.oauth_select.clone()
@@ -1034,7 +1118,10 @@ impl HostServices for RecordingServices {
         Ok(self.responses.http_response.clone())
     }
     fn http_request_stream(&self, req: &HttpRequest) -> Result<HttpStreamResponse, String> {
-        let mut g = self.state.lock().map_err(|_| "recording lock poisoned".to_string())?;
+        let mut g = self
+            .state
+            .lock()
+            .map_err(|_| "recording lock poisoned".to_string())?;
         g.http_requests.push(req.clone());
         let handle = g.next_http_stream_handle;
         g.next_http_stream_handle += 1;
@@ -1046,7 +1133,10 @@ impl HostServices for RecordingServices {
         })
     }
     fn http_poll_stream_chunk(&self, handle: u32) -> Result<Option<Vec<u8>>, String> {
-        let mut g = self.state.lock().map_err(|_| "recording lock poisoned".to_string())?;
+        let mut g = self
+            .state
+            .lock()
+            .map_err(|_| "recording lock poisoned".to_string())?;
         let cursor = g
             .http_streams
             .get_mut(&handle)
@@ -1066,7 +1156,10 @@ impl HostServices for RecordingServices {
         }
     }
     fn proc_spawn(&self, spec: &ProcSpawnSpec) -> Result<u32, String> {
-        let mut g = self.state.lock().map_err(|_| "recording lock poisoned".to_string())?;
+        let mut g = self
+            .state
+            .lock()
+            .map_err(|_| "recording lock poisoned".to_string())?;
         g.proc_spawns.push((spec.cmd.clone(), spec.args.clone()));
         g.proc_spawn_cwds.push(spec.cwd.clone());
         let handle = g.next_proc_handle;
@@ -1076,12 +1169,18 @@ impl HostServices for RecordingServices {
         Ok(handle)
     }
     fn proc_write_stdin(&self, handle: u32, data: &[u8]) -> Result<u32, String> {
-        let mut g = self.state.lock().map_err(|_| "recording lock poisoned".to_string())?;
+        let mut g = self
+            .state
+            .lock()
+            .map_err(|_| "recording lock poisoned".to_string())?;
         g.proc_writes.push((handle, data.to_vec()));
         Ok(u32::try_from(data.len()).unwrap_or(u32::MAX))
     }
     fn proc_read_stdout(&self, handle: u32, _max_bytes: u32) -> Result<Vec<u8>, String> {
-        let mut g = self.state.lock().map_err(|_| "recording lock poisoned".to_string())?;
+        let mut g = self
+            .state
+            .lock()
+            .map_err(|_| "recording lock poisoned".to_string())?;
         let cursor = g
             .proc_stdout_cursors
             .get_mut(&handle)
@@ -1096,7 +1195,10 @@ impl HostServices for RecordingServices {
         })
     }
     fn proc_read_stderr(&self, handle: u32, _max_bytes: u32) -> Result<Vec<u8>, String> {
-        let mut g = self.state.lock().map_err(|_| "recording lock poisoned".to_string())?;
+        let mut g = self
+            .state
+            .lock()
+            .map_err(|_| "recording lock poisoned".to_string())?;
         let cursor = g
             .proc_stderr_cursors
             .get_mut(&handle)
@@ -1141,7 +1243,10 @@ impl HostServices for RecordingServices {
         self.responses.system_prompt_options.clone()
     }
     fn append_entry(&self, custom_type: &str, data: &Value) -> Result<String, String> {
-        let mut g = self.state.lock().map_err(|_| "recording lock poisoned".to_string())?;
+        let mut g = self
+            .state
+            .lock()
+            .map_err(|_| "recording lock poisoned".to_string())?;
         g.next_entry += 1;
         let id = format!("entry-{}", g.next_entry);
         g.entries.push((custom_type.to_string(), data.clone()));
@@ -1161,7 +1266,8 @@ impl HostServices for RecordingServices {
             // EXT-046: a `None` clear is recorded as an EMPTY string so a test can tell "cleared"
             // from "never touched" (the pair is absent) — the RecordingServices analog of
             // `append_label(id, None)`.
-            g.labels.push((entry_id.to_string(), label.unwrap_or_default().to_string()));
+            g.labels
+                .push((entry_id.to_string(), label.unwrap_or_default().to_string()));
         }
     }
 }
@@ -1187,7 +1293,10 @@ impl FsCaps {
     /// One read+write root — the pre-EXT-055 shape, kept for host-internal loads with no manifest.
     /// Guest paths resolve directly under `root`, exactly as `FsCaps { root: Some(..) }` did.
     pub fn single(root: PathBuf) -> Self {
-        Self { base: Some(root.clone()), grants: vec![(root, true)] }
+        Self {
+            base: Some(root.clone()),
+            grants: vec![(root, true)],
+        }
     }
 
     /// Build from parsed manifest grants (EXT-054/EXT-055). Guest paths are addressed relative to
@@ -1203,7 +1312,10 @@ impl FsCaps {
         }
         Self {
             base: Some(base.to_path_buf()),
-            grants: grants.iter().map(|g| (base.join(&g.path), g.write)).collect(),
+            grants: grants
+                .iter()
+                .map(|g| (base.join(&g.path), g.write))
+                .collect(),
         }
     }
 
@@ -1235,7 +1347,11 @@ impl FsCaps {
         };
         let candidate = PathBuf::from(path);
         // Reject absolute paths and parent-dir escapes (capability scoping, R-ARCH-EXT-011).
-        if candidate.is_absolute() || candidate.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        if candidate.is_absolute()
+            || candidate
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
             return Err(format!("path `{path}` escapes the granted capability root"));
         }
         let resolved = base.join(&candidate);
@@ -1250,7 +1366,9 @@ impl FsCaps {
                 "path `{path}` is not inside a `write:` grant in `capabilities.fs`"
             ))
         } else {
-            Err(format!("path `{path}` is not inside any `capabilities.fs` grant"))
+            Err(format!(
+                "path `{path}` is not inside any `capabilities.fs` grant"
+            ))
         }
     }
 }
@@ -1260,7 +1378,6 @@ impl FsCaps {
 /// natives — had no `pi.events` at all. Re-exported from this module so existing `crate::host::`
 /// paths keep working.
 pub use crate::bus::SharedBus;
-
 
 /// The `before_provider_request` / `after_provider_response` reductions, reachable from inside a
 /// guest's `provider-stream` imports (EXT-052).
@@ -1474,11 +1591,23 @@ pub struct WidgetEffect {
 /// An OAuth login-flow callback the guest invoked during `provider-login` (Pi `OAuthLoginCallbacks`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OAuthEvent {
-    Auth { url: String, instructions: Option<String> },
-    DeviceCode { user_code: String, verification_uri: String },
-    Prompt { message: String },
-    Progress { message: String },
-    Select { message: String },
+    Auth {
+        url: String,
+        instructions: Option<String>,
+    },
+    DeviceCode {
+        user_code: String,
+        verification_uri: String,
+    },
+    Prompt {
+        message: String,
+    },
+    Progress {
+        message: String,
+    },
+    Select {
+        message: String,
+    },
 }
 
 impl GuestState {
@@ -1627,7 +1756,9 @@ impl GuestState {
     pub fn require_proc_handle(&self, handle: u32) -> Result<(), String> {
         match self.proc_handles.lock() {
             Ok(g) if g.contains(&handle) => Ok(()),
-            _ => Err(format!("proc handle {handle} is not open for this extension")),
+            _ => Err(format!(
+                "proc handle {handle} is not open for this extension"
+            )),
         }
     }
 
@@ -1642,7 +1773,9 @@ impl GuestState {
     pub fn require_stream_handle(&self, handle: u32) -> Result<(), String> {
         match self.stream_handles.lock() {
             Ok(g) if g.contains(&handle) => Ok(()),
-            _ => Err(format!("http stream handle {handle} is not open for this extension")),
+            _ => Err(format!(
+                "http stream handle {handle} is not open for this extension"
+            )),
         }
     }
 
@@ -1757,7 +1890,8 @@ impl GuestState {
             // ambient store state), so upstream's "do not use a captured pi or command ctx" advice is
             // about a JS closure hazard that does not exist here — what survives is the fact itself.
             *g = Some(message.unwrap_or_else(|| {
-                "This extension instance is stale after a session replacement or reload.".to_string()
+                "This extension instance is stale after a session replacement or reload."
+                    .to_string()
             }));
         }
         self.bus.unsubscribe_all(&self.owner);
@@ -1824,7 +1958,10 @@ impl GuestState {
     }
 
     pub fn subscriptions(&self) -> Subscriptions {
-        self.subs.lock().map(|g| *g).unwrap_or_else(|_| Subscriptions::empty())
+        self.subs
+            .lock()
+            .map(|g| *g)
+            .unwrap_or_else(|_| Subscriptions::empty())
     }
 
     pub fn set_flag(&self, name: String, spec: Value) {
@@ -1872,7 +2009,10 @@ impl GuestState {
     }
 
     pub fn autocomplete_commands(&self) -> Vec<String> {
-        self.autocomplete.lock().map(|g| g.clone()).unwrap_or_default()
+        self.autocomplete
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 
     pub fn add_renderer(&self, custom_type: String) {
@@ -1901,7 +2041,10 @@ impl GuestState {
 
     /// Recorded notifications with their Pi `type` severity (types.ts:142 @v0.83.0).
     pub fn notifications_with_kind(&self) -> Vec<(String, NotifyKind)> {
-        self.notifications.lock().map(|g| g.clone()).unwrap_or_default()
+        self.notifications
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 
     /// Record a keyed status update (Pi `setStatus(key, text?)`, types.ts:148 @v0.83.0). A `None` `text`
@@ -1921,10 +2064,11 @@ impl GuestState {
     /// `setStatus` calls (Pi keeps a per-key map; a `None` text clears the key). `None` means the
     /// key is unset/cleared.
     pub fn status_for(&self, key: &str) -> Option<String> {
-        self.statuses
-            .lock()
-            .ok()
-            .and_then(|g| g.iter().rfind(|(k, _)| k == key).and_then(|(_, t)| t.clone()))
+        self.statuses.lock().ok().and_then(|g| {
+            g.iter()
+                .rfind(|(k, _)| k == key)
+                .and_then(|(_, t)| t.clone())
+        })
     }
 
     pub fn set_widget(&self, effect: WidgetEffect) {
@@ -2043,7 +2187,10 @@ impl GuestState {
     /// a cancelled call and, the one a JS port cannot think of, the `execute_tool` future being
     /// DROPPED at its await point. Returns how many were discarded (diagnostics/tests).
     pub fn clear_tool_updates(&self) -> usize {
-        self.tool_updates.lock().map(|mut g| std::mem::take(&mut *g).len()).unwrap_or(0)
+        self.tool_updates
+            .lock()
+            .map(|mut g| std::mem::take(&mut *g).len())
+            .unwrap_or(0)
     }
 
     /// How many `emit-update` chunks are queued (tests/diagnostics; never consumed by the host).
@@ -2074,7 +2221,10 @@ impl GuestState {
 
     /// The OAuth login callbacks the guest invoked during `provider-login` (tests/diagnostics).
     pub fn oauth_events(&self) -> Vec<OAuthEvent> {
-        self.oauth_events.lock().map(|g| g.clone()).unwrap_or_default()
+        self.oauth_events
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 
     // --- provider streamSimple events (Pi createAssistantMessageEventStream, host gap #1) ---
@@ -2087,7 +2237,10 @@ impl GuestState {
 
     /// The assistant-message stream events a guest `streamSimple` pushed (stream_id, event).
     pub fn stream_events(&self) -> Vec<(String, Value)> {
-        self.stream_events.lock().map(|g| g.clone()).unwrap_or_default()
+        self.stream_events
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 
     // --- active-tool restriction (Pi setActiveTools, host gap-08-sdk #7) ---
@@ -2100,7 +2253,10 @@ impl GuestState {
 
     /// The active-tool restriction the guest set, if any (the merge is applied host-side).
     pub fn active_tools_restriction(&self) -> Option<Vec<String>> {
-        self.active_tools_restriction.lock().ok().and_then(|g| g.clone())
+        self.active_tools_restriction
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
     }
 
     // --- named abort signals (Pi ExtensionUIDialogOptions.signal / execute signal; sdk gap #1/#2) ---
@@ -2119,17 +2275,25 @@ impl GuestState {
 
     /// Whether a named signal id has been aborted (drives dialog dismissal + tool cancellation).
     pub fn is_signal_aborted(&self, id: &str) -> bool {
-        self.aborted_signals.lock().map(|g| g.contains(id)).unwrap_or(false)
+        self.aborted_signals
+            .lock()
+            .map(|g| g.contains(id))
+            .unwrap_or(false)
     }
 
     /// The set of aborted signal ids (tests/diagnostics).
     pub fn aborted_signals(&self) -> Vec<String> {
-        self.aborted_signals.lock().map(|g| g.iter().cloned().collect()).unwrap_or_default()
+        self.aborted_signals
+            .lock()
+            .map(|g| g.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Whether a dialog opened with `opts` is already dismissed by a programmatic signal (sdk gap #2).
     pub fn dialog_dismissed(&self, opts: &DialogOptions) -> bool {
-        opts.signal_id.as_deref().is_some_and(|id| self.is_signal_aborted(id))
+        opts.signal_id
+            .as_deref()
+            .is_some_and(|id| self.is_signal_aborted(id))
     }
 
     /// (Re)arm [`Self::deadline_estimate`] to `Instant::now() + ticks * epoch::DEFAULT_TICK` — call
@@ -2151,7 +2315,9 @@ impl GuestState {
     /// the field is already `None`).
     pub fn arm_epoch_deadline_estimate(&self, ticks: u64) {
         let ticks_u32 = u32::try_from(ticks).unwrap_or(u32::MAX);
-        let budget = crate::host::epoch::DEFAULT_TICK.checked_mul(ticks_u32).unwrap_or(std::time::Duration::MAX);
+        let budget = crate::host::epoch::DEFAULT_TICK
+            .checked_mul(ticks_u32)
+            .unwrap_or(std::time::Duration::MAX);
         let deadline = std::time::Instant::now().checked_add(budget);
         if let Ok(mut g) = self.deadline_estimate.lock() {
             *g = deadline;
@@ -2206,7 +2372,12 @@ impl GuestState {
     /// (already finished, with real untracked guest execution since) is treated as no wait at all —
     /// zero forgiveness, a real trap — which is exactly correct: nothing is actually being waited on.
     pub fn take_dialog_extra_ticks(&self) -> u64 {
-        let Some(first_started) = self.first_wait_started.lock().ok().and_then(|mut g| g.take()) else {
+        let Some(first_started) = self
+            .first_wait_started
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take())
+        else {
             return 0;
         };
         // Same-dispatch stale-anchor guard (see [`Self::last_wait_touch`]'s doc): `first_started` only
@@ -2224,7 +2395,9 @@ impl GuestState {
             .lock()
             .ok()
             .and_then(|mut g| g.take())
-            .is_some_and(|touched| std::time::Instant::now().saturating_duration_since(touched) <= STALE_WAIT_TOUCH_GAP);
+            .is_some_and(|touched| {
+                std::time::Instant::now().saturating_duration_since(touched) <= STALE_WAIT_TOUCH_GAP
+            });
         if !touch_is_fresh {
             return 0;
         }
@@ -2253,8 +2426,11 @@ impl GuestState {
     /// The tool `signal` poll (Pi `signal.aborted`): true if the active tool's `CancelToken` is
     /// cancelled OR a named signal matching this `call_id` was aborted (sdk gap #1).
     pub fn tool_is_cancelled(&self, call_id: &str) -> bool {
-        let token_cancelled =
-            self.tool_cancel.lock().map(|g| g.as_ref().is_some_and(|t| t.is_cancelled())).unwrap_or(false);
+        let token_cancelled = self
+            .tool_cancel
+            .lock()
+            .map(|g| g.as_ref().is_some_and(|t| t.is_cancelled()))
+            .unwrap_or(false);
         token_cancelled || self.is_signal_aborted(call_id)
     }
 
@@ -2269,7 +2445,10 @@ impl GuestState {
 
     /// Drain the scheduled `with-session` callback ids (the loader invokes the export for each).
     pub fn take_pending_with_session(&self) -> Vec<String> {
-        self.pending_with_session.lock().map(|mut g| std::mem::take(&mut *g)).unwrap_or_default()
+        self.pending_with_session
+            .lock()
+            .map(|mut g| std::mem::take(&mut *g))
+            .unwrap_or_default()
     }
 }
 
@@ -2279,7 +2458,10 @@ mod tests {
     use super::*;
 
     fn state() -> GuestState {
-        GuestState::new(ExtensionId::from("test"), Arc::new(ExtensionRegistry::new()))
+        GuestState::new(
+            ExtensionId::from("test"),
+            Arc::new(ExtensionRegistry::new()),
+        )
     }
 
     #[test]
@@ -2362,7 +2544,10 @@ mod tests {
              have granted ~100, the wait duration in ticks)"
         );
         // Never zero (a recorded wait must never trap — that permanently wedges the instance).
-        assert!(forgiven >= 1, "a recorded dialog wait must never produce zero forgiveness");
+        assert!(
+            forgiven >= 1,
+            "a recorded dialog wait must never produce zero forgiveness"
+        );
         // Roughly matches the ~12 remaining ticks (60ms / 5ms), not the ~100-tick wait duration —
         // generous bounds to absorb real scheduler jitter from the `thread::sleep` calls above.
         assert!(
@@ -2382,7 +2567,11 @@ mod tests {
         let wait_started = std::time::Instant::now();
         std::thread::sleep(std::time::Duration::from_millis(10));
         s.note_dialog_wait(wait_started); // called right after the (simulated) block, like live.rs
-        assert_eq!(s.take_dialog_extra_ticks(), 1, "a recorded wait floors at 1 tick, never 0");
+        assert_eq!(
+            s.take_dialog_extra_ticks(),
+            1,
+            "a recorded wait floors at 1 tick, never 0"
+        );
     }
 
     /// No recorded dialog wait ⇒ zero forgiveness (a genuine runaway/looping guest, which never
@@ -2418,7 +2607,10 @@ mod tests {
         // Remaining budget computed from `first` (~90ms / 18 ticks) must be used, not from the
         // second call's later start (~70ms / 14 ticks) — i.e. `forgiven` skews toward the larger,
         // first-anchored value.
-        assert!(forgiven >= 15, "must anchor to the FIRST wait in the batch, got {forgiven} ticks");
+        assert!(
+            forgiven >= 15,
+            "must anchor to the FIRST wait in the batch, got {forgiven} ticks"
+        );
     }
 
     /// THE same-dispatch stale-anchor fix this closes (the sibling of the CROSS-dispatch case below):
@@ -2429,7 +2621,8 @@ mod tests {
     /// the fast call's ancient `first_wait_started` regardless of what happened since, handing the
     /// guest close to a full fresh budget for a wait that had already finished.
     #[test]
-    fn take_dialog_extra_ticks_does_not_reward_a_fast_dialog_followed_by_an_unrelated_cpu_runaway() {
+    fn take_dialog_extra_ticks_does_not_reward_a_fast_dialog_followed_by_an_unrelated_cpu_runaway()
+    {
         let s = state();
         // A 20-tick (100ms) per-dispatch budget.
         s.arm_epoch_deadline_estimate(20);
@@ -2459,7 +2652,8 @@ mod tests {
     /// genuinely runs long past ITS OWN budget must trap normally — it must NOT be handed forgiveness
     /// computed from the ancient, unrelated anchor.
     #[test]
-    fn arm_epoch_deadline_estimate_clears_a_stale_anchor_left_by_a_fast_dialog_in_an_earlier_dispatch() {
+    fn arm_epoch_deadline_estimate_clears_a_stale_anchor_left_by_a_fast_dialog_in_an_earlier_dispatch()
+     {
         let s = state();
 
         // Dispatch A: a small budget, and a dialog that resolves FAST (well inside budget) — the
@@ -2499,9 +2693,16 @@ mod tests {
         for i in 0..MAX_ABORTED_SIGNALS {
             s.abort_signal(format!("sig-{i}"));
         }
-        assert_eq!(s.aborted_signals().len(), MAX_ABORTED_SIGNALS, "primed exactly at the cap");
+        assert_eq!(
+            s.aborted_signals().len(),
+            MAX_ABORTED_SIGNALS,
+            "primed exactly at the cap"
+        );
         for id in 0..MAX_ABORTED_SIGNALS {
-            assert!(s.is_signal_aborted(&format!("sig-{id}")), "every id under the cap stays tracked");
+            assert!(
+                s.is_signal_aborted(&format!("sig-{id}")),
+                "every id under the cap stays tracked"
+            );
         }
 
         // One more DISTINCT id beyond the cap must be silently dropped, not tracked.
@@ -2548,14 +2749,32 @@ mod tests {
             placement: WidgetPlacement::BelowEditor,
         });
         // Upstream's removal: `setWidget(key, undefined)`.
-        s.set_widget(WidgetEffect { key: "fleet".into(), lines: None, placement: WidgetPlacement::default() });
+        s.set_widget(WidgetEffect {
+            key: "fleet".into(),
+            lines: None,
+            placement: WidgetPlacement::default(),
+        });
 
         let got = s.widgets();
-        assert_eq!(got.len(), 3, "each call is recorded — two keys never collapse into one slot");
+        assert_eq!(
+            got.len(),
+            3,
+            "each call is recorded — two keys never collapse into one slot"
+        );
         assert_eq!(got[0].key, "fleet");
-        assert_eq!(got[0].lines.as_deref(), Some(["a".to_string(), "b".to_string()].as_slice()));
-        assert_eq!(got[1].placement, WidgetPlacement::BelowEditor, "belowEditor is expressible");
-        assert!(got[2].lines.is_none(), "a clear is a real removal, not a null-content payload");
+        assert_eq!(
+            got[0].lines.as_deref(),
+            Some(["a".to_string(), "b".to_string()].as_slice())
+        );
+        assert_eq!(
+            got[1].placement,
+            WidgetPlacement::BelowEditor,
+            "belowEditor is expressible"
+        );
+        assert!(
+            got[2].lines.is_none(),
+            "a clear is a real removal, not a null-content payload"
+        );
     }
 
     /// The placement bag is pi's `ExtensionWidgetOptions` (`extensions/types.ts:107-110`), whose
@@ -2575,7 +2794,10 @@ mod tests {
             WidgetPlacement::AboveEditor,
             "an omitted placement is upstream's documented default, not an error"
         );
-        assert_eq!(WidgetPlacement::from_opts(&Value::Null), WidgetPlacement::AboveEditor);
+        assert_eq!(
+            WidgetPlacement::from_opts(&Value::Null),
+            WidgetPlacement::AboveEditor
+        );
         assert_eq!(WidgetPlacement::AboveEditor.as_str(), "aboveEditor");
         assert_eq!(WidgetPlacement::BelowEditor.as_str(), "belowEditor");
     }
@@ -2599,7 +2821,10 @@ mod tests {
         // pi `setHiddenThinkingLabel(label?)` types.ts:167.
         deny.set_hidden_thinking_label(Some("thought"));
         // pi `getTheme(name)` types.ts:272 — inspect WITHOUT switching.
-        assert!(deny.theme_by_name("dracula").is_none(), "the default backend grants no theme read");
+        assert!(
+            deny.theme_by_name("dracula").is_none(),
+            "the default backend grants no theme read"
+        );
         // pi `getAllThemes()` types.ts:269 — `{name, path}` rows, empty by default.
         assert_eq!(deny.theme_list(), json!([]));
     }
@@ -2610,7 +2835,10 @@ mod tests {
     #[test]
     fn ext037_038_all_tools_and_commands_default_to_no_live_session() {
         let deny = DenyServices;
-        assert!(deny.all_tools().is_none(), "no live session ⇒ fall back to the registry view");
+        assert!(
+            deny.all_tools().is_none(),
+            "no live session ⇒ fall back to the registry view"
+        );
         assert!(deny.commands().is_none());
     }
 }

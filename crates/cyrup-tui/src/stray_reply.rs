@@ -109,7 +109,10 @@ impl StrayReplyFilter {
     /// A filter holding nothing.
     #[must_use]
     pub fn new() -> Self {
-        Self { state: State::Idle, held: Vec::new() }
+        Self {
+            state: State::Idle,
+            held: Vec::new(),
+        }
     }
 
     /// Whether events are currently being held. The reader thread uses this to shorten its poll
@@ -224,8 +227,11 @@ impl StrayReplyFilter {
         }
         self.held.push(Event::Key(key));
         let next = matched.saturating_add(1);
-        self.state =
-            if usize::from(next) == TAIL.len() { State::Payload } else { State::Tail(next) };
+        self.state = if usize::from(next) == TAIL.len() {
+            State::Payload
+        } else {
+            State::Tail(next)
+        };
         Step::Hold
     }
 
@@ -291,7 +297,12 @@ enum Step {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
     use super::*;
 
     /// Exactly what crossterm 0.29 produces for one raw byte stream, so the tests below are written
@@ -328,7 +339,10 @@ mod tests {
     fn typed(out: &[Event]) -> String {
         out.iter()
             .filter_map(|e| match e {
-                Event::Key(KeyEvent { code: KeyCode::Char(c), .. }) => Some(*c),
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char(c),
+                    ..
+                }) => Some(*c),
                 _ => None,
             })
             .collect()
@@ -375,7 +389,10 @@ mod tests {
         let mut v = vec![esc(), ch(']'), ch('1'), ch('1'), ch(';')];
         v.extend("rgb:ffff/ffff/ffff".chars().map(ch));
         v.push(ctrl('g'));
-        assert!(run(v).is_empty(), "the split-opener form must be recognised");
+        assert!(
+            run(v).is_empty(),
+            "the split-opener form must be recognised"
+        );
     }
 
     #[test]
@@ -383,10 +400,17 @@ mod tests {
         let mut v = vec![alt(']'), ch('1'), ch('1'), ch(';')];
         v.extend("rgb:".chars().map(ch));
         // `parse.rs:127-133` sets SHIFT on uppercase characters.
-        v.extend("FFFF".chars().map(|c| key(KeyCode::Char(c), KeyModifiers::SHIFT)));
+        v.extend(
+            "FFFF"
+                .chars()
+                .map(|c| key(KeyCode::Char(c), KeyModifiers::SHIFT)),
+        );
         v.extend("/0000/0000".chars().map(ch));
         v.push(ctrl('g'));
-        assert!(run(v).is_empty(), "uppercase hex channels must not break the match");
+        assert!(
+            run(v).is_empty(),
+            "uppercase hex channels must not break the match"
+        );
     }
 
     // ---------------------------------------------------------------- keystroke safety ----
@@ -403,7 +427,10 @@ mod tests {
         // survive, because the tail `1`,`1`,`;` does not follow.
         assert_eq!(run(vec![esc(), ch('[')]), vec![esc(), ch('[')]);
         assert_eq!(run(vec![esc(), ch(']')]), vec![esc(), ch(']')]);
-        assert_eq!(run(vec![esc(), ch(']'), ch('x')]), vec![esc(), ch(']'), ch('x')]);
+        assert_eq!(
+            run(vec![esc(), ch(']'), ch('x')]),
+            vec![esc(), ch(']'), ch('x')]
+        );
     }
 
     #[test]
@@ -416,7 +443,11 @@ mod tests {
 
     #[test]
     fn a_double_escape_releases_the_first_and_holds_the_second() {
-        assert_eq!(run(vec![esc(), esc()]), vec![esc(), esc()], "both Escapes must arrive, in order");
+        assert_eq!(
+            run(vec![esc(), esc()]),
+            vec![esc(), esc()],
+            "both Escapes must arrive, in order"
+        );
         assert_eq!(run(vec![esc(), esc(), esc()]), vec![esc(), esc(), esc()]);
     }
 
@@ -426,7 +457,11 @@ mod tests {
         // state, then `a`… wait — `a` and `b` ARE hex digits, so the frame is still held. The
         // proof that nothing is lost is the flush.
         let burst = vec![alt(']'), ch('1'), ch('1'), ch(';'), ch('a'), ch('b')];
-        assert_eq!(run(burst.clone()), burst, "an unterminated frame must be replayed whole");
+        assert_eq!(
+            run(burst.clone()),
+            burst,
+            "an unterminated frame must be replayed whole"
+        );
 
         // And a payload character outside the OSC alphabet aborts immediately.
         let burst = vec![alt(']'), ch('1'), ch('1'), ch(';'), ch('z')];
@@ -435,9 +470,15 @@ mod tests {
 
     #[test]
     fn a_fast_paste_like_burst_of_ordinary_typing_is_untouched() {
-        let burst: Vec<Event> =
-            "the quick brown fox; jumps over 11 lazy dogs -- 1;2;3 [x] {y} ]z]".chars().map(ch).collect();
-        assert_eq!(run(burst.clone()), burst, "ordinary typing must pass through byte-for-byte");
+        let burst: Vec<Event> = "the quick brown fox; jumps over 11 lazy dogs -- 1;2;3 [x] {y} ]z]"
+            .chars()
+            .map(ch)
+            .collect();
+        assert_eq!(
+            run(burst.clone()),
+            burst,
+            "ordinary typing must pass through byte-for-byte"
+        );
     }
 
     #[test]
@@ -448,7 +489,13 @@ mod tests {
         // So must Enter, arrows and every other non-Char key.
         let burst = vec![esc(), key(KeyCode::Enter, KeyModifiers::NONE)];
         assert_eq!(run(burst.clone()), burst);
-        let burst = vec![alt(']'), ch('1'), ch('1'), ch(';'), key(KeyCode::Up, KeyModifiers::NONE)];
+        let burst = vec![
+            alt(']'),
+            ch('1'),
+            ch('1'),
+            ch(';'),
+            key(KeyCode::Up, KeyModifiers::NONE),
+        ];
         assert_eq!(run(burst.clone()), burst);
     }
 
@@ -518,10 +565,10 @@ mod tests {
     #[test]
     fn a_replay_leaves_the_machine_idle_not_armed_and_empty() {
         for prefix in [
-            vec![esc()],                                     // State::Esc
-            vec![alt(']')],                                  // State::Tail(0)
-            vec![esc(), ch(']'), ch('1')],                   // State::Tail(1)
-            vec![alt(']'), ch('1'), ch('1'), ch(';')],       // State::Payload
+            vec![esc()],                                      // State::Esc
+            vec![alt(']')],                                   // State::Tail(0)
+            vec![esc(), ch(']'), ch('1')],                    // State::Tail(1)
+            vec![alt(']'), ch('1'), ch('1'), ch(';')],        // State::Payload
             vec![alt(']'), ch('1'), ch('1'), ch(';'), esc()], // State::PayloadEsc
         ] {
             let mut f = StrayReplyFilter::new();
@@ -540,7 +587,11 @@ mod tests {
             out.clear();
             f.push(alt('\\'), &mut out);
             f.flush(&mut out);
-            assert_eq!(out, vec![alt('\\')], "a bare ST after a replay is real typing");
+            assert_eq!(
+                out,
+                vec![alt('\\')],
+                "a bare ST after a replay is real typing"
+            );
         }
     }
 
@@ -551,7 +602,10 @@ mod tests {
         let mut burst = vec![alt(']'), ch('1'), ch('1'), ch(';')];
         burst.extend(std::iter::repeat_n(ch('a'), MAX_HELD * 3));
         let out = run(burst.clone());
-        assert_eq!(out, burst, "every held event must be replayed when the cap is hit");
+        assert_eq!(
+            out, burst,
+            "every held event must be replayed when the cap is hit"
+        );
 
         // And the machine is idle afterwards, so a REAL reply right after still gets swallowed.
         let mut f = StrayReplyFilter::new();
@@ -563,7 +617,10 @@ mod tests {
         for ev in shredded_bel_reply() {
             f.push(ev, &mut out);
         }
-        assert!(out.is_empty(), "the machine must recover after giving up, got {out:?}");
+        assert!(
+            out.is_empty(),
+            "the machine must recover after giving up, got {out:?}"
+        );
     }
 
     #[test]
@@ -576,7 +633,11 @@ mod tests {
         f.push(ch(';'), &mut out);
         for _ in 0..1000 {
             f.push(ch('a'), &mut out);
-            assert!(f.held.len() <= MAX_HELD, "hold must stay bounded: {}", f.held.len());
+            assert!(
+                f.held.len() <= MAX_HELD,
+                "hold must stay bounded: {}",
+                f.held.len()
+            );
         }
     }
 
@@ -588,20 +649,39 @@ mod tests {
         let mut out = Vec::new();
         f.push(alt(']'), &mut out);
         f.flush(&mut out);
-        assert_eq!(out, vec![alt(']')], "an idle opener is released, never dropped");
+        assert_eq!(
+            out,
+            vec![alt(']')],
+            "an idle opener is released, never dropped"
+        );
     }
 
     #[test]
     fn every_event_of_a_non_matching_burst_is_accounted_for() {
         // Property-ish sweep: for a set of bursts that contain NO complete frame, output == input.
-        let alphabet = [alt(']'), esc(), ch(']'), ch('1'), ch(';'), ch('a'), ch('z'), ctrl('c')];
+        let alphabet = [
+            alt(']'),
+            esc(),
+            ch(']'),
+            ch('1'),
+            ch(';'),
+            ch('a'),
+            ch('z'),
+            ctrl('c'),
+        ];
         for i in 0..alphabet.len() {
             for j in 0..alphabet.len() {
                 for k in 0..alphabet.len() {
-                    let burst =
-                        vec![alphabet[i].clone(), alphabet[j].clone(), alphabet[k].clone()];
+                    let burst = vec![
+                        alphabet[i].clone(),
+                        alphabet[j].clone(),
+                        alphabet[k].clone(),
+                    ];
                     let out = run(burst.clone());
-                    assert_eq!(out, burst, "no 3-event burst without a terminator may be altered");
+                    assert_eq!(
+                        out, burst,
+                        "no 3-event burst without a terminator may be altered"
+                    );
                 }
             }
         }

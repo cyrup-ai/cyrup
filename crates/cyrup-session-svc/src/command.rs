@@ -28,36 +28,71 @@ pub enum SessionCommand {
     FollowUp(UserInput),
     Abort,
     ClearQueue,
-    Compact { instructions: Option<String> },
+    Compact {
+        instructions: Option<String>,
+    },
     AbortCompaction,
     AbortBranchSummary,
-    SetModel { pattern: String },
-    CycleModel { forward: bool },
-    SetAutoRetry { enabled: bool },
+    SetModel {
+        pattern: String,
+    },
+    CycleModel {
+        forward: bool,
+    },
+    SetAutoRetry {
+        enabled: bool,
+    },
     AbortRetry,
-    SetAutoCompaction { enabled: bool },
-    Bash { command: String, exclude_from_context: bool },
+    SetAutoCompaction {
+        enabled: bool,
+    },
+    Bash {
+        command: String,
+        exclude_from_context: bool,
+    },
     AbortBash,
     GetActiveTools,
     GetAllTools,
-    SetActiveTools { names: Vec<String> },
-    SetThinkingLevel { level: cyrup_core::ModelThinkingLevel },
+    SetActiveTools {
+        names: Vec<String>,
+    },
+    SetThinkingLevel {
+        level: cyrup_core::ModelThinkingLevel,
+    },
     CycleThinkingLevel,
-    SetSteeringMode { mode: cyrup_agent::QueueMode },
-    SetFollowUpMode { mode: cyrup_agent::QueueMode },
-    Branch { entry: EntryId },
+    SetSteeringMode {
+        mode: cyrup_agent::QueueMode,
+    },
+    SetFollowUpMode {
+        mode: cyrup_agent::QueueMode,
+    },
+    Branch {
+        entry: EntryId,
+    },
     /// Unified `/tree` navigation (`navigateTree`): navigate to `target`, optionally summarizing the
     /// abandoned branch, returning the re-editable text + appended summary entry.
-    NavigateTree { target: EntryId, options: NavigateTreeOptions },
-    Fork { entry: EntryId, position: ForkPosition },
+    NavigateTree {
+        target: EntryId,
+        options: NavigateTreeOptions,
+    },
+    Fork {
+        entry: EntryId,
+        position: ForkPosition,
+    },
     /// Clone the session at an entry (or current leaf) into a new file without switching (`clone_at`).
-    CloneAt { entry: Option<EntryId> },
-    SetSessionName { name: String },
+    CloneAt {
+        entry: Option<EntryId>,
+    },
+    SetSessionName {
+        name: String,
+    },
     GetState,
     GetSessionStats,
     GetContextUsage,
     GetForkMessages,
-    ExportJsonl { path: Option<PathBuf> },
+    ExportJsonl {
+        path: Option<PathBuf>,
+    },
     GetLastAssistantText,
 }
 
@@ -125,9 +160,11 @@ impl AgentSession {
                 self.set_model(&pattern).await?;
                 O::Unit
             }
-            C::CycleModel { forward } => {
-                O::Model(self.cycle_model(forward).await?.map(|r| r.model.id.to_string()))
-            }
+            C::CycleModel { forward } => O::Model(
+                self.cycle_model(forward)
+                    .await?
+                    .map(|r| r.model.id.to_string()),
+            ),
             C::SetAutoRetry { enabled } => {
                 self.set_auto_retry_enabled(enabled);
                 O::Unit
@@ -140,12 +177,19 @@ impl AgentSession {
                 self.set_auto_compaction_enabled(enabled);
                 O::Unit
             }
-            C::Bash { command, exclude_from_context } => O::Bash(
+            C::Bash {
+                command,
+                exclude_from_context,
+            } => O::Bash(
                 self.execute_bash(
                     &command,
                     // No request id on the in-process command seam (Pi's `options.id` is the
                     // JSON-RPC request id, supplied only by `rpc-mode.ts:574`).
-                    crate::BashOptions { exclude_from_context, id: None, operations: None },
+                    crate::BashOptions {
+                        exclude_from_context,
+                        id: None,
+                        operations: None,
+                    },
                     None,
                 )
                 .await?,

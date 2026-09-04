@@ -10,8 +10,8 @@
     clippy::indexing_slicing
 )]
 
-use base64::Engine;
 use crate::{Cli, build_inputs};
+use base64::Engine;
 use cyrup_sdk::core::Content;
 use image::{ImageBuffer, Rgb};
 

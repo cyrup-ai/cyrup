@@ -122,7 +122,8 @@ const CACHE_MAX_AGE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
 /// Builtin tool names a resolved/prefixed MCP name may never shadow (pi `BUILTIN_TOOL_NAMES`): a
 /// formatted MCP name colliding with one of these is dropped rather than emitted.
-const BUILTIN_TOOL_NAMES: [&str; 8] = ["read", "bash", "edit", "write", "grep", "find", "ls", "mcp"];
+const BUILTIN_TOOL_NAMES: [&str; 8] =
+    ["read", "bash", "edit", "write", "grep", "find", "ls", "mcp"];
 
 /// The server-name → tool-name prefixing mode — upstream `types.ts:460`
 /// `ToolPrefix = "server" | "none" | "short" | "mcp"`, and the twin of
@@ -180,11 +181,12 @@ impl ImportKind {
                 home.join(".claude.json"),
                 home.join(".claude").join("claude_desktop_config.json"),
             ],
-            ImportKind::ClaudeDesktop => vec![home
-                .join("Library")
-                .join("Application Support")
-                .join("Claude")
-                .join("claude_desktop_config.json")],
+            ImportKind::ClaudeDesktop => vec![
+                home.join("Library")
+                    .join("Application Support")
+                    .join("Claude")
+                    .join("claude_desktop_config.json"),
+            ],
             ImportKind::Codex => vec![home.join(".codex").join("config.json")],
             ImportKind::Windsurf => vec![home.join(".windsurf").join("mcp.json")],
             ImportKind::Vscode => vec![cwd.join(".vscode").join("mcp.json")],
@@ -194,7 +196,10 @@ impl ImportKind {
     /// Whether this family's native config nests its servers under `mcpServers`/`mcp-servers`
     /// (pi: cursor/windsurf/vscode) or only `mcpServers` (the others).
     fn allows_hyphen_key(self) -> bool {
-        matches!(self, ImportKind::Cursor | ImportKind::Windsurf | ImportKind::Vscode)
+        matches!(
+            self,
+            ImportKind::Cursor | ImportKind::Windsurf | ImportKind::Vscode
+        )
     }
 }
 
@@ -260,7 +265,11 @@ pub struct ServerEntry {
     /// `"legacy" | "auto" | "2026-07-28"` in pi — held raw and folded verbatim into the identity
     /// hash, exactly as [`Self::auth`] is. Part of the config identity (MCP-141) because pinning a
     /// protocol revision changes what the server advertises; not otherwise used by this resolver.
-    #[serde(default, rename = "protocolVersion", deserialize_with = "present_or_absent")]
+    #[serde(
+        default,
+        rename = "protocolVersion",
+        deserialize_with = "present_or_absent"
+    )]
     pub protocol_version: Option<Value>,
     #[serde(default, rename = "bearerToken")]
     pub bearer_token: Option<String>,
@@ -280,11 +289,19 @@ pub struct ServerEntry {
     /// The glob-or-exact allowlist upstream applies **before** [`Self::exclude_tools`], through
     /// [`is_tool_allowed`]. Part of the config identity (MCP-141): editing it changes which tools
     /// the adapter registers, so it must evict the cache.
-    #[serde(default, rename = "includeTools", deserialize_with = "lenient_string_list")]
+    #[serde(
+        default,
+        rename = "includeTools",
+        deserialize_with = "lenient_string_list"
+    )]
     pub include_tools: Option<Vec<String>>,
     /// The glob-or-exact denylist [`is_tool_allowed`] applies **after** [`Self::include_tools`] —
     /// the same selector rule, negated. Also one of the fifteen identity keys.
-    #[serde(default, rename = "excludeTools", deserialize_with = "lenient_string_list")]
+    #[serde(
+        default,
+        rename = "excludeTools",
+        deserialize_with = "lenient_string_list"
+    )]
     pub exclude_tools: Option<Vec<String>>,
 }
 
@@ -475,7 +492,12 @@ pub fn resolve_mcp_direct_tool_names_in(
     let Some(cache) = load_metadata_cache(dirs) else {
         return Vec::new();
     };
-    let prefix = get_tool_prefix(config.settings.as_ref().and_then(|s| s.tool_prefix.as_deref()));
+    let prefix = get_tool_prefix(
+        config
+            .settings
+            .as_ref()
+            .and_then(|s| s.tool_prefix.as_deref()),
+    );
     resolve_direct_tool_names(&config, &cache, prefix, mcp_direct_tools)
 }
 
@@ -862,7 +884,11 @@ fn is_server_cache_valid_with_age(
 /// mismatch tells you nothing about *which* field disagreed, and the conformance tests below assert
 /// the bytes.
 pub fn server_identity_pre_image(definition: &ServerEntry) -> Result<String, IdentityError> {
-    server_identity_pre_image_with(definition, &|name| std::env::var(name).ok(), &crate::paths::home_dir())
+    server_identity_pre_image_with(
+        definition,
+        &|name| std::env::var(name).ok(),
+        &crate::paths::home_dir(),
+    )
 }
 
 /// [`server_identity_pre_image`] against an injected environment and home directory.
@@ -877,9 +903,18 @@ pub fn server_identity_pre_image_with(
     home: &Path,
 ) -> Result<String, IdentityError> {
     let identity = HashValue::Object(vec![
-        ("command".to_string(), opt_string(definition.command.as_deref())),
-        ("args".to_string(), opt_string_list(definition.args.as_ref())),
-        ("env".to_string(), interpolate_env_record(definition.env.as_ref(), env)?),
+        (
+            "command".to_string(),
+            opt_string(definition.command.as_deref()),
+        ),
+        (
+            "args".to_string(),
+            opt_string_list(definition.args.as_ref()),
+        ),
+        (
+            "env".to_string(),
+            interpolate_env_record(definition.env.as_ref(), env)?,
+        ),
         (
             "cwd".to_string(),
             opt_string(resolve_config_path(definition.cwd.as_deref(), home, env).as_deref()),
@@ -892,12 +927,18 @@ pub fn server_identity_pre_image_with(
             "url".to_string(),
             opt_string(resolve_server_url(definition.url.as_deref(), env)?.as_deref()),
         ),
-        ("headers".to_string(), interpolate_env_record(definition.headers.as_ref(), env)?),
+        (
+            "headers".to_string(),
+            interpolate_env_record(definition.headers.as_ref(), env)?,
+        ),
         (
             "requestHeadersCommand".to_string(),
             request_headers_command_value(definition.request_headers_command.as_ref(), env)?,
         ),
-        ("auth".to_string(), HashValue::from_optional_json(definition.auth.clone())),
+        (
+            "auth".to_string(),
+            HashValue::from_optional_json(definition.auth.clone()),
+        ),
         (
             "protocolVersion".to_string(),
             HashValue::from_optional_json(definition.protocol_version.clone()),
@@ -906,13 +947,24 @@ pub fn server_identity_pre_image_with(
             "bearerToken".to_string(),
             opt_string(resolve_bearer_token(definition, env).as_deref()),
         ),
-        ("bearerTokenEnv".to_string(), opt_string(definition.bearer_token_env.as_deref())),
+        (
+            "bearerTokenEnv".to_string(),
+            opt_string(definition.bearer_token_env.as_deref()),
+        ),
         (
             "exposeResources".to_string(),
-            definition.expose_resources.map_or(HashValue::Undefined, HashValue::Bool),
+            definition
+                .expose_resources
+                .map_or(HashValue::Undefined, HashValue::Bool),
         ),
-        ("includeTools".to_string(), opt_string_list(definition.include_tools.as_ref())),
-        ("excludeTools".to_string(), opt_string_list(definition.exclude_tools.as_ref())),
+        (
+            "includeTools".to_string(),
+            opt_string_list(definition.include_tools.as_ref()),
+        ),
+        (
+            "excludeTools".to_string(),
+            opt_string_list(definition.exclude_tools.as_ref()),
+        ),
     ]);
     Ok(stable_stringify(&identity))
 }
@@ -948,7 +1000,9 @@ pub fn compute_mcp_server_hash_with(
     env: &dyn Fn(&str) -> Option<String>,
     home: &Path,
 ) -> Result<String, IdentityError> {
-    Ok(hex_sha256(&server_identity_pre_image_with(definition, env, home)?))
+    Ok(hex_sha256(&server_identity_pre_image_with(
+        definition, env, home,
+    )?))
 }
 
 /// `createHash("sha256").update(preImage).digest("hex")`.
@@ -1001,22 +1055,31 @@ fn request_headers_command_value(
             command
                 .command
                 .as_deref()
-                .map_or(HashValue::Undefined, |c| HashValue::String(interpolate_env_vars(c, env))),
+                .map_or(HashValue::Undefined, |c| {
+                    HashValue::String(interpolate_env_vars(c, env))
+                }),
         ),
         (
             "args".to_string(),
             command.args.as_ref().map_or(HashValue::Undefined, |args| {
                 HashValue::Array(
-                    args.iter().map(|a| HashValue::String(interpolate_env_vars(a, env))).collect(),
+                    args.iter()
+                        .map(|a| HashValue::String(interpolate_env_vars(a, env)))
+                        .collect(),
                 )
             }),
         ),
         // `interpolateEnvRecord`, so a non-string value throws here too — the nested `env` is not a
         // laxer map than the outer one.
-        ("env".to_string(), interpolate_env_record(command.env.as_ref(), env)?),
+        (
+            "env".to_string(),
+            interpolate_env_record(command.env.as_ref(), env)?,
+        ),
         (
             "timeoutMs".to_string(),
-            command.timeout_ms.map_or(HashValue::Undefined, HashValue::Number),
+            command
+                .timeout_ms
+                .map_or(HashValue::Undefined, HashValue::Number),
         ),
     ]))
 }
@@ -1119,7 +1182,9 @@ fn match_placeholder(rest: &str) -> Option<(&str, usize)> {
         let Some(after) = rest.strip_prefix(open) else {
             continue;
         };
-        let name_len = after.find(|c: char| !is_word_char(c)).unwrap_or(after.len());
+        let name_len = after
+            .find(|c: char| !is_word_char(c))
+            .unwrap_or(after.len());
         if name_len == 0 {
             continue;
         }
@@ -1188,7 +1253,11 @@ fn legacy_server_prefix(server_name: &str, mode: ToolPrefix) -> String {
         ToolPrefix::None => String::new(),
         ToolPrefix::Short => {
             let short = sanitize_server_prefix(strip_mcp_suffix(server_name), false);
-            if short.is_empty() { "mcp".to_string() } else { short }
+            if short.is_empty() {
+                "mcp".to_string()
+            } else {
+                short
+            }
         }
         ToolPrefix::Mcp => format!("mcp__{}", sanitize_server_prefix(server_name, false)),
         ToolPrefix::Server => sanitize_server_prefix(server_name, false),
@@ -1199,9 +1268,15 @@ fn legacy_server_prefix(server_name: &str, mode: ToolPrefix) -> String {
 /// which is the one place the two grammars differ on the tool half of the name.
 fn format_legacy_tool_name(tool_name: &str, server_name: &str, prefix: ToolPrefix) -> String {
     let server_prefix = legacy_server_prefix(server_name, prefix);
-    let sanitized: String =
-        tool_name.chars().map(|c| if c == '.' || c == '-' { '_' } else { c }).collect();
-    if server_prefix.is_empty() { sanitized } else { format!("{server_prefix}_{sanitized}") }
+    let sanitized: String = tool_name
+        .chars()
+        .map(|c| if c == '.' || c == '-' { '_' } else { c })
+        .collect();
+    if server_prefix.is_empty() {
+        sanitized
+    } else {
+        format!("{server_prefix}_{sanitized}")
+    }
 }
 
 /// Port of `getServerPrefix` (`types.ts:675`), and the twin of
@@ -1413,7 +1488,9 @@ fn tool_name_candidates(
 fn matches_tool_pattern(candidates: &HashSet<String>, patterns: &[String]) -> bool {
     patterns.iter().any(|pattern| {
         if is_glob(pattern) {
-            candidates.iter().any(|candidate| glob_matches(pattern, candidate))
+            candidates
+                .iter()
+                .any(|candidate| glob_matches(pattern, candidate))
         } else {
             candidates.contains(pattern)
         }
@@ -1448,9 +1525,15 @@ impl CandidateIndex {
         // Disjoint field borrows: the closure reads `all_current` while `matching_count` is
         // borrowed mutably, exactly as the writer's `has_other_current_match` does.
         let all_current = &self.all_current;
-        let total = *self.matching_count.entry(pattern.to_string()).or_insert_with(|| {
-            all_current.iter().filter(|candidate| glob_matches(pattern, candidate)).count()
-        });
+        let total = *self
+            .matching_count
+            .entry(pattern.to_string())
+            .or_insert_with(|| {
+                all_current
+                    .iter()
+                    .filter(|candidate| glob_matches(pattern, candidate))
+                    .count()
+            });
         if total == 0 {
             return false;
         }
@@ -1517,9 +1600,13 @@ fn is_tool_allowed(
 ) -> bool {
     let included = match include_tools.filter(|p| !p.is_empty()) {
         None => true,
-        Some(patterns) => {
-            matches_tool_selector(tool_name, server_name, prefix, patterns, index.as_deref_mut())
-        }
+        Some(patterns) => matches_tool_selector(
+            tool_name,
+            server_name,
+            prefix,
+            patterns,
+            index.as_deref_mut(),
+        ),
     };
     if !included {
         return false;
@@ -1533,15 +1620,25 @@ fn is_tool_allowed(
 /// `resolveToolPrefix` (`types.ts:702`, `cyrup_mcp::registration::resolve_tool_prefix`) — the
 /// per-server override if it parses, else the global.
 fn effective_tool_prefix(definition: &ServerEntry, global: ToolPrefix) -> ToolPrefix {
-    definition.tool_prefix.as_deref().and_then(parse_tool_prefix).unwrap_or(global)
+    definition
+        .tool_prefix
+        .as_deref()
+        .and_then(parse_tool_prefix)
+        .unwrap_or(global)
 }
 
 /// `hasToolFilters` (`direct-tools.ts:153`) — whether this server needs the cross-server index at
 /// all. Upstream builds it lazily and so does this: the answer is identical either way, but the
 /// index is O(servers × tools) and most servers carry no filters.
 fn has_tool_filters(definition: &ServerEntry) -> bool {
-    definition.include_tools.as_ref().is_some_and(|v| !v.is_empty())
-        || definition.exclude_tools.as_ref().is_some_and(|v| !v.is_empty())
+    definition
+        .include_tools
+        .as_ref()
+        .is_some_and(|v| !v.is_empty())
+        || definition
+            .exclude_tools
+            .as_ref()
+            .is_some_and(|v| !v.is_empty())
 }
 
 /// The `selectorCandidateIndex` builder (`direct-tools.ts:156-174`, the twin of
@@ -1586,7 +1683,10 @@ fn build_candidate_index(
             all_current.extend(tool_name_candidates(&base, other_name, other_prefix, false));
         }
     }
-    CandidateIndex { all_current, matching_count: HashMap::new() }
+    CandidateIndex {
+        all_current,
+        matching_count: HashMap::new(),
+    }
 }
 
 /// Port of pi `resourceNameToToolName`: non-alphanumerics → `_`, collapse runs, trim edge `_`,
@@ -1736,7 +1836,9 @@ fn expand_pattern(
                 rest = after;
             }
             None => {
-                let name_len = after.find(|c: char| !is_word_char(c)).unwrap_or(after.len());
+                let name_len = after
+                    .find(|c: char| !is_word_char(c))
+                    .unwrap_or(after.len());
                 let name = after.get(..name_len).unwrap_or("");
                 if name.is_empty() {
                     out.push_str(open);
@@ -1766,7 +1868,10 @@ fn resolve_config_path(
     if resolved == "~" {
         return Some(home.to_string_lossy().into_owned());
     }
-    if let Some(rest) = resolved.strip_prefix("~/").or_else(|| resolved.strip_prefix("~\\")) {
+    if let Some(rest) = resolved
+        .strip_prefix("~/")
+        .or_else(|| resolved.strip_prefix("~\\"))
+    {
         return Some(node_path_join(home, rest).to_string_lossy().into_owned());
     }
     Some(resolved)
@@ -1886,7 +1991,9 @@ impl HashValue {
                 HashValue::Array(items.into_iter().map(HashValue::from_json).collect())
             }
             Value::Object(map) => HashValue::Object(
-                map.into_iter().map(|(k, v)| (k, HashValue::from_json(v))).collect(),
+                map.into_iter()
+                    .map(|(k, v)| (k, HashValue::from_json(v)))
+                    .collect(),
             ),
         }
     }
@@ -2008,7 +2115,8 @@ mod tests {
         config_path: Option<PathBuf>,
         cached_at: Option<i64>,
     ) {
-        let mut definition = serde_json::json!({ "command": "npx", "args": ["chrome-devtools-mcp"] });
+        let mut definition =
+            serde_json::json!({ "command": "npx", "args": ["chrome-devtools-mcp"] });
         if let Value::Object(extra) = definition_extra
             && let Value::Object(base) = &mut definition
         {
@@ -2132,7 +2240,10 @@ mod tests {
                 None,
                 None,
             );
-            assert_eq!(resolve(&fixture, &["linear-mcp"]), vec![expected.to_string()]);
+            assert_eq!(
+                resolve(&fixture, &["linear-mcp"]),
+                vec![expected.to_string()]
+            );
         }
     }
 
@@ -2223,7 +2334,9 @@ mod tests {
     #[test]
     fn empty_selector_list_resolves_to_empty() {
         let fixture = make_fixture();
-        assert!(resolve_mcp_direct_tool_names_in(&[], &fixture.project_dir, &fixture.dirs).is_empty());
+        assert!(
+            resolve_mcp_direct_tool_names_in(&[], &fixture.project_dir, &fixture.dirs).is_empty()
+        );
     }
 
     #[test]
@@ -2303,7 +2416,10 @@ mod tests {
 
         let pre_image = server_identity_pre_image(&reader).expect("hashable");
         assert_eq!(pre_image, writer_pre_image(&writer, &resolved));
-        assert_eq!(compute_mcp_server_hash(&reader).expect("hashable"), compute_server_hash(&writer, &resolved));
+        assert_eq!(
+            compute_mcp_server_hash(&reader).expect("hashable"),
+            compute_server_hash(&writer, &resolved)
+        );
 
         // Fifteen keys, named — a count alone would not say which one went missing.
         for key in [
@@ -2323,7 +2439,10 @@ mod tests {
             "socket",
             "url",
         ] {
-            assert!(pre_image.contains(&format!("\"{key}\":")), "missing {key} in {pre_image}");
+            assert!(
+                pre_image.contains(&format!("\"{key}\":")),
+                "missing {key} in {pre_image}"
+            );
         }
         // Upstream's own digest for this definition, measured on node 22 @ `v2.26.1` (`fafae21`).
         // While `socket` was missing the two crates agreed with each other here and with nobody
@@ -2390,9 +2509,15 @@ mod tests {
             "2190558e470a75c0f992989bd1799b374e669deecb8093e4118a1a9419068cf4";
 
         let ours = server_identity_pre_image(&entry).expect("hashable");
-        assert_eq!(ours, UPSTREAM_PRE_IMAGE, "byte-for-byte, or the key moved again");
+        assert_eq!(
+            ours, UPSTREAM_PRE_IMAGE,
+            "byte-for-byte, or the key moved again"
+        );
         assert!(ours.contains(r#""socket":undefined"#), "{ours}");
-        assert_eq!(compute_mcp_server_hash(&entry).expect("hashable"), UPSTREAM_DIGEST);
+        assert_eq!(
+            compute_mcp_server_hash(&entry).expect("hashable"),
+            UPSTREAM_DIGEST
+        );
 
         // The writer agrees with both, which is the property the shared cache file depends on.
         let writer: WriterServerEntry = serde_json::from_str(
@@ -2437,7 +2562,10 @@ mod tests {
         let writer_env: cyrup_mcp::credentials::EnvFn = std::sync::Arc::new(|_: &str| None);
 
         for (json, message) in [
-            (r#"{"command":"x","env":{"K":5}}"#, "value.startsWith is not a function"),
+            (
+                r#"{"command":"x","env":{"K":5}}"#,
+                "value.startsWith is not a function",
+            ),
             (
                 r#"{"command":"x","headers":{"K":null}}"#,
                 "Cannot read properties of null (reading 'startsWith')",
@@ -2475,7 +2603,10 @@ mod tests {
                 cached_at: Some(crate::time::now_epoch_millis()),
                 ..ServerCacheEntry::default()
             };
-            assert!(!is_server_cache_valid_with_age(&entry, &reader, 0), "{json}");
+            assert!(
+                !is_server_cache_valid_with_age(&entry, &reader, 0),
+                "{json}"
+            );
             assert!(
                 cyrup_mcp::dirs::try_compute_server_hash(&writer, &writer_env, home).is_err(),
                 "{json}"
@@ -2490,7 +2621,10 @@ mod tests {
         let record = mixed.env.as_ref().expect("the map survives");
         assert_eq!(record.get("GOOD").map(String::as_str), Some("1"));
         assert_eq!(record.len(), 1, "only the string members are usable");
-        assert_eq!(record.unhashable(), Some("value.startsWith is not a function"));
+        assert_eq!(
+            record.unhashable(),
+            Some("value.startsWith is not a function")
+        );
     }
 
     /// The `protocolVersion` digest divergence, closed and pinned against upstream's own digest.
@@ -2513,7 +2647,8 @@ mod tests {
     /// `cyrup_mcp::runtime`'s `wire_tests::an_unknown_revision_throws_upstreams_sentence_at_connect`.
     #[test]
     fn a_protocol_revision_the_writer_used_to_reject_now_agrees_on_the_digest() {
-        const JSON: &str = r#"{"url":"https://api.example.com/mcp","protocolVersion":"2025-06-18"}"#;
+        const JSON: &str =
+            r#"{"url":"https://api.example.com/mcp","protocolVersion":"2025-06-18"}"#;
         const UPSTREAM_PRE_IMAGE: &str = concat!(
             r#"{"args":undefined,"auth":undefined,"bearerToken":undefined,"#,
             r#""bearerTokenEnv":undefined,"command":undefined,"cwd":undefined,"env":undefined,"#,
@@ -2538,10 +2673,19 @@ mod tests {
 
         // Both keep what the user wrote, and it is what upstream keeps.
         assert!(ours.contains(r#""protocolVersion":"2025-06-18""#), "{ours}");
-        assert!(theirs.contains(r#""protocolVersion":"2025-06-18""#), "{theirs}");
-        assert_eq!(ours, theirs, "if these differ, the passthrough arm regressed");
+        assert!(
+            theirs.contains(r#""protocolVersion":"2025-06-18""#),
+            "{theirs}"
+        );
+        assert_eq!(
+            ours, theirs,
+            "if these differ, the passthrough arm regressed"
+        );
         assert_eq!(ours, UPSTREAM_PRE_IMAGE);
-        assert_eq!(compute_mcp_server_hash(&reader).expect("hashable"), UPSTREAM_DIGEST);
+        assert_eq!(
+            compute_mcp_server_hash(&reader).expect("hashable"),
+            UPSTREAM_DIGEST
+        );
         assert_eq!(compute_server_hash(&writer, &resolved), UPSTREAM_DIGEST);
     }
 
@@ -2572,14 +2716,26 @@ mod tests {
             theirs
         );
         assert_eq!(compute_server_hash(&writer, &resolved), UPSTREAM_DIGEST);
-        assert_eq!(compute_mcp_server_hash(&reader).expect("hashable"), UPSTREAM_DIGEST);
+        assert_eq!(
+            compute_mcp_server_hash(&reader).expect("hashable"),
+            UPSTREAM_DIGEST
+        );
 
         // `"oauth"`, `"bearer"` and the two booleans still land on the arms that have meaning, so
         // the passthrough widened nothing: `Other` catches only what those reject.
         for (json, expected) in [
-            (r#"{"auth":"oauth"}"#, cyrup_mcp::config::AuthMode::Named(cyrup_mcp::config::AuthKind::Oauth)),
-            (r#"{"auth":"bearer"}"#, cyrup_mcp::config::AuthMode::Named(cyrup_mcp::config::AuthKind::Bearer)),
-            (r#"{"auth":false}"#, cyrup_mcp::config::AuthMode::Disabled(false)),
+            (
+                r#"{"auth":"oauth"}"#,
+                cyrup_mcp::config::AuthMode::Named(cyrup_mcp::config::AuthKind::Oauth),
+            ),
+            (
+                r#"{"auth":"bearer"}"#,
+                cyrup_mcp::config::AuthMode::Named(cyrup_mcp::config::AuthKind::Bearer),
+            ),
+            (
+                r#"{"auth":false}"#,
+                cyrup_mcp::config::AuthMode::Disabled(false),
+            ),
         ] {
             let parsed: WriterServerEntry = serde_json::from_str(json).expect("writer entry");
             assert_eq!(parsed.auth, Some(expected), "{json}");
@@ -2791,7 +2947,10 @@ mod tests {
                 serde_json::from_str(changed_json).expect("writer changed");
             assert_eq!(
                 compute_mcp_server_hash(&changed).expect("hashable"),
-                compute_server_hash(&writer_changed, &ResolvedIdentity::verbatim(&writer_changed)),
+                compute_server_hash(
+                    &writer_changed,
+                    &ResolvedIdentity::verbatim(&writer_changed)
+                ),
                 "{changed_json}"
             );
             assert_eq!(
@@ -2811,7 +2970,10 @@ mod tests {
         let pre_image = server_identity_pre_image(&literal).expect("hashable");
         assert!(!pre_image.contains("${HOME}"), "{pre_image}");
         let home = std::env::var("HOME").unwrap_or_default();
-        assert!(pre_image.contains(&format!("https://x.example/{home}/mcp")), "{pre_image}");
+        assert!(
+            pre_image.contains(&format!("https://x.example/{home}/mcp")),
+            "{pre_image}"
+        );
     }
 
     /// MCP-370's shared table: the same `(server, tool, mode)` triples through this module's
@@ -3020,7 +3182,11 @@ mod tests {
             ("{env:café}", "{env:café}"),
         ];
         for (input, expected) in cases {
-            assert_eq!(interpolate_env_vars(input, &vector_env), expected, "input {input:?}");
+            assert_eq!(
+                interpolate_env_vars(input, &vector_env),
+                expected,
+                "input {input:?}"
+            );
         }
     }
 
@@ -3032,31 +3198,58 @@ mod tests {
     /// through upstream's `interpolateEnvRecord`.
     #[test]
     fn the_secret_expression_grammar_covers_both_hashed_call_sites() {
-        assert_eq!(interpolate_secret_expression("!!${HOST}", &vector_env), "!a.example");
-        assert_eq!(interpolate_secret_expression("!op read x", &vector_env), "!op read x");
+        assert_eq!(
+            interpolate_secret_expression("!!${HOST}", &vector_env),
+            "!a.example"
+        );
+        assert_eq!(
+            interpolate_secret_expression("!op read x", &vector_env),
+            "!op read x"
+        );
         assert_eq!(interpolate_secret_expression("!!!x", &vector_env), "!!x");
-        assert_eq!(interpolate_secret_expression("{env:HOST}", &vector_env), "a.example");
+        assert_eq!(
+            interpolate_secret_expression("{env:HOST}", &vector_env),
+            "a.example"
+        );
 
         // Call site 1 — `env` / `headers`.
         let values = BTreeMap::from([
-            ("ESCAPED".to_string(), Value::String("!!${HOST}".to_string())),
-            ("MARKER".to_string(), Value::String("!op read x".to_string())),
+            (
+                "ESCAPED".to_string(),
+                Value::String("!!${HOST}".to_string()),
+            ),
+            (
+                "MARKER".to_string(),
+                Value::String("!op read x".to_string()),
+            ),
         ]);
         assert_eq!(
             interpolate_env_record(Some(&values), &vector_env).expect("all strings"),
             HashValue::Object(vec![
-                ("ESCAPED".to_string(), HashValue::String("!a.example".to_string())),
-                ("MARKER".to_string(), HashValue::String("!op read x".to_string())),
+                (
+                    "ESCAPED".to_string(),
+                    HashValue::String("!a.example".to_string())
+                ),
+                (
+                    "MARKER".to_string(),
+                    HashValue::String("!op read x".to_string())
+                ),
             ])
         );
 
         // Call site 2 — `bearerToken`.
         let escaped: ServerEntry =
             serde_json::from_str(r#"{ "bearerToken": "!!${HOST}" }"#).expect("entry");
-        assert_eq!(resolve_bearer_token(&escaped, &vector_env).as_deref(), Some("!a.example"));
+        assert_eq!(
+            resolve_bearer_token(&escaped, &vector_env).as_deref(),
+            Some("!a.example")
+        );
         let marker: ServerEntry =
             serde_json::from_str(r#"{ "bearerToken": "!op read tok" }"#).expect("entry");
-        assert_eq!(resolve_bearer_token(&marker, &vector_env).as_deref(), Some("!op read tok"));
+        assert_eq!(
+            resolve_bearer_token(&marker, &vector_env).as_deref(),
+            Some("!op read tok")
+        );
         // An empty `bearerTokenEnv` is falsy upstream, so it supplies nothing.
         let empty: ServerEntry =
             serde_json::from_str(r#"{ "bearerTokenEnv": "" }"#).expect("entry");
@@ -3119,8 +3312,8 @@ mod tests {
         let resolved = ResolvedIdentity::resolve(&writer, &writer_env, &vector_home())
             .expect("this url resolves");
 
-        let ours = server_identity_pre_image_with(&reader, &vector_env, &vector_home())
-            .expect("hashable");
+        let ours =
+            server_identity_pre_image_with(&reader, &vector_env, &vector_home()).expect("hashable");
         assert_eq!(ours, PRE_IMAGE);
         assert_eq!(ours, writer_pre_image(&writer, &resolved));
         assert_eq!(
@@ -3131,7 +3324,10 @@ mod tests {
 
         // The digest the writer used to stamp — `verbatim`, no resolvers — is a different one, and
         // that difference is the production bug both sides now avoid.
-        assert_ne!(compute_server_hash(&writer, &ResolvedIdentity::verbatim(&writer)), DIGEST);
+        assert_ne!(
+            compute_server_hash(&writer, &ResolvedIdentity::verbatim(&writer)),
+            DIGEST
+        );
     }
 
     /// MCP-145 — the throw arm, on the two things that can throw, plus the two `cachedAt` rules and
@@ -3187,15 +3383,17 @@ mod tests {
                 ..ServerCacheEntry::default()
             };
             assert!(!is_server_cache_valid(&entry, definition));
-            assert!(!is_server_cache_valid_with_age(&entry, definition, 0), "even with no TTL");
+            assert!(
+                !is_server_cache_valid_with_age(&entry, definition, 0),
+                "even with no TTL"
+            );
         }
     }
 
     /// `!entry.cachedAt` is falsy-testing a number, and `maxAgeMs > 0` gates the age check.
     #[test]
     fn cached_at_zero_is_rejected_and_max_age_zero_disables_the_age_check() {
-        let definition: ServerEntry =
-            serde_json::from_str(r#"{ "command": "x" }"#).expect("entry");
+        let definition: ServerEntry = serde_json::from_str(r#"{ "command": "x" }"#).expect("entry");
         let hash = compute_mcp_server_hash(&definition).expect("hashable");
         let with_stamp = |cached_at: Option<i64>| ServerCacheEntry {
             config_hash: Some(hash.clone()),
@@ -3203,9 +3401,15 @@ mod tests {
             ..ServerCacheEntry::default()
         };
 
-        assert!(!is_server_cache_valid(&with_stamp(Some(0)), &definition), "0 is falsy");
+        assert!(
+            !is_server_cache_valid(&with_stamp(Some(0)), &definition),
+            "0 is falsy"
+        );
         assert!(!is_server_cache_valid(&with_stamp(None), &definition));
-        assert!(is_server_cache_valid(&with_stamp(Some(crate::time::now_epoch_millis())), &definition));
+        assert!(is_server_cache_valid(
+            &with_stamp(Some(crate::time::now_epoch_millis())),
+            &definition
+        ));
 
         let year = 365 * 24 * 60 * 60 * 1000;
         let ancient = with_stamp(Some(crate::time::now_epoch_millis() - year));

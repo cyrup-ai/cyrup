@@ -18,7 +18,10 @@ fn texts(lines: &[Line<'static>]) -> Vec<String> {
 fn clusters(rows: &[Line<'static>]) -> Vec<String> {
     rows.iter()
         .flat_map(|r| {
-            txt(r).graphemes(true).map(str::to_string).collect::<Vec<_>>()
+            txt(r)
+                .graphemes(true)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
         })
         .filter(|g| !g.trim().is_empty())
         .collect()
@@ -38,23 +41,42 @@ fn wrap_line_breaks_on_graphemes_not_chars() {
     // emoji, a combining-mark sequence and wide CJK.
     let src = "AAAA\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}BBe\u{301}\u{65e5}\u{672c}\u{8a9e}";
     let rows = wrap_line(&Line::raw(src.to_string()), 8);
-    assert!(rows.len() > 1, "the token must hard-break at width 8: {:?}", texts(&rows));
+    assert!(
+        rows.len() > 1,
+        "the token must hard-break at width 8: {:?}",
+        texts(&rows)
+    );
     for (i, r) in rows.iter().enumerate() {
-        assert!(r.width() <= 8, "row {i} overflows: {} cols {:?}", r.width(), txt(r));
+        assert!(
+            r.width() <= 8,
+            "row {i} overflows: {} cols {:?}",
+            r.width(),
+            txt(r)
+        );
     }
     // No cluster was split: re-segmenting the produced rows yields the source's clusters, in
     // order. A per-`char` break emits `"\u{1f468}"` then a bare `"\u{200d}"`, which does not.
-    let want: Vec<String> =
-        src.graphemes(true).filter(|g| !g.trim().is_empty()).map(str::to_string).collect();
-    assert_eq!(clusters(&rows), want, "a grapheme cluster was torn: {:?}", texts(&rows));
+    let want: Vec<String> = src
+        .graphemes(true)
+        .filter(|g| !g.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        clusters(&rows),
+        want,
+        "a grapheme cluster was torn: {:?}",
+        texts(&rows)
+    );
     assert!(
-        rows.iter().any(|r| txt(r).contains('\u{1f468}')
-            && txt(r).contains('\u{1f466}')),
+        rows.iter()
+            .any(|r| txt(r).contains('\u{1f468}') && txt(r).contains('\u{1f466}')),
         "the ZWJ family landed on one row whole: {:?}",
         texts(&rows)
     );
     assert!(
-        !rows.iter().any(|r| txt(r).starts_with('\u{200d}') || txt(r).starts_with('\u{301}')),
+        !rows
+            .iter()
+            .any(|r| txt(r).starts_with('\u{200d}') || txt(r).starts_with('\u{301}')),
         "a row began with an orphaned joiner/combining mark: {:?}",
         texts(&rows)
     );
@@ -63,16 +85,29 @@ fn wrap_line_breaks_on_graphemes_not_chars() {
     let cjk = "\u{8a9e}".repeat(26);
     let wide = wrap_line(&Line::raw(cjk.clone()), 10);
     for (i, r) in wide.iter().enumerate() {
-        assert!(r.width() <= 10, "wide row {i} overflows: {} cols", r.width());
+        assert!(
+            r.width() <= 10,
+            "wide row {i} overflows: {} cols",
+            r.width()
+        );
     }
-    assert_eq!(clusters(&wide).len(), 26, "characters were lost or duplicated");
+    assert_eq!(
+        clusters(&wide).len(),
+        26,
+        "characters were lost or duplicated"
+    );
 
     // MIRROR: the token-width SUM leg is grapheme-measured too, so a space-separated wide string
     // wraps on its spaces and every row still fits.
     let words = "\u{65e5}\u{672c}\u{8a9e} \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466} abc \u{65e5}\u{672c}\u{8a9e}";
     let ws = wrap_line(&Line::raw(words.to_string()), 9);
     for (i, r) in ws.iter().enumerate() {
-        assert!(r.width() <= 9, "row {i} overflows: {} cols {:?}", r.width(), txt(r));
+        assert!(
+            r.width() <= 9,
+            "row {i} overflows: {} cols {:?}",
+            r.width(),
+            txt(r)
+        );
     }
     assert_eq!(
         clusters(&ws),
@@ -107,16 +142,32 @@ fn whitespace_only_assistant_turn_is_not_visible_content() {
     // Committed leg: a whitespace-only turn never becomes an entry.
     let mut view = TranscriptView::new();
     view.commit_assistant(Some("   \n\t ".to_string()));
-    assert!(view.pending().is_empty(), "whitespace-only turn committed: {:?}", view.pending());
+    assert!(
+        view.pending().is_empty(),
+        "whitespace-only turn committed: {:?}",
+        view.pending()
+    );
 
     // …and the render arm refuses it independently, because `Entry::Assistant` is public.
-    assert!(entry_lines(&Entry::Assistant("  ".into()), &theme, 40, 1, ImageOpts::default())
-        .is_empty());
+    assert!(
+        entry_lines(
+            &Entry::Assistant("  ".into()),
+            &theme,
+            40,
+            1,
+            ImageOpts::default()
+        )
+        .is_empty()
+    );
 
     // Streaming leg: the live region shows nothing at all until real text arrives.
     let mut live = TranscriptView::new();
     live.push_assistant_delta("  ");
-    assert!(live.lines(40, &theme).is_empty(), "{:?}", texts(&live.lines(40, &theme)));
+    assert!(
+        live.lines(40, &theme).is_empty(),
+        "{:?}",
+        texts(&live.lines(40, &theme))
+    );
 
     // MIRROR: real content still gets exactly one leading blank, on both legs.
     let mut ok = TranscriptView::new();
@@ -124,7 +175,10 @@ fn whitespace_only_assistant_turn_is_not_visible_content() {
     let committed = entry_lines(&ok.pending()[0], &theme, 40, 1, ImageOpts::default());
     assert_eq!(texts(&committed), vec!["".to_string(), " hi".to_string()]);
     live.push_assistant_delta("hi");
-    assert_eq!(texts(&live.lines(40, &theme)), vec!["".to_string(), " hi".to_string()]);
+    assert_eq!(
+        texts(&live.lines(40, &theme)),
+        vec!["".to_string(), " hi".to_string()]
+    );
 }
 
 /// The `hasVisibleContent` fix must not disarm the reasoning leg: a whitespace-only THINKING
@@ -138,7 +192,10 @@ fn live_thinking_and_answer_spacers_use_the_trimmed_predicate() {
     view.set_hide_thinking_block(true);
 
     view.push_thinking_delta("  ");
-    assert!(view.lines(40, &theme).is_empty(), "whitespace-only reasoning is not visible");
+    assert!(
+        view.lines(40, &theme).is_empty(),
+        "whitespace-only reasoning is not visible"
+    );
 
     view.push_thinking_delta("musing");
     assert_eq!(
@@ -175,7 +232,10 @@ fn live_thinking_and_answer_spacers_use_the_trimmed_predicate() {
 #[test]
 fn a_component_that_renders_nothing_gets_no_leading_spacer() {
     let theme = UiTheme::dark();
-    let empty = Entry::User { text: String::new(), lead_spacer: true };
+    let empty = Entry::User {
+        text: String::new(),
+        lead_spacer: true,
+    };
     assert!(
         entry_lines(&empty, &theme, 40, 1, ImageOpts::default()).is_empty(),
         "orphan blank ahead of an empty user box"
@@ -184,10 +244,17 @@ fn a_component_that_renders_nothing_gets_no_leading_spacer() {
     assert!(box_lines(Vec::new(), 40, 1, 1, Style::default()).is_empty());
 
     // MIRROR: real text still gets the blank, the tinted paddingY row and the inset body.
-    let real = Entry::User { text: "hello".into(), lead_spacer: true };
+    let real = Entry::User {
+        text: "hello".into(),
+        lead_spacer: true,
+    };
     let rows = entry_lines(&real, &theme, 40, 1, ImageOpts::default());
     assert_eq!(txt(&rows[0]), "", "leading Spacer(1)");
-    assert_eq!(rows[0].width(), 0, "the Spacer is outside the Box, so it is not filled");
+    assert_eq!(
+        rows[0].width(),
+        0,
+        "the Spacer is outside the Box, so it is not filled"
+    );
     assert_eq!(rows[1].width(), 40, "the Box's top paddingY row IS filled");
     assert!(txt(&rows[2]).starts_with(" hello"));
 }
@@ -209,14 +276,40 @@ fn a_component_that_renders_nothing_gets_no_leading_spacer() {
 #[test]
 fn status_row_is_a_spacer_plus_a_one_column_inset_dim_text() {
     let theme = UiTheme::dark();
-    let rows = entry_lines(&Entry::Status("Model: opus".into()), &theme, 40, 1, ImageOpts::default());
-    assert_eq!(texts(&rows), vec!["".to_string(), " Model: opus".to_string()]);
-    assert!(!txt(&rows[1]).contains('\u{2022}'), "invented bullet: {:?}", txt(&rows[1]));
-    assert_eq!(rows[1].spans[1].style, theme.dim_style(), "`theme.fg(\"dim\", message)`");
+    let rows = entry_lines(
+        &Entry::Status("Model: opus".into()),
+        &theme,
+        40,
+        1,
+        ImageOpts::default(),
+    );
+    assert_eq!(
+        texts(&rows),
+        vec!["".to_string(), " Model: opus".to_string()]
+    );
+    assert!(
+        !txt(&rows[1]).contains('\u{2022}'),
+        "invented bullet: {:?}",
+        txt(&rows[1])
+    );
+    assert_eq!(
+        rows[1].spans[1].style,
+        theme.dim_style(),
+        "`theme.fg(\"dim\", message)`"
+    );
 
     // The inset does not depend on `outputPad` — `new Text(…, 1, 0)` hard-codes paddingX 1.
-    let flush = entry_lines(&Entry::Status("Model: opus".into()), &theme, 40, 0, ImageOpts::default());
-    assert_eq!(texts(&flush), vec!["".to_string(), " Model: opus".to_string()]);
+    let flush = entry_lines(
+        &Entry::Status("Model: opus".into()),
+        &theme,
+        40,
+        0,
+        ImageOpts::default(),
+    );
+    assert_eq!(
+        texts(&flush),
+        vec!["".to_string(), " Model: opus".to_string()]
+    );
 
     // MIRROR: a long status wraps at `contentWidth = width - 2` and every row keeps the inset.
     let long = entry_lines(
@@ -226,9 +319,17 @@ fn status_row_is_a_spacer_plus_a_one_column_inset_dim_text() {
         1,
         ImageOpts::default(),
     );
-    assert!(long.len() > 2, "a long status must wrap: {:?}", texts(&long));
+    assert!(
+        long.len() > 2,
+        "a long status must wrap: {:?}",
+        texts(&long)
+    );
     for row in long.iter().skip(1) {
-        assert!(txt(row).starts_with(' '), "row lost its inset: {:?}", txt(row));
+        assert!(
+            txt(row).starts_with(' '),
+            "row lost its inset: {:?}",
+            txt(row)
+        );
         assert!(row.width() <= 16, "row overflows: {:?}", txt(row));
     }
 }
@@ -244,16 +345,40 @@ fn the_first_chat_child_gets_no_leading_spacer() {
     let mut view = TranscriptView::new();
     view.push_user("first");
     let first = view.drain_committed();
-    assert!(matches!(first[0], Entry::User { lead_spacer: false, .. }), "{:?}", first[0]);
+    assert!(
+        matches!(
+            first[0],
+            Entry::User {
+                lead_spacer: false,
+                ..
+            }
+        ),
+        "{:?}",
+        first[0]
+    );
     let rows = entry_lines(&first[0], &theme, 40, 1, ImageOpts::default());
-    assert_eq!(rows[0].width(), 40, "row 0 is the Box's tinted paddingY row, not a Spacer");
+    assert_eq!(
+        rows[0].width(),
+        40,
+        "row 0 is the Box's tinted paddingY row, not a Spacer"
+    );
     assert!(txt(&rows[1]).starts_with(" first"), "{:?}", texts(&rows));
 
     // MIRROR: the SECOND message gets one — and it still does after the first was flushed to
     // native scrollback, which is why the answer cannot be read off `pending` at render time.
     view.push_user("second");
     let second = view.drain_committed();
-    assert!(matches!(second[0], Entry::User { lead_spacer: true, .. }), "{:?}", second[0]);
+    assert!(
+        matches!(
+            second[0],
+            Entry::User {
+                lead_spacer: true,
+                ..
+            }
+        ),
+        "{:?}",
+        second[0]
+    );
     let srows = entry_lines(&second[0], &theme, 40, 1, ImageOpts::default());
     assert_eq!(txt(&srows[0]), "");
     assert_eq!(srows[0].width(), 0, "the Spacer is untinted and unpadded");
@@ -263,7 +388,13 @@ fn the_first_chat_child_gets_no_leading_spacer() {
     let mut streamed = TranscriptView::new();
     streamed.push_assistant_delta("hi");
     streamed.push_user("after a stream");
-    assert!(matches!(streamed.pending()[0], Entry::User { lead_spacer: true, .. }));
+    assert!(matches!(
+        streamed.pending()[0],
+        Entry::User {
+            lead_spacer: true,
+            ..
+        }
+    ));
 
     // `:3500` covers the SKILL component too (`:3506` sits inside it), while the user message
     // that trails the skill block (`:3513-3521`) has its own unconditional spacer.
@@ -271,11 +402,27 @@ fn the_first_chat_child_gets_no_leading_spacer() {
     skill.push_user("<skill name=\"deploy\" location=\"a\">\nrun it\n</skill>\n\nand then?");
     let entries = skill.drain_committed();
     assert!(
-        matches!(entries[0], Entry::SkillInvocation { lead_spacer: false, .. }),
+        matches!(
+            entries[0],
+            Entry::SkillInvocation {
+                lead_spacer: false,
+                ..
+            }
+        ),
         "{:?}",
         entries[0]
     );
-    assert!(matches!(entries[1], Entry::User { lead_spacer: true, .. }), "{:?}", entries[1]);
+    assert!(
+        matches!(
+            entries[1],
+            Entry::User {
+                lead_spacer: true,
+                ..
+            }
+        ),
+        "{:?}",
+        entries[1]
+    );
     assert_eq!(
         txt(&entry_lines(&entries[1], &theme, 40, 1, ImageOpts::default())[0]),
         ""
@@ -283,14 +430,18 @@ fn the_first_chat_child_gets_no_leading_spacer() {
 
     // MIRROR: the ungated call sites are unaffected — a branch summary opening a fresh session
     // still leads with its blank (`:3491`).
-    let branch =
-        entry_lines(
-            &Entry::BranchSummary { summary: "merged".into() },
-            &theme,
-            40,
-            1,
-            ImageOpts { tools_expanded: true, ..ImageOpts::default() },
-        );
+    let branch = entry_lines(
+        &Entry::BranchSummary {
+            summary: "merged".into(),
+        },
+        &theme,
+        40,
+        1,
+        ImageOpts {
+            tools_expanded: true,
+            ..ImageOpts::default()
+        },
+    );
     assert_eq!(txt(&branch[0]), "");
     assert_eq!(branch[0].width(), 0, "`:3491`'s Spacer is outside the Box");
 }
@@ -311,7 +462,10 @@ fn block_body_wraps_at_width_minus_two() {
     let body = "aaaaaaaaa bbbbbbbbb";
     assert_eq!(Line::raw(body).width(), 19);
     let rows = entry_lines(
-        &Entry::Block { title: "T".into(), markdown: body.into() },
+        &Entry::Block {
+            title: "T".into(),
+            markdown: body.into(),
+        },
         &theme,
         20,
         1,
@@ -319,20 +473,36 @@ fn block_body_wraps_at_width_minus_two() {
     );
     let text: Vec<String> = texts(&rows);
     assert!(
-        text.iter().any(|r| r.trim() == "aaaaaaaaa") && text.iter().any(|r| r.trim() == "bbbbbbbbb"),
+        text.iter().any(|r| r.trim() == "aaaaaaaaa")
+            && text.iter().any(|r| r.trim() == "bbbbbbbbb"),
         "the body did not wrap at `width - 2` — it was rendered at the full width: {text:?}"
     );
     for row in &rows {
-        assert!(row.width() <= 20, "a row overflowed the block: {:?}", txt(row));
+        assert!(
+            row.width() <= 20,
+            "a row overflowed the block: {:?}",
+            txt(row)
+        );
     }
     // `leftMargin` — every body row carries the one-column inset (`markdown.ts:328-340`).
-    for row in rows.iter().filter(|r| txt(r).contains('a') || txt(r).contains('b')) {
-        assert!(txt(row).starts_with(' '), "body row lost `leftMargin`: {:?}", txt(row));
+    for row in rows
+        .iter()
+        .filter(|r| txt(r).contains('a') || txt(r).contains('b'))
+    {
+        assert!(
+            txt(row).starts_with(' '),
+            "body row lost `leftMargin`: {:?}",
+            txt(row)
+        );
     }
 
     // MIRROR — the two `─` rules are the one thing that DOES run edge to edge (`DynamicBorder`
     // is a chat child with no padding at all), so the block is 20 wide even though its body is 18.
-    assert_eq!(txt(&rows[1]), "─".repeat(20), "the opening rule is full width");
+    assert_eq!(
+        txt(&rows[1]),
+        "─".repeat(20),
+        "the opening rule is full width"
+    );
     assert_eq!(
         txt(rows.last().unwrap()),
         "─".repeat(20),
@@ -361,7 +531,10 @@ fn block_with_an_empty_body_emits_no_padding_rows() {
     let theme = UiTheme::dark();
     let rule = "─".repeat(24);
     let empty = entry_lines(
-        &Entry::Block { title: "What's New".into(), markdown: String::new() },
+        &Entry::Block {
+            title: "What's New".into(),
+            markdown: String::new(),
+        },
         &theme,
         24,
         1,
@@ -369,30 +542,51 @@ fn block_with_an_empty_body_emits_no_padding_rows() {
     );
     assert_eq!(
         texts(&empty),
-        vec!["".to_string(), rule.clone(), " What's New".to_string(), String::new(), rule.clone()],
+        vec![
+            "".to_string(),
+            rule.clone(),
+            " What's New".to_string(),
+            String::new(),
+            rule.clone()
+        ],
         "an empty body must add nothing between the title's trailing blank and the closing rule"
     );
 
     // Whitespace-only is the same case — the guard is `text.trim() === ""`, not `!text`.
     let blank = entry_lines(
-        &Entry::Block { title: "What's New".into(), markdown: "  \n\n \t".into() },
+        &Entry::Block {
+            title: "What's New".into(),
+            markdown: "  \n\n \t".into(),
+        },
         &theme,
         24,
         1,
         ImageOpts::default(),
     );
-    assert_eq!(texts(&blank), texts(&empty), "a whitespace-only body is a blank body");
+    assert_eq!(
+        texts(&blank),
+        texts(&empty),
+        "a whitespace-only body is a blank body"
+    );
 
     // MIRROR — a real body DOES bring the `paddingY` pair with it (`:352-361`), so the two
     // shapes differ by exactly the body plus its two blanks.
     let full = entry_lines(
-        &Entry::Block { title: "What's New".into(), markdown: "hello".into() },
+        &Entry::Block {
+            title: "What's New".into(),
+            markdown: "hello".into(),
+        },
         &theme,
         24,
         1,
         ImageOpts::default(),
     );
-    assert_eq!(full.len(), empty.len() + 3, "body + one blank above + one below: {:?}", texts(&full));
+    assert_eq!(
+        full.len(),
+        empty.len() + 3,
+        "body + one blank above + one below: {:?}",
+        texts(&full)
+    );
     assert_eq!(txt(&full[4]), "", "paddingY row above the body");
     assert_eq!(txt(&full[5]).trim(), "hello");
     assert_eq!(txt(&full[6]), "", "paddingY row below the body");

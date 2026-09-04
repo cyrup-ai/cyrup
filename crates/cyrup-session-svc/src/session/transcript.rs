@@ -32,7 +32,10 @@ impl AgentSession {
         // Emit `session_info_changed { name }` to every live subscription (Pi `_emit(event)`,
         // agent-session.ts:2714-2715); the `name` is re-read from the manager so it byte-matches Pi's
         // `getSessionName()` (an empty/whitespace name resolves to `None`).
-        self.fanout_emit(AgentSessionEvent::SessionInfoChanged { name: resolved.clone() }).await;
+        self.fanout_emit(AgentSessionEvent::SessionInfoChanged {
+            name: resolved.clone(),
+        })
+        .await;
         // EXT-011 — the SAME rename is an EXTENSION event upstream (`SessionInfoChangedEvent`,
         // `extensions/types.ts:571-575` @v0.83.0). The kind, the WIT export and the SDK hook all
         // existed; nothing EMITTED it, so a guest could subscribe to `session_info_changed` and
@@ -41,7 +44,10 @@ impl AgentSession {
         self.services
             .ext_host
             .dispatcher()
-            .dispatch_notify(&HostEvent::SessionInfoChanged { name: resolved }, &notify_cancel)
+            .dispatch_notify(
+                &HostEvent::SessionInfoChanged { name: resolved },
+                &notify_cancel,
+            )
             .await;
         Ok(())
     }
@@ -90,7 +96,9 @@ impl AgentSession {
                     .await
                     .and_then(|f| f.file_stem().map(|s| s.to_string_lossy().into_owned()))
                     .unwrap_or_else(|| self.session_id().as_str().to_string());
-                self.services.cwd.join(format!("cyrup-session-{basename}.html"))
+                self.services
+                    .cwd
+                    .join(format!("cyrup-session-{basename}.html"))
             }
         };
         std::fs::write(&out, html).map_err(|e| SessionServiceError::Io(e.to_string()))?;
@@ -128,7 +136,11 @@ impl AgentSession {
     /// second private copy here is precisely how the SEAM-060 omission survived on one side.
     pub async fn tree_json(&self) -> Vec<serde_json::Value> {
         let guard = self.manager.lock().await;
-        guard.tree().iter().map(crate::host_services::tree_node_to_json).collect()
+        guard
+            .tree()
+            .iter()
+            .map(crate::host_services::tree_node_to_json)
+            .collect()
     }
 
     /// The **flattened session DAG** for the `/tree` selector (feature #2): the manager's real branch
@@ -161,7 +173,11 @@ impl AgentSession {
     /// [`Self::last_assistant_text`].
     pub async fn entry_copy_text(&self, entry_id: &EntryId) -> Option<String> {
         let guard = self.manager.lock().await;
-        guard.entries().iter().find(|e| &e.id() == entry_id).and_then(dag_copy_text)
+        guard
+            .entries()
+            .iter()
+            .find(|e| &e.id() == entry_id)
+            .and_then(dag_copy_text)
     }
 }
 
@@ -190,7 +206,11 @@ fn flatten_dag_node(
         foldable: !node.children.is_empty(),
         is_leaf: leaf == Some(&id),
         has_label: node.label.is_some(),
-        timestamp: node.entry.base().map(|b| b.timestamp.clone()).unwrap_or_default(),
+        timestamp: node
+            .entry
+            .base()
+            .map(|b| b.timestamp.clone())
+            .unwrap_or_default(),
     });
     for child in &node.children {
         flatten_dag_node(child, Some(id.clone()), depth + 1, leaf, out);
@@ -210,20 +230,26 @@ fn dag_display(e: &cyrup_session::Entry) -> (SessionDagKind, String) {
     };
     match e {
         Entry::Known(KnownEntry::Message { message, .. }) => match message {
-            SessMsg::Core(Message::User { content, .. }) => {
-                (SessionDagKind::Message, clip(format!("user: {}", normalize(&join_text(content)))))
-            }
+            SessMsg::Core(Message::User { content, .. }) => (
+                SessionDagKind::Message,
+                clip(format!("user: {}", normalize(&join_text(content)))),
+            ),
             SessMsg::Core(Message::Assistant(m)) => {
                 let text = normalize(&join_text(&m.content));
-                let body = if text.is_empty() { "(no content)".to_string() } else { text };
+                let body = if text.is_empty() {
+                    "(no content)".to_string()
+                } else {
+                    text
+                };
                 (SessionDagKind::Message, clip(format!("assistant: {body}")))
             }
             SessMsg::Core(Message::ToolResult { tool_name, .. }) => {
                 (SessionDagKind::Tool, format!("[{tool_name}]"))
             }
-            SessMsg::BashExecution(b) => {
-                (SessionDagKind::Message, clip(format!("[bash]: {}", normalize(&b.command))))
-            }
+            SessMsg::BashExecution(b) => (
+                SessionDagKind::Message,
+                clip(format!("[bash]: {}", normalize(&b.command))),
+            ),
             SessMsg::Custom(c) => (SessionDagKind::Message, format!("[{}]", c.custom_type)),
             // Pi's `AgentMessage` union also admits the two summary roles inside a `type:"message"`
             // entry; label them like the equivalent standalone entries.
@@ -231,34 +257,36 @@ fn dag_display(e: &cyrup_session::Entry) -> (SessionDagKind, String) {
                 SessionDagKind::Compaction,
                 clip(format!("branch summary: {}", normalize(&b.summary))),
             ),
-            SessMsg::CompactionSummary(_) => {
-                (SessionDagKind::Compaction, "compaction".to_string())
-            }
+            SessMsg::CompactionSummary(_) => (SessionDagKind::Compaction, "compaction".to_string()),
         },
         Entry::Known(KnownEntry::ModelChange { model_id, .. }) => {
             (SessionDagKind::ModelChange, format!("model → {model_id}"))
         }
-        Entry::Known(KnownEntry::ThinkingLevelChange { thinking_level, .. }) => {
-            (SessionDagKind::ThinkingChange, format!("thinking → {thinking_level}"))
-        }
+        Entry::Known(KnownEntry::ThinkingLevelChange { thinking_level, .. }) => (
+            SessionDagKind::ThinkingChange,
+            format!("thinking → {thinking_level}"),
+        ),
         Entry::Known(KnownEntry::Compaction { .. }) => {
             (SessionDagKind::Compaction, "compaction".to_string())
         }
-        Entry::Known(KnownEntry::BranchSummary { summary, .. }) => {
-            (SessionDagKind::Compaction, clip(format!("branch summary: {}", normalize(summary))))
-        }
-        Entry::Known(KnownEntry::SessionInfo { name, .. }) => {
-            (SessionDagKind::Other, format!("title: {}", name.clone().unwrap_or_default()))
-        }
+        Entry::Known(KnownEntry::BranchSummary { summary, .. }) => (
+            SessionDagKind::Compaction,
+            clip(format!("branch summary: {}", normalize(summary))),
+        ),
+        Entry::Known(KnownEntry::SessionInfo { name, .. }) => (
+            SessionDagKind::Other,
+            format!("title: {}", name.clone().unwrap_or_default()),
+        ),
         Entry::Known(KnownEntry::CustomMessage { custom_type, .. }) => {
             (SessionDagKind::Other, format!("[{custom_type}]"))
         }
         Entry::Known(KnownEntry::Custom { custom_type, .. }) => {
             (SessionDagKind::Other, format!("custom {custom_type}"))
         }
-        Entry::Known(KnownEntry::Label { label, .. }) => {
-            (SessionDagKind::Other, format!("label {}", label.clone().unwrap_or_default()))
-        }
+        Entry::Known(KnownEntry::Label { label, .. }) => (
+            SessionDagKind::Other,
+            format!("label {}", label.clone().unwrap_or_default()),
+        ),
         Entry::Unknown(_) => (SessionDagKind::Other, "(entry)".to_string()),
     }
 }
@@ -286,7 +314,9 @@ fn extract_full_content(content: &serde_json::Value) -> String {
     if let Some(s) = content.as_str() {
         return s.to_string();
     }
-    let Some(blocks) = content.as_array() else { return String::new() };
+    let Some(blocks) = content.as_array() else {
+        return String::new();
+    };
     blocks
         .iter()
         .filter(|b| b.get("type").and_then(serde_json::Value::as_str) == Some("text"))
@@ -328,7 +358,11 @@ fn dag_copy_text(e: &cyrup_session::Entry) -> Option<String> {
                 // `:904-906` — the `errorMessage` fallback fires only when the extracted text is
                 // empty AND the role is `assistant`.
                 let body = join_text(&m.content);
-                if body.is_empty() { m.error_message.clone() } else { Some(body) }
+                if body.is_empty() {
+                    m.error_message.clone()
+                } else {
+                    Some(body)
+                }
             }
             SessMsg::Custom(c) => Some(extract_full_content(&c.content)),
             SessMsg::BranchSummary(_) | SessMsg::CompactionSummary(_) => None,
@@ -349,8 +383,12 @@ fn dag_copy_text(e: &cyrup_session::Entry) -> Option<String> {
 pub(super) fn user_message_text(e: &cyrup_session::Entry) -> Option<String> {
     use cyrup_session::agent_message::AgentMessage as SessMsg;
     use cyrup_session::entry::{Entry, KnownEntry};
-    let Entry::Known(KnownEntry::Message { message, .. }) = e else { return None };
-    let SessMsg::Core(Message::User { content, .. }) = message else { return None };
+    let Entry::Known(KnownEntry::Message { message, .. }) = e else {
+        return None;
+    };
+    let SessMsg::Core(Message::User { content, .. }) = message else {
+        return None;
+    };
     let text: String = content
         .iter()
         .filter_map(|c| match c {

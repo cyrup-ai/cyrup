@@ -76,8 +76,12 @@ impl AgentSession {
         let models = self.full_model_registry();
         let mgr = self.manager.lock().await;
         let scan = crate::state::cache_scan_entries(mgr.entries());
-        let last = scan.iter().rposition(|e| matches!(e, CacheScanEntry::Assistant(_)))?;
-        cyrup_provider::cache_stats::collect_cache_misses(&scan, &models).get(&last).copied()
+        let last = scan
+            .iter()
+            .rposition(|e| matches!(e, CacheScanEntry::Assistant(_)))?;
+        cyrup_provider::cache_stats::collect_cache_misses(&scan, &models)
+            .get(&last)
+            .copied()
     }
 
     /// The `contextUsage` sub-object of [`Self::session_stats`], in Pi's `ContextUsage` shape
@@ -120,15 +124,17 @@ impl AgentSession {
 
     /// `true` when this branch's occupied-token count can be trusted — i.e. there is no compaction
     /// on the branch, or an assistant has responded since the latest one (Pi
-    /// `getContextUsage`'s `hasPostCompactionUsage` scan, agent-session.ts:3181-3193).
+    /// `getContextUsage`'s `hasPostCompactionUsage` scan, agent-session.ts:3181-3193 @v0.83.0,
+    /// `:3390-3403` @v0.84.4). Branch isolation is pinned by `tests/context_usage_branch.rs`
+    /// (SEAM-115).
     ///
     /// Scans backwards from the branch tail to the compaction boundary, matching Pi's loop
     /// direction, and accepts the first assistant that neither aborted nor errored and whose usage
     /// accounts for a non-zero context.
     async fn has_post_compaction_usage(&self) -> bool {
         use cyrup_core::StopReason;
-        use cyrup_session::entry::{Entry, KnownEntry};
         use cyrup_session::AgentMessage;
+        use cyrup_session::entry::{Entry, KnownEntry};
 
         let guard = self.manager.lock().await;
         // Pi scans `sessionManager.getBranch()` (agent-session.ts:3174, indexed at :3181-3193) —
@@ -169,7 +175,7 @@ impl AgentSession {
     }
 
     /// Context-window occupancy from the last assistant turn (Pi `getContextUsage`,
-    /// agent-session.ts:3164-3208 @v0.83.0).
+    /// agent-session.ts:3164-3208 @v0.83.0; byte-identical at `:3375-3413` @v0.84.4).
     ///
     /// Answers from a **reverse walk of the active branch's entries** — Pi's own
     /// `sessionManager.getBranch()` shape (`:3174`) — never from a rebuilt message list. The
@@ -180,8 +186,8 @@ impl AgentSession {
     /// TUI run-loop task (TUI-092 F4).
     pub async fn context_usage(&self) -> crate::state::ContextUsage {
         use cyrup_core::StopReason;
-        use cyrup_session::entry::{Entry, KnownEntry};
         use cyrup_session::AgentMessage;
+        use cyrup_session::entry::{Entry, KnownEntry};
 
         // Pi `getContextUsage`: `const model = this.model; if (!model) return undefined;`
         // (agent-session.ts:3165-3166) and `if (contextWindow <= 0) return undefined;` (:3168-3169).
@@ -190,7 +196,11 @@ impl AgentSession {
         // and no lock-nesting question arises at all. cyrup's return type is non-optional, so the
         // modelless case degrades to a zero window, which `from_last_assistant` already renders as
         // fraction 0.0 — the same "unknown occupancy" the TUI shows for an undefined usage.
-        let window = { Self::lock(&self.compaction_model).as_ref().map_or(0, |m| m.context_window) };
+        let window = {
+            Self::lock(&self.compaction_model)
+                .as_ref()
+                .map_or(0, |m| m.context_window)
+        };
 
         let guard = self.manager.lock().await;
         // The last assistant ON THE ACTIVE BRANCH, by parent-link walk — the same answer
@@ -230,7 +240,8 @@ impl AgentSession {
         let stats = self.session_stats().await;
         let messages = self.messages().await;
         // ONE producer for occupancy, as upstream has: Pi's `getSessionStats` does not re-derive it
-        // either, it returns `contextUsage: this.getContextUsage()` (agent-session.ts:3170).
+        // either, it returns `contextUsage: this.getContextUsage()` (agent-session.ts:3160
+        // @v0.83.0, `:3371` @v0.84.4). Pinned by `tests/context_usage_branch.rs` (SEAM-115).
         // Deriving it inline here duplicated the pre-F4 windowed-build scan, so it disagreed with
         // `GetContextUsage` whenever a compaction's kept window held no assistant while an earlier
         // pre-compaction assistant existed — including every unresolvable-v1 `first_kept_entry_id`

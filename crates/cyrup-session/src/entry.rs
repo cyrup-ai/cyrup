@@ -49,7 +49,11 @@ pub struct EntryBase {
 // (unstable) at every match site — same rationale as `Entry` below.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum KnownEntry {
     Message {
         #[serde(flatten)]
@@ -261,9 +265,7 @@ impl Entry {
     pub fn parent_id(&self) -> Option<EntryId> {
         match self {
             Entry::Known(k) => k.base().parent_id.clone(),
-            Entry::Unknown(v) => {
-                v.get("parentId").and_then(Value::as_str).map(EntryId::from)
-            }
+            Entry::Unknown(v) => v.get("parentId").and_then(Value::as_str).map(EntryId::from),
         }
     }
 

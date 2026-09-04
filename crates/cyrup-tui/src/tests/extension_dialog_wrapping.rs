@@ -9,13 +9,18 @@
 //! Mirrors `extension_dialog_countdown.rs`'s harness (`buf_text`, `TestBackend`) for the same reason:
 //! a real ratatui render into a fixed-size buffer, not a unit test on the wrapping arithmetic alone.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
+use super::harness::*;
+use crate::{App, SelectorKind, UiTheme};
 use cyrup_ext::host::DialogOptions;
 use cyrup_session_svc::{UiKind, UiRequest};
-use crate::{App, SelectorKind, UiTheme};
 use ratatui::backend::TestBackend;
-use super::harness::*;
 
 /// A confirm dialog's message is long enough that it CANNOT fit on a single 60-column row (nor
 /// alongside the title on the same row) — Pi's exact join is `` `${title}\n${message}` ``
@@ -35,11 +40,17 @@ fn extension_confirm_dialog_wraps_a_long_message_instead_of_truncating_it() {
         options: serde_json::Value::Null,
         message: long_message.to_string(),
         placeholder: None,
-        opts: DialogOptions { timeout_ms: None, signal_id: None },
+        opts: DialogOptions {
+            timeout_ms: None,
+            signal_id: None,
+        },
         reply: tx,
     };
     app.open_extension_dialog(req);
-    assert_eq!(app.active_selector_kind(), Some(SelectorKind::ExtensionConfirm));
+    assert_eq!(
+        app.active_selector_kind(),
+        Some(SelectorKind::ExtensionConfirm)
+    );
     app.draw().unwrap();
     let text = buf_text(&app);
     assert!(text.contains("Proceed?"), "the title survives:\n{text}");
@@ -63,11 +74,17 @@ fn extension_input_dialog_wraps_a_long_title_instead_of_truncating_it() {
         options: serde_json::Value::Null,
         message: String::new(),
         placeholder: None,
-        opts: DialogOptions { timeout_ms: None, signal_id: None },
+        opts: DialogOptions {
+            timeout_ms: None,
+            signal_id: None,
+        },
         reply: tx,
     };
     app.open_extension_dialog(req);
-    assert_eq!(app.active_selector_kind(), Some(SelectorKind::ExtensionInput));
+    assert_eq!(
+        app.active_selector_kind(),
+        Some(SelectorKind::ExtensionInput)
+    );
     app.draw().unwrap();
     let text = buf_text(&app);
     assert!(
@@ -88,13 +105,19 @@ fn extension_confirm_dialog_short_title_still_uses_a_single_row() {
         options: serde_json::Value::Null,
         message: String::new(),
         placeholder: None,
-        opts: DialogOptions { timeout_ms: None, signal_id: None },
+        opts: DialogOptions {
+            timeout_ms: None,
+            signal_id: None,
+        },
         reply: tx,
     };
     app.open_extension_dialog(req);
     app.draw().unwrap();
     let text = buf_text(&app);
-    assert!(text.contains("Proceed?"), "the short title still renders:\n{text}");
+    assert!(
+        text.contains("Proceed?"),
+        "the short title still renders:\n{text}"
+    );
 }
 
 /// E6, at the CONSTRUCTION SITE. `TextInputSelector`'s hint row is built from its own `keymap`
@@ -120,14 +143,23 @@ fn extension_input_dialog_hint_row_uses_the_apps_live_keybindings_on_the_first_p
         options: serde_json::Value::Null,
         message: String::new(),
         placeholder: None,
-        opts: DialogOptions { timeout_ms: None, signal_id: None },
+        opts: DialogOptions {
+            timeout_ms: None,
+            signal_id: None,
+        },
         reply: tx,
     };
     app.open_extension_dialog(req);
-    assert_eq!(app.active_selector_kind(), Some(SelectorKind::ExtensionInput));
+    assert_eq!(
+        app.active_selector_kind(),
+        Some(SelectorKind::ExtensionInput)
+    );
     app.draw().unwrap();
     let text = buf_text(&app);
-    assert!(text.contains("ctrl+j"), "submit names the user's own key:\n{text}");
+    assert!(
+        text.contains("ctrl+j"),
+        "submit names the user's own key:\n{text}"
+    );
     assert!(text.contains("ctrl+q"), "and so does cancel:\n{text}");
     assert!(
         !text.contains("enter submit") && !text.contains("esc  cancel"),

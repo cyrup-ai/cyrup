@@ -3,12 +3,17 @@
 //! the input slot and inspect the buffer). Asserts the buffer carries the fuzzy **search box**, a `✓`
 //! on the **active** model, and a `[provider]` badge per row — the pieces the audit found missing when
 //! `/model` degraded to a bare titled list (Pi `model-selector.ts:229-283`, spec/tui/05 §5.2).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
+use super::harness::*;
 use crate::crossterm::event::KeyCode;
 use crate::{App, ModelEntry, SelectorKind, UiTheme};
 use ratatui::backend::TestBackend;
-use super::harness::*;
 
 fn catalog() -> Vec<ModelEntry> {
     vec![
@@ -62,18 +67,42 @@ fn assembled_model_selector_open_shows_search_check_and_provider_badges() {
         screen.lines().any(|l| l.starts_with("> ")),
         "search box `\"> \"` prompt missing from assembled buffer:\n{screen}"
     );
-    assert!(!screen.contains('\u{258f}'), "no U+258F bars anywhere:\n{screen}");
+    assert!(
+        !screen.contains('\u{258f}'),
+        "no U+258F bars anywhere:\n{screen}"
+    );
     // A `[provider]` badge on every provider (Pi `:251`, muted).
-    assert!(screen.contains("[anthropic]"), "provider badge [anthropic] missing:\n{screen}");
-    assert!(screen.contains("[openai]"), "provider badge [openai] missing:\n{screen}");
-    assert!(screen.contains("[google]"), "provider badge [google] missing:\n{screen}");
+    assert!(
+        screen.contains("[anthropic]"),
+        "provider badge [anthropic] missing:\n{screen}"
+    );
+    assert!(
+        screen.contains("[openai]"),
+        "provider badge [openai] missing:\n{screen}"
+    );
+    assert!(
+        screen.contains("[google]"),
+        "provider badge [google] missing:\n{screen}"
+    );
     // The `✓` marks the active model (Pi `:252`, success).
-    assert!(screen.contains('✓'), "active-model check `✓` missing:\n{screen}");
+    assert!(
+        screen.contains('✓'),
+        "active-model check `✓` missing:\n{screen}"
+    );
     // The `→` selection cursor + `Model Name:` footer (Pi `:249`, `:282`).
-    assert!(screen.contains('→'), "selection cursor `→` missing:\n{screen}");
-    assert!(screen.contains("Model Name:"), "model-name footer missing:\n{screen}");
+    assert!(
+        screen.contains('→'),
+        "selection cursor `→` missing:\n{screen}"
+    );
+    assert!(
+        screen.contains("Model Name:"),
+        "model-name footer missing:\n{screen}"
+    );
     // The active model was sorted to the top and is the initial highlight.
-    assert!(screen.contains("claude-opus-4-6"), "active model row missing:\n{screen}");
+    assert!(
+        screen.contains("claude-opus-4-6"),
+        "active model row missing:\n{screen}"
+    );
 }
 
 #[test]
@@ -86,11 +115,17 @@ fn assembled_model_selector_typing_filters_the_live_render() {
     }
     app.draw().unwrap();
     let screen = buf_text(&app);
-    assert!(screen.contains("gpt-5.1"), "typed query did not surface the gpt row:\n{screen}");
+    assert!(
+        screen.contains("gpt-5.1"),
+        "typed query did not surface the gpt row:\n{screen}"
+    );
     assert!(
         !screen.contains("gemini-3-pro"),
         "fuzzy filter did not drop the non-matching gemini row:\n{screen}"
     );
     // The typed query is echoed in the search box.
-    assert!(screen.contains("gpt"), "typed query missing from the search box:\n{screen}");
+    assert!(
+        screen.contains("gpt"),
+        "typed query missing from the search box:\n{screen}"
+    );
 }

@@ -14,15 +14,18 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::context::Context;
 use crate::model::{Modality, Model, ModelCost};
 use crate::stream::StreamOptions;
-use crate::utils::simple_options::{build_base_options, SimpleStreamOptions};
+use crate::utils::simple_options::{SimpleStreamOptions, build_base_options};
 
 fn sampling(pairs: &[(&str, Value)]) -> Map<String, Value> {
-    pairs.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect()
+    pairs
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), v.clone()))
+        .collect()
 }
 
 /// pi `makeContext()` — one user message.
@@ -84,9 +87,16 @@ fn capture_completions_payload(model: &Model, options: SimpleStreamOptions) -> V
     crate::api::openai_completions::build_body(model, &ctx, &lowered)
 }
 
-fn simple_with(sampling_params: Option<Map<String, Value>>, temperature: Option<f32>) -> SimpleStreamOptions {
+fn simple_with(
+    sampling_params: Option<Map<String, Value>>,
+    temperature: Option<f32>,
+) -> SimpleStreamOptions {
     SimpleStreamOptions {
-        base: StreamOptions { sampling_params, temperature, ..Default::default() },
+        base: StreamOptions {
+            sampling_params,
+            temperature,
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
@@ -101,12 +111,20 @@ fn agent026_merges_stream_option_sampling_params_into_the_request_body() {
     let body = capture_completions_payload(
         &model,
         simple_with(
-            Some(sampling(&[("top_p", json!(0.95)), ("top_k", json!(0)), ("min_p", json!(0))])),
+            Some(sampling(&[
+                ("top_p", json!(0.95)),
+                ("top_k", json!(0)),
+                ("min_p", json!(0)),
+            ])),
             None,
         ),
     );
     assert_eq!(body.get("top_p"), Some(&json!(0.95)));
-    assert_eq!(body.get("top_k"), Some(&json!(0)), "a zero-valued key must still be sent");
+    assert_eq!(
+        body.get("top_k"),
+        Some(&json!(0)),
+        "a zero-valued key must still be sent"
+    );
     assert_eq!(body.get("min_p"), Some(&json!(0)));
 }
 
@@ -123,8 +141,10 @@ fn agent026_omits_sampling_params_when_neither_side_sets_them() {
 /// at all, and the reason the merge lives in `build_base_options` rather than in each adapter.
 #[test]
 fn agent026_applies_model_level_sampling_params() {
-    let model =
-        completions_model(Some(sampling(&[("temperature", json!(1)), ("top_p", json!(0.95))])));
+    let model = completions_model(Some(sampling(&[
+        ("temperature", json!(1)),
+        ("top_p", json!(0.95)),
+    ])));
     let body = capture_completions_payload(&model, SimpleStreamOptions::default());
     assert_eq!(body.get("temperature"), Some(&json!(1)));
     assert_eq!(body.get("top_p"), Some(&json!(0.95)));
@@ -134,13 +154,19 @@ fn agent026_applies_model_level_sampling_params() {
 /// the `top_p` assertion and fails `min_p`, which is exactly why pi asserts both.
 #[test]
 fn agent026_stream_option_keys_override_model_level_keys_per_key() {
-    let model =
-        completions_model(Some(sampling(&[("top_p", json!(0.95)), ("min_p", json!(0.05))])));
+    let model = completions_model(Some(sampling(&[
+        ("top_p", json!(0.95)),
+        ("min_p", json!(0.05)),
+    ])));
     let body = capture_completions_payload(
         &model,
         simple_with(Some(sampling(&[("top_p", json!(0.5))])), None),
     );
-    assert_eq!(body.get("top_p"), Some(&json!(0.5)), "the per-request key wins");
+    assert_eq!(
+        body.get("top_p"),
+        Some(&json!(0.5)),
+        "the per-request key wins"
+    );
     assert_eq!(
         body.get("min_p"),
         Some(&json!(0.05)),
@@ -169,11 +195,12 @@ fn agent026_sampling_params_are_ignored_by_non_openai_compatible_apis() {
     let ctx = make_context();
 
     let openai = completions_model(None);
-    let present = capture_completions_payload(
-        &openai,
-        simple_with(Some(params.clone()), None),
+    let present = capture_completions_payload(&openai, simple_with(Some(params.clone()), None));
+    assert_eq!(
+        present.get("top_p"),
+        Some(&json!(0.9)),
+        "control: the openai route DOES send it"
     );
-    assert_eq!(present.get("top_p"), Some(&json!(0.9)), "control: the openai route DOES send it");
 
     let model = anthropic_model();
     let lowered = build_base_options(

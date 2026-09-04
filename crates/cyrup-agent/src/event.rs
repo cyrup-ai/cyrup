@@ -4,9 +4,9 @@
 //! Pi-interop (R-00-013).
 
 use cyrup_core::{AssistantMessage, Content, SharedStr, ToolCallId, Usage};
-use std::sync::Arc;
 use cyrup_provider::StreamEvent;
 use serde_json::Value;
+use std::sync::Arc;
 
 /// A message in the agent transcript: a real LLM message (`user`/`assistant`/`toolResult`) OR an
 /// app/extension message that is NOT sent to the model verbatim (func-02 R-02-052).
@@ -96,8 +96,11 @@ pub enum AppRole {
 }
 
 impl AppRole {
-    pub const ALL: [AppRole; 3] =
-        [AppRole::BashExecution, AppRole::BranchSummary, AppRole::CompactionSummary];
+    pub const ALL: [AppRole; 3] = [
+        AppRole::BashExecution,
+        AppRole::BranchSummary,
+        AppRole::CompactionSummary,
+    ];
 
     /// The pi `role` tag — the exact wire string.
     pub const fn as_str(self) -> &'static str {
@@ -137,9 +140,16 @@ impl serde::Serialize for AgentMessage {
         /// Byte-identical to the old derive for every arm it carries. `AgentMessage::Assistant` is
         /// deliberately absent: that arm is the one whose payload self-tags.
         #[derive(serde::Serialize)]
-        #[serde(tag = "role", rename_all = "camelCase", rename_all_fields = "camelCase")]
+        #[serde(
+            tag = "role",
+            rename_all = "camelCase",
+            rename_all_fields = "camelCase"
+        )]
         enum TaggedNonAssistant<'a> {
-            User { content: &'a Vec<Content>, timestamp: &'a Option<i64> },
+            User {
+                content: &'a Vec<Content>,
+                timestamp: &'a Option<i64>,
+            },
             ToolResult(&'a ToolResultMessage),
             Custom {
                 kind: &'a str,
@@ -159,9 +169,18 @@ impl serde::Serialize for AgentMessage {
                 TaggedNonAssistant::User { content, timestamp }.serialize(serializer)
             }
             AgentMessage::ToolResult(m) => TaggedNonAssistant::ToolResult(m).serialize(serializer),
-            AgentMessage::Custom { kind, payload, details, timestamp } => {
-                TaggedNonAssistant::Custom { kind, payload, details, timestamp }.serialize(serializer)
+            AgentMessage::Custom {
+                kind,
+                payload,
+                details,
+                timestamp,
+            } => TaggedNonAssistant::Custom {
+                kind,
+                payload,
+                details,
+                timestamp,
             }
+            .serialize(serializer),
             // SESS-043 — the payload IS the pi wire object (`role` included), so it is emitted as
             // it stands; `role` is held out separately only so this crate can classify without
             // parsing. Key order is `serde_json::Map`'s, not pi's — see the variant's docs.
@@ -185,7 +204,11 @@ impl<'de> serde::Deserialize<'de> for AgentMessage {
 
         /// The four typed arms, attribute-for-attribute the old derive.
         #[derive(serde::Deserialize)]
-        #[serde(tag = "role", rename_all = "camelCase", rename_all_fields = "camelCase")]
+        #[serde(
+            tag = "role",
+            rename_all = "camelCase",
+            rename_all_fields = "camelCase"
+        )]
         enum Typed {
             User {
                 content: Vec<Content>,
@@ -205,28 +228,45 @@ impl<'de> serde::Deserialize<'de> for AgentMessage {
         }
 
         let v = Value::deserialize(d)?;
-        if let Some(role) = v.get("role").and_then(Value::as_str).and_then(AppRole::parse) {
+        if let Some(role) = v
+            .get("role")
+            .and_then(Value::as_str)
+            .and_then(AppRole::parse)
+        {
             let Value::Object(payload) = v else {
                 // Unreachable: `v.get` only yields on an object.
                 return Err(D::Error::custom("agent message must be a JSON object"));
             };
             return Ok(AgentMessage::App { role, payload });
         }
-        Ok(match serde_json::from_value::<Typed>(v).map_err(D::Error::custom)? {
-            Typed::User { content, timestamp } => AgentMessage::User { content, timestamp },
-            Typed::Assistant(a) => AgentMessage::Assistant(Arc::new(a)),
-            Typed::ToolResult(t) => AgentMessage::ToolResult(t),
-            Typed::Custom { kind, payload, details, timestamp } => {
-                AgentMessage::Custom { kind, payload, details, timestamp }
-            }
-        })
+        Ok(
+            match serde_json::from_value::<Typed>(v).map_err(D::Error::custom)? {
+                Typed::User { content, timestamp } => AgentMessage::User { content, timestamp },
+                Typed::Assistant(a) => AgentMessage::Assistant(Arc::new(a)),
+                Typed::ToolResult(t) => AgentMessage::ToolResult(t),
+                Typed::Custom {
+                    kind,
+                    payload,
+                    details,
+                    timestamp,
+                } => AgentMessage::Custom {
+                    kind,
+                    payload,
+                    details,
+                    timestamp,
+                },
+            },
+        )
     }
 }
 
 impl AgentMessage {
     /// Convenience: a plain user text message.
     pub fn user_text(text: impl Into<SharedStr>) -> Self {
-        AgentMessage::User { content: vec![Content::text(text)], timestamp: None }
+        AgentMessage::User {
+            content: vec![Content::text(text)],
+            timestamp: None,
+        }
     }
 
     pub fn is_assistant(&self) -> bool {
@@ -266,7 +306,11 @@ pub struct ToolResultMessage {
 /// `rename_all_fields` makes PAYLOAD fields camelCase (`assistantMessageEvent`, `toolCallId`,
 /// `toolName`, `partialResult`, `isError`, `toolResults`) for Pi-interop (R-00-013).
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum AgentEvent {
     AgentStart,
     TurnStart,

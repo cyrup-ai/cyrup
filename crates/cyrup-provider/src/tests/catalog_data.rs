@@ -85,8 +85,8 @@ fn catalog_dir() -> std::path::PathBuf {
 fn catalogs() -> Vec<(String, String)> {
     let mut out = Vec::new();
     let dir = catalog_dir();
-    for entry in std::fs::read_dir(&dir)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
+    for entry in
+        std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
     {
         let path = entry.expect("dir entry").path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
@@ -147,10 +147,17 @@ fn every_embedded_catalog_parses_non_empty() {
         }
         let models: Vec<Model> = serde_json::from_str(&blob)
             .unwrap_or_else(|e| panic!("catalog {name}.json failed to parse: {e}"));
-        assert!(!models.is_empty(), "catalog {name}.json parsed to ZERO models");
+        assert!(
+            !models.is_empty(),
+            "catalog {name}.json parsed to ZERO models"
+        );
         for m in &models {
             assert!(!m.id.as_str().is_empty(), "{name}: empty model id");
-            assert!(m.context_window > 0, "{name}: {} has zero contextWindow", m.id);
+            assert!(
+                m.context_window > 0,
+                "{name}: {} has zero contextWindow",
+                m.id
+            );
             // Azure is the one provider whose endpoint is per-deployment and therefore supplied by
             // the user at runtime — pi's generated catalog ships `baseUrl: ""` for all 42 entries
             // (`azure-openai-responses.models.ts` @ `91585d9a`). Everywhere else an empty baseUrl
@@ -261,23 +268,67 @@ fn the_catalog_manifest_matches_the_file_set() {
     // The floor must be the LATEST extraction revision. b0c2a90e (2026-07-17T09:00:03Z) is the
     // newest any embedded catalog was taken from — see providers/google_vertex.rs's provenance
     // note — so an overlay dated between 2026-07-10 and that must be DISCARDED, not accepted.
-    let generated_at = crate::providers::all::builtin_model_data_generated_at()
-        .expect("generatedAt parses");
+    let generated_at =
+        crate::providers::all::builtin_model_data_generated_at().expect("generatedAt parses");
     let jul_17 = 1_784_278_803_000_i64; // 2026-07-17T09:00:03Z
-    assert_eq!(generated_at, jul_17, "the floor must be b0c2a90e's timestamp");
+    assert_eq!(
+        generated_at, jul_17,
+        "the floor must be b0c2a90e's timestamp"
+    );
 }
 
-/// The same guard one level up: every *registered* provider must expose a non-empty catalog. Catches
-/// a loader wired to the wrong file as well as a bad blob.
+/// Registered providers with NO embedded catalog, by design — each with the upstream fact that
+/// makes it so. This list is asserted in BOTH directions below: an id here must really be empty,
+/// and an empty provider must really be here, so an accidentally empty catalog still fails.
+///
+/// * `radius` — pi's only dynamic built-in, "purely dynamic providers (e.g. `radius`) that have
+///   no static catalog entry" (`all.ts:50-52` @v0.84.4); the catalog comes from the gateway's
+///   `/v1/config` (`providers/radius.rs`). PROV-014.
+/// * `qwen-token-plan`, `qwen-token-plan-cn`, `qwen-token-plan-individual` — pi's rows are
+///   models.dev data generated into a gitignored file, and the providers post-date `b0c2a90e`, the
+///   last revision at which any catalog was a data literal; see `providers/fleet.rs`'s module doc.
+///   PROV-014.
+pub(crate) const DYNAMIC_ONLY_PROVIDERS: &[&str] = &[
+    "qwen-token-plan",
+    "qwen-token-plan-cn",
+    "qwen-token-plan-individual",
+    "radius",
+];
+
+/// The same guard one level up: every *registered* provider must expose a non-empty catalog —
+/// except the [`DYNAMIC_ONLY_PROVIDERS`], which must expose an EMPTY one. Catches a loader wired
+/// to the wrong file as well as a bad blob, and a dynamic member that quietly grew embedded rows
+/// nobody sourced.
 #[test]
 fn every_registered_provider_has_a_non_empty_catalog() {
+    let mut empty: Vec<String> = Vec::new();
     for p in all_providers() {
+        let id = p.id().as_str().to_string();
+        if DYNAMIC_ONLY_PROVIDERS.contains(&id.as_str()) {
+            assert!(
+                p.models().is_empty(),
+                "provider {id} is listed as dynamic-only but ships {} embedded rows — either \
+                 source them and remove it from DYNAMIC_ONLY_PROVIDERS, or delete the rows",
+                p.models().len()
+            );
+            empty.push(id);
+            continue;
+        }
         assert!(
             !p.models().is_empty(),
-            "provider {} exposes zero models — catalog parse likely failed silently",
-            p.id()
+            "provider {id} exposes zero models — catalog parse likely failed silently"
         );
     }
+    empty.sort();
+    let mut expected: Vec<String> = DYNAMIC_ONLY_PROVIDERS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    expected.sort();
+    assert_eq!(
+        empty, expected,
+        "every dynamic-only provider must be registered, and nothing else may be empty"
+    );
 }
 
 // -------------------------------------------------------------------------- the selection seam --
@@ -316,7 +367,10 @@ fn sonnet_4_5_offers_the_full_1m_context_window() {
             m.context_window, 1_000_000,
             "{id}: pi anthropic.models.ts @91585d9a says contextWindow 1000000 (cc2db980)"
         );
-        assert_eq!(m.max_tokens, 64_000, "{id}: maxTokens is unchanged at 64000");
+        assert_eq!(
+            m.max_tokens, 64_000,
+            "{id}: maxTokens is unchanged at 64000"
+        );
     }
 }
 
@@ -357,7 +411,12 @@ fn retired_claude_models_are_gone() {
     // …and the surviving set is exactly pi's 14.
     assert_eq!(models.get_models(Some("anthropic")).len(), 14);
     // Every remaining Claude model is a reasoning model (pi @91585d9a: all 14 `reasoning: true`).
-    assert!(models.get_models(Some("anthropic")).iter().all(|m| m.reasoning));
+    assert!(
+        models
+            .get_models(Some("anthropic"))
+            .iter()
+            .all(|m| m.reasoning)
+    );
 }
 
 /// Models pi added in the missed window that cyrup users simply could not select. Sources:
@@ -393,8 +452,16 @@ fn models_added_upstream_are_now_selectable() {
     }
     // nvidia replaced GLM 5.1 with 5.2; openrouter renamed the poolside ids.
     assert!(models.get_model("nvidia", "z-ai/glm-5.1").is_none());
-    assert!(models.get_model("openrouter", "poolside/laguna-xs.2").is_none());
-    assert!(models.get_model("openrouter", "poolside/laguna-xs-2.1").is_some());
+    assert!(
+        models
+            .get_model("openrouter", "poolside/laguna-xs.2")
+            .is_none()
+    );
+    assert!(
+        models
+            .get_model("openrouter", "poolside/laguna-xs-2.1")
+            .is_some()
+    );
 }
 
 // ------------------------------------------------------------------------------- cost / capability --
@@ -406,7 +473,10 @@ fn models_added_upstream_are_now_selectable() {
 #[test]
 fn mistral_medium_reasons_and_is_priced_correctly() {
     let m = pick(&selection(), "mistral", "mistral-medium-latest");
-    assert!(m.reasoning, "pi mistral.models.ts @91585d9a: reasoning true");
+    assert!(
+        m.reasoning,
+        "pi mistral.models.ts @91585d9a: reasoning true"
+    );
     assert_eq!(m.cost.input, 1.5);
     assert_eq!(m.cost.output, 7.5);
     assert_eq!(m.cost.cache_read, 0.15);
@@ -420,7 +490,10 @@ fn mistral_medium_reasons_and_is_priced_correctly() {
 fn cache_read_rates_match_upstream() {
     let models = selection();
     let fw = pick(&models, "fireworks", "accounts/fireworks/models/glm-5p2");
-    assert_eq!(fw.cost.cache_read, 0.14, "cyrup over-reported this by 1.86x");
+    assert_eq!(
+        fw.cost.cache_read, 0.14,
+        "cyrup over-reported this by 1.86x"
+    );
 
     let vercel = pick(&models, "vercel-ai-gateway", "deepseek/deepseek-v4-flash");
     assert_eq!(
@@ -445,7 +518,12 @@ fn xiaomi_token_plans_are_prepaid_and_carry_no_api_billing_models() {
         assert!(!list.is_empty(), "{provider} has no models");
         for m in &list {
             assert_eq!(
-                (m.cost.input, m.cost.output, m.cost.cache_read, m.cost.cache_write),
+                (
+                    m.cost.input,
+                    m.cost.output,
+                    m.cost.cache_read,
+                    m.cost.cache_write
+                ),
                 (0.0, 0.0, 0.0, 0.0),
                 "{provider}/{}: token-plan usage is prepaid, pi zeroes all rates",
                 m.id
@@ -480,13 +558,20 @@ fn openrouter_context_windows_come_from_the_serving_provider() {
     // for `46145bef` itself.
     let flash = pick(&models, "openrouter", "deepseek/deepseek-v4-flash");
     assert_eq!(flash.max_tokens, 4_096, "openrouter.models.ts @b0c2a90e");
-    assert_eq!(flash.context_window, 1_048_575, "openrouter.models.ts @b0c2a90e");
+    assert_eq!(
+        flash.context_window, 1_048_575,
+        "openrouter.models.ts @b0c2a90e"
+    );
 
     let r1 = pick(&models, "openrouter", "deepseek/deepseek-r1");
     assert_eq!(r1.context_window, 64_000);
 
     // A transposed digit in the snapshot: 1048756 is not a power-of-two-ish window at all.
-    let gem = pick(&models, "openrouter", "google/gemini-3.1-pro-preview-customtools");
+    let gem = pick(
+        &models,
+        "openrouter",
+        "google/gemini-3.1-pro-preview-customtools",
+    );
     assert_eq!(gem.context_window, 1_048_576);
 }
 
@@ -1010,7 +1095,15 @@ fn gen_catalogs_check_reports_no_drift_against_the_pinned_revision() {
         .expect("workspace root");
     let out = std::process::Command::new(env!("CARGO"))
         .current_dir(root)
-        .args(["run", "--quiet", "-p", "xtask", "--", "gen-catalogs", "--check"])
+        .args([
+            "run",
+            "--quiet",
+            "-p",
+            "xtask",
+            "--",
+            "gen-catalogs",
+            "--check",
+        ])
         .output()
         .expect("cargo run -p xtask");
     assert!(

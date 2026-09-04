@@ -26,24 +26,25 @@ impl TranscriptView {
         args: Value,
         rendered: Option<String>,
     ) {
-        self.push_tool_start_defined(name, call_id, args, rendered, false);
+        self.push_tool_start_defined(name, call_id, args, rendered, None);
     }
 
-    /// [`Self::push_tool_start_rendered`] plus the has-a-DEFINITION answer for this tool name — Pi
-    /// `hasRendererDefinition()` (tool-execution.ts:103-105), see [`ToolRun::has_definition`].
+    /// [`Self::push_tool_start_rendered`] plus what the definition registry answered for this tool
+    /// name — Pi `hasRendererDefinition()` (tool-execution.ts:103-105) and `getRenderShell()`
+    /// (`:108-116`) in one value, see [`ToolRun::definition`].
     ///
-    /// The two forms above default it to `false`, which is the shape-preserving value for a caller
-    /// with no registry in hand: an unknown name keeps drawing through `formatToolExecution`. Every
-    /// production path has the session — [`crate::App::ingest_session_event_owned`] resolves it off
-    /// the live `getToolDefinition` registry per tool start, and the `/resume` replay walk reads the
-    /// set that same bind cached.
+    /// The two forms above default it to `None`, which is the shape-preserving value for a caller
+    /// with no registry in hand: an unknown name keeps drawing through `formatToolExecution`, and
+    /// a known one keeps its shell. Every production path has the session —
+    /// [`crate::App::ingest_session_event_owned`] resolves it off the live `getToolDefinition`
+    /// registry per tool start, and the `/resume` replay walk reads the map that same bind cached.
     pub fn push_tool_start_defined(
         &mut self,
         name: impl Into<String>,
         call_id: Option<String>,
         args: Value,
         rendered: Option<String>,
-        has_definition: bool,
+        definition: Option<ToolRenderKind>,
     ) {
         self.bump_render_generation();
         self.active_tools.push(ToolRun {
@@ -57,7 +58,7 @@ impl TranscriptView {
             duration_ms: None,
             rendered_call: rendered,
             rendered_result: None,
-            has_definition,
+            definition,
             preview: None,
             images: Vec::new(),
         });
@@ -72,7 +73,10 @@ impl TranscriptView {
     pub fn push_tool_update(&mut self, call_id: Option<&str>, partial: Option<Value>) {
         self.bump_render_generation();
         let run = match call_id {
-            Some(id) => self.active_tools.iter_mut().find(|r| !r.done && r.call_id.as_deref() == Some(id)),
+            Some(id) => self
+                .active_tools
+                .iter_mut()
+                .find(|r| !r.done && r.call_id.as_deref() == Some(id)),
             None => self.active_tools.iter_mut().rev().find(|r| !r.done),
         };
         if let Some(run) = run
@@ -111,9 +115,10 @@ impl TranscriptView {
     pub fn set_edit_preview(&mut self, call_id: Option<&str>, preview: Result<String, String>) {
         self.bump_render_generation();
         let run = match call_id {
-            Some(id) => {
-                self.active_tools.iter_mut().find(|r| !r.done && r.call_id.as_deref() == Some(id))
-            }
+            Some(id) => self
+                .active_tools
+                .iter_mut()
+                .find(|r| !r.done && r.call_id.as_deref() == Some(id)),
             None => self.active_tools.iter_mut().rev().find(|r| !r.done),
         };
         if let Some(run) = run {
@@ -127,7 +132,12 @@ impl TranscriptView {
     ///
     /// Prefer [`Self::push_tool_end_rendered`] with the result's `toolCallId` — see
     /// [`ToolRun::call_id`] and [`Self::pending_run_mut`].
-    pub fn push_tool_end(&mut self, name: impl Into<String>, is_error: bool, result: Option<Value>) {
+    pub fn push_tool_end(
+        &mut self,
+        name: impl Into<String>,
+        is_error: bool,
+        result: Option<Value>,
+    ) {
         self.bump_render_generation();
         self.push_tool_end_rendered(name, None, is_error, result, None);
     }
@@ -150,7 +160,10 @@ impl TranscriptView {
         let name = name.into();
         // Decode the result's `image` content blocks ONCE here (`tool-execution.ts:331-350`), not on
         // every frame — a screenshot-sized PNG must never be re-decoded per redraw.
-        let images = result.as_ref().map(decode_result_images).unwrap_or_default();
+        let images = result
+            .as_ref()
+            .map(decode_result_images)
+            .unwrap_or_default();
         if let Some(run) = self.pending_run_mut(&name, call_id) {
             run.done = true;
             run.is_error = is_error;
@@ -170,10 +183,10 @@ impl TranscriptView {
                 duration_ms: None,
                 rendered_call: None,
                 rendered_result: rendered,
-                // A result whose START was missed carries no registry answer; `false` keeps the
+                // A result whose START was missed carries no registry answer; `None` keeps the
                 // pre-existing `formatToolExecution` shape for an unknown name, and a built-in name
                 // is dispatched by the built-in table regardless.
-                has_definition: false,
+                definition: None,
                 preview: None,
                 images,
             });
@@ -209,7 +222,11 @@ impl TranscriptView {
                     .rev()
                     .find(|r| !r.done && r.call_id.is_none() && r.name == name)
             }
-            None => self.active_tools.iter_mut().rev().find(|r| !r.done && r.name == name),
+            None => self
+                .active_tools
+                .iter_mut()
+                .rev()
+                .find(|r| !r.done && r.name == name),
         }
     }
 

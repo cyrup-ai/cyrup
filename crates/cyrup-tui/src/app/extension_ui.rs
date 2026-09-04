@@ -27,80 +27,96 @@ impl<B: Backend> App<B> {
             let _ = req.reply.send(default_ui_reply(req.kind));
             return;
         }
-        let UiRequest { kind, prompt, options, message, placeholder, opts, reply } = req;
-        let (selector_kind, base_title, mut inner): (SelectorKind, String, Box<dyn Selector>) = match kind
-        {
-            UiKind::Confirm => {
-                // Pi's EXACT join (`showExtensionConfirm`, `interactive-mode.ts:2177`):
-                // `` `${title}\n${message}` `` — a real newline, not an em-dash. The title area
-                // now auto-sizes + word-wraps (`ListSelector::desired_height`/`render`,
-                // `title_wrapped_height`) so a long title and/or multi-line message both render in
-                // full instead of being clipped to one row (L4 review §2.6).
-                let title = if message.is_empty() { prompt } else { format!("{prompt}\n{message}") };
-                let rows = vec![
-                    ("yes".to_string(), "Yes".to_string(), None),
-                    ("no".to_string(), "No".to_string(), None),
-                ];
-                (
-                    SelectorKind::ExtensionConfirm,
-                    title.clone(),
-                    Box::new(ListSelector::prompt(title, rows, 0).with_upstream_chrome(
+        let UiRequest {
+            kind,
+            prompt,
+            options,
+            message,
+            placeholder,
+            opts,
+            reply,
+        } = req;
+        let (selector_kind, base_title, mut inner): (SelectorKind, String, Box<dyn Selector>) =
+            match kind {
+                UiKind::Confirm => {
+                    // Pi's EXACT join (`showExtensionConfirm`, `interactive-mode.ts:2177`):
+                    // `` `${title}\n${message}` `` — a real newline, not an em-dash. The title area
+                    // now auto-sizes + word-wraps (`ListSelector::desired_height`/`render`,
+                    // `title_wrapped_height`) so a long title and/or multi-line message both render in
+                    // full instead of being clipped to one row (L4 review §2.6).
+                    let title = if message.is_empty() {
+                        prompt
+                    } else {
+                        format!("{prompt}\n{message}")
+                    };
+                    let rows = vec![
+                        ("yes".to_string(), "Yes".to_string(), None),
+                        ("no".to_string(), "No".to_string(), None),
+                    ];
+                    (
                         SelectorKind::ExtensionConfirm,
-                        &self.state.select_keymap,
-                    )),
-                )
-            }
-            UiKind::Select => {
-                // L4 review §4: an empty `options` list must still OPEN the dialog (Pi's
-                // `ExtensionSelectorComponent`, `extension-selector.ts:101-103`, renders whatever
-                // it's given including `[]`; Enter is a no-op with nothing selected, and resolution
-                // only ever happens via Esc/timeout/signal — same as any other select), not
-                // short-circuit to `None` before the guest's dialog is ever shown. `cyrup`'s RPC path
-                // (`rpc.rs`) already forwards `options: []` verbatim with no such short-circuit;
-                // `ListSelector`/`SelectList` already render an empty list safely (`"No matches"`,
-                // `current_value()` never panics) — no special-casing needed here beyond NOT
-                // early-returning.
-                let picked: Vec<String> = options
-                    .as_array()
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-                    .unwrap_or_default();
-                let rows: Vec<(String, String, Option<String>)> =
-                    picked.into_iter().map(|o| (o.clone(), o, None)).collect();
-                (
-                    SelectorKind::ExtensionSelect,
-                    prompt.clone(),
-                    Box::new(ListSelector::prompt(prompt, rows, 0).with_upstream_chrome(
+                        title.clone(),
+                        Box::new(ListSelector::prompt(title, rows, 0).with_upstream_chrome(
+                            SelectorKind::ExtensionConfirm,
+                            &self.state.select_keymap,
+                        )),
+                    )
+                }
+                UiKind::Select => {
+                    // L4 review §4: an empty `options` list must still OPEN the dialog (Pi's
+                    // `ExtensionSelectorComponent`, `extension-selector.ts:101-103`, renders whatever
+                    // it's given including `[]`; Enter is a no-op with nothing selected, and resolution
+                    // only ever happens via Esc/timeout/signal — same as any other select), not
+                    // short-circuit to `None` before the guest's dialog is ever shown. `cyrup`'s RPC path
+                    // (`rpc.rs`) already forwards `options: []` verbatim with no such short-circuit;
+                    // `ListSelector`/`SelectList` already render an empty list safely (`"No matches"`,
+                    // `current_value()` never panics) — no special-casing needed here beyond NOT
+                    // early-returning.
+                    let picked: Vec<String> = options
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let rows: Vec<(String, String, Option<String>)> =
+                        picked.into_iter().map(|o| (o.clone(), o, None)).collect();
+                    (
                         SelectorKind::ExtensionSelect,
-                        &self.state.select_keymap,
-                    )),
-                )
-            }
-            UiKind::Input => (
-                SelectorKind::ExtensionInput,
-                prompt.clone(),
-                // E6: the hint row is built from the LIVE `tui.select.*` table, so the first paint
-                // already names the user's own submit/cancel keys — upstream re-resolves `keyHint`
-                // on every render (`keybinding-hints.ts:34-44`) and so never shows stock defaults.
-                Box::new(
-                    TextInputSelector::new(prompt, placeholder)
-                        .with_keymap(&self.state.select_keymap),
+                        prompt.clone(),
+                        Box::new(ListSelector::prompt(prompt, rows, 0).with_upstream_chrome(
+                            SelectorKind::ExtensionSelect,
+                            &self.state.select_keymap,
+                        )),
+                    )
+                }
+                UiKind::Input => (
+                    SelectorKind::ExtensionInput,
+                    prompt.clone(),
+                    // E6: the hint row is built from the LIVE `tui.select.*` table, so the first paint
+                    // already names the user's own submit/cancel keys — upstream re-resolves `keyHint`
+                    // on every render (`keybinding-hints.ts:34-44`) and so never shows stock defaults.
+                    Box::new(
+                        TextInputSelector::new(prompt, placeholder)
+                            .with_keymap(&self.state.select_keymap),
+                    ),
                 ),
-            ),
-            // L4 review §3: the DEFAULT is an inline dialog (Pi's `ExtensionEditorComponent`,
-            // `extension-editor.ts`), not a teardown to `$EDITOR` — `title` on `prompt`, the seed
-            // text (Pi `prefill`) on `message` (L4 review §2's `editor(title, initial)` fix).
-            UiKind::Editor => (
-                SelectorKind::ExtensionEditor,
-                prompt.clone(),
-                // E9: the hint row is built from the LIVE `tui.select.*` + app tables, so the first
-                // paint already names the user's own keys (upstream re-resolves every `keyHint` on
-                // each render, `keybinding-hints.ts:34-44`).
-                Box::new(
-                    ExtensionEditorSelector::new(prompt, &message)
-                        .with_keymaps(&self.state.select_keymap, &self.state.keymap),
+                // L4 review §3: the DEFAULT is an inline dialog (Pi's `ExtensionEditorComponent`,
+                // `extension-editor.ts`), not a teardown to `$EDITOR` — `title` on `prompt`, the seed
+                // text (Pi `prefill`) on `message` (L4 review §2's `editor(title, initial)` fix).
+                UiKind::Editor => (
+                    SelectorKind::ExtensionEditor,
+                    prompt.clone(),
+                    // E9: the hint row is built from the LIVE `tui.select.*` + app tables, so the first
+                    // paint already names the user's own keys (upstream re-resolves every `keyHint` on
+                    // each render, `keybinding-hints.ts:34-44`).
+                    Box::new(
+                        ExtensionEditorSelector::new(prompt, &message)
+                            .with_keymaps(&self.state.select_keymap, &self.state.keymap),
+                    ),
                 ),
-            ),
-        };
+            };
         // Pi's `CountdownTimer` (`countdown-timer.ts:7-38`, wired by `ExtensionSelectorComponent`/
         // `ExtensionInputComponent`): a guest-set `opts.timeout_ms > 0` arms a live 1s-cadence
         // countdown, shown in the title from the INSTANT the dialog opens (Pi calls `onTick`
@@ -109,13 +125,20 @@ impl<B: Backend> App<B> {
         // showed the deadline `LiveHostServices::ui_roundtrip` already enforces host-side, and stayed
         // open on screen (stale) after that host-side timeout had already resolved the guest's call.
         let opened_at = tokio::time::Instant::now();
-        let deadline =
-            opts.timeout_ms.filter(|&ms| ms > 0).map(|ms| opened_at + Duration::from_millis(ms));
+        let deadline = opts
+            .timeout_ms
+            .filter(|&ms| ms > 0)
+            .map(|ms| opened_at + Duration::from_millis(ms));
         if let Some(deadline) = deadline {
             inner.set_title(countdown_title(&base_title, deadline, opened_at));
         }
         self.open_boxed_selector(selector_kind, inner);
-        self.state.pending_ui_reply = Some(PendingUiReply { kind, reply, base_title, deadline });
+        self.state.pending_ui_reply = Some(PendingUiReply {
+            kind,
+            reply,
+            base_title,
+            deadline,
+        });
     }
 
     /// Bind BOTH extension-UI seams of a session's host services to this run loop — the single place
@@ -176,7 +199,8 @@ impl<B: Backend> App<B> {
             &self.state.theme.name,
             switch,
         ));
-        services.attach_theme_access(Arc::clone(&access) as Arc<dyn cyrup_session_svc::ThemeAccess>);
+        services
+            .attach_theme_access(Arc::clone(&access) as Arc<dyn cyrup_session_svc::ThemeAccess>);
         self.state.theme_access = Some(access);
         // Seed both cells before the first extension can ask, rather than waiting for the first
         // frame: a boot-time `onSessionStart` handler runs before any draw.
@@ -195,7 +219,9 @@ impl<B: Backend> App<B> {
     /// extension `getExpandedText?.() ?? getText()` (`interactive-mode.ts:2393` @v0.84.2), i.e. with
     /// `[paste #N …]` markers substituted back to their full content.
     pub fn publish_extension_readbacks(&mut self) {
-        self.state.editor_mirror.publish(self.state.editor.expanded_text());
+        self.state
+            .editor_mirror
+            .publish(self.state.editor.expanded_text());
         if let Some(access) = self.state.theme_access.as_ref() {
             access.publish_active(&self.state.theme.name);
         }
@@ -284,9 +310,11 @@ impl<B: Backend> App<B> {
     /// `pub` for the same reason [`Self::apply_ui_effect`] is: `tests/*.rs` drive the run loop's
     /// drain arm directly, since `App::run` needs a real terminal event source.
     pub fn show_extension_error(&mut self, err: &cyrup_ext::ExtensionError) {
-        self.state
-            .transcript
-            .push_error(format!("Extension \"{}\" error: {}", err.extension.as_str(), err.error));
+        self.state.transcript.push_error(format!(
+            "Extension \"{}\" error: {}",
+            err.extension.as_str(),
+            err.error
+        ));
     }
 
     /// Apply one fire-and-forget extension UI effect — the interactive-TUI half of the
@@ -320,17 +348,23 @@ impl<B: Backend> App<B> {
             UiEffect::Notify { message, kind } => match kind {
                 NotifyKind::Error => {
                     // Pi `showError` prefixes the copy (`interactive-mode.ts:3952`).
-                    self.state.transcript.push_error(format!("Error: {message}"));
+                    self.state
+                        .transcript
+                        .push_error(format!("Error: {message}"));
                 }
                 NotifyKind::Warning => {
-                    self.state.transcript.push_warning(format!("Warning: {message}"));
+                    self.state
+                        .transcript
+                        .push_warning(format!("Warning: {message}"));
                 }
                 NotifyKind::Info => self.state.transcript.push_status(message),
             },
             UiEffect::SetStatus { key, text } => {
                 // `text: None` clears the key — `StatusLine::set_extension_status` already treats an
                 // empty value as a removal (Pi `footer.ts:233`).
-                self.state.status.set_extension_status(key, text.unwrap_or_default());
+                self.state
+                    .status
+                    .set_extension_status(key, text.unwrap_or_default());
             }
             UiEffect::SetEditorText { text, is_paste } => {
                 if is_paste {
@@ -431,7 +465,9 @@ impl<B: Backend> App<B> {
             }
             self.close_selector(true);
         } else if let Some(active) = self.state.selector.as_mut() {
-            active.inner.set_title(countdown_title(&base_title, deadline, now));
+            active
+                .inner
+                .set_title(countdown_title(&base_title, deadline, now));
         }
     }
 
@@ -476,7 +512,9 @@ impl<B: Backend> App<B> {
         // interrupt)"` (`:2213-2217`) — the ONLY place upstream ever suffixes a working message, and
         // it says "to interrupt", not the "to cancel" the other three kinds bake in.
         let interrupt = self.state.keymap.keys_label(Action::Interrupt);
-        self.state.indicator.reset_extension_working_state(interrupt.as_deref());
+        self.state
+            .indicator
+            .reset_extension_working_state(interrupt.as_deref());
         self.state.transcript.set_hidden_thinking_label(None);
     }
 }

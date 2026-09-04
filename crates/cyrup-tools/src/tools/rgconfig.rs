@@ -170,8 +170,7 @@ impl RgFlags {
     // Nothing in the production path consumes the string — `-q` is dropped silently, which is the
     // whole point — so outside `cfg(test)` it is deliberately inert.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub const QUIET_IS_REFUSED: &'static str =
-        "-q/--quiet suppresses ripgrep's JSON match events (hiargs.rs:565); honouring it would \
+    pub const QUIET_IS_REFUSED: &'static str = "-q/--quiet suppresses ripgrep's JSON match events (hiargs.rs:565); honouring it would \
          reproduce pi's silent 'No matches found' with matches present";
 
     /// Why `-P`/`--pcre2`/`--engine` are recognised and then dropped.
@@ -189,8 +188,7 @@ impl RgFlags {
     /// not available in this build of ripgrep", `hiargs.rs:447-452` — but that is not the binary
     /// Pi runs, so it is not the parity target either.)
     #[cfg_attr(not(test), allow(dead_code))]
-    pub const PCRE2_IS_DECLINED: &'static str =
-        "-P/--pcre2/--engine=pcre2 need grep-pcre2 (a C dependency cyrup-tools does not take); \
+    pub const PCRE2_IS_DECLINED: &'static str = "-P/--pcre2/--engine=pcre2 need grep-pcre2 (a C dependency cyrup-tools does not take); \
          Pi's rg has the feature, so this is a real divergence, recorded rather than erased — \
          this module never fails a search over a config line";
 
@@ -212,8 +210,7 @@ impl RgFlags {
     /// `defs.rs:5431-5435`). They are recognised anyway, because the catch-all is for flags this
     /// module does not KNOW, and these belong to a group it does.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub const PREPROCESSOR_IS_DECLINED: &'static str =
-        "--pre/--pre-glob/-z spawn a program per file (and --no-pre/--no-search-zip turn that \
+    pub const PREPROCESSOR_IS_DECLINED: &'static str = "--pre/--pre-glob/-z spawn a program per file (and --no-pre/--no-search-zip turn that \
          off); grep's seam is FsOps (ops/mod.rs:437), which has no exec, and a subprocess would \
          bypass the isolation decorators";
 
@@ -278,8 +275,19 @@ impl RgFlags {
                     // the loop and is applied as a flag in its own right.
                     if matches!(
                         ch,
-                        'm' | 'E' | 'g' | 't' | 'T' | 'd' | 'A' | 'B' | 'C' | 'M' | 'e' | 'f'
-                            | 'j' | 'r'
+                        'm' | 'E'
+                            | 'g'
+                            | 't'
+                            | 'T'
+                            | 'd'
+                            | 'A'
+                            | 'B'
+                            | 'C'
+                            | 'M'
+                            | 'e'
+                            | 'f'
+                            | 'j'
+                            | 'r'
                     ) {
                         let tail: String = it.by_ref().collect();
                         let v = if tail.is_empty() {
@@ -391,11 +399,26 @@ impl RgFlags {
             // leading `-` makes it parse as a flag and apply — `--replace` followed by `-i`
             // silently turned the search case-insensitive. The catch-all below stays for flags this
             // module does not KNOW: a newer ripgrep's flag must still be ignored, never an error.
-            "after-context" | "before-context" | "color" | "colors" | "context"
-            | "context-separator" | "dfa-size-limit" | "field-context-separator"
-            | "field-match-separator" | "file" | "generate" | "hostname-bin"
-            | "hyperlink-format" | "max-columns" | "path-separator" | "regex-size-limit"
-            | "regexp" | "replace" | "threads" | "type-clear" => {
+            "after-context"
+            | "before-context"
+            | "color"
+            | "colors"
+            | "context"
+            | "context-separator"
+            | "dfa-size-limit"
+            | "field-context-separator"
+            | "field-match-separator"
+            | "file"
+            | "generate"
+            | "hostname-bin"
+            | "hyperlink-format"
+            | "max-columns"
+            | "path-separator"
+            | "regex-size-limit"
+            | "regexp"
+            | "replace"
+            | "threads"
+            | "type-clear" => {
                 take();
             }
             // Everything else — inert through the JSON pipeline, or a flag from a ripgrep newer
@@ -464,7 +487,11 @@ fn parse_size(s: &str) -> Option<u64> {
     // from the search with nothing in the output to say so. An overflowing value is unusable
     // either way, so it is dropped like any other unparseable one — the module's contract is that
     // a bad config never makes the tool fail.
-    digits.trim().parse::<u64>().ok().and_then(|n| n.checked_mul(mult))
+    digits
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(mult))
 }
 
 /// Resolve `$RIPGREP_CONFIG_PATH` the way ripgrep does.
@@ -530,8 +557,11 @@ pub(crate) fn build_types(flags: &RgFlags) -> Option<Types> {
     //
     // `all` is not in `definitions()` but is valid — `select`/`negate` expand it over every type
     // currently defined (ignore `types.rs:385-396`), so it is admitted explicitly.
-    let known: std::collections::HashSet<String> =
-        b.definitions().iter().map(|d| d.name().to_string()).collect();
+    let known: std::collections::HashSet<String> = b
+        .definitions()
+        .iter()
+        .map(|d| d.name().to_string())
+        .collect();
     let resolves = |name: &String| name == "all" || known.contains(name);
     for t in flags.types.iter().filter(|t| resolves(t)) {
         b.select(t);

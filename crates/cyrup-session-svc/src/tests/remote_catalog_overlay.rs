@@ -7,14 +7,19 @@
 //!
 //! **No network.** Nothing here issues a request: the store is written directly, exactly as a
 //! completed refresh would have left it, and the session only ever reads it from disk.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::{SessionBuilder, SessionConfig};
 use cyrup_provider::faux::{FauxConfig, FauxModelDefinition, FauxProvider};
 use cyrup_provider::models_store::{ModelsStore, ModelsStoreEntry};
-use crate::{SessionBuilder, SessionConfig};
 use tempfile::TempDir;
 
 fn faux() -> Arc<FauxProvider> {
@@ -76,7 +81,11 @@ fn fixture() -> Fx {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fx { _tmp: tmp, cwd, agent_dir }
+    Fx {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 async fn catalog_for(fx: &Fx) -> Vec<cyrup_provider::Model> {
@@ -117,12 +126,16 @@ async fn a_persisted_overlay_reaches_the_live_session_registry_without_removing_
 
     // ...and the next session to be built sees it.
     let after = catalog_for(&fx).await;
-    let groq_after: Vec<&cyrup_provider::Model> =
-        after.iter().filter(|m| m.provider.as_str() == "groq").collect();
+    let groq_after: Vec<&cyrup_provider::Model> = after
+        .iter()
+        .filter(|m| m.provider.as_str() == "groq")
+        .collect();
 
     // ADD.
     assert!(
-        groq_after.iter().any(|m| m.id.as_str() == "overlay-only-model"),
+        groq_after
+            .iter()
+            .any(|m| m.id.as_str() == "overlay-only-model"),
         "the persisted overlay did not reach the session registry"
     );
     // REPLACE, in place.
@@ -151,7 +164,11 @@ async fn a_corrupt_or_stale_cache_leaves_the_session_exactly_as_it_is_today() {
 
     // Corrupt file.
     std::fs::write(&path, "{ not json at all").unwrap();
-    assert_eq!(catalog_for(&fx).await, baseline, "a corrupt cache changed the registry");
+    assert_eq!(
+        catalog_for(&fx).await,
+        baseline,
+        "a corrupt cache changed the registry"
+    );
 
     // Well-formed but STALE: `lastModified` older than the built-in manifest, i.e. an overlay
     // persisted before an upgrade that refreshed the embedded catalogs (pi #7016).

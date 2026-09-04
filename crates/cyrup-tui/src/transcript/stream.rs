@@ -23,7 +23,10 @@ impl TranscriptView {
                 lead_spacer,
             });
             if let Some(user_message) = block.user_message {
-                self.pending.push(Entry::User { text: user_message, lead_spacer: true });
+                self.pending.push(Entry::User {
+                    text: user_message,
+                    lead_spacer: true,
+                });
             }
         } else {
             self.pending.push(Entry::User { text, lead_spacer });
@@ -132,7 +135,10 @@ impl TranscriptView {
         if let Some(t) = final_text
             && !t.trim().is_empty()
         {
-            self.pending.push(Entry::Thinking { text: t, hidden: self.hide_thinking });
+            self.pending.push(Entry::Thinking {
+                text: t,
+                hidden: self.hide_thinking,
+            });
         }
     }
 
@@ -163,6 +169,8 @@ impl TranscriptView {
     /// [`HIDDEN_THINKING_LABEL`]. Read by the shell when flushing committed entries to scrollback,
     /// so a pending entry and the live block cannot disagree.
     pub fn hidden_thinking_label(&self) -> &str {
-        self.hidden_thinking_label.as_deref().unwrap_or(HIDDEN_THINKING_LABEL)
+        self.hidden_thinking_label
+            .as_deref()
+            .unwrap_or(HIDDEN_THINKING_LABEL)
     }
 }

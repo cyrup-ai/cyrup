@@ -22,16 +22,16 @@
 //! the installed-package → live-session wiring (gap-07 §1) and `PackageManager::set_enabled`, both
 //! in `cyrup-resources`/`cyrup-session-svc`.
 
+use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use crate::chrome::key_hint_spans;
 use crate::keymap::{SelectAction, SelectKeymap};
-use crate::selector::{border_rule, centered_window, input_line_spans, Selector, SelectorOutcome};
+use crate::selector::{Selector, SelectorOutcome, border_rule, centered_window, input_line_spans};
 use crate::text_input::{Input, InputOutcome};
 use crate::text_width::{str_width, truncate_line_to_width, truncate_to_width};
 use crate::theme::UiTheme;
@@ -227,7 +227,12 @@ impl ConfigToggle {
         if parts.next().is_some() {
             return None;
         }
-        Some(ConfigToggle { scope, kind, pattern, enabled })
+        Some(ConfigToggle {
+            scope,
+            kind,
+            pattern,
+            enabled,
+        })
     }
 }
 
@@ -307,7 +312,12 @@ impl ConfigSelector {
         let mut order: Vec<usize> = (0..rows.len()).collect();
         order.sort_by_key(|&i| {
             rows.get(i).map(|r| {
-                (r.scope.order(), r.base_dir.clone(), r.kind.order(), r.display_name.to_lowercase())
+                (
+                    r.scope.order(),
+                    r.base_dir.clone(),
+                    r.kind.order(),
+                    r.display_name.to_lowercase(),
+                )
             })
         });
         let override_states = vec![ProjectOverrideState::default(); rows.len()];
@@ -394,7 +404,9 @@ impl ConfigSelector {
     /// dropped every such row back to "local".
     fn is_inherited_global(&self, row: &ConfigRow) -> bool {
         row.scope == ConfigScope::User
-            || self.inherited_global_keys.contains(&Self::resource_key(row))
+            || self
+                .inherited_global_keys
+                .contains(&Self::resource_key(row))
     }
 
     /// `isDimmedItem` (`config-selector.ts:657-663`): project scope **and** inherited from global
@@ -414,7 +426,9 @@ impl ConfigSelector {
     /// every frame. Upstream never has that problem: its body is windowed to the terminal, so the
     /// whole envelope fits whenever the terminal has at least `5 + chrome` rows.
     fn max_visible_for(terminal_rows: u16) -> u16 {
-        terminal_rows.saturating_sub(CHROME_ROWS).max(MIN_MAX_VISIBLE)
+        terminal_rows
+            .saturating_sub(CHROME_ROWS)
+            .max(MIN_MAX_VISIBLE)
     }
 
     /// The current body-window size (tests / inspection).
@@ -437,7 +451,11 @@ impl ConfigSelector {
     /// goes negative when the list is shorter than the window and the outer `Math.max(0, …)`
     /// catches it.
     fn window(&self) -> (usize, usize) {
-        centered_window(self.selected, self.flat.len(), usize::from(self.max_visible))
+        centered_window(
+            self.selected,
+            self.flat.len(),
+            usize::from(self.max_visible),
+        )
     }
 
     /// `renderCheckbox` (`config-selector.ts:639-647`) — the glyph **and** its colour.
@@ -501,7 +519,11 @@ impl ConfigSelector {
     fn header_lines(&self, width: u16, theme: &UiTheme) -> Vec<Line<'static>> {
         let w = usize::from(width);
         let project = self.write_scope == ConfigWriteScope::Project;
-        let title = if project { "Project Local Resources" } else { "Global Resources" };
+        let title = if project {
+            "Project Local Resources"
+        } else {
+            "Global Resources"
+        };
         let sep = || Span::styled(" · ", theme.muted_style());
 
         let mut hint: Vec<Span<'static>> = Vec::new();
@@ -509,15 +531,24 @@ impl ConfigSelector {
             hint.extend(key_hint_spans("tab", "switch mode", theme));
             hint.push(sep());
         }
-        let action = if project { "cycle inherit/+/-" } else { "toggle" };
+        let action = if project {
+            "cycle inherit/+/-"
+        } else {
+            "toggle"
+        };
         hint.extend(key_hint_spans("space", action, theme));
         hint.push(sep());
         hint.extend(key_hint_spans("esc", "close", theme));
 
         let hint_w: usize = hint.iter().map(|s| s.width()).sum();
-        let spacing = w.saturating_sub(str_width(title)).saturating_sub(hint_w).max(1);
-        let mut row1: Vec<Span<'static>> =
-            vec![Span::styled(title, theme.base_style().add_modifier(Modifier::BOLD))];
+        let spacing = w
+            .saturating_sub(str_width(title))
+            .saturating_sub(hint_w)
+            .max(1);
+        let mut row1: Vec<Span<'static>> = vec![Span::styled(
+            title,
+            theme.base_style().add_modifier(Modifier::BOLD),
+        )];
         row1.push(Span::styled(" ".repeat(spacing), theme.base_style()));
         row1.extend(hint);
 
@@ -528,7 +559,10 @@ impl ConfigSelector {
         };
         vec![
             truncate_line_to_width(Line::from(row1), w, ""),
-            Line::from(Span::styled(truncate_to_width(&scope_hint, w, ""), theme.muted_style())),
+            Line::from(Span::styled(
+                truncate_to_width(&scope_hint, w, ""),
+                theme.muted_style(),
+            )),
         ]
     }
 
@@ -550,7 +584,10 @@ impl ConfigSelector {
 
         // `:399-402` — `theme.fg("muted", …)`, not dim (S17 fix #43).
         if self.flat.is_empty() {
-            lines.push(Line::from(Span::styled("  No resources found", theme.muted_style())));
+            lines.push(Line::from(Span::styled(
+                "  No resources found",
+                theme.muted_style(),
+            )));
             return lines;
         }
 
@@ -569,7 +606,11 @@ impl ConfigSelector {
                     } else {
                         format!("  {label}")
                     };
-                    let style = if inherited { theme.dim_style() } else { theme.accent_style() };
+                    let style = if inherited {
+                        theme.dim_style()
+                    } else {
+                        theme.accent_style()
+                    };
                     lines.push(truncate_line_to_width(
                         Line::from(Span::styled(text, style.add_modifier(Modifier::BOLD))),
                         w,
@@ -580,7 +621,11 @@ impl ConfigSelector {
                 Flat::Subgroup(label) => {
                     let inherited = self.write_scope == ConfigWriteScope::Project
                         && self.group_scope_at(i) == Some(ConfigScope::User);
-                    let style = if inherited { theme.dim_style() } else { theme.muted_style() };
+                    let style = if inherited {
+                        theme.dim_style()
+                    } else {
+                        theme.muted_style()
+                    };
                     lines.push(truncate_line_to_width(
                         Line::from(Span::styled(format!("    {label}"), style)),
                         w,
@@ -590,7 +635,9 @@ impl ConfigSelector {
                 // `:426-440` — the resource row, truncated with a REAL ellipsis (`"..."`, `:437`).
                 // cyrup made no truncation call at all, so long names hard-clipped at the frame.
                 Flat::Item(ri) => {
-                    let Some(row) = self.rows.get(*ri) else { continue };
+                    let Some(row) = self.rows.get(*ri) else {
+                        continue;
+                    };
                     let is_sel = i == self.selected;
                     let dimmed = self.is_dimmed(*ri, row);
                     let cursor = if is_sel { "> " } else { "  " };
@@ -622,7 +669,11 @@ impl ConfigSelector {
         // is how many precede the highlight, +1. Counting flat entries instead would report the
         // group/subgroup headers as resources.
         if start > 0 || end < self.flat.len() {
-            let item_count = self.flat.iter().filter(|e| matches!(e, Flat::Item(_))).count();
+            let item_count = self
+                .flat
+                .iter()
+                .filter(|e| matches!(e, Flat::Item(_)))
+                .count();
             let current = self
                 .flat
                 .get(..self.selected)
@@ -684,13 +735,19 @@ impl ConfigSelector {
         let mut cur_group: Option<(ConfigScope, String)> = None;
         let mut cur_kind: Option<ConfigKind> = None;
         for &i in &self.order {
-            let Some(row) = self.rows.get(i) else { continue };
+            let Some(row) = self.rows.get(i) else {
+                continue;
+            };
             if !Self::matches_query(row, self.input.value()) {
                 continue;
             }
             let gkey = (row.scope, row.base_dir.clone());
             if cur_group.as_ref() != Some(&gkey) {
-                flat.push(Flat::Group(format!("{} ({})", row.scope.label(), row.base_dir)));
+                flat.push(Flat::Group(format!(
+                    "{} ({})",
+                    row.scope.label(),
+                    row.base_dir
+                )));
                 cur_group = Some(gkey);
                 cur_kind = None;
             }
@@ -741,8 +798,12 @@ impl ConfigSelector {
         };
         let enabled = !row.enabled;
         row.enabled = enabled;
-        let toggle =
-            ConfigToggle { scope: row.scope, kind: row.kind, pattern: row.pattern.clone(), enabled };
+        let toggle = ConfigToggle {
+            scope: row.scope,
+            kind: row.kind,
+            pattern: row.pattern.clone(),
+            enabled,
+        };
         self.flat = self.build_flat();
         SelectorOutcome::Apply(toggle.to_payload())
     }
@@ -795,7 +856,10 @@ impl Selector for ConfigSelector {
             crate::selector::stack_rows(area, [1, 1, 1, header_h, 1, body_h, 1, 1]);
 
         frame.render_widget(border_rule(top.width, theme), top);
-        frame.render_widget(Paragraph::new(header).style(theme.base_style()), header_area);
+        frame.render_widget(
+            Paragraph::new(header).style(theme.base_style()),
+            header_area,
+        );
         // The window is `maxVisible` rows and NOTHING else — `startIndex`/`endIndex`
         // (`config-selector.ts:405-409`) are computed from `this.maxVisible`, never from a box
         // height, because upstream's `ResourceList` has no box height. Deriving it from
@@ -833,8 +897,13 @@ impl Selector for ConfigSelector {
         // ([`Input::handle_key`]'s `None` arm). The guard made Ctrl+W / Ctrl+U / Ctrl+K / Alt+B /
         // Alt+F / Alt+D unreachable in this dialog.
         match key.code {
-            KeyCode::Char(' ') if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                => self.toggle_selected(),
+            KeyCode::Char(' ')
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.toggle_selected()
+            }
             // `tui.input.tab` flips the write scope (`config-selector.ts:495-498` →
             // `switchWriteScope`, `:933-937`) — and only when project mode is available, because
             // upstream leaves `onSwitchMode` unset otherwise (`:920-925`).
@@ -874,7 +943,13 @@ mod tests {
     use super::*;
     use ratatui::crossterm::event::{KeyEventKind, KeyEventState};
 
-    fn row(scope: ConfigScope, kind: ConfigKind, name: &str, pattern: &str, enabled: bool) -> ConfigRow {
+    fn row(
+        scope: ConfigScope,
+        kind: ConfigKind,
+        name: &str,
+        pattern: &str,
+        enabled: bool,
+    ) -> ConfigRow {
         ConfigRow {
             scope,
             kind,
@@ -899,9 +974,27 @@ mod tests {
 
     fn sample() -> ConfigSelector {
         ConfigSelector::new(vec![
-            row(ConfigScope::User, ConfigKind::Skills, "greeter", "skills/greeter/SKILL.md", true),
-            row(ConfigScope::User, ConfigKind::Skills, "farewell", "skills/farewell/SKILL.md", true),
-            row(ConfigScope::Project, ConfigKind::Prompts, "plan.md", "prompts/plan.md", true),
+            row(
+                ConfigScope::User,
+                ConfigKind::Skills,
+                "greeter",
+                "skills/greeter/SKILL.md",
+                true,
+            ),
+            row(
+                ConfigScope::User,
+                ConfigKind::Skills,
+                "farewell",
+                "skills/farewell/SKILL.md",
+                true,
+            ),
+            row(
+                ConfigScope::Project,
+                ConfigKind::Prompts,
+                "plan.md",
+                "prompts/plan.md",
+                true,
+            ),
         ])
     }
 
@@ -963,8 +1056,14 @@ mod tests {
     fn enter_toggles_and_esc_cancels() {
         let mut sel = sample();
         let keymap = SelectKeymap::default();
-        assert!(matches!(sel.handle(&key(KeyCode::Enter), &keymap), SelectorOutcome::Apply(_)));
-        assert_eq!(sel.handle(&key(KeyCode::Esc), &keymap), SelectorOutcome::Cancel);
+        assert!(matches!(
+            sel.handle(&key(KeyCode::Enter), &keymap),
+            SelectorOutcome::Apply(_)
+        ));
+        assert_eq!(
+            sel.handle(&key(KeyCode::Esc), &keymap),
+            SelectorOutcome::Cancel
+        );
     }
 
     #[test]
@@ -975,13 +1074,26 @@ mod tests {
             sel.handle(&key(KeyCode::Char(c)), &keymap);
         }
         // Only the farewell skill (and its User/Skills headers) survive the filter.
-        let item_count = sel.flat.iter().filter(|e| matches!(e, Flat::Item(_))).count();
+        let item_count = sel
+            .flat
+            .iter()
+            .filter(|e| matches!(e, Flat::Item(_)))
+            .count();
         assert_eq!(item_count, 1);
-        assert_eq!(sel.selected_row().map(|i| sel.rows[i].display_name.clone()), Some("farewell".to_string()));
+        assert_eq!(
+            sel.selected_row().map(|i| sel.rows[i].display_name.clone()),
+            Some("farewell".to_string())
+        );
         // Backspacing restores the rest.
         for _ in 0..8 {
             sel.handle(&key(KeyCode::Backspace), &keymap);
         }
-        assert_eq!(sel.flat.iter().filter(|e| matches!(e, Flat::Item(_))).count(), 3);
+        assert_eq!(
+            sel.flat
+                .iter()
+                .filter(|e| matches!(e, Flat::Item(_)))
+                .count(),
+            3
+        );
     }
 }

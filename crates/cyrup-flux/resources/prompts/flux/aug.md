@@ -47,7 +47,8 @@ IF $ARGUMENTS is a pure integer (ONLY digits, nothing else — no letters, under
     -> Run each in single-task mode yourself (no subagents), one after another
     -> Do not proceed to next task until current one is complete
   ELSE:
-    -> Multi-task mode with $ARGUMENTS parallel sub-agents
+    -> Multi-task mode with $ARGUMENTS parallel sub-agents — ONLY IF the `subagent` tool is in your tool list
+    -> If the `subagent` tool is NOT in your tool list -> say so once, then Sequential mode exactly as for 'all' (see the availability pre-condition under MULTI-TASK MODE)
 
 OTHERWISE (argument is a filename — including any argument that contains letters, underscores, hyphens, or dots):
   -> Single-task mode for that file
@@ -153,6 +154,8 @@ updated: <YYYY-MM-DD HH:MM>
 ---
 
 ## MULTI-TASK MODE
+
+**Availability pre-condition — check BEFORE anything else in this mode.** The `subagent` tool is provided by cyrup's opt-in subagents extension and is NOT in the tool list on a default install. If the `subagent` tool is NOT in your tool list: do NOT call it and do NOT substitute another tool; tell the user ONCE, in one sentence, that the `subagent` tool is not available (it is enabled with `CYRUP_SUBAGENTS=1` or a `subagents/config.json` at user or project scope) so the tasks will run sequentially, then process every `$FLUX_BASE/todo/*.md` task in SINGLE-TASK MODE yourself, one after another, exactly as `all` does — and skip the rest of this section. Continue below ONLY when `subagent` IS in your tool list.
 
 Use the `subagent` tool — parallel foreground calls only; NEVER background — to execute tasks IN PARALLEL.
 

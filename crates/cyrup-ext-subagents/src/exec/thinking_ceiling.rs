@@ -62,7 +62,10 @@ pub fn parse_thinking_level(value: Option<&str>, field: &str) -> Result<String, 
     {
         return Ok(trimmed.to_string());
     }
-    Err(format!("Invalid {field}; expected one of {}.", expected_levels()))
+    Err(format!(
+        "Invalid {field}; expected one of {}.",
+        expected_levels()
+    ))
 }
 
 /// pi `intersectThinkingCeilings` (`shared/thinking-ceiling.ts:23-27` @v0.57.0): the LOWEST of the
@@ -160,15 +163,18 @@ pub fn assert_thinking_within_ceiling(
     // Reuses the existing port of pi `resolveEffectiveThinking` (`shared/model-info.ts:35-40`)
     // rather than re-deriving it: a `:suffix` on the model wins outright, else the config value,
     // and only if it is a recognized level.
-    let config = config_thinking.map(|level| crate::watchdog::types::ThinkingSetting::Level(level.to_string()));
-    let Some(requested) = crate::watchdog::review::resolve_effective_thinking(model, config.as_ref())
+    let config = config_thinking
+        .map(|level| crate::watchdog::types::ThinkingSetting::Level(level.to_string()));
+    let Some(requested) =
+        crate::watchdog::review::resolve_effective_thinking(model, config.as_ref())
     else {
         return Ok(());
     };
     let requested = parse_thinking_level(Some(&requested), "requested thinking level")?;
-    let (Some(requested_rank), Some(ceiling_rank)) =
-        (thinking_level_rank(&requested), thinking_level_rank(ceiling))
-    else {
+    let (Some(requested_rank), Some(ceiling_rank)) = (
+        thinking_level_rank(&requested),
+        thinking_level_rank(ceiling),
+    ) else {
         return Err(format!(
             "Invalid thinking level comparison; expected one of {}.",
             expected_levels()
@@ -213,14 +219,22 @@ mod tests {
 
     #[test]
     fn parse_trims_and_names_the_field_in_upstreams_message() {
-        assert_eq!(parse_thinking_level(Some("  high  "), "x"), Ok("high".to_string()));
+        assert_eq!(
+            parse_thinking_level(Some("  high  "), "x"),
+            Ok("high".to_string())
+        );
         assert_eq!(
             parse_thinking_level(Some("nope"), "requested thinking level"),
-            Err("Invalid requested thinking level; expected one of off, minimal, low, medium, \
+            Err(
+                "Invalid requested thinking level; expected one of off, minimal, low, medium, \
                  high, xhigh, max."
-                .to_string())
+                    .to_string()
+            )
         );
-        assert!(parse_thinking_level(Option::None, "x").is_err(), "absent is invalid too");
+        assert!(
+            parse_thinking_level(Option::None, "x").is_err(),
+            "absent is invalid too"
+        );
     }
 
     /// The mechanism: the LOWEST wins, which is what makes a bound able only to tighten as the
@@ -277,7 +291,10 @@ mod tests {
     fn a_malformed_inherited_ceiling_is_an_error_never_unbounded() {
         assert_eq!(decode_thinking_ceiling(Option::None), Ok(Option::None));
         assert_eq!(decode_thinking_ceiling(Some("")), Ok(Option::None));
-        assert_eq!(decode_thinking_ceiling(Some("low")), Ok(Some("low".to_string())));
+        assert_eq!(
+            decode_thinking_ceiling(Some("low")),
+            Ok(Some("low".to_string()))
+        );
         let err = decode_thinking_ceiling(Some("garbage")).expect_err("must not degrade");
         assert!(err.contains("Invalid inherited thinking ceiling;"), "{err}");
     }
@@ -307,14 +324,23 @@ mod tests {
             Option::None,
         )
         .expect_err("xhigh exceeds low");
-        assert_eq!(err, "Thinking level 'xhigh' exceeds configured maximum 'low'.");
+        assert_eq!(
+            err,
+            "Thinking level 'xhigh' exceeds configured maximum 'low'."
+        );
     }
 
     #[test]
     fn a_level_at_or_below_the_ceiling_passes() {
         for level in ["off", "minimal", "low"] {
             assert_eq!(
-                assert_thinking_within_ceiling(Some("m"), Some(level), Some("low"), Option::None, Option::None),
+                assert_thinking_within_ceiling(
+                    Some("m"),
+                    Some(level),
+                    Some("low"),
+                    Option::None,
+                    Option::None
+                ),
                 Ok(()),
                 "{level} is within 'low'"
             );
@@ -327,17 +353,35 @@ mod tests {
     #[test]
     fn the_two_no_op_arms_never_refuse() {
         assert_eq!(
-            assert_thinking_within_ceiling(Some("m"), Some("xhigh"), Option::None, Option::None, Option::None),
+            assert_thinking_within_ceiling(
+                Some("m"),
+                Some("xhigh"),
+                Option::None,
+                Option::None,
+                Option::None
+            ),
             Ok(()),
             "no ceiling configured => no check"
         );
         assert_eq!(
-            assert_thinking_within_ceiling(Option::None, Some("xhigh"), Some("off"), Option::None, Option::None),
+            assert_thinking_within_ceiling(
+                Option::None,
+                Some("xhigh"),
+                Some("off"),
+                Option::None,
+                Option::None
+            ),
             Ok(()),
             "no model => nothing resolves => no check, even against the tightest ceiling"
         );
         assert_eq!(
-            assert_thinking_within_ceiling(Some("m"), Some("false"), Some("off"), Option::None, Option::None),
+            assert_thinking_within_ceiling(
+                Some("m"),
+                Some("false"),
+                Some("off"),
+                Option::None,
+                Option::None
+            ),
             Ok(()),
             "a non-level `thinking:` contributes nothing, exactly as pi's `find(level === config)`"
         );
@@ -355,7 +399,10 @@ mod tests {
             Option::None,
         )
         .expect_err("the suffix is what the child would run at");
-        assert!(err.contains("'xhigh' exceeds configured maximum 'low'"), "{err}");
+        assert!(
+            err.contains("'xhigh' exceeds configured maximum 'low'"),
+            "{err}"
+        );
     }
 
     /// SUBA-078: the ceiling is SETTINGS-ONLY. If `maxThinking` ever became an authored frontmatter

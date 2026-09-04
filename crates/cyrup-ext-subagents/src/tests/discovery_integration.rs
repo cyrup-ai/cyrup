@@ -11,20 +11,31 @@
 //! root with a real `cyrup.toml`, and settings-override application runs against a real,
 //! populated `SubagentSettings`.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::path::{Path, PathBuf};
 
-use cyrup_core::PackageId;
 use crate::discovery::types::{
     AgentOverrideConfig, AgentReadScope, AgentSource, LayeredOverrideSettings, OverrideField,
     SubagentSettings, ToolRef,
 };
 use crate::discovery::{AgentDiscoveryConfig, discover_agents, discover_agents_all};
+use cyrup_core::PackageId;
 use cyrup_resources::package::source::PackageSource;
 use cyrup_resources::{InstallScope, InstalledPackage, InstalledPackages};
 
-fn write_agent(dir: &Path, file_name: &str, frontmatter_extra: &str, name: &str, description: &str) {
+fn write_agent(
+    dir: &Path,
+    file_name: &str,
+    frontmatter_extra: &str,
+    name: &str,
+    description: &str,
+) {
     std::fs::create_dir_all(dir).expect("mkdir agent dir");
     std::fs::write(
         dir.join(file_name),
@@ -114,7 +125,13 @@ fn build_four_scope_fixture() -> FourScopeFixture {
     let project_dir = base.join("project");
 
     // --- Builtin tier ---
-    write_agent(&builtin_dir, "delegate.md", "", "delegate", "builtin delegate persona");
+    write_agent(
+        &builtin_dir,
+        "delegate.md",
+        "",
+        "delegate",
+        "builtin delegate persona",
+    );
     write_agent(
         &builtin_dir,
         "shared-name.md",
@@ -155,7 +172,13 @@ fn build_four_scope_fixture() -> FourScopeFixture {
         "shared-name",
         "user dir-b shared-name (scanned second, must win the User tier)",
     );
-    write_agent(&user_root, "scoped-user-only.md", "", "scoped-user-only", "visible only under User scope");
+    write_agent(
+        &user_root,
+        "scoped-user-only.md",
+        "",
+        "scoped-user-only",
+        "visible only under User scope",
+    );
     // R-SA-007: a skill bundle living under the SAME root being scanned for agents. Its SKILL.md
     // declares a `name`/`description` that WOULD parse as a valid agent if not excluded.
     std::fs::create_dir_all(&user_skills_dir).expect("mkdir skills bundle");
@@ -264,6 +287,7 @@ fn build_four_scope_fixture() -> FourScopeFixture {
         project_agent_dirs: vec![project_dir],
         project_chain_dirs: Vec::new(),
         override_settings,
+        runtime_agents: Vec::new(),
     };
 
     FourScopeFixture { _root: root, cfg }
@@ -415,7 +439,10 @@ fn skill_association_frontmatter_round_trips_as_pointer_metadata() {
         .iter()
         .find(|a| a.name == "skill-associated")
         .expect("skill-associated agent present");
-    assert_eq!(agent.skills, vec!["research".to_string(), "writing".to_string()]);
+    assert_eq!(
+        agent.skills,
+        vec!["research".to_string(), "writing".to_string()]
+    );
     assert!(agent.inherit_skills);
 }
 
@@ -520,7 +547,13 @@ fn discovery_observes_filesystem_changes_between_calls_over_the_full_fixture() {
         .project_agent_dirs
         .first()
         .expect("project dir configured");
-    write_agent(project_dir, "brand-new.md", "", "brand-new", "added after first call");
+    write_agent(
+        project_dir,
+        "brand-new.md",
+        "",
+        "brand-new",
+        "added after first call",
+    );
 
     let after = discover_agents_all(&fixture.cfg).expect("discovery succeeds");
     assert!(after.agents.iter().any(|a| a.name == "brand-new"));
@@ -699,7 +732,11 @@ fn all_six_bundled_builtin_personas_are_discovered_with_builtin_source() {
                 panic!(
                     "expected bundled builtin persona '{expected_name}' to be discovered; \
                      discovered names were: {:?}",
-                    result.agents.iter().map(|a| a.name.as_str()).collect::<Vec<_>>()
+                    result
+                        .agents
+                        .iter()
+                        .map(|a| a.name.as_str())
+                        .collect::<Vec<_>>()
                 )
             });
         assert_eq!(
@@ -718,7 +755,11 @@ fn all_six_bundled_builtin_personas_are_discovered_with_builtin_source() {
         BUILTIN_PERSONA_NAMES.len(),
         "exactly the 6 bundled personas should be discovered from the builtin resource root, \
          found: {:?}",
-        result.agents.iter().map(|a| a.name.as_str()).collect::<Vec<_>>()
+        result
+            .agents
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -787,7 +828,10 @@ fn bundled_researcher_persona_names_only_real_cyrup_tools() {
         .tools
         .as_ref()
         .expect("researcher must declare a tools allowlist");
-    assert!(!tools.is_empty(), "researcher must declare at least one tool");
+    assert!(
+        !tools.is_empty(),
+        "researcher must declare at least one tool"
+    );
 
     for tool in tools {
         let name = tool_ref_name(tool);
@@ -874,7 +918,10 @@ fn no_bundled_alias_can_collide_with_a_builtin_name_or_another_alias() {
     for agent in &agents {
         for alias in &agent.aliases {
             if let Some((other, _)) = claimed.iter().find(|(a, _)| *a == alias.as_str()) {
-                panic!("alias '{alias}' is claimed by both '{other}' and '{}'", agent.name);
+                panic!(
+                    "alias '{alias}' is claimed by both '{other}' and '{}'",
+                    agent.name
+                );
             }
             claimed.push((alias.as_str(), agent.name.as_str()));
         }
@@ -891,7 +938,10 @@ fn no_bundled_alias_can_collide_with_a_builtin_name_or_another_alias() {
                         "`advisor` ships no file of its own; it must resolve through oracle's alias"
                     );
                 } else {
-                    assert_eq!(agent.name, name, "roster name '{name}' must resolve to itself");
+                    assert_eq!(
+                        agent.name, name,
+                        "roster name '{name}' must resolve to itself"
+                    );
                 }
             }
             AgentNameResolution::NotFound => {
@@ -907,7 +957,10 @@ fn no_bundled_alias_can_collide_with_a_builtin_name_or_another_alias() {
     //    that is still reachable is exactly the stale-roster state `83b9872` set out to end.
     for gone in ["planner", "context-builder"] {
         assert!(
-            matches!(resolve_agent_name(gone, &agents), AgentNameResolution::NotFound),
+            matches!(
+                resolve_agent_name(gone, &agents),
+                AgentNameResolution::NotFound
+            ),
             "removed role '{gone}' must not resolve at all"
         );
     }

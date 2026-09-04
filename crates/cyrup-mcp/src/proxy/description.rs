@@ -2,16 +2,14 @@
 //!
 //! See [`crate::proxy`] for the module overview.
 
-
 use indexmap::{IndexMap, IndexSet};
 
-
-use crate::config::{
-    McpConfig, ServerEntry,
-    ToolPrefix,
-};
+use crate::config::{McpConfig, ServerEntry, ToolPrefix};
 use crate::proxy::constants::INSTRUCTIONS_SNIPPET_LENGTH;
-use crate::proxy::tool_metadata::{CandidateIndex, ToolMetadata, is_tool_allowed, is_ui_tool_visible_to_model, resolve_tool_prefix, resource_name_to_tool_name, tool_name_candidates, truncate_at_word};
+use crate::proxy::tool_metadata::{
+    CandidateIndex, ToolMetadata, is_tool_allowed, is_ui_tool_visible_to_model,
+    resolve_tool_prefix, resource_name_to_tool_name, tool_name_candidates, truncate_at_word,
+};
 
 // ==================================================================================================
 // 13 · `buildProxyDescription` — the regenerated description (MCP-152, MCP-198)
@@ -64,8 +62,14 @@ pub struct CachedServerEntry {
 /// the two collapse into one when MCP-207 merges this file's simple candidate-set form into 13e's
 /// memoised [`crate::registration::CandidateIndex`].
 fn server_has_tool_filters(definition: &ServerEntry) -> bool {
-    definition.include_tools.as_ref().is_some_and(|list| !list.is_empty())
-        || definition.exclude_tools.as_ref().is_some_and(|list| !list.is_empty())
+    definition
+        .include_tools
+        .as_ref()
+        .is_some_and(|list| !list.is_empty())
+        || definition
+            .exclude_tools
+            .as_ref()
+            .is_some_and(|list| !list.is_empty())
 }
 
 /// The MCP-198 cross-server collision set, as the memoising index [`is_tool_allowed`] consumes:
@@ -95,7 +99,9 @@ fn collision_index(
     }
     let mut all_candidates: IndexSet<String> = IndexSet::new();
     for (other_server, other_definition) in &config.mcp_servers {
-        let Some(other_entry) = cache.get(other_server) else { continue };
+        let Some(other_entry) = cache.get(other_server) else {
+            continue;
+        };
         if other_definition.is_disabled() {
             continue;
         }
@@ -106,13 +112,22 @@ fn collision_index(
             if !is_ui_tool_visible_to_model(tool.ui_visibility.as_deref()) {
                 continue;
             }
-            all_candidates
-                .extend(tool_name_candidates(&tool.name, other_server, other_prefix, false));
+            all_candidates.extend(tool_name_candidates(
+                &tool.name,
+                other_server,
+                other_prefix,
+                false,
+            ));
         }
         if other_definition.expose_resources() {
             for (name, _) in &other_entry.resources {
                 let base = format!("read_{}", resource_name_to_tool_name(name));
-                all_candidates.extend(tool_name_candidates(&base, other_server, other_prefix, false));
+                all_candidates.extend(tool_name_candidates(
+                    &base,
+                    other_server,
+                    other_prefix,
+                    false,
+                ));
             }
         }
     }
@@ -174,11 +189,15 @@ pub fn build_proxy_description(
     // 2 · Direct tools, counted in `directSpecs` iteration order.
     let mut direct_by_server: IndexMap<String, usize> = IndexMap::new();
     for spec in direct_specs {
-        *direct_by_server.entry(spec.server_name.clone()).or_insert(0) += 1;
+        *direct_by_server
+            .entry(spec.server_name.clone())
+            .or_insert(0) += 1;
     }
     if !direct_by_server.is_empty() {
-        let parts: Vec<String> =
-            direct_by_server.iter().map(|(server, count)| format!("{server} ({count})")).collect();
+        let parts: Vec<String> = direct_by_server
+            .iter()
+            .map(|(server, count)| format!("{server} ({count})"))
+            .collect();
         desc.push_str(&format!(
             "\nDirect tools available (call as normal tools): {}\n",
             parts.join(", ")
@@ -203,8 +222,11 @@ pub fn build_proxy_description(
         //
         // Explicit loops, not `.filter(…).count()`: [`CandidateIndex`] memoises as it answers, so
         // the borrow is `&mut` and cannot cross a closure that the surrounding iterator also holds.
-        let mut index =
-            if server_has_tool_filters(definition) { collision.as_mut() } else { None };
+        let mut index = if server_has_tool_filters(definition) {
+            collision.as_mut()
+        } else {
+            None
+        };
 
         let mut tool_count = 0_usize;
         if let Some(entry) = entry {
@@ -280,13 +302,18 @@ pub fn build_proxy_description(
         if definition.is_disabled() {
             continue;
         }
-        let Some(instructions) =
-            cache.get(server_name).and_then(|entry| entry.instructions.as_ref()).filter(|text| !text.is_empty())
+        let Some(instructions) = cache
+            .get(server_name)
+            .and_then(|entry| entry.instructions.as_ref())
+            .filter(|text| !text.is_empty())
         else {
             continue;
         };
         // `instructions.replace(/\s+/g, " ").trim()` before truncating.
-        let flattened = instructions.split_whitespace().collect::<Vec<_>>().join(" ");
+        let flattened = instructions
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         let snippet = truncate_at_word(&flattened, INSTRUCTIONS_SNIPPET_LENGTH);
         // The two-space indent is part of each summary line, not of the joiner.
         instruction_summaries.push(format!("  {server_name}: {snippet}"));
@@ -302,10 +329,16 @@ pub fn build_proxy_description(
     desc.push_str("\nUsage:\n");
     desc.push_str("  mcp({ })                              → Show server status\n");
     desc.push_str("  mcp({ server: \"name\" })               → List tools from server\n");
-    desc.push_str("  mcp({ search: \"query\" })              → Search MCP tools by name/description\n");
+    desc.push_str(
+        "  mcp({ search: \"query\" })              → Search MCP tools by name/description\n",
+    );
     desc.push_str("  mcp({ describe: \"tool_name\" })        → Show tool details and parameters\n");
-    desc.push_str("  mcp({ instructions: \"name\" })         → Show full server usage instructions\n");
-    desc.push_str("  mcp({ connect: \"server-name\" })       → Connect to a server and refresh metadata\n");
+    desc.push_str(
+        "  mcp({ instructions: \"name\" })         → Show full server usage instructions\n",
+    );
+    desc.push_str(
+        "  mcp({ connect: \"server-name\" })       → Connect to a server and refresh metadata\n",
+    );
     desc.push_str("  mcp({ tool: \"name\", args: { key: \"value\" } })         → Call a tool (object args; JSON string also accepted)\n");
     desc.push_str("  mcp({ action: \"auth-start\", server: \"name\" })      → Start manual OAuth and get a browser URL\n");
     desc.push_str("  mcp({ action: \"auth-complete\", server: \"name\", args: { redirectUrl: \"...\" } }) → Complete manual OAuth\n");
@@ -314,7 +347,12 @@ pub fn build_proxy_description(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::proxy::testsupport::{config_with, stdio};
@@ -337,9 +375,18 @@ mod tests {
 
     #[test]
     fn proxy_description_renders_every_block_in_order() {
-        let github = ServerEntry { command: Some("npx".to_string()), ..ServerEntry::default() };
-        let docs = ServerEntry { command: Some("npx".to_string()), ..ServerEntry::default() };
-        let off = ServerEntry { disabled: Some(true), ..ServerEntry::default() };
+        let github = ServerEntry {
+            command: Some("npx".to_string()),
+            ..ServerEntry::default()
+        };
+        let docs = ServerEntry {
+            command: Some("npx".to_string()),
+            ..ServerEntry::default()
+        };
+        let off = ServerEntry {
+            disabled: Some(true),
+            ..ServerEntry::default()
+        };
         let config = config_with(&[("github", github), ("docs", docs), ("legacy", off)]);
 
         let mut cache: IndexMap<String, CachedServerEntry> = IndexMap::new();
@@ -376,7 +423,9 @@ mod tests {
         assert!(!description.contains("mcpScript"));
         assert!(!description.contains("Pi tools"));
         // 2 · direct-tool counts.
-        assert!(description.contains("\nDirect tools available (call as normal tools): github (1)\n"));
+        assert!(
+            description.contains("\nDirect tools available (call as normal tools): github (1)\n")
+        );
         // 3 · proxy counts: github has 2 cached tools minus 1 direct = 1.
         assert!(description.contains("\nServers: github (1 tools), docs (1 tools)\n"));
         // 4 · disabled servers.
@@ -392,14 +441,21 @@ mod tests {
         assert!(description.ends_with(
             "\nMode: action > tool (call) > connect > describe > instructions > search > server (list) > nothing (status)"
         ));
-        assert_eq!(description.matches('→').count(), 9, "nine usage arrows survive the cut");
+        assert_eq!(
+            description.matches('→').count(),
+            9,
+            "nine usage arrows survive the cut"
+        );
     }
 
     /// MCP-198 · a tool hidden by `uiVisibility` is not counted, and does not reserve its name in
     /// the cross-server collision set.
     #[test]
     fn hidden_tools_are_excluded_from_the_advertised_counts() {
-        let server = ServerEntry { command: Some("npx".to_string()), ..ServerEntry::default() };
+        let server = ServerEntry {
+            command: Some("npx".to_string()),
+            ..ServerEntry::default()
+        };
         let config = config_with(&[("app", server)]);
         let mut cache: IndexMap<String, CachedServerEntry> = IndexMap::new();
         let mut hidden = ToolMetadata::new("app_widget", "widget", "App-only");
@@ -413,7 +469,10 @@ mod tests {
             },
         );
         let description = build_proxy_description(&config, &cache, &[]);
-        assert!(description.contains("\nServers: app (1 tools)\n"), "{description}");
+        assert!(
+            description.contains("\nServers: app (1 tools)\n"),
+            "{description}"
+        );
         assert!(is_ui_tool_visible_to_model(None));
         assert!(is_ui_tool_visible_to_model(Some(&["model".to_string()])));
         assert!(!is_ui_tool_visible_to_model(Some(&[])));
@@ -429,17 +488,45 @@ mod tests {
     fn tool_selectors_are_two_tier_and_collision_guarded() {
         let none: Option<&[String]> = None;
         // No filters at all ⇒ allowed.
-        assert!(is_tool_allowed("do-it", "srv", ToolPrefix::Server, none, none, None));
+        assert!(is_tool_allowed(
+            "do-it",
+            "srv",
+            ToolPrefix::Server,
+            none,
+            none,
+            None
+        ));
 
         // A current-candidate include selects; a miss does not.
         let include_current = ["srv_do-it".to_string()];
-        assert!(is_tool_allowed("do-it", "srv", ToolPrefix::Server, Some(&include_current), none, None));
+        assert!(is_tool_allowed(
+            "do-it",
+            "srv",
+            ToolPrefix::Server,
+            Some(&include_current),
+            none,
+            None
+        ));
         let include_other = ["something_else".to_string()];
-        assert!(!is_tool_allowed("do-it", "srv", ToolPrefix::Server, Some(&include_other), none, None));
+        assert!(!is_tool_allowed(
+            "do-it",
+            "srv",
+            ToolPrefix::Server,
+            Some(&include_other),
+            none,
+            None
+        ));
 
         // A current-candidate exclude excludes.
         let exclude_current = ["srv_do-it".to_string()];
-        assert!(!is_tool_allowed("do-it", "srv", ToolPrefix::Server, none, Some(&exclude_current), None));
+        assert!(!is_tool_allowed(
+            "do-it",
+            "srv",
+            ToolPrefix::Server,
+            none,
+            Some(&exclude_current),
+            None
+        ));
 
         // `do_it` is a LEGACY-only candidate of `do-it`.
         let current = tool_name_candidates("do-it", "srv", ToolPrefix::Server, false);
@@ -449,7 +536,14 @@ mod tests {
 
         let exclude_legacy = ["do_it".to_string()];
         // …with no collision context it still excludes…
-        assert!(!is_tool_allowed("do-it", "srv", ToolPrefix::Server, none, Some(&exclude_legacy), None));
+        assert!(!is_tool_allowed(
+            "do-it",
+            "srv",
+            ToolPrefix::Server,
+            none,
+            Some(&exclude_legacy),
+            None
+        ));
         // …and with a collision index that does not contain it, likewise.
         let mut quiet = CandidateIndex::new(current.clone());
         assert!(!is_tool_allowed(
@@ -497,7 +591,10 @@ mod tests {
         );
         let description = build_proxy_description(&config, &cache, &[]);
         // 2 tools − 1 excluded + 1 resource (`read_notes_md`) = 2.
-        assert!(description.contains("\nServers: srv (2 tools)\n"), "{description}");
+        assert!(
+            description.contains("\nServers: srv (2 tools)\n"),
+            "{description}"
+        );
         assert_eq!(resource_name_to_tool_name("notes.md"), "notes_md");
         assert_eq!(resource_name_to_tool_name("9lives"), "resource_9lives");
         assert_eq!(resource_name_to_tool_name("__A B__"), "a_b");
@@ -518,7 +615,11 @@ mod tests {
             cache.insert(
                 server.to_string(),
                 CachedServerEntry {
-                    tools: vec![ToolMetadata::new(format!("{server}_search"), "search", "Search")],
+                    tools: vec![ToolMetadata::new(
+                        format!("{server}_search"),
+                        "search",
+                        "Search",
+                    )],
                     resources: Vec::new(),
                     instructions: None,
                 },
@@ -534,20 +635,33 @@ mod tests {
         // Positive control: one selector on one server re-arms the scan for the whole call, and the
         // set spans the filtered server too — a tool's own candidates are subtracted by match count
         // inside `CandidateIndex::has_other_current_match`, never by omitting them here.
-        let filtered =
-            ServerEntry { exclude_tools: Some(vec!["a_search".to_string()]), ..stdio("npx") };
+        let filtered = ServerEntry {
+            exclude_tools: Some(vec!["a_search".to_string()]),
+            ..stdio("npx")
+        };
         let armed = config_with(&[("a", filtered), ("b", stdio("npx"))]);
         let index = collision_index(&armed, &cache, armed.tool_prefix());
         let candidates = index.as_ref().map(CandidateIndex::all_current);
-        assert!(candidates.is_some_and(|set| set.contains("b_search")), "{candidates:?}");
-        assert!(candidates.is_some_and(|set| set.contains("a_search")), "{candidates:?}");
+        assert!(
+            candidates.is_some_and(|set| set.contains("b_search")),
+            "{candidates:?}"
+        );
+        assert!(
+            candidates.is_some_and(|set| set.contains("a_search")),
+            "{candidates:?}"
+        );
 
         // …and skipping it changes nothing the model reads: the counts are identical either way,
         // which is the whole claim — a pure startup-cost fix, not a behaviour change.
         let described = build_proxy_description(&unfiltered, &cache, &[]);
-        assert!(described.contains("\nServers: a (1 tools), b (1 tools)\n"), "{described}");
+        assert!(
+            described.contains("\nServers: a (1 tools), b (1 tools)\n"),
+            "{described}"
+        );
         let described = build_proxy_description(&armed, &cache, &[]);
-        assert!(described.contains("\nServers: b (1 tools)\n"), "{described}");
+        assert!(
+            described.contains("\nServers: b (1 tools)\n"),
+            "{described}"
+        );
     }
-
 }

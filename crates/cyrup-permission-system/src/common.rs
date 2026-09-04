@@ -20,7 +20,11 @@ pub fn to_record(value: &Value) -> &Map<String, Value> {
 pub fn get_non_empty_string(value: Option<&Value>) -> Option<String> {
     let s = value?.as_str()?;
     let trimmed = s.trim();
-    if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 /// The user's home directory (pi `os.homedir()`), from `$HOME`/`$USERPROFILE`. Degrades to `""`
@@ -121,8 +125,11 @@ pub fn is_path_within_directory(path_value: &str, directory: &str) -> bool {
     if path_value == directory {
         return true;
     }
-    let prefix =
-        if directory.ends_with('/') { directory.to_string() } else { format!("{directory}/") };
+    let prefix = if directory.ends_with('/') {
+        directory.to_string()
+    } else {
+        format!("{directory}/")
+    };
     path_value.starts_with(&prefix)
 }
 
@@ -388,7 +395,10 @@ mod tests {
             "    echo *: allow\n",
         ));
         for k in ["__proto__", "constructor", "prototype"] {
-            assert!(parsed.get(k).is_none(), "top-level key {k:?} must be dropped");
+            assert!(
+                parsed.get(k).is_none(),
+                "top-level key {k:?} must be dropped"
+            );
         }
         let bash = parsed.get("permission").unwrap().get("bash").unwrap();
         for k in ["__proto__", "constructor", "prototype"] {
@@ -425,7 +435,11 @@ mod tests {
             ("prototypes", "e"),
             ("proto", "f"),
         ] {
-            assert_eq!(parsed.get(k).and_then(|x| x.as_str()), Some(v), "key {k:?} must survive");
+            assert_eq!(
+                parsed.get(k).and_then(|x| x.as_str()),
+                Some(v),
+                "key {k:?} must survive"
+            );
         }
     }
 
@@ -439,8 +453,14 @@ mod tests {
         let permission = parsed.get("permission").unwrap();
         assert!(permission.get("constructor").is_none());
         // `bash: allow` (indent 4) lands directly on `permission`, not under a `constructor` map.
-        assert_eq!(permission.get("bash").and_then(|v| v.as_str()), Some("allow"));
-        assert_eq!(permission.get("skills").and_then(|v| v.as_str()), Some("ask"));
+        assert_eq!(
+            permission.get("bash").and_then(|v| v.as_str()),
+            Some("allow")
+        );
+        assert_eq!(
+            permission.get("skills").and_then(|v| v.as_str()),
+            Some("ask")
+        );
     }
 
     #[test]

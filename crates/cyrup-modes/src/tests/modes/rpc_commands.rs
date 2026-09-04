@@ -10,7 +10,7 @@ use std::sync::Arc;
 use super::support::{build_runtime, fixture, parse_lines, type_of};
 use crate::run_rpc;
 use cyrup_core::StopReason;
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
+use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
 use cyrup_session_svc::{InputSource, UserInput};
 use serde_json::Value;
 
@@ -36,7 +36,10 @@ use serde_json::Value;
 async fn rpc_thinking_levels_blank_lines_and_omitted_optional_state_match_pi() {
     let fx = fixture();
     let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("ok")],
+        StopReason::Stop,
+    )]);
     let runtime = build_runtime(&fx, faux).await;
 
     let input = concat!(
@@ -48,7 +51,9 @@ async fn rpc_thinking_levels_blank_lines_and_omitted_optional_state_match_pi() {
     );
     let reader = Cursor::new(input.as_bytes().to_vec());
     let mut out: Vec<u8> = Vec::new();
-    run_rpc(&runtime, reader, &mut out).await.expect("rpc mode runs");
+    run_rpc(&runtime, reader, &mut out)
+        .await
+        .expect("rpc mode runs");
     let lines = parse_lines(&out);
     let responses: Vec<&Value> = lines.iter().filter(|l| type_of(l) == "response").collect();
 
@@ -114,7 +119,9 @@ async fn rpc_mode_drives_prompt_and_answers_queries() {
     let reader = Cursor::new(input.as_bytes().to_vec());
     let mut out: Vec<u8> = Vec::new();
 
-    run_rpc(&runtime, reader, &mut out).await.expect("rpc mode runs");
+    run_rpc(&runtime, reader, &mut out)
+        .await
+        .expect("rpc mode runs");
 
     let lines = parse_lines(&out);
     assert!(!lines.is_empty(), "no output produced");
@@ -131,15 +138,27 @@ async fn rpc_mode_drives_prompt_and_answers_queries() {
     assert_eq!(prompt_resp["success"], true);
 
     // (2) abort acknowledged.
-    let abort_resp = responses.iter().find(|r| r["command"] == "abort").expect("an abort response");
+    let abort_resp = responses
+        .iter()
+        .find(|r| r["command"] == "abort")
+        .expect("an abort response");
     assert_eq!(abort_resp["id"], "2");
     assert_eq!(abort_resp["success"], true);
 
     // (3) get_state returns the full session snapshot (Pi RpcSessionState).
-    let state = responses.iter().find(|r| r["command"] == "get_state").expect("a get_state response");
+    let state = responses
+        .iter()
+        .find(|r| r["command"] == "get_state")
+        .expect("a get_state response");
     assert_eq!(state["id"], "3");
-    assert!(state["data"]["sessionId"].is_string(), "state missing sessionId: {state}");
-    assert!(state["data"]["model"]["provider"].is_string(), "state missing model: {state}");
+    assert!(
+        state["data"]["sessionId"].is_string(),
+        "state missing sessionId: {state}"
+    );
+    assert!(
+        state["data"]["model"]["provider"].is_string(),
+        "state missing model: {state}"
+    );
     // The widened shape (gap #25): every Pi RpcSessionState field is present.
     for field in [
         "thinkingLevel",
@@ -151,7 +170,10 @@ async fn rpc_mode_drives_prompt_and_answers_queries() {
         "messageCount",
         "pendingMessageCount",
     ] {
-        assert!(!state["data"][field].is_null(), "state missing {field}: {state}");
+        assert!(
+            !state["data"][field].is_null(),
+            "state missing {field}: {state}"
+        );
     }
 
     // (4) get_commands returns the invocable-commands envelope (Pi `{commands:[...]}`), NOT the RPC
@@ -161,11 +183,17 @@ async fn rpc_mode_drives_prompt_and_answers_queries() {
         .find(|r| r["command"] == "get_commands")
         .expect("a get_commands response");
     assert_eq!(cmds["id"], "4");
-    assert!(cmds["data"]["commands"].is_array(), "get_commands must carry a commands array: {cmds}");
+    assert!(
+        cmds["data"]["commands"].is_array(),
+        "get_commands must carry a commands array: {cmds}"
+    );
 
     // (5) the agent event stream surfaced on the protocol (at least the run start).
     let kinds: Vec<&str> = events.iter().copied().map(type_of).collect();
-    assert!(kinds.contains(&"agent_start"), "no agent_start event on the stream: {kinds:?}");
+    assert!(
+        kinds.contains(&"agent_start"),
+        "no agent_start event on the stream: {kinds:?}"
+    );
 }
 
 #[tokio::test]
@@ -194,17 +222,31 @@ async fn rpc_fork_at_entry_branches_and_rebinds() {
 
     // Pi `fork({entryId})`: position "before" the user message; selected text is returned so a UI
     // can re-edit it; the runtime swaps the active session and the protocol rebinds.
-    let input = format!("{{\"type\":\"fork\",\"id\":\"42\",\"entryId\":\"{}\"}}\n", anchor.entry_id.as_str());
+    let input = format!(
+        "{{\"type\":\"fork\",\"id\":\"42\",\"entryId\":\"{}\"}}\n",
+        anchor.entry_id.as_str()
+    );
     let reader = Cursor::new(input.into_bytes());
     let mut out: Vec<u8> = Vec::new();
-    run_rpc(&runtime, reader, &mut out).await.expect("rpc mode runs");
+    run_rpc(&runtime, reader, &mut out)
+        .await
+        .expect("rpc mode runs");
 
     let lines = parse_lines(&out);
-    let resp = lines.iter().find(|l| l["command"] == "fork").expect("a fork response");
+    let resp = lines
+        .iter()
+        .find(|l| l["command"] == "fork")
+        .expect("a fork response");
     assert_eq!(resp["id"], "42");
     assert_eq!(resp["success"], true, "fork must succeed: {resp}");
-    assert_eq!(resp["data"]["cancelled"], false, "fork was not vetoed: {resp}");
-    assert_eq!(resp["data"]["text"], "seed the session", "fork returns the anchor text: {resp}");
+    assert_eq!(
+        resp["data"]["cancelled"], false,
+        "fork was not vetoed: {resp}"
+    );
+    assert_eq!(
+        resp["data"]["text"], "seed the session",
+        "fork returns the anchor text: {resp}"
+    );
 }
 
 /// The extended command surface drives the runtime/session: model listing, thinking, queue modes,
@@ -237,10 +279,17 @@ async fn rpc_extended_command_surface() {
     );
     let reader = Cursor::new(input.as_bytes().to_vec());
     let mut out: Vec<u8> = Vec::new();
-    run_rpc(&runtime, reader, &mut out).await.expect("rpc mode runs");
+    run_rpc(&runtime, reader, &mut out)
+        .await
+        .expect("rpc mode runs");
 
     let lines = parse_lines(&out);
-    let resp = |cmd: &str| lines.iter().find(|l| l["command"] == cmd).unwrap_or_else(|| panic!("no {cmd} response"));
+    let resp = |cmd: &str| {
+        lines
+            .iter()
+            .find(|l| l["command"] == cmd)
+            .unwrap_or_else(|| panic!("no {cmd} response"))
+    };
 
     // get_available_models → {models:[...]}.
     assert_eq!(resp("get_available_models")["success"], true);
@@ -272,7 +321,10 @@ async fn rpc_extended_command_surface() {
         "tokens",
         "cost",
     ] {
-        assert!(!data[key].is_null(), "stats missing Pi key `{key}`: {stats}");
+        assert!(
+            !data[key].is_null(),
+            "stats missing Pi key `{key}`: {stats}"
+        );
     }
     for key in ["input", "output", "cacheRead", "cacheWrite", "total"] {
         assert!(
@@ -289,25 +341,49 @@ async fn rpc_extended_command_surface() {
         "outputTokens",
         "cacheTokens",
     ] {
-        assert!(data[gone].is_null(), "cyrup-invented key `{gone}` still on the wire: {stats}");
+        assert!(
+            data[gone].is_null(),
+            "cyrup-invented key `{gone}` still on the wire: {stats}"
+        );
     }
     // `sessionFile` is `string | undefined` — this runtime IS persisted, so it must be present.
-    assert!(data["sessionFile"].is_string(), "stats missing sessionFile: {stats}");
+    assert!(
+        data["sessionFile"].is_string(),
+        "stats missing sessionFile: {stats}"
+    );
 
     // set_session_name trims + persists ("f"), and rejects an empty/whitespace name ("g").
-    let named: Vec<&Value> = lines.iter().filter(|l| l["command"] == "set_session_name").collect();
-    let ok = named.iter().find(|r| r["id"] == "f").expect("named ok response");
+    let named: Vec<&Value> = lines
+        .iter()
+        .filter(|l| l["command"] == "set_session_name")
+        .collect();
+    let ok = named
+        .iter()
+        .find(|r| r["id"] == "f")
+        .expect("named ok response");
     assert_eq!(ok["success"], true, "trim+persist must succeed: {ok}");
-    let empty = named.iter().find(|r| r["id"] == "g").expect("named empty response");
-    assert_eq!(empty["success"], false, "empty name must be rejected: {empty}");
+    let empty = named
+        .iter()
+        .find(|r| r["id"] == "g")
+        .expect("named empty response");
+    assert_eq!(
+        empty["success"], false,
+        "empty name must be rejected: {empty}"
+    );
 
     // get_messages now returns the {messages:[...]} envelope (gap #45).
-    assert!(resp("get_messages")["data"]["messages"].is_array(), "get_messages envelope");
+    assert!(
+        resp("get_messages")["data"]["messages"].is_array(),
+        "get_messages envelope"
+    );
 
     // new_session swaps the active session and is not vetoed.
     let new = resp("new_session");
     assert_eq!(new["success"], true);
-    assert_eq!(new["data"]["cancelled"], false, "new_session not vetoed: {new}");
+    assert_eq!(
+        new["data"]["cancelled"], false,
+        "new_session not vetoed: {new}"
+    );
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -322,13 +398,21 @@ async fn rpc_compact_refusal_is_an_error_response_with_pi_s_reason() {
     let faux = Arc::new(FauxProvider::new());
     let runtime = build_runtime(&fx, faux).await;
 
-    let reader =
-        Cursor::new(concat!(r#"{"type":"compact","id":"c1"}"#, "\n").as_bytes().to_vec());
+    let reader = Cursor::new(
+        concat!(r#"{"type":"compact","id":"c1"}"#, "\n")
+            .as_bytes()
+            .to_vec(),
+    );
     let mut out: Vec<u8> = Vec::new();
-    run_rpc(&runtime, reader, &mut out).await.expect("rpc mode runs");
+    run_rpc(&runtime, reader, &mut out)
+        .await
+        .expect("rpc mode runs");
 
     let lines = parse_lines(&out);
-    let resp = lines.iter().find(|l| l["command"] == "compact").expect("compact response");
+    let resp = lines
+        .iter()
+        .find(|l| l["command"] == "compact")
+        .expect("compact response");
     assert_eq!(
         resp["success"], false,
         "nothing-to-compact must be a FAILURE response, not success-with-null: {resp}"

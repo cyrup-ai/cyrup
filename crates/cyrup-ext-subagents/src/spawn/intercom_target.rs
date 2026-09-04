@@ -206,12 +206,24 @@ mod tests {
         // These strings are the cross-crate contract the child's `cyrup-intercom::identity` gate
         // reads. Pinned here (the two crates cannot import each other's constants) so a rename on
         // either side is caught by a failing test rather than a silently dead bridge.
-        assert_eq!(ENV_ORCHESTRATOR_TARGET, "CYRUP_SUBAGENT_ORCHESTRATOR_TARGET");
+        assert_eq!(
+            ENV_ORCHESTRATOR_TARGET,
+            "CYRUP_SUBAGENT_ORCHESTRATOR_TARGET"
+        );
         assert_eq!(ENV_INTERCOM_SESSION_ID, "CYRUP_INTERCOM_SESSION_ID");
-        assert_eq!(ENV_ORCHESTRATOR_SESSION_ID, "CYRUP_SUBAGENT_ORCHESTRATOR_SESSION_ID");
-        assert_eq!(ENV_SUPERVISOR_CHANNEL_DIR, "CYRUP_SUBAGENT_SUPERVISOR_CHANNEL_DIR");
+        assert_eq!(
+            ENV_ORCHESTRATOR_SESSION_ID,
+            "CYRUP_SUBAGENT_ORCHESTRATOR_SESSION_ID"
+        );
+        assert_eq!(
+            ENV_SUPERVISOR_CHANNEL_DIR,
+            "CYRUP_SUBAGENT_SUPERVISOR_CHANNEL_DIR"
+        );
         assert_eq!(ENV_CHILD_AGENT, "CYRUP_SUBAGENT_CHILD_AGENT");
-        assert_eq!(ENV_INTERCOM_SESSION_NAME, "CYRUP_SUBAGENT_INTERCOM_SESSION_NAME");
+        assert_eq!(
+            ENV_INTERCOM_SESSION_NAME,
+            "CYRUP_SUBAGENT_INTERCOM_SESSION_NAME"
+        );
         assert_eq!(RUN_ID_ENV, "CYRUP_SUBAGENT_RUN_ID");
         assert_eq!(CHILD_INDEX_ENV, "CYRUP_SUBAGENT_CHILD_INDEX");
     }
@@ -219,7 +231,10 @@ mod tests {
     #[test]
     fn sanitize_matches_pi_regex_behavior() {
         // trim + lowercase + non-[a-z0-9_-] runs -> single '-' + strip edge '-'.
-        assert_eq!(sanitize_intercom_target_part("  Research Bot  "), "research-bot");
+        assert_eq!(
+            sanitize_intercom_target_part("  Research Bot  "),
+            "research-bot"
+        );
         assert_eq!(sanitize_intercom_target_part("a//b__c--d"), "a-b__c--d");
         assert_eq!(sanitize_intercom_target_part("***"), "agent");
         assert_eq!(sanitize_intercom_target_part(""), "agent");
@@ -242,7 +257,10 @@ mod tests {
     /// else `subagent-chat-<id[0:8]>` with `session-` stripped.
     #[test]
     fn orchestrator_presence_target_is_name_else_eight_char_alias() {
-        assert_eq!(orchestrator_presence_target_with(Some("  Alice "), "id", None), "Alice");
+        assert_eq!(
+            orchestrator_presence_target_with(Some("  Alice "), "id", None),
+            "Alice"
+        );
         assert_eq!(
             orchestrator_presence_target_with(None, "session-deadbeefcafef00d", None),
             "subagent-chat-deadbeef"
@@ -264,7 +282,11 @@ mod tests {
     #[test]
     fn a_set_intercom_session_id_env_outranks_the_session_id() {
         assert_eq!(
-            orchestrator_presence_target_with(None, "session-aaaaaaaabbbb", Some("session-ccccccccdddd")),
+            orchestrator_presence_target_with(
+                None,
+                "session-aaaaaaaabbbb",
+                Some("session-ccccccccdddd")
+            ),
             "subagent-chat-cccccccc"
         );
         // `?.trim() ||` — blank is falsy, so it falls through to `sessionId`.
@@ -302,6 +324,9 @@ mod tests {
         );
         // A NAMED session agrees on both sides (both return the trimmed name), which is the case
         // that actually has to work.
-        assert_eq!(orchestrator_presence_target_with(Some(" Alice "), id, None), "Alice");
+        assert_eq!(
+            orchestrator_presence_target_with(Some(" Alice "), id, None),
+            "Alice"
+        );
     }
 }

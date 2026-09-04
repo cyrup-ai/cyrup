@@ -33,15 +33,20 @@
 //! A test that called `RenderingTool::render_call` directly would pass against the unfixed tree,
 //! which is exactly the trap here — the method always worked, nothing ever called it.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::{SessionBuilder, SessionConfig};
 use cyrup_core::{Content, Tool, ToolError, ToolResult, ToolUpdateSink};
-use cyrup_provider::faux::FauxProvider;
 use cyrup_provider::Provider;
+use cyrup_provider::faux::FauxProvider;
 use tempfile::TempDir;
 
 struct Fixture {
@@ -56,7 +61,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -94,10 +103,16 @@ impl Tool for RenderingTool {
         "A tool that draws its own call and result"
     }
     fn render_call(&self, args: &serde_json::Value) -> Option<String> {
-        Some(format!("CALL<{}>", args.get("q").and_then(|v| v.as_str()).unwrap_or("")))
+        Some(format!(
+            "CALL<{}>",
+            args.get("q").and_then(|v| v.as_str()).unwrap_or("")
+        ))
     }
     fn render_result(&self, result: &serde_json::Value) -> Option<String> {
-        Some(format!("RESULT<{}>", result.get("marker").and_then(|v| v.as_str()).unwrap_or("")))
+        Some(format!(
+            "RESULT<{}>",
+            result.get("marker").and_then(|v| v.as_str()).unwrap_or("")
+        ))
     }
     async fn execute(
         &self,
@@ -106,7 +121,10 @@ impl Tool for RenderingTool {
         _cancel: cyrup_core::CancelToken,
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
-        Ok(ToolResult { content: vec![Content::text("done")], ..Default::default() })
+        Ok(ToolResult {
+            content: vec![Content::text("done")],
+            ..Default::default()
+        })
     }
 }
 
@@ -120,7 +138,9 @@ struct PlainTool {
 
 impl PlainTool {
     fn new() -> Self {
-        Self { params: serde_json::json!({"type": "object", "properties": {}}) }
+        Self {
+            params: serde_json::json!({"type": "object", "properties": {}}),
+        }
     }
 }
 
@@ -218,11 +238,17 @@ async fn tool_without_renderers_resolves_to_nothing() {
     let host = session.ext_host();
 
     assert!(
-        host.render_tool_call_outcome("plain_me", &serde_json::json!({})).await.into_option().is_none(),
+        host.render_tool_call_outcome("plain_me", &serde_json::json!({}))
+            .await
+            .into_option()
+            .is_none(),
         "a tool overriding neither method must leave the caller drawing the built-in shell"
     );
     assert!(
-        host.render_tool_result_outcome("plain_me", &serde_json::json!({})).await.into_option().is_none(),
+        host.render_tool_result_outcome("plain_me", &serde_json::json!({}))
+            .await
+            .into_option()
+            .is_none(),
         "same on the result side"
     );
     assert!(
@@ -234,7 +260,10 @@ async fn tool_without_renderers_resolves_to_nothing() {
         "an unknown tool name is claimed by nothing"
     );
     assert!(
-        host.render_tool_call_outcome("nonexistent", &serde_json::json!({})).await.into_option().is_none(),
+        host.render_tool_call_outcome("nonexistent", &serde_json::json!({}))
+            .await
+            .into_option()
+            .is_none(),
         "and resolves to nothing"
     );
 }

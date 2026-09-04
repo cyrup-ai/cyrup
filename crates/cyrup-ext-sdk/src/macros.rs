@@ -49,15 +49,19 @@ macro_rules! export_extension {
                     name: ::std::string::String,
                     call_id: ::std::string::String,
                     params_json: ::std::string::String,
-                ) -> ::core::result::Result<bindings::cyrup::ext::types::ToolOutput, ::std::string::String>
-                {
+                ) -> ::core::result::Result<
+                    bindings::cyrup::ext::types::ToolOutput,
+                    ::std::string::String,
+                > {
                     $crate::guest::run_tool(name, call_id, params_json)
                 }
                 fn execute_command(
                     name: ::std::string::String,
                     args: ::std::string::String,
-                ) -> ::core::result::Result<::core::option::Option<::std::string::String>, ::std::string::String>
-                {
+                ) -> ::core::result::Result<
+                    ::core::option::Option<::std::string::String>,
+                    ::std::string::String,
+                > {
                     $crate::guest::run_command(name, args)
                 }
                 fn get_argument_completions(
@@ -144,7 +148,11 @@ macro_rules! export_extension {
                     options_json: ::std::string::String,
                 ) -> ::core::result::Result<(), ::std::string::String> {
                     $crate::guest::provider_stream_simple(
-                        id, stream_id, model_json, context_json, options_json,
+                        id,
+                        stream_id,
+                        model_json,
+                        context_json,
+                        options_json,
                     )
                 }
                 fn autocomplete_suggest(
@@ -189,10 +197,14 @@ macro_rules! export_extension {
                         ],
                     )
                 }
-                fn on_context(messages_json: ::std::string::String) -> bindings::cyrup::ext::types::HookOutcome {
+                fn on_context(
+                    messages_json: ::std::string::String,
+                ) -> bindings::cyrup::ext::types::HookOutcome {
                     $crate::guest::hook(2, &[&messages_json])
                 }
-                fn on_message_end(message_json: ::std::string::String) -> bindings::cyrup::ext::types::HookOutcome {
+                fn on_message_end(
+                    message_json: ::std::string::String,
+                ) -> bindings::cyrup::ext::types::HookOutcome {
                     $crate::guest::hook(3, &[&message_json])
                 }
                 fn on_before_agent_start(
@@ -211,7 +223,12 @@ macro_rules! export_extension {
                 ) -> bindings::cyrup::ext::types::HookOutcome {
                     $crate::guest::hook(
                         18,
-                        &[&text, &images_json, &source, streaming_behavior.as_deref().unwrap_or("")],
+                        &[
+                            &text,
+                            &images_json,
+                            &source,
+                            streaming_behavior.as_deref().unwrap_or(""),
+                        ],
                     )
                 }
                 fn on_user_bash(
@@ -224,13 +241,17 @@ macro_rules! export_extension {
                         &[&command, $crate::guest::b(exclude_from_context), &cwd],
                     )
                 }
-                fn on_before_provider_request(payload_json: ::std::string::String) -> bindings::cyrup::ext::types::HookOutcome {
+                fn on_before_provider_request(
+                    payload_json: ::std::string::String,
+                ) -> bindings::cyrup::ext::types::HookOutcome {
                     $crate::guest::hook(20, &[&payload_json])
                 }
                 // EXT-009 / PROV-042 — `before_provider_headers` (pi `BeforeProviderHeadersEvent`,
                 // extensions/types.ts:686-689 @v0.83.0; runner `emitBeforeProviderHeaders`,
                 // core/extensions/runner.ts:1049-1065). Kind 31.
-                fn on_before_provider_headers(headers_json: ::std::string::String) -> bindings::cyrup::ext::types::HookOutcome {
+                fn on_before_provider_headers(
+                    headers_json: ::std::string::String,
+                ) -> bindings::cyrup::ext::types::HookOutcome {
                     $crate::guest::hook(31, &[&headers_json])
                 }
                 // EXT-016 — `cwd` + `reason` (pi extensions/types.ts:544-548 @v0.83.0).
@@ -240,14 +261,19 @@ macro_rules! export_extension {
                 ) -> bindings::cyrup::ext::types::HookOutcome {
                     $crate::guest::hook(5, &[&cwd, &reason])
                 }
-                fn on_project_trust(cwd: ::std::string::String) -> bindings::cyrup::ext::types::HookOutcome {
+                fn on_project_trust(
+                    cwd: ::std::string::String,
+                ) -> bindings::cyrup::ext::types::HookOutcome {
                     $crate::guest::hook(6, &[&cwd])
                 }
                 fn on_session_before_switch(
                     reason: ::std::string::String,
                     target_session_file: ::core::option::Option<::std::string::String>,
                 ) -> bindings::cyrup::ext::types::HookOutcome {
-                    $crate::guest::hook(24, &[&reason, target_session_file.as_deref().unwrap_or("")])
+                    $crate::guest::hook(
+                        24,
+                        &[&reason, target_session_file.as_deref().unwrap_or("")],
+                    )
                 }
                 fn on_session_before_fork(
                     entry_id: ::std::string::String,
@@ -370,7 +396,11 @@ macro_rules! export_extension {
                 ) {
                     $crate::guest::notify(
                         22,
-                        &[&model_json, previous_model_json.as_deref().unwrap_or(""), &source],
+                        &[
+                            &model_json,
+                            previous_model_json.as_deref().unwrap_or(""),
+                            &source,
+                        ],
                     );
                 }
                 fn on_thinking_level_select(
@@ -400,15 +430,12 @@ macro_rules! export_extension {
                 }
 
                 // --- inter-extension event bus delivery (gap-08 §5.3) ---
-                fn bus_deliver(
-                    topic: ::std::string::String,
-                    payload_json: ::std::string::String,
-                ) {
+                fn bus_deliver(topic: ::std::string::String, payload_json: ::std::string::String) {
                     $crate::guest::bus_deliver(topic, payload_json)
                 }
             }
 
-            bindings::export!(__CyrupExtComponent with_types_in bindings);
+    bindings::export!(__CyrupExtComponent with_types_in bindings);
         };
     };
 }

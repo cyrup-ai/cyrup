@@ -19,8 +19,8 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::process::ChildStdin;
-use tokio::sync::watch;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::watch;
 
 mod npx_resolver;
 
@@ -145,7 +145,10 @@ pub(crate) fn interpolate_env_vars(value: &str) -> String {
 /// substitution logic itself is unit-testable hermetically: `cyrup-ext` is `#![forbid(unsafe_code)]`
 /// (`src/lib.rs:20`) crate-wide, and edition 2024 makes `std::env::set_var`/`remove_var` `unsafe fn`
 /// — tests cannot mutate the real process environment at all, so they inject a fixed lookup instead.
-fn interpolate_env_vars_with(value: &str, lookup: impl Fn(&str) -> Option<String> + Copy) -> String {
+fn interpolate_env_vars_with(
+    value: &str,
+    lookup: impl Fn(&str) -> Option<String> + Copy,
+) -> String {
     interpolate_dollar_env(&interpolate_braces(value, lookup), lookup)
 }
 
@@ -231,7 +234,9 @@ fn resolve_config_path_with(
     if resolved == "~" {
         return home().unwrap_or_else(|| PathBuf::from(resolved));
     }
-    if let Some(rest) = resolved.strip_prefix("~/").or_else(|| resolved.strip_prefix("~\\"))
+    if let Some(rest) = resolved
+        .strip_prefix("~/")
+        .or_else(|| resolved.strip_prefix("~\\"))
         && let Some(home) = home()
     {
         return home.join(rest);
@@ -275,7 +280,10 @@ struct PipeBufState {
 
 impl PipeBufState {
     fn new() -> Arc<Self> {
-        Arc::new(Self { data: Mutex::new(VecDeque::new()), space_freed: tokio::sync::Notify::new() })
+        Arc::new(Self {
+            data: Mutex::new(VecDeque::new()),
+            space_freed: tokio::sync::Notify::new(),
+        })
     }
 
     /// Park until buffered bytes drop below the cap (immediately if already under it) OR the child
@@ -408,7 +416,12 @@ impl Drop for ProcCaps {
         // Second-chance sweep for pids that lost `Self::spawn`'s atomic cap race ([`Self::orphaned_pids`]'s
         // doc) — same best-effort swallow idiom as above; whatever pid this is has no OTHER
         // compensating cleanup, since it was never accepted into `registry` in the first place.
-        for pid in self.orphaned_pids.lock().map(|mut g| std::mem::take(&mut *g)).unwrap_or_default() {
+        for pid in self
+            .orphaned_pids
+            .lock()
+            .map(|mut g| std::mem::take(&mut *g))
+            .unwrap_or_default()
+        {
             let _ = cyrup_tools::kill_pid(pid);
         }
     }
@@ -472,11 +485,16 @@ impl ProcCaps {
     }
 
     fn registry(&self) -> std::sync::MutexGuard<'_, HashMap<u32, Arc<ProcEntry>>> {
-        self.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn entry(&self, handle: u32) -> Result<Arc<ProcEntry>, String> {
-        self.registry().get(&handle).cloned().ok_or_else(|| format!("no live process for handle {handle}"))
+        self.registry()
+            .get(&handle)
+            .cloned()
+            .ok_or_else(|| format!("no live process for handle {handle}"))
     }
 
     /// Spawn a REAL long-lived child (the WIT `proc.spawn`): pipes stdin/stdout always, stderr iff
@@ -537,8 +555,12 @@ impl ProcCaps {
         // entry (and this `ProcCaps`) is dropped without one — e.g. the guest unloads.
         cmd.kill_on_drop(true);
 
-        let mut child = cmd.spawn().map_err(|e| format!("spawn {resolved_cmd}: {e}"))?;
-        let pid = child.id().ok_or_else(|| format!("spawn {resolved_cmd}: no pid assigned"))?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("spawn {resolved_cmd}: {e}"))?;
+        let pid = child
+            .id()
+            .ok_or_else(|| format!("spawn {resolved_cmd}: no pid assigned"))?;
         let stdin = child.stdin.take();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -686,7 +708,10 @@ impl ProcCaps {
 
     fn drain(buf: &PipeBuf, max_bytes: u32) -> Result<Vec<u8>, String> {
         let out = {
-            let mut g = buf.data.lock().map_err(|_| "proc pipe buffer lock poisoned".to_string())?;
+            let mut g = buf
+                .data
+                .lock()
+                .map_err(|_| "proc pipe buffer lock poisoned".to_string())?;
             let n = (max_bytes as usize).min(g.len());
             g.drain(..n).collect::<Vec<u8>>()
         };
@@ -784,7 +809,10 @@ impl ProcCaps {
         if Self::wait_exited(&entry, KILL_CONFIRM_TIMEOUT).await {
             Ok(())
         } else {
-            Err(format!("process {} did not terminate after SIGKILL", entry.pid))
+            Err(format!(
+                "process {} did not terminate after SIGKILL",
+                entry.pid
+            ))
         }
     }
 
@@ -872,8 +900,15 @@ mod tests {
     /// A fixed, hermetic lookup (never touches the real process environment — `cyrup-ext` is
     /// `#![forbid(unsafe_code)]`, and edition 2024 makes `std::env::set_var` `unsafe fn`, so tests
     /// cannot mutate real env vars at all).
-    fn fixed_lookup(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> + Copy {
-        move |name: &str| pairs.iter().find(|(k, _)| *k == name).map(|(_, v)| (*v).to_string())
+    fn fixed_lookup(
+        pairs: &'static [(&'static str, &'static str)],
+    ) -> impl Fn(&str) -> Option<String> + Copy {
+        move |name: &str| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| (*v).to_string())
+        }
     }
 
     /// THE MEDIUM finding this closes: `interpolate_env_vars` must handle BOTH placeholder forms Pi's
@@ -884,7 +919,11 @@ mod tests {
     /// itself yields a literal `$env:...` that must then ALSO be resolved.
     #[test]
     fn interpolate_env_vars_resolves_both_placeholder_forms_in_pis_exact_order() {
-        let lookup = fixed_lookup(&[("FOO", "foo-value"), ("BAR", "$env:BAZ"), ("BAZ", "baz-value")]);
+        let lookup = fixed_lookup(&[
+            ("FOO", "foo-value"),
+            ("BAR", "$env:BAZ"),
+            ("BAZ", "baz-value"),
+        ]);
 
         assert_eq!(interpolate_env_vars_with("${FOO}", lookup), "foo-value");
         assert_eq!(interpolate_env_vars_with("$env:FOO", lookup), "foo-value");
@@ -898,7 +937,10 @@ mod tests {
         // Malformed placeholders are left byte-for-byte untouched (no matching `}`, empty name).
         assert_eq!(interpolate_env_vars_with("${FOO", lookup), "${FOO");
         assert_eq!(interpolate_env_vars_with("${}", lookup), "${}");
-        assert_eq!(interpolate_env_vars_with("plain text, no placeholders", lookup), "plain text, no placeholders");
+        assert_eq!(
+            interpolate_env_vars_with("plain text, no placeholders", lookup),
+            "plain text, no placeholders"
+        );
         // Two-pass order: `${BAR}` resolves to the LITERAL string `$env:BAZ` in pass one, which pass
         // two then ALSO resolves — proving the passes are sequential over the whole string, not a
         // single combined scan (mirrors Pi's chained `.replace(...).replace(...)`).
@@ -917,7 +959,10 @@ mod tests {
         let lookup = fixed_lookup(&[("PROJECT", "my-project")]);
         let home = || Some(PathBuf::from("/home/testuser"));
 
-        assert_eq!(resolve_config_path_with("~", lookup, home), PathBuf::from("/home/testuser"));
+        assert_eq!(
+            resolve_config_path_with("~", lookup, home),
+            PathBuf::from("/home/testuser")
+        );
         assert_eq!(
             resolve_config_path_with("~/${PROJECT}/servers", lookup, home),
             PathBuf::from("/home/testuser/my-project/servers")
@@ -957,7 +1002,10 @@ mod tests {
             apply_npx_resolution(Some(js_resolution), &original),
             (
                 "node".to_string(),
-                vec!["/cache/_npx/abc/node_modules/@foo/bar/cli.js".to_string(), "--flag".to_string()]
+                vec![
+                    "/cache/_npx/abc/node_modules/@foo/bar/cli.js".to_string(),
+                    "--flag".to_string()
+                ]
             )
         );
 
@@ -970,14 +1018,20 @@ mod tests {
         };
         assert_eq!(
             apply_npx_resolution(Some(native_resolution), &original),
-            ("/cache/_npx/abc/node_modules/.bin/foo-bar".to_string(), vec!["--flag".to_string()])
+            (
+                "/cache/_npx/abc/node_modules/.bin/foo-bar".to_string(),
+                vec!["--flag".to_string()]
+            )
         );
 
         // resolved === null (here, None) ⇒ `command`/`args` pass through UNCHANGED — the original
         // guest-supplied `spec.cmd`/`spec.args`, not touched at all.
         assert_eq!(
             apply_npx_resolution(None, &original),
-            ("npx".to_string(), vec!["-y".to_string(), "@foo/bar".to_string()])
+            (
+                "npx".to_string(),
+                vec!["-y".to_string(), "@foo/bar".to_string()]
+            )
         );
     }
 
@@ -1018,18 +1072,37 @@ mod tests {
         let caps = ProcCaps::new();
         let handle = caps.spawn(&spec("cat", &[])).expect("cat spawns");
 
-        caps.write_stdin(handle, b"first\n").await.expect("write first line");
+        caps.write_stdin(handle, b"first\n")
+            .await
+            .expect("write first line");
         let got = poll_until_contains(&caps, handle, b"first\n").await;
-        assert!(got, "the real cat echoed the first line back across multiple polls");
+        assert!(
+            got,
+            "the real cat echoed the first line back across multiple polls"
+        );
 
-        caps.write_stdin(handle, b"second\n").await.expect("write second line on the SAME handle");
+        caps.write_stdin(handle, b"second\n")
+            .await
+            .expect("write second line on the SAME handle");
         let got = poll_until_contains(&caps, handle, b"second\n").await;
-        assert!(got, "the SAME live pipe kept echoing after the first round-trip");
+        assert!(
+            got,
+            "the SAME live pipe kept echoing after the first round-trip"
+        );
 
-        assert_eq!(caps.poll_exit(handle), None, "cat is still running (no EOF sent yet)");
+        assert_eq!(
+            caps.poll_exit(handle),
+            None,
+            "cat is still running (no EOF sent yet)"
+        );
 
-        caps.kill(handle).await.expect("kill terminates the real cat");
-        assert!(caps.poll_exit(handle).is_some(), "poll_exit reports the real exit after kill");
+        caps.kill(handle)
+            .await
+            .expect("kill terminates the real cat");
+        assert!(
+            caps.poll_exit(handle).is_some(),
+            "poll_exit reports the real exit after kill"
+        );
     }
 
     /// Poll `read_stdout` repeatedly (never blocking) until the accumulated bytes contain `needle`
@@ -1038,7 +1111,9 @@ mod tests {
         let mut acc = Vec::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while tokio::time::Instant::now() < deadline {
-            let chunk = caps.read_stdout(handle, 4096).expect("read_stdout on a live handle");
+            let chunk = caps
+                .read_stdout(handle, 4096)
+                .expect("read_stdout on a live handle");
             acc.extend_from_slice(&chunk);
             if acc.windows(needle.len()).any(|w| w == needle) {
                 return true;
@@ -1059,7 +1134,10 @@ mod tests {
         let real_home = std::env::var("HOME").expect("HOME is set in the test environment");
         let caps = ProcCaps::new();
         let mut s = spec("sh", &["-c", "printenv MY_GREETING"]);
-        s.env = vec![("MY_GREETING".to_string(), "hello-${HOME}-and-$env:HOME-again".to_string())];
+        s.env = vec![(
+            "MY_GREETING".to_string(),
+            "hello-${HOME}-and-$env:HOME-again".to_string(),
+        )];
         let handle = caps.spawn(&s).expect("sh spawns");
 
         // Wait for the real natural exit, then drain the real stdout it printed.
@@ -1067,7 +1145,9 @@ mod tests {
         while caps.poll_exit(handle).is_none() && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let out = caps.read_stdout(handle, 4096).expect("read_stdout after exit");
+        let out = caps
+            .read_stdout(handle, 4096)
+            .expect("read_stdout after exit");
         let printed = String::from_utf8_lossy(&out);
         let expected = format!("hello-{real_home}-and-{real_home}-again\n");
         assert_eq!(
@@ -1090,16 +1170,23 @@ mod tests {
         let caps = ProcCaps::new();
         let mut s = spec("pwd", &[]);
         s.cwd = Some(resolve_config_path("~"));
-        let handle = caps.spawn(&s).expect("pwd spawns with an already-resolved ~ cwd");
+        let handle = caps
+            .spawn(&s)
+            .expect("pwd spawns with an already-resolved ~ cwd");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while caps.poll_exit(handle).is_none() && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let out = caps.read_stdout(handle, 4096).expect("read_stdout after exit");
+        let out = caps
+            .read_stdout(handle, 4096)
+            .expect("read_stdout after exit");
         let printed = std::fs::canonicalize(String::from_utf8_lossy(&out).trim_end())
             .expect("pwd's real stdout is a real, canonical directory");
-        assert_eq!(printed, real_home, "a bare `~` cwd must resolve to the REAL host home directory");
+        assert_eq!(
+            printed, real_home,
+            "a bare `~` cwd must resolve to the REAL host home directory"
+        );
     }
 
     /// `poll_exit` is `None` while genuinely running and `Some(code)` with the REAL exit code once
@@ -1108,8 +1195,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn poll_exit_reports_still_running_then_the_real_natural_exit_code() {
         let caps = ProcCaps::new();
-        let handle = caps.spawn(&spec("sh", &["-c", "sleep 0.2; exit 7"])).expect("sh spawns");
-        assert_eq!(caps.poll_exit(handle), None, "still running immediately after spawn");
+        let handle = caps
+            .spawn(&spec("sh", &["-c", "sleep 0.2; exit 7"]))
+            .expect("sh spawns");
+        assert_eq!(
+            caps.poll_exit(handle),
+            None,
+            "still running immediately after spawn"
+        );
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let mut code = None;
@@ -1120,7 +1213,11 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert_eq!(code, Some(7), "the REAL natural exit code round-trips (no kill involved)");
+        assert_eq!(
+            code,
+            Some(7),
+            "the REAL natural exit code round-trips (no kill involved)"
+        );
     }
 
     /// THE regression this closes: a child that exits ON ITS OWN (never explicitly `kill`ed — the
@@ -1133,18 +1230,26 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn natural_exit_closes_the_stdin_write_end_no_fd_leak() {
         let caps = ProcCaps::new();
-        let handle = caps.spawn(&spec("sh", &["-c", "exit 0"])).expect("sh spawns");
+        let handle = caps
+            .spawn(&spec("sh", &["-c", "exit 0"]))
+            .expect("sh spawns");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while tokio::time::Instant::now() < deadline && caps.poll_exit(handle).is_none() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert_eq!(caps.poll_exit(handle), Some(0), "the child really did exit naturally");
+        assert_eq!(
+            caps.poll_exit(handle),
+            Some(0),
+            "the child really did exit naturally"
+        );
 
         // No extra wait needed: the waiter task closes `entry.stdin` BEFORE it sends on `exit_tx`
         // (program order, same task — see `Self::spawn`'s doc), so `poll_exit` observing the exit
         // code above already proves the stdin close happened.
-        let entry = caps.entry(handle).expect("entry still present after natural exit");
+        let entry = caps
+            .entry(handle)
+            .expect("entry still present after natural exit");
         assert!(
             entry.stdin.lock().await.is_none(),
             "a naturally-exited child's stdin write-end must be closed, not left open to a dead \
@@ -1160,10 +1265,16 @@ mod tests {
     async fn kill_terminates_a_real_running_child_and_the_os_process_is_gone() {
         let caps = ProcCaps::new();
         let handle = caps.spawn(&spec("sleep", &["30"])).expect("sleep spawns");
-        assert_eq!(caps.poll_exit(handle), None, "sleep is genuinely still running");
+        assert_eq!(
+            caps.poll_exit(handle),
+            None,
+            "sleep is genuinely still running"
+        );
 
         let started = tokio::time::Instant::now();
-        caps.kill(handle).await.expect("kill terminates the real sleep");
+        caps.kill(handle)
+            .await
+            .expect("kill terminates the real sleep");
         assert!(
             // `sleep` never reads stdin, so phase 1 (stdin EOF) always eats its full REAL
             // production grace period (~2s, DEFAULT_KILL_GRACE) with no reaction; `sleep` IS
@@ -1174,15 +1285,22 @@ mod tests {
              grace period, no SIGKILL escalation needed: elapsed {:?}",
             started.elapsed()
         );
-        assert!(caps.poll_exit(handle).is_some(), "poll_exit reflects the real termination");
+        assert!(
+            caps.poll_exit(handle).is_some(),
+            "poll_exit reflects the real termination"
+        );
 
         // Independently verify at the OS level (never just trust our own accounting): the pid must
         // no longer exist. `kill -0` sends no signal; it only checks existence/permission.
         let pid = {
             let reg = caps.registry();
-            reg.get(&handle).expect("entry still present after kill").pid
+            reg.get(&handle)
+                .expect("entry still present after kill")
+                .pid
         };
-        let alive = std::process::Command::new("kill").args(["-0", &pid.to_string()]).status();
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status();
         assert!(
             alive.map(|s| !s.success()).unwrap_or(true),
             "kill -0 on the killed pid must fail — the OS process is really gone"
@@ -1203,9 +1321,16 @@ mod tests {
         // ignored-SIGTERM) before SIGKILL, not one.
         let caps = ProcCaps::with_kill_grace(Duration::from_millis(150));
         let handle = caps
-            .spawn(&spec("sh", &["-c", "trap '' TERM; while true; do sleep 1; done"]))
+            .spawn(&spec(
+                "sh",
+                &["-c", "trap '' TERM; while true; do sleep 1; done"],
+            ))
             .expect("the SIGTERM-ignoring shell spawns");
-        assert_eq!(caps.poll_exit(handle), None, "genuinely running before kill");
+        assert_eq!(
+            caps.poll_exit(handle),
+            None,
+            "genuinely running before kill"
+        );
         // Let the shell actually REACH `trap '' TERM` before we signal it — otherwise SIGTERM can
         // race the trap install and kill it via the (still-default) terminate disposition, which
         // would falsely "pass" this test without ever exercising the SIGKILL escalation. The
@@ -1219,7 +1344,9 @@ mod tests {
         };
 
         let started = tokio::time::Instant::now();
-        caps.kill(handle).await.expect("kill still terminates it via the SIGKILL escalation");
+        caps.kill(handle)
+            .await
+            .expect("kill still terminates it via the SIGKILL escalation");
         assert!(
             // Two full grace-period legs (stdin-EOF, then ignored-SIGTERM) genuinely elapse before
             // the SIGKILL escalation — not just one.
@@ -1227,9 +1354,14 @@ mod tests {
             "both grace-period legs were genuinely waited out before escalating (elapsed {:?})",
             started.elapsed()
         );
-        assert!(caps.poll_exit(handle).is_some(), "poll_exit reflects the SIGKILL-forced termination");
+        assert!(
+            caps.poll_exit(handle).is_some(),
+            "poll_exit reflects the SIGKILL-forced termination"
+        );
 
-        let alive = std::process::Command::new("kill").args(["-0", &pid.to_string()]).status();
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status();
         assert!(
             alive.map(|s| !s.success()).unwrap_or(true),
             "kill -0 on the SIGKILLed pid must fail — the OS process is really gone, SIGTERM alone \
@@ -1248,8 +1380,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn kill_exits_a_child_via_graceful_stdin_eof_alone_no_signal_needed() {
         let caps = ProcCaps::new(); // real production grace (2s/leg) — proves this returns FAST.
-        let handle = caps.spawn(&spec("sh", &["-c", "cat >/dev/null"])).expect("spawns");
-        assert_eq!(caps.poll_exit(handle), None, "genuinely running before kill");
+        let handle = caps
+            .spawn(&spec("sh", &["-c", "cat >/dev/null"]))
+            .expect("spawns");
+        assert_eq!(
+            caps.poll_exit(handle),
+            None,
+            "genuinely running before kill"
+        );
 
         let pid = {
             let reg = caps.registry();
@@ -1257,7 +1395,9 @@ mod tests {
         };
 
         let started = tokio::time::Instant::now();
-        caps.kill(handle).await.expect("kill terminates via graceful stdin EOF alone");
+        caps.kill(handle)
+            .await
+            .expect("kill terminates via graceful stdin EOF alone");
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "a stdin-EOF-driven exit must be near-instant (well under the 2s production grace \
@@ -1265,9 +1405,14 @@ mod tests {
              elapsed {:?}",
             started.elapsed()
         );
-        assert!(caps.poll_exit(handle).is_some(), "poll_exit reflects the real termination");
+        assert!(
+            caps.poll_exit(handle).is_some(),
+            "poll_exit reflects the real termination"
+        );
 
-        let alive = std::process::Command::new("kill").args(["-0", &pid.to_string()]).status();
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status();
         assert!(
             alive.map(|s| !s.success()).unwrap_or(true),
             "kill -0 on the EOF-exited pid must fail — the OS process is really gone"
@@ -1291,9 +1436,14 @@ mod tests {
             .spawn()
             .expect("`true` spawns");
         let pid = child.id().expect("spawned child has a pid");
-        child.wait().await.expect("`true` exits and is reaped almost immediately");
+        child
+            .wait()
+            .await
+            .expect("`true` exits and is reaped almost immediately");
 
-        let alive = std::process::Command::new("kill").args(["-0", &pid.to_string()]).status();
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status();
         assert!(
             alive.map(|s| !s.success()).unwrap_or(true),
             "the pid must be genuinely gone before this test proceeds"
@@ -1327,8 +1477,13 @@ mod tests {
     async fn kill_still_confirms_termination_with_the_error_propagation_removed() {
         let caps = ProcCaps::new();
         let handle = caps.spawn(&spec("sleep", &["30"])).expect("sleep spawns");
-        caps.kill(handle).await.expect("kill still confirms real termination");
-        assert!(caps.poll_exit(handle).is_some(), "poll_exit reflects the real termination");
+        caps.kill(handle)
+            .await
+            .expect("kill still confirms real termination");
+        assert!(
+            caps.poll_exit(handle).is_some(),
+            "poll_exit reflects the real termination"
+        );
     }
 
     /// A busy/slow guest that never calls `read_stdout` against a maximally-bursty child (`yes`,
@@ -1347,7 +1502,12 @@ mod tests {
         let buffered_len = |caps: &ProcCaps| -> usize {
             let reg = caps.registry();
             let entry = reg.get(&handle).expect("entry present");
-            entry.stdout_buf.data.lock().expect("stdout buffer lock").len()
+            entry
+                .stdout_buf
+                .data
+                .lock()
+                .expect("stdout buffer lock")
+                .len()
         };
 
         // EXT-N01: the bound is the cap PLUS one chunk, because that is the pump's actual
@@ -1390,16 +1550,22 @@ mod tests {
         // Drain a big chunk and confirm the pump resumes filling the buffer again shortly after —
         // proving the parked pump (and the real `yes` child) are genuinely alive, gated by
         // backpressure, not dead or silently discarding bytes past the cap.
-        let drained =
-            caps.read_stdout(handle, MAX_PIPE_BUFFER_BYTES as u32).expect("read_stdout drains");
-        assert!(!drained.is_empty(), "the buffered bytes were real, not silently dropped");
+        let drained = caps
+            .read_stdout(handle, MAX_PIPE_BUFFER_BYTES as u32)
+            .expect("read_stdout drains");
+        assert!(
+            !drained.is_empty(),
+            "the buffered bytes were real, not silently dropped"
+        );
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
             buffered_len(&caps) > 0,
             "the pump did not resume reading after space freed — it looks dead, not parked"
         );
 
-        caps.kill(handle).await.expect("kill terminates the real yes");
+        caps.kill(handle)
+            .await
+            .expect("kill terminates the real yes");
     }
 
     /// A fake `AsyncRead` mirroring a bursty child's live pipe: always offers more bytes while
@@ -1439,7 +1605,13 @@ mod tests {
         // Mirrors `ProcCaps::spawn`'s own wiring exactly: ONE `watch` channel, cloned once for the
         // (fake) pipe reader's own EOF-on-exit behavior and once for `wait_for_room`'s race.
         let (exit_tx, exit_rx) = watch::channel(None);
-        let pump = spawn_pump(BurstyUntilExited { exited: exit_rx.clone() }, buf.clone(), exit_rx);
+        let pump = spawn_pump(
+            BurstyUntilExited {
+                exited: exit_rx.clone(),
+            },
+            buf.clone(),
+            exit_rx,
+        );
 
         // Let the pump run until the buffer fills to the cap and it parks — nobody ever drains it.
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -1474,7 +1646,8 @@ mod tests {
         let handle = caps.spawn(&s).expect("spawns");
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(
-            caps.read_stderr(handle, 4096).expect("read_stderr never errors"),
+            caps.read_stderr(handle, 4096)
+                .expect("read_stderr never errors"),
             Vec::<u8>::new(),
             "uncaptured stderr yields nothing, not an error"
         );
@@ -1505,9 +1678,12 @@ mod tests {
     async fn spawn_rejects_once_the_registry_cap_is_reached() {
         let caps = ProcCaps::new();
         for _ in 0..MAX_SPAWNED_PROCESSES {
-            caps.spawn(&spec("true", &[])).expect("spawn succeeds under the cap");
+            caps.spawn(&spec("true", &[]))
+                .expect("spawn succeeds under the cap");
         }
-        let err = caps.spawn(&spec("true", &[])).expect_err("one more spawn must be rejected at the cap");
+        let err = caps
+            .spawn(&spec("true", &[]))
+            .expect_err("one more spawn must be rejected at the cap");
         assert!(err.contains("too many processes spawned"), "got: {err}");
     }
 
@@ -1526,14 +1702,21 @@ mod tests {
     async fn spawn_cap_check_is_atomic_with_the_insert_under_concurrent_spawns() {
         let caps = Arc::new(ProcCaps::new());
         for _ in 0..MAX_SPAWNED_PROCESSES - 1 {
-            caps.spawn(&spec("true", &[])).expect("spawn succeeds under the cap");
+            caps.spawn(&spec("true", &[]))
+                .expect("spawn succeeds under the cap");
         }
-        assert_eq!(caps.registry().len(), MAX_SPAWNED_PROCESSES - 1, "primed one below the cap");
+        assert_eq!(
+            caps.registry().len(),
+            MAX_SPAWNED_PROCESSES - 1,
+            "primed one below the cap"
+        );
 
         let mut tasks = Vec::new();
         for _ in 0..50 {
             let caps = Arc::clone(&caps);
-            tasks.push(tokio::spawn(async move { caps.spawn(&spec("true", &[])).is_ok() }));
+            tasks.push(tokio::spawn(async move {
+                caps.spawn(&spec("true", &[])).is_ok()
+            }));
         }
         let mut ok_count = 0usize;
         for t in tasks {
@@ -1591,12 +1774,20 @@ mod tests {
         // A real, independently-spawned, long-running process `ProcCaps` never registered at all —
         // exactly what `Self::spawn`'s atomic-recheck rejection branch hands to `orphaned_pids` (a
         // real forked pid with no registry entry), without depending on timing to force the race.
-        let mut orphan = std::process::Command::new("sleep").arg("30").spawn().expect("sleep spawns");
+        let mut orphan = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep spawns");
         let pid = orphan.id();
         caps.orphaned_pids.lock().expect("lock").push(pid);
 
-        let alive_before = std::process::Command::new("kill").args(["-0", &pid.to_string()]).status();
-        assert!(alive_before.map(|s| s.success()).unwrap_or(false), "the orphan must be alive before drop");
+        let alive_before = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status();
+        assert!(
+            alive_before.map(|s| s.success()).unwrap_or(false),
+            "the orphan must be alive before drop"
+        );
 
         drop(caps);
         // SIGKILL is not interceptable, but the OS still needs a scheduler tick to actually reap it.
@@ -1607,7 +1798,9 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
 
-        let alive_after = std::process::Command::new("kill").args(["-0", &pid.to_string()]).status();
+        let alive_after = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status();
         assert!(
             alive_after.map(|s| !s.success()).unwrap_or(true),
             "an orphaned pid recorded via the lost-spawn-race path must be confirmed dead once \
@@ -1625,7 +1818,11 @@ mod tests {
     async fn dropping_proc_caps_kills_a_still_running_child_no_leak() {
         let caps = ProcCaps::new();
         let handle = caps.spawn(&spec("sleep", &["30"])).expect("sleep spawns");
-        assert_eq!(caps.poll_exit(handle), None, "genuinely still running before drop");
+        assert_eq!(
+            caps.poll_exit(handle),
+            None,
+            "genuinely still running before drop"
+        );
 
         let pid = {
             let reg = caps.registry();
@@ -1633,15 +1830,21 @@ mod tests {
         };
         // Independently confirm the OS process is alive BEFORE the drop, so a later "not found" is
         // meaningful rather than a false positive from a pid that never existed.
-        let alive_before =
-            std::process::Command::new("kill").args(["-0", &pid.to_string()]).status();
-        assert!(alive_before.map(|s| s.success()).unwrap_or(false), "sleep must be alive pre-drop");
+        let alive_before = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status();
+        assert!(
+            alive_before.map(|s| s.success()).unwrap_or(false),
+            "sleep must be alive pre-drop"
+        );
 
         drop(caps); // NO explicit `kill(handle)` call — this is the leak scenario.
 
         // Give the synchronous SIGKILL a brief moment to actually land at the OS level.
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let alive_after = std::process::Command::new("kill").args(["-0", &pid.to_string()]).status();
+        let alive_after = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status();
         assert!(
             alive_after.map(|s| !s.success()).unwrap_or(true),
             "kill -0 must fail after dropping ProcCaps — the child must not outlive it unkilled"
@@ -1681,7 +1884,9 @@ mod tests {
 
         // The stdin handle is left open after a mere timeout (not a real io error) — a subsequent
         // `kill` must still work normally, proving the capability itself is not left wedged.
-        caps.kill(handle).await.expect("the capability survives a write_stdin timeout intact");
+        caps.kill(handle)
+            .await
+            .expect("the capability survives a write_stdin timeout intact");
     }
 
     /// THE LOW finding this closes: `write_stdin`'s bound must cover BOTH acquiring the per-handle
@@ -1694,7 +1899,9 @@ mod tests {
     /// the SECOND call being issued, not two.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_write_stdin_calls_against_the_same_handle_do_not_compound_the_timeout() {
-        let caps = Arc::new(ProcCaps::with_write_stdin_timeout(Duration::from_millis(300)));
+        let caps = Arc::new(ProcCaps::with_write_stdin_timeout(Duration::from_millis(
+            300,
+        )));
         let handle = caps.spawn(&spec("sleep", &["30"])).expect("sleep spawns");
         let payload = || vec![b'x'; 8 * 1024 * 1024];
 
@@ -1718,8 +1925,14 @@ mod tests {
         let second_result = second.await.expect("second task joins");
         let elapsed = started.elapsed();
 
-        assert!(first_result.is_err(), "the first write against a non-reading child must time out");
-        assert!(second_result.is_err(), "the second write must also time out, not hang unbounded");
+        assert!(
+            first_result.is_err(),
+            "the first write against a non-reading child must time out"
+        );
+        assert!(
+            second_result.is_err(),
+            "the second write must also time out, not hang unbounded"
+        );
         assert!(
             elapsed < Duration::from_millis(500),
             "two concurrent writes against the same handle must resolve within roughly ONE \
@@ -1729,7 +1942,9 @@ mod tests {
              acquired the lock): got {elapsed:?}"
         );
 
-        caps.kill(handle).await.expect("the capability survives concurrent write_stdin timeouts intact");
+        caps.kill(handle)
+            .await
+            .expect("the capability survives concurrent write_stdin timeouts intact");
     }
 
     /// L4 review §5 — `kill`'s phase-1 stdin-close must NEVER be blocked by a CONCURRENT
@@ -1764,7 +1979,10 @@ mod tests {
         let result = caps.kill(handle).await;
         let elapsed = started.elapsed();
 
-        assert!(result.is_ok(), "kill must still succeed while a write is in flight: {result:?}");
+        assert!(
+            result.is_ok(),
+            "kill must still succeed while a write is in flight: {result:?}"
+        );
         assert!(
             elapsed < Duration::from_secs(5),
             "kill must not be blocked by the concurrent write_stdin's 30s timeout (its own budget \

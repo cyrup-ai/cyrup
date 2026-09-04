@@ -86,7 +86,9 @@ use crate::timings;
 /// 7. **Flux** (spec/flux.md §3.4.5): the pipeline's bundled prompt templates + the three native
 ///    renderers. Attached unconditionally at the top level — unlike the three above there is no
 ///    install gate, because the whole point of moving flux into the binary is that it works with
-///    no install step. `flux_extension_for_env` still returns `None` inside a subagent CHILD: a
+///    no install step — the templates are EMBEDDED and materialised under `<agent_dir>/flux/`
+///    on `ResourcesDiscover` (FLUX-001), which is why it takes `agent_dir` like the two above.
+///    `flux_extension_for_env` still returns `None` inside a subagent CHILD: a
 ///    child re-execs this binary in Print/Json mode, and contributing 15 templates plus a skill to
 ///    every child would put the skill into every child's system prompt for a pipeline the child is
 ///    not running.
@@ -133,7 +135,7 @@ fn attach_native_extensions(
     {
         builder = builder.with_native_extension(ext);
     }
-    if let Some(ext) = cyrup_flux::flux_extension_for_env() {
+    if let Some(ext) = cyrup_flux::flux_extension_for_env(agent_dir) {
         builder = builder.with_native_extension(ext);
     }
     Ok(builder)
@@ -167,7 +169,11 @@ pub fn build_factory(
     builder = builder.provider_resolver(Arc::new(crate::provider::BuiltinProviderResolver::new(
         models_json,
     )));
-    Ok(Arc::new(attach_native_extensions(builder, dirs, session_cwd)?))
+    Ok(Arc::new(attach_native_extensions(
+        builder,
+        dirs,
+        session_cwd,
+    )?))
 }
 
 /// The per-run, post-build session knobs, and whether pi's modelless hard stop applies to this
@@ -263,7 +269,12 @@ async fn apply_post_build(session: &AgentSession, name: Option<&str>, cli: &Cli,
     // Pi `modelPatterns = parsed.models ?? settingsManager.getEnabledModels()` (main.ts:685): an
     // explicit `--models` wins; otherwise fall back to the persisted `enabledModels` setting.
     let patterns: Vec<String> = if cli.models.is_empty() {
-        session.services().settings.effective().enabled_models().unwrap_or_default()
+        session
+            .services()
+            .settings
+            .effective()
+            .enabled_models()
+            .unwrap_or_default()
     } else {
         cli.models.clone()
     };
@@ -411,23 +422,31 @@ mod tests {
         // A pattern that matches nothing warns, in BOTH arms — the glob arm
         // (model-resolver.ts:311-318) and the non-glob arm (:334-341).
         for pattern in ["anthropc/*", "no-such-model-anywhere"] {
-            let diags = resolve_scoped_models_reporting_diagnostics(&catalog, &[pattern.to_string()]);
+            let diags =
+                resolve_scoped_models_reporting_diagnostics(&catalog, &[pattern.to_string()]);
             assert_eq!(diags.len(), 1, "{pattern}: {diags:?}");
             let only = diags.first().expect("one diagnostic");
             assert_eq!(only.level, DiagnosticLevel::Warning);
-            assert_eq!(only.message, format!("No models match pattern \"{pattern}\""));
+            assert_eq!(
+                only.message,
+                format!("No models match pattern \"{pattern}\"")
+            );
         }
 
         // A pattern that DOES match is silent.
         assert!(
-            resolve_scoped_models_reporting_diagnostics(&catalog, &["anthropic/*".to_string()]).is_empty(),
+            resolve_scoped_models_reporting_diagnostics(&catalog, &["anthropic/*".to_string()])
+                .is_empty(),
             "a matching pattern emits no diagnostic"
         );
 
         // An invalid `:level` suffix on a resolving pattern warns with Pi's exact sentence
         // (`parseModelPattern`, model-resolver.ts:243) and does NOT also warn no-match — the model
         // still resolves, at the default thinking level.
-        let diags = resolve_scoped_models_reporting_diagnostics(&catalog, &["claude-opus-4-8:hihg".to_string()]);
+        let diags = resolve_scoped_models_reporting_diagnostics(
+            &catalog,
+            &["claude-opus-4-8:hihg".to_string()],
+        );
         assert_eq!(diags.len(), 1, "{diags:?}");
         assert_eq!(
             diags.first().expect("one diagnostic").message,
@@ -436,7 +455,11 @@ mod tests {
 
         // A VALID `:level` is not a diagnostic at all.
         assert!(
-            resolve_scoped_models_reporting_diagnostics(&catalog, &["claude-opus-4-8:high".to_string()]).is_empty(),
+            resolve_scoped_models_reporting_diagnostics(
+                &catalog,
+                &["claude-opus-4-8:high".to_string()]
+            )
+            .is_empty(),
             "a valid thinking level is silent"
         );
 
@@ -447,8 +470,16 @@ mod tests {
         );
         assert_eq!(diags.len(), 2, "{diags:?}");
         let messages: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
-        assert!(messages.first().is_some_and(|m| m.starts_with("Invalid thinking level")));
-        assert!(messages.get(1).is_some_and(|m| m.starts_with("No models match pattern")));
+        assert!(
+            messages
+                .first()
+                .is_some_and(|m| m.starts_with("Invalid thinking level"))
+        );
+        assert!(
+            messages
+                .get(1)
+                .is_some_and(|m| m.starts_with("No models match pattern"))
+        );
     }
 
     /// CFG-008's residual. Pi's `resolveModelScope` returns `{ scopedModels, diagnostics }` from ONE
@@ -473,7 +504,9 @@ mod tests {
         // Presence before absence: the good pattern really did scope something.
         assert!(!scoped.is_empty(), "`anthropic/*` scopes a non-empty set");
         assert!(
-            scoped.iter().any(|s| s.model.id.as_str() == "claude-opus-4-8"),
+            scoped
+                .iter()
+                .any(|s| s.model.id.as_str() == "claude-opus-4-8"),
             "the `:hihg` pattern still resolves its prefix — Pi keeps the model and drops the level"
         );
         assert!(
@@ -500,7 +533,6 @@ mod tests {
                 .all(|d| matches!(d.level, DiagnosticLevel::Warning)),
             "Pi renders every scope diagnostic through `console.warn` (model-resolver.ts:355-361)"
         );
-
     }
 
     /// The live `--models`/`enabledModels` scope resolution must go through `cyrup-config`'s
@@ -525,26 +557,39 @@ mod tests {
             scoped.iter().all(|m| !m.model.id.as_str().contains('/')),
             "`anthropic*` is one segment, so it must never match the 2-segment `anthropic/<id>` \
              form; got {:?}",
-            scoped.iter().map(|m| m.model.id.as_str()).collect::<Vec<_>>()
+            scoped
+                .iter()
+                .map(|m| m.model.id.as_str())
+                .collect::<Vec<_>>()
         );
         assert!(
-            scoped.iter().all(|m| m.model.id.as_str().starts_with("anthropic")),
+            scoped
+                .iter()
+                .all(|m| m.model.id.as_str().starts_with("anthropic")),
             "every match must actually begin with the literal pattern prefix; got {:?}",
-            scoped.iter().map(|m| m.model.id.as_str()).collect::<Vec<_>>()
+            scoped
+                .iter()
+                .map(|m| m.model.id.as_str())
+                .collect::<Vec<_>>()
         );
 
         // Character classes (`[68]`) are real minimatch syntax the crude matcher could not express
         // (it fell through to a literal-substring miss). Pi matches exactly the -6 and -8 opus ids.
         // (This used to read `[08]`; `claude-opus-4-0` was retired upstream in pi `cc2db980` — see
         // cyrup-provider `tests/catalog_data.rs`, PROV-004.)
-        let scoped = resolve_scoped_models_reporting_models(&catalog, &["anthropic/claude-opus-4-[68]".to_string()]);
+        let scoped = resolve_scoped_models_reporting_models(
+            &catalog,
+            &["anthropic/claude-opus-4-[68]".to_string()],
+        );
         let ids: Vec<&str> = scoped.iter().map(|s| s.model.id.as_str()).collect();
         assert!(
             ids.contains(&"claude-opus-4-6") && ids.contains(&"claude-opus-4-8"),
             "`anthropic/claude-opus-4-[68]` char-class must scope both opus ids, got {ids:?}"
         );
         assert!(
-            scoped.iter().all(|s| s.model.provider.as_str() == "anthropic"),
+            scoped
+                .iter()
+                .all(|s| s.model.provider.as_str() == "anthropic"),
             "char-class stays path-segment-scoped to the anthropic provider"
         );
 
@@ -556,12 +601,16 @@ mod tests {
         let scoped = resolve_scoped_models_reporting_models(&catalog, &["anthropic/*".to_string()]);
         assert!(!scoped.is_empty(), "`anthropic/*` scopes a non-empty set");
         assert!(
-            scoped.iter().any(|s| s.model.provider.as_str() == "anthropic"),
+            scoped
+                .iter()
+                .any(|s| s.model.provider.as_str() == "anthropic"),
             "`anthropic/*` includes the anthropic provider's own models"
         );
         assert!(
-            scoped.iter().all(|s| s.model.provider.as_str() == "anthropic"
-                || s.model.id.as_str().starts_with("anthropic/")),
+            scoped
+                .iter()
+                .all(|s| s.model.provider.as_str() == "anthropic"
+                    || s.model.id.as_str().starts_with("anthropic/")),
             "every `anthropic/*` match is anthropic-provider or an `anthropic/`-prefixed id (Pi's \
              `minimatch(fullId) || minimatch(id)`)"
         );

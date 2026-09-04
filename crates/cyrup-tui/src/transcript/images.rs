@@ -48,7 +48,11 @@ pub(super) fn push_image_fallbacks(run: &ToolRun, theme: &UiTheme, out: &mut Vec
 /// The raster is clamped to `width_cells` and to the content width. See
 /// [`ImageBlock::halfblock_lines`] for why this is half-blocks rather than the negotiated
 /// Kitty/iTerm2 protocol.
-pub(super) fn image_raster_lines(run: &ToolRun, width: usize, width_cells: u16) -> Vec<Line<'static>> {
+pub(super) fn image_raster_lines(
+    run: &ToolRun,
+    width: usize,
+    width_cells: u16,
+) -> Vec<Line<'static>> {
     let cols = width_cells.min(width.min(u16::MAX as usize) as u16).max(1);
     let mut out = Vec::new();
     for img in run.images.iter().filter_map(|i| i.block.as_ref()) {
@@ -73,7 +77,9 @@ pub(super) fn decode_result_images(result: &Value) -> Vec<ResultImage> {
         Value::Array(_) => Some(result),
         _ => None,
     };
-    let Some(Value::Array(items)) = content else { return Vec::new() };
+    let Some(Value::Array(items)) = content else {
+        return Vec::new();
+    };
     items
         .iter()
         .filter_map(Value::as_object)
@@ -94,7 +100,11 @@ pub(super) fn decode_result_images(result: &Value) -> Vec<ResultImage> {
             // raster the renderer will actually clone+resize each frame.
             let dimensions = decoded.as_ref().map(ImageBlock::dimensions);
             let block = decoded.map(|b| b.downscaled(MAX_RASTER_PX));
-            ResultImage { mime_type, block, dimensions }
+            ResultImage {
+                mime_type,
+                block,
+                dimensions,
+            }
         })
         .collect()
 }

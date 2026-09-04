@@ -14,8 +14,8 @@
 use std::sync::{Arc, Mutex};
 
 use cyrup_core::{
-    TerminateHint,
-    CancelToken, Content, ExtensionId, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink,
+    CancelToken, Content, ExtensionId, TerminateHint, Tool, ToolCallId, ToolError, ToolResult,
+    ToolUpdateSink,
 };
 use cyrup_ext::{ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension};
 
@@ -29,12 +29,18 @@ pub struct ToolExtension {
 impl ToolExtension {
     /// An extension named `test-tools` that registers `tools` (built-in names override built-ins).
     pub fn new(tools: Vec<Arc<dyn Tool>>) -> Self {
-        Self { id: ExtensionId::from("test-tools"), tools }
+        Self {
+            id: ExtensionId::from("test-tools"),
+            tools,
+        }
     }
 
     /// An extension with a caller-chosen id (for loading several disjoint tool sets).
     pub fn with_id(id: impl Into<String>, tools: Vec<Arc<dyn Tool>>) -> Self {
-        Self { id: ExtensionId::from(id.into()), tools }
+        Self {
+            id: ExtensionId::from(id.into()),
+            tools,
+        }
     }
 }
 
@@ -114,7 +120,10 @@ impl Tool for SyntheticTool {
         self.calls
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(SyntheticCall { call_id: call_id.to_string(), params });
+            .push(SyntheticCall {
+                call_id: call_id.to_string(),
+                params,
+            });
         Ok(ToolResult {
             content: vec![Content::text(self.result_text.clone())],
             details: None,

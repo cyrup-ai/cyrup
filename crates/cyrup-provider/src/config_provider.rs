@@ -11,9 +11,7 @@
 //! together/openai providers are constructed ([`crate::wire::WireProvider`]).
 
 use crate::api::builtin_registry;
-use crate::auth::{
-    Credential, CredentialStore, InMemoryCredentialStore, ProviderAuth, env_key,
-};
+use crate::auth::{Credential, CredentialStore, InMemoryCredentialStore, ProviderAuth, env_key};
 use crate::context::Context;
 use crate::model::Model;
 use crate::provider::Provider;
@@ -53,8 +51,7 @@ impl ConfigProvider {
         // `env_key` with no vars: a stored credential owns the provider (used here); with none stored
         // it resolves to "not configured" rather than reading an unrelated env var.
         let auth = ProviderAuth::with_api_key(env_key("API key", Vec::<String>::new()));
-        let inner =
-            WireProvider::new(id, name, models, auth, store, Arc::new(builtin_registry()));
+        let inner = WireProvider::new(id, name, models, auth, store, Arc::new(builtin_registry()));
         Self { inner }
     }
 
@@ -109,11 +106,7 @@ impl Provider for ConfigProvider {
     }
 
     /// PROV-M01 — trait default returns the catalog unchanged.
-    fn filter_models(
-        &self,
-        models: &[Model],
-        credential: Option<&Credential>,
-    ) -> Vec<Model> {
+    fn filter_models(&self, models: &[Model], credential: Option<&Credential>) -> Vec<Model> {
         self.inner.filter_models(models, credential)
     }
 
@@ -182,7 +175,12 @@ mod tests {
 
     #[test]
     fn exposes_registration_catalog() {
-        let p = ConfigProvider::new("acme", "Acme", Some("sk-acme".into()), vec![model("acme-1", "https://acme.test/v1")]);
+        let p = ConfigProvider::new(
+            "acme",
+            "Acme",
+            Some("sk-acme".into()),
+            vec![model("acme-1", "https://acme.test/v1")],
+        );
         assert_eq!(p.id().as_str(), "acme");
         assert!(p.get_model("acme-1").is_some());
     }
@@ -203,7 +201,11 @@ mod tests {
             Some("sk-acme".into()),
             vec![model("acme-1", "https://acme.test/v1")],
         );
-        assert_ne!("Acme Machines, Inc.", p.id().as_str(), "fixture must not agree with the default");
+        assert_ne!(
+            "Acme Machines, Inc.",
+            p.id().as_str(),
+            "fixture must not agree with the default"
+        );
         assert_eq!(Provider::name(&p), "Acme Machines, Inc.");
     }
 
@@ -214,11 +216,18 @@ mod tests {
         let mut m = model("acme-1", "http://127.0.0.1:1/v1");
         m.base_url = "http://127.0.0.1:1/v1".to_string();
         let p = ConfigProvider::new("acme", "Acme", Some("sk-acme".into()), vec![m.clone()]);
-        let msg = collect_message(p.stream(&m, &Context::default(), &StreamOptions::default())).await;
+        let msg =
+            collect_message(p.stream(&m, &Context::default(), &StreamOptions::default())).await;
         assert_eq!(msg.stop_reason, StopReason::Error);
         let err = msg.error_message.unwrap();
-        assert!(!err.contains("not configured"), "seeded key should resolve, got: {err}");
-        assert!(err.contains("transport"), "expected transport error, got: {err}");
+        assert!(
+            !err.contains("not configured"),
+            "seeded key should resolve, got: {err}"
+        );
+        assert!(
+            err.contains("transport"),
+            "expected transport error, got: {err}"
+        );
     }
 
     /// No key → the provider streams as "not configured" (Pi requires apiKey/oauth for models).
@@ -226,7 +235,8 @@ mod tests {
     async fn missing_key_is_not_configured() {
         let m = model("acme-1", "http://127.0.0.1:1/v1");
         let p = ConfigProvider::new("acme", "Acme", None, vec![m.clone()]);
-        let msg = collect_message(p.stream(&m, &Context::default(), &StreamOptions::default())).await;
+        let msg =
+            collect_message(p.stream(&m, &Context::default(), &StreamOptions::default())).await;
         assert_eq!(msg.stop_reason, StopReason::Error);
         assert!(msg.error_message.unwrap().contains("not configured"));
     }

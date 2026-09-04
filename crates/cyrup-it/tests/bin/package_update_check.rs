@@ -11,7 +11,12 @@
 //! These tests build actual git repos with the `git` binary (which is what the feature drives, so
 //! stubbing it would test nothing) and drive `cyrup::update_check` over them. No network is touched:
 //! `origin` is a local path, so `git ls-remote origin` resolves entirely on disk.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -237,7 +242,10 @@ async fn an_offline_policy_suppresses_the_check_over_a_real_stale_install() {
         1,
         "precondition: the package really is out of date"
     );
-    let offline = NetworkPolicy { offline: true, ..ONLINE };
+    let offline = NetworkPolicy {
+        offline: true,
+        ..ONLINE
+    };
     assert!(
         cyrup::update_check::check_for_available_updates(store, offline)
             .await

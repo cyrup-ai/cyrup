@@ -136,13 +136,24 @@ impl<B: Backend> App<B> {
                     // `custom-message.ts:82-84`'s `catch { /* Fall through to default rendering */ }`.
                     // Carried through as the host produced it: `Rendered::Live` must reach the
                     // entry intact so `entry_lines` can re-render it per frame.
-                    self.state.transcript.push_custom_message_rendered(kind, body, rendered.clone());
+                    self.state.transcript.push_custom_message_rendered(
+                        kind,
+                        body,
+                        rendered.clone(),
+                    );
                 }
             }
-            AgentSessionEvent::MessageUpdate { assistant_message_event, .. } => {
+            AgentSessionEvent::MessageUpdate {
+                assistant_message_event,
+                ..
+            } => {
                 self.ingest_stream_event(&assistant_message_event);
             }
-            AgentSessionEvent::ToolExecutionStart { tool_call_id, tool_name, args } => {
+            AgentSessionEvent::ToolExecutionStart {
+                tool_call_id,
+                tool_name,
+                args,
+            } => {
                 // Pi's `edit` renderCall fires `computeEditsDiff` the moment the streamed arguments
                 // are complete (edit.ts:377-386) so the diff is on screen while the call is still
                 // pending. `ToolExecutionStart` IS that moment here: cyrup emits it with the full
@@ -171,12 +182,13 @@ impl<B: Backend> App<B> {
                 // tool name.
                 // EXT-006: an extension that declared a renderer for THIS tool supplies the call
                 // header; `None` keeps the built-in per-tool dispatch.
-                // `hasRendererDefinition()` (tool-execution.ts:103-105) — resolved off the live
-                // `getToolDefinition` registry one frame up, in
-                // [`Self::ingest_session_event_owned`], because this fold holds no session. It is
-                // what decides whether an unrendered tool draws as a bold name + ten-line preview
-                // or as `formatToolExecution`'s full argument dump.
-                let has_definition = self.state.known_tool_definitions.contains(&tool_name);
+                // `hasRendererDefinition()` (tool-execution.ts:103-105) and `getRenderShell()`
+                // (`:108-116`) — resolved off the live `getToolDefinition` registry one frame up,
+                // in [`Self::ingest_session_event_owned`], because this fold holds no session. The
+                // first decides whether an unrendered tool draws as a bold name + ten-line preview
+                // or as `formatToolExecution`'s full argument dump; the second whether the block
+                // gets the tinted `Box(1, 1)` shell or the tool's own framing (EXT-024).
+                let definition = self.state.known_tool_definitions.get(&tool_name).copied();
                 self.state.transcript.push_tool_start_defined(
                     tool_name,
                     Some(tool_call_id.as_str().to_string()),
@@ -184,19 +196,30 @@ impl<B: Backend> App<B> {
                     // A tool ROW is a string surface: it has no live-component tier, so the
                     // outcome is flattened here rather than carried.
                     rendered.clone().into_text(),
-                    has_definition,
+                    definition,
                 );
                 if let Some(preview) = preview {
-                    self.state.transcript.set_edit_preview(Some(tool_call_id.as_str()), preview);
+                    self.state
+                        .transcript
+                        .set_edit_preview(Some(tool_call_id.as_str()), preview);
                 }
             }
-            AgentSessionEvent::ToolExecutionUpdate { tool_call_id, partial_result, .. } => {
+            AgentSessionEvent::ToolExecutionUpdate {
+                tool_call_id,
+                partial_result,
+                ..
+            } => {
                 // Pi: `this.pendingTools.get(event.toolCallId)` (interactive-mode.ts:3104).
                 self.state
                     .transcript
                     .push_tool_update(Some(tool_call_id.as_str()), Some(partial_result));
             }
-            AgentSessionEvent::ToolExecutionEnd { tool_call_id, tool_name, is_error, result } => {
+            AgentSessionEvent::ToolExecutionEnd {
+                tool_call_id,
+                tool_name,
+                is_error,
+                result,
+            } => {
                 // The full `{content, details, terminate}` result flows through so `renderResult` can
                 // reach each tool's `details` (edit `diff`, bash/read truncation, …), and the
                 // `toolCallId` routes it to the run that made THIS call (`:3113`).
@@ -220,7 +243,10 @@ impl<B: Backend> App<B> {
             // pending-messages region and re-render. TUI-016 — cyrup used to keep only the COUNT
             // (`status.set_queued`) and, since the fidelity pass deleted the `{n} queued` footer
             // segment, rendered it nowhere; the texts were dropped on the floor here.
-            AgentSessionEvent::QueueUpdate { steering, follow_up } => {
+            AgentSessionEvent::QueueUpdate {
+                steering,
+                follow_up,
+            } => {
                 self.state.session_queue = (steering, follow_up);
                 // TUI-031 — the region shows the UNION of the session's queues and the compaction
                 // queue, as `getAllQueuedMessages` does (`interactive-mode.ts:3942-3953`).
@@ -251,11 +277,19 @@ impl<B: Backend> App<B> {
                 // it disappears the moment `clearStatusIndicator` runs. cyrup was ALSO pushing the
                 // identical string into the transcript, which `insert_before` then froze into
                 // scrollback as a permanent dim `• Compacting context...` row upstream never writes.
-                self.state.indicator.set(IndicatorKind::Compaction, Some(msg));
+                self.state
+                    .indicator
+                    .set(IndicatorKind::Compaction, Some(msg));
                 // Pi rebinds `defaultEditor.onEscape` to `abortCompaction` here (`:3080-3086`).
                 self.state.compacting = true;
             }
-            AgentSessionEvent::CompactionEnd { reason, result, aborted, error_message, .. } => {
+            AgentSessionEvent::CompactionEnd {
+                reason,
+                result,
+                aborted,
+                error_message,
+                ..
+            } => {
                 // Pi `case "compaction_end"` (`interactive-mode.ts:3090-3092`): clears
                 // unconditionally, even when this was an AUTO-compaction inside a still-streaming
                 // turn. Pi's own `agent_end` then re-clears; the visible effect is a brief gap in
@@ -293,7 +327,9 @@ impl<B: Backend> App<B> {
                 // `compact error: …` where pi reads `Compaction cancelled`) is closed.
                 if !matches!(reason, CompactionReason::Manual) {
                     if aborted {
-                        self.state.transcript.push_status("Auto-compaction cancelled");
+                        self.state
+                            .transcript
+                            .push_status("Auto-compaction cancelled");
                     } else if let Some(msg) = error_message {
                         self.state.transcript.push_error(msg);
                     } else if let Some(res) = result {
@@ -326,7 +362,12 @@ impl<B: Backend> App<B> {
                 // Pi restores the previous Escape handler here (`:3094-3097`).
                 self.state.compacting = false;
             }
-            AgentSessionEvent::AutoRetryStart { attempt, max_attempts, delay_ms, .. } => {
+            AgentSessionEvent::AutoRetryStart {
+                attempt,
+                max_attempts,
+                delay_ms,
+                ..
+            } => {
                 // Pi's exact retry copy (status-indicator.ts:46-47): `Retrying (a/max) in Ns...`,
                 // where N starts at `Math.ceil(delayMs / 1000)` and is then re-set every second by a
                 // `CountdownTimer` (`:55-64`, `countdown-timer.ts:21-30`). `set_retry` owns that
@@ -337,7 +378,9 @@ impl<B: Backend> App<B> {
                 // chat write. The mirrored `• Retrying (1/3) in 30s...` row was cyrup-only, and
                 // being a snapshot of a ticking countdown it froze at whatever second it was
                 // pushed.
-                self.state.indicator.set_retry(attempt, max_attempts, delay_ms);
+                self.state
+                    .indicator
+                    .set_retry(attempt, max_attempts, delay_ms);
             }
             AgentSessionEvent::SummarizationRetryScheduled {
                 attempt,
@@ -352,15 +395,18 @@ impl<B: Backend> App<B> {
                 // RetryStatusIndicator(...))` (`interactive-mode.ts:3367-3374`) — the error goes to
                 // the chat, the countdown stays in the band (X18).
                 self.state.transcript.push_error(error_message);
-                self.state.indicator.set_retry(attempt, max_attempts, delay_ms);
+                self.state
+                    .indicator
+                    .set_retry(attempt, max_attempts, delay_ms);
             }
             AgentSessionEvent::SummarizationRetryAttemptStart { source } => {
                 // Pi `interactive-mode.ts:3231-3240`: clear the retry indicator and RECREATE the
                 // underlying one from `source` — that is the only reason the event carries it.
                 let (kind, msg) = match source {
-                    SummarizationRetrySource::BranchSummary => {
-                        (IndicatorKind::BranchSummary, "Summarizing branch...".to_string())
-                    }
+                    SummarizationRetrySource::BranchSummary => (
+                        IndicatorKind::BranchSummary,
+                        "Summarizing branch...".to_string(),
+                    ),
                     SummarizationRetrySource::Compaction { reason } => (
                         IndicatorKind::Compaction,
                         match reason {
@@ -397,9 +443,11 @@ impl<B: Backend> App<B> {
                 } else {
                     self.state.indicator.idle();
                 }
-                self.state
-                    .transcript
-                    .push_status(if success { "retry succeeded" } else { "retry ended" });
+                self.state.transcript.push_status(if success {
+                    "retry succeeded"
+                } else {
+                    "retry ended"
+                });
             }
             AgentSessionEvent::ModelChanged { provider, model } => {
                 let label = format!("{provider}/{model}");
@@ -412,7 +460,9 @@ impl<B: Backend> App<B> {
                 // must push it, or a `/model` switch from a subscription provider to a metered one
                 // would keep printing ` (sub)` (and vice versa).
                 self.refresh_subscription_marker();
-                self.state.transcript.push_status(format!("model → {label}"));
+                self.state
+                    .transcript
+                    .push_status(format!("model → {label}"));
             }
             AgentSessionEvent::ThinkingLevelChanged { level } => {
                 // Pi's `thinking_level_changed` handler (interactive-mode.ts:2804-2807) only
@@ -428,7 +478,9 @@ impl<B: Backend> App<B> {
             AgentSessionEvent::SessionInfoChanged { name } => {
                 // Pi `interactive-mode.ts:2784` mirrors the renamed session into the header/status.
                 let label = name.clone().unwrap_or_default();
-                self.state.transcript.push_status(format!("session renamed → {label}"));
+                self.state
+                    .transcript
+                    .push_status(format!("session renamed → {label}"));
                 // Pi's `session_info_changed` arm (`interactive-mode.ts:2900-2903`) is
                 // `updateTerminalTitle()` + `footer.invalidate()`: the new name reaches BOTH the
                 // footer's location line (` • {name}`, footer.ts:116-130) and the window title. The
@@ -467,7 +519,9 @@ impl<B: Backend> App<B> {
                     // pre-existing one-line receipt for that case only — strictly additive over
                     // "nothing", and it never competes with a renderer, because a renderer that
                     // produced output (or faulted) took the branch above.
-                    self.state.transcript.push_status(format!("entry appended → {ty}"));
+                    self.state
+                        .transcript
+                        .push_status(format!("entry appended → {ty}"));
                 }
             }
             // pi routes `session_start`/`session_shutdown` to EXTENSIONS ONLY — declared
@@ -540,5 +594,4 @@ impl<B: Backend> App<B> {
             _ => {}
         }
     }
-
 }

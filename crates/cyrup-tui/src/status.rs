@@ -26,11 +26,11 @@
 //!   `str::len` (spec/tui/01 §8).
 
 use cyrup_core::Usage;
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use crate::component::Component;
 use crate::text_width::{str_width, truncate_parts, truncate_to_width};
@@ -144,7 +144,10 @@ pub struct StatusLine {
 impl StatusLine {
     /// A fresh footer with the given model label.
     pub fn new(model: impl Into<String>) -> Self {
-        StatusLine { model: model.into(), ..Self::default() }
+        StatusLine {
+            model: model.into(),
+            ..Self::default()
+        }
     }
 
     pub fn set_model(&mut self, model: impl Into<String>) {
@@ -161,9 +164,15 @@ impl StatusLine {
     pub fn add_usage(&mut self, turn: &Usage) {
         self.add_usage_totals(turn);
         // Latest-turn cache-hit rate over the turn's full prompt (`footer.ts:102-105`).
-        let prompt = turn.input.saturating_add(turn.cache_read).saturating_add(turn.cache_write);
-        self.latest_cache_hit =
-            if prompt > 0 { Some((turn.cache_read as f64 / prompt as f64) * 100.0) } else { None };
+        let prompt = turn
+            .input
+            .saturating_add(turn.cache_read)
+            .saturating_add(turn.cache_write);
+        self.latest_cache_hit = if prompt > 0 {
+            Some((turn.cache_read as f64 / prompt as f64) * 100.0)
+        } else {
+            None
+        };
     }
 
     /// Accumulate usage that is NOT an assistant turn — today, the usage a tool reported for its own
@@ -294,7 +303,11 @@ impl StatusLine {
 
     /// Footer **line 1**: `~/path (branch) • session` (`footer.ts:116-130`).
     pub fn location_text(&self) -> String {
-        let mut s = if self.cwd.is_empty() { String::new() } else { self.cwd.clone() };
+        let mut s = if self.cwd.is_empty() {
+            String::new()
+        } else {
+            self.cwd.clone()
+        };
         if let Some(branch) = &self.branch {
             if !s.is_empty() {
                 s.push(' ');
@@ -334,22 +347,38 @@ impl StatusLine {
     fn left_segments(&self) -> Vec<(String, SegStyle)> {
         let mut segs: Vec<(String, SegStyle)> = Vec::new();
         if self.usage.input > 0 {
-            segs.push((format!("↑{}", format_tokens(self.usage.input)), SegStyle::Dim));
+            segs.push((
+                format!("↑{}", format_tokens(self.usage.input)),
+                SegStyle::Dim,
+            ));
         }
         if self.usage.output > 0 {
-            segs.push((format!("↓{}", format_tokens(self.usage.output)), SegStyle::Dim));
+            segs.push((
+                format!("↓{}", format_tokens(self.usage.output)),
+                SegStyle::Dim,
+            ));
         }
         if self.usage.cache_read > 0 {
-            segs.push((format!("R{}", format_tokens(self.usage.cache_read)), SegStyle::Dim));
+            segs.push((
+                format!("R{}", format_tokens(self.usage.cache_read)),
+                SegStyle::Dim,
+            ));
         }
         if self.usage.cache_write > 0 {
-            segs.push((format!("W{}", format_tokens(self.usage.cache_write)), SegStyle::Dim));
+            segs.push((
+                format!("W{}", format_tokens(self.usage.cache_write)),
+                SegStyle::Dim,
+            ));
         }
         if let Some(hit) = self.cache_hit_rate() {
             segs.push((format!("CH{hit:.1}%"), SegStyle::Dim));
         }
         if self.usage.cost.total > 0.0 || self.using_subscription {
-            let sub = if self.using_subscription { " (sub)" } else { "" };
+            let sub = if self.using_subscription {
+                " (sub)"
+            } else {
+                ""
+            };
             segs.push((format!("${:.3}{sub}", self.usage.cost.total), SegStyle::Dim));
         }
         // The context segment is UNCONDITIONAL upstream — `statsParts.push(contextPercentStr)` at
@@ -403,9 +432,17 @@ impl StatusLine {
     /// The right cluster **without** the optional `(provider)` prefix (`footer.ts:184-189`):
     /// `{model}`, plus ` • thinking off` / ` • {level}` when the model supports reasoning.
     fn right_cluster(&self) -> String {
-        let model = if self.model.is_empty() { "no-model" } else { self.model.as_str() };
+        let model = if self.model.is_empty() {
+            "no-model"
+        } else {
+            self.model.as_str()
+        };
         if self.reasoning {
-            let level = if self.thinking_level.is_empty() { "off" } else { self.thinking_level.as_str() };
+            let level = if self.thinking_level.is_empty() {
+                "off"
+            } else {
+                self.thinking_level.as_str()
+            };
             if level == "off" {
                 format!("{model} • thinking off")
             } else if self.thinking_hidden {
@@ -505,7 +542,11 @@ fn sanitize_status_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut prev_space = false;
     for ch in text.chars() {
-        let c = if matches!(ch, '\r' | '\n' | '\t') { ' ' } else { ch };
+        let c = if matches!(ch, '\r' | '\n' | '\t') {
+            ' '
+        } else {
+            ch
+        };
         if c == ' ' {
             if !prev_space {
                 out.push(' ');
@@ -558,7 +599,11 @@ impl StatusLine {
             && let Some(provider) = self.provider.as_deref()
         {
             let with_provider = format!("({provider}) {base_right}");
-            if left_width.saturating_add(2).saturating_add(str_width(&with_provider)) <= width {
+            if left_width
+                .saturating_add(2)
+                .saturating_add(str_width(&with_provider))
+                <= width
+            {
                 right = with_provider;
             }
         }
@@ -617,7 +662,10 @@ fn truncate_spans(
     ellipsis: &str,
     ellipsis_style: Style,
 ) -> Vec<Span<'static>> {
-    let total = spans.iter().map(|s| str_width(&s.content)).fold(0usize, usize::saturating_add);
+    let total = spans
+        .iter()
+        .map(|s| str_width(&s.content))
+        .fold(0usize, usize::saturating_add);
     if total <= max {
         return spans;
     }
@@ -646,7 +694,12 @@ fn truncate_spans(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 mod tests {
     use super::StatusLine;
 
@@ -671,6 +724,9 @@ mod tests {
         status.set_extension_status("ext", "busy");
         assert!(status.has_extension_statuses());
         status.set_extension_status("ext", "   ");
-        assert!(!status.has_extension_statuses(), "blank value removes the entry");
+        assert!(
+            !status.has_extension_statuses(),
+            "blank value removes the entry"
+        );
     }
 }

@@ -69,8 +69,8 @@ fn google_thinking_override_threads_budget_and_level() {
         })),
         ..Default::default()
     };
-    let tc = build_body(&m, &user_ctx("think"), &opts)["generationConfig"]["thinkingConfig"]
-        .clone();
+    let tc =
+        build_body(&m, &user_ctx("think"), &opts)["generationConfig"]["thinkingConfig"].clone();
     // Pi: { includeThoughts: true, thinkingBudget: -1 }.
     assert_eq!(tc, json!({ "includeThoughts": true, "thinkingBudget": -1 }));
 
@@ -86,10 +86,13 @@ fn google_thinking_override_threads_budget_and_level() {
         })),
         ..Default::default()
     };
-    let tc = build_body(&m, &user_ctx("think"), &opts)["generationConfig"]["thinkingConfig"]
-        .clone();
+    let tc =
+        build_body(&m, &user_ctx("think"), &opts)["generationConfig"]["thinkingConfig"].clone();
     // Pi: { includeThoughts: true, thinkingLevel: "MEDIUM" } (no thinkingBudget).
-    assert_eq!(tc, json!({ "includeThoughts": true, "thinkingLevel": "MEDIUM" }));
+    assert_eq!(
+        tc,
+        json!({ "includeThoughts": true, "thinkingLevel": "MEDIUM" })
+    );
 
     // 3. enabled:false override DISABLES thinking even though unified reasoning is High → the
     //    model's disabled config (Pi `model.reasoning && options.thinking && !enabled`,
@@ -105,8 +108,8 @@ fn google_thinking_override_threads_budget_and_level() {
         })),
         ..Default::default()
     };
-    let tc = build_body(&m, &user_ctx("think"), &opts)["generationConfig"]["thinkingConfig"]
-        .clone();
+    let tc =
+        build_body(&m, &user_ctx("think"), &opts)["generationConfig"]["thinkingConfig"].clone();
     assert_eq!(tc, json!({ "thinkingBudget": 0 }));
 
     // 4. without the override, the unified `reasoning` lowering still drives the bytes (32768),
@@ -115,7 +118,7 @@ fn google_thinking_override_threads_budget_and_level() {
         reasoning: ModelThinkingLevel::High,
         ..Default::default()
     };
-    let tc = build_body(&m, &user_ctx("think"), &opts)["generationConfig"]["thinkingConfig"]
-        .clone();
+    let tc =
+        build_body(&m, &user_ctx("think"), &opts)["generationConfig"]["thinkingConfig"].clone();
     assert_eq!(tc["thinkingBudget"], 32768);
 }

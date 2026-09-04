@@ -91,7 +91,10 @@ pub fn reset_timings(namespace: TimingLabel) {
     let Ok(mut ns) = namespaces().lock() else {
         return;
     };
-    let fresh = TimingNamespace { timings: Vec::new(), last: Instant::now() };
+    let fresh = TimingNamespace {
+        timings: Vec::new(),
+        last: Instant::now(),
+    };
     match ns.iter_mut().find(|(k, _)| *k == namespace) {
         // `Map.set` on an existing key REPLACES the value and keeps the key's original position.
         Some((_, slot)) => *slot = fresh,
@@ -110,10 +113,17 @@ pub fn time(label: &str, namespace: TimingLabel) {
         return;
     };
     if !ns.iter().any(|(k, _)| *k == namespace) {
-        ns.push((namespace, TimingNamespace { timings: Vec::new(), last: now }));
+        ns.push((
+            namespace,
+            TimingNamespace {
+                timings: Vec::new(),
+                last: now,
+            },
+        ));
     }
     if let Some((_, slot)) = ns.iter_mut().find(|(k, _)| *k == namespace) {
-        slot.timings.push((label.to_string(), now.duration_since(slot.last).as_millis()));
+        slot.timings
+            .push((label.to_string(), now.duration_since(slot.last).as_millis()));
         slot.last = now;
     }
 }
@@ -173,10 +183,17 @@ mod tests {
         let mut ns = namespaces().lock().unwrap();
         let now = Instant::now();
         if !ns.iter().any(|(k, _)| *k == namespace) {
-            ns.push((namespace, TimingNamespace { timings: Vec::new(), last: now }));
+            ns.push((
+                namespace,
+                TimingNamespace {
+                    timings: Vec::new(),
+                    last: now,
+                },
+            ));
         }
         let slot = &mut ns.iter_mut().find(|(k, _)| *k == namespace).unwrap().1;
-        slot.timings.push((label.to_string(), now.duration_since(slot.last).as_millis()));
+        slot.timings
+            .push((label.to_string(), now.duration_since(slot.last).as_millis()));
         slot.last = now;
     }
 
@@ -191,8 +208,15 @@ mod tests {
         let main = recorded_labels(TimingLabel::Main);
         let ext = recorded_labels(TimingLabel::Extensions);
         assert!(main.iter().any(|l| l == "parseArgs"), "{main:?}");
-        assert!(!main.iter().any(|l| l.contains("module import")), "no bleed into main: {main:?}");
-        assert_eq!(ext, vec!["/ext/a module import", "/ext/a factory"], "{ext:?}");
+        assert!(
+            !main.iter().any(|l| l.contains("module import")),
+            "no bleed into main: {main:?}"
+        );
+        assert_eq!(
+            ext,
+            vec!["/ext/a module import", "/ext/a factory"],
+            "{ext:?}"
+        );
         // Printing is side-effect-only; just ensure it does not panic with two groups present.
         print_timings();
     }
@@ -213,7 +237,9 @@ mod tests {
         }
         time("never-recorded", TimingLabel::Main);
         assert!(
-            !recorded_labels(TimingLabel::Main).iter().any(|l| l == "never-recorded"),
+            !recorded_labels(TimingLabel::Main)
+                .iter()
+                .any(|l| l == "never-recorded"),
             "a disabled `time` must not push a mark"
         );
     }

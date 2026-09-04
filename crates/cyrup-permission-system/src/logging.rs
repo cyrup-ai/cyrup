@@ -132,7 +132,11 @@ impl PermissionSystemLogger {
     /// pi `createPermissionSystemLogger({ getConfig })` (`index.ts:148-150`).
     #[must_use]
     pub fn new(config: SharedExtensionConfig, default_logs_dir: PathBuf) -> Self {
-        PermissionSystemLogger { config, default_logs_dir, write_lock: Mutex::new(()) }
+        PermissionSystemLogger {
+            config,
+            default_logs_dir,
+            write_lock: Mutex::new(()),
+        }
     }
 
     /// pi `logger.debug` (`logging.ts:88-94`): the diagnostic stream. Gated on `config.debug` — a
@@ -181,7 +185,9 @@ impl PermissionSystemLogger {
     /// `options.getConfig().debug` (v0.8.0 `logging.ts:91`) — read by the `debug` stream ONLY;
     /// `review` is unconditional since v0.8.0.
     fn enabled(&self) -> bool {
-        self.config.lock().map_or_else(|e| e.into_inner().debug, |c| c.debug)
+        self.config
+            .lock()
+            .map_or_else(|e| e.into_inner().debug, |c| c.debug)
     }
 
     /// pi `writeLine` (`logging.ts:64-86`): resolve the path, `mkdir -p` the log dir (returning its
@@ -198,7 +204,10 @@ impl PermissionSystemLogger {
         // — so a `details` key of the same name overwrites, exactly as `...details` does.
         let mut record = Map::new();
         record.insert("timestamp".to_string(), Value::String(iso_timestamp()));
-        record.insert("extension".to_string(), Value::String(EXTENSION_ID.to_string()));
+        record.insert(
+            "extension".to_string(),
+            Value::String(EXTENSION_ID.to_string()),
+        );
         record.insert("stream".to_string(), Value::String(stream.to_string()));
         record.insert("event".to_string(), Value::String(event.to_string()));
         if let Value::Object(map) = details {
@@ -218,7 +227,10 @@ impl PermissionSystemLogger {
         // `[CYRUP-DELTA] 1` + `3`: serialized under the write lock, and the io error is REPORTED
         // rather than swallowed (see the module header). A poisoned lock still writes — a panicking
         // writer elsewhere must not silently disable the audit trail.
-        let _guard = self.write_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let append = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -285,7 +297,10 @@ impl AuditTrail {
 
     /// pi `setLoggingWarningReporter(reporter)` (`index.ts:170-172`).
     pub fn set_reporter(&self, reporter: LoggingWarningReporter) {
-        *self.reporter.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reporter);
+        *self
+            .reporter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reporter);
     }
 
     /// pi `writeDebugEntry` (`index.ts:196-198`) → `writeLogEntry("debug", …)`.
@@ -317,7 +332,10 @@ impl AuditTrail {
     /// the reporter, and remember it so a persistently broken trail cannot notify on every entry.
     pub fn report_logging_warning(&self, message: &str) {
         let reporter = {
-            let slot = self.reporter.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let slot = self
+                .reporter
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             match slot.as_ref() {
                 // pi `:175-177`: no reporter ⇒ return WITHOUT adding to the set.
                 None => return,
@@ -326,8 +344,10 @@ impl AuditTrail {
         };
         // Scoped so the memo lock is released before the reporter runs — it reaches the host.
         let is_new = {
-            let mut reported =
-                self.reported.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut reported = self
+                .reported
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             reported.insert(message.to_string())
         };
         if is_new {
@@ -390,7 +410,11 @@ pub fn sensitive_log_metadata(value: Option<&str>) -> Value {
     // The digest is unaffected by the unit question below: node's `hash.update(string)` defaults to
     // utf8, so both sides hash the same bytes.
     hasher.update(value.as_bytes());
-    let hex = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let hex = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
     // PERM-028 — `length` is pi's `value.length`, i.e. UTF-16 CODE UNITS, not UTF-8 bytes.
     // `str::len()` counted bytes, so "café" logged 5 where pi logs 4 and an emoji logged 4 where pi
     // logs 2. The field exists so a redacted entry can still be correlated against another trail,
@@ -412,14 +436,19 @@ mod tests {
     use crate::ext_config::ExtensionConfig;
 
     fn logger_with(debug: bool, dir: &Path) -> PermissionSystemLogger {
-        let config = ExtensionConfig { debug, ..ExtensionConfig::default() };
+        let config = ExtensionConfig {
+            debug,
+            ..ExtensionConfig::default()
+        };
         PermissionSystemLogger::new(Arc::new(StdMutex::new(config)), dir.join(LOGS_DIR_NAME))
     }
 
     fn read_lines(dir: &Path) -> Vec<Value> {
         let path = debug_path(&dir.join(LOGS_DIR_NAME));
         let text = std::fs::read_to_string(path).unwrap_or_default();
-        text.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).collect()
+        text.lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .collect()
     }
 
     // Regression test for pi `logging.ts:64-86` + `:96-102`: a `review` entry under
@@ -431,7 +460,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let logger = logger_with(true, dir.path());
 
-        assert_eq!(logger.review("permission_request.blocked", &serde_json::json!({"toolName": "bash"})), None);
+        assert_eq!(
+            logger.review(
+                "permission_request.blocked",
+                &serde_json::json!({"toolName": "bash"})
+            ),
+            None
+        );
         logger.flush();
 
         let lines = read_lines(dir.path());
@@ -439,10 +474,16 @@ mod tests {
         let entry = &lines[0];
         assert_eq!(entry["extension"], Value::String(EXTENSION_ID.to_string()));
         assert_eq!(entry["stream"], Value::String("review".to_string()));
-        assert_eq!(entry["event"], Value::String("permission_request.blocked".to_string()));
+        assert_eq!(
+            entry["event"],
+            Value::String("permission_request.blocked".to_string())
+        );
         assert_eq!(entry["toolName"], Value::String("bash".to_string()));
         let ts = entry["timestamp"].as_str().unwrap();
-        assert!(ts.ends_with('Z') && ts.len() == 24, "pi `toISOString()` shape, got {ts}");
+        assert!(
+            ts.ends_with('Z') && ts.len() == 24,
+            "pi `toISOString()` shape, got {ts}"
+        );
     }
 
     // v0.8.0 `logging.ts:98-100`: `review` is a bare `writeLine` — the four-line
@@ -454,12 +495,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let logger = logger_with(false, dir.path());
 
-        assert_eq!(logger.review("permission_request.blocked", &serde_json::json!({"n": 1})), None);
+        assert_eq!(
+            logger.review("permission_request.blocked", &serde_json::json!({"n": 1})),
+            None
+        );
 
         let lines = read_lines(dir.path());
-        assert_eq!(lines.len(), 1, "the security-review stream is not gated on `debug`");
+        assert_eq!(
+            lines.len(),
+            1,
+            "the security-review stream is not gated on `debug`"
+        );
         assert_eq!(lines[0]["stream"], Value::String("review".to_string()));
-        assert_eq!(lines[0]["event"], Value::String("permission_request.blocked".to_string()));
+        assert_eq!(
+            lines[0]["event"],
+            Value::String("permission_request.blocked".to_string())
+        );
     }
 
     // MIRROR for the above: v0.8.0 `logging.ts:90-93` keeps the guard on the DIAGNOSTIC stream, so
@@ -506,7 +557,11 @@ mod tests {
     #[test]
     fn sensitive_metadata_length_is_utf16_code_units() {
         let cafe = sensitive_log_metadata(Some("café"));
-        assert_eq!(cafe["length"], serde_json::json!(4), "UTF-8 bytes would say 5");
+        assert_eq!(
+            cafe["length"],
+            serde_json::json!(4),
+            "UTF-8 bytes would say 5"
+        );
         assert_eq!(cafe["present"], serde_json::json!(true));
 
         // A surrogate pair counts 2, so "a😀b" is 4 — not 3 scalars and not 6 bytes.
@@ -521,9 +576,7 @@ mod tests {
         assert_eq!(ascii["length"], serde_json::json!(3));
         assert_eq!(
             ascii["sha256"],
-            serde_json::json!(
-                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-            ),
+            serde_json::json!("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
             "sha256(\"abc\") must be unchanged by the length-unit fix"
         );
 
@@ -544,14 +597,19 @@ mod tests {
         // concurrent sibling's trail into this directory. Pinned per-thread, no sibling can see it
         // and no sibling can be redirected — which is why the module's trail lock is gone, not moved.
         let result = {
-            let _pin =
-                crate::envx::pin(LOGS_DIR_ENV_KEY, Some(&overridden.display().to_string()));
+            let _pin = crate::envx::pin(LOGS_DIR_ENV_KEY, Some(&overridden.display().to_string()));
             logger.review("permission_request.blocked", &serde_json::json!({}))
         };
 
         assert_eq!(result, None);
-        assert!(debug_path(&overridden).exists(), "the override dir must receive the trail");
-        assert!(!dir.path().join(LOGS_DIR_NAME).exists(), "the default dir must be untouched");
+        assert!(
+            debug_path(&overridden).exists(),
+            "the override dir must receive the trail"
+        );
+        assert!(
+            !dir.path().join(LOGS_DIR_NAME).exists(),
+            "the default dir must be untouched"
+        );
     }
 
     // pi `createSensitiveLogMetadata` (`index.ts:682-692`).

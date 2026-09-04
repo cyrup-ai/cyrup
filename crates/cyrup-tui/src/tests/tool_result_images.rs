@@ -19,11 +19,16 @@
 //! (`Paragraph … .wrap()`, and `Terminal::insert_before` for scrollback), which would corrupt such a
 //! sequence. The upside over Pi is that the image survives into native scrollback instead of
 //! degrading to text once the turn commits.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
+use crate::{App, UiTheme};
 use base64::Engine as _;
 use cyrup_session_svc::AgentSessionEvent;
-use crate::{App, UiTheme};
 use image::{Rgba, RgbaImage};
 use ratatui::backend::TestBackend;
 use ratatui::style::Color;
@@ -42,7 +47,10 @@ fn red_png_base64(w: u32, h: u32) -> String {
     }
     let mut bytes: Vec<u8> = Vec::new();
     image::DynamicImage::ImageRgba8(img)
-        .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
         .unwrap();
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
@@ -74,7 +82,12 @@ fn run_read_tool(app: &mut App<TestBackend>, result: serde_json::Value) {
 
 /// Any buffer cell painted in the test image's red — proof real pixels landed, not text.
 fn painted_red(app: &App<TestBackend>) -> bool {
-    app.terminal().backend().buffer().content().iter().any(|c| c.fg == RED || c.bg == RED)
+    app.terminal()
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .any(|c| c.fg == RED || c.bg == RED)
 }
 
 /// Any committed scrollback span painted in the test image's red.
@@ -93,9 +106,16 @@ fn tool_result_image_renders_inline_instead_of_the_literal_placeholder() {
     run_read_tool(&mut app, image_result(&red_png_base64(24, 24)));
     app.draw().unwrap();
 
-    assert!(painted_red(&app), "the tool-result image must paint real cells:\n{}", live_text(&app));
+    assert!(
+        painted_red(&app),
+        "the tool-result image must paint real cells:\n{}",
+        live_text(&app)
+    );
     let out = app.scrollback_text();
-    assert!(!out.contains("[image]"), "the literal `[image]` placeholder must be gone; got:\n{out}");
+    assert!(
+        !out.contains("[image]"),
+        "the literal `[image]` placeholder must be gone; got:\n{out}"
+    );
 }
 
 /// A half-block raster is ordinary cells, so it survives the commit into native scrollback.
@@ -104,7 +124,10 @@ fn a_committed_tool_result_image_keeps_its_pixels_in_scrollback() {
     let mut app = new_app();
     run_read_tool(&mut app, image_result(&red_png_base64(24, 24)));
     // End the turn: the live tool block commits and flushes through `insert_before`.
-    app.ingest_event(&AgentSessionEvent::AgentEnd { messages: Vec::new(), will_retry: false });
+    app.ingest_event(&AgentSessionEvent::AgentEnd {
+        messages: Vec::new(),
+        will_retry: false,
+    });
     app.draw().unwrap();
 
     assert!(
@@ -121,7 +144,10 @@ fn show_images_off_renders_pis_image_fallback_text() {
     let mut app = new_app();
     app.state_mut().transcript.set_show_images(false);
     run_read_tool(&mut app, image_result(&red_png_base64(24, 24)));
-    app.ingest_event(&AgentSessionEvent::AgentEnd { messages: Vec::new(), will_retry: false });
+    app.ingest_event(&AgentSessionEvent::AgentEnd {
+        messages: Vec::new(),
+        will_retry: false,
+    });
     app.draw().unwrap();
 
     let out = app.scrollback_text();
@@ -129,8 +155,14 @@ fn show_images_off_renders_pis_image_fallback_text() {
         out.contains("[Image: [image/png] 24x24]"),
         "images-off must show Pi's fallback indicator; got:\n{out}"
     );
-    assert!(!scrollback_painted_red(&app), "images-off must not paint the raster");
-    assert!(!out.contains("[image]"), "the old literal placeholder must be gone; got:\n{out}");
+    assert!(
+        !scrollback_painted_red(&app),
+        "images-off must not paint the raster"
+    );
+    assert!(
+        !out.contains("[image]"),
+        "the old literal placeholder must be gone; got:\n{out}"
+    );
 }
 
 /// An image block whose payload cannot be decoded still tells the user an image came back, rather
@@ -144,7 +176,10 @@ fn an_undecodable_image_block_falls_back_to_text() {
             "content": [{ "type": "image", "data": "not-base64-!!", "mimeType": "image/png" }]
         }),
     );
-    app.ingest_event(&AgentSessionEvent::AgentEnd { messages: Vec::new(), will_retry: false });
+    app.ingest_event(&AgentSessionEvent::AgentEnd {
+        messages: Vec::new(),
+        will_retry: false,
+    });
     app.draw().unwrap();
 
     let out = app.scrollback_text();
@@ -161,11 +196,17 @@ fn the_text_part_of_an_image_result_still_renders() {
     let mut app = new_app();
     app.state_mut().transcript.tool_expanded = true;
     run_read_tool(&mut app, image_result(&red_png_base64(16, 16)));
-    app.ingest_event(&AgentSessionEvent::AgentEnd { messages: Vec::new(), will_retry: false });
+    app.ingest_event(&AgentSessionEvent::AgentEnd {
+        messages: Vec::new(),
+        will_retry: false,
+    });
     app.draw().unwrap();
 
     let out = app.scrollback_text();
-    assert!(out.contains("Read image file [image/png]"), "the text note still renders; got:\n{out}");
+    assert!(
+        out.contains("Read image file [image/png]"),
+        "the text note still renders; got:\n{out}"
+    );
 }
 
 /// The `[Image: …]` indicator reports the SOURCE pixel size, even though the raster the renderer
@@ -175,7 +216,10 @@ fn the_fallback_reports_the_source_dimensions_of_a_large_image() {
     let mut app = new_app();
     app.state_mut().transcript.set_show_images(false);
     run_read_tool(&mut app, image_result(&red_png_base64(2048, 1024)));
-    app.ingest_event(&AgentSessionEvent::AgentEnd { messages: Vec::new(), will_retry: false });
+    app.ingest_event(&AgentSessionEvent::AgentEnd {
+        messages: Vec::new(),
+        will_retry: false,
+    });
     app.draw().unwrap();
 
     let out = app.scrollback_text();
@@ -191,13 +235,19 @@ fn image_width_cells_clamps_the_raster() {
     let mut narrow = new_app();
     narrow.state_mut().transcript.set_image_width_cells(4);
     run_read_tool(&mut narrow, image_result(&red_png_base64(64, 64)));
-    narrow.ingest_event(&AgentSessionEvent::AgentEnd { messages: Vec::new(), will_retry: false });
+    narrow.ingest_event(&AgentSessionEvent::AgentEnd {
+        messages: Vec::new(),
+        will_retry: false,
+    });
     narrow.draw().unwrap();
 
     let mut wide = new_app();
     wide.state_mut().transcript.set_image_width_cells(40);
     run_read_tool(&mut wide, image_result(&red_png_base64(64, 64)));
-    wide.ingest_event(&AgentSessionEvent::AgentEnd { messages: Vec::new(), will_retry: false });
+    wide.ingest_event(&AgentSessionEvent::AgentEnd {
+        messages: Vec::new(),
+        will_retry: false,
+    });
     wide.draw().unwrap();
 
     let cells = |app: &App<TestBackend>| -> usize {
@@ -210,7 +260,10 @@ fn image_width_cells_clamps_the_raster() {
     };
     let (n, w) = (cells(&narrow), cells(&wide));
     assert!(n > 0 && w > 0, "both rasters painted ({n} vs {w})");
-    assert!(w > n, "a wider imageWidthCells must paint more cells: {w} vs {n}");
+    assert!(
+        w > n,
+        "a wider imageWidthCells must paint more cells: {w} vs {n}"
+    );
 }
 
 fn live_text(app: &App<TestBackend>) -> String {
@@ -242,7 +295,10 @@ fn no_image_protocol_renders_the_fallback_text_not_a_raster() {
     let mut app = new_app();
     app.state_mut().transcript.set_graphical_images(false);
     run_read_tool(&mut app, image_result(&red_png_base64(24, 24)));
-    app.ingest_event(&AgentSessionEvent::AgentEnd { messages: Vec::new(), will_retry: false });
+    app.ingest_event(&AgentSessionEvent::AgentEnd {
+        messages: Vec::new(),
+        will_retry: false,
+    });
     app.draw().unwrap();
 
     let out = app.scrollback_text();
@@ -250,5 +306,8 @@ fn no_image_protocol_renders_the_fallback_text_not_a_raster() {
         out.contains("[Image: [image/png] 24x24]"),
         "a no-protocol terminal must get Pi's fallback indicator; got:\n{out}"
     );
-    assert!(!scrollback_painted_red(&app), "a no-protocol terminal must not paint a raster");
+    assert!(
+        !scrollback_painted_red(&app),
+        "a no-protocol terminal must not paint a raster"
+    );
 }

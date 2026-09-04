@@ -31,9 +31,7 @@ pub(super) fn map_tool_choice(tc: &ToolChoice) -> Value {
 /// "strict tools are unsupported" arm is unreachable here. The `Result` is still load-bearing —
 /// a `strict: "require"` tool whose schema cannot be converted to the strict subset fails the
 /// request with the conversion's own reason.
-pub(super) fn to_function_tools(
-    tools: &[ToolDef],
-) -> Result<Vec<Value>, ConstrainedSamplingError> {
+pub(super) fn to_function_tools(tools: &[ToolDef]) -> Result<Vec<Value>, ConstrainedSamplingError> {
     tools
         .iter()
         .map(|t| {

@@ -135,7 +135,9 @@ impl NestedRunView {
         // pi's nested row prefers a single `agent` and falls back to the `agents` list (`:76-78`);
         // a one-step run has the former, a multi-step run the latter.
         let agents: Vec<String> = status.steps.iter().map(|s| s.agent.clone()).collect();
-        let single = (agents.len() == 1).then(|| agents.first().cloned()).flatten();
+        let single = (agents.len() == 1)
+            .then(|| agents.first().cloned())
+            .flatten();
         // The run's telemetry rolls up from whichever step is live (`RunStatus::sync_top_level_
         // telemetry`), so the model/thinking shown is that step's.
         let live = status
@@ -145,7 +147,11 @@ impl NestedRunView {
         Self {
             id: id.into(),
             agent: single,
-            agents: if agents.len() == 1 { Vec::new() } else { agents },
+            agents: if agents.len() == 1 {
+                Vec::new()
+            } else {
+                agents
+            },
             mode: Some(status.mode),
             state: crate::background::run_status::run_state_label(status.state).to_string(),
             model: live.and_then(|s| s.model.as_ref().map(|m| m.as_str().to_string())),
@@ -443,6 +449,14 @@ pub struct FleetState {
     pub current_session_id: Option<String>,
     /// pi `state.parentSessionFile` — the artifacts-dir resolver's first input (`fleet.ts:336`).
     pub parent_session_file: Option<PathBuf>,
+    /// SUBA-091 — pi `state.trustedSessionRoots` (`extension/index.ts:447` initialised `[]`,
+    /// re-seeded per session at `:895-898` @v0.64.0 from `config.defaultSessionDir` and the
+    /// parent session's subagent session root): the ONLY roots the detail pane's session-JSONL
+    /// fallback (`fleet.ts:557` → `readSessionTranscriptTail`) may read a recorded `sessionFile`
+    /// under. Seeded by the producer (`SubagentExecutor::fleet_state`) through the extension's
+    /// `paths::trusted_session_roots`; empty means every session transcript read is refused,
+    /// exactly as pi's `[]` does.
+    pub trusted_session_roots: Vec<PathBuf>,
     /// pi `state.foregroundControls` (a `Map` upstream; ordered by
     /// [`ForegroundControlView::updated_at`] descending at `fleet.ts:142`).
     pub foreground_controls: Vec<ForegroundControlView>,
@@ -468,7 +482,12 @@ pub struct FleetState {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 mod tests {
     use super::*;
     use crate::background::{RunId, RunPaths, RunStatus, StepStatus};
@@ -481,7 +500,8 @@ mod tests {
     }
 
     fn run(steps: Vec<StepStatus>) -> RunStatus {
-        let mut status = RunStatus::queued(RunId::from_token("r1".to_string()), RunMode::Chain, None);
+        let mut status =
+            RunStatus::queued(RunId::from_token("r1".to_string()), RunMode::Chain, None);
         status.steps = steps;
         status.started_at = 1_000;
         status.last_update = 2_000;
@@ -493,19 +513,37 @@ mod tests {
     /// both, or neither, is what makes a nested row render blank or doubled.
     #[test]
     fn a_one_step_nested_run_names_one_agent_and_a_multi_step_run_lists_them() {
-        let one = NestedRunView::from_run_status("n1", &run(vec![step("solo", StepState::Running)]), None);
+        let one = NestedRunView::from_run_status(
+            "n1",
+            &run(vec![step("solo", StepState::Running)]),
+            None,
+        );
         assert_eq!(one.agent.as_deref(), Some("solo"));
-        assert!(one.agents.is_empty(), "the list form must stay empty when there is a single agent");
+        assert!(
+            one.agents.is_empty(),
+            "the list form must stay empty when there is a single agent"
+        );
 
         let many = NestedRunView::from_run_status(
             "n2",
-            &run(vec![step("first", StepState::Complete), step("second", StepState::Running)]),
+            &run(vec![
+                step("first", StepState::Complete),
+                step("second", StepState::Running),
+            ]),
             Some(3),
         );
         assert_eq!(many.agent, None, "no single agent to name");
         assert_eq!(many.agents, vec!["first".to_string(), "second".to_string()]);
-        assert_eq!(many.parent_step_index, Some(3), "the owner step the row hangs off");
-        assert_eq!(many.steps.len(), 2, "one level deep, but that level in full");
+        assert_eq!(
+            many.parent_step_index,
+            Some(3),
+            "the owner step the row hangs off"
+        );
+        assert_eq!(
+            many.steps.len(),
+            2,
+            "one level deep, but that level in full"
+        );
     }
 
     /// The model/thinking a nested row shows comes from the LIVE step (`current_step`), not from
@@ -537,7 +575,12 @@ mod tests {
         only.model = Some(ModelId::from("m0"));
         let mut status = run(vec![only]);
         status.current_step = None;
-        assert_eq!(NestedRunView::from_run_status("n", &status, None).model.as_deref(), Some("m0"));
+        assert_eq!(
+            NestedRunView::from_run_status("n", &status, None)
+                .model
+                .as_deref(),
+            Some("m0")
+        );
 
         // …and a run with no steps at all projects no model rather than panicking.
         let empty = NestedRunView::from_run_status("n", &run(Vec::new()), None);
@@ -592,7 +635,11 @@ mod tests {
         let mut unique = labels.clone();
         unique.sort_unstable();
         unique.dedup();
-        assert_eq!(unique.len(), labels.len(), "each state renders distinctly: {labels:?}");
+        assert_eq!(
+            unique.len(),
+            labels.len(),
+            "each state renders distinctly: {labels:?}"
+        );
     }
 
     /// [`AsyncRunView`]'s four accessors are what the roster sorts and labels by.
@@ -614,7 +661,10 @@ mod tests {
         };
         assert_eq!(view.updated_at(), 2_000, "the run's own last_update");
         assert!(view.is_active(), "a Running run holds the roster row open");
-        assert_eq!(view.state_label(), crate::background::run_status::run_state_label(crate::background::RunState::Running));
+        assert_eq!(
+            view.state_label(),
+            crate::background::run_status::run_state_label(crate::background::RunState::Running)
+        );
         assert!(view.dir().ends_with("r1"));
     }
 }

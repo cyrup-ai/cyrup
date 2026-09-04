@@ -18,11 +18,14 @@ use crate::error::SubagentError;
 /// scope) would supply real [`ChainStepConfig`] values directly rather than going through
 /// `step_count`.
 #[derive(Clone, Debug, Default)]
-#[allow(dead_code, reason = "exercised only by this file's own direct-primitive unit tests below \
+#[allow(
+    dead_code,
+    reason = "exercised only by this file's own direct-primitive unit tests below \
     (create_chain_with_steps/update_chain_full below are the real production entry points, called \
     from handlers.rs); pre-existing asymmetry preserved verbatim from the original flat management.rs, \
     where these were silently externally-reachable through the top-level `pub mod management` and so \
-    never tripped dead_code — nesting them in this private submodule makes that reachability honest")]
+    never tripped dead_code — nesting them in this private submodule makes that reachability honest"
+)]
 pub struct ChainFields {
     pub name: Option<String>,
     pub description: Option<String>,
@@ -300,8 +303,8 @@ fn serialize_chain_json(def: &ChainDefinition) -> String {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
-    use super::*;
     use super::super::test_support::sample_chain;
+    use super::*;
 
     #[test]
     fn create_chain_rejects_builtin_source() {
@@ -332,13 +335,19 @@ mod tests {
 
     #[test]
     fn update_chain_rejects_builtin_and_package_sources() {
-        let builtin = sample_chain(AgentSource::Builtin, PathBuf::from("/builtin/release.chain.json"));
+        let builtin = sample_chain(
+            AgentSource::Builtin,
+            PathBuf::from("/builtin/release.chain.json"),
+        );
         assert!(matches!(
             update_chain(&builtin, &ChainFields::default()),
             Err(SubagentError::ReadOnlySource(_))
         ));
 
-        let package = sample_chain(AgentSource::Package, PathBuf::from("/pkg/release.chain.json"));
+        let package = sample_chain(
+            AgentSource::Package,
+            PathBuf::from("/pkg/release.chain.json"),
+        );
         assert!(matches!(
             update_chain(&package, &ChainFields::default()),
             Err(SubagentError::ReadOnlySource(_))
@@ -347,13 +356,19 @@ mod tests {
 
     #[test]
     fn delete_chain_rejects_builtin_and_package_sources() {
-        let builtin = sample_chain(AgentSource::Builtin, PathBuf::from("/builtin/release.chain.json"));
+        let builtin = sample_chain(
+            AgentSource::Builtin,
+            PathBuf::from("/builtin/release.chain.json"),
+        );
         assert!(matches!(
             delete_chain(&builtin),
             Err(SubagentError::ReadOnlySource(_))
         ));
 
-        let package = sample_chain(AgentSource::Package, PathBuf::from("/pkg/release.chain.json"));
+        let package = sample_chain(
+            AgentSource::Package,
+            PathBuf::from("/pkg/release.chain.json"),
+        );
         assert!(matches!(
             delete_chain(&package),
             Err(SubagentError::ReadOnlySource(_))
@@ -362,13 +377,19 @@ mod tests {
 
     #[test]
     fn rename_chain_rejects_builtin_and_package_sources() {
-        let builtin = sample_chain(AgentSource::Builtin, PathBuf::from("/builtin/release.chain.json"));
+        let builtin = sample_chain(
+            AgentSource::Builtin,
+            PathBuf::from("/builtin/release.chain.json"),
+        );
         assert!(matches!(
             rename_chain(&builtin, "new-name"),
             Err(SubagentError::ReadOnlySource(_))
         ));
 
-        let package = sample_chain(AgentSource::Package, PathBuf::from("/pkg/release.chain.json"));
+        let package = sample_chain(
+            AgentSource::Package,
+            PathBuf::from("/pkg/release.chain.json"),
+        );
         assert!(matches!(
             rename_chain(&package, "new-name"),
             Err(SubagentError::ReadOnlySource(_))

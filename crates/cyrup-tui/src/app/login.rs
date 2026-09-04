@@ -28,7 +28,10 @@ impl<B: Backend> App<B> {
     /// Pi's `Provider` interface carries `name`; cyrup's does not (the display name lives on the
     /// concrete `WireProvider`), so the name comes from [`crate::provider_display_name`] — the same
     /// `getProviderDisplayName` fallback the picker already used for its labels.
-    pub(crate) async fn login_provider_inputs(&self, session: &Arc<AgentSession>) -> Vec<ProviderLoginInput> {
+    pub(crate) async fn login_provider_inputs(
+        &self,
+        session: &Arc<AgentSession>,
+    ) -> Vec<ProviderLoginInput> {
         Self::build_login_inputs(session, self.login_providers.as_deref()).await
     }
 
@@ -198,7 +201,11 @@ impl<B: Backend> App<B> {
 
     /// `handleLoginCommand(providerRef?)` (`interactive-mode.ts:4994-5026`), routed through the
     /// ported [`cyrup_config::login::resolve_login_command`].
-    pub(crate) async fn handle_login_command(&mut self, session: &Arc<AgentSession>, arg: Option<String>) {
+    pub(crate) async fn handle_login_command(
+        &mut self,
+        session: &Arc<AgentSession>,
+        arg: Option<String>,
+    ) {
         let inputs = self.login_provider_inputs(session).await;
         let options = cyrup_config::login::login_provider_options(&inputs, None);
         match cyrup_config::login::resolve_login_command(arg.as_deref(), &options) {
@@ -268,17 +275,16 @@ impl<B: Backend> App<B> {
     ) {
         let options = cyrup_config::login::login_provider_options(inputs, auth_type);
         if options.is_empty() {
-            self.state
-                .transcript
-                .push_status(cyrup_config::login::provider_selector_empty_message(auth_type));
+            self.state.transcript.push_status(
+                cyrup_config::login::provider_selector_empty_message(auth_type),
+            );
             return;
         }
         // S5/S21: the real `OAuthSelectorComponent` (`oauth-selector.ts`) — search `Input`, fuzzy
         // filter, coloured status runs — in place of the bare `ListSelector`. `initialSearchInput`
         // (`:5124`) now lands where upstream puts it: seeded into the search box (`:99`), not
         // reported as a status line.
-        let selector =
-            crate::OAuthSelector::new(crate::OAuthMode::Login, &options, initial_search);
+        let selector = crate::OAuthSelector::new(crate::OAuthMode::Login, &options, initial_search);
         self.state.login_options = options;
         self.open_boxed_selector(SelectorKind::Login, Box::new(selector));
     }
@@ -291,13 +297,15 @@ impl<B: Backend> App<B> {
     /// `showLoginDialog` / `showApiKeyLoginDialog` only because of two cosmetic differences — the
     /// amazon-bedrock `showDetails` block (`:5266-5272`; that provider is unported, see
     /// `providers/all.rs`) and the failure-message wording, which [`LoginFinished::oauth`] carries.
-    pub(crate) fn begin_provider_login(&mut self, session: &Arc<AgentSession>, option: LoginProviderOption) {
+    pub(crate) fn begin_provider_login(
+        &mut self,
+        session: &Arc<AgentSession>,
+        option: LoginProviderOption,
+    ) {
         match cyrup_config::login::start_provider_login(&option) {
             // `showAmbientAuthDialog(providerOption)` (`:5023`, `:5229-5250`): a dialog with a
             // single info line and a close hint. Nothing to run, so no task is spawned.
-            LoginStep::Ambient {
-                title, message, ..
-            } => {
+            LoginStep::Ambient { title, message, .. } => {
                 self.open_login_dialog(title);
                 if let Some(dialog) = self.login_dialog_mut() {
                     dialog.show_info(&message, &[], true);
@@ -332,14 +340,9 @@ impl<B: Backend> App<B> {
                     // `await this.session.modelRuntime.login(providerId, method, {…})`
                     // (`interactive-mode.ts:5368`) — `Models.login` persists into the credential
                     // store itself, so there is no separate write here.
-                    let result = cyrup_config::login::login(
-                        &*store,
-                        &inputs,
-                        &id,
-                        auth_type,
-                        &interaction,
-                    )
-                    .await;
+                    let result =
+                        cyrup_config::login::login(&*store, &inputs, &id, auth_type, &interaction)
+                            .await;
                     let finished = match result {
                         Ok(_) => LoginFinished {
                             provider_id: id.as_str().to_string(),

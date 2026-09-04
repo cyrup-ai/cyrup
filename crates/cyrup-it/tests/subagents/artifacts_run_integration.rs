@@ -17,14 +17,11 @@
 
 use std::path::PathBuf;
 
-
-use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::artifacts::project_artifacts_dir;
 use cyrup_ext_subagents::extension::SubagentsExtension;
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 use cyrup_ext_subagents::spawn::SpawnCommand;
-
-
 
 fn fixture_binary_path() -> PathBuf {
     crate::support::bins::subagent_fixture()
@@ -76,7 +73,6 @@ fn artifact_file_names(dir: &std::path::Path) -> Vec<String> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_real_foreground_run_writes_the_four_artifact_files() {
-
     let work_dir = tempfile::tempdir().expect("real tempdir for the fixture persona + cwd");
     let home_dir = tempfile::tempdir().expect("real tempdir to isolate CYRUP_HOME artifacts");
     write_fixture_persona(work_dir.path(), "worker");
@@ -123,13 +119,28 @@ async fn a_real_foreground_run_writes_the_four_artifact_files() {
     let executor = extension.executor().clone();
 
     let result = executor
-        .run_foreground(work_dir.path(), "worker", "do the trivial thing", None, None, None)
+        .run_foreground(
+            work_dir.path(),
+            "worker",
+            "do the trivial thing",
+            None,
+            None,
+            None,
+        )
         .await;
 
     let result = result.expect("the foreground run completes without an orchestration-level error");
-    assert_eq!(result.exit_code, 0, "the fixture child exits cleanly; error: {:?}", result.error);
+    assert_eq!(
+        result.exit_code, 0,
+        "the fixture child exits cleanly; error: {:?}",
+        result.error
+    );
     assert!(
-        result.final_output.as_deref().unwrap_or("").contains("ARTIFACT_TEST_OUTPUT"),
+        result
+            .final_output
+            .as_deref()
+            .unwrap_or("")
+            .contains("ARTIFACT_TEST_OUTPUT"),
         "the run's final output must carry the fixture child's emitted text"
     );
 
@@ -142,10 +153,22 @@ async fn a_real_foreground_run_writes_the_four_artifact_files() {
 
     // All four artifact files (the `<runId>_worker` base is random; assert one of each suffix).
     let has_suffix = |suffix: &str| names.iter().any(|n| n.ends_with(suffix));
-    assert!(has_suffix("_input.md"), "missing _input.md artifact; got: {names:?}");
-    assert!(has_suffix("_output.md"), "missing _output.md artifact; got: {names:?}");
-    assert!(has_suffix(".jsonl"), "missing .jsonl artifact; got: {names:?}");
-    assert!(has_suffix("_meta.json"), "missing _meta.json artifact; got: {names:?}");
+    assert!(
+        has_suffix("_input.md"),
+        "missing _input.md artifact; got: {names:?}"
+    );
+    assert!(
+        has_suffix("_output.md"),
+        "missing _output.md artifact; got: {names:?}"
+    );
+    assert!(
+        has_suffix(".jsonl"),
+        "missing .jsonl artifact; got: {names:?}"
+    );
+    assert!(
+        has_suffix("_meta.json"),
+        "missing _meta.json artifact; got: {names:?}"
+    );
 
     // The output artifact carries the delivered answer; the input artifact carries the task.
     let output_file = names.iter().find(|n| n.ends_with("_output.md")).unwrap();
@@ -161,18 +184,17 @@ async fn a_real_foreground_run_writes_the_four_artifact_files() {
         "the _input.md artifact must contain the task the child was given; got: {input_body:?}"
     );
 
-    // R-SA-058: the per-attempt raw-stdout tee `run_sync` writes under `.cyrup-subagent-scratch`
+    // R-SA-058: the per-attempt raw-stdout tee `run_sync` writes under `attempt_scratch_dir(cwd)`
+    // (SUBA-072: `<temp_root_dir>/scratch/<cwd_key>`, never under the project tree)
     // is this run's persisted, observable child record and survives the orchestrator — exactly as
     // it does on every other spawn path in this crate (the tool single/parallel/chain fan-outs and
     // the background hop-2 runner all leave it in place; it is the observation channel
     // `tool_parallel_chain_integration`/`companions_wiring_proof` read back). It is NOT swept by the
     // foreground orchestrator: mirroring pi, which never deletes its persisted child NDJSON stream
-    // and only cleans the transient `os.tmpdir()` prompt/task-overflow dir (`runs/shared/pi-args.ts:233-236`
-    // `cleanupTempDir`, `execution.ts:1109`) that lives outside the working tree.
+    // and only cleans the transient `os.tmpdir()` prompt/task-overflow dir (`runs/shared/pi-args.ts:1052-1059`
+    // `cleanupTempDir` @v0.64.0, `execution.ts:491`) that lives outside the working tree.
     let tee = std::fs::read_to_string(
-        work_dir
-            .path()
-            .join(".cyrup-subagent-scratch")
+        cyrup_ext_subagents::background::attempt_scratch_dir(work_dir.path())
             .join("attempt-0.jsonl"),
     )
     .unwrap_or_default();
@@ -180,5 +202,12 @@ async fn a_real_foreground_run_writes_the_four_artifact_files() {
         !tee.is_empty(),
         "the per-attempt raw-stdout tee is this run's persisted child record and must survive the \
          foreground orchestrator (it must not be swept away with the scratch dir)"
+    );
+    // SUBA-072: and that record lives under the crate's run-scratch root — the project working
+    // tree gets NO `.cyrup-subagent-scratch/` (the pre-fix location, pi's `os.tmpdir()`-rooted
+    // per-spawn scratch never touches the project: `runs/shared/pi-args.ts:787` @v0.64.0).
+    assert!(
+        !work_dir.path().join(".cyrup-subagent-scratch").exists(),
+        "a real subagent run must leave no scratch directory in the project working tree"
     );
 }

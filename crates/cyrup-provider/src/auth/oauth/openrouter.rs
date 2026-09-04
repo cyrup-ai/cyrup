@@ -237,7 +237,8 @@ impl CallbackHandler for OpenRouterCallbackHandler {
         // `:172-175` — the pathname half is checked by the shared server; this is the method half.
         if request.method != "GET" {
             return CallbackOutcome::Continue {
-                reply: CallbackReply::error(404, "OAuth callback route not found.", None).no_store(),
+                reply: CallbackReply::error(404, "OAuth callback route not found.", None)
+                    .no_store(),
             };
         }
 
@@ -424,14 +425,21 @@ impl OpenRouterOAuth {
             Ok(text) => Some(text),
             Err(error) => {
                 if ok {
-                    return Err(map_transport_error(&error, cancel, Some(INVALID_JSON_MESSAGE)));
+                    return Err(map_transport_error(
+                        &error,
+                        cancel,
+                        Some(INVALID_JSON_MESSAGE),
+                    ));
                 }
                 None
             }
         };
 
         let empty = serde_json::Map::new();
-        let body = match text.as_deref().map(serde_json::from_str::<serde_json::Value>) {
+        let body = match text
+            .as_deref()
+            .map(serde_json::from_str::<serde_json::Value>)
+        {
             // `:105` — only a non-array object is adopted; anything else leaves `body = {}`.
             Some(Ok(serde_json::Value::Object(map))) => map,
             Some(Ok(_)) => empty,
@@ -755,7 +763,10 @@ mod tests {
 
     #[test]
     fn url_fragment_is_not_searchable() {
-        assert_eq!(parse_authorization_input("http://localhost/cb#code=nope"), None);
+        assert_eq!(
+            parse_authorization_input("http://localhost/cb#code=nope"),
+            None
+        );
     }
 
     #[test]
@@ -908,7 +919,10 @@ mod tests {
             .unwrap();
 
         let (head, body) = server.recorded();
-        assert!(head.starts_with("POST /api/v1/auth/keys HTTP/1.1"), "{head}");
+        assert!(
+            head.starts_with("POST /api/v1/auth/keys HTTP/1.1"),
+            "{head}"
+        );
         // openrouter.ts:99
         let lower = head.to_lowercase();
         assert!(lower.contains("accept: application/json"), "{head}");
@@ -986,7 +1000,10 @@ mod tests {
             .exchange_authorization_code("CODE", "VERIF", None)
             .await
             .unwrap_err();
-        assert_eq!(err.to_string(), "OpenRouter OAuth response carries no \"key\"");
+        assert_eq!(
+            err.to_string(),
+            "OpenRouter OAuth response carries no \"key\""
+        );
     }
 
     #[tokio::test]
@@ -1047,10 +1064,13 @@ mod tests {
     /// Block until the flow has published its authorize URL, exactly as a TUI would.
     async fn await_auth_url(interaction: &ScriptedInteraction) -> String {
         loop {
-            let found = interaction.events().into_iter().find_map(|event| match event {
-                AuthEvent::AuthUrl { url, .. } => Some(url),
-                _ => None,
-            });
+            let found = interaction
+                .events()
+                .into_iter()
+                .find_map(|event| match event {
+                    AuthEvent::AuthUrl { url, .. } => Some(url),
+                    _ => None,
+                });
             if let Some(url) = found {
                 return url;
             }
@@ -1059,7 +1079,9 @@ mod tests {
     }
 
     fn callback_url_of(authorize: &str) -> String {
-        let (_, query) = authorize.split_once('?').expect("authorize URL has a query");
+        let (_, query) = authorize
+            .split_once('?')
+            .expect("authorize URL has a query");
         parse_query(query)
             .into_iter()
             .find(|(k, _)| k == "callback_url")
@@ -1085,7 +1107,10 @@ mod tests {
         assert!(authorize.contains("&code_challenge_method=S256"));
         let callback_url = callback_url_of(&authorize);
         // openrouter.ts:210/232 — loopback, ephemeral port, per-login UUID path.
-        assert!(callback_url.starts_with("http://127.0.0.1:"), "{callback_url}");
+        assert!(
+            callback_url.starts_with("http://127.0.0.1:"),
+            "{callback_url}"
+        );
         assert!(callback_url.contains("/oauth/callback/"), "{callback_url}");
 
         let response =
@@ -1143,7 +1168,10 @@ mod tests {
             "http://127.0.0.1:1/oauth/callback/z?code=PASTED".to_string(),
         )]));
 
-        let cred = flow.login(interaction.as_ref()).await.expect("login succeeds");
+        let cred = flow
+            .login(interaction.as_ref())
+            .await
+            .expect("login succeeds");
         match &cred {
             Credential::Oauth { access, .. } => assert_eq!(access, "sk-or-v1-pasted"),
             other => panic!("expected oauth credential, got {other:?}"),
@@ -1171,11 +1199,9 @@ mod tests {
         );
 
         // openrouter.ts:293
-        assert!(
-            interaction.events().contains(&AuthEvent::Progress {
-                message: "Exchanging authorization code for an API key...".to_string(),
-            })
-        );
+        assert!(interaction.events().contains(&AuthEvent::Progress {
+            message: "Exchanging authorization code for an API key...".to_string(),
+        }));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1209,7 +1235,10 @@ mod tests {
         .await
         .unwrap();
         // openrouter.ts:184
-        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{response}");
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+            "{response}"
+        );
         assert!(response.contains("OpenRouter authorization was denied."));
         assert!(response.contains("User said no"));
 
@@ -1267,11 +1296,10 @@ mod tests {
         assert!(first.contains("OpenRouter returned no authorization code."));
 
         // A second, good redirect still completes the login.
-        let second = tokio::task::spawn_blocking(move || {
-            browser_get(&format!("{callback_url}?code=LATER"))
-        })
-        .await
-        .unwrap();
+        let second =
+            tokio::task::spawn_blocking(move || browser_get(&format!("{callback_url}?code=LATER")))
+                .await
+                .unwrap();
         assert!(second.starts_with("HTTP/1.1 200 OK\r\n"), "{second}");
         match login.await.unwrap().expect("login succeeds") {
             Credential::Oauth { access, .. } => assert_eq!(access, "sk-or-v1-second"),
@@ -1296,7 +1324,10 @@ mod tests {
                 .await
                 .unwrap();
         // openrouter.ts:202
-        assert!(response.starts_with("HTTP/1.1 502 Bad Gateway\r\n"), "{response}");
+        assert!(
+            response.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
+            "{response}"
+        );
         assert!(response.contains("OpenRouter key exchange failed."));
         // openrouter.ts:120 with the `:72` detail rung.
         assert!(

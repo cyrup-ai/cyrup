@@ -73,7 +73,10 @@ impl SessionManager {
     /// self-parent entries); a well-formed session has exactly one root.
     pub fn tree(&self) -> Vec<TreeNode> {
         let mut visited = std::collections::HashSet::new();
-        self.roots.iter().filter_map(|id| self.build_node(id, &mut visited)).collect()
+        self.roots
+            .iter()
+            .filter_map(|id| self.build_node(id, &mut visited))
+            .collect()
     }
 
     fn build_node(
@@ -87,8 +90,15 @@ impl SessionManager {
         }
         let entry = self.entry(id)?.clone();
         let mut kids = self.children.get(id).cloned().unwrap_or_default();
-        kids.sort_by_key(|k| self.entry(k).and_then(|e| e.base()).map(|b| b.timestamp.clone()));
-        let children = kids.iter().filter_map(|k| self.build_node(k, visited)).collect();
+        kids.sort_by_key(|k| {
+            self.entry(k)
+                .and_then(|e| e.base())
+                .map(|b| b.timestamp.clone())
+        });
+        let children = kids
+            .iter()
+            .filter_map(|k| self.build_node(k, visited))
+            .collect();
         Some(TreeNode {
             entry,
             children,

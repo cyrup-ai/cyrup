@@ -84,7 +84,13 @@ pub struct PaneLaunchError {
 /// identical to upstream.
 impl std::fmt::Display for PaneLaunchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} project pane error ({}): {}", self.backend, self.code.as_str(), self.message)
+        write!(
+            f,
+            "{} project pane error ({}): {}",
+            self.backend,
+            self.code.as_str(),
+            self.message
+        )
     }
 }
 
@@ -164,8 +170,10 @@ pub trait ProjectPaneLauncher: Send + Sync {
     ///
     /// # Errors
     /// A [`PaneLaunchError`] whose `code` is the real condition, never a catch-all.
-    async fn open(&self, request: ProjectPaneRequest<'_>)
-    -> Result<ProjectPaneLaunch, PaneLaunchError>;
+    async fn open(
+        &self,
+        request: ProjectPaneRequest<'_>,
+    ) -> Result<ProjectPaneLaunch, PaneLaunchError>;
 }
 
 /// The launcher substituted when no backend is configured. Every call answers
@@ -213,9 +221,14 @@ impl ProjectPaneLauncher for UnavailableLauncher {
 /// `Project target '<path>' is not a directory.` (`:183`, verbatim).
 pub fn resolve_project_root(base: &Path, cwd: &str) -> Result<PathBuf, String> {
     let resolved = crate::cwd::resolve_path(base, cwd);
-    let is_dir = std::fs::metadata(&resolved).map(|m| m.is_dir()).unwrap_or(false);
+    let is_dir = std::fs::metadata(&resolved)
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
     if !is_dir {
-        return Err(format!("Project target '{}' is not a directory.", resolved.display()));
+        return Err(format!(
+            "Project target '{}' is not a directory.",
+            resolved.display()
+        ));
     }
     Ok(std::fs::canonicalize(&resolved).unwrap_or(resolved))
 }
@@ -236,7 +249,10 @@ fn parse_last_json(value: &str) -> Option<serde_json::Value> {
         return Some(v);
     }
     // `trimmed.split(/\r?\n/).reverse()` — `str::lines` splits on the same pair.
-    trimmed.lines().rev().find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+    trimmed
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
 }
 
 /// `String(value)` for the two error fields upstream stringifies (`:117`, `:134`). A JSON string
@@ -246,7 +262,9 @@ fn parse_last_json(value: &str) -> Option<serde_json::Value> {
 /// the object's JSON instead. The divergence is only reachable when a backend puts a non-string in
 /// `error.message`, and the Rust form is strictly more diagnosable.
 fn js_string(value: &serde_json::Value) -> String {
-    value.as_str().map_or_else(|| value.to_string(), str::to_string)
+    value
+        .as_str()
+        .map_or_else(|| value.to_string(), str::to_string)
 }
 
 /// `extractPaneId(value)` (`project-agent.ts:164-172`): look inside `value.pane` when that is an
@@ -254,10 +272,15 @@ fn js_string(value: &serde_json::Value) -> String {
 /// string. Arrays are rejected — `serde_json`'s `as_object` already does that.
 fn extract_pane_id(value: &serde_json::Value) -> Option<String> {
     let record = value.as_object()?;
-    let pane = record.get("pane").and_then(serde_json::Value::as_object).unwrap_or(record);
-    ["pane_id", "paneId", "id"]
-        .into_iter()
-        .find_map(|key| pane.get(key).and_then(serde_json::Value::as_str).map(str::to_string))
+    let pane = record
+        .get("pane")
+        .and_then(serde_json::Value::as_object)
+        .unwrap_or(record);
+    ["pane_id", "paneId", "id"].into_iter().find_map(|key| {
+        pane.get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    })
 }
 
 /// `shellQuote(value)` (`project-agent.ts:174-177`). The pane runs the command through a shell, so
@@ -279,7 +302,9 @@ fn leading_digits(rest: &[u8]) -> Option<(u64, usize)> {
         if !byte.is_ascii_digit() {
             break;
         }
-        value = value.checked_mul(10)?.checked_add(u64::from(*byte - b'0'))?;
+        value = value
+            .checked_mul(10)?
+            .checked_add(u64::from(*byte - b'0'))?;
         len = len.checked_add(1)?;
     }
     (len > 0).then_some((value, len))
@@ -294,14 +319,30 @@ fn leading_digits(rest: &[u8]) -> Option<(u64, usize)> {
 fn parse_herdr_version(value: &str) -> Option<(u64, u64, u64)> {
     let bytes = value.as_bytes();
     for start in 0..bytes.len() {
-        let Some(rest) = bytes.get(start..) else { continue };
-        let Some((major, major_len)) = leading_digits(rest) else { continue };
-        let Some(rest) = rest.get(major_len..) else { continue };
-        let Some(rest) = rest.strip_prefix(b".") else { continue };
-        let Some((minor, minor_len)) = leading_digits(rest) else { continue };
-        let Some(rest) = rest.get(minor_len..) else { continue };
-        let Some(rest) = rest.strip_prefix(b".") else { continue };
-        let Some((patch, _)) = leading_digits(rest) else { continue };
+        let Some(rest) = bytes.get(start..) else {
+            continue;
+        };
+        let Some((major, major_len)) = leading_digits(rest) else {
+            continue;
+        };
+        let Some(rest) = rest.get(major_len..) else {
+            continue;
+        };
+        let Some(rest) = rest.strip_prefix(b".") else {
+            continue;
+        };
+        let Some((minor, minor_len)) = leading_digits(rest) else {
+            continue;
+        };
+        let Some(rest) = rest.get(minor_len..) else {
+            continue;
+        };
+        let Some(rest) = rest.strip_prefix(b".") else {
+            continue;
+        };
+        let Some((patch, _)) = leading_digits(rest) else {
+            continue;
+        };
         return Some((major, minor, patch));
     }
     None
@@ -372,7 +413,10 @@ impl HerdrLauncher {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "herdr".to_string());
-        Self { bin, agent_command: resolve_agent_command(env) }
+        Self {
+            bin,
+            agent_command: resolve_agent_command(env),
+        }
     }
 
     /// The message every `ENOENT` path shares (`:79-81`, `:111-113`).
@@ -385,7 +429,11 @@ impl HerdrLauncher {
     }
 
     fn fail(&self, code: PaneErrorCode, message: String) -> PaneLaunchError {
-        PaneLaunchError { backend: self.name(), code, message }
+        PaneLaunchError {
+            backend: self.name(),
+            code,
+            message,
+        }
     }
 
     /// `client.run(args, { timeoutMs, signal })` (`project-agent.ts:71-137`).
@@ -458,8 +506,10 @@ impl HerdrLauncher {
             Ok(output) => output,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(self.not_installed()),
             Err(e) => {
-                return Err(self
-                    .fail(PaneErrorCode::Unavailable, format!("Failed to run Herdr: {e}")));
+                return Err(self.fail(
+                    PaneErrorCode::Unavailable,
+                    format!("Failed to run Herdr: {e}"),
+                ));
             }
         };
 
@@ -469,8 +519,13 @@ impl HerdrLauncher {
         let succeeded = exit_code == Some(0);
 
         // `parseLastJson(stdout) ?? (exitCode === 0 ? undefined : parseLastJson(stderr))` (`:118`).
-        let parsed = parse_last_json(&stdout)
-            .or_else(|| if succeeded { None } else { parse_last_json(&stderr) });
+        let parsed = parse_last_json(&stdout).or_else(|| {
+            if succeeded {
+                None
+            } else {
+                parse_last_json(&stderr)
+            }
+        });
 
         // `if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && "error" in parsed)`
         // (`:119-123`) — the envelope wins over the exit code, in both directions.
@@ -494,7 +549,10 @@ impl HerdrLauncher {
                     .cloned()
                     .unwrap_or(p)
             });
-            return Ok(HerdrOutput { json, text: stdout.trim().to_string() });
+            return Ok(HerdrOutput {
+                json,
+                text: stdout.trim().to_string(),
+            });
         }
 
         // `stderr.split(/\r?\n/).find(line => line.trim())?.trim() ?? …` (`:133`).
@@ -505,8 +563,7 @@ impl HerdrLauncher {
             .unwrap_or_else(|| {
                 // `Herdr exited with code ${exitCode}.` — a signal-killed child has a null code in
                 // node too, so the literal `null` is upstream's own rendering.
-                let rendered =
-                    exit_code.map_or_else(|| "null".to_string(), |c| c.to_string());
+                let rendered = exit_code.map_or_else(|| "null".to_string(), |c| c.to_string());
                 format!("Herdr exited with code {rendered}.")
             });
         Err(self.fail(PaneErrorCode::ValidationError, message))
@@ -515,7 +572,9 @@ impl HerdrLauncher {
     /// `detectHerdr(client, signal)` (`project-agent.ts:154-162`) — availability THEN version, each
     /// with its own code. Returns the version text `ProjectPaneLaunch` carries.
     async fn detect(&self, cancel: &CancelToken) -> Result<String, PaneLaunchError> {
-        let probe = self.run(&["--version"], VERSION_PROBE_TIMEOUT_MS, cancel).await?;
+        let probe = self
+            .run(&["--version"], VERSION_PROBE_TIMEOUT_MS, cancel)
+            .await?;
         // `typeof result.data === "string" ? result.data : JSON.stringify(result.data)` (`:157`).
         let version_text = probe.json.map_or(probe.text, |v| js_string(&v));
         let Some(version) = parse_herdr_version(&version_text) else {
@@ -553,31 +612,49 @@ impl ProjectPaneLauncher for HerdrLauncher {
 
         // `["pane", "split", "--current", "--direction", "right", "--cwd", projectRoot]` (`:237`),
         // `--focus` only when `input.focus !== false` (`:238`).
-        let mut split_args =
-            vec!["pane", "split", "--current", "--direction", "right", "--cwd", &project_root];
+        let mut split_args = vec![
+            "pane",
+            "split",
+            "--current",
+            "--direction",
+            "right",
+            "--cwd",
+            &project_root,
+        ];
         if request.focus {
             split_args.push("--focus");
         }
-        let split = self.run(&split_args, PANE_COMMAND_TIMEOUT_MS, request.cancel).await?;
+        let split = self
+            .run(&split_args, PANE_COMMAND_TIMEOUT_MS, request.cancel)
+            .await?;
         let Some(pane_id) = split.json.as_ref().and_then(extract_pane_id) else {
             // `:243` — the literal upstream sentence, produced through `fail` so the prefix stays
             // in one place.
-            return Err(
-                self.fail(PaneErrorCode::PaneGone, "pane split returned no pane id.".to_string())
-            );
+            return Err(self.fail(
+                PaneErrorCode::PaneGone,
+                "pane split returned no pane id.".to_string(),
+            ));
         };
 
         let command = shell_quote(&self.agent_command);
-        if let Err(e) =
-            self.run(&["pane", "run", &pane_id, &command], PANE_COMMAND_TIMEOUT_MS, request.cancel)
-                .await
+        if let Err(e) = self
+            .run(
+                &["pane", "run", &pane_id, &command],
+                PANE_COMMAND_TIMEOUT_MS,
+                request.cancel,
+            )
+            .await
         {
             // `await client.run(["pane", "close", paneId], { timeoutMs: 5_000 })` (`:248`) — note
             // upstream passes NO signal here, so a cancelled launch still cleans its pane up. A
             // FRESH token reproduces that: reusing `request.cancel` would skip the cleanup in
             // exactly the case that needs it most.
             let _ = self
-                .run(&["pane", "close", &pane_id], PANE_CLOSE_TIMEOUT_MS, &CancelToken::new())
+                .run(
+                    &["pane", "close", &pane_id],
+                    PANE_CLOSE_TIMEOUT_MS,
+                    &CancelToken::new(),
+                )
                 .await;
             return Err(e);
         }
@@ -594,7 +671,12 @@ impl ProjectPaneLauncher for HerdrLauncher {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
 
     use super::*;
 
@@ -644,7 +726,10 @@ mod tests {
         // An array is not an object.
         assert_eq!(extract_pane_id(&serde_json::json!([1, 2])), None);
         // A non-object `pane` falls back to the record itself.
-        assert_eq!(extract_pane_id(&serde_json::json!({ "pane": 7, "id": "%4" })).unwrap(), "%4");
+        assert_eq!(
+            extract_pane_id(&serde_json::json!({ "pane": 7, "id": "%4" })).unwrap(),
+            "%4"
+        );
         assert_eq!(extract_pane_id(&serde_json::json!({ "other": "x" })), None);
     }
 
@@ -698,7 +783,8 @@ mod tests {
 
     #[test]
     fn the_herdr_binary_honours_its_vendor_env_var_and_defaults_to_the_bare_name() {
-        let l = HerdrLauncher::with_env(|k| (k == ENV_HERDR_BIN).then(|| " /opt/herdr ".to_string()));
+        let l =
+            HerdrLauncher::with_env(|k| (k == ENV_HERDR_BIN).then(|| " /opt/herdr ".to_string()));
         assert_eq!(l.bin, "/opt/herdr");
         let d = HerdrLauncher::with_env(|_| None);
         assert_eq!(d.bin, "herdr");
@@ -734,14 +820,19 @@ mod tests {
         // won the race rather than the timeout.
         let l = HerdrLauncher::with_env(|k| (k == ENV_HERDR_BIN).then(|| "sleep".to_string()));
         let started = std::time::Instant::now();
-        let err = l.detect(&cancel).await.expect_err("a cancelled launch cannot detect");
+        let err = l
+            .detect(&cancel)
+            .await
+            .expect_err("a cancelled launch cannot detect");
         assert_eq!(err.code, PaneErrorCode::Timeout);
         assert!(started.elapsed() < Duration::from_millis(2_500));
     }
 
     #[test]
     fn the_unavailable_launcher_answers_every_request_with_its_reason() {
-        let l = UnavailableLauncher { reason: "nothing configured".to_string() };
+        let l = UnavailableLauncher {
+            reason: "nothing configured".to_string(),
+        };
         assert_eq!(l.name(), "cyrup");
         let err = futures_lite_block(l.open(ProjectPaneRequest {
             project_root: PathBuf::from("/tmp"),
@@ -760,7 +851,9 @@ mod tests {
 
     /// The one future in these tests that touches no IO, driven without a runtime.
     fn futures_lite_block<F: std::future::Future>(fut: F) -> F::Output {
-        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
         rt.block_on(fut)
     }
 

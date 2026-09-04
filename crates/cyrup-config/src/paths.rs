@@ -185,7 +185,9 @@ fn resolve_asset_dir() -> Option<PathBuf> {
     if let Some(raw) = std::env::var_os("CYRUP_ASSET_DIR")
         && !raw.is_empty()
     {
-        return Some(lexically_normalize(&normalize_path_buf(&raw.to_string_lossy())));
+        return Some(lexically_normalize(&normalize_path_buf(
+            &raw.to_string_lossy(),
+        )));
     }
     let exe = std::env::current_exe().ok()?;
     let exe_dir = exe.parent()?;
@@ -329,8 +331,11 @@ pub const ENV_HOME: &str = "CYRUP_HOME";
 /// subsets, so a `CYRUP_CODING_AGENT_DIR` moved the binary's layout and left
 /// `cyrup-ext-subagents`' agent memory, run history, settings, prompts and sessions behind in the
 /// un-relocated tree (MCP-139 gap 1, "the agent-dir consolidation did not happen").
-pub const ENV_AGENT_DIR_KEYS: [&str; 3] =
-    ["CYRUP_AGENT_DIR", ENV_CODING_AGENT_DIR, "PI_CODING_AGENT_DIR"];
+pub const ENV_AGENT_DIR_KEYS: [&str; 3] = [
+    "CYRUP_AGENT_DIR",
+    ENV_CODING_AGENT_DIR,
+    "PI_CODING_AGENT_DIR",
+];
 
 /// The sibling-port spelling of the agent-dir override, named on its own because two resolvers
 /// read it OUTSIDE the ladder above and must spell it identically:
@@ -449,8 +454,10 @@ mod tests {
     /// `unsafe` under Rust 2024, this crate is `#![forbid(unsafe_code)]`, and the whole reason the
     /// ladders take a lookup is so every rung is provable without it.
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> {
-        let owned: Vec<(String, std::ffi::OsString)> =
-            pairs.iter().map(|(k, v)| ((*k).to_string(), std::ffi::OsString::from(*v))).collect();
+        let owned: Vec<(String, std::ffi::OsString)> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), std::ffi::OsString::from(*v)))
+            .collect();
         move |key: &str| owned.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
     }
 
@@ -458,15 +465,24 @@ mod tests {
     #[test]
     fn the_home_ladder_is_one_ladder() {
         let lookup = env(&[("CYRUP_HOME", "/sandbox"), ("HOME", "/real")]);
-        assert_eq!(super::cyrup_home_dir_from(&lookup), Some(PathBuf::from("/sandbox")));
+        assert_eq!(
+            super::cyrup_home_dir_from(&lookup),
+            Some(PathBuf::from("/sandbox"))
+        );
 
         let lookup = env(&[("HOME", "/real")]);
-        assert_eq!(super::cyrup_home_dir_from(&lookup), Some(PathBuf::from("/real")));
+        assert_eq!(
+            super::cyrup_home_dir_from(&lookup),
+            Some(PathBuf::from("/real"))
+        );
 
         // A set-but-blank value is UNSET. `PathBuf::from("")` is the relative empty path, so
         // honouring it would root every derived tree at the process working directory.
         let lookup = env(&[("CYRUP_HOME", "   "), ("HOME", "/real")]);
-        assert_eq!(super::cyrup_home_dir_from(&lookup), Some(PathBuf::from("/real")));
+        assert_eq!(
+            super::cyrup_home_dir_from(&lookup),
+            Some(PathBuf::from("/real"))
+        );
 
         // Nothing set: the ladder declines rather than picking a terminal. That is what lets
         // `ConfigDirs::resolve` error while `cyrup_ext_subagents` falls to a temp dir.
@@ -495,7 +511,10 @@ mod tests {
             ("CYRUP_CODING_AGENT_DIR", "/long"),
             ("PI_CODING_AGENT_DIR", "/legacy"),
         ]);
-        assert_eq!(super::cyrup_agent_dir_from(&home, &all), PathBuf::from("/short"));
+        assert_eq!(
+            super::cyrup_agent_dir_from(&home, &all),
+            PathBuf::from("/short")
+        );
         // Unset: `<home>/.cyrup/agent`.
         assert_eq!(
             super::cyrup_agent_dir_from(&home, &env(&[])),
@@ -511,7 +530,10 @@ mod tests {
     fn a_tilde_agent_dir_anchors_on_the_supplied_home_not_an_ambient_one() {
         let sandbox = PathBuf::from("/sandbox");
         let lookup = env(&[("CYRUP_AGENT_DIR", "~/agents")]);
-        assert_eq!(super::cyrup_agent_dir_from(&sandbox, &lookup), sandbox.join("agents"));
+        assert_eq!(
+            super::cyrup_agent_dir_from(&sandbox, &lookup),
+            sandbox.join("agents")
+        );
         assert_eq!(
             super::cyrup_agent_dir_from(Path::new("/other"), &lookup),
             PathBuf::from("/other/agents"),
@@ -524,7 +546,10 @@ mod tests {
     #[test]
     fn the_cyrup_dir_hangs_off_the_same_home() {
         let lookup = env(&[("CYRUP_HOME", "/sandbox"), ("HOME", "/real")]);
-        assert_eq!(super::cyrup_dir_from(&lookup), PathBuf::from("/sandbox/.cyrup"));
+        assert_eq!(
+            super::cyrup_dir_from(&lookup),
+            PathBuf::from("/sandbox/.cyrup")
+        );
     }
     use super::*;
 

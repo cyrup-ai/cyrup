@@ -10,9 +10,7 @@
 
 use crate::contract::{EventPatch, HandledValue, HookOutcome};
 use crate::error::ExtError;
-use crate::event::{
-    EventKind, HostEvent, InputEventSource, InputStreamingBehavior, Subscriptions,
-};
+use crate::event::{EventKind, HostEvent, InputEventSource, InputStreamingBehavior, Subscriptions};
 use crate::extension::{ExtKind, Extension};
 use crate::host::engine::map_wasm_error;
 use crate::host::limits::StoreLimits;
@@ -50,7 +48,10 @@ use bindings::cyrup::ext::types as wit_types;
 
 /// Helper: fetch the guest backing or surface a trap-free error string (imports never panic).
 fn guest_of(state: &HostState) -> Result<&Arc<GuestState>, String> {
-    state.guest.as_ref().ok_or_else(|| "no guest state in store".to_string())
+    state
+        .guest
+        .as_ref()
+        .ok_or_else(|| "no guest state in store".to_string())
 }
 
 // --- EXT-054: the manifest capability grant, enforced HOST-SIDE ---------------------------------
@@ -146,7 +147,9 @@ impl bindings::cyrup::ext::registration::Host for HostState {
         };
         // A guest tool is dispatched back across the boundary; register it via the registry's
         // descriptor table so the active-tool set can surface it (R-08-012/014).
-        let _ = guest.registry.register_guest_tool(guest.owner.clone(), desc);
+        let _ = guest
+            .registry
+            .register_guest_tool(guest.owner.clone(), desc);
     }
 
     /// EXT-058 — pi `registerCommand(name, options)` writes STRAIGHT into the extension's live
@@ -166,7 +169,9 @@ impl bindings::cyrup::ext::registration::Host for HostState {
     async fn register_command(&mut self, name: String, desc_json: String) {
         let Ok(guest) = guest_of(self) else { return };
         let desc: CommandDescriptor = serde_json::from_str(&desc_json).unwrap_or_default();
-        let _ = guest.registry.register_command(guest.owner.clone(), name, desc);
+        let _ = guest
+            .registry
+            .register_command(guest.owner.clone(), name, desc);
     }
 
     async fn register_shortcut(&mut self, key: String, desc: String) {
@@ -176,8 +181,14 @@ impl bindings::cyrup::ext::registration::Host for HostState {
         // (extensions/types.ts:1524-1529 @v0.83.0) and renders `shortcut.description ??
         // shortcut.extensionPath` (interactive-mode.ts:5856). An EMPTY string is upstream's absent
         // field, which falls back to the extension ID — never to the key.
-        let desc = if desc.trim().is_empty() { None } else { Some(desc) };
-        let _ = guest.registry.register_shortcut(guest.owner.clone(), key, desc);
+        let desc = if desc.trim().is_empty() {
+            None
+        } else {
+            Some(desc)
+        };
+        let _ = guest
+            .registry
+            .register_shortcut(guest.owner.clone(), key, desc);
     }
 
     async fn register_flag(&mut self, name: String, spec_json: String) {
@@ -186,7 +197,9 @@ impl bindings::cyrup::ext::registration::Host for HostState {
         guest.set_flag(name.clone(), spec.clone());
         // Owner-attributed so Pi's first-wins flag rule (`getFlags`, runner.ts:473-483) and its
         // `Flag "--x" conflicts with <owner>` diagnostic apply to a guest's `registerFlag`.
-        let _ = guest.registry.register_flag(guest.owner.clone(), name, spec);
+        let _ = guest
+            .registry
+            .register_flag(guest.owner.clone(), name, spec);
     }
 
     async fn get_flag(&mut self, name: String) -> Option<String> {
@@ -197,7 +210,9 @@ impl bindings::cyrup::ext::registration::Host for HostState {
     async fn register_provider(&mut self, id: String, config_json: String) {
         let Ok(guest) = guest_of(self) else { return };
         let config: Value = serde_json::from_str(&config_json).unwrap_or(Value::Null);
-        let _ = guest.registry.register_provider(guest.owner.clone(), id, config);
+        let _ = guest
+            .registry
+            .register_provider(guest.owner.clone(), id, config);
     }
 
     async fn unregister_provider(&mut self, id: String) {
@@ -210,7 +225,9 @@ impl bindings::cyrup::ext::registration::Host for HostState {
     /// `transform-markdown` export, so this only records that this guest HAS one, in load order.
     async fn register_markdown_transformer(&mut self) {
         let Ok(guest) = guest_of(self) else { return };
-        let _ = guest.registry.register_markdown_transformer(guest.owner.clone());
+        let _ = guest
+            .registry
+            .register_markdown_transformer(guest.owner.clone());
     }
 
     async fn register_message_renderer(&mut self, custom_type: String) {
@@ -218,7 +235,9 @@ impl bindings::cyrup::ext::registration::Host for HostState {
         // Record it in the SHARED registry so the host can route a custom type back to its owning
         // guest (Pi `getMessageRenderer`, runner.ts:579-587) — the per-guest `GuestState` vec below
         // is host-side bookkeeping only and no consumer can reach it by custom type (EXT-006).
-        let _ = guest.registry.register_message_renderer(guest.owner.clone(), custom_type.clone());
+        let _ = guest
+            .registry
+            .register_message_renderer(guest.owner.clone(), custom_type.clone());
         guest.add_renderer(custom_type);
     }
 
@@ -230,7 +249,9 @@ impl bindings::cyrup::ext::registration::Host for HostState {
     /// export — see `ExtensionHost::render_entry` for why the world has no fourth export.
     async fn register_entry_renderer(&mut self, custom_type: String) {
         let Ok(guest) = guest_of(self) else { return };
-        let _ = guest.registry.register_entry_renderer(guest.owner.clone(), custom_type.clone());
+        let _ = guest
+            .registry
+            .register_entry_renderer(guest.owner.clone(), custom_type.clone());
         guest.add_renderer(custom_type);
     }
 
@@ -246,7 +267,9 @@ impl bindings::cyrup::ext::registration::Host for HostState {
         // (`facade.rs::load_native_body` -> `add_command_autocomplete`); without this line the WASM
         // tier declared the flag into a counter nothing reads, so the two tiers disagreed about
         // whether a guest had argument completions at all.
-        let _ = guest.registry.add_command_autocomplete(guest.owner.clone(), command.clone());
+        let _ = guest
+            .registry
+            .add_command_autocomplete(guest.owner.clone(), command.clone());
         guest.add_autocomplete(command);
     }
 
@@ -301,7 +324,9 @@ impl bindings::cyrup::ext::ui::Host for HostState {
     }
     async fn confirm(&mut self, prompt: String, message: String, opts_json: String) -> bool {
         let opts = DialogOptions::parse(&opts_json);
-        let Ok(guest) = ui_guest_of(self) else { return false };
+        let Ok(guest) = ui_guest_of(self) else {
+            return false;
+        };
         // Programmatic dismiss (Pi `signal`): a dialog bound to an aborted signal returns cancelled.
         if guest.dialog_dismissed(&opts) {
             return false;
@@ -316,7 +341,12 @@ impl bindings::cyrup::ext::ui::Host for HostState {
         guest.note_dialog_wait(started);
         result
     }
-    async fn input(&mut self, prompt: String, placeholder: Option<String>, opts_json: String) -> Option<String> {
+    async fn input(
+        &mut self,
+        prompt: String,
+        placeholder: Option<String>,
+        opts_json: String,
+    ) -> Option<String> {
         let opts = DialogOptions::parse(&opts_json);
         let guest = ui_guest_of(self).ok()?;
         if guest.dialog_dismissed(&opts) {
@@ -327,7 +357,12 @@ impl bindings::cyrup::ext::ui::Host for HostState {
         guest.note_dialog_wait(started);
         result
     }
-    async fn select(&mut self, prompt: String, options_json: String, opts_json: String) -> Option<String> {
+    async fn select(
+        &mut self,
+        prompt: String,
+        options_json: String,
+        opts_json: String,
+    ) -> Option<String> {
         let guest = ui_guest_of(self).ok()?;
         let options: Value = serde_json::from_str(&options_json).unwrap_or(Value::Null);
         let opts = DialogOptions::parse(&opts_json);
@@ -351,22 +386,21 @@ impl bindings::cyrup::ext::ui::Host for HostState {
     /// EXT-047 — pi's `setWidget(key, content: string[] | undefined, options?)`
     /// (`extensions/types.ts:170-175` @v0.83.0). `content-json` is the LINES array; `none` removes
     /// this key's widget (upstream's `content: undefined`).
-    async fn set_widget(
-        &mut self,
-        key: String,
-        content_json: Option<String>,
-        opts_json: String,
-    ) {
+    async fn set_widget(&mut self, key: String, content_json: Option<String>, opts_json: String) {
         if let Ok(guest) = ui_guest_of(self) {
             // A malformed lines array is NOT a removal: it is a broken write, and treating it as
             // `undefined` would silently tear down a widget the guest was trying to update. Fall
             // back to an empty line list, which upstream renders as a present-but-blank widget.
-            let lines: Option<Vec<String>> = content_json
-                .map(|j| serde_json::from_str::<Vec<String>>(&j).unwrap_or_default());
+            let lines: Option<Vec<String>> =
+                content_json.map(|j| serde_json::from_str::<Vec<String>>(&j).unwrap_or_default());
             let opts: Value = serde_json::from_str(&opts_json).unwrap_or(Value::Null);
             let placement = crate::host::WidgetPlacement::from_opts(&opts);
             guest.services.set_widget(&key, lines.as_deref(), placement);
-            guest.set_widget(crate::host::WidgetEffect { key, lines, placement });
+            guest.set_widget(crate::host::WidgetEffect {
+                key,
+                lines,
+                placement,
+            });
         }
     }
 
@@ -440,7 +474,9 @@ impl bindings::cyrup::ext::ui::Host for HostState {
         result
     }
     async fn get_editor_text(&mut self) -> String {
-        ui_guest_of(self).map(|g| g.services.editor_text()).unwrap_or_default()
+        ui_guest_of(self)
+            .map(|g| g.services.editor_text())
+            .unwrap_or_default()
     }
     async fn set_editor_text(&mut self, text: String) {
         if let Ok(guest) = ui_guest_of(self) {
@@ -468,7 +504,9 @@ impl bindings::cyrup::ext::ui::Host for HostState {
             // number in `GuestState` that no consumer can reach. (The consumer itself — the
             // interactive editor consulting these providers — is TUI-029 and still open; this is the
             // producer half it will read.)
-            let _ = guest.registry.add_autocomplete_provider(guest.owner.clone());
+            let _ = guest
+                .registry
+                .add_autocomplete_provider(guest.owner.clone());
             guest.add_autocomplete_provider();
         }
     }
@@ -485,7 +523,9 @@ impl bindings::cyrup::ext::ui::Host for HostState {
         guest.services.theme_by_name(&name).map(|t| t.to_string())
     }
     async fn theme_list(&mut self) -> String {
-        ui_guest_of(self).map(|g| g.services.theme_list().to_string()).unwrap_or_else(|_| "[]".into())
+        ui_guest_of(self)
+            .map(|g| g.services.theme_list().to_string())
+            .unwrap_or_else(|_| "[]".into())
     }
     async fn theme_set(&mut self, name: String) -> Result<(), String> {
         let guest = ui_guest_of(self)?;
@@ -504,7 +544,9 @@ impl bindings::cyrup::ext::ui::Host for HostState {
         }
     }
     async fn get_tools_expanded(&mut self) -> bool {
-        ui_guest_of(self).map(|g| g.services.tools_expanded()).unwrap_or(false)
+        ui_guest_of(self)
+            .map(|g| g.services.tools_expanded())
+            .unwrap_or(false)
     }
     async fn set_tools_expanded(&mut self, expanded: bool) {
         if let Ok(guest) = ui_guest_of(self) {
@@ -516,15 +558,25 @@ impl bindings::cyrup::ext::ui::Host for HostState {
 
 impl bindings::cyrup::ext::session::Host for HostState {
     async fn entries_json(&mut self) -> String {
-        guest_of(self).map(|g| g.services.entries().to_string()).unwrap_or_else(|_| "[]".into())
+        guest_of(self)
+            .map(|g| g.services.entries().to_string())
+            .unwrap_or_else(|_| "[]".into())
     }
     async fn branch_json(&mut self) -> String {
-        guest_of(self).map(|g| g.services.branch().to_string()).unwrap_or_else(|_| "[]".into())
+        guest_of(self)
+            .map(|g| g.services.branch().to_string())
+            .unwrap_or_else(|_| "[]".into())
     }
     async fn tree_json(&mut self) -> String {
-        guest_of(self).map(|g| g.services.tree().to_string()).unwrap_or_else(|_| "null".into())
+        guest_of(self)
+            .map(|g| g.services.tree().to_string())
+            .unwrap_or_else(|_| "null".into())
     }
-    async fn append_entry(&mut self, custom_type: String, data_json: String) -> Result<String, String> {
+    async fn append_entry(
+        &mut self,
+        custom_type: String,
+        data_json: String,
+    ) -> Result<String, String> {
         let guest = guest_of(self)?;
         let data: Value = serde_json::from_str(&data_json).map_err(|e| e.to_string())?;
         guest.services.append_entry(&custom_type, &data)
@@ -551,7 +603,9 @@ impl bindings::cyrup::ext::session::Host for HostState {
 
 impl bindings::cyrup::ext::models::Host for HostState {
     async fn list_models(&mut self) -> String {
-        guest_of(self).map(|g| g.services.models().to_string()).unwrap_or_else(|_| "[]".into())
+        guest_of(self)
+            .map(|g| g.services.models().to_string())
+            .unwrap_or_else(|_| "[]".into())
     }
     /// pi `ctx.scopedModels` (extensions/types.ts:326 @v0.83.0) — EXT-045.
     async fn scoped_models(&mut self) -> String {
@@ -576,10 +630,14 @@ impl bindings::cyrup::ext::models::Host for HostState {
         let _ = guest.services.control(ControlOp::SetModel(v));
     }
     async fn context_usage(&mut self) -> String {
-        guest_of(self).map(|g| g.services.context_usage().to_string()).unwrap_or_else(|_| "{}".into())
+        guest_of(self)
+            .map(|g| g.services.context_usage().to_string())
+            .unwrap_or_else(|_| "{}".into())
     }
     async fn thinking_level(&mut self) -> Option<String> {
-        guest_of(self).ok().and_then(|g| g.services.thinking_level())
+        guest_of(self)
+            .ok()
+            .and_then(|g| g.services.thinking_level())
     }
     async fn set_thinking_level(&mut self, level: String) -> Result<(), String> {
         let guest = guest_of(self)?;
@@ -631,8 +689,18 @@ impl bindings::cyrup::ext::exec::Host for HostState {
         let started = std::time::Instant::now();
         let result = guest.services.exec(&cmd, &args, &opts, cancel);
         guest.note_dialog_wait(started);
-        let ExecOutput { code, stdout, stderr, killed } = result?;
-        Ok(wit_types::ExecResult { code, stdout, stderr, killed })
+        let ExecOutput {
+            code,
+            stdout,
+            stderr,
+            killed,
+        } = result?;
+        Ok(wit_types::ExecResult {
+            code,
+            stdout,
+            stderr,
+            killed,
+        })
     }
 }
 
@@ -654,7 +722,9 @@ impl bindings::cyrup::ext::proc::Host for HostState {
             .ok()
             .and_then(|v| v.as_object().cloned())
             .map(|m| {
-                m.into_iter().filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string()))).collect()
+                m.into_iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
+                    .collect()
             })
             .unwrap_or_default();
         // Resolve a guest-supplied `cwd` HERE — the true guest/config-authored boundary, matching
@@ -895,7 +965,9 @@ impl bindings::cyrup::ext::host_tool::Host for HostState {
     async fn is_cancelled(&mut self, call_id: String) -> bool {
         // The tool `signal` poll (Pi `signal.aborted`): the executing tool's `CancelToken` fired, or
         // a named signal for this `call-id` was aborted (sdk gap #1).
-        guest_of(self).map(|g| g.tool_is_cancelled(&call_id)).unwrap_or(false)
+        guest_of(self)
+            .map(|g| g.tool_is_cancelled(&call_id))
+            .unwrap_or(false)
     }
 }
 
@@ -913,7 +985,10 @@ impl bindings::cyrup::ext::oauth::Host for HostState {
         _expires_in_seconds: Option<u32>,
     ) {
         if let Ok(guest) = guest_of(self) {
-            guest.record_oauth_event(OAuthEvent::DeviceCode { user_code, verification_uri });
+            guest.record_oauth_event(OAuthEvent::DeviceCode {
+                user_code,
+                verification_uri,
+            });
         }
     }
     async fn on_prompt(
@@ -923,14 +998,18 @@ impl bindings::cyrup::ext::oauth::Host for HostState {
         allow_empty: bool,
     ) -> Result<String, String> {
         let guest = guest_of(self)?;
-        guest.record_oauth_event(OAuthEvent::Prompt { message: message.clone() });
+        guest.record_oauth_event(OAuthEvent::Prompt {
+            message: message.clone(),
+        });
         // Same epoch-budget forgiveness its `ui::Host` siblings (`confirm`/`input`/`select`/
         // `editor`/`custom`, above) already carry: an OAuth prompt is exactly as human-paced a wait
         // once a real `HostServices` backend wires it to a live UI (Pi `onPrompt`), so the
         // wall-clock block must be recorded here too, not only for the `ui.*` dialog kinds that
         // happened to land first.
         let started = std::time::Instant::now();
-        let result = guest.services.oauth_prompt(&message, placeholder.as_deref(), allow_empty);
+        let result = guest
+            .services
+            .oauth_prompt(&message, placeholder.as_deref(), allow_empty);
         guest.note_dialog_wait(started);
         result
     }
@@ -941,7 +1020,9 @@ impl bindings::cyrup::ext::oauth::Host for HostState {
     }
     async fn on_select(&mut self, message: String, options_json: String) -> Option<String> {
         let guest = guest_of(self).ok()?;
-        guest.record_oauth_event(OAuthEvent::Select { message: message.clone() });
+        guest.record_oauth_event(OAuthEvent::Select {
+            message: message.clone(),
+        });
         let options: Value = serde_json::from_str(&options_json).unwrap_or(Value::Null);
         // Same epoch-budget forgiveness as `on_prompt` just above (Pi `onSelect` is the identical
         // human-paced OAuth wait).
@@ -982,7 +1063,10 @@ impl bindings::cyrup::ext::provider_stream::Host for HostState {
             (guest.owner.clone(), guest.provider_reduction()?)
         };
         let payload: Value = serde_json::from_str(&payload_json).unwrap_or(Value::Null);
-        hooks.before_provider_request(&owner, payload).await.map(|v| v.to_string())
+        hooks
+            .before_provider_request(&owner, payload)
+            .await
+            .map(|v| v.to_string())
     }
 
     /// EXT-052 — the `onResponse` half ("They must invoke `options.onResponse` after receiving the
@@ -999,13 +1083,17 @@ impl bindings::cyrup::ext::provider_stream::Host for HostState {
             return;
         };
         let headers: Value = serde_json::from_str(&headers_json).unwrap_or(Value::Null);
-        hooks.after_provider_response(&owner, u32::from(status), headers).await;
+        hooks
+            .after_provider_response(&owner, u32::from(status), headers)
+            .await;
     }
 }
 
 impl bindings::cyrup::ext::ext_tools::Host for HostState {
     async fn get_active_tools(&mut self) -> String {
-        let Ok(guest) = guest_of(self) else { return "[]".into() };
+        let Ok(guest) = guest_of(self) else {
+            return "[]".into();
+        };
         // Prefer the LIVE session's real active tool set (Pi `getActiveTools` = `getActiveToolNames`,
         // agent-session.ts:2281,813 — the SAME source the host/CLI tool-toggle reads). Fall back to
         // the guest's own restriction / registry when no session backend is attached (default host).
@@ -1013,13 +1101,18 @@ impl bindings::cyrup::ext::ext_tools::Host for HostState {
             Some(live) => live,
             None => match guest.active_tools_restriction() {
                 Some(r) => r,
-                None => guest.registry.all_registered_tool_names().unwrap_or_default(),
+                None => guest
+                    .registry
+                    .all_registered_tool_names()
+                    .unwrap_or_default(),
             },
         };
         serde_json::to_string(&names).unwrap_or_else(|_| "[]".into())
     }
     async fn get_all_tools(&mut self) -> String {
-        let Ok(guest) = guest_of(self) else { return "[]".into() };
+        let Ok(guest) = guest_of(self) else {
+            return "[]".into();
+        };
         // EXT-038: prefer the LIVE session's merged registry — pi's `getAllTools()` maps
         // `this._toolDefinitions`, which is built-ins + MCP + extension tools
         // (`core/agent-session.ts:906-914` @v0.83.0). `registry.tool_info()` walks the two
@@ -1044,7 +1137,9 @@ impl bindings::cyrup::ext::ext_tools::Host for HostState {
         }
     }
     async fn get_commands(&mut self) -> String {
-        let Ok(guest) = guest_of(self) else { return "[]".into() };
+        let Ok(guest) = guest_of(self) else {
+            return "[]".into();
+        };
         // EXT-037. pi's `getCommands()` is `[...extensionCommands, ...templates, ...skills]`, each
         // row `{name: command.invocationName, description, source, sourceInfo}`
         // (`core/agent-session.ts:2332-2354` @v0.83.0, type `SlashCommandInfo` at
@@ -1101,7 +1196,9 @@ impl bindings::cyrup::ext::control::Host for HostState {
         let guest = guest_of(self)?;
         guest.require_command_tier()?;
         let opts: Value = serde_json::from_str(&opts_json).unwrap_or(Value::Null);
-        guest.services.control(ControlOp::NewSession { opts: opts.clone() })?;
+        guest
+            .services
+            .control(ControlOp::NewSession { opts: opts.clone() })?;
         schedule_with_session(guest, &opts);
         Ok(())
     }
@@ -1109,7 +1206,10 @@ impl bindings::cyrup::ext::control::Host for HostState {
         let guest = guest_of(self)?;
         guest.require_command_tier()?;
         let opts: Value = serde_json::from_str(&opts_json).unwrap_or(Value::Null);
-        guest.services.control(ControlOp::Switch { session_id, opts: opts.clone() })?;
+        guest.services.control(ControlOp::Switch {
+            session_id,
+            opts: opts.clone(),
+        })?;
         schedule_with_session(guest, &opts);
         Ok(())
     }
@@ -1117,7 +1217,10 @@ impl bindings::cyrup::ext::control::Host for HostState {
         let guest = guest_of(self)?;
         guest.require_command_tier()?;
         let opts: Value = serde_json::from_str(&opts_json).unwrap_or(Value::Null);
-        guest.services.control(ControlOp::Fork { entry_id, opts: opts.clone() })?;
+        guest.services.control(ControlOp::Fork {
+            entry_id,
+            opts: opts.clone(),
+        })?;
         schedule_with_session(guest, &opts);
         Ok(())
     }
@@ -1125,7 +1228,9 @@ impl bindings::cyrup::ext::control::Host for HostState {
         let guest = guest_of(self)?;
         guest.require_command_tier()?;
         let opts: Value = serde_json::from_str(&opts_json).unwrap_or(Value::Null);
-        guest.services.control(ControlOp::Navigate { entry_id, opts })
+        guest
+            .services
+            .control(ControlOp::Navigate { entry_id, opts })
     }
     async fn reload(&mut self) -> Result<(), String> {
         let guest = guest_of(self)?;
@@ -1143,28 +1248,44 @@ impl bindings::cyrup::ext::control::Host for HostState {
         let custom_instructions = serde_json::from_str::<Value>(&opts_json)
             .ok()
             .and_then(|v| {
-                v.get("customInstructions").and_then(Value::as_str).map(str::to_string)
+                v.get("customInstructions")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
             })
             .filter(|s| !s.is_empty());
-        guest.services.control(ControlOp::Compact { custom_instructions })
+        guest.services.control(ControlOp::Compact {
+            custom_instructions,
+        })
     }
     async fn wait_idle(&mut self) -> Result<(), String> {
         let guest = guest_of(self)?;
         guest.require_command_tier()?;
         guest.services.control(ControlOp::WaitIdle)
     }
-    async fn send_message(&mut self, message_json: String, opts_json: String) -> Result<(), String> {
+    async fn send_message(
+        &mut self,
+        message_json: String,
+        opts_json: String,
+    ) -> Result<(), String> {
         let guest = guest_of(self)?;
         guest.require_command_tier()?;
         let message: Value = serde_json::from_str(&message_json).unwrap_or(Value::Null);
         let opts: Value = serde_json::from_str(&opts_json).unwrap_or(Value::Null);
-        guest.services.control(ControlOp::SendMessage { message, opts })
+        guest
+            .services
+            .control(ControlOp::SendMessage { message, opts })
     }
-    async fn send_user_message(&mut self, content: String, opts_json: String) -> Result<(), String> {
+    async fn send_user_message(
+        &mut self,
+        content: String,
+        opts_json: String,
+    ) -> Result<(), String> {
         let guest = guest_of(self)?;
         guest.require_command_tier()?;
         let opts: Value = serde_json::from_str(&opts_json).unwrap_or(Value::Null);
-        guest.services.control(ControlOp::SendUserMessage { content, opts })
+        guest
+            .services
+            .control(ControlOp::SendUserMessage { content, opts })
     }
 
     /// Pi `ctx.abort()` (extensions/types.ts:339): "Abort the current agent run. **Available in all
@@ -1214,13 +1335,20 @@ impl bindings::cyrup::ext::ctx_state::Host for HostState {
         guest_of(self).map(|g| g.services.is_idle()).unwrap_or(true)
     }
     async fn has_pending_messages(&mut self) -> bool {
-        guest_of(self).map(|g| g.services.has_pending_messages()).unwrap_or(false)
+        guest_of(self)
+            .map(|g| g.services.has_pending_messages())
+            .unwrap_or(false)
     }
     async fn is_project_trusted(&mut self) -> bool {
-        guest_of(self).map(|g| g.services.is_project_trusted()).unwrap_or(false)
+        guest_of(self)
+            .map(|g| g.services.is_project_trusted())
+            .unwrap_or(false)
     }
     async fn get_system_prompt(&mut self) -> String {
-        guest_of(self).ok().and_then(|g| g.services.system_prompt()).unwrap_or_default()
+        guest_of(self)
+            .ok()
+            .and_then(|g| g.services.system_prompt())
+            .unwrap_or_default()
     }
     /// pi `ctx.getSystemPromptOptions()` (`extensions/types.ts:355` @v0.83.0) — the BAG behind the
     /// string `get_system_prompt` returns (EXT-061).
@@ -1237,9 +1365,9 @@ impl bindings::cyrup::ext::ctx_state::Host for HostState {
     async fn get_system_prompt_options(&mut self) -> Result<String, String> {
         let guest = guest_of(self)?;
         guest.require_command_tier()?;
-        let bag = guest.services.system_prompt_options().unwrap_or_else(|| {
-            serde_json::json!({ "cwd": guest.cwd().to_string_lossy().into_owned() })
-        });
+        let bag = guest.services.system_prompt_options().unwrap_or_else(
+            || serde_json::json!({ "cwd": guest.cwd().to_string_lossy().into_owned() }),
+        );
         Ok(bag.to_string())
     }
     /// pi `ctx.cwd` (extensions/types.ts:315 @v0.83.0) — on the BASE `ExtensionContext`, so every
@@ -1247,13 +1375,17 @@ impl bindings::cyrup::ext::ctx_state::Host for HostState {
     /// from the `HostConfig.cwd` copy `GuestState` takes at load time — the same value the native
     /// tier has always exposed as `HostCtx.cwd`.
     async fn get_cwd(&mut self) -> String {
-        guest_of(self).map(|g| g.cwd().to_string_lossy().into_owned()).unwrap_or_default()
+        guest_of(self)
+            .map(|g| g.cwd().to_string_lossy().into_owned())
+            .unwrap_or_default()
     }
     /// The run-scoped cancellation poll (EXT-045; pi `ctx.signal`, extensions/types.ts:334
     /// @v0.83.0). See the `is-run-cancelled` CYRUP-DELTA in `world.wit` for why this is a poll and
     /// not a subscription.
     async fn is_run_cancelled(&mut self) -> bool {
-        guest_of(self).map(|g| g.services.is_run_cancelled()).unwrap_or(false)
+        guest_of(self)
+            .map(|g| g.services.is_run_cancelled())
+            .unwrap_or(false)
     }
 }
 
@@ -1338,8 +1470,8 @@ impl LiveExtension {
         guest: Arc<GuestState>,
         epoch_ticks: u64,
     ) -> Result<Self, ExtError> {
-        let component =
-            Component::from_binary(engine, bytes).map_err(|e| ExtError::Component(e.to_string()))?;
+        let component = Component::from_binary(engine, bytes)
+            .map_err(|e| ExtError::Component(e.to_string()))?;
 
         let mut linker = Linker::<HostState>::new(engine);
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)
@@ -1371,8 +1503,12 @@ impl LiveExtension {
         // `UpdateDeadline::Interrupt` is wasmtime's own explicit "halt and trap" variant, so this is
         // not a weaker budget, only a correctly-scoped one.
         store.epoch_deadline_callback(|ctx| {
-            let owed =
-                ctx.data().guest.as_ref().map(|g| g.take_dialog_extra_ticks()).unwrap_or(0);
+            let owed = ctx
+                .data()
+                .guest
+                .as_ref()
+                .map(|g| g.take_dialog_extra_ticks())
+                .unwrap_or(0);
             if owed > 0 {
                 Ok(wasmtime::UpdateDeadline::Continue(owed))
             } else {
@@ -1464,7 +1600,9 @@ impl LiveExtension {
                 // `extensions/types.ts:359`, which is `ExtensionContext.compact`'s neighbourhood in
                 // the wrong package; `:359` in the RIGHT package is `details: T`); thread it through
                 // from the guest's update chunk.
-                terminate: TerminateHint::from_wire(chunk.get("terminate").and_then(Value::as_bool)),
+                terminate: TerminateHint::from_wire(
+                    chunk.get("terminate").and_then(Value::as_bool),
+                ),
             });
         }
         let Some(res) = res else {
@@ -1609,7 +1747,10 @@ impl LiveExtension {
         self.guest.arm_epoch_deadline_estimate(self.epoch_ticks);
         self.guest.set_tier(CtxTier::Command);
         let api = inner.instance.cyrup_ext_events();
-        match api.call_get_argument_completions(&mut inner.store, name, prefix).await {
+        match api
+            .call_get_argument_completions(&mut inner.store, name, prefix)
+            .await
+        {
             Ok(v) => Ok(v),
             Err(e) => Err(map_wasm_error(&e)),
         }
@@ -1649,7 +1790,10 @@ impl LiveExtension {
         self.guest.set_tier(CtxTier::Event);
         let ctx_s = ctx.to_string();
         let api = inner.instance.cyrup_ext_events();
-        match api.call_transform_markdown(&mut inner.store, markdown, &ctx_s).await {
+        match api
+            .call_transform_markdown(&mut inner.store, markdown, &ctx_s)
+            .await
+        {
             Ok(out) => Ok(out),
             Err(e) => Err(map_wasm_error(&e)),
         }
@@ -1708,7 +1852,10 @@ impl LiveExtension {
         self.guest.arm_epoch_deadline_estimate(self.epoch_ticks);
         self.guest.set_tier(CtxTier::Command);
         let api = inner.instance.cyrup_ext_events();
-        match api.call_provider_refresh_token(&mut inner.store, id, &creds).await {
+        match api
+            .call_provider_refresh_token(&mut inner.store, id, &creds)
+            .await
+        {
             Ok(Ok(s)) => Ok(serde_json::from_str(&s).unwrap_or(Value::Null)),
             Ok(Err(msg)) => Err(ExtError::Component(msg)),
             Err(e) => Err(map_wasm_error(&e)),
@@ -1728,7 +1875,10 @@ impl LiveExtension {
         self.guest.arm_epoch_deadline_estimate(self.epoch_ticks);
         self.guest.set_tier(CtxTier::Command);
         let api = inner.instance.cyrup_ext_events();
-        match api.call_provider_get_api_key(&mut inner.store, id, &creds).await {
+        match api
+            .call_provider_get_api_key(&mut inner.store, id, &creds)
+            .await
+        {
             Ok(Ok(key)) => Ok(key),
             Ok(Err(msg)) => Err(ExtError::Component(msg)),
             Err(e) => Err(map_wasm_error(&e)),
@@ -1750,7 +1900,10 @@ impl LiveExtension {
         self.guest.arm_epoch_deadline_estimate(self.epoch_ticks);
         self.guest.set_tier(CtxTier::Command);
         let api = inner.instance.cyrup_ext_events();
-        match api.call_provider_modify_models(&mut inner.store, id, &models_s, &creds).await {
+        match api
+            .call_provider_modify_models(&mut inner.store, id, &models_s, &creds)
+            .await
+        {
             Ok(Ok(s)) => Ok(serde_json::from_str(&s).unwrap_or(Value::Null)),
             Ok(Err(msg)) => Err(ExtError::Component(msg)),
             Err(e) => Err(map_wasm_error(&e)),
@@ -1778,7 +1931,14 @@ impl LiveExtension {
         self.guest.set_tier(CtxTier::Command);
         let api = inner.instance.cyrup_ext_events();
         match api
-            .call_provider_stream_simple(&mut inner.store, id, stream_id, &model_s, &context_s, &options_s)
+            .call_provider_stream_simple(
+                &mut inner.store,
+                id,
+                stream_id,
+                &model_s,
+                &context_s,
+                &options_s,
+            )
             .await
         {
             Ok(Ok(())) => Ok(()),
@@ -1804,7 +1964,10 @@ impl LiveExtension {
         self.guest.arm_epoch_deadline_estimate(self.epoch_ticks);
         self.guest.set_tier(CtxTier::Command);
         let api = inner.instance.cyrup_ext_events();
-        match api.call_autocomplete_suggest(&mut inner.store, &base_s, &query_s).await {
+        match api
+            .call_autocomplete_suggest(&mut inner.store, &base_s, &query_s)
+            .await
+        {
             Ok(s) => Ok(serde_json::from_str(&s).unwrap_or(Value::Null)),
             Err(e) => Err(map_wasm_error(&e)),
         }
@@ -1826,7 +1989,10 @@ impl LiveExtension {
         // command handler, so session-replacement ops must stay refused (arch-08 §6.3).
         self.guest.set_tier(CtxTier::Event);
         let api = inner.instance.cyrup_ext_events();
-        match api.call_prepare_arguments(&mut inner.store, name, &args_s).await {
+        match api
+            .call_prepare_arguments(&mut inner.store, name, &args_s)
+            .await
+        {
             Ok(Some(s)) => Ok(serde_json::from_str::<Value>(&s).ok()),
             Ok(None) => Ok(None),
             Err(e) => Err(map_wasm_error(&e)),
@@ -1847,9 +2013,11 @@ impl LiveExtension {
         let payload_s = payload.to_string();
         let api = inner.instance.cyrup_ext_events();
         let res = if is_call {
-            api.call_render_call(&mut inner.store, custom_type, &payload_s).await
+            api.call_render_call(&mut inner.store, custom_type, &payload_s)
+                .await
         } else {
-            api.call_render_result(&mut inner.store, custom_type, &payload_s).await
+            api.call_render_result(&mut inner.store, custom_type, &payload_s)
+                .await
         };
         match res {
             Ok(Some(s)) => Ok(serde_json::from_str::<Value>(&s).ok()),
@@ -1945,7 +2113,11 @@ impl Tool for WasmTool {
     /// field crossed the ABI and had NO reader: a guest declaring guidelines contributed nothing,
     /// silently, with no warning on either side.
     fn prompt_guidelines(&self) -> Vec<&str> {
-        self.descriptor.prompt_guidelines.iter().map(String::as_str).collect()
+        self.descriptor
+            .prompt_guidelines
+            .iter()
+            .map(String::as_str)
+            .collect()
     }
     /// The guest's declared `renderShell` (pi `ToolDefinition.renderShell?: "default" | "self"`,
     /// `extensions/types.ts:465` @v0.83.0: "Controls whether ToolExecutionComponent renders the
@@ -1982,7 +2154,11 @@ impl Tool for WasmTool {
         if !self.descriptor.prepare_arguments {
             return args;
         }
-        match self.ext.prepare_arguments(&self.descriptor.name, &args).await {
+        match self
+            .ext
+            .prepare_arguments(&self.descriptor.name, &args)
+            .await
+        {
             Ok(Some(v)) => v,
             Ok(None) => args,
             Err(e) => {
@@ -2003,7 +2179,13 @@ impl Tool for WasmTool {
         mut on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
         self.ext
-            .execute_tool(&self.descriptor.name, &call_id, &params, &cancel, &mut on_update)
+            .execute_tool(
+                &self.descriptor.name,
+                &call_id,
+                &params,
+                &cancel,
+                &mut on_update,
+            )
             .await
     }
 }
@@ -2060,12 +2242,26 @@ async fn invoke(
     let api = inner.instance.cyrup_ext_events();
     let noop = || Ok(wit_types::HookOutcome::Noop);
     match ev {
-        HostEvent::ToolCall { call_id, name, input } => {
-            api.call_on_tool_call(store, call_id.as_str(), name, &input.to_string()).await
+        HostEvent::ToolCall {
+            call_id,
+            name,
+            input,
+        } => {
+            api.call_on_tool_call(store, call_id.as_str(), name, &input.to_string())
+                .await
         }
         // `terminate` is host-side only: the WIT `on-tool-result` signature is fixed (no ABI
         // change), so it is not delivered to the guest — see `HostEvent::ToolResult::terminate`.
-        HostEvent::ToolResult { call_id, name, input, content, details, is_error, usage, terminate: _ } => {
+        HostEvent::ToolResult {
+            call_id,
+            name,
+            input,
+            content,
+            details,
+            is_error,
+            usage,
+            terminate: _,
+        } => {
             let content_json = serde_json::to_string(content).unwrap_or_else(|_| "[]".into());
             let details_json = details.as_ref().map(|d| d.to_string());
             // Pi `ToolResultEventBase.usage` (types.ts:919-921): absent for every ordinary tool, so
@@ -2091,7 +2287,13 @@ async fn invoke(
             let m = serde_json::to_string(message).unwrap_or_else(|_| "null".into());
             api.call_on_message_end(store, &m).await
         }
-        HostEvent::BeforeAgentStart { prompt, images, system_prompt, options, .. } => {
+        HostEvent::BeforeAgentStart {
+            prompt,
+            images,
+            system_prompt,
+            options,
+            ..
+        } => {
             api.call_on_before_agent_start(
                 store,
                 prompt,
@@ -2101,21 +2303,34 @@ async fn invoke(
             )
             .await
         }
-        HostEvent::Input { text, images, source, streaming_behavior } => {
+        HostEvent::Input {
+            text,
+            images,
+            source,
+            streaming_behavior,
+        } => {
             let images_json = serde_json::to_string(images).unwrap_or_else(|_| "[]".into());
             let source = input_source_str(*source);
             let behavior = streaming_behavior.map(streaming_behavior_str);
-            api.call_on_input(store, text, &images_json, source, behavior).await
+            api.call_on_input(store, text, &images_json, source, behavior)
+                .await
         }
-        HostEvent::UserBash { command, exclude_from_context, cwd } => {
-            api.call_on_user_bash(store, command, *exclude_from_context, cwd).await
+        HostEvent::UserBash {
+            command,
+            exclude_from_context,
+            cwd,
+        } => {
+            api.call_on_user_bash(store, command, *exclude_from_context, cwd)
+                .await
         }
         HostEvent::BeforeProviderRequest { payload } => {
-            api.call_on_before_provider_request(store, &payload.to_string()).await
+            api.call_on_before_provider_request(store, &payload.to_string())
+                .await
         }
         // EXT-009 — pi `emitBeforeProviderHeaders` (extensions/runner.ts:1045 @v0.83.0).
         HostEvent::BeforeProviderHeaders { headers } => {
-            api.call_on_before_provider_headers(store, &headers.to_string()).await
+            api.call_on_before_provider_headers(store, &headers.to_string())
+                .await
         }
         // EXT-016 / EXT-043: both events now carry the cwd they are being asked about.
         HostEvent::ResourcesDiscover { cwd, reason } => {
@@ -2123,11 +2338,16 @@ async fn invoke(
         }
         HostEvent::ProjectTrust { cwd } => api.call_on_project_trust(store, cwd).await,
         // EXT-015: the four session-lifecycle events keep their discriminating fields.
-        HostEvent::SessionBeforeSwitch { reason, target_session_file } => {
-            api.call_on_session_before_switch(store, reason, target_session_file.as_deref()).await
+        HostEvent::SessionBeforeSwitch {
+            reason,
+            target_session_file,
+        } => {
+            api.call_on_session_before_switch(store, reason, target_session_file.as_deref())
+                .await
         }
         HostEvent::SessionBeforeFork { entry_id, position } => {
-            api.call_on_session_before_fork(store, entry_id, position).await
+            api.call_on_session_before_fork(store, entry_id, position)
+                .await
         }
         HostEvent::SessionBeforeCompact {
             preparation,
@@ -2148,7 +2368,8 @@ async fn invoke(
             .await
         }
         HostEvent::SessionBeforeTree { preparation, .. } => {
-            api.call_on_session_before_tree(store, &preparation.to_string()).await
+            api.call_on_session_before_tree(store, &preparation.to_string())
+                .await
         }
         // ---- notify-only: fire-and-forget, return Noop ----
         HostEvent::AgentStart => api.call_on_agent_start(store).await.and_then(|()| noop()),
@@ -2157,29 +2378,47 @@ async fn invoke(
             api.call_on_agent_end(store, &m).await.and_then(|()| noop())
         }
         // agent_settled (Pi `_emitAgentSettled`, agent-session.ts:581-588): payload-free, notify-only.
-        HostEvent::AgentSettled => {
-            api.call_on_agent_settled(store).await.and_then(|()| noop())
-        }
-        HostEvent::TurnStart { turn_index, timestamp } => {
-            api.call_on_turn_start(store, *turn_index, *timestamp).await.and_then(|()| noop())
-        }
-        HostEvent::TurnEnd { turn_index, message, tool_results } => {
+        HostEvent::AgentSettled => api.call_on_agent_settled(store).await.and_then(|()| noop()),
+        HostEvent::TurnStart {
+            turn_index,
+            timestamp,
+        } => api
+            .call_on_turn_start(store, *turn_index, *timestamp)
+            .await
+            .and_then(|()| noop()),
+        HostEvent::TurnEnd {
+            turn_index,
+            message,
+            tool_results,
+        } => {
             let m = serde_json::to_string(message).unwrap_or_else(|_| "null".into());
             let tr = serde_json::to_string(tool_results).unwrap_or_else(|_| "[]".into());
-            api.call_on_turn_end(store, *turn_index, &m, &tr).await.and_then(|()| noop())
+            api.call_on_turn_end(store, *turn_index, &m, &tr)
+                .await
+                .and_then(|()| noop())
         }
-        HostEvent::MessageStart { message } => {
-            api.call_on_message_start(store, &message.to_string()).await.and_then(|()| noop())
-        }
+        HostEvent::MessageStart { message } => api
+            .call_on_message_start(store, &message.to_string())
+            .await
+            .and_then(|()| noop()),
         HostEvent::MessageUpdate { message, delta } => api
             .call_on_message_update(store, &message.to_string(), &delta.to_string())
             .await
             .and_then(|()| noop()),
-        HostEvent::ToolExecStart { call_id, name, args } => api
+        HostEvent::ToolExecStart {
+            call_id,
+            name,
+            args,
+        } => api
             .call_on_tool_execution_start(store, call_id.as_str(), name, &args.to_string())
             .await
             .and_then(|()| noop()),
-        HostEvent::ToolExecUpdate { call_id, name, args, chunk } => api
+        HostEvent::ToolExecUpdate {
+            call_id,
+            name,
+            args,
+            chunk,
+        } => api
             .call_on_tool_execution_update(
                 store,
                 call_id.as_str(),
@@ -2189,39 +2428,69 @@ async fn invoke(
             )
             .await
             .and_then(|()| noop()),
-        HostEvent::ToolExecEnd { call_id, name, result, is_error } => api
-            .call_on_tool_execution_end(store, call_id.as_str(), name, &result.to_string(), *is_error)
+        HostEvent::ToolExecEnd {
+            call_id,
+            name,
+            result,
+            is_error,
+        } => api
+            .call_on_tool_execution_end(
+                store,
+                call_id.as_str(),
+                name,
+                &result.to_string(),
+                *is_error,
+            )
             .await
             .and_then(|()| noop()),
-        HostEvent::SessionStart { reason, previous_session_file } => api
+        HostEvent::SessionStart {
+            reason,
+            previous_session_file,
+        } => api
             .call_on_session_start(store, reason, previous_session_file.as_deref())
             .await
             .and_then(|()| noop()),
-        HostEvent::SessionShutdown { reason, target_session_file } => api
+        HostEvent::SessionShutdown {
+            reason,
+            target_session_file,
+        } => api
             .call_on_session_shutdown(store, reason, target_session_file.as_deref())
             .await
             .and_then(|()| noop()),
         // EXT-011 — pi `SessionInfoChangedEvent` (extensions/types.ts:571-575 @v0.83.0).
-        HostEvent::SessionInfoChanged { name } => {
-            api.call_on_session_info_changed(store, name.as_deref()).await.and_then(|()| noop())
-        }
+        HostEvent::SessionInfoChanged { name } => api
+            .call_on_session_info_changed(store, name.as_deref())
+            .await
+            .and_then(|()| noop()),
         HostEvent::AfterProviderResponse { status, headers } => api
             .call_on_after_provider_response(store, *status, &headers.to_string())
             .await
             .and_then(|()| noop()),
         // EXT-042: `previousModel`/`source` and `previousLevel` are pi SIBLING fields, not
         // members of the `model` blob.
-        HostEvent::ModelSelect { model, previous_model, source } => {
+        HostEvent::ModelSelect {
+            model,
+            previous_model,
+            source,
+        } => {
             let prev = previous_model.as_ref().map(|v| v.to_string());
             api.call_on_model_select(store, &model.to_string(), prev.as_deref(), source)
                 .await
                 .and_then(|()| noop())
         }
-        HostEvent::ThinkingLevelSelect { level, previous_level } => api
+        HostEvent::ThinkingLevelSelect {
+            level,
+            previous_level,
+        } => api
             .call_on_thinking_level_select(store, level, previous_level.as_deref())
             .await
             .and_then(|()| noop()),
-        HostEvent::SessionCompact { compaction_entry, from_extension, reason, will_retry } => api
+        HostEvent::SessionCompact {
+            compaction_entry,
+            from_extension,
+            reason,
+            will_retry,
+        } => api
             .call_on_session_compact(
                 store,
                 &compaction_entry.to_string(),
@@ -2231,9 +2500,10 @@ async fn invoke(
             )
             .await
             .and_then(|()| noop()),
-        HostEvent::SessionTree { tree } => {
-            api.call_on_session_tree(store, &tree.to_string()).await.and_then(|()| noop())
-        }
+        HostEvent::SessionTree { tree } => api
+            .call_on_session_tree(store, &tree.to_string())
+            .await
+            .and_then(|()| noop()),
     }
 }
 
@@ -2264,7 +2534,10 @@ fn decode_outcome(kind: EventKind, wit: wit_types::HookOutcome) -> HookOutcome {
         // `ToolCallEventResult.terminate` (extensions/types.ts:1072-1079 @v0.84.1).
         wit_types::HookOutcome::Block(b) => {
             // WIT `block-result.terminate` is a plain `bool` (world.wit:80) — the other boundary.
-            HookOutcome::Block { reason: b.reason, terminate: TerminateHint::from_guest_bool(b.terminate) }
+            HookOutcome::Block {
+                reason: b.reason,
+                terminate: TerminateHint::from_guest_bool(b.terminate),
+            }
         }
         wit_types::HookOutcome::Handled(s) => {
             let v: Value = serde_json::from_str(&s).unwrap_or(Value::Null);
@@ -2305,7 +2578,13 @@ fn decode_patch(kind: EventKind, v: Value) -> Option<EventPatch> {
                 .get("terminate")
                 .and_then(Value::as_bool)
                 .map(|b| TerminateHint::from_wire(Some(b)));
-            Some(EventPatch::ToolResult { content, details, is_error, usage, terminate })
+            Some(EventPatch::ToolResult {
+                content,
+                details,
+                is_error,
+                usage,
+                terminate,
+            })
         }
         EventKind::Context => {
             let messages = serde_json::from_value(v).ok()?;
@@ -2316,7 +2595,10 @@ fn decode_patch(kind: EventKind, v: Value) -> Option<EventPatch> {
             Some(EventPatch::Message(Box::new(m)))
         }
         EventKind::BeforeAgentStart => {
-            let system = v.get("systemPrompt").and_then(|s| s.as_str()).map(|s| s.to_string());
+            let system = v
+                .get("systemPrompt")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string());
             let inject = v
                 .get("message")
                 .cloned()
@@ -2366,8 +2648,11 @@ mod tests {
     /// callable directly. Exercises the REAL production `exec::Host::run` implementation, not a
     /// reimplementation of its logic.
     fn state_with(services: Arc<RecordingServices>) -> HostState {
-        let guest =
-            GuestState::with_services(ExtensionId::from("test"), Arc::new(ExtensionRegistry::new()), services);
+        let guest = GuestState::with_services(
+            ExtensionId::from("test"),
+            Arc::new(ExtensionRegistry::new()),
+            services,
+        );
         HostState::with_guest(StoreLimits::default(), Arc::new(guest))
     }
 
@@ -2416,8 +2701,15 @@ mod tests {
         // The SDK defaults `label` to the name (`cyrup-ext-sdk/src/descriptor.rs:113`), so an EMPTY
         // label only reaches the host from a guest that sent one deliberately. `Tool::label`
         // documents `None` as "fall back to the tool name"; `Some("")` would blank the UI row.
-        let blank = ToolDescriptor { label: String::new(), ..described };
-        assert_eq!(descriptor_label(&blank), None, "an empty label is the name fallback, not an empty row");
+        let blank = ToolDescriptor {
+            label: String::new(),
+            ..described
+        };
+        assert_eq!(
+            descriptor_label(&blank),
+            None,
+            "an empty label is the name fallback, not an empty row"
+        );
     }
 
     /// EXT-M03, the half the mapping test above CANNOT cover — and the half that was actually
@@ -2487,11 +2779,16 @@ mod tests {
         let mut state = state_with(rec.clone());
         // The guest already aborted this signal id (Pi `signal.abort()`, mirrors a prior
         // `ctx.abort_signal("my-signal")` call reaching `ui::Host::abort_signal`).
-        guest_of(&state).expect("guest state present").abort_signal("my-signal".into());
+        guest_of(&state)
+            .expect("guest state present")
+            .abort_signal("my-signal".into());
 
         let opts_json = serde_json::json!({ "signalId": "my-signal" }).to_string();
         let result = ExecHost::run(&mut state, "echo".into(), vec!["hi".into()], opts_json).await;
-        assert!(result.is_ok(), "exec still runs (a pre-cancelled token is not a host error)");
+        assert!(
+            result.is_ok(),
+            "exec still runs (a pre-cancelled token is not a host error)"
+        );
 
         assert_eq!(
             rec.exec_call_pre_cancelled(),
@@ -2537,14 +2834,23 @@ mod tests {
         let rec = Arc::new(RecordingServices::new(CannedResponses::default()));
         let mut state = state_with(rec.clone());
 
-        ProcHost::spawn(&mut state, "true".into(), vec![], "{}".into(), Some("~".into()), false)
-            .await
-            .expect("spawn succeeds");
+        ProcHost::spawn(
+            &mut state,
+            "true".into(),
+            vec![],
+            "{}".into(),
+            Some("~".into()),
+            false,
+        )
+        .await
+        .expect("spawn succeeds");
 
         let cwds = rec.proc_spawn_cwds();
         assert_eq!(cwds.len(), 1);
         assert_eq!(
-            cwds.first().and_then(|c| c.as_deref()).and_then(|p| p.to_str()),
+            cwds.first()
+                .and_then(|c| c.as_deref())
+                .and_then(|p| p.to_str()),
             Some(real_home.as_str()),
             "a raw guest `~` cwd must already be tilde-expanded by the time it reaches \
              HostServices::proc_spawn — NOT left for a later layer to (possibly never) resolve"
@@ -2570,9 +2876,16 @@ mod tests {
         let mut state = state_with(rec.clone());
 
         // A literal empty string.
-        ProcHost::spawn(&mut state, "true".into(), vec![], "{}".into(), Some(String::new()), false)
-            .await
-            .expect("spawn succeeds");
+        ProcHost::spawn(
+            &mut state,
+            "true".into(),
+            vec![],
+            "{}".into(),
+            Some(String::new()),
+            false,
+        )
+        .await
+        .expect("spawn succeeds");
         // An undefined-var placeholder that interpolates to empty (`${DEFINITELY_NOT_SET_...}`).
         ProcHost::spawn(
             &mut state,

@@ -173,7 +173,9 @@ fn keybindings_object(json: &str) -> Result<serde_json::Map<String, serde_json::
             .0
             .into_iter()
             .collect()),
-        other => Err(TuiError::Keybindings(format!("expected a JSON object, got {other}"))),
+        other => Err(TuiError::Keybindings(format!(
+            "expected a JSON object, got {other}"
+        ))),
     }
 }
 
@@ -504,12 +506,18 @@ pub struct Key {
 impl Key {
     /// A Ctrl+char chord.
     pub fn ctrl(c: char) -> Key {
-        Key { code: KeyCode::Char(c), mods: KeyModifiers::CONTROL }
+        Key {
+            code: KeyCode::Char(c),
+            mods: KeyModifiers::CONTROL,
+        }
     }
 
     /// A bare key with no modifiers.
     pub fn plain(code: KeyCode) -> Key {
-        Key { code, mods: KeyModifiers::NONE }
+        Key {
+            code,
+            mods: KeyModifiers::NONE,
+        }
     }
 
     /// Parse a string spec like `"ctrl+c"`, `"shift+tab"`, `"alt+enter"`, `"esc"` (R-10-023).
@@ -555,9 +563,9 @@ impl Key {
                 // counterpart, so there is nothing to map it to.
                 "insert" | "ins" => code = Some(KeyCode::Insert),
                 other
-                    if other
-                        .strip_prefix('f')
-                        .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())) =>
+                    if other.strip_prefix('f').is_some_and(|d| {
+                        !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())
+                    }) =>
                 {
                     match other.strip_prefix('f').and_then(|d| d.parse::<u8>().ok()) {
                         Some(n @ 1..=12) => code = Some(KeyCode::F(n)),
@@ -689,24 +697,57 @@ impl Default for Keymap {
                 // `BackTab` (with or without a SHIFT flag) and — under this TUI's Kitty
                 // DISAMBIGUATE mode — `Tab`+SHIFT. Bind all three so the cycle fires regardless.
                 (Key::plain(KeyCode::BackTab), Action::ThinkingCycle),
-                (Key { code: KeyCode::BackTab, mods: KeyModifiers::SHIFT }, Action::ThinkingCycle),
-                (Key { code: KeyCode::Tab, mods: KeyModifiers::SHIFT }, Action::ThinkingCycle),
+                (
+                    Key {
+                        code: KeyCode::BackTab,
+                        mods: KeyModifiers::SHIFT,
+                    },
+                    Action::ThinkingCycle,
+                ),
+                (
+                    Key {
+                        code: KeyCode::Tab,
+                        mods: KeyModifiers::SHIFT,
+                    },
+                    Action::ThinkingCycle,
+                ),
                 // `app.model.cycleForward` / `cycleBackward` (`core/keybindings.ts:76-83`).
                 (Key::ctrl('p'), Action::ModelCycleForward),
                 (
-                    Key { code: KeyCode::Char('p'), mods: KeyModifiers::CONTROL | KeyModifiers::SHIFT },
+                    Key {
+                        code: KeyCode::Char('p'),
+                        mods: KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                    },
                     Action::ModelCycleBackward,
                 ),
                 // `app.message.followUp` (`core/keybindings.ts:98-101`, default `alt+enter`).
-                (Key { code: KeyCode::Enter, mods: KeyModifiers::ALT }, Action::FollowUp),
+                (
+                    Key {
+                        code: KeyCode::Enter,
+                        mods: KeyModifiers::ALT,
+                    },
+                    Action::FollowUp,
+                ),
                 // `app.message.dequeue` (`core/keybindings.ts:102-105`, default `alt+up`).
-                (Key { code: KeyCode::Up, mods: KeyModifiers::ALT }, Action::Dequeue),
+                (
+                    Key {
+                        code: KeyCode::Up,
+                        mods: KeyModifiers::ALT,
+                    },
+                    Action::Dequeue,
+                ),
                 // `app.clipboard.pasteImage` (`core/keybindings.ts:106-109`): `ctrl+v` everywhere,
                 // `alt+v` on Windows. Bind both so muscle memory works on either platform (the read is
                 // gated on an image actually being present, so a bare Ctrl+V still falls through to the
                 // editor as before).
                 (Key::ctrl('v'), Action::ClipboardPasteImage),
-                (Key { code: KeyCode::Char('v'), mods: KeyModifiers::ALT }, Action::ClipboardPasteImage),
+                (
+                    Key {
+                        code: KeyCode::Char('v'),
+                        mods: KeyModifiers::ALT,
+                    },
+                    Action::ClipboardPasteImage,
+                ),
                 // TUI-008. `app.model.select` `ctrl+l` (`core/keybindings.ts:85`),
                 // `app.thinking.toggle` `ctrl+t` (`:87-90`), `app.message.copy` `ctrl+x`
                 // (`:99-102`).
@@ -725,7 +766,9 @@ impl Default for Keymap {
 impl Keymap {
     /// An empty keymap (all keys fall through to the editor).
     pub fn empty() -> Self {
-        Keymap { bindings: Vec::new() }
+        Keymap {
+            bindings: Vec::new(),
+        }
     }
 
     /// Bind (or override) a key to an action.
@@ -736,12 +779,18 @@ impl Keymap {
 
     /// Resolve the global action for an event, if any (R-10-018: never compare keys inline).
     pub fn action_for(&self, ev: &KeyEvent) -> Option<Action> {
-        self.bindings.iter().find_map(|(key, action)| key.matches(ev).then_some(*action))
+        self.bindings
+            .iter()
+            .find_map(|(key, action)| key.matches(ev).then_some(*action))
     }
 
     /// All keys currently bound to `action` (the reverse of [`action_for`](Self::action_for)).
     pub fn keys_for(&self, action: Action) -> Vec<Key> {
-        self.bindings.iter().filter(|(_, a)| *a == action).map(|(k, _)| *k).collect()
+        self.bindings
+            .iter()
+            .filter(|(_, a)| *a == action)
+            .map(|(k, _)| *k)
+            .collect()
     }
 
     /// The label of the first key bound to `action` (`escape`, `ctrl+c`), or `None` if unbound.
@@ -750,7 +799,10 @@ impl Keymap {
     /// all funnel through `keyText`, which joins every bound key. This first-key form is for callers
     /// that genuinely need one key.
     pub fn key_label(&self, action: Action) -> Option<String> {
-        self.bindings.iter().find(|(_, a)| *a == action).map(|(k, _)| k.label())
+        self.bindings
+            .iter()
+            .find(|(_, a)| *a == action)
+            .map(|(k, _)| k.label())
     }
 
     /// **All** keys bound to `action`, joined with `/` — Pi's `keyText`, i.e.
@@ -763,14 +815,20 @@ impl Keymap {
     /// keys shows both instead of silently hiding the second. The app-tier twin of
     /// [`SelectKeymap::keys_label`].
     pub fn keys_label(&self, action: Action) -> Option<String> {
-        join_key_labels(self.bindings.iter().filter(|(_, a)| *a == action).map(|(k, _)| k))
+        join_key_labels(
+            self.bindings
+                .iter()
+                .filter(|(_, a)| *a == action)
+                .map(|(k, _)| k),
+        )
     }
 
     /// Rebind `action` to exactly `keys`, dropping any keys it was previously bound to **and** taking
     /// each new key away from whatever other action held it (a key maps to exactly one global action,
     /// matching `core/keybindings.ts` where a rebind moves the key).
     pub fn set_action(&mut self, action: Action, keys: Vec<Key>) {
-        self.bindings.retain(|(k, a)| *a != action && !keys.contains(k));
+        self.bindings
+            .retain(|(k, a)| *a != action && !keys.contains(k));
         for key in keys {
             self.bindings.push((key, action));
         }
@@ -782,7 +840,9 @@ impl Keymap {
     /// DOCUMENT is an error; a rejected entry or key spec comes back as a [`KeybindingIssue`] and
     /// every other entry still applies (CFG-038 — see [`merge_entries`]).
     pub fn merge_json(&mut self, json: &str) -> Result<Vec<KeybindingIssue>, TuiError> {
-        merge_entries(json, Action::from_id, |action, keys| self.set_action(action, keys))
+        merge_entries(json, Action::from_id, |action, keys| {
+            self.set_action(action, keys)
+        })
     }
 }
 
@@ -834,7 +894,9 @@ impl Default for SelectKeymap {
 impl SelectKeymap {
     /// An empty selector keymap.
     pub fn empty() -> Self {
-        SelectKeymap { bindings: Vec::new() }
+        SelectKeymap {
+            bindings: Vec::new(),
+        }
     }
 
     /// Bind (or override) a key to a selector action.
@@ -845,7 +907,9 @@ impl SelectKeymap {
 
     /// Resolve the selector action for an event, if any (R-10-018: never compare keys inline).
     pub fn action_for(&self, ev: &KeyEvent) -> Option<SelectAction> {
-        self.bindings.iter().find_map(|(key, action)| key.matches(ev).then_some(*action))
+        self.bindings
+            .iter()
+            .find_map(|(key, action)| key.matches(ev).then_some(*action))
     }
 
     /// The label of the first key bound to `action` (`esc`, `enter`), or `None` if unbound — the
@@ -854,7 +918,10 @@ impl SelectKeymap {
     /// `keybindings.json` rebind of `tui.select.*` changes the hint text too (spec/tui/05 §10; the
     /// cancel text is never hardcoded).
     pub fn key_label(&self, action: SelectAction) -> Option<String> {
-        self.bindings.iter().find(|(_, a)| *a == action).map(|(k, _)| k.label())
+        self.bindings
+            .iter()
+            .find(|(_, a)| *a == action)
+            .map(|(k, _)| k.label())
     }
 
     /// **All** keys bound to `action`, joined with `/` — Pi's `keyText`, which is
@@ -865,7 +932,12 @@ impl SelectKeymap {
     /// This is what a `keyHint("tui.select.cancel", …)` renders: with the stock bindings
     /// (`tui/src/keybindings.ts:149-152`) it is `escape/ctrl+c`, not just the first key.
     pub fn keys_label(&self, action: SelectAction) -> Option<String> {
-        join_key_labels(self.bindings.iter().filter(|(_, a)| *a == action).map(|(k, _)| k))
+        join_key_labels(
+            self.bindings
+                .iter()
+                .filter(|(_, a)| *a == action)
+                .map(|(k, _)| k),
+        )
     }
 
     /// Rebind `action` to exactly `keys`.
@@ -878,7 +950,9 @@ impl SelectKeymap {
 
     /// Merge a JSON keybindings document, applying only the `tui.select.*` ids (spec/tui/05 §10).
     pub fn merge_json(&mut self, json: &str) -> Result<Vec<KeybindingIssue>, TuiError> {
-        merge_entries(json, SelectAction::from_id, |action, keys| self.set_action(action, keys))
+        merge_entries(json, SelectAction::from_id, |action, keys| {
+            self.set_action(action, keys)
+        })
     }
 }
 
@@ -952,7 +1026,9 @@ impl Default for AutocompleteKeymap {
 impl AutocompleteKeymap {
     /// An empty popup keymap.
     pub fn empty() -> Self {
-        AutocompleteKeymap { bindings: Vec::new() }
+        AutocompleteKeymap {
+            bindings: Vec::new(),
+        }
     }
 
     /// Bind (or override) a key to a popup action.
@@ -963,7 +1039,9 @@ impl AutocompleteKeymap {
 
     /// Resolve the popup action for an event, if any (R-10-018: never compare keys inline).
     pub fn action_for(&self, ev: &KeyEvent) -> Option<AutocompleteAction> {
-        self.bindings.iter().find_map(|(key, action)| key.matches(ev).then_some(*action))
+        self.bindings
+            .iter()
+            .find_map(|(key, action)| key.matches(ev).then_some(*action))
     }
 
     /// Rebind `action` to exactly `keys`.
@@ -976,7 +1054,9 @@ impl AutocompleteKeymap {
 
     /// Merge a JSON keybindings document, applying only the `tui.autocomplete.*` ids (item #6).
     pub fn merge_json(&mut self, json: &str) -> Result<Vec<KeybindingIssue>, TuiError> {
-        merge_entries(json, AutocompleteAction::from_id, |action, keys| self.set_action(action, keys))
+        merge_entries(json, AutocompleteAction::from_id, |action, keys| {
+            self.set_action(action, keys)
+        })
     }
 }
 
@@ -1026,8 +1106,20 @@ impl Default for ModelsKeymap {
         use ModelsAction as M;
         ModelsKeymap {
             bindings: vec![
-                (Key { code: KeyCode::Up, mods: KeyModifiers::ALT }, M::ReorderUp),
-                (Key { code: KeyCode::Down, mods: KeyModifiers::ALT }, M::ReorderDown),
+                (
+                    Key {
+                        code: KeyCode::Up,
+                        mods: KeyModifiers::ALT,
+                    },
+                    M::ReorderUp,
+                ),
+                (
+                    Key {
+                        code: KeyCode::Down,
+                        mods: KeyModifiers::ALT,
+                    },
+                    M::ReorderDown,
+                ),
                 (Key::ctrl('a'), M::EnableAll),
                 (Key::ctrl('x'), M::ClearAll),
                 (Key::ctrl('p'), M::ToggleProvider),
@@ -1040,7 +1132,9 @@ impl Default for ModelsKeymap {
 impl ModelsKeymap {
     /// Resolve the scoped-models action for an event, if any (R-10-018).
     pub fn action_for(&self, ev: &KeyEvent) -> Option<ModelsAction> {
-        self.bindings.iter().find_map(|(key, action)| key.matches(ev).then_some(*action))
+        self.bindings
+            .iter()
+            .find_map(|(key, action)| key.matches(ev).then_some(*action))
     }
 
     /// **All** keys bound to `action`, joined with `/` — the `app.models.*` twin of
@@ -1052,7 +1146,12 @@ impl ModelsKeymap {
     /// (`scoped-models-selector.ts:197-205`), which is the only place upstream calls `keyText` on
     /// an `app.models.*` id.
     pub fn keys_label(&self, action: ModelsAction) -> Option<String> {
-        join_key_labels(self.bindings.iter().filter(|(_, a)| *a == action).map(|(k, _)| k))
+        join_key_labels(
+            self.bindings
+                .iter()
+                .filter(|(_, a)| *a == action)
+                .map(|(k, _)| k),
+        )
     }
 
     /// Rebind `action` to exactly `keys`.
@@ -1065,7 +1164,9 @@ impl ModelsKeymap {
 
     /// Merge a JSON keybindings document, applying only the `app.models.*` ids.
     pub fn merge_json(&mut self, json: &str) -> Result<Vec<KeybindingIssue>, TuiError> {
-        merge_entries(json, ModelsAction::from_id, |action, keys| self.set_action(action, keys))
+        merge_entries(json, ModelsAction::from_id, |action, keys| {
+            self.set_action(action, keys)
+        })
     }
 }
 
@@ -1073,9 +1174,10 @@ impl ModelsKeymap {
 /// 135-154` `app.session.*`). These bind only inside the session selector, on top of the shared
 /// `tui.select.*` navigation; resolved via [`SessionKeymap`] (R-10-018).
 ///
-/// The header's second hint row names **every one of them** through `keyHint("app.session.…", …)`
-/// (`session-selector.ts:171-179`), so a rebind has to reach the hint text as well as the handler —
-/// which is exactly what a hardcoded `"ctrl+s sort · ctrl+n named · …"` string cannot do.
+/// The header's second hint row names every one of them **except** [`SessionAction::DeleteNoninvasive`]
+/// through `keyHint("app.session.…", …)` (`session-selector.ts:171-179`), so a rebind has to reach
+/// the hint text as well as the handler — which is exactly what a hardcoded
+/// `"ctrl+s sort · ctrl+n named · …"` string cannot do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SessionAction {
     /// Cycle threaded → recent → fuzzy — `app.session.toggleSort` (Ctrl+S).
@@ -1088,6 +1190,13 @@ pub enum SessionAction {
     TogglePath,
     /// Rename the highlighted session — `app.session.rename` (Ctrl+R).
     Rename,
+    /// "Delete session when query is empty" — `app.session.deleteNoninvasive` (Ctrl+Backspace),
+    /// pi's "non-invasive convenience alias for delete": with an empty search query it opens the
+    /// same delete confirmation as [`SessionAction::Delete`]; with a non-empty query the key is
+    /// forwarded to the search input and the list is re-filtered
+    /// (`core/keybindings.ts:177-180`, `session-selector.ts:590-600` @v0.84.4; identical at
+    /// v0.83.0 `:151-154` / `:590-600`). TUI-068.
+    DeleteNoninvasive,
 }
 
 impl SessionAction {
@@ -1099,13 +1208,15 @@ impl SessionAction {
             "app.session.delete" => Some(SessionAction::Delete),
             "app.session.togglePath" => Some(SessionAction::TogglePath),
             "app.session.rename" => Some(SessionAction::Rename),
+            "app.session.deleteNoninvasive" => Some(SessionAction::DeleteNoninvasive),
             _ => None,
         }
     }
 }
 
 /// The configurable `/resume` binding table. Defaults are upstream's verbatim
-/// (`core/keybindings.ts:91-94` Ctrl+N, `:135-150` Ctrl+P / Ctrl+S / Ctrl+R / Ctrl+D).
+/// (`core/keybindings.ts:91-94` Ctrl+N, `:135-150` Ctrl+P / Ctrl+S / Ctrl+R / Ctrl+D, and
+/// `:177-180` @v0.84.4 `ctrl+backspace` for `deleteNoninvasive`).
 #[derive(Clone, Debug)]
 pub struct SessionKeymap {
     bindings: Vec<(Key, SessionAction)>,
@@ -1121,6 +1232,13 @@ impl Default for SessionKeymap {
                 (Key::ctrl('d'), S::Delete),
                 (Key::ctrl('p'), S::TogglePath),
                 (Key::ctrl('r'), S::Rename),
+                (
+                    Key {
+                        code: KeyCode::Backspace,
+                        mods: KeyModifiers::CONTROL,
+                    },
+                    S::DeleteNoninvasive,
+                ),
             ],
         }
     }
@@ -1129,14 +1247,21 @@ impl Default for SessionKeymap {
 impl SessionKeymap {
     /// Resolve the session-picker action for an event, if any (R-10-018).
     pub fn action_for(&self, ev: &KeyEvent) -> Option<SessionAction> {
-        self.bindings.iter().find_map(|(key, action)| key.matches(ev).then_some(*action))
+        self.bindings
+            .iter()
+            .find_map(|(key, action)| key.matches(ev).then_some(*action))
     }
 
     /// **All** keys bound to `action`, joined with `/` — Pi's `keyText("app.session.…")`
     /// (`keybinding-hints.ts:29-36`). `None` when the action is unbound (upstream's
     /// `keys.length === 0` → `""`).
     pub fn keys_label(&self, action: SessionAction) -> Option<String> {
-        join_key_labels(self.bindings.iter().filter(|(_, a)| *a == action).map(|(k, _)| k))
+        join_key_labels(
+            self.bindings
+                .iter()
+                .filter(|(_, a)| *a == action)
+                .map(|(k, _)| k),
+        )
     }
 
     /// Rebind `action` to exactly `keys`.
@@ -1149,7 +1274,9 @@ impl SessionKeymap {
 
     /// Merge a JSON keybindings document, applying only the `app.session.*` ids.
     pub fn merge_json(&mut self, json: &str) -> Result<Vec<KeybindingIssue>, TuiError> {
-        merge_entries(json, SessionAction::from_id, |action, keys| self.set_action(action, keys))
+        merge_entries(json, SessionAction::from_id, |action, keys| {
+            self.set_action(action, keys)
+        })
     }
 }
 
@@ -1235,10 +1362,22 @@ pub struct TreeKeymap {
 impl Default for TreeKeymap {
     fn default() -> Self {
         use TreeAction as T;
-        let ctrl = |c: char| Key { code: KeyCode::Char(c), mods: KeyModifiers::CONTROL };
-        let alt_code = |code: KeyCode| Key { code, mods: KeyModifiers::ALT };
-        let ctrl_code = |code: KeyCode| Key { code, mods: KeyModifiers::CONTROL };
-        let shift = |c: char| Key { code: KeyCode::Char(c), mods: KeyModifiers::SHIFT };
+        let ctrl = |c: char| Key {
+            code: KeyCode::Char(c),
+            mods: KeyModifiers::CONTROL,
+        };
+        let alt_code = |code: KeyCode| Key {
+            code,
+            mods: KeyModifiers::ALT,
+        };
+        let ctrl_code = |code: KeyCode| Key {
+            code,
+            mods: KeyModifiers::CONTROL,
+        };
+        let shift = |c: char| Key {
+            code: KeyCode::Char(c),
+            mods: KeyModifiers::SHIFT,
+        };
         TreeKeymap {
             bindings: vec![
                 (alt_code(KeyCode::Left), T::FoldOrUp),
@@ -1273,7 +1412,9 @@ impl Default for TreeKeymap {
 impl TreeKeymap {
     /// Resolve the tree action for an event, if any (R-10-018).
     pub fn action_for(&self, ev: &KeyEvent) -> Option<TreeAction> {
-        self.bindings.iter().find_map(|(key, action)| key.matches(ev).then_some(*action))
+        self.bindings
+            .iter()
+            .find_map(|(key, action)| key.matches(ev).then_some(*action))
     }
 
     /// The label of the **first** key bound to `action`, with pi's help-row arrow substitutions
@@ -1281,7 +1422,11 @@ impl TreeKeymap {
     /// `up`/`down`/`left`/`right` to `↑`/`↓`/`←`/`→` and `pageUp`/`pageDown` to `pgup`/`pgdn`.
     /// `None` when the action is unbound (upstream's `keys.length === 0` → `""`).
     pub fn first_key_label(&self, action: TreeAction) -> Option<String> {
-        let raw = self.bindings.iter().find(|(_, a)| *a == action).map(|(k, _)| k.label())?;
+        let raw = self
+            .bindings
+            .iter()
+            .find(|(_, a)| *a == action)
+            .map(|(k, _)| k.label())?;
         // pi's replacements are `\b`-anchored, so they rewrite the base key token and never the
         // inside of a longer word. cyrup's labels are `mod+mod+base`, so rewrite the base token.
         let (prefix, base) = match raw.rfind('+') {
@@ -1313,7 +1458,9 @@ impl TreeKeymap {
     /// document, so a rebind of `app.message.copy` moves this table and the global one together,
     /// which is what keeps the chord identical inside and outside `/tree`.
     pub fn merge_json(&mut self, json: &str) -> Result<Vec<KeybindingIssue>, TuiError> {
-        merge_entries(json, TreeAction::from_id, |action, keys| self.set_action(action, keys))
+        merge_entries(json, TreeAction::from_id, |action, keys| {
+            self.set_action(action, keys)
+        })
     }
 }
 
@@ -1330,10 +1477,22 @@ impl Default for EditorKeymap {
         use KeyCode::{
             Backspace, Char, Delete, Down, End, Enter, Home, Left, PageDown, PageUp, Right, Tab, Up,
         };
-        let ctrl = |c: char| Key { code: Char(c), mods: KeyModifiers::CONTROL };
-        let alt = |c: char| Key { code: Char(c), mods: KeyModifiers::ALT };
-        let alt_code = |code: KeyCode| Key { code, mods: KeyModifiers::ALT };
-        let ctrl_code = |code: KeyCode| Key { code, mods: KeyModifiers::CONTROL };
+        let ctrl = |c: char| Key {
+            code: Char(c),
+            mods: KeyModifiers::CONTROL,
+        };
+        let alt = |c: char| Key {
+            code: Char(c),
+            mods: KeyModifiers::ALT,
+        };
+        let alt_code = |code: KeyCode| Key {
+            code,
+            mods: KeyModifiers::ALT,
+        };
+        let ctrl_code = |code: KeyCode| Key {
+            code,
+            mods: KeyModifiers::CONTROL,
+        };
         EditorKeymap {
             bindings: vec![
                 // Motion (`keybindings.ts:54-78`).
@@ -1386,9 +1545,21 @@ impl Default for EditorKeymap {
                 (ctrl('-'), E::Undo),
                 // Char-jump (`:111-114`, Kitty-gated).
                 (ctrl(']'), E::JumpForward),
-                (Key { code: Char(']'), mods: KeyModifiers::CONTROL | KeyModifiers::ALT }, E::JumpBackward),
+                (
+                    Key {
+                        code: Char(']'),
+                        mods: KeyModifiers::CONTROL | KeyModifiers::ALT,
+                    },
+                    E::JumpBackward,
+                ),
                 // Newline / submit / tab (`:120-134`).
-                (Key { code: Enter, mods: KeyModifiers::SHIFT }, E::NewLine),
+                (
+                    Key {
+                        code: Enter,
+                        mods: KeyModifiers::SHIFT,
+                    },
+                    E::NewLine,
+                ),
                 (ctrl('j'), E::NewLine),
                 (Key::plain(Enter), E::Submit),
                 (Key::plain(Tab), E::Tab),
@@ -1400,7 +1571,9 @@ impl Default for EditorKeymap {
 impl EditorKeymap {
     /// An empty editor keymap.
     pub fn empty() -> Self {
-        EditorKeymap { bindings: Vec::new() }
+        EditorKeymap {
+            bindings: Vec::new(),
+        }
     }
 
     /// Bind (or override) a key to an editor action.
@@ -1417,13 +1590,18 @@ impl EditorKeymap {
     pub fn action_for(&self, ev: &KeyEvent) -> Option<EditorAction> {
         let normalized = normalize_legacy_control_byte(ev);
         let ev = normalized.as_ref().unwrap_or(ev);
-        self.bindings.iter().find_map(|(key, action)| key.matches(ev).then_some(*action))
+        self.bindings
+            .iter()
+            .find_map(|(key, action)| key.matches(ev).then_some(*action))
     }
 
     /// The label of the first key bound to `action` (`enter`, `ctrl+w`), or `None` if unbound. Drives
     /// the `/hotkeys` table from the live editor keymap (`getEditorKeyDisplay`, interactive-mode.ts).
     pub fn key_label(&self, action: EditorAction) -> Option<String> {
-        self.bindings.iter().find(|(_, a)| *a == action).map(|(k, _)| k.label())
+        self.bindings
+            .iter()
+            .find(|(_, a)| *a == action)
+            .map(|(k, _)| k.label())
     }
 
     /// **All** keys bound to `action`, joined with `/` — Pi's `keyText`
@@ -1432,7 +1610,12 @@ impl EditorKeymap {
     /// key, e.g. `tui.input.newLine`'s stock `["shift+enter", "ctrl+j"]`
     /// (pi `tui/src/keybindings.ts:137`) renders as `shift+enter/ctrl+j`.
     pub fn keys_label(&self, action: EditorAction) -> Option<String> {
-        join_key_labels(self.bindings.iter().filter(|(_, a)| *a == action).map(|(k, _)| k))
+        join_key_labels(
+            self.bindings
+                .iter()
+                .filter(|(_, a)| *a == action)
+                .map(|(k, _)| k),
+        )
     }
 
     /// **All** keys bound to `action` — the key set behind [`Self::keys_label`], handed out so a
@@ -1445,7 +1628,11 @@ impl EditorKeymap {
     /// resolving an event against a table. Calling [`Self::action_for`] there instead would let
     /// `tui.editor.cursorUp` and friends fire inside a list selector, which upstream never does.
     pub fn keys_for(&self, action: EditorAction) -> Vec<Key> {
-        self.bindings.iter().filter(|(_, a)| *a == action).map(|(k, _)| *k).collect()
+        self.bindings
+            .iter()
+            .filter(|(_, a)| *a == action)
+            .map(|(k, _)| *k)
+            .collect()
     }
 
     /// Rebind `action` to exactly `keys`.
@@ -1458,7 +1645,9 @@ impl EditorKeymap {
 
     /// Merge a JSON keybindings document, applying only the `editor.*` ids (spec/tui/03 §6.1).
     pub fn merge_json(&mut self, json: &str) -> Result<Vec<KeybindingIssue>, TuiError> {
-        merge_entries(json, EditorAction::from_id, |action, keys| self.set_action(action, keys))
+        merge_entries(json, EditorAction::from_id, |action, keys| {
+            self.set_action(action, keys)
+        })
     }
 }
 
@@ -1634,7 +1823,10 @@ impl Default for AltScreenKeymap {
             code,
             mods: KeyModifiers::CONTROL | KeyModifiers::SHIFT,
         };
-        let ctrl_code = |code: KeyCode| Key { code, mods: KeyModifiers::CONTROL };
+        let ctrl_code = |code: KeyCode| Key {
+            code,
+            mods: KeyModifiers::CONTROL,
+        };
         AltScreenKeymap {
             bindings: vec![
                 (Key::plain(KeyCode::PageUp), A::PageUp),
@@ -1661,7 +1853,9 @@ impl AltScreenKeymap {
     /// row, a conflict report — asks "what does this chord mean in fullscreen?" with no live
     /// renderer to ask about.
     pub fn action_for(&self, ev: &KeyEvent) -> Option<AltScreenAction> {
-        self.bindings.iter().find_map(|(key, action)| key.matches(ev).then_some(*action))
+        self.bindings
+            .iter()
+            .find_map(|(key, action)| key.matches(ev).then_some(*action))
     }
 
     /// Resolve the viewport action for an event **only while the fullscreen renderer is live** —
@@ -1694,7 +1888,12 @@ impl AltScreenKeymap {
     /// [`AltScreenAction::id`] and [`AltScreenAction::description`] name them, and this answers
     /// `None` for their keys until someone binds them (ADR-0005 §Decision C rule ii).
     pub fn keys_label(&self, action: AltScreenAction) -> Option<String> {
-        join_key_labels(self.bindings.iter().filter(|(_, a)| *a == action).map(|(k, _)| k))
+        join_key_labels(
+            self.bindings
+                .iter()
+                .filter(|(_, a)| *a == action)
+                .map(|(k, _)| k),
+        )
     }
 
     /// Rebind `action` to exactly `keys`.

@@ -274,7 +274,12 @@ fn safe_agent(agent: &str) -> String {
 /// The four artifact paths for one run (pi `getArtifactPaths`, `shared/artifacts.ts:186-197`): base is
 /// `<runId>_<safeAgent>[_<index>]`, with a per-fan-out `_<index>` suffix only when `index` is set.
 #[must_use]
-pub fn artifact_paths(dir: &Path, run_id: &str, agent: &str, index: Option<usize>) -> ArtifactPaths {
+pub fn artifact_paths(
+    dir: &Path,
+    run_id: &str,
+    agent: &str,
+    index: Option<usize>,
+) -> ArtifactPaths {
     let suffix = index.map_or_else(String::new, |i| format!("_{i}"));
     let base = format!("{run_id}_{}{suffix}", safe_agent(agent));
     ArtifactPaths {
@@ -320,7 +325,10 @@ pub fn write_metadata(path: &Path, metadata: &serde_json::Value) -> io::Result<(
 /// Propagates the underlying open/append error.
 pub fn append_jsonl(path: &Path, line: &str) -> io::Result<()> {
     use std::io::Write as _;
-    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     writeln!(file, "{line}")
 }
 
@@ -328,7 +336,10 @@ pub fn append_jsonl(path: &Path, line: &str) -> io::Result<()> {
 /// determined (matches pi reading `stat.mtimeMs`).
 fn mtime_ms(path: &Path) -> Option<u128> {
     let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
-    modified.duration_since(UNIX_EPOCH).ok().map(|d| d.as_millis())
+    modified
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis())
 }
 
 /// `Date.now()` (the crate's one clock, [`crate::time::now_epoch_millis`]) widened to the `u128`
@@ -512,7 +523,11 @@ pub fn write_run_artifacts(
 /// exactly one artifact-metadata shape shared by its foreground and async paths.
 #[must_use]
 pub(crate) fn run_artifact_metadata(run_id: &str, result: &SingleResult) -> serde_json::Value {
-    let attempted: Vec<&str> = result.attempted_models.iter().map(ModelId::as_str).collect();
+    let attempted: Vec<&str> = result
+        .attempted_models
+        .iter()
+        .map(ModelId::as_str)
+        .collect();
     let model_attempts: Vec<serde_json::Value> = result
         .model_attempts
         .iter()
@@ -623,7 +638,12 @@ mod tests {
         );
         // ...and falls back to temp when there is no session file (pi's `return TEMP_ARTIFACTS_DIR`).
         assert_eq!(
-            resolve_artifacts_dir(None, Some(project), temp_cwd, ArtifactDirPreference::Session),
+            resolve_artifacts_dir(
+                None,
+                Some(project),
+                temp_cwd,
+                ArtifactDirPreference::Session
+            ),
             temp_artifacts_dir(temp_cwd)
         );
         // `project` is upstream's default and keeps the previous three-way fall-through.
@@ -637,7 +657,12 @@ mod tests {
             project_artifacts_dir(project)
         );
         assert_eq!(
-            resolve_artifacts_dir(Some(session_file), None, temp_cwd, ArtifactDirPreference::Project),
+            resolve_artifacts_dir(
+                Some(session_file),
+                None,
+                temp_cwd,
+                ArtifactDirPreference::Project
+            ),
             session_sibling
         );
         assert_eq!(
@@ -645,7 +670,10 @@ mod tests {
             temp_artifacts_dir(temp_cwd)
         );
         // The default IS `project` (pi `DEFAULT_ARTIFACT_CONFIG.dir`).
-        assert_eq!(ArtifactDirPreference::default(), ArtifactDirPreference::Project);
+        assert_eq!(
+            ArtifactDirPreference::default(),
+            ArtifactDirPreference::Project
+        );
     }
 
     /// SUBA-048 / PARITY-GAPS PB-13 — pi `getChainRunsDir(projectCwd, dirPreference = "project")`
@@ -746,7 +774,10 @@ mod tests {
     fn default_config_matches_pi_default_artifact_config() {
         let c = ArtifactConfig::default();
         assert!(c.enabled && c.include_input && c.include_output && c.include_metadata);
-        assert!(!c.include_jsonl, "pi DEFAULT_ARTIFACT_CONFIG.includeJsonl is false");
+        assert!(
+            !c.include_jsonl,
+            "pi DEFAULT_ARTIFACT_CONFIG.includeJsonl is false"
+        );
         assert_eq!(c.cleanup_days, 7);
         // The foreground variant additionally captures the event stream.
         assert!(ArtifactConfig::foreground().include_jsonl);
@@ -773,13 +804,37 @@ mod tests {
         )
         .expect("enabled config writes artifacts");
 
-        for p in [&paths.input_path, &paths.output_path, &paths.jsonl_path, &paths.metadata_path] {
-            assert!(p.exists(), "expected artifact file to exist: {}", p.display());
+        for p in [
+            &paths.input_path,
+            &paths.output_path,
+            &paths.jsonl_path,
+            &paths.metadata_path,
+        ] {
+            assert!(
+                p.exists(),
+                "expected artifact file to exist: {}",
+                p.display()
+            );
         }
-        assert_eq!(std::fs::read_to_string(&paths.output_path).unwrap(), "the answer");
-        assert!(std::fs::read_to_string(&paths.input_path).unwrap().contains("do the thing"));
-        assert!(std::fs::read_to_string(&paths.metadata_path).unwrap().contains("\"exitCode\": 0"));
-        assert!(std::fs::read_to_string(&paths.jsonl_path).unwrap().contains("\"type\":\"final\""));
+        assert_eq!(
+            std::fs::read_to_string(&paths.output_path).unwrap(),
+            "the answer"
+        );
+        assert!(
+            std::fs::read_to_string(&paths.input_path)
+                .unwrap()
+                .contains("do the thing")
+        );
+        assert!(
+            std::fs::read_to_string(&paths.metadata_path)
+                .unwrap()
+                .contains("\"exitCode\": 0")
+        );
+        assert!(
+            std::fs::read_to_string(&paths.jsonl_path)
+                .unwrap()
+                .contains("\"type\":\"final\"")
+        );
     }
 
     #[test]
@@ -791,12 +846,22 @@ mod tests {
             "r2",
             "worker",
             None,
-            &RunArtifactContent { input: "in", output: "out", metadata: &meta, jsonl_lines: &[] },
+            &RunArtifactContent {
+                input: "in",
+                output: "out",
+                metadata: &meta,
+                jsonl_lines: &[],
+            },
             &ArtifactConfig::default(),
         )
         .unwrap();
-        assert!(paths.input_path.exists() && paths.output_path.exists() && paths.metadata_path.exists());
-        assert!(!paths.jsonl_path.exists(), "pi default leaves the .jsonl unwritten");
+        assert!(
+            paths.input_path.exists() && paths.output_path.exists() && paths.metadata_path.exists()
+        );
+        assert!(
+            !paths.jsonl_path.exists(),
+            "pi default leaves the .jsonl unwritten"
+        );
     }
 
     #[test]
@@ -814,9 +879,15 @@ mod tests {
 
         cleanup_old_artifacts(dir.path(), DEFAULT_CLEANUP_DAYS);
 
-        assert!(!old.exists(), "a 10-day-old artifact is swept under the 7-day horizon");
+        assert!(
+            !old.exists(),
+            "a 10-day-old artifact is swept under the 7-day horizon"
+        );
         assert!(fresh.exists(), "a fresh artifact survives the sweep");
-        assert!(dir.path().join(CLEANUP_MARKER_FILE).exists(), "the throttle marker is written");
+        assert!(
+            dir.path().join(CLEANUP_MARKER_FILE).exists(),
+            "the throttle marker is written"
+        );
     }
 
     #[test]
@@ -828,9 +899,16 @@ mod tests {
         filetime::set_file_mtime(&old, filetime::FileTime::from_system_time(ten_days_ago)).unwrap();
 
         // A marker touched "now" must short-circuit the sweep entirely (pi 24h throttle).
-        std::fs::write(dir.path().join(CLEANUP_MARKER_FILE), now_millis_u128().to_string()).unwrap();
+        std::fs::write(
+            dir.path().join(CLEANUP_MARKER_FILE),
+            now_millis_u128().to_string(),
+        )
+        .unwrap();
 
         cleanup_old_artifacts(dir.path(), DEFAULT_CLEANUP_DAYS);
-        assert!(old.exists(), "a fresh throttle marker skips the sweep, so the old file survives");
+        assert!(
+            old.exists(),
+            "a fresh throttle marker skips the sweep, so the old file survives"
+        );
     }
 }

@@ -12,11 +12,16 @@
 //! [`crate::ImageRenderer::from_capabilities_with_cell_size`], which is what
 //! `App::detect_image_support` now builds the live renderer with.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use crate::{
-    find_cell_size_report, parse_cell_size_report, ImageBlock, ImageProtocol, ImageRenderer,
-    TerminalCapabilities, CELL_SIZE_QUERY,
+    CELL_SIZE_QUERY, ImageBlock, ImageProtocol, ImageRenderer, TerminalCapabilities,
+    find_cell_size_report, parse_cell_size_report,
 };
 use image::{DynamicImage, Rgba, RgbaImage};
 
@@ -30,7 +35,11 @@ fn red_image(w: u32, h: u32) -> ImageBlock {
 }
 
 fn kitty_caps() -> TerminalCapabilities {
-    TerminalCapabilities { images: Some(ImageProtocol::Kitty), true_color: true, hyperlinks: true }
+    TerminalCapabilities {
+        images: Some(ImageProtocol::Kitty),
+        true_color: true,
+        hyperlinks: true,
+    }
 }
 
 /// The query Pi writes, and the reply shape it accepts (`tui.ts:686`, `:879`).
@@ -40,7 +49,10 @@ fn the_query_and_its_reply_are_pis() {
     // `CSI 6 ; height ; width t` — the reply is height-first; the parsed tuple is (width, height).
     assert_eq!(parse_cell_size_report("\x1b[6;18;9t"), Some((9, 18)));
     // Found alongside the DA1 sentinel reply the probe appends, in one read.
-    assert_eq!(find_cell_size_report("\x1b[6;36;15t\x1b[?62;1;2c"), Some((15, 36)));
+    assert_eq!(
+        find_cell_size_report("\x1b[6;36;15t\x1b[?62;1;2c"),
+        Some((15, 36))
+    );
     // A terminal that answers only DA1 leaves the cell unmeasured (Pi keeps its own default).
     assert_eq!(find_cell_size_report("\x1b[?62;1;2c"), None);
     // Pi's `heightPx <= 0 || widthPx <= 0` guard (`:885`) — a zero cell would divide geometry by 0.
@@ -57,7 +69,11 @@ fn a_measured_cell_changes_the_image_geometry() {
 
     // Unmeasured: `ratatui-image`'s placeholder cell.
     let guessed = ImageRenderer::from_capabilities_with_cell_size(kitty_caps(), None);
-    assert_eq!(guessed.cell_pixels(), (10, 20), "the un-measured default cyrup used to be stuck on");
+    assert_eq!(
+        guessed.cell_pixels(),
+        (10, 20),
+        "the un-measured default cyrup used to be stuck on"
+    );
     assert_eq!(guessed.cell_size(&block, 200), (9, 9));
 
     // Measured (`CSI 6 ; 18 ; 9 t` — Pi's own documented default cell).
@@ -76,11 +92,21 @@ fn a_measured_cell_changes_the_image_geometry() {
 fn a_degenerate_cell_is_ignored_and_the_protocol_is_preserved() {
     for bogus in [Some((0, 18)), Some((9, 0)), None] {
         let r = ImageRenderer::from_capabilities_with_cell_size(kitty_caps(), bogus);
-        assert_eq!(r.cell_pixels(), (10, 20), "{bogus:?} must fall back to the default cell");
+        assert_eq!(
+            r.cell_pixels(),
+            (10, 20),
+            "{bogus:?} must fall back to the default cell"
+        );
     }
     // A terminal with no image protocol keeps the half-block raster (and is never asked, upstream).
-    let none_caps =
-        TerminalCapabilities { images: None, true_color: true, hyperlinks: false };
+    let none_caps = TerminalCapabilities {
+        images: None,
+        true_color: true,
+        hyperlinks: false,
+    };
     let plain = ImageRenderer::from_capabilities_with_cell_size(none_caps, Some((9, 18)));
-    assert!(!plain.is_graphical(), "no image capability ⇒ half-blocks regardless of the cell size");
+    assert!(
+        !plain.is_graphical(),
+        "no image capability ⇒ half-blocks regardless of the cell size"
+    );
 }

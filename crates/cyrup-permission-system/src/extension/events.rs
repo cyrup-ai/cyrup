@@ -20,7 +20,13 @@ impl PermissionSystemExtension {
     /// That is the same class of loss — "the event did not reach the bus" — so it takes the same
     /// entry, with the reason in upstream's `error` key. The three keys pi puts on the entry
     /// (`requestId`, `source`, `state`) are its own (`:1522-1527`).
-    fn emit_permission_request_event(&self, payload: &Value, request_id: &str, source: &str, state: &str) {
+    fn emit_permission_request_event(
+        &self,
+        payload: &Value,
+        request_id: &str,
+        source: &str,
+        state: &str,
+    ) {
         if let Some(services) = self.host_services.get() {
             services.emit_event(PERMISSION_REQUEST_EVENT_CHANNEL, payload);
             return;

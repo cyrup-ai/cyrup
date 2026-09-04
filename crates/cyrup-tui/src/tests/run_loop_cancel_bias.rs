@@ -41,7 +41,9 @@ fn every_cancel_racing_select_in_the_run_loop_is_biased() {
         let body = &APP_SRC[offset..];
         // The arm list of one `select!`: everything up to the next one, which is enough context to
         // see both its first statement and whether it races the token.
-        let end = body[1..].find("tokio::select! {").map_or(body.len(), |i| i + 1);
+        let end = body[1..]
+            .find("tokio::select! {")
+            .map_or(body.len(), |i| i + 1);
         let block = &body[..end];
         if !block.contains("cancel.cancelled()") {
             continue;
@@ -72,7 +74,9 @@ fn every_cancel_racing_select_in_the_run_loop_is_biased() {
 fn the_cancel_arm_is_the_first_arm() {
     for (offset, _) in APP_SRC.match_indices("tokio::select! {") {
         let body = &APP_SRC[offset..];
-        let end = body[1..].find("tokio::select! {").map_or(body.len(), |i| i + 1);
+        let end = body[1..]
+            .find("tokio::select! {")
+            .map_or(body.len(), |i| i + 1);
         let block = &body[..end];
         if !block.contains("cancel.cancelled()") {
             continue;

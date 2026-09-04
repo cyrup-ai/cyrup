@@ -2,24 +2,23 @@
 
 use std::path::Path;
 
-use crate::background::{run_status, RunId, RunMode, RunPaths, RunState, StepState};
 use crate::background::atomic::write_atomic_json;
 use crate::background::control::{self, AppendOutcome, InterruptOutcome, ResumeOutcome};
+use crate::background::{RunId, RunMode, RunPaths, RunState, StepState, run_status};
 use crate::discovery::types::AgentReadScope;
 use crate::error::SubagentError;
-use crate::fork_context::ContextMode;
-use crate::spawn::chain_graph::{RunnerStep, SingleStepSpec};
 use crate::extension::executor::SubagentExecutor;
 use crate::extension::executor::paths::{default_async_root_in, default_results_dir_in};
 use crate::extension::executor::requests::BackgroundStepsSpec;
 use crate::extension::tool::text::{
-    dismiss_not_running_refusal, STEER_ACK_POLL_INTERVAL, STEER_ACK_TIMEOUT,
-    STEER_FOREGROUND_RUN_REFUSAL, STOP_FOREGROUND_RUN_REFUSAL, STOP_NESTED_RUN_REFUSAL,
-    STOP_NO_STOPPABLE_RUN_REFUSAL,
+    STEER_ACK_POLL_INTERVAL, STEER_ACK_TIMEOUT, STEER_FOREGROUND_RUN_REFUSAL,
+    STOP_FOREGROUND_RUN_REFUSAL, STOP_NESTED_RUN_REFUSAL, STOP_NO_STOPPABLE_RUN_REFUSAL,
+    dismiss_not_running_refusal,
 };
+use crate::fork_context::ContextMode;
+use crate::spawn::chain_graph::{RunnerStep, SingleStepSpec};
 
 impl SubagentExecutor {
-
     /// `action: "interrupt"` (C5): deliver a soft, resumable interrupt (R-SA-084 — a *pause*
     /// request, never a kill) to the target async run, or, with no id, to the most-recently-updated
     /// running run in this cwd's async root — pi `subagent-executor.ts:2871-2911`.
@@ -28,7 +27,11 @@ impl SubagentExecutor {
     ///
     /// Returns `Err` if no interrupt-capable run is found, if the target is not Running (R-SA-079),
     /// or if the underlying delivery fails.
-    pub async fn control_interrupt(&self, cwd: &Path, target: Option<&str>) -> Result<String, String> {
+    pub async fn control_interrupt(
+        &self,
+        cwd: &Path,
+        target: Option<&str>,
+    ) -> Result<String, String> {
         let roots = self.config_snapshot().await.roots;
         let async_root = default_async_root_in(&roots, cwd);
         let results_dir = default_results_dir_in(&roots, cwd);
@@ -38,16 +41,21 @@ impl SubagentExecutor {
                 // No id: interrupt the most-recently-updated running run (the list is already sorted
                 // running-first, most-recent-first), mirroring pi's "defaults to the most recently
                 // active controllable run" contract for interrupt.
-                let runs = run_status::list_active_runs(&async_root, &results_dir, self.current_session_id().as_deref())
-                    .await
-                    .map_err(|e| e.to_string())?;
+                let runs = run_status::list_active_runs(
+                    &async_root,
+                    &results_dir,
+                    self.current_session_id().as_deref(),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
                 runs.iter()
                     .find(|run| run.status.state == RunState::Running)
                     .map(|run| run.status.run_id.as_str().to_string())
                     .ok_or_else(|| "No interrupt-capable run found in this session.".to_string())?
             }
         };
-        match control::interrupt(&async_root, &results_dir, &run_id, "interrupt-action", None).await {
+        match control::interrupt(&async_root, &results_dir, &run_id, "interrupt-action", None).await
+        {
             Ok(InterruptOutcome::Delivered | InterruptOutcome::AlreadyPending) => {
                 Ok(format!("Interrupt requested for async run {run_id}."))
             }
@@ -103,6 +111,17 @@ impl SubagentExecutor {
     /// | `Workflow {id} is not controlled by this extension runtime; reload recovery cannot stop it safely.` (`:4801`) | **unported subsystem** |
     /// | `Async run '{id}' was not found in the active session.` (`async-stop-action.ts:34`) | **unported subsystem** |
     ///
+    /// SUBA-087 — `childId` (pi `async-stop-action.ts:48-66,68,75` @v0.64.0, threaded from
+    /// `subagent-executor.ts:6163,6184`): when given, the child is resolved against the reconciled
+    /// status ([`crate::background::child_identity::resolve_async_status_child`]) and gated on
+    /// pending/running BEFORE anything is written — a failed resolution answers with the
+    /// resolver's own sentence, a non-stoppable child with `Child '{childId}' in async run
+    /// '{runId}' is {status}; stop only supports pending or running children.`, and success with
+    /// `Stop requested for child {child.id} in async run {id}.` naming the RESOLVED identity. The
+    /// written request then carries `targetIndex`/`childId`, and the runner stops that one step
+    /// while the run stays alive. The `workflowControllers` child-stop branch
+    /// (`subagent-executor.ts:6122-6155`) is the unported workflow subsystem, as below.
+    ///
     /// The two `Workflow …` strings are the `workflowControllers` fast path and the `mode ===
     /// "workflow"` reload-recovery refusal. Both are gated on upstream's fourth run mode
     /// (`SubagentRunMode = "single" | "parallel" | "chain" | "workflow"`, `shared/types.ts:231`) and
@@ -123,6 +142,7 @@ impl SubagentExecutor {
         cwd: &Path,
         target: Option<&str>,
         dir: Option<&str>,
+        child_id: Option<&str>,
     ) -> Result<String, String> {
         if target.is_none() && dir.is_none() {
             return Err("action='stop' requires id or dir.".to_string());
@@ -186,12 +206,39 @@ impl SubagentExecutor {
             None => resolved_async_id.unwrap_or_else(|| target.unwrap_or_default().to_string()),
         };
 
-        match control::stop(&async_root, &results_dir, &run_id, "stop-action", None).await {
+        match control::stop(
+            &async_root,
+            &results_dir,
+            &run_id,
+            "stop-action",
+            None,
+            child_id,
+        )
+        .await
+        {
             Ok(control::StopOutcome::Requested) => {
                 Ok(format!("Stop requested for async run {run_id}."))
             }
+            // SUBA-087 — `async-stop-action.ts:75`: the receipt names the RESOLVED child id.
+            Ok(control::StopOutcome::ChildRequested { child_id }) => Ok(format!(
+                "Stop requested for child {child_id} in async run {run_id}."
+            )),
             Ok(control::StopOutcome::NotStoppable) => Err(format!(
                 "No running or queued async run was found for '{run_id}'."
+            )),
+            // SUBA-087 — `async-stop-action.ts:51-57`: the resolver's own not-found/ambiguous
+            // sentence, verbatim.
+            Ok(control::StopOutcome::ChildUnresolved(message)) => Err(message),
+            // SUBA-087 — `async-stop-action.ts:59-65`: the caller's own spelling of the id and
+            // the status record's run id, with pi's lowercase step-status word.
+            Ok(control::StopOutcome::ChildNotStoppable {
+                run_id: status_run_id,
+                state,
+            }) => Err(format!(
+                "Child '{}' in async run '{status_run_id}' is {}; stop only supports pending or \
+                 running children.",
+                child_id.unwrap_or_default(),
+                run_status::step_state_label(state)
             )),
             Err(e) => Err(format!("Failed to stop async run {run_id}: {e}")),
         }
@@ -246,7 +293,11 @@ impl SubagentExecutor {
     /// # Errors
     ///
     /// Returns each of the five refusals above, or a resolution/read/write failure, as `Err`.
-    pub async fn control_dismiss(&self, cwd: &Path, target: Option<&str>) -> Result<String, String> {
+    pub async fn control_dismiss(
+        &self,
+        cwd: &Path,
+        target: Option<&str>,
+    ) -> Result<String, String> {
         // pi `:5873`: `paramsWithResolvedCwd.runId ?? paramsWithResolvedCwd.id` is resolved by the
         // caller; a missing selector is its own sentence, ahead of everything else.
         let Some(target) = target.filter(|id| !id.trim().is_empty()) else {
@@ -291,10 +342,9 @@ impl SubagentExecutor {
         }
 
         // pi `:37-42` — see the [CYRUP-DELTA] above for why the carrier is a pid probe.
-        if status
-            .pid
-            .is_some_and(|pid| crate::background::reconcile::check_pid_liveness(pid).is_possibly_alive())
-        {
+        if status.pid.is_some_and(|pid| {
+            crate::background::reconcile::check_pid_liveness(pid).is_possibly_alive()
+        }) {
             return Err(format!(
                 "Workflow '{run_id_text}' still has a live controller and cannot be dismissed."
             ));
@@ -376,9 +426,13 @@ impl SubagentExecutor {
         let roots = self.config_snapshot().await.roots;
         let async_root = default_async_root_in(&roots, cwd);
         let results_dir = default_results_dir_in(&roots, cwd);
-        let runs = run_status::list_active_runs(&async_root, &results_dir, self.current_session_id().as_deref())
-            .await
-            .map_err(|e| e.to_string())?;
+        let runs = run_status::list_active_runs(
+            &async_root,
+            &results_dir,
+            self.current_session_id().as_deref(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         if runs.is_empty() {
             return Ok(
                 "No active current-session async runs or scheduled subagent runs to stop."
@@ -525,9 +579,7 @@ impl SubagentExecutor {
                     run_status::step_state_label(step.status)
                 ));
             }
-        } else if steps.len() > 1
-            && !steps.iter().any(|s| s.status == StepState::Running)
-        {
+        } else if steps.len() > 1 && !steps.iter().any(|s| s.status == StepState::Running) {
             return Err(format!(
                 "Async run '{run_id}' has no running child yet. Provide index to steer a queued \
                  child."
@@ -684,11 +736,13 @@ impl SubagentExecutor {
                 // registered its broker presence under at spawn.
                 let (child_target, child_agent) = match status.steps.get(step_index) {
                     Some(step) => (
-                        Some(crate::spawn::intercom_target::resolve_subagent_intercom_target(
-                            run_id,
-                            &step.agent,
-                            step_index,
-                        )),
+                        Some(
+                            crate::spawn::intercom_target::resolve_subagent_intercom_target(
+                                run_id,
+                                &step.agent,
+                                step_index,
+                            ),
+                        ),
                         Some(step.agent.clone()),
                     ),
                     None => (None, None),
@@ -707,7 +761,9 @@ impl SubagentExecutor {
                 // pi's follow-up header includes the resolved agent name (`subagent-executor.ts:863`:
                 // `Follow-up for async run ${target.runId} (${target.agent}):`).
                 let follow_up_message = match &child_agent {
-                    Some(agent) => format!("Follow-up for async run {run_id} ({agent}):\n\n{follow_up}"),
+                    Some(agent) => {
+                        format!("Follow-up for async run {run_id} ({agent}):\n\n{follow_up}")
+                    }
                     None => format!("Follow-up for async run {run_id}:\n\n{follow_up}"),
                 };
                 // pi's `deliverSubagentIntercomMessageEvent` bounds EVERY caller (including this
@@ -748,7 +804,10 @@ impl SubagentExecutor {
                     ))
                 }
             }
-            Ok(ResumeOutcome::RespawnFromTranscript { step_index, session_file }) => self
+            Ok(ResumeOutcome::RespawnFromTranscript {
+                step_index,
+                session_file,
+            }) => self
                 .revive_from_transcript(cwd, run_id, step_index, &session_file, follow_up)
                 .await
                 .map_err(|e| e.to_string()),
@@ -802,13 +861,12 @@ impl SubagentExecutor {
         // never silently reroute a revived agent into a different directory than the one it was
         // originally invoked from.
         let effective_cwd = status.cwd.clone().unwrap_or_else(|| cwd.to_path_buf());
-        let resolved_agents =
-            self.resolve_plan_personas(
-                &effective_cwd,
-                [agent.clone()],
-                AgentReadScope::Both,
-                &roots,
-            )?;
+        let resolved_agents = self.resolve_plan_personas(
+            &effective_cwd,
+            [agent.clone()],
+            AgentReadScope::Both,
+            &roots,
+        )?;
         let revived_task =
             Self::build_revived_async_task(source_run_id, &agent, session_file, follow_up);
         let step = SingleStepSpec {
@@ -1019,7 +1077,12 @@ impl SubagentExecutor {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
 
@@ -1105,5 +1168,4 @@ mod tests {
             "action='append-step' requires chain with exactly one step."
         );
     }
-
 }

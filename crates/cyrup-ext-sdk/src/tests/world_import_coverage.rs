@@ -129,7 +129,9 @@ fn declared_funcs(interface: &str) -> Vec<String> {
                 return None;
             }
             let (name, rest) = trimmed.split_once(':')?;
-            rest.trim_start().starts_with("func").then(|| name.trim().to_string())
+            rest.trim_start()
+                .starts_with("func")
+                .then(|| name.trim().to_string())
         })
         .collect()
 }
@@ -148,10 +150,13 @@ fn sdk_calls(interface: &str, func: &str) -> bool {
     }
     // `use crate::guest::bindings::cyrup::ext::<module> as <alias>;`
     let alias_marker = format!("::ext::{module} as ");
-    SDK_SOURCES.split(alias_marker.as_str()).skip(1).any(|rest| {
-        let alias = rest.split(';').next().unwrap_or("").trim();
-        !alias.is_empty() && SDK_SOURCES.contains(&format!("{alias}::{name}("))
-    })
+    SDK_SOURCES
+        .split(alias_marker.as_str())
+        .skip(1)
+        .any(|rest| {
+            let alias = rest.split(';').next().unwrap_or("").trim();
+            !alias.is_empty() && SDK_SOURCES.contains(&format!("{alias}::{name}("))
+        })
 }
 
 /// The world's IMPORT interfaces — everything except `events`, which is the guest's EXPORT surface
@@ -186,7 +191,9 @@ const NON_IMPORT_INTERFACES: &[&str] = &["types", "events"];
 #[test]
 fn every_world_interface_is_classified() {
     for line in WORLD.lines() {
-        let Some(rest) = line.strip_prefix("interface ") else { continue };
+        let Some(rest) = line.strip_prefix("interface ") else {
+            continue;
+        };
         let name = rest.split_whitespace().next().unwrap_or("");
         assert!(
             IMPORT_INTERFACES.contains(&name) || NON_IMPORT_INTERFACES.contains(&name),
@@ -201,11 +208,15 @@ fn every_declared_world_import_has_a_caller_in_the_sdk() {
     // Assert PRESENCE before absence: prove the parse actually found the two imports this test was
     // written for, so a parse that silently yields nothing cannot pass.
     assert!(
-        declared_funcs("ui").iter().any(|n| n == "unsubscribe-terminal-input"),
+        declared_funcs("ui")
+            .iter()
+            .any(|n| n == "unsubscribe-terminal-input"),
         "the world parse lost `ui.unsubscribe-terminal-input` (EXT-M04)"
     );
     assert!(
-        declared_funcs("provider-stream").iter().any(|n| n == "on-payload"),
+        declared_funcs("provider-stream")
+            .iter()
+            .any(|n| n == "on-payload"),
         "the world parse lost `provider-stream.on-payload` (EXT-M05)"
     );
 
@@ -219,7 +230,10 @@ fn every_declared_world_import_has_a_caller_in_the_sdk() {
             }
         }
     }
-    assert!(checked >= 60, "only {checked} imports parsed across {IMPORT_INTERFACES:?} — parse broke");
+    assert!(
+        checked >= 60,
+        "only {checked} imports parsed across {IMPORT_INTERFACES:?} — parse broke"
+    );
 
     assert!(
         unwired.is_empty(),
@@ -246,7 +260,8 @@ fn crate_root_doc_states_the_real_event_count() {
     // Non-vacuity: prove the slice really spans the table — first discriminant to last — rather
     // than an empty or truncated match that would make the count below meaningless.
     assert!(
-        kind_mod.contains("TOOL_CALL: u8 = 0;") && kind_mod.contains("SESSION_INFO_CHANGED: u8 = 32;"),
+        kind_mod.contains("TOOL_CALL: u8 = 0;")
+            && kind_mod.contains("SESSION_INFO_CHANGED: u8 = 32;"),
         "the `mod kind` slice lost its first or last discriminant, so this guard would be vacuous"
     );
 
@@ -312,7 +327,10 @@ fn kind_consts() -> Vec<(String, u32)> {
         .expect("`mod kind {` block present in src/api.rs");
     body.lines()
         .filter_map(|line| {
-            let (name, value) = line.trim().strip_prefix("pub const ")?.split_once(": u8 = ")?;
+            let (name, value) = line
+                .trim()
+                .strip_prefix("pub const ")?
+                .split_once(": u8 = ")?;
             let value: u32 = value.trim().trim_end_matches(';').trim().parse().ok()?;
             Some((name.trim().to_string(), value))
         })
@@ -325,8 +343,12 @@ fn macro_event_exports() -> Vec<(String, Option<u32>)> {
     let lines: Vec<&str> = MACROS_RS.lines().collect();
     let mut out: Vec<(String, Option<u32>)> = Vec::new();
     for (i, line) in lines.iter().enumerate() {
-        let Some(rest) = line.trim_start().strip_prefix("fn on_") else { continue };
-        let Some((suffix, _)) = rest.split_once('(') else { continue };
+        let Some(rest) = line.trim_start().strip_prefix("fn on_") else {
+            continue;
+        };
+        let Some((suffix, _)) = rest.split_once('(') else {
+            continue;
+        };
         let mut discriminant = None;
         // Stop at the next `fn `: a body that dispatches no kind must come back `None` rather than
         // silently adopt the following export's literal and pass for the wrong reason.
@@ -343,9 +365,18 @@ fn macro_event_exports() -> Vec<(String, Option<u32>)> {
             };
             // Calls with many arguments are wrapped by rustfmt, which puts the discriminant alone
             // on the next line.
-            let digits = if after.trim().is_empty() { lines.get(j + 1).copied().unwrap_or_default() } else { after };
-            discriminant =
-                digits.trim_start().chars().take_while(char::is_ascii_digit).collect::<String>().parse().ok();
+            let digits = if after.trim().is_empty() {
+                lines.get(j + 1).copied().unwrap_or_default()
+            } else {
+                after
+            };
+            discriminant = digits
+                .trim_start()
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .ok();
             break;
         }
         out.push((format!("on_{suffix}"), discriminant));

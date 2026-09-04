@@ -261,7 +261,10 @@ fn scan_file(path: &Path) -> Option<SessionInfo> {
         };
         // Latest session_info wins, including explicit clears (Pi `session-manager.ts:616-618`).
         if let Entry::Known(KnownEntry::SessionInfo { name: n, .. }) = &entry {
-            name = n.as_deref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            name = n
+                .as_deref()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
             continue;
         }
         // Pi's scan is UNTYPED: `parseSessionEntryLine` is a bare `JSON.parse`
@@ -278,7 +281,9 @@ fn scan_file(path: &Path) -> Option<SessionInfo> {
             Entry::Unknown(v) if v.get("type").and_then(Value::as_str) == Some("message") => (
                 None,
                 Some(v),
-                v.get("timestamp").and_then(Value::as_str).unwrap_or_default(),
+                v.get("timestamp")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
             ),
             _ => continue,
         };
@@ -301,7 +306,11 @@ fn scan_file(path: &Path) -> Option<SessionInfo> {
             _ => continue,
         };
 
-        let activity_ms = if msg_ts != 0 { msg_ts } else { rfc3339_to_ms(entry_ts).unwrap_or(0) };
+        let activity_ms = if msg_ts != 0 {
+            msg_ts
+        } else {
+            rfc3339_to_ms(entry_ts).unwrap_or(0)
+        };
         last_activity_ms = Some(last_activity_ms.unwrap_or(0).max(activity_ms));
 
         if role_text.is_empty() {
@@ -313,8 +322,7 @@ fn scan_file(path: &Path) -> Option<SessionInfo> {
         }
     }
 
-    let created =
-        rfc3339_to_systemtime(&header.timestamp).unwrap_or(SystemTime::UNIX_EPOCH);
+    let created = rfc3339_to_systemtime(&header.timestamp).unwrap_or(SystemTime::UNIX_EPOCH);
     // modified = latest message activity, else header time, else file mtime (Pi:645-651).
     let modified = match last_activity_ms {
         Some(ms) if ms > 0 => ms_to_systemtime(ms),
@@ -366,7 +374,11 @@ fn raw_core_message(entry: &Value) -> Option<(String, bool, i64)> {
             .join(" "),
         _ => String::new(),
     };
-    Some((text, is_user, msg.get("timestamp").and_then(Value::as_i64).unwrap_or(0)))
+    Some((
+        text,
+        is_user,
+        msg.get("timestamp").and_then(Value::as_i64).unwrap_or(0),
+    ))
 }
 
 /// Join the text blocks of a core message with `" "` (Pi `extractTextContent`,
@@ -407,9 +419,9 @@ fn ms_to_systemtime(ms: i64) -> SystemTime {
 pub fn resolve(sel: &SessionSelector, layout: &SessionLayout) -> Result<PathBuf, SessionError> {
     match sel {
         SessionSelector::Path(p) if p.exists() => Ok(p.clone()),
-        SessionSelector::Path(p) => {
-            Err(SessionError::NotFound { what: p.display().to_string() })
-        }
+        SessionSelector::Path(p) => Err(SessionError::NotFound {
+            what: p.display().to_string(),
+        }),
         SessionSelector::Uuid(prefix) => {
             let matches: Vec<PathBuf> = scan_session_paths(&layout.dir())
                 .into_iter()
@@ -417,7 +429,9 @@ pub fn resolve(sel: &SessionSelector, layout: &SessionLayout) -> Result<PathBuf,
                 .collect();
             match matches.as_slice() {
                 [one] => Ok(one.clone()),
-                [] => Err(SessionError::NotFound { what: prefix.clone() }),
+                [] => Err(SessionError::NotFound {
+                    what: prefix.clone(),
+                }),
                 _ => Err(SessionError::AmbiguousSelector {
                     prefix: prefix.clone(),
                     n: matches.len(),
@@ -443,5 +457,7 @@ fn scan_session_paths(dir: &Path) -> Vec<PathBuf> {
 /// Extract the uuid component from a `<timestamp>_<uuid>.jsonl` filename.
 fn uuid_of(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_str()?;
-    stem.rsplit_once('_').map(|(_, u)| u.to_string()).or_else(|| Some(stem.to_string()))
+    stem.rsplit_once('_')
+        .map(|(_, u)| u.to_string())
+        .or_else(|| Some(stem.to_string()))
 }

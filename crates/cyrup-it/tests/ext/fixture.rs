@@ -21,5 +21,9 @@ pub fn component() -> PathBuf {
 }
 
 pub fn cfg() -> HostConfig {
-    HostConfig { mode: ExtMode::Tui, has_ui: true, cwd: PathBuf::from(".") }
+    HostConfig {
+        mode: ExtMode::Tui,
+        has_ui: true,
+        cwd: PathBuf::from("."),
+    }
 }

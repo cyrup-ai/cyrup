@@ -22,18 +22,23 @@
 //! * `session-selector.ts:476` uses U+203A `› `. `tree-selector.ts:722` puts the fold state in the
 //!   CONNECTOR (`isFolded ? "⊞" : foldable ? "⊟" : "─"`, dim); `:734`'s accent `⊞ ` marker is the
 //!   connector-less fallback, NOT the only site — the audit's S24 row read that guard backwards.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
+use super::harness::key_event as key;
 use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::{
     ColumnLayout, ListSelector, SelectItem, SelectKeymap, SelectList, Selector, SelectorKind,
     SelectorOutcome, SessionRow, SessionSelector, TreeKind, TreeNode, TreeSelector, UiTheme,
 };
+use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
-use ratatui::Terminal;
-use super::harness::key_event as key;
 
 // ---------------------------------------------------------------------------------------------
 // helpers
@@ -61,7 +66,9 @@ fn selected_bg(theme: &UiTheme) -> Option<ratatui::style::Color> {
 fn render_selector(sel: &mut dyn Selector, w: u16, h: u16) -> Terminal<TestBackend> {
     let theme = UiTheme::dark();
     let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
-    terminal.draw(|f| sel.render(f, Rect::new(0, 0, w, h), &theme)).unwrap();
+    terminal
+        .draw(|f| sel.render(f, Rect::new(0, 0, w, h), &theme))
+        .unwrap();
     terminal
 }
 
@@ -107,14 +114,26 @@ fn thinking_with_hidden(current: &str, default_level: &str) -> crate::ThinkingSe
 fn thinking_selector_warns_when_thinking_output_is_hidden() {
     let mut sel = thinking_with_hidden("max", "max");
     let s = screen(&render_selector(&mut sel, 80, 22));
-    assert!(s.contains("Thinking output is HIDDEN"), "warning missing:\n{s}");
-    assert!(s.contains("Ctrl+T shows it"), "live toggle key not named:\n{s}");
+    assert!(
+        s.contains("Thinking output is HIDDEN"),
+        "warning missing:\n{s}"
+    );
+    assert!(
+        s.contains("Ctrl+T shows it"),
+        "live toggle key not named:\n{s}"
+    );
 
     // Additive ONLY: with the flag off the dialog is what it was, warning and its blank included.
     let mut plain = thinking("max", "max");
     let p = screen(&render_selector(&mut plain, 80, 22));
-    assert!(!p.contains("HIDDEN"), "warning leaked into the un-hidden dialog:\n{p}");
-    assert!(!p.contains("shows it"), "restore hint leaked into the un-hidden dialog:\n{p}");
+    assert!(
+        !p.contains("HIDDEN"),
+        "warning leaked into the un-hidden dialog:\n{p}"
+    );
+    assert!(
+        !p.contains("shows it"),
+        "restore hint leaked into the un-hidden dialog:\n{p}"
+    );
 }
 
 fn screen(terminal: &Terminal<TestBackend>) -> String {
@@ -228,9 +247,19 @@ fn select_list_selection_stays_visible_through_accent_foreground() {
         );
     }
     // …and the neighbours are not.
-    assert_ne!(lines[1].spans[0].style.fg, Some(accent), "unselected row must not be accent");
-    assert!(text(&lines[2]).starts_with("→ "), "selected row keeps the `→ ` cursor");
-    assert!(text(&lines[1]).starts_with("  "), "unselected rows keep the two-space prefix");
+    assert_ne!(
+        lines[1].spans[0].style.fg,
+        Some(accent),
+        "unselected row must not be accent"
+    );
+    assert!(
+        text(&lines[2]).starts_with("→ "),
+        "selected row keeps the `→ ` cursor"
+    );
+    assert!(
+        text(&lines[1]).starts_with("  "),
+        "unselected rows keep the two-space prefix"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -262,7 +291,10 @@ fn select_list_two_column_reserves_the_right_safety_gutter() {
     let theme = UiTheme::dark();
     let list = SelectList::new(
         vec![SelectItem::new("cmd", Some("z".repeat(200)))],
-        ColumnLayout { primary_min: 12, primary_max: 32 },
+        ColumnLayout {
+            primary_min: 12,
+            primary_max: 32,
+        },
     );
     let width = 60usize;
     let line = &list.lines(width as u16, &theme)[0];
@@ -285,13 +317,19 @@ fn select_list_primary_column_is_measured_over_every_row_not_the_window() {
     let mut rows: Vec<SelectItem> = (0..5)
         .map(|i| SelectItem::new(format!("s{i}"), Some("a description".to_string())))
         .collect();
-    rows.push(SelectItem::new("a-very-long-command-name", Some("a description".to_string())));
+    rows.push(SelectItem::new(
+        "a-very-long-command-name",
+        Some("a description".to_string()),
+    ));
     let mut list = SelectList::new(rows, ColumnLayout::DEFAULT);
     list.set_max_visible(3);
 
     let desc_col = |list: &SelectList| -> usize {
         let lines = list.lines(100, &theme);
-        let row = lines.iter().find(|l| text(l).contains("a description")).expect("a visible row");
+        let row = lines
+            .iter()
+            .find(|l| text(l).contains("a description"))
+            .expect("a visible row");
         col_of(&text(row), "a description").expect("description present")
     };
 
@@ -315,13 +353,19 @@ fn select_list_folds_the_gap_into_the_clamped_primary_column() {
     let theme = UiTheme::dark();
     let long = "L".repeat(50);
     let list = SelectList::new(
-        vec![SelectItem::new(long.clone(), Some("DESCRIPTION".to_string()))],
+        vec![SelectItem::new(
+            long.clone(),
+            Some("DESCRIPTION".to_string()),
+        )],
         ColumnLayout::SLASH, // primary_max = 32
     );
     let line = &list.lines(120, &theme)[0];
     let rendered = text(line);
     let label_run = rendered.chars().filter(|c| *c == 'L').count();
-    assert_eq!(label_run, 30, "label must be truncated to 32 - PRIMARY_COLUMN_GAP: {rendered:?}");
+    assert_eq!(
+        label_run, 30,
+        "label must be truncated to 32 - PRIMARY_COLUMN_GAP: {rendered:?}"
+    );
     assert_eq!(
         col_of(&rendered, "DESCRIPTION"),
         Some(34),
@@ -367,15 +411,26 @@ fn list_selector_draws_pis_keyboard_hint_row() {
     let s = screen(&terminal);
     assert!(s.contains("↑↓ navigate"), "navigate hint missing:\n{s}");
     assert!(s.contains("enter select"), "select hint missing:\n{s}");
-    assert!(s.contains("escape/ctrl+c cancel"), "cancel hint missing (all bound keys):\n{s}");
+    assert!(
+        s.contains("escape/ctrl+c cancel"),
+        "cancel hint missing (all bound keys):\n{s}"
+    );
 
     // Two-tone per pair (`keybinding-hints.ts:42-44`): dim key, muted description.
     let theme = UiTheme::dark();
     let hint_y = row_of(&terminal, "navigate");
     let buf = terminal.backend().buffer();
     let key_cell = &buf[(1, hint_y)]; // first column of `↑↓`, after the 1-column inset
-    assert_eq!(key_cell.fg, theme.dim_style().fg.unwrap(), "hint key must use the `dim` token");
-    let hint_row = screen(&terminal).lines().nth(hint_y as usize).unwrap().to_string();
+    assert_eq!(
+        key_cell.fg,
+        theme.dim_style().fg.unwrap(),
+        "hint key must use the `dim` token"
+    );
+    let hint_row = screen(&terminal)
+        .lines()
+        .nth(hint_y as usize)
+        .unwrap()
+        .to_string();
     let desc_x = col_of(&hint_row, "navigate").unwrap();
     assert_eq!(
         buf[(desc_x as u16, hint_y)].fg,
@@ -392,8 +447,14 @@ fn list_selector_hint_row_follows_a_rebound_cancel_key() {
     km.set_action(SelectAction::Cancel, vec![Key::ctrl('q')]);
     let mut sel = extension_select_selector(&km);
     let s = screen(&render_selector(&mut sel, 80, 14));
-    assert!(s.contains("ctrl+q cancel"), "hint did not follow the rebind:\n{s}");
-    assert!(!s.contains("escape/ctrl+c cancel"), "stale default cancel hint:\n{s}");
+    assert!(
+        s.contains("ctrl+q cancel"),
+        "hint did not follow the rebind:\n{s}"
+    );
+    assert!(
+        !s.contains("escape/ctrl+c cancel"),
+        "stale default cancel hint:\n{s}"
+    );
 }
 
 /// **S28.** `extension-selector.ts:87` wraps every row in `new Text(text, 1, 0)`, so the `→ `/`  `
@@ -404,8 +465,16 @@ fn list_selector_rows_are_inset_one_column_where_pi_insets_them() {
     let terminal = render_selector(&mut sel, 80, 16);
     let cursor_y = row_of(&terminal, "→ ");
     let buf = terminal.backend().buffer();
-    assert_eq!(buf[(0, cursor_y)].symbol(), " ", "column 0 must be the Text left margin");
-    assert_eq!(buf[(1, cursor_y)].symbol(), "→", "the cursor glyph belongs at column 1");
+    assert_eq!(
+        buf[(0, cursor_y)].symbol(),
+        " ",
+        "column 0 must be the Text left margin"
+    );
+    assert_eq!(
+        buf[(1, cursor_y)].symbol(),
+        "→",
+        "the cursor glyph belongs at column 1"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -440,8 +509,14 @@ fn session_rows() -> Vec<SessionRow> {
 fn session_selector_uses_pis_single_angle_quote_cursor() {
     let mut sel = SessionSelector::new(session_rows());
     let s = screen(&render_selector(&mut sel, 80, 16));
-    assert!(s.contains('\u{203a}'), "U+203A `›` cursor missing from /resume:\n{s}");
-    assert!(!s.contains('\u{2192}'), "/resume still draws SelectList's `→` cursor:\n{s}");
+    assert!(
+        s.contains('\u{203a}'),
+        "U+203A `›` cursor missing from /resume:\n{s}"
+    );
+    assert!(
+        !s.contains('\u{2192}'),
+        "/resume still draws SelectList's `→` cursor:\n{s}"
+    );
 }
 
 /// **S2 / SYS-4.** `session-selector.ts:506-508` `if (isSelected) line = theme.bg("selectedBg",
@@ -466,7 +541,11 @@ fn session_selector_fills_the_selected_row_with_selected_bg() {
     }
     // The row below it is not filled.
     let other_y = row_of(&terminal, "Fix the footer");
-    assert_ne!(buf[(2, other_y)].bg, fill, "an unselected row must not be filled");
+    assert_ne!(
+        buf[(2, other_y)].bg,
+        fill,
+        "an unselected row must not be filled"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -503,11 +582,18 @@ fn tree_selector_fills_the_selected_row_with_selected_bg() {
     }
     // The fill must not bleed onto the accent foreground it is laid over.
     assert!(
-        rows[0].spans.iter().any(|s| s.style.fg == theme.accent_style().fg),
+        rows[0]
+            .spans
+            .iter()
+            .any(|s| s.style.fg == theme.accent_style().fg),
         "the fill replaced the row's foreground instead of layering over it"
     );
     for span in &rows[1].spans {
-        assert_ne!(span.style.bg, Some(fill), "an unselected /tree row must not be filled");
+        assert_ne!(
+            span.style.bg,
+            Some(fill),
+            "an unselected /tree row must not be filled"
+        );
     }
 }
 
@@ -531,9 +617,15 @@ fn tree_selector_draws_the_fold_state_inside_the_connector() {
         expanded.contains("└⊟ "),
         "expanded foldable node must render `└⊟ ` in its connector: {expanded:?}"
     );
-    assert!(!expanded.contains('\u{229e}'), "`⊞` drawn with nothing folded: {expanded:?}");
+    assert!(
+        !expanded.contains('\u{229e}'),
+        "`⊞` drawn with nothing folded: {expanded:?}"
+    );
     // The leaf under it is not foldable, so its connector keeps the plain `─`.
-    assert!(expanded.contains("└─ "), "a non-foldable node keeps `└─ `: {expanded:?}");
+    assert!(
+        expanded.contains("└─ "),
+        "a non-foldable node keeps `└─ `: {expanded:?}"
+    );
 
     // Fold it and the SAME cell flips to `⊞` — the row does not grow or shift.
     let km = SelectKeymap::default();
@@ -541,8 +633,14 @@ fn tree_selector_draws_the_fold_state_inside_the_connector() {
     sel.handle(&tree_fold_key(), &km); // fold (`app.tree.foldOrUp`, `tree-selector.ts:1002-1009`)
     let rows = sel.rows(80, &theme);
     let folded: String = rows.iter().map(text).collect();
-    assert!(folded.contains("└⊞ "), "folded node must render `└⊞ `: {folded:?}");
-    assert!(!folded.contains('\u{229f}'), "`⊟` still drawn after folding: {folded:?}");
+    assert!(
+        folded.contains("└⊞ "),
+        "folded node must render `└⊞ `: {folded:?}"
+    );
+    assert!(
+        !folded.contains('\u{229f}'),
+        "`⊟` still drawn after folding: {folded:?}"
+    );
     let connector = rows
         .iter()
         .flat_map(|l| l.spans.iter())
@@ -569,8 +667,14 @@ fn tree_selector_fold_marker_is_the_connectorless_fallback() {
     // Expanded depth-0 root: no connector AND no marker.
     let rows = sel.rows(80, &theme);
     let row0 = text(&rows[0]);
-    assert!(!row0.contains('\u{229f}'), "no `⊟` fallback exists upstream: {row0:?}");
-    assert!(!row0.contains('\u{229e}'), "`⊞` drawn with nothing folded: {row0:?}");
+    assert!(
+        !row0.contains('\u{229f}'),
+        "no `⊟` fallback exists upstream: {row0:?}"
+    );
+    assert!(
+        !row0.contains('\u{229e}'),
+        "`⊞` drawn with nothing folded: {row0:?}"
+    );
 
     // Fold it: now the accent `⊞ ` fallback appears, because there is no connector to hold it.
     let km = SelectKeymap::default();
@@ -603,11 +707,23 @@ fn tree_selector_marks_the_selection_pis_way_not_with_an_invented_marker() {
     let sel = TreeSelector::new(tree_nodes());
     let rows = sel.rows(80, &theme);
     let selected = text(&rows[0]);
-    assert!(!selected.contains('◀'), "cyrup-only `◀ selected` marker still drawn: {selected:?}");
-    assert!(!selected.contains("selected"), "cyrup-only marker text still drawn: {selected:?}");
+    assert!(
+        !selected.contains('◀'),
+        "cyrup-only `◀ selected` marker still drawn: {selected:?}"
+    );
+    assert!(
+        !selected.contains("selected"),
+        "cyrup-only marker text still drawn: {selected:?}"
+    );
     // `:689` — U+203A on the selected row, two spaces on the others.
-    assert!(selected.starts_with("\u{203a} "), "selected row must open with `› `: {selected:?}");
-    assert!(text(&rows[1]).starts_with("  "), "unselected rows open with two spaces");
+    assert!(
+        selected.starts_with("\u{203a} "),
+        "selected row must open with `› `: {selected:?}"
+    );
+    assert!(
+        text(&rows[1]).starts_with("  "),
+        "unselected rows open with two spaces"
+    );
     // The row is content-wide, not padded out to `width`.
     assert!(
         selected.chars().count() < 80,
@@ -624,7 +740,10 @@ fn tree_selection_without_a_selected_bg_role_keeps_its_foreground() {
     let sel = TreeSelector::new(tree_nodes());
     let rows = sel.rows(80, &theme);
     assert!(
-        rows[0].spans.iter().any(|s| s.style.fg == theme.accent_style().fg),
+        rows[0]
+            .spans
+            .iter()
+            .any(|s| s.style.fg == theme.accent_style().fg),
         "selected row lost its accent foreground when selectedBg is undefined"
     );
 }
@@ -734,13 +853,25 @@ fn only_pis_own_components_opt_into_the_dialog_chrome() {
         SelectorKind::BranchSummary,
         SelectorKind::LoginAuthType,
     ] {
-        assert!(kind.draws_hint_row(), "{kind:?} is an ExtensionSelectorComponent — it hints");
-        assert!(kind.insets_rows(), "{kind:?} is an ExtensionSelectorComponent — it insets");
+        assert!(
+            kind.draws_hint_row(),
+            "{kind:?} is an ExtensionSelectorComponent — it hints"
+        );
+        assert!(
+            kind.insets_rows(),
+            "{kind:?} is an ExtensionSelectorComponent — it insets"
+        );
     }
     // `OAuthSelectorComponent` insets (`oauth-selector.ts:144`) but has no `keyHint` at all.
     for kind in [SelectorKind::Login, SelectorKind::Logout] {
-        assert!(!kind.draws_hint_row(), "{kind:?}: oauth-selector.ts contains no keyHint");
-        assert!(kind.insets_rows(), "{kind:?}: oauth-selector.ts:144 is TruncatedText(line, 1, 0)");
+        assert!(
+            !kind.draws_hint_row(),
+            "{kind:?}: oauth-selector.ts contains no keyHint"
+        );
+        assert!(
+            kind.insets_rows(),
+            "{kind:?}: oauth-selector.ts:144 is TruncatedText(line, 1, 0)"
+        );
     }
     // Neither for the components that add a bare `SelectList` / list child.
     for kind in [
@@ -750,7 +881,10 @@ fn only_pis_own_components_opt_into_the_dialog_chrome() {
         SelectorKind::UserMessage,
     ] {
         assert!(!kind.draws_hint_row(), "{kind:?} has no hint row upstream");
-        assert!(!kind.insets_rows(), "{kind:?} adds its list unwrapped upstream");
+        assert!(
+            !kind.insets_rows(),
+            "{kind:?} adds its list unwrapped upstream"
+        );
     }
 }
 
@@ -791,7 +925,11 @@ fn an_inset_dialog_lays_out_two_columns_narrower() {
     let mut sel = ListSelector::prompt("t".to_string(), rows, 0)
         .with_upstream_chrome(SelectorKind::ExtensionSelect, &SelectKeymap::default());
     let terminal = render_selector(&mut sel, 60, 16);
-    let row = screen(&terminal).lines().find(|l| l.contains('Z')).unwrap().to_string();
+    let row = screen(&terminal)
+        .lines()
+        .find(|l| l.contains('Z'))
+        .unwrap()
+        .to_string();
     // 1 (margin) + 2 (cursor) + label, where the label budget is `(60 - 2) - 2 - 2` (`:169`).
     assert_eq!(
         row.trim_end().chars().count(),
@@ -850,12 +988,21 @@ fn select_list_does_not_truncate_a_label_the_clamp_never_touched() {
 fn select_list_flattens_a_multiline_description() {
     let theme = UiTheme::dark();
     let list = SelectList::new(
-        vec![SelectItem::new("cmd", Some("  first line\r\n\nsecond line  ".to_string()))],
+        vec![SelectItem::new(
+            "cmd",
+            Some("  first line\r\n\nsecond line  ".to_string()),
+        )],
         ColumnLayout::SLASH,
     );
     let rendered = text(&list.lines(100, &theme)[0]);
-    assert!(!rendered.contains('\n'), "raw newline reached the row: {rendered:?}");
-    assert!(!rendered.contains('\r'), "raw carriage return reached the row: {rendered:?}");
+    assert!(
+        !rendered.contains('\n'),
+        "raw newline reached the row: {rendered:?}"
+    );
+    assert!(
+        !rendered.contains('\r'),
+        "raw carriage return reached the row: {rendered:?}"
+    );
     // A RUN of breaks collapses to exactly one space (the regex is `+`), and the value is trimmed.
     assert!(
         rendered.contains("first line second line"),
@@ -875,7 +1022,11 @@ fn select_list_treats_a_whitespace_only_description_as_absent() {
     let rendered = text(&list.lines(100, &theme)[0]);
     // The row is the (only, hence selected) one, so the cursor is `→ `; what matters is that no
     // description column follows it.
-    assert_eq!(rendered.trim_end(), "→ cmd", "must take the single-column arm: {rendered:?}");
+    assert_eq!(
+        rendered.trim_end(),
+        "→ cmd",
+        "must take the single-column arm: {rendered:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -929,7 +1080,10 @@ fn select_list_measures_a_cjk_label_in_columns_not_chars() {
     let rendered = text(&list.lines(120, &theme)[0]);
 
     let kept = rendered.chars().filter(|c| *c == '銀').count();
-    assert_eq!(kept, 15, "label must be cut to 30 COLUMNS = 15 CJK chars: {rendered:?}");
+    assert_eq!(
+        kept, 15,
+        "label must be cut to 30 COLUMNS = 15 CJK chars: {rendered:?}"
+    );
     assert_eq!(
         vis_col_of(&rendered, "説明テキスト"),
         Some(34),
@@ -960,7 +1114,11 @@ fn select_list_never_splits_a_zwj_cluster_in_a_label() {
     let rendered = text(&list.lines(20, &theme)[0]);
     let body = rendered.strip_prefix("→ ").expect("selected row prefix");
 
-    assert_eq!(vis_width(body), 16, "budget is width(20) - prefix(2) - 2: {rendered:?}");
+    assert_eq!(
+        vis_width(body),
+        16,
+        "budget is width(20) - prefix(2) - 2: {rendered:?}"
+    );
     assert_eq!(
         body.matches(family).count(),
         8,
@@ -988,8 +1146,16 @@ fn select_list_never_splits_a_combining_mark_in_a_label() {
     let rendered = text(&list.lines(20, &theme)[0]);
     let body = rendered.strip_prefix("→ ").expect("selected row prefix");
 
-    assert_eq!(vis_width(body), 16, "budget is width(20) - prefix(2) - 2: {rendered:?}");
-    assert_eq!(body.matches("e\u{301}").count(), 16, "16 whole clusters: {rendered:?}");
+    assert_eq!(
+        vis_width(body),
+        16,
+        "budget is width(20) - prefix(2) - 2: {rendered:?}"
+    );
+    assert_eq!(
+        body.matches("e\u{301}").count(),
+        16,
+        "16 whole clusters: {rendered:?}"
+    );
     assert!(
         !body.ends_with('e'),
         "the last kept letter must keep its accent: {rendered:?}"
@@ -1013,11 +1179,19 @@ fn select_list_never_splits_a_zwj_cluster_in_a_description() {
     );
     let rendered = text(&list.lines(45, &theme)[0]);
 
-    assert_eq!(vis_col_of(&rendered, family), Some(14), "description column: {rendered:?}");
+    assert_eq!(
+        vis_col_of(&rendered, family),
+        Some(14),
+        "description column: {rendered:?}"
+    );
     let start = rendered.find(family).expect("description present");
     let desc = rendered.get(start..).expect("suffix");
 
-    assert_eq!(vis_width(desc), 28, "29-column budget holds 14 two-column families: {rendered:?}");
+    assert_eq!(
+        vis_width(desc),
+        28,
+        "29-column budget holds 14 two-column families: {rendered:?}"
+    );
     assert_eq!(
         desc.matches(family).count(),
         14,
@@ -1046,13 +1220,28 @@ fn select_list_never_splits_a_combining_mark_in_a_description() {
         ColumnLayout::SLASH,
     );
     let rendered = text(&list.lines(45, &theme)[0]);
-    assert_eq!(vis_col_of(&rendered, "e\u{301}"), Some(14), "description column: {rendered:?}");
+    assert_eq!(
+        vis_col_of(&rendered, "e\u{301}"),
+        Some(14),
+        "description column: {rendered:?}"
+    );
     let start = rendered.find("e\u{301}").expect("description present");
     let desc = rendered.get(start..).expect("suffix");
 
-    assert_eq!(vis_width(desc), 29, "description budget is 29 columns: {rendered:?}");
-    assert_eq!(desc.matches("e\u{301}").count(), 29, "29 whole clusters: {rendered:?}");
-    assert!(!desc.ends_with('e'), "trailing letter kept its accent: {rendered:?}");
+    assert_eq!(
+        vis_width(desc),
+        29,
+        "description budget is 29 columns: {rendered:?}"
+    );
+    assert_eq!(
+        desc.matches("e\u{301}").count(),
+        29,
+        "29 whole clusters: {rendered:?}"
+    );
+    assert!(
+        !desc.ends_with('e'),
+        "trailing letter kept its accent: {rendered:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1103,7 +1292,9 @@ fn roled_nodes() -> Vec<TreeNode> {
     summary.kind = TreeKind::Compaction;
     let mut model = TreeNode::message("m", 0, "model → opus");
     model.kind = TreeKind::ModelChange;
-    vec![user, assistant, empty, bash, tool, compaction, summary, model]
+    vec![
+        user, assistant, empty, bash, tool, compaction, summary, model,
+    ]
 }
 
 /// **S24(b).** Each entry type carries its own colour, and the role prefix carries a *different*
@@ -1183,7 +1374,10 @@ fn tree_rows_are_coloured_per_role_like_pi() {
     ];
     for (i, a) in four.iter().enumerate() {
         for b in four.iter().skip(i + 1) {
-            assert_ne!(a, b, "user / assistant / tool / compaction must differ in colour: {four:?}");
+            assert_ne!(
+                a, b,
+                "user / assistant / tool / compaction must differ in colour: {four:?}"
+            );
         }
     }
 }
@@ -1198,14 +1392,29 @@ fn tree_rows_are_coloured_per_role_like_pi() {
 #[test]
 fn tree_compaction_row_reads_the_border_accent_token() {
     let theme = UiTheme::dark();
-    let want = *theme.roles.get("borderAccent").expect("dark.json:25 defines borderAccent");
+    let want = *theme
+        .roles
+        .get("borderAccent")
+        .expect("dark.json:25 defines borderAccent");
     let mut sel = TreeSelector::new(roled_nodes());
     sel.handle(&key(KeyCode::Down), &SelectKeymap::default());
     let rows = sel.rows(120, &theme);
     let got = span_style_containing(&rows[5], "compaction").fg;
-    assert_eq!(got, Some(want), "the compaction row must read `borderAccent`");
-    assert_ne!(got, theme.accent_style().fg, "`borderAccent` is not `accent` (#00d7ff vs #8abeb7)");
-    assert_ne!(got, theme.base_style().fg, "the compaction row is not body text");
+    assert_eq!(
+        got,
+        Some(want),
+        "the compaction row must read `borderAccent`"
+    );
+    assert_ne!(
+        got,
+        theme.accent_style().fg,
+        "`borderAccent` is not `accent` (#00d7ff vs #8abeb7)"
+    );
+    assert_ne!(
+        got,
+        theme.base_style().fg,
+        "the compaction row is not body text"
+    );
 }
 
 /// **S24(b), the selection.** `:851` `return isSelected ? theme.bold(result) : result;` — the
@@ -1222,16 +1431,33 @@ fn tree_selected_row_is_bolded_not_repainted_accent() {
     let prefix = span_style_containing(&rows[0], "user: ");
     let body = span_style_containing(&rows[0], "port the editor");
 
-    assert!(prefix.add_modifier.contains(ratatui::style::Modifier::BOLD), "`:851` bolds the row");
-    assert!(body.add_modifier.contains(ratatui::style::Modifier::BOLD), "`:851` bolds the row");
-    assert_eq!(body.fg, theme.base_style().fg, "the body keeps its own colour under the bold");
+    assert!(
+        prefix.add_modifier.contains(ratatui::style::Modifier::BOLD),
+        "`:851` bolds the row"
+    );
+    assert!(
+        body.add_modifier.contains(ratatui::style::Modifier::BOLD),
+        "`:851` bolds the row"
+    );
+    assert_eq!(
+        body.fg,
+        theme.base_style().fg,
+        "the body keeps its own colour under the bold"
+    );
 
     // And an unselected row of the same role is the same colour, minus the bold.
     let mut moved = TreeSelector::new(roled_nodes());
     moved.handle(&key(KeyCode::Down), &SelectKeymap::default());
     let unselected = span_style_containing(&moved.rows(120, &theme)[0], "port the editor");
-    assert_eq!(unselected.fg, body.fg, "selection must not change the colour");
-    assert!(!unselected.add_modifier.contains(ratatui::style::Modifier::BOLD));
+    assert_eq!(
+        unselected.fg, body.fg,
+        "selection must not change the colour"
+    );
+    assert!(
+        !unselected
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD)
+    );
 }
 
 /// **S24(a).** The label-timestamp pad is `width - leftWidth - stampWidth - 1`, and `leftWidth` has
@@ -1260,7 +1486,10 @@ fn tree_label_timestamp_pad_is_measured_in_columns_not_chars() {
     let width = 80u16;
     let row = &sel.rows(width, &theme)[0];
     let rendered = text(row);
-    assert!(rendered.contains("12:04"), "precondition: the column is on: {rendered:?}");
+    assert!(
+        rendered.contains("12:04"),
+        "precondition: the column is on: {rendered:?}"
+    );
 
     assert_eq!(
         row.width(),

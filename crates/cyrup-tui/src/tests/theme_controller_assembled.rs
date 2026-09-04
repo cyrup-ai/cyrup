@@ -4,10 +4,15 @@
 //! terminal-bg/`ColorMode` fallback. Here we boot the whole `App` through the controller with
 //! `settings.theme = "light"` (a non-default, non-dark theme) and assert the rendered foreground/accent
 //! roles are the LIGHT theme's colors, not the hardwired dark palette.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
-use cyrup_resources::theme::ThemeData;
 use crate::{App, ColorMode, TerminalTheme, ThemeController, UiTheme};
+use cyrup_resources::theme::ThemeData;
 use ratatui::backend::TestBackend;
 use ratatui::style::Color;
 
@@ -48,14 +53,25 @@ fn structured_sub_themes_make_every_bg_and_thinking_field_addressable() {
     // Every thinking-border level is a typed field; a defined level uses the theme, an omitted level
     // falls back to the spec dark hex (so the border is total, never a flat-map miss).
     let think = theme.thinking();
-    assert_eq!(think.off, Color::Rgb(0x20, 0x20, 0x20), "defined level uses the theme value");
+    assert_eq!(
+        think.off,
+        Color::Rgb(0x20, 0x20, 0x20),
+        "defined level uses the theme value"
+    );
     assert_eq!(think.medium, Color::Rgb(0x81, 0xa2, 0xbe));
     assert_eq!(think.xhigh, Color::Rgb(0xd1, 0x83, 0xe8));
-    assert_eq!(think.low, Color::Rgb(0x5f, 0x87, 0xaf), "omitted level uses the spec dark fallback");
+    assert_eq!(
+        think.low,
+        Color::Rgb(0x5f, 0x87, 0xaf),
+        "omitted level uses the spec dark fallback"
+    );
     // PROV-002: this assembled theme predates the `max` rung and omits `thinkingMax`, so it must
     // reuse its OWN resolved `xhigh` color (Pi's `thinkingMax ?? thinkingXhigh`, theme.ts:329) —
     // not the spec dark hex, and not the neutral border.
-    assert_eq!(think.max, think.xhigh, "a theme without thinkingMax falls back to xhigh");
+    assert_eq!(
+        think.max, think.xhigh,
+        "a theme without thinkingMax falls back to xhigh"
+    );
     assert_eq!(theme.thinking_border_style("max").fg, Some(think.xhigh));
 
     // The structured fields drive the live accessors (one source of truth): the medium thinking rule
@@ -66,20 +82,33 @@ fn structured_sub_themes_make_every_bg_and_thinking_field_addressable() {
 
 /// Whether any cell in the assembled buffer carries `color` as its foreground.
 fn any_fg(app: &App<TestBackend>, color: Color) -> bool {
-    app.terminal().backend().buffer().content().iter().any(|c| c.fg == color)
+    app.terminal()
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .any(|c| c.fg == color)
 }
 
 #[test]
 fn assembled_boot_honors_settings_theme_light_not_hardwired_dark() {
     // Boot the controller from `settings.theme = "light"` (truecolor so the role colors stay RGB and
     // are exactly comparable). Resolution: a bare name passes through → active theme "light".
-    let controller = ThemeController::boot(Some("light"), ColorMode::TrueColor, TerminalTheme::Dark);
-    assert_eq!(controller.active_name(), "light", "settings.theme=light not honored at boot");
+    let controller =
+        ThemeController::boot(Some("light"), ColorMode::TrueColor, TerminalTheme::Dark);
+    assert_eq!(
+        controller.active_name(),
+        "light",
+        "settings.theme=light not honored at boot"
+    );
 
     let light = UiTheme::builtin("light");
     let dark = UiTheme::builtin("dark");
     // Sanity: the two builtins genuinely differ (else the assertion below would be vacuous).
-    assert_ne!(light.foreground, dark.foreground, "light/dark builtins must differ");
+    assert_ne!(
+        light.foreground, dark.foreground,
+        "light/dark builtins must differ"
+    );
 
     // Boot the whole app from the controller's projected theme, seed a footer, render.
     let mut app = App::new(TestBackend::new(100, 30), controller.theme()).unwrap();
@@ -88,12 +117,19 @@ fn assembled_boot_honors_settings_theme_light_not_hardwired_dark() {
     app.draw().unwrap();
 
     // The booted app carries the LIGHT theme, not dark.
-    assert_eq!(app.state().theme.name, light.name, "app did not boot the light theme");
+    assert_eq!(
+        app.state().theme.name,
+        light.name,
+        "app did not boot the light theme"
+    );
     // The LIGHT foreground reaches real cells; the DARK foreground never does — the boot is themed,
     // not hardwired dark (audit #4).
     let light_fg = light.foreground.expect("light theme has a foreground");
     let dark_fg = dark.foreground.expect("dark theme has a foreground");
-    assert!(any_fg(&app, light_fg), "light-theme foreground did not reach the rendered buffer");
+    assert!(
+        any_fg(&app, light_fg),
+        "light-theme foreground did not reach the rendered buffer"
+    );
     assert!(
         !any_fg(&app, dark_fg),
         "dark-theme foreground leaked into a light-theme boot (hardwired dark, audit #4)"
@@ -103,18 +139,40 @@ fn assembled_boot_honors_settings_theme_light_not_hardwired_dark() {
 #[test]
 fn theme_controller_resolves_auto_and_unset_against_terminal_background() {
     // `auto` (`light/dark`) picks the arm matching the terminal polarity (Pi `resolveThemeSetting`).
-    let light_term =
-        ThemeController::boot(Some("light/dark"), ColorMode::TrueColor, TerminalTheme::Light);
-    assert_eq!(light_term.active_name(), "light", "auto setting on a light terminal → light");
-    let dark_term =
-        ThemeController::boot(Some("light/dark"), ColorMode::TrueColor, TerminalTheme::Dark);
-    assert_eq!(dark_term.active_name(), "dark", "auto setting on a dark terminal → dark");
+    let light_term = ThemeController::boot(
+        Some("light/dark"),
+        ColorMode::TrueColor,
+        TerminalTheme::Light,
+    );
+    assert_eq!(
+        light_term.active_name(),
+        "light",
+        "auto setting on a light terminal → light"
+    );
+    let dark_term = ThemeController::boot(
+        Some("light/dark"),
+        ColorMode::TrueColor,
+        TerminalTheme::Dark,
+    );
+    assert_eq!(
+        dark_term.active_name(),
+        "dark",
+        "auto setting on a dark terminal → dark"
+    );
 
     // An unset setting falls back to the terminal polarity's theme name (never hardwired dark).
     let unset_light = ThemeController::boot(None, ColorMode::TrueColor, TerminalTheme::Light);
-    assert_eq!(unset_light.active_name(), "light", "unset setting on a light terminal → light");
+    assert_eq!(
+        unset_light.active_name(),
+        "light",
+        "unset setting on a light terminal → light"
+    );
     let unset_dark = ThemeController::boot(None, ColorMode::TrueColor, TerminalTheme::Dark);
-    assert_eq!(unset_dark.active_name(), "dark", "unset setting on a dark terminal → dark");
+    assert_eq!(
+        unset_dark.active_name(),
+        "dark",
+        "unset setting on a dark terminal → dark"
+    );
 }
 
 #[test]
@@ -133,7 +191,10 @@ fn live_theme_switch_reprojects_through_the_apps_color_mode() {
         .content()
         .iter()
         .any(|c| matches!(c.fg, Color::Rgb(_, _, _)) || matches!(c.bg, Color::Rgb(_, _, _)));
-    assert!(!has_rgb, "a /theme switch leaked truecolor on a 256-color boot (set_theme re-projection)");
+    assert!(
+        !has_rgb,
+        "a /theme switch leaked truecolor on a 256-color boot (set_theme re-projection)"
+    );
 }
 
 #[test]
@@ -154,7 +215,10 @@ fn hot_reload_theme_data_repaints_the_assembled_app() {
 
     // A bright-magenta accent no dark/light builtin uses, so its presence is unambiguous.
     let accent = Color::Rgb(0xff, 0x00, 0xff);
-    assert!(!any_fg(&app, accent), "sanity: the accent must not be present before the reload");
+    assert!(
+        !any_fg(&app, accent),
+        "sanity: the accent must not be present before the reload"
+    );
 
     // The `Arc<ThemeData>` shape the `ThemeWatcher` publishes on a file edit.
     let data: ThemeData = serde_json::from_str(
@@ -165,6 +229,13 @@ fn hot_reload_theme_data_repaints_the_assembled_app() {
     app.set_theme(UiTheme::from_theme_data(&data, 0));
     app.draw().unwrap();
 
-    assert_eq!(app.state().theme.name, "hot-magenta", "hot-reloaded theme name not applied");
-    assert!(any_fg(&app, accent), "hot-reloaded accent color did not reach the rendered buffer");
+    assert_eq!(
+        app.state().theme.name,
+        "hot-magenta",
+        "hot-reloaded theme name not applied"
+    );
+    assert!(
+        any_fg(&app, accent),
+        "hot-reloaded accent color did not reach the rendered buffer"
+    );
 }

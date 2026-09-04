@@ -80,7 +80,9 @@ impl AgentSession {
         if same_model && is_context_overflow(assistant, Some(window)) {
             let will_retry = assistant.stop_reason != cyrup_core::StopReason::Stop;
             if !will_retry {
-                return self.run_auto_compaction(CompactionReason::Overflow, false).await;
+                return self
+                    .run_auto_compaction(CompactionReason::Overflow, false)
+                    .await;
             }
             if *Self::lock(&self.overflow_recovery_attempted) {
                 self.fanout_emit(AgentSessionEvent::CompactionEnd {
@@ -99,7 +101,9 @@ impl AgentSession {
             }
             *Self::lock(&self.overflow_recovery_attempted) = true;
             self.drop_trailing_assistant().await;
-            return self.run_auto_compaction(CompactionReason::Overflow, will_retry).await;
+            return self
+                .run_auto_compaction(CompactionReason::Overflow, will_retry)
+                .await;
         }
 
         // Case 2: threshold — the context is getting large (Pi agent-session.ts:1900-1927). Prefer the
@@ -139,7 +143,9 @@ impl AgentSession {
             // If the usage source predates the compaction boundary, its tokens are stale.
             if let (
                 Some(boundary_ts),
-                Some(cyrup_session::agent_message::AgentMessage::Core(Message::Assistant(usage_msg))),
+                Some(cyrup_session::agent_message::AgentMessage::Core(Message::Assistant(
+                    usage_msg,
+                ))),
             ) = (compaction_ts, messages.get(last_usage_index))
                 && usage_msg.timestamp <= boundary_ts
             {
@@ -152,7 +158,9 @@ impl AgentSession {
         // Pi `shouldCompact`: contextTokens > contextWindow − reserveTokens (compaction.ts).
         let threshold = window.saturating_sub(u64::from(settings.reserve_tokens));
         if u64::from(context_tokens) > threshold {
-            return self.run_auto_compaction(CompactionReason::Threshold, false).await;
+            return self
+                .run_auto_compaction(CompactionReason::Threshold, false)
+                .await;
         }
         Ok(false)
     }
@@ -161,12 +169,16 @@ impl AgentSession {
     /// (Pi `getLatestCompactionEntry(this.sessionManager.getBranch())`, agent-session.ts:1859).
     async fn latest_compaction_ts(&self) -> Option<i64> {
         let guard = self.manager.lock().await;
-        guard.branch_path(None).into_iter().rev().find_map(|e| match e {
-            cyrup_session::Entry::Known(cyrup_session::KnownEntry::Compaction { base, .. }) => {
-                Some(cyrup_session::context::parse_entry_ts(&base.timestamp))
-            }
-            _ => None,
-        })
+        guard
+            .branch_path(None)
+            .into_iter()
+            .rev()
+            .find_map(|e| match e {
+                cyrup_session::Entry::Known(cyrup_session::KnownEntry::Compaction {
+                    base, ..
+                }) => Some(cyrup_session::context::parse_entry_ts(&base.timestamp)),
+                _ => None,
+            })
     }
 
     /// Run an auto-compaction with its own abort controller + events (Pi `_runAutoCompaction`,
@@ -193,21 +205,27 @@ impl AgentSession {
         // (`:1199`), which a racing caller can drop.
         let mut cancel_slot =
             CompactionCancelGuard::install(&self.auto_compaction_cancel, cancel.clone());
-        self.fanout_emit(AgentSessionEvent::CompactionStart { reason }).await;
+        self.fanout_emit(AgentSessionEvent::CompactionStart { reason })
+            .await;
 
         // Pi: `this._summarizationRetryCallbacks({ source: "compaction", reason })` — the LIVE
         // threshold/overflow reason, not a literal (agent-session.ts:2133).
-        let (retry_observer, retry_rx) = crate::compact::summarization_retry_channel(
-            SummarizationRetrySource::Compaction { reason },
-        );
+        let (retry_observer, retry_rx) =
+            crate::compact::summarization_retry_channel(SummarizationRetrySource::Compaction {
+                reason,
+            });
         let retry_pump = self.spawn_event_pump(retry_rx);
-        let summarizer =
-            DynSummarizer::new(self.provider.current(), model.clone(), self.summarization_retry())
-                .with_observer(retry_observer);
+        let summarizer = DynSummarizer::new(
+            self.provider.current(),
+            model.clone(),
+            self.summarization_retry(),
+        )
+        .with_observer(retry_observer);
         // Pi threads the session thinking level into every compaction summarization call
         // (`agent-session.ts:1855,2129`); `summarization_reasoning` applies the `model.reasoning`
         // gate before it reaches the request.
-        let compactor = Compactor::new(summarizer, NoHooks).with_thinking(self.thinking_level().await);
+        let compactor =
+            Compactor::new(summarizer, NoHooks).with_thinking(self.thinking_level().await);
         let settings = self.effective_compaction_settings();
 
         // Compute the REAL preparation BEFORE the extension hook (L4 gap #5) — the ONLY preparation.
@@ -438,11 +456,7 @@ impl AgentSession {
                     error_message,
                 })
                 .await;
-                if aborted {
-                    Ok(false)
-                } else {
-                    Err(e.into())
-                }
+                if aborted { Ok(false) } else { Err(e.into()) }
             }
         }
     }

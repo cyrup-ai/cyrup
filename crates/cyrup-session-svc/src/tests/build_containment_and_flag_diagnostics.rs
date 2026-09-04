@@ -33,20 +33,25 @@
 //! `runtime.diagnostics` (agent-session-services.ts:98-125, merged at `:182`) and makes the bin
 //! exit 1 (`main.ts:843-848`). Asserted here at the `AgentSessionRuntime::diagnostics()` seam the
 //! bin's new checkpoint consumes.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use cyrup_core::ExtensionId;
-use cyrup_ext::{ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension};
-use cyrup_provider::faux::FauxProvider;
-use cyrup_provider::Provider;
 use crate::{
     AgentSessionRuntime, ExtensionFlagValue, SessionBuilder, SessionConfig, SessionFactory,
     SessionTarget,
 };
+use cyrup_core::ExtensionId;
+use cyrup_ext::{ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension};
+use cyrup_provider::Provider;
+use cyrup_provider::faux::FauxProvider;
 use tempfile::TempDir;
 
 /// A native built-in whose `init()` always fails — the EXT-S01 trigger.
@@ -60,7 +65,9 @@ impl NativeExtension for FailingExt {
         ExtensionId::from(self.id)
     }
     async fn init(&self, _api: &mut InitApi) -> Result<(), ExtError> {
-        Err(ExtError::Panicked("boom: could not open the policy file".to_string()))
+        Err(ExtError::Panicked(
+            "boom: could not open the policy file".to_string(),
+        ))
     }
     async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         HookOutcome::Noop
@@ -100,7 +107,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -125,10 +136,13 @@ async fn a_failing_native_init_is_contained_and_recorded_not_fatal() {
     let reached = Arc::new(AtomicBool::new(false));
 
     let session = SessionBuilder::new(faux(), base_config(&fx))
-        .with_native_extension(Arc::new(FailingExt { id: "permission-system" })
-            as Arc<dyn NativeExtension>)
-        .with_native_extension(Arc::new(MarkerExt { id: "intercom", inited: reached.clone() })
-            as Arc<dyn NativeExtension>)
+        .with_native_extension(Arc::new(FailingExt {
+            id: "permission-system",
+        }) as Arc<dyn NativeExtension>)
+        .with_native_extension(Arc::new(MarkerExt {
+            id: "intercom",
+            inited: reached.clone(),
+        }) as Arc<dyn NativeExtension>)
         .build()
         .await
         .expect("a failing native extension must NOT abort the session build");
@@ -142,23 +156,40 @@ async fn a_failing_native_init_is_contained_and_recorded_not_fatal() {
     // (2) The failure is SURFACED, not swallowed. This is the `[Extension issues]` channel
     //     `build_startup_report` feeds to `cyrup_tui::extension_diagnostics` (d2c5509).
     let diags = &session.services().startup_diagnostics.extensions;
-    assert_eq!(diags.len(), 1, "expected exactly one recorded extension failure, got {diags:?}");
+    assert_eq!(
+        diags.len(),
+        1,
+        "expected exactly one recorded extension failure, got {diags:?}"
+    );
     assert_eq!(
         diags[0].path,
         PathBuf::from("permission-system"),
         "the diagnostic must name the extension that failed"
     );
     assert!(
-        diags[0].error.contains("boom: could not open the policy file"),
+        diags[0]
+            .error
+            .contains("boom: could not open the policy file"),
         "the diagnostic must carry the underlying error, got {:?}",
         diags[0].error
     );
 
     // (3) The failed extension is genuinely absent — containment is not "load it anyway".
-    let loaded: Vec<String> =
-        session.services().ext_host.loaded_ids().iter().map(|i| i.to_string()).collect();
-    assert!(!loaded.contains(&"permission-system".to_string()), "loaded ids: {loaded:?}");
-    assert!(loaded.contains(&"intercom".to_string()), "loaded ids: {loaded:?}");
+    let loaded: Vec<String> = session
+        .services()
+        .ext_host
+        .loaded_ids()
+        .iter()
+        .map(|i| i.to_string())
+        .collect();
+    assert!(
+        !loaded.contains(&"permission-system".to_string()),
+        "loaded ids: {loaded:?}"
+    );
+    assert!(
+        loaded.contains(&"intercom".to_string()),
+        "loaded ids: {loaded:?}"
+    );
 }
 
 /// EVERY failing native is recorded, not just the first — the pre-fix `?` could only ever produce
@@ -189,8 +220,10 @@ async fn a_clean_native_load_records_no_extension_diagnostics() {
     let fx = fixture();
     let reached = Arc::new(AtomicBool::new(false));
     let session = SessionBuilder::new(faux(), base_config(&fx))
-        .with_native_extension(Arc::new(MarkerExt { id: "ok-ext", inited: reached.clone() })
-            as Arc<dyn NativeExtension>)
+        .with_native_extension(Arc::new(MarkerExt {
+            id: "ok-ext",
+            inited: reached.clone(),
+        }) as Arc<dyn NativeExtension>)
         .build()
         .await
         .expect("build");
@@ -203,8 +236,10 @@ async fn a_clean_native_load_records_no_extension_diagnostics() {
 
 fn config_with_flags(fx: &Fixture, flags: &[(&str, ExtensionFlagValue)]) -> SessionConfig {
     let mut cfg = base_config(fx);
-    cfg.extension_flag_values =
-        flags.iter().map(|(n, v)| ((*n).to_string(), v.clone())).collect();
+    cfg.extension_flag_values = flags
+        .iter()
+        .map(|(n, v)| ((*n).to_string(), v.clone()))
+        .collect();
     cfg
 }
 
@@ -223,7 +258,10 @@ async fn an_unknown_cli_flag_becomes_a_runtime_error_diagnostic() {
 
     let diags = runtime.diagnostics().await;
     assert_eq!(diags.len(), 1, "expected one diagnostic, got {diags:?}");
-    assert_eq!(diags[0].severity, "error", "Pi types this as an error (exit 1), not a warning");
+    assert_eq!(
+        diags[0].severity, "error",
+        "Pi types this as an error (exit 1), not a warning"
+    );
     assert_eq!(diags[0].message, "Unknown option: --no-such-flag");
     assert_eq!(diags[0].source.as_deref(), Some("extension-flag"));
 }
@@ -233,7 +271,10 @@ async fn an_unknown_cli_flag_becomes_a_runtime_error_diagnostic() {
 #[tokio::test]
 async fn no_captured_flags_means_no_flag_diagnostics() {
     let fx = fixture();
-    let clean = SessionBuilder::new(faux(), base_config(&fx)).build().await.expect("build");
+    let clean = SessionBuilder::new(faux(), base_config(&fx))
+        .build()
+        .await
+        .expect("build");
     assert!(clean.services().startup_diagnostics.flags.is_empty());
 
     let cfg = config_with_flags(
@@ -243,7 +284,10 @@ async fn no_captured_flags_means_no_flag_diagnostics() {
             ("beta", ExtensionFlagValue::Bool(true)),
         ],
     );
-    let dirty = SessionBuilder::new(faux(), cfg).build().await.expect("build");
+    let dirty = SessionBuilder::new(faux(), cfg)
+        .build()
+        .await
+        .expect("build");
     assert_eq!(
         dirty.services().startup_diagnostics.flags,
         vec!["Unknown options: --alpha, --beta".to_string()]
@@ -272,21 +316,31 @@ async fn a_contained_native_failure_is_a_fatal_runtime_diagnostic_in_every_mode(
     let fx = fixture();
     let reached = Arc::new(AtomicBool::new(false));
     let factory = SessionFactory::new(faux(), base_config(&fx))
-        .with_native_extension(Arc::new(FailingExt { id: "permission-system" })
-            as Arc<dyn NativeExtension>)
-        .with_native_extension(Arc::new(MarkerExt { id: "intercom", inited: reached.clone() })
-            as Arc<dyn NativeExtension>);
+        .with_native_extension(Arc::new(FailingExt {
+            id: "permission-system",
+        }) as Arc<dyn NativeExtension>)
+        .with_native_extension(Arc::new(MarkerExt {
+            id: "intercom",
+            inited: reached.clone(),
+        }) as Arc<dyn NativeExtension>);
 
     let runtime = AgentSessionRuntime::create(Arc::new(factory), SessionTarget::New)
         .await
         .expect("a failing native extension must NOT abort the session build");
 
     // Containment still holds: the later built-in loaded.
-    assert!(reached.load(Ordering::SeqCst), "the load loop stopped at the first failure");
+    assert!(
+        reached.load(Ordering::SeqCst),
+        "the load loop stopped at the first failure"
+    );
 
     let diags = runtime.diagnostics().await;
     let errors: Vec<_> = diags.iter().filter(|d| d.severity == "error").collect();
-    assert_eq!(errors.len(), 1, "expected exactly one fatal diagnostic, got {diags:?}");
+    assert_eq!(
+        errors.len(),
+        1,
+        "expected exactly one fatal diagnostic, got {diags:?}"
+    );
     assert_eq!(
         errors[0].message,
         "Failed to load extension \"permission-system\": extension panicked: boom: could not open the policy file",
@@ -300,9 +354,11 @@ async fn a_contained_native_failure_is_a_fatal_runtime_diagnostic_in_every_mode(
 #[tokio::test]
 async fn the_failure_reaches_the_panel_and_the_exit_channel_together() {
     let fx = fixture();
-    let factory = SessionFactory::new(faux(), base_config(&fx))
-        .with_native_extension(Arc::new(FailingExt { id: "subagents" })
-            as Arc<dyn NativeExtension>);
+    let factory =
+        SessionFactory::new(faux(), base_config(&fx))
+            .with_native_extension(
+                Arc::new(FailingExt { id: "subagents" }) as Arc<dyn NativeExtension>
+            );
     let runtime = AgentSessionRuntime::create(Arc::new(factory), SessionTarget::New)
         .await
         .expect("build");
@@ -310,10 +366,15 @@ async fn the_failure_reaches_the_panel_and_the_exit_channel_together() {
     let session = runtime.session().await;
     let panel = &session.services().startup_diagnostics.extensions;
     assert_eq!(panel.len(), 1, "panel channel lost the failure: {panel:?}");
-    assert!(panel[0].fatal, "a native init failure is Pi's fatal load-failure class");
+    assert!(
+        panel[0].fatal,
+        "a native init failure is Pi's fatal load-failure class"
+    );
 
     let fatal = runtime.diagnostics().await.iter().any(|d| {
-        d.severity == "error" && d.message.starts_with("Failed to load extension \"subagents\"")
+        d.severity == "error"
+            && d.message
+                .starts_with("Failed to load extension \"subagents\"")
     });
     assert!(fatal, "exit channel lost the failure");
 }
@@ -324,14 +385,21 @@ async fn the_failure_reaches_the_panel_and_the_exit_channel_together() {
 async fn a_clean_build_produces_no_fatal_diagnostic() {
     let fx = fixture();
     let reached = Arc::new(AtomicBool::new(false));
-    let factory = SessionFactory::new(faux(), base_config(&fx))
-        .with_native_extension(Arc::new(MarkerExt { id: "ok-ext", inited: reached.clone() })
+    let factory =
+        SessionFactory::new(faux(), base_config(&fx)).with_native_extension(Arc::new(MarkerExt {
+            id: "ok-ext",
+            inited: reached.clone(),
+        })
             as Arc<dyn NativeExtension>);
     let runtime = AgentSessionRuntime::create(Arc::new(factory), SessionTarget::New)
         .await
         .expect("build");
     assert!(reached.load(Ordering::SeqCst));
-    assert!(runtime.diagnostics().await.is_empty(), "{:?}", runtime.diagnostics().await);
+    assert!(
+        runtime.diagnostics().await.is_empty(),
+        "{:?}",
+        runtime.diagnostics().await
+    );
 }
 
 /// A corrupt on-disk (wasm) extension in the GLOBAL, pre-trust root is the same fatal class — Pi's
@@ -346,10 +414,12 @@ async fn a_corrupt_disk_extension_is_fatal_too() {
 
     let mut cfg = base_config(&fx);
     cfg.no_extensions = false; // the global root is only scanned when extensions are enabled
-    let runtime =
-        AgentSessionRuntime::create(Arc::new(SessionFactory::new(faux(), cfg)), SessionTarget::New)
-            .await
-            .expect("a corrupt extension must not abort the build either");
+    let runtime = AgentSessionRuntime::create(
+        Arc::new(SessionFactory::new(faux(), cfg)),
+        SessionTarget::New,
+    )
+    .await
+    .expect("a corrupt extension must not abort the build either");
 
     let diags = runtime.diagnostics().await;
     let hit = diags
@@ -376,15 +446,24 @@ async fn an_untrusted_project_extension_is_reported_but_never_fatal() {
     let mut cfg = base_config(&fx);
     cfg.no_extensions = false;
     cfg.trust_override = Some(false); // an untrusted project
-    let runtime =
-        AgentSessionRuntime::create(Arc::new(SessionFactory::new(faux(), cfg)), SessionTarget::New)
-            .await
-            .expect("build");
+    let runtime = AgentSessionRuntime::create(
+        Arc::new(SessionFactory::new(faux(), cfg)),
+        SessionTarget::New,
+    )
+    .await
+    .expect("build");
 
     let session = runtime.session().await;
     let panel = &session.services().startup_diagnostics.extensions;
-    assert_eq!(panel.len(), 1, "the skip must still be reported in the panel: {panel:?}");
-    assert!(!panel[0].fatal, "the trust-gate skip is not Pi's load-failure class");
+    assert_eq!(
+        panel.len(),
+        1,
+        "the skip must still be reported in the panel: {panel:?}"
+    );
+    assert!(
+        !panel[0].fatal,
+        "the trust-gate skip is not Pi's load-failure class"
+    );
     assert!(
         panel[0].error.contains("untrusted"),
         "expected the trust-gate error, got {:?}",

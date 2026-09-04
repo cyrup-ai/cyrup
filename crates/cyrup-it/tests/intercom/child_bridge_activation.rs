@@ -29,13 +29,17 @@
 //! make `cargo test -p cyrup-it --features it` SKIP this test in silence — the invisible-skip
 //! failure mode the whole `required-features` gate exists to prevent.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-
 
 use cyrup_core::{CancelToken, ModelId};
 use cyrup_ext_subagents::background::RunId;
@@ -48,10 +52,10 @@ use cyrup_ext_subagents::fork_context::ForkContext;
 use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::spawn::depth::DepthEnvelope;
 
+use crate::common::registration;
 use cyrup_intercom::transport::client::{InboundEvent, IntercomClient, SendOptions};
 use cyrup_intercom::transport::protocol::{Message, SessionInfo};
 use cyrup_intercom::transport::spawn::wait_for_broker;
-use crate::common::registration;
 
 fn child_fixture_path() -> PathBuf {
     crate::support::bins::intercom_child_fixture()
@@ -95,6 +99,7 @@ fn base_agent_config(model: &str) -> AgentConfig {
     AgentConfig {
         name: "worker".to_string(),
         model: Some(ModelId::from(model)),
+        model_provider: None,
         fallback_models: Vec::new(),
         thinking: None,
         system_prompt_mode: SystemPromptMode::Replace,
@@ -109,12 +114,19 @@ fn base_agent_config(model: &str) -> AgentConfig {
         completion_guard: Some(false),
         max_output: OutputCap::default(),
         max_subagent_depth: None,
-        depth: DepthEnvelope { current_depth: 0, max_depth: 5 },
+        depth: DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        },
         // Added when the agent-definition fields landed (G95 `memory:`, G89 `toolBudget:`); this
         // fixture declares neither, which is the same as an agent file omitting them.
         memory: None,
         tool_budget: None,
-        runner: None, // SUBA-074: the native child, as before
+        runner: None,          // SUBA-074: the native child, as before
+        acceptance_role: None, // SUBA-082: no declared role, the name decides
+        default_acceptance: None,
+        exclude_tools: Vec::new(), // SUBA-092: no exclusions (this literal predates the field)
+        allow_nested_subagents: None,
     }
 }
 
@@ -161,7 +173,10 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
         runtime_cwd: None,
         include_progress: None,
         agent_scope: None,
-        acceptance: Some(AcceptanceContract::explicit(AcceptanceStatus::NotRequired, vec![])),
+        acceptance: Some(AcceptanceContract::explicit(
+            AcceptanceStatus::NotRequired,
+            vec![],
+        )),
         fork_context: ForkContext::fresh(),
         live_events: None,
         parent_session_id: None,
@@ -178,9 +193,14 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     }
 }
 
+/// The per-attempt raw-stdout tee `exec::run_sync` wrote for the child that ran in `child_cwd` —
+/// `<attempt_scratch_dir(child_cwd)>/attempt-0.jsonl` (SUBA-072: under the crate's run-scratch
+/// root, keyed by cwd, never under the project tree).
 fn read_attempt_tee(child_cwd: &Path) -> String {
-    std::fs::read_to_string(child_cwd.join(".cyrup-subagent-scratch").join("attempt-0.jsonl"))
-        .unwrap_or_default()
+    std::fs::read_to_string(
+        cyrup_ext_subagents::background::attempt_scratch_dir(child_cwd).join("attempt-0.jsonl"),
+    )
+    .unwrap_or_default()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -245,7 +265,10 @@ async fn production_spawned_child_registers_on_the_broker_and_round_trips_with_i
 
     let agent = base_agent_config("fixture-model"); // persona name = "worker"
     let mut opts = base_run_options(work.path(), "fixture-model");
-    opts.spawn_command = Some(SpawnCommand { binary: child_fixture_path(), base_args: Vec::new() });
+    opts.spawn_command = Some(SpawnCommand {
+        binary: child_fixture_path(),
+        base_args: Vec::new(),
+    });
     opts.child_env = spawn_env(&child_fixture_path(), agent_dir.path());
     opts.orchestrator_intercom_target = Some(orchestrator_target.to_string());
     opts.run_id = Some(RunId::from_token("run-bridge01"));
@@ -273,7 +296,11 @@ async fn production_spawned_child_registers_on_the_broker_and_round_trips_with_i
          got {from:?}",
     );
     // (2) It addressed THIS supervisor with a reply-expecting ask carrying its run/agent identity.
-    assert_eq!(ask.expects_reply, Some(true), "the child's ask must record an ask edge: {ask:?}");
+    assert_eq!(
+        ask.expects_reply,
+        Some(true),
+        "the child's ask must record an ask edge: {ask:?}"
+    );
     assert!(
         ask.content.text.contains("run-bridge01") && ask.content.text.contains("worker"),
         "the child's ask body must carry its production-set run/agent identity: {}",

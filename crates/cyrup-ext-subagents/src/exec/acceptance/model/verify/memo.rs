@@ -3,10 +3,13 @@
 
 use std::path::{Path, PathBuf};
 
-
-use super::super::types::{AcceptanceVerifyCommand, AcceptanceVerifyResult, VerifyWorkspaceKind, VerifyWorkspaceState};
+use super::super::types::{
+    AcceptanceVerifyCommand, AcceptanceVerifyResult, VerifyWorkspaceKind, VerifyWorkspaceState,
+};
 use super::super::verify::redact::effective_verify_env;
-use super::super::verify::run::{resolve_verify_cwd, run_verify_command_with_cancel, DEFAULT_VERIFY_TIMEOUT_MS};
+use super::super::verify::run::{
+    DEFAULT_VERIFY_TIMEOUT_MS, resolve_verify_cwd, run_verify_command_with_cancel,
+};
 
 // --------------------------------------------------------------------------------------------
 // G80: per-workspace memoization of verify results (acceptance.ts:1032-1132)

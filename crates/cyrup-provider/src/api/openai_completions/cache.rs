@@ -5,7 +5,10 @@ use crate::stream::CacheRetention;
 use serde_json::{Map, Value, json};
 
 /// Anthropic-style ephemeral cache-control marker (Pi `getCompatCacheControl`).
-pub(super) fn compat_cache_control(compat: &ResolvedCompat, cache: CacheRetention) -> Option<Value> {
+pub(super) fn compat_cache_control(
+    compat: &ResolvedCompat,
+    cache: CacheRetention,
+) -> Option<Value> {
     if compat.cache_control_format != Some(CacheControlFormat::Anthropic)
         || cache == CacheRetention::None
     {

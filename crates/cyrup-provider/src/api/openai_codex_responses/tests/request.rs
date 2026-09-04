@@ -127,7 +127,8 @@ fn named_function_tool_choice_falls_back_to_auto() {
         &so,
         &codex,
         None,
-    ).unwrap();
+    )
+    .unwrap();
     assert_eq!(body["tool_choice"], json!("auto"));
 }
 
@@ -206,4 +207,3 @@ fn reasoning_summary_option_overrides_auto() {
     let body = build_request_body(&model, &Context::default(), &so, &codex, None).unwrap();
     assert_eq!(body["reasoning"]["summary"], json!("detailed"));
 }
-

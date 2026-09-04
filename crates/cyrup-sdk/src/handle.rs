@@ -41,7 +41,9 @@ impl Session {
     /// session's self-handle (via `into_shared`) so the post-run execution loop — auto-retry,
     /// post-run auto-compaction, queued continuations — actually fires from a completed turn.
     pub(crate) fn new(inner: AgentSession) -> Self {
-        Self { inner: inner.into_shared() }
+        Self {
+            inner: inner.into_shared(),
+        }
     }
 
     /// Borrow the underlying facade for any method not surfaced here (escape hatch).
@@ -193,10 +195,7 @@ impl Session {
     /// let _accepted = session.prompt_accepted("go").await?;
     /// # Ok(()) }
     /// ```
-    pub async fn prompt_accepted(
-        &self,
-        input: impl Into<UserInput>,
-    ) -> SdkResult<PromptAccepted> {
+    pub async fn prompt_accepted(&self, input: impl Into<UserInput>) -> SdkResult<PromptAccepted> {
         Ok(self.inner.prompt_accepted(input).await?)
     }
 

@@ -26,7 +26,12 @@
 //! point the dispatcher drives at runtime. The context is headless (`has_ui == false`) and this is not
 //! a subagent, so an unresolved `ask` fail-CLOSES to `Block`: the outcome is a clean readout of the
 //! resolved permission state.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -71,8 +76,7 @@ async fn ext_with(
     if let Some(body) = approvals {
         write(&agent_dir.join(APPROVALS_FILE), body);
     }
-    let ext =
-        PermissionSystemExtension::new(agent_dir.to_path_buf(), agent_dir.to_path_buf());
+    let ext = PermissionSystemExtension::new(agent_dir.to_path_buf(), agent_dir.to_path_buf());
     ext.set_host_services(Arc::new(RegistryServices));
     let mut api = InitApi::new();
     ext.init(&mut api).await.unwrap();
@@ -115,7 +119,12 @@ async fn on_disk_allow_no_longer_promotes_an_ask_to_allow() {
     )
     .await;
 
-    let out = ext.on_event(&bash_call("call-1", "git status"), &ctx(agent_dir.to_path_buf())).await;
+    let out = ext
+        .on_event(
+            &bash_call("call-1", "git status"),
+            &ctx(agent_dir.to_path_buf()),
+        )
+        .await;
     assert!(
         matches!(out, HookOutcome::Block { .. }),
         "a hand-authored {APPROVALS_FILE} must NOT auto-allow a policy-`ask` command — the \
@@ -143,7 +152,12 @@ async fn on_disk_deny_no_longer_overrides_a_config_allow() {
     )
     .await;
 
-    let out = ext.on_event(&bash_call("call-2", "git status"), &ctx(agent_dir.to_path_buf())).await;
+    let out = ext
+        .on_event(
+            &bash_call("call-2", "git status"),
+            &ctx(agent_dir.to_path_buf()),
+        )
+        .await;
     assert!(
         matches!(out, HookOutcome::Noop),
         "a hand-authored {APPROVALS_FILE} must NOT override the operator's own `allow` rule; \
@@ -166,7 +180,10 @@ async fn config_rule_still_decides_when_no_approvals_file_exists() {
     let allow_dir = tempfile::tempdir().unwrap();
     let allowed = ext_with(allow_dir.path(), r#"{ "bash": { "*": "allow" } }"#, None).await;
     let allow_out = allowed
-        .on_event(&bash_call("call-3", "git status"), &ctx(allow_dir.path().to_path_buf()))
+        .on_event(
+            &bash_call("call-3", "git status"),
+            &ctx(allow_dir.path().to_path_buf()),
+        )
         .await;
     assert!(
         matches!(allow_out, HookOutcome::Noop),
@@ -177,7 +194,10 @@ async fn config_rule_still_decides_when_no_approvals_file_exists() {
     let ask_dir = tempfile::tempdir().unwrap();
     let asking = ext_with(ask_dir.path(), r#"{ "bash": { "*": "ask" } }"#, None).await;
     let ask_out = asking
-        .on_event(&bash_call("call-4", "git status"), &ctx(ask_dir.path().to_path_buf()))
+        .on_event(
+            &bash_call("call-4", "git status"),
+            &ctx(ask_dir.path().to_path_buf()),
+        )
         .await;
     assert!(
         matches!(ask_out, HookOutcome::Block { .. }),
@@ -200,7 +220,12 @@ async fn no_approvals_file_is_ever_written() {
     let agent_dir = dir.path();
     let ext = ext_with(agent_dir, r#"{ "bash": { "*": "ask" } }"#, None).await;
 
-    let _ = ext.on_event(&bash_call("call-5", "git status"), &ctx(agent_dir.to_path_buf())).await;
+    let _ = ext
+        .on_event(
+            &bash_call("call-5", "git status"),
+            &ctx(agent_dir.to_path_buf()),
+        )
+        .await;
 
     assert!(
         !agent_dir.join(APPROVALS_FILE).exists(),

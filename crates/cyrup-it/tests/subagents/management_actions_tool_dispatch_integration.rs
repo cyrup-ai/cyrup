@@ -17,16 +17,13 @@
 
 use std::sync::Arc;
 
-
-use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::extension::SubagentsExtension;
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 use cyrup_test_support::harness::{HarnessOptions, create_harness_with_extensions};
 use cyrup_test_support::response::FauxResponse;
 
-fn tool_results(
-    events: &[cyrup_session_svc::AgentSessionEvent],
-) -> Vec<(String, String, bool)> {
+fn tool_results(events: &[cyrup_session_svc::AgentSessionEvent]) -> Vec<(String, String, bool)> {
     events
         .iter()
         .filter_map(|e| match e {
@@ -56,7 +53,10 @@ async fn a_model_can_disable_then_enable_an_agent_through_the_live_subagent_tool
     )
     .unwrap();
     let user_settings = user_agents.join("settings.json");
-    assert!(!user_settings.exists(), "precondition: no settings file yet");
+    assert!(
+        !user_settings.exists(),
+        "precondition: no settings file yet"
+    );
 
     // This run names its own root: `roots` reaches the user-scope discovery roots and the
     // user `settings.json` path through `SubagentExecutor::discovery_config`, which the management

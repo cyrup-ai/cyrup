@@ -45,8 +45,11 @@ pub const MISSION_STATUSES: [MissionStatus; 7] = [
 
 /// The three statuses `store.ts:38`'s `TERMINAL_MISSION_STATUSES` treats as terminal — a mission in
 /// one of these is eligible for retention pruning and is never advanced by a later run's status.
-pub const TERMINAL_MISSION_STATUSES: [MissionStatus; 3] =
-    [MissionStatus::Completed, MissionStatus::Failed, MissionStatus::Cancelled];
+pub const TERMINAL_MISSION_STATUSES: [MissionStatus; 3] = [
+    MissionStatus::Completed,
+    MissionStatus::Failed,
+    MissionStatus::Cancelled,
+];
 
 /// pi `MissionStatus` (`missions/types.ts:11`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -684,7 +687,21 @@ pub enum MissionGoalUpdate {
     Set(MissionGoal),
 }
 
-/// pi `MissionUpdateInput` (`missions/types.ts:143-157`).
+/// SUBA-085 — pi's inline `resolveDecision?: { id: string; resolution: string }`
+/// (`missions/types.ts:188` @v0.64.0, unchanged since it entered at v0.47.1 with
+/// `1dec33dd feat: add mission dispatch ledger`): the one mutation that can close an open
+/// [`MissionDecision`]. The store validates `id` by the mission-id rule and `resolution` as a
+/// non-empty string (`store.ts:497-508` @v0.64.0).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MissionDecisionResolution {
+    /// The decision's generated id, as `mission.show` rendered it.
+    pub id: String,
+    /// The chosen answer; stored trimmed.
+    pub resolution: String,
+}
+
+/// pi `MissionUpdateInput` (`missions/types.ts:174-190` @v0.64.0; `:143-157` @v0.43.0 before
+/// `resolveDecision` joined it).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MissionUpdateInput {
     /// Replace the title (trimmed).
@@ -712,6 +729,10 @@ pub struct MissionUpdateInput {
     pub add_artifacts: Vec<MissionArtifact>,
     /// Append decisions (always as NEW, open decisions with fresh ids).
     pub add_decisions: Vec<MissionDecisionInput>,
+    /// SUBA-085 — resolve ONE existing open decision by id (`missions/types.ts:188` @v0.64.0).
+    /// Applied AFTER `add_decisions` (`store.ts:497` @v0.64.0), so a decision appended and
+    /// resolved in the same update is reachable only by an id the caller cannot know yet.
+    pub resolve_decision: Option<MissionDecisionResolution>,
     /// Upsert receipts, keyed on `(kind, url)`; an existing receipt keeps its ORIGINAL
     /// `createdAt` (`store.ts:428`).
     pub add_receipts: Vec<MissionReceiptInput>,
@@ -734,6 +755,7 @@ impl MissionUpdateInput {
             && self.add_runs.is_empty()
             && self.add_artifacts.is_empty()
             && self.add_decisions.is_empty()
+            && self.resolve_decision.is_none()
             && self.add_receipts.is_empty()
     }
 }
@@ -768,8 +790,10 @@ mod tests {
 
     #[test]
     fn goal_status_serializes_budget_exhausted_with_a_hyphen() {
-        let json = serde_json::to_string(&MissionGoal { status: MissionGoalStatus::BudgetExhausted })
-            .unwrap();
+        let json = serde_json::to_string(&MissionGoal {
+            status: MissionGoalStatus::BudgetExhausted,
+        })
+        .unwrap();
         assert_eq!(json, r#"{"status":"budget-exhausted"}"#);
     }
 
@@ -820,14 +844,21 @@ mod tests {
         assert!(!json.contains("null"), "{json}");
         assert!(!json.contains("goal"), "{json}");
         // Field ORDER is load-bearing (see module docs): schemaVersion first, then id/title.
-        assert!(json.starts_with(r#"{"schemaVersion":1,"id":"m1","title":"t","objective":"o","status":"planned""#), "{json}");
+        assert!(
+            json.starts_with(
+                r#"{"schemaVersion":1,"id":"m1","title":"t","objective":"o","status":"planned""#
+            ),
+            "{json}"
+        );
     }
 
     #[test]
     fn update_input_is_empty_only_when_nothing_was_set() {
         assert!(MissionUpdateInput::default().is_empty());
-        let with_status =
-            MissionUpdateInput { status: Some(MissionStatus::Active), ..Default::default() };
+        let with_status = MissionUpdateInput {
+            status: Some(MissionStatus::Active),
+            ..Default::default()
+        };
         assert!(!with_status.is_empty());
         let with_receipt = MissionUpdateInput {
             add_receipts: vec![MissionReceiptInput {

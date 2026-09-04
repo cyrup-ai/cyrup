@@ -57,7 +57,12 @@ impl<B: Backend> App<B> {
                 // `tui.editor.pageUp` and `app.pageUp` exactly as it did before ADR-0005, and would
                 // still do so even if this block were reached with no alternate screen live.
                 if self.altscreen.is_some() {
-                    let App { altscreen, state, alt_keymap, .. } = self;
+                    let App {
+                        altscreen,
+                        state,
+                        alt_keymap,
+                        ..
+                    } = self;
                     // `document()` is passed rather than held: §B-10's prompt walk is its only
                     // reader, and the renderer owns no copy of the transcript (`altscreen/mod.rs`,
                     // rule 2).
@@ -151,8 +156,11 @@ impl<B: Backend> App<B> {
                 // the global-keymap tier — after the built-in bindings (so an extension can't shadow
                 // `Ctrl+D`/`Esc`) but before the editor (so the key never leaks in as text). The run
                 // loop dispatches the matched key-id to the session's extension host.
-                if let Some((_, spec)) =
-                    self.state.extension_shortcuts.iter().find(|(k, _)| k.matches(key))
+                if let Some((_, spec)) = self
+                    .state
+                    .extension_shortcuts
+                    .iter()
+                    .find(|(k, _)| k.matches(key))
                 {
                     return AppAction::ExtensionShortcut(spec.id.clone());
                 }
@@ -193,7 +201,12 @@ impl<B: Backend> App<B> {
             // that replacement.
             InputEvent::Mouse(m) => {
                 let area = match self.terminal.size() {
-                    Ok(s) => ratatui::layout::Rect { x: 0, y: 0, width: s.width, height: s.height },
+                    Ok(s) => ratatui::layout::Rect {
+                        x: 0,
+                        y: 0,
+                        width: s.width,
+                        height: s.height,
+                    },
                     Err(_) => return AppAction::None,
                 };
                 let Some(alt) = self.altscreen.as_mut() else {
@@ -455,13 +468,11 @@ impl<B: Backend> App<B> {
                 // otherwise leave the view unchanged AND compute the same `hidden` again on the
                 // next press — a key that toggles nothing, twice.
                 self.state.set_hide_thinking(hidden);
-                self.state
-                    .transcript
-                    .push_status(if hidden {
-                        "Thinking blocks: hidden"
-                    } else {
-                        "Thinking blocks: visible"
-                    });
+                self.state.transcript.push_status(if hidden {
+                    "Thinking blocks: hidden"
+                } else {
+                    "Thinking blocks: visible"
+                });
                 AppAction::Command(AppCommand::ApplySetting {
                     id: "hideThinkingBlock".to_string(),
                     value: hidden.to_string(),
@@ -476,9 +487,7 @@ impl<B: Backend> App<B> {
             // ship with `defaultKeys: []` (`core/keybindings.ts:115-118`): reachable only from a
             // user's `keybindings.json`, which is precisely the case that used to be silent.
             Action::SessionNew => AppAction::Command(AppCommand::NewSession),
-            Action::SessionTree => {
-                AppAction::Command(AppCommand::OpenSelector(SelectorKind::Tree))
-            }
+            Action::SessionTree => AppAction::Command(AppCommand::OpenSelector(SelectorKind::Tree)),
             Action::SessionFork => {
                 AppAction::Command(AppCommand::OpenSelector(SelectorKind::UserMessage))
             }
@@ -491,7 +500,9 @@ impl<B: Backend> App<B> {
     /// Route one key to the topmost floating overlay (spec/tui/05 §2 step 2). `Close` pops it; any
     /// other outcome stays open and redraws. A no-op when the stack is empty.
     fn handle_overlay_key(&mut self, key: &event::KeyEvent) -> AppAction {
-        let Some(top) = self.state.overlays.last_mut() else { return AppAction::None };
+        let Some(top) = self.state.overlays.last_mut() else {
+            return AppAction::None;
+        };
         match top.handle(key) {
             OverlayOutcome::Close => {
                 self.state.overlays.pop();

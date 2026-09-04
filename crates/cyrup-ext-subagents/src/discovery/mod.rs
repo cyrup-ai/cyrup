@@ -66,15 +66,16 @@
 //! exclusion to duplicate at the package/builtin tiers, because they route through the same walk
 //! function as User/Project.
 
-pub mod types;
-pub mod frontmatter;
-pub(crate) mod package_name;
 pub mod agent_memory;
 pub mod chains;
+pub mod frontmatter;
 pub mod management;
-pub mod skills;
 pub mod merge;
+pub(crate) mod package_name;
+pub mod runtime_registry;
 pub mod settings_write;
+pub mod skills;
+pub mod types;
 
 use std::path::{Path, PathBuf};
 
@@ -85,8 +86,8 @@ use crate::error::SubagentError;
 use chains::{ChainScanResult, scan_chain_scopes};
 use management::{AgentVisibility, ChainVisibility};
 use types::{
-    AgentDefinition, AgentReadScope, AgentSource, ChainDefinition, ChainDiscoveryDiagnostic,
-    LayeredOverrideSettings, OverrideField, SubagentSettings,
+    AgentDefinition, AgentDiscoveryDiagnostic, AgentReadScope, AgentSource, ChainDefinition,
+    ChainDiscoveryDiagnostic, LayeredOverrideSettings, OverrideField, SubagentSettings,
 };
 
 /// Directory segment reserved for skill bundling (R-SA-007), excluded from agent-file discovery
@@ -257,8 +258,12 @@ pub fn read_project_root_resolution(
     };
     match subagents.get("projectRootResolution") {
         None => Ok(None),
-        Some(serde_json::Value::String(s)) if s == "nearest" => Ok(Some(ProjectRootResolution::Nearest)),
-        Some(serde_json::Value::String(s)) if s == "git-root" => Ok(Some(ProjectRootResolution::GitRoot)),
+        Some(serde_json::Value::String(s)) if s == "nearest" => {
+            Ok(Some(ProjectRootResolution::Nearest))
+        }
+        Some(serde_json::Value::String(s)) if s == "git-root" => {
+            Ok(Some(ProjectRootResolution::GitRoot))
+        }
         Some(_) => Err(SubagentError::MalformedSettings(format!(
             "Subagent settings in '{}' have invalid 'projectRootResolution'; expected 'nearest' or 'git-root'.",
             settings_path.display()
@@ -341,7 +346,11 @@ pub fn resolve_project_agent_read_dirs(project_root: &Path) -> Vec<PathBuf> {
     if legacy.is_dir() {
         dirs.push(legacy);
     }
-    dirs.push(project_root.join(PROJECT_CONFIG_DIR_SEGMENT).join(AGENTS_SUBDIR));
+    dirs.push(
+        project_root
+            .join(PROJECT_CONFIG_DIR_SEGMENT)
+            .join(AGENTS_SUBDIR),
+    );
     dirs
 }
 
@@ -350,7 +359,11 @@ pub fn resolve_project_agent_read_dirs(project_root: &Path) -> Vec<PathBuf> {
 /// from the project agents dir ([`CHAINS_SUBDIR`]).
 #[must_use]
 pub fn resolve_project_chain_read_dirs(project_root: &Path) -> Vec<PathBuf> {
-    vec![project_root.join(PROJECT_CONFIG_DIR_SEGMENT).join(CHAINS_SUBDIR)]
+    vec![
+        project_root
+            .join(PROJECT_CONFIG_DIR_SEGMENT)
+            .join(CHAINS_SUBDIR),
+    ]
 }
 
 /// User-scope agent read directories rooted at `home`, **lowest-precedence first** (pi
@@ -445,13 +458,15 @@ fn effective_agent_match<'a>(matches: &[&'a AgentDefinition]) -> Option<&'a Agen
     Some(best)
 }
 
-/// pi's `sourceRank` map (`agents.ts:504`).
+/// pi's `sourceRank` map (`agents.ts:504` @v0.43.0; `:687` @v0.64.0 adds `["runtime", 4]` —
+/// SUBA-084: a runtime agent outranks every on-disk tier in same-name resolution).
 fn source_rank(source: AgentSource) -> u8 {
     match source {
         AgentSource::Builtin => 0,
         AgentSource::Package => 1,
         AgentSource::User => 2,
         AgentSource::Project => 3,
+        AgentSource::Runtime => 4,
     }
 }
 
@@ -501,8 +516,10 @@ pub fn resolve_agent_name<'a>(
         ));
     }
 
-    let aliased: Vec<&AgentDefinition> =
-        agents.iter().filter(|a| a.aliases.iter().any(|al| al == raw)).collect();
+    let aliased: Vec<&AgentDefinition> = agents
+        .iter()
+        .filter(|a| a.aliases.iter().any(|al| al == raw))
+        .collect();
     if aliased.len() == 1
         && let Some(agent) = aliased.first().copied()
     {
@@ -522,7 +539,116 @@ pub fn resolve_agent_name<'a>(
 }
 
 fn join_match_names(matches: &[&AgentDefinition]) -> String {
-    matches.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")
+    matches
+        .iter()
+        .map(|a| a.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// pi `agentDefinitionPriority` (`agents.ts:259-262` @v0.64.0):
+/// `AGENT_SOURCE_PRIORITY[source] * 1_000_000 + (discoveryPriority ?? 0)`, over the same
+/// `builtin 0 · package 1 · user 2 · project 3 · runtime 4` map as [`source_rank`] (`:251-257`).
+/// NOT [`AgentSource::precedence_rank`], whose "lower wins" orientation is the inverse.
+fn agent_definition_priority(source: AgentSource, discovery_priority: Option<u32>) -> u64 {
+    u64::from(source_rank(source)) * 1_000_000 + u64::from(discovery_priority.unwrap_or(0))
+}
+
+/// SUBA-086 — the candidate set pi hands `findBlockingAgentDiagnostic` for a resolution outcome
+/// (`subagent-executor.ts:2337-2338`, `preflight.ts:264-266`, `slash-commands.ts:891-893`
+/// @v0.64.0):
+///
+/// ```text
+/// const resolved = resolveAgentName(name, agents);
+/// const candidates = resolved.error ? agents.filter((agent) => resolveAgentName(name, [agent]).agent) : resolved.agent;
+/// ```
+///
+/// `Found` → that one agent; `Ambiguous` (pi's `error`) → every agent the name resolves to on
+/// its own; `NotFound` → nothing. Shared by the delegation seams so they cannot drift.
+#[must_use]
+pub fn blocking_candidates<'a>(
+    name: &str,
+    agents: &'a [AgentDefinition],
+    resolution: &AgentNameResolution<'a>,
+) -> Vec<&'a AgentDefinition> {
+    match resolution {
+        AgentNameResolution::Found(agent) => vec![*agent],
+        AgentNameResolution::Ambiguous(_) => agents
+            .iter()
+            .filter(|agent| {
+                resolve_agent_name(name, std::slice::from_ref(*agent))
+                    .agent()
+                    .is_some()
+            })
+            .collect(),
+        AgentNameResolution::NotFound => Vec::new(),
+    }
+}
+
+/// SUBA-086 — does a malformed definition BLOCK `name`? Direct port of pi
+/// `findBlockingAgentDiagnostic` (`agents.ts:264-278` @v0.64.0; `:249-263` @v0.57.0, identical):
+///
+/// ```text
+/// const normalizedName = name.trim();
+/// let match;
+/// for (const diagnostic of diagnostics ?? []) {
+///   if ((diagnostic.runtimeName === normalizedName
+///       || (diagnostic.name === normalizedName && (!diagnostic.packageSpecified
+///           || diagnostic.runtimeName === undefined
+///           || agents.some((agent) => agent.name === diagnostic.runtimeName && agent.localName === diagnostic.name))))
+///       && (!match || agentDefinitionPriority(diagnostic) > agentDefinitionPriority(match))) {
+///     match = diagnostic;
+///   }
+/// }
+/// const highestPriority = Math.max(...agents.map(agentDefinitionPriority), -Infinity);
+/// return !agents.length || (match && agentDefinitionPriority(match) > highestPriority) ? match : undefined;
+/// ```
+///
+/// A diagnostic matches by runtime name, or by local name unless it declared a `package:` whose
+/// runtime name no candidate carries under that local name. The highest-priority match blocks
+/// only when NO candidate survived, or when it OUTRANKS every survivor — so a broken PROJECT
+/// `worker.md` blocks the valid builtin/user `worker` that would otherwise silently run in its
+/// place (the row's "wrong agent runs" case), while a broken USER copy under a valid PROJECT one
+/// stays a listing-only diagnostic. `candidates` is [`blocking_candidates`]' output (or a
+/// management `find_agents` match set); [`AgentDefinition`] carries no `discoveryPriority`, so
+/// its side of the comparison is source rank alone (see
+/// [`AgentDiscoveryDiagnostic::discovery_priority`]).
+#[must_use]
+pub fn find_blocking_agent_diagnostic<'d>(
+    name: &str,
+    candidates: &[&AgentDefinition],
+    diagnostics: &'d [AgentDiscoveryDiagnostic],
+) -> Option<&'d AgentDiscoveryDiagnostic> {
+    let normalized = name.trim();
+    let diagnostic_priority =
+        |d: &AgentDiscoveryDiagnostic| agent_definition_priority(d.source, d.discovery_priority);
+    let mut best: Option<&'d AgentDiscoveryDiagnostic> = None;
+    for diagnostic in diagnostics {
+        let by_runtime_name = diagnostic.runtime_name.as_deref() == Some(normalized);
+        let by_local_name = diagnostic.name.as_deref() == Some(normalized)
+            && (!diagnostic.package_specified
+                || diagnostic.runtime_name.is_none()
+                || candidates.iter().any(|agent| {
+                    Some(agent.name.as_str()) == diagnostic.runtime_name.as_deref()
+                        && Some(agent.local_name.as_str()) == diagnostic.name.as_deref()
+                }));
+        if (by_runtime_name || by_local_name)
+            && best.is_none_or(|current| {
+                diagnostic_priority(diagnostic) > diagnostic_priority(current)
+            })
+        {
+            best = Some(diagnostic);
+        }
+    }
+    let highest = candidates
+        .iter()
+        .map(|agent| agent_definition_priority(agent.source, None))
+        .max();
+    match (highest, best) {
+        (None, _) => best,
+        (Some(highest), Some(found)) if diagnostic_priority(found) > highest => Some(found),
+        _ => None,
+    }
 }
 
 // -------------------------------------------------------------------------------------------
@@ -588,6 +714,17 @@ pub struct AgentDiscoveryConfig {
     /// problem to have already surfaced via [`read_subagent_settings_file`] /
     /// [`load_layered_override_settings`] before constructing a valid config.
     pub override_settings: LayeredOverrideSettings,
+    /// SUBA-084 — the in-process runtime agents (pi `listRuntimeAgentConfigs(pi)`,
+    /// `runtime-agent-registry.ts:404-406` @v0.64.0), already validated and stamped
+    /// [`AgentSource::Runtime`] by [`runtime_registry::RuntimeAgentRegistry::register`]. The
+    /// caller (normally `SubagentExecutor::discovery_config`) copies the executor-owned
+    /// registry's current list in here so [`run_discovery`] can merge it — the ONE seam every
+    /// discovery consumer shares, which is what makes a runtime agent reach tool routing, chains,
+    /// nested control, the management `list`, and `/subagents-doctor` alike (upstream wires
+    /// `mergeRuntimeAgents` into each of those separately: `extension/index.ts:528-546`,
+    /// `slash/slash-commands.ts:120-130`, `agents/agent-management.ts:132-141`). Empty (the
+    /// default) means no runtime agents and no extra work.
+    pub runtime_agents: Vec<AgentDefinition>,
 }
 
 impl AgentDiscoveryConfig {
@@ -664,7 +801,9 @@ pub fn parse_subagent_settings(
     // fails the whole struct with `invalid type: integer \`7\`, expected a string`, which names no
     // field and is useless for finding the offending line in a settings file.
     validate_default_thinking(value)?;
+    validate_default_provider(value)?;
     validate_default_extensions(value)?;
+    validate_override_default_providers(value)?;
     let mut settings: SubagentSettings = serde_json::from_value(value.clone())
         .map_err(|e| SubagentError::MalformedSettings(e.to_string()))?;
     // pi `readSubagentSettings` (`agents.ts:874-881`): `defaultModel` must be a NON-EMPTY string;
@@ -689,9 +828,24 @@ pub fn parse_subagent_settings(
             settings.default_thinking = Some(trimmed.to_string());
         }
     }
+    // SUBA-088 / pi `agents.ts:1150` @v0.64.0: `defaultProvider` is likewise stored trimmed, and
+    // so is each per-agent override's `defaultProvider` (`agents.ts:1088`).
+    if let Some(dp) = settings.default_provider.as_ref() {
+        let trimmed = dp.trim();
+        if trimmed.len() != dp.len() {
+            settings.default_provider = Some(trimmed.to_string());
+        }
+    }
+    for delta in settings.overrides.values_mut() {
+        if let OverrideField::Value(provider) = &delta.default_provider {
+            let trimmed = provider.trim();
+            if trimmed.len() != provider.len() {
+                delta.default_provider = OverrideField::Value(trimmed.to_string());
+            }
+        }
+    }
     if let Some(de) = settings.default_extensions.as_ref() {
-        settings.default_extensions =
-            Some(de.iter().map(|item| item.trim().to_string()).collect());
+        settings.default_extensions = Some(de.iter().map(|item| item.trim().to_string()).collect());
     }
     // pi `parseModelScopeConfig(subagentsObject.modelScope, { filePath })` (`agents.ts:731`):
     // `modelScope` is validated by its own parser (not serde's derive), so a malformed block
@@ -699,25 +853,29 @@ pub fn parse_subagent_settings(
     // field as `skip_deserializing`, so this is the ONLY place it is ever populated — before this,
     // serde's tolerance of unknown keys meant a configured `modelScope` was silently discarded and
     // the setting had no effect anywhere (SUBA-003).
-    settings.model_scope = crate::exec::model_scope::parse_model_scope_config(value.get("modelScope"))
-        .map_err(SubagentError::MalformedSettings)?;
+    settings.model_scope =
+        crate::exec::model_scope::parse_model_scope_config(value.get("modelScope"))
+            .map_err(SubagentError::MalformedSettings)?;
     // SUBA-078 / pi `agents.ts:1090-1096`: presence-gated, and the inner `parseThinkingLevel`
     // failure is SWALLOWED and replaced by this outer message — so the observable text is only ever
     // the one below. Note its Oxford `or max`, which differs from `parse_thinking_level`'s own
     // `…, xhigh, max.`; the two strings are not interchangeable.
     if let Some(raw) = value.get("maxThinking") {
         settings.max_thinking = Some(
-            crate::exec::thinking_ceiling::parse_thinking_level(raw.as_str(), "subagents.maxThinking")
-                .map_err(|_| {
-                    // The file path upstream interpolates is not in scope here — this function
-                    // takes only the raw `subagents` value — so this matches its SIBLING
-                    // `validate_default_thinking`, which drops the path for the same reason.
-                    SubagentError::MalformedSettings(
-                        "invalid 'maxThinking'; expected one of off, minimal, low, medium, high, \
+            crate::exec::thinking_ceiling::parse_thinking_level(
+                raw.as_str(),
+                "subagents.maxThinking",
+            )
+            .map_err(|_| {
+                // The file path upstream interpolates is not in scope here — this function
+                // takes only the raw `subagents` value — so this matches its SIBLING
+                // `validate_default_thinking`, which drops the path for the same reason.
+                SubagentError::MalformedSettings(
+                    "invalid 'maxThinking'; expected one of off, minimal, low, medium, high, \
                          xhigh, or max"
-                            .to_string(),
-                    )
-                })?,
+                        .to_string(),
+                )
+            })?,
         );
     }
     populate_override_tool_budgets(&mut settings, value)?;
@@ -772,7 +930,6 @@ fn populate_override_tool_budgets(
     Ok(())
 }
 
-
 /// pi `readSubagentSettings`'s `defaultThinking` gate (`agents.ts:882-889`):
 ///
 /// ```text
@@ -796,6 +953,65 @@ fn validate_default_thinking(subagents: &serde_json::Value) -> Result<(), Subage
     ))
 }
 
+/// SUBA-088 / pi `readSubagentSettings`'s `defaultProvider` gate (`agents.ts:1147-1153` @v0.64.0),
+/// the same shape as [`validate_default_thinking`]:
+///
+/// ```text
+/// if ("defaultProvider" in subagentsObject) {
+///   if (typeof ... === "string" && ....trim()) defaultProvider = ....trim();
+///   else throw new Error(`... have invalid 'defaultProvider'; expected a non-empty string.`);
+/// }
+/// ```
+///
+/// Presence-gated: `null`, a number, `false` and `"   "` all throw; only an absent key is silent.
+/// Before this gate existed the key deserialized into nothing and was dropped without a word.
+fn validate_default_provider(subagents: &serde_json::Value) -> Result<(), SubagentError> {
+    let Some(value) = subagents.get("defaultProvider") else {
+        return Ok(());
+    };
+    if value.as_str().is_some_and(|s| !s.trim().is_empty()) {
+        return Ok(());
+    }
+    Err(SubagentError::MalformedSettings(
+        "invalid 'defaultProvider'; expected a non-empty string".to_string(),
+    ))
+}
+
+/// SUBA-088 / pi `parseBuiltinOverride`'s `defaultProvider` arm (`agents.ts:1086-1089` @v0.64.0):
+///
+/// ```text
+/// if ("defaultProvider" in input) {
+///   if (input.defaultProvider === false) override.defaultProvider = false;
+///   else if (typeof input.defaultProvider === "string" && input.defaultProvider.trim()) override.defaultProvider = input.defaultProvider.trim();
+///   else throw new Error(`Builtin override '${name}' in '${filePath}' has invalid 'defaultProvider'; expected a non-empty string or false.`);
+/// }
+/// ```
+///
+/// Runs against the RAW object because serde's untagged [`OverrideField<String>`] would accept
+/// `""` as a `Value` and a `true` as an `ExplicitClear`, neither of which upstream admits. The file
+/// path upstream interpolates is not in scope here (this function takes only the raw `subagents`
+/// value), so it is dropped exactly as [`validate_default_thinking`] drops it; the agent name is
+/// kept so the offending entry is findable.
+fn validate_override_default_providers(subagents: &serde_json::Value) -> Result<(), SubagentError> {
+    let Some(entries) = subagents.get("agentOverrides").and_then(|v| v.as_object()) else {
+        return Ok(());
+    };
+    for (name, entry) in entries {
+        let Some(raw) = entry.get("defaultProvider") else {
+            continue;
+        };
+        let valid = raw == &serde_json::Value::Bool(false)
+            || raw.as_str().is_some_and(|s| !s.trim().is_empty());
+        if !valid {
+            return Err(SubagentError::MalformedSettings(format!(
+                "Builtin override '{name}' has invalid 'defaultProvider'; expected a non-empty \
+                 string or false."
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// pi `readSubagentSettings`'s `defaultExtensions` gate (`agents.ts:890-897`): the value must be an
 /// ARRAY whose every entry is a non-empty string. An EMPTY array is legal — pi's `.some(...)` guard
 /// passes vacuously — and means "no extensions", which is distinct from an absent key.
@@ -804,7 +1020,9 @@ fn validate_default_extensions(subagents: &serde_json::Value) -> Result<(), Suba
         return Ok(());
     };
     let ok = value.as_array().is_some_and(|items| {
-        items.iter().all(|item| item.as_str().is_some_and(|s| !s.trim().is_empty()))
+        items
+            .iter()
+            .all(|item| item.as_str().is_some_and(|s| !s.trim().is_empty()))
     });
     if ok {
         return Ok(());
@@ -855,10 +1073,9 @@ pub fn read_subagent_settings_file(path: &Path) -> Result<SubagentSettings, Suba
     parse_subagent_settings(subagents).map_err(|e| match e {
         // Prefix the originating file path so R-SA-009's surfaced error names the offending file
         // (pi includes the settings path in every malformed-settings message).
-        SubagentError::MalformedSettings(msg) => SubagentError::MalformedSettings(format!(
-            "settings file '{}': {msg}",
-            path.display()
-        )),
+        SubagentError::MalformedSettings(msg) => {
+            SubagentError::MalformedSettings(format!("settings file '{}': {msg}", path.display()))
+        }
         other => other,
     })
 }
@@ -869,7 +1086,7 @@ pub fn read_subagent_settings_file(path: &Path) -> Result<SubagentSettings, Suba
 /// `716-728`). Resolution (R-SA-012/R-SA-133):
 /// - per-agent `agentOverrides.<name>`: the **project** entry wins over a same-named **user** entry
 ///   (only one is ever applied to a given agent name);
-/// - `defaultModel` / `disableBuiltins` / `disableThinking`: the **project** value wins when
+/// - `defaultModel` / `defaultProvider` / `disableBuiltins` / `disableThinking`: the **project** value wins when
 ///   present, else the **user** value — so a project `disableBuiltins: false` re-enables what a user
 ///   `disableBuiltins: true` disabled, and a project `defaultModel` overrides a user one.
 ///
@@ -929,6 +1146,9 @@ fn resolve_layered_subagent_settings(
     SubagentSettings {
         overrides,
         default_model: project.default_model.or(user.default_model),
+        // SUBA-088 / pi `resolveSubagentDefaultProvider` (`agents.ts:1242-1249` @v0.64.0) —
+        // project-wins-outright, exactly like `defaultModel`.
+        default_provider: project.default_provider.or(user.default_provider),
         // pi `resolveSubagentDefaultThinking`/`resolveSubagentDefaultExtensions`
         // (`agents.ts:946-973`) — project-wins-outright, exactly like `defaultModel`.
         default_thinking: project.default_thinking.or(user.default_thinking),
@@ -986,32 +1206,52 @@ pub(crate) fn should_prune_discovery_dir(root: &Path, dir: &Path, dir_name: &str
     dir != root && is_discovery_nested_project_root(dir)
 }
 
+/// One tier's (or one directory's) agent-file scan: the definitions that parsed, plus SUBA-086's
+/// per-file diagnostics for the ones that did not — pi `loadAgentsFromDefinitionFiles`' return
+/// shape `{ agents: AgentConfig[]; diagnostics: AgentDiscoveryDiagnostic[] }` (`agents.ts:1959`
+/// @v0.64.0).
+#[derive(Debug, Default)]
+pub(crate) struct AgentFileScan {
+    pub(crate) agents: Vec<AgentDefinition>,
+    pub(crate) diagnostics: Vec<AgentDiscoveryDiagnostic>,
+}
+
+impl AgentFileScan {
+    fn extend(&mut self, other: AgentFileScan) {
+        self.agents.extend(other.agents);
+        self.diagnostics.extend(other.diagnostics);
+    }
+}
+
 /// Recursively walk `root` for agent `.md` files, alphabetical-by-filename, depth-first
 /// (R-SA-004), excluding any subtree rooted at a directory segment literally named
 /// [`SKILLS_DIR_SEGMENT`] (R-SA-007). Each file is parsed via
-/// [`frontmatter::parse_agent_file`], which itself silently skips a file missing `name`/
-/// `description` (R-SA-005) or bearing an invalid `package` identifier (R-SA-006) — this
-/// function simply omits a `None` result from its output, continuing the walk unaffected
-/// (R-SA-005's "discovery of other files MUST continue unaffected").
+/// [`frontmatter::parse_agent_file_checked`]: a file missing `name`/`description` is silently
+/// skipped (R-SA-005), and a file whose frontmatter fails validation is skipped AND recorded as
+/// an [`AgentDiscoveryDiagnostic`] (SUBA-086; pi's per-file catch, `agents.ts:2149-2151`
+/// @v0.64.0) — either way the walk continues unaffected (R-SA-005's "discovery of other files
+/// MUST continue unaffected").
 ///
-/// A `root` that does not exist (or is not readable) yields an empty `Vec`, not an error — an
+/// A `root` that does not exist (or is not readable) yields an empty scan, not an error — an
 /// absent scope directory is a normal, unconfigured-scope condition, not a malformed-discovery
 /// one (mirrors `discovery::chains::scan_chain_dir`'s identical convention).
 ///
 /// Returned in scan order (which, per R-SA-004, is exactly the order that determines same-scope
 /// collision winners once handed to `merge::reduce_last_seen_wins`/`reduce_first_seen_wins`).
-pub fn walk_agent_dir(root: &Path, source: AgentSource) -> Vec<AgentDefinition> {
-    let mut out = Vec::new();
+pub(crate) fn walk_agent_dir_checked(root: &Path, source: AgentSource) -> AgentFileScan {
+    let mut out = AgentFileScan::default();
     walk_agent_dir_into(root, root, source, &mut out);
     out
 }
 
-fn walk_agent_dir_into(
-    root: &Path,
-    dir: &Path,
-    source: AgentSource,
-    out: &mut Vec<AgentDefinition>,
-) {
+/// [`walk_agent_dir_checked`] with the diagnostics dropped — the pre-SUBA-086 shape, kept for
+/// callers that only want the parsed definitions.
+#[must_use]
+pub fn walk_agent_dir(root: &Path, source: AgentSource) -> Vec<AgentDefinition> {
+    walk_agent_dir_checked(root, source).agents
+}
+
+fn walk_agent_dir_into(root: &Path, dir: &Path, source: AgentSource, out: &mut AgentFileScan) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -1049,20 +1289,22 @@ fn walk_agent_dir_into(
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
-        if let Some(def) = frontmatter::parse_agent_file(&content, source, &path) {
-            out.push(def);
+        match frontmatter::parse_agent_file_checked(&content, source, &path) {
+            Ok(Some(def)) => out.agents.push(def),
+            Ok(None) => {}
+            Err(diagnostic) => out.diagnostics.push(diagnostic),
         }
     }
 }
 
 /// Walk multiple User/Project agent directories in fixed scan order, concatenating their
-/// per-directory [`walk_agent_dir`] results into one flat, scan-ordered `Vec` — the shape
+/// per-directory [`walk_agent_dir_checked`] results into one flat, scan-ordered scan — the shape
 /// `merge::reduce_last_seen_wins` expects for its own last-directory-scanned-wins reduction
 /// (R-SA-002).
-fn walk_agent_dirs(roots: &[PathBuf], source: AgentSource) -> Vec<AgentDefinition> {
-    let mut out = Vec::new();
+fn walk_agent_dirs(roots: &[PathBuf], source: AgentSource) -> AgentFileScan {
+    let mut out = AgentFileScan::default();
     for root in roots {
-        out.extend(walk_agent_dir(root, source));
+        out.extend(walk_agent_dir_checked(root, source));
     }
     out
 }
@@ -1083,16 +1325,18 @@ fn walk_agent_dirs(roots: &[PathBuf], source: AgentSource) -> Vec<AgentDefinitio
 /// crate's analog: a file entry is parsed directly; a directory entry is expanded via
 /// [`walk_agent_dir`] (R-SA-004/005/006/007 all apply uniformly to that expansion, since it is
 /// the exact same walk User/Project tiers use).
-fn expand_manifest_agent_entry(entry: &Path, source: AgentSource, out: &mut Vec<AgentDefinition>) {
+fn expand_manifest_agent_entry(entry: &Path, source: AgentSource, out: &mut AgentFileScan) {
     if entry.is_file() {
         let Ok(content) = std::fs::read_to_string(entry) else {
             return;
         };
-        if let Some(def) = frontmatter::parse_agent_file(&content, source, entry) {
-            out.push(def);
+        match frontmatter::parse_agent_file_checked(&content, source, entry) {
+            Ok(Some(def)) => out.agents.push(def),
+            Ok(None) => {}
+            Err(diagnostic) => out.diagnostics.push(diagnostic),
         }
     } else if entry.is_dir() {
-        out.extend(walk_agent_dir(entry, source));
+        out.extend(walk_agent_dir_checked(entry, source));
     }
     // A non-existent entry (dangling manifest declaration) is silently skipped — not this
     // function's place to surface a diagnostic (see `scan_package_agents`'s own doc for why
@@ -1124,13 +1368,18 @@ fn expand_manifest_agent_entry(entry: &Path, source: AgentSource, out: &mut Vec<
 /// failure is already surfaced as a warning for skills/prompts, so this crate does not duplicate
 /// that reporting for agents.
 pub fn scan_package_agents(cfg: &AgentDiscoveryConfig) -> Vec<AgentDefinition> {
+    scan_package_agents_checked(cfg).agents
+}
+
+/// [`scan_package_agents`] plus SUBA-086's per-file diagnostics.
+pub(crate) fn scan_package_agents_checked(cfg: &AgentDiscoveryConfig) -> AgentFileScan {
     let mut ordered: Vec<&InstalledPackage> = cfg.installed_packages.packages.iter().collect();
     ordered.sort_by_key(|p| match p.scope {
         InstallScope::Project => 0u8,
         InstallScope::Global => 1u8,
     });
 
-    let mut out = Vec::new();
+    let mut out = AgentFileScan::default();
     for pkg in ordered {
         if pkg.scope == InstallScope::Project && !cfg.trusted_project {
             continue;
@@ -1206,8 +1455,13 @@ pub fn scan_package_chain_scopes(cfg: &AgentDiscoveryConfig) -> Vec<(PathBuf, Ag
 /// not an error — an unconfigured builtin directory (e.g. a minimal test harness with no bundled
 /// personas) is a normal condition.
 pub fn scan_builtin_agents(cfg: &AgentDiscoveryConfig) -> Vec<AgentDefinition> {
+    scan_builtin_agents_checked(cfg).agents
+}
+
+/// [`scan_builtin_agents`] plus SUBA-086's per-file diagnostics.
+pub(crate) fn scan_builtin_agents_checked(cfg: &AgentDiscoveryConfig) -> AgentFileScan {
     let Some(dir) = cfg.builtin_agents_dir.as_ref() else {
-        return Vec::new();
+        return AgentFileScan::default();
     };
     let Ok(manifest) = resolve_manifest(dir) else {
         // A builtin directory that fails manifest resolution (e.g. no recognizable manifest
@@ -1217,7 +1471,7 @@ pub fn scan_builtin_agents(cfg: &AgentDiscoveryConfig) -> Vec<AgentDefinition> {
         // detecting a conventional `agents/` child dir; a directory that is itself already the
         // agents root (no `agents/` subdirectory of its own) falls through to this arm and is
         // walked directly below instead.
-        return walk_agent_dir(dir, AgentSource::Builtin);
+        return walk_agent_dir_checked(dir, AgentSource::Builtin);
     };
     if manifest.agents.is_empty() {
         // No manifest-declared `agents` entries resolved (including the "this directory has no
@@ -1225,9 +1479,9 @@ pub fn scan_builtin_agents(cfg: &AgentDiscoveryConfig) -> Vec<AgentDefinition> {
         // itself as the agents root directly, so a builtin_agents_dir pointing straight at a flat
         // directory of `.md` personas (the common case for this extension's own bundled
         // scout.md/worker.md/delegate.md) still discovers them without requiring a manifest.
-        return walk_agent_dir(dir, AgentSource::Builtin);
+        return walk_agent_dir_checked(dir, AgentSource::Builtin);
     }
-    let mut out = Vec::new();
+    let mut out = AgentFileScan::default();
     for agent_entry in &manifest.agents {
         expand_manifest_agent_entry(agent_entry, AgentSource::Builtin, &mut out);
     }
@@ -1255,6 +1509,12 @@ pub struct AgentDiscoveryResult {
     /// Non-fatal per-chain-file parse diagnostics (R-SA-009's diagnostic case) — never aborts
     /// discovery of sibling files.
     pub diagnostics: Vec<ChainDiscoveryDiagnostic>,
+    /// SUBA-086 — per-AGENT-file parse diagnostics (pi `agentDiagnostics`, `agents.ts:2670`
+    /// on the effective result and `:2705-2710` on `discoverAgentsAll` @v0.64.0), in tier scan
+    /// order builtin → package → user → project. Already narrowed by the requested
+    /// [`AgentReadScope`] the same way pi `discoveryDiagnostics(sources, scope)` (`:2651-2662`)
+    /// is: the tier a scope excludes is never walked here, so it contributes no diagnostic.
+    pub agent_diagnostics: Vec<AgentDiscoveryDiagnostic>,
     /// The effective `subagents.modelScope` policy for this discovery's cwd (pi `discoverAgents`'s
     /// own returned `modelScope`, `agents.ts:1738/1446`): project scope wins over user, `None` =
     /// no policy configured, so model-scope enforcement is off.
@@ -1281,14 +1541,24 @@ pub struct AgentDiscoveryResult {
 /// exposed, so the two can never disagree about what is on disk.
 #[must_use]
 pub fn scan_agent_tiers(cfg: &AgentDiscoveryConfig) -> merge::TieredAgents {
-    scan_agent_tiers_scoped(cfg, AgentReadScope::Both)
+    scan_agent_tiers_scoped(cfg, AgentReadScope::Both).0
 }
 
 /// The tier-scan step shared by [`run_discovery`] and [`scan_agent_tiers`] — see
 /// [`run_discovery`]'s doc for why `scope` narrows the User-vs-Project axis *inside* the scan.
-fn scan_agent_tiers_scoped(cfg: &AgentDiscoveryConfig, scope: AgentReadScope) -> merge::TieredAgents {
-    let builtin = scan_builtin_agents(cfg);
-    let package = scan_package_agents(cfg);
+/// The second element is SUBA-086's agent diagnostics across the scanned tiers, in tier order.
+fn scan_agent_tiers_scoped(
+    cfg: &AgentDiscoveryConfig,
+    scope: AgentReadScope,
+) -> (merge::TieredAgents, Vec<AgentDiscoveryDiagnostic>) {
+    let AgentFileScan {
+        agents: builtin,
+        diagnostics: builtin_diagnostics,
+    } = scan_builtin_agents_checked(cfg);
+    let AgentFileScan {
+        agents: package,
+        diagnostics: package_diagnostics,
+    } = scan_package_agents_checked(cfg);
     // Scope-filtered discovery (R-SA-013; pi `discoverAgents` + `mergeAgentsForScope`,
     // agents.ts:1752-1778, agent-selection.ts): narrow the User-vs-Project axis **within each
     // tier, BEFORE the merge** — never merge-all-then-filter. Zeroing the excluded tier's
@@ -1299,17 +1569,39 @@ fn scan_agent_tiers_scoped(cfg: &AgentDiscoveryConfig, scope: AgentReadScope) ->
     // always scanned (an `AgentReadScope` narrows only User-vs-Project, mirroring
     // `mergeAgentsForScope`, which always seeds the map with builtin+package then adds only the
     // in-scope User/Project agents).
-    let user = if scope == AgentReadScope::Project {
-        Vec::new()
+    let AgentFileScan {
+        agents: user,
+        diagnostics: user_diagnostics,
+    } = if scope == AgentReadScope::Project {
+        AgentFileScan::default()
     } else {
         walk_agent_dirs(&cfg.user_agent_dirs, AgentSource::User)
     };
-    let project = if scope == AgentReadScope::User {
-        Vec::new()
+    let AgentFileScan {
+        agents: project,
+        diagnostics: project_diagnostics,
+    } = if scope == AgentReadScope::User {
+        AgentFileScan::default()
     } else {
         walk_agent_dirs(&cfg.project_agent_dirs, AgentSource::Project)
     };
-    merge::TieredAgents { builtin, package, user, project }
+    // pi `discoveryDiagnostics` (`agents.ts:2651-2662` @v0.64.0) concatenates builtin, then the
+    // in-scope user/project tiers, then package; `buildAllDiscovery` (`:2705-2710`) goes
+    // builtin, user, package, project. Tier scan order is used here — the ORDER is only what
+    // `list`/doctor print, never what blocks (that is priority-ranked).
+    let mut diagnostics = builtin_diagnostics;
+    diagnostics.extend(package_diagnostics);
+    diagnostics.extend(user_diagnostics);
+    diagnostics.extend(project_diagnostics);
+    (
+        merge::TieredAgents {
+            builtin,
+            package,
+            user,
+            project,
+        },
+        diagnostics,
+    )
 }
 
 /// Run the shared walk-and-merge pipeline once: four-tier agent scan + merge + overrides
@@ -1325,7 +1617,7 @@ fn run_discovery(
     cfg: &AgentDiscoveryConfig,
     scope: AgentReadScope,
 ) -> Result<AgentDiscoveryResult, SubagentError> {
-    let tiers = scan_agent_tiers_scoped(cfg, scope);
+    let (tiers, agent_diagnostics) = scan_agent_tiers_scoped(cfg, scope);
     let merged = merge::discover_and_merge(tiers, &cfg.override_settings)?;
 
     let mut agents: Vec<AgentDefinition> = merged.into_values().collect();
@@ -1334,6 +1626,31 @@ fn run_discovery(
     // — mirrors `discovery::chains::scan_chain_dir`'s identical "sort by name before returning"
     // convention.
     agents.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // SUBA-084 — pi `discoverAgentsForRuntime` (`extension/index.ts:528-546` @v0.64.0): only
+    // when runtime agents exist (`listRuntimeAgentConfigs(pi).length === 0` short-circuits to
+    // plain discovery), re-snapshot EVERY on-disk tier at `Both` scope — `configuredAgents =
+    // [...all.builtin, ...all.package, ...all.user, ...all.project]` regardless of the requested
+    // `scope` — and merge the runtime agents against that full set, so a configured agent hidden
+    // by scope narrowing (or shadowed by a higher tier) still blocks a colliding runtime agent
+    // (`runtime-agent-registration.test.ts:331-366`). Runtime agents are APPENDED after the
+    // merged, sorted result (`runtime-agent-registry.ts:428`), never ranked into it. Upstream's
+    // `maxThinking` re-stamp (`:540-545`) has no counterpart here: cyrup carries the ceiling on
+    // the RESULT (`max_thinking` below, SUBA-078), not on each agent.
+    if !cfg.runtime_agents.is_empty() {
+        // The collision snapshot's own diagnostics are NOT surfaced: they duplicate the scoped
+        // scan's (or belong to a tier the requested scope excludes), exactly as upstream's
+        // `discoverAgentsForRuntime` re-snapshot feeds only `configuredAgents`.
+        let (all, _) = scan_agent_tiers_scoped(cfg, AgentReadScope::Both);
+        let mut configured: Vec<AgentDefinition> = Vec::with_capacity(
+            all.builtin.len() + all.package.len() + all.user.len() + all.project.len(),
+        );
+        configured.extend(all.builtin);
+        configured.extend(all.package);
+        configured.extend(all.user);
+        configured.extend(all.project);
+        runtime_registry::merge_runtime_agents(&cfg.runtime_agents, &mut agents, &configured)?;
+    }
 
     let mut chain_scopes: Vec<(PathBuf, AgentSource)> = Vec::new();
     // Package-scope chain scopes first (R-SA-020, chains-share-agents-dir), so a package-provided
@@ -1347,12 +1664,16 @@ fn run_discovery(
     for dir in &cfg.project_chain_dirs {
         chain_scopes.push((dir.clone(), AgentSource::Project));
     }
-    let ChainScanResult { chains, diagnostics } = scan_chain_scopes(&chain_scopes);
+    let ChainScanResult {
+        chains,
+        diagnostics,
+    } = scan_chain_scopes(&chain_scopes);
 
     Ok(AgentDiscoveryResult {
         agents,
         chains,
         diagnostics,
+        agent_diagnostics,
         // pi `discoverAgents` returns `{ agents, projectAgentsDir, modelScope }` (`agents.ts:1727-1781`)
         // — the effective policy travels WITH the discovery result so an execution path that
         // already discovered the agent does not have to re-read settings to learn the scope.
@@ -1375,7 +1696,9 @@ fn run_discovery(
 /// re-invoke this function before each mutating action rather than reusing a prior result — this
 /// function does not (and, holding no cache, cannot) enforce that on its own; it simply never
 /// violates it by never caching anything itself.
-pub fn discover_agents_all(cfg: &AgentDiscoveryConfig) -> Result<AgentDiscoveryResult, SubagentError> {
+pub fn discover_agents_all(
+    cfg: &AgentDiscoveryConfig,
+) -> Result<AgentDiscoveryResult, SubagentError> {
     // Management/introspection is always the full Both-scope view (pi `discoverAgentsAll` loads
     // every tier unconditionally, agents.ts:1783-1888); scope narrowing is a delegation-only
     // concern applied by `discover_agents`.
@@ -1459,6 +1782,10 @@ fn chain_run_precedence(source: AgentSource) -> u8 {
         AgentSource::Package => 1,
         AgentSource::User => 2,
         AgentSource::Project => 3,
+        // SUBA-084: no chain is ever runtime-sourced (the registry defines agents only), so
+        // this arm is unreachable in practice; it follows `agents.ts:687`'s ordering for
+        // totality.
+        AgentSource::Runtime => 4,
     }
 }
 
@@ -1498,9 +1825,8 @@ mod tests {
 
     #[test]
     fn resolve_extra_agent_dirs_is_empty_when_env_var_is_empty_string() {
-        let dirs = resolve_extra_agent_dirs(|key| {
-            (key == EXTRA_AGENT_DIRS_ENV_VAR).then(String::new)
-        });
+        let dirs =
+            resolve_extra_agent_dirs(|key| (key == EXTRA_AGENT_DIRS_ENV_VAR).then(String::new));
         assert!(dirs.is_empty());
     }
 
@@ -1555,7 +1881,11 @@ mod tests {
         let result = discover_agents(&cfg, None).expect("discovery succeeds");
         let scouts: Vec<&AgentDefinition> =
             result.agents.iter().filter(|a| a.name == "scout").collect();
-        assert_eq!(scouts.len(), 1, "the same-named agent must be deduped, not duplicated");
+        assert_eq!(
+            scouts.len(),
+            1,
+            "the same-named agent must be deduped, not duplicated"
+        );
         assert_eq!(
             scouts[0].description, "primary scout",
             "the user's own dir must win over an extra dir"
@@ -1707,8 +2037,18 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let user_chains = tmp.path().join("user-chains");
         let project_chains = tmp.path().join("project-chains");
-        write_json_chain(&user_chains, "release.chain.json", "release", "user release");
-        write_json_chain(&project_chains, "release.chain.json", "release", "project release");
+        write_json_chain(
+            &user_chains,
+            "release.chain.json",
+            "release",
+            "user release",
+        );
+        write_json_chain(
+            &project_chains,
+            "release.chain.json",
+            "release",
+            "project release",
+        );
 
         let cfg = AgentDiscoveryConfig {
             user_chain_dirs: vec![user_chains],
@@ -1782,7 +2122,12 @@ mod tests {
     #[test]
     fn walk_agent_dir_visits_nested_subdirectories() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        write_agent(&tmp.path().join("nested"), "deep.md", "deep", "nested agent");
+        write_agent(
+            &tmp.path().join("nested"),
+            "deep.md",
+            "deep",
+            "nested agent",
+        );
         write_agent(tmp.path(), "shallow.md", "shallow", "top-level agent");
 
         let discovered = walk_agent_dir(tmp.path(), AgentSource::User);
@@ -2005,7 +2350,70 @@ mod tests {
         // pi `agent-overrides.test.ts:215-229`: an empty `defaultModel` is malformed.
         let raw = serde_json::json!({ "defaultModel": "  " });
         let result = parse_subagent_settings(Some(&raw));
-        assert!(matches!(result, Err(SubagentError::MalformedSettings(msg)) if msg.contains("defaultModel")));
+        assert!(
+            matches!(result, Err(SubagentError::MalformedSettings(msg)) if msg.contains("defaultModel"))
+        );
+    }
+
+    /// SUBA-088 / pi `readSubagentSettings` (`agents.ts:1147-1153` @v0.64.0): `defaultProvider`
+    /// is presence-gated and must be a NON-EMPTY string; the stored value is trimmed.
+    #[test]
+    fn parse_subagent_settings_reads_and_trims_default_provider() {
+        let raw = serde_json::json!({ "defaultProvider": "  openai-codex " });
+        let settings = parse_subagent_settings(Some(&raw)).expect("valid settings parse");
+        assert_eq!(settings.default_provider.as_deref(), Some("openai-codex"));
+    }
+
+    /// SUBA-088 / pi `agents.ts:1152` @v0.64.0: a present-but-invalid `defaultProvider` (blank,
+    /// `null`, a number) ABORTS the read with upstream's message rather than being dropped.
+    #[test]
+    fn parse_subagent_settings_rejects_invalid_default_provider_with_upstreams_message() {
+        for raw in [
+            serde_json::json!({ "defaultProvider": "   " }),
+            serde_json::json!({ "defaultProvider": null }),
+            serde_json::json!({ "defaultProvider": 7 }),
+        ] {
+            let result = parse_subagent_settings(Some(&raw));
+            assert!(
+                matches!(&result, Err(SubagentError::MalformedSettings(msg))
+                    if msg == "invalid 'defaultProvider'; expected a non-empty string"),
+                "expected upstream's defaultProvider diagnostic for {raw}, got {result:?}"
+            );
+        }
+    }
+
+    /// SUBA-088 / pi `parseBuiltinOverride` (`agents.ts:1086-1089` @v0.64.0): a per-agent
+    /// `defaultProvider` override is a non-empty string (trimmed) or the literal `false`; anything
+    /// else aborts the read with upstream's message, which names the offending agent.
+    #[test]
+    fn parse_subagent_settings_validates_override_default_provider() {
+        let ok = serde_json::json!({
+            "agentOverrides": {
+                "worker": { "defaultProvider": " openai-codex " },
+                "reviewer": { "defaultProvider": false }
+            }
+        });
+        let settings = parse_subagent_settings(Some(&ok)).expect("valid override parse");
+        assert_eq!(
+            settings.overrides["worker"].default_provider,
+            OverrideField::Value("openai-codex".to_string())
+        );
+        assert_eq!(
+            settings.overrides["reviewer"].default_provider,
+            OverrideField::ExplicitClear
+        );
+        for bad in [
+            serde_json::json!({ "agentOverrides": { "worker": { "defaultProvider": "" } } }),
+            serde_json::json!({ "agentOverrides": { "worker": { "defaultProvider": true } } }),
+            serde_json::json!({ "agentOverrides": { "worker": { "defaultProvider": 3 } } }),
+        ] {
+            let result = parse_subagent_settings(Some(&bad));
+            assert!(
+                matches!(&result, Err(SubagentError::MalformedSettings(msg))
+                    if msg == "Builtin override 'worker' has invalid 'defaultProvider'; expected a non-empty string or false."),
+                "expected upstream's override diagnostic for {bad}, got {result:?}"
+            );
+        }
     }
 
     #[test]
@@ -2014,7 +2422,10 @@ mod tests {
             "agentOverrides": { "reviewer": { "model": "openai/gpt-5.4" } }
         });
         let settings = parse_subagent_settings(Some(&raw)).expect("valid");
-        let reviewer = settings.overrides.get("reviewer").expect("reviewer override present");
+        let reviewer = settings
+            .overrides
+            .get("reviewer")
+            .expect("reviewer override present");
         assert_eq!(
             reviewer.model,
             crate::discovery::types::OverrideField::Value("openai/gpt-5.4".to_string())
@@ -2049,6 +2460,8 @@ mod tests {
                     "systemPrompt": "be terse",
                     "skills": ["tdd"],
                     "tools": "inherit",
+                    "excludeTools": ["bash"],
+                    "allowNestedSubagents": true,
                     "extensions": ["./ext/a.ts"],
                     "subagentOnlyExtensions": ["./ext/child.ts"],
                     "completionGuard": false,
@@ -2057,7 +2470,10 @@ mod tests {
             }
         });
         let settings = parse_subagent_settings(Some(&raw)).expect("all 22 pi override keys load");
-        let reviewer = settings.overrides.get("reviewer").expect("reviewer override");
+        let reviewer = settings
+            .overrides
+            .get("reviewer")
+            .expect("reviewer override");
 
         assert_eq!(
             reviewer.description,
@@ -2089,6 +2505,33 @@ mod tests {
             types::ToolsOverrideField::Inherit,
             "`tools: \"inherit\"` must LOAD (it used to abort the whole read) and be its own state"
         );
+        // SUBA-092 (`agents.ts:104-105` @v0.64.0): both keys used to be silently dropped — the
+        // struct had no slot to deserialize them into.
+        assert_eq!(
+            reviewer.exclude_tools,
+            OverrideField::Value(vec!["bash".to_string()])
+        );
+        assert_eq!(reviewer.allow_nested_subagents, OverrideField::Value(true));
+    }
+
+    /// SUBA-092 — `excludeTools: false` is pi's explicit clear (`parseOverrideStringArrayOrFalse`,
+    /// `agents.ts:921-926` @v0.64.0), and `allowNestedSubagents: false` is a real `Value(false)`
+    /// (a plain boolean with no clear form), never a clear.
+    #[test]
+    fn parse_subagent_settings_reads_the_suba092_false_shapes() {
+        let raw = serde_json::json!({
+            "agentOverrides": {
+                "reviewer": { "excludeTools": false, "allowNestedSubagents": false }
+            }
+        });
+        let settings = parse_subagent_settings(Some(&raw)).expect("loads");
+        let reviewer = settings
+            .overrides
+            .get("reviewer")
+            .expect("reviewer override");
+        assert_eq!(reviewer.exclude_tools, OverrideField::ExplicitClear);
+        assert_eq!(reviewer.allow_nested_subagents, OverrideField::Value(false));
+        assert!(!reviewer.is_empty());
     }
 
     /// The `false` explicit-clear shape of the four clearable SUBA-081 keys, and the `false`
@@ -2108,7 +2551,10 @@ mod tests {
             }
         });
         let settings = parse_subagent_settings(Some(&raw)).expect("clears load");
-        let reviewer = settings.overrides.get("reviewer").expect("reviewer override");
+        let reviewer = settings
+            .overrides
+            .get("reviewer")
+            .expect("reviewer override");
         assert_eq!(reviewer.output, OverrideField::ExplicitClear);
         assert_eq!(reviewer.default_reads, OverrideField::ExplicitClear);
         assert_eq!(reviewer.extensions, OverrideField::ExplicitClear);
@@ -2159,7 +2605,8 @@ mod tests {
                 "expected MalformedSettings, got {err:?}"
             );
             assert!(
-                err.to_string().contains("subagents.agentOverrides.reviewer.toolBudget"),
+                err.to_string()
+                    .contains("subagents.agentOverrides.reviewer.toolBudget"),
                 "the message must name the offending key: {err}"
             );
         }
@@ -2172,7 +2619,10 @@ mod tests {
             "disableBuiltins": true,
         });
         let settings = parse_subagent_settings(Some(&raw)).expect("valid settings parse");
-        assert_eq!(settings.default_model, Some("anthropic/claude-sonnet-4".to_string()));
+        assert_eq!(
+            settings.default_model,
+            Some("anthropic/claude-sonnet-4".to_string())
+        );
         assert_eq!(settings.disable_builtins, Some(true));
     }
 
@@ -2259,8 +2709,14 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let user = tmp.path().join("user/settings.json");
         let project = tmp.path().join("proj/settings.json");
-        write_settings(&user, serde_json::json!({ "subagents": { "disableBuiltins": true } }));
-        write_settings(&project, serde_json::json!({ "subagents": { "disableBuiltins": false } }));
+        write_settings(
+            &user,
+            serde_json::json!({ "subagents": { "disableBuiltins": true } }),
+        );
+        write_settings(
+            &project,
+            serde_json::json!({ "subagents": { "disableBuiltins": false } }),
+        );
 
         let resolved = load_layered_subagent_settings(&user, Some(&project)).expect("layer");
         assert_eq!(
@@ -2280,8 +2736,9 @@ mod tests {
     ) -> AgentDiscoveryConfig {
         write_agent(builtin_dir, "reviewer.md", "reviewer", "reviews things");
         write_agent(builtin_dir, "worker.md", "worker", "does work");
-        let override_settings = load_layered_override_settings(user_settings, Some(project_settings))
-            .expect("layered settings load");
+        let override_settings =
+            load_layered_override_settings(user_settings, Some(project_settings))
+                .expect("layered settings load");
         AgentDiscoveryConfig {
             builtin_agents_dir: Some(builtin_dir.to_path_buf()),
             override_settings,
@@ -2301,14 +2758,23 @@ mod tests {
                 "subagents": { "agentOverrides": { "reviewer": { "model": "openai/gpt-5.4" } } }
             }),
         );
-        let cfg = e2e_config_with_builtins_and_settings(&tmp.path().join("builtins"), &user, &project);
+        let cfg =
+            e2e_config_with_builtins_and_settings(&tmp.path().join("builtins"), &user, &project);
 
         let result = discover_agents(&cfg, None).expect("discovery");
-        let reviewer = result.agents.iter().find(|a| a.name == "reviewer").expect("reviewer present");
+        let reviewer = result
+            .agents
+            .iter()
+            .find(|a| a.name == "reviewer")
+            .expect("reviewer present");
         assert_eq!(reviewer.source, AgentSource::Builtin);
         assert_eq!(reviewer.model, Some("openai/gpt-5.4".into()));
         // A sibling builtin the override never named keeps its (absent) model.
-        let worker = result.agents.iter().find(|a| a.name == "worker").expect("worker present");
+        let worker = result
+            .agents
+            .iter()
+            .find(|a| a.name == "worker")
+            .expect("worker present");
         assert_eq!(worker.model, None);
     }
 
@@ -2317,15 +2783,30 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let user = tmp.path().join("user/settings.json");
         let project = tmp.path().join("proj/settings.json");
-        write_settings(&user, serde_json::json!({ "subagents": { "defaultModel": "deepseek-v4-flash" } }));
+        write_settings(
+            &user,
+            serde_json::json!({ "subagents": { "defaultModel": "deepseek-v4-flash" } }),
+        );
         write_settings(&project, serde_json::json!({}));
-        let cfg = e2e_config_with_builtins_and_settings(&tmp.path().join("builtins"), &user, &project);
+        let cfg =
+            e2e_config_with_builtins_and_settings(&tmp.path().join("builtins"), &user, &project);
 
         let result = discover_agents(&cfg, None).expect("discovery");
         for name in ["reviewer", "worker"] {
-            let a = result.agents.iter().find(|a| a.name == name).expect("present");
-            assert_eq!(a.model, Some("deepseek-v4-flash".into()), "{name} filled from defaultModel");
-            assert_eq!(a.model_source, Some(types::AgentModelSourceInfo::SettingsDefault));
+            let a = result
+                .agents
+                .iter()
+                .find(|a| a.name == name)
+                .expect("present");
+            assert_eq!(
+                a.model,
+                Some("deepseek-v4-flash".into()),
+                "{name} filled from defaultModel"
+            );
+            assert_eq!(
+                a.model_source,
+                Some(types::AgentModelSourceInfo::SettingsDefault)
+            );
         }
     }
 
@@ -2334,9 +2815,13 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let user = tmp.path().join("user/settings.json");
         let project = tmp.path().join("proj/settings.json");
-        write_settings(&user, serde_json::json!({ "subagents": { "disableBuiltins": true } }));
+        write_settings(
+            &user,
+            serde_json::json!({ "subagents": { "disableBuiltins": true } }),
+        );
         write_settings(&project, serde_json::json!({}));
-        let cfg = e2e_config_with_builtins_and_settings(&tmp.path().join("builtins"), &user, &project);
+        let cfg =
+            e2e_config_with_builtins_and_settings(&tmp.path().join("builtins"), &user, &project);
 
         // Delegation view excludes disabled builtins entirely.
         let delegation = discover_agents(&cfg, None).expect("discovery");
@@ -2348,7 +2833,11 @@ mod tests {
 
         // Management view still lists them (so a user can re-enable), marked disabled.
         let mgmt = discover_agents_all(&cfg).expect("discovery-all");
-        let reviewer = mgmt.agents.iter().find(|a| a.name == "reviewer").expect("mgmt lists disabled");
+        let reviewer = mgmt
+            .agents
+            .iter()
+            .find(|a| a.name == "reviewer")
+            .expect("mgmt lists disabled");
         assert_eq!(reviewer.disabled, Some(true));
     }
 
@@ -2360,9 +2849,7 @@ mod tests {
         std::fs::create_dir_all(dir).expect("mkdir");
         std::fs::write(
             dir.join(file_name),
-            format!(
-                "---\nname: {name}\ndescription: d\ndisabled: {disabled}\n---\n\nBody\n"
-            ),
+            format!("---\nname: {name}\ndescription: d\ndisabled: {disabled}\n---\n\nBody\n"),
         )
         .expect("write agent file");
     }
@@ -2384,7 +2871,10 @@ mod tests {
         let result = discover_agents_all(&cfg).expect("discovery succeeds");
         let names: Vec<&str> = result.agents.iter().map(|a| a.name.as_str()).collect();
         assert!(names.contains(&"on-agent"));
-        assert!(names.contains(&"off-agent"), "management view must include disabled agents");
+        assert!(
+            names.contains(&"off-agent"),
+            "management view must include disabled agents"
+        );
     }
 
     #[test]
@@ -2475,7 +2965,12 @@ mod tests {
         let user_dir = tmp.path().join("user");
         let project_dir = tmp.path().join("project");
         write_agent(&user_dir, "reviewer.md", "reviewer", "the user reviewer");
-        write_agent(&project_dir, "reviewer.md", "reviewer", "the project reviewer");
+        write_agent(
+            &project_dir,
+            "reviewer.md",
+            "reviewer",
+            "the project reviewer",
+        );
 
         let cfg = AgentDiscoveryConfig {
             user_agent_dirs: vec![user_dir],
@@ -2504,8 +2999,11 @@ mod tests {
 
         // Both scope: project wins the merge (R-SA-001), a single deduped entry.
         let both_view = discover_agents(&cfg, Some(AgentReadScope::Both)).expect("discovery");
-        let reviewers: Vec<&AgentDefinition> =
-            both_view.agents.iter().filter(|a| a.name == "reviewer").collect();
+        let reviewers: Vec<&AgentDefinition> = both_view
+            .agents
+            .iter()
+            .filter(|a| a.name == "reviewer")
+            .collect();
         assert_eq!(reviewers.len(), 1);
         assert_eq!(reviewers[0].source, AgentSource::Project);
     }
@@ -2604,7 +3102,10 @@ mod tests {
             AgentSource::Builtin,
             "---\nname: worker\ndescription: Implementation agent\naliases: developer, coder, implementer, develop\n---\n\nBody\n",
         );
-        assert_eq!(agent.aliases, vec!["developer", "coder", "implementer", "develop"]);
+        assert_eq!(
+            agent.aliases,
+            vec!["developer", "coder", "implementer", "develop"]
+        );
 
         // trim + drop empties + de-duplicate (first occurrence wins) + drop the agent's own name.
         let messy = parsed_agent(
@@ -2635,7 +3136,11 @@ mod tests {
             AgentSource::Builtin,
             "---\nname: oracle\ndescription: d\naliases: advisor\nalias: seer\n---\n\nBody\n",
         );
-        assert_eq!(both.aliases, vec!["advisor"], "the plural key must win outright");
+        assert_eq!(
+            both.aliases,
+            vec!["advisor"],
+            "the plural key must win outright"
+        );
     }
 
     /// An unqualified `aliases:` on a PACKAGED agent is normalized against the RUNTIME name
@@ -2659,20 +3164,30 @@ mod tests {
                 AgentSource::Builtin,
                 "---\nname: oracle\ndescription: d\naliases: advisor\n---\n\nBody\n",
             ),
-            parsed_agent(AgentSource::Builtin, "---\nname: scout\ndescription: d\n---\n\nBody\n"),
+            parsed_agent(
+                AgentSource::Builtin,
+                "---\nname: scout\ndescription: d\n---\n\nBody\n",
+            ),
         ];
         let resolved = resolve_agent_name("advisor", &agents);
         assert_eq!(resolved.agent().map(|a| a.name.as_str()), Some("oracle"));
         // Whitespace around the request is trimmed (`agents.ts:512`).
         assert_eq!(
-            resolve_agent_name("  advisor  ", &agents).agent().map(|a| a.name.as_str()),
+            resolve_agent_name("  advisor  ", &agents)
+                .agent()
+                .map(|a| a.name.as_str()),
             Some("oracle")
         );
         assert_eq!(
-            resolve_agent_name("scout", &agents).agent().map(|a| a.name.as_str()),
+            resolve_agent_name("scout", &agents)
+                .agent()
+                .map(|a| a.name.as_str()),
             Some("scout")
         );
-        assert!(matches!(resolve_agent_name("nobody", &agents), AgentNameResolution::NotFound));
+        assert!(matches!(
+            resolve_agent_name("nobody", &agents),
+            AgentNameResolution::NotFound
+        ));
     }
 
     /// Stage 3 only runs when stage 2 matched NOTHING (`agents.ts:513-521`), so a real agent named
@@ -2684,10 +3199,15 @@ mod tests {
                 AgentSource::Builtin,
                 "---\nname: oracle\ndescription: d\naliases: advisor\n---\n\nBody\n",
             ),
-            parsed_agent(AgentSource::User, "---\nname: advisor\ndescription: d\n---\n\nBody\n"),
+            parsed_agent(
+                AgentSource::User,
+                "---\nname: advisor\ndescription: d\n---\n\nBody\n",
+            ),
         ];
         assert_eq!(
-            resolve_agent_name("advisor", &agents).agent().map(|a| a.name.as_str()),
+            resolve_agent_name("advisor", &agents)
+                .agent()
+                .map(|a| a.name.as_str()),
             Some("advisor"),
             "the exact-name stage must short-circuit before the alias stage"
         );
@@ -2713,12 +3233,16 @@ mod tests {
             ),
         ];
         assert_eq!(
-            resolve_agent_name("oracle", &agents).agent().map(|a| a.description.as_str()),
+            resolve_agent_name("oracle", &agents)
+                .agent()
+                .map(|a| a.description.as_str()),
             Some("project"),
             "project (rank 3) beats user (2) beats builtin (0)"
         );
         assert_eq!(
-            resolve_agent_name("advisor", &agents).agent().map(|a| a.description.as_str()),
+            resolve_agent_name("advisor", &agents)
+                .agent()
+                .map(|a| a.description.as_str()),
             Some("project"),
             "the same collapse applies on the ALIAS stage"
         );
@@ -2739,8 +3263,14 @@ mod tests {
             ),
         ];
         let resolved = resolve_agent_name("advisor", &agents);
-        assert!(resolved.agent().is_none(), "an ambiguous alias must resolve to nothing");
-        assert_eq!(resolved.error(), Some("Ambiguous agent alias 'advisor': oracle, seer"));
+        assert!(
+            resolved.agent().is_none(),
+            "an ambiguous alias must resolve to nothing"
+        );
+        assert_eq!(
+            resolved.error(),
+            Some("Ambiguous agent alias 'advisor': oracle, seer")
+        );
     }
 
     /// The same rule on the NAME stage, with pi's distinct `Ambiguous agent name` wording
@@ -2849,12 +3379,20 @@ mod tests {
             ..AgentDiscoveryConfig::default()
         };
         let result = discover_agents_all(&cfg).expect("discovery succeeds");
-        let by_name =
-            |n: &str| result.agents.iter().find(|a| a.name == n).expect("agent is discovered");
+        let by_name = |n: &str| {
+            result
+                .agents
+                .iter()
+                .find(|a| a.name == n)
+                .expect("agent is discovered")
+        };
 
         let bare = by_name("bare");
         assert_eq!(bare.thinking.as_deref(), Some("high"));
-        assert_eq!(bare.extensions.as_deref(), Some(["shared-ext".to_string()].as_slice()));
+        assert_eq!(
+            bare.extensions.as_deref(),
+            Some(["shared-ext".to_string()].as_slice())
+        );
         assert!(
             bare.extensions_from_default,
             "a settings-supplied extension list must be flagged so management never bakes it into \
@@ -2867,7 +3405,10 @@ mod tests {
             Some("off"),
             "an EXPLICIT `thinking: off` is set, not unset — the default must not re-arm it"
         );
-        assert_eq!(opinionated.extensions.as_deref(), Some(["own-ext".to_string()].as_slice()));
+        assert_eq!(
+            opinionated.extensions.as_deref(),
+            Some(["own-ext".to_string()].as_slice())
+        );
         assert!(!opinionated.extensions_from_default);
     }
 
@@ -2878,8 +3419,11 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let agents_dir = tmp.path().join("agents");
         std::fs::create_dir_all(&agents_dir).expect("mkdir");
-        std::fs::write(agents_dir.join("bare.md"), "---\nname: bare\ndescription: d\n---\n\nBody\n")
-            .expect("write");
+        std::fs::write(
+            agents_dir.join("bare.md"),
+            "---\nname: bare\ndescription: d\n---\n\nBody\n",
+        )
+        .expect("write");
 
         let user = tmp.path().join("user-settings.json");
         let project = tmp.path().join("project-settings.json");
@@ -2901,9 +3445,16 @@ mod tests {
             ..AgentDiscoveryConfig::default()
         };
         let result = discover_agents_all(&cfg).expect("discovery succeeds");
-        let bare = result.agents.iter().find(|a| a.name == "bare").expect("bare discovered");
+        let bare = result
+            .agents
+            .iter()
+            .find(|a| a.name == "bare")
+            .expect("bare discovered");
         assert_eq!(bare.thinking.as_deref(), Some("high"));
-        assert_eq!(bare.extensions.as_deref(), Some(["project-ext".to_string()].as_slice()));
+        assert_eq!(
+            bare.extensions.as_deref(),
+            Some(["project-ext".to_string()].as_slice())
+        );
     }
 
     // ---- projectRootResolution (pi findConfiguredProjectRoot, agents.ts:640-672) --------------
@@ -2913,8 +3464,11 @@ mod tests {
     fn write_project_settings(root: &Path, subagents_json: &str) {
         let dir = root.join(".cyrup").join("agents");
         std::fs::create_dir_all(&dir).expect("mkdir");
-        std::fs::write(dir.join("settings.json"), format!("{{\"subagents\":{subagents_json}}}"))
-            .expect("write settings");
+        std::fs::write(
+            dir.join("settings.json"),
+            format!("{{\"subagents\":{subagents_json}}}"),
+        )
+        .expect("write settings");
     }
 
     #[test]
@@ -2953,7 +3507,10 @@ mod tests {
         // sub-project configuring nothing at all.
         write_project_settings(&inner, "{}");
         write_project_settings(&outer, r#"{"projectRootResolution":"git-root"}"#);
-        assert_eq!(find_configured_project_root(&inner).expect("resolves"), Some(outer));
+        assert_eq!(
+            find_configured_project_root(&inner).expect("resolves"),
+            Some(outer)
+        );
     }
 
     #[test]
@@ -2967,7 +3524,10 @@ mod tests {
         write_project_settings(&inner, r#"{"projectRootResolution":"nearest"}"#);
         std::fs::create_dir_all(outer.join(".git")).expect("mkdir .git");
 
-        assert_eq!(find_configured_project_root(&inner).expect("resolves"), Some(inner));
+        assert_eq!(
+            find_configured_project_root(&inner).expect("resolves"),
+            Some(inner)
+        );
     }
 
     #[test]
@@ -2980,7 +3540,10 @@ mod tests {
         std::fs::create_dir_all(outer.join(".git")).expect("mkdir .git");
         write_project_settings(&inner, r#"{"projectRootResolution":"git-root"}"#);
 
-        assert_eq!(find_configured_project_root(&inner).expect("resolves"), Some(inner));
+        assert_eq!(
+            find_configured_project_root(&inner).expect("resolves"),
+            Some(inner)
+        );
     }
 
     /// The git probe is a PRESENCE test, not a directory test: pi writes
@@ -3001,9 +3564,15 @@ mod tests {
         let inner = outer.join("packages").join("app");
         write_project_settings(&outer, r#"{"projectRootResolution":"git-root"}"#);
         write_project_settings(&inner, "{}");
-        std::fs::write(outer.join(".git"), "gitdir: /elsewhere/.git/worktrees/app\n")
-            .expect("write the linked worktree's .git FILE");
-        assert!(outer.join(".git").is_file(), "the fixture must be a file, not a directory");
+        std::fs::write(
+            outer.join(".git"),
+            "gitdir: /elsewhere/.git/worktrees/app\n",
+        )
+        .expect("write the linked worktree's .git FILE");
+        assert!(
+            outer.join(".git").is_file(),
+            "the fixture must be a file, not a directory"
+        );
 
         assert_eq!(
             find_nearest_git_root(&inner).as_deref(),
@@ -3055,5 +3624,172 @@ mod tests {
         let after = discover_agents_all(&cfg).expect("discovery succeeds");
         assert_eq!(after.agents.len(), 1);
         assert_eq!(after.agents[0].name, "new-agent");
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // SUBA-086: agent diagnostics travel on the discovery result and block their own name
+    // -----------------------------------------------------------------------------------------
+
+    fn write_broken_agent(dir: &Path, file_name: &str, name: &str) {
+        std::fs::create_dir_all(dir).expect("mkdir");
+        std::fs::write(
+            dir.join(file_name),
+            format!("---\nname: {name}\ndescription: d\ntimeoutMs: 30s\n---\n\nBody\n"),
+        )
+        .expect("write broken agent file");
+    }
+
+    const TIMEOUT_MSG: &str =
+        "Agent 'worker' has invalid timeoutMs frontmatter; expected a positive integer.";
+
+    #[test]
+    fn a_malformed_project_agent_file_is_reported_by_name_and_scoped_like_upstream() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project = tmp.path().join("project");
+        write_broken_agent(&project, "worker.md", "worker");
+        write_agent(&project, "scout.md", "scout", "still discovered");
+        let cfg = AgentDiscoveryConfig {
+            project_agent_dirs: vec![project.clone()],
+            ..AgentDiscoveryConfig::default()
+        };
+
+        let all = discover_agents_all(&cfg).expect("discovery succeeds");
+        assert!(
+            all.agents.iter().all(|a| a.name != "worker"),
+            "the broken file must not load"
+        );
+        assert!(
+            all.agents.iter().any(|a| a.name == "scout"),
+            "siblings keep discovering (R-SA-005)"
+        );
+        assert_eq!(
+            all.agent_diagnostics.len(),
+            1,
+            "{:?}",
+            all.agent_diagnostics
+        );
+        let diag = &all.agent_diagnostics[0];
+        assert_eq!(diag.source, AgentSource::Project);
+        assert_eq!(diag.name.as_deref(), Some("worker"));
+        assert_eq!(diag.file_path, project.join("worker.md"));
+        assert_eq!(diag.error, TIMEOUT_MSG);
+
+        // pi `discoveryDiagnostics(sources, "user")` drops the project tier (`agents.ts:2653-2656`).
+        let user_view = discover_agents(&cfg, Some(AgentReadScope::User)).expect("discovery");
+        assert!(
+            user_view.agent_diagnostics.is_empty(),
+            "{:?}",
+            user_view.agent_diagnostics
+        );
+        let project_view = discover_agents(&cfg, Some(AgentReadScope::Project)).expect("discovery");
+        assert_eq!(project_view.agent_diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn a_broken_higher_tier_definition_blocks_the_valid_lower_tier_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let user = tmp.path().join("user");
+        let project = tmp.path().join("project");
+        write_agent(&user, "worker.md", "worker", "valid user copy");
+        write_broken_agent(&project, "worker.md", "worker");
+        let cfg = AgentDiscoveryConfig {
+            user_agent_dirs: vec![user],
+            project_agent_dirs: vec![project],
+            ..AgentDiscoveryConfig::default()
+        };
+        let result = discover_agents(&cfg, None).expect("discovery");
+
+        // Plain resolution silently lands on the user copy — the very "wrong agent runs" outcome.
+        let resolution = resolve_agent_name("worker", &result.agents);
+        assert!(
+            matches!(resolution, AgentNameResolution::Found(a) if a.source == AgentSource::User)
+        );
+        let candidates = blocking_candidates("worker", &result.agents, &resolution);
+        assert_eq!(candidates.len(), 1);
+        let blocking =
+            find_blocking_agent_diagnostic("worker", &candidates, &result.agent_diagnostics);
+        assert!(
+            blocking.is_some_and(|d| d.source == AgentSource::Project && d.error == TIMEOUT_MSG),
+            "project (3) outranks user (2), so the diagnostic must block: {blocking:?}"
+        );
+    }
+
+    #[test]
+    fn a_broken_lower_tier_definition_does_not_block_the_valid_higher_tier_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let user = tmp.path().join("user");
+        let project = tmp.path().join("project");
+        write_broken_agent(&user, "worker.md", "worker");
+        write_agent(&project, "worker.md", "worker", "valid project copy");
+        let cfg = AgentDiscoveryConfig {
+            user_agent_dirs: vec![user],
+            project_agent_dirs: vec![project],
+            ..AgentDiscoveryConfig::default()
+        };
+        let result = discover_agents(&cfg, None).expect("discovery");
+        assert_eq!(
+            result.agent_diagnostics.len(),
+            1,
+            "still LISTED as a diagnostic"
+        );
+        let resolution = resolve_agent_name("worker", &result.agents);
+        let candidates = blocking_candidates("worker", &result.agents, &resolution);
+        assert!(
+            find_blocking_agent_diagnostic("worker", &candidates, &result.agent_diagnostics)
+                .is_none(),
+            "a user-tier (2) diagnostic never outranks a project-tier (3) definition"
+        );
+    }
+
+    #[test]
+    fn find_blocking_agent_diagnostic_with_no_candidates_returns_the_trimmed_name_match() {
+        let diag = AgentDiscoveryDiagnostic {
+            source: AgentSource::User,
+            file_path: PathBuf::from("/u/worker.md"),
+            error: "boom".to_string(),
+            name: Some("worker".to_string()),
+            runtime_name: None,
+            package_specified: false,
+            discovery_priority: None,
+        };
+        let diagnostics = std::slice::from_ref(&diag);
+        assert!(find_blocking_agent_diagnostic("worker", &[], diagnostics).is_some());
+        assert!(
+            find_blocking_agent_diagnostic("  worker  ", &[], diagnostics).is_some(),
+            "pi trims"
+        );
+        assert!(find_blocking_agent_diagnostic("other", &[], diagnostics).is_none());
+        assert!(find_blocking_agent_diagnostic("worker", &[], &[]).is_none());
+    }
+
+    #[test]
+    fn a_packaged_diagnostic_matches_by_runtime_name_and_gates_local_name_on_a_matching_candidate()
+    {
+        let diag = AgentDiscoveryDiagnostic {
+            source: AgentSource::Project,
+            file_path: PathBuf::from("/p/worker.md"),
+            error: "boom".to_string(),
+            name: Some("worker".to_string()),
+            runtime_name: Some("acme.worker".to_string()),
+            package_specified: true,
+            discovery_priority: None,
+        };
+        let diagnostics = std::slice::from_ref(&diag);
+        // The runtime name matches outright.
+        assert!(find_blocking_agent_diagnostic("acme.worker", &[], diagnostics).is_some());
+        // The bare local name matches only through a candidate carrying that exact
+        // (runtimeName, localName) pair (`agents.ts:270-272`).
+        assert!(find_blocking_agent_diagnostic("worker", &[], diagnostics).is_none());
+        let candidate = frontmatter::parse_agent_file(
+            "---\nname: worker\npackage: acme\ndescription: d\n---\n\nBody\n",
+            AgentSource::User,
+            Path::new("/u/worker.md"),
+        )
+        .expect("candidate parses");
+        assert_eq!(candidate.name, "acme.worker");
+        assert!(
+            find_blocking_agent_diagnostic("worker", &[&candidate], diagnostics).is_some(),
+            "local-name match unlocked by the candidate, and project outranks user"
+        );
     }
 }

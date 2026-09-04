@@ -39,7 +39,13 @@ fn model_match_candidates(model: &Model) -> Vec<String> {
 /// pi `supportsAdaptiveThinking` (`bedrock-converse-stream.ts:588-600`).
 pub(super) fn supports_adaptive_thinking(model: &Model) -> bool {
     const NEEDLES: [&str; 7] = [
-        "opus-4-6", "opus-4-7", "opus-4-8", "opus-5", "sonnet-4-6", "sonnet-5", "fable-5",
+        "opus-4-6",
+        "opus-4-7",
+        "opus-4-8",
+        "opus-5",
+        "sonnet-4-6",
+        "sonnet-5",
+        "fable-5",
     ];
     let candidates = model_match_candidates(model);
     candidates

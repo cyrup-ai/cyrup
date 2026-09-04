@@ -17,9 +17,9 @@
     clippy::indexing_slicing
 )]
 
-use cyrup_core::{AssistantMessage, Content, Message, ProviderId, StopReason, Usage};
 use crate::utils::estimate::estimate_message_list_tokens;
 use crate::utils::overflow::{is_context_overflow, overflow_patterns};
+use cyrup_core::{AssistantMessage, Content, Message, ProviderId, StopReason, Usage};
 
 fn err(message: &str) -> AssistantMessage {
     AssistantMessage::errored(

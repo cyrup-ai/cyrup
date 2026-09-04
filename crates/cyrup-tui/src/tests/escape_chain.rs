@@ -15,12 +15,17 @@
 //! during a turn that also had a `!`-child killed the child as collateral; and the third and fourth
 //! branches did not exist at all, which left the live, persisted, documented `doubleEscapeAction`
 //! `/settings` row with no consumer.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
+use super::harness::*;
 use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::{App, AppAction, AppCommand, Entry, InputEvent, SelectorKind, UiTheme};
 use ratatui::backend::TestBackend;
-use super::harness::*;
 
 fn new_app() -> App<TestBackend> {
     App::new(TestBackend::new(80, 16), UiTheme::dark()).unwrap()
@@ -42,12 +47,20 @@ fn type_str(app: &mut App<TestBackend>, s: &str) {
 #[test]
 fn escape_while_streaming_does_not_kill_a_running_bash_child() {
     let mut app = new_app();
-    app.transcript_mut().start_bash("sleep 100".to_string(), false, None, None);
+    app.transcript_mut()
+        .start_bash("sleep 100".to_string(), false, None, None);
     app.state_mut().status.set_streaming(true);
-    assert!(app.state().transcript.bash_running(), "precondition: a child is running");
+    assert!(
+        app.state().transcript.bash_running(),
+        "precondition: a child is running"
+    );
 
     let out = app.handle_input(&esc());
-    assert_eq!(out, AppAction::InterruptRestoreQueued, "the streaming arm must win");
+    assert_eq!(
+        out,
+        AppAction::InterruptRestoreQueued,
+        "the streaming arm must win"
+    );
     assert!(
         app.state().transcript.bash_running(),
         "the bash child must survive an Escape that belongs to the turn"
@@ -58,10 +71,14 @@ fn escape_while_streaming_does_not_kill_a_running_bash_child() {
 #[test]
 fn escape_with_no_turn_cancels_the_bash_child() {
     let mut app = new_app();
-    app.transcript_mut().start_bash("sleep 100".to_string(), false, None, None);
+    app.transcript_mut()
+        .start_bash("sleep 100".to_string(), false, None, None);
     let out = app.handle_input(&esc());
     assert_eq!(out, AppAction::Interrupt, "the run loop kills the child");
-    assert!(!app.state().transcript.bash_running(), "the block is marked cancelled");
+    assert!(
+        !app.state().transcript.bash_running(),
+        "the block is marked cancelled"
+    );
 }
 
 /// TUI-005's other half — the bash-MODE arm (`:2574-2578`): a typed-but-unsent `!cmd` is cleared.
@@ -73,7 +90,10 @@ fn escape_in_bash_mode_clears_the_editor() {
     assert_eq!(app.state().editor.text(), "!echo hi");
     let out = app.handle_input(&esc());
     assert_eq!(out, AppAction::Redraw);
-    assert!(app.state().editor.text().is_empty(), "pi's `this.editor.setText(\"\")`");
+    assert!(
+        app.state().editor.text().is_empty(),
+        "pi's `this.editor.setText(\"\")`"
+    );
 }
 
 /// A non-empty, non-`!` buffer falls off the end of pi's chain and does nothing (`:2569-2595`) — in
@@ -84,7 +104,11 @@ fn escape_with_ordinary_text_does_nothing() {
     type_str(&mut app, "hello");
     let out = app.handle_input(&esc());
     assert_eq!(out, AppAction::Redraw);
-    assert_eq!(app.state().editor.text(), "hello", "Escape must not clear an ordinary buffer");
+    assert_eq!(
+        app.state().editor.text(),
+        "hello",
+        "Escape must not clear an ordinary buffer"
+    );
 }
 
 /// TUI-009 — the double-Escape window (`interactive-mode.ts:2579-2594`, `lastEscapeTime` at `:355`).
@@ -124,7 +148,11 @@ fn the_none_setting_never_fires() {
     let mut app = new_app();
     app.state_mut().double_escape_action = "none".to_string();
     app.handle_input(&esc());
-    assert_eq!(app.handle_input(&esc()), AppAction::Redraw, "`none` must do nothing");
+    assert_eq!(
+        app.handle_input(&esc()),
+        AppAction::Redraw,
+        "`none` must do nothing"
+    );
 }
 
 /// TUI-010 / TUI-038 — Ctrl+O is a FAN-OUT plus a status echo, not an if/else.
@@ -139,8 +167,12 @@ fn the_none_setting_never_fires() {
 #[test]
 fn ctrl_o_expands_the_bash_block_and_the_tool_blocks_together_and_echoes() {
     let mut app = new_app();
-    app.transcript_mut().start_bash("ls".to_string(), false, None, None);
-    assert!(!app.state().transcript.tool_expanded(), "precondition: collapsed");
+    app.transcript_mut()
+        .start_bash("ls".to_string(), false, None, None);
+    assert!(
+        !app.state().transcript.tool_expanded(),
+        "precondition: collapsed"
+    );
 
     let ctrl_o = InputEvent::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
     app.handle_input(&ctrl_o);
@@ -156,9 +188,15 @@ fn ctrl_o_expands_the_bash_block_and_the_tool_blocks_together_and_echoes() {
     );
 
     app.handle_input(&ctrl_o);
-    assert!(!app.state().transcript.tool_expanded(), "a second press collapses");
+    assert!(
+        !app.state().transcript.tool_expanded(),
+        "a second press collapses"
+    );
     app.draw().unwrap();
-    assert!(screen(&app).contains("Tool output: collapsed"), "both directions echo");
+    assert!(
+        screen(&app).contains("Tool output: collapsed"),
+        "both directions echo"
+    );
 }
 
 /// TUI-S10 — Shift+Ctrl+D reaches `/debug` regardless of focus. Pi tests it inside
@@ -171,7 +209,10 @@ fn ctrl_o_expands_the_bash_block_and_the_tool_blocks_together_and_echoes() {
 fn shift_ctrl_d_dumps_debug_even_with_a_selector_focused() {
     let mut app = new_app();
     app.open_selector(SelectorKind::Theme);
-    assert!(app.state().selector.is_some(), "precondition: a selector owns the slot");
+    assert!(
+        app.state().selector.is_some(),
+        "precondition: a selector owns the slot"
+    );
 
     let chord = InputEvent::Key(KeyEvent::new(
         KeyCode::Char('d'),
@@ -196,7 +237,10 @@ fn shift_ctrl_d_dumps_debug_even_with_a_selector_focused() {
         "the debug block's body must actually paint:\n{}",
         screen(&app)
     );
-    assert!(app.state().selector.is_some(), "the selector keeps its slot");
+    assert!(
+        app.state().selector.is_some(),
+        "the selector keeps its slot"
+    );
 }
 
 fn screen(app: &App<TestBackend>) -> String {
@@ -226,7 +270,9 @@ fn screen(app: &App<TestBackend>) -> String {
 async fn escape_during_a_compaction_aborts_the_compaction() {
     use cyrup_session_svc::{AgentSessionEvent, CompactionReason};
     let mut app = new_app();
-    app.ingest_event(&AgentSessionEvent::CompactionStart { reason: CompactionReason::Manual });
+    app.ingest_event(&AgentSessionEvent::CompactionStart {
+        reason: CompactionReason::Manual,
+    });
     assert_eq!(app.handle_input(&esc()), AppAction::AbortCompaction);
 
     app.ingest_event(&AgentSessionEvent::CompactionEnd {

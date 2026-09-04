@@ -216,7 +216,9 @@ mod tests {
             Some("conversation-edits")
         );
         assert_eq!(
-            headers.get(COPILOT_VISION_REQUEST).and_then(|v| v.as_deref()),
+            headers
+                .get(COPILOT_VISION_REQUEST)
+                .and_then(|v| v.as_deref()),
             Some("true")
         );
     }

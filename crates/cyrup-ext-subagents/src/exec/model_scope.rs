@@ -211,7 +211,10 @@ pub fn check_model_scope(
     if allow.is_empty() {
         return None;
     }
-    if allow.iter().any(|pattern| matches_scope_pattern(model, pattern)) {
+    if allow
+        .iter()
+        .any(|pattern| matches_scope_pattern(model, pattern))
+    {
         return None;
     }
 
@@ -319,7 +322,7 @@ pub fn parse_model_scope_config(
         }
         if allow.is_empty() {
             return Err(
-                "invalid 'modelScope.allow'; expected a non-empty array of patterns".to_string()
+                "invalid 'modelScope.allow'; expected a non-empty array of patterns".to_string(),
             );
         }
         config.allow = Some(allow);
@@ -338,7 +341,12 @@ pub fn parse_model_scope_config(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 
@@ -401,10 +409,19 @@ mod tests {
 
     #[test]
     fn glob_only_treats_star_as_special_and_is_case_insensitive() {
-        assert!(matches_scope_pattern("anthropic/claude-opus-4", "anthropic/*"));
-        assert!(matches_scope_pattern("ANTHROPIC/Claude-Opus-4", "anthropic/*"));
+        assert!(matches_scope_pattern(
+            "anthropic/claude-opus-4",
+            "anthropic/*"
+        ));
+        assert!(matches_scope_pattern(
+            "ANTHROPIC/Claude-Opus-4",
+            "anthropic/*"
+        ));
         assert!(matches_scope_pattern("anthropic/claude-opus-4", "*opus*"));
-        assert!(matches_scope_pattern("anthropic/claude-opus-4", "anthropic/claude-opus-4"));
+        assert!(matches_scope_pattern(
+            "anthropic/claude-opus-4",
+            "anthropic/claude-opus-4"
+        ));
         assert!(!matches_scope_pattern("openai/gpt-5", "anthropic/*"));
         // A `.` in the pattern is a LITERAL dot upstream (escaped before `*` -> `.*`), so it must
         // NOT behave like a regex any-char.
@@ -419,10 +436,19 @@ mod tests {
     #[test]
     fn the_known_thinking_suffix_is_stripped_before_matching_including_max() {
         // `:max` is the 7th level (cyrup commit 6d29542 extended THINKING_LEVELS to 7).
-        assert!(matches_scope_pattern("anthropic/claude-opus-4:max", "anthropic/claude-opus-4"));
-        assert!(matches_scope_pattern("anthropic/claude-opus-4:high", "anthropic/claude-opus-4"));
+        assert!(matches_scope_pattern(
+            "anthropic/claude-opus-4:max",
+            "anthropic/claude-opus-4"
+        ));
+        assert!(matches_scope_pattern(
+            "anthropic/claude-opus-4:high",
+            "anthropic/claude-opus-4"
+        ));
         // An UNKNOWN colon suffix is part of the id, not a thinking level, and must not be stripped.
-        assert!(!matches_scope_pattern("anthropic/claude-opus-4:preview", "anthropic/claude-opus-4"));
+        assert!(!matches_scope_pattern(
+            "anthropic/claude-opus-4:preview",
+            "anthropic/claude-opus-4"
+        ));
     }
 
     #[test]
@@ -458,8 +484,9 @@ mod tests {
         let mut strict = scope(&["anthropic/*"]);
         strict.strict = Some(true);
 
-        let inherited = check_model_scope(Some("openai/gpt-5"), Some(&strict), ModelSource::Inherited)
-            .expect("out-of-scope inherited model must still violate");
+        let inherited =
+            check_model_scope(Some("openai/gpt-5"), Some(&strict), ModelSource::Inherited)
+                .expect("out-of-scope inherited model must still violate");
         assert_eq!(
             inherited.severity,
             ModelScopeSeverity::Error,
@@ -473,8 +500,9 @@ mod tests {
         );
 
         // Explicit stays an error (it always was), so the strict arm cannot mask a regression there.
-        let explicit = check_model_scope(Some("openai/gpt-5"), Some(&strict), ModelSource::Explicit)
-            .expect("violates");
+        let explicit =
+            check_model_scope(Some("openai/gpt-5"), Some(&strict), ModelSource::Explicit)
+                .expect("violates");
         assert_eq!(explicit.severity, ModelScopeSeverity::Error);
 
         // pi's `scope.strict === true` is strict equality: an EXPLICIT `false` behaves exactly like
@@ -493,8 +521,12 @@ mod tests {
         let mut strict_but_off = strict.clone();
         strict_but_off.enforce = Some(false);
         assert!(
-            check_model_scope(Some("openai/gpt-5"), Some(&strict_but_off), ModelSource::Inherited)
-                .is_none()
+            check_model_scope(
+                Some("openai/gpt-5"),
+                Some(&strict_but_off),
+                ModelSource::Inherited
+            )
+            .is_none()
         );
     }
 
@@ -523,12 +555,27 @@ mod tests {
 
     #[test]
     fn enforcement_is_a_no_op_without_enforce_or_without_patterns() {
-        let off = ModelScopeConfig { enforce: Some(false), strict: None, allow: Some(vec!["anthropic/*".into()]) };
-        assert!(check_model_scope(Some("openai/gpt-5"), Some(&off), ModelSource::Explicit).is_none());
-        let empty = ModelScopeConfig { enforce: Some(true), strict: None, allow: Some(Vec::new()) };
-        assert!(check_model_scope(Some("openai/gpt-5"), Some(&empty), ModelSource::Explicit).is_none());
+        let off = ModelScopeConfig {
+            enforce: Some(false),
+            strict: None,
+            allow: Some(vec!["anthropic/*".into()]),
+        };
+        assert!(
+            check_model_scope(Some("openai/gpt-5"), Some(&off), ModelSource::Explicit).is_none()
+        );
+        let empty = ModelScopeConfig {
+            enforce: Some(true),
+            strict: None,
+            allow: Some(Vec::new()),
+        };
+        assert!(
+            check_model_scope(Some("openai/gpt-5"), Some(&empty), ModelSource::Explicit).is_none()
+        );
         assert!(check_model_scope(Some("openai/gpt-5"), None, ModelSource::Explicit).is_none());
-        assert!(check_model_scope(None, Some(&scope(&["anthropic/*"])), ModelSource::Explicit).is_none());
+        assert!(
+            check_model_scope(None, Some(&scope(&["anthropic/*"])), ModelSource::Explicit)
+                .is_none()
+        );
     }
 
     #[test]
@@ -572,9 +619,11 @@ mod tests {
         );
         assert_eq!(
             parse_model_scope_config(Some(&serde_json::json!({"enforce": true}))),
-            Err("modelScope.enforce is set without a non-empty 'allow' list; supply allowed model \
+            Err(
+                "modelScope.enforce is set without a non-empty 'allow' list; supply allowed model \
                  patterns or disable enforcement"
-                .to_string())
+                    .to_string()
+            )
         );
     }
 
@@ -597,6 +646,9 @@ mod tests {
 
     #[test]
     fn an_empty_object_says_nothing_and_yields_no_config() {
-        assert_eq!(parse_model_scope_config(Some(&serde_json::json!({}))), Ok(None));
+        assert_eq!(
+            parse_model_scope_config(Some(&serde_json::json!({}))),
+            Ok(None)
+        );
     }
 }

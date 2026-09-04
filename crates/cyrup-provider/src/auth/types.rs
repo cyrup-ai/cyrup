@@ -58,7 +58,9 @@ impl Credential {
 
 /// Pi `Credential["type"]` (`ai/src/auth/types.ts:36-42`) as a standalone value, so
 /// [`CredentialInfo`] can name the KIND of a stored credential without carrying its secret.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CredentialType {
     ApiKey,
@@ -215,7 +217,8 @@ mod tests {
             "the home directory exists, so a bare `~` must resolve"
         );
         assert!(
-            !ctx.file_exists("~/cyrup-prov053-does-not-exist-9f3a2b").await,
+            !ctx.file_exists("~/cyrup-prov053-does-not-exist-9f3a2b")
+                .await,
             "expansion must not turn every `~` path into a hit"
         );
     }

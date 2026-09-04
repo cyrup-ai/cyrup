@@ -24,7 +24,10 @@ impl From<Result<ToolResult, ToolError>> for Executed {
             // AGENT-009 — `terminate` is optional upstream (`AgentToolResult.terminate?`,
             // types.ts:354-368) and `TerminateHint` carries all three of its values through
             // unchanged: `Unspecified` puts no key on the wire, `Continue` puts an explicit `false`.
-            Ok(result) => Self { result, is_error: false },
+            Ok(result) => Self {
+                result,
+                is_error: false,
+            },
             // A throwing TOOL yields `createErrorToolResult(...)` (`agent-loop.ts:700-703`
             // @v0.83.0), i.e. `details: {}` and no `terminate`.
             Err(e) => Self {
@@ -55,7 +58,9 @@ impl RunCtx {
         outcome: Result<ToolResult, ToolError>,
     ) -> Finalized {
         let executed = Executed::from(outcome);
-        let hook = self.after_hook(assistant, ctx_messages, call, &args, &executed).await;
+        let hook = self
+            .after_hook(assistant, ctx_messages, call, &args, &executed)
+            .await;
         fold_tool_outcome(call, source_index, executed, hook)
     }
 
@@ -103,10 +108,18 @@ pub(super) fn fold_tool_outcome(
     executed: Executed,
     hook: AfterOutcome,
 ) -> Finalized {
-    let Executed { result, mut is_error } = executed;
+    let Executed {
+        result,
+        mut is_error,
+    } = executed;
     // Exhaustive destructure: a field added to `ToolResult` must be placed in this table.
-    let ToolResult { mut content, mut details, mut usage, mut added_tool_names, mut terminate } =
-        result;
+    let ToolResult {
+        mut content,
+        mut details,
+        mut usage,
+        mut added_tool_names,
+        mut terminate,
+    } = result;
     match hook {
         AfterOutcome::Override(ov) => {
             if let Some(c) = ov.content {
@@ -182,7 +195,10 @@ mod tests {
     }
 
     fn usage(input: u64) -> Usage {
-        Usage { input, ..Usage::default() }
+        Usage {
+            input,
+            ..Usage::default()
+        }
     }
 
     fn ok_result() -> ToolResult {
@@ -225,10 +241,20 @@ mod tests {
     /// `tool_execution_end.result` carries `terminate: true` and `addedToolNames`.
     #[test]
     fn fold_keep_passes_the_result_through() {
-        let fin = fold_tool_outcome(&call(), 3, Executed::from(Ok(ok_result())), AfterOutcome::Keep);
+        let fin = fold_tool_outcome(
+            &call(),
+            3,
+            Executed::from(Ok(ok_result())),
+            AfterOutcome::Keep,
+        );
         assert_eq!(fin.source_index(), 3);
         assert_eq!(fin.terminate(), TerminateHint::Terminate);
-        let AgentEvent::ToolExecutionEnd { tool_call_id, tool_name, result, is_error } = fin.end_event()
+        let AgentEvent::ToolExecutionEnd {
+            tool_call_id,
+            tool_name,
+            result,
+            is_error,
+        } = fin.end_event()
         else {
             panic!("end_event is ToolExecutionEnd");
         };
@@ -254,21 +280,48 @@ mod tests {
             terminate: Some(TerminateHint::Unspecified),
             ..AfterOverride::default()
         };
-        let fin = fold_tool_outcome(&call(), 0, Executed::from(Ok(ok_result())), AfterOutcome::Override(over));
-        assert_eq!(fin.terminate(), TerminateHint::Unspecified, "Some(Unspecified) clears the hint");
-        let AgentEvent::ToolExecutionEnd { result, is_error, .. } = fin.end_event() else {
+        let fin = fold_tool_outcome(
+            &call(),
+            0,
+            Executed::from(Ok(ok_result())),
+            AfterOutcome::Override(over),
+        );
+        assert_eq!(
+            fin.terminate(),
+            TerminateHint::Unspecified,
+            "Some(Unspecified) clears the hint"
+        );
+        let AgentEvent::ToolExecutionEnd {
+            result, is_error, ..
+        } = fin.end_event()
+        else {
             panic!("end_event is ToolExecutionEnd");
         };
-        assert!(result.get("terminate").is_none(), "cleared hint puts no key on the wire");
+        assert!(
+            result.get("terminate").is_none(),
+            "cleared hint puts no key on the wire"
+        );
         assert!(!is_error, "is_error untouched when the hook left it None");
         let msg = fin.into_message();
         assert_eq!(text_of(&msg.content), vec!["patched".to_string()]);
         assert_eq!(msg.details, Some(json!({ "k": "v" })), "details kept");
         assert_eq!(msg.usage, Some(usage(700)), "usage replaced in full");
-        assert_eq!(msg.added_tool_names, vec!["late".to_string()], "not a hook field");
+        assert_eq!(
+            msg.added_tool_names,
+            vec!["late".to_string()],
+            "not a hook field"
+        );
 
-        let flip = AfterOverride { is_error: Some(true), ..AfterOverride::default() };
-        let fin = fold_tool_outcome(&call(), 0, Executed::from(Ok(ok_result())), AfterOutcome::Override(flip));
+        let flip = AfterOverride {
+            is_error: Some(true),
+            ..AfterOverride::default()
+        };
+        let fin = fold_tool_outcome(
+            &call(),
+            0,
+            Executed::from(Ok(ok_result())),
+            AfterOutcome::Override(flip),
+        );
         assert!(fin.into_message().is_error);
     }
 
@@ -285,7 +338,10 @@ mod tests {
         assert_eq!(fin.terminate(), TerminateHint::Unspecified);
         let msg = fin.into_message();
         assert!(msg.is_error);
-        assert_eq!(text_of(&msg.content), vec!["redaction pass failed on block 3".to_string()]);
+        assert_eq!(
+            text_of(&msg.content),
+            vec!["redaction pass failed on block 3".to_string()]
+        );
         assert_eq!(msg.details, Some(json!({})));
         assert!(msg.usage.is_none());
         assert!(msg.added_tool_names.is_empty());
@@ -307,14 +363,23 @@ mod tests {
         };
         let fin = Finalized::new(7, message, TerminateHint::Continue);
         assert_eq!(fin.source_index(), 7);
-        let AgentEvent::ToolExecutionEnd { tool_call_id, tool_name, result, is_error } = fin.end_event()
+        let AgentEvent::ToolExecutionEnd {
+            tool_call_id,
+            tool_name,
+            result,
+            is_error,
+        } = fin.end_event()
         else {
             panic!("end_event is ToolExecutionEnd");
         };
         assert_eq!(tool_call_id, ToolCallId::from("c9"));
         assert_eq!(tool_name, "t");
         assert!(is_error);
-        assert_eq!(result["terminate"], json!(false), "explicit Continue IS on the wire");
+        assert_eq!(
+            result["terminate"],
+            json!(false),
+            "explicit Continue IS on the wire"
+        );
         assert!(result.get("details").is_none());
         assert!(result.get("usage").is_none());
         assert!(result.get("addedToolNames").is_none());

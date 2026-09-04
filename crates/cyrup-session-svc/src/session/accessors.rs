@@ -79,7 +79,11 @@ impl AgentSession {
 
     /// The on-disk session file, if this session is persisted.
     pub async fn session_file(&self) -> Option<std::path::PathBuf> {
-        self.manager.lock().await.session_file().map(Path::to_path_buf)
+        self.manager
+            .lock()
+            .await
+            .session_file()
+            .map(Path::to_path_buf)
     }
 
     /// The cwd-bound services this session wired (settings/auth/resources/ext host/model/prompt).
@@ -122,12 +126,17 @@ impl AgentSession {
     /// reflects the new session only after a `/reload`, matching Pi.
     pub async fn write_project_trust(
         &self,
-        updates: &[(std::path::PathBuf, Option<cyrup_config::trust::TrustDecision>)],
+        updates: &[(
+            std::path::PathBuf,
+            Option<cyrup_config::trust::TrustDecision>,
+        )],
     ) -> Result<(), SessionServiceError> {
         if updates.is_empty() {
             return Ok(());
         }
-        cyrup_config::trust::TrustStore::new(self.trust_store_path()).set_many(updates).await?;
+        cyrup_config::trust::TrustStore::new(self.trust_store_path())
+            .set_many(updates)
+            .await?;
         Ok(())
     }
 
@@ -142,7 +151,10 @@ impl AgentSession {
         value: serde_json::Value,
     ) -> Result<(), SessionServiceError> {
         let path: Vec<&str> = key.split('.').filter(|s| !s.is_empty()).collect();
-        self.services.settings.persist_nested(scope, &path, value).await?;
+        self.services
+            .settings
+            .persist_nested(scope, &path, value)
+            .await?;
         Ok(())
     }
 
@@ -326,20 +338,24 @@ impl AgentSession {
 
     /// The most recent assistant message text on the current branch (print-mode helper).
     pub async fn last_assistant_text(&self) -> Option<String> {
-        self.messages().await.into_iter().rev().find_map(|m| match m {
-            Message::Assistant(AssistantMessage { content, .. }) => {
-                let text: String = content
-                    .iter()
-                    .filter_map(|c| match c {
-                        cyrup_core::Content::Text { text, .. } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("");
-                if text.is_empty() { None } else { Some(text) }
-            }
-            _ => None,
-        })
+        self.messages()
+            .await
+            .into_iter()
+            .rev()
+            .find_map(|m| match m {
+                Message::Assistant(AssistantMessage { content, .. }) => {
+                    let text: String = content
+                        .iter()
+                        .filter_map(|c| match c {
+                            cyrup_core::Content::Text { text, .. } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("");
+                    if text.is_empty() { None } else { Some(text) }
+                }
+                _ => None,
+            })
     }
 
     /// The file-based prompt templates discovered for this session (Pi `promptTemplates` getter,
@@ -403,6 +419,10 @@ impl AgentSession {
         caps: &cyrup_ext::Capabilities,
     ) -> Result<Arc<cyrup_ext::host::LiveExtension>, SessionServiceError> {
         let services: Arc<dyn cyrup_ext::host::HostServices> = self.services.host_services.clone();
-        Ok(self.services.ext_host.load_wasm_with_caps(id, bytes, services, caps).await?)
+        Ok(self
+            .services
+            .ext_host
+            .load_wasm_with_caps(id, bytes, services, caps)
+            .await?)
     }
 }

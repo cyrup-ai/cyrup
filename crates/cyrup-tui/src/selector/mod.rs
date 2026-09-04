@@ -14,12 +14,12 @@
 //! editor-swap, exactly as Pi (§1.2 "Decision for parity").
 
 use cyrup_resources::theme::builtin_themes;
+use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use crate::keymap::{ModelsAction, ModelsKeymap, SelectAction, SelectKeymap};
 use crate::select_list::{ColumnLayout, SelectItem, SelectList};
@@ -54,7 +54,12 @@ pub const INPUT_PROMPT: &str = "> ";
 /// `width` is the **full** slot width; the value gets `width - prompt.length`, pi's
 /// `availableWidth` (`input.ts:381`), and an `availableWidth <= 0` renders the bare prompt
 /// (`:383-385`).
-pub fn input_line_spans(value: &str, cursor: usize, width: u16, theme: &UiTheme) -> Vec<Span<'static>> {
+pub fn input_line_spans(
+    value: &str,
+    cursor: usize,
+    width: u16,
+    theme: &UiTheme,
+) -> Vec<Span<'static>> {
     let mut spans = Vec::with_capacity(4);
     spans.push(Span::styled(INPUT_PROMPT, theme.base_style()));
     let available = usize::from(width).saturating_sub(INPUT_PROMPT.len());
@@ -86,8 +91,11 @@ fn input_window(value: &str, cursor: usize, available: usize) -> (String, usize)
     }
     // `const scrollWidth = this.cursor === this.value.length ? availableWidth - 1 : availableWidth`
     // (`:397`).
-    let scroll =
-        if cursor >= value.len() { available.saturating_sub(1) } else { available };
+    let scroll = if cursor >= value.len() {
+        available.saturating_sub(1)
+    } else {
+        available
+    };
     // The `else` of `if (scrollWidth > 0)` (`:418-421`): nothing fits, no caret.
     if scroll == 0 {
         return (String::new(), 0);
@@ -103,8 +111,12 @@ fn input_window(value: &str, cursor: usize, available: usize) -> (String, usize)
     };
     let visible = crate::text_width::slice_by_column(value, start_col, scroll, true);
     // `cursorDisplay = beforeCursor.length` (`:416-417`) — the caret's offset *inside the window*.
-    let before =
-        crate::text_width::slice_by_column(value, start_col, cursor_col.saturating_sub(start_col), true);
+    let before = crate::text_width::slice_by_column(
+        value,
+        start_col,
+        cursor_col.saturating_sub(start_col),
+        true,
+    );
     let caret = before.len();
     (visible, caret)
 }
@@ -127,12 +139,18 @@ pub fn search_input_spans(
 ) -> Vec<Span<'static>> {
     let cursor = cursor.min(query.len());
     // Snap to a char boundary so slicing never panics on a multi-byte caret position.
-    let cursor = (0..=cursor).rev().find(|i| query.is_char_boundary(*i)).unwrap_or(0);
+    let cursor = (0..=cursor)
+        .rev()
+        .find(|i| query.is_char_boundary(*i))
+        .unwrap_or(0);
     // Everything below draws the WINDOW, with the caret at its window-local offset.
     let (window, cursor) = input_window(query, cursor, available);
     let query = window.as_str();
     let cursor = cursor.min(query.len());
-    let cursor = (0..=cursor).rev().find(|i| query.is_char_boundary(*i)).unwrap_or(0);
+    let cursor = (0..=cursor)
+        .rev()
+        .find(|i| query.is_char_boundary(*i))
+        .unwrap_or(0);
     let before = query.get(..cursor).unwrap_or("");
     let rest = query.get(cursor..).unwrap_or("");
     let mut chars = rest.chars();
@@ -141,7 +159,9 @@ pub fn search_input_spans(
         // Cursor at end of the query: draw the caret as a reversed space.
         None => (" ".to_string(), String::new()),
     };
-    let cursor_style = theme.base_style().add_modifier(ratatui::style::Modifier::REVERSED);
+    let cursor_style = theme
+        .base_style()
+        .add_modifier(ratatui::style::Modifier::REVERSED);
     let mut spans = Vec::with_capacity(3);
     if !before.is_empty() {
         spans.push(Span::styled(before.to_string(), theme.base_style()));
@@ -193,7 +213,10 @@ pub(crate) fn caret_cell(buf: &ratatui::buffer::Buffer, area: Rect) -> Option<(u
 /// applied separately, at render/measurement time, via ratatui's `Wrap`/`Paragraph::line_count`
 /// (see [`title_wrapped_height`]) — this function only splits on EXPLICIT newlines.
 pub(crate) fn title_lines(title: &str) -> Vec<Line<'static>> {
-    title.split('\n').map(|l| Line::from(format!(" {l}"))).collect()
+    title
+        .split('\n')
+        .map(|l| Line::from(format!(" {l}")))
+        .collect()
 }
 
 /// The WRAPPED row count `title` occupies at `width` columns — closes the fixed-0-or-1-row dialog
@@ -260,12 +283,22 @@ pub(crate) fn title_wrapped_height(title: &str, width: u16) -> u16 {
 ///   rows before `opt0` appears: `:44` `:45` `:47` `:49` come first). pi has no floor here either,
 ///   and forcing one would have to drop a `Spacer` — the behaviour this note exists to remove.
 pub(crate) fn stack_rows<const N: usize>(area: Rect, heights: [u16; N]) -> [Rect; N] {
-    let mut out = [Rect { x: area.x, y: area.y, width: area.width, height: 0 }; N];
+    let mut out = [Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: 0,
+    }; N];
     let mut y = area.y;
     let bottom = area.y.saturating_add(area.height);
     for (slot, want) in out.iter_mut().zip(heights) {
         let height = want.min(bottom.saturating_sub(y));
-        *slot = Rect { x: area.x, y, width: area.width, height };
+        *slot = Rect {
+            x: area.x,
+            y,
+            width: area.width,
+            height,
+        };
         y = y.saturating_add(height);
     }
     out
@@ -284,7 +317,9 @@ pub(crate) fn centered_window(selected: usize, len: usize, max: usize) -> (usize
     if len <= max {
         return (0, len);
     }
-    let start = selected.saturating_sub(max / 2).min(len.saturating_sub(max));
+    let start = selected
+        .saturating_sub(max / 2)
+        .min(len.saturating_sub(max));
     (start, start.saturating_add(max).min(len))
 }
 
@@ -323,6 +358,13 @@ pub enum SelectorKind {
     /// `showExtensionEditor("Custom summarization instructions")` (`interactive-mode.ts:4769`).
     /// Escape loops back to the [`Self::BranchSummary`] prompt (Pi's `continue`, `:4772`).
     BranchSummaryInstructions,
+    /// TUI-081 — the Yes/No guard `/import <path>` shows BEFORE the live session is replaced: Pi's
+    /// `showExtensionConfirm("Import session", `Replace current session with ${inputPath}?`)`
+    /// (`interactive-mode.ts:6069` @v0.84.4), which is `showExtensionSelector` over `["Yes","No"]`
+    /// (`:2557-2565`). First-party (the path rides [`crate::app::AppState`], the answer rides an
+    /// ordinary `ConfirmSelection`) so it never occupies the single extension-dialog reply slot.
+    /// Escape or `No` → `Import cancelled` (`:6071`), nothing imported.
+    ImportConfirm,
     /// Project-trust picker (`/trust`, `trust-selector.ts`).
     Trust,
     /// Fork-from-message picker (`/fork`, `user-message-selector.ts`).
@@ -404,6 +446,10 @@ impl SelectorKind {
             // Pi's exact prompt string (`interactive-mode.ts:4755`).
             SelectorKind::BranchSummary => "Summarize branch?",
             SelectorKind::BranchSummaryInstructions => "Custom summarization instructions",
+            // Pi's confirm title (`interactive-mode.ts:6069` @v0.84.4); the body line
+            // (`Replace current session with {path}?`) is joined on at open time, as
+            // `showExtensionConfirm`'s `` `${title}\n${message}` `` does (`:2563`).
+            SelectorKind::ImportConfirm => "Import session",
             SelectorKind::Trust => "Project Trust",
             SelectorKind::UserMessage => "Fork from Message",
             // `OAuthSelectorComponent`'s own titles (`oauth-selector.ts:70`), verbatim.
@@ -429,10 +475,10 @@ impl SelectorKind {
     /// individual components, and at v0.84.1 exactly two build the
     /// `rawKeyHint("↑↓","navigate") + keyHint(confirm,…) + keyHint(cancel,…)` row:
     ///
-    /// * `ExtensionSelectorComponent` (`extension-selector.ts:63-73`) — "select"/"cancel". Four
+    /// * `ExtensionSelectorComponent` (`extension-selector.ts:63-73`) — "select"/"cancel". Five
     ///   cyrup kinds route through it: [`Self::ExtensionSelect`] and [`Self::BranchSummary`] via
-    ///   `showExtensionSelector`, [`Self::ExtensionConfirm`] via `showExtensionConfirm`
-    ///   (`interactive-mode.ts:2172-2179`), and [`Self::LoginAuthType`], which constructs one
+    ///   `showExtensionSelector`, [`Self::ExtensionConfirm`] and [`Self::ImportConfirm`] via
+    ///   `showExtensionConfirm` (`interactive-mode.ts:2172-2179`), and [`Self::LoginAuthType`], which constructs one
     ///   directly (`interactive-mode.ts:5286-5289`).
     /// * `TrustSelectorComponent` (`trust-selector.ts:75-85`) — the same row but with **"save"**
     ///   rather than "select". cyrup's `/trust` is [`crate::settings_selector`]'s bespoke selector,
@@ -456,6 +502,7 @@ impl SelectorKind {
             SelectorKind::ExtensionSelect
                 | SelectorKind::ExtensionConfirm
                 | SelectorKind::BranchSummary
+                | SelectorKind::ImportConfirm
                 | SelectorKind::LoginAuthType
         )
     }
@@ -500,7 +547,8 @@ impl SelectorKind {
     /// * `ExtensionSelectorComponent` (`extension-selector.ts:44-75`) — `DynamicBorder`(:44),
     ///   `Spacer`(:45), title(:47), `Spacer`(:49), list(:61), `Spacer`(:62), hint(:63-73),
     ///   `Spacer`(:74), `DynamicBorder`(:75). **Four.** Reached by [`Self::ExtensionSelect`],
-    ///   [`Self::ExtensionConfirm`], [`Self::BranchSummary`] and [`Self::LoginAuthType`].
+    ///   [`Self::ExtensionConfirm`], [`Self::BranchSummary`], [`Self::ImportConfirm`] and
+    ///   [`Self::LoginAuthType`].
     /// * `OAuthSelectorComponent` (`oauth-selector.ts:68-96`) — `DynamicBorder`(:68),
     ///   `Spacer`(:69), title(:73), `Spacer`(:74), search `Input`(:86), `Spacer`(:87), list(:91),
     ///   `Spacer`(:93), `DynamicBorder`(:96). **Four**, but one of them (`:87`) sits under the
@@ -520,6 +568,7 @@ impl SelectorKind {
             SelectorKind::ExtensionSelect
                 | SelectorKind::ExtensionConfirm
                 | SelectorKind::BranchSummary
+                | SelectorKind::ImportConfirm
                 | SelectorKind::LoginAuthType
                 | SelectorKind::Login
                 | SelectorKind::Logout

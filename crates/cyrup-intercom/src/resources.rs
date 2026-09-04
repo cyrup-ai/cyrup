@@ -103,7 +103,10 @@ fn collect_skill_files(dir: &Path, root_level: bool, out: &mut Vec<PathBuf>) {
 
 /// A dot-entry or `node_modules` directory the resource walks skip.
 fn is_skippable_entry(path: &Path) -> bool {
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
     name.starts_with('.') || name == "node_modules"
 }
 
@@ -114,7 +117,12 @@ fn has_extension(path: &Path, ext: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
 
@@ -124,12 +132,22 @@ mod tests {
     #[test]
     fn the_bundled_intercom_skill_is_discoverable() {
         let files = bundled_skill_files();
-        assert_eq!(files.len(), 1, "exactly one bundled skill ships, got {files:?}");
+        assert_eq!(
+            files.len(),
+            1,
+            "exactly one bundled skill ships, got {files:?}"
+        );
         let skill = &files[0];
-        assert!(skill.is_file(), "discovered skill {skill:?} must exist on disk");
+        assert!(
+            skill.is_file(),
+            "discovered skill {skill:?} must exist on disk"
+        );
         assert_eq!(skill.file_name().and_then(|n| n.to_str()), Some("SKILL.md"));
         assert_eq!(
-            skill.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()),
+            skill
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str()),
             Some("pi-intercom"),
             "the skill keeps upstream's name, as the ported `pi-subagents` skill does"
         );
@@ -151,7 +169,10 @@ mod tests {
         let files = bundled_skill_files();
         let text = std::fs::read_to_string(&files[0]).expect("the bundled skill is readable");
         assert!(text.starts_with("---\n"), "front matter is first");
-        assert!(text.contains("\nname: pi-intercom\n"), "upstream skill name is preserved");
+        assert!(
+            text.contains("\nname: pi-intercom\n"),
+            "upstream skill name is preserved"
+        );
         // Both forced deltas are asserted against the BODY — the model-facing text — because the
         // `[CYRUP-DELTA]` note in the YAML front matter necessarily quotes what it replaced.
         let body = text.split_once("\n---\n").map(|(_, b)| b).unwrap_or(&text);
@@ -188,7 +209,9 @@ mod tests {
             .iter()
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect();
-        for action in ["send", "ask", "reply", "pending", "list", "status", "list-cwd"] {
+        for action in [
+            "send", "ask", "reply", "pending", "list", "status", "list-cwd",
+        ] {
             assert!(
                 body.contains(&format!("\"{action}\"")),
                 "the skill exercises {action:?}, which must be advertised"

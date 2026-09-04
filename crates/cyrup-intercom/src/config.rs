@@ -121,7 +121,9 @@ fn parse_config(raw: &str) -> Result<IntercomConfig, String> {
     let mut config = IntercomConfig::default();
 
     if let Some(v) = obj.get("brokerCommand") {
-        let s = v.as_str().ok_or_else(|| "\"brokerCommand\" must be a string".to_string())?;
+        let s = v
+            .as_str()
+            .ok_or_else(|| "\"brokerCommand\" must be a string".to_string())?;
         let trimmed = s.trim();
         if trimmed.is_empty() {
             return Err("\"brokerCommand\" must not be empty".to_string());
@@ -129,39 +131,57 @@ fn parse_config(raw: &str) -> Result<IntercomConfig, String> {
         config.broker_command = trimmed.to_string();
     }
     if let Some(v) = obj.get("brokerArgs") {
-        let arr = v.as_array().ok_or_else(|| "\"brokerArgs\" must be an array".to_string())?;
+        let arr = v
+            .as_array()
+            .ok_or_else(|| "\"brokerArgs\" must be an array".to_string())?;
         let mut args = Vec::with_capacity(arr.len());
         for arg in arr {
-            let s = arg.as_str().ok_or_else(|| "\"brokerArgs\" items must be strings".to_string())?;
+            let s = arg
+                .as_str()
+                .ok_or_else(|| "\"brokerArgs\" items must be strings".to_string())?;
             args.push(s.to_string());
         }
         config.broker_args = args;
     }
     if let Some(v) = obj.get("confirmSend") {
-        config.confirm_send = v.as_bool().ok_or_else(|| "\"confirmSend\" must be a boolean".to_string())?;
+        config.confirm_send = v
+            .as_bool()
+            .ok_or_else(|| "\"confirmSend\" must be a boolean".to_string())?;
     }
     if let Some(v) = obj.get("enabled") {
-        config.enabled = v.as_bool().ok_or_else(|| "\"enabled\" must be a boolean".to_string())?;
+        config.enabled = v
+            .as_bool()
+            .ok_or_else(|| "\"enabled\" must be a boolean".to_string())?;
     }
     if let Some(v) = obj.get("inboundTrigger") {
         config.inbound_trigger = match v.as_str() {
             Some("always") => InboundTrigger::Always,
             Some("replies") => InboundTrigger::Replies,
             Some("never") => InboundTrigger::Never,
-            _ => return Err("\"inboundTrigger\" must be \"always\", \"replies\", or \"never\"".to_string()),
+            _ => {
+                return Err(
+                    "\"inboundTrigger\" must be \"always\", \"replies\", or \"never\"".to_string(),
+                );
+            }
         };
     }
     if let Some(v) = obj.get("replyHint") {
-        config.reply_hint = v.as_bool().ok_or_else(|| "\"replyHint\" must be a boolean".to_string())?;
+        config.reply_hint = v
+            .as_bool()
+            .ok_or_else(|| "\"replyHint\" must be a boolean".to_string())?;
     }
     if let Some(v) = obj.get("status") {
-        let s = v.as_str().ok_or_else(|| "\"status\" must be a string".to_string())?;
+        let s = v
+            .as_str()
+            .ok_or_else(|| "\"status\" must be a string".to_string())?;
         config.status = Some(s.to_string());
     }
     // `v0.10.1 config.ts:141-150`. Fail-closed on both halves: a non-string is an error, and a
     // present-but-blank value is an error too rather than a silent `undefined`.
     if let Some(v) = obj.get("stableId") {
-        let s = v.as_str().ok_or_else(|| "\"stableId\" must be a string".to_string())?;
+        let s = v
+            .as_str()
+            .ok_or_else(|| "\"stableId\" must be a string".to_string())?;
         let trimmed = s.trim();
         if trimmed.is_empty() {
             return Err("\"stableId\" must not be empty".to_string());
@@ -245,16 +265,25 @@ mod tests {
         std::fs::write(&path, "{ this is not valid json").unwrap();
         let err = load_config(dir.path()).expect_err("a corrupt config is a hard error");
         assert!(
-            err.starts_with(&format!("Failed to load intercom config at {}: ", path.display())),
+            err.starts_with(&format!(
+                "Failed to load intercom config at {}: ",
+                path.display()
+            )),
             "must name the config path: {err}"
         );
-        assert!(err.contains("valid JSON"), "must carry the underlying parse message: {err}");
+        assert!(
+            err.contains("valid JSON"),
+            "must carry the underlying parse message: {err}"
+        );
     }
 
     #[test]
     fn load_config_missing_file_is_defaults() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(load_config(dir.path()).expect("missing file is not an error"), IntercomConfig::default());
+        assert_eq!(
+            load_config(dir.path()).expect("missing file is not an error"),
+            IntercomConfig::default()
+        );
     }
 
     /// `v0.10.1 config.ts:141-150`. `stableId` used to be accepted and silently ignored, which reads
@@ -262,7 +291,10 @@ mod tests {
     #[test]
     fn stable_id_is_parsed_trimmed_and_fails_closed() {
         assert_eq!(
-            parse_config(r#"{"stableId":"  worker-a  "}"#).expect("valid").stable_id.as_deref(),
+            parse_config(r#"{"stableId":"  worker-a  "}"#)
+                .expect("valid")
+                .stable_id
+                .as_deref(),
             Some("worker-a")
         );
         assert!(parse_config("{}").expect("valid").stable_id.is_none());
@@ -278,9 +310,18 @@ mod tests {
 
     #[test]
     fn ask_timeout_default_and_override() {
-        assert_eq!(ask_timeout_ms_from(|_| None).unwrap(), DEFAULT_ASK_TIMEOUT_MS);
-        assert_eq!(ask_timeout_ms_from(|_| Some("   ".to_string())).unwrap(), DEFAULT_ASK_TIMEOUT_MS);
-        assert_eq!(ask_timeout_ms_from(|_| Some("5000".to_string())).unwrap(), 5000);
+        assert_eq!(
+            ask_timeout_ms_from(|_| None).unwrap(),
+            DEFAULT_ASK_TIMEOUT_MS
+        );
+        assert_eq!(
+            ask_timeout_ms_from(|_| Some("   ".to_string())).unwrap(),
+            DEFAULT_ASK_TIMEOUT_MS
+        );
+        assert_eq!(
+            ask_timeout_ms_from(|_| Some("5000".to_string())).unwrap(),
+            5000
+        );
     }
 
     #[test]

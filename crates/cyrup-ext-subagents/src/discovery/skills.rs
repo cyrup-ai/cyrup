@@ -45,7 +45,9 @@ use std::path::{Path, PathBuf};
 use cyrup_core::CancelToken;
 use cyrup_resources::{DiscoveryConfig, ResourceSet, Skill, discover};
 
-use crate::discovery::types::{AgentDefinition, ChainDefinition, ChainListBinding, ChainStepConfig};
+use crate::discovery::types::{
+    AgentDefinition, ChainDefinition, ChainListBinding, ChainStepConfig,
+};
 
 /// The parent orchestration skill (pi `SUBAGENT_ORCHESTRATION_SKILL`, `skills.ts:54`). It is NEVER
 /// injectable into a child: an explicit request for it always reports it as `missing`, and it is
@@ -241,7 +243,10 @@ pub async fn discover_available_skills(cwd: &Path) -> Vec<AvailableSkill> {
     discover_available_skills_in(cwd, &SkillDiscoveryDirs::from_env()).await
 }
 
-async fn discover_available_skills_in(cwd: &Path, dirs: &SkillDiscoveryDirs) -> Vec<AvailableSkill> {
+async fn discover_available_skills_in(
+    cwd: &Path,
+    dirs: &SkillDiscoveryDirs,
+) -> Vec<AvailableSkill> {
     let skills = discover_skills(cwd, dirs).await;
     let mut out: Vec<AvailableSkill> = skills
         .winners()
@@ -271,7 +276,8 @@ pub fn build_skill_injection(skills: &[ResolvedSkill]) -> String {
     }
     let mut lines = vec![
         "The following configured skills are available to this subagent.".to_string(),
-        "Use the read tool to load a skill's file when the task matches its description.".to_string(),
+        "Use the read tool to load a skill's file when the task matches its description."
+            .to_string(),
         "When a skill file references a relative path, resolve it against the skill directory \
          (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands."
             .to_string(),
@@ -453,7 +459,10 @@ pub fn resolve_proactive_skill_subagents_config(
 /// Choose the agent that carries every recommendation (pi `chooseRecommendationAgent`): the
 /// preferred agent if enabled, else the first available fallback in order, else the first enabled
 /// agent.
-fn choose_recommendation_agent(agents: &[ProactiveAgentInput], preferred_agent: &str) -> Option<String> {
+fn choose_recommendation_agent(
+    agents: &[ProactiveAgentInput],
+    preferred_agent: &str,
+) -> Option<String> {
     let enabled: Vec<&ProactiveAgentInput> = agents.iter().filter(|a| !a.disabled).collect();
     if enabled.iter().any(|a| a.name == preferred_agent) {
         return Some(preferred_agent.to_string());
@@ -493,8 +502,8 @@ pub fn recommend_proactive_skill_subagents(
         return Vec::new();
     };
 
-    let available_by_name: Option<HashMap<&str, &AvailableSkill>> = available_skills
-        .map(|list| list.iter().map(|s| (s.name.as_str(), s)).collect());
+    let available_by_name: Option<HashMap<&str, &AvailableSkill>> =
+        available_skills.map(|list| list.iter().map(|s| (s.name.as_str(), s)).collect());
 
     let mut counts: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for candidate in agents {
@@ -701,9 +710,7 @@ fn normalize_skill_names_json(value: Option<&serde_json::Value>) -> Vec<String> 
         Some(serde_json::Value::Array(items)) => {
             dedup_trimmed(items.iter().filter_map(|v| v.as_str().map(str::to_string)))
         }
-        Some(serde_json::Value::String(raw)) => {
-            dedup_trimmed(raw.split(',').map(str::to_string))
-        }
+        Some(serde_json::Value::String(raw)) => dedup_trimmed(raw.split(',').map(str::to_string)),
         _ => Vec::new(),
     }
 }
@@ -748,7 +755,12 @@ fn dedup_trimmed(values: impl IntoIterator<Item = String>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
 
     use super::*;
 
@@ -779,7 +791,12 @@ mod tests {
     #[tokio::test]
     async fn discovers_project_skills_from_filesystem_paths() {
         let tmp = tempfile::tempdir().unwrap();
-        make_project_skill(tmp.path(), "fallback-skill", "Use fallback mode.", "Test description");
+        make_project_skill(
+            tmp.path(),
+            "fallback-skill",
+            "Use fallback mode.",
+            "Test description",
+        );
 
         let skills = discover_available_skills_in(tmp.path(), &isolated_dirs(tmp.path())).await;
         let discovered = skills
@@ -792,11 +809,19 @@ mod tests {
     #[tokio::test]
     async fn resolves_and_reads_skill_pointer_via_filesystem() {
         let tmp = tempfile::tempdir().unwrap();
-        make_project_skill(tmp.path(), "resolve-skill", "Run local fallback checks.", "Test description");
+        make_project_skill(
+            tmp.path(),
+            "resolve-skill",
+            "Run local fallback checks.",
+            "Test description",
+        );
 
-        let resolution =
-            resolve_skills_in(&["resolve-skill".to_string()], tmp.path(), &isolated_dirs(tmp.path()))
-                .await;
+        let resolution = resolve_skills_in(
+            &["resolve-skill".to_string()],
+            tmp.path(),
+            &isolated_dirs(tmp.path()),
+        )
+        .await;
         assert_eq!(resolution.missing, Vec::<String>::new());
         assert_eq!(resolution.resolved.len(), 1);
         assert_eq!(resolution.resolved[0].name, "resolve-skill");
@@ -813,13 +838,18 @@ mod tests {
             "Test description",
         );
 
-        let resolution =
-            resolve_skills_in(&["lazy-skill".to_string()], tmp.path(), &isolated_dirs(tmp.path()))
-                .await;
+        let resolution = resolve_skills_in(
+            &["lazy-skill".to_string()],
+            tmp.path(),
+            &isolated_dirs(tmp.path()),
+        )
+        .await;
         assert_eq!(resolution.missing, Vec::<String>::new());
 
         let injection = build_skill_injection(&resolution.resolved);
-        assert!(injection.contains("The following configured skills are available to this subagent"));
+        assert!(
+            injection.contains("The following configured skills are available to this subagent")
+        );
         assert!(injection.contains("Use the read tool to load a skill's file"));
         assert!(injection.contains("<available_skills>"));
         assert!(injection.contains("<name>lazy-skill</name>"));
@@ -846,7 +876,12 @@ mod tests {
     #[tokio::test]
     async fn does_not_expose_pi_subagents_as_a_child_injectable_skill() {
         let tmp = tempfile::tempdir().unwrap();
-        make_project_skill(tmp.path(), "pi-subagents", "Parent orchestration only.", "Orchestration");
+        make_project_skill(
+            tmp.path(),
+            "pi-subagents",
+            "Parent orchestration only.",
+            "Orchestration",
+        );
         make_project_skill(tmp.path(), "safe-bash", "Use safe bash.", "Safe bash");
         let dirs = isolated_dirs(tmp.path());
 
@@ -866,7 +901,11 @@ mod tests {
         .await;
         assert_eq!(resolution.missing, vec!["pi-subagents".to_string()]);
         assert_eq!(
-            resolution.resolved.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
+            resolution
+                .resolved
+                .iter()
+                .map(|s| s.name.clone())
+                .collect::<Vec<_>>(),
             vec!["safe-bash".to_string()]
         );
     }
@@ -877,7 +916,12 @@ mod tests {
         let nested = tmp.path().join("nested");
         std::fs::create_dir_all(&nested).unwrap();
         // The skill lives at the runtime (fallback) cwd only.
-        make_project_skill(tmp.path(), "runtime-fallback-skill", "Runtime fallback skill.", "Fallback");
+        make_project_skill(
+            tmp.path(),
+            "runtime-fallback-skill",
+            "Runtime fallback skill.",
+            "Fallback",
+        );
         let dirs = isolated_dirs(tmp.path());
 
         // Primary (nested) misses it; fallback (tmp) resolves it.
@@ -952,7 +996,10 @@ mod tests {
                 agent("ui-reviewer", &["accessibility"], false),
                 agent("disabled-reviewer", &["accessibility"], true),
             ],
-            &[chain("ui-check", &["accessibility"]), chain("cleanup", &["deslop"])],
+            &[
+                chain("ui-check", &["accessibility"]),
+                chain("cleanup", &["deslop"]),
+            ],
             Some(&[
                 available("accessibility", Some("Accessibility review.")),
                 available("deslop", Some("Cleanup review.")),
@@ -965,7 +1012,10 @@ mod tests {
         assert_eq!(recommendations[0].references, 2);
         assert_eq!(
             recommendations[0].sources,
-            vec!["agent:ui-reviewer".to_string(), "chain:ui-check".to_string()]
+            vec![
+                "agent:ui-reviewer".to_string(),
+                "chain:ui-check".to_string()
+            ]
         );
     }
 
@@ -979,15 +1029,24 @@ mod tests {
                 agent("three", &["gamma"], false),
             ],
             &[],
-            Some(&[available("alpha", None), available("beta", None), available("gamma", None)]),
-            Some(&ProactiveSkillSubagentsSetting::Config(ProactiveSkillSubagentsConfig {
-                preferred_agent: Some("delegate".to_string()),
-                max_recommendations: Some(2),
-                ..Default::default()
-            })),
+            Some(&[
+                available("alpha", None),
+                available("beta", None),
+                available("gamma", None),
+            ]),
+            Some(&ProactiveSkillSubagentsSetting::Config(
+                ProactiveSkillSubagentsConfig {
+                    preferred_agent: Some("delegate".to_string()),
+                    max_recommendations: Some(2),
+                    ..Default::default()
+                },
+            )),
         );
         assert_eq!(
-            recommendations.iter().map(|r| r.skill.clone()).collect::<Vec<_>>(),
+            recommendations
+                .iter()
+                .map(|r| r.skill.clone())
+                .collect::<Vec<_>>(),
             vec!["alpha".to_string(), "beta".to_string()]
         );
         assert!(recommendations.iter().all(|r| r.agent == "delegate"));
@@ -1015,12 +1074,8 @@ mod tests {
                     ..Default::default()
                 })
             });
-            let out = recommend_proactive_skill_subagents(
-                agents,
-                &[],
-                Some(&skills),
-                setting.as_ref(),
-            );
+            let out =
+                recommend_proactive_skill_subagents(agents, &[], Some(&skills), setting.as_ref());
             out.first().map(|r| r.agent.clone())
         };
 
@@ -1072,7 +1127,10 @@ mod tests {
         // Rung 2, second entry — with `reviewer` absent, `delegate` is next in the order.
         assert_eq!(
             chosen(
-                &[agent("zeta", &["deslop"], false), agent("delegate", &["deslop"], false)],
+                &[
+                    agent("zeta", &["deslop"], false),
+                    agent("delegate", &["deslop"], false)
+                ],
                 Some("nobody"),
             )
             .as_deref(),
@@ -1114,7 +1172,10 @@ mod tests {
         // bails before counting anything (`proactive-skills.ts:117-118`).
         assert_eq!(
             chosen(
-                &[agent("zeta", &["deslop"], true), agent("yankee", &["deslop"], true)],
+                &[
+                    agent("zeta", &["deslop"], true),
+                    agent("yankee", &["deslop"], true)
+                ],
                 Some("nobody"),
             ),
             None
@@ -1123,14 +1184,24 @@ mod tests {
 
     #[test]
     fn can_be_disabled_and_formats_guardrails_for_visible_suggestions() {
-        assert!(!resolve_proactive_skill_subagents_config(Some(&ProactiveSkillSubagentsSetting::Disabled)).enabled);
-        assert!(recommend_proactive_skill_subagents(
-            &[agent("reviewer", &["deslop"], false), agent("cleanup", &["deslop"], false)],
-            &[],
-            Some(&[available("deslop", None)]),
-            Some(&ProactiveSkillSubagentsSetting::Disabled),
-        )
-        .is_empty());
+        assert!(
+            !resolve_proactive_skill_subagents_config(Some(
+                &ProactiveSkillSubagentsSetting::Disabled
+            ))
+            .enabled
+        );
+        assert!(
+            recommend_proactive_skill_subagents(
+                &[
+                    agent("reviewer", &["deslop"], false),
+                    agent("cleanup", &["deslop"], false)
+                ],
+                &[],
+                Some(&[available("deslop", None)]),
+                Some(&ProactiveSkillSubagentsSetting::Disabled),
+            )
+            .is_empty()
+        );
 
         let lines = format_proactive_skill_subagent_recommendations(&[
             ProactiveSkillSubagentRecommendation {
@@ -1152,7 +1223,10 @@ mod tests {
         let discovery_calls = std::cell::Cell::new(0usize);
 
         let disabled_lines = build_proactive_skill_subagent_recommendation_lines(
-            &[agent("reviewer", &["deslop"], false), agent("cleanup", &["deslop"], false)],
+            &[
+                agent("reviewer", &["deslop"], false),
+                agent("cleanup", &["deslop"], false),
+            ],
             &[],
             Some(&ProactiveSkillSubagentsSetting::Disabled),
             || {
@@ -1164,7 +1238,10 @@ mod tests {
         assert_eq!(discovery_calls.get(), 0);
 
         let failed_lines = build_proactive_skill_subagent_recommendation_lines(
-            &[agent("reviewer", &["deslop"], false), agent("cleanup", &["deslop"], false)],
+            &[
+                agent("reviewer", &["deslop"], false),
+                agent("cleanup", &["deslop"], false),
+            ],
             &[],
             None,
             || {
@@ -1181,7 +1258,10 @@ mod tests {
         let steps = vec![
             ChainStepConfig {
                 agent: Some("worker".to_string()),
-                skills: Some(ChainListBinding::List(vec!["alpha".to_string(), "beta".to_string()])),
+                skills: Some(ChainListBinding::List(vec![
+                    "alpha".to_string(),
+                    "beta".to_string(),
+                ])),
                 ..Default::default()
             },
             ChainStepConfig {
@@ -1194,6 +1274,9 @@ mod tests {
         ];
         let collected = collect_chain_step_skills(&steps);
         // Union, de-duplicated, first-occurrence order; `skills: false` contributes nothing.
-        assert_eq!(collected, vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]);
+        assert_eq!(
+            collected,
+            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]
+        );
     }
 }

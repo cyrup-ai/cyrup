@@ -14,17 +14,20 @@
 //! `details` is what the intercom card renderer rebuilds its component from (ICOM-024): an entry
 //! that persists without it draws the built-in `[intercom_message] body` framing instead of the
 //! card, so "the message arrived" is NOT sufficient — the structured payload has to arrive with it.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use cyrup_core::StopReason;
-use cyrup_provider::faux::{
-    faux_assistant_message, faux_text, FauxProvider, FauxResponseStep,
-};
 use cyrup_provider::Provider;
+use cyrup_provider::faux::{FauxProvider, FauxResponseStep, faux_assistant_message, faux_text};
 use serde_json::json;
 use tempfile::TempDir;
 use tokio::sync::Notify;
@@ -46,7 +49,11 @@ fn fixture() -> Fixture {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
+    Fixture {
+        _tmp: tmp,
+        cwd,
+        agent_dir,
+    }
 }
 
 fn base_config(fx: &Fixture) -> SessionConfig {
@@ -72,10 +79,14 @@ async fn persisted_details(
     kind: &str,
 ) -> Option<serde_json::Value> {
     use cyrup_session::agent_message::AgentMessage as Raw;
-    session.raw_context_messages().await.into_iter().find_map(|m| match m {
-        Raw::Custom(c) if c.custom_type == kind => c.details,
-        _ => None,
-    })
+    session
+        .raw_context_messages()
+        .await
+        .into_iter()
+        .find_map(|m| match m {
+            Raw::Custom(c) if c.custom_type == kind => c.details,
+            _ => None,
+        })
 }
 
 /// The DURABLE arm (`trigger_turn: false`, idle): appends directly and surfaces via
@@ -95,7 +106,13 @@ async fn the_durable_arm_persists_details_and_emits_them_on_message_end() {
     let mut events = session.subscribe();
 
     session
-        .inject_message("body".to_string(), Some(KIND.to_string()), true, Some(card()), false)
+        .inject_message(
+            "body".to_string(),
+            Some(KIND.to_string()),
+            true,
+            Some(card()),
+            false,
+        )
         .await
         .expect("the durable injection succeeds");
 
@@ -103,7 +120,9 @@ async fn the_durable_arm_persists_details_and_emits_them_on_message_end() {
     let mut seen_end: Option<serde_json::Value> = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {
-        let Ok(Some(ev)) = tokio::time::timeout_at(deadline, events.next()).await else { break };
+        let Ok(Some(ev)) = tokio::time::timeout_at(deadline, events.next()).await else {
+            break;
+        };
         if let AgentSessionEvent::MessageEnd { message } = ev {
             let v = serde_json::to_value(&message).unwrap();
             // The AGENT wire form tags the type as `kind` (`event.rs` `TaggedNonAssistant`); the
@@ -115,14 +134,25 @@ async fn the_durable_arm_persists_details_and_emits_them_on_message_end() {
         }
     }
     let end_details = seen_end.expect("a MessageEnd for the injected custom message was emitted");
-    assert_eq!(end_details, card(), "the live MessageEnd carries the whole card, not a stripped twin");
+    assert_eq!(
+        end_details,
+        card(),
+        "the live MessageEnd carries the whole card, not a stripped twin"
+    );
 
     // ---- the PERSISTED surface: the same object, byte-for-byte. ----
     let persisted = persisted_details(&session, KIND)
         .await
         .expect("the durable arm persisted a custom message carrying details");
-    assert_eq!(persisted, card(), "the persisted entry carries the whole card");
-    assert_eq!(persisted, end_details, "live and persisted agree, so --resume redraws the same card");
+    assert_eq!(
+        persisted,
+        card(),
+        "the persisted entry carries the whole card"
+    );
+    assert_eq!(
+        persisted, end_details,
+        "live and persisted agree, so --resume redraws the same card"
+    );
 
     // ---- the fields the renderer actually reads (ICOM-029 DoD 3/4). ----
     assert_eq!(persisted["from"]["id"], "peer-7");
@@ -144,7 +174,10 @@ async fn the_durable_arm_persists_details_and_emits_them_on_message_end() {
 async fn the_trigger_turn_arm_carries_details_through_the_run_loop() {
     let fx = fixture();
     let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("ok")],
+        StopReason::Stop,
+    )]);
     let session = SessionBuilder::new(faux as Arc<dyn Provider>, base_config(&fx))
         .build()
         .await
@@ -152,7 +185,13 @@ async fn the_trigger_turn_arm_carries_details_through_the_run_loop() {
         .into_shared();
 
     session
-        .inject_message("body".to_string(), Some(KIND.to_string()), true, Some(card()), true)
+        .inject_message(
+            "body".to_string(),
+            Some(KIND.to_string()),
+            true,
+            Some(card()),
+            true,
+        )
         .await
         .expect("the trigger-turn injection succeeds");
 
@@ -162,7 +201,10 @@ async fn the_trigger_turn_arm_carries_details_through_the_run_loop() {
         if let Some(d) = persisted_details(&session, KIND).await {
             break d;
         }
-        assert!(tokio::time::Instant::now() < deadline, "the injected message never persisted");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the injected message never persisted"
+        );
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
     assert_eq!(
@@ -186,16 +228,18 @@ async fn the_steer_arm_carries_details_through_the_live_turn() {
     {
         let hold = hold.clone();
         let in_turn = in_turn.clone();
-        faux.set_response_steps(vec![FauxResponseStep::async_factory(move |_c, _o, _s, _m| {
-            let hold = hold.clone();
-            let in_turn = in_turn.clone();
-            async move {
-                // Announce that the turn is live, then park until the injection has landed.
-                in_turn.notify_one();
-                hold.notified().await;
-                faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)
-            }
-        })]);
+        faux.set_response_steps(vec![FauxResponseStep::async_factory(
+            move |_c, _o, _s, _m| {
+                let hold = hold.clone();
+                let in_turn = in_turn.clone();
+                async move {
+                    // Announce that the turn is live, then park until the injection has landed.
+                    in_turn.notify_one();
+                    hold.notified().await;
+                    faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)
+                }
+            },
+        )]);
     }
 
     let session = SessionBuilder::new(faux as Arc<dyn Provider>, base_config(&fx))
@@ -207,15 +251,26 @@ async fn the_steer_arm_carries_details_through_the_live_turn() {
     // Start a turn and wait until the provider is actually inside it.
     let runner = session.clone();
     tokio::spawn(async move {
-        let _ = runner.send_user_message("drive a turn".to_string(), None).await;
+        let _ = runner
+            .send_user_message("drive a turn".to_string(), None)
+            .await;
     });
     tokio::time::timeout(Duration::from_secs(10), in_turn.notified())
         .await
         .expect("the faux provider entered the turn");
-    assert!(session.is_streaming().await, "the session is genuinely streaming before the injection");
+    assert!(
+        session.is_streaming().await,
+        "the session is genuinely streaming before the injection"
+    );
 
     session
-        .inject_message("body".to_string(), Some(KIND.to_string()), true, Some(card()), false)
+        .inject_message(
+            "body".to_string(),
+            Some(KIND.to_string()),
+            true,
+            Some(card()),
+            false,
+        )
         .await
         .expect("the steered injection succeeds");
 
@@ -227,7 +282,10 @@ async fn the_steer_arm_carries_details_through_the_live_turn() {
         if let Some(d) = persisted_details(&session, KIND).await {
             break d;
         }
-        assert!(tokio::time::Instant::now() < deadline, "the steered message never persisted");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the steered message never persisted"
+        );
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
     assert_eq!(

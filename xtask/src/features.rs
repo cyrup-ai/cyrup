@@ -12,6 +12,12 @@
 //! for you"*), so this is a command, not a workflow. It sits beside `cargo clippy` in the README's
 //! Build block and is run the same way: by hand, before merging.
 //!
+//! It is also where the gated seam suite RUNS. `cyrup-it`'s `[[test]]` targets are
+//! `required-features = ["it"]` (docs/TEST-ARCHITECTURE.md §2.3), so `cargo nextest run
+//! --workspace` never builds them; this matrix's `cyrup-it` row is the one step in the README's
+//! Build block that executes them, and it is `nextest run`, not `check`, for exactly that reason
+//! (ICOM-053). `--fast` skips it, and the README says so.
+//!
 //! # Why a curated list and not `cargo hack --feature-powerset`
 //!
 //! `cargo-hack` is not installed here, and a powerset is the wrong shape for this workspace anyway.
@@ -35,9 +41,11 @@ use std::process::Command;
 
 /// One row: the cargo verb, everything after it, and the obligation it discharges.
 struct Combo {
-    /// `check` for every row but one — MCP-037a's verify line requires `cyrup-ext`'s tests to RUN
+    /// `check` for every row but two. MCP-037a's verify line requires `cyrup-ext`'s tests to RUN
     /// on both arms of `wasm-host`, not merely to type-check
-    /// (`docs/gap-analysis/13a-mcp-activation.md:1895-1899`).
+    /// (`docs/gap-analysis/13a-mcp-activation.md:1895-1899`); and the `cyrup-it` row RUNS the
+    /// gated seam suite, because a type-check of a suite the everyday gate never builds proves
+    /// nothing about what those tests find (ICOM-053).
     verb: &'static str,
     args: &'static [&'static str],
     /// Printed when the row fails. Name the obligation, not the command.
@@ -79,7 +87,12 @@ const MATRIX: &[Combo] = &[
     },
     Combo {
         verb: "check",
-        args: &["-p", "cyrup-session-svc", "--no-default-features", "--all-targets"],
+        args: &[
+            "-p",
+            "cyrup-session-svc",
+            "--no-default-features",
+            "--all-targets",
+        ],
         why: "compiles the native arms (builder.rs:936, :1158, :2056; session.rs:1180), which no \
               other row compiles. It does NOT remove wasmtime: `src/lib.rs:30` declares \
               `mod host_services;` ungated and that module names `cyrup_ext::{caps, host}::*`, so \
@@ -89,7 +102,12 @@ const MATRIX: &[Combo] = &[
     },
     Combo {
         verb: "check",
-        args: &["-p", "cyrup-tools", "--no-default-features", "--all-targets"],
+        args: &[
+            "-p",
+            "cyrup-tools",
+            "--no-default-features",
+            "--all-targets",
+        ],
         why: "`inline-images` off: read.rs:330's fallback arm and the \
               `#[cfg(not(feature = \"inline-images\"))]` test at src/tests/tools.rs:210.",
         slow: false,
@@ -123,7 +141,13 @@ const MATRIX: &[Combo] = &[
     },
     Combo {
         verb: "check",
-        args: &["-p", "cyrup-tui", "--features", "scrollback-accumulator", "--all-targets"],
+        args: &[
+            "-p",
+            "cyrup-tui",
+            "--features",
+            "scrollback-accumulator",
+            "--all-targets",
+        ],
         why: "defaults + the accumulator — the shape cyrup-it's dev edge creates \
               (crates/cyrup-it/Cargo.toml:99), and the only one in which the perf probe's \
               `scroll_region_*` delegations are actually compiled.",
@@ -131,7 +155,13 @@ const MATRIX: &[Combo] = &[
     },
     Combo {
         verb: "check",
-        args: &["-p", "cyrup-provider", "--features", "faux", "--all-targets"],
+        args: &[
+            "-p",
+            "cyrup-provider",
+            "--features",
+            "faux",
+            "--all-targets",
+        ],
         why: "the scripted double compiles standalone, not only via cyrup-test-support's edge.",
         slow: false,
     },
@@ -144,14 +174,26 @@ const MATRIX: &[Combo] = &[
     },
     Combo {
         verb: "check",
-        args: &["-p", "cyrup-ext-subagents", "--features", "test-fixtures", "--all-targets"],
+        args: &[
+            "-p",
+            "cyrup-ext-subagents",
+            "--features",
+            "test-fixtures",
+            "--all-targets",
+        ],
         why: "the two `required-features` fixture bins (Cargo.toml:92-112); cyrup-it's build.rs \
               builds them BY NAME and fails if a target stops existing.",
         slow: false,
     },
     Combo {
         verb: "check",
-        args: &["-p", "cyrup-intercom", "--features", "test-fixtures", "--all-targets"],
+        args: &[
+            "-p",
+            "cyrup-intercom",
+            "--features",
+            "test-fixtures",
+            "--all-targets",
+        ],
         why: "same, for cyrup-intercom-child-fixture (Cargo.toml:62-72).",
         slow: false,
     },
@@ -174,7 +216,13 @@ const MATRIX: &[Combo] = &[
         // `--exclude cyrup-it` is NOT optional and NOT the caller's business: `--all-features`
         // sets `it`, which un-no-ops crates/cyrup-it/build.rs into a nested build of five binaries
         // plus a wasm guest and re-arms every seam test (docs/TEST-ARCHITECTURE.md §9.3 G3).
-        args: &["--workspace", "--exclude", "cyrup-it", "--all-features", "--all-targets"],
+        args: &[
+            "--workspace",
+            "--exclude",
+            "cyrup-it",
+            "--all-features",
+            "--all-targets",
+        ],
         why: "every optional feature in the workspace on AT ONCE — two that are individually fine \
               and jointly contradictory fail HERE and nowhere else. `--exclude cyrup-it` is part \
               of the row's data; feature selection is per-package, so deselecting that one package \
@@ -190,13 +238,21 @@ const MATRIX: &[Combo] = &[
         slow: false,
     },
     Combo {
-        verb: "check",
-        args: &["-p", "cyrup-it", "--features", "it,wasm-host", "--all-targets"],
-        why: "the deliberate suite's own type-check — its [[test]] targets are `required-features \
-              = [\"it\"]`, so the everyday gate never compiles a line of them. SLOW: build.rs runs \
-              a nested cargo build of five binaries plus the wasm guest (build.rs:95-180). Set \
-              CYRUP_IT_BIN_DIR and CYRUP_EXT_FIXTURE_COMPONENT to skip that, or pass --fast to \
-              skip this row.",
+        verb: "nextest",
+        // The literal "everything" command of docs/TEST-ARCHITECTURE.md §2.4 — RUN, not `check`.
+        // A `check` here type-checked 486 seam tests and executed none: with every [[test]]
+        // target behind `required-features = ["it"]`, this row was the only documented pre-merge
+        // step that reached the broker-socket, spawned-binary and live-wasm seams, and a wrong
+        // answer over a real socket stayed green (ICOM-053, docs/gap-analysis/11-cyrup-intercom.md).
+        args: &["run", "-p", "cyrup-it", "--features", "it,wasm-host"],
+        why: "the deliberate suite, RUN and not merely type-checked — its [[test]] targets are \
+              `required-features = [\"it\"]`, so the everyday gate never builds a line of them and \
+              this row is the only step in README \"Build\" that executes them. A type-check \
+              would not catch a wrong answer over the broker socket, only a wrong type. SLOW: \
+              build.rs runs a nested cargo build of five binaries plus the wasm guest \
+              (build.rs:95-180), then ~2 min of tests. Set CYRUP_IT_BIN_DIR and \
+              CYRUP_EXT_FIXTURE_COMPONENT to skip the nested build, or pass --fast to skip this \
+              row.",
         slow: true,
     },
 ];
@@ -213,7 +269,9 @@ pub fn run_matrix(flags: &[String], root: PathBuf) -> Result<(), String> {
         match flag.as_str() {
             "--fast" => fast = true,
             other => {
-                return Err(format!("unknown flag {other:?} — feature-matrix takes `--fast`"))
+                return Err(format!(
+                    "unknown flag {other:?} — feature-matrix takes `--fast`"
+                ));
             }
         }
     }
@@ -248,4 +306,57 @@ pub fn run_matrix(flags: &[String], root: PathBuf) -> Result<(), String> {
         failed.len(),
         failed.join("\n  ")
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
+
+    use super::*;
+
+    fn rows_selecting(pkg: &str) -> Vec<&'static Combo> {
+        MATRIX
+            .iter()
+            .filter(|c| c.args.windows(2).any(|w| w == ["-p", pkg]))
+            .collect()
+    }
+
+    /// ICOM-053. The seam suite is `required-features = ["it"]` on every `[[test]]` target
+    /// (`crates/cyrup-it/Cargo.toml`), so the everyday `cargo nextest run --workspace` gate never
+    /// builds a line of it, and this matrix is the ONLY documented pre-merge step that reaches it
+    /// (README "Build"). A `check` row here type-checks 486 tests and executes none — a wrong
+    /// answer over the real broker socket would stay green. Upstream's sole test gate runs its
+    /// socket suite in the same invocation as everything else (pi-intercom v0.13.0
+    /// `package.json:21`, `intercom.integration.test.ts` in the one `npm test` script), and this
+    /// row is the cyrup counterpart: it must RUN the suite, armed by `it`, in the exact form
+    /// `docs/TEST-ARCHITECTURE.md` §2.4 documents as "everything".
+    #[test]
+    fn the_matrix_runs_the_gated_seam_suite_rather_than_type_checking_it() {
+        let rows = rows_selecting("cyrup-it");
+        let labels: Vec<String> = rows.iter().map(|c| c.label()).collect();
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly one row selects cyrup-it: {labels:?}"
+        );
+        let row = rows[0];
+        assert_eq!(row.verb, "nextest", "{}", row.label());
+        assert_eq!(row.args.first().copied(), Some("run"), "{}", row.label());
+        assert!(
+            row.args
+                .windows(2)
+                .any(|w| w == ["--features", "it,wasm-host"]),
+            "the suite only arms through `it`; wasm-host is the §2.4 form: {}",
+            row.label()
+        );
+        // The row IS slow (a nested build of five binaries plus the wasm guest, then 486 tests),
+        // and README "Build" says `--fast skips cyrup-it`. Pinned so that flag and that sentence
+        // cannot silently diverge: flip this and update the README in the same change.
+        assert!(row.slow, "{}", row.label());
+    }
 }

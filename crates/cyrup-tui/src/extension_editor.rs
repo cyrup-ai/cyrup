@@ -17,17 +17,17 @@
 //! [`Selector::apply_external_edit`] WITHOUT closing the dialog (Pi `this.editor.setText(newContent)`,
 //! `extension-editor.ts:152` — the dialog stays open; only `Enter`/`Esc` resolve it).
 
+use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use crate::component::Component;
 use crate::editor::{EditorOutcome, InputEditor};
 use crate::keymap::{Action, EditorAction, Keymap, SelectAction, SelectKeymap};
 use crate::selector::{
-    border_rule, stack_rows, title_lines, title_wrapped_height, Selector, SelectorOutcome,
+    Selector, SelectorOutcome, border_rule, stack_rows, title_lines, title_wrapped_height,
 };
 use crate::theme::UiTheme;
 
@@ -291,19 +291,25 @@ impl Selector for ExtensionEditorSelector {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyEventKind, KeyEventState};
-    use ratatui::Terminal;
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
-        KeyEvent { code, modifiers, kind: KeyEventKind::Press, state: KeyEventState::NONE }
+        KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
     }
 
     /// Render into a `w`×`h` buffer and return the rows, trailing whitespace trimmed.
     fn rows_at(sel: &mut ExtensionEditorSelector, w: u16, h: u16) -> Vec<String> {
         let theme = UiTheme::dark();
         let mut term = Terminal::new(TestBackend::new(w, h)).expect("test terminal");
-        term.draw(|f| sel.render(f, f.area(), &theme)).expect("draw");
+        term.draw(|f| sel.render(f, f.area(), &theme))
+            .expect("draw");
         let buf = term.backend().buffer().clone();
         (0..buf.area.height)
             .map(|y| {
@@ -326,7 +332,8 @@ mod tests {
     fn buffer_at(sel: &mut ExtensionEditorSelector, w: u16, h: u16) -> ratatui::buffer::Buffer {
         let theme = UiTheme::dark();
         let mut term = Terminal::new(TestBackend::new(w, h)).expect("test terminal");
-        term.draw(|f| sel.render(f, f.area(), &theme)).expect("draw");
+        term.draw(|f| sel.render(f, f.area(), &theme))
+            .expect("draw");
         term.backend().buffer().clone()
     }
 
@@ -367,7 +374,10 @@ mod tests {
         // E16, in `desired_height`: the envelope is 2 dialog rules + 4 `Spacer(1)` + 1 title row +
         // the embedded editor's own 2 rules + its 1 text row = 10, so a ONE-row hint would make
         // this 11. It is 12.
-        assert_eq!(h, 12, "E16: the wrapped hint is worth TWO rows in `desired_height`");
+        assert_eq!(
+            h, 12,
+            "E16: the wrapped hint is worth TWO rows in `desired_height`"
+        );
 
         let buf = buffer_at(&mut sel, W, h);
         let text_of = |y: u16| {
@@ -384,13 +394,25 @@ mod tests {
 
         // Both rows carry the `paddingX = 1` inset — `Text.render` prefixes `leftMargin` to EVERY
         // wrapped line (`text.ts:70-76`), not just the first.
-        assert!(first.starts_with(' '), "E9: inset one column (`new Text(hint, 1, 0)`): {first:?}");
-        assert!(second.starts_with(' '), "E16: the wrapped row is inset too: {second:?}");
-        assert!(!second.trim().is_empty(), "E16: the row wrapped, it did not clip: {joined:?}");
+        assert!(
+            first.starts_with(' '),
+            "E9: inset one column (`new Text(hint, 1, 0)`): {first:?}"
+        );
+        assert!(
+            second.starts_with(' '),
+            "E16: the wrapped row is inset too: {second:?}"
+        );
+        assert!(
+            !second.trim().is_empty(),
+            "E16: the row wrapped, it did not clip: {joined:?}"
+        );
 
         // All four upstream affordances survive the wrap, in upstream order.
         for want in ["submit", "newline", "cancel", "external editor"] {
-            assert!(joined.contains(want), "the `{want}` pair (`:83-89`) is missing: {joined:?}");
+            assert!(
+                joined.contains(want),
+                "the `{want}` pair (`:83-89`) is missing: {joined:?}"
+            );
         }
         assert!(
             joined.find("submit") < joined.find("newline")
@@ -434,7 +456,9 @@ mod tests {
         );
         // E16 must not cost E9 its colours: the WRAPPED row is two-tone too. `wrapTextWithAnsi`
         // carries the active ANSI runs across the break (`utils.ts:770-798`).
-        let ext_x = second.find("external editor").expect("the wrapped description") as u16;
+        let ext_x = second
+            .find("external editor")
+            .expect("the wrapped description") as u16;
         assert_eq!(
             buf.cell((ext_x, hint_y + 1)).expect("cell").fg,
             theme.muted_style().fg.expect("muted fg"),
@@ -458,9 +482,18 @@ mod tests {
         let h = sel.desired_height(W);
         let rows = rows_at(&mut sel, W, h);
         let hint = &rows[usize::from(h) - 3];
-        assert!(hint.contains("ctrl+s submit"), "the rebound confirm key: {hint:?}");
-        assert!(hint.contains("ctrl+x external editor"), "the rebound external key: {hint:?}");
-        assert!(!hint.contains("enter submit"), "the stock label must be gone: {hint:?}");
+        assert!(
+            hint.contains("ctrl+s submit"),
+            "the rebound confirm key: {hint:?}"
+        );
+        assert!(
+            hint.contains("ctrl+x external editor"),
+            "the rebound external key: {hint:?}"
+        );
+        assert!(
+            !hint.contains("enter submit"),
+            "the stock label must be gone: {hint:?}"
+        );
     }
 
     /// **E11.** The dialog title is plain accent — `new Text(theme.fg("accent", title), 1, 0)`
@@ -474,7 +507,10 @@ mod tests {
         // Title row = child index 2, inset one column by its `paddingX = 1`.
         let cell = buf.cell((1, 2)).expect("cell");
         assert_eq!(cell.symbol(), "C", "the title row");
-        assert_eq!(cell.fg, UiTheme::dark().accent_style().fg.expect("accent fg"));
+        assert_eq!(
+            cell.fg,
+            UiTheme::dark().accent_style().fg.expect("accent fg")
+        );
         assert!(
             !cell.modifier.contains(ratatui::style::Modifier::BOLD),
             "E11: `theme.fg` is colour-only — nothing bolds this title"
@@ -516,7 +552,11 @@ mod tests {
             // editor's scrolled top rule and measure the wrong pair of rows.
             let any_rule = |r: &String| r.starts_with('─');
             let find_rule_from = |from: usize| {
-                rows.iter().enumerate().skip(from).find(|(_, r)| any_rule(r)).map(|(i, _)| i)
+                rows.iter()
+                    .enumerate()
+                    .skip(from)
+                    .find(|(_, r)| any_rule(r))
+                    .map(|(i, _)| i)
             };
             let first = find_rule_from(0).expect("the dialog's top rule");
             let body_top = find_rule_from(first + 1).expect("the embedded editor's top rule");
@@ -549,7 +589,11 @@ mod tests {
         for term_rows in [10u16, 24, 80] {
             let mut sel = ExtensionEditorSelector::new("t".to_string(), "one\ntwo");
             sel.set_terminal_height(term_rows);
-            assert_eq!(sel.desired_height(60), 2 + 11, "two lines stay two at {term_rows} rows");
+            assert_eq!(
+                sel.desired_height(60),
+                2 + 11,
+                "two lines stay two at {term_rows} rows"
+            );
         }
     }
 
@@ -571,14 +615,23 @@ mod tests {
     fn envelope_has_four_spacers_a_hint_row_and_a_closing_border() {
         let mut sel = ExtensionEditorSelector::new("edit demo".to_string(), "");
         let h = sel.desired_height(60);
-        assert_eq!(h, 12, "title + 3 editor rows + 2 hint rows + 2 rules + 4 spacers");
+        assert_eq!(
+            h, 12,
+            "title + 3 editor rows + 2 hint rows + 2 rules + 4 spacers"
+        );
         let rows = rows_at(&mut sel, 60, h);
-        assert!(is_rule(&rows[0]), "the opening DynamicBorder (:62): {rows:?}");
+        assert!(
+            is_rule(&rows[0]),
+            "the opening DynamicBorder (:62): {rows:?}"
+        );
         assert_eq!(rows[1], "", "Spacer(1) (:63): {rows:?}");
         assert!(rows[2].contains("edit demo"), "the title (:66): {rows:?}");
         assert_eq!(rows[3], "", "Spacer(1) (:67): {rows:?}");
         assert_eq!(rows[7], "", "Spacer(1) after the editor (:80): {rows:?}");
-        assert!(rows[8].contains("submit"), "the hint row (:83-90): {rows:?}");
+        assert!(
+            rows[8].contains("submit"),
+            "the hint row (:83-90): {rows:?}"
+        );
         assert!(
             rows[9].contains("external editor"),
             "E16: the hint's WRAPPED second row (`text.ts:64-87`), not a spacer: {rows:?}"
@@ -595,7 +648,10 @@ mod tests {
             .enumerate()
             .filter(|(i, r)| !(4..=6).contains(i) && r.is_empty())
             .count();
-        assert_eq!(envelope_blanks, 4, "exactly four envelope spacers: {rows:?}");
+        assert_eq!(
+            envelope_blanks, 4,
+            "exactly four envelope spacers: {rows:?}"
+        );
     }
 
     /// MIRROR of the E5 assertion. The rule the dialog always had is the one at the TOP; a test
@@ -608,7 +664,10 @@ mod tests {
         let rows = rows_at(&mut sel, 60, h);
         // The embedded `InputEditor` draws its own two rules inside the body region, so the
         // envelope's own pair is the first row and the last row specifically.
-        assert!(is_rule(&rows[0]) && is_rule(&rows[h as usize - 1]), "{rows:?}");
+        assert!(
+            is_rule(&rows[0]) && is_rule(&rows[h as usize - 1]),
+            "{rows:?}"
+        );
     }
 
     /// Height ladder. pi renders a dialog `Container` at its natural height and paints only the
@@ -631,7 +690,11 @@ mod tests {
         /// Index of the `Editor` child (`extension-editor.ts:78`); rows before it are the envelope.
         const ENVELOPE_HEAD: usize = 4;
         let natural_h = ExtensionEditorSelector::new("t".to_string(), "").desired_height(60);
-        let full = rows_at(&mut ExtensionEditorSelector::new("t".to_string(), ""), 60, natural_h);
+        let full = rows_at(
+            &mut ExtensionEditorSelector::new("t".to_string(), ""),
+            60,
+            natural_h,
+        );
         for h in 1..=natural_h {
             let mut sel = ExtensionEditorSelector::new("t".to_string(), "");
             let rows = rows_at(&mut sel, 60, h);
@@ -663,7 +726,10 @@ mod tests {
         let mut sel = ExtensionEditorSelector::new("t".to_string(), "seed");
         let km = SelectKeymap::default();
         for c in " more".chars() {
-            assert_eq!(sel.handle(&key(KeyCode::Char(c), KeyModifiers::NONE), &km), SelectorOutcome::Redraw);
+            assert_eq!(
+                sel.handle(&key(KeyCode::Char(c), KeyModifiers::NONE), &km),
+                SelectorOutcome::Redraw
+            );
         }
         assert_eq!(
             sel.handle(&key(KeyCode::Enter, KeyModifiers::NONE), &km),
@@ -675,7 +741,10 @@ mod tests {
     fn esc_cancels_without_confirming() {
         let mut sel = ExtensionEditorSelector::new("t".to_string(), "seed");
         let km = SelectKeymap::default();
-        assert_eq!(sel.handle(&key(KeyCode::Esc, KeyModifiers::NONE), &km), SelectorOutcome::Cancel);
+        assert_eq!(
+            sel.handle(&key(KeyCode::Esc, KeyModifiers::NONE), &km),
+            SelectorOutcome::Cancel
+        );
     }
 
     /// L4 review §3 (TUI `ui.editor` always tears down to `$EDITOR`): `Ctrl+G` must be a REQUEST,

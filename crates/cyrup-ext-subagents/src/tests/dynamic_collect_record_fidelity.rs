@@ -33,13 +33,13 @@
 
 use std::sync::Arc;
 
-use cyrup_core::CancelToken;
 use crate::error::SubagentError;
 use crate::spawn::chain_graph::{
     ChainRunContext, DynamicGroupSpec, OnEmpty, OutputRegistry, RunnerStep, SingleStepExecutor,
     SingleStepSpec, StepResult, walk_chain,
 };
 use crate::spawn::parallel::GlobalConcurrencyLimit;
+use cyrup_core::CancelToken;
 use serde_json::{Value, json};
 
 /// A [`SingleStepExecutor`] that answers each child by looking its task text up in a scripted
@@ -260,7 +260,11 @@ async fn a_collect_schema_requiring_output_path_validates() {
     fn make(task: &str) -> StepResult {
         let mut result = StepResult::success(Some("done".to_string()), None);
         result.exit_code = Some(0);
-        let id = if task.contains("alpha") { "alpha" } else { "beta" };
+        let id = if task.contains("alpha") {
+            "alpha"
+        } else {
+            "beta"
+        };
         result.saved_output_path = Some(format!("/runs/chain/{id}.md"));
         result
     }

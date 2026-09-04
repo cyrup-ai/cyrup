@@ -41,7 +41,9 @@ pub fn format_token_count(tokens: f64) -> String {
     } else {
         let fixed = format!("{k:.1}");
         // `.replace(/\.0$/, "")` — anchored at the END, so `10.0` → `10` but `1.05` → `1.1` stays.
-        fixed.strip_suffix(".0").map_or(fixed.clone(), ToString::to_string)
+        fixed
+            .strip_suffix(".0")
+            .map_or(fixed.clone(), ToString::to_string)
     };
     format!("{value}k")
 }
@@ -72,17 +74,32 @@ pub fn format_context_usage(session: &SessionInfo) -> String {
         return String::new();
     };
     let mut out = format!(" · {pct}% ctx");
-    if let Some(tokens) = session.context_tokens.as_ref().and_then(serde_json::Number::as_f64)
-        && let Some(window) = session.context_window.as_ref().and_then(serde_json::Number::as_f64)
+    if let Some(tokens) = session
+        .context_tokens
+        .as_ref()
+        .and_then(serde_json::Number::as_f64)
+        && let Some(window) = session
+            .context_window
+            .as_ref()
+            .and_then(serde_json::Number::as_f64)
         && window > 0.0
     {
-        out.push_str(&format!(" ({}/{})", format_token_count(tokens), format_token_count(window)));
+        out.push_str(&format!(
+            " ({}/{})",
+            format_token_count(tokens),
+            format_token_count(window)
+        ));
     }
     out
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 
@@ -112,7 +129,11 @@ mod tests {
     #[test]
     fn renders_percent_plus_token_detail_when_all_known() {
         let s = with(
-            with(with(base(), "contextPct", 72.into()), "contextTokens", 144_000.into()),
+            with(
+                with(base(), "contextPct", 72.into()),
+                "contextTokens",
+                144_000.into(),
+            ),
             "contextWindow",
             200_000.into(),
         );
@@ -130,7 +151,11 @@ mod tests {
     #[test]
     fn renders_nothing_when_percent_is_unknown() {
         assert_eq!(format_context_usage(&base()), "");
-        let s = with(with(base(), "contextTokens", 100.into()), "contextWindow", 200.into());
+        let s = with(
+            with(base(), "contextTokens", 100.into()),
+            "contextWindow",
+            200.into(),
+        );
         assert_eq!(
             format_context_usage(&s),
             "",
@@ -144,12 +169,28 @@ mod tests {
     fn token_counts_render_compactly() {
         assert_eq!(format_token_count(0.0), "0");
         assert_eq!(format_token_count(999.0), "999");
-        assert_eq!(format_token_count(-5.0), "0", "`Math.max(0, …)` floors at zero");
-        assert_eq!(format_token_count(1000.0), "1k", "`.toFixed(1)` = \"1.0\" → the `.0` is stripped");
+        assert_eq!(
+            format_token_count(-5.0),
+            "0",
+            "`Math.max(0, …)` floors at zero"
+        );
+        assert_eq!(
+            format_token_count(1000.0),
+            "1k",
+            "`.toFixed(1)` = \"1.0\" → the `.0` is stripped"
+        );
         assert_eq!(format_token_count(1432.0), "1.4k", "upstream's own example");
         assert_eq!(format_token_count(99_900.0), "99.9k");
-        assert_eq!(format_token_count(100_000.0), "100k", "at k >= 100 the decimal is dropped");
-        assert_eq!(format_token_count(144_000.0), "144k", "upstream's own example");
+        assert_eq!(
+            format_token_count(100_000.0),
+            "100k",
+            "at k >= 100 the decimal is dropped"
+        );
+        assert_eq!(
+            format_token_count(144_000.0),
+            "144k",
+            "upstream's own example"
+        );
         assert_eq!(format_token_count(200_000.0), "200k");
     }
 
@@ -158,7 +199,11 @@ mod tests {
     #[test]
     fn a_zero_window_suppresses_only_the_token_detail() {
         let s = with(
-            with(with(base(), "contextPct", 12.into()), "contextTokens", 100.into()),
+            with(
+                with(base(), "contextPct", 12.into()),
+                "contextTokens",
+                100.into(),
+            ),
             "contextWindow",
             0.into(),
         );

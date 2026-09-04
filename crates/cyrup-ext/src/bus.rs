@@ -56,7 +56,9 @@ impl SharedBus {
     /// (`extensions/loader.ts:413-421` @v0.84.1) — so a listener that is only wanted while a mode
     /// is active can be taken down. Returns whether a subscription was actually removed.
     pub fn unsubscribe(&self, owner: &ExtensionId, topic: &str) -> bool {
-        let Ok(mut g) = self.subs.lock() else { return false };
+        let Ok(mut g) = self.subs.lock() else {
+            return false;
+        };
         let before = g.len();
         g.retain(|(o, t)| !(o == owner && t == topic));
         g.len() != before
@@ -67,7 +69,9 @@ impl SharedBus {
     /// (`extensions/loader.ts:206-214` @v0.84.1). Called when an extension leaves the host's live
     /// map, so a replaced or unloaded instance stops receiving. Returns how many were removed.
     pub fn unsubscribe_all(&self, owner: &ExtensionId) -> usize {
-        let Ok(mut g) = self.subs.lock() else { return 0 };
+        let Ok(mut g) = self.subs.lock() else {
+            return 0;
+        };
         let before = g.len();
         g.retain(|(o, _)| o != owner);
         before - g.len()
@@ -90,7 +94,10 @@ impl SharedBus {
 
     /// Drain every queued event (the host delivers them, then re-checks for cascaded emits).
     pub fn take_pending(&self) -> Vec<(String, Value)> {
-        self.pending.lock().map(|mut g| g.drain(..).collect()).unwrap_or_default()
+        self.pending
+            .lock()
+            .map(|mut g| g.drain(..).collect())
+            .unwrap_or_default()
     }
 
     /// How many events are still queued. Used by the fan-out to tell "the queue emptied" from
@@ -103,14 +110,22 @@ impl SharedBus {
     /// gives up at its round bound, so the drop is explicit and reportable rather than a silent
     /// fall-out of a `for` loop (EXT-057).
     pub fn drop_pending(&self) -> usize {
-        self.pending.lock().map(|mut g| g.drain(..).count()).unwrap_or(0)
+        self.pending
+            .lock()
+            .map(|mut g| g.drain(..).count())
+            .unwrap_or(0)
     }
 
     /// The extension ids subscribed to `topic`, in subscription order (pi listener order).
     pub fn subscribers_for(&self, topic: &str) -> Vec<ExtensionId> {
         self.subs
             .lock()
-            .map(|g| g.iter().filter(|(_, t)| t == topic).map(|(o, _)| o.clone()).collect())
+            .map(|g| {
+                g.iter()
+                    .filter(|(_, t)| t == topic)
+                    .map(|(o, _)| o.clone())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 

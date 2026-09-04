@@ -42,7 +42,9 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use cyrup_ext::{HostServices, NotifyKind};
-use cyrup_ext_subagents::{validate_contains_root, validate_safe_token, CONTROL_INBOX_POLL_INTERVAL};
+use cyrup_ext_subagents::{
+    CONTROL_INBOX_POLL_INTERVAL, validate_contains_root, validate_safe_token,
+};
 
 use crate::ask::{
     AskChannel, AskOutcome, LocalAskChannel, PermissionDecisionState, PermissionPromptDecision,
@@ -50,7 +52,7 @@ use crate::ask::{
 };
 use crate::error::PermissionError;
 use crate::ext_config::ExtensionConfig;
-use crate::logging::{sensitive_log_metadata, AuditTrail};
+use crate::logging::{AuditTrail, sensitive_log_metadata};
 
 /// pi `PERMISSION_FORWARDING_TIMEOUT_MS = 10 * 60 * 1000` (`permission-forwarding.ts:7`): the CHILD's
 /// blocking-wait deadline AND the parent's expired-on-read cutoff.
@@ -122,7 +124,11 @@ pub struct ForwardedPermissionResponse {
     pub response_nonce: String,
     pub approved: bool,
     pub state: PermissionDecisionState,
-    #[serde(rename = "denialReason", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "denialReason",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub denial_reason: Option<String>,
     #[serde(rename = "responderSessionId")]
     pub responder_session_id: String,
@@ -172,12 +178,19 @@ pub fn normalize_session_id(value: &str) -> Option<String> {
 #[must_use]
 pub fn encode_session_id_for_path(session_id: &str) -> String {
     fn hex_digit(nibble: u8) -> char {
-        char::from(if nibble < 10 { b'0' + nibble } else { b'A' + (nibble - 10) })
+        char::from(if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'A' + (nibble - 10)
+        })
     }
     let mut out = String::with_capacity(session_id.len());
     for &b in session_id.as_bytes() {
         let unreserved = b.is_ascii_alphanumeric()
-            || matches!(b, b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')');
+            || matches!(
+                b,
+                b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')'
+            );
         if unreserved {
             out.push(b as char);
         } else {
@@ -201,12 +214,16 @@ pub fn forwarding_location(
     session_id: &str,
 ) -> Result<ForwardingLocation, PermissionError> {
     let normalized = normalize_session_id(session_id).ok_or_else(|| {
-        PermissionError::UnsafeToken("session id must be a non-empty, non-\"unknown\" string".into())
+        PermissionError::UnsafeToken(
+            "session id must be a non-empty, non-\"unknown\" string".into(),
+        )
     })?;
     let encoded = encode_session_id_for_path(&normalized);
     validate_safe_token(&encoded).map_err(|e| PermissionError::UnsafeToken(e.to_string()))?;
     let root = forwarding_root_dir(default_agent_dir);
-    let session_root = root.join(SESSION_FORWARDING_ROOT_DIRECTORY_NAME).join(&encoded);
+    let session_root = root
+        .join(SESSION_FORWARDING_ROOT_DIRECTORY_NAME)
+        .join(&encoded);
     validate_contains_root(&root, &session_root)
         .map_err(|e| PermissionError::UnsafeToken(e.to_string()))?;
     Ok(ForwardingLocation {
@@ -231,19 +248,17 @@ fn set_restrictive_mode(path: &Path, mode: u32, description: &str, audit: Option
         && let Some(audit) = audit
     {
         audit.forwarding_warning(
-            &format!("Failed to restrict {description} permissions for '{}'", path.display()),
+            &format!(
+                "Failed to restrict {description} permissions for '{}'",
+                path.display()
+            ),
             Some(&err.to_string()),
         );
     }
 }
 
 #[cfg(not(unix))]
-fn set_restrictive_mode(
-    _path: &Path,
-    _mode: u32,
-    _description: &str,
-    _audit: Option<&AuditTrail>,
-) {
+fn set_restrictive_mode(_path: &Path, _mode: u32, _description: &str, _audit: Option<&AuditTrail>) {
 }
 
 /// pi `ensureDirectoryExists` (v0.8.0 `index.ts:754-763`): mkdir recursive + chmod `0o700`, with
@@ -254,7 +269,10 @@ fn ensure_directory_exists(path: &Path, description: &str, audit: Option<&AuditT
     if let Err(err) = std::fs::create_dir_all(path) {
         if let Some(audit) = audit {
             audit.forwarding_error(
-                &format!("Failed to create {description} directory '{}'", path.display()),
+                &format!(
+                    "Failed to create {description} directory '{}'",
+                    path.display()
+                ),
                 Some(&err.to_string()),
             );
         }
@@ -537,7 +555,10 @@ fn try_remove_directory_if_empty(path: &Path, description: &str, audit: Option<&
         Err(err) => {
             if let Some(audit) = audit {
                 audit.forwarding_warning(
-                    &format!("Failed to inspect {description} directory '{}'", path.display()),
+                    &format!(
+                        "Failed to inspect {description} directory '{}'",
+                        path.display()
+                    ),
                     Some(&err.to_string()),
                 );
             }
@@ -554,7 +575,10 @@ fn try_remove_directory_if_empty(path: &Path, description: &str, audit: Option<&
         );
         if !ignorable && let Some(audit) = audit {
             audit.forwarding_warning(
-                &format!("Failed to remove empty {description} directory '{}'", path.display()),
+                &format!(
+                    "Failed to remove empty {description} directory '{}'",
+                    path.display()
+                ),
                 Some(&err.to_string()),
             );
         }
@@ -606,7 +630,13 @@ fn safe_delete_file(path: &Path, description: &str, audit: Option<&AuditTrail>) 
 /// Returns [`PermissionError::Io`] if the watcher cannot be constructed or attached.
 fn watch_dir(
     dir: &Path,
-) -> Result<(notify::PollWatcher, tokio::sync::mpsc::UnboundedReceiver<()>), PermissionError> {
+) -> Result<
+    (
+        notify::PollWatcher,
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+    ),
+    PermissionError,
+> {
     use notify::Watcher as _;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let cfg = notify::Config::default()
@@ -628,7 +658,11 @@ fn watch_dir(
 }
 
 fn denied() -> PermissionPromptDecision {
-    PermissionPromptDecision { approved: false, state: PermissionDecisionState::Denied, denial_reason: None }
+    PermissionPromptDecision {
+        approved: false,
+        state: PermissionDecisionState::Denied,
+        denial_reason: None,
+    }
 }
 
 /// The child wait bound: the [`CHILD_WAIT_TIMEOUT_ENV`] override if set to a finite positive ms value,
@@ -714,7 +748,10 @@ pub async fn wait_for_forwarded_approval(
     if let Err(err) = write_json_atomic(&request_path, &request, Some(audit)) {
         // pi request-write failure deny + error entry (v0.8.0 `index.ts:1039-1044`).
         audit.forwarding_error(
-            &format!("Failed to write forwarded permission request '{}'", request_path.display()),
+            &format!(
+                "Failed to write forwarded permission request '{}'",
+                request_path.display()
+            ),
             Some(&err.to_string()),
         );
         return denied();
@@ -836,7 +873,10 @@ fn format_forwarded_prompt(request: &ForwardedPermissionRequest) -> String {
     } else {
         request.requester_session_id.as_str()
     };
-    format!("Subagent '{agent}' requested permission.\nSession ID: {session}\n\n{}", request.message)
+    format!(
+        "Subagent '{agent}' requested permission.\nSession ID: {session}\n\n{}",
+        request.message
+    )
 }
 
 /// pi's `options` bag for [`process_forwarded_requests`] (`index.ts:1358`
@@ -859,7 +899,9 @@ impl ProcessForwardedOptions {
     /// pi's `{ preserveLocation: true }` — the watcher's option bag.
     #[must_use]
     pub const fn preserve_location() -> Self {
-        Self { preserve_location: true }
+        Self {
+            preserve_location: true,
+        }
     }
 }
 
@@ -1175,7 +1217,9 @@ async fn resolve_forwarded_decision(
         )
     });
     let prompt_message = match positive_timeout_secs {
-        Some(secs) => format!("This forwarded prompt auto-denies after {secs} seconds if unanswered."),
+        Some(secs) => {
+            format!("This forwarded prompt auto-denies after {secs} seconds if unanswered.")
+        }
         None => "This forwarded prompt will wait indefinitely until answered.".to_string(),
     };
     let body = format!("{}\n\n{}", format_forwarded_prompt(request), prompt_message);
@@ -1192,7 +1236,10 @@ async fn resolve_forwarded_decision(
         .confirm(
             "Permission Required (Subagent)",
             &body,
-            PromptOpts { timeout, timeout_denial_reason },
+            PromptOpts {
+                timeout,
+                timeout_denial_reason,
+            },
         )
         .await
     {
@@ -1230,7 +1277,10 @@ pub type SharedHasUi = Arc<AtomicBool>;
 /// Read the current [`ExtensionConfig`] out of a [`SharedExtensionConfig`], never holding the lock
 /// across an `await` (the clone is taken and the guard dropped inside this call).
 fn snapshot_config(config: &SharedExtensionConfig) -> ExtensionConfig {
-    config.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    config
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
 }
 
 /// The parent-side forwarding watcher (pi `startForwardedPermissionPolling`, `index.ts:1983-2031`): a
@@ -1347,7 +1397,12 @@ pub fn spawn_forwarding_watcher(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
     use super::*;
 
     #[test]
@@ -1379,7 +1434,10 @@ mod tests {
     fn location_layout_is_pi_faithful() {
         let dir = tempfile::tempdir().unwrap();
         let loc = forwarding_location(dir.path(), "sess-1").unwrap();
-        assert!(loc.session_root.ends_with("sessions/permission-forwarding/sessions/sess-1"));
+        assert!(
+            loc.session_root
+                .ends_with("sessions/permission-forwarding/sessions/sess-1")
+        );
         assert!(loc.requests_dir.ends_with("requests"));
         assert!(loc.responses_dir.ends_with("responses"));
     }
@@ -1439,7 +1497,10 @@ mod tests {
             responder_session_id: "parent".into(),
             responded_at: 0,
         };
-        assert!(!response_is_bound(&forged, &req, "parent"), "a forged nonce must NOT bind");
+        assert!(
+            !response_is_bound(&forged, &req, "parent"),
+            "a forged nonce must NOT bind"
+        );
         let mut good = forged.clone();
         good.response_nonce = "real-nonce".into();
         assert!(response_is_bound(&good, &req, "parent"));
@@ -1453,7 +1514,10 @@ mod tests {
         let cases = [
             (PermissionDecisionState::Approved, "approved"),
             (PermissionDecisionState::Denied, "denied"),
-            (PermissionDecisionState::DeniedWithReason, "denied_with_reason"),
+            (
+                PermissionDecisionState::DeniedWithReason,
+                "denied_with_reason",
+            ),
             (PermissionDecisionState::Once, "once"),
             (PermissionDecisionState::Always, "always"),
             (PermissionDecisionState::Reject, "reject"),
@@ -1502,7 +1566,10 @@ mod tests {
     /// Drop a well-formed forwarded request into `parent`'s inbox and return its id.
     fn seed_request(agent_dir: &Path, parent: &str) -> String {
         let loc = forwarding_location(agent_dir, parent).unwrap();
-        assert!(ensure_location(&loc, None), "the spool dirs must be creatable");
+        assert!(
+            ensure_location(&loc, None),
+            "the spool dirs must be creatable"
+        );
         let req = ForwardedPermissionRequest {
             id: "req-perm005".to_string(),
             response_nonce: create_nonce(),
@@ -1552,15 +1619,14 @@ mod tests {
         });
 
         let config = Arc::new(Mutex::new(ExtensionConfig::default()));
-        let watcher =
-            spawn_forwarding_watcher(
-                agent_dir.clone(),
-                Arc::clone(&services),
-                Arc::clone(&config),
-                Arc::new(AuditTrail::detached(agent_dir.join("logs"))),
-                // PERM-031: a UI is present, which is the precondition for the spool being scanned.
-                Arc::new(AtomicBool::new(true)),
-            );
+        let watcher = spawn_forwarding_watcher(
+            agent_dir.clone(),
+            Arc::clone(&services),
+            Arc::clone(&config),
+            Arc::new(AuditTrail::detached(agent_dir.join("logs"))),
+            // PERM-031: a UI is present, which is the precondition for the spool being scanned.
+            Arc::new(AtomicBool::new(true)),
+        );
 
         let request_path = forwarding_location(&agent_dir, parent)
             .unwrap()
@@ -1568,8 +1634,10 @@ mod tests {
             .join("req-perm005.json");
         seed_request(&agent_dir, parent);
 
-        let serviced =
-            eventually(Duration::from_secs(10), || selects.load(Ordering::SeqCst) > 0).await;
+        let serviced = eventually(Duration::from_secs(10), || {
+            selects.load(Ordering::SeqCst) > 0
+        })
+        .await;
         watcher.abort();
 
         assert!(
@@ -1616,25 +1684,32 @@ mod tests {
         let parent = "perm005-live-config";
         let selects = Arc::new(AtomicUsize::new(0));
 
-        let services: Arc<dyn HostServices> =
-            Arc::new(NoDialogHost { id: parent.to_string(), selects: Arc::clone(&selects) });
+        let services: Arc<dyn HostServices> = Arc::new(NoDialogHost {
+            id: parent.to_string(),
+            selects: Arc::clone(&selects),
+        });
         let config = Arc::new(Mutex::new(ExtensionConfig::default()));
-        assert!(!snapshot_config(&config).yolo_mode, "the watcher starts in non-yolo mode");
+        assert!(
+            !snapshot_config(&config).yolo_mode,
+            "the watcher starts in non-yolo mode"
+        );
 
-        let watcher =
-            spawn_forwarding_watcher(
-                agent_dir.clone(),
-                Arc::clone(&services),
-                Arc::clone(&config),
-                Arc::new(AuditTrail::detached(agent_dir.join("logs"))),
-                // PERM-031: a UI is present, which is the precondition for the spool being scanned.
-                Arc::new(AtomicBool::new(true)),
-            );
+        let watcher = spawn_forwarding_watcher(
+            agent_dir.clone(),
+            Arc::clone(&services),
+            Arc::clone(&config),
+            Arc::new(AuditTrail::detached(agent_dir.join("logs"))),
+            // PERM-031: a UI is present, which is the precondition for the spool being scanned.
+            Arc::new(AtomicBool::new(true)),
+        );
 
         // The mid-session `refreshExtensionConfig`. This lands strictly AFTER the pre-fix code took
         // its by-value snapshot (that snapshot was the `config: ExtensionConfig` argument itself,
         // frozen at the call above, before the task's first poll), so a by-value port cannot see it.
-        config.lock().unwrap_or_else(PoisonError::into_inner).yolo_mode = true;
+        config
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .yolo_mode = true;
 
         seed_request(&agent_dir, parent);
         let loc = forwarding_location(&agent_dir, parent).unwrap();
@@ -1643,7 +1718,10 @@ mod tests {
         let answered = eventually(Duration::from_secs(10), || response_path.exists()).await;
         watcher.abort();
 
-        assert!(answered, "the watcher must have written a response for the seeded request");
+        assert!(
+            answered,
+            "the watcher must have written a response for the seeded request"
+        );
         let body = std::fs::read_to_string(&response_path).unwrap();
         let response: ForwardedPermissionResponse = serde_json::from_str(&body).unwrap();
         assert!(

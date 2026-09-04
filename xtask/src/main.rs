@@ -4,7 +4,9 @@
 //! * `gen-catalogs` — regenerate `crates/cyrup-provider/src/providers/catalog/*.json` and
 //!   `catalog_manifest.json` from a pinned pi revision (PROV-018 / PROV-060). Documented below.
 //! * `feature-matrix` — type-check the feature combinations `cargo check --workspace
-//!   --all-targets` does not reach. See [`features`] for the matrix and why each row is in it.
+//!   --all-targets` does not reach, and RUN the two suites the everyday gate skips (`cyrup-ext`
+//!   with `wasm-host` off, and the gated `cyrup-it` seam suite). See [`features`] for the matrix
+//!   and why each row is in it.
 //!
 //! # `gen-catalogs`
 //!
@@ -176,11 +178,11 @@ const GPT_56_TERRA_COST: &str = r#"{"input":2,"output":12,"cacheRead":0.2,"cache
 /// drops `tiers` (`ai/scripts/generate-models.ts:2718-2723` @v0.84.1).
 const GPT_56_LUNA_COST_NO_TIERS: &str =
     r#"{"input":0.2,"output":1.2,"cacheRead":0.02,"cacheWrite":0.25}"#;
-const GPT_56_TERRA_COST_NO_TIERS: &str = r#"{"input":2,"output":12,"cacheRead":0.2,"cacheWrite":2.5}"#;
+const GPT_56_TERRA_COST_NO_TIERS: &str =
+    r#"{"input":2,"output":12,"cacheRead":0.2,"cacheWrite":2.5}"#;
 
 /// The GPT-5.6 price-cut rationale, shared by the six cost pins.
-const WHY_GPT_56_PRICE_CUT: &str =
-    "[CYRUP-DELTA] pi `OPENAI_GPT_56_STANDARD_COSTS` (v0.84.1 `ai/scripts/generate-models.ts:387-393`) \
+const WHY_GPT_56_PRICE_CUT: &str = "[CYRUP-DELTA] pi `OPENAI_GPT_56_STANDARD_COSTS` (v0.84.1 `ai/scripts/generate-models.ts:387-393`) \
      vs the inline `{1,6,0.1,1.25}` / `{2.5,15,0.25,3.125}` literals at v0.83.0 (`:2193`, `:2181`) \
      — the same literals b0c2a90e's generated data carries. OpenAI cut Luna and Terra prices on \
      2026-07-30 and cyrup adopted the post-cut table: a deliberate, documented v0.84.1 forward-port \
@@ -297,8 +299,7 @@ const FIREWORKS_OPENAI_COMPAT: &str = r#"{"supportsStore":false,"supportsDevelop
      "sendSessionAffinityHeaders":true,"supportsLongCacheRetention":false}"#;
 
 /// DRIFT-052's rationale, shared by the two Fireworks GLM compat pins.
-const WHY_FIREWORKS_GLM_COMPAT: &str =
-    "[CYRUP-DELTA] DRIFT-052. pi `b9497c8c1` (\"fix(ai): correct Fireworks GLM prompt caching, \
+const WHY_FIREWORKS_GLM_COMPAT: &str = "[CYRUP-DELTA] DRIFT-052. pi `b9497c8c1` (\"fix(ai): correct Fireworks GLM prompt caching, \
      closes #7676\", first tag **v0.84.0**, still current at v0.84.2) moved the Fireworks GLM rows \
      off the inline `candidate.compat = { supportsStore: false, supportsDeveloperRole: false }` \
      they carried at the ported tag v0.83.0 (`ai/scripts/generate-models.ts:2151-2155`) onto the \
@@ -312,8 +313,7 @@ const WHY_FIREWORKS_GLM_COMPAT: &str =
      forward-port as the six GPT-5.6 cost pins above, and is pinned by \
      `providers/fireworks.rs::the_glm_5p2_rows_carry_pi_s_openai_compat`.";
 
-const WHY_CODEX_CONTEXT: &str =
-    "PROV-059(d) REFUTED. `CODEX_GPT_56_CONTEXT` is 272000 at the ported tag v0.83.0 \
+const WHY_CODEX_CONTEXT: &str = "PROV-059(d) REFUTED. `CODEX_GPT_56_CONTEXT` is 272000 at the ported tag v0.83.0 \
      (`ai/scripts/generate-models.ts:2352`) AND at v0.84.1 (`:2541`); v0.83.0's comment at `:2349` \
      reads \"GPT-5.6 follows Codex's 272k catalog limit (formerly 372k)\". b0c2a90e's generated \
      data still holds the FORMER 372000, so taking it here would inflate the window 100k past the \
@@ -348,10 +348,7 @@ fn workspace_root() -> PathBuf {
 fn parse_args() -> Result<Args, String> {
     let root = workspace_root();
     let mut args = Args {
-        pi: root
-            .parent()
-            .unwrap_or(Path::new(".."))
-            .join("pi"),
+        pi: root.parent().unwrap_or(Path::new("..")).join("pi"),
         rev: DEFAULT_REV.to_string(),
         out: root.join("crates/cyrup-provider/src/providers"),
         check: false,
@@ -366,10 +363,7 @@ fn parse_args() -> Result<Args, String> {
         ));
     }
     while let Some(a) = it.next() {
-        let mut value = || {
-            it.next()
-                .ok_or_else(|| format!("flag {a} needs a value"))
-        };
+        let mut value = || it.next().ok_or_else(|| format!("flag {a} needs a value"));
         match a.as_str() {
             "--pi" => args.pi = PathBuf::from(value()?),
             "--rev" => args.rev = value()?,
@@ -423,7 +417,11 @@ fn run_gen_catalogs() -> Result<(), String> {
 
     if args.check {
         if differing.is_empty() {
-            println!("gen-catalogs --check: all {} files match pi@{}", generated.len(), args.rev);
+            println!(
+                "gen-catalogs --check: all {} files match pi@{}",
+                generated.len(),
+                args.rev
+            );
             return Ok(());
         }
         return Err(format!(
@@ -459,22 +457,30 @@ fn catalog_path(out: &Path, name: &str) -> PathBuf {
 fn generate_all(args: &Args) -> Result<Vec<(String, String)>, String> {
     let mut out = Vec::new();
     for spec in CATALOGS {
-        let src = git_show(&args.pi, &args.rev, &format!("packages/ai/src/{}", spec.module_path()))?;
+        let src = git_show(
+            &args.pi,
+            &args.rev,
+            &format!("packages/ai/src/{}", spec.module_path()),
+        )?;
         let rows = extract_rows(spec, &src)?;
         let rows = apply_deltas(spec, rows)?;
         let mut body = Val::Arr(rows).to_json();
         body.push('\n');
         out.push((spec.file.to_string(), body));
     }
-    out.push(("catalog_manifest".to_string(), manifest_json(args, out.len())));
+    out.push((
+        "catalog_manifest".to_string(),
+        manifest_json(args, out.len()),
+    ));
     Ok(out)
 }
 
 /// The rows of one catalog, in upstream declaration order.
 fn extract_rows(spec: &CatalogSpec, src: &str) -> Result<Vec<Val>, String> {
     match spec.images_provider {
-        None => tsdata::parse_models_module(src)
-            .map_err(|e| format!("{}: {e}", spec.module_path())),
+        None => {
+            tsdata::parse_models_module(src).map_err(|e| format!("{}: {e}", spec.module_path()))
+        }
         Some(provider) => {
             let whole = tsdata::parse_module_object(src)
                 .map_err(|e| format!("{}: {e}", spec.module_path()))?;
@@ -518,7 +524,10 @@ fn apply_deltas(spec: &CatalogSpec, mut rows: Vec<Val>) -> Result<Vec<Val>, Stri
             }
             DeltaAction::Set(json) => {
                 let pinned = tsdata::parse_json(json).map_err(|e| {
-                    format!("{}: DELTAS pin for {}.{} is not JSON: {e}", spec.file, delta.model, delta.key)
+                    format!(
+                        "{}: DELTAS pin for {}.{} is not JSON: {e}",
+                        spec.file, delta.model, delta.key
+                    )
                 })?;
                 let upstream = row.get(delta.key).ok_or_else(|| {
                     format!(
@@ -570,7 +579,8 @@ fn manifest_json(args: &Args, catalog_count: usize) -> String {
     let generated_at = if args.rev == DEFAULT_REV {
         DEFAULT_REV_TIMESTAMP.to_string()
     } else {
-        git_show_commit_date(&args.pi, &args.rev).unwrap_or_else(|_| DEFAULT_REV_TIMESTAMP.to_string())
+        git_show_commit_date(&args.pi, &args.rev)
+            .unwrap_or_else(|_| DEFAULT_REV_TIMESTAMP.to_string())
     };
 
     // Derived from DELTAS rather than written as prose: the previous note said "one signed-off row
@@ -654,7 +664,13 @@ fn git_show_commit_date(pi: &Path, rev: &str) -> Result<String, String> {
     let out = Command::new("git")
         .arg("-C")
         .arg(pi)
-        .args(["show", "-s", "--format=%cd", "--date=format-local:%Y-%m-%dT%H:%M:%SZ", rev])
+        .args([
+            "show",
+            "-s",
+            "--format=%cd",
+            "--date=format-local:%Y-%m-%dT%H:%M:%SZ",
+            rev,
+        ])
         .env("TZ", "UTC")
         .output()
         .map_err(|e| format!("cannot run git in {}: {e}", pi.display()))?;
@@ -679,9 +695,9 @@ fn report_diff(args: &Args, generated: &[(String, String)]) -> Result<(), String
         }
         let path = catalog_path(&args.out, name);
         let current_src = std::fs::read_to_string(&path).unwrap_or_default();
-        let current = index_rows(&tsdata::parse_json(&current_src).map_err(|e| {
-            format!("{}: {e}", path.display())
-        })?)?;
+        let current = index_rows(
+            &tsdata::parse_json(&current_src).map_err(|e| format!("{}: {e}", path.display()))?,
+        )?;
         let next = index_rows(&tsdata::parse_json(body).map_err(|e| format!("{name}: {e}"))?)?;
 
         for (id, row) in &next {
@@ -874,7 +890,10 @@ mod tests {
         };
         let keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, vec!["id", "contextWindow", "maxTokens"]);
-        assert_eq!(out[0].get("contextWindow"), Some(&Val::Num("272000".into())));
+        assert_eq!(
+            out[0].get("contextWindow"),
+            Some(&Val::Num("272000".into()))
+        );
     }
 
     /// A pin whose value upstream has since adopted is a no-op, and a pin on a key upstream does
@@ -919,8 +938,19 @@ mod tests {
             ("added".into(), Val::Num("1".into())),
         ]);
         let lines = field_diff(&a, &b);
-        assert!(lines.iter().any(|l| l.contains("api: \"openai-completions\" -> \"openai-responses\"")), "{lines:?}");
-        assert!(lines.iter().any(|l| l.contains("added: (absent) -> 1")), "{lines:?}");
-        assert!(lines.iter().any(|l| l.contains("gone: true -> (absent)")), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("api: \"openai-completions\" -> \"openai-responses\"")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("added: (absent) -> 1")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("gone: true -> (absent)")),
+            "{lines:?}"
+        );
     }
 }

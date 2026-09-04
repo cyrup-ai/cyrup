@@ -59,6 +59,12 @@ cyrup-provider = { workspace = true }
 tokio = { workspace = true, features = ["process", "io-util", "fs", "sync", "time", "signal", "macros", "rt-multi-thread"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# SUBA-082: an agent file's `acceptance:` frontmatter value is YAML upstream
+# (`parseAgentAcceptanceFrontmatter` calls `parseYaml`, `agents.ts:1916` @v0.64.0 — a bare scalar,
+# a JSON object, a YAML flow map with unquoted keys, or a nested block are all documented forms),
+# so `discovery/frontmatter.rs` parses it with the same crate `cyrup-resources` already uses for
+# its own frontmatter rather than a JSON-only reader that would reject the documented flow-map form.
+serde_yml = "0.0.13"
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 nix = { workspace = true, features = ["signal", "process"] }
@@ -70,8 +76,10 @@ notify = { workspace = true }
 jsonschema = { workspace = true }
 # `v4` added on top of the workspace-default `v7` feature: `background::RunId` (R-SA-072) needs
 # pure random entropy for an opaque, non-orderable run token, whereas `atomic.rs`'s temp-filename
-# nonce deliberately wants v7's sortable timestamp prefix — both features compose additively.
-uuid = { workspace = true, features = ["v4"] }
+# nonce and `background::control`'s stop-request file names deliberately want v7's sortable,
+# monotonic timestamp prefix — both features compose additively (`v7` named here as well so this
+# crate's own use of `Uuid::now_v7` does not silently depend on workspace feature unification).
+uuid = { workspace = true, features = ["v4", "v7"] }
 libc = { workspace = true }
 # G90 steer: pi names a steer-request file `<ts>-<base64url(id)>.json`
 # (`control-channel.ts:85-87` @v0.34.0), so the id — an arbitrary caller-supplied string —

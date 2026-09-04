@@ -1,15 +1,20 @@
 //! Response decoding — block close-out, `thoughtSignature` retention, usage folding and the
 //! terminal error (Pi google-generative-ai.ts:106-122,218-273).
 
+use super::decoder::{CurrentKind, Decoder};
 use crate::api::EventSink;
 use crate::model::Model;
 use crate::stream::StreamEvent;
 use cyrup_core::{ApiId, Content, StopReason, Usage};
 use serde_json::Value;
-use super::decoder::{CurrentKind, Decoder};
 
 /// Emit the `*_end` for the in-progress text/thinking block, if any (Pi google-generative-ai.ts:106-122).
-pub(super) async fn close_current(dec: &mut Decoder, model: &Model, api: &ApiId, sink: &EventSink) -> bool {
+pub(super) async fn close_current(
+    dec: &mut Decoder,
+    model: &Model,
+    api: &ApiId,
+    sink: &EventSink,
+) -> bool {
     let Some(kind) = dec.current.take() else {
         return true;
     };
@@ -75,7 +80,13 @@ pub(super) fn apply_usage(usage: &mut Usage, meta: &Value) {
 
 /// Emit a terminal error event carrying the partial snapshot (Pi catch block,
 /// google-generative-ai.ts:266-277).
-pub(super) async fn emit_error(dec: &Decoder, model: &Model, api: &ApiId, sink: &EventSink, message: String) {
+pub(super) async fn emit_error(
+    dec: &Decoder,
+    model: &Model,
+    api: &ApiId,
+    sink: &EventSink,
+    message: String,
+) {
     let mut msg = dec.snapshot_owned(model, api);
     msg.stop_reason = StopReason::Error;
     msg.error_message = Some(message);

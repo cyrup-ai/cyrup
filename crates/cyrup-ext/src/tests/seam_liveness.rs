@@ -14,7 +14,12 @@
 //!
 //! Feature-independent on purpose: everything except the two guest-import tests runs on BOTH
 //! `cargo test -p cyrup-ext` and `cargo test -p cyrup-ext --no-default-features`.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use crate::{
     CommandDescriptor, EventKind, ExtError, ExtKind, Extension, ExtensionHost, ExtensionRegistry,
@@ -24,7 +29,7 @@ use crate::{
 use cyrup_core::{
     CancelToken, Content, ExtensionId, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -72,7 +77,10 @@ impl Extension for LateSubscriber {
         ExtKind::Wasm
     }
     fn subscriptions(&self) -> Subscriptions {
-        self.subs.lock().map(|g| *g).unwrap_or_else(|_| Subscriptions::empty())
+        self.subs
+            .lock()
+            .map(|g| *g)
+            .unwrap_or_else(|_| Subscriptions::empty())
     }
     async fn invoke_event(
         &self,
@@ -92,12 +100,20 @@ async fn a_subscription_taken_after_load_receives_the_next_event() {
     let cancel = CancelToken::new();
 
     // Nothing subscribed yet: the cheap gate must still skip the handler loop.
-    host.dispatcher().dispatch_notify(&HostEvent::AgentStart, &cancel).await;
-    assert_eq!(ext.seen(), 0, "an unsubscribed extension must not be invoked");
+    host.dispatcher()
+        .dispatch_notify(&HostEvent::AgentStart, &cancel)
+        .await;
+    assert_eq!(
+        ext.seen(),
+        0,
+        "an unsubscribed extension must not be invoked"
+    );
 
     // The late `subscribe` — pi's `pi.on(\"agent_start\", …)` from a live handler.
     ext.subscribe_now(EventKind::AgentStart);
-    host.dispatcher().dispatch_notify(&HostEvent::AgentStart, &cancel).await;
+    host.dispatcher()
+        .dispatch_notify(&HostEvent::AgentStart, &cancel)
+        .await;
     assert_eq!(
         ext.seen(),
         1,
@@ -128,7 +144,10 @@ async fn a_guest_command_registered_after_init_is_routable() {
 
     // No `LiveExtension::load` drain runs here — this is the live-handler path.
     state
-        .register_command("late".into(), json!({"description": "registered late"}).to_string())
+        .register_command(
+            "late".into(),
+            json!({"description": "registered late"}).to_string(),
+        )
         .await;
 
     assert_eq!(
@@ -171,21 +190,37 @@ fn an_owner_re_registering_its_own_command_replaces_it() {
         .register_command(
             owner.clone(),
             "deploy",
-            CommandDescriptor { description: "v1".into(), completions: vec![] },
+            CommandDescriptor {
+                description: "v1".into(),
+                completions: vec![],
+            },
         )
         .expect("first");
     registry
         .register_command(
             owner.clone(),
             "deploy",
-            CommandDescriptor { description: "v2".into(), completions: vec![] },
+            CommandDescriptor {
+                description: "v2".into(),
+                completions: vec![],
+            },
         )
         .expect("second");
 
     let resolved = registry.resolved_commands().expect("resolve");
-    assert_eq!(resolved.len(), 1, "one upstream Map entry, one row: {resolved:?}");
-    assert_eq!(resolved[0].invocation_name, "deploy", "the bare name stays routable");
-    assert_eq!(resolved[0].descriptor.description, "v2", "the newer descriptor wins");
+    assert_eq!(
+        resolved.len(),
+        1,
+        "one upstream Map entry, one row: {resolved:?}"
+    );
+    assert_eq!(
+        resolved[0].invocation_name, "deploy",
+        "the bare name stays routable"
+    );
+    assert_eq!(
+        resolved[0].descriptor.description, "v2",
+        "the newer descriptor wins"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -215,7 +250,10 @@ impl Tool for StubTool {
         _cancel: CancelToken,
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
-        Ok(ToolResult { content: vec![Content::text("stub")], ..Default::default() })
+        Ok(ToolResult {
+            content: vec![Content::text("stub")],
+            ..Default::default()
+        })
     }
 }
 
@@ -242,11 +280,17 @@ fn descriptor(name: &str, description: &str) -> ToolDescriptor {
 #[tokio::test]
 async fn refresh_tools_reports_a_late_native_registration() {
     let host = ExtensionHost::new(HostConfig::default());
-    assert!(!host.refresh_tools().expect("clean"), "nothing registered yet");
+    assert!(
+        !host.refresh_tools().expect("clean"),
+        "nothing registered yet"
+    );
 
     host.register_late_tool(
         ExtensionId::from("native-a"),
-        Arc::new(StubTool { name: "late_tool".into(), schema: json!({"type": "object"}) }),
+        Arc::new(StubTool {
+            name: "late_tool".into(),
+            schema: json!({"type": "object"}),
+        }),
     )
     .expect("register");
 
@@ -255,7 +299,10 @@ async fn refresh_tools_reports_a_late_native_registration() {
         "a registration that landed since the last refresh must be reported as a change — pi's \
          `registerTool` ends with an unconditional `runtime.refreshTools()`"
     );
-    assert!(!host.refresh_tools().expect("refresh"), "and the flag is consumed exactly once");
+    assert!(
+        !host.refresh_tools().expect("refresh"),
+        "and the flag is consumed exactly once"
+    );
 }
 
 /// The guest half: a descriptor REPLACED by its own owner (the `dynamic-tools.ts` pattern — same
@@ -267,10 +314,17 @@ async fn refresh_tools_reports_a_late_native_registration() {
 async fn refresh_tools_reports_a_replaced_guest_descriptor() {
     let host = ExtensionHost::new(HostConfig::default());
     let owner = ExtensionId::from("guest-a");
-    host.registry().register_guest_tool(owner.clone(), descriptor("t", "v1")).expect("first");
-    assert!(host.refresh_tools().expect("refresh"), "the first registration is a change");
+    host.registry()
+        .register_guest_tool(owner.clone(), descriptor("t", "v1"))
+        .expect("first");
+    assert!(
+        host.refresh_tools().expect("refresh"),
+        "the first registration is a change"
+    );
 
-    host.registry().register_guest_tool(owner, descriptor("t", "v2")).expect("replace");
+    host.registry()
+        .register_guest_tool(owner, descriptor("t", "v2"))
+        .expect("replace");
     assert!(
         host.refresh_tools().expect("refresh"),
         "re-registering the SAME name with a CHANGED descriptor is a change too"
@@ -296,7 +350,10 @@ fn the_tool_enumeration_accessors_report_registration_order_without_duplicates()
         registry
             .register_tool(
                 owner.clone(),
-                Arc::new(StubTool { name: name.into(), schema: json!({"type": "object"}) }),
+                Arc::new(StubTool {
+                    name: name.into(),
+                    schema: json!({"type": "object"}),
+                }),
             )
             .expect("register");
     }
@@ -304,18 +361,35 @@ fn the_tool_enumeration_accessors_report_registration_order_without_duplicates()
     registry
         .register_tool(
             owner.clone(),
-            Arc::new(StubTool { name: "b_tool".into(), schema: json!({"type": "object"}) }),
+            Arc::new(StubTool {
+                name: "b_tool".into(),
+                schema: json!({"type": "object"}),
+            }),
         )
         .expect("re-register");
 
     let tools = registry.extension_tools().expect("tools");
     let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-    assert_eq!(names, vec!["b_tool", "a_tool"], "registration order, no duplicate row");
+    assert_eq!(
+        names,
+        vec!["b_tool", "a_tool"],
+        "registration order, no duplicate row"
+    );
 
-    registry.register_guest_tool(owner, descriptor("g_tool", "v1")).expect("guest tool");
-    let guest: Vec<String> =
-        registry.guest_tool_descriptors().expect("descs").into_iter().map(|d| d.name).collect();
-    assert_eq!(guest, vec!["g_tool".to_string()], "the guest table is separate from `tools`");
+    registry
+        .register_guest_tool(owner, descriptor("g_tool", "v1"))
+        .expect("guest tool");
+    let guest: Vec<String> = registry
+        .guest_tool_descriptors()
+        .expect("descs")
+        .into_iter()
+        .map(|d| d.name)
+        .collect();
+    assert_eq!(
+        guest,
+        vec!["g_tool".to_string()],
+        "the guest table is separate from `tools`"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -349,7 +423,11 @@ struct CtxProbe {
 
 impl CtxProbe {
     fn snapshot(ctx: &HostCtx) -> String {
-        format!("idle={} trusted={}", ctx.is_idle(), ctx.is_project_trusted())
+        format!(
+            "idle={} trusted={}",
+            ctx.is_idle(),
+            ctx.is_project_trusted()
+        )
     }
     fn seen(&self) -> Vec<String> {
         self.seen.lock().map(|g| g.clone()).unwrap_or_default()
@@ -397,19 +475,26 @@ async fn a_native_reads_live_ctx_state_on_every_arm() {
     host.load_native(probe.clone()).await.expect("load native");
 
     let cancel = CancelToken::new();
-    host.dispatcher().dispatch_notify(&HostEvent::AgentStart, &cancel).await;
+    host.dispatcher()
+        .dispatch_notify(&HostEvent::AgentStart, &cancel)
+        .await;
     let command = host
         .execute_native_command("probe", "", &cancel)
         .await
         .expect("routed")
         .expect("owned")
         .expect("handler ok");
-    host.run_shortcut("ctrl+p", &cancel).await.expect("shortcut");
+    host.run_shortcut("ctrl+p", &cancel)
+        .await
+        .expect("shortcut");
 
     let seen = probe.seen();
     assert_eq!(
         seen,
-        vec!["event:idle=true trusted=true", "shortcut:idle=true trusted=true"],
+        vec![
+            "event:idle=true trusted=true",
+            "shortcut:idle=true trusted=true"
+        ],
         "event and shortcut handlers must read the live source, not HostCtxRich::default() — on \
          the native-only build too"
     );
@@ -435,8 +520,14 @@ async fn a_poisoned_dispatcher_lock_is_reported_once() {
     host.dispatcher().poison_for_test();
 
     let cancel = CancelToken::new();
-    host.dispatcher().dispatch_notify(&HostEvent::AgentStart, &cancel).await;
-    assert_eq!(ext.seen(), 0, "fail-soft: a poisoned lock never crashes the host");
+    host.dispatcher()
+        .dispatch_notify(&HostEvent::AgentStart, &cancel)
+        .await;
+    assert_eq!(
+        ext.seen(),
+        0,
+        "fail-soft: a poisoned lock never crashes the host"
+    );
     assert!(
         host.dispatcher().poison_reported(),
         "…but it is no longer silent: poisoning is permanent, so every extension event is dropped \

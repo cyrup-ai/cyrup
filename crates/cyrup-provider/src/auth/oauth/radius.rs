@@ -525,10 +525,7 @@ impl RadiusOAuth {
         cancel: Option<&CancelToken>,
     ) -> Result<Credential, TokenRequestError> {
         let url = gateway_url(&self.gateway, "/v1/oauth/token");
-        let client = self
-            .client(&url)
-            .await
-            .map_err(TokenRequestError::Other)?;
+        let client = self.client(&url).await.map_err(TokenRequestError::Other)?;
 
         // `:106-112`
         let send = client
@@ -567,7 +564,9 @@ impl RadiusOAuth {
         let data: serde_json::Value =
             serde_json::from_str(text.trim()).unwrap_or(serde_json::Value::Null);
         let access = data.get("access_token").and_then(serde_json::Value::as_str);
-        let refresh = data.get("refresh_token").and_then(serde_json::Value::as_str);
+        let refresh = data
+            .get("refresh_token")
+            .and_then(serde_json::Value::as_str);
         let expires_in = data.get("expires_in").and_then(serde_json::Value::as_f64);
 
         let (access, refresh, expires_in) = match (access, refresh, expires_in) {
@@ -705,15 +704,12 @@ impl RadiusOAuth {
         // `:222-233`
         let authorize_url = self.authorization_url(authorization_endpoint, &pkce.challenge, &state);
         // `:235`
-        let server = self.start_oauth_callback_server(&state, interaction).await?;
+        let server = self
+            .start_oauth_callback_server(&state, interaction)
+            .await?;
 
         let result = self
-            .run_login_with_browser(
-                interaction,
-                &authorize_url,
-                &pkce.verifier,
-                server.as_ref(),
-            )
+            .run_login_with_browser(interaction, &authorize_url, &pkce.verifier, server.as_ref())
             .await;
 
         // `:262` — `finally { callbackServer.close(); }`.
@@ -791,7 +787,9 @@ impl RadiusOAuth {
                     interval: data.get("interval").and_then(serde_json::Value::as_f64),
                 })
             }
-            _ => Err(OAuthError::Failed(DEVICE_MISSING_FIELDS_MESSAGE.to_string())),
+            _ => Err(OAuthError::Failed(
+                DEVICE_MISSING_FIELDS_MESSAGE.to_string(),
+            )),
         }
     }
 
@@ -1048,7 +1046,8 @@ mod tests {
 
     #[test]
     fn oauth_response_error_detail_follows_upstream_precedence() {
-        let of = |body: &str| read_oauth_response_error(400, body, "Radius OAuth token request failed");
+        let of =
+            |body: &str| read_oauth_response_error(400, body, "Radius OAuth token request failed");
         // `:75-77` — error + description.
         assert_eq!(
             of(r#"{"error":"invalid_grant","error_description":"bad code"}"#).to_string(),
@@ -1070,10 +1069,7 @@ mod tests {
             "Radius OAuth token request failed: 400"
         );
         // `:88` — an empty body contributes nothing at all.
-        assert_eq!(
-            of("").to_string(),
-            "Radius OAuth token request failed: 400"
-        );
+        assert_eq!(of("").to_string(), "Radius OAuth token request failed: 400");
         // `:96-98` — an unparseable body becomes the description wholesale.
         assert_eq!(
             of("<html>gateway</html>").to_string(),
@@ -1086,7 +1082,9 @@ mod tests {
         );
         // `oauth_error` is what the device poll switches on (`:329`).
         assert_eq!(
-            of(r#"{"error":"authorization_pending"}"#).oauth_error.as_deref(),
+            of(r#"{"error":"authorization_pending"}"#)
+                .oauth_error
+                .as_deref(),
             Some("authorization_pending")
         );
     }
@@ -1173,9 +1171,16 @@ mod tests {
             "https://auth.example/authorize"
         );
         let recorded = gateway.recorded();
-        assert!(recorded[0].0.starts_with("GET /v1/oauth HTTP/1.1"), "{}", recorded[0].0);
         assert!(
-            recorded[0].0.to_lowercase().contains("accept: application/json"),
+            recorded[0].0.starts_with("GET /v1/oauth HTTP/1.1"),
+            "{}",
+            recorded[0].0
+        );
+        assert!(
+            recorded[0]
+                .0
+                .to_lowercase()
+                .contains("accept: application/json"),
             "{}",
             recorded[0].0
         );
@@ -1188,7 +1193,10 @@ mod tests {
         let flow = flow_for(&gateway.base);
         assert_eq!(
             flow.load_oauth_discovery().await.unwrap_err().to_string(),
-            format!("Could not load Radius OAuth config from {}: 503 down", flow.gateway())
+            format!(
+                "Could not load Radius OAuth config from {}: 503 down",
+                flow.gateway()
+            )
         );
 
         for body in [r#"{}"#, r#"{"authorizationEndpoint":7}"#, "not json"] {
@@ -1288,7 +1296,10 @@ mod tests {
         match err {
             TokenRequestError::Response(response) => {
                 assert_eq!(response.status, 400);
-                assert_eq!(response.oauth_error.as_deref(), Some("authorization_pending"));
+                assert_eq!(
+                    response.oauth_error.as_deref(),
+                    Some("authorization_pending")
+                );
                 assert_eq!(
                     response.to_string(),
                     "Radius OAuth token request failed: authorization_pending"
@@ -1325,7 +1336,10 @@ mod tests {
             recorded[0].0
         );
         // `:274` — the field order upstream serializes.
-        assert_eq!(recorded[0].1, "client_id=pi-gateway&scope=gateway+offline_access");
+        assert_eq!(
+            recorded[0].1,
+            "client_id=pi-gateway&scope=gateway+offline_access"
+        );
 
         // `:288-294` — JS truthiness, so an empty string or a zero `expires_in` is missing.
         for body in [
@@ -1362,7 +1376,10 @@ mod tests {
 
     // -- the device poll mapping, radius.ts:325-340 ------------------------
 
-    async fn poll_once(status: u16, body: &str) -> Result<DeviceCodePollResult<Credential>, OAuthError> {
+    async fn poll_once(
+        status: u16,
+        body: &str,
+    ) -> Result<DeviceCodePollResult<Credential>, OAuthError> {
         let gateway = FakeGateway::one(status, body);
         let flow = flow_for(&gateway.base);
         let poller = DeviceTokenPoller {
@@ -1404,12 +1421,20 @@ mod tests {
         );
         // `:334-335`
         assert_eq!(
-            describe(&poll_once(400, r#"{"error":"expired_token"}"#).await.unwrap()),
+            describe(
+                &poll_once(400, r#"{"error":"expired_token"}"#)
+                    .await
+                    .unwrap()
+            ),
             "failed:Device authorization expired."
         );
         // `:336-337`
         assert_eq!(
-            describe(&poll_once(400, r#"{"error":"access_denied"}"#).await.unwrap()),
+            describe(
+                &poll_once(400, r#"{"error":"access_denied"}"#)
+                    .await
+                    .unwrap()
+            ),
             "failed:Device authorization was denied."
         );
         // `:338-339` — an unrecognised code rethrows rather than being folded into a poll result.
@@ -1482,7 +1507,9 @@ mod tests {
         );
 
         match credential {
-            Credential::Oauth { access, refresh, .. } => {
+            Credential::Oauth {
+                access, refresh, ..
+            } => {
                 assert_eq!(access, "at-9");
                 assert_eq!(refresh, "rt-9");
             }
@@ -1490,7 +1517,11 @@ mod tests {
         }
 
         let recorded = gateway.recorded();
-        assert!(recorded[1].0.starts_with("POST /v1/oauth/token"), "{}", recorded[1].0);
+        assert!(
+            recorded[1].0.starts_with("POST /v1/oauth/token"),
+            "{}",
+            recorded[1].0
+        );
         // `:313-322` — the device grant, in upstream's field order.
         assert_eq!(
             recorded[1].1,
@@ -1645,7 +1676,10 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(missing.contains("<p>Missing authorization code.</p>"), "{missing}");
+        assert!(
+            missing.contains("<p>Missing authorization code.</p>"),
+            "{missing}"
+        );
 
         // Mirror: the listener is still live.
         let good = tokio::task::spawn_blocking(move || {
@@ -1676,8 +1710,13 @@ mod tests {
             let interaction = Arc::clone(&interaction);
             let flow = flow.clone();
             async move {
-                flow.run_login_with_browser(interaction.as_ref(), "https://a/b", "VERIF", Some(&server))
-                    .await
+                flow.run_login_with_browser(
+                    interaction.as_ref(),
+                    "https://a/b",
+                    "VERIF",
+                    Some(&server),
+                )
+                .await
             }
         };
         let drive = tokio::task::spawn_blocking(move || {
@@ -1688,7 +1727,10 @@ mod tests {
         });
         let (result, response) = tokio::join!(login, drive);
         let response = response.unwrap();
-        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{response}");
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+            "{response}"
+        );
         // `:189` — the description wins over the bare code.
         assert!(response.contains("<p>User said no</p>"), "{response}");
         assert_eq!(
@@ -1736,7 +1778,9 @@ mod tests {
         };
         let refreshed = flow.refresh(&cred).await.unwrap();
         match refreshed {
-            Credential::Oauth { access, refresh, .. } => {
+            Credential::Oauth {
+                access, refresh, ..
+            } => {
                 assert_eq!(access, "at-2");
                 assert_eq!(refresh, "rt-2");
             }

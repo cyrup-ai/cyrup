@@ -77,8 +77,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cyrup_core::CancelToken;
-use futures::future::{BoxFuture, FutureExt, Shared};
 use futures::StreamExt;
+use futures::future::{BoxFuture, FutureExt, Shared};
 use indexmap::IndexMap;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -364,8 +364,7 @@ pub type PendingAuthCheck = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 /// `ReconnectCallback` (`lifecycle.ts:9`). Fallible on purpose: `publishConnectedMetadata` catches
 /// a throwing callback and turns it into a `"publish"` connection failure (`lifecycle.ts:311-314`),
 /// which is what keeps a broken metadata write from being mistaken for a healthy reconnect.
-pub type ReconnectCallback =
-    Arc<dyn Fn(String) -> BoxFuture<'static, McpResult<()>> + Send + Sync>;
+pub type ReconnectCallback = Arc<dyn Fn(String) -> BoxFuture<'static, McpResult<()>> + Send + Sync>;
 
 /// `ReconnectFailureCallback` (`lifecycle.ts:10`) — synchronous and infallible upstream
 /// (`recordFailure` + `updateStatusBar`).
@@ -644,7 +643,9 @@ impl McpLifecycleManager {
         if definition.is_disabled() {
             return;
         }
-        registry.keep_alive_servers.insert(name.to_string(), definition);
+        registry
+            .keep_alive_servers
+            .insert(name.to_string(), definition);
     }
 
     /// `markKeepAliveAfterConnect(state, serverName)` (`init.ts:463-469`) — the `lazy-keep-alive`
@@ -660,12 +661,13 @@ impl McpLifecycleManager {
         let Some(definition) = registry.all_servers.get(name).map(Arc::clone) else {
             return;
         };
-        if definition.is_disabled()
-            || definition.lifecycle_mode() != ServerLifecycle::LazyKeepAlive
+        if definition.is_disabled() || definition.lifecycle_mode() != ServerLifecycle::LazyKeepAlive
         {
             return;
         }
-        registry.keep_alive_servers.insert(name.to_string(), definition);
+        registry
+            .keep_alive_servers
+            .insert(name.to_string(), definition);
     }
 
     /// `getIdleTimeout(name)` (`lifecycle.ts:377-381`) — the registered override, else the
@@ -980,7 +982,9 @@ impl McpLifecycleManager {
         Box::pin(async move {
             let result = check.clone().await;
             if let Ok(mut slot) = owner.convergence.lock()
-                && slot.as_ref().is_some_and(|held| Shared::ptr_eq(held, &check))
+                && slot
+                    .as_ref()
+                    .is_some_and(|held| Shared::ptr_eq(held, &check))
             {
                 *slot = None;
             }
@@ -1066,8 +1070,7 @@ impl McpLifecycleManager {
                 return Ok(());
             }
 
-            let connected = current
-                .filter(|c| c.status() == ConnectionStatus::Connected);
+            let connected = current.filter(|c| c.status() == ConnectionStatus::Connected);
             let Some(connection) = connected else {
                 // ── missing or not connected: a full connect (`lifecycle.ts:176-207`) ──
                 if self.has_pending_auth(name) {
@@ -1439,7 +1442,9 @@ impl McpLifecycleManager {
                 .get(name)
                 .map_or(0, |retry| retry.attempts)
                 .saturating_add(1);
-            let doublings = attempts.saturating_sub(1).min(KEEP_ALIVE_RETRY_MAX_DOUBLINGS);
+            let doublings = attempts
+                .saturating_sub(1)
+                .min(KEEP_ALIVE_RETRY_MAX_DOUBLINGS);
             let delay = KEEP_ALIVE_RETRY_BASE
                 .checked_mul(1u32 << doublings)
                 .unwrap_or(KEEP_ALIVE_RETRY_MAX)
@@ -1487,7 +1492,9 @@ impl McpLifecycleManager {
 
     fn add_pending_publication(&self, name: &str) {
         if let Ok(mut registry) = self.registry.lock() {
-            registry.pending_metadata_publications.insert(name.to_string());
+            registry
+                .pending_metadata_publications
+                .insert(name.to_string());
         }
     }
 
@@ -1574,10 +1581,9 @@ impl McpLifecycleManager {
 
 impl std::fmt::Debug for McpLifecycleManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (all, keep_alive) = self
-            .registry
-            .lock()
-            .map_or((0, 0), |r| (r.all_servers.len(), r.keep_alive_servers.len()));
+        let (all, keep_alive) = self.registry.lock().map_or((0, 0), |r| {
+            (r.all_servers.len(), r.keep_alive_servers.len())
+        });
         f.debug_struct("McpLifecycleManager")
             .field("stopped", &self.is_stopped())
             .field("servers", &all)
@@ -1712,7 +1718,9 @@ pub fn shutdown_previous_generation(
     flush: MetadataFlush,
 ) -> impl Future<Output = ()> + Send + 'static {
     // 1 — the synchronous abort.
-    let stop_previous = previous.owner.map(|owner| owner.begin_stop(Some(stop_reason)));
+    let stop_previous = previous
+        .owner
+        .map(|owner| owner.begin_stop(Some(stop_reason)));
     // 2 — `shutdownState`'s own synchronous prefix (snapshot + flush) also happens now.
     let shutdown = shutdown_state(previous.state, state_reason, flush);
     // 3 — the OAuth runtime's teardown.
@@ -1923,7 +1931,10 @@ mod tests {
     }
 
     fn keep_alive_entry() -> ServerEntry {
-        ServerEntry { lifecycle: Some(ServerLifecycle::KeepAlive), ..Default::default() }
+        ServerEntry {
+            lifecycle: Some(ServerLifecycle::KeepAlive),
+            ..Default::default()
+        }
     }
 
     // ── registration and idle accounting ────────────────────────────────────────────────────
@@ -1936,11 +1947,20 @@ mod tests {
         lc.register_server("global", ServerEntry::default(), None);
         assert_eq!(lc.idle_timeout("global"), Some(Duration::from_secs(600)));
 
-        let entry = ServerEntry { idle_timeout: Some(2.0), ..Default::default() };
+        let entry = ServerEntry {
+            idle_timeout: Some(2.0),
+            ..Default::default()
+        };
         lc.register_server("entry", entry.clone(), None);
         assert_eq!(lc.idle_timeout("entry"), Some(Duration::from_secs(120)));
 
-        lc.register_server("over", entry, Some(LifecycleOverrides { idle_timeout: Some(1.0) }));
+        lc.register_server(
+            "over",
+            entry,
+            Some(LifecycleOverrides {
+                idle_timeout: Some(1.0),
+            }),
+        );
         assert_eq!(lc.idle_timeout("over"), Some(Duration::from_secs(60)));
     }
 
@@ -1950,9 +1970,15 @@ mod tests {
         lc.register_server(
             "eager",
             ServerEntry::default(),
-            Some(LifecycleOverrides { idle_timeout: Some(0.0) }),
+            Some(LifecycleOverrides {
+                idle_timeout: Some(0.0),
+            }),
         );
-        assert_eq!(lc.idle_timeout("eager"), None, "0 means never idle out, not 'immediately'");
+        assert_eq!(
+            lc.idle_timeout("eager"),
+            None,
+            "0 means never idle out, not 'immediately'"
+        );
         assert_eq!(lc.idle_timeout("unregistered"), None);
     }
 
@@ -1961,12 +1987,18 @@ mod tests {
         let lc = lifecycle();
         lc.register_server(
             "nan",
-            ServerEntry { idle_timeout: Some(f64::NAN), ..Default::default() },
+            ServerEntry {
+                idle_timeout: Some(f64::NAN),
+                ..Default::default()
+            },
             None,
         );
         lc.register_server(
             "neg",
-            ServerEntry { idle_timeout: Some(-5.0), ..Default::default() },
+            ServerEntry {
+                idle_timeout: Some(-5.0),
+                ..Default::default()
+            },
             None,
         );
         assert_eq!(lc.idle_timeout("nan"), None);
@@ -1978,11 +2010,18 @@ mod tests {
         let lc = lifecycle();
         lc.register_server(
             "off",
-            ServerEntry { disabled: Some(true), ..Default::default() },
+            ServerEntry {
+                disabled: Some(true),
+                ..Default::default()
+            },
             None,
         );
         lc.mark_keep_alive("off");
-        assert_eq!(lc.idle_timeout("off"), None, "a disabled server is never registered at all");
+        assert_eq!(
+            lc.idle_timeout("off"),
+            None,
+            "a disabled server is never registered at all"
+        );
         assert!(!lc.is_keep_alive("off"));
     }
 
@@ -1992,7 +2031,10 @@ mod tests {
         lc.register_server("plain-lazy", ServerEntry::default(), None);
         lc.register_server(
             "lazy-keep",
-            ServerEntry { lifecycle: Some(ServerLifecycle::LazyKeepAlive), ..Default::default() },
+            ServerEntry {
+                lifecycle: Some(ServerLifecycle::LazyKeepAlive),
+                ..Default::default()
+            },
             None,
         );
         lc.mark_keep_alive_after_connect("plain-lazy");
@@ -2011,12 +2053,18 @@ mod tests {
         lc.register_server("plain", ServerEntry::default(), None);
         lc.register_server(
             "explicit",
-            ServerEntry { idle_timeout: Some(3.0), ..Default::default() },
+            ServerEntry {
+                idle_timeout: Some(3.0),
+                ..Default::default()
+            },
             None,
         );
         lc.register_server(
             "eager",
-            ServerEntry { lifecycle: Some(ServerLifecycle::Eager), ..Default::default() },
+            ServerEntry {
+                lifecycle: Some(ServerLifecycle::Eager),
+                ..Default::default()
+            },
             None,
         );
         assert_eq!(lc.effective_idle_timeout_minutes("plain"), 7.0);
@@ -2028,7 +2076,13 @@ mod tests {
     #[test]
     fn unregister_clears_every_map() {
         let lc = lifecycle();
-        lc.register_server("a", keep_alive_entry(), Some(LifecycleOverrides { idle_timeout: Some(4.0) }));
+        lc.register_server(
+            "a",
+            keep_alive_entry(),
+            Some(LifecycleOverrides {
+                idle_timeout: Some(4.0),
+            }),
+        );
         lc.mark_keep_alive("a");
         assert!(lc.is_keep_alive("a"));
         lc.unregister_server("a");
@@ -2061,13 +2115,19 @@ mod tests {
         lc.check_connections(&CancelToken::new()).await.unwrap();
         assert_eq!(supervisor.log(), vec!["connect:a", "connected:a"]);
         assert_eq!(published.lock().unwrap().clone(), vec!["a".to_string()]);
-        assert!(!lc.has_pending_publication("a"), "a successful publish clears the retry marker");
+        assert!(
+            !lc.has_pending_publication("a"),
+            "a successful publish clears the retry marker"
+        );
     }
 
     #[tokio::test]
     async fn a_connected_stdio_server_is_never_probed() {
         let supervisor = FakeSupervisor::arc();
-        supervisor.set_connection("a", FakeConnection::handle(ConnectionStatus::Connected, false));
+        supervisor.set_connection(
+            "a",
+            FakeConnection::handle(ConnectionStatus::Connected, false),
+        );
         let lc = lifecycle_with(Arc::clone(&supervisor));
         lc.register_server("a", keep_alive_entry(), None);
         lc.mark_keep_alive("a");
@@ -2083,7 +2143,10 @@ mod tests {
     #[tokio::test]
     async fn a_connected_http_server_is_probed_every_pass() {
         let supervisor = FakeSupervisor::arc();
-        supervisor.set_connection("a", FakeConnection::handle(ConnectionStatus::Connected, true));
+        supervisor.set_connection(
+            "a",
+            FakeConnection::handle(ConnectionStatus::Connected, true),
+        );
         let lc = lifecycle_with(Arc::clone(&supervisor));
         let entry = ServerEntry {
             url: Some("https://example.test/mcp".to_string()),
@@ -2094,13 +2157,20 @@ mod tests {
         lc.mark_keep_alive("a");
 
         lc.check_connections(&CancelToken::new()).await.unwrap();
-        assert_eq!(supervisor.log(), vec!["refresh:a"], "keep-alive servers skip the idle sweep");
+        assert_eq!(
+            supervisor.log(),
+            vec!["refresh:a"],
+            "keep-alive servers skip the idle sweep"
+        );
     }
 
     #[tokio::test]
     async fn a_needs_auth_connection_is_never_treated_as_a_failure() {
         let supervisor = FakeSupervisor::arc();
-        supervisor.set_connection("a", FakeConnection::handle(ConnectionStatus::NeedsAuth, false));
+        supervisor.set_connection(
+            "a",
+            FakeConnection::handle(ConnectionStatus::NeedsAuth, false),
+        );
         let lc = lifecycle_with(Arc::clone(&supervisor));
         lc.register_server("a", keep_alive_entry(), None);
         lc.mark_keep_alive("a");
@@ -2170,7 +2240,10 @@ mod tests {
         assert!(lc.has_pending_auth("a"));
         lc.check_connections(&CancelToken::new()).await.unwrap();
         assert!(
-            !suppressed.log().iter().any(|entry| entry.starts_with("connect:")),
+            !suppressed
+                .log()
+                .iter()
+                .any(|entry| entry.starts_with("connect:")),
             "a rebound predicate must gate the reconnect: {:?}",
             suppressed.log()
         );
@@ -2195,8 +2268,15 @@ mod tests {
         lc.check_connections(&token).await.unwrap();
         lc.check_connections(&token).await.unwrap();
 
-        let connects = supervisor.log().iter().filter(|e| *e == "connect:a").count();
-        assert_eq!(connects, 1, "the 30 s backoff suppresses passes two and three entirely");
+        let connects = supervisor
+            .log()
+            .iter()
+            .filter(|e| *e == "connect:a")
+            .count();
+        assert_eq!(
+            connects, 1,
+            "the 30 s backoff suppresses passes two and three entirely"
+        );
         assert_eq!(failures.load(Ordering::Acquire), 1);
     }
 
@@ -2215,14 +2295,24 @@ mod tests {
         supervisor.set_connection("a", FakeConnection::handle(ConnectionStatus::Closed, false));
         lc.check_connections(&token).await.unwrap();
 
-        let connects = supervisor.log().iter().filter(|e| *e == "connect:a").count();
-        assert_eq!(connects, 2, "a changed connection clears the retry state on sight");
+        let connects = supervisor
+            .log()
+            .iter()
+            .filter(|e| *e == "connect:a")
+            .count();
+        assert_eq!(
+            connects, 2,
+            "a changed connection clears the retry state on sight"
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn health_restored_fires_once_when_a_failing_server_answers_again() {
         let supervisor = FakeSupervisor::arc();
-        supervisor.set_connection("a", FakeConnection::handle(ConnectionStatus::Connected, true));
+        supervisor.set_connection(
+            "a",
+            FakeConnection::handle(ConnectionStatus::Connected, true),
+        );
         let lc = lifecycle_with(Arc::clone(&supervisor));
         let entry = ServerEntry {
             url: Some("https://example.test/mcp".to_string()),
@@ -2272,10 +2362,18 @@ mod tests {
 
         tokio::time::advance(KEEP_ALIVE_RETRY_BASE + Duration::from_secs(1)).await;
         lc.check_connections(&token).await.unwrap();
-        assert_eq!(restored.load(Ordering::Acquire), 1, "the backoff expired and the probe passed");
+        assert_eq!(
+            restored.load(Ordering::Acquire),
+            1,
+            "the backoff expired and the probe passed"
+        );
 
         lc.check_connections(&token).await.unwrap();
-        assert_eq!(restored.load(Ordering::Acquire), 1, "the notification is edge-triggered");
+        assert_eq!(
+            restored.load(Ordering::Acquire),
+            1,
+            "the notification is edge-triggered"
+        );
     }
 
     #[tokio::test]
@@ -2300,7 +2398,10 @@ mod tests {
         lc.check_keep_alive_connection("a", stale, &CancelToken::new(), true)
             .await
             .unwrap();
-        assert!(supervisor.log().is_empty(), "a stale pass touches nothing at all");
+        assert!(
+            supervisor.log().is_empty(),
+            "a stale pass touches nothing at all"
+        );
     }
 
     // ── the idle sweep (MCP-034, pass 2) ────────────────────────────────────────────────────
@@ -2308,9 +2409,18 @@ mod tests {
     #[tokio::test]
     async fn the_idle_sweep_closes_only_non_keep_alive_servers_past_their_timeout() {
         let supervisor = FakeSupervisor::arc();
-        supervisor.set_connection("lazy", FakeConnection::handle(ConnectionStatus::Connected, false));
-        supervisor.set_connection("kept", FakeConnection::handle(ConnectionStatus::Connected, false));
-        supervisor.set_connection("busy", FakeConnection::handle(ConnectionStatus::Connected, false));
+        supervisor.set_connection(
+            "lazy",
+            FakeConnection::handle(ConnectionStatus::Connected, false),
+        );
+        supervisor.set_connection(
+            "kept",
+            FakeConnection::handle(ConnectionStatus::Connected, false),
+        );
+        supervisor.set_connection(
+            "busy",
+            FakeConnection::handle(ConnectionStatus::Connected, false),
+        );
         supervisor.mark_idle("lazy");
         supervisor.mark_idle("kept");
 
@@ -2338,13 +2448,18 @@ mod tests {
     #[tokio::test]
     async fn an_idle_timeout_of_zero_exempts_a_server_from_the_sweep() {
         let supervisor = FakeSupervisor::arc();
-        supervisor.set_connection("a", FakeConnection::handle(ConnectionStatus::Connected, false));
+        supervisor.set_connection(
+            "a",
+            FakeConnection::handle(ConnectionStatus::Connected, false),
+        );
         supervisor.mark_idle("a");
         let lc = lifecycle_with(Arc::clone(&supervisor));
         lc.register_server(
             "a",
             ServerEntry::default(),
-            Some(LifecycleOverrides { idle_timeout: Some(0.0) }),
+            Some(LifecycleOverrides {
+                idle_timeout: Some(0.0),
+            }),
         );
 
         lc.check_connections(&CancelToken::new()).await.unwrap();
@@ -2404,7 +2519,10 @@ mod tests {
 
         tokio::time::advance(HEALTH_CHECK_INTERVAL - Duration::from_secs(1)).await;
         settle().await;
-        assert!(supervisor.log().is_empty(), "`setInterval` does not fire at t=0");
+        assert!(
+            supervisor.log().is_empty(),
+            "`setInterval` does not fire at t=0"
+        );
 
         tokio::time::advance(Duration::from_secs(2)).await;
         settle().await;
@@ -2425,7 +2543,10 @@ mod tests {
         lc.mark_keep_alive("a");
         // A non-keep-alive server the idle sweep always asks about, so every completed pass leaves
         // exactly one `is_idle:` mark in the log. That is how the passes are counted.
-        supervisor.set_connection("idler", FakeConnection::handle(ConnectionStatus::Connected, false));
+        supervisor.set_connection(
+            "idler",
+            FakeConnection::handle(ConnectionStatus::Connected, false),
+        );
         lc.register_server("idler", ServerEntry::default(), None);
 
         let owner = Arc::new(McpRuntimeOwner::new());
@@ -2441,8 +2562,15 @@ mod tests {
             settle().await;
         }
 
-        let passes = supervisor.log().iter().filter(|e| e.as_str() == "is_idle:idler").count();
-        assert_eq!(passes, 2, "the overrun tick fired once and re-based; nothing was queued");
+        let passes = supervisor
+            .log()
+            .iter()
+            .filter(|e| e.as_str() == "is_idle:idler")
+            .count();
+        assert_eq!(
+            passes, 2,
+            "the overrun tick fired once and re-based; nothing was queued"
+        );
 
         lc.graceful_shutdown().await;
     }
@@ -2457,7 +2585,10 @@ mod tests {
         owner.token().cancel();
 
         lc.start(&owner);
-        assert!(lc.is_stopped(), "an aborted signal sets `stopped` and starts nothing");
+        assert!(
+            lc.is_stopped(),
+            "an aborted signal sets `stopped` and starts nothing"
+        );
         tokio::time::advance(HEALTH_CHECK_INTERVAL * 3).await;
         settle().await;
         assert!(supervisor.log().is_empty());
@@ -2479,7 +2610,11 @@ mod tests {
         // Let the tick fire and the connect start, then shut down while it is in flight.
         tokio::time::advance(HEALTH_CHECK_INTERVAL + Duration::from_millis(50)).await;
         settle().await;
-        assert_eq!(supervisor.log(), vec!["connect:a"], "the connect is mid-flight");
+        assert_eq!(
+            supervisor.log(),
+            vec!["connect:a"],
+            "the connect is mid-flight"
+        );
 
         lc.graceful_shutdown().await;
         assert_eq!(
@@ -2496,7 +2631,10 @@ mod tests {
         assert!(!lc.is_stopped());
 
         let first = lc.graceful_shutdown();
-        assert!(lc.is_stopped(), "`stopped` is set before anything is awaited");
+        assert!(
+            lc.is_stopped(),
+            "`stopped` is set before anything is awaited"
+        );
         let second = lc.graceful_shutdown();
         first.await;
         second.await;
@@ -2561,7 +2699,10 @@ mod tests {
             "the flush runs at call time, before the first await"
         );
         assert_eq!(status.borrow_and_update().connected_count, 0);
-        assert!(!owner.is_active(), "the owner is cancelled at call time too");
+        assert!(
+            !owner.is_active(),
+            "the owner is cancelled at call time too"
+        );
         pending.await.unwrap();
     }
 
@@ -2592,9 +2733,13 @@ mod tests {
         }));
         let state = state_with(Arc::clone(&owner));
 
-        let error = shutdown_state(Some(state), SESSION_SHUTDOWN_STATE_REASON, no_metadata_flush())
-            .await
-            .expect_err("the cleanup failed");
+        let error = shutdown_state(
+            Some(state),
+            SESSION_SHUTDOWN_STATE_REASON,
+            no_metadata_flush(),
+        )
+        .await
+        .expect_err("the cleanup failed");
         assert!(error.to_string().contains("cleanup exploded"), "{error}");
     }
 
@@ -2635,8 +2780,14 @@ mod tests {
         );
 
         // This is the whole point of MCP-008: the abort is observable *before* the drain finishes.
-        assert!(!owner.is_active(), "the cancel happens at call time, not at first poll");
-        assert!(!released.load(Ordering::Acquire), "the cleanup has not finished yet");
+        assert!(
+            !owner.is_active(),
+            "the cancel happens at call time, not at first poll"
+        );
+        assert!(
+            !released.load(Ordering::Acquire),
+            "the cleanup has not finished yet"
+        );
         assert_eq!(
             owner.stop_reason().as_deref().map(String::as_str),
             Some(SESSION_RESTART_STOP_REASON)

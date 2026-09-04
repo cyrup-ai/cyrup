@@ -32,7 +32,12 @@
 //!   the 24 nested `cargo build -p cyrup-ext-sdk --target wasm32-wasip2` invocations, and the
 //!   component now comes from `build.rs` via `support::bins::component()`. Its two-line `cfg()`
 //!   had exactly one caller and is inlined below.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -65,14 +70,20 @@ fn buffer_text(app: &App<TestBackend>) -> String {
 
 /// Inlined from the deleted `crates/cyrup-tui/tests/fixture/mod.rs` (its only caller was here).
 fn cfg() -> HostConfig {
-    HostConfig { mode: ExtMode::Tui, has_ui: true, cwd: PathBuf::from(".") }
+    HostConfig {
+        mode: ExtMode::Tui,
+        has_ui: true,
+        cwd: PathBuf::from("."),
+    }
 }
 
 async fn host_with_demo_guest() -> Arc<ExtensionHost> {
     let bytes =
         std::fs::read(crate::support::bins::component()).expect("read fixture component bytes");
     let host = ExtensionHost::with_wasm(cfg()).expect("host with wasm runtime");
-    host.load_wasm("demo".into(), &bytes, Arc::new(DenyServices)).await.expect("load + init");
+    host.load_wasm("demo".into(), &bytes, Arc::new(DenyServices))
+        .await
+        .expect("load + init");
     Arc::new(host)
 }
 
@@ -144,8 +155,14 @@ async fn a_wasm_guests_message_renderer_draws_on_screen() {
     app.draw().unwrap();
 
     let sb = app.scrollback_text();
-    assert!(sb.contains("demo call:"), "the GUEST's message renderer drew the block:\n{sb}");
-    assert!(!sb.contains("\"widget\""), "flattened, not dumped as JSON:\n{sb}");
+    assert!(
+        sb.contains("demo call:"),
+        "the GUEST's message renderer drew the block:\n{sb}"
+    );
+    assert!(
+        !sb.contains("\"widget\""),
+        "flattened, not dumped as JSON:\n{sb}"
+    );
     // The guest's renderer REPLACES the default framing (Pi's `CustomMessageComponent.rebuild()`
     // returns early once a custom renderer produced a component, `custom-message.ts:66-81`). This
     // guest echoes the whole message JSON, so the *payload* text legitimately appears inside its

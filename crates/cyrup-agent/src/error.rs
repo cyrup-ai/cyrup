@@ -58,7 +58,9 @@ impl std::fmt::Display for BusyEntry {
             Self::Run => "Agent is already processing.",
             // [CYRUP-DELTA] no pi counterpart — pi edits `this.agent.state.messages` directly from
             // the session; cyrup's atomic edit is refused mid-run in the same family of texts.
-            Self::Edit => "Agent is already processing. Wait for completion before editing the transcript.",
+            Self::Edit => {
+                "Agent is already processing. Wait for completion before editing the transcript."
+            }
         })
     }
 }

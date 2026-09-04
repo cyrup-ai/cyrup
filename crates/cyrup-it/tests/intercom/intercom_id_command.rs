@@ -52,18 +52,23 @@
 //! that the TUI slash-command router calls. Nothing calls `run_intercom_id_command` or
 //! `format_intercom_contact_snippet` directly — both are private.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::common::{spawn_broker, within, write_broker_command};
 use cyrup_ext::{ExtMode, HostCtx, HostEvent, HostServices, NativeExtension};
 use cyrup_intercom::config::{config_path, load_config};
 use cyrup_intercom::extension::{INTERCOM_ID_COMMAND, IntercomExtension};
 use cyrup_intercom::paths::{broker_socket_path, intercom_dir_path};
 use cyrup_intercom::transport::spawn::wait_for_broker;
-use crate::common::{spawn_broker, within, write_broker_command};
 
 const MY_SESSION_ID: &str = "session-aaaabbbbccccdddd";
 
@@ -76,7 +81,9 @@ struct EditorSink {
 
 impl EditorSink {
     fn with_text(initial: &str) -> Arc<Self> {
-        Arc::new(Self { buffer: Mutex::new(initial.to_string()) })
+        Arc::new(Self {
+            buffer: Mutex::new(initial.to_string()),
+        })
     }
 
     fn text(&self) -> String {
@@ -89,7 +96,10 @@ impl HostServices for EditorSink {
         self.buffer.lock().unwrap().clone()
     }
     fn set_editor_text(&self, text: &str, is_paste: bool) {
-        assert!(!is_paste, "pi calls setEditorText (REPLACE), never pasteEditorText (index.ts:2266)");
+        assert!(
+            !is_paste,
+            "pi calls setEditorText (REPLACE), never pasteEditorText (index.ts:2266)"
+        );
         *self.buffer.lock().unwrap() = text.to_string();
     }
     fn session_id(&self) -> Option<String> {
@@ -144,7 +154,9 @@ async fn live_session(
     let socket = broker_socket_path(&intercom_dir);
 
     let broker = spawn_broker(agent_dir);
-    wait_for_broker(&socket, Duration::from_secs(20)).await.expect("broker up");
+    wait_for_broker(&socket, Duration::from_secs(20))
+        .await
+        .expect("broker up");
 
     let ext = Arc::new(
         IntercomExtension::new(
@@ -157,10 +169,21 @@ async fn live_session(
     );
     ext.set_host_services(services);
     let ctx = HostCtx::command(ExtMode::Tui, has_ui, agent_dir.to_path_buf());
-    let _ = ext.on_event(&HostEvent::SessionStart { reason: "test".to_string(), previous_session_file: None }, &ctx).await;
+    let _ = ext
+        .on_event(
+            &HostEvent::SessionStart {
+                reason: "test".to_string(),
+                previous_session_file: None,
+            },
+            &ctx,
+        )
+        .await;
     let state = ext.state().clone();
     assert!(
-        within(Duration::from_secs(30), || state.client().is_some_and(|c| c.is_connected())).await,
+        within(Duration::from_secs(30), || state
+            .client()
+            .is_some_and(|c| c.is_connected()))
+        .await,
         "the session connects on SessionStart"
     );
     (ext, ctx, broker)
@@ -185,7 +208,11 @@ async fn slash_intercom_id_appends_the_handoff_snippet_to_the_editor() {
         .expect("`/intercom-id` is a registered command with a handler")
         .expect("the command produces output");
 
-    let session_id = ext.state().client().and_then(|c| c.session_id()).expect("registered session id");
+    let session_id = ext
+        .state()
+        .client()
+        .and_then(|c| c.session_id())
+        .expect("registered session id");
 
     // pi `insertIntoEditor`: `existing.trim() ? `${existing.trimEnd()}\n\n${text}` : text`
     // (`v0.9.2 index.ts:2266`) — the seeded note is KEPT and the snippet follows a blank line,
@@ -226,7 +253,11 @@ async fn slash_intercom_id_into_an_empty_editor_inserts_the_bare_snippet() {
         .await
         .expect("the command dispatches")
         .expect("the command produces output");
-    let session_id = ext.state().client().and_then(|c| c.session_id()).expect("registered session id");
+    let session_id = ext
+        .state()
+        .client()
+        .and_then(|c| c.session_id())
+        .expect("registered session id");
 
     assert_eq!(
         editor.text(),
@@ -235,7 +266,10 @@ async fn slash_intercom_id_into_an_empty_editor_inserts_the_bare_snippet() {
         ),
         "a blank editor gets the snippet alone, with no leading newlines"
     );
-    assert_eq!(reply, format!("Inserted intercom contact target: {session_id}"));
+    assert_eq!(
+        reply,
+        format!("Inserted intercom contact target: {session_id}")
+    );
 
     if let Some(c) = ext.state().client() {
         c.disconnect();
@@ -252,14 +286,19 @@ async fn slash_intercom_id_into_an_empty_editor_inserts_the_bare_snippet() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn slash_intercom_id_without_a_ui_reports_the_id_instead_of_inserting() {
     let agent_dir = tempfile::tempdir().expect("tempdir");
-    let (ext, ctx, mut broker) = live_session(agent_dir.path(), Arc::new(NoEditorSink), false).await;
+    let (ext, ctx, mut broker) =
+        live_session(agent_dir.path(), Arc::new(NoEditorSink), false).await;
 
     let reply = ext
         .execute_command(INTERCOM_ID_COMMAND, "", &ctx)
         .await
         .expect("the command dispatches")
         .expect("the command produces output");
-    let session_id = ext.state().client().and_then(|c| c.session_id()).expect("registered session id");
+    let session_id = ext
+        .state()
+        .client()
+        .and_then(|c| c.session_id())
+        .expect("registered session id");
 
     assert_eq!(
         reply,
@@ -284,8 +323,10 @@ async fn slash_intercom_id_reports_intercom_unavailable_when_the_broker_cannot_b
     // A broker command that exits immediately: `ensure_broker` can never bring a socket up.
     std::fs::write(
         config_path(&intercom_dir),
-        serde_json::to_string(&serde_json::json!({ "brokerCommand": "/bin/false", "brokerArgs": [] }))
-            .expect("serialize"),
+        serde_json::to_string(
+            &serde_json::json!({ "brokerCommand": "/bin/false", "brokerArgs": [] }),
+        )
+        .expect("serialize"),
     )
     .expect("write config.json");
 
@@ -314,7 +355,11 @@ async fn slash_intercom_id_reports_intercom_unavailable_when_the_broker_cannot_b
          same sentence a second time at Info: {reply:?}"
     );
     let raised = recorder.taken();
-    assert_eq!(raised.len(), 1, "exactly one notification for one failure: {raised:?}");
+    assert_eq!(
+        raised.len(),
+        1,
+        "exactly one notification for one failure: {raised:?}"
+    );
     let (message, kind) = raised.first().expect("one notification");
     assert!(
         message.starts_with("Intercom unavailable: "),

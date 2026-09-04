@@ -1,13 +1,13 @@
 //! Response decoding — in-progress block and decoder state.
 
+use crate::api::content_cache::ContentCache;
 use crate::model::Model;
 use crate::usage::apply_cost;
-use crate::api::content_cache::ContentCache;
 use crate::utils::provider_plumbing::now_millis;
-use std::sync::Arc;
 use cyrup_core::{
     ApiId, AssistantMessage, Content, LazyArgs, SharedStr, StopReason, ToolCall, ToolCallId, Usage,
 };
+use std::sync::Arc;
 
 /// One in-progress content block, keyed by the Anthropic `index`.
 pub(super) enum Block {

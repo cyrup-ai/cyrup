@@ -27,21 +27,18 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-
 use cyrup_core::{CancelToken, ModelId};
 use cyrup_ext_subagents::discovery::types::{OutputMode, SystemPromptMode};
-use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::exec::acceptance::{AcceptanceContract, AcceptanceStatus};
 use cyrup_ext_subagents::exec::child_protocol::MAX_CHILD_PENDING_LINE_BYTES;
 use cyrup_ext_subagents::exec::fallback::{
-    ModelOverride, SUBAGENT_STARTUP_RETRY_DELAYS_MS,
-    format_subagent_startup_retry_exhausted_error,
+    ModelOverride, SUBAGENT_STARTUP_RETRY_DELAYS_MS, format_subagent_startup_retry_exhausted_error,
 };
 use cyrup_ext_subagents::exec::output::OutputCap;
 use cyrup_ext_subagents::exec::{AgentConfig, RunOptions, SingleResult};
 use cyrup_ext_subagents::fork_context::ForkContext;
+use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::spawn::depth::DepthEnvelope;
-
 
 fn fixture_binary_path() -> PathBuf {
     crate::support::bins::subagent_fixture()
@@ -59,7 +56,10 @@ fn write_script(dir: &Path, name: &str, script: &serde_json::Value) -> PathBuf {
 fn fixture_spawn_command(script_path: &Path) -> SpawnCommand {
     SpawnCommand {
         binary: fixture_binary_path(),
-        base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+        base_args: vec![
+            "--fixture-script".to_string(),
+            script_path.display().to_string(),
+        ],
     }
 }
 
@@ -79,8 +79,11 @@ fn message_end_line(text: &str) -> String {
 
 fn base_agent_config(model: &str) -> AgentConfig {
     AgentConfig {
+        acceptance_role: None, // SUBA-082: no declared role, the name decides
+        default_acceptance: None,
         name: "worker".to_string(),
         model: Some(ModelId::from(model)),
+        model_provider: None,
         fallback_models: Vec::new(),
         thinking: None,
         system_prompt_mode: SystemPromptMode::Replace,
@@ -88,6 +91,8 @@ fn base_agent_config(model: &str) -> AgentConfig {
         tools: None,
         extensions: None,
         subagent_only_extensions: Vec::new(),
+        exclude_tools: Vec::new(),
+        allow_nested_subagents: None,
         output: None,
         inherit_project_context: false,
         inherit_skills: true,
@@ -387,7 +392,7 @@ async fn a_zero_activity_child_exit_relaunches_the_same_model_then_reports_exhau
     assert_ne!(result.exit_code, 0, "{result:?}");
 
     // Four LAUNCHES means four real child processes, each with its own NDJSON tee artifact.
-    let scratch = dir.path().join(".cyrup-subagent-scratch");
+    let scratch = cyrup_ext_subagents::background::attempt_scratch_dir(dir.path());
     for index in 0..expected_launches {
         assert!(
             scratch.join(format!("attempt-{index}.jsonl")).exists(),
@@ -422,8 +427,7 @@ async fn a_child_that_produced_output_before_failing_is_not_relaunched() {
         "this is not a startup failure and must not be reported as one: {error}"
     );
     assert!(
-        !dir.path()
-            .join(".cyrup-subagent-scratch")
+        !cyrup_ext_subagents::background::attempt_scratch_dir(dir.path())
             .join("attempt-1.jsonl")
             .exists(),
         "no second child may be spawned"

@@ -60,7 +60,7 @@ mod handle;
 pub mod prelude;
 
 // ---- the embedding surface ----
-pub use client::{zero_config_provider, Cyrup, CyrupBuilder};
+pub use client::{Cyrup, CyrupBuilder, zero_config_provider};
 pub use error::{SdkError, SdkResult};
 pub use handle::Session;
 
@@ -69,17 +69,16 @@ pub use handle::Session;
 // `StreamFn` is the transport an embedder injects (bring-your-own proxy/HTTP client); `ProxyStreamFn`
 // is the built-in proxy transport; `ApiKeyResolver` is dynamic per-request key resolution. The
 // override closures transform the discovered [`SkillPointer`]/[`ContextFile`] sets. ----
-pub use cyrup_agent::{stream_proxy, ApiKeyResolver, ProxyStreamFn, ProxyStreamOptions, StreamFn};
 /// Re-exported by name so an SDK user can match the transcript `handle.agent_messages()` returns
 /// without reaching through the `agent` module alias.
 pub use cyrup_agent::{AgentMessage, AppRole};
+pub use cyrup_agent::{ApiKeyResolver, ProxyStreamFn, ProxyStreamOptions, StreamFn, stream_proxy};
 pub use cyrup_session_svc::{ContextFile, ContextScope, SkillPointer};
 
 // ---- load-bearing seam types, re-exported so embedders depend only on this crate ----
 pub use cyrup_session_svc::{
     AgentSession, AgentSessionEvent, AgentSessionServices, CompactionResult, InputSource, NoTools,
-    PromptAccepted,
-    ScopedModel, SessionBuilder, SessionConfig, SessionServiceError, SessionTarget,
+    PromptAccepted, ScopedModel, SessionBuilder, SessionConfig, SessionServiceError, SessionTarget,
     StreamingBehavior, UserInput,
 };
 
@@ -101,8 +100,8 @@ pub use cyrup_session_svc::{
 // it — `modes/index.ts:6` and `index.ts:337` — so an embedder writing its own event lane emits the
 // same delta-only `message_update` the built-in modes do rather than re-deriving the projection.
 pub use cyrup_modes::{
-    run_json, run_print, run_rpc, to_json_event, JsonAgentSessionEvent, ModesError, PrintOptions,
-    QueueModeArg, RpcOut, RpcResponse, SessionCommand,
+    JsonAgentSessionEvent, ModesError, PrintOptions, QueueModeArg, RpcOut, RpcResponse,
+    SessionCommand, run_json, run_print, run_rpc, to_json_event,
 };
 
 /// The single streaming primitive (arch-00 §3.1): every event feed is an `EventStream<T>`.

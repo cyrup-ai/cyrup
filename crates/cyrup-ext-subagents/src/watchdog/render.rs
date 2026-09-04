@@ -203,7 +203,12 @@ pub fn render_watchdog_warning_plain(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 mod tests {
     use super::*;
     use crate::watchdog::types::{WatchdogCategory, WatchdogWarningSource};
@@ -255,8 +260,9 @@ mod tests {
         warning.agent = Some("reviewer".into());
         warning.run_id = Some("run-7".into());
         assert!(
-            format_watchdog_warning_render_text(&warning)
-                .contains("Category: Missed Constraint · Source: main · Agent: reviewer · Run: run-7")
+            format_watchdog_warning_render_text(&warning).contains(
+                "Category: Missed Constraint · Source: main · Agent: reviewer · Run: run-7"
+            )
         );
     }
 
@@ -274,11 +280,9 @@ mod tests {
                 "auto-follow attempt 2".to_string(),
             ]
         );
-        assert!(
-            format_watchdog_warning_render_text(&warning).starts_with(
-                "Subagent watchdog Concern (displayed, stale · no auto-follow, auto-follow attempt 2): "
-            )
-        );
+        assert!(format_watchdog_warning_render_text(&warning).starts_with(
+            "Subagent watchdog Concern (displayed, stale · no auto-follow, auto-follow attempt 2): "
+        ));
     }
 
     #[test]
@@ -343,9 +347,16 @@ mod tests {
         blocker.severity = WatchdogSeverity::Blocker;
         let rendered = render_watchdog_warning(&blocker, false);
         assert_eq!(rendered[0].spans[0].style.fg, Some(Color::Red));
-        assert!(rendered[0].spans[0].style.add_modifier.contains(Modifier::BOLD));
         assert!(
-            rendered[0].spans[0].content.starts_with("Subagent watchdog Blocker: "),
+            rendered[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert!(
+            rendered[0].spans[0]
+                .content
+                .starts_with("Subagent watchdog Blocker: "),
             "the subject switches with the severity"
         );
         let concern = render_watchdog_warning(&details(), false);

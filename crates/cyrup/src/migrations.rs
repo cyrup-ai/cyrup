@@ -257,7 +257,9 @@ fn migrate_commands_to_prompts(base_dir: &Path, label: &str) -> bool {
                 // Routed through the stdout guard (Pi `console.log` under `takeOverStdout`): during a
                 // non-interactive PRINT/JSON/RPC run this notice is rerouted to stderr so it can never
                 // corrupt the machine-readable stream on stdout (Pi migrations.ts:144, main.ts:537).
-                crate::output_guard::emit_stray_line(&format!("Migrated {label} commands/ → prompts/"));
+                crate::output_guard::emit_stray_line(&format!(
+                    "Migrated {label} commands/ → prompts/"
+                ));
                 return true;
             }
             Err(err) => {
@@ -497,7 +499,11 @@ mod tests {
             "auth.json holds credentials and must be owner-read/write only, got {mode:o}"
         );
         // And the credential really is in there, so the assertion is about a live secret.
-        assert!(std::fs::read_to_string(&auth_path).unwrap().contains("secret-refresh"));
+        assert!(
+            std::fs::read_to_string(&auth_path)
+                .unwrap()
+                .contains("secret-refresh")
+        );
     }
 
     #[test]
@@ -605,7 +611,10 @@ mod tests {
             !migrate_tools_to_bin(&d.agent_dir, &d.bin_dir()),
             "a collision delete is not a move"
         );
-        assert!(!tools.join("rg").exists(), "the stale source is still removed");
+        assert!(
+            !tools.join("rg").exists(),
+            "the stale source is still removed"
+        );
         assert!(d.bin_dir().join("rg").exists());
     }
 
@@ -618,14 +627,20 @@ mod tests {
     fn migrates_installed_packages_out_of_the_doubled_root() {
         let tmp = tempfile::tempdir().unwrap();
         let d = dirs(tmp.path());
-        let legacy = d.package_dir.join("packages").join("git-github.com-acme-pack");
+        let legacy = d
+            .package_dir
+            .join("packages")
+            .join("git-github.com-acme-pack");
         std::fs::create_dir_all(&legacy).unwrap();
         std::fs::write(legacy.join("SKILL.md"), "x").unwrap();
 
         run_migrations(&d);
 
         let moved = d.package_dir.join("git-github.com-acme-pack");
-        assert!(moved.join("SKILL.md").exists(), "the tree must move up one level");
+        assert!(
+            moved.join("SKILL.md").exists(),
+            "the tree must move up one level"
+        );
         assert!(!d.package_dir.join("packages").exists());
         // Idempotent: the second run has nothing to move, so it says nothing.
         assert_eq!(migrate_packages_root(&d.package_dir), 0);

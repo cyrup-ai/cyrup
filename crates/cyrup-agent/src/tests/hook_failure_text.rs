@@ -61,7 +61,9 @@ impl Hooks for FailingBefore {
         _ctx: BeforeToolCall<'_>,
         _cancel: CancelToken,
     ) -> BeforeOutcome {
-        BeforeOutcome::Failed(HookError::new("policy store unreachable: /var/run/gate.sock"))
+        BeforeOutcome::Failed(HookError::new(
+            "policy store unreachable: /var/run/gate.sock",
+        ))
     }
 }
 
@@ -73,7 +75,8 @@ async fn failing_before_tool_call_surfaces_the_hooks_own_message() {
     let sf = faux_stream_fn(vec![
         faux_assistant_message(vec![faux_tool_call("echo", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
-    ]).1;
+    ])
+    .1;
     let rec = Arc::new(EventRecorder::default());
     let agent = Agent::builder(model_ref(), sf)
         .tools(vec![EchoTool::named("echo")])
@@ -85,7 +88,10 @@ async fn failing_before_tool_call_surfaces_the_hooks_own_message() {
     agent.wait_for_idle().await;
 
     let te = first_turn_results(&rec.snapshot());
-    assert!(te[0].is_error, "a throwing before_tool_call yields an isError result");
+    assert!(
+        te[0].is_error,
+        "a throwing before_tool_call yields an isError result"
+    );
     assert_eq!(
         result_text(&te[0]),
         "policy store unreachable: /var/run/gate.sock",
@@ -101,11 +107,7 @@ struct FailingAfter;
 
 #[async_trait::async_trait]
 impl Hooks for FailingAfter {
-    async fn after_tool_call(
-        &self,
-        _ctx: AfterToolCall<'_>,
-        _cancel: CancelToken,
-    ) -> AfterOutcome {
+    async fn after_tool_call(&self, _ctx: AfterToolCall<'_>, _cancel: CancelToken) -> AfterOutcome {
         AfterOutcome::Failed(HookError::new("redaction pass failed on block 3"))
     }
 }
@@ -119,7 +121,8 @@ async fn failing_after_tool_call_surfaces_the_hooks_own_message() {
     let sf = faux_stream_fn(vec![
         faux_assistant_message(vec![faux_tool_call("echo", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
-    ]).1;
+    ])
+    .1;
     let rec = Arc::new(EventRecorder::default());
     let agent = Agent::builder(model_ref(), sf)
         .tools(vec![EchoTool::named("echo")])
@@ -150,10 +153,13 @@ async fn failing_transform_context_surfaces_the_hooks_own_message() {
     let sf = faux_stream_fn(vec![faux_assistant_message(
         vec![faux_text("unused")],
         StopReason::Stop,
-    )]).1;
+    )])
+    .1;
     let rec = Arc::new(EventRecorder::default());
     let agent = Agent::builder(model_ref(), sf)
-        .hooks(Arc::new(FailingTransform::new("compaction budget exceeded: 412k > 200k")))
+        .hooks(Arc::new(FailingTransform::new(
+            "compaction budget exceeded: 412k > 200k",
+        )))
         .build();
     agent.subscribe(rec.clone());
 
@@ -178,7 +184,11 @@ async fn failing_transform_context_surfaces_the_hooks_own_message() {
             _ => None,
         })
         .expect("an agent_end");
-    assert_eq!(end.len(), 1, "agent_end carries only the failure message: {end:?}");
+    assert_eq!(
+        end.len(),
+        1,
+        "agent_end carries only the failure message: {end:?}"
+    );
 }
 
 struct FailingConvert;
@@ -196,9 +206,12 @@ async fn failing_convert_to_llm_surfaces_the_hooks_own_message() {
     let sf = faux_stream_fn(vec![faux_assistant_message(
         vec![faux_text("unused")],
         StopReason::Stop,
-    )]).1;
+    )])
+    .1;
     let rec = Arc::new(EventRecorder::default());
-    let agent = Agent::builder(model_ref(), sf).hooks(Arc::new(FailingConvert)).build();
+    let agent = Agent::builder(model_ref(), sf)
+        .hooks(Arc::new(FailingConvert))
+        .build();
     agent.subscribe(rec.clone());
 
     agent.prompt("go").await.unwrap().finished().await;
@@ -222,5 +235,9 @@ async fn failing_convert_to_llm_surfaces_the_hooks_own_message() {
             _ => None,
         })
         .expect("an agent_end");
-    assert_eq!(end.len(), 1, "agent_end carries only the failure message: {end:?}");
+    assert_eq!(
+        end.len(),
+        1,
+        "agent_end carries only the failure message: {end:?}"
+    );
 }

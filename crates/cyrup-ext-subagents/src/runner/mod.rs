@@ -269,7 +269,10 @@ pub fn parse_agent_runner_frontmatter(
             Ok(Some(AgentRunnerConfig::Pi))
         }
         Some("external-job") => {
-            let provider = object.get("provider").and_then(Value::as_str).unwrap_or_default();
+            let provider = object
+                .get("provider")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             if provider.is_empty() || provider.trim() != provider {
                 return Err(format!(
                     "Agent '{agent_name}' external-job runner requires a non-empty trimmed \
@@ -305,7 +308,10 @@ pub fn parse_agent_runner_frontmatter(
             })))
         }
         Some("external-cli") => {
-            let command = object.get("command").and_then(Value::as_str).unwrap_or_default();
+            let command = object
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             if command.trim().is_empty() {
                 return Err(format!(
                     "Agent '{agent_name}' external-cli runner requires a non-empty command string."
@@ -393,8 +399,7 @@ mod tests {
     use super::*;
 
     fn err(raw: &str) -> String {
-        parse_agent_runner_frontmatter(Some(raw), "worker")
-            .expect_err("expected a refusal")
+        parse_agent_runner_frontmatter(Some(raw), "worker").expect_err("expected a refusal")
     }
 
     /// `{ type: "pi" }` is the native child, accepted with no other key permitted
@@ -410,8 +415,14 @@ mod tests {
             "Agent 'worker' has invalid Pi runner frontmatter; only 'type' is supported."
         );
         // An absent or blank block is simply "no runner declared".
-        assert_eq!(parse_agent_runner_frontmatter(None, "worker").unwrap(), None);
-        assert_eq!(parse_agent_runner_frontmatter(Some("   "), "worker").unwrap(), None);
+        assert_eq!(
+            parse_agent_runner_frontmatter(None, "worker").unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_agent_runner_frontmatter(Some("   "), "worker").unwrap(),
+            None
+        );
     }
 
     /// Upstream's `external-cli` refusals, verbatim and in upstream's own order
@@ -538,7 +549,10 @@ mod tests {
             contract::validate_code_owned_profile_runner(&["claude-code"], Some("claude-code")),
             None
         );
-        assert_eq!(contract::validate_code_owned_profile_runner(&["reviewer"], None), None);
+        assert_eq!(
+            contract::validate_code_owned_profile_runner(&["reviewer"], None),
+            None
+        );
     }
 
     /// `validateExternalRunnerProfile` tests KEY PRESENCE, not a parsed value, so a

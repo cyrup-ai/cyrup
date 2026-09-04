@@ -1,27 +1,35 @@
 //! Differential-parity tests for the 1:1 gaps closed against Pi (gap-analysis 05-cyrup-session).
 //! Each test cites the Pi behavior it pins.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::path::PathBuf;
 
-use cyrup_core::{Content, EntryId, Message};
 use crate::agent_message::{AgentMessage, BashExecutionMessage, CustomRoleMessage};
 use crate::compaction::cutpoint::{find_cut_point, find_valid_cut_points};
 use crate::compaction::files::format_file_operations;
-use crate::compaction::tokens::{estimate_agent_message, TokenCache};
+use crate::compaction::tokens::{TokenCache, estimate_agent_message};
 use crate::context::{
-    branch_summary_message, build_context_messages, compaction_summary_message,
     BRANCH_SUMMARY_PREFIX, BRANCH_SUMMARY_SUFFIX, COMPACTION_SUMMARY_PREFIX,
-    COMPACTION_SUMMARY_SUFFIX,
+    COMPACTION_SUMMARY_SUFFIX, branch_summary_message, build_context_messages,
+    compaction_summary_message,
 };
 use crate::{
-    serialize_conversation, Entry, EntryBase, KnownEntry, NewSessionOpts, SessionHeader,
-    SessionLayout, SessionManager,
+    Entry, EntryBase, KnownEntry, NewSessionOpts, SessionHeader, SessionLayout, SessionManager,
+    serialize_conversation,
 };
-use serde_json::{json, Value};
+use cyrup_core::{Content, EntryId, Message};
+use serde_json::{Value, json};
 
 fn user(s: &str) -> Message {
-    Message::User { content: vec![Content::text(s)], timestamp: 0 }
+    Message::User {
+        content: vec![Content::text(s)],
+        timestamp: 0,
+    }
 }
 
 fn text_of(m: &Message) -> String {
@@ -72,7 +80,11 @@ fn gap1_bash_and_custom_role_entries_survive_into_context() {
 
     let ctx = m.build_context();
     // All three contribute (the bash as a rendered user message, the custom unwrapped).
-    assert_eq!(ctx.messages.len(), 3, "bash/custom roles are not dropped from context");
+    assert_eq!(
+        ctx.messages.len(),
+        3,
+        "bash/custom roles are not dropped from context"
+    );
     assert!(text_of(&ctx.messages[1]).starts_with("Ran `ls`"));
     assert_eq!(text_of(&ctx.messages[2]), "from extension");
 }
@@ -96,9 +108,18 @@ fn gap1_bash_entry_roundtrips_on_disk() {
     .unwrap();
     let reopened = SessionManager::open(m.session_file().unwrap()).unwrap();
     let has_bash = reopened.entries().iter().any(|e| {
-        matches!(e, Entry::Known(KnownEntry::Message { message: AgentMessage::BashExecution(_), .. }))
+        matches!(
+            e,
+            Entry::Known(KnownEntry::Message {
+                message: AgentMessage::BashExecution(_),
+                ..
+            })
+        )
     });
-    assert!(has_bash, "bash-role message round-trips as a typed entry, not Entry::Unknown");
+    assert!(
+        has_bash,
+        "bash-role message round-trips as a typed entry, not Entry::Unknown"
+    );
 }
 
 // ---------------------------------------------------------------- gap 3 / 4 --------------------
@@ -106,13 +127,19 @@ fn gap1_bash_entry_roundtrips_on_disk() {
 #[test]
 fn gap3_4_summary_wrapper_text_is_pi_exact() {
     let c = compaction_summary_message("BODY", 999, 0);
-    assert_eq!(text_of(&c), format!("{COMPACTION_SUMMARY_PREFIX}BODY{COMPACTION_SUMMARY_SUFFIX}"));
+    assert_eq!(
+        text_of(&c),
+        format!("{COMPACTION_SUMMARY_PREFIX}BODY{COMPACTION_SUMMARY_SUFFIX}")
+    );
     // Pi never leaks tokensBefore into the prompt.
     assert!(!text_of(&c).contains("999"));
     assert!(text_of(&c).starts_with("The conversation history before this point was compacted"));
 
     let b = branch_summary_message("WORK", 0);
-    assert_eq!(text_of(&b), format!("{BRANCH_SUMMARY_PREFIX}WORK{BRANCH_SUMMARY_SUFFIX}"));
+    assert_eq!(
+        text_of(&b),
+        format!("{BRANCH_SUMMARY_PREFIX}WORK{BRANCH_SUMMARY_SUFFIX}")
+    );
     assert!(text_of(&b).starts_with("The following is a summary of a branch"));
 }
 
@@ -130,15 +157,22 @@ fn gap5_cut_point_validity_excludes_settings_and_summaries() {
         id: EntryId::from(id),
         parent_id: None,
         timestamp: "2026-01-01T00:00:00Z".into(),
- extra: Default::default() };
+        extra: Default::default(),
+    };
     let entries = vec![
-        ent(KnownEntry::Message { base: base("e0"), message: AgentMessage::Core(user("hi")) }),
+        ent(KnownEntry::Message {
+            base: base("e0"),
+            message: AgentMessage::Core(user("hi")),
+        }),
         ent(KnownEntry::ModelChange {
             base: base("e1"),
             provider: "p".into(),
             model_id: "m".into(),
         }),
-        ent(KnownEntry::SessionInfo { base: base("e2"), name: Some("n".into()) }),
+        ent(KnownEntry::SessionInfo {
+            base: base("e2"),
+            name: Some("n".into()),
+        }),
         ent(KnownEntry::CustomMessage {
             base: base("e3"),
             custom_type: "x".into(),
@@ -165,7 +199,8 @@ fn gap6_back_scan_folds_leading_non_message_entries() {
         id: EntryId::from(id),
         parent_id: p.map(EntryId::from),
         timestamp: "2026-01-01T00:00:00Z".into(),
- extra: Default::default() };
+        extra: Default::default(),
+    };
     let big = "word ".repeat(80);
     let entries = vec![
         ent(KnownEntry::Message {
@@ -187,7 +222,10 @@ fn gap6_back_scan_folds_leading_non_message_entries() {
     // model_change (e1) INTO the kept region (cutIndex moves from 2 to 1), stopping at e0 (a
     // message). So the leading settings change travels with the recent messages, not into history.
     let cut = find_cut_point(&entries, &cache, 0, entries.len(), 5);
-    assert_eq!(cut.first_kept_index, 1, "back-scan folded the model_change into the kept region");
+    assert_eq!(
+        cut.first_kept_index, 1,
+        "back-scan folded the model_change into the kept region"
+    );
     assert!(matches!(
         entries.get(cut.first_kept_index),
         Some(Entry::Known(KnownEntry::ModelChange { .. }))
@@ -213,14 +251,20 @@ fn gap12_session_id_validation() {
     let lay = SessionLayout::new(dir.path().to_path_buf(), cwd.clone());
     // Invalid ids are rejected (assertValidSessionId, session-manager.ts:207-213).
     for bad in ["bad/id", "", "-leading", "trailing-", "has space"] {
-        let opts = NewSessionOpts { id: Some(bad.into()), parent_session: None };
+        let opts = NewSessionOpts {
+            id: Some(bad.into()),
+            parent_session: None,
+        };
         assert!(
             SessionManager::create(&cwd, &lay, opts).is_err(),
             "id {bad:?} must be rejected"
         );
     }
     // A valid id is accepted.
-    let opts = NewSessionOpts { id: Some("good.id-1_OK".into()), parent_session: None };
+    let opts = NewSessionOpts {
+        id: Some("good.id-1_OK".into()),
+        parent_session: None,
+    };
     assert!(SessionManager::create(&cwd, &lay, opts).is_ok());
 }
 
@@ -249,11 +293,19 @@ fn gap13_tree_promotes_orphans_and_self_parent_to_roots() {
 
     let m = SessionManager::open(&file).unwrap();
     let tree = m.tree(); // must terminate (no infinite recursion on the self-parent)
-    let root_ids: Vec<String> =
-        tree.iter().map(|n| n.entry.id().as_str().to_string()).collect();
+    let root_ids: Vec<String> = tree
+        .iter()
+        .map(|n| n.entry.id().as_str().to_string())
+        .collect();
     assert!(root_ids.contains(&"e0".to_string()));
-    assert!(root_ids.contains(&"e1".to_string()), "self-parent promoted to root");
-    assert!(root_ids.contains(&"e2".to_string()), "orphan promoted to root, never dropped");
+    assert!(
+        root_ids.contains(&"e1".to_string()),
+        "self-parent promoted to root"
+    );
+    assert!(
+        root_ids.contains(&"e2".to_string()),
+        "orphan promoted to root, never dropped"
+    );
 }
 
 // ---------------------------------------------------------------- gap 14 / 15 ------------------
@@ -290,10 +342,18 @@ fn gap14_15_listing_first_message_user_only_with_sentinel() {
     .unwrap();
 
     let infos = crate::list(&lay);
-    let info = infos.iter().find(|i| i.id.as_str() == a.session_id().as_str()).unwrap();
-    assert_eq!(info.first_message, "the user question", "firstMessage is the first USER message");
+    let info = infos
+        .iter()
+        .find(|i| i.id.as_str() == a.session_id().as_str())
+        .unwrap();
+    assert_eq!(
+        info.first_message, "the user question",
+        "firstMessage is the first USER message"
+    );
     assert!(
-        !info.all_messages_text.contains("TOOL-OUTPUT-SHOULD-NOT-APPEAR"),
+        !info
+            .all_messages_text
+            .contains("TOOL-OUTPUT-SHOULD-NOT-APPEAR"),
         "allMessagesText excludes toolResult text"
     );
     assert!(info.all_messages_text.contains("assistant speaks first"));
@@ -349,7 +409,10 @@ fn gap16_migration_renames_hookmessage_to_custom() {
     assert_eq!(header.version, Some(3));
     // Now it is a typed custom-role message and contributes to context.
     match &entries[0] {
-        Entry::Known(KnownEntry::Message { message: AgentMessage::Custom(c), .. }) => {
+        Entry::Known(KnownEntry::Message {
+            message: AgentMessage::Custom(c),
+            ..
+        }) => {
             assert_eq!(c.custom_type, "legacy.hook");
         }
         other => panic!("expected custom-role message, got {other:?}"),
@@ -369,13 +432,21 @@ fn gap17_serialize_separators_json_args_and_skips_empty() {
             Content::ToolCall(ToolCall {
                 id: "t1".into(),
                 name: "read".into(),
-                arguments: json!({ "path": "a.rs" }).as_object().cloned().unwrap().into(),
+                arguments: json!({ "path": "a.rs" })
+                    .as_object()
+                    .cloned()
+                    .unwrap()
+                    .into(),
                 thought_signature: None,
             }),
             Content::ToolCall(ToolCall {
                 id: "t2".into(),
                 name: "write".into(),
-                arguments: json!({ "path": "b.rs" }).as_object().cloned().unwrap().into(),
+                arguments: json!({ "path": "b.rs" })
+                    .as_object()
+                    .cloned()
+                    .unwrap()
+                    .into(),
                 thought_signature: None,
             }),
         ],
@@ -393,11 +464,17 @@ fn gap17_serialize_separators_json_args_and_skips_empty() {
         timestamp: 0,
     });
     // An empty user message must NOT emit a "[User]: " line.
-    let empty_user = Message::User { content: vec![Content::text("")], timestamp: 0 };
+    let empty_user = Message::User {
+        content: vec![Content::text("")],
+        timestamp: 0,
+    };
     let out = serialize_conversation(&[empty_user, asst]);
     assert!(!out.contains("[User]:"), "empty user line skipped");
     // Calls joined with "; ", args JSON-encoded (string quoted).
-    assert!(out.contains("read(path=\"a.rs\"); write(path=\"b.rs\")"), "got: {out}");
+    assert!(
+        out.contains("read(path=\"a.rs\"); write(path=\"b.rs\")"),
+        "got: {out}"
+    );
 }
 
 // ---------------------------------------------------------------- gap 18 -----------------------
@@ -407,7 +484,10 @@ fn gap18_format_file_operations_only_non_empty_sections() {
     // Only the read section when there are no modified files (utils.ts:72-82).
     let only_read = format_file_operations(&["a.rs".into()], &[]);
     assert!(only_read.contains("<read-files>"));
-    assert!(!only_read.contains("<modified-files>"), "no empty modified section");
+    assert!(
+        !only_read.contains("<modified-files>"),
+        "no empty modified section"
+    );
     let only_mod = format_file_operations(&[], &["b.rs".into()]);
     assert!(!only_mod.contains("<read-files>"), "no empty read section");
     assert!(only_mod.contains("<modified-files>"));
@@ -418,38 +498,41 @@ fn gap18_format_file_operations_only_non_empty_sections() {
 
 #[test]
 fn gap19_20_prompts_are_pi_verbatim() {
+    use crate::compaction::branch::{BRANCH_SUMMARY_PREAMBLE, BRANCH_SUMMARY_PROMPT};
     use crate::compaction::summarize::{
         SUMMARIZATION_PROMPT, SUMMARIZATION_SYSTEM_PROMPT, TURN_PREFIX_SUMMARIZATION_PROMPT,
         UPDATE_SUMMARIZATION_PROMPT,
     };
-    use crate::compaction::branch::{BRANCH_SUMMARY_PREAMBLE, BRANCH_SUMMARY_PROMPT};
 
-    assert!(SUMMARIZATION_SYSTEM_PROMPT
-        .starts_with("You are a context summarization assistant."));
-    assert!(SUMMARIZATION_PROMPT.contains(
-        "The messages above are a conversation to summarize."
-    ));
+    assert!(SUMMARIZATION_SYSTEM_PROMPT.starts_with("You are a context summarization assistant."));
+    assert!(SUMMARIZATION_PROMPT.contains("The messages above are a conversation to summarize."));
     assert!(SUMMARIZATION_PROMPT.contains("## Critical Context"));
-    assert!(UPDATE_SUMMARIZATION_PROMPT.contains(
-        "The messages above are NEW conversation messages to incorporate"
-    ));
-    assert!(TURN_PREFIX_SUMMARIZATION_PROMPT
-        .starts_with("This is the PREFIX of a turn that was too large to keep."));
+    assert!(
+        UPDATE_SUMMARIZATION_PROMPT
+            .contains("The messages above are NEW conversation messages to incorporate")
+    );
+    assert!(
+        TURN_PREFIX_SUMMARIZATION_PROMPT
+            .starts_with("This is the PREFIX of a turn that was too large to keep.")
+    );
     // The branch prompt has NO Critical Context section (unlike compaction).
-    assert!(BRANCH_SUMMARY_PROMPT
-        .starts_with("Create a structured summary of this conversation branch"));
+    assert!(
+        BRANCH_SUMMARY_PROMPT
+            .starts_with("Create a structured summary of this conversation branch")
+    );
     assert!(!BRANCH_SUMMARY_PROMPT.contains("## Critical Context"));
-    assert!(BRANCH_SUMMARY_PREAMBLE
-        .starts_with("The user explored a different conversation branch before returning here."));
+    assert!(
+        BRANCH_SUMMARY_PREAMBLE.starts_with(
+            "The user explored a different conversation branch before returning here."
+        )
+    );
 }
 
 // ============================================================== round-2 gaps ==================
 // Lifecycle/listing divergences re-derived in 05-cyrup-session.md (#12, #21, #22, #23, #24).
 
+use crate::{DiskStore, SessionError, SessionStore, list_all_in_dir, list_in_dir, newest_session};
 use cyrup_core::SessionId;
-use crate::{
-    list_all_in_dir, list_in_dir, newest_session, DiskStore, SessionError, SessionStore,
-};
 
 fn asst() -> Message {
     Message::Assistant(cyrup_core::AssistantMessage::errored(
@@ -482,7 +565,10 @@ fn gap12_in_memory_validates_caller_id() {
     let cwd = PathBuf::from("/proj/gap12");
 
     // A bad id (leading dot / illegal char) is rejected.
-    let bad = NewSessionOpts { id: Some(SessionId::from(".bad/id")), parent_session: None };
+    let bad = NewSessionOpts {
+        id: Some(SessionId::from(".bad/id")),
+        parent_session: None,
+    };
     match SessionManager::in_memory(&cwd, bad) {
         Err(SessionError::InvalidSessionId(_)) => {}
         Err(e) => panic!("wrong error: {e:?}"),
@@ -490,7 +576,10 @@ fn gap12_in_memory_validates_caller_id() {
     }
 
     // A valid id is accepted and preserved verbatim.
-    let good = NewSessionOpts { id: Some(SessionId::from("good-1.0_x")), parent_session: None };
+    let good = NewSessionOpts {
+        id: Some(SessionId::from("good-1.0_x")),
+        parent_session: None,
+    };
     let m = SessionManager::in_memory(&cwd, good).unwrap();
     assert_eq!(m.session_id().as_str(), "good-1.0_x");
 
@@ -519,10 +608,16 @@ fn gap21_list_reports_progress_loaded_and_total() {
 
     assert_eq!(infos.len(), 3);
     assert_eq!(seen.len(), 3, "progress fires once per file");
-    assert!(seen.iter().all(|&(_, total)| total == 3), "total is stable at the file count");
+    assert!(
+        seen.iter().all(|&(_, total)| total == 3),
+        "total is stable at the file count"
+    );
     assert_eq!(seen.last().copied(), Some((3, 3)), "loaded reaches total");
     // loaded is monotonic 1..=total.
-    assert_eq!(seen.iter().map(|&(l, _)| l).collect::<Vec<_>>(), vec![1, 2, 3]);
+    assert_eq!(
+        seen.iter().map(|&(l, _)| l).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
 }
 
 // ---------------------------------------------------------------- gap 22 -----------------------
@@ -539,7 +634,11 @@ fn gap22_list_in_dir_filters_by_cwd_for_shared_directory() {
 
     // No filter → both projects' sessions.
     let all = list_in_dir(&shared, None, None);
-    assert_eq!(all.len(), 2, "unfiltered listing returns every session in the dir");
+    assert_eq!(
+        all.len(),
+        2,
+        "unfiltered listing returns every session in the dir"
+    );
 
     // cwd filter → only sessions whose header cwd matches.
     let here = std::path::Path::new("/proj/here");
@@ -560,12 +659,25 @@ fn gap22_continue_recent_filtered_skips_other_projects() {
     let lay = SessionLayout::new(dir.path().to_path_buf(), cwd.clone());
     let sdir = lay.dir();
     // `mine` written first, `other` (a different project) written last → newest by mtime.
-    write_header_only(&sdir, "2026-01-01T00-00-00_mine.jsonl", "mine", "/proj/mine");
-    write_header_only(&sdir, "2026-01-01T00-00-09_other.jsonl", "other", "/proj/elsewhere");
+    write_header_only(
+        &sdir,
+        "2026-01-01T00-00-00_mine.jsonl",
+        "mine",
+        "/proj/mine",
+    );
+    write_header_only(
+        &sdir,
+        "2026-01-01T00-00-09_other.jsonl",
+        "other",
+        "/proj/elsewhere",
+    );
 
     // newest_session with a cwd filter skips the newer foreign session.
     let picked = newest_session(&sdir, Some(cwd.as_path())).unwrap();
-    assert!(picked.to_string_lossy().contains("mine"), "filtered newest = current project");
+    assert!(
+        picked.to_string_lossy().contains("mine"),
+        "filtered newest = current project"
+    );
 
     // continue_recent_filtered resumes that one (its header cwd is /proj/mine).
     let resumed = SessionManager::continue_recent_filtered(&cwd, &lay, true).unwrap();
@@ -589,7 +701,10 @@ fn gap23_create_exclusive_refuses_to_clobber() {
 
     // A second exclusive-create on the same path fails (does not clobber).
     let err = store.create_exclusive(&header, &[]).unwrap_err();
-    assert!(matches!(err, SessionError::AlreadyExists(_)), "got: {err:?}");
+    assert!(
+        matches!(err, SessionError::AlreadyExists(_)),
+        "got: {err:?}"
+    );
 }
 
 #[test]
@@ -601,9 +716,15 @@ fn gap23_first_flush_uses_exclusive_create() {
     let lay = SessionLayout::new(dir.path().to_path_buf(), cwd.clone());
     let mut m = SessionManager::create(&cwd, &lay, NewSessionOpts::default()).unwrap();
     m.append_message(user("hi")).unwrap();
-    assert!(!m.session_file().unwrap().exists(), "no file before the first assistant message");
+    assert!(
+        !m.session_file().unwrap().exists(),
+        "no file before the first assistant message"
+    );
     m.append_message(asst()).unwrap();
-    assert!(m.session_file().unwrap().exists(), "file created on first assistant message");
+    assert!(
+        m.session_file().unwrap().exists(),
+        "file created on first assistant message"
+    );
 }
 
 // ---------------------------------------------------------------- gap 24 -----------------------
@@ -624,16 +745,25 @@ fn gap24_clone_defers_write_until_assistant_exists() {
         .create_branched_session(&leaf, &lay)
         .unwrap()
         .expect("persisted branch returns a path");
-    assert!(!cloned_path.exists(), "branched session with no assistant defers its file");
+    assert!(
+        !cloned_path.exists(),
+        "branched session with no assistant defers its file"
+    );
 
     // Once an assistant message arrives, the deferred buffer is flushed via create_exclusive.
     m.append_message(asst()).unwrap();
-    assert!(cloned_path.exists(), "deferred branched file is created on the first assistant message");
+    assert!(
+        cloned_path.exists(),
+        "deferred branched file is created on the first assistant message"
+    );
     // The retained user message survived into the new file.
     let reopened = SessionManager::open(&cloned_path).unwrap();
     assert!(reopened.entries().iter().any(|e| matches!(
         e,
-        Entry::Known(KnownEntry::Message { message: AgentMessage::Core(Message::User { .. }), .. })
+        Entry::Known(KnownEntry::Message {
+            message: AgentMessage::Core(Message::User { .. }),
+            ..
+        })
     )));
 }
 
@@ -653,7 +783,10 @@ fn gap24_clone_with_assistant_writes_eagerly() {
         .create_branched_session(&leaf, &lay)
         .unwrap()
         .expect("persisted branch returns a path");
-    assert!(cloned_path.exists(), "assistant-bearing clone is written eagerly");
+    assert!(
+        cloned_path.exists(),
+        "assistant-bearing clone is written eagerly"
+    );
 }
 
 // ---------------------------------------------------------------- M3 / M4 branched labels -----
@@ -676,13 +809,19 @@ fn m3_m4_branched_labels_keep_original_ts_and_global_scope() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("2026-01-01T00-00-00-000Z_aaaaaaaa.jsonl");
     let contents = concat!(
-        r#"{"type":"session","version":3,"id":"11111111-1111-7111-8111-111111111111","timestamp":"2026-01-01T00:00:00Z","cwd":"/proj/m3"}"#, "\n",
-        r#"{"type":"message","id":"e1","parentId":null,"timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":[{"type":"text","text":"hi"}],"timestamp":0}}"#, "\n",
-        r#"{"type":"message","id":"e2","parentId":"e1","timestamp":"2026-01-01T00:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"reply"}],"provider":"faux","model":"f","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":0}}"#, "\n",
+        r#"{"type":"session","version":3,"id":"11111111-1111-7111-8111-111111111111","timestamp":"2026-01-01T00:00:00Z","cwd":"/proj/m3"}"#,
+        "\n",
+        r#"{"type":"message","id":"e1","parentId":null,"timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":[{"type":"text","text":"hi"}],"timestamp":0}}"#,
+        "\n",
+        r#"{"type":"message","id":"e2","parentId":"e1","timestamp":"2026-01-01T00:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"reply"}],"provider":"faux","model":"f","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":0}}"#,
+        "\n",
         // OFF-PATH labels (children of e2 / each other), not on the root->e2 path:
-        r#"{"type":"label","id":"L1","parentId":"e2","timestamp":"2020-01-01T00:00:00.000Z","targetId":"e1","label":"important"}"#, "\n",
-        r#"{"type":"label","id":"L2","parentId":"L1","timestamp":"2021-01-01T00:00:00.000Z","targetId":"e2","label":"temp"}"#, "\n",
-        r#"{"type":"label","id":"L3","parentId":"L2","timestamp":"2022-01-01T00:00:00.000Z","targetId":"e2"}"#, "\n",
+        r#"{"type":"label","id":"L1","parentId":"e2","timestamp":"2020-01-01T00:00:00.000Z","targetId":"e1","label":"important"}"#,
+        "\n",
+        r#"{"type":"label","id":"L2","parentId":"L1","timestamp":"2021-01-01T00:00:00.000Z","targetId":"e2","label":"temp"}"#,
+        "\n",
+        r#"{"type":"label","id":"L3","parentId":"L2","timestamp":"2022-01-01T00:00:00.000Z","targetId":"e2"}"#,
+        "\n",
     );
     std::fs::write(&file, contents).unwrap();
 
@@ -693,16 +832,20 @@ fn m3_m4_branched_labels_keep_original_ts_and_global_scope() {
 
     // Branch onto the root->e2 path. The three label entries are OFF this path.
     let lay = SessionLayout::new(dir.path().to_path_buf(), PathBuf::from("/proj/m3"));
-    m.create_branched_session(&EntryId::from("e2"), &lay).unwrap();
+    m.create_branched_session(&EntryId::from("e2"), &lay)
+        .unwrap();
 
     // Collect the re-attached label entries in the new (in-place) session.
     let labels: Vec<(&str, &str)> = m
         .entries()
         .iter()
         .filter_map(|e| match e {
-            Entry::Known(KnownEntry::Label { base, target_id, label: Some(_), .. }) => {
-                Some((target_id.as_str(), base.timestamp.as_str()))
-            }
+            Entry::Known(KnownEntry::Label {
+                base,
+                target_id,
+                label: Some(_),
+                ..
+            }) => Some((target_id.as_str(), base.timestamp.as_str())),
             _ => None,
         })
         .collect();
@@ -737,11 +880,19 @@ fn g1_token_estimate_rounds_up_like_pi_ceil() {
     // Pi estimateTokens returns Math.ceil(chars / 4) in EVERY arm (compaction.ts:264,277,287,291).
     // A floor would under-count and shift the cut-point / trigger. bash("abc","de") = 5 chars.
     let b = bash("abc", "de"); // 3 + 2 = 5 chars → ceil(5/4) = 2 (floor would give 1)
-    assert_eq!(estimate_agent_message(&b), 2, "bashExecution estimate rounds up");
+    assert_eq!(
+        estimate_agent_message(&b),
+        2,
+        "bashExecution estimate rounds up"
+    );
 
     // Core user message: 9 chars → ceil(9/4) = 3 (floor would give 2).
     let u = AgentMessage::Core(user("123456789"));
-    assert_eq!(estimate_agent_message(&u), 3, "core message estimate rounds up");
+    assert_eq!(
+        estimate_agent_message(&u),
+        3,
+        "core message estimate rounds up"
+    );
 
     // Exact multiple of 4 is unaffected by the rounding mode.
     let exact = bash("abcd", "efgh"); // 8 chars → 2
@@ -787,14 +938,22 @@ fn g2_v1_to_v2_converts_first_kept_entry_index_to_id() {
         .unwrap(),
     ];
     // Pre-migration the compaction cannot parse (no id, no firstKeptEntryId).
-    assert!(matches!(entries[2], Entry::Unknown(_)), "v1 compaction starts as Unknown");
+    assert!(
+        matches!(entries[2], Entry::Unknown(_)),
+        "v1 compaction starts as Unknown"
+    );
 
     assert!(to_current(&mut header, &mut entries));
     assert_eq!(header.version, Some(crate::CURRENT_VERSION));
 
     let kept_id = entries[1].id();
     match &entries[2] {
-        Entry::Known(KnownEntry::Compaction { first_kept_entry_id, summary, tokens_before, .. }) => {
+        Entry::Known(KnownEntry::Compaction {
+            first_kept_entry_id,
+            summary,
+            tokens_before,
+            ..
+        }) => {
             assert_eq!(
                 first_kept_entry_id.as_ref(),
                 Some(&kept_id),
@@ -807,7 +966,10 @@ fn g2_v1_to_v2_converts_first_kept_entry_index_to_id() {
     }
     // The numeric index field is gone from the re-typed entry.
     let line = entries[2].to_line().unwrap();
-    assert!(!line.contains("firstKeptEntryIndex"), "index field removed: {line}");
+    assert!(
+        !line.contains("firstKeptEntryIndex"),
+        "index field removed: {line}"
+    );
 }
 
 // ---------------------------------------------------------------- G-3 file-op extraction -------
@@ -847,8 +1009,16 @@ fn g3_file_ops_match_exact_tool_name_and_path_arg_only() {
     ops.absorb_message(&asst_toolcall("read", "file_path", "y.rs")); // path under wrong key → skipped
 
     let (read, modified) = ops.compute_lists();
-    assert_eq!(read, vec!["a.rs".to_string()], "only exact 'read' with args.path tracked");
-    assert_eq!(modified, vec!["b.rs".to_string()], "only exact 'edit' with args.path tracked");
+    assert_eq!(
+        read,
+        vec!["a.rs".to_string()],
+        "only exact 'read' with args.path tracked"
+    );
+    assert_eq!(
+        modified,
+        vec!["b.rs".to_string()],
+        "only exact 'edit' with args.path tracked"
+    );
 }
 
 // ---------------------------------------------------------------- G-4 name sanitization --------
@@ -860,7 +1030,11 @@ fn g4_session_name_is_sanitized_on_write_and_trimmed_on_read() {
     let cwd = PathBuf::from("/proj/g4");
     let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
     m.append_session_info("  Hello\r\n\nWorld  ").unwrap();
-    assert_eq!(m.session_name().as_deref(), Some("Hello World"), "newline run collapsed + trimmed");
+    assert_eq!(
+        m.session_name().as_deref(),
+        Some("Hello World"),
+        "newline run collapsed + trimmed"
+    );
 
     // The persisted entry stores the sanitized bytes (no raw newline in the JSONL line).
     let line = m
@@ -872,11 +1046,18 @@ fn g4_session_name_is_sanitized_on_write_and_trimmed_on_read() {
             _ => None,
         })
         .unwrap();
-    assert!(!line.contains('\n') && !line.contains('\r'), "no raw newline persisted: {line}");
+    assert!(
+        !line.contains('\n') && !line.contains('\r'),
+        "no raw newline persisted: {line}"
+    );
 
     // A later whitespace-only name clears the title (empty → None).
     m.append_session_info("   \n  ").unwrap();
-    assert_eq!(m.session_name(), None, "empty name clears the session title");
+    assert_eq!(
+        m.session_name(),
+        None,
+        "empty name clears the session title"
+    );
 }
 
 // ---------------------------------------------------------------- G-5 summary timestamps -------
@@ -893,7 +1074,8 @@ fn g5_summary_messages_carry_entry_timestamp() {
         id: EntryId::from(id),
         parent_id: p.map(EntryId::from),
         timestamp: t.into(),
- extra: Default::default() };
+        extra: Default::default(),
+    };
     let entries = [
         Entry::known(KnownEntry::Message {
             base: base("e0", None, "2026-01-01T00:00:00Z"),
@@ -913,7 +1095,11 @@ fn g5_summary_messages_carry_entry_timestamp() {
     let msgs = build_context_messages(&refs);
     // Expected ms = 2026-01-01T00:00:01Z.
     let expected = 1767225601000i64;
-    assert_eq!(ts_of(&msgs[0]), expected, "compaction summary carries the entry timestamp");
+    assert_eq!(
+        ts_of(&msgs[0]),
+        expected,
+        "compaction summary carries the entry timestamp"
+    );
 }
 
 // ---------------------------------------------------------------- G-6 tree root order ----------
@@ -939,7 +1125,10 @@ fn g6_tree_leaves_roots_in_insertion_order() {
 
 fn text_of_entry(e: &Entry) -> String {
     match e {
-        Entry::Known(KnownEntry::Message { message: AgentMessage::Core(m), .. }) => text_of(m),
+        Entry::Known(KnownEntry::Message {
+            message: AgentMessage::Core(m),
+            ..
+        }) => text_of(m),
         _ => String::new(),
     }
 }
@@ -962,12 +1151,21 @@ fn g7_clone_of_in_memory_session_writes_no_file() {
     let path = m.create_branched_session(&leaf, &lay).unwrap();
     let after = std::fs::read_dir(dir.path()).unwrap().count();
 
-    assert!(path.is_none(), "in-memory branch returns no path (Pi returns undefined)");
+    assert!(
+        path.is_none(),
+        "in-memory branch returns no path (Pi returns undefined)"
+    );
     assert!(!m.is_persisted(), "in-memory clone stays in memory");
     assert!(m.session_file().is_none(), "no backing file path");
-    assert_eq!(before, after, "no file created on disk for an in-memory clone");
+    assert_eq!(
+        before, after,
+        "no file created on disk for an in-memory clone"
+    );
     // The retained path still carries the messages in memory.
-    assert!(!m.entries().is_empty(), "retained entries are present in memory");
+    assert!(
+        !m.entries().is_empty(),
+        "retained entries are present in memory"
+    );
 }
 
 // ---------------------------------------------------------------- G-2 explicit-leaf branch -----
@@ -995,12 +1193,22 @@ fn g2_create_branched_session_explicit_leaf_in_place() {
         .expect("a persisted branch returns the new file path");
 
     assert_ne!(new_path, old_file, "branched session lives in a new file");
-    assert_eq!(m.session_file(), Some(new_path.as_path()), "manager mutated in place to the branch");
+    assert_eq!(
+        m.session_file(),
+        Some(new_path.as_path()),
+        "manager mutated in place to the branch"
+    );
     assert_eq!(m.entries().len(), 2, "only the root→a0 path is retained");
     assert_eq!(m.leaf_id().cloned(), m.entries().last().map(Entry::id));
-    assert_eq!(m.header().parent_session.as_deref(), Some(old_file.to_string_lossy().as_ref()));
+    assert_eq!(
+        m.header().parent_session.as_deref(),
+        Some(old_file.to_string_lossy().as_ref())
+    );
     // a0 is an assistant → the branch is written eagerly.
-    assert!(new_path.exists(), "assistant-bearing branch is written eagerly");
+    assert!(
+        new_path.exists(),
+        "assistant-bearing branch is written eagerly"
+    );
 
     // The previous file is untouched on disk (Pi never rewrites it): all 4 entries remain.
     let reopened = SessionManager::open(&old_file).unwrap();
@@ -1060,7 +1268,10 @@ fn f1_forked_file_stays_in_the_listing_dir_end_to_end() {
     // Branch the way the service callers do: reuse the open file's OWN parent dir, LITERALLY.
     let branch_layout = SessionLayout::literal(list_dir.clone(), cwd.clone());
     let leaf = m.leaf_id().cloned().unwrap();
-    let branched = m.create_branched_session(&leaf, &branch_layout).unwrap().unwrap();
+    let branched = m
+        .create_branched_session(&leaf, &branch_layout)
+        .unwrap()
+        .unwrap();
 
     assert_eq!(
         branched.parent().unwrap(),
@@ -1070,7 +1281,10 @@ fn f1_forked_file_stays_in_the_listing_dir_end_to_end() {
     let listed = crate::listing::list(&lay);
     let paths: Vec<PathBuf> = listed.iter().map(|s| s.path.clone()).collect();
     assert!(paths.contains(&original), "original session is listed");
-    assert!(paths.contains(&branched), "Finding 1: the branched session must be visible to listing");
+    assert!(
+        paths.contains(&branched),
+        "Finding 1: the branched session must be visible to listing"
+    );
 }
 
 #[test]
@@ -1081,11 +1295,19 @@ fn f2_open_nonexistent_path_creates_a_fresh_session() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("brand-new-notes.jsonl");
     assert!(!path.exists());
-    let m = SessionManager::open(&path).expect("opening a nonexistent --session path creates a fresh session");
-    assert_eq!(m.session_file(), Some(path.as_path()), "the explicit path is preserved verbatim");
+    let m = SessionManager::open(&path)
+        .expect("opening a nonexistent --session path creates a fresh session");
+    assert_eq!(
+        m.session_file(),
+        Some(path.as_path()),
+        "the explicit path is preserved verbatim"
+    );
     assert!(m.entries().is_empty(), "a fresh session starts empty");
     // Fresh + no assistant yet ⇒ deferred flush, exactly like `newSession` (no file written yet).
-    assert!(!path.exists(), "the file is deferred until the first assistant message (Pi parity)");
+    assert!(
+        !path.exists(),
+        "the file is deferred until the first assistant message (Pi parity)"
+    );
 }
 
 // ---------------------------------------------------------------- SESS-001 ---------------------
@@ -1106,7 +1328,10 @@ fn sess001_null_or_missing_content_is_normalized_to_empty_not_dropped() {
     asst_missing.as_object_mut().unwrap().remove("content");
 
     let cases: Vec<(&str, serde_json::Value)> = vec![
-        ("user/null", json!({ "role": "user", "content": null, "timestamp": 0 })),
+        (
+            "user/null",
+            json!({ "role": "user", "content": null, "timestamp": 0 }),
+        ),
         ("user/missing", json!({ "role": "user", "timestamp": 0 })),
         ("assistant/null", asst_null),
         ("assistant/missing", asst_missing),
@@ -1148,12 +1373,19 @@ fn sess001_null_or_missing_content_is_normalized_to_empty_not_dropped() {
         // Observable effect: the turn reaches the LLM context with an EMPTY content array.
         let path = [&entry];
         let msgs = build_context_messages(&path);
-        assert_eq!(msgs.len(), 1, "{label}: the turn must not vanish from context");
+        assert_eq!(
+            msgs.len(),
+            1,
+            "{label}: the turn must not vanish from context"
+        );
         let content = match &msgs[0] {
             Message::User { content, .. } | Message::ToolResult { content, .. } => content.clone(),
             Message::Assistant(a) => a.content.clone(),
         };
-        assert!(content.is_empty(), "{label}: content normalizes to [], got {content:?}");
+        assert!(
+            content.is_empty(),
+            "{label}: content normalizes to [], got {content:?}"
+        );
     }
 }
 
@@ -1170,9 +1402,15 @@ fn sess001_normalized_empty_content_still_counts_as_a_cut_point_and_round_trips(
         "message": { "role": "user", "content": null, "timestamp": 0 },
     }))
     .unwrap();
-    assert_eq!(find_valid_cut_points(std::slice::from_ref(&entry), 0, 1), vec![0]);
+    assert_eq!(
+        find_valid_cut_points(std::slice::from_ref(&entry), 0, 1),
+        vec![0]
+    );
     let line = entry.to_line().unwrap();
-    assert!(line.contains("\"content\":[]"), "writes the array form back, got {line}");
+    assert!(
+        line.contains("\"content\":[]"),
+        "writes the array form back, got {line}"
+    );
 }
 
 // ------------------------------------- SESS-015 unresolvable firstKeptEntryIndex ---------------
@@ -1266,7 +1504,11 @@ fn sess015_unresolvable_first_kept_index_keeps_the_compacted_history_out_of_cont
 
         // Observable behavior #2 — the RAW projection compaction/token accounting runs on.
         let raw = m.build_context_raw();
-        assert_eq!(raw.len(), 2, "[{label}] raw context is summary + post-compaction: {raw:?}");
+        assert_eq!(
+            raw.len(),
+            2,
+            "[{label}] raw context is summary + post-compaction: {raw:?}"
+        );
         assert!(
             matches!(raw.first(), Some(AgentMessage::CompactionSummary(_))),
             "[{label}] the raw context leads with the compaction summary: {raw:?}"
@@ -1298,10 +1540,21 @@ fn sess015_resolvable_first_kept_index_still_keeps_the_tail_of_the_history() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_v1_session_with_first_kept_index(dir.path(), json!(2));
     let m = SessionManager::open(&path).unwrap();
-    let joined =
-        m.build_context().messages.iter().map(text_of).collect::<Vec<_>>().join("\n---\n");
-    assert!(joined.contains("THE SUMMARY of everything before the cut"), "{joined}");
-    assert!(!joined.contains("OLD-ONE"), "index 2 cuts before OLD-TWO: {joined}");
+    let joined = m
+        .build_context()
+        .messages
+        .iter()
+        .map(text_of)
+        .collect::<Vec<_>>()
+        .join("\n---\n");
+    assert!(
+        joined.contains("THE SUMMARY of everything before the cut"),
+        "{joined}"
+    );
+    assert!(
+        !joined.contains("OLD-ONE"),
+        "index 2 cuts before OLD-TWO: {joined}"
+    );
     assert!(joined.contains("OLD-TWO"), "{joined}");
     assert!(joined.contains("OLD-THREE"), "{joined}");
     assert!(joined.contains("NEW-ONE"), "{joined}");

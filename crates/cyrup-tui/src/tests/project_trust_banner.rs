@@ -30,13 +30,18 @@
 //! These tests drive the real `App::render_project_trust_warning_if_needed` seam — the one both the
 //! boot path (`App::run`, before the first frame) and the `session_swapped` arm call — and read the
 //! COMMITTED SCROLLBACK, i.e. what the user actually sees, including the warning colour.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::sync::Arc;
 
 use crate::{App, UiTheme};
-use cyrup_provider::faux::FauxProvider;
 use cyrup_provider::Provider;
+use cyrup_provider::faux::FauxProvider;
 use cyrup_session_svc::{AgentSession, SessionBuilder, SessionConfig};
 use ratatui::backend::TestBackend;
 
@@ -84,10 +89,16 @@ fn commit(app: &mut App<TestBackend>, session: &Arc<AgentSession>) -> String {
 async fn an_untrusted_project_with_cyrup_resources_shows_the_banner() {
     let dir = tempfile::tempdir().unwrap();
     let session = session(dir.path(), false, true).await;
-    assert!(!session.services().project_trusted, "fixture must actually be untrusted");
+    assert!(
+        !session.services().project_trusted,
+        "fixture must actually be untrusted"
+    );
     let mut app = new_app();
     let out = commit(&mut app, &session);
-    assert!(out.contains(BANNER), "the trust banner is missing from the transcript:\n{out}");
+    assert!(
+        out.contains(BANNER),
+        "the trust banner is missing from the transcript:\n{out}"
+    );
 }
 
 /// `theme.fg("warning", …)` (`:3505`) — the colour is the signal that this is a security notice and
@@ -105,7 +116,11 @@ async fn the_banner_is_painted_in_the_warning_colour() {
                 && line.style.patch(s.style).fg == theme.warning_style().fg
         })
     });
-    assert!(painted, "banner is not warning-coloured:\n{}", app.scrollback_text());
+    assert!(
+        painted,
+        "banner is not warning-coloured:\n{}",
+        app.scrollback_text()
+    );
 }
 
 /// `if (this.settingsManager.isProjectTrusted() … ) return;` (`:3497`) — the first half of pi's
@@ -114,7 +129,10 @@ async fn the_banner_is_painted_in_the_warning_colour() {
 async fn a_trusted_project_shows_no_banner() {
     let dir = tempfile::tempdir().unwrap();
     let session = session(dir.path(), true, true).await;
-    assert!(session.services().project_trusted, "fixture must actually be trusted");
+    assert!(
+        session.services().project_trusted,
+        "fixture must actually be trusted"
+    );
     let mut app = new_app();
     let out = commit(&mut app, &session);
     assert!(

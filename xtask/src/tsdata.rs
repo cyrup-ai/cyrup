@@ -215,7 +215,9 @@ pub fn parse_module_object(src: &str) -> Result<Val, String> {
     let tail = p.remaining().trim();
     let tail = tail.strip_prefix(';').unwrap_or(tail).trim();
     if !tail.is_empty() {
-        return Err(format!("unexpected trailing source after the literal: {tail:?}"));
+        return Err(format!(
+            "unexpected trailing source after the literal: {tail:?}"
+        ));
     }
     Ok(value)
 }
@@ -235,7 +237,9 @@ pub fn parse_json(src: &str) -> Result<Val, String> {
     p.skip_trivia();
     let tail = p.remaining().trim();
     if !tail.is_empty() {
-        return Err(format!("unexpected trailing JSON after the document: {tail:?}"));
+        return Err(format!(
+            "unexpected trailing JSON after the document: {tail:?}"
+        ));
     }
     Ok(value)
 }
@@ -378,7 +382,10 @@ impl<'a> Parser<'a> {
             };
             self.skip_trivia();
             if self.peek() != Some(b':') {
-                return Err(format!("expected `:` after key {key:?} at byte {}", self.pos));
+                return Err(format!(
+                    "expected `:` after key {key:?} at byte {}",
+                    self.pos
+                ));
             }
             self.pos += 1;
             let value = self.value()?;
@@ -412,7 +419,8 @@ impl<'a> Parser<'a> {
 
     fn identifier(&mut self) -> Result<String, String> {
         let start = self.pos;
-        while matches!(self.peek(), Some(c) if c.is_ascii_alphanumeric() || c == b'_' || c == b'$') {
+        while matches!(self.peek(), Some(c) if c.is_ascii_alphanumeric() || c == b'_' || c == b'$')
+        {
             self.pos += 1;
         }
         if start == self.pos {
@@ -501,7 +509,11 @@ impl<'a> Parser<'a> {
         {
             // `-` is only part of a numeral directly after an exponent marker.
             if matches!(self.peek(), Some(b'-') | Some(b'+')) {
-                let prev = self.pos.checked_sub(1).and_then(|i| self.src.get(i)).copied();
+                let prev = self
+                    .pos
+                    .checked_sub(1)
+                    .and_then(|i| self.src.get(i))
+                    .copied();
                 if !matches!(prev, Some(b'e') | Some(b'E')) {
                     break;
                 }
@@ -567,7 +579,9 @@ export const XAI_MODELS = {
         let m = &models[0];
         assert_eq!(m.get("id").and_then(Val::as_str), Some("grok-4.5"));
         assert_eq!(m.get("api").and_then(Val::as_str), Some("openai-responses"));
-        let Val::Obj(entries) = m else { panic!("object") };
+        let Val::Obj(entries) = m else {
+            panic!("object")
+        };
         let keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(
             keys,
@@ -614,8 +628,13 @@ export const XAI_MODELS = {
     fn emits_tab_indented_json() {
         let models = parse_models_module(SAMPLE).unwrap();
         let json = Val::Arr(models).to_json();
-        assert!(json.starts_with("[\n\t{\n\t\t\"id\": \"grok-4.5\","), "{json}");
-        assert!(json.contains("\t\t\"compat\": {\n\t\t\t\"supportsLongCacheRetention\": false\n\t\t},"));
+        assert!(
+            json.starts_with("[\n\t{\n\t\t\"id\": \"grok-4.5\","),
+            "{json}"
+        );
+        assert!(
+            json.contains("\t\t\"compat\": {\n\t\t\t\"supportsLongCacheRetention\": false\n\t\t},")
+        );
         assert!(json.ends_with("\n]"));
     }
 

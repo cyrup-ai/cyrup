@@ -21,7 +21,6 @@
 //! swallowed, so a hand-edited typo is discoverable) and this function still falls back to the
 //! default rather than aborting startup over one malformed optional file.
 
-
 use cyrup_config::ConfigDirs;
 use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
@@ -73,7 +72,10 @@ pub fn load_subagent_extension_config(dirs: &ConfigDirs) -> SubagentExtensionCon
         // `roots` is `#[serde(skip)]`, so a parsed config carries `Default`'s env-derived value.
         // Overwrite it with the binary's own layout: a `config.json` must not be able to decide
         // where a run writes, and the two must not be able to disagree.
-        Ok(cfg) => SubagentExtensionConfig { roots: Roots::from_config_dirs(dirs), ..cfg },
+        Ok(cfg) => SubagentExtensionConfig {
+            roots: Roots::from_config_dirs(dirs),
+            ..cfg
+        },
         Err(err) => {
             eprintln!(
                 "cyrup: warning: {} is not valid subagents config JSON ({err}); using defaults",
@@ -112,7 +114,10 @@ mod tests {
     /// this (rather than a bare `SubagentExtensionConfig::default()`) is what proves the roots are
     /// set on the absent-file, unparseable and missions-invalid paths too, not just the happy one.
     fn defaults_for(dirs: &ConfigDirs) -> SubagentExtensionConfig {
-        SubagentExtensionConfig { roots: Roots::from_config_dirs(dirs), ..Default::default() }
+        SubagentExtensionConfig {
+            roots: Roots::from_config_dirs(dirs),
+            ..Default::default()
+        }
     }
 
     #[test]

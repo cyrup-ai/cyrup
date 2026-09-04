@@ -84,4 +84,3 @@ fn fake_jwt(payload: &Value) -> String {
     let body = ATOB.encode(serde_json::to_vec(payload).unwrap());
     format!("eyJhbGciOiJub25lIn0.{body}.sig")
 }
-

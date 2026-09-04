@@ -11,24 +11,25 @@
 //! Gated on `test-fixtures` (the `cyrup-subagent-fixture` `[[bin]]`'s own `required-features` gate);
 //! without it this file compiles to an empty, passing test list.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-
 use cyrup_core::{CancelToken, ToolUpdate, ToolUpdateSink};
-use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::background::RunMode;
 use cyrup_ext_subagents::discovery::types::AgentReadScope;
-use cyrup_ext_subagents::extension::{
-    ForegroundRunRequest, SingleRunOverrides, SubagentExecutor,
-};
+use cyrup_ext_subagents::extension::{ForegroundRunRequest, SingleRunOverrides, SubagentExecutor};
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::tui::events::{LiveProgressStatus, SubagentUpdatePayload};
-
 
 /// Path to the real, already-built `cyrup-subagent-fixture` binary.
 ///
@@ -117,7 +118,10 @@ async fn foreground_run_streams_live_progress_through_on_update() {
     let executor = SubagentExecutor::with_config(SubagentExtensionConfig {
         spawn_command: Some(SpawnCommand {
             binary: fixture,
-            base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+            base_args: vec![
+                "--fixture-script".to_string(),
+                script_path.display().to_string(),
+            ],
         }),
         roots: Roots::sandboxed(home.path()),
         ..SubagentExtensionConfig::default()
@@ -144,7 +148,10 @@ async fn foreground_run_streams_live_progress_through_on_update() {
     .expect("streaming foreground run must not hang against a fast fixture child")
     .expect("run_foreground_streaming resolves the persona and completes");
 
-    assert_eq!(result.exit_code, 0, "the scripted fixture run must exit 0: {result:?}");
+    assert_eq!(
+        result.exit_code, 0,
+        "the scripted fixture run must exit 0: {result:?}"
+    );
 
     let captured = updates.lock().expect("updates lock").clone();
     assert!(
@@ -179,9 +186,10 @@ async fn foreground_run_streams_live_progress_through_on_update() {
 
     // A later update (after the assistant message_end) must reflect the turn's tokens (input+output).
     assert!(
-        payloads
+        payloads.iter().any(|p| p
+            .progress
             .iter()
-            .any(|p| p.progress.iter().any(|pr| pr.turn_count >= 1 && pr.tokens >= 42)),
+            .any(|pr| pr.turn_count >= 1 && pr.tokens >= 42)),
         "a progress update must reflect the assistant turn (turns>=1, tokens>=42): {payloads:?}"
     );
 
@@ -191,9 +199,10 @@ async fn foreground_run_streams_live_progress_through_on_update() {
         "SINGLE-mode run must tag every payload mode=single: {payloads:?}"
     );
     assert!(
-        payloads
+        payloads.iter().any(|p| p
+            .progress
             .iter()
-            .any(|p| p.progress.iter().any(|pr| pr.agent.as_deref() == Some("streamtest"))),
+            .any(|pr| pr.agent.as_deref() == Some("streamtest"))),
         "progress entries must name the running persona: {payloads:?}"
     );
 
@@ -201,7 +210,10 @@ async fn foreground_run_streams_live_progress_through_on_update() {
     // settled SingleResult in `results`.
     assert!(
         payloads.iter().any(|p| {
-            p.progress.iter().any(|pr| pr.status == LiveProgressStatus::Complete) && !p.results.is_empty()
+            p.progress
+                .iter()
+                .any(|pr| pr.status == LiveProgressStatus::Complete)
+                && !p.results.is_empty()
         }),
         "a terminal settle update must carry status=complete + the settled result: {payloads:?}"
     );
@@ -262,7 +274,10 @@ async fn foreground_run_honors_an_already_cancelled_host_token() {
     let executor = SubagentExecutor::with_config(SubagentExtensionConfig {
         spawn_command: Some(SpawnCommand {
             binary: fixture,
-            base_args: vec!["--fixture-script".to_string(), script_path.display().to_string()],
+            base_args: vec![
+                "--fixture-script".to_string(),
+                script_path.display().to_string(),
+            ],
         }),
         roots: Roots::sandboxed(home.path()),
         ..SubagentExtensionConfig::default()

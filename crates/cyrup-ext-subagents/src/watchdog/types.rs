@@ -677,14 +677,22 @@ pub struct WatchdogSettingsResult {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 mod tests {
     use super::*;
 
     #[test]
     fn union_tuples_keep_upstream_order_and_wire_strings() {
         assert_eq!(
-            WatchdogCategory::ALL.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+            WatchdogCategory::ALL
+                .iter()
+                .map(|c| c.as_str())
+                .collect::<Vec<_>>(),
             vec![
                 "correctness",
                 "missed-constraint",
@@ -697,11 +705,24 @@ mod tests {
             ]
         );
         assert_eq!(
-            WatchdogRuntimeStatus::ALL.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-            vec!["idle", "queued", "reviewing", "waiting-at-agent-end", "stale", "failed"]
+            WatchdogRuntimeStatus::ALL
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "idle",
+                "queued",
+                "reviewing",
+                "waiting-at-agent-end",
+                "stale",
+                "failed"
+            ]
         );
         assert_eq!(
-            WatchdogWarningState::ALL.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            WatchdogWarningState::ALL
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>(),
             vec![
                 "candidate",
                 "confirmed",
@@ -713,13 +734,19 @@ mod tests {
                 "suppressed"
             ]
         );
-        assert_eq!(WatchdogSeverity::parse("blocker"), Some(WatchdogSeverity::Blocker));
+        assert_eq!(
+            WatchdogSeverity::parse("blocker"),
+            Some(WatchdogSeverity::Blocker)
+        );
         assert_eq!(WatchdogSeverity::parse("Blocker"), None);
     }
 
     #[test]
     fn thinking_setting_serializes_false_as_json_bool() {
-        assert_eq!(serde_json::to_string(&ThinkingSetting::Off).unwrap(), "false");
+        assert_eq!(
+            serde_json::to_string(&ThinkingSetting::Off).unwrap(),
+            "false"
+        );
         assert_eq!(
             serde_json::to_string(&ThinkingSetting::Level("high".into())).unwrap(),
             "\"high\""
@@ -738,8 +765,14 @@ mod tests {
 
     #[test]
     fn sync_backlog_serializes_as_off_or_number() {
-        assert_eq!(serde_json::to_string(&WatchdogSyncBacklog::Off).unwrap(), "\"off\"");
-        assert_eq!(serde_json::to_string(&WatchdogSyncBacklog::Count(4)).unwrap(), "4");
+        assert_eq!(
+            serde_json::to_string(&WatchdogSyncBacklog::Off).unwrap(),
+            "\"off\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WatchdogSyncBacklog::Count(4)).unwrap(),
+            "4"
+        );
     }
 
     #[test]

@@ -130,7 +130,10 @@ pub(crate) fn clipboard_write_plan(os: &str, env: &ClipboardEnv) -> Vec<Clipboar
             // both as Pi's `else if (hasX11Display)` and as the post-`wl-copy` fallback
             // (`clipboard.ts:145-148`), which is the same list in the same order.
             if env.x11_display {
-                steps.push(ClipboardWrite::Command("xclip", &["-selection", "clipboard"]));
+                steps.push(ClipboardWrite::Command(
+                    "xclip",
+                    &["-selection", "clipboard"],
+                ));
                 steps.push(ClipboardWrite::Command("xsel", &["--clipboard", "--input"]));
             }
         }
@@ -162,9 +165,9 @@ async fn run_step(step: ClipboardWrite, text: &str) -> bool {
         // Synchronous, like Pi's awaited addon call: on the two platforms this step runs
         // (see the `[CYRUP-DELTA]` in `clipboard_write_plan`) it is an NSPasteboard / `OpenClipboard`
         // write that returns immediately, not an X11 round trip, so there is nothing to offload.
-        ClipboardWrite::Native => {
-            arboard::Clipboard::new().and_then(|mut c| c.set_text(text)).is_ok()
-        }
+        ClipboardWrite::Native => arboard::Clipboard::new()
+            .and_then(|mut c| c.set_text(text))
+            .is_ok(),
         ClipboardWrite::Command(bin, args) => run_command(bin, args, text).await,
     }
 }

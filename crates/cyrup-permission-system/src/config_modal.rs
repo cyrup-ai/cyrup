@@ -98,8 +98,14 @@ pub fn build_setting_items(config: &ExtensionConfig) -> Vec<SettingItem> {
 pub fn apply_setting(config: &ExtensionConfig, id: &str, value: &str) -> ExtensionConfig {
     let enabled = value == ON_OFF[0];
     match id {
-        "debug" => ExtensionConfig { debug: enabled, ..config.clone() },
-        "yoloMode" => ExtensionConfig { yolo_mode: enabled, ..config.clone() },
+        "debug" => ExtensionConfig {
+            debug: enabled,
+            ..config.clone()
+        },
+        "yoloMode" => ExtensionConfig {
+            yolo_mode: enabled,
+            ..config.clone()
+        },
         _ => config.clone(),
     }
 }
@@ -307,7 +313,15 @@ impl PermissionSystemSettingsOverlay {
         let current = controller.get_config();
         let items = build_setting_items(&current);
         let filtered = (0..items.len()).collect();
-        Self { controller, current, items, filtered, selected: 0, search: String::new(), error: None }
+        Self {
+            controller,
+            current,
+            items,
+            filtered,
+            selected: 0,
+            search: String::new(),
+            error: None,
+        }
     }
 
     /// The most recent commit failure, if any — so the command handler can raise the same
@@ -345,7 +359,10 @@ impl PermissionSystemSettingsOverlay {
         let Some(item) = self.items.get(index) else {
             return OverlayOutcome::Ignored;
         };
-        let ring_index = ON_OFF.iter().position(|v| *v == item.current_value).unwrap_or(0);
+        let ring_index = ON_OFF
+            .iter()
+            .position(|v| *v == item.current_value)
+            .unwrap_or(0);
         // `.get()` rather than `ON_OFF[..]`: the `% len` already makes the index infallible, but
         // the crate denies `clippy::indexing_slicing` (lib.rs:69) and this line was tripping it.
         // `ON_OFF` is a non-empty const array, so the fallback is unreachable; it stays on the
@@ -371,7 +388,9 @@ impl PermissionSystemSettingsOverlay {
     fn apply_filter(&mut self) {
         self.filtered = (0..self.items.len())
             .filter(|i| {
-                self.items.get(*i).is_some_and(|item| label_matches(item.label, &self.search))
+                self.items
+                    .get(*i)
+                    .is_some_and(|item| label_matches(item.label, &self.search))
             })
             .collect();
         self.selected = 0;
@@ -407,7 +426,10 @@ impl InteractiveOverlay for PermissionSystemSettingsOverlay {
         lines.push(OverlayLine::default());
 
         // The search input (`settings-list.ts:91-94`).
-        lines.push(OverlayLine::new(vec![OverlaySpan::raw(format!("> {}", self.search))]));
+        lines.push(OverlayLine::new(vec![OverlaySpan::raw(format!(
+            "> {}",
+            self.search
+        ))]));
         lines.push(OverlayLine::default());
 
         if self.filtered.is_empty() {
@@ -469,7 +491,11 @@ impl InteractiveOverlay for PermissionSystemSettingsOverlay {
             }
 
             // pi's selected-item description block (`settings-list.ts:153-161`).
-            if let Some(item) = self.filtered.get(self.selected).and_then(|i| self.items.get(*i)) {
+            if let Some(item) = self
+                .filtered
+                .get(self.selected)
+                .and_then(|i| self.items.get(*i))
+            {
                 lines.push(OverlayLine::default());
                 for line in wrap_text(item.description, inner.saturating_sub(4)) {
                     lines.push(Self::hint(format!("  {line}")));
@@ -486,7 +512,9 @@ impl InteractiveOverlay for PermissionSystemSettingsOverlay {
         // pi `helpUndertitle` (`config-modal.ts:98-101`), verbatim.
         lines.push(Self::hint("Esc: close | ↑↓: navigate | Space: toggle"));
         // pi's own hint row under `enableSearch` (`settings-list.ts:243-247`), verbatim.
-        lines.push(Self::hint("  Type to search · Enter/Space to change · Esc to cancel"));
+        lines.push(Self::hint(
+            "  Type to search · Enter/Space to change · Esc to cancel",
+        ));
 
         if let Some(error) = &self.error {
             lines.push(OverlayLine::new(vec![OverlaySpan {
@@ -570,7 +598,10 @@ mod tests {
     /// labels, and each row's value projected off the config.
     #[test]
     fn the_modal_offers_pis_two_rows_with_their_current_values() {
-        let config = ExtensionConfig { debug: true, ..ExtensionConfig::default() };
+        let config = ExtensionConfig {
+            debug: true,
+            ..ExtensionConfig::default()
+        };
         let items = build_setting_items(&config);
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].id, "debug");
@@ -614,7 +645,10 @@ mod tests {
         );
 
         assert!(ctl.get_config().debug, "the live config must be flipped");
-        assert!(ctl.get_config_path().exists(), "the config file must have been written");
+        assert!(
+            ctl.get_config_path().exists(),
+            "the config file must have been written"
+        );
         let on_disk: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(ctl.get_config_path()).unwrap()).unwrap();
         assert_eq!(on_disk.get("debug"), Some(&serde_json::Value::Bool(true)));
@@ -636,12 +670,21 @@ mod tests {
         overlay.handle_key(OverlayKey::plain(OverlayKeyCode::Down));
         assert_eq!(overlay.selected, 1);
         overlay.handle_key(OverlayKey::plain(OverlayKeyCode::Down));
-        assert_eq!(overlay.selected, 0, "down from the last row wraps to the first");
+        assert_eq!(
+            overlay.selected, 0,
+            "down from the last row wraps to the first"
+        );
         overlay.handle_key(OverlayKey::plain(OverlayKeyCode::Up));
-        assert_eq!(overlay.selected, 1, "up from the first row wraps to the last");
+        assert_eq!(
+            overlay.selected, 1,
+            "up from the first row wraps to the last"
+        );
 
         overlay.handle_key(OverlayKey::plain(OverlayKeyCode::Enter));
-        assert!(ctl.get_config().yolo_mode, "Enter toggles the SELECTED row, not the first");
+        assert!(
+            ctl.get_config().yolo_mode,
+            "Enter toggles the SELECTED row, not the first"
+        );
         assert!(!ctl.get_config().debug);
     }
 
@@ -655,7 +698,11 @@ mod tests {
         for c in "yolo".chars() {
             overlay.handle_key(OverlayKey::plain(OverlayKeyCode::Char(c)));
         }
-        assert_eq!(overlay.filtered, vec![1], "only the YOLO row survives the filter");
+        assert_eq!(
+            overlay.filtered,
+            vec![1],
+            "only the YOLO row survives the filter"
+        );
         assert_eq!(overlay.selected, 0);
 
         overlay.handle_key(OverlayKey::plain(OverlayKeyCode::Backspace));
@@ -685,9 +732,18 @@ mod tests {
         let mut overlay = PermissionSystemSettingsOverlay::new(Arc::clone(&ctl));
         overlay.handle_key(OverlayKey::plain(OverlayKeyCode::Char(' ')));
 
-        assert!(!ctl.get_config().debug, "a refused write must not mutate the live config");
-        assert_eq!(overlay.items[0].current_value, "off", "the row snaps back to what is in effect");
-        assert!(overlay.take_error().is_some(), "the cause must be available to the caller");
+        assert!(
+            !ctl.get_config().debug,
+            "a refused write must not mutate the live config"
+        );
+        assert_eq!(
+            overlay.items[0].current_value, "off",
+            "the row snaps back to what is in effect"
+        );
+        assert!(
+            overlay.take_error().is_some(),
+            "the cause must be available to the caller"
+        );
     }
 
     /// The rendered frame must actually carry the two rows, the resolved config path
@@ -711,7 +767,10 @@ mod tests {
             text.contains(&format!("Config file: {}", ctl.get_config_path().display())),
             "{text}"
         );
-        assert!(text.contains("Esc: close | ↑↓: navigate | Space: toggle"), "{text}");
+        assert!(
+            text.contains("Esc: close | ↑↓: navigate | Space: toggle"),
+            "{text}"
+        );
         // The selected row's description is upstream's, verbatim.
         assert!(
             text.contains("Write diagnostics and permission review entries"),

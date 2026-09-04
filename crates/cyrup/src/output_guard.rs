@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// consumers are the protocol writers (`json.rs`, `print.rs`), and `cyrup` depends on
 /// `cyrup-modes`, not the reverse. Re-exported so this module still names pi's full surface and a
 /// reader looking for `writeRawStdout` in the file that ports `output-guard.ts` finds it.
-pub use cyrup_modes::{flush_raw_stdout, write_raw_stdout, RAW_STDOUT_RETRY_DELAY_MS};
+pub use cyrup_modes::{RAW_STDOUT_RETRY_DELAY_MS, flush_raw_stdout, write_raw_stdout};
 
 /// Process-global takeover state — the analog of Pi's module-level `stdoutTakeoverState`
 /// (output-guard.ts:7). `false` (not taken over) until `main` installs the guard for a

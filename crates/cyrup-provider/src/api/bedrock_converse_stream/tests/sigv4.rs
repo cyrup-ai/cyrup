@@ -17,7 +17,10 @@ fn hmac_sha256_matches_rfc_4231() {
     // A key longer than the 64-byte block must be hashed first (case 4 of the same RFC uses a
     // 131-byte key).
     assert_eq!(
-        hex(&hmac_sha256(&[0xaa; 131], b"Test Using Larger Than Block-Size Key - Hash Key First")),
+        hex(&hmac_sha256(
+            &[0xaa; 131],
+            b"Test Using Larger Than Block-Size Key - Hash Key First"
+        )),
         "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
     );
 }
@@ -27,10 +30,7 @@ fn hmac_sha256_matches_rfc_4231() {
 /// service `iam`.
 #[test]
 fn sigv4_signing_key_derivation_matches_the_aws_example() {
-    let k_date = hmac_sha256(
-        b"AWS4wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
-        b"20150830",
-    );
+    let k_date = hmac_sha256(b"AWS4wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", b"20150830");
     let k_region = hmac_sha256(&k_date, b"us-east-1");
     let k_service = hmac_sha256(&k_region, b"iam");
     let k_signing = hmac_sha256(&k_service, b"aws4_request");
@@ -75,7 +75,15 @@ fn sigv4_signs_deterministically_and_covers_the_caller_headers() {
         if let Some((k, v)) = extra {
             headers.insert(k.to_string(), v.to_string());
         }
-        sign_sigv4(&mut headers, &url, b"{\"a\":1}", &creds, "us-east-1", 1_440_938_160).unwrap();
+        sign_sigv4(
+            &mut headers,
+            &url,
+            b"{\"a\":1}",
+            &creds,
+            "us-east-1",
+            1_440_938_160,
+        )
+        .unwrap();
         headers
     };
 
@@ -85,12 +93,17 @@ fn sigv4_signs_deterministically_and_covers_the_caller_headers() {
         base.get("x-amz-date").map(String::as_str),
         Some("20150830T123600Z")
     );
-    assert_eq!(base.get("x-amz-security-token").map(String::as_str), Some("sess"));
+    assert_eq!(
+        base.get("x-amz-security-token").map(String::as_str),
+        Some("sess")
+    );
     let auth = base.get("authorization").expect("authorization");
     assert!(auth.starts_with(
         "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/bedrock/aws4_request, SignedHeaders="
     ));
-    assert!(auth.contains("content-type;host;x-amz-content-sha256;x-amz-date;x-amz-security-token"));
+    assert!(
+        auth.contains("content-type;host;x-amz-content-sha256;x-amz-date;x-amz-security-token")
+    );
 
     // A caller header changes the signature — proving injected headers are covered by it, which
     // is the whole reason upstream registers its middleware at the `build` step.

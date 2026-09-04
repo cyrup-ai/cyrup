@@ -174,10 +174,7 @@ fn validate_limit(value: &serde_json::Value, label: &str) -> Result<UsageBudgetL
     let soft = match raw.get("soft") {
         None | Some(serde_json::Value::Null) => None,
         Some(raw_soft) => {
-            let Some(soft) = raw_soft
-                .as_f64()
-                .filter(|s| s.is_finite() && *s > 0.0)
-            else {
+            let Some(soft) = raw_soft.as_f64().filter(|s| s.is_finite() && *s > 0.0) else {
                 return Err(format!("{label}.soft must be a positive number."));
             };
             if soft > hard {
@@ -212,10 +209,7 @@ pub fn validate_usage_budget_config(
     let Some(raw) = value.as_object() else {
         return Err(format!("{label} must be an object."));
     };
-    if let Some(unknown) = raw
-        .keys()
-        .find(|key| *key != "tokens" && *key != "costUsd")
-    {
+    if let Some(unknown) = raw.keys().find(|key| *key != "tokens" && *key != "costUsd") {
         return Err(format!("{label}.{unknown} is not supported."));
     }
     let mut budget = UsageBudgetConfig::default();
@@ -260,10 +254,7 @@ pub fn usage_budget_state(
 ) -> Option<UsageBudgetState> {
     let config = config?;
     let totals = totals.unwrap_or_default();
-    let tokens = metric_state(
-        config.tokens,
-        totals.input_tokens + totals.output_tokens,
-    );
+    let tokens = metric_state(config.tokens, totals.input_tokens + totals.output_tokens);
     let cost_usd = metric_state(config.cost_usd, totals.cost_usd);
     // pi's ternary chain: `tokens` wins the tie, and only a HARD breach produces a reason.
     let reason = if tokens.is_some_and(|t| t.outcome == UsageBudgetOutcome::HardExceeded) {
@@ -314,7 +305,12 @@ fn format_number(value: f64) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 
@@ -487,12 +483,19 @@ mod tests {
             None,
         )
         .expect("budgeted");
-        assert_eq!(state.cost_usd.expect("cost").used, 0.0, "absent totals read as 0");
+        assert_eq!(
+            state.cost_usd.expect("cost").used,
+            0.0,
+            "absent totals read as 0"
+        );
         let value = serde_json::to_value(state).expect("serializes");
         assert_eq!(value["version"], 1);
         assert_eq!(value["source"], "reported");
         assert_eq!(value["exhausted"], false);
-        assert!(value.get("tokens").is_none(), "an undeclared metric is omitted");
+        assert!(
+            value.get("tokens").is_none(),
+            "an undeclared metric is omitted"
+        );
         assert!(value.get("reason").is_none());
         assert_eq!(value["costUsd"]["outcome"], "within-budget");
     }

@@ -6,13 +6,21 @@ use super::*;
 fn adaptive_models_send_adaptive_thinking_and_an_effort() {
     let opts = opts_with_reasoning(ModelThinkingLevel::High);
     for (id, name) in [
-        ("global.anthropic.claude-opus-4-8-v1", "Claude Opus 4.8 (Global)"),
+        (
+            "global.anthropic.claude-opus-4-8-v1",
+            "Claude Opus 4.8 (Global)",
+        ),
         ("global.anthropic.claude-fable-5", "Claude Fable 5"),
         ("global.anthropic.claude-sonnet-5", "Claude Sonnet 5"),
         ("global.anthropic.claude-opus-5", "Claude Opus 5"),
     ] {
         let model = model_with(id, name);
-        let body = payload(&model, &user_ctx("Hello"), &opts, &BedrockOptions::default());
+        let body = payload(
+            &model,
+            &user_ctx("Hello"),
+            &opts,
+            &BedrockOptions::default(),
+        );
         let fields = &body["additionalModelRequestFields"];
         assert_eq!(
             fields["thinking"],
@@ -28,7 +36,12 @@ fn adaptive_models_send_adaptive_thinking_and_an_effort() {
 fn xhigh_reaches_the_native_effort_on_models_that_support_it() {
     let opts = opts_with_reasoning(ModelThinkingLevel::Xhigh);
     let model = opus_48();
-    let body = payload(&model, &user_ctx("Hello"), &opts, &BedrockOptions::default());
+    let body = payload(
+        &model,
+        &user_ctx("Hello"),
+        &opts,
+        &BedrockOptions::default(),
+    );
     assert_eq!(
         body["additionalModelRequestFields"]["output_config"],
         json!({ "effort": "xhigh" })
@@ -37,7 +50,12 @@ fn xhigh_reaches_the_native_effort_on_models_that_support_it() {
     // MIRROR: an adaptive model WITHOUT native xhigh support still clamps to "high" — proving
     // the branch keys off `supportsNativeXhighEffort`, not off the level alone.
     let sonnet_46 = model_with("global.anthropic.claude-sonnet-4-6", "Claude Sonnet 4.6");
-    let body = payload(&sonnet_46, &user_ctx("Hello"), &opts, &BedrockOptions::default());
+    let body = payload(
+        &sonnet_46,
+        &user_ctx("Hello"),
+        &opts,
+        &BedrockOptions::default(),
+    );
     assert_eq!(
         body["additionalModelRequestFields"]["output_config"],
         json!({ "effort": "high" })
@@ -53,7 +71,12 @@ fn govcloud_omits_the_thinking_display_field() {
         "us-gov.anthropic.claude-sonnet-4-5-20250929-v1:0",
         "Claude Sonnet 4.5 (GovCloud)",
     );
-    let body = payload(&model, &user_ctx("Hello"), &opts, &BedrockOptions::default());
+    let body = payload(
+        &model,
+        &user_ctx("Hello"),
+        &opts,
+        &BedrockOptions::default(),
+    );
     assert_eq!(
         body["additionalModelRequestFields"]["thinking"],
         json!({ "type": "enabled", "budget_tokens": 16384 })
@@ -94,7 +117,12 @@ fn interleaved_thinking_defaults_on_and_can_be_suppressed() {
     let opts = opts_with_reasoning(ModelThinkingLevel::High);
     let model = sonnet_45();
 
-    let body = payload(&model, &user_ctx("Hello"), &opts, &BedrockOptions::default());
+    let body = payload(
+        &model,
+        &user_ctx("Hello"),
+        &opts,
+        &BedrockOptions::default(),
+    );
     assert_eq!(
         body["additionalModelRequestFields"]["anthropic_beta"],
         json!([INTERLEAVED_THINKING_BETA])
@@ -355,7 +383,12 @@ fn budget_based_claude_resplits_max_tokens_between_thinking_and_output() {
     // budget at all.
     let mut adaptive = opus_48();
     adaptive.max_tokens = 8_000;
-    let body = payload(&adaptive, &user_ctx("hi"), &opts, &BedrockOptions::default());
+    let body = payload(
+        &adaptive,
+        &user_ctx("hi"),
+        &opts,
+        &BedrockOptions::default(),
+    );
     assert_eq!(body["inferenceConfig"]["maxTokens"], json!(2_000));
     assert!(
         body["additionalModelRequestFields"]["thinking"]

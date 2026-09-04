@@ -25,13 +25,18 @@
 //!   index (`:157-160`) — W1 + W2.
 //! * the caret cell is `afterGraphemes[0].segment` (`:555-559`) and the hardware marker is spliced
 //!   into the row string, so the terminal advances by real cell widths (`:546-550`) — U2 + U3.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
 use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::{App, Component, InputEditor, InputEvent, UiTheme};
+use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::style::Modifier;
-use ratatui::Terminal;
 
 /// The ZWJ family emoji — ONE extended grapheme cluster, seven `char`s, two display columns.
 const FAMILY: &str = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}";
@@ -106,7 +111,12 @@ fn caret_cell(app: &App<TestBackend>) -> Option<(u16, u16)> {
     let buf = app.terminal().backend().buffer();
     for y in 0..buf.area.height {
         for x in 0..buf.area.width {
-            if buf.cell((x, y)).unwrap().modifier.contains(Modifier::REVERSED) {
+            if buf
+                .cell((x, y))
+                .unwrap()
+                .modifier
+                .contains(Modifier::REVERSED)
+            {
                 return Some((y, x));
             }
         }
@@ -136,7 +146,12 @@ fn the_editor_draws_no_prompt_glyph_before_the_typed_text() {
     app.draw().unwrap();
     let r = rows(&app);
     let body = editor_top_rule(&app) + 1;
-    assert_eq!(r[body], "hello", "the text row is the text alone: {:?}", &r[body - 1..=body]);
+    assert_eq!(
+        r[body],
+        "hello",
+        "the text row is the text alone: {:?}",
+        &r[body - 1..=body]
+    );
     assert!(
         !r.join("\n").contains('\u{203a}'),
         "no `›` anywhere in an editor-only frame:\n{}",
@@ -155,7 +170,11 @@ fn editor_padding_still_insets_the_text_after_the_glyph_is_gone() {
     app.draw().unwrap();
     let r = rows(&app);
     let body = editor_top_rule(&app) + 1;
-    assert_eq!(r[body], "   hello", "3 columns of `leftPadding`, then the text: {:?}", r[body]);
+    assert_eq!(
+        r[body], "   hello",
+        "3 columns of `leftPadding`, then the text: {:?}",
+        r[body]
+    );
 }
 
 /// **E2.** Every visual row of a wrapped line starts at the SAME column.
@@ -185,8 +204,16 @@ fn wrapped_rows_share_one_left_edge_and_the_first_row_is_not_clipped() {
         );
     }
     // Nothing was clipped off the first row: rejoining the rows reproduces the buffer.
-    let rejoined: String = body.iter().map(|s| s.trim_end()).collect::<Vec<_>>().join(" ");
-    assert_eq!(rejoined.replace("  ", " ").trim(), text, "a character was clipped: {body:?}");
+    let rejoined: String = body
+        .iter()
+        .map(|s| s.trim_end())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(
+        rejoined.replace("  ", " ").trim(),
+        text,
+        "a character was clipped: {body:?}"
+    );
 }
 
 // ------------------------------------------------------------------------ E3 --------------------
@@ -240,7 +267,11 @@ fn a_short_buffer_stays_short_under_the_thirty_percent_cap() {
     let top = editor_top_rule(&app);
     assert_eq!(r[top + 1], "one");
     assert_eq!(r[top + 2], "two");
-    assert!(is_rule(&r[top + 3]), "two rows, then the bottom rule: {:?}", &r[top..]);
+    assert!(
+        is_rule(&r[top + 3]),
+        "two rows, then the bottom rule: {:?}",
+        &r[top..]
+    );
 }
 
 // ------------------------------------------------------------------------ E4 --------------------
@@ -269,11 +300,30 @@ fn overflow_scrolls_to_the_caret_and_the_rules_count_the_hidden_rows() {
     // above: the TOP rule carries `↑ 6 more`.
     let r = rows(&app);
     let top = editor_top_rule(&app);
-    assert!(r[top].starts_with("─── ↑ 6 more "), "top scroll rule (`:527`): {:?}", r[top]);
-    assert!(r[top].chars().all(|c| c != '↓'), "no down indicator while at the bottom: {:?}", r[top]);
-    assert!(r.iter().any(|l| l == "line 11"), "the last line must be visible:\n{}", r.join("\n"));
-    assert!(!r.iter().any(|l| l == "line 5"), "line 5 is scrolled off:\n{}", r.join("\n"));
-    assert!(caret_cell(&app).is_some(), "the caret must be inside the window");
+    assert!(
+        r[top].starts_with("─── ↑ 6 more "),
+        "top scroll rule (`:527`): {:?}",
+        r[top]
+    );
+    assert!(
+        r[top].chars().all(|c| c != '↓'),
+        "no down indicator while at the bottom: {:?}",
+        r[top]
+    );
+    assert!(
+        r.iter().any(|l| l == "line 11"),
+        "the last line must be visible:\n{}",
+        r.join("\n")
+    );
+    assert!(
+        !r.iter().any(|l| l == "line 5"),
+        "line 5 is scrolled off:\n{}",
+        r.join("\n")
+    );
+    assert!(
+        caret_cell(&app).is_some(),
+        "the caret must be inside the window"
+    );
 
     // Walk the caret to the very top with real Up presses. The window follows it and the rules swap
     // ends: nothing above, six below.
@@ -283,12 +333,33 @@ fn overflow_scrolls_to_the_caret_and_the_rules_count_the_hidden_rows() {
     app.draw().unwrap();
     let r = rows(&app);
     let top = editor_top_rule(&app);
-    assert!(r[top].chars().all(|c| c == '─'), "back at the top the rule is plain: {:?}", r[top]);
-    assert_eq!(r[top + 1], "line 0", "scroll-to-cursor put line 0 back on screen: {:?}", &r[top..]);
+    assert!(
+        r[top].chars().all(|c| c == '─'),
+        "back at the top the rule is plain: {:?}",
+        r[top]
+    );
+    assert_eq!(
+        r[top + 1],
+        "line 0",
+        "scroll-to-cursor put line 0 back on screen: {:?}",
+        &r[top..]
+    );
     let bottom = editor_bottom_rule(&app);
-    assert_eq!(bottom, top + 8, "7 text rows between the rules: {:?}", &r[top..=bottom]);
-    assert!(r[bottom].starts_with("─── ↓ 6 more "), "bottom scroll rule (`:584`): {:?}", r[bottom]);
-    assert!(caret_cell(&app).is_some(), "the caret must still be inside the window");
+    assert_eq!(
+        bottom,
+        top + 8,
+        "7 text rows between the rules: {:?}",
+        &r[top..=bottom]
+    );
+    assert!(
+        r[bottom].starts_with("─── ↓ 6 more "),
+        "bottom scroll rule (`:584`): {:?}",
+        r[bottom]
+    );
+    assert!(
+        caret_cell(&app).is_some(),
+        "the caret must still be inside the window"
+    );
 }
 
 /// MIRROR of E4. A buffer that fits shows PLAIN rules on both ends — `createScrollBorder` is called
@@ -300,8 +371,14 @@ fn a_buffer_that_fits_draws_plain_rules_with_no_indicator() {
     type_text(&mut app, "one\ntwo\nthree");
     app.draw().unwrap();
     let joined = rows(&app).join("\n");
-    assert!(!joined.contains("more "), "no scroll indicator on a fitting buffer:\n{joined}");
-    assert!(!joined.contains('↑') && !joined.contains('↓'), "no arrows either:\n{joined}");
+    assert!(
+        !joined.contains("more "),
+        "no scroll indicator on a fitting buffer:\n{joined}"
+    );
+    assert!(
+        !joined.contains('↑') && !joined.contains('↓'),
+        "no arrows either:\n{joined}"
+    );
 }
 
 // ----------------------------------------------------------------------- E13 --------------------
@@ -325,7 +402,10 @@ fn the_caret_stays_visible_when_the_terminal_loses_focus() {
     app.draw().unwrap();
     let focused = caret_cell(&app).expect("a focused editor draws its caret");
     // Two Lefts from the end of `hello` ⇒ the caret is on the `l` at column 3.
-    assert_eq!(focused.1, 3, "the caret follows the arrow keys, got {focused:?}");
+    assert_eq!(
+        focused.1, 3,
+        "the caret follows the arrow keys, got {focused:?}"
+    );
 
     app.handle_input(&InputEvent::FocusLost);
     app.draw().unwrap();
@@ -339,7 +419,11 @@ fn the_caret_stays_visible_when_the_terminal_loses_focus() {
 
     app.handle_input(&InputEvent::FocusGained);
     app.draw().unwrap();
-    assert_eq!(caret_cell(&app), Some(focused), "and regaining focus changes nothing about it");
+    assert_eq!(
+        caret_cell(&app),
+        Some(focused),
+        "and regaining focus changes nothing about it"
+    );
 }
 
 /// MIRROR of E13. What `focused` DOES gate is the hardware cursor — pi's `emitCursorMarker`
@@ -352,7 +436,10 @@ fn focus_loss_still_withdraws_the_hardware_cursor() {
     app.editor_mut().set_show_hardware_cursor(true);
     type_text(&mut app, "hi");
     app.draw().unwrap();
-    assert!(app.terminal().backend().cursor_visible(), "baseline: focused + enabled ⇒ visible");
+    assert!(
+        app.terminal().backend().cursor_visible(),
+        "baseline: focused + enabled ⇒ visible"
+    );
 
     app.handle_input(&InputEvent::FocusLost);
     app.draw().unwrap();
@@ -360,7 +447,10 @@ fn focus_loss_still_withdraws_the_hardware_cursor() {
         !app.terminal().backend().cursor_visible(),
         "`emitCursorMarker = this.focused` (`editor.ts:537`): no marker while blurred"
     );
-    assert!(caret_cell(&app).is_some(), "…while the SOFT caret stays (E13)");
+    assert!(
+        caret_cell(&app).is_some(),
+        "…while the SOFT caret stays (E13)"
+    );
 }
 
 // ----------------------------------------------------------------------- E14 --------------------
@@ -379,9 +469,18 @@ fn the_autocomplete_popup_is_indented_under_the_editor_padding() {
     app.draw().unwrap();
     let r = rows(&app);
     let top = editor_top_rule(&app);
-    assert_eq!(r[top + 1], "   /hotk", "the text is inset 3 (`:522`): {:?}", r[top + 1]);
+    assert_eq!(
+        r[top + 1],
+        "   /hotk",
+        "the text is inset 3 (`:522`): {:?}",
+        r[top + 1]
+    );
     let popup = &r[top + 3];
-    assert!(popup.contains("hotkeys"), "the popup must be open: {:?}", &r[top..]);
+    assert!(
+        popup.contains("hotkeys"),
+        "the popup must be open: {:?}",
+        &r[top..]
+    );
     assert!(
         popup.starts_with("   "),
         "E14: the popup carries the same `leftPadding` as the text (`:596`): {popup:?}"
@@ -398,8 +497,15 @@ fn the_popup_is_flush_at_the_default_zero_padding() {
     let r = rows(&app);
     let top = editor_top_rule(&app);
     let popup = &r[top + 3];
-    assert!(popup.contains("hotkeys"), "the popup must be open: {:?}", &r[top..]);
-    assert!(!popup.starts_with(' '), "no inset at paddingX = 0: {popup:?}");
+    assert!(
+        popup.contains("hotkeys"),
+        "the popup must be open: {:?}",
+        &r[top..]
+    );
+    assert!(
+        !popup.starts_with(' '),
+        "no inset at paddingX = 0: {popup:?}"
+    );
 }
 
 // ----------------------------------------------------------------------- E15 --------------------
@@ -431,10 +537,23 @@ fn a_padded_editor_reserves_every_row_it_renders() {
     let r = rows(&app);
     let top = editor_top_rule(&app);
     let bottom = editor_bottom_rule(&app);
-    assert_eq!(bottom - top - 1, 2, "34 chars wrap to 2 rows at width 28:\n{}", r.join("\n"));
-    assert!(r[top + 2].contains("01234"), "the LAST row must be on screen: {:?}", &r[top..=bottom]);
+    assert_eq!(
+        bottom - top - 1,
+        2,
+        "34 chars wrap to 2 rows at width 28:\n{}",
+        r.join("\n")
+    );
+    assert!(
+        r[top + 2].contains("01234"),
+        "the LAST row must be on screen: {:?}",
+        &r[top..=bottom]
+    );
     let caret = caret_cell(&app).expect("the end-of-buffer caret must be inside the slot");
-    assert_eq!(caret.0 as usize, top + 2, "the caret rides the last wrapped row, got {caret:?}");
+    assert_eq!(
+        caret.0 as usize,
+        top + 2,
+        "the caret rides the last wrapped row, got {caret:?}"
+    );
 }
 
 /// MIRROR of E15. The unpadded case — where measurement and render always agreed — is unchanged:
@@ -448,8 +567,17 @@ fn an_unpadded_editor_still_reserves_the_end_of_line_cursor_column() {
     app.draw().unwrap();
     let r = rows(&app);
     let top = editor_top_rule(&app);
-    assert_eq!(r[top + 1], text, "39 chars fit the 39-column layout width: {:?}", &r[top..]);
-    assert!(is_rule(&r[top + 2]), "one row, then the rule: {:?}", &r[top..]);
+    assert_eq!(
+        r[top + 1],
+        text,
+        "39 chars fit the 39-column layout width: {:?}",
+        &r[top..]
+    );
+    assert!(
+        is_rule(&r[top + 2]),
+        "one row, then the rule: {:?}",
+        &r[top..]
+    );
 }
 
 // ------------------------------------------------------------------ W1 + W2 ---------------------
@@ -486,10 +614,24 @@ fn cjk_wraps_on_display_columns_and_keeps_the_caret_in_the_frame() {
     );
     // ratatui parks a filler blank in the second cell of every wide grapheme, so read the rows back
     // through their non-blank cells — the CJK content itself has no spaces.
-    let glyphs = |row: &str| row.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    let glyphs = |row: &str| {
+        row.chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+    };
     // The break lands where the columns run out: 19 ideographs are 38 columns, a 20th would be 40.
-    assert_eq!(glyphs(&r[top + 1]).chars().count(), 19, "row 0 fills the width in COLUMNS: {:?}", r[top + 1]);
-    assert_eq!(glyphs(&r[top + 2]).chars().count(), 5, "the remainder: {:?}", r[top + 2]);
+    assert_eq!(
+        glyphs(&r[top + 1]).chars().count(),
+        19,
+        "row 0 fills the width in COLUMNS: {:?}",
+        r[top + 1]
+    );
+    assert_eq!(
+        glyphs(&r[top + 2]).chars().count(),
+        5,
+        "the remainder: {:?}",
+        r[top + 2]
+    );
     assert_eq!(
         format!("{}{}", glyphs(&r[top + 1]), glyphs(&r[top + 2])),
         cjk,
@@ -525,7 +667,12 @@ fn a_grapheme_cluster_is_never_torn_across_the_wrap_boundary() {
     let r = rows(&app);
     let top = editor_top_rule(&app);
 
-    assert_eq!(r[top + 1], head, "row 0 is the ASCII run alone — the emoji does not fit: {:?}", r[top + 1]);
+    assert_eq!(
+        r[top + 1],
+        head,
+        "row 0 is the ASCII run alone — the emoji does not fit: {:?}",
+        r[top + 1]
+    );
     assert!(
         r[top + 2].starts_with(FAMILY),
         "W2: the family emoji must arrive on row 1 WHOLE, not as a bare `\\u{{200d}}` tail: {:?}",
@@ -562,8 +709,15 @@ fn the_hardware_cursor_rides_the_scrolled_window_not_the_absolute_row() {
 
     let top = editor_top_rule(&app);
     let bottom = editor_bottom_rule(&app);
-    assert_eq!(bottom - top - 1, 7, "precondition: a 7-row window over 13 layout lines");
-    assert!(rows(&app)[top].starts_with("─── ↑ "), "precondition: the window really scrolled");
+    assert_eq!(
+        bottom - top - 1,
+        7,
+        "precondition: a 7-row window over 13 layout lines"
+    );
+    assert!(
+        rows(&app)[top].starts_with("─── ↑ "),
+        "precondition: the window really scrolled"
+    );
 
     let pos = app.terminal().backend().cursor_position();
     let soft = caret_cell(&app).expect("the soft caret is inside the window");
@@ -575,7 +729,11 @@ fn the_hardware_cursor_rides_the_scrolled_window_not_the_absolute_row() {
         bottom - 1,
         rows(&app).join("\n")
     );
-    assert_eq!(usize::from(pos.y), usize::from(soft.0), "and it agrees with the soft caret");
+    assert_eq!(
+        usize::from(pos.y),
+        usize::from(soft.0),
+        "and it agrees with the soft caret"
+    );
 }
 
 /// **U2 (the wide-character caret column).** `cursor_in`'s COLUMN is the DISPLAY WIDTH of the text
@@ -630,7 +788,10 @@ fn the_soft_caret_inverts_a_whole_grapheme_cluster() {
     app.draw().unwrap();
 
     let (y, x) = caret_cell(&app).expect("the caret is on the emoji");
-    assert_eq!(x, 0, "two Lefts over two grapheme clusters put the caret at column 0");
+    assert_eq!(
+        x, 0,
+        "two Lefts over two grapheme clusters put the caret at column 0"
+    );
     let buf = app.terminal().backend().buffer();
     assert_eq!(
         buf.cell((x, y)).unwrap().symbol(),
@@ -639,8 +800,17 @@ fn the_soft_caret_inverts_a_whole_grapheme_cluster() {
     );
     // The cluster is two columns wide, so the `x` that follows it starts at column 2 and is NOT
     // inverted — i.e. the highlight covers the cluster and stops.
-    assert_eq!(buf.cell((2, y)).unwrap().symbol(), "x", "the cluster occupies both of its columns");
-    assert!(!buf.cell((2, y)).unwrap().modifier.contains(Modifier::REVERSED));
+    assert_eq!(
+        buf.cell((2, y)).unwrap().symbol(),
+        "x",
+        "the cluster occupies both of its columns"
+    );
+    assert!(
+        !buf.cell((2, y))
+            .unwrap()
+            .modifier
+            .contains(Modifier::REVERSED)
+    );
 }
 
 // ----------------------------------------------------------------------- E17 --------------------
@@ -659,10 +829,16 @@ fn the_soft_caret_inverts_a_whole_grapheme_cluster() {
 fn the_editor_caps_itself_at_thirty_percent_regardless_of_the_rect_it_is_given() {
     let mut ed = InputEditor::new();
     ed.set_terminal_height(24);
-    ed.set_text(&(0..30).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n"));
+    ed.set_text(
+        &(0..30)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
 
     let mut term = Terminal::new(TestBackend::new(40, 20)).unwrap();
-    term.draw(|f| ed.render(f, f.area(), &UiTheme::dark())).unwrap();
+    term.draw(|f| ed.render(f, f.area(), &UiTheme::dark()))
+        .unwrap();
     let buf = term.backend().buffer();
     let row = |y: u16| {
         let mut s = String::new();
@@ -674,7 +850,11 @@ fn the_editor_caps_itself_at_thirty_percent_regardless_of_the_rect_it_is_given()
 
     // `scrollOffset` chases the caret (`editor.ts:507-516`), which `set_text` leaves at the end of
     // the buffer, so the window is the LAST 7 lines and 23 are hidden above.
-    assert_eq!(row(1), "line 23", "the window is the 7 rows around the caret");
+    assert_eq!(
+        row(1),
+        "line 23",
+        "the window is the 7 rows around the caret"
+    );
     assert_eq!(row(7), "line 29", "max(5, floor(24 * 0.3)) = 7 text rows");
     assert_eq!(
         row(8),
@@ -696,10 +876,16 @@ fn the_editor_caps_itself_at_thirty_percent_regardless_of_the_rect_it_is_given()
 fn a_rect_shorter_than_the_intrinsic_budget_still_wins() {
     let mut ed = InputEditor::new();
     ed.set_terminal_height(100); // intrinsic budget 30
-    ed.set_text(&(0..30).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n"));
+    ed.set_text(
+        &(0..30)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
 
     let mut term = Terminal::new(TestBackend::new(40, 6)).unwrap();
-    term.draw(|f| ed.render(f, f.area(), &UiTheme::dark())).unwrap();
+    term.draw(|f| ed.render(f, f.area(), &UiTheme::dark()))
+        .unwrap();
     let buf = term.backend().buffer();
     let row = |y: u16| {
         let mut s = String::new();
@@ -708,7 +894,19 @@ fn a_rect_shorter_than_the_intrinsic_budget_still_wins() {
         }
         s.trim_end().to_string()
     };
-    assert!(row(5).chars().all(|c| c == '─'), "nothing below the caret: {:?}", row(5));
-    assert_eq!(row(1), "line 26", "the window is the 4 rows the RECT allows, around the caret");
-    assert_eq!(row(4), "line 29", "4 text rows in a 6-row rect, not the intrinsic 30");
+    assert!(
+        row(5).chars().all(|c| c == '─'),
+        "nothing below the caret: {:?}",
+        row(5)
+    );
+    assert_eq!(
+        row(1),
+        "line 26",
+        "the window is the 4 rows the RECT allows, around the caret"
+    );
+    assert_eq!(
+        row(4),
+        "line 29",
+        "4 text rows in a 6-row rect, not the intrinsic 30"
+    );
 }

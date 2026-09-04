@@ -29,17 +29,14 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Mutex as StdMutex;
 
-
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId};
-use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::extension::SubagentsExtension;
+use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 use cyrup_ext_subagents::spawn::SpawnCommand;
 use cyrup_ext_subagents::tui::intercom::{
     DeliveryChannel, IntercomPayload, NoOpClarifyChannel, NoTransportSteerChannel,
 };
-
-
 
 fn fixture_binary_path() -> PathBuf {
     crate::support::bins::subagent_fixture()
@@ -105,7 +102,6 @@ fn tool_result_text(result: &cyrup_core::ToolResult) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn single_mode_delivers_out_of_band_and_renders_pis_receipt_with_the_real_run_id() {
-
     let work_dir = tempfile::tempdir().expect("real tempdir for the fixture persona + cwd");
     let home_dir = tempfile::tempdir().expect("real tempdir to isolate CYRUP_HOME artifacts");
     write_fixture_persona(work_dir.path(), "worker");
@@ -226,7 +222,6 @@ async fn single_mode_delivers_out_of_band_and_renders_pis_receipt_with_the_real_
 /// merely "some id that happens to render".
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parallel_mode_receipt_cites_the_same_run_id_the_chain_dir_was_created_under() {
-
     let work_dir = tempfile::tempdir().expect("real tempdir for the fixture persona + cwd");
     let home_dir = tempfile::tempdir().expect("real tempdir to isolate CYRUP_HOME artifacts");
     write_fixture_persona(work_dir.path(), "worker");
@@ -279,7 +274,11 @@ async fn parallel_mode_receipt_cites_the_same_run_id_the_chain_dir_was_created_u
     let text = tool_result_text(&result);
 
     let received = delivery.received.lock().expect("lock");
-    assert_eq!(received.len(), 1, "PARALLEL-mode foreground completion must attempt exactly one delivery");
+    assert_eq!(
+        received.len(),
+        1,
+        "PARALLEL-mode foreground completion must attempt exactly one delivery"
+    );
     let payload = &received[0];
 
     assert!(

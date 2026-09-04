@@ -9,6 +9,7 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
+use cyrup_config::{AppMode, AuthStore, Settings};
 use cyrup_core::{Content, Message, ProviderId, Tool};
 use cyrup_ext::NativeExtension;
 use cyrup_provider::faux::FauxModelDefinition;
@@ -16,16 +17,15 @@ use cyrup_provider::{Model, Provider};
 use cyrup_session_svc::{
     AgentSession, AgentSessionEvent, SessionBuilder, SessionConfig, SessionServiceError,
 };
-use cyrup_config::{AppMode, AuthStore, Settings};
 use cyrup_tools::{Availability, PermissionPolicy};
 use futures::StreamExt;
 
 use crate::response::{
-    faux_model, faux_model_from_def, faux_model_with_context_window, FauxResponse,
+    FauxResponse, faux_model, faux_model_from_def, faux_model_with_context_window,
 };
 use crate::scripted::{
-    create_faux_stream_fn_queued, create_faux_stream_fn_with_models, FauxStreamFnState,
-    ScriptedProvider,
+    FauxStreamFnState, ScriptedProvider, create_faux_stream_fn_queued,
+    create_faux_stream_fn_with_models,
 };
 use crate::tempdir::TestTempDir;
 use crate::tool_ext::ToolExtension;
@@ -127,7 +127,10 @@ impl Default for HarnessOptions {
 impl HarnessOptions {
     /// Options scripted with the given responses (everything else default).
     pub fn with_responses(responses: Vec<FauxResponse>) -> Self {
-        Self { responses, ..Default::default() }
+        Self {
+            responses,
+            ..Default::default()
+        }
     }
 }
 
@@ -188,12 +191,24 @@ impl Harness {
 
     /// Snapshot of the faux call state (call count + captured contexts; Pi `harness.faux`).
     pub fn faux(&self) -> FauxStreamFnState {
-        self.faux_state.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.faux_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Drive one prompt turn to completion, returning that run's events (also appended to the
-    /// cumulative [`Self::events`]). The run-scoped stream terminates after `agent_end`, so capture
-    /// is deterministic and race-free.
+    /// cumulative [`Self::events`]). The run-scoped stream terminates after `agent_settled`, so
+    /// capture is deterministic and race-free — and then this waits for the session to go IDLE,
+    /// which is a separate, later fact: on an unbound session the stream is closed inside the
+    /// agent's `agent_end` emit (`cyrup-session-svc/src/subscriber.rs` `end_run`), BEFORE the
+    /// agent's `SettlementGuard::drop` releases its `running` latch, so a caller prompting again
+    /// the instant the stream ended could be refused with `StreamingNeedsBehavior`
+    /// (`session/run.rs` `prompt` via `is_run_active`). pi's multi-turn tests always follow
+    /// `await session.prompt(...)` with `await session.waitForIdle()` (`core/agent-session.ts:1626`
+    /// @v0.84.4); folding that wait in here gives every two-turn caller the same guarantee
+    /// without each having to remember it (`crates/cyrup-test-support/src/lib.rs`
+    /// `run_returns_only_once_the_session_is_idle`).
     pub async fn run(
         &self,
         text: impl Into<String>,
@@ -202,20 +217,30 @@ impl Harness {
         let mut run_events = Vec::new();
         while let Some(ev) = stream.next().await {
             run_events.push(ev.clone());
-            self.events.lock().unwrap_or_else(|e| e.into_inner()).push(ev);
+            self.events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(ev);
         }
+        self.session.wait_for_idle().await;
         Ok(run_events)
     }
 
     /// All events captured across every [`Self::run`], in order (Pi `harness.events`).
     pub fn events(&self) -> Vec<AgentSessionEvent> {
-        self.events.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Filter captured events by their `kind` discriminant (Pi `eventsOfType<T>`,
     /// test-harness.ts:424). cyrup keys on the snake_case `type` tag string.
     pub fn events_of_kind(&self, kind: &str) -> Vec<AgentSessionEvent> {
-        self.events().into_iter().filter(|e| e.kind() == kind).collect()
+        self.events()
+            .into_iter()
+            .filter(|e| e.kind() == kind)
+            .collect()
     }
 
     /// The persisted user-message texts on the current branch (Pi `getUserTexts`,
@@ -396,7 +421,10 @@ pub async fn create_test_session(
     config.model_pattern = options.model_pattern;
     config.trust_override = Some(true);
     let session = SessionBuilder::new(provider, config).build().await?;
-    Ok(TestSession { session, _temp: temp })
+    Ok(TestSession {
+        session,
+        _temp: temp,
+    })
 }
 
 /// Build a headless harness with inline native extensions (Pi `createHarnessWithExtensions`,

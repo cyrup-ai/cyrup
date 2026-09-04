@@ -13,12 +13,12 @@
     clippy::string_slice
 )]
 
+use super::harness::*;
 use crate::crossterm::event::KeyCode;
 use crate::{
     App, AppAction, AppCommand, SelectorKind, SettingRow, SettingsSelector, TrustSelector, UiTheme,
 };
 use ratatui::backend::TestBackend;
-use super::harness::*;
 
 fn settings_app() -> App<TestBackend> {
     let mut app = App::new(TestBackend::new(70, 20), UiTheme::dark()).unwrap();
@@ -53,7 +53,10 @@ fn settings_selector_renders_search_rows_values_and_hint() {
         !text.lines().any(|l| l.trim() == "Settings"),
         "upstream draws no title row for /settings: {text}"
     );
-    assert!(text.lines().any(|l| l.trim_end() == ">"), "the search Input: {text}");
+    assert!(
+        text.lines().any(|l| l.trim_end() == ">"),
+        "the search Input: {text}"
+    );
     assert!(text.contains("Show images"), "row label shown: {text}");
     assert!(text.contains("true"), "current value shown: {text}");
     assert!(
@@ -78,7 +81,10 @@ fn settings_enter_cycles_in_place_and_emits_apply_command() {
     // The slot is still the settings selector (apply does NOT close), and the value flipped.
     assert_eq!(app.active_selector_kind(), Some(SelectorKind::Settings));
     app.draw().unwrap();
-    assert!(buf_text(&app).contains("false"), "displayed value updated in place");
+    assert!(
+        buf_text(&app).contains("false"),
+        "displayed value updated in place"
+    );
 }
 
 #[test]
@@ -92,7 +98,11 @@ fn settings_choice_cycles_through_its_set() {
                 "transport",
                 "Transport",
                 "auto",
-                vec!["auto".to_string(), "websocket".to_string(), "sse".to_string()],
+                vec![
+                    "auto".to_string(),
+                    "websocket".to_string(),
+                    "sse".to_string(),
+                ],
             )],
         )),
     );
@@ -109,8 +119,7 @@ fn settings_choice_cycles_through_its_set() {
 #[test]
 fn trust_selector_renders_header_options_and_cursor() {
     let mut app = App::new(TestBackend::new(70, 18), UiTheme::dark()).unwrap();
-    let labels =
-        vec!["Trust".to_string(), "Do not trust".to_string()];
+    let labels = vec!["Trust".to_string(), "Do not trust".to_string()];
     app.open_boxed_selector(
         SelectorKind::Trust,
         Box::new(TrustSelector::new(
@@ -125,8 +134,14 @@ fn trust_selector_renders_header_options_and_cursor() {
     let text = buf_text(&app);
     assert!(text.contains("Project trust"), "header title: {text}");
     assert!(text.contains("/home/me/project"), "cwd shown: {text}");
-    assert!(text.contains("Saved decision: none"), "saved decision line: {text}");
-    assert!(text.contains("Current session: untrusted"), "session trust line: {text}");
+    assert!(
+        text.contains("Saved decision: none"),
+        "saved decision line: {text}"
+    );
+    assert!(
+        text.contains("Current session: untrusted"),
+        "session trust line: {text}"
+    );
     assert!(text.contains("Trust"), "option label: {text}");
     assert!(text.contains('→'), "selection cursor: {text}");
 }
@@ -163,7 +178,13 @@ fn trust_esc_cancels_without_confirming() {
     let mut app = App::new(TestBackend::new(60, 14), UiTheme::dark()).unwrap();
     app.open_boxed_selector(
         SelectorKind::Trust,
-        Box::new(TrustSelector::new("/p", "none", true, vec!["Trust".to_string()], 0)),
+        Box::new(TrustSelector::new(
+            "/p",
+            "none",
+            true,
+            vec!["Trust".to_string()],
+            0,
+        )),
     );
     let action = app.handle_input(&key(KeyCode::Esc));
     assert_eq!(action, AppAction::Redraw);
@@ -173,11 +194,13 @@ fn trust_esc_cancels_without_confirming() {
 #[test]
 fn bordered_loader_occupies_the_editor_slot_when_set() {
     let mut app = App::new(TestBackend::new(60, 12), UiTheme::dark()).unwrap();
-    app.state_mut().loader =
-        Some(crate::BorderedLoader::plain("Creating gist…"));
+    app.state_mut().loader = Some(crate::BorderedLoader::plain("Creating gist…"));
     app.draw().unwrap();
     let text = buf_text(&app);
-    assert!(text.contains("Creating gist"), "loader message rendered: {text}");
+    assert!(
+        text.contains("Creating gist"),
+        "loader message rendered: {text}"
+    );
 }
 
 fn trust_app() -> App<TestBackend> {
@@ -213,7 +236,10 @@ fn trust_hint_row_uses_two_space_separators_and_bare_arrows() {
         "trust-selector.ts:74-83 verbatim"
     );
     assert!(!row.contains('·'), "no `·` separators upstream: {row:?}");
-    assert!(!row.contains("↑/↓"), "`rawKeyHint(\"↑↓\", …)` has no slash: {row:?}");
+    assert!(
+        !row.contains("↑/↓"),
+        "`rawKeyHint(\"↑↓\", …)` has no slash: {row:?}"
+    );
 }
 
 /// **S4.** Each hint pair is two-tone: `theme.fg("dim", keyText(kb)) + theme.fg("muted",
@@ -257,9 +283,15 @@ fn trust_hint_pairs_are_dim_key_plus_muted_description() {
 fn trust_option_rows_are_inset_one_column_like_the_header() {
     let app = trust_app();
     let (_, row) = row_with(&app, "→ Trust");
-    assert!(row.starts_with(" → Trust"), "one-column inset (`Text(…, 1, 0)`): {row:?}");
+    assert!(
+        row.starts_with(" → Trust"),
+        "one-column inset (`Text(…, 1, 0)`): {row:?}"
+    );
     let (_, header) = row_with(&app, "Project trust");
-    assert!(header.starts_with(" Project trust"), "header is inset too: {header:?}");
+    assert!(
+        header.starts_with(" Project trust"),
+        "header is inset too: {header:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -269,7 +301,9 @@ fn trust_option_rows_are_inset_one_column_like_the_header() {
 
 /// More rows than `SettingsList`'s `maxVisible = 10` (`settings-selector.ts:767`).
 fn many_settings(n: usize) -> Vec<SettingRow> {
-    (0..n).map(|i| SettingRow::toggle(format!("s{i:02}"), format!("Setting {i:02}"), true)).collect()
+    (0..n)
+        .map(|i| SettingRow::toggle(format!("s{i:02}"), format!("Setting {i:02}"), true))
+        .collect()
 }
 
 fn settings_app_with(rows: Vec<SettingRow>) -> App<TestBackend> {
@@ -290,7 +324,10 @@ fn settings_reports_its_scroll_position_and_counts_the_filtered_rows() {
     let mut app = settings_app_with(many_settings(14));
     app.draw().unwrap();
     let text = buf_text(&app);
-    assert!(text.contains("  (1/14)"), "no scroll readout (settings-list.ts:146-150):\n{text}");
+    assert!(
+        text.contains("  (1/14)"),
+        "no scroll readout (settings-list.ts:146-150):\n{text}"
+    );
     assert_eq!(
         text.lines().filter(|l| l.contains("Setting ")).count(),
         10,
@@ -307,7 +344,10 @@ fn settings_reports_its_scroll_position_and_counts_the_filtered_rows() {
     app.handle_input(&key(KeyCode::Char('1')));
     app.draw().unwrap();
     let text = buf_text(&app);
-    assert!(!text.contains("/14)"), "the denominator must follow the filter:\n{text}");
+    assert!(
+        !text.contains("/14)"),
+        "the denominator must follow the filter:\n{text}"
+    );
 
     // A list that fits the window gets no readout at all.
     let mut small = settings_app_with(many_settings(4));
@@ -325,7 +365,10 @@ fn settings_navigation_wraps_at_both_ends() {
     app.handle_input(&key(KeyCode::Up));
     match app.handle_input(&key(KeyCode::Enter)) {
         AppAction::Command(AppCommand::ApplySetting { id, .. }) => {
-            assert_eq!(id, "steeringMode", "Up at index 0 wrapped to the last row (:179-181)");
+            assert_eq!(
+                id, "steeringMode",
+                "Up at index 0 wrapped to the last row (:179-181)"
+            );
         }
         other => panic!("expected ApplySetting, got {other:?}"),
     }
@@ -397,8 +440,14 @@ fn confirming_a_thinking_level_emits_a_set_thinking_command() {
 #[test]
 fn the_settings_grid_offers_the_warnings_and_thinking_submenus() {
     let rows = crate::app::settings_rows_for_test();
-    assert!(rows.iter().any(|r| r.id == "warnings"), "pi's `warnings` submenu row is missing");
-    assert!(rows.iter().any(|r| r.id == "thinking"), "pi's `Thinking level` submenu row is missing");
+    assert!(
+        rows.iter().any(|r| r.id == "warnings"),
+        "pi's `warnings` submenu row is missing"
+    );
+    assert!(
+        rows.iter().any(|r| r.id == "thinking"),
+        "pi's `Thinking level` submenu row is missing"
+    );
 }
 
 /// TUI-036 — `Show images` / `Image width` are offered ONLY on a terminal with an image protocol.
