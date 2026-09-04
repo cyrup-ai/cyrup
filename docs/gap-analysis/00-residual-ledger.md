@@ -29,10 +29,24 @@ and against HEAD, and spot-checked citations with `rg` at HEAD and `git show` at
 resolved; the audit's own corrections are listed below). Repo checks at HEAD from the last review:
 `cargo fmt --all -- --check` clean, `cargo clippy -p <crate> --all-targets -- -D warnings` clean for
 every touched crate, per-crate `cargo nextest run` green (`cyrup-ext-subagents` 2725/2725,
-`cyrup-tui` 1372/1372, `cyrup-config` 226/226). **Not run anywhere this batch after `ICOM-053`'s own
-run: `cargo nextest run -p cyrup-it --features it` — the shared disk sat at 94–100% and the nested
-`it` build ENOSPCs.** `SUBA-072`/`088`/`090` edited ~30 `cyrup-it` test files after that run and were
-`cargo check`ed only; a maintainer must run the `it` suite once before trusting those seams.
+`cyrup-tui` 1372/1372, `cyrup-config` 226/226). **The armed seam suite HAS now been run, and it
+found two real test-side breaks this edition originally shipped unmeasured.** `cargo nextest run
+-p cyrup-it --features it` (with `CYRUP_IT_BIN_DIR` pointed at pre-built `--features faux` /
+`--features test-fixtures` binaries, which is what makes it fit on a 96%-full disk) failed
+`background_cascade_integration::a_delivered_stop_request_stops_the_run_and_cascades_to_descendants`
+(asserted the LEGACY single-file `control/stop.json` on the descendant; since `SUBA-087` the
+cascade writes one file per request under `control/stop-requests/`, pi `requestAsyncStop`,
+`runs/background/control-channel.ts:297-310` @v0.64.0) and
+`background_runner_main_integration::a_child_scoped_stop_stops_one_chain_step_and_the_next_step_still_completes`
+(its second chain step named agent `second`, absent from the shared `all_personas()` fixture, so
+the step failed pre-spawn as `Unknown agent: second`). Both are FIXTURE defects, not port defects —
+the runner behaviour each test describes is correct at HEAD — and both are fixed at `1a559d33`.
+After that fix: **492/492 passing**, `cargo clippy -p cyrup-it --features it --all-targets -D
+warnings` clean. Workspace at the same head: `cargo fmt --all -- --check` clean, `RUSTDOCFLAGS='-D
+warnings' cargo doc --workspace --no-deps` clean, `cargo clippy --workspace --all-targets -D
+warnings` clean, `cargo nextest run --workspace` 8710/8710. **The lesson stands even though the
+port survived it: `SUBA-072`/`087`/`088`/`090` edited ~30 `cyrup-it` files that nothing in this
+batch executed until now, and a `cargo check` is not a run.**
 
 ## What closed, and on what evidence — each row re-read in its area file, not taken from a commit subject
 
