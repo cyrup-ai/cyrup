@@ -1185,3 +1185,70 @@ impl NativeExtension for HandlingProbe {
         HookOutcome::Noop
     }
 }
+
+/// SEAM-015, the fill's precedence against the CALLER: `execute_bash_with_user_event` writes the
+/// event-supplied backend with `options.operations.get_or_insert(...)`, so a backend the caller
+/// already supplied WINS over the one the winning `user_bash` handler offers.
+///
+/// This is the port's one deliberate divergence from upstream, which writes
+/// `operations: eventResult?.operations` unconditionally at each front-end
+/// (`modes/rpc/rpc-mode.ts:581`, `modes/interactive/interactive-mode.ts:6524` @v0.84.4) and would
+/// therefore overwrite it. It is unobservable in production — both callers pass `operations: None`
+/// (`crates/cyrup-modes/src/rpc/mod.rs:1169`, `crates/cyrup-tui/src/app/bash_spawn.rs:58`) — and is
+/// pinned here so it cannot flip silently.
+///
+/// The sibling `execute_bash_with_user_event_forwards_the_operations_override_to_the_executor` does
+/// NOT cover this: it builds a session with no extension at all, so `emit_user_bash_event` returns
+/// at its `no_subscribers` guard and the `Backend` arm is never reached. Here the extension is
+/// loaded, subscribed, wins the reduction and offers a backend of its own.
+#[tokio::test]
+async fn a_caller_supplied_operations_backend_is_not_clobbered_by_the_user_bash_handler() {
+    let fx = fixture();
+    let ext = Arc::new(BashOpsSupplier::new(Some(serde_json::json!({}))));
+    let session = SessionBuilder::new(faux_ok() as Arc<dyn Provider>, base_config(&fx))
+        .with_native_extension(ext.clone())
+        .build()
+        .await
+        .expect("build");
+
+    let caller_ops = Arc::new(RecordingBashOps {
+        seen: Mutex::new(Vec::new()),
+    });
+    let result = session
+        .execute_bash_with_user_event(
+            "echo LOCAL_SHELL_RAN",
+            BashOptions {
+                exclude_from_context: false,
+                id: None,
+                operations: Some(caller_ops.clone() as Arc<dyn cyrup_tools::ops::BashOperations>),
+            },
+            None,
+        )
+        .await
+        .expect("the caller's backend succeeds");
+
+    // PRESENCE — the caller's own backend ran the command.
+    let seen = caller_ops.seen.lock().unwrap().clone();
+    assert_eq!(
+        seen.len(),
+        1,
+        "the caller's backend executed the command exactly once: {seen:?}"
+    );
+    assert_eq!(seen[0].0, "echo LOCAL_SHELL_RAN");
+
+    // ABSENCE — the extension's backend did not run it, even though its handler WON the reduction.
+    // The control for this assertion is
+    // `execute_bash_with_user_event_fills_operations_from_the_winning_user_bash_handler` above:
+    // same extension, same command, `operations: None`, and there the extension's backend DOES run.
+    assert!(
+        ext.ops.seen.lock().unwrap().is_empty(),
+        "a caller-supplied backend must not be clobbered by the event-supplied one"
+    );
+
+    // …and the local shell is out of the picture either way.
+    assert!(
+        !result.output.contains("LOCAL_SHELL_RAN"),
+        "got: {:?}",
+        result.output
+    );
+}

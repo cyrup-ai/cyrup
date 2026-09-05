@@ -442,7 +442,13 @@ impl BrokerState {
         // is, so a scoped peer cannot even reach another scope's PARKED identity.
         let disconnected = self.find_disconnected_session_keys(to, current_key.scope.as_ref(), now);
         let target_info = match disconnected.as_slice() {
-            [only] => self.disconnected_sessions.get(only).map(|s| s.info.clone()),
+            // The resolved key travels with the info: upstream's reply-edge guard below compares
+            // `replyEdge.from` against `disconnectedTarget.key` — the whole composite, not the id
+            // (`v0.13.0 broker/broker.ts:747`).
+            [only] => self
+                .disconnected_sessions
+                .get(only)
+                .map(|s| (only.clone(), s.info.clone())),
             [] => {
                 send_msg(
                     self_tx,
@@ -470,7 +476,7 @@ impl BrokerState {
                 return FrameResult::cont();
             }
         };
-        let Some(target) = target_info else {
+        let Some((target_key, target)) = target_info else {
             send_msg(
                 self_tx,
                 &BrokerMessage::delivery_failed(
@@ -522,7 +528,7 @@ impl BrokerState {
         }
         // `:623-630`
         if let Some(edge) = reply_edge
-            && (edge.to != *current_key || edge.from.id != target.id)
+            && (edge.to != *current_key || edge.from != target_key)
         {
             send_msg(
                 self_tx,
