@@ -67,7 +67,10 @@ pub use event::{
     AgentSessionEvent, DeliverAs, InputSource, PromptAccepted, PromptOptions, StreamingBehavior,
     SummarizationRetrySource, UserInput,
 };
-pub use export::session_jsonl_to_html;
+pub use export::{
+    CssColor, ExportBackdrops, ExportTheme, ParseColorError, derive_export_colors,
+    session_jsonl_to_html, session_jsonl_to_html_with_theme,
+};
 pub use factory::SessionFactory;
 pub use guest_providers::GuestProviderRegistry;
 pub use host_services::{

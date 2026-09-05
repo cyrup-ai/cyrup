@@ -3613,16 +3613,17 @@ mod tests {
             "HOP C: to_agent_config dropped the runner"
         );
 
-        // The observable end product: the rebuilt config refuses, so a background/chain/parallel
-        // step declines the profile exactly as the foreground path does.
-        let reason = agent
-            .runner
-            .as_ref()
-            .and_then(crate::runner::AgentRunnerConfig::refusal_reason)
-            .expect("a non-`pi` runner must refuse after surviving the hand-off");
-        assert!(reason.contains("runner.type='external-cli'"), "{reason}");
-        assert!(reason.contains("adapter 'claude-code'"), "{reason}");
-        assert!(reason.contains("full-capability native child"), "{reason}");
+        // The observable end product: the rebuilt config still DISPATCHES as an external profile,
+        // so a background/chain/parallel step honours (or refuses) it exactly as the foreground
+        // path does — it is never silently downgraded to a native child.
+        let dispatch = crate::runner::dispatch::resolve_runner_dispatch(
+            agent.runner.as_ref(),
+            &crate::exec::external_cli::ExternalCliLaunchContext::default(),
+        );
+        let crate::runner::dispatch::RunnerDispatch::ExternalCli(launch) = dispatch else {
+            panic!("a claude-code runner must dispatch to an external launch after the hand-off");
+        };
+        assert_eq!(launch.status().adapter.id.wire(), "claude-code");
     }
 
     /// SUBA-S01 (pi `runs/shared/pi-args.ts:246-250`): a declared `outputSchema` must reach the child as BOTH

@@ -999,8 +999,12 @@ impl SharedIntercomState {
             )
             .await;
 
-        match send_result {
-            Ok(result) if result.delivered => {}
+        let delivery_state = match send_result {
+            // ICOM-054 — `deliveryState = sendResult.delivery` (`v0.13.0 index.ts:2464`), which
+            // replaced the hard-coded `"socket_delivered"` ternary. The timeout message below can
+            // now say `queued` when the peer was offline, instead of claiming the message reached
+            // its socket.
+            Ok(result) if result.delivered => result.delivery,
             Ok(result) => {
                 self.waiter.clear_matching(&question_id);
                 return Err(IntercomError::Client(
@@ -1013,7 +1017,7 @@ impl SharedIntercomState {
                 self.waiter.clear_matching(&question_id);
                 return Err(e);
             }
-        }
+        };
 
         let timeout = Duration::from_millis(self.ask_timeout_ms);
         tokio::select! {
@@ -1076,11 +1080,13 @@ impl SharedIntercomState {
                 // that the timeout is NOT a cancellation, so the peer may still act on it. Without
                 // the last sentence a supervisor re-sends work a peer is already doing.
                 //
-                // `deliveryState`'s fallback here is `socket_delivered` rather than upstream's
-                // initial `"created"` (`:2092`) because this branch is only reachable AFTER the
-                // `result.delivered` arm above — which is exactly where `:2148` assigns it.
-                let delivery_state =
-                    self.latest_delivery_state(Some(&question_id), "socket_delivered");
+                // The fallback is the SEND's own `delivery` (`v0.13.0 index.ts:2464`,
+                // `latestDeliveryState(questionId, deliveryState)` at `:2452`) rather than
+                // upstream's initial `"created"` (`:2408`), because this branch is only reachable
+                // after the delivered arm above assigned it. ICOM-054 made it the ack's real value:
+                // a message parked for an offline peer now reports `queued` here.
+                let delivery_state = self
+                    .latest_delivery_state(Some(&question_id), delivery_state.wire_name());
                 Err(IntercomError::Client(format!(
                     "No reply from \"{target}\" for message {question_id} within {}. Last known \
                      delivery state: {delivery_state}. This waiter timeout is not cancellation; the \
@@ -1240,6 +1246,7 @@ mod tests {
                 std::path::PathBuf::from("/w"),
             );
             let from = crate::transport::protocol::SessionInfo {
+                endpoint_epoch: None,
                 id: "peer".to_string(),
                 name: None,
                 runtime_fallback_alias: None,
@@ -1503,8 +1510,7 @@ mod tests {
                                 // ever polled.
                                 broker_send_seen.notify_one();
                                 broker_ack_gate.notified().await;
-                                let out = encode_json(&BrokerMessage::Delivered { message_id: id })
-                                    .unwrap();
+                                let out = encode_json(&BrokerMessage::delivered_bare(id)).unwrap();
                                 stream.write_all(&out).await.unwrap();
                             }
                             _ => {}
@@ -1570,6 +1576,7 @@ mod tests {
                 ..Default::default()
             };
             let peer = SessionInfo {
+                endpoint_epoch: None,
                 id: "peer".to_string(),
                 name: Some("peer".to_string()),
                 runtime_fallback_alias: None,

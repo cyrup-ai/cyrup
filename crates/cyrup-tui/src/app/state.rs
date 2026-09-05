@@ -226,6 +226,13 @@ pub struct AppState {
     /// project grows `.cyrup/` resources and disarms it. `None` when trust was decided explicitly
     /// (a flag, a saved entry, the prompt) or already persisted.
     pub auto_trust_on_reload_cwd: Option<PathBuf>,
+    /// TUI-N02 — pi's `this.options.verbose` (`interactive-mode.ts:1702` @v0.84.4), the `--verbose`
+    /// flag that overrides `quietStartup` for the loaded-resources listing. Held on the App because
+    /// the panel is emitted from TWO places, not one: the boot path in the binary and the
+    /// `session_swapped` arm in this crate ([`App::push_session_loaded_resources`]), which is where
+    /// `/reload`'s re-emit lands. Armed by the host through [`App::set_verbose_startup`]; `false`
+    /// (pi's own default for an absent flag) until it is.
+    pub verbose_startup: bool,
     /// Committed lines already emitted to native scrollback via `Terminal::insert_before`
     /// (R-ARCH-TUI-003). Test/inspection only — OFF in production builds (TUI-092 F1).
     #[cfg(any(test, feature = "scrollback-accumulator"))]
@@ -268,6 +275,13 @@ pub struct AppState {
     /// swap because it holds that session's resource snapshot. Kept here so
     /// [`App::publish_extension_readbacks`] can republish the active theme name each frame.
     pub(super) theme_access: Option<Arc<crate::theme_access::TuiThemeAccess>>,
+    /// TUI-004 — the boot [`crate::ThemeController`], handed over by the composition root
+    /// ([`App::set_theme_controller`]) so a session swap can re-run Pi's `applyFromSettings`
+    /// (`modes/interactive/theme/theme-controller.ts:57-81` @v0.84.4), which upstream drives from
+    /// the `setRebindSession` hook (`interactive-mode.ts:576-579`) and from `handleReloadCommand`
+    /// (`:5987`). `None` for an app whose launcher never booted one — every such app keeps the theme
+    /// it was constructed with, which is the pre-TUI-004 behaviour and what the test harnesses want.
+    pub(super) theme_controller: Option<crate::theme::ThemeController>,
     /// The `/tree` target the user confirmed, held while the "Summarize branch?" prompt (and, on its
     /// third option, the custom-instructions editor) is open — Pi keeps the same values in the
     /// `entryId` / `wantsSummary` / `customInstructions` locals of its `while (true)` prompt loop
@@ -476,6 +490,7 @@ impl AppState {
             cache_miss_check_pending: false,
             pending_swap_status: None,
             auto_trust_on_reload_cwd: None,
+            verbose_startup: false,
             #[cfg(any(test, feature = "scrollback-accumulator"))]
             scrollback: Vec::new(),
             extension_shortcuts: Vec::new(),
@@ -487,6 +502,7 @@ impl AppState {
             pending_ui_reply: None,
             editor_mirror: cyrup_session_svc::EditorTextMirror::new(),
             theme_access: None,
+            theme_controller: None,
             pending_tree_nav: None,
             pending_import: None,
             terminal_title: None,

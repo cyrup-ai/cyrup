@@ -266,6 +266,11 @@ impl AgentSession {
                 // discarded on this branch only — the trigger-turn arm now carries it like the
                 // `send_custom_message` tail below.
                 details: details.clone(),
+                // SUBA-094 — likewise `display`, read just above and dropped here until now: pi
+                // hands `_runAgentPrompt` the same `appMessage` that carries it
+                // (`agent-session.ts:1488-1505` @v0.84.4), so a guest's
+                // `sendMessage({display:false}, {triggerTurn:true})` is a model-only message.
+                display,
                 timestamp: Some(now_ms()),
             };
             return self.spawn_run(vec![msg]).await;

@@ -1,4 +1,4 @@
-// cyrup:ext@0.8.0 — the versioned WIT world (arch-08 §4.1).
+// cyrup:ext@0.10.0 — the versioned WIT world (arch-08 §4.1).
 //
 // Single source of truth, shared verbatim by the host (`wasmtime::component::bindgen!`)
 // and the guest (`wit-bindgen` in cyrup-ext-sdk). Open-shaped values (tool params, message
@@ -49,6 +49,14 @@
 // records it as "would not have required a bump on its own". The two statements contradicted each
 // other; `manifest.rs` is the correct one (EXT-061 re-derived it against `check_world`).
 //
+// 0.8 -> 0.9 is the renderer display-options batch, and it is an EXPORT re-signing:
+// `events.render-call` and `events.render-result` each gained a third parameter, `opts-json`,
+// carrying the `(options, theme)` half of every upstream renderer signature (EXT-006;
+// `MessageRenderer` `extensions/types.ts:1213-1217` @v0.84.4, `EntryRenderer` `:1219-1223`,
+// `ToolDefinition.renderCall`/`renderResult` `:491-498`). A 0.8 guest exports the two-parameter
+// shape and would die inside wasmtime on the link; `check_world` turns that into a typed
+// `ExtError::WorldVersion` instead. No import moved in this batch.
+//
 // ADDED WITHOUT A BUMP, same batch, same rule: `ctx-state.get-system-prompt-options` (EXT-061), the
 // last unaccounted-for member of pi's extension API surface. Recorded here because "additive import,
 // no bump" is the ONE case where the world file changes and the version does not, so a reader
@@ -60,7 +68,18 @@
 // then dies in wasmtime on the missing import, and NO version bump can change that, because the
 // bump moves the host's floor rather than its ceiling. Bumping for an additive import therefore buys
 // nothing and costs every already-built guest at the old minor.
-package cyrup:ext@0.8.0;
+//
+// 0.9 -> 0.10 is the guest-supplied BASH BACKEND batch, and it is again an EXPORT re-signing:
+// `events.bash-operations-exec` is NEW, so a 0.9 guest exports nothing under that name and would
+// die inside wasmtime on the link (`check_world` turns that into a typed `ExtError::WorldVersion`
+// instead). It is the guest half of pi's `UserBashEventResult.operations`
+// (`core/extensions/types.ts:1136-1142` @v0.84.4, the `BashOperations` interface at
+// `core/tools/bash.ts:63-81`), which a WASM guest cannot RETURN because it is a callable
+// (ADR-0002) — so the callable stays guest-side behind an export the host calls by `call-id`, and
+// its two closure-shaped arguments (`onData`, `signal`) come back over the new `host-bash`
+// interface. DRIFT-004. The `registration.register-bash-operations` and `host-bash.*` IMPORTS are
+// additive and would not have forced a bump on their own (see the paragraph above).
+package cyrup:ext@0.10.0;
 
 // ---------------------------------------------------------------------------
 // Serializable mirrors of cyrup-core. JSON-as-string at the seam (arch-08 §4.1).
@@ -282,8 +301,34 @@ interface events {
   // `cyrup_ext_sdk::widget` constructs exactly these. Anything else — an unknown tag, a missing
   // tag, a tree nested deeper than 16 — is drawn as pretty-printed JSON rather than dropped, so a
   // mistyped node is visible instead of blank.
-  render-call:   func(custom-type: string, call-json: string) -> option<string>;
-  render-result: func(custom-type: string, result-json: string) -> option<string>;
+  //
+  // `opts-json` is the `(options, theme)` half of upstream's renderer signature (EXT-006). Every
+  // pi renderer takes it and pi re-invokes the renderer from the DRAW path, so both halves are
+  // LIVE inputs rather than ingest-time constants; cyrup's host re-invokes this export whenever
+  // they move (`cyrup_tui::App::refresh_extension_renders`). The bag is the UNION of pi's three,
+  // because cyrup routes all three surfaces through this one export pair:
+  //
+  //   {"expanded": bool,        // all three: `MessageRenderOptions.expanded` (`types.ts:1196`
+  //                             // @v0.84.4), `EntryRenderOptions.expanded` (`:1210`),
+  //                             // `ToolRenderResultOptions.expanded` (`:415`)
+  //    "outputPad": number,     // `MessageRenderOptions.outputPad` (`:1198`) — the horizontal
+  //                             // padding the outputPad setting configures
+  //    "isPartial": bool,       // `ToolRenderResultOptions.isPartial` (`:417`)
+  //    "theme": string|null}    // see below
+  //
+  // TAG-TO-TAG: at the ported baseline v0.83.0 the MESSAGE surface took `EntryRenderOptions`
+  // too — `MessageRenderOptions` and its `outputPad` are a post-baseline addition, carried here
+  // because ADR-0006 makes the LATEST tag the parity target.
+  //
+  // [CYRUP-DELTA] `theme` is the theme's NAME, not the `Theme` object pi passes: an object cannot
+  // cross the component boundary. A guest that needs the PALETTE reads it with the
+  // `ui.theme-get-json` import, which was added for exactly this and returns the ACTIVE theme
+  // (EXT-066). The name is what changes when the user switches themes, so it is the value a
+  // renderer's staleness is decided by. `null` = the caller has no display (an RPC host, a test).
+  // A NATIVE renderer is under no such constraint and gets the real thing
+  // (`cyrup_ext::RenderCtx.theme`, a `&dyn RenderTheme`).
+  render-call:   func(custom-type: string, call-json: string, opts-json: string) -> option<string>;
+  render-result: func(custom-type: string, result-json: string, opts-json: string) -> option<string>;
 
   // --- markdown transformation (EXT-019; pi `MarkdownTransformer`,
   // `extensions/types.ts:1147-1153` @v0.84.1 — a POST-BASELINE addition, absent at v0.83.0) ---
@@ -301,6 +346,30 @@ interface events {
   // Called only on a guest that declared `registration.register-markdown-transformer`. A guest
   // fault leaves the markdown untouched (the identity default), never dropping the transcript text.
   transform-markdown: func(markdown: string, ctx-json: string) -> string;
+
+  // --- guest-supplied bash backend (DRIFT-004; pi `BashOperations.exec`,
+  // `core/tools/bash.ts:71-80` @v0.84.4:
+  //   `exec: (command, cwd, {onData, signal, timeout, env}) => Promise<{exitCode: number|null}>`)
+  //
+  // Called only on a guest that declared `registration.register-bash-operations`, and only for the
+  // ONE `user_bash` command whose handler won the reduction without supplying a `result`
+  // (`modes/rpc/rpc-mode.ts:581` `operations: eventResult?.operations`;
+  // `modes/interactive/interactive-mode.ts:6524`). Keyed by `call-id` exactly like `execute-tool`,
+  // because upstream's two closure-shaped options are per-CALL and cyrup cannot pass a closure:
+  //   * `onData(data: Buffer)`  -> the `host-bash.emit-bash-output(call-id, chunk)` import;
+  //   * `signal: AbortSignal`   -> the `host-bash.is-bash-cancelled(call-id)` poll.
+  // `opts-json` carries the two VALUE options plus cyrup's `env-remove` split:
+  //   {"timeoutMs": number|null, "env": {k: v}, "envRemove": [k]}
+  // — `env` is ADDITIVE over the inherited shell environment and `envRemove` names keys to unset,
+  // the same shape `cyrup_tools::ops::BashExecOptions` documents (pi materializes the whole
+  // environment and expresses a deletion by omission; cyrup inherits and must therefore name it).
+  //
+  // The return is pi's `{exitCode: number | null}`: `ok(some(code))` is an exit code, `ok(none)` is
+  // pi's `null` ("killed" — the host decides whether that was its own cancel, its own timeout, or
+  // an external signal, exactly as `executeBashWithOperations` re-derives it from its own state),
+  // and `err(msg)` is pi's `throw`, which upstream re-raises past the abort check
+  // (`bash-executor.ts:154`) rather than reporting as a successful command.
+  bash-operations-exec: func(call-id: string, command: string, cwd: string, opts-json: string) -> result<option<s32>, string>;
 
   // --- raw terminal input (EXT-021's residual; pi `ExtensionUIContext.onTerminalInput(handler)`,
   // `extensions/types.ts:145` @v0.83.0, handler type `TerminalInputHandler` at `:113`:
@@ -515,6 +584,16 @@ interface registration {
   // one. Upstream stores it as `extension.markdownTransformer = transformer`, i.e. AT MOST ONE per
   // extension with the last registration winning; the host models that the same way (EXT-019).
   register-markdown-transformer: func();
+  // DRIFT-004 — pi `UserBashEventResult.operations` (`core/extensions/types.ts:1136-1142`
+  // @v0.84.4; the `BashOperations` interface at `core/tools/bash.ts:63-81`: *"Pluggable operations
+  // for the bash tool. Override these to delegate command execution to remote systems (for example
+  // SSH)"*). Argument-less for exactly the reason `register-markdown-transformer` above is: the
+  // backend itself is a guest closure the host reaches through the `bash-operations-exec` EXPORT,
+  // and upstream reads at most ONE per extension — the `operations` of the single
+  // `UserBashEventResult` whose handler won the reduction (`extensions/runner.ts:1005-1032`
+  // returns the FIRST truthy handler's whole result and stops). This import only declares that
+  // this guest HAS one; the last registration wins, as an assignment does upstream.
+  register-bash-operations: func();
   // Pi `registerEntryRenderer(customType, renderer)` (`extensions/types.ts:1279` @v0.83.0, the
   // ported baseline — `:1295` @v0.84.1 / `loader.ts:314-318`) — the
   // custom-ENTRY surface, a SEPARATE table from register-message-renderer above (upstream keeps
@@ -917,6 +996,21 @@ interface host-tool {
   is-cancelled: func(call-id: string) -> bool;
 }
 
+// The two closure-shaped options of pi's `BashOperations.exec` (`core/tools/bash.ts:71-80`
+// @v0.84.4), which cannot cross a component boundary as closures (ADR-0002) — the same
+// substitution `host-tool` above already makes for `ToolDefinition.execute`'s `onUpdate`/`signal`.
+// Both are keyed by the `call-id` the host passed to `bash-operations-exec`, so a chunk or a poll
+// can never be attributed to another command (EXT-M06). DRIFT-004.
+interface host-bash {
+  // pi `onData: (data: Buffer) => void` — RAW bytes, combined stdout+stderr, sanitized by the
+  // CALLER (`bash-executor.ts:78-105` strips ANSI and normalizes CR inside its own wrapper), never
+  // by the backend. A chunk whose `call-id` is not the live one is DROPPED.
+  emit-bash-output: func(call-id: string, chunk: list<u8>);
+  // pi `signal?: AbortSignal` — the guest polls this while the command runs and stops
+  // cooperatively. True once the host's `CancelToken` for this command fired.
+  is-bash-cancelled: func(call-id: string) -> bool;
+}
+
 // OAuth login callbacks (Pi `OAuthLoginCallbacks`, pi-ai oauth/types.ts): the host-side handlers a
 // guest's `login(callbacks)` flow drives during `provider-login`. The host renders the auth URL /
 // device code / prompts and returns the user's answers (the interactive half of `/login`).
@@ -1093,6 +1187,7 @@ world extension {
   import ext-fs;
   import bus;
   import host-tool;
+  import host-bash;
   import oauth;
   import provider-stream;
   import ext-tools;

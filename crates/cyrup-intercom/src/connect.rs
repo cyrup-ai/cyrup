@@ -32,9 +32,10 @@
 //!   [`ensure_connected`] refuses outright while `shutting_down` (`index.ts:813-815`).
 //! - **Single-flight**: pi dedups concurrent callers by returning the same `reconnectPromise`
 //!   (`index.ts:826-827,851-856`). Rust has no shareable promise here, so the equivalent is an
-//!   async gate plus an attempt *epoch*: a caller that waited on the gate re-checks the live client
-//!   first, and if the epoch moved while it waited it adopts that attempt's failure instead of
-//!   stacking a second connect. Net effect matches pi — N concurrent callers produce ONE connect.
+//!   async gate plus an attempt *generation*: a caller that waited on the gate re-checks the live
+//!   client first, and if the generation moved while it waited it adopts that attempt's failure
+//!   instead of stacking a second connect. Net effect matches pi — N concurrent callers produce ONE
+//!   connect.
 //! - **Only a `Background` failure re-arms the ladder** (`index.ts:847-849`); a `Tool`/`Overlay`
 //!   failure surfaces to its caller without arming a retry storm, and `Startup` arms it explicitly
 //!   from its own catch (`index.ts:963-964`). This is a faithful port of pi's asymmetry, including
@@ -149,7 +150,13 @@ pub struct ConnectSupervisor {
     gate: tokio::sync::Mutex<()>,
     /// Incremented once per completed attempt; lets a caller that queued behind the gate tell
     /// "nobody has tried yet" from "an attempt just failed" (pi's shared `reconnectPromise`).
-    epoch: AtomicU64,
+    ///
+    /// Named `epoch` until ICOM-054, which introduced the unrelated broker-owned
+    /// [`crate::transport::protocol::SessionInfo::endpoint_epoch`]. This counter is LOCAL to one
+    /// process, never leaves it, and has nothing to do with endpoints — "generation" is what the
+    /// rest of the crate already calls this idea ([`ConnectSupervisor::generation`],
+    /// `crate::inbound`'s `message_generation`), so the two greps now mean what they say.
+    reconnect_generation: AtomicU64,
     /// The most recent attempt's failure, replayed to callers that queued behind it.
     last_error: Mutex<Option<String>>,
     /// The broker-assigned session id from the last successful connect, re-offered on reconnect so
@@ -445,7 +452,7 @@ pub async fn ensure_connected(
     // redundant. (Called from the timer body this is a no-op — it already released its own slot.)
     sup.set_timer(None);
 
-    let epoch_at_start = sup.epoch.load(Ordering::SeqCst);
+    let generation_at_start = sup.reconnect_generation.load(Ordering::SeqCst);
     let _gate = sup.gate.lock().await;
     // Someone else may have connected — or failed — while we queued behind the gate.
     if let Some(client) = state.client()
@@ -453,7 +460,7 @@ pub async fn ensure_connected(
     {
         return Ok(client);
     }
-    if sup.epoch.load(Ordering::SeqCst) != epoch_at_start {
+    if sup.reconnect_generation.load(Ordering::SeqCst) != generation_at_start {
         // A concurrent attempt completed and left us unconnected: adopt its failure, exactly as pi's
         // shared `reconnectPromise` hands every queued caller the same rejection, instead of
         // stacking a second connect per caller.
@@ -471,7 +478,7 @@ pub async fn ensure_connected(
     sup.connecting.store(true, Ordering::SeqCst);
     let result = connect_once(state, &params, generation).await;
     sup.connecting.store(false, Ordering::SeqCst);
-    sup.epoch.fetch_add(1, Ordering::SeqCst);
+    sup.reconnect_generation.fetch_add(1, Ordering::SeqCst);
 
     match result {
         Ok(client) => {

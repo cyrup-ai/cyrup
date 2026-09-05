@@ -133,13 +133,12 @@
 //! `&[ratatui::text::Line<'static>]` parameter, the way [`prompt_nav`] takes the same cache rather
 //! than holding it (rule 2 below), and [`AltScreen::stop`] threads it down.
 //!
-//! **That branch does not run today, and the reason is not this module's.** `preserve_screen` is
-//! fixed at construction and the only construction site (`app/mode_switch.rs`) passes `true`, so
-//! every teardown — the live mode switch AND session exit, which share `stop_fullscreen()` — takes
-//! the `true` branch and skips the repaint. Making it reachable means deciding `preserve_screen`
-//! per teardown rather than per renderer: `true` for a mode switch, where another renderer takes
-//! the same terminal, and `false` for a real exit, where the transcript belongs in scrollback.
-//! Filed as `ALT_SCREEN_EXIT_REPAINT_UNREACHABLE`.
+//! `preserve_screen` is decided PER TEARDOWN, by whoever calls `App::stop_fullscreen`. The live
+//! mode switch (`app/mode_switch.rs`, `install_renderer`'s `Regular` arm) always passes `false`,
+//! because the inline renderer it hands the terminal back to cannot re-render the excursion's
+//! history. Session exit (`app/run.rs`) passes `App::preserve_screen_on_exit`, i.e. the
+//! `fullscreenExitOutput` setting (CFG-078): `false` for `transcript`, `true` for `resume-hint`,
+//! which is the one configuration in which this repaint is deliberately skipped.
 //!
 //! # Two structural rules this module holds its siblings to
 //! Recorded here because they are what keeps twelve units out of one another's files, and because
@@ -189,6 +188,34 @@ pub use selection::PointerOutcome;
 /// the setting onto it — `always` reserves the rightmost column, `auto` shows the bar only while
 /// the content overflows and the view moved within 1000 ms, `hidden` never draws it.
 pub use scroll::ScrollbarMode;
+
+/// What leaving the alternate screen puts on the main screen — pi's `FullscreenExitOutput`
+/// (`packages/coding-agent/src/core/settings-manager.ts:38` @v0.84.4), the settings key
+/// `fullscreenExitOutput` (`:143`, default `"transcript"`, "no effect in regular TUI mode").
+/// CFG-078.
+///
+/// Deliberately **not** `cyrup-config`'s settings type, for the same reason
+/// [`TuiRenderMode`] is not its `tuiMode`: that key records what the user asked for and degrades an
+/// unknown spelling, this records what the teardown is going to DO. The composition root maps one
+/// onto the other (`crates/cyrup/src/interactive.rs`), exactly as it does for [`ScrollbarMode`].
+///
+/// Upstream reaches the same two outcomes by a route cyrup cannot take: `stopInteractiveTui`
+/// switches back to the regular renderer and re-renders the shared chat container before stopping
+/// when the setting is `"transcript"`, and stops the alternate screen with `preserveScreen: true`
+/// otherwise (`modes/interactive/interactive-mode.ts:836-843` @v0.84.4). cyrup's committed entries
+/// have already left the app for the terminal's own scrollback (R-ARCH-TUI-003), so its inline
+/// renderer has nothing to re-render — the transcript reaches scrollback through
+/// [`exit::repaint`], and this enum therefore selects that repaint rather than a renderer swap.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FullscreenExitOutput {
+    /// Repaint the excursion's retained document into the main screen's scrollback on the way out
+    /// — pi's `"transcript"`, its documented default.
+    #[default]
+    Transcript,
+    /// Leave the restored main screen as the terminal handed it back and print nothing — pi's
+    /// `"resume-hint"`, whose hint itself is the launcher's, not this renderer's.
+    ResumeHint,
+}
 
 /// The pending-attachment strip §B-12 places, re-exported because the app owns the two
 /// [`crate::AppState`] fields it borrows and builds it per frame.
@@ -348,6 +375,16 @@ pub struct AltScreen<B: Backend> {
     drag: scrollbar_drag::DragState,
     /// Selection, clipboard and link activation (§B-8).
     selection: selection::SelectionState,
+    /// Whether ending a selection copies it — pi's `TuiAltScreen.copyOnSelect`
+    /// (`tui-alt-screen.ts:205`, seeded `options.copyOnSelect ?? true` at `:229`, read at `:1035`),
+    /// the renderer half of the `fullscreenCopyOnSelect` setting. CFG-078.
+    ///
+    /// `true` at construction, which is upstream's `?? true` and what makes every existing caller —
+    /// and every test that builds a renderer without saying — behave exactly as it did before this
+    /// field existed. The app pushes the setting in through [`Self::set_copy_on_select`] when the
+    /// renderer is adopted and again when the `/settings` row is cycled, which is pi's constructor
+    /// option (`interactive-mode.ts:378`) plus its `applyRuntimeSettings` write (`:1995`).
+    copy_on_select: bool,
     /// Transient overlay messages (§B-11).
     flashes: flash::FlashStack,
     /// Inline-image placements and their eviction (§B-12).
@@ -413,6 +450,7 @@ impl<B: Backend> AltScreen<B> {
             bar: scroll::ScrollbarView::default(),
             drag: scrollbar_drag::DragState::default(),
             selection: selection::SelectionState::default(),
+            copy_on_select: true,
             flashes: flash::FlashStack::default(),
             images,
             doc: Vec::new(),
@@ -742,6 +780,17 @@ impl<B: Backend> AltScreen<B> {
         scroll::set_mode(&mut self.bar, &mut self.scroll, mode);
     }
 
+    /// Apply the `fullscreenCopyOnSelect` setting (CFG-078) — pi's `setCopyOnSelect`
+    /// (`tui-alt-screen.ts:246-248`), called from its `applyRuntimeSettings` (`:1995`) and from the
+    /// `/settings` row's own handler (`interactive-mode.ts:4757-4760`).
+    ///
+    /// Nothing about an existing selection changes: turning the setting off mid-drag leaves the
+    /// highlight exactly where it is and only withholds the copy at release, which is upstream's
+    /// shape — the flag is read at `:1035`, inside the release arm, and nowhere else.
+    pub(crate) fn set_copy_on_select(&mut self, enabled: bool) {
+        self.copy_on_select = enabled;
+    }
+
     pub(crate) fn handle_key(
         &mut self,
         ev: &KeyEvent,
@@ -785,7 +834,14 @@ impl<B: Backend> AltScreen<B> {
             selection::cancel(&mut self.selection);
             return selection::PointerOutcome::Handled;
         }
-        match selection::route(&mut self.selection, &self.scroll, &self.doc, viewport, ev) {
+        match selection::route(
+            &mut self.selection,
+            &self.scroll,
+            &self.doc,
+            viewport,
+            ev,
+            self.copy_on_select,
+        ) {
             selection::PointerOutcome::Ignored => {
                 if wheel::route(&mut self.scroll, viewport, ev) {
                     selection::PointerOutcome::Handled
@@ -839,9 +895,11 @@ impl<B: Backend> AltScreen<B> {
         // next one. The `:262` entry-side clear needs no call here: `enter` builds a fresh
         // `FlashStack::default()`, so an entering renderer starts empty by construction.
         flash::clear(&mut self.flashes);
-        // `preserve_screen` is the CALLER's, not this renderer's: both of cyrup's teardowns need the
-        // repaint, because the fullscreen frame path drains the transcript's pending queue and drops
-        // it (`app/draw.rs`), so `self.doc` is the only surviving copy of the excursion's history.
+        // `preserve_screen` is the CALLER's, not this renderer's: cyrup's teardowns need the repaint
+        // by default, because the fullscreen frame path drains the transcript's pending queue and
+        // drops it (`app/draw.rs`), so `self.doc` is the only surviving copy of the excursion's
+        // history — and the one caller that may skip it, the `resume-hint` exit (CFG-078), is a
+        // user asking for exactly that loss.
         // Upstream reaches the same outcome by another route — `switchTuiMode` stops the alternate
         // screen with `preserveScreen: true` and lets the regular renderer re-render the shared chat
         // container (`interactive-mode.ts:833-840`) — which cyrup cannot do, because its committed

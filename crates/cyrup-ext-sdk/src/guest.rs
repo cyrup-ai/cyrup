@@ -159,6 +159,12 @@ fn push_registrations(api: &ExtensionApi) {
     if api.has_markdown_transformer() {
         registration::register_markdown_transformer();
     }
+    // DRIFT-004: declare (not send) the bash backend — the closure stays guest-side and the host
+    // reaches it through the `bash-operations-exec` export. Pi `UserBashEventResult.operations`,
+    // `core/extensions/types.ts:1139` @v0.84.4.
+    if api.has_bash_operations() {
+        registration::register_bash_operations();
+    }
     // EXT-021: declare (not send) the raw terminal-input handler — the closure stays guest-side
     // and the host reaches it through the `on-terminal-input` export. Pi
     // `ctx.ui.onTerminalInput(handler)`, `extensions/types.ts:145` @v0.83.0.
@@ -305,23 +311,38 @@ pub fn completions(name: String, prefix: String) -> Vec<String> {
 }
 
 /// `render-call` export body (Pi `renderCall`).
-pub fn render_call(custom_type: String, call_json: String) -> Option<String> {
+///
+/// EXT-006 — `opts_json` is upstream's `(options, theme)` pair; see
+/// [`crate::api::RenderOptions`]. Malformed JSON parses to the defaults rather than skipping the
+/// render, for the same reason the payload does: a renderer that cannot be told the options must
+/// still draw.
+pub fn render_call(custom_type: String, call_json: String, opts_json: String) -> Option<String> {
     let call = serde_json::from_str(&call_json).unwrap_or(Value::Null);
+    let opts = crate::api::RenderOptions::from_json(
+        &serde_json::from_str(&opts_json).unwrap_or(Value::Null),
+    );
     API.with(|c| {
         c.borrow()
             .as_ref()
-            .and_then(|api| api.render_call(&custom_type, &call))
+            .and_then(|api| api.render_call(&custom_type, &call, &opts))
             .map(|v| v.to_string())
     })
 }
 
-/// `render-result` export body (Pi `renderResult`).
-pub fn render_result(custom_type: String, result_json: String) -> Option<String> {
+/// `render-result` export body (Pi `renderResult`). See [`render_call`] for `opts_json`.
+pub fn render_result(
+    custom_type: String,
+    result_json: String,
+    opts_json: String,
+) -> Option<String> {
     let result = serde_json::from_str(&result_json).unwrap_or(Value::Null);
+    let opts = crate::api::RenderOptions::from_json(
+        &serde_json::from_str(&opts_json).unwrap_or(Value::Null),
+    );
     API.with(|c| {
         c.borrow()
             .as_ref()
-            .and_then(|api| api.render_result(&custom_type, &result))
+            .and_then(|api| api.render_result(&custom_type, &result, &opts))
             .map(|v| v.to_string())
     })
 }
@@ -335,6 +356,22 @@ pub fn transform_markdown(markdown: String, ctx_json: String) -> String {
     API.with(|c| match c.borrow().as_ref() {
         Some(api) => api.transform_markdown(&markdown, &ctx),
         None => markdown,
+    })
+}
+
+/// `bash-operations-exec` export body (DRIFT-004; Pi `BashOperations.exec`,
+/// `core/tools/bash.ts:71-80` @v0.84.4). `Err` when this guest registered no backend, so an
+/// unexpected call surfaces as a failed command rather than a silent success with no output.
+pub fn bash_operations_exec(
+    call_id: String,
+    command: String,
+    cwd: String,
+    opts_json: String,
+) -> Result<Option<i32>, String> {
+    let cmd = crate::ctx::BashCommand::from_host_args(call_id, command, cwd, &opts_json);
+    API.with(|c| match c.borrow().as_ref() {
+        Some(api) => api.exec_bash_operations(&cmd),
+        None => Err("extension not initialized".into()),
     })
 }
 

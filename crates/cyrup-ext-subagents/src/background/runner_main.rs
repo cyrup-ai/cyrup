@@ -95,6 +95,7 @@ use super::child_stop::{
     mark_child_stop_requested, mark_child_stopped,
 };
 use super::control::{self, ChainAppendRequest};
+use super::flat_index::{flat_base, flat_range, flat_total, pending_step_statuses_for};
 use super::{
     ParallelGroupStatus, ResultFile, RunId, RunMode, RunPaths, RunState, RunStatus, StepState,
     StepStatus,
@@ -796,7 +797,14 @@ async fn publish_initial_status(config: &RunnerConfig, run_paths: &RunPaths) -> 
         .filter(|id| !id.is_empty())
         .or_else(crate::background::parent_anchor::resolve_parent_session_anchor);
     status.chain_step_count = Some(config.steps.len());
-    status.steps = config.steps.iter().map(pending_step_status_for).collect();
+    // SUBA-093 — one entry per FLAT child, not per top-level step: a `ParallelGroup` declares one
+    // `RunStatus::steps` entry per member (pi `subagent-runner.ts:2618-2652` @v0.64.0), which is
+    // what makes a `tasks[]` fan-out's members individually addressable.
+    status.steps = config
+        .steps
+        .iter()
+        .flat_map(pending_step_statuses_for)
+        .collect();
     // Queued -> Running is always legal (RunState::can_transition_to).
     if status.advance_state(RunState::Running).is_err() {
         // Unreachable in practice (a freshly `queued` status can always advance to Running), but
@@ -1152,26 +1160,14 @@ fn run_id_from_paths(run_paths: &RunPaths) -> RunId {
         .unwrap_or_else(|| RunId::from_token("unknown-run"))
 }
 
-/// A freshly declared, `Pending` [`StepStatus`] for one [`RunnerStep`] — the agent name shown is
-/// the step's own agent for a [`RunnerStep::SingleStep`], or a synthesized `"<n> parallel
-/// tasks>"`-shaped label for a group step (whose own per-child detail lives in
-/// `RunStatus::parallel_groups`, not this top-level `steps` list's single entry for the group).
-fn pending_step_status_for(step: &RunnerStep) -> StepStatus {
-    match step {
-        RunnerStep::SingleStep(spec) => StepStatus::pending(spec.agent.clone()),
-        RunnerStep::ParallelGroup(group) => {
-            StepStatus::pending(format!("<parallel:{} tasks>", group.steps.len()))
-        }
-        RunnerStep::DynamicGroup(dynamic) => {
-            StepStatus::pending(format!("<dynamic:{}>", dynamic.collect))
-        }
-        RunnerStep::ImportAsyncRoot(spec) => StepStatus::pending(spec.agent.clone()),
-    }
-}
-
 /// The agent name shown for one [`RunnerStep`] in a `subagent.step.*` `events.jsonl` line — the
-/// step's own agent for a single/import step, or a synthesized group label (mirroring
-/// [`pending_step_status_for`]'s own display convention).
+/// step's own agent for a single/import step, or a synthesized group label.
+///
+/// The events are one-per-TOP-LEVEL-step, so the group label survives here. `RunStatus::steps` is
+/// the other index space and its entries are one-per-FLAT-CHILD, which is why
+/// [`crate::background::flat_index::pending_step_statuses_for`] names a group's members
+/// individually instead. (SUBA-093 deleted `pending_step_status_for`, the collapsed builder this
+/// comment used to point at.)
 fn step_display_agent(step: &RunnerStep) -> String {
     match step {
         RunnerStep::SingleStep(spec) => spec.agent.clone(),
@@ -1412,10 +1408,7 @@ async fn run_inner(
     let depth = crate::spawn::depth::resolve_effective_depth(config.max_subagent_depth);
     ensure_depth_available(&depth)?;
 
-    // Published just before each dispatch so the live-telemetry sink tags every child NDJSON line
-    // with the step it belongs to (pi's `statusPayload.currentStep`, `subagent-runner.ts:1434`).
-    let current_flat_index = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let (executor, ctx) = build_chain_context(
+    let (executor, mut ctx) = build_chain_context(
         child_env,
         spawn_command,
         config,
@@ -1424,7 +1417,6 @@ async fn run_inner(
         interrupt_cancel,
         telemetry,
         depth,
-        &current_flat_index,
     );
 
     let mut io = TurnLoopIo {
@@ -1463,36 +1455,55 @@ async fn run_inner(
             SubagentError::Spawn(std::io::Error::other("step cursor out of range"))
         })?;
 
+        // SUBA-093 — the FLAT status slots this top-level step occupies. A `ParallelGroup` owns
+        // one slot per member; every other shape owns exactly one.
+        let flat_slots = flat_range(&steps, cursor);
+
         // SUBA-087 — pi `if (childStopRequests.has(flatIndex)) { results.push(childStopResult(…));
         // flatIndex++; continue; }` (`subagent-runner.ts:4937-4941` @v0.64.0): a child-scoped stop
         // that landed while this step was still `pending` (`subagent.step.stop_queued`) is applied
         // HERE, before dispatch — the step is marked `stopped` without ever spawning a child, and
         // the loop moves on to the next step. The run itself stays alive.
-        if let Some(record) = io.flags.child_stops.recorded(cursor) {
-            skip_child_stopped_step(&mut io, &steps, cursor, &step, &record, &mut results).await?;
+        //
+        // SUBA-093: only for a step that occupies exactly ONE flat slot, which is pi's own
+        // sequential branch. A wider `ParallelGroup` is addressed per member instead, inside the
+        // fan-out (`ExecSingleStepExecutor::run_single`, pi `:4221`) — resolving a member's stop
+        // here would tear down the whole group, which is precisely the defect this item closes.
+        if flat_slots.len() == 1
+            && let Some(record) = io.flags.child_stops.recorded(flat_slots.start)
+        {
+            skip_child_stopped_step(
+                &mut io,
+                &steps,
+                flat_slots.start,
+                &step,
+                &record,
+                &mut results,
+            )
+            .await?;
             cursor += 1;
             continue;
         }
 
-        // Publish the current flat index BEFORE dispatch so the live-telemetry sink tags this
-        // step's child NDJSON lines with the right index (pi `statusPayload.currentStep = flatIndex`).
-        current_flat_index.store(cursor, std::sync::atomic::Ordering::SeqCst);
-
-        // SUBA-087 — pi `registerStepStop(flatIndex, stop)` (`subagent-runner.ts:3048-3055`): this
-        // step's OWN stop handle, a child token of the run-wide interrupt token, registered BEFORE
-        // the step is marked `Running` so a child-scoped stop arriving against a `Running` step
-        // always finds a handle to fire. A run-wide interrupt/timeout/stop still cancels it through
-        // the parent; a child-scoped stop cancels it alone. The executor reads it back through
-        // `current_flat_index` when it builds the child's `RunOptions::interrupt`.
-        io.flags
-            .child_stops
-            .register_active(cursor, interrupt_cancel.child_token());
+        // SUBA-093 — publish this step's flat base on the context BEFORE dispatch. The dispatch
+        // adapter reads it back for the live-telemetry tag, the per-child steer paths, the child's
+        // intercom label and its stop handle; `dispatch_group` re-stamps it per member for a
+        // parallel fan-out (pi's per-step `ctx.flatIndex`, `subagent-runner.ts:1294`).
+        ctx.step_slot = crate::spawn::chain_graph::StepSlot::Exclusive(flat_slots.start);
 
         {
             let mut guard = lock_status(status);
             let s = &mut *guard;
-            mark_step_running(s, cursor);
-            s.current_step = Some(cursor);
+            // SUBA-093: every member of a group goes `Running` when the group is dispatched.
+            // [CYRUP-DELTA, granularity only] pi marks each member at the moment its own worker
+            // claims it (`subagent-runner.ts:4236-4238`); cyrup's fan-out happens behind
+            // `walk_chain`, which reports no per-member start, so a concurrency-limited group can
+            // show a member `Running` slightly before its worker claims a permit. Nothing keys on
+            // the distinction: `is_stoppable_step_state` accepts `Pending` and `Running` alike.
+            for flat in flat_slots.clone() {
+                mark_step_running(s, flat);
+            }
+            s.current_step = Some(flat_slots.start);
             refresh_workflow_graph(s, &steps);
             s.touch();
         }
@@ -1504,7 +1515,7 @@ async fn run_inner(
             "subagent.step.started",
             Some(serde_json::json!({
                 "runId": config.run_id.as_str(),
-                "stepIndex": cursor,
+                "stepIndex": flat_slots.start,
                 "agent": step_display_agent(&step),
             })),
         )
@@ -1514,7 +1525,7 @@ async fn run_inner(
             run_import_async_root(
                 &mut io,
                 &steps,
-                cursor,
+                flat_slots.start,
                 &step,
                 spec,
                 &mut registry,
@@ -1532,10 +1543,6 @@ async fn run_inner(
         // one-element "graph" is just a fresh one-element `Vec`.
         let one_step: Vec<RunnerStep> = vec![step.clone()];
         let walked = walk_chain(&one_step, &mut registry, &executor, &ctx).await;
-        // pi `registerStepStop(flatIndex, undefined)` (`:1102,1162`): the child is gone, whatever
-        // the outcome, so a late child-scoped stop against this index is `stop_failed`, not a
-        // cancel of a token nothing is listening to.
-        io.flags.child_stops.clear_active(cursor);
         let (step_results, group_results) = walked?;
 
         let step_result = step_results.into_iter().next().ok_or_else(|| {
@@ -1547,7 +1554,7 @@ async fn run_inner(
         match settle_step_result(
             &mut io,
             &steps,
-            cursor,
+            flat_slots,
             step,
             step_result,
             group_results,
@@ -1629,7 +1636,6 @@ fn build_chain_context(
     interrupt_cancel: &cyrup_core::CancelToken,
     telemetry: tokio::sync::mpsc::UnboundedSender<TelemetryMsg>,
     depth: DepthEnvelope,
-    current_flat_index: &Arc<std::sync::atomic::AtomicUsize>,
 ) -> (Arc<dyn SingleStepExecutor>, ChainRunContext) {
     let global_limit = GlobalConcurrencyLimit::new(config.global_concurrency_limit.max(1));
     let cancel_root = cyrup_core::CancelToken::new();
@@ -1649,7 +1655,6 @@ fn build_chain_context(
         interrupted: Arc::clone(&flags.interrupted),
         interrupt_cancel: interrupt_cancel.clone(),
         child_stops: Some(flags.child_stops.clone()),
-        current_flat_index: Arc::clone(current_flat_index),
         telemetry: Some(telemetry),
         resolved_agents,
         // Intercom child-bridge (pi `subagent-runner.ts:779-783`): the orchestrator's presence target
@@ -1733,6 +1738,9 @@ fn build_chain_context(
         // falls back to the SAME run-wide cap the foreground path applies, rather than always
         // failing materialization.
         dynamic_fanout_max_items: config.dynamic_fanout_max_items,
+        // SUBA-093: re-stamped by `run_inner` before every dispatch (and again per member by
+        // `dispatch_group`); the initial value is only the first step's own base.
+        step_slot: crate::spawn::chain_graph::StepSlot::Exclusive(0),
     };
     (executor, ctx)
 }
@@ -1773,7 +1781,7 @@ async fn check_stop_flag(
             let stopped_children: Vec<(usize, String, String)> = {
                 let mut guard = lock_status(status);
                 let s = &mut *guard;
-                mark_remaining_stopped(s, cursor, steps.len(), &message);
+                mark_remaining_stopped(s, flat_base(steps, cursor), flat_total(steps), &message);
                 refresh_workflow_graph(s, steps);
                 s.touch();
                 recorded_child_stops
@@ -1854,7 +1862,7 @@ async fn check_timeout_flag(
             {
                 let mut guard = lock_status(status);
                 let s = &mut *guard;
-                mark_remaining_timed_out(s, cursor, steps.len(), &message);
+                mark_remaining_timed_out(s, flat_base(steps, cursor), flat_total(steps), &message);
                 refresh_workflow_graph(s, steps);
                 s.touch();
             }
@@ -1911,7 +1919,7 @@ async fn check_interrupt_flag(
             {
                 let mut guard = lock_status(status);
                 let s = &mut *guard;
-                mark_remaining_paused(s, cursor, steps.len());
+                mark_remaining_paused(s, flat_base(steps, cursor), flat_total(steps));
                 refresh_workflow_graph(s, steps);
                 s.touch();
             }
@@ -2039,7 +2047,7 @@ async fn run_import_async_root(
     {
         let mut guard = lock_status(status);
         let s = &mut *guard;
-        record_step_outcome(s, cursor, step, &step_result, None);
+        record_step_outcome(s, &(cursor..cursor + 1), step, &step_result, None);
         step_duration_ms = step_elapsed_ms(s, cursor);
         refresh_workflow_graph(s, steps);
         s.touch();
@@ -2098,7 +2106,7 @@ enum MidFlightVerb {
 async fn settle_step_result(
     io: &mut TurnLoopIo<'_>,
     steps: &[RunnerStep],
-    cursor: usize,
+    flat_slots: std::ops::Range<usize>,
     step: RunnerStep,
     step_result: StepResult,
     group_results: Vec<crate::spawn::chain_graph::GroupStepResult>,
@@ -2107,6 +2115,16 @@ async fn settle_step_result(
     let config = io.config;
     let run_paths = io.run_paths;
     let status = io.status;
+    let cursor = flat_slots.start;
+    let flat_end = flat_slots.end;
+    // SUBA-093 — a group settles per MEMBER; every other shape settles as one child. The group
+    // aggregate carries no `interrupted` flag of its own (`chain_graph::collapse_fan_out`), so the
+    // mid-flight disambiguation below is a non-group concern by construction.
+    let is_group = matches!(
+        step,
+        RunnerStep::ParallelGroup(_) | RunnerStep::DynamicGroup(_)
+    );
+    let flat_step_total = flat_total(steps);
     let interrupted_mid_flight = step_result.interrupted;
     // Disambiguate WHICH verb tore this child down, in pi's precedence. Both run-wide verbs are
     // checked against their FILE rather than their flag so a stale flag can never spin this
@@ -2125,15 +2143,37 @@ async fn settle_step_result(
         } else {
             Some(MidFlightVerb::Interrupt)
         }
+    } else if !is_group && let Some(record) = io.flags.child_stops.recorded(cursor) {
+        // SUBA-093 — the stop was applied at the dispatch GATE rather than mid-flight
+        // (`ExecSingleStepExecutor::run_single`'s `is_requested` short-circuit, pi `:4937`), so
+        // no child ever ran and nothing reports `interrupted`. The step is still `Stopped`.
+        Some(MidFlightVerb::ChildStop(record))
     } else {
         None
     };
     let step_duration_ms;
     let mut child_stopped: Option<super::child_stop::ChildStoppedSummary> = None;
+    // SUBA-093 — per-MEMBER child stops settled inside a fan-out, each of which gets pi's two
+    // terminal events of its own.
+    let mut group_child_stops: Vec<(usize, super::child_stop::ChildStoppedSummary)> = Vec::new();
     {
         let mut guard = lock_status(status);
         let s = &mut *guard;
-        record_step_outcome(s, cursor, &step, &step_result, group_results.first());
+        record_step_outcome(s, &flat_slots, &step, &step_result, group_results.first());
+        // SUBA-093 — a `ParallelGroup` member whose OWN child-scoped stop fired is `Stopped`, not
+        // the `Failed` its non-zero exit would otherwise make it (pi's per-member
+        // `childStopped` settle, `subagent-runner.ts:4285-4342` @v0.64.0). Its siblings keep the
+        // outcomes `record_step_outcome` just wrote, and the run stays alive.
+        if is_group {
+            for flat in flat_slots.clone() {
+                if let Some(record) = io.flags.child_stops.recorded(flat)
+                    && let Some(summary) =
+                        mark_child_stopped(s, flat, Some(&record), crate::time::now_epoch_millis())
+                {
+                    group_child_stops.push((flat, summary));
+                }
+            }
+        }
         match &mid_flight {
             Some(MidFlightVerb::ChildStop(record)) => {
                 // pi `markChildStopped` (`subagent-runner.ts:2992-3010`): `record_step_outcome`
@@ -2148,7 +2188,7 @@ async fn settle_step_result(
                     entry.status = StepState::Paused;
                     entry.error = None;
                 }
-                mark_remaining_paused(s, cursor + 1, steps.len());
+                mark_remaining_paused(s, flat_end, flat_step_total);
             }
             None => {}
         }
@@ -2156,11 +2196,18 @@ async fn settle_step_result(
         refresh_workflow_graph(s, steps);
         s.touch();
     }
+    for (flat, summary) in &group_child_stops {
+        append_child_stopped_events(io.events, config, *flat, summary).await;
+    }
     if let Some(summary) = &child_stopped {
         // pi `subagent-runner.ts:4335-4340`: `subagent.step.stopped` with `exitCode: 1`, then
         // `appendTerminalChildStatusEvent` → `subagent.child-status` `stopped`.
         append_child_stopped_events(io.events, config, cursor, summary).await;
         let mut single = step_result_to_single_result(&step, &step_result);
+        // The child's own record is `stopped` whether the stop tore it down mid-flight or was
+        // applied at its dispatch gate (pi's `stoppedAfterAcceptance`, `:1642,1722`), so the
+        // promotion below runs either way.
+        single.interrupted = true;
         promote_interrupted_results_to_stopped(
             std::slice::from_mut(&mut single),
             control::STOP_MESSAGE,
@@ -2229,7 +2276,7 @@ async fn settle_step_result(
         {
             let mut guard = lock_status(status);
             let s = &mut *guard;
-            mark_remaining_timed_out(s, cursor + 1, steps.len(), &message);
+            mark_remaining_timed_out(s, flat_end, flat_step_total, &message);
             refresh_workflow_graph(s, steps);
             s.touch();
         }
@@ -2423,6 +2470,25 @@ async fn skip_child_stopped_step(
     Ok(())
 }
 
+/// SUBA-093 — pi `childStopResult`/`stoppedStepResult` (`subagent-runner.ts:3011-3014,3182-3190`
+/// @v0.64.0) as the [`StepResult`] a dispatch returns when a child-scoped stop was already queued
+/// against its slot: the stop message as both output and error, exit code 1, nothing interrupted
+/// (no child ever ran) and nothing timed out.
+fn child_stopped_step_result() -> StepResult {
+    StepResult {
+        success: false,
+        structured_output: None,
+        final_output: Some(control::STOP_MESSAGE.to_string()),
+        error: Some(control::STOP_MESSAGE.to_string()),
+        interrupted: false,
+        control_events: Vec::new(),
+        exit_code: Some(1),
+        timed_out: false,
+        saved_output_path: None,
+        artifact_paths: None,
+    }
+}
+
 /// pi `stoppedStepResult` (`subagent-runner.ts:3182-3190`) as a [`SingleResult`]: the stop message
 /// as both output and error, `exitCode: 1`, `stopped: true`, nothing interrupted or timed out.
 fn stopped_single_result(step: &RunnerStep) -> SingleResult {
@@ -2545,24 +2611,72 @@ fn mark_step_running(status: &mut RunStatus, index: usize) {
     }
 }
 
-/// Fold one completed step's [`StepResult`] (and, for a group step, its [`crate::spawn::chain_graph::GroupStepResult`]'s own
-/// per-child detail) back into `status.steps[index]`/`status.parallel_groups`.
+/// Fold one completed step's [`StepResult`] (and, for a group step, its
+/// [`crate::spawn::chain_graph::GroupStepResult`]'s own per-child detail) back into the flat
+/// `status.steps` slots `slots` names, plus `status.parallel_groups`.
+///
+/// SUBA-093 — a [`RunnerStep::ParallelGroup`] owns one flat slot PER MEMBER, so each member's own
+/// outcome lands on its own entry (pi's per-member settle, `subagent-runner.ts:4286-4295`
+/// @v0.64.0) instead of every member collapsing onto the group's single entry. A member with no
+/// result at all (fail-fast-skipped or cancelled) is `Failed` with the same sentence the aggregate
+/// error counts it under. Every other shape — including an un-spliced
+/// [`RunnerStep::DynamicGroup`], whose members share one slot (a recorded SUBA-093 residual) —
+/// records the aggregate on its single entry, exactly as before.
 fn record_step_outcome(
     status: &mut RunStatus,
-    index: usize,
+    slots: &std::ops::Range<usize>,
     step: &RunnerStep,
     result: &StepResult,
     group_result: Option<&crate::spawn::chain_graph::GroupStepResult>,
 ) {
     let now = crate::time::now_epoch_millis();
-    if let Some(entry) = status.steps.get_mut(index) {
-        entry.status = if result.success {
-            StepState::Complete
-        } else {
-            StepState::Failed
-        };
-        entry.ended_at = Some(now);
-        entry.error = result.error.clone();
+    let index = slots.start;
+    let per_member = match (step, group_result) {
+        (RunnerStep::ParallelGroup(_), Some(group)) if slots.len() > 1 => Some(group),
+        _ => None,
+    };
+    match per_member {
+        Some(group) => {
+            for (offset, child) in group.children.iter().enumerate() {
+                let Some(entry) = status.steps.get_mut(index + offset) else {
+                    continue;
+                };
+                if entry.status.is_terminal() {
+                    continue;
+                }
+                entry.ended_at = Some(now);
+                match child {
+                    Some(outcome) => {
+                        entry.status = if outcome.success {
+                            StepState::Complete
+                        } else {
+                            StepState::Failed
+                        };
+                        entry.error = outcome.error.clone();
+                    }
+                    None => {
+                        entry.status = StepState::Failed;
+                        entry.error = Some("skipped (fail-fast or cancellation)".to_string());
+                    }
+                }
+            }
+        }
+        // A zero-width group owns NO flat slot, so `slots.start` is the next step's entry rather
+        // than one of its own: writing this step's outcome there would settle a step that has not
+        // run. No constructor produces a zero-task `ParallelGroup` today (`flat_step_width`'s own
+        // doc says a zero-width group contributes nothing), so this is a guard, not a live branch.
+        None if !slots.is_empty() => {
+            if let Some(entry) = status.steps.get_mut(index) {
+                entry.status = if result.success {
+                    StepState::Complete
+                } else {
+                    StepState::Failed
+                };
+                entry.ended_at = Some(now);
+                entry.error = result.error.clone();
+            }
+        }
+        None => {}
     }
 
     if let (RunnerStep::ParallelGroup(_) | RunnerStep::DynamicGroup(_), Some(group)) =
@@ -2608,7 +2722,9 @@ fn record_step_outcome(
 /// `chain_step_count`" — both updated together so they never observably diverge).
 fn append_steps(steps: &mut Vec<RunnerStep>, status: &mut RunStatus, request: &ChainAppendRequest) {
     for step in &request.steps {
-        status.steps.push(pending_step_status_for(step));
+        // SUBA-093: an appended step extends the FLAT list by its own width, and only at the tail,
+        // so no already-published flat base is disturbed.
+        status.steps.extend(pending_step_statuses_for(step));
         steps.push(step.clone());
     }
 }
@@ -2677,6 +2793,12 @@ fn step_result_to_single_result(step: &RunnerStep, result: &StepResult) -> Singl
         // orchestrator, which reads them off the terminal `ResultFile`.
         control_events: result.control_events.clone(),
         progress: None,
+        // SUBA-074: `StepResult` carries no external-runner receipt, so an ASYNC external run's
+        // `runner`/`externalProcess` do not survive this projection. Recorded as a residual on the
+        // item rather than papered over — the run itself executes identically on both paths; only
+        // the receipt fields are absent from the async `ResultFile`.
+        runner: None,
+        external_process: None,
     }
 }
 
@@ -2717,6 +2839,9 @@ fn imported_root_to_single_result(
         output_truncated: false,
         control_events: Vec::new(),
         progress: None,
+        // An imported async ROOT is a cyrup run, never a foreign process.
+        runner: None,
+        external_process: None,
     }
 }
 
@@ -2760,15 +2885,10 @@ pub(crate) struct ExecSingleStepExecutor {
     /// Caller-supplied additions to each dispatched step's child environment
     /// ([`RunnerOverrides::child_env`]). Empty on the real detached runner.
     pub(crate) child_env: std::collections::HashMap<String, String>,
-    /// The flat index of the step currently being dispatched, published here just before each
-    /// dispatch so the live-telemetry [`RunOptions::live_events`] sink can tag every child NDJSON
-    /// line with the step it belongs to (pi's `statusPayload.currentStep`/per-step fold,
-    /// `subagent-runner.ts:1434`). Shared (`Arc`) so the sink closure reads the current value at
-    /// event time rather than capturing a stale index.
-    pub(crate) current_flat_index: Arc<std::sync::atomic::AtomicUsize>,
     /// The live-telemetry channel (`None` for a foreground executor with no `status.json` to
     /// update): each dispatched step installs a [`RunOptions::live_events`] sink that forwards every
-    /// raw child NDJSON line here, tagged with [`Self::current_flat_index`], for the runner's own
+    /// raw child NDJSON line here, tagged with the dispatch's own
+    /// [`crate::spawn::chain_graph::ChainRunContext::step_slot`] index, for the runner's own
     /// telemetry task to fold into `status.json` (pi `updateStepFromChildEvent`).
     pub(crate) telemetry: Option<tokio::sync::mpsc::UnboundedSender<TelemetryMsg>>,
     /// The fully-resolved persona for every agent any dispatched step may name (T0.1 / C13), keyed
@@ -2942,7 +3062,6 @@ impl ExecSingleStepExecutor {
             interrupt_cancel: cyrup_core::CancelToken::new(),
             // SUBA-087: no control inbox → no child-scoped stops on the foreground walk.
             child_stops: None,
-            current_flat_index: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             telemetry: None,
             orchestrator_intercom_target,
             run_id,
@@ -3209,15 +3328,14 @@ impl ExecSingleStepExecutor {
         // token, so a child-scoped stop cancels this child alone while every run-wide verb still
         // reaches it through the parent (pi hands `runSubagentProcess` both `stopSignal` and
         // `registerStop`, `subagent-runner.ts:4268-4270`).
+        //
+        // SUBA-093: the handle is looked up under THIS dispatch's own flat slot, which
+        // `dispatch_group` stamps per member — so a child-scoped stop aimed at one member of a
+        // `tasks[]` fan-out cancels that member alone and its siblings run on.
         let interrupt_token = self
             .child_stops
             .as_ref()
-            .and_then(|registry| {
-                registry.active_token(
-                    self.current_flat_index
-                        .load(std::sync::atomic::Ordering::SeqCst),
-                )
-            })
+            .and_then(|registry| registry.active_token(ctx.step_slot.index()))
             .unwrap_or_else(|| self.interrupt_cancel.clone());
         if self.interrupted.load(std::sync::atomic::Ordering::SeqCst) {
             interrupt_token.cancel();
@@ -3232,9 +3350,8 @@ impl ExecSingleStepExecutor {
         // index of its own), so the sink reads the CURRENT step's index at event time.
         let live_events = self.telemetry.as_ref().map(|sender| {
             let sender = sender.clone();
-            let flat = Arc::clone(&self.current_flat_index);
+            let flat_index = ctx.step_slot.index();
             crate::exec::LiveEventSink::new(move |raw: &str| {
-                let flat_index = flat.load(std::sync::atomic::Ordering::SeqCst);
                 let _ = sender.send(TelemetryMsg {
                     flat_index,
                     raw: raw.to_string(),
@@ -3387,10 +3504,7 @@ impl ExecSingleStepExecutor {
             // of its own), matching the `status.steps` position the steer path indexes by.
             orchestrator_intercom_target: self.orchestrator_intercom_target.clone(),
             run_id: self.run_id.clone(),
-            child_index: Some(
-                self.current_flat_index
-                    .load(std::sync::atomic::Ordering::SeqCst),
-            ),
+            child_index: Some(ctx.step_slot.index()),
             // G90 (pi `steerInboxDir: stepSteerInboxDir(asyncDir, fi)`,
             // `subagent-runner.ts:2313,2600,2797` @v0.34.0): THIS step's own per-child steer inbox,
             // handed to the spawned child so its live steering watcher has a path to attach to. The
@@ -3398,20 +3512,11 @@ impl ExecSingleStepExecutor {
             // runner's own `deliver_steer_request` routes an accepted request to
             // (`control::enqueue_step_steer`), so the two halves of the hop address the same
             // directory by construction. `None` for a foreground executor (no async run dir).
-            steer_inbox_dir: self.steer_inbox_for(
-                self.current_flat_index
-                    .load(std::sync::atomic::Ordering::SeqCst),
-            ),
+            steer_inbox_dir: self.steer_inbox_for(ctx.step_slot.index()),
             // SUBA-049: the return path, keyed off the SAME flat index as the inbox above — see
             // `steer_ack_dir_for`'s doc for why the derivation is shared rather than re-written.
-            steer_ack_dir: self.steer_ack_dir_for(
-                self.current_flat_index
-                    .load(std::sync::atomic::Ordering::SeqCst),
-            ),
-            steer_capability_path: self.steer_capability_path_for(
-                self.current_flat_index
-                    .load(std::sync::atomic::Ordering::SeqCst),
-            ),
+            steer_ack_dir: self.steer_ack_dir_for(ctx.step_slot.index()),
+            steer_capability_path: self.steer_capability_path_for(ctx.step_slot.index()),
             // SUBA-N05: the run's resolved live-control config, threaded from
             // [`RunnerConfig::control`] (background) or [`ExecSingleStepExecutor::with_control`]
             // (foreground chain/parallel) — pi `controlConfig: input.controlConfig` on the
@@ -3458,20 +3563,19 @@ impl ExecSingleStepExecutor {
     /// foreground path's identical convention.
     ///
     /// Index: pi passes the step's own index into `getArtifactPaths` so a chain's steps do not
-    /// overwrite each other's files. `current_flat_index` is the value `run_inner` publishes
-    /// immediately before each dispatch — the SAME index `RunOptions::child_index` uses.
+    /// overwrite each other's files. `index` is this dispatch's own flat slot (SUBA-093) — the
+    /// SAME index `RunOptions::child_index` uses, and per MEMBER inside a `ParallelGroup`, so two
+    /// concurrently-running siblings no longer write the same artifact quadruple.
     fn write_step_input_artifact(
         &self,
         step: &SingleStepSpec,
         resolved_task: &str,
+        index: usize,
     ) -> Option<(crate::artifacts::ArtifactPaths, String)> {
         self.artifacts_dir
             .as_ref()
             .filter(|_| self.artifact_config.enabled)
             .map(|dir| {
-                let index = self
-                    .current_flat_index
-                    .load(std::sync::atomic::Ordering::SeqCst);
                 let run_token = self
                     .run_id
                     .as_ref()
@@ -3522,6 +3626,19 @@ impl ExecSingleStepExecutor {
     }
 }
 
+/// Deregisters one step's live child-stop handle when the dispatch it belongs to ends — however
+/// it ends. See its only construction site in [`ExecSingleStepExecutor::run_single`].
+struct ActiveStopGuard<'a> {
+    registry: &'a super::child_stop::ChildStopRegistry,
+    index: usize,
+}
+
+impl Drop for ActiveStopGuard<'_> {
+    fn drop(&mut self) {
+        self.registry.clear_active(self.index);
+    }
+}
+
 #[async_trait::async_trait]
 impl SingleStepExecutor for ExecSingleStepExecutor {
     async fn run_single(
@@ -3540,14 +3657,60 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             Err(rejection) => return Ok(*rejection),
         };
 
+        // SUBA-093 / SUBA-087 — the child-scoped stop handle is registered HERE, per dispatch,
+        // which is where pi registers it too: `registerStop: (stop) => registerStepStop(fi, stop)`
+        // appears at all three of pi's dispatch sites (`subagent-runner.ts:4268` parallel, `:4667`
+        // dynamic, `:5034` sequential @v0.64.0), each with its OWN `fi`. Registering per top-level
+        // step instead — which is what this runner did before this item — gave every member of a
+        // `tasks[]` fan-out the same handle, so stopping one member stopped all of them.
+        //
+        // Only an EXCLUSIVE slot registers: a dynamic group's members still share one flat slot
+        // (a recorded SUBA-093 residual), and two live children under one index would let a stop
+        // aimed at either tear down whichever registered last.
+        let stop_slot = self.child_stops.as_ref().and_then(|registry| {
+            ctx.step_slot
+                .exclusive_index()
+                .map(|index| (registry, index))
+        });
+        if let Some((registry, index)) = stop_slot {
+            // pi `if (childStopRequests.has(fi)) return childStopResult(fi, …)` immediately ahead
+            // of each dispatch (`:4221`, `:4604`, `:4937`): a stop queued against a member that
+            // has not started yet is applied without ever spawning a child.
+            if registry.is_requested(index) {
+                return Ok(child_stopped_step_result());
+            }
+            // A child token of the run-wide interrupt token: a run-wide stop/interrupt/timeout
+            // still reaches this child through the parent, a child-scoped stop cancels it alone.
+            registry.register_active(index, self.interrupt_cancel.child_token());
+        }
+        // pi `registerStepStop(flatIndex, undefined)` (`:3049-3052`): this child is gone, so a
+        // later child-scoped stop against its index is `stop_failed`, not a cancel of a token
+        // nothing is listening to. A GUARD rather than a statement after the await, because this
+        // future is dropped rather than completed whenever a fan-out sibling fail-fasts or the
+        // group is cancelled — and the plain statement never ran on that path, leaving a dead
+        // token registered under a live index for the rest of the run.
+        let _active = stop_slot.map(|(registry, index)| ActiveStopGuard { registry, index });
+
         let opts =
             self.build_step_run_options(step, ctx, available_models, model_override, acceptance);
 
-        let artifact_paths = self.write_step_input_artifact(step, resolved_task);
+        let artifact_paths =
+            self.write_step_input_artifact(step, resolved_task, ctx.step_slot.index());
 
         let result = exec::run_sync(&agent, resolved_task, &opts).await;
 
         self.write_step_result_artifacts(artifact_paths.as_ref(), &result);
+
+        // SUBA-093 — a child torn down by ITS OWN child-scoped stop reports pi's stopped result
+        // (`exitCode: 1`), not the paused-success (exit 0) an interrupt yields:
+        // `requiredStatusStep(fi).exitCode = stopped || childStopped ? 1 : …` and the matching
+        // `singleResult` (`subagent-runner.ts:4286-4295` @v0.64.0). Without this, a stopped MEMBER
+        // of a fan-out came back successful, its group's aggregate stayed successful, and a run
+        // whose member the user explicitly stopped ended `Complete`. The whole-run verbs are
+        // unaffected: they cancel through the parent token and leave nothing recorded here.
+        if stop_slot.is_some_and(|(registry, index)| registry.is_requested(index)) {
+            return Ok(child_stopped_step_result());
+        }
 
         Ok(build_step_result(
             &agent.name,
@@ -4214,6 +4377,8 @@ async fn finish_run(
             output_truncated: false,
             control_events: Vec::new(),
             progress: None,
+            runner: None,
+            external_process: None,
         });
     }
 
@@ -4550,7 +4715,6 @@ mod tests {
             interrupted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             interrupt_cancel: cyrup_core::CancelToken::new(),
             child_stops: None,
-            current_flat_index: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             telemetry: None,
             share: None,
             artifacts_dir: None,
@@ -4841,7 +5005,6 @@ mod tests {
             interrupted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             interrupt_cancel: cyrup_core::CancelToken::new(),
             child_stops: None,
-            current_flat_index: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             telemetry: None,
             share: None,
             artifacts_dir: None,
@@ -4865,6 +5028,7 @@ mod tests {
             original_task: String::new(),
             chain_dir: None,
             dynamic_fanout_max_items: None,
+            step_slot: crate::spawn::chain_graph::StepSlot::Exclusive(0),
         };
         let step = single_step("nonexistent-reviewer", "review the change");
 
@@ -5221,6 +5385,8 @@ mod tests {
                 output_truncated: false,
                 control_events: Vec::new(),
                 progress: None,
+                runner: None,
+                external_process: None,
             }],
             dir.path().to_path_buf(),
             None,
@@ -5509,6 +5675,194 @@ mod tests {
         }
     }
 
+    /// SUBA-093 — a `ParallelGroup`'s per-member outcomes land on the members' OWN flat status
+    /// entries, not collapsed onto one entry for the whole group (pi's per-member settle,
+    /// `subagent-runner.ts:4286-4295` @v0.64.0). This is what gives a `tasks[]` fan-out a live
+    /// per-child status at all, and therefore what a `childId` resolves against.
+    ///
+    /// Fails at the parent commit by construction: `record_step_outcome` took a single `usize`
+    /// there and `status.steps` carried one `<parallel:3 tasks>` entry for the whole group.
+    #[test]
+    fn a_parallel_groups_member_outcomes_land_on_their_own_flat_status_entries() {
+        let mut status = RunStatus::queued(
+            RunId::from_token("flatgroup001".to_string()),
+            RunMode::Parallel,
+            Some(1),
+        );
+        status.state = RunState::Running;
+        let group_step = RunnerStep::ParallelGroup(crate::spawn::chain_graph::ParallelGroupSpec {
+            steps: vec![
+                single_step("alpha", "a"),
+                single_step("beta", "b"),
+                single_step("gamma", "c"),
+            ],
+            concurrency: 3,
+            fail_fast: false,
+            worktree: false,
+        });
+        status.steps = super::super::flat_index::pending_step_statuses_for(&group_step);
+        assert_eq!(
+            status
+                .steps
+                .iter()
+                .map(|s| s.agent.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta", "gamma"],
+            "the declaration itself is per member"
+        );
+
+        let group_result = crate::spawn::chain_graph::GroupStepResult {
+            aggregate: StepResult::failure("1 of 3 group step(s) failed or were skipped"),
+            children: vec![
+                Some(StepResult::success(Some("out-a".to_string()), None)),
+                Some(StepResult::failure("beta blew up")),
+                Some(StepResult::success(Some("out-c".to_string()), None)),
+            ],
+            fail_fast_skipped: vec![false, false, false],
+        };
+        let aggregate = group_result.aggregate.clone();
+        record_step_outcome(
+            &mut status,
+            &(0..3),
+            &group_step,
+            &aggregate,
+            Some(&group_result),
+        );
+
+        assert_eq!(status.steps[0].status, StepState::Complete);
+        assert_eq!(
+            status.steps[1].status,
+            StepState::Failed,
+            "only the member that failed is Failed: {:?}",
+            status.steps
+        );
+        assert_eq!(status.steps[1].error.as_deref(), Some("beta blew up"));
+        assert_eq!(status.steps[2].status, StepState::Complete);
+        assert!(
+            status.steps[0].error.is_none() && status.steps[2].error.is_none(),
+            "a sibling never picks up the aggregate's own error text"
+        );
+        // The settled-detail record is still written, now keyed by the group's FLAT base.
+        let groups = status.parallel_groups.as_ref().expect("group recorded");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].group_step_index, 0);
+        assert_eq!(groups[0].children.len(), 3);
+    }
+
+    /// SUBA-093 review fix — a step that owns NO flat slot settles nothing.
+    ///
+    /// `flat_range` returns `base..base` for a zero-width `ParallelGroup`, whose `slots.start` is
+    /// the NEXT step's status entry. Before the guard, `record_step_outcome` took the non-group
+    /// arm (`per_member` needs `slots.len() > 1`) and wrote the empty group's aggregate over a
+    /// step that had not run. No constructor produces a zero-task group today, which is exactly
+    /// why the invariant needs pinning rather than trusting.
+    #[test]
+    fn a_zero_width_group_settles_nothing_and_leaves_the_next_step_pending() {
+        let steps = vec![
+            RunnerStep::ParallelGroup(crate::spawn::chain_graph::ParallelGroupSpec {
+                steps: Vec::new(),
+                concurrency: 2,
+                fail_fast: false,
+                worktree: false,
+            }),
+            RunnerStep::SingleStep(single_step("tail", "t")),
+        ];
+        assert_eq!(flat_total(&steps), 1);
+        assert_eq!(flat_range(&steps, 0), 0..0, "the group owns no slot");
+        assert_eq!(flat_range(&steps, 1), 0..1, "the tail owns slot 0");
+
+        let mut status = RunStatus::queued(
+            RunId::from_token("flatempty001".to_string()),
+            RunMode::Chain,
+            Some(1),
+        );
+        status.steps = steps.iter().flat_map(pending_step_statuses_for).collect();
+        assert_eq!(status.steps.len(), 1);
+        record_step_outcome(
+            &mut status,
+            &flat_range(&steps, 0),
+            &steps[0],
+            &StepResult::failure("the empty group"),
+            None,
+        );
+        assert_eq!(
+            status.steps[0].status,
+            StepState::Pending,
+            "the tail must not have been settled by the group ahead of it: {:?}",
+            status.steps
+        );
+        assert!(status.steps[0].error.is_none(), "{:?}", status.steps);
+    }
+
+    /// SUBA-093 review fix — the live child-stop handle is deregistered even when the dispatch's
+    /// future is DROPPED rather than run to completion, which is what happens to every sibling of
+    /// a fail-fast member inside `spawn::parallel::run_bounded`.
+    ///
+    /// Before the guard the `clear_active` call sat after the `run_sync` await, so a dropped
+    /// member left a dead token registered under a live flat index for the rest of the run.
+    #[test]
+    fn a_dropped_dispatch_still_deregisters_its_child_stop_handle() {
+        let registry = super::super::child_stop::ChildStopRegistry::new();
+        registry.register_active(2, cyrup_core::CancelToken::new());
+        assert!(registry.active_token(2).is_some());
+        {
+            let _guard = ActiveStopGuard {
+                registry: &registry,
+                index: 2,
+            };
+        }
+        assert!(
+            registry.active_token(2).is_none(),
+            "dropping the dispatch must clear the handle"
+        );
+        // pi `stopChildStep`'s "was there a live child?" answer is now `false`, so a later
+        // child-scoped stop against this index is `stop_failed` rather than a cancel of a token
+        // nothing is listening to.
+        assert!(!registry.cancel_active(2));
+    }
+
+    /// SUBA-093 — a step that occupies one flat slot still records the aggregate on that slot, and
+    /// a chain's later steps are numbered past a group's whole width.
+    #[test]
+    fn a_single_step_records_on_its_own_slot_and_flat_bases_skip_a_groups_width() {
+        let steps = vec![
+            RunnerStep::SingleStep(single_step("lead", "l")),
+            RunnerStep::ParallelGroup(crate::spawn::chain_graph::ParallelGroupSpec {
+                steps: vec![single_step("x", "x"), single_step("y", "y")],
+                concurrency: 2,
+                fail_fast: false,
+                worktree: false,
+            }),
+            RunnerStep::SingleStep(single_step("tail", "t")),
+        ];
+        assert_eq!(flat_total(&steps), 4);
+        assert_eq!(flat_base(&steps, 2), 3);
+        assert_eq!(flat_range(&steps, 1), 1..3);
+
+        let mut status = RunStatus::queued(
+            RunId::from_token("flatchain001".to_string()),
+            RunMode::Chain,
+            Some(1),
+        );
+        status.steps = steps.iter().flat_map(pending_step_statuses_for).collect();
+        assert_eq!(status.steps.len(), 4);
+        record_step_outcome(
+            &mut status,
+            &(3..4),
+            &steps[2],
+            &StepResult::failure("tail failed"),
+            None,
+        );
+        assert_eq!(status.steps[3].status, StepState::Failed);
+        assert_eq!(status.steps[3].error.as_deref(), Some("tail failed"));
+        assert!(
+            status.steps[..3]
+                .iter()
+                .all(|s| s.status == StepState::Pending),
+            "recording the tail step touches nothing ahead of it"
+        );
+    }
+
     /// G77 widening 2 — `mark_remaining_stopped`'s PARALLEL-GROUP child sweep.
     ///
     /// A parallel group's children live on `RunStatus::parallel_groups`, not in the flat `steps`
@@ -5651,6 +6005,8 @@ mod tests {
             output_truncated: false,
             control_events: Vec::new(),
             progress: None,
+            runner: None,
+            external_process: None,
         };
         let mut results = vec![
             settled(
@@ -5765,6 +6121,8 @@ mod tests {
                 output_truncated: false,
                 control_events: Vec::new(),
                 progress: None,
+                runner: None,
+                external_process: None,
             }],
         };
         write_atomic_json(&target_paths.result, &target_result)

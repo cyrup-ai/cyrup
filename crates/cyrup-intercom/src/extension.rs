@@ -1300,6 +1300,7 @@ mod tests {
 
         let triggering = crate::reply_tracker::IntercomContext {
             from: SessionInfo {
+                endpoint_epoch: None,
                 id: "s-trigger".to_string(),
                 name: Some("trigger-sender".to_string()),
                 runtime_fallback_alias: None,
@@ -1338,6 +1339,7 @@ mod tests {
             // An unrelated, older pending ask (e.g. from a different session) that must NOT win.
             tracker.record_incoming_message(
                 SessionInfo {
+                    endpoint_epoch: None,
                     id: "s-other".to_string(),
                     name: Some("other-sender".to_string()),
                     runtime_fallback_alias: None,

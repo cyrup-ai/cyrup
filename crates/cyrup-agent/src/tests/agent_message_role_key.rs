@@ -50,6 +50,7 @@ fn the_other_arms_are_byte_unchanged_and_still_tagged() {
                 kind: "note".into(),
                 payload: serde_json::json!({"a": 1}),
                 details: None,
+                display: true,
                 timestamp: Some(7),
             },
             "custom",
@@ -79,6 +80,7 @@ fn every_arm_still_round_trips() {
             kind: "note".into(),
             payload: serde_json::json!({"a": 1}),
             details: None,
+            display: true,
             timestamp: Some(7),
         },
     ] {
@@ -147,5 +149,56 @@ fn an_unknown_role_is_still_a_parse_error() {
     assert!(
         err.is_err(),
         "an unrecognized role must not be swallowed: {err:?}"
+    );
+}
+
+/// SUBA-094 — a custom message's `display` must survive the wire in BOTH directions.
+///
+/// The `Custom` arm is the one surface an extension constructs directly, and pi carries `display`
+/// ON the message (`coding-agent/src/core/messages.ts:50` @v0.84.4) precisely so every consumer —
+/// the interactive host's `if (message.display)` gate at `interactive-mode.ts:3609`, and the
+/// `appendCustomMessageEntry` that persists it — reads one value. cyrup's TUI reads this arm
+/// through the serialized projection (`AgentMessage` is only a dev-dependency there), so a `display`
+/// that does not reach the bytes cannot be honoured at all.
+///
+/// Written as a JSON→JSON round trip rather than over a constructed value so it exercises the
+/// hand-written `Deserialize`/`Serialize` pair, which is where the field could be dropped.
+#[test]
+fn a_custom_message_round_trips_display_in_both_directions() {
+    for want in [false, true] {
+        let wire = serde_json::json!({
+            "role": "custom",
+            "kind": "subagent-notify",
+            "payload": "Background run finished",
+            "display": want,
+            "timestamp": 7,
+        });
+        let msg: AgentMessage =
+            serde_json::from_value(wire.clone()).expect("the custom arm parses its own wire form");
+        assert!(
+            matches!(&msg, AgentMessage::Custom { display, .. } if *display == want),
+            "display survives Deserialize: {wire}"
+        );
+        let back = serde_json::to_value(&msg).expect("serializes");
+        assert_eq!(
+            back["display"], want,
+            "display survives Serialize — the projection the TUI gates on: {back}"
+        );
+    }
+}
+
+/// An absent `display` (a producer predating the field) still parses, and parses as VISIBLE — the
+/// disposition every such message already had.
+#[test]
+fn a_custom_message_without_display_defaults_to_visible() {
+    let msg: AgentMessage = serde_json::from_value(serde_json::json!({
+        "role": "custom",
+        "kind": "note",
+        "payload": "hi",
+    }))
+    .expect("an absent display is not a parse error");
+    assert!(
+        matches!(&msg, AgentMessage::Custom { display, .. } if *display),
+        "absent display reads as visible"
     );
 }

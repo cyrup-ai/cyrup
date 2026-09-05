@@ -180,6 +180,7 @@ impl EventSubscriber for SvcSubscriber {
                 kind,
                 payload,
                 details,
+                display,
                 ..
             } = message
             {
@@ -187,13 +188,15 @@ impl EventSubscriber for SvcSubscriber {
                 // `send_custom_message` deliver_as steer/followUp and pulled mid-run) finalize as a
                 // `message_end` here. Pi persists them as a CustomMessageEntry
                 // (agent-session.ts:546-553 `appendCustomMessageEntry`); without this they would be
-                // silently dropped by the `Custom -> None` core mapping. `details` now rides on the
-                // message, so the persisted entry matches the live one; `display` still follows the
-                // bash-message convention (`true`), which is what every injector passes.
+                // silently dropped by the `Custom -> None` core mapping. `details` and — SUBA-094 —
+                // `display` both ride on the message, so the persisted entry matches the live one:
+                // pi appends `appMessage.display` (`_appendCustomMessage`, agent-session.ts:1517-1524
+                // @v0.84.4), and the hardcoded `true` this line used to pass was what re-drew a
+                // hidden notice on `--resume` even once the live gate honoured it.
                 let _ = self.manager.lock().await.append_custom_message(
                     kind,
                     payload.clone(),
-                    true,
+                    *display,
                     details.clone(),
                 );
             }

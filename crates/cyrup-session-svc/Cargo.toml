@@ -62,6 +62,11 @@ async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 time = { workspace = true }
+# `src/export/mod.rs` base64-encodes the exported `SessionData` payload into the document's
+# `<script id="session-data">`, mirroring pi's `Buffer.from(JSON.stringify(…)).toString("base64")`
+# (`core/export-html/index.ts:160` @v0.84.4). Already in the lockfile (cyrup-provider); this
+# promotes the crate's own dev-dependency edge to a normal one and adds no new crate.
+base64 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
@@ -78,7 +83,11 @@ cyrup-tools = { workspace = true }
 # Lock-neutral: cyrup-provider is already a dependency; `faux` pulls no new crate.
 cyrup-provider = { workspace = true, features = ["faux"] }
 # `tests/read_image_auto_resize.rs` builds a real >2000px PNG fixture and compares the `read` tool's
-# attached base64 against the file's own bytes. Both are already in the lockfile (`image` via
-# cyrup-tools' default `inline-images`, `base64` via cyrup-provider), so this adds no new crate.
+# attached base64 against the file's own bytes. Already in the lockfile (`image` via cyrup-tools'
+# default `inline-images`), so this adds no new crate. `base64` itself is now a normal dependency
+# (see `[dependencies]`) and no longer needs an edge here.
 image = { workspace = true }
-base64 = { workspace = true }
+# `src/tests/export_html.rs` pins the SHA-256 of the five embedded `export-html` assets so a local
+# edit cannot silently fork them from pi v0.84.4. Already in the lockfile (cyrup-provider's oauth
+# PKCE path), so this adds no new crate.
+sha2 = { workspace = true }

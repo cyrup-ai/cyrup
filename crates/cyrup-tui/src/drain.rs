@@ -9,10 +9,18 @@
 //! mode goes away is **not** discarded — it is handed to the next reader of that tty, which is the
 //! user's shell. Two things are routinely in flight there:
 //!
-//! * **Kitty key-*release* events.** With `DISAMBIGUATE_ESCAPE_CODES` pushed, the final `Ctrl+D` /
-//!   `Ctrl+C` that asked for the quit also generates a release report. Over a slow SSH link that
-//!   report is still on the wire while the process is already tearing the terminal down, so it
-//!   lands in cooked mode and the shell echoes a bare `[109;5u` (or similar) at the prompt.
+//! * **The Kitty CSI-u report for the quit chord.** With `DISAMBIGUATE_ESCAPE_CODES` pushed, the
+//!   final `Ctrl+D` / `Ctrl+C` that asked for the quit arrives as `CSI 100 ; 5 u` rather than as one
+//!   byte. Over a slow SSH link that report can still be on the wire while the process is already
+//!   tearing the terminal down, so it lands in cooked mode and the shell echoes a bare `[100;5u`
+//!   (or similar) at the prompt.
+//!
+//!   `TUI-046` — this paragraph used to say *release* report, which was never true here: release
+//!   and repeat reports need `REPORT_EVENT_TYPES`, and cyrup deliberately does not push it
+//!   ([`crate::keyboard_protocol::DESIRED_FLAGS`], and that module's `[CYRUP-DELTA]` for why). The
+//!   drain's justification does not depend on the correction — a press report split across the
+//!   teardown leaks exactly the same way, and Pi drains for the same reason with the same
+//!   protocol-disable-first ordering.
 //! * **The keypress itself.** Pi's own comment at `terminal.ts:441-445` names the concrete
 //!   consequence: a buffered `Ctrl+D` re-interpreted after raw mode is off closes the parent shell,
 //!   i.e. drops an SSH session.

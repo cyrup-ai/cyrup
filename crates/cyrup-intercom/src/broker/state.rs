@@ -16,18 +16,24 @@ use tokio::sync::Notify;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::transport::framing::encode_json;
-use crate::transport::protocol::{BrokerMessage, SessionInfo};
+use crate::transport::protocol::{BrokerMessage, ScopeId, SessionInfo};
 
+use super::delivery::{DeliveryRecord, DeliveryRecordKey};
 use super::extension_state::ExtensionStateManager;
-use super::extensions::NamespaceOwner;
+use super::extensions::{NamespaceKey, NamespaceOwner};
 use super::limits::{MAX_UNREGISTERED_CONNECTIONS, MESSAGE_RECEIPT_ROUTE_RETENTION_MS};
 use super::mailbox::{DisconnectedSession, MailboxMessage};
 use super::receipts::MessageReceiptRoute;
-use super::routing::AskEdge;
+use super::routing::{AskEdge, SessionKey};
 
 /// One registered session + a handle to write to its socket (`broker.ts:32-36`).
 pub(super) struct ConnectedSession {
     pub(super) conn_id: u64,
+    /// `key` (`v0.13.0 broker/broker.ts:60`) — this session's own composite map key, stored so a
+    /// handler holding the session never has to re-derive it, and so its SCOPE
+    /// (`key.scope`) is reachable from anywhere the session is. There is deliberately no second
+    /// `scope_id` field: one place to read it, one place that can be wrong.
+    pub(super) key: SessionKey,
     pub(super) info: SessionInfo,
     pub(super) tx: UnboundedSender<Vec<u8>>,
     pub(super) last_presence_broadcast_at: u64,
@@ -55,13 +61,13 @@ pub(super) struct ConnHandle {
 /// The broker's in-memory routing state (`broker.ts:132-139`). Held behind a `std::sync::Mutex`;
 /// every handler is synchronous and never holds the guard across an `.await`.
 pub(super) struct BrokerState {
-    pub(super) sessions: HashMap<String, ConnectedSession>,
-    /// Registered session ids in **join order**. `broker.ts:133` holds the sessions in a JS `Map`,
+    pub(super) sessions: HashMap<SessionKey, ConnectedSession>,
+    /// Registered session keys in **join order**. `broker.ts:133` holds the sessions in a JS `Map`,
     /// which iterates in insertion order, so every consumer of the map — the `list` reply
     /// (`broker.ts:408`), presence broadcasts and name resolution — observes a stable join order.
     /// A `std::collections::HashMap` has no such guarantee, so the order is tracked alongside it,
     /// the way `unregistered` already tracks connection insertion order below.
-    pub(super) session_order: Vec<String>,
+    pub(super) session_order: Vec<SessionKey>,
     pub(super) ask_edges: HashMap<String, AskEdge>,
     /// `messageReceiptRoutes` (`v0.10.1 broker/broker.ts:100`), keyed by message id.
     pub(super) message_receipt_routes: HashMap<String, MessageReceiptRoute>,
@@ -72,12 +78,21 @@ pub(super) struct BrokerState {
     /// is `findDisconnectedSessions` (`:1010-1024`) and every one of ITS consumers is gated on
     /// `length === 1` or `length > 1` (`:596`, `:660`), so no branch can observe which element
     /// came first. Same argument as `resolve_reply_target`'s (ICOM-001).
-    pub(super) disconnected_sessions: HashMap<String, DisconnectedSession>,
+    pub(super) disconnected_sessions: HashMap<SessionKey, DisconnectedSession>,
     /// `mailboxMessages` (`v0.10.1 broker/broker.ts:102`) — an ARRAY upstream, and the order is
     /// load-bearing: [`BrokerState::queue_mailbox_message`] evicts from the FRONT at the cap
     /// (`:892-898`, FIFO) and [`BrokerState::flush_mailbox_for_session`] redelivers front-to-back
     /// (`:913`), so a peer receives its parked mail in the order it was sent.
     pub(super) mailbox_messages: Vec<MailboxMessage>,
+    /// `deliveryRecords` (`v0.13.0 broker/broker.ts:208`), keyed by `(sender key, message id)` —
+    /// ICOM-054's exactly-once-per-authored-content store.
+    pub(super) delivery_records: HashMap<DeliveryRecordKey, DeliveryRecord>,
+    /// Insertion order for [`Self::delivery_records`], because the cap evicts the OLDEST INSERTED
+    /// entry (`this.deliveryRecords.keys().next().value`, `v0.13.0 broker/broker.ts:1082-1085`) and
+    /// a `HashMap`'s iteration order is arbitrary. Same device as [`Self::session_order`] and
+    /// [`Self::unregistered`]; an in-place `update_delivery_record` must not disturb it, because a
+    /// JS `Map.set` on an existing key keeps that key's original position.
+    pub(super) delivery_record_order: Vec<DeliveryRecordKey>,
     pub(super) connections: HashMap<u64, ConnHandle>,
     /// Unregistered connection ids in insertion order (for oldest-eviction, `broker.ts:256-268`).
     pub(super) unregistered: Vec<u64>,
@@ -118,7 +133,7 @@ pub(super) struct BrokerState {
     /// idempotent (`v0.9.2 broker/client.ts:538-552`), so no peer can observe the difference — and a
     /// `HashMap` here WOULD be observable as nondeterminism across runs, which is the failure
     /// `session_order` exists to prevent.
-    pub(super) namespace_owners: BTreeMap<String, NamespaceOwner>,
+    pub(super) namespace_owners: BTreeMap<NamespaceKey, NamespaceOwner>,
     /// `nextOwnerOrder = 1` (`v0.9.2 broker/broker.ts:226`).
     pub(super) next_owner_order: u64,
     /// `extensionStateManager` (`v0.9.2 broker/broker.ts:227,232`).
@@ -145,6 +160,8 @@ impl BrokerState {
             message_receipt_routes: HashMap::new(),
             disconnected_sessions: HashMap::new(),
             mailbox_messages: Vec::new(),
+            delivery_records: HashMap::new(),
+            delivery_record_order: Vec::new(),
             connections: HashMap::new(),
             unregistered: Vec::new(),
             ask_timeout_ms,
@@ -212,29 +229,42 @@ impl BrokerState {
 
     /// The registered sessions in join order — the Rust equivalent of iterating pi's
     /// `this.sessions` JS `Map` (`broker.ts:133`).
-    pub(super) fn sessions_in_order(&self) -> impl Iterator<Item = (&String, &ConnectedSession)> {
+    pub(super) fn sessions_in_order(
+        &self,
+    ) -> impl Iterator<Item = (&SessionKey, &ConnectedSession)> {
         self.session_order
             .iter()
-            .filter_map(|id| self.sessions.get_key_value(id))
+            .filter_map(|key| self.sessions.get_key_value(key))
     }
 
     /// `this.sessions.set(id, …)` (`broker.ts:376`). JS `Map.set` on an **existing** key keeps
     /// that key's original position, so an identity takeover must not move the session to the back
     /// of the join order.
-    pub(super) fn insert_session(&mut self, id: String, session: ConnectedSession) {
-        if self.sessions.insert(id.clone(), session).is_none() {
-            self.session_order.push(id);
+    pub(super) fn insert_session(&mut self, key: SessionKey, session: ConnectedSession) {
+        if self.sessions.insert(key.clone(), session).is_none() {
+            self.session_order.push(key);
         }
     }
 
-    /// `this.sessions.delete(id)` (`broker.ts:243,394`).
-    pub(super) fn remove_session(&mut self, id: &str) {
-        if self.sessions.remove(id).is_some() {
-            self.session_order.retain(|s| s != id);
+    /// `this.sessions.delete(key)` (`broker.ts:243,394`).
+    pub(super) fn remove_session(&mut self, key: &SessionKey) {
+        if self.sessions.remove(key).is_some() {
+            self.session_order.retain(|s| s != key);
         }
     }
 
-    pub(super) fn broadcast(&self, msg: &BrokerMessage, exclude: Option<&str>) {
+    /// `broadcast(msg, exclude, scopeId)` (`v0.13.0 broker/broker.ts:1312-1318`).
+    ///
+    /// `scope` is the ORIGINATING session's scope: a `session_joined` / `session_left` /
+    /// `presence_update` never crosses the boundary, so a scoped session's very existence is
+    /// invisible outside it. Passing `None` broadcasts to the unscoped class only — unscoped is a
+    /// scope, not a wildcard.
+    pub(super) fn broadcast(
+        &self,
+        msg: &BrokerMessage,
+        exclude: Option<&SessionKey>,
+        scope: Option<&ScopeId>,
+    ) {
         let frame = match encode_json(msg) {
             Ok(f) => f,
             Err(e) => {
@@ -242,16 +272,11 @@ impl BrokerState {
                 return;
             }
         };
-        for (id, session) in self.sessions_in_order() {
-            if Some(id.as_str()) != exclude {
+        for (key, session) in self.sessions_in_order() {
+            if Some(key) != exclude && key.in_scope(scope) {
                 let _ = session.tx.send(frame.clone());
             }
         }
-    }
-
-    pub(super) fn clear_ask_edges_for_session(&mut self, session_id: &str) {
-        self.ask_edges
-            .retain(|_, edge| edge.from != session_id && edge.to != session_id);
     }
 
     pub(super) fn prune_ask_edges(&mut self, now: u64) {
@@ -261,9 +286,9 @@ impl BrokerState {
     }
 
     /// `clearMessageReceiptRoutesForSession` (`v0.10.1 broker/broker.ts:979-985`).
-    pub(super) fn clear_message_receipt_routes_for_session(&mut self, session_id: &str) {
+    pub(super) fn clear_message_receipt_routes_for_session(&mut self, key: &SessionKey) {
         self.message_receipt_routes
-            .retain(|_, route| route.from != session_id && route.to != session_id);
+            .retain(|_, route| &route.from != key && &route.to != key);
     }
 
     /// `pruneMessageReceiptRoutes` (`v0.10.1 broker/broker.ts:971-977`).
@@ -276,8 +301,12 @@ impl BrokerState {
     /// `Array.from(this.sessions.values()).map(s => s.info)` (`broker.ts:408`) — join-ordered,
     /// because pi's `Map` iterates in insertion order and neither `index.ts`'s `list` handler nor
     /// `ui/session-list.ts` re-sorts the reply.
-    pub(super) fn session_infos(&self) -> Vec<SessionInfo> {
+    /// ICOM-055 — `.filter(session => sameScope(session.scopeId, requester.scopeId))`
+    /// (`v0.13.0 broker/broker.ts:596-597`). The roster is scope-relative, which is what makes a
+    /// client-side filter unnecessary: `intercom{list}` renders whatever the broker hands it.
+    pub(super) fn session_infos_in_scope(&self, scope: Option<&ScopeId>) -> Vec<SessionInfo> {
         self.sessions_in_order()
+            .filter(|(key, _)| key.in_scope(scope))
             .map(|(_, s)| s.info.clone())
             .collect()
     }
@@ -288,9 +317,13 @@ impl BrokerState {
     /// (pi `existing?.socket === socket`).
     ///
     /// **The departing session's ask edges are deliberately NOT cleared**, and that is upstream's
-    /// mechanism, not an omission: `clearAskEdgesForSession` has exactly one call site in
+    /// mechanism, not an omission: `clearAskEdgesForSession` had exactly one call site in
     /// `broker.ts` — the register-time identity takeover at `:350` — at every tag from v0.9.2 to
-    /// v0.10.1. An edge toward a departed session is what `flushMailboxForSession` re-points at
+    /// v0.10.1, and `636f61e` (v0.11.0, ICOM-054) REMOVED even that one, leaving the method dead at
+    /// `v0.13.0 broker/broker.ts:1176`. The endpoint epoch is what now invalidates a stale send, so
+    /// wiping a replaced endpoint's ask edges became both unnecessary and harmful; this port
+    /// therefore has no such method at all. An edge toward a departed session is what
+    /// `flushMailboxForSession` re-points at
     /// `:936-939` when that identity comes back, so clearing it here would make every parked ask
     /// undeliverable-as-a-reply ("Reply target does not match a pending ask") the moment the peer
     /// reconnected. The edges instead expire on `pruneAskEdges`' `askTimeoutMs`, exactly as they do
@@ -298,25 +331,30 @@ impl BrokerState {
     pub(super) fn on_connection_closed(
         &mut self,
         conn_id: u64,
-        session_id: &Option<String>,
+        session_key: &Option<SessionKey>,
         now: u64,
     ) -> bool {
         self.connections.remove(&conn_id);
         self.remove_unregistered(conn_id);
-        if let Some(sid) = session_id
-            && self.sessions.get(sid).map(|s| s.conn_id) == Some(conn_id)
+        if let Some(key) = session_key
+            && self.sessions.get(key).map(|s| s.conn_id) == Some(conn_id)
         {
-            if let Some(existing) = self.sessions.get(sid) {
+            if let Some(existing) = self.sessions.get(key) {
                 let info = existing.info.clone();
-                self.remember_disconnected_session(info, now);
+                self.remember_disconnected_session(key.clone(), info, now);
             }
-            self.remove_session(sid);
-            self.clear_message_receipt_routes_for_session(sid);
+            self.remove_session(key);
+            self.clear_message_receipt_routes_for_session(key);
+            // `this.broadcast({ type: "session_left", sessionId: existing.info.id }, sessionKey,
+            // existing.scopeId)` (`v0.13.0 broker/broker.ts:327`). The WIRE still carries the bare
+            // session id: `scopeId` exists on the register frame and nowhere else, so a peer never
+            // learns that scopes exist, let alone which one it is in.
             self.broadcast(
                 &BrokerMessage::SessionLeft {
-                    session_id: sid.clone(),
+                    session_id: key.id.clone(),
                 },
-                Some(sid),
+                Some(key),
+                key.scope.as_ref(),
             );
             // `this.recomputeNamespaceOwners()` (`v0.9.2 broker/broker.ts:337`) — this is what
             // re-elects a namespace whose owner just died.
@@ -347,9 +385,13 @@ mod tests {
         let joined: Vec<String> = (0..16u64).map(|i| format!("session-{i}")).collect();
         for (conn_id, id) in joined.iter().enumerate() {
             let mut sid = None;
-            register(&mut state, conn_id as u64, &mut sid, id);
+            register(&mut state, conn_id as u64, &mut sid, id, None);
         }
-        let listed: Vec<String> = state.session_infos().into_iter().map(|s| s.id).collect();
+        let listed: Vec<String> = state
+            .session_infos_in_scope(None)
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
         assert_eq!(
             listed, joined,
             "`list` must report sessions in join order, like pi's Map"
@@ -358,22 +400,32 @@ mod tests {
         // An identity takeover is `this.sessions.set(id, …)` on an EXISTING key, which in JS keeps
         // that key's original position (`broker.ts:376`) — it must not jump to the back.
         let mut sid = None;
-        register(&mut state, 900, &mut sid, "session-3");
-        let after_takeover: Vec<String> = state.session_infos().into_iter().map(|s| s.id).collect();
+        register(&mut state, 900, &mut sid, "session-3", None);
+        let after_takeover: Vec<String> = state
+            .session_infos_in_scope(None)
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
         assert_eq!(
             after_takeover, joined,
             "a re-register must keep the session's original position"
         );
 
         // `this.sessions.delete(id)` drops it from the order and leaves the rest intact.
-        let mut sid = Some("session-7".to_string());
+        let mut sid = Some(super::super::routing::SessionKey::unscoped(
+            "session-7".to_string(),
+        ));
         state.handle_unregister(7, &make_tx(), &mut sid, 0);
         let expected: Vec<String> = joined
             .iter()
             .filter(|id| *id != "session-7")
             .cloned()
             .collect();
-        let after_leave: Vec<String> = state.session_infos().into_iter().map(|s| s.id).collect();
+        let after_leave: Vec<String> = state
+            .session_infos_in_scope(None)
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
         assert_eq!(
             after_leave, expected,
             "a departure must not disturb the surviving join order"

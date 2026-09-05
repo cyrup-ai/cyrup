@@ -8,9 +8,9 @@ use serde_json::Value;
 
 use super::layer::Settings;
 use super::types::{
-    BranchSummarySettings, CompactionSettings, DefaultProjectTrust, FullscreenScrollbar,
-    MermaidRenderingMode, PackageSource, ProviderRetrySettings, RetrySettings, ThinkingBudgets,
-    TuiMode, Warnings,
+    BranchSummarySettings, CompactionSettings, DefaultProjectTrust, FullscreenExitOutput,
+    FullscreenScrollbar, MermaidRenderingMode, PackageSource, ProviderRetrySettings, RetrySettings,
+    ThinkingBudgets, TuiMode, Warnings,
 };
 use crate::error::ConfigError;
 
@@ -167,6 +167,37 @@ impl EffectiveSettings {
     /// an empty `Vec` (the prior `unwrap_or_default`) lost that distinction.
     pub fn enabled_models(&self) -> Option<Vec<String>> {
         self.merged.get("enabledModels").map(|v| {
+            v.as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+    }
+
+    /// `getDefaultTools(): string[] | undefined` (Pi v0.84.4 settings-manager.ts:1273-1276, key
+    /// declared at `:128` as `defaultTools?: string[]; // Initial built-in tool selection`).
+    ///
+    /// A v0.84.4 addition (absent at v0.84.1): the INITIAL BUILT-IN tool selection a session starts
+    /// with, in place of pi's `defaultActiveToolNames` (`read`/`bash`/`edit`/`write`, sdk.ts:256).
+    /// Ported as a plain passthrough — upstream's getter only makes a defensive copy and validates
+    /// nothing, so an unknown name is carried through and simply matches no tool.
+    ///
+    /// `None` (unset) and `Some(vec![])` (an explicit empty list) are DIFFERENT, exactly as for
+    /// [`Self::enabled_models`]: unset means "pi's own four built-ins", empty means "no built-ins at
+    /// all". Extension/SDK tools are unaffected either way — see the consumer in
+    /// `cyrup-session-svc`'s `select_active_tools`.
+    ///
+    /// Tag-to-tag (ADR-0006): the key landed at `4d9aa837c` ("add configurable default tools") as an
+    /// `allowedToolNames` allowlist, which also SUPPRESSED extension and SDK custom tools;
+    /// `541045ae0` ("preserve extension tools with defaults") narrowed it to the initial built-in
+    /// selection before v0.84.4 shipped. v0.84.4's behaviour — selection, not allowlist — is what is
+    /// ported here.
+    pub fn default_tools(&self) -> Option<Vec<String>> {
+        self.merged.get("defaultTools").map(|v| {
             v.as_array()
                 .map(|a| {
                     a.iter()
@@ -494,6 +525,39 @@ impl EffectiveSettings {
             Some("hidden") => FullscreenScrollbar::Hidden,
             _ => FullscreenScrollbar::Auto,
         }
+    }
+
+    /// `fullscreenExitOutput` — what leaving the alternate screen puts on the main screen, default
+    /// `transcript` (Pi `getFullscreenExitOutput`, settings-manager.ts:1212-1214 @v0.84.4:
+    /// `this.settings.fullscreenExitOutput === "resume-hint" ? "resume-hint" : "transcript"`).
+    /// CFG-078.
+    ///
+    /// Same degrade-don't-reject contract as [`Self::tui_mode`] — upstream tests it directly, with
+    /// `{"fullscreenExitOutput":"nothing"}` reading back as `"transcript"`
+    /// (`test/settings-manager.test.ts:471-474` @v0.84.4) — and the same preservation guarantee for
+    /// the value on disk. The key is documented "no effect in regular TUI mode" (`:143`); that
+    /// conditionality belongs to the renderer, not to this accessor.
+    pub fn fullscreen_exit_output(&self) -> FullscreenExitOutput {
+        match self.merged.get_str("fullscreenExitOutput").as_deref() {
+            Some("resume-hint") => FullscreenExitOutput::ResumeHint,
+            _ => FullscreenExitOutput::Transcript,
+        }
+    }
+
+    /// `fullscreenCopyOnSelect` — whether ending a fullscreen text selection copies it to the
+    /// clipboard, default `true` (Pi `getFullscreenCopyOnSelect`, settings-manager.ts:1233-1235
+    /// @v0.84.4: `this.settings.fullscreenCopyOnSelect ?? true`). CFG-078.
+    ///
+    /// `??`, not `||`, so only an ABSENT (or null) key defaults — an explicit `false` is honoured.
+    /// The merged layer's `get_bool` answers `None` for a non-boolean, which is the
+    /// nearest reading of a TypeScript field typed `boolean | undefined`: a `"false"` STRING is not
+    /// a boolean, and pi would hand it to `if (this.copyOnSelect)` as a truthy value. That one
+    /// mis-typed-value edge is the only place the two implementations differ here, and both end at
+    /// "copy on select stays on".
+    pub fn fullscreen_copy_on_select(&self) -> bool {
+        self.merged
+            .get_bool("fullscreenCopyOnSelect")
+            .unwrap_or(true)
     }
 
     /// `showHardwareCursor` — the setting takes precedence, then the

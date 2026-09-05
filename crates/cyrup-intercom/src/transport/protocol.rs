@@ -89,6 +89,14 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// `broker::extension_state`). The constant exists so the negotiated name is stated once, next to
 /// the union that carries it.
 pub const EXTENSION_BUS_FEATURE: &str = "extension-bus-v1";
+/// `EXACT_SEND_FEATURE = "exact-send-v1"` (`v0.13.0 types.ts:2`, added by `636f61e` at v0.11.0) —
+/// the second value pi's broker advertises in `registered.features`.
+///
+/// ICOM-054: it tells a client this broker mints [`SessionInfo::endpoint_epoch`] and honours the
+/// `targetId`/`targetEpoch` pair on `send`. Gated exactly like the bus feature — a conforming client
+/// that does not see it never sends the pair (`v0.13.0 broker/client.ts:671`), so a v0.9.2 broker
+/// keeps receiving the v0.9.2 frame byte-for-byte.
+pub const EXACT_SEND_FEATURE: &str = "exact-send-v1";
 
 /// `Number.MAX_SAFE_INTEGER` (2^53 - 1) — the bound `Number.isSafeInteger` enforces.
 const JS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
@@ -243,6 +251,23 @@ pub fn as_epoch_ms(value: &serde_json::Number) -> Option<u64> {
 pub struct SessionInfo {
     /// Broker-assigned session id (`v0.9.2 broker/client.ts:160`).
     pub id: String,
+    /// `endpointEpoch` (`v0.13.0 types.ts:14-16`): "Broker-owned lifetime of this live endpoint."
+    ///
+    /// Minted fresh by the broker on EVERY `register` (`v0.13.0 broker/broker.ts:466`), a stable-id
+    /// takeover included — the id names the identity, this names the particular socket binding of
+    /// it, and that distinction is the only fact that makes a stale send detectable. Never supplied
+    /// by a client: `SessionRegistration` omits it upstream (`v0.13.0 types.ts:102`) and
+    /// [`SessionRegistration`] does not model it here.
+    ///
+    /// `[NON-NULL]`, per `isSessionInfo`'s guard (`v0.13.0 broker/protocol.ts:142-144`): absent is
+    /// legal (a pre-v0.11.0 broker mints none, and the client then degrades to a plain name-routed
+    /// send), a non-string is fatal.
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub endpoint_epoch: Option<String>,
     /// Optional presence name (`v0.9.2 broker/client.ts:170-172`).
     #[serde(
         default,
@@ -849,6 +874,200 @@ pub struct SessionRegistration {
     pub extra: UnknownFields,
 }
 
+/// An intercom routing scope — the broker's opaque isolation boundary (`scopeId`,
+/// `v0.13.0 types.ts:107`), resolved from `CYRUP_INTERCOM_SCOPE_ID` by
+/// [`crate::config::intercom_scope_id`] and carried on the `register` frame only.
+///
+/// **Parsed, never validated after the fact.** The inner string is private and the only
+/// constructor is [`ScopeId::parse`], which is `normalizeScopeId`'s trim
+/// (`v0.13.0 broker/broker.ts:140-141`) and `getIntercomScopeId`'s `?.trim()` truthiness test
+/// (`v0.13.0 config.ts:22-23`) in one place. That makes two states unrepresentable rather than
+/// merely unlikely: an UNTRIMMED scope, which would silently split one intended boundary in two
+/// (`"a"` and `" a"` are different map keys), and a BLANK scope, which would be an isolation class
+/// no unscoped session could reach — the exact inverse of the opt-in guarantee, since upstream's
+/// `trimmed ? trimmed : undefined` makes whitespace-only mean *unscoped*.
+///
+/// `Option<ScopeId>` is therefore the whole domain: `None` is the unscoped class every session
+/// registers into today, and `sameScope` (`:144-146`, a plain `===` over `string | undefined`) is
+/// the derived `PartialEq`.
+///
+/// There is deliberately no `Deserialize`: a wire value reaches this type only through
+/// [`scope_id_field`], which applies the same parse.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
+#[serde(transparent)]
+pub struct ScopeId(String);
+
+impl ScopeId {
+    /// `normalizeScopeId`'s non-fatal half (`v0.13.0 broker/broker.ts:140-141`) and the whole of
+    /// `getIntercomScopeId` (`v0.13.0 config.ts:21-24`): trim, and treat the empty result as
+    /// UNSCOPED rather than as an error.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(Self(trimmed.to_string()))
+        }
+    }
+
+    /// The normalized scope string, as it appears on the register frame.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// `normalizeScopeId(value)` (`v0.13.0 broker/broker.ts:133-142`) as a serde field deserializer,
+/// for [`ClientMessage::Register`]'s `scopeId`.
+///
+/// All three of upstream's arms, in upstream's order: an ABSENT key is `undefined` → unscoped
+/// (supplied by `#[serde(default)]`, so this function never runs for it); a PRESENT-but-not-a-string
+/// value — an explicit `null` included, since `typeof null !== "string"` — is a `throw`, i.e. a
+/// decode error, because a malformed scope must never silently degrade to "global"; and a
+/// whitespace-only string trims to unscoped and is *not* fatal.
+///
+/// # Errors
+/// Propagates serde's error for a present value that is not a string.
+fn scope_id_field<'de, D>(deserializer: D) -> Result<Option<ScopeId>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    Ok(ScopeId::parse(&raw))
+}
+
+/// `DeliveryState` (`v0.13.0 types.ts:4`) — the crate-facing union of both acks' states.
+///
+/// ICOM-054. Kept wide because [`crate::transport::client::SendResult`] reports one value for
+/// either ack; the two ack frames themselves are narrower and say so in their own types
+/// ([`DeliveredState`], [`FailedState`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryState {
+    /// Handed to a live target's socket.
+    SocketDelivered,
+    /// Parked in the broker mailbox for a disconnected target.
+    Queued,
+    /// Refused; the accompanying code says why.
+    Failed,
+    /// The outcome is genuinely not known. The BROKER never emits this — it is what
+    /// [`crate::transport::client`] reports when a connection drops with sends in flight, the one
+    /// case pi answers by rejecting the promise instead of resolving it.
+    Unknown,
+}
+
+/// The `delivered` ack's acceptance set (`v0.13.0 broker/client.ts:375-386`): `socket_delivered` or
+/// `queued` ONLY — a `delivered` frame carrying `"failed"` throws upstream, i.e. destroys the
+/// connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveredState {
+    /// Handed to a live target's socket.
+    SocketDelivered,
+    /// Parked in the broker mailbox for a disconnected target.
+    Queued,
+}
+
+/// The `delivery_failed` ack's acceptance set (`v0.13.0 broker/client.ts:392-403`): `failed` or
+/// `unknown` ONLY.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailedState {
+    /// Refused by the broker.
+    Failed,
+    /// Outcome unknown.
+    Unknown,
+}
+
+impl DeliveryState {
+    /// The wire spelling, for the places the crate reports a delivery state inside prose
+    /// (`latestDeliveryState`'s fallback, `v0.13.0 index.ts:2452`).
+    #[must_use]
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::SocketDelivered => "socket_delivered",
+            Self::Queued => "queued",
+            Self::Failed => "failed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl From<DeliveredState> for DeliveryState {
+    fn from(value: DeliveredState) -> Self {
+        match value {
+            DeliveredState::SocketDelivered => Self::SocketDelivered,
+            DeliveredState::Queued => Self::Queued,
+        }
+    }
+}
+
+impl From<FailedState> for DeliveryState {
+    fn from(value: FailedState) -> Self {
+        match value {
+            FailedState::Failed => Self::Failed,
+            FailedState::Unknown => Self::Unknown,
+        }
+    }
+}
+
+/// The optional exact-target pair on `send` (`v0.13.0 types.ts:111`): bind this send to one exact
+/// live endpoint, so a broker that has since replaced that endpoint refuses it instead of routing
+/// the message to whatever the NAME resolves to now.
+///
+/// ICOM-054. The both-or-neither rule is enforced by the **constructors**, not by `Deserialize`,
+/// and that split is upstream's rather than a shortcut. pi checks `ownerId`/`ownerEpoch` inside a
+/// type guard, so a half-set pair destroys the connection ([`ExtensionOwnerRef`] reproduces that);
+/// it checks `targetId`/`targetEpoch` inside `case "send"` (`v0.13.0 broker/broker.ts:624-633`) and
+/// answers a half-set, non-string or empty-string pair with a `delivery_failed` carrying
+/// `E_INVALID_TARGET`. Rejecting it here would make cyrup fatally stricter than pi on a frame pi
+/// merely refuses, so the decode stays permissive and the rule lives in [`crate::broker`]'s send
+/// handler, where pi puts it.
+///
+/// The fields are private and the only two ways to build one in Rust are [`Self::default`]
+/// (neither) and [`Self::bound`] (both), so a cyrup client cannot EMIT a half-set pair; the single
+/// reader, [`Self::as_pair`], hands back both halves or nothing, so no caller can use one half
+/// alone.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExactTarget {
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
+    target_id: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
+    target_epoch: Option<String>,
+}
+
+impl ExactTarget {
+    /// Bind a send to `target_id` at exactly `target_epoch`
+    /// (`{ targetId, targetEpoch }`, `v0.13.0 broker/client.ts:653`).
+    #[must_use]
+    pub fn bound(target_id: impl Into<String>, target_epoch: impl Into<String>) -> Self {
+        Self {
+            target_id: Some(target_id.into()),
+            target_epoch: Some(target_epoch.into()),
+        }
+    }
+
+    /// Both halves, or `None` when neither is set — the only reader.
+    ///
+    /// A decoded half-set pair (which only a non-cyrup peer can produce) also answers `None`; the
+    /// broker distinguishes that case from "absent" by looking at the raw frame, exactly as
+    /// upstream's `hasTargetId !== hasTargetEpoch` does.
+    #[must_use]
+    pub fn as_pair(&self) -> Option<(&str, &str)> {
+        Some((self.target_id.as_deref()?, self.target_epoch.as_deref()?))
+    }
+}
+
 /// Client → broker messages (`v0.9.2 types.ts:77-101`).
 ///
 /// The full v0.9.2 tag set is modelled even where cyrup neither sends nor acts on a tag, because
@@ -887,6 +1106,28 @@ pub enum ClientMessage {
             skip_serializing_if = "Option::is_none"
         )]
         state_id: Option<String>,
+        /// The broker routing scope this session registers into (`scopeId`,
+        /// `v0.13.0 types.ts:107`, filled in from `CYRUP_INTERCOM_SCOPE_ID` by
+        /// [`crate::transport::client::IntercomClient::connect_target`], mirroring
+        /// `...(scopeId ? { scopeId } : {})` at `v0.13.0 broker/client.ts:286-292`).
+        ///
+        /// **Absent — never null, never blank — for an unscoped session**, which is what keeps an
+        /// unscoped register frame byte-identical to the pre-scope one and therefore keeps a
+        /// scope-aware broker wire-compatible with an older client and vice versa. Normalized on
+        /// the way in by [`scope_id_field`], this crate's `normalizeScopeId`
+        /// (`v0.13.0 broker/broker.ts:133-142`).
+        ///
+        /// The broker does not enforce anything through THIS field: it reads raw
+        /// `serde_json::Value` frames and never deserializes a `ClientMessage` (see
+        /// `broker/js.rs`), so the enforcement copy lives at the register handler. This variant is
+        /// the crate's statement of the wire shape, and the `skip_serializing_if` is what the write
+        /// path depends on.
+        #[serde(
+            default,
+            deserialize_with = "scope_id_field",
+            skip_serializing_if = "Option::is_none"
+        )]
+        scope_id: Option<ScopeId>,
     },
     /// Unregister this session (`v0.9.2 types.ts:79`).
     Unregister,
@@ -907,6 +1148,11 @@ pub enum ClientMessage {
         to: String,
         /// The message to deliver.
         message: Message,
+        /// Bind this send to one exact live endpoint — both halves or neither
+        /// (`v0.13.0 types.ts:111`). [`ExactTarget::default`] serialises to nothing, which is the
+        /// v0.9.2 frame byte-for-byte, so an unbound send is unchanged on the wire.
+        #[serde(flatten)]
+        target: ExactTarget,
     },
     /// Report what happened to a message this session received (`v0.9.2 types.ts:83`). A pi >= 0.9.0
     /// client sends this unprompted on its first inbound message.
@@ -1091,17 +1337,82 @@ pub enum BrokerMessage {
         /// The error text.
         error: String,
     },
-    /// A `send` was delivered (`v0.9.2 broker/client.ts:441-456`).
+    /// A `send` was delivered (`v0.9.2 broker/client.ts:441-456`; `DeliveryDetails` spread added at
+    /// v0.11.0, `v0.13.0 types.ts:140`).
+    ///
+    /// ICOM-054: all four detail fields are OPTIONAL on the wire, because upstream's own
+    /// `cancel_message` arms answer with a BARE `{ type: "delivered", messageId }`
+    /// (`v0.13.0 broker/broker.ts:829,856`) and because a pre-v0.11.0 broker emits none. The
+    /// client's defaults (`:386`) fill them in.
     Delivered {
         /// The delivered message id.
         message_id: String,
+        /// Absent ⇒ `socket_delivered` (`v0.13.0 broker/client.ts:386`).
+        #[serde(
+            default,
+            deserialize_with = "present_non_null",
+            skip_serializing_if = "Option::is_none"
+        )]
+        delivery: Option<DeliveredState>,
+        /// A broker code; never set on a success in practice, modelled because
+        /// `DeliveryDetails` carries it on both acks.
+        #[serde(
+            default,
+            deserialize_with = "present_non_null",
+            skip_serializing_if = "Option::is_none"
+        )]
+        code: Option<String>,
+        /// Absent ⇒ `false` (`v0.13.0 broker/client.ts:388`).
+        #[serde(
+            default,
+            deserialize_with = "present_non_null",
+            skip_serializing_if = "Option::is_none"
+        )]
+        retryable: Option<bool>,
+        /// Absent ⇒ `true` (`v0.13.0 broker/client.ts:389`).
+        #[serde(
+            default,
+            deserialize_with = "present_non_null",
+            skip_serializing_if = "Option::is_none"
+        )]
+        outcome_known: Option<bool>,
     },
-    /// A `send` could not be delivered (`v0.9.2 broker/client.ts:458-473`).
+    /// A `send` could not be delivered (`v0.9.2 broker/client.ts:458-473`; `DeliveryDetails` spread
+    /// added at v0.11.0, `v0.13.0 types.ts:141`).
     DeliveryFailed {
         /// The message id that failed.
         message_id: String,
         /// The failure reason.
         reason: String,
+        /// Absent ⇒ `failed` (`v0.13.0 broker/client.ts:403`).
+        #[serde(
+            default,
+            deserialize_with = "present_non_null",
+            skip_serializing_if = "Option::is_none"
+        )]
+        delivery: Option<FailedState>,
+        /// The machine-readable code, e.g. `E_TARGET_REBOUND` — what
+        /// [`crate::transport::client::IntercomClient::send`] keys its single retry on.
+        #[serde(
+            default,
+            deserialize_with = "present_non_null",
+            skip_serializing_if = "Option::is_none"
+        )]
+        code: Option<String>,
+        /// Absent ⇒ `false`.
+        #[serde(
+            default,
+            deserialize_with = "present_non_null",
+            skip_serializing_if = "Option::is_none"
+        )]
+        retryable: Option<bool>,
+        /// Absent ⇒ `true`.
+        #[serde(
+            default,
+            deserialize_with = "present_non_null",
+            skip_serializing_if = "Option::is_none"
+        )]
+        outcome_known: Option<bool>,
     },
     /// A receipt forwarded back to the original sender (`v0.9.2 types.ts:113`, guarded at
     /// `v0.9.2 broker/client.ts:475-482`).
@@ -1175,6 +1486,71 @@ pub enum BrokerMessage {
     },
 }
 
+impl BrokerMessage {
+    /// `writeDeliverySuccess` (`v0.13.0 broker/broker.ts:1035-1037`) — a full `delivered` ack.
+    #[must_use]
+    pub fn delivered(message_id: impl Into<String>, delivery: DeliveredState) -> Self {
+        Self::Delivered {
+            message_id: message_id.into(),
+            delivery: Some(delivery),
+            code: None,
+            retryable: Some(false),
+            outcome_known: Some(true),
+        }
+    }
+
+    /// The BARE `delivered` ack `cancel_message` answers with
+    /// (`writeMessage(socket, { type: "delivered", messageId })`,
+    /// `v0.13.0 broker/broker.ts:829,856`).
+    ///
+    /// `636f61e` rewrote every OTHER `delivered` through `writeDeliverySuccess` and deliberately
+    /// left these two alone, so the client's absent-field defaults are what supply the details.
+    /// Reproducing that asymmetry is why the four fields are optional on the wire.
+    #[must_use]
+    pub fn delivered_bare(message_id: impl Into<String>) -> Self {
+        Self::Delivered {
+            message_id: message_id.into(),
+            delivery: None,
+            code: None,
+            retryable: None,
+            outcome_known: None,
+        }
+    }
+
+    /// `writeDeliveryFailure` (`v0.13.0 broker/broker.ts:1039-1041`), whose `retryable` parameter
+    /// defaults to `false`.
+    #[must_use]
+    pub fn delivery_failed(
+        message_id: impl Into<String>,
+        reason: impl Into<String>,
+        code: impl Into<String>,
+        retryable: bool,
+    ) -> Self {
+        Self::DeliveryFailed {
+            message_id: message_id.into(),
+            reason: reason.into(),
+            delivery: Some(FailedState::Failed),
+            code: Some(code.into()),
+            retryable: Some(retryable),
+            outcome_known: Some(true),
+        }
+    }
+
+    /// The BARE `delivery_failed` `cancel_message` answers an unowned message with
+    /// (`v0.13.0 broker/broker.ts:835-839`), which `636f61e` also left without a code.
+    #[must_use]
+    pub fn delivery_failed_bare(message_id: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::DeliveryFailed {
+            message_id: message_id.into(),
+            reason: reason.into(),
+            delivery: None,
+            code: None,
+            retryable: None,
+            outcome_known: None,
+        }
+    }
+}
+
 /// The health handshake (`v0.9.2 broker/spawn.ts:104-113,302-306`) — NOT in the TS
 /// `ClientMessage`/`BrokerMessage` unions; used only by discovery (`transport::spawn`) and answered
 /// by the broker (`v0.9.2 broker/broker.ts:404-417`).
@@ -1245,6 +1621,7 @@ mod tests {
             },
             session_id: Some("sess-1".to_string()),
             state_id: None,
+            scope_id: None,
         };
         let v: serde_json::Value = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["type"], "register");
@@ -1253,18 +1630,200 @@ mod tests {
         assert_eq!(v["session"]["lastActivity"], 2);
         // state_id omitted when None.
         assert!(v.get("stateId").is_none());
+        // ICOM-055 — and `scopeId` likewise, which is half of the opt-in guarantee: an unscoped
+        // register frame must be byte-identical to the pre-scope one
+        // (`...(scopeId ? { scopeId } : {})`, `v0.13.0 broker/client.ts:291`).
+        assert!(v.get("scopeId").is_none());
+    }
+
+    /// ICOM-055 — `normalizeScopeId` (`v0.13.0 broker/broker.ts:133-142`) as this crate's
+    /// [`scope_id_field`], on the one path that actually deserializes a `ClientMessage`.
+    ///
+    /// Three arms, upstream's: absent is unscoped, whitespace-only trims TO unscoped without being
+    /// fatal, and a present non-string (an explicit `null` included, since
+    /// `typeof null !== "string"`) is a decode error — upstream's `throw`, which the broker turns
+    /// into `socket.destroy`. A malformed scope must never quietly become "global".
+    #[test]
+    fn register_scope_id_is_normalized_and_a_non_string_is_a_decode_error() {
+        let base = serde_json::json!({
+            "type": "register",
+            "session": { "cwd": "/w", "model": "m", "pid": 1, "startedAt": 0, "lastActivity": 0 },
+        });
+        let with = |scope: serde_json::Value| {
+            let mut v = base.clone();
+            v["scopeId"] = scope;
+            serde_json::from_value::<ClientMessage>(v)
+        };
+        // Extracted rather than matched-with-a-panic: this module's test block allows
+        // `unwrap`/`expect` but the crate denies `panic!` everywhere (arch-00 §8).
+        let scope_of = |msg: ClientMessage| match msg {
+            ClientMessage::Register { scope_id, .. } => Some(scope_id),
+            _ => None,
+        };
+        assert_eq!(
+            scope_of(serde_json::from_value::<ClientMessage>(base.clone()).unwrap())
+                .expect("a register frame"),
+            None,
+            "an absent scopeId is unscoped"
+        );
+        assert_eq!(
+            scope_of(with(serde_json::json!("  alpha  ")).unwrap())
+                .expect("a register frame")
+                .as_ref()
+                .map(ScopeId::as_str),
+            Some("alpha"),
+            "a present scopeId is trimmed"
+        );
+        assert_eq!(
+            scope_of(with(serde_json::json!("   ")).unwrap()).expect("a register frame"),
+            None,
+            "a whitespace-only scopeId is unscoped, NOT an error"
+        );
+        assert!(with(serde_json::json!(7)).is_err(), "a number is fatal");
+        assert!(
+            with(serde_json::json!(null)).is_err(),
+            "an explicit null is fatal"
+        );
+    }
+
+    /// ICOM-055 — a scoped register frame carries the trimmed scope and nothing else changes.
+    #[test]
+    fn a_scoped_register_frame_carries_the_normalized_scope() {
+        let msg = ClientMessage::Register {
+            session: SessionRegistration {
+                runtime_fallback_alias: None,
+                name: None,
+                cwd: "/w".to_string(),
+                model: "m".to_string(),
+                pid: 1u64.into(),
+                started_at: 0u64.into(),
+                last_activity: 0u64.into(),
+                status: None,
+                tmux_pane: None,
+                extra: UnknownFields::default(),
+            },
+            session_id: None,
+            state_id: None,
+            scope_id: ScopeId::parse(" alpha "),
+        };
+        let v: serde_json::Value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["scopeId"], "alpha");
+    }
+
+    /// ICOM-054 — an unbound `send` must be the v0.9.2 frame BYTE-FOR-BYTE, or every pre-v0.11.0
+    /// broker sees a shape it did not agree to. [`ExactTarget::default`] serialises to nothing
+    /// because both halves are `skip_serializing_if = "Option::is_none"`.
+    #[test]
+    fn an_unbound_send_frame_carries_no_exact_target_keys() {
+        let message: Message = serde_json::from_value(serde_json::json!({
+            "id": "m1", "timestamp": 1, "content": { "text": "hi" },
+        }))
+        .expect("decodes");
+        let unbound = serde_json::to_value(ClientMessage::Send {
+            to: "peer".to_string(),
+            message: message.clone(),
+            target: ExactTarget::default(),
+        })
+        .expect("encodes");
+        assert_eq!(
+            unbound
+                .as_object()
+                .map(|o| o.keys().map(String::as_str).collect::<Vec<_>>()),
+            // `serde_json::Map` is a `BTreeMap` in this build, so the assertion is on the KEY SET,
+            // which is what matters: no `targetId`, no `targetEpoch`.
+            Some(vec!["message", "to", "type"]),
+        );
+
+        let bound = serde_json::to_value(ClientMessage::Send {
+            to: "peer".to_string(),
+            message,
+            target: ExactTarget::bound("peer-id", "epoch-1"),
+        })
+        .expect("encodes");
+        assert_eq!(bound["targetId"], "peer-id");
+        assert_eq!(bound["targetEpoch"], "epoch-1");
+    }
+
+    /// ICOM-054 — the pairing rule lives in the CONSTRUCTORS, not in `Deserialize`.
+    ///
+    /// A half-set pair off the wire decodes (pi answers it with `E_INVALID_TARGET` rather than
+    /// destroying the connection, `v0.13.0 broker/broker.ts:624-633`) but reads back as "no exact
+    /// target", so no caller can act on one half. There is no way to BUILD a half-set one in Rust.
+    #[test]
+    fn a_half_set_exact_target_decodes_but_never_reads_back_as_a_pair() {
+        let half: ExactTarget =
+            serde_json::from_value(serde_json::json!({ "targetId": "peer-id" })).expect("decodes");
+        assert_eq!(half.as_pair(), None);
+        assert_eq!(ExactTarget::default().as_pair(), None);
+        assert_eq!(
+            ExactTarget::bound("peer-id", "epoch-1").as_pair(),
+            Some(("peer-id", "epoch-1"))
+        );
+        // `[NON-NULL]` still holds on each half.
+        assert!(
+            serde_json::from_value::<ExactTarget>(
+                serde_json::json!({ "targetId": null, "targetEpoch": "e" })
+            )
+            .is_err()
+        );
+    }
+
+    /// ICOM-054 — the two ack acceptance sets are ASYMMETRIC upstream
+    /// (`v0.13.0 broker/client.ts:375,392`) and the two narrow wire enums encode that: `"failed"`
+    /// on a `delivered` frame, or `"queued"` on a `delivery_failed` frame, is a decode error here
+    /// exactly as it is a `throw` there.
+    #[test]
+    fn the_two_acks_accept_disjoint_delivery_states() {
+        let ok: BrokerMessage = serde_json::from_value(serde_json::json!({
+            "type": "delivered", "messageId": "m1", "delivery": "queued",
+            "retryable": false, "outcomeKnown": true,
+        }))
+        .expect("`queued` is legal on a `delivered` ack");
+        assert!(matches!(
+            ok,
+            BrokerMessage::Delivered {
+                delivery: Some(DeliveredState::Queued),
+                ..
+            }
+        ));
+        assert!(
+            serde_json::from_value::<BrokerMessage>(serde_json::json!({
+                "type": "delivered", "messageId": "m1", "delivery": "failed",
+            }))
+            .is_err(),
+            "`failed` on a `delivered` frame is fatal upstream"
+        );
+        assert!(
+            serde_json::from_value::<BrokerMessage>(serde_json::json!({
+                "type": "delivery_failed", "messageId": "m1", "reason": "r",
+                "delivery": "socket_delivered",
+            }))
+            .is_err(),
+            "`socket_delivered` on a `delivery_failed` frame is fatal upstream"
+        );
+        let unknown: BrokerMessage = serde_json::from_value(serde_json::json!({
+            "type": "delivery_failed", "messageId": "m1", "reason": "r", "delivery": "unknown",
+        }))
+        .expect("`unknown` is legal on a failure ack");
+        assert!(matches!(
+            unknown,
+            BrokerMessage::DeliveryFailed {
+                delivery: Some(FailedState::Unknown),
+                ..
+            }
+        ));
     }
 
     #[test]
     fn broker_delivery_failed_uses_snake_case_tag_and_camel_fields() {
-        let msg = BrokerMessage::DeliveryFailed {
-            message_id: "m1".to_string(),
-            reason: "Session not found".to_string(),
-        };
+        let msg = BrokerMessage::delivery_failed_bare("m1", "Session not found");
         let v = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["type"], "delivery_failed");
         assert_eq!(v["messageId"], "m1");
         assert_eq!(v["reason"], "Session not found");
+        // ICOM-054: a BARE ack still serialises to exactly the v0.9.2 three-key object, because
+        // every detail field is `skip_serializing_if = "Option::is_none"`.
+        assert_eq!(v.as_object().map(serde_json::Map::len), Some(3));
     }
 
     #[test]

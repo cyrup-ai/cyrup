@@ -450,6 +450,57 @@ fn the_settings_grid_offers_the_warnings_and_thinking_submenus() {
     );
 }
 
+/// CFG-078 — the two v0.84.4 alt-screen rows, withheld while this grid was measured against
+/// v0.84.1 where neither settings key existed.
+///
+/// pi: `{id:"fullscreen-exit-output", label:"Fullscreen exit output", …, values:["transcript",
+/// "resume-hint"]}` (`settings-selector.ts:680-686` @v0.84.4) and
+/// `{id:"fullscreen-copy-on-select", label:"Fullscreen copy on select", …, currentValue:
+/// config.fullscreenCopyOnSelect ? "true" : "false", values:["true","false"]}` (`:694-700`), with
+/// pi's own descriptions carried over verbatim.
+///
+/// The row `id` IS the settings key, exactly as the `tuiMode` / `fullscreenScrollbar` pair's is:
+/// `parse_setting_value` re-types neither beyond `"true"`/`"false"` → bool, which is the JSON type
+/// `fullscreenCopyOnSelect` is declared with upstream (`settings-manager.ts:145`).
+///
+/// RED at HEAD: `settings_rows` emitted neither id — the file carried a comment saying the exit
+/// row was deliberately absent — so a user could reach neither key without hand-editing
+/// `settings.json`.
+#[test]
+fn the_settings_grid_offers_the_two_v0_84_4_alt_screen_rows() {
+    let rows = crate::app::settings_rows_for_test();
+    let exit = rows
+        .iter()
+        .find(|r| r.id == "fullscreenExitOutput")
+        .expect("pi's `fullscreen-exit-output` row is missing");
+    assert_eq!(exit.label, "Fullscreen exit output");
+    assert_eq!(exit.value, "transcript", "pi's documented default");
+    assert_eq!(
+        exit.cycle,
+        vec!["transcript".to_string(), "resume-hint".to_string()],
+        "pi's `values` array, in pi's order"
+    );
+
+    let copy = rows
+        .iter()
+        .find(|r| r.id == "fullscreenCopyOnSelect")
+        .expect("pi's `fullscreen-copy-on-select` row is missing");
+    assert_eq!(copy.label, "Fullscreen copy on select");
+    assert_eq!(copy.value, "true", "pi's `?? true` default");
+    assert_eq!(
+        copy.cycle,
+        vec!["true".to_string(), "false".to_string()],
+        "a boolean row cycles pi's two spellings"
+    );
+
+    // The group's relative order is pi's for everything that was already here, and the two new rows
+    // sit after it — see the placement note in `app/settings_rows.rs`.
+    let idx = |id: &str| rows.iter().position(|r| r.id == id).expect(id);
+    assert!(idx("tuiMode") < idx("fullscreenScrollbar"));
+    assert!(idx("fullscreenScrollbar") < idx("fullscreenExitOutput"));
+    assert!(idx("fullscreenExitOutput") < idx("fullscreenCopyOnSelect"));
+}
+
 /// TUI-036 — `Show images` / `Image width` are offered ONLY on a terminal with an image protocol.
 ///
 /// Pi: `// Only show image toggle if terminal supports it` / `if (supportsImages) { items.splice(1,

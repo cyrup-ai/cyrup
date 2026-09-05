@@ -19,6 +19,7 @@ pub mod opencode;
 pub mod opencode_go;
 pub mod openrouter_images;
 pub mod radius;
+pub mod radius_share;
 pub mod together;
 
 pub use all::{

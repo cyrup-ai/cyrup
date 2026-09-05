@@ -70,6 +70,12 @@ impl AgentSession {
             // Carried on the live message too, not just the durable arm below: the steer, follow-up
             // and next-turn arms surface through `message_end`, which is the renderer's surface.
             details: details.clone(),
+            // SUBA-094 — same reason, and the same line of pi: `sendCustomMessage` puts `display` on
+            // the ONE `appMessage` it builds (`agent-session.ts:1488-1496` @v0.84.4) and hands that
+            // object to all five branches. Every arm below surfaces through `message_end`, so a
+            // `display: false` message that took the steer / follow-up / next-turn route used to be
+            // drawn anyway.
+            display,
             timestamp: Some(ts),
         };
         match deliver_as {
@@ -134,6 +140,13 @@ impl AgentSession {
             kind: kind.clone(),
             payload: serde_json::Value::String(content.clone()),
             details: details.clone(),
+            // SUBA-094 — the field this branch used to drop. pi's `_runAgentPrompt(appMessage)`
+            // (`agent-session.ts:1505` @v0.84.4) runs the turn over the SAME object that carries
+            // `display`, and the interactive host gates drawing on `message.display`
+            // (`interactive-mode.ts:3609`), so a background completion whose predicate said
+            // `display: false` (`pi-subagents notify.ts:402` @v0.64.0) reaches the model and not
+            // the screen. Without the field the trigger-turn arm rendered every one of them.
+            display,
             timestamp: Some(now_ms()),
         };
         // AGENT-030 — pi routes on `this.isStreaming`, the session latch `_isAgentRunActive`

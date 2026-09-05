@@ -193,6 +193,11 @@ impl<B: Backend> App<B> {
         use cyrup_session_svc::agent_message::AgentMessage;
         use serde_json::Value;
         let mut rendered = ReplayRenders::default();
+        // EXT-006 — the display inputs every renderer in this walk is invoked under, read ONCE
+        // here from the live view rather than defaulted, so a replay lands in the same expansion
+        // and theme the live turn would have. They are recorded on each render, so the first
+        // toggle after the replay re-invokes exactly as it does for a live row.
+        let opts = self.render_options();
         // MESSAGE-relative, matching the walk below: `rendered.messages` is keyed by the index a
         // message has among messages, not among items, so an interleaved notice cannot shift a
         // custom message's renderer onto its neighbour.
@@ -207,7 +212,8 @@ impl<B: Backend> App<B> {
                     // Carried WHOLE. `has_content()` is the "did a renderer claim this" question
                     // the old `if let Some(text)` was asking, and it stays true for a LIVE
                     // component, which `Rendered::into_text()` would have dropped.
-                    let r = extension_render_message(ext_host, &c.custom_type, &payload).await;
+                    let r =
+                        extension_render_message(ext_host, &c.custom_type, &payload, &opts).await;
                     if r.has_content() {
                         rendered.messages.insert(i, r);
                     }
@@ -231,9 +237,10 @@ impl<B: Backend> App<B> {
                         let args = Value::Object((*call.arguments).clone());
                         // A tool ROW is a string surface (see the live fold): `into_text` flattens
                         // exactly as `events_fold.rs` does, and a fault already collapsed to `None`.
-                        if let Some(text) = extension_render_tool_call(ext_host, &call.name, &args)
-                            .await
-                            .into_text()
+                        if let Some(text) =
+                            extension_render_tool_call(ext_host, &call.name, &args, &opts)
+                                .await
+                                .into_text()
                         {
                             rendered
                                 .tool_calls
@@ -253,9 +260,10 @@ impl<B: Backend> App<B> {
                     // (`tool-execution.ts:307-308`: `{ content: this.result.content, details:
                     // this.result.details }`).
                     let result = tool_result_payload(content, details.as_ref());
-                    if let Some(text) = extension_render_tool_result(ext_host, tool_name, &result)
-                        .await
-                        .into_text()
+                    if let Some(text) =
+                        extension_render_tool_result(ext_host, tool_name, &result, &opts)
+                            .await
+                            .into_text()
                     {
                         rendered
                             .tool_results
@@ -469,6 +477,39 @@ impl<B: Backend> App<B> {
             .push_loaded_resources(crate::startup::build_startup_lines(report));
     }
 
+    /// Arm pi's `options.verbose` for [`Self::push_session_loaded_resources`] — the `--verbose`
+    /// flag that overrides `quietStartup` for the listing (`interactive-mode.ts:1702` @v0.84.4).
+    /// The host calls this once, before the first frame, exactly as it arms
+    /// [`Self::set_auto_trust_on_reload_cwd`].
+    pub fn set_verbose_startup(&mut self, verbose: bool) {
+        self.state.verbose_startup = verbose;
+    }
+
+    /// Re-emit the loaded-resources / diagnostics panel for `session` (TUI-N02).
+    ///
+    /// pi calls `showLoadedResources({force: false, showDiagnosticsWhenQuiet: true})` from BOTH
+    /// `bindCurrentSessionExtensions` (`interactive-mode.ts:1982` @v0.84.4, reached on boot AND on
+    /// every session replacement via `rebindCurrentSession` → the runtime's `setRebindSession`
+    /// hook, `:577`) and `handleReloadCommand` (`:5991-5994`, the identical options object). cyrup
+    /// pushed it only from the boot path, so `/reload` — the command a user runs right after
+    /// editing an extension, skill or prompt — reported `Reloaded …` and swallowed the very
+    /// diagnostics the reload had just re-collected: a broken extension, a shadowed skill name, a
+    /// prompt conflict. The data was rebuilt server-side by the session factory and discarded.
+    ///
+    /// The panel is NOT gated by swap reason, because pi's is not: its hook fires for `/new`,
+    /// `/resume`, `/fork`, `/import` and `/reload` alike.
+    ///
+    /// pi re-renders into a dedicated `loadedResourcesContainer` that it `clear()`s first
+    /// (`:1699`), a region pinned ABOVE `chatContainer` (`:594-596`); cyrup's committed entries live
+    /// in the terminal's own scrollback and cannot be re-rendered, so the caller pushes this
+    /// BEFORE the swap's replay to reproduce that stacking, and a second swap appends a second
+    /// panel rather than replacing the first.
+    pub fn push_session_loaded_resources(&mut self, session: &cyrup_session_svc::AgentSession) {
+        let report =
+            crate::startup::StartupReport::from_session(session, self.state.verbose_startup);
+        self.push_loaded_resources(&report);
+    }
+
     /// Put already-queued steering/follow-up text back into the editor — the buffer half of Pi's
     /// `restoreQueuedMessagesToEditor` (interactive-mode.ts:4064-4083). `queued` is
     /// `[...steering, ...followUp]` **already drained** from the session (Pi's `clearAllQueues()`
@@ -511,9 +552,9 @@ struct ReplayRenders {
     /// MESSAGE index → the custom-message renderer's output (X11 / EXT-006).
     messages: std::collections::HashMap<usize, crate::transcript::Rendered>,
     /// Tool-call id → the extension's `renderCall` text (EXT-041).
-    tool_calls: std::collections::HashMap<String, String>,
+    tool_calls: std::collections::HashMap<String, crate::transcript::RenderedText>,
     /// Tool-call id → the extension's `renderResult` text (EXT-041).
-    tool_results: std::collections::HashMap<String, String>,
+    tool_results: std::collections::HashMap<String, crate::transcript::RenderedText>,
 }
 
 /// The `{content, details}` value a persisted `toolResult` message presents to a `renderResult`

@@ -234,6 +234,45 @@ impl<B: Backend> App<B> {
         }
     }
 
+    /// Apply the `fullscreenExitOutput` setting (CFG-078). Nothing happens now: the value is read
+    /// by [`Self::stop_fullscreen`]'s caller on the exit path, which is where pi reads it too
+    /// (`stop(fullscreenExitOutput = this.settingsManager.getFullscreenExitOutput())`,
+    /// `interactive-mode.ts:6556` @v0.84.4).
+    ///
+    /// Legal in regular mode, and deliberately so — upstream's `stop()` default argument is
+    /// evaluated whatever renderer is live, and a user who cycles the row inline must not have to
+    /// re-enter fullscreen for it to take. The renderer is what makes it VISIBLE, not what makes it
+    /// settable.
+    pub fn set_fullscreen_exit_output(&mut self, output: crate::altscreen::FullscreenExitOutput) {
+        self.fullscreen_exit_output = output;
+    }
+
+    /// Apply the `fullscreenCopyOnSelect` setting (CFG-078) to this app AND to the live alternate
+    /// screen — pi's `onFullscreenCopyOnSelectChange`, which persists and then, `if (this.renderer
+    /// instanceof TuiAltScreen)`, calls `setCopyOnSelect(enabled)` (`interactive-mode.ts:4757-4760`).
+    ///
+    /// Both halves are needed and neither is redundant: the field is what the NEXT alternate screen
+    /// is built with ([`Self::adopt_fullscreen_renderer`], pi's constructor option at `:378`), and
+    /// the push is what makes the change take effect on the excursion already running.
+    pub fn set_fullscreen_copy_on_select(&mut self, enabled: bool) {
+        self.fullscreen_copy_on_select = enabled;
+        if let Some(alt) = self.altscreen.as_mut() {
+            alt.set_copy_on_select(enabled);
+        }
+    }
+
+    /// What [`Self::stop_fullscreen`] must be passed on the SESSION-EXIT teardown for the configured
+    /// `fullscreenExitOutput` (CFG-078) — `true` (preserve, i.e. repaint nothing) for
+    /// `resume-hint`, `false` (repaint the excursion's transcript into scrollback) for `transcript`.
+    ///
+    /// A named method rather than a comparison at the call site because the polarity inverts: pi
+    /// spells the same choice as `preserveScreen: this.renderer.mode === "fullscreen"` AFTER a
+    /// conditional switch back to regular (`interactive-mode.ts:836-842`), so reading `true` as
+    /// "print the transcript" is the mistake this exists to make unavailable.
+    pub(crate) fn preserve_screen_on_exit(&self) -> bool {
+        self.fullscreen_exit_output == crate::altscreen::FullscreenExitOutput::ResumeHint
+    }
+
     /// Lift the inline frame geometry out of [`App`] before a swap — pi's
     /// `previousUi.captureRenderState()` (`interactive-mode.ts:853-855`, over
     /// `tui-main-screen.ts:134-144`).
@@ -437,6 +476,12 @@ impl<B: RebuildBackend> App<B> {
         // terminal's protocol and suppress the one (iterm2) whose placements the alternate screen
         // cannot own. Undone by [`Self::stop_fullscreen`].
         alt.adopt_images(&mut self.state.transcript);
+        // CFG-078 — pi passes `copyOnSelect: options.fullscreenCopyOnSelect` into every
+        // `createInteractiveTui` (`interactive-mode.ts:378`, fed at `:586` and again at `:871`),
+        // so an alternate screen entered mid-session starts with the CURRENT setting rather than
+        // the renderer's `?? true` default. This is that argument, moved to the one place both the
+        // production and the captured entry paths pass through.
+        alt.set_copy_on_select(self.fullscreen_copy_on_select);
         // §B-1. The retained document is the ONLY thing the alternate screen has to paint, and it
         // grows exclusively inside `TranscriptView::drain_committed` (`transcript/view.rs:110-116`)
         // — so retention has to be on before the first drain of the excursion or the screen would
@@ -467,9 +512,15 @@ impl<B: RebuildBackend> App<B> {
     /// disables mouse reporting, `:315` leaves the screen), then put the image capabilities and the
     /// transcript's graphics gate back (`:330-333`), then retire the retained document.
     /// `preserve_screen` is the caller's: `false` repaints the excursion's document into the main
-    /// screen's scrollback on the way out, `true` skips it. Both of cyrup's teardowns pass `false` —
-    /// see [`crate::AltScreen::stop`] for why neither can rely on the inline renderer to re-render
-    /// that history the way upstream's does.
+    /// screen's scrollback on the way out, `true` skips it — see [`crate::AltScreen::stop`] for why
+    /// neither caller can rely on the inline renderer to re-render that history the way upstream's
+    /// does.
+    ///
+    /// The mode-switch caller ([`Self::install_renderer`]) always passes `false`, because the inline
+    /// renderer it is handing the terminal to would otherwise resume over a blank screen. The
+    /// SESSION-EXIT caller (`App::run`) passes [`Self::preserve_screen_on_exit`], which is the
+    /// `fullscreenExitOutput` setting (CFG-078) — pi's own split between printing the transcript and
+    /// printing only the resume hint (`interactive-mode.ts:836-842` @v0.84.4).
     pub(crate) fn stop_fullscreen(&mut self, preserve_screen: bool) -> bool {
         let Some(mut alt) = self.altscreen.take() else {
             return false;

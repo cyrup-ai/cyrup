@@ -51,7 +51,14 @@ impl App<InlineBackend<Stdout>> {
                 // the cancelled path too.
                 if let Some(share) = self.state.share_in_flight.take() {
                     share.task.abort();
-                    let _ = std::fs::remove_file(&share.tmp);
+                    // The Radius upload is an in-flight HTTP request, not a child process:
+                    // cancelling its token is pi's `loader.signal` firing (`session-share.ts:123`).
+                    // Harmless on the gist path, whose token nothing selects on.
+                    share.cancel.cancel();
+                    // `None` on the Radius path, which writes no temp file.
+                    if let Some(tmp) = share.tmp.as_ref() {
+                        let _ = std::fs::remove_file(tmp);
+                    }
                 }
                 // pi's `loader.signal.aborted`, re-checked by every completion path: `gh` may
                 // already have settled and posted a result the loop has not drained yet.
@@ -216,6 +223,16 @@ impl App<InlineBackend<Stdout>> {
             }
             AppAction::Redraw | AppAction::None => {}
         }
+        // EXT-006 — the display inputs an extension renderer runs under (`options.expanded`, the
+        // `outputPad` setting, the active theme) are LIVE upstream, because pi re-invokes the
+        // renderer from the draw path (`core/extensions/types.ts:1213-1217` @v0.84.4). Every action
+        // that can move one of them ends here: `Ctrl+O` (`Action::ToolsExpand` ->
+        // `set_tools_expanded`), a `/theme` or `/settings` command, a selector, and an extension
+        // shortcut. One call site rather than a hook on each, for the same reason
+        // `publish_extension_readbacks` has one: an arm added later cannot forget it. The pass is a
+        // comparison per already-resident row and returns immediately when nothing moved.
+        let ext_host = ctx.session.services().ext_host.clone();
+        self.refresh_extension_renders(&ext_host).await;
         Ok(RunFlow::Continue)
     }
 

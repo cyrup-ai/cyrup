@@ -43,6 +43,7 @@ const MACROS_RS: &str = include_str!("../macros.rs");
 
 /// Every `.rs` file in this crate that may hold a binding call, concatenated.
 const SDK_SOURCES: &str = concat!(
+    include_str!("../ctx/bash_call.rs"),
     include_str!("../ctx/base.rs"),
     include_str!("../ctx/command.rs"),
     include_str!("../ctx/exec.rs"),
@@ -168,6 +169,7 @@ const IMPORT_INTERFACES: &[&str] = &[
     "bus",
     "provider-stream",
     "host-tool",
+    "host-bash",
     "oauth",
     "control",
     "session",

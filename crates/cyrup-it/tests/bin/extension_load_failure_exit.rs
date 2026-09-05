@@ -10,7 +10,10 @@
 //! and rpc exactly as it does under the TUI.
 //!
 //! cyrup's containment landed with the failure routed ONLY to `StartupDiagnostics::extensions`,
-//! whose sole consumer is `build_startup_report` — called only from `run_interactive`. Under
+//! whose sole consumer is the interactive `[Extension issues]` panel
+//! (`cyrup_tui::StartupReport::from_session`, which was `crates/cyrup/src/interactive.rs`'s private
+//! `build_startup_report` until TUI-N02 moved it into `cyrup-tui` and gave it a second call
+//! site — the session-swap arm — both of them interactive-only). Under
 //! `cyrup -p …` a built-in that failed `init()` therefore produced no message, no diagnostic and
 //! exit 0, where the pre-containment code had at least died loudly. Those built-ins include the
 //! permission gate, so the silent path is fail-OPEN.

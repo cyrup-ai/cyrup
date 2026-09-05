@@ -148,6 +148,7 @@ async fn a_wasm_guests_message_renderer_draws_on_screen() {
             kind: "demo".into(),
             payload: json!("plain fallback body"),
             details: None,
+            display: true,
             timestamp: None,
         },
     };

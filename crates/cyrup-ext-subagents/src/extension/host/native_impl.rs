@@ -575,10 +575,12 @@ impl NativeExtension for SubagentsExtension {
     ///   via [`crate::tui::events::render_inline_result`], which reuses the same header/stat
     ///   primitives `tui::render` already owns.
     ///
-    /// EXPANDED rendering (pi's `options.expanded` arm, `:1431-1500`) is NOT reachable here: the
-    /// host's renderer contract passes no expansion state (`ExtensionHost::render_tool_result`
-    /// takes only the payload), so this always draws pi's COMPACT tier — the tier a collapsed row
-    /// shows, which is what the transcript draws by default.
+    /// EXPANDED rendering (pi's `options.expanded` arm, `:1431-1500`) is not drawn here, so this
+    /// always emits pi's COMPACT tier — the tier a collapsed row shows, which is what the
+    /// transcript draws by default. Since EXT-006 that is a CHOICE rather than a limit: the host
+    /// does now carry `options.expanded`, and a renderer that wants the expanded arm overrides
+    /// [`cyrup_ext::NativeExtension::render_result_under`] (whose default delegates to this
+    /// two-argument form) and is re-invoked whenever the toggle moves.
     fn render_result(&self, key: &str, result: &serde_json::Value) -> Option<serde_json::Value> {
         if key != TOOL_NAME {
             return None;

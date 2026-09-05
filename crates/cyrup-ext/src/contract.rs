@@ -238,8 +238,20 @@ pub enum Reduced {
         terminate: TerminateHint,
         by: cyrup_core::ExtensionId,
     },
-    /// An extension fully serviced the action.
-    Handled(HandledValue),
+    /// An extension fully serviced the action. Carries the id of the extension that produced the
+    /// winning value, exactly as [`Self::Blocked`] does.
+    ///
+    /// **Why attribution.** Pi's `emitUserBash` returns the FIRST truthy handler's whole
+    /// `UserBashEventResult` (`extensions/runner.ts:1005-1032` @v0.84.4), and the RPC host then
+    /// reads `eventResult.operations` off it (`modes/rpc/rpc-mode.ts:581`) — a live
+    /// `BashOperations` OBJECT. ADR-0002 makes cyrup's extension I/O values, so the callable half
+    /// cannot ride inside [`HandledValue`]; the host has to ask the winning extension for it. That
+    /// is only possible if the reduction says WHICH extension won, which is what `by` is for
+    /// (SEAM-015). The same field on `Blocked` exists for the same reason and predates this.
+    Handled {
+        value: HandledValue,
+        by: cyrup_core::ExtensionId,
+    },
 }
 
 /// One terminal-input handler's answer (EXT-021; pi `TerminalInputHandler`'s return,

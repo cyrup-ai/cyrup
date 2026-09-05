@@ -184,7 +184,11 @@ async fn custom_tool_renders_its_own_call() {
     );
 
     let out = host
-        .render_tool_call_outcome("render_me", &serde_json::json!({"q": "hello"}))
+        .render_tool_call_outcome(
+            "render_me",
+            &serde_json::json!({"q": "hello"}),
+            &cyrup_ext::RenderOptions::default(),
+        )
         .await
         .into_option();
     assert_eq!(
@@ -207,7 +211,11 @@ async fn custom_tool_renders_its_own_result() {
 
     let out = session
         .ext_host()
-        .render_tool_result_outcome("render_me", &serde_json::json!({"marker": "ok"}))
+        .render_tool_result_outcome(
+            "render_me",
+            &serde_json::json!({"marker": "ok"}),
+            &cyrup_ext::RenderOptions::default(),
+        )
         .await
         .into_option();
     assert_eq!(
@@ -238,17 +246,25 @@ async fn tool_without_renderers_resolves_to_nothing() {
     let host = session.ext_host();
 
     assert!(
-        host.render_tool_call_outcome("plain_me", &serde_json::json!({}))
-            .await
-            .into_option()
-            .is_none(),
+        host.render_tool_call_outcome(
+            "plain_me",
+            &serde_json::json!({}),
+            &cyrup_ext::RenderOptions::default(),
+        )
+        .await
+        .into_option()
+        .is_none(),
         "a tool overriding neither method must leave the caller drawing the built-in shell"
     );
     assert!(
-        host.render_tool_result_outcome("plain_me", &serde_json::json!({}))
-            .await
-            .into_option()
-            .is_none(),
+        host.render_tool_result_outcome(
+            "plain_me",
+            &serde_json::json!({}),
+            &cyrup_ext::RenderOptions::default(),
+        )
+        .await
+        .into_option()
+        .is_none(),
         "same on the result side"
     );
     assert!(
@@ -260,10 +276,14 @@ async fn tool_without_renderers_resolves_to_nothing() {
         "an unknown tool name is claimed by nothing"
     );
     assert!(
-        host.render_tool_call_outcome("nonexistent", &serde_json::json!({}))
-            .await
-            .into_option()
-            .is_none(),
+        host.render_tool_call_outcome(
+            "nonexistent",
+            &serde_json::json!({}),
+            &cyrup_ext::RenderOptions::default(),
+        )
+        .await
+        .into_option()
+        .is_none(),
         "and resolves to nothing"
     );
 }

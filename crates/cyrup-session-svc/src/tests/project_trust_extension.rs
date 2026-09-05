@@ -450,3 +450,62 @@ async fn no_prompt_callback_is_pis_no_ui_branch() {
         .unwrap();
     assert!(!session.services().settings.project_trusted());
 }
+
+// ==================== EXT-003: a dead wasm runtime must not silence the natives ================
+
+/// EXT-003 residual — the pre-trust pass opened with `ExtensionHost::with_wasm(host_config).ok()?`
+/// *before* the native vote loop, so a Wasmtime engine that cannot be constructed returned `None`
+/// for the whole pass and every native `decides_project_trust` extension was skipped, though not
+/// one of them needs wasm to vote. Pi's rule is the opposite: `loadProjectTrustExtensions()`
+/// (`core/resource-loader.ts:380-386` @v0.84.4) returns a `LoadExtensionsResult` whose faults live
+/// in `errors`, and `emitProjectTrustEvent` polls `extensionsResult.extensions` — the ones that DID
+/// load (`core/extensions/runner.ts:204-233` @v0.84.4). Part of the subsystem failing never
+/// silences the part that still works.
+///
+/// The failure is staged with `SessionBuilder::force_pre_trust_wasm_failure` (`cfg(test)` only):
+/// engine construction cannot be made to fail on demand, and the production trigger — the pooling
+/// allocator failing to reserve its slabs (`cyrup-ext/src/host/engine.rs:19-26`, the reason
+/// `build_engine_on_demand` exists) — is a property of the machine, not of the process.
+///
+/// RED before the fix: with `.ok()?` in place the voter is never asked (`asked == 0`), the tiers
+/// fall through to the prompt (`prompted == 1`) and its `yes` trusts the project. GREEN after: the
+/// native votes, the prompt never runs, and the extension's `no` decides.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dead_pre_trust_wasm_runtime_does_not_discard_native_votes() {
+    let fx = fixture_with_trust_requiring_resources();
+    let (voter, asked, _inits) = TrustVoter::new("no", false);
+    let prompted = Arc::new(AtomicUsize::new(0));
+
+    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
+    cfg.home = fx.agent_dir.clone();
+    // Interactive is the only mode whose tiered decision can reach `NeedsPrompt`, so it is the mode
+    // on which a discarded extension verdict is visible as a re-prompt.
+    cfg.app_mode = cyrup_config::AppMode::Interactive;
+    let counter = prompted.clone();
+    let session = SessionBuilder::new(Arc::new(FauxProvider::new()) as Arc<dyn Provider>, cfg)
+        .with_native_extension(voter)
+        .force_pre_trust_wasm_failure()
+        .trust_prompt(Arc::new(move |_options, _saved| {
+            counter.fetch_add(1, Ordering::AcqRel);
+            Box::pin(async { Some(true) })
+        }))
+        .build()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        asked.load(Ordering::Acquire),
+        1,
+        "a wasm-runtime failure must not skip the native project_trust deciders — they are the \
+         voters that did load (pi runner.ts:209-231 @v0.84.4)"
+    );
+    assert_eq!(
+        prompted.load(Ordering::Acquire),
+        0,
+        "the extension tier still returns before the prompt tier (project-trust.ts:54-70 vs :90-94)"
+    );
+    assert!(
+        !session.services().settings.project_trusted(),
+        "and the native's `no` is what the session ends up with, not the callback's `yes`"
+    );
+}

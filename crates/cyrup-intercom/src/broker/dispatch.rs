@@ -16,18 +16,20 @@ use crate::transport::framing::encode_json;
 use crate::transport::protocol::{HealthMessage, PROTOCOL_NAME, PROTOCOL_VERSION};
 
 use super::frame::FrameResult;
+use super::routing::SessionKey;
 use super::state::BrokerState;
 
 impl BrokerState {
-    /// Handle one already-JSON-parsed frame (`handleMessage`, `broker.ts:298-563`). `session_id` is
-    /// this connection's current id (mutated on register/unregister). `self_tx` writes to this
-    /// connection's own socket.
+    /// Handle one already-JSON-parsed frame (`handleMessage`, `broker.ts:298-563`). `session_key`
+    /// is this connection's current session key — the `(scope, id)` pair, upstream's
+    /// `sessionKey`/`currentKey` (`v0.13.0 broker/broker.ts:268,384`) — mutated on
+    /// register/unregister. `self_tx` writes to this connection's own socket.
     pub(super) fn handle_frame(
         &mut self,
         conn_id: u64,
         self_tx: &UnboundedSender<Vec<u8>>,
         value: &serde_json::Value,
-        session_id: &mut Option<String>,
+        session_key: &mut Option<SessionKey>,
         now: u64,
     ) -> FrameResult {
         let Some(ty) = value.get("type").and_then(|v| v.as_str()) else {
@@ -83,20 +85,20 @@ impl BrokerState {
         }
 
         // Only health/register are legal before registration (broker.ts:332-334).
-        if session_id.is_none() && ty != "register" {
+        if session_key.is_none() && ty != "register" {
             return FrameResult::protocol_error();
         }
 
         match ty {
-            "register" => self.handle_register(conn_id, self_tx, value, session_id, now),
-            "unregister" => self.handle_unregister(conn_id, self_tx, session_id, now),
-            "list" => self.handle_list(self_tx, value),
-            "send" => self.handle_send(conn_id, self_tx, value, session_id, now),
-            "cancel_ask" => self.handle_cancel_ask(conn_id, value, session_id),
-            "presence" => self.handle_presence(conn_id, value, session_id, now),
-            "message_receipt" => self.handle_message_receipt(conn_id, value, session_id, now),
+            "register" => self.handle_register(conn_id, self_tx, value, session_key, now),
+            "unregister" => self.handle_unregister(conn_id, self_tx, session_key, now),
+            "list" => self.handle_list(conn_id, self_tx, value, session_key),
+            "send" => self.handle_send(conn_id, self_tx, value, session_key, now),
+            "cancel_ask" => self.handle_cancel_ask(conn_id, value, session_key),
+            "presence" => self.handle_presence(conn_id, value, session_key, now),
+            "message_receipt" => self.handle_message_receipt(conn_id, value, session_key, now),
             "cancel_message" => {
-                self.handle_cancel_message(conn_id, self_tx, value, session_id, now)
+                self.handle_cancel_message(conn_id, self_tx, value, session_key, now)
             }
             // Extension-bus frames (`v0.9.2 broker/broker.ts:551-585,961-969`). ICOM-016 landed the
             // effects, so the broker now advertises `EXTENSION_BUS_FEATURE` on `registered` and a
@@ -107,13 +109,13 @@ impl BrokerState {
             // `super::extension_state`. All three still port pi's validation prefix verbatim,
             // because a non-conforming peer can reach this socket regardless of what was advertised.
             "extension_publish" => {
-                self.handle_extension_publish(conn_id, self_tx, value, session_id)
+                self.handle_extension_publish(conn_id, self_tx, value, session_key)
             }
             "extension_state_commit" => {
-                self.handle_extension_state_commit(conn_id, self_tx, value, session_id)
+                self.handle_extension_state_commit(conn_id, self_tx, value, session_key)
             }
             "extension_capabilities_update" => {
-                self.handle_extension_capabilities_update(conn_id, self_tx, value, session_id)
+                self.handle_extension_capabilities_update(conn_id, self_tx, value, session_key)
             }
             // Genuinely unknown tags stay fatal — that is pi's own behaviour
             // (`default: throw new Error(\`Unknown client message type\`)`,
@@ -129,6 +131,7 @@ impl BrokerState {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
     use super::super::frame::FrameOutcome;
+    use super::super::routing::SessionKey;
     use super::super::state::BrokerState;
     use serde_json::json;
     use std::sync::Arc;
@@ -243,7 +246,10 @@ mod tests {
                 1_000,
             );
             assert_eq!(
-                state.sessions.get("s1").and_then(|s| s.info.trusted_local),
+                state
+                    .sessions
+                    .get(&SessionKey::unscoped("s1".to_string()))
+                    .and_then(|s| s.info.trusted_local),
                 Some(trusted),
                 "the {label} endpoint's registration must carry trustedLocal = {trusted}"
             );

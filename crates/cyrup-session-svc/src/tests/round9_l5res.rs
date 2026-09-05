@@ -894,13 +894,12 @@ async fn execute_bash_without_an_operations_override_still_runs_on_the_local_she
 
 /// DRIFT-004 / SEAM-015, the wrapper half: `execute_bash_with_user_event` FORWARDS a caller-supplied
 /// `operations` down to the executor. Pi's RPC front-end writes the field
-/// (`operations: eventResult?.operations`, `rpc-mode.ts:576`) and `executeBash` consumes it one
+/// (`operations: eventResult?.operations`, `rpc-mode.ts:581`) and `executeBash` consumes it one
 /// frame lower, so the value has to survive the wrapper.
 ///
-/// What this test deliberately does NOT assert is that the wrapper FILLS the field from the
-/// `user_bash` event result — it cannot, and that is the row's last open half: cyrup's extension I/O
-/// is serde values (ADR-0002), so the reduction payload can carry the `operations` key but never a
-/// callable behind it. See `crates/cyrup-ext/src/lib.rs`'s CYRUP-DELTA register.
+/// A caller-supplied backend is also what the wrapper must NOT overwrite when it fills the field
+/// from the `user_bash` event result — the sibling tests below cover that fill; this one covers the
+/// pass-through it has to keep.
 #[tokio::test]
 async fn execute_bash_with_user_event_forwards_the_operations_override_to_the_executor() {
     let fx = fixture();
@@ -935,6 +934,318 @@ async fn execute_bash_with_user_event_forwards_the_operations_override_to_the_ex
         "got: {:?}",
         result.output
     );
+    assert!(
+        !result.output.contains("LOCAL_SHELL_RAN"),
+        "got: {:?}",
+        result.output
+    );
+}
+
+// ================================= SEAM-015: the wrapper FILLS `operations` from the event ====
+
+/// A native extension that wins the `user_bash` reduction and supplies a live
+/// [`cyrup_tools::ops::BashOperations`] for the command — Pi
+/// `UserBashEventResult.operations` (`extensions/types.ts:1139` @v0.84.4), read off the winning
+/// handler result at `rpc-mode.ts:581` / `interactive-mode.ts:6524`.
+///
+/// `handled` is the `HookOutcome::Handled` payload it returns (upstream: any truthy
+/// `UserBashEventResult` ends the handler loop and becomes THE result); `ops` is what its
+/// `user_bash_operations` hands back, and `ops_calls` counts how often the host asked for it.
+struct BashOpsSupplier {
+    handled: Option<serde_json::Value>,
+    ops: Arc<RecordingBashOps>,
+    ops_calls: Arc<Mutex<Vec<(String, bool, String)>>>,
+}
+
+impl BashOpsSupplier {
+    fn new(handled: Option<serde_json::Value>) -> Self {
+        Self {
+            handled,
+            ops: Arc::new(RecordingBashOps {
+                seen: Mutex::new(Vec::new()),
+            }),
+            ops_calls: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl NativeExtension for BashOpsSupplier {
+    fn id(&self) -> ExtensionId {
+        ExtensionId::from("bash-ops-supplier")
+    }
+    async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
+        api.subscribe(&[EventKind::UserBash]);
+        Ok(())
+    }
+    async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        if matches!(ev, HostEvent::UserBash { .. })
+            && let Some(v) = &self.handled
+        {
+            return HookOutcome::Handled(cyrup_ext::HandledValue(v.clone()));
+        }
+        HookOutcome::Noop
+    }
+    fn user_bash_operations(
+        &self,
+        command: &str,
+        exclude_from_context: bool,
+        cwd: &str,
+    ) -> Option<Arc<dyn cyrup_tools::ops::BashOperations>> {
+        self.ops_calls.lock().unwrap().push((
+            command.to_string(),
+            exclude_from_context,
+            cwd.to_string(),
+        ));
+        Some(self.ops.clone() as Arc<dyn cyrup_tools::ops::BashOperations>)
+    }
+}
+
+/// SEAM-015, the half the row named: `execute_bash_with_user_event` FILLS `BashOptions::operations`
+/// from the `user_bash` event result, so an extension-supplied backend executes the command instead
+/// of the local shell. Pi does this at each front-end — `operations: eventResult?.operations`
+/// (`modes/rpc/rpc-mode.ts:581`, `modes/interactive/interactive-mode.ts:6524` @v0.84.4) — over the
+/// result `emitUserBash` returned (`core/extensions/runner.ts:1005-1032`); cyrup does it once, in
+/// the shared wrapper both front-ends call, and reaches the callable through the winning
+/// extension's `NativeExtension::user_bash_operations` because ADR-0002 keeps the reduction payload
+/// value-typed.
+///
+/// The caller passes `operations: None` — exactly what `crates/cyrup-modes/src/rpc/mod.rs`'s `bash`
+/// arm passes — so nothing but the event result can be supplying the backend here.
+#[tokio::test]
+async fn execute_bash_with_user_event_fills_operations_from_the_winning_user_bash_handler() {
+    let fx = fixture();
+    let ext = Arc::new(BashOpsSupplier::new(Some(serde_json::json!({}))));
+    let session = SessionBuilder::new(faux_ok() as Arc<dyn Provider>, base_config(&fx))
+        .with_native_extension(ext.clone())
+        .build()
+        .await
+        .expect("build");
+
+    let result = session
+        .execute_bash_with_user_event(
+            "echo LOCAL_SHELL_RAN",
+            BashOptions {
+                exclude_from_context: true,
+                id: None,
+                operations: None,
+            },
+            None,
+        )
+        .await
+        .expect("the extension backend succeeds");
+
+    // PRESENCE — the extension's backend ran the command.
+    let seen = ext.ops.seen.lock().unwrap().clone();
+    assert_eq!(
+        seen.len(),
+        1,
+        "the event-supplied backend executed the command exactly once: {seen:?}"
+    );
+    assert_eq!(seen[0].0, "echo LOCAL_SHELL_RAN");
+    assert!(
+        result.output.contains("REMOTE-SENTINEL"),
+        "got: {:?}",
+        result.output
+    );
+
+    // ABSENCE — the local shell never ran it. The control for this assertion is
+    // `execute_bash_without_an_operations_override_still_runs_on_the_local_shell` above, which runs
+    // the identical command with no backend and gets `LOCAL_SHELL_RAN` back.
+    assert!(
+        !result.output.contains("LOCAL_SHELL_RAN"),
+        "an extension-supplied backend must displace the local shell: {:?}",
+        result.output
+    );
+
+    // The supplier is asked with the LIVE event fields (Pi's handler receives the `UserBashEvent`
+    // and returns `operations` from it, `extensions/types.ts:813-821`).
+    let asked = ext.ops_calls.lock().unwrap().clone();
+    assert_eq!(asked.len(), 1, "asked exactly once: {asked:?}");
+    assert_eq!(asked[0].0, "echo LOCAL_SHELL_RAN");
+    assert!(
+        asked[0].1,
+        "the !!-prefix excludeFromContext flag is passed"
+    );
+    assert_eq!(asked[0].2, fx.cwd.display().to_string());
+}
+
+/// SEAM-015, the precedence: a handler result carrying `result` short-circuits execution and its
+/// `operations` is NEVER consulted. Pi tests `if (eventResult?.result)` and returns before it reads
+/// `operations` (`rpc-mode.ts:571-582`; `interactive-mode.ts:6471-6499` then `:6524`), so a handler
+/// that sets both has the backend ignored — which is why `UserBashOutcome` cannot represent both at
+/// once.
+#[tokio::test]
+async fn a_user_bash_result_override_wins_over_the_same_handlers_operations_backend() {
+    let fx = fixture();
+    let ext = Arc::new(BashOpsSupplier::new(Some(serde_json::json!({
+        "result": {
+            "output": "handled-by-extension",
+            "exitCode": 0,
+            "cancelled": false,
+            "truncated": false,
+        }
+    }))));
+    let session = SessionBuilder::new(faux_ok() as Arc<dyn Provider>, base_config(&fx))
+        .with_native_extension(ext.clone())
+        .build()
+        .await
+        .expect("build");
+
+    let result = session
+        .execute_bash_with_user_event(
+            "echo LOCAL_SHELL_RAN",
+            BashOptions {
+                exclude_from_context: false,
+                id: None,
+                operations: None,
+            },
+            None,
+        )
+        .await
+        .expect("the result override succeeds");
+
+    assert_eq!(result.output, "handled-by-extension");
+    assert!(
+        ext.ops.seen.lock().unwrap().is_empty(),
+        "a `result` override short-circuits execution — no backend runs at all"
+    );
+    assert!(
+        ext.ops_calls.lock().unwrap().is_empty(),
+        "…and the backend is never even asked for, matching pi's early `return`"
+    );
+}
+
+/// SEAM-015, the attribution: the backend comes from the extension whose result WON the reduction,
+/// not from whichever loaded extension happens to have one. Pi's `emitUserBash` returns the FIRST
+/// truthy handler result and stops (`extensions/runner.ts:1005-1032`), and the front-end reads
+/// `operations` off THAT object alone — a later extension's `operations` is unreachable because its
+/// handler was never called. `Reduced::Handled`'s `by` is what makes cyrup able to honour that.
+///
+/// Here the first-loaded extension handles the event with a payload carrying no backend, so the
+/// second one's backend must not run even though it is loaded and subscribed.
+#[tokio::test]
+async fn user_bash_operations_come_from_the_handler_that_won_not_a_later_extension() {
+    let fx = fixture();
+    // `HandlingProbe` wins the reduction and supplies nothing (its `user_bash_operations` is the
+    // trait default); `loser` loads AFTER it and would supply a backend if it were ever asked.
+    let loser = Arc::new(BashOpsSupplier::new(Some(serde_json::json!({}))));
+    let session = SessionBuilder::new(faux_ok() as Arc<dyn Provider>, base_config(&fx))
+        .with_native_extension(Arc::new(HandlingProbe))
+        .with_native_extension(loser.clone())
+        .build()
+        .await
+        .expect("build");
+
+    let result = session
+        .execute_bash_with_user_event(
+            "echo LOCAL_SHELL_RAN",
+            BashOptions {
+                exclude_from_context: false,
+                id: None,
+                operations: None,
+            },
+            None,
+        )
+        .await
+        .expect("the local shell succeeds");
+
+    assert!(
+        loser.ops_calls.lock().unwrap().is_empty(),
+        "the second extension's backend must never be asked for — its handler never ran"
+    );
+    assert!(
+        loser.ops.seen.lock().unwrap().is_empty(),
+        "…and must never execute the command"
+    );
+    assert!(
+        result.output.contains("LOCAL_SHELL_RAN"),
+        "with no backend from the winning handler the command falls through to the local shell \
+         (`options?.operations ?? createLocalBashOperations(...)`, agent-session.ts:2782): {:?}",
+        result.output
+    );
+}
+
+/// The first-loaded extension of the attribution test: subscribes to `user_bash`, handles it, and
+/// has no backend of its own (the [`NativeExtension::user_bash_operations`] trait default).
+struct HandlingProbe;
+#[async_trait::async_trait]
+impl NativeExtension for HandlingProbe {
+    fn id(&self) -> ExtensionId {
+        ExtensionId::from("handling-probe")
+    }
+    async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
+        api.subscribe(&[EventKind::UserBash]);
+        Ok(())
+    }
+    async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        if matches!(ev, HostEvent::UserBash { .. }) {
+            return HookOutcome::Handled(cyrup_ext::HandledValue(serde_json::json!({})));
+        }
+        HookOutcome::Noop
+    }
+}
+
+/// SEAM-015, the fill's precedence against the CALLER: `execute_bash_with_user_event` writes the
+/// event-supplied backend with `options.operations.get_or_insert(...)`, so a backend the caller
+/// already supplied WINS over the one the winning `user_bash` handler offers.
+///
+/// This is the port's one deliberate divergence from upstream, which writes
+/// `operations: eventResult?.operations` unconditionally at each front-end
+/// (`modes/rpc/rpc-mode.ts:581`, `modes/interactive/interactive-mode.ts:6524` @v0.84.4) and would
+/// therefore overwrite it. It is unobservable in production — both callers pass `operations: None`
+/// (`crates/cyrup-modes/src/rpc/mod.rs:1169`, `crates/cyrup-tui/src/app/bash_spawn.rs:58`) — and is
+/// pinned here so it cannot flip silently.
+///
+/// The sibling `execute_bash_with_user_event_forwards_the_operations_override_to_the_executor` does
+/// NOT cover this: it builds a session with no extension at all, so `emit_user_bash_event` returns
+/// at its `no_subscribers` guard and the `Backend` arm is never reached. Here the extension is
+/// loaded, subscribed, wins the reduction and offers a backend of its own.
+#[tokio::test]
+async fn a_caller_supplied_operations_backend_is_not_clobbered_by_the_user_bash_handler() {
+    let fx = fixture();
+    let ext = Arc::new(BashOpsSupplier::new(Some(serde_json::json!({}))));
+    let session = SessionBuilder::new(faux_ok() as Arc<dyn Provider>, base_config(&fx))
+        .with_native_extension(ext.clone())
+        .build()
+        .await
+        .expect("build");
+
+    let caller_ops = Arc::new(RecordingBashOps {
+        seen: Mutex::new(Vec::new()),
+    });
+    let result = session
+        .execute_bash_with_user_event(
+            "echo LOCAL_SHELL_RAN",
+            BashOptions {
+                exclude_from_context: false,
+                id: None,
+                operations: Some(caller_ops.clone() as Arc<dyn cyrup_tools::ops::BashOperations>),
+            },
+            None,
+        )
+        .await
+        .expect("the caller's backend succeeds");
+
+    // PRESENCE — the caller's own backend ran the command.
+    let seen = caller_ops.seen.lock().unwrap().clone();
+    assert_eq!(
+        seen.len(),
+        1,
+        "the caller's backend executed the command exactly once: {seen:?}"
+    );
+    assert_eq!(seen[0].0, "echo LOCAL_SHELL_RAN");
+
+    // ABSENCE — the extension's backend did not run it, even though its handler WON the reduction.
+    // The control for this assertion is
+    // `execute_bash_with_user_event_fills_operations_from_the_winning_user_bash_handler` above:
+    // same extension, same command, `operations: None`, and there the extension's backend DOES run.
+    assert!(
+        ext.ops.seen.lock().unwrap().is_empty(),
+        "a caller-supplied backend must not be clobbered by the event-supplied one"
+    );
+
+    // …and the local shell is out of the picture either way.
     assert!(
         !result.output.contains("LOCAL_SHELL_RAN"),
         "got: {:?}",

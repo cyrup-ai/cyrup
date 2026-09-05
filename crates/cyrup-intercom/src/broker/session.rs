@@ -9,11 +9,12 @@
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::transport::protocol::{BrokerMessage, SessionInfo, SessionRegistration};
+use crate::transport::protocol::{BrokerMessage, ScopeId, SessionInfo, SessionRegistration};
 
 use super::extensions::extensions_field_is_valid;
 use super::frame::{FrameOutcome, FrameResult, send_msg};
 use super::limits::MAX_SESSIONS;
+use super::routing::SessionKey;
 use super::state::{BrokerState, ConnectedSession};
 
 impl BrokerState {
@@ -22,7 +23,7 @@ impl BrokerState {
         conn_id: u64,
         self_tx: &UnboundedSender<Vec<u8>>,
         value: &serde_json::Value,
-        session_id: &mut Option<String>,
+        session_key: &mut Option<SessionKey>,
         now: u64,
     ) -> FrameResult {
         let Some(session_val) = value.get("session") else {
@@ -32,7 +33,7 @@ impl BrokerState {
         else {
             return FrameResult::protocol_error();
         };
-        if session_id.is_some() {
+        if session_key.is_some() {
             // Duplicate register (broker.ts:342-344).
             return FrameResult::protocol_error();
         }
@@ -44,6 +45,25 @@ impl BrokerState {
                 _ => return FrameResult::protocol_error(),
             },
         };
+        // ICOM-055 — `normalizeScopeId(clientMessage.scopeId)`
+        // (`v0.13.0 broker/broker.ts:133-142,436`), in pi's own position: after the `sessionId`
+        // check, before the `extensions` guard.
+        //
+        // THIS is the enforcement copy. The broker reads raw `serde_json::Value` frames and never
+        // deserializes a typed `ClientMessage` (`super::js`), so the `scope_id_field`
+        // deserializer on `ClientMessage::Register` runs on the client's serialize side and in its
+        // round-trip test only. Delete the match below and a `scopeId: 7` frame would register
+        // UNSCOPED — a malformed scope silently becoming "global" is a confidentiality failure, not
+        // a parse failure, which is why upstream `throw`s (i.e. `socket.destroy`) instead.
+        // Whitespace-only trims to unscoped and is NOT fatal ([`ScopeId::parse`]).
+        let scope = match value.get("scopeId") {
+            None => None,
+            Some(v) => match v.as_str() {
+                Some(s) => ScopeId::parse(s),
+                None => return FrameResult::protocol_error(),
+            },
+        };
+        let key = SessionKey::new(scope.clone(), id.clone());
         // `case "register"`'s extensions guard (`v0.9.2 broker/broker.ts:446-456`), in pi's own
         // position — after the `sessionId` check, before `pruneDisconnectedSessions()`. Absent is
         // legal (`extensions !== undefined`); present-but-invalid throws, i.e. `socket.destroy`.
@@ -62,7 +82,11 @@ impl BrokerState {
         self.prune_disconnected_sessions(now);
         self.prune_mailbox_messages(now);
 
-        let previous_conn = self.sessions.get(&id).map(|s| s.conn_id);
+        // `this.sessions.get(key)` (`v0.13.0 broker/broker.ts:437-443`): an identity takeover now
+        // only takes over WITHIN one scope — the same stable id in two scopes is two coexisting
+        // sessions. The `MAX_SESSIONS` cap stays GLOBAL (`this.sessions.size`), so a scope cannot
+        // be used to mint an unbounded roster.
+        let previous_conn = self.sessions.get(&key).map(|s| s.conn_id);
         if previous_conn.is_none() && self.sessions.len() >= MAX_SESSIONS {
             send_msg(
                 self_tx,
@@ -73,11 +97,17 @@ impl BrokerState {
             return FrameResult::close_self();
         }
         if previous_conn.is_some() {
-            // Identity takeover (`v0.10.1 broker/broker.ts:348-352`): clear the old edges AND the
-            // old receipt routes, then end the previous socket. This is `clearAskEdgesForSession`'s
-            // ONLY call site upstream — see `on_connection_closed`.
-            self.clear_ask_edges_for_session(&id);
-            self.clear_message_receipt_routes_for_session(&id);
+            // Identity takeover (`v0.13.0 broker/broker.ts:450-456`): clear the old receipt routes,
+            // then end the previous socket.
+            //
+            // ICOM-054 — `636f61e` REMOVED `clearAskEdgesForSession(id)` from this branch, leaving
+            // that method with zero call sites upstream (`v0.13.0 broker/broker.ts:1176` is dead
+            // code). The endpoint epoch is what now invalidates a stale send, so wiping the
+            // replaced endpoint's ask edges is both unnecessary and HARMFUL: it would refuse a
+            // reply that arrives after a stable-id replacement — exactly the case the commit body
+            // means by "replies … keep their existing behavior". Receipt routes still go, because
+            // they key a cancel/supersede against a socket that is gone.
+            self.clear_message_receipt_routes_for_session(&key);
             if let Some(prev_id) = previous_conn
                 && let Some(h) = self.connections.get(&prev_id)
             {
@@ -85,11 +115,16 @@ impl BrokerState {
             }
         }
 
-        *session_id = Some(id.clone());
+        *session_key = Some(key.clone());
         self.remove_unregistered(conn_id);
 
         let info = SessionInfo {
             id: id.clone(),
+            // ICOM-054 — `endpointEpoch: randomUUID()` (`v0.13.0 broker/broker.ts:466`). Minted on
+            // EVERY register, takeover included: a re-registered id is a NEW endpoint, and that is
+            // the only fact that makes a stale send detectable. Never read from the registration —
+            // `SessionRegistration` omits it upstream (`v0.13.0 types.ts:102`).
+            endpoint_epoch: Some(uuid::Uuid::new_v4().to_string()),
             name: registration.name,
             // `v0.10.1 broker/broker.ts:358` copies the registration's `runtimeFallbackAlias` onto
             // the stored `SessionInfo`, so every peer's roster can tell a chosen name from a
@@ -119,7 +154,7 @@ impl BrokerState {
         // `previous?.ownerOrder ?? this.nextOwnerOrder++` (`v0.9.2 broker/broker.ts:488`) — read
         // BEFORE the takeover path removes anything, so a session that re-registers under the same
         // id keeps its original election order and cannot seize a namespace by reconnecting.
-        let owner_order = self.sessions.get(&id).map_or_else(
+        let owner_order = self.sessions.get(&key).map_or_else(
             || {
                 let next = self.next_owner_order;
                 self.next_owner_order += 1;
@@ -136,9 +171,10 @@ impl BrokerState {
             .unwrap_or_default();
         let namespaces: Vec<String> = extensions.iter().map(|e| e.namespace.clone()).collect();
         self.insert_session(
-            id.clone(),
+            key.clone(),
             ConnectedSession {
                 conn_id,
+                key: key.clone(),
                 info: info.clone(),
                 tx: self_tx.clone(),
                 last_presence_broadcast_at: now,
@@ -148,7 +184,7 @@ impl BrokerState {
         );
         // `this.disconnectedSessions.delete(id)` (`v0.10.1 broker/broker.ts:377`): this identity is
         // live again, so it must no longer be a mailbox TARGET — only a mailbox recipient.
-        self.disconnected_sessions.remove(&id);
+        self.disconnected_sessions.remove(&key);
         // A register cancels any pending auto-shutdown (`v0.10.1 broker/broker.ts:378-381`):
         //   if (this.shutdownTimer) { clearTimeout(this.shutdownTimer); this.shutdownTimer = null; }
         // NULLING THE HANDLE is the load-bearing half — it is what lets a LATER disconnect arm a
@@ -160,31 +196,41 @@ impl BrokerState {
             task.abort();
         }
 
-        // ICOM-016 — `features: [EXTENSION_BUS_FEATURE]` (`v0.9.2 broker/broker.ts:502-506`). This
-        // is what a conforming pi client gates every bus frame on
-        // (`v0.9.2 broker/client.ts:648,817-819`), so the broker could not advertise it until the
-        // effects existed. v0.9.2 advertises this one value only: `EXACT_SEND_FEATURE` is a v0.12.0
-        // addition whose behaviour is not ported, so advertising it would be a lie.
+        // ICOM-016 + ICOM-054 — `features: [EXTENSION_BUS_FEATURE, EXACT_SEND_FEATURE]`
+        // (`v0.13.0 broker/broker.ts:498-502`), the exact pair and order upstream advertises. This
+        // is what a conforming pi client gates its bus frames (`v0.13.0 broker/client.ts:648`) and
+        // its `targetId`/`targetEpoch` pair (`:671`) on, so neither name could be advertised until
+        // its effects existed. Both now do: the bus in `broker::extension_state`, the exact-send
+        // refusal in `broker::delivery` + `broker::send`.
         send_msg(
             self_tx,
             &BrokerMessage::Registered {
                 session_id: id.clone(),
                 features: Some(vec![
                     crate::transport::protocol::EXTENSION_BUS_FEATURE.to_string(),
+                    crate::transport::protocol::EXACT_SEND_FEATURE.to_string(),
                 ]),
             },
         );
-        self.broadcast(&BrokerMessage::SessionJoined { session: info }, Some(&id));
+        // `this.broadcast({ type: "session_joined", session: info }, key, scopeId)`
+        // (`v0.13.0 broker/broker.ts:504`) — the join is announced inside this scope only.
+        // `SessionInfo` itself never carries the scope, so no roster row, no `intercom{list}` line
+        // and no `registered` reply changes shape.
+        self.broadcast(
+            &BrokerMessage::SessionJoined { session: info },
+            Some(&key),
+            scope.as_ref(),
+        );
         // pi's order: AFTER `session_joined` and BEFORE the mailbox flush (`:509-510`).
         self.recompute_namespace_owners();
         // `this.flushMailboxForSession(connectedSession)` (`v0.10.1 broker/broker.ts:392`), in pi's
         // own position: AFTER `registered` and `session_joined`, so the client has already
         // transitioned to connected and installed its message handler before its parked mail
         // arrives on the same socket, in order.
-        self.flush_mailbox_for_session(&id, now);
+        self.flush_mailbox_for_session(&key, now);
         // The per-capability replay (`v0.9.2 broker/broker.ts:512-528`), shared verbatim with
         // `extension_capabilities_update` (`:570-585`) and factored once in `extensions.rs`.
-        self.replay_extension_state(self_tx, &namespaces);
+        self.replay_extension_state(self_tx, scope.as_ref(), &namespaces);
         FrameResult::cont()
     }
 
@@ -192,35 +238,39 @@ impl BrokerState {
         &mut self,
         conn_id: u64,
         _self_tx: &UnboundedSender<Vec<u8>>,
-        session_id: &mut Option<String>,
+        session_key: &mut Option<SessionKey>,
         now: u64,
     ) -> FrameResult {
-        let Some(sid) = session_id.clone() else {
+        let Some(key) = session_key.clone() else {
             return FrameResult::protocol_error();
         };
         let mut schedule = false;
-        if self.sessions.get(&sid).map(|s| s.conn_id) == Some(conn_id) {
+        if self.sessions.get(&key).map(|s| s.conn_id) == Some(conn_id) {
             // `case "unregister"` (`v0.10.1 broker/broker.ts:418-432`) is the socket-close body
             // verbatim: remember the departing identity for its mailbox, drop its receipt routes,
             // and — as at `on_connection_closed` — do NOT clear its ask edges.
-            if let Some(existing) = self.sessions.get(&sid) {
+            if let Some(existing) = self.sessions.get(&key) {
                 let info = existing.info.clone();
-                self.remember_disconnected_session(info, now);
+                self.remember_disconnected_session(key.clone(), info, now);
             }
-            self.remove_session(&sid);
-            self.clear_message_receipt_routes_for_session(&sid);
+            self.remove_session(&key);
+            self.clear_message_receipt_routes_for_session(&key);
+            // `this.broadcast({…}, currentKey, existing.scopeId)`
+            // (`v0.13.0 broker/broker.ts:540`) — the bare id on the wire, the scope only as the
+            // fan-out boundary.
             self.broadcast(
                 &BrokerMessage::SessionLeft {
-                    session_id: sid.clone(),
+                    session_id: key.id.clone(),
                 },
-                Some(&sid),
+                Some(&key),
+                key.scope.as_ref(),
             );
             // `this.recomputeNamespaceOwners()` (`v0.9.2 broker/broker.ts:544`) — the departing
             // session may have been a namespace owner.
             self.recompute_namespace_owners();
             schedule = true;
         }
-        *session_id = None;
+        *session_key = None;
         // Re-arm the registration timeout for the now-unregistered-but-open socket (broker.ts:228):
         // the reader re-arms its 1 s deadline; track the connection as unregistered again and run
         // the same oldest-eviction pass pi's `armRegistrationTimeout` runs on this transition
@@ -235,17 +285,35 @@ impl BrokerState {
 
     pub(super) fn handle_list(
         &mut self,
+        conn_id: u64,
         self_tx: &UnboundedSender<Vec<u8>>,
         value: &serde_json::Value,
+        session_key: &Option<SessionKey>,
     ) -> FrameResult {
         let Some(request_id) = value.get("requestId").and_then(|v| v.as_str()) else {
+            return FrameResult::protocol_error();
+        };
+        // ICOM-055 — `throw new Error("List session not found")`
+        // (`v0.13.0 broker/broker.ts:592-595`): the roster is now scope-relative, so it can only be
+        // answered to a requester whose scope the broker can attribute.
+        //
+        // NOTE the exact width of this new fatality. `super::dispatch` already refuses every
+        // non-`register`/`health` frame while the connection has no session, so a pre-registration
+        // `list` was a protocol error before this change. The only newly-fatal case is upstream's
+        // `requester.socket !== socket`: a SUPERSEDED socket, whose session a newer connection has
+        // taken over. That socket is handed the full roster today, and "answer with everything" is
+        // the one wrong reply to a peer whose scope the broker can no longer attribute.
+        let Some(requester) = session_key
+            .as_ref()
+            .filter(|k| self.sessions.get(*k).map(|s| s.conn_id) == Some(conn_id))
+        else {
             return FrameResult::protocol_error();
         };
         send_msg(
             self_tx,
             &BrokerMessage::Sessions {
                 request_id: request_id.to_string(),
-                sessions: self.session_infos(),
+                sessions: self.session_infos_in_scope(requester.scope.as_ref()),
             },
         );
         FrameResult::cont()
@@ -280,10 +348,16 @@ mod tests {
         assert_eq!(state.unregistered.len(), MAX_UNREGISTERED_CONNECTIONS);
 
         // Register 10 of those connections, removing them from the unregistered set.
-        let mut session_ids: Vec<Option<String>> = Vec::new();
+        let mut session_ids: Vec<Option<super::super::routing::SessionKey>> = Vec::new();
         for conn_id in 0..10u64 {
             let mut sid = None;
-            register(&mut state, conn_id, &mut sid, &format!("session-{conn_id}"));
+            register(
+                &mut state,
+                conn_id,
+                &mut sid,
+                &format!("session-{conn_id}"),
+                None,
+            );
             session_ids.push(sid);
         }
         assert_eq!(state.unregistered.len(), MAX_UNREGISTERED_CONNECTIONS - 10);

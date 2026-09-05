@@ -75,8 +75,8 @@ pub(crate) use bash_spawn::{BashMsg, spawn_session_bash};
 #[cfg(any(test, feature = "scrollback-accumulator"))]
 pub(crate) use event_extract::line_text;
 pub(crate) use event_extract::{
-    assistant_message_from_event, context_usage_may_have_moved, custom_message_from_event,
-    custom_message_text, edit_preview, message_role_from_event, model_entries,
+    assistant_message_from_event, context_usage_may_have_moved, custom_message_text,
+    displayable_custom_message_from_event, edit_preview, message_role_from_event, model_entries,
     read_clipboard_image_to_temp, stop_reason_notice, tool_result_usage_from_event,
     truncate_summary, user_message_text_from_event,
 };
@@ -114,8 +114,11 @@ pub(crate) use settings_rows::{
 };
 #[cfg(test)]
 pub(crate) use settings_rows::{settings_rows_for_test, settings_rows_for_test_with_images};
-pub(crate) use share::ShareInFlight;
-pub use share::{ShareMsg, gist_id_from_url, share_viewer_url, share_viewer_url_from};
+pub(crate) use share::{ShareInFlight, ShareUpload};
+pub use share::{
+    ShareMsg, ShareTool, append_share_metadata, gist_id_from_url, share_viewer_url,
+    share_viewer_url_from,
+};
 
 pub(crate) use crossterm::resolve_external_editor;
 #[cfg(test)]
@@ -158,14 +161,11 @@ use cyrup_session_svc::{NotifyKind, UiEffect, UiKind, UiReply, UiRequest};
 use futures::{FutureExt, StreamExt};
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::crossterm::cursor::MoveTo;
-use ratatui::crossterm::event::{
-    self, Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
-};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::crossterm::terminal::{
     BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate, enable_raw_mode,
 };
-use ratatui::crossterm::{ExecutableCommand, execute, queue};
+use ratatui::crossterm::{ExecutableCommand, queue};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
@@ -244,6 +244,18 @@ pub struct App<B: Backend> {
     /// [`App::reload_keybindings_from`]; adding this one is a line in each, and until then the
     /// table is upstream's defaults for the session's life.
     alt_keymap: AltScreenKeymap,
+    /// The `fullscreenExitOutput` setting (CFG-078) — what [`App::run`]'s exit teardown puts on the
+    /// main screen. pi reads `settingsManager.getFullscreenExitOutput()` at the moment it stops
+    /// (`interactive-mode.ts:6556` @v0.84.4), so this is kept LIVE: the composition root seeds it
+    /// and the `/settings` row's `ApplySetting` arm rewrites it, rather than a value latched at
+    /// boot that a mid-session change could not reach.
+    fullscreen_exit_output: crate::altscreen::FullscreenExitOutput,
+    /// The `fullscreenCopyOnSelect` setting (CFG-078), held here because the renderer that consumes
+    /// it does not exist yet in a regular-mode session: [`App::adopt_fullscreen_renderer`] pushes it
+    /// into each alternate screen as it is built, which is pi's `copyOnSelect` constructor option
+    /// (`interactive-mode.ts:378`), and [`App::set_fullscreen_copy_on_select`] keeps both this and a
+    /// live renderer in step, which is its `applyRuntimeSettings` write (`:1995`).
+    fullscreen_copy_on_select: bool,
     /// The current inline-viewport height (the live region's content height). Recomputed each
     /// [`draw`](Self::draw); the viewport is rebuilt only when it changes (audit #1).
     viewport_height: u16,
@@ -309,6 +321,14 @@ pub struct App<B: Backend> {
     /// [`App::set_login_provider_source`] so a test can drive the whole `/login` path against a
     /// stub provider WITHOUT reaching a real endpoint (see `tests/login_flow.rs`).
     login_providers: Option<LoginProviderSource>,
+    /// The Radius gateway `/share` uploads its artifact to (DRIFT-053). `None` — always, in
+    /// production — is pi's hardcoded `DEFAULT_RADIUS_GATEWAY` (`session-share.ts:112`).
+    ///
+    /// The sibling of [`Self::login_providers`] and it exists for the same reason: this crate's
+    /// "tests must never hit real provider APIs" convention. [`App::set_radius_share_gateway`]
+    /// points the upload at a local address so the ROUTING — radius attempted, `gh` never
+    /// reached — is asserted without a socket to `radius.pi.dev`.
+    radius_gateway: Option<String>,
     /// Where a spawned `/compact` posts its outcome back to the run loop — installed by
     /// [`App::install_compact_channel`], the same shape as [`Self::tree_nav_tx`].
     ///

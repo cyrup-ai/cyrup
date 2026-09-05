@@ -157,7 +157,7 @@ the embedder SDK (`cyrup/crates/cyrup-sdk/`), measured against
 | SEAM-012 | still open | Unchanged; emit sites still lossy at `runtime.rs:461` and `:525`. Batch with SEAM-025 (one WIT bump, both copies). |
 | SEAM-013 | **closed** | `rpc.rs:844-849` samples `shutdown_requested()` every iteration; both pi checkpoints present (`:837-839`, `:754`/`:776`). Upstream v0.84.1 `rpc-mode.ts:357-358`, `:787`. |
 | SEAM-014 | still open | Whole `handle` switch (`rpc.rs:1020-1381`) read: no `GetAvailableThinkingLevels` arm; `grep available_thinking_levels crates/cyrup-modes` is empty. |
-| SEAM-015 | still open | Third argument still a literal `None` at `rpc.rs:1232`; omission recorded only in the source comment at `:1226-1227`. |
+| ~~SEAM-015~~ | **CLOSED 2026-09-04** | The `None` this row pointed at was never `operations` — it is `on_chunk`, pi's own `undefined` second argument. The real half (the wrapper never FILLED `BashOptions::operations` from the `user_bash` result) is closed at `abb8b5e3`; see the item. |
 | SEAM-016 | still open | Unchanged, and the refuter folded in a second divergence in the same function: `StopReason::Pending => 1` (`run.rs:138`) where pi leaves the initialised `exitCode = 0`. |
 | SEAM-017 | still open | Zero `RpcClient`/`rpc_client` hits workspace-wide. At v0.84.1 the client's listener type became `JsonAgentSessionEvent`. |
 | SEAM-018 | **closed** | `crates/cyrup/src/credential_print.rs` (618 lines) implements both print verbs, dispatched pre-parse from `main.rs:105-107`. Against the ported baseline (pi v0.83.0 `cli/credential-print.ts`, 152 lines) this is complete. The v0.84.1 `auth check` extension is a separate item, SEAM-050. |
@@ -437,7 +437,8 @@ the check that establishes it. Do not "recover" them.
 | ~~SEAM-011~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | M | setWidget goes on the wire with a cyrup-invented `{widget}` blob — **CLOSED 2026-08-14**: sweep 2 — the consumer halves of EXT-047, landed against the same signature area 06 derived independently. (1) `cyrup-session-svc/src/host_services.rs`: `HostServices::set_widget` now takes `(&str, Option<&[String]>, WidgetPlacement)` and builds the front-end `UiEffect::SetWidget` carrier under pi's own key names, with `lines: null` preserved as pi's remove-this-key. (2) `cyrup-modes/src/rpc.rs`: the wire emission is pi's union member — `widgetKey` always, `widgetLines` only when present (ABSENT, never null, for a removal), `widgetPlacement` only when `belowEditor`. One `[CYRUP-DELTA]`: `WidgetPlacement` has no unset state after the WIT resolves pi's `aboveEditor` default, so the default is emitted as an ABSENT key — which is what pi's `options?.placement` produces for every extension that does not set one. **FOR THE ORCHESTRATOR: `UiEffect::SetWidget { widget: Value }` was deliberately KEPT as the front-end carrier (populated under pi's key names) rather than split into typed fields, so `crates/cyrup-tui` keeps compiling while area 07 is editing it. Splitting it later is a scheduled cross-crate break, not an oversight.** |
 | ~~SEAM-012~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | M | `session_before_switch` carries no reason, `session_before_fork` no position — **CLOSED 2026-08-14**: sweep 1 — the WIT half arrived from area 06 mid-pass and the emit half is populated; the body saying both hooks are lossy is superseded. |
 | ~~SEAM-014~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | S | RPC verb `get_available_thinking_levels` not implemented — **CLOSED 2026-08-14**: sweep 1. |
-| SEAM-015 | medium | not-ported | M | RPC bash ignores the `operations` backend override — **2026-08-15, still open; NEEDS re-measured (sweep 9)**: the routing note said this needs *"a `BashOperations` trait in `crates/cyrup-tools` (area 04) **PLUS** an extension-capability decision in area 06"*. **The cyrup-tools half is DONE** — `pub trait BashOperations` exists at `crates/cyrup-tools/src/ops/mod.rs:462`, `BashOptions::operations: Option<Arc<dyn BashOperations>>` exists and is consumed (`run_bash` takes it, and any IN-HOST caller can supply one today, which is upstream's `options?.operations ?? createLocalBashOperations({shellPath})`, `agent-session.ts:2782` @v0.83.0). **ONE half is left and it is area 06's alone:** the `operations: None` the RPC bash arm passes is upstream's ABSENT `operations`, not a dropped one, because a WASM guest still has no way to return a callable across the WIT boundary — closing it is the `register-bash-operations` import + keyed `bash-operations-exec` export round-trip, whose design is written out in `crates/cyrup-ext/src/lib.rs`'s CYRUP-DELTA register. The site is documented in-source in `crates/cyrup-modes/src/rpc.rs`'s bash arm. Sibling: DRIFT-004. **Still not schedulable against area 08.** |
+| ~~SEAM-015~~ | ~~medium~~ **CLOSED 2026-09-04** | not-ported | M | **CLOSED 2026-09-04 at `abb8b5e3`** (`feat(session-svc): SEAM-015 fill BashOptions::operations from the winning user_bash result`): `execute_bash_with_user_event` (`crates/cyrup-session-svc/src/session/bash.rs:195-219`) now reduces the `user_bash` result to a `UserBashOutcome` (`:41-62`) and, on the `Backend` arm, writes the extension's backend into `BashOptions::operations` before falling through to `execute_bash` — upstream's `operations: eventResult?.operations` (`modes/rpc/rpc-mode.ts:581`, `modes/interactive/interactive-mode.ts:6524` @v0.84.4), written once in the shared wrapper because BOTH cyrup front-ends emit through it. The callable is fetched from the extension that WON the reduction: `Reduced::Handled` now carries `by` (`crates/cyrup-ext/src/contract.rs:242-254`, mirroring `Blocked` at `:236-240`), `ExtensionHost::user_bash_operations` (`crates/cyrup-ext/src/facade.rs::user_bash_operations`) asks that extension's new `NativeExtension::user_bash_operations` (`crates/cyrup-ext/src/native.rs::user_bash_operations`) with panic containment. Pinned by five tests — `crates/cyrup-session-svc/src/tests/round9_l5res.rs` `execute_bash_with_user_event_fills_operations_from_the_winning_user_bash_handler`, `a_user_bash_result_override_wins_over_the_same_handlers_operations_backend`, `user_bash_operations_come_from_the_handler_that_won_not_a_later_extension` and `a_caller_supplied_operations_backend_is_not_clobbered_by_the_user_bash_handler` — and the end-to-end wire proof `crates/cyrup-modes/src/tests/modes/rpc_bash.rs::rpc_bash_runs_on_an_extension_supplied_operations_backend`. Each was shown RED by a targeted mutation (drop the fill; ask for `operations` before checking `result`; resolve the backend from any native instead of `by`; write the fill as `options.operations = Some(ops)`) and GREEN at HEAD. **The fourth of those landed 2026-09-05 in the review pass** — the detail block below had claimed the no-clobber invariant was covered at closure and it was not, since the only caller-supplied-backend test at the time built a session with no extension and so never reached the `Backend` arm. **Residual (recorded, not a reopen):** only a NATIVE extension can supply the backend — ADR-0002 keeps extension I/O value-typed, so a WASM guest can put the `operations` KEY in its payload but not a callable behind it; that is the `register-bash-operations` + `bash-operations-exec` WIT round-trip costed in `crates/cyrup-ext/src/lib.rs`'s CYRUP-DELTA register and owned by area 06 / DRIFT-004. **SUPERSEDED 2026-09-05: that residual is DISCHARGED.** `DRIFT-004` landed the guest tier at `8b688401` — `ExtensionHost::user_bash_operations` now resolves a `#[cfg(feature = "wasm-host")]` `GuestBashOperations` forwarder as well as a native object, so a WASM guest CAN supply the backend a `user_bash` command runs through. It read as open only because `DRIFT-004` landed after this row was written. **Falsification:** a `user_bash` handler supplying a backend whose command still runs on the local shell, a `result` override that consults the backend, or a backend taken from an extension whose handler never won, reopens it. **The original row follows unchanged.** RPC bash ignores the `operations` backend override — ~~**2026-08-15, still open; NEEDS re-measured (sweep 9)**~~: the routing note said this needs *"a `BashOperations` trait in `crates/cyrup-tools` (area 04) **PLUS** an extension-capability decision in area 06"*. **The cyrup-tools half is DONE** — `pub trait BashOperations` exists at `crates/cyrup-tools/src/ops/mod.rs:462`, `BashOptions::operations: Option<Arc<dyn BashOperations>>` exists and is consumed (`run_bash` takes it, and any IN-HOST caller can supply one today, which is upstream's `options?.operations ?? createLocalBashOperations({shellPath})`, `agent-session.ts:2993` @v0.83.0). **ONE half is left and it is area 06's alone:** the `operations: None` the RPC bash arm passes is upstream's ABSENT `operations`, not a dropped one, because a WASM guest still has no way to return a callable across the WIT boundary — closing it is the `register-bash-operations` import + keyed `bash-operations-exec` export round-trip, whose design is written out in `crates/cyrup-ext/src/lib.rs`'s CYRUP-DELTA register. The site is documented in-source in `crates/cyrup-modes/src/rpc.rs`'s bash arm. Sibling: DRIFT-004. **Still not schedulable against area 08.** |
+| SEAM-118 | low | parity-bug | S | **`--no-builtin-tools` leaves four built-ins active where pi starts a session with none** — filed 2026-09-05 by the batch-3 ledger pass, as `CFG-079`'s own closure asked (*"it wants its own row and its own red-before test rather than being smuggled into this closure"*, `05-cyrup-config-and-resources.md`). **upstream** `packages/coding-agent/src/core/sdk.ts:261-262` @v0.84.4 — `initialActiveToolNames = (options.tools ?? (options.noTools ? [] : (configuredDefaultToolNames ?? defaultActiveToolNames)))…`, so ANY `noTools` yields an EMPTY initial built-in set; extension and SDK tools stay on only via `_buildRuntime`'s `includeAllExtensionTools` (`core/agent-session.ts:406-410`, the branch at `:2742-2745`). **cyrup** `crates/cyrup-session-svc/src/builder.rs::select_active_tools` — the `NoTools::Builtin` arm is `!DEFAULT_BUILTIN_TOOLS.contains(name)`, which drops only pi's four (`read`/`bash`/`edit`/`write`) and leaves `grep`, `find`, `ls` and `powershell` ACTIVE. **Impact** `--no-builtin-tools` does not do what it says: four built-in tools survive the flag, including `powershell`. Low because the flag is opt-in and the survivors are read-mostly, but it is an affirmative wrong behaviour rather than an absent one. **Fix** make the arm select nothing built-in, keeping the existing `\|\| !ALL_BUILTIN_TOOLS.contains(name)` leg that is cyrup's spelling of `includeAllExtensionTools`. **Verify** a red-before test over the same stub tool set `the_default_tools_setting_replaces_pis_four_built_ins` uses: with `NoTools::Builtin`, assert the surviving set is the extension tool alone |
 | ~~SEAM-016~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | print-mode exit code derived by reverse-scanning the transcript — **CLOSED 2026-08-14**: sweep 1. |
 | ~~SEAM-025~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | M | Extension `session_start`/`session_shutdown` drop pi's session-file fields — **CLOSED 2026-08-14**: sweep 1 — the WIT/event widening arrived from area 06 mid-pass and the host halves (`emit_session_start`, `dispose_with`'s new target parameter, `install_inner`) are done. |
 | ~~SEAM-027~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | M | `--mode json` subscribes per-run, dropping between-prompt events — **CLOSED 2026-08-14**: sweep 1. |
@@ -793,7 +794,121 @@ at all**, so this fix must add one, not merely correct one.)* Add a `delete_sess
 
 **Verify** — Extend `modes.rs`'s command-surface test to assert the verb succeeds and `data.levels` is a non-empty array; re-run the verb-set diff against `rpc-types.ts:20-72` and expect it empty but for `unknown`.
 
-## SEAM-015 — RPC bash ignores the operations backend override
+## ~~SEAM-015~~ — ~~medium~~ **CLOSED 2026-09-04 (`abb8b5e3`)** — RPC bash ignores the operations backend override
+
+**Kind** not-ported · **Severity** ~~medium~~ closed · **Effort** M · **Confidence** confirmed · **CLOSED 2026-09-04**
+
+> **CLOSED 2026-09-04 at `abb8b5e3`** (`feat(session-svc): SEAM-015 fill BashOptions::operations from
+> the winning user_bash result`).
+>
+> **The row's own `cyrup` paragraph named the wrong `None`, and that is settled first.** The third
+> argument of the `execute_bash_with_user_event` call that opens at `crates/cyrup-modes/src/rpc/mod.rs:1164`
+> is `on_chunk`, passed `None` at `:1171` (this block first cited `:1163`, which is the `match session`
+> line above the call — off by the argument list, corrected 2026-09-05 in the review pass), and it is a FAITHFUL
+> port: pi passes `undefined` in the same position (`session.executeBash(command.command, undefined,
+> {…})`, `modes/rpc/rpc-mode.ts:578` @v0.84.4) because the RPC front-end observes output through the
+> `bash_execution_update` events keyed by `id`, not through a callback. Nothing was ever dropped there.
+>
+> **The real gap was one frame lower and is what closed.** Upstream reads `operations` off the winning
+> `emitUserBash` result at each front-end — `operations: eventResult?.operations`,
+> `modes/rpc/rpc-mode.ts:578-582` (the key at `:581`) and
+> `modes/interactive/interactive-mode.ts:6516-6525` (at `:6524`), over
+> `UserBashEventResult.operations` (`core/extensions/types.ts:1136-1142`, the field at `:1139`), which
+> `core/extensions/runner.ts:1005-1032` fills from the FIRST truthy handler and stops. cyrup emits
+> `user_bash` inside the shared `AgentSession::execute_bash_with_user_event` wrapper (so the interactive
+> `!`/`!!` front-end and the RPC arm cannot drift on WHETHER they emit), so the read-back belongs there
+> too — and did not exist: `emit_user_bash_event` took only the `"result"` key off the reduction payload
+> and threw the rest away.
+>
+> **What landed.** `crates/cyrup-session-svc/src/session/bash.rs`: a private `UserBashOutcome`
+> (`:41-62`) — `Serviced(BashResult)` / `Backend(Arc<dyn BashOperations>)` / `None` — replaces the old
+> `Option<BashResult>` return; `emit_user_bash_event` (`:238-288`) decodes `result` first and, only when
+> it is absent, resolves the backend; `execute_bash_with_user_event` (`:195-219`) records-and-returns on
+> `Serviced` and does `options.operations.get_or_insert(ops)` on `Backend`, so a caller that already
+> supplied its own backend (the arch-12 isolation decorators) keeps it. The callable is reached through
+> the extension that WON: `Reduced::Handled` gained a `by: ExtensionId`
+> (`crates/cyrup-ext/src/contract.rs:242-254`), exactly the field `Reduced::Blocked` already carried
+> (`:236-240`); `ExtensionHost::user_bash_operations` (`crates/cyrup-ext/src/facade.rs::user_bash_operations`)
+> resolves that owner and asks its `NativeExtension::user_bash_operations`
+> (`crates/cyrup-ext/src/native.rs::user_bash_operations`) with
+> `catch_unwind` containment — the native-only, every-build tier `render_live` already occupies. The RPC
+> arm itself is unchanged apart from its comment: its `operations: None` is upstream's absent
+> CALLER-supplied backend, which the wrapper now fills.
+>
+> **Design decision** (DESIGN-GUIDANCE): two small invariants, no ceremony beyond them.
+> (1) *A handled reduction is attributable.* Without `by`, a host holding a `HandledValue` had no route
+> back to the extension that produced it — which is precisely why the callable half was unreachable.
+> The field mirrors `Blocked`'s and makes "handled by nobody in particular" unrepresentable. Migration
+> cost: 8 match sites, all in-tree. Rejected: scanning every native for a backend (breaks pi's
+> first-truthy-handler rule — pinned by
+> `user_bash_operations_come_from_the_handler_that_won_not_a_later_extension`), and putting the backend
+> in `HookOutcome` (a bash-specific field on a type shared by every event).
+> (2) *`result` and `operations` are mutually exclusive at consumption.* Upstream's two fields are
+> independent on the wire but every consumption site tests `result` and returns before reading
+> `operations`, so a handler setting both silently loses the backend. `UserBashOutcome` applies that
+> precedence once, where the event result is decoded, instead of leaving two `Option`s for each
+> front-end to re-derive it from. Still needs runtime tests: that the precedence is applied on the RIGHT
+> side (a `result` override must not consult the backend) and that `get_or_insert` does not clobber a
+> caller's own backend. The first was covered below at closure; **the second was NOT — this block
+> claimed both were, and that claim was false for a day.** The only test with a caller-supplied backend,
+> `execute_bash_with_user_event_forwards_the_operations_override_to_the_executor`, builds a session with
+> no extension at all, so `emit_user_bash_event` returns at its `no_subscribers` guard
+> (`crates/cyrup-session-svc/src/session/bash.rs:245-251`) and the `Backend` arm never runs. Caught by
+> the batch-3 review; the missing test
+> (`a_caller_supplied_operations_backend_is_not_clobbered_by_the_user_bash_handler`) landed 2026-09-05
+> in the review-fix commit and is listed below. Rejected: a struct with two `Option`s (the shape that
+> permits the bug), and encoding it in `BashOptions` (which is the executor's input, not the event's
+> output).
+>
+> **Tests** — five, all RED before / GREEN after (four at closure, the fifth added 2026-09-05 in the
+> review pass). `crates/cyrup-session-svc/src/tests/round9_l5res.rs`:
+> `execute_bash_with_user_event_fills_operations_from_the_winning_user_bash_handler` (RED when the
+> `Backend` arm drops `ops`: the local shell's `LOCAL_SHELL_RAN` comes back instead of the backend's
+> sentinel; its non-vacuity control is the pre-existing
+> `execute_bash_without_an_operations_override_still_runs_on_the_local_shell`),
+> `a_user_bash_result_override_wins_over_the_same_handlers_operations_backend` (RED when the backend is
+> resolved before the `result` check), `user_bash_operations_come_from_the_handler_that_won_not_a_later_extension`
+> (RED when the facade resolves a backend from any loaded native instead of `by`). End to end on the
+> wire: `crates/cyrup-modes/src/tests/modes/rpc_bash.rs::rpc_bash_runs_on_an_extension_supplied_operations_backend`
+> — a `{"type":"bash"}` line whose command would print `locally-executed` comes back as
+> `ran-on-extension-backend`, with the `bash_execution_update` deltas still keyed by the request id
+> (same `onChunk` wrapper for both branches, `core/agent-session.ts:2779-2789`); RED with the same
+> drop-the-fill mutation. **Added 2026-09-05:**
+> `a_caller_supplied_operations_backend_is_not_clobbered_by_the_user_bash_handler`
+> (`round9_l5res.rs`) — the caller passes its own `RecordingBashOps` while a subscribed
+> `BashOpsSupplier` wins the reduction and offers another; the caller's backend runs the command and
+> the extension's never does. RED when `options.operations.get_or_insert(ops)` is written
+> `options.operations = Some(ops)` (the upstream-literal form), GREEN at HEAD. This is the invariant
+> the block above wrongly claimed was already covered. `cargo nextest run`: `-p cyrup-session-svc`
+> 329/329 at closure, **334/334** at the review-fix commit (this test plus four that arrived with later
+> batch-3 items on this branch), `-p cyrup-modes` 85/85.
+>
+> **Residual, recorded not filed as a reopen:** only a NATIVE extension can supply the backend. ADR-0002
+> keeps extension I/O value-typed, so a WASM guest can put the `operations` KEY in its reduction payload
+> (still pinned by `cyrup-ext`'s
+> `user_bash_reduction_carries_the_operations_half_not_only_the_result_half`) but nothing callable behind
+> it; that half is the `register-bash-operations` import + keyed `bash-operations-exec` export
+> round-trip costed in `crates/cyrup-ext/src/lib.rs`'s CYRUP-DELTA register, which is area 06's surface
+> and DRIFT-004's sibling half.
+>
+> **Second residual, recorded 2026-09-05 (review pass), no code change:**
+> `NativeExtension::user_bash_operations` is a SYNC method run inline on the async path that is
+> servicing the bash command — `ExtensionHost::user_bash_operations` (`crates/cyrup-ext/src/facade.rs:1029`)
+> takes its `std::sync::RwLock` read, drops the guard (it is consumed by the `and_then`, so nothing is
+> held across the call) and then runs the native supplier on the runtime thread. That mirrors the
+> `render_live` live tier exactly, so it is consistent with the crate and is not a defect of this
+> change, but a supplier that blocks stalls that command: a supplier should decide and return, doing
+> the work in the async `BashOperations::exec`. Recorded here rather than as a
+> `crates/cyrup-ext/src/native.rs` trait-doc line because the shared disk hit 100% during the review
+> pass and any `cyrup-ext` edit rebuilds every dependent crate; it is a one-line doc addition for
+> whoever next opens that trait.
+>
+> **Falsification:** a `user_bash` handler supplying a backend whose command still executes on the local
+> shell; a handler returning `result` whose backend is nevertheless consulted; a backend taken from an
+> extension whose handler never won the reduction; or a caller-supplied `BashOptions::operations`
+> overwritten by the event result.
+
+**The original item follows unchanged, for the record.**
 
 **Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** high
 

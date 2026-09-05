@@ -230,6 +230,14 @@ impl bindings::cyrup::ext::registration::Host for HostState {
             .register_markdown_transformer(guest.owner.clone());
     }
 
+    /// DRIFT-004 — pi `UserBashEventResult.operations` (`core/extensions/types.ts:1139`
+    /// @v0.84.4). Argument-less: the backend is a guest closure the host reaches through the
+    /// `bash-operations-exec` export, so this only records that this guest HAS one.
+    async fn register_bash_operations(&mut self) {
+        let Ok(guest) = guest_of(self) else { return };
+        let _ = guest.registry.register_bash_operations(guest.owner.clone());
+    }
+
     async fn register_message_renderer(&mut self, custom_type: String) {
         let Ok(guest) = guest_of(self) else { return };
         // Record it in the SHARED registry so the host can route a custom type back to its owning
@@ -971,6 +979,24 @@ impl bindings::cyrup::ext::host_tool::Host for HostState {
     }
 }
 
+/// DRIFT-004 — the two closure-shaped options of pi's `BashOperations.exec`
+/// (`core/tools/bash.ts:71-80` @v0.84.4), which cannot cross the boundary as closures.
+impl bindings::cyrup::ext::host_bash::Host for HostState {
+    async fn emit_bash_output(&mut self, call_id: String, chunk: Vec<u8>) {
+        if let Ok(guest) = guest_of(self) {
+            guest.push_bash_output(call_id, chunk);
+        }
+    }
+    async fn is_bash_cancelled(&mut self, call_id: String) -> bool {
+        // pi `signal.aborted` on the `AbortSignal` `executeBashWithOperations` threads into
+        // `operations.exec` (`core/bash-executor.ts:108-113`): true once the host's `CancelToken`
+        // for THIS command fired.
+        guest_of(self)
+            .map(|g| g.bash_is_cancelled(&call_id))
+            .unwrap_or(false)
+    }
+}
+
 impl bindings::cyrup::ext::oauth::Host for HostState {
     async fn on_auth(&mut self, url: String, instructions: Option<String>) {
         if let Ok(guest) = guest_of(self) {
@@ -1443,6 +1469,28 @@ impl Drop for ToolCallBinding<'_> {
     }
 }
 
+/// The `bash-operations-exec` sibling of [`ToolCallBinding`], with the same job on the same three
+/// exit paths (settled / cancelled / future dropped): unbind the command's `CancelToken` so a later
+/// `is-bash-cancelled` poll cannot read a dead command's state, and discard any output chunk that
+/// was never replayed so it cannot surface in the NEXT command's `on_data` (EXT-M06, DRIFT-004).
+///
+/// Declared AFTER the `inner` mutex guard so it drops BEFORE it, for the same reason.
+pub(crate) struct BashCallBinding<'a>(pub(crate) &'a Arc<GuestState>);
+
+impl Drop for BashCallBinding<'_> {
+    fn drop(&mut self) {
+        self.0.set_bash_cancel(None);
+        let dropped = self.0.clear_bash_output();
+        if dropped > 0 {
+            tracing::debug!(
+                chunks = dropped,
+                "guest bash command ended without replaying its streamed output (cancelled or \
+                 abandoned); discarded so it cannot surface in the next command"
+            );
+        }
+    }
+}
+
 /// A live loaded WASM extension (arch-08b). Holds the instantiated component + its `Store` behind an
 /// async `Mutex` (single-thread-per-Store, R-ARCH-EXT-013) and the `GuestState` that backs its
 /// imports. Implements [`Extension`]; the dispatcher treats it identically to a native built-in.
@@ -1630,6 +1678,125 @@ impl LiveExtension {
         }
     }
 
+    /// Run one command through this guest's registered bash backend — pi
+    /// `BashOperations.exec(command, cwd, {onData, signal, timeout, env})`
+    /// (`packages/coding-agent/src/core/tools/bash.ts:71-80` @v0.84.4), reached because this
+    /// extension's `user_bash` result carried `operations`
+    /// (`core/extensions/types.ts:1139`, consumed at `modes/rpc/rpc-mode.ts:581`). DRIFT-004.
+    ///
+    /// The two closure-shaped options travel as host imports keyed by `call_id`
+    /// (`host-bash.emit-bash-output` / `host-bash.is-bash-cancelled`); the two value options travel
+    /// in `opts_json`. Output is replayed into `on_data` after the call settles, exactly as
+    /// [`Self::execute_tool`] replays `onUpdate` and for the same reason — and, as there, the
+    /// CANCELLED arm still replays: upstream's `onData` fires synchronously as the command runs, so
+    /// an abort never retracts the output already delivered (`core/bash-executor.ts:130-147` keeps
+    /// the accumulated output on the abort path and returns it with `cancelled: true`).
+    ///
+    /// [CYRUP-DELTA, mechanism] A guest backend runs under the wasm EPOCH budget; pi's backends are
+    /// ordinary JS objects with none. The budget for this call is the standard per-dispatch one plus
+    /// the caller's declared `timeout` when there is one, so a backend given 30s to work gets 30s of
+    /// guest execution. An untimed command (what the `user_bash` seam passes, `bash.rs`'s
+    /// `timeout: None`) therefore gets the ordinary ~5s dispatch budget and a longer one traps as
+    /// [`ExtError::EpochTimeout`] — surfaced here as a `ToolError`, never a host crash.
+    pub async fn bash_operations_exec(
+        &self,
+        call_id: &str,
+        command: &str,
+        cwd: &std::path::Path,
+        opts: cyrup_tools::ops::BashExecOptions<'_>,
+    ) -> Result<cyrup_tools::ops::ExitStatus, ToolError> {
+        use cyrup_tools::ops::ExitStatus;
+        // The seam's own options type is the parameter, so this method and
+        // [`cyrup_tools::ops::BashOperations::exec`] cannot drift on what a call carries. The two
+        // closure-shaped members are split off HERE, which is the whole substitution: `on_data`
+        // becomes the replayed `emit-bash-output` queue and `cancel` becomes the
+        // `is-bash-cancelled` binding, while the two value members cross as JSON.
+        let cyrup_tools::ops::BashExecOptions {
+            on_data,
+            cancel,
+            timeout,
+            env,
+            env_remove,
+        } = opts;
+        let opts_json = serde_json::json!({
+            "timeoutMs": timeout.map(|t| u64::try_from(t.as_millis()).unwrap_or(u64::MAX)),
+            "env": env
+                .into_iter()
+                .map(|(k, v)| (k, Value::String(v)))
+                .collect::<serde_json::Map<String, Value>>(),
+            "envRemove": env_remove,
+        })
+        .to_string();
+        let cwd = cwd.to_string_lossy();
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        let ticks = self.bash_epoch_ticks(timeout);
+        inner.store.set_epoch_deadline(ticks);
+        self.guest.arm_epoch_deadline_estimate(ticks);
+        // EVENT tier: a bash backend is a data path, not a session-control handler — upstream hands
+        // `exec` only the command, the cwd and its options.
+        self.guest.set_tier(CtxTier::Event);
+        self.guest
+            .set_bash_cancel(Some((call_id.to_string(), cancel.clone())));
+        let _bash_call = BashCallBinding(&self.guest);
+        let api = inner.instance.cyrup_ext_events();
+        let call =
+            api.call_bash_operations_exec(&mut inner.store, call_id, command, &cwd, &opts_json);
+        // Three arms, in priority order: the host's own cancel (pi's aborted `AbortSignal`, which
+        // `executeBashWithOperations` turns into `cancelled: true` rather than an error), the
+        // caller's declared timeout (what a local backend enforces by killing the child,
+        // `core/tools/bash.ts:119-123`), then the call itself.
+        let deadline = timeout.map(|t| Box::pin(tokio::time::sleep(t)));
+        let res = match deadline {
+            Some(mut sleep) => tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(ExitStatus::Killed),
+                _ = &mut sleep => Err(ExitStatus::TimedOut),
+                r = call => Ok(r),
+            },
+            None => tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(ExitStatus::Killed),
+                r = call => Ok(r),
+            },
+        };
+        for chunk in self.guest.take_bash_output_for(call_id) {
+            on_data(&chunk);
+        }
+        let res = match res {
+            Ok(r) => r,
+            // Cancelled / timed out: the accumulated output is already delivered above.
+            Err(status) => return Ok(status),
+        };
+        match res {
+            // pi `{ exitCode: number }`.
+            Ok(Ok(Some(code))) => Ok(ExitStatus::Exited(code)),
+            // pi `{ exitCode: null }` — "killed". Which KIND of kill is the host's own state to
+            // know, exactly as `executeBashWithOperations` re-derives `cancelled` from its own
+            // signal (`core/bash-executor.ts:121`) rather than from the backend's return.
+            Ok(Ok(None)) => Ok(if cancel.is_cancelled() {
+                ExitStatus::Killed
+            } else {
+                ExitStatus::Signaled
+            }),
+            // pi's `throw`: `executeBashWithOperations` re-raises everything that is not an abort
+            // (`core/bash-executor.ts:154`), so a backend failure is never a successful command.
+            Ok(Err(msg)) => Err(ToolError::new(msg)),
+            Err(e) => Err(ToolError::new(map_wasm_error(&e).to_string())),
+        }
+    }
+
+    /// The epoch budget for one `bash-operations-exec`: the standard per-dispatch budget, plus the
+    /// caller's declared `timeout` converted at [`crate::host::epoch::DEFAULT_TICK`] when there is
+    /// one. See [`Self::bash_operations_exec`]'s CYRUP-DELTA note.
+    fn bash_epoch_ticks(&self, timeout: Option<std::time::Duration>) -> u64 {
+        let tick_ms = crate::host::epoch::DEFAULT_TICK.as_millis().max(1);
+        let extra = timeout
+            .map(|t| u64::try_from(t.as_millis().div_ceil(tick_ms)).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        self.epoch_ticks.saturating_add(extra)
+    }
+
     /// Execute a guest-registered slash command (R-08-016). Mirrors Pi's
     /// `RegisteredCommand.handler(args, ctx)` (types.ts:1167 @v0.83.0; EXT-072: `:1109` is
     /// `skipConversationRestore`): runs at COMMAND tier (session-control
@@ -1756,23 +1923,30 @@ impl LiveExtension {
         }
     }
 
-    /// Render a tool call via a guest-registered message renderer (Pi `renderCall`, types.ts:489).
-    /// Returns the serialized widget tree, or `None` to fall back to the default renderer.
+    /// Render a tool call via a guest-registered message renderer (Pi `renderCall`,
+    /// `extensions/types.ts:491` @v0.84.4). Returns the serialized widget tree, or `None` to fall
+    /// back to the default renderer.
+    ///
+    /// `opts` is the `(options, theme)` half of every upstream renderer signature and is a LIVE
+    /// input, not an ingest-time constant (EXT-006) — see [`crate::RenderOptions`].
     pub async fn render_call(
         &self,
         custom_type: &str,
         call: &Value,
+        opts: &crate::RenderOptions,
     ) -> Result<Option<Value>, ExtError> {
-        self.render(custom_type, call, true).await
+        self.render(custom_type, call, opts, true).await
     }
 
-    /// Render a tool result via a guest-registered renderer (Pi `renderResult`, types.ts:492).
+    /// Render a tool result via a guest-registered renderer (Pi `renderResult`,
+    /// `extensions/types.ts:493-498` @v0.84.4). See [`Self::render_call`].
     pub async fn render_result(
         &self,
         custom_type: &str,
         result: &Value,
+        opts: &crate::RenderOptions,
     ) -> Result<Option<Value>, ExtError> {
-        self.render(custom_type, result, false).await
+        self.render(custom_type, result, opts, false).await
     }
 
     /// Transform transcript markdown through this guest's registered transformer (EXT-019; pi
@@ -2003,6 +2177,7 @@ impl LiveExtension {
         &self,
         custom_type: &str,
         payload: &Value,
+        opts: &crate::RenderOptions,
         is_call: bool,
     ) -> Result<Option<Value>, ExtError> {
         let mut guard = self.inner.lock().await;
@@ -2011,12 +2186,13 @@ impl LiveExtension {
         self.guest.arm_epoch_deadline_estimate(self.epoch_ticks);
         self.guest.set_tier(CtxTier::Event);
         let payload_s = payload.to_string();
+        let opts_s = opts.to_json();
         let api = inner.instance.cyrup_ext_events();
         let res = if is_call {
-            api.call_render_call(&mut inner.store, custom_type, &payload_s)
+            api.call_render_call(&mut inner.store, custom_type, &payload_s, &opts_s)
                 .await
         } else {
-            api.call_render_result(&mut inner.store, custom_type, &payload_s)
+            api.call_render_result(&mut inner.store, custom_type, &payload_s, &opts_s)
                 .await
         };
         match res {
@@ -2186,6 +2362,50 @@ impl Tool for WasmTool {
                 &cancel,
                 &mut on_update,
             )
+            .await
+    }
+}
+
+/// The per-call bash backend a WASM guest supplies — pi's `UserBashEventResult.operations` object
+/// (`core/extensions/types.ts:1139` @v0.84.4), reconstituted host-side as a
+/// [`cyrup_tools::ops::BashOperations`] that forwards each `exec` to the owning guest's
+/// `bash-operations-exec` export. DRIFT-004.
+///
+/// This is the GUEST tier of [`crate::ExtensionHost::user_bash_operations`], beside the native tier
+/// ([`crate::NativeExtension::user_bash_operations`], which hands back a real Rust object). ADR-0002
+/// forbids a guest RETURNING a callable, so the callable stays guest-side and the host holds this
+/// forwarder instead — the same substitution `register-message-renderer` + `render-call` makes for
+/// a renderer.
+pub struct GuestBashOperations {
+    ext: Arc<LiveExtension>,
+}
+
+impl GuestBashOperations {
+    /// Over the live instance of the extension whose `user_bash` result won the reduction.
+    pub fn new(ext: Arc<LiveExtension>) -> Self {
+        Self { ext }
+    }
+
+    /// A fresh key for one `exec`, so `emit-bash-output` / `is-bash-cancelled` are attributable to
+    /// the command that is actually running (EXT-M06's rule, applied to this seam). Upstream needs
+    /// no key at all: its `onData`/`signal` ARE the call.
+    fn next_call_id() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        format!("user-bash-{}", NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+#[async_trait::async_trait]
+impl cyrup_tools::ops::BashOperations for GuestBashOperations {
+    async fn exec(
+        &self,
+        command: &str,
+        cwd: &std::path::Path,
+        opts: cyrup_tools::ops::BashExecOptions<'_>,
+    ) -> Result<cyrup_tools::ops::ExitStatus, ToolError> {
+        self.ext
+            .bash_operations_exec(&Self::next_call_id(), command, cwd, opts)
             .await
     }
 }

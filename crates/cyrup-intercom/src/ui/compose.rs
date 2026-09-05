@@ -291,6 +291,7 @@ mod tests {
 
     fn session() -> SessionInfo {
         SessionInfo {
+            endpoint_epoch: None,
             id: "session-12345678".to_string(),
             name: Some("subagent-chat-019ecaf6".to_string()),
             runtime_fallback_alias: None,

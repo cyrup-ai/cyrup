@@ -104,6 +104,7 @@ fn child_runtime_for(inbox: &std::path::Path) -> Arc<dyn NativeExtension> {
     crate::prompt_runtime::prompt_runtime_extension_from(&move |key: &str| {
         (key == STEER_INBOX_ENV).then(|| inbox.clone())
     })
+    .expect("no tool budget in this env, so the runtime always builds")
     .expect(
         "a child handed a steer inbox MUST get a prompt runtime — before this wiring the env var \
          did not exist and this resolver returned None",
@@ -395,6 +396,7 @@ fn child_runtime_with_return_path(
             None
         }
     })
+    .expect("no tool budget in this env, so the runtime always builds")
     .expect("a child handed a steer inbox MUST get a prompt runtime")
 }
 
@@ -846,13 +848,16 @@ async fn the_default_delivery_mode_is_omitted_from_the_wire_record() {
 #[test]
 fn a_child_with_no_steer_inbox_gets_no_steering_surface() {
     assert!(
-        crate::prompt_runtime::prompt_runtime_extension_from(&|_key: &str| None).is_none(),
+        crate::prompt_runtime::prompt_runtime_extension_from(&|_key: &str| None)
+            .expect("no tool budget in this env, so the runtime always builds")
+            .is_none(),
         "a process with none of the child env vars must get no runtime at all"
     );
     assert!(
         crate::prompt_runtime::prompt_runtime_extension_from(&|key: &str| {
             (key == STEER_INBOX_ENV).then(|| "   ".to_string())
         })
+        .expect("no tool budget in this env, so the runtime always builds")
         .is_none(),
         "a BLANK inbox path is the same as unset (pi `:194`'s `?.trim()`), not a poller against \
          the process cwd"

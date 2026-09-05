@@ -135,7 +135,7 @@ async fn the_call_row_renders_every_pi_branch() {
         async move {
             flatten(
                 &host
-                    .render_tool_call("subagent", &args)
+                    .render_tool_call("subagent", &args, &Default::default())
                     .await
                     .expect("rendered"),
             )
@@ -239,7 +239,7 @@ async fn a_settled_single_result_draws_the_compact_row() {
 
     let drawn = flatten(
         &host
-            .render_tool_result("subagent", &result)
+            .render_tool_result("subagent", &result, &Default::default())
             .await
             .expect("rendered"),
     );
@@ -276,7 +276,7 @@ async fn an_async_start_draws_the_content_text_with_the_fork_prefix() {
     });
     let drawn = flatten(
         &host
-            .render_tool_result("subagent", &result)
+            .render_tool_result("subagent", &result, &Default::default())
             .await
             .expect("rendered"),
     );
@@ -289,12 +289,22 @@ async fn an_async_start_draws_the_content_text_with_the_fork_prefix() {
         "terminate": false
     });
     assert_eq!(
-        flatten(&host.render_tool_result("subagent", &plain).await.unwrap()),
+        flatten(
+            &host
+                .render_tool_result("subagent", &plain, &Default::default())
+                .await
+                .unwrap()
+        ),
         "Async: researcher [run-2]"
     );
     let empty = json!({ "content": [], "details": Value::Null, "terminate": false });
     assert_eq!(
-        flatten(&host.render_tool_result("subagent", &empty).await.unwrap()),
+        flatten(
+            &host
+                .render_tool_result("subagent", &empty, &Default::default())
+                .await
+                .unwrap()
+        ),
         "(no output)"
     );
 }
@@ -312,7 +322,7 @@ async fn a_management_result_draws_its_report_text() {
     });
     let drawn = flatten(
         &host
-            .render_tool_result("subagent", &result)
+            .render_tool_result("subagent", &result, &Default::default())
             .await
             .expect("rendered"),
     );
@@ -428,7 +438,7 @@ async fn a_real_tool_result_renders_through_the_settled_branch() {
     let host = host_at(dir.path()).await;
     let drawn = flatten(
         &host
-            .render_tool_result("subagent", &wire)
+            .render_tool_result("subagent", &wire, &Default::default())
             .await
             .expect("rendered"),
     );

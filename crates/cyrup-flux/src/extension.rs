@@ -24,8 +24,10 @@ use cyrup_ext::{
 /// EditorKeymap`, `ctrl('f') => CursorRight`). The extension-shortcut tier fires BEFORE the editor
 /// (`crates/cyrup-tui/src/app/input.rs`, "before the editor (so the key never leaks in as text)"),
 /// so every emacs-motion user lost forward-char to this overlay on a default install, with no
-/// diagnostic (the host never calls `ExtensionRegistry::resolve_shortcuts` — EXT-039's residual)
-/// and no rebind path (an extension shortcut is not a `Keybinding`). This extension has no
+/// diagnostic (at the time nothing called `ExtensionRegistry::resolve_shortcuts` — EXT-039's
+/// residual, since closed: `App::install_extension_shortcuts` now runs the gate, and a collision
+/// like that one warns in the `[Extension issues]` panel) and no rebind path (an extension
+/// shortcut is not a `Keybinding`). This extension has no
 /// upstream chord to port: `flux_bootstrap/` @v0.0.40 registers no keybinding at all (the overlay
 /// is a cyrup-native surface), so the chord is a cyrup design choice and must stay clear of every
 /// default keymap.

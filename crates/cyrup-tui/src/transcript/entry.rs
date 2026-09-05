@@ -157,8 +157,9 @@ pub enum Rendered {
     /// MESSAGE draws the default `[label]` + markdown box; a custom ENTRY is not pushed at all.
     #[default]
     None,
-    /// The renderer's output, already flattened to display text. Emitted verbatim.
-    Text(String),
+    /// The renderer's output, already flattened to display text, together with the invocation that
+    /// produced it ([`RenderedText`]). Emitted verbatim.
+    Text(RenderedText),
     /// The renderer threw; the payload is `error.message`. Draws Pi's failure box
     /// (`components/custom-entry.ts:47-52`).
     ///
@@ -171,6 +172,121 @@ pub enum Rendered {
     /// `Entry::BranchSummary` already follow, and what makes a resize re-wrap and an expand toggle
     /// open a card that was pushed collapsed.
     Live(std::sync::Arc<dyn cyrup_ext::RenderedComponent>),
+}
+
+/// One extension render: the flattened rows, and everything it takes to ASK FOR THEM AGAIN
+/// (EXT-006).
+///
+/// # Why the two travel together
+/// Upstream re-invokes a renderer from the DRAW path — `MessageRenderer = (message, options, theme)
+/// => Component` (`pi/packages/coding-agent/src/core/extensions/types.ts:1213-1217` @v0.84.4) is
+/// called per paint — so `options.expanded` and the active `theme` are live inputs. cyrup's draw
+/// path is sync and a guest renderer is an async wasm call, so the render happens once, off the
+/// event path, and the text is written into the transcript. That makes the text a SNAPSHOT, and a
+/// snapshot is only valid for the inputs it was taken under.
+///
+/// Rather than have every toggle remember to invalidate something, the snapshot carries its own
+/// inputs: [`crate::App::refresh_extension_renders`] derives staleness by comparing
+/// [`RenderSource::under`] against the live display inputs, so a row that would draw differently
+/// re-renders and a row that would not costs one comparison. A new producer of a
+/// [`Rendered::Text`] cannot forget to register itself, because the only thing that builds one is
+/// [`crate::app::run_renderer`], which stamps the source from the call it just made.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RenderedText {
+    /// The rows the renderer produced, flattened by `crate::app::rendered_text`.
+    pub text: String,
+    /// How to obtain them again — see [`Self::source`]. Private, and boxed: it is read only by the
+    /// refresh pass, every [`Entry`] carries two of these, and `Entry`'s largest variant is already
+    /// the one that would grow.
+    source: Option<Box<RenderSource>>,
+}
+
+impl RenderedText {
+    /// A render that can be asked for again — what every extension renderer produces.
+    pub fn new(text: impl Into<String>, source: RenderSource) -> Self {
+        Self {
+            text: text.into(),
+            source: Some(Box::new(source)),
+        }
+    }
+
+    /// A render with NO re-invocation path: it never refreshes, whatever the display inputs do.
+    /// The literal a test builds, and the shape-preserving value for a producer that is not an
+    /// extension renderer.
+    pub fn frozen(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            source: None,
+        }
+    }
+
+    /// The invocation that produced [`Self::text`], if it can be repeated.
+    pub fn source(&self) -> Option<&RenderSource> {
+        self.source.as_deref()
+    }
+}
+
+/// The renderer invocation a [`RenderedText`] came from, and the display inputs it ran under.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RenderSource {
+    /// Which host renderer surface answered — the one to ask again.
+    pub surface: RenderSurface,
+    /// The key the renderer is registered under: a custom type for a message/entry, the TOOL NAME
+    /// for a tool row (`crate::app::extension_render`).
+    pub key: String,
+    /// The payload the renderer was handed. Kept because a re-invocation needs it and the entry it
+    /// is attached to does not always still hold it (a custom message keeps only its rendered body).
+    pub payload: serde_json::Value,
+    /// The display inputs [`RenderedText::text`] was produced under. Comparing this against the
+    /// live ones IS the staleness test.
+    pub under: cyrup_ext::RenderOptions,
+}
+
+/// Where in the view a [`RenderedText`] lives, so [`crate::App::refresh_extension_renders`] can
+/// write a fresh one back into the row it re-rendered.
+///
+/// A live tool row is in `active_tools` and a finished-and-flushed one is in `pending`, so both
+/// have to be addressable; a custom message/entry is only ever in `pending`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RenderSlot {
+    /// `pending[i]`, an [`Entry::Custom`]'s `rendered`.
+    PendingCustom(usize),
+    /// `pending[i]`, an [`Entry::Tool`]'s CALL side.
+    PendingToolCall(usize),
+    /// `pending[i]`, an [`Entry::Tool`]'s RESULT side.
+    PendingToolResult(usize),
+    /// `active_tools[i]`'s CALL side.
+    ActiveToolCall(usize),
+    /// `active_tools[i]`'s RESULT side.
+    ActiveToolResult(usize),
+}
+
+/// One row whose extension render was produced under display inputs that no longer hold.
+pub(crate) struct StaleRender {
+    /// The row to write the new text into.
+    pub slot: RenderSlot,
+    /// The invocation to repeat, with [`RenderSource::under`] already advanced to the LIVE inputs —
+    /// so the caller hands it straight to `crate::app::run_renderer` and the result records the
+    /// options it was actually produced under.
+    pub next: RenderSource,
+}
+
+/// Which of the host's four renderer entry points produced a [`RenderedText`].
+///
+/// Upstream keeps `messageRenderers` and `entryRenderers` as disjoint maps
+/// (`extensions/types.ts:1766-1768` @v0.84.4) and resolves a tool row's `renderCall`/`renderResult`
+/// off the tool DEFINITION (`components/tool-execution.ts:84-92`); cyrup's host keeps the same
+/// tables, so re-asking has to name the surface rather than just the key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderSurface {
+    /// `ExtensionHost::render_message_call_outcome` — a custom MESSAGE.
+    Message,
+    /// `ExtensionHost::render_tool_call_outcome` — the CALL side of a tool row.
+    ToolCall,
+    /// `ExtensionHost::render_tool_result_outcome` — the RESULT side of a tool row.
+    ToolResult,
+    /// `ExtensionHost::render_entry` — a custom ENTRY.
+    Entry,
 }
 
 impl PartialEq for Rendered {
@@ -188,10 +304,10 @@ impl PartialEq for Rendered {
 }
 
 impl Rendered {
-    /// Collapse to the pre-X15 `Option<String>` shape — what the custom-MESSAGE and TOOL-row
+    /// Collapse to the pre-X15 single-render shape — what the custom-MESSAGE and TOOL-row
     /// surfaces want, since `custom-message.ts:82-84` catches a throw and falls through to the
     /// default box. The ENTRY surface must NOT use this.
-    pub fn into_text(self) -> Option<String> {
+    pub fn into_text(self) -> Option<RenderedText> {
         match self {
             Self::Text(t) => Some(t),
             // A live component has no flattened text: it is drawn per frame, not folded once. The
@@ -247,13 +363,17 @@ pub struct ToolRun {
     /// bash `Took {d}s` footer once the command finishes.
     pub(super) duration_ms: Option<u64>,
     /// The CALL text an extension's registered renderer produced for this tool (EXT-006; Pi
-    /// `ToolDefinition.renderCall`, extensions/types.ts:472-473, preferred over the built-in by
+    /// `ToolDefinition.renderCall`, extensions/types.ts:491 @v0.84.4, preferred over the built-in by
     /// `tool-execution.ts:81-112`). `None` = no extension renders this tool, so the built-in
     /// per-tool dispatch draws it.
-    pub rendered_call: Option<String>,
+    ///
+    /// A [`RenderedText`] rather than a bare `String` since EXT-006: it carries the display inputs
+    /// the text was produced under, which is what lets `Ctrl+O` and a theme switch re-invoke the
+    /// renderer instead of leaving a frozen row among live ones.
+    pub rendered_call: Option<RenderedText>,
     /// The RESULT text an extension's registered renderer produced (Pi `renderResult`,
-    /// extensions/types.ts:475-481). See [`ToolRun::rendered_call`].
-    pub rendered_result: Option<String>,
+    /// extensions/types.ts:493-498 @v0.84.4). See [`ToolRun::rendered_call`].
+    pub rendered_result: Option<RenderedText>,
     /// What the session's `getToolDefinition(name)` registry (agent-session.ts:806) answered for
     /// [`name`](ToolRun::name) when the run started: `None` = no definition, `Some(shell)` = a
     /// definition declaring that `renderShell`. Two of Pi's `ToolExecutionComponent` questions

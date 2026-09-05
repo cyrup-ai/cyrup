@@ -55,6 +55,7 @@
 //! - `command` — `control`: [`CommandCtx`].
 //! - `with_session` — the guest-side `withSession` callback registry + [`ReplacedSessionContext`].
 //! - `tool_call` — `host-tool`: [`Signal`] and [`ToolCall`].
+//! - `bash_call` — `host-bash`: [`BashCommand`], the one command a guest bash backend runs.
 //!
 //! Because those modules are private, rustdoc does not visit them on a default
 //! `cargo doc -p cyrup-ext-sdk --no-deps` run, so the crate-root
@@ -69,6 +70,7 @@
 #![allow(clippy::needless_return)]
 
 mod base;
+mod bash_call;
 mod command;
 mod exec;
 mod fs;
@@ -82,6 +84,7 @@ mod ui;
 mod with_session;
 
 pub use base::{Ctx, ExtMode};
+pub use bash_call::BashCommand;
 pub use command::CommandCtx;
 pub use exec::ExecResult;
 pub use http::{HttpRequest, HttpResponse, HttpStreamResponse};

@@ -603,6 +603,51 @@ fn shortcut_resolution_refuses_reserved_keys_warns_on_the_rest_and_records_every
     );
 }
 
+/// EXT-039, the shape production installs — `resolve_shortcut_specs` is `resolve_shortcuts` with
+/// the DESCRIPTION kept, because upstream's `getShortcuts` returns whole `ExtensionShortcut`
+/// records (`extensions/types.ts:1547-1552` @v0.84.4) and `/hotkeys` renders the same map it hands
+/// the editor — `shortcut.description ?? shortcut.extensionPath`
+/// (`modes/interactive/interactive-mode.ts:6364-6377`).
+///
+/// So a key the gate REFUSES cannot be listed either, and the `?? extensionPath` fallback resolves
+/// to the extension id, never to the key id.
+#[test]
+fn resolve_shortcut_specs_keeps_descriptions_and_drops_the_refused_key() {
+    let reg = ExtensionRegistry::new();
+    let keymap = vec![
+        ("app.interrupt".to_string(), vec!["ctrl+c".to_string()]),
+        ("app.help".to_string(), vec!["ctrl+h".to_string()]),
+    ];
+    reg.register_shortcut("ext-a".into(), "Ctrl+C", Some("steal interrupt".into()))
+        .unwrap();
+    reg.register_shortcut("ext-a".into(), "ctrl+h", Some("override help".into()))
+        .unwrap();
+    reg.register_shortcut("ext-b".into(), "ctrl+t", None)
+        .unwrap();
+
+    let specs = reg.resolve_shortcut_specs(&keymap).unwrap();
+    assert_eq!(
+        specs,
+        vec![
+            ("ctrl+h".to_string(), Some("override help".to_string())),
+            // `description ?? extensionPath` — the OWNER, not the key id.
+            ("ctrl+t".to_string(), Some("ext-b".to_string())),
+        ],
+        "the reserved `ctrl+c` must be absent, so `/hotkeys` cannot advertise it"
+    );
+    // Same rules, same diagnostics as the owner-only shape: the two must not drift.
+    assert_eq!(
+        reg.resolve_shortcuts(&keymap)
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect::<Vec<_>>(),
+        specs.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>()
+    );
+    // Rule 2 (`ctrl+c` skipped) and rule 3 (`ctrl+h` overridden) each recorded one.
+    assert_eq!(reg.shortcut_diagnostics().unwrap().len(), 2);
+}
+
 /// EXT-040. BEFORE: `register_shortcut` took only `(owner, key)` and the host discarded `desc` one
 /// line inside `register_shortcut` (`host/live.rs:98-101`), so `/hotkeys` printed the key id as its
 /// own label. pi renders `shortcut.description ?? shortcut.extensionPath`
@@ -1162,10 +1207,16 @@ impl NativeExtension for BashRedirect {
 ///     per-event key filter — `decode_patch`'s per-kind shaping applies to `mutate` only) and out of
 ///     [`ExtensionHost::emit_user_bash`] as the whole `UserBashReduction::Handled(Value)`.
 ///
-/// So the drop is downstream of both, in `cyrup-session-svc`: `emit_user_bash_event`
-/// (`session.rs`) reads only the `"result"` key off this value, and `BashOptions` (`bash.rs`) has no
-/// `operations` field for it to land in. The assertion below fails the moment anyone "fixes" the
-/// omission by filtering `operations` out here instead.
+/// The drop used to be downstream of both, in `cyrup-session-svc`. It no longer is: `BashOptions`
+/// has an `operations` field and `execute_bash_with_user_event` fills it from the winning
+/// `user_bash` result (SEAM-015). The KEY tested here is still the one a WASM guest can put in the
+/// payload today, and the assertion below fails the moment anyone "fixes" anything by filtering
+/// `operations` out at this boundary. Putting a CALLABLE behind the key is the OTHER half and is no
+/// longer open: a native extension supplies its backend through
+/// `NativeExtension::user_bash_operations`, and a guest through the
+/// `register-bash-operations` + `bash-operations-exec` round-trip (DRIFT-004,
+/// `crate::tests::bash_operations_seam` and `cyrup-it/tests/ext/wasm_bash_operations.rs`). This
+/// test is still about the PAYLOAD: the key must survive the reduction whichever tier reads it.
 ///
 /// Presence before absence: the `result` half is asserted first, so a reduction that dropped the
 /// whole payload could not pass by vacuously satisfying the `operations` check.
@@ -1200,9 +1251,9 @@ async fn user_bash_reduction_carries_the_operations_half_not_only_the_result_hal
     assert_eq!(
         v["operations"],
         json!({ "backend": "ssh", "remote": "build-box" }),
-        "the `operations` override must reach the caller intact; the seam that can act on it is \
-         `cyrup_tools::ops::BashOperations`, and the guest-side round-trip that would let a WASM \
-         extension supply one is the open half of DRIFT-004 (see the CYRUP-DELTA register in \
-         `crates/cyrup-ext/src/lib.rs`)"
+        "the `operations` override must reach the caller intact; the seam that acts on it is \
+         `cyrup_tools::ops::BashOperations`, supplied by a native extension directly or by a WASM \
+         guest over the `bash-operations-exec` round-trip (DRIFT-004; see the CYRUP-DELTA register \
+         in `crates/cyrup-ext/src/lib.rs`)"
     );
 }

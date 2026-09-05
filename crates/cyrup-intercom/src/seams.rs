@@ -175,6 +175,7 @@ fn deliver_local_relay(state: &SharedIntercomState, text: String) -> Result<bool
     // trigger is unconditional here too (never `config.inbound_trigger`-gated).
     let now = now_ms();
     let from = SessionInfo {
+        endpoint_epoch: None,
         id: LOCAL_RELAY_SENDER.to_string(),
         name: Some(LOCAL_RELAY_SENDER.to_string()),
         // A synthetic relay sender is not an unnamed runtime: the name is chosen, not derived.
@@ -446,6 +447,7 @@ mod tests {
         // Simulate the orchestrator having received the child's ask over the broker.
         let body = format_child_orchestrator_message(ChildMessageKind::Ask, &meta(), "Which DB?");
         let from = SessionInfo {
+            endpoint_epoch: None,
             id: "child-session".to_string(),
             name: Some("subagent-chat-1".to_string()),
             runtime_fallback_alias: None,
@@ -505,6 +507,7 @@ mod tests {
         // unambiguously the "no host services bound" (P-1 unbound) degrade, not a correlation miss.
         let body = format_child_orchestrator_message(ChildMessageKind::Ask, &meta(), "Which DB?");
         let from = SessionInfo {
+            endpoint_epoch: None,
             id: "child-session".to_string(),
             name: Some("subagent-chat-1".to_string()),
             runtime_fallback_alias: None,

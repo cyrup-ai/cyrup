@@ -55,6 +55,7 @@ fn turn_end(text: &str) -> HostEvent {
             kind: "probe".to_string(),
             payload: serde_json::json!({ "text": text }),
             details: None,
+            display: true,
             timestamp: Some(0),
         },
         tool_results: Vec::new(),
@@ -448,6 +449,7 @@ fn the_env_built_child_watchdog_has_a_review_wired() {
     let runtime = crate::prompt_runtime::prompt_runtime_from_env(&|key| {
         (key == crate::watchdog::child_status::CHILD_WATCHDOG_CONFIG_ENV).then(|| config.clone())
     })
+    .expect("no tool budget in this env, so the runtime always builds")
     .expect("a watchdog config alone arms the child runtime");
     let watchdog = runtime.watchdog().expect("the child watchdog is installed");
     let snapshot = watchdog.runtime().get_snapshot(None);
@@ -463,7 +465,8 @@ async fn an_unarmed_child_installs_no_watchdog_at_all() {
     // The env-driven resolver with nothing in the environment: no watchdog, and — with no other
     // child flag set either — no prompt-runtime extension at all, exactly as upstream's
     // `registerChildWatchdog` returns `undefined`.
-    let extension = crate::prompt_runtime::prompt_runtime_extension_from(&|_| None);
+    let extension = crate::prompt_runtime::prompt_runtime_extension_from(&|_| None)
+        .expect("no tool budget in this env, so the runtime always builds");
     assert!(extension.is_none());
 }
 

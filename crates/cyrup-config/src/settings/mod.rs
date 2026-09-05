@@ -32,7 +32,7 @@ pub use merge::deep_merge;
 pub use migrate::migrate_settings;
 pub use store::{FileSettingsStore, InMemorySettingsStore, SettingsStore};
 pub use types::{
-    BranchSummarySettings, CompactionSettings, DefaultProjectTrust, FullscreenScrollbar,
-    MermaidRenderingMode, PackageSource, ProviderRetrySettings, RetrySettings, SettingsScope,
-    ThinkingBudgets, TuiMode, Warnings,
+    BranchSummarySettings, CompactionSettings, DefaultProjectTrust, FullscreenExitOutput,
+    FullscreenScrollbar, MermaidRenderingMode, PackageSource, ProviderRetrySettings, RetrySettings,
+    SettingsScope, ThinkingBudgets, TuiMode, Warnings,
 };

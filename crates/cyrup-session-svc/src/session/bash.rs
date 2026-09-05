@@ -38,6 +38,29 @@ impl Drop for BashCancelGuard<'_> {
     }
 }
 
+/// What the `user_bash` extension seam decided about one user-initiated command — the reduction of
+/// Pi's `UserBashEventResult` (`packages/coding-agent/src/core/extensions/types.ts:1136-1142`
+/// @v0.84.4: `{operations?: BashOperations, result?: BashResult}`) at the point the host consumes
+/// it.
+///
+/// Upstream's two fields are optional and independent on the WIRE, but MUTUALLY EXCLUSIVE at every
+/// consumption site: `rpc-mode.ts:571-582` (and `interactive-mode.ts:6471-6524`) test
+/// `eventResult?.result` first and `return` before `operations` is read, so a handler that sets
+/// both has its `operations` silently ignored. Collapsing them into one enum applies that
+/// precedence ONCE, where the event result is decoded, instead of leaving two `Option`s for each
+/// front-end to re-derive it from — and makes "executed the handler's result AND over the
+/// handler's backend" unrepresentable rather than merely unreachable.
+enum UserBashOutcome {
+    /// Pi `eventResult.result`: the handler fully serviced the command. Recorded into the
+    /// transcript and returned; nothing executes.
+    Serviced(BashResult),
+    /// Pi `eventResult.operations` with no `result`: execute normally, but over this backend
+    /// instead of `createLocalBashOperations` (`agent-session.ts:2782`'s `??`).
+    Backend(std::sync::Arc<dyn cyrup_tools::ops::BashOperations>),
+    /// Pi `undefined` — nobody subscribed, nobody handled, or the winner supplied neither half.
+    None,
+}
+
 impl AgentSession {
     /// Execute a bash command out-of-band and record its result (Pi `executeBash`,
     /// agent-session.ts:2588). Streams combined output to `on_chunk`; the result is recorded into the
@@ -154,64 +177,84 @@ impl AgentSession {
     /// "fix: rpc bash no longer bypass user_bash", #7214, so an extension observing user bash no
     /// longer misses RPC-issued commands). Both cyrup front-ends therefore share this one wrapper.
     ///
-    /// Pi's sibling `operations` remote-exec override — the other half of `UserBashEventResult` —
-    /// is threaded through [`BashOptions::operations`] and honored by [`Self::execute_bash`]
-    /// (`options?.operations ?? createLocalBashOperations({ shellPath })`,
-    /// `agent-session.ts:2782`). **What this wrapper still cannot do is FILL it from the event
-    /// result, and that is DRIFT-004 / SEAM-015's last remaining half.** Upstream's
-    /// `rpc-mode.ts:576` can write `operations: eventResult?.operations` because a JS handler
-    /// returns a live object; cyrup's extension I/O is serde values (ADR-0002), so the payload
-    /// [`Self::emit_user_bash_event`] receives can carry the `operations` KEY but never a callable
-    /// behind it. Closing it needs the `register-bash-operations` import + keyed
-    /// `bash-operations-exec` export round-trip designed in full in `crates/cyrup-ext/src/lib.rs`'s
-    /// CYRUP-DELTA register — a `crates/cyrup-ext` + `crates/cyrup-ext-sdk` change with a
-    /// `HOST_WORLD` minor bump, not a change here. Once it exists this wrapper sets one field.
+    /// Pi's sibling `operations` remote-exec override — the other half of `UserBashEventResult`
+    /// (`extensions/types.ts:1136-1142` @v0.84.4, the field at `:1139`) — is FILLED here from the same winning event
+    /// result and threaded through [`BashOptions::operations`] into [`Self::execute_bash`], which
+    /// resolves `options?.operations ?? createLocalBashOperations({ shellPath })`
+    /// (`agent-session.ts:2782`). Upstream writes the field at each front-end
+    /// (`operations: eventResult?.operations`, `rpc-mode.ts:581`;
+    /// `interactive-mode.ts:6524`); cyrup writes it once, here, because both front-ends share this
+    /// wrapper. A field the CALLER already supplied is never overwritten — the RPC and interactive
+    /// arms both pass `None`, so in practice the event result is what fills it, but an in-host
+    /// caller with its own backend (the arch-12 isolation decorators) keeps it.
+    ///
+    /// Both extension tiers can supply the backend (DRIFT-004): a NATIVE extension returns the
+    /// object, and a WASM guest — which ADR-0002 forbids returning a callable — declares one with
+    /// `registration.register-bash-operations` and serves it over the `events.bash-operations-exec`
+    /// export. `ExtensionHost::user_bash_operations` resolves whichever tier the winning extension
+    /// lives in, so this wrapper sees one `Arc<dyn BashOperations>` either way.
     pub async fn execute_bash_with_user_event(
         &self,
         command: &str,
-        options: BashOptions,
+        mut options: BashOptions,
         on_chunk: crate::bash::BashChunkSink,
     ) -> Result<BashResult, SessionServiceError> {
-        if let Some(result) = self
+        match self
             .emit_user_bash_event(command, options.exclude_from_context)
             .await
         {
-            self.record_bash_result(command, &result, options).await;
-            return Ok(result);
+            // Pi `if (eventResult?.result) { recordBashResult(...); return ... }`
+            // (`rpc-mode.ts:571-576`): a full result short-circuits execution entirely.
+            UserBashOutcome::Serviced(result) => {
+                self.record_bash_result(command, &result, options).await;
+                Ok(result)
+            }
+            // Pi's `else` branch: execute normally, but over the handler's backend
+            // (`rpc-mode.ts:578-582`).
+            UserBashOutcome::Backend(ops) => {
+                options.operations.get_or_insert(ops);
+                self.execute_bash(command, options, on_chunk).await
+            }
+            UserBashOutcome::None => self.execute_bash(command, options, on_chunk).await,
         }
-        self.execute_bash(command, options, on_chunk).await
     }
 
-    /// Emit the `user_bash` extension event and, if a handler fully serviced the command (Pi
-    /// `UserBashEventResult.result`, `extensions/types.ts:1078-1083`), return its [`BashResult`]
-    /// override so the caller skips local execution. Returns `None` when nobody subscribed or no
-    /// result override was supplied. Carries the live `command`, the `exclude_from_context` flag
-    /// (the interactive `!!` prefix, or the RPC command's `excludeFromContext ?? false`,
-    /// `rpc-mode.ts:562`), and the session cwd (Pi `UserBashEvent`, `extensions/types.ts:813-821`).
+    /// Emit the `user_bash` extension event and reduce the winning handler's
+    /// `UserBashEventResult` (Pi `extensions/types.ts:1136-1142` @v0.84.4) to a
+    /// [`UserBashOutcome`]. Carries the live `command`, the `exclude_from_context` flag (the
+    /// interactive `!!` prefix, or the RPC command's `excludeFromContext ?? false`,
+    /// `rpc-mode.ts:567`), and the session cwd (Pi `UserBashEvent`, `extensions/types.ts:813-821`).
     ///
-    /// Matches Pi's `emitUserBash` (`extensions/runner.ts:955-981`) dispatch semantics: the FIRST
-    /// truthy handler result wins and short-circuits the remaining handlers, and a handler that
-    /// throws is caught and reported rather than being fatal — `dispatch_block_mutate` returning
-    /// `Reduced::Handled` is cyrup's equivalent of the former, and the dispatcher's per-extension
-    /// error isolation of the latter.
+    /// Matches Pi's `emitUserBash` (`extensions/runner.ts:1005-1032` @v0.84.4) dispatch semantics:
+    /// the FIRST truthy handler result wins and short-circuits the remaining handlers, and a
+    /// handler that throws is caught and reported rather than being fatal — `dispatch_block_mutate`
+    /// returning `Reduced::Handled` is cyrup's equivalent of the former, and the dispatcher's
+    /// per-extension error isolation of the latter.
+    ///
+    /// The `result` half deserializes straight out of the reduction payload. The `operations` half
+    /// cannot — it is a callable, and ADR-0002 makes extension I/O values — so it is fetched back
+    /// from the extension that WON the reduction (`Reduced::Handled`'s `by`) via
+    /// [`cyrup_ext::ExtensionHost::user_bash_operations`], which is upstream's
+    /// `eventResult.operations` read (`rpc-mode.ts:581`) expressed over cyrup's value-typed seam.
     async fn emit_user_bash_event(
         &self,
         command: &str,
         exclude_from_context: bool,
-    ) -> Option<BashResult> {
+    ) -> UserBashOutcome {
         if self
             .services
             .ext_host
             .dispatcher()
             .no_subscribers(cyrup_ext::EventKind::UserBash)
         {
-            return None;
+            return UserBashOutcome::None;
         }
         let cancel = self.session_cancel.child_token();
+        let cwd = self.services.cwd.display().to_string();
         let event = HostEvent::UserBash {
             command: command.to_string(),
             exclude_from_context,
-            cwd: self.services.cwd.display().to_string(),
+            cwd: cwd.clone(),
         };
         let reduced = self
             .services
@@ -219,17 +262,30 @@ impl AgentSession {
             .dispatcher()
             .dispatch_block_mutate(event, &cancel)
             .await;
-        // A handler that returned a `UserBashEventResult.result` (Pi types.ts:1043-1048) fully
-        // serviced the command; deserialize the override `BashResult`. Other outcomes fall through
-        // to normal execution.
-        if let Reduced::Handled(handled) = reduced {
-            return handled
-                .0
-                .get("result")
-                .cloned()
-                .and_then(|r| serde_json::from_value::<BashResult>(r).ok());
+        // Only a `Handled` outcome carries a `UserBashEventResult` at all; a block or a pass falls
+        // through to normal local execution.
+        let Reduced::Handled { value, by } = reduced else {
+            return UserBashOutcome::None;
+        };
+        // Pi tests `eventResult?.result` FIRST and returns before it ever looks at `operations`
+        // (`rpc-mode.ts:571-582`), so a result the handler supplied wins outright — which is why
+        // [`UserBashOutcome`] cannot hold both.
+        if let Some(result) = value
+            .0
+            .get("result")
+            .cloned()
+            .and_then(|r| serde_json::from_value::<BashResult>(r).ok())
+        {
+            return UserBashOutcome::Serviced(result);
         }
-        None
+        match self
+            .services
+            .ext_host
+            .user_bash_operations(&by, command, exclude_from_context, &cwd)
+        {
+            Some(ops) => UserBashOutcome::Backend(ops),
+            None => UserBashOutcome::None,
+        }
     }
 
     /// Record a bash result into the transcript + session (Pi `recordBashResult`,

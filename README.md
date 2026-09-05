@@ -12,7 +12,8 @@ backbone.
 > **Status:** pre-release, and not yet versioned. The agent loop, provider layer, tool set, session
 > tree, terminal interface, extension host, all four run modes, the MCP client and the Flux
 > development pipeline work end to end. 21 crates, ~786k lines of Rust, 8,710 workspace tests and
-> 492 integration tests passing.
+> 492 integration tests passing — those four figures were measured at code HEAD `6cf2cb9f`; the
+> batch since then added tests across nine crates and neither total has been re-derived.
 
 ## Install
 
@@ -65,7 +66,7 @@ change a setting, or answer a trust prompt.
 ## Extensions are WebAssembly components
 
 Pi loads TypeScript at runtime. cyrup runs extensions as WASM components under Wasmtime, against a
-versioned WIT world (`cyrup:ext@0.8.0`). That buys three things a dynamic-import model cannot.
+versioned WIT world (`cyrup:ext@0.10.0`). That buys three things a dynamic-import model cannot.
 
 **A real sandbox.** An extension declares what it needs in its manifest: filesystem roots, process
 execution, network, UI. The host enforces it. A component that declares nothing gets nothing, and
@@ -250,12 +251,18 @@ Two conventions:
 
 Behavioural differences from Pi are tracked in the open, in
 [`docs/gap-analysis/`](docs/gap-analysis/README.md), so an unported feature is not mistaken for a
-bug. 103 rows are open across the area files: no `critical`, one `high`, 28 `medium`, 74 `low`, with
-564 closed. `docs/gap-analysis/scripts/count_open_items.py` produces those counts.
+bug. 90 rows are open across the area files: no `critical`, no `high`, 14 `medium`, 76 `low`, with
+584 closed. `docs/gap-analysis/scripts/count_open_items.py` produces those counts, measured at code
+HEAD `79b0a578`.
 
-The one row above `medium` is `SUBA-074`: an agent's `runner:` frontmatter can name an external CLI
-to run the child under, and that adapter protocol is unported, so the frontmatter is refused rather
-than honoured.
+**Nothing is open above `medium`**, which is a first for this ledger. `SUBA-074` — an agent's
+`runner:` frontmatter naming an external CLI to run the child under — was the last such row, and the
+external-CLI runner, its capability contract and the `claude-code` adapter are now ported; the
+`codex-exec` and `cursor-agent` adapters and the `external-job` protocol are refused by name rather
+than silently ignored. Read that as "no row currently carries a `critical` or `high` severity",
+not as "nothing serious is left": whatever is open is a floor rather than a total, six of the
+fifteen open `medium` rows were filed in the last two days, and the set above `medium` has turned
+over completely inside a single pass before.
 
 The ledger is mostly a static analysis. Items are evidenced by reading both sources rather than by
 running anything, its measured error rate has run near 12%, and it lags the code. Treat an entry as a
@@ -263,11 +270,14 @@ lead to verify. Items that have been observed against a running binary are marke
 [`REPRO-LOG.md`](docs/gap-analysis/REPRO-LOG.md).
 
 MCP is the largest piece still in flight. A model calls a real server's tools end to end, and the
-port is enumerated as 437 units in `docs/gap-analysis/13*` against `pi-mcp-adapter`, with four
-upstream surfaces cut by owner decision. That census predates the work that made the crate function
-and needs re-deriving; the live figure is the source, where 9 `TODO(MCP-NNN)` ids remain. Area 13 is
-counted separately from the table above because it plans code that does not exist yet rather than
-measuring drift in code that does.
+port is enumerated in `docs/gap-analysis/13*` against `pi-mcp-adapter`, with four upstream surfaces
+cut by owner decision. That census has now been re-derived against `v2.32.1`: **244 of 437 units
+implemented, 166 open**, plus 40 units filed for the `v2.26.1..v2.32.1` delta (147 files,
++16,014 / −1,001 across 72 commits). The counted figure is a floor, not an answer — 159 open rows
+were not re-opened, and the extrapolation over them carries a wide interval, so do not quote it as a
+count. The 13 `TODO(MCP-NNN)` markers in `crates/cyrup-mcp/src` are likewise a floor: six further ids
+are open with no marker. Area 13 is counted separately from the table above because it plans code
+that does not exist yet rather than measuring drift in code that does.
 
 ## Upstreams
 

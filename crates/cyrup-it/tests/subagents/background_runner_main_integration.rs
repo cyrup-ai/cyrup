@@ -52,7 +52,7 @@ use cyrup_ext_subagents::background::{ResultFile, RunId, RunMode, RunPaths, RunS
 use cyrup_ext_subagents::discovery::types::SystemPromptMode;
 use cyrup_ext_subagents::exec::ResolvedAgentPersona;
 use cyrup_ext_subagents::spawn::SpawnCommand;
-use cyrup_ext_subagents::spawn::chain_graph::{RunnerStep, SingleStepSpec};
+use cyrup_ext_subagents::spawn::chain_graph::{ParallelGroupSpec, RunnerStep, SingleStepSpec};
 
 /// A minimal resolved persona for a fixture-driven test (T0.1 / C13): a real model so
 /// `build_model_candidates` yields a non-empty ladder (the scripted fixture ignores `--model`
@@ -2517,4 +2517,186 @@ async fn a_child_scoped_stop_for_a_pending_step_is_queued_and_skips_it_when_reac
         "the skipped step must never be reported started: {events:?}"
     );
     assert!(of("subagent.run.stopped").is_empty());
+}
+
+/// SUBA-093 — a child-scoped stop aimed at ONE member of a `tasks[]` fan-out tears that member
+/// down and lets its siblings finish, which is the scenario `SUBA-087`'s filing led with and left
+/// undelivered: cyrup published a single `<parallel:3 tasks>` entry for the whole group, so
+/// `childId: "step:1"` resolved to the group and `route_child_stop_requests` fired the one stop
+/// handle registered for it, killing all three.
+///
+/// Upstream flattens a parallel group into `steps[]` at declaration — one entry per member, each
+/// with its own `flatIndex` — and registers a stop handle per member
+/// (`subagent-runner.ts:2618-2652`, `:4221`, `:4268` @v0.64.0). This asserts the same three facts
+/// on cyrup: three live status entries named by their own agents, member 1 `Stopped` with pi's
+/// stamps and events, members 0 and 2 `Complete` with their own outputs, and the RUN still alive
+/// (`Failed` on its members' exit codes, never `Stopped`).
+///
+/// Fails at the parent commit by construction: `status.steps.len()` was 1 there, so both the
+/// per-member assertions and the `step:1` identity are unreachable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_child_scoped_stop_kills_one_fan_out_member_and_its_siblings_still_complete() {
+    let dir = tempfile::tempdir().expect("real tempdir");
+
+    // Every member sleeps 1.5s then reports DONE. Member 1 is stopped ~300ms in, so its DONE must
+    // never appear; members 0 and 2 run untouched and theirs must.
+    let script = serde_json::json!({
+        "steps": [
+            {"kind": "sleep_ms", "ms": 1500},
+            {"kind": "emit", "line": message_end_line("DONE")},
+        ],
+        "exit_code": 0
+    });
+    let script_path = write_script(dir.path(), "script.json", &script);
+
+    let async_root = dir.path().join("async");
+    let results_dir = dir.path().join("results");
+    tokio::fs::create_dir_all(&async_root)
+        .await
+        .expect("mkdir async_root");
+    tokio::fs::create_dir_all(&results_dir)
+        .await
+        .expect("mkdir results_dir");
+    let run_id = RunId::from_token("childstop003");
+    let run_paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
+    tokio::fs::create_dir_all(&run_paths.run_dir)
+        .await
+        .expect("mkdir run_dir");
+    let config = RunnerConfig {
+        mode: RunMode::Parallel,
+        steps: vec![RunnerStep::ParallelGroup(ParallelGroupSpec {
+            steps: vec![
+                single_step("first", "member zero"),
+                single_step("second", "member one"),
+                single_step("only", "member two"),
+            ],
+            concurrency: 3,
+            fail_fast: false,
+            worktree: false,
+        })],
+        ..child_stop_chain_config(dir.path(), &run_id, &async_root, &results_dir)
+    };
+    let cfg_path = run_paths.run_dir.join("runner-config.json");
+    write_atomic_json(&cfg_path, &config)
+        .await
+        .expect("write config");
+
+    // Deliver the child-scoped stop for `step:1` ~300ms in — through the REAL parent-side writer.
+    let stop_dir = run_paths.run_dir.clone();
+    let stop_task = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        cyrup_ext_subagents::background::control::deliver_child_stop_request(
+            &stop_dir,
+            "stop-action",
+            1,
+            Some("step:1".to_string()),
+        )
+        .await
+        .expect("write child stop request");
+    });
+
+    let outcome = run_with(
+        &cfg_path,
+        &run_paths,
+        RunnerOverrides {
+            spawn_command: Some(fixture_cmd(&script_path)),
+            ..Default::default()
+        },
+    )
+    .await;
+    stop_task.await.expect("stop task completes");
+    outcome.expect("run() itself never returns Err");
+
+    let status: RunStatus = serde_json::from_slice(
+        &tokio::fs::read(&run_paths.status)
+            .await
+            .expect("status.json exists"),
+    )
+    .expect("parse status.json");
+
+    // The flatten itself: three LIVE status entries, one per member, named by their own agents.
+    assert_eq!(
+        status
+            .steps
+            .iter()
+            .map(|step| step.agent.as_str())
+            .collect::<Vec<_>>(),
+        vec!["first", "second", "only"],
+        "a `tasks[]` fan-out publishes one status entry per member: {status:?}"
+    );
+
+    // The RUN is not stopped — it ran on and ended on its members' own exit codes.
+    assert_eq!(
+        status.state,
+        RunState::Failed,
+        "one stopped member + two completed ones is a Failed run, never Stopped: {status:?}"
+    );
+
+    let stopped_member = &status.steps[1];
+    assert_eq!(
+        stopped_member.status,
+        cyrup_ext_subagents::background::StepState::Stopped,
+        "only the targeted member is stopped: {stopped_member:?}"
+    );
+    assert!(stopped_member.stopped && stopped_member.stop_requested);
+    assert!(stopped_member.stop_requested_at.is_some());
+    assert_eq!(
+        stopped_member.error.as_deref(),
+        Some(cyrup_ext_subagents::background::control::STOP_MESSAGE)
+    );
+    for sibling_index in [0usize, 2] {
+        let sibling = &status.steps[sibling_index];
+        assert_eq!(
+            sibling.status,
+            cyrup_ext_subagents::background::StepState::Complete,
+            "sibling {sibling_index} ran to completion: {sibling:?}"
+        );
+        assert!(
+            !sibling.stop_requested && !sibling.stopped,
+            "sibling {sibling_index} was never asked to stop: {sibling:?}"
+        );
+    }
+
+    // Per-child outputs: the two siblings produced their own, the stopped member never emitted.
+    let group_children = status
+        .parallel_groups
+        .as_ref()
+        .and_then(|groups| groups.first())
+        .map(|group| group.children.len());
+    assert_eq!(group_children, Some(3), "{status:?}");
+
+    // Events: pi's child-scoped sequence, addressed at member 1 by its own identity and agent.
+    let events = parsed_events(
+        &tokio::fs::read_to_string(&run_paths.events)
+            .await
+            .expect("events.jsonl exists"),
+    );
+    let of = |kind: &str| -> Vec<&serde_json::Value> {
+        events.iter().filter(|e| e["type"] == kind).collect()
+    };
+    let requested = of("subagent.step.stop_requested");
+    assert_eq!(requested.len(), 1, "{events:?}");
+    assert_eq!(requested[0]["stepIndex"], 1);
+    assert_eq!(requested[0]["childId"], "step:1");
+    assert_eq!(
+        requested[0]["agent"], "second",
+        "the identity resolves to the MEMBER, not the group: {events:?}"
+    );
+    let child_status = of("subagent.child-status");
+    assert_eq!(
+        child_status
+            .iter()
+            .map(|e| e["status"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec!["stopping", "stopped"],
+        "{events:?}"
+    );
+    assert!(child_status.iter().all(|e| e["childId"] == "step:1"));
+    let stopped_events = of("subagent.step.stopped");
+    assert_eq!(stopped_events.len(), 1, "{events:?}");
+    assert_eq!(stopped_events[0]["stepIndex"], 1);
+    assert!(
+        of("subagent.run.stopped").is_empty() && of("subagent.run.paused").is_empty(),
+        "a child-scoped stop must not end the run stopped or paused: {events:?}"
+    );
 }

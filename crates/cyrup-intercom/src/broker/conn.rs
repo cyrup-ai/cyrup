@@ -22,6 +22,7 @@ use super::frame::{FrameOutcome, send_msg};
 use super::lifecycle::schedule_shutdown_check;
 use super::limits::{READ_BUF, REGISTRATION_TIMEOUT_MS};
 use super::ratelimit::TokenBucket;
+use super::routing::SessionKey;
 use super::state::{BrokerState, lock};
 
 /// The per-connection writer task: drain queued frames to the socket, then half-close on EOF.
@@ -38,7 +39,7 @@ async fn writer_task(
 }
 
 /// The outcome of [`process_frame_payload`]: whether the connection should keep reading, and
-/// whether the registration timeout must be re-armed (`was_registered && session_id.is_none()` on a
+/// whether the registration timeout must be re-armed (`was_registered && session_key.is_none()` on a
 /// frame `handle_frame` flagged `rearmed_registration` for — an `unregister`, `broker.ts:223-230`).
 struct PayloadOutcome {
     keep_going: bool,
@@ -55,7 +56,7 @@ fn process_frame_payload(
     self_tx: &UnboundedSender<Vec<u8>>,
     state: &Arc<Mutex<BrokerState>>,
     bucket: &mut TokenBucket,
-    session_id: &mut Option<String>,
+    session_key: &mut Option<SessionKey>,
 ) -> PayloadOutcome {
     // Rate limit BEFORE handling (broker.ts:218-222).
     if !bucket.consume(now_ms()) {
@@ -87,16 +88,16 @@ fn process_frame_payload(
             };
         }
     };
-    let was_registered = session_id.is_some();
+    let was_registered = session_key.is_some();
     let now = now_ms();
     let result = {
         let mut g = lock(state);
-        g.handle_frame(conn_id, self_tx, &value, session_id, now)
+        g.handle_frame(conn_id, self_tx, &value, session_key, now)
     };
     if result.schedule_shutdown {
         schedule_shutdown_check(state);
     }
-    let rearm = result.rearmed_registration && was_registered && session_id.is_none();
+    let rearm = result.rearmed_registration && was_registered && session_key.is_none();
     PayloadOutcome {
         keep_going: matches!(result.outcome, FrameOutcome::Continue),
         rearm_registration: rearm,
@@ -112,7 +113,8 @@ async fn reader_task(
     close: Arc<Notify>,
     state: Arc<Mutex<BrokerState>>,
 ) {
-    let mut session_id: Option<String> = None;
+    // `let sessionKey: string | null = null;` (`v0.13.0 broker/broker.ts:268`).
+    let mut session_key: Option<SessionKey> = None;
     let mut bucket = TokenBucket::new(now_ms());
     let mut reader = FrameReader::new();
     let mut buf = vec![0u8; READ_BUF];
@@ -124,7 +126,7 @@ async fn reader_task(
         tokio::select! {
             biased;
             () = close.notified() => break,
-            () = &mut reg_deadline, if session_id.is_none() => {
+            () = &mut reg_deadline, if session_key.is_none() => {
                 // No register within the timeout → destroy (broker.ts:196-201).
                 break;
             }
@@ -142,7 +144,7 @@ async fn reader_task(
                         // oversize length (`framing.ts:52-84`) — dispatch `e.frames` before tearing the
                         // connection down, rather than discarding them.
                         for payload in &e.frames {
-                            let outcome = process_frame_payload(payload, conn_id, &self_tx, &state, &mut bucket, &mut session_id);
+                            let outcome = process_frame_payload(payload, conn_id, &self_tx, &state, &mut bucket, &mut session_key);
                             if outcome.rearm_registration {
                                 reg_deadline
                                     .as_mut()
@@ -157,7 +159,7 @@ async fn reader_task(
                     }
                 };
                 for payload in &frames {
-                    let outcome = process_frame_payload(payload, conn_id, &self_tx, &state, &mut bucket, &mut session_id);
+                    let outcome = process_frame_payload(payload, conn_id, &self_tx, &state, &mut bucket, &mut session_key);
                     if outcome.rearm_registration {
                         reg_deadline
                             .as_mut()
@@ -175,7 +177,7 @@ async fn reader_task(
     // task's channel close so it half-closes the socket.
     let did_leave = {
         let mut g = lock(&state);
-        g.on_connection_closed(conn_id, &session_id, now_ms())
+        g.on_connection_closed(conn_id, &session_key, now_ms())
     };
     if did_leave {
         schedule_shutdown_check(&state);
@@ -217,11 +219,11 @@ mod tests {
     /// `Err(_) => break` on `reader.push` discarded `FrameReadError::frames` entirely — a `register`
     /// frame reassembled earlier in the very same chunk as a trailing oversize header would never
     /// reach `handle_frame`, silently dropping a connection's registration. This test fails against
-    /// that pre-fix behavior: `session_id` would stay `None` instead of becoming `Some("s1")`.
+    /// that pre-fix behavior: `session_key` would stay `None` instead of naming `s1`.
     #[test]
     fn oversize_chunk_still_dispatches_frames_reassembled_earlier_in_the_same_chunk() {
         let state: Arc<Mutex<BrokerState>> = Arc::new(Mutex::new(make_state()));
-        let mut session_id: Option<String> = None;
+        let mut session_key: Option<SessionKey> = None;
         let mut bucket = TokenBucket::new(now_ms());
         let self_tx = make_tx();
 
@@ -248,14 +250,14 @@ mod tests {
 
         for payload in &err.frames {
             let outcome =
-                process_frame_payload(payload, 1, &self_tx, &state, &mut bucket, &mut session_id);
+                process_frame_payload(payload, 1, &self_tx, &state, &mut bucket, &mut session_key);
             assert!(
                 outcome.keep_going,
                 "a valid register frame must not itself trip a teardown"
             );
         }
         assert_eq!(
-            session_id.as_deref(),
+            session_key.as_ref().map(|k| k.id.as_str()),
             Some("s1"),
             "the preserved register frame must actually be dispatched to handle_frame, not discarded"
         );

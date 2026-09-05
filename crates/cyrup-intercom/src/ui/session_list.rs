@@ -248,6 +248,7 @@ mod tests {
 
     fn session(id: &str, name: &str) -> SessionInfo {
         SessionInfo {
+            endpoint_epoch: None,
             id: id.to_string(),
             name: Some(name.to_string()),
             runtime_fallback_alias: None,

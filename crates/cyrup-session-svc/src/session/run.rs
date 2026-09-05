@@ -429,7 +429,7 @@ impl AgentSession {
             .dispatch_block_mutate(event, &cancel)
             .await;
         match reduced {
-            Reduced::Handled(_) | Reduced::Blocked { .. } => InputDisposition::Handled,
+            Reduced::Handled { .. } | Reduced::Blocked { .. } => InputDisposition::Handled,
             // Apply any `transform` the handler chain folded into the event (Pi
             // agent-session.ts:1029-1032: `currentText`/`currentImages` adopt the result).
             Reduced::Pass(ev) => {

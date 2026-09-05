@@ -93,6 +93,7 @@ async fn host_with_child_env(
     let host = ExtensionHost::new(cfg());
     let ext =
         prompt_runtime_extension_from(&child_env(inherit_project_context, inherit_skills, fanout))
+            .expect("no tool budget in this env, so the runtime always builds")
             .expect("a child env must build the runtime");
     host.load_native(ext).await.expect("load_native");
     host
@@ -324,7 +325,9 @@ async fn a_fanout_child_keeps_its_own_delegation_history() {
 #[tokio::test]
 async fn a_non_child_process_attaches_no_runtime() {
     assert!(
-        prompt_runtime_extension_from(&|_| None).is_none(),
+        prompt_runtime_extension_from(&|_| None)
+            .expect("no tool budget in this env, so the runtime always builds")
+            .is_none(),
         "an empty environment must not attach the child runtime"
     );
 
@@ -362,6 +365,7 @@ fn parent_notice(kind: &str) -> AgentMessage {
         kind: kind.to_string(),
         payload: serde_json::json!({ "content": "run finished" }),
         details: None,
+        display: true,
         timestamp: None,
     }
 }
@@ -412,7 +416,8 @@ fn assistant_with(blocks: Vec<Content>) -> AgentMessage {
 #[test]
 fn the_runtime_the_binary_loads_is_the_one_under_test() {
     let built: Option<Arc<dyn cyrup_ext::NativeExtension>> =
-        prompt_runtime_extension_from(&child_env("0", "0", "0"));
+        prompt_runtime_extension_from(&child_env("0", "0", "0"))
+            .expect("no tool budget in this env, so the runtime always builds");
     assert_eq!(
         built.map(|ext| ext.id().to_string()),
         Some("subagent-prompt-runtime".to_string())
@@ -470,6 +475,7 @@ async fn the_registered_structured_output_tool_advertises_rewritten_local_refs()
         }
         _ => None,
     })
+    .expect("no tool budget in this env, so the runtime always builds")
     .expect("both structured vars build the runtime");
 
     let host = ExtensionHost::new(cfg());

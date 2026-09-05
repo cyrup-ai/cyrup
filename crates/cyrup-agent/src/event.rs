@@ -47,6 +47,19 @@ pub enum AgentMessage {
         /// (`cyrup-tui/src/app/extension_render.rs` takes `to_value(ev)?["message"]`). Without it an
         /// injected card could be drawn on `--resume` and not on the turn that produced it.
         details: Option<Value>,
+        /// Pi's `CustomMessage.display` (`coding-agent/src/core/messages.ts:50` @v0.84.4) — whether
+        /// the host DRAWS this message. The model sees it either way; `false` means "reaches the
+        /// transcript, never reaches the screen".
+        ///
+        /// SUBA-094 — carried on the MESSAGE, exactly as pi carries it: `sendCustomMessage` builds
+        /// one `appMessage` with `display` on it (`agent-session.ts:1488-1496` @v0.84.4) and hands
+        /// that same object to every one of its five branches — `nextTurn`, `steer`, `followUp`,
+        /// `_runAgentPrompt` (the trigger-turn branch) and `_appendCustomMessage`. cyrup instead
+        /// passed `display` beside the message as a loose argument, so only the append branch could
+        /// see it: a `display: false` notice injected with `trigger_turn` was drawn on screen and
+        /// persisted as `display: true`. A required (non-`Option`) field makes "constructed a custom
+        /// message without deciding its display disposition" unrepresentable.
+        display: bool,
         timestamp: Option<i64>,
     },
     /// SESS-043 — one of pi's declaration-merged coding-agent roles that this crate has no type
@@ -117,6 +130,12 @@ impl AppRole {
     }
 }
 
+/// The `display` a custom message deserializes to when the key is absent — see
+/// [`AgentMessage::Custom`]'s `display`.
+fn custom_display_default() -> bool {
+    true
+}
+
 impl serde::Serialize for AgentMessage {
     /// Manual serializer so the `role` discriminant appears EXACTLY ONCE — the same defect, and the
     /// same fix, as [`cyrup_core::Message`]'s serializer.
@@ -158,6 +177,10 @@ impl serde::Serialize for AgentMessage {
                 /// serializes byte-identically.
                 #[serde(skip_serializing_if = "Option::is_none")]
                 details: &'a Option<Value>,
+                /// Always emitted, like pi's own `display` (`messages.ts:50` @v0.84.4), so a
+                /// consumer of this wire — the TUI reads the custom arm through exactly this
+                /// projection — can gate on it without guessing.
+                display: &'a bool,
                 timestamp: &'a Option<i64>,
             },
         }
@@ -173,11 +196,13 @@ impl serde::Serialize for AgentMessage {
                 kind,
                 payload,
                 details,
+                display,
                 timestamp,
             } => TaggedNonAssistant::Custom {
                 kind,
                 payload,
                 details,
+                display,
                 timestamp,
             }
             .serialize(serializer),
@@ -222,6 +247,12 @@ impl<'de> serde::Deserialize<'de> for AgentMessage {
                 payload: Value,
                 #[serde(default)]
                 details: Option<Value>,
+                /// Absent means a producer that predates the field, or one that never opted out of
+                /// display; both were drawn. `true` keeps them drawn, and matches the same default
+                /// the guest `sendMessage` bridge applies to a missing `display`
+                /// (`cyrup-session-svc/src/session/control.rs`).
+                #[serde(default = "custom_display_default")]
+                display: bool,
                 #[serde(default)]
                 timestamp: Option<i64>,
             },
@@ -248,11 +279,13 @@ impl<'de> serde::Deserialize<'de> for AgentMessage {
                     kind,
                     payload,
                     details,
+                    display,
                     timestamp,
                 } => AgentMessage::Custom {
                     kind,
                     payload,
                     details,
+                    display,
                     timestamp,
                 },
             },

@@ -362,6 +362,7 @@ fn the_llm_boundary_renders_pi_s_declaration_merged_roles() {
         kind: "ext.note".into(),
         payload: serde_json::Value::String("remember the deploy freeze".into()),
         details: None,
+        display: true,
         timestamp: Some(11),
     };
     // The pre-fix boundary. Kept as an explicit witness of what changed.
@@ -496,6 +497,7 @@ fn a_live_bash_execution_renders_like_a_reseeded_one_and_honours_exclude_from_co
         kind: "ext.note".into(),
         payload: serde_json::Value::String("keep me".into()),
         details: None,
+        display: true,
         timestamp: Some(8),
     };
     let out = coding_agent_convert_to_llm(&arcs([ext.clone()]));

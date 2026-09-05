@@ -18,7 +18,7 @@
 //! The fix must satisfy BOTH halves — the session builds AND the failure is visible. A silent
 //! `let _ =` would pass "the session builds" and be strictly worse than the bug, so every test here
 //! asserts the diagnostic too. `StartupDiagnostics::extensions` is the channel the interactive
-//! `[Extension issues]` startup panel reads (`crates/cyrup/src/main.rs::build_startup_report` →
+//! `[Extension issues]` startup panel reads (`cyrup_tui::StartupReport::from_session` →
 //! `cyrup_tui::extension_diagnostics`), i.e. the panel added in d2c5509.
 //!
 //! And the panel is not sufficient on its own, because it is INTERACTIVE-ONLY. Pi's containment
@@ -154,7 +154,7 @@ async fn a_failing_native_init_is_contained_and_recorded_not_fatal() {
     );
 
     // (2) The failure is SURFACED, not swallowed. This is the `[Extension issues]` channel
-    //     `build_startup_report` feeds to `cyrup_tui::extension_diagnostics` (d2c5509).
+    //     `StartupReport::from_session` feeds to `cyrup_tui::extension_diagnostics` (d2c5509).
     let diags = &session.services().startup_diagnostics.extensions;
     assert_eq!(
         diags.len(),
