@@ -1161,8 +1161,13 @@ fn run_id_from_paths(run_paths: &RunPaths) -> RunId {
 }
 
 /// The agent name shown for one [`RunnerStep`] in a `subagent.step.*` `events.jsonl` line — the
-/// step's own agent for a single/import step, or a synthesized group label (mirroring
-/// [`pending_step_status_for`]'s own display convention).
+/// step's own agent for a single/import step, or a synthesized group label.
+///
+/// The events are one-per-TOP-LEVEL-step, so the group label survives here. `RunStatus::steps` is
+/// the other index space and its entries are one-per-FLAT-CHILD, which is why
+/// [`crate::background::flat_index::pending_step_statuses_for`] names a group's members
+/// individually instead. (SUBA-093 deleted `pending_step_status_for`, the collapsed builder this
+/// comment used to point at.)
 fn step_display_agent(step: &RunnerStep) -> String {
     match step {
         RunnerStep::SingleStep(spec) => spec.agent.clone(),
@@ -2656,7 +2661,11 @@ fn record_step_outcome(
                 }
             }
         }
-        None => {
+        // A zero-width group owns NO flat slot, so `slots.start` is the next step's entry rather
+        // than one of its own: writing this step's outcome there would settle a step that has not
+        // run. No constructor produces a zero-task `ParallelGroup` today (`flat_step_width`'s own
+        // doc says a zero-width group contributes nothing), so this is a guard, not a live branch.
+        None if !slots.is_empty() => {
             if let Some(entry) = status.steps.get_mut(index) {
                 entry.status = if result.success {
                     StepState::Complete
@@ -2667,6 +2676,7 @@ fn record_step_outcome(
                 entry.error = result.error.clone();
             }
         }
+        None => {}
     }
 
     if let (RunnerStep::ParallelGroup(_) | RunnerStep::DynamicGroup(_), Some(group)) =
@@ -3616,6 +3626,19 @@ impl ExecSingleStepExecutor {
     }
 }
 
+/// Deregisters one step's live child-stop handle when the dispatch it belongs to ends — however
+/// it ends. See its only construction site in [`ExecSingleStepExecutor::run_single`].
+struct ActiveStopGuard<'a> {
+    registry: &'a super::child_stop::ChildStopRegistry,
+    index: usize,
+}
+
+impl Drop for ActiveStopGuard<'_> {
+    fn drop(&mut self) {
+        self.registry.clear_active(self.index);
+    }
+}
+
 #[async_trait::async_trait]
 impl SingleStepExecutor for ExecSingleStepExecutor {
     async fn run_single(
@@ -3660,6 +3683,13 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             // still reaches this child through the parent, a child-scoped stop cancels it alone.
             registry.register_active(index, self.interrupt_cancel.child_token());
         }
+        // pi `registerStepStop(flatIndex, undefined)` (`:3049-3052`): this child is gone, so a
+        // later child-scoped stop against its index is `stop_failed`, not a cancel of a token
+        // nothing is listening to. A GUARD rather than a statement after the await, because this
+        // future is dropped rather than completed whenever a fan-out sibling fail-fasts or the
+        // group is cancelled — and the plain statement never ran on that path, leaving a dead
+        // token registered under a live index for the rest of the run.
+        let _active = stop_slot.map(|(registry, index)| ActiveStopGuard { registry, index });
 
         let opts =
             self.build_step_run_options(step, ctx, available_models, model_override, acceptance);
@@ -3668,13 +3698,6 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             self.write_step_input_artifact(step, resolved_task, ctx.step_slot.index());
 
         let result = exec::run_sync(&agent, resolved_task, &opts).await;
-
-        // pi `registerStepStop(flatIndex, undefined)` (`:3049-3052`): this child is gone, so a
-        // later child-scoped stop against its index is `stop_failed`, not a cancel of a token
-        // nothing is listening to.
-        if let Some((registry, index)) = stop_slot {
-            registry.clear_active(index);
-        }
 
         self.write_step_result_artifacts(artifact_paths.as_ref(), &result);
 
@@ -5724,6 +5747,78 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].group_step_index, 0);
         assert_eq!(groups[0].children.len(), 3);
+    }
+
+    /// SUBA-093 review fix — a step that owns NO flat slot settles nothing.
+    ///
+    /// `flat_range` returns `base..base` for a zero-width `ParallelGroup`, whose `slots.start` is
+    /// the NEXT step's status entry. Before the guard, `record_step_outcome` took the non-group
+    /// arm (`per_member` needs `slots.len() > 1`) and wrote the empty group's aggregate over a
+    /// step that had not run. No constructor produces a zero-task group today, which is exactly
+    /// why the invariant needs pinning rather than trusting.
+    #[test]
+    fn a_zero_width_group_settles_nothing_and_leaves_the_next_step_pending() {
+        let steps = vec![
+            RunnerStep::ParallelGroup(crate::spawn::chain_graph::ParallelGroupSpec {
+                steps: Vec::new(),
+                concurrency: 2,
+                fail_fast: false,
+                worktree: false,
+            }),
+            RunnerStep::SingleStep(single_step("tail", "t")),
+        ];
+        assert_eq!(flat_total(&steps), 1);
+        assert_eq!(flat_range(&steps, 0), 0..0, "the group owns no slot");
+        assert_eq!(flat_range(&steps, 1), 0..1, "the tail owns slot 0");
+
+        let mut status = RunStatus::queued(
+            RunId::from_token("flatempty001".to_string()),
+            RunMode::Chain,
+            Some(1),
+        );
+        status.steps = steps.iter().flat_map(pending_step_statuses_for).collect();
+        assert_eq!(status.steps.len(), 1);
+        record_step_outcome(
+            &mut status,
+            &flat_range(&steps, 0),
+            &steps[0],
+            &StepResult::failure("the empty group"),
+            None,
+        );
+        assert_eq!(
+            status.steps[0].status,
+            StepState::Pending,
+            "the tail must not have been settled by the group ahead of it: {:?}",
+            status.steps
+        );
+        assert!(status.steps[0].error.is_none(), "{:?}", status.steps);
+    }
+
+    /// SUBA-093 review fix — the live child-stop handle is deregistered even when the dispatch's
+    /// future is DROPPED rather than run to completion, which is what happens to every sibling of
+    /// a fail-fast member inside `spawn::parallel::run_bounded`.
+    ///
+    /// Before the guard the `clear_active` call sat after the `run_sync` await, so a dropped
+    /// member left a dead token registered under a live flat index for the rest of the run.
+    #[test]
+    fn a_dropped_dispatch_still_deregisters_its_child_stop_handle() {
+        let registry = super::super::child_stop::ChildStopRegistry::new();
+        registry.register_active(2, cyrup_core::CancelToken::new());
+        assert!(registry.active_token(2).is_some());
+        {
+            let _guard = ActiveStopGuard {
+                registry: &registry,
+                index: 2,
+            };
+        }
+        assert!(
+            registry.active_token(2).is_none(),
+            "dropping the dispatch must clear the handle"
+        );
+        // pi `stopChildStep`'s "was there a live child?" answer is now `false`, so a later
+        // child-scoped stop against this index is `stop_failed` rather than a cancel of a token
+        // nothing is listening to.
+        assert!(!registry.cancel_active(2));
     }
 
     /// SUBA-093 — a step that occupies one flat slot still records the aggregate on that slot, and

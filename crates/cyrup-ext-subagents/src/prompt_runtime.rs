@@ -2244,6 +2244,13 @@ pub fn prompt_runtime_from_env(
     // first turn (`crates/cyrup/src/session_launch.rs`). Both refuse to run a budgeted child with
     // its budget silently removed; cyrup additionally refuses to run it with the rest of the
     // subagent runtime missing, which for this crate's children is not a survivable state anyway.
+    //
+    // The radius is wider than a subagent child, and deliberately so: this decode runs before the
+    // inertness check below, so `attach_native_extensions` is unconditional and a stray or stale
+    // `CYRUP_SUBAGENT_TOOL_BUDGET` refuses a TOP-LEVEL interactive launch too, where pi would
+    // merely have lost one extension. Only the parent writes that variable, so a value present in
+    // a top-level environment is already evidence the environment is not the one this process was
+    // handed — which is the case this arm exists to refuse, not one to make an exception for.
     let tool_budget = crate::exec::tool_budget::decode_tool_budget_env(
         get(crate::exec::tool_budget::TOOL_BUDGET_ENV).as_deref(),
         crate::exec::tool_budget::HardMinimum::from_env(get),

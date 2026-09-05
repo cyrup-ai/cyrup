@@ -306,8 +306,30 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         return failure;
     }
 
-    // Step 0b (SUBA-074) — REFUSE a runner this crate cannot honour, before the model-fallback
-    // ladder rather than inside it. `build_attempt_spawn_plan`'s errors are per-ATTEMPT
+    // Step 1 (R-SA-025): fail fast before any subprocess spawns — INCLUDING a foreign one. This
+    // sits above the runner dispatch, not below it, because `run_external_cli` resolves and
+    // finalizes its output through the very same `opts.output_mode` (`resolve_saved_output` /
+    // `finalize_delivered_output`); leaving the validation on the native side of the dispatch let
+    // an external-cli agent declaring `output_mode: file-only` with no `output_path` spawn the
+    // foreign process and only then discover the config was unusable. The ordering against Step 2a
+    // is deliberate: an agent that is BOTH misconfigured here and declares an unsupported runner
+    // reports the output error, because that one is a property of the caller's request rather than
+    // of the build's capabilities.
+    if let Some(err) =
+        validate_file_only_requires_path(opts.output_mode, opts.output_path.as_deref())
+    {
+        return pre_spawn_failure(agent, task, err.to_string());
+    }
+
+    // Step 2 (R-SA-023): resolve the effective acceptance contract. Ahead of the dispatch because
+    // the external branch needs it too — upstream appends `formatAcceptancePrompt` to `task` at
+    // `subagent-runner.ts:1462-1465`, ABOVE its own `if (step.runner?.type === "external-cli")` at
+    // `:1491`, so a foreign process is told the contract exactly as a native child is.
+    let contract = resolve_run_acceptance(opts, agent, task);
+
+    // Step 2a (SUBA-074) — REFUSE a runner this crate cannot honour, before the model-fallback
+    // ladder rather than inside it. (Numbered `0b` until 2026-09-05, when it moved BELOW steps 1
+    // and 2: the external arm needs the acceptance contract, and R-SA-025 binds on it too.) `build_attempt_spawn_plan`'s errors are per-ATTEMPT
     // (`exec/attempt_runner.rs:351` hands an `Err` to `attempt_setup_failure`, `:534-556`, which
     // yields `AttemptSignal { success: false, … }` and the ladder tries the next model), so a
     // runner refusal raised there would fire once per candidate model and end in a misleading
@@ -325,9 +347,6 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
     // (`api/preflight.ts:322-343` @v0.64.0), so the external arm returns from here rather than
     // entering the ladder below.
     let launch_ctx = crate::exec::external_cli::ExternalCliLaunchContext {
-        cwd: opts.cwd.clone(),
-        scratch_dir: crate::background::attempt_scratch_dir(&opts.cwd),
-        step_index: opts.child_index.unwrap_or(0),
         command_prefix_args: Vec::new(),
     };
     match crate::runner::dispatch::resolve_runner_dispatch(agent.runner.as_ref(), &launch_ctx) {
@@ -335,20 +354,13 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
             return pre_spawn_failure(agent, task, reason);
         }
         crate::runner::dispatch::RunnerDispatch::ExternalCli(launch) => {
-            return crate::exec::external_cli::run_external_cli(agent, task, opts, *launch).await;
+            return crate::exec::external_cli::run_external_cli(
+                agent, task, opts, &contract, *launch,
+            )
+            .await;
         }
         crate::runner::dispatch::RunnerDispatch::NativePi => {}
     }
-
-    // Step 1 (R-SA-025): fail fast before any subprocess spawns.
-    if let Some(err) =
-        validate_file_only_requires_path(opts.output_mode, opts.output_path.as_deref())
-    {
-        return pre_spawn_failure(agent, task, err.to_string());
-    }
-
-    // Step 2 (R-SA-023): resolve the effective acceptance contract.
-    let contract = resolve_run_acceptance(opts, agent, task);
 
     let candidates = resolve_model_candidates(agent, opts);
     if candidates.is_empty() {
@@ -1902,6 +1914,154 @@ mod tests {
         assert_eq!(process.exit_code, Some(0));
         assert!(process.stdout_path.ends_with(".stdout.log"), "{process:?}");
         assert!(!process.stdout_truncated);
+    }
+
+    /// SUBA-074 review fix — the acceptance contract reaches the FOREIGN process too.
+    ///
+    /// Upstream appends `formatAcceptancePrompt(step.effectiveAcceptance, …)` to `task` at
+    /// `subagent-runner.ts:1462-1465` @v0.64.0, ABOVE the `if (step.runner?.type ===
+    /// "external-cli")` branch at `:1491`, so `buildExternalCliPrompt(systemPrompt, task)` at
+    /// `:1506` is built over the post-acceptance task. cyrup injected only on the native spawn
+    /// path, and `run_sync` returned into `run_external_cli` before ever resolving the contract:
+    /// an external agent under a `verified` contract was never told there was one.
+    #[tokio::test]
+    async fn run_sync_tells_an_external_cli_the_acceptance_contract_it_will_be_judged_against() {
+        use crate::exec::acceptance::{AcceptanceContract, AcceptanceStatus};
+        use crate::runner::{AgentRunnerConfig, ExternalCliRunner};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("echo-prompt.sh");
+        std::fs::write(&script, "#!/bin/sh\ncat\n").expect("write script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.runner = Some(AgentRunnerConfig::ExternalCli(ExternalCliRunner {
+            adapter: None,
+            command: script.display().to_string(),
+            args: Vec::new(),
+            prompt_delivery_stdin: false,
+            capabilities: None,
+        }));
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.acceptance = Some(AcceptanceContract::explicit(
+            AcceptanceStatus::Verified,
+            vec![crate::exec::acceptance::VerifyCommand::shell("cargo test")],
+        ));
+
+        let result = run_sync(&agent, "say hello", &opts).await;
+
+        assert_eq!(result.exit_code, 0, "{result:?}");
+        // The script echoes its stdin, so the delivered output IS the prompt the foreign process
+        // was handed.
+        let output = result.final_output.as_deref().unwrap_or_default();
+        assert!(
+            output.contains("## Acceptance Contract"),
+            "the foreign process must be told the contract; got: {output}"
+        );
+        assert!(output.contains("cargo test"), "{output}");
+        // The RECORDED task stays the raw one, exactly as the native path records it.
+        assert_eq!(result.task, "say hello");
+    }
+
+    /// SUBA-074 review fix — R-SA-025 binds on the external path too.
+    ///
+    /// `run_external_cli` resolves and finalizes its output through the same `opts.output_mode`
+    /// (`resolve_saved_output`/`finalize_delivered_output`), so a `file-only` agent with no
+    /// `output_path` must fail before the foreign process runs rather than after. The script
+    /// leaves a marker behind, which is what proves nothing spawned.
+    #[tokio::test]
+    async fn run_sync_fast_fails_file_only_without_a_path_before_an_external_cli_spawns() {
+        use crate::runner::{AgentRunnerConfig, ExternalCliRunner};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("it-ran");
+        let script = dir.path().join("touch-marker.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        )
+        .expect("write script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.runner = Some(AgentRunnerConfig::ExternalCli(ExternalCliRunner {
+            adapter: None,
+            command: script.display().to_string(),
+            args: Vec::new(),
+            prompt_delivery_stdin: false,
+            capabilities: None,
+        }));
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.output_mode = crate::discovery::types::OutputMode::FileOnly;
+        opts.output_path = None;
+
+        let result = run_sync(&agent, "say hello", &opts).await;
+
+        assert_eq!(result.exit_code, 1, "{result:?}");
+        assert_eq!(
+            result.error.as_deref(),
+            Some(
+                crate::error::SubagentError::OutputPathRequired
+                    .to_string()
+                    .as_str()
+            ),
+            "{result:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "the foreign process must not have been spawned"
+        );
+    }
+
+    /// SUBA-074 review fix — a PREFLIGHT failure still publishes a process receipt.
+    ///
+    /// Upstream's pre-spawn `catch` emits `{startedAt, endedAt, durationMs, exitCode: 1,
+    /// processSignal: null, stdoutPath, stderrPath}` (`external-cli-runner.ts:212-213`) whether or
+    /// not it got as far as spawning. cyrup ran the preflight OUTSIDE the process runner and
+    /// returned `external_process: None`, so a probe failure looked like a run that never reached
+    /// the runner at all.
+    #[tokio::test]
+    async fn run_sync_publishes_a_process_receipt_when_the_adapter_preflight_fails() {
+        use crate::runner::{AgentRunnerConfig, ExternalCliRunner};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("no-such-claude");
+
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.runner = Some(AgentRunnerConfig::ExternalCli(ExternalCliRunner {
+            adapter: Some(crate::runner::contract::AdapterId::ClaudeCode),
+            command: missing.display().to_string(),
+            args: Vec::new(),
+            prompt_delivery_stdin: false,
+            capabilities: None,
+        }));
+        let opts = base_opts(dir.path(), &["m1"]);
+
+        let result = run_sync(&agent, "say hello", &opts).await;
+
+        assert_eq!(result.exit_code, 1, "{result:?}");
+        assert!(result.error.is_some(), "{result:?}");
+        let process = result
+            .external_process
+            .as_ref()
+            .expect("a preflight failure still publishes its receipt");
+        assert_eq!(process.exit_code, Some(1), "{process:?}");
+        assert_eq!(process.process_signal, None, "{process:?}");
+        assert!(process.pid.is_none(), "nothing was spawned: {process:?}");
+        assert!(process.stdout_path.ends_with(".stdout.log"), "{process:?}");
+        assert!(process.stderr_path.ends_with(".stderr.log"), "{process:?}");
+        assert!(process.duration_ms.is_some(), "{process:?}");
+        assert!(result.runner.is_some(), "{result:?}");
     }
 
     /// `runner: {"type":"pi"}` is the native child, so it is indistinguishable from declaring no

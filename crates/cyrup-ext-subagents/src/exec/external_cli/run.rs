@@ -83,6 +83,42 @@ pub struct ExternalCliProcessPlan {
     pub final_output_path: Option<PathBuf>,
 }
 
+/// The two bounded stream logs one run writes, named by its FLAT step index (`:170-171`).
+///
+/// Public because every pre-spawn failure — including the ones raised by
+/// [`super::run_external_cli`] before this module is entered at all — must publish a receipt that
+/// names the same two paths a spawned run would have used.
+#[must_use]
+pub fn external_log_paths(log_dir: &Path, step_index: usize) -> (PathBuf, PathBuf) {
+    (
+        log_dir.join(format!("external-{step_index}.stdout.log")),
+        log_dir.join(format!("external-{step_index}.stderr.log")),
+    )
+}
+
+/// The receipt every pre-spawn failure publishes (`:212-213`): `exitCode: 1`, no signal, a
+/// duration, and the two log paths, so a reader can see the run got far enough to have logs and
+/// that there is nothing in them.
+#[must_use]
+pub fn pre_spawn_receipt(
+    started_at: i64,
+    stdout_path: &Path,
+    stderr_path: &Path,
+    final_output_path: Option<&Path>,
+) -> ExternalProcessStatus {
+    let ended_at = crate::time::now_epoch_millis();
+    ExternalProcessStatus {
+        started_at,
+        ended_at: Some(ended_at),
+        duration_ms: Some(ended_at - started_at),
+        exit_code: Some(1),
+        stdout_path: stdout_path.display().to_string(),
+        stderr_path: stderr_path.display().to_string(),
+        final_output_path: final_output_path.map(|path| path.display().to_string()),
+        ..ExternalProcessStatus::default()
+    }
+}
+
 /// The pre-spawn failure shape (`:211-224`): exit 1, the failure text, and a receipt that still
 /// names the log paths so a caller can see there was nothing to read.
 fn pre_spawn_outcome(
@@ -92,7 +128,6 @@ fn pre_spawn_outcome(
     stderr_path: &Path,
     final_output_path: Option<&Path>,
 ) -> ExternalCliRunOutcome {
-    let ended_at = crate::time::now_epoch_millis();
     ExternalCliRunOutcome {
         output: String::new(),
         exit_code: 1,
@@ -100,16 +135,12 @@ fn pre_spawn_outcome(
         timed_out: false,
         stopped: false,
         process_signal: None,
-        external_process: ExternalProcessStatus {
+        external_process: pre_spawn_receipt(
             started_at,
-            ended_at: Some(ended_at),
-            duration_ms: Some(ended_at - started_at),
-            exit_code: Some(1),
-            stdout_path: stdout_path.display().to_string(),
-            stderr_path: stderr_path.display().to_string(),
-            final_output_path: final_output_path.map(|path| path.display().to_string()),
-            ..ExternalProcessStatus::default()
-        },
+            stdout_path,
+            stderr_path,
+            final_output_path,
+        ),
     }
 }
 
@@ -125,12 +156,7 @@ pub async fn run_external_cli_process(
     input: &ExternalCliRunInput<'_>,
 ) -> ExternalCliRunOutcome {
     let started_at = crate::time::now_epoch_millis();
-    let stdout_path = input
-        .log_dir
-        .join(format!("external-{}.stdout.log", input.step_index));
-    let stderr_path = input
-        .log_dir
-        .join(format!("external-{}.stderr.log", input.step_index));
+    let (stdout_path, stderr_path) = external_log_paths(&input.log_dir, input.step_index);
     if let Err(error) = std::fs::create_dir_all(&input.log_dir) {
         return pre_spawn_outcome(
             error.to_string(),
@@ -176,16 +202,6 @@ pub async fn run_external_cli_process(
     };
     let pid = child.id();
 
-    // Deliver the prompt down its single channel and close stdin (`:363-364`). A write failure is
-    // swallowed for the same reason upstream installs a no-op `stdin.on("error")`: a one-shot CLI
-    // that exits before reading its input is a normal outcome, not a runner failure.
-    if let Some(mut stdin) = child.stdin.take() {
-        if let Some(payload) = prompt.stdin_payload() {
-            let _ = stdin.write_all(payload.as_bytes()).await;
-        }
-        let _ = stdin.shutdown().await;
-    }
-
     let mut stdout_log = BoundedLog::create(&stdout_path, plan.limits.stdout_log_bytes);
     let mut stderr_log = BoundedLog::create(&stderr_path, plan.limits.stderr_log_bytes);
     let mut stdout_tail = ByteTail::new(MAX_OUTPUT_TAIL_BYTES);
@@ -193,6 +209,18 @@ pub async fn run_external_cli_process(
     let mut splitter = LineSplitter::new(plan.limits);
     let mut parser_error: Option<String> = None;
 
+    // ORDER IS LOAD-BEARING: both drains start BEFORE anything is written to stdin, which is
+    // upstream's own order — `child.stdout.on("data", …)`/`child.stderr.on("data", …)` are
+    // registered at `external-cli-runner.ts:350-360` and `child.stdin.end(input.prompt)` only at
+    // `:364`, so Node is draining both pipes while the prompt goes down the third.
+    //
+    // Writing the prompt first deadlocks the pair whenever the prompt exceeds the stdin pipe
+    // buffer (64 KiB on Linux — `build_external_cli_prompt` concatenates the whole system-prompt
+    // body and the task, so that is an ordinary size) AND the child writes enough to fill its own
+    // stdout buffer before consuming all of stdin: the child blocks in `write`, this runner blocks
+    // in `write_all`, and NEITHER the deadline arm nor the stop arm below can fire because the
+    // select loop has not been entered yet. That is an unbounded hang no run-wide verb can
+    // recover, which is why the delivery is its own task rather than a step before the loop.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<(bool, Vec<u8>)>(64);
     if let Some(pipe) = child.stdout.take() {
         let tx = tx.clone();
@@ -203,6 +231,10 @@ pub async fn run_external_cli_process(
         tokio::spawn(pump(pipe, tx, false));
     }
     drop(tx);
+    tokio::spawn(deliver_prompt(
+        child.stdin.take(),
+        prompt.stdin_payload().map(str::to_owned),
+    ));
 
     let mut exit: Option<std::process::ExitStatus> = None;
     let mut timed_out = false;
@@ -219,6 +251,16 @@ pub async fn run_external_cli_process(
                 if is_stdout {
                     if plan.parser.is_some() && parser_error.is_none() {
                         feed_parser(&mut splitter, plan.parser.as_mut(), &bytes, &mut parser_error);
+                        // `failParser` tears the process TREE down the moment a JSONL protocol
+                        // violation is seen (`external-cli-runner.ts:267-272`) rather than letting
+                        // a misbehaving CLI run on to its own exit or to the deadline. Unlike the
+                        // two arms below this sets neither `timed_out` nor `stopped`: the failure
+                        // precedence at the bottom of this function reports the PARSER error.
+                        if parser_error.is_some() && !terminated {
+                            terminated = true;
+                            exit = crate::spawn::signal::terminate_on_timeout(&mut child).await.ok();
+                            drain_deadline = Some(tokio::time::Instant::now() + crate::spawn::signal::TIMEOUT_SIGTERM_GRACE);
+                        }
                     }
                     stdout_log.push(&bytes);
                     stdout_tail.push(&bytes);
@@ -406,6 +448,23 @@ fn apply_line_event(
         }
         LineEvent::Failed(error) => *parser_error = Some(error),
     }
+}
+
+/// Deliver the prompt down stdin and close it (`external-cli-runner.ts:363-364`).
+///
+/// Owns the pipe outright and runs on its own task, so it closes stdin as soon as the write
+/// settles no matter what the run loop does — including when the loop breaks first, which is what
+/// keeps a half-written prompt from holding the child's stdin open past the loop.
+///
+/// A write failure is swallowed for the same reason upstream installs a no-op `stdin.on("error")`
+/// (`:363`): a one-shot CLI that exits before reading its input is a normal outcome, not a runner
+/// failure.
+async fn deliver_prompt(stdin: Option<tokio::process::ChildStdin>, payload: Option<String>) {
+    let Some(mut stdin) = stdin else { return };
+    if let Some(payload) = payload {
+        let _ = stdin.write_all(payload.as_bytes()).await;
+    }
+    let _ = stdin.shutdown().await;
 }
 
 /// A future that resolves at `deadline`, or never when there is none.
@@ -604,6 +663,100 @@ mod tests {
                 .unwrap_or_default()
                 .starts_with("Claude Code emitted malformed JSONL:"),
             "{outcome:?}"
+        );
+    }
+
+    /// SUBA-074 review fix — a parser protocol violation TEARS THE PROCESS DOWN at the violation
+    /// (`failParser` -> `terminateExternalProcessTree`, `external-cli-runner.ts:267-272`) instead
+    /// of draining a misbehaving CLI to its own exit or to the deadline.
+    ///
+    /// The script emits one bad line and then sleeps for a minute with no deadline set, so the
+    /// only thing that can end this run inside the assertion's wall clock is the teardown.
+    #[tokio::test]
+    async fn a_parser_protocol_violation_tears_the_process_down_at_the_violation() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop = cyrup_core::CancelToken::new();
+        let program = script(
+            dir.path(),
+            "#!/bin/sh\nprintf '%s\\n' 'not json'\nsleep 60 &\nwait\n",
+        );
+        let prepared = PromptDelivery::Stdin.prepare("x").unwrap();
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            run_external_cli_process(
+                plan(
+                    program,
+                    Some(AdapterParser::ClaudeCode(ClaudeCodeParser::new())),
+                ),
+                &prepared,
+                &input(dir.path(), &stop),
+            ),
+        )
+        .await
+        .expect("the parser failure must end the run, not wait for a 60s sleep");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(outcome.exit_code, 1, "{outcome:?}");
+        // Neither run-wide verb fired: this is a PARSER failure and reports as one (`:400-405`).
+        assert!(!outcome.timed_out && !outcome.stopped, "{outcome:?}");
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("Claude Code emitted malformed JSONL:"),
+            "{outcome:?}"
+        );
+    }
+
+    /// SUBA-074 review fix, THE blocking one — a prompt larger than the stdin pipe must not
+    /// deadlock against a child that writes before it reads.
+    ///
+    /// Upstream registers `child.stdout.on("data", …)`/`child.stderr.on("data", …)` at
+    /// `external-cli-runner.ts:350-360` and only then does `child.stdin.end(input.prompt)` at
+    /// `:364`, so Node drains both pipes while the prompt goes down the third. cyrup wrote the
+    /// prompt to completion BEFORE creating the pumps and before entering the select loop: with a
+    /// prompt over the 64 KiB pipe buffer and a child that fills its own stdout buffer first, the
+    /// two sides blocked on each other and NEITHER the deadline arm nor the stop arm could fire,
+    /// because the loop that owns them had not been entered. This test hangs forever against that
+    /// order, which is why it is wrapped in a wall-clock bound.
+    ///
+    /// The child echoes 128 KiB before reading a byte, then reports the stdin byte count, so the
+    /// assertion also proves the WHOLE prompt was delivered rather than just enough of it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_prompt_larger_than_the_stdin_pipe_does_not_deadlock_a_child_that_writes_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop = cyrup_core::CancelToken::new();
+        let program = script(
+            dir.path(),
+            "#!/bin/sh\nhead -c 131072 /dev/zero | tr '\\000' 'x'\necho\nwc -c\n",
+        );
+        let prompt = "p".repeat(256 * 1024);
+        let prepared = PromptDelivery::Stdin.prepare(&prompt).unwrap();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_external_cli_process(plan(program, None), &prepared, &input(dir.path(), &stop)),
+        )
+        .await
+        .expect("writing the prompt must not deadlock against the child's own stdout");
+
+        assert_eq!(outcome.exit_code, 0, "{outcome:?}");
+        assert_eq!(outcome.error, None, "{outcome:?}");
+        let last = outcome
+            .output
+            .lines()
+            .next_back()
+            .unwrap_or_default()
+            .trim();
+        assert_eq!(
+            last,
+            prompt.len().to_string(),
+            "the child must have read the WHOLE prompt: {last}"
         );
     }
 

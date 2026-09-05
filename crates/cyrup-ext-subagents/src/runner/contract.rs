@@ -107,6 +107,16 @@ impl AdapterId {
         }
     }
 
+    /// `RESERVED_READ_ONLY_ADAPTERS` in upstream's own ROW ORDER
+    /// (`external-cli-contract.ts:42-46`): `claude-code`, `codex-exec`, `cursor-agent`.
+    ///
+    /// The order is observable, which is why this is declared rather than filtered out of
+    /// [`Self::ALL`]: [`validate_code_owned_profile_runner`] returns on the FIRST matching row, so
+    /// an agent whose selection names contain two reserved names is told about whichever upstream
+    /// would name — and `ALL` is in wire-id order (`codex-exec` first), which is not the same.
+    pub const RESERVED_READ_ONLY: [Self; 3] =
+        [Self::ClaudeCode, Self::CodexExec, Self::CursorAgent];
+
     /// `RESERVED_READ_ONLY_ADAPTERS` (`external-cli-contract.ts:42-46`) as a total function:
     /// `Some((writer twin, access word))` for a reserved READ-ONLY id, `None` for a writer id.
     ///
@@ -193,13 +203,6 @@ impl<'de> serde::Deserialize<'de> for AdapterId {
 /// rather than a computed join so the refusal text cannot drift from [`AdapterId::ALL`] without the
 /// accompanying assertion failing.
 pub const CODE_OWNED_ADAPTER_LABEL: &str = "'codex-exec', 'codex-exec-writer', 'claude-code', 'claude-code-writer', 'cursor-agent', 'cursor-agent-writer'";
-
-/// `isCodeOwnedExternalCliAdapterId` (`:38-40`), kept as a free predicate for the two frontmatter
-/// parsers that must answer "is this string legal?" before they have anywhere to put the id.
-#[must_use]
-pub fn is_code_owned_adapter_id(value: &str) -> bool {
-    AdapterId::try_from(value).is_ok()
-}
 
 /// The seven narrowable capabilities — upstream's `Object.keys(UNSUPPORTED)`
 /// (`external-cli-contract.ts:8-17`).
@@ -298,21 +301,72 @@ impl Capability {
     }
 }
 
-impl serde::Serialize for Capability {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.wire())
-    }
-}
+/// serde for [`ExternalCliRunner::capabilities`](crate::runner::ExternalCliRunner::capabilities)
+/// in UPSTREAM's wire shape: the `Partial<Record<key, false>>` OBJECT an agent file's
+/// `runner.capabilities` block carries (`shared/types.ts:1695`), not the set the in-memory type is.
+///
+/// The narrowing is a [`BTreeSet`] because every value in that object is `false` by construction
+/// (see [`ExternalCliCapabilityNarrowing`]) — but the SET is an internal representation, and a
+/// derived impl would put `["steer"]` on the wire. That matters at exactly one place: the hop-2
+/// `runner-config.json` hand-off, which carries a whole [`crate::exec::ResolvedAgentPersona`]
+/// including its runner. Without this the detached runner's copy of a `runner:` block and the
+/// frontmatter writer's ([`crate::runner::runner_to_json_string`]) would disagree in SHAPE, and
+/// neither would match the block an author wrote.
+///
+/// Deserialization applies the same two refusals the frontmatter parser does — an unknown key, and
+/// any value that is not literally `false` — so the hand-off cannot be the seam through which a
+/// widened capability enters.
+pub mod capability_narrowing_serde {
+    use super::{Capability, ExternalCliCapabilityNarrowing};
+    use std::collections::BTreeMap;
 
-impl<'de> serde::Deserialize<'de> for Capability {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = String::deserialize(deserializer)?;
-        Self::ALL
-            .into_iter()
-            .find(|candidate| candidate.wire() == raw)
-            .ok_or_else(|| {
-                serde::de::Error::custom(format!("unknown external-cli capability '{raw}'"))
-            })
+    /// # Errors
+    ///
+    /// Propagates the serializer's own failures only.
+    pub fn serialize<S: serde::Serializer>(
+        value: &Option<ExternalCliCapabilityNarrowing>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        match value {
+            None => serializer.serialize_none(),
+            Some(narrowing) => {
+                let mut map = serializer.serialize_map(Some(narrowing.len()))?;
+                for capability in narrowing {
+                    map.serialize_entry(capability.wire(), &false)?;
+                }
+                map.end()
+            }
+        }
+    }
+
+    /// # Errors
+    ///
+    /// An unsupported capability key, or any value other than `false`.
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<ExternalCliCapabilityNarrowing>, D::Error> {
+        use serde::Deserialize as _;
+        let Some(raw) = Option::<BTreeMap<String, bool>>::deserialize(deserializer)? else {
+            return Ok(None);
+        };
+        let mut narrowing = ExternalCliCapabilityNarrowing::new();
+        for (key, setting) in raw {
+            let capability = Capability::ALL
+                .into_iter()
+                .find(|candidate| candidate.wire() == key)
+                .ok_or_else(|| {
+                    serde::de::Error::custom(format!("unknown external-cli capability '{key}'"))
+                })?;
+            if setting {
+                return Err(serde::de::Error::custom(format!(
+                    "capabilities.{key} may only be false; user config cannot widen code-owned \
+                     external adapter capabilities."
+                )));
+            }
+            narrowing.insert(capability);
+        }
+        Ok(Some(narrowing))
     }
 }
 
@@ -379,14 +433,16 @@ pub fn parse_capability_narrowing(
 /// selected in place of the sandboxed read-only profile — the same class of silent widening this
 /// whole item exists to close.
 ///
-/// `selection_names` is upstream's `[name, localName?, ...aliases]`. The reserved rows are derived
-/// from [`AdapterId::reserved_pair`], so they cannot drift from the id set.
+/// `selection_names` is upstream's `[name, localName?, ...aliases]`. The rows are
+/// [`AdapterId::RESERVED_READ_ONLY`] — upstream's own order, because the loop returns on the first
+/// match — and each row's writer twin and access word come from [`AdapterId::reserved_pair`], so
+/// neither can drift from the id set.
 #[must_use]
 pub fn validate_code_owned_profile_runner(
     selection_names: &[&str],
     runner_adapter: Option<AdapterId>,
 ) -> Option<String> {
-    for reserved in AdapterId::ALL {
+    for reserved in AdapterId::RESERVED_READ_ONLY {
         let Some((writer, access)) = reserved.reserved_pair() else {
             continue;
         };
@@ -427,7 +483,7 @@ mod tests {
         }
         assert_eq!(AdapterId::try_from("cursor_agent"), Err(()));
         assert_eq!(AdapterId::try_from("grok-build"), Err(()));
-        assert!(!is_code_owned_adapter_id("claude-code-reader"));
+        assert_eq!(AdapterId::try_from("claude-code-reader"), Err(()));
     }
 
     /// The three reserved read-only ids, their writer twins and their per-adapter access words —
@@ -558,13 +614,82 @@ mod tests {
             assert_eq!(serde_json::from_str::<AdapterId>(&json).unwrap(), id);
         }
         assert!(serde_json::from_str::<AdapterId>("\"grok-build\"").is_err());
-        for capability in Capability::ALL {
-            let json = serde_json::to_string(&capability).unwrap();
-            assert_eq!(json, format!("\"{}\"", capability.wire()));
-            assert_eq!(
-                serde_json::from_str::<Capability>(&json).unwrap(),
-                capability
-            );
+    }
+
+    /// SUBA-074 review fix — a narrowing persists as upstream's `{key: false}` OBJECT, not as the
+    /// `BTreeSet` it is in memory.
+    ///
+    /// `ExternalCliRunner` derives serde and rides inside `runner-config.json`, so a derived set
+    /// impl would have put `["steer"]` on the hop-2 wire while the frontmatter writer
+    /// ([`crate::runner::runner_to_json_string`]) went on emitting the object — two spellings of
+    /// one block. Deserialization keeps the frontmatter parser's two refusals, so the hand-off
+    /// cannot be the seam a `true` enters through.
+    #[test]
+    fn a_capability_narrowing_persists_as_upstreams_false_valued_object() {
+        let runner = crate::runner::ExternalCliRunner {
+            adapter: Some(AdapterId::ClaudeCode),
+            command: "claude".to_string(),
+            args: Vec::new(),
+            prompt_delivery_stdin: false,
+            capabilities: Some(
+                [Capability::Steer, Capability::Resume]
+                    .into_iter()
+                    .collect(),
+            ),
+        };
+        let json = serde_json::to_value(&runner).unwrap();
+        assert_eq!(
+            json["capabilities"],
+            serde_json::json!({ "steer": false, "resume": false })
+        );
+        assert_eq!(
+            serde_json::from_value::<crate::runner::ExternalCliRunner>(json).unwrap(),
+            runner
+        );
+
+        // Absent stays absent rather than becoming an empty object.
+        let none = crate::runner::ExternalCliRunner {
+            capabilities: None,
+            ..runner
+        };
+        let json = serde_json::to_value(&none).unwrap();
+        assert!(json.get("capabilities").is_none(), "{json}");
+
+        // The parser's two refusals hold on this wire too.
+        assert!(
+            serde_json::from_value::<crate::runner::ExternalCliRunner>(serde_json::json!({
+                "command": "claude",
+                "capabilities": { "steer": true }
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<crate::runner::ExternalCliRunner>(serde_json::json!({
+                "command": "claude",
+                "capabilities": { "stop": false }
+            }))
+            .is_err()
+        );
+    }
+
+    /// SUBA-074 review fix — the reserved rows are swept in upstream's OWN order
+    /// (`external-cli-contract.ts:42-46`: claude-code, codex-exec, cursor-agent), not in
+    /// `AdapterId::ALL`'s wire order. The loop returns on the first match, so an agent whose
+    /// selection names contain two reserved names must be told about the one upstream would name.
+    #[test]
+    fn the_reserved_rows_are_swept_in_upstreams_own_order() {
+        assert_eq!(
+            AdapterId::RESERVED_READ_ONLY.map(AdapterId::wire),
+            ["claude-code", "codex-exec", "cursor-agent"]
+        );
+        for id in AdapterId::RESERVED_READ_ONLY {
+            assert!(id.reserved_pair().is_some(), "{id:?}");
         }
+        let message = validate_code_owned_profile_runner(&["codex-exec", "claude-code"], None)
+            .expect("both names are reserved");
+        assert!(
+            message.starts_with("Selection name 'claude-code'"),
+            "upstream's first row is claude-code; got {message}"
+        );
     }
 }

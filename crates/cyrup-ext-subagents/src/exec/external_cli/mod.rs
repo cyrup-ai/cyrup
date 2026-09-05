@@ -38,14 +38,18 @@ use prompt::{PromptDelivery, build_external_cli_prompt};
 ///
 /// Passed by [`crate::runner::dispatch::resolve_runner_dispatch`], which is pure — nothing here is
 /// read from the filesystem or the clock.
+///
+/// It carries ONLY what a shipped resolver reads. Upstream's `resolveCodexExecLaunch` /
+/// `resolveCursorAgentLaunch` also take `cwd`, `asyncDir` and `stepIndex`
+/// (`subagent-runner.ts:1493-1498` @v0.64.0), and those three were carried here from the start of
+/// stage 2 — but neither of those adapters ships (both are REFUSED by
+/// [`crate::runner::dispatch`]), the two resolvers that DO ship never read them, and
+/// [`run_external_cli`] derives the same values from [`RunOptions`] for itself. Populating a field
+/// nothing reads invites exactly the drift where the context's copy and the runner's copy stop
+/// agreeing, so they are not here: the adapter that needs them reintroduces them with its
+/// resolver.
 #[derive(Debug, Clone, Default)]
 pub struct ExternalCliLaunchContext {
-    /// The child's working directory.
-    pub cwd: PathBuf,
-    /// Where the bounded stream logs and any adapter artifacts go.
-    pub scratch_dir: PathBuf,
-    /// The flat step index, which names those logs.
-    pub step_index: usize,
     /// Upstream's `commandPrefixArgs` test seam (`claude-code-adapter.ts:84-85`): argv placed in
     /// FRONT of the adapter's own, so a test can point `command` at an interpreter and still
     /// exercise the real flags against a fake process. Empty in production.
@@ -171,10 +175,14 @@ pub fn resolve_claude_code_launch(
 /// The result carries `model: None` and empty `attempted_models`/`model_attempts` — upstream
 /// resolves NO model for an external runner at all (`api/preflight.ts:322-343`), and a "helpful"
 /// ladder entry here would misreport which model produced the work.
+///
+/// `contract` is the run's effective acceptance contract, injected into the task the FOREIGN
+/// process sees — see the call site below.
 pub async fn run_external_cli(
     agent: &AgentConfig,
     task: &str,
     opts: &RunOptions,
+    contract: &crate::exec::acceptance::AcceptanceContract,
     launch: ExternalCliLaunch,
 ) -> SingleResult {
     let ExternalCliLaunch {
@@ -188,16 +196,44 @@ pub async fn run_external_cli(
         final_output_path,
     } = launch;
 
+    let started_at = crate::time::now_epoch_millis();
     let output_snapshot = crate::exec::output::snapshot_output_file(opts.output_path.as_deref());
     let scratch_dir = crate::background::attempt_scratch_dir(&opts.cwd);
     let step_index = opts.child_index.unwrap_or(0);
+    // Every pre-spawn failure below still publishes a receipt naming these two, exactly as
+    // upstream's pre-spawn `catch` does (`external-cli-runner.ts:212-213`) — an empty
+    // `externalProcess` would tell a reader the run never reached the runner at all.
+    let (stdout_path, stderr_path) = run::external_log_paths(&scratch_dir, step_index);
+    let pre_spawn = |error: String| {
+        external_failure(
+            agent,
+            task,
+            &status,
+            Some(run::pre_spawn_receipt(
+                started_at,
+                &stdout_path,
+                &stderr_path,
+                final_output_path.as_deref(),
+            )),
+            error,
+        )
+    };
 
-    // `buildExternalCliPrompt(step.systemPrompt ?? "", task)` (`subagent-runner.ts:1506`).
-    let prompt_text = build_external_cli_prompt(&agent.system_prompt_body, task);
+    // `buildExternalCliPrompt(step.systemPrompt ?? "", task)` (`subagent-runner.ts:1506`) — over
+    // the POST-acceptance task. Upstream appends `formatAcceptancePrompt(step.effectiveAcceptance,
+    // …)` to `task` at `:1462-1465`, ABOVE the `if (step.runner?.type === "external-cli")` branch
+    // at `:1491`, so the foreign process is told the contract it will be judged against just as a
+    // native child is. Only the PROMPT carries it: `SingleResult::task` below stays the raw task,
+    // matching the native path, where the injection likewise happens inside prompt construction
+    // (`exec/spawn_plan.rs`) and never rewrites the recorded task.
+    let prompt_text = build_external_cli_prompt(
+        &agent.system_prompt_body,
+        &crate::exec::acceptance::inject_acceptance_contract(task, contract),
+    );
     let prepared = match delivery.prepare(&prompt_text) {
         Ok(prepared) => prepared,
         Err(error) => {
-            return external_failure(agent, task, &status, None, error.to_string());
+            return pre_spawn(error.to_string());
         }
     };
 
@@ -215,7 +251,7 @@ pub async fn run_external_cli(
                     spec,
                     preflight::classify_invalidation(&error),
                 );
-                return external_failure(agent, task, &status, None, error);
+                return pre_spawn(error);
             }
         }
     }
@@ -436,7 +472,6 @@ mod tests {
     fn the_command_prefix_reaches_the_argv_and_both_probes() {
         let ctx = ExternalCliLaunchContext {
             command_prefix_args: vec!["--fake".to_string()],
-            ..ExternalCliLaunchContext::default()
         };
         let launch = resolve_claude_code_launch(
             AdapterId::ClaudeCode,

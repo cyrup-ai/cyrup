@@ -58,8 +58,14 @@ pub struct ExternalCliRunner {
     /// Upstream's only legal value is `"stdin"`, so this is a flag: `true` iff the key was present.
     #[serde(default)]
     pub prompt_delivery_stdin: bool,
-    /// Narrowing-only; see [`contract::parse_capability_narrowing`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Narrowing-only; see [`contract::parse_capability_narrowing`]. Serialized in upstream's
+    /// `{key: false}` OBJECT shape rather than as the set it is in memory — see
+    /// [`contract::capability_narrowing_serde`] for why the hop-2 hand-off depends on that.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "contract::capability_narrowing_serde"
+    )]
     pub capabilities: Option<ExternalCliCapabilityNarrowing>,
 }
 
