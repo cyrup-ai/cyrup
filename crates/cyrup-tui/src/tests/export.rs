@@ -46,9 +46,10 @@ fn the_active_theme_changes_the_exported_palette() {
             &Theme::parse(json, None, ResourceScope::Builtin, ResourceOrigin::Builtin).unwrap(),
         )
     };
-    let dark = session_jsonl_to_html_with_theme(JSONL, &theme(cyrup_resources::BUILTIN_DARK_JSON));
+    let dark =
+        session_jsonl_to_html_with_theme(JSONL, &theme(cyrup_resources::BUILTIN_DARK_JSON), None);
     let light =
-        session_jsonl_to_html_with_theme(JSONL, &theme(cyrup_resources::BUILTIN_LIGHT_JSON));
+        session_jsonl_to_html_with_theme(JSONL, &theme(cyrup_resources::BUILTIN_LIGHT_JSON), None);
 
     assert!(dark.contains("--body-bg: #18181e;"));
     assert!(light.contains("--body-bg: #f8f8f8;"));
@@ -63,4 +64,32 @@ fn empty_input_still_yields_a_document() {
     let html = session_jsonl_to_html("");
     assert!(html.starts_with("<!DOCTYPE html>"));
     assert!(html.contains("id=\"messages\""));
+}
+
+/// DRIFT-041 review fix — the TUI's two HTML export sites must hand the renderer the MANAGER's
+/// leaf, not let it re-derive one from the JSONL.
+///
+/// pi passes `sm.getLeafId()` (`core/export-html/index.ts:266` @v0.84.4); cyrup's manager moves its
+/// leaf without appending (`SessionManager::branch`), so after a `/tree` switch with no new message
+/// the last line of the exported file belongs to the abandoned branch. Read from the source for the
+/// same reason `theme_reapply_on_reload.rs` reads its arm: neither `/export` nor `/share` can be
+/// driven from this crate without a live `AgentSession`.
+#[test]
+fn both_tui_export_sites_pass_the_session_leaf() {
+    for (label, src) in [
+        ("/export", include_str!("../app/execute_session.rs")),
+        ("/share", include_str!("../app/execute_misc.rs")),
+    ] {
+        let call = src
+            .find("session_jsonl_to_html_with_theme(")
+            .unwrap_or_else(|| panic!("{label} must still render through the shared renderer"));
+        let args = src
+            .get(call..(call + 220).min(src.len()))
+            .unwrap_or_default();
+        assert!(
+            args.contains("session.export_leaf_id()"),
+            "{label} must pass `session.export_leaf_id()` — without it the exported document walks \
+             the branch the user abandoned (DRIFT-041)"
+        );
+    }
 }

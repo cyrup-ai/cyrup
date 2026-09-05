@@ -1064,8 +1064,11 @@ impl<B: Backend> App<B> {
         if self.try_share_via_radius(session, &jsonl).await {
             return;
         }
-        let html =
-            cyrup_session_svc::session_jsonl_to_html_with_theme(&jsonl, &session.export_theme());
+        let html = cyrup_session_svc::session_jsonl_to_html_with_theme(
+            &jsonl,
+            &session.export_theme(),
+            session.export_leaf_id().await.as_deref(),
+        );
         let tmp = std::env::temp_dir().join(format!("cyrup-session-{}.html", session.session_id()));
         if let Err(e) = std::fs::write(&tmp, html.as_bytes()) {
             self.state

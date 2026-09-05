@@ -189,6 +189,12 @@ impl ExportTheme {
     }
 
     /// One resolved role, by pi's camelCase token name.
+    ///
+    /// Deliberately `pub` with no production caller: the whole palette leaves this type as CSS text
+    /// through [`Self::theme_vars`], so the only way to assert that a NAMED role resolved the way
+    /// pi's `generateThemeVars` resolves it is to read it back (`tests/export_html.rs`'s
+    /// `optional_role_aliases_fall_back_the_way_pi_does`). Kept on the public surface rather than
+    /// `cfg(test)` because it is also the accessor any future non-HTML export would want.
     #[must_use]
     pub fn role(&self, token: &str) -> Option<CssColor> {
         self.roles.get(token).copied()
@@ -220,7 +226,16 @@ impl ExportTheme {
 /// `systemPrompt`, `tools` and `renderedTools` are absent, which is what `JSON.stringify` produces
 /// for pi's own `exportFromFile` (`index.ts:298-304` sets the first two `undefined` and never sets
 /// the third); `template.js:15` destructures them and every reader is `?.`-guarded.
-fn session_data(jsonl: &str) -> Value {
+///
+/// `leaf_id` is pi's `sm.getLeafId()` (`index.ts:266` and `:301`), supplied by the shell. `None`
+/// falls back to the last non-`session` line, which is `_buildIndex`'s own seeding rule
+/// (`session-manager.ts:959-977`) and therefore exactly what pi's `exportFromFile` gets from a
+/// `SessionManager.open`ed file. It is NOT a safe substitute for a live manager's leaf:
+/// `SessionManager::branch` moves the leaf without appending and `reset_leaf` clears it, so after a
+/// `/tree` branch switch with no new message the last file entry belongs to the ABANDONED branch —
+/// pi's own `branch` / `branchWithSummary` reassign `this.leafId` for the same reason
+/// (`session-manager.ts:1361-1365`, `:1393`), and `resetLeaf` nulls it (`:1373-1374`). Every caller that holds a manager passes `Some`.
+fn session_data(jsonl: &str, leaf_id: Option<&str>) -> Value {
     let mut lines = jsonl.lines().filter(|l| !l.trim().is_empty());
     // pi `sm.getHeader()` — `fileEntries[0]`, the `type: "session"` line.
     let header: Value = lines
@@ -239,38 +254,51 @@ fn session_data(jsonl: &str) -> Value {
         .filter(|v| v.get("type").and_then(Value::as_str) != Some("session"))
         .collect();
 
-    let leaf_id = entries
-        .last()
-        .and_then(|e| e.get("id"))
-        .cloned()
-        .unwrap_or(Value::Null);
+    let leaf = match leaf_id {
+        Some(id) => Value::String(id.to_string()),
+        None => entries
+            .last()
+            .and_then(|e| e.get("id"))
+            .cloned()
+            .unwrap_or(Value::Null),
+    };
 
     let mut map = Map::new();
     map.insert("header".to_string(), header);
     map.insert("entries".to_string(), Value::Array(entries));
-    map.insert("leafId".to_string(), leaf_id);
+    map.insert("leafId".to_string(), leaf);
     Value::Object(map)
 }
 
 /// Render the session JSONL (`SessionManager::export_jsonl` output: header line + one entry per
-/// line) into a standalone HTML document, using the compiled-in `dark` palette.
+/// line) into a standalone HTML document, using the compiled-in `dark` palette and deriving the
+/// leaf from the file.
 ///
-/// [`session_jsonl_to_html_with_theme`] is the same renderer with the user's live theme; this
-/// signature is kept for the callers that have no theme to offer (`cyrup --export`, which runs
-/// before a session is built).
+/// This is pi's `exportFromFile` shape exactly (`export-html/index.ts:288-305` @v0.84.4): a file is
+/// all there is, so the leaf is whatever `_buildIndex` would seed from it. Callers that hold a live
+/// `SessionManager` must use [`session_jsonl_to_html_with_theme`] and pass its
+/// `SessionManager::leaf_id`; see [`session_data`].
 #[must_use]
 pub fn session_jsonl_to_html(jsonl: &str) -> String {
-    session_jsonl_to_html_with_theme(jsonl, &ExportTheme::default())
+    session_jsonl_to_html_with_theme(jsonl, &ExportTheme::default(), None)
 }
 
 /// pi `generateHtml(sessionData, themeName)` (`export-html/index.ts:143-175` @v0.84.4).
 ///
-/// Pure: the same `(jsonl, theme)` always yields the same document, and nothing here touches the
-/// filesystem, the clock or the resource registry. Never panics — a malformed or empty transcript
-/// still produces a valid document (the template renders an empty session).
+/// Pure: the same `(jsonl, theme, leaf_id)` always yields the same document, and nothing here
+/// touches the filesystem, the clock or the resource registry. Never panics — a malformed or empty
+/// transcript still produces a valid document (the template renders an empty session).
+///
+/// `leaf_id` is the shell's, not the renderer's, exactly as pi's is (`index.ts:266` passes
+/// `sm.getLeafId()` into `generateHtml`) — see [`session_data`] for why deriving it here is wrong
+/// for a live session.
 #[must_use]
-pub fn session_jsonl_to_html_with_theme(jsonl: &str, theme: &ExportTheme) -> String {
-    let data = session_data(jsonl);
+pub fn session_jsonl_to_html_with_theme(
+    jsonl: &str,
+    theme: &ExportTheme,
+    leaf_id: Option<&str>,
+) -> String {
+    let data = session_data(jsonl, leaf_id);
     // `Buffer.from(JSON.stringify(sessionData)).toString("base64")` (`index.ts:160`). Base64 is
     // what makes the payload injection-proof: no transcript byte can close the `<script>` element,
     // which is why nothing on this path is HTML-escaped.

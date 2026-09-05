@@ -632,7 +632,7 @@ impl IntercomClient {
         }
     }
 
-    /// `supportsFeature` (`v0.13.0 broker/client.ts:817-819`) — whether the broker advertised
+    /// `supportsFeature` (`v0.13.0 broker/client.ts:93-95`) — whether the broker advertised
     /// `feature` on `registered`.
     #[must_use]
     pub fn supports_feature(&self, feature: &str) -> bool {

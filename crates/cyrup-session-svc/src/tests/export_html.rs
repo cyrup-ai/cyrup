@@ -227,6 +227,63 @@ fn branching_history_is_exported_as_a_tree_with_a_leaf() {
     );
 }
 
+/// DRIFT-041 review fix — the leaf is the MANAGER's, not the file's last line.
+///
+/// pi passes `sm.getLeafId()` into `generateHtml` (`core/export-html/index.ts:266` @v0.84.4), and
+/// `branch` / `branchWithSummary` reassign that pointer WITHOUT appending
+/// (`core/session-manager.ts:1361-1365`, `:1393`), exactly as `SessionManager::branch` does. In
+/// `FIXTURE`, `dddddddd` and `eeeeeeee` are siblings off `cccccccc` and `eeeeeeee` is last in the
+/// file; a user who runs `/tree` and switches back to the `dddddddd` branch has a manager leaf of
+/// `dddddddd` and has appended nothing, so the last-line rule names an entry on the branch they
+/// just abandoned and `template.js:116-142` walks the wrong conversation.
+///
+/// RED before the fix: `session_jsonl_to_html_with_theme` took no leaf and always derived
+/// `eeeeeeee` here.
+#[test]
+fn an_explicit_leaf_wins_over_the_last_file_entry() {
+    let html = session_jsonl_to_html_with_theme(FIXTURE, &ExportTheme::default(), Some("dddddddd"));
+    let data = session_data(&html);
+    assert_eq!(
+        data["leafId"], "dddddddd",
+        "the manager's leaf, not the last line of the file"
+    );
+    // Nothing else moves: the whole tree still travels, as pi's `sm.getEntries()` does.
+    assert_eq!(data["entries"].as_array().unwrap().len(), 5);
+
+    // And `None` is still pi's `exportFromFile` rule (`index.ts:288-305`), which is all a
+    // file-only caller can know.
+    let derived = session_data(&session_jsonl_to_html_with_theme(
+        FIXTURE,
+        &ExportTheme::default(),
+        None,
+    ));
+    assert_eq!(derived["leafId"], "eeeeeeee");
+}
+
+/// The shell must actually supply that leaf. Read from the source because nothing in this crate can
+/// construct an `AgentSession` (it owns a provider, a registry and a live manager lock) — the same
+/// reason `crates/cyrup-tui/src/tests/theme_reapply_on_reload.rs` reads its swap arm from source.
+/// Without this guard, `export_leaf_id` could be dropped from `export_to_html` and every test above
+/// would still pass while each branched export silently regressed.
+#[test]
+fn export_to_html_passes_the_managers_leaf_to_the_renderer() {
+    const TRANSCRIPT_SRC: &str = include_str!("../session/transcript.rs");
+    let offset = TRANSCRIPT_SRC
+        .find("pub async fn export_to_html")
+        .expect("transcript.rs must still define `export_to_html`");
+    let body = &TRANSCRIPT_SRC[offset..];
+    let call = body
+        .find("session_jsonl_to_html_with_theme(")
+        .expect("`export_to_html` must still render through the pure renderer");
+    let call_args = &body[call..(call + 200).min(body.len())];
+    assert!(
+        call_args.contains("self.export_leaf_id()"),
+        "`export_to_html` must pass `self.export_leaf_id()` to the renderer — pi passes \
+         `sm.getLeafId()` (`core/export-html/index.ts:266` @v0.84.4), and re-deriving the leaf from \
+         the JSONL names an abandoned branch after a `/tree` switch"
+    );
+}
+
 /// Base64 is why nothing on this path is HTML-escaped (`index.ts:159-160`): no transcript byte can
 /// close the `<script>` element it travels in.
 #[test]
@@ -279,8 +336,8 @@ fn palette_comes_from_the_active_theme_not_a_constant() {
     let light = ExportTheme::from_theme(&builtin(cyrup_resources::BUILTIN_LIGHT_JSON));
     assert_ne!(dark, light, "the two built-ins are different palettes");
 
-    let dark_html = session_jsonl_to_html_with_theme(FIXTURE, &dark);
-    let light_html = session_jsonl_to_html_with_theme(FIXTURE, &light);
+    let dark_html = session_jsonl_to_html_with_theme(FIXTURE, &dark, None);
+    let light_html = session_jsonl_to_html_with_theme(FIXTURE, &light, None);
 
     // The explicit `export` blocks of the two built-ins (`cyrup-resources/src/theme.rs:602-606`,
     // `:689-693`), which pi prefers over the derived triple (`index.ts:155-157`).

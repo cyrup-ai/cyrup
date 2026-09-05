@@ -1221,3 +1221,60 @@ fn staleness_is_derived_from_the_options_the_text_was_produced_under() {
             .is_empty()
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// EXT-006 review fix — the run-loop SEAMS.
+//
+// Every test above drives `refresh_extension_renders` directly. A call site is not a type: nothing
+// above would notice if `dispatch_run_action` or `ingest_session_event_owned` stopped calling it,
+// and the renderers would silently go back to being one-shot. Neither arm is constructible from a
+// test in this crate — `dispatch_run_action` takes a `RunCtx` that owns a runtime, an event stream
+// and nine channels — so both are read from the source, the way
+// `theme_reapply_on_reload.rs::the_session_swap_arm_reapplies_the_theme_after_the_registry_and_before_the_replay`
+// and `startup_resources_panel.rs` read theirs.
+
+/// `dispatch_run_action` must end with the refresh: `Ctrl+O`, `/theme`, `/settings`, a selector and
+/// an extension shortcut all move display inputs upstream re-reads from the draw path
+/// (`core/extensions/types.ts:1213-1217` @v0.84.4).
+#[test]
+fn the_action_arm_still_refreshes_extension_renders() {
+    const ACTION_SRC: &str = include_str!("../app/run_action.rs");
+    let offset = ACTION_SRC
+        .find("async fn dispatch_run_action")
+        .expect("run_action.rs must still define `dispatch_run_action`");
+    let body = ACTION_SRC.get(offset..).unwrap_or("");
+    let end = body
+        .find("pub(crate) async fn on_input_event")
+        .unwrap_or(body.len());
+    assert!(
+        body.get(..end)
+            .unwrap_or("")
+            .contains("self.refresh_extension_renders("),
+        "`dispatch_run_action` no longer refreshes extension renders — Ctrl+O, `/theme`, \
+         `/settings`, a selector and an extension shortcut would all leave an extension's row \
+         frozen at the options it was first rendered under (EXT-006)"
+    );
+}
+
+/// `ingest_session_event_owned` must too: an extension HANDLER can move the same inputs from an
+/// EVENT (`ui.set-tools-expanded`, `ui.theme-set`), which never passes through the input arm.
+#[test]
+fn the_events_arm_still_refreshes_extension_renders() {
+    const EVENTS_SRC: &str = include_str!("../app/events.rs");
+    let offset = EVENTS_SRC
+        .find("async fn ingest_session_event_owned")
+        .expect("events.rs must still define `ingest_session_event_owned`");
+    let body = EVENTS_SRC.get(offset..).unwrap_or("");
+    let ingest = body
+        .find("self.ingest_event_with_extensions_owned(")
+        .expect("the events arm must still fold the event into the view");
+    let refresh = body.find("self.refresh_extension_renders(").expect(
+        "`ingest_session_event_owned` no longer refreshes extension renders — an extension \
+         handler moving `toolOutputExpanded` or the theme from an event would leave every \
+         already-rendered row frozen (EXT-006)",
+    );
+    assert!(
+        ingest < refresh,
+        "the refresh must run AFTER the fold, so the row this event created is itself refreshable"
+    );
+}

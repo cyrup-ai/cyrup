@@ -101,7 +101,7 @@ post-processes it.
 {
   "id": "my-ext",
   "version": "1.0.0",
-  "world": "cyrup:ext@0.8",
+  "world": "cyrup:ext@0.10",
   "entry": "crates/my-ext",
   "capabilities": {
     "fs": ["read:.", "write:.cyrup/todo"],
@@ -122,9 +122,10 @@ post-processes it.
 
 ### World compatibility
 
-The host world is `cyrup:ext@0.8`. A manifest's `world` must declare the **same major version** as
-the host and a **minor version at least** the host's. Against today's host, `cyrup:ext@0.8` is the
-value to write; an older minor is a mismatch, and so is a different major.
+The host world is `cyrup:ext@0.10` (`HOST_WORLD` in `crates/cyrup-ext/src/manifest.rs`, which also
+carries the bump history). A manifest's `world` must declare the **same major version** as the host
+and a **minor version at least** the host's. Against today's host, `cyrup:ext@0.10` is the value to
+write; an older minor is a mismatch, and so is a different major.
 
 The minor moves whenever an export is added, removed or re-signed, and whenever an import is removed
 or re-signed — both of those break an already-built guest at link time. A purely additive import does

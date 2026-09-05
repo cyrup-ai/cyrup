@@ -93,7 +93,11 @@ impl<B: Backend> App<B> {
     ///   the palette.
     ///
     /// `is_partial` is left `false` here because it is a property of a tool ROW, not of the frame;
-    /// [`crate::transcript::TranscriptView::stale_extension_renders`] overrides it per row.
+    /// [`crate::transcript::TranscriptView::stale_extension_renders`] overrides it per row with
+    /// `partial(!run.done)`. Those two never disagree at ingest, so this cannot schedule a wasted
+    /// re-invocation: `TranscriptView::push_tool_end_rendered` is the ONLY writer of
+    /// `ToolRun::rendered_result` and it sets `done = true` in the same statement, so a result
+    /// render always exists under `done`, i.e. under `is_partial == false`.
     pub(crate) fn render_options(&self) -> cyrup_ext::RenderOptions {
         cyrup_ext::RenderOptions::new(
             self.state.transcript.tool_expanded(),

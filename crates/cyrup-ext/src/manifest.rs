@@ -36,7 +36,7 @@ pub const MANIFEST_FILE: &str = "extension.json";
 pub struct ExtensionManifest {
     pub id: String,
     pub version: String,
-    /// WIT world compatibility, e.g. `cyrup:ext@0.8` (see [`HOST_WORLD`], which is the value a
+    /// WIT world compatibility, e.g. `cyrup:ext@0.10` (see [`HOST_WORLD`], which is the value a
     /// manifest written today should carry — this example rotted two bumps behind it once already).
     pub world: String,
     /// Source entry for a Tier-1 build; absent for a prebuilt `.wasm` package.

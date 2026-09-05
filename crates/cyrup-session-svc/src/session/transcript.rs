@@ -95,6 +95,21 @@ impl AgentSession {
             .unwrap_or_default()
     }
 
+    /// The leaf the exported document must be walked from — pi's `sm.getLeafId()`, which
+    /// `exportSessionToHtml` reads straight off the live manager (`core/export-html/index.ts:266`
+    /// @v0.84.4).
+    ///
+    /// Threaded through the shell for the same reason [`Self::export_theme`] is: the renderer stays
+    /// a pure function of `(jsonl, palette, leaf)` and never re-derives state the manager owns. It
+    /// MUST NOT be re-derived from the JSONL — `SessionManager::branch` moves the leaf without
+    /// appending and `reset_leaf` clears it, so after a `/tree` branch switch with no new message
+    /// the last line of the file belongs to the abandoned branch and `template.js` would walk the
+    /// wrong conversation.
+    pub async fn export_leaf_id(&self) -> Option<String> {
+        let guard = self.manager.lock().await;
+        guard.leaf_id().map(|id| id.as_str().to_string())
+    }
+
     /// Export the current session branch to a standalone HTML document (Pi `exportToHtml`,
     /// agent-session.ts:3022 → `exportSessionToHtml`, `core/export-html/index.ts:236-282`
     /// @v0.84.4). With `path` the document is written there; otherwise the Pi default
@@ -114,7 +129,11 @@ impl AgentSession {
             guard.export_jsonl(&mut buf)?;
             String::from_utf8_lossy(&buf).into_owned()
         };
-        let html = crate::export::session_jsonl_to_html_with_theme(&jsonl, &self.export_theme());
+        let html = crate::export::session_jsonl_to_html_with_theme(
+            &jsonl,
+            &self.export_theme(),
+            self.export_leaf_id().await.as_deref(),
+        );
         let out = match path {
             Some(p) => p.to_path_buf(),
             None => {

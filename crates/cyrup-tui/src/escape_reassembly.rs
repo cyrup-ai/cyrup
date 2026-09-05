@@ -978,15 +978,21 @@ mod tests {
         );
     }
 
-    /// `TUI-046` — `REPORT_ALTERNATE_KEYS` is now part of
-    /// [`crate::keyboard_protocol::DESIRED_FLAGS`], so a Kitty CSI-u can carry
-    /// `unicode-key-code:shifted-key:base-layout-key`. That shape is reachable input from this
-    /// commit on, and split or not it must decode the way crossterm's own
-    /// `parse_csi_u_encoded_key_code` does (`parse.rs:597-606`): with `SHIFT` held the alternate
-    /// (shifted) codepoint replaces the base keycode and `SHIFT` is cleared, so a keybinding is
-    /// matched against the character the user's layout actually produces.
+    /// `TUI-046` — the alternate-key CSI-u shape
+    /// (`unicode-key-code:shifted-key:base-layout-key`), pinned as the reason
+    /// `REPORT_ALTERNATE_KEYS` is NOT in [`crate::keyboard_protocol::DESIRED_FLAGS`].
+    ///
+    /// crossterm's `parse_csi_u_encoded_key_code` (`parse.rs:596-605`) replaces the base keycode
+    /// with the alternate (shifted) codepoint and CLEARS `SHIFT` whenever `SHIFT` is set —
+    /// reassembly does not change that, and cannot. `Char('"')` + `NONE` below is the *whole*
+    /// event: the `SHIFT` bit and the base `2` are gone, and with them any chance for
+    /// [`crate::keymap::Key::matches`] to recognise a `shift+<key>` binding. A terminal only sends
+    /// this shape when bit 4 was pushed, so with the flag withheld it is unreachable in production;
+    /// the test exists so that a future push of bit 4 is a visible decision about the two
+    /// assertions below rather than an invisible regression in every shift chord. See
+    /// `keyboard_protocol::tests::alternate_keys_would_defeat_the_shift_chord_bindings`.
     #[test]
-    fn a_split_kitty_alternate_key_sequence_resolves_the_layout_character() {
+    fn a_kitty_alternate_key_sequence_loses_the_base_code_and_the_shift_bit() {
         // German layout, Shift+2 → `"`: base codepoint 50 (`2`), shifted 34 (`"`), modifier 2.
         assert_eq!(
             run(split_at_esc("[50:34;2u")),
