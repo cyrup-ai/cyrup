@@ -66,6 +66,12 @@ pub struct Cli {
     /// Shorthand for `--mode rpc` — back-compat alias.
     #[arg(long)]
     pub rpc: bool,
+    /// Shorthand for `--mode acp` — serve the Agent Client Protocol on stdio (ACP-002).
+    ///
+    /// Follows the `--rpc` precedent exactly, including the CYRUP-DELTA above: it is not a pi flag,
+    /// and being in `KNOWN_LONG_FLAGS` means an extension can never register `--acp` for itself.
+    #[arg(long)]
+    pub acp: bool,
 
     // ---- provider / model (args.ts:87-92,130) ----
     /// Provider name (e.g. `openai`, `anthropic`); combines with `--model`.

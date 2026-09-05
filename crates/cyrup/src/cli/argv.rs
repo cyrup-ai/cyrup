@@ -109,6 +109,9 @@ const KNOWN_LONG_FLAGS: &[&str] = &[
     "--output-format",
     "--json",
     "--rpc",
+    // ACP-002 — `--acp` follows `--rpc` into the known set so it reaches clap instead of being
+    // captured as an extension flag by `partition_extension_flags`.
+    "--acp",
     "--provider",
     "--model",
     "--api-key",

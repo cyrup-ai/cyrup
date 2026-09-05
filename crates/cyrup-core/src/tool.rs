@@ -139,13 +139,44 @@ pub enum ToolRenderKind {
 #[error("{message}")]
 pub struct ToolError {
     pub message: String,
+    /// The structured `details` payload this failure carries into
+    /// [`ToolResult::details`](crate::ToolResult::details), if any.
+    ///
+    /// Pi's `createErrorToolResult` (`agent-loop.ts:700-703` @v0.83.0) hard-codes `details: {}`
+    /// for a throwing tool, because a JS `throw` carries nothing structured. `None` reproduces
+    /// that exactly and is what every constructor produces unless a tool opts in, so this is a
+    /// widening rather than a change: the empty object is still what a failure without a payload
+    /// serializes as.
+    ///
+    /// # [CYRUP-DELTA] — a failing tool may report structure, where pi can only report a string
+    ///
+    /// **What differs.** A tool that knows something machine-readable about its own failure — the
+    /// bash tool's process exit code is the case this was added for — can put it here instead of
+    /// leaving a front-end to parse it back out of the human-readable message. `details` is
+    /// documented as "not shown to the model", so nothing the model reads changes; what changes is
+    /// the `details` object on the persisted `ToolResultMessage` of a failing tool, which is `{}`
+    /// in pi and in cyrup for every tool that does not opt in.
+    ///
+    /// **What it costs.** A byte-comparison of a cyrup session file against a pi one diverges on
+    /// exactly those rows. The alternative is the front-end parsing
+    /// `Command exited with code {n}` out of the message text, which turns a human-readable
+    /// diagnostic into an API — a copy-edit of that sentence would then be a wire regression.
+    pub details: Option<serde_json::Value>,
 }
 
 impl ToolError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            details: None,
         }
+    }
+
+    /// Attach the structured payload. See [`ToolError::details`].
+    #[must_use]
+    pub fn with_details(mut self, details: serde_json::Value) -> Self {
+        self.details = Some(details);
+        self
     }
 }
 

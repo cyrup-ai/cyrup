@@ -241,11 +241,45 @@ pub enum AppMode {
     Print,
     Json,
     Rpc,
+    /// The Agent Client Protocol host (`--acp` / `--mode acp`) — a JSON-RPC agent driven by an
+    /// editor over stdio. ACP-002; see `cyrup_acp` and `crate::cli::runtime_mode::resolve_app_mode`
+    /// in the `cyrup` bin, where this variant must be the FIRST branch (an ACP agent is launched
+    /// with pipes on both ends and would otherwise resolve to `Print`).
+    Acp,
 }
 
 impl AppMode {
+    /// "This host owns a TTY and paints a terminal UI." Read by `should_take_over_stdout`,
+    /// `config.persist`'s explicit-session ladder and the `!= Interactive` guards in the `cyrup`
+    /// bin's `bootstrap.rs` / `startup_ui.rs` / `prelaunch.rs`.
+    ///
+    /// ACP-002 — **this deliberately stays `Interactive`-only** even though the ACP host CAN put a
+    /// question to a human. Flipping it for [`AppMode::Acp`] would take every one of those four
+    /// sites down the TTY branch: the stdout takeover would be skipped (letting a stray library
+    /// write corrupt the JSON-RPC frame stream), and the startup-UI / session-picker guards would
+    /// try to paint a selector into a pipe. The prompting half is [`AppMode::can_prompt`].
     pub fn is_interactive(self) -> bool {
         matches!(self, AppMode::Interactive)
+    }
+
+    /// "There is a human this host can put a question to, and a channel to reach them on."
+    ///
+    /// ACP-002 — the split half of [`AppMode::is_interactive`], and the ONLY consumer is
+    /// [`decide_trust`]'s step 5. An ACP client renders `session/request_permission` and
+    /// `elicitation/create`, so an untrusted project reaching an ACP host is a question, not a
+    /// silent refusal — which is exactly what pi's own `hasUI` gate means (project-trust.ts:86-88)
+    /// and what `is_interactive` used to stand in for while `Interactive` was the only such host.
+    ///
+    /// # CYRUP-DELTA
+    ///
+    /// pi-acp has no counterpart: its adapter spawns `pi --mode rpc`, so the child is a
+    /// non-interactive host and every untrusted project silently resolves `Untrusted`. cyrup's ACP
+    /// host is in-process and can ask, so it does. **The cost**: an ACP client that never answers
+    /// the trust prompt leaves `decide_trust` at [`TrustOutcome::NeedsPrompt`], and the front end
+    /// (not this function) owns the timeout that turns that back into `Untrusted` — a host that
+    /// forgets to supply `prompt_choice` hangs its own `session/new` instead of refusing it.
+    pub fn can_prompt(self) -> bool {
+        matches!(self, AppMode::Interactive | AppMode::Acp)
     }
 }
 
@@ -304,8 +338,11 @@ pub fn decide_trust(input: TrustInputs) -> TrustOutcome {
         DefaultProjectTrust::Never => return TrustOutcome::Untrusted,
         DefaultProjectTrust::Ask => {}
     }
-    // 5. ask: only interactive mode may prompt; everything else is untrusted (R-07-009).
-    if input.mode.is_interactive() {
+    // 5. ask: only a host that can reach a human may prompt; everything else is untrusted
+    // (R-07-009). ACP-002 — the predicate is `can_prompt`, not `is_interactive`: `AppMode::Acp`
+    // has a client that renders permission dialogs, and this is the ONE site that distinction is
+    // for. Every other reader of `is_interactive` means "TUI host" and must stay unchanged.
+    if input.mode.can_prompt() {
         match input.prompt_choice {
             Some(true) => TrustOutcome::Trusted,
             Some(false) => TrustOutcome::Untrusted,
@@ -630,6 +667,67 @@ mod tests {
             }),
             TrustOutcome::Trusted
         );
+    }
+
+    /// ACP-002 — the split concept. `can_prompt` admits the ACP host; `is_interactive` must NOT,
+    /// because it also drives `should_take_over_stdout`, `config.persist` and the three
+    /// `!= Interactive` guards in the `cyrup` bin. Both directions are asserted so a later
+    /// "simplification" that collapses the two predicates fails here.
+    #[test]
+    fn acp_can_prompt_but_is_not_a_tui_host() {
+        assert!(AppMode::Acp.can_prompt(), "an ACP client renders dialogs");
+        assert!(
+            !AppMode::Acp.is_interactive(),
+            "`is_interactive` means TUI host; flipping it changes four unrelated sites"
+        );
+        assert!(AppMode::Interactive.can_prompt());
+        assert!(AppMode::Interactive.is_interactive());
+        for mode in [AppMode::Print, AppMode::Json, AppMode::Rpc] {
+            assert!(!mode.can_prompt(), "{mode:?} has no channel to a human");
+            assert!(!mode.is_interactive(), "{mode:?} paints no TUI");
+        }
+    }
+
+    /// ACP-002 — `decide_trust`'s step 5 is the one consumer of [`AppMode::can_prompt`], and the
+    /// other four modes must be byte-identical to what they were before the variant existed.
+    #[test]
+    fn acp_reaches_the_trust_prompt_and_the_other_modes_do_not() {
+        let base = TrustInputs {
+            has_resources: true,
+            trust_override: None,
+            saved: None,
+            default_trust: DefaultProjectTrust::Ask,
+            mode: AppMode::Acp,
+            prompt_choice: None,
+        };
+        assert_eq!(decide_trust(base), TrustOutcome::NeedsPrompt);
+        assert_eq!(
+            decide_trust(TrustInputs {
+                prompt_choice: Some(true),
+                ..base
+            }),
+            TrustOutcome::Trusted
+        );
+        assert_eq!(
+            decide_trust(TrustInputs {
+                prompt_choice: Some(false),
+                ..base
+            }),
+            TrustOutcome::Untrusted
+        );
+        for mode in [
+            AppMode::Print,
+            AppMode::Json,
+            AppMode::Rpc,
+            AppMode::Interactive,
+        ] {
+            let expected = if mode.is_interactive() {
+                TrustOutcome::NeedsPrompt
+            } else {
+                TrustOutcome::Untrusted
+            };
+            assert_eq!(decide_trust(TrustInputs { mode, ..base }), expected, "{mode:?}");
+        }
     }
 
     #[test]

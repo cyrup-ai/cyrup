@@ -1124,9 +1124,15 @@ mod tests {
                 .unwrap_err()
                 .to_string()
         };
+        // ACP-Q1 — the echoed payload keeps the response's own key order (`serde_json/preserve_order`,
+        // turned on graph-wide by `agent-client-protocol`, `cyrup-acp`'s wire dependency), so this
+        // user-visible string is now byte-identical to upstream's `JSON.stringify`. It used to be
+        // alphabetised by `BTreeMap`; see `openai_codex`'s
+        // `the_echoed_payload_matches_json_stringify_insertion_order` for the same change stated in
+        // full.
         assert_eq!(
             err(json!({"refresh_token": "r", "expires_in": 1}), "refresh"),
-            r#"Kimi Code token refresh response missing fields: {"expires_in":1,"refresh_token":"r"}"#
+            r#"Kimi Code token refresh response missing fields: {"refresh_token":"r","expires_in":1}"#
         );
         assert!(
             err(

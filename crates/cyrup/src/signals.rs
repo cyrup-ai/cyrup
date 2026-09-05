@@ -267,7 +267,11 @@ mod tests {
     /// SIGINT keeps cyrup's graceful abort (pi registers no SIGINT handler).
     #[test]
     fn first_sigterm_and_sighup_exit_non_interactive_hosts() {
-        for host in [AppMode::Rpc, AppMode::Print, AppMode::Json] {
+        // `ACP-006` — `AppMode::Acp` is a non-interactive host and takes the same three rows.
+        // `first_delivery_exit_code` needed no change to answer correctly for it (it is `!=
+        // Interactive`), so this line is coverage: it is what fails if `Acp` is ever folded into
+        // the interactive arm, where a SIGTERM would leave the editor's agent process alive.
+        for host in [AppMode::Rpc, AppMode::Print, AppMode::Json, AppMode::Acp] {
             assert_eq!(
                 first_delivery_exit_code(host, ShutdownSignal::Terminate),
                 Some(143),

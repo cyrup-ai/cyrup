@@ -6,6 +6,7 @@
 //! (R-11-009).
 
 use std::io::Write;
+use std::sync::Arc;
 
 use cyrup_modes::{PrintOptions, run_json, run_print, run_rpc};
 use cyrup_session_svc::{AgentSession, AgentSessionRuntime, InputSource, UserInput};
@@ -123,6 +124,69 @@ where
     runtime.dispose().await;
     ran?;
     Ok(())
+}
+
+/// ACP dispatch: serve the Agent Client Protocol on stdio until the client closes the connection
+/// (`ACP-003`, `ACP-004`, `ACP-005`). Modelled on [`run_rpc_dispatch`], with **three** structural
+/// divergences from its sibling, each of which is a unit.
+///
+/// 1. **It takes no [`AgentSessionRuntime`].** `run_rpc` opens with
+///    `runtime.session().await.bind_extensions().await` (SEAM-033 — the host announces after
+///    `--name`/`--models`), but ACP must announce after `initialize` settles, because `has_ui` and
+///    the client's advertised capabilities are what a `session_start` handler should see. So the
+///    runtime is built **lazily on `session/new`**, through `host`, and the teardown that
+///    `run_rpc_dispatch` performs unconditionally is performed by
+///    `cyrup_acp::SessionManager`'s own slot instead (`ACP-003`, `ACP-023`).
+/// 2. **A broken pipe is a clean exit, not an error** (`ACP-004`). `Stdio::connect_to` is
+///    `blocking::Unblock` over `std::io::stdout()` feeding a sink around `write_line`,
+///    `transport_outgoing_lines_actor` surfaces the `io::Error` verbatim, and the ACP crate handles
+///    no `BrokenPipe` itself — so a broken pipe propagates out of `connect_to`.
+///
+///    **`CYRUP-DELTA`:** cyrup's RPC sibling does the **opposite on purpose** — `write_pump`
+///    propagates any write error to a non-zero exit, which is right for RPC (a severed protocol
+///    stream is a real failure) and wrong for ACP, where the client closing the pipe **is** the
+///    normal termination. pi-acp holds the same rule with three guards of its own: an
+///    already-destroyed stdout resolves immediately, the write callback's `err` is explicitly
+///    discarded, a synchronous `ERR_STREAM_DESTROYED` throw is caught, and any `error` event on
+///    stdout exits **0**. The cost is that a genuine `EIO` on the output fd is now indistinguishable
+///    from a client hanging up; that is the trade, and it is exit-code fidelity against a
+///    supervising editor rather than anything lost or corrupted.
+/// 3. **`ACP-024` — the stdin split, pinned.** A clean EOF is exit 0; so is a read error, because
+///    `Stdio`'s reader is a `blocking::Unblock` thread whose `read(2)` failure reaches this function
+///    as the same connection-closed condition and cannot be distinguished from EOF without
+///    reimplementing the transport. Upstream registers `stdin.on('error')` separately and also exits
+///    0 from it, so all three paths agreeing on 0 matches pi-acp; it is pinned here so a porter
+///    cannot flatten or split it by accident.
+///
+/// # Errors
+///
+/// Only a transport fault that is not a hang-up.
+pub async fn run_acp_dispatch(host: Arc<dyn cyrup_acp::AcpHost>) -> anyhow::Result<()> {
+    match cyrup_acp::serve_stdio(host).await {
+        Ok(()) => Ok(()),
+        // `ACP-004` — the client closed the pipe. Not a failure; the normal termination.
+        Err(cyrup_acp::AcpError::Transport(err)) if is_client_hangup(&err) => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Is this transport error the client having gone away? (`ACP-004`.)
+///
+/// The ACP crate surfaces the `io::Error` inside its own `Error`'s message rather than as a typed
+/// kind (`rg 'BrokenPipe'` over the crate returns nothing), so this matches on the two kinds'
+/// `Display` text. That is a string test in a port whose whole point is to stop classifying by
+/// string, so it is confined to exactly one predicate with one test and it is checked against
+/// `io::ErrorKind`'s own `Display`, never against a hand-typed literal — which is what keeps it
+/// honest if the standard library ever rewords them.
+fn is_client_hangup(err: &cyrup_acp::WireError) -> bool {
+    let message = err.message.as_str();
+    [
+        std::io::ErrorKind::BrokenPipe,
+        std::io::ErrorKind::NotConnected,
+        std::io::ErrorKind::UnexpectedEof,
+    ]
+    .into_iter()
+    .any(|kind| message.contains(&std::io::Error::from(kind).to_string()))
 }
 
 /// The process exit code for a settled one-shot run — pi's `print-mode.ts:139-148`, reproduced

@@ -23,6 +23,17 @@ Before this batch, `docs/adr/` did not exist while ~2 195 in-source citations po
 | [ADR-0010](ADR-0010-oauth-acquisition.md) — `CFG-005` credential acquisition | **OQ-8**, the `CFG-005` half only | withdraw the deprioritisation and schedule **four** (not two) api-key login bodies into batch 11 beside `PROV-003`; the providers are not un-loginnable, they **lie** | batch 11; batch 12's `PROV-030` precondition | accepted |
 | [ADR-0011](ADR-0011-first-run-wizard.md) — first-run wizard | **OQ-9** / `PARITY-GAPS` §6 q6 (`UW-2`) | **wire it** — pi ships and invokes the wizard, cyrup has a complete unit-tested port and no caller; the "deliberately unreachable" trap is inverted | batch 14; batch 2; move 1's repro row; the known-traps list | accepted |
 
+## Decisions added since
+
+| ADR | decides | the decision, in one line | unblocks | status |
+|---|---|---|---|---|
+| [ADR-0028](ADR-0028-cyrup-acp-type-design.md) — `cyrup-acp` type design | the Rust type-design question for the unwritten `crates/cyrup-acp`, raised by area 15 | **explicit domain enums and a functional core / imperative shell split first, boundary newtypes second, and typestate essentially not at all** — an ACP agent is driven by an editor sending JSON-RPC in whatever order it likes, so every candidate lifecycle is inspected dynamically, which is the decision rule's own signal for an enum | every area-15 unit whose Rust mechanism names one of its types; `docs/gap-analysis/15-cyrup-acp.md` links to it per-unit rather than repeating the argument | accepted |
+
+It is an **opportunity review written before its subject exists**, which no earlier ADR is. Its §5,
+*Deliberately rejected opportunities*, is load-bearing rather than decorative: it is where the file
+argues against applying typestate in the four places it looks attractive.
+
+
 **Not a decision:** [`LEADS-SETTLED.md`](LEADS-SETTLED.md) is an **evidence record** — the two-sided
 reads that closed `DRIFT-023` (superseded by `CFG-020`; kind corrected to `not-ported`) and
 `DRIFT-040` (out of scope, corroborating ADR-0004 from upstream's own non-goal statement). It carries
@@ -35,7 +46,10 @@ non-user-observable lows ordinary work items or a mechanically-executed conforma
 ## The convention going forward
 
 **Numbering.** ADRs are `docs/adr/ADR-NNNN-<slug>.md`, numbered sequentially from the highest
-existing number — the next is **ADR-0012**. Numbers are never reused and never renumbered, including
+existing number — but **0012 through 0027 are claimed and are not free**. `docs/gap-analysis/MCP-PORT-METHODOLOGY.md`
+reserves that whole block for the MCP port and cites `ADR-0012` by name in four places, so the block
+is spent whether or not the files exist yet. `ADR-0028` is written (below); **the next free number is
+ADR-0029.** Numbers are never reused and never renumbered, including
 `ADR-0001` and `ADR-0002`, which this batch deliberately re-used because 26 in-source tokens already
 spend them on the same two subjects (ADR-0008 §A.5 records that as a live ambiguity closed per-site
 by reading). `LEADS-SETTLED.md` holds no number. A slug that turns out to be wrong stays put —

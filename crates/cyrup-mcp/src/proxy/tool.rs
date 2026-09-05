@@ -580,24 +580,30 @@ mod tests {
         assert_eq!(action, "Action: 'auth-start' or 'auth-complete'");
         assert!(!action.contains("ui-messages"));
 
-        // MCP-194: the decision is visible in the test. `serde_json::Map` is a `BTreeMap` under this
-        // workspace's features, so the properties serialise alphabetically.
+        // MCP-194: the decision is visible in the test. **ACP-Q1 changed which decision it is.**
+        // `serde_json::Map` was a `BTreeMap` under this workspace's features and the properties
+        // serialised alphabetically; `cyrup-acp`'s `agent-client-protocol` edge declares
+        // `serde_json/preserve_order` non-optionally, and cargo feature unification is graph-wide,
+        // so it is now an `IndexMap` and the order is the `json!` literal's own — which is
+        // upstream's declaration order and the order the model sees the schema in. That is the
+        // better of the two for a tool schema (a reader of the JSON meets `tool` and `args` first,
+        // as the upstream file writes them), so the flip is accepted rather than worked around.
         let order: Vec<&str> = properties.keys().map(String::as_str).collect();
         assert_eq!(
             order,
             vec![
-                "action",
+                "tool",
                 "args",
                 "connect",
                 "describe",
-                "includeSchemas",
                 "instructions",
+                "search",
+                "regex",
+                "includeSchemas",
                 "limit",
                 "offset",
-                "regex",
-                "search",
                 "server",
-                "tool"
+                "action"
             ]
         );
     }

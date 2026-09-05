@@ -62,6 +62,7 @@ Options:
   --mode <mode>                  Output mode: text (default), json, or rpc
   --json                         cyrup alias for --mode json (not a pi flag)
   --rpc                          cyrup alias for --mode rpc (not a pi flag)
+  --acp                          cyrup alias for --mode acp: serve the Agent Client Protocol on stdio
   --output-format <fmt>          cyrup alias: text = --print, json = --mode json (not a pi flag)
   --print, -p                    Non-interactive mode: process prompt and exit
   --continue, -c                 Continue previous session

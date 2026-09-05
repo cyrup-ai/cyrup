@@ -204,7 +204,16 @@ fn header_candidate(line: &str) -> Option<Option<SessionHeader>> {
 /// (`session-manager.ts:571-613`): a BOUNDED, chunked scan that stops at the first parsed entry and
 /// gives up after [`MAX_SESSION_HEADER_SCAN_BYTES`], rather than reading the whole file into memory.
 /// Listing N sessions previously read N whole files.
-fn read_header(path: &Path) -> Option<SessionHeader> {
+///
+/// `pub` because resolving a client-supplied session id to a file has to CONFIRM the id against the
+/// header rather than trust the filename — [`uuid_of`] splits on the *last* underscore, so
+/// `--session-id my_session` derives `"session"` and a bare `s.jsonl` derives `"s"`
+/// (gap-analysis 15 `ACP-222`). `cyrup_acp::sessions::find_stored` scans candidates with this, and
+/// exporting it is what keeps the first-entry rule this shares with [`scan_file`] and
+/// `manager::load` in ONE place: a second copy is how a file with a leading blank line comes to be
+/// a session to one reader and not to another, which is the disagreement
+/// [`header_candidate`] was extracted to end.
+pub fn read_header(path: &Path) -> Option<SessionHeader> {
     use std::io::Read as _;
 
     let file = std::fs::File::open(path).ok()?;

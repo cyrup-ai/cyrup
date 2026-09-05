@@ -2896,6 +2896,14 @@ mod tests {
             .expect("read row");
         // pi's `ToolInfo` is EXACTLY these five keys (`extensions/types.ts:1552-1554` @v0.83.0) —
         // no `source` discriminator (EXT-060).
+        //
+        // ACP-Q1 — the ORDER here is now the object's insertion order, not `BTreeMap`'s
+        // lexicographic one: `agent-client-protocol` (`cyrup-acp`'s wire dependency) declares
+        // `serde_json` with a non-optional `preserve_order` and cargo unifies features graph-wide.
+        // `name` before `description` is upstream's own field order at `types.ts:1552-1554`, so the
+        // flip moved this TOWARD pi. The assertion stays on the ordered vector rather than being
+        // relaxed to a set, because the claim it makes — "these keys and no others" — is what
+        // EXT-060 is about, and a set assertion would let a re-ordering pass unremarked.
         let keys: Vec<&str> = read
             .as_object()
             .expect("object")
@@ -2905,8 +2913,8 @@ mod tests {
         assert_eq!(
             keys,
             [
-                "description",
                 "name",
+                "description",
                 "parameters",
                 "promptGuidelines",
                 "sourceInfo"

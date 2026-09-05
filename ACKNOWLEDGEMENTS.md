@@ -1,6 +1,6 @@
 # Acknowledgements
 
-cyrup exists because five TypeScript projects did the hard part first. Every architectural decision
+cyrup exists because six TypeScript projects did the hard part first. Every architectural decision
 worth defending in this codebase was made by someone else, in another language, and proved out in
 use before a line of Rust was written.
 
@@ -118,6 +118,49 @@ path through `serde_json::Value` sorts those keys and silently destroys it. That
 subtlety so much as an upstream *affordance*, but it is only visible if you read the original
 closely enough to notice what it never had to state.
 
+## pi-acp — the editor seam
+
+**[svkozak/pi-acp](https://github.com/svkozak/pi-acp)** · MIT © 2026 Sergii Kozak
+
+*ACP ([Agent Client Protocol](https://agentclientprotocol.com)) adapter for the pi coding agent.*
+
+The odd one out, and the reason it is worth reading closely. Every other project here is a pi
+extension — it loads into pi and is handed typed objects. pi-acp is the inverse: it sits entirely
+outside, spawns `pi --mode rpc`, and reconstructs the agent's state from untyped NDJSON on the
+child's stdout while speaking JSON-RPC to an editor on its own. It knows nothing that did not
+survive a serialize/parse round trip, and roughly 40% of its code exists to cope with that —
+`translate/bash.ts` probes twelve key paths to find one command string.
+
+Which is exactly what makes it a good specification. An adapter that can only observe has to state
+what it observes, and three of its rules are the kind that are invisible until you get them wrong:
+
+- **A turn ends on `agent_settled`, and on nothing else.** pi emits several `turn_end` and
+  `agent_end` events for a single user prompt whenever retry, compaction, or a queued continuation
+  runs. Resolving the ACP `session/prompt` on either of them closes the editor's turn while the
+  agent is still working — the user sees a finished response and then more text arriving into a
+  session the client believes is idle. `session.ts` names this in a comment and structures the whole
+  turn state machine around it. It is the correctness core of the adapter and it is one boolean
+  (`inAgentLoop`) away from being wrong.
+- **Tool-call status is monotonic.** Late `toolcall_*` deltas can arrive after execution has already
+  started, and a client that sees `in_progress` fall back to `pending` hides its progress UI. So
+  `currentToolCalls` exists solely to refuse the downgrade. That is a rendering invariant of real
+  clients, discovered by using them, and it is not written down in the protocol.
+- **A structured diff has to be manufactured.** pi's tool events do not carry the old and new text
+  of an edit, so `tool_execution_start` snapshots the file, `tool_execution_end` re-reads it, and the
+  ACP `diff` content block is synthesised from the pair — with a 1-based line number inferred from a
+  *unique* `oldText` match, and no location emitted at all when the match is ambiguous. The
+  restraint in that last clause is the part worth copying.
+
+The port is planned rather than done (`docs/gap-analysis/15-cyrup-acp.md`), and planning it was
+already useful, because most of pi-acp turns out to be scaffolding against a limitation cyrup does
+not have. `cyrup-acp` is a workspace crate: it binds to `AgentSession` directly, so the subprocess,
+its ENOENT diagnostics, its ANSI prelude scraping and its twelve-key probes have no counterpart at
+all, and `AgentSessionEvent` supplies typed variants — `QueueUpdate`, `BashExecutionUpdate`,
+`SessionInfoChanged` — that pi-acp had to infer or fake. What survives the deletion is the part
+that was never about the transport: the three rules above, the exact user-visible strings, and the
+ordering constraint that `available_commands_update` must follow the `session/new` response because
+clients drop notifications for a session id they have not yet seen.
+
 ---
 
 ## On the relationship
@@ -137,7 +180,7 @@ what makes the citations above auditable rather than decorative — a divergence
 preferred, it has to be recorded as a `CYRUP-DELTA` naming the upstream symbol and the reason it was
 forced.
 
-Thank you to Mario Zechner, Nico Bailon and MasuRii.
+Thank you to Mario Zechner, Nico Bailon, MasuRii and Sergii Kozak.
 
 ---
 

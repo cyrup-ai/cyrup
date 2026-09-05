@@ -281,10 +281,10 @@ that does not exist yet rather than measuring drift in code that does.
 
 ## Upstreams
 
-cyrup tracks six upstream projects, five TypeScript and one Python. The core is
-[`earendil-works/pi`](https://github.com/earendil-works/pi). Four optional subsystems follow
-standalone Pi extensions, since Pi core ships no permission system and no MCP client of its own.
-Flux follows `code_puppy_core_plugins`, which is Python.
+cyrup tracks seven upstream projects, six TypeScript and one Python. The core is
+[`earendil-works/pi`](https://github.com/earendil-works/pi). Five optional subsystems follow
+standalone Pi extensions, since Pi core ships no permission system, no MCP client and no editor
+protocol of its own. Flux follows `code_puppy_core_plugins`, which is Python.
 
 | upstream | followed by | ported baseline | latest tag |
 |---|---|---|---|
@@ -294,11 +294,21 @@ Flux follows `code_puppy_core_plugins`, which is Python.
 | `nicobailon/pi-intercom` | `cyrup-intercom` | v0.9.2 | v0.13.0 |
 | `nicobailon/pi-mcp-adapter` | `cyrup-mcp` | v2.26.1 | v2.32.1 |
 | `code_puppy_core_plugins` (Python) | `cyrup-flux` | v0.0.6 | v0.0.40 |
+| `svkozak/pi-acp` | `cyrup-acp` | not started — port planned | v0.0.33 |
 
 The Flux row's version gap is not a behaviour gap: the ported surface (`flux_bootstrap/`) is
 byte-identical across all 34 intervening tags.
 
-Clone all six under `./tmp/` (gitignored) before working a ledger row. The area files cite them as
+The pi-acp row is the newest and the only one with no code behind it yet. `cyrup-acp` will speak the
+[Agent Client Protocol](https://agentclientprotocol.com) over stdio so an editor — Zed is the
+reference client — can drive cyrup the way it drives any other ACP agent. The port is planned in
+[`docs/gap-analysis/15-cyrup-acp.md`](docs/gap-analysis/15-cyrup-acp.md), whose first section is the
+decision that shapes everything else: pi-acp *must* spawn `pi --mode rpc` as a child and scrape
+untyped NDJSON off its stdout, because it is a separate npm package; `cyrup-acp` is a workspace
+crate and binds to `AgentSession` in-process instead, which deletes the whole subprocess surface and
+replaces `Record<string, unknown>` event probing with the typed `AgentSessionEvent`.
+
+Clone all seven under `./tmp/` (gitignored) before working a ledger row. The area files cite them as
 `git -C tmp/<repo> show <tag>:<path>`, and a working tree's line numbers will mislead you.
 [`docs/gap-analysis/README.md`](docs/gap-analysis/README.md) records the exact commits each pass
 measured against. Re-measure the latest-tag column with `git ls-remote --tags` rather than trusting

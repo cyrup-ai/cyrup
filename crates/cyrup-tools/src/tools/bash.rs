@@ -565,8 +565,11 @@ impl Tool for ShellTool {
         let full_output_path = full_path.as_ref().map(|p| p.to_string_lossy().into_owned());
         let details = if truncated {
             serde_json::to_value(BashDetails {
-                truncation: Some(info),
+                truncation: Some(info.clone()),
                 full_output_path: full_output_path.clone(),
+                // `ACP-141` — the SUCCESS path. A clean exit is already unambiguous to every
+                // consumer, and adding a `0` here would change `details` on rows pi leaves alone.
+                exit_code: None,
             })
             .ok()
         } else {
@@ -605,10 +608,23 @@ impl Tool for ShellTool {
                 } else {
                     text
                 };
-                Err(error::invalid(append_status(
+                // `ACP-141` — the exit code, structured, alongside the sentence rather than only
+                // inside it. `ToolError::with_details` overrides `createErrorToolResult`'s `{}`
+                // for this one tool; see that method and `BashDetails::exit_code`. `truncation`
+                // and `fullOutputPath` ride along when they were computed, so the failing row
+                // carries the same side-channel the succeeding one does.
+                let mut failure = error::invalid(append_status(
                     &body,
                     &format!("Command exited with code {code}"),
-                )))
+                ));
+                if let Ok(payload) = serde_json::to_value(BashDetails {
+                    truncation: if truncated { Some(info) } else { None },
+                    full_output_path,
+                    exit_code: Some(code),
+                }) {
+                    failure = failure.with_details(payload);
+                }
+                Err(failure)
             }
             // Catch path (abort/timeout): `formatOutput(snapshot, "")` — `emptyText` is `""`, so an
             // empty output yields just the status with NO leading `\n\n` (bash.ts:375,388-396).
@@ -668,6 +684,8 @@ fn stream_details(
     serde_json::to_value(BashDetails {
         truncation,
         full_output_path,
+        // Mid-stream: the process has not exited yet.
+        exit_code: None,
     })
     .ok()
 }

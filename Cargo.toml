@@ -23,6 +23,7 @@ members = [
     "crates/cyrup-intercom",
     "crates/cyrup-flux",
     "crates/cyrup-mcp",
+    "crates/cyrup-acp",
     "crates/cyrup-it",
     "xtask",
 ]
@@ -81,6 +82,7 @@ default-members = [
     "crates/cyrup-intercom",
     "crates/cyrup-flux",
     "crates/cyrup-mcp",
+    "crates/cyrup-acp",
 ]
 
 [workspace.package]
@@ -132,6 +134,7 @@ cyrup-permission-system = { path = "crates/cyrup-permission-system", version = "
 cyrup-intercom     = { path = "crates/cyrup-intercom",     version = "0.0.0" }
 cyrup-flux         = { path = "crates/cyrup-flux",         version = "0.0.0" }
 cyrup-mcp          = { path = "crates/cyrup-mcp",          version = "0.0.0" }
+cyrup-acp          = { path = "crates/cyrup-acp",          version = "0.0.0" }
 
 # --- standardized external deps (arch-00 §7). Versions are inert until a crate
 #     references them via `dep.workspace = true`; verify/bump on first use. ---
@@ -143,7 +146,34 @@ futures-core = { version = "0.3" }
 async-trait  = { version = "0.1" }
 thiserror    = { version = "2" }
 serde        = { version = "1",   features = ["derive", "rc"] }
-serde_json   = { version = "1" }
+# `preserve_order` is declared HERE, deliberately, and not inherited from an edge.
+#
+# `agent-client-protocol` (below) declares it non-optionally, so adding `crates/cyrup-acp` turns it
+# on for the whole graph whether or not this line says so. Leaving it implicit would make
+# `serde_json::Map`'s ordering depend on the SHAPE OF THE BUILD: `cargo build -p cyrup-mcp` alone
+# would get a `BTreeMap` and `cargo build --workspace` an `IndexMap`, which is the same
+# passes-alone/fails-under-`--workspace` hazard the `mermansi` block below rejected a crate for.
+# Declaring it makes every invocation agree.
+#
+# It is also REQUIRED independently of ACP. `docs/gap-analysis/13h-mcp-tui.md` prescribes it twice
+# as the cyrup mechanism, both times for a byte count that must match `JSON.stringify`'s: "the
+# `stringify` must reproduce V8's key order, which for a schema deserialized from JSON is insertion
+# order; a `BTreeMap`-backed value sorts keys and changes the byte count, hence every estimate."
+# Those units cannot be correct without this line. (`13i-mcp-protocol-and-verification.md` retracts
+# a THIRD, different prerequisite — `ElicitationSchema` property order, which `rmcp` carries itself.
+# That retraction is not about these two.)
+#
+# What it changes: `IndexMap` preserves insertion order where `BTreeMap` sorted keys. No production
+# site depended on the sort — every place that needs sorted output gets it from an explicit
+# `BTreeMap` (`cyrup_config::trust`, `cyrup_flux::install::save_manifest`) or an explicit key sort
+# (`cyrup_mcp::dirs::stable_stringify`). Two tests asserted the incidental ordering and were
+# corrected to assert what they said they asserted; `crates/cyrup-test-support/fixtures/pi/*.jsonl`
+# were regenerated, values identical and key order only — and the new order is the one pi actually
+# emits, where the old alphabetical order was not.
+#
+# `preserve_order_is_declared_workspace_wide` in `crates/cyrup-core/src/tests/` pins this so a
+# future dependency change cannot revert it silently. This is `ACP-Q1`, decided: accept, and own it.
+serde_json   = { version = "1", features = ["preserve_order"] }
 
 # arch-00 §7.1 ratified — first used by cyrup-tools (arch-03).
 ignore               = { version = "0.4.26" }
@@ -258,6 +288,12 @@ syntect              = { version = "5.3.0", default-features = false, features =
 # survey. MIT, and only three direct deps (`ascii-dag`, `chrono`, `unicode-width` — the last two
 # were already in this tree), so `#![forbid(unsafe_code)]` in cyrup-tui is unaffected.
 #
+# NOTE (2026-09-05): the `preserve_order` half of this rejection is now MOOT — the workspace
+# declares `serde_json/preserve_order` deliberately (see the comment on `serde_json` above), because
+# two `cyrup-mcp` units require it. `mermansi` stays rejected on its OTHER grounds: 151 transitive
+# crates including a CSS engine, and an alpha (`merman-core` 0.8.0-alpha.3) on the path. The
+# paragraph below is kept verbatim as the record of what was known at the time.
+#
 # `mermansi` was tried FIRST and REJECTED — record the reason so nobody re-picks it. It is a fine
 # renderer, but it pulls 151 transitive crates including a CSS engine, and one of them,
 # `merman-core` 0.8.0-alpha.3 (an alpha), declares `serde_json` with a NON-OPTIONAL
@@ -270,6 +306,28 @@ syntect              = { version = "5.3.0", default-features = false, features =
 #
 # Not `default-features = false`: its `default` is already empty.
 mermaid-text         = { version = "0.57.0" }
+# The Agent Client Protocol SDK — the wire `crates/cyrup-acp` speaks (gap-analysis 15, ADR-0028).
+# Apache-2.0, the first Apache-2.0 edge in an MIT workspace.
+#
+# **DEFAULT FEATURES, and no `unstable_*` feature — this is a decision, not an omission.** The
+# default surface IS protocol v1, which is what pi-acp v0.0.33 speaks. `unstable_protocol_v2` arms
+# `ProtocolCompat::incoming_initialize_request`'s version guard, which HARD-ERRORS an unknown
+# `protocolVersion` where pi-acp (and ACP-050) downgrade gracefully — the opposite of the behaviour
+# this port needs. `unstable_end_turn_token_usage` would add a `usage` key to `PromptResponse` that
+# ACP-065's golden does not expect.
+#
+# **`serde_json/preserve_order`, stated plainly because the `mermansi` block above rejected a crate
+# for exactly this.** `agent-client-protocol` 2.1.0 and `agent-client-protocol-schema` 1.7.0 both
+# declare `serde_json = { features = ["preserve_order", "raw_value"] }` NON-OPTIONALLY, with no
+# cargo feature to turn it off, so this edge flips `serde_json::Map` from `BTreeMap` to `IndexMap`
+# for the whole shipped binary. Unlike `mermansi` — a rendering nicety with three alternatives —
+# there is no alternative here: the ACP wire types are the protocol, and forking them or
+# `[patch.crates-io]`-ing the feature out would fork the schema this port is written against.
+# `IndexMap` preserves *insertion* order where `BTreeMap` sorted keys; that is a defensible and
+# usually better behaviour (config files and MCP payloads keep the order they were written in), and
+# any site that depended on the sort is a site that was relying on an unstated invariant. This is
+# `ACP-Q1`, decided: accept the flip.
+agent-client-protocol = { version = "2.1" }
 # `default-features = false` drops the `chafa-dyn` feature (a C `libchafa` pkg-config dep used only
 # for higher-quality sixel encoding); sixel still works via the pure-Rust `icy_sixel`, so the
 # workspace stays all-Rust with no system library. `crossterm` matches ratatui's backend.

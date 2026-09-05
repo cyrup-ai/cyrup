@@ -20,7 +20,8 @@ use anyhow::Context;
 use cyrup_config::{CliConfigOverrides, ConfigDirs, EnvVars};
 
 use crate::{
-    credential_print, intercom_broker_cmd, mcp_keyring_helper_cmd, subagent_runner_cmd, subcommands,
+    acp_terminal_login_cmd, credential_print, intercom_broker_cmd, mcp_keyring_helper_cmd,
+    subagent_runner_cmd, subcommands,
 };
 
 /// Which internal, never-advertised subcommand this argv selects, if any.
@@ -46,6 +47,19 @@ pub enum Internal {
     /// stdin and one on stdout, so it must reach [`crate::mcp_keyring_helper_cmd::dispatch`] before
     /// anything can log, print, or otherwise put a byte on stdout.
     McpKeyringHelper,
+    /// `--terminal-login` — the ACP client's Authenticate button (ACP-001). Port of pi-acp v0.0.33
+    /// `index.ts`'s top-level `process.argv.includes("--terminal-login")` block.
+    ///
+    /// **The odd one out in three ways, and each is load-bearing.** (1) Its predicate is membership
+    /// ANYWHERE after the program name, not `argv[1]`, because an ACP client appends
+    /// `AuthMethod.args` to a command it already holds — see
+    /// [`crate::acp_terminal_login_cmd::is_selected`]. (2) It is not `__`-prefixed and is not
+    /// internal: it is a token cyrup publishes to clients in `AuthMethod::Terminal.args`
+    /// (`ACP-011`). (3) It does **not** end the process — `main` strips its tokens and falls
+    /// through into the ordinary interactive launch, which is why it is classified LAST of the four
+    /// (a `__subagent-runner` whose own argv happens to contain the token must still be a subagent
+    /// runner).
+    AcpTerminalLogin,
 }
 
 /// Classify the internal pre-dispatch. `raw` (not the program-stripped `argv`) is passed because
@@ -60,6 +74,12 @@ pub fn classify_internal(raw: &[String]) -> Option<Internal> {
     }
     if mcp_keyring_helper_cmd::is_selected(raw) {
         return Some(Internal::McpKeyringHelper);
+    }
+    // ACP-001 — LAST of the four, because its predicate is membership anywhere in argv rather than a
+    // fixed position: checking it first would let a `--terminal-login` appearing in one of the three
+    // internal subcommands' own argv hijack that hop.
+    if acp_terminal_login_cmd::is_selected(raw) {
+        return Some(Internal::AcpTerminalLogin);
     }
     None
 }

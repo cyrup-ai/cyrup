@@ -11,6 +11,10 @@ pub enum Mode {
     Json,
     /// The persistent stdin/stdout RPC line protocol.
     Rpc,
+    /// The Agent Client Protocol host — ACP JSON-RPC 2.0 on stdio, driven by an editor
+    /// (ACP-002). A cyrup-invented value: pi has no ACP role at all, and pi-acp encodes it in the
+    /// identity of a separate binary rather than in a flag.
+    Acp,
 }
 
 /// Output format for the non-interactive one-shot path (`--output-format`; a cyrup back-compat
