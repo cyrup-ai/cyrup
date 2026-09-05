@@ -464,7 +464,7 @@ fn shortcut_conflict_warnings_join_the_extension_issues_block() {
 // the identical `{force: false, showDiagnosticsWhenQuiet: true}` options object:
 //
 // ```ts
-// // pi v0.84.4 coding-agent/src/modes/interactive/interactive-mode.ts:1985-1986
+// // pi v0.84.4 coding-agent/src/modes/interactive/interactive-mode.ts:1981-1982
 // const extensionRunner = this.session.extensionRunner;
 // this.setupExtensionShortcuts(extensionRunner);
 // this.showLoadedResources({ force: false, showDiagnosticsWhenQuiet: true });
@@ -612,7 +612,7 @@ async fn set_verbose_startup_overrides_quiet_startup_at_the_session_seam() {
 ///
 /// * `install_extension_shortcuts` BEFORE the push — `resolve_shortcut_specs` is what records the
 ///   EXT-039 reserved-key refusals that `[Extension issues]` renders, and upstream orders the pair
-///   the same way at both call sites (`:1985-1986`, `:5990-5991`).
+///   the same way at both call sites (`:1981-1982`, `:5990-5991`).
 /// * the push BEFORE the replay — pi's `loadedResourcesContainer` is pinned above `chatContainer`
 ///   (`:594-596`), and cyrup's committed scrollback is linear.
 #[test]
@@ -647,7 +647,7 @@ fn the_session_swap_arm_pushes_the_panel_after_the_shortcuts_and_before_the_repl
         shortcuts < push,
         "`install_extension_shortcuts` must precede the panel push: it is what RECORDS the \
          EXT-039 reserved-key refusals the `[Extension issues]` block renders \
-         (interactive-mode.ts:1985-1986 @v0.84.4)"
+         (interactive-mode.ts:1981-1982 @v0.84.4)"
     );
     assert!(
         push < replay,

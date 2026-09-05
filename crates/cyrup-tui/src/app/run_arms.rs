@@ -311,12 +311,12 @@ impl App<InlineBackend<Stdout>> {
         // description `/hotkeys` renders; `shortcut_keys()` drops it. EXT-039: they go through the
         // reserved-key gate, which is why this is `install_extension_shortcuts` and not
         // `set_extension_shortcuts` — pi re-runs the whole of `setupExtensionShortcuts` on a
-        // session replacement too (`interactive-mode.ts:1985`, `:5990` @v0.84.4).
+        // session replacement too (`interactive-mode.ts:1981`, `:5990` @v0.84.4).
         //
         // TUI-N02 — and it runs HERE, ahead of the panel below, rather than after the replay where
         // it used to sit: `resolve_shortcut_specs` is what RECORDS the reserved-key refusals, and
         // `StartupReport::from_session` folds them into `[Extension issues]`. Upstream orders the
-        // pair the same way at both of its call sites (`:1985-1986`, `:5990-5991`), so a shortcut
+        // pair the same way at both of its call sites (`:1981-1982`, `:5990-5991`), so a shortcut
         // an extension lost on this reload is reported by the same reload that lost it.
         let ext_host = ctx.session.services().ext_host.clone();
         self.install_extension_shortcuts(&ext_host);

@@ -54,7 +54,7 @@ fn registered_shortcut_keypress_dispatches_to_ext_host() {
 /// non-reserved built-in (`extensions/runner.ts:568-574`).
 ///
 /// `alt+up` is cyrup's `app.message.dequeue` (`core/keybindings.ts:102-105`) and is NOT in
-/// `RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS` (`runner.ts:71-89`), so it is exactly the case
+/// `RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS` (`runner.ts:72-90`), so it is exactly the case
 /// upstream hands to the extension.
 ///
 /// RED before this pass: the global keymap was consulted first (`app/input.rs`), so this returned
@@ -158,7 +158,7 @@ fn a_reserved_builtin_key_is_refused_at_install_and_diagnosed() {
 
 /// EXT-039 — `App::effective_keybindings` is cyrup's `KeybindingsManager.getEffectiveConfig()`, and
 /// the gate can only refuse a reserved key that appears in it. Every namespace the reserved list
-/// spans (`extensions/runner.ts:71-89` @v0.84.4) must therefore be represented, and a user rebind
+/// spans (`extensions/runner.ts:72-90` @v0.84.4) must therefore be represented, and a user rebind
 /// must move the entry — otherwise a rebound Enter would stop being protected.
 #[test]
 fn effective_keybindings_spans_every_reserved_namespace_and_follows_a_rebind() {

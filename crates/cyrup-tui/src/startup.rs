@@ -175,7 +175,7 @@ impl StartupReport {
     /// `install_extension_shortcuts` must already have run for this session: EXT-039's
     /// reserved-key warnings are recorded by `resolve_shortcut_specs` and folded into
     /// `extension_diagnostics` below, exactly as upstream orders `setupExtensionShortcuts` ahead of
-    /// `showLoadedResources` at both call sites (`:1985-1986`, `:5990-5991`).
+    /// `showLoadedResources` at both call sites (`:1981-1982`, `:5990-5991`).
     pub fn from_session(session: &cyrup_session_svc::AgentSession, verbose: bool) -> Self {
         use cyrup_resources::ResourceKind;
         let services = session.services();

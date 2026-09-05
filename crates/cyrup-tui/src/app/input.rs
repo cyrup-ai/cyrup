@@ -126,7 +126,7 @@ impl<B: Backend> App<B> {
                 // `ExtensionHost::resolve_shortcut_specs`'s survivors, and `app.interrupt`,
                 // `app.clear`, `app.exit`, `tui.input.submit`, `tui.select.confirm`/`cancel` and the
                 // rest of `RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS`
-                // (`extensions/runner.ts:71-89`) can never reach this map. What an extension CAN
+                // (`extensions/runner.ts:72-90`) can never reach this map. What an extension CAN
                 // win here is exactly what pi lets it win: a NON-reserved built-in, with a
                 // `[Extension issues]` warning naming both (`runner.ts:568-574`).
                 //

@@ -301,6 +301,17 @@ impl Action {
     /// key that collides with a RESERVED id (`extensions/runner.ts:544-586` @v0.84.4). Without an
     /// id per action cyrup could not name the built-in the extension collides with, so it could
     /// neither refuse nor warn.
+    ///
+    /// **[CYRUP-DELTA]** two of the ids below are cyrup's own — `app.pageUp` and `app.pageDown` are
+    /// not in upstream's `AppKeybindings`, which lists every `app.*` id at
+    /// `core/keybindings.ts:14-57` @v0.84.4 and has no page-scroll entry (pi's page ids are all in
+    /// the tui namespace: `tui.editor.pageUp` / `tui.select.pageUp` / `tui.altScreen.pageUp`,
+    /// `packages/tui/src/keybindings.ts:21-22`, `:40-41`, `:45-46`). [`Action::from_id`] already
+    /// records the invention as TUI-028; this is the same delta seen from the gate side. Both are bound
+    /// by default in cyrup's global keymap, so they enter `effective_keybindings()` and an
+    /// extension registering `pageup` earns a `[Extension issues]` warning ("is built-in shortcut
+    /// for app.pageUp … Using `<ext>`") that pi would never emit. Neither is reserved, so the key is
+    /// still handed to the extension: the delta is one extra warning, not a routing change.
     pub fn id(self) -> &'static str {
         match self {
             Action::Quit => "app.exit",
