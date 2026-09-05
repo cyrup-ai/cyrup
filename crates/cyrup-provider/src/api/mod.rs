@@ -145,6 +145,19 @@ impl ApiRegistry {
         Some(imp)
     }
 
+    /// Every api id this registry can serve — the registered factories plus any already-live
+    /// impls. Order is unspecified. Used to hold cross-impl invariants (e.g. PROV-042's
+    /// "every api impl, not just one") as properties rather than hand-maintained lists.
+    pub fn ids(&self) -> Vec<ApiId> {
+        let mut out: Vec<ApiId> = self.factories.keys().cloned().collect();
+        for entry in &self.live {
+            if !out.contains(entry.key()) {
+                out.push(entry.key().clone());
+            }
+        }
+        out
+    }
+
     /// `true` if an impl is available (live or via a factory) for `api`.
     pub fn contains(&self, api: &ApiId) -> bool {
         self.live.contains_key(api) || self.factories.contains_key(api)

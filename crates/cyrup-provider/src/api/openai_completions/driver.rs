@@ -93,7 +93,13 @@ impl ApiImpl for OpenAiCompletionsApi {
         };
         // gap-08 #2: let a `before_provider_request` extension inspect/replace the outbound body.
         let body = crate::stream::apply_on_payload(opts, model, params).await;
-        let headers = build_headers(model, ctx, auth, opts, &compat, cache_session_id);
+        // PROV-042: `transformHeaders` runs LAST over the fully-assembled set (pi
+        // `models.ts:657` @v0.84.4); its return value is what goes on the wire.
+        let headers = crate::stream::apply_transform_headers(
+            opts,
+            build_headers(model, ctx, auth, opts, &compat, cache_session_id),
+        )
+        .await;
         let req = SseRequest {
             method: reqwest::Method::POST,
             url,

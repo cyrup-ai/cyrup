@@ -13,7 +13,7 @@
 //! | 92      | `ant-ling`                   | ✓ fleet                                |
 //! | 93      | `anthropic`                  | ✓                                      |
 //! | 94      | `azure-openai-responses`     | ✓                                      |
-//! | **95**  | **`baseten`**                | **✗ NOT REGISTERED — v0.84.x addition (no ledger id yet; see the guard test)** |
+//! | 95      | `baseten`                    | ✓ fleet (dynamic catalog) — DRIFT-009  |
 //! | 96      | `cerebras`                   | ✓ fleet                                |
 //! | 97      | `cloudflare-ai-gateway`      | ✓                                      |
 //! | 98      | `cloudflare-workers-ai`      | ✓                                      |
@@ -48,14 +48,22 @@
 //! | 129     | `zai`                        | ✓ fleet                                |
 //! | 130     | `zai-coding-cn`              | ✓ fleet                                |
 //!
-//! **39 of pi v0.84.4's 40 built-in providers are registered below** (every one of the ported
-//! baseline v0.83.0's 38, `all.ts:89-126` @v0.83.0, plus v0.84.x's `qwen-token-plan-individual`;
-//! `baseten` is the one v0.84.x addition still outstanding). Every api id the registered
+//! **All 40 of pi v0.84.4's built-in providers are registered below** (every one of the ported
+//! baseline v0.83.0's 38, `all.ts:89-126` @v0.83.0, plus both v0.84.x additions —
+//! `qwen-token-plan-individual` and `baseten`). Every api id the registered
 //! providers' catalogs name has a registered impl — that half is not left to this comment:
 //! `src/tests/catalog_data.rs`'s `every_catalog_api_has_a_registered_impl` walks all 35 catalogs and
-//! asserts `builtin_registry().contains(&row.api)` for every row. Four registered providers ship
-//! NO embedded catalog by design — `radius` and the three `qwen-token-plan*` members — and
-//! `catalog_data.rs`'s `DYNAMIC_ONLY_PROVIDERS` pins that set in both directions.
+//! asserts `builtin_registry().contains(&row.api)` for every row. Five registered providers ship
+//! NO embedded catalog by design — `radius`, the three `qwen-token-plan*` members and `baseten` —
+//! and `catalog_data.rs`'s `DYNAMIC_ONLY_PROVIDERS` pins that set in both directions.
+//!
+//! **DRIFT-009, 2026-09-05.** `baseten` (`all.ts:95` @v0.84.4, added upstream at `c1019d920`) was
+//! the last unregistered built-in and the fourth of that item's four missing catalogs. It joins the
+//! Qwen plans as a [`super::fleet`] member with a [`super::fleet::FleetCatalog::Dynamic`] catalog —
+//! its rows are models.dev's `baseten` record, in git at no revision — and registering it required
+//! porting the `baseten` thinking format it is the sole user of
+//! ([`crate::api::compat::ThinkingFormat::Baseten`], `openai-completions.ts:888-904`), without which
+//! every row the overlay delivers would fail to deserialize and the provider would offer nothing.
 //!
 //! **PROV-014, 2026-09-04.** `qwen-token-plan` / `qwen-token-plan-cn` (`all.ts:115-117` @v0.83.0)
 //! and `radius` were the three v0.83.0 built-ins this file did not construct. They are now: the
@@ -188,10 +196,10 @@ fn builtin_providers_with(
 ) -> Vec<Arc<dyn Provider>> {
     let mut providers: Vec<Arc<dyn Provider>> = Vec::new();
 
-    // openai-completions fleet: ant-ling, cerebras, deepseek, groq, huggingface, moonshotai,
-    // moonshotai-cn, nvidia, openrouter, qwen-token-plan, qwen-token-plan-cn,
+    // openai-completions fleet: ant-ling, baseten, cerebras, deepseek, groq, huggingface,
+    // moonshotai, moonshotai-cn, nvidia, openrouter, qwen-token-plan, qwen-token-plan-cn,
     // qwen-token-plan-individual, xai, xiaomi, xiaomi-token-plan-{ams,cn,sgp}, zai, zai-coding-cn
-    // (Pi `all.ts` @v0.84.4 lines 92,96,99,104,105,110,111,112,117,118-120,124,125,126-128,129,130).
+    // (Pi `all.ts` @v0.84.4 lines 92,95,96,99,104,105,110,111,112,117,118-120,124,125,126-128,129,130).
     for p in fleet_providers_with(store.clone(), registry.clone()) {
         providers.push(Arc::new(p));
     }
@@ -340,6 +348,26 @@ pub fn default_images_models(options: CreateModelsOptions) -> ImagesModels {
 mod tests {
     use super::*;
 
+    /// Providers not yet ported. This is a NOT-YET list, not an exemption list: the project ports
+    /// everything, and an id leaves this array by being implemented. It exists so a half-finished
+    /// provider cannot be registered and silently answer requests it cannot serve — the assertion
+    /// is "absent until real", never "must stay absent".
+    ///
+    /// PROV-062: this list was DELETED, with a comment claiming "every built-in provider pi ships
+    /// is now ported, so there is no not-yet list left to assert against". That was false at the
+    /// time it was written — PROV-014 was open against `qwen-token-plan`, `qwen-token-plan-cn` and
+    /// `radius` — so the guard was removed in the same edit that made the claim it was guarding
+    /// untrue. Restored, and it is the one place a future porter learns the set is incomplete
+    /// without reading a backlog file. Each id leaves this array by being implemented, not by being
+    /// reclassified: the three PROV-014 ids left on 2026-09-04, and `baseten` (`all.ts:95`
+    /// @v0.84.4) left on 2026-09-05 under DRIFT-009.
+    ///
+    /// It is EMPTY today. Both guards below read it, and they read it in opposite directions:
+    /// `registry_contains_implemented_provider_ids` asserts every id here is NOT registered, and
+    /// `all_of_pis_v0_84_4_builtins_are_registered` SUBTRACTS it from the expected set so the two
+    /// compose instead of contradicting each other. Parking an id therefore stays a one-line edit.
+    const NOT_YET: &[&str] = &[];
+
     /// The registry must contain every ported built-in id and none of the not-yet-ported ones.
     #[test]
     fn registry_contains_implemented_provider_ids() {
@@ -384,6 +412,8 @@ mod tests {
             "qwen-token-plan-cn",
             "qwen-token-plan-individual",
             "radius",
+            // DRIFT-009 (2026-09-05): the last unregistered built-in, `all.ts:95` @v0.84.4.
+            "baseten",
         ] {
             assert!(
                 ids.iter().any(|id| id == expected),
@@ -391,31 +421,117 @@ mod tests {
             );
         }
 
-        // Providers not yet ported. This is a NOT-YET list, not an exemption list: the project
-        // ports everything, and an id leaves this array by being implemented. It exists so a
-        // half-finished provider cannot be registered and silently answer requests it cannot serve
-        // — the assertion is "absent until real", never "must stay absent".
-        //
-        // PROV-062: this list was DELETED, with a comment claiming "every built-in provider pi ships
-        // is now ported, so there is no not-yet list left to assert against". That was false at the
-        // time it was written — PROV-014 was open against `qwen-token-plan`, `qwen-token-plan-cn`
-        // and `radius` — so the guard was removed in the same edit that made the claim it was
-        // guarding untrue. Restored, and it is the one place a future porter learns the set is
-        // incomplete without reading a backlog file. Each id leaves this array by being
-        // implemented, not by being reclassified: the three PROV-014 ids left on 2026-09-04, and
-        // `baseten` (`all.ts:95` @v0.84.4, a v0.84.x addition; `providers/baseten.ts`) entered.
-        const NOT_YET: &[&str] = &["baseten"];
+        // `NOT_YET` is declared at the top of this module, because
+        // `all_of_pis_v0_84_4_builtins_are_registered` subtracts the same array from its expected
+        // set. Keep the loop: the day a provider is genuinely half-ported, this is where it is
+        // parked, and parking it satisfies both guards at once.
         for not_yet in NOT_YET {
             assert!(
                 !ids.iter().any(|id| id == not_yet),
-                "'{not_yet}' is registered but has no working stream path (pi all.ts:95 \
-                 @v0.84.4). If it was genuinely ported, delete it from this array and from the \
-                 NOT REGISTERED row in this module's header table in the same commit."
+                "'{not_yet}' is registered but has no working stream path. If it was genuinely \
+                 ported, delete it from this array and from the NOT REGISTERED row in this \
+                 module's header table in the same commit."
             );
         }
 
         // The count matches what `all_providers()` returns and has no duplicate ids.
         assert_eq!(ids.len(), all_providers().len());
+    }
+
+    /// DRIFT-009 — pi's `builtinProviders()` list in full, so the registry cannot disagree with
+    /// upstream in silence.
+    ///
+    /// This is the lesson DRIFT-009 was filed for, applied to registrations instead of catalogs:
+    /// the previous guard was a hand-kept NOT-YET array plus a prose table, and both went stale
+    /// (`PROV-062` deleted the array while three providers were missing; the header claimed 39 of
+    /// 40 while it listed one). Forty ids, transcribed from `providers/all.ts:91-130` @v0.84.4 in
+    /// upstream's own order.
+    ///
+    /// **What this guard does and does not reach.** `PI_BUILTINS` is a hand transcription of the
+    /// PINNED parity target, not a live read of upstream, so it catches exactly two things: a
+    /// provider cyrup DROPS relative to v0.84.4, and a provider cyrup INVENTS that v0.84.4 does not
+    /// ship (the direction the old prose table could not see at all). It CANNOT see a provider pi
+    /// adds after v0.84.4 — such an id is in neither list and the comparison stays green — so it is
+    /// exactly as hand-kept as the array it sits beside, and it must be refreshed when ADR-0006
+    /// moves the parity target. `xtask gen-catalogs --roster <rev>` is the check that reads
+    /// upstream live; this one pins the registry against the target that check names.
+    ///
+    /// It composes with `NOT_YET` rather than contradicting it: a parked id is subtracted from the
+    /// expected set here and asserted absent there, so parking a half-ported provider keeps both
+    /// guards green while it is parked and fails both the moment it is registered without leaving
+    /// the array (or leaves the array without being registered).
+    #[test]
+    fn all_of_pis_v0_84_4_builtins_are_registered() {
+        const PI_BUILTINS: &[&str] = &[
+            "amazon-bedrock",
+            "ant-ling",
+            "anthropic",
+            "azure-openai-responses",
+            "baseten",
+            "cerebras",
+            "cloudflare-ai-gateway",
+            "cloudflare-workers-ai",
+            "deepseek",
+            "fireworks",
+            "github-copilot",
+            "google",
+            "google-vertex",
+            "groq",
+            "huggingface",
+            "kimi-coding",
+            "minimax",
+            "minimax-cn",
+            "mistral",
+            "moonshotai",
+            "moonshotai-cn",
+            "nvidia",
+            "openai",
+            "openai-codex",
+            "opencode",
+            "opencode-go",
+            "openrouter",
+            "qwen-token-plan",
+            "qwen-token-plan-cn",
+            "qwen-token-plan-individual",
+            "radius",
+            "together",
+            "vercel-ai-gateway",
+            "xai",
+            "xiaomi",
+            "xiaomi-token-plan-ams",
+            "xiaomi-token-plan-cn",
+            "xiaomi-token-plan-sgp",
+            "zai",
+            "zai-coding-cn",
+        ];
+        assert_eq!(
+            PI_BUILTINS.len(),
+            40,
+            "all.ts:91-130 @v0.84.4 is 40 entries"
+        );
+
+        let mut registered: Vec<String> = all_providers()
+            .iter()
+            .map(|p| p.id().as_str().to_string())
+            .collect();
+        registered.sort();
+        // Subtract the parked ids so this guard and `registry_contains_implemented_provider_ids`
+        // compose: that one asserts a parked id is NOT registered, so expecting it here would make
+        // the two contradict each other and leave `NOT_YET` unusable.
+        let mut expected: Vec<String> = PI_BUILTINS
+            .iter()
+            .filter(|id| !NOT_YET.contains(*id))
+            .map(|s| (*s).to_string())
+            .collect();
+        expected.sort();
+        assert_eq!(
+            registered, expected,
+            "the registry and pi's builtinProviders() @v0.84.4 (minus anything parked in NOT_YET) \
+             must name the same set — an id only pi has is an unported provider that belongs in \
+             NOT_YET, an id only cyrup has is an invention. This list is pinned to v0.84.4: it \
+             cannot see a provider pi adds later, and must be re-transcribed when the parity \
+             target moves."
+        );
     }
 
     /// The built-in images collection registers `openrouter-images` (Pi `builtinImagesModels`,

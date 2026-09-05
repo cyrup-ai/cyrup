@@ -18,3 +18,4 @@ mod overflow_estimate_parity;
 mod remote_catalog;
 mod sampling_params;
 mod thinking_max;
+mod transform_headers_on_the_wire;

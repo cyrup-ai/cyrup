@@ -273,6 +273,22 @@ impl<B: Backend> App<B> {
                 _ => {}
             }
         }
+        // EXT-041 — the custom-ENTRY surface, a SECOND and disjoint lookup exactly as it is on the
+        // live path (pi keeps `messageRenderers` and `entryRenderers` as separate maps,
+        // `extensions/types.ts:1766`/`:1768` @v0.84.4, and `addCustomEntryToChat` resolves the entry one,
+        // `interactive-mode.ts:3571`). Its own loop because it is keyed by ITEM index, not by the
+        // message index the loop above walks. The three-state outcome is carried WHOLE: a faulting
+        // renderer draws pi's failure box (`custom-entry.ts:47-52`), which is not the same answer
+        // as "no renderer claimed this type".
+        for (i, item) in items.iter().enumerate() {
+            if let cyrup_session_svc::ReplayItem::CustomEntry(entry) = item {
+                let ty = custom_entry_type(entry);
+                let r = extension_render_entry(ext_host, &ty, entry, &opts).await;
+                if r.has_content() {
+                    rendered.entries.insert(i, r);
+                }
+            }
+        }
         // EXT-019 — the commit frontier before the walk, for the transform pass below.
         let first_pending = self.state.transcript.pending_len();
         self.replay_session_rendered(items, &rendered);
@@ -308,7 +324,7 @@ impl<B: Backend> App<B> {
         // The MESSAGE index `rendered` is keyed by — advanced only on a message, so the notices
         // interleaved by [`AgentSession::replay_items`] cannot desynchronise it.
         let mut next_index = 0usize;
-        for item in items {
+        for (item_index, item) in items.iter().enumerate() {
             let message = match item {
                 ReplayItem::Message(m) => m.as_ref(),
                 // pi re-injects the miss notice after the assistant message that paid for it
@@ -336,6 +352,20 @@ impl<B: Backend> App<B> {
                             usage,
                         );
                     }
+                    continue;
+                }
+                // EXT-041 — pi's `if (isCustomSessionEntry(item)) this.addCustomEntryToChat(item)`
+                // (`interactive-mode.ts:3717-3719`), the SAME method its live `entry_appended` arm
+                // calls (`:3217-3218`). The three-state outcome the pre-pass resolved decides what
+                // draws, exactly as it does live.
+                ReplayItem::CustomEntry(entry) => {
+                    let ty = custom_entry_type(entry);
+                    let r = rendered
+                        .entries
+                        .get(&item_index)
+                        .cloned()
+                        .unwrap_or(crate::transcript::Rendered::None);
+                    self.push_custom_entry(ty, r);
                     continue;
                 }
             };
@@ -539,14 +569,17 @@ impl<B: Backend> App<B> {
 }
 
 /// Everything the extension-renderer pre-pass resolved for one replay, handed to the sync walk
-/// ([`App::replay_session_rendered`]). Three surfaces, three keys, because pi resolves them at
-/// three different places: a custom message by its position in the stream (`getMessageRenderer`,
-/// `interactive-mode.ts:3610` @v0.84.4), a tool call by `content.id` (`:3760`) and a tool result by
-/// `message.toolCallId` (`:3770`). A key with no entry draws the built-in framing.
+/// ([`App::replay_session_rendered`]). Four surfaces, four keys, because pi resolves them at four
+/// different places: a custom message by its position in the stream (`getMessageRenderer`,
+/// `interactive-mode.ts:3610` @v0.84.4), a tool call by `content.id` (`:3760`), a tool result by
+/// `message.toolCallId` (`:3770`) and a custom ENTRY by `entry.customType` at the walk itself
+/// (`getEntryRenderer`, `:3571`). A key with no entry draws the built-in framing.
 ///
 /// The two tool maps hold flattened text rather than [`crate::transcript::Rendered`] because a
 /// tool row is a string surface — the live fold flattens with `into_text()` at the push
-/// (`events_fold.rs`), and the replay must not carry a tier the row cannot draw.
+/// (`events_fold.rs`), and the replay must not carry a tier the row cannot draw. The message and
+/// entry maps carry the whole [`crate::transcript::Rendered`]: a `Live` component draws, and — for
+/// an entry — `Failed` is pi's own third outcome (`custom-entry.ts:47-52`), not an absence.
 #[derive(Default)]
 struct ReplayRenders {
     /// MESSAGE index → the custom-message renderer's output (X11 / EXT-006).
@@ -555,6 +588,13 @@ struct ReplayRenders {
     tool_calls: std::collections::HashMap<String, crate::transcript::RenderedText>,
     /// Tool-call id → the extension's `renderResult` text (EXT-041).
     tool_results: std::collections::HashMap<String, crate::transcript::RenderedText>,
+    /// ITEM index → the custom-ENTRY renderer's three-state outcome (EXT-041).
+    ///
+    /// Keyed by position in the ITEM stream, not by entry id: pi resolves this renderer inside the
+    /// walk, holding the entry (`addCustomEntryToChat(item)`, `:3718`), so there is no upstream key
+    /// to mirror — and the item's own position is the one address that exists whatever the
+    /// serialized entry happens to carry.
+    entries: std::collections::HashMap<usize, crate::transcript::Rendered>,
 }
 
 /// The `{content, details}` value a persisted `toolResult` message presents to a `renderResult`

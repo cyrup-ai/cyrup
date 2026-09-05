@@ -246,6 +246,18 @@ impl AgentBuilder {
         self
     }
 
+    /// PROV-042 — transform the fully-assembled outbound provider headers before dispatch (pi
+    /// `transformHeaders`, installed by the session `streamFn` at
+    /// `packages/coding-agent/src/core/sdk.ts:330-339` @v0.84.4). Forwarded verbatim into
+    /// `cyrup_provider::StreamOptions::transform_headers`; the provider applies it last, after auth,
+    /// model and per-request header overlays are merged, and its return value is what goes on the
+    /// wire.
+    #[must_use]
+    pub fn transform_headers(mut self, f: cyrup_provider::TransformHeadersFn) -> Self {
+        self.gen_config.transform_headers = Some(f);
+        self
+    }
+
     #[must_use]
     pub fn build(self) -> Agent {
         let (running_tx, running_rx) = watch::channel(false);

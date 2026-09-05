@@ -13,7 +13,13 @@
 //! * **The deadline/cancel race.** `biased` select with the exit arm first, exactly as
 //!   [`crate::exec::acceptance::model::verify::run`] does and for the same reason: an unbiased
 //!   select whose exit arm and cancel arm are both ready picks at random, so a process that had
-//!   already finished when the token fired would report "stopped" about half the time.
+//!   already finished when the token fired would report "stopped" about half the time. The order
+//!   alone is not enough, because the loop outlives the reap by however long the pipes stay open:
+//!   the two verbs are ALSO gated on the child not having been reaped, which is upstream's
+//!   `settled` (`external-cli-runner.ts:262`, `:378`). The chunk arm is polled LAST. See the
+//!   arm-order note on the loop itself, which is the whole of upstream's
+//!   `registerTimeout`/`registerStop` independence (`external-cli-runner.ts:361-362`) expressed as
+//!   a poll order.
 
 use std::path::{Path, PathBuf};
 
@@ -239,25 +245,101 @@ pub async fn run_external_cli_process(
     let mut exit: Option<std::process::ExitStatus> = None;
     let mut timed_out = false;
     let mut stopped = false;
-    let mut terminated = false;
+    // Both pumps still alive-or-buffered. Goes false on the channel's close, which says the two
+    // PIPES are done — it says nothing about the process, which may still be running.
+    let mut streaming = true;
+    // Upstream's `settled` (`external-cli-runner.ts:262`, set at `:378`): the child is REAPED, so
+    // no run-ending verb may fire any more. Tracked separately from `exit` because `exit` is
+    // `child.wait()`'s status and is left `None` when that call fails at the OS level — a reaped
+    // child with no status is still reaped, and re-enabling the arms on it is the bug, not the fix.
+    let mut reaped = false;
     let mut drain_deadline: Option<tokio::time::Instant> = None;
 
-    loop {
+    // ARM ORDER AND LOOP CONDITION ARE BOTH LOAD-BEARING (SUBA-095). Upstream's two run-ending
+    // verbs are event-loop callbacks — `input.registerTimeout?.(() => terminate("timeout"))` and
+    // `input.registerStop?.(() => terminate("stop"))` (`external-cli-runner.ts:361-362`) — so they
+    // fire regardless of stream state, and only `child.once("close")` (`:377`) settles the run.
+    // Two things are needed to hold that here:
+    //
+    // * The loop runs until the child is REAPED, not until the pipes end. `rx` closes when both
+    //   pumps see `Ok(0)`, which is independent of process exit: a child that closes stdout and
+    //   stderr and keeps running made `recv()` permanently ready with `None`, and breaking on that
+    //   left the run settling on an unguarded `child.wait()` — an await with no deadline arm and
+    //   no stop arm, for as long as the child chose to live. EOF now only lowers `streaming`.
+    // * `biased` short-circuits on the first ready branch, so whichever arm is polled first can
+    //   starve every arm below it. The chunk arm therefore goes LAST: a child that never stops
+    //   writing keeps `recv()` ready at every poll, and with it first neither the deadline arm nor
+    //   the stop arm was polled AT ALL for as long as the stream ran. Chunk delivery is not more
+    //   urgent than the two verbs that end the run, and it is the pumps' own channel back-pressure
+    //   that bounds memory, not this loop's priority. The exit arm keeps the first slot for the
+    //   race the module note above describes; the arms above `recv()` are each ready at most once
+    //   (the exit arm and the two verbs are all disabled by `reaped`, and the drain arm breaks), so
+    //   none of them can starve the stream in turn.
+    // * NEITHER VERB MAY FIRE ON A REAPED CHILD. That is upstream's `terminate`'s own first line —
+    //   `if (settled || timedOut || stopped || parserError) return;` (`:262`) — and without it the
+    //   post-exit drain window is a live hazard: the loop keeps running while the pumps' backlog is
+    //   consumed, and with the verbs polled ABOVE the chunk arm a stop (or an elapsed deadline)
+    //   landing in that window would set `stopped`/`timed_out`, re-run the terminate ladder on a
+    //   corpse, and report `exit_code: 1` + "Subagent stopped by user." for a run that COMPLETED.
+    //   `reaped` is the gate; the exit arm arms `drain_deadline` on its way through so that window
+    //   is bounded rather than merely quiet — a grandchild that inherited the pipes keeps them open
+    //   for as long as it likes, and upstream's `close` (`:377`), which waits for exactly that, is
+    //   the one place upstream itself can hang. cyrup does not follow it there.
+    while streaming || !reaped {
         let deadline = input.deadline;
         tokio::select! {
             biased;
-            chunk = rx.recv() => {
-                let Some((is_stdout, bytes)) = chunk else { break };
+            status = child.wait(), if !reaped => {
+                reaped = true;
+                exit = status.ok();
+                drain_deadline.get_or_insert_with(|| {
+                    tokio::time::Instant::now() + crate::spawn::signal::TIMEOUT_SIGTERM_GRACE
+                });
+            }
+            () = wait_until(deadline), if !reaped => {
+                timed_out = true;
+                // The ladder returns only once the process is CONFIRMED gone, so this is a reap.
+                reaped = true;
+                exit = crate::spawn::signal::terminate_on_timeout(&mut child).await.ok();
+                drain_deadline = Some(tokio::time::Instant::now() + crate::spawn::signal::TIMEOUT_SIGTERM_GRACE);
+            }
+            () = input.stop.cancelled(), if !reaped => {
+                stopped = true;
+                reaped = true;
+                exit = crate::spawn::signal::terminate_on_timeout(&mut child).await.ok();
+                drain_deadline = Some(tokio::time::Instant::now() + crate::spawn::signal::TIMEOUT_SIGTERM_GRACE);
+            }
+            () = wait_until(drain_deadline), if drain_deadline.is_some() => {
+                // A descendant that escaped the group can still hold the pipes open; this arm is
+                // what makes sure it can never be the thing that hangs the orchestrator.
+                break;
+            }
+            chunk = rx.recv(), if streaming => {
+                let Some((is_stdout, bytes)) = chunk else {
+                    streaming = false;
+                    continue;
+                };
                 if is_stdout {
                     if plan.parser.is_some() && parser_error.is_none() {
                         feed_parser(&mut splitter, plan.parser.as_mut(), &bytes, &mut parser_error);
                         // `failParser` tears the process TREE down the moment a JSONL protocol
-                        // violation is seen (`external-cli-runner.ts:267-272`) rather than letting
-                        // a misbehaving CLI run on to its own exit or to the deadline. Unlike the
-                        // two arms below this sets neither `timed_out` nor `stopped`: the failure
-                        // precedence at the bottom of this function reports the PARSER error.
-                        if parser_error.is_some() && !terminated {
-                            terminated = true;
+                        // violation is seen (`external-cli-runner.ts:266-272` @v0.64.0) rather than
+                        // letting a misbehaving CLI run on to its own exit or to the deadline.
+                        // Unlike the deadline and stop arms this sets neither `timed_out` nor
+                        // `stopped`: the failure precedence at the bottom of this function reports
+                        // the PARSER error.
+                        //
+                        // [CYRUP-DELTA] the `!reaped` conjunct is cyrup's, not upstream's.
+                        // Upstream's `failParser` (`:266-272`) is guarded ONLY by
+                        // `if (parserError) return;` at `:268` and calls
+                        // `terminateExternalProcessTree` at `:271` even after the child is settled;
+                        // it is `terminate` (`:261-266`), the deadline/stop verb, that carries
+                        // `settled` in its guard. Killing a corpse is harmless in Node, where the
+                        // termination result is discarded. Here the ladder RETURNS the exit status
+                        // and `exit` is what the receipt reports, so re-running it on a reaped
+                        // child would overwrite the real status with the corpse's.
+                        if parser_error.is_some() && !reaped {
+                            reaped = true;
                             exit = crate::spawn::signal::terminate_on_timeout(&mut child).await.ok();
                             drain_deadline = Some(tokio::time::Instant::now() + crate::spawn::signal::TIMEOUT_SIGTERM_GRACE);
                         }
@@ -269,31 +351,18 @@ pub async fn run_external_cli_process(
                     stderr_tail.push(&bytes);
                 }
             }
-            status = child.wait(), if exit.is_none() => {
-                exit = status.ok();
-            }
-            () = wait_until(deadline), if !terminated => {
-                terminated = true;
-                timed_out = true;
-                exit = crate::spawn::signal::terminate_on_timeout(&mut child).await.ok();
-                drain_deadline = Some(tokio::time::Instant::now() + crate::spawn::signal::TIMEOUT_SIGTERM_GRACE);
-            }
-            () = input.stop.cancelled(), if !terminated => {
-                terminated = true;
-                stopped = true;
-                exit = crate::spawn::signal::terminate_on_timeout(&mut child).await.ok();
-                drain_deadline = Some(tokio::time::Instant::now() + crate::spawn::signal::TIMEOUT_SIGTERM_GRACE);
-            }
-            () = wait_until(drain_deadline), if drain_deadline.is_some() => {
-                // A descendant that escaped the group can still hold the pipes open; this arm is
-                // what makes sure it can never be the thing that hangs the orchestrator.
-                break;
-            }
         }
     }
 
     if exit.is_none() {
-        exit = child.wait().await.ok();
+        // Reached only when the child was never observed to exit cleanly: either the drain-deadline
+        // `break` fired (with the terminate ladder already returned — and that ladder returns only
+        // once the process is CONFIRMED reaped), or `wait` itself failed at the OS level. Bounded
+        // either way: nothing after the loop is allowed to outlive the verbs that ended the run.
+        exit = tokio::time::timeout(crate::spawn::signal::TIMEOUT_SIGTERM_GRACE, child.wait())
+            .await
+            .ok()
+            .and_then(Result::ok);
     }
 
     // `stdout.once("end")` (`:367-376`): flush the trailing line, then settle the parser.
@@ -758,6 +827,191 @@ mod tests {
             prompt.len().to_string(),
             "the child must have read the WHOLE prompt: {last}"
         );
+    }
+
+    /// SUBA-095 path 1 — a child that EOFs BOTH pipes and then keeps running must still settle at
+    /// its own deadline.
+    ///
+    /// `rx` closes when both pumps see `Ok(0)`, which is independent of process exit: a child that
+    /// closes stdout and stderr and goes on running (a CLI that closes stdio after its final
+    /// `result` event and then flushes telemetry) made `rx.recv()` permanently ready with `None`,
+    /// so the loop broke out with no exit status and settled on an UNGUARDED `child.wait()` —
+    /// an await with no deadline arm and no stop arm, for as long as the child chose to live.
+    /// Upstream cannot reach that state: `registerTimeout`/`registerStop`
+    /// (`external-cli-runner.ts:361-362` @v0.64.0) are event-loop callbacks that fire regardless of
+    /// stream state, and only `child.once("close")` (`:377`) settles the run.
+    ///
+    /// The script closes both pipes and sleeps far past the wall-clock bound, so the only thing
+    /// that can end this run inside it is the deadline.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_child_that_eofs_both_pipes_without_exiting_still_hits_its_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop = cyrup_core::CancelToken::new();
+        let program = script(dir.path(), "#!/bin/sh\nexec 1>&- 2>&-\nsleep 30\n");
+        let prepared = PromptDelivery::Stdin.prepare("x").unwrap();
+        let mut timed = input(dir.path(), &stop);
+        timed.deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_millis(200));
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_external_cli_process(plan(program, None), &prepared, &timed),
+        )
+        .await
+        .expect("the deadline must reach a child that closed its pipes and kept running");
+
+        assert!(outcome.timed_out, "{outcome:?}");
+        assert!(!outcome.stopped, "{outcome:?}");
+        assert_eq!(outcome.exit_code, 1, "{outcome:?}");
+        assert_eq!(outcome.error.as_deref(), Some("Subagent timed out."));
+    }
+
+    /// SUBA-095 path 1, the stop half — the same child, ended by an explicit stop instead.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_child_that_eofs_both_pipes_without_exiting_still_honours_a_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = script(dir.path(), "#!/bin/sh\nexec 1>&- 2>&-\nsleep 30\n");
+        let prepared = PromptDelivery::Stdin.prepare("x").unwrap();
+        let stop = cyrup_core::CancelToken::new();
+        let stopper = stop.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            stopper.cancel();
+        });
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_external_cli_process(plan(program, None), &prepared, &input(dir.path(), &stop)),
+        )
+        .await
+        .expect("a stop must reach a child that closed its pipes and kept running");
+
+        assert!(outcome.stopped, "{outcome:?}");
+        assert_eq!(outcome.exit_code, 1, "{outcome:?}");
+        assert_eq!(outcome.error.as_deref(), Some("Subagent stopped by user."));
+    }
+
+    /// SUBA-095 path 2 — a stop must be honoured while the child streams output without pause.
+    ///
+    /// `biased` short-circuits on the first ready branch, so with `rx.recv()` polled first a chunk
+    /// that is always ready meant the deadline arm and the stop arm were never polled AT ALL. The
+    /// child here streams JSONL faster than the parser can consume it, which keeps the 64-slot
+    /// channel full for the whole run; upstream's two callbacks are not on the stream's path at all
+    /// (`external-cli-runner.ts:361-362` @v0.64.0).
+    ///
+    /// A multi-threaded runtime is what makes the starvation observable — and it is also what
+    /// cyrup runs on: with the pump on another worker the channel is refilled while this loop
+    /// spins, so `recv()` never once returns `Pending` for the other arms to be reached through.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_is_honoured_while_the_child_streams_output_without_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = script(
+            dir.path(),
+            "#!/bin/sh\nexec timeout 20 yes '{\"type\":\"system\"}'\n",
+        );
+        let prepared = PromptDelivery::Stdin.prepare("x").unwrap();
+        let stop = cyrup_core::CancelToken::new();
+        let stopper = stop.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            stopper.cancel();
+        });
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_external_cli_process(
+                plan(
+                    program,
+                    Some(AdapterParser::ClaudeCode(ClaudeCodeParser::new())),
+                ),
+                &prepared,
+                &input(dir.path(), &stop),
+            ),
+        )
+        .await
+        .expect("a stop must not be starved by a child that never stops writing");
+
+        assert!(outcome.stopped, "{outcome:?}");
+        assert_eq!(outcome.exit_code, 1, "{outcome:?}");
+        assert_eq!(outcome.error.as_deref(), Some("Subagent stopped by user."));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the stop must be honoured promptly, not after the stream ends: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// SUBA-095 review fix — a stop that lands AFTER the child has been reaped reports the child's
+    /// own exit, not "stopped".
+    ///
+    /// This is upstream's `terminate`'s own first line, `if (settled || timedOut || stopped ||
+    /// parserError) return;` (`external-cli-runner.ts:262` @v0.64.0), where `settled` is set by
+    /// `child.once("close")` (`:378`). Without it in cyrup the post-exit drain window is live: the
+    /// loop runs until the PIPES end as well as the process, and the stop arm is polled above the
+    /// chunk arm, so a stop arriving while a grandchild still holds stdout open turned a completed
+    /// run into `exit_code: 1` + "Subagent stopped by user.".
+    ///
+    /// The script makes that window wide and deterministic instead of racing a 64-slot backlog: the
+    /// shell exits 7 at once while a background `sleep` it spawned keeps the inherited stdout and
+    /// stderr pipes open, so the loop is still draining a second later, which is when the stop
+    /// fires. The run then ends on the drain deadline the exit arm arms — the pipes are a
+    /// grandchild's to close, and upstream's `close` waits for them forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stop_that_lands_after_the_child_exits_reports_the_childs_own_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = script(dir.path(), "#!/bin/sh\nsleep 3 &\nexit 7\n");
+        let prepared = PromptDelivery::Stdin.prepare("x").unwrap();
+        let stop = cyrup_core::CancelToken::new();
+        let stopper = stop.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            stopper.cancel();
+        });
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_external_cli_process(plan(program, None), &prepared, &input(dir.path(), &stop)),
+        )
+        .await
+        .expect("the post-exit drain must be bounded by the drain deadline");
+
+        assert!(
+            !outcome.stopped,
+            "a run whose child had already exited is not a stopped run: {outcome:?}"
+        );
+        assert!(!outcome.timed_out, "{outcome:?}");
+        assert_eq!(outcome.exit_code, 7, "{outcome:?}");
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some("External CLI exited with code 7.")
+        );
+    }
+
+    /// SUBA-095 review fix, the deadline half — the same reaped child, with the run's own deadline
+    /// elapsing inside the drain window instead of a stop. `terminate("timeout")` is guarded by the
+    /// same `settled` (`external-cli-runner.ts:262` @v0.64.0).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_deadline_that_elapses_after_the_child_exits_reports_the_childs_own_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop = cyrup_core::CancelToken::new();
+        let program = script(dir.path(), "#!/bin/sh\nsleep 3 &\nexit 7\n");
+        let prepared = PromptDelivery::Stdin.prepare("x").unwrap();
+        let mut timed = input(dir.path(), &stop);
+        timed.deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_millis(100));
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_external_cli_process(plan(program, None), &prepared, &timed),
+        )
+        .await
+        .expect("the post-exit drain must be bounded by the drain deadline");
+
+        assert!(
+            !outcome.timed_out,
+            "a run whose child had already exited did not time out: {outcome:?}"
+        );
+        assert!(!outcome.stopped, "{outcome:?}");
+        assert_eq!(outcome.exit_code, 7, "{outcome:?}");
     }
 
     /// A run past its deadline is torn down and reported as a TIMEOUT, and one whose stop token

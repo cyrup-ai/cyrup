@@ -28,7 +28,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::export::{
-    CssColor, ExportTheme, derive_export_colors, session_jsonl_to_html,
+    CssColor, ExportState, ExportTheme, ExportTool, derive_export_colors, session_jsonl_to_html,
     session_jsonl_to_html_with_theme,
 };
 
@@ -241,7 +241,11 @@ fn branching_history_is_exported_as_a_tree_with_a_leaf() {
 /// `eeeeeeee` here.
 #[test]
 fn an_explicit_leaf_wins_over_the_last_file_entry() {
-    let html = session_jsonl_to_html_with_theme(FIXTURE, &ExportTheme::default(), Some("dddddddd"));
+    let html = session_jsonl_to_html_with_theme(
+        FIXTURE,
+        &ExportTheme::default(),
+        &ExportState::live(Some("dddddddd".to_string()), String::new(), Vec::new()),
+    );
     let data = session_data(&html);
     assert_eq!(
         data["leafId"], "dddddddd",
@@ -255,7 +259,7 @@ fn an_explicit_leaf_wins_over_the_last_file_entry() {
     let derived = session_data(&session_jsonl_to_html_with_theme(
         FIXTURE,
         &ExportTheme::default(),
-        None,
+        &ExportState::from_file(),
     ));
     assert_eq!(derived["leafId"], "eeeeeeee");
 }
@@ -266,7 +270,7 @@ fn an_explicit_leaf_wins_over_the_last_file_entry() {
 /// Without this guard, `export_leaf_id` could be dropped from `export_to_html` and every test above
 /// would still pass while each branched export silently regressed.
 #[test]
-fn export_to_html_passes_the_managers_leaf_to_the_renderer() {
+fn export_to_html_passes_the_live_session_state_to_the_renderer() {
     const TRANSCRIPT_SRC: &str = include_str!("../session/transcript.rs");
     let offset = TRANSCRIPT_SRC
         .find("pub async fn export_to_html")
@@ -277,11 +281,127 @@ fn export_to_html_passes_the_managers_leaf_to_the_renderer() {
         .expect("`export_to_html` must still render through the pure renderer");
     let call_args = &body[call..(call + 200).min(body.len())];
     assert!(
-        call_args.contains("self.export_leaf_id()"),
-        "`export_to_html` must pass `self.export_leaf_id()` to the renderer — pi passes \
-         `sm.getLeafId()` (`core/export-html/index.ts:266` @v0.84.4), and re-deriving the leaf from \
-         the JSONL names an abandoned branch after a `/tree` switch"
+        call_args.contains("self.export_state()"),
+        "`export_to_html` must pass `self.export_state()` to the renderer — pi passes \
+         `sm.getLeafId()` AND `this.state` (`core/export-html/index.ts:263-270`, \
+         `agent-session.ts:3439` @v0.84.4). Re-deriving the leaf from the JSONL names an abandoned \
+         branch after a `/tree` switch (DRIFT-041), and dropping the state loses the System Prompt \
+         and Available Tools sections (DRIFT-054)"
     );
+}
+
+/// DRIFT-054 — the LIVE export carries pi's two `AgentState` keys.
+///
+/// pi's `exportSessionToHtml` sets `systemPrompt: state?.systemPrompt` and
+/// `tools: state?.tools?.map((t) => ({ name, description, parameters }))`
+/// (`core/export-html/index.ts:267-268` @v0.84.4), and `AgentSession.exportToHtml` ALWAYS passes
+/// `this.state` (`agent-session.ts:3439`) — it is the only entry point `/export`, `/share` and RPC
+/// `export_html` have. The byte-identical `template.js` this crate ships renders a collapsible
+/// **System Prompt** block and an **Available Tools** list from exactly those two keys
+/// (`:1403-1452`, destructured at `:15`), so without them every exported document was missing two
+/// visible sections.
+///
+/// RED before the fix: `session_data` inserted `header`, `entries` and `leafId` only, so both
+/// lookups were `Value::Null`.
+#[test]
+fn a_live_export_carries_the_system_prompt_and_the_active_tools() {
+    let state = ExportState::live(
+        Some("dddddddd".to_string()),
+        "You are cyrup.\nBe brief.".to_string(),
+        vec![
+            ExportTool {
+                name: "bash".to_string(),
+                description: "Run a shell command".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": { "command": { "type": "string", "description": "the command" } },
+                    "required": ["command"],
+                }),
+            },
+            ExportTool {
+                name: "read".to_string(),
+                description: "Read a file".to_string(),
+                parameters: serde_json::json!({ "type": "object", "properties": {} }),
+            },
+        ],
+    );
+    let data = session_data(&session_jsonl_to_html_with_theme(
+        FIXTURE,
+        &ExportTheme::default(),
+        &state,
+    ));
+
+    assert_eq!(
+        data["systemPrompt"], "You are cyrup.\nBe brief.",
+        "`systemPrompt: state?.systemPrompt` (`index.ts:267`) — `template.js:1404` renders the \
+         System Prompt block from it"
+    );
+
+    let tools = data["tools"]
+        .as_array()
+        .expect("`tools` must be an array — `template.js:1425` reads `tools.length`");
+    assert_eq!(tools.len(), 2);
+    assert_eq!(tools[0]["name"], "bash");
+    assert_eq!(tools[0]["description"], "Run a shell command");
+    assert_eq!(
+        tools[0]["parameters"]["properties"]["command"]["type"],
+        "string"
+    );
+    assert_eq!(tools[1]["name"], "read");
+    // Upstream picks exactly three fields (`index.ts:268`) — nothing else travels.
+    assert_eq!(
+        {
+            let mut keys = tools[0]
+                .as_object()
+                .expect("a tool entry is an object")
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            // Sorted rather than taken in map order because `serde_json::Map` is NOT a `BTreeMap`
+            // in this build: `serde_json` is declared with `preserve_order` at the workspace
+            // (`6200b011`), so every map in the workspace is an `IndexMap` and iterates in
+            // INSERTION order — here `name`, `description`, `parameters`, the field order of
+            // `ExportTool`. Sorting keeps this test asserting the KEY SET it says it asserts
+            // instead of the alphabetical accident of the old map type. Same flip, same fix as
+            // ICOM-054 (`71fefe30`).
+            keys.sort_unstable();
+            keys
+        },
+        vec!["description", "name", "parameters"],
+    );
+    // The leaf still travels beside them.
+    assert_eq!(data["leafId"], "dddddddd");
+}
+
+/// …and the FILE-only export still omits both keys, because that is what pi's `exportFromFile`
+/// produces: `systemPrompt: undefined, tools: undefined` (`core/export-html/index.ts:298-304`
+/// @v0.84.4), which `JSON.stringify` drops. `cyrup --export` has no live session to read them from.
+#[test]
+fn the_file_only_export_omits_both_agent_keys_the_way_pi_does() {
+    let data = session_data(&session_jsonl_to_html(FIXTURE));
+    let obj = data.as_object().expect("payload is an object");
+    assert!(
+        !obj.contains_key("systemPrompt"),
+        "`exportFromFile` sets it `undefined`, and `JSON.stringify` omits an undefined value"
+    );
+    assert!(!obj.contains_key("tools"));
+    // `renderedTools` is never set on either path (the documented low residual).
+    assert!(!obj.contains_key("renderedTools"));
+}
+
+/// A live session whose tool set is EMPTY still sends `tools: []`, not nothing: pi's `state.tools`
+/// is a required array (`packages/agent/src/types.ts:341-342` @v0.84.4), so `state?.tools?.map(...)`
+/// yields `[]`. `template.js:1425`'s `tools && tools.length > 0` renders the two cases identically,
+/// but the payload is what this seam owes upstream.
+#[test]
+fn an_empty_live_tool_set_is_an_empty_array_not_an_absent_key() {
+    let data = session_data(&session_jsonl_to_html_with_theme(
+        FIXTURE,
+        &ExportTheme::default(),
+        &ExportState::live(None, String::new(), Vec::new()),
+    ));
+    assert_eq!(data["tools"], serde_json::json!([]));
+    assert_eq!(data["systemPrompt"], "");
 }
 
 /// Base64 is why nothing on this path is HTML-escaped (`index.ts:159-160`): no transcript byte can
@@ -336,8 +456,8 @@ fn palette_comes_from_the_active_theme_not_a_constant() {
     let light = ExportTheme::from_theme(&builtin(cyrup_resources::BUILTIN_LIGHT_JSON));
     assert_ne!(dark, light, "the two built-ins are different palettes");
 
-    let dark_html = session_jsonl_to_html_with_theme(FIXTURE, &dark, None);
-    let light_html = session_jsonl_to_html_with_theme(FIXTURE, &light, None);
+    let dark_html = session_jsonl_to_html_with_theme(FIXTURE, &dark, &ExportState::from_file());
+    let light_html = session_jsonl_to_html_with_theme(FIXTURE, &light, &ExportState::from_file());
 
     // The explicit `export` blocks of the two built-ins (`cyrup-resources/src/theme.rs:602-606`,
     // `:689-693`), which pi prefers over the derived triple (`index.ts:155-157`).

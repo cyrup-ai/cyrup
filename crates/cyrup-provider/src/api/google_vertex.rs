@@ -189,7 +189,13 @@ impl ApiImpl for GoogleVertexApi {
             Err(e) => fail!(ProviderError::from(e)),
         };
         let body = crate::stream::apply_on_payload(opts, model, params).await;
-        let headers = build_headers(model, opts, api_key, bearer.as_deref());
+        // PROV-042: `transformHeaders` runs LAST over the fully-assembled set (pi
+        // `models.ts:657` @v0.84.4); its return value is what goes on the wire.
+        let headers = crate::stream::apply_transform_headers(
+            opts,
+            build_headers(model, opts, api_key, bearer.as_deref()),
+        )
+        .await;
         let req = SseRequest {
             method: reqwest::Method::POST,
             url,

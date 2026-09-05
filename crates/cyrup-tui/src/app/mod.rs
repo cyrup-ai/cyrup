@@ -197,7 +197,7 @@ use crate::status_indicator::{IndicatorKind, SPINNER_INTERVAL, StatusIndicator, 
 use crate::stray_reply::StrayReplyFilter;
 use crate::terminal_title::session_terminal_title;
 use crate::text_input::TextInputSelector;
-use crate::theme::{ColorMode, ThemeController, UiTheme};
+use crate::theme::{ColorMode, ThemeApply, ThemeController, UiTheme};
 use crate::transcript::{TranscriptView, content_text, entry_lines, thinking_text};
 use crate::tree_selector::{TreeKind, TreeNode, TreeSelector};
 

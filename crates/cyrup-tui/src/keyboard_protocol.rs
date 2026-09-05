@@ -71,6 +71,17 @@
 //!   `KeyEvent { code: Char('à'), modifiers: NONE, kind: Press, state: NONE }` values
 //!   (`parse.rs:540-568` vs `:118-135`). At the event level the guard degenerates to "drop the
 //!   second of two identical printable presses", which would eat the second `l` of `hello`.
+//!
+//!   **Measured, not only read (2026-09-05).** crossterm 0.29's real `event::read()`, driven
+//!   through a pty: `\x1b[224u` followed by the UTF-8 bytes of `à` (pi's
+//!   `packages/tui/test/stdin-buffer.test.ts:284-287` @v0.84.4) — in one write, and again split
+//!   across two writes 350 ms apart, the shape of pi's cross-chunk case (`:289-293`) — yields two
+//!   `Char('à') / NONE / Press / NONE` events both times, and a bare `ll` yields two
+//!   `Char('l') / NONE / Press / NONE` events of exactly the same shape. The duplicate and the
+//!   ordinary double letter are the same bytes at this seam. The two cases pi's guard must NOT fire
+//!   on already behave correctly here with no guard at all: `\x1b[97u` + `b` gives `Char('a')` then
+//!   `Char('b')` (`:295-298`), and `\x1b[64;3u` + `@` gives `Char('@') + ALT` then
+//!   `Char('@') + NONE` (`:300-303`), distinguishable by codepoint and by modifier respectively.
 //! * Guard two, Pi's WezTerm split (`stdin-buffer.ts:207-232`), emits a lone `ESC` and restarts
 //!   when `\x1b\x1b` is followed by `[`/`]`/`O`/`P`/`_` — the shape WezTerm produces for the Escape
 //!   key once event types are reported (a raw `\x1b` press plus a `CSI 27 ; … : 3 u` release).
@@ -132,6 +143,27 @@ use ratatui::crossterm::execute;
 /// negotiated state [`current`] reports.
 pub const DESIRED_FLAGS: KeyboardEnhancementFlags =
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES;
+
+/// Pi's own flag set, as crossterm bitflags — `DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS = 7`
+/// (`pi/packages/tui/src/terminal.ts:15` @v0.84.4), i.e. `DISAMBIGUATE_ESCAPE_CODES |
+/// REPORT_EVENT_TYPES | REPORT_ALTERNATE_KEYS`, wire form `CSI > 7 u`.
+///
+/// Here so the delta is a SUBTRACTION the compiler performs ([`WITHHELD_FLAGS`]) rather than a
+/// sentence each call site restates. `TUI-046`'s bit-4 revert changed the withheld set once
+/// already and the restatement at [`crate::App::into_stdout`]'s push site did not follow it,
+/// leaving that site describing `CSI > 5 u` for a full day — the same class of defect as the
+/// `CSI > 7 u` module doc the item was originally filed against.
+pub const PI_DESIRED_FLAGS: KeyboardEnhancementFlags =
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        .union(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+        .union(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS);
+
+/// The bits of [`PI_DESIRED_FLAGS`] cyrup deliberately does not ask for: `REPORT_EVENT_TYPES` and
+/// `REPORT_ALTERNATE_KEYS`, both argued as `[CYRUP-DELTA]`s in this module's docs (`TUI-046`).
+///
+/// Derived from the two constants above, never written out, so it cannot disagree with what
+/// [`push_flags`] puts on the wire.
+pub const WITHHELD_FLAGS: KeyboardEnhancementFlags = PI_DESIRED_FLAGS.difference(DESIRED_FLAGS);
 
 /// Write the `CSI > <flags> u` push — the first third of Pi's `KITTY_KEYBOARD_PROTOCOL_QUERY`
 /// (`terminal.ts:17`), which Pi re-writes on every `start()`: `:193` calls
@@ -346,6 +378,64 @@ mod tests {
              and clears SHIFT, which defeats every shift chord this TUI binds"
         );
         assert!(!DESIRED_FLAGS.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
+    }
+
+    /// `TUI-046` — the withheld set is a SUBTRACTION, not a sentence.
+    ///
+    /// Pi asks for 7 (`DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS`, `terminal.ts:15` @v0.84.4); cyrup
+    /// asks for 1; [`WITHHELD_FLAGS`] is whatever is left, so the delta cannot be misquoted by a
+    /// later change to either end. Red before this change in the strongest sense — neither
+    /// constant existed, and the one prose restatement of the delta that did exist
+    /// ([`crate::App::into_stdout`]'s push-site comment) was wrong, still naming a one-bit
+    /// withheld set a day after the bit-4 revert made it two.
+    #[test]
+    fn the_withheld_set_is_exactly_pis_flags_minus_cyrups() {
+        assert_eq!(PI_DESIRED_FLAGS.bits(), 7, "pi terminal.ts:15 @v0.84.4");
+        assert_eq!(
+            DESIRED_FLAGS.union(WITHHELD_FLAGS),
+            PI_DESIRED_FLAGS,
+            "asked-for plus withheld must reconstruct pi's set exactly"
+        );
+        assert!(
+            DESIRED_FLAGS.intersection(WITHHELD_FLAGS).is_empty(),
+            "a bit cannot be both asked for and withheld"
+        );
+        assert_eq!(
+            WITHHELD_FLAGS,
+            KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                .union(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS),
+            "bits 2 and 4, both argued in this module's [CYRUP-DELTA] block"
+        );
+    }
+
+    /// `TUI-046` — the push site names the constants and never restates the flag set.
+    ///
+    /// The item was filed because [`crate::keyboard_protocol`]'s own module doc described a flag
+    /// set (`CSI > 7 u`) the caller did not push. The 2026-09-04 fix single-sourced the value but
+    /// left the caller's comment restating the delta in prose, and the 2026-09-05 bit-4 revert
+    /// widened the withheld set without updating it — so `App::into_stdout` documented `CSI > 5 u`
+    /// while pushing `CSI > 1 u`. Two occurrences of the same defect in the same file is enough to
+    /// make it a rule: the push site refers to [`DESIRED_FLAGS`], [`PI_DESIRED_FLAGS`] and
+    /// [`WITHHELD_FLAGS`], and spells no individual bit out.
+    ///
+    /// RED before this change — `app/crossterm.rs` contained `REPORT_EVENT_TYPES`.
+    #[test]
+    fn the_push_site_does_not_restate_the_flag_set_it_pushes() {
+        const PUSH_SITE_SRC: &str = include_str!("app/crossterm.rs");
+        for bit in [
+            "DISAMBIGUATE_ESCAPE_CODES",
+            "REPORT_EVENT_TYPES",
+            "REPORT_ALTERNATE_KEYS",
+            "REPORT_ALL_KEYS_AS_ESCAPE_CODES",
+        ] {
+            assert!(
+                !PUSH_SITE_SRC.contains(bit),
+                "app/crossterm.rs names the individual flag `{bit}`; say `DESIRED_FLAGS` / \
+                 `WITHHELD_FLAGS` instead so the delta cannot drift from what push_flags writes"
+            );
+        }
+        assert!(PUSH_SITE_SRC.contains("DESIRED_FLAGS"));
+        assert!(PUSH_SITE_SRC.contains("WITHHELD_FLAGS"));
     }
 
     /// Why bit 4 is withheld, as an executable argument rather than a paragraph.

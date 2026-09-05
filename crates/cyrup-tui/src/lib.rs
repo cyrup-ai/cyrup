@@ -169,6 +169,7 @@ pub use image::{
 pub use keyboard_protocol::{
     DESIRED_FLAGS as KITTY_DESIRED_FLAGS, KITTY_FLAGS_QUERY, KeyboardProtocol,
     MODIFY_OTHER_KEYS_DISABLE, MODIFY_OTHER_KEYS_ENABLE, NEGOTIATION_TIMEOUT, NegotiationSequence,
+    PI_DESIRED_FLAGS as PI_KITTY_DESIRED_FLAGS, WITHHELD_FLAGS as KITTY_WITHHELD_FLAGS,
     current as keyboard_protocol, decide as decide_keyboard_protocol, find_kitty_flags,
     is_negotiation_prefix, negotiate as negotiate_keyboard_protocol, parse_negotiation_sequence,
     push_flags as push_kitty_flags, set_current as set_keyboard_protocol,
@@ -237,7 +238,7 @@ pub use terminal_title::{APP_TITLE, session_terminal_title};
 pub use text_input::{Input, InputOutcome, TextInputSelector};
 pub use theme::{
     BackgroundTheme, ColorMode, DetectionConfidence, TerminalTheme, TerminalThemeDetection,
-    TerminalThemeSource, ThemeController, ThinkingTheme, UiTheme, color_of,
+    TerminalThemeSource, ThemeApply, ThemeController, ThinkingTheme, UiTheme, color_of,
     detect_terminal_background_from_env, detect_terminal_background_theme,
     detect_terminal_theme_for_auto, rgb_to_256, theme_for_rgb,
 };

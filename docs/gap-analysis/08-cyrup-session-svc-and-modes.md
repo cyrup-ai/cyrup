@@ -221,6 +221,18 @@ This is the **complete** open set for area 08 — one table, deliberately. The `
 2026-08-12 pass starting its new ids at `SEAM-047`. See the repair-pass note in the header block for
 the check that establishes it. Do not "recover" them.
 
+> ### RECOUNTED 2026-09-05 (`SEAM-118` closed — authoritative over every block below)
+>
+> **Counted set: 0 critical, 0 high, 0 medium, 3 low = 3 open**, over **75 rows: 72 closed, 3 open**
+> (`python3 scripts/count_open_items.py`, area 08 row). `SEAM-058` remains under `## Trackers` and is
+> not counted. Two things moved since the block below, both after it was written: `SEAM-118` was
+> FILED low by the batch-3 ledger pass on 2026-09-05 (7 → 8, and the four mediums had already closed
+> to 4 open by then), and it is CLOSED here at `e2e51870`. **The area's whole open set is now three
+> low rows**, verified by re-running the script's own parser over this file rather than by reading
+> the table by eye: `SEAM-020` (the `--help` half only — its `--list-models` half is done),
+> `SEAM-073` (half (b); half (a) is area 05's `FileLock`) and `SEAM-057` (residual only, and that
+> residual is an owner decision, not an implementation).
+>
 > ### RECOUNTED 2026-09-04, second pass (`SEAM-113` closed — authoritative over every block below)
 >
 > **Counted set: 0 critical, 0 high, 4 medium, 3 low = 7 open.** The table now carries **74 rows: 67
@@ -438,7 +450,7 @@ the check that establishes it. Do not "recover" them.
 | ~~SEAM-012~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | M | `session_before_switch` carries no reason, `session_before_fork` no position — **CLOSED 2026-08-14**: sweep 1 — the WIT half arrived from area 06 mid-pass and the emit half is populated; the body saying both hooks are lossy is superseded. |
 | ~~SEAM-014~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | S | RPC verb `get_available_thinking_levels` not implemented — **CLOSED 2026-08-14**: sweep 1. |
 | ~~SEAM-015~~ | ~~medium~~ **CLOSED 2026-09-04** | not-ported | M | **CLOSED 2026-09-04 at `abb8b5e3`** (`feat(session-svc): SEAM-015 fill BashOptions::operations from the winning user_bash result`): `execute_bash_with_user_event` (`crates/cyrup-session-svc/src/session/bash.rs:195-219`) now reduces the `user_bash` result to a `UserBashOutcome` (`:41-62`) and, on the `Backend` arm, writes the extension's backend into `BashOptions::operations` before falling through to `execute_bash` — upstream's `operations: eventResult?.operations` (`modes/rpc/rpc-mode.ts:581`, `modes/interactive/interactive-mode.ts:6524` @v0.84.4), written once in the shared wrapper because BOTH cyrup front-ends emit through it. The callable is fetched from the extension that WON the reduction: `Reduced::Handled` now carries `by` (`crates/cyrup-ext/src/contract.rs:242-254`, mirroring `Blocked` at `:236-240`), `ExtensionHost::user_bash_operations` (`crates/cyrup-ext/src/facade.rs::user_bash_operations`) asks that extension's new `NativeExtension::user_bash_operations` (`crates/cyrup-ext/src/native.rs::user_bash_operations`) with panic containment. Pinned by five tests — `crates/cyrup-session-svc/src/tests/round9_l5res.rs` `execute_bash_with_user_event_fills_operations_from_the_winning_user_bash_handler`, `a_user_bash_result_override_wins_over_the_same_handlers_operations_backend`, `user_bash_operations_come_from_the_handler_that_won_not_a_later_extension` and `a_caller_supplied_operations_backend_is_not_clobbered_by_the_user_bash_handler` — and the end-to-end wire proof `crates/cyrup-modes/src/tests/modes/rpc_bash.rs::rpc_bash_runs_on_an_extension_supplied_operations_backend`. Each was shown RED by a targeted mutation (drop the fill; ask for `operations` before checking `result`; resolve the backend from any native instead of `by`; write the fill as `options.operations = Some(ops)`) and GREEN at HEAD. **The fourth of those landed 2026-09-05 in the review pass** — the detail block below had claimed the no-clobber invariant was covered at closure and it was not, since the only caller-supplied-backend test at the time built a session with no extension and so never reached the `Backend` arm. **Residual (recorded, not a reopen):** only a NATIVE extension can supply the backend — ADR-0002 keeps extension I/O value-typed, so a WASM guest can put the `operations` KEY in its payload but not a callable behind it; that is the `register-bash-operations` + `bash-operations-exec` WIT round-trip costed in `crates/cyrup-ext/src/lib.rs`'s CYRUP-DELTA register and owned by area 06 / DRIFT-004. **SUPERSEDED 2026-09-05: that residual is DISCHARGED.** `DRIFT-004` landed the guest tier at `8b688401` — `ExtensionHost::user_bash_operations` now resolves a `#[cfg(feature = "wasm-host")]` `GuestBashOperations` forwarder as well as a native object, so a WASM guest CAN supply the backend a `user_bash` command runs through. It read as open only because `DRIFT-004` landed after this row was written. **Falsification:** a `user_bash` handler supplying a backend whose command still runs on the local shell, a `result` override that consults the backend, or a backend taken from an extension whose handler never won, reopens it. **The original row follows unchanged.** RPC bash ignores the `operations` backend override — ~~**2026-08-15, still open; NEEDS re-measured (sweep 9)**~~: the routing note said this needs *"a `BashOperations` trait in `crates/cyrup-tools` (area 04) **PLUS** an extension-capability decision in area 06"*. **The cyrup-tools half is DONE** — `pub trait BashOperations` exists at `crates/cyrup-tools/src/ops/mod.rs:462`, `BashOptions::operations: Option<Arc<dyn BashOperations>>` exists and is consumed (`run_bash` takes it, and any IN-HOST caller can supply one today, which is upstream's `options?.operations ?? createLocalBashOperations({shellPath})`, `agent-session.ts:2993` @v0.83.0). **ONE half is left and it is area 06's alone:** the `operations: None` the RPC bash arm passes is upstream's ABSENT `operations`, not a dropped one, because a WASM guest still has no way to return a callable across the WIT boundary — closing it is the `register-bash-operations` import + keyed `bash-operations-exec` export round-trip, whose design is written out in `crates/cyrup-ext/src/lib.rs`'s CYRUP-DELTA register. The site is documented in-source in `crates/cyrup-modes/src/rpc.rs`'s bash arm. Sibling: DRIFT-004. **Still not schedulable against area 08.** |
-| SEAM-118 | low | parity-bug | S | **`--no-builtin-tools` leaves four built-ins active where pi starts a session with none** — filed 2026-09-05 by the batch-3 ledger pass, as `CFG-079`'s own closure asked (*"it wants its own row and its own red-before test rather than being smuggled into this closure"*, `05-cyrup-config-and-resources.md`). **upstream** `packages/coding-agent/src/core/sdk.ts:261-262` @v0.84.4 — `initialActiveToolNames = (options.tools ?? (options.noTools ? [] : (configuredDefaultToolNames ?? defaultActiveToolNames)))…`, so ANY `noTools` yields an EMPTY initial built-in set; extension and SDK tools stay on only via `_buildRuntime`'s `includeAllExtensionTools` (`core/agent-session.ts:406-410`, the branch at `:2742-2745`). **cyrup** `crates/cyrup-session-svc/src/builder.rs::select_active_tools` — the `NoTools::Builtin` arm is `!DEFAULT_BUILTIN_TOOLS.contains(name)`, which drops only pi's four (`read`/`bash`/`edit`/`write`) and leaves `grep`, `find`, `ls` and `powershell` ACTIVE. **Impact** `--no-builtin-tools` does not do what it says: four built-in tools survive the flag, including `powershell`. Low because the flag is opt-in and the survivors are read-mostly, but it is an affirmative wrong behaviour rather than an absent one. **Fix** make the arm select nothing built-in, keeping the existing `\|\| !ALL_BUILTIN_TOOLS.contains(name)` leg that is cyrup's spelling of `includeAllExtensionTools`. **Verify** a red-before test over the same stub tool set `the_default_tools_setting_replaces_pis_four_built_ins` uses: with `NoTools::Builtin`, assert the surviving set is the extension tool alone |
+| ~~SEAM-118~~ | ~~low~~ **CLOSED 2026-09-05** | parity-bug | S | **CLOSED 2026-09-05 at `e2e51870`** (`fix(session-svc): SEAM-118 --no-builtin-tools starts a session with no built-in active`): `select_active_tools`'s `NoTools::Builtin` arm is now `!ALL_BUILTIN_TOOLS.contains(&name)` (`crates/cyrup-session-svc/src/builder.rs`), so `--no-builtin-tools` / `-nbt` starts with **no** built-in active and the `\|\| !ALL_BUILTIN_TOOLS.contains(name)` extension leg — cyrup's spelling of `includeAllExtensionTools` — is untouched, exactly as the Fix line asked. **Both sides re-read at HEAD and at pi v0.84.4, not taken from this row:** the branch is on the PRESENCE of the option (`core/sdk.ts:261-262`, `options.tools ?? (options.noTools ? [] : (configuredDefaultToolNames ?? defaultActiveToolNames))`), and the two modes part company one line earlier at `:258` (`allowedToolNames = options.tools ?? (options.noTools === "all" ? [] : undefined)`) — `"all"` also forbids re-enabling, `"builtin"` leaves every built-in registered and enable-able. pi's own doc comment on the option (`:56-58`, "disable the default built-in tools (read, bash, edit, write)") is NARROWER THAN ITS CODE; the behaviour is pinned by pi's own regression test at the same tag, `test/suite/regressions/3592-no-builtin-tools-keeps-extension-tools.test.ts` — with `noTools: "builtin"` `getAllTools()` still lists all eight built-ins while `getActiveToolNames()` is exactly `["dynamic_tool"]`. That test is the port's source: `builder::tests::no_builtin_tools_leaves_only_extension_tools_active`, **RED before the commit** — the selection was `["powershell", "grep", "find", "ls", "static_tool"]` against an expected `["static_tool"]`, i.e. the row's symptom reproduced literally — and it also pins the four adjacent rules that must not move (a `defaultTools` setting cannot resurrect a built-in through this arm, `excludeTools` still applies after, `--tools` still outranks the flag, `NoTools::All` still takes the extension tool too). The `NoTools::Builtin` doc comment now records the upstream doc-vs-code divergence instead of repeating the doc string. **REVIEW FIX `7a3b1a22` (same batch, not a new row):** as first landed that comment also asserted two differences cyrup does NOT model — that under `Builtin` a built-in stays enable-able at runtime and that a built-in is "still registered and listed at all". `no_tools` is read at exactly one site in the workspace, registration through `ToolRegistry::with_builtins` is independent of the flag under both modes, and cyrup has no `allowedToolNames` and no runtime re-enable path. The comment now names the ONE difference HEAD implements (extension tools survive `Builtin`, not `All`) as the implemented one, and marks the runtime-re-enable consequence as upstream-only and as the reason the two variants are kept. **No design decision was needed** — one predicate over a set (`ALL_BUILTIN_TOOLS`) that already existed for exactly this built-in-vs-host distinction; merging the two `NoTools` modes into one "no built-ins" type was considered and rejected because they genuinely differ in `allowedToolNames`, a distinction cyrup will need when it ports runtime re-enablement. `cargo nextest run -p cyrup-session-svc` 354/354; `cargo fmt --all -- --check`, `cargo clippy -p cyrup-session-svc --all-targets -- -D warnings` and `RUSTDOCFLAGS='-D warnings' cargo doc -p cyrup-session-svc --no-deps` all clean. **Residual (one, low, NOT a new row):** the fix is pinned at `select_active_tools`, not through a live session — no process was launched with `-nbt` to watch the tool array reach a provider request and the built-in prompt snippets leave the system prompt, which is what upstream's regression test additionally asserts (`systemPrompt` contains `- dynamic_tool:` and neither `- read:` nor `- bash:`). Same shape as `CFG-079`'s residual 1. **Original filing follows.** **`--no-builtin-tools` leaves four built-ins active where pi starts a session with none** — filed 2026-09-05 by the batch-3 ledger pass, as `CFG-079`'s own closure asked (*"it wants its own row and its own red-before test rather than being smuggled into this closure"*, `05-cyrup-config-and-resources.md`). **upstream** `packages/coding-agent/src/core/sdk.ts:261-262` @v0.84.4 — `initialActiveToolNames = (options.tools ?? (options.noTools ? [] : (configuredDefaultToolNames ?? defaultActiveToolNames)))…`, so ANY `noTools` yields an EMPTY initial built-in set; extension and SDK tools stay on only via `_buildRuntime`'s `includeAllExtensionTools` (`core/agent-session.ts:406-410`, the branch at `:2742-2745`). **cyrup** `crates/cyrup-session-svc/src/builder.rs::select_active_tools` — the `NoTools::Builtin` arm is `!DEFAULT_BUILTIN_TOOLS.contains(name)`, which drops only pi's four (`read`/`bash`/`edit`/`write`) and leaves `grep`, `find`, `ls` and `powershell` ACTIVE. **Impact** `--no-builtin-tools` does not do what it says: four built-in tools survive the flag, including `powershell`. Low because the flag is opt-in and the survivors are read-mostly, but it is an affirmative wrong behaviour rather than an absent one. **Fix** make the arm select nothing built-in, keeping the existing `\|\| !ALL_BUILTIN_TOOLS.contains(name)` leg that is cyrup's spelling of `includeAllExtensionTools`. **Verify** a red-before test over the same stub tool set `the_default_tools_setting_replaces_pis_four_built_ins` uses: with `NoTools::Builtin`, assert the surviving set is the extension tool alone |
 | ~~SEAM-016~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | print-mode exit code derived by reverse-scanning the transcript — **CLOSED 2026-08-14**: sweep 1. |
 | ~~SEAM-025~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | M | Extension `session_start`/`session_shutdown` drop pi's session-file fields — **CLOSED 2026-08-14**: sweep 1 — the WIT/event widening arrived from area 06 mid-pass and the host halves (`emit_session_start`, `dispose_with`'s new target parameter, `install_inner`) are done. |
 | ~~SEAM-027~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | M | `--mode json` subscribes per-run, dropping between-prompt events — **CLOSED 2026-08-14**: sweep 1. |
@@ -2444,6 +2456,94 @@ The settings-layer precedence underneath is identical too — runtime overrides 
 **Fix** — thread the cumulative message's `usage` through to the projection: `AgentSessionEvent::MessageUpdate`'s destructure needs the outer message's usage (or a dedicated field carrying it, mirroring how pi reads `event.message.usage`) rather than discarding it via `..`; add a third `map.serialize_entry("usage", …)` in `JsonAgentSessionEvent::serialize`. For `toolcall_start`, `DeltaOnly` needs the resolved tool call (id + name) at that content index — the cumulative `partial` snapshot the event already carries before it is dropped — and a bespoke 4-key branch (`type`, `contentIndex`, `id`, `toolName`) in place of the shared `indexed()` call.
 
 **Verify** — drive a prompt through `--mode json` or RPC against a tool-using turn; assert every `message_update` line on the wire carries a `usage` object, and that the `toolcall_start` line carries `id` and `toolName` matching the tool call `toolcall_end` later reports for the same `contentIndex`. Byte-diff a `text_delta` line against the pre-fix shape plus the new `usage` key to confirm no other field regressed.
+
+## ~~SEAM-118~~ — ~~low~~ **CLOSED 2026-09-05 (`e2e51870`)** — `--no-builtin-tools` left four built-ins active where pi starts a session with none
+
+**Kind** parity-bug · **Severity** ~~low~~ closed · **Effort** S · **Confidence** confirmed · **filed 2026-09-05 (batch-3 ledger pass, as `CFG-079`'s residual 2), CLOSED 2026-09-05**
+
+> **CLOSED 2026-09-05 at `e2e51870`.** The Fix line was applied as written and nothing else moved.
+> This section records what was re-read on both sides, because the row was filed from another row's
+> residual rather than from a first-hand read.
+
+**upstream, re-read at v0.84.4** — `packages/coding-agent/src/core/sdk.ts`:
+
+```text
+:258  const allowedToolNames = options.tools ?? (options.noTools === "all" ? [] : undefined);
+:261  const initialActiveToolNames = (
+:262    options.tools ?? (options.noTools ? [] : (configuredDefaultToolNames ?? defaultActiveToolNames))
+:263  ).filter((name) => !excludedToolNameSet?.has(name));
+```
+
+`:262` branches on the **presence** of `noTools`, not on its value, so `"builtin"` yields an EMPTY
+initial built-in selection — identical to `"all"` at this line. The modes diverge at `:258`: under
+`"all"` `allowedToolNames` is `[]`, which `_refreshToolRegistry`'s `if (allowedToolNames)` branch
+(`core/agent-session.ts:2740-2745`) turns into "nothing may ever be active"; under `"builtin"` it is
+`undefined`, so the `includeAllExtensionTools` branch runs and every wrapped extension tool is pushed
+onto the active set while all eight built-ins stay REGISTERED and enable-able. `_buildRuntime` is
+called with `includeAllExtensionTools: true` at construction (`agent-session.ts:406-410`), which is
+what makes that branch the one taken.
+
+pi's own doc comment for the option is narrower than its code — `sdk.ts:56-58` says `"builtin"`
+disables "the default built-in tools (read, bash, edit, write)". Its behaviour is pinned instead by
+its own regression test at the same tag,
+`test/suite/regressions/3592-no-builtin-tools-keeps-extension-tools.test.ts`: with
+`noTools: "builtin"`, `getAllTools()` is
+`["bash","dynamic_tool","edit","find","grep","ls","powershell","read","write"]` while
+`getActiveToolNames()` is exactly `["dynamic_tool"]`, and the system prompt contains
+`- dynamic_tool: …` and neither `- read:` nor `- bash:`. Reading only the doc comment is how a port
+lands on `DEFAULT_BUILTIN_TOOLS`, which is what happened here.
+
+**cyrup before the fix** — `crates/cyrup-session-svc/src/builder.rs::select_active_tools`:
+
+```text
+(None, Some(NoTools::Builtin)) => !DEFAULT_BUILTIN_TOOLS.contains(&name),
+```
+
+`DEFAULT_BUILTIN_TOOLS` is pi's four defaults, so the flag dropped `read`/`bash`/`edit`/`write` and
+left `grep`, `find`, `ls` and `powershell` ACTIVE — four built-ins surviving a flag whose whole
+purpose is to remove them, `powershell` included. Because each tool's `prompt_snippet` /
+`prompt_guidelines` are injected via `tool_contribution`, the survivors changed both the tool array
+on every provider request and the system prompt relative to pi under the same flag.
+
+**What landed** — the arm is `!ALL_BUILTIN_TOOLS.contains(&name)`. The
+`|| !ALL_BUILTIN_TOOLS.contains(name)` leg of the no-flags arm — cyrup's spelling of
+`includeAllExtensionTools` — is untouched, which is what keeps extension/embedder tools active under
+`Builtin`; `NoTools::All`'s `false` arm is untouched, which is what keeps `"all"` stricter. The
+`NoTools::Builtin` doc comment now records the doc-vs-code divergence and names `allowedToolNames`
+as the real difference between the modes, so the next reader is not sent back to the doc string.
+
+**Design decision** — none was needed, and the commit body says so: this is one predicate over
+`ALL_BUILTIN_TOOLS`, a set that already existed for exactly the built-in-vs-host-supplied
+distinction the fix turns on. Collapsing `NoTools::All` and `NoTools::Builtin` into a single
+"no built-ins" state was considered and rejected: they differ in `allowedToolNames` (`sdk.ts:258`),
+a live distinction cyrup will need when it ports runtime re-enablement, so merging them would erase
+real information rather than make a bad state unrepresentable. Migration cost of what landed: zero —
+no signature, type or settings key changed.
+
+**Test** — `builder::tests::no_builtin_tools_leaves_only_extension_tools_active`, ported case for
+case from upstream's regression test and running over the same stub tool set as
+`the_default_tools_setting_replaces_pis_four_built_ins` (all eight built-ins plus one
+`static_tool`), exactly as this row's `Verify` line specified. **RED before the fix**, measured, not
+argued: `assertion left == right failed  left: ["powershell", "grep", "find", "ls", "static_tool"]
+right: ["static_tool"]` — the filed symptom reproduced literally, `powershell` first. It also pins
+the four adjacent rules that must not move: a `defaultTools` setting cannot resurrect a built-in
+through this arm (`noTools` short-circuits before `configuredDefaultToolNames`), `excludeTools`
+still applies afterwards, an explicit `--tools` allowlist still outranks the flag, and `NoTools::All`
+still takes the extension tool too.
+
+**Checks** — `cargo fmt --all` (then `--check` clean), `cargo clippy -p cyrup-session-svc
+--all-targets -- -D warnings` clean, `cargo nextest run -p cyrup-session-svc` 354/354,
+`RUSTDOCFLAGS='-D warnings' cargo doc -p cyrup-session-svc --no-deps` clean.
+
+**Residual (one, low; recorded, not filed as a row).** The port is pinned at `select_active_tools`,
+not through a live session: no process was launched with `-nbt` to watch the resulting tool array
+reach a provider request and the built-in prompt snippets leave the system prompt — the second half
+of what upstream's regression test asserts. Same shape as `CFG-079`'s residual 1 over the same
+function, and it does not describe a divergence, only an unobserved consequence of one.
+
+**Not in scope, deliberately.** `crates/cyrup/src/cli/help.rs:78`'s text for the flag is
+character-for-character pi's own (`src/cli/args.ts:296`), and is accurate for what now ships, so it
+was not touched — a different crate and no divergence to fix.
 
 ## Coverage
 

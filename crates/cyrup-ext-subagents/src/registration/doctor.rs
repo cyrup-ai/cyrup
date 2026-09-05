@@ -926,6 +926,11 @@ pub struct DoctorReportInput<'a> {
     /// R-SA-009's malformed-settings abort — renders `- agents/chains: failed — <msg>` instead of a
     /// fabricated zero-count success.
     pub discovered: Result<&'a AgentDiscoveryResult, &'a str>,
+    /// CFG-067 — the already-resolved `Run fan-out budget` block (pi `formatRunFanoutSection`,
+    /// `extension/doctor.ts:180-193` @v0.64.0). Resolved by the caller so this report still reads
+    /// no environment of its own; [`crate::exec::run_fanout_budget::RunFanoutDoctor::resolve`] is
+    /// the production constructor.
+    pub run_fanout: crate::exec::run_fanout_budget::RunFanoutDoctor,
 }
 
 /// Per-`AgentSource` tallies for one population (agents or chains), rendered as pi's
@@ -1147,6 +1152,15 @@ pub fn build_doctor_report(input: &DoctorReportInput) -> String {
     lines.push("Discovery".to_string());
     lines.extend(format_discovery(input.discovered));
 
+    // CFG-067 / pi `buildDoctorReport`'s `"Run fan-out budget"` block (`extension/doctor.ts:257`
+    // @v0.64.0). Upstream puts a `"Spawn budget"` block between Discovery and this one; that
+    // section is not rendered here yet (the per-SESSION budget itself is ported —
+    // `crate::exec::spawn_budget` — only its doctor surface is not), so this block follows
+    // Discovery directly rather than being reordered.
+    lines.push(String::new());
+    lines.push("Run fan-out budget".to_string());
+    lines.extend(input.run_fanout.lines());
+
     lines.join("\n")
 }
 
@@ -1155,6 +1169,16 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
     use super::*;
+    use crate::exec::run_fanout_budget::{MaxSpawnsPerRunSource, RunFanoutDoctor};
+
+    /// The `Run fan-out budget` block a process with no inherited ledger and no configured limit
+    /// resolves to — stated as a literal so these reports never read the ambient environment.
+    fn run_fanout_default() -> RunFanoutDoctor {
+        RunFanoutDoctor::Configured {
+            limit: 64,
+            source: MaxSpawnsPerRunSource::Default,
+        }
+    }
 
     // -----------------------------------------------------------------------------------------
     // Test helpers
@@ -1900,9 +1924,38 @@ mod tests {
             results_dir: results.clone(),
             chain_runs_dir: chain_runs.clone(),
             discovered: Ok(&discovered),
+            run_fanout: run_fanout_default(),
         };
 
         let report = build_doctor_report(&input);
+
+        // CFG-067 — the `Run fan-out budget` block, pi `buildDoctorReport`'s own header
+        // (`extension/doctor.ts:257` @v0.64.0), with its three lines plus cyrup's enforcement
+        // disclosure.
+        assert!(report.contains("\nRun fan-out budget\n"), "{report}");
+        assert!(
+            report.contains("\n- configured limit: 64 (default)\n"),
+            "{report}"
+        );
+        assert!(
+            report.contains("\n- usage: available after a run starts\n"),
+            "{report}"
+        );
+        // The operator must not read a cap nothing applies as a cap that applies (batch-4 review).
+        assert!(
+            report.contains(
+                "\n- enforcement: NOT WIRED — no run creates or claims against this budget yet, \
+                 so the limit above is reported but not applied\n"
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains(
+                "- reset boundary: cumulative claims are never released; a new top-level run \
+                 creates a new budget"
+            ),
+            "{report}"
+        );
 
         // Header + the three mandated sections.
         assert!(report.starts_with("Subagents doctor report\n"), "{report}");
@@ -1973,6 +2026,7 @@ mod tests {
             results_dir: PathBuf::from("/tmp/subagents/results"),
             chain_runs_dir: PathBuf::from("/tmp/subagents/chain-runs"),
             discovered: Ok(&discovered),
+            run_fanout: run_fanout_default(),
         };
 
         let report = build_doctor_report(&input);
@@ -2016,6 +2070,7 @@ mod tests {
             results_dir: PathBuf::from("/tmp/subagents/results"),
             chain_runs_dir: PathBuf::from("/tmp/subagents/chain-runs"),
             discovered: Err("malformed subagents settings: agentOverrides must be an object"),
+            run_fanout: run_fanout_default(),
         };
 
         let report = build_doctor_report(&input);
@@ -2073,6 +2128,7 @@ mod tests {
             results_dir: results,
             chain_runs_dir: chain_runs,
             discovered: Ok(&discovered),
+            run_fanout: run_fanout_default(),
         };
 
         let report = build_doctor_report(&input);

@@ -76,6 +76,8 @@ pub mod external_cli;
 /// The live per-attempt progress fold (R-SA-027/028): [`AgentProgress`], [`ProgressSnapshotInput`].
 pub mod progress;
 
+pub mod run_fanout_budget;
+
 /// The output contract of one [`run_sync`] call: [`SingleResult`] (arch-SA §3.4's output-contract
 /// half; [`agent_config`] is the input-contract half).
 pub mod run_result;

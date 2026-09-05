@@ -73,6 +73,9 @@ fn the_env_help_block_and_the_read_set_are_the_same_set() {
         ("xiaomi-token-plan-cn", "XIAOMI_TOKEN_PLAN_CN_API_KEY"),
         ("xiaomi-token-plan-ams", "XIAOMI_TOKEN_PLAN_AMS_API_KEY"),
         ("xiaomi-token-plan-sgp", "XIAOMI_TOKEN_PLAN_SGP_API_KEY"),
+        // DRIFT-009: pi's block carries this row too (`args.ts:406` @v0.84.4), between
+        // TOGETHER_API_KEY and OPENROUTER_API_KEY, which is where cyrup's now sits.
+        ("baseten", "BASETEN_API_KEY"),
     ] {
         assert!(
             cyrup_provider::env_api_keys::api_key_env_vars(provider)

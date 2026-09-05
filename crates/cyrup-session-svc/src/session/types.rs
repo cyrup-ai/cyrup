@@ -141,11 +141,15 @@ pub enum CompactionCostKind {
 /// One item of a replayable conversation — the raw-context message stream plus the two derived
 /// notices a front-end cannot reconstruct from the messages alone.
 ///
-/// This is pi's `RenderSessionItem` (`interactive-mode.ts:217`), minus its `custom` entry variant
-/// (cyrup's raw projection already carries custom messages as
-/// [`cyrup_session::agent_message::AgentMessage::Custom`]) and with the cache-miss notice
-/// materialised as an item instead of being looked up by `AssistantMessage` object identity during
-/// the walk (`:3694-3696`, `:3753-3755`).
+/// This is pi's `RenderSessionItem` (`interactive-mode.ts:216` @v0.84.4) — the same three-way
+/// union: an `AgentMessage`, a `custom` ENTRY, or the synthesised compaction-cost notice — with the
+/// cache-miss notice materialised as an item as well, instead of being looked up by
+/// `AssistantMessage` object identity during the walk (`:3707-3709`, `:3766-3768`).
+///
+/// Note that a `custom` ENTRY is not a custom MESSAGE: the latter is a `custom_message` entry that
+/// projects [`cyrup_session::agent_message::AgentMessage::Custom`] and rides the `Message` variant,
+/// the former projects no message at all and is replayed for its registered ENTRY renderer alone
+/// (EXT-041).
 ///
 /// The derivation has to live here, not in the front-end, because it bridges two index spaces the
 /// front-end never sees at once: [`cyrup_provider::cache_stats::collect_cache_misses`] keys misses
@@ -167,6 +171,19 @@ pub enum ReplayItem {
         kind: CompactionCostKind,
         usage: cyrup_core::Usage,
     },
+    /// A `custom` ENTRY on the replayed branch, serialized exactly as
+    /// [`crate::AgentSessionEvent::EntryAppended`] carries it live — pi's
+    /// `Extract<SessionEntry, { type: "custom" }>` arm of `RenderSessionItem`, admitted by
+    /// `renderSessionEntries` with `if (entry.type === "custom") return [entry];`
+    /// (`interactive-mode.ts:3799-3801` @v0.84.4) and dispatched to `addCustomEntryToChat`
+    /// (`:3717-3719`, body `:3570-3590`).
+    ///
+    /// The whole entry travels because that is what an entry renderer is handed — pi builds
+    /// `new CustomEntryComponent(entry, renderer)` from it (`:3575`) after keying the renderer
+    /// lookup on `entry.customType` (`:3571`) — and because sending the SAME JSON the live
+    /// `entry_appended` event sends keeps the front-end's live and replay arms one arm
+    /// (EXT-041).
+    CustomEntry(serde_json::Value),
 }
 
 /// A scoped model in the `cycle_model` set (Pi `{model, thinkingLevel?}`, agent-session.ts:870). An

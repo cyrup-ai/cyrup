@@ -95,6 +95,17 @@ pub struct SubagentExtensionConfig {
     /// Cap on the total number of subagent spawns permitted within one orchestrator session,
     /// across every run mode. Default 40 (func-SA §4.7).
     pub max_subagent_spawns_per_session: u32,
+    /// CFG-067 — pi `ExtensionConfig.maxSubagentSpawnsPerRun?` (`shared/types.ts:2550` @v0.64.0):
+    /// the cap on subagent spawns within ONE RUN's whole subtree, the middle rung of
+    /// [`crate::exec::run_fanout_budget::resolve_max_spawns_per_run`]'s
+    /// `env -> config -> default(64)` ladder.
+    ///
+    /// `None` (the key absent) is NOT "unlimited" — it falls through to the next rung, exactly as
+    /// pi's `normalizeMaxSubagentSpawnsPerRun` drops any value that is not `> 0`. This is the
+    /// opposite of the per-SESSION sibling above, where `0` DOES mean unlimited; the asymmetry is
+    /// upstream's and is documented at both resolvers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_subagent_spawns_per_run: Option<u32>,
     /// Top-level parallel fan-out limits, as a NESTED object matching pi's
     /// `ExtensionConfig.parallel?: { maxTasks?, concurrency? }` (shared/types.ts:1715-1718/1771) — NOT two
     /// flat `parallelMaxTasks`/`parallelConcurrency` keys. Read via the [`Self::parallel_max_tasks`]
@@ -442,6 +453,9 @@ impl Default for SubagentExtensionConfig {
             force_top_level_async: false,
             global_concurrency_limit: 20,
             max_subagent_spawns_per_session: 40,
+            // Absent, not `Some(64)`: the default belongs to the resolver's last rung, so a
+            // config that never mentions the key cannot be told apart from one that pins 64 here.
+            max_subagent_spawns_per_run: None,
             parallel: None,
             control: None,
             chain: None,

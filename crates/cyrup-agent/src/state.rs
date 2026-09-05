@@ -2,7 +2,9 @@
 
 use crate::event::{AgentEvent, AgentMessage};
 use cyrup_core::{ModelRef, ModelThinkingLevel, Tool, ToolCallId};
-use cyrup_provider::{CacheRetention, OnPayload, OnResponseHook, ThinkingBudgets, Transport};
+use cyrup_provider::{
+    CacheRetention, OnPayload, OnResponseHook, ThinkingBudgets, TransformHeadersFn, Transport,
+};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -61,6 +63,15 @@ pub struct GenerationConfig {
     /// Telemetry: invoked after the HTTP response arrives, before its body is read (Pi `onResponse`,
     /// agent.ts:103).
     pub on_response: Option<OnResponseHook>,
+    /// PROV-042 — the outbound-header transform forwarded into
+    /// `cyrup_provider::StreamOptions::transform_headers` (pi `ModelsStreamTransforms.transformHeaders`,
+    /// `packages/ai/src/models.ts:80` @v0.84.4).
+    ///
+    /// pi installs it in its session `streamFn` (`coding-agent/src/core/sdk.ts:330-339`), which is
+    /// the layer cyrup's `AgentBuilder` occupies: the agent is what owns the `StreamOptions` the
+    /// loop dispatches with, so without a slot here there was no path from an embedder to the
+    /// provider field at all and `before_provider_headers` had no producer.
+    pub transform_headers: Option<TransformHeadersFn>,
     /// Provider-scoped env overlay forwarded into `cyrup_provider::StreamOptions.env` (Pi
     /// `StreamOptions.env`, types.ts:184). The session builder seeds it with the `httpProxy` setting
     /// (`HTTP_PROXY`/`HTTPS_PROXY`) so the provider's proxy resolver honors the configured proxy (Pi

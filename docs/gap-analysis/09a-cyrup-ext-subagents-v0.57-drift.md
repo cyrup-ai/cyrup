@@ -93,7 +93,7 @@ corrections are applied and recorded at the item.
 |---|---|---|---|---|
 | ~~SUBA-072~~ | ~~critical~~ **CLOSED 2026-09-04** | M | foreground exec / tool allowlisting | Capability ceiling's `allowedTools` and `denyExtensions` axes are resolved and propagated but never applied to the child |
 | ~~SUBA-073~~ | ~~medium~~ **CLOSED 2026-09-04** | M | config / permissions / frontmatter | Subagent permission policy never reaches a spawned child; `permission:` frontmatter is accepted and inert |
-| ~~SUBA-074~~ | ~~high~~ **CLOSED 2026-09-04** | L | external runners / agent schema | Stage 1 (refusal) closed at `bf8b0f9`; **stage 2 ported at `af1a8a76`** — the capability/status contract, the hardened external-CLI runner, the generic no-adapter path (upstream's in-baseline `v0.43.0` half) and the `claude-code`/`claude-code-writer` adapter. A declared external profile now RUNS as the foreign process and resolves no model; `codex-exec`, `cursor-agent` and the whole `external-job` protocol stay refused by name through the new exhaustive `RunnerDispatch`. **Review fix `95a55ea1` (2026-09-05):** the process runner wrote the prompt to the child's stdin BEFORE the stdout/stderr pumps existed and before the select loop that owns the deadline and the stop token — a prompt over the 64 KiB pipe buffer against a child that writes before it reads DEADLOCKED with no verb able to recover it (upstream registers both `data` handlers at `external-cli-runner.ts:350-360` and calls `child.stdin.end` only at `:364`); also fixed in the same pass: the acceptance contract now reaches the foreign process (upstream appends it at `subagent-runner.ts:1462-1465`, ABOVE the `external-cli` branch at `:1491`), R-SA-025 is validated ahead of the dispatch, a JSONL protocol violation tears the process down (`:267-272`), a preflight failure publishes its process receipt (`:212-213`), `capabilities` persists in upstream's `{key:false}` object shape on the hop-2 wire, and `validate_code_owned_profile_runner` sweeps the reserved rows in upstream's order (`external-cli-contract.ts:42-46`). The stage-2 test count below was understated: the net is **59**, not 34. **Ledger pass 2026-09-05 — CLOSED, plainly: this was the ledger's last row above `medium`, and with it struck the above-medium open set is empty across all thirteen area files** (`scripts/count_open_items.py`). The design decision (`RunnerDispatch` replacing the stage-1 `Option` gate) and its rejected alternatives are written out in the section below. **One review finding against this item's own code is NOT fixed and is filed as `SUBA-095` (medium)** rather than reopening a closed row: `exec/external_cli/run.rs`'s select loop still has a post-loop unguarded `child.wait()` and a `biased` starvation path, either of which puts a run outside the reach of its deadline and stop arms |
+| ~~SUBA-074~~ | ~~high~~ **CLOSED 2026-09-04** | L | external runners / agent schema | Stage 1 (refusal) closed at `bf8b0f9`; **stage 2 ported at `af1a8a76`** — the capability/status contract, the hardened external-CLI runner, the generic no-adapter path (upstream's in-baseline `v0.43.0` half) and the `claude-code`/`claude-code-writer` adapter. A declared external profile now RUNS as the foreign process and resolves no model; `codex-exec`, `cursor-agent` and the whole `external-job` protocol stay refused by name through the new exhaustive `RunnerDispatch`. **Review fix `95a55ea1` (2026-09-05):** the process runner wrote the prompt to the child's stdin BEFORE the stdout/stderr pumps existed and before the select loop that owns the deadline and the stop token — a prompt over the 64 KiB pipe buffer against a child that writes before it reads DEADLOCKED with no verb able to recover it (upstream registers both `data` handlers at `external-cli-runner.ts:350-360` and calls `child.stdin.end` only at `:364`); also fixed in the same pass: the acceptance contract now reaches the foreign process (upstream appends it at `subagent-runner.ts:1462-1465`, ABOVE the `external-cli` branch at `:1491`), R-SA-025 is validated ahead of the dispatch, a JSONL protocol violation tears the process down (`:267-272`), a preflight failure publishes its process receipt (`:212-213`), `capabilities` persists in upstream's `{key:false}` object shape on the hop-2 wire, and `validate_code_owned_profile_runner` sweeps the reserved rows in upstream's order (`external-cli-contract.ts:42-46`). The stage-2 test count below was understated: the net is **59**, not 34. **Ledger pass 2026-09-05 — CLOSED, plainly: this was the ledger's last row above `medium`, and with it struck the above-medium open set is empty across all thirteen area files** (`scripts/count_open_items.py`). The design decision (`RunnerDispatch` replacing the stage-1 `Option` gate) and its rejected alternatives are written out in the section below. **One review finding against this item's own code was filed as `SUBA-095` (medium)** rather than reopening a closed row — `exec/external_cli/run.rs`'s select loop had a post-loop unguarded `child.wait()` and a `biased` starvation path, either of which put a run outside the reach of its deadline and stop arms; **that row is itself CLOSED at `1f718391` (2026-09-05)**, fixed rather than carried |
 | ~~SUBA-075~~ | ~~high~~ **CLOSED 2026-09-04** | M | fork context / thinking | Forked child sessions are not sanitized: signed/redacted Anthropic thinking blocks inherited, no thinking-off override |
 | ~~SUBA-076~~ | ~~high~~ **CLOSED 2026-09-04** | S | acceptance / evidence scoring | Evidence checks are scored binary where upstream is tri-state, producing two spurious acceptance rejections |
 | ~~SUBA-077~~ | ~~high~~ **CLOSED 2026-09-04** | S | foreground exec / deadlines | A foreground run with no explicit timeout has NO wall-clock deadline, and there is no global `timeoutMs` |
@@ -113,7 +113,7 @@ corrections are applied and recorded at the item.
 | ~~SUBA-092~~ | ~~high~~ **CLOSED 2026-09-04** | M | discovery / agent schema | `excludeTools:`/`allowNestedSubagents:` ported at `247ff97b` — frontmatter, settings-override, serializer, and the spawn-plan tool subtraction / nested-fanout grant. v0.64.0's cross-field custom-override precedence change (`31562d76`) is a recorded residual, not this row |
 | ~~SUBA-093~~ | ~~medium~~ **CLOSED 2026-09-04** | M | background status model / child-scoped stop | `SUBA-087`'s residual, filed as its own item 2026-09-04 **and ported at `07f2df0d`**: `background/flat_index.rs` is pi's declaration-time flatten, so a `ParallelGroup` publishes one `RunStatus::steps` entry PER MEMBER named by its own agent; `ChainRunContext::step_slot` (`StepSlot::{Exclusive,Shared}`) carries pi's per-member `ctx.flatIndex` through the telemetry fold, `child_index`, the steer paths, the artifact index and the per-child stop handle, which `ExecSingleStepExecutor::run_single` now registers per DISPATCH. `subagent({action:"stop", id, childId:"step:1"})` against a 3-task fan-out stops member 1 alone. Residuals (low): a `DynamicGroup` keeps one shared slot (upstream's runtime splice, `:4155`, is not ported); group members go `Running` at group dispatch rather than per worker claim. **Review fix `95a55ea1` (2026-09-05):** `record_step_outcome` now guards an EMPTY flat range (a zero-width `ParallelGroup`'s `slots.start` is the NEXT step's entry — believed unreachable, now pinned); `run_single`'s `clear_active` became an `ActiveStopGuard` drop guard, so a member whose future is DROPPED (fail-fast / cancellation inside `run_bounded`) no longer leaks a dead token under a live flat index; `step_display_agent`'s doc no longer points at `pending_step_status_for`, which this item deleted. Citation drift corrected in the detail section: the per-member `flatIndex: fi` lines are `:4254`/`:4653` and the sequential spread is `:5015-5020`, not `:4245`/`:4640`/`:5017` |
 | ~~SUBA-094~~ | ~~medium~~ **CLOSED 2026-09-04** | M | completion notify / session-svc inject seam | `SUBA-090`'s residual, filed as its own item 2026-09-04 **and ported at `f9de9fe7`** (fix site `crates/cyrup-agent` + `crates/cyrup-session-svc` + `crates/cyrup-tui`, areas 03/08/07): `AgentMessage::Custom` carries a REQUIRED `display: bool`, so `send_custom_message`/`inject_message`/the guest `sendMessage` bridge put it ON the message the way pi's one `appMessage` does (`agent-session.ts:1483-1516` @v0.84.4) and all five delivery arms keep it; `subscriber.rs`'s run-loop append reads it where it hardcoded `true`, `raw_message_to_agent` restores it from the persisted entry, and the TUI's extractor became `displayable_custom_message_from_event`, pi's `if (message.display)` (`interactive-mode.ts:3607-3620`) placed where both live drawing callers funnel through. Residual (low): the guest bridge still reads a MISSING `display` as `true` where pi's `undefined` is falsy — unreachable from a type-conforming guest |
-| SUBA-095 | medium | S | external-CLI runner / deadline + stop | **Filed 2026-09-05 by the batch-3 ledger pass, against the code `SUBA-074` stage 2 landed.** `exec/external_cli/run.rs`'s `tokio::select!` loop still has two escapes from the arms that own `opts.deadline_at` and `opts.cancel`: the loop breaks on stream EOF and then `await`s an unguarded `child.wait()` (`:295-297`), and `biased` puts `rx.recv()` ahead of both arms so a chunk always ready starves them. Upstream cannot reach either state — `registerTimeout`/`registerStop` are event-loop callbacks independent of stream state (`external-cli-runner.ts:361-362` @v0.64.0) |
+| ~~SUBA-095~~ | ~~medium~~ **CLOSED 2026-09-05** | S | external-CLI runner / deadline + stop | Filed 2026-09-05 by the batch-3 ledger pass against the code `SUBA-074` stage 2 landed; both escapes confirmed by reproduction and **fixed at `1f718391`**. `exec/external_cli/run.rs`'s `tokio::select!` loop broke on the chunk channel's close — which tracks the PIPES, not the process — and then awaited an unguarded `child.wait()`, and `biased` put `rx.recv()` ahead of the deadline and stop arms so a chunk always ready starved them. Upstream's `input.registerTimeout`/`input.registerStop` are event-loop callbacks that fire regardless of stream state and the run settles only on `child.once("close")` (`external-cli-runner.ts:361-362`, `:377` @v0.64.0); ported as a poll order and a loop condition — EOF now only lowers a `streaming` flag, the loop runs `while streaming \|\| !reaped`, the chunk arm is polled LAST, and the residual post-loop wait is bounded by `TIMEOUT_SIGTERM_GRACE`. Three tests, each red before the commit. **REVIEW FIX `e36a1871` (same batch, not a new row):** as `1f718391` first landed the deadline and stop arms were gated only on `!terminated`, so both stayed enabled — and polled above the chunk arm — for the whole post-exit drain window, turning a COMPLETED run into `exit_code: 1` + "Subagent stopped by user." whenever a stop or a deadline landed there. Upstream's `terminate` returns early on `settled` (`external-cli-runner.ts:262`, set at `:378`); that flag is now ported as a `reaped` bool gating all three arms, the exit arm arms the drain deadline so the post-exit window is bounded, and two more red-before tests pin it (five in all). **TWO DEFECTS IN THAT FIX SHIPPED UNFIXED — recorded here rather than filed, per the batch-4 rule, and both caught by the batch-4 regression gate AFTER the review round had closed:** **(a) a false upstream citation.** `exec/external_cli/run.rs:333-336` says of the parser-failure teardown "Like the two verbs it is a no-op on a reaped child — upstream's `failParser` is guarded by `settled` through the same `terminateExternalProcessTree` call site (`:268-272`)". It is not. `failParser` (`external-cli-runner.ts:267-272` @v0.64.0, read directly at the tag) is `const failParser = (error) => { if (parserError) return; … if (processTree && processPid !== undefined) termination = terminateExternalProcessTree(processPid, processTree); }` — its ONLY guard is `if (parserError) return;`, the token `settled` does not appear in it, and its terminate call runs after settle. The citation is correct for `terminate` (`:261-262`, which genuinely begins `if (settled \|\| timedOut \|\| stopped \|\| parserError) return;`) and false for the parser arm. The SHIPPED BEHAVIOUR is defensible — `feed_parser` records `parser_error` before the guard, so the failure is still reported by the precedence at `run.rs:443-445`, and skipping the redundant ladder is what stops the corpse's status overwriting the real one — but it is a deliberate cyrup divergence declared as fidelity to a guard upstream does not have. It must be restated as a `[CYRUP-DELTA]` naming what upstream actually does at `:267-272`; no change to the guard itself is needed. This is the same class of false in-source upstream claim batch 4 spent three commits correcting elsewhere (`e8f93355`, `7a3b1a22`, `4d361c21`), shipping uncorrected in the one place it was introduced. **(b) `terminated` is now dead state.** On `origin/main` it was the sole guard on all three arms; `e36a1871` added `reaped` beside it, and now every writer of `terminated` (`run.rs:301`, `:309`, `:338`) also sets `reaped`, `reaped` is never cleared, and all three readers are `!terminated && !reaped` — so the `!terminated` conjunct can never be the deciding term, and `terminated` is read nowhere else in the function (`grep -n terminated run.rs` returns exactly those seven lines). The guard reads as two independent conditions when the real invariant is `!reaped` alone, obscuring the very property the fix exists to encode. No behavioural effect; drop `terminated`, or say at the site why it is kept. **Both are code-level corrections in a file this batch owns and neither reopens the escape this row is about, which is genuinely fixed and pinned by five red-before tests — so the row stays CLOSED and these ride it as named residuals** |
 
 > **RE-AUDITED 2026-09-04, cyrup HEAD `2571969`** (baseline `4fb5e40`, 09/09a combined pass). Of the
 > eleven items counted "confirmed, schedulable" above, **nine are now closed and one is
@@ -451,13 +451,14 @@ the env write in `exec/spawn_plan.rs`.
 > `only_a_pi_runner_is_honourable_today` FALSIFIED by the change and therefore split rather than
 > deleted.
 >
-> **One review finding against this item's own code is NOT fixed and is now filed as its own row:
-> `SUBA-095` (medium).** The batch-3 second review found that `exec/external_cli/run.rs`'s select
-> loop still has two ways to escape the deadline and stop arms — a post-loop unguarded
-> `child.wait()` and `biased` starvation of the later arms. Both were re-derived on both sides by
-> this ledger pass and both hold at HEAD `ba380e58`. They are NOT this row's original gap (external
-> runners are ported), they are a defect in the code that ported it, so they take a new id rather
-> than reopening a closed one — see `SUBA-095` below.
+> **One review finding against this item's own code was filed as its own row: `SUBA-095`
+> (medium).** The batch-3 second review found that `exec/external_cli/run.rs`'s select loop had two
+> ways to escape the deadline and stop arms — a post-loop unguarded `child.wait()` and `biased`
+> starvation of the later arms. Both were re-derived on both sides by the batch-3 ledger pass and
+> both held at HEAD `ba380e58`. They are NOT this row's original gap (external runners are ported),
+> they are a defect in the code that ported it, so they took a new id rather than reopening a closed
+> one. **`SUBA-095` is itself CLOSED at `1f718391` (2026-09-05)** — reproduced as three failing
+> tests, then fixed; see the section below.
 
 > **STAGE 1 CLOSED 2026-09-04, cyrup HEAD `2571969`.** Landed by `bf8b0f9` (same commit as
 > `SUBA-072`/`SUBA-073`), verified by reading the current code — this is exactly the item's own Fix
@@ -2754,7 +2755,122 @@ custom message from `message_end` where pi draws it from `message_start`
 
 ---
 
-## SUBA-095 — The external-CLI runner's select loop still has two escapes from its own deadline and stop arms
+## ~~SUBA-095~~ — ~~medium~~ **CLOSED 2026-09-05** — The external-CLI runner's select loop had two escapes from its own deadline and stop arms
+
+> **UNFIXED AT MERGE — TWO DEFECTS IN THIS ITEM'S OWN FIX (tenth-edition ledger pass, 2026-09-05).**
+> The batch-4 regression gate ran after the review round had already closed, so neither of these
+> reached a fix commit. Both are recorded here rather than filed as rows, per the batch-4 rule that a
+> defect in the current batch's own code is fixed — and, when it is not, is carried on the row that
+> owns the code rather than dressed up as a new finding.
+>
+> * **A FALSE UPSTREAM CITATION at `run.rs:333-336`.** The comment on the parser-failure teardown
+>   claims upstream's `failParser` is guarded by `settled`. Read at the tag, it is not:
+>   `external-cli-runner.ts:267-272` @v0.64.0 is `const failParser = (error) => { if (parserError)
+>   return; parserError = …; if (input.preflight) invalidateExternalCliPreflight(…); if (processTree
+>   && processPid !== undefined) termination = terminateExternalProcessTree(processPid, processTree); }`
+>   — the only guard is `if (parserError) return;`, `settled` does not appear, and the terminate call
+>   runs after settle. The `settled` citation is correct for `terminate` (`:261-262`) and false for the
+>   parser arm. The behaviour cyrup ships is defensible and arguably better than upstream's — the
+>   parser failure is still reported by the precedence at `run.rs:443-445`, and not re-running the
+>   ladder is what stops the corpse's status overwriting the real one — so this is a `[CYRUP-DELTA]`
+>   mislabelled as fidelity. Fix: restate the comment, naming what upstream actually does at
+>   `:267-272` and why cyrup diverges. The guard itself is correct and must not change.
+> * **`terminated` IS NOW DEAD STATE**, introduced by `e36a1871`. Every writer of it (`run.rs:301`,
+>   `:309`, `:338`) also sets `reaped`; `reaped` is never cleared; all three readers are
+>   `!terminated && !reaped`. The `!terminated` conjunct can therefore never decide anything, and the
+>   variable is read nowhere else. Low severity, no behavioural effect — but it makes the guard read
+>   as two invariants where there is one (`!reaped`), which is exactly the property this item exists
+>   to make legible. Drop it, or say at the site why it is kept.
+>
+> Neither reopens the escape this row is about. Both escapes remain fixed and pinned by five
+> red-before tests; the row stays CLOSED and these ride it.
+
+> **CLOSED 2026-09-05 at `1f718391`** (`crates/cyrup-ext-subagents/src/exec/external_cli/run.rs`).
+> Both escapes were REPRODUCED before a line of production code moved, and both were fixed in the
+> batch that filed them rather than carried: a review finding against this programme's own code is a
+> bug, not a row. The filing below stands as written — both paths were re-derived on both sides once
+> more before the fix — with one correction of record: the `biased` starvation is real but is
+> observable only on a MULTI-THREADED runtime. On a current-thread runtime the loop drains the
+> channel to empty, `recv()` then returns `Pending`, and `select!` polls on to the arms below it, so
+> the two verbs are merely delayed by the buffered chunks; with the pumps on another worker — which
+> is what cyrup runs on — the channel is refilled while the loop spins and `recv()` is ready at
+> every poll, so the arms below are never polled at all. The severity stays `medium` on that
+> reading, and the row's own falsification condition is now moot.
+>
+> **The reproduction, before the fix.** Three tests, in
+> `exec::external_cli::run::tests`, beside `a_prompt_larger_than_the_stdin_pipe_does_not_deadlock_a_child_that_writes_first`
+> as the row asked:
+> * `a_child_that_eofs_both_pipes_without_exiting_still_hits_its_deadline` — child is
+>   `#!/bin/sh` / `exec 1>&- 2>&-` / `sleep 30`, deadline at 200 ms. Before: the run left the loop on
+>   the channel's `None` and sat in the unguarded `child.wait()` for the child's full sleep, blowing
+>   the test's 10 s wall-clock bound. After: settles in ~0.21 s, `timed_out`, exit 1, "Subagent timed
+>   out.".
+> * `a_child_that_eofs_both_pipes_without_exiting_still_honours_a_stop` — same child, stop fired at
+>   200 ms. Before: identical hang. After: ~0.21 s, `stopped`, exit 1, "Subagent stopped by user.".
+> * `a_stop_is_honoured_while_the_child_streams_output_without_pause` — `timeout 20 yes
+>   '{"type":"system"}'` under the Claude Code JSONL parser on a 2-worker runtime, stop fired at
+>   200 ms. Before: the stop was NEVER observed — the run ended 2.3 s later at the parser's own
+>   32 MiB stream cap with `ExternalCliRunOutcome { exit_code: 1, error: Some("External CLI parser
+>   stream exceeded its byte limit."), timed_out: false, stopped: false }`. After: ~0.25 s,
+>   `stopped`, exit 1, the stop message. Eight consecutive runs of the three, all green.
+>
+> **The fix, and why it is upstream's own shape.** Upstream's two verbs are event-loop callbacks
+> installed independently of the streams (`external-cli-runner.ts:361-362`) and the run settles on
+> `child.once("close")` (`:377`) — on the PROCESS, not on the pipes. In a select loop that is a loop
+> condition and a poll order, and it is ported as exactly those two things:
+> * EOF on the chunk channel no longer breaks; it lowers a `streaming` flag, and the loop runs
+>   `while streaming || !reaped`, so it is left only once the child is reaped or the drain
+>   deadline breaks it. Entering the loop implies at least one enabled arm, so the select can never
+>   be all-disabled. The post-loop `child.wait()` is reachable only through the drain-deadline break
+>   or a `wait()` that failed at the OS level, and is bounded by `TIMEOUT_SIGTERM_GRACE` regardless.
+> * The chunk arm moved LAST. The exit arm keeps the first slot for the race the module note
+>   documents (an unbiased select whose exit and cancel arms are both ready reports "stopped" about
+>   half the time). Every arm above the chunk arm is ready at most once — the exit arm and the two
+>   verbs are all disabled by `reaped`, the drain arm breaks — so the reordering cannot starve the
+>   stream in turn, and chunk delivery was never more urgent than the verbs that end the run: it is
+>   the pumps' own channel back-pressure that bounds memory, not this loop's priority.
+> * **ADDED at `e36a1871` (batch-4 review fix), and the reason the two bullets above read as they
+>   now do.** As `1f718391` first landed, the deadline arm and the stop arm were gated only on
+>   `!terminated`, and the loop no longer left on the exit arm — so both verbs stayed ENABLED, and
+>   polled ABOVE the chunk arm, for the whole post-exit drain window. A stop cancelled (or a
+>   deadline elapsing) while the pumps' backlog was still being consumed set `stopped`/`timed_out`,
+>   re-ran the terminate ladder on a corpse, and reported `exit_code: 1` + "Subagent stopped by
+>   user." for a run that COMPLETED — and the commit's own module note and arm-order comment
+>   asserted this could not happen. Upstream cannot reach it: `terminate` begins
+>   `if (settled || timedOut || stopped || parserError) return;` (`external-cli-runner.ts:262`),
+>   `settled` being set when the run settles (`:378`). `settled` is now ported as a `reaped` bool,
+>   kept separate from `exit` because `exit` is `child.wait()`'s STATUS and is `None` when that call
+>   fails at the OS level — a reaped child with no status is still reaped. Gating the exit arm on it
+>   also removes the hot-spin an erroring `wait()` could cause from the first `biased` slot. The
+>   exit arm now arms `drain_deadline` on its way through, so the post-exit drain is BOUNDED; the
+>   parser-failure teardown inside the chunk arm carries the same guard and can no longer overwrite
+>   a real exit status.
+>
+> **No design decision was taken, deliberately.** The states this loop tracks are already carried
+> faithfully by `exit`/`terminated`/`drain_deadline` plus the one new `streaming` bool; the defect
+> was ordering, not representability. An outcome enum over `{Exited, PipesClosed, Terminated}` was
+> considered and rejected on that ground — it would have added ceremony without making either escape
+> unrepresentable, since nothing in it would have forced the chunk arm below the two verbs. What
+> still depends on runtime tests: the poll order itself, which no type can pin — hence the three
+> tests above, one per escape.
+>
+>
+> **Two more tests at `e36a1871`**, both red before it and green after, making five in all:
+> `a_stop_that_lands_after_the_child_exits_reports_the_childs_own_exit` and
+> `a_deadline_that_elapses_after_the_child_exits_reports_the_childs_own_exit`. Both use
+> `sh -c 'sleep 3 & exit 7'` — the shell exits 7 at once while the background sleep keeps the
+> inherited pipes open — so the post-exit window is wide and deterministic rather than a race
+> against a 64-slot backlog, and the verb fires 100 ms into it. Before: the `!outcome.stopped`
+> assertion panicked (exit 1, "Subagent stopped by user."). After: `exit_code: 7`, "External CLI
+> exited with code 7.", settled at the 1 s drain deadline.
+>
+> **Residual (low, recorded not filed) — NARROWED at `e36a1871`:** if the child exits cleanly but a
+> descendant that escaped the process group holds a pipe open, the loop drains for at most
+> `TIMEOUT_SIGTERM_GRACE` past the reap and then breaks, so late output from such a descendant is
+> dropped. That is a deliberate [CYRUP-DELTA]: upstream's `close` waits on the stdio streams as well
+> as the exit and therefore never returns at all while a grandchild holds them, which is the one
+> place upstream itself can hang. cyrup bounds it instead.
+
 
 **Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** confirmed (both sides read at HEAD `ba380e58` / `v0.64.0`)
 **Subsystem** external runners — `crates/cyrup-ext-subagents/src/exec/external_cli/run.rs`

@@ -76,6 +76,23 @@ pub(super) async fn run_inner(
     headers.insert("accept".to_string(), EVENT_STREAM_MEDIA_TYPE.to_string());
     // pi `:224-227`: caller headers are injected at the Smithy `build` step, i.e. before signing.
     apply_custom_headers(&mut headers, opts.headers.as_ref(), model.headers.as_ref());
+    // PROV-042: `transformHeaders` runs LAST over the fully-assembled set (pi `models.ts:657`
+    // @v0.84.4). It sits BEFORE `authorize` because Bedrock signs its headers: a header the hook
+    // adds after SigV4 would either be unsigned or invalidate the signature, so the hook has to be
+    // part of what is signed — pi's own caller headers are injected at the same pre-signing Smithy
+    // `build` step (`bedrock-converse-stream.ts:224-227`). The map is `String`-valued here, so a
+    // `None` the hook returns means "delete", matching [`crate::HeaderMap`]'s suppression rule.
+    if opts.transform_headers.is_some() {
+        let view: crate::HeaderMap = headers
+            .iter()
+            .map(|(k, v)| (k.clone(), Some(v.clone())))
+            .collect();
+        headers = crate::stream::apply_transform_headers(opts, view)
+            .await
+            .into_iter()
+            .filter_map(|(k, v)| v.map(|v| (k.to_lowercase(), v)))
+            .collect();
+    }
     authorize(&mut headers, &config, &url, &body_bytes).map_err(|e| {
         BedrockFailure::errored(dec.snapshot_owned(model, api), format_bedrock_error(&e))
     })?;

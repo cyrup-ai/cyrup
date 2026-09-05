@@ -225,10 +225,15 @@ impl AgentSession {
         self.manager.lock().await.build_context_raw()
     }
 
-    /// [`raw_context_messages`](Self::raw_context_messages) plus the two derived notices a replay
-    /// cannot reconstruct from the messages alone — pi's `renderSessionEntries` flat-map
-    /// (`modes/interactive/interactive-mode.ts:3781-3796` @v0.83.0) together with the cache-miss
-    /// re-injection its `renderSessionItems` performs (`:3694-3696`, `:3753-3755`).
+    /// [`raw_context_messages`](Self::raw_context_messages) plus the items a replay cannot
+    /// reconstruct from the messages alone — pi's `renderSessionEntries` flat-map
+    /// (`modes/interactive/interactive-mode.ts:3794-3806` @v0.84.4, `:3781-3796` @v0.83.0) together
+    /// with the cache-miss re-injection its `renderSessionItems` performs (`:3706-3709`,
+    /// `:3766-3768`).
+    ///
+    /// Three of them: the two derived notices, and the `custom` ENTRY, which projects no message at
+    /// all and is passed through by the flat-map for its registered entry renderer alone
+    /// (`if (entry.type === "custom") return [entry];`, `:3799-3801`) — EXT-041.
     ///
     /// **Why this is a session method and not a front-end walk.** The two facts are keyed in index
     /// spaces the front-end never holds at once:
@@ -280,29 +285,57 @@ impl AgentSession {
             })
             .collect();
 
-        let tagged = mgr.build_context_raw_tagged();
-        let mut out = Vec::with_capacity(tagged.len());
-        for (id, message) in tagged {
-            // Resolved BEFORE the message moves into the stream; emitted after it, which is pi's
-            // order at both sites.
-            let notice = match &message {
-                AgentMessage::Core(Message::Assistant(a))
-                    if !matches!(a.stop_reason, StopReason::Aborted | StopReason::Error) =>
-                {
-                    misses.get(&id).copied().map(ReplayItem::CacheMiss)
+        // The compaction-aware ENTRY list, not the projected message list: pi's replay walk is
+        // `renderSessionEntries(this.sessionManager.buildContextEntries())`
+        // (`interactive-mode.ts:3910` @v0.84.4), and its flat-map keeps the one entry kind that
+        // projects NO message — `if (entry.type === "custom") return [entry];` (`:3799-3801`).
+        // Flat-mapping [`cyrup_session::context::raw_context_messages`] over it reproduces
+        // `build_context_raw_tagged` exactly (that function is now the same walk), with the custom
+        // entries still in hand and in branch order.
+        let entries_in_context = mgr.context_entries();
+        let mut out = Vec::with_capacity(entries_in_context.len());
+        for entry in entries_in_context {
+            // EXT-041 — a `custom` entry replays as itself, serialized exactly as the live
+            // `entry_appended` event carries it (`host_services.rs`'s `append_entry`), so the
+            // front-end hands its registered ENTRY renderer the same JSON on both paths. pi's
+            // `addCustomEntryToChat` is reached identically from the live event (`:3217-3218`) and
+            // from the replay walk (`:3717-3719`).
+            if let Entry::Known(KnownEntry::Custom { .. }) = entry {
+                // A serialization failure is unreachable for `Entry` (no map with non-string keys,
+                // no non-finite float), but if it ever happened the entry must still reach the
+                // stream: dropping it here would lose the one entry kind this walk exists to carry.
+                // The live sibling degrades the same way rather than skipping —
+                // `host_services.rs`'s `append_entry` does `serde_json::to_value(e).ok()
+                // .unwrap_or(Value::Null)` — so both paths hand the front-end a null payload and it
+                // draws the unclaimed-entry receipt.
+                out.push(ReplayItem::CustomEntry(
+                    serde_json::to_value(entry).unwrap_or(serde_json::Value::Null),
+                ));
+                continue;
+            }
+            let id = entry.id();
+            for message in cyrup_session::context::raw_context_messages(entry) {
+                // Resolved BEFORE the message moves into the stream; emitted after it, which is pi's
+                // order at both sites.
+                let notice = match &message {
+                    AgentMessage::Core(Message::Assistant(a))
+                        if !matches!(a.stop_reason, StopReason::Aborted | StopReason::Error) =>
+                    {
+                        misses.get(&id).copied().map(ReplayItem::CacheMiss)
+                    }
+                    // A summary entry with no `usage`, or one whose summary was empty and therefore
+                    // projected no message at all, contributes nothing — pi's
+                    // `entry.usage && messages.length > 0` (`:3791`).
+                    AgentMessage::CompactionSummary(_) | AgentMessage::BranchSummary(_) => costs
+                        .get(&id)
+                        .cloned()
+                        .map(|(kind, usage)| ReplayItem::CompactionCost { kind, usage }),
+                    _ => None,
+                };
+                out.push(ReplayItem::Message(Box::new(message)));
+                if let Some(notice) = notice {
+                    out.push(notice);
                 }
-                // A summary entry with no `usage`, or one whose summary was empty and therefore
-                // projected no message at all, contributes nothing — pi's
-                // `entry.usage && messages.length > 0` (`:3791`).
-                AgentMessage::CompactionSummary(_) | AgentMessage::BranchSummary(_) => costs
-                    .get(&id)
-                    .cloned()
-                    .map(|(kind, usage)| ReplayItem::CompactionCost { kind, usage }),
-                _ => None,
-            };
-            out.push(ReplayItem::Message(Box::new(message)));
-            if let Some(notice) = notice {
-                out.push(notice);
             }
         }
         out

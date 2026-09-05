@@ -116,7 +116,13 @@ impl ApiImpl for AnthropicMessagesApi {
         };
         // gap-08 #2: `before_provider_request` may inspect/replace the outbound body.
         let body = crate::stream::apply_on_payload(opts, model, params).await;
-        let headers = build_headers(model, ctx, auth, opts, is_oauth);
+        // PROV-042: `transformHeaders` runs LAST over the fully-assembled set (pi
+        // `models.ts:657` @v0.84.4); its return value is what goes on the wire.
+        let headers = crate::stream::apply_transform_headers(
+            opts,
+            build_headers(model, ctx, auth, opts, is_oauth),
+        )
+        .await;
         let req = SseRequest {
             method: reqwest::Method::POST,
             url,

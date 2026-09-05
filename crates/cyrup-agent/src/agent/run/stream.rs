@@ -122,6 +122,12 @@ impl RunCtx {
             thinking_budgets: self.gen_config.thinking_budgets,
             on_payload: self.gen_config.on_payload.clone(),
             on_response: self.gen_config.on_response.clone(),
+            // PROV-042 — pi's session `streamFn` sets `transformHeaders` on every request it makes
+            // (`sdk.ts:330-339` @v0.84.4). `headers` above is the ATTRIBUTION overlay (AGENT-029);
+            // it is merged into the assembled set BEFORE the provider runs this transform, which is
+            // pi's ordering guarantee — the `before_provider_headers` hook this carries sees the
+            // attribution set already present and its own return value wins.
+            transform_headers: self.gen_config.transform_headers.clone(),
             // Provider-scoped env overlay (e.g. the `httpProxy` setting) + request idle timeout (Pi
             // `applyHttpProxySettings`/`configureHttpDispatcher`, main.ts:744-745).
             env: self.gen_config.env.clone(),
