@@ -114,8 +114,11 @@ pub(crate) use settings_rows::{
 };
 #[cfg(test)]
 pub(crate) use settings_rows::{settings_rows_for_test, settings_rows_for_test_with_images};
-pub(crate) use share::ShareInFlight;
-pub use share::{ShareMsg, gist_id_from_url, share_viewer_url, share_viewer_url_from};
+pub(crate) use share::{ShareInFlight, ShareUpload};
+pub use share::{
+    ShareMsg, ShareTool, append_share_metadata, gist_id_from_url, share_viewer_url,
+    share_viewer_url_from,
+};
 
 pub(crate) use crossterm::resolve_external_editor;
 #[cfg(test)]
@@ -318,6 +321,14 @@ pub struct App<B: Backend> {
     /// [`App::set_login_provider_source`] so a test can drive the whole `/login` path against a
     /// stub provider WITHOUT reaching a real endpoint (see `tests/login_flow.rs`).
     login_providers: Option<LoginProviderSource>,
+    /// The Radius gateway `/share` uploads its artifact to (DRIFT-053). `None` — always, in
+    /// production — is pi's hardcoded `DEFAULT_RADIUS_GATEWAY` (`session-share.ts:112`).
+    ///
+    /// The sibling of [`Self::login_providers`] and it exists for the same reason: this crate's
+    /// "tests must never hit real provider APIs" convention. [`App::set_radius_share_gateway`]
+    /// points the upload at a local address so the ROUTING — radius attempted, `gh` never
+    /// reached — is asserted without a socket to `radius.pi.dev`.
+    radius_gateway: Option<String>,
     /// Where a spawned `/compact` posts its outcome back to the run loop — installed by
     /// [`App::install_compact_channel`], the same shape as [`Self::tree_nav_tx`].
     ///

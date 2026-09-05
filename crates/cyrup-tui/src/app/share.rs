@@ -57,6 +57,98 @@ pub fn share_viewer_url_from(env_base: Option<&str>, gist_id: &str) -> String {
     format!("{base}#{gist_id}")
 }
 
+/// One entry of the tool list pi puts in the `pi.share` trailing entry
+/// (`session-share.ts:35-39`). Borrowed rather than owned so the caller hands over its live
+/// `ToolInfo` slice with no clone.
+pub struct ShareTool<'a> {
+    pub name: &'a str,
+    pub description: &'a str,
+    pub parameters: &'a serde_json::Value,
+}
+
+/// pi `exportSessionForShare` (`session-share.ts:25-43` @v0.84.4), the export-only trailing entry
+/// that makes a Radius share renderable:
+///
+/// ```ts
+/// exportSessionToJsonl(session.sessionManager, filePath, (parentId, timestamp) => [{
+///     type: "custom", customType: "pi.share", id: crypto.randomUUID().slice(0, 8),
+///     parentId, timestamp,
+///     data: { systemPrompt: session.state.systemPrompt,
+///             tools: session.state.tools.map((t) => ({ name, description, parameters })) },
+/// }]);
+/// ```
+///
+/// `parentId` and `timestamp` are the two values `exportSessionToJsonl` computes and hands to the
+/// callback (`core/session-export.ts:21`, `:31-36`): the timestamp is the one it stamped on the
+/// SESSION HEADER, and `parentId` is the id of the last exported entry (`null` for an export with
+/// no entries). Both are recovered here from the already-serialized JSONL rather than recomputed,
+/// so the trailing entry cannot disagree with the document it is appended to.
+///
+/// `customType` stays `pi.share` unrebranded: it is a WIRE tag the Radius viewer matches on, in the
+/// same class as [`DEFAULT_SHARE_VIEWER_URL`] above — renaming it would produce a share the service
+/// cannot render.
+///
+/// `id` is the caller's (pi: `crypto.randomUUID().slice(0, 8)`), passed in so the line is a pure
+/// function of its inputs and can be asserted byte for byte.
+#[must_use]
+pub fn append_share_metadata(
+    jsonl: &str,
+    id: &str,
+    system_prompt: &str,
+    tools: &[ShareTool<'_>],
+) -> String {
+    let mut lines = jsonl.lines().filter(|l| !l.trim().is_empty());
+    let timestamp = lines
+        .next()
+        .and_then(|header| serde_json::from_str::<serde_json::Value>(header).ok())
+        .and_then(|header| {
+            header
+                .get("timestamp")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    // `let parentId: string | null = null; for (…) { …; parentId = entry.id; }` — the last
+    // exported entry's id, and `null` when the branch is empty.
+    let parent_id = jsonl
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .skip(1)
+        .last()
+        .and_then(|last| serde_json::from_str::<serde_json::Value>(last).ok())
+        .and_then(|last| {
+            last.get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        });
+    let entry = serde_json::json!({
+        "type": "custom",
+        "customType": "pi.share",
+        "id": id,
+        "parentId": parent_id,
+        "timestamp": timestamp,
+        "data": {
+            "systemPrompt": system_prompt,
+            "tools": tools
+                .iter()
+                .map(|t| serde_json::json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                }))
+                .collect::<Vec<_>>(),
+        },
+    });
+    // `writeFileSync(filePath, \`${lines.join("\n")}\n\`)` — every line terminated, including the
+    // trailing one.
+    let mut out = String::with_capacity(jsonl.len() + 256);
+    out.push_str(jsonl.trim_end_matches('\n'));
+    out.push('\n');
+    out.push_str(&serde_json::to_string(&entry).unwrap_or_default());
+    out.push('\n');
+    out
+}
+
 /// The in-flight half of a `/share` gist upload: the waiter task driving `gh gist create` and the
 /// temp HTML file it is uploading.
 ///
@@ -75,7 +167,16 @@ pub(crate) struct ShareInFlight {
     pub(crate) task: tokio::task::AbortHandle,
     /// The temp HTML file to unlink on the cancel path — pi's `finally` block (`:76-84`), which
     /// runs for a cancelled share exactly as it does for a successful one.
-    pub(crate) tmp: std::path::PathBuf,
+    ///
+    /// `None` on the Radius path (DRIFT-053): that upload POSTs the export from memory and writes
+    /// no temp file, so there is nothing to unlink. pi writes one there
+    /// (`session-share.ts:47`, `:52`) only because `exportSessionToJsonl` is a file writer.
+    pub(crate) tmp: Option<std::path::PathBuf>,
+    /// pi's `loader.signal` (`session-share.ts:123`) — the Radius upload's `AbortSignal`. `gh` is
+    /// killed by dropping the aborted waiter (see above) and needs no token; an in-flight HTTP
+    /// request is stopped by cancelling this one, which is what
+    /// [`cyrup_provider::providers::radius_share::upload_share_artifact`] selects on.
+    pub(crate) cancel: cyrup_core::CancelToken,
 }
 
 /// A settled `gh gist create --public=false <file>`, posted back to [`crate::app::App::run`]'s
@@ -87,10 +188,31 @@ pub(crate) struct ShareInFlight {
 /// `wait_with_output()` and sends this message when it resolves.
 #[derive(Debug)]
 pub struct ShareMsg {
-    /// `gh`'s exit status plus its captured streams, or the error `spawn`/`wait` failed with.
-    pub(crate) result: Result<std::process::Output, std::io::Error>,
-    /// The temp HTML file to unlink — pi's `finally { fs.unlinkSync(tmpFile) }` (`:76-84`).
-    pub(crate) tmp: std::path::PathBuf,
+    /// Which of `/share`'s two upload paths settled, and what it settled to.
+    pub(crate) upload: ShareUpload,
+}
+
+/// The settled result of ONE of `/share`'s two upload paths.
+///
+/// pi's `shareSession` is a two-step chain — `tryShareViaRadius` first, `shareViaGist` only when
+/// that answers `false` (`session-share.ts:57`, `:77`) — and each step reports through its own
+/// post-`await` tail with its own message wording. Modelling that as one enum rather than as a
+/// `gh`-shaped `Output` plus a nullable Radius field is what keeps
+/// [`crate::app::App::apply_share_outcome`] an exhaustive match: a third path added later cannot
+/// compile until it says what the user is told.
+#[derive(Debug)]
+pub(crate) enum ShareUpload {
+    /// `gh gist create --public=false <file>` settled — pi `shareViaGist` (`:152-203`).
+    Gist {
+        /// `gh`'s exit status plus its captured streams, or the error `spawn`/`wait` failed with.
+        result: Result<std::process::Output, std::io::Error>,
+        /// The temp HTML file to unlink — pi's `finally { fs.unlinkSync(tmpFile) }` (`:76-84`).
+        tmp: std::path::PathBuf,
+    },
+    /// The Radius artifact `POST` settled — pi `tryShareViaRadius` (`:110-149`). DRIFT-053.
+    /// `Err(Aborted)` is pi's `if (loader.signal.aborted) return true` (`:125`, `:130`): the
+    /// cancel path has already printed `Share cancelled`, so this one prints nothing.
+    Radius(Result<cyrup_provider::providers::radius_share::RadiusShareOutcome, String>),
 }
 
 impl ShareMsg {
@@ -102,6 +224,18 @@ impl ShareMsg {
         result: Result<std::process::Output, std::io::Error>,
         tmp: std::path::PathBuf,
     ) -> Self {
-        ShareMsg { result, tmp }
+        ShareMsg {
+            upload: ShareUpload::Gist { result, tmp },
+        }
+    }
+
+    /// The Radius sibling of [`ShareMsg::new`], `pub` for the same reason: a test drives the
+    /// upload's three reported outcomes without a gateway.
+    pub fn radius(
+        outcome: Result<cyrup_provider::providers::radius_share::RadiusShareOutcome, String>,
+    ) -> Self {
+        ShareMsg {
+            upload: ShareUpload::Radius(outcome),
+        }
     }
 }

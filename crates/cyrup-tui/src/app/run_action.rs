@@ -51,7 +51,14 @@ impl App<InlineBackend<Stdout>> {
                 // the cancelled path too.
                 if let Some(share) = self.state.share_in_flight.take() {
                     share.task.abort();
-                    let _ = std::fs::remove_file(&share.tmp);
+                    // The Radius upload is an in-flight HTTP request, not a child process:
+                    // cancelling its token is pi's `loader.signal` firing (`session-share.ts:123`).
+                    // Harmless on the gist path, whose token nothing selects on.
+                    share.cancel.cancel();
+                    // `None` on the Radius path, which writes no temp file.
+                    if let Some(tmp) = share.tmp.as_ref() {
+                        let _ = std::fs::remove_file(tmp);
+                    }
                 }
                 // pi's `loader.signal.aborted`, re-checked by every completion path: `gh` may
                 // already have settled and posted a result the loop has not drained yet.

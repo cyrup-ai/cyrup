@@ -115,6 +115,7 @@ mod selector_wiring;
 mod session_replay;
 mod settings_inert_keys;
 mod settings_trust_selectors;
+mod share_radius_route;
 mod share_url;
 mod sigint_double_tap;
 mod startup_resources_panel;

@@ -48,6 +48,7 @@ impl<B: Backend> App<B> {
             package_update_rx: None,
             login_tx: None,
             login_providers: None,
+            radius_gateway: None,
             compact_tx: None,
             queue_drain_tx: None,
             lifecycle_tx: None,

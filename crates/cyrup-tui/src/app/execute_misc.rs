@@ -1019,25 +1019,40 @@ impl<B: Backend> App<B> {
         }
     }
 
-    /// `/share` (`handleShareCommand`, interactive-mode.ts:5191): export the session to HTML, write a
-    /// temp file, then shell `gh gist create --public=false <file>` behind a [`crate::chrome::BorderedLoader`] and
-    /// surface the resulting gist URL. `gh` missing / logged-out is caught by pi's `gh auth status`
-    /// pre-check (`session-share.ts:59-68`) before anything is mounted; a failing upload degrades to
-    /// a status line. Fully in-crate (the HTML body is rendered by [`crate::export`]).
+    /// `/share` — pi `shareSession` (`modes/interactive/session-share.ts:46-89` @v0.84.4).
     ///
-    /// The upload itself is SPAWNED whenever a run loop is present, never awaited on the loop task —
+    /// **Radius first, private gist as the fallback (DRIFT-053).** Upstream restructured this
+    /// command at `v0.84.3` (`460191cfc`): it exports the branch as JSONL with a `pi.share`
+    /// trailing entry ([`crate::app::append_share_metadata`]), tries
+    /// [`Self::try_share_via_radius`] (`:57`), and only when THAT answers `false` — no radius
+    /// provider, or no stored credential — runs the pre-existing chain: `gh auth status`
+    /// (`:59-68`), `exportToHtml` (`:70-76`), `gh gist create --public=false` (`shareViaGist`,
+    /// `:152-203`). A user who deliberately configured Radius so their sessions stay inside their
+    /// organization must not have `/share` publish a GitHub gist instead, which is exactly what
+    /// this crate did before the Radius attempt existed.
+    ///
+    /// A radius upload that FAILS does not fall through either (pi returns `true` from both arms
+    /// of `:132-140`): the user is told, and the command ends. Falling back there would publish
+    /// the gist the Radius configuration was chosen to avoid.
+    ///
+    /// Either upload is SPAWNED whenever a run loop is present, never awaited on the loop task —
     /// see [`Self::share_tx`] — and settles through [`Self::apply_share_outcome`].
     async fn share_session(&mut self, session: &Arc<AgentSession>) {
         use tokio::process::Command;
-        // Render the session HTML over its own JSONL (the same body `/export` writes).
-        let html = match session.export_to_jsonl(None).await {
-            Ok(Some(jsonl)) => crate::export::session_jsonl_to_html(&jsonl),
+        // `exportSessionForShare(jsonlFile, context.session)` (`:52`) — one export, used for BOTH
+        // paths: the Radius body verbatim, the gist body after `session_jsonl_to_html`. pi exports
+        // twice (JSONL here, HTML at `:72`) because its HTML writer starts from the manager, not
+        // from the JSONL; cyrup's renders the same JSONL, so re-exporting could only introduce a
+        // disagreement between what the two paths upload.
+        let jsonl = match session.export_to_jsonl(None).await {
+            Ok(Some(jsonl)) => jsonl,
             Ok(None) => {
                 self.state
                     .transcript
                     .push_status("nothing to share (empty session)");
                 return;
             }
+            // pi `showError(\`Failed to export session: …\`)` (`:54`).
             Err(e) => {
                 self.state
                     .transcript
@@ -1045,6 +1060,11 @@ impl<B: Backend> App<B> {
                 return;
             }
         };
+        // `if (await tryShareViaRadius(jsonlFile, context)) return;` (`:57`).
+        if self.try_share_via_radius(session, &jsonl).await {
+            return;
+        }
+        let html = crate::export::session_jsonl_to_html(&jsonl);
         let tmp = std::env::temp_dir().join(format!("cyrup-session-{}.html", session.session_id()));
         if let Err(e) = std::fs::write(&tmp, html.as_bytes()) {
             self.state
@@ -1111,7 +1131,7 @@ impl<B: Backend> App<B> {
                 .arg(&tmp)
                 .output()
                 .await;
-            self.apply_share_outcome(ShareMsg { result, tmp });
+            self.apply_share_outcome(ShareMsg::new(result, tmp));
             return;
         };
         // pi spawns the child and awaits it while the render loop keeps running
@@ -1133,25 +1153,172 @@ impl<B: Backend> App<B> {
             // pi's `catch` around the whole promise (`:198-203`) — reported through the same arms
             // the settled result uses.
             Err(e) => {
-                self.apply_share_outcome(ShareMsg {
-                    result: Err(e),
-                    tmp,
-                });
+                self.apply_share_outcome(ShareMsg::new(Err(e), tmp));
                 return;
             }
         };
         let waiter_tmp = tmp.clone();
         let waiter = tokio::spawn(async move {
             let result = child.wait_with_output().await;
-            let _ = tx.send(ShareMsg {
-                result,
-                tmp: waiter_tmp,
-            });
+            let _ = tx.send(ShareMsg::new(result, waiter_tmp));
         });
         self.state.share_in_flight = Some(ShareInFlight {
             task: waiter.abort_handle(),
-            tmp,
+            tmp: Some(tmp),
+            // The gist path is killed by dropping the aborted waiter (`kill_on_drop`), so its token
+            // is never consulted; only the Radius upload selects on one.
+            cancel: cyrup_core::CancelToken::new(),
         });
+    }
+
+    /// pi `tryShareViaRadius` (`modes/interactive/session-share.ts:91-150` @v0.84.4). DRIFT-053.
+    ///
+    /// ```ts
+    /// const provider = context.session.modelRuntime.getProvider("radius");
+    /// if (!provider) return false;
+    /// const token = getAuthCredential(
+    ///     await context.session.modelRuntime.getAuth("radius", { minOAuthValidityMs: 5 * 60_000 }));
+    /// if (!token) return false;
+    /// // …loader, POST {gateway}/v1/artifacts?visibility=organization…
+    /// ```
+    ///
+    /// The return value is upstream's, and it is the whole contract: `false` means "not my path,
+    /// go publish a gist", and it is returned by exactly the two credential-shaped conditions —
+    /// no radius provider, no resolvable credential. Every outcome AFTER the request is sent is
+    /// `true`, failures included, so a Radius upload that 403s does not silently republish the
+    /// session as a public-to-anyone-with-the-link gist.
+    ///
+    /// The provider registry is the same one `/login` reads ([`Self::login_provider_inputs`]), so
+    /// [`Self::set_login_provider_source`] substitutes it here too and a test can drive the whole
+    /// decision offline. The credential store is the session's own `auth.json`
+    /// ([`cyrup_config::AuthStore`], which implements [`cyrup_provider::CredentialStore`]), so an
+    /// OAuth token that has to be refreshed for the upload is refreshed and PERSISTED, exactly as
+    /// a streaming request would.
+    async fn try_share_via_radius(&mut self, session: &Arc<AgentSession>, jsonl: &str) -> bool {
+        use cyrup_provider::providers::radius::{DEFAULT_RADIUS_GATEWAY, RADIUS_PROVIDER_ID};
+        use cyrup_provider::providers::radius_share;
+
+        // `modelRuntime.getProvider("radius")` (`:92`).
+        let providers = match self.login_providers.as_deref() {
+            Some(source) => source(),
+            None => cyrup_provider::all_providers(),
+        };
+        let Some(provider) = providers
+            .iter()
+            .find(|p| p.id().as_str() == RADIUS_PROVIDER_ID)
+        else {
+            return false;
+        };
+        let Some(auth) = provider.provider_auth() else {
+            return false;
+        };
+        // `new URL("/v1/artifacts", DEFAULT_RADIUS_GATEWAY)` (`:112`): upstream posts the artifact
+        // to the DEFAULT gateway, not to the provider's configured `baseUrl` — a `models.json`
+        // provider declaring `"oauth": "radius"` streams against its own gateway
+        // (`model-runtime.ts:222-233`) but still shares to `radius.pi.dev`. The override exists
+        // only for [`Self::set_radius_share_gateway`], the offline-test seam.
+        let gateway = self
+            .radius_gateway
+            .clone()
+            .unwrap_or_else(|| DEFAULT_RADIUS_GATEWAY.to_string());
+        // `getAuthCredential(await modelRuntime.getAuth("radius", { minOAuthValidityMs }))`
+        // (`:95-97`). A resolution ERROR — an OAuth refresh that failed — is `undefined` upstream
+        // too (`getAuth` rejects and `shareSession` has no catch around it only because pi's
+        // `Models.getAuth` resolves `undefined` for an unconfigured provider); here it is treated
+        // as "no credential", which takes the gist fallback rather than aborting `/share`.
+        let token = radius_share::radius_share_token(
+            provider.id(),
+            auth,
+            &gateway,
+            session.services().auth.as_ref(),
+            &cyrup_provider::EnvAuthContext,
+        )
+        .await
+        .ok()
+        .flatten();
+        // `if (!token) return false;` (`:98`).
+        let Some(token) = token.filter(|t| !t.is_empty()) else {
+            return false;
+        };
+
+        // `exportSessionForShare`'s trailing `pi.share` entry (`:25-43`) — the system prompt and
+        // tool list the Radius viewer renders the transcript against. Only the Radius body carries
+        // it; the gist path uploads HTML.
+        let tools = session.all_tools();
+        let share_tools: Vec<crate::app::ShareTool<'_>> = tools
+            .iter()
+            // `session.state.tools` is the ACTIVE set — what the model was given this turn — not
+            // `getAllTools()`, which also lists the toggled-off ones.
+            .filter(|t| t.active)
+            .map(|t| crate::app::ShareTool {
+                name: &t.name,
+                description: &t.description,
+                parameters: &t.parameters,
+            })
+            .collect();
+        let body = crate::app::append_share_metadata(
+            jsonl,
+            // `crypto.randomUUID().slice(0, 8)` (`:30`). `now_v7` is the generator this crate
+            // already uses for the same "unique id for one artifact" role
+            // (`app/event_extract.rs:115`); the id only has to be distinct from the other entry
+            // ids inside THIS one export, which the trailing 8 hex digits — v7's random tail, not
+            // its timestamp prefix — give.
+            &uuid::Uuid::now_v7()
+                .simple()
+                .to_string()
+                .chars()
+                .skip(24)
+                .collect::<String>(),
+            &session.current_system_prompt().await,
+            &share_tools,
+        )
+        .into_bytes();
+
+        // `new BorderedLoader(context.ui, theme, "Uploading to Radius...")` (`:100-108`) — the same
+        // mount/focus/cancel shape the gist path uses below.
+        self.state.loader = Some(crate::chrome::BorderedLoader::cancellable(
+            "Uploading to Radius...",
+            self.state
+                .select_keymap
+                .keys_label(SelectAction::Cancel)
+                .unwrap_or_else(|| "escape/ctrl+c".into()),
+        ));
+        self.state.share_cancelled = false;
+
+        let cancel = cyrup_core::CancelToken::new();
+        let Some(tx) = self.share_tx.clone() else {
+            // No run loop (an embedder or a test driving `execute_command` directly): await
+            // inline, exactly as the gist path does.
+            let outcome = radius_share::upload_share_artifact(
+                &gateway,
+                &token,
+                body,
+                &cyrup_provider::EnvAuthContext,
+                &cancel,
+            )
+            .await;
+            self.apply_share_outcome(ShareMsg::radius(outcome.map_err(|e| e.to_string())));
+            return true;
+        };
+        let task_cancel = cancel.clone();
+        let waiter = tokio::spawn(async move {
+            let outcome = radius_share::upload_share_artifact(
+                &gateway,
+                &token,
+                body,
+                &cyrup_provider::EnvAuthContext,
+                &task_cancel,
+            )
+            .await;
+            let _ = tx.send(ShareMsg::radius(outcome.map_err(|e| e.to_string())));
+        });
+        self.state.share_in_flight = Some(ShareInFlight {
+            task: waiter.abort_handle(),
+            // No temp file on this path — the export is POSTed from memory.
+            tmp: None,
+            cancel,
+        });
+        true
     }
 
     /// Finish a settled `/share` on the run loop's task — pi's post-`await` tail
@@ -1164,18 +1331,29 @@ impl<B: Backend> App<B> {
         // `restoreEditor(loader, context)` — the loader comes down before anything is printed.
         self.state.loader = None;
         self.state.share_in_flight = None;
-        // pi's `finally { fs.unlinkSync(tmpFile) }` (`:76-84`): every path unlinks, cancellation
+        // pi's `finally { fs.unlinkSync(tmpFile) }` (`:78-87`): every path unlinks, cancellation
         // included (the cancel path unlinks too, so this is a no-op there — `remove_file`'s error is
-        // deliberately ignored, exactly as upstream's `catch {}` ignores it).
-        let _ = std::fs::remove_file(&msg.tmp);
-        // pi re-checks `loader.signal.aborted` on EVERY completion path (`:174`, `:191-199`) and
+        // deliberately ignored, exactly as upstream's `catch {}` ignores it). The Radius path has no
+        // temp file to unlink, which is why `tmp` is an `Option` — upstream's `for (const tmpFile of
+        // [jsonlFile, htmlFile])` skips a `null` the same way (`:79-86`).
+        let result = match msg.upload {
+            ShareUpload::Gist { result, tmp } => {
+                let _ = std::fs::remove_file(&tmp);
+                result
+            }
+            ShareUpload::Radius(outcome) => {
+                self.apply_radius_share_outcome(outcome);
+                return;
+            }
+        };
+        // pi re-checks `loader.signal.aborted` on EVERY completion path (`:180`, `:198`) and
         // returns without touching the UI: `gh` may have settled in the window between the user's
         // Escape and the abort landing, and a cancelled share must print neither a gist URL nor a
         // `share error:` line over the top of `Share cancelled`.
         if std::mem::take(&mut self.state.share_cancelled) {
             return;
         }
-        match msg.result {
+        match result {
             Ok(out) if out.status.success() => {
                 // TUI-063 — pi does NOT surface the raw gist URL on its own. It peels the gist ID
                 // off the URL `gh` printed and renders the VIEWER link built from it:
@@ -1229,6 +1407,45 @@ impl<B: Backend> App<B> {
                 .state
                 .transcript
                 .push_status(format!("share error: {e}")),
+        }
+    }
+
+    /// The Radius half of the settled-`/share` tail — pi `tryShareViaRadius`'s `:125-149`.
+    /// DRIFT-053.
+    ///
+    /// `Err(_)` is [`cyrup_provider::ProviderError::Aborted`] reaching here as a string: pi's
+    /// `if (loader.signal.aborted) return true` (`:125`, `:130`) and its `catch`'s
+    /// `if (!loader.signal.aborted)` guard (`:142`) all end the same way — print NOTHING, because
+    /// the cancel path already printed `Share cancelled`.
+    fn apply_radius_share_outcome(
+        &mut self,
+        outcome: Result<cyrup_provider::providers::radius_share::RadiusShareOutcome, String>,
+    ) {
+        use cyrup_provider::providers::radius_share::RadiusShareOutcome;
+        // The same re-check the gist tail does, for the same reason: the POST may have settled in
+        // the window between the user's Escape and the abort landing.
+        if std::mem::take(&mut self.state.share_cancelled) {
+            return;
+        }
+        match outcome {
+            // `context.showStatus(\`Share URL: ${hyperlink(shareUrl, shareUrl)}\`)` (`:139`). The
+            // OSC-8 wrapping of the URL is `TUI-020`'s (it needs a paint-time emitter, the same
+            // residual `login_dialog.rs` records); the STATUS and its text are pi's.
+            Ok(RadiusShareOutcome::Shared { url }) => {
+                self.state
+                    .transcript
+                    .push_status(format!("Share URL: {url}"));
+            }
+            // `context.showError(\`Failed to upload Radius artifact: ${…}\`)` (`:133-136`,
+            // `:144-146`). `showError` builds its own `Error: ` prefix
+            // (`interactive-mode.ts:3878-3882`) while `Entry::Error` renders verbatim, so the
+            // prefix is supplied here — the shape every other `showError` port in this file uses.
+            Ok(RadiusShareOutcome::Failed { detail }) => {
+                self.state
+                    .transcript
+                    .push_error(format!("Error: Failed to upload Radius artifact: {detail}"));
+            }
+            Err(_aborted) => {}
         }
     }
 }
