@@ -617,6 +617,35 @@ fn registered_shortcut_handler_actually_runs() {
 }
 
 #[test]
+fn a_shortcut_registered_with_capitals_still_dispatches_on_the_normalized_key() {
+    // EXT-076 — the host lowercases the key before dispatch
+    // (`ExtensionRegistry::resolve_shortcuts_inner`) while `register_shortcut` stores the
+    // author's spelling verbatim, so an exact compare in `execute_shortcut` never found a
+    // handler an author wrote as `"Ctrl+G"`: the press resolved an owner and then died with
+    // `no such shortcut: ctrl+g`. Regression introduced by EXT-039 (`9c25f603`), which moved
+    // the production path onto the normalized keys.
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let fired = Rc::new(Cell::new(false));
+    let f = fired.clone();
+    let mut api = ExtensionApi::new();
+    api.register_shortcut("Ctrl+G", "do the thing", move |_ctx: &Ctx| {
+        f.set(true);
+        Ok(())
+    });
+
+    let ctx = Ctx::new();
+    assert!(
+        api.execute_shortcut("ctrl+g", &ctx).is_ok(),
+        "the normalized key the host dispatches must reach a handler registered with capitals"
+    );
+    assert!(fired.get(), "the handler ran");
+    // The author's own spelling keeps working, and an unknown key is still an error.
+    assert!(api.execute_shortcut("Ctrl+G", &ctx).is_ok());
+    assert!(api.execute_shortcut("ctrl+z", &ctx).is_err());
+}
+
+#[test]
 fn tool_call_carries_a_cancellation_signal() {
     // The tool `execute` call now bundles a `signal` (Pi `ToolDefinition.execute` signal param,
     // sdk gap #1). On the host target the poll is inert (false); the live wasm E2E proves the real

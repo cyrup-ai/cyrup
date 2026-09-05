@@ -781,7 +781,19 @@ impl ExtensionApi {
     /// routes here when the host reports the matching `KeyId` fired. Returns an error for an unknown
     /// key (never a panic).
     pub fn execute_shortcut(&self, key: &str, ctx: &Ctx) -> Result<(), String> {
-        match self.shortcuts.iter().find(|s| s.key == key) {
+        // EXT-076: the host dispatches the NORMALIZED (lowercased) key —
+        // `ExtensionRegistry::resolve_shortcuts_inner` emits `key.to_lowercase()` — while
+        // `register_shortcut` stores the author's key verbatim, so an exact compare here never
+        // finds a handler registered as e.g. `"Ctrl+G"`. Upstream is structurally immune because
+        // `setupExtensionShortcuts` captures the handler off the normalized map rather than
+        // re-looking it up by the pressed key; matching case-insensitively is the same guarantee
+        // at this seam. Shortcut keys are ASCII (`ctrl+alt+f`, `Ctrl+G`), so ASCII folding is the
+        // right comparison and avoids Unicode-case surprises in a lookup key.
+        match self
+            .shortcuts
+            .iter()
+            .find(|s| s.key.eq_ignore_ascii_case(key))
+        {
             Some(s) => s.handler.execute(ctx),
             None => Err(format!("no such shortcut: {key}")),
         }
