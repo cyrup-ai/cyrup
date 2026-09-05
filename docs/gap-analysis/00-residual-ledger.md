@@ -5,6 +5,287 @@ next work item**.
 
 ---
 
+# RECONCILED 2026-09-04 → 2026-09-05 (ninth edition) — batch 3: nineteen rows closed, two partially, one refuted; **the set above `medium` is EMPTY for the first time**, and this pass filed seven new rows against the code the batch itself landed
+
+> **Read this block before planning.** cyrup **code** HEAD **`824a539e`**, branch
+> `claude/parity-batch3`, cut from `main` = `3e9633c4`. That is the last CODE commit of the batch —
+> `fix(tui,session-svc,ext,intercom): TUI-046 DRIFT-041 EXT-006 ICOM-054 review fixes`. The docs
+> commit carrying this block cannot cite its own sha, and a status is measured against code, not
+> against the doc commit that describes it. 51 commits off the base, 23 of them touching
+> `crates/`/`xtask`.
+>
+> **Dating.** The batch's brief was written 2026-09-04 and the first half of the work carries that
+> date; a container restart pushed the second half into 2026-09-05, and every closure mark in the
+> area files matches its own commit's date. This edition is therefore dated across both days rather
+> than to the one the brief named.
+>
+> **Counts are `scripts/count_open_items.py`'s, re-run after every correction below was written:**
+> **91 open = 0 critical, 0 high, 15 medium, 76 low; 583 closed; 6 trackers** (eighth edition:
+> 103 = 0/1/28/74, 564 closed). §0 of `PARITY-GAPS.md` carries the per-area table and §0a the
+> above-medium set; neither is duplicated here.
+>
+> **The arithmetic, stated so the headline cannot flatter itself.** 583 − 564 = **19 rows closed**.
+> Open went 103 → 91, which is −12 and not −19, because **this ledger pass filed seven NEW rows** —
+> six of them against defects in the code this very batch landed, found by reviews that blocked and
+> were then not answered before the batch ended. A batch that closes nineteen rows and opens seven
+> has closed twelve, and that is the number to plan against.
+
+## The above-medium set is EMPTY — what that does and does not mean
+
+`SUBA-074` was the last row above `medium` in the ledger, and it is genuinely closed: stage 1 (the
+refusal) at `bf8b0f9`, stage 2 (the capability/status contract, the hardened external-CLI runner, the
+generic no-adapter path and the `claude-code` adapter) at `af1a8a76`, review-fixed at `95a55ea1`.
+`codex-exec`, `cursor-agent` and the whole `external-job` protocol stay deferred and are refused BY
+NAME through an exhaustive `RunnerDispatch`, never silently widened. The row now writes out what
+landed, what is deferred and why, and the design decision with its rejected alternatives.
+
+`scripts/count_open_items.py` prints `Above-medium open rows (0)` across all fourteen tables. **No
+prior edition has been able to print that line.** What it means: no row currently carries a
+`critical` or `high` severity cell. What it does NOT mean:
+
+* **It is not "the port is finished."** 91 rows are open, 15 of them `medium`, and `README.md`'s
+  *Where this analysis is blind* is unchanged — an item-driven analysis cannot see behaviour nobody
+  filed an item for, and **whatever is open is a floor, never a total**.
+* **It is not "nothing serious is left."** Severity is a per-row judgement made when the row was
+  written; six of this edition's fifteen mediums were filed in the last two days, which is a
+  statement about how recently anyone looked, not about how bad the remainder is.
+* **It is not durable.** The fifth edition recorded the above-medium set turning over *completely* in
+  one pass, twice acquiring criticals that had not existed a week earlier. Expect this line to be
+  false again the next time a surface is walked.
+
+## What closed, and on what evidence — every row re-opened in its area file, not taken from a commit subject
+
+Nineteen rows, each with a landing sha that exists and whose subject matches the claim (all 27 shas
+cited across the batch were resolved with `git rev-parse` this pass):
+
+* **`SUBA-074`** (was the last `high`) — external-CLI runner + capability contract + `claude-code`
+  adapter, `af1a8a76` / `95a55ea1`. See above.
+* **`SUBA-093`** `07f2df0d` — parallel-group members flattened into `RunStatus::steps` so a
+  child-scoped stop can address one. **`SUBA-094`** `f9de9fe7` — `display` carried on the custom
+  message, so a hidden completion notice is no longer drawn.
+* **`EXT-003`** `605f483c` — the pre-trust `with_wasm` fallback. **Landed under `TUI-N02`'s subject
+  and body**, which is recorded as a scope defect on both rows rather than tidied away.
+  **`EXT-006`** `1739fcc4` — renderers get display options + theme and are re-invoked when either
+  moves. **`EXT-039`** `9c25f603` — the reserved-keybinding gate wired into the TUI, precedence
+  inverted to match `custom-editor.ts`.
+* **`TUI-N02`** `605f483c` · **`TUI-N11`** `f061bf35` · **`TUI-004`** `1f53b8bd` (the `/reload`
+  half; the mode-2031 half stays the reasoned divergence the item's own Fix asks for).
+* **`SEAM-015`** `abb8b5e3` / `8f1b5e76` · **`ICOM-054`** `87421cd7` · **`ICOM-055`** `c440c038`.
+* **`DRIFT-004`** `8b688401` (the WASM guest bash-operations tier) · **`DRIFT-041`** `ce81dba9` /
+  `824a539e` (pi's templated HTML export, five byte-identical assets) · **`DRIFT-053`** `9de4254b`
+  (`/share`'s Radius-first path).
+* **`CFG-078`** `69f6c4e1` · **`CFG-079`** `0a697d62` · **`CFG-080`** `9a7c0fdb`.
+
+**Partial, and correctly left OPEN with severity intact so the script still counts them:**
+`DRIFT-009` (`9e2bfda5` — the four unembeddable catalogs accounted for and pi's own differ ported;
+the catalog floor itself stands) and `TUI-046` (`8bb0d22f`, then **bit 4 REVERTED** at `824a539e`
+because it broke every shift chord — the row is now `low` and still open).
+
+**Refuted, not closed by work:** `TOOL-022`. All three limbs (`renderShell`, `prepareArguments`,
+`label`) already reached a guest tool at HEAD; the missing consumer had landed in `75532cee`
+(`EXT-024`), which `git merge-base --is-ancestor` confirms reached `main` before this branch was cut.
+Docs-only closure at `5ad1a419`. Its `label` half is **parity, not a gap** — pi copies `label` at
+`core/tools/tool-definition-wrapper.ts:11`/`:39` and reads it nowhere.
+
+## Seven rows filed BY this pass, all against code this batch landed
+
+Six came out of batch-3 reviews that blocked and were not answered before the batch ended; one is a
+residual whose own closure asked for an id. Every one was re-derived on both sides by this pass
+before it was written — the Rust at HEAD `ba380e58`, the TypeScript with `git -C tmp/<repo> show`.
+
+| id | sev | what | why it is a new id rather than a re-opening |
+|---|---|---|---|
+| `SUBA-095` | medium | `exec/external_cli/run.rs`'s select loop still has two escapes from its own deadline and stop arms: a post-loop unguarded `child.wait()` reached when both pipes EOF before the child exits, and `biased` starvation of the deadline/stop arms by an always-ready `rx.recv()`. Upstream's `registerTimeout`/`registerStop` are event-loop callbacks independent of stream state (`external-cli-runner.ts:361-362` @v0.64.0) | `SUBA-074`'s own gap — external runners unported — is genuinely closed. This is a defect in the code that closed it |
+| `DRIFT-054` | medium | The templated HTML export drops `systemPrompt` and `tools`, so **every** exported document silently loses its System Prompt and Available Tools sections, on `/export`, `/share` and RPC `export_html` alike. pi always passes `this.state` (`agent-session.ts:3438` @v0.84.4) into `exportSessionToHtml`, which sets both keys (`export-html/index.ts:263-269`), and the byte-identical `template.js` this batch shipped renders both blocks from them (`:1405-1435`) | `DRIFT-041`'s subject — a 131-line text dump vs a templated document — is closed. The payload being two keys short is a new defect, and the row asserted the opposite |
+| `EXT-076` | medium | A non-lowercase extension shortcut key is normalized on install but dispatched by exact, case-sensitive match, so its handler is never found. A **regression**: before `9c25f603` the production line installed the raw keys from `shortcut_specs()` | `EXT-039`'s subject — the reserved-key gate and the precedence inversion — is closed |
+| `TUI-096` | low | A theme that fails to load repaints dark in silence and `active_name()` keeps the broken name. pi's `applyThemeName` also seats `"dark"` AND surfaces ``Failed to load theme "…": …\nFell back to dark theme.`` under `showError`, which is `true` on both naming branches (`theme-controller.ts:126-135`, `:64`, `:70`) | `TUI-004`'s `/reload` re-apply is ported; its row claimed the whole failure path and had ported half |
+| `TUI-097` | low | Ctrl+X and `/copy` are one `AppCommand::Copy`, so `/copy` prefers a live selection where pi always copies the last assistant message (`interactive-mode.ts:2910` vs `:3022`, the selection leg gated at `:6117-6127`) | `CFG-078`'s residual 2, which asked for its own row and its own red-before test |
+| `SEAM-118` | low | `--no-builtin-tools` leaves `grep`/`find`/`ls`/`powershell` active where pi's `options.noTools ? []` starts a session with **no** built-in active (`sdk.ts:261-262`) | `CFG-079`'s residual 2, filed in area 08 because that area owns `cyrup-session-svc/src/builder.rs` |
+| `DRIFT-055` | low | `/share` uploads the whole session tree with original `parentId`s and the stored header timestamp, where pi uploads `getBranch()` linearised with a fresh one (`core/session-export.ts:21-38`) | `DRIFT-053`'s residual (d), which asked for its own id |
+
+## Corrections this audit made in place — two of them were FALSE claims in CLOSED rows
+
+The batch's own reviews found these and the batch ended without answering them; the reviews'
+findings were re-derived here rather than trusted, and **one review claim was itself refuted**.
+
+1. **`DRIFT-041`'s residual list was false.** It said "one residual, low: `renderedTools`" in three
+   places. Corrected, and the real second residual filed as `DRIFT-054`. Two in-source claims carry
+   the same false statement and need a CODE pass:
+   `crates/cyrup-session-svc/src/session/transcript.rs`'s *"Its one residual is `renderedTools`"* and
+   `src/export/mod.rs`'s `SessionData` doc, which excuses the absence as *"what `JSON.stringify`
+   produces for pi's own `exportFromFile`"* — but `exportFromFile` is `cyrup --export`'s path, not
+   the path any front-end takes.
+2. **`TUI-004`'s row equated half of `applyThemeName` with all of it.** Corrected; filed as
+   `TUI-096`.
+3. **`EXT-039`'s `ExtensionShortcut` citation did not resolve.** `types.ts:1547-1552` @v0.84.4 is the
+   OAuth provider block; the interface is at **`:1611-1616`**. Fixed in both area-06 sites. Four
+   in-source copies remain (`crates/cyrup-ext/src/registry.rs`,
+   `crates/cyrup-ext/src/tests/payload_and_seam_parity.rs`, `crates/cyrup/src/interactive.rs`,
+   `crates/cyrup-tui/src/app/state.rs`) and need a code pass.
+4. **Two area-13 cyrup citations did not resolve, one of them on the re-audit's only new `critical`.**
+   `URL_BOUND_AUTH_FIELDS` is at `config.rs:2274`, not `:1702` (`:1702` is the `AuthMode` derive);
+   `ConfigContext::sources()` is at `:3231`, not `:2578` (`:2578` is `read_imported_config`). The
+   substance of both rows re-derives exactly — upstream really is five fields at
+   `v2.32.1:config.ts:525` with the delete loop at `:572`, and the ladder really has no manifest
+   rung.
+5. **`05-cyrup-config-and-resources.md` carried TWO `## CFG-079` sections**, the second unstruck and
+   reading as open work: the closure block had been inserted as a new section rather than in front of
+   the original. Demoted to a "superseded text follows" marker, so the file carries one section per
+   id again.
+6. **Six closed detail sections had headings that did not carry a closure mark**, so a reader
+   scanning `## ` headings saw open items — `SUBA-074`, `EXT-006`, `EXT-039`, `TUI-004`, `TUI-N11`,
+   `DRIFT-004` (plus `DRIFT-041`/`DRIFT-053`/`CFG-078`/`CFG-079`/`CFG-080` normalised to the
+   `~~sev~~ **CLOSED date**` form their siblings use).
+7. **Stale-by-a-day cyrup line citations repaired by re-finding each SYMBOL, never by shifting an
+   offset** — `TOOL-022`'s (rotted by `EXT-006`, `DRIFT-004` and `CFG-078` rewriting `world.wit`,
+   `host/live.rs` and `app/state.rs` after it was written), `TUI-N02`'s (rotted by `TUI-004`
+   inserting 27 lines into `run_arms.rs`), `SEAM-015`'s and `EXT-003`'s. Each carries a dated note
+   saying so. `SEAM-015`'s `agent-session.ts:2782` is corrected to `:2993` — the expression moved
+   between v0.83.0 and the ADR-0006 target v0.84.4, and **17 in-tree copies of the stale number
+   remain** across six crates.
+8. **`SEAM-015`'s guest-tier residual was discharged and read as open** — `DRIFT-004` landed
+   `GuestBashOperations` later in the same batch. Struck.
+9. **`ICOM-055`'s "`E_SENDER_NOT_FOUND` belongs to a different gap"** was true when written and stale
+   by the end of the batch: `ICOM-054` *was* the different gap and every refusal now carries its
+   code. Struck.
+10. **One review claim REFUTED rather than applied.** The batch-3 second review reported `DRIFT-009`'s
+    three `scripts/diff-model-catalog.mjs` citations as each off by one. All three were re-derived at
+    `v0.84.4` and are **exact**: `sortJsonKeys` opens at `:96` and `canonicalizeJson` closes at
+    `:114`, `THINKING_LEVEL_ORDER` is `:93`, the no-parent-key array arm is `:106`. The row was right
+    and is left alone; the refutation is recorded in it.
+
+## The container restart, and what it cost
+
+The batch was interrupted by a container restart with **nine code commits already landed and
+unreviewed**, and one agent was killed mid-item. Three consequences are on the record because they
+are the shape a restart leaves behind, not because they were unusual:
+
+* **`TUI-N02` was recovered from a killed agent's uncommitted work** and landed at `605f483c` with
+  its row already closed. That recovery is also how `EXT-003`'s whole fix came to land under
+  `TUI-N02`'s subject and body with `EXT-003`'s row still asserting the opposite — a scope defect
+  caught by review and now recorded on both rows.
+* **`1739fcc4` (`EXT-006`) left the tree unbuildable for `cargo nextest run -p cyrup-session-svc`**
+  for two commits: it re-signed `render_tool_call_outcome`/`render_tool_result_outcome` with a third
+  parameter and missed five call sites in `crates/cyrup-session-svc/src/tests/custom_tool_render.rs`.
+  Repaired at `b0f9fbe5`. Bisect-hostile, and the commit's own check list named four crates and not
+  the one it broke.
+* **Reviews that blocked were not all answered before the batch ended.** Six of the seven rows this
+  pass filed are review findings that survived to the end of the batch unfixed. The restart did not
+  create them; it removed the slack that would otherwise have closed them.
+
+The **disk** is the other standing cost: it hit 100% three times across the batch. Agents recovered
+by deleting `target/debug/incremental` and `~/.cargo/registry/cache` — both regenerable caches,
+never `target/` itself — and several checks were skipped for it, which is recorded honestly per row.
+
+## Residual leads this batch produced — recorded, NOT counted
+
+Ownerless unless an id is named. These are leads, not items: neither side has been re-read to the
+standard *Working an item* sets.
+
+* **`cargo nextest run -p cyrup-it --features it` was not run for most of the batch**, and the
+  `492/493/494` figures several rows quote are taken from commit bodies rather than measured by any
+  reviewer. `EXT-006`'s agent did run the `ext` target (46/46) and `ICOM-054`'s ran
+  `-E 'binary(intercom)'` (80/80); everything else is unverified. **This is the single largest
+  unmeasured claim in the batch.**
+* **17 in-tree `agent-session.ts:2782` citations** across `cyrup-ext`, `cyrup-ext-sdk`, `cyrup-tools`,
+  `cyrup-session-svc`, `cyrup-modes` and `cyrup-it` should be `:2993` at the ADR-0006 target. One
+  sweep, no behaviour.
+* **`crates/cyrup-tui/src/tests/startup_resources_panel.rs`** cites `(:1986, :5993)` for
+  `showDiagnosticsWhenQuiet: true`; `:5993` is right, `:1986` should be `:1982`.
+* **The `[Extension issues]` panel omits pi's MIDDLE tier.** Upstream assembles load errors →
+  `getCommandDiagnostics()` → `getBuiltInCommandConflictDiagnostics()` → `getShortcutDiagnostics()`
+  (`interactive-mode.ts:1872-1886` @v0.84.4); `StartupReport::from_session` folds the first and last
+  only. Area 07 already owns a row for the command tier, whose body still names the now-deleted
+  `build_startup_report` in the present tense.
+* **Dead-but-shipped surface in `cyrup-ext-subagents`**: `ClaudeCodeParser::AFTER_TERMINAL` and the
+  `AfterTerminal` enum have no production reader, and their one test asserts a constant against its
+  own definition. `af1a8a76`'s body claims the divergence is "a named constant rather than an `if`";
+  at HEAD the `if` is what is there.
+* **`runner_to_json_string`'s `capabilities` comment states the opposite of what the code does** —
+  it claims upstream's capability ORDER survives, but the values are collected into a
+  `serde_json::Map` and this workspace deliberately does not enable `preserve_order`, so the emitted
+  object is alphabetical.
+* **The shortcut key is three stringly-typed copies with three normalization policies**
+  (registry-as-registered, `ShortcutSpec.id`-as-normalized, guest `Shortcut.key`-as-registered).
+  `EXT-076` fixes the symptom; a `KeyId` newtype whose only constructor normalizes would make the
+  third copy unrepresentable.
+* **`ExtensionRegistry::resolve_shortcuts`** (the owner-only projection) has no production caller
+  left after `EXT-039` — it survives only as one test's drift-check counterpart.
+* **A two-lock TOCTOU on the export leaf**: `AgentSession::export_to_html` takes the manager lock
+  once for `export_jsonl` and again for `export_leaf_id`, where pi reads entries and leaf in one
+  synchronous object literal. An append between them yields a leaf absent from the entries, and
+  `template.js` walking an unknown id produces an EMPTY document — the exact failure the leaf fix
+  existed to prevent.
+* **29 markdown table rows across the area files have the wrong cell count**, because a `|` inside a
+  cell (usually a JS `||` or a Rust closure `|s|` in an inline code span) was never escaped, so the
+  row renders short and its trailing columns vanish. Measured this pass with a five-line script
+  over every `|---|` separator and the rows beneath it; **none was introduced by batch 3** (the
+  same script found zero new ones in this pass's own diff). It is mechanical and belongs with the
+  citation-resolver CI check `README.md`'s *Work this directory owns* already asks for.
+* **pi's two `exportSessionToHtml` guards are unported** — `"Cannot export in-memory session to
+  HTML"` and `"Nothing to export yet - start a conversation first"` (`export-html/index.ts:245-250`).
+  cyrup writes a valid-but-empty document and reports success.
+
+## Area 13 — the MCP port, re-audited at `pi-mcp-adapter` v2.32.1
+
+Folded in here from `11b9994a` because no cross-cutting file had recorded it, and because the eighth
+edition's *Recommended next batch* put area 13 first. **Area 13 remains counted separately from the
+fourteen tables above** and nothing in this file speaks for its unit inventory — the structural
+reason is in `README.md`'s *Area 13* section: the fourteen measure drift in code that exists, area 13
+specifies code that does not exist yet, and the two cannot be added.
+
+* **The clone was re-pulled to `v2.32.1` and the area files were opened against it** — the prior
+  record said "clone re-pulled, area 13 NOT re-audited". That is no longer true, and `README.md`'s
+  Baselines row is updated to say so.
+* **The upstream delta**: `git diff --stat v2.26.1..v2.32.1` = **147 files, +16,014 / −1,001**;
+  `git rev-list --count` = **72 commits** (68 `--no-merges`). *The re-audit first said 79; corrected
+  at `b18fe2ff`, and the file/line figures on either side of it re-derive exactly.* 66 of the 147
+  are tests; production TypeScript changed in 38 files, six of them new.
+* **The census, re-derived by re-parsing the unit table** (not carried from prose): the pre-re-audit
+  baseline is **214 implemented / 98 partial / 98 missing / 27 n-a of 437**, and the counted figure
+  after this pass is **244 / 82 / 84 / 27 of 437** — 166 open. Thirty rows moved to `implemented`,
+  each carrying a citation.
+* **That counted column is a FLOOR, not the answer**: 159 open rows were not opened this pass and are
+  counted exactly as they stood. The extrapolation — a 1-in-6 systematic sample closing 26 of 33,
+  p̂ = 0.788, Wilson 95% CI [0.622, 0.893] — puts roughly **76 open of 477 units, 95% interval ~59 to
+  102**, once the 40 new units this pass filed (35 of them open work) are added. **It is an
+  extrapolation from a sample; do not quote it as a count.**
+* **Four new criticals/highs were filed against `crates/cyrup-mcp`**, of which the load-bearing one is
+  `MCP-500`: `URL_BOUND_AUTH_FIELDS` is five fields upstream and four in cyrup. It is not a live leak
+  *today* only because `bearerTokenStore` (`MCP-501`) is unported — **land the two together, never
+  `MCP-501` first**. `crates/cyrup-mcp/src/config.rs`'s own header comment asserts *"the symbol
+  appears at no upstream tag"*, which is **false at v2.32.1** and must be corrected in the same
+  change.
+* **The 13 `TODO(MCP-NNN)` markers in `crates/cyrup-mcp/src` are a floor on the open set, not its
+  size** — six ids are open at HEAD with no marker. `README.md`'s "9 `TODO(MCP-NNN)` ids remain" is
+  corrected to 13 with that caveat.
+
+## Recommended next batch
+
+Ranked by what a wrong entry costs, not by effort.
+
+1. **The six rows this pass filed against batch-3's own code, as one batch** — `SUBA-095`,
+   `DRIFT-054`, `EXT-076` (all `medium`), then `TUI-096`, `TUI-097`, `SEAM-118`, `DRIFT-055`. They
+   are small, they are all in code landed in the last two days while the context is still recoverable,
+   and three of them are things a closed row currently denies. Doing them first also closes the
+   review-debt loop the restart opened, instead of letting it compound into a fourth batch.
+2. **Run `cargo nextest run -p cyrup-it --features it` and publish the number.** It is the batch's
+   largest unmeasured claim, three rows quote figures nobody re-derived, and two of the commits
+   under those rows add tests to that suite. `CYRUP_IT_BIN_DIR=/home/user/cyrup/target/debug` is what
+   makes it fit on a full disk.
+3. **Area 13, `MCP-500` + `MCP-501` together**, with the false `config.rs` header comment corrected in
+   the same change. It is the only credential-shaped item in the directory, and the eighth edition
+   already put area 13 first.
+4. **The remaining twelve mediums** — areas 01, 05 (4), 06 (2 after `EXT-076`), 09 (3), 12 (1 after
+   `DRIFT-054`). Rank port bugs above version lag above test defects, as the eighth edition did.
+5. **The citation rot, once, mechanically.** Two of this pass's ten corrections and three of its
+   repairs were line numbers that had rotted within a *day*. `README.md`'s *Work this directory owns*
+   has proposed a CI check that resolves every `<file>.rs:<line>` and fails past EOF for three
+   editions running; until it exists, every pass will keep spending its budget here. **Prefer a
+   `file::symbol` citation to a `file:line` one wherever the symbol is unique** — this pass repaired
+   in that form where it could.
+
+
 # RECONCILED 2026-09-04 (eighth edition) — batch 2: twenty-five medium rows worked in one day on landed code; 18 closed, 6 partially closed, 1 refuted; the set above medium is still ONE row
 
 > **Read this block before planning.** cyrup **code** HEAD **`6cf2cb9f`**, branch

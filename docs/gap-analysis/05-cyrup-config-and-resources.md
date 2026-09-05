@@ -1570,7 +1570,7 @@ Covers `cyrup/crates/cyrup-config` (settings, auth store, trust, model resolutio
 
 **Verify** — already pinned, and no test-coverage sub-gap should be filed against this: nine `npt_*` cases in `crates/cyrup-resources/src/tests/resources/prompt_namespaces.rs` cover name derivation and expansion (`:25`), the dir-names-only skip rules (`:81`), the depth cap warning once per refused dir (`:115`), symlink policy (`:167`), `load_with_root` derivation edges (`:217`) and its non-UTF-8 component error (`:285`), load-error-becomes-warning (`:312`), precedence shadowing and case collision (`:344`), and — the one that guards the four call sites this row enumerates — `npt_all_directory_and_single_file_call_sites` (`:367`).
 
-## ~~CFG-078~~ — `fullscreenExitOutput` and `fullscreenCopyOnSelect` (v0.84.4 additions) are not modelled — **CLOSED 2026-09-05**
+## ~~CFG-078~~ — ~~low~~ **CLOSED 2026-09-05** — `fullscreenExitOutput` and `fullscreenCopyOnSelect` (v0.84.4 additions) are not modelled
 
 > **CLOSED 2026-09-05 — commit `69f6c4e1`, `crates/cyrup-config` + `crates/cyrup-tui` +
 > `crates/cyrup`.** Both halves of the `Fix` line below landed, and the `Verify` line's four
@@ -1665,7 +1665,7 @@ Covers `cyrup/crates/cyrup-config` (settings, auth store, trust, model resolutio
 
 **Verify** — round-trip both keys through `SettingsManager::set`/`EffectiveSettings` byte-faithfully (an unrecognized value degrades rather than errors, matching pi); assert the alt-screen exit path honours `fullscreenExitOutput` and the selection path honours `fullscreenCopyOnSelect`.
 
-## ~~CFG-079~~ — `defaultTools` (v0.84.4 addition) is not modelled — **CLOSED 2026-09-05**
+## ~~CFG-079~~ — ~~low~~ **CLOSED 2026-09-05** — `defaultTools` (v0.84.4 addition) is not modelled
 
 > **CLOSED 2026-09-05 — commit `0a697d62`, `crates/cyrup-config` + `crates/cyrup-session-svc`.**
 > Both halves of the `Fix` line below landed and all three of the `Verify` line's assertions are
@@ -1751,9 +1751,14 @@ Covers `cyrup/crates/cyrup-config` (settings, auth store, trust, model resolutio
 > it drops only pi's four and leaves `grep`/`find`/`ls`/`powershell` ACTIVE, while pi's
 > `options.noTools ? []` (sdk.ts:262) starts with no built-in active at all and only extension/SDK
 > tools on. It is adjacent to this row's arm but is not `defaultTools`, and it wants its own row and
-> its own red-before test rather than being smuggled into this closure.
+> its own red-before test rather than being smuggled into this closure. **Filed 2026-09-05 by the
+> batch-3 ledger pass as `SEAM-118` (low, open) in `08-cyrup-session-svc-and-modes.md`, which is
+> the area that owns `crates/cyrup-session-svc/src/builder.rs`.**
 
-## CFG-079 — `defaultTools` (v0.84.4 addition) is not modelled
+**Superseded text follows — the original filing of `CFG-079`, kept unedited.** *(Its `## `
+heading was demoted 2026-09-05 by the batch-3 ledger pass: the closure block above had been
+inserted as a NEW section rather than in front of this one, leaving the file with two
+`## CFG-079` sections, the second of them unstruck and reading as open work.)*
 
 **Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed
 
@@ -1767,7 +1772,7 @@ Covers `cyrup/crates/cyrup-config` (settings, auth store, trust, model resolutio
 
 **Verify** — round-trip the key through settings; assert an unset key still yields the full built-in tool set (pi's `undefined` fallback), and a set key narrows it.
 
-## ~~CFG-080~~ — An unauthorised `{"hard":0}` tool budget runs the child UNBUDGETED where pi's child refuses to start — **CLOSED 2026-09-04**
+## ~~CFG-080~~ — ~~low~~ **CLOSED 2026-09-04** — An unauthorised `{"hard":0}` tool budget runs the child UNBUDGETED where pi's child refuses to start
 
 > **CLOSED 2026-09-04 — commit `9a7c0fdb`, `crates/cyrup-ext-subagents` + `crates/cyrup`.** Fix
 > option **(a)** below — fail closed, carrying pi's own message — taken over option (b) because (b)

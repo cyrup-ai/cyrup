@@ -68,13 +68,13 @@ difference costs behaviour, the entry says so and stays on the list as work.**
 
 | | |
 |---|---|
-| cyrup HEAD | **`275c1f85`** — last CODE commit, 2026-09-04 (second pass), branch `claude/beautiful-feynman-odz1v5`, five commits off `main` = `a4805955`, which merged the `2571969` re-audit. *Superseded: `2571969` — measured 2026-09-04, branch `claude/gap-analysis-refresh` (off `main`), 210 commits ahead of the `4fb5e40` baseline that pass re-audited against; `e5c6933` at the third edition (2026-08-14, docs `0097149`); `04c1ba2` (docs `a9000b1`) when this file was first regenerated; `bdcb0d0` at the second edition. See `README.md`'s "Baselines measured against" table for the same figures kept current across passes.* |
+| cyrup HEAD | **`824a539e`** — last CODE commit of the 2026-09-04→05 batch-3 (eleventh-edition) pass (`fix(tui,session-svc,ext,intercom): TUI-046 DRIFT-041 EXT-006 ICOM-054 review fixes`, branch `claude/parity-batch3`, 51 commits off `main` = `3e9633c4`, 23 of them touching `crates/`/`xtask`). The docs commit that wrote this row cannot cite its own sha; a status is measured against code. *Superseded: `6cf2cb9f` (batch 2), `275c1f85` (second pass).* **Re-measure before trusting any status.** |
 | `pi` | ported baseline **v0.83.0** → latest **v0.84.4** (HEAD `6aedd1066`) · delta v0.83.0..v0.84.4 = 775 files, +68 885 / −20 827 |
 | `pi-subagents` | ported baseline **≈v0.43.0** (inferred — the crate records no version string) → latest **v0.64.0** (HEAD `a5f401e8`) · delta v0.43.0..v0.64.0 = 485 files, +92 664 / −18 069 |
 | `pi-permission-system` | ported baseline **v0.7.1** → latest **v0.8.0** (HEAD `9affcc9`) · delta 28 files, +4 023 / −1 851 — **re-checked 2026-09-04, unchanged from every prior edition's figure** |
 | `pi-intercom` | ported baseline **v0.9.2** *(prior docs said v0.7.0 — wrong, see §1d)* → latest **v0.13.0** (HEAD `199279a`, re-measured 2026-09-04, superseding the `v0.12.0` figure recorded 2026-08-27) · true window `v0.9.2..v0.13.0` = 26 files, +4 701 / −976 |
 | `code_puppy_core_plugins` | ported baseline **v0.0.6** *(not recorded in-crate; see `FLUX-007`)* → latest **v0.0.40** (HEAD `8c6f852`) · 139 files, +11 071 / −3 822 across the whole repo, but the *ported* surface (`flux_bootstrap/`) is byte-identical `v0.0.6..v0.0.40` — area 14's own re-derivation this pass |
-| `pi-mcp-adapter` | **counted separately** — area 13 (this repository's own work; the earlier "owned by the MCP team" note was wrong); not re-measured here, and the `v2.25.0..v2.32.1` window is the next area-13 audit's input |
+| `pi-mcp-adapter` | **counted separately** — area 13 (this repository's own work; the earlier "owned by the MCP team" note was wrong). Clone re-pulled and **area 13 RE-AUDITED against `v2.32.1` on 2026-09-04** (`11b9994a`), superseding the prior "not re-measured here" note: `v2.26.1..v2.32.1` = 147 files, +16 014 / −1 001, **72 commits** (68 `--no-merges`). Its census stays outside §0 by the standing counting rule |
 
 Read upstream with `git -C <repo> show <tag>:<path>`, never from a working tree — clone-HEAD line
 numbers and file existence both mislead. §7 says how much of this was first-hand.
@@ -83,6 +83,79 @@ numbers and file existence both mislead. §7 says how much of this was first-han
 
 ## 0. Census — every open item in the fourteen area files, by class
 
+> **ELEVENTH EDITION 2026-09-05 (batch 3), cyrup code HEAD `824a539e` — the same script, unchanged,
+> re-run after nineteen closures, two partial closures, one refutation and the seven new rows this
+> ledger pass filed against batch-3's own code.** `python3 scripts/count_open_items.py` from
+> `docs/gap-analysis/`, over the fourteen files' current `## Open items` tables (and `09a`'s
+> `## Summary — confirmed items` table), reproduced verbatim below; `SEAM-058` and `SUBA-005` remain
+> the two hand-counted trackers outside any table. **No script change this edition** — both carried
+> lists were already empty and the census is entirely table-derived.
+>
+> **What moved since the tenth edition (103 → 91 open; 564 → 583 closed):** `04` 2 → 1
+> (`TOOL-022` REFUTED — all three limbs already reached a guest tool at HEAD, the consumer having
+> landed in `75532cee` before this branch was cut); `05` 15 → 12 (`CFG-078`, `CFG-079`, `CFG-080`);
+> `06` 14 → 12 (`EXT-003`, `EXT-006`, `EXT-039` closed; **`EXT-076` FILED medium** by this pass);
+> `07` 30 → 29 (`TUI-004`, `TUI-N02`, `TUI-N11` closed; **`TUI-096` and `TUI-097` FILED low**);
+> `08` 4 → 4 (`SEAM-015` closed; **`SEAM-118` FILED low**); `09a` 3 → 1 (`SUBA-074` — the last
+> `high` — plus `SUBA-093` and `SUBA-094` closed; **`SUBA-095` FILED medium**); `11` 5 → 3
+> (`ICOM-054`, `ICOM-055`); `12` 7 → 6 (`DRIFT-004`, `DRIFT-041`, `DRIFT-053` closed;
+> **`DRIFT-054` FILED medium and `DRIFT-055` FILED low**); `01`, `02`, `03`, `09`, `10`, `14`
+> untouched. `DRIFT-009` and `TUI-046` are PARTIAL and correctly stay open with their severities
+> intact (`TUI-046` re-rated `medium` → `low`).
+>
+> **Read the arithmetic before quoting the headline.** 583 − 564 = nineteen rows closed, but open
+> fell only 103 → 91, because six of the seven new rows are defects in the code this batch landed —
+> raised by reviews that blocked and were not answered before the batch ended. A batch that closes
+> nineteen and opens seven has closed twelve.
+>
+> **Open set: 91 work items — 0 critical, 0 high, 15 medium, 76 low**, of which 89 sort into the
+> six Kind-derived classes and 2 do not (`EXT-058`, `PERM-032`).
+>
+> | area | open | crit | high | med | low | trackers | closed |
+> |---|---:|---:|---:|---:|---:|---:|---:|
+> | [01 core + provider](01-cyrup-core-and-provider.md) | 4 | 0 | 0 | 1 | 3 | 0 | 56 |
+> | [02 agent](02-cyrup-agent.md) | 3 | 0 | 0 | 0 | 3 | 1 | 28 |
+> | [03 session](03-cyrup-session.md) | 3 | 0 | 0 | 0 | 3 | 1 | 32 |
+> | [04 tools](04-cyrup-tools.md) | 1 | 0 | 0 | 0 | 1 | 0 | 33 |
+> | [05 config + resources](05-cyrup-config-and-resources.md) | 12 | 0 | 0 | 4 | 8 | 0 | 55 |
+> | [06 ext host](06-cyrup-ext.md) | 12 | 0 | 0 | 3 | 9 | 0 | 61 |
+> | [07 tui](07-cyrup-tui.md) | 29 | 0 | 0 | 0 | 29 | 0 | 77 |
+> | [08 session-svc + modes](08-cyrup-session-svc-and-modes.md) | 4 | 0 | 0 | 0 | 4 | 0† | 71 |
+> | [09 subagents](09-cyrup-ext-subagents.md) | 11 | 0 | 0 | 3 | 8 | 0† | 40 |
+> | [09a v0.57 drift](09a-cyrup-ext-subagents-v0.57-drift.md) | 1 | 0 | 0 | 1 | 0 | 0 | 22 |
+> | [10 permission system](10-cyrup-permission-system.md) | 1 | 0 | 0 | 0 | 1 | 1 | 22 |
+> | [11 intercom](11-cyrup-intercom.md) | 3 | 0 | 0 | 0 | 3 | 0 | 51 |
+> | [12 pi core drift](12-upstream-drift-pi-core.md) | 6 | 0 | 0 | 3 | 3 | 3 | 29 |
+> | [14 flux](14-cyrup-flux.md) | 1 | 0 | 0 | 0 | 1 | 0 | 6 |
+> | **total** | **91** | **0** | **0** | **15** | **76** | **6 + 2‡** | **583** |
+>
+> † `SEAM-058` and `SUBA-005` sit outside their files' `## Open items` tables (standalone
+> `## Trackers` sections) and print as 0 here; ‡ they are the "+ 2" hand-counted in the total.
+>
+> | class | n |
+> |---|---:|
+> | **Port bug** (`not-ported` + `parity-bug` + `port-divergence`) | **56** |
+> | **Version lag** (`upstream-drift`; the one open `09a` row counts here) | **15** |
+> | **Reverse lag** (`stale-port`) | **1** |
+> | **Test defect** (`test-defect`) | **1** |
+> | **Invented surface** (`cyrup-original`) | **15** |
+> | **Tooling** (`tooling`) | **1** |
+> | *(unclassified — `EXT-058`, `PERM-032`)* | 2 |
+> | | **91** |
+>
+> **Above-medium open rows: ZERO.** The script prints `Above-medium open rows (0)`. `SUBA-074` was
+> the last one and closed at `af1a8a76` / `95a55ea1`. **No prior edition of this census has been able
+> to print that line** — see §0a, which is now a statement rather than a table, and
+> `00-residual-ledger.md`'s ninth edition for what it does and does not mean.
+>
+> **Not counted, deliberately:** area 13 (`13-cyrup-mcp*.md`) stays outside this census by the
+> standing counting rule. **It HAS now been re-audited** against `tmp/pi-mcp-adapter` v2.32.1
+> (`11b9994a`), which the tenth edition recorded as still outstanding; the counted census is
+> **244 implemented / 82 partial / 84 missing / 27 n-a of 437**, a floor rather than an answer, with
+> the extrapolation and its interval in `00-residual-ledger.md`'s ninth edition and in
+> `13-cyrup-mcp-STATUS.md`.
+>
+> Every block below this one is superseded.
 > **TENTH EDITION 2026-09-04 (batch 2), cyrup code HEAD `6cf2cb9f` — the same script, re-run after the
 > twenty-five-row medium batch and its two independent reviews.** `python3 scripts/count_open_items.py`
 > from `docs/gap-analysis/`, over the fourteen files' current `## Open items` tables (and `09a`'s
@@ -511,6 +584,43 @@ Where the re-audit moved an item to a different class, the id moves section and 
 ---
 
 ## 0a. Everything above medium, in one table
+
+> **EIGHTH EDITION 2026-09-05 (batch 3), cyrup code HEAD `824a539e` — THE SET IS EMPTY. This section
+> is a statement, not a table, because there is nothing to tabulate.**
+>
+> `python3 scripts/count_open_items.py` prints `Above-medium open rows (0)` across all fourteen
+> tables. **No prior edition of this section has been able to say that.** The seventh edition's one
+> row, `SUBA-074`, closed in batch 3: stage 1 (the refusal) at `bf8b0f9`, stage 2 — the
+> capability/status contract, the hardened external-CLI runner, the generic no-adapter path and the
+> `claude-code`/`claude-code-writer` adapter — at `af1a8a76`, review-fixed at `95a55ea1`. The three
+> deferred surfaces (`codex-exec`, `cursor-agent`, the whole `external-job` protocol) are refused BY
+> NAME through an exhaustive `RunnerDispatch` with no `_` arm, so "did not refuse" can no longer be
+> what selects a full-capability native child. `09a`'s row and section carry the landed/deferred
+> split and the design decision with its rejected alternatives.
+>
+> **What this does NOT license, stated here because an empty section invites the wrong reading.**
+>
+> * **It is not a claim that nothing serious is open.** 91 rows are open, 15 of them `medium`, and
+>   §0's eleventh edition has the table. Severity is a per-row judgement made when the row was
+>   written; a `medium` that nobody has re-read is not evidence of a small problem.
+> * **It is not a claim that the analysis has looked everywhere.** `README.md`'s *Where this analysis
+>   is blind* is unchanged: an item-driven pass cannot see behaviour nobody filed an item for, so
+>   **whatever is open is a floor, never a total.**
+> * **It is not durable, and the record says so.** The fifth edition watched this set turn over
+>   completely in a single pass and acquire two criticals that had not existed a week before; the
+>   sixth celebrated "zero critical" and still carried eight rows. The next surface-driven sweep
+>   should be expected to refill it.
+> * **It is not a statement about area 13**, which is counted separately and whose own re-audit at
+>   `pi-mcp-adapter` v2.32.1 filed four new criticals/highs against `crates/cyrup-mcp` — `MCP-500`
+>   (`URL_BOUND_AUTH_FIELDS` is five fields upstream, four here) foremost. Those are not in this
+>   section by the standing counting rule, not because they are less serious.
+>
+> **Six of the fifteen open mediums were filed in the two days this batch ran**, three of them by the
+> ledger pass against batch-3's own landed code (`SUBA-095`, `DRIFT-054`, `EXT-076`). That is a
+> statement about how recently anyone looked, not about how good the remainder is, and it is the
+> first item on the recommended next batch in `00-residual-ledger.md`'s ninth edition.
+>
+> Every block below this one is superseded.
 
 > **BATCH-2 NOTE 2026-09-04 (eighth-edition ledger audit), cyrup code HEAD `6cf2cb9f`: the set is
 > UNCHANGED — still the one row below (`SUBA-074`, stage 2).** The twenty-five medium rows batch 2
