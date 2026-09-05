@@ -311,7 +311,28 @@ impl AgentSessionRuntime {
         factory: Arc<SessionFactory>,
         target: SessionTarget,
     ) -> Result<Arc<Self>, SessionServiceError> {
-        let session = factory.build(target, None).await?.into_shared();
+        Self::create_unannounced_at(factory, target, None).await
+    }
+
+    /// [`Self::create_unannounced`] with an explicit working directory, i.e.
+    /// `SessionFactory::build(target, cwd)` rather than `build(target, None)`.
+    ///
+    /// The factory's `base_config.cwd` is the one the **process** was launched in, which is the
+    /// right default for every front-end that is launched inside the project it serves — the TUI,
+    /// print/json, `--mode rpc`. It is the wrong default for a front-end whose peer *names* the
+    /// project: ACP's `session/new` carries a `cwd` (gap-analysis 15 `ACP-056`), and building with
+    /// `None` silently rooted that session in the editor's launch directory instead — wrong
+    /// services cwd, wrong session directory, and a transcript `session/list` could not find under
+    /// the cwd the client asked for.
+    ///
+    /// `Some(cwd)` binds it to both the rebuilt services and, for a `Resume` target, the resumed
+    /// manager's own `cwd_override`; see [`SessionFactory::build`].
+    pub async fn create_unannounced_at(
+        factory: Arc<SessionFactory>,
+        target: SessionTarget,
+        cwd: Option<std::path::PathBuf>,
+    ) -> Result<Arc<Self>, SessionServiceError> {
+        let session = factory.build(target, cwd).await?.into_shared();
         let diagnostics = collect_diagnostics(&session);
         let (gen_tx, _rx) = watch::channel(0);
         let this = Arc::new(Self {

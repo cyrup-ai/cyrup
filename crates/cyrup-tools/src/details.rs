@@ -17,6 +17,19 @@ pub struct BashDetails {
     pub truncation: Option<Truncation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub full_output_path: Option<String>,
+    /// The process exit code, on the non-zero-exit path only (`ACP-141`).
+    ///
+    /// Pi has no counterpart: its bash tool throws a string and the exit code survives only inside
+    /// `Command exited with code {n}`. Every front-end that wants the number then has to parse it
+    /// back out of a human-readable sentence — which is what pi-acp's `bashExitCode` does through
+    /// a four-key `Record<string, unknown>` probe that hits nothing, and why an ACP client showed
+    /// `terminal_exit.exit_code: 1` for `sh -c 'exit 42'`.
+    ///
+    /// Absent (not `null`) on every other path: a clean exit reports through the ordinary success
+    /// result, and a timeout or a kill has no exit code to report. Carried to the client by
+    /// `cyrup_acp::translate::bash_exit_code`, whose probe reads `details.exitCode` first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]

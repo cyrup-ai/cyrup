@@ -7,6 +7,15 @@ use super::enums::{Mode, OutputFormat};
 /// non-TTY stdin or stdout forces PRINT, and a full TTY pair selects the interactive front-end.
 /// `--mode text` is the DEFAULT (it does not force PRINT by itself — only `--print`/non-TTY does).
 pub fn resolve_app_mode(cli: &Cli, stdin_tty: bool, stdout_tty: bool) -> AppMode {
+    // ACP-002 — FIRST, and the position is the whole unit. An ACP agent is launched by an editor
+    // with pipes on both ends, so `!stdin_tty || !stdout_tty` is always true for it. Any branch
+    // ahead of this one that can match would resolve `Print`, and the host would then read the
+    // client's first JSON-RPC frame as a chat prompt and answer it as one-shot text on the stream
+    // the client is parsing as JSON-RPC. Nothing downstream can recover from that, which is why it
+    // is ordered rather than merely present.
+    if cli.acp || cli.mode == Some(Mode::Acp) {
+        return AppMode::Acp;
+    }
     if cli.rpc || cli.mode == Some(Mode::Rpc) {
         return AppMode::Rpc;
     }

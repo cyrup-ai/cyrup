@@ -39,7 +39,8 @@ use cyrup::{
     AppMode, Cli, Diagnostic, DiagnosticLevel, actions, apply_arg_leniency, bootstrap,
     build_inputs, diagnostics, interactive, migrations, normalize_short_aliases,
     partition_extension_flags, predispatch, prelaunch, render_help, resolve_app_mode,
-    run_json_dispatch, run_print_dispatch, run_rpc_dispatch, select_provider, session_launch,
+    run_acp_dispatch, run_json_dispatch, run_print_dispatch, run_rpc_dispatch, select_provider,
+    session_launch,
     should_take_over_stdout, spawn_abort_on_signal, timings,
 };
 use cyrup_config::{AuthStore, EnvVars};
@@ -246,8 +247,7 @@ async fn run() -> anyhow::Result<i32> {
 
     // Pi rewrites its multi-char short aliases in its hand-rolled parser; clap cannot express them as
     // native shorts, so normalize them up front (`-nt` ⇒ `--no-tools`, …).
-    let raw: Vec<String> = normalize_short_aliases(std::env::args());
-    let argv: Vec<String> = raw.iter().skip(1).cloned().collect();
+    let mut raw: Vec<String> = normalize_short_aliases(std::env::args());
 
     // The three internal, never-advertised subcommands — `__subagent-runner --config <path>`
     // (arch-SA §2.2/§6.5), `__intercom-broker` (cyrup-intercom-port.md §7.3) and
@@ -281,8 +281,28 @@ async fn run() -> anyhow::Result<i32> {
             set_process_name("cyrup-mcp-keyring");
             return Ok(cyrup::mcp_keyring_helper_cmd::dispatch());
         }
+        // ACP-001 — the `--terminal-login` gate. Unlike the three above it does NOT end the
+        // process: an ACP client's Authenticate button appends `AuthMethod.args` to the agent
+        // command it already holds, so this argv is `cyrup --acp … --terminal-login`, and the job
+        // is to become an ordinary interactive `cyrup` the user can type `/login` into.
+        //
+        // Two steps, in this order. ACP-026 first: with either end piped there is no terminal to
+        // land in, so refuse with a diagnostic rather than painting a TUI into a pipe (upstream's
+        // `spawnSync(cmd, [], {stdio:"inherit"})` does exactly that, silently). Then strip the
+        // gate's own token AND every ACP selector, so `resolve_app_mode`'s first branch — which
+        // ACP-002 deliberately put ahead of the TTY probe — does not answer `Acp` for a run whose
+        // entire purpose is to be a TUI. No `set_process_name` call: this IS `cyrup`, and `run`
+        // already named it that above.
+        Some(Internal::AcpTerminalLogin) => {
+            if let Some(code) = cyrup::acp_terminal_login_cmd::refuse_when_not_a_terminal() {
+                return Ok(code);
+            }
+            raw = cyrup::acp_terminal_login_cmd::strip(raw);
+        }
         None => {}
     }
+
+    let argv: Vec<String> = raw.iter().skip(1).cloned().collect();
 
     // PROV-047 — the BOOTSTRAP `httpProxy` install (pi main.ts:536-538). It sits HERE, above the
     // package/config pre-dispatch (:541), above the credential-print pre-dispatch (:557) and above
@@ -373,6 +393,11 @@ async fn run() -> anyhow::Result<i32> {
     // the resolved mode is known. SEAM-070.
     if mode == AppMode::Rpc {
         set_process_name("cyrup-rpc");
+    }
+    // ACP-002 / SEAM-070 — the same rationale as the `cyrup-rpc` line above: a distinct role name is
+    // what makes a stuck ACP host findable in `ps` next to the editor that spawned it.
+    if mode == AppMode::Acp {
+        set_process_name("cyrup-acp");
     }
 
     // Stdout takeover (Pi main.ts:535-537): for a non-interactive run that is not a plain-metadata
@@ -713,6 +738,60 @@ async fn run() -> anyhow::Result<i32> {
         anyhow::bail!("PI_STARTUP_BENCHMARK only supports interactive mode");
     }
 
+    // The ACP host (`ACP-002`, `ACP-003`, `ACP-021`). It gets its own arm, ahead of the shared
+    // non-interactive launch below, for one reason that is a unit in its own right.
+    //
+    // **`ACP-021` — the ACP arm must not inherit `require_model: true`.** The block below applies
+    // pi's modelless hard stop (main.ts:852-855) to both non-interactive hosts, and
+    // `session_launch::launch` executes it — `diagnostics::no_models_available()` then exit 1 —
+    // *before* `main` reaches `match mode`. Put `AppMode::Acp` on that leg and a credential-less
+    // launch dies before the transport exists: the editor sees a process that exited 1 having
+    // written `No models available. Use /login …` to stderr and **zero JSON-RPC frames**, which
+    // makes `ACP-010`, `ACP-012`, `ACP-016` and `ACP-017` structurally unreachable — the entire
+    // authentication surface. ACP takes Interactive's answer (SEAM-075: launch modelless and say so
+    // in-band) and reports the modelless state **over the wire**, per `ACP-017`.
+    //
+    // Here that is stronger than a `require_model: false`: `launch` is not called at all, because
+    // `ACP-003` requires the runtime to be built lazily on `session/new` (the host must announce
+    // after `initialize` settles, so a `session_start` handler sees `has_ui` and the client's
+    // advertised capabilities). Only the FACTORY is built here, which is cheap — `build_factory`
+    // constructs a `SessionFactory` and touches no session — and `cyrup::acp_host::BinaryAcpHost`
+    // does the rest when the client asks for it.
+    //
+    // No trust PROMPT callback is supplied, for the same SEAM-065 reason as the hosts below: pi's
+    // `resolveProjectTrusted` reads the saved-decision tier for every host and only the prompt is
+    // behind `hasUI`. `AppMode::can_prompt()` admits ACP at `decide_trust`'s step 5 (`ACP-002`), so
+    // an untrusted project reaching an ACP host resolves `NeedsPrompt` — which this arm answers as
+    // untrusted today by supplying no callback. Wiring that prompt to
+    // `session/request_permission` is `cyrup-acp`'s permission seam, not this call site.
+    if mode == AppMode::Acp {
+        let sessions_root = cyrup_acp::SessionsRoot(dirs.session_dir.clone());
+        let factory = session_launch::build_factory(
+            provider,
+            config,
+            settings_store.clone(),
+            auth_store.clone(),
+            &dirs,
+            models_json.clone(),
+            None,
+        )?;
+        timings::print_timings();
+        let host: Arc<dyn cyrup_acp::AcpHost> = Arc::new(cyrup::acp_host::BinaryAcpHost::new(
+            factory,
+            sessions_root,
+            cancel.clone(),
+        ));
+        // `ACP-023` — the shutdown watcher is armed by `BinaryAcpHost::runtime_ready` on the first
+        // `session/new`, not here, because `spawn_abort_on_signal` takes the runtime by value at
+        // spawn time and there is no runtime yet. See that method for why the window that leaves is
+        // empty.
+        let served = run_acp_dispatch(host).await;
+        // Restore stdout at teardown (Pi `finally { restoreStdout() }`, main.ts:848).
+        cyrup::output_guard::restore_stdout();
+        served?;
+        return Ok(0);
+    }
+
     // The two non-interactive hosts. Both take pi's modelless hard stop (`require_model: true`,
     // main.ts:852-855) and neither supplies a trust PROMPT — SEAM-065: pi's `resolveProjectTrusted`
     // reads the saved-decision tier for every host (project-trust.ts:72-75) and only the prompt is
@@ -799,5 +878,8 @@ async fn run() -> anyhow::Result<i32> {
             dispatch
         }
         AppMode::Interactive => unreachable!("interactive mode is handled before this match"),
+        // ACP-002 — the ACP host is served by its own arm above, for `ACP-021`'s reason: it must
+        // never reach `session_launch::launch`'s modelless hard stop, which runs before this match.
+        AppMode::Acp => unreachable!("ACP mode is handled before this match"),
     }
 }

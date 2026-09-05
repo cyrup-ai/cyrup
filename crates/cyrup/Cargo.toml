@@ -80,6 +80,17 @@ cyrup-flux = { workspace = true }
 # session of every mode, so `mcp_extension_for_env` attaches unconditionally and `--no-extensions`
 # reaches it through `NativeExtension::is_ambient() -> true` rather than through the gate.
 cyrup-mcp = { workspace = true }
+# The ACP front-end (gap-analysis 15, the `pi-acp` port): `AppMode::Acp`'s implementation, reached
+# from `crate::run::run_acp_dispatch`. Its `AcpHost` trait is implemented HERE
+# (`crate::acp_host::BinaryAcpHost`) rather than in the library, because `session_launch::build_factory`
+# and `signals::spawn_abort_on_signal` live in this crate and the dependency cannot be inverted —
+# `ACP-Q30`, decided; see `cyrup_acp::sessions::AcpHost`.
+#
+# **This edge flips `serde_json::Map` to `IndexMap` for the shipped binary** (`preserve_order`, which
+# both ACP crates declare non-optionally). That is `ACP-Q1`, decided and stated in full on the
+# `[workspace.dependencies]` line — the same finding that got `mermansi` rejected, taken the other
+# way here because the ACP wire types ARE the protocol and there is no alternative crate.
+cyrup-acp = { workspace = true }
 # Package + config subcommands (Pi `package-manager-cli.ts`) drive the resources package manager.
 cyrup-resources = { workspace = true }
 # The provider seam. **NO `features = ["faux"]` HERE** (PROV-052): this is a NORMAL dependency, and

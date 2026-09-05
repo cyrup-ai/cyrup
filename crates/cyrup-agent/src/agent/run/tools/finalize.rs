@@ -29,11 +29,14 @@ impl From<Result<ToolResult, ToolError>> for Executed {
                 is_error: false,
             },
             // A throwing TOOL yields `createErrorToolResult(...)` (`agent-loop.ts:700-703`
-            // @v0.83.0), i.e. `details: {}` and no `terminate`.
+            // @v0.83.0), i.e. `details: {}` and no `terminate`. `ToolError::details` overrides the
+            // empty object when the tool opted in to reporting structure about its own failure —
+            // see that field's CYRUP-DELTA; `None` is what every other constructor produces, so
+            // upstream's shape is unchanged for every tool that does not.
             Err(e) => Self {
                 result: ToolResult {
+                    details: Some(e.details.clone().unwrap_or_else(empty_details)),
                     content: vec![Content::text(e.to_string())],
-                    details: Some(empty_details()),
                     usage: None,
                     added_tool_names: Vec::new(),
                     terminate: TerminateHint::Unspecified,

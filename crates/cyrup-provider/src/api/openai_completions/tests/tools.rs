@@ -296,7 +296,14 @@ fn an_opted_in_tool_is_serialized_with_the_strict_converted_schema() {
         json!({
             "type": "object",
             "additionalProperties": false,
-            "required": ["limit", "offset", "path"],
+            // ACP-Q1 — `required` is built by walking `properties`, so its ORDER follows that map's
+            // iteration order. `serde_json` now carries `preserve_order` (declared non-optionally by
+            // `agent-client-protocol`, `cyrup-acp`'s wire dependency, unified graph-wide), so that is
+            // the schema's own declaration order rather than the old lexicographic one. An array IS
+            // order-sensitive on the wire, unlike the surrounding object, so this line is the real
+            // observable change — and it is the better one: `required` now reads in the same order
+            // the model sees the properties declared.
+            "required": ["path", "offset", "limit"],
             "properties": {
                 "path": { "type": "string" },
                 "offset": { "anyOf": [{ "type": "number" }, { "type": "null" }] },

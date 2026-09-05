@@ -13,6 +13,8 @@
 //! `anyhow` boundary (arch-00 §8).
 #![forbid(unsafe_code)]
 
+pub mod acp_host;
+pub mod acp_terminal_login_cmd;
 pub mod actions;
 pub mod bootstrap;
 pub mod cli;
@@ -63,8 +65,8 @@ pub use output_guard::{
 };
 pub use provider::{select_provider, unknown_model_warning};
 pub use run::{
-    dispose_session, exit_code, initial_input, run_json_dispatch, run_print_dispatch,
-    run_rpc_dispatch,
+    dispose_session, exit_code, initial_input, run_acp_dispatch, run_json_dispatch,
+    run_print_dispatch, run_rpc_dispatch,
 };
 pub use session_resolve::{
     MissingSessionCwd, Outcome, Resolution, SessionFlags, SessionLookup, SessionRef,

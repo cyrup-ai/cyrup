@@ -11,6 +11,25 @@ use super::args::Cli;
 use super::argv::ExtFlagValue;
 use super::enums::ThinkingArg;
 
+/// Does this run write a session JSONL? — the ONE definition of Pi's
+/// `persist = !noSession && (explicitSession || interactive)` rule.
+///
+/// ACP-213 — this function exists because the expression was written out **twice, verbatim**: here
+/// in [`Cli::to_session_config`] and again in `crate::prelaunch::resolve_session`, which recomputes
+/// it once the `--session`/`--fork`/`--session-id` resolution has settled `config.target`. Adding a
+/// mode to one and not the other is a live foot-gun: an ACP `session/new` would build a
+/// `MemStore`-backed session on whichever path it took, `session_file()` would return `None`, and
+/// the session would be invisible to `session/list` and unloadable by `session/load` on the next
+/// connection — with nothing reporting a fault. Both call sites now route through here.
+///
+/// `AppMode::Acp` persists for the same reason `Interactive` does, and for a stronger one: every
+/// feature in area 4d — `session/list`, `session/load`, `session/delete`, replay — presupposes a
+/// JSONL, where for the TUI persistence is merely the expected default. `--no-session` still wins,
+/// as it does for every other host.
+pub(crate) fn persists(no_session: bool, explicit_session: bool, mode: AppMode) -> bool {
+    !no_session && (explicit_session || matches!(mode, AppMode::Interactive | AppMode::Acp))
+}
+
 impl Cli {
     /// `--approve` (Some(true)) / `--no-approve` (Some(false)) / neither (None). Approve wins if both.
     pub fn trust_override(&self) -> Option<bool> {
@@ -128,7 +147,22 @@ impl Cli {
         config.no_context_files = self.no_context_files;
         config.no_skills = self.no_skills;
         config.no_prompt_templates = self.no_prompt_templates;
-        config.no_themes = self.no_themes;
+        // `ACP-018` — the ACP host disables theme discovery unconditionally, and it is the one
+        // mode-conditional resource knob here.
+        //
+        // Port of the `--no-themes` pi-acp v0.0.33 `pi-rpc/process.ts` passes to its child, with
+        // upstream's own justifying comment: a theme is a TERMINAL rendering concern, and the ACP
+        // client draws every pixel the user sees. Discovering, parsing and validating them costs
+        // startup time on every `session/new` and can only produce diagnostics about something no
+        // ACP user can observe.
+        //
+        // Scoped to themes ALONE, deliberately: `no_skills`, `no_prompt_templates`,
+        // `no_context_files` and `no_extensions` all keep following their flags, because those
+        // resources ARE observable over ACP — a skill is a slash command in the client's palette
+        // (`ACP-268`), a prompt template expands server-side (`ACP-266`), and an extension can
+        // register both. `--no-themes` is therefore a no-op under `--acp` rather than a
+        // contradiction, and `--theme` still names a path that is simply never read.
+        config.no_themes = self.no_themes || mode == AppMode::Acp;
         // `--no-extensions`/`-ne` disables extension discovery; explicit `--extension`/`-e` paths still
         // load (Pi `resourceLoaderOptions.noExtensions`/`additionalExtensionPaths`, main.ts:660,664).
         config.no_extensions = self.no_extensions;
@@ -174,7 +208,8 @@ impl Cli {
             config.target,
             SessionTarget::Resume(_) | SessionTarget::Continue
         );
-        config.persist = !self.no_session && (explicit_session || mode == AppMode::Interactive);
+        // ACP-213 — one definition, two call sites; see [`persists`].
+        config.persist = persists(self.no_session, explicit_session, mode);
         (config, prompt_diagnostics)
     }
 

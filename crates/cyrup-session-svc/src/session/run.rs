@@ -69,6 +69,34 @@ impl AgentSession {
         &self,
         input: impl Into<UserInput>,
     ) -> Result<EventStream<AgentSessionEvent>, SessionServiceError> {
+        self.prompt_run(input).await.map(|(_accepted, stream)| stream)
+    }
+
+    /// [`Self::prompt`] **plus the preflight's own answer**.
+    ///
+    /// The distinction this returns is load-bearing for any front-end that parks a request on the
+    /// stream: `PromptAccepted::Handled` means an `input` extension handler fully serviced the
+    /// submission and **no run was started**, so no `agent_settled` will ever reach the returned
+    /// stream. [`Self::prompt`] discards that fact — a caller that awaits the settle then waits
+    /// forever, with no timeout anywhere, which is what an ACP `session/prompt` does
+    /// (gap-analysis 15 `ACP-153`).
+    ///
+    /// `PromptAccepted::Queued` is unreachable here: this refuses with
+    /// [`SessionServiceError::StreamingNeedsBehavior`] when a run is active, and that is the only
+    /// state that queues. Use [`Self::prompt_with`] to queue deliberately.
+    ///
+    /// The stream is the **run-scoped** one and it is registered before the run starts, so no event
+    /// is missed; `Fanout::end_run` clears it right after `emit_agent_settled`, which makes the
+    /// settle its last event.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionServiceError::StreamingNeedsBehavior`] when a run is already active, or whatever
+    /// the preflight itself fails with.
+    pub async fn prompt_run(
+        &self,
+        input: impl Into<UserInput>,
+    ) -> Result<(PromptAccepted, EventStream<AgentSessionEvent>), SessionServiceError> {
         // AGENT-030: the session-level run latch, not the agent's per-run streaming flag — pi's
         // `prompt()` consults `this.isStreaming`, which IS `_isAgentRunActive`
         // (agent-session.ts:876-877 / :1159 @v0.83.0). See [`Self::is_run_active`].
@@ -80,10 +108,13 @@ impl AgentSession {
         match self.prepare(input.into(), PromptOptions::default()).await? {
             Prepared::Run(messages) => {
                 self.spawn_run(messages).await?;
-                Ok(stream)
+                Ok((PromptAccepted::Started, stream))
             }
             // An `input` handler serviced the submission (no run started); the stream stays idle.
-            Prepared::Handled | Prepared::Queued(..) => Ok(stream),
+            Prepared::Handled => Ok((PromptAccepted::Handled, stream)),
+            // Unreachable — see the doc. Reported rather than assumed, so a future change to the
+            // guard above surfaces here instead of silently parking a caller on a dead stream.
+            Prepared::Queued(behavior, _) => Ok((PromptAccepted::Queued(behavior), stream)),
         }
     }
 

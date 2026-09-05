@@ -804,11 +804,14 @@ mod tests {
     #[test]
     fn strict_conversion_requires_every_key_and_makes_optionals_nullable() {
         let converted = make_strict_json_schema(&read_parameters()).unwrap();
-        // `serde_json::Map` is a `BTreeMap` in this workspace (no `preserve_order`), so
-        // `Object::keys()` — and therefore the rewritten `required` — is alphabetical. Ordering is
-        // immaterial: `required` is a SET, and every schema cyrup emits already has alphabetical
-        // keys for the same reason.
-        assert_eq!(converted["required"], json!(["limit", "offset", "path"]));
+        // ACP-Q1 — `serde_json::Map` is an `IndexMap` in this workspace: `agent-client-protocol`
+        // (`cyrup-acp`'s wire dependency) declares `serde_json` with a non-optional
+        // `preserve_order`, and cargo feature unification is graph-wide. So `Object::keys()` — and
+        // therefore the rewritten `required` — is the schema's own DECLARATION order, where it used
+        // to be alphabetical. Ordering remains immaterial to correctness (`required` is a SET), but
+        // it is observable in the emitted JSON, so it is pinned to the new value rather than sorted
+        // in the assertion — a sorted assertion would hide a real change in what goes on the wire.
+        assert_eq!(converted["required"], json!(["path", "offset", "limit"]));
         assert_eq!(converted["additionalProperties"], json!(false));
         // The required property keeps its own schema verbatim.
         assert_eq!(
@@ -856,12 +859,14 @@ mod tests {
             }
         });
         let converted = make_strict_json_schema(&edit_parameters).unwrap();
-        assert_eq!(converted["required"], json!(["edits", "path"]));
+        // ACP-Q1 — declaration order, not alphabetical; see
+        // `strict_conversion_requires_every_key_and_makes_optionals_nullable`.
+        assert_eq!(converted["required"], json!(["path", "edits"]));
         assert_eq!(converted["additionalProperties"], json!(false));
         // No `anyOf` wrapping anywhere: nothing was optional.
         assert_eq!(converted["properties"]["path"], json!({ "type": "string" }));
         let items = &converted["properties"]["edits"]["items"];
-        assert_eq!(items["required"], json!(["newText", "oldText"]));
+        assert_eq!(items["required"], json!(["oldText", "newText"]));
         assert_eq!(items["additionalProperties"], json!(false));
         assert_eq!(items["properties"]["oldText"], json!({ "type": "string" }));
     }

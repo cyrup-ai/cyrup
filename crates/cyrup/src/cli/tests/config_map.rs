@@ -119,6 +119,45 @@ fn config_mapping_carries_flags_and_persistence() {
     assert!(!ephemeral.persist);
 }
 
+/// ACP-213 — `AppMode::Acp` must persist sessions, and `--no-session` must still win.
+///
+/// The second half is the foot-gun half: `config.persist` used to be computed by the same
+/// expression written out twice, in `Cli::to_session_config` and again in
+/// `crate::prelaunch::resolve_session`, so this asserts the shared rule
+/// (`crate::cli::persists`) directly for all six mode/flag combinations rather than only the
+/// path `to_session_config` happens to take.
+#[test]
+fn acp_persists_sessions_unless_no_session() {
+    let d = dirs();
+    assert!(
+        parse(&[]).to_session_config(&d, AppMode::Acp).persist,
+        "an ACP session with no JSONL is invisible to session/list and unloadable"
+    );
+    assert!(
+        !parse(&["--no-session"])
+            .to_session_config(&d, AppMode::Acp)
+            .persist
+    );
+    // The one rule, both call sites. `explicit_session` is the `--session`/`--fork`/`--continue`
+    // leg `prelaunch::resolve_session` recomputes after the target settles.
+    for (no_session, explicit, mode, expected) in [
+        (false, false, AppMode::Acp, true),
+        (true, false, AppMode::Acp, false),
+        (false, true, AppMode::Acp, true),
+        (false, false, AppMode::Interactive, true),
+        (false, false, AppMode::Print, false),
+        (false, true, AppMode::Print, true),
+        (false, false, AppMode::Rpc, false),
+        (false, false, AppMode::Json, false),
+    ] {
+        assert_eq!(
+            crate::cli::persists(no_session, explicit, mode),
+            expected,
+            "persists({no_session}, {explicit}, {mode:?})"
+        );
+    }
+}
+
 /// PROV-002 (pi `test/max-thinking.test.ts`, "is accepted by CLI"): `--thinking max` must
 /// parse, and a `model:max` suffix must split off the model id. Before the fix clap rejected
 /// `max` with a usage error and `split_model_level` left `:max` glued to the id.
@@ -341,4 +380,61 @@ fn an_empty_prompt_token_is_never_probed_as_a_path() {
     let (text, diags) = resolve_prompt_input(tmp.path(), "", "system prompt");
     assert_eq!(text, "");
     assert!(diags.is_empty(), "{diags:?}");
+}
+
+/// ACP-018 — the ACP host disables theme discovery, and **only** theme discovery.
+///
+/// The unit's verify has two halves, and the second is the one that catches an over-broad fix: it
+/// is not enough that `no_themes` is true; extension, skill, prompt-template and context-file
+/// discovery must be *untouched*, because every one of those IS observable over ACP (a skill is a
+/// slash command in the client's palette, a prompt template expands server-side, an extension can
+/// register both). Only the terminal's own rendering concern is dropped.
+#[test]
+fn the_acp_host_drops_themes_and_nothing_else() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dirs = dirs_at(tmp.path());
+
+    let bare = parse(&[]);
+    let acp = bare.to_session_config(&dirs, AppMode::Acp);
+    assert!(
+        acp.no_themes,
+        "ACP-018: the ACP host disables theme discovery with no flag"
+    );
+    for (name, dropped) in [
+        ("extensions", acp.no_extensions),
+        ("skills", acp.no_skills),
+        ("prompt templates", acp.no_prompt_templates),
+        ("context files", acp.no_context_files),
+    ] {
+        assert!(
+            !dropped,
+            "ACP-018: {name} discovery must be untouched — it is observable over ACP"
+        );
+    }
+
+    // Every other mode keeps following the flag, in both directions.
+    for mode in [
+        AppMode::Interactive,
+        AppMode::Print,
+        AppMode::Json,
+        AppMode::Rpc,
+    ] {
+        assert!(
+            !bare.to_session_config(&dirs, mode).no_themes,
+            "{mode:?} without --no-themes must keep theme discovery"
+        );
+        assert!(
+            parse(&["--no-themes"])
+                .to_session_config(&dirs, mode)
+                .no_themes,
+            "{mode:?} with --no-themes must drop it"
+        );
+    }
+
+    // And `--no-themes` under ACP is a no-op rather than a contradiction.
+    assert!(
+        parse(&["--no-themes"])
+            .to_session_config(&dirs, AppMode::Acp)
+            .no_themes
+    );
 }

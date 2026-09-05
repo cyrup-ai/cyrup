@@ -2915,9 +2915,14 @@ mod tests {
             &[json!({ "type": "resource", "resource": { "uri": "u", "mimeType": "m" } })],
             None,
         );
+        // ACP-Q1 — the stringified record now preserves the record's own key order rather than
+        // sorting it (`serde_json/preserve_order`, turned on graph-wide by `cyrup-acp`'s
+        // `agent-client-protocol` edge). This is a parity IMPROVEMENT: upstream's
+        // `JSON.stringify(resource)` also emits insertion order, so the rendered text an MCP tool
+        // result carries is now byte-identical to what the TypeScript adapter produces.
         assert_eq!(
             blocks.first(),
-            Some(&text("[Resource: u]\n{\"mimeType\":\"m\",\"uri\":\"u\"}"))
+            Some(&text("[Resource: u]\n{\"uri\":\"u\",\"mimeType\":\"m\"}"))
         );
     }
 
@@ -2931,9 +2936,11 @@ mod tests {
             None,
         );
         assert_eq!(blocks.first(), Some(&text("body")));
+        // ACP-Q1 — insertion order, matching `JSON.stringify`. See
+        // `a_resource_without_text_stringifies_the_whole_record`.
         assert_eq!(
             blocks.get(1),
-            Some(&text("{\"mimeType\":\"m\",\"uri\":\"u2\"}"))
+            Some(&text("{\"uri\":\"u2\",\"mimeType\":\"m\"}"))
         );
     }
 

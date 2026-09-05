@@ -901,6 +901,10 @@ impl SessionBuilder {
             fs,
             proc: base.proc.clone(),
         };
+        // `ACP-156` — the SAME handle the tool registry gets, retained on the services so a
+        // front-end diffing a file mutation reads through this session's confinement rather than
+        // around it. See `AgentSessionServices::fs`.
+        let services_fs = Arc::clone(&backend.fs);
         // The live session metadata every `bash` child gets as `CYRUP_*` (Pi's `resolveSpawnContext`
         // reads the same five values off the per-call `ExtensionContext`, bash.ts:171-181). Pi's
         // values are "resolved when each command starts" (docs/environment-variables.md:27), so this
@@ -1897,6 +1901,7 @@ impl SessionBuilder {
             system_prompt,
             host_services,
             extension_flag_values: cfg.extension_flag_values.clone(),
+            fs: services_fs,
         };
 
         Ok(AgentSession::from_parts(
@@ -2530,6 +2535,26 @@ fn ext_mode(mode: AppMode) -> (ExtMode, bool) {
         AppMode::Rpc => (ExtMode::Rpc, true),
         AppMode::Json => (ExtMode::Json, false),
         AppMode::Print => (ExtMode::Print, false),
+        // ACP-025 — the ACP host reports itself to extensions as `rpc`, with `has_ui: true`.
+        //
+        // # CYRUP-DELTA
+        //
+        // **What differs.** pi-acp's adapter genuinely spawns `pi --mode rpc`, so its guest `ctx.mode`
+        // is `"rpc"` as a fact about the child rather than a choice. cyrup's ACP host is a fourth
+        // in-process front-end and could report a fifth `ExtMode` — this arm decides it does not.
+        // `has_ui` is `true` for the same reason `Rpc`'s is: the host owns a live dialog channel
+        // (`UiSink` → `session/request_permission` / `elicitation/create`), which is the only thing
+        // `has_ui` claims.
+        //
+        // **What it costs.** `ctx.mode` is guest-visible, so an extension cannot tell an ACP client
+        // from an RPC client and cannot special-case either. Two concrete consequences: an extension
+        // that gates a feature on `mode == "rpc"` will enable it under ACP (usually right — both are
+        // JSON-RPC-over-stdio hosts with a dialog channel), and an extension that wants ACP-only
+        // behaviour has no way to ask for it. Adding an `ExtMode::Acp` variant instead would be a
+        // guest-visible wire change to `cyrup_ext::HostConfig` for every already-published
+        // extension, whose `mode` matches would then fall to their default arm — a strictly worse
+        // trade for a distinction no extension has asked for. Revisit only with a real consumer.
+        AppMode::Acp => (ExtMode::Rpc, true),
     }
 }
 
@@ -2581,8 +2606,23 @@ fn today() -> time::Date {
     clippy::indexing_slicing
 )]
 mod tests {
-    use super::{ALL_BUILTIN_TOOLS, DEFAULT_BUILTIN_TOOLS, http_proxy_overlay};
+    use super::{ALL_BUILTIN_TOOLS, DEFAULT_BUILTIN_TOOLS, ext_mode, http_proxy_overlay};
+    use cyrup_config::AppMode;
+    use cyrup_ext::ExtMode;
     use std::path::Path;
+
+    /// ACP-025 — the guest-visible mode string an ACP session reports. `AppMode::Acp` is
+    /// deliberately projected onto the EXISTING `ExtMode::Rpc` rather than a fifth variant; the
+    /// `CYRUP-DELTA` at [`ext_mode`] states what that costs. The other four rows are asserted here
+    /// too so the new arm cannot be added by rewriting one of them.
+    #[test]
+    fn acp_reports_itself_to_extensions_as_rpc_with_a_ui() {
+        assert_eq!(ext_mode(AppMode::Acp), (ExtMode::Rpc, true));
+        assert_eq!(ext_mode(AppMode::Interactive), (ExtMode::Tui, true));
+        assert_eq!(ext_mode(AppMode::Rpc), (ExtMode::Rpc, true));
+        assert_eq!(ext_mode(AppMode::Json), (ExtMode::Json, false));
+        assert_eq!(ext_mode(AppMode::Print), (ExtMode::Print, false));
+    }
 
     /// `select_active_tools`'s no-flags arm is
     /// `DEFAULT_BUILTIN_TOOLS.contains(name) || !ALL_BUILTIN_TOOLS.contains(name)` — it KEEPS any

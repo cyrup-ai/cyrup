@@ -53,8 +53,22 @@ impl Diagnostic {
 /// by two.
 const VALID_THINKING_LEVELS: [&str; 7] =
     ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-/// Valid `--mode` values (Pi args.ts:80).
-const VALID_MODES: [&str; 3] = ["text", "json", "rpc"];
+/// Valid `--mode` values (Pi args.ts:80), **plus cyrup's own `acp`**.
+///
+/// # CYRUP-DELTA — ACP-002 adds a fourth value pi does not have
+///
+/// **What differs.** pi's list is exactly `text`/`json`/`rpc`; `acp` is cyrup-invented, and pi has
+/// no ACP role at all (pi-acp encodes it in the identity of a separate npm binary rather than in a
+/// flag).
+///
+/// **What it costs, and why the entry is load-bearing rather than cosmetic.** This pass is pi's
+/// silent drop for an invalid `--mode` (args.ts:80-82) and it runs **before clap**, so a value
+/// missing from this array never reaches [`crate::cli::enums::Mode`] at all: `--mode acp` would be
+/// deleted along with its value and the run would fall through to `Print`, answering the ACP
+/// client's first JSON-RPC frame as a chat prompt. Adding `Mode::Acp` to the clap enum without
+/// adding it here produces exactly the failure ACP-002 hoisted the branch in `resolve_app_mode` to
+/// prevent, with no diagnostic anywhere. The two lists must move together.
+const VALID_MODES: [&str; 4] = ["text", "json", "rpc", "acp"];
 /// Valid `--tui-mode` values (pi args.ts:182 @v0.84.1 — `mode === "regular" || mode === "fullscreen"`).
 const VALID_TUI_MODES: [&str; 2] = ["regular", "fullscreen"];
 /// pi's `--tui-mode`-with-no-usable-value error (args.ts:186 @v0.84.1), verbatim.

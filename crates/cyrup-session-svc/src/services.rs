@@ -153,4 +153,16 @@ pub struct AgentSessionServices {
     /// Captured extension CLI flag values threaded from the CLI (Pi `extensionFlagValues`,
     /// main.ts:634). Read-only seam a loaded extension consumes via `applyExtensionFlagValues`.
     pub extension_flag_values: Vec<(String, crate::builder::ExtensionFlagValue)>,
+    /// **This session's** filesystem seam — the same `Arc<dyn FsOps>`
+    /// [`crate::builder::SessionBuilder::build`] hands the tool registry, `TraversalFs` /
+    /// `ProtectedFs` wrappers included.
+    ///
+    /// Retained (gap-analysis 15 `ACP-156`) so a *front-end* can read a file the way the session's
+    /// own tools would. It is not a convenience: with `confine_to_cwd` set, `TraversalFs::read`
+    /// hard-denies a path outside the root, so a front-end that reached for `std::fs` instead
+    /// would transmit bytes this session's backend refuses to open — which is exactly what the ACP
+    /// adapter's pre/post-mutation diff snapshot would have done. The only in-tree consumer today
+    /// is `cyrup_acp::sessions`' snapshot read; the tool registry keeps its own clone, so this is
+    /// a second handle on one backend rather than a new authority.
+    pub fs: Arc<dyn cyrup_tools::FsOps>,
 }

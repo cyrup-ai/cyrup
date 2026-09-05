@@ -54,9 +54,12 @@ fn constrained_sampling_drives_anthropic_strict_tools() {
     // The EXACT key set of a strict tool. pi's object literal is written
     // `name, description, eager_input_streaming?, strict?, input_schema, defer_loading?,
     // cache_control?` (`anthropic-messages.ts:1313-1321` @v0.83.0), but a JSON object is
-    // unordered and this workspace's `serde_json` has no `preserve_order` feature, so `Map` is
-    // a `BTreeMap` and emission order is lexicographic — only the key SET is observable on the
-    // wire. pi asserts key sets the same way, `.sort()`ed
+    // unordered. **ACP-Q1 changed which order that is**: this workspace's `serde_json` now HAS
+    // `preserve_order` (declared non-optionally by `agent-client-protocol`, `cyrup-acp`'s wire
+    // dependency, and unified graph-wide), so `Map` is an `IndexMap` and emission order is the
+    // struct's own field order — which is upstream's declaration order at
+    // `anthropic-messages.ts:1313-1321`, so this moved TOWARD pi. Only the key SET is observable
+    // on the wire either way. pi asserts key sets the same way, `.sort()`ed
     // (`packages/ai/test/bedrock-error-metadata.test.ts:117`). Equality on the whole vector
     // still pins it exactly: no missing key, no extra key.
     //
@@ -74,12 +77,12 @@ fn constrained_sampling_drives_anthropic_strict_tools() {
     assert_eq!(
         keys,
         [
-            "cache_control",
+            "name",
             "description",
             "eager_input_streaming",
+            "strict",
             "input_schema",
-            "name",
-            "strict"
+            "cache_control"
         ]
     );
     // Its VALUE is the plain ephemeral marker for "short" retention. `build_body` passes no

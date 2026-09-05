@@ -1985,6 +1985,73 @@ async fn bash_nonzero_exit_empty_output_labels_no_output() {
     );
 }
 
+// ACP-141 — a non-zero exit reports its code STRUCTURALLY, not only inside the sentence.
+//
+// The message is unchanged (the assertion above still pins it byte-for-byte); what is added is
+// `details.exitCode`, which is what an ACP client's `terminal_exit.exit_code` reads. Before this,
+// `sh -c 'exit 42'` reported 1 to the client, because the only place 42 existed was the trailing
+// `Command exited with code 42` and parsing that would turn a diagnostic into an API.
+#[tokio::test]
+async fn bash_nonzero_exit_reports_its_code_in_details() {
+    let dir = tempfile::tempdir().unwrap();
+    let bash = bash_tool(dir.path().to_path_buf(), BashOpts::default());
+    let err = bash
+        .execute(
+            cid(),
+            serde_json::json!({ "command": "exit 42" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "(no output)\n\nCommand exited with code 42"
+    );
+    let details = err.details.as_ref().expect("ACP-141 attaches details");
+    assert_eq!(details["exitCode"], 42);
+
+    // A CLEAN exit does not: `details` is `None` unless the output was truncated, which is pi's
+    // `formatOutput` rule, and the `isError ? 1 : 0` fallback already reports 0 correctly.
+    let ok = bash
+        .execute(
+            cid(),
+            serde_json::json!({ "command": "true" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .expect("exit 0");
+    assert!(
+        ok.details
+            .as_ref()
+            .and_then(|d| d.get("exitCode"))
+            .is_none(),
+        "a clean exit adds no key pi does not have: {:?}",
+        ok.details
+    );
+
+    // A timeout has no exit code to report, so it attaches none and the ACP fallback summarises
+    // it as 1. The sentence still reaches the user.
+    let timed_out = bash
+        .execute(
+            cid(),
+            serde_json::json!({ "command": "sleep 5", "timeout": 0.05 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .unwrap_err();
+    assert!(timed_out.to_string().contains("Command timed out after"));
+    assert!(
+        timed_out
+            .details
+            .as_ref()
+            .and_then(|d| d.get("exitCode"))
+            .is_none()
+    );
+}
+
 // gap #5 — a timeout with NO captured output goes through the catch-path `formatOutput(snapshot, "")`
 // (emptyText = ""), so `appendStatus` emits the bare status with NO leading `\n\n` (bash.ts:375,388).
 #[tokio::test]

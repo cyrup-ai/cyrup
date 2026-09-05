@@ -1,0 +1,61 @@
+[package]
+name = "cyrup-acp"
+description = "Agent Client Protocol adapter: the pi-acp port as cyrup's fourth front-end (gap-analysis 15)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# --- the wire ----------------------------------------------------------------------------------
+# Default features, no `unstable_*`. The rationale — including the `serde_json/preserve_order`
+# ruling (ACP-Q1) — is on the `[workspace.dependencies]` line; it is not repeated here so there is
+# exactly one place to read it.
+agent-client-protocol = { workspace = true }
+
+# --- the agent this front-end drives -----------------------------------------------------------
+# `AgentSession`, `AgentSessionRuntime`, `AgentSessionEvent`, `SessionServiceError`, the `UiSink`
+# request/reply seam and `SessionConfig`. This edge IS the architecture decision (gap-analysis 15
+# §1): cyrup-acp binds to the session in-process, so there is no `PiRpcProcess` and no NDJSON
+# re-parse.
+cyrup-session-svc = { workspace = true }
+# `listing::{list_all, SessionInfo}` + `layout::{SessionLayout, SessionsRoot, encode_cwd}` are the
+# SINGLE SOURCE OF TRUTH for the sessionId -> file mapping, which is what deletes pi-acp's
+# `~/.pi/pi-acp/session-map.json` sidecar outright (ADR-0028 §5). `ids::validate_session_id` is the
+# boundary check `AcpSessionId` is built on (ACP-291).
+cyrup-session = { workspace = true }
+# `AppMode` (this crate is `AppMode::Acp`'s consumer) and `ConfigDirs`.
+cyrup-config = { workspace = true }
+# `SessionId`, `ToolCallId`, `ModelRef`, `ModelThinkingLevel` — cyrup's own id and model vocabulary,
+# kept distinct from the ACP schema's `SessionId`/`ToolCallId` on purpose (ADR-0028 §5 rejects a
+# third wrapper: the two existing types are different types and will not unify).
+cyrup-core = { workspace = true }
+# `parse_command_args` — the ONE argument tokenizer (`ACP-264`/`ACP-282`). This edge exists so
+# `commands::dispatch` can take `args: &str` and split it itself rather than re-implementing a
+# quote-aware splitter, which is the error `ACP-264`'s refutation exists to prevent.
+cyrup-resources = { workspace = true }
+# `FsOps` — the session's own confined filesystem backend, which `ACP-156`'s pre/post-mutation
+# snapshot MUST read through (a `std::fs` read here would ship bytes a `confine_to_cwd` session
+# refuses to open). Also `BUILTIN_NAMES`, so `ledger::ToolClass::of`'s table is checked against the
+# registry at compile time instead of by hand (`ACP-157`).
+cyrup-tools = { workspace = true }
+
+# --- runtime -----------------------------------------------------------------------------------
+tokio = { workspace = true, features = ["sync", "time", "macros", "rt-multi-thread"] }
+futures = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = "0.1.44"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# `PERMISSION_DIALOG_OPTIONS` — the four strings `LocalAskChannel::confirm` puts in its `select`.
+# A DEV edge only: `permission.rs` writes the same four out so its matcher can be reviewed without
+# opening another crate, and `the_permission_dialog_list_is_the_permission_systems_own` is what
+# keeps the two honest (`ACP-145`). Nothing in the shipped crate depends on the permission system.
+cyrup-permission-system = { workspace = true }

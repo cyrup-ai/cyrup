@@ -101,7 +101,10 @@ pub async fn resolve_session(
             // Recompute persistence now the target may be Resume/Fork/CreateWithId (Pi: any explicit
             // session persists; `--no-session` forces ephemeral; interactive always persists).
             let explicit = !matches!(config.target, SessionTarget::New);
-            config.persist = !cli.no_session && (explicit || mode == AppMode::Interactive);
+            // ACP-213 — the second of the two sites that used to spell this rule out verbatim. It
+            // now shares `crate::cli::config_map::persists` with `Cli::to_session_config`, so a new
+            // `AppMode` cannot be admitted on one path and forgotten on the other.
+            config.persist = crate::cli::persists(cli.no_session, explicit, mode);
             None
         }
         Some(Outcome::ExitOk) => Some(0),

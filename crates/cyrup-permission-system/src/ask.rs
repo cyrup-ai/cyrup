@@ -96,6 +96,21 @@ impl AskChannel for NoOpAskChannel {
 // ---------------------------------------------------------------- the live in-session dialog (P-1)
 
 /// pi `permission-dialog.ts:24-28` — the four options, in pi's exact order.
+///
+/// `pub` because a FRONT-END has to recognise this exact list to render the dialog as a permission
+/// prompt rather than as an arbitrary extension menu: `cyrup_acp::permission` matches the whole
+/// four-option list, in this order, to decide whether to advertise ACP `PermissionOptionKind`s
+/// (gap-analysis 15 `ACP-145`). Matching the WHOLE list is the point — a per-string match would let
+/// a guest menu that merely happens to contain `"Reject"` be dressed with permission affordances —
+/// and that is only checkable against the strings themselves, which is why they are exported rather
+/// than duplicated.
+pub const PERMISSION_DIALOG_OPTIONS: [&str; 4] = [
+    APPROVE_ONCE_OPTION,
+    APPROVE_ALWAYS_OPTION,
+    REJECT_OPTION,
+    REJECT_WITH_REASON_OPTION,
+];
+
 const APPROVE_ONCE_OPTION: &str = "Allow Once";
 const APPROVE_ALWAYS_OPTION: &str = "Allow Always";
 const REJECT_OPTION: &str = "Reject";
@@ -128,12 +143,7 @@ impl LocalAskChannel {
 impl AskChannel for LocalAskChannel {
     async fn confirm(&self, title: &str, message: &str, opts: PromptOpts) -> AskOutcome {
         let prompt = compact_permission_prompt_for_select(&format!("{title}\n{message}"));
-        let options = serde_json::json!([
-            APPROVE_ONCE_OPTION,
-            APPROVE_ALWAYS_OPTION,
-            REJECT_OPTION,
-            REJECT_WITH_REASON_OPTION,
-        ]);
+        let options = serde_json::json!(PERMISSION_DIALOG_OPTIONS);
         // pi passes `{timeout}` only when a positive, finite timeout is set (`permission-dialog.ts:122`);
         // otherwise the select blocks until the human answers.
         let dialog_opts = DialogOptions {

@@ -733,9 +733,16 @@ mod tests {
             "name": "write",
             "input": { "path": "a.rs", "content": "hello" },
         });
+        // ACP-Q1 — key order here is the JSON object's INSERTION order (`serde_json/preserve_order`,
+        // turned on graph-wide by `cyrup-acp`'s `agent-client-protocol` edge; see the workspace
+        // `Cargo.toml`). It used to be alphabetical, because `serde_json::Map` was a `BTreeMap`.
+        // This is the better of the two for a watchdog review: the fields reach the reviewing model
+        // in the order the tool actually declared them, which is what upstream's
+        // `Object.entries(...)` yields (`turn-delta.ts`) — so the flip moves this TOWARD pi rather
+        // than away from it.
         assert_eq!(
             format_watchdog_review_message(&message).unwrap(),
-            "Tool call: write\nArguments:\ncontent: [omitted 5 chars; use tool result diff]\npath: a.rs"
+            "Tool call: write\nArguments:\npath: a.rs\ncontent: [omitted 5 chars; use tool result diff]"
         );
         // A non-BMP character is 2 UTF-16 code units, as `String.prototype.length` reports it.
         let emoji = json!({ "content": "\u{1F600}" });
@@ -777,9 +784,12 @@ mod tests {
         // indent (`turn-delta.ts:56-57`'s `${indent}${key}: ${formatValue(item, indent+"  ")}`), so
         // the first item follows the `key: ` on the same line — only a MULTI-LINE STRING gets its
         // own block. Reproducing that exactly is the point of this test.
+        // ACP-Q1 — insertion order, not alphabetical: see the note on
+        // `edit_and_write_arguments_are_redacted_by_utf16_length`. `one`/`two`/`three` is the order
+        // the `json!` literal declares them and the order `Object.entries` would yield upstream.
         assert_eq!(
             format_value(&value, ""),
-            "one:\na\nb\nthree:   - true\n  - null\ntwo: 3"
+            "one:\na\nb\ntwo: 3\nthree:   - true\n  - null"
         );
     }
 

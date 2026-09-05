@@ -1481,10 +1481,16 @@ mod tests {
         }
     }
 
-    /// The one place this port's message text can differ from `JSON.stringify`: `serde_json`
-    /// sorts object keys. Pinned so the divergence is visible rather than discovered.
+    /// ACP-Q1 — **this test used to pin a divergence and now pins parity.**
+    ///
+    /// It was written because `serde_json::Map` was a `BTreeMap` here, so the echoed payload came
+    /// out with sorted keys where `JSON.stringify` emits insertion order. `agent-client-protocol`
+    /// (`cyrup-acp`'s wire dependency) declares `serde_json` with a non-optional `preserve_order`,
+    /// and cargo feature unification is graph-wide, so the map is now an `IndexMap` and this
+    /// user-visible error string is byte-identical to upstream's. The test is kept, and renamed,
+    /// because the property is still worth pinning — it is just the opposite property now.
     #[tokio::test]
-    async fn echoed_payload_keys_are_sorted_not_insertion_ordered() {
+    async fn the_echoed_payload_matches_json_stringify_insertion_order() {
         let server = FakeEndpoint::one(200, r#"{"refresh_token":"r","expires_in":1}"#);
         let err = flow_with_token_url(&server.url("/oauth/token"))
             .exchange_authorization_code("CODE", "VERIF", REDIRECT_URI, None)
@@ -1492,8 +1498,8 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             err.to_string(),
-            // `JSON.stringify` would say `{"refresh_token":"r","expires_in":1}`.
-            r#"OpenAI Codex token exchange response missing fields: {"expires_in":1,"refresh_token":"r"}"#
+            // Exactly what `JSON.stringify` emits for this body.
+            r#"OpenAI Codex token exchange response missing fields: {"refresh_token":"r","expires_in":1}"#
         );
     }
 

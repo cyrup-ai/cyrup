@@ -76,6 +76,16 @@
 mod support;
 
 // ---- crates/cyrup: the shipped binary's argv / exit-code / stdio seam -------------------------
+/// The ACP front-end's **session lifecycle** over a connection whose stdin stays open: the
+/// `session/load` replay ordering, the cancel interleaving, the config pump's unprompted updates.
+/// Every assertion here is about what happens BETWEEN two frames, which the one-shot pipe in
+/// [`acp_transport`] cannot express.
+mod acp_session;
+/// The ACP front-end's process seam (gap-analysis 15): `ACP-003`'s transport bootstrap,
+/// `ACP-021`'s credential-less launch, and `ACP-001`/`ACP-026`'s `--terminal-login` gate. Each
+/// assertion is on the raw bytes a supervising editor would see, which is why none of them can be
+/// made in-process.
+mod acp_transport;
 mod auth_credential_print;
 mod extension_load_failure_exit;
 mod list_models_overlay;

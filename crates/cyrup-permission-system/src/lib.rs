@@ -115,7 +115,7 @@ mod tests;
 
 pub use ask::{
     AskChannel, AskOutcome, ForwardingAskChannel, LocalAskChannel, NoOpAskChannel,
-    PermissionDecisionState, PermissionPromptDecision, PromptOpts,
+    PERMISSION_DIALOG_OPTIONS, PermissionDecisionState, PermissionPromptDecision, PromptOpts,
 };
 pub use error::PermissionError;
 pub use ext_config::ExtensionConfig;
