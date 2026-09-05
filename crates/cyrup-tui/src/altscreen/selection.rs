@@ -263,6 +263,7 @@ pub(super) fn route(
     doc: &[Line<'_>],
     viewport: Rect,
     ev: &MouseEvent,
+    copy_on_select: bool,
 ) -> PointerOutcome {
     if right_click_paste_applies(ev) {
         // `try { this.onRightClickPaste(); } catch {}` then `return true` (`:709-715`): consumed
@@ -275,7 +276,9 @@ pub(super) fn route(
     match ev.kind {
         MouseEventKind::Down(MouseButton::Left) => press(sel, scroll, doc, viewport, ev),
         MouseEventKind::Drag(MouseButton::Left) => drag(sel, scroll, doc, viewport, ev),
-        MouseEventKind::Up(MouseButton::Left) => release(sel, scroll, doc, viewport, ev),
+        MouseEventKind::Up(MouseButton::Left) => {
+            release(sel, scroll, doc, viewport, ev, copy_on_select)
+        }
         _ => PointerOutcome::Ignored,
     }
 }
@@ -570,12 +573,21 @@ fn drag(
 /// copies what is selected (`:1011`). That ordering is the whole of "clicking a link activates it,
 /// clicking plain text does not": a click on plain text selects nothing, so [`selected_text`]
 /// answers `None` and the release is a no-op.
+///
+/// `copy_on_select` is the `fullscreenCopyOnSelect` setting (CFG-078), and it gates ONLY the copy:
+/// upstream's `:1035` is `if (this.copyOnSelect) void this.copySelectionToClipboard();`, with the
+/// `requestRender()` beneath it unconditional. So a release with the setting off keeps the
+/// selection anchored, focused and highlighted — "selections stay highlighted and `Ctrl+X` copies
+/// the active selection" (`packages/coding-agent/docs/settings.md:72` @v0.84.4) — and only
+/// withholds [`PointerOutcome::Copy`], which is the sole thing this module's caller would have
+/// written to the clipboard.
 fn release(
     sel: &mut SelectionState,
     scroll: &ScrollState,
     doc: &[Line<'_>],
     viewport: Rect,
     ev: &MouseEvent,
+    copy_on_select: bool,
 ) -> PointerOutcome {
     // `if (!this.selectionPressActive) return;` (`:987`) — a release belonging to no press of ours.
     if !sel.press_active {
@@ -603,6 +615,12 @@ fn release(
         // and [`crate::open_browser::open_browser`] is already exactly that: it spawns the platform
         // launcher with its stdio nulled, reaps it off-thread and swallows every failure.
         crate::open_browser::open_browser(&url);
+        return PointerOutcome::Handled;
+    }
+    // `if (this.copyOnSelect) void this.copySelectionToClipboard();` (`:1035`) — the selection
+    // itself is untouched either way, so the `Handled` arm below is upstream's bare
+    // `requestRender()` with nothing copied.
+    if !copy_on_select {
         return PointerOutcome::Handled;
     }
     match selected_text(sel, doc) {

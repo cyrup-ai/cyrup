@@ -79,6 +79,7 @@ mod footer_git_branch;
 mod footer_subscription;
 mod fork_selector;
 mod fullscreen_scrollback;
+mod fullscreen_settings;
 pub(crate) mod harness;
 mod image;
 mod image_capabilities;

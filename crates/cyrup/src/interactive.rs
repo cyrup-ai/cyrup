@@ -160,6 +160,24 @@ pub async fn run_interactive(
             },
         );
     }
+    // CFG-078 — the two v0.84.4 alt-screen keys. Applied UNCONDITIONALLY, not inside the
+    // fullscreen branch above: pi seeds `copyOnSelect` into every `createInteractiveTui`
+    // (`interactive-mode.ts:378`, fed at `:586`), including the one a later `/settings` switch
+    // builds, and evaluates `getFullscreenExitOutput()` at `stop()` whatever renderer is live
+    // (`:6556`). Seeding them only when the session BOOTS fullscreen would leave a session that
+    // switched in mid-run running on the renderer defaults instead of the user's settings.
+    {
+        let eff = session.services().settings.effective();
+        app.set_fullscreen_exit_output(match eff.fullscreen_exit_output() {
+            cyrup_config::settings::FullscreenExitOutput::ResumeHint => {
+                cyrup_tui::FullscreenExitOutput::ResumeHint
+            }
+            cyrup_config::settings::FullscreenExitOutput::Transcript => {
+                cyrup_tui::FullscreenExitOutput::Transcript
+            }
+        });
+        app.set_fullscreen_copy_on_select(eff.fullscreen_copy_on_select());
+    }
     // TUI-004: now that `into_stdout` has raw mode on — and BEFORE `crossterm_input_stream` spawns
     // the reader thread that would race us for the reply bytes — complete Pi's boot detection by
     // actually ASKING the terminal (OSC 11, and DSR `?996` for an `auto` setting) instead of

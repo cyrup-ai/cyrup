@@ -841,6 +841,26 @@ impl<B: Backend> App<B> {
                     // committed yet at this point.
                     self.rebuild_command_registry(session, value == "true");
                 }
+                // CFG-078 — both alt-screen rows are live in pi. `onFullscreenCopyOnSelectChange`
+                // persists and then pushes into the running renderer
+                // (`interactive-mode.ts:4757-4760`); `onFullscreenExitOutputChange` persists only
+                // (`:4750-4752`) because pi re-reads the getter at `stop()` time (`:6556`). cyrup
+                // caches BOTH on `App` — the renderer is built per excursion and the exit teardown
+                // has no settings view — so each has to be pushed in here, or a row cycled
+                // mid-session would not take effect until the next launch.
+                if id == "fullscreenCopyOnSelect" {
+                    self.set_fullscreen_copy_on_select(value == "true");
+                }
+                if id == "fullscreenExitOutput" {
+                    self.set_fullscreen_exit_output(if value == "resume-hint" {
+                        crate::altscreen::FullscreenExitOutput::ResumeHint
+                    } else {
+                        // The getter's own degrade rule (`settings-manager.ts:1213`), applied to
+                        // the row's value so the cached copy and a later `EffectiveSettings` read
+                        // of the same document cannot disagree.
+                        crate::altscreen::FullscreenExitOutput::Transcript
+                    });
+                }
                 // `transport` is live in Pi too, and it is the ONLY row whose live half touches the
                 // agent rather than the UI: `onTransportChange` persists the setting AND assigns
                 // `this.session.agent.transport = transport` (`interactive-mode.ts:4213-4216`), so

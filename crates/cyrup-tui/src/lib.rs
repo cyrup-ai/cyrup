@@ -112,7 +112,9 @@ mod user_message_selector;
 #[cfg(test)]
 mod tests;
 
-pub use altscreen::{AltScreen, PointerOutcome, ScrollbarMode, TuiRenderMode, ViewportRenderer};
+pub use altscreen::{
+    AltScreen, FullscreenExitOutput, PointerOutcome, ScrollbarMode, TuiRenderMode, ViewportRenderer,
+};
 pub use app::{
     App, AppAction, AppCommand, AppState, CompactionQueued, ExtensionWidget, ImplicitTrustReload,
     InlineBackend, LifecycleEffects, LifecycleOutcome, LoginProviderSource, MainScreenRenderState,

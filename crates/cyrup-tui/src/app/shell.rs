@@ -36,6 +36,11 @@ impl<B: Backend> App<B> {
             // behaves as it did before ADR-0005 in the strongest available sense.
             altscreen: None,
             alt_keymap: AltScreenKeymap::default(),
+            // CFG-078 — pi's two documented defaults (`settings-manager.ts:143`, `:145` @v0.84.4),
+            // so an `App` the composition root never configures behaves as upstream's does with an
+            // empty `settings.json`.
+            fullscreen_exit_output: crate::altscreen::FullscreenExitOutput::default(),
+            fullscreen_copy_on_select: true,
             viewport_height: 0,
             live_floor: 0,
             tree_nav_tx: None,

@@ -241,6 +241,18 @@ pub struct App<B: Backend> {
     /// [`App::reload_keybindings_from`]; adding this one is a line in each, and until then the
     /// table is upstream's defaults for the session's life.
     alt_keymap: AltScreenKeymap,
+    /// The `fullscreenExitOutput` setting (CFG-078) — what [`App::run`]'s exit teardown puts on the
+    /// main screen. pi reads `settingsManager.getFullscreenExitOutput()` at the moment it stops
+    /// (`interactive-mode.ts:6556` @v0.84.4), so this is kept LIVE: the composition root seeds it
+    /// and the `/settings` row's `ApplySetting` arm rewrites it, rather than a value latched at
+    /// boot that a mid-session change could not reach.
+    fullscreen_exit_output: crate::altscreen::FullscreenExitOutput,
+    /// The `fullscreenCopyOnSelect` setting (CFG-078), held here because the renderer that consumes
+    /// it does not exist yet in a regular-mode session: [`App::adopt_fullscreen_renderer`] pushes it
+    /// into each alternate screen as it is built, which is pi's `copyOnSelect` constructor option
+    /// (`interactive-mode.ts:378`), and [`App::set_fullscreen_copy_on_select`] keeps both this and a
+    /// live renderer in step, which is its `applyRuntimeSettings` write (`:1995`).
+    fullscreen_copy_on_select: bool,
     /// The current inline-viewport height (the live region's content height). Recomputed each
     /// [`draw`](Self::draw); the viewport is rebuilt only when it changes (audit #1).
     viewport_height: u16,

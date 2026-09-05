@@ -9,7 +9,9 @@ use super::effective::EffectiveSettings;
 use super::layer::{Settings, strip_global_only};
 use super::merge::deep_merge;
 use super::store::SettingsStore;
-use super::types::{FullscreenScrollbar, MermaidRenderingMode, SettingsScope, TuiMode};
+use super::types::{
+    FullscreenExitOutput, FullscreenScrollbar, MermaidRenderingMode, SettingsScope, TuiMode,
+};
 use crate::error::{ConfigError, ScopedError};
 
 /// The layered settings facade (arch-07 §3.3). Holds the two layers + a memoized merge.
@@ -402,6 +404,33 @@ impl SettingsManager {
             scrollbar.as_str(),
         )
         .await
+    }
+
+    /// `setFullscreenExitOutput` (Pi settings-manager.ts:1216-1220 @v0.84.4): GLOBAL scope, same
+    /// shape as [`Self::set_fullscreen_scrollbar`]; read back through
+    /// [`EffectiveSettings::fullscreen_exit_output`]. CFG-078.
+    pub async fn set_fullscreen_exit_output(
+        &mut self,
+        output: FullscreenExitOutput,
+    ) -> Result<(), ConfigError> {
+        self.set(
+            SettingsScope::Global,
+            "fullscreenExitOutput",
+            output.as_str(),
+        )
+        .await
+    }
+
+    /// `setFullscreenCopyOnSelect` (Pi settings-manager.ts:1237-1241 @v0.84.4): GLOBAL scope, and a
+    /// BOOLEAN rather than a spelling, because the key is one (`:145`) — read back through
+    /// [`EffectiveSettings::fullscreen_copy_on_select`], whose `?? true` default is what makes
+    /// writing `true` and clearing the key indistinguishable to a reader. CFG-078.
+    pub async fn set_fullscreen_copy_on_select(
+        &mut self,
+        enabled: bool,
+    ) -> Result<(), ConfigError> {
+        self.set(SettingsScope::Global, "fullscreenCopyOnSelect", enabled)
+            .await
     }
 
     /// `setEditorPaddingX`: clamp to 0..=3 (Pi settings-manager.ts:1179-1183).

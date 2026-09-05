@@ -468,7 +468,11 @@ impl App<InlineBackend<Stdout>> {
         // The frame afterwards is what re-establishes the inline viewport at the bottom of the
         // restored main screen, exactly as the first frame of any session does; `?` is deliberately
         // not used, because a cosmetic failure here must not swallow `drain_and_restore`.
-        if self.stop_fullscreen(false) {
+        // CFG-078 — `fullscreenExitOutput`: `transcript` repaints the excursion's document into
+        // native scrollback on the way out, `resume-hint` restores the screen the terminal had
+        // before and leaves only `resume_hint`'s line under it. pi's `stop()` reads the setting at
+        // exactly this moment (`interactive-mode.ts:6556`, consumed at `:836-842` @v0.84.4).
+        if self.stop_fullscreen(self.preserve_screen_on_exit()) {
             let _ = self.draw_synchronized();
         }
         // pi `interactive-mode.ts:3589-3591`: drain, THEN stop. The drain MUST happen here, before
