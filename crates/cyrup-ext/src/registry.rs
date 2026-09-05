@@ -294,6 +294,15 @@ struct RegistryInner {
     /// for exactly that reason; re-registration by the same owner is idempotent rather than a
     /// second fold step, because upstream's field ASSIGNMENT replaces rather than appends.
     markdown_transformers: Vec<ExtensionId>,
+    /// Extensions that declared a guest-supplied bash backend (DRIFT-004; pi
+    /// `UserBashEventResult.operations`, `core/extensions/types.ts:1139` @v0.84.4).
+    ///
+    /// A SET, not an ordered fold like `markdown_transformers` above, because upstream never folds
+    /// these: `emitUserBash` returns the FIRST truthy handler's whole result and stops
+    /// (`extensions/runner.ts:1005-1032`), and the consumer reads `operations` off exactly that one
+    /// result (`modes/rpc/rpc-mode.ts:581`). So the only question this table ever answers is
+    /// "does THIS owner — the one that won the reduction — have one?".
+    bash_operations: Vec<ExtensionId>,
     /// Per-extension `{source, baseDir}` provenance (SEAM-084). pi derives this ONCE per extension
     /// in `createExtension` (`core/extensions/loader.ts:433-444` @v0.83.0) and stores it on the
     /// `Extension` object, from which `registerCommand` copies it onto every `RegisteredCommand`;
@@ -558,6 +567,26 @@ impl ExtensionRegistry {
     /// answer must not allocate.
     pub fn has_markdown_transformers(&self) -> Result<bool, ExtError> {
         Ok(!self.lock_read()?.markdown_transformers.is_empty())
+    }
+
+    /// Record that `owner` declared a guest-supplied bash backend (DRIFT-004; pi
+    /// `UserBashEventResult.operations`, `core/extensions/types.ts:1139` @v0.84.4). Idempotent per
+    /// owner: the backend itself lives guest-side behind the `bash-operations-exec` export, so this
+    /// records only that the guest HAS one, exactly as
+    /// [`Self::register_markdown_transformer`] records that it has a transformer.
+    pub fn register_bash_operations(&self, owner: ExtensionId) -> Result<(), ExtError> {
+        let mut g = self.lock_write()?;
+        if !g.bash_operations.contains(&owner) {
+            g.bash_operations.push(owner);
+        }
+        Ok(())
+    }
+
+    /// Whether `owner` declared a guest-supplied bash backend — the question
+    /// [`crate::ExtensionHost::user_bash_operations`] asks about the ONE extension whose
+    /// `user_bash` result won the reduction.
+    pub fn has_bash_operations(&self, owner: &ExtensionId) -> Result<bool, ExtError> {
+        Ok(self.lock_read()?.bash_operations.contains(owner))
     }
 
     /// Record that `owner` subscribed to raw terminal input (EXT-021; pi

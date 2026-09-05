@@ -73,7 +73,7 @@
 //!   register's job is to be a record of what was decided and why — a silently vanished bullet
 //!   reads as "there was never a gap here".
 //!
-//! ## CYRUP-DELTA register — `UserBashEventResult.operations` has no guest-supplied form yet
+//! ## CYRUP-DELTA register — `UserBashEventResult.operations` — ~~no guest-supplied form yet~~ CLOSED
 //!
 //! * **`operations?: BashOperations`** on `UserBashEventResult`
 //!   (`pi/packages/coding-agent/src/core/extensions/types.ts:1078-1080` @v0.83.0, the interface
@@ -120,10 +120,27 @@
 //!   [`ExtensionHost::user_bash_operations`] asks that extension's
 //!   [`NativeExtension::user_bash_operations`] for the live backend — the same native-only,
 //!   every-build tier `render_live` already occupies, and for the same ADR-0002 reason.
-//!   **What is open is the WIT round-trip above ALONE**, i.e. the GUEST tier: a WASM extension can
+//!   ~~**What is open is the WIT round-trip above ALONE**, i.e. the GUEST tier: a WASM extension can
 //!   put the `"operations"` KEY in its reduction payload but cannot put a callable behind it until
-//!   it can register one. **Owning item: DRIFT-004 / SEAM-015,
-//!   `docs/gap-analysis/06-cyrup-ext.md`.**
+//!   it can register one.~~ **CLOSED (DRIFT-004): the round-trip is built, exactly as costed.**
+//!   `registration.register-bash-operations` declares it, the keyed
+//!   `events.bash-operations-exec(call-id, command, cwd, opts-json) -> result<option<s32>, string>`
+//!   EXPORT runs it, and pi's two closure-shaped `exec` options travel back over the new
+//!   `host-bash` interface — `emit-bash-output(call-id, chunk)` for `onData`,
+//!   `is-bash-cancelled(call-id)` for the `AbortSignal`. It cost the `HOST_WORLD` minor bump the
+//!   rule predicted (0.9 -> 0.10, `manifest.rs`) and landed with the guest half in
+//!   `cyrup-ext-sdk/src/{api,guest,macros}.rs` in the same change. [`ExtensionHost::user_bash_operations`]
+//!   now has two tiers: a native owner's real object, or a declaring guest's
+//!   [`crate::host::GuestBashOperations`] forwarder. The live round trip is
+//!   `crates/cyrup-it/tests/ext/wasm_bash_operations.rs`.
+//!
+//!   **The one thing the port does NOT carry**, recorded here because it is a WASM-tier property
+//!   with no upstream counterpart: a guest backend runs under the epoch budget (its dispatch budget
+//!   plus the caller's declared `timeout`), where pi's backends are plain JS objects with none. The
+//!   `user_bash` seam declares no timeout (`cyrup-session-svc/src/bash.rs`'s `timeout: None`,
+//!   itself a port of `bash-executor.ts:108-111`, which passes only `onData` and `signal`), so a
+//!   guest backend has the ordinary ~5s dispatch budget unless a caller declares one. **Owning
+//!   item: DRIFT-004 / SEAM-015, `docs/gap-analysis/06-cyrup-ext.md`.**
 //!
 //! No-panic policy (arch-00 §8) is enforced crate-wide via `[workspace.lints]`; tests may
 //! `#[allow(...)]` where unwrap/expect is acceptable.

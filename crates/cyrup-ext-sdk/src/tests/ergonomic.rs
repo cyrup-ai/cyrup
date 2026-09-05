@@ -744,3 +744,114 @@ fn tool_result_patch_carries_usage_and_omits_it_when_absent() {
     let v = serde_json::to_value(&empty).unwrap();
     assert!(!v.as_object().unwrap().contains_key("usage"));
 }
+
+// --- DRIFT-004: the guest half of pi's `UserBashEventResult.operations` -----------------------
+
+/// A guest bash backend is DECLARED (the `register-bash-operations` import at `init`) and REACHED
+/// (the `bash-operations-exec` export body) as two separate halves — pi
+/// `BashOperations` (`core/tools/bash.ts:63-81` @v0.84.4) behind
+/// `UserBashEventResult.operations` (`core/extensions/types.ts:1139`).
+#[test]
+fn bash_operations_are_declared_and_reachable() {
+    let mut api = ExtensionApi::new();
+    assert!(
+        !api.has_bash_operations(),
+        "an api that registered none must not declare one, or every guest would claim a backend \
+         it cannot serve"
+    );
+    api.register_bash_operations(|cmd: &BashCommand| {
+        cmd.write(b"streamed");
+        Ok(Some(7))
+    });
+    assert!(api.has_bash_operations());
+    let cmd = BashCommand::from_host_args("c1", "uname -a", "/tmp", "{}");
+    assert_eq!(api.exec_bash_operations(&cmd), Ok(Some(7)));
+}
+
+/// The AT-MOST-ONE rule: a second registration REPLACES the first, exactly as upstream's per-result
+/// field assignment does (`extensions/runner.ts:1005-1032` reads one result, not a fold).
+#[test]
+fn a_second_bash_operations_registration_replaces_the_first() {
+    let mut api = ExtensionApi::new();
+    api.register_bash_operations(|_: &BashCommand| Ok(Some(1)));
+    api.register_bash_operations(|_: &BashCommand| Ok(Some(2)));
+    let cmd = BashCommand::from_host_args("c1", "x", "/tmp", "{}");
+    assert_eq!(api.exec_bash_operations(&cmd), Ok(Some(2)));
+}
+
+/// An unexpected call on a guest that registered NO backend is an `Err` — pi's `throw`, which the
+/// host re-raises (`core/bash-executor.ts:154`) — and never `Ok(Some(0))`, which would report a
+/// command that never ran as a silent success with no output.
+#[test]
+fn bash_operations_exec_without_a_backend_is_an_error_not_a_silent_success() {
+    let api = ExtensionApi::new();
+    let cmd = BashCommand::from_host_args("c1", "x", "/tmp", "{}");
+    assert!(api.exec_bash_operations(&cmd).is_err());
+}
+
+/// The `opts-json` half of the seam: pi's two VALUE options (`timeout?`, `env?`,
+/// `core/tools/bash.ts:77-78`) plus cyrup's `envRemove` split, decoded as the guest sees them.
+#[test]
+fn bash_command_decodes_the_host_options_bag() {
+    let cmd = BashCommand::from_host_args(
+        "call-9",
+        "echo hi",
+        "/work",
+        r#"{"timeoutMs":1500,"env":{"PI_MODEL":"opus"},"envRemove":["SECRET"]}"#,
+    );
+    assert_eq!(cmd.call_id, "call-9");
+    assert_eq!(cmd.command, "echo hi");
+    assert_eq!(cmd.cwd, "/work");
+    assert_eq!(cmd.timeout_ms, Some(1500));
+    assert_eq!(cmd.env, vec![("PI_MODEL".to_string(), "opus".to_string())]);
+    assert_eq!(cmd.env_remove, vec!["SECRET".to_string()]);
+}
+
+/// A malformed or absent options bag degrades to the empty/absent form rather than failing the
+/// command — the same rule the rest of this SDK's seam decoding follows. `timeout_ms: None` is pi's
+/// absent `timeout`, i.e. no timeout at all, NOT a zero-length one.
+#[test]
+fn a_malformed_options_bag_leaves_a_runnable_command() {
+    let cmd = BashCommand::from_host_args("c", "ls", "/", "not json at all");
+    assert_eq!(cmd.timeout_ms, None);
+    assert!(cmd.env.is_empty());
+    assert!(cmd.env_remove.is_empty());
+    assert_eq!(cmd.command, "ls");
+}
+
+/// The bundled demo declares a backend and redirects exactly the `remote:` commands to it — the
+/// two-halves pairing (`{ operations }` from the handler + the registration) that
+/// `examples/extensions/ssh.ts:203-206` @v0.84.4 shows upstream. The `rm -rf` block must still win,
+/// since upstream evaluates the handler's own decision first.
+#[test]
+fn the_demo_extension_declares_a_bash_backend_and_redirects_only_remote_commands() {
+    let api = crate::example::build();
+    assert!(api.has_bash_operations());
+
+    let ctx = Ctx;
+    let redirected = api.dispatch(
+        19, // `user_bash` (`api::kind::USER_BASH`)
+        &["remote: uname -a", "false", "/work"],
+        &ctx,
+    );
+    assert_eq!(
+        redirected,
+        RawOutcome::Handled(json!({ "operations": true }).to_string()),
+        "a `remote:` command must be handled with the `operations` key and nothing else — a \
+         `result` would short-circuit execution before the backend is ever consulted \
+         (`modes/rpc/rpc-mode.ts:571-576`)"
+    );
+    assert_eq!(
+        api.dispatch(19, &["ls", "false", "/work"], &ctx),
+        RawOutcome::Noop,
+        "an ordinary command still falls through to the local shell"
+    );
+
+    let cmd = BashCommand::from_host_args("c1", "remote: uname -a", "/work", "{}");
+    assert_eq!(api.exec_bash_operations(&cmd), Ok(Some(0)));
+    assert!(
+        api.exec_bash_operations(&BashCommand::from_host_args("c2", "boom", "/work", "{}"))
+            .is_err(),
+        "a backend failure is pi's `throw`, not an exit code"
+    );
+}

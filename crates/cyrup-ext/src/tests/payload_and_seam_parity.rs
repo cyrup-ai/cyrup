@@ -1211,9 +1211,12 @@ impl NativeExtension for BashRedirect {
 /// has an `operations` field and `execute_bash_with_user_event` fills it from the winning
 /// `user_bash` result (SEAM-015). The KEY tested here is still the one a WASM guest can put in the
 /// payload today, and the assertion below fails the moment anyone "fixes" anything by filtering
-/// `operations` out at this boundary. What a guest still cannot do is put a CALLABLE behind the key
-/// — that is the residual WIT round-trip in the CYRUP-DELTA register; a NATIVE extension supplies
-/// its backend through `NativeExtension::user_bash_operations` instead.
+/// `operations` out at this boundary. Putting a CALLABLE behind the key is the OTHER half and is no
+/// longer open: a native extension supplies its backend through
+/// `NativeExtension::user_bash_operations`, and a guest through the
+/// `register-bash-operations` + `bash-operations-exec` round-trip (DRIFT-004,
+/// `crate::tests::bash_operations_seam` and `cyrup-it/tests/ext/wasm_bash_operations.rs`). This
+/// test is still about the PAYLOAD: the key must survive the reduction whichever tier reads it.
 ///
 /// Presence before absence: the `result` half is asserted first, so a reduction that dropped the
 /// whole payload could not pass by vacuously satisfying the `operations` check.
@@ -1248,9 +1251,9 @@ async fn user_bash_reduction_carries_the_operations_half_not_only_the_result_hal
     assert_eq!(
         v["operations"],
         json!({ "backend": "ssh", "remote": "build-box" }),
-        "the `operations` override must reach the caller intact; the seam that can act on it is \
-         `cyrup_tools::ops::BashOperations`, and the guest-side round-trip that would let a WASM \
-         extension supply one is the open half of DRIFT-004 (see the CYRUP-DELTA register in \
-         `crates/cyrup-ext/src/lib.rs`)"
+        "the `operations` override must reach the caller intact; the seam that acts on it is \
+         `cyrup_tools::ops::BashOperations`, supplied by a native extension directly or by a WASM \
+         guest over the `bash-operations-exec` round-trip (DRIFT-004; see the CYRUP-DELTA register \
+         in `crates/cyrup-ext/src/lib.rs`)"
     );
 }

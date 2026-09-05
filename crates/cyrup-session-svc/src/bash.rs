@@ -88,14 +88,14 @@ pub struct BashOptions {
     /// `None` is upstream's absent `operations` and takes the local-shell branch of that `??`,
     /// byte-for-byte the path this seam took before the field existed.
     ///
-    /// **The one producer pi has is not yet reachable here, and that is DRIFT-004 / SEAM-015's
-    /// remaining half, now the ONLY one.** Upstream fills this from the `user_bash` event result
-    /// (`UserBashEventResult.operations`, `core/extensions/types.ts:1078-1080`; threaded at
-    /// `modes/rpc/rpc-mode.ts:576`, `operations: eventResult?.operations`). cyrup's extension I/O is
-    /// serde values, not references (ADR-0002), so a WASM guest cannot *return* an implementation of
-    /// this trait until the `register-bash-operations` import + keyed `bash-operations-exec` export
-    /// round-trip is built — the design is written out in full in `crates/cyrup-ext/src/lib.rs`'s
-    /// CYRUP-DELTA register. Any in-host caller can supply one today.
+    /// Upstream fills this from the `user_bash` event result (`UserBashEventResult.operations`,
+    /// `core/extensions/types.ts:1139` @v0.84.4; threaded at `modes/rpc/rpc-mode.ts:581`,
+    /// `operations: eventResult?.operations`), and so does cyrup — `execute_bash_with_user_event`
+    /// writes what `ExtensionHost::user_bash_operations` returns for the winning extension. BOTH
+    /// extension tiers can produce one: a native extension returns the object, and a WASM guest —
+    /// which ADR-0002 forbids returning a callable — declares one with
+    /// `registration.register-bash-operations` and serves it over the `events.bash-operations-exec`
+    /// export (DRIFT-004, `cyrup:ext@0.10`). Any in-host caller can supply one directly.
     pub operations: Option<Arc<dyn cyrup_tools::ops::BashOperations>>,
 }
 

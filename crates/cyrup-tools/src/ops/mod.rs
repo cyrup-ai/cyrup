@@ -653,10 +653,13 @@ pub struct BashExecOptions<'a> {
 ///
 /// [CYRUP-DELTA, mechanism] A WASM guest cannot RETURN an implementation of this trait: ADR-0002
 /// (`docs/adr/ADR-0002-extension-io-is-serde.md`, rule 4) makes extension I/O values rather than
-/// references, so the guest half of `UserBashEventResult.operations` needs a registration import plus
-/// a keyed dispatch export in `crates/cyrup-ext/wit/world.wit` before a WASM extension can supply
-/// one. That round-trip is NOT built; the register entry naming its cost lives in
-/// `crates/cyrup-ext/src/lib.rs` (DRIFT-004 / SEAM-015).
+/// references, so the guest half of `UserBashEventResult.operations` is a registration import plus a
+/// keyed dispatch export in `crates/cyrup-ext/wit/world.wit`. That round-trip IS built (DRIFT-004,
+/// `cyrup:ext@0.10`): `registration.register-bash-operations` declares a guest backend,
+/// `events.bash-operations-exec` runs one command through it, and pi's two closure-shaped `exec`
+/// options come back over `host-bash.emit-bash-output` / `is-bash-cancelled`. The host holds a
+/// `cyrup_ext::host::GuestBashOperations` — an implementation of THIS trait that forwards to that
+/// export — so this seam's callers cannot tell the two tiers apart.
 ///
 /// A NATIVE extension CAN supply one, over the same native-only tier `RenderedComponent` uses:
 /// `cyrup_ext::NativeExtension::user_bash_operations` is consulted on the extension whose

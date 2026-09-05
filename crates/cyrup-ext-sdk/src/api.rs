@@ -9,7 +9,7 @@
 //! that have a handler (driving the host subscription bitset, R-ARCH-EXT-014).
 
 use crate::autocomplete::{AutocompleteProvider, AutocompleteQuery, AutocompleteSuggestions};
-use crate::ctx::{CommandCtx, Ctx, ToolCall};
+use crate::ctx::{BashCommand, CommandCtx, Ctx, ToolCall};
 use crate::descriptor::{CommandDescriptor, FlagSpec, ProviderConfig, ToolDescriptor};
 use crate::events::*;
 use crate::provider::{OAuthCallbacks, OAuthCredentials, ProviderHandlers, ProviderStream};
@@ -585,6 +585,36 @@ where
     }
 }
 
+/// A per-call command-execution backend this extension supplies for a `user_bash` command it
+/// handled — pi `BashOperations` (`packages/coding-agent/src/core/tools/bash.ts:63-81` @v0.84.4:
+/// *"Pluggable operations for the bash tool. Override these to delegate command execution to remote
+/// systems (for example SSH)"*), returned as `UserBashEventResult.operations`
+/// (`core/extensions/types.ts:1139`).
+///
+/// Register one with [`ExtensionApi::register_bash_operations`] and return `{"operations": true}`
+/// from a `user_bash` handler (see that method's doc for why BOTH halves are needed). The host then
+/// runs the extension's `!` command through [`Self::exec`] instead of the local shell — upstream's
+/// `options?.operations ?? createLocalBashOperations({ shellPath })`
+/// (`core/agent-session.ts:2782`).
+///
+/// The return is pi's `{ exitCode: number | null }`: `Ok(Some(code))` is an exit code, `Ok(None)`
+/// is its `null` ("killed"), and `Err(message)` is its `throw` — which the host re-raises as a
+/// failed command rather than a successful one with no output (`core/bash-executor.ts:154`).
+pub trait BashOperations: 'static {
+    /// Run one command, streaming its output with [`BashCommand::write`] and stopping when
+    /// [`BashCommand::is_cancelled`] turns true.
+    fn exec(&self, command: &BashCommand) -> Result<Option<i32>, String>;
+}
+
+impl<F> BashOperations for F
+where
+    F: Fn(&BashCommand) -> Result<Option<i32>, String> + 'static,
+{
+    fn exec(&self, command: &BashCommand) -> Result<Option<i32>, String> {
+        self(command)
+    }
+}
+
 /// A uniform handler: parses the ordered string args the host passes and returns a [`RawOutcome`].
 type Handler = Box<dyn Fn(&[&str], &Ctx) -> RawOutcome + 'static>;
 
@@ -610,6 +640,9 @@ pub struct ExtensionApi {
     /// EXT-019: at most one per extension (pi `extension.markdownTransformer`, types.ts:1703 @v0.84.1
     /// @v0.84.1).
     pub(crate) markdown_transformer: Option<Box<dyn MarkdownTransformer>>,
+    /// DRIFT-004: at most one per extension — upstream reads `operations` off the SINGLE
+    /// `UserBashEventResult` whose handler won the reduction (`extensions/runner.ts:1005-1032`).
+    pub(crate) bash_operations: Option<Box<dyn BashOperations>>,
     /// EXT-021: this extension's raw terminal-input handler, if it subscribed. AT MOST ONE —
     /// upstream allows several `onTerminalInput` calls per extension, but each returns its own
     /// unsubscribe and the host's subscriber table is keyed by EXTENSION, so a guest with two
@@ -819,6 +852,40 @@ impl ExtensionApi {
     /// `register-markdown-transformer` import at init).
     pub fn has_markdown_transformer(&self) -> bool {
         self.markdown_transformer.is_some()
+    }
+
+    /// Register this extension's bash backend (DRIFT-004; pi `UserBashEventResult.operations`,
+    /// `core/extensions/types.ts:1139` @v0.84.4). AT MOST ONE — a second call REPLACES the first,
+    /// as upstream's per-result field does.
+    ///
+    /// BOTH halves are required for the backend to be used, and they say different things:
+    ///
+    /// * this call declares that the guest HAS a backend (it drives the
+    ///   `registration.register-bash-operations` import at `init`);
+    /// * a `user_bash` handler returning [`Outcome::handled`] with `{"operations": true}` is what
+    ///   says *this particular command* should run through it — upstream's handler returns
+    ///   `{ operations }` for exactly the commands it wants to redirect and `undefined` for the
+    ///   rest (`examples/extensions/ssh.ts:203-206`), and a handler that returns a `result`
+    ///   instead short-circuits execution entirely, so the backend is never consulted
+    ///   (`modes/rpc/rpc-mode.ts:571-576`).
+    pub fn register_bash_operations(&mut self, operations: impl BashOperations) {
+        self.bash_operations = Some(Box::new(operations));
+    }
+
+    /// Run this extension's bash backend (the `bash-operations-exec` export body). `Err` when it
+    /// registered none — an unexpected call must not look like a command that ran and produced
+    /// nothing.
+    pub fn exec_bash_operations(&self, command: &BashCommand) -> Result<Option<i32>, String> {
+        match &self.bash_operations {
+            Some(ops) => ops.exec(command),
+            None => Err("this extension registered no bash operations".to_string()),
+        }
+    }
+
+    /// Whether this extension registered a bash backend (drives the
+    /// `registration.register-bash-operations` import at init).
+    pub fn has_bash_operations(&self) -> bool {
+        self.bash_operations.is_some()
     }
 
     /// Listen to raw terminal input (EXT-021; pi `ctx.ui.onTerminalInput(handler)`,

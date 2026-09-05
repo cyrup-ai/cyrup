@@ -816,9 +816,11 @@ pub trait NativeExtension: Send + Sync {
     /// Native-only by construction, for the same reason as [`Self::render_live`]: a
     /// [`cyrup_tools::ops::BashOperations`] is an object with an `exec` METHOD, and ADR-0002
     /// (`docs/adr/ADR-0002-extension-io-is-serde.md`) makes extension I/O values rather than
-    /// references, so a WASM guest cannot hand one back across the WIT boundary. The guest half is
-    /// the `register-bash-operations` import + keyed `bash-operations-exec` export round-trip
-    /// costed in `crates/cyrup-ext/src/lib.rs`'s CYRUP-DELTA register.
+    /// references, so a WASM guest cannot hand one back across the WIT boundary. A guest supplies
+    /// its backend the other way instead — the `register-bash-operations` import + keyed
+    /// `bash-operations-exec` export round-trip (DRIFT-004), which
+    /// [`crate::ExtensionHost::user_bash_operations`] resolves as its second tier. THIS method is
+    /// the native tier of the same question.
     ///
     /// `None` — upstream's absent `operations` — falls through to
     /// `createLocalBashOperations({ shellPath })` (`core/agent-session.ts:2782`'s `??`), i.e. the

@@ -1155,11 +1155,11 @@ async fn handle(
             // by `cyrup-modes/src/tests/modes/rpc_bash.rs`'s
             // `rpc_bash_runs_on_an_extension_supplied_operations_backend` and by
             // `cyrup-session-svc/src/tests/round9_l5res.rs`'s `..._operations_override_...` tests.
-            // RESIDUAL: only a NATIVE extension can supply the backend — ADR-0002 makes extension
-            // I/O values, so a WASM guest cannot return a callable; that half is the
-            // `register-bash-operations` import + keyed `bash-operations-exec` export round-trip
-            // costed in the CYRUP-DELTA register in `crates/cyrup-ext/src/lib.rs`.
-            // DRIFT-004 / SEAM-015.
+            // Either tier can supply the backend: a NATIVE extension returns the object directly,
+            // and a WASM guest — which ADR-0002 forbids returning a callable — declares one with
+            // `registration.register-bash-operations` and serves it over the
+            // `events.bash-operations-exec` export (DRIFT-004, `cyrup:ext@0.10`). Both resolve
+            // through `ExtensionHost::user_bash_operations`, which this wrapper calls.
             match session
                 .execute_bash_with_user_event(
                     &command,

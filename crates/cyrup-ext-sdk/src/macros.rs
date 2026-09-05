@@ -104,6 +104,17 @@ macro_rules! export_extension {
                 ) -> ::std::string::String {
                     $crate::guest::transform_markdown(markdown, ctx_json)
                 }
+                // DRIFT-004 — the guest half of `UserBashEventResult.operations`. Called only on
+                // a guest that declared `registration.register-bash-operations`.
+                fn bash_operations_exec(
+                    call_id: ::std::string::String,
+                    command: ::std::string::String,
+                    cwd: ::std::string::String,
+                    opts_json: ::std::string::String,
+                ) -> ::core::result::Result<::core::option::Option<i32>, ::std::string::String>
+                {
+                    $crate::guest::bash_operations_exec(call_id, command, cwd, opts_json)
+                }
                 fn on_terminal_input(
                     data: ::std::string::String,
                 ) -> ::core::option::Option<

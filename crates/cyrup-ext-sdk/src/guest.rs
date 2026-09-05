@@ -159,6 +159,12 @@ fn push_registrations(api: &ExtensionApi) {
     if api.has_markdown_transformer() {
         registration::register_markdown_transformer();
     }
+    // DRIFT-004: declare (not send) the bash backend — the closure stays guest-side and the host
+    // reaches it through the `bash-operations-exec` export. Pi `UserBashEventResult.operations`,
+    // `core/extensions/types.ts:1139` @v0.84.4.
+    if api.has_bash_operations() {
+        registration::register_bash_operations();
+    }
     // EXT-021: declare (not send) the raw terminal-input handler — the closure stays guest-side
     // and the host reaches it through the `on-terminal-input` export. Pi
     // `ctx.ui.onTerminalInput(handler)`, `extensions/types.ts:145` @v0.83.0.
@@ -350,6 +356,22 @@ pub fn transform_markdown(markdown: String, ctx_json: String) -> String {
     API.with(|c| match c.borrow().as_ref() {
         Some(api) => api.transform_markdown(&markdown, &ctx),
         None => markdown,
+    })
+}
+
+/// `bash-operations-exec` export body (DRIFT-004; Pi `BashOperations.exec`,
+/// `core/tools/bash.ts:71-80` @v0.84.4). `Err` when this guest registered no backend, so an
+/// unexpected call surfaces as a failed command rather than a silent success with no output.
+pub fn bash_operations_exec(
+    call_id: String,
+    command: String,
+    cwd: String,
+    opts_json: String,
+) -> Result<Option<i32>, String> {
+    let cmd = crate::ctx::BashCommand::from_host_args(call_id, command, cwd, &opts_json);
+    API.with(|c| match c.borrow().as_ref() {
+        Some(api) => api.exec_bash_operations(&cmd),
+        None => Err("extension not initialized".into()),
     })
 }
 

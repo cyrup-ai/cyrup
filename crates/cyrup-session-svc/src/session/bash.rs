@@ -188,10 +188,11 @@ impl AgentSession {
     /// arms both pass `None`, so in practice the event result is what fills it, but an in-host
     /// caller with its own backend (the arch-12 isolation decorators) keeps it.
     ///
-    /// **Residual (SEAM-015):** only a NATIVE extension can supply the backend. ADR-0002 makes
-    /// extension I/O values, so a WASM guest cannot return a callable; the guest half is the
-    /// `register-bash-operations` import + keyed `bash-operations-exec` export round-trip costed in
-    /// `crates/cyrup-ext/src/lib.rs`'s CYRUP-DELTA register.
+    /// Both extension tiers can supply the backend (DRIFT-004): a NATIVE extension returns the
+    /// object, and a WASM guest — which ADR-0002 forbids returning a callable — declares one with
+    /// `registration.register-bash-operations` and serves it over the `events.bash-operations-exec`
+    /// export. `ExtensionHost::user_bash_operations` resolves whichever tier the winning extension
+    /// lives in, so this wrapper sees one `Arc<dyn BashOperations>` either way.
     pub async fn execute_bash_with_user_event(
         &self,
         command: &str,

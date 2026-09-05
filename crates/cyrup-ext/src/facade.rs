@@ -1017,12 +1017,19 @@ impl ExtensionHost {
     /// is the only one upstream ever reads `operations` from (`extensions/runner.ts:1005-1032`
     /// returns the FIRST truthy handler's whole result and stops).
     ///
-    /// NATIVE-only and available in EVERY build, exactly like [`Self::render_via`]'s live-component
-    /// tier and for the same ADR-0002 reason: a [`cyrup_tools::ops::BashOperations`] is a callable,
-    /// not a value, so a WASM guest cannot return one — a guest owner therefore resolves to `None`
-    /// and the command falls through to `createLocalBashOperations` (`agent-session.ts:2782`'s
-    /// `??`). Closing THAT half is the `register-bash-operations` + `bash-operations-exec`
-    /// round-trip costed in this crate's CYRUP-DELTA register (SEAM-015's residual).
+    /// TWO TIERS, exactly like [`Self::render_via`] and for the same ADR-0002 reason. A
+    /// [`cyrup_tools::ops::BashOperations`] is a callable, not a value, so a WASM guest cannot
+    /// RETURN one:
+    ///
+    /// * a NATIVE owner hands back the real object ([`crate::NativeExtension::user_bash_operations`]),
+    ///   available in every build;
+    /// * a GUEST owner that declared `registration.register-bash-operations` gets a
+    ///   [`crate::host::GuestBashOperations`] forwarder, which routes each `exec` back over the
+    ///   guest's `bash-operations-exec` export (DRIFT-004, the round-trip costed in this crate's
+    ///   CYRUP-DELTA register).
+    ///
+    /// An owner with neither is upstream's ABSENT `operations`: the command falls through to
+    /// `createLocalBashOperations` (`agent-session.ts:2782`'s `??`), i.e. the local shell.
     ///
     /// A panicking supplier is contained (`warn!` + `None`) rather than propagated: pi's
     /// `emitUserBash` wraps every handler in `try`/`catch` (`runner.ts:1012-1029`), so an extension
@@ -1034,25 +1041,36 @@ impl ExtensionHost {
         exclude_from_context: bool,
         cwd: &str,
     ) -> Option<Arc<dyn cyrup_tools::ops::BashOperations>> {
-        let native = self
-            .native
-            .read()
-            .ok()
-            .and_then(|g| g.get(owner).cloned())?;
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            native.user_bash_operations(command, exclude_from_context, cwd)
-        })) {
-            Ok(ops) => ops,
-            Err(panic) => {
-                let message = native_panic_msg(panic);
-                tracing::warn!(
-                    extension = %owner, error = %message,
-                    "native user_bash operations supplier panicked (contained; the command falls \
-                     back to the local shell)"
-                );
-                None
+        if let Some(native) = self.native.read().ok().and_then(|g| g.get(owner).cloned()) {
+            return match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                native.user_bash_operations(command, exclude_from_context, cwd)
+            })) {
+                Ok(ops) => ops,
+                Err(panic) => {
+                    let message = native_panic_msg(panic);
+                    tracing::warn!(
+                        extension = %owner, error = %message,
+                        "native user_bash operations supplier panicked (contained; the command \
+                         falls back to the local shell)"
+                    );
+                    None
+                }
+            };
+        }
+        #[cfg(feature = "wasm-host")]
+        {
+            // The guest declared one at `init` (or from a live handler — the registry is written
+            // through, EXT-058), and the instance is still loaded. Both halves are required: a
+            // recorded owner with no live instance has nothing to call, and a live instance that
+            // never registered must not be handed a command its export would answer with the
+            // SDK's "no backend" default.
+            if self.registry.has_bash_operations(owner).unwrap_or(false)
+                && let Some(ext) = self.live.read().ok().and_then(|g| g.get(owner).cloned())
+            {
+                return Some(Arc::new(crate::host::GuestBashOperations::new(ext)));
             }
         }
+        None
     }
 
     /// Dispatch `session_before_compact` (Pi `emit("session_before_compact")`,

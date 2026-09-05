@@ -229,13 +229,46 @@ pub(super) fn install(api: &mut ExtensionApi) {
         Outcome::mutate(payload)
     });
 
-    // user_bash (gap-08 #5): block a destructive `!rm -rf` invocation; otherwise proceed.
+    // user_bash (gap-08 #5): block a destructive `!rm -rf` invocation; REDIRECT a `remote:` one to
+    // this extension's own bash backend (DRIFT-004 — pi's `UserBashEventResult.operations`, the
+    // shape every shipped upstream example uses: `examples/extensions/ssh.ts:203-206` returns
+    // `{ operations }` and nothing else); otherwise proceed.
     api.on_user_bash(|ev, _ctx| {
         if ev.command.contains("rm -rf") {
             Outcome::block("user_bash blocked by demo")
+        } else if ev.command.starts_with("remote:") {
+            Outcome::handled(json!({ "operations": true }))
         } else {
             Outcome::noop()
         }
+    });
+
+    // The backend the handler above redirects to (DRIFT-004). Declared once at `init`
+    // (`registration.register-bash-operations`) and reached per command through the
+    // `bash-operations-exec` export: pi `BashOperations.exec(command, cwd, {onData, signal, …})`,
+    // `core/tools/bash.ts:71-80` @v0.84.4. It streams through `write` (pi's `onData`) rather than
+    // returning its output, because upstream's backend has no return channel for output at all —
+    // only the exit code — and stops early when the host cancels (pi's `signal.aborted`).
+    api.register_bash_operations(|cmd: &crate::BashCommand| {
+        if cmd.is_cancelled() {
+            return Ok(None); // pi `exitCode: null` — killed before it started.
+        }
+        if cmd.command.contains("boom") {
+            // pi's `throw`: a backend FAILURE, which the host must not report as a command that
+            // ran and produced nothing (`core/bash-executor.ts:154`).
+            return Err("demo backend refused to run".to_string());
+        }
+        cmd.write(format!("[demo-backend] {} in {}\n", cmd.command, cmd.cwd).as_bytes());
+        // Prove the VALUE half of pi's options bag crossed too (`timeout?`, `env?`).
+        cmd.write(
+            format!(
+                "[demo-backend] env={} timeout={:?}\n",
+                cmd.env.len(),
+                cmd.timeout_ms
+            )
+            .as_bytes(),
+        );
+        Ok(Some(0))
     });
 
     // session_before_compact (L4 gap #5): READ the computed typed preparation and return a custom
