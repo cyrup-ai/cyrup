@@ -91,7 +91,7 @@ numbers and file existence both mislead. §7 says how much of this was first-han
 > the two hand-counted trackers outside any table. **No script change this edition** — both carried
 > lists were already empty and the census is entirely table-derived.
 >
-> **What moved since the tenth edition (103 → 91 open; 564 → 583 closed):** `04` 2 → 1
+> **What moved since the tenth edition (103 → 90 open; 564 → 584 closed):** `04` 2 → 1
 > (`TOOL-022` REFUTED — all three limbs already reached a guest tool at HEAD, the consumer having
 > landed in `75532cee` before this branch was cut); `05` 15 → 12 (`CFG-078`, `CFG-079`, `CFG-080`);
 > `06` 14 → 12 (`EXT-003`, `EXT-006`, `EXT-039` closed; **`EXT-076` FILED medium** by this pass);
@@ -108,7 +108,7 @@ numbers and file existence both mislead. §7 says how much of this was first-han
 > raised by reviews that blocked and were not answered before the batch ended. A batch that closes
 > nineteen and opens seven has closed twelve.
 >
-> **Open set: 91 work items — 0 critical, 0 high, 15 medium, 76 low**, of which 89 sort into the
+> **Open set: 90 work items — 0 critical, 0 high, 14 medium, 76 low**, of which 88 sort into the
 > six Kind-derived classes and 2 do not (`EXT-058`, `PERM-032`).
 >
 > | area | open | crit | high | med | low | trackers | closed |

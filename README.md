@@ -251,9 +251,9 @@ Two conventions:
 
 Behavioural differences from Pi are tracked in the open, in
 [`docs/gap-analysis/`](docs/gap-analysis/README.md), so an unported feature is not mistaken for a
-bug. 91 rows are open across the area files: no `critical`, no `high`, 15 `medium`, 76 `low`, with
-583 closed. `docs/gap-analysis/scripts/count_open_items.py` produces those counts, measured at code
-HEAD `824a539e`.
+bug. 90 rows are open across the area files: no `critical`, no `high`, 14 `medium`, 76 `low`, with
+584 closed. `docs/gap-analysis/scripts/count_open_items.py` produces those counts, measured at code
+HEAD `79b0a578`.
 
 **Nothing is open above `medium`**, which is a first for this ledger. `SUBA-074` — an agent's
 `runner:` frontmatter naming an external CLI to run the child under — was the last such row, and the

@@ -20,14 +20,16 @@ next work item**.
 > than to the one the brief named.
 >
 > **Counts are `scripts/count_open_items.py`'s, re-run after every correction below was written:**
-> **91 open = 0 critical, 0 high, 15 medium, 76 low; 583 closed; 6 trackers** (eighth edition:
+> **90 open = 0 critical, 0 high, 14 medium, 76 low; 584 closed; 6 trackers** (eighth edition:
 > 103 = 0/1/28/74, 564 closed). §0 of `PARITY-GAPS.md` carries the per-area table and §0a the
 > above-medium set; neither is duplicated here.
 >
-> **The arithmetic, stated so the headline cannot flatter itself.** 583 − 564 = **19 rows closed**.
-> Open went 103 → 91, which is −12 and not −19, because **this ledger pass filed seven NEW rows** —
+> **The arithmetic, stated so the headline cannot flatter itself.** 584 − 564 = **20 rows closed**.
+> Open went 103 → 90, which is −13 and not −20, because **this ledger pass filed seven NEW rows** —
 > six of them against defects in the code this very batch landed, found by reviews that blocked and
-> were then not answered before the batch ended. A batch that closes nineteen rows and opens seven
+> were then not answered before the batch ended. One of those seven, `EXT-076`, was answered after
+> the batch: a regression `EXT-039` introduced in this same branch, fixed at `79b0a578` rather than
+> shipped. A batch that closes nineteen rows and opens seven
 > has closed twelve, and that is the number to plan against.
 
 ## The above-medium set is EMPTY — what that does and does not mean
