@@ -93,7 +93,7 @@ corrections are applied and recorded at the item.
 |---|---|---|---|---|
 | ~~SUBA-072~~ | ~~critical~~ **CLOSED 2026-09-04** | M | foreground exec / tool allowlisting | Capability ceiling's `allowedTools` and `denyExtensions` axes are resolved and propagated but never applied to the child |
 | ~~SUBA-073~~ | ~~medium~~ **CLOSED 2026-09-04** | M | config / permissions / frontmatter | Subagent permission policy never reaches a spawned child; `permission:` frontmatter is accepted and inert |
-| ~~SUBA-074~~ | ~~high~~ **CLOSED 2026-09-04** | L | external runners / agent schema | Stage 1 (refusal) closed at `bf8b0f9`; **stage 2 ported at `af1a8a76`** — the capability/status contract, the hardened external-CLI runner, the generic no-adapter path (upstream's in-baseline `v0.43.0` half) and the `claude-code`/`claude-code-writer` adapter. A declared external profile now RUNS as the foreign process and resolves no model; `codex-exec`, `cursor-agent` and the whole `external-job` protocol stay refused by name through the new exhaustive `RunnerDispatch` |
+| ~~SUBA-074~~ | ~~high~~ **CLOSED 2026-09-04** | L | external runners / agent schema | Stage 1 (refusal) closed at `bf8b0f9`; **stage 2 ported at `af1a8a76`** — the capability/status contract, the hardened external-CLI runner, the generic no-adapter path (upstream's in-baseline `v0.43.0` half) and the `claude-code`/`claude-code-writer` adapter. A declared external profile now RUNS as the foreign process and resolves no model; `codex-exec`, `cursor-agent` and the whole `external-job` protocol stay refused by name through the new exhaustive `RunnerDispatch`. **Review fix `95a55ea1` (2026-09-05):** the process runner wrote the prompt to the child's stdin BEFORE the stdout/stderr pumps existed and before the select loop that owns the deadline and the stop token — a prompt over the 64 KiB pipe buffer against a child that writes before it reads DEADLOCKED with no verb able to recover it (upstream registers both `data` handlers at `external-cli-runner.ts:350-360` and calls `child.stdin.end` only at `:364`); also fixed in the same pass: the acceptance contract now reaches the foreign process (upstream appends it at `subagent-runner.ts:1462-1465`, ABOVE the `external-cli` branch at `:1491`), R-SA-025 is validated ahead of the dispatch, a JSONL protocol violation tears the process down (`:267-272`), a preflight failure publishes its process receipt (`:212-213`), `capabilities` persists in upstream's `{key:false}` object shape on the hop-2 wire, and `validate_code_owned_profile_runner` sweeps the reserved rows in upstream's order (`external-cli-contract.ts:42-46`). The stage-2 test count below was understated: the net is **59**, not 34 |
 | ~~SUBA-075~~ | ~~high~~ **CLOSED 2026-09-04** | M | fork context / thinking | Forked child sessions are not sanitized: signed/redacted Anthropic thinking blocks inherited, no thinking-off override |
 | ~~SUBA-076~~ | ~~high~~ **CLOSED 2026-09-04** | S | acceptance / evidence scoring | Evidence checks are scored binary where upstream is tri-state, producing two spurious acceptance rejections |
 | ~~SUBA-077~~ | ~~high~~ **CLOSED 2026-09-04** | S | foreground exec / deadlines | A foreground run with no explicit timeout has NO wall-clock deadline, and there is no global `timeoutMs` |
@@ -111,7 +111,7 @@ corrections are applied and recorded at the item.
 | ~~SUBA-090~~ | ~~medium~~ **PARTIALLY CLOSED 2026-09-04** | S | background completion notify / `display` | **Promoted out of `## Carried` 2026-09-04** (both sides read at v0.43.0, v0.57.0 and v0.64.0; confirmed exactly as filed — predicate verbatim at all three tags, `scheduleOrigin` clause the only tag-to-tag change) **and ported at `79ee7eff`**: `completion_notice_display(ClassifiedOutcome)` is pi's `notify.ts:402` predicate reduced to its one cyrup-reachable clause (`status !== "completed"`), `format_completion_message` computes `display` from the same `classify_outcome` that picks the header word, the false "Always `true`" doc is gone, `trigger_turn` stays `true` (no `triggerTurn:false` input exists). **Residual (medium, area 08/03 seam, not this crate):** on the trigger-turn path `session-svc inject.rs:125-160` drops `display` (`AgentMessage::Custom` has no such field) so the hidden notice still renders on screen — **filed as `SUBA-094` (medium)**; the grouped `formatGroupedCompletion` form stays with `SUBA-017` |
 | ~~SUBA-091~~ | ~~medium~~ **CLOSED 2026-09-04** | S | fleet inspector / transcript containment | **Promoted out of `## Carried` 2026-09-04** (both sides read at v0.57.0 and v0.64.0 plus the upstream landing commit `9ceb5650`; confirmed exactly as filed, line drift only) **and ported at `681f6255`**: `FleetState::trusted_session_roots` is pi's `state.trustedSessionRoots` (`index.ts:895-898`: `defaultSessionDir` tilde-expanded + resolved, then the parent's subagent session root, deduped), seeded by `SubagentExecutor::fleet_state` through the pure `paths::trusted_session_roots`, and `async_detail` passes `unique_paths(state.trusted_session_roots)` where the literal `&[]` was, so the session-JSONL tail renders in the detail pane; the containment gate is unchanged. Residuals (low): pi's `trustedSessionFiles`/`trustedSessionFileRoot` rung and `trackedJob?.sessionRoot` are not carried; `subagent status`'s cyrup-original root triple differs from pi's `trustedSessionRootsForStatus` |
 | ~~SUBA-092~~ | ~~high~~ **CLOSED 2026-09-04** | M | discovery / agent schema | `excludeTools:`/`allowNestedSubagents:` ported at `247ff97b` — frontmatter, settings-override, serializer, and the spawn-plan tool subtraction / nested-fanout grant. v0.64.0's cross-field custom-override precedence change (`31562d76`) is a recorded residual, not this row |
-| ~~SUBA-093~~ | ~~medium~~ **CLOSED 2026-09-04** | M | background status model / child-scoped stop | `SUBA-087`'s residual, filed as its own item 2026-09-04 **and ported at `07f2df0d`**: `background/flat_index.rs` is pi's declaration-time flatten, so a `ParallelGroup` publishes one `RunStatus::steps` entry PER MEMBER named by its own agent; `ChainRunContext::step_slot` (`StepSlot::{Exclusive,Shared}`) carries pi's per-member `ctx.flatIndex` through the telemetry fold, `child_index`, the steer paths, the artifact index and the per-child stop handle, which `ExecSingleStepExecutor::run_single` now registers per DISPATCH. `subagent({action:"stop", id, childId:"step:1"})` against a 3-task fan-out stops member 1 alone. Residuals (low): a `DynamicGroup` keeps one shared slot (upstream's runtime splice, `:4155`, is not ported); group members go `Running` at group dispatch rather than per worker claim |
+| ~~SUBA-093~~ | ~~medium~~ **CLOSED 2026-09-04** | M | background status model / child-scoped stop | `SUBA-087`'s residual, filed as its own item 2026-09-04 **and ported at `07f2df0d`**: `background/flat_index.rs` is pi's declaration-time flatten, so a `ParallelGroup` publishes one `RunStatus::steps` entry PER MEMBER named by its own agent; `ChainRunContext::step_slot` (`StepSlot::{Exclusive,Shared}`) carries pi's per-member `ctx.flatIndex` through the telemetry fold, `child_index`, the steer paths, the artifact index and the per-child stop handle, which `ExecSingleStepExecutor::run_single` now registers per DISPATCH. `subagent({action:"stop", id, childId:"step:1"})` against a 3-task fan-out stops member 1 alone. Residuals (low): a `DynamicGroup` keeps one shared slot (upstream's runtime splice, `:4155`, is not ported); group members go `Running` at group dispatch rather than per worker claim. **Review fix `95a55ea1` (2026-09-05):** `record_step_outcome` now guards an EMPTY flat range (a zero-width `ParallelGroup`'s `slots.start` is the NEXT step's entry — believed unreachable, now pinned); `run_single`'s `clear_active` became an `ActiveStopGuard` drop guard, so a member whose future is DROPPED (fail-fast / cancellation inside `run_bounded`) no longer leaks a dead token under a live flat index; `step_display_agent`'s doc no longer points at `pending_step_status_for`, which this item deleted. Citation drift corrected in the detail section: the per-member `flatIndex: fi` lines are `:4254`/`:4653` and the sequential spread is `:5015-5020`, not `:4245`/`:4640`/`:5017` |
 | ~~SUBA-094~~ | ~~medium~~ **CLOSED 2026-09-04** | M | completion notify / session-svc inject seam | `SUBA-090`'s residual, filed as its own item 2026-09-04 **and ported at `f9de9fe7`** (fix site `crates/cyrup-agent` + `crates/cyrup-session-svc` + `crates/cyrup-tui`, areas 03/08/07): `AgentMessage::Custom` carries a REQUIRED `display: bool`, so `send_custom_message`/`inject_message`/the guest `sendMessage` bridge put it ON the message the way pi's one `appMessage` does (`agent-session.ts:1483-1516` @v0.84.4) and all five delivery arms keep it; `subscriber.rs`'s run-loop append reads it where it hardcoded `true`, `raw_message_to_agent` restores it from the persisted entry, and the TUI's extractor became `displayable_custom_message_from_event`, pi's `if (message.display)` (`interactive-mode.ts:3607-3620`) placed where both live drawing callers funnel through. Residual (low): the guest bridge still reads a MISSING `display` as `true` where pi's `undefined` is falsy — unreachable from a type-conforming guest |
 
 > **RE-AUDITED 2026-09-04, cyrup HEAD `2571969`** (baseline `4fb5e40`, 09/09a combined pass). Of the
@@ -401,7 +401,8 @@ the env write in `exec/spawn_plan.rs`.
 > (`:126`) and parses it into `AgentDefinition::runner`; `parseAgentRunnerFrontmatter`'s Pi-only-field
 > guard is ported at `:1001-1012` (rejects `tools`/`permission`/etc. alongside a non-`pi` runner) and
 > `validateCodeOwnedProfileRunner` at `:990-1020`. **The refusal is live on the production launch
-> path, not only tested**: `exec/mod.rs::run_sync`'s Step 0b (`:287-303`) calls
+> path, not only tested**: `exec/mod.rs::run_sync`'s dispatch step (`:287-303` then; `Step 0b` then,
+> `Step 2a` since 2026-09-05) calls
 > `agent.runner.as_ref().and_then(AgentRunnerConfig::refusal_reason)` **before** the model-fallback
 > ladder and fails the run with pi's message via `pre_spawn_failure`, with a same-file test asserting
 > a `pi` runner never hits it (`exec/mod.rs:1602-1614`). `runner::AgentRunnerConfig::refusal_reason`
@@ -435,7 +436,8 @@ the env write in `exec/spawn_plan.rs`.
 > "did not refuse" can no longer be what selects the native child. That ordering was
 > non-negotiable: with the supported set non-empty and the gate still an `Option`, `None` would
 > again mean "spawn a full-capability native child", silently. The external arm returns from
-> `exec/mod.rs`'s Step 0b before `run_fallback_ladder`, because upstream resolves NO model for an
+> `exec/mod.rs`'s Step 2a (`0b` before the 2026-09-05 review fix moved it below R-SA-025 and
+> the acceptance resolve) before `run_fallback_ladder`, because upstream resolves NO model for an
 > external runner at all (`api/preflight.ts:322-343`).
 >
 > **Deferred, with reasons, still refused by name:** `codex-exec` (a second output channel — the
@@ -447,14 +449,17 @@ the env write in `exec/spawn_plan.rs`.
 > path that can never succeed, replacing an honest "not supported" with a dishonest "no provider
 > registered".
 >
-> **Three anchor/count corrections to the text below.** The refusal is at `exec/mod.rs:308-325`,
-> not `:287-303`; the tools doc is `discovery/types.rs:1025`, not `:728-730`; and the claude-code
+> **Three anchor/count corrections to the text below.** The refusal is at `exec/mod.rs:330-362`,
+> not `:287-303` (nor the `:308-325` this block first said, which named only the comment block
+> above the `match resolve_runner_dispatch(...)`; the line numbers moved again with the
+> 2026-09-05 review fix, which lifted R-SA-025 and the acceptance resolve above the dispatch); the tools doc is `discovery/types.rs:1025`, not `:728-730`; and the claude-code
 > env allowlist is **32** keys (`claude-code-adapter.ts:10-43`). Also ported here as a tag-to-tag
 > correction inside this item's own surface: `validateExternalRunnerProfile`'s Pi-only field list
 > is **seventeen** at `v0.64.0` (`agents.ts:1906`), not the fourteen stage 1 pinned —
 > `excludeTools`, `allowNestedSubagents` and `mutationTools` were added after that port.
 >
-> **Tests (34 added).** The behavioural fail-before/pass-after is
+> **Tests (59 added — the body of `af1a8a76` said 34, which was wrong in the harmless
+> direction; `-p cyrup-ext-subagents` went 2735 -> 2794).** The behavioural fail-before/pass-after is
 > `run_sync_executes_a_generic_external_cli_profile_and_resolves_no_model`: at the previous HEAD
 > every `external-cli` runner took `pre_spawn_failure` (exit 1, no output); it now runs the foreign
 > process, delivers its stdout, and carries `model: None` with an empty ladder plus a runner and
@@ -471,7 +476,78 @@ the env write in `exec/spawn_plan.rs`.
 > projection, and `api/preflight.ts`'s own external branch. Each depends only on the contract types
 > that now exist. (3) `runner_to_json_string` re-emits a `capabilities:` block in upstream's
 > capability order rather than the author's — strictly closer to upstream than the previous
-> alphabetical order.
+> alphabetical order. (The SHAPE divergence this residual did NOT record — the derived serde on
+> `ExternalCliRunner` put `["steer"]` on the hop-2 `runner-config.json` wire where the
+> frontmatter writer emitted `{"steer":false}` — was a defect, not a residual, and is fixed in
+> the review-fix block below.)
+
+> **REVIEW FIX 2026-09-05, commit `95a55ea1`.** The batch-3 review of `af1a8a76` found one blocking
+> defect and seven smaller ones; every claim was re-derived on both sides before anything was
+> touched (`pi-subagents` v0.64.0 via `git show`, cyrup at HEAD).
+>
+> **BLOCKING — an unbounded hang in `exec/external_cli/run.rs`.** `run_external_cli_process` did
+> `stdin.write_all(payload)` + `stdin.shutdown()` and only THEN created the mpsc channel, spawned
+> the two `pump` tasks and entered the `tokio::select!` loop that owns `opts.deadline_at` and
+> `opts.cancel`. Upstream is the other way round — `child.stdout.on("data", …)`/
+> `child.stderr.on("data", …)` at `external-cli-runner.ts:350-360`, `child.stdin.end(input.prompt)`
+> at `:364` — so Node drains both pipes while the prompt goes down the third. With a prompt over
+> the stdin pipe buffer (64 KiB on Linux; `build_external_cli_prompt` concatenates the system-prompt
+> body AND the task) and a child that fills its own 64 KiB stdout buffer before consuming all of
+> stdin, the child blocked in `write` and cyrup blocked in `write_all`, and neither the timeout arm
+> nor the stop arm could fire because the loop had not been entered. Reachable on the shipped
+> generic no-adapter path. Fixed by starting both pumps first and moving the delivery onto its own
+> task (`deliver_prompt`), which also closes stdin as soon as the write settles no matter what the
+> loop does. Pinned by
+> `a_prompt_larger_than_the_stdin_pipe_does_not_deadlock_a_child_that_writes_first` (256 KiB prompt,
+> a child that emits 128 KiB before reading a byte and then reports its stdin byte count), which
+> against the old order hangs and fails at its 30 s wall-clock bound — verified by restoring that
+> order.
+>
+> **Seven more, all with both sides re-read.** (a) The acceptance contract never reached an external
+> CLI: upstream appends `formatAcceptancePrompt(step.effectiveAcceptance, …)` to `task` at
+> `subagent-runner.ts:1462-1465`, ABOVE the `if (step.runner?.type === "external-cli")` branch at
+> `:1491`, so `buildExternalCliPrompt` at `:1506` sees the post-acceptance task; cyrup injected only
+> on the native spawn path and returned into `run_external_cli` before Step 2 ran at all.
+> `resolve_run_acceptance` now sits above the dispatch and `run_external_cli` takes the contract;
+> `SingleResult::task` stays the RAW task, as on the native path. (b) R-SA-025
+> (`validate_file_only_requires_path`) sat after the dispatch returned while `run_external_cli`
+> called `resolve_saved_output`/`finalize_delivered_output` with that same `output_mode`; it moved
+> above the dispatch, so a `file-only` external agent with no `output_path` fast-fails instead of
+> spawning first. (c) A JSONL protocol violation only recorded `parser_error` and kept draining,
+> where upstream's `failParser` calls `terminateExternalProcessTree` at the violation
+> (`:267-272`); the stdout arm now tears the tree down, setting neither `timed_out` nor `stopped`
+> so the precedence at `:400-405` still reports the parser error. (d) A preflight failure returned
+> `external_process: None`, where upstream's pre-spawn `catch` still emits a receipt with both log
+> paths (`:212-213`); new `run::external_log_paths`/`run::pre_spawn_receipt` give BOTH pre-spawn
+> arms (prompt-file preparation and the probe) the receipt the runner's own arms already had.
+> (e) `ExternalCliRunner::capabilities` became a `BTreeSet` in stage 2 and the struct derives serde,
+> so the hop-2 `runner-config.json` silently carried `["steer"]` while `runner_to_json_string` went
+> on emitting `{"steer":false}`; `contract::capability_narrowing_serde` puts the field back on
+> upstream's wire (`shared/types.ts:1695`) and applies the frontmatter parser's two refusals on the
+> way in. `Capability`'s hand-written string serde, whose only user this was, is gone. (f) Dead
+> surface: `contract::is_code_owned_adapter_id` (both production callers had moved to
+> `AdapterId::try_from`) and `ExternalCliLaunchContext::{cwd, scratch_dir, step_index}` (populated by
+> `run_sync`, read by no shipped resolver, and re-derived from `RunOptions` inside
+> `run_external_cli`) are deleted — the deferred codex/cursor resolvers upstream passes them to will
+> reintroduce them with their adapter. (g) `validate_code_owned_profile_runner` swept
+> `AdapterId::ALL` (wire-id order) where upstream's `RESERVED_READ_ONLY_ADAPTERS` is claude-code,
+> codex-exec, cursor-agent (`external-cli-contract.ts:42-46`); since the loop returns on the first
+> match, an agent whose selection names contain two reserved names was told about a different
+> adapter than upstream would name. New `AdapterId::RESERVED_READ_ONLY` declares upstream's order.
+>
+> **One review finding NOT acted on, with evidence.** The review's reading that upstream's
+> `failParser` invalidation ("parser") and the close-path `classifyInvalidation(error)` are two
+> different reasons is correct upstream but has no consequence here:
+> `preflight::invalidate_external_cli_preflight` takes its reason as `_reason` and evicts by
+> `(command, spec key)` regardless (`exec/external_cli/preflight.rs:435-455`), so cyrup's single
+> post-run invalidation is observationally identical to upstream's two.
+>
+> **Checks at this commit:** `cargo fmt --all -- --check` clean; `cargo clippy -p
+> cyrup-ext-subagents --all-targets -- -D warnings` and `-p cyrup` clean;
+> `cargo nextest run -p cyrup-ext-subagents` **2803/2803** (2794 + the 9 tests above) and `-p cyrup`
+> 236/236; `RUSTDOCFLAGS='-D warnings' cargo doc --no-deps` clean on both. NOT run, per the batch's
+> disk rule (no crate under `crates/cyrup-it` was touched and the shared disk was at 91%):
+> `cargo nextest run -p cyrup-it --features it`.
 
 **Kind** not-ported · **Severity** high · **Effort** L · **Confidence** confirmed
 **Subsystem** external runners / agent definition schema
@@ -2373,6 +2449,22 @@ from area 09's `SUBA-006`/`SUBA-014`, which are about the *existing* `tools:` al
 > `SUBA-087` (`subagent({action:"stop", id, childId})` against a `tasks[]` fan-out); everything else
 > in that row landed.
 
+> **REVIEW FIX 2026-09-05, commit `95a55ea1`.** Three defects the batch-3 review found in `07f2df0d`,
+> none of them observable at HEAD but each one a live hazard. (1) `flat_range` returns `base..base`
+> for a zero-width `ParallelGroup`, and `record_step_outcome`'s non-group arm (`per_member` needs
+> `slots.len() > 1`) then wrote that step's outcome to `status.steps[slots.start]` — the NEXT step's
+> entry. No constructor produces a zero-task group, which is why the arm is now guarded and pinned
+> by `a_zero_width_group_settles_nothing_and_leaves_the_next_step_pending` rather than left to that
+> belief. (2) `ExecSingleStepExecutor::run_single` called `registry.clear_active(index)` after the
+> `exec::run_sync` await, so a member whose future was DROPPED rather than completed — every
+> sibling of a fail-fast member inside `spawn::parallel::run_bounded` — left a dead token
+> registered under a live flat index for the rest of the run. It is now an `ActiveStopGuard` drop
+> guard, which runs on both paths; `a_dropped_dispatch_still_deregisters_its_child_stop_handle`
+> pins it. (3) `step_display_agent`'s doc still pointed at `pending_step_status_for`, the collapsed
+> builder this item deleted; it now states its own (top-level, group-labelled) convention and
+> contrasts it with `flat_index::pending_step_statuses_for`'s per-member one. The three upstream
+> anchors that had drifted are corrected in the **upstream** paragraph below.
+
 **Kind** port limitation (status model) · **Severity** medium · **Effort** M · **Confidence** confirmed
 (both sides read for `SUBA-087` at v0.57.0 and v0.64.0; cyrup re-read at HEAD; re-verified at
 v0.64.0 for this closure)
@@ -2391,8 +2483,10 @@ concurrently-running member read the same value from.
 **upstream** — `src/runs/background/subagent-runner.ts` @v0.64.0: every member of a parallel group
 is its own flat step. `:2612-2652` is the declaration-time flatten (`flatStepCount`, one
 `initialStatusSteps.push` per `step.parallel` task, `agent: task.agent`); `:1294` `flatIndex` on the
-step context, spread per member at each dispatch site (`:4245` parallel, `:4640` dynamic, `:5017`
-sequential); the flat index is the `stepIndex`/`childIndex` of every event and file a step produces
+step context, spread per member at each dispatch site (`:4254` parallel, `:4653` dynamic, `:5015-5020`
+sequential — the `flatIndex: fi` lines themselves; `:4245`/`:4640`/`:5017`, cited when this row
+was written, are inside the right blocks but name `statusPayload.lastUpdate`, the close of the
+`step.started` `appendJsonl` and `outputs:` respectively); the flat index is the `stepIndex`/`childIndex` of every event and file a step produces
 (`:1472-1508`, `:1709`, `:1746`, `:1762`, `:1829`), the `output-${fi}.log` and steer paths
 (`:4243-4257`), and the key of `registerStepStop` (`:4268`, `:3048-3055`) and the
 `childStopRequests.has(fi)` gate (`:4221`). `markChildStopRequested` (`:2979-2991`) and
