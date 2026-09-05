@@ -7,7 +7,8 @@ difference and its reason, and if the mechanism difference costs behaviour, it s
 
 **Five upstreams are ported**: the four TypeScript ones — `pi`, `pi-subagents`,
 `pi-permission-system`, `pi-intercom` — plus **`code_puppy_core_plugins`, which is Python**, ported
-as `crates/cyrup-flux`. A sixth, `pi-mcp-adapter`, is TypeScript and **not** ported (area 13, below).
+as `crates/cyrup-flux`. Two more are TypeScript and **not** ported: `pi-mcp-adapter` (area 13,
+below) and `pi-acp` (area 15, below).
 The hard rule `git -C <repo> show <tag>:<path>` applies to all of them; only the language differs.
 
 **Where the work is:**
@@ -56,6 +57,7 @@ covers.
 | [`11-cyrup-intercom.md`](11-cyrup-intercom.md) | supervisor↔subagent broker |
 | [`12-upstream-drift-pi-core.md`](12-upstream-drift-pi-core.md) | pi core drift since the ported baseline |
 | [`14-cyrup-flux.md`](14-cyrup-flux.md) | the Flux pipeline — the fifth ported upstream, and the first that is neither pi nor TypeScript |
+| [`15-cyrup-acp.md`](15-cyrup-acp.md) | **the `cyrup-acp` port plan** — the Agent Client Protocol adapter, following `svkozak/pi-acp`. Like area 13 it specifies code that does not exist yet, so it is **counted separately from the twelve** for the same structural reason; its own tables are the authority for its unit inventory |
 
 ## Reading the area tables
 
@@ -124,6 +126,25 @@ written into — so the tool never reaches the running agent, and `take_tools_di
 the signal rather than deferring it. Dormant only because `register_late_tool` has zero callers
 anywhere in the workspace. Filed as `MCP-037a`.
 
+A **seventh upstream**, `svkozak/pi-acp` v0.0.33 (4 238 lines of TypeScript across 17 `src/` files),
+which has also never been ported. `cyrup-acp` is the Agent Client Protocol adapter that lets an
+editor — Zed is the reference client — drive cyrup over JSON-RPC on stdio. **Area 15 is scoped and
+counted separately from the twelve for the same structural reason as area 13**: it specifies code
+that does not exist yet, so its units cannot be added to a backward-looking defect count. The
+exclusion runs both ways, and [`15-cyrup-acp.md`](15-cyrup-acp.md)'s own tables are the authority
+for its unit inventory and status.
+
+**Area 15's defining decision is an inversion of its upstream, and it is worth knowing before
+reading any unit.** pi-acp is an out-of-process adapter by necessity — a separate npm package that
+spawns `pi --mode rpc` and rebuilds the agent's state from untyped NDJSON. `cyrup-acp` is a
+workspace crate and binds to `AgentSession` in-process, so the entire subprocess surface —
+`PiRpcProcess`, its ENOENT/EACCES diagnostics, the ANSI prelude scraping, and the defensive
+key-probing in `translate/bash.ts` and `translate/pi-tools.ts` — has **no counterpart to port**, and
+`AgentSessionEvent` supplies typed variants (`QueueUpdate`, `BashExecutionUpdate`,
+`SessionInfoChanged`, `EntryAppended`) that upstream had to infer. Much of the area is therefore
+recorded as *already present* or *cut* rather than as work; that record is the point, not an
+omission.
+
 ## Item format
 
 Every item is a `##` section with a stable id (`AREA-NNN`):
@@ -173,6 +194,7 @@ a deletion — `SEAM-035`…`SEAM-046` never existed, and area 08 records the ch
 | `pi-permission-system/` | `9affcc9` — **re-checked this pass, unchanged from the prior record** | **v0.7.1** | **v0.8.0** — **re-checked this pass, unchanged from the prior record** | 28 files, +4 023 / −1 851 (re-measured identical to the prior record) |
 | `pi-intercom/` | `199279a` | **v0.9.2** — *not v0.7.0; every prior doc had this wrong* | **v0.13.0** | true window `v0.9.2..v0.13.0` = 26 files, +4 701 / −976 |
 | `code_puppy_core_plugins/` | `8c6f852` | **v0.0.6** — *not recorded anywhere in `crates/cyrup-flux`; see `FLUX-007`* | **v0.0.40** | 139 files, +11 071 / −3 822 across the whole repo — but the ported surface is unchanged: `git diff --stat v0.0.6..v0.0.40 -- code_puppy_core_plugins/flux_bootstrap/ tests/test_flux_bootstrap.py` is empty, byte-identical across all 34 intervening tags. Ported surface is `flux_bootstrap/` — 18 bundled commands, 4 `_docs` files, 3 renderer scripts. cyrup ships 15 templates + 3 native renderers = the same 18 |
+| `pi-acp/` | `d1cffc0` = `v0.0.33-2-gd1cffc0` — **first recorded 2026-09-05**; the two commits past the tag are README-only | **not ported** — area 15 is the plan | **v0.0.33** | 17 `.ts` under `src/` = 4 238 lines, plus 3 265 lines of `test/` across 25 files; MIT © Sergii Kozak. The `v0.0.33..HEAD` window touches no `src/` path |
 | `pi-mcp-adapter/` | `6ba7d36` = `v2.32.1-3-g6ba7d36` — **clone re-pulled 2026-09-04; area 13 NOT re-audited against it** (its files were not opened this pass; the prior "MCP team owns area 13" note was wrong — area 13 is in scope and is scheduled from this directory like every other area). *Superseded: `14c0e6c` = `v2.25.0-4-g14c0e6c`.* | **not ported** — area 13 is the plan | **v2.32.1** *(was v2.25.0; the `v2.25.0..v2.32.1` window is unmeasured here)* | 203 paths / 164 `.ts` at the tag, ~24 200 lines; drift to HEAD is 17 files, +543 / −69 |
 
 **Read upstream with `git -C <repo> show <tag>:<path>`, never from a working tree.** Clone-HEAD line
