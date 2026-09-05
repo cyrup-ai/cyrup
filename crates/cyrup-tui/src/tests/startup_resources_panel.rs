@@ -21,14 +21,17 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::indexing_slicing,
-    clippy::panic
+    clippy::panic,
+    // TUI-N02's arm-ordering guard slices the run-loop source, exactly as
+    // `run_loop_swap_arm_reachable.rs` does.
+    clippy::string_slice
 )]
 
 use std::path::PathBuf;
 
 use crate::{
     App, DiagnosticSeverity, StartupDiagnostic, StartupReport, UiTheme, extension_diagnostics,
-    resource_diagnostics,
+    resource_diagnostics, shortcut_diagnostics,
 };
 use cyrup_resources::{ResourceDiagnostic, ResourceKind};
 use cyrup_session_svc::ExtensionLoadDiagnostic;
@@ -391,4 +394,265 @@ fn startup_panel_rows_wrap_inside_the_frame() {
             line.width()
         );
     }
+}
+
+/// EXT-039 — the extension-shortcut conflict warnings reach the SAME `[Extension issues]` block the
+/// load failures do, appended after them.
+///
+/// Upstream builds one `extensionDiagnostics` vector: load errors first, then the command
+/// diagnostics, then `extensionRunner.getShortcutDiagnostics()`, and renders the lot under one
+/// header (`modes/interactive/interactive-mode.ts:1872-1892` @v0.84.4). A shortcut warning is
+/// `{type: "warning", …}` (`extensions/runner.ts:549-553`), so it must paint as a WARNING beside an
+/// error-painted load failure.
+///
+/// RED before this pass: `shortcut_diagnostics` had no projector and no caller — the registry
+/// recorded the warnings and nothing ever read them, which is the "emit no conflict diagnostics"
+/// half of the item.
+#[test]
+fn shortcut_conflict_warnings_join_the_extension_issues_block() {
+    let load_failure = extension_diagnostics(
+        &[ExtensionLoadDiagnostic {
+            path: PathBuf::from("/x/broken.wasm"),
+            error: "instantiate failed".into(),
+            fatal: true,
+        }],
+        None,
+    );
+    let mut extension = load_failure;
+    extension.extend(shortcut_diagnostics(&[cyrup_ext::ExtensionConflict {
+        path: "ext-a".into(),
+        message: "Extension shortcut 'ctrl+c' from ext-a conflicts with built-in shortcut. \
+                  Skipping."
+            .into(),
+    }]));
+
+    let report = StartupReport {
+        quiet_startup: true,
+        extension_diagnostics: extension,
+        ..Default::default()
+    };
+    let (app, out) = commit(&report);
+
+    assert_eq!(
+        out.matches("[Extension issues]").count(),
+        1,
+        "one block, not two:\n{out}"
+    );
+    assert!(out.contains("instantiate failed"), "{out}");
+    assert!(
+        out.contains("conflicts with built-in shortcut. Skipping."),
+        "the refusal warning never reached the panel:\n{out}"
+    );
+    assert!(
+        out.find("instantiate failed") < out.find("conflicts with built-in"),
+        "pi appends the shortcut diagnostics after the load errors:\n{out}"
+    );
+    assert!(
+        styled(
+            &app,
+            "conflicts with built-in",
+            UiTheme::dark().warning_style()
+        ),
+        "a shortcut conflict is a WARNING, not an error:\n{out}"
+    );
+}
+
+// ================================================================================ TUI-N02 =======
+//
+// The panel had exactly ONE production call site — the boot path in `crates/cyrup/src/interactive.rs`
+// — and its builder was a private function in that binary. pi emits it from TWO places, both with
+// the identical `{force: false, showDiagnosticsWhenQuiet: true}` options object:
+//
+// ```ts
+// // pi v0.84.4 coding-agent/src/modes/interactive/interactive-mode.ts:1981-1982
+// const extensionRunner = this.session.extensionRunner;
+// this.setupExtensionShortcuts(extensionRunner);
+// this.showLoadedResources({ force: false, showDiagnosticsWhenQuiet: true });
+//
+// // …:5990-5994, inside handleReloadCommand
+// const runner = this.session.extensionRunner;
+// this.setupExtensionShortcuts(runner);
+// this.showLoadedResources({
+//     force: false,
+//     showDiagnosticsWhenQuiet: true,
+// });
+// ```
+//
+// The first sits in `bindCurrentSessionExtensions`, which `rebindCurrentSession` calls on boot AND
+// on every session replacement (the runtime's `setRebindSession` hook, `:576-578`). So a `/reload`
+// that broke an extension, shadowed a skill or introduced a prompt conflict re-collected all of
+// that server-side and cyrup discarded it, printing only `Reloaded keybindings, extensions, …`.
+
+/// A native built-in whose `init()` always fails, so `SessionBuilder::build` records a contained
+/// extension load failure in `startup_diagnostics.extensions` — the channel
+/// `StartupReport::from_session` reads for `[Extension issues]` (the same trigger
+/// `cyrup-session-svc`'s `build_containment_and_flag_diagnostics.rs` uses).
+struct FailingExt;
+
+#[async_trait::async_trait]
+impl cyrup_ext::NativeExtension for FailingExt {
+    fn id(&self) -> cyrup_core::ExtensionId {
+        cyrup_core::ExtensionId::from("broken-ext")
+    }
+    async fn init(&self, _api: &mut cyrup_ext::InitApi) -> Result<(), cyrup_ext::ExtError> {
+        Err(cyrup_ext::ExtError::Panicked(
+            "boom: the reload broke this extension".to_string(),
+        ))
+    }
+    async fn on_event(
+        &self,
+        _ev: &cyrup_ext::HostEvent,
+        _ctx: &cyrup_ext::HostCtx,
+    ) -> cyrup_ext::HookOutcome {
+        cyrup_ext::HookOutcome::Noop
+    }
+}
+
+/// A session whose effective settings carry `quietStartup: <quiet>` and whose build recorded one
+/// contained extension load failure.
+async fn broken_extension_session(
+    dir: &std::path::Path,
+    quiet: bool,
+) -> std::sync::Arc<cyrup_session_svc::AgentSession> {
+    let cwd = dir.join("project");
+    let agent_dir = dir.join("agent");
+    let home = dir.join("home");
+    for d in [&cwd, &agent_dir, &home] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    // One `[Context]` entry, so the listing half of the panel has something to print.
+    std::fs::write(cwd.join("AGENTS.md"), "# house rules\n").unwrap();
+    let faux: std::sync::Arc<dyn cyrup_provider::Provider> =
+        std::sync::Arc::new(cyrup_provider::faux::FauxProvider::new());
+    let mut cfg = cyrup_session_svc::SessionConfig::new(cwd, agent_dir);
+    cfg.home = home;
+    cfg.trust_override = Some(true);
+    cfg.no_extensions = true;
+    std::sync::Arc::new(
+        cyrup_session_svc::SessionBuilder::new(faux, cfg)
+            // pi's `settingsManager.applyOverrides` tier (CFG-059) — the merged view the panel
+            // reads, without a settings file for the fixture to keep in sync.
+            .cli_settings(
+                cyrup_config::settings::Settings::parse(&format!("{{\"quietStartup\": {quiet}}}"))
+                    .unwrap(),
+            )
+            .with_native_extension(
+                std::sync::Arc::new(FailingExt) as std::sync::Arc<dyn cyrup_ext::NativeExtension>
+            )
+            .build()
+            .await
+            .unwrap(),
+    )
+}
+
+/// The item's own scenario: the panel is derivable from a bare session, so the run loop can re-emit
+/// it, and a `quietStartup` user still gets the diagnostics — pi's `showDiagnosticsWhenQuiet: true`
+/// (`:1986`, `:5993`) against `showListing = force || verbose || !quietStartup` (`:1702`).
+///
+/// RED before this pass: there was no session-derived seam at all. `build_startup_report` was
+/// private to `crates/cyrup/src/interactive.rs`, so nothing in this crate — where the run loop
+/// lives — could build the report, which is exactly why `/reload` had nothing to push.
+#[tokio::test]
+async fn the_panel_is_derivable_from_a_session_and_survives_quiet_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = broken_extension_session(dir.path(), true).await;
+    assert_eq!(
+        session.services().startup_diagnostics.extensions.len(),
+        1,
+        "fixture must actually have recorded a load failure"
+    );
+
+    let mut app = new_app();
+    app.push_session_loaded_resources(&session);
+    app.draw().unwrap();
+    let out = app.scrollback_text();
+
+    assert!(
+        out.contains("[Extension issues]"),
+        "the diagnostics block must survive quietStartup:\n{out}"
+    );
+    assert!(
+        out.contains("boom: the reload broke this extension"),
+        "the recorded failure never reached the panel:\n{out}"
+    );
+    // `showListing` is false, so the inventory is suppressed — the half `quietStartup` DOES hide.
+    assert!(
+        !out.contains("[Skills]") && !out.contains("[Context]"),
+        "quietStartup must still hide the inventory:\n{out}"
+    );
+}
+
+/// `--verbose` is pi's `options.verbose`, read inside `showListing` (`:1702`) — so it has to be
+/// held on the App, not passed at the single boot call site, or the re-emit could never honour it.
+#[tokio::test]
+async fn set_verbose_startup_overrides_quiet_startup_at_the_session_seam() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = broken_extension_session(dir.path(), true).await;
+
+    let mut app = new_app();
+    app.set_verbose_startup(true);
+    app.push_session_loaded_resources(&session);
+    app.draw().unwrap();
+    let out = app.scrollback_text();
+
+    assert!(
+        out.contains("[Context]"),
+        "--verbose must force the listing through the session seam too:\n{out}"
+    );
+}
+
+/// The other half of the item: the panel must actually be pushed from the run loop's session-swap
+/// arm — the arm every `/reload`, `/new`, `/resume`, `/fork` and `/import` funnels through — and it
+/// must be pushed in pi's ORDER.
+///
+/// Read from the source for the same reason `run_loop_swap_arm_reachable.rs` does: nothing in this
+/// crate constructs a `RunCtx` (it owns a runtime, an event stream and nine channels), so the arm's
+/// internal ordering has no behavioural coverage. Two orderings are load-bearing and neither is
+/// observable from the seam test above:
+///
+/// * `install_extension_shortcuts` BEFORE the push — `resolve_shortcut_specs` is what records the
+///   EXT-039 reserved-key refusals that `[Extension issues]` renders, and upstream orders the pair
+///   the same way at both call sites (`:1981-1982`, `:5990-5991`).
+/// * the push BEFORE the replay — pi's `loadedResourcesContainer` is pinned above `chatContainer`
+///   (`:594-596`), and cyrup's committed scrollback is linear.
+#[test]
+fn the_session_swap_arm_pushes_the_panel_after_the_shortcuts_and_before_the_replay() {
+    const ARMS_SRC: &str = include_str!("../app/run_arms.rs");
+    let offset = ARMS_SRC
+        .find("pub(crate) async fn on_session_swapped")
+        .expect("run_arms.rs must still define `on_session_swapped`");
+    let body = &ARMS_SRC[offset..];
+    let end = body
+        .find("pub(crate) fn drain_over_budget_arm")
+        .unwrap_or(body.len());
+    let arm = &body[..end];
+
+    let push = arm
+        .find("self.push_session_loaded_resources(")
+        .unwrap_or_else(|| {
+            panic!(
+                "the `session_swapped` arm never pushes the loaded-resources panel — `/reload` \
+             swallows the diagnostics it just re-collected (pi `showLoadedResources` at \
+             interactive-mode.ts:1982 and :5991 @v0.84.4)"
+            )
+        });
+    let shortcuts = arm
+        .find("self.install_extension_shortcuts(")
+        .unwrap_or_else(|| panic!("the `session_swapped` arm must re-source extension shortcuts"));
+    let replay = arm
+        .find(".replay_items()")
+        .unwrap_or_else(|| panic!("the `session_swapped` arm must still replay the conversation"));
+
+    assert!(
+        shortcuts < push,
+        "`install_extension_shortcuts` must precede the panel push: it is what RECORDS the \
+         EXT-039 reserved-key refusals the `[Extension issues]` block renders \
+         (interactive-mode.ts:1981-1982 @v0.84.4)"
+    );
+    assert!(
+        push < replay,
+        "the panel must be pushed BEFORE the replay: pi's `loadedResourcesContainer` is pinned \
+         above `chatContainer` (interactive-mode.ts:594-596) and cyrup's committed scrollback is \
+         linear, so a push after the replay would land under the conversation"
+    );
 }

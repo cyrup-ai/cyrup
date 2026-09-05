@@ -1500,6 +1500,20 @@ pub struct GuestState {
     /// The `CancelToken` of the currently-executing guest tool, backing the `host-tool.is-cancelled`
     /// poll (Pi `signal` param). Set before `execute-tool`, cleared after (sdk gap #1).
     tool_cancel: Mutex<Option<CancelToken>>,
+    /// `host-bash.emit-bash-output` chunks emitted during a guest bash backend's
+    /// `bash-operations-exec` — pi's `onData: (data: Buffer) => void`
+    /// (`core/tools/bash.ts:75` @v0.84.4). RAW bytes, combined stdout+stderr, keyed by the
+    /// `call-id` the host passed in.
+    ///
+    /// Instance-scoped for the same reason [`GuestState::tool_updates`] is, and drained by the same
+    /// rule ([`GuestState::take_bash_output_for`], cleared on every non-replaying exit): the
+    /// Component Model cannot carry pi's per-call closure, so the chunk needs a key to be
+    /// attributable at all (EXT-M06).
+    bash_output: Mutex<Vec<(String, Vec<u8>)>>,
+    /// The `call-id` + `CancelToken` of the currently-executing guest bash command, backing the
+    /// `host-bash.is-bash-cancelled` poll — pi's `signal?: AbortSignal`
+    /// (`core/tools/bash.ts:76` @v0.84.4). Set before `bash-operations-exec`, cleared after.
+    bash_cancel: Mutex<Option<(String, CancelToken)>>,
     /// `withSession` callback ids the guest scheduled via a `control.*` op carrying a
     /// `withSessionCallbackId`; the host invokes the `with-session` export for each after the command
     /// body returns (Pi `finishSessionReplacement`, agent-session-runtime.ts:184; sdk gap #3).
@@ -1651,6 +1665,8 @@ impl GuestState {
             stream_handles: Mutex::new(HashSet::new()),
             aborted_signals: Mutex::new(HashSet::new()),
             tool_cancel: Mutex::new(None),
+            bash_output: Mutex::new(Vec::new()),
+            bash_cancel: Mutex::new(None),
             pending_with_session: Mutex::new(Vec::new()),
             deadline_estimate: Mutex::new(None),
             first_wait_started: Mutex::new(None),
@@ -2432,6 +2448,74 @@ impl GuestState {
             .map(|g| g.as_ref().is_some_and(|t| t.is_cancelled()))
             .unwrap_or(false);
         token_cancelled || self.is_signal_aborted(call_id)
+    }
+
+    // --- guest-supplied bash backend (DRIFT-004; pi `BashOperations.exec`'s two closure options) ---
+
+    /// Queue one `host-bash.emit-bash-output` chunk (pi `onData(data)`), keyed by `call-id`.
+    pub fn push_bash_output(&self, call_id: String, chunk: Vec<u8>) {
+        if let Ok(mut g) = self.bash_output.lock() {
+            g.push((call_id, chunk));
+        }
+    }
+
+    /// Drain the output belonging to ONE settled `bash-operations-exec`, keyed by its `call-id`.
+    /// Chunks addressed to any other id are DROPPED, not left queued — the same rule, for the same
+    /// reason, as [`Self::take_tool_updates_for`]: only one guest bash command can be in flight per
+    /// instance (the caller holds the store for its whole duration), so a foreign id is an
+    /// abandoned call's residue and leaving it queued would grow for the life of the instance.
+    pub fn take_bash_output_for(&self, call_id: &str) -> Vec<Vec<u8>> {
+        let Ok(mut g) = self.bash_output.lock() else {
+            return Vec::new();
+        };
+        let mut mine = Vec::new();
+        let mut foreign = 0usize;
+        for (cid, chunk) in std::mem::take(&mut *g) {
+            if cid == call_id {
+                mine.push(chunk);
+            } else {
+                foreign += 1;
+            }
+        }
+        drop(g);
+        if foreign > 0 {
+            tracing::warn!(
+                extension = %self.owner, call_id, foreign,
+                "discarded queued `host-bash.emit-bash-output` chunk(s) addressed to another call-id"
+            );
+        }
+        mine
+    }
+
+    /// Discard every queued bash-output chunk — the teardown half of
+    /// [`Self::take_bash_output_for`], run by the drop guard on the exit paths that never reach a
+    /// replay (a cancelled command, or the exec future being dropped at its await point). Returns
+    /// how many were discarded (diagnostics/tests).
+    pub fn clear_bash_output(&self) -> usize {
+        self.bash_output
+            .lock()
+            .map(|mut g| std::mem::take(&mut *g).len())
+            .unwrap_or(0)
+    }
+
+    /// Bind the currently-executing guest bash command's `call-id` + `CancelToken` for the
+    /// `is-bash-cancelled` poll (pi's `signal`). `None` clears the binding.
+    pub fn set_bash_cancel(&self, binding: Option<(String, CancelToken)>) {
+        if let Ok(mut g) = self.bash_cancel.lock() {
+            *g = binding;
+        }
+    }
+
+    /// The bash `signal` poll (pi `signal.aborted`): true only for the LIVE `call_id`, so a stale
+    /// or forged id can never report another command's cancellation.
+    pub fn bash_is_cancelled(&self, call_id: &str) -> bool {
+        self.bash_cancel
+            .lock()
+            .map(|g| {
+                g.as_ref()
+                    .is_some_and(|(id, t)| id == call_id && t.is_cancelled())
+            })
+            .unwrap_or(false)
     }
 
     // --- withSession re-binding callbacks (Pi finishSessionReplacement; sdk gap #3) ---

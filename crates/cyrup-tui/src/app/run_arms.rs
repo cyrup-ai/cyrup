@@ -230,6 +230,33 @@ impl App<InlineBackend<Stdout>> {
             Arc::clone(&ctx.session.services().resources),
             ctx.theme_switch_tx.clone(),
         );
+        // TUI-004 — ...and, immediately after that re-registration and in upstream's order, the
+        // RENDER theme itself. pi pairs `setRegisteredThemes(...)` with
+        // `await this.themeController.applyFromSettings()` at both call sites — the
+        // `setRebindSession` hook (`interactive-mode.ts:1977` then `:578`, the two halves of one
+        // rebind) and `handleReloadCommand` (`:5985` then `:5987`) — so a `settings.theme` edited on
+        // disk, a custom theme file rewritten under an unchanged name, and a theme an extension
+        // newly registered all take effect on the reload that discovered them. cyrup re-read
+        // `outputPad`, `hideThinking`, `showImages`, `imageWidthCells` and `editorPaddingX` here and
+        // left the theme latched at whatever boot resolved, so the only in-app way to change a theme
+        // FILE was to restart.
+        //
+        // Reads the setting from the SWAPPED-IN session, which is pi's
+        // `settingsManager.getThemeSetting()` (`theme-controller.ts:59`): `/reload` rebuilds the
+        // session, so this view is the freshly re-read one. pi prefers its in-memory
+        // `currentThemeSetting` over the manager; cyrup has no such shadow because every theme
+        // change here — the `/settings → theme` confirm arm and an extension's `setTheme` alike —
+        // persists through `AppCommand::ApplySetting` unconditionally (see `on_theme_switch`), so
+        // the persisted value IS what upstream would be holding in memory.
+        self.reapply_theme_from_settings(
+            ctx.session
+                .services()
+                .settings
+                .effective()
+                .theme_setting()
+                .as_deref(),
+            &ctx.session.services().resources,
+        );
         // ...and the fault listener, whose `ExtensionHost` is likewise brand new on the swapped-in
         // session (Pi re-binds `onError` from `rebindSession`, and `crates/cyrup-modes/src/rpc.rs`'s
         // `rebind_session` does the same).
@@ -306,6 +333,36 @@ impl App<InlineBackend<Stdout>> {
         // Same liveness as the rows above: a swap can move the settings scope, so re-read the
         // cache-miss notice gate for the swapped-in session BEFORE its replay below.
         self.state.show_cache_miss_notices = eff.show_cache_miss_notices();
+        // The swapped-in session owns a fresh extension host; re-source its registered shortcuts
+        // (R-08-017) so a post-swap press still routes. EXT-040: the installed specs carry the
+        // description `/hotkeys` renders; `shortcut_keys()` drops it. EXT-039: they go through the
+        // reserved-key gate, which is why this is `install_extension_shortcuts` and not
+        // `set_extension_shortcuts` — pi re-runs the whole of `setupExtensionShortcuts` on a
+        // session replacement too (`interactive-mode.ts:1981`, `:5990` @v0.84.4).
+        //
+        // TUI-N02 — and it runs HERE, ahead of the panel below, rather than after the replay where
+        // it used to sit: `resolve_shortcut_specs` is what RECORDS the reserved-key refusals, and
+        // `StartupReport::from_session` folds them into `[Extension issues]`. Upstream orders the
+        // pair the same way at both of its call sites (`:1981-1982`, `:5990-5991`), so a shortcut
+        // an extension lost on this reload is reported by the same reload that lost it.
+        let ext_host = ctx.session.services().ext_host.clone();
+        self.install_extension_shortcuts(&ext_host);
+        // TUI-N02 — the loaded-resources / diagnostics panel. pi emits it on EVERY rebind
+        // (`bindCurrentSessionExtensions`, `interactive-mode.ts:1982` @v0.84.4, reached from
+        // `rebindCurrentSession` — the runtime's `setRebindSession` hook, `:576-578`) and again
+        // explicitly from `handleReloadCommand` (`:5991-5994`), both with the identical
+        // `{force: false, showDiagnosticsWhenQuiet: true}` the boot path uses. cyrup pushed it only
+        // at boot, so `/reload` — the command a user runs straight after editing an extension,
+        // skill or prompt — printed `Reloaded …` and swallowed the diagnostics the rebuilt session
+        // had just re-collected.
+        //
+        // BEFORE the replay: pi's panel lives in `loadedResourcesContainer`, pinned above
+        // `chatContainer` (`:594-596`), and cyrup's committed scrollback is linear, so the push has
+        // to precede the conversation to land in the same place on screen.
+        //
+        // Not gated by swap reason — pi's is not: the hook fires for `/new`, `/resume`, `/fork`,
+        // `/import` and `/reload` alike.
+        self.push_session_loaded_resources(&ctx.session);
         // TUI-003: seed the view from the swapped-in session's conversation (Pi re-runs
         // `renderInitialMessages()` after a tree/fork navigation, interactive-mode.ts:1737-1742).
         // Without this a `/resume`, `/fork` or `/import` leaves the user staring at an empty
@@ -333,12 +390,6 @@ impl App<InlineBackend<Stdout>> {
         // in a DIFFERENT project swaps the cwd and the trust decision with it, so the banner's
         // answer changes on the swap.
         self.render_project_trust_warning_if_needed(&ctx.session);
-        // The swapped-in session owns a fresh extension host; re-source its registered shortcuts
-        // (R-08-017) so a post-swap press still routes. EXT-040: `shortcut_specs()` carries the
-        // description `/hotkeys` renders; `shortcut_keys()` drops it.
-        let shortcuts = ctx.session.services().ext_host.shortcut_specs();
-        self.state.set_extension_shortcuts(shortcuts);
-
         // pi's re-entrancy guard, `interactive-mode.ts:1977-1979`
         // (`if (this.session !== session) return;`): a newer session landed while we awaited above,
         // so abandon this rebind without painting it — the `session_swapped` arm will fire again for

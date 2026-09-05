@@ -30,7 +30,7 @@
 //!   `defaultToolTimeoutMs`). They are validated EXACTLY as upstream validates them (so a
 //!   malformed value produces upstream's message) and are then REFUSED by name
 //!   ([`unrepresentable_field_error`]) rather than accepted and dropped — the same
-//!   refuse-don't-downgrade stance `crate::runner::AgentRunnerConfig::refusal_reason` takes.
+//!   refuse-don't-downgrade stance `crate::runner::dispatch::resolve_runner_dispatch` takes.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -501,19 +501,20 @@ fn validate_runner(value: Option<&Value>) -> Result<Option<AgentRunnerConfig>, S
             let adapter = match runner.get("adapter") {
                 None => None,
                 Some(adapter) => {
-                    let id = adapter.as_str().unwrap_or_default();
-                    if !contract::is_code_owned_adapter_id(id) {
+                    let Ok(id) = crate::runner::contract::AdapterId::try_from(
+                        adapter.as_str().unwrap_or_default(),
+                    ) else {
                         return Err(management_error(format!(
                             "Runtime agent definition external-cli runner adapter must be {}.",
                             contract::CODE_OWNED_ADAPTER_LABEL
                         )));
-                    }
+                    };
                     if !args.is_empty() {
                         return Err(management_error(format!(
                             "Runtime agent definition {id} adapter owns its argv; runner args are not supported."
                         )));
                     }
-                    Some(id.to_string())
+                    Some(id)
                 }
             };
             let prompt_delivery_stdin = match runner.get("promptDelivery") {
@@ -1527,7 +1528,7 @@ mod tests {
             "Runtime agent definition external-job runner has unsupported fields: x."
         );
         // A well-formed external-cli runner registers (the refusal to LAUNCH it is
-        // `AgentRunnerConfig::refusal_reason`'s, at spawn time, not registration's).
+        // `runner::dispatch::resolve_runner_dispatch`'s, at spawn time, not registration's).
         reg.register_value(
             "cli",
             &with_runner(
@@ -1616,7 +1617,7 @@ mod tests {
         let reg = registry();
         let mut writer = RuntimeAgentDefinition::new("Unsafe", "Write.");
         writer.runner = Some(AgentRunnerConfig::ExternalCli(ExternalCliRunner {
-            adapter: Some("claude-code-writer".into()),
+            adapter: Some(crate::runner::contract::AdapterId::ClaudeCodeWriter),
             command: "claude".into(),
             args: Vec::new(),
             prompt_delivery_stdin: false,

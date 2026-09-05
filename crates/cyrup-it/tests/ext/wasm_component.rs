@@ -210,7 +210,7 @@ async fn live_guest_component_blocks_notifies_and_runs_a_tool() {
 
     // 6) a guest message renderer renders a call across the boundary (R-08-020).
     let widget = ext
-        .render_call("demo", &json!({ "x": 1 }))
+        .render_call("demo", &json!({ "x": 1 }), &Default::default())
         .await
         .expect("render call")
         .expect("renderer produced a widget");

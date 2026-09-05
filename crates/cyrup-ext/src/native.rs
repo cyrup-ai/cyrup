@@ -688,6 +688,50 @@ pub trait NativeExtension: Send + Sync {
         None
     }
 
+    /// [`Self::render_call`] with the display inputs upstream passes every renderer (EXT-006;
+    /// `ToolDefinition.renderCall(args, theme, context)`, `extensions/types.ts:491` @v0.84.4, and
+    /// `MessageRenderer = (message, options, theme)`, `:1213-1217`).
+    ///
+    /// Defaults to [`Self::render_call`], which is the whole point: a renderer whose output does
+    /// not vary with the expand toggle or the theme implements the two-argument form and is done.
+    /// Override THIS one to branch on `opts` — the host re-invokes it whenever the options move
+    /// (`cyrup_tui::App::refresh_extension_renders`), so the branch is live, not frozen.
+    ///
+    /// The richer alternative is [`Self::render_live`], which is re-rendered per FRAME with the
+    /// terminal width as well; this hook exists for a renderer that wants the options without
+    /// owning a component.
+    fn render_call_under(
+        &self,
+        key: &str,
+        call: &serde_json::Value,
+        _opts: &crate::RenderOptions,
+    ) -> Option<serde_json::Value> {
+        self.render_call(key, call)
+    }
+
+    /// The result-side companion of [`Self::render_call_under`] (Pi `renderResult(result, options,
+    /// theme, context)`, `extensions/types.ts:493-498` @v0.84.4 — the ONE upstream renderer whose
+    /// options bag also carries `isPartial`).
+    fn render_result_under(
+        &self,
+        key: &str,
+        result: &serde_json::Value,
+        _opts: &crate::RenderOptions,
+    ) -> Option<serde_json::Value> {
+        self.render_result(key, result)
+    }
+
+    /// The entry-side companion of [`Self::render_call_under`] (Pi `EntryRenderer = (entry,
+    /// options: EntryRenderOptions, theme)`, `extensions/types.ts:1219-1223` @v0.84.4).
+    fn render_entry_under(
+        &self,
+        custom_type: &str,
+        entry: &serde_json::Value,
+        _opts: &crate::RenderOptions,
+    ) -> Option<serde_json::Value> {
+        self.render_entry(custom_type, entry)
+    }
+
     /// Transform transcript markdown before the host renders it (EXT-019; pi
     /// `MarkdownTransformer = (markdown, context) => string`, `extensions/types.ts:1153` @v0.84.1
     /// — a POST-BASELINE addition, absent at v0.83.0). Called only when [`Self::init`] declared one
@@ -752,6 +796,44 @@ pub trait NativeExtension: Send + Sync {
         _key: &str,
         _payload: &serde_json::Value,
     ) -> Option<std::sync::Arc<dyn RenderedComponent>> {
+        None
+    }
+
+    /// Supply a per-call command-execution backend for a `user_bash` command this extension just
+    /// serviced — Pi `UserBashEventResult.operations`
+    /// (`packages/coding-agent/src/core/extensions/types.ts:1136-1142` @v0.84.4, the field at `:1139`:
+    /// *"Custom operations to use for execution"*), consumed by the RPC host at
+    /// `packages/coding-agent/src/modes/rpc/rpc-mode.ts:581` (`operations: eventResult?.operations`)
+    /// and by the interactive `!`/`!!` handler at
+    /// `packages/coding-agent/src/modes/interactive/interactive-mode.ts:6524`.
+    ///
+    /// Consulted ONLY on the extension whose [`HookOutcome::Handled`] won the `user_bash`
+    /// reduction, and only when that value carried no `result` — upstream reads exactly one
+    /// `UserBashEventResult`, the first truthy handler's (`extensions/runner.ts:1005-1032`), and its
+    /// `result` short-circuits execution before `operations` is ever looked at
+    /// (`rpc-mode.ts:571-576`; `interactive-mode.ts:6471-6499`).
+    ///
+    /// Native-only by construction, for the same reason as [`Self::render_live`]: a
+    /// [`cyrup_tools::ops::BashOperations`] is an object with an `exec` METHOD, and ADR-0002
+    /// (`docs/adr/ADR-0002-extension-io-is-serde.md`) makes extension I/O values rather than
+    /// references, so a WASM guest cannot hand one back across the WIT boundary. A guest supplies
+    /// its backend the other way instead — the `register-bash-operations` import + keyed
+    /// `bash-operations-exec` export round-trip (DRIFT-004), which
+    /// [`crate::ExtensionHost::user_bash_operations`] resolves as its second tier. THIS method is
+    /// the native tier of the same question.
+    ///
+    /// `None` — upstream's absent `operations` — falls through to
+    /// `createLocalBashOperations({ shellPath })` (`core/agent-session.ts:2782`'s `??`), i.e. the
+    /// local shell. The arguments repeat the live `UserBashEvent` fields
+    /// (`extensions/types.ts:813-821`) so a stateless extension can decide per command without
+    /// stashing what [`Self::on_event`] saw. Sync, and a PANIC is contained by the host and treated
+    /// as `None`, so a broken extension can never break a user's `!` command.
+    fn user_bash_operations(
+        &self,
+        _command: &str,
+        _exclude_from_context: bool,
+        _cwd: &str,
+    ) -> Option<Arc<dyn cyrup_tools::ops::BashOperations>> {
         None
     }
 

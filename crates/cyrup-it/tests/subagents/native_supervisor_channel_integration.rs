@@ -783,6 +783,7 @@ async fn a_child_that_declared_intercom_gets_both_native_supervisor_tools() {
     let runtime = cyrup_ext_subagents::prompt_runtime::prompt_runtime_extension_from(&env(
         r#"["read","intercom"]"#,
     ))
+    .expect("no tool budget in this env, so the runtime always builds")
     .expect("a metadata-carrying child with no installed intercom gets a runtime");
     let mut api = InitApi::new();
     runtime.init(&mut api).await.expect("init");
@@ -792,6 +793,7 @@ async fn a_child_that_declared_intercom_gets_both_native_supervisor_tools() {
     let plain = cyrup_ext_subagents::prompt_runtime::prompt_runtime_extension_from(&env(
         r#"["read","bash"]"#,
     ))
+    .expect("no tool budget in this env, so the runtime always builds")
     .expect("still gets contact_supervisor");
     let mut plain_api = InitApi::new();
     plain.init(&mut plain_api).await.expect("init");

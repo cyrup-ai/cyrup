@@ -120,6 +120,101 @@ fn mermaid_rendering_mode_defaults_to_streaming_and_accepts_only_pis_three_value
     assert_eq!(eff.code_block_indent(), "\t");
 }
 
+/// CFG-078 — the two v0.84.4 alt-screen keys, both of which DEGRADE rather than reject.
+///
+/// `getFullscreenExitOutput` is `this.settings.fullscreenExitOutput === "resume-hint" ?
+/// "resume-hint" : "transcript"` (settings-manager.ts:1212-1214 @v0.84.4) and
+/// `getFullscreenCopyOnSelect` is `this.settings.fullscreenCopyOnSelect ?? true` (`:1233-1235`).
+/// The unknown-value legs are upstream's own case: `{"fullscreenExitOutput":"nothing"}` reads back
+/// as `"transcript"` and the absent copy-on-select key as `true`
+/// (`test/settings-manager.test.ts:471-476` @v0.84.4).
+///
+/// Red at HEAD before this change: `grep -rn 'fullscreenExitOutput\|fullscreenCopyOnSelect'
+/// crates/cyrup-config/src` returned ZERO — neither getter existed, so the file did not compile.
+#[test]
+fn fullscreen_exit_output_and_copy_on_select_degrade_to_pis_defaults() {
+    let eff = |json: &str| EffectiveSettings::from_settings(Settings::parse(json).unwrap());
+    assert_eq!(
+        eff(r#"{"fullscreenExitOutput":"resume-hint"}"#).fullscreen_exit_output(),
+        FullscreenExitOutput::ResumeHint
+    );
+    assert_eq!(
+        eff(r#"{"fullscreenExitOutput":"transcript"}"#).fullscreen_exit_output(),
+        FullscreenExitOutput::Transcript
+    );
+    // Upstream's own "nothing" case, plus a wrong-typed value and the absent key.
+    assert_eq!(
+        eff(r#"{"fullscreenExitOutput":"nothing"}"#).fullscreen_exit_output(),
+        FullscreenExitOutput::Transcript
+    );
+    assert_eq!(
+        eff(r#"{"fullscreenExitOutput":true}"#).fullscreen_exit_output(),
+        FullscreenExitOutput::Transcript
+    );
+    assert_eq!(
+        eff("{}").fullscreen_exit_output(),
+        FullscreenExitOutput::Transcript
+    );
+    assert_eq!(
+        EffectiveSettings::from_settings(Settings::default()).fullscreen_exit_output(),
+        FullscreenExitOutput::Transcript
+    );
+
+    // `?? true`: only an absent/null key defaults, an explicit `false` is honoured.
+    assert!(!eff(r#"{"fullscreenCopyOnSelect":false}"#).fullscreen_copy_on_select());
+    assert!(eff(r#"{"fullscreenCopyOnSelect":true}"#).fullscreen_copy_on_select());
+    assert!(eff(r#"{"fullscreenCopyOnSelect":null}"#).fullscreen_copy_on_select());
+    assert!(eff("{}").fullscreen_copy_on_select());
+    // A non-boolean is not a boolean; pi would read `"false"` as truthy, and so does this.
+    assert!(eff(r#"{"fullscreenCopyOnSelect":"false"}"#).fullscreen_copy_on_select());
+}
+
+/// CFG-078 — both setters write the GLOBAL scope with the spelling upstream stores
+/// (settings-manager.ts:1216-1220 / `:1237-1241` @v0.84.4), so the keys round-trip between the two
+/// implementations, and neither disturbs the other key or an unrelated one (R-07-004).
+///
+/// Red at HEAD before this change: `set_fullscreen_exit_output` /
+/// `set_fullscreen_copy_on_select` did not exist.
+#[tokio::test]
+async fn fullscreen_exit_output_and_copy_on_select_round_trip_through_the_global_scope() {
+    let store = Arc::new(InMemorySettingsStore::new());
+    store.seed(SettingsScope::Global, r#"{ "theme": "dark" }"#);
+    let mut mgr = SettingsManager::load(store.clone(), false);
+
+    mgr.set_fullscreen_exit_output(FullscreenExitOutput::ResumeHint)
+        .await
+        .unwrap();
+    mgr.set_fullscreen_copy_on_select(false).await.unwrap();
+
+    let s = Settings::parse(&store.read(SettingsScope::Global).unwrap().unwrap()).unwrap();
+    assert_eq!(
+        s.get("fullscreenExitOutput"),
+        Some(&serde_json::json!("resume-hint"))
+    );
+    assert_eq!(
+        s.get("fullscreenCopyOnSelect"),
+        Some(&serde_json::json!(false))
+    );
+    assert_eq!(s.get("theme"), Some(&serde_json::json!("dark")));
+
+    assert_eq!(
+        mgr.effective().fullscreen_exit_output(),
+        FullscreenExitOutput::ResumeHint
+    );
+    assert!(!mgr.effective().fullscreen_copy_on_select());
+
+    // And back, which is the leg that proves the reader is not latching.
+    mgr.set_fullscreen_exit_output(FullscreenExitOutput::Transcript)
+        .await
+        .unwrap();
+    mgr.set_fullscreen_copy_on_select(true).await.unwrap();
+    assert_eq!(
+        mgr.effective().fullscreen_exit_output(),
+        FullscreenExitOutput::Transcript
+    );
+    assert!(mgr.effective().fullscreen_copy_on_select());
+}
+
 #[test]
 fn output_pad_only_explicit_zero_disables() {
     // Pi `getOutputPad`: `outputPad === 0 ? 0 : 1` — only an explicit 0 turns padding off.
@@ -390,6 +485,53 @@ fn enabled_models_distinguishes_unset_from_empty() {
         some.enabled_models(),
         Some(vec!["anthropic/claude-opus-4-8".to_string()])
     );
+}
+
+#[test]
+fn default_tools_round_trips_and_distinguishes_unset_from_empty() {
+    // CFG-079. Pi v0.84.4 `getDefaultTools(): string[] | undefined` (settings-manager.ts:1273-1276)
+    // over the key declared at `:128`. Unset is `undefined` — sdk.ts:262 then falls back to
+    // `defaultActiveToolNames` (read/bash/edit/write) — while an explicit `[]` is a configured
+    // empty selection: no built-ins at all. Collapsing both to an empty Vec loses that.
+    let unset = EffectiveSettings::from_settings(Settings::default());
+    assert_eq!(unset.default_tools(), None);
+
+    let empty =
+        EffectiveSettings::from_settings(Settings::parse(r#"{ "defaultTools": [] }"#).unwrap());
+    assert_eq!(empty.default_tools(), Some(vec![]));
+
+    let some = EffectiveSettings::from_settings(
+        Settings::parse(r#"{ "defaultTools": ["read", "powershell", "edit", "write"] }"#).unwrap(),
+    );
+    assert_eq!(
+        some.default_tools(),
+        Some(vec![
+            "read".to_string(),
+            "powershell".to_string(),
+            "edit".to_string(),
+            "write".to_string(),
+        ])
+    );
+
+    // No validation, exactly like upstream's getter: an unknown name is carried through verbatim
+    // and simply matches no tool at the consumer.
+    let unknown = EffectiveSettings::from_settings(
+        Settings::parse(r#"{ "defaultTools": ["no-such-tool"] }"#).unwrap(),
+    );
+    assert_eq!(
+        unknown.default_tools(),
+        Some(vec!["no-such-tool".to_string()])
+    );
+
+    // A project layer REPLACES the global array (docs/settings.md:244, "A project `defaultTools`
+    // array replaces the global array") — the deep merge's array rule, not a union.
+    let global = serde_json::json!({ "defaultTools": ["read", "bash"] });
+    let project = serde_json::json!({ "defaultTools": ["grep"] });
+    let merged = crate::settings::merge::deep_merge(&global, &project);
+    let layered = EffectiveSettings::from_settings(
+        Settings::parse(&merged.to_string()).expect("merged layers parse"),
+    );
+    assert_eq!(layered.default_tools(), Some(vec!["grep".to_string()]));
 }
 
 #[test]

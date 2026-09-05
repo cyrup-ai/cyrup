@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::transcript::RenderSurface;
+
 /// Truncate a one-line summary to a sane length (avoid overrunning the marker line).
 /// Detect a `Custom`-role `cyrup_agent::AgentMessage` from its serde projection and return its
 /// `(kind, body)` for [`TranscriptView::push_custom_message`](crate::transcript::TranscriptView::push_custom_message).
@@ -57,11 +59,12 @@ pub(crate) const EXTENSION_RENDER_TIMEOUT: std::time::Duration = std::time::Dura
 pub async fn extension_render(
     ext_host: &Arc<cyrup_ext::ExtensionHost>,
     ev: &AgentSessionEvent,
+    opts: &cyrup_ext::RenderOptions,
 ) -> crate::transcript::Rendered {
     use crate::transcript::Rendered;
     let which = match ev {
         AgentSessionEvent::MessageEnd { .. } => {
-            let Some((kind, _)) = custom_message_from_event(ev) else {
+            let Some((kind, _)) = displayable_custom_message_from_event(ev) else {
                 return Rendered::None;
             };
             if !ext_host.has_message_renderer(&kind) {
@@ -73,16 +76,16 @@ pub async fn extension_render(
             else {
                 return Rendered::None;
             };
-            Which::Message(kind, message)
+            (RenderSurface::Message, kind, message)
         }
         // The tool half is shared with the REPLAY walk (EXT-041), which has a persisted
         // `toolCall`/`toolResult` in hand rather than an event — same lookup, same collapse.
         AgentSessionEvent::ToolExecutionStart {
             tool_name, args, ..
-        } => return extension_render_tool_call(ext_host, tool_name, args).await,
+        } => return extension_render_tool_call(ext_host, tool_name, args, opts).await,
         AgentSessionEvent::ToolExecutionEnd {
             tool_name, result, ..
-        } => return extension_render_tool_result(ext_host, tool_name, result).await,
+        } => return extension_render_tool_result(ext_host, tool_name, result, opts).await,
         _ => return Rendered::None,
     };
     // A FAULTING renderer collapses to `None` here on purpose: both of this function's surfaces
@@ -92,7 +95,8 @@ pub async fn extension_render(
     // ([`cyrup_ext::RenderOutcome`]) for the ENTRY surface, which does NOT swallow it — see
     // [`extension_render_entry`].
     // A FAULT collapses to `None` here on purpose (see above); a LIVE component passes through.
-    match run_renderer(ext_host, which).await {
+    let (surface, key, payload) = which;
+    match run_renderer(ext_host, surface, key, payload, opts).await {
         Rendered::Failed(_) => Rendered::None,
         other => other,
     }
@@ -115,13 +119,17 @@ pub async fn extension_render_tool_call(
     ext_host: &Arc<cyrup_ext::ExtensionHost>,
     tool_name: &str,
     call: &serde_json::Value,
+    opts: &cyrup_ext::RenderOptions,
 ) -> crate::transcript::Rendered {
     if !ext_host.has_tool_renderer(tool_name) {
         return crate::transcript::Rendered::None;
     }
     match run_renderer(
         ext_host,
-        Which::ToolCall(tool_name.to_string(), call.clone()),
+        RenderSurface::ToolCall,
+        tool_name.to_string(),
+        call.clone(),
+        opts,
     )
     .await
     {
@@ -140,13 +148,17 @@ pub async fn extension_render_tool_result(
     ext_host: &Arc<cyrup_ext::ExtensionHost>,
     tool_name: &str,
     result: &serde_json::Value,
+    opts: &cyrup_ext::RenderOptions,
 ) -> crate::transcript::Rendered {
     if !ext_host.has_tool_renderer(tool_name) {
         return crate::transcript::Rendered::None;
     }
     match run_renderer(
         ext_host,
-        Which::ToolResult(tool_name.to_string(), result.clone()),
+        RenderSurface::ToolResult,
+        tool_name.to_string(),
+        result.clone(),
+        opts,
     )
     .await
     {
@@ -173,13 +185,17 @@ pub async fn extension_render_entry(
     ext_host: &Arc<cyrup_ext::ExtensionHost>,
     custom_type: &str,
     entry: &serde_json::Value,
+    opts: &cyrup_ext::RenderOptions,
 ) -> crate::transcript::Rendered {
     if !ext_host.has_entry_renderer(custom_type) {
         return crate::transcript::Rendered::None;
     }
     run_renderer(
         ext_host,
-        Which::Entry(custom_type.to_string(), entry.clone()),
+        RenderSurface::Entry,
+        custom_type.to_string(),
+        entry.clone(),
+        opts,
     )
     .await
 }
@@ -201,14 +217,6 @@ pub(crate) fn custom_entry_type(entry: &serde_json::Value) -> String {
         .to_string()
 }
 
-/// Which registered renderer to invoke, and with what payload.
-pub(crate) enum Which {
-    Message(String, serde_json::Value),
-    ToolCall(String, serde_json::Value),
-    ToolResult(String, serde_json::Value),
-    Entry(String, serde_json::Value),
-}
-
 /// Resolve an extension's registered MESSAGE renderer for `custom_type` and run it against
 /// `payload` (Pi `getMessageRenderer(customType)`, `extensions/runner.ts:579-587`).
 ///
@@ -226,23 +234,42 @@ pub(crate) enum Which {
 /// (`custom-message.ts:82-84` catches and falls through).
 pub(crate) async fn run_renderer(
     ext_host: &Arc<cyrup_ext::ExtensionHost>,
-    which: Which,
+    surface: RenderSurface,
+    key: String,
+    payload: serde_json::Value,
+    opts: &cyrup_ext::RenderOptions,
 ) -> crate::transcript::Rendered {
     use crate::transcript::Rendered;
     let host = ext_host.clone();
+    // EXT-006 — the source is assembled BEFORE the call and stamped into the result below, so a
+    // `Rendered::Text` cannot exist without recording what produced it and under which display
+    // inputs. That is what makes [`crate::App::refresh_extension_renders`] able to DERIVE staleness
+    // rather than depend on every toggle remembering to invalidate something.
+    let source = crate::transcript::RenderSource {
+        surface,
+        key: key.clone(),
+        payload: payload.clone(),
+        under: opts.clone(),
+    };
+    let opts = opts.clone();
     let task = tokio::spawn(async move {
-        match which {
-            Which::Message(key, payload) => host.render_message_call_outcome(&key, &payload).await,
-            Which::ToolCall(key, payload) => host.render_tool_call_outcome(&key, &payload).await,
-            Which::ToolResult(key, payload) => {
-                host.render_tool_result_outcome(&key, &payload).await
+        match surface {
+            RenderSurface::Message => {
+                host.render_message_call_outcome(&key, &payload, &opts)
+                    .await
             }
-            Which::Entry(key, payload) => host.render_entry(&key, &payload).await,
+            RenderSurface::ToolCall => host.render_tool_call_outcome(&key, &payload, &opts).await,
+            RenderSurface::ToolResult => {
+                host.render_tool_result_outcome(&key, &payload, &opts).await
+            }
+            RenderSurface::Entry => host.render_entry(&key, &payload, &opts).await,
         }
     });
     let abort = task.abort_handle();
     match tokio::time::timeout(EXTENSION_RENDER_TIMEOUT, task).await {
-        Ok(Ok(cyrup_ext::RenderOutcome::Rendered(v))) => Rendered::Text(rendered_text(&v)),
+        Ok(Ok(cyrup_ext::RenderOutcome::Rendered(v))) => Rendered::Text(
+            crate::transcript::RenderedText::new(rendered_text(&v), source),
+        ),
         // The renderer FAULTED. `cyrup-ext` already contained the fault (native panic caught,
         // guest trap mapped) and kept its message; upstream's `catch` binding is the same value.
         Ok(Ok(cyrup_ext::RenderOutcome::Failed(message))) => Rendered::Failed(message),
@@ -382,6 +409,7 @@ pub async fn extension_render_message(
     ext_host: &Arc<cyrup_ext::ExtensionHost>,
     custom_type: &str,
     payload: &serde_json::Value,
+    opts: &cyrup_ext::RenderOptions,
 ) -> crate::transcript::Rendered {
     use crate::transcript::Rendered;
     if !ext_host.has_message_renderer(custom_type) {
@@ -391,7 +419,10 @@ pub async fn extension_render_message(
     // A LIVE component passes through so the replay can re-render it per frame.
     match run_renderer(
         ext_host,
-        Which::Message(custom_type.to_string(), payload.clone()),
+        RenderSurface::Message,
+        custom_type.to_string(),
+        payload.clone(),
+        opts,
     )
     .await
     {

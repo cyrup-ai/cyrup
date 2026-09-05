@@ -24,9 +24,17 @@
 
 use crate::fixture;
 
-use cyrup_ext::DenyServices;
+use cyrup_ext::{DenyServices, RenderOptions};
 use serde_json::json;
 use std::sync::Arc;
+
+/// The display inputs a renderer runs under (EXT-006) — the `(options, theme)` half of upstream's
+/// renderer signature. The routing tests below are about which renderer answers, so they use the
+/// collapsed defaults; `a_guest_renderer_sees_the_display_options_and_the_theme` is the one that
+/// varies them.
+fn opts() -> RenderOptions {
+    RenderOptions::default()
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_host_routes_a_tool_row_to_the_guest_that_renders_it() {
@@ -53,7 +61,7 @@ async fn the_host_routes_a_tool_row_to_the_guest_that_renders_it() {
 
     // Render by TOOL NAME only — no `LiveExtension` handle in sight.
     let call = host
-        .render_tool_call("demo_echo", &json!({ "text": "hi" }))
+        .render_tool_call("demo_echo", &json!({ "text": "hi" }), &opts())
         .await
         .expect("the host resolved and CALLED the guest's tool-call renderer");
     // The guest returns a serialized WIDGET TREE (`cyrup_ext_sdk::widget`), the wire analog of the
@@ -70,7 +78,7 @@ async fn the_host_routes_a_tool_row_to_the_guest_that_renders_it() {
     );
 
     let result = host
-        .render_tool_result("demo_echo", &json!({ "content": "echo: hi" }))
+        .render_tool_result("demo_echo", &json!({ "content": "echo: hi" }), &opts())
         .await
         .expect("the host resolved and CALLED the guest's tool-result renderer");
     assert!(
@@ -83,11 +91,15 @@ async fn the_host_routes_a_tool_row_to_the_guest_that_renders_it() {
 
     // A tool nobody renders falls back to the host's own framing (`None`), never an error.
     assert!(
-        host.render_tool_call("signal_probe", &json!({}))
+        host.render_tool_call("signal_probe", &json!({}), &opts())
             .await
             .is_none()
     );
-    assert!(host.render_tool_result("bash", &json!({})).await.is_none());
+    assert!(
+        host.render_tool_result("bash", &json!({}), &opts())
+            .await
+            .is_none()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -105,7 +117,7 @@ async fn the_host_routes_a_custom_message_to_its_registered_renderer() {
     assert!(!host.has_message_renderer("nope"));
 
     let widget = host
-        .render_message_call("demo", &json!({ "x": 1 }))
+        .render_message_call("demo", &json!({ "x": 1 }), &opts())
         .await
         .expect("the host resolved and CALLED the guest's message renderer");
     assert!(
@@ -114,7 +126,9 @@ async fn the_host_routes_a_custom_message_to_its_registered_renderer() {
     );
 
     assert!(
-        host.render_message_call("nope", &json!({})).await.is_none(),
+        host.render_message_call("nope", &json!({}), &opts())
+            .await
+            .is_none(),
         "an unregistered custom type falls back to the host's framing"
     );
 }
@@ -174,7 +188,10 @@ async fn the_host_routes_a_custom_entry_to_its_registered_guest_renderer() {
     );
     assert!(!host.has_entry_renderer("nope"));
 
-    match host.render_entry("demo_card", &json!({ "n": 7 })).await {
+    match host
+        .render_entry("demo_card", &json!({ "n": 7 }), &opts())
+        .await
+    {
         cyrup_ext::RenderOutcome::Rendered(v) => assert!(
             v["text"]
                 .as_str()
@@ -188,7 +205,7 @@ async fn the_host_routes_a_custom_entry_to_its_registered_guest_renderer() {
     // "No renderer claims this type" stays `None` — never `Failed`, or the failure box would draw
     // for every unrendered entry (`interactive-mode.ts:3433-3435` draws nothing at all).
     assert_eq!(
-        host.render_entry("nope", &json!({})).await,
+        host.render_entry("nope", &json!({}), &opts()).await,
         cyrup_ext::RenderOutcome::None
     );
 }
@@ -210,7 +227,7 @@ async fn a_faulting_guest_entry_renderer_reports_failed_not_none() {
         "the faulting renderer IS registered"
     );
 
-    let out = host.render_entry("demo_boom", &json!({})).await;
+    let out = host.render_entry("demo_boom", &json!({}), &opts()).await;
     assert!(
         out.failure().is_some(),
         "a trapping guest renderer is a FAULT, distinct from `None` — got {out:?}"
@@ -221,4 +238,67 @@ async fn a_faulting_guest_entry_renderer_reports_failed_not_none() {
         "collapsing this to `None` is exactly the bug: it is indistinguishable from \
          `has_entry_renderer == false`"
     );
+}
+
+/// EXT-006 — the `(options, theme)` half of every upstream renderer signature reaches a WASM GUEST,
+/// and the guest's output really does vary with it.
+///
+/// Upstream: `renderResult(result, options: ToolRenderResultOptions, theme, context)`
+/// (`core/extensions/types.ts:493-498` @v0.84.4, `ToolRenderResultOptions.expanded` at `:415`) and
+/// `EntryRenderer = (entry, options, theme)` (`:1219-1223`). cyrup's world carries the pair as
+/// `opts-json` on `render-call`/`render-result` (the 0.8 -> 0.9 bump); before it, a guest renderer
+/// could not know whether the row was expanded or which theme was active, so its output was frozen
+/// while every built-in row around it moved.
+///
+/// The fixture is the in-tree SDK example: `DemoToolRenderer::render_result` branches on
+/// `opts.expanded`, `DemoEntryRenderer::render_call` names `opts.theme`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_guest_renderer_sees_the_display_options_and_the_theme() {
+    let bytes = std::fs::read(fixture::component()).expect("read fixture component bytes");
+    let host = cyrup_ext::ExtensionHost::with_wasm(fixture::cfg()).expect("host with wasm runtime");
+    host.load_wasm("demo".into(), &bytes, Arc::new(DenyServices))
+        .await
+        .expect("load + init");
+
+    let collapsed = host
+        .render_tool_result("demo_echo", &json!({ "content": "echo: hi" }), &opts())
+        .await
+        .expect("the guest rendered the collapsed form");
+    assert!(
+        collapsed["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("(collapsed)"),
+        "the guest saw `expanded: false`: {collapsed}"
+    );
+
+    let expanded_opts = RenderOptions::new(true, 1, Some("solarized".into()));
+    let expanded = host
+        .render_tool_result(
+            "demo_echo",
+            &json!({ "content": "echo: hi" }),
+            &expanded_opts,
+        )
+        .await
+        .expect("the guest rendered the expanded form");
+    assert!(
+        expanded["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("(expanded)"),
+        "the SAME payload under `expanded: true` produced a DIFFERENT render — which is the whole \
+         point of passing the options: {expanded}"
+    );
+
+    // The theme crosses as a NAME (see `cyrup_ext::RenderOptions`) and reaches the guest too.
+    match host
+        .render_entry("demo_card", &json!({ "n": 7 }), &expanded_opts)
+        .await
+    {
+        cyrup_ext::RenderOutcome::Rendered(v) => assert!(
+            v["text"].as_str().unwrap_or("").contains("[solarized]"),
+            "the guest read the active theme's name out of the options bag: {v}"
+        ),
+        other => panic!("expected the guest's output, got {other:?}"),
+    }
 }

@@ -35,6 +35,62 @@ where
     })
 }
 
+/// pi `getAuthCredential` (`coding-agent/src/cli/auth-command.ts:120-125` @v0.84.4) — the single
+/// bearer string a resolved [`AuthResult`] yields, for the callers that must send a token
+/// themselves rather than hand the whole `AuthResult` to a wire adapter:
+///
+/// ```ts
+/// export function getAuthCredential(auth: AuthResult | undefined): string | undefined {
+///     if (auth?.auth.apiKey) return auth.auth.apiKey;
+///     const authorization = Object.entries(auth?.auth.headers ?? {}).find(
+///         ([name]) => name.toLowerCase() === "authorization",
+///     )?.[1];
+///     return typeof authorization === "string" ? /^Bearer\s+(.+)$/iu.exec(authorization)?.[1] : undefined;
+/// }
+/// ```
+///
+/// Both JS falsiness rules are preserved: an api key that is the EMPTY string falls through to the
+/// header (`if (auth?.auth.apiKey)`), and the header match requires at least one character after
+/// the whitespace (`(.+)`), so a bare `Authorization: Bearer ` yields `None` rather than `""`.
+/// The header name test is case-insensitive and the `Bearer` prefix match is too (`/…/iu`).
+///
+/// pi's `.find()` takes the FIRST matching entry of the header object, in insertion order;
+/// [`crate::HeaderMap`] is a `BTreeMap`, so it answers in sorted-key order instead. The two can
+/// only disagree when a single `AuthResult` carries TWO differently-cased `authorization` keys,
+/// which no strategy in this crate produces.
+#[must_use]
+pub fn auth_credential(auth: Option<&AuthResult>) -> Option<String> {
+    let auth = auth?;
+    if let Some(key) = auth.auth.api_key.as_ref().filter(|k| !k.is_empty()) {
+        return Some(key.clone());
+    }
+    auth.auth
+        .headers
+        .as_ref()?
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        .and_then(|(_, value)| value.as_deref())
+        .and_then(strip_bearer)
+}
+
+/// `/^Bearer\s+(.+)$/iu` applied to one header value (pi `auth-command.ts:125`). `\s` is JS
+/// whitespace; the ASCII subset [`char::is_whitespace`] agrees on for every byte a header value may
+/// legally carry.
+fn strip_bearer(value: &str) -> Option<String> {
+    let tail = value
+        .get(..6)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("Bearer"))
+        .map(|prefix| &value[prefix.len()..])?;
+    // `\s+` is greedy, so the capture starts at the first non-whitespace byte; `$` with a greedy
+    // `(.+)` keeps any TRAILING whitespace, which is why only the front is trimmed.
+    let trimmed = tail.trim_start();
+    // `\s+` requires at least one whitespace character, and `(.+)` at least one more after it.
+    if trimmed.len() == tail.len() || trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
 /// A keyless-local strategy (func-01 R-01-062): always resolves as "configured, no key" — for local
 /// servers (Ollama, llama.cpp, vLLM) that need no credential.
 pub fn keyless_local() -> Arc<dyn ApiKeyAuth> {

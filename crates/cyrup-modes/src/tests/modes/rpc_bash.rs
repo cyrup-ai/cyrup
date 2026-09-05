@@ -403,3 +403,142 @@ async fn rpc_bash_honors_a_partial_user_bash_result_override() {
         "the partial override is recorded into the transcript: {msgs_json}"
     );
 }
+
+// ----------------------------------------------------------------------------------------------
+// SEAM-015 — the JSON-RPC `bash` command must honour the `operations` backend the `user_bash`
+// handler supplied, not just its `result`.
+//
+// Pi `rpc-mode.ts:578-582` @v0.84.4: after the `result` short-circuit it calls
+// `session.executeBash(command.command, undefined, {excludeFromContext, id,
+// operations: eventResult?.operations})` — `operations` at `:581`, the sibling half of
+// `UserBashEventResult` (`core/extensions/types.ts:1139`). cyrup fills the same field one frame
+// lower, inside the shared `execute_bash_with_user_event` wrapper, so this arm's literal
+// `operations: None` is upstream's absent CALLER-supplied backend rather than a dropped
+// extension-supplied one.
+// ----------------------------------------------------------------------------------------------
+
+/// The extension-supplied remote-exec backend: it never touches a shell, it just answers with a
+/// sentinel the local shell could not possibly produce for the command the test sends.
+struct SentinelBashOps {
+    /// The commands it was handed, so the test can assert it really executed rather than inferring
+    /// it from the output alone.
+    seen: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl cyrup_tools::ops::BashOperations for SentinelBashOps {
+    async fn exec(
+        &self,
+        command: &str,
+        _cwd: &std::path::Path,
+        opts: cyrup_tools::ops::BashExecOptions<'_>,
+    ) -> Result<cyrup_tools::ExitStatus, cyrup_tools::ToolError> {
+        self.seen.lock().unwrap().push(command.to_string());
+        (opts.on_data)(b"ran-on-extension-backend\n");
+        Ok(cyrup_tools::ExitStatus::Exited(0))
+    }
+}
+
+/// A native extension that wins the `user_bash` reduction with a payload carrying no `result`, and
+/// supplies [`SentinelBashOps`] as Pi's `UserBashEventResult.operations`.
+struct RpcBashOpsSupplier {
+    ops: Arc<SentinelBashOps>,
+}
+
+#[async_trait::async_trait]
+impl cyrup_ext::NativeExtension for RpcBashOpsSupplier {
+    fn id(&self) -> cyrup_core::ExtensionId {
+        cyrup_core::ExtensionId::from("rpc-bash-ops-supplier")
+    }
+    async fn init(&self, api: &mut cyrup_ext::InitApi) -> Result<(), cyrup_ext::ExtError> {
+        api.subscribe(&[cyrup_ext::EventKind::UserBash]);
+        Ok(())
+    }
+    async fn on_event(
+        &self,
+        ev: &cyrup_ext::HostEvent,
+        _ctx: &cyrup_ext::HostCtx,
+    ) -> cyrup_ext::HookOutcome {
+        if matches!(ev, cyrup_ext::HostEvent::UserBash { .. }) {
+            // Upstream: any truthy `UserBashEventResult` ends the handler loop and becomes THE
+            // result (`core/extensions/runner.ts:1005-1032`); one carrying only `operations` does
+            // not short-circuit execution, it redirects it.
+            return cyrup_ext::HookOutcome::Handled(cyrup_ext::HandledValue(serde_json::json!({})));
+        }
+        cyrup_ext::HookOutcome::Noop
+    }
+    fn user_bash_operations(
+        &self,
+        _command: &str,
+        _exclude_from_context: bool,
+        _cwd: &str,
+    ) -> Option<Arc<dyn cyrup_tools::ops::BashOperations>> {
+        Some(self.ops.clone() as Arc<dyn cyrup_tools::ops::BashOperations>)
+    }
+}
+
+/// SEAM-015: a wire `{"type":"bash"}` command runs on the backend the `user_bash` handler supplied.
+/// The command sent would print `locally-executed` if it reached the local shell, and the backend
+/// answers `ran-on-extension-backend`, so neither the presence nor the absence assertion can pass by
+/// accident — and `rpc_bash_delivers_user_bash_to_an_extension` above is the control proving this
+/// same wire command DOES reach the local shell when no handler supplies a backend.
+#[tokio::test]
+async fn rpc_bash_runs_on_an_extension_supplied_operations_backend() {
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    let ops = Arc::new(SentinelBashOps {
+        seen: std::sync::Mutex::new(Vec::new()),
+    });
+    let ext = Arc::new(RpcBashOpsSupplier { ops: ops.clone() });
+    let runtime = build_runtime_with_ext(&fx, faux, ext).await;
+
+    let input = concat!(
+        r#"{"type":"bash","id":"b1","command":"echo locally-executed"}"#,
+        "\n"
+    );
+    let reader = Cursor::new(input.as_bytes().to_vec());
+    let mut out: Vec<u8> = Vec::new();
+    run_rpc(&runtime, reader, &mut out)
+        .await
+        .expect("rpc mode runs");
+
+    let executed = ops.seen.lock().unwrap().clone();
+    assert_eq!(
+        executed,
+        vec!["echo locally-executed".to_string()],
+        "the extension's backend must have executed the wire command: {executed:?}"
+    );
+
+    let lines = parse_lines(&out);
+    let resp = lines
+        .iter()
+        .find(|l| l["command"] == "bash" && l["id"] == "b1")
+        .expect("bash response");
+    assert_eq!(resp["success"], true, "{resp}");
+    assert!(
+        resp["data"]["output"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ran-on-extension-backend"),
+        "the RPC result is the extension backend's output: {resp}"
+    );
+    assert!(
+        !resp["data"]["output"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("locally-executed"),
+        "the local shell must never have run the command: {resp}"
+    );
+    // The streaming half is shared with the local branch (pi builds the `onChunk` wrapper once and
+    // hands it to whichever backend the `??` chose, `agent-session.ts:2779-2789`), so the
+    // redirected command still emits its `bash_execution_update` deltas keyed by the request id.
+    assert!(
+        lines.iter().any(|l| type_of(l) == "bash_execution_update"
+            && l["id"] == "b1"
+            && l["delta"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("ran-on-extension-backend")),
+        "a redirected bash still streams its output over the same event: {lines:?}"
+    );
+}

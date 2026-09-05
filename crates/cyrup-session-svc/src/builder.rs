@@ -341,10 +341,30 @@ const ALL_BUILTIN_TOOLS: [&str; 8] = [
 ];
 
 /// Apply the `tools`/`noTools`/`excludeTools` selection over the Availability-visible tool set
-/// (Pi sdk.ts:244-251). When none of the three is set the visible set passes through unchanged.
+/// (Pi sdk.ts:256-263), with the `defaultTools` setting standing in for pi's
+/// `defaultActiveToolNames` when it is configured.
+///
+/// Upstream v0.84.4 (`sdk.ts:261-263`) is one expression:
+///
+/// ```text
+/// options.tools ?? (options.noTools ? [] : (configuredDefaultToolNames ?? defaultActiveToolNames))
+/// ```
+///
+/// followed by the `excludeTools` filter — so `default_tools` is consulted only on the arm where
+/// neither an explicit allowlist nor a suppression mode is set, and it REPLACES the four defaults
+/// rather than adding to them.
+///
+/// `default_tools` narrows built-ins ONLY. An extension- or embedder-supplied tool is kept by the
+/// `!ALL_BUILTIN_TOOLS.contains(name)` leg regardless of what the setting lists, which is upstream's
+/// `includeAllExtensionTools: true` at construction (`agent-session.ts:406-410` →
+/// `_refreshToolRegistry`'s `:2742-2745` branch). That is deliberate and was a bug fix upstream:
+/// `defaultTools` first shipped as an `allowedToolNames` allowlist (`4d9aa837c`) that dropped
+/// extension and SDK custom tools, and `541045ae0` ("preserve extension tools with defaults")
+/// narrowed it to the built-in selection before v0.84.4 shipped.
 fn select_active_tools(
     visible: &[Arc<dyn cyrup_core::Tool>],
     cfg: &SessionConfig,
+    default_tools: Option<&[String]>,
 ) -> Vec<Arc<dyn cyrup_core::Tool>> {
     let exclude: std::collections::HashSet<&str> =
         cfg.exclude_tools.iter().map(String::as_str).collect();
@@ -371,8 +391,17 @@ fn select_active_tools(
             // ENABLE-able at runtime via `set_active_tools_by_name`, exactly as pi's
             // `_refreshToolRegistry` can widen its own active set. This changes the DEFAULT, not
             // what is reachable.
+            //
+            // CFG-079: `defaultTools` (settings-manager.ts:128, getter `:1273-1276`) replaces
+            // `DEFAULT_BUILTIN_TOOLS` on this arm when it is configured. An explicit `[]` is a
+            // configured value — it means "no built-ins", not "unset" — which is why the setting is
+            // an `Option<&[String]>` and not a `Vec` defaulted to the four names.
             (None, None) => {
-                DEFAULT_BUILTIN_TOOLS.contains(&name) || !ALL_BUILTIN_TOOLS.contains(&name)
+                let selected = match default_tools {
+                    Some(configured) => configured.iter().any(|t| t == name),
+                    None => DEFAULT_BUILTIN_TOOLS.contains(&name),
+                };
+                selected || !ALL_BUILTIN_TOOLS.contains(&name)
             }
         }
     };
@@ -436,6 +465,13 @@ pub struct SessionBuilder {
     /// which is the ordering SEAM-065 exists to restore. `None` ⇒ no UI (pi's `hasUI` false branch,
     /// `:86-88`), so the run proceeds untrusted.
     trust_prompt: Option<TrustPromptFn>,
+    /// EXT-003, tests only: make the pre-trust pass behave as if `ExtensionHost::with_wasm`
+    /// returned `Err`, so the native-only fallback is exercisable. There is no production switch
+    /// for this and no production build carries the field — the real trigger is a machine on which
+    /// Wasmtime's engine cannot be constructed (`cyrup-ext/src/host/engine.rs:19-26`, the pooling
+    /// allocator reserving its slabs), which cannot be staged from inside the test process.
+    #[cfg(test)]
+    force_pre_trust_wasm_failure: bool,
 }
 
 /// The interactive project-trust prompt seam (pi `selectProjectTrustOption`,
@@ -499,7 +535,19 @@ impl SessionBuilder {
             context_files_override: None,
             trust_store: None,
             trust_prompt: None,
+            #[cfg(test)]
+            force_pre_trust_wasm_failure: false,
         }
+    }
+
+    /// Force the EXT-003 native-only fallback in the pre-trust project-trust pass: the pass behaves
+    /// as if the Wasmtime runtime could not be constructed. Tests only — see the field of the same
+    /// name; production code has no way to reach this and no build outside `cfg(test)` compiles it.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn force_pre_trust_wasm_failure(mut self) -> Self {
+        self.force_pre_trust_wasm_failure = true;
+        self
     }
 
     /// Wire the project-trust store so the saved-decision tier and the `remember` persist can run
@@ -656,11 +704,16 @@ impl SessionBuilder {
         // extension pass when the answer is actually in doubt — no explicit `--approve/--no-approve`
         // and there IS something to gate. In every other case this is the exact previous code path.
         let ext_trust = if cfg.trust_override.is_none() && has_resources {
+            #[cfg(test)]
+            let force_wasm_failure = self.force_pre_trust_wasm_failure;
+            #[cfg(not(test))]
+            let force_wasm_failure = false;
             pre_trust_extension_verdict(
                 &cfg,
                 &cwd,
                 &self.native_extensions,
                 &settings.global().extension_paths(),
+                force_wasm_failure,
             )
             .await
         } else {
@@ -982,10 +1035,13 @@ impl SessionBuilder {
             },
         );
         let visible = registry.visible(&cfg.tool_availability);
-        // Tool-set selection (Pi sdk.ts:244-251): an explicit `tools` allowlist, or `noTools`
+        // Tool-set selection (Pi sdk.ts:256-263): an explicit `tools` allowlist, or `noTools`
         // ("all" ⇒ none; "builtin" ⇒ drop the default built-ins), then minus the `excludeTools`
-        // denylist. Absent all three, the Availability-visible set is kept verbatim.
-        let base_tools = select_active_tools(&visible, &cfg);
+        // denylist. Absent all three, the initial built-in selection is the `defaultTools` setting
+        // when configured (CFG-079, `settingsManager.getDefaultTools()` at sdk.ts:257) and pi's four
+        // `defaultActiveToolNames` otherwise.
+        let configured_default_tools = settings.effective().default_tools();
+        let base_tools = select_active_tools(&visible, &cfg, configured_default_tools.as_deref());
         let read_available = base_tools.iter().any(|t| t.name() == "read");
 
         // ---- 4a. the LIVE host-services backend (arch-08 §5.6) — built BEFORE the extension host so
@@ -2237,6 +2293,7 @@ async fn pre_trust_extension_verdict(
     cwd: &Path,
     natives: &[Arc<dyn NativeExtension>],
     global_extension_patterns: &[String],
+    force_wasm_failure: bool,
 ) -> Option<cyrup_ext::ProjectTrustDecision> {
     // A globally disabled extension must not vote on trust either: this throwaway pass loads the
     // SAME pre-trust set the real pass loads, so it has to apply the same settings `-pattern`
@@ -2253,10 +2310,38 @@ async fn pre_trust_extension_verdict(
         has_ui,
         cwd: cwd.to_path_buf(),
     };
+    // EXT-003 — a wasm-runtime construction failure must NOT discard the native votes. This line
+    // used to be `ExtensionHost::with_wasm(host_config).ok()?`, so on a machine where the Wasmtime
+    // engine cannot be built the WHOLE pre-trust pass returned `None` and every native
+    // `decides_project_trust` extension was silently skipped, even though not one of them needs
+    // wasm to vote. The realistic trigger is `build_engine`'s pooling allocator reserving its
+    // slabs (`cyrup-ext/src/host/engine.rs:19-26`) — `build_engine_on_demand` (`:31-37`) exists
+    // precisely because that reservation fails on constrained hosts, and address-space pressure is
+    // transient, so this pass can fail while the real host at step 4b succeeds.
+    //
+    // Pi has no runtime to construct, but it does have the corresponding partial-failure rule and
+    // it is the opposite of fail-everything: `loadProjectTrustExtensions()`
+    // (`core/resource-loader.ts:380-386` @v0.84.4) returns a `LoadExtensionsResult` whose
+    // per-extension faults live in `errors`, and `resolveProjectTrusted` hands that straight to
+    // `emitProjectTrustEvent`, which polls `extensionsResult.extensions` — the ones that DID load
+    // (`core/extensions/runner.ts:204-233` @v0.84.4). A failure in part of the extension subsystem
+    // never silences the part that still works; here the natives are exactly that part.
     #[cfg(feature = "wasm-host")]
-    let host = ExtensionHost::with_wasm(host_config).ok()?;
+    let (host, wasm_ready) = match pre_trust_wasm_host(host_config.clone(), force_wasm_failure) {
+        Ok(host) => (host, true),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "pre-trust wasm runtime unavailable; native project_trust deciders vote alone"
+            );
+            (ExtensionHost::new(host_config), false)
+        }
+    };
     #[cfg(not(feature = "wasm-host"))]
-    let host = ExtensionHost::new(host_config);
+    let host = {
+        let _ = force_wasm_failure;
+        ExtensionHost::new(host_config)
+    };
 
     // SEAM-071: a native that `--no-extensions` will not load must not vote on project trust
     // either — pi's pre-trust pass (`loadProjectTrustExtensions()`) runs over the SAME reduced set
@@ -2272,8 +2357,13 @@ async fn pre_trust_extension_verdict(
             tracing::debug!(error = %e, "pre-trust extension load skipped");
         }
     }
+    // No engine ⇒ nothing to discover FOR: every `load_wasm_with_caps` on a runtime-less host
+    // returns `ExtError::WasmHostDisabled` (`cyrup-ext/src/facade.rs:1834`), so the scan would cost
+    // a walk of the global extensions root to produce a `LoadExtensionsResult` of nothing but
+    // errors. Pi's equivalent is that a tier it cannot load contributes no voters, not that the
+    // remaining voters are dropped.
     #[cfg(feature = "wasm-host")]
-    {
+    if wasm_ready {
         let mut roots = extension_discovery_roots(cfg);
         roots.disabled = cyrup_resources::scan_loose_extension_root(
             &cfg.agent_dir.join(cyrup_ext::EXTENSIONS_SUBDIR),
@@ -2293,6 +2383,27 @@ async fn pre_trust_extension_verdict(
     let decision = host.aggregate_project_trust(&CancelToken::new()).await;
     // The host (and every instance it loaded) is dropped here — Pi's `clearExtensionCache()`.
     decision
+}
+
+/// [`ExtensionHost::with_wasm`] for the throwaway pre-trust pass, with the test-only fault
+/// injection `SessionBuilder::force_pre_trust_wasm_failure` folded in so the native-only fallback
+/// above is reachable from a test. Every non-`cfg(test)` build compiles to the bare `with_wasm`
+/// call: `force_failure` is dead in production and the `Err` arm is only ever produced by a real
+/// engine-construction failure.
+#[cfg(feature = "wasm-host")]
+fn pre_trust_wasm_host(
+    config: HostConfig,
+    force_failure: bool,
+) -> Result<ExtensionHost, cyrup_ext::ExtError> {
+    #[cfg(test)]
+    if force_failure {
+        return Err(cyrup_ext::ExtError::Engine(
+            "forced pre-trust wasm-runtime failure".to_string(),
+        ));
+    }
+    #[cfg(not(test))]
+    let _ = force_failure;
+    ExtensionHost::with_wasm(config)
 }
 
 /// The subagent-child marker (`cyrup_ext_subagents::spawn::nested_events::CHILD_ENV`). Read as a
@@ -2652,6 +2763,123 @@ mod tests {
         for name in DEFAULT_BUILTIN_TOOLS {
             assert!(cyrup_tools::BUILTIN_NAMES.contains(&name));
         }
+    }
+
+    // ---- CFG-079: the `defaultTools` setting is the initial BUILT-IN selection ----------------
+    //
+    // pi v0.84.4 `sdk.ts:256-263`. Ported from `test/default-tools-setting.test.ts` at the same
+    // tag, case for case: "uses the configured list as the initial built-in selection",
+    // "can select powershell instead of bash", "keeps extension and SDK custom tools enabled" and
+    // "preserves explicit tool option precedence".
+
+    /// A name-only tool: `select_active_tools` reads nothing else off the trait.
+    struct NamedTool(&'static str, serde_json::Value);
+
+    #[async_trait::async_trait]
+    impl cyrup_core::Tool for NamedTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn parameters(&self) -> &serde_json::Value {
+            &self.1
+        }
+        async fn execute(
+            &self,
+            _id: cyrup_core::ToolCallId,
+            _args: serde_json::Value,
+            _cancel: cyrup_core::CancelToken,
+            _on_update: Box<dyn FnMut(cyrup_core::ToolUpdate) + Send>,
+        ) -> Result<cyrup_core::ToolResult, cyrup_core::ToolError> {
+            Err(cyrup_core::ToolError::new("not executable"))
+        }
+    }
+
+    /// Every built-in `ToolRegistry::with_builtins` installs, plus one extension-supplied tool —
+    /// upstream's `getAllTools()` in the same test file, which lists all eight built-ins whatever
+    /// `defaultTools` says, plus the extension/SDK tools.
+    fn visible_tools() -> Vec<std::sync::Arc<dyn cyrup_core::Tool>> {
+        ALL_BUILTIN_TOOLS
+            .iter()
+            .copied()
+            .chain(std::iter::once("static_tool"))
+            .map(|name| {
+                std::sync::Arc::new(NamedTool(name, serde_json::json!({})))
+                    as std::sync::Arc<dyn cyrup_core::Tool>
+            })
+            .collect()
+    }
+
+    fn selected(cfg: &super::SessionConfig, default_tools: Option<&[String]>) -> Vec<String> {
+        super::select_active_tools(&visible_tools(), cfg, default_tools)
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect()
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn the_default_tools_setting_replaces_pis_four_built_ins() {
+        let cfg = super::SessionConfig::new("/tmp", "/tmp/agent");
+
+        // Unset: pi's `defaultActiveToolNames` (sdk.ts:256), extension tool alongside.
+        assert_eq!(
+            selected(&cfg, None),
+            names(&["read", "write", "edit", "bash", "static_tool"])
+        );
+
+        // "uses the configured list as the initial built-in selection": grep/find are built-ins pi
+        // does NOT activate by default, and the four defaults are REPLACED, not widened.
+        assert_eq!(
+            selected(&cfg, Some(&names(&["grep", "find"]))),
+            names(&["grep", "find", "static_tool"])
+        );
+
+        // "can select powershell instead of bash".
+        assert_eq!(
+            selected(&cfg, Some(&names(&["read", "powershell", "edit", "write"]))),
+            names(&["read", "write", "edit", "powershell", "static_tool"])
+        );
+
+        // An explicit `[]` is a configured value, not "unset": no built-ins at all. The extension
+        // tool still survives — this is the `541045ae0` fix, and the reason the parameter is an
+        // `Option` rather than a `Vec` defaulted to the four names.
+        assert_eq!(selected(&cfg, Some(&[])), names(&["static_tool"]));
+
+        // A name that matches no tool is carried through and simply selects nothing: pi's getter
+        // validates nothing (settings-manager.ts:1273-1276).
+        assert_eq!(
+            selected(&cfg, Some(&names(&["read", "no-such-tool"]))),
+            names(&["read", "static_tool"])
+        );
+    }
+
+    #[test]
+    fn explicit_tool_flags_still_outrank_the_default_tools_setting() {
+        // "preserves explicit tool option precedence" — pi's
+        // `options.tools ?? (options.noTools ? [] : (configuredDefaultToolNames ?? …))`, then the
+        // `excludeTools` filter (sdk.ts:261-263).
+        let default_tools = names(&["read", "grep"]);
+
+        let mut allowlisted = super::SessionConfig::new("/tmp", "/tmp/agent");
+        allowlisted.tools = Some(names(&["read"]));
+        assert_eq!(
+            selected(&allowlisted, Some(&default_tools)),
+            names(&["read"])
+        );
+
+        let mut excluded = super::SessionConfig::new("/tmp", "/tmp/agent");
+        excluded.exclude_tools = names(&["read"]);
+        assert_eq!(
+            selected(&excluded, Some(&default_tools)),
+            names(&["grep", "static_tool"])
+        );
+
+        let mut none = super::SessionConfig::new("/tmp", "/tmp/agent");
+        none.no_tools = Some(super::NoTools::All);
+        assert!(selected(&none, Some(&default_tools)).is_empty());
     }
 
     // ---- SEAM-071: `--no-extensions` gates the native built-ins ----------------------------

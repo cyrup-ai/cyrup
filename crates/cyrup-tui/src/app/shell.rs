@@ -36,6 +36,11 @@ impl<B: Backend> App<B> {
             // behaves as it did before ADR-0005 in the strongest available sense.
             altscreen: None,
             alt_keymap: AltScreenKeymap::default(),
+            // CFG-078 — pi's two documented defaults (`settings-manager.ts:143`, `:145` @v0.84.4),
+            // so an `App` the composition root never configures behaves as upstream's does with an
+            // empty `settings.json`.
+            fullscreen_exit_output: crate::altscreen::FullscreenExitOutput::default(),
+            fullscreen_copy_on_select: true,
             viewport_height: 0,
             live_floor: 0,
             tree_nav_tx: None,
@@ -43,6 +48,7 @@ impl<B: Backend> App<B> {
             package_update_rx: None,
             login_tx: None,
             login_providers: None,
+            radius_gateway: None,
             compact_tx: None,
             queue_drain_tx: None,
             lifecycle_tx: None,
@@ -137,13 +143,60 @@ impl<B: Backend> App<B> {
     }
 
     /// Install the extension-registered keyboard shortcuts (R-08-017; delegates to
-    /// [`AppState::set_extension_shortcuts`]). The binary calls this at boot from
-    /// `ExtensionHost::shortcut_keys()`.
+    /// [`AppState::set_extension_shortcuts`]) VERBATIM, with no conflict gate.
+    ///
+    /// Production installs go through [`Self::install_extension_shortcuts`], which is the gated
+    /// form; this one is the raw seam a test (or an embedder with no extension host) drives
+    /// directly, the way pi's own `getShortcuts` tests build a runner and read its map back
+    /// (`test/extensions-runner.test.ts:176-358` @v0.84.4).
     pub fn set_extension_shortcuts(
         &mut self,
         specs: impl IntoIterator<Item = impl Into<ShortcutSpec>>,
     ) {
         self.state.set_extension_shortcuts(specs);
+    }
+
+    /// Every live binding table as upstream's `KeybindingsConfig` — `action id -> key specs`, pi
+    /// `KeybindingsManager.getEffectiveConfig()` (`core/keybindings.ts` @v0.84.4).
+    ///
+    /// pi keeps ONE `KeybindingsManager` over every registered definition, so its config is
+    /// naturally whole; cyrup splits the same ids across a table per focus context, so the whole is
+    /// the concatenation. Order does not matter to the only consumer — EXT-039's gate inverts it
+    /// key-first and lets the RESERVED id win any tie (`extensions/runner.ts:104-106`).
+    ///
+    /// [`crate::keymap::AutocompleteKeymap`] is deliberately absent: upstream has no
+    /// `tui.autocomplete.*` family at all (the popup reuses `tui.select.*` and `tui.input.tab` —
+    /// see [`crate::keymap::AutocompleteAction::from_id`]), so every id it could contribute is
+    /// already contributed by the select and editor maps, and adding it would only duplicate rows.
+    pub fn effective_keybindings(&self) -> Vec<(String, Vec<String>)> {
+        let mut out = self.state.keymap.effective_config();
+        out.extend(self.state.select_keymap.effective_config());
+        out.extend(self.state.tree_keymap.effective_config());
+        out.extend(self.state.session_keymap.effective_config());
+        out.extend(self.state.models_keymap.effective_config());
+        out.extend(self.state.editor.keymap_ref().effective_config());
+        out.extend(self.alt_keymap.effective_config());
+        out
+    }
+
+    /// Resolve an extension host's registered shortcuts against the live keybindings and install
+    /// the survivors — EXT-039, pi `setupExtensionShortcuts`
+    /// (`modes/interactive/interactive-mode.ts:2078-2131` @v0.84.4), whose first statement is
+    /// `const shortcuts = extensionRunner.getShortcuts(this.keybindings.getEffectiveConfig());`.
+    ///
+    /// This is the gate cyrup had built and never called: `resolve_shortcut_specs` REFUSES a key
+    /// bound to a reserved built-in (Ctrl+C, Enter, …), lets a non-reserved override through with a
+    /// warning, and records both — so a refused key is neither dispatched nor listed by `/hotkeys`,
+    /// instead of being advertised and permanently dead. The warnings are read back with
+    /// `ExtensionHost::shortcut_diagnostics()` and belong in the `[Extension issues]` startup panel
+    /// (`interactive-mode.ts:1884-1886`).
+    ///
+    /// Call it wherever either input changes: at boot after `keybindings.json` is loaded, and after
+    /// a session swap brings a new host.
+    pub fn install_extension_shortcuts(&mut self, host: &cyrup_ext::ExtensionHost) {
+        let effective = self.effective_keybindings();
+        self.state
+            .set_extension_shortcuts(host.resolve_shortcut_specs(&effective));
     }
 
     /// Plumb the `autocompleteMaxVisible` setting (Pi, item #6) into the editor's autocomplete popup
@@ -457,6 +510,57 @@ impl<B: Backend> App<B> {
         let mut theme = controller.theme();
         theme.generation = self.state.theme.generation.saturating_add(1);
         self.state.theme = theme;
+    }
+
+    /// TUI-004 — hand the app the boot [`ThemeController`] so a session swap can re-run Pi's
+    /// `applyFromSettings` (`modes/interactive/theme/theme-controller.ts:57-81` @v0.84.4).
+    ///
+    /// Upstream's controller is a FIELD of the interactive mode (`interactive-mode.ts:960`), which
+    /// is why its `setRebindSession` hook can reach it (`:576-579`); cyrup's lived in the
+    /// composition root's stack frame and was consulted exactly once, at boot, so `/reload` re-read
+    /// five other settings rows and left the theme alone. The controller is CLONED in, not borrowed:
+    /// the launcher still needs `active_name()` to bind the theme file watcher, and the app owns
+    /// every mutation from here on.
+    pub fn set_theme_controller(&mut self, controller: ThemeController) {
+        self.state.theme_controller = Some(controller);
+    }
+
+    /// TUI-004 — re-resolve and re-apply the render theme from a swapped-in session's freshly
+    /// re-read `settings.theme`, loading the named theme out of THAT session's freshly discovered
+    /// resources. Pi's `setRegisteredThemes(resourceLoader.getThemes().themes)` +
+    /// `await this.themeController.applyFromSettings()` pair (`interactive-mode.ts:1977`/`:5985` and
+    /// `:578`/`:5987` @v0.84.4).
+    ///
+    /// Unconditional, exactly as upstream's is: the name may be unchanged while the theme FILE it
+    /// names has been rewritten — the case `/reload` exists for — so the load is redone every time
+    /// rather than gated on the name differing (see [`ThemeController::apply_from_settings`]).
+    ///
+    /// `resources` is the session's whole discovered set, so a file-backed custom theme resolves
+    /// here exactly as it does for an extension's `getTheme` ([`crate::theme_access::TuiThemeAccess`]
+    /// answers from the same [`cyrup_resources::ResourceSet`]). A name that resolves to nothing
+    /// degrades to [`UiTheme::builtin`]'s dark fallback, which is Pi's `applyThemeName` failure path
+    /// (`activeThemeName = "dark"`, `theme-controller.ts:126-135`).
+    ///
+    /// A no-op when no controller was handed over — an app the composition root did not boot has no
+    /// `settings.theme` to answer from and keeps the theme it was constructed with.
+    pub(crate) fn reapply_theme_from_settings(
+        &mut self,
+        setting: Option<&str>,
+        resources: &cyrup_resources::ResourceRegistry,
+    ) {
+        let Some(controller) = self.state.theme_controller.as_mut() else {
+            return;
+        };
+        let name = controller.apply_from_settings(setting);
+        let projected = resources
+            .themes
+            .get_name(&name)
+            .map(|theme| UiTheme::from_theme_data(&theme.data, 0))
+            .unwrap_or_else(|| UiTheme::builtin(&name));
+        // `set_theme`, not a bare assignment: it re-projects through the app's live `ColorMode` and
+        // bumps the generation, which is what invalidates the render caches (`notifyChanged` →
+        // `ui.invalidate()`, `theme-controller.ts:136-139`).
+        self.set_theme(projected);
     }
 
     /// The app's active color mode (test/inspection).

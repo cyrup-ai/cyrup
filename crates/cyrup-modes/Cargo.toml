@@ -52,4 +52,9 @@ cyrup-provider = { workspace = true, features = ["faux"] }
 cyrup-config = { workspace = true }
 # The RPC seam tests declare their own `NativeExtension` impls, whose trait methods are async.
 async-trait.workspace = true
+# SEAM-015: the RPC bash test declares its own `cyrup_tools::ops::BashOperations` backend — the
+# per-call remote-exec seam an extension supplies through `user_bash` — to prove the wire command
+# actually runs on it instead of the local shell. Test-only; production `cyrup-modes` never names a
+# bash backend, it only forwards `BashOptions`.
+cyrup-tools = { workspace = true }
 tempfile.workspace = true

@@ -72,11 +72,53 @@ impl AgentSession {
         }
     }
 
+    /// The palette an export from THIS session renders with — the imperative shell around the pure
+    /// [`crate::export::session_jsonl_to_html_with_theme`].
+    ///
+    /// Pi resolves the theme inside `generateHtml` from module-global state
+    /// (`getResolvedThemeColors(themeName)` → `themeName ?? currentThemeName ?? getDefaultTheme()`,
+    /// `theme.ts:1065` @v0.84.4). cyrup has no such global: the ACTIVE theme name lives behind the
+    /// interactive TUI's [`crate::ThemeAccess`] handle (republished every frame, so a
+    /// `/settings → theme` switch made a keystroke ago is visible here) and the theme DOCUMENTS live
+    /// in this session's discovered-resource snapshot. Reading both here keeps the renderer a pure
+    /// function of `(jsonl, palette)`.
+    ///
+    /// Unattached — headless `print`/`json`/`rpc` — falls through to
+    /// [`crate::ExportTheme::default`], which is pi's `getDefaultTheme()` arm.
+    pub fn export_theme(&self) -> crate::export::ExportTheme {
+        use cyrup_ext::host::HostServices as _;
+        self.services
+            .host_services
+            .theme()
+            .and_then(|name| self.services.resources.themes.get_name(&name))
+            .map(crate::export::ExportTheme::from_theme)
+            .unwrap_or_default()
+    }
+
+    /// The leaf the exported document must be walked from — pi's `sm.getLeafId()`, which
+    /// `exportSessionToHtml` reads straight off the live manager (`core/export-html/index.ts:266`
+    /// @v0.84.4).
+    ///
+    /// Threaded through the shell for the same reason [`Self::export_theme`] is: the renderer stays
+    /// a pure function of `(jsonl, palette, leaf)` and never re-derives state the manager owns. It
+    /// MUST NOT be re-derived from the JSONL — `SessionManager::branch` moves the leaf without
+    /// appending and `reset_leaf` clears it, so after a `/tree` branch switch with no new message
+    /// the last line of the file belongs to the abandoned branch and `template.js` would walk the
+    /// wrong conversation.
+    pub async fn export_leaf_id(&self) -> Option<String> {
+        let guard = self.manager.lock().await;
+        guard.leaf_id().map(|id| id.as_str().to_string())
+    }
+
     /// Export the current session branch to a standalone HTML document (Pi `exportToHtml`,
-    /// agent-session.ts:3022). With `path` the document is written there; otherwise the Pi default
+    /// agent-session.ts:3022 → `exportSessionToHtml`, `core/export-html/index.ts:236-282`
+    /// @v0.84.4). With `path` the document is written there; otherwise the Pi default
     /// `cyrup-session-<basename>.html` (in the session cwd, basename = the session-file stem, else the
-    /// session id) is used. Returns the resolved output path. The rich per-tool HTML cards
-    /// (`export-html/tool-renderer.ts`) remain the one L5 residual; the document is a real transcript.
+    /// session id) is used. Returns the resolved output path.
+    ///
+    /// The document is the templated one pi ships (tree sidebar, markdown, highlighting, the user's
+    /// theme) — see [`crate::export`]. Its one residual is `renderedTools`, the pre-rendered
+    /// EXTENSION tool cards, which pi's own `exportFromFile` also omits.
     pub async fn export_to_html(
         &self,
         path: Option<&Path>,
@@ -87,7 +129,11 @@ impl AgentSession {
             guard.export_jsonl(&mut buf)?;
             String::from_utf8_lossy(&buf).into_owned()
         };
-        let html = crate::export::session_jsonl_to_html(&jsonl);
+        let html = crate::export::session_jsonl_to_html_with_theme(
+            &jsonl,
+            &self.export_theme(),
+            self.export_leaf_id().await.as_deref(),
+        );
         let out = match path {
             Some(p) => p.to_path_buf(),
             None => {

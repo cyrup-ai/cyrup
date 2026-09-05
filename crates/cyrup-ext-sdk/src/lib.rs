@@ -65,17 +65,18 @@ pub mod guest;
 mod tests;
 
 pub use api::{
-    ArgCompleter, CommandExec, ContentBlock, ExtensionApi, MarkdownTransformContext,
-    MarkdownTransformer, MessageRenderer, Outcome, RawOutcome, RegisteredCommand,
-    RegisteredRenderer, RegisteredShortcut, RegisteredTool, ShortcutExec, TerminalInputHandler,
-    TerminalInputResult, ToolExec, ToolOutput,
+    ArgCompleter, BashOperations, CommandExec, ContentBlock, ExtensionApi,
+    MarkdownTransformContext, MarkdownTransformer, MessageRenderer, Outcome, RawOutcome,
+    RegisteredCommand, RegisteredRenderer, RegisteredShortcut, RegisteredTool, RenderOptions,
+    ShortcutExec, TerminalInputHandler, TerminalInputResult, ToolExec, ToolOutput,
 };
 pub use autocomplete::{
     AutocompleteItem, AutocompleteProvider, AutocompleteQuery, AutocompleteSuggestions,
 };
 pub use ctx::{
-    CommandCtx, Ctx, ExecResult, ExtMode, HttpRequest, HttpResponse, HttpStreamResponse, Models,
-    NotifyKind, ProcSpawnOptions, ReplacedSessionContext, Session, Signal, ToolCall, Ui,
+    BashCommand, CommandCtx, Ctx, ExecResult, ExtMode, HttpRequest, HttpResponse,
+    HttpStreamResponse, Models, NotifyKind, ProcSpawnOptions, ReplacedSessionContext, Session,
+    Signal, ToolCall, Ui,
 };
 pub use descriptor::{
     CommandDescriptor, CompactOptions, ConstrainedSampling, ConstrainedSamplingConfig,
@@ -99,18 +100,18 @@ pub use widget::WidgetPlacement;
 /// instead of a downstream author's.
 pub mod prelude {
     pub use crate::api::{
-        ArgCompleter, CommandExec, ContentBlock, ExtensionApi, MarkdownTransformContext,
-        MarkdownTransformer, MessageRenderer, Outcome, RawOutcome, RegisteredCommand,
-        RegisteredRenderer, RegisteredShortcut, RegisteredTool, ShortcutExec, TerminalInputHandler,
-        TerminalInputResult, ToolExec, ToolOutput,
+        ArgCompleter, BashOperations, CommandExec, ContentBlock, ExtensionApi,
+        MarkdownTransformContext, MarkdownTransformer, MessageRenderer, Outcome, RawOutcome,
+        RegisteredCommand, RegisteredRenderer, RegisteredShortcut, RegisteredTool, RenderOptions,
+        ShortcutExec, TerminalInputHandler, TerminalInputResult, ToolExec, ToolOutput,
     };
     pub use crate::autocomplete::{
         AutocompleteItem, AutocompleteProvider, AutocompleteQuery, AutocompleteSuggestions,
     };
     pub use crate::ctx::{
-        CommandCtx, Ctx, ExecResult, ExtMode, HttpRequest, HttpResponse, HttpStreamResponse,
-        Models, NotifyKind, ProcSpawnOptions, ReplacedSessionContext, Session, Signal, ToolCall,
-        Ui,
+        BashCommand, CommandCtx, Ctx, ExecResult, ExtMode, HttpRequest, HttpResponse,
+        HttpStreamResponse, Models, NotifyKind, ProcSpawnOptions, ReplacedSessionContext, Session,
+        Signal, ToolCall, Ui,
     };
     pub use crate::descriptor::{
         CommandDescriptor, CompactOptions, ConstrainedSampling, ConstrainedSamplingConfig,

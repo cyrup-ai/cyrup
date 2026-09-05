@@ -13,6 +13,7 @@
 //! moved (`cyrup_ext::X` -> `crate::X`).
 
 mod aggregation;
+mod bash_operations_seam;
 mod capability_handle_ownership;
 mod command_dispatch;
 mod entry_renderer;

@@ -158,9 +158,129 @@ pub struct StartupReport {
 }
 
 impl StartupReport {
-    /// Pi `showListing` (`:1488`): `force || verbose || !quietStartup`. cyrup has no `force` (the
-    /// `/reload` re-emit is not ported), so `--verbose` is the only override — which is exactly what
-    /// `cli.rs`'s help text has been promising all along.
+    /// Assemble the panel's input from a live session — pi reads the same collaborators inside
+    /// `showLoadedResources` itself, so the report has to be derivable from a bare
+    /// [`cyrup_session_svc::AgentSession`] and nothing else (TUI-N02). The listing halves come
+    /// from the session's own resource snapshot / context store / extension host; the
+    /// diagnostics half comes from
+    /// `AgentSessionServices::startup_diagnostics`, which the builder retains instead of discarding
+    /// (`showLoadedResources`, `interactive-mode.ts:1693-1907` @v0.84.4).
+    ///
+    /// This lived in the binary (`crates/cyrup/src/interactive.rs::build_startup_report`) while the
+    /// panel had exactly one call site, the boot path. pi has two — boot
+    /// (`bindCurrentSessionExtensions`, `:1982`) and `/reload` (`handleReloadCommand`, `:5991`) —
+    /// and the second one is inside the run loop, which lives in this crate, so the builder moved
+    /// here with it.
+    ///
+    /// `install_extension_shortcuts` must already have run for this session: EXT-039's
+    /// reserved-key warnings are recorded by `resolve_shortcut_specs` and folded into
+    /// `extension_diagnostics` below, exactly as upstream orders `setupExtensionShortcuts` ahead of
+    /// `showLoadedResources` at both call sites (`:1981-1982`, `:5990-5991`).
+    pub fn from_session(session: &cyrup_session_svc::AgentSession, verbose: bool) -> Self {
+        use cyrup_resources::ResourceKind;
+        let services = session.services();
+        let home = Some(services.home.as_path());
+        let snapshot = services.context.snapshot();
+        Self {
+            verbose,
+            quiet_startup: services.settings.effective().quiet_startup(),
+            // Pi's `[Context]` list is the system-prompt source + appended prompts + the `AGENTS.md`
+            // chain, in load order (`:1551-1555`, `{sort: false}`).
+            // `formatContextPath` (interactive-mode.ts:1334-1343) tries the CWD-RELATIVE form FIRST
+            // and only falls back to display formatting:
+            //
+            //     const relativePath = getCwdRelativePath(absolutePath, cwd);
+            //     if (relativePath !== undefined) { return relativePath; }
+            //     return this.formatDisplayPath(absolutePath);
+            //
+            // Only the fallback leg was ported, so a project `AGENTS.md` INSIDE the cwd listed as
+            // `~/…` or as a full absolute path where pi lists it `AGENTS.md`.
+            // `cyrup_tools::path::cwd_relative_path` is the `getCwdRelativePath` port; it already
+            // existed and simply was not reached from here.
+            context_files: snapshot
+                .context_files
+                .iter()
+                .map(|f| {
+                    // Returned RAW, not posix-normalised: `formatContextPath` hands back
+                    // `relativePath` as-is. The `.split(sep).join("/")` fold belongs to
+                    // `formatPathRelativeToCwdOrAbsolute` (`utils/paths.ts:119-122`), a different
+                    // function that this call site does not use.
+                    cyrup_tools::path::cwd_relative_path(&f.path, &services.cwd).map_or_else(
+                        || display_path(&f.path, home),
+                        |rel| rel.display().to_string(),
+                    )
+                })
+                .collect(),
+            skills: services
+                .resources
+                .skills
+                .all()
+                .iter()
+                .map(|s| s.name.clone())
+                .collect(),
+            // Prompt templates list as their slash command (Pi `/${template.name}`, `:1596`).
+            prompts: services
+                .resources
+                .prompts
+                .all()
+                .iter()
+                .map(|p| format!("/{}", p.name))
+                .collect(),
+            extensions: services
+                .ext_host
+                .loaded_ids()
+                .iter()
+                .map(|id| id.to_string())
+                .collect(),
+            // Built-ins are excluded — Pi lists only themes with a `sourcePath` (`:1615`).
+            themes: services
+                .resources
+                .themes
+                .all()
+                .iter()
+                .filter(|t| t.origin_path.is_some())
+                .map(|t| t.data.name.clone())
+                .collect(),
+            skill_diagnostics: resource_diagnostics(
+                &services.startup_diagnostics.resources,
+                ResourceKind::Skill,
+                home,
+            ),
+            prompt_diagnostics: resource_diagnostics(
+                &services.startup_diagnostics.resources,
+                ResourceKind::Prompt,
+                home,
+            ),
+            // The whole extension vector, Pi-faithfully (`:1660-1665` maps every recorded error into
+            // the block). In practice only the NON-fatal entries — the project-trust skips — are
+            // reachable here: a genuine load failure is reported and exits 1 at
+            // `report_runtime_diagnostics`, well before this panel is built, exactly as Pi's
+            // `main.ts:843-849` precedes `InteractiveMode`.
+            // EXT-039 — the shortcut-resolution warnings join the load failures in the ONE
+            // `[Extension issues]` block, appended last, exactly as upstream folds
+            // `getShortcutDiagnostics()` in after the command diagnostics
+            // (`interactive-mode.ts:1884-1886` @v0.84.4).
+            extension_diagnostics: {
+                let mut diags =
+                    extension_diagnostics(&services.startup_diagnostics.extensions, home);
+                diags.extend(shortcut_diagnostics(
+                    &services.ext_host.shortcut_diagnostics(),
+                ));
+                diags
+            },
+            theme_diagnostics: resource_diagnostics(
+                &services.startup_diagnostics.resources,
+                ResourceKind::Theme,
+                home,
+            ),
+        }
+    }
+
+    /// Pi `showListing` (`:1702` @v0.84.4): `force || verbose || !quietStartup`. cyrup has no
+    /// `force` and does not need one — `force` is dead upstream at this tag, both of pi's call
+    /// sites passing `{force: false, showDiagnosticsWhenQuiet: true}` (`:1982`, `:5991-5994`) — so
+    /// `--verbose` is the only override, which is exactly what `cli.rs`'s help text has been
+    /// promising all along.
     pub fn show_listing(&self) -> bool {
         self.verbose || !self.quiet_startup
     }
@@ -232,6 +352,30 @@ pub fn extension_diagnostics(
                 DiagnosticSeverity::Error,
                 Some(display_path(&e.path, home)),
                 e.error.clone(),
+            )
+        })
+        .collect()
+}
+
+/// Project the extension-shortcut conflict warnings onto the panel's shape — EXT-039.
+///
+/// Upstream appends `extensionRunner.getShortcutDiagnostics()` to the SAME `extensionDiagnostics`
+/// vector the per-path load errors go into, immediately after the command diagnostics and just
+/// before the `[Extension issues]` block is rendered
+/// (`modes/interactive/interactive-mode.ts:1884-1886` @v0.84.4). Each is
+/// `{type: "warning", message, path: extensionPath}` (`extensions/runner.ts:549-553`), so they
+/// carry [`DiagnosticSeverity::Warning`] here and the load failures keep their `Error`.
+///
+/// [`cyrup_ext::ExtensionConflict::path`] is the extension ID, not a filesystem path — cyrup's
+/// stand-in for pi's `extensionPath` — so it is passed through verbatim rather than shortened.
+pub fn shortcut_diagnostics(conflicts: &[cyrup_ext::ExtensionConflict]) -> Vec<StartupDiagnostic> {
+    conflicts
+        .iter()
+        .map(|c| {
+            StartupDiagnostic::plain(
+                DiagnosticSeverity::Warning,
+                Some(c.path.to_string()),
+                c.message.clone(),
             )
         })
         .collect()

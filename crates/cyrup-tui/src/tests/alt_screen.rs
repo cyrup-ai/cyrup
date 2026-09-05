@@ -451,6 +451,48 @@ fn a_drag_and_release_yields_the_selected_text() {
     );
 }
 
+/// CFG-078 — pi `test/tui-alt-screen.test.ts:1003-1007` @v0.84.4: "leaves selections visible
+/// without copying when copyOnSelect is disabled".
+///
+/// The gate is `if (this.copyOnSelect) void this.copySelectionToClipboard();`
+/// (`packages/tui/src/tui-alt-screen.ts:1035`), so it withholds the COPY and nothing else: the
+/// anchor, the focus and the highlight are all still there afterwards, which is what makes the
+/// `Ctrl+X` fallback the CHANGELOG describes possible at all
+/// (`packages/coding-agent/docs/settings.md:72`).
+///
+/// Red before this change: `set_copy_on_select` did not exist, and with it stubbed to a no-op the
+/// release still answers `PointerOutcome::Copy`.
+#[test]
+fn copy_on_select_disabled_keeps_the_selection_and_withholds_the_copy() {
+    let (mut alt, _captured, area) = screen(20, 6, 10);
+    alt.draw(None).unwrap();
+    alt.set_copy_on_select(false);
+
+    alt.handle_mouse(&wheel(MouseEventKind::Down(MouseButton::Left), 0, 0), area);
+    alt.handle_mouse(&wheel(MouseEventKind::Drag(MouseButton::Left), 6, 0), area);
+    let outcome = alt.handle_mouse(&wheel(MouseEventKind::Up(MouseButton::Left), 6, 0), area);
+    assert_eq!(
+        outcome,
+        PointerOutcome::Handled,
+        "the release is still OURS — only the clipboard write is withheld"
+    );
+    assert!(
+        alt.selection_text().is_some(),
+        "the selection stays live so Ctrl+X / `/copy` can still reach it"
+    );
+
+    // Turning it back on mid-session is upstream's `setCopyOnSelect` (`tui-alt-screen.ts:246-248`),
+    // and the very next release copies again — no re-entry of the renderer needed.
+    alt.set_copy_on_select(true);
+    alt.handle_mouse(&wheel(MouseEventKind::Down(MouseButton::Left), 0, 0), area);
+    alt.handle_mouse(&wheel(MouseEventKind::Drag(MouseButton::Left), 6, 0), area);
+    let outcome = alt.handle_mouse(&wheel(MouseEventKind::Up(MouseButton::Left), 6, 0), area);
+    assert!(
+        matches!(outcome, PointerOutcome::Copy(ref text) if !text.is_empty()),
+        "with the setting back on the release copies again, got {outcome:?}"
+    );
+}
+
 /// pi `:1170` — "clears an active visible selection on focus loss", and `:1200` — a COMPLETED
 /// selection survives it. The two clears are different on purpose (`altscreen::selection`).
 #[test]

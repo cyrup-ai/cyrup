@@ -36,7 +36,7 @@ pub const MANIFEST_FILE: &str = "extension.json";
 pub struct ExtensionManifest {
     pub id: String,
     pub version: String,
-    /// WIT world compatibility, e.g. `cyrup:ext@0.8` (see [`HOST_WORLD`], which is the value a
+    /// WIT world compatibility, e.g. `cyrup:ext@0.10` (see [`HOST_WORLD`], which is the value a
     /// manifest written today should carry — this example rotted two bumps behind it once already).
     pub world: String,
     /// Source entry for a Tier-1 build; absent for a prebuilt `.wasm` package.
@@ -235,7 +235,22 @@ impl Capabilities {
 ///   host's FLOOR, not its ceiling. So bumping here would refuse every already-built 0.8 guest and
 ///   prevent nothing. The ABI fingerprint (`build/abi.rs`), not the version, is what stops a STALE
 ///   cached artifact being served across this edit.
-pub const HOST_WORLD: &str = "cyrup:ext@0.8";
+/// - 0.8 -> 0.9: EXPORT RE-SIGNING — `events.render-call` and `events.render-result` each gained a
+///   third parameter, `opts-json`, carrying the `(options, theme)` half of upstream's renderer
+///   signature (EXT-006; `MessageRenderer` `extensions/types.ts:1213-1217` @v0.84.4,
+///   `EntryRenderer` `:1219-1223`, `ToolDefinition.renderCall`/`renderResult` `:491-498`). This is
+///   the direction the gate DOES defend: a 0.8 guest exports the two-parameter shape, so without
+///   the bump it would pass [`ExtensionManifest::check_world`] and then die inside wasmtime on an
+///   opaque link error — the `f777e44` failure mode, verbatim. Nothing else moved in this batch.
+/// - 0.9 -> 0.10: EXPORT ADDITION — `events.bash-operations-exec` (DRIFT-004), the guest half of
+///   pi's `UserBashEventResult.operations` (`extensions/types.ts:1136-1142` @v0.84.4, the field at
+///   `:1139`; the `BashOperations` interface at `core/tools/bash.ts:63-81`, its `exec` signature at
+///   `:71-80`). A new export is the same fails-to-LINK direction as a re-signed one — a 0.9 guest
+///   exports nothing under that name — so it takes the bump on its own. Its declaring import
+///   `registration.register-bash-operations` and the `host-bash` interface carrying pi's two
+///   closure-shaped `exec` options (`emit-bash-output` for `onData`, `is-bash-cancelled` for
+///   `signal`) are ADDITIVE imports and would not have required a bump on their own.
+pub const HOST_WORLD: &str = "cyrup:ext@0.10";
 
 impl ExtensionManifest {
     /// Parse from JSON bytes.

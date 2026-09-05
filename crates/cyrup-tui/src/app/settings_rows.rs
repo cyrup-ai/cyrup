@@ -294,9 +294,11 @@ pub(crate) fn settings_rows(
         // and both settings keys hold strings — so the row `id` IS the settings key
         // `EffectiveSettings::tui_mode` / `::fullscreen_scrollbar` reads back.
         //
-        // Pi's third row of that group, `fullscreen-exit-output` (`:678-684`), is deliberately
-        // absent: the `fullscreenExitOutput` key does not exist at v0.84.1, the tag ADR-0005 §A-3
-        // ports, so cyrup has no getter for it and offering the row would invent a config surface.
+        // CFG-078 — that third row, `fullscreen-exit-output` (`settings-selector.ts:680-686`
+        // @v0.84.4), and the fourth, `fullscreen-copy-on-select` (`:694-700`), are now BOTH here.
+        // They were withheld while this file was measured against v0.84.1, where neither settings
+        // key existed; both are v0.84.4 additions (`settings-manager.ts:143`, `:145`) and
+        // `EffectiveSettings` has their getters.
         //
         // PLACEMENT — upstream has this pair immediately BEFORE its `theme` row, i.e. last. cyrup
         // hoisted `theme` to row 0 long ago (`crates/cyrup-tui/src/tests/selector_wiring.rs:221`
@@ -322,6 +324,29 @@ pub(crate) fn settings_rows(
             choices(&["auto", "always", "hidden"]),
         )
         .with_description("Scrollbar behavior in fullscreen mode; has no effect in regular mode"),
+        // CFG-078. pi's row ORDER inside this group is `tui-mode`, `fullscreen-exit-output`,
+        // `fullscreen-scrollbar`, `fullscreen-copy-on-select` (`settings-selector.ts:673-700`).
+        // cyrup appends the two new ones after the pair that already shipped rather than splicing
+        // one between them: `crates/cyrup-tui/src/tests/selector_wiring.rs` pins positions, and the
+        // group's own relative order is what the placement note above committed to preserving —
+        // which appending does for everything that was already here.
+        SettingRow::choice(
+            "fullscreenExitOutput",
+            "Fullscreen exit output",
+            eff.fullscreen_exit_output().as_str(),
+            choices(&["transcript", "resume-hint"]),
+        )
+        .with_description(
+            "Print the transcript or only a session resume hint when exiting fullscreen mode",
+        ),
+        SettingRow::toggle(
+            "fullscreenCopyOnSelect",
+            "Fullscreen copy on select",
+            eff.fullscreen_copy_on_select(),
+        )
+        .with_description(
+            "Automatically copy selected text in fullscreen mode; disable to copy selections with Ctrl+X",
+        ),
     ]);
     rows
 }

@@ -653,18 +653,25 @@ pub struct BashExecOptions<'a> {
 ///
 /// [CYRUP-DELTA, mechanism] A WASM guest cannot RETURN an implementation of this trait: ADR-0002
 /// (`docs/adr/ADR-0002-extension-io-is-serde.md`, rule 4) makes extension I/O values rather than
-/// references, so the guest half of `UserBashEventResult.operations` needs a registration import plus
-/// a keyed dispatch export in `crates/cyrup-ext/wit/world.wit` before an extension can supply one.
-/// That round-trip is NOT built yet; the register entry naming its cost lives in
-/// `crates/cyrup-ext/src/lib.rs` (DRIFT-004 / SEAM-015). This trait is the host-side half and is
-/// complete: any in-host caller — the isolation decorators (arch-12), a future keyed guest proxy —
-/// can already supply one.
+/// references, so the guest half of `UserBashEventResult.operations` is a registration import plus a
+/// keyed dispatch export in `crates/cyrup-ext/wit/world.wit`. That round-trip IS built (DRIFT-004,
+/// `cyrup:ext@0.10`): `registration.register-bash-operations` declares a guest backend,
+/// `events.bash-operations-exec` runs one command through it, and pi's two closure-shaped `exec`
+/// options come back over `host-bash.emit-bash-output` / `is-bash-cancelled`. The host holds a
+/// `cyrup_ext::host::GuestBashOperations` — an implementation of THIS trait that forwards to that
+/// export — so this seam's callers cannot tell the two tiers apart.
+///
+/// A NATIVE extension CAN supply one, over the same native-only tier `RenderedComponent` uses:
+/// `cyrup_ext::NativeExtension::user_bash_operations` is consulted on the extension whose
+/// `user_bash` result won the reduction, and `AgentSession::execute_bash_with_user_event` writes
+/// what it returns into `BashOptions::operations` — upstream's `operations: eventResult?.operations`
+/// (`modes/rpc/rpc-mode.ts:581`, `modes/interactive/interactive-mode.ts:6524` @v0.84.4).
 ///
 /// The CONSUMER side is built as well: `cyrup_session_svc::BashOptions::operations` carries an
 /// `Arc<dyn BashOperations>` through `execute_bash_with_user_event` into `execute_bash`, which
 /// resolves pi's `options?.operations ?? createLocalBashOperations({ shellPath })`
 /// (`agent-session.ts:2782`) and routes the whole sanitize/buffer/spill pipeline over whichever
-/// backend won. The one remaining half of DRIFT-004 / SEAM-015 is the guest round-trip above.
+/// backend won.
 #[async_trait::async_trait]
 pub trait BashOperations: Send + Sync {
     /// Execute `command` in `cwd`, streaming combined stdout+stderr to `opts.on_data`.

@@ -75,7 +75,11 @@ fn payload_hash(payload_json: &str) -> String {
 }
 
 /// Lowercase hex, matching node's `digest("hex")`. A local helper rather than a `hex` crate edge.
-fn hex(bytes: &[u8]) -> String {
+///
+/// `pub(super)` because `super::extensions::scoped_extension_state_namespace` needs the SAME
+/// encoding for `sha256(scopeId)` (`v0.13.0 broker/broker.ts:160`); a second copy of it would be a
+/// second place for the persistence key to drift.
+pub(super) fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     bytes
         .iter()

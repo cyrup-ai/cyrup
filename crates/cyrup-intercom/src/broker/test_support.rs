@@ -14,6 +14,7 @@ use tokio::sync::Notify;
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use super::frame::FrameOutcome;
+use super::routing::SessionKey;
 use super::state::BrokerState;
 
 /// A process-unique extension-state directory for a test broker. Never the real
@@ -35,21 +36,30 @@ pub(super) fn make_tx() -> UnboundedSender<Vec<u8>> {
     tx
 }
 
+/// Register `id` on `conn_id`, in `scope` (ICOM-055) or unscoped when `None`.
+///
+/// `scopeId` is emitted only when `Some`, so an unscoped registration produces exactly the frame
+/// this fixture produced before scopes existed — the same conditional spread upstream's client uses
+/// (`...(scopeId ? { scopeId } : {})`, `v0.13.0 broker/client.ts:291`).
 pub(super) fn register(
     state: &mut BrokerState,
     conn_id: u64,
-    session_id: &mut Option<String>,
+    session_key: &mut Option<SessionKey>,
     id: &str,
+    scope: Option<&str>,
 ) {
     let tx = make_tx();
-    let value = json!({
+    let mut value = json!({
         "type": "register",
         "sessionId": id,
         "session": {
             "cwd": "/tmp", "model": "test-model", "pid": 1, "startedAt": 0, "lastActivity": 0,
         }
     });
-    let result = state.handle_register(conn_id, &tx, &value, session_id, 0);
+    if let Some(scope) = scope {
+        value["scopeId"] = json!(scope);
+    }
+    let result = state.handle_register(conn_id, &tx, &value, session_key, 0);
     assert!(matches!(result.outcome, FrameOutcome::Continue));
 }
 
@@ -75,21 +85,40 @@ pub(super) fn payloads(
 pub(super) fn register_named(
     state: &mut BrokerState,
     conn_id: u64,
-    session_id: &mut Option<String>,
+    session_key: &mut Option<SessionKey>,
     tx: &UnboundedSender<Vec<u8>>,
     id: &str,
     name: &str,
     cwd: &str,
     now: u64,
 ) {
-    let value = json!({
+    register_named_in_scope(state, conn_id, session_key, tx, id, name, cwd, None, now);
+}
+
+/// [`register_named`] with an explicit routing scope (ICOM-055).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn register_named_in_scope(
+    state: &mut BrokerState,
+    conn_id: u64,
+    session_key: &mut Option<SessionKey>,
+    tx: &UnboundedSender<Vec<u8>>,
+    id: &str,
+    name: &str,
+    cwd: &str,
+    scope: Option<&str>,
+    now: u64,
+) {
+    let mut value = json!({
         "type": "register",
         "sessionId": id,
         "session": {
             "name": name, "cwd": cwd, "model": "m", "pid": 1, "startedAt": 0, "lastActivity": 0,
         }
     });
-    let result = state.handle_register(conn_id, tx, &value, session_id, now);
+    if let Some(scope) = scope {
+        value["scopeId"] = json!(scope);
+    }
+    let result = state.handle_register(conn_id, tx, &value, session_key, now);
     assert!(matches!(result.outcome, FrameOutcome::Continue));
 }
 
@@ -97,7 +126,7 @@ pub(super) fn send_frame(
     state: &mut BrokerState,
     conn_id: u64,
     tx: &UnboundedSender<Vec<u8>>,
-    sid: &mut Option<String>,
+    sid: &mut Option<SessionKey>,
     to: &str,
     message: serde_json::Value,
     now: u64,

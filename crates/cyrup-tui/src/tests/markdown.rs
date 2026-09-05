@@ -2034,12 +2034,14 @@ fn m7_inline_formatting_survives_inside_a_table_cell() {
     // CELL. Before this batch the suffix was pushed onto the row buffer and came out fused to the
     // grid's top border.
     let linked = "| Ref |\n|-----|\n| [doc](https://ex.com) |";
-    // Pinned to the incapable branch: the ` (url)` suffix exists ONLY there (`markdown.ts:544-554`
-    // @v0.83.0), so leaving this to the ambient `TERM_PROGRAM` made the assertion a property of the
-    // developer's terminal rather than of the renderer. Upstream pins the same way for the same
-    // reason, in this very table block — `packages/tui/test/markdown.test.ts:469-470` @v0.83.0,
-    // "Pin to no-hyperlinks so width checks work on plain text without OSC 8 sequences." The rest
-    // of this file already honours that convention (see the note at `:132-134`).
+    // Pinned to the incapable branch: the ` (url)` suffix exists ONLY there
+    // (`markdown.ts:696-707` @v0.84.4, the same arm as `:544-554` @v0.83.0 — the body is unchanged
+    // between the tags, only its line numbers moved), so leaving this to the ambient `TERM_PROGRAM`
+    // made the assertion a property of the developer's terminal rather than of the renderer.
+    // Upstream pins the same way for the same reason, in this very table block —
+    // `packages/tui/test/markdown.test.ts:597-598` @v0.84.4 (`:469-470` @v0.83.0), "Pin to
+    // no-hyperlinks so width checks work on plain text without OSC 8 sequences." The rest of this
+    // file already honours that convention (see the note at `:181-183`).
     let plain = render_markdown_with_hyperlinks(linked, 40, &theme, false);
     let lr = rows(&plain);
     assert!(
@@ -2064,8 +2066,8 @@ fn m7_inline_formatting_survives_inside_a_table_cell() {
 
     // MIRROR — the OSC-8 branch, which used to be whichever one the host happened to provide.
     // Upstream prints the link text alone there, "regardless of whether it matches href"
-    // (`markdown.ts:540-543` @v0.83.0), so the cell holds `doc`, the column is 3 wide, and nothing
-    // leaks onto the frame on this branch either.
+    // (`markdown.ts:692-695` @v0.84.4, `:540-543` @v0.83.0), so the cell holds `doc`, the column is
+    // 3 wide, and nothing leaks onto the frame on this branch either.
     let cap = rows(&render_markdown_with_hyperlinks(linked, 40, &theme, true));
     assert!(
         cap.iter().any(|l| l.starts_with('┌')),

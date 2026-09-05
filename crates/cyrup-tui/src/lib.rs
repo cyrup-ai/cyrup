@@ -112,7 +112,9 @@ mod user_message_selector;
 #[cfg(test)]
 mod tests;
 
-pub use altscreen::{AltScreen, PointerOutcome, ScrollbarMode, TuiRenderMode, ViewportRenderer};
+pub use altscreen::{
+    AltScreen, FullscreenExitOutput, PointerOutcome, ScrollbarMode, TuiRenderMode, ViewportRenderer,
+};
 pub use app::{
     App, AppAction, AppCommand, AppState, CompactionQueued, ExtensionWidget, ImplicitTrustReload,
     InlineBackend, LifecycleEffects, LifecycleOutcome, LoginProviderSource, MainScreenRenderState,
@@ -165,11 +167,11 @@ pub use image::{
     reset_capabilities_cache, seed_capabilities, seed_hyperlink_support, set_capabilities,
 };
 pub use keyboard_protocol::{
-    KITTY_FLAGS_QUERY, KeyboardProtocol, MODIFY_OTHER_KEYS_DISABLE, MODIFY_OTHER_KEYS_ENABLE,
-    NEGOTIATION_TIMEOUT, NegotiationSequence, current as keyboard_protocol,
-    decide as decide_keyboard_protocol, find_kitty_flags, is_negotiation_prefix,
-    negotiate as negotiate_keyboard_protocol, parse_negotiation_sequence,
-    set_current as set_keyboard_protocol,
+    DESIRED_FLAGS as KITTY_DESIRED_FLAGS, KITTY_FLAGS_QUERY, KeyboardProtocol,
+    MODIFY_OTHER_KEYS_DISABLE, MODIFY_OTHER_KEYS_ENABLE, NEGOTIATION_TIMEOUT, NegotiationSequence,
+    current as keyboard_protocol, decide as decide_keyboard_protocol, find_kitty_flags,
+    is_negotiation_prefix, negotiate as negotiate_keyboard_protocol, parse_negotiation_sequence,
+    push_flags as push_kitty_flags, set_current as set_keyboard_protocol,
 };
 pub use keymap::{
     Action, AltScreenAction, AltScreenKeymap, AutocompleteAction, AutocompleteKeymap, EditorAction,
@@ -211,7 +213,7 @@ pub use settings_selector::{FIELD_SEP, SettingRow, SettingsSelector, TrustSelect
 pub use startup::{
     DiagnosticCollision, DiagnosticSeverity, StartupDiagnostic, StartupLine, StartupReport,
     StartupRole, StartupSpan, build_startup_lines, display_path, extension_diagnostics,
-    resource_diagnostics,
+    resource_diagnostics, shortcut_diagnostics,
 };
 pub use startup_selector::run_startup_selector;
 pub use status::{

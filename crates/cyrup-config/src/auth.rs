@@ -441,6 +441,124 @@ impl AuthStore {
     }
 }
 
+/// The file-backed [`cyrup_provider::CredentialStore`] this module's header has always claimed —
+/// pi's `CredentialStore` contract (`ai/src/auth/types.ts:60-90` @v0.84.4) over `auth.json`.
+///
+/// Until DRIFT-053 the trait had exactly one implementation in the workspace
+/// ([`cyrup_provider::InMemoryCredentialStore`]), so every caller that needed request-time auth
+/// resolution outside the streaming path — `cyrup auth print-api-key`
+/// (`crates/cyrup/src/credential_print.rs`) and now the `/share` Radius upload — had to SEED an
+/// in-memory store from this one and throw the result away. That is fine for a read-only print and
+/// wrong for anything that can trigger an OAuth refresh: [`cyrup_provider::resolve_provider_auth`]
+/// rotates the token by calling `modify` on the store it was handed
+/// (`ai/src/auth/resolve.ts:117-149`), and a refresh whose new `refresh` token is written to a
+/// discarded in-memory map leaves `auth.json` holding a refresh token the provider has already
+/// invalidated. Implementing the trait here routes that write back through the SAME
+/// cross-process-locked, atomic [`AuthStore::modify`] a login uses.
+///
+/// The two `Credential` enums are field-identical (`api_key { key, env }` / `oauth { refresh,
+/// access, expires, ..ext }`, and `ProviderEnv` is the same `BTreeMap<String, String>`), so the
+/// conversions below are total and lossless in both directions — there is no fallible arm to
+/// mis-handle.
+#[async_trait::async_trait]
+impl cyrup_provider::CredentialStore for AuthStore {
+    async fn read(
+        &self,
+        provider: &ProviderId,
+    ) -> Result<Option<cyrup_provider::Credential>, cyrup_provider::AuthError> {
+        AuthStore::read(self, provider)
+            .await
+            .map(|c| c.map(to_provider_credential))
+            .map_err(|e| store_error(provider, e))
+    }
+
+    async fn list(&self) -> Result<Vec<CredentialInfo>, cyrup_provider::AuthError> {
+        // `list_credentials` is already the `{ providerId, type }` view the trait specifies, and it
+        // never resolves a `!command` api-key value — pi: "Implementations must not execute
+        // configured API-key commands while listing" (`ai/src/auth/types.ts:69-70`).
+        self.list_credentials()
+            .map_err(|e| store_error(&ProviderId::from(""), e))
+    }
+
+    async fn modify(
+        &self,
+        provider: &ProviderId,
+        f: cyrup_provider::ModifyFn,
+    ) -> Result<Option<cyrup_provider::Credential>, cyrup_provider::AuthError> {
+        // The closure runs INSIDE `AuthStore::modify`, i.e. under both the per-provider mutex and
+        // the cross-process file lock, which is the whole contract: "The OAuth refresh MUST happen
+        // inside `f` so concurrent requests/processes cannot double-refresh a rotated token".
+        let provider_for_err = provider.clone();
+        AuthStore::modify(self, provider, |current| async move {
+            let next = f(current.map(to_provider_credential))
+                .await
+                .map_err(|e| AuthError::Oauth(e.to_string()))?;
+            Ok(next.map(from_provider_credential))
+        })
+        .await
+        .map(|c| c.map(to_provider_credential))
+        .map_err(|e| store_error(&provider_for_err, e))
+    }
+
+    async fn delete(&self, provider: &ProviderId) -> Result<(), cyrup_provider::AuthError> {
+        AuthStore::delete(self, provider)
+            .await
+            .map_err(|e| store_error(provider, e))
+    }
+}
+
+/// [`AuthError`] → [`cyrup_provider::AuthError`], preserving pi's R-01-017 taxonomy split: a
+/// refresh failure stays `oauth` (the code that tells a caller the stored credential is intact and
+/// re-login is the fix), everything else is a store failure.
+fn store_error(provider: &ProviderId, e: AuthError) -> cyrup_provider::AuthError {
+    match e {
+        AuthError::Oauth(_) => cyrup_provider::AuthError::OAuth {
+            provider: provider.clone(),
+            cause: Box::new(e),
+        },
+        _ => cyrup_provider::AuthError::Store {
+            provider: provider.clone(),
+            cause: Box::new(e),
+        },
+    }
+}
+
+/// [`Credential`] → [`cyrup_provider::Credential`]. Total: the variants and their fields match.
+fn to_provider_credential(cred: Credential) -> cyrup_provider::Credential {
+    match cred {
+        Credential::ApiKey { key, env } => cyrup_provider::Credential::ApiKey { key, env },
+        Credential::Oauth {
+            refresh,
+            access,
+            expires,
+            ext,
+        } => cyrup_provider::Credential::Oauth {
+            refresh,
+            access,
+            expires,
+            ext,
+        },
+    }
+}
+
+/// The inverse of [`to_provider_credential`], for the value a `modify` closure returns.
+fn from_provider_credential(cred: cyrup_provider::Credential) -> Credential {
+    match cred {
+        cyrup_provider::Credential::ApiKey { key, env } => Credential::ApiKey { key, env },
+        cyrup_provider::Credential::Oauth {
+            refresh,
+            access,
+            expires,
+            ext,
+        } => Credential::Oauth {
+            refresh,
+            access,
+            expires,
+            ext,
+        },
+    }
+}
+
 /// Current unix time in milliseconds (OAuth `expires` is an epoch-ms timestamp, like `Date.now()`).
 fn unix_millis() -> i64 {
     std::time::SystemTime::now()

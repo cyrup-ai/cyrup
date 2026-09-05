@@ -24,7 +24,7 @@ impl TranscriptView {
         name: impl Into<String>,
         call_id: Option<String>,
         args: Value,
-        rendered: Option<String>,
+        rendered: Option<RenderedText>,
     ) {
         self.push_tool_start_defined(name, call_id, args, rendered, None);
     }
@@ -43,7 +43,7 @@ impl TranscriptView {
         name: impl Into<String>,
         call_id: Option<String>,
         args: Value,
-        rendered: Option<String>,
+        rendered: Option<RenderedText>,
         definition: Option<ToolRenderKind>,
     ) {
         self.bump_render_generation();
@@ -154,7 +154,7 @@ impl TranscriptView {
         call_id: Option<&str>,
         is_error: bool,
         result: Option<Value>,
-        rendered: Option<String>,
+        rendered: Option<RenderedText>,
     ) {
         self.bump_render_generation();
         let name = name.into();

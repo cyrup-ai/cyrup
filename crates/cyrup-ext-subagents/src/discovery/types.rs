@@ -1170,11 +1170,11 @@ pub struct AgentDefinition {
     /// via [`crate::exec::permissions::resolve_permission_rules`] — this field alone is NOT the
     /// effective policy, only this agent's contribution to it.
     pub permission_rules: Option<crate::watchdog::permission_arbiter::PermissionRules>,
-    /// SUBA-074 — the agent's declared execution runner (`agents.ts:121` @v0.57.0), already
+    /// SUBA-074 — the agent's declared execution runner (`agents.ts:131` @v0.64.0), already
     /// validated (`discovery/frontmatter.rs`). `None` and `Some(AgentRunnerConfig::Pi)` both mean
-    /// "the native child this crate spawns"; any other value is a profile cyrup cannot yet honour
-    /// and must REFUSE rather than downgrade — see
-    /// [`crate::runner::AgentRunnerConfig::refusal_reason`].
+    /// "the native child this crate spawns"; every other value is EITHER executed as a foreign
+    /// process or REFUSED, never downgraded — the three-way decision is
+    /// [`crate::runner::dispatch::resolve_runner_dispatch`].
     pub runner: Option<crate::runner::AgentRunnerConfig>,
     pub disabled: Option<bool>,
     /// The agent's own frontmatter-body prose, prior to any orchestrator-injected scaffolding

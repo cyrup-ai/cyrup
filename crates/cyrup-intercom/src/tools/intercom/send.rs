@@ -283,7 +283,9 @@ impl IntercomTool {
         // `v0.10.1 index.ts:2054-2060`: `{ messageId, delivered: true, ...(effectiveReplyTo
         // ? { replyTo: effectiveReplyTo } : {}) }` — the spread means `replyTo` is OMITTED,
         // not null, when the send was not a reply.
-        let mut details = serde_json::json!({ "messageId": result.id, "delivered": true });
+        // ICOM-054 — `details: { ...deliveryDetails(result), … }` (`v0.13.0 index.ts:2373`), which
+        // replaced the bare `{ messageId, delivered: true }` pair.
+        let mut details = crate::tools::delivery_details(&result);
         if let Some(reply_to) = &effective_reply_to
             && let Some(map) = details.as_object_mut()
         {

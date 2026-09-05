@@ -56,7 +56,8 @@ pub use api::{
 pub use auth::{
     ApiKeyAuth, AuthContext, AuthOverrides, AuthResult, Credential, CredentialInfo,
     CredentialStore, CredentialType, EnvAuthContext, InMemoryCredentialStore, ModelAuth, ModifyFn,
-    OAuthAuth, ProviderAuth, ProviderEnv, env_key, keyless_local, resolve_provider_auth,
+    OAuthAuth, ProviderAuth, ProviderEnv, auth_credential, env_key, keyless_local,
+    resolve_provider_auth,
 };
 pub use cache_stats::{
     CACHE_TTL_MS, CacheMiss, CacheScan, CacheScanEntry, CacheWasteTotals, ModelPriceSource,

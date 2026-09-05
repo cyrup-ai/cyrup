@@ -21,6 +21,17 @@ impl<B: Backend> App<B> {
         self.login_providers = Some(source);
     }
 
+    /// Override the gateway `/share`'s Radius upload posts to (default: pi's hardcoded
+    /// `DEFAULT_RADIUS_GATEWAY`, `session-share.ts:112`). DRIFT-053.
+    ///
+    /// The same offline-test seam as [`Self::set_login_provider_source`] and mandated by the same
+    /// convention: pointed at a local address, a test can assert that a session holding a radius
+    /// credential takes the Radius path and never shells `gh` — the item's Verify line — without
+    /// any request leaving the machine. Production never calls it.
+    pub fn set_radius_share_gateway(&mut self, gateway: impl Into<String>) {
+        self.radius_gateway = Some(gateway.into());
+    }
+
     /// `this.session.modelRuntime.getProviders()` + `getProviderAuthStatus` + `isUsingOAuth`, the
     /// three registry reads `getLoginProviderOptions` folds together
     /// (`interactive-mode.ts:4943-4947`).

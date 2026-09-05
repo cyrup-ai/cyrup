@@ -12,7 +12,7 @@ use crate::error::AuthError;
 use crate::model::Model;
 use std::sync::Arc;
 
-pub use helpers::{env_key, keyless_local};
+pub use helpers::{auth_credential, env_key, keyless_local};
 pub use oauth::{
     AuthEvent, AuthInfoLink, AuthInteraction, AuthPrompt, AuthPromptKind, AuthSelectOption,
     CallbackServer, CallbackServerConfig, OAuthError, Pkce, generate_pkce, oauth_credential,

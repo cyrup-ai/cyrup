@@ -52,11 +52,10 @@ impl App<InlineBackend<Stdout>> {
         enable_raw_mode()?;
         let mut out = io::stdout();
         out.execute(ratatui::crossterm::event::EnableBracketedPaste)?;
-        // Kitty keyboard protocol where supported; ignore failure (legacy terminals).
-        let _ = execute!(
-            out,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        );
+        // Kitty keyboard protocol where supported; ignore failure (legacy terminals). The flag
+        // set is `crate::keyboard_protocol::DESIRED_FLAGS` — Pi's `CSI > 7 u` (`terminal.ts:15`)
+        // minus `REPORT_EVENT_TYPES`, a `[CYRUP-DELTA]` that module's docs argue in full (TUI-046).
+        let _ = crate::keyboard_protocol::push_flags(&mut out);
         // …and then ASK whether the push took, instead of assuming it did (Pi
         // `queryAndEnableKittyProtocol`, `tui/src/terminal.ts:213-226`). The query has to follow the
         // push — `CSI ? u` reports the top of the terminal's flag stack — and it has to run HERE:
@@ -139,10 +138,7 @@ impl App<InlineBackend<Stdout>> {
         enable_raw_mode()?;
         let mut out = io::stdout();
         let _ = out.execute(ratatui::crossterm::event::EnableBracketedPaste);
-        let _ = execute!(
-            out,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        );
+        let _ = crate::keyboard_protocol::push_flags(&mut out);
         let _ = self.terminal.clear();
         self.draw_synchronized()
     }
@@ -238,10 +234,7 @@ impl App<InlineBackend<Stdout>> {
         enable_raw_mode()?;
         let mut out = io::stdout();
         let _ = out.execute(ratatui::crossterm::event::EnableBracketedPaste);
-        let _ = execute!(
-            out,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        );
+        let _ = crate::keyboard_protocol::push_flags(&mut out);
         let _ = self.terminal.clear();
         Ok(result)
     }

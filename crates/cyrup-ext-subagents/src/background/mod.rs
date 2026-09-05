@@ -36,6 +36,7 @@ pub mod cascade;
 pub mod child_identity;
 pub mod child_stop;
 pub mod control;
+pub mod flat_index;
 pub mod parent_anchor;
 pub mod reconcile;
 pub mod runner_main;
@@ -806,12 +807,23 @@ impl StepStatus {
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ParallelGroupStatus {
-    /// Index of the owning `ParallelGroup`/`DynamicGroup` step within the run's overall step
-    /// list.
+    /// The FLAT index the owning group starts at in [`RunStatus::steps`] — pi's `group.start`
+    /// (`subagent-runner.ts:2621,2657` @v0.64.0).
+    ///
+    /// SUBA-093 changed what this number means: `RunStatus::steps` now carries one entry per
+    /// `ParallelGroup` MEMBER rather than one entry for the whole group, so this is the group's
+    /// base slot, not its position in the run's `RunnerStep` list. Nothing outside
+    /// [`crate::background::runner_main`]'s own terminal sweeps reads it, and those compare it
+    /// against a flat cursor, so the two moved together.
     pub group_step_index: usize,
     /// Status of each concurrently-dispatched child within this group, in fixed dispatch-order
     /// (R-SA-051: result/status ordering is always preserved, never reordered by completion
     /// order).
+    ///
+    /// A settled-detail record, written once when the group finishes. For a `ParallelGroup` the
+    /// LIVE per-member status is in [`RunStatus::steps`] itself after SUBA-093 — this vector
+    /// remains for the consumers (`registration::cost`, `background::tracker`,
+    /// `tui::fleet_status`) that already walk it.
     pub children: Vec<StepStatus>,
 }
 
@@ -2309,7 +2321,14 @@ pub fn workflow_graph_from_run(
     let mut step_statuses: Vec<WorkflowStepStatusInput> = Vec::new();
 
     for (index, step) in steps.iter().enumerate() {
-        let step_status = status.steps.get(index);
+        // SUBA-093 — `status.steps` is FLAT (one entry per child), so a top-level step's own entry
+        // is at its flat base, not at its position in `steps`. pi keys its graph nodes on the same
+        // value (`node.flatIndex` → `statusPayload.steps[node.flatIndex]`,
+        // `subagent-runner.ts:2847-2854` @v0.64.0). A group node therefore still reports its FIRST
+        // member's state, which is the same single word the collapsed group entry used to carry.
+        let step_status = status
+            .steps
+            .get(crate::background::flat_index::flat_base(steps, index));
         let status_str = step_status.map(|s| match s.status {
             StepState::Pending => "pending",
             StepState::Running => "running",
@@ -2752,6 +2771,8 @@ mod tests {
             output_truncated: false,
             control_events: Vec::new(),
             progress: None,
+            runner: None,
+            external_process: None,
         };
         let mut bad = ok.clone();
         bad.agent = "writer".to_string();

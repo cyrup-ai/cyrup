@@ -547,3 +547,58 @@ fn every_subscribed_at_citation_names_the_event_pi_subscribes_on_that_line() {
         wrong.join("\n"),
     );
 }
+
+/// EXT-006 / DRIFT-004 review fix — the SHIPPED DOCUMENTATION is a third declaration of the world
+/// version, and until now nothing tied it to `HOST_WORLD`.
+///
+/// Two bumps in one batch (`0.8 -> 0.9 -> 0.10`) left `docs/guide/extensions/authoring.md`'s sample
+/// manifest telling authors to write `"world": "cyrup:ext@0.8"` — a value
+/// [`crate::ExtensionManifest::check_world`] REFUSES with [`crate::ExtError::WorldVersion`], because
+/// the gate demands `gmin >= hmin`. A guide that hands the reader a manifest the host rejects is
+/// worse than no guide, and the in-tree fixtures could not catch it: they interpolate `HOST_WORLD`.
+///
+/// So every `cyrup:ext@…` literal in the author-facing documents is compared to `HOST_WORLD` here.
+/// A future bump either updates these files or fails this test. The `PATCH` component is ignored
+/// for the same reason the `package`-line tie ignores it: `check_world` compares MAJOR and MINOR.
+#[test]
+fn the_authoring_docs_declare_the_current_host_world() {
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for rel in [
+        "docs/guide/extensions/authoring.md",
+        "docs/guide/extensions/overview.md",
+        "README.md",
+    ] {
+        let path = repo.join(rel);
+        let src = read(&path);
+        let mut seen = 0usize;
+        let mut rest = src.as_str();
+        while let Some(at) = rest.find("cyrup:ext@") {
+            let tail = &rest[at + "cyrup:ext@".len()..];
+            let end = tail
+                .find(|c: char| !c.is_ascii_digit() && c != '.')
+                .unwrap_or(tail.len());
+            let ver = tail[..end].trim_end_matches('.');
+            let mut parts = ver.split('.');
+            let major_minor = format!(
+                "cyrup:ext@{}.{}",
+                parts.next().unwrap_or(""),
+                parts.next().unwrap_or("")
+            );
+            assert_eq!(
+                major_minor,
+                crate::HOST_WORLD,
+                "{rel} documents `cyrup:ext@{ver}` but the host gate is {} — an author who copies \
+                 that manifest gets `ExtError::WorldVersion`, since `check_world` requires the same \
+                 MAJOR and a MINOR at least the host's",
+                crate::HOST_WORLD,
+            );
+            seen += 1;
+            rest = &tail[end..];
+        }
+        assert!(
+            seen > 0,
+            "{rel} no longer names the world at all — the sample manifest and the compatibility \
+             rule are what this guard exists to keep honest"
+        );
+    }
+}

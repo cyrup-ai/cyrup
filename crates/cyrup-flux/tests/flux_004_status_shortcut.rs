@@ -4,9 +4,10 @@
 //! on both sides (pi `packages/tui/src/keybindings.ts:86-89` @v0.84.4 `["right", "ctrl+f"]`;
 //! cyrup `crates/cyrup-tui/src/keymap.rs` `impl Default for EditorKeymap`). The extension-shortcut
 //! tier is consulted BEFORE the editor (`crates/cyrup-tui/src/app/input.rs`), so the chord took
-//! forward-char away from every emacs-motion user on a default install — with no diagnostic (the
-//! host never calls `ExtensionRegistry::resolve_shortcuts`, EXT-039's open residual) and no rebind
-//! path (an extension shortcut is not a `Keybinding`). Upstream `flux_bootstrap/` @v0.0.40
+//! forward-char away from every emacs-motion user on a default install — with no diagnostic (at the
+//! time nothing called `ExtensionRegistry::resolve_shortcuts`, EXT-039's residual, since closed by
+//! `App::install_extension_shortcuts`) and no rebind path (an extension shortcut is not a
+//! `Keybinding`). Upstream `flux_bootstrap/` @v0.0.40
 //! registers no keybinding at all, so the chord is a cyrup design choice with no upstream line to
 //! copy; the invariant it must satisfy is "bound by no default keymap", and that is what these
 //! tests check against the REAL default tables rather than a hand-copied list.
@@ -108,7 +109,9 @@ fn the_status_shortcut_is_bound_by_no_default_keymap() {
 /// The registry-side rule that WOULD have flagged the old chord had the host called it (pi
 /// `getShortcuts` rule 3, `extensions/runner.ts:517-522` @v0.83.0 — warn, extension wins):
 /// resolved against `tui.editor.cursorRight`'s pi/cyrup default keys, the chord must produce no
-/// diagnostic. This is the check EXT-039's residual will wire live; until then it runs here.
+/// diagnostic. EXT-039 has since wired that gate into production
+/// (`App::install_extension_shortcuts` over `App::effective_keybindings`); this keeps the
+/// registry-level check pinned to the two ids the retired chord actually collided with.
 #[test]
 fn the_status_shortcut_resolves_with_no_conflict_against_the_editor_defaults() {
     let reg = cyrup_ext::ExtensionRegistry::new();

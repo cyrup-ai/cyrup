@@ -748,7 +748,7 @@ mod tests {
         def.description = "Worker".to_string();
         def.system_prompt_body = "Do work".to_string();
         def.runner = Some(AgentRunnerConfig::ExternalCli(ExternalCliRunner {
-            adapter: Some("claude-code".to_string()),
+            adapter: Some(crate::runner::contract::AdapterId::ClaudeCode),
             command: "claude".to_string(),
             args: Vec::new(),
             prompt_delivery_stdin: false,

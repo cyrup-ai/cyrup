@@ -1138,28 +1138,28 @@ async fn handle(
             // through the `bash_execution_update` events keyed by `id` above, not through a callback.
             //
             // Pi's sibling `operations` override (`UserBashEventResult.operations`,
-            // `extensions/types.ts:1078-1080`) is NOT threadable from HERE, and that is a shape
-            // difference rather than a carve-out: pi emits `user_bash` AT this call site, so
-            // `rpc-mode.ts:577` still holds `eventResult` and can pass `operations` down; cyrup emits
-            // inside the shared `execute_bash_with_user_event` wrapper (so the interactive `!`/`!!`
-            // front-end and this one cannot drift on WHETHER they emit), and the event result never
-            // surfaces here. The override therefore has to be honored inside that wrapper.
+            // `extensions/types.ts:1139` @v0.84.4) is threaded one frame LOWER than upstream threads
+            // it, and that is a shape difference rather than a carve-out: pi emits `user_bash` AT
+            // this call site, so `rpc-mode.ts:581` still holds `eventResult` and passes
+            // `operations` down itself; cyrup emits inside the shared
+            // `execute_bash_with_user_event` wrapper (so the interactive `!`/`!!` front-end and this
+            // one cannot drift on WHETHER they emit), and that wrapper is therefore also where the
+            // event result's `operations` is READ BACK and written into `BashOptions::operations`
+            // (SEAM-015). Both front-ends get upstream's behaviour from one place.
             //
-            // The CONSUMPTION half is now built and this `operations: None` is upstream's absent
-            // `operations`, not a dropped one: `BashOptions::operations` exists,
-            // `execute_bash_with_user_event` forwards it and `execute_bash` resolves pi's
-            // `options?.operations ?? createLocalBashOperations({ shellPath })`
-            // (`agent-session.ts:2782`), pinned by
-            // `cyrup-session-svc/src/tests/round9_l5res.rs`'s three
-            // `..._operations_override_...` tests. **ONE half is left, and it is not in this file
-            // either:** cyrup's extension I/O is serde values (ADR-0002), so a WASM guest cannot
-            // RETURN a backend — `emit_user_bash_event`'s reduction payload can carry the
-            // `operations` KEY but never a callable behind it. Closing it is the
-            // `register-bash-operations` import + keyed `bash-operations-exec` export round-trip
-            // designed in full in the CYRUP-DELTA register in `crates/cyrup-ext/src/lib.rs`, plus
-            // its guest half in `crates/cyrup-ext-sdk` and a `HOST_WORLD` minor bump. When that
-            // lands, the wrapper sets one field and this arm is unchanged.
-            // DRIFT-004 / SEAM-015.
+            // So this `operations: None` is upstream's ABSENT `operations` at the point pi builds
+            // the same options bag — a caller-supplied per-call backend, which the RPC front-end has
+            // none of — not a dropped one: the wrapper only fills the field when the caller left it
+            // empty, and `execute_bash` then resolves pi's `options?.operations ??
+            // createLocalBashOperations({ shellPath })` (`agent-session.ts:2782`). Pinned end to end
+            // by `cyrup-modes/src/tests/modes/rpc_bash.rs`'s
+            // `rpc_bash_runs_on_an_extension_supplied_operations_backend` and by
+            // `cyrup-session-svc/src/tests/round9_l5res.rs`'s `..._operations_override_...` tests.
+            // Either tier can supply the backend: a NATIVE extension returns the object directly,
+            // and a WASM guest — which ADR-0002 forbids returning a callable — declares one with
+            // `registration.register-bash-operations` and serves it over the
+            // `events.bash-operations-exec` export (DRIFT-004, `cyrup:ext@0.10`). Both resolve
+            // through `ExtensionHost::user_bash_operations`, which this wrapper calls.
             match session
                 .execute_bash_with_user_event(
                     &command,

@@ -9,7 +9,7 @@
 //! that have a handler (driving the host subscription bitset, R-ARCH-EXT-014).
 
 use crate::autocomplete::{AutocompleteProvider, AutocompleteQuery, AutocompleteSuggestions};
-use crate::ctx::{CommandCtx, Ctx, ToolCall};
+use crate::ctx::{BashCommand, CommandCtx, Ctx, ToolCall};
 use crate::descriptor::{CommandDescriptor, FlagSpec, ProviderConfig, ToolDescriptor};
 use crate::events::*;
 use crate::provider::{OAuthCallbacks, OAuthCredentials, ProviderHandlers, ProviderStream};
@@ -390,17 +390,67 @@ pub struct RegisteredShortcut {
     pub handler: Box<dyn ShortcutExec>,
 }
 
-// --- message renderers (Pi `renderCall`/`renderResult`, types.ts:489-497; R-08-020) ---
+// --- message renderers (Pi `renderCall`/`renderResult`, types.ts:491-498 @v0.84.4; R-08-020) ---
+
+/// The `(options, theme)` half of every upstream renderer signature (EXT-006) — the guest mirror of
+/// `cyrup_ext::RenderOptions`, which is what the host serializes into the export's `opts-json`.
+///
+/// cyrup routes all three of pi's renderer surfaces through ONE export pair, so this is the union
+/// of pi's three option bags (`pi/packages/coding-agent/src/core/extensions/types.ts` @v0.84.4):
+/// `MessageRenderOptions { expanded, outputPad }` `:1195-1199`, `EntryRenderOptions { expanded }`
+/// `:1209-1211`, `ToolRenderResultOptions { expanded, isPartial }` `:413-418`. A surface for which
+/// a field has no meaning leaves it at its default.
+///
+/// Both halves are LIVE: the host re-invokes the renderer whenever they move, so a renderer that
+/// branches on [`Self::expanded`] really does redraw when the user presses the expand key.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RenderOptions {
+    /// `options.expanded` — the live `app.tools.expand` flag.
+    pub expanded: bool,
+    /// `MessageRenderOptions.outputPad` — the horizontal padding the `outputPad` setting configures.
+    pub output_pad: u32,
+    /// `ToolRenderResultOptions.isPartial` — whether the result being drawn is still streaming.
+    pub is_partial: bool,
+    /// The NAME of the active theme. Pi passes the whole `Theme` object; an object cannot cross the
+    /// component boundary, so a guest that needs the PALETTE calls `ui.theme_get_json()` (EXT-066).
+    /// `None` when the host has no display (an RPC host, a test).
+    pub theme: Option<String>,
+}
+
+impl RenderOptions {
+    /// Parse the host's `opts-json`. Absent or malformed fields take their defaults rather than
+    /// failing — a renderer must still draw when it cannot be told the options, which is exactly
+    /// what upstream does for a renderer that never reads its `options` argument.
+    pub fn from_json(v: &Value) -> Self {
+        Self {
+            expanded: v.get("expanded").and_then(Value::as_bool).unwrap_or(false),
+            output_pad: v
+                .get("outputPad")
+                .and_then(Value::as_u64)
+                .and_then(|w| u32::try_from(w).ok())
+                .unwrap_or(0),
+            is_partial: v.get("isPartial").and_then(Value::as_bool).unwrap_or(false),
+            theme: v
+                .get("theme")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+        }
+    }
+}
 
 /// A custom message renderer the guest registers for a `custom_type`. Each method returns a
 /// serialized widget tree (`Value`), or `None` to fall back to the runtime's default renderer.
+///
+/// EXT-006 — `opts` is upstream's `(options, theme)` pair and is a LIVE input: the host re-invokes
+/// the renderer when the expansion or the theme changes, so branching on it is how a renderer
+/// draws a collapsed and an expanded form.
 pub trait MessageRenderer: 'static {
     /// Render the CALL row as a widget tree, or `None` (the default) to leave it to the runtime.
-    fn render_call(&self, _call: &Value, _ctx: &Ctx) -> Option<Value> {
+    fn render_call(&self, _call: &Value, _opts: &RenderOptions, _ctx: &Ctx) -> Option<Value> {
         None
     }
     /// Render the RESULT row as a widget tree, or `None` (the default) to leave it to the runtime.
-    fn render_result(&self, _result: &Value, _ctx: &Ctx) -> Option<Value> {
+    fn render_result(&self, _result: &Value, _opts: &RenderOptions, _ctx: &Ctx) -> Option<Value> {
         None
     }
 }
@@ -535,6 +585,36 @@ where
     }
 }
 
+/// A per-call command-execution backend this extension supplies for a `user_bash` command it
+/// handled — pi `BashOperations` (`packages/coding-agent/src/core/tools/bash.ts:63-81` @v0.84.4:
+/// *"Pluggable operations for the bash tool. Override these to delegate command execution to remote
+/// systems (for example SSH)"*), returned as `UserBashEventResult.operations`
+/// (`core/extensions/types.ts:1139`).
+///
+/// Register one with [`ExtensionApi::register_bash_operations`] and return `{"operations": true}`
+/// from a `user_bash` handler (see that method's doc for why BOTH halves are needed). The host then
+/// runs the extension's `!` command through [`Self::exec`] instead of the local shell — upstream's
+/// `options?.operations ?? createLocalBashOperations({ shellPath })`
+/// (`core/agent-session.ts:2782`).
+///
+/// The return is pi's `{ exitCode: number | null }`: `Ok(Some(code))` is an exit code, `Ok(None)`
+/// is its `null` ("killed"), and `Err(message)` is its `throw` — which the host re-raises as a
+/// failed command rather than a successful one with no output (`core/bash-executor.ts:154`).
+pub trait BashOperations: 'static {
+    /// Run one command, streaming its output with [`BashCommand::write`] and stopping when
+    /// [`BashCommand::is_cancelled`] turns true.
+    fn exec(&self, command: &BashCommand) -> Result<Option<i32>, String>;
+}
+
+impl<F> BashOperations for F
+where
+    F: Fn(&BashCommand) -> Result<Option<i32>, String> + 'static,
+{
+    fn exec(&self, command: &BashCommand) -> Result<Option<i32>, String> {
+        self(command)
+    }
+}
+
 /// A uniform handler: parses the ordered string args the host passes and returns a [`RawOutcome`].
 type Handler = Box<dyn Fn(&[&str], &Ctx) -> RawOutcome + 'static>;
 
@@ -560,6 +640,9 @@ pub struct ExtensionApi {
     /// EXT-019: at most one per extension (pi `extension.markdownTransformer`, types.ts:1703 @v0.84.1
     /// @v0.84.1).
     pub(crate) markdown_transformer: Option<Box<dyn MarkdownTransformer>>,
+    /// DRIFT-004: at most one per extension — upstream reads `operations` off the SINGLE
+    /// `UserBashEventResult` whose handler won the reduction (`extensions/runner.ts:1005-1032`).
+    pub(crate) bash_operations: Option<Box<dyn BashOperations>>,
     /// EXT-021: this extension's raw terminal-input handler, if it subscribed. AT MOST ONE —
     /// upstream allows several `onTerminalInput` calls per extension, but each returns its own
     /// unsubscribe and the host's subscriber table is keyed by EXTENSION, so a guest with two
@@ -698,7 +781,19 @@ impl ExtensionApi {
     /// routes here when the host reports the matching `KeyId` fired. Returns an error for an unknown
     /// key (never a panic).
     pub fn execute_shortcut(&self, key: &str, ctx: &Ctx) -> Result<(), String> {
-        match self.shortcuts.iter().find(|s| s.key == key) {
+        // EXT-076: the host dispatches the NORMALIZED (lowercased) key —
+        // `ExtensionRegistry::resolve_shortcuts_inner` emits `key.to_lowercase()` — while
+        // `register_shortcut` stores the author's key verbatim, so an exact compare here never
+        // finds a handler registered as e.g. `"Ctrl+G"`. Upstream is structurally immune because
+        // `setupExtensionShortcuts` captures the handler off the normalized map rather than
+        // re-looking it up by the pressed key; matching case-insensitively is the same guarantee
+        // at this seam. Shortcut keys are ASCII (`ctrl+alt+f`, `Ctrl+G`), so ASCII folding is the
+        // right comparison and avoids Unicode-case surprises in a lookup key.
+        match self
+            .shortcuts
+            .iter()
+            .find(|s| s.key.eq_ignore_ascii_case(key))
+        {
             Some(s) => s.handler.execute(ctx),
             None => Err(format!("no such shortcut: {key}")),
         }
@@ -769,6 +864,40 @@ impl ExtensionApi {
     /// `register-markdown-transformer` import at init).
     pub fn has_markdown_transformer(&self) -> bool {
         self.markdown_transformer.is_some()
+    }
+
+    /// Register this extension's bash backend (DRIFT-004; pi `UserBashEventResult.operations`,
+    /// `core/extensions/types.ts:1139` @v0.84.4). AT MOST ONE — a second call REPLACES the first,
+    /// as upstream's per-result field does.
+    ///
+    /// BOTH halves are required for the backend to be used, and they say different things:
+    ///
+    /// * this call declares that the guest HAS a backend (it drives the
+    ///   `registration.register-bash-operations` import at `init`);
+    /// * a `user_bash` handler returning [`Outcome::handled`] with `{"operations": true}` is what
+    ///   says *this particular command* should run through it — upstream's handler returns
+    ///   `{ operations }` for exactly the commands it wants to redirect and `undefined` for the
+    ///   rest (`examples/extensions/ssh.ts:203-206`), and a handler that returns a `result`
+    ///   instead short-circuits execution entirely, so the backend is never consulted
+    ///   (`modes/rpc/rpc-mode.ts:571-576`).
+    pub fn register_bash_operations(&mut self, operations: impl BashOperations) {
+        self.bash_operations = Some(Box::new(operations));
+    }
+
+    /// Run this extension's bash backend (the `bash-operations-exec` export body). `Err` when it
+    /// registered none — an unexpected call must not look like a command that ran and produced
+    /// nothing.
+    pub fn exec_bash_operations(&self, command: &BashCommand) -> Result<Option<i32>, String> {
+        match &self.bash_operations {
+            Some(ops) => ops.exec(command),
+            None => Err("this extension registered no bash operations".to_string()),
+        }
+    }
+
+    /// Whether this extension registered a bash backend (drives the
+    /// `registration.register-bash-operations` import at init).
+    pub fn has_bash_operations(&self) -> bool {
+        self.bash_operations.is_some()
     }
 
     /// Listen to raw terminal input (EXT-021; pi `ctx.ui.onTerminalInput(handler)`,
@@ -1496,20 +1625,30 @@ impl ExtensionApi {
     /// A custom-ENTRY renderer is searched too, and LAST: the message table is the one the host
     /// routes tool rows and custom messages through, and it must keep winning a key it already
     /// claims. An entry-only type falls through to the entry table.
-    pub fn render_call(&self, custom_type: &str, call: &Value) -> Option<Value> {
+    pub fn render_call(
+        &self,
+        custom_type: &str,
+        call: &Value,
+        opts: &RenderOptions,
+    ) -> Option<Value> {
         self.renderers
             .iter()
             .chain(self.entry_renderers.iter())
             .find(|r| r.custom_type == custom_type)
-            .and_then(|r| r.renderer.render_call(call, &Ctx::new()))
+            .and_then(|r| r.renderer.render_call(call, opts, &Ctx::new()))
     }
 
     /// Render a tool result via a registered renderer for `custom_type` (Pi `renderResult`).
-    pub fn render_result(&self, custom_type: &str, result: &Value) -> Option<Value> {
+    pub fn render_result(
+        &self,
+        custom_type: &str,
+        result: &Value,
+        opts: &RenderOptions,
+    ) -> Option<Value> {
         self.renderers
             .iter()
             .find(|r| r.custom_type == custom_type)
-            .and_then(|r| r.renderer.render_result(result, &Ctx::new()))
+            .and_then(|r| r.renderer.render_result(result, opts, &Ctx::new()))
     }
 
     // --- provider OAuth + streamSimple callbacks (pi `ProviderConfig`, types.ts:1427-1464 @v0.83.0

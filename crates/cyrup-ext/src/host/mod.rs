@@ -21,7 +21,7 @@ pub mod testkit;
 pub use engine::{build_engine, build_engine_on_demand, map_wasm_error};
 pub use epoch::EpochDriver;
 pub use limits::StoreLimits;
-pub use live::{LiveExtension, WasmTool};
+pub use live::{GuestBashOperations, LiveExtension, WasmTool};
 pub use overlay::{
     CustomOption, CustomSpec, InteractiveOverlay, OverlayColor, OverlayKey, OverlayKeyCode,
     OverlayLine, OverlayOptions, OverlayOutcome, OverlaySpan, SpecOverlay,

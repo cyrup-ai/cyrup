@@ -93,6 +93,37 @@ impl FullscreenScrollbar {
     }
 }
 
+/// `fullscreenExitOutput` — what leaving the alternate screen puts on the main screen (Pi
+/// `FullscreenExitOutput`, settings-manager.ts:38 @v0.84.4: `"transcript" | "resume-hint"`; the
+/// settings key is declared at `:143` with `// default: "transcript"; no effect in regular TUI
+/// mode`). CFG-078.
+///
+/// Both this type and the key are **v0.84.4 additions** — neither exists at v0.84.1, the tag
+/// ADR-0005 §A-3 was measured against, which is why `crates/cyrup-tui/src/app/settings_rows.rs`
+/// carried a note saying so until this landed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FullscreenExitOutput {
+    /// Print the excursion's transcript into the main screen's scrollback on the way out. Pi's
+    /// documented default, and the value every unrecognized spelling degrades to — see
+    /// [`super::EffectiveSettings::fullscreen_exit_output`].
+    #[default]
+    Transcript,
+    /// Restore the screen the terminal had before the alternate screen was entered and print only
+    /// the session's resume hint (`docs/settings.md:70` @v0.84.4).
+    ResumeHint,
+}
+
+impl FullscreenExitOutput {
+    /// The settings-file spelling, i.e. the value `setFullscreenExitOutput` writes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Transcript => "transcript",
+            Self::ResumeHint => "resume-hint",
+        }
+    }
+}
+
 /// Custom per-level thinking token budgets (Pi `ThinkingBudgetsSettings`, settings-manager.ts:46-51).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]

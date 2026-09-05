@@ -629,6 +629,7 @@ mod tests {
             kind: "probe".to_string(),
             payload: json!({}),
             details: None,
+            display: true,
             timestamp: Some(0),
         };
 
@@ -672,6 +673,7 @@ mod tests {
             kind: "probe".to_string(),
             payload: json!({}),
             details: None,
+            display: true,
             timestamp: Some(0),
         };
         let event = watchdog_turn_end_event(&message, std::slice::from_ref(&result));

@@ -1,54 +1,382 @@
-//! SUBA-074 — the stage-1 subset of `pi-subagents/src/runs/shared/external-cli-contract.ts`
-//! (167 lines @v0.57.0): the code-owned adapter id set, the capability-narrowing parser, and the
-//! reserved-selection-name guard. The rest of that file (`resolveExternalCliRunnerStatus`,
-//! `normalizeExternalCliRunnerStatus`, `externalCliReceiptMetadata`) is stage 2 and lands with the
-//! runner itself.
+//! SUBA-074 — the code-owned half of `pi-subagents/src/runs/shared/external-cli-contract.ts`
+//! (@v0.64.0): the adapter id set, the seven narrowable capabilities **and their unsupported
+//! reasons**, the capability-narrowing parser, and the reserved-selection-name guard.
+//!
+//! Everything here is a CLOSED set the compiler knows. That is deliberate and is the item's
+//! central design decision: upstream derives its label, its reserved table, its per-adapter safety
+//! block, its prompt-delivery mode and its launch resolver from the same six string literals, and
+//! every one of those derivations is a fall-through waiting to happen when the id is an
+//! `Option<String>`. Modelling the id as [`AdapterId`] and the capability as [`Capability`] makes
+//! each derivation an exhaustive `match`, so adding a seventh adapter (or an eighth capability) is
+//! a compile error in every place that must change rather than a silent generic fallback.
+//!
+//! The status/receipt half — `resolveExternalCliRunnerStatus`, `normalizeExternalCliRunnerStatus`,
+//! `externalCliReceiptMetadata` — lives in [`super::status`], which is built entirely out of the
+//! two enums below.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use serde_json::Value;
 
-/// `CODE_OWNED_EXTERNAL_CLI_ADAPTER_IDS` (`external-cli-contract.ts:26-33`), in upstream's order —
-/// the order is load-bearing because [`CODE_OWNED_ADAPTER_LABEL`] is built from it and appears
-/// verbatim in a user-facing refusal.
-pub const CODE_OWNED_ADAPTER_IDS: [&str; 6] = [
-    "codex-exec",
-    "codex-exec-writer",
-    "claude-code",
-    "claude-code-writer",
-    "cursor-agent",
-    "cursor-agent-writer",
-];
+/// How the prompt actually reaches the external child. Upstream's `promptDelivery`
+/// (`shared/types.ts:1729` @v0.64.0) — and note the AUTHOR only ever writes `"stdin"`
+/// (`agents.ts:1886-1888`): the effective mode is the ADAPTER's, not the author's
+/// (`external-cli-contract.ts:93` forces `"prompt-file"` for cursor-agent regardless of what the
+/// file said).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PromptDeliveryKind {
+    /// Written to the child's stdin, which is then closed.
+    Stdin,
+    /// Written to an adapter-owned file named in argv; stdin is closed empty.
+    PromptFile,
+}
+
+impl PromptDeliveryKind {
+    /// Upstream's `promptDelivery` wire value.
+    #[must_use]
+    pub const fn wire(self) -> &'static str {
+        match self {
+            Self::Stdin => "stdin",
+            Self::PromptFile => "prompt-file",
+        }
+    }
+
+    /// Upstream's `adapter.executionMode` (`external-cli-contract.ts:88`), which is a pure function
+    /// of the delivery mode.
+    #[must_use]
+    pub const fn execution_mode(self) -> &'static str {
+        match self {
+            Self::Stdin => "one-shot-stdin",
+            Self::PromptFile => "one-shot-prompt-file",
+        }
+    }
+}
+
+/// `CODE_OWNED_EXTERNAL_CLI_ADAPTER_IDS` (`external-cli-contract.ts:25-33` @v0.64.0) as a closed
+/// enum rather than a string set.
+///
+/// **The invariant this encodes.** An adapter id is one of exactly six values, and the user-facing
+/// label, the reserved-name table, the prompt-delivery mode, the safety receipt and the launch
+/// resolver are all FUNCTIONS of that set — upstream literally builds its label by mapping over the
+/// array (`:36`). With an `Option<String>` every one of those is a string comparison that falls
+/// through silently on a typo: `resolveExternalCliRunnerStatus` (`:77-116`) is six such
+/// comparisons, and a miss yields the GENERIC status — adapter id `"external-cli"`, **no `safety`
+/// block at all**, and `promptDelivery: "stdin"` for an adapter that needs a prompt file. That
+/// misreports the capability envelope of a run that was supposed to be sandboxed, which is the same
+/// severity class as widening it.
+///
+/// [`Self::try_from`] is the only constructor, so a value of this type is proof of membership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AdapterId {
+    /// Codex `exec`, read-only sandbox.
+    CodexExec,
+    /// Codex `exec`, workspace-write.
+    CodexExecWriter,
+    /// Claude Code, plan mode with no tools.
+    ClaudeCode,
+    /// Claude Code, `acceptEdits` with the five file tools.
+    ClaudeCodeWriter,
+    /// cursor-agent, ask mode.
+    CursorAgent,
+    /// cursor-agent, print mode.
+    CursorAgentWriter,
+}
+
+impl AdapterId {
+    /// Every code-owned id, in upstream's own array order — the order is load-bearing because
+    /// [`CODE_OWNED_ADAPTER_LABEL`] is built from it and appears verbatim in a user-facing refusal.
+    pub const ALL: [Self; 6] = [
+        Self::CodexExec,
+        Self::CodexExecWriter,
+        Self::ClaudeCode,
+        Self::ClaudeCodeWriter,
+        Self::CursorAgent,
+        Self::CursorAgentWriter,
+    ];
+
+    /// The wire spelling — what an agent file writes and what a receipt records.
+    #[must_use]
+    pub const fn wire(self) -> &'static str {
+        match self {
+            Self::CodexExec => "codex-exec",
+            Self::CodexExecWriter => "codex-exec-writer",
+            Self::ClaudeCode => "claude-code",
+            Self::ClaudeCodeWriter => "claude-code-writer",
+            Self::CursorAgent => "cursor-agent",
+            Self::CursorAgentWriter => "cursor-agent-writer",
+        }
+    }
+
+    /// `RESERVED_READ_ONLY_ADAPTERS` in upstream's own ROW ORDER
+    /// (`external-cli-contract.ts:42-46`): `claude-code`, `codex-exec`, `cursor-agent`.
+    ///
+    /// The order is observable, which is why this is declared rather than filtered out of
+    /// [`Self::ALL`]: [`validate_code_owned_profile_runner`] returns on the FIRST matching row, so
+    /// an agent whose selection names contain two reserved names is told about whichever upstream
+    /// would name — and `ALL` is in wire-id order (`codex-exec` first), which is not the same.
+    pub const RESERVED_READ_ONLY: [Self; 3] =
+        [Self::ClaudeCode, Self::CodexExec, Self::CursorAgent];
+
+    /// `RESERVED_READ_ONLY_ADAPTERS` (`external-cli-contract.ts:42-46`) as a total function:
+    /// `Some((writer twin, access word))` for a reserved READ-ONLY id, `None` for a writer id.
+    ///
+    /// The access word differs per adapter and is interpolated into the refusal, so the three rows
+    /// are NOT interchangeable.
+    #[must_use]
+    pub const fn reserved_pair(self) -> Option<(Self, &'static str)> {
+        match self {
+            Self::ClaudeCode => Some((Self::ClaudeCodeWriter, "file-write")),
+            Self::CodexExec => Some((Self::CodexExecWriter, "workspace-write")),
+            Self::CursorAgent => Some((Self::CursorAgentWriter, "workspace-write")),
+            Self::ClaudeCodeWriter | Self::CodexExecWriter | Self::CursorAgentWriter => None,
+        }
+    }
+
+    /// The EFFECTIVE prompt delivery for this adapter (`external-cli-contract.ts:93`: `cursor ?
+    /// "prompt-file" : input.promptDelivery ?? "stdin"`). Not the author's declaration — the
+    /// adapter's own, which is why the author's `promptDelivery: "stdin"` is nearly free of
+    /// information.
+    #[must_use]
+    pub const fn prompt_delivery(self) -> PromptDeliveryKind {
+        match self {
+            Self::CursorAgent | Self::CursorAgentWriter => PromptDeliveryKind::PromptFile,
+            Self::CodexExec | Self::CodexExecWriter | Self::ClaudeCode | Self::ClaudeCodeWriter => {
+                PromptDeliveryKind::Stdin
+            }
+        }
+    }
+
+    /// Whether this adapter grants the foreign process WRITE access to the workspace — the half of
+    /// each reserved pair that is not read-only.
+    #[must_use]
+    pub const fn is_writer(self) -> bool {
+        self.reserved_pair().is_none()
+    }
+}
+
+impl TryFrom<&str> for AdapterId {
+    type Error = ();
+
+    /// `isCodeOwnedExternalCliAdapterId` (`external-cli-contract.ts:38-40`) — the ONLY constructor,
+    /// so holding an [`AdapterId`] is proof the string was in the code-owned set.
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.wire() == value)
+            .ok_or(())
+    }
+}
+
+impl std::str::FromStr for AdapterId {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::try_from(value)
+    }
+}
+
+impl std::fmt::Display for AdapterId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.wire())
+    }
+}
+
+impl serde::Serialize for AdapterId {
+    /// The persisted form is the WIRE STRING, not the variant name: this field crosses the hop-2
+    /// `runner-config.json` boundary (see the module doc on [`super`]) and is re-read by
+    /// [`super::status::normalize_external_cli_runner_status`] out of a receipt.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.wire())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for AdapterId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::try_from(raw.as_str()).map_err(|()| {
+            serde::de::Error::custom(format!("unknown external-cli adapter id '{raw}'"))
+        })
+    }
+}
 
 /// `CODE_OWNED_EXTERNAL_CLI_ADAPTER_LABEL` — each id single-quoted, comma-joined. A `const` string
-/// rather than a computed join so the refusal text cannot drift from the array above without the
+/// rather than a computed join so the refusal text cannot drift from [`AdapterId::ALL`] without the
 /// accompanying assertion failing.
 pub const CODE_OWNED_ADAPTER_LABEL: &str = "'codex-exec', 'codex-exec-writer', 'claude-code', 'claude-code-writer', 'cursor-agent', 'cursor-agent-writer'";
 
-/// `isCodeOwnedExternalCliAdapterId` (`:38-40`).
-#[must_use]
-pub fn is_code_owned_adapter_id(value: &str) -> bool {
-    CODE_OWNED_ADAPTER_IDS.contains(&value)
+/// The seven narrowable capabilities — upstream's `Object.keys(UNSUPPORTED)`
+/// (`external-cli-contract.ts:8-17`).
+///
+/// `stop` is deliberately NOT a variant: it is the one capability an external adapter always has
+/// (`capabilities.stop: true`, `shared/types.ts:1698`), so it is not narrowable and naming it in a
+/// `capabilities:` block is an unsupported-field error. Making that structural rather than a
+/// comment is half the point of the enum.
+///
+/// The other half is [`Self::unsupported_reason`]: upstream defines the key set AS the reason map's
+/// domain (`CAPABILITY_KEYS = new Set(Object.keys(UNSUPPORTED))`, `:17`), so the two can never
+/// drift there. A Rust port that keeps a key array and adds a separate reason table reintroduces
+/// exactly that drift, and the idiomatic `.unwrap_or_default()` on a lookup miss writes an EMPTY
+/// `nonResumableReason` into a receipt — a run recorded as non-resumable for no stated reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Capability {
+    /// Live steer messages after launch.
+    Steer,
+    /// Resuming a durable external session.
+    Resume,
+    /// A trusted structured result.
+    StructuredOutput,
+    /// Native Pi tool events on the child's stream.
+    ToolEvents,
+    /// A trusted supervisor event transport.
+    Supervisor,
+    /// Native Pi fork context.
+    ForkContext,
+    /// Native Pi extension bindings.
+    ExtensionBindings,
 }
 
-/// The seven narrowable capability keys — `Object.keys(UNSUPPORTED)` (`:8-18`). `stop` is
-/// deliberately ABSENT: it is the one capability an external adapter always has, so it is not
-/// narrowable and naming it is an unsupported-field error.
-const CAPABILITY_KEYS: [&str; 7] = [
-    "steer",
-    "resume",
-    "structuredOutput",
-    "toolEvents",
-    "supervisor",
-    "forkContext",
-    "extensionBindings",
-];
+impl Capability {
+    /// Upstream's key order (`:8-16`), which reaches the user through
+    /// [`super::status::ExternalCliRunnerStatus::unsupported_reasons`].
+    pub const ALL: [Self; 7] = [
+        Self::Steer,
+        Self::Resume,
+        Self::StructuredOutput,
+        Self::ToolEvents,
+        Self::Supervisor,
+        Self::ForkContext,
+        Self::ExtensionBindings,
+    ];
 
-/// `ExternalCliCapabilityNarrowing` — the parsed narrowing map. Every value is `false` by
-/// construction ([`parse_capability_narrowing`] refuses anything else), and the map is kept rather
-/// than collapsed to a key set so an explicit empty object round-trips as an empty object rather
-/// than as "absent".
-pub type ExternalCliCapabilityNarrowing = BTreeMap<String, bool>;
+    /// The wire key an agent file's `capabilities:` block and a receipt both use.
+    #[must_use]
+    pub const fn wire(self) -> &'static str {
+        match self {
+            Self::Steer => "steer",
+            Self::Resume => "resume",
+            Self::StructuredOutput => "structuredOutput",
+            Self::ToolEvents => "toolEvents",
+            Self::Supervisor => "supervisor",
+            Self::ForkContext => "forkContext",
+            Self::ExtensionBindings => "extensionBindings",
+        }
+    }
+
+    /// `UNSUPPORTED[key]` (`:8-16`), with `PROMPT_FILE_UNSUPPORTED`'s two overrides (`:19-24`)
+    /// folded in as the `PromptFile` arms.
+    ///
+    /// Total by construction: no capability can lack a reason, and the delivery-mode override
+    /// cannot be applied to the wrong subset because it IS this match.
+    #[must_use]
+    pub const fn unsupported_reason(self, delivery: PromptDeliveryKind) -> &'static str {
+        match (self, delivery) {
+            (Self::Steer, PromptDeliveryKind::Stdin) => {
+                "The one-shot stdin adapter closes input after launch and cannot accept live steer messages."
+            }
+            (Self::Steer, PromptDeliveryKind::PromptFile) => {
+                "The one-shot prompt-file adapter closes input after launch and cannot accept live steer messages."
+            }
+            (Self::Resume, PromptDeliveryKind::Stdin) => {
+                "The one-shot stdin adapter has no durable external session identity."
+            }
+            (Self::Resume, PromptDeliveryKind::PromptFile) => {
+                "The one-shot prompt-file adapter does not retain a durable external session identity."
+            }
+            (Self::StructuredOutput, _) => {
+                "The generic external CLI adapter does not parse a trusted structured result."
+            }
+            (Self::ToolEvents, _) => {
+                "The generic external CLI adapter treats stdout as untrusted text, not native Pi tool events."
+            }
+            (Self::Supervisor, _) => {
+                "The generic external CLI adapter has no trusted supervisor event transport."
+            }
+            (Self::ForkContext, _) => {
+                "Native Pi fork context is not available without an adapter-owned handoff artifact."
+            }
+            (Self::ExtensionBindings, _) => {
+                "Native Pi extension bindings are never passed to external runners."
+            }
+        }
+    }
+}
+
+/// serde for [`ExternalCliRunner::capabilities`](crate::runner::ExternalCliRunner::capabilities)
+/// in UPSTREAM's wire shape: the `Partial<Record<key, false>>` OBJECT an agent file's
+/// `runner.capabilities` block carries (`shared/types.ts:1695`), not the set the in-memory type is.
+///
+/// The narrowing is a [`BTreeSet`] because every value in that object is `false` by construction
+/// (see [`ExternalCliCapabilityNarrowing`]) — but the SET is an internal representation, and a
+/// derived impl would put `["steer"]` on the wire. That matters at exactly one place: the hop-2
+/// `runner-config.json` hand-off, which carries a whole [`crate::exec::ResolvedAgentPersona`]
+/// including its runner. Without this the detached runner's copy of a `runner:` block and the
+/// frontmatter writer's ([`crate::runner::runner_to_json_string`]) would disagree in SHAPE, and
+/// neither would match the block an author wrote.
+///
+/// Deserialization applies the same two refusals the frontmatter parser does — an unknown key, and
+/// any value that is not literally `false` — so the hand-off cannot be the seam through which a
+/// widened capability enters.
+pub mod capability_narrowing_serde {
+    use super::{Capability, ExternalCliCapabilityNarrowing};
+    use std::collections::BTreeMap;
+
+    /// # Errors
+    ///
+    /// Propagates the serializer's own failures only.
+    pub fn serialize<S: serde::Serializer>(
+        value: &Option<ExternalCliCapabilityNarrowing>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        match value {
+            None => serializer.serialize_none(),
+            Some(narrowing) => {
+                let mut map = serializer.serialize_map(Some(narrowing.len()))?;
+                for capability in narrowing {
+                    map.serialize_entry(capability.wire(), &false)?;
+                }
+                map.end()
+            }
+        }
+    }
+
+    /// # Errors
+    ///
+    /// An unsupported capability key, or any value other than `false`.
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<ExternalCliCapabilityNarrowing>, D::Error> {
+        use serde::Deserialize as _;
+        let Some(raw) = Option::<BTreeMap<String, bool>>::deserialize(deserializer)? else {
+            return Ok(None);
+        };
+        let mut narrowing = ExternalCliCapabilityNarrowing::new();
+        for (key, setting) in raw {
+            let capability = Capability::ALL
+                .into_iter()
+                .find(|candidate| candidate.wire() == key)
+                .ok_or_else(|| {
+                    serde::de::Error::custom(format!("unknown external-cli capability '{key}'"))
+                })?;
+            if setting {
+                return Err(serde::de::Error::custom(format!(
+                    "capabilities.{key} may only be false; user config cannot widen code-owned \
+                     external adapter capabilities."
+                )));
+            }
+            narrowing.insert(capability);
+        }
+        Ok(Some(narrowing))
+    }
+}
+
+/// `ExternalCliCapabilityNarrowing` — the parsed narrowing.
+///
+/// A SET, not a map, because upstream's type is `Partial<Record<key, false>>`
+/// (`shared/types.ts:1695`) and its parser refuses any value that is not literally `false`
+/// (`:65-76`): every value in the map is `false` by construction, so a map is a set wearing a map's
+/// clothes. Keeping it a set removes the only place a `true` could ever be represented.
+pub type ExternalCliCapabilityNarrowing = BTreeSet<Capability>;
 
 /// `parseExternalCliCapabilityNarrowing(value, label)` (`:65-76`).
 ///
@@ -70,7 +398,7 @@ pub fn parse_capability_narrowing(
     let unknown: Vec<&str> = object
         .keys()
         .map(String::as_str)
-        .filter(|key| !CAPABILITY_KEYS.contains(key))
+        .filter(|key| Capability::ALL.iter().all(|known| known.wire() != *key))
         .collect();
     if !unknown.is_empty() {
         return Err(format!(
@@ -86,40 +414,282 @@ pub fn parse_capability_narrowing(
                  adapter capabilities."
             ));
         }
-        narrowed.insert(key.clone(), false);
+        // The unknown-key sweep above already proved membership, so this cannot fail; expressing
+        // it as a filter_map keeps the function free of a panic path.
+        if let Some(capability) = Capability::ALL
+            .into_iter()
+            .find(|candidate| candidate.wire() == key)
+        {
+            narrowed.insert(capability);
+        }
     }
     Ok(Some(narrowed))
 }
-
-/// `RESERVED_READ_ONLY_ADAPTERS` (`:42-46`) — `(reserved name, writer twin, access word)`. The
-/// access word differs per adapter and is interpolated into the refusal, so the three rows are NOT
-/// interchangeable.
-const RESERVED_READ_ONLY_ADAPTERS: [(&str, &str, &str); 3] = [
-    ("claude-code", "claude-code-writer", "file-write"),
-    ("codex-exec", "codex-exec-writer", "workspace-write"),
-    ("cursor-agent", "cursor-agent-writer", "workspace-write"),
-];
 
 /// `validateCodeOwnedProfileRunner` (`:48-63`) — the reserved-selection-name guard.
 ///
 /// An agent reachable by the selection name `claude-code`/`codex-exec`/`cursor-agent` MUST actually
 /// be that read-only adapter. Without this a hand-written agent can squat the reserved name and be
 /// selected in place of the sandboxed read-only profile — the same class of silent widening this
-/// whole item exists to close, which is why it is stage 1 and not stage 2.
+/// whole item exists to close.
 ///
-/// `selection_names` is upstream's `[name, localName?, ...aliases]`.
+/// `selection_names` is upstream's `[name, localName?, ...aliases]`. The rows are
+/// [`AdapterId::RESERVED_READ_ONLY`] — upstream's own order, because the loop returns on the first
+/// match — and each row's writer twin and access word come from [`AdapterId::reserved_pair`], so
+/// neither can drift from the id set.
 #[must_use]
 pub fn validate_code_owned_profile_runner(
     selection_names: &[&str],
-    runner_adapter: Option<&str>,
+    runner_adapter: Option<AdapterId>,
 ) -> Option<String> {
-    for (name, writer, access) in RESERVED_READ_ONLY_ADAPTERS {
-        if selection_names.contains(&name) && runner_adapter != Some(name) {
+    for reserved in AdapterId::RESERVED_READ_ONLY {
+        let Some((writer, access)) = reserved.reserved_pair() else {
+            continue;
+        };
+        let name = reserved.wire();
+        if selection_names.contains(&name) && runner_adapter != Some(reserved) {
             return Some(format!(
-                "Selection name '{name}' is reserved for the read-only '{name}' adapter. Use \
-                 '{writer}' for explicit {access} access."
+                "Selection name '{name}' is reserved for the read-only '{name}' adapter. Use '{}' \
+                 for explicit {access} access.",
+                writer.wire()
             ));
         }
     }
     None
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod tests {
+    use super::*;
+
+    /// The label a user-facing refusal quotes is built from the SAME set the parser accepts
+    /// (`external-cli-contract.ts:36`), so the two can never drift.
+    #[test]
+    fn the_adapter_label_is_the_id_set_and_nothing_else() {
+        let derived = AdapterId::ALL
+            .iter()
+            .map(|id| format!("'{}'", id.wire()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert_eq!(derived, CODE_OWNED_ADAPTER_LABEL);
+        for id in AdapterId::ALL {
+            assert_eq!(AdapterId::try_from(id.wire()), Ok(id));
+        }
+        assert_eq!(AdapterId::try_from("cursor_agent"), Err(()));
+        assert_eq!(AdapterId::try_from("grok-build"), Err(()));
+        assert_eq!(AdapterId::try_from("claude-code-reader"), Err(()));
+    }
+
+    /// The three reserved read-only ids, their writer twins and their per-adapter access words —
+    /// derived from the enum rather than a parallel table (`:42-46`).
+    #[test]
+    fn exactly_three_ids_are_reserved_and_each_names_its_own_writer_and_access_word() {
+        let reserved: Vec<(&str, &str, &str)> = AdapterId::ALL
+            .into_iter()
+            .filter_map(|id| {
+                id.reserved_pair()
+                    .map(|(writer, access)| (id.wire(), writer.wire(), access))
+            })
+            .collect();
+        assert_eq!(
+            reserved,
+            vec![
+                ("codex-exec", "codex-exec-writer", "workspace-write"),
+                ("claude-code", "claude-code-writer", "file-write"),
+                ("cursor-agent", "cursor-agent-writer", "workspace-write"),
+            ]
+        );
+        assert!(AdapterId::ClaudeCodeWriter.is_writer());
+        assert!(!AdapterId::ClaudeCode.is_writer());
+    }
+
+    /// Only cursor-agent delivers its prompt by file (`:93`), and the execution mode follows the
+    /// delivery rather than being a second literal that could disagree with it.
+    #[test]
+    fn only_cursor_agent_delivers_its_prompt_by_file() {
+        for id in AdapterId::ALL {
+            let expected = if id.wire().starts_with("cursor-agent") {
+                PromptDeliveryKind::PromptFile
+            } else {
+                PromptDeliveryKind::Stdin
+            };
+            assert_eq!(id.prompt_delivery(), expected, "{id}");
+        }
+        assert_eq!(PromptDeliveryKind::Stdin.execution_mode(), "one-shot-stdin");
+        assert_eq!(
+            PromptDeliveryKind::PromptFile.execution_mode(),
+            "one-shot-prompt-file"
+        );
+    }
+
+    /// Every capability has a NON-EMPTY reason under BOTH delivery modes, and the prompt-file
+    /// override touches exactly `steer` and `resume` (`:19-24`) — exhaustive over
+    /// `Capability::ALL × PromptDeliveryKind`, so an eighth capability cannot silently arrive
+    /// without one.
+    #[test]
+    fn every_capability_has_a_reason_and_only_steer_and_resume_change_by_delivery() {
+        let mut overridden = Vec::new();
+        for capability in Capability::ALL {
+            let stdin = capability.unsupported_reason(PromptDeliveryKind::Stdin);
+            let file = capability.unsupported_reason(PromptDeliveryKind::PromptFile);
+            assert!(!stdin.is_empty(), "{}", capability.wire());
+            assert!(!file.is_empty(), "{}", capability.wire());
+            if stdin != file {
+                overridden.push(capability.wire());
+            }
+        }
+        assert_eq!(overridden, vec!["steer", "resume"]);
+        assert_eq!(
+            Capability::Resume.unsupported_reason(PromptDeliveryKind::Stdin),
+            "The one-shot stdin adapter has no durable external session identity."
+        );
+        assert_eq!(
+            Capability::Resume.unsupported_reason(PromptDeliveryKind::PromptFile),
+            "The one-shot prompt-file adapter does not retain a durable external session identity."
+        );
+    }
+
+    /// `stop` is outside the narrowable set entirely (`:8-17` vs `shared/types.ts:1698`).
+    #[test]
+    fn stop_is_not_a_narrowable_capability() {
+        assert!(Capability::ALL.iter().all(|c| c.wire() != "stop"));
+        assert_eq!(
+            parse_capability_narrowing(
+                Some(&serde_json::json!({"stop": false})),
+                "runner capabilities"
+            )
+            .unwrap_err(),
+            "runner capabilities has unsupported fields: stop."
+        );
+    }
+
+    /// The narrowing parses into a SET — there is nowhere for a `true` to live.
+    #[test]
+    fn narrowing_parses_to_a_set_of_capabilities() {
+        let parsed = parse_capability_narrowing(
+            Some(&serde_json::json!({"steer": false, "resume": false})),
+            "runner capabilities",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            parsed,
+            [Capability::Steer, Capability::Resume]
+                .into_iter()
+                .collect::<ExternalCliCapabilityNarrowing>()
+        );
+        assert_eq!(
+            parse_capability_narrowing(
+                Some(&serde_json::json!({"steer": true})),
+                "runner capabilities"
+            )
+            .unwrap_err(),
+            "runner capabilities.steer may only be false; user config cannot widen code-owned \
+             external adapter capabilities."
+        );
+        assert_eq!(
+            parse_capability_narrowing(Some(&serde_json::json!([])), "runner capabilities")
+                .unwrap_err(),
+            "runner capabilities must be an object."
+        );
+        assert_eq!(
+            parse_capability_narrowing(None, "runner capabilities").unwrap(),
+            None
+        );
+    }
+
+    /// An adapter id persists as its wire string, so a receipt or a hop-2 `runner-config.json`
+    /// round-trips through the same spelling upstream writes.
+    #[test]
+    fn an_adapter_id_serializes_as_its_wire_string() {
+        for id in AdapterId::ALL {
+            let json = serde_json::to_string(&id).unwrap();
+            assert_eq!(json, format!("\"{}\"", id.wire()));
+            assert_eq!(serde_json::from_str::<AdapterId>(&json).unwrap(), id);
+        }
+        assert!(serde_json::from_str::<AdapterId>("\"grok-build\"").is_err());
+    }
+
+    /// SUBA-074 review fix — a narrowing persists as upstream's `{key: false}` OBJECT, not as the
+    /// `BTreeSet` it is in memory.
+    ///
+    /// `ExternalCliRunner` derives serde and rides inside `runner-config.json`, so a derived set
+    /// impl would have put `["steer"]` on the hop-2 wire while the frontmatter writer
+    /// ([`crate::runner::runner_to_json_string`]) went on emitting the object — two spellings of
+    /// one block. Deserialization keeps the frontmatter parser's two refusals, so the hand-off
+    /// cannot be the seam a `true` enters through.
+    #[test]
+    fn a_capability_narrowing_persists_as_upstreams_false_valued_object() {
+        let runner = crate::runner::ExternalCliRunner {
+            adapter: Some(AdapterId::ClaudeCode),
+            command: "claude".to_string(),
+            args: Vec::new(),
+            prompt_delivery_stdin: false,
+            capabilities: Some(
+                [Capability::Steer, Capability::Resume]
+                    .into_iter()
+                    .collect(),
+            ),
+        };
+        let json = serde_json::to_value(&runner).unwrap();
+        assert_eq!(
+            json["capabilities"],
+            serde_json::json!({ "steer": false, "resume": false })
+        );
+        assert_eq!(
+            serde_json::from_value::<crate::runner::ExternalCliRunner>(json).unwrap(),
+            runner
+        );
+
+        // Absent stays absent rather than becoming an empty object.
+        let none = crate::runner::ExternalCliRunner {
+            capabilities: None,
+            ..runner
+        };
+        let json = serde_json::to_value(&none).unwrap();
+        assert!(json.get("capabilities").is_none(), "{json}");
+
+        // The parser's two refusals hold on this wire too.
+        assert!(
+            serde_json::from_value::<crate::runner::ExternalCliRunner>(serde_json::json!({
+                "command": "claude",
+                "capabilities": { "steer": true }
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<crate::runner::ExternalCliRunner>(serde_json::json!({
+                "command": "claude",
+                "capabilities": { "stop": false }
+            }))
+            .is_err()
+        );
+    }
+
+    /// SUBA-074 review fix — the reserved rows are swept in upstream's OWN order
+    /// (`external-cli-contract.ts:42-46`: claude-code, codex-exec, cursor-agent), not in
+    /// `AdapterId::ALL`'s wire order. The loop returns on the first match, so an agent whose
+    /// selection names contain two reserved names must be told about the one upstream would name.
+    #[test]
+    fn the_reserved_rows_are_swept_in_upstreams_own_order() {
+        assert_eq!(
+            AdapterId::RESERVED_READ_ONLY.map(AdapterId::wire),
+            ["claude-code", "codex-exec", "cursor-agent"]
+        );
+        for id in AdapterId::RESERVED_READ_ONLY {
+            assert!(id.reserved_pair().is_some(), "{id:?}");
+        }
+        let message = validate_code_owned_profile_runner(&["codex-exec", "claude-code"], None)
+            .expect("both names are reserved");
+        assert!(
+            message.starts_with("Selection name 'claude-code'"),
+            "upstream's first row is claude-code; got {message}"
+        );
+    }
 }

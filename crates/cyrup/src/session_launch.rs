@@ -121,7 +121,15 @@ fn attach_native_extensions(
     if let Some(ext) = subagent_ext {
         builder = builder.with_native_extension(ext);
     }
-    if let Some(runtime) = cyrup_ext_subagents::prompt_runtime::prompt_runtime_extension_for_env() {
+    // CFG-080: the prompt runtime REFUSES to build when the tool budget the parent shipped in
+    // `CYRUP_SUBAGENT_TOOL_BUDGET` does not decode — pi's `decodeToolBudgetEnv` throws out of
+    // `registerSubagentPromptRuntime` (`pi-subagents` v0.64.0
+    // `src/runs/shared/subagent-prompt-runtime.ts:693`, `tool-budget.ts:74-80`) and its loader
+    // discards the extension. Carrying the error out of the launch path is how this process
+    // declines to run a child whose budget was silently removed; the message is pi's own.
+    let prompt_runtime = cyrup_ext_subagents::prompt_runtime::prompt_runtime_extension_for_env()
+        .map_err(|e| anyhow::anyhow!("building the subagent prompt runtime: {e}"))?;
+    if let Some(runtime) = prompt_runtime {
         builder = builder.with_native_extension(runtime);
     }
     if let Some(ic) = intercom_ext {

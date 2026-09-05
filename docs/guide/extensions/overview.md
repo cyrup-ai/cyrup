@@ -24,7 +24,7 @@ Every extension ships an `extension.json` manifest that declares what it needs:
 {
   "id": "todo",
   "version": "1.0.0",
-  "world": "cyrup:ext@0.8",
+  "world": "cyrup:ext@0.10",
   "capabilities": {
     "fs": ["read:.", "write:.cyrup/todo"],
     "exec": false,

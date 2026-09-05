@@ -32,6 +32,7 @@
 //!
 //! ```text
 //! cargo run -p xtask -- gen-catalogs [--pi <path>] [--rev <rev>] [--out <dir>] [--check] [--diff]
+//! cargo run -p xtask -- gen-catalogs --roster <rev> [--pi <path>]
 //! cargo run -p xtask -- feature-matrix [--fast]
 //! ```
 //!
@@ -39,6 +40,18 @@
 //!   difference. This is the drift check: point it at a newer pi and it fails.
 //! * `--diff` — print a **structural** (model-level and field-level) diff of on-disk vs generated
 //!   instead of writing anything. Whitespace-insensitive, so it reports only real data movement.
+//!   Its comparison is a port of pi's own `scripts/diff-model-catalog.mjs` (see [`canonicalize`]),
+//!   not an invention: key order alone is not a difference, and rows are walked over the sorted
+//!   union of both sides' model ids.
+//! * `--roster <rev>` — audit the provider **set** rather than the catalog **content**: list every
+//!   `packages/ai/src/providers/*.models.ts` pi ships at `<rev>` and require each one to be either
+//!   generated ([`CATALOGS`]) or ledgered as unported ([`UNPORTED`]). Generates and writes nothing.
+//!   `--check` catches a row that moved inside a catalog cyrup already has; this catches a whole
+//!   provider that appeared and has no catalog at all, which is the failure DRIFT-009 was filed for
+//!   — `catalog_data.rs` claimed 31 catalogs while the tree shipped 35 and pi shipped 39, and no
+//!   command could disagree with the prose. It also re-tests DRIFT-009's data block itself: if one
+//!   of the four blocked modules is a data literal again at `<rev>`, the block has lifted and the
+//!   audit fails saying so.
 
 mod features;
 mod tsdata;
@@ -57,6 +70,7 @@ const DEFAULT_REV: &str = "b0c2a90e";
 const DEFAULT_REV_TIMESTAMP: &str = "2026-07-17T09:00:03Z";
 
 /// One embedded catalog and the upstream module its rows come from.
+#[derive(Debug)]
 struct CatalogSpec {
     /// `providers/catalog/<file>.json`.
     file: &'static str,
@@ -137,6 +151,89 @@ impl CatalogSpec {
         }
     }
 }
+
+/// One upstream `packages/ai/src/providers/<stem>.models.ts` module that this generator produces
+/// **no** catalog for, with the reason and the ledger item that owns the absence.
+///
+/// [`CATALOGS`] is the positive half of the roster and this is the negative half. Together they
+/// must account for every provider module pi ships at the revision under audit — that is what
+/// `gen-catalogs --roster <rev>` checks, and it is the whole point of writing the shortfall down
+/// as a table. DRIFT-009 exists because the shortfall was prose: `catalog_data.rs:5-8` said "31
+/// embedded catalogs" long after the tree had 35, while pi shipped 39, and nothing in the repo
+/// could contradict it.
+#[derive(Debug)]
+struct Unported {
+    /// The module stem — `packages/ai/src/providers/<stem>.models.ts`.
+    stem: &'static str,
+    reason: UnportedReason,
+    /// The gap-analysis item that owns this absence.
+    item: &'static str,
+    why: &'static str,
+}
+
+/// Why an upstream provider module has no embedded catalog. The distinction is load-bearing: a
+/// [`HandPorted`](UnportedReason::HandPorted) module is a deliberate placement of the same data
+/// elsewhere in the tree, a [`DataNotInGit`](UnportedReason::DataNotInGit) one is data this
+/// workspace cannot obtain at all — no extractor, no revision and no amount of effort will produce
+/// it, so it is an escalation rather than a task.
+#[derive(Debug, PartialEq, Eq)]
+enum UnportedReason {
+    /// cyrup carries the rows as Rust literals somewhere else, so this generator cannot own them.
+    HandPorted,
+    /// The rows are in git at **no** upstream revision, so nothing can extract them.
+    DataNotInGit,
+}
+
+/// The five upstream provider modules with no `providers/catalog/*.json`, as of pi `v0.84.4`.
+///
+/// The four `DataNotInGit` entries are DRIFT-009's four-catalog shortfall, and the reason they are
+/// unobtainable is one fact: **all four providers postdate `b0c2a90e`**, the last revision at which
+/// a `*.models.ts` is a data literal (`baseten` `c1019d920` 2026-08-03, `qwen-token-plan` and
+/// `qwen-token-plan-cn` `bbb91fa8a` 2026-07-20, `qwen-token-plan-individual` `c03d78bdc`
+/// 2026-08-06; `a9f6a3159` gitignored `providers/data/` on 2026-07-17). At every revision that has
+/// them, the module is a two-line re-export of a JSON file that is in git nowhere, and the JSON is
+/// produced by `packages/ai/scripts/generate-models.ts` from a **network** fetch of models.dev
+/// (`v0.84.4 packages/ai/scripts/generate-models.ts:2334` reads `data[source]?.models`, `:1944`
+/// `processBasetenModels(data.baseten)`). Everything the generator hardcodes for them survives in
+/// git — `baseUrl`, `compat`, `thinkingFormat`, the thinking-level ladders and the Individual
+/// allowlist (`:290-334`, `:1259-1330`, `:2303-2380`) — but `cost`, `contextWindow`, `maxTokens`,
+/// `name`, `reasoning` and the input modalities are models.dev's, and only models.dev has them.
+const UNPORTED: &[Unported] = &[
+    Unported {
+        stem: "together",
+        reason: UnportedReason::HandPorted,
+        item: "PROV-060",
+        why: "cyrup hand-ports Together's rows as Rust literals in \
+              `providers/together.rs::together_models()`, so there is no JSON catalog to generate",
+    },
+    Unported {
+        stem: "baseten",
+        reason: UnportedReason::DataNotInGit,
+        item: "DRIFT-009",
+        why: "added at c1019d920, 17 days after the b0c2a90e extraction floor; the module has \
+              never been anything but a re-export of gitignored data/baseten.json",
+    },
+    Unported {
+        stem: "qwen-token-plan",
+        reason: UnportedReason::DataNotInGit,
+        item: "DRIFT-009",
+        why: "added at bbb91fa8a as a `values as { … }` type-only literal — the model IDS are in \
+              git there, the costs, context windows and maxTokens never were",
+    },
+    Unported {
+        stem: "qwen-token-plan-cn",
+        reason: UnportedReason::DataNotInGit,
+        item: "DRIFT-009",
+        why: "added at bbb91fa8a alongside qwen-token-plan and blocked identically",
+    },
+    Unported {
+        stem: "qwen-token-plan-individual",
+        reason: UnportedReason::DataNotInGit,
+        item: "DRIFT-009",
+        why: "added at c03d78bdc; a narrowed view of the same models.dev source, so it inherits \
+              the same block",
+    },
+];
 
 /// A row-level divergence from `b0c2a90e` that the regeneration must PRESERVE.
 ///
@@ -336,6 +433,8 @@ struct Args {
     out: PathBuf,
     check: bool,
     diff: bool,
+    /// `Some(rev)` selects the provider-set audit at `rev` instead of generating anything.
+    roster: Option<String>,
 }
 
 fn workspace_root() -> PathBuf {
@@ -353,6 +452,7 @@ fn parse_args() -> Result<Args, String> {
         out: root.join("crates/cyrup-provider/src/providers"),
         check: false,
         diff: false,
+        roster: None,
     };
     let mut it = std::env::args().skip(1);
     let cmd = it.next().unwrap_or_default();
@@ -370,6 +470,7 @@ fn parse_args() -> Result<Args, String> {
             "--out" => args.out = PathBuf::from(value()?),
             "--check" => args.check = true,
             "--diff" => args.diff = true,
+            "--roster" => args.roster = Some(value()?),
             other => return Err(format!("unknown flag {other:?}")),
         }
     }
@@ -395,6 +496,9 @@ fn run() -> Result<(), String> {
 
 fn run_gen_catalogs() -> Result<(), String> {
     let args = parse_args()?;
+    if let Some(rev) = args.roster.clone() {
+        return run_roster(&args, &rev);
+    }
     let generated = generate_all(&args)?;
 
     if args.diff {
@@ -441,6 +545,172 @@ fn run_gen_catalogs() -> Result<(), String> {
     );
     for name in &differing {
         println!("  updated {name}");
+    }
+    Ok(())
+}
+
+// -------------------------------------------------------------------------- the provider roster --
+
+/// How the two roster tables account for the provider modules pi ships at one revision.
+#[derive(Debug)]
+struct Roster {
+    /// Modules [`CATALOGS`] generates a catalog from, in upstream order.
+    embedded: Vec<&'static CatalogSpec>,
+    /// [`UNPORTED`] entries pi ships at this revision.
+    unported_present: Vec<&'static Unported>,
+    /// [`UNPORTED`] entries pi does **not** ship at this revision — the four DRIFT-009 modules
+    /// against the `b0c2a90e` floor, which predates all of them. Reported, never an error: the
+    /// table describes pi's tip and the floor is allowed to be older than it.
+    unported_absent: Vec<&'static Unported>,
+}
+
+/// Account for every `*.models.ts` stem pi ships at one revision, or say which ones nobody has.
+///
+/// Pure so the accounting is testable without a pi checkout: the shell ([`run_roster`]) owns the
+/// `git ls-tree` and this owns the decision. Two conditions are hard errors, and both are silent
+/// today: a module pi ships that neither table names (a provider appeared and no catalog was
+/// filed — DRIFT-009's original failure), and a [`CATALOGS`] entry pi no longer ships (cyrup would
+/// keep embedding a retired provider, and a plain `gen-catalogs` run would fail far less legibly,
+/// on a missing `git show`).
+fn account_for_roster(upstream_stems: &[String]) -> Result<Roster, String> {
+    let mut embedded = Vec::new();
+    let mut unported_present = Vec::new();
+    let mut unaccounted = Vec::new();
+
+    for stem in upstream_stems {
+        if let Some(spec) = CATALOGS
+            .iter()
+            .find(|c| c.images_provider.is_none() && c.file == stem)
+        {
+            embedded.push(spec);
+        } else if let Some(u) = UNPORTED.iter().find(|u| u.stem == stem) {
+            unported_present.push(u);
+        } else {
+            unaccounted.push(stem.as_str());
+        }
+    }
+    if !unaccounted.is_empty() {
+        return Err(format!(
+            "pi ships {} provider module(s) this generator has never heard of: {}. Each one is a \
+             catalog cyrup does not embed. File it, then add it to CATALOGS (if its rows are \
+             extractable) or to UNPORTED with the ledger item that owns the absence — a roster \
+             that cannot disagree with the tree is how DRIFT-009 went four catalogs stale.",
+            unaccounted.len(),
+            unaccounted.join(", ")
+        ));
+    }
+
+    let retired: Vec<&str> = CATALOGS
+        .iter()
+        .filter(|c| c.images_provider.is_none())
+        .map(|c| c.file)
+        .filter(|file| !upstream_stems.iter().any(|s| s == file))
+        .collect();
+    if !retired.is_empty() {
+        return Err(format!(
+            "CATALOGS generates {} catalog(s) pi does not ship at this revision: {}. Either the \
+             revision is older than the port (expected for --rev b0c2a90e, not for a tag) or \
+             upstream retired the provider and the embedded catalog must be retired with it.",
+            retired.len(),
+            retired.join(", ")
+        ));
+    }
+
+    let unported_absent = UNPORTED
+        .iter()
+        .filter(|u| !upstream_stems.iter().any(|s| s == u.stem))
+        .collect();
+    Ok(Roster {
+        embedded,
+        unported_present,
+        unported_absent,
+    })
+}
+
+/// The `*.models.ts` stems pi ships at `rev`, in `git ls-tree` (byte) order.
+fn upstream_provider_stems(pi: &Path, rev: &str) -> Result<Vec<String>, String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(pi)
+        .args(["ls-tree", "--name-only", rev, "packages/ai/src/providers/"])
+        .output()
+        .map_err(|e| format!("cannot run git in {}: {e}", pi.display()))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git ls-tree {rev} packages/ai/src/providers/ failed in {}: {}",
+            pi.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| line.rsplit('/').next())
+        .filter_map(|name| name.strip_suffix(".models.ts"))
+        .map(str::to_string)
+        .collect())
+}
+
+/// `gen-catalogs --roster <rev>`: audit the provider SET at `rev`, writing nothing.
+///
+/// Beyond the accounting, this re-tests DRIFT-009's block rather than trusting the note above:
+/// every [`UnportedReason::DataNotInGit`] module is read at `rev` and must still fail to parse as a
+/// data literal. The day pi commits that data again — or reverts `a9f6a3159` — the block lifts and
+/// this fails, which is the only trigger the item can have while models.dev is its only source.
+fn run_roster(args: &Args, rev: &str) -> Result<(), String> {
+    let stems = upstream_provider_stems(&args.pi, rev)?;
+    if stems.is_empty() {
+        return Err(format!(
+            "no packages/ai/src/providers/*.models.ts at {rev} in {} — wrong --pi path or wrong \
+             revision",
+            args.pi.display()
+        ));
+    }
+    let roster = account_for_roster(&stems)?;
+
+    let mut unblocked = Vec::new();
+    for u in roster
+        .unported_present
+        .iter()
+        .filter(|u| u.reason == UnportedReason::DataNotInGit)
+    {
+        let src = git_show(
+            &args.pi,
+            rev,
+            &format!("packages/ai/src/providers/{}.models.ts", u.stem),
+        )?;
+        if tsdata::parse_models_module(&src).is_ok() {
+            unblocked.push(u.stem);
+        }
+    }
+    if !unblocked.is_empty() {
+        return Err(format!(
+            "UNPORTED marks {} module(s) as data-not-in-git, but at {rev} they parse as data \
+             literals: {}. The block has LIFTED — move them into CATALOGS, regenerate, and close \
+             the owning ledger item.",
+            unblocked.len(),
+            unblocked.join(", ")
+        ));
+    }
+
+    println!(
+        "gen-catalogs --roster {rev}: {} provider module(s) upstream — {} embedded, {} accounted \
+         for as unported",
+        stems.len(),
+        roster.embedded.len(),
+        roster.unported_present.len()
+    );
+    for u in &roster.unported_present {
+        let reason = match u.reason {
+            UnportedReason::HandPorted => "hand-ported",
+            UnportedReason::DataNotInGit => "data not in git (block re-tested at this revision)",
+        };
+        println!("  unported {} — {reason}, {} — {}", u.stem, u.item, u.why);
+    }
+    for u in &roster.unported_absent {
+        println!(
+            "  (not shipped at {rev}) {} — {}, listed because pi's tip ships it",
+            u.stem, u.item
+        );
     }
     Ok(())
 }
@@ -700,29 +970,128 @@ fn report_diff(args: &Args, generated: &[(String, String)]) -> Result<(), String
         )?;
         let next = index_rows(&tsdata::parse_json(body).map_err(|e| format!("{name}: {e}"))?)?;
 
-        for (id, row) in &next {
-            match current.get(id) {
-                None => {
+        for row in diff_catalog(&current, &next) {
+            match row {
+                RowDiff::Added(id) => {
                     println!("{name}: + {id}  (absent in cyrup, present upstream)");
                     added += 1;
                 }
-                Some(cur) => {
-                    for line in field_diff(cur, row) {
+                RowDiff::Removed(id) => {
+                    println!("{name}: - {id}  (shipped by cyrup, retired upstream)");
+                    removed += 1;
+                }
+                RowDiff::Changed(id, lines) => {
+                    for line in lines {
                         println!("{name}: ~ {id}  {line}");
                         changed += 1;
                     }
                 }
             }
         }
-        for id in current.keys() {
-            if !next.contains_key(id) {
-                println!("{name}: - {id}  (shipped by cyrup, retired upstream)");
-                removed += 1;
-            }
-        }
     }
     println!("\ntotals: {added} missing rows, {removed} retired rows, {changed} field differences");
     Ok(())
+}
+
+/// What happened to one model id between the on-disk catalog and the freshly extracted one.
+///
+/// Upstream's differ reports the same three outcomes off one walk of the sorted union of both
+/// sides' ids (`v0.84.4 scripts/diff-model-catalog.mjs:191-198`, where `beforeModel` and
+/// `afterModel` are each `undefined` when that side lacks the row). Naming them keeps the decision
+/// — which row moved, and how — separable from the printing, and is what lets the union walk be
+/// tested without capturing stdout.
+enum RowDiff {
+    /// Absent in cyrup, present upstream.
+    Added(String),
+    /// Shipped by cyrup, retired upstream.
+    Removed(String),
+    /// On both sides, with at least one field difference.
+    Changed(String, Vec<String>),
+}
+
+/// Classify one catalog's rows, walking the **sorted union** of both sides' model ids.
+///
+/// Port of `diff-model-catalog.mjs:191-195`: `modelIds` is the deduplicated, sorted union, and a
+/// row counts as unchanged when the two sides are equal **after canonicalization**, so an added
+/// row and a changed row that sort next to each other are reported next to each other rather than
+/// in two separate passes.
+fn diff_catalog(current: &BTreeMap<String, Val>, next: &BTreeMap<String, Val>) -> Vec<RowDiff> {
+    let mut ids: Vec<&String> = current.keys().chain(next.keys()).collect();
+    ids.sort();
+    ids.dedup();
+
+    let mut out = Vec::new();
+    for id in ids {
+        match (current.get(id), next.get(id)) {
+            (None, Some(_)) => out.push(RowDiff::Added(id.clone())),
+            (Some(_), None) => out.push(RowDiff::Removed(id.clone())),
+            (Some(cur), Some(row)) => {
+                if canonicalize(cur, "") == canonicalize(row, "") {
+                    continue;
+                }
+                out.push(RowDiff::Changed(id.clone(), field_diff(cur, row)));
+            }
+            (None, None) => {}
+        }
+    }
+    out
+}
+
+/// pi's thinking-level ladder, in the order its differ canonicalizes `thinkingLevelMap` keys into
+/// (`v0.84.4 scripts/diff-model-catalog.mjs:93`).
+const THINKING_LEVEL_ORDER: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// A key's position in [`THINKING_LEVEL_ORDER`], or "after everything" for a key that is not a
+/// thinking level — `THINKING_LEVEL_RANKS.get(left) ?? Number.POSITIVE_INFINITY`
+/// (`v0.84.4 scripts/diff-model-catalog.mjs:99-100`).
+fn thinking_level_rank(key: &str) -> usize {
+    THINKING_LEVEL_ORDER
+        .iter()
+        .position(|level| *level == key)
+        .unwrap_or(usize::MAX)
+}
+
+/// Canonicalize a catalog value for comparison, the way upstream's own differ does.
+///
+/// Port of `canonicalizeJson` / `sortJsonKeys` (`v0.84.4 scripts/diff-model-catalog.mjs:96-114`):
+/// object keys are sorted, except under a `thinkingLevelMap` or `values` parent, where they are
+/// ordered by the thinking ladder first and lexically only to break ties. **Array entries are
+/// canonicalized with no parent key** (`:106` calls `canonicalizeJson(entry)` with one argument),
+/// so a map nested inside an array does not inherit the ladder — ported literally rather than
+/// tidied, because the point of the port is that the two sides agree.
+///
+/// This is why the emitted catalogs keep upstream's declaration order on disk (`Val::Obj` is an
+/// ordered vector, and `--check` is a byte comparison) yet `--diff` reports no difference when only
+/// that order moves: reordering a `compat` block is not a data change, and a differ that says it is
+/// buries the rows that are.
+///
+/// The one deliberate approximation: JS breaks ties with `localeCompare`, this uses byte order.
+/// Every key pi emits is ASCII (`tsdata`'s module docs record that no `*.models.ts` at `b0c2a90e`
+/// contains a non-ASCII string), where the two agree.
+fn canonicalize(v: &Val, parent_key: &str) -> Val {
+    match v {
+        Val::Arr(items) => Val::Arr(items.iter().map(|i| canonicalize(i, "")).collect()),
+        Val::Obj(entries) => {
+            let ladder = parent_key == "thinkingLevelMap" || parent_key == "values";
+            let mut sorted: Vec<&(String, Val)> = entries.iter().collect();
+            sorted.sort_by(|(a, _), (b, _)| {
+                if ladder {
+                    thinking_level_rank(a)
+                        .cmp(&thinking_level_rank(b))
+                        .then_with(|| a.cmp(b))
+                } else {
+                    a.cmp(b)
+                }
+            });
+            Val::Obj(
+                sorted
+                    .into_iter()
+                    .map(|(k, v)| (k.clone(), canonicalize(v, k)))
+                    .collect(),
+            )
+        }
+        other => other.clone(),
+    }
 }
 
 fn index_rows(v: &Val) -> Result<BTreeMap<String, Val>, String> {
@@ -741,8 +1110,13 @@ fn index_rows(v: &Val) -> Result<BTreeMap<String, Val>, String> {
 }
 
 /// Field-by-field differences between two rows, as human-readable lines.
+///
+/// Both sides are [`canonicalize`]d first, so this reports only differences upstream's own differ
+/// would report: a key that moved is not a difference, and the lines come out in the same
+/// canonical order on every run.
 fn field_diff(cur: &Val, next: &Val) -> Vec<String> {
-    let (Val::Obj(a), Val::Obj(b)) = (cur, next) else {
+    let (cur, next) = (canonicalize(cur, ""), canonicalize(next, ""));
+    let (Val::Obj(a), Val::Obj(b)) = (&cur, &next) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -925,6 +1299,268 @@ mod tests {
         let err = apply_deltas(&spec, rows).unwrap_err();
         assert!(err.contains("stale and must be re-decided"), "{err}");
         assert!(err.contains("gpt-5.6-sol"), "{err}");
+    }
+
+    /// Every `packages/ai/src/providers/*.models.ts` pi ships at `v0.84.4`, from
+    /// `git -C tmp/pi ls-tree v0.84.4 --name-only packages/ai/src/providers/`. Hard-coded rather
+    /// than shelled out for so the accounting is testable with no pi checkout — the checkout is
+    /// `--roster`'s job, this is the decision's.
+    fn upstream_stems_at_v0_84_4() -> Vec<String> {
+        [
+            "amazon-bedrock",
+            "ant-ling",
+            "anthropic",
+            "azure-openai-responses",
+            "baseten",
+            "cerebras",
+            "cloudflare-ai-gateway",
+            "cloudflare-workers-ai",
+            "deepseek",
+            "fireworks",
+            "github-copilot",
+            "google-vertex",
+            "google",
+            "groq",
+            "huggingface",
+            "kimi-coding",
+            "minimax-cn",
+            "minimax",
+            "mistral",
+            "moonshotai-cn",
+            "moonshotai",
+            "nvidia",
+            "openai-codex",
+            "openai",
+            "opencode-go",
+            "opencode",
+            "openrouter",
+            "qwen-token-plan-cn",
+            "qwen-token-plan-individual",
+            "qwen-token-plan",
+            "together",
+            "vercel-ai-gateway",
+            "xai",
+            "xiaomi-token-plan-ams",
+            "xiaomi-token-plan-cn",
+            "xiaomi-token-plan-sgp",
+            "xiaomi",
+            "zai-coding-cn",
+            "zai",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+    }
+
+    /// DRIFT-009's shortfall, stated as an assertion instead of prose: pi ships 39 provider
+    /// modules at `v0.84.4`, cyrup embeds 34 of them, and the other five are named — one because
+    /// its rows live in Rust, four because their rows are in git at no revision.
+    #[test]
+    fn the_v0_84_4_provider_roster_is_fully_accounted_for() {
+        let stems = upstream_stems_at_v0_84_4();
+        assert_eq!(stems.len(), 39);
+        let roster = account_for_roster(&stems).unwrap();
+        assert_eq!(roster.embedded.len(), 34);
+        assert!(roster.unported_absent.is_empty());
+
+        let mut blocked: Vec<&str> = roster
+            .unported_present
+            .iter()
+            .filter(|u| u.reason == UnportedReason::DataNotInGit)
+            .map(|u| u.stem)
+            .collect();
+        blocked.sort_unstable();
+        assert_eq!(
+            blocked,
+            vec![
+                "baseten",
+                "qwen-token-plan",
+                "qwen-token-plan-cn",
+                "qwen-token-plan-individual"
+            ]
+        );
+        assert!(
+            roster
+                .unported_present
+                .iter()
+                .all(|u| !u.why.is_empty() && !u.item.is_empty())
+        );
+    }
+
+    /// The extraction floor predates all four blocked providers, which is *why* they are blocked —
+    /// so the floor must audit clean and say which entries it is too old to see.
+    #[test]
+    fn the_extraction_floor_is_accounted_for_and_predates_the_blocked_four() {
+        let stems: Vec<String> = upstream_stems_at_v0_84_4()
+            .into_iter()
+            .filter(|s| !s.starts_with("baseten") && !s.starts_with("qwen-token-plan"))
+            .collect();
+        assert_eq!(stems.len(), 35);
+        let roster = account_for_roster(&stems).unwrap();
+        assert_eq!(roster.embedded.len(), 34);
+        assert_eq!(roster.unported_present.len(), 1);
+        assert_eq!(roster.unported_absent.len(), 4);
+    }
+
+    /// The failure this whole table exists to catch: pi adds a provider and nobody files a catalog
+    /// for it. Silence here is how DRIFT-009 stayed four catalogs stale across nine sweeps.
+    #[test]
+    fn an_unaccounted_upstream_module_is_a_hard_error() {
+        let mut stems = upstream_stems_at_v0_84_4();
+        stems.push("brand-new-provider".to_string());
+        let err = account_for_roster(&stems).unwrap_err();
+        assert!(err.contains("brand-new-provider"), "{err}");
+        assert!(err.contains("never heard of"), "{err}");
+    }
+
+    /// The mirror failure: cyrup keeps embedding a catalog upstream has retired.
+    #[test]
+    fn an_embedded_catalog_pi_no_longer_ships_is_a_hard_error() {
+        let stems: Vec<String> = upstream_stems_at_v0_84_4()
+            .into_iter()
+            .filter(|s| s != "zai")
+            .collect();
+        let err = account_for_roster(&stems).unwrap_err();
+        assert!(err.contains("zai"), "{err}");
+        assert!(err.contains("does not ship"), "{err}");
+    }
+
+    /// A stem in both tables would make the accounting ambiguous and hide whichever branch lost.
+    #[test]
+    fn the_two_roster_tables_are_disjoint() {
+        for u in UNPORTED {
+            assert!(
+                !CATALOGS
+                    .iter()
+                    .any(|c| c.images_provider.is_none() && c.file == u.stem),
+                "{} is in both CATALOGS and UNPORTED",
+                u.stem
+            );
+        }
+    }
+
+    /// Upstream's differ compares canonicalized JSON (`diff-model-catalog.mjs:195`), so moving a
+    /// key is not a data change. Before this port, `field_diff` compared `Val`s whose object
+    /// equality is order-sensitive and reported a reordered `compat` block as a difference on
+    /// every model in the catalog.
+    #[test]
+    fn key_order_alone_is_not_a_field_difference() {
+        let a = Val::Obj(vec![
+            ("id".into(), Val::Str("m".into())),
+            (
+                "compat".into(),
+                Val::Obj(vec![
+                    ("supportsStore".into(), Val::Bool(false)),
+                    ("maxTokensField".into(), Val::Str("max_tokens".into())),
+                ]),
+            ),
+        ]);
+        let b = Val::Obj(vec![
+            (
+                "compat".into(),
+                Val::Obj(vec![
+                    ("maxTokensField".into(), Val::Str("max_tokens".into())),
+                    ("supportsStore".into(), Val::Bool(false)),
+                ]),
+            ),
+            ("id".into(), Val::Str("m".into())),
+        ]);
+        assert_eq!(field_diff(&a, &b), Vec::<String>::new());
+    }
+
+    /// `sortJsonKeys` (`diff-model-catalog.mjs:96-103`) orders a `thinkingLevelMap` by the ladder,
+    /// not alphabetically, and everything else alphabetically.
+    #[test]
+    fn thinking_level_maps_canonicalize_in_ladder_order() {
+        let row = Val::Obj(vec![
+            ("reasoning".into(), Val::Bool(true)),
+            ("api".into(), Val::Str("openai-completions".into())),
+            (
+                "thinkingLevelMap".into(),
+                Val::Obj(vec![
+                    ("max".into(), Val::Str("max".into())),
+                    ("off".into(), Val::Str("none".into())),
+                    ("high".into(), Val::Str("high".into())),
+                    ("zzz-not-a-level".into(), Val::Null),
+                    ("low".into(), Val::Null),
+                ]),
+            ),
+        ]);
+        let Val::Obj(top) = canonicalize(&row, "") else {
+            panic!("object")
+        };
+        let keys: Vec<&str> = top.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["api", "reasoning", "thinkingLevelMap"]);
+
+        let Some((_, Val::Obj(map))) = top.iter().find(|(k, _)| k == "thinkingLevelMap") else {
+            panic!("thinkingLevelMap")
+        };
+        let levels: Vec<&str> = map.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            levels,
+            vec!["off", "low", "high", "max", "zzz-not-a-level"],
+            "unranked keys sort after every ladder key"
+        );
+    }
+
+    /// `canonicalizeJson(entry)` is called with ONE argument for array entries (`:106`), so a map
+    /// nested in an array does not inherit the ladder. Ported literally; pinned so a later tidy-up
+    /// cannot silently diverge from upstream's canonical form.
+    #[test]
+    fn array_entries_canonicalize_without_the_parent_key() {
+        let v = Val::Obj(vec![(
+            "thinkingLevelMap".into(),
+            Val::Arr(vec![Val::Obj(vec![
+                ("max".into(), Val::Null),
+                ("off".into(), Val::Null),
+            ])]),
+        )]);
+        let Val::Obj(top) = canonicalize(&v, "") else {
+            panic!("object")
+        };
+        let Some((_, Val::Arr(items))) = top.first() else {
+            panic!("array")
+        };
+        let Some(Val::Obj(entry)) = items.first() else {
+            panic!("entry")
+        };
+        let keys: Vec<&str> = entry.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["max", "off"], "alphabetical, not ladder order");
+    }
+
+    /// The union walk (`diff-model-catalog.mjs:191`): one pass in sorted id order, so an added row
+    /// and a changed row that sort next to each other are reported next to each other.
+    #[test]
+    fn diff_catalog_walks_the_sorted_union() {
+        let row = |name: &str| Val::Obj(vec![("name".into(), Val::Str(name.into()))]);
+        let current: BTreeMap<String, Val> = [
+            ("a".to_string(), row("a")),
+            ("b".to_string(), row("old")),
+            ("d".to_string(), row("d")),
+        ]
+        .into_iter()
+        .collect();
+        let next: BTreeMap<String, Val> = [
+            ("a".to_string(), row("a")),
+            ("b".to_string(), row("new")),
+            ("c".to_string(), row("c")),
+        ]
+        .into_iter()
+        .collect();
+
+        let seen: Vec<String> = diff_catalog(&current, &next)
+            .into_iter()
+            .map(|d| match d {
+                RowDiff::Added(id) => format!("+{id}"),
+                RowDiff::Removed(id) => format!("-{id}"),
+                RowDiff::Changed(id, lines) => format!("~{id}:{}", lines.len()),
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            vec!["~b:1", "+c", "-d"],
+            "`a` is unchanged and silent"
+        );
     }
 
     #[test]
