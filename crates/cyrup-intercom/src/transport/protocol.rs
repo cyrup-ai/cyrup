@@ -1726,11 +1726,20 @@ mod tests {
         })
         .expect("encodes");
         assert_eq!(
-            unbound
-                .as_object()
-                .map(|o| o.keys().map(String::as_str).collect::<Vec<_>>()),
-            // `serde_json::Map` is a `BTreeMap` in this build, so the assertion is on the KEY SET,
-            // which is what matters: no `targetId`, no `targetEpoch`.
+            unbound.as_object().map(|o| {
+                let mut keys = o.keys().map(String::as_str).collect::<Vec<_>>();
+                // The assertion is on the KEY SET, which is what ICOM-054 is about: no `targetId`,
+                // no `targetEpoch`. It is sorted rather than taken in map order because
+                // `serde_json::Map` is NO LONGER a `BTreeMap` in this build — `cyrup-acp`'s
+                // `agent-client-protocol` dependency declares `serde_json/preserve_order`
+                // non-optionally, and cargo feature unification is graph-wide, so every
+                // `serde_json::Map` in the workspace is now an `IndexMap` and iterates in
+                // INSERTION order (here `type`, `to`, `message` — the field order of
+                // `ClientMessage::Send`). Sorting keeps this test asserting the thing it says it
+                // asserts instead of the alphabetical accident of the old map type.
+                keys.sort_unstable();
+                keys
+            }),
             Some(vec!["message", "to", "type"]),
         );
 
