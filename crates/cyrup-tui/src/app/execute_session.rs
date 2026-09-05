@@ -80,8 +80,10 @@ impl<B: Backend> App<B> {
                 // Format chosen **by extension**, matching Pi (`handleExportCommand`,
                 // interactive-mode.ts:5106-5112): a `.jsonl` target writes the raw transcript;
                 // every other target (including no path) writes a styled HTML document — HTML is the
-                // default. cyrup renders the HTML body in-crate (`export::session_jsonl_to_html`) over
-                // the session's own JSONL; the rich tool-card renderer is the L5 residual.
+                // default. cyrup renders the document at the L5 seam
+                // (`cyrup_session_svc::session_jsonl_to_html_with_theme`) over the session's own
+                // JSONL, carrying the ACTIVE theme's palette as pi's `generateHtml` does
+                // (`core/export-html/index.ts:151-157` @v0.84.4).
                 let is_jsonl = arg
                     .as_deref()
                     .is_some_and(|p| p.trim_end().to_ascii_lowercase().ends_with(".jsonl"));
@@ -107,7 +109,10 @@ impl<B: Backend> App<B> {
                     // Pull the transcript as JSONL (no path ⇒ returned as text), render to HTML, write.
                     match session.export_to_jsonl(None).await {
                         Ok(Some(jsonl)) => {
-                            let html = crate::export::session_jsonl_to_html(&jsonl);
+                            let html = cyrup_session_svc::session_jsonl_to_html_with_theme(
+                                &jsonl,
+                                &session.export_theme(),
+                            );
                             // TUI-082 — bare `/export` WRITES A FILE. It used to `push_block` the
                             // raw HTML into the transcript, so the single most likely invocation
                             // produced no artifact and flooded scrollback with markup the user

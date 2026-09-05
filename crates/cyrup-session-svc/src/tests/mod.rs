@@ -19,6 +19,7 @@ mod ctx_state_and_abort;
 mod custom_tool_render;
 mod delete_session_file_trash;
 mod dispose_invalidates;
+mod export_html;
 mod fork_non_persisted;
 mod fork_parent_and_unsaved_guard;
 mod get_commands_source_info;
