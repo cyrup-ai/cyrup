@@ -348,7 +348,7 @@ counts**: they propose no work and say so, so they are bookkeeping rather than b
 | ~~DRIFT-045~~ | ~~low~~ **CLOSED 2026-08-15** | not-ported | S | — | Ctrl+V with text on the clipboard inserts nothing — **CLOSED 2026-08-15** (area-12 pass). `read_clipboard_text()` added to `crates/cyrup-tui/src/clipboard.rs` beside the existing writer, porting `utils/clipboard.ts:35-69` @v0.84.2 including the Wayland branch pi added this delta (`bfc679d5e`): `clipboard_read_plan(os, env)` is a pure function gated on pi's literal three-way conjunction `platform() === "linux" && isWaylandSession() && WAYLAND_DISPLAY` (`:53`), then `wl-paste --no-newline --type text`, then `arboard`. **The three-state result is preserved and it is the subtle part**: pi's `ClipboardReadResult` (`:35`) distinguishes ok-with-null from failed, and `readClipboardText` returns `result.text` whenever `ok` — so an EMPTY Wayland clipboard must NOT fall through to the X11-oriented native backend, or it would paste a stale selection. Modelled as `Option<Option<String>>`. **TAG CORRECTION, adversarial review 2026-08-15 — only the WAYLAND branch is v0.84.x drift; the text-paste half is not-ported AT THE PORTED TAG, and every in-source citation for it says @v0.84.2.** Re-derived: `readClipboardText` already exists at v0.83.0 (`clipboard.ts:36-47`, native-only), and `handleClipboardPaste` at v0.83.0 is `interactive-mode.ts:2635-2658` — image-first, `return` at `:2647`, `readClipboardText()` at `:2650` — structurally identical to v0.84.2's `:2870-2893`. So cyrup was missing a v0.83.0 behaviour, not lagging a v0.84.x one. This is the **twelfth** row in this file to take the upstream-drift → not-ported correction; the Kind column already reads not-ported, but the citations should be re-tagged when this file is next touched. Minor off-by-ones in the same in-source block, listed so they are not re-derived: pi's `READ_CLIPBOARD_OPTIONS` is `:37-41` (cited `:36-40`), `readWaylandClipboardText` is `:43-50` (cited `:42-48`), the native read is `:65-70` (cited `:64-67`), `text || null` is `:67` (cited `:66`), and the text read/insert is `:2885-2889` (cited `:2884-2888`). `App::paste_from_clipboard` is pi's `handleClipboardPaste` (`interactive-mode.ts:2870-2892`): image first, text second, and the two reads are closures so the LAZINESS is testable — pi returns at `:2882` and never reads text when an image was found. **`[CYRUP-DELTA]`s, both recorded in-file:** the read gate stays pi's literal `"linux"` where the WRITE side's existing delta widened `p !== "linux"` to "macOS or Windows" (a failed read degrades to "no text"; a silently-succeeding write does not, which is what justified widening the other one) — asserted as a test so the two are not "made consistent" later; and the 5 s timeout comes from `recv_timeout` over a helper thread running `Command::output()`, because `output()` drains the pipe (a 50 MB clipboard cannot deadlock, which a `try_wait` poll over a piped stdout would) but has no timeout, and the helper still holds the `Child` so it is reaped. |
 | ~~DRIFT-046~~ | ~~low~~ **CLOSED 2026-08-14** | upstream-drift | S | duplicate-of: `TOOL-036` | `normalizeWindowsShellPath` unported — Git-Bash/MSYS/Cygwin/WSL drive paths unconverted — **CLOSED 2026-08-14**: sweep 1 + 2 — **REOPENED AND RE-CLOSED, not a plain duplicate.** Sweep 1 closed it on TOOL-036's landing in `cyrup-tools/src/path.rs`, but a SECOND live instance existed in `crates/cyrup-config/src/paths.rs` — which is the 1:1 port of the very function upstream applies the rule inside (`utils/paths.ts` `normalizePath`) and was created AFTER this item was written, by CFG-025/CFG-036 — so cyrup ended sweep 1 with the rule in one copy of the normalizer and not the other. Now ported and applied at paths.ts:83-85's exact position (before the tilde expansion, inside the shared normalizer), with `test/paths.test.ts:133-150` ported verbatim INCLUDING the pass-through list, plus six extra grammar cases pinning where pi's regex backtracks and a hand parse does not. **The item's own Fix sentence — "Port the function into cyrup-resources (wherever `normalize_path` lives)" — names the wrong crate: `normalize_path` lives in cyrup-config, and cyrup-resources depends on it.** |
 | DRIFT-047 | low | upstream-drift | L | duplicate-of: `VL-P5` | `packages/telemetry` and the `pi.ai.request` span contract absent — **2026-08-15, BLOCKED (measured), still open**: area-12 pass, re-derived at `v0.84.2`. Still absent — `grep -rnE 'TelemetryContext\|TelemetrySpan\|telemetry_context' crates --include='*.rs'` → **0**. Upstream sizes re-measured: `packages/telemetry/src` is **935 lines** (`index.ts` 357, `testing/conformance.ts` 315, `memory.ts` 219, `noop.ts` 20, `testing/{index,types}.ts` 24) and `packages/agent/src/harness/telemetry.ts` — where the `pi.ai.request` schema actually lives — is **615**. The threading surface in `packages/ai` is still just two lines (`types.ts:123` declares `telemetryContext?`, `api/simple-options.ts:36` forwards it), so the item's "SDK-surface parity today" note holds at v0.84.2 as well. **Why not attempted here rather than deferred silently:** the item's own refuter note says to resolve it by EXTENDING `PARITY-GAPS` VL-P5, not by opening a second L workstream from this ID, and landing only the trait pair would put a `telemetry_context` field on `StreamOptions` with no emitter and no conformance suite behind it — an invented surface, which is the `PROV-061` failure mode. Needs the VL-P5 owner. |
-| DRIFT-053 | medium | upstream-drift | M | — | `/share` gained a Radius-first upload path in `v0.84.3`; cyrup's `/share` still only knows the old gist-only flow — **new 2026-09-04**, area-12 pass. Uniquely owned here. See row and body below. |
+| ~~DRIFT-053~~ | ~~medium~~ **CLOSED 2026-09-05** | upstream-drift | M | — | `/share` gained a Radius-first upload path in `v0.84.3`; cyrup's `/share` still only knew the old gist-only flow — **CLOSED 2026-09-05** (batch-3 pass; code `9de4254b`). **The BLOCKER this row was filed under is gone at this HEAD:** `DRIFT-019`/`PROV-014` landed the real `radius` provider kind (`cyrup-provider/src/providers/radius.rs`, registered at `providers/all.rs:199-202`), so `get_provider("radius")` resolves and `tryShareViaRadius` has something to call. `crates/cyrup-tui/src/app/execute_misc.rs::share_session` now follows pi's restructured `shareSession` (`modes/interactive/session-share.ts:46-89` @v0.84.4): export the branch as JSONL once, try `try_share_via_radius` (`:57`), and only on `false` run the pre-existing `gh auth status` → `exportToHtml` → `gh gist create` chain. `try_share_via_radius` returns `false` for exactly the two conditions upstream does — no radius provider (`:93`), no resolvable credential (`:98`) — and `true` for **every** post-request outcome, so a failed Radius upload reports and does NOT republish the session as a gist, which is the divergence the row's Verify line specifically forbade "improving" into a fallback. The upload and its reply classification are a new `cyrup-provider/src/providers/radius_share.rs` (`artifacts_url` ← `:112-114`, `upload_share_artifact` ← `:110-149`, `classify_artifact_response` ← `:126-140`, `radius_share_token` ← `:95-98`), placed there for the reason upstream keeps `DEFAULT_RADIUS_GATEWAY` in `packages/ai` (`session-share.ts:6`). `exportSessionForShare`'s `pi.share` trailing entry (`:25-43` over `core/session-export.ts:21`,`:31-36`) IS ported — `cyrup-tui/src/app/share.rs::append_share_metadata` — so the row's "if the Radius viewer needs it parsed" caveat is settled in the affirmative. **Tag-to-tag:** the file is byte-identical at `v0.84.3` and `v0.84.4` (`git -C tmp/pi diff v0.84.3 v0.84.4 --` on that path is empty); this row's own line cites were off by a few (`shareSession` is `:46-89` not `:46-70`, `tryShareViaRadius` `:91-150` not `:72-101`, `shareViaGist` `:152-203` not `:103-140`) and are corrected here. The row also missed a third search param, `title` (`:114`). **Two supporting changes:** `impl cyrup_provider::CredentialStore for cyrup_config::AuthStore` — the impl that file's own header has always claimed and which did not exist, needed because `resolve_provider_auth` rotates an expiring OAuth token through `modify` on the store it is handed (`ai/src/auth/resolve.ts:117-149`) and a rotated refresh token written into a discarded in-memory map would leave `auth.json` invalid; and `auth_credential` (`cli/auth-command.ts:120-125`) in `cyrup-provider/src/auth/helpers.rs`. **Proof:** `cyrup-tui tests::share_radius_route` drives the row's two Verify lines against a real `AgentSession` with a seeded `auth.json` — with a radius credential `/share` reports the Radius upload's own failure sentence and never reaches `gh` (no "GitHub CLI", no "Gist:"), without one no Radius message appears at all — and was established RED behaviourally, not merely by symbol (short-circuiting the ported call site to `if false && self.try_share_via_radius(..)` fails the first test and leaves the second passing). Plus `tests::share_url::radius_share_tests` (the `pi.share` entry shape, the null-parent case, the three reported outcomes) and `providers::radius_share::tests` (URL, the 2xx-without-an-artifact arm, pi's three-tier failure detail with JS falsiness, an unparseable body, the credential gate both ways). **RESIDUALS (new, low):** (a) cyrup's `ApiKeyAuth::resolve` carries a `&Model` pi's does not (`ai/src/auth/types.ts:190-193`: "Resolution is provider-scoped") and radius's catalog is dynamic, so `radius_share_token` builds a provider-scoped `Model` describing the gateway — a divergence in the auth trait, not in `/share`; (b) the share URL is printed unwrapped, since pi's `hyperlink()` (`:139`) needs the paint-time OSC-8 emitter that is `TUI-020`'s; (c) a 15 s upload timeout upstream does not set, matched to `radius.rs`'s config-fetch ceiling. |
 | ~~DRIFT-050~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | — | `CYRUP_TELEMETRY=` empty is an explicit OFF upstream and a silent no-op here — **CLOSED 2026-08-14**: sweep 2 — `CYRUP_TELEMETRY=` / `PI_TELEMETRY=` (set but empty) is now an explicit OFF that beats the settings opt-in, restoring pi's tri-state (unset / set-empty / set-truthy): the telemetry field no longer goes through the `!v.is_empty()` filter and takes the first key that is SET AT ALL, while the two sibling flags (`offline`, `skip_version_chk`) keep the per-key empty filter, which is indistinguishable from pi for them. **MECHANISM NOTE the item could not anticipate: this could not be tested by mutating the process environment, because `std::env::set_var` is `unsafe` under Rust 2024 and `cyrup-config` is `#![forbid(unsafe_code)]`. `EnvVars::from_lookup(get)` was added as a pure seam and `from_process` reduced to `from_lookup(\|k\| std::env::var(k).ok())`; `first_env` no longer exists. Any area file citing `cyrup-config/src/env.rs:50-53 first_env` is now stale, and any future env-tier parity item in that crate needs the same seam.** |
 | ~~DRIFT-051~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | S | — | `process.title`'s role suffix never set — RPC / runner / broker children are all bare `cyrup` in `ps` — **CLOSED 2026-08-14**: sweep 1 — duplicate of SEAM-070, fixed in the same sweep. **Sweep 2 carries SEAM-070's own caveat across: on macOS `pthread_setname_np` does not change what `ps -o comm=` prints, so this item's Verify line holds verbatim only on Linux.** |
 | ~~DRIFT-052~~ | ~~medium~~ **FILED AND CLOSED 2026-08-15** | upstream-drift | S | — | Fireworks GLM 5.2 lost pi's `openAICompat` — no session-affinity header and a long cache retention Fireworks does not honour — **FILED AND CLOSED 2026-08-15** (area-12 pass; this is the unrecorded item the pass was asked to give an id). pi `b9497c8c1` ("fix(ai): correct Fireworks GLM prompt caching, closes #7676") replaced the inline `candidate.compat = { supportsStore: false, supportsDeveloperRole: false }` the GLM rows carried at the ported tag (`ai/scripts/generate-models.ts:2151-2155` @v0.83.0) with the shared `openAICompat` constant `processFireworksModels` builds (`:1239-1244` @v0.84.2), adding `sendSessionAffinityHeaders: true` and `supportsLongCacheRetention: false`. **The tag attribution in the hand-off was off by one: it first ships in `v0.84.0`, not `v0.84.1`, and is unchanged at `v0.84.2`.** See the body below. |
@@ -372,7 +372,10 @@ medium, 6 low, of which ~~3~~ 2 are still open:** medium `DRIFT-004`\* *(closed 
 (\* = closed, kept for the ID census). **Superseded 2026-09-05 (batch-3): `DRIFT-004` is CLOSED**,
 so the table is 36 IDs = **27 closed + 9 open** — **6 severity-bearing (0 critical, 0 high, 4
 medium, 2 low)** + 3 trackers, and the uniquely-owned open set is **two** mediums (`DRIFT-041`,
-`DRIFT-053`). ~~This area's entire open-and-uniquely-owned set is three
+`DRIFT-053`). **Superseded again 2026-09-05 (same batch): `DRIFT-053` is CLOSED** (code
+`9de4254b`), so the table is 36 IDs = **28 closed + 8 open** — **5 severity-bearing (0 critical, 0
+high, 3 medium, 2 low)** + 3 trackers, and this area's uniquely-owned open set is **one** medium,
+`DRIFT-041`. ~~This area's entire open-and-uniquely-owned set is three
 mediums — `DRIFT-004`, `DRIFT-041`, `DRIFT-053`~~ — everything else open here (`DRIFT-009`,
 `DRIFT-015`, `DRIFT-019`, `DRIFT-047`, and the three trackers) is scheduled in its owning area and
 this file is read only for the extra evidence it carries.** ~~**Count:** 34 IDs =
@@ -1188,9 +1191,104 @@ a `node` toolchain this workspace does not have. Do not seed from the pi.dev art
 
 **Verify** — `cyrup --mode rpc`, then `ps -o comm= -p <pid>` returns `cyrup-rpc`; an interactive session returns `cyrup`; a live `__subagent-runner` child returns its own name. All three return `cyrup` today.
 
-## DRIFT-053 — `/share` gained a Radius-upload-first path in `v0.84.3`; cyrup still only knows the old gist-only flow
+## ~~DRIFT-053~~ — `/share` gained a Radius-upload-first path in `v0.84.3`; cyrup still only knows the old gist-only flow — **CLOSED 2026-09-05**
 
-**Kind** upstream-drift · **Severity** medium · **Effort** M · **Confidence** high
+**Kind** upstream-drift · **Severity** ~~medium~~ **CLOSED** · **Effort** M · **Confidence** high
+
+> **CLOSED 2026-09-05** (batch-3 pass; code `9de4254b`, `crates/cyrup-tui`, `crates/cyrup-provider`,
+> `crates/cyrup-config`). Re-derived two-sided at `v0.84.4` before any code was written.
+>
+> **The blocker is gone, and that is the first thing this pass established.** The Fix below ends
+> *"do not attempt this before `DRIFT-019`/`PROV-014` registers a `radius` provider"*. At this HEAD
+> it is registered: `crates/cyrup-provider/src/providers/radius.rs` is the real provider **kind**
+> (`pi-messages`, env-key **or** OAuth, dynamic catalog off `GET {gateway}/v1/config`) and
+> `providers/all.rs:199-202` constructs it, so `get_provider("radius")` resolves and the
+> credential the upload needs is resolvable through the ordinary request-auth path.
+>
+> **What landed.** `share_session` (`crates/cyrup-tui/src/app/execute_misc.rs`) is now pi's
+> restructured `shareSession` (`session-share.ts:46-89`): one JSONL export, then
+> `try_share_via_radius` (`:57`), then — only on `false` — the pre-existing `gh auth status`
+> (`:59-68`) → `exportToHtml` (`:70-76`) → `shareViaGist` (`:152-203`) chain, unchanged.
+> `try_share_via_radius` is `tryShareViaRadius` (`:91-150`) and its RETURN VALUE is the contract:
+> `false` — go publish a gist — for exactly the two credential-shaped conditions upstream returns it
+> for (`:93` no provider, `:98` no credential), and `true` for every outcome after the request is
+> sent. A 403 from the gateway therefore ends `/share` with an error; it does **not** fall through
+> and publish the gist the Radius configuration exists to avoid. The transport and the reply
+> classification are a new `crates/cyrup-provider/src/providers/radius_share.rs`, beside
+> `DEFAULT_RADIUS_GATEWAY` — the same placement upstream uses (`packages/ai`, imported at
+> `session-share.ts:6`). `exportSessionForShare`'s `pi.share` trailing entry (`:25-43`, over
+> `core/session-export.ts:21`/`:31-36`) is ported as `app/share.rs::append_share_metadata`, so this
+> item's own "if the Radius viewer needs it parsed" caveat is settled in the affirmative: `parentId`
+> is the last exported entry's id and `timestamp` is the **session header's**, both recovered from
+> the serialized document so the appended entry cannot disagree with it.
+>
+> **Corrections to this row's own evidence,** found by reading the file rather than the row:
+> `shareSession` is `:46-89` (not `:46-70`), `tryShareViaRadius` `:91-150` (not `:72-101`),
+> `shareViaGist` `:152-203` (not `:103-140`), and the URL carries a THIRD search param the row does
+> not mention — `title` (`:114`). The file is **byte-identical at `v0.84.3` and `v0.84.4`**
+> (`git -C tmp/pi diff v0.84.3 v0.84.4 -- packages/coding-agent/src/modes/interactive/session-share.ts`
+> is empty), so the ADR-0006 latest-tag target and the row's `v0.84.3` attribution agree.
+>
+> **Two supporting changes, each doing only what this item needs.**
+> (1) `impl cyrup_provider::CredentialStore for cyrup_config::AuthStore` — the impl
+> `cyrup-config/src/auth.rs`'s own header has claimed since it was written, and which **did not
+> exist**: the trait's only implementation in the workspace was `InMemoryCredentialStore`, which is
+> why `crates/cyrup/src/credential_print.rs` seeds one from `auth.json` and throws it away. Fine for
+> a read-only print, wrong here: `resolve_provider_auth` rotates an expiring OAuth token by calling
+> `modify` on the store it was handed (`ai/src/auth/resolve.ts:117-149`), and writing the rotated
+> refresh token into a discarded map would leave `auth.json` holding a token the provider has
+> already invalidated. (2) `auth_credential` — pi `getAuthCredential`
+> (`cli/auth-command.ts:120-125`) — in `cyrup-provider/src/auth/helpers.rs`, with both JS falsiness
+> rules preserved.
+>
+> **Design decisions** (batch-3 guidance). `RadiusShareOutcome { Shared, Failed }` and
+> `ShareUpload { Gist, Radius }` are explicit domain enums rather than `Result<String, String>` /
+> an `Output` plus a nullable field. The invariant: a non-2xx gateway reply is an **ordinary,
+> reported** outcome of `/share`, not a technical failure to propagate — precisely the distinction
+> the Verify line turns on. What becomes impossible: a `?` that silently swallows a reported error,
+> and adding a third upload path without saying what the user is told (`apply_share_outcome` matches
+> exhaustively). Still runtime-checked: which arm a given HTTP reply lands in — five tests.
+> Rejected: `Result<String, String>` (invites `?`), a bool + message pair (makes "failed with no
+> message" representable). Migration cost: `ShareMsg`'s two fields became one; `ShareMsg::new`
+> keeps its public signature for existing callers and `ShareMsg::radius` was added. Functional
+> core / imperative shell for the reply handling — `classify_artifact_response` is pure over
+> (status, statusText, body), so every branch's wording is asserted without a socket. **Not**
+> taken: typestate for the share lifecycle (its states are driven by external events and already
+> live as `App` runtime state; typestate would buy nothing over the enum).
+>
+> **`[CYRUP-DELTA]`s, all recorded in-source.** No temp file on the Radius path (the export is
+> POSTed from memory; pi writes one at `:47`/`:52` only because `exportSessionToJsonl` is a file
+> writer, and its `finally` at `:79-86` already tolerates a null path — which is why
+> `ShareInFlight::tmp` became an `Option`). A 200 whose `artifact` object carries no
+> `canonical_url` is reported as a failure, where upstream's truthy `!json?.artifact` would render
+> `Share URL: undefined`. A 15 s upload timeout upstream does not set, matched to `radius.rs`'s
+> config-fetch ceiling. The artifact title is rebranded `"Cyrup session"` (pi: `"Pi session"`),
+> while `customType: "pi.share"` and `DEFAULT_SHARE_VIEWER_URL` are deliberately **not** rebranded —
+> both are matched by pi-operated services.
+>
+> **Proof.** `cyrup-tui tests::share_radius_route` drives the two Verify lines against a real
+> `AgentSession` over a seeded `auth.json`: with a radius credential `/share` reports the Radius
+> upload's own failure sentence and **never reaches `gh`** (no `GitHub CLI`, no `Gist:`); without
+> one, no Radius message appears at all. No socket leaves the machine — the gateway is redirected to
+> a closed local port through `App::set_radius_share_gateway`, the sibling of
+> `set_login_provider_source` and mandated by the same "tests must never hit real provider APIs"
+> convention. **Red established behaviourally, not merely by symbol:** short-circuiting the ported
+> call site to `if false && self.try_share_via_radius(..)` fails the first test and leaves the
+> second passing. Also `tests::share_url::radius_share_tests` (entry type / parentId / header
+> timestamp / tool shape, the null-parent case, the three reported outcomes) and
+> `providers::radius_share::tests` (URL with both params, the 2xx-without-an-artifact arm, pi's
+> three-tier failure detail with JS falsiness, an unparseable body, the credential gate both ways).
+>
+> **RESIDUALS (new, low, none of them `/share`'s).** (a) cyrup's `ApiKeyAuth::resolve` carries a
+> `&Model` pi's does not — `ai/src/auth/types.ts:190-193` states resolution is provider-scoped —
+> and radius's catalog is dynamic, so `radius_share_token` builds a provider-scoped `Model`
+> describing the gateway rather than a placeholder; the trait divergence is what forces it and
+> belongs to whoever next touches `cyrup-provider`'s auth surface. (b) The share URL is printed
+> unwrapped: pi's `hyperlink()` (`:139`) needs the paint-time OSC-8 emitter that is `TUI-020`'s
+> (area 07), the same residual `login_dialog.rs` records for `DRIFT-042` half (b). (c) The
+> `"Uploading to Radius..."` loader is mounted and cancellable, but no pty-driven observation of it
+> was made this pass — the cancel path is asserted at the message level
+> (`a_cancelled_radius_upload_prints_nothing`), not on screen.
 
 *(Filed 2026-09-04, area-12 pass, from the v0.84.2→v0.84.4 diff-stat skim. New relative to this
 file's own baseline: `packages/coding-agent/src/modes/interactive/session-share.ts` does not exist
