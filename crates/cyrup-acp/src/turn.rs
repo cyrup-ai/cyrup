@@ -48,8 +48,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, ContentChunk, Meta, PromptResponse, SessionId, SessionInfoUpdate,
-    SessionNotification, SessionUpdate, StopReason, TextContent,
+    ContentBlock, ContentChunk, Cost, Meta, PromptResponse, SessionId, SessionInfoUpdate,
+    SessionNotification, SessionUpdate, StopReason, TextContent, UsageUpdate,
 };
 use agent_client_protocol::{BoxFuture, Client, ConnectionTo, Responder};
 use cyrup_core::EventStream;
@@ -725,6 +725,53 @@ pub trait TurnAgent: Send + Sync + 'static {
         let _ = abs;
         Box::pin(async move { FileSnapshot::unreadable(named) })
     }
+
+    /// The session's context-window occupancy and running cost, read once per settle so the
+    /// client's context meter and cost readout track the turn that just ended.
+    ///
+    /// # Why this is a seam and not a `translate` arm
+    ///
+    /// `SessionUpdate::UsageUpdate { used, size, cost }` needs the context **window**, and no
+    /// `AgentSessionEvent` carries it: `AgentEnd`'s terminal `AssistantMessage::usage`
+    /// (`crates/cyrup-core/src/message/usage.rs`) has the token counts and the cost but not the
+    /// model's window, so a pure translation would have to invent `size`. The window lives on the
+    /// session (`AgentSession::stats_context_usage`), which is why this is a call on the agent
+    /// rather than an arm of [`crate::translate::status_updates`].
+    ///
+    /// The default is `None` — "this agent has no usage to report" — which is the honest answer
+    /// for a test double and is also what an implementor that has not opted in gets. **A wrapper
+    /// around [`RuntimeAgent`] must forward this method, exactly as it forwards
+    /// [`TurnAgent::snapshot`]**, or the client's meter stays empty.
+    ///
+    /// **On `ACP-155`:** awaited on the pump, in the same class as [`TurnAgent::snapshot`]. It is
+    /// one in-memory fold over the session's entries behind one mutex — no client, no human, no
+    /// I/O — and it happens once per turn rather than once per event.
+    fn usage<'a>(&'a self) -> BoxFuture<'a, Option<UsageUpdate>> {
+        Box::pin(async move { None })
+    }
+}
+
+/// `SessionStats` → the ACP `usage_update` payload, or `None` when there is nothing honest to say.
+///
+/// The two `None`s are the whole content of this function and neither is cosmetic:
+///
+/// * **no `context_usage`** — `AgentSession::stats_context_usage` returns `None` when the model's
+///   window is `0`, i.e. unknown. `size` is a required `u64`, and `0` renders as a meter with no
+///   capacity.
+/// * **`tokens: None`** — Pi's post-compaction guard: right after a compaction the last assistant
+///   `usage` still describes the PRE-compaction context, so the occupied count is genuinely
+///   unknown until the next response (`crates/cyrup-session-svc/src/session/stats.rs`). `used` is
+///   a required `u64`, and reporting `0` would show an empty context window that is about to jump.
+///   Sending nothing leaves the client's last good value on screen, which is the truthful display.
+///
+/// The cost is always sent, `0.0` included: a session that has spent nothing has spent nothing,
+/// and USD is the currency `/session`'s own `Cost: $…` line already prints
+/// (`crate::commands::stats_text`).
+#[must_use]
+fn usage_update(stats: &cyrup_session_svc::SessionStats) -> Option<UsageUpdate> {
+    let context = stats.context_usage?;
+    let used = context.tokens?;
+    Some(UsageUpdate::new(used, context.context_window).cost(Cost::new(stats.cost, "USD")))
 }
 
 /// The production [`TurnAgent`]: `AgentSessionRuntime`'s live session, re-read per call.
@@ -802,36 +849,23 @@ impl TurnAgent for RuntimeAgent {
     }
 
     /// `ACP-156` — the session's own `FsOps`, never `std::fs`. See [`TurnAgent::snapshot`].
+    ///
+    /// The body is [`snapshot_through`], which takes the backend rather than reaching for it, so
+    /// the three-way classification is testable against a real `LocalFs`/`TraversalFs` stack
+    /// without standing a whole `AgentSessionRuntime` up (`ACP-131`). This method is then exactly
+    /// "which `FsOps`" — the session's, re-read per call, for the reason on [`RuntimeAgent`].
     fn snapshot<'a>(&'a self, abs: PathBuf, named: PathBuf) -> BoxFuture<'a, FileSnapshot> {
         Box::pin(async move {
             let fs = Arc::clone(&self.session().await.services().fs);
-            match fs.read(&abs).await {
-                Ok(bytes) => match String::from_utf8(bytes) {
-                    Ok(text) => FileSnapshot::read(named, text),
-                    // A binary file has no `Diff` to show. `unreadable` — not `absent` — is right:
-                    // `absent` would claim the file did not exist and produce a whole-file diff
-                    // with `oldText` omitted on the next write.
-                    Err(_) => FileSnapshot::unreadable(named),
-                },
-                // `ToolError` is a bare message (`cyrup_core::tool::ToolError`), so a read failure
-                // cannot be classified from its type and MUST NOT be classified from its text —
-                // parsing a diagnostic turns a copy-edit into a wire regression. The probe is
-                // `FsOps::metadata` through the SAME decorator stack: an entry the backend will
-                // describe but not read is `Unreadable` (a binary file, an `EACCES`), and one it
-                // will not describe at all is `Absent`.
-                //
-                // A path `TraversalFs` DENIES lands on `Absent` here, since it is denied both
-                // times. That is deliberate and it cannot leak: `Absent` only makes a diff
-                // *possible*, and the bytes in a diff come from the `After` read, which the same
-                // backend denies too — so `after.before` is `None` and `tool_execution_end` emits
-                // no diff at all. The confinement decides what is transmitted; this function only
-                // decides what is claimed about a file it could not open.
-                Err(_) => match fs.metadata(&abs).await {
-                    Ok(_) => FileSnapshot::unreadable(named),
-                    Err(_) => FileSnapshot::absent(named),
-                },
-            }
+            snapshot_through(fs.as_ref(), &abs, named).await
         })
+    }
+
+    /// The live session's own rollup, which is the same number `/session` prints and the same one
+    /// the TUI footer reads — one source, three surfaces. See [`TurnAgent::usage`] and
+    /// [`usage_update`].
+    fn usage<'a>(&'a self) -> BoxFuture<'a, Option<UsageUpdate>> {
+        Box::pin(async move { usage_update(&self.session().await.session_stats().await) })
     }
 
     fn abort<'a>(&'a self) -> BoxFuture<'a, ()> {
@@ -852,6 +886,51 @@ impl TurnAgent for RuntimeAgent {
             // of settlement than the latch `wait_for_idle` polls.
             self.session().await.abort();
         })
+    }
+}
+
+/// The `ACP-156` pre/post-mutation read, as a function of the backend it goes through.
+///
+/// This is the whole of [`RuntimeAgent`]'s [`TurnAgent::snapshot`]; it is a free function taking
+/// `&dyn FsOps` so that the three-way classification below — which decides what
+/// [`crate::translate::tool_execution_end`] claims about a file, and therefore what bytes reach the
+/// client inside `Diff.new_text` — can be driven against a real `LocalFs` and a real confined
+/// `TraversalFs` in a temp dir rather than only through a live `AgentSessionRuntime` (`ACP-131`:
+/// the classifier was the sole production producer of a [`FileSnapshot`] and was instantiated by
+/// no test, while every diff assertion in the crate hand-built its snapshots).
+///
+/// `abs` is the path resolved against the session cwd; `named` is the string the tool used, which
+/// is what the [`FileSnapshot`] carries so a later `Diff.path` is the one the client recognises.
+async fn snapshot_through(
+    fs: &dyn cyrup_tools::FsOps,
+    abs: &std::path::Path,
+    named: PathBuf,
+) -> FileSnapshot {
+    match fs.read(abs).await {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(text) => FileSnapshot::read(named, text),
+            // A binary file has no `Diff` to show. `unreadable` — not `absent` — is right:
+            // `absent` would claim the file did not exist and produce a whole-file diff
+            // with `oldText` omitted on the next write.
+            Err(_) => FileSnapshot::unreadable(named),
+        },
+        // `ToolError` is a bare message (`cyrup_core::tool::ToolError`), so a read failure
+        // cannot be classified from its type and MUST NOT be classified from its text —
+        // parsing a diagnostic turns a copy-edit into a wire regression. The probe is
+        // `FsOps::metadata` through the SAME decorator stack: an entry the backend will
+        // describe but not read is `Unreadable` (a binary file, an `EACCES`), and one it
+        // will not describe at all is `Absent`.
+        //
+        // A path `TraversalFs` DENIES lands on `Absent` here, since it is denied both
+        // times. That is deliberate and it cannot leak: `Absent` only makes a diff
+        // *possible*, and the bytes in a diff come from the `After` read, which the same
+        // backend denies too — so `after.before` is `None` and `tool_execution_end` emits
+        // no diff at all. The confinement decides what is transmitted; this function only
+        // decides what is claimed about a file it could not open.
+        Err(_) => match fs.metadata(abs).await {
+            Ok(_) => FileSnapshot::unreadable(named),
+            Err(_) => FileSnapshot::absent(named),
+        },
     }
 }
 
@@ -1402,6 +1481,15 @@ impl<R: PromptReply> TurnActor<R> {
                         RunTermination::Aborted => TurnOutcome::Cancelled,
                         RunTermination::Failed(failure) => TurnOutcome::Failed(failure),
                     };
+                // The context meter and the cost readout, once per settle, BEFORE `finish` — which
+                // sends the last notification and then the response, and between which `ACP-122`
+                // allows nothing. A client that renders `usage_update` gets the numbers cyrup
+                // already computes for `/session`; without this it has only the prose warning
+                // `status_updates` emits at the compaction threshold, which is the same fact with
+                // the numbers stripped out.
+                if let Some(usage) = self.agent.usage().await {
+                    self.emit(SessionUpdate::UsageUpdate(usage));
+                }
                 self.finish(outcome);
             }
             // `ACP-154` — respond, then rebind. In that order: the pending request must be
@@ -1565,6 +1653,17 @@ mod tests {
     }
 
     impl Recording {
+        /// Every notification, in order, as JSON — for assertions about update *kinds* and their
+        /// ordering rather than their text.
+        fn json(&self) -> Vec<serde_json::Value> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .map(|u| serde_json::to_value(u).expect("SessionUpdate serializes"))
+                .collect()
+        }
+
         fn texts(&self) -> Vec<String> {
             self.0
                 .lock()
@@ -1599,6 +1698,8 @@ mod tests {
         /// `prepare` that runs an `input` extension handler with a human behind it.
         block_start: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
         block_fold: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        /// What `usage` reports. `None` is the un-opted-in agent, which emits no `usage_update`.
+        usage: Option<UsageUpdate>,
         aborts: Arc<Mutex<usize>>,
         starts: Arc<Mutex<usize>>,
         folds: Arc<Mutex<usize>>,
@@ -1613,6 +1714,7 @@ mod tests {
                 refuse: None,
                 block_start: Mutex::new(None),
                 block_fold: Mutex::new(None),
+                usage: None,
                 aborts: Arc::new(Mutex::new(0)),
                 starts: Arc::new(Mutex::new(0)),
                 folds: Arc::new(Mutex::new(0)),
@@ -1686,6 +1788,10 @@ mod tests {
 
         fn rebound<'a>(&'a self) -> BoxFuture<'a, ()> {
             Box::pin(async move { Self::bump(&self.rebinds) })
+        }
+
+        fn usage<'a>(&'a self) -> BoxFuture<'a, Option<UsageUpdate>> {
+            Box::pin(async move { self.usage.clone() })
         }
     }
 
@@ -2147,6 +2253,123 @@ mod tests {
         );
         assert_eq!(queued_message_text(1), "Queued message (position 1).");
         assert_eq!(queued_message_text(12), "Queued message (position 12).");
+    }
+
+    /// The `usage_update` payload is a function of `SessionStats`, and its two refusals are the
+    /// whole of it: `used` and `size` are required `u64`s, so an unknown value has no honest
+    /// encoding and the update must be withheld rather than zeroed.
+    #[test]
+    fn an_unknown_context_count_withholds_the_usage_update_rather_than_reporting_zero() {
+        let stats = |context_usage| cyrup_session_svc::SessionStats {
+            session_file: None,
+            session_id: "s1".into(),
+            user_messages: 1,
+            assistant_messages: 1,
+            tool_calls: 0,
+            tool_results: 0,
+            total_messages: 2,
+            tokens: cyrup_session_svc::StatsTokens::default(),
+            cost: 0.125,
+            context_usage,
+        };
+
+        let update = usage_update(&stats(Some(cyrup_session_svc::StatsContextUsage {
+            tokens: Some(12_345),
+            context_window: 200_000,
+            percent: Some(6.17),
+        })))
+        .expect("a known occupancy is reportable");
+        assert_eq!(update.used, 12_345);
+        assert_eq!(update.size, 200_000);
+        let cost = update.cost.expect("the cost rides along");
+        assert!((cost.amount - 0.125).abs() < f64::EPSILON);
+        assert_eq!(cost.currency, "USD", "the currency `/session`'s own line prints");
+
+        assert!(
+            usage_update(&stats(Some(cyrup_session_svc::StatsContextUsage {
+                tokens: None,
+                context_window: 200_000,
+                percent: None,
+            })))
+            .is_none(),
+            "right after a compaction the occupied count is genuinely unknown; reporting 0 would \
+             show an empty context window that is about to jump"
+        );
+        assert!(
+            usage_update(&stats(None)).is_none(),
+            "no window means no meter to fill"
+        );
+    }
+
+    /// The context meter reaches the client once per settle, and it lands where `ACP-122` allows:
+    /// after the turn's own updates, before the queue-depth `session_info_update` that is the last
+    /// notification, and before the response.
+    #[tokio::test]
+    async fn the_settle_emits_one_usage_update_before_the_last_notification() {
+        let h = Harness::with(|mut agent| {
+            agent.usage = Some(UsageUpdate::new(1_000, 200_000).cost(Cost::new(0.5, "USD")));
+            agent
+        });
+        h.prompt();
+        h.settle_scheduler().await;
+        h.feed(AgentSessionEvent::AgentEnd {
+            messages: Vec::new(),
+            will_retry: false,
+        })
+        .await;
+        h.settle_scheduler().await;
+        assert!(
+            h.sink
+                .json()
+                .iter()
+                .all(|u| u["sessionUpdate"] != "usage_update"),
+            "an AgentEnd is not a settle (ACP-121), so no usage is reported yet"
+        );
+
+        h.feed(AgentSessionEvent::AgentSettled).await;
+        h.settle_scheduler().await;
+        assert_eq!(h.answers.taken(), vec![Ok(StopReason::EndTurn)]);
+
+        let json = h.sink.json();
+        let usage: Vec<&serde_json::Value> = json
+            .iter()
+            .filter(|u| u["sessionUpdate"] == "usage_update")
+            .collect();
+        assert_eq!(usage.len(), 1, "once per settle, not once per event: {json:?}");
+        assert_eq!(usage[0]["used"], 1_000);
+        assert_eq!(usage[0]["size"], 200_000);
+        assert_eq!(usage[0]["cost"]["currency"], "USD");
+
+        let last = json.last().expect("at least one notification");
+        assert_eq!(
+            last["sessionUpdate"], "session_info_update",
+            "the queue-depth update stays the LAST notification (ACP-122): {json:?}"
+        );
+        assert_eq!(
+            json[json.len() - 2]["sessionUpdate"],
+            "usage_update",
+            "and the meter is the one immediately before it: {json:?}"
+        );
+        h.shutdown().await;
+    }
+
+    /// The default: an agent that reports no usage sends no `usage_update` at all. A meter with
+    /// invented numbers in it is worse than no meter.
+    #[tokio::test]
+    async fn an_agent_with_no_usage_to_report_emits_no_usage_update() {
+        let h = Harness::new();
+        h.prompt();
+        h.settle_scheduler().await;
+        h.feed(AgentSessionEvent::AgentSettled).await;
+        h.settle_scheduler().await;
+        assert!(
+            h.sink
+                .json()
+                .iter()
+                .all(|u| u["sessionUpdate"] != "usage_update"),
+            "the default TurnAgent::usage is None and nothing fabricates one"
+        );
+        h.shutdown().await;
     }
 
     // -----------------------------------------------------------------------------------------
@@ -2910,6 +3133,117 @@ mod tests {
             answers.taken(),
             vec![Err(crate::error::INTERNAL_ERROR_CODE)],
             "the request was answered, not dropped"
+        );
+    }
+
+    /// ACP-131 / ACP-156 — the production classifier, driven against a real filesystem backend.
+    ///
+    /// Every diff assertion elsewhere in the crate hand-builds its `FileSnapshot::{read, absent,
+    /// unreadable}`; this is the one test that runs the function which DECIDES which of the three
+    /// a real file produces, through the same `FsOps` stack a session's own tools hold. The three
+    /// decisions it pins are each non-obvious and each wrong-answer-shaped:
+    ///
+    /// * non-UTF-8 bytes are `Unreadable`, **not** `Absent` — `Absent` would claim the file did
+    ///   not exist and fabricate a whole-file diff of a binary on the next write;
+    /// * a read failure is disambiguated by a second `FsOps::metadata` probe through the same
+    ///   decorator stack, not by parsing `ToolError`'s message;
+    /// * a `TraversalFs`-denied path lands on `Absent`, which is only safe because the `After`
+    ///   read is denied too — asserted below rather than argued.
+    #[tokio::test]
+    async fn the_snapshot_classifier_reads_a_real_file_through_the_sessions_own_fs() {
+        use cyrup_tools::ops::local::LocalFs;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let text = root.path().join("a.txt");
+        std::fs::write(&text, "before\n").expect("write");
+        let binary = root.path().join("b.bin");
+        std::fs::write(&binary, [0xff_u8, 0xfe, 0x00, 0x01]).expect("write");
+        let missing = root.path().join("gone.txt");
+
+        let fs = LocalFs;
+
+        assert_eq!(
+            snapshot_through(&fs, &text, PathBuf::from("a.txt")).await,
+            FileSnapshot::read("a.txt", "before\n"),
+            "an existing UTF-8 file is Content, carrying the name the TOOL used"
+        );
+        assert_eq!(
+            snapshot_through(&fs, &missing, PathBuf::from("gone.txt")).await,
+            FileSnapshot::absent("gone.txt"),
+            "a missing file is Absent: the write-to-a-new-file case, whose diff has old_text null"
+        );
+        let snapshot = snapshot_through(&fs, &binary, PathBuf::from("b.bin")).await;
+        assert_eq!(
+            snapshot,
+            FileSnapshot::unreadable("b.bin"),
+            "non-UTF-8 bytes are Unreadable — Absent here would diff the whole binary as new"
+        );
+        assert!(
+            !snapshot.is_diffable(),
+            "and Unreadable is what suppresses the diff (ACP-135)"
+        );
+    }
+
+    /// ACP-131 / ACP-156 — the confinement clause, which the classifier's own doc argues rather
+    /// than demonstrates: a `confine_to_cwd` session snapshots a path outside its root as `Absent`
+    /// (both the read AND the `metadata` probe are denied), and that is safe **only** because the
+    /// post-mutation re-read is denied by the same backend, so `tool_execution_end` emits no diff
+    /// and no bytes from outside the root ever reach `Diff.new_text`.
+    #[tokio::test]
+    async fn a_confined_session_snapshots_an_outside_path_as_absent_and_emits_no_diff() {
+        use cyrup_tools::isolation::TraversalFs;
+        use cyrup_tools::ops::local::LocalFs;
+
+        let jail = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("tempdir");
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "cleartext\n").expect("write");
+
+        let fs = TraversalFs::new(Arc::new(LocalFs), jail.path());
+        let named = PathBuf::from("../secret.txt");
+
+        let before = snapshot_through(&fs, &secret, named.clone()).await;
+        assert_eq!(
+            before,
+            FileSnapshot::absent(named.clone()),
+            "denied twice — by `read` and by the `metadata` probe — reads as Absent"
+        );
+
+        // The whole safety argument: `Absent` only makes a diff POSSIBLE. The bytes would have to
+        // come from the After read, which the same backend denies, so `before` is None there too.
+        let after = snapshot_through(&fs, &secret, named.clone()).await;
+        assert_eq!(after.before, None, "the After read is denied as well");
+
+        let mut ledger = ToolCallLedger::new(AbsCwd::parse("/work").expect("absolute"));
+        ledger.announce(crate::ledger::Announce {
+            id: "w1".into(),
+            class: crate::ledger::ToolClass::Mutation,
+            title: "write".into(),
+            status: crate::ledger::ToolStatus::InProgress,
+            locations: Vec::new(),
+            raw_input: None,
+            snapshot: Some(before),
+        });
+        let out = translate(
+            &mut ledger,
+            &cyrup_session_svc::AgentSessionEvent::ToolExecutionEnd {
+                tool_call_id: "w1".into(),
+                tool_name: "write".into(),
+                result: serde_json::json!({ "content": [{ "type": "text", "text": "ok" }] }),
+                is_error: false,
+            },
+            Some(after),
+        );
+        let updates: Vec<serde_json::Value> = out
+            .updates
+            .iter()
+            .map(|u| serde_json::to_value(u).expect("serializes"))
+            .collect();
+        assert!(
+            updates
+                .iter()
+                .all(|u| u["content"].is_null() || u["content"][0]["type"] != "diff"),
+            "a confined session must not transmit a diff for a path it refuses to open: {updates:?}"
         );
     }
 }

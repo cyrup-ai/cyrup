@@ -54,6 +54,12 @@ tracing = "0.1.44"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# `tests/end_to_end.rs` drives the REAL connection over an in-memory `Lines` transport against a
+# session whose provider is the scripted `FauxProvider`, so a whole turn — tool calls, diffs,
+# permission round-trip, cancellation — runs offline, deterministically, with no credential and no
+# spawned process. `serve()` takes an arbitrary transport for exactly this reason
+# (`connection.rs`). A DEV edge: the shipped crate has no provider dependency at all.
+cyrup-provider = { workspace = true, features = ["faux"] }
 # `PERMISSION_DIALOG_OPTIONS` — the four strings `LocalAskChannel::confirm` puts in its `select`.
 # A DEV edge only: `permission.rs` writes the same four out so its matcher can be reviewed without
 # opening another crate, and `the_permission_dialog_list_is_the_permission_systems_own` is what

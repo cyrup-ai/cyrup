@@ -10,10 +10,12 @@ core, everything-is-an-extension, an agent that can extend itself. It rebuilds t
 backbone.
 
 > **Status:** pre-release, and not yet versioned. The agent loop, provider layer, tool set, session
-> tree, terminal interface, extension host, all four run modes, the MCP client and the Flux
-> development pipeline work end to end. 21 crates, ~786k lines of Rust, 8,710 workspace tests and
-> 492 integration tests passing — those four figures were measured at code HEAD `6cf2cb9f`; the
-> batch since then added tests across nine crates and neither total has been re-derived.
+> tree, terminal interface, extension host, all five run modes, the MCP client and the Flux
+> development pipeline work end to end; the ACP adapter is in with its port unfinished. 22 crates,
+> ~825k lines of Rust and 9,200 workspace tests passing — re-derived at code HEAD `6200b01`
+> (`cargo test --workspace`, 11 ignored, all pre-existing). The 492 integration-test figure is the
+> one number NOT re-derived here; it was measured at `6cf2cb9f` and the batches since added tests
+> across ten crates.
 
 ## Install
 
@@ -49,6 +51,26 @@ an API key. Credentials are saved to `~/.cyrup/agent/auth.json` at mode `0600`.
 Installation itself writes only the binary. The agent directory appears the first time you log in,
 change a setting, or answer a trust prompt.
 
+### From an editor instead
+
+The terminal interface is one front-end. `cyrup --acp` serves the
+[Agent Client Protocol](https://agentclientprotocol.com) on stdio, so an editor that speaks ACP can
+drive the same agent — same tools, same permission prompts, same session files — inside its own UI.
+For Zed, add cyrup to `agent_servers` in `settings.json`:
+
+```json
+{
+  "agent_servers": {
+    "cyrup": { "command": "/usr/local/bin/cyrup", "args": ["--acp"], "env": {} }
+  }
+}
+```
+
+Then pick **External Agent → cyrup** in the agent panel. The editor launches the process and owns
+both pipes, so this is not a command you run yourself.
+[Zed and other ACP editors](docs/guide/guides/zed-acp.md) covers credentials, thinking levels and
+the command palette.
+
 ## What you get
 
 - **39 built-in providers** over 10 wire APIs, with 35 embedded model catalogs. Anthropic, OpenAI,
@@ -56,9 +78,10 @@ change a setting, or answer a trust prompt.
 - **The built-in tool set**: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, over an
   `FsOps`/`ProcOps` interface that tests substitute.
 - **A session tree on disk** as JSONL, with compaction, forking, import and export.
-- **Four run modes.** The terminal interface, plus `--mode print`, `--mode json` and `--mode rpc`
-  for scripting and embedding. `--tui-mode fullscreen` switches to an alternate-screen renderer with
-  mouse capture, a scrollbar, text selection and image support.
+- **Five run modes.** The terminal interface, plus `--mode print`, `--mode json` and `--mode rpc`
+  for scripting and embedding, and `--mode acp` to run as an
+  [editor's agent](docs/guide/guides/zed-acp.md). `--tui-mode fullscreen` switches to an
+  alternate-screen renderer with mouse capture, a scrollbar, text selection and image support.
 - **Subagent delegation**, a runtime permission gate over every tool call, a Unix-socket broker for
   supervisor-to-subagent coordination, an MCP client, and the Flux development pipeline.
 - **MCP over stdio and OAuth-protected HTTP**, with sampling, elicitation and a JSON-RPC wire tracer.
@@ -156,6 +179,7 @@ Dependencies point downward only. `cyrup-core` depends on nothing in-workspace, 
 | `cyrup-intercom` | Unix-socket broker for supervisor-to-subagent coordination |
 | `cyrup-flux` | the Flux structured development pipeline |
 | `cyrup-mcp` | MCP client: servers, tools, OAuth, sampling, elicitation, wire tracer, the `/mcp` surface |
+| `cyrup-acp` | Agent Client Protocol adapter: an editor (Zed is the reference client) drives cyrup over ACP JSON-RPC on stdio |
 | `cyrup-ext-sdk` | guest SDK for authoring extensions (`wasm32-wasip2`) |
 | `cyrup-test-support` | faux provider plus differential, interop and golden harnesses |
 | `cyrup-it` | the gated integration-test harness |
@@ -172,6 +196,7 @@ mdbook serve   # http://localhost:3000, live-reloads on save
 
 - [Install](docs/guide/getting-started/install.md) · [Connect a provider](docs/guide/getting-started/authenticate.md) · [Your first session](docs/guide/getting-started/first-session.md)
 - [The terminal interface](docs/guide/guides/tui.md) · [sessions](docs/guide/guides/sessions.md) · [models and thinking](docs/guide/guides/models.md) · [tools and permissions](docs/guide/guides/tools-and-permissions.md)
+- [Scripting and automation](docs/guide/guides/scripting.md) · [Zed and other ACP editors](docs/guide/guides/zed-acp.md)
 - [How extensions work](docs/guide/extensions/overview.md) · [subagents](docs/guide/extensions/subagents.md) · [permissions](docs/guide/extensions/permissions.md) · [intercom](docs/guide/extensions/intercom.md) · [Flux](docs/guide/extensions/flux.md)
 - [CLI reference](docs/guide/reference/cli.md) · [`settings.json`](docs/guide/reference/settings.md) · [environment variables](docs/guide/reference/environment.md) · [keybindings](docs/guide/reference/keybindings.md) · [troubleshooting](docs/guide/reference/troubleshooting.md)
 
@@ -294,19 +319,26 @@ protocol of its own. Flux follows `code_puppy_core_plugins`, which is Python.
 | `nicobailon/pi-intercom` | `cyrup-intercom` | v0.9.2 | v0.13.0 |
 | `nicobailon/pi-mcp-adapter` | `cyrup-mcp` | v2.26.1 | v2.32.1 |
 | `code_puppy_core_plugins` (Python) | `cyrup-flux` | v0.0.6 | v0.0.40 |
-| `svkozak/pi-acp` | `cyrup-acp` | not started — port planned | v0.0.33 |
+| `svkozak/pi-acp` | `cyrup-acp` | v0.0.33 | v0.0.33, the newest upstream |
 
 The Flux row's version gap is not a behaviour gap: the ported surface (`flux_bootstrap/`) is
 byte-identical across all 34 intervening tags.
 
-The pi-acp row is the newest and the only one with no code behind it yet. `cyrup-acp` will speak the
+The pi-acp row is the newest. `cyrup-acp` speaks the
 [Agent Client Protocol](https://agentclientprotocol.com) over stdio so an editor — Zed is the
-reference client — can drive cyrup the way it drives any other ACP agent. The port is planned in
-[`docs/gap-analysis/15-cyrup-acp.md`](docs/gap-analysis/15-cyrup-acp.md), whose first section is the
-decision that shapes everything else: pi-acp *must* spawn `pi --mode rpc` as a child and scrape
-untyped NDJSON off its stdout, because it is a separate npm package; `cyrup-acp` is a workspace
-crate and binds to `AgentSession` in-process instead, which deletes the whole subprocess surface and
-replaces `Record<string, unknown>` event probing with the typed `AgentSessionEvent`.
+reference client — can drive cyrup the way it drives any other ACP agent: `initialize`,
+`session/new`, `session/prompt` and the rest, with the turn streamed back as `session/update`
+notifications and `session/request_permission` requests. It is a **fourth front-end** beside the
+TUI, `--mode rpc` and print/json, not a new agent.
+
+The foundation is in — the turn, the permission seam, sessions and the command surface — but the
+port is **not complete**: [`docs/gap-analysis/15-cyrup-acp.md`](docs/gap-analysis/15-cyrup-acp.md)
+§6 is the authority for what is still open, and the tool-call streaming and structured-diff paths
+are unit-tested but have not been exercised against a live model end to end. That document's first
+section is the decision that shapes everything else: pi-acp *must* spawn `pi --mode rpc` as a child
+and scrape untyped NDJSON off its stdout, because it is a separate npm package; `cyrup-acp` is a
+workspace crate and binds to `AgentSession` in-process instead, which deletes the whole subprocess
+surface and replaces `Record<string, unknown>` event probing with the typed `AgentSessionEvent`.
 
 Clone all seven under `./tmp/` (gitignored) before working a ledger row. The area files cite them as
 `git -C tmp/<repo> show <tag>:<path>`, and a working tree's line numbers will mislead you.

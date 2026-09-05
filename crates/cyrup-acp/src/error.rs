@@ -297,8 +297,20 @@ pub enum AcpError {
     /// The transport ended, or a frame could not be written. Carries the SDK's own error.
     ///
     /// `ACP-004` — a `BrokenPipe`/`NotConnected` write failure is the client closing the pipe,
-    /// which is the ACP host's NORMAL termination, and `crate::run_acp` maps it to `Ok(())` rather
-    /// than surfacing it here. Anything that reaches this variant is a real transport fault.
+    /// which is the ACP host's NORMAL termination, and `run_acp_dispatch`
+    /// (`crates/cyrup/src/run.rs`) maps it to `Ok(())` rather than surfacing it here. Anything
+    /// that reaches this variant is a real transport fault.
+    ///
+    /// **Where the io text actually is.** Every transport io failure on this path is built by
+    /// `agent_client_protocol::Error::into_internal_error`, which is
+    /// `Error::internal_error().data(err.to_string())` (agent-client-protocol-schema-1.7.0
+    /// `src/v1/error.rs:132-136`), reached from the outgoing sink and the incoming stream alike
+    /// (agent-client-protocol-2.1.0 `src/jsonrpc/transport_actor.rs:129,:139,:149,:229`). So the
+    /// `Broken pipe (os error 32)` sits in the wire error's `data` field and `message` is
+    /// the literal `"Internal error"` — [`AcpFailure::into_error`]'s own doc records the same
+    /// strum trap from the other side, and a hang-up predicate that reads only `message` is dead
+    /// code. That is exactly the defect `ACP-004` was filed for; `is_client_hangup` matches on the
+    /// code plus `data`, with `message` kept only as a belt.
     #[error("acp transport: {0}")]
     Transport(agent_client_protocol::Error),
 

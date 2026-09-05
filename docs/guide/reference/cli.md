@@ -26,7 +26,8 @@ token starting with `-` or `@` is never a subcommand, so `cyrup @notes.md instal
 called `install` — not the installer.
 
 With no subcommand, cyrup starts the [terminal interface](../guides/tui.md), unless `--print`,
-`--mode json`, `--mode rpc`, or a non-TTY stdin or stdout selects a non-interactive mode.
+`--mode json`, `--mode rpc`, `--mode acp`, or a non-TTY stdin or stdout selects a non-interactive
+mode.
 
 ## Subcommands
 
@@ -275,14 +276,15 @@ More in [Sessions](../guides/sessions.md).
 
 | Flag | Argument | Meaning |
 |---|---|---|
-| `--mode` | `<text\|json\|rpc>` | Output mode; `text` is the default |
+| `--mode` | `<text\|json\|rpc\|acp>` | Output mode; `text` is the default |
 | `-p`, `--print` | — | Run the prompt to completion, print the final text, exit |
 | `--json` | — | Alias for `--mode json` |
 | `--rpc` | — | Alias for `--mode rpc` |
+| `--acp` | — | Alias for `--mode acp`; serve the Agent Client Protocol on stdio |
 | `--output-format` | `<text\|json>` | Alias: `text` means `--print`, `json` means `--mode json` |
 | `--tui-mode` | `<regular\|fullscreen>` | TUI renderer; `regular` is the default |
 
-Precedence when several are given: `rpc`, then `json`, then `print`. A non-TTY stdin or stdout
+Precedence when several are given: `acp`, then `rpc`, then `json`, then `print`. A non-TTY stdin or stdout
 selects print mode on its own, which is what makes `cyrup -p` redundant inside a pipe.
 
 A token beginning with `---` immediately after `-p`/`--print` is taken as the prompt, not as a flag:
@@ -292,7 +294,7 @@ genuine unknown long flag (`--weird`) is still captured as an extension flag.
 `--tui-mode fullscreen` parses but the alternate-screen renderer is not built in this release; cyrup
 warns and falls back to `regular`.
 
-`--json`, `--rpc` and `--output-format` are cyrup additions. Because they are known flags, an
+`--json`, `--rpc`, `--acp` and `--output-format` are cyrup additions. Because they are known flags, an
 extension cannot register a flag of the same name and receive it. See
 [Scripting and automation](../guides/scripting.md).
 

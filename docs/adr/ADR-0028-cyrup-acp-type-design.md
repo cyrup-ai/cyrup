@@ -2,8 +2,15 @@
 
 **Status** accepted (decided by default under the parity rule — overridable)
 **Date** 2026-09-05
-**Decides** the Rust type-design question for the unwritten `crates/cyrup-acp`, raised by area 15 (`docs/gap-analysis/15-cyrup-acp.md`)
+**Decides** the Rust type-design question for `crates/cyrup-acp`, raised by area 15 (`docs/gap-analysis/15-cyrup-acp.md`)
 **Blocks released** every area-15 unit whose `cyrup_mechanism` names a type this file defines — the `Turn` enum, the `ToolCallLedger`, `AbsCwd`/`SessionFile`/`AcpSessionId`, `AcpFailure::classify`, `SessionConfigKnob`, `TerminalAppender` and `DialogChoice`
+
+**Implementation status (2026-09-05, added after the fact)** — **`crates/cyrup-acp` EXISTS and is
+merged**: 12 modules, 18 043 lines, 216 unit tests, landed at `0aefd08` and merged to `main` at
+`ef4448d` (PR #123). This ADR was written before that, and several passages below still read in the
+future tense; they are the record of the decision, not a description of the tree. **Do not conclude
+from this document that the crate is unwritten.** For what is actually implemented versus still
+open, `docs/gap-analysis/15-cyrup-acp.md` §6 is the authority.
 
 ## Numbering note
 
@@ -14,7 +21,9 @@ line predates that claim. Numbers are never reused and never renumbered.
 
 ## Context
 
-This is an **opportunity review written before the crate exists**, not a refactor of shipped code.
+This is an **opportunity review written before the crate existed**, not a refactor of shipped code.
+It was written against the design; the crate has since landed (see **Implementation status** above),
+and the paragraphs below are preserved as written rather than rewritten in hindsight.
 Its subject is reconstructed from `svkozak/pi-acp` @ **v0.0.33** (`git -C tmp/pi-acp show
 v0.0.33:<path>`) and from the cyrup types `cyrup-acp` will sit on. No code was modified to produce
 it. It follows area 15's five surveys and their five adversary passes, and its invariant map is
@@ -137,7 +146,7 @@ impl Turn {
 
 **Guarantee not gained.** Rust cannot force `SettleAction` to actually be delivered — `#[must_use]` warns, it does not prove. Nothing here prevents the *session* from settling without ever emitting `AgentSettled` (a wedged tool, a panicking driver task); that still needs the shell's own timeout and still needs a test. And this says nothing about ordering relative to `session/update` notifications — that is F2.
 
-**Migration and compatibility cost.** None; the crate does not exist. The cost is that `Turn` must be behind the same lock as whatever drains the event stream, which is a design constraint on the per-session actor, not a refactor.
+**Migration and compatibility cost.** None; the crate did not exist when this was decided, and it landed with `Turn` in this shape. The cost is that `Turn` must be behind the same lock as whatever drains the event stream, which is a design constraint on the per-session actor, not a refactor.
 
 **Benefit versus ceremony.** Four fields and one dead one become one enum with three transitions. Strongly positive.
 
@@ -667,7 +676,9 @@ The whole `handlePiEvent` switch is now testable as `translate(&mut ledger, &eve
 
 ## 6. Incremental migration plan
 
-The crate does not exist, so this is the order in which types should *land*, each stage compiling and testable on its own.
+This was the order in which the types were to *land*, each stage compiling and testable on its own.
+**All six stages have landed** at `0aefd08`; the sequence is kept as the record of the intended
+dependency order, which a later refactor should still respect.
 
 1. **`AcpFailure` + `From<AcpFailure> for agent_client_protocol::Error` (F4).** No dependencies; needed by every handler's signature. Land it first so no handler is ever written with a `String` error, and so the `maybeAuthRequiredError` shape never appears in the tree at all. Ship with a table test asserting each named `SessionServiceError` variant's classification and the byte-exact ACP message.
 2. **`AbsCwd` + `SessionFile` (F3).** Also dependency-free, and required before any handler signature is fixed — retrofitting a newtype into signatures that already take `&Path` is the expensive direction. Land `AbsCwd` with the crate's first handler; land `SessionFile` when `session/delete` and `session/list` land, together with the decision to read `cyrup_session::listing` as the sole source of truth.

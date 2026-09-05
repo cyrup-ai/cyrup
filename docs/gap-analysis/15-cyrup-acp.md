@@ -34,9 +34,17 @@ print/json, and everything below the front-end is the `AgentSession` those three
 > wholly single-source; the 36 adversary-filed units are individually marked `single-source` in
 > `## Open items` because only one pass has seen them.
 >
-> **Nothing in this document is implemented.** `crates/cyrup-acp` does not exist. Every `verify`
-> line is a design, not an observation, and this is a static analysis: the only thing in the corpus
-> that was compiled and run is the Architecture phase's binding probe at `tmp/acp-probe/`.
+> **Implementation status — CORRECTED 2026-09-05.** This paragraph previously read *"Nothing in this
+> document is implemented. `crates/cyrup-acp` does not exist."* **That is no longer true and must not
+> be relied on.** The crate landed at `0aefd08` and merged to `main` at `ef4448d` (PR #123): 12
+> modules, 18 043 lines, 216 unit tests, plus `acp_session.rs` and `acp_transport.rs` in `cyrup-it`.
+>
+> What remains true from the original wording: the unit tables below were written as a **design**,
+> so a `verify` line states what was intended, not what has been observed. Treat a `verify` line as a
+> specification to check the code against — **not** as evidence the check was run. Section 6 is the
+> authority for what is open; the merge did not close every unit, and the tool-call streaming and
+> structured-diff paths in particular are unit-tested but were never exercised end to end (no
+> credentials to complete a `session/prompt`).
 >
 > **The Rust type design is a companion document, not a duplicate.**
 > [`../adr/ADR-0028-cyrup-acp-type-design.md`](../adr/ADR-0028-cyrup-acp-type-design.md) decides the

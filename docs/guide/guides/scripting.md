@@ -36,6 +36,7 @@ A `-p` run does not write a session file unless you asked for one with `--contin
 | `--mode text` | `--output-format text` | Plain text. The default. |
 | `--mode json` | `--json`, `--output-format json` | Structured events on stdout, for a program to parse. |
 | `--mode rpc` | `--rpc` | A request/response protocol for driving cyrup as a child process. |
+| `--mode acp` | `--acp` | The Agent Client Protocol, for an editor. See [Zed and other ACP editors](zed-acp.md). |
 
 `json` is what you want when a script consumes the result. `rpc` is what you want when another
 program owns the conversation and calls cyrup turn by turn. Both imply non-interactive behaviour.
