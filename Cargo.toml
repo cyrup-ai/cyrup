@@ -146,7 +146,34 @@ futures-core = { version = "0.3" }
 async-trait  = { version = "0.1" }
 thiserror    = { version = "2" }
 serde        = { version = "1",   features = ["derive", "rc"] }
-serde_json   = { version = "1" }
+# `preserve_order` is declared HERE, deliberately, and not inherited from an edge.
+#
+# `agent-client-protocol` (below) declares it non-optionally, so adding `crates/cyrup-acp` turns it
+# on for the whole graph whether or not this line says so. Leaving it implicit would make
+# `serde_json::Map`'s ordering depend on the SHAPE OF THE BUILD: `cargo build -p cyrup-mcp` alone
+# would get a `BTreeMap` and `cargo build --workspace` an `IndexMap`, which is the same
+# passes-alone/fails-under-`--workspace` hazard the `mermansi` block below rejected a crate for.
+# Declaring it makes every invocation agree.
+#
+# It is also REQUIRED independently of ACP. `docs/gap-analysis/13h-mcp-tui.md` prescribes it twice
+# as the cyrup mechanism, both times for a byte count that must match `JSON.stringify`'s: "the
+# `stringify` must reproduce V8's key order, which for a schema deserialized from JSON is insertion
+# order; a `BTreeMap`-backed value sorts keys and changes the byte count, hence every estimate."
+# Those units cannot be correct without this line. (`13i-mcp-protocol-and-verification.md` retracts
+# a THIRD, different prerequisite — `ElicitationSchema` property order, which `rmcp` carries itself.
+# That retraction is not about these two.)
+#
+# What it changes: `IndexMap` preserves insertion order where `BTreeMap` sorted keys. No production
+# site depended on the sort — every place that needs sorted output gets it from an explicit
+# `BTreeMap` (`cyrup_config::trust`, `cyrup_flux::install::save_manifest`) or an explicit key sort
+# (`cyrup_mcp::dirs::stable_stringify`). Two tests asserted the incidental ordering and were
+# corrected to assert what they said they asserted; `crates/cyrup-test-support/fixtures/pi/*.jsonl`
+# were regenerated, values identical and key order only — and the new order is the one pi actually
+# emits, where the old alphabetical order was not.
+#
+# `preserve_order_is_declared_workspace_wide` in `crates/cyrup-core/src/tests/` pins this so a
+# future dependency change cannot revert it silently. This is `ACP-Q1`, decided: accept, and own it.
+serde_json   = { version = "1", features = ["preserve_order"] }
 
 # arch-00 §7.1 ratified — first used by cyrup-tools (arch-03).
 ignore               = { version = "0.4.26" }
@@ -260,6 +287,12 @@ syntect              = { version = "5.3.0", default-features = false, features =
 # pi's `grok-mermaid` JS package (`components/mermaid.ts:2`), chosen 2026-08-28 after a crates.io
 # survey. MIT, and only three direct deps (`ascii-dag`, `chrono`, `unicode-width` — the last two
 # were already in this tree), so `#![forbid(unsafe_code)]` in cyrup-tui is unaffected.
+#
+# NOTE (2026-09-05): the `preserve_order` half of this rejection is now MOOT — the workspace
+# declares `serde_json/preserve_order` deliberately (see the comment on `serde_json` above), because
+# two `cyrup-mcp` units require it. `mermansi` stays rejected on its OTHER grounds: 151 transitive
+# crates including a CSS engine, and an alpha (`merman-core` 0.8.0-alpha.3) on the path. The
+# paragraph below is kept verbatim as the record of what was known at the time.
 #
 # `mermansi` was tried FIRST and REJECTED — record the reason so nobody re-picks it. It is a fine
 # renderer, but it pulls 151 transitive crates including a CSS engine, and one of them,

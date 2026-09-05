@@ -110,6 +110,37 @@ pub struct ModelRef {
 mod tests {
     use super::*;
 
+    /// `serde_json/preserve_order` is on for the whole workspace, and stays on.
+    ///
+    /// The workspace `Cargo.toml` declares it on `serde_json` deliberately rather than inheriting
+    /// it from `agent-client-protocol`'s non-optional edge, because two `cyrup-mcp` units compute a
+    /// byte count that must match `JSON.stringify`'s and a `BTreeMap`-backed value sorts keys and
+    /// changes it (`docs/gap-analysis/13h-mcp-tui.md`, twice). Left implicit, the ordering would
+    /// depend on the shape of the build — `-p cyrup-mcp` alone would sort, `--workspace` would not.
+    ///
+    /// This test fails if the feature is ever dropped: the keys below are inserted in an order that
+    /// is NOT alphabetical, so a `BTreeMap`-backed `serde_json::Map` reorders them. It asserts the
+    /// map's behaviour rather than any one caller's output, so it keeps holding as callers change.
+    #[test]
+    fn preserve_order_is_declared_workspace_wide() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"type":"send","to":"peer","message":"hi","id":"m1"}"#)
+                .expect("decodes");
+        let keys: Vec<&str> = v
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["type", "to", "message", "id"],
+            "serde_json::Map is not preserving insertion order — the workspace \
+             `serde_json/preserve_order` feature has been dropped. See the comment on \
+             `serde_json` in the workspace Cargo.toml before changing this."
+        );
+    }
+
     #[test]
     fn id_roundtrips_and_displays() {
         let p = ProviderId::from("anthropic");
