@@ -112,7 +112,7 @@ corrections are applied and recorded at the item.
 | ~~SUBA-091~~ | ~~medium~~ **CLOSED 2026-09-04** | S | fleet inspector / transcript containment | **Promoted out of `## Carried` 2026-09-04** (both sides read at v0.57.0 and v0.64.0 plus the upstream landing commit `9ceb5650`; confirmed exactly as filed, line drift only) **and ported at `681f6255`**: `FleetState::trusted_session_roots` is pi's `state.trustedSessionRoots` (`index.ts:895-898`: `defaultSessionDir` tilde-expanded + resolved, then the parent's subagent session root, deduped), seeded by `SubagentExecutor::fleet_state` through the pure `paths::trusted_session_roots`, and `async_detail` passes `unique_paths(state.trusted_session_roots)` where the literal `&[]` was, so the session-JSONL tail renders in the detail pane; the containment gate is unchanged. Residuals (low): pi's `trustedSessionFiles`/`trustedSessionFileRoot` rung and `trackedJob?.sessionRoot` are not carried; `subagent status`'s cyrup-original root triple differs from pi's `trustedSessionRootsForStatus` |
 | ~~SUBA-092~~ | ~~high~~ **CLOSED 2026-09-04** | M | discovery / agent schema | `excludeTools:`/`allowNestedSubagents:` ported at `247ff97b` — frontmatter, settings-override, serializer, and the spawn-plan tool subtraction / nested-fanout grant. v0.64.0's cross-field custom-override precedence change (`31562d76`) is a recorded residual, not this row |
 | ~~SUBA-093~~ | ~~medium~~ **CLOSED 2026-09-04** | M | background status model / child-scoped stop | `SUBA-087`'s residual, filed as its own item 2026-09-04 **and ported at `07f2df0d`**: `background/flat_index.rs` is pi's declaration-time flatten, so a `ParallelGroup` publishes one `RunStatus::steps` entry PER MEMBER named by its own agent; `ChainRunContext::step_slot` (`StepSlot::{Exclusive,Shared}`) carries pi's per-member `ctx.flatIndex` through the telemetry fold, `child_index`, the steer paths, the artifact index and the per-child stop handle, which `ExecSingleStepExecutor::run_single` now registers per DISPATCH. `subagent({action:"stop", id, childId:"step:1"})` against a 3-task fan-out stops member 1 alone. Residuals (low): a `DynamicGroup` keeps one shared slot (upstream's runtime splice, `:4155`, is not ported); group members go `Running` at group dispatch rather than per worker claim |
-| SUBA-094 | medium | M | completion notify / session-svc inject seam | `SUBA-090`'s residual, filed as its own item 2026-09-04 — **FIX SITE `crates/cyrup-session-svc` + `crates/cyrup-agent` (areas 08/03)**: `inject_message` drops `display` on the trigger-turn path (`AgentMessage::Custom` has no such field), so a `display: false` completion notice still renders |
+| ~~SUBA-094~~ | ~~medium~~ **CLOSED 2026-09-04** | M | completion notify / session-svc inject seam | `SUBA-090`'s residual, filed as its own item 2026-09-04 **and ported at `f9de9fe7`** (fix site `crates/cyrup-agent` + `crates/cyrup-session-svc` + `crates/cyrup-tui`, areas 03/08/07): `AgentMessage::Custom` carries a REQUIRED `display: bool`, so `send_custom_message`/`inject_message`/the guest `sendMessage` bridge put it ON the message the way pi's one `appMessage` does (`agent-session.ts:1483-1516` @v0.84.4) and all five delivery arms keep it; `subscriber.rs`'s run-loop append reads it where it hardcoded `true`, `raw_message_to_agent` restores it from the persisted entry, and the TUI's extractor became `displayable_custom_message_from_event`, pi's `if (message.display)` (`interactive-mode.ts:3607-3620`) placed where both live drawing callers funnel through. Residual (low): the guest bridge still reads a MISSING `display` as `true` where pi's `undefined` is falsy — unreachable from a type-conforming guest |
 
 > **RE-AUDITED 2026-09-04, cyrup HEAD `2571969`** (baseline `4fb5e40`, 09/09a combined pass). Of the
 > eleven items counted "confirmed, schedulable" above, **nine are now closed and one is
@@ -2495,12 +2495,20 @@ one collapsed record for the group — pre-existing, and out of this row's scope
 
 ---
 
-## SUBA-094 — A `display: false` completion notice still renders: the session-svc trigger-turn injection drops `display` because `AgentMessage::Custom` cannot carry it
+## ~~SUBA-094~~ — ~~medium~~ **CLOSED 2026-09-04** — A `display: false` completion notice still rendered: the session-svc trigger-turn injection dropped `display` because `AgentMessage::Custom` could not carry it
+
+> **CLOSED 2026-09-04 — landing commit `f9de9fe7`** (code), on top of `b0f9fbe5`. Both sides read
+> for this pass: cyrup at HEAD, `nicobailon/pi-subagents` at **v0.64.0** and `earendil-works/pi-mono`
+> at **v0.84.4** (the ADR-0006 parity targets) via `git show`. The filing was accurate in every
+> particular; it is reproduced below with the port-side half rewritten to what now exists, and with
+> two additions the closure work established (the persisted twin, and the two further arms that
+> dropped the flag).
 
 > **Filed 2026-09-04 from `SUBA-090`'s residual (1)** (review fix `6cf2cb9f`), so the residual is a
 > counted row rather than prose inside a closed one. **FIX SITE `crates/cyrup-session-svc` and
 > `crates/cyrup-agent` (areas 08 / 03), not this crate** — filed here so the enumeration is not
-> lost; the area-08 ledger agent may re-home it.
+> lost; the area-08 ledger agent may re-home it. The landed change also touches `crates/cyrup-tui`
+> (area 07), which is where pi's display gate lives.
 
 **Kind** port-bug (cross-crate seam) · **Severity** medium · **Effort** M · **Confidence** confirmed
 (both sides read for `SUBA-090` at v0.43.0, v0.57.0 and v0.64.0; cyrup re-read at HEAD).
@@ -2523,12 +2531,68 @@ false` on a triggering message — the model sees the notice, the screen does no
 **Impact** — every plain successful background completion is still drawn on screen; the `SUBA-090`
 fix is inert at the one surface a user sees.
 
-**Fix** — carry `display` with the Custom message: an `Option<bool>`/`bool` on
-`AgentMessage::Custom`, threaded by `inject.rs`'s trigger-turn branch and honoured by the TUI
-renderer (`cyrup-tui/src/app/extension_render.rs` reads the message off `message_end`).
+**Wider than filed (established while closing).** The trigger-turn branch was not the only arm
+that dropped the flag, because the flag was not on the message at all: `send_custom_message`'s
+`deliverAs` steer / follow-up / next-turn arms surface through the same `message_end` and likewise
+carried no `display`; the guest bridge `session/control.rs`'s own trigger-turn arm read `display`
+from the guest's JSON and then discarded it; and `subscriber.rs`'s run-loop append persisted every
+such message with a hardcoded `display: true` (its comment said so), so even once the live gate
+honoured the flag a hidden notice would have been redrawn on `--resume`. Four arms, one missing
+field. Note the asymmetry that made the defect survive review: the `--resume` walk
+(`cyrup-tui/src/app/session_bind.rs`, both the render pre-pass and the fold) has honoured
+`c.display` off the PERSISTED entry since it was written — the flag existed everywhere except on
+the live message.
 
-**Verify** — a background run that completes cleanly must reach the model (next turn sees the
-notice) and NOT be drawn on screen; a failed one must be drawn. Today both are drawn.
+**Fix (landed)** — `f9de9fe7`:
+* `crates/cyrup-agent/src/event.rs` — `AgentMessage::Custom` gains a REQUIRED `display: bool`
+  (not `Option<bool>`), emitted unconditionally by the hand-written serializer as pi emits it, and
+  defaulted to `true` by the hand-written deserializer when the key is absent (a producer predating
+  the field; those messages were all drawn).
+* `crates/cyrup-session-svc` — `session/inject.rs`'s `send_custom_message` and `inject_message`, and
+  `session/control.rs`'s guest `sendMessage` bridge, put the caller's `display` ON the message, so
+  every delivery arm carries it; `subscriber.rs` appends `*display` where it hardcoded `true`;
+  `event.rs`'s `raw_message_to_agent` restores it from the persisted entry so a resume /
+  compaction re-seed does not silently make a hidden message visible.
+* `crates/cyrup-tui` — `custom_message_from_event` became
+  `displayable_custom_message_from_event` and returns `None` for a hidden message. That is pi's
+  `if (message.display)` placed at the one point BOTH live drawing callers already funnel through:
+  the transcript push in `app/events_fold.rs` and the renderer dispatch in
+  `app/extension_render.rs`. pi's guard likewise wraps the `getMessageRenderer` lookup, so a hidden
+  message never reaches an extension renderer either.
+
+**Design decision (type-driven review).** The invariant encoded is that *a custom message and its
+display disposition are one value*, known at the single point pi knows it — the message
+constructor. A required non-`Option` field makes "constructed a live custom message without deciding
+whether it is drawn" unrepresentable; the compiler enumerated all 19 construction sites. Rejected:
+`Option<bool>` (the filing's own suggestion — it re-legalises "no decision" and pushes a default
+onto every reader, which is the bug in a new shape); a `CustomVisibility` domain enum (renames a
+field upstream calls `display: boolean`, must serialize back to a bool, buys no invariant a named
+`bool` field lacks); a side channel past the seam (would need replicating through the agent's
+steer/follow-up queues, i.e. four new chances to drop it); gating in the TUI fold rather than the
+extractor (leaves the renderer dispatch ungated, which pi's single `if` does cover). Still runtime
+questions, hence the tests: that each site passes the RIGHT value, that the gate suppresses, and
+that the flag survives serde both ways.
+
+**Verify (done)** — three suites, each red before and green after:
+* `cyrup-session-svc` `tests::inject_message_display` (new, the sibling of `inject_message_details`)
+  — the trigger-turn arm and the durable arm each put `display: false` on the live `MessageEnd` wire
+  AND in the persisted entry; `display: true` still rides the same route. Red established by
+  restoring the pre-fix behaviour in place (message built `display: true`, `subscriber.rs`
+  appending `true`): 2 of 3 failed, the `display: true` case passed.
+* `cyrup-tui` `tests::rich_messages::a_custom_message_with_display_false_is_not_drawn` — neither
+  label nor body reaches the scrollback; the same kind with `display: true` still draws. Red
+  established by removing the gate from `displayable_custom_message_from_event`.
+* `cyrup-agent` `tests::agent_message_role_key` — a JSON→JSON round trip of both polarities through
+  the hand-written serde pair, plus the absent-key default. Red established by dropping `display`
+  from the serializer's mirror enum.
+
+**Residual (low)** — the guest `sendMessage` bridge (`session/control.rs`) reads a MISSING `display`
+as `true`, where pi's `message.display` would be `undefined` and therefore falsy at
+`interactive-mode.ts:3609`. pi's own TS type makes the field required
+(`core/extensions/types.ts:1365-1368`), so only a non-conforming guest can reach the difference; it
+was left as filed rather than changed silently under this row. Unrelated to the flag: cyrup draws a
+custom message from `message_end` where pi draws it from `message_start`
+(`interactive-mode.ts:3234-3237`) — a pre-existing ordering delta this change does not touch.
 
 ---
 
