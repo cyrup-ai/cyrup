@@ -27,8 +27,9 @@ use tokio::task::AbortHandle;
 use crate::error::{IntercomError, Result};
 use crate::transport::framing::{FrameReader, encode_json};
 use crate::transport::protocol::{
-    Attachment, BrokerMessage, ClientMessage, Message, MessageContent, MessageControl,
-    MessageReceipt, SessionInfo, SessionRegistration, now_ms,
+    Attachment, BrokerMessage, ClientMessage, DeliveryState, EXACT_SEND_FEATURE, ExactTarget,
+    Message, MessageContent, MessageControl, MessageReceipt, SessionInfo, SessionRegistration,
+    now_ms,
 };
 use crate::transport::stream::{BrokerReadHalf, BrokerStream, BrokerWriteHalf};
 use crate::transport::target::BrokerConnectTarget;
@@ -73,7 +74,11 @@ pub struct SendOptions {
     pub provenance: Option<crate::transport::protocol::MessageProvenance>,
 }
 
-/// The result of a [`IntercomClient::send`] (`SendResult`, `client.ts:16-20`).
+/// The result of a [`IntercomClient::send`] (`SendResult`, `v0.13.0 broker/client.ts:16-24`).
+///
+/// ICOM-054 widened it with the ack's `DeliveryDetails` (`v0.13.0 types.ts:6-11`), which is what
+/// lets a caller distinguish "handed to the peer's socket" from "parked in the broker mailbox" and
+/// what [`IntercomClient::send`] keys its single rebound retry on.
 #[derive(Clone, Debug)]
 pub struct SendResult {
     /// The message id.
@@ -82,6 +87,37 @@ pub struct SendResult {
     pub delivered: bool,
     /// The `delivery_failed` reason, when `!delivered`.
     pub reason: Option<String>,
+    /// `delivery` (`v0.13.0 types.ts:7`). Defaults applied at the ack
+    /// (`v0.13.0 broker/client.ts:386,403`): `socket_delivered` on a bare `delivered`, `failed` on
+    /// a bare `delivery_failed`.
+    pub delivery: DeliveryState,
+    /// The broker's failure code, e.g. `E_TARGET_REBOUND`.
+    pub code: Option<String>,
+    /// Whether the sender may retry under the same message id.
+    pub retryable: bool,
+    /// `false` only when the connection dropped with this send in flight — the outcome may well
+    /// have been a delivery.
+    pub outcome_known: bool,
+}
+
+impl SendResult {
+    /// The answer for a send whose connection died before an ack arrived: the crate's ONLY producer
+    /// of [`DeliveryState::Unknown`], which the broker never emits.
+    ///
+    /// pi rejects the promise here (`onClose`'s `failPendingSends`,
+    /// `v0.13.0 broker/client.ts:222-226`); this port resolves it with an honest
+    /// `outcome_known: false` and lets the caller decide, which is what the two drain sites need.
+    fn unknown(reason: String) -> Self {
+        Self {
+            id: String::new(),
+            delivered: false,
+            reason: Some(reason),
+            delivery: DeliveryState::Unknown,
+            code: None,
+            retryable: true,
+            outcome_known: false,
+        }
+    }
 }
 
 /// A fanned-out inbound broker event (the Rust analog of pi's `IntercomClient` `EventEmitter`
@@ -161,6 +197,11 @@ struct ClientInner {
     /// Signalled once teardown has actually run, so `disconnect()` can await the real close
     /// (`client.ts:436-466`) instead of returning immediately.
     closed_notify: Notify,
+    /// The features the broker advertised on `registered` (`this.brokerFeatures`,
+    /// `v0.13.0 broker/client.ts:398-400`), read back by
+    /// [`IntercomClient::supports_feature`]. Empty until the handshake completes, and empty for a
+    /// broker that advertises none — which is what makes the exact-send path opt-in.
+    features: Mutex<Vec<String>>,
     /// The liveness-heartbeat task's abort handle — pi's `livenessTimer`
     /// (`v0.10.1 broker/client.ts:72`). `Some` between `startLivenessHeartbeat` (`:106-112`) and
     /// `stopLivenessHeartbeat` (`:114-120`).
@@ -186,11 +227,7 @@ fn teardown(inner: &Arc<ClientInner>, reason: String) {
     inner.connected.store(false, Ordering::SeqCst);
     *guard(&inner.session_id) = None;
     for (_, tx) in guard(&inner.pending_sends).drain() {
-        let _ = tx.send(SendResult {
-            id: String::new(),
-            delivered: false,
-            reason: Some(reason.clone()),
-        });
+        let _ = tx.send(SendResult::unknown(reason.clone()));
     }
     for (_, tx) in guard(&inner.pending_lists).drain() {
         let _ = tx.send(Err(reason.clone()));
@@ -433,6 +470,7 @@ impl IntercomClient {
             teardown_started: AtomicBool::new(false),
             read_abort: Mutex::new(None),
             closed_notify: Notify::new(),
+            features: Mutex::new(Vec::new()),
             liveness_abort: Mutex::new(None),
         });
 
@@ -513,6 +551,7 @@ impl IntercomClient {
         if !self.is_connected() {
             return Err(IntercomError::Client("not connected".to_string()));
         }
+        let is_reply = options.reply_to.is_some();
         let message_id = options
             .message_id
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -531,11 +570,50 @@ impl IntercomClient {
             },
             ..Default::default()
         };
+
+        // ICOM-054 — `if (!this.supportsFeature(EXACT_SEND_FEATURE) || options.replyTo)`
+        // (`v0.13.0 broker/client.ts:671-673`). A REPLY is never exact-sent: it must keep routing
+        // by its ask edge, which is the "replies keep their existing behavior" half of `636f61e`.
+        // A broker that never advertised `exact-send-v1` gets the v0.9.2 frame byte-for-byte,
+        // because [`ExactTarget::default`] serialises to nothing.
+        if is_reply || !self.supports_feature(EXACT_SEND_FEATURE) {
+            return self.send_once(to, &message, ExactTarget::default()).await;
+        }
+        // `const target = await resolveTarget(); if (!target) return sendOnce();` (`:685-687`).
+        let Some(target) = self.resolve_exact_target(to).await else {
+            return self.send_once(to, &message, ExactTarget::default()).await;
+        };
+        let result = self.send_once(to, &message, target).await?;
+        if result.code.as_deref() != Some("E_TARGET_REBOUND") {
+            return Ok(result);
+        }
+        // EXACTLY ONE retry (`:688-690`), under the SAME message id — which the broker permits only
+        // because it recorded the rebound refusal as retryable
+        // (`v0.13.0 broker/broker.ts:1068-1070`). A target that has vanished entirely falls back to
+        // the rebound result rather than re-sending by name.
+        match self.resolve_exact_target(to).await {
+            Some(rebound) => self.send_once(to, &message, rebound).await,
+            None => Ok(result),
+        }
+    }
+
+    /// `sendOnce` (`v0.13.0 broker/client.ts:645-669`) — one `send` frame and its correlated ack.
+    ///
+    /// # Errors
+    /// [`IntercomError::Client`] on a send timeout or if the client disconnected mid-send.
+    async fn send_once(
+        &self,
+        to: &str,
+        message: &Message,
+        target: ExactTarget,
+    ) -> Result<SendResult> {
+        let message_id = message.id.clone();
         let (tx, rx) = oneshot::channel();
         guard(&self.inner.pending_sends).insert(message_id.clone(), tx);
         let frame = encode_json(&ClientMessage::Send {
             to: to.to_string(),
-            message,
+            message: message.clone(),
+            target,
         })?;
         if !self.inner.send_frame(frame) {
             guard(&self.inner.pending_sends).remove(&message_id);
@@ -552,6 +630,41 @@ impl IntercomClient {
                 Err(IntercomError::Client("send timeout".to_string()))
             }
         }
+    }
+
+    /// `supportsFeature` (`v0.13.0 broker/client.ts:817-819`) — whether the broker advertised
+    /// `feature` on `registered`.
+    #[must_use]
+    pub fn supports_feature(&self, feature: &str) -> bool {
+        guard(&self.inner.features).iter().any(|f| f == feature)
+    }
+
+    /// `resolveTarget` (`v0.13.0 broker/client.ts:675-684`) — the CLIENT-side resolver, which
+    /// returns `None` on ambiguity rather than raising.
+    ///
+    /// Deliberately NOT [`crate::session_state::SessionState::resolve_target`], which raises two
+    /// distinct disambiguation errors because a human is reading them; here an ambiguous name
+    /// simply degrades to a plain name-routed send and the BROKER produces `E_AMBIGUOUS_TARGET`.
+    /// The id → exact-name → id-prefix ladder is `findSessions`', so it reuses
+    /// [`crate::broker::routing::find_session_ids`] rather than restating it.
+    ///
+    /// A target whose roster row carries no `endpointEpoch` is a pre-v0.11.0 broker's: fall back to
+    /// a plain send rather than inventing one (`target?.endpointEpoch ? … : null`, `:683`).
+    async fn resolve_exact_target(&self, to: &str) -> Option<ExactTarget> {
+        let sessions = self.list_sessions().await.ok()?;
+        let entries: Vec<(String, Option<String>)> = sessions
+            .iter()
+            .map(|s| (s.id.clone(), s.name.clone()))
+            .collect();
+        let matches = crate::broker::routing::find_session_ids(&entries, to);
+        let [only] = matches.as_slice() else {
+            return None;
+        };
+        let target = sessions.iter().find(|s| &s.id == only)?;
+        Some(ExactTarget::bound(
+            target.id.clone(),
+            target.endpoint_epoch.clone()?,
+        ))
     }
 
     /// List all connected sessions, correlated by `requestId` (`listSessions`, `client.ts:469-502`).
@@ -745,11 +858,7 @@ impl IntercomClient {
 
         let reason = "client disconnected".to_string();
         for (_, tx) in guard(&self.inner.pending_sends).drain() {
-            let _ = tx.send(SendResult {
-                id: String::new(),
-                delivered: false,
-                reason: Some(reason.clone()),
-            });
+            let _ = tx.send(SendResult::unknown(reason.clone()));
         }
         for (_, tx) in guard(&self.inner.pending_lists).drain() {
             let _ = tx.send(Err(reason.clone()));
@@ -900,7 +1009,7 @@ async fn read_task(
             match msg {
                 BrokerMessage::Registered {
                     session_id,
-                    features: _,
+                    features,
                 } => {
                     if registered {
                         // A second `registered` frame is fatal post-connect (`client.ts:312-314`);
@@ -914,6 +1023,10 @@ async fn read_task(
                     }
                     // Set the id BEFORE resolving connect (so `is_connected` holds immediately).
                     *guard(&inner.session_id) = Some(session_id.clone());
+                    // `this.brokerFeatures = new Set(message.features ?? [])`
+                    // (`v0.13.0 broker/client.ts:398-400`) — the negotiated set, previously
+                    // discarded, is what gates the `targetId`/`targetEpoch` pair (ICOM-054).
+                    *guard(&inner.features) = features.unwrap_or_default();
                     inner.ever_registered.store(true, Ordering::SeqCst);
                     if let Some(tx) = reg_tx.take() {
                         let _ = tx.send(Ok(session_id));
@@ -933,21 +1046,45 @@ async fn read_task(
                         message: Box::new(message),
                     });
                 }
-                BrokerMessage::Delivered { message_id } => {
+                // The absent-field defaults are upstream's (`v0.13.0 broker/client.ts:386-389`),
+                // and they are what keeps `cancel_message`'s deliberately BARE acks — and a
+                // pre-v0.11.0 broker's — reading exactly as they did before ICOM-054.
+                BrokerMessage::Delivered {
+                    message_id,
+                    delivery,
+                    code,
+                    retryable,
+                    outcome_known,
+                } => {
                     if let Some(tx) = guard(&inner.pending_sends).remove(&message_id) {
                         let _ = tx.send(SendResult {
                             id: message_id,
                             delivered: true,
                             reason: None,
+                            delivery: delivery.map_or(DeliveryState::SocketDelivered, Into::into),
+                            code,
+                            retryable: retryable.unwrap_or(false),
+                            outcome_known: outcome_known.unwrap_or(true),
                         });
                     }
                 }
-                BrokerMessage::DeliveryFailed { message_id, reason } => {
+                BrokerMessage::DeliveryFailed {
+                    message_id,
+                    reason,
+                    delivery,
+                    code,
+                    retryable,
+                    outcome_known,
+                } => {
                     if let Some(tx) = guard(&inner.pending_sends).remove(&message_id) {
                         let _ = tx.send(SendResult {
                             id: message_id,
                             delivered: false,
                             reason: Some(reason),
+                            delivery: delivery.map_or(DeliveryState::Failed, Into::into),
+                            code,
+                            retryable: retryable.unwrap_or(false),
+                            outcome_known: outcome_known.unwrap_or(true),
                         });
                     }
                 }
@@ -1059,9 +1196,190 @@ mod tests {
             teardown_started: AtomicBool::new(false),
             read_abort: Mutex::new(None),
             closed_notify: Notify::new(),
+            features: Mutex::new(Vec::new()),
             liveness_abort: Mutex::new(None),
         });
         (inner, wrx)
+    }
+
+    /// A scripted broker for the ICOM-054 client tests: drains the writer channel, records every
+    /// frame the client emitted, answers `list` with one peer whose `endpointEpoch` it controls,
+    /// and answers `send` per `send_answer`.
+    ///
+    /// Resolving `pending_sends`/`pending_lists` directly is the same seam `read_task`'s ack arms
+    /// use; it keeps the test on `send`'s control flow instead of on socket framing, which the
+    /// reader tests above already cover.
+    fn scripted_broker(
+        inner: &Arc<ClientInner>,
+        mut wrx: mpsc::UnboundedReceiver<WriterCmd>,
+        epochs: Vec<&'static str>,
+        send_answer: fn(usize, Option<&str>) -> SendResult,
+    ) -> Arc<Mutex<Vec<serde_json::Value>>> {
+        let seen = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let recorded = Arc::clone(&seen);
+        let inner = Arc::clone(inner);
+        tokio::spawn(async move {
+            let (mut lists, mut sends) = (0usize, 0usize);
+            while let Some(WriterCmd::Frame(bytes)) = wrx.recv().await {
+                let Ok(frame) =
+                    serde_json::from_slice::<serde_json::Value>(bytes.get(4..).unwrap_or_default())
+                else {
+                    continue;
+                };
+                guard(&recorded).push(frame.clone());
+                match frame["type"].as_str() {
+                    Some("list") => {
+                        let epoch = epochs.get(lists).copied().unwrap_or("epoch-final");
+                        lists += 1;
+                        let mut peer = test_session_info("peer-id");
+                        peer.endpoint_epoch = Some(epoch.to_string());
+                        if let Some(id) = frame["requestId"].as_str()
+                            && let Some(tx) = guard(&inner.pending_lists).remove(id)
+                        {
+                            let _ = tx.send(Ok(vec![peer]));
+                        }
+                    }
+                    Some("send") => {
+                        let answer = send_answer(sends, frame["targetEpoch"].as_str());
+                        sends += 1;
+                        if let Some(id) = frame["message"]["id"].as_str()
+                            && let Some(tx) = guard(&inner.pending_sends).remove(id)
+                        {
+                            let _ = tx.send(SendResult {
+                                id: id.to_string(),
+                                ..answer
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+        seen
+    }
+
+    fn plain_options(text: &str) -> SendOptions {
+        SendOptions {
+            text: text.to_string(),
+            attachments: None,
+            reply_to: None,
+            expects_reply: None,
+            message_id: None,
+            supersedes: None,
+            retry_of: None,
+            provenance: None,
+        }
+    }
+
+    /// ICOM-054 DoD 4 — with `exact-send-v1` advertised, a send whose target is replaced between
+    /// resolution and delivery lands on the replacement after EXACTLY ONE re-resolve, under the
+    /// SAME message id (`v0.13.0 broker/client.ts:671-690`).
+    ///
+    /// Red before ICOM-054: `send` emitted one frame carrying no `targetId`/`targetEpoch` at all,
+    /// so there was nothing to rebind and `SendResult` had no `code` to key a retry on.
+    #[tokio::test]
+    async fn a_rebound_target_is_retried_exactly_once_under_the_same_message_id() {
+        let (inner, wrx) = bare_inner();
+        *guard(&inner.session_id) = Some("s1".to_string());
+        inner.connected.store(true, Ordering::SeqCst);
+        *guard(&inner.features) = vec![EXACT_SEND_FEATURE.to_string()];
+        let seen = scripted_broker(&inner, wrx, vec!["epoch-1", "epoch-2"], |attempt, epoch| {
+            if attempt == 0 {
+                assert_eq!(epoch, Some("epoch-1"));
+                SendResult {
+                    id: String::new(),
+                    delivered: false,
+                    reason: Some("Target endpoint changed before delivery".to_string()),
+                    delivery: DeliveryState::Failed,
+                    code: Some("E_TARGET_REBOUND".to_string()),
+                    retryable: true,
+                    outcome_known: true,
+                }
+            } else {
+                assert_eq!(epoch, Some("epoch-2"));
+                SendResult {
+                    id: String::new(),
+                    delivered: true,
+                    reason: None,
+                    delivery: DeliveryState::SocketDelivered,
+                    code: None,
+                    retryable: false,
+                    outcome_known: true,
+                }
+            }
+        });
+
+        let client = IntercomClient { inner };
+        let result = client
+            .send("peer-id", plain_options("hi"))
+            .await
+            .expect("the retry succeeds");
+        assert!(result.delivered);
+        assert_eq!(result.delivery, DeliveryState::SocketDelivered);
+
+        let frames = guard(&seen).clone();
+        let sends: Vec<&serde_json::Value> =
+            frames.iter().filter(|f| f["type"] == "send").collect();
+        assert_eq!(sends.len(), 2, "exactly one retry, not a loop: {frames:?}");
+        assert_eq!(sends[0]["message"]["id"], sends[1]["message"]["id"]);
+        assert_eq!(sends[0]["targetId"], "peer-id");
+        assert_eq!(sends[0]["targetEpoch"], "epoch-1");
+        assert_eq!(sends[1]["targetEpoch"], "epoch-2");
+    }
+
+    /// ICOM-054 — the two ways the exact-send path stays OFF: a broker that never advertised
+    /// `exact-send-v1`, and a REPLY, which must keep routing by its ask edge
+    /// (`!this.supportsFeature(EXACT_SEND_FEATURE) || options.replyTo`,
+    /// `v0.13.0 broker/client.ts:671`). Both emit the v0.9.2 frame and never call `list`.
+    #[tokio::test]
+    async fn a_reply_and_an_unadvertised_broker_both_get_the_plain_send_frame() {
+        for advertise in [false, true] {
+            let (inner, wrx) = bare_inner();
+            *guard(&inner.session_id) = Some("s1".to_string());
+            inner.connected.store(true, Ordering::SeqCst);
+            if advertise {
+                *guard(&inner.features) = vec![EXACT_SEND_FEATURE.to_string()];
+            }
+            let seen = scripted_broker(&inner, wrx, vec!["epoch-1"], |_, epoch| {
+                assert_eq!(epoch, None, "no exact target may be emitted here");
+                SendResult {
+                    id: String::new(),
+                    delivered: true,
+                    reason: None,
+                    delivery: DeliveryState::SocketDelivered,
+                    code: None,
+                    retryable: false,
+                    outcome_known: true,
+                }
+            });
+
+            let client = IntercomClient { inner };
+            let mut options = plain_options("hi");
+            if advertise {
+                // The feature IS advertised, so only `replyTo` can be what suppresses the pair.
+                options.reply_to = Some("ask-1".to_string());
+            }
+            let result = client.send("peer-id", options).await.expect("delivered");
+            assert!(result.delivered);
+
+            let frames = guard(&seen).clone();
+            assert!(
+                !frames.iter().any(|f| f["type"] == "list"),
+                "no roster lookup may happen on the plain path: {frames:?}"
+            );
+            let send = frames
+                .iter()
+                .find(|f| f["type"] == "send")
+                .expect("one send frame");
+            assert_eq!(
+                send.as_object().map(|o| o.contains_key("targetId")),
+                Some(false)
+            );
+            assert_eq!(
+                send.as_object().map(|o| o.contains_key("targetEpoch")),
+                Some(false)
+            );
+        }
     }
 
     fn registration() -> SessionRegistration {
@@ -1502,6 +1820,7 @@ mod tests {
         // A valid `message` frame, immediately followed (in the SAME write, i.e. the SAME chunk the
         // reader's `push()` sees) by a bogus oversize length header.
         let from = SessionInfo {
+            endpoint_epoch: None,
             id: "sender".to_string(),
             name: Some("sender".to_string()),
             runtime_fallback_alias: None,
@@ -1566,6 +1885,7 @@ mod tests {
     #[cfg(unix)]
     fn test_session_info(id: &str) -> SessionInfo {
         SessionInfo {
+            endpoint_epoch: None,
             id: id.to_string(),
             name: Some(id.to_string()),
             runtime_fallback_alias: None,
@@ -1796,6 +2116,7 @@ mod tests {
             teardown_started: AtomicBool::new(false),
             read_abort: Mutex::new(None),
             closed_notify: Notify::new(),
+            features: Mutex::new(Vec::new()),
             liveness_abort: Mutex::new(None),
         });
         let (send_tx, send_rx) = oneshot::channel::<SendResult>();

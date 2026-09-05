@@ -16,6 +16,7 @@ use crate::transport::protocol::{
     BrokerMessage, MessageControl, MessageControlAction, MessageReceipt, now_ms,
 };
 
+use super::delivery::RecordedOutcome;
 use super::frame::{FrameResult, send_msg};
 use super::routing::SessionKey;
 use super::state::BrokerState;
@@ -120,6 +121,17 @@ impl BrokerState {
             && sender_info.is_some()
         {
             self.mailbox_messages.remove(index);
+            // ICOM-054 — `v0.13.0 broker/broker.ts:823`, BEFORE the ask-edge removal, in upstream's
+            // own order.
+            self.update_delivery_record(
+                &current_key,
+                &message_id,
+                RecordedOutcome::Failed {
+                    reason: "Sender cancelled the queued delivery".to_string(),
+                    code: "E_DELIVERY_CANCELLED".to_string(),
+                    retryable: false,
+                },
+            );
             if self
                 .ask_edges
                 .get(&message_id)
@@ -127,7 +139,10 @@ impl BrokerState {
             {
                 self.ask_edges.remove(&message_id);
             }
-            send_msg(self_tx, &BrokerMessage::Delivered { message_id });
+            // `writeMessage(socket, { type: "delivered", messageId })` (`:829`) — BARE, and
+            // deliberately so: `636f61e` rewrote every other `delivered` through
+            // `writeDeliverySuccess` and left `cancel_message`'s two alone.
+            send_msg(self_tx, &BrokerMessage::delivered_bare(message_id));
             return FrameResult::cont();
         }
 
@@ -137,12 +152,13 @@ impl BrokerState {
             .and_then(|route| self.sessions.get(&route.to))
             .map(|receiver| receiver.tx.clone());
         let (Some(from), Some(receiver_tx)) = (sender_info, receiver_tx) else {
+            // Bare too (`v0.13.0 broker/broker.ts:835-839`): no `delivery`, no `code`.
             send_msg(
                 self_tx,
-                &BrokerMessage::DeliveryFailed {
+                &BrokerMessage::delivery_failed_bare(
                     message_id,
-                    reason: "Message cannot be cancelled by this session".to_string(),
-                },
+                    "Message cannot be cancelled by this session",
+                ),
             );
             return FrameResult::cont();
         };
@@ -167,7 +183,18 @@ impl BrokerState {
         {
             self.ask_edges.remove(&message_id);
         }
-        send_msg(self_tx, &BrokerMessage::Delivered { message_id });
+        // ICOM-054 — `v0.13.0 broker/broker.ts:856`, AFTER the ask-edge removal here (upstream's
+        // order differs between the two arms and is reproduced as written).
+        self.update_delivery_record(
+            &current_key,
+            &message_id,
+            RecordedOutcome::Failed {
+                reason: "Sender cancelled the delivery".to_string(),
+                code: "E_DELIVERY_CANCELLED".to_string(),
+                retryable: false,
+            },
+        );
+        send_msg(self_tx, &BrokerMessage::delivered_bare(message_id));
         FrameResult::cont()
     }
 }

@@ -86,13 +86,16 @@ impl IntercomTool {
             // and NO trailing period. `:2234` carries `{ messageId, delivered: true,
             // replyTo: target.message.id }` — here `replyTo` is unconditional, unlike the
             // `send` arm's spread, because a reply always has one.
+            // ICOM-054 — `{ ...deliveryDetails(result), replyTo: target.message.id }`
+            // (`v0.13.0 index.ts:2557`); `replyTo` stays unconditional, unlike the `send` arm's
+            // spread, because a reply always has one.
+            let mut details = crate::tools::delivery_details(&result);
+            if let Some(map) = details.as_object_mut() {
+                map.insert("replyTo".to_string(), serde_json::json!(target.message.id));
+            }
             Ok(detailed_result(
                 format!("Reply sent to {}", display_name(&target.from)),
-                serde_json::json!({
-                    "messageId": result.id,
-                    "delivered": true,
-                    "replyTo": target.message.id,
-                }),
+                details,
             ))
         } else {
             // `v0.10.1 index.ts:2222-2225`: the failure names the peer and keeps pi's

@@ -9,8 +9,11 @@
 //! bookkeeping. Nothing here calls a frame handler — `state`, `session`, `send` and `receipts` all
 //! call inward, never the reverse — so `mailbox` is a leaf of the handler layer.
 
-use crate::transport::protocol::{BrokerMessage, Message, ScopeId, SessionInfo, now_ms};
+use crate::transport::protocol::{
+    BrokerMessage, DeliveredState, Message, ScopeId, SessionInfo, now_ms,
+};
 
+use super::delivery::RecordedOutcome;
 use super::frame::send_msg;
 use super::js::js_truthy_alias;
 use super::limits::{
@@ -82,10 +85,11 @@ impl BrokerState {
     /// Dropping a parked ask must drop its ask edge too, or the sender's reply window stays open
     /// against mail that no longer exists.
     pub(super) fn prune_mailbox_messages(&mut self, now: u64) {
-        let mut expired: Vec<(String, bool)> = Vec::new();
+        let mut expired: Vec<(SessionKey, String, bool)> = Vec::new();
         self.mailbox_messages.retain(|entry| {
             if now.saturating_sub(entry.queued_at) > MAILBOX_MESSAGE_RETENTION_MS {
                 expired.push((
+                    entry.from_key.clone(),
                     entry.message.id.clone(),
                     entry.message.expects_reply == Some(true),
                 ));
@@ -93,11 +97,23 @@ impl BrokerState {
             }
             true
         });
-        for (message_id, expects_reply) in expired {
+        for (from_key, message_id, expects_reply) in expired {
             if expects_reply {
                 self.ask_edges.remove(&message_id);
             }
             self.message_receipt_routes.remove(&message_id);
+            // ICOM-054 — `updateDeliveryRecord(entry.fromKey, entry.message.id, "failed", …)`
+            // (`v0.13.0 broker/broker.ts:1005`): the sender's record stops claiming `queued` once
+            // the parked message can never be delivered.
+            self.update_delivery_record(
+                &from_key,
+                &message_id,
+                RecordedOutcome::Failed {
+                    reason: "Mailbox delivery expired".to_string(),
+                    code: "E_DELIVERY_EXPIRED".to_string(),
+                    retryable: false,
+                },
+            );
         }
     }
 
@@ -123,6 +139,16 @@ impl BrokerState {
                 self.ask_edges.remove(&evicted.message.id);
             }
             self.message_receipt_routes.remove(&evicted.message.id);
+            // ICOM-054 — `v0.13.0 broker/broker.ts:1021`.
+            self.update_delivery_record(
+                &evicted.from_key,
+                &evicted.message.id,
+                RecordedOutcome::Failed {
+                    reason: "Mailbox capacity evicted the delivery".to_string(),
+                    code: "E_DELIVERY_EVICTED".to_string(),
+                    retryable: false,
+                },
+            );
         }
         // `{ ...message, brokerReceivedAt }` (`:903`): the parked envelope carries the time the
         // BROKER accepted it, so a later flush can date the receipt route from it (`:948`).
@@ -322,6 +348,14 @@ impl BrokerState {
                         .unwrap_or(entry.queued_at),
                 },
             );
+            // ICOM-054 — `updateDeliveryRecord(entry.fromKey, entry.message.id,
+            // "socket_delivered")` (`v0.13.0 broker/broker.ts:1162`): the record flips from
+            // `queued` to `socket_delivered` when the parked message actually lands.
+            self.update_delivery_record(
+                &entry.from_key,
+                &entry.message.id,
+                RecordedOutcome::Delivered(DeliveredState::SocketDelivered),
+            );
         }
     }
 }
@@ -332,6 +366,68 @@ mod tests {
     use super::super::test_support::{make_state, payloads, register_named, send_frame};
     use super::*;
     use serde_json::json;
+
+    /// ICOM-054 DoD 7 — a parked message's delivery record reads `queued`, and FLIPS to
+    /// `socket_delivered` when the mailbox flush actually delivers it
+    /// (`v0.13.0 broker/broker.ts:775,1162`).
+    ///
+    /// Asserted through the observable replay rather than the private map: re-sending the id
+    /// answers `queued` while the message is parked and `socket_delivered` once it has landed —
+    /// which is the whole point of tracking a message's real fate.
+    #[test]
+    fn a_parked_message_records_queued_and_flips_to_socket_delivered_on_flush() {
+        let mut state = make_state();
+        let (a_tx, mut a_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (b_tx, _b_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut a_sid = None;
+        let mut b_sid = None;
+        register_named(&mut state, 1, &mut a_sid, &a_tx, "a", "alice", "/w", 1_000);
+        register_named(&mut state, 2, &mut b_sid, &b_tx, "b", "bob", "/w", 1_000);
+        state.on_connection_closed(2, &b_sid, 1_500);
+        let _ = payloads(&mut a_rx);
+
+        let parked = json!({ "id": "m1", "timestamp": 1, "content": { "text": "hi" } });
+        send_frame(&mut state, 1, &a_tx, &mut a_sid, "b", parked.clone(), 2_000);
+        let acked = payloads(&mut a_rx);
+        assert!(
+            acked
+                .iter()
+                .any(|p| p["type"] == "delivered" && p["delivery"] == "queued"),
+            "an offline peer's mail is acked `queued`, not `socket_delivered`: {acked:?}"
+        );
+
+        // Replaying the id while it is still parked reports `queued` from the record.
+        send_frame(&mut state, 1, &a_tx, &mut a_sid, "b", parked.clone(), 2_100);
+        assert!(
+            payloads(&mut a_rx)
+                .iter()
+                .any(|p| p["type"] == "delivered" && p["delivery"] == "queued")
+        );
+
+        let (b2_tx, mut b2_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut b2_sid = None;
+        register_named(&mut state, 3, &mut b2_sid, &b2_tx, "b", "bob", "/w", 3_000);
+        assert!(
+            payloads(&mut b2_rx)
+                .iter()
+                .any(|p| p["type"] == "message" && p["message"]["id"] == "m1"),
+            "the flush still delivers the parked mail unchanged"
+        );
+        let _ = payloads(&mut a_rx);
+
+        send_frame(&mut state, 1, &a_tx, &mut a_sid, "b", parked, 3_100);
+        let after = payloads(&mut a_rx);
+        assert!(
+            after
+                .iter()
+                .any(|p| p["type"] == "delivered" && p["delivery"] == "socket_delivered"),
+            "once flushed, the record reports the delivery that actually happened: {after:?}"
+        );
+        assert!(
+            !payloads(&mut b2_rx).iter().any(|p| p["type"] == "message"),
+            "and the replay does not re-inject the message"
+        );
+    }
 
     /// ICOM-010 — the broker mailbox (`v0.10.1 broker/broker.ts:890-953`). Before this landed, a
     /// message sent during a peer's reconnect gap was answered `Session not found` and DROPPED;

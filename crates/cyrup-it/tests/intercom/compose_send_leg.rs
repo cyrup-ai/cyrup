@@ -23,6 +23,7 @@ use super::common::Broker;
 
 fn session() -> SessionInfo {
     SessionInfo {
+        endpoint_epoch: None,
         // ICOM-041: `runtimeFallbackAlias` (v0.10.1 types.ts:6-7) — these fixtures
         // register under a REAL name, not a synthesized unnamed-runtime alias.
         runtime_fallback_alias: None,

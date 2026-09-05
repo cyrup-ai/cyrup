@@ -40,3 +40,29 @@ pub(crate) fn detailed_result(text: impl Into<String>, details: serde_json::Valu
         ..Default::default()
     }
 }
+
+/// `deliveryDetails(result)` (`v0.13.0 index.ts:116-126`) — the ack's full outcome, spread into a
+/// tool result's `details`.
+///
+/// ICOM-054. `code` and `reason` are OMITTED when absent rather than emitted as `null`, because
+/// upstream spreads them conditionally; the other four are always present. This is what puts
+/// `delivery: "queued"` in front of the model when a peer was offline, where the result previously
+/// said only `delivered: true`.
+pub(crate) fn delivery_details(result: &crate::transport::client::SendResult) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    map.insert("messageId".to_string(), serde_json::json!(result.id));
+    map.insert("delivered".to_string(), serde_json::json!(result.delivered));
+    map.insert("delivery".to_string(), serde_json::json!(result.delivery));
+    map.insert("retryable".to_string(), serde_json::json!(result.retryable));
+    map.insert(
+        "outcomeKnown".to_string(),
+        serde_json::json!(result.outcome_known),
+    );
+    if let Some(code) = &result.code {
+        map.insert("code".to_string(), serde_json::json!(code));
+    }
+    if let Some(reason) = &result.reason {
+        map.insert("reason".to_string(), serde_json::json!(reason));
+    }
+    serde_json::Value::Object(map)
+}

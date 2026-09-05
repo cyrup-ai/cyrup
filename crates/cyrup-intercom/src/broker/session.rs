@@ -97,10 +97,16 @@ impl BrokerState {
             return FrameResult::close_self();
         }
         if previous_conn.is_some() {
-            // Identity takeover (`v0.10.1 broker/broker.ts:348-352`): clear the old edges AND the
-            // old receipt routes, then end the previous socket. This is `clearAskEdgesForSession`'s
-            // ONLY call site upstream — see `on_connection_closed`.
-            self.clear_ask_edges_for_session(&key);
+            // Identity takeover (`v0.13.0 broker/broker.ts:450-456`): clear the old receipt routes,
+            // then end the previous socket.
+            //
+            // ICOM-054 — `636f61e` REMOVED `clearAskEdgesForSession(id)` from this branch, leaving
+            // that method with zero call sites upstream (`v0.13.0 broker/broker.ts:1176` is dead
+            // code). The endpoint epoch is what now invalidates a stale send, so wiping the
+            // replaced endpoint's ask edges is both unnecessary and HARMFUL: it would refuse a
+            // reply that arrives after a stable-id replacement — exactly the case the commit body
+            // means by "replies … keep their existing behavior". Receipt routes still go, because
+            // they key a cancel/supersede against a socket that is gone.
             self.clear_message_receipt_routes_for_session(&key);
             if let Some(prev_id) = previous_conn
                 && let Some(h) = self.connections.get(&prev_id)
@@ -114,6 +120,11 @@ impl BrokerState {
 
         let info = SessionInfo {
             id: id.clone(),
+            // ICOM-054 — `endpointEpoch: randomUUID()` (`v0.13.0 broker/broker.ts:466`). Minted on
+            // EVERY register, takeover included: a re-registered id is a NEW endpoint, and that is
+            // the only fact that makes a stale send detectable. Never read from the registration —
+            // `SessionRegistration` omits it upstream (`v0.13.0 types.ts:102`).
+            endpoint_epoch: Some(uuid::Uuid::new_v4().to_string()),
             name: registration.name,
             // `v0.10.1 broker/broker.ts:358` copies the registration's `runtimeFallbackAlias` onto
             // the stored `SessionInfo`, so every peer's roster can tell a chosen name from a
@@ -185,17 +196,19 @@ impl BrokerState {
             task.abort();
         }
 
-        // ICOM-016 — `features: [EXTENSION_BUS_FEATURE]` (`v0.9.2 broker/broker.ts:502-506`). This
-        // is what a conforming pi client gates every bus frame on
-        // (`v0.9.2 broker/client.ts:648,817-819`), so the broker could not advertise it until the
-        // effects existed. v0.9.2 advertises this one value only: `EXACT_SEND_FEATURE` is a v0.12.0
-        // addition whose behaviour is not ported, so advertising it would be a lie.
+        // ICOM-016 + ICOM-054 — `features: [EXTENSION_BUS_FEATURE, EXACT_SEND_FEATURE]`
+        // (`v0.13.0 broker/broker.ts:498-502`), the exact pair and order upstream advertises. This
+        // is what a conforming pi client gates its bus frames (`v0.13.0 broker/client.ts:648`) and
+        // its `targetId`/`targetEpoch` pair (`:671`) on, so neither name could be advertised until
+        // its effects existed. Both now do: the bus in `broker::extension_state`, the exact-send
+        // refusal in `broker::delivery` + `broker::send`.
         send_msg(
             self_tx,
             &BrokerMessage::Registered {
                 session_id: id.clone(),
                 features: Some(vec![
                     crate::transport::protocol::EXTENSION_BUS_FEATURE.to_string(),
+                    crate::transport::protocol::EXACT_SEND_FEATURE.to_string(),
                 ]),
             },
         );

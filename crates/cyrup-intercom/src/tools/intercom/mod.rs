@@ -738,6 +738,7 @@ mod tests {
     fn cwd_delivery_label_falls_through_blank_to_and_blank_name() {
         let label = |to: Option<&str>, name: Option<&str>| {
             let peer = SessionInfo {
+                endpoint_epoch: None,
                 name: name.map(str::to_string),
                 ..session("peer-1", "/w/proj")
             };
@@ -874,14 +875,17 @@ mod tests {
     async fn list_cwd_filters_the_roster_to_one_directory_and_points_back_when_it_is_empty() {
         let roster = vec![
             SessionInfo {
+                endpoint_epoch: None,
                 name: Some("me".to_string()),
                 ..session("self-1", "/w/proj")
             },
             SessionInfo {
+                endpoint_epoch: None,
                 name: Some("peer-here".to_string()),
                 ..session("s-here", "/w/proj")
             },
             SessionInfo {
+                endpoint_epoch: None,
                 name: Some("peer-there".to_string()),
                 ..session("s-there", "/w/other")
             },
@@ -1001,6 +1005,7 @@ mod tests {
 
     fn session(id: &str, cwd: &str) -> SessionInfo {
         SessionInfo {
+            endpoint_epoch: None,
             id: id.to_string(),
             name: Some(id.to_string()),
             runtime_fallback_alias: None,

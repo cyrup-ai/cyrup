@@ -26,7 +26,8 @@
 //! 3,292 lines; the modules below are the seams it was carrying. `state` holds `BrokerState` and
 //! the bookkeeping every handler builds on; `dispatch` is the frame switch; `session`/`send`/
 //! `receipts`/`presence`/`extensions` are the handlers, one per protocol concern, each an
-//! `impl BrokerState` block; `mailbox` is offline delivery (`v0.10.1`); `conn` is one connection's
+//! `impl BrokerState` block; `mailbox` is offline delivery (`v0.10.1`) and `delivery` the bounded
+//! delivery-record store ICOM-054's exact-send refusal replays from; `conn` is one connection's
 //! reader/writer pair and `lifecycle` the process itself; `frame`, `limits` and `js` are the shared
 //! plumbing, the ported constants, and the JS value semantics the protocol echoes verbatim.
 //!
@@ -40,6 +41,7 @@ pub(crate) mod routing;
 pub(crate) mod runtime_claim;
 
 mod conn;
+mod delivery;
 mod dispatch;
 mod extension_state;
 mod extensions;

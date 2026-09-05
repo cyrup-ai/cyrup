@@ -25,6 +25,10 @@ pub(super) const DISCONNECTED_SESSION_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
 pub(super) const MAILBOX_MESSAGE_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
 /// `MAX_MAILBOX_MESSAGES = 256` (`v0.10.1 broker/broker.ts:42`).
 pub(super) const MAX_MAILBOX_MESSAGES: usize = 256;
+/// `DELIVERY_RECORD_RETENTION_MS = 60 * 60 * 1000` (`v0.13.0 broker/broker.ts:45`).
+pub(super) const DELIVERY_RECORD_RETENTION_MS: u64 = 60 * 60 * 1000;
+/// `MAX_DELIVERY_RECORDS = 4096` (`v0.13.0 broker/broker.ts:46`).
+pub(super) const MAX_DELIVERY_RECORDS: usize = 4096;
 /// Reader read-buffer size (implementation detail; framing reassembles across chunk boundaries).
 pub(super) const READ_BUF: usize = 16 * 1024;
 /// `MAX_EXTENSIONS_PER_SESSION = 32` (`v0.9.2 broker/broker.ts:35`).

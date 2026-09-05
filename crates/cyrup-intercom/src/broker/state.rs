@@ -18,6 +18,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::transport::framing::encode_json;
 use crate::transport::protocol::{BrokerMessage, ScopeId, SessionInfo};
 
+use super::delivery::{DeliveryRecord, DeliveryRecordKey};
 use super::extension_state::ExtensionStateManager;
 use super::extensions::{NamespaceKey, NamespaceOwner};
 use super::limits::{MAX_UNREGISTERED_CONNECTIONS, MESSAGE_RECEIPT_ROUTE_RETENTION_MS};
@@ -83,6 +84,15 @@ pub(super) struct BrokerState {
     /// (`:892-898`, FIFO) and [`BrokerState::flush_mailbox_for_session`] redelivers front-to-back
     /// (`:913`), so a peer receives its parked mail in the order it was sent.
     pub(super) mailbox_messages: Vec<MailboxMessage>,
+    /// `deliveryRecords` (`v0.13.0 broker/broker.ts:208`), keyed by `(sender key, message id)` —
+    /// ICOM-054's exactly-once-per-authored-content store.
+    pub(super) delivery_records: HashMap<DeliveryRecordKey, DeliveryRecord>,
+    /// Insertion order for [`Self::delivery_records`], because the cap evicts the OLDEST INSERTED
+    /// entry (`this.deliveryRecords.keys().next().value`, `v0.13.0 broker/broker.ts:1082-1085`) and
+    /// a `HashMap`'s iteration order is arbitrary. Same device as [`Self::session_order`] and
+    /// [`Self::unregistered`]; an in-place `update_delivery_record` must not disturb it, because a
+    /// JS `Map.set` on an existing key keeps that key's original position.
+    pub(super) delivery_record_order: Vec<DeliveryRecordKey>,
     pub(super) connections: HashMap<u64, ConnHandle>,
     /// Unregistered connection ids in insertion order (for oldest-eviction, `broker.ts:256-268`).
     pub(super) unregistered: Vec<u64>,
@@ -150,6 +160,8 @@ impl BrokerState {
             message_receipt_routes: HashMap::new(),
             disconnected_sessions: HashMap::new(),
             mailbox_messages: Vec::new(),
+            delivery_records: HashMap::new(),
+            delivery_record_order: Vec::new(),
             connections: HashMap::new(),
             unregistered: Vec::new(),
             ask_timeout_ms,
@@ -267,11 +279,6 @@ impl BrokerState {
         }
     }
 
-    pub(super) fn clear_ask_edges_for_session(&mut self, key: &SessionKey) {
-        self.ask_edges
-            .retain(|_, edge| &edge.from != key && &edge.to != key);
-    }
-
     pub(super) fn prune_ask_edges(&mut self, now: u64) {
         let timeout = self.ask_timeout_ms;
         self.ask_edges
@@ -310,9 +317,13 @@ impl BrokerState {
     /// (pi `existing?.socket === socket`).
     ///
     /// **The departing session's ask edges are deliberately NOT cleared**, and that is upstream's
-    /// mechanism, not an omission: `clearAskEdgesForSession` has exactly one call site in
+    /// mechanism, not an omission: `clearAskEdgesForSession` had exactly one call site in
     /// `broker.ts` — the register-time identity takeover at `:350` — at every tag from v0.9.2 to
-    /// v0.10.1. An edge toward a departed session is what `flushMailboxForSession` re-points at
+    /// v0.10.1, and `636f61e` (v0.11.0, ICOM-054) REMOVED even that one, leaving the method dead at
+    /// `v0.13.0 broker/broker.ts:1176`. The endpoint epoch is what now invalidates a stale send, so
+    /// wiping a replaced endpoint's ask edges became both unnecessary and harmful; this port
+    /// therefore has no such method at all. An edge toward a departed session is what
+    /// `flushMailboxForSession` re-points at
     /// `:936-939` when that identity comes back, so clearing it here would make every parked ask
     /// undeliverable-as-a-reply ("Reply target does not match a pending ask") the moment the peer
     /// reconnected. The edges instead expire on `pruneAskEdges`' `askTimeoutMs`, exactly as they do
