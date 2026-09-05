@@ -979,6 +979,33 @@ impl ExtensionHost {
         }
     }
 
+    /// Dispatch `before_provider_headers` (pi `ExtensionRunner.emitBeforeProviderHeaders`,
+    /// `packages/coding-agent/src/core/extensions/runner.ts:1100-1125` @v0.84.4; PROV-042 /
+    /// EXT-009).
+    ///
+    /// Upstream's semantics, from the event's own doc (`extensions/types.ts:681-685`): "Handlers
+    /// mutate `headers` in place … A `null` value deletes that header", and the handler's return
+    /// value is ignored. The [`crate::contract`] reducer already implements exactly that for
+    /// [`HostEvent::BeforeProviderHeaders`]; this is the entry point that had no production caller,
+    /// so an extension could subscribe to `before_provider_headers` and never be invoked.
+    ///
+    /// `headers` is a JSON object of `string | null`. Returns the mutated bag.
+    pub async fn emit_before_provider_headers(
+        &self,
+        headers: Value,
+        cancel: &CancelToken,
+    ) -> Value {
+        let orig = headers.clone();
+        let ev = HostEvent::BeforeProviderHeaders { headers };
+        match self.dispatcher.dispatch_block_mutate(ev, cancel).await {
+            Reduced::Pass(ev) => match *ev {
+                HostEvent::BeforeProviderHeaders { headers } => headers,
+                _ => orig,
+            },
+            _ => orig,
+        }
+    }
+
     /// Dispatch `user_bash` (Pi `ExtensionRunner.emitUserBash`, runner.ts:885-912; gap-08 #5). The
     /// FIRST handler that returns a result wins (Pi short-circuits): a block stops the command, a
     /// `handled` result (operations/result) supplies the execution. Returns the reduced

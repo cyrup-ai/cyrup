@@ -5,7 +5,211 @@ next work item**.
 
 ---
 
+# RECONCILED 2026-09-05 (tenth edition) — batch 4: six rows closed, three narrowed, **ZERO rows filed — and zero of them against its own code**, the number the ninth edition set as the target; but the batch merged with four unfixed findings against that same code
+
+> **Read this block before planning, and read the three numbers in the heading together — each one
+> flatters the batch if quoted alone.** cyrup **code** HEAD **`f2630a7a`**, branch
+> `claude/parity-batch4`, cut from `main` = `824a539e` (batch 3's last commit). 32 commits off the
+> base, 21 of them touching `crates/`/`xtask`.
+>
+> **THE THREE NUMBERS.**
+>
+> * **Rows CLOSED: 6.** `DRIFT-054`, `SUBA-095`, `TUI-096`, `SEAM-118`, `PROV-042`, `EXT-041`.
+> * **Rows FILED: 0.** No new item id exists on this branch. Every id touched by the branch's ledger
+>   diff already existed on `origin/main` (verified id by id with
+>   `git grep -c <id> origin/main -- docs/gap-analysis/`).
+> * **Rows filed that describe this batch's OWN code: 0.** The ninth edition's number was **six**,
+>   and it named zero as this batch's target. **The target was met.**
+>
+> **Counts are `scripts/count_open_items.py`'s, run twice — once against `origin/main`'s copy of this
+> directory (`git archive origin/main docs/gap-analysis`) and once at HEAD — so the delta below is a
+> difference of two script runs rather than of two hand-written tables:** **90 → 84 open
+> (0 critical, 0 high, 10 medium, 74 low); 584 → 590 closed; 6 trackers.** §0 of `PARITY-GAPS.md`
+> carries the per-area table (twelfth edition) and §0a the above-medium set (ninth edition, still
+> empty); neither is duplicated here.
+>
+> **The arithmetic, stated so the headline cannot flatter itself.** 590 − 584 = six closed, and open
+> fell by exactly six. **For the first time in this ledger's history the two numbers agree**, because
+> nothing was filed to absorb the difference. Batch 3 closed twenty and moved the open set by
+> thirteen; batch 4 closed six and moved it by six.
+>
+> **Four of the six closures are batch 3's own self-filed rows.** `DRIFT-054`, `SUBA-095`, `TUI-096`
+> and `SEAM-118` were opened by the batch-3 ledger pass against code batch 3 had just landed, and
+> batch 3 merged with them open. All four now carry landing shas:
+>
+> | row | closed at | what landed |
+> |---|---|---|
+> | `DRIFT-054` | `16b38c93`, restated `e8f93355` | `AgentSession::export_state()` threads the leaf + `systemPrompt` + active `tools` through all three live export paths, as pi's `exportSessionToHtml(sm, this.state, …)` does |
+> | `SUBA-095` | `1f718391`, review-fixed `e36a1871` | the external-CLI select loop runs `while streaming \|\| !reaped`, the chunk arm polls last, and no run-ending verb fires on a reaped child |
+> | `TUI-096` | `b897afe8` + `8950604b`, pinned `096a4dcf` | a theme that fails to load seats `dark` as the active name and says so, in pi's own verbatim sentence |
+> | `SEAM-118` | `e2e51870`, doc-fixed `7a3b1a22` | `--no-builtin-tools` starts a session with no built-in active, matching `sdk.ts:261-263` rather than pi's narrower doc comment |
+>
+> The other two closures are `PROV-042` (both halves — `transform_headers` now applies on the path
+> the agent actually streams, and `before_provider_headers` has a producer) and `EXT-041` (the
+> custom-ENTRY replay half, the last one open). `DRIFT-009`, `TUI-046` and `CFG-067` were worked and
+> **narrowed**, and correctly stay open at their existing severities.
+>
+> ---
+>
+> ## What this batch got wrong: it merged with four unfixed findings against its own code
+>
+> **The zero-filed number above is real and is not the whole story.** Batch 4's defining rule was
+> that a defect found in code from this branch is a **bug to fix, not a row to file**. The filing half
+> of that rule was held perfectly. The **fixing** half was not: the regression gate ran after the
+> review rounds had already closed, and four findings it raised — two of them blocking — reached no
+> fix commit. No commit after `e36a1871` touches `run.rs`; none after `033e8c79` touches
+> `run_fanout_budget.rs`.
+>
+> Per the same rule these are **not** filed as rows. Three are recorded on the rows that own the
+> code, where a reader of that row will meet them; the fourth was in this ledger and is fixed.
+>
+> 1. **BLOCKING — a false upstream citation**, `crates/cyrup-ext-subagents/src/exec/external_cli/run.rs:333-336`
+>    (introduced by `e36a1871`). The comment claims upstream's `failParser` is guarded by `settled`.
+>    Read at the tag, `external-cli-runner.ts:267-272` @v0.64.0 has only `if (parserError) return;`;
+>    `settled` appears nowhere in it, and its terminate call runs after settle. The citation is
+>    correct for `terminate` (`:261-262`) and false for the parser arm. The shipped behaviour is
+>    defensible — arguably better than upstream's — so this is a `[CYRUP-DELTA]` mislabelled as
+>    fidelity, and it is the same class of false in-source claim this batch spent three commits
+>    correcting elsewhere (`e8f93355`, `7a3b1a22`, `4d361c21`). **Recorded on `SUBA-095`.**
+> 2. **BLOCKING — a claim rollback that is not panic-safe**, `.../exec/run_fanout_budget.rs:888-902`
+>    (from `063cfe6f`). Upstream's `catch` at `run-fanout-budget.ts:257-262` unlinks every created
+>    slot when `commit` throws; cyrup rolls back only under `if outcome.is_err()`, which a panic
+>    skips and an inner `Err` return never reaches, so a failing commit permanently burns slots of a
+>    run's cap. `033e8c79` applied the correct mechanism — a drop guard — to the admission LOCK and
+>    not to the claims that lock protects, and its own new test asserts the divergent `used == 2`
+>    (upstream: 1) as correct, with a comment saying so. A review-fix commit pinned a divergence
+>    instead of declaring it. **Recorded on `CFG-067`.**
+> 3. **A ledger citation this batch announced as corrected and did not correct.** `bbce4652`'s commit
+>    message stated that `agent-session.ts:3438` → `:3439` was "corrected in the ledger and in all
+>    five source sites". The five source sites were genuinely fixed; three present-tense assertions
+>    in `12-upstream-drift-pi-core.md` were not — including one sentence that cited `:3438` and
+>    `:3439` for the same call. **FIXED by this tenth-edition pass**, and the claim itself rewritten
+>    to say what was and was not done.
+> 4. **Dead state introduced by this branch.** `terminated` in `run.rs` was load-bearing on
+>    `origin/main`; after `e36a1871` every writer of it also sets `reaped`, `reaped` is never cleared,
+>    and all three readers are `!terminated && !reaped`, so the `!terminated` conjunct can never
+>    decide anything. Low severity, no behavioural effect, but it makes the guard read as two
+>    invariants where there is one. **Recorded on `SUBA-095`.**
+>
+> **The honest summary of the batch's own rule: filing zero and leaving four unfixed is a real
+> improvement on batch 3's six-against-itself, and it is still the same failure in a smaller size.**
+> Batch 3 wrote its defects down and merged; batch 4 declined to write them down and merged. Neither
+> fixed them before merging. The next batch's first job is these four — they are comment-, doc- and
+> small-code-level corrections in files this programme already owns, none needs a new design
+> decision, and none should become a row.
+>
+> ### The regression gate's verdict, quoted verbatim
+>
+> Reproduced in full rather than paraphrased, because every previous edition's summary of a blocking
+> review has read softer than the review did:
+>
+> > NOT CLEAN — DO NOT MERGE. The batch's defining rule is half-held: the FILING side is clean (no new ledger row anywhere describes this branch's own code; every id touched pre-exists on origin/main, and the two rows batch 3 filed against itself — DRIFT-054, SUBA-095 — were closed here rather than re-filed), and all four full-workspace checks pass green (fmt clean; workspace rustdoc under -D warnings clean; workspace clippy --all-targets under -D warnings clean; nextest 8986/8986 passed, 9 pre-existing skips). But the FIXING side has four unfixed findings against this branch's own output, two of them blocking, and they are unfixed because both of the final reviews landed AFTER their fix rounds and nothing came after them: no commit later than e36a1871 touches run.rs, and no commit later than 033e8c79 touches run_fanout_budget.rs. (1) run.rs:333-336 still declares a `settled` guard on upstream's `failParser` that upstream does not have — I read external-cli-runner.ts:267-272 at v0.64.0 myself; the only guard there is `if (parserError) return;`, while :262's `terminate` genuinely does carry `settled`, so the citation is right for the two verbs and false for the parser arm. That is the same class of false in-source upstream claim this batch spent e8f93355, 7a3b1a22 and 4d361c21 correcting elsewhere, shipping uncorrected in the one place it was introduced. (2) run_fanout_budget.rs:888-902 rolls claims back only under `if outcome.is_err()`, so a panic out of the caller's `commit` — or a commit that fails by returning an inner Err — permanently burns slots of the run's cap that upstream's try/catch at :238-262 unlinks; the fix round applied the correct mechanism (a drop guard) to the admission lock at :1083 and not to the claims that lock protects, and then pinned the divergent outcome as correct in `a_panic_inside_the_commit_closure_still_releases_the_admission_lock` (`assert_eq!(snapshot.used, 2)`; upstream is 1) with the comment "the claim the panicking batch wrote stands". A review-fix commit enshrining a divergence in a test comment is strictly worse than leaving it open. (3) The `agent-session.ts:3438` → `:3439` correction this batch ANNOUNCED as complete (12-upstream-drift-pi-core.md:1558: "corrected in the ledger and in all five source sites") is done in crates/ and NOT done in the ledger: :187 carries both `:3438` and `:3439` for the same call in one sentence, and :324 carries `:3438`. (4) `terminated` in run.rs is now dead state this branch created — on origin/main it was the sole guard on all three arms; e36a1871 added `reaped` beside it, every writer now sets both, `reaped` is never cleared, and all three readers are `!terminated && !reaped`, so the `!terminated` conjunct can never decide anything. All four are comment-, doc-, ledger- and small-code-level corrections inside files this batch already owns; none needs a new design decision, and none should become a ledger row. Batch 3 merged with six unfixed defects in its own fresh code. Batch 4 has four — a real improvement, and still the same failure. Fix these four, then re-gate.
+>
+> Finding 3 is discharged by this pass. Findings 1, 2 and 4 are code and are recorded, not fixed —
+> a ledger pass may not edit `crates/`.
+>
+> ### Workspace checks at HEAD, as the gate ran them
+>
+> Run once, sequentially, on `f2630a7a` with a clean working tree: `cargo fmt --all -- --check`
+> clean; `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps` clean across all 22 crates;
+> `cargo clippy --workspace --all-targets -- -D warnings` clean; **`cargo nextest run --workspace`
+> — 8986 tests run, 8986 passed, 9 skipped**, the 9 being the pre-existing skips (7 in
+> `cyrup-provider`, 1 in `cyrup-tui`, 1 other). No test was newly skipped, ignored or quarantined by
+> this branch. **This is the first edition of this ledger whose test count comes from a single
+> workspace-wide run rather than from summing per-crate runs**, and `README.md`'s status block is
+> updated from it.
+>
+> ---
+>
+> ## Two container restarts destroyed in-flight work — read the commit timeline with this in hand
+>
+> **A later reader looking at `git log --date` on this branch will see a six-hour hole and misread
+> it.** The batch's commits run `06:24 → 06:28` on 2026-09-05 (four commits: `16b38c93`,
+> `1f718391`, `bbce4652`, `8f6e524b`) and then **stop dead until `12:33`**, after which they run
+> continuously to `15:14`. That hole is not idle time and not a long-running build. It is a
+> **container restart that destroyed uncommitted work**, and it is the second of two in this session.
+>
+> * **The first restart left no trace in the log at all** — it happened before anything had been
+>   committed, so the work it destroyed is invisible to `git log`. That invisibility *is* the cost:
+>   there is no artefact to point at.
+> * **The second restart is the `06:28 → 12:33` hole.** Everything in flight at `06:28` was lost and
+>   re-done from scratch.
+>
+> **What it cost, and what it changed about how the batch was run.** After the second restart the
+> batch adopted a commit-as-soon-as-it-compiles-and-passes discipline, which is directly visible in
+> the log: sixteen commits land in the 2h41m after `12:33` — several within a minute of each other
+> (`836c6006`/`ccd14981` at `12:56`, `bb355412`/`104002d3` at `13:12`, `fbc28fb0`/`7ed3b0c4` at
+> `15:12`) — against four in the four minutes before the hole. **Do not read that burst as
+> haste or as work done without checks**; each of those commits carries its own scoped
+> `clippy`/`nextest`/`doc` run, and the gate's whole-workspace re-run at HEAD is green. Read it as
+> the deliberate response to having lost work twice.
+>
+> **This is also the most likely explanation for finding 3 above** — a correction announced in a
+> commit message and completed in `crates/` but not in the ledger — and it is part of why the two
+> final reviews landed after their fix rounds with no room left to answer them. That is an
+> explanation, not an excuse: the four findings are still unfixed and the gate still says do not
+> merge.
+>
+> ---
+>
+> ## Audit findings from this ledger pass
+>
+> Every row this batch touched was re-checked at HEAD against the code and against upstream at the
+> pinned tags (`git -C tmp/<repo> show <tag>:<path>`; the checkouts were never moved).
+>
+> 1. **All six closure marks carry evidence and all cited shas exist on the branch.** Each was
+>    resolved with `git log -1 <sha>` and each subject matches the row's claim. **No row was found
+>    marked closed without evidence, so none was reverted to open.**
+> 2. **The eleventh edition's §0 table was internally inconsistent** and this pass corrected it. Its
+>    per-area table totalled 91 open / 583 closed while its own prose said 90 / 584; the prose was
+>    right, and the error was one cell — area `06`, printed as `12 open / 61 closed / 3 medium` where
+>    the script said `11 / 62 / 2`. Nothing on this branch caused it. It is recorded in §0's twelfth
+>    edition, and it is why that edition quotes two script runs instead of differencing published
+>    tables. **Anyone re-deriving batch 3's delta should use 90 / 584 as its end state.**
+> 3. **`DRIFT-041`'s row no longer asserts the HTML export is complete**, as required. It carries the
+>    struck original claim, the explicit correction that the residual list was wrong, `DRIFT-054`'s
+>    filing, and `DRIFT-054`'s close at `16b38c93` — with the `renderedTools` residual now stated as a
+>    **live-path** gap rather than excused by pi's `exportFromFile`, which was the defence that made
+>    the row wrong in the first place.
+> 4. **`09a`'s open set is now empty** (`SUBA-095` was its last row). The file remains as the
+>    v0.57-drift evidence supplement.
+> 5. **This batch touched no foreign ledger file.** Its ledger diff is confined to seven area files
+>    (01, 05, 06, 07, 08, 09a, 12); `PARITY-GAPS.md` and this file were left to this pass, which is
+>    the intended discipline.
+> 6. **Citation spot-checks all resolved.** `agent-session.ts:3439` (`git -C tmp/pi grep -n
+>    'exportSessionToHtml(this.sessionManager' v0.84.4`), `external-cli-runner.ts:261-272` and
+>    `run-fanout-budget.ts:238-262` @v0.64.0 were each read personally this pass; the first two are
+>    what refute the run.rs comment, the third what establishes the rollback finding.
+>
+> ---
+>
+> ## Recommended next batch
+>
+> 1. **The four unfixed findings above, first and as bugs.** They are the cheapest work on this list
+>    and the only work that is a debt rather than a gap. Do not file rows for them.
+> 2. **`CFG-067`'s enforcement wiring.** The run fan-out ledger and its doctor surface are ported and
+>    proven; nothing creates a budget, writes `RUN_FANOUT_BUDGET_ENV` into a fan-out child, or claims
+>    against it. The doctor now says so in its own output, which makes this honest rather than
+>    fixed.
+> 3. **`DRIFT-009`'s data half stays BLOCKED**, not deferred: the four embedded catalogs cannot be
+>    generated because `models.dev` is an egress-policy 403 and pi's own catalog data is gitignored
+>    upstream. It needs an environment, not an engineer. Node, npm and bun ARE installed — the row's
+>    old escalation clause claiming otherwise was refuted this batch.
+> 4. **The ten open mediums**, none of which this batch filed and six of which predate it by more than
+>    a week.
+> 5. **Area 13 is still outside the census** and its own re-audit filed four criticals/highs against
+>    `crates/cyrup-mcp` (`MCP-500` foremost). Excluded by the counting rule, not by severity.
+
+---
+
 # RECONCILED 2026-09-04 → 2026-09-05 (ninth edition) — batch 3: nineteen rows closed, two partially, one refuted; **the set above `medium` is EMPTY for the first time**, and this pass filed seven new rows against the code the batch itself landed
+
+> **SUPERSEDED by the tenth edition above (2026-09-05, batch 4). Kept as written history, and it is a
+> dated snapshot, not a status.** Four of the seven rows this edition filed — `DRIFT-054`,
+> `SUBA-095`, `TUI-096`, `SEAM-118` — are CLOSED at HEAD with landing shas; this block still lists
+> them as open because it records what was true at code HEAD `824a539e`. The per-area files are the
+> status of record. Its `agent-session.ts:3438` citation is likewise the value as filed; the correct
+> one is `:3439`.
 
 > **Read this block before planning.** cyrup **code** HEAD **`824a539e`**, branch
 > `claude/parity-batch3`, cut from `main` = `3e9633c4`. That is the last CODE commit of the batch —

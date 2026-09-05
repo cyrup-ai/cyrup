@@ -183,10 +183,14 @@ impl ApiImpl for PiMessagesApi {
         // `options?.onPayload?.(payload, model)`, pi-messages.ts:377-380).
         let body =
             crate::stream::apply_on_payload(opts, model, build_payload(model, ctx, opts)).await;
+        // PROV-042: `transformHeaders` runs LAST over the fully-assembled set (pi
+        // `models.ts:657` @v0.84.4); its return value is what goes on the wire.
+        let headers =
+            crate::stream::apply_transform_headers(opts, build_headers(opts, &api_key)).await;
         let req = SseRequest {
             method: reqwest::Method::POST,
             url: url.clone(),
-            headers: build_headers(opts, &api_key),
+            headers,
             body: Some(body),
         };
 

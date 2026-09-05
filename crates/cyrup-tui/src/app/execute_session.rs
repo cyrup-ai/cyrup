@@ -112,7 +112,7 @@ impl<B: Backend> App<B> {
                             let html = cyrup_session_svc::session_jsonl_to_html_with_theme(
                                 &jsonl,
                                 &session.export_theme(),
-                                session.export_leaf_id().await.as_deref(),
+                                &session.export_state().await,
                             );
                             // TUI-082 — bare `/export` WRITES A FILE. It used to `push_block` the
                             // raw HTML into the transcript, so the single most likely invocation

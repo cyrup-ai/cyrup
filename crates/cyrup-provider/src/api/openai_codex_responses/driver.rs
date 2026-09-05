@@ -78,14 +78,20 @@ impl ApiImpl for CodexResponsesApi {
         // `options?.onPayload?.(body, model)`, :284-287).
         let body = crate::stream::apply_on_payload(opts, model, params).await;
 
-        let headers = build_sse_headers(
-            model,
-            auth,
+        // PROV-042: `transformHeaders` runs LAST over the fully-assembled set (pi
+        // `models.ts:657` @v0.84.4); its return value is what goes on the wire.
+        let headers = crate::stream::apply_transform_headers(
             opts,
-            &account_id,
-            &api_key,
-            codex_session_id.as_deref(),
-        );
+            build_sse_headers(
+                model,
+                auth,
+                opts,
+                &account_id,
+                &api_key,
+                codex_session_id.as_deref(),
+            ),
+        )
+        .await;
         let url = resolve_codex_url(resolved_base_url(model, auth));
         let req = SseRequest {
             method: reqwest::Method::POST,

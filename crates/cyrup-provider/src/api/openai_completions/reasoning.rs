@@ -57,8 +57,41 @@ pub(super) fn apply_reasoning(
             );
         }
         ThinkingFormat::ChatTemplate => {
-            if let Some(kwargs) = build_chat_template_kwargs(model, opts, compat) {
+            if let Some(kwargs) =
+                build_chat_template_values(model, opts, &compat.chat_template_kwargs)
+            {
                 obj.insert("chat_template_kwargs".to_string(), Value::Object(kwargs));
+            }
+        }
+        // DRIFT-009 — `api/openai-completions.ts:888-904` @v0.84.4. Two independent halves, and
+        // neither is gated on the other: `chat_template_args` is emitted whenever the resolved
+        // args map produces at least one value (`:893-896`), and `reasoning_effort` whenever the
+        // model `supportsReasoningEffort` (`:897-903`) — note there is NO `options.reasoningEffort`
+        // guard on the second half, unlike every sibling branch: with thinking OFF it falls back
+        // to `thinkingLevelMap.off` (`:899`), so Baseten is told "off" explicitly rather than being
+        // left to its own default.
+        ThinkingFormat::Baseten => {
+            if let Some(args) = build_chat_template_values(model, opts, &compat.chat_template_args)
+            {
+                obj.insert("chat_template_args".to_string(), Value::Object(args));
+            }
+            if sre {
+                // `mappedEffort = requestedEffort ? map[requestedEffort] : map.off`, then
+                // `effort = mappedEffort === undefined ? requestedEffort : mappedEffort`, emitted
+                // only when it is a string (`:899-903`).
+                let mapped = if eff.is_some() {
+                    level_map_lookup(map, key)
+                } else {
+                    level_map_lookup(map, "off")
+                };
+                let effort = match mapped {
+                    None => eff.map(str::to_string),
+                    Some(Some(s)) => Some(s.clone()),
+                    Some(None) => None,
+                };
+                if let Some(s) = effort {
+                    obj.insert("reasoning_effort".to_string(), json!(s));
+                }
             }
         }
         ThinkingFormat::Deepseek => {
@@ -133,14 +166,19 @@ pub(super) fn apply_reasoning(
     }
 }
 
-/// Build `chat_template_kwargs` from `compat.chatTemplateKwargs` (Pi `buildChatTemplateKwargs`).
-fn build_chat_template_kwargs(
+/// Resolve one of the two `ChatTemplateKwargValue` maps (Pi `buildChatTemplateValues`,
+/// `openai-completions.ts:1010-1026` @v0.84.4).
+///
+/// DRIFT-009 took the `compat`-shaped parameter off this function: upstream passes the MAP
+/// (`compat.chatTemplateKwargs` at `:884`, `compat.chatTemplateArgs` at `:893`), because the same
+/// resolution feeds two different request fields.
+fn build_chat_template_values(
     model: &Model,
     opts: &StreamOptions,
-    compat: &ResolvedCompat,
+    values: &Map<String, Value>,
 ) -> Option<Map<String, Value>> {
     let mut kwargs = Map::new();
-    for (key, value) in &compat.chat_template_kwargs {
+    for (key, value) in values {
         if let Some(resolved) = resolve_chat_template_kwarg_value(model, opts, value) {
             kwargs.insert(key.clone(), resolved);
         }

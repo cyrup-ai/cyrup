@@ -198,6 +198,13 @@ enum UnportedReason {
 /// git — `baseUrl`, `compat`, `thinkingFormat`, the thinking-level ladders and the Individual
 /// allowlist (`:290-334`, `:1259-1330`, `:2303-2380`) — but `cost`, `contextWindow`, `maxTokens`,
 /// `name`, `reasoning` and the input modalities are models.dev's, and only models.dev has them.
+///
+/// **All four are REGISTERED providers (PROV-014, DRIFT-009), so this is a DATA shortfall and not
+/// a registration one.** Each is a `FleetCatalog::Dynamic` member of
+/// `crates/cyrup-provider/src/providers/fleet.rs` — auth resolves from its env var, requests
+/// stream, and the rows arrive through the pi.dev overlay or `models.json`. What is missing is the
+/// embedded FLOOR: an `--offline` run, and the window before the overlay's first fetch, sees no
+/// models for them. `--roster <rev>` below is the trigger that says when that can be fixed.
 const UNPORTED: &[Unported] = &[
     Unported {
         stem: "together",

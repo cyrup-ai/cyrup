@@ -83,6 +83,84 @@ numbers and file existence both mislead. §7 says how much of this was first-han
 
 ## 0. Census — every open item in the fourteen area files, by class
 
+> **TWELFTH EDITION 2026-09-05 (batch 4), cyrup code HEAD `f2630a7a` — the same script, unchanged,
+> re-run after six closures, three narrowings, and — for the first time in this ledger's history —
+> **ZERO new rows filed by the batch that ran**. `python3 scripts/count_open_items.py` from
+> `docs/gap-analysis/`, over the fourteen files' current `## Open items` tables (and `09a`'s
+> `## Summary — confirmed items` table), reproduced verbatim below; `SEAM-058` and `SUBA-005` remain
+> the two hand-counted trackers outside any table. No script change this edition.
+>
+> **Open set: 84 work items — 0 critical, 0 high, 10 medium, 74 low**, of which 82 sort into the six
+> Kind-derived classes and 2 do not (`EXT-058`, `PERM-032`). **590 closed.**
+>
+> | area | open | crit | high | med | low | trackers | closed |
+> |---|---:|---:|---:|---:|---:|---:|---:|
+> | [01 core + provider](01-cyrup-core-and-provider.md) | 3 | 0 | 0 | 0 | 3 | 0 | 57 |
+> | [02 agent](02-cyrup-agent.md) | 3 | 0 | 0 | 0 | 3 | 1 | 28 |
+> | [03 session](03-cyrup-session.md) | 3 | 0 | 0 | 0 | 3 | 1 | 32 |
+> | [04 tools](04-cyrup-tools.md) | 1 | 0 | 0 | 0 | 1 | 0 | 33 |
+> | [05 config + resources](05-cyrup-config-and-resources.md) | 12 | 0 | 0 | 4 | 8 | 0 | 55 |
+> | [06 ext host](06-cyrup-ext.md) | 10 | 0 | 0 | 1 | 9 | 0 | 63 |
+> | [07 tui](07-cyrup-tui.md) | 28 | 0 | 0 | 0 | 28 | 0 | 78 |
+> | [08 session-svc + modes](08-cyrup-session-svc-and-modes.md) | 3 | 0 | 0 | 0 | 3 | 0† | 72 |
+> | [09 subagents](09-cyrup-ext-subagents.md) | 11 | 0 | 0 | 3 | 8 | 0† | 40 |
+> | [09a v0.57 drift](09a-cyrup-ext-subagents-v0.57-drift.md) | 0 | 0 | 0 | 0 | 0 | 0 | 23 |
+> | [10 permission system](10-cyrup-permission-system.md) | 1 | 0 | 0 | 0 | 1 | 1 | 22 |
+> | [11 intercom](11-cyrup-intercom.md) | 3 | 0 | 0 | 0 | 3 | 0 | 51 |
+> | [12 pi core drift](12-upstream-drift-pi-core.md) | 5 | 0 | 0 | 2 | 3 | 3 | 30 |
+> | [14 flux](14-cyrup-flux.md) | 1 | 0 | 0 | 0 | 1 | 0 | 6 |
+> | **total** | **84** | **0** | **0** | **10** | **74** | **6 + 2‡** | **590** |
+>
+> † `SEAM-058` and `SUBA-005` sit outside their files' `## Open items` tables (standalone
+> `## Trackers` sections) and print as 0 here; ‡ they are the "+ 2" hand-counted in the total.
+>
+> | class | n |
+> |---|---:|
+> | **Port bug** (`not-ported` + `parity-bug` + `port-divergence`) | **50** |
+> | **Version lag** (`upstream-drift`) | **14** |
+> | **Reverse lag** (`stale-port`) | **1** |
+> | **Test defect** (`test-defect`) | **1** |
+> | **Invented surface** (`cyrup-original`) | **15** |
+> | **Tooling** (`tooling`) | **1** |
+> | *(unclassified — `EXT-058`, `PERM-032`)* | 2 |
+> | | **82 + 2 = 84** |
+>
+> **What moved, measured rather than asserted.** The script was run against `origin/main`'s copy of
+> this directory (`git archive origin/main docs/gap-analysis`) as well as HEAD, so the delta below is
+> a difference of two script runs, not a difference of two hand-written tables: **90 → 84 open,
+> 584 → 590 closed. Six rows closed, none filed.** `01` 4 → 3 (`PROV-042`, the last `medium` in
+> that area); `06` 11 → 10 (`EXT-041`); `07` 29 → 28 (`TUI-096`); `08` 4 → 3 (`SEAM-118`);
+> `09a` 1 → 0 (`SUBA-095` — **that file's open set is now empty**); `12` 6 → 5 (`DRIFT-054`).
+> `DRIFT-009`, `TUI-046` and `CFG-067` were worked and NARROWED but correctly stay open at their
+> existing severities. Every other area is untouched.
+>
+> **Four of the six closures are batch 3's own self-filed rows.** `DRIFT-054`, `SUBA-095`, `TUI-096`
+> and `SEAM-118` were opened by the batch-3 ledger pass against code batch 3 had just landed, and
+> that batch merged with them open. All four are closed here with landing shas. Of the seven rows
+> batch 3 filed, six described its own code; batch 4 filed **zero** rows of any kind. That is the one
+> number this edition exists to publish, and `00-residual-ledger.md`'s tenth edition says what it does
+> and does not license — in particular that batch 4 still shipped with four unfixed review findings
+> against its own code, recorded on the rows that own the code (`SUBA-095`, `CFG-067`) rather than
+> filed as new rows.
+>
+> **AUDIT CORRECTION carried by this edition.** The eleventh edition's per-area TABLE and its own
+> prose disagreed: the table totalled **91 open / 583 closed** while the paragraph above it said
+> **90 / 584**. The prose was right and the table was wrong, in one cell — area `06` was printed as
+> `12 open / 61 closed / 3 medium` where the script said `11 / 62 / 2`. Nothing on this branch caused
+> it; it was a hand-transcription slip in the eleventh edition itself, and it is the reason this
+> edition quotes both script runs rather than differencing published tables. Anyone re-deriving the
+> batch-3 delta should use 90/584 as its end state.
+>
+> **Above-medium open rows: ZERO**, for the second consecutive edition. The script prints
+> `Above-medium open rows (0)`. See §0a for what that does not mean.
+>
+> **Not counted, deliberately:** area 13 (`13-cyrup-mcp*.md`) stays outside this census by the
+> standing counting rule, unchanged by this batch. Its last counted census is
+> **244 implemented / 82 partial / 84 missing / 27 n-a of 437** at `pi-mcp-adapter` v2.32.1 — a floor,
+> not an answer; see `13-cyrup-mcp-STATUS.md`.
+>
+> Every block below this one is superseded.
+
 > **ELEVENTH EDITION 2026-09-05 (batch 3), cyrup code HEAD `824a539e` — the same script, unchanged,
 > re-run after nineteen closures, two partial closures, one refutation and the seven new rows this
 > ledger pass filed against batch-3's own code.** `python3 scripts/count_open_items.py` from
@@ -584,6 +662,44 @@ Where the re-audit moved an item to a different class, the id moves section and 
 ---
 
 ## 0a. Everything above medium, in one table
+
+> **NINTH EDITION 2026-09-05 (batch 4), cyrup code HEAD `f2630a7a` — THE SET IS STILL EMPTY, for the
+> second consecutive edition. This section remains a statement, not a table.**
+>
+> `python3 scripts/count_open_items.py` prints `Above-medium open rows (0)` across all fourteen
+> tables. Batch 4 neither closed nor filed an above-medium row — it closed six `medium`/`low` rows
+> and filed none — so the set is empty for the same reason the eighth edition gave: `SUBA-074`,
+> the last one, closed in batch 3.
+>
+> **What this does NOT license — unchanged from the eighth edition, with the numbers refreshed.**
+>
+> * **It is not a claim that nothing serious is open.** 84 rows are open, 10 of them `medium`, and
+>   §0's twelfth edition has the table. Severity is a per-row judgement made when the row was
+>   written; a `medium` that nobody has re-read is not evidence of a small problem.
+> * **It is not a claim that the analysis has looked everywhere.** `README.md`'s *Where this analysis
+>   is blind* is unchanged: an item-driven pass cannot see behaviour nobody filed an item for, so
+>   **whatever is open is a floor, never a total.**
+> * **It is not durable.** The fifth edition watched this set turn over completely in one pass and
+>   acquire two criticals that had not existed a week before. The next surface-driven sweep should be
+>   expected to refill it.
+> * **It is not a statement about area 13**, counted separately, whose own re-audit at
+>   `pi-mcp-adapter` v2.32.1 filed four criticals/highs against `crates/cyrup-mcp` — `MCP-500`
+>   foremost. Excluded by the standing counting rule, not because they are less serious.
+> * **NEW THIS EDITION — it is not a claim that this batch's own code is clean.** Batch 4 filed zero
+>   rows, which is its target and a real improvement on batch 3's six-against-itself. It nonetheless
+>   merged with **four unfixed findings against its own output**, two of them raised as blocking: a
+>   false upstream citation at `crates/cyrup-ext-subagents/src/exec/external_cli/run.rs:333-336`, a
+>   claim rollback that is not panic-safe at `.../exec/run_fanout_budget.rs:888-902` (with a test
+>   pinning the divergent outcome as correct), a ledger citation this batch announced as corrected and
+>   did not correct, and dead state in `run.rs`. Three of the four are recorded on `SUBA-095`'s and
+>   `CFG-067`'s rows; the ledger one is fixed. **A batch with zero filed rows and four unfixed findings
+>   is not the same thing as a batch with nothing wrong in it**, and reading this section as the
+>   latter is the specific misreading the tenth-edition residual ledger was written to prevent.
+>
+> **Six of the ten open mediums predate this batch by more than a week**; none was filed by it. That
+> is a statement about how recently anyone looked, not about how good the remainder is.
+>
+> Every block below this one is superseded.
 
 > **EIGHTH EDITION 2026-09-05 (batch 3), cyrup code HEAD `824a539e` — THE SET IS EMPTY. This section
 > is a statement, not a table, because there is nothing to tabulate.**

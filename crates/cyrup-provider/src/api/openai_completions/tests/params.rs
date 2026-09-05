@@ -249,3 +249,157 @@ fn deepseek_catalog_sends_max_effort() {
     );
     assert_eq!(body["reasoning_effort"], "max", "body={body}");
 }
+
+// ------------------------------------------------------- DRIFT-009: the `baseten` thinkingFormat --
+
+/// The exact `zai-org/GLM-5.2` row pi's own test pins (`packages/ai/test/baseten-models.test.ts:19-54`
+/// @v0.84.4), in the JSON shape a catalog / pi.dev-overlay row arrives in.
+///
+/// It is written as JSON rather than as a `Model` literal on purpose: Baseten is one of the four
+/// providers whose rows are in git at no upstream revision (DRIFT-009), so **every** row it will
+/// ever have reaches cyrup by deserialization at runtime. A `ThinkingFormat` that cannot parse
+/// `"baseten"` fails the whole row, and a provider whose rows all fail to parse is a provider that
+/// silently offers nothing — which is why this fixture goes through `serde_json`.
+fn baseten_glm_52_row() -> &'static str {
+    r#"{
+        "id": "zai-org/GLM-5.2",
+        "name": "GLM-5.2",
+        "api": "openai-completions",
+        "provider": "baseten",
+        "baseUrl": "https://inference.baseten.co/v1",
+        "reasoning": true,
+        "thinkingLevelMap": {
+            "off": "none", "minimal": null, "low": null, "medium": null,
+            "high": "high", "xhigh": null, "max": "max"
+        },
+        "input": ["text", "image"],
+        "contextWindow": 1048576,
+        "maxTokens": 262144,
+        "cost": { "input": 1.4, "output": 4.4, "cacheRead": 0.3, "cacheWrite": 0 },
+        "compat": {
+            "supportsStore": false,
+            "supportsDeveloperRole": false,
+            "supportsReasoningEffort": true,
+            "supportsUsageInStreaming": true,
+            "maxTokensField": "max_tokens",
+            "supportsStrictMode": true,
+            "supportsLongCacheRetention": false,
+            "thinkingFormat": "baseten",
+            "chatTemplateArgs": { "enable_thinking": { "$var": "thinking.enabled" } }
+        }
+    }"#
+}
+
+/// DRIFT-009 — `api/openai-completions.ts:888-904` @v0.84.4, against the row pi's
+/// `baseten-models.test.ts` pins.
+///
+/// Two independent halves. `chat_template_args` carries the resolved `chatTemplateArgs` map
+/// (`:893-896`) — `{"$var": "thinking.enabled"}` becomes the boolean. `reasoning_effort` is the
+/// thinking-level map's value for the requested level (`:897-903`), and — unlike every sibling
+/// branch — it is emitted **with thinking off too**, from `thinkingLevelMap.off` (`:899`).
+#[test]
+fn baseten_sends_chat_template_args_and_a_mapped_reasoning_effort() {
+    let model: Model = serde_json::from_str(baseten_glm_52_row()).expect("catalog row parses");
+    let ctx = Context {
+        system_prompt: None,
+        messages: vec![],
+        tools: vec![],
+    };
+
+    let on = build_body(
+        &model,
+        &ctx,
+        &StreamOptions {
+            reasoning: ModelThinkingLevel::High,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        on["chat_template_args"],
+        json!({ "enable_thinking": true }),
+        "`{{$var: thinking.enabled}}` resolves to the boolean and rides `chat_template_args`, not \
+         `chat_template_kwargs`: {on}"
+    );
+    assert!(
+        on.get("chat_template_kwargs").is_none(),
+        "the two maps are separate request fields (`:884` vs `:893`): {on}"
+    );
+    assert_eq!(on["reasoning_effort"], "high", "map[high] = \"high\": {on}");
+
+    // `max` maps to "max" on this row, which is the rung `thinkingLevelMap` exists to carry.
+    let maxed = build_body(
+        &model,
+        &ctx,
+        &StreamOptions {
+            reasoning: ModelThinkingLevel::Max,
+            ..Default::default()
+        },
+    );
+    assert_eq!(maxed["reasoning_effort"], "max");
+
+    // Thinking OFF: `mappedEffort = map.off` (`:899`) — Baseten is told "none" explicitly.
+    let off = build_body(&model, &ctx, &StreamOptions::default());
+    assert_eq!(
+        off["chat_template_args"],
+        json!({ "enable_thinking": false }),
+        "{off}"
+    );
+    assert_eq!(
+        off["reasoning_effort"], "none",
+        "there is no `options.reasoningEffort` guard on the effort half (`:897`): {off}"
+    );
+}
+
+/// The rung the map nulls out sends no `reasoning_effort` at all — `mappedEffort` is `null`, not
+/// `undefined`, so the `typeof effort === "string"` guard at `:901` rejects it. And a row that
+/// does not `supportsReasoningEffort` never reaches the guard (`:897`).
+#[test]
+fn baseten_omits_reasoning_effort_for_a_nulled_rung_and_without_effort_support() {
+    let model: Model = serde_json::from_str(baseten_glm_52_row()).expect("catalog row parses");
+    let ctx = Context {
+        system_prompt: None,
+        messages: vec![],
+        tools: vec![],
+    };
+
+    let low = build_body(
+        &model,
+        &ctx,
+        &StreamOptions {
+            reasoning: ModelThinkingLevel::Low,
+            ..Default::default()
+        },
+    );
+    assert!(
+        low.get("reasoning_effort").is_none(),
+        "map[low] is null — send nothing: {low}"
+    );
+    assert_eq!(
+        low["chat_template_args"],
+        json!({ "enable_thinking": true }),
+        "the args half is independent of the effort half: {low}"
+    );
+
+    // pi's `toggleReasoningCompat` (`ai/scripts/generate-models.ts:1274-1278`): the same format
+    // with `supportsReasoningEffort: false`, which is what a Baseten row without an `effort`
+    // reasoning option generates.
+    let mut toggle_only = model.clone();
+    toggle_only
+        .compat
+        .as_mut()
+        .expect("compat")
+        .supports_reasoning_effort = Some(false);
+    let body = build_body(
+        &toggle_only,
+        &ctx,
+        &StreamOptions {
+            reasoning: ModelThinkingLevel::High,
+            ..Default::default()
+        },
+    );
+    assert!(body.get("reasoning_effort").is_none(), "{body}");
+    assert_eq!(
+        body["chat_template_args"],
+        json!({ "enable_thinking": true })
+    );
+}

@@ -341,3 +341,157 @@ fn the_session_swap_arm_reapplies_the_theme_after_the_registry_and_before_the_re
         "the theme must be re-applied BEFORE the replay materialises the restored conversation"
     );
 }
+
+// ---------------------------------------------------------------------------
+// TUI-096 — the failure half of pi's `applyThemeName` (`theme-controller.ts:126-135` @v0.84.4)
+// ---------------------------------------------------------------------------
+//
+// `applyThemeName` does TWO things when `setTheme` fails: it seats `activeThemeName = "dark"`, and
+// — under `showError`, which is `true` on both `applyFromSettings` branches that name a theme
+// (`:64`, `:70`) — it surfaces
+// `Failed to load theme "<name>": <error>\nFell back to dark theme.`. The error text for a name
+// that resolves to nothing is `setTheme`'s caught `Theme not found: <name>`
+// (`theme/theme.ts:623` thrown by `loadThemeJson`, caught at `:903-911`). cyrup ported neither
+// half: it repainted dark and kept the broken name.
+
+/// A `/reload` onto a theme the swapped-in session cannot resolve must seat `dark` as the ACTIVE
+/// name, not keep the name that failed — pi `this.activeThemeName = result.success ? themeName :
+/// "dark"` (`theme-controller.ts:127`).
+#[test]
+fn a_theme_that_fails_to_load_seats_dark_as_the_active_name() {
+    let mut app = booted(Some("midnight"), TerminalTheme::Dark);
+
+    let outcome = app.reapply_theme_from_settings(Some("midnight"), &registry(Vec::new()));
+
+    assert_eq!(
+        app.theme_controller().map(ThemeController::active_name),
+        Some("dark"),
+        "a theme that failed to load must not leave its own name reported as active — pi seats \
+         `\"dark\"` on the failure branch (`theme-controller.ts:127` @v0.84.4)"
+    );
+    assert_eq!(
+        outcome,
+        crate::ThemeApply::FellBackToDark {
+            name: "midnight".to_string(),
+            error: "Theme not found: midnight".to_string(),
+        },
+        "the load result is pi's `ThemeResult` (`theme-controller.ts:16`) and must reach the caller"
+    );
+}
+
+/// ...and the user must be TOLD. pi hands the sentence to `showError`, which commits
+/// `Spacer(1)` + `Text(fg(\"error\", `Error: ${message}`))` (`interactive-mode.ts:4258-4262`) —
+/// cyrup's [`crate::transcript::TranscriptView::push_error`], whose caller supplies the prefix.
+#[test]
+fn a_theme_that_fails_to_load_surfaces_pis_sentence() {
+    let mut app = booted(Some("midnight"), TerminalTheme::Dark);
+
+    app.reapply_theme_from_settings(Some("midnight"), &registry(Vec::new()));
+    app.draw().unwrap();
+    let out = app.scrollback_text();
+
+    assert!(
+        out.contains("Error: Failed to load theme \"midnight\": Theme not found: midnight"),
+        "pi surfaces `Failed to load theme \"${{themeName}}\": ${{result.error}}` \
+         (`theme-controller.ts:131-133` @v0.84.4):\n{out}"
+    );
+    assert!(
+        out.contains("Fell back to dark theme."),
+        "the second line of pi's message says WHICH theme is now painted:\n{out}"
+    );
+}
+
+/// The silence is only removed on failure: a theme that loads says nothing at all, so a `/reload`
+/// on a healthy config stays quiet (pi guards on `!result.success`, `theme-controller.ts:131`).
+#[test]
+fn a_theme_that_loads_is_reported_as_loaded_and_says_nothing() {
+    let mut app = booted(Some("dark"), TerminalTheme::Dark);
+
+    let outcome = app.reapply_theme_from_settings(
+        Some("midnight"),
+        &registry(vec![custom_theme("midnight", "#010203")]),
+    );
+    app.draw().unwrap();
+
+    assert_eq!(outcome, crate::ThemeApply::Loaded("midnight".to_string()));
+    assert_eq!(
+        app.theme_controller().map(ThemeController::active_name),
+        Some("midnight"),
+        "a theme that loaded keeps its own name active (`result.success ? themeName : \"dark\"`)"
+    );
+    assert!(
+        !app.scrollback_text().contains("Failed to load theme"),
+        "a healthy reload must not print an error"
+    );
+}
+
+/// TUI-096 follow-up (`8950604b`) — THE test for the load ORDER, and the only one that can tell it
+/// from the order it replaced.
+///
+/// `reapply_theme_from_settings` asks the swapped-in session's discovered themes FIRST and uses
+/// `UiTheme::builtin_named` only as the fallback. That is a declared [CYRUP-DELTA] against
+/// `loadThemeJson`, which checks `if (name in builtinThemes)` first (`theme/theme.ts:607-610`
+/// @v0.84.4): the two orders differ ONLY when a discovered theme reuses a built-in name, because
+/// discovery seeds the candidate list with the built-ins anyway (`registry` above). cyrup resolves
+/// that collision the other way everywhere else it resolves a theme by name — `TuiThemeAccess::get`
+/// / `set` (`theme_access.rs:144`, `:164`) and the boot theme-file watcher — so under the upstream
+/// order `/reload` would repaint the compiled-in `dark` while the watcher watched the user's
+/// `themes/dark.json`.
+///
+/// A user theme is `ResourceScope::Global` (rank 3) and the compiled-in pair is
+/// `ResourceScope::Builtin` (rank 7), so `ResourceSet::build`'s first-wins-by-rank already makes
+/// the user's the WINNER for the name; this test pins that the seam honours that winner.
+///
+/// RED under built-ins-first: the accent would be the compiled-in dark's, not `#ff0000`.
+#[test]
+fn a_discovered_theme_that_shadows_a_builtin_name_beats_the_builtin() {
+    let mut app = booted(Some("dark"), TerminalTheme::Dark);
+
+    let outcome = app.reapply_theme_from_settings(
+        Some("dark"),
+        &registry(vec![custom_theme("dark", "#ff0000")]),
+    );
+
+    assert_eq!(outcome, crate::ThemeApply::Loaded("dark".to_string()));
+    assert_ne!(
+        UiTheme::builtin("dark").accent,
+        Some(Color::Rgb(0xff, 0x00, 0x00)),
+        "the fixture must not accidentally match the compiled-in dark, or it proves nothing"
+    );
+    assert_eq!(
+        app.state().theme.accent,
+        Some(Color::Rgb(0xff, 0x00, 0x00)),
+        "a `themes/dark.json` the session discovered must win over the compiled-in `dark`, which \
+         is what every other by-name theme lookup in cyrup does"
+    );
+}
+
+/// A built-in name always loads, even against a registry that discovered nothing: `builtin_named`
+/// is the FALLBACK leg of the load above, and it is what keeps `dark`/`light` resolvable for a
+/// harness `ResourceRegistry::default()` that discovered nothing to shadow them with.
+#[test]
+fn a_builtin_name_loads_even_when_the_session_discovered_no_themes() {
+    let mut app = booted(Some("dark"), TerminalTheme::Dark);
+
+    let outcome = app.reapply_theme_from_settings(Some("light"), &ResourceRegistry::default());
+
+    assert_eq!(outcome, crate::ThemeApply::Loaded("light".to_string()));
+    assert_eq!(
+        app.state().theme.foreground,
+        UiTheme::light().foreground,
+        "the compiled-in light theme must not be reported as a failed load"
+    );
+}
+
+/// An app the composition root never handed a controller has nothing to re-resolve, and must say
+/// so rather than reporting a load that did not happen.
+#[test]
+fn an_app_with_no_controller_reports_that_nothing_was_re_resolved() {
+    let mut app = App::new(TestBackend::new(80, 24), UiTheme::light()).unwrap();
+
+    let outcome = app.reapply_theme_from_settings(Some("nope"), &registry(Vec::new()));
+
+    assert_eq!(outcome, crate::ThemeApply::NoController);
+    app.draw().unwrap();
+    assert!(!app.scrollback_text().contains("Failed to load theme"));
+}

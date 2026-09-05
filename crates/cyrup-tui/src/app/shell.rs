@@ -537,30 +537,97 @@ impl<B: Backend> App<B> {
     ///
     /// `resources` is the session's whole discovered set, so a file-backed custom theme resolves
     /// here exactly as it does for an extension's `getTheme` ([`crate::theme_access::TuiThemeAccess`]
-    /// answers from the same [`cyrup_resources::ResourceSet`]). A name that resolves to nothing
-    /// degrades to [`UiTheme::builtin`]'s dark fallback, which is Pi's `applyThemeName` failure path
-    /// (`activeThemeName = "dark"`, `theme-controller.ts:126-135`).
+    /// answers from the same [`cyrup_resources::ResourceSet`]).
+    ///
+    /// TUI-096 — a name that resolves to NOTHING is pi's `setTheme` failure, and upstream does two
+    /// things with it (`applyThemeName`, `theme-controller.ts:126-135` @v0.84.4), not one:
+    ///
+    /// 1. `this.activeThemeName = result.success ? themeName : "dark"` — the ACTIVE name becomes
+    ///    the theme that is actually painted ([`ThemeController::fall_back_to_dark`]); and
+    /// 2. under `showError` — which is `true` on both `applyFromSettings` branches that name a
+    ///    theme (`:64`, `:70`), i.e. on every path that reaches here — it surfaces
+    ///    ``Failed to load theme "<name>": <error>\nFell back to dark theme.``
+    ///
+    /// cyrup projected [`UiTheme::builtin`]'s silent dark fallback and kept the broken name, so a
+    /// `/reload` onto a deleted, renamed or malformed theme turned the UI dark with no way to tell
+    /// that apart from a theme that simply looks dark. `<error>` is pi's `result.error`: for a name
+    /// nothing resolves, `loadThemeJson`'s `Theme not found: <name>` (`theme/theme.ts:623`, caught
+    /// by `setTheme` at `:903-911`). The sentence goes to
+    /// [`crate::transcript::TranscriptView::push_error`], which is `showError`'s
+    /// `Spacer(1)` + `Text(theme.fg("error", …), outputPad, 0)`
+    /// (`interactive-mode.ts:4258-4262`) — with the `Error: ` prefix supplied here, since that
+    /// entry renders verbatim (see `transcript/render.rs`'s `Entry::Error` arm).
+    ///
+    /// cyrup has ONE `<error>` string where pi can have two, and the reason is where the parse
+    /// happens: a malformed theme file is rejected by `cyrup-resources` during discovery
+    /// (`discovery/scan.rs:551-558` turns the `Theme::load` error into a `ResourceWarning`, which
+    /// the startup diagnostics panel already renders) and therefore never reaches the registry, so
+    /// by the time this seam looks the file is indistinguishable from a deleted one and reads
+    /// `Theme not found`. pi parses lazily inside `setTheme` and would print
+    /// `Failed to parse theme <label>: …` (`theme/theme.ts:600-604`) for that case. The user is
+    /// told either way, once here and once in the panel.
     ///
     /// A no-op when no controller was handed over — an app the composition root did not boot has no
     /// `settings.theme` to answer from and keeps the theme it was constructed with.
-    pub(crate) fn reapply_theme_from_settings(
+    pub fn reapply_theme_from_settings(
         &mut self,
         setting: Option<&str>,
         resources: &cyrup_resources::ResourceRegistry,
-    ) {
+    ) -> ThemeApply {
         let Some(controller) = self.state.theme_controller.as_mut() else {
-            return;
+            return ThemeApply::NoController;
         };
         let name = controller.apply_from_settings(setting);
-        let projected = resources
+        // The load: the swapped-in session's discovered themes, then the compiled-in built-ins.
+        // `None` from both is pi's `setTheme` throw — the failure this seam owes the user a sentence
+        // for.
+        //
+        // [CYRUP-DELTA] vs `loadThemeJson`, which checks `if (name in builtinThemes)` FIRST
+        // (`theme/theme.ts:607-610` @v0.84.4) and so shadows a user theme that reuses a built-in
+        // name. Discovery already seeds the registry with the built-ins, so the two orders differ
+        // only for that shadowing case, and cyrup resolves it the other way everywhere else it
+        // resolves a theme by name — `TuiThemeAccess::get`/`set` (`theme_access.rs:144`, `:164`) and
+        // the boot theme-file watcher (`crates/cyrup/src/interactive.rs`'s `build_theme_watcher`)
+        // both go through `ResourceSet::get_name`. Re-ordering HERE alone would repaint one theme
+        // while the watcher watched another's file. `builtin_named` is therefore the fallback, which
+        // is what a registry that discovered nothing (a harness `ResourceRegistry::default()`) needs
+        // to keep `dark`/`light` loadable. Pinned by
+        // `tests::theme_reapply_on_reload::a_discovered_theme_that_shadows_a_builtin_name_beats_the_builtin`,
+        // which is red under the upstream order and is the ONLY test that can tell the two apart.
+        let loaded = resources
             .themes
             .get_name(&name)
             .map(|theme| UiTheme::from_theme_data(&theme.data, 0))
-            .unwrap_or_else(|| UiTheme::builtin(&name));
+            .or_else(|| UiTheme::builtin_named(&name));
+        let (projected, outcome) = match loaded {
+            Some(theme) => (theme, ThemeApply::Loaded(name)),
+            None => (
+                UiTheme::builtin(crate::theme::DARK_THEME_NAME),
+                ThemeApply::FellBackToDark {
+                    error: format!("Theme not found: {name}"),
+                    name,
+                },
+            ),
+        };
+        if matches!(outcome, ThemeApply::FellBackToDark { .. }) {
+            controller.fall_back_to_dark();
+        }
         // `set_theme`, not a bare assignment: it re-projects through the app's live `ColorMode` and
         // bumps the generation, which is what invalidates the render caches (`notifyChanged` →
         // `ui.invalidate()`, `theme-controller.ts:136-139`).
         self.set_theme(projected);
+        if let ThemeApply::FellBackToDark { name, error } = &outcome {
+            self.state.transcript.push_error(format!(
+                "Error: Failed to load theme \"{name}\": {error}\nFell back to dark theme."
+            ));
+        }
+        outcome
+    }
+
+    /// The boot [`ThemeController`] the composition root handed over, if any (test/inspection).
+    /// `None` for a harness app, which has no `settings.theme` to answer from.
+    pub fn theme_controller(&self) -> Option<&ThemeController> {
+        self.state.theme_controller.as_ref()
     }
 
     /// The app's active color mode (test/inspection).

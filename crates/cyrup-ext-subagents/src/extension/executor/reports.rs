@@ -104,6 +104,11 @@ impl SubagentExecutor {
             results_dir: artifact_roots.results_dir,
             chain_runs_dir: crate::artifacts::chain_runs_dir(cwd),
             discovered: discovery_result.as_ref().map_err(|err| err.as_str()),
+            // CFG-067 — resolved here (the environment and the managed ledger root are ambient
+            // inputs) so `build_doctor_report` stays a pure function of already-resolved state.
+            run_fanout: crate::exec::run_fanout_budget::RunFanoutDoctor::resolve(
+                cfg.max_subagent_spawns_per_run,
+            ),
         };
         build_doctor_report(&input)
     }

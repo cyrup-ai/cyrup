@@ -53,8 +53,13 @@ impl App<InlineBackend<Stdout>> {
         let mut out = io::stdout();
         out.execute(ratatui::crossterm::event::EnableBracketedPaste)?;
         // Kitty keyboard protocol where supported; ignore failure (legacy terminals). The flag
-        // set is `crate::keyboard_protocol::DESIRED_FLAGS` — Pi's `CSI > 7 u` (`terminal.ts:15`)
-        // minus `REPORT_EVENT_TYPES`, a `[CYRUP-DELTA]` that module's docs argue in full (TUI-046).
+        // set is `crate::keyboard_protocol::DESIRED_FLAGS` — Pi's
+        // `crate::keyboard_protocol::PI_DESIRED_FLAGS` (`terminal.ts:15`) minus
+        // `crate::keyboard_protocol::WITHHELD_FLAGS`, a `[CYRUP-DELTA]` that module's docs argue
+        // in full (TUI-046). Named through those constants and never spelled out here: a
+        // spelled-out withheld set at this site went stale the day TUI-046's bit-4 revert widened
+        // it, which is the very drift the item was filed for. Pinned by
+        // `keyboard_protocol::tests::the_push_site_does_not_restate_the_flag_set_it_pushes`.
         let _ = crate::keyboard_protocol::push_flags(&mut out);
         // …and then ASK whether the push took, instead of assuming it did (Pi
         // `queryAndEnableKittyProtocol`, `tui/src/terminal.ts:213-226`). The query has to follow the

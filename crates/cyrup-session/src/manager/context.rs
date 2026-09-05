@@ -91,4 +91,21 @@ impl SessionManager {
         }
         build_context_agent_messages_tagged(&path)
     }
+
+    /// The current branch's ENTRIES with compaction applied — Pi
+    /// `SessionManager.buildContextEntries()` (`session-manager.ts:1277-1279` @v0.84.4, delegating
+    /// to the free function at `:418-453`), the input its interactive host replays from
+    /// (`renderSessionEntries(this.sessionManager.buildContextEntries())`,
+    /// `modes/interactive/interactive-mode.ts:3910`).
+    ///
+    /// [`build_context_raw`](Self::build_context_raw) is this list flat-mapped through the raw
+    /// projection. A caller wants THIS one when it needs the entries that project no message —
+    /// `custom` entries, which a front-end replays through its registered entry renderer (EXT-041).
+    pub fn context_entries(&self) -> Vec<&Entry> {
+        let path = self.branch_path(None);
+        if path.is_empty() {
+            return Vec::new();
+        }
+        crate::context::build_context_entries(&path)
+    }
 }

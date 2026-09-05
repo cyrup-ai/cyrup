@@ -349,26 +349,47 @@ pub fn build_context_agent_messages(path: &[&Entry]) -> Vec<AgentMessage> {
 /// cannot drift.
 pub fn build_context_agent_messages_tagged(path: &[&Entry]) -> Vec<(EntryId, AgentMessage)> {
     let mut messages = Vec::new();
+    for e in build_context_entries(path) {
+        push_as_raw_tagged(&mut messages, e);
+    }
+    messages
+}
+
+/// The active, compaction-aware ENTRY list — Pi `buildContextEntries`
+/// (`packages/coding-agent/src/core/session-manager.ts:418-453` @v0.84.4):
+///
+/// ```ts
+/// const contextEntries: SessionEntry[] = [compaction];
+/// let foundFirstKept = false;
+/// for (let i = 0; i < compactionIdx; i++) { … if (foundFirstKept) contextEntries.push(entry); }
+/// contextEntries.push(...path.slice(compactionIdx + 1));
+/// ```
+///
+/// i.e. the governing (latest) compaction entry at the HEAD, then the entries it kept starting at
+/// `firstKeptEntryId`, then everything after it; no compaction on the path ⇒ the path verbatim. An
+/// unresolvable `first_kept_entry_id` keeps NOTHING — see [`build_context_messages`] for why that
+/// is Pi's own outcome and not a defensive choice.
+///
+/// EXT-041 — this exists as its own function because the message projections are NOT the only
+/// consumer of the admission rule. Pi's replay walk is
+/// `buildContextEntries().flatMap(sessionEntryToContextMessages)` for MESSAGES
+/// (`session-manager.ts:468`) but `entries.flatMap(entry => entry.type === "custom" ? [entry] : …)`
+/// for the render stream (`modes/interactive/interactive-mode.ts:3799-3806` @v0.84.4): a `custom`
+/// entry projects no message at all yet still has to be replayed, under the same admission rule, so
+/// a front-end can hand it to its registered entry renderer. `build_context_agent_messages_tagged`
+/// is now this function flat-mapped through [`raw_context_messages`], so the rule cannot drift
+/// between the two.
+pub fn build_context_entries<'a>(path: &[&'a Entry]) -> Vec<&'a Entry> {
     match latest_compaction(path).and_then(|i| path.get(i).copied().map(|e| (i, e))) {
         Some((
             cpos,
             centry @ Entry::Known(KnownEntry::Compaction {
-                summary,
                 first_kept_entry_id,
-                tokens_before,
-                base,
                 ..
             }),
         )) => {
-            messages.push((
-                centry.id(),
-                AgentMessage::CompactionSummary(CompactionSummaryMessage {
-                    summary: summary.clone(),
-                    tokens_before: *tokens_before,
-                    timestamp: parse_entry_ts(&base.timestamp),
-                }),
-            ));
-            // See [`build_context_messages`]: an unresolvable `first_kept_entry_id` keeps NOTHING.
+            let mut out = Vec::with_capacity(path.len().saturating_sub(cpos));
+            out.push(centry);
             if let Some(before) = path.get(..cpos)
                 && let Some(first_kept) = first_kept_entry_id
             {
@@ -378,23 +399,17 @@ pub fn build_context_agent_messages_tagged(path: &[&Entry]) -> Vec<(EntryId, Age
                         keeping = true;
                     }
                     if keeping {
-                        push_as_raw_tagged(&mut messages, e);
+                        out.push(e);
                     }
                 }
             }
             if let Some(after) = path.get(cpos + 1..) {
-                for e in after {
-                    push_as_raw_tagged(&mut messages, e);
-                }
+                out.extend(after.iter().copied());
             }
+            out
         }
-        _ => {
-            for e in path {
-                push_as_raw_tagged(&mut messages, e);
-            }
-        }
+        _ => path.to_vec(),
     }
-    messages
 }
 
 /// [`push_as_raw`], tagging every message it produces with the source entry's [`EntryId`].

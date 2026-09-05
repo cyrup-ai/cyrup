@@ -1,6 +1,6 @@
 //! Standalone-HTML session export — pi `core/export-html/index.ts` (`generateHtml`,
 //! `exportSessionToHtml`, `exportFromFile`) @v0.84.4, reached from pi's
-//! `agent-session.ts:3022 exportToHtml`.
+//! `agent-session.ts:3427 exportToHtml`.
 //!
 //! pi renders the transcript into a **templated document**, not a text dump: `generateHtml`
 //! (`index.ts:143-175`) base64-encodes a `SessionData{header, entries, leafId, systemPrompt, tools,
@@ -36,10 +36,17 @@
 //! `:177-230`) — the `renderedTools` map that pre-renders EXTENSION tool calls and results through
 //! their TUI renderers and converts the resulting ANSI to HTML (`export-html/tool-renderer.ts`,
 //! `export-html/ansi-to-html.ts`) — is not ported. `template.js:1026` reads `renderedTools?.[…]`
-//! and falls back to its own built-in rendering when the key is absent, which is exactly the shape
-//! pi's own `exportFromFile` (`index.ts:288-316`) produces: it passes no renderer either. So the
-//! document is complete for every built-in tool and degrades for a custom-rendered one precisely
-//! the way upstream's file-mode export does.
+//! and falls back to its own built-in rendering when the key is absent, so the document is complete
+//! for every built-in tool and degrades only for a custom-rendered extension tool.
+//!
+//! That degradation is a LIVE-path gap, not a shape upstream also has. pi's `exportFromFile`
+//! (`index.ts:288-316`) does pass no renderer — but pi's LIVE path always does:
+//! `AgentSession.exportToHtml` builds `createToolHtmlRenderer(…)` unconditionally
+//! (`agent-session.ts:3433-3437`) and hands it to `exportSessionToHtml` (`:3439-3443`), which
+//! pre-renders the map into the payload (`index.ts:254-261`, `:269`). cyrup's `/export`, `/share`
+//! and RPC `export_html` are all live paths, so citing the file entry point here would be excusing
+//! a live gap with an unrelated call site — which is exactly the defence DRIFT-054 was filed
+//! against. `cyrup --export`, the file path, matches upstream exactly.
 
 mod color;
 
@@ -220,12 +227,115 @@ impl ExportTheme {
     }
 }
 
+/// One entry of the payload's `tools` array — pi's
+/// `Pick<ToolDefinition, "name" | "description" | "parameters">` (`export-html/index.ts:135`
+/// @v0.84.4), built from `state.tools.map((t) => ({ name, description, parameters }))` (`:268`).
+///
+/// `template.js:1425-1452` renders one row per element, expanding `parameters.properties` with each
+/// property's `type`, its `required`/`optional` label and its description.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExportTool {
+    /// `ToolDefinition.name`.
+    pub name: String,
+    /// `ToolDefinition.description` — the text shown after the tool name.
+    pub description: String,
+    /// `ToolDefinition.parameters` — a JSON Schema object; the row expands it only when
+    /// `parameters.properties` is a non-empty object (`template.js:1430`).
+    pub parameters: Value,
+}
+
+/// The three `SessionData` keys the session JSONL itself cannot supply: pi reads them off the LIVE
+/// `SessionManager` and `AgentState` (`export-html/index.ts:263-269` @v0.84.4), not off the file.
+///
+/// DRIFT-054. This type exists because a per-key positional parameter is exactly how the two agent
+/// keys came to be missing: `systemPrompt` and `tools` are BOTH gated on pi's single `state?`
+/// (`:267-268`), so they are supplied together or not at all, and holding them behind
+/// [`Self::live`] with private fields makes "passed the leaf, forgot the prompt" unrepresentable.
+///
+/// The two shapes are pi's two call sites, and each is a NAMED constructor so that neither can be
+/// reached by accident:
+///
+/// * [`Self::from_file`] is pi's `exportFromFile` shape (`:288-305`): `systemPrompt: undefined`,
+///   `tools: undefined`, and the leaf derived from the file. That is `cyrup --export`'s path — a
+///   file is all it has.
+/// * [`Self::live`] is pi's `exportSessionToHtml` shape (`:263-270`), which is the ONLY entry point
+///   `/export` (`interactive-mode.ts:6023`), `/share` (`session-share.ts:72`) and RPC `export_html`
+///   (`rpc-mode.ts:601`) have, because `AgentSession.exportToHtml` always passes `this.state`
+///   (`agent-session.ts:3439`).
+///
+/// WHAT THIS DOES NOT MAKE IMPOSSIBLE, stated plainly because the first version of this doc
+/// overstated it: nothing at the TYPE level stops a live caller from handing the renderer a
+/// [`Self::from_file`] value and losing both keys again — that is the original DRIFT-054 defect,
+/// and it stays representable. What the type buys is that the two keys cannot be split from each
+/// other, and that the lossy shape now has to be asked for by name (there is deliberately no
+/// `Default` impl, which is the unnamed bypass the review found). What actually holds the live
+/// paths on [`Self::live`] is the source-grep test in `src/tests/export_html.rs`
+/// (`export_to_html_passes_the_live_session_state_to_the_renderer`) and its negative counterpart
+/// (`the_file_only_export_omits_both_agent_keys_the_way_pi_does`), not the compiler.
+///
+/// Built in the imperative shell — [`crate::AgentSession::export_state`] — for the same reason
+/// [`ExportTheme`] is, so the renderer stays a pure function of its arguments. `export_state` is
+/// the only PRODUCER of a live value in this workspace, but [`Self::live`] is `pub`: the tests
+/// build one directly, and so could a future caller.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExportState {
+    /// pi `sm.getLeafId()` (`index.ts:266` and `:301`).
+    leaf_id: Option<String>,
+    /// pi `state?.systemPrompt` (`:267`).
+    system_prompt: Option<String>,
+    /// pi `state?.tools?.map(...)` (`:268`). `None` is `undefined` — the key is omitted, as
+    /// `JSON.stringify` omits it; `Some(vec![])` is an empty array, which `template.js:1425`'s
+    /// `tools && tools.length > 0` guard renders identically but which is a different payload.
+    tools: Option<Vec<ExportTool>>,
+}
+
+impl ExportState {
+    /// The file-only shape: pi's `exportFromFile`, which opens a `SessionManager` over the file and
+    /// passes NO `AgentState` at all — `systemPrompt: undefined, tools: undefined`
+    /// (`export-html/index.ts:288-305` @v0.84.4). The leaf is left `None` here and derived from the
+    /// file by [`session_jsonl_to_html`], which is what `SessionManager.open` would have seeded.
+    ///
+    /// Named rather than a `Default` impl on purpose: this shape LOSES both agent keys, so a caller
+    /// that has a live session must not be able to reach it by writing `..Default::default()` or
+    /// letting an inferred default fill a field in. `cyrup --export` is its only production caller.
+    #[must_use]
+    pub fn from_file() -> Self {
+        Self {
+            leaf_id: None,
+            system_prompt: None,
+            tools: None,
+        }
+    }
+
+    /// The live-session shape: the manager's leaf plus the agent's system prompt and ACTIVE tool
+    /// set (pi `exportSessionToHtml`, `export-html/index.ts:263-270` @v0.84.4).
+    ///
+    /// `leaf_id` stays an `Option` because `SessionManager::leaf_id` is one — a session with no
+    /// entries yet has no leaf, and pi's `getLeafId()` is `string | null` for the same reason. The
+    /// prompt and the tools are not optional here: a live session always has both.
+    #[must_use]
+    pub fn live(leaf_id: Option<String>, system_prompt: String, tools: Vec<ExportTool>) -> Self {
+        Self {
+            leaf_id,
+            system_prompt: Some(system_prompt),
+            tools: Some(tools),
+        }
+    }
+
+    /// The leaf this export walks from, if the shell knew one.
+    #[must_use]
+    pub fn leaf_id(&self) -> Option<&str> {
+        self.leaf_id.as_deref()
+    }
+}
+
 /// The payload `template.js` decodes out of `<script id="session-data">` (pi `SessionData`,
 /// `export-html/index.ts:130-138` @v0.84.4).
 ///
-/// `systemPrompt`, `tools` and `renderedTools` are absent, which is what `JSON.stringify` produces
-/// for pi's own `exportFromFile` (`index.ts:298-304` sets the first two `undefined` and never sets
-/// the third); `template.js:15` destructures them and every reader is `?.`-guarded.
+/// `header`, `entries` and `leafId` come from the transcript and the shell; `systemPrompt` and
+/// `tools` come from [`ExportState`] and are present for every LIVE export, absent for the
+/// file-only one — pi's two call sites exactly (`:263-270` vs `:298-304`). `renderedTools` is
+/// never set; `template.js:15` destructures all three and every reader is `?.`-guarded.
 ///
 /// `leaf_id` is pi's `sm.getLeafId()` (`index.ts:266` and `:301`), supplied by the shell. `None`
 /// falls back to the last non-`session` line, which is `_buildIndex`'s own seeding rule
@@ -235,7 +345,7 @@ impl ExportTheme {
 /// `/tree` branch switch with no new message the last file entry belongs to the ABANDONED branch —
 /// pi's own `branch` / `branchWithSummary` reassign `this.leafId` for the same reason
 /// (`session-manager.ts:1361-1365`, `:1393`), and `resetLeaf` nulls it (`:1373-1374`). Every caller that holds a manager passes `Some`.
-fn session_data(jsonl: &str, leaf_id: Option<&str>) -> Value {
+fn session_data(jsonl: &str, state: &ExportState) -> Value {
     let mut lines = jsonl.lines().filter(|l| !l.trim().is_empty());
     // pi `sm.getHeader()` — `fileEntries[0]`, the `type: "session"` line.
     let header: Value = lines
@@ -254,7 +364,7 @@ fn session_data(jsonl: &str, leaf_id: Option<&str>) -> Value {
         .filter(|v| v.get("type").and_then(Value::as_str) != Some("session"))
         .collect();
 
-    let leaf = match leaf_id {
+    let leaf = match state.leaf_id() {
         Some(id) => Value::String(id.to_string()),
         None => entries
             .last()
@@ -267,6 +377,30 @@ fn session_data(jsonl: &str, leaf_id: Option<&str>) -> Value {
     map.insert("header".to_string(), header);
     map.insert("entries".to_string(), Value::Array(entries));
     map.insert("leafId".to_string(), leaf);
+    // `systemPrompt: state?.systemPrompt` (`index.ts:267`). Absent — not `null` — when the shell
+    // has no agent state, because `JSON.stringify` drops an `undefined` value and `template.js`
+    // reads it as `if (systemPrompt)`.
+    if let Some(prompt) = &state.system_prompt {
+        map.insert("systemPrompt".to_string(), Value::String(prompt.clone()));
+    }
+    // `tools: state?.tools?.map((t) => ({ name: t.name, description: t.description, parameters:
+    // t.parameters }))` (`index.ts:268`) — the three fields upstream picks, and no others.
+    if let Some(tools) = &state.tools {
+        let rendered: Vec<Value> = tools
+            .iter()
+            .map(|t| {
+                let mut entry = Map::new();
+                entry.insert("name".to_string(), Value::String(t.name.clone()));
+                entry.insert(
+                    "description".to_string(),
+                    Value::String(t.description.clone()),
+                );
+                entry.insert("parameters".to_string(), t.parameters.clone());
+                Value::Object(entry)
+            })
+            .collect();
+        map.insert("tools".to_string(), Value::Array(rendered));
+    }
     Value::Object(map)
 }
 
@@ -275,12 +409,13 @@ fn session_data(jsonl: &str, leaf_id: Option<&str>) -> Value {
 /// leaf from the file.
 ///
 /// This is pi's `exportFromFile` shape exactly (`export-html/index.ts:288-305` @v0.84.4): a file is
-/// all there is, so the leaf is whatever `_buildIndex` would seed from it. Callers that hold a live
-/// `SessionManager` must use [`session_jsonl_to_html_with_theme`] and pass its
-/// `SessionManager::leaf_id`; see [`session_data`].
+/// all there is, so the leaf is whatever `_buildIndex` would seed from it and `systemPrompt` /
+/// `tools` are `undefined`. Callers that hold a live session must use
+/// [`session_jsonl_to_html_with_theme`] with [`crate::AgentSession::export_state`]; see
+/// [`ExportState`].
 #[must_use]
 pub fn session_jsonl_to_html(jsonl: &str) -> String {
-    session_jsonl_to_html_with_theme(jsonl, &ExportTheme::default(), None)
+    session_jsonl_to_html_with_theme(jsonl, &ExportTheme::default(), &ExportState::from_file())
 }
 
 /// pi `generateHtml(sessionData, themeName)` (`export-html/index.ts:143-175` @v0.84.4).
@@ -289,16 +424,17 @@ pub fn session_jsonl_to_html(jsonl: &str) -> String {
 /// touches the filesystem, the clock or the resource registry. Never panics — a malformed or empty
 /// transcript still produces a valid document (the template renders an empty session).
 ///
-/// `leaf_id` is the shell's, not the renderer's, exactly as pi's is (`index.ts:266` passes
-/// `sm.getLeafId()` into `generateHtml`) — see [`session_data`] for why deriving it here is wrong
-/// for a live session.
+/// `state` is the shell's, not the renderer's, exactly as pi's is: `generateHtml` is handed a
+/// `SessionData` already carrying `sm.getLeafId()`, `state?.systemPrompt` and `state?.tools`
+/// (`index.ts:263-270`). See [`ExportState`] for why the leaf must not be re-derived here, and why
+/// the two agent keys travel with it rather than as separate parameters.
 #[must_use]
 pub fn session_jsonl_to_html_with_theme(
     jsonl: &str,
     theme: &ExportTheme,
-    leaf_id: Option<&str>,
+    state: &ExportState,
 ) -> String {
-    let data = session_data(jsonl, leaf_id);
+    let data = session_data(jsonl, state);
     // `Buffer.from(JSON.stringify(sessionData)).toString("base64")` (`index.ts:160`). Base64 is
     // what makes the payload injection-proof: no transcript byte can close the `<script>` element,
     // which is why nothing on this path is HTML-escaped.

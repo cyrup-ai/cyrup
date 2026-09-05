@@ -210,14 +210,30 @@ impl UiTheme {
 
     /// A compiled-in built-in (`"dark"` / `"light"`); falls back to the dark palette if the name is
     /// unknown so this is total and never panics (R-00-009, R-10-027).
+    ///
+    /// Callers that must DISTINGUISH "the name is unknown" from "the name is `dark`" — the theme
+    /// load path, which owes the user pi's `Failed to load theme …` sentence (TUI-096) — ask
+    /// [`UiTheme::builtin_named`] instead; this stays the total, silent projection every render
+    /// site uses.
     pub fn builtin(name: &str) -> Self {
-        for theme in builtin_themes() {
-            if theme.key.as_str() == name {
+        UiTheme::builtin_named(name).unwrap_or_else(UiTheme::dark)
+    }
+
+    /// The compiled-in built-in with this exact name, or `None` when there is none.
+    ///
+    /// This is pi's `loadThemeJson` built-in lookup, `if (name in builtinThemes)`
+    /// (`modes/interactive/theme/theme.ts:607-610` @v0.84.4), split out from [`UiTheme::builtin`]
+    /// so a failed lookup is a value rather than a silent dark repaint: upstream's miss continues
+    /// on to the registered themes and finally `throw new Error(\`Theme not found: ${name}\`)`
+    /// (`:623`), which `setTheme` catches into the `{success: false, error}` the controller reports
+    /// (`:900-911`).
+    pub fn builtin_named(name: &str) -> Option<Self> {
+        builtin_themes().into_iter().find_map(|theme| {
+            (theme.key.as_str() == name).then(|| {
                 let resolved = theme.resolve();
-                return UiTheme::from_resolved(theme.data.name.clone(), &resolved, 0);
-            }
-        }
-        UiTheme::dark()
+                UiTheme::from_resolved(theme.data.name.clone(), &resolved, 0)
+            })
+        })
     }
 
     /// The compiled-in `dark` theme (Pi `dark.json`: text `#d4d4d4`, accent `#8abeb7`, error `#cc6666`).
@@ -1441,6 +1457,38 @@ pub fn resolve_theme_setting(setting: Option<&str>, terminal: TerminalTheme) -> 
     }
 }
 
+/// The theme pi falls back to when a named theme fails to load (`theme-controller.ts:127`,
+/// `theme.ts:906` @v0.84.4 — both hardwire the string).
+pub(crate) const DARK_THEME_NAME: &str = "dark";
+
+/// The outcome of one theme (re-)application — pi's `ThemeResult`
+/// (`modes/interactive/theme/theme-controller.ts:16` @v0.84.4), widened by the one case upstream
+/// cannot have: an app that was never handed a controller.
+///
+/// Returned by [`crate::App::reapply_theme_from_settings`] so the failure is a VALUE and not a
+/// silent dark repaint (TUI-096). Upstream's `applyThemeName` reacts to the same result twice
+/// (`:126-135`): it seats `"dark"` as the active name, and, under `showError`, surfaces
+/// ``Failed to load theme "<name>": <error>\nFell back to dark theme.``
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ThemeApply {
+    /// No controller was booted — a harness `App`, which has no `settings.theme` to answer from and
+    /// keeps the theme it was constructed with. Upstream has no counterpart: its controller is a
+    /// field of the interactive mode and always exists (`interactive-mode.ts:960`).
+    NoController,
+    /// The named theme resolved and is now painted; `active_name()` is that name
+    /// (`this.activeThemeName = result.success ? themeName : "dark"`, `:127`).
+    Loaded(String),
+    /// The named theme did NOT resolve: `dark` is painted AND seated as the active name, and the
+    /// notice was pushed to the transcript. `error` is pi's `result.error` — for a name that
+    /// resolves to nothing, `loadThemeJson`'s `Theme not found: <name>` (`theme.ts:623`).
+    FellBackToDark {
+        /// The name `settings.theme` asked for, as asked for.
+        name: String,
+        /// pi's `result.error` for that failure.
+        error: String,
+    },
+}
+
 /// The boot + live-switch owner of the render theme (Pi `InteractiveThemeController`,
 /// `theme-controller.ts`). It resolves the boot theme from `settings.theme` with a terminal-bg
 /// fallback, carries the [`ColorMode`] so every projected [`UiTheme`] is depth-correct, and drives
@@ -1641,6 +1689,17 @@ impl ThemeController {
     /// `getTerminalTheme`, `theme-controller.ts:88-90`; drives auto-sync + the unset-setting fallback).
     pub fn terminal_theme(&self) -> TerminalTheme {
         self.terminal_theme
+    }
+
+    /// pi's `applyThemeName` failure assignment — `this.activeThemeName = result.success ?
+    /// themeName : "dark"` (`theme-controller.ts:127` @v0.84.4).
+    ///
+    /// Called by the loader ([`crate::App::reapply_theme_from_settings`]) when the name the
+    /// controller just resolved could not be loaded, so `active_name()` and every reader of it
+    /// (`/settings`, the theme-file watcher binding) name the theme that is actually painted rather
+    /// than the one that failed. The generation bumps for the same reason every other apply does.
+    pub fn fall_back_to_dark(&mut self) -> UiTheme {
+        self.set_theme_name(DARK_THEME_NAME)
     }
 
     /// Switch the active theme by name (Pi `setThemeName`, `theme-controller.ts:62-65`), bumping the

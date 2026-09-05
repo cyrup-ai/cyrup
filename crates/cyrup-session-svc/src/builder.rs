@@ -266,7 +266,24 @@ impl SessionConfig {
 pub enum NoTools {
     /// Start with no tools enabled.
     All,
-    /// Disable the default built-in tools but keep extension/custom tools (Pi default built-ins).
+    /// Start with no built-in tool enabled, but keep extension/custom tools enabled.
+    ///
+    /// pi's own doc comment says "disable the default built-in tools (read, bash, edit, write)",
+    /// but its code disables ALL of them: `options.noTools ? [] : …` (sdk.ts:261-262) tests the
+    /// PRESENCE of the option.
+    ///
+    /// The ONE difference cyrup models is on the line above: extension tools survive `Builtin` and
+    /// not `All`, because `_buildRuntime({ includeAllExtensionTools: true })` adds them only when
+    /// `allowedToolNames` is `undefined` (`agent-session.ts:406-410` → `:2740-2745`), and
+    /// `allowedToolNames` is `[]` under `"all"` and `undefined` under `"builtin"` (`sdk.ts:258`).
+    /// That is what `select_active_tools` implements and what its test pins.
+    ///
+    /// Upstream's OTHER consequence of that same `allowedToolNames` — a built-in stays enable-able
+    /// at runtime under `"builtin"` and not under `"all"` — is NOT modelled here: cyrup has no
+    /// `allowedToolNames` and no runtime re-enable path, and `no_tools` is read at exactly one site
+    /// in the workspace (`select_active_tools`). Registration is independent of the flag under
+    /// both modes. The distinction is kept as two variants because cyrup will need it when that
+    /// path is ported, not because HEAD behaves differently in any second way.
     Builtin,
 }
 
@@ -373,7 +390,21 @@ fn select_active_tools(
             // Explicit allowlist wins (Pi `options.tools`).
             (Some(allow), _) => allow.iter().any(|a| a == name),
             (None, Some(NoTools::All)) => false,
-            (None, Some(NoTools::Builtin)) => !DEFAULT_BUILTIN_TOOLS.contains(&name),
+            // SEAM-118: `!ALL_BUILTIN_TOOLS`, not `!DEFAULT_BUILTIN_TOOLS`. Upstream's expression
+            // branches on the PRESENCE of `noTools`, not on its value —
+            // `options.noTools ? [] : (configuredDefaultToolNames ?? defaultActiveToolNames)`
+            // (sdk.ts:261-262) — so `"builtin"` starts the session with an EMPTY built-in
+            // selection, exactly like `"all"`. The two modes part company one line earlier, at
+            // `allowedToolNames = options.tools ?? (options.noTools === "all" ? [] : undefined)`
+            // (`:258`): `"all"` also forbids re-enabling anything, `"builtin"` leaves every
+            // built-in ENABLE-able at runtime. Extension/embedder tools survive `"builtin"` only
+            // through the `!ALL_BUILTIN_TOOLS` leg, which is upstream's
+            // `includeAllExtensionTools: true` (`agent-session.ts:406-410` → `:2742-2745`).
+            //
+            // This arm read `!DEFAULT_BUILTIN_TOOLS`, so `--no-builtin-tools` dropped only pi's
+            // four defaults and left `grep`, `find`, `ls` and `powershell` ACTIVE — the flag
+            // advertised a smaller tool surface than it delivered, `powershell` included.
+            (None, Some(NoTools::Builtin)) => !ALL_BUILTIN_TOOLS.contains(&name),
             // pi `sdk.ts:244-250`: with no `tools`/`noTools` the active set is
             // `defaultActiveToolNames` — read/bash/edit/write — NOT every visible tool. Confirmed
             // at the same tag in `agent-session.ts:2592-2594`, and `_refreshToolRegistry`
@@ -1818,6 +1849,73 @@ impl SessionBuilder {
                     (out != payload).then_some(out)
                 })
             }));
+            // PROV-042 — the `before_provider_headers` PRODUCER. Every other piece of this hook
+            // already existed (the `EventKind`, the WIT export, the SDK `on_before_provider_headers`
+            // registration, the in-place/`null`-deletes reducer at `cyrup-ext/src/contract.rs:187`),
+            // but nothing in the tree ever constructed the event: an extension could subscribe and
+            // would never be called, which is worse than a documented refusal. pi emits it from its
+            // session `streamFn`'s `transformHeaders` closure
+            // (`packages/coding-agent/src/core/sdk.ts:330-339` @v0.84.4 →
+            // `ExtensionRunner.emitBeforeProviderHeaders`, `extensions/runner.ts:1100-1125`), which
+            // is exactly this position.
+            //
+            // ORDERING. pi's closure merges `mergeProviderAttributionHeaders` first and hands the
+            // result to the hook, so extensions see the attribution set already present and win over
+            // it. cyrup reaches the same guarantee by a different route: attribution rides
+            // `StreamOptions::headers` (AGENT-029, `session/model.rs:282` via
+            // `Agent::set_header_fn`), and the provider merges that overlay into the assembled set
+            // BEFORE running `transform_headers` (`cyrup-provider/src/stream.rs`
+            // `apply_transform_headers`, called by every api impl after `build_headers`). Same two
+            // facts, same order: attribution first, hook last, hook's return value on the wire.
+            //
+            // Gated on a live subscriber like its two siblings, so the common no-extension path
+            // does no JSON round-trip at all.
+            let h = ext_host.clone();
+            agent_builder = agent_builder.transform_headers(Arc::new(move |headers| {
+                let h = h.clone();
+                Box::pin(async move {
+                    if h.dispatcher()
+                        .no_subscribers(EventKind::BeforeProviderHeaders)
+                    {
+                        return headers;
+                    }
+                    // `ProviderHeaders` upstream is `Record<string, string | null>` and cyrup's
+                    // `HeaderMap` is `BTreeMap<String, Option<String>>` — the same shape, so the
+                    // round-trip is total in both directions and a `null` survives as the `None`
+                    // that suppresses the header at `stream/sse.rs:359`.
+                    let payload = serde_json::Value::Object(
+                        headers
+                            .iter()
+                            .map(|(k, v)| {
+                                (
+                                    k.clone(),
+                                    v.clone().map_or(serde_json::Value::Null, |s| {
+                                        serde_json::Value::String(s)
+                                    }),
+                                )
+                            })
+                            .collect(),
+                    );
+                    let out = h
+                        .emit_before_provider_headers(payload, &CancelToken::new())
+                        .await;
+                    match out {
+                        serde_json::Value::Object(map) => map
+                            .into_iter()
+                            .map(|(k, v)| match v {
+                                serde_json::Value::Null => (k, None),
+                                serde_json::Value::String(s) => (k, Some(s)),
+                                // A handler that set a non-string value is coerced rather than
+                                // dropped: JS would have stringified it on the way out.
+                                other => (k, Some(other.to_string())),
+                            })
+                            .collect(),
+                        // A handler that replaced the bag with a non-object is ignored (degrade,
+                        // never panic) — pi ignores the return value entirely.
+                        _ => headers,
+                    }
+                })
+            }));
             let h = ext_host.clone();
             agent_builder = agent_builder.on_response(Arc::new(move |resp, _model| {
                 let h = h.clone();
@@ -2880,6 +2978,61 @@ mod tests {
         let mut none = super::SessionConfig::new("/tmp", "/tmp/agent");
         none.no_tools = Some(super::NoTools::All);
         assert!(selected(&none, Some(&default_tools)).is_empty());
+    }
+
+    // ---- SEAM-118: `--no-builtin-tools` starts a session with NO built-in active -------------
+    //
+    // pi v0.84.4 `sdk.ts:261-262`:
+    //
+    // ```text
+    // options.tools ?? (options.noTools ? [] : (configuredDefaultToolNames ?? defaultActiveToolNames))
+    // ```
+    //
+    // ANY `noTools` — `"all"` or `"builtin"` — yields an EMPTY initial active set; the two modes
+    // differ only in `allowedToolNames` (`sdk.ts:258`, `options.noTools === "all" ? [] : undefined`),
+    // i.e. in whether a tool can be re-enabled later, not in what starts active. Extension and SDK
+    // tools survive `"builtin"` solely through `_buildRuntime`'s `includeAllExtensionTools: true`
+    // (`agent-session.ts:406-410` → the `:2742-2745` branch), which is what cyrup's
+    // `!ALL_BUILTIN_TOOLS.contains(name)` leg spells.
+    //
+    // Ported from upstream's own regression test at the same tag,
+    // `test/suite/regressions/3592-no-builtin-tools-keeps-extension-tools.test.ts`: with
+    // `noTools: "builtin"` all eight built-ins are still REGISTERED
+    // (`getAllTools()` → bash/dynamic_tool/edit/find/grep/ls/powershell/read/write) while
+    // `getActiveToolNames()` is exactly `["dynamic_tool"]`.
+    #[test]
+    fn no_builtin_tools_leaves_only_extension_tools_active() {
+        let mut builtin = super::SessionConfig::new("/tmp", "/tmp/agent");
+        builtin.no_tools = Some(super::NoTools::Builtin);
+
+        // The extension tool alone. `grep`/`find`/`ls`/`powershell` are built-ins pi does not
+        // activate by default, but they are still built-ins: `noTools` drops them too.
+        assert_eq!(selected(&builtin, None), names(&["static_tool"]));
+
+        // `noTools` short-circuits BEFORE `configuredDefaultToolNames` in that expression, so a
+        // `defaultTools` setting cannot resurrect a built-in through this arm.
+        assert_eq!(
+            selected(&builtin, Some(&names(&["read", "grep", "powershell"]))),
+            names(&["static_tool"])
+        );
+
+        // `excludeTools` still applies after the selection (`sdk.ts:263`).
+        let mut excluded = super::SessionConfig::new("/tmp", "/tmp/agent");
+        excluded.no_tools = Some(super::NoTools::Builtin);
+        excluded.exclude_tools = names(&["static_tool"]);
+        assert!(selected(&excluded, None).is_empty());
+
+        // An explicit allowlist still outranks `noTools` (`options.tools ??` is first): pi keeps
+        // `--tools read --no-builtin-tools` meaning `read`.
+        let mut allowlisted = super::SessionConfig::new("/tmp", "/tmp/agent");
+        allowlisted.no_tools = Some(super::NoTools::Builtin);
+        allowlisted.tools = Some(names(&["read"]));
+        assert_eq!(selected(&allowlisted, None), names(&["read"]));
+
+        // The sibling mode is unchanged and stricter: `"all"` takes the extension tool too.
+        let mut all = super::SessionConfig::new("/tmp", "/tmp/agent");
+        all.no_tools = Some(super::NoTools::All);
+        assert!(selected(&all, None).is_empty());
     }
 
     // ---- SEAM-071: `--no-extensions` gates the native built-ins ----------------------------

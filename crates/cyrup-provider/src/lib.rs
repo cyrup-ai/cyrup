@@ -161,8 +161,8 @@ pub use stream::sse::{
 };
 pub use stream::{
     AssistantMessageEventSink, AssistantMessageEventStream, CacheRetention, OnPayload,
-    OnResponseHook, ProviderResponse, StreamEvent, StreamOptions, ToolChoice, Transport,
-    collect_message, create_assistant_message_event_stream,
+    OnResponseHook, ProviderResponse, StreamEvent, StreamOptions, ToolChoice, TransformHeadersFn,
+    Transport, collect_message, create_assistant_message_event_stream,
 };
 pub use usage::{apply_cost, compute_cost};
 pub use utils::error_body::{MAX_PROVIDER_ERROR_BODY_CHARS, truncate_error_text};

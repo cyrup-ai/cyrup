@@ -81,6 +81,10 @@ pub fn api_key_env_vars(provider: &str) -> Option<&'static [&'static str]> {
         "huggingface" => Some(&["HF_TOKEN"]),
         "fireworks" => Some(&["FIREWORKS_API_KEY"]),
         "together" => Some(&["TOGETHER_API_KEY"]),
+        // DRIFT-009. `baseten: "BASETEN_API_KEY"` (env-api-keys.ts:106 @v0.84.4), between
+        // `together` and `opencode` upstream. A v0.84.x addition — the key is absent from
+        // `env-api-keys.ts` at v0.83.0, as is the provider.
+        "baseten" => Some(&["BASETEN_API_KEY"]),
         "opencode" => Some(&["OPENCODE_API_KEY"]),
         "opencode-go" => Some(&["OPENCODE_API_KEY"]),
         "kimi-coding" => Some(&["KIMI_API_KEY"]),
@@ -257,6 +261,7 @@ mod tests {
             "qwen-token-plan-cn",
             "qwen-token-plan-individual",
             "radius",
+            "baseten",
         ] {
             assert!(
                 api_key_env_vars(p).is_some(),
@@ -284,6 +289,17 @@ mod tests {
             Some(&["QWEN_TOKEN_PLAN_API_KEY"][..])
         );
         assert_eq!(api_key_env_vars("radius"), Some(&["RADIUS_API_KEY"][..]));
+    }
+
+    /// DRIFT-009 — `baseten: "BASETEN_API_KEY"` (`env-api-keys.ts:106` @v0.84.4). Its own
+    /// variable, shared with nothing, and absent at v0.83.0 along with the provider.
+    #[test]
+    fn baseten_row_matches_upstream() {
+        assert_eq!(
+            api_key_env_vars("baseten"),
+            Some(&["BASETEN_API_KEY"][..]),
+            "env-api-keys.ts:106 @v0.84.4"
+        );
     }
 
     #[tokio::test]

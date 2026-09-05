@@ -1067,7 +1067,7 @@ impl<B: Backend> App<B> {
         let html = cyrup_session_svc::session_jsonl_to_html_with_theme(
             &jsonl,
             &session.export_theme(),
-            session.export_leaf_id().await.as_deref(),
+            &session.export_state().await,
         );
         let tmp = std::env::temp_dir().join(format!("cyrup-session-{}.html", session.session_id()));
         if let Err(e) = std::fs::write(&tmp, html.as_bytes()) {

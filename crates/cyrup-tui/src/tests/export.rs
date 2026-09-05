@@ -10,7 +10,7 @@
 
 use cyrup_resources::{ResourceOrigin, ResourceScope, Theme};
 
-use cyrup_session_svc::{ExportTheme, session_jsonl_to_html_with_theme};
+use cyrup_session_svc::{ExportState, ExportTheme, session_jsonl_to_html_with_theme};
 
 use crate::export::session_jsonl_to_html;
 
@@ -46,10 +46,14 @@ fn the_active_theme_changes_the_exported_palette() {
             &Theme::parse(json, None, ResourceScope::Builtin, ResourceOrigin::Builtin).unwrap(),
         )
     };
+    let state = ExportState::from_file();
     let dark =
-        session_jsonl_to_html_with_theme(JSONL, &theme(cyrup_resources::BUILTIN_DARK_JSON), None);
-    let light =
-        session_jsonl_to_html_with_theme(JSONL, &theme(cyrup_resources::BUILTIN_LIGHT_JSON), None);
+        session_jsonl_to_html_with_theme(JSONL, &theme(cyrup_resources::BUILTIN_DARK_JSON), &state);
+    let light = session_jsonl_to_html_with_theme(
+        JSONL,
+        &theme(cyrup_resources::BUILTIN_LIGHT_JSON),
+        &state,
+    );
 
     assert!(dark.contains("--body-bg: #18181e;"));
     assert!(light.contains("--body-bg: #f8f8f8;"));
@@ -66,16 +70,19 @@ fn empty_input_still_yields_a_document() {
     assert!(html.contains("id=\"messages\""));
 }
 
-/// DRIFT-041 review fix — the TUI's two HTML export sites must hand the renderer the MANAGER's
-/// leaf, not let it re-derive one from the JSONL.
+/// DRIFT-041 / DRIFT-054 — the TUI's two HTML export sites must hand the renderer the LIVE session
+/// state, not let it re-derive a leaf from the JSONL and not let the agent's two keys go missing.
 ///
-/// pi passes `sm.getLeafId()` (`core/export-html/index.ts:266` @v0.84.4); cyrup's manager moves its
-/// leaf without appending (`SessionManager::branch`), so after a `/tree` switch with no new message
-/// the last line of the exported file belongs to the abandoned branch. Read from the source for the
-/// same reason `theme_reapply_on_reload.rs` reads its arm: neither `/export` nor `/share` can be
-/// driven from this crate without a live `AgentSession`.
+/// pi passes `sm.getLeafId()` AND `this.state` into `exportSessionToHtml`
+/// (`core/export-html/index.ts:263-270` @v0.84.4, from `agent-session.ts:3439`). cyrup's manager
+/// moves its leaf without appending (`SessionManager::branch`), so after a `/tree` switch with no
+/// new message the last line of the exported file belongs to the abandoned branch; and without
+/// `systemPrompt`/`tools` the document loses its System Prompt and Available Tools sections
+/// (`template.js:1403-1452`). `AgentSession::export_state()` composes all three. Read from the
+/// source for the same reason `theme_reapply_on_reload.rs` reads its arm: neither `/export` nor
+/// `/share` can be driven from this crate without a live `AgentSession`.
 #[test]
-fn both_tui_export_sites_pass_the_session_leaf() {
+fn both_tui_export_sites_pass_the_live_session_state() {
     for (label, src) in [
         ("/export", include_str!("../app/execute_session.rs")),
         ("/share", include_str!("../app/execute_misc.rs")),
@@ -87,9 +94,10 @@ fn both_tui_export_sites_pass_the_session_leaf() {
             .get(call..(call + 220).min(src.len()))
             .unwrap_or_default();
         assert!(
-            args.contains("session.export_leaf_id()"),
-            "{label} must pass `session.export_leaf_id()` — without it the exported document walks \
-             the branch the user abandoned (DRIFT-041)"
+            args.contains("session.export_state()"),
+            "{label} must pass `session.export_state()` — without the leaf the exported document \
+             walks the branch the user abandoned (DRIFT-041), and without the agent state it drops \
+             the System Prompt and Available Tools sections (DRIFT-054)"
         );
     }
 }

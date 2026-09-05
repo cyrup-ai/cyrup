@@ -492,37 +492,10 @@ impl<B: Backend> App<B> {
             AgentSessionEvent::EntryAppended { entry } => {
                 // A loaded extension appended a custom (non-LLM) entry to the tree (Pi
                 // `entry_appended`, agent-session.ts:140 → `addCustomEntryToChat(event.entry)`,
-                // interactive-mode.ts:3105/3431-3450).
-                let ty = custom_entry_type(&entry);
-                // X15 — `addCustomEntryToChat` is entirely a renderer question:
-                //
-                // ```ts
-                // const renderer = this.session.extensionRunner.getEntryRenderer(entry.customType);
-                // if (!renderer) { return; }                      // :3433-3435 — draws NOTHING
-                // const component = new CustomEntryComponent(entry, renderer);
-                // component.setExpanded(this.toolOutputExpanded);
-                // if (!component.hasContent()) { return; }        // :3438-3440 — also nothing
-                // ```
-                //
-                // …and `CustomEntryComponent` is where a THROW becomes the failure box
-                // (`custom-entry.ts:47-52`) rather than being dropped. `entry_rendered` carries
-                // that three-state answer here.
-                if entry_rendered.has_content() {
-                    self.state.transcript.push_custom_message_rendered(
-                        ty,
-                        String::new(),
-                        entry_rendered,
-                    );
-                } else {
-                    // CYRUP-DELTA: with no renderer claiming the type upstream shows nothing at
-                    // all, which leaves a `/statedemo`-style entry invisible. cyrup keeps its
-                    // pre-existing one-line receipt for that case only — strictly additive over
-                    // "nothing", and it never competes with a renderer, because a renderer that
-                    // produced output (or faulted) took the branch above.
-                    self.state
-                        .transcript
-                        .push_status(format!("entry appended → {ty}"));
-                }
+                // interactive-mode.ts:3217-3218). The replay walk reaches the SAME method
+                // ([`Self::push_custom_entry`]) from `renderSessionItems`' custom arm (`:3717-3719`)
+                // — EXT-041.
+                self.push_custom_entry(custom_entry_type(&entry), entry_rendered);
             }
             // pi routes `session_start`/`session_shutdown` to EXTENSIONS ONLY — declared
             // `extensions/types.ts:563`/`:632`, subscribed via `on("session_start", …)` at
@@ -537,6 +510,42 @@ impl<B: Backend> App<B> {
                 self.state.status.set_streaming(false);
                 self.state.indicator.idle();
             }
+        }
+    }
+
+    /// Draw one `custom` ENTRY — pi `addCustomEntryToChat`
+    /// (`modes/interactive/interactive-mode.ts:3570-3590` @v0.84.4), the ONE method both the live
+    /// `entry_appended` arm (`:3217-3218`) and the replay walk (`:3717-3719`) call:
+    ///
+    /// ```ts
+    /// const renderer = this.session.extensionRunner.getEntryRenderer(entry.customType);
+    /// if (!renderer) { return; }                      // :3572-3574 — draws NOTHING
+    /// const component = new CustomEntryComponent(entry, renderer);
+    /// component.setExpanded(this.toolOutputExpanded);
+    /// if (!component.hasContent()) { return; }        // :3577-3579 — also nothing
+    /// ```
+    ///
+    /// …and `CustomEntryComponent` is where a THROW becomes the failure box
+    /// (`custom-entry.ts:47-52`) rather than being dropped. `rendered` carries that three-state
+    /// answer, resolved off this path because the fold is sync and a guest renderer is an async
+    /// call — see [`crate::app::extension_render_entry`].
+    ///
+    /// EXT-041 — shared by the two callers rather than duplicated into the replay walk, so the
+    /// resumed transcript cannot drift from the live one it is meant to reproduce.
+    ///
+    /// [CYRUP-DELTA] with no renderer claiming the type upstream shows nothing at all, which leaves
+    /// a `/statedemo`-style entry invisible. cyrup keeps its pre-existing one-line receipt for that
+    /// case only — strictly additive over "nothing", and it never competes with a renderer, because
+    /// a renderer that produced output (or faulted) takes the first branch.
+    pub(crate) fn push_custom_entry(&mut self, ty: String, rendered: crate::transcript::Rendered) {
+        if rendered.has_content() {
+            self.state
+                .transcript
+                .push_custom_message_rendered(ty, String::new(), rendered);
+        } else {
+            self.state
+                .transcript
+                .push_status(format!("entry appended → {ty}"));
         }
     }
 

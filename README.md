@@ -12,10 +12,12 @@ backbone.
 > **Status:** pre-release, and not yet versioned. The agent loop, provider layer, tool set, session
 > tree, terminal interface, extension host, all five run modes, the MCP client and the Flux
 > development pipeline work end to end; the ACP adapter is in with its port unfinished. 22 crates,
-> ~825k lines of Rust and 9,200 workspace tests passing — re-derived at code HEAD `6200b01`
-> (`cargo test --workspace`, 11 ignored, all pre-existing). The 492 integration-test figure is the
-> one number NOT re-derived here; it was measured at `6cf2cb9f` and the batches since added tests
-> across ten crates.
+> ~835k lines of Rust and 9,303 workspace tests passing — re-derived with this change applied to
+> `1ad7391` (`cargo test --workspace --features test-fixtures --no-fail-fast`, 0 failed, 11
+> ignored, all pre-existing; `test-fixtures` is required or the two subagent-subprocess fixture
+> binaries never build and their tests silently do not run). The 492 integration-test figure is NOT
+> re-derived here; it was measured at `6cf2cb9f` and the batches since added tests across ten
+> crates.
 
 ## Install
 
@@ -211,7 +213,7 @@ cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy -p cyrup-ext-sdk --target wasm32-wasip2   # --workspace does not reach the guest SDK
 cargo clippy -p cyrup-it --features it                 # nor the gated harness
-cargo nextest run --workspace                          # 8,710 tests, 9 skipped
+cargo nextest run --workspace                          # 8,986 tests, 9 skipped
 cargo run -p xtask -- feature-matrix                   # non-default feature combos, and runs the integration suite
 cargo doc --workspace --no-deps --bins                 # rustdoc links are denied, not warned
 ```
@@ -276,18 +278,25 @@ Two conventions:
 
 Behavioural differences from Pi are tracked in the open, in
 [`docs/gap-analysis/`](docs/gap-analysis/README.md), so an unported feature is not mistaken for a
-bug. 90 rows are open across the area files: no `critical`, no `high`, 14 `medium`, 76 `low`, with
-584 closed. `docs/gap-analysis/scripts/count_open_items.py` produces those counts, measured at code
-HEAD `79b0a578`.
+bug. 84 rows are open across the area files: no `critical`, no `high`, 10 `medium`, 74 `low`, with
+590 closed. `docs/gap-analysis/scripts/count_open_items.py` produces those counts, measured at code
+HEAD `f2630a7a`.
 
 **Nothing is open above `medium`**, which is a first for this ledger. `SUBA-074` — an agent's
 `runner:` frontmatter naming an external CLI to run the child under — was the last such row, and the
 external-CLI runner, its capability contract and the `claude-code` adapter are now ported; the
 `codex-exec` and `cursor-agent` adapters and the `external-job` protocol are refused by name rather
 than silently ignored. Read that as "no row currently carries a `critical` or `high` severity",
-not as "nothing serious is left": whatever is open is a floor rather than a total, six of the
-fifteen open `medium` rows were filed in the last two days, and the set above `medium` has turned
-over completely inside a single pass before.
+not as "nothing serious is left": whatever is open is a floor rather than a total, six of the ten
+open `medium` rows have gone more than a week without anyone re-reading them, and the set above
+`medium` has turned over completely inside a single pass before.
+
+The batch that produced these counts closed six rows and filed none — the first batch in this
+ledger's history to file nothing against its own output. It nonetheless merged with four unfixed
+findings against that output, two of them raised as blocking. They are recorded on the rows that
+own the code rather than filed as new rows; the tenth edition of
+[`00-residual-ledger.md`](docs/gap-analysis/00-residual-ledger.md) names all four and quotes the
+regression gate's verdict in full. A count of zero filed rows is not a claim that nothing is wrong.
 
 The ledger is mostly a static analysis. Items are evidenced by reading both sources rather than by
 running anything, its measured error rate has run near 12%, and it lags the code. Treat an entry as a

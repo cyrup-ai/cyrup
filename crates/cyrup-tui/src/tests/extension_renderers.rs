@@ -846,6 +846,90 @@ fn entry_event(custom_type: &str) -> AgentSessionEvent {
     }
 }
 
+/// The same entry, as the REPLAY stream carries it: `AgentSession::replay_items` emits
+/// `ReplayItem::CustomEntry` holding the serialized entry, which is byte-for-byte what the live
+/// `entry_appended` event holds (`LiveHostServices::append_entry`).
+fn replay_entry(custom_type: &str) -> cyrup_session_svc::ReplayItem {
+    let AgentSessionEvent::EntryAppended { entry } = entry_event(custom_type) else {
+        unreachable!("entry_event builds exactly this variant")
+    };
+    cyrup_session_svc::ReplayItem::CustomEntry(entry)
+}
+
+// =============================================================================================
+// EXT-041, the custom-ENTRY half. `renderSessionItems` dispatches a replayed `custom` entry into
+// `addCustomEntryToChat` (`interactive-mode.ts:3717-3719` @v0.84.4) — the SAME method the live
+// `entry_appended` arm calls (`:3217-3218`) — so all three of its outcomes have to survive a
+// `/resume`. cyrup's replay stream had no custom-entry item at all, so the shipped consumer
+// (`cyrup-intercom`'s inbound-message card) drew live and vanished on resume.
+// =============================================================================================
+
+/// A replayed custom entry reaches its registered ENTRY renderer and draws the renderer's own
+/// output — not the unclaimed-entry receipt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replayed_custom_entry_still_reaches_its_registered_renderer() {
+    let host = host_with_entry_renderer().await;
+    let mut app = app();
+
+    app.replay_items_with_extensions(&[replay_entry("card")], &host)
+        .await;
+    app.draw().unwrap();
+
+    let sb = app.scrollback_text();
+    assert!(
+        sb.contains("ENTRYCARD payload-bytes="),
+        "the replayed entry went through `getEntryRenderer(entry.customType)` (`:3571`):\n{sb}"
+    );
+    assert!(
+        !sb.contains("entry appended"),
+        "a rendered entry never also draws the unclaimed receipt:\n{sb}"
+    );
+}
+
+/// MIRROR — a replayed entry NO extension claims does exactly what the live path does for one, so
+/// the fix cannot be satisfied by drawing something for every entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replayed_unclaimed_entry_draws_what_the_live_path_draws_for_one() {
+    let host = host_with_entry_renderer().await;
+    let mut app = app();
+
+    app.replay_items_with_extensions(&[replay_entry("nobody-claims-this")], &host)
+        .await;
+    app.draw().unwrap();
+
+    let sb = app.scrollback_text();
+    assert!(
+        sb.contains("entry appended → nobody-claims-this"),
+        "the CYRUP-DELTA receipt, identical to the live arm's:\n{sb}"
+    );
+    assert!(
+        !sb.contains("ENTRYCARD") && !sb.contains("renderer failed"),
+        "no renderer was consulted and nothing faulted:\n{sb}"
+    );
+}
+
+/// The THIRD outcome survives replay too: a throwing renderer draws pi's failure box
+/// (`custom-entry.ts:47-52`), which is not the same answer as "no renderer claimed this type".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replayed_entry_whose_renderer_faults_still_draws_the_failure_box() {
+    let host = host_with_entry_renderer().await;
+    let mut app = app();
+
+    app.replay_items_with_extensions(&[replay_entry("boom")], &host)
+        .await;
+    app.draw().unwrap();
+
+    let sb = app.scrollback_text();
+    assert!(
+        sb.contains("[boom] renderer failed: entry renderer exploded"),
+        "the replay carries the three-state outcome whole, exactly as the live fold does:\n{sb}"
+    );
+    assert!(
+        !sb.contains("entry appended"),
+        "the failure box REPLACES the receipt on replay as well:\n{sb}"
+    );
+}
+
 /// THE REGRESSION, end to end. A panicking ENTRY renderer draws Pi's failure box
 /// (`custom-entry.ts:47-52`): `[${customType}] renderer failed: ${message}`. Before X15 the fault
 /// arrived as `None` and this drew the plain "entry appended" receipt instead — indistinguishable

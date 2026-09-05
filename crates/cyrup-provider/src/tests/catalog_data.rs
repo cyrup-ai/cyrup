@@ -288,7 +288,13 @@ fn the_catalog_manifest_matches_the_file_set() {
 ///   models.dev data generated into a gitignored file, and the providers post-date `b0c2a90e`, the
 ///   last revision at which any catalog was a data literal; see `providers/fleet.rs`'s module doc.
 ///   PROV-014.
+/// * `baseten` — blocked identically to the Qwen plans and added upstream even later
+///   (`c1019d920`, 2026-08-03). DRIFT-009.
 pub(crate) const DYNAMIC_ONLY_PROVIDERS: &[&str] = &[
+    // DRIFT-009 — `baseten`'s rows are models.dev's `baseten` record
+    // (`ai/scripts/generate-models.ts:1256-1345`, `:1944` @v0.84.4), generated into a gitignored
+    // `providers/data/baseten.json` that is in git at no revision. Same block as the Qwen plans.
+    "baseten",
     "qwen-token-plan",
     "qwen-token-plan-cn",
     "qwen-token-plan-individual",

@@ -100,7 +100,10 @@ impl AgentSession {
     /// @v0.84.4).
     ///
     /// Threaded through the shell for the same reason [`Self::export_theme`] is: the renderer stays
-    /// a pure function of `(jsonl, palette, leaf)` and never re-derives state the manager owns. It
+    /// a pure function of `(jsonl, palette, state)` and never re-derives state the manager owns.
+    /// Every export path reaches it through [`Self::export_state`], which is what also carries pi's
+    /// two `AgentState` keys (DRIFT-054); this accessor stays public as the manager's own leaf
+    /// getter. It
     /// MUST NOT be re-derived from the JSONL — `SessionManager::branch` moves the leaf without
     /// appending and `reset_leaf` clears it, so after a `/tree` branch switch with no new message
     /// the last line of the file belongs to the abandoned branch and `template.js` would walk the
@@ -110,15 +113,64 @@ impl AgentSession {
         guard.leaf_id().map(|id| id.as_str().to_string())
     }
 
+    /// Everything an export needs that the session JSONL does not carry — pi's
+    /// `exportSessionToHtml(sm, this.state, …)` argument list, collapsed into one value
+    /// (`core/export-html/index.ts:263-270` @v0.84.4, called from `agent-session.ts:3439`).
+    ///
+    /// DRIFT-054. The leaf used to be threaded alone, and the two keys pi reads off `this.state`
+    /// were never supplied at all, so EVERY exported document lost its **System Prompt** and
+    /// **Available Tools** sections — `template.js:1403-1452` renders both blocks from exactly
+    /// those keys. Composing them here is what stops a fourth export path from repeating it: the
+    /// renderer takes one [`crate::ExportState`], whose two agent keys cannot be split from each
+    /// other. This method is the only PRODUCER of a live value in the workspace, but it is not the
+    /// only way to build one — `ExportState::live` is `pub` and the tests call it — and
+    /// `ExportState::from_file` remains passable from a live caller. See [`crate::ExportState`] for
+    /// exactly what the type does and does not make impossible.
+    ///
+    /// The two agent values are read off the AGENT, not off the session's mirrors, because pi's
+    /// `this.state` IS `agent.state`:
+    /// * `systemPrompt` is [`Self::current_system_prompt`] — `override ?? base`, so a
+    ///   `before_agent_start` handler's replacement is what the document shows, exactly as
+    ///   `agent.state.systemPrompt` is;
+    /// * `tools` is `agent.state.tools`, the ACTIVE set the model was given this turn — NOT
+    ///   [`Self::all_tools`], which also lists the toggled-off ones (the same distinction
+    ///   `/share`'s `pi.share` entry draws at `cyrup-tui/src/app/execute_misc.rs`).
+    pub async fn export_state(&self) -> crate::export::ExportState {
+        let leaf_id = self.export_leaf_id().await;
+        let system_prompt = self.current_system_prompt().await;
+        let tools = self
+            .agent
+            .tools()
+            .await
+            .iter()
+            .map(|t| crate::export::ExportTool {
+                name: t.name().to_string(),
+                description: t.description().to_string(),
+                parameters: t.parameters().clone(),
+            })
+            .collect();
+        crate::export::ExportState::live(leaf_id, system_prompt, tools)
+    }
+
     /// Export the current session branch to a standalone HTML document (Pi `exportToHtml`,
-    /// agent-session.ts:3022 → `exportSessionToHtml`, `core/export-html/index.ts:236-282`
+    /// agent-session.ts:3427 → `exportSessionToHtml`, `core/export-html/index.ts:236-282`
     /// @v0.84.4). With `path` the document is written there; otherwise the Pi default
     /// `cyrup-session-<basename>.html` (in the session cwd, basename = the session-file stem, else the
     /// session id) is used. Returns the resolved output path.
     ///
     /// The document is the templated one pi ships (tree sidebar, markdown, highlighting, the user's
-    /// theme) — see [`crate::export`]. Its one residual is `renderedTools`, the pre-rendered
-    /// EXTENSION tool cards, which pi's own `exportFromFile` also omits.
+    /// theme, the system prompt and the active tool list) — see [`crate::export`].
+    ///
+    /// RESIDUAL, stated as the LIVE-path gap it is: `renderedTools`, the pre-rendered EXTENSION tool
+    /// cards, is never set. This method ports pi's live path, and pi's live path ALWAYS builds a
+    /// `toolRenderer` — `createToolHtmlRenderer({ getToolDefinition, theme, cwd })`
+    /// (`agent-session.ts:3433-3437`) is unconditional and is passed to `exportSessionToHtml`
+    /// (`:3439-3443`), which pre-renders the map and puts it in the payload
+    /// (`export-html/index.ts:254-261`, `:269`). Citing `exportFromFile`, which omits it, would be
+    /// citing the FILE entry point to excuse a live-path gap — the same false comfort DRIFT-054 was
+    /// itself about. A custom-rendered extension tool therefore falls back to `template.js`'s
+    /// built-in rendering (`:1026` reads `renderedTools?.[…]`) where pi would show the extension's
+    /// own card; every built-in tool is unaffected.
     pub async fn export_to_html(
         &self,
         path: Option<&Path>,
@@ -132,7 +184,7 @@ impl AgentSession {
         let html = crate::export::session_jsonl_to_html_with_theme(
             &jsonl,
             &self.export_theme(),
-            self.export_leaf_id().await.as_deref(),
+            &self.export_state().await,
         );
         let out = match path {
             Some(p) => p.to_path_buf(),

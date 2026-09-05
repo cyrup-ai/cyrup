@@ -30,6 +30,23 @@ pub enum ThinkingFormat {
     Openrouter,
     Deepseek,
     Together,
+    /// Baseten: configurable `chat_template_args` plus `reasoning_effort` when supported.
+    ///
+    /// DRIFT-009 — `types.ts:584` @v0.84.4 (the union member) and `:578` (the doc line: "`baseten`
+    /// uses configurable chat_template_args plus reasoning_effort when supported"). Encoded at
+    /// `api/openai-completions.ts:888-904`. The variant postdates the ported v0.83.0 baseline
+    /// (`git grep '"baseten"' v0.83.0 -- packages/ai/src/types.ts` is empty).
+    ///
+    /// Which Baseten rows need it: `processBasetenModels` picks one of FOUR compat blocks per row
+    /// (`ai/scripts/generate-models.ts:1310-1319` @v0.84.4). Only the two toggle-reasoning blocks —
+    /// `toggleReasoningCompat` and `toggleReasoningEffortCompat` (`:1274-1283`) — carry
+    /// `thinkingFormat: "baseten"`; `reasoningEffortCompat` (`:1269-1273`, an effort-only reasoning
+    /// row) carries `"openai"` and `baseCompat` (`:1260-1268`, a non-reasoning row) carries no
+    /// format at all. So this variant is not what makes the provider work at all — it is what makes
+    /// its toggle-reasoning rows work: without it those rows fail `ModelCompat` deserialization
+    /// (hence the whole `Model`) and the provider silently offers only its effort-only and
+    /// non-reasoning subset.
+    Baseten,
     Zai,
     Qwen,
     ChatTemplate,
@@ -318,6 +335,14 @@ pub struct ModelCompat {
     pub thinking_format: Option<ThinkingFormat>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub chat_template_kwargs: Option<Map<String, Value>>,
+    /// Arguments sent as `chat_template_args` when `thinkingFormat` is `baseten`.
+    ///
+    /// DRIFT-009 — `types.ts:593-594` @v0.84.4. Same `ChatTemplateKwargValue` grammar as
+    /// [`Self::chat_template_kwargs`] (`{"$var": "thinking.enabled"|"thinking.effort"|
+    /// "thinking.budget"}`); a SEPARATE key because upstream keeps the two maps separate and
+    /// sends them under different request fields (`openai-completions.ts:884` vs `:893`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub chat_template_args: Option<Map<String, Value>>,
     /// OpenRouter routing, passed through verbatim as the `provider` request field.
     ///
     /// PROV-066: typed as [`OpenRouterRouting`] rather than a bare `serde_json::Value`, so a
@@ -487,6 +512,9 @@ pub struct ResolvedCompat {
     pub requires_reasoning_content_on_assistant_messages: bool,
     pub thinking_format: ThinkingFormat,
     pub chat_template_kwargs: Map<String, Value>,
+    /// Pi `chatTemplateArgs` — detected `{}` (`openai-completions.ts:1649` @v0.84.4), catalog
+    /// override resolved at `:1695` (DRIFT-009).
+    pub chat_template_args: Map<String, Value>,
     pub zai_tool_stream: bool,
     pub supports_strict_mode: bool,
     /// Pi `supportsOpenAIGrammarTools` — detected **false** (`openai-completions.ts:1469`
@@ -656,6 +684,8 @@ pub fn detect_compat(model: &Model) -> ResolvedCompat {
         requires_reasoning_content_on_assistant_messages: is_deepseek,
         thinking_format,
         chat_template_kwargs: Map::new(),
+        // `chatTemplateArgs: {}` (openai-completions.ts:1649 @v0.84.4) — never detected.
+        chat_template_args: Map::new(),
         zai_tool_stream: false,
         supports_strict_mode: !is_moonshot
             && !is_together
@@ -722,6 +752,12 @@ pub fn get_compat(model: &Model) -> ResolvedCompat {
             .chat_template_kwargs
             .clone()
             .unwrap_or(detected.chat_template_kwargs),
+        // `chatTemplateArgs: model.compat.chatTemplateArgs ?? detected.chatTemplateArgs`
+        // (openai-completions.ts:1695 @v0.84.4).
+        chat_template_args: c
+            .chat_template_args
+            .clone()
+            .unwrap_or(detected.chat_template_args),
         zai_tool_stream: c.zai_tool_stream.unwrap_or(detected.zai_tool_stream),
         supports_strict_mode: c
             .supports_strict_mode

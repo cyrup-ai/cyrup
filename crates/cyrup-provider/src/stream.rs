@@ -81,6 +81,41 @@ pub async fn apply_on_payload(
     body
 }
 
+/// Apply the async `transform_headers` hook (PROV-042) to a request's fully-assembled outbound
+/// header set: if a hook is set, `.await` it and adopt its return value wholesale (Pi
+/// `if (options?.transformHeaders) headers = await options.transformHeaders(headers ?? {})`,
+/// `packages/ai/src/models.ts:657` @v0.84.4).
+///
+/// # Why each wire `run` fn calls this, and not only [`Models`](crate::collection::Models)'s `apply_auth`
+///
+/// pi's single application point is `Models.applyAuth` (`models.ts:653-661`) because in pi EVERY
+/// request goes through `Models.stream`/`streamSimple` — `applyAuth` merges `auth.headers` with
+/// `options.headers`, transforms, and hands the result to the api impl, which spreads it LAST over
+/// its own defaults. cyrup's agent loop does not go through [`crate::collection::Models`]: it
+/// streams `StreamFn` → [`crate::Provider::stream`] → [`crate::wire::WireProvider`] → `ApiImpl::run`,
+/// so the `Models`-level seam is never reached on the production path and a transform installed
+/// there would be silently inert.
+///
+/// Calling it here — immediately after `build_headers`, immediately before the request is
+/// constructed — is the position that reproduces pi's *effect* on cyrup's topology: the hook sees
+/// the final header set and its return value is what goes on the wire. It sees strictly more than
+/// pi's does (pi's runs before the api impl adds `x-api-key`/`anthropic-version`/`model.headers`),
+/// which is what makes the item's stated contract reachable at all: "the closure receives the
+/// already-merged auth + option headers, so removing `x-api-key` inside it actually suppresses it".
+///
+/// [`Models`](crate::collection::Models)'s `apply_auth` keeps its own application and still **strips** the
+/// field from what it forwards (`models.ts:660`), so a `Models`-routed request transforms exactly
+/// once, there, and never twice.
+pub async fn apply_transform_headers(
+    opts: &StreamOptions,
+    headers: crate::HeaderMap,
+) -> crate::HeaderMap {
+    match &opts.transform_headers {
+        Some(t) => t(headers).await,
+        None => headers,
+    }
+}
+
 /// Bridges the sync `open_sse` response-observation point (func-01 R-01-049) to the async
 /// `on_response` hook (gap-08 #3): the sync shim records `{status, headers}` into a shared cell
 /// during connect; after `open_sse` returns, [`ResponseCapture::fire`] `.await`s the async hook.
