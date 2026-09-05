@@ -142,7 +142,8 @@ conflating them is what produced both of the workspace's earlier baseline errors
 > **Updated 2026-09-04.** The comparison tag moved twice since this table was written — to v2.26.1
 > (2026-08-20 retarget, recorded in `13-cyrup-mcp.md` §*Retarget*) and now to **v2.32.1**
 > (`10a4536`), the clone's tag under ADR-0006's latest-tag rule. The v2.26.1 → v2.32.1 delta is
-> **147 files / +16,014 / −1,001 across 79 commits**, triaged in
+> **147 files / +16,014 / −1,001 across 72 commits** (68 with `--no-merges`; 79 until corrected
+> 2026-09-05 in the review pass), triaged in
 > `13-cyrup-mcp-STATUS.md` §*The upstream delta, triaged*, which also files the 40 units it needs.
 > Rule 1 of the 2026-08-20 retarget still binds: a `file:line` in this document or in `13a`–`13i`
 > resolves against **v2.25.0**, and a version-string search-and-replace would silently invalidate

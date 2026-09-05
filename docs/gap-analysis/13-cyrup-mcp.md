@@ -57,7 +57,8 @@ exists.
 ## Retarget — v2.26.1 → v2.32.1 (pointer)
 
 **Dated 2026-09-04.** The clone moved again, to **v2.32.1** (`10a4536`). The delta is **147 files /
-+16,014 / −1,001 across 79 commits**, and it is triaged — file by file, against the four cuts and
++16,014 / −1,001 across 72 commits** (68 with `--no-merges`; this line said 79 until it was
+corrected 2026-09-05 in the review pass), and it is triaged — file by file, against the four cuts and
 against this plan's units — in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) §*The upstream
 delta, triaged*, which also files **40 new units, `MCP-500`–`MCP-539`**, for the surfaces this plan
 has no unit for. Nothing in this document's body was rewritten, for the reason Rule 1 below gives.

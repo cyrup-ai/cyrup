@@ -166,8 +166,11 @@ The first two columns are **counts**, obtained by re-parsing the unit table belo
 
 ### The upstream delta, triaged
 
-`git diff --stat v2.26.1..v2.32.1` is **147 files, +16,014 / −1,001**; the log is **79 commits**
-across releases 2.27.0 → 2.32.1. Tests are 66 of those files. Production TypeScript changed in 38
+`git diff --stat v2.26.1..v2.32.1` is **147 files, +16,014 / −1,001**; the log is **72 commits**
+(68 with `--no-merges`) across releases 2.27.0 → 2.32.1. *(Corrected 2026-09-05, review pass: this
+line and the two copies of it in `13-cyrup-mcp.md` and `MCP-PORT-METHODOLOGY.md` said 79.
+`git -C tmp/pi-mcp-adapter rev-list --count v2.26.1..v2.32.1` = 72. The file and line counts on
+either side of it re-derive exactly.)* Tests are 66 of those files. Production TypeScript changed in 38
 files, six of which are new.
 
 | upstream file(s) | what moved | triage |
