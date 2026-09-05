@@ -51,6 +51,26 @@ an API key. Credentials are saved to `~/.cyrup/agent/auth.json` at mode `0600`.
 Installation itself writes only the binary. The agent directory appears the first time you log in,
 change a setting, or answer a trust prompt.
 
+### From an editor instead
+
+The terminal interface is one front-end. `cyrup --acp` serves the
+[Agent Client Protocol](https://agentclientprotocol.com) on stdio, so an editor that speaks ACP can
+drive the same agent — same tools, same permission prompts, same session files — inside its own UI.
+For Zed, add cyrup to `agent_servers` in `settings.json`:
+
+```json
+{
+  "agent_servers": {
+    "cyrup": { "command": "/usr/local/bin/cyrup", "args": ["--acp"], "env": {} }
+  }
+}
+```
+
+Then pick **External Agent → cyrup** in the agent panel. The editor launches the process and owns
+both pipes, so this is not a command you run yourself.
+[Zed and other ACP editors](docs/guide/guides/zed-acp.md) covers credentials, thinking levels, the
+command palette and what is not finished yet.
+
 ## What you get
 
 - **39 built-in providers** over 10 wire APIs, with 35 embedded model catalogs. Anthropic, OpenAI,
@@ -58,9 +78,10 @@ change a setting, or answer a trust prompt.
 - **The built-in tool set**: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, over an
   `FsOps`/`ProcOps` interface that tests substitute.
 - **A session tree on disk** as JSONL, with compaction, forking, import and export.
-- **Four run modes.** The terminal interface, plus `--mode print`, `--mode json` and `--mode rpc`
-  for scripting and embedding. `--tui-mode fullscreen` switches to an alternate-screen renderer with
-  mouse capture, a scrollbar, text selection and image support.
+- **Five run modes.** The terminal interface, plus `--mode print`, `--mode json` and `--mode rpc`
+  for scripting and embedding, and `--mode acp` to run as an
+  [editor's agent](docs/guide/guides/zed-acp.md). `--tui-mode fullscreen` switches to an
+  alternate-screen renderer with mouse capture, a scrollbar, text selection and image support.
 - **Subagent delegation**, a runtime permission gate over every tool call, a Unix-socket broker for
   supervisor-to-subagent coordination, an MCP client, and the Flux development pipeline.
 - **MCP over stdio and OAuth-protected HTTP**, with sampling, elicitation and a JSON-RPC wire tracer.
@@ -175,6 +196,7 @@ mdbook serve   # http://localhost:3000, live-reloads on save
 
 - [Install](docs/guide/getting-started/install.md) · [Connect a provider](docs/guide/getting-started/authenticate.md) · [Your first session](docs/guide/getting-started/first-session.md)
 - [The terminal interface](docs/guide/guides/tui.md) · [sessions](docs/guide/guides/sessions.md) · [models and thinking](docs/guide/guides/models.md) · [tools and permissions](docs/guide/guides/tools-and-permissions.md)
+- [Scripting and automation](docs/guide/guides/scripting.md) · [Zed and other ACP editors](docs/guide/guides/zed-acp.md)
 - [How extensions work](docs/guide/extensions/overview.md) · [subagents](docs/guide/extensions/subagents.md) · [permissions](docs/guide/extensions/permissions.md) · [intercom](docs/guide/extensions/intercom.md) · [Flux](docs/guide/extensions/flux.md)
 - [CLI reference](docs/guide/reference/cli.md) · [`settings.json`](docs/guide/reference/settings.md) · [environment variables](docs/guide/reference/environment.md) · [keybindings](docs/guide/reference/keybindings.md) · [troubleshooting](docs/guide/reference/troubleshooting.md)
 
