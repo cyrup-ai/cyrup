@@ -183,7 +183,7 @@ pub(crate) fn edit_preview(
 
 /// The `usage` a `toolResult` message carries, if any (Pi `entry.message.role === "toolResult" &&
 /// entry.message.usage`, `footer.ts:99-101`). Read through the same serde projection
-/// [`custom_message_from_event`] uses, for the same reason: the `AgentMessage` type lives in
+/// [`displayable_custom_message_from_event`] uses, for the same reason: the `AgentMessage` type lives in
 /// `cyrup-agent`, which is only a dev-dependency here.
 pub(crate) fn tool_result_usage_from_event(ev: &AgentSessionEvent) -> Option<cyrup_core::Usage> {
     let value = serde_json::to_value(ev).ok()?;
@@ -195,7 +195,7 @@ pub(crate) fn tool_result_usage_from_event(ev: &AgentSessionEvent) -> Option<cyr
 }
 
 /// The `role` discriminant of the message an event carries (`"user"`/`"assistant"`/`"toolResult"`/
-/// `"custom"`), read through the same serde projection [`custom_message_from_event`] uses and for
+/// `"custom"`), read through the same serde projection [`displayable_custom_message_from_event`] uses and for
 /// the same reason: `AgentMessage` lives in `cyrup-agent`, a dev-dependency here.
 ///
 /// This is Pi's `event.message.role` test (`interactive-mode.ts:3122`, `:3181`).
@@ -239,10 +239,34 @@ pub(crate) fn assistant_message_from_event(
     serde_json::from_value(message.clone()).ok()
 }
 
-pub(crate) fn custom_message_from_event(ev: &AgentSessionEvent) -> Option<(String, String)> {
+/// The `(kind, body)` of a custom message an event carries — **only when it asked to be drawn**.
+///
+/// SUBA-094: pi's `addMessageToChat` `case "custom"` is `if (message.display) { … }`
+/// (`interactive-mode.ts:3607-3620` @v0.84.4), and the guard wraps the WHOLE arm — the
+/// `getMessageRenderer` lookup included. Returning `None` for a hidden message puts that guard in
+/// the one place both live callers already funnel through (the transcript push in `events_fold`
+/// and the renderer dispatch in `extension_render`), which is why the extraction and the gate are
+/// one function rather than two chances to forget: a `display: false` message cannot reach a
+/// drawing path at all. It still reaches the MODEL — the transcript and the LLM projection never
+/// consult this function.
+///
+/// This mirrors the `--resume` walk, which has read `c.display` off the persisted entry since it
+/// was written (`session_bind.rs`, pi `:3470`); the live path had no `display` to read until
+/// [`cyrup_agent::AgentMessage::Custom`] carried one.
+pub(crate) fn displayable_custom_message_from_event(
+    ev: &AgentSessionEvent,
+) -> Option<(String, String)> {
     let value = serde_json::to_value(ev).ok()?;
     let message = value.get("message")?;
     if message.get("role").and_then(serde_json::Value::as_str) != Some("custom") {
+        return None;
+    }
+    // Absent ⇒ drawn, matching the wire default `AgentMessage`'s own deserializer applies.
+    if !message
+        .get("display")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
+    {
         return None;
     }
     let kind = message

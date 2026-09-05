@@ -469,6 +469,11 @@ pub(crate) fn raw_message_to_agent(m: &cyrup_session::agent_message::AgentMessag
                 // The persisted entry's `details` survives the resume / compaction re-seed round
                 // trip, so a card drawn on the live turn is drawn identically on `--resume`.
                 details: c.details.clone(),
+                // SUBA-094 — and its `display`, so a re-seeded transcript carries the same
+                // disposition the entry was written with (pi's `createCustomMessage(entry.customType,
+                // entry.content, entry.display, entry.details)`, `session-manager.ts:396-400`
+                // @v0.84.4) instead of silently becoming visible.
+                display: c.display,
                 timestamp: Some(c.timestamp),
             },
         },

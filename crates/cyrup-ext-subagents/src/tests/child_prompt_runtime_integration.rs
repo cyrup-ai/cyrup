@@ -365,6 +365,7 @@ fn parent_notice(kind: &str) -> AgentMessage {
         kind: kind.to_string(),
         payload: serde_json::json!({ "content": "run finished" }),
         details: None,
+        display: true,
         timestamp: None,
     }
 }

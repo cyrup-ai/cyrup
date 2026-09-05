@@ -55,6 +55,7 @@ fn turn_end(text: &str) -> HostEvent {
             kind: "probe".to_string(),
             payload: serde_json::json!({ "text": text }),
             details: None,
+            display: true,
             timestamp: Some(0),
         },
         tool_results: Vec::new(),

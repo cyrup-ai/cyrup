@@ -1027,7 +1027,7 @@ fn mirror_meta_container_still_greys_the_whole_annotation() {
 
 /// The user action: an extension posts a custom message during a turn (a review/notice block). It
 /// arrives as `AgentSessionEvent::MessageEnd { message: AgentMessage::Custom { .. } }`, which
-/// `App::ingest_event` folds into a labeled transcript block (`app.rs` `custom_message_from_event`
+/// `App::ingest_event` folds into a labeled transcript block (`app.rs` `displayable_custom_message_from_event`
 /// → `push_custom_message_rendered`) — the same path a replayed session takes via
 /// `AgentMessage::Custom` when `display` is set. Pi's component is
 /// `new Box(1, 1, (t) => theme.bg("customMessageBg", t))` holding the `[label]` `Text` and
@@ -1055,6 +1055,7 @@ fn t9_render_custom_message_paints_bg_and_text_tokens() {
             kind: "review".to_string(),
             payload: serde_json::json!("Looks good to ship."),
             details: None,
+            display: true,
             timestamp: None,
         },
     });

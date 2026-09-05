@@ -3645,6 +3645,7 @@ mod tests {
             kind: kind.to_string(),
             payload: serde_json::json!({}),
             details: None,
+            display: true,
             timestamp: None,
         }
     }

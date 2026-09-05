@@ -133,6 +133,7 @@ fn custom_message_event_renders_a_labeled_block() {
         kind: "review".to_string(),
         payload: serde_json::json!("Looks good to ship."),
         details: None,
+        display: true,
         timestamp: None,
     };
     app.ingest_event(&AgentSessionEvent::MessageEnd { message });
@@ -155,6 +156,7 @@ fn custom_message_event_handles_array_content() {
         kind: "note".to_string(),
         payload: serde_json::json!([{ "type": "text", "text": "part one " }, { "type": "text", "text": "part two" }]),
         details: None,
+        display: true,
         timestamp: None,
     };
     app.ingest_event(&AgentSessionEvent::MessageEnd { message });
@@ -208,5 +210,52 @@ fn core_messages_do_not_render_as_custom_blocks() {
     assert!(
         !out.contains("[user]"),
         "core user message is not labeled custom:\n{out}"
+    );
+}
+
+/// SUBA-094 — a custom message that opted OUT of display reaches the model and NOT the screen.
+///
+/// pi's interactive host gates the whole `case "custom"` arm on `message.display`
+/// (`interactive-mode.ts:3607-3620` @v0.84.4), and `pi-subagents` computes that flag per completion
+/// (`notify.ts:402` @v0.64.0: a plain successful background run is `display: false`). cyrup's live
+/// path drew every custom message because [`cyrup_agent::AgentMessage::Custom`] had no `display`
+/// for the fold to read — the `--resume` walk had honoured the persisted flag all along, so a
+/// hidden notice appeared on the turn that produced it and vanished on reload.
+#[test]
+fn a_custom_message_with_display_false_is_not_drawn() {
+    let mut app = new_app();
+    let hidden = AgentMessage::Custom {
+        kind: "subagent-notify".to_string(),
+        payload: serde_json::json!("Background run finished: docs-writer"),
+        details: None,
+        display: false,
+        timestamp: None,
+    };
+    app.ingest_event(&AgentSessionEvent::MessageEnd { message: hidden });
+    app.draw().unwrap();
+    let out = app.scrollback_text();
+    assert!(
+        !out.contains("[subagent-notify]"),
+        "a display:false custom message must not put its label on screen:\n{out}"
+    );
+    assert!(
+        !out.contains("Background run finished"),
+        "…nor its body:\n{out}"
+    );
+
+    // The SAME message with `display: true` still draws — the gate is the flag, not the kind.
+    let shown = AgentMessage::Custom {
+        kind: "subagent-notify".to_string(),
+        payload: serde_json::json!("Background run FAILED: docs-writer"),
+        details: None,
+        display: true,
+        timestamp: None,
+    };
+    app.ingest_event(&AgentSessionEvent::MessageEnd { message: shown });
+    app.draw().unwrap();
+    let out = app.scrollback_text();
+    assert!(
+        out.contains("[subagent-notify]") && out.contains("Background run FAILED"),
+        "a display:true custom message of the same kind still draws:\n{out}"
     );
 }

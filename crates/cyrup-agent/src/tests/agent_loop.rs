@@ -1006,6 +1006,7 @@ async fn a_02_9_custom_message_dropped_from_llm_visible_in_events() {
         kind: "note".into(),
         payload: json!({ "hidden": true }),
         details: None,
+        display: true,
         timestamp: None,
     });
 

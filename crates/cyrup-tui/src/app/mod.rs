@@ -75,8 +75,8 @@ pub(crate) use bash_spawn::{BashMsg, spawn_session_bash};
 #[cfg(any(test, feature = "scrollback-accumulator"))]
 pub(crate) use event_extract::line_text;
 pub(crate) use event_extract::{
-    assistant_message_from_event, context_usage_may_have_moved, custom_message_from_event,
-    custom_message_text, edit_preview, message_role_from_event, model_entries,
+    assistant_message_from_event, context_usage_may_have_moved, custom_message_text,
+    displayable_custom_message_from_event, edit_preview, message_role_from_event, model_entries,
     read_clipboard_image_to_temp, stop_reason_notice, tool_result_usage_from_event,
     truncate_summary, user_message_text_from_event,
 };

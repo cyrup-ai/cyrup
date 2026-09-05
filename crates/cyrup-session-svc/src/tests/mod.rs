@@ -23,6 +23,7 @@ mod fork_non_persisted;
 mod fork_parent_and_unsaved_guard;
 mod get_commands_source_info;
 mod inject_message_details;
+mod inject_message_display;
 mod install_noop;
 mod integration;
 mod late_seams;

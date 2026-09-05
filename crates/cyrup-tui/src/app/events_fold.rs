@@ -126,7 +126,7 @@ impl<B: Backend> App<B> {
                 // The `AgentMessage` type lives in `cyrup-agent` (a dev-dep here, not a direct dep), so
                 // the `Custom` arm is detected via its serde projection (`tag = "role"`,
                 // `rename_all_fields = camelCase`) rather than a direct match — no dependency ripple.
-                if let Some((kind, body)) = custom_message_from_event(&ev) {
+                if let Some((kind, body)) = displayable_custom_message_from_event(&ev) {
                     // EXT-006: `rendered` is the text the extension that registered a renderer for
                     // this custom type produced; absent one it is `None` and the default
                     // `[kind] body` framing draws (Pi `CustomMessageComponent`).
