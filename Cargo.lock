@@ -1364,6 +1364,7 @@ dependencies = [
  "cyrup-config",
  "cyrup-core",
  "cyrup-permission-system",
+ "cyrup-provider",
  "cyrup-resources",
  "cyrup-session",
  "cyrup-session-svc",
