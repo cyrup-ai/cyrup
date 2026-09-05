@@ -275,6 +275,13 @@ pub struct AppState {
     /// swap because it holds that session's resource snapshot. Kept here so
     /// [`App::publish_extension_readbacks`] can republish the active theme name each frame.
     pub(super) theme_access: Option<Arc<crate::theme_access::TuiThemeAccess>>,
+    /// TUI-004 — the boot [`crate::ThemeController`], handed over by the composition root
+    /// ([`App::set_theme_controller`]) so a session swap can re-run Pi's `applyFromSettings`
+    /// (`modes/interactive/theme/theme-controller.ts:57-81` @v0.84.4), which upstream drives from
+    /// the `setRebindSession` hook (`interactive-mode.ts:576-579`) and from `handleReloadCommand`
+    /// (`:5987`). `None` for an app whose launcher never booted one — every such app keeps the theme
+    /// it was constructed with, which is the pre-TUI-004 behaviour and what the test harnesses want.
+    pub(super) theme_controller: Option<crate::theme::ThemeController>,
     /// The `/tree` target the user confirmed, held while the "Summarize branch?" prompt (and, on its
     /// third option, the custom-instructions editor) is open — Pi keeps the same values in the
     /// `entryId` / `wantsSummary` / `customInstructions` locals of its `while (true)` prompt loop
@@ -495,6 +502,7 @@ impl AppState {
             pending_ui_reply: None,
             editor_mirror: cyrup_session_svc::EditorTextMirror::new(),
             theme_access: None,
+            theme_controller: None,
             pending_tree_nav: None,
             pending_import: None,
             terminal_title: None,

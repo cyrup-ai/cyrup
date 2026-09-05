@@ -125,6 +125,7 @@ mod terminal_theme_query;
 mod terminal_title;
 mod theme_controller_assembled;
 mod theme_fidelity;
+mod theme_reapply_on_reload;
 mod thinking;
 mod tool_render;
 mod tool_render_shell;

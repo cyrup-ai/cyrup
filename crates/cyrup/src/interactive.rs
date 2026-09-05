@@ -203,6 +203,13 @@ pub async fn run_interactive(
             )
             .await;
     }
+    // TUI-004 — hand the settled controller to the app so the run loop's `session_swapped` arm can
+    // re-run pi's `applyFromSettings` on every session replacement. Upstream's controller is a field
+    // of the interactive mode (`interactive-mode.ts:960` @v0.84.4) and its `setRebindSession` hook
+    // calls straight into it (`:576-579`); cyrup's lived only in this stack frame, which is why
+    // `/reload` re-read five other settings rows and never the theme. Cloned rather than moved: the
+    // theme file watcher below still binds against `controller.active_name()`.
+    app.set_theme_controller(controller.clone());
     app.detect_image_support();
     seed_footer(&mut app, &runtime, &session).await;
     // Pi shows the package-update notification whenever the detached check settles, which is why the

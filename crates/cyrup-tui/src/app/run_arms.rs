@@ -230,6 +230,33 @@ impl App<InlineBackend<Stdout>> {
             Arc::clone(&ctx.session.services().resources),
             ctx.theme_switch_tx.clone(),
         );
+        // TUI-004 — ...and, immediately after that re-registration and in upstream's order, the
+        // RENDER theme itself. pi pairs `setRegisteredThemes(...)` with
+        // `await this.themeController.applyFromSettings()` at both call sites — the
+        // `setRebindSession` hook (`interactive-mode.ts:1977` then `:578`, the two halves of one
+        // rebind) and `handleReloadCommand` (`:5985` then `:5987`) — so a `settings.theme` edited on
+        // disk, a custom theme file rewritten under an unchanged name, and a theme an extension
+        // newly registered all take effect on the reload that discovered them. cyrup re-read
+        // `outputPad`, `hideThinking`, `showImages`, `imageWidthCells` and `editorPaddingX` here and
+        // left the theme latched at whatever boot resolved, so the only in-app way to change a theme
+        // FILE was to restart.
+        //
+        // Reads the setting from the SWAPPED-IN session, which is pi's
+        // `settingsManager.getThemeSetting()` (`theme-controller.ts:59`): `/reload` rebuilds the
+        // session, so this view is the freshly re-read one. pi prefers its in-memory
+        // `currentThemeSetting` over the manager; cyrup has no such shadow because every theme
+        // change here — the `/settings → theme` confirm arm and an extension's `setTheme` alike —
+        // persists through `AppCommand::ApplySetting` unconditionally (see `on_theme_switch`), so
+        // the persisted value IS what upstream would be holding in memory.
+        self.reapply_theme_from_settings(
+            ctx.session
+                .services()
+                .settings
+                .effective()
+                .theme_setting()
+                .as_deref(),
+            &ctx.session.services().resources,
+        );
         // ...and the fault listener, whose `ExtensionHost` is likewise brand new on the swapped-in
         // session (Pi re-binds `onError` from `rebindSession`, and `crates/cyrup-modes/src/rpc.rs`'s
         // `rebind_session` does the same).

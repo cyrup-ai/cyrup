@@ -1543,6 +1543,61 @@ impl ThemeController {
         (resolved != self.active_name).then(|| self.set_theme_name(resolved))
     }
 
+    /// Re-resolve the active theme from a freshly re-read `settings.theme` — Pi `applyFromSettings`
+    /// (`modes/interactive/theme/theme-controller.ts:57-81` @v0.84.4) — and return the theme NAME
+    /// the caller must now load.
+    ///
+    /// This is the `/reload` half of TUI-004. Pi runs `applyFromSettings` on every session
+    /// replacement (the `setRebindSession` hook, `interactive-mode.ts:576-579`) and again explicitly
+    /// from `handleReloadCommand` (`:5987`), so a `settings.theme` the user edited on disk, and a
+    /// custom theme file whose CONTENT changed under an unchanged name, both take effect without a
+    /// restart.
+    ///
+    /// The three branches are Pi's, in Pi's order (`:60-72`): an `auto` (`light/dark`) pair resolves
+    /// against the terminal polarity with auto-sync on; an explicit name is applied verbatim with
+    /// auto-sync off; an unset setting falls back to the polarity's own theme name.
+    ///
+    /// **[CYRUP-DELTA] vs `:62` and `:74`** — the two probing branches do **not** re-probe. Upstream
+    /// asks the terminal again (DSR `?996` for an `auto` setting, OSC 11 for an unset one) because
+    /// its own TUI owns the stdin demultiplexer and can route the reply back to the awaiting caller.
+    /// By the time cyrup can reach this seam the crossterm reader thread owns stdin
+    /// (`crates/cyrup/src/interactive.rs` starts it right after the boot probe, for exactly this
+    /// reason), so a second query's reply bytes would be raced for and mis-decoded as keystrokes
+    /// into the user's prompt — the same hazard [`Self::auto_sync`] records for mode `2031`. The
+    /// polarity detected at boot is therefore reused, which is correct for every terminal whose
+    /// background did not change mid-session, and a stale-polarity `auto` resolve is strictly better
+    /// than corrupting the editor buffer. For the same reason branch 3 offers nothing new to
+    /// [`Self::theme_to_persist`]: there is no fresh detection to persist.
+    ///
+    /// Returns the resolved name rather than an `Option<UiTheme>` the way
+    /// [`Self::sync_with_terminal`] does, and deliberately: "the name did not change" is NOT "there
+    /// is nothing to do" here, because the theme's own file may have been rewritten under the same
+    /// name — which is precisely the `/reload` case the item names. The caller re-loads the named
+    /// theme from the swapped-in session's freshly discovered resources every time
+    /// ([`crate::App::reapply_theme_from_settings`]), matching Pi's unconditional
+    /// `applyThemeName` → `setTheme(name)` re-read (`:126-135`).
+    pub fn apply_from_settings(&mut self, setting: Option<&str>) -> String {
+        self.theme_setting = setting.map(str::to_string);
+        let resolved = if let Some((light, dark)) = parse_auto_theme_setting(setting) {
+            self.auto_sync = true;
+            match self.terminal_theme {
+                TerminalTheme::Light => light,
+                TerminalTheme::Dark => dark,
+            }
+        } else if let Some(name) = setting {
+            self.auto_sync = false;
+            name.to_string()
+        } else {
+            self.auto_sync = false;
+            self.terminal_theme.theme_name().to_string()
+        };
+        // `set_theme_name` is Pi's `applyThemeName` (`:126-135`): it re-seats the active name and
+        // bumps the generation so every render cache keyed by it re-materialises, which is what
+        // makes an unchanged NAME with changed CONTENT repaint.
+        self.set_theme_name(resolved.clone());
+        resolved
+    }
+
     /// Whether the active setting is an `auto` pair, i.e. whether Pi would keep terminal
     /// color-scheme notifications (mode `2031`) enabled and re-theme on every change.
     ///
