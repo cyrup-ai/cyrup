@@ -1,8 +1,8 @@
 # Acknowledgements
 
-cyrup exists because six TypeScript projects did the hard part first. Every architectural decision
-worth defending in this codebase was made by someone else, in another language, and proved out in
-use before a line of Rust was written.
+cyrup exists because seven projects did the hard part first — six in TypeScript and one in Python.
+Every architectural decision worth defending in this codebase was made by someone else, in another
+language, and proved out in use before a line of Rust was written.
 
 The source carries **20,561 citations** naming the exact upstream file and line a given Rust item
 mirrors. That index is not decoration — it is how equivalence gets audited, and it is a standing
@@ -160,6 +160,30 @@ all, and `AgentSessionEvent` supplies typed variants — `QueueUpdate`, `BashExe
 that was never about the transport: the three rules above, the exact user-visible strings, and the
 ordering constraint that `available_commands_update` must follow the `session/new` response because
 clients drop notifications for a session id they have not yet seen.
+
+## code-puppy — the development pipeline
+
+**[mpfaffenberger/code_puppy](https://github.com/mpfaffenberger/code_puppy)** and
+**[mpfaffenberger/code_puppy_core_plugins](https://github.com/mpfaffenberger/code_puppy_core_plugins)** · both MIT © 2025 Mike Pfaffenberger
+
+The one upstream here that is neither pi nor TypeScript, and the only one that is two repositories.
+`cyrup-flux` is measured against the plugin for the ported surface and against core code-puppy for
+the runtime it assumes — the `invoke_agent` tool the bundled templates were renamed off lives in
+core, not in the plugin, and one port unit turns on exactly that.
+
+The `flux_bootstrap` plugin is a structured development pipeline — `plan → tasks → implement →
+review → commit → create-pr` — carried as eighteen bundled commands, a `~/.flux/<flattened-cwd>/`
+state tree, and three status renderers.
+
+`cyrup-flux` ports that surface, and the state tree stays **byte-identical** to code-puppy's, so a
+directory written by one is readable by the other. That is a deliberate constraint rather than a
+coincidence, and it is why the port was checked by running the upstream Python and comparing output:
+`flux_status.py --no-color` is a golden in this repo's test suite. Six real defects fell out of that
+comparison, including `str.splitlines()`'s boundary table (a lone `\r` split a task file differently
+in the two languages) and Python's `\w` being Unicode where the Rust was ASCII.
+
+Being Python rather than TypeScript made it the most instructive of the seven: nothing could be
+ported by shape, so every behaviour had to be re-derived from what the program actually did.
 
 ---
 
