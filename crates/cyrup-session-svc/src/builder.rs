@@ -341,10 +341,30 @@ const ALL_BUILTIN_TOOLS: [&str; 8] = [
 ];
 
 /// Apply the `tools`/`noTools`/`excludeTools` selection over the Availability-visible tool set
-/// (Pi sdk.ts:244-251). When none of the three is set the visible set passes through unchanged.
+/// (Pi sdk.ts:256-263), with the `defaultTools` setting standing in for pi's
+/// `defaultActiveToolNames` when it is configured.
+///
+/// Upstream v0.84.4 (`sdk.ts:261-263`) is one expression:
+///
+/// ```text
+/// options.tools ?? (options.noTools ? [] : (configuredDefaultToolNames ?? defaultActiveToolNames))
+/// ```
+///
+/// followed by the `excludeTools` filter — so `default_tools` is consulted only on the arm where
+/// neither an explicit allowlist nor a suppression mode is set, and it REPLACES the four defaults
+/// rather than adding to them.
+///
+/// `default_tools` narrows built-ins ONLY. An extension- or embedder-supplied tool is kept by the
+/// `!ALL_BUILTIN_TOOLS.contains(name)` leg regardless of what the setting lists, which is upstream's
+/// `includeAllExtensionTools: true` at construction (`agent-session.ts:406-410` →
+/// `_refreshToolRegistry`'s `:2742-2745` branch). That is deliberate and was a bug fix upstream:
+/// `defaultTools` first shipped as an `allowedToolNames` allowlist (`4d9aa837c`) that dropped
+/// extension and SDK custom tools, and `541045ae0` ("preserve extension tools with defaults")
+/// narrowed it to the built-in selection before v0.84.4 shipped.
 fn select_active_tools(
     visible: &[Arc<dyn cyrup_core::Tool>],
     cfg: &SessionConfig,
+    default_tools: Option<&[String]>,
 ) -> Vec<Arc<dyn cyrup_core::Tool>> {
     let exclude: std::collections::HashSet<&str> =
         cfg.exclude_tools.iter().map(String::as_str).collect();
@@ -371,8 +391,17 @@ fn select_active_tools(
             // ENABLE-able at runtime via `set_active_tools_by_name`, exactly as pi's
             // `_refreshToolRegistry` can widen its own active set. This changes the DEFAULT, not
             // what is reachable.
+            //
+            // CFG-079: `defaultTools` (settings-manager.ts:128, getter `:1273-1276`) replaces
+            // `DEFAULT_BUILTIN_TOOLS` on this arm when it is configured. An explicit `[]` is a
+            // configured value — it means "no built-ins", not "unset" — which is why the setting is
+            // an `Option<&[String]>` and not a `Vec` defaulted to the four names.
             (None, None) => {
-                DEFAULT_BUILTIN_TOOLS.contains(&name) || !ALL_BUILTIN_TOOLS.contains(&name)
+                let selected = match default_tools {
+                    Some(configured) => configured.iter().any(|t| t == name),
+                    None => DEFAULT_BUILTIN_TOOLS.contains(&name),
+                };
+                selected || !ALL_BUILTIN_TOOLS.contains(&name)
             }
         }
     };
@@ -1002,10 +1031,13 @@ impl SessionBuilder {
             },
         );
         let visible = registry.visible(&cfg.tool_availability);
-        // Tool-set selection (Pi sdk.ts:244-251): an explicit `tools` allowlist, or `noTools`
+        // Tool-set selection (Pi sdk.ts:256-263): an explicit `tools` allowlist, or `noTools`
         // ("all" ⇒ none; "builtin" ⇒ drop the default built-ins), then minus the `excludeTools`
-        // denylist. Absent all three, the Availability-visible set is kept verbatim.
-        let base_tools = select_active_tools(&visible, &cfg);
+        // denylist. Absent all three, the initial built-in selection is the `defaultTools` setting
+        // when configured (CFG-079, `settingsManager.getDefaultTools()` at sdk.ts:257) and pi's four
+        // `defaultActiveToolNames` otherwise.
+        let configured_default_tools = settings.effective().default_tools();
+        let base_tools = select_active_tools(&visible, &cfg, configured_default_tools.as_deref());
         let read_available = base_tools.iter().any(|t| t.name() == "read");
 
         // ---- 4a. the LIVE host-services backend (arch-08 §5.6) — built BEFORE the extension host so
@@ -2691,6 +2723,123 @@ mod tests {
         for name in DEFAULT_BUILTIN_TOOLS {
             assert!(cyrup_tools::BUILTIN_NAMES.contains(&name));
         }
+    }
+
+    // ---- CFG-079: the `defaultTools` setting is the initial BUILT-IN selection ----------------
+    //
+    // pi v0.84.4 `sdk.ts:256-263`. Ported from `test/default-tools-setting.test.ts` at the same
+    // tag, case for case: "uses the configured list as the initial built-in selection",
+    // "can select powershell instead of bash", "keeps extension and SDK custom tools enabled" and
+    // "preserves explicit tool option precedence".
+
+    /// A name-only tool: `select_active_tools` reads nothing else off the trait.
+    struct NamedTool(&'static str, serde_json::Value);
+
+    #[async_trait::async_trait]
+    impl cyrup_core::Tool for NamedTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn parameters(&self) -> &serde_json::Value {
+            &self.1
+        }
+        async fn execute(
+            &self,
+            _id: cyrup_core::ToolCallId,
+            _args: serde_json::Value,
+            _cancel: cyrup_core::CancelToken,
+            _on_update: Box<dyn FnMut(cyrup_core::ToolUpdate) + Send>,
+        ) -> Result<cyrup_core::ToolResult, cyrup_core::ToolError> {
+            Err(cyrup_core::ToolError::new("not executable"))
+        }
+    }
+
+    /// Every built-in `ToolRegistry::with_builtins` installs, plus one extension-supplied tool —
+    /// upstream's `getAllTools()` in the same test file, which lists all eight built-ins whatever
+    /// `defaultTools` says, plus the extension/SDK tools.
+    fn visible_tools() -> Vec<std::sync::Arc<dyn cyrup_core::Tool>> {
+        ALL_BUILTIN_TOOLS
+            .iter()
+            .copied()
+            .chain(std::iter::once("static_tool"))
+            .map(|name| {
+                std::sync::Arc::new(NamedTool(name, serde_json::json!({})))
+                    as std::sync::Arc<dyn cyrup_core::Tool>
+            })
+            .collect()
+    }
+
+    fn selected(cfg: &super::SessionConfig, default_tools: Option<&[String]>) -> Vec<String> {
+        super::select_active_tools(&visible_tools(), cfg, default_tools)
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect()
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn the_default_tools_setting_replaces_pis_four_built_ins() {
+        let cfg = super::SessionConfig::new("/tmp", "/tmp/agent");
+
+        // Unset: pi's `defaultActiveToolNames` (sdk.ts:256), extension tool alongside.
+        assert_eq!(
+            selected(&cfg, None),
+            names(&["read", "write", "edit", "bash", "static_tool"])
+        );
+
+        // "uses the configured list as the initial built-in selection": grep/find are built-ins pi
+        // does NOT activate by default, and the four defaults are REPLACED, not widened.
+        assert_eq!(
+            selected(&cfg, Some(&names(&["grep", "find"]))),
+            names(&["grep", "find", "static_tool"])
+        );
+
+        // "can select powershell instead of bash".
+        assert_eq!(
+            selected(&cfg, Some(&names(&["read", "powershell", "edit", "write"]))),
+            names(&["read", "write", "edit", "powershell", "static_tool"])
+        );
+
+        // An explicit `[]` is a configured value, not "unset": no built-ins at all. The extension
+        // tool still survives — this is the `541045ae0` fix, and the reason the parameter is an
+        // `Option` rather than a `Vec` defaulted to the four names.
+        assert_eq!(selected(&cfg, Some(&[])), names(&["static_tool"]));
+
+        // A name that matches no tool is carried through and simply selects nothing: pi's getter
+        // validates nothing (settings-manager.ts:1273-1276).
+        assert_eq!(
+            selected(&cfg, Some(&names(&["read", "no-such-tool"]))),
+            names(&["read", "static_tool"])
+        );
+    }
+
+    #[test]
+    fn explicit_tool_flags_still_outrank_the_default_tools_setting() {
+        // "preserves explicit tool option precedence" — pi's
+        // `options.tools ?? (options.noTools ? [] : (configuredDefaultToolNames ?? …))`, then the
+        // `excludeTools` filter (sdk.ts:261-263).
+        let default_tools = names(&["read", "grep"]);
+
+        let mut allowlisted = super::SessionConfig::new("/tmp", "/tmp/agent");
+        allowlisted.tools = Some(names(&["read"]));
+        assert_eq!(
+            selected(&allowlisted, Some(&default_tools)),
+            names(&["read"])
+        );
+
+        let mut excluded = super::SessionConfig::new("/tmp", "/tmp/agent");
+        excluded.exclude_tools = names(&["read"]);
+        assert_eq!(
+            selected(&excluded, Some(&default_tools)),
+            names(&["grep", "static_tool"])
+        );
+
+        let mut none = super::SessionConfig::new("/tmp", "/tmp/agent");
+        none.no_tools = Some(super::NoTools::All);
+        assert!(selected(&none, Some(&default_tools)).is_empty());
     }
 
     // ---- SEAM-071: `--no-extensions` gates the native built-ins ----------------------------

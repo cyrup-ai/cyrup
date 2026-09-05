@@ -178,6 +178,37 @@ impl EffectiveSettings {
         })
     }
 
+    /// `getDefaultTools(): string[] | undefined` (Pi v0.84.4 settings-manager.ts:1273-1276, key
+    /// declared at `:128` as `defaultTools?: string[]; // Initial built-in tool selection`).
+    ///
+    /// A v0.84.4 addition (absent at v0.84.1): the INITIAL BUILT-IN tool selection a session starts
+    /// with, in place of pi's `defaultActiveToolNames` (`read`/`bash`/`edit`/`write`, sdk.ts:256).
+    /// Ported as a plain passthrough — upstream's getter only makes a defensive copy and validates
+    /// nothing, so an unknown name is carried through and simply matches no tool.
+    ///
+    /// `None` (unset) and `Some(vec![])` (an explicit empty list) are DIFFERENT, exactly as for
+    /// [`Self::enabled_models`]: unset means "pi's own four built-ins", empty means "no built-ins at
+    /// all". Extension/SDK tools are unaffected either way — see the consumer in
+    /// `cyrup-session-svc`'s `select_active_tools`.
+    ///
+    /// Tag-to-tag (ADR-0006): the key landed at `4d9aa837c` ("add configurable default tools") as an
+    /// `allowedToolNames` allowlist, which also SUPPRESSED extension and SDK custom tools;
+    /// `541045ae0` ("preserve extension tools with defaults") narrowed it to the initial built-in
+    /// selection before v0.84.4 shipped. v0.84.4's behaviour — selection, not allowlist — is what is
+    /// ported here.
+    pub fn default_tools(&self) -> Option<Vec<String>> {
+        self.merged.get("defaultTools").map(|v| {
+            v.as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+    }
+
     /// `sessionDir`, tilde-expanded (Pi `getSessionDir` → `normalizePath`, settings-manager.ts:665).
     pub fn session_dir(&self) -> Option<String> {
         self.merged.get_str("sessionDir").map(|s| expand_tilde(&s))

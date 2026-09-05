@@ -488,6 +488,53 @@ fn enabled_models_distinguishes_unset_from_empty() {
 }
 
 #[test]
+fn default_tools_round_trips_and_distinguishes_unset_from_empty() {
+    // CFG-079. Pi v0.84.4 `getDefaultTools(): string[] | undefined` (settings-manager.ts:1273-1276)
+    // over the key declared at `:128`. Unset is `undefined` — sdk.ts:262 then falls back to
+    // `defaultActiveToolNames` (read/bash/edit/write) — while an explicit `[]` is a configured
+    // empty selection: no built-ins at all. Collapsing both to an empty Vec loses that.
+    let unset = EffectiveSettings::from_settings(Settings::default());
+    assert_eq!(unset.default_tools(), None);
+
+    let empty =
+        EffectiveSettings::from_settings(Settings::parse(r#"{ "defaultTools": [] }"#).unwrap());
+    assert_eq!(empty.default_tools(), Some(vec![]));
+
+    let some = EffectiveSettings::from_settings(
+        Settings::parse(r#"{ "defaultTools": ["read", "powershell", "edit", "write"] }"#).unwrap(),
+    );
+    assert_eq!(
+        some.default_tools(),
+        Some(vec![
+            "read".to_string(),
+            "powershell".to_string(),
+            "edit".to_string(),
+            "write".to_string(),
+        ])
+    );
+
+    // No validation, exactly like upstream's getter: an unknown name is carried through verbatim
+    // and simply matches no tool at the consumer.
+    let unknown = EffectiveSettings::from_settings(
+        Settings::parse(r#"{ "defaultTools": ["no-such-tool"] }"#).unwrap(),
+    );
+    assert_eq!(
+        unknown.default_tools(),
+        Some(vec!["no-such-tool".to_string()])
+    );
+
+    // A project layer REPLACES the global array (docs/settings.md:244, "A project `defaultTools`
+    // array replaces the global array") — the deep merge's array rule, not a union.
+    let global = serde_json::json!({ "defaultTools": ["read", "bash"] });
+    let project = serde_json::json!({ "defaultTools": ["grep"] });
+    let merged = crate::settings::merge::deep_merge(&global, &project);
+    let layered = EffectiveSettings::from_settings(
+        Settings::parse(&merged.to_string()).expect("merged layers parse"),
+    );
+    assert_eq!(layered.default_tools(), Some(vec!["grep".to_string()]));
+}
+
+#[test]
 fn compaction_and_retry_combined_getters() {
     // settings-manager.ts:776-782 (getCompactionSettings), :808-814 (getRetrySettings).
     let s = EffectiveSettings::from_settings(Settings::default());
