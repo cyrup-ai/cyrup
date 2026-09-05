@@ -2132,66 +2132,66 @@ mod tests {
         );
     }
 
-    /// ACP-140 — the desync is visible at the translator too: a head-dropping preview appends
-    /// nothing rather than repeating the tail.
+    /// ACP-140 — the sliding window seen from the translator, which is the seam the real bash tool
+    /// feeds. A preview whose head `truncate_tail` dropped resyncs on the overlap and appends only
+    /// the genuinely new bytes; only a preview sharing no overlap at all appends nothing.
     #[test]
-    fn a_truncated_preview_appends_nothing_rather_than_repeating() {
+    fn a_slid_preview_appends_the_new_bytes_and_a_discontinuity_appends_nothing() {
+        // A corpus line long enough that one line of overlap clears `MIN_RESYNC_OVERLAP`, as the
+        // real 50 KiB / 2 000-line window does by four orders of magnitude.
+        let line = |n: usize| format!("line {n:04}: Compiling cyrup-acp v0.0.0 (/home/user)\n");
+        let window = |upto: usize| -> String { (upto.saturating_sub(3)..upto).map(line).collect() };
+
         let mut ledger = fresh();
         let _ = translate(
             &mut ledger,
             &AgentSessionEvent::ToolExecutionStart {
                 tool_call_id: "sh1".into(),
                 tool_name: "bash".into(),
-                args: json!({ "command": "yes" }),
+                args: json!({ "command": "cargo build" }),
             },
             None,
         );
-        for preview in ["aaa\n", "aaa\nbbb\n"] {
-            let _ = translate(
-                &mut ledger,
+        let preview = |ledger: &mut ToolCallLedger, text: &str| {
+            translate(
+                ledger,
                 &AgentSessionEvent::ToolExecutionUpdate {
                     tool_call_id: "sh1".into(),
                     tool_name: "bash".into(),
-                    args: json!({ "command": "yes" }),
-                    partial_result: tool_result(preview),
+                    args: json!({ "command": "cargo build" }),
+                    partial_result: tool_result(text),
                 },
                 None,
-            );
-        }
-        // `truncate_tail` dropped the head.
-        let out = translate(
-            &mut ledger,
-            &AgentSessionEvent::ToolExecutionUpdate {
-                tool_call_id: "sh1".into(),
-                tool_name: "bash".into(),
-                args: json!({ "command": "yes" }),
-                partial_result: tool_result("bbb\nccc\n"),
-            },
-            None,
-        );
-        assert!(
-            out.updates.is_empty(),
-            "a desynced preview appends nothing and has no status transition left to report, so \
-             there is no frame to send at all — upstream would re-append the whole preview here: \
-             {:?}",
-            json_all(&out)
-        );
-        // And the appender re-based, so the very next update is a clean suffix.
-        let out = translate(
-            &mut ledger,
-            &AgentSessionEvent::ToolExecutionUpdate {
-                tool_call_id: "sh1".into(),
-                tool_name: "bash".into(),
-                args: json!({ "command": "yes" }),
-                partial_result: tool_result("bbb\nccc\nddd\n"),
-            },
-            None,
-        );
+            )
+        };
+
+        // Fill the window, then slide it. Before ACP-140's fix the pane froze here for good.
+        let _ = preview(&mut ledger, &window(3));
+        let out = preview(&mut ledger, &window(5));
         assert_eq!(
             json_all(&out)[0]["_meta"]["terminal_output"]["data"],
-            "ddd\n"
+            [line(3), line(4)].concat(),
+            "the two lines past the overlap, and only those: {:?}",
+            json_all(&out)
         );
-        // The unit test on the appender itself pins the outcome name.
+
+        // A jump larger than one whole window has no overlap to anchor on: the amount of missing
+        // output is unknown, so nothing is appended rather than the tail being repeated.
+        let out = preview(&mut ledger, "unrelated output\nfrom far ahead\n");
+        assert!(
+            out.updates.is_empty(),
+            "a genuinely discontinuous preview appends nothing and has no status transition left \
+             to report, so there is no frame to send at all — upstream would re-append the whole \
+             preview here: {:?}",
+            json_all(&out)
+        );
+        // And it re-based, so the very next update is a clean suffix.
+        let out = preview(&mut ledger, "unrelated output\nfrom far ahead\nand on\n");
+        assert_eq!(
+            json_all(&out)[0]["_meta"]["terminal_output"]["data"],
+            "and on\n"
+        );
+        // The unit tests on the appender itself pin the outcome names.
         assert_eq!(
             crate::ledger::TerminalAppender::default().push("x"),
             Push::Append("x".into())

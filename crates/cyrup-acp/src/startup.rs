@@ -1,4 +1,5 @@
-//! The markdown startup prelude (`ACP-066`, `ACP-068`, `ACP-081`).
+//! The markdown startup prelude and the modelless banner that precedes it (`ACP-017`,
+//! `ACP-066`, `ACP-068`, `ACP-081`).
 //!
 //! Port of pi-acp v0.0.33 `agent.ts`'s `buildStartupInfo` and `session.ts`'s
 //! `sendStartupInfoIfPending` @v0.0.33 — the inventory a client is shown once, immediately after
@@ -265,20 +266,100 @@ fn render_block(block: &StartupBlock) -> Option<String> {
     Some(out)
 }
 
-/// The prelude as a `session/update`, ready for `session/new`'s `follow_up` (`ACP-066`,
-/// `ACP-068`).
+/// The `Warning: ` prefix the modelless banner carries (`ACP-017`).
 ///
-/// `None` when there is nothing to report (`ACP-081`).
+/// The **same** string the sibling terminal front-end prefixes it with
+/// (`crates/cyrup/src/interactive.rs`'s `push_warning(format!("Warning: {msg}"))`), spelled once
+/// here so the two front-ends cannot drift in wording. It is deliberately *not* markdown-emphasised:
+/// the prelude's other chunk is markdown, but this one is a sentence a user must be able to read in
+/// a client that renders `agent_message_chunk` as plain text, and `**Warning:**` in such a client is
+/// noise around the only instruction it carries.
+pub const MODEL_FALLBACK_PREFIX: &str = "Warning: ";
+
+/// One `agent_message_chunk` carrying `text`.
+fn text_chunk(text: String) -> SessionUpdate {
+    SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(TextContent::new(
+        text,
+    ))))
+}
+
+/// The updates `session/new` sends after its response, in wire order (`ACP-017`, `ACP-066`,
+/// `ACP-068`, `ACP-081`).
+///
+/// Split from [`startup_prelude`] for the same reason [`render_markdown`] is: it is the ordering
+/// rule, and it must be assertable without building an [`AgentSession`].
+///
+/// # `ACP-017` — the modelless session says so in-band, and says it **first**
+///
+/// `ACP-Q7` decided that a session with no resolvable model is **not** refused at `session/new`
+/// (`crates/cyrup-acp/src/sessions.rs`'s `decorate_new_session`), where pi-acp's
+/// `rawModelsCount === 0` branch cleans up and answers `auth-required`
+/// (`src/acp/agent.ts:330-340` @v0.0.33). That answer is only half of a working behaviour: the
+/// verify for it is two-part — **no `model` config option** *and* **a first `session/update`
+/// carrying the fallback text** — and only the first half was written, so a credential-less first
+/// run in Zed got a `session/new` that looked entirely successful and learned otherwise one round
+/// trip later, from `session/prompt`'s `No model selected`.
+///
+/// `AgentSession::model_fallback_message()` is the message the session already built at
+/// resolve time (`cyrup_session_svc`'s `resolve_model`): with an empty catalog it is
+/// `format_no_models_available_message()` — *"No models available. Use /login to log into a
+/// provider…"* — and on a resumed session whose saved model has gone it is
+/// *"Could not restore model p/m. Using x/y"*. Both are worth saying; the terminal front-end says
+/// both, from the same accessor, and this is the ACP host reaching the same value.
+///
+/// **It is emitted ahead of the inventory** because it is the actionable half: a client that
+/// renders only the first chunk of a burst must render the instruction, not the skill list.
+///
+/// # [CYRUP-DELTA] — `quiet_startup` does not suppress it
+///
+/// **What differs.** `quiet_startup` is [`StartupInventory::show_listing`]'s gate and it is
+/// upstream's `getQuietStartup` (`src/acp/pi-settings.ts` @v0.0.33), which gates the *whole* pi-acp
+/// prelude. Here it gates the inventory only — the diagnostics already ignore it (pi's
+/// `showDiagnosticsWhenQuiet: true`) and this banner ignores it too, because a session that cannot
+/// run is not startup verbosity.
+///
+/// **What it costs.** A user who set `quietStartup` still gets one line on a credential-less
+/// launch. That is the line that tells them what to do about it, and suppressing it would leave
+/// `--terminal-login` (`ACP-010`) as the only clue that anything is wrong.
 #[must_use]
-pub fn startup_prelude(session: &AgentSession) -> Option<SessionUpdate> {
-    let markdown = render_markdown(&StartupInventory::of(session))?;
-    Some(SessionUpdate::AgentMessageChunk(ContentChunk::new(
-        ContentBlock::Text(TextContent::new(markdown)),
-    )))
+pub fn startup_updates(
+    model_fallback: Option<&str>,
+    inventory: &StartupInventory,
+) -> Vec<SessionUpdate> {
+    let mut out = Vec::with_capacity(2);
+    // `ACP-017` — first, and before the `ACP-081` suppression can empty the burst entirely.
+    out.extend(
+        model_fallback
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(|m| text_chunk(format!("{MODEL_FALLBACK_PREFIX}{m}"))),
+    );
+    // `ACP-081` — a project with nothing to report contributes no chunk at all.
+    out.extend(render_markdown(inventory).map(text_chunk));
+    out
+}
+
+/// The `session/new` follow-up chunks, ready for its `follow_up` (`ACP-017`, `ACP-066`,
+/// `ACP-068`, `ACP-081`).
+///
+/// Empty when there is nothing to say: no model warning *and* nothing to report (`ACP-081`).
+/// The caller `extend`s its `follow_up` with this, so an empty vector is "no notification at all"
+/// with no branch at the call site.
+#[must_use]
+pub fn startup_prelude(session: &AgentSession) -> Vec<SessionUpdate> {
+    startup_updates(
+        session.model_fallback_message(),
+        &StartupInventory::of(session),
+    )
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 
@@ -389,5 +470,92 @@ mod tests {
             diagnostics: vec![block("Skill conflicts", &[])],
         };
         assert_eq!(render_markdown(&quiet), None);
+    }
+
+    // ---- ACP-017 -------------------------------------------------------------------------------
+
+    /// The text of an `agent_message_chunk`, or a panic naming what came instead.
+    fn chunk_text(update: &SessionUpdate) -> &str {
+        match update {
+            SessionUpdate::AgentMessageChunk(chunk) => match &chunk.content {
+                ContentBlock::Text(text) => text.text.as_str(),
+                other => panic!("the prelude is text, got {other:?}"),
+            },
+            other => panic!("the prelude is an agent_message_chunk, got {other:?}"),
+        }
+    }
+
+    /// **ACP-017** — the credential-less `session/new` says so in-band, and says it FIRST.
+    ///
+    /// The exact string is `AgentSession::model_fallback_message()`'s, which for an empty catalog
+    /// is `cyrup_session_svc::auth_guidance::format_no_models_available_message()`. This asserts
+    /// the two things `ACP-017`'s verify names that the wire can check: the banner is present, and
+    /// it precedes the inventory.
+    #[test]
+    fn a_modelless_session_leads_with_the_model_fallback_warning() {
+        let fallback = "No models available. Use /login to log into a provider via OAuth or API \
+                        key. See:\n  docs/providers.md\n  docs/models.md";
+        let updates = startup_updates(Some(fallback), &fixture());
+        assert_eq!(
+            updates.len(),
+            2,
+            "the banner AND the inventory: {updates:?}"
+        );
+        assert_eq!(chunk_text(&updates[0]), format!("Warning: {fallback}"));
+        assert!(
+            chunk_text(&updates[0]).contains("/login"),
+            "ACP-017: the banner's whole job is to name the remedy"
+        );
+        assert!(
+            chunk_text(&updates[1]).starts_with("## Context"),
+            "ACP-017: the actionable half is FIRST, the inventory second: {updates:?}"
+        );
+        assert_eq!(MODEL_FALLBACK_PREFIX, "Warning: ");
+    }
+
+    /// **ACP-017** — a session whose model resolved cleanly emits the inventory and nothing else.
+    ///
+    /// This is the assertion that stops the banner becoming an unconditional chunk: the accessor
+    /// is `None` for every session that has a model, which is the normal case.
+    #[test]
+    fn a_session_with_a_model_emits_no_banner() {
+        let updates = startup_updates(None, &fixture());
+        assert_eq!(updates.len(), 1, "the inventory alone: {updates:?}");
+        assert!(chunk_text(&updates[0]).starts_with("## Context"));
+    }
+
+    /// **ACP-017** / **ACP-081** — the banner survives `quiet_startup` and an empty inventory, and
+    /// a whitespace-only message is not a banner.
+    ///
+    /// `quiet_startup` gates the inventory (`StartupInventory::show_listing`), not this: see
+    /// [`startup_updates`]'s CYRUP-DELTA. A modelless session in a bare project therefore still
+    /// gets exactly one chunk, where `ACP-081` alone would have sent none.
+    #[test]
+    fn the_banner_is_not_startup_verbosity_and_is_not_whitespace() {
+        let quiet_and_bare = StartupInventory {
+            show_listing: false,
+            listing: vec![block("Skills", &["pdf"])],
+            diagnostics: vec![],
+        };
+        assert_eq!(render_markdown(&quiet_and_bare), None);
+        let updates = startup_updates(
+            Some("Could not restore model a/b. Using c/d"),
+            &quiet_and_bare,
+        );
+        assert_eq!(
+            updates.len(),
+            1,
+            "ACP-017: quiet_startup suppresses the listing, never the banner: {updates:?}"
+        );
+        assert_eq!(
+            chunk_text(&updates[0]),
+            "Warning: Could not restore model a/b. Using c/d",
+            "the resumed-session fallback is carried too, not just the modelless one"
+        );
+
+        // A message that is only whitespace is no message: `ACP-081`'s rule, applied to the banner
+        // so an empty accessor value cannot produce a blank transcript entry.
+        assert!(startup_updates(Some("   \n"), &StartupInventory::default()).is_empty());
+        assert!(startup_updates(None, &StartupInventory::default()).is_empty());
     }
 }

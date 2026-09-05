@@ -88,7 +88,7 @@ use agent_client_protocol::schema::v1::{
     NewSessionResponse, PromptRequest, PromptResponse, SessionId, SessionInfo as AcpSessionInfo,
     SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, ToolCallContent,
-    ToolCallId as AcpToolCallId,
+    ToolCallId as AcpToolCallId, UsageUpdate,
 };
 use agent_client_protocol::{BoxFuture, Client, ConnectionTo, Responder};
 use cyrup_core::{Content, Message};
@@ -395,6 +395,29 @@ pub fn find_stored(root: &SessionsRoot, id: &AcpSessionId) -> Option<StoredSessi
         });
     }
     None
+}
+
+/// Check the live session's **own** reported path into a [`SessionFile`] (`NEW`, area 4d).
+///
+/// The disk half of [`SessionManager::live_session_file`], split out because the slot read needs an
+/// `AgentSessionRuntime` and this does not: what it decides — `None` for a session that has no file
+/// yet, `None` for a path that is not a contained `.jsonl`, `Some` otherwise — is the whole of the
+/// new behaviour that can be wrong.
+///
+/// `reported` is `AgentSession::session_file()`, which for a `DiskStore` is `store.path()` and is
+/// therefore `Some` **whether or not the file has been created**: `persist_last` only calls
+/// `store.create_exclusive(..)` once `has_assistant_message()` is true, so a session that has not
+/// yet produced an assistant reply names a path that does not exist. That is deliberate here — the
+/// path is the resume target, and `SessionTarget::Resume` on a missing file is the manager's
+/// `flushed = false` open, not an error. A disk scan cannot produce this answer at all, which is
+/// exactly the finding.
+///
+/// The containment check is not defence in depth: the path comes from the session rather than from
+/// a `read_dir` of the root, so [`SessionFile::resolve`] is what keeps `session/load`'s resume
+/// target inside the sessions root, the same guard [`SessionManager::delete_session`] applies to
+/// the same value.
+fn live_file(root: &SessionsRoot, reported: Option<PathBuf>) -> Option<SessionFile> {
+    SessionFile::resolve(root, &reported?).ok()
 }
 
 /// Every stored session under `root`, newest first, optionally restricted to one cwd
@@ -869,8 +892,8 @@ fn purge_partial_session_file(root: &SessionsRoot, path: &Path) -> bool {
 ///
 /// `ACP-209` prescribes a critical section that begins with the live check re-taken inside the
 /// lock; `ACP-212` requires `session/load` on the already-live id to still produce exactly one
-/// `factory.build` and one `SessionReplaced`. Both cannot hold of one function, which is what
-/// `ACP-225` says. The rule, taken once and asserted both ways:
+/// `factory.build` and one eviction of the outgoing session. Both cannot hold of one function,
+/// which is what `ACP-225` says. The rule, taken once and asserted both ways:
 ///
 /// * **`session/prompt` short-circuits on live** — [`RestoreGate::enter`].
 /// * **`session/load` bypasses the short-circuit** — [`RestoreGate::rebuild`], which still takes
@@ -1073,6 +1096,15 @@ impl TurnAgent for AcpTurnAgent {
 
     fn snapshot<'a>(&'a self, abs: PathBuf, named: PathBuf) -> BoxFuture<'a, FileSnapshot> {
         self.inner.snapshot(abs, named)
+    }
+
+    /// Forwarded for the reason [`TurnAgent::usage`]'s own doc gives: *"a wrapper around
+    /// [`RuntimeAgent`] must forward this method, exactly as it forwards [`TurnAgent::snapshot`],
+    /// or the client's meter stays empty."* Inheriting the `None` default here compiled, passed
+    /// every test of `usage_update` in isolation, and shipped a context-window meter that never
+    /// filled — the emission was built and tested but no production path ever asked for it.
+    fn usage<'a>(&'a self) -> BoxFuture<'a, Option<UsageUpdate>> {
+        self.inner.usage()
     }
 
     /// `ACP-061` / `ACP-154` — re-install the ui sinks on whatever session is live now.
@@ -1468,11 +1500,6 @@ impl SessionManager {
         *self.last_cwd.lock().await = Some(cwd);
     }
 
-    /// Install a freshly built runtime, disposing whatever was live (`ACP-061`, `ACP-212`).
-    ///
-    /// Upstream's `closeAllExcept(keep)`; here the eviction is structural. `runtime_ready` is
-    /// invoked on the NEW runtime before the slot is published, so `ACP-023`'s signal watcher is
-    /// armed before anything can be dispatched against it.
     /// The three tasks a live session needs, spawned together so a half-installed session cannot
     /// exist.
     ///
@@ -1530,15 +1557,104 @@ impl SessionManager {
         }
     }
 
+    /// The teardown every path that removes a [`SessionBinding`] owes it (`ACP-061`, `ACP-224`).
+    ///
+    /// Written once and called from all three removers — [`SessionManager::install`],
+    /// [`SessionManager::unbind`] and [`SessionManager::unbind_any`] — because the two statements
+    /// are not interchangeable and the reasons are different for each:
+    ///
+    /// * `turn.shutdown()` rather than dropping the handle, because `TurnActor::run`'s teardown is
+    ///   what answers an outstanding `session/prompt` with `cancelled`. Dropping reaches the same
+    ///   code path, but saying so is the difference between a guarantee and a coincidence.
+    /// * `pump.abort()`, because the pump's stream would otherwise outlive the session it describes
+    ///   and go on pushing `config_option_update`s for a runtime the client has been told is gone.
+    ///
+    /// Sync and infallible: both halves are a channel send and a `JoinHandle::abort`, so this is
+    /// callable from `session/cancel`'s dispatch-loop neighbourhood as well as from an async path.
+    fn shut_down_binding(binding: Option<SessionBinding>) {
+        if let Some(binding) = binding {
+            binding.turn.shutdown();
+            binding.pump.abort();
+        }
+    }
+
+    /// Take the binding out and tear it down, but only when it names `id`.
+    ///
+    /// `NEW` (area 4d) — `session/delete` of the **live** session used to leave its binding
+    /// installed: `delete_session` took the session out of the slot and disposed the runtime, and
+    /// nothing touched `self.bound`. The residue was a turn actor and a config pump holding
+    /// `Arc<AgentSessionRuntime>` clones of a disposed runtime until the next
+    /// [`SessionManager::install`] replaced them, with [`SessionManager::turn_for`] still returning
+    /// `Some` for the deleted id — so a later `session/cancel` for a session the client was told is
+    /// gone reached a live actor over a disposed agent instead of being the no-op
+    /// [`SessionManager::request_cancel`]'s doc claims. `install` alone stated the teardown
+    /// contract; this is the same contract applied at the other exit.
+    ///
+    /// The id filter is what makes this safe to call unconditionally: the binding's `session_id` is
+    /// the live session's id (both are written by `install` from the same `LiveSession`), so a
+    /// delete aimed at some other, merely-stored session is a no-op here.
+    fn unbind(&self, id: &SessionId) {
+        let taken = match self.bound.lock() {
+            Ok(mut bound) => {
+                if bound.as_ref().is_some_and(|b| b.session_id == *id) {
+                    bound.take()
+                } else {
+                    None
+                }
+            }
+            // A poisoned lock means a panic in a `Mutex` guard, and this crate contains no panic.
+            Err(_) => None,
+        };
+        Self::shut_down_binding(taken);
+    }
+
+    /// Take whatever binding is installed and tear it down, whichever session it names.
+    ///
+    /// `ACP-005`'s half of [`SessionManager::shutdown`]: at connection teardown there is no id to
+    /// match against — the connection is going away and every task it owns goes with it.
+    fn unbind_any(&self) {
+        let taken = match self.bound.lock() {
+            Ok(mut bound) => bound.take(),
+            Err(_) => None,
+        };
+        Self::shut_down_binding(taken);
+    }
+
+    /// Install a freshly built runtime, disposing whatever was live (`ACP-061`, `ACP-212`).
+    ///
+    /// Upstream's `closeAllExcept(keep)`; here the eviction is structural. `runtime_ready` is
+    /// invoked on the NEW runtime before the slot is published, so `ACP-023`'s signal watcher is
+    /// armed before anything can be dispatched against it.
+    ///
+    /// # [CYRUP-DELTA] — the eviction is a `session_shutdown{reason:"quit"}`, not a `SessionReplaced`
+    ///
+    /// **What differs.** `ACP-212`'s verify was written as *"exactly one `factory.build` and one
+    /// `SessionReplaced`"*, and the second half is not satisfiable by this code path.
+    /// `AgentSessionRuntime::notify_replaced` has exactly one caller in the workspace —
+    /// `AgentSessionRuntime::install_inner`, i.e. the runtime replacing its OWN session — and the
+    /// ACP host never routes through it: `AcpHost::build_runtime` builds a *fresh*
+    /// `AgentSessionRuntime` per session (`crates/cyrup/src/acp_host.rs`), so there is no
+    /// generation bump on the outgoing runtime to carry a `SessionReplaced`. The eviction here is
+    /// `previous.runtime.dispose()`, which is `dispose_with("quit", ..)`.
+    ///
+    /// **What it costs.** An extension with a `session_shutdown` handler on the outgoing session
+    /// sees `reason:"quit"` where a switch happened, on every `session/new`, `session/load` and
+    /// prompt-restore that evicts a live session. The in-flight `session/prompt` is still answered
+    /// — `dispose` closes the run fanout, and `TurnActor::run`'s `Wake::Event(None)` arm settles it
+    /// as `Replaced` (`ACP-154`) — so `ACP-061`'s "observable rather than silent" clause holds; it
+    /// is the *event name* that differs, and it is recorded here rather than asserted away.
+    ///
+    /// Routing the replacement through `AgentSessionRuntime::install_inner` instead would emit the
+    /// `SessionReplaced` the unit names, at the cost of one runtime shared across every ACP session
+    /// — which is `ACP-023`'s per-session-runtime shape, deliberately chosen elsewhere. The
+    /// divergence is therefore kept and named, not closed.
     pub async fn install(&self, session: LiveSession) {
         self.host.runtime_ready(&session.runtime);
         let binding = self.bind(&session).await;
         let previous = self.live.lock().await.replace(session);
 
-        // Replace the plumbing in the same breath as the slot. The OLD turn actor is shut down
-        // rather than dropped, because `TurnActor::run`'s teardown is what answers an outstanding
-        // `session/prompt` with `cancelled` — dropping the handle reaches the same code path, but
-        // saying so is the difference between a guarantee and a coincidence.
+        // Replace the plumbing in the same breath as the slot; the teardown contract is
+        // `shut_down_binding`'s.
         let previous_binding = match self.bound.lock() {
             Ok(mut bound) => bound.replace(binding),
             // A poisoned lock means a panic in a `Mutex` guard, and this crate contains no panic.
@@ -1546,17 +1662,62 @@ impl SessionManager {
             // losing the old one costs a shutdown message the drop of its handle also sends.
             Err(_) => None,
         };
-        if let Some(previous_binding) = previous_binding {
-            previous_binding.turn.shutdown();
-            // The pump's stream would otherwise outlive the session it describes and go on pushing
-            // `config_option_update`s for a runtime the client has been told is gone.
-            previous_binding.pump.abort();
-        }
+        Self::shut_down_binding(previous_binding);
 
         if let Some(previous) = previous {
             // `close` is `AgentSessionRuntime::dispose().await` — upstream's swallowing
             // try/catch has no counterpart, because `dispose` is infallible.
             previous.runtime.dispose().await;
+        }
+    }
+
+    /// Tear the connection down: take the live session out of the slot, stop its plumbing and
+    /// dispose its runtime (`ACP-005`).
+    ///
+    /// Port of pi-acp v0.0.33 `src/index.ts`'s `shutdown()` — `agent.agent.dispose()`, registered
+    /// on both `stdin.on('end')` and `stdin.on('close')` — which reaches `agent.ts`'s
+    /// `dispose(){ this.sessions.disposeAll() }`.
+    ///
+    /// # Why this exists at all
+    ///
+    /// **Closing the pipe is the ACP host's NORMAL termination**: the editor quits, or the user
+    /// closes the project window. Before this, every `dispose` in the crate was on a *replace* or
+    /// *delete* path — [`SessionManager::install`], [`SessionManager::delete_session`] via
+    /// [`LiveSession::dispose_and_take_path`], [`SessionManager::cleanup_failed_new_session`] —
+    /// and none of them runs when the transport ends. So on the ordinary exit
+    /// `AgentSessionRuntime::dispose` never ran: no `session_shutdown{reason:"quit"}` was emitted,
+    /// so no extension flushed or deregistered; `ExtensionHost::invalidate_live` ran only through
+    /// the `impl Drop for AgentSession` backstop; and `session_cancel` never fired, so every
+    /// tracked detached bash process group the turn started — `LocalProc::exec`'s `setsid` group,
+    /// drained only by `kill_tracked_detached_children()` — outlived the agent, one orphaned group
+    /// per still-running background command per editor quit. The signal watcher (`ACP-023`) covers
+    /// SIGTERM/SIGHUP only, which is why stdin EOF was the exposed path.
+    ///
+    /// # The order, and why it is this order
+    ///
+    /// 1. **Take the slot first.** Nothing can be dispatched against a session that is no longer
+    ///    in it, so no handler can hand the runtime to a prompt while it is being disposed.
+    /// 2. **Then the binding** ([`SessionManager::unbind_any`]). `TurnActor::run`'s teardown is
+    ///    what answers an outstanding `session/prompt` with `cancelled`, and doing it before the
+    ///    dispose means the client is answered by the actor rather than by the closed run fanout.
+    /// 3. **Then `dispose().await`.** This is the statement the whole unit is about: it emits
+    ///    `session_shutdown{reason:"quit"}` and fires `session_cancel`.
+    ///
+    /// # Idempotent, and safe with nothing live
+    ///
+    /// Every step is a take: a second call finds an empty slot and no binding and does nothing, and
+    /// a call on a manager that never installed a session is a no-op. That matters because the
+    /// caller is an exit path — `serve`/`serve_stdio` returning, and the hang-up arm above it — and
+    /// an exit path must be callable more than once without the callers having to agree on which of
+    /// them owns it.
+    pub async fn shutdown(&self) {
+        // 1. Out of the slot, guard released before anything awaits on the runtime.
+        let live = self.live.lock().await.take();
+        // 2. The plumbing, whichever session it names.
+        self.unbind_any();
+        // 3. The statement `ACP-005` exists for.
+        if let Some(live) = live {
+            live.runtime.dispose().await;
         }
     }
 
@@ -1583,6 +1744,58 @@ impl SessionManager {
     pub fn locate(&self, id: &SessionId) -> Result<StoredSession, AcpFailure> {
         let parsed = AcpSessionId::parse(&id.0)?;
         find_stored(&self.host.sessions_root(), &parsed).ok_or_else(|| Self::unknown_session(id))
+    }
+
+    /// The file the **live** session is writing, when `id` names it (`NEW`, area 4d).
+    ///
+    /// The slot read [`SessionManager::locate`] cannot do: `locate` is
+    /// [`AcpSessionId::parse`] + [`find_stored`], a pure scan of the sessions root, and a live
+    /// session's JSONL does not exist on disk until its first assistant message
+    /// (`cyrup_session`'s `persist_last` reaches `store.create_exclusive` only once
+    /// `has_assistant_message()` is true). So a client that sends `session/new`, gets an id back
+    /// and — before any reply exists — sends `session/load` for that id got
+    /// `Unknown sessionId: <id>` for the session that was live in the slot at that moment. Zed does
+    /// exactly this on window/history restore, and `ACP-Q7`'s decision that a modelless session is
+    /// not refused at `session/new` makes it the *normal* case on a credential-less first run:
+    /// every session created there is one that can never produce an assistant message.
+    ///
+    /// Upstream never had the problem because its sidecar carried the answer:
+    /// `SessionManager.create` upserts `sessionId -> {cwd, sessionFile}` before the session object
+    /// exists (`src/acp/session.ts`), and `findStoredSession` reads `this.store.get(sessionId)`
+    /// **first**, falling back to `findPiSession`'s walk (`src/acp/agent.ts`). ADR-0028 §5 cut the
+    /// sidecar because the id → path map is derivable from the filename; what it also cut is the
+    /// only record of a file that has not been written yet. The live slot is that record, and it is
+    /// authoritative — it is the session, not a cache of it.
+    ///
+    /// Returns `None` for an id that is not the live one, for a live session with no file at all
+    /// (`persist == false`), and for a reported path that is not a contained `.jsonl`
+    /// ([`live_file`]).
+    async fn live_session_file(&self, id: &SessionId) -> Option<SessionFile> {
+        // `get` filters on the id and clones the `Arc` out, so the slot lock is released before the
+        // session is read.
+        let runtime = self.get(id).await?;
+        let reported = runtime.session().await.session_file().await;
+        live_file(&self.host.sessions_root(), reported)
+    }
+
+    /// The JSONL `session/load` should resume for `id`: the live session's own, else the scan's.
+    ///
+    /// `NEW` (area 4d). The live slot is consulted **first** for the reason on
+    /// [`SessionManager::live_session_file`]; [`SessionManager::locate`] is the fallback and stays
+    /// the sole answer for every id this connection is not currently serving.
+    ///
+    /// `ACP-291` is unaffected: an id that reaches the live branch is one cyrup minted itself
+    /// (`session/new` reads it back off `AgentSession::session_id`), so it is well formed by
+    /// construction, and every other id still goes through `locate`'s [`AcpSessionId::parse`].
+    ///
+    /// # Errors
+    ///
+    /// As [`SessionManager::locate`], and only from it.
+    async fn load_target(&self, id: &SessionId) -> Result<SessionFile, AcpFailure> {
+        match self.live_session_file(id).await {
+            Some(file) => Ok(file),
+            None => Ok(self.locate(id)?.file),
+        }
     }
 
     /// Build a runtime for `stored` at `cwd` and publish it as the live session.
@@ -1868,8 +2081,17 @@ impl SessionManager {
     ///
     /// [`RestoreGate::rebuild`] takes the same lock as the prompt path and then builds
     /// unconditionally, so `session/load` on the **already-live** id still yields exactly one
-    /// `factory.build` and one `SessionReplaced` (`ACP-212`) and still re-advertises commands,
-    /// which is upstream's stated reason for closing the id first.
+    /// `factory.build` and still re-advertises commands, which is upstream's stated reason for
+    /// closing the id first. The eviction of the outgoing runtime is a
+    /// `session_shutdown{reason:"quit"}` rather than the `SessionReplaced` `ACP-212` names — see
+    /// the CYRUP-DELTA on [`SessionManager::install`], which is where that divergence lives.
+    ///
+    /// # `NEW` (area 4d) — the live slot answers before the disk scan
+    ///
+    /// The resume target comes from [`SessionManager::load_target`], not from
+    /// [`SessionManager::locate`] directly: the already-live id is also the id most likely to have
+    /// **no file on disk yet**, and a pure scan answers `Unknown sessionId` for it. That path and
+    /// this one are the same request in Zed's history restore.
     ///
     /// # Errors
     ///
@@ -1879,7 +2101,11 @@ impl SessionManager {
         // `ACP-211` — first statement. `session/load` with a relative cwd performs no filesystem
         // work at all, which is what the unit's verify asserts.
         let cwd = AbsCwd::parse(req.cwd.clone())?;
-        let stored = self.locate(&req.session_id)?;
+        // `NEW` (area 4d) — the live slot before the disk scan. See
+        // [`SessionManager::load_target`]: a session that has not yet written an assistant message
+        // has no `*.jsonl` for `locate` to find, and answering `Unknown sessionId` for the session
+        // that is live in the slot at that moment is the bug.
+        let file = self.load_target(&req.session_id).await?;
 
         // Upstream's `opts?.cwd ?? stored.cwd`: the request's cwd wins, because a client that moved
         // a project is telling the agent where it is now.
@@ -1888,7 +2114,7 @@ impl SessionManager {
             .rebuild(|| {
                 self.build_and_install(
                     &req.session_id,
-                    SessionTarget::Resume(stored.file.path().to_path_buf()),
+                    SessionTarget::Resume(file.path().to_path_buf()),
                     cwd.clone(),
                 )
             })
@@ -1926,6 +2152,21 @@ impl SessionManager {
     /// ordering it enforces cannot be expressed by returning a value:
     /// [`crate::respond_then_notify`] writes the response first by construction, which is right for
     /// `session/new` and wrong for a load.
+    ///
+    /// # `ACP-217` — there is no [`crate::HandlerOutcome`] variant of this, deliberately
+    ///
+    /// A `load_session(&self, req) -> Result<HandlerOutcome<LoadSessionResponse>, AcpFailure>` used
+    /// to sit beside this function as a seam for the handler table, carrying a CYRUP-DELTA that
+    /// said `connection.rs` had not been switched over yet and that `session/load` therefore
+    /// shipped with **no** replay and **no** command advertisement. That switch had already
+    /// happened — `connection.rs`'s `session/load` arm dispatches `handle_load`, and the wire test
+    /// proves both are emitted — so the seam was dead code whose doc told its next reader that a
+    /// shipped, tested feature was missing. It is deleted rather than re-documented: the shape
+    /// cannot express `ACP-217` at all (`crate::respond_then_notify` writes the response first by
+    /// construction, and `LoadSessionResponse` names no session, so `SessionScoped` yields `None`
+    /// and the follow-up is not addressable), and leaving a `pub` function that *looks* like the
+    /// handler is an invitation to route the arm back through it — which is the exact ordering bug
+    /// this function exists to prevent.
     ///
     /// # `ACP-Q35`, decided — replay from the spawned task, not from the dispatch loop
     ///
@@ -1986,38 +2227,6 @@ impl SessionManager {
         Ok(())
     }
 
-    /// `session/load` in [`crate::HandlerOutcome`] shape, for the handler table as it stands today.
-    ///
-    /// # [CYRUP-DELTA] — this signature cannot express `ACP-217`, and that is why `handle_load` exists
-    ///
-    /// **What differs.** `ACP-217` requires every replay notification to be on the wire **before**
-    /// the response, and `crate::respond_then_notify` — which is what `connection.rs` currently
-    /// applies to this function's result — writes the response first, by construction and on
-    /// purpose. `LoadSessionResponse` additionally names no session, so `SessionScoped` yields
-    /// `None` and the follow-up is not addressable at all. Both facts are `lib.rs`'s and neither is
-    /// a defect there.
-    ///
-    /// **What it costs.** Until `connection.rs`'s `session/load` arm is switched to
-    /// [`SessionManager::handle_load`] — a four-line change filed as this module's interface change
-    /// — a `session/load` restores the session correctly and emits **no** replay and **no**
-    /// command advertisement. The transcript is not lost (it is on disk and in the rebuilt
-    /// session); the client simply is not told it. This function returns both halves in
-    /// `follow_up` so that a caller which *can* address them still gets them, in the only order
-    /// this shape can carry.
-    ///
-    /// # Errors
-    ///
-    /// As [`SessionManager::prepare_load`].
-    pub async fn load_session(
-        &self,
-        req: &LoadSessionRequest,
-    ) -> Result<HandlerOutcome<LoadSessionResponse>, AcpFailure> {
-        let outcome = self.prepare_load(req).await?;
-        let mut follow_up = outcome.replay;
-        follow_up.extend(outcome.follow_up);
-        Ok(HandlerOutcome::with_follow_up(outcome.response, follow_up))
-    }
-
     /// `session/list` (`ACP-203`…`ACP-208`, `ACP-223`).
     ///
     /// Port of pi-acp v0.0.33 `agent.ts`'s `listSessions`. One streaming pass over
@@ -2052,6 +2261,18 @@ impl SessionManager {
     /// `response.nextCursor == null` sees a difference. Both spellings mean "no more pages" to
     /// every client that reads the field's value, and `the_last_page_omits_the_cursor_and_keeps_meta`
     /// pins the actual bytes so the claim is checked rather than asserted.
+    ///
+    /// # `NEW` (area 4d), decided — this stays a pure disk scan, unlike `session/load`
+    ///
+    /// [`SessionManager::load_target`] consults the live slot before [`find_stored`], because a
+    /// live session that has not yet written an assistant message has no `*.jsonl` and answering
+    /// `Unknown sessionId` for it is a bug on a reachable path. **The same session is also absent
+    /// from this listing, and that is left alone**: upstream's `listSessions` is disk-only too
+    /// (`listPiSessions` walks files and consults no live map), so an unlisted just-created session
+    /// is parity rather than a divergence, and synthesising a row for it would mean inventing the
+    /// `title` and `updatedAt` the projection reads off a transcript that does not exist. The row
+    /// appears the moment the session's first assistant message lands, which is also the moment it
+    /// becomes something a picker can usefully show.
     ///
     /// # Errors
     ///
@@ -2149,7 +2370,19 @@ impl SessionManager {
         // `ACP-219` — if the target is the live session, take it out of the slot and dispose it
         // BEFORE anything touches the file. Its own `session_file()` is the authoritative path for
         // that case; `find_stored` is the fallback for a session that is merely on disk.
-        let live_path = match self.take_live(&req.session_id).await {
+        let taken = self.take_live(&req.session_id).await;
+
+        // `NEW` (area 4d) — and the binding with it. `install`'s teardown contract applies at every
+        // exit, not only at a replacement: without this the deleted session's turn actor and config
+        // pump survive, `turn_for` keeps answering `Some` for the deleted id, and a later
+        // `session/cancel` for it reaches a live actor over a disposed agent. Unconditional because
+        // `unbind` filters on the binding's own id, so a delete aimed at a merely-stored session is
+        // a no-op here. Before the dispose, so an outstanding `session/prompt` is answered by
+        // `TurnActor::run`'s teardown (`cancelled`, `ACP-224`'s stated cost) rather than by the run
+        // fanout closing underneath it.
+        self.unbind(&req.session_id);
+
+        let live_path = match taken {
             // `LiveSession::dispose_and_take_path` consumes the session: there is no other way to
             // learn the live session's path, so the dispose cannot be dropped or reordered here.
             Some(live) => live.dispose_and_take_path().await,
@@ -2199,8 +2432,20 @@ impl SessionManager {
         req: &SetSessionModeRequest,
     ) -> Result<HandlerOutcome<SetSessionModeResponse>, AcpFailure> {
         let session = self.live_session(&req.session_id).await?;
-        let (_applied, response) =
+        let (application, response) =
             crate::config_options::apply_mode(&session, &req.mode_id).await?;
+        // `ACP-072` — sent HERE, not returned as `follow_up`. `SetSessionModeResponse` carries no
+        // session, so `SessionScoped` yields `None` for it and `respond_then_notify` would drop
+        // these on the floor; that is the trait doing its job, not an obstacle to route around.
+        // The echo is non-empty only when [`crate::config_options::pump_emits_mode_change`] is
+        // false — i.e. the applied level equals the previous one, no `ThinkingLevelChanged` is
+        // observed, and the pump will therefore never speak. Without this a no-op `set_mode`
+        // answers `{}` and says nothing, leaving a client that optimistically moved its mode
+        // selector wrong for the rest of the session.
+        let wire = self.wire();
+        for update in application.echo {
+            wire.notify(&req.session_id, update);
+        }
         Ok(HandlerOutcome::plain(response))
     }
 
@@ -2427,7 +2672,8 @@ impl SessionManager {
 mod tests {
     use super::*;
     use cyrup_core::{AssistantMessage, ProviderId, StopReason, ToolCallId as CoreToolCallId};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use cyrup_session_svc::PromptAccepted;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     // ---------------------------------------------------------------------------------------
     // Fixtures
@@ -3505,6 +3751,280 @@ mod tests {
                 "{hostile:?} -> {err:?}"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // NEW (area 4d) / ACP-005 — the binding teardown contract, applied at every exit
+    // ---------------------------------------------------------------------------------------
+
+    /// A [`TurnAgent`] with no session behind it.
+    ///
+    /// Enough to spawn a **real** `TurnActor`, so the binding these cases tear down is the real
+    /// plumbing rather than a mock of it — which is the whole point: the residue the finding
+    /// describes is a live actor and a live pump, and a fake binding would not have either.
+    /// Nothing here is ever prompted (these cases assert teardown), so both admission paths refuse.
+    struct InertAgent;
+
+    impl TurnAgent for InertAgent {
+        fn start_run<'a>(
+            &'a self,
+            _input: UserInput,
+        ) -> BoxFuture<'a, Result<RunStarted, SessionServiceError>> {
+            Box::pin(async { Err(SessionServiceError::ModelNotFound("inert".into())) })
+        }
+        fn fold_into_run<'a>(
+            &'a self,
+            _input: UserInput,
+        ) -> BoxFuture<'a, Result<PromptAccepted, SessionServiceError>> {
+            Box::pin(async { Err(SessionServiceError::ModelNotFound("inert".into())) })
+        }
+        fn abort<'a>(&'a self) -> BoxFuture<'a, ()> {
+            Box::pin(async {})
+        }
+    }
+
+    /// Sinks nothing: these cases assert on the binding, not on the wire.
+    struct NullSink;
+
+    impl TurnSink for NullSink {
+        fn notify(&self, _session_id: &SessionId, _update: SessionUpdate) {}
+    }
+
+    /// Set when the config-pump stand-in's future is **dropped**, which is what
+    /// `JoinHandle::abort` does and the only way to observe an abort of a task that would
+    /// otherwise never finish.
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Install a real [`SessionBinding`] for `id` without a runtime.
+    ///
+    /// Returns the agent — whose last surviving `Arc` is the actor's, so `strong_count() == 1`
+    /// means `TurnActor::run` has returned — and the pump's drop flag.
+    fn bind_inert(mgr: &SessionManager, id: &SessionId) -> (Arc<InertAgent>, Arc<AtomicBool>) {
+        let agent = Arc::new(InertAgent);
+        let turn = crate::turn::TurnActor::spawn(
+            id.clone(),
+            AbsCwd::parse(PathBuf::from("/proj")).unwrap(),
+            Arc::clone(&agent) as Arc<dyn TurnAgent>,
+            Box::new(NullSink),
+        );
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = DropFlag(Arc::clone(&dropped));
+        let pump = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        *mgr.bound.lock().unwrap() = Some(SessionBinding {
+            session_id: id.clone(),
+            turn,
+            pump,
+            rename_echo: crate::commands::RenameEcho::default(),
+        });
+        (agent, dropped)
+    }
+
+    /// Spin the scheduler until `cond` holds, or give up. Both observations below are the end of a
+    /// spawned task, which is not synchronous with the call that ends it.
+    async fn settles(cond: impl Fn() -> bool) -> bool {
+        for _ in 0..1000 {
+            if cond() {
+                return true;
+            }
+            tokio::task::yield_now().await;
+        }
+        cond()
+    }
+
+    /// NEW (area 4d) — `session/delete` must apply `install`'s teardown contract to the binding it
+    /// is deleting. Before the fix `delete_session` took the session out of the slot and disposed
+    /// the runtime and never touched `self.bound`, so the turn actor and the config pump survived
+    /// holding `Arc` clones of a disposed runtime, and `turn_for` kept answering `Some` for the
+    /// deleted id — which is what routes a later `session/cancel` to a stale actor instead of
+    /// making it the no-op `request_cancel`'s doc claims.
+    #[tokio::test]
+    async fn deleting_a_session_tears_down_the_binding_that_names_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(host_at(tmp.path()));
+        let id = SessionId::new("bound_one");
+        let (agent, pump_dropped) = bind_inert(&mgr, &id);
+        assert!(mgr.turn_for(&id).is_some(), "the fixture installed nothing");
+
+        mgr.delete_session(&DeleteSessionRequest::new(id.clone()))
+            .await
+            .unwrap();
+
+        assert!(
+            mgr.turn_for(&id).is_none(),
+            "session/cancel for a deleted session still reaches its turn actor"
+        );
+        assert!(
+            settles(|| pump_dropped.load(Ordering::SeqCst)).await,
+            "the config pump outlived the session it describes"
+        );
+        assert!(
+            settles(|| Arc::strong_count(&agent) == 1).await,
+            "the turn actor outlived the session it answers for"
+        );
+    }
+
+    /// The other half of the same rule: `unbind` filters on the binding's own id, so deleting some
+    /// merely-stored session must not tear down the live one's plumbing. Without the filter,
+    /// `delete_session`'s unconditional call would evict a session the client never asked about.
+    #[tokio::test]
+    async fn deleting_a_different_session_leaves_the_live_binding_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_session(
+            &tmp.path().join("--proj-a--"),
+            "0000_other.jsonl",
+            "other_one",
+            "/proj/a",
+            "2024-01-02T03:04:05.000Z",
+            &[],
+        );
+        let mgr = SessionManager::new(host_at(tmp.path()));
+        let id = SessionId::new("bound_one");
+        let (agent, pump_dropped) = bind_inert(&mgr, &id);
+
+        mgr.delete_session(&DeleteSessionRequest::new(SessionId::new("other_one")))
+            .await
+            .unwrap();
+
+        assert!(
+            mgr.turn_for(&id).is_some(),
+            "deleting another session evicted the live one's turn actor"
+        );
+        assert!(!pump_dropped.load(Ordering::SeqCst));
+        assert_eq!(Arc::strong_count(&agent), 2);
+    }
+
+    /// ACP-005 — the stdin-EOF path. `shutdown()` must take the live session out of the slot, stop
+    /// its plumbing and dispose its runtime. The dispose half needs a real `AgentSessionRuntime`
+    /// and is a `cyrup-it` assertion (named in this module's report); the two halves reachable
+    /// here are the slot take and the binding teardown, and the teardown is the one that used to
+    /// have no owner at all on this path.
+    #[tokio::test]
+    async fn shutdown_stops_the_turn_actor_and_the_config_pump() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(host_at(tmp.path()));
+        let id = SessionId::new("bound_one");
+        let (agent, pump_dropped) = bind_inert(&mgr, &id);
+
+        mgr.shutdown().await;
+
+        assert!(
+            mgr.turn_for(&id).is_none(),
+            "the connection went away and left its turn actor behind"
+        );
+        assert!(
+            settles(|| pump_dropped.load(Ordering::SeqCst)).await,
+            "the config pump outlived the connection"
+        );
+        assert!(
+            settles(|| Arc::strong_count(&agent) == 1).await,
+            "the turn actor outlived the connection"
+        );
+    }
+
+    /// ACP-005's other requirement, and the reason it is stated on the function: `shutdown()` is an
+    /// exit path with more than one caller — `serve`/`serve_stdio` returning, and the hang-up arm
+    /// above it — so it must be callable twice, and callable when nothing was ever installed,
+    /// without the callers having to agree on which of them owns it.
+    #[tokio::test]
+    async fn shutdown_is_idempotent_and_safe_with_nothing_live() {
+        let mgr = SessionManager::new(null_host());
+        mgr.shutdown().await;
+        mgr.shutdown().await;
+        assert!(mgr.get(&SessionId::new("anything")).await.is_none());
+        assert!(mgr.turn_for(&SessionId::new("anything")).is_none());
+
+        // And a second shutdown after a real teardown is still a no-op.
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(host_at(tmp.path()));
+        let id = SessionId::new("bound_one");
+        let (_agent, pump_dropped) = bind_inert(&mgr, &id);
+        mgr.shutdown().await;
+        mgr.shutdown().await;
+        assert!(settles(|| pump_dropped.load(Ordering::SeqCst)).await);
+        assert!(mgr.turn_for(&id).is_none());
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // NEW (area 4d) — a live session that has not flushed is still resolvable by session/load
+    // ---------------------------------------------------------------------------------------
+
+    /// NEW — the answer the disk scan cannot give. `AgentSession::session_file()` names the path a
+    /// `DiskStore` *will* write, and `persist_last` only creates it once the session has an
+    /// assistant message — so the file of a freshly created session does not exist, and
+    /// `find_stored` (a `read_dir` of the sessions root) cannot see it. `live_file` accepts it
+    /// anyway, because the live slot is the session rather than a cache of it, and still refuses
+    /// everything `SessionFile::resolve` refuses: this value reaches a resume target, so the
+    /// containment check is not decoration.
+    #[test]
+    fn the_live_sessions_own_file_is_accepted_before_it_exists_and_only_inside_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = SessionsRoot(tmp.path().join("sessions"));
+
+        let unflushed = root.path().join("--proj-a--").join("0000_live.jsonl");
+        assert!(
+            !unflushed.exists(),
+            "the fixture is about a file that is NOT there"
+        );
+        assert_eq!(
+            live_file(&root, Some(unflushed.clone()))
+                .map(|f| f.path().to_path_buf())
+                .as_deref(),
+            Some(unflushed.as_path()),
+            "a session/load for a live session that has not flushed answered Unknown sessionId"
+        );
+
+        // A session with no file at all (`SessionConfig.persist == false`).
+        assert!(live_file(&root, None).is_none());
+        // Outside the sessions root, and a contained non-`.jsonl`: both refused.
+        assert!(live_file(&root, Some(tmp.path().join("elsewhere.jsonl"))).is_none());
+        assert!(live_file(&root, Some(root.path().join("settings.json"))).is_none());
+    }
+
+    /// NEW — consulting the live slot first must not weaken the fallback. With nothing live,
+    /// `load_target` is exactly `locate`: the stored file for a known id, the byte-exact
+    /// `Unknown sessionId` for an id nothing carries, and `ACP-291`'s validator sentence for an id
+    /// that must never become a path.
+    #[tokio::test]
+    async fn a_load_with_nothing_live_still_resolves_through_the_disk_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_session(
+            &tmp.path().join("--proj-a--"),
+            "0000_stored.jsonl",
+            "stored_one",
+            "/proj/a",
+            "2024-01-02T03:04:05.000Z",
+            &[],
+        );
+        let mgr = SessionManager::new(host_at(tmp.path()));
+
+        let file = mgr
+            .load_target(&SessionId::new("stored_one"))
+            .await
+            .unwrap();
+        assert_eq!(file.path(), path);
+
+        assert_eq!(
+            err_of(mgr.load_target(&SessionId::new("nothing-here")).await),
+            AcpFailure::InvalidParams {
+                message: "Unknown sessionId: nothing-here".into()
+            }
+        );
+        assert!(
+            matches!(
+                err_of(mgr.load_target(&SessionId::new("../../etc/passwd")).await),
+                AcpFailure::InvalidParams { message } if message.starts_with("Session id must be")
+            ),
+            "ACP-291 must still run on the fallback"
+        );
     }
 
     // ---------------------------------------------------------------------------------------

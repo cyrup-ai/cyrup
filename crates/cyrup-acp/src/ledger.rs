@@ -323,30 +323,109 @@ pub enum Push {
     Nothing,
     /// The snapshot is a strict extension of what was already sent; this is the suffix.
     Append(String),
-    /// The snapshot is **not** a prefix extension of what was sent.
+    /// The snapshot is a **slid window**: its head was dropped by the producer's tail truncation,
+    /// but a suffix of what was already sent is still a prefix of it. This is the part past that
+    /// overlap — the bytes that are genuinely new — and it is emitted exactly like
+    /// [`Push::Append`].
     ///
-    /// **This is the one place cyrup is materially worse than pi upstream, and it must not be
-    /// papered over.** cyrup's bash tool `ToolUpdate.content` is a tail-truncated preview
-    /// (`build_stream_update` takes `acc.tail_string()` then `truncate_tail(…, TruncOpts::new(
-    /// max_lines, max_bytes))`, `crates/cyrup-tools/src/tools/bash.rs`), so once output exceeds the
-    /// limit the next preview has **dropped its head** and is no longer a prefix extension of the
-    /// last. Upstream's fallback re-appends the whole preview into a terminal that appends, so
-    /// Zed's terminal shows the last N lines repeated once per update — tens of times over one
-    /// command, with nothing reporting a problem.
+    /// This is the case the real producer reaches on *every* update once a command's output passes
+    /// `truncate_tail`'s limit (`build_stream_update` takes `acc.tail_string()` then
+    /// `truncate_tail(…, TruncOpts::new(max_lines, max_bytes))`,
+    /// `crates/cyrup-tools/src/tools/bash.rs`), so it is the common case for `cargo build`,
+    /// `npm ci` or a wide `grep` — not an exotic one. Distinguishing it from [`Push::Append`]
+    /// costs nothing on the wire and is what lets a test tell "the window slid and we recovered"
+    /// apart from "the snapshot simply grew".
+    Resync(String),
+    /// The snapshot shares **no** usable overlap with what was already sent: the producer skipped
+    /// more bytes between two flushes than one whole preview window holds, so there is no way to
+    /// tell how much output is missing.
+    ///
+    /// Emitting nothing is the `ACP-Q26` decision. What is NOT true — and what
+    /// [`ToolCallLedger::terminal_finish`] now repairs — is that "the same bytes reach the client
+    /// as ordinary tool-call content": a [`ToolClass::Terminal`] call sends no `content` and no
+    /// `rawOutput` at all, so a desync on the *final* push used to drop the tail of the command
+    /// through every field at once.
     Desynced,
+}
+
+/// The shortest overlap [`TerminalAppender::push`] will accept as evidence that the producer's
+/// window merely slid, rather than that output was skipped outright. `ACP-140`.
+///
+/// A real slide overlaps by `window_len - bytes_appended_since_the_last_flush`, and the real
+/// producer's window is 2 000 lines / 50 KiB, so a genuine overlap is kilobytes. A *coincidental*
+/// agreement between the tail of one chunk of output and the head of an unrelated one is a handful
+/// of bytes — overwhelmingly the one-byte `"\n"` case, since previews end with a newline and a
+/// window that starts on a blank line starts with one. Accepting that one byte would emit the
+/// whole next window minus it, which is upstream's duplicate-the-tail bug with an off-by-one.
+/// 32 bytes sits far below any real overlap and far above any plausible coincidence.
+pub const MIN_RESYNC_OVERLAP: usize = 32;
+
+/// The length of the longest suffix of `emitted` that is also a prefix of `next`. `ACP-140`.
+///
+/// KMP rather than the obvious `for k in (1..=m).rev() { emitted.ends_with(&next[..k]) }`: `next`
+/// is a whole preview window (up to 50 KiB) and this runs once per output flush of every bash
+/// command, so the quadratic form is ~10⁹ byte comparisons on the hot path. This is `O(|next|)`
+/// for the failure table plus `O(|next|)` for the scan — `emitted` is truncated to its last
+/// `|next|` bytes first, because a longer overlap than that cannot exist.
+///
+/// Byte-indexed, but the returned length is always a `char` boundary of **both** strings: the
+/// matched region starts at `next[0]`, which is never a UTF-8 continuation byte, so the two
+/// framings of the same bytes coincide.
+fn prefix_overlap(emitted: &str, next: &str) -> usize {
+    let pat = next.as_bytes();
+    let m = pat.len();
+    if m == 0 || emitted.is_empty() {
+        return 0;
+    }
+    let all = emitted.as_bytes();
+    let hay = all.get(all.len().saturating_sub(m)..).unwrap_or(all);
+
+    // `fail[i]` = the longest proper prefix of `pat[..=i]` that is also its suffix.
+    let mut fail = vec![0usize; m];
+    let mut len = 0usize;
+    for i in 1..m {
+        let Some(&c) = pat.get(i) else { break };
+        while len > 0 && pat.get(len) != Some(&c) {
+            len = fail.get(len - 1).copied().unwrap_or(0);
+        }
+        if pat.get(len) == Some(&c) {
+            len += 1;
+        }
+        if let Some(slot) = fail.get_mut(i) {
+            *slot = len;
+        }
+    }
+
+    // Scan the tail of `emitted`; `len` ends as the match length still live at its last byte,
+    // which is exactly "longest prefix of `next` that is a suffix of `emitted`".
+    let mut len = 0usize;
+    for &c in hay {
+        while len > 0 && pat.get(len) != Some(&c) {
+            len = fail.get(len - 1).copied().unwrap_or(0);
+        }
+        if pat.get(len) == Some(&c) {
+            len += 1;
+        }
+    }
+    len
 }
 
 /// The append-only terminal output delta. `ACP-140`.
 ///
 /// Port of pi-acp v0.0.33 `session.ts`'s `bashOutputSnapshots` map plus `translate/bash.ts`'s
-/// `bashOutputDelta`.
+/// `bashOutputDelta`, with the `: next` fallback replaced by the overlap recovery documented on
+/// [`TerminalAppender::push`].
 #[derive(Debug, Default)]
 pub struct TerminalAppender {
+    /// The last snapshot offered, whose END is the end of everything sent — which is the only
+    /// property [`TerminalAppender::push`] reads it for. It is NOT the whole transcript: the
+    /// producer's window slides, so this holds one window, not the command's entire output.
     emitted: String,
 }
 
 impl TerminalAppender {
-    /// What has been sent to the client so far.
+    /// The last snapshot offered — the tail of what has been sent, not the whole of it. See the
+    /// field's own note.
     #[must_use]
     pub fn emitted(&self) -> &str {
         &self.emitted
@@ -354,29 +433,57 @@ impl TerminalAppender {
 
     /// Offer a new output snapshot and learn what to emit.
     ///
-    /// **`ACP-Q26` / the desync policy, decided: emit nothing and record the gap.** The three
-    /// candidates were re-appending the whole preview (upstream's, and the one that is actively
-    /// wrong — it duplicates output in a terminal that appends), emitting a visible marker, and
-    /// emitting nothing. Nothing wins because the terminal is *chrome*: the same bytes still reach
-    /// the client as ordinary tool-call content, so a gap in the terminal pane costs the user
-    /// nothing they cannot read elsewhere, whereas a duplicated tail is unreadable and a marker is
-    /// a cyrup-invented string in a pane the user reads as their own shell's output. The cost is
-    /// that a very long command's terminal pane stops updating partway through, silently — which
-    /// is why [`Push::Desynced`] is a named outcome the caller must match on rather than an
-    /// `Option::None` it can ignore, and why the caller `tracing::debug!`s it.
+    /// # The producer is a sliding window, so "prefix extension" is the exception
     ///
-    /// # The second half of that decision: a desync **re-bases**, it does not latch
+    /// The snapshot this is fed is **not** a growing string. `build_stream_update` takes
+    /// `acc.tail_string()` and then `truncate_tail(…, TruncOpts::new(2000, 50 KiB))`
+    /// (`crates/cyrup-tools/src/tools/bash.rs`, `crates/cyrup-tools/src/truncate.rs`), which
+    /// selects whole lines working *backwards from the end*. So for any command exceeding 2 000
+    /// lines or 50 KiB — `cargo build`, `npm ci`, a wide `grep`, on a first use — every subsequent
+    /// preview begins LATER than the last and `strip_prefix` fails on all of them. Treating that
+    /// as an unrecoverable desync froze the terminal pane at the first ~50 KiB for the rest of the
+    /// command, permanently, with only a `tracing::debug!` anywhere: not "exactly one gap", which
+    /// is what an earlier version of this doc and its test claimed on the strength of a synthetic
+    /// sequence whose window stops sliding.
     ///
-    /// `emitted` is replaced on the [`Push::Desynced`] path too, exactly as upstream stores `next`
-    /// unconditionally. Not re-basing would compare every later snapshot against a prefix the tool
-    /// has permanently dropped, so one truncation would silence the terminal for the rest of the
-    /// command; re-basing costs exactly one gap and the pane resumes on the next update. Asserted
-    /// by `a_desync_costs_one_gap_and_then_resumes`.
+    /// So the slide is recovered instead: [`prefix_overlap`] finds the longest suffix of what has
+    /// already been sent that is still a prefix of the new window, and the bytes past it are a
+    /// [`Push::Resync`] — the same emission as [`Push::Append`], with no duplication and no gap.
+    /// The overlap must be at least [`MIN_RESYNC_OVERLAP`] to count; below that it is indexing
+    /// noise rather than evidence of continuity.
+    ///
+    /// # `ACP-Q26` / the desync policy, still decided: emit nothing and record the gap
+    ///
+    /// A [`Push::Desynced`] now means the producer skipped more than a whole window between two
+    /// flushes, so the amount of missing output is unknown. The three candidates were re-appending
+    /// the whole preview (upstream's `: next`, and the one that is actively wrong — it duplicates
+    /// output in a terminal that appends), emitting a visible marker (a cyrup-invented string in a
+    /// pane the user reads as their own shell's output), and emitting nothing. Nothing still wins,
+    /// but its old justification — "the same bytes still reach the client as ordinary tool-call
+    /// content" — was false for a terminal, which sends no `content` and no `rawOutput`. That half
+    /// is repaired at [`ToolCallLedger::terminal_finish`], which falls back to a text content block
+    /// when the FINAL push desyncs, so the tail of a command is never lost through every field at
+    /// once. [`Push::Desynced`] stays a named outcome the caller must match on rather than an
+    /// `Option::None` it can ignore, and the caller still `tracing::debug!`s it.
+    ///
+    /// # A desync **re-bases**, it does not latch
+    ///
+    /// `emitted` is replaced on every path, exactly as upstream stores `next` unconditionally.
+    /// Not re-basing would compare every later snapshot against a prefix the tool has permanently
+    /// dropped. Since `emitted` is only ever read as *the tail of what was sent* — both
+    /// `strip_prefix` and [`prefix_overlap`] anchor at its end — holding the window rather than
+    /// the whole transcript is also what keeps this `O(|window|)` per flush instead of growing
+    /// with the command's total output.
     ///
     /// The clean fix is `ACP-Q26`'s other half — stream from the tool's `OutputAccumulator`
     /// (`crates/cyrup-tools/src/output.rs`), which holds the untruncated tail, making the prefix
-    /// invariant true by construction. That is a new seam between `cyrup-tools` and `cyrup-acp` and
-    /// is out of scope for this port; it is recorded here so it is a known option, not a discovery.
+    /// invariant true by construction and deleting [`Push::Resync`] and [`Push::Desynced`] both.
+    /// That is a new seam between `cyrup-tools` and `cyrup-acp` and is out of scope for this port;
+    /// it is recorded here so it is a known option, not a discovery.
+    ///
+    /// Asserted by `a_slid_window_resyncs_on_the_overlap`,
+    /// `a_genuine_discontinuity_is_still_a_silent_gap` and
+    /// `a_sliding_window_never_repeats_or_drops_a_line`.
     pub fn push(&mut self, next: &str) -> Push {
         if next == self.emitted {
             return Push::Nothing;
@@ -386,8 +493,18 @@ impl TerminalAppender {
             self.emitted = next.to_string();
             return Push::Append(suffix);
         }
+        let overlap = prefix_overlap(&self.emitted, next);
+        let resync = (overlap >= MIN_RESYNC_OVERLAP)
+            .then(|| next.get(overlap..))
+            .flatten()
+            .map(str::to_string);
         self.emitted = next.to_string();
-        Push::Desynced
+        match resync {
+            // The whole new window was already sent: a slide of zero new bytes.
+            Some(data) if data.is_empty() => Push::Nothing,
+            Some(data) => Push::Resync(data),
+            None => Push::Desynced,
+        }
     }
 }
 
@@ -648,6 +765,22 @@ impl ToolCallLedger {
     /// `ACP-Q27`, decided: cyrup **could** tell `ExitStatus::{Killed, TimedOut, Signaled}` apart,
     /// but that distinction is not present in the tool result this layer receives (see
     /// [`crate::translate::bash_exit_code`]), so inventing a signal name here would be a fiction.
+    ///
+    /// # [CYRUP-DELTA] — a desynced FINAL push falls back to a text content block (`ACP-140`)
+    ///
+    /// **What differs.** Upstream's terminal updates carry no `content` ever, and neither do
+    /// cyrup's — the whole point of `terminal_info`/`terminal_output`/`terminal_exit` is that the
+    /// client renders a terminal, not a text blob. But the "emit nothing on a desync" policy is
+    /// only defensible while the bytes reach the client *somewhere*, and for a terminal there is
+    /// nowhere else: no `content`, no `rawOutput`. A desync on the last push therefore used to
+    /// drop the tail of the command — the part the user actually wants — through every field at
+    /// once. So when, and only when, the final push is [`Push::Desynced`], the final update also
+    /// carries `content: [{type: "text", …}]` holding the whole last preview.
+    ///
+    /// **What it costs.** On that one frame a client that renders both a terminal and the content
+    /// array shows the tail twice: once in the pane (as far as it got) and once as text. That is
+    /// strictly better than losing it, it happens only on a real discontinuity, and it never
+    /// happens on the [`Push::Resync`] path, which is what a long command actually takes.
     pub fn terminal_finish(
         &mut self,
         id: &ToolCallId,
@@ -659,7 +792,9 @@ impl ToolCallLedger {
         let StreamBody::Terminal(appender) = &mut stream.body else {
             return None;
         };
-        let mut meta = terminal_delta_meta(id, appender.push(output));
+        let push = appender.push(output);
+        let lost = push == Push::Desynced;
+        let mut meta = terminal_delta_meta(id, push);
         let mut exit = Map::new();
         exit.insert("terminal_id".to_string(), Value::String(id.0.to_string()));
         exit.insert("exit_code".to_string(), Value::from(exit_code));
@@ -672,8 +807,12 @@ impl ToolCallLedger {
         } else {
             ToolCallStatus::Completed
         };
+        let mut fields = ToolCallUpdateFields::new().status(status);
+        if lost && !output.is_empty() {
+            fields = fields.content(vec![ToolCallContent::from(output.to_string())]);
+        }
         Some(SessionUpdate::ToolCallUpdate(
-            ToolCallUpdate::new(id.clone(), ToolCallUpdateFields::new().status(status)).meta(meta),
+            ToolCallUpdate::new(id.clone(), fields).meta(meta),
         ))
     }
 
@@ -831,13 +970,14 @@ fn terminal_info_meta(id: &ToolCallId, cwd: &Path) -> Meta {
 /// to append.
 ///
 /// Port of pi-acp v0.0.33 `translate/bash.ts`'s `bashTerminalOutputMeta`, gated on upstream's
-/// `...(delta ? … : {})`. [`Push::Desynced`] takes the same "emit nothing" branch as
-/// [`Push::Nothing`] — the `ACP-Q26` decision recorded on [`TerminalAppender::push`] — and is
-/// logged so a silent gap is at least a loud one in the agent's own logs.
+/// `...(delta ? … : {})`. [`Push::Resync`] emits exactly like [`Push::Append`] — a slid window is
+/// still append-only output once the overlap is subtracted (`ACP-140`). Only [`Push::Desynced`]
+/// takes the "emit nothing" branch — the `ACP-Q26` decision recorded on [`TerminalAppender::push`]
+/// — and it is logged so a silent gap is at least a loud one in the agent's own logs.
 fn terminal_delta_meta(id: &ToolCallId, push: Push) -> Meta {
     let mut meta = Map::new();
     match push {
-        Push::Append(data) => {
+        Push::Append(data) | Push::Resync(data) => {
             let mut out = Map::new();
             out.insert("terminal_id".to_string(), Value::String(id.0.to_string()));
             out.insert("data".to_string(), Value::String(data));
@@ -847,8 +987,8 @@ fn terminal_delta_meta(id: &ToolCallId, push: Push) -> Meta {
         Push::Desynced => {
             tracing::debug!(
                 terminal_id = %id.0,
-                "ACP-140: bash preview is no longer a prefix extension of what was sent \
-                 (tail truncation dropped the head); emitting no terminal_output for this update"
+                "ACP-140: bash preview shares no overlap with what was sent (the producer skipped \
+                 more than one whole preview window); emitting no terminal_output for this update"
             );
         }
     }
@@ -1121,60 +1261,153 @@ mod tests {
         assert_eq!(appender.emitted(), "abcd");
     }
 
-    /// ACP-140 / ACP-Q26 — a head-dropping snapshot is a named desync, **not** a duplicate append,
-    /// and it re-bases so exactly one gap occurs rather than permanent silence.
+    /// One line of the corpus these tests slide a window over. Long enough that a single line of
+    /// overlap clears [`MIN_RESYNC_OVERLAP`], which is what the real 50 KiB window does by four
+    /// orders of magnitude.
+    fn corpus_line(n: usize) -> String {
+        format!("line {n:04}: Compiling cyrup-acp v0.0.0 (/home/user/cyrup)\n")
+    }
+
+    /// What the real producer hands this module: `build_stream_update` takes `acc.tail_string()`
+    /// and then `truncate_tail`, which selects whole lines working BACKWARDS from the end. So the
+    /// preview after `upto` lines have been written is the last `window` of them — a window that
+    /// slides, not a string that grows.
+    fn tail_window(upto: usize, window: usize) -> String {
+        (upto.saturating_sub(window)..upto).map(corpus_line).collect()
+    }
+
+    /// ACP-140 — the case the real producer reaches on every flush of any command past
+    /// `truncate_tail`'s limit: the window slid, so the preview is not a prefix extension, but the
+    /// bytes past the overlap are still ordinary append-only output.
     #[test]
-    fn a_desync_costs_one_gap_and_then_resumes() {
+    fn a_slid_window_resyncs_on_the_overlap() {
+        let mut appender = TerminalAppender::default();
+        // Four lines fit in the window, so the first two pushes still grow.
+        assert_eq!(appender.push(&tail_window(1, 4)), Push::Append(corpus_line(0)));
+        assert_eq!(appender.push(&tail_window(2, 4)), Push::Append(corpus_line(1)));
+        // From here the window is full and every later preview has dropped its head. Before this
+        // fix each of these was `Push::Desynced` — forever, for the rest of the command.
+        assert_eq!(
+            appender.push(&tail_window(5, 4)),
+            Push::Resync([corpus_line(2), corpus_line(3), corpus_line(4)].concat()),
+            "three lines were written between flushes; the fourth is the overlap"
+        );
+        assert_eq!(appender.push(&tail_window(6, 4)), Push::Resync(corpus_line(5)));
+        assert_eq!(
+            appender.push(&tail_window(9, 4)),
+            Push::Resync([corpus_line(6), corpus_line(7), corpus_line(8)].concat())
+        );
+        // A window that slid past everything already sent is a repeat of nothing new.
+        assert_eq!(appender.push(&tail_window(9, 4)), Push::Nothing);
+    }
+
+    /// ACP-140 / ACP-Q26 — the residue after the slide is recovered: a preview sharing no usable
+    /// overlap with what was sent is still a named, silent gap rather than upstream's duplicated
+    /// tail, and it re-bases so the very next preview resumes.
+    #[test]
+    fn a_genuine_discontinuity_is_still_a_silent_gap() {
         let mut appender = TerminalAppender::default();
         assert_eq!(
             appender.push("line1\nline2\n"),
             Push::Append("line1\nline2\n".into())
         );
-        // `truncate_tail` dropped the head: the new preview is not a prefix extension.
-        assert_eq!(appender.push("line2\nline3\n"), Push::Desynced);
+        // Five bytes of overlap ("ine2\n") is indexing noise, not evidence of continuity: below
+        // MIN_RESYNC_OVERLAP the honest answer about how much was skipped is "unknown".
+        assert_eq!(appender.push("ine2\nline3\n"), Push::Desynced);
         assert_eq!(
             appender.emitted(),
-            "line2\nline3\n",
+            "ine2\nline3\n",
             "re-based, so the NEXT update is a clean suffix rather than a second desync"
         );
         assert_eq!(
-            appender.push("line2\nline3\nline4\n"),
+            appender.push("ine2\nline3\nline4\n"),
             Push::Append("line4\n".into())
         );
     }
 
-    /// ACP-140's component assertion, at the ledger: the concatenated `terminal_output.data` of a
-    /// whole command contains no repeated segment, which is exactly what upstream's `: next`
-    /// fallback would produce.
+    /// ACP-140's whole-command property, at the ledger: over a command whose output outgrows the
+    /// preview window many times, the concatenated `terminal_output.data` is the command's output
+    /// **exactly** — every line once, in order, none dropped and none repeated. Upstream's `: next`
+    /// fallback repeats the window on every flush; the pre-fix cyrup behaviour dropped everything
+    /// after the first full window.
     #[test]
-    fn the_concatenated_terminal_data_never_repeats_a_segment() {
+    fn a_sliding_window_never_repeats_or_drops_a_line() {
         let mut ledger = ledger();
         let id = ToolCallId::new("sh-1");
         ledger.announce(announce_of("sh-1", ToolClass::Terminal));
 
-        // Three previews, the third having dropped its head — the tail-truncation case.
-        let previews = ["aaa\n", "aaa\nbbb\n", "bbb\nccc\n"];
+        let window = 4;
         let mut seen = String::new();
-        let mut frames = 0;
-        for preview in previews {
-            let Some(update) = ledger.terminal_progress(&id, preview) else {
+        // 20 lines through a 4-line window: 16 flushes past the point of no return.
+        for upto in 1..=20 {
+            let Some(update) = ledger.terminal_progress(&id, &tail_window(upto, window)) else {
                 continue;
             };
-            frames += 1;
             if let Some(data) = as_json(&update)["_meta"]["terminal_output"]["data"].as_str() {
                 seen.push_str(data);
             }
         }
-        assert_eq!(seen, "aaa\nbbb\n", "the desynced preview appended nothing");
+        let whole: String = (0..20).map(corpus_line).collect();
         assert_eq!(
-            frames, 2,
-            "and it sent no frame either: the desynced update has no data and no status \
-             transition, so there is nothing in it for a client to render"
+            seen, whole,
+            "the terminal pane must hold the command's entire output, once"
+        );
+        for n in 0..20 {
+            assert_eq!(
+                seen.matches(&corpus_line(n)).count(),
+                1,
+                "line {n} appears more than once — that is upstream's duplicate-the-tail bug"
+            );
+        }
+    }
+
+    /// ACP-140 — the second half: a terminal update carries no `content` and no `rawOutput`, so a
+    /// desync on the FINAL push had no field left to deliver the tail of the command through. It
+    /// now falls back to a text content block.
+    #[test]
+    fn the_tail_of_a_desynced_final_push_survives_as_content() {
+        let mut ledger = ledger();
+        let id = ToolCallId::new("sh-1");
+        ledger.announce(announce_of("sh-1", ToolClass::Terminal));
+        let _ = ledger.terminal_progress(&id, "aaa\n");
+
+        let update = ledger
+            .terminal_finish(&id, "zzz\n", false, 0)
+            .expect("the terminal closes");
+        let json = as_json(&update);
+        assert!(
+            json["_meta"]["terminal_output"].is_null(),
+            "the desynced delta is still suppressed in `_meta`: {json}"
         );
         assert_eq!(
-            seen.matches("bbb").count(),
-            1,
-            "upstream's `: next` fallback would print bbb twice: {seen}"
+            json["content"][0]["content"]["text"], "zzz\n",
+            "…but the bytes are not lost: {json}"
+        );
+        assert_eq!(json["_meta"]["terminal_exit"]["exit_code"], 0);
+    }
+
+    /// ACP-140 — and the fallback is *only* for the lost case: an ordinary terminal close carries
+    /// no `content` at all, which is upstream's shape and what makes a client render the pane
+    /// rather than a text blob.
+    #[test]
+    fn an_ordinary_terminal_close_still_carries_no_content() {
+        let mut ledger = ledger();
+        let id = ToolCallId::new("sh-1");
+        ledger.announce(announce_of("sh-1", ToolClass::Terminal));
+        let _ = ledger.terminal_progress(&id, &tail_window(6, 4));
+
+        let update = ledger
+            .terminal_finish(&id, &tail_window(8, 4), false, 0)
+            .expect("the terminal closes");
+        let json = as_json(&update);
+        assert!(
+            json["content"].is_null(),
+            "a resynced close needs no fallback: {json}"
+        );
+        assert_eq!(
+            json["_meta"]["terminal_output"]["data"],
+            [corpus_line(6), corpus_line(7)].concat(),
+            "the final delta rides `_meta`, as upstream: {json}"
         );
     }
 

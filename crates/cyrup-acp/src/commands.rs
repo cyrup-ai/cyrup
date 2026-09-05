@@ -500,6 +500,11 @@ pub fn intercept(text: &str, has_image: bool) -> Option<(Builtin, String)> {
 /// answering with an error chunk — upstream has no try/catch on the compact arm, and its export
 /// arm's catch is replaced here by the typed `Result`, so the client can tell a failed command from
 /// a command that reported a failure.
+///
+/// Those two are the **only** rejecting arms, and the list is exhaustive rather than illustrative:
+/// upstream's `name` arm *does* catch and answer with a chunk, so a failing `/name` completes the
+/// turn here too (`NEW`, area 4e — see [`name_failure_updates`]), and the remaining four arms
+/// cannot fail at all.
 pub async fn dispatch(
     builtin: Builtin,
     args: &str,
@@ -515,7 +520,7 @@ pub async fn dispatch(
         Builtin::Autocompact => Ok(autocompact(&tokens, session)),
         Builtin::Export => export(session_id, cwd, session).await,
         Builtin::Session => Ok(session_stats(session).await),
-        Builtin::Name => name(&tokens, session, rename_echo).await,
+        Builtin::Name => Ok(name(&tokens, session, rename_echo).await),
         Builtin::Steering => Ok(queue_mode(QueueKind::Steering, &tokens, session)),
         Builtin::FollowUp => Ok(queue_mode(QueueKind::FollowUp, &tokens, session)),
     }
@@ -575,6 +580,29 @@ async fn compact(
         .await
         .map_err(|e| AcpFailure::classify(&e))?;
 
+    Ok(vec![chunk(compaction_text(
+        custom.as_deref(),
+        result.tokens_before,
+        &result.summary,
+    ))])
+}
+
+/// `ACP-283`'s three format decisions, as a value.
+///
+/// Split out of [`compact`] for the reason [`compact_refusal`] was: every other line of that
+/// function needs a live `AgentSession`, which no unit test can build, so the string the user
+/// actually reads had no assertion anywhere and each of its three decisions was one character from
+/// a silent divergence —
+///
+/// 1. the parenthetical's **leading space** (`` `Compaction completed.${custom ? ' (custom
+///    instructions applied)' : ''}` ``),
+/// 2. the single `\n` before `Tokens before:` (upstream's `headerLines.join('\n')`), and
+/// 3. the `\n\n` before the summary **and its JS-truthiness guard**: an empty summary omits the
+///    whole block, because upstream's `summary ? … : ''` treats `''` as falsy. Preserved
+///    deliberately; see [`compact`]'s delta for why the `Tokens before:` line is *not* conditional
+///    here where upstream's was.
+#[must_use]
+fn compaction_text(custom: Option<&str>, tokens_before: u64, summary: &str) -> String {
     let mut text = format!(
         "Compaction completed.{}",
         if custom.is_some() {
@@ -583,11 +611,11 @@ async fn compact(
             ""
         }
     );
-    text.push_str(&format!("\nTokens before: {}", result.tokens_before));
-    if !result.summary.is_empty() {
-        text.push_str(&format!("\n\n{}", result.summary));
+    text.push_str(&format!("\nTokens before: {tokens_before}"));
+    if !summary.is_empty() {
+        text.push_str(&format!("\n\n{summary}"));
     }
-    Ok(vec![chunk(text)])
+    text
 }
 
 /// `ACP-292`'s refusal, byte-for-byte as the user reads it.
@@ -648,7 +676,26 @@ fn compact_refusal(run_active: bool) -> Option<Vec<SessionUpdate>> {
 /// unit, and the natural home for the richer view is `UsageUpdate` (which the ACP schema already
 /// has and which the event translator owns) rather than a hand-formatted text block.
 async fn session_stats(session: &AgentSession) -> Vec<SessionUpdate> {
-    let stats = session.session_stats().await;
+    vec![chunk(stats_text(&session.session_stats().await))]
+}
+
+/// `ACP-284`'s five-line shape, as a value.
+///
+/// Split out of [`session_stats`] for [`compact_refusal`]'s reason: `session_stats` takes an
+/// `&AgentSession`, so no unit test could reach the composition, and the integration case
+/// (`crates/cyrup-it/tests/bin/acp_session.rs`) asserts three of the five lines. The two that were
+/// unasserted in either direction are exactly the two that can silently go wrong:
+///
+/// * the `Tokens:` line's **five comma-joined sub-parts in order** — a reorder or a renamed
+///   sub-label reads as a different wire string to a client that parses it, and
+/// * the `Session file:` conditional, the one genuinely conditional line after the typed-stats
+///   collapse (see this arm's delta): an `Option` that became always-`Some` would add a line to
+///   every in-memory session's output with nothing failing.
+///
+/// The integration case stays as the proof that the arm is reached above the turn queue; this is
+/// the proof of what it says.
+#[must_use]
+fn stats_text(stats: &cyrup_session_svc::SessionStats) -> String {
     let mut lines = vec![format!("Session: {}", stats.session_id)];
     // The one genuinely conditional line: an in-memory session has no file.
     if let Some(file) = &stats.session_file {
@@ -661,7 +708,7 @@ async fn session_stats(session: &AgentSession) -> Vec<SessionUpdate> {
         "Tokens: in {}, out {}, cache read {}, cache write {}, total {}",
         t.input, t.output, t.cache_read, t.cache_write, t.total
     ));
-    vec![chunk(lines.join("\n"))]
+    lines.join("\n")
 }
 
 /// `/name` (`ACP-285`).
@@ -670,19 +717,27 @@ async fn session_stats(session: &AgentSession) -> Vec<SessionUpdate> {
 /// Otherwise set the name, then answer `Session name set: <name>`. Note `args.join(' ')` re-joins
 /// the quote-stripped tokens, so `/name "a  b"` becomes `a b` — preserved exactly.
 ///
-/// # [CYRUP-DELTA] — no `session_info_update` is emitted here (`ACP-Q20`)
+/// # [CYRUP-DELTA] — the `session_info_update` is emitted **here**, and the pump's copy is claimed
 ///
-/// **What differs.** Upstream emits **two** updates: a `session_info_update` carrying the title and
-/// a fresh `updatedAt`, then the text chunk. Here only the chunk is emitted.
-/// `AgentSession::set_session_name` already fans out `AgentSessionEvent::SessionInfoChanged { name }`
-/// to every subscriber **and** dispatches a `HostEvent::SessionInfoChanged` to extensions, so the
-/// event pump is the single emitter — see `crate::config_options`' `ACP-Q20` delta and
-/// [`crate::config_options::session_info_update`], which is where the notification is built.
+/// **What differs.** Upstream's arm emits two updates and its setter emits nothing, so the two
+/// halves are independent. Here `AgentSession::set_session_name` *also* fans out
+/// `AgentSessionEvent::SessionInfoChanged { name }` to every subscriber and dispatches a
+/// `HostEvent::SessionInfoChanged` to extensions, which `crate::sessions`' `config_pump` — a
+/// **different task** — would project into a second `session_info_update` that always lost the race
+/// with this command's own response (`ACP-122`; see [`RenameEcho`] for the observed 9-of-9 wire
+/// order). So the causer emits upstream's update itself, in its own ordered output, and
+/// [`RenameEcho::claim`] makes the pump swallow the copy the fanout is about to produce.
+///
+/// **The claim and the emission are ONE unit and neither may be removed alone.** Deleting the
+/// `session_info_update` from the returned vec while leaving `claim.keep()` in place makes the
+/// pump consume the claim and emit nothing, so a rename produces **zero** `session_info_update`s
+/// with no error anywhere. Deleting the claim while leaving the emission produces two.
 ///
 /// **What it costs.** `ACP-285`'s verify — **exactly one** `session_info_update` with a parseable
-/// ISO-8601 `updatedAt` — must be asserted end to end (the pump's output), not at this function,
-/// which emits none. In exchange a rename originating from an extension, from the TUI on the same
-/// session file, or from any other front-end reaches the client identically, which upstream's
+/// ISO-8601 `updatedAt` — is a property of this function *plus* the pump, so it is asserted end to
+/// end in `crates/cyrup-it` as well as here ([`name_updates`] pins this half). In exchange a
+/// rename originating from an extension, from the TUI on the same session file, or from any other
+/// front-end still reaches the client through the pump, identically — which upstream's
 /// setter-local emission cannot do.
 ///
 /// # [CYRUP-DELTA] — an empty name is refused before the setter, and the skew hint is cut
@@ -693,12 +748,14 @@ async fn session_stats(session: &AgentSession) -> Vec<SessionUpdate> {
 /// (`cyrup_modes::rpc`'s `SessionCommand::SetSessionName`) refuses an empty name with
 /// `Session name cannot be empty`, which the usage line already covers here.
 ///
-/// **What it costs.** Nothing: the cut branch describes a failure mode that cannot occur.
+/// **What it costs.** Nothing: the cut branch describes a failure mode that cannot occur. The
+/// `catch` **itself** is ported — see [`name_failure_updates`] — because `/name` is the one arm
+/// where upstream answers a failure instead of rejecting the request.
 async fn name(
     tokens: &[String],
     session: &AgentSession,
     rename_echo: &RenameEcho,
-) -> Result<Vec<SessionUpdate>, AcpFailure> {
+) -> Vec<SessionUpdate> {
     let joined = tokens.join(" ");
     let name = joined.trim();
     if name.is_empty() {
@@ -706,7 +763,7 @@ async fn name(
         // wants the name has `session/list`'s `SessionInfo.title` and the pump's
         // `session_info_update`; overloading a setter to be a getter is what makes `/name` with a
         // typo'd argument silently do nothing.
-        return Ok(vec![chunk("Usage: /name <name>")]);
+        return vec![chunk(NAME_USAGE)];
     }
 
     // `ACP-122` — claimed BEFORE the mutation, because `set_session_name` emits
@@ -717,19 +774,50 @@ async fn name(
     match session.set_session_name(name).await {
         Ok(()) => {
             claim.keep();
-            Ok(vec![
-                // `ACP-285`'s order: the update, then the confirmation the user reads.
-                crate::config_options::session_info_update(
-                    Some(name.to_string()),
-                    crate::sessions::now_iso8601_millis(),
-                ),
-                chunk(format!("Session name set: {name}")),
-            ])
+            name_updates(name, crate::sessions::now_iso8601_millis())
         }
         // The rename did not happen, so nothing will arrive for the pump to suppress. `claim` is
         // dropped un-kept and releases itself.
-        Err(e) => Err(AcpFailure::classify(&e)),
+        Err(e) => name_failure_updates(&e.to_string()),
     }
+}
+
+/// `/name`'s usage line, for the empty argument (`ACP-Q44`). Upstream's string.
+const NAME_USAGE: &str = "Usage: /name <name>";
+
+/// `ACP-285`'s two updates, in upstream's order, as a value.
+///
+/// The `session_info_update` first, then the confirmation the user reads — upstream's order, and
+/// the order that matters to a client which renders the title from the notification and the
+/// transcript from the chunk. Split out of [`name`] for [`compact_refusal`]'s reason (the rest of
+/// that function needs a live `AgentSession`) and because the delta above turns on there being
+/// **exactly one** update of each kind here: this is where that is asserted.
+#[must_use]
+fn name_updates(name: &str, updated_at: String) -> Vec<SessionUpdate> {
+    vec![
+        crate::config_options::session_info_update(Some(name.to_string()), updated_at),
+        chunk(format!("Session name set: {name}")),
+    ]
+}
+
+/// Upstream's `catch` on the `/name` arm, ported (`NEW`, area 4e).
+///
+/// pi-acp v0.0.33 `agent.ts`'s `name` arm wraps `setSessionName` in a try/catch that emits
+/// `` `Failed to set session name: ${msg}${hint}` `` as an `agent_message_chunk` and returns
+/// `{stopReason:'end_turn'}`: the turn completes and the user reads the failure in the transcript.
+/// This crate previously answered `Err(AcpFailure::classify(&e))` instead, which
+/// `SessionManager::serve_builtin` turns into a JSON-RPC error frame on the
+/// `session/prompt` — so a disk error on a rename surfaced in Zed as a **failed request**, and
+/// [`dispatch`]'s "following upstream, a failing command rejects the request" is true of `compact`
+/// and `export` (upstream has no catch on the first and its catch is replaced by the typed `Result`
+/// on the second) but was **false** for the one arm where upstream does catch and answer. Restored
+/// to upstream's behaviour, minus the version-skew `hint` this port cut for the reason in [`name`]'s
+/// second delta.
+///
+/// The message is the error's `Display`, which is upstream's `String(e?.message ?? e)`.
+#[must_use]
+fn name_failure_updates(error: &str) -> Vec<SessionUpdate> {
+    vec![chunk(format!("Failed to set session name: {error}"))]
 }
 
 /// The one-emitter rule (`ACP-Q20`) reconciled with the response-follows-notifications rule
@@ -885,31 +973,70 @@ fn queue_mode_id(mode: QueueMode) -> &'static str {
 /// **What it costs.** Nothing observable: `unknown` was only ever printed when pi's reply was
 /// malformed.
 fn queue_mode(kind: QueueKind, tokens: &[String], session: &AgentSession) -> Vec<SessionUpdate> {
+    let (updates, write) =
+        queue_mode_updates(kind, tokens.first().map(String::as_str), kind.read(session));
+    // The write is the pure half's *decision*, applied here — never a second parse of `raw`.
+    if let Some(mode) = write {
+        kind.write(session, mode);
+    }
+    updates
+}
+
+/// `ACP-286`/`ACP-287`'s three branches, three strings and one write decision, as values.
+///
+/// Split out of [`queue_mode`] for [`compact_refusal`]'s reason — that function takes an
+/// `&AgentSession` purely to reach `kind.read`/`kind.write`, so nothing could reach the composition
+/// from a unit test and the three composed strings (`"{label} mode: {id}"`,
+/// `"{label} mode set to: {id}"` and `"Usage: /{cmd} all | /{cmd} one-at-a-time"`) were unpinned
+/// while only their *pieces* were asserted.
+///
+/// The returned `Option<QueueMode>` is the whole write decision, and it is upstream's own test
+/// assertion made checkable: `test/component/agent-steering-followup-modes.test.ts` asserts
+/// `setTo === 'one-at-a-time'` on the set branch and `called === false` on the invalid one, i.e.
+/// exactly `Some(OneAtATime)` and `None` here. A read or a usage line that started writing is a
+/// failing test rather than a silent mode change.
+///
+/// `arg` is the raw token; the `toLowerCase()` is upstream's and lives **here** so the case table
+/// is pinned with the strings rather than at the one call site.
+#[must_use]
+fn queue_mode_updates(
+    kind: QueueKind,
+    arg: Option<&str>,
+    current: QueueMode,
+) -> (Vec<SessionUpdate>, Option<QueueMode>) {
     // Upstream's `String(args[0] ?? '').toLowerCase()`.
-    let raw = tokens.first().map(|s| s.to_lowercase()).unwrap_or_default();
+    let raw = arg.map(str::to_lowercase).unwrap_or_default();
     if raw.is_empty() {
-        return vec![chunk(format!(
-            "{} mode: {}",
-            kind.label(),
-            queue_mode_id(kind.read(session))
-        ))];
+        return (
+            vec![chunk(format!(
+                "{} mode: {}",
+                kind.label(),
+                queue_mode_id(current)
+            ))],
+            None,
+        );
     }
     let mode = match raw.as_str() {
         "all" => QueueMode::All,
         "one-at-a-time" => QueueMode::OneAtATime,
         _ => {
-            return vec![chunk(format!(
-                "Usage: /{cmd} all | /{cmd} one-at-a-time",
-                cmd = kind.command()
-            ))];
+            return (
+                vec![chunk(format!(
+                    "Usage: /{cmd} all | /{cmd} one-at-a-time",
+                    cmd = kind.command()
+                ))],
+                None,
+            );
         }
     };
-    kind.write(session, mode);
-    vec![chunk(format!(
-        "{} mode set to: {}",
-        kind.label(),
-        queue_mode_id(mode)
-    ))]
+    (
+        vec![chunk(format!(
+            "{} mode set to: {}",
+            kind.label(),
+            queue_mode_id(mode)
+        ))],
+        Some(mode),
+    )
 }
 
 /// `/autocompact` (`ACP-289`).
@@ -923,20 +1050,46 @@ fn queue_mode(kind: QueueKind, tokens: &[String], session: &AgentSession) -> Vec
 /// reached by every unrecognised word, not only by `toggle`. It is worth knowing when reading the
 /// unit's table — `/autocompact onn` flips the flag rather than printing a usage line.
 fn autocompact(tokens: &[String], session: &AgentSession) -> Vec<SessionUpdate> {
-    let mode = tokens
-        .first()
-        .map(|s| s.to_lowercase())
-        .unwrap_or_else(|| "toggle".to_string());
-    let enabled = match mode.as_str() {
+    let enabled = autocompact_target(
+        tokens.first().map(String::as_str),
+        session.auto_compaction_enabled(),
+    );
+    session.set_auto_compaction_enabled(enabled);
+    vec![chunk(autocompact_text(enabled))]
+}
+
+/// `ACP-289`'s accept table and its one surprise, as a value.
+///
+/// Split out of [`autocompact`] for [`compact_refusal`]'s reason — the arm needs a live
+/// `AgentSession` for both the read and the write, so **none** of the seven inputs `ACP-289`'s
+/// verify enumerates (`on`/`enabled`/`off`/`disabled`/no-arg/`toggle`/a typo) was asserted anywhere.
+///
+/// The surprise is the last one: upstream's `enabled === null` branch is reached by **every**
+/// unrecognised word, not only by the literal `toggle`, so `/autocompact onn` **inverts** the flag
+/// rather than printing a usage line. That is the behaviour a later reader will "fix" into a usage
+/// line; it is upstream's, it is preserved, and it is now a failing test rather than a review note.
+///
+/// The lowercasing is upstream's `(args[0] ?? 'toggle').toLowerCase()` and lives here so the
+/// 8-word table is pinned with the inputs that reach it.
+#[must_use]
+fn autocompact_target(arg: Option<&str>, current: bool) -> bool {
+    let mode = arg.map_or_else(|| "toggle".to_string(), str::to_lowercase);
+    match mode.as_str() {
         "on" | "true" | "enable" | "enabled" => true,
         "off" | "false" | "disable" | "disabled" => false,
-        _ => !session.auto_compaction_enabled(),
-    };
-    session.set_auto_compaction_enabled(enabled);
-    vec![chunk(format!(
+        // Upstream's `enabled === null` branch: `toggle`, and every typo, inverts.
+        _ => !current,
+    }
+}
+
+/// `ACP-289`'s answer, byte-for-byte — upstream's
+/// `` `Auto-compaction ${enabled ? 'enabled' : 'disabled'}.` ``, trailing period included.
+#[must_use]
+fn autocompact_text(enabled: bool) -> String {
+    format!(
         "Auto-compaction {}.",
         if enabled { "enabled" } else { "disabled" }
-    ))]
+    )
 }
 
 /// `/export` (`ACP-288`) — and the security control that makes it safe (`ACP-291`).
@@ -964,6 +1117,9 @@ fn autocompact(tokens: &[String], session: &AgentSession) -> Vec<SessionUpdate> 
 /// containment cannot be simplified away into a `format!`. `ACP-Q45` and `ACP-Q46` are pre-decided
 /// and are not reversible here: **no client-supplied path is accepted**, and containment is a real
 /// boundary check.
+///
+/// The *directory* that check confines the write to is [`export_dir`]'s, not the caller's — see
+/// that function for the slot race a containment check cannot see.
 ///
 /// # [CYRUP-DELTA] — the guard branches and the empty-path branch are gone; overwrite is parity
 ///
@@ -1003,7 +1159,7 @@ async fn export(
     // `cwd.join(format!("cyrup-session-{session_id}.html"))` here does not compile, which is the
     // point: `ACP-Q45`'s rule ("`/export` composes its own path and containment-checks it") is a
     // property of the types rather than of this line staying as written.
-    let path = session_id.export_path_in(cwd.as_path())?;
+    let path = session_id.export_path_in(export_dir(cwd, &session.services().cwd))?;
     let written = session
         .export_to_html(Some(path.as_path()))
         .await
@@ -1016,15 +1172,58 @@ async fn export(
         // a file name. The fallback is the id rather than a panic or an `unwrap`.
         .unwrap_or_else(|| format!("cyrup-session-{session_id}.html"));
 
-    Ok(vec![
+    Ok(export_updates(name, file_uri(&written)))
+}
+
+/// Which directory `/export` writes into (`NEW`, area 4e — the ACP-291 failure class through the
+/// cwd rather than through the id).
+///
+/// **The session's own cwd wins, always.** Upstream is `join(session.cwd, …)` where `session` is
+/// the *resolved binding*; the `cwd` this function is handed comes from
+/// [`crate::sessions::SessionManager`]'s live slot, which is the one slot read on this path that
+/// does not filter on the session id — `get`, `take_live`, `turn_for` and `rename_echo_for` all do.
+/// `serve_prompt` resolves the session and then runs spawned, while `session/new` and
+/// `session/load` replace the slot from a different task, so a client that pipelines a
+/// `session/new` for project **B** behind a `/export` prompt for session **A** would otherwise get
+/// `cyrup-session-<A-id>.html` written into **B**'s working directory. Containment still held —
+/// [`AcpSessionId::export_path_in`] confines the write to the directory it is handed — but it held
+/// against the *wrong* directory, so it is a mislocated file rather than an escape.
+///
+/// The connection's cwd is kept as a **cross-check** rather than dropped: the two agree on every
+/// non-racing path (a session is built by `build_and_install` with exactly the `AbsCwd` it stores
+/// in the slot), so a disagreement is the race itself and is worth a log line. It is deliberately
+/// *not* a refusal — the session's cwd is the correct destination either way, and refusing would
+/// turn a benign slot move into a failed export.
+fn export_dir<'a>(connection_cwd: &'a AbsCwd, session_cwd: &'a Path) -> &'a Path {
+    if connection_cwd.as_path() != session_cwd {
+        tracing::warn!(
+            slot_cwd = %connection_cwd.as_path().display(),
+            session_cwd = %session_cwd.display(),
+            "ACP-288: the live-session slot moved under /export; exporting into the session's own cwd"
+        );
+    }
+    session_cwd
+}
+
+/// `ACP-288`'s wire shape, as a value.
+///
+/// Split out of [`export`] for [`compact_refusal`]'s reason — the rest of that function needs a
+/// live `AgentSession` — and because every part of this emission is one character from a
+/// divergence that no test would have caught: the **two** updates and their order, the trailing
+/// space in `"Session exported: "` (upstream's own comment explains it: clients concatenate chunks,
+/// so a newline or a missing space produces the "link + duplicate plain text" look), and the
+/// resource link's `mimeType: "text/html"` and `title: "Session exported"`.
+#[must_use]
+fn export_updates(name: String, uri: String) -> Vec<SessionUpdate> {
+    vec![
         // Upstream's exact prefix, trailing space preserved and NO newline.
         chunk("Session exported: "),
         SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::ResourceLink(
-            ResourceLink::new(name, file_uri(&written))
+            ResourceLink::new(name, uri)
                 .mime_type("text/html".to_string())
                 .title("Session exported".to_string()),
         ))),
-    ])
+    ]
 }
 
 /// `file://<absolute path>` — upstream's `` `file://${resultPath}` ``, unencoded.
@@ -1806,9 +2005,346 @@ mod tests {
 
     // ---- the arms that need no session ----------------------------------------------------------
 
+    /// The plain text of an `agent_message_chunk` — the shape every built-in answers with. Panics
+    /// naming what actually arrived, so a wrong update type reads as a wrong update type rather
+    /// than as a string mismatch.
+    #[track_caller]
+    fn chunk_text(update: &SessionUpdate) -> &str {
+        let SessionUpdate::AgentMessageChunk(chunk) = update else {
+            panic!("expected an agent_message_chunk, got {update:?}");
+        };
+        let ContentBlock::Text(text) = &chunk.content else {
+            panic!("expected plain text, got {:?}", chunk.content);
+        };
+        &text.text
+    }
+
+    /// The single chunk of a one-update answer.
+    #[track_caller]
+    fn only_chunk(updates: &[SessionUpdate]) -> &str {
+        assert_eq!(
+            updates.len(),
+            1,
+            "one chunk, not {}: {updates:?}",
+            updates.len()
+        );
+        chunk_text(&updates[0])
+    }
+
+    /// **ACP-283** — `/compact`'s output string, whose three format decisions are each one
+    /// character from a divergence and none of which was asserted anywhere.
+    ///
+    /// `ACP-283`'s verify, verbatim: "`/compact tighten it` emits exactly `"Compaction completed.
+    /// (custom instructions applied)\nTokens before: <n>\n\n<summary>"` as one chunk; no args omits
+    /// the parenthetical".
+    #[test]
+    fn the_compaction_summary_has_upstreams_exact_shape() {
+        // Custom instructions + a summary: the parenthetical's LEADING SPACE, one `\n` before the
+        // token line, two before the summary.
+        assert_eq!(
+            compaction_text(Some("tighten it"), 1234, "It was tightened."),
+            "Compaction completed. (custom instructions applied)\nTokens before: 1234\n\nIt was tightened."
+        );
+        // No argument omits the parenthetical and nothing else.
+        assert_eq!(
+            compaction_text(None, 1234, "It was tightened."),
+            "Compaction completed.\nTokens before: 1234\n\nIt was tightened."
+        );
+        // JS truthiness on `''`, preserved: an empty summary omits the block AND its blank line.
+        assert_eq!(
+            compaction_text(None, 0, ""),
+            "Compaction completed.\nTokens before: 0"
+        );
+        assert!(
+            !compaction_text(None, 0, "").ends_with('\n'),
+            "an empty summary must not leave a trailing separator"
+        );
+        // The `Tokens before:` line is unconditional here — see the arm's delta (upstream omitted
+        // it when pi's untyped reply lacked the key; `CompactionResult::tokens_before` is a `u64`).
+        for summary in ["", "s"] {
+            assert!(compaction_text(Some("c"), 7, summary).contains("\nTokens before: 7"));
+        }
+    }
+
+    /// **ACP-284** — `/session`'s five-line shape, including the `Tokens:` line's five sub-parts in
+    /// order and the one genuinely conditional line.
+    ///
+    /// The integration case (`crates/cyrup-it/tests/bin/acp_session.rs`) asserts the `Session:`
+    /// prefix, `\nMessages: ` and `\nCost: $` and stops, so a reordering of the token sub-parts, or
+    /// a `session_file` that became always-`Some`, passed in both directions.
+    #[test]
+    fn the_session_stats_block_is_five_lines_in_upstreams_order() {
+        let stats = cyrup_session_svc::SessionStats {
+            session_file: Some("/tmp/p/.cyrup/sessions/s1.jsonl".to_string()),
+            session_id: "s1".to_string(),
+            total_messages: 12,
+            cost: 0.012_345,
+            tokens: cyrup_session_svc::StatsTokens {
+                input: 1,
+                output: 2,
+                cache_read: 3,
+                cache_write: 4,
+                total: 10,
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            stats_text(&stats),
+            "Session: s1\n\
+             Session file: /tmp/p/.cyrup/sessions/s1.jsonl\n\
+             Messages: 12\n\
+             Cost: $0.012\n\
+             Tokens: in 1, out 2, cache read 3, cache write 4, total 10"
+        );
+
+        // The ONE conditional line: an in-memory session omits `Session file:` and nothing else,
+        // so the block is four lines with the other four unchanged.
+        let in_memory = cyrup_session_svc::SessionStats {
+            session_file: None,
+            ..stats.clone()
+        };
+        let text = stats_text(&in_memory);
+        assert!(!text.contains("Session file:"), "{text}");
+        assert_eq!(text.lines().count(), 4, "{text}");
+        assert_eq!(
+            text,
+            "Session: s1\nMessages: 12\nCost: $0.012\n\
+             Tokens: in 1, out 2, cache read 3, cache write 4, total 10"
+        );
+        // The `$` and the three decimals are cyrup's, deliberately (see the arm's delta): pi-acp
+        // printed JS default number formatting. Sub tenth-of-a-cent renders as `$0.000`.
+        assert!(stats_text(&stats).contains("\nCost: $0.012"));
+        assert!(
+            stats_text(&cyrup_session_svc::SessionStats {
+                cost: 0.000_04,
+                ..stats
+            })
+            .contains("\nCost: $0.000")
+        );
+    }
+
+    /// **ACP-285** — `/name` emits the `session_info_update` **here**, before its own chunk, and
+    /// exactly one of each.
+    ///
+    /// This is the half of `ACP-285`'s verify that the pump cannot carry. The two updates and the
+    /// [`RenameEcho`] claim are one unit: deleting this emission while leaving `claim.keep()` in
+    /// place makes the pump swallow the fanout's copy and the client sees **zero** renames. The
+    /// count and the order are asserted on the wire shape, which is what a client parses.
+    #[test]
+    fn a_rename_emits_one_titled_update_then_the_confirmation() {
+        let updates = name_updates("my project", "2026-09-05T12:00:00.000Z".to_string());
+        assert_eq!(updates.len(), 2, "exactly one of each: {updates:?}");
+
+        // Upstream's order: the update first, the confirmation second.
+        let wire = serde_json::to_value(&updates[0]).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "sessionUpdate": "session_info_update",
+                "title": "my project",
+                "updatedAt": "2026-09-05T12:00:00.000Z"
+            }),
+            "the causer's own session_info_update"
+        );
+        assert_eq!(chunk_text(&updates[1]), "Session name set: my project");
+
+        // Exactly one titled update, from this function — not zero (the hazard the delta names).
+        assert_eq!(
+            updates
+                .iter()
+                .filter(|u| matches!(u, SessionUpdate::SessionInfoUpdate(_)))
+                .count(),
+            1
+        );
+    }
+
+    /// **NEW (area 4e)** — a failing `/name` answers with a chunk and ends the turn, as upstream's
+    /// `catch` does, instead of rejecting the whole `session/prompt`.
+    ///
+    /// The rejection sent a JSON-RPC error frame for a disk error on a rename, so a Zed user saw a
+    /// failed request rather than a message. `dispatch`'s `# Errors` paragraph now names `compact`
+    /// and `export` as the only rejecting arms and this is what makes that exhaustive: `name`
+    /// returns `Vec<SessionUpdate>`, so an `Err` from it is not representable.
+    #[test]
+    fn a_failing_rename_is_answered_not_rejected() {
+        let updates = name_failure_updates("permission denied (os error 13)");
+        assert_eq!(
+            only_chunk(&updates),
+            "Failed to set session name: permission denied (os error 13)"
+        );
+        // Upstream's version-skew hint is cut (see the arm's second delta), so the message is the
+        // error's own text and nothing else.
+        assert!(!only_chunk(&updates).contains("newer pi version"));
+        // The usage line is upstream's too, and is the empty-argument answer rather than a getter.
+        assert_eq!(NAME_USAGE, "Usage: /name <name>");
+    }
+
+    /// **ACP-286 / ACP-287** — the three branches, their three exact strings, and the write
+    /// decision, for both commands.
+    ///
+    /// Upstream's own component test (`test/component/agent-steering-followup-modes.test.ts`)
+    /// asserts `setTo === 'one-at-a-time'` on the set branch and `called === false` on the invalid
+    /// one; here those are the returned `Option<QueueMode>`, so a read or a usage line that started
+    /// writing fails rather than silently changing a mode.
+    #[test]
+    fn the_queue_mode_arm_has_three_branches_and_three_strings() {
+        // No argument reports the current mode — `ACP-286`'s `Steering mode: all` verbatim.
+        let (updates, write) = queue_mode_updates(QueueKind::Steering, None, QueueMode::All);
+        assert_eq!(only_chunk(&updates), "Steering mode: all");
+        assert_eq!(write, None, "a read must not write");
+        let (updates, write) = queue_mode_updates(QueueKind::FollowUp, None, QueueMode::OneAtATime);
+        assert_eq!(only_chunk(&updates), "Follow-up mode: one-at-a-time");
+        assert_eq!(write, None);
+
+        // Setting: the string and the mode that is actually written.
+        let (updates, write) =
+            queue_mode_updates(QueueKind::Steering, Some("one-at-a-time"), QueueMode::All);
+        assert_eq!(only_chunk(&updates), "Steering mode set to: one-at-a-time");
+        assert_eq!(write, Some(QueueMode::OneAtATime));
+        let (updates, write) =
+            queue_mode_updates(QueueKind::FollowUp, Some("all"), QueueMode::OneAtATime);
+        assert_eq!(only_chunk(&updates), "Follow-up mode set to: all");
+        assert_eq!(write, Some(QueueMode::All));
+
+        // Upstream's `toLowerCase()` on the argument, and only on the argument.
+        let (updates, write) =
+            queue_mode_updates(QueueKind::Steering, Some("ALL"), QueueMode::OneAtATime);
+        assert_eq!(only_chunk(&updates), "Steering mode set to: all");
+        assert_eq!(write, Some(QueueMode::All));
+
+        // Anything else is the usage line, and writes NOTHING (upstream's `called === false`).
+        for bad in ["nope", "???", "one at a time", ""] {
+            let (updates, write) =
+                queue_mode_updates(QueueKind::Steering, Some(bad), QueueMode::All);
+            assert_eq!(write, None, "`{bad}` must not write a mode");
+            if bad.is_empty() {
+                // An empty argument is upstream's `String(args[0] ?? '')` read branch, not usage.
+                assert_eq!(only_chunk(&updates), "Steering mode: all");
+            } else {
+                assert_eq!(
+                    only_chunk(&updates),
+                    "Usage: /steering all | /steering one-at-a-time"
+                );
+            }
+        }
+        let (updates, write) =
+            queue_mode_updates(QueueKind::FollowUp, Some("nope"), QueueMode::All);
+        assert_eq!(
+            only_chunk(&updates),
+            "Usage: /follow-up all | /follow-up one-at-a-time"
+        );
+        assert_eq!(write, None);
+    }
+
+    /// **ACP-289** — `/autocompact`'s seven inputs, including the upstream quirk that a typo
+    /// toggles, and the two answer strings.
+    ///
+    /// The arm had no test at all. The quirk is the one a later reader will "fix" into a usage
+    /// line: upstream's `enabled === null` branch is reached by every unrecognised word.
+    #[test]
+    fn autocompact_accepts_eight_words_and_toggles_on_everything_else() {
+        // The accept table, from both starting states so a table entry that fell through to the
+        // inversion cannot pass by coincidence.
+        for word in ["on", "true", "enable", "enabled"] {
+            assert!(autocompact_target(Some(word), false), "`{word}`");
+            assert!(autocompact_target(Some(word), true), "`{word}`");
+        }
+        for word in ["off", "false", "disable", "disabled"] {
+            assert!(!autocompact_target(Some(word), false), "`{word}`");
+            assert!(!autocompact_target(Some(word), true), "`{word}`");
+        }
+        // Upstream lowercases the argument.
+        assert!(autocompact_target(Some("ON"), false));
+        assert!(!autocompact_target(Some("Disabled"), true));
+
+        // No argument is upstream's `args[0] ?? 'toggle'` — it inverts.
+        assert!(autocompact_target(None, false));
+        assert!(!autocompact_target(None, true));
+        assert!(autocompact_target(Some("toggle"), false));
+
+        // THE QUIRK: every unrecognised word inverts rather than printing usage. `/autocompact
+        // onn` flips the flag. Upstream's behaviour, preserved deliberately.
+        for typo in ["onn", "offf", "yes", "??"] {
+            assert!(autocompact_target(Some(typo), false), "`{typo}` toggles on");
+            assert!(
+                !autocompact_target(Some(typo), true),
+                "`{typo}` toggles off"
+            );
+        }
+
+        // The two answers, byte-for-byte, trailing period included.
+        assert_eq!(autocompact_text(true), "Auto-compaction enabled.");
+        assert_eq!(autocompact_text(false), "Auto-compaction disabled.");
+    }
+
+    /// **ACP-288** — `/export` emits exactly two chunks: the trailing-space prefix, then a
+    /// `resource_link` with the `text/html` mime type and the `Session exported` title.
+    ///
+    /// Asserted on the wire shape because that is what the client concatenates: upstream's comment
+    /// on this arm explains that the trailing space (rather than a newline, and rather than
+    /// nothing) is what avoids the "link + duplicate plain text" look.
+    #[test]
+    fn the_export_emits_the_prefix_chunk_then_the_resource_link() {
+        let updates = export_updates(
+            "cyrup-session-2026-09-05_abc123.html".to_string(),
+            "file:///tmp/project/cyrup-session-2026-09-05_abc123.html".to_string(),
+        );
+        assert_eq!(updates.len(), 2, "exactly two chunks: {updates:?}");
+        assert_eq!(
+            chunk_text(&updates[0]),
+            "Session exported: ",
+            "the trailing space is load-bearing and there is NO newline"
+        );
+        assert_eq!(
+            serde_json::to_value(&updates[1]).unwrap(),
+            serde_json::json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                    "type": "resource_link",
+                    "name": "cyrup-session-2026-09-05_abc123.html",
+                    "uri": "file:///tmp/project/cyrup-session-2026-09-05_abc123.html",
+                    "mimeType": "text/html",
+                    "title": "Session exported"
+                }
+            })
+        );
+    }
+
+    /// **NEW (area 4e)** — `/export` writes into the **session's own** cwd, never the live slot's.
+    ///
+    /// The slot read in `SessionManager::serve_builtin` is the one on this path that does not
+    /// filter on the session id, and `session/new` replaces it from a different task while
+    /// `serve_prompt` runs spawned. A client that pipelines a `session/new` for project B behind a
+    /// `/export` for session A would otherwise get A's HTML written into B's directory —
+    /// containment holds, against the wrong directory.
+    #[test]
+    fn the_export_directory_is_the_sessions_own_cwd_not_the_slot() {
+        let session_cwd = std::path::Path::new("/tmp/project-a");
+        // The agreeing case: identical, and the session's is returned.
+        let agreeing = AbsCwd::parse("/tmp/project-a").unwrap();
+        assert_eq!(export_dir(&agreeing, session_cwd), session_cwd);
+        // The race: the slot has moved to another project. The SESSION wins.
+        let moved = AbsCwd::parse("/tmp/project-b").unwrap();
+        assert_eq!(
+            export_dir(&moved, session_cwd),
+            session_cwd,
+            "the slot's cwd must never decide where a session's export lands"
+        );
+        // And the composed path follows it, so B's directory is never written to.
+        let id = AcpSessionId::parse("2026-09-05_abc123").unwrap();
+        let path = id.export_path_in(export_dir(&moved, session_cwd)).unwrap();
+        assert_eq!(
+            path.as_path(),
+            std::path::Path::new("/tmp/project-a/cyrup-session-2026-09-05_abc123.html")
+        );
+        assert!(!path.as_path().starts_with("/tmp/project-b"));
+    }
+
     /// ACP-286 / ACP-287 — the wire spelling of a queue mode, and the two labels that make the two
-    /// commands distinguishable. The "they write to different modes" half needs a live session and
-    /// is a `cyrup-it` assertion; this pins every string it would read.
+    /// commands distinguishable. The three composed strings and the write *decision* are
+    /// `the_queue_mode_arm_has_three_branches_and_three_strings`'; what is left over is
+    /// [`QueueKind::write`]'s mapping onto `set_steering_mode`/`set_follow_up_mode`, which needs a
+    /// live session and is a `cyrup-it` assertion. This pins the pieces both of those read.
     #[test]
     fn the_queue_mode_spelling_round_trips() {
         for mode in [QueueMode::All, QueueMode::OneAtATime] {

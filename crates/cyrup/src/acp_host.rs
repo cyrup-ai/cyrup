@@ -12,6 +12,7 @@
 //! `cyrup_acp::AcpFailure::classify` is written against.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use cyrup_acp::{AcpError, AcpHost, AgentSessionRuntime, BoxFuture, RuntimeRequest, SessionsRoot};
 use cyrup_config::AppMode;
@@ -26,6 +27,28 @@ pub struct BinaryAcpHost {
     factory: Arc<SessionFactory>,
     sessions_root: SessionsRoot,
     cancel: CancelToken,
+    /// What the ONE shutdown watcher tears down, re-pointed by each [`AcpHost::runtime_ready`].
+    /// See [`crate::signals::RuntimeSlot`] for why this is a slot and not a captured `Arc`.
+    watcher_target: crate::signals::RuntimeSlot,
+    /// Whether the watcher has been armed. See [`claim_watcher`].
+    watcher_armed: AtomicBool,
+}
+
+/// Claim the right to arm the shutdown watcher: `true` for exactly ONE caller, ever.
+///
+/// `AcpHost::runtime_ready` is called on every `session/new` and, through `build_and_install`, on
+/// every `session/load` — both routine in Zed. Arming a watcher per call left N tasks each running
+/// the whole of [`crate::signals::spawn_abort_on_signal_slot`]'s body on a single SIGTERM: N drains,
+/// N repeat watchers, and N racing `std::process::exit(143)`. The stale watchers' runtimes are
+/// already disposed (`cyrup_acp::SessionManager::install` disposes the one it replaces), so their
+/// `dispose()` returns immediately and one of them can exit the process out from under the live
+/// session's `session_shutdown` fanout and fsync drain.
+///
+/// A swap rather than a `OnceLock` because the answer is a bit, and rather than a `bool` behind the
+/// existing lock because `runtime_ready` is `&self` on a `Sync` trait object and two `session/new`
+/// requests can be dispatched concurrently — `swap` makes "who arms it" a single atomic decision.
+fn claim_watcher(armed: &AtomicBool) -> bool {
+    !armed.swap(true, Ordering::SeqCst)
 }
 
 impl BinaryAcpHost {
@@ -42,6 +65,8 @@ impl BinaryAcpHost {
             factory,
             sessions_root,
             cancel,
+            watcher_target: crate::signals::RuntimeSlot::new(),
+            watcher_armed: AtomicBool::new(false),
         }
     }
 }
@@ -90,20 +115,74 @@ impl AcpHost for BinaryAcpHost {
     }
 
     fn runtime_ready(&self, runtime: &Arc<AgentSessionRuntime>) {
+        // Point the watcher at this runtime FIRST, so the ordering holds for both callers: the
+        // arming call below finds a non-empty slot, and every later call has re-pointed the
+        // already-running watcher before it returns to `SessionManager::install`.
+        self.watcher_target.set(Arc::clone(runtime));
+
         // `ACP-023` / `ACP-006` — arm the shutdown watcher on the first runtime, exactly as the
         // `Rpc` arm does in `main`, but at the point the runtime first exists rather than before it
         // (see `AcpHost::runtime_ready`'s doc for why the startup window that leaves is empty).
         //
-        // The handle is deliberately dropped: `spawn_abort_on_signal`'s own doc states that
+        // ONE watcher for the connection, not one per runtime: `runtime_ready` fires on every
+        // `session/new` and every `session/load`, and a second watcher would race the first for
+        // `std::process::exit` on the next SIGTERM. See [`claim_watcher`].
+        //
+        // The handle is deliberately dropped: `spawn_abort_on_signal_slot`'s own doc states that
         // dropping it does not stop the watcher, which lives for the run.
-        let _watcher = crate::signals::spawn_abort_on_signal(
-            Arc::clone(runtime),
-            self.cancel.clone(),
-            AppMode::Acp,
-        );
+        if claim_watcher(&self.watcher_armed) {
+            let _watcher = crate::signals::spawn_abort_on_signal_slot(
+                self.watcher_target.clone(),
+                self.cancel.clone(),
+                AppMode::Acp,
+            );
+        }
     }
 
     fn sessions_root(&self) -> SessionsRoot {
         self.sessions_root.clone()
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+
+    use super::claim_watcher;
+
+    /// One watcher per CONNECTION, not per runtime. `runtime_ready` fires on every `session/new`
+    /// and every `session/load`; before this, each of those spawned a watcher of its own and one
+    /// SIGTERM ran the whole teardown body N times, with N racing `std::process::exit(143)` — the
+    /// stale ones returning instantly from an already-disposed `dispose()` and able to kill the
+    /// process mid-`session_shutdown` fanout for the live session.
+    #[test]
+    fn only_the_first_runtime_arms_a_watcher() {
+        let armed = AtomicBool::new(false);
+        let claims = (0..8).filter(|_| claim_watcher(&armed)).count();
+        assert_eq!(claims, 1, "exactly one runtime may arm the watcher");
+    }
+
+    /// Two `session/new` requests can be in flight at once — `AcpHost` is a `Sync` trait object and
+    /// `cyrup_acp::connection` dispatches each off the loop — so the claim has to be atomic, not a
+    /// read-then-write on a plain flag.
+    #[test]
+    fn concurrent_runtime_ready_calls_still_arm_exactly_one() {
+        let armed = std::sync::Arc::new(AtomicBool::new(false));
+        let winners: Vec<bool> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| {
+                    let armed = std::sync::Arc::clone(&armed);
+                    scope.spawn(move || claim_watcher(&armed))
+                })
+                .collect();
+            handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        });
+        assert_eq!(winners.len(), 16, "every thread must report");
+        assert_eq!(
+            winners.into_iter().filter(|won| *won).count(),
+            1,
+            "exactly one concurrent caller may arm the watcher"
+        );
     }
 }

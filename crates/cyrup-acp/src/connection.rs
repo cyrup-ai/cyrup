@@ -240,17 +240,32 @@ impl AcpConnection {
 /// (EOF) and `ACP-023` (signals) are both written to that rule, and this is why `ACP-023`'s
 /// watcher exits the process itself rather than unwinding through here.
 ///
+/// # `ACP-005` — the live session is disposed when the transport ends
+///
+/// Stdin EOF is the ACP host's NORMAL termination (the editor quit, or the user closed the project
+/// window), and it arrives here as `connect_to` simply returning. [`serve`] therefore calls
+/// [`SessionManager::shutdown`] on **every** exit path out of `connect_to`, before the result is
+/// propagated — pi-acp's `stdin.on('end') | stdin.on('close') → shutdown()`, which is
+/// `agent.dispose()` then `process.exit(0)` (`src/index.ts:54-69` → `agent.ts:129-130` →
+/// `session.ts:155 disposeAll()`).
+///
 /// # Errors
 ///
 /// [`AcpError::Transport`] for a real transport fault. A client that closes the pipe is **not** a
-/// fault — see `crate::run_acp`, which is the function `crates/cyrup/src/run.rs` calls, and which
-/// applies `ACP-004`'s broken-pipe rule before this error escapes.
+/// fault — see `run_acp_dispatch` in `crates/cyrup/src/run.rs`, which is the function that calls
+/// this one, and which applies `ACP-004`'s broken-pipe rule before this error escapes.
 pub async fn serve_stdio(host: Arc<dyn AcpHost>) -> Result<(), AcpError> {
     serve(host, agent_client_protocol::Stdio::new()).await
 }
 
 /// [`serve_stdio`] over an arbitrary transport, so `cyrup-it` can drive a pipe pair without
 /// spawning a process and the handler table can be exercised in one place.
+///
+/// Owns `ACP-005`'s teardown for both entry points — see [`serve_stdio`]'s doc.
+///
+/// # Errors
+///
+/// [`AcpError::Transport`], exactly as [`serve_stdio`]; the shutdown runs first either way.
 pub async fn serve(
     host: Arc<dyn AcpHost>,
     transport: impl ConnectTo<Agent> + 'static,
@@ -270,7 +285,7 @@ pub async fn serve(
     let set_config = conn.clone();
     let cancel = conn.clone();
 
-    Agent
+    let served = Agent
         .builder()
         .name("cyrup-acp")
         // ---- initialize ---------------------------------------------------------------------
@@ -427,7 +442,29 @@ pub async fn serve(
         )
         .connect_to(transport)
         .await
-        .map_err(AcpError::Transport)
+        .map_err(AcpError::Transport);
+
+    // `ACP-005` — the teardown, on EVERY exit path out of the transport, before the result is
+    // propagated. This is deliberately the shape of `run_rpc_dispatch`
+    // (`crates/cyrup/src/run.rs`), which disposes unconditionally and only then applies `?` to what
+    // the mode returned: the client closing the pipe is the normal termination here, so a session
+    // must not survive it un-disposed, and a genuine transport fault must not skip the teardown
+    // either. Without this call `AgentSessionRuntime::dispose` never runs on the EOF path, so no
+    // `session_shutdown{reason:"quit"}` is emitted to any extension and `session_cancel` never
+    // fires — leaving one orphaned `setsid` process group per still-running background command,
+    // per editor quit.
+    //
+    // It lives HERE rather than in `run_acp_dispatch` because `conn` — and therefore the
+    // `SessionManager` holding the live slot — is owned by this function; the alternative
+    // (`serve` handing the `Arc<SessionManager>` back so the binary can call it) would put the
+    // obligation on every future caller instead of discharging it once.
+    //
+    // `SessionManager::shutdown` is idempotent and a no-op with nothing live, so the `ACP-004`
+    // hang-up arm and a clean EOF reach it identically and neither has to agree with the other
+    // about who owns the teardown.
+    conn.sessions().shutdown().await;
+
+    served
 }
 
 #[cfg(test)]

@@ -56,6 +56,15 @@
 //! route and assert the client is told) is the assertion that covers it, and it can only be written
 //! at the pump.
 //!
+//! **The one exception, and why it is not a hole in the rule (`ACP-072`).** "The pump emits it" is
+//! only true of a *change*: `AgentSession::set_thinking_level` early-returns without emitting
+//! `ThinkingLevelChanged` when the clamped level equals the level already in effect, so a
+//! `session/set_mode` that applies the current level produced no notification from anywhere — and
+//! `SetSessionModeResponse` is `_meta`-only, so the response could not carry the correction either.
+//! [`apply_mode`] therefore returns [`ModeApplication::echo`], populated **only** in that case
+//! ([`pump_emits_mode_change`] is the whole test), for its caller to put on the wire. Every other
+//! set still leaves `echo` empty and stays the pump's alone.
+//!
 //! `ACP-075`'s discipline survives unchanged and moves to [`config_options_update`]: the pushed set
 //! is **re-derived** from the session, never patched from the request, so a clamped thinking level
 //! and a provider-swapped model stay honest in the client's dropdown.
@@ -361,6 +370,24 @@ pub enum AppliedKnob {
     Model(String),
     /// The thinking level now in effect, **after** clamping.
     Thinking(ModelThinkingLevel),
+}
+
+/// The outcome of a `session/set_mode`: the level that took effect, and the notifications the
+/// caller must send **itself** because [`config_pump`](crate::sessions) will not (`ACP-072`).
+///
+/// See [`apply_mode`] for the hole this closes and [`pump_emits_mode_change`] for the rule that
+/// decides when `echo` is populated. `echo` is empty on every ordinary change — the pump owns
+/// those (`ACP-Q20`) — so a caller that forwards it unconditionally cannot double-emit.
+#[derive(Clone, Debug)]
+pub struct ModeApplication {
+    /// The thinking level now in effect, **after** clamping — never the request's id.
+    pub applied: ModelThinkingLevel,
+    /// `current_mode_update` + `config_option_update`, in that order, or empty.
+    ///
+    /// The caller addresses these to the request's `sessionId`:
+    /// `SetSessionModeResponse` carries no session and `SessionScoped` for it yields `None`
+    /// (`crate::lib`), so they cannot ride `HandlerOutcome::follow_up`.
+    pub echo: Vec<SessionUpdate>,
 }
 
 /// What the advertiser needs to know about the session, so [`SessionConfigKnob::advertise`] stays
@@ -707,16 +734,95 @@ pub async fn session_surface(
     )
 }
 
+/// Whether [`config_pump`](crate::sessions) will emit this mode change on its own (`ACP-072`,
+/// `ACP-Q20`).
+///
+/// **This is the whole of `ACP-072`, as a predicate.** `ACP-Q20` made the pump the single emitter
+/// of `current_mode_update` / `config_option_update`, and the pump is driven by
+/// `AgentSessionEvent::ThinkingLevelChanged` — which `AgentSession::set_thinking_level` emits
+/// **only on a real change**: `if effective == previous { return Ok(effective); }`
+/// (`crates/cyrup-session-svc/src/session/thinking.rs`, pi's own `if (isChanging)` guard at
+/// `agent-session.ts:1688-1697`). So a `session/set_mode` whose applied level equals the level
+/// already in effect emits nothing anywhere, and `SetSessionModeResponse` is `_meta`-only — it has
+/// no field that could carry the correction the way `SetSessionConfigOptionResponse.configOptions`
+/// does for the `thought_level` arm.
+///
+/// That is reachable with a spec-compliant client, and it is the case `ACP-072` tables: a
+/// non-reasoning model advertises the one-rung `[off]` ladder and the session sits at `off`; a
+/// client restoring a persisted selection sends `{modeId:"medium"}`; `parse_mode` accepts any rung
+/// by design (`ACP-Q19` — accept and clamp, never reject a well-formed level); `set_thinking_level`
+/// clamps `Medium` to `Off`; `Off == previous`; nothing is emitted and the response is `{}`. The
+/// client's mode selector then reads `Thinking: medium` for the rest of the session while the agent
+/// is off. The same shape is the *normal* case on a modelless session, which `ACP-Q7` keeps alive:
+/// `available_thinking_levels()` returns the full seven-rung ladder with no model resolved while
+/// `set_thinking_level` clamps every rung to `Off`.
+///
+/// Upstream is wrong in the other direction and self-corrects: `setSessionMode`
+/// (`src/acp/agent.ts:1151-1162` @v0.0.33) emits `current_mode_update` with the **requested** id
+/// unconditionally and then re-derives the option set, so the dropdown lands on the truth one
+/// notification later. This port emits the **applied** level and only when the pump will not, which
+/// is upstream's guarantee without upstream's wrong intermediate value.
+#[must_use]
+pub fn pump_emits_mode_change(previous: ModelThinkingLevel, applied: ModelThinkingLevel) -> bool {
+    previous != applied
+}
+
+/// The notifications a no-op `session/set_mode` must send in the pump's place (`ACP-072`).
+///
+/// `current_mode_update` **first** — it is what moves the client's mode selector — then the
+/// re-derived `config_option_update` for a client that renders the `thought_level` dropdown
+/// instead. Exactly the pair, in exactly the order, that
+/// `crate::sessions::session_updates_for`'s `ThinkingLevelChanged` arm sends, so the two emitters
+/// are indistinguishable on the wire and a client cannot tell which route a change came by.
+///
+/// Takes the applied level and an already-derived option set rather than a session, so the order
+/// and the contents are assertable without a runtime.
+#[must_use]
+pub fn mode_echo(
+    applied: ModelThinkingLevel,
+    options: Vec<SessionConfigOption>,
+) -> Vec<SessionUpdate> {
+    vec![current_mode_update(applied), config_option_update(options)]
+}
+
 /// `session/set_mode`'s whole body below the `Unknown sessionId` gate (`ACP-072`, `ACP-079`).
 ///
-/// Port of pi-acp v0.0.33 `agent.ts`'s `setSessionMode`, minus its two `sessionUpdate` calls
-/// (`ACP-Q20` — the pump emits them). The caller resolves the session against `req.session_id` and
-/// answers [`crate::SessionManager::unknown_session`](crate::sessions::SessionManager::unknown_session)
+/// Port of pi-acp v0.0.33 `agent.ts`'s `setSessionMode`. The caller resolves the session against
+/// `req.session_id` and answers
+/// [`crate::SessionManager::unknown_session`](crate::sessions::SessionManager::unknown_session)
 /// on a miss; everything after that is here.
 ///
-/// Returns the applied level alongside the response so the caller can hand it to the pump if the
-/// pump ever needs a nudge — and, more importantly, so a reader can see that the applied level
-/// exists and is not the request's.
+/// # [CYRUP-DELTA] — `ACP-Q20` stands, with the one exception `ACP-072` needs
+///
+/// **What differs.** `ACP-Q20` says the setters do not notify and the pump does, and that is still
+/// true for every change: [`ModeApplication::echo`] is **empty** whenever
+/// [`pump_emits_mode_change`] holds, so an ordinary `session/set_mode` still produces exactly one
+/// `current_mode_update` and one `config_option_update`, both from the pump. The exception is the
+/// case the pump cannot see at all — a set whose applied level equals the current one, which emits
+/// no `ThinkingLevelChanged` and therefore no pump output. There the setter carries the echo,
+/// because the alternative is silence and a client left rendering a mode the agent is not in.
+///
+/// **What it costs.** There are now two emitters for one notification pair rather than one, and
+/// the invariant that keeps them from doubling is [`pump_emits_mode_change`] alone — a single
+/// `!=`, tested directly, and the reason `echo` is a field the caller forwards blindly rather than
+/// a decision the caller makes.
+///
+/// The `previous` level is read **before** the set for the same reason `AppliedKnob` exists: it is
+/// the only moment at which the no-op is observable, and re-reading afterwards would compare a
+/// value against itself.
+///
+/// # The caller's obligation — [`ModeApplication::echo`] must be forwarded
+///
+/// This function still sends nothing; it cannot, because it holds an `AgentSession` and not the
+/// connection. `crate::sessions::SessionManager::set_mode` is the only caller and it owns the
+/// wire: `self.wire().notify(&req.session_id, update)` for each element of `echo`, before or after
+/// `HandlerOutcome::plain(response)` — the pair describes a state the session is already in, so
+/// their position relative to the response does not matter the way `ACP-068`'s does. They cannot
+/// ride `HandlerOutcome::follow_up`: `SessionScoped for SetSessionModeResponse` yields `None`
+/// (`crate::lib`) because the response names no session, so a follow-up on it is unaddressable and
+/// is silently discarded. **An `echo` that is dropped puts `ACP-072` straight back**, and the
+/// assertion that would catch it is a second `session/set_mode` for the level already applied,
+/// asserting exactly one `current_mode_update` carrying that level.
 ///
 /// This must not be awaited inline in the dispatch handler (`ACP-079`): `set_thinking_level`
 /// appends to the session file and then dispatches `HostEvent::ThinkingLevelSelect` into guest
@@ -730,10 +836,23 @@ pub async fn session_surface(
 pub async fn apply_mode(
     session: &AgentSession,
     mode_id: &SessionModeId,
-) -> Result<(ModelThinkingLevel, SetSessionModeResponse), AcpFailure> {
+) -> Result<(ModeApplication, SetSessionModeResponse), AcpFailure> {
     let knob = SessionConfigKnob::parse_mode(mode_id)?;
+    // `ACP-072` — before the set. After it, `previous` and `applied` are the same read.
+    let previous = session.thinking_level().await;
     match knob.apply(session).await? {
-        AppliedKnob::Thinking(level) => Ok((level, SetSessionModeResponse::new())),
+        AppliedKnob::Thinking(applied) => {
+            let echo = if pump_emits_mode_change(previous, applied) {
+                Vec::new()
+            } else {
+                // `ACP-075` — re-derived from the session, never patched from the request.
+                mode_echo(applied, config_options(session).await)
+            };
+            Ok((
+                ModeApplication { applied, echo },
+                SetSessionModeResponse::new(),
+            ))
+        }
         // Unreachable: `parse_mode` constructs only `Thinking`, and `apply` preserves the variant.
         // Answered rather than panicked, per the crate's no-panic rule.
         AppliedKnob::Model(id) => Err(AcpFailure::Internal {
@@ -769,8 +888,19 @@ pub async fn apply_config_option(
 
 /// [`config_options`] as the `session/update` the pump pushes (`ACP-075`, `ACP-077`).
 pub async fn config_options_update(session: &AgentSession) -> SessionUpdate {
+    config_option_update(config_options(session).await)
+}
+
+/// An already-derived option set as its `session/update` (`ACP-075`, `ACP-077`).
+///
+/// Split from [`config_options_update`] so the notification can be built in a pure test — and so
+/// [`mode_echo`] cannot accidentally re-read the session a second time and race the value it is
+/// echoing. The list must still come from [`config_options`]: `ACP-075`'s re-derive-rather-than-
+/// patch discipline is about where the list is read, not about who wraps it.
+#[must_use]
+pub fn config_option_update(options: Vec<SessionConfigOption>) -> SessionUpdate {
     SessionUpdate::ConfigOptionUpdate(agent_client_protocol::schema::v1::ConfigOptionUpdate::new(
-        config_options(session).await,
+        options,
     ))
 }
 
@@ -1345,6 +1475,83 @@ mod tests {
             serde_json::json!("xhigh"),
             "ACP-072: a test asserting only that `{{}}` came back passes the broken version"
         );
+    }
+
+    /// ACP-072 — the no-op set the pump cannot see, which is the whole of the gap.
+    ///
+    /// `AgentSession::set_thinking_level` early-returns before `fanout_emit` when the clamped level
+    /// equals the level already in effect (`crates/cyrup-session-svc/src/session/thinking.rs`), so
+    /// `config_pump` — the single emitter under `ACP-Q20` — never runs for such a set. Before this
+    /// predicate existed the setter also emitted nothing, and `SetSessionModeResponse` is
+    /// `_meta`-only, so `session/set_mode` produced NO notification at all and the client's mode
+    /// selector kept the value it optimistically rendered.
+    ///
+    /// The tabled case is the first assertion: a non-reasoning model advertises `[off]`, the
+    /// session is at `off`, a client sends `{modeId:"medium"}`, `parse_mode` accepts it
+    /// (`ACP-Q19` — accept and clamp), `set_thinking_level` clamps it to `off`, and `off == off`.
+    #[test]
+    fn a_set_mode_that_changes_nothing_is_the_case_the_pump_cannot_emit() {
+        // `[off]`-only model: every rung clamps to `off`, so the applied level equals the current.
+        assert!(
+            !pump_emits_mode_change(ModelThinkingLevel::Off, ModelThinkingLevel::Off),
+            "ACP-072: `medium` clamped to `off` on a session already at `off` emits no \
+             `ThinkingLevelChanged`, so the setter must carry the echo itself"
+        );
+        // Re-picking the level already shown, on a reasoning model — harmless, but equally silent.
+        assert!(!pump_emits_mode_change(
+            ModelThinkingLevel::Medium,
+            ModelThinkingLevel::Medium
+        ));
+        // And every real change stays the pump's, so `ACP-Q20` is not weakened into double-emission.
+        for (previous, applied) in [
+            (ModelThinkingLevel::Off, ModelThinkingLevel::Medium),
+            (ModelThinkingLevel::High, ModelThinkingLevel::Off),
+            (ModelThinkingLevel::Xhigh, ModelThinkingLevel::Max),
+        ] {
+            assert!(
+                pump_emits_mode_change(previous, applied),
+                "ACP-Q20: {previous:?} -> {applied:?} is the pump's to emit, not the setter's"
+            );
+        }
+    }
+
+    /// ACP-072 — the echo is the pump's own pair, in the pump's own order, carrying the APPLIED
+    /// level.
+    ///
+    /// `crate::sessions::session_updates_for`'s `ThinkingLevelChanged` arm sends
+    /// `current_mode_update` then `config_option_update`. A client must not be able to tell which
+    /// emitter a change came from, so this pins the same two, in the same order — and pins that the
+    /// mode id is the clamped level, never the `modeId` the client sent.
+    #[test]
+    fn the_no_op_echo_is_indistinguishable_from_the_pumps_own_pair() {
+        // The client asked for `xhigh`; the session clamped to `off` and was already there.
+        let echo = mode_echo(
+            ModelThinkingLevel::Off,
+            SessionConfigKnob::advertise(&view()),
+        );
+        assert_eq!(echo.len(), 2, "exactly the pump's pair: {echo:?}");
+
+        let first = serde_json::to_value(&echo[0]).unwrap();
+        assert_eq!(
+            first["sessionUpdate"],
+            serde_json::json!("current_mode_update"),
+            "ACP-072: `current_mode_update` FIRST — it is what moves the client's mode selector"
+        );
+        assert_eq!(first["currentModeId"], serde_json::json!("off"));
+        assert_ne!(
+            first["currentModeId"],
+            serde_json::json!("xhigh"),
+            "ACP-072: the applied level, never the requested modeId"
+        );
+
+        let second = serde_json::to_value(&echo[1]).unwrap();
+        assert_eq!(
+            second["sessionUpdate"],
+            serde_json::json!("config_option_update"),
+            "ACP-072: and the re-derived option set second, for a client that renders the \
+             `thought_level` dropdown instead of the mode selector"
+        );
+        assert_eq!(second["configOptions"].as_array().map(Vec::len), Some(2));
     }
 
     /// ACP-285 / ACP-Q20 — `title` is `MaybeUndefined`, and the two-state-to-three-state mapping is

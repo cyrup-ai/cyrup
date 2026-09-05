@@ -362,6 +362,11 @@ fn the_frame_sequence_is_stable() {
                 "tool_call_update:in_progress",
                 "tool_call_update:completed",
                 "agent_message_chunk",
+                // The context-window meter. Absent until `AcpTurnAgent` forwarded
+                // `TurnAgent::usage` — the trait's default is `None`, so the production wrapper
+                // inheriting it shipped a meter that never filled while every unit test of the
+                // emission passed. This entry is what says the wrapper still forwards.
+                "usage_update",
                 "session_info_update",
                 "<response>",
             ],
@@ -402,6 +407,59 @@ fn a_bash_call_streams_terminal_output() {
         assert!(
             blob.contains("cyrup-acp-e2e"),
             "the command output never reached the client: {frames:#?}"
+        );
+    });
+}
+
+/// A `session/set_mode` that changes nothing still tells the client where the mode landed.
+///
+/// `ACP-072`. The config pump emits `current_mode_update` on `ThinkingLevelChanged`, but a request
+/// whose applied level equals the current one raises no such event, so the pump stays silent. A
+/// client that optimistically moved its selector would be wrong for the rest of the session. The
+/// echo is sent by `set_mode` itself for exactly that case.
+#[test]
+fn a_no_op_set_mode_still_echoes_the_applied_level() {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let (mut client, cwd, _agent) =
+            connect(vec![faux_assistant_message(vec![faux_text("hi")], StopReason::Stop)]).await;
+
+        let id = client
+            .request("initialize", json!({"protocolVersion": 1, "clientCapabilities": {}}))
+            .await;
+        client.response_to(id).await;
+        let id = client
+            .request("session/new", json!({"cwd": cwd.path().to_string_lossy(), "mcpServers": []}))
+            .await;
+        let opened = client.response_to(id).await;
+        let session = opened["result"]["sessionId"].as_str().unwrap().to_string();
+        let current = opened["result"]["modes"]["currentModeId"]
+            .as_str()
+            .expect("session/new advertises a current mode")
+            .to_string();
+
+        // Set it to what it already is: nothing changes, so the pump will not speak.
+        let id = client
+            .request("session/set_mode", json!({"sessionId": session, "modeId": current}))
+            .await;
+        let frames = client
+            .drain_until(|v| v.get("id").and_then(Value::as_i64) == Some(id))
+            .await;
+
+        let modes = updates_of(&frames, "current_mode_update");
+        assert!(
+            !modes.is_empty(),
+            "a no-op set_mode said nothing, so a client that moved its selector stays wrong: {frames:#?}"
+        );
+        assert_eq!(
+            modes[0]["params"]["update"]["currentModeId"].as_str(),
+            Some(current.as_str()),
+            "the echo must carry the APPLIED level, not the requested one"
+        );
+        assert!(
+            !updates_of(&frames, "config_option_update").is_empty(),
+            "the echo must also re-derive the option set, for a client rendering the dropdown"
         );
     });
 }

@@ -75,6 +75,71 @@ use cyrup_sdk::core::CancelToken;
 use cyrup_session_svc::{AgentSessionRuntime, AppMode, flush_session_writes};
 use cyrup_tools::kill_tracked_detached_children;
 
+/// The runtime a spawned watcher tears down, re-read **at signal time** instead of captured at
+/// spawn time.
+///
+/// SEAM-059's rule — *"dereference the CURRENT session, never the startup `Arc`"* — held inside
+/// one runtime (`/new`, `/fork`, `switchSession` and `reload` all replace the session behind an
+/// `AgentSessionRuntime`, which is why the watcher goes through `runtime.session().await`). It did
+/// **not** hold across runtimes, and the ACP front-end is the host that has more than one: its
+/// `AcpHost::runtime_ready` fires on every `session/new` and every `session/load`, so arming a
+/// watcher per runtime left N watchers racing one `std::process::exit` on a single SIGTERM. The
+/// stale one's runtime is already disposed, so its `dispose()` returns immediately and it can exit
+/// the process while the LIVE session's `dispose_with` is still fanning `session_shutdown` out to
+/// extensions and awaiting the fsync drain — truncating the very shutdown `ACP-005`/`ACP-023`
+/// exist to guarantee, and re-emitting `session_shutdown` for a dead session on the way out.
+///
+/// So the target is a slot: [`crate::acp_host::BinaryAcpHost`] arms **one** watcher and later
+/// runtimes replace what it points at. A `std::sync::Mutex` rather than a `watch` channel because
+/// the watcher reads it exactly once, synchronously, after the signal arrives — there is nothing
+/// to await on and no change notification anyone wants.
+///
+/// A poisoned lock is recovered rather than propagated: this value is read on the way out of the
+/// process, and refusing to dispose the session because some unrelated task panicked while holding
+/// the slot would be the worst possible reading of a poison flag.
+#[derive(Clone, Default)]
+pub struct RuntimeSlot(Arc<std::sync::Mutex<Option<Arc<AgentSessionRuntime>>>>);
+
+impl RuntimeSlot {
+    /// An empty slot, for a watcher armed before any runtime exists.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A slot already pointing at `runtime` — the fixed-target case every non-ACP host uses.
+    #[must_use]
+    pub fn of(runtime: Arc<AgentSessionRuntime>) -> Self {
+        let slot = Self::new();
+        slot.set(runtime);
+        slot
+    }
+
+    /// Point the slot at `runtime`, replacing whatever it held.
+    ///
+    /// Dropping the previous `Arc` here does not dispose it: the caller replacing a runtime is the
+    /// one that owns its teardown (`cyrup_acp::SessionManager::install`), and this slot is only a
+    /// borrow of whatever is current.
+    pub fn set(&self, runtime: Arc<AgentSessionRuntime>) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(runtime);
+    }
+
+    /// The runtime to tear down, cloned out so the guard is released before any `.await`.
+    ///
+    /// `None` only in the window before the first runtime exists — see `AcpHost::runtime_ready`'s
+    /// doc for why that window is empty (no session means no tracked bash group and nothing to
+    /// dispose).
+    fn current(&self) -> Option<Arc<AgentSessionRuntime>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
 /// Which shutdown signal was delivered, so a REPEAT delivery can exit with the conventional code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ShutdownSignal {
@@ -194,6 +259,20 @@ pub fn spawn_abort_on_signal(
     cancel: CancelToken,
     host: AppMode,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_abort_on_signal_slot(RuntimeSlot::of(runtime), cancel, host)
+}
+
+/// [`spawn_abort_on_signal`] against a [`RuntimeSlot`] the caller can re-point.
+///
+/// Identical in every respect except which runtime the teardown reaches: this one reads the slot
+/// once, when the signal arrives. It exists for the ACP host, which builds a runtime per
+/// `session/new` and must arm exactly **one** watcher across all of them — see [`RuntimeSlot`] for
+/// what a watcher per runtime costs.
+pub fn spawn_abort_on_signal_slot(
+    target: RuntimeSlot,
+    cancel: CancelToken,
+    host: AppMode,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let first = wait_for_signal().await;
 
@@ -230,11 +309,20 @@ pub fn spawn_abort_on_signal(
         // (`runtimeHost.dispose()`, print-mode.ts:57 / rpc-mode.ts:733), so a `/new`, `/fork`,
         // `switchSession` or `reload` earlier in the run cannot leave the signal aborting a disposed
         // session while the live turn runs on to completion.
-        runtime.session().await.abort();
+        //
+        // Read ONCE, here: the abort and the dispose below must reach the same runtime, and
+        // re-reading the slot between them would let a `session/new` landing mid-teardown split the
+        // two across a live and a dead session.
+        let runtime = target.current();
+        if let Some(runtime) = runtime.as_ref() {
+            runtime.session().await.abort();
+        }
         cancel.cancel();
 
         if let Some(code) = first_delivery_exit_code(host, first) {
-            runtime.dispose().await;
+            if let Some(runtime) = runtime.as_ref() {
+                runtime.dispose().await;
+            }
             // `dispose` already drained the session fsync queue (PERF-004 §3.5); this covers
             // anything appended between it returning and the exit below.
             flush_session_writes();
@@ -251,6 +339,15 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// An unarmed slot answers `None` rather than blocking or panicking, which is what makes a
+    /// watcher armable before the first runtime exists — the shape `crate::acp_host` needs so it
+    /// can arm ONE watcher and re-point it, instead of one watcher per `session/new` racing
+    /// `std::process::exit`.
+    #[test]
+    fn an_empty_runtime_slot_is_none_not_a_panic() {
+        assert!(RuntimeSlot::new().current().is_none());
+    }
 
     /// The shell's `128 + signum` convention, and pi's literal
     /// `process.exit(signal === "SIGHUP" ? 129 : 143)` (`print-mode.ts:52-62`).
