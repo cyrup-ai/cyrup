@@ -17,6 +17,7 @@
 - [Project context and skills](guides/project-context.md)
 - [Themes](guides/themes.md)
 - [Scripting and automation](guides/scripting.md)
+- [Zed and other ACP editors](guides/zed-acp.md)
 
 # Extensions
 
