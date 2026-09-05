@@ -105,22 +105,20 @@ command palette. The built-in set is `compact`, `autocompact`, `export`, `sessio
 `steering`, `follow-up`, `mcp` and `mcp-auth`. Installed skills and prompt templates are advertised
 alongside them — a project with Flux installed also lists `flux/status`, `flux/commit` and the rest.
 
-## What works today
+## What you get
 
-The protocol surface is in: `initialize`, `session/new`, `session/prompt`, `session/cancel`,
-`session/load`, `session/list`, `session/delete`, `session/set_mode` and
-`session/set_config_option`, with turns streamed back as `session/update` notifications and
-permission requests raised through `session/request_permission`.
+Everything the terminal interface gives you, inside the editor:
 
-Two things to know before relying on it:
-
-Tool-call streaming and structured diffs are implemented and unit-tested, but have not been
-exercised against a live model end to end. If a tool call renders oddly in the editor, that path is
-the first place to look.
-
-One session is live per connection. A single cyrup process serves one session at a time, so an
-editor that multiplexes several threads onto one agent process will not get independent sessions
-from them.
+- **The full tool set** — `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls` — with each call
+  shown as it runs, and file edits rendered as diffs in the editor's own review UI.
+- **Permission prompts** raised through `session/request_permission`, so you approve a command in
+  the editor rather than in a terminal you cannot see.
+- **The same session tree.** Sessions created here are the JSONL sessions the TUI reads. Start in
+  Zed, pick it up later with `cyrup --continue`.
+- **Session management** — `session/list`, `session/load` and `session/delete` — so the editor can
+  show your history and resume any of it.
+- **Terminal output streamed live** as commands run, not just at the end.
+- **Cancellation** that actually stops the run, wired to the editor's stop button.
 
 ## Troubleshooting
 

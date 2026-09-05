@@ -68,8 +68,8 @@ For Zed, add cyrup to `agent_servers` in `settings.json`:
 
 Then pick **External Agent → cyrup** in the agent panel. The editor launches the process and owns
 both pipes, so this is not a command you run yourself.
-[Zed and other ACP editors](docs/guide/guides/zed-acp.md) covers credentials, thinking levels, the
-command palette and what is not finished yet.
+[Zed and other ACP editors](docs/guide/guides/zed-acp.md) covers credentials, thinking levels and
+the command palette.
 
 ## What you get
 
