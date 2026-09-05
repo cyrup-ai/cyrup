@@ -324,7 +324,7 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 | TUI-043 | **FIXED 2026-08-13** | Was: word motion and Ctrl+W were not paste-marker atomic — one Ctrl+W deleted the single `]`. Now: `word_left_target`/`word_right_target` are a statement-for-statement port of `findWordBackward`/`findWordForward` (`word-navigation.ts:22-114`) over a marker-merging segmenter (`segmentWithMarkers`, `editor.ts:37-90`), including the `isAtomic` branches at `:44-46`/`:97-99`; `prev_grapheme`/`next_grapheme` route through the same merge, so **cursor motion** is marker-atomic too (pi's `moveCursor`, `editor.ts:1808-1830`) and the caret can no longer be parked inside a marker. `marker_covering` is deleted — upstream has no such predicate. Per `editor.ts:1607-1630`, `deleteWordBackwards` does **not** drop the registry entry, so cyrup no longer does either (see the correction below). RED→GREEN: `::ctrl_w_at_a_marker_end_deletes_the_whole_marker` (RED output: `left: "[paste #1 1500 chars"`), `::alt_d_at_a_marker_start_deletes_the_whole_marker`, `::word_motion_treats_a_paste_marker_as_one_unit`, `::arrow_keys_step_over_a_paste_marker_as_one_grapheme`. |
 | TUI-044 | **FIXED 2026-08-13** | `undo()` restores `snap.col` and calls `reset_preferred_col()` (`editor.ts:2019-2022`); `exit_history()` moved ahead of the pop to match `:2017`. RED→GREEN: `::undo_restores_the_snapshot_cursor_column` — the item's own live scenario, asserting `(0, 5)` and that the next keystroke yields `helloZ` rather than `heZllo`. |
 | TUI-045 | ~~**new (repair pass)** — open, **raised to high 2026-08-13**~~ **CLOSED 2026-08-14** | An escape sequence split at the ESC byte across `read(2)` boundaries is not reassembled — crossterm emits a spurious `Escape` plus the tail as typed text. `stray_reply.rs` documents observing this exact split and rescues only OSC 11. Escape is not inert: it aborts the turn. **Reproduced live, idle and mid-stream — a 60 ms gap between two writes on a LOCAL pty is enough; the "exposure is over SSH/mosh/tmux" hedge was too conservative.** |
-| TUI-046 | ~~**new (repair pass)** — open (medium)~~ **PARTIALLY FIXED 2026-09-04 at `8bb0d22f` — still open (low)** | The flag set is decided and single-sourced: `crate::keyboard_protocol::DESIRED_FLAGS` = `DISAMBIGUATE_ESCAPE_CODES \| REPORT_ALTERNATE_KEYS` (`\x1b[>5u`), written by the one `push_flags()` all three sites call. `REPORT_EVENT_TYPES` is a reasoned `[CYRUP-DELTA]`, not the old silent gap, and withholding it makes the WezTerm hazard **unreachable** rather than merely unguarded. `drain.rs:11-16`'s release-report premise is corrected. **Residual:** pi's `pendingKittyPrintableCodepoint` dedup is still unported and is not portable at cyrup's post-crossterm seam. |
+| TUI-046 | ~~**new (repair pass)** — open (medium)~~ ~~**PARTIALLY FIXED 2026-09-04 at `8bb0d22f`**~~ **PARTIALLY FIXED 2026-09-04 at `8bb0d22f`, bit 4 REVERTED 2026-09-05 at `824a539e` — still open (low)** | The flag set is decided and single-sourced: `crate::keyboard_protocol::DESIRED_FLAGS` = `DISAMBIGUATE_ESCAPE_CODES` alone (`\x1b[>1u`), written by the one `push_flags()` all three sites call. **BOTH** `REPORT_EVENT_TYPES` (bit 2) and `REPORT_ALTERNATE_KEYS` (bit 4) are reasoned `[CYRUP-DELTA]`s, not the old silent gap, and withholding bit 2 makes the WezTerm hazard **unreachable** rather than merely unguarded. ~~Bit 4 is pushed and resolves a shifted key to the layout character a keybinding is matched against~~ — **that was false and was a REGRESSION** (review finding, reverted at `824a539e`): crossterm SUBSTITUTES the alternate codepoint for the base keycode and CLEARS `SHIFT` (`crossterm-0.29.0/src/event/sys/unix/parse.rs:596-605`), while `Key::matches` compares the `SHIFT` bit and the BASE code — as pi's `matchesKittySequence` does (`keys.ts:653-692`, on `parsed.codepoint`; the shifted field is used only by `decodeKittyPrintable`, `:1371-1372`). `drain.rs:11-16`'s release-report premise is corrected. **Residual:** pi's `pendingKittyPrintableCodepoint` dedup is still unported and is not portable at cyrup's post-crossterm seam. |
 | TUI-047 | **new (repair pass)** — open (low) | A late or unsolicited DCS/APC frame is shredded into ~20 typed characters; `stray_reply.rs` recognises only OSC 11. Reachability is narrow (tmux passthrough), blast radius is not. |
 | TUI-048 | **PARTIALLY FIXED 2026-08-13 — still open** | The character-class run is gone: word motion now goes through `unicode-segmentation`'s UAX#29 word iterator plus pi's `PUNCTUATION_REGEX` sub-boundaries (`utils.ts:821`) in pi's three-branch shape. CJK no longer jumps the whole run (`::cjk_word_motion_no_longer_swallows_the_whole_run`, RED at HEAD). **Not parity**: ICU's `Intl.Segmenter` adds a dictionary/LSTM pass, so pi lands at col 2 in `你好世界` where UAX#29 lands at 3. Closing it needs an ICU-class segmenter (`icu_segmenter` + CJK/Thai data) — a new workspace dependency, deliberately not taken here. CYRUP-DELTA recorded on `InputEditor::word_segments`. |
 | TUI-049 | **FIXED 2026-08-13** | `marker_at` now matches `PASTE_MARKER_SINGLE` exactly (`editor.ts:24`): id, then either an immediate `]` or one space and exactly one of `+<digits> lines` / `<digits> chars`. RED→GREEN: `::a_hand_typed_marker_shaped_string_is_not_expanded`, which also pins that the bare `[paste #N]` form pi's regex allows still expands. |
@@ -517,7 +517,7 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 | ~~TUI-034~~ | ~~medium~~ **CLOSED 2026-09-04** | upstream-drift | L | ~~No markdown-transformer hook — extension transformers and pi's Mermaid renderer both absent~~ — `App::apply_markdown_transformers` (`crates/cyrup-tui/src/app/events.rs:102-140`) calls `ExtensionHost::transform_markdown` from three real sites (`session_bind.rs:214`, `events.rs:75,102`), and a real Mermaid renderer (the `mermaid-text` crate) ships in `markdown/mermaid.rs`, live while streaming, gated by the `markdown.mermaid` setting. |
 | ~~TUI-037~~ | ~~medium~~ **CLOSED 2026-09-04** | not-ported | S | ~~`/reload` never persists an implicitly-granted project trust~~ — landed in `0e8c62fa`. `App::maybe_save_implicit_project_trust` (`crates/cyrup-tui/src/app/reload_trust.rs:126`) is the shell of pi's `maybeSaveImplicitProjectTrustAfterReload` (`interactive-mode.ts:4921-4941` @v0.84.4) over the pure `implicit_trust_after_reload` (`:85-102`, outcomes `ImplicitTrustReload::{Keep,Disarm,Persist}` `:64`); the `/reload` arm calls it (`app/execute_session.rs:279`) and selects pi's `; saved project trust` status variant (`:299`, `interactive-mode.ts:6000-6003`); the host arms `autoTrustOnReloadCwd` at the composition root (`crates/cyrup/src/main.rs:672-677`, pi `main.ts:701-704`) → `run_interactive` → `App::set_auto_trust_on_reload_cwd` (`interactive.rs:346`); the store failure is pi's `Warning: Could not save project trust after reload: …`, carried post-swap by `LifecycleEffects::warning` (`app/outcome.rs:104`, `app/channels.rs:181`). **[CYRUP-DELTA]** the write runs BEFORE the rebuild is dispatched, not after as pi's does: cyrup's `/reload` rebuilds the session through the factory and re-decides trust from the store, where pi's `AgentSession.reload` preserves `SettingsManager.projectTrusted` (`resource-loader.ts:404`); the inputs are the same, the store ends the same, and the rebuilt session reads the saved `true` back — the one difference is a reload that then FAILS has already written the entry. Tests: `src/app/reload_trust.rs` (4 decision-table cases) and `src/tests/reload_implicit_trust.rs` (5 App tests through the real runtime + `trust.json` store; `reload_persists_an_implicitly_granted_project_trust`, `…_disarms_without_writing` and `a_store_failure_warns_and_keeps_the_plain_status` were RED against the unwired arm). Closes `TUI-025`'s last residual (the `; saved project trust` variant). |
 | TUI-044 | **FIXED 2026-08-13** | parity-bug | S | ~~`undo()` discards the snapshot's cursor column — `Snapshot::col` is written and never read~~ |
-| TUI-046 | ~~medium~~ **low** | parity-bug | M | ~~cyrup pushes Kitty keyboard flag 1, pi pushes 7 — and neither guard flag 7 requires exists, so raising it alone would duplicate characters and leak CSI-u text~~ — **PARTIALLY FIXED 2026-09-04 at `8bb0d22f`.** The three push sites are now one: `crate::keyboard_protocol::push_flags()` writing `DESIRED_FLAGS` = `DISAMBIGUATE_ESCAPE_CODES \| REPORT_ALTERNATE_KEYS` (`\x1b[>5u`, pi's `\x1b[>7u` minus bit 2). Alternate keys was the half with a user-visible effect (a shifted key on a non-US layout now resolves to the character that layout produces, `crossterm-0.29.0/src/event/sys/unix/parse.rs:597-606`). `REPORT_EVENT_TYPES` is withheld as an argued `[CYRUP-DELTA]` (`keyboard_protocol.rs` module docs): it buys cyrup nothing — `map_event_on` discards every `Release` — and both guards it requires filter RAW BYTES, which cyrup's seam is below. `drain.rs:11-16` corrected. **Stays open (low) for one residual only: the `pendingKittyPrintableCodepoint` dedup, unportable while cyrup filters crossterm events rather than bytes.** |
+| TUI-046 | ~~medium~~ **low** | parity-bug | M | ~~cyrup pushes Kitty keyboard flag 1, pi pushes 7 — and neither guard flag 7 requires exists, so raising it alone would duplicate characters and leak CSI-u text~~ — **PARTIALLY FIXED 2026-09-04 at `8bb0d22f`.** The three push sites are now one: `crate::keyboard_protocol::push_flags()` writing `DESIRED_FLAGS` = `DISAMBIGUATE_ESCAPE_CODES` alone (`\x1b[>1u`, pi's `\x1b[>7u` minus bits 2 and 4). ~~Alternate keys was the half with a user-visible effect (a shifted key on a non-US layout now resolves to the character that layout produces, `crossterm-0.29.0/src/event/sys/unix/parse.rs:597-606`).~~ **REVERTED 2026-09-05 at `824a539e`** — pushing bit 4 was a REGRESSION on every shift chord; see the detail section. Both `REPORT_EVENT_TYPES` and `REPORT_ALTERNATE_KEYS` are withheld as argued `[CYRUP-DELTA]`s (`keyboard_protocol.rs` module docs). Bit 2 buys cyrup nothing — `map_event_on` discards every `Release` — and both guards it requires filter RAW BYTES, which cyrup's seam is below. `drain.rs:11-16` corrected. **Stays open (low) for one residual only: the `pendingKittyPrintableCodepoint` dedup, unportable while cyrup filters crossterm events rather than bytes.** |
 | ~~TUI-051~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | `/reload` never re-reads `keybindings.json`, while the command's help text and its in-source comment both claim it does — **CLOSED 2026-08-14**: sweep 1. |
 | TUI-058 | **FIXED 2026-08-13** | parity-bug | S | ~~Deleting a paste marker does not renumber the pastes that follow it — ids diverge from pi's for the life of the session~~ — **new, found 2026-08-13** |
 | TUI-059 | **FIXED 2026-08-13** | parity-bug | S | ~~Only Left/Right clear `lastAction`, so a kill survives every other motion and the next kill accumulates into the same ring entry~~ — **new, found 2026-08-13** |
@@ -1224,6 +1224,40 @@ The third line reads `self.col`, i.e. the **live pre-undo** column, and merely c
 > **PARTIALLY FIXED 2026-09-04 at `8bb0d22f` — still open (low). The flags decision is made and
 > single-sourced; one residual remains and it is not portable at cyrup's seam.**
 >
+> **CORRECTION 2026-09-05, code `824a539e` — `REPORT_ALTERNATE_KEYS` (bit 4) was a REGRESSION and is
+> now withheld too; `DESIRED_FLAGS` is `DISAMBIGUATE_ESCAPE_CODES` alone, wire form `\x1b[>1u`.**
+> The 2026-09-04 text below claimed bit 4 makes a shifted key "report the character that layout
+> produces — which is what a keybinding is matched against". **That is false for cyrup's matcher**,
+> and the flag broke every shift chord on any terminal that honours it. crossterm's
+> `parse_csi_u_encoded_key_code` SUBSTITUTES the alternate (shifted) codepoint for the base keycode
+> and CLEARS `SHIFT` (`crossterm-0.29.0/src/event/sys/unix/parse.rs:596-605`; its own flag doc,
+> `event.rs:299-302`, says "The alternate keycode overrides the base keycode in resulting
+> `KeyEvent`s"). `Key::matches` (`keymap.rs`) compares the `SHIFT` bit and `normalize_shifted_letter`
+> lowercases only when `SHIFT` is present, so `Ctrl+Shift+P` arrived as `Char('P')`+`CONTROL` and no
+> longer matched the `Char('p')`+`CONTROL|SHIFT` binding. Concretely broken while bit 4 was pushed:
+> `keymap.rs`'s `Ctrl+Shift+P` → `ModelCycleBackward`, `/tree`'s `shift+l` → `Tree::EditLabel` and
+> `shift+t` → `ToggleLabelTimestamp`, `Ctrl+Shift+O` → `FilterCycleBackward`, plus any user
+> `shift+<letter>` in `keybindings.json`.
+>
+> **Upstream is NOT exposed to this**, which is what the 2026-09-04 pass missed: pi keeps the two
+> codepoints in SEPARATE fields — `parseKittySequence` returns `{ codepoint, shiftedKey, … }`
+> (`packages/tui/src/keys.ts:600-606` @v0.84.4) — and prefers `shiftedKey` only in
+> `decodeKittyPrintable`, i.e. for TEXT INSERTION (`:1371-1372`), while every keybinding comparison
+> in `matchesKittySequence` (`:653-692`) is against the base `parsed.codepoint`, exactly the value
+> cyrup matches on. The port took pi's flag without pi's compensating parse. There is nothing to gain
+> in exchange: crossterm has already spent the shifted codepoint by the time an event reaches cyrup,
+> and the base codepoint it destroys is the one the matcher wants. Bit 4 now waits on the same
+> condition bit 2 does — cyrup owning the bytes ahead of crossterm's parser (the pre-parser TUI-045
+> /TUI-047/TUI-050 also land on).
+>
+> **Tests added 2026-09-05:** `keyboard_protocol.rs::alternate_keys_would_defeat_the_shift_chord_bindings`
+> — RED with `DESIRED_FLAGS` at `0b101` (the two `Key::matches` assertions hold either way; the
+> assertion on the constant is what fails), green after. The 2026-09-04
+> `escape_reassembly.rs` alternate-key test asserted the substitution as if it were desirable; it is
+> kept and reframed as `a_kitty_alternate_key_sequence_loses_the_base_code_and_the_shift_bit`, the
+> pin on WHY bit 4 is withheld. `push_flags_writes_the_csi_push_all_three_sites_share` now asserts
+> `\x1b[>1u`.
+>
 > **What landed.** `crate::keyboard_protocol::DESIRED_FLAGS` is now the only place the flag set is
 > written — `DISAMBIGUATE_ESCAPE_CODES | REPORT_ALTERNATE_KEYS`, wire form `\x1b[>5u` — and
 > `keyboard_protocol::push_flags()` is the only function that writes it. The three literals at
@@ -1232,8 +1266,9 @@ The third line reads `self.col`, i.e. the **live pre-undo** column, and merely c
 > and (4) of the item are done; part (2) is the residual below; part (3) is now unreachable rather
 > than unported.
 >
-> **`REPORT_ALTERNATE_KEYS` is the half with a user-visible effect, and it is the half that was
-> missing.** crossterm substitutes a CSI-u's alternate (shifted) codepoint for the base keycode and
+> ~~**`REPORT_ALTERNATE_KEYS` is the half with a user-visible effect, and it is the half that was
+> missing.**~~ **(WRONG — see the 2026-09-05 correction above; kept unedited per the no-deletion
+> rule.)** crossterm substitutes a CSI-u's alternate (shifted) codepoint for the base keycode and
 > clears `SHIFT` (`crossterm-0.29.0/src/event/sys/unix/parse.rs:597-606`), so a shifted key on a
 > non-US layout now reports the character that layout produces — which is what a keybinding is
 > matched against. The decoder cyrup owns for split sequences already handled the
@@ -1285,13 +1320,16 @@ The third line reads `self.col`, i.e. the **live pre-undo** column, and merely c
 > the module docs own and that has exactly one production caller. Migration cost: three call sites,
 > two removed imports, two added `pub use` names; no serde, no behavioural API change.
 >
-> **Tests.** `keyboard_protocol.rs::cyrup_asks_for_disambiguate_and_alternate_keys_and_withholds_event_types`
+> **Tests (2026-09-04; superseded in part by the correction above).**
+> ~~`keyboard_protocol.rs::cyrup_asks_for_disambiguate_and_alternate_keys_and_withholds_event_types`
 > and `::push_flags_writes_the_csi_push_all_three_sites_share` were RED with `DESIRED_FLAGS` reverted
-> to HEAD's `DISAMBIGUATE_ESCAPE_CODES` alone (`left: "\x1b[>1u"`, `right: "\x1b[>5u"`), green after;
+> to HEAD's `DISAMBIGUATE_ESCAPE_CODES` alone (`left: "\x1b[>1u"`, `right: "\x1b[>5u"`), green after;~~
+> the first is now `::cyrup_asks_for_disambiguate_alone_and_withholds_the_other_two_bits` and the
+> second asserts `\x1b[>1u`;
 > `::a_terminal_echoing_the_flags_cyrup_pushed_is_read_as_kitty` closes the push/read-back loop;
-> `escape_reassembly.rs::a_split_kitty_alternate_key_sequence_resolves_the_layout_character` guards
+> ~~`escape_reassembly.rs::a_split_kitty_alternate_key_sequence_resolves_the_layout_character` guards
 > the newly reachable `unicode:shifted:base` shape (it passes with the flags reverted too, so it is a
-> guard, not a red test). `cargo nextest run -p cyrup-tui` 1387 passed; clippy `-D warnings` and
+> guard, not a red test).~~ Renamed and reframed on 2026-09-05, see above. `cargo nextest run -p cyrup-tui` 1387 passed; clippy `-D warnings` and
 > `RUSTDOCFLAGS='-D warnings' cargo doc` clean.
 >
 > **Residual — why this stays open at `low`.** The `pendingKittyPrintableCodepoint` dedup is
