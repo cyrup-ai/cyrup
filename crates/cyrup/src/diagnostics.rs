@@ -63,7 +63,7 @@ const VALID_THINKING_LEVELS: [&str; 7] =
 ///
 /// **What it costs, and why the entry is load-bearing rather than cosmetic.** This pass is pi's
 /// silent drop for an invalid `--mode` (args.ts:80-82) and it runs **before clap**, so a value
-/// missing from this array never reaches [`crate::cli::enums::Mode`] at all: `--mode acp` would be
+/// missing from this array never reaches [`crate::cli::Mode`] at all: `--mode acp` would be
 /// deleted along with its value and the run would fall through to `Print`, answering the ACP
 /// client's first JSON-RPC frame as a chat prompt. Adding `Mode::Acp` to the clap enum without
 /// adding it here produces exactly the failure ACP-002 hoisted the branch in `resolve_app_mode` to

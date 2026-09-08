@@ -67,11 +67,7 @@ mod session_info_context_fields;
 mod shared_human_lock;
 mod tool_actions;
 
-/// §4 R5 layer 3. Cheap, and it names the leak at the top of the run instead of letting a broker
-/// test quietly inherit an ambient `CYRUP_INTERCOM=1` — the variable that has already leaked 13
-/// broker processes out of one run here.
-#[test]
-fn no_ambient_provider_credentials_or_feature_gates() {
-    support::env::assert_no_ambient_provider_credentials();
-    support::env::assert_no_ambient_feature_gates();
-}
+// §4 R5 layer 3 — the ambient-credential and feature-gate guards (an ambient `CYRUP_INTERCOM=1`
+// has already leaked 13 broker processes out of one run here) now live as `#[test]`s inside
+// `support::env` itself, so every target that declares `mod support` runs them without per-target
+// wiring. Nothing to declare here.

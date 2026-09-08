@@ -108,6 +108,7 @@ fn agent_config(name: &str) -> AgentConfig {
 /// therefore genuinely requires an `acceptance-report` block from somewhere.
 fn run_options(cwd: &Path, output_path: &Path) -> RunOptions {
     RunOptions {
+        structured_output_dir: None,
         spawn_command: None,
         child_env: std::collections::HashMap::new(),
         turn_budget: None,

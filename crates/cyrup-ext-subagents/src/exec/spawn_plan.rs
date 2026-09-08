@@ -353,7 +353,7 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
     }
 
     // An injected command wins; `None` falls back to the environment, leaving R-SA-045's
-    // three-tier priority exactly as it was for every caller that supplies nothing.
+    // five-tier priority ladder exactly as it was for every caller that supplies nothing.
     let command = opts
         .spawn_command
         .clone()
@@ -992,6 +992,13 @@ fn compose_persona(
     let persona_owned = crate::exec::turn_budget::append_turn_budget_system_prompt(
         &persona_owned,
         opts.turn_budget.as_ref(),
+    );
+    // SCOPE_17 — the OUTERMOST fold, same reasoning as the turn-budget one immediately above:
+    // nothing composed earlier can displace it, and it is the ONE seam a foreground child and a
+    // detached fan-out member both pass through.
+    let persona_owned = crate::exec::result_summary::append_result_summary_system_prompt(
+        &persona_owned,
+        opts.structured_output_schema.is_none(),
     );
     let persona_body: &str = &persona_owned;
     let mut persona_temp_file: Option<std::path::PathBuf> = None;
@@ -2564,9 +2571,13 @@ mod tests {
             Some("code_reviewer_v2.md"),
             "pi `promptFileStem` sanitization: `[^\\w.-]` -> `_`, extension `.md`"
         );
-        assert_eq!(
-            std::fs::read_to_string(&path).expect("spill readable"),
-            body,
+        // SCOPE_17 — the result-summary fold now appends unconditionally (no output_schema on
+        // `base_opts`), so the spill is the persona PLUS the block, not the persona alone; the
+        // persona itself must still survive verbatim as a PREFIX.
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("spill readable")
+                .starts_with(&body),
             "the spill must carry the composed persona verbatim"
         );
 
@@ -2656,9 +2667,12 @@ mod tests {
 
         let delivered = delivered_system_prompt(&argv)
             .unwrap_or_else(|| panic!("replace mode must emit --system-prompt; argv was {argv:?}"));
-        assert_eq!(
-            delivered, "- You are the REVIEWER persona.\n- Only review.",
-            "replace mode must ship the persona body on --system-prompt; argv was {argv:?}"
+        // SCOPE_17 — the result-summary fold now appends unconditionally (no output_schema on
+        // `base_opts`), so the persona is a PREFIX of the delivered value rather than the whole
+        // of it; `starts_with` preserves this test's original intent.
+        assert!(
+            delivered.starts_with("- You are the REVIEWER persona.\n- Only review.\n\n## Result summary\n"),
+            "replace mode must ship the persona body on --system-prompt; argv was {argv:?}: {delivered:?}"
         );
         // `replace` must never also append — the two flags are mutually exclusive per mode.
         assert!(!argv.iter().any(|a| a.starts_with("--append-system-prompt")));
@@ -3229,9 +3243,12 @@ mod tests {
         )
         .expect("plan builds");
         let argv = plan.spec.build_argv();
-        assert_eq!(
-            delivered_system_prompt(&argv).as_deref(),
-            Some("- persona"),
+        // SCOPE_17 — the result-summary fold now appends unconditionally (no output_schema on
+        // `base_opts`), so the persona is a PREFIX of the delivered value rather than the whole
+        // of it.
+        assert!(
+            delivered_system_prompt(&argv)
+                .is_some_and(|d| d.starts_with("- persona\n\n## Result summary\n")),
             "{argv:?}"
         );
         assert!(!argv.iter().any(|a| a.contains("Persistent agent memory")));
@@ -3754,9 +3771,12 @@ mod tests {
         let argv = plan.spec.build_argv();
 
         let delivered = delivered_system_prompt(&argv).unwrap_or_default();
-        assert_eq!(
-            delivered, "You are a delegate persona.",
-            "append mode must ship the persona body on --append-system-prompt; argv was {argv:?}"
+        // SCOPE_17 — the result-summary fold now appends unconditionally (no output_schema on
+        // `base_opts`), so the persona is a PREFIX of the delivered value rather than the whole
+        // of it.
+        assert!(
+            delivered.starts_with("You are a delegate persona.\n\n## Result summary\n"),
+            "append mode must ship the persona body on --append-system-prompt; argv was {argv:?}: {delivered:?}"
         );
         assert!(!argv.iter().any(|a| a.starts_with("--system-prompt")));
         // Delivered EXACTLY once: the body no longer rides along inside the task text as well.
@@ -3769,7 +3789,11 @@ mod tests {
 
     #[test]
     fn build_attempt_spawn_plan_omits_the_system_prompt_flag_for_an_empty_persona_body() {
-        // A persona with no prose must not blank the child's own assembled system prompt.
+        // A persona with no prose must not blank the child's own assembled system prompt with
+        // whitespace garbage. SCOPE_17: with no output_schema declared, the result-summary
+        // contract still applies unconditionally, so this run NOW ships a `--system-prompt` flag
+        // — but its content must be ONLY the result-summary block, never the blank persona body
+        // preserved as leading noise.
         let dir = tempfile::tempdir().expect("tempdir");
         let mut agent = sample_agent_config("m1", &[]);
         agent.system_prompt_mode = SystemPromptMode::Replace;
@@ -3791,7 +3815,11 @@ mod tests {
         )
         .expect("plan builds");
         let argv = plan.spec.build_argv();
-        assert!(!argv.iter().any(|a| a.starts_with("--system-prompt")));
+        assert!(
+            delivered_system_prompt(&argv).is_some_and(|d| d.starts_with("## Result summary\n")),
+            "a whitespace-only persona body must still ship ONLY the result-summary block, never a \
+             blank override: {argv:?}"
+        );
         assert!(!argv.iter().any(|a| a.starts_with("--append-system-prompt")));
     }
 
@@ -3889,9 +3917,13 @@ mod tests {
         )
         .expect("plan builds");
         let argv = plan.spec.build_argv();
-        assert_eq!(
-            delivered_system_prompt(&argv).as_deref(),
-            Some("- persona"),
+        // SCOPE_17 — the result-summary fold now appends unconditionally (no output_schema on
+        // `base_opts`); this test's OWN point (output-path alone leaves the prompt alone) is
+        // unaffected — turn-budget and result-summary already apply unconditionally regardless of
+        // output_path, before and after this change.
+        assert!(
+            delivered_system_prompt(&argv)
+                .is_some_and(|d| d.starts_with("- persona\n\n## Result summary\n")),
             "argv was {argv:?}"
         );
     }
@@ -5393,7 +5425,15 @@ mod tests {
         )
         .expect("plan builds");
         let unbudgeted = read_system_prompt_arg(&plan);
-        assert_eq!(unbudgeted.trim(), "You are a careful worker.");
+        // SCOPE_17 — the result-summary fold now appends unconditionally (no output_schema on
+        // `base_opts`), so "no budget" no longer means the persona is untouched — only that the
+        // TURN-BUDGET block specifically is absent, which the very next assertion still pins.
+        assert!(
+            unbudgeted
+                .trim()
+                .starts_with("You are a careful worker.\n\n## Result summary\n"),
+            "{unbudgeted}"
+        );
         assert!(!unbudgeted.contains("## Turn budget"), "{unbudgeted}");
 
         opts.turn_budget = Some(crate::exec::turn_budget::ResolvedTurnBudget {

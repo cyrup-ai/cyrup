@@ -32,6 +32,11 @@ impl CompactionCostKind {
 /// `Eq` is intentionally omitted: [`ToolRun`] carries the raw `serde_json::Value` call args / result
 /// (so each tool can render its Pi-specific `renderCall`/`renderResult`), and `Value` is `PartialEq`
 /// but not `Eq` (floats). Nothing in the crate needs a total `Eq` on entries.
+// Committed entries do sit in the transcript `Vec`, but each is built once and re-read on every
+// render; boxing the widest variant would put a heap hop on that hot path and force restructuring
+// every constructor/match for a modest per-entry saving — same call as `cyrup-session`'s
+// `SessionEntry` (`clippy::large_enum_variant`).
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum Entry {
     /// A user submission.

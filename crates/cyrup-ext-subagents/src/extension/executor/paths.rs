@@ -609,6 +609,7 @@ mod tests {
 
         let err = executor
             .spawn_background(BackgroundSingleRequest {
+                thinking: None,
                 // SUBA-021: unbudgeted on this path (see the field doc).
                 usage_budget: None,
                 turn_budget: None,
@@ -661,6 +662,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let err = executor
             .spawn_background(BackgroundSingleRequest {
+                thinking: None,
                 // SUBA-021: unbudgeted on this path (see the field doc).
                 usage_budget: None,
                 turn_budget: None,
@@ -1022,7 +1024,7 @@ mod tests {
             "dismissal is display-only — it must NOT advance the run's state"
         );
         assert!(
-            !paths.result.exists(),
+            !paths.legacy_result_root.exists(),
             "dismissal must not fabricate a terminal result file"
         );
 

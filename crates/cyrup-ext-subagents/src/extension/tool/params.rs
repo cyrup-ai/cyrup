@@ -363,6 +363,34 @@ pub(crate) fn resolve_foreground_timeout(
     Ok(p.timeout_ms.or(p.max_runtime_ms).or(default_timeout_ms))
 }
 
+/// SCOPE_19/A1 — lower the caller's `thinking` param into the launch override (rung 2 of the
+/// resolution ladder; see `SingleRunOverrides::thinking`).
+///
+/// `"false"` — [`deserialize_watchdog_thinking`]'s spelling of the JSON boolean `false` — means
+/// `off`, exactly as [`crate::watchdog::model_selection::parse_watchdog_thinking_input`] reads it;
+/// `"inherit"` lowers to `None`, deferring to persona-then-parent-session, which is also what
+/// omitting the param does. Anything else must be a recognized
+/// [`crate::watchdog::model_selection::THINKING_LEVELS`] entry or the call is refused AT THE TOOL
+/// BOUNDARY, naming the valid levels: this param used to be accepted on launches and silently
+/// discarded, and a named refusal is the contract that replaces that.
+///
+/// # Errors
+///
+/// An unrecognized level, echoing the offending value and the full valid set.
+pub(crate) fn lower_launch_thinking(raw: Option<&str>) -> Result<Option<String>, String> {
+    match raw {
+        None | Some("inherit") => Ok(None),
+        Some("false") => Ok(Some("off".to_string())),
+        Some(level) if crate::watchdog::model_selection::THINKING_LEVELS.contains(&level) => {
+            Ok(Some(level.to_string()))
+        }
+        Some(other) => Err(format!(
+            "Unsupported thinking level '{other}'; expected {}, inherit, or false.",
+            crate::watchdog::model_selection::THINKING_LEVELS.join(", ")
+        )),
+    }
+}
+
 /// pi `resolveExecutionAgentScope` (`pi-subagents/src/agents/agent-scope.ts:3-6`): `"user"`/
 /// `"project"`/`"both"` pass through verbatim; anything else (absent, or any other garbage
 /// string) coerces to `Both` with no error. Every execution entry point (single/parallel/chain

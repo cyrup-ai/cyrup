@@ -98,6 +98,80 @@ pub fn api_key_env_vars(provider: &str) -> Option<&'static [&'static str]> {
     }
 }
 
+/// Every environment variable this module can turn into a usable provider credential — the
+/// UNION of every [`api_key_env_vars`] arm plus the ambient-credential triggers consulted by
+/// [`get_env_api_key`] / [`has_vertex_adc_credentials`] (Vertex ADC, Amazon Bedrock), plus the
+/// AWS companions the Bedrock SDK itself reads once a request is signed (`AWS_SESSION_TOKEN`,
+/// `AWS_REGION`, `AWS_DEFAULT_REGION`).
+///
+/// # This is a TEST-HERMETICITY contract, kept here on purpose
+///
+/// The integration suite (`crates/cyrup-it/tests/support/env.rs`) derives its credential scrub
+/// from THIS slice, so "which env vars can spend real tokens" has exactly one owner: the crate
+/// that reads them. A hand-copied list over there is how `TOGETHER_API_KEY` once reached a child
+/// process and made a real network call — the denylist knew 4 names, this map knew ~40.
+///
+/// The `credential_env_inventory_covers_every_name_this_file_reads` test locks the slice to this
+/// file's own source: any new `SOMETHING_API_KEY` literal added to [`api_key_env_vars`] (or
+/// anywhere else in this module) fails that test until it is added here too. Entries may be a
+/// SUPERSET of what the file names (the AWS companions are), never a subset.
+pub const CREDENTIAL_ENV_VARS: &[&str] = &[
+    // -- literal API keys / tokens, one per `api_key_env_vars` arm --------------------------
+    "COPILOT_GITHUB_TOKEN",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_OAUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "ANT_LING_API_KEY",
+    "QWEN_TOKEN_PLAN_API_KEY",
+    "QWEN_TOKEN_PLAN_CN_API_KEY",
+    "OPENAI_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+    "NVIDIA_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_CLOUD_API_KEY",
+    "GROQ_API_KEY",
+    "CEREBRAS_API_KEY",
+    "XAI_API_KEY",
+    "RADIUS_API_KEY",
+    "OPENROUTER_API_KEY",
+    "AI_GATEWAY_API_KEY",
+    "ZAI_API_KEY",
+    "ZAI_CODING_CN_API_KEY",
+    "MISTRAL_API_KEY",
+    "MINIMAX_API_KEY",
+    "MINIMAX_CN_API_KEY",
+    "MOONSHOT_API_KEY",
+    "HF_TOKEN",
+    "FIREWORKS_API_KEY",
+    "TOGETHER_API_KEY",
+    "BASETEN_API_KEY",
+    "OPENCODE_API_KEY",
+    "KIMI_API_KEY",
+    "CLOUDFLARE_API_KEY",
+    "XIAOMI_API_KEY",
+    "XIAOMI_TOKEN_PLAN_CN_API_KEY",
+    "XIAOMI_TOKEN_PLAN_AMS_API_KEY",
+    "XIAOMI_TOKEN_PLAN_SGP_API_KEY",
+    // -- Google Vertex ambient credentials (ADC), `get_env_api_key` + `has_vertex_adc_credentials`
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_CLOUD_PROJECT",
+    "GCLOUD_PROJECT",
+    "GOOGLE_CLOUD_LOCATION",
+    // -- Amazon Bedrock ambient credentials (`get_env_api_key`'s `amazon-bedrock` block) -----
+    "AWS_PROFILE",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    // -- AWS companions not named in this file but read by the signing SDK -------------------
+    "AWS_SESSION_TOKEN",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+];
+
 /// The configured env var(s) that can provide an API key for a provider.
 /// 1:1 port of `findEnvKeys` (`env-api-keys.ts:121`). Reports only literal API-key vars (it
 /// intentionally excludes ambient sources: AWS profiles/IAM, Google ADC). Returns `None` when none
@@ -389,6 +463,102 @@ mod tests {
         // Missing location → not configured.
         m.env.remove("GOOGLE_CLOUD_LOCATION");
         assert!(get_env_api_key("google-vertex", &m, None).await.is_none());
+    }
+
+    /// The [`CREDENTIAL_ENV_VARS`] sync guard: every UPPER_SNAKE string literal in this file —
+    /// which is where EVERY provider-credential env var this crate reads is spelled — must be in
+    /// the inventory. A new `api_key_env_vars` arm whose variable is missing from
+    /// [`CREDENTIAL_ENV_VARS`] fails here, which is what keeps the integration suite's scrub
+    /// (derived from that slice) complete without a human remembering two lists.
+    ///
+    /// Scanning SOURCE rather than calling the function is deliberate: a `match` cannot be
+    /// enumerated at runtime, and a hand-kept provider-id list is exactly the drift this guard
+    /// exists to rule out. Comments are scanned too — a false positive there costs one inventory
+    /// entry; a false negative on the real map costs real tokens.
+    #[test]
+    fn credential_env_inventory_covers_every_name_this_file_reads() {
+        let source = include_str!("env_api_keys.rs");
+        // Env-var names that appear in this file but are NOT provider credentials.
+        let exceptions = ["HOME", "CREDENTIAL_ENV_VARS", "UPPER_SNAKE", "SOMETHING_API_KEY"];
+
+        let mut missing = Vec::new();
+        for raw in source.split('"').skip(1).step_by(2) {
+            let looks_like_env_var = raw.len() >= 3
+                && raw.contains('_')
+                && raw
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                && raw.starts_with(|c: char| c.is_ascii_uppercase());
+            if looks_like_env_var
+                && !exceptions.contains(&raw)
+                && !CREDENTIAL_ENV_VARS.contains(&raw)
+                && !missing.contains(&raw)
+            {
+                missing.push(raw);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "env var name(s) read by this module but absent from CREDENTIAL_ENV_VARS: \
+             {missing:?}. Add them — the integration suite derives its credential scrub from that \
+             slice, and a name missing there can reach a spawned child and spend real tokens."
+        );
+    }
+
+    /// The inventory covers what [`api_key_env_vars`] returns for every known provider — the
+    /// direct (function-level) half of the source-scan above, using the same provider list
+    /// [`map_covers_every_fleet_provider`] maintains plus the arms it omits.
+    #[test]
+    fn credential_env_inventory_covers_every_mapped_provider() {
+        for p in [
+            "github-copilot",
+            "anthropic",
+            "ant-ling",
+            "qwen-token-plan",
+            "qwen-token-plan-cn",
+            "qwen-token-plan-individual",
+            "openai",
+            "azure-openai-responses",
+            "nvidia",
+            "deepseek",
+            "google",
+            "google-vertex",
+            "groq",
+            "cerebras",
+            "xai",
+            "radius",
+            "openrouter",
+            "vercel-ai-gateway",
+            "zai",
+            "zai-coding-cn",
+            "mistral",
+            "minimax",
+            "minimax-cn",
+            "moonshotai",
+            "moonshotai-cn",
+            "huggingface",
+            "fireworks",
+            "together",
+            "baseten",
+            "opencode",
+            "opencode-go",
+            "kimi-coding",
+            "cloudflare-workers-ai",
+            "cloudflare-ai-gateway",
+            "xiaomi",
+            "xiaomi-token-plan-cn",
+            "xiaomi-token-plan-ams",
+            "xiaomi-token-plan-sgp",
+        ] {
+            let vars = api_key_env_vars(p)
+                .unwrap_or_else(|| panic!("provider {p} lost its env-key mapping"));
+            for v in vars {
+                assert!(
+                    CREDENTIAL_ENV_VARS.contains(v),
+                    "api_key_env_vars({p:?}) names {v} but CREDENTIAL_ENV_VARS does not carry it"
+                );
+            }
+        }
     }
 
     #[tokio::test]

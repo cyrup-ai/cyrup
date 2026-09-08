@@ -225,7 +225,9 @@ pub struct ForkContext {
     ///
     /// Doubly gated, exactly as upstream is (see [`ForkContextResolver::resolve`]'s
     /// three-outcome contract): the branch must have actually had an unsafe thinking block
-    /// stripped from it AND the resolved child model must require thinking off. A fork that
+    /// stripped from it AND either the caller's gate demanded the downgrade (an external runner
+    /// this crate cannot speak for) or the stripping disturbed the branch's FINAL assistant entry
+    /// — the one position that can leave a thinking-enabled continuation invalid. A fork that
     /// sanitized nothing never carries an override.
     pub thinking_override: Option<String>,
 }
@@ -248,84 +250,33 @@ impl ForkContext {
 // for a different request context — so an unsanitized fork does not degrade, it hard-fails at the
 // provider on the ordinary `context: fork` path. Stripping those blocks is therefore unconditional;
 // the thinking-off override that accompanies it is not (see [`ForkContextResolver::resolve`]).
+//
+// SCOPE_19/A3 [CYRUP-DELTA] — upstream additionally gates the override on the child's PROVIDER:
+// pi `forkedChildRequiresThinkingOff` (`shared/fork-context.ts:105-115` @v0.57.0, fed by
+// `prepareForkThinking`, `runs/foreground/subagent-executor.ts:5858-5885`) forces reasoning off
+// for ANY candidate that resolves to the `anthropic` provider or the `anthropic-messages` api.
+// cyrup gates on the BRANCH TAIL instead ([`Sanitization::tail_disturbed`]): the unconditional
+// stripping above already discharges the provider constraint — once the unsafe blocks are gone
+// there are no invalid signatures left for the provider to reject — and the one position that can
+// still make a thinking-enabled continuation invalid is the branch's FINAL assistant entry, a
+// property of the branch, not of the provider. The provider check disabled reasoning on branches
+// that were already made safe, and misaligning the child's effort from its parent's forfeits
+// prompt-prefix reuse on exactly the call shape that inherits the most context.
 
-/// pi `forkedChildRequiresThinkingOff` (`shared/fork-context.ts:105-115` @v0.57.0) — does the
-/// resolved child model speak Anthropic's provider or message api, and therefore need the
-/// sanitized branch to run with reasoning disabled?
+/// SCOPE_19/A3 — what the sanitizer did to a branch, in the two dimensions the fork decision
+/// needs.
 ///
-/// Conservative by construction: an absent/empty model, or one the registry cannot resolve
-/// UNAMBIGUOUSLY, answers `true` (upstream's `if (!model) return true` / `if (!info) return true`).
-/// The asymmetry is deliberate — forcing thinking off on a model that did not need it costs
-/// reasoning depth for one run, while failing to force it on a model that did means the child's
-/// very first request carries inherited signed thinking blocks and is rejected outright.
-///
-/// Callers compute the gate and hand the result to [`ForkContextResolver::resolve`]; this is
-/// upstream's `forceThinkingOffForIndex` callback seam, kept as a caller-side decision so this
-/// module never reaches into the model registry mid-branch.
-#[must_use]
-pub fn forked_child_requires_thinking_off(
-    model: Option<&str>,
-    preferred_provider: Option<&str>,
-) -> bool {
-    // `!model` upstream is truthiness, so it catches `undefined` AND `""`; no trimming happens.
-    let Some(model) = model.filter(|m| !m.is_empty()) else {
-        return true;
-    };
-    let Some(info) = find_model_info(model, preferred_provider) else {
-        return true;
-    };
-    info.provider.as_str().eq_ignore_ascii_case("anthropic")
-        || info.api.as_str().eq_ignore_ascii_case("anthropic-messages")
-}
-
-/// pi `findModelInfo` (`shared/model-info.ts:74-86` @v0.57.0), resolved against
-/// [`crate::extension::models::registry_models`] — this crate's standing binding for pi's
-/// `ctx.modelRegistry.getAvailable()`.
-///
-/// Upstream's exact order, including its refusal to guess: strip any known `:<level>` suffix; try
-/// an exact `provider/id` match; then collect the bare-`id` matches and narrow them by
-/// `preferred_provider`; and when several providers offer that bare id with no preferred provider
-/// to break the tie, return `None` rather than picking one. An ambiguous id is left UNKNOWN, which
-/// [`forked_child_requires_thinking_off`] then treats conservatively — upstream's
-/// `matches.length === 1 ? matches[0] : undefined`.
-///
-/// Id matching is case-SENSITIVE (upstream compares with `===`); only the provider/api test in
-/// [`forked_child_requires_thinking_off`] lowercases, which is likewise upstream's own split.
-fn find_model_info(
-    model: &str,
-    preferred_provider: Option<&str>,
-) -> Option<&'static cyrup_provider::Model> {
-    let (base_model, _) = crate::exec::spawn_plan::split_known_thinking_suffix(model);
-    let models = crate::extension::models::registry_models();
-
-    // Upstream's `entry.fullId === baseModel`. `fullId` is exactly `${provider}/${id}`, so
-    // splitting on the FIRST `/` (provider names never contain one) compares the same two halves
-    // without formatting a throwaway string per catalog entry.
-    if let Some((provider, id)) = base_model.split_once('/')
-        && let Some(exact) = models
-            .iter()
-            .find(|m| m.provider.as_str() == provider && m.id.as_str() == id)
-    {
-        return Some(exact);
-    }
-
-    let matches: Vec<&'static cyrup_provider::Model> = models
-        .iter()
-        .filter(|m| m.id.as_str() == base_model)
-        .collect();
-    if let Some(preferred) = preferred_provider
-        && let Some(hit) = matches
-            .iter()
-            .copied()
-            .find(|m| m.provider.as_str() == preferred)
-    {
-        return Some(hit);
-    }
-    if matches.len() == 1 {
-        matches.first().copied()
-    } else {
-        None
-    }
+/// A bare `bool` could say only "something changed", which is why the thinking-off decision was
+/// made on the provider instead — the one fact that actually settles it was not being reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Sanitization {
+    /// Any unsafe block was stripped anywhere: the branch file must be rewritten.
+    pub(crate) changed: bool,
+    /// The FINAL assistant entry had a block stripped. The only position that can leave a
+    /// thinking-enabled continuation invalid — a tail left holding tool calls whose thinking
+    /// blocks were just removed — and therefore the only one that justifies forcing the child's
+    /// reasoning off (see the module-level `[CYRUP-DELTA]`).
+    pub(crate) tail_disturbed: bool,
 }
 
 /// pi `isUnsafeAnthropicThinkingBlock` (`shared/fork-context.ts:117-127` @v0.57.0).
@@ -379,11 +330,29 @@ struct BranchLine {
 }
 
 /// pi `sanitizeUnsafeThinkingBlocks` (`shared/fork-context.ts:152-163` @v0.57.0): strip every
-/// unsafe thinking block from every assistant entry, in place. Returns whether anything was
-/// removed — the value that gates BOTH the thinking-off entry and the file rewrite.
-fn sanitize_unsafe_thinking_blocks(lines: &mut [BranchLine]) -> bool {
-    let mut sanitized = false;
-    for line in lines {
+/// unsafe thinking block from every assistant entry, in place.
+///
+/// SCOPE_19/A3 [CYRUP-DELTA] — upstream returns a bare `sanitized: boolean`; this returns
+/// [`Sanitization`], reporting the tail dimension the thinking-off decision actually turns on
+/// (see the section comment above). `changed` still gates the file rewrite exactly as upstream's
+/// boolean did.
+fn sanitize_unsafe_thinking_blocks(lines: &mut [BranchLine]) -> Sanitization {
+    // The branch's FINAL assistant entry — the position a thinking-enabled continuation builds
+    // from — located up front so the strip loop below can flag whether IT was the entry disturbed.
+    let tail_index = lines.iter().rposition(|line| {
+        matches!(
+            &line.entry,
+            Entry::Known(KnownEntry::Message {
+                message: AgentMessage::Core(Message::Assistant(_)),
+                ..
+            })
+        )
+    });
+    let mut sanitization = Sanitization {
+        changed: false,
+        tail_disturbed: false,
+    };
+    for (index, line) in lines.iter_mut().enumerate() {
         let Entry::Known(KnownEntry::Message {
             message: AgentMessage::Core(Message::Assistant(assistant)),
             ..
@@ -405,11 +374,14 @@ fn sanitize_unsafe_thinking_blocks(lines: &mut [BranchLine]) -> bool {
             !is_unsafe_thinking_block(provider.as_str(), api.as_str(), model, block)
         });
         if content.len() != before {
-            sanitized = true;
+            sanitization.changed = true;
+            if Some(index) == tail_index {
+                sanitization.tail_disturbed = true;
+            }
             line.raw = None;
         }
     }
-    sanitized
+    sanitization
 }
 
 /// pi `createEntryId` (`shared/fork-context.ts:129-137` @v0.57.0): a short id colliding with
@@ -585,7 +557,7 @@ impl ForkContextResolver {
     /// pi `resolveFork` (`shared/fork-context.ts:246-272` @v0.57.0) has THREE outcomes, and so
     /// does this, because the two gates are independent:
     ///
-    /// | parent transcript | `force_thinking_off` | result |
+    /// | parent transcript | `force_thinking_off \|\| tail_disturbed` | result |
     /// |---|---|---|
     /// | no unsafe block | not consulted | file left untouched, no override |
     /// | unsafe blocks | `false` | blocks stripped and the file rewritten, but NO override and no `thinking_level_change` entry |
@@ -593,13 +565,25 @@ impl ForkContextResolver {
     ///
     /// Sanitization itself is unconditional (an inherited Anthropic thinking block whose signature
     /// was minted for another request context is rejected by the provider, so leaving one in place
-    /// breaks the run outright); the override is what the model gate decides.
+    /// breaks the run outright); the override is decided here, on what the sanitizer actually did.
+    ///
+    /// SCOPE_19/A3 [CYRUP-DELTA] — pi decides the override through a PROVIDER gate
+    /// (`prepareForkThinking` → `forkedChildRequiresThinkingOff`,
+    /// `runs/foreground/subagent-executor.ts:5858-5885` / `shared/fork-context.ts:105-115`
+    /// @v0.57.0). cyrup decides it on [`Sanitization::tail_disturbed`] — whether the strip
+    /// disturbed the branch's FINAL assistant entry, the only position that can leave a
+    /// thinking-enabled continuation invalid — because the unconditional stripping already
+    /// discharged the provider constraint and the provider gate was disabling reasoning on
+    /// branches that were already safe, forfeiting prefix-cache alignment with the parent on
+    /// exactly the call shape that inherits the most context. See the module-level section
+    /// comment beside [`Sanitization`].
     ///
     /// `force_thinking_off` is upstream's `options.forceThinkingOffForIndex?.(index) ?? true`,
-    /// hoisted to a parameter: the model ladder this branch's child will run is resolved by the
-    /// CALLER, well after the fork is requested, so the decision cannot be made here. Callers that
-    /// have the ladder compute it with [`forked_child_requires_thinking_off`]; callers that do not
-    /// pass `true`, which is upstream's own `?? true` default and the conservative direction.
+    /// hoisted to a parameter, and it now carries only what the RESOLVER cannot know: an external
+    /// (non-cyrup) child resolves no model from this registry, so the crate cannot speak for its
+    /// continuation semantics and the caller passes `true` (upstream's own `?? true` default and
+    /// the conservative direction — see `fork_requires_thinking_off`). Either signal — the
+    /// caller's gate or a disturbed tail — forces the override.
     pub async fn resolve(
         &self,
         requested: ContextMode,
@@ -669,8 +653,14 @@ impl ForkContextResolver {
         // file's bytes and mtime for every fork of a clean transcript.
         let mut thinking_override = None;
         let (header, mut lines) = read_session_entries(&branched_path)?;
-        if sanitize_unsafe_thinking_blocks(&mut lines) {
-            if force_thinking_off {
+        let sanitization = sanitize_unsafe_thinking_blocks(&mut lines);
+        if sanitization.changed {
+            // SCOPE_19/A3: the override fires on EITHER signal — the caller's gate (external
+            // runners the crate cannot speak for) or a disturbed branch tail (the one position
+            // that invalidates a thinking-enabled continuation). A mid-transcript-only strip
+            // carries no override: the branch is already safe and the child keeps its effort
+            // aligned with the parent's.
+            if force_thinking_off || sanitization.tail_disturbed {
                 append_thinking_off_entry(&mut lines);
                 thinking_override = Some("off".to_string());
             }
@@ -1143,34 +1133,6 @@ mod tests {
     // SUBA-075 — fork sanitization (pi `shared/fork-context.ts:105-178` @v0.57.0)
     // ---------------------------------------------------------------------------------------
 
-    /// Concrete catalog ids the gate tests pin to. Each is asserted to still have the shape the
-    /// test depends on before it is used, so a catalog change fails with "this fixture moved"
-    /// rather than silently inverting the assertion it was chosen to make.
-    const ANTHROPIC_QUALIFIED: &str = "anthropic/claude-opus-4-6";
-    /// `anthropic-messages` api under a provider that is NOT `anthropic` — the only fixture that
-    /// can tell the two arms of the gate apart.
-    const ANTHROPIC_API_OTHER_PROVIDER: &str = "cloudflare-ai-gateway/claude-3-opus";
-    /// Neither Anthropic axis. Its `:0` tail also proves the suffix strip only fires on a
-    /// recognized THINKING level.
-    const NON_ANTHROPIC_QUALIFIED: &str = "amazon-bedrock/amazon.nova-pro-v1:0";
-    /// A bare id several providers offer, none of them Anthropic on either axis.
-    const AMBIGUOUS_BARE: &str = "deepseek-v4-flash";
-
-    fn catalog_entry(qualified: &str) -> &'static cyrup_provider::Model {
-        let (provider, id) = qualified
-            .split_once('/')
-            .expect("fixture is provider-qualified");
-        let found = crate::extension::models::registry_models()
-            .iter()
-            .find(|m| m.provider.as_str() == provider && m.id.as_str() == id);
-        assert!(
-            found.is_some(),
-            "catalog fixture {qualified} is no longer in the registry; pick a live id rather than \
-             letting the assertions below pass vacuously"
-        );
-        found.expect("asserted present immediately above")
-    }
-
     fn thinking(signature: Option<&str>, redacted: bool) -> Content {
         Content::Thinking {
             thinking: "chain of thought".into(),
@@ -1249,120 +1211,6 @@ mod tests {
             .count()
     }
 
-    // ---- the model gate --------------------------------------------------------------------
-
-    #[test]
-    fn thinking_off_is_required_for_a_model_on_either_anthropic_axis() {
-        let anthropic = catalog_entry(ANTHROPIC_QUALIFIED);
-        assert_eq!(
-            anthropic.provider.as_str(),
-            "anthropic",
-            "fixture precondition"
-        );
-        assert!(
-            forked_child_requires_thinking_off(Some(ANTHROPIC_QUALIFIED), None),
-            "an `anthropic` provider model must force the sanitized branch to thinking-off"
-        );
-
-        // The SECOND axis, isolated: this model's provider is not `anthropic` at all, so only the
-        // `api == anthropic-messages` test can be what carries it. Collapsing the gate to a
-        // provider check alone would leave this one thinking-on and its inherited signed blocks
-        // would be sent straight back to an Anthropic endpoint.
-        let gateway = catalog_entry(ANTHROPIC_API_OTHER_PROVIDER);
-        assert_ne!(
-            gateway.provider.as_str(),
-            "anthropic",
-            "fixture precondition"
-        );
-        assert_eq!(
-            gateway.api.as_str(),
-            "anthropic-messages",
-            "fixture precondition"
-        );
-        assert!(forked_child_requires_thinking_off(
-            Some(ANTHROPIC_API_OTHER_PROVIDER),
-            None
-        ));
-    }
-
-    #[test]
-    fn thinking_off_is_not_required_for_a_model_on_neither_anthropic_axis() {
-        let entry = catalog_entry(NON_ANTHROPIC_QUALIFIED);
-        assert_ne!(entry.provider.as_str(), "anthropic", "fixture precondition");
-        assert_ne!(
-            entry.api.as_str(),
-            "anthropic-messages",
-            "fixture precondition"
-        );
-        assert!(
-            !forked_child_requires_thinking_off(Some(NON_ANTHROPIC_QUALIFIED), None),
-            "a model on neither Anthropic axis keeps its reasoning; forcing it off would cost \
-             depth for no safety gain"
-        );
-    }
-
-    /// pi `if (!model) return true` / `if (!info) return true` — the conservative arms. An
-    /// unresolvable model is not assumed safe.
-    #[test]
-    fn thinking_off_is_required_when_the_model_cannot_be_resolved() {
-        assert!(
-            forked_child_requires_thinking_off(None, None),
-            "absent model"
-        );
-        assert!(
-            forked_child_requires_thinking_off(Some(""), None),
-            "empty model"
-        );
-        assert!(
-            forked_child_requires_thinking_off(Some("no-such-provider/no-such-model"), None),
-            "a model absent from the catalog is unknown, and unknown is conservative"
-        );
-    }
-
-    /// pi `matches.length === 1 ? matches[0] : undefined`: a bare id several providers offer is
-    /// left UNRESOLVED rather than guessed at — which the conservative arm then turns into `true`.
-    /// A `preferred_provider` breaks the tie and the real answer comes through.
-    #[test]
-    fn an_ambiguous_bare_id_stays_unresolved_until_a_preferred_provider_breaks_the_tie() {
-        let providers: Vec<&str> = crate::extension::models::registry_models()
-            .iter()
-            .filter(|m| m.id.as_str() == AMBIGUOUS_BARE)
-            .map(|m| m.provider.as_str())
-            .collect();
-        assert!(
-            providers.len() > 1 && !providers.contains(&"anthropic"),
-            "fixture precondition: {AMBIGUOUS_BARE} must be offered by several NON-anthropic \
-             providers, got {providers:?}"
-        );
-
-        assert!(
-            forked_child_requires_thinking_off(Some(AMBIGUOUS_BARE), None),
-            "ambiguous -> unresolved -> conservative true"
-        );
-        assert!(
-            !forked_child_requires_thinking_off(Some(AMBIGUOUS_BARE), Some(providers[0])),
-            "the preferred provider resolves the id, and the resolved model is not Anthropic — \
-             proof the `true` above came from ambiguity, not from a blanket default"
-        );
-    }
-
-    /// pi resolves against `splitKnownThinkingSuffix(model).baseModel`, so a ladder entry that
-    /// already carries `:high` still resolves. A colon that is NOT a known level is part of the id.
-    #[test]
-    fn the_gate_strips_a_known_thinking_suffix_before_resolving_but_leaves_other_colons() {
-        assert!(
-            forked_child_requires_thinking_off(Some(&format!("{ANTHROPIC_QUALIFIED}:high")), None),
-            "`:high` is a recognized level and must be stripped before the catalog lookup"
-        );
-        // `amazon.nova-pro-v1:0` ends in a colon segment that is NOT a thinking level. If the
-        // split were unconditional the id would be truncated, resolve to nothing, and this would
-        // come back conservatively `true`.
-        assert!(!forked_child_requires_thinking_off(
-            Some(NON_ANTHROPIC_QUALIFIED),
-            None
-        ));
-    }
-
     // ---- sanitization over a real fork -----------------------------------------------------
 
     /// The full live path, both gates armed: an Anthropic parent turn carrying BOTH unsafe shapes
@@ -1429,13 +1277,14 @@ mod tests {
         assert_eq!(resolved.thinking_override.as_deref(), Some("off"));
     }
 
-    /// The gate OFF: sanitization still happens (it is unconditional — the inherited blocks are
-    /// unusable no matter who the child is), but nothing is flagged and no override is reported.
-    /// This is the arm that would vanish if the two gates were collapsed into one.
+    /// SCOPE_19/A3 — the caller's gate OFF, but the strip disturbed the branch's FINAL assistant
+    /// entry: the override fires anyway, because a tail left without its thinking blocks is the
+    /// one position that invalidates a thinking-enabled continuation. This is the rule that
+    /// replaced the provider gate; under the old semantics this branch carried no override at all.
     #[tokio::test]
-    async fn a_fork_for_a_non_anthropic_child_is_still_sanitized_but_carries_no_override() {
+    async fn a_disturbed_tail_forces_the_override_even_when_the_callers_gate_is_off() {
         let root = tempfile::tempdir().expect("tempdir");
-        let cwd = PathBuf::from("/proj/sanitize-gate-off");
+        let cwd = PathBuf::from("/proj/sanitize-tail-rule");
         let resolver = parent_with_assistant(
             root.path(),
             &cwd,
@@ -1461,10 +1310,70 @@ mod tests {
         );
         assert_eq!(
             thinking_off_entries(&lines),
-            0,
-            "the model gate said no, so nothing may downgrade this child's reasoning"
+            1,
+            "the FINAL assistant entry was disturbed, so the branch must record the downgrade \
+             even though the caller's gate was off"
         );
-        assert_eq!(resolved.thinking_override, None);
+        assert_eq!(resolved.thinking_override.as_deref(), Some("off"));
+    }
+
+    /// SCOPE_19/A3 — a mid-transcript-only strip: the unsafe blocks sit BEHIND a clean final
+    /// assistant entry, so the branch is rewritten but the child keeps its reasoning. Under the
+    /// deleted provider gate this Anthropic-parented fork would have been forced to `off` despite
+    /// the branch already being safe — the exact over-reach the tail rule removes.
+    #[tokio::test]
+    async fn a_mid_transcript_sanitization_leaves_the_tail_and_carries_no_override() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let cwd = PathBuf::from("/proj/sanitize-mid-transcript");
+        let lay = layout(root.path(), &cwd);
+        let mut parent = SessionManager::create(&cwd, &lay, NewSessionOpts::default())
+            .expect("create parent session");
+        parent.append_message(user("go")).expect("append user");
+        parent
+            .append_message(assistant_from(
+                "anthropic",
+                "anthropic-messages",
+                "anthropic/claude-opus-4-6",
+                vec![
+                    Content::text("early answer"),
+                    thinking(Some("sig-abc"), false),
+                ],
+            ))
+            .expect("append unsafe assistant");
+        parent
+            .append_message(user("and then?"))
+            .expect("append user");
+        parent
+            .append_message(assistant_from(
+                "anthropic",
+                "anthropic-messages",
+                "anthropic/claude-opus-4-6",
+                vec![Content::text("final answer")],
+            ))
+            .expect("append clean tail assistant");
+        let resolver = ForkContextResolver::new(Arc::new(AsyncMutex::new(parent)), lay);
+
+        let resolved = resolver
+            .resolve(ContextMode::Fork, 0, false)
+            .await
+            .expect("fork resolves");
+        let path = resolved.session_file_path.clone().expect("branch path");
+        let (_, lines) = read_session_entries(&path).expect("branch parses");
+
+        assert!(
+            surviving_thinking(&lines).is_empty(),
+            "stripping is unconditional — the mid-transcript signed block must still go"
+        );
+        assert_eq!(
+            thinking_off_entries(&lines),
+            0,
+            "the FINAL assistant entry was untouched, so nothing may downgrade this child's \
+             reasoning — the branch is already safe"
+        );
+        assert_eq!(
+            resolved.thinking_override, None,
+            "a mid-transcript-only strip keeps the child's effort aligned with the parent's"
+        );
     }
 
     /// The third outcome: a parent with nothing unsafe in it. No override, no level-change entry,
@@ -1634,9 +1543,14 @@ mod tests {
             ),
             "an unmodelled entry must land in `Unknown`, not be dropped"
         );
+        let sanitization = sanitize_unsafe_thinking_blocks(&mut lines);
         assert!(
-            sanitize_unsafe_thinking_blocks(&mut lines),
+            sanitization.changed,
             "the assistant entry's signed block must trigger the rewrite"
+        );
+        assert!(
+            sanitization.tail_disturbed,
+            "the assistant entry is the branch's final one, so the tail dimension must report it"
         );
         write_session_entries(&path, &header, &lines).expect("write");
 

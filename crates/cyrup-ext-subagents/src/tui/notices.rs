@@ -152,9 +152,14 @@ pub struct LoggingControlNoticeSink;
 
 impl ControlNoticeSink for LoggingControlNoticeSink {
     fn emit_control_notice(&self, notice: ControlNotice, trigger_turn: bool) {
-        eprintln!(
-            "[subagent-control] (trigger_turn={trigger_turn}) {}",
-            notice.message
+        // `info!` rather than `eprintln!` — see [`crate::background::watch::LoggingCompletionSink`]
+        // for the mechanism: stderr is the TTY under the TUI, and this sink is the FALLBACK used
+        // exactly when no transcript sink is attached, i.e. often while a frame is live.
+        tracing::info!(
+            target: "subagent_control",
+            trigger_turn,
+            message = %notice.message,
+            "subagent control notice"
         );
     }
 }

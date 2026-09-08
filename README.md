@@ -10,10 +10,10 @@ core, everything-is-an-extension, an agent that can extend itself. It rebuilds t
 backbone.
 
 > **Status:** pre-release, and not yet versioned. The agent loop, provider layer, tool set, session
-> tree, terminal interface, extension host, all five run modes, the MCP client and the Flux
-> development pipeline work end to end; the ACP adapter is in with its port unfinished. 22 crates,
-> ~835k lines of Rust and 9,303 workspace tests passing — re-derived with this change applied to
-> `1ad7391` (`cargo test --workspace --features test-fixtures --no-fail-fast`, 0 failed, 11
+> tree, terminal interface, extension host, all five run modes, the MCP client, the ACP adapter and
+> the Flux development pipeline work end to end. 22 crates, ~835k lines of Rust and 9,306 workspace
+> tests passing — re-derived with this change applied to
+> `ce1bfa79` (`cargo test --workspace --features test-fixtures --no-fail-fast`, 0 failed, 11
 > ignored, all pre-existing; `test-fixtures` is required or the two subagent-subprocess fixture
 > binaries never build and their tests silently do not run). The 492 integration-test figure is NOT
 > re-derived here; it was measured at `6cf2cb9f` and the batches since added tests across ten
@@ -263,7 +263,7 @@ link. On a constrained disk that is the difference between the suite running and
 failing on disk space. Type-checking this crate does not exercise it; run it before trusting a
 change to one of those subsystems.
 
-Sixteen integration binaries remain in-crate under `crates/*/tests/`, each because it needs a process
+Eighteen integration binaries remain in-crate under `crates/*/tests/`, each because it needs a process
 of its own: it mutates the process environment, spawns the shipped `cyrup` binary, or pins a
 whole-crate wiring proof next to the crate it proves.
 
@@ -340,14 +340,11 @@ reference client — can drive cyrup the way it drives any other ACP agent: `ini
 notifications and `session/request_permission` requests. It is a **fourth front-end** beside the
 TUI, `--mode rpc` and print/json, not a new agent.
 
-The foundation is in — the turn, the permission seam, sessions and the command surface — but the
-port is **not complete**: [`docs/gap-analysis/15-cyrup-acp.md`](docs/gap-analysis/15-cyrup-acp.md)
-§6 is the authority for what is still open, and the tool-call streaming and structured-diff paths
-are unit-tested but have not been exercised against a live model end to end. That document's first
-section is the decision that shapes everything else: pi-acp *must* spawn `pi --mode rpc` as a child
-and scrape untyped NDJSON off its stdout, because it is a separate npm package; `cyrup-acp` is a
-workspace crate and binds to `AgentSession` in-process instead, which deletes the whole subprocess
-surface and replaces `Record<string, unknown>` event probing with the typed `AgentSessionEvent`.
+[`docs/gap-analysis/15-cyrup-acp.md`](docs/gap-analysis/15-cyrup-acp.md) records the decision that
+shapes everything else: pi-acp *must* spawn `pi --mode rpc` as a child and scrape untyped NDJSON off
+its stdout, because it is a separate npm package; `cyrup-acp` is a workspace crate and binds to
+`AgentSession` in-process instead, which deletes the whole subprocess surface and replaces
+`Record<string, unknown>` event probing with the typed `AgentSessionEvent`.
 
 Clone all seven under `./tmp/` (gitignored) before working a ledger row. The area files cite them as
 `git -C tmp/<repo> show <tag>:<path>`, and a working tree's line numbers will mislead you.

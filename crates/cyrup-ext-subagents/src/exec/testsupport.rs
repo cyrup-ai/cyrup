@@ -52,6 +52,7 @@ pub(crate) fn sample_agent_config(model: &str, fallback: &[&str]) -> AgentConfig
 
 pub(crate) fn base_opts(cwd: &std::path::Path, available: &[&str]) -> RunOptions {
     RunOptions {
+        structured_output_dir: None,
         spawn_command: None,
         child_env: std::collections::HashMap::new(),
         // SUBA-021: no usage budget on this path (see the field doc).

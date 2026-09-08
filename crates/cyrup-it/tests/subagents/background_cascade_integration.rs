@@ -198,6 +198,7 @@ async fn build_run(dir: &Path, roots: &Roots, run_token: &str, child_id: &str) -
     tokio::fs::create_dir_all(&run_paths.run_dir).await.unwrap();
 
     let config = RunnerConfig {
+        completion_owner_id: None,
         turn_budget: None,
         permission_rules: None, // SUBA-073: no policy — the pre-field behaviour
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
@@ -216,7 +217,10 @@ async fn build_run(dir: &Path, roots: &Roots, run_token: &str, child_id: &str) -
         ))],
         cwd: dir.to_path_buf(),
         session_file: None,
-        session_id: None,
+        // The session-partitioned result index refuses a session-less result outright
+        // (`write_result_file`, pi `result-files.ts:166`), so a runner expected to land a
+        // terminal ResultFile must carry the launching session's identity.
+        session_id: Some("it-session".to_string()),
         global_concurrency_limit: 20,
         worktree_base_dir: None,
         max_subagent_depth: 2,
@@ -227,6 +231,7 @@ async fn build_run(dir: &Path, roots: &Roots, run_token: &str, child_id: &str) -
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
+        inherited_session_thinking: None,
         // The whole point: this run owns descendants, so the cascade has somewhere to go.
         nested_route: Some(route),
         nested_self: None,

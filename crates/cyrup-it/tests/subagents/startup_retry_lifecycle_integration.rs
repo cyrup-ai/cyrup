@@ -124,6 +124,7 @@ fn base_agent_config(model: &str) -> AgentConfig {
 
 fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
+        structured_output_dir: None,
         spawn_command: None,
         child_env: std::collections::HashMap::new(),
         turn_budget: None,
@@ -275,12 +276,28 @@ async fn a_cancel_during_the_startup_backoff_abandons_the_run_before_relaunching
         "a cancel inside the backoff is pi's cancellation branch, not an exhausted ladder: {result:?}"
     );
     // `apply_startup_outcome`'s `Cancelled` arm — the half that puts the diagnosis in the OUTPUT,
-    // not merely the error field.
+    // not merely the error field. The delivered output leads with the accumulated startup-retry
+    // notes (pi prepends `attemptNotes`, `subagent-runner.ts:1432-1433`); how many backoffs
+    // elapsed before the cancel landed is timing-dependent, but each retried launch's own attempt
+    // row carries exactly its note as `error`, so the expected composition is reconstructable
+    // from the observed ladder.
+    let notes: Vec<&str> = result
+        .model_attempts
+        .iter()
+        .filter_map(|attempt| attempt.error.as_deref())
+        .filter(|error| error.starts_with("[startup-retry]"))
+        .collect();
+    let expected_output = if notes.is_empty() {
+        CANCELLED.to_string()
+    } else {
+        format!("{}\n\n{CANCELLED}", notes.join("\n"))
+    };
     assert_eq!(
         result.final_output.as_deref(),
-        Some(CANCELLED),
+        Some(expected_output.as_str()),
         "pi sets `result.finalOutput = cancellationError` alongside `result.error` \
-         (`execution.ts:1596-1597`): {result:?}"
+         (`execution.ts:1596-1597`), delivered behind the accumulated attempt notes \
+         (`subagent-runner.ts:1432-1433`): {result:?}"
     );
     assert!(
         result.model_attempts.len() < SUBAGENT_STARTUP_RETRY_DELAYS_MS.len() + 1,
@@ -334,11 +351,25 @@ async fn an_interrupt_during_the_startup_backoff_is_a_paused_success_not_a_failu
         result.error, None,
         "and its error is explicitly CLEARED — reporting one turns a pause into a failure: {result:?}"
     );
-    // `apply_startup_outcome`'s `Interrupted` arm.
+    // `apply_startup_outcome`'s `Interrupted` arm. As in the cancel test above, the delivered
+    // output leads with the timing-dependent accumulated startup-retry notes
+    // (`subagent-runner.ts:1432-1433`), reconstructable from the observed attempt rows.
+    let notes: Vec<&str> = result
+        .model_attempts
+        .iter()
+        .filter_map(|attempt| attempt.error.as_deref())
+        .filter(|error| error.starts_with("[startup-retry]"))
+        .collect();
+    let expected_output = if notes.is_empty() {
+        INTERRUPTED_FINAL_OUTPUT.to_string()
+    } else {
+        format!("{}\n\n{INTERRUPTED_FINAL_OUTPUT}", notes.join("\n"))
+    };
     assert_eq!(
         result.final_output.as_deref(),
-        Some(INTERRUPTED_FINAL_OUTPUT),
-        "the paused sentinel is what the caller renders: {result:?}"
+        Some(expected_output.as_str()),
+        "the paused sentinel is what the caller renders, behind the accumulated attempt notes: \
+         {result:?}"
     );
     assert!(
         result.model_attempts.len() < SUBAGENT_STARTUP_RETRY_DELAYS_MS.len() + 1,
@@ -374,11 +405,33 @@ async fn with_no_signal_the_backoff_ladder_runs_to_exhaustion_and_reports_it_as_
         Some(exhausted.as_str()),
         "{result:?}"
     );
+    // An undisturbed ladder is fully deterministic — three backoffs, three notes — so the whole
+    // delivered composition is assertable verbatim: the accumulated startup-retry notes (pi
+    // prepends `attemptNotes` to the delivered output, `subagent-runner.ts:1432-1433`), a blank
+    // line, then the exhaustion diagnosis `apply_startup_outcome`'s Exhausted arm put in the
+    // OUTPUT as well as in `error` (pi `execution.ts:1610-1611`).
+    let notes: Vec<String> = SUBAGENT_STARTUP_RETRY_DELAYS_MS
+        .iter()
+        .enumerate()
+        .map(|(index, delay_ms)| {
+            // `AttemptNote`'s `Display` renders upstream's exact wording, so rendering here keeps
+            // this assertion on the delivered TEXT — which is what the operator reads — rather
+            // than on the structured kind tag the note now also carries.
+            format_subagent_startup_retry_note(
+                "fixture-model",
+                index + 1,
+                expected_launches,
+                *delay_ms,
+            )
+            .to_string()
+        })
+        .collect();
+    let expected_output = format!("{}\n\n{exhausted}", notes.join("\n"));
     assert_eq!(
         result.final_output.as_deref(),
-        Some(exhausted.as_str()),
-        "`apply_startup_outcome`'s Exhausted arm puts the diagnosis in the OUTPUT too, not only \
-         in `error` (pi `execution.ts:1610-1611`): {result:?}"
+        Some(expected_output.as_str()),
+        "the delivered output is the accumulated retry notes, a blank line, then the exhaustion \
+         diagnosis: {result:?}"
     );
 }
 
@@ -489,12 +542,15 @@ async fn the_startup_retry_note_reaches_the_live_progress_surface_of_the_relaunc
     // Every relaunch's note, in the exact text pi formats. All of them must appear: each explains
     // one relaunch, and a surface that shows only the last one hides the earlier failures.
     for launch in 1..=SUBAGENT_STARTUP_RETRY_DELAYS_MS.len() {
+        // `recent_output` is a `Vec<String>` of already-rendered progress lines, so the note is
+        // compared in its `Display` form — the same text pi pushes into `attemptNotes`.
         let expected = format_subagent_startup_retry_note(
             "fixture-model",
             launch,
             SUBAGENT_STARTUP_RETRY_DELAYS_MS.len() + 1,
             SUBAGENT_STARTUP_RETRY_DELAYS_MS[launch - 1],
-        );
+        )
+        .to_string();
         assert!(
             payloads.iter().any(|p| p
                 .progress

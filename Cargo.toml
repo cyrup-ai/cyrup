@@ -260,6 +260,21 @@ sha2                 = { version = "0.10" }
 # being approximated by a hand-rolled scheme scan. Pure Rust, no C, and already resolved in
 # `Cargo.lock` as a transitive dependency of `reqwest`, so this adds no new resolution surface.
 url                  = { version = "2.5" }
+# SUBA-3c — `pi-subagents/src/runs/shared/mutation-evidence.ts` shells out to
+# `git diff --name-only HEAD` and `git diff --binary HEAD -- <path>` to characterise what a
+# timed-out child changed. cyrup uses `gix` instead: the evidence path runs at a deadline kill,
+# where a subprocess is the one thing that must not be spawned, and shelling out imports the
+# user's `diff.external`/`core.pager`/fsmonitor configuration into a diagnostic (upstream needs
+# `-c core.fsmonitor=false` at `mutation-evidence.ts:12-15` precisely for the last one). Default
+# features only: `status` and `dirwalk` arrive via `extras`
+# (`gix-0.85.0/Cargo.toml:148-161`), and `gix-status`/`gix-dir` are already resolved in
+# `Cargo.lock` through `cyrup-resources`, so this adds no new compilation units. The network
+# features `cyrup-resources` pins for the skills package manager (`blocking-network-client`,
+# `blocking-http-transport-reqwest-rust-tls`) are deliberately NOT taken here — nothing on this
+# path makes a request — which is also why `cyrup-resources` keeps its own crate-local pin
+# rather than converting to this alias: the alias must not force an HTTP transport onto every
+# consumer.
+gix                  = { version = "0.85.0" }
 
 # arch-00 §7.1 ratified — first used by cyrup-ext (arch-08 §3.2 draft): the real consumer's
 # `fetch()` (same `streamableHttp.js` citation as `reqwest` above) preserves the WIRE
@@ -283,6 +298,35 @@ async-compression    = { version = "0.4.33", features = ["tokio", "gzip", "brotl
 # `forbid(unsafe_code)` in cyrup-tui is unaffected (the lint is per-crate, not transitive).
 pulldown-cmark       = { version = "0.13.4", default-features = false }
 syntect              = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
+
+# SCOPE_3f (workflow runtime): the acceptance-recovery classifier ports ~36 upstream JS regexes of
+# which ten use lookaround and three put a negative lookahead INSIDE a bounded repetition (a
+# tempered greedy token, `scripted-workflow.ts:1185-1188`) — unsplittable, so the `regex` crate
+# cannot host them. `fancy-regex` 0.18 is pure Rust, ALREADY resolved in this lockfile via
+# `syntect`'s `default-fancy` (zero new transitive crates), and auto-delegates lookaround-free
+# patterns to the linear-time `regex` engine (`RegexImpl::Wrap`). Used ONLY by
+# `cyrup-ext-subagents`'s `workflows/scripted/{recovery,preview}.rs`.
+fancy-regex          = { version = "0.18.0" }
+
+# SCOPE_3f (workflowScript runtime) — V8 via `deno_core`, the engine core Deno itself ships.
+# The deciding term is bar (b) conformance: the authoring model's reference implementation is
+# V8-in-Node, so any other engine is a trap where the agent is right and the runtime is wrong.
+# Ops are natively async on tokio, which is what lets `runs.all` fan out for real.
+#
+# V8 is C++, admitted under this file's own "where a pure-Rust alternative exists" carve-out — the
+# same one already used for `aws-lc-sys`, `ring`, `tree-sitter` and `zstd-sys`. The pure-Rust
+# alternative (`boa_engine`) fails bar (b). `forbid(unsafe_code)` is per-crate and unaffected.
+#
+# `rusty_v8`'s build downloads a CHECKSUMMED prebuilt static lib by default; `V8_FROM_SOURCE=1`
+# builds from source and `RUSTY_V8_MIRROR` points the download at an internal mirror for closed CI.
+# Used ONLY by `cyrup-ext-subagents`'s `workflows/scripted/`.
+deno_core            = { version = "0.411.0" }
+# `scopes` (pulls view+utils+visit) gives `deno_ast::scopes::Scope::is_global`, which is precisely
+# the scope-aware free-identifier resolution §3.6's enumerated-globals check needs: a local
+# `const fetch = …` must not be reported as a missing global.
+deno_ast             = { version = "0.53.3", features = ["scopes", "transforms"] }
+deno_error           = { version = "0.7.1" }
+
 # Mermaid -> Unicode terminal diagrams for cyrup-tui's markdown renderer — the Rust counterpart of
 # pi's `grok-mermaid` JS package (`components/mermaid.ts:2`), chosen 2026-08-28 after a crates.io
 # survey. MIT, and only three direct deps (`ascii-dag`, `chrono`, `unicode-width` — the last two

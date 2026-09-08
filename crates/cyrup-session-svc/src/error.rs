@@ -51,6 +51,17 @@ pub enum SessionServiceError {
     #[error("{0}")]
     AuthPreflightRefused(String),
 
+    /// The message-injection seam is not wired to a live session, or its pump has exited, so the
+    /// message was never queued (R-SA-101 / P-2).
+    ///
+    /// A technical failure of the call and therefore a `Result` variant, unlike the two things it
+    /// is easily confused with: a session that is merely BUSY is reported as an ordinary outcome
+    /// (`InjectionOffer::AgentBusy`) and never reaches an error type, and a session that took the
+    /// message but could not run a turn answers its producer with
+    /// `InjectOutcome::SessionUnavailable` rather than failing this call.
+    #[error("message injection unavailable: {0}")]
+    InjectUnavailable(String),
+
     /// A prompt / manual compaction was attempted on a session that has NO model — pi
     /// `if (!this.model) { throw new Error(formatNoModelSelectedMessage()); }`
     /// (agent-session.ts:1178-1180 for `prompt`, :1790-1792 for `compact`).

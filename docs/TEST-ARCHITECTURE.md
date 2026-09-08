@@ -655,37 +655,54 @@ explodes does not apply here.
 
 Reviewer check: `rg '127\.0\.0\.1:[1-9]' crates/*/tests` must match only the two dead-address sites.
 
-### R5 — Ambient credentials are scrubbed, and the scrub is asserted.
+### R5 — Ambient credentials cannot be used, and the machinery is asserted.
 
 `TOGETHER_API_KEY` is exported on this machine and **has already caused a test to make a real
-network call.** Three layers, because any one alone has a hole:
+network call**; ambient AWS credentials later turned an "offline, credential-less" ACP suite into
+a live Bedrock 403 (`tests/bin/acp_session.rs`'s builder comment records the incident). The rule
+is therefore stated as an outcome — *no test can spend real tokens, no matter what the machine's
+shell exports* — and implemented in four layers, each of which is itself asserted:
 
-1. **Every spawned child gets `Command::env_clear()` plus an explicit allowlist.** The reference
-   implementation already exists at `crates/cyrup/tests/auth_credential_print.rs:76`, and
-   `11-cyrup-intercom.md:791` cites it as the pattern the other four hermetic-child builders should
-   copy — which is precisely what §3.3's de-duplication does, once, in `cyrup-test-support`.
-2. **In-process reads go through injected config, never ambient env.** Generalize
-   `crates/cyrup-session-svc/tests/model_registry.rs:38-70`'s `ScrubbedProviderEnv` and its
-   `SCRUBBED_PROVIDER_ENV_KEYS` list into `cyrup_test_support::env::PROVIDER_KEYS`, and make the
-   harness's provider constructors take an explicit key rather than falling back to env.
-3. **A guard test per target that fails loudly if the suite's own process has any of them set:**
+0. **One authoritative inventory, owned by the crate that reads the variables.**
+   `cyrup_provider::env_api_keys::CREDENTIAL_ENV_VARS` is the union of every env var the provider
+   layer can turn into a credential (~45 names: every `api_key_env_vars` arm, the Vertex-ADC and
+   Bedrock ambient triggers, the AWS signing companions). Its completeness is not a convention:
+   `credential_env_inventory_covers_every_name_this_file_reads` scans the module's own source for
+   UPPER_SNAKE string literals and reds on any name missing from the slice, so a provider added
+   upstream cannot silently widen the leak surface. The old shape — a hand-copied 4-name list in
+   the harness — is how every incident above happened.
+1. **Every spawned `cyrup` gets `Command::env_clear()` plus a tiny explicit allowlist.**
+   `crates/cyrup-it/tests/support/env.rs::hermetic` (composed by `Scratch::command`) is the one
+   constructor, in the shape of `auth_credential_print.rs`'s original `env_clear` + allowlist and
+   pi's own `env -i` `test.sh`. This also removes `CYRUP_HOME`, which no denylist ever listed and
+   which OUTRANKS the `HOME` a test sets (the home ladder, `cyrup-config/src/paths.rs:361`) — an
+   ambient value pointed children at the developer's REAL `auth.json` with every `*_API_KEY`
+   scrubbed. Enforced structurally: the `every_cyrup_spawn_site_is_hermetic` lint test scans
+   `tests/**/*.rs` and reds any `bins::cyrup()` not wrapped in `hermetic(`/`.command(`.
+2. **In-process reads go through injected config; live e2e needs a double key.** Fixtures inject
+   `auth.json`/`models.json` under per-test tempdirs. `cyrup_test_support::auth` — the port of
+   pi's `describe.skipIf(!API_KEY)` live-e2e seam — deliberately deviates from pi: `api_key()`
+   answers `None` and `get_real_auth_store()` panics unless `CYRUP_LIVE_E2E=1` is set IN ADDITION
+   to the credential, so an exported key alone can never arm a token-spending test.
+3. **Guard tests in every target, inherited automatically.** The `#[test]`s live inside
+   `support/env.rs` itself (`no_ambient_provider_credentials`, `no_ambient_feature_gates`,
+   `allowlist_cannot_reinstate_a_scrubbed_name`, plus the layer-1 lint), so every target that
+   declares `mod support` runs them with no per-target wiring — a new target cannot forget them.
+   They check the FULL derived inventory and turn "a test quietly used a real API" into a named
+   red at the top of the run. A nextest setup script is **not** the answer here — a setup script
+   can only *append* `KEY=value` lines to `$NEXTEST_ENV`, so it can blank a variable but not unset
+   it, and blanking defeats a value check while passing an `is_some()` check.
 
-   ```rust
-   #[test]
-   fn no_ambient_provider_credentials() {
-       let leaked: Vec<_> = cyrup_test_support::env::PROVIDER_KEYS.iter()
-           .filter(|k| std::env::var_os(k).is_some()).collect();
-       assert!(leaked.is_empty(),
-           "ambient credentials in the test environment: {leaked:?}. \
-            Unset them before running the integration suite — a test has previously made a real \
-            network call because TOGETHER_API_KEY was exported.");
-   }
-   ```
-
-   Layer 3 is what layers 1 and 2 cannot give you: it turns "a test quietly used a real API" into a
-   named red at the top of the run. A nextest setup script is **not** the answer here — a setup
-   script can only *append* `KEY=value` lines to `$NEXTEST_ENV`, so it can blank a variable but not
-   unset it, and blanking defeats a value check while passing an `is_some()` check.
+Layer 3 is deliberately loud rather than silent because one in-process seam
+(`session_svc/model_registry.rs` → `provider_is_configured(.., env: None)`, 1:1 Pi parity) reads
+the process environment non-injectably: ambient credentials would change what that test observes,
+so they must be absent, not merely unused. **The supported way to run the suite on a machine whose
+shell exports real keys is `cargo run -p xtask -- it`** (also the `feature-matrix` seam row, which
+shares the same helper): it re-execs the suite under `env_clear` plus a toolchain-only allowlist,
+so the guards pass, every test runs against the faux provider, and the run provably spends
+nothing. Reviewer check: `rg '\.env_remove\(' crates/cyrup-it/tests` must match only
+`support/env.rs` (the `scrub()` implementation itself) — a per-test denylist reappearing is the
+regression signal.
 
 ### R6 — No `process::exit`, `abort`, or global handler installation in test code.
 

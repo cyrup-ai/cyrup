@@ -81,6 +81,7 @@ pub(crate) use event_extract::{
     truncate_summary, user_message_text_from_event,
 };
 pub(crate) use extension_render_impl::custom_entry_type;
+pub(crate) use extension_render_impl::run_renderer;
 pub use extension_render_impl::{
     extension_render, extension_render_entry, extension_render_message, extension_render_tool_call,
     extension_render_tool_result, should_honor_extension_shutdown,

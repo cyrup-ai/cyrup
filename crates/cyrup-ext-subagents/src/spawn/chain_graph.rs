@@ -1181,6 +1181,15 @@ pub struct StepResult {
     /// deadline kill from an ordinary failure in a collect record. `false` for every step that
     /// finished within its budget and for every executor that runs no child.
     pub timed_out: bool,
+    /// The step's child ended on a context overflow
+    /// ([`crate::exec::SingleResult::context_overflow`], pi `contextOverflow`) — carried across
+    /// this waist for the same reason `timed_out` is: upstream copies it onto the
+    /// sequential-chain results array (`contextOverflow: singleResult.contextOverflow`,
+    /// `subagent-runner.ts:4486`) and onto the status payload (`:3668`/`:4083`/`:4570`), and both
+    /// of cyrup's projections (`step_result_to_single_result`, `record_step_outcome`) read from
+    /// here. `false` for every step that ended any other way and for every executor that runs no
+    /// child.
+    pub context_overflow: bool,
     /// The file the step's R-SA-031 output-path handoff persisted the child's delivered output to
     /// ([`crate::exec::SingleResult::saved_output_path`], pi `result.savedOutputPath`,
     /// `execution.ts:963`) — pi emits it as a collect record's `outputPath`
@@ -1188,16 +1197,60 @@ pub struct StepResult {
     /// wrote. `None` when the step declared no `output_path`, did not complete cleanly, or wrote
     /// nothing.
     pub saved_output_path: Option<String>,
-    /// The step's artifact quadruple (pi `result.artifactPaths`, `shared/types.ts:488`, stamped on
-    /// the result at `execution.ts:1114`), serialized to pi's camelCase JSON object and carried
-    /// opaquely — pi spreads it verbatim onto a collect record's `artifactPaths`
-    /// (`dynamic-fanout.ts:284`). `None` when artifact writing was disabled or no artifacts dir was
-    /// configured, which is exactly pi's own `result.artifactPaths ? … : {}` gate.
-    pub artifact_paths: Option<Value>,
+    /// The step's artifact bundle (pi `result.artifactPaths`, `shared/types.ts:1349`, stamped on
+    /// the result at `execution.ts:1826-1830`) — pi spreads it verbatim onto a collect record's
+    /// `artifactPaths` (`dynamic-fanout.ts:284`). `None` when artifact writing was disabled or no
+    /// artifacts dir was configured, which is exactly pi's own `result.artifactPaths ? … : {}`
+    /// gate.
+    ///
+    /// Typed [`crate::artifacts::ArtifactPaths`] rather than the `serde_json::Value` this field
+    /// used to be: the value was ALWAYS an `ArtifactPaths`, and the untyped hop is exactly what
+    /// let cyrup's four-field struct diverge unnoticed from upstream's five. The one place that
+    /// genuinely wants pi's wire shape — the dynamic-fanout collect record — serializes at that
+    /// boundary instead ([`collapse_fan_out`]'s `CollectChildResult` fold).
+    pub artifact_paths: Option<crate::artifacts::ArtifactPaths>,
+    /// Token/cost usage this step actually consumed ([`crate::exec::SingleResult::usage`], pi
+    /// `result.usage`, `execution.ts:1998`).
+    ///
+    /// Carried for the same reason `exit_code`/`timed_out`/`saved_output_path` are: it is known at
+    /// `crate::background::runner_main`'s `build_step_result` and nowhere upstream of it, and
+    /// without this hop `step_result_to_single_result` has nothing to write but
+    /// [`cyrup_core::Usage::default`]. That is what it wrote before this field existed, which made
+    /// every async run report zero tokens and zero cost on its terminal `ResultFile`, and made
+    /// `/subagent-cost` (`registration/cost.rs`) report zero for the whole run.
+    pub usage: cyrup_core::Usage,
+    /// Assistant turns this step ran — pi's `Usage.turns` (`shared/types.ts:262`), kept beside
+    /// [`Self::usage`] for the reason stated on [`crate::exec::SingleResult::turns`].
+    pub turns: u64,
+    /// The model that actually produced this step's answer ([`crate::exec::SingleResult::model`],
+    /// pi `result.model`). `None` for a group aggregate and for an executor that spawned no child.
+    pub model: Option<cyrup_core::ModelId>,
+    /// Every model the fallback ladder attempted for this step, in ladder order (R-SA-038).
+    pub attempted_models: Vec<cyrup_core::ModelId>,
+    /// The child's persisted session transcript ([`crate::exec::SingleResult::session_file`]).
+    pub session_file: Option<std::path::PathBuf>,
+    /// Whether the child produced substantive output
+    /// ([`crate::exec::SingleResult::output_state`]).
+    pub output_state: crate::exec::output_state::SubagentOutputState,
+    /// Where the child's structured output was written, when it survives
+    /// ([`crate::exec::SingleResult::structured_output_path`]).
+    pub structured_output_path: Option<std::path::PathBuf>,
+    /// Bounded recovery evidence for a child killed by its deadline
+    /// ([`crate::exec::SingleResult::timeout_recovery`], pi's chain-results copy at
+    /// `subagent-runner.ts:4946` and status write at `:4645`) — carried across this waist for the
+    /// same reason `timed_out` is: `step_result_to_single_result` and `record_step_outcome` both
+    /// read from here, and without this hop an async run's recovery summary was built, spliced,
+    /// and then discarded at this boundary. `None` for every step whose child ended on its own and
+    /// for every executor that runs no child. No serde attribute: this struct is not serialized.
+    pub timeout_recovery: Option<crate::exec::mutation_evidence::TimeoutRecoverySummary>,
 }
 
 impl StepResult {
     /// Construct a successful result.
+    ///
+    /// `output_state` defaults to [`Unknown`](crate::exec::output_state::SubagentOutputState::Unknown)
+    /// — a constructor that never saw a child cannot know — and `build_step_result` overwrites it
+    /// with the producer's own derivation.
     #[must_use]
     pub fn success(final_output: Option<String>, structured_output: Option<Value>) -> Self {
         Self {
@@ -1209,12 +1262,23 @@ impl StepResult {
             control_events: Vec::new(),
             exit_code: None,
             timed_out: false,
+            context_overflow: false,
             saved_output_path: None,
             artifact_paths: None,
+            usage: cyrup_core::Usage::default(),
+            turns: 0,
+            model: None,
+            attempted_models: Vec::new(),
+            session_file: None,
+            output_state: crate::exec::output_state::SubagentOutputState::Unknown,
+            structured_output_path: None,
+            timeout_recovery: None,
         }
     }
 
-    /// Construct a failed result.
+    /// Construct a failed result. `output_state` defaults to
+    /// [`Unknown`](crate::exec::output_state::SubagentOutputState::Unknown) exactly as
+    /// [`Self::success`] does.
     #[must_use]
     pub fn failure(error: impl Into<String>) -> Self {
         Self {
@@ -1226,8 +1290,17 @@ impl StepResult {
             control_events: Vec::new(),
             exit_code: None,
             timed_out: false,
+            context_overflow: false,
             saved_output_path: None,
             artifact_paths: None,
+            usage: cyrup_core::Usage::default(),
+            turns: 0,
+            model: None,
+            attempted_models: Vec::new(),
+            session_file: None,
+            output_state: crate::exec::output_state::SubagentOutputState::Unknown,
+            structured_output_path: None,
+            timeout_recovery: None,
         }
     }
 }
@@ -1236,12 +1309,18 @@ impl StepResult {
 /// dispatched (`chain-execution.ts:283`: `exitCode: -1`). Deliberately outside the `0`/`1` range
 /// [`collapse_fan_out`] maps real child outcomes to, so a consumer of the dynamic collect array
 /// can tell "never ran" apart from "ran and failed".
-const FAIL_FAST_SKIPPED_EXIT_CODE: i64 = -1;
+///
+/// `pub(crate)` so `runner_main::settle`'s SCOPE_17 per-member flatten stamps the SAME sentinel on
+/// the synthetic `SingleResult` it records for an undispatched member, rather than a second copy
+/// of the literal that could drift from this one.
+pub(crate) const FAIL_FAST_SKIPPED_EXIT_CODE: i64 = -1;
 
 /// The verbatim `error` text pi attaches to that same synthetic skipped result
 /// (`chain-execution.ts:329`: `error: "Skipped due to fail-fast"`). Kept byte-identical because it
 /// surfaces to chain authors through `{outputs.<collect.as>}`.
-const FAIL_FAST_SKIPPED_ERROR: &str = "Skipped due to fail-fast";
+///
+/// `pub(crate)` for the same reason as [`FAIL_FAST_SKIPPED_EXIT_CODE`].
+pub(crate) const FAIL_FAST_SKIPPED_ERROR: &str = "Skipped due to fail-fast";
 
 /// One [`RunnerStep::ParallelGroup`]/[`RunnerStep::DynamicGroup`]'s fully collapsed outcome,
 /// combining the aggregate [`StepResult`] the chain's own [`OutputRegistry`] cares about with the
@@ -1796,7 +1875,14 @@ async fn run_dynamic_group(
                         error: sr.error.clone(),
                         timed_out: sr.timed_out,
                         structured_output: sr.structured_output.clone(),
-                        artifact_paths: sr.artifact_paths.clone(),
+                        // The ONE surviving `to_value`: `CollectChildResult` is a pi-shaped WIRE
+                        // record spread verbatim into `{outputs.<collect.as>}`
+                        // (`dynamic-fanout.ts:284`), so `Value` is the correct type THERE and the
+                        // typed `StepResult` bundle serializes at this boundary.
+                        artifact_paths: sr
+                            .artifact_paths
+                            .as_ref()
+                            .and_then(|paths| serde_json::to_value(paths).ok()),
                         saved_output_path: sr.saved_output_path.clone(),
                         output: None,
                         final_output: sr.final_output.clone(),
@@ -2145,22 +2231,72 @@ fn collapse_fan_out(fan_out: FanOutResult<StepResult, SubagentError>) -> GroupSt
         .flat_map(|child| child.control_events.iter().cloned())
         .collect();
 
+    // SCOPE_17: the children's text, folded exactly as `structured_output` and
+    // `aggregate_control_events` already are above.
+    //
+    // For a `ParallelGroup` the terminal payload no longer reads this field —
+    // `runner_main::settle::settle_step_result` flattens one `SingleResult` per member, matching
+    // pi `subagent-runner.ts:4229-4230`. For a `DynamicGroup` it is load-bearing: a dynamic group
+    // owns exactly ONE flat status slot by construction
+    // (`background::flat_index::pending_step_statuses_for`, whose width is unknown until walk
+    // time), so it cannot be flattened without breaking `ResultFile::results`' documented
+    // "same fixed order as `RunStatus::steps`" contract. This aggregate IS its record, and the
+    // `None` that used to sit here is what made a dynamic fan-out's completion notification read
+    // `(no output)` — `background::watch::format_completion_message` renders exactly
+    // `final_output.or(error)`.
+    //
+    // Blank-line separator, matching the `"\n\n"` join that same renderer uses ACROSS
+    // `ResultFile::results`, so N children in one group read identically to N single-child steps.
+    // A child with no text contributes NOTHING rather than an empty slot — upstream's
+    // `displaySummary` filters empties out (`notify.ts:58-104`) instead of emitting a gap.
+    let aggregate_final_output = {
+        let joined = children
+            .iter()
+            .flatten()
+            .filter_map(|child| child.final_output.as_deref())
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        (!joined.is_empty()).then_some(joined)
+    };
+
+    // SCOPE_17: `Unknown` was correct only while the aggregate could never carry output. Reuse the
+    // crate's single derivation (itself the port of pi's `subagent-runner.ts:1442-1447`) rather
+    // than a second hand-rolled match — its own doc states it exists so the two forms cannot
+    // drift. Computed here rather than inline because `structured_output` is moved into the struct
+    // literal below.
+    let aggregate_output_state = crate::exec::output_state::derive_output_state(
+        aggregate_final_output.as_deref(),
+        Some(&structured_output),
+        None,
+    );
+
     GroupStepResult {
         aggregate: StepResult {
             success,
             structured_output: Some(structured_output),
-            final_output: None,
+            final_output: aggregate_final_output,
             error,
             interrupted: false,
             control_events: aggregate_control_events,
             // A GROUP aggregate has no single child of its own; the per-child exit codes /
-            // deadline flags / paths live on `children` below (which is exactly where the dynamic
-            // collect-record fold reads them from). Nothing is lost by leaving the aggregate's
-            // copies unset — pi has no aggregate-level analogue of these fields either.
+            // deadline flags / paths / usage / models / session files live on `children` below
+            // (which is exactly where the dynamic collect-record fold AND `record_step_outcome`'s
+            // per-member arm read them from). Nothing is lost by leaving the aggregate's copies
+            // unset — pi has no aggregate-level analogue of these fields either.
             exit_code: None,
             timed_out: false,
+            context_overflow: false,
             saved_output_path: None,
             artifact_paths: None,
+            usage: cyrup_core::Usage::default(),
+            turns: 0,
+            model: None,
+            attempted_models: Vec::new(),
+            session_file: None,
+            output_state: aggregate_output_state,
+            structured_output_path: None,
+            timeout_recovery: None,
         },
         children,
         fail_fast_skipped,

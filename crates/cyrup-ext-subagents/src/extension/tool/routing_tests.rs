@@ -654,7 +654,7 @@ async fn subagent_tool_rejects_a_second_concurrent_dispatch_while_one_is_in_flig
     let err = tool
         .execute(
             ToolCallId::from("t"),
-            serde_json::json!({ "agent": "worker", "task": "do it" }),
+            serde_json::json!({ "agent": "worker", "task": "do it", "async": false }),
             CancelToken::new(),
             Box::new(|_u: cyrup_core::ToolUpdate| {}),
         )
@@ -678,6 +678,47 @@ async fn subagent_tool_rejects_a_second_concurrent_dispatch_while_one_is_in_flig
     assert!(
         action_err.to_string().contains("Async run not found"),
         "an `action` call must bypass the dispatch guard entirely, got: {action_err}"
+    );
+}
+
+/// SCOPE_18 (pi `executeWithSingleDispatchGuard`, `subagent-executor.ts:7209-7230` @ the current
+/// tag): an effectively-async dispatch is EXEMPT from the single-dispatch guard — pi's second
+/// early return (`if (!runsForeground) return execute(...)`) sits BEFORE the `subagentInProgress`
+/// check, so a second `async: true` launch arriving while another dispatch is still in flight must
+/// be accepted, not rejected with the duplicate-call text; only FOREGROUND dispatches serialize.
+/// Same technique as the foreground test above: hold the guard's one slot directly (rather than
+/// racing two real futures), isolating the assertion to the guard-gating wiring itself. The agent
+/// is `ghost` — deliberately NOT the bundled builtin `worker`, which resolves in this environment
+/// and would detach a real child run — so the dispatch errors at agent resolution, which is
+/// downstream of the guard and therefore proves the bypass reached real dispatch logic.
+#[tokio::test]
+async fn subagent_tool_does_not_serialize_a_concurrent_async_dispatch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tool = scoped_tool(dir.path()).await;
+
+    // Simulate "a prior dispatch is in progress" exactly as the sibling foreground test does.
+    let _held = tool
+        .dispatch_guard
+        .try_acquire()
+        .expect("the guard's single slot is free before any dispatch has run");
+
+    let err = tool
+        .execute(
+            ToolCallId::from("t"),
+            serde_json::json!({ "agent": "ghost", "task": "do it", "async": true }),
+            CancelToken::new(),
+            Box::new(|_u: cyrup_core::ToolUpdate| {}),
+        )
+        .await
+        .expect_err("the agent is unresolvable, so the call still errors downstream");
+    assert!(
+        !err.to_string().contains("already in progress"),
+        "an async dispatch must bypass the guard entirely (pi's `if (!runsForeground) return \
+         execute(...)`), even while the guard's slot is held by something else; got: {err}"
+    );
+    assert!(
+        err.to_string().contains("agent not found") || err.to_string().contains("Agent"),
+        "having bypassed the guard, the call must reach real agent resolution, not stop early: {err}"
     );
 }
 

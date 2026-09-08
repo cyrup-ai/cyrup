@@ -61,8 +61,8 @@ pub(crate) fn format_async_started_message(headline: &str) -> String {
         "",
         "The async run is detached. Do not run sleep timers or polling loops just to wait for it.",
         "If you have independent work, continue that work. If you have nothing else to do until \
-         the async result arrives, end your turn now; Pi will deliver the completion when the run \
-         finishes.",
+         the async result arrives, end your turn now; cyrup will deliver the completion when the \
+         run finishes.",
         "Use subagent({ action: \"status\", id: \"...\" }) when you need the current status/result, \
          or to inspect a blocked/stale run. Do not poll just to wait.",
     ]
@@ -396,8 +396,8 @@ mod tests {
              \n\
              The async run is detached. Do not run sleep timers or polling loops just to wait for it.\n\
              If you have independent work, continue that work. If you have nothing else to do until \
-             the async result arrives, end your turn now; Pi will deliver the completion when the run \
-             finishes.\n\
+             the async result arrives, end your turn now; cyrup will deliver the completion when the \
+             run finishes.\n\
              Use subagent({ action: \"status\", id: \"...\" }) when you need the current status/result, \
              or to inspect a blocked/stale run. Do not poll just to wait."
         );

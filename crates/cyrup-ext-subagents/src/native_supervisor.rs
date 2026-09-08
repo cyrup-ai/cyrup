@@ -93,8 +93,9 @@ pub const ENV_ASK_TIMEOUT_MS: &str = "CYRUP_INTERCOM_ASK_TIMEOUT_MS";
 // Paths (`native-supervisor-channel.ts:18-20, 74-101`)
 // =================================================================================================
 
-/// `safeSegment` (`:74-76`): trim, collapse every run of characters outside `[A-Za-z0-9._-]` to a
-/// single `-`, strip leading/trailing `-`, and fall back to `"unknown"` when nothing survives.
+/// `safeSegment` (`:74-76`): trim, collapse every run of characters outside the keep-set
+/// (ASCII alphanumerics plus `.`, `_` and `-`) to a single `-`, strip leading/trailing `-`, and
+/// fall back to `"unknown"` when nothing survives.
 #[must_use]
 pub fn safe_segment(value: &str) -> String {
     let trimmed = value.trim();
@@ -1931,7 +1932,7 @@ mod tests {
         assert_eq!(safe_segment("***"), "unknown");
         assert_eq!(safe_segment(""), "unknown");
         // The traversal case the sanitiser exists for. `.` IS in upstream's allowed class
-        // (`[^A-Za-z0-9._-]` is what gets replaced), so the dots survive — what does NOT survive is
+        // (everything outside the keep-set gets replaced), so the dots survive — what does NOT survive is
         // the SEPARATOR, so the result is a single flat path component and cannot escape the root.
         assert_eq!(safe_segment("../../etc"), "..-..-etc");
         assert!(!safe_segment("../../etc").contains(std::path::MAIN_SEPARATOR));

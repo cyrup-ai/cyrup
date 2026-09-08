@@ -35,24 +35,24 @@ fn spawn_rpc() -> (Child, ChildStdin, ChildStdout, TempDir) {
     let work = tmp.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
 
-    let mut child = Command::new(crate::support::bins::cyrup())
+    // Hermetic by construction (`env_clear` + allowlist, `support::env::hermetic`): no ambient
+    // credential, proxy, `CYRUP_HOME` redirect or built-in opt-in can reach the child. Enforced
+    // suite-wide by the `every_cyrup_spawn_site_is_hermetic` lint.
+    let mut child = crate::support::env::hermetic(crate::support::bins::cyrup(), tmp.path())
         .current_dir(&work)
-        .env("HOME", tmp.path())
         .env("CYRUP_AGENT_DIR", &agent_dir)
-        .env_remove("ANTHROPIC_API_KEY")
-        .env_remove("OPENAI_API_KEY")
-        .env_remove("HTTP_PROXY")
-        .env_remove("HTTPS_PROXY")
-        // Never inherit an ambient built-in opt-in — see `unknown_flag_exit.rs`.
-        .env_remove("CYRUP_INTERCOM")
-        .env_remove("CYRUP_SUBAGENTS")
-        .env_remove("CYRUP_PERMISSION_SYSTEM")
         .args([
             "--mode",
             "rpc",
             "--offline",
             "--no-session",
             "--no-extensions",
+            // The offline faux model (same fixture `one_shot_parity.rs` runs on): with NO model
+            // available the binary refuses at startup ("No models available. Use /login …") and
+            // exits before the RPC serving loop — the loop whose signal teardown is this file's
+            // entire subject — ever starts.
+            "--model",
+            "faux/faux-1",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

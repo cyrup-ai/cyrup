@@ -213,6 +213,21 @@ pub enum ReconcileAction {
 /// files (a missing file is not itself an error — see algorithm step 2/3 above; a present-but-
 /// unparseable file IS surfaced as an error rather than silently discarded, since a corrupted
 /// status/result file is a real anomaly a caller should be able to detect rather than have masked).
+/// Read a run's terminal [`ResultFile`] from wherever it was promoted to.
+///
+/// The owned location is session-partitioned, so the owning session must be known; `status.json`
+/// records it. A run whose status is missing, unreadable or session-less falls back to the legacy
+/// root path, which is where builds predating the partition published.
+async fn read_terminal_result(paths: &RunPaths) -> std::io::Result<Option<ResultFile>> {
+    if let Ok(Some(status)) = read_optional_json::<RunStatus>(&paths.status).await
+        && let Some(session_id) = status.session_id.as_ref()
+        && let Some(path) = paths.resolve_result(session_id, &status.run_id).await
+    {
+        return read_optional_json::<ResultFile>(&path).await;
+    }
+    read_optional_json::<ResultFile>(&paths.legacy_result_root).await
+}
+
 pub async fn reconcile(
     paths: &RunPaths,
     spawn_confirmed_at: Option<SystemTime>,
@@ -223,7 +238,10 @@ pub async fn reconcile(
 ) -> std::io::Result<ReconcileOutcome> {
     // Step 1: a ResultFile is ALWAYS authoritative over status.json, unconditionally, before any
     // liveness probing is even considered (R-SA-088 item 1, R-SA-077).
-    if let Some(result) = read_optional_json::<ResultFile>(&paths.result).await? {
+    // A payload lives under `result-owned/<enc(session)>/` once promoted, so it is resolved
+    // through the index when the status records a session, and read from the legacy root path
+    // otherwise (a run written by a build predating the partition).
+    if let Some(result) = read_terminal_result(paths).await? {
         return repair_from_result(paths, result).await;
     }
 
@@ -404,6 +422,23 @@ async fn repair_from_result(
 
     crate::background::atomic::write_atomic_json(&paths.status, &repaired).await?;
 
+    // The repaired record is terminal, so it must enter the terminal-run index exactly as a
+    // healthy runner's own write would (pi `updateTerminalRunIndex` via `updateActiveRunIndex`,
+    // `active-run-index.ts:100-108`) — or a run whose runner died is invisible to the index while
+    // being perfectly visible to the full scan. Best-effort: the index is advisory.
+    if let Err(err) = crate::background::terminal_run_index::update_terminal_run_index(
+        &paths.run_dir,
+        &repaired,
+    )
+    .await
+    {
+        tracing::warn!(
+            run_id = %repaired.run_id,
+            error = %err,
+            "failed to write terminal-run index marker; the run's own terminal record is unaffected"
+        );
+    }
+
     Ok(ReconcileOutcome {
         status: repaired,
         action: ReconcileAction::RepairedFromResult,
@@ -512,6 +547,21 @@ async fn synthesize_failure(
 
     crate::background::atomic::write_atomic_json(&paths.status, status).await?;
 
+    // As in `repair_from_result` above: a synthesized terminal state indexes like a real one, so
+    // the session that launched this stale-dead run can still find it through the index.
+    if let Err(err) = crate::background::terminal_run_index::update_terminal_run_index(
+        &paths.run_dir,
+        status,
+    )
+    .await
+    {
+        tracing::warn!(
+            run_id = %status.run_id,
+            error = %err,
+            "failed to write terminal-run index marker; the run's own terminal record is unaffected"
+        );
+    }
+
     let stderr_tail = read_stderr_tail(&paths.runner_stderr_log).await;
     let mut diagnostic = format!("subagent run reconciled as stale/dead: {reason}");
     if let Some(tail) = stderr_tail.filter(|tail| !tail.is_empty()) {
@@ -534,10 +584,48 @@ async fn synthesize_failure(
         success: false,
         cwd: paths.run_dir.clone(),
         session_file: status.steps.first().and_then(|s| s.session_file.clone()),
+        // The DEAD runner's own recorded identities, carried off `status` — this process is
+        // reconciling on someone else's behalf and must not substitute its own, or it would
+        // hand itself delivery rights over another instance's run.
+        session_id: status.session_id.clone(),
+        completion_owner_id: status.completion_owner_id.clone(),
         results: synthesized_results,
     };
 
-    crate::background::atomic::write_atomic_json(&paths.result, &result).await?;
+    // pi `stale-run-reconciler.ts:283` writes the repaired result only `if (repair.result.sessionId)`.
+    // A reconciled run with no recorded session cannot be indexed, and an unindexed result is
+    // invisible to every reader — so writing one would create an orphan rather than a repair. The
+    // status write above still records the failure, which is what `/subagents` reads.
+    if let Some(session_id) = result.session_id.clone() {
+        {
+            let results_dir = paths.results_dir.as_path();
+            let write = crate::background::result_index::write_async_result_file(
+                &crate::background::result_index::ResultWrite {
+                    results_dir,
+                    session_id: &session_id,
+                    run_id: &result.run_id,
+                    written_at: crate::time::now_epoch_millis(),
+                    async_dir: Some(paths.run_dir.as_path()),
+                    tool_call_id: None,
+                },
+                &result,
+            )
+            .await;
+            if let Err(error) = write {
+                tracing::warn!(
+                    run_id = %result.run_id,
+                    %error,
+                    "failed to write reconciled ResultFile"
+                );
+            }
+        }
+    } else {
+        tracing::debug!(
+            run_id = %result.run_id,
+            "reconciled run has no recorded session; skipping the result write (pi \
+             `stale-run-reconciler.ts:283`)"
+        );
+    }
 
     Ok(ReconcileOutcome {
         status: status.clone(),
@@ -570,15 +658,32 @@ fn synthesize_step_results(status: &RunStatus, diagnostic: &str) -> Vec<crate::e
             task: String::new(),
             exit_code: -1,
             usage: step.usage.clone(),
+            turns: step.turns,
             model: step.model.clone(),
             attempted_models: step.attempted_models.clone(),
             model_attempts: Vec::new(),
+            // SCOPE_3d — the same `StepStatus::run_id` mirror the settle path performs
+            // (`runner_main/settle.rs`): a stale-dead workflow child keeps its own run id on the
+            // synthesized terminal record.
+            child_run_id: step.run_id.clone(),
             final_output: None,
             structured_output: None,
+            // The step's own recorded transcript, when the runner got far enough to record one —
+            // the same value `resume`'s terminal-revival branch reads (R-SA-085).
+            session_file: step.session_file.clone(),
+            // A reconciled placeholder describes a run cyrup could not read back — whether the
+            // child produced output is genuinely unknowable here.
+            output_state: crate::exec::output_state::SubagentOutputState::Unknown,
+            structured_output_path: None,
+            artifact_paths: None,
             acceptance: None,
             detached: false,
             interrupted: false,
             timed_out: false,
+            // Synthesized from a status step cyrup could not read a result for — any recovery
+            // summary the real child built is unknowable here.
+            timeout_recovery: None,
+            context_overflow: false,
             stopped: false,
             process_signal: None,
             error: Some(step.error.clone().unwrap_or_else(|| diagnostic.to_string())),
@@ -611,15 +716,25 @@ fn placeholder_result(
         task: String::new(),
         exit_code: -1,
         usage: cyrup_core::Usage::default(),
+        // A placeholder for a run with no readable steps names no child run.
+        child_run_id: None,
+        turns: 0,
         model: None,
         attempted_models: Vec::new(),
         model_attempts: Vec::new(),
         final_output: None,
         structured_output: None,
+        session_file: None,
+        // As on `synthesize_step_results`: a run cyrup could not read back — unknowable.
+        output_state: crate::exec::output_state::SubagentOutputState::Unknown,
+        structured_output_path: None,
+        artifact_paths: None,
         acceptance: None,
         detached: false,
         interrupted: false,
         timed_out: false,
+        timeout_recovery: None,
+        context_overflow: false,
         stopped: false,
         process_signal: None,
         error: Some(diagnostic.to_string()),
@@ -801,9 +916,11 @@ mod tests {
             success: true,
             cwd: paths.run_dir.clone(),
             session_file: None,
+            session_id: None,
+            completion_owner_id: None,
             results: Vec::new(),
         };
-        crate::background::atomic::write_atomic_json(&paths.result, &result)
+        crate::background::atomic::write_atomic_json(&paths.legacy_result_root, &result)
             .await
             .expect("write result");
 
@@ -862,9 +979,11 @@ mod tests {
             success: false,
             cwd: paths.run_dir.clone(),
             session_file: None,
+            session_id: None,
+            completion_owner_id: None,
             results: Vec::new(),
         };
-        crate::background::atomic::write_atomic_json(&paths.result, &result)
+        crate::background::atomic::write_atomic_json(&paths.legacy_result_root, &result)
             .await
             .expect("write result");
 
@@ -923,9 +1042,11 @@ mod tests {
             success: false,
             cwd: paths.run_dir.clone(),
             session_file: None,
+            session_id: None,
+            completion_owner_id: None,
             results: Vec::new(),
         };
-        crate::background::atomic::write_atomic_json(&paths.result, &result)
+        crate::background::atomic::write_atomic_json(&paths.legacy_result_root, &result)
             .await
             .expect("write result");
 
@@ -1056,11 +1177,14 @@ mod tests {
         let run_id = run_id_from_paths(&paths);
         let dead_pid = spawn_and_reap_dead_pid();
 
-        let status = running_status(
+        let mut status = running_status(
             run_id,
             dead_pid,
             crate::time::epoch_millis(SystemTime::now()),
         );
+        // A real run carries its launching session; the reconciler writes the repaired result only
+        // when it does (pi `stale-run-reconciler.ts:283`).
+        status.session_id = crate::identity::SessionId::parse("test-session");
         crate::background::atomic::write_atomic_json(&paths.status, &status)
             .await
             .expect("write status");
@@ -1094,9 +1218,15 @@ mod tests {
         let reread_status: RunStatus = serde_json::from_slice(&status_bytes).expect("valid JSON");
         assert_eq!(reread_status.state, RunState::Failed);
 
-        let result_bytes = tokio::fs::read(&paths.result)
-            .await
-            .expect("ResultFile exists");
+        // The repaired result is published into the owning session's partition, which is where
+        // its own reader resolves it — never the shared results root.
+        let result_bytes = tokio::fs::read(crate::background::result_index::owned_payload_path(
+            &paths.results_dir,
+            &crate::identity::SessionId::parse("test-session").expect("non-empty"),
+            &run_id_from_paths(&paths),
+        ))
+        .await
+        .expect("ResultFile exists");
         let reread_result: ResultFile = serde_json::from_slice(&result_bytes).expect("valid JSON");
         assert_eq!(reread_result.state, RunState::Failed);
         assert!(!reread_result.success);
@@ -1179,7 +1309,7 @@ mod tests {
         assert_eq!(outcome.action, ReconcileAction::NoneNeeded);
         assert_eq!(outcome.status.state, RunState::Running);
         assert!(
-            !paths.result.exists(),
+            !paths.legacy_result_root.exists(),
             "no ResultFile should ever be synthesized for a genuinely still-active run"
         );
 

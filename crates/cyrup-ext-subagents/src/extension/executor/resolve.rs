@@ -398,12 +398,13 @@ impl SubagentExecutor {
     /// Resolve one task's requested [`ContextMode`] into a concrete [`ForkContext`] (R-SA-137,
     /// fail-hard per DI-SA-2 — never silently downgrades to `Fresh`).
     ///
-    /// SUBA-075: `force_thinking_off` is the caller's answer to "does the model this branch's
-    /// child will run require reasoning disabled?" — pi's `forceThinkingOffForIndex` callback,
-    /// which upstream likewise populates outside the resolver because the model ladder is not
-    /// resolved until after the fork is requested. Compute it with
-    /// [`crate::fork_context::forked_child_requires_thinking_off`]; pass `true` (upstream's own
-    /// `?? true` fallback) when the ladder is not in hand.
+    /// SUBA-075, narrowed by SCOPE_19/A3: `force_thinking_off` is the caller's answer to "must
+    /// this branch's child run with reasoning disabled for a reason the resolver cannot see?" —
+    /// pi's `forceThinkingOffForIndex` callback seam, now carrying ONLY the external-runner
+    /// short-circuit (`fork_requires_thinking_off` in `executor/foreground.rs`); the branch-tail
+    /// decision that replaced upstream's provider walk is the resolver's own
+    /// (`Sanitization::tail_disturbed`). Pass `true` (upstream's own `?? true` fallback) when the
+    /// child's runner is not in hand.
     ///
     /// # Errors
     ///

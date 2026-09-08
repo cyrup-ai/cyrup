@@ -117,12 +117,17 @@ impl RawClient {
         // ICOM-016 INVERTED this assertion. The broker now implements the bus effects — capability
         // bookkeeping, owner election, publish fan-out and the revision-checked state store — so it
         // advertises `extension-bus-v1`, which is exactly what admits the frames from a conforming
-        // pi client (`supportsFeature` gate, `v0.9.2 broker/client.ts:648,817-819`) and matches
-        // upstream's own `features` on `registered` (`v0.9.2 broker/broker.ts:502-506`).
+        // pi client (`supportsFeature` gate, `v0.9.2 broker/client.ts:648,817-819`).
+        //
+        // `exact-send-v1` joined the advertisement when the endpoint-epoch effects landed (the
+        // broker's own `every_register_mints_a_fresh_endpoint_epoch_and_advertises_exact_send` and
+        // `an_exact_send_against_a_superseded_endpoint_is_refused_and_delivers_nothing` prove
+        // them), matching upstream's own `features` on `registered`
+        // (`broker/broker.ts:498-503`: `[EXTENSION_BUS_FEATURE, EXACT_SEND_FEATURE]`).
         assert_eq!(
             ack["features"],
-            serde_json::json!(["extension-bus-v1"]),
-            "cyrup advertises exactly the one v0.9.2 feature whose effects it implements"
+            serde_json::json!(["extension-bus-v1", "exact-send-v1"]),
+            "cyrup advertises exactly the features whose effects it implements, in upstream's order"
         );
     }
 }

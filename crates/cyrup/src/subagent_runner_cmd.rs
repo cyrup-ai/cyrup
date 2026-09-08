@@ -277,7 +277,11 @@ mod tests {
         let cfg = PathBuf::from("/base/async/a1b2c3d4/runner-config.json");
         let paths = derive_run_paths(&cfg).expect("derives");
         assert_eq!(paths.run_dir, PathBuf::from("/base/async/a1b2c3d4"));
-        assert_eq!(paths.result, PathBuf::from("/base/results/a1b2c3d4.json"));
+        assert_eq!(paths.results_dir, PathBuf::from("/base/results"));
+        assert_eq!(
+            paths.legacy_result_root,
+            PathBuf::from("/base/results/a1b2c3d4.json")
+        );
     }
 
     #[test]
@@ -294,13 +298,13 @@ mod tests {
             PathBuf::from("/home/me/.cyrup/subagents/async/abcd1234/run00099")
         );
         assert_eq!(
-            paths.result,
+            paths.legacy_result_root,
             PathBuf::from("/home/me/.cyrup/subagents/results/abcd1234/run00099.json"),
             "the ResultFile must be the per-cwd-key sibling of the async root, matching the \
              orchestrator's own run_artifact_roots derivation (C7)"
         );
         assert!(
-            !paths.result.starts_with("/home/me/.cyrup/subagents/async"),
+            !paths.results_dir.starts_with("/home/me/.cyrup/subagents/async"),
             "the results dir must never be nested under the async tree"
         );
     }

@@ -312,7 +312,7 @@ pub async fn run_external_cli(
     let (final_output, output_truncated) = crate::exec::finalize_delivered_output(
         final_output,
         full_output_for_reference,
-        saved_output_path.as_ref(),
+        saved_output_path.as_deref(),
         false,
         outcome.exit_code,
         agent.max_output,
@@ -324,16 +324,39 @@ pub async fn run_external_cli(
         task: task.to_string(),
         exit_code: outcome.exit_code,
         usage: Usage::default(),
+        turns: 0,
         // Upstream resolves no model for an external runner at all.
         model: None,
         attempted_models: Vec::new(),
         model_attempts: Vec::new(),
+        // pi's external branch derives `outputState` with the simple two-branch rule
+        // (`subagent-runner.ts:927`: `external.output.trim() ? "present" : "absent"`) — the shared
+        // derivation with its last two arguments `None`, from the RAW foreign output rather than
+        // the finalized delivery.
+        output_state: crate::exec::output_state::derive_output_state(
+            (!outcome.output.is_empty()).then_some(outcome.output.as_str()),
+            None,
+            None,
+        ),
+        session_file: None,
+        structured_output_path: None,
+        artifact_paths: None,
+        // A foreign-CLI child has no cyrup run id of its own.
+        child_run_id: None,
         final_output,
         structured_output: None,
         acceptance: None,
         detached: false,
         interrupted: false,
         timed_out: outcome.timed_out,
+        // Upstream's external-CLI branch never sets `timeoutRecovery` either (`subagent-runner.ts:1563`
+        // builds the external result without it): the mutation snapshot/collect pair is scoped to
+        // the native child path, and the foreign process ran under its own sandbox contract.
+        timeout_recovery: None,
+        // Upstream's external-CLI branch never sets `contextOverflow` (`subagent-runner.ts:1563`
+        // builds the external result without it): the flag is a model-fallback-ladder
+        // classification, and an external profile never enters the ladder.
+        context_overflow: false,
         stopped: outcome.stopped,
         process_signal: outcome.process_signal.clone(),
         turn_budget: None,

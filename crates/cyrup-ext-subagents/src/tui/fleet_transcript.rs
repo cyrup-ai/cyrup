@@ -1238,8 +1238,9 @@ pub fn tool_duration(event: &FleetToolEvent) -> Option<String> {
     ))
 }
 
-/// pi `bounded` (`fleet-transcript.ts:488-490`).
-fn bounded(line: Line<'static>, width: usize) -> Line<'static> {
+/// pi `bounded` (`fleet-transcript.ts:488-490`) — renamed: it CLIPS to a width, which is the
+/// truncating family, not `workflows::Bounded`'s rejecting one (SCOPE_3 §A.4).
+fn clip_line(line: Line<'static>, width: usize) -> Line<'static> {
     th::clip(&line, width)
 }
 
@@ -1247,7 +1248,7 @@ fn bounded(line: Line<'static>, width: usize) -> Line<'static> {
 fn rail_line(content: Vec<Span<'static>>, width: usize) -> Line<'static> {
     let mut spans = vec![th::fg(Role::BorderMuted, "│"), th::raw(" ")];
     spans.extend(content);
-    bounded(Line::from(spans), width)
+    clip_line(Line::from(spans), width)
 }
 
 /// pi `renderWrapped` (`fleet-transcript.ts:496-498`).
@@ -1387,7 +1388,7 @@ pub fn render_fleet_transcript(
     }
     let mut lines: Vec<Line<'static>> = Vec::new();
     if transcript.truncated {
-        lines.push(bounded(
+        lines.push(clip_line(
             Line::from(vec![th::fg(Role::Dim, "↑ Earlier activity omitted")]),
             width,
         ));
@@ -1399,7 +1400,7 @@ pub fn render_fleet_transcript(
         ) {
             let mut spans = vec![th::fg(Role::Warning, "!"), th::raw(" ")];
             spans.extend(line.spans);
-            lines.push(bounded(Line::from(spans), width));
+            lines.push(clip_line(Line::from(spans), width));
         }
     }
 
@@ -1430,7 +1431,7 @@ pub fn render_fleet_transcript(
                 if tool.status == ToolStatus::Running {
                     head.push(th::fg(Role::Warning, " running"));
                 }
-                lines.push(bounded(Line::from(head), width));
+                lines.push(clip_line(Line::from(head), width));
 
                 let body_width = width.saturating_sub(4).max(1);
                 if let Some(output) = tool.output.as_ref()
@@ -1548,7 +1549,7 @@ fn render_message(
     if assistant && let Some(model) = model {
         head.push(th::fg(Role::Dim, format!(" · {model}")));
     }
-    lines.push(bounded(Line::from(head), width));
+    lines.push(clip_line(Line::from(head), width));
     for body in render_wrapped(
         vec![th::raw(text.to_string())],
         width.saturating_sub(2).max(1),
@@ -1647,19 +1648,27 @@ mod tests {
             turn_budget: None,
             turn_budget_exceeded: false,
             wrap_up_requested: false,
+            child_run_id: None,
             agent: "reviewer".to_string(),
             task: "task".to_string(),
             exit_code: 0,
             usage: Default::default(),
+            turns: 0,
             model: Some(cyrup_core::ModelId::from("claude-opus-4-8")),
             attempted_models: Vec::new(),
             model_attempts: Vec::new(),
             final_output: Some("The change is safe.".to_string()),
             structured_output: None,
+            session_file: None,
+            output_state: Default::default(),
+            structured_output_path: None,
+            artifact_paths: None,
             acceptance: None,
             detached: false,
             interrupted: false,
             timed_out: false,
+            timeout_recovery: None,
+            context_overflow: false,
             stopped: false,
             process_signal: None,
             error: None,

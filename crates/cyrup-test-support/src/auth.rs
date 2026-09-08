@@ -3,6 +3,17 @@
 //! (`~/.cyrup/agent/auth.json`). cyrup delegates OAuth refresh + write-back to
 //! [`cyrup_config::AuthStore`]'s serialized modify path (the same one the provider auth flow uses),
 //! so these helpers read the resolved credential without re-implementing refresh.
+//!
+//! # The [`LIVE_E2E_ENV`] double-key — a deliberate deviation from Pi
+//!
+//! Pi's `describe.skipIf(!API_KEY)` arms a LIVE, token-spending e2e the moment
+//! `ANTHROPIC_API_KEY` is exported — which is exactly how a developer machine with keys "set by
+//! design" quietly pays for a test run. Here the live seam requires BOTH the credential AND an
+//! explicit `CYRUP_LIVE_E2E=1`: [`api_key`]/[`has_api_key`] answer `None`/`false` without it, so
+//! every gated test skips, and [`get_real_auth_store`] (the door to the developer's real
+//! `auth.json`) panics with a named message rather than silently reading it. The integration
+//! suite's hermetic runner (`cargo xtask it`) does not carry either variable through its
+//! allowlist, so under it even an armed machine spends nothing.
 
 use std::path::PathBuf;
 
@@ -10,10 +21,24 @@ use cyrup_config::{AuthError, AuthStore, Credential};
 use cyrup_core::ProviderId;
 use cyrup_provider::OAuthAuth;
 
+/// The opt-in gate for live, token-spending e2e: must be set to exactly `1` IN ADDITION to the
+/// credential itself, or every live helper in this module stays inert (module doc).
+pub const LIVE_E2E_ENV: &str = "CYRUP_LIVE_E2E";
+
+/// Whether the operator has explicitly armed live e2e (`CYRUP_LIVE_E2E=1`).
+pub fn live_e2e_armed() -> bool {
+    std::env::var(LIVE_E2E_ENV).is_ok_and(|v| v == "1")
+}
+
 /// The credential for authenticated e2e tests: `ANTHROPIC_OAUTH_TOKEN`, else `ANTHROPIC_API_KEY`
 /// (Pi `API_KEY`, utilities.ts:26). Tests that need a live key gate on this — `None` ⇒ skip (the
-/// Rust analogue of Pi's `describe.skipIf(!API_KEY)`). An empty env var counts as absent.
+/// Rust analogue of Pi's `describe.skipIf(!API_KEY)`). An empty env var counts as absent, and so
+/// does ANY value without the explicit [`LIVE_E2E_ENV`] arm — an exported key alone must never be
+/// enough to spend tokens (module doc).
 pub fn api_key() -> Option<String> {
+    if !live_e2e_armed() {
+        return None;
+    }
     std::env::var("ANTHROPIC_OAUTH_TOKEN")
         .ok()
         .filter(|s| !s.is_empty())
@@ -50,7 +75,17 @@ pub fn real_auth_path() -> PathBuf {
 
 /// An [`AuthStore`] backed by the real `~/.cyrup/agent/auth.json` (Pi `getRealAuthStorage`,
 /// utilities.ts:123-125).
+///
+/// # Panics
+///
+/// Unless [`LIVE_E2E_ENV`]`=1` is set: this is the door to the developer's REAL credentials, and
+/// a test that walks through it un-armed must fail loudly by name, not silently authenticate.
 pub fn get_real_auth_store() -> AuthStore {
+    assert!(
+        live_e2e_armed(),
+        "get_real_auth_store() reads the developer's real auth.json; set {LIVE_E2E_ENV}=1 to arm \
+         live e2e deliberately (an exported API key alone is not enough by design)"
+    );
     AuthStore::at(real_auth_path())
 }
 

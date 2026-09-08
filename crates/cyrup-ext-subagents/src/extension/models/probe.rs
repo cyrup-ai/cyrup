@@ -139,6 +139,17 @@ async fn probe_model_with(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
+    #[cfg(unix)]
+    {
+        // `crate::spawn::resolve_spawn_command` tier 3 execs through `/proc/self/exe` (this
+        // process's inode-pinned image, still valid after a rebuild replaced the file on disk).
+        // Present the real program name as `argv[0]` so a model probe reads as `cyrup` in `ps`
+        // rather than as the magic link; this changes only `argv[0]`, never which inode runs.
+        if let Some(arg0) = spawn_command.arg0() {
+            command.arg0(arg0);
+        }
+    }
+
     let child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {

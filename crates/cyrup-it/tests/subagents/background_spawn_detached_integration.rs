@@ -572,6 +572,7 @@ async fn detached_runner_survives_orchestrator_death_and_writes_terminal_files()
     // fragile against this type's own serde shape) — one SingleStep, matching
     // `background_runner_main_integration.rs`'s own identical `single_step` helper shape.
     let runner_config = RunnerConfig {
+        completion_owner_id: None,
         turn_budget: None,
         permission_rules: None, // SUBA-073: no policy — the pre-field behaviour
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
@@ -592,7 +593,10 @@ async fn detached_runner_survives_orchestrator_death_and_writes_terminal_files()
         ))],
         cwd: dir.path().to_path_buf(),
         session_file: None,
-        session_id: None,
+        // The session-partitioned result index refuses a session-less result outright
+        // (`write_result_file`, pi `result-files.ts:166`), so a runner expected to land a
+        // terminal ResultFile must carry the launching session's identity.
+        session_id: Some("it-session".to_string()),
         global_concurrency_limit: 20,
         worktree_base_dir: None,
         max_subagent_depth: 2,
@@ -606,6 +610,7 @@ async fn detached_runner_survives_orchestrator_death_and_writes_terminal_files()
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
+        inherited_session_thinking: None,
         nested_route: None,
         nested_self: None,
         dynamic_fanout_max_items: None,
@@ -792,6 +797,7 @@ async fn interrupting_a_running_step_pauses_rather_than_fails_the_run() {
     // has real remaining work to cut short (R-SA-084 marks the NOT-yet-dispatched step(s) Paused
     // too — see `mark_remaining_paused`'s own doc).
     let runner_config = RunnerConfig {
+        completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
@@ -812,7 +818,10 @@ async fn interrupting_a_running_step_pauses_rather_than_fails_the_run() {
         ],
         cwd: dir.path().to_path_buf(),
         session_file: None,
-        session_id: None,
+        // The session-partitioned result index refuses a session-less result outright
+        // (`write_result_file`, pi `result-files.ts:166`), so a runner expected to land a
+        // terminal ResultFile must carry the launching session's identity.
+        session_id: Some("it-session".to_string()),
         global_concurrency_limit: 20,
         worktree_base_dir: None,
         max_subagent_depth: 2,
@@ -826,6 +835,7 @@ async fn interrupting_a_running_step_pauses_rather_than_fails_the_run() {
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
+        inherited_session_thinking: None,
         nested_route: None,
         nested_self: None,
         dynamic_fanout_max_items: None,
@@ -885,6 +895,9 @@ async fn interrupting_a_running_step_pauses_rather_than_fails_the_run() {
         run_id.as_str(),
         "test",
         Some("A-SA-14 interrupt-is-soft scenario".to_string()),
+        // No current-session identity: `SessionGate::Permissive` admits a session-less caller, so
+        // the interrupt still lands against the real Running run.
+        None,
     )
     .await
     .expect("interrupt() call itself succeeds");

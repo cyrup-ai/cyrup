@@ -1991,6 +1991,80 @@ impl NativeExtension for SubagentPromptRuntime {
                 _ => {}
             }
         }
+        // pi's child-side auto-drain (`subagent-prompt-runtime.ts:488-491`):
+        //
+        // ```ts
+        // onRuntimeEvent("agent_end", async (_event, ctx) => {
+        //   if ((ctx as { hasUI?: boolean } | undefined)?.hasUI === true) return;
+        //   await drainOutstandingWork({ state: waitState, events: pi.events });
+        // });
+        // ```
+        //
+        // Registered after `registerChildWatchdog` (`:477`), so it runs after the watchdog block
+        // above — pi's runner walks handlers in registration order. Upstream writes the headless
+        // gate as a strict `=== true` early-return here and as `!ctx.hasUI` in the parent; with
+        // cyrup's `has_ui: bool` the two are identical. This is the site that matters for a NESTED
+        // subagent that itself spawned background children: without it a child's grandchildren are
+        // abandoned when the child's single turn ends (`docs/gap-analysis/PARITY-GAPS.md` VL-S8).
+        //
+        // The session identity is upstream's `waitState.currentSessionId` (resolved from the
+        // session manager); cyrup reads it off the late-bound host services. Absent identity is
+        // pi's `auto-drain.ts:39` refusal — nothing scoping-safe to drain — minus the throw, which
+        // `on_event`'s `HookOutcome` cannot carry. No completion bus: a child process installs no
+        // results watcher, so the wait runs in upstream's own documented no-bus polling shape.
+        if matches!(ev, HostEvent::AgentEnd { .. }) && !_ctx.has_ui {
+            let services = self
+                .services
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let session_id = crate::identity::SessionId::parse_opt(
+                services
+                    .as_ref()
+                    .and_then(|services| services.session_id())
+                    .as_deref(),
+            );
+            if let Some(session_id) = session_id {
+                let roots = crate::paths::Roots::from_env();
+                let artifact_roots =
+                    crate::background::run_artifact_roots_in(&roots, &_ctx.cwd);
+                let probe = crate::background::auto_drain::FsDrainProbe {
+                    async_root: artifact_roots.async_root,
+                    results_dir: artifact_roots.results_dir,
+                };
+                let waiter = crate::background::auto_drain::SubagentDrainWaiter {
+                    // `enabled: true` — the drain ignores the `wait` TOOL's config gate, exactly
+                    // as in the parent site (pi checks `deps.enabled === false` and the drain
+                    // never sets it, `subagent-wait.ts:547`).
+                    deps: crate::background::wait::WaitDeps::for_cwd(
+                        &_ctx.cwd,
+                        true,
+                        Some(session_id.as_str().to_string()),
+                        &roots,
+                    )
+                    // The drain's literal flags (`auto-drain.ts:61-63`).
+                    .with_stop_on_attention(false)
+                    .with_fail_on_failed_runs(true)
+                    .with_fail_on_attention(true),
+                };
+                if let Err(message) = crate::background::auto_drain::drain_outstanding_work(
+                    &session_id,
+                    crate::background::auto_drain::DEFAULT_AUTO_DRAIN_TIMEOUT_MS,
+                    &crate::time::now_epoch_millis,
+                    &probe,
+                    &waiter,
+                )
+                .await
+                {
+                    // [CYRUP-DELTA in mechanism, not in behaviour] as at the parent site: upstream
+                    // throws, pi's runner catches it (`runner.ts:869-878`) and the headless
+                    // `onError` listener prints one stderr line (`print-mode.ts:101-103`) — so the
+                    // equivalent diagnostic is emitted here directly, and the drain has still been
+                    // awaited.
+                    tracing::warn!(%message, "child auto-drain at agent_end did not complete");
+                }
+            }
+        }
         // pi `registerPermissionGate`'s `tool_call` handler (`subagent-prompt-runtime.ts:288-304`).
         // It runs BEFORE the tool-budget handler below because upstream registers the two in that
         // order (`:475-476`) and pi's runner walks handlers in registration order

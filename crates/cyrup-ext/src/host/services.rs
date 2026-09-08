@@ -20,6 +20,33 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 pub use crate::caps::http::{HttpRequest, HttpResponse, HttpStreamResponse};
 pub use crate::caps::proc::ProcSpawnSpec;
 
+/// What became of a message handed to [`HostServices::inject_message_ack`].
+///
+/// # Two variants, and why there is no third
+///
+/// A caller asking to inject is stating a fact ("here is a message"), not asking a question that
+/// may be refused. The only thing that can genuinely go wrong is that there is nobody to state it
+/// to. "The session is busy right now" is NOT a failure and never appears here: scheduling the
+/// message onto a turn is the backend's own business, and a backend that returns
+/// [`Self::Accepted`] only after the message is in the transcript needs no `Busy`/`Retry` variant
+/// for a caller to interpret — the caller would have nothing useful to do with one that the
+/// backend cannot do better itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InjectOutcome {
+    /// The message is in the session: it is the input of a run the agent has accepted (so the
+    /// transcript records it and the model sees it), or it was persisted durably on the no-turn
+    /// path. This is the ONLY licence for the caller to destroy its own copy of the data.
+    Accepted,
+    /// The session could not take it — it was dropped, the host is headless, or it cannot run
+    /// turns at all. Nothing was delivered and nothing was consumed: the caller keeps its copy.
+    ///
+    /// Named for what the CALLER must do, not for one particular cause, because every cause has
+    /// the same consequence. In particular "a run is in flight right now" is NOT one of them: a
+    /// backend schedules around a busy session itself rather than reporting it, since a caller
+    /// could do nothing better with that fact than wait — which is the backend's own job.
+    SessionUnavailable,
+}
+
 /// Bounds how many DISTINCT ids [`GuestState::aborted_signals`] can ever hold. `ui.abort-signal`
 /// (the WIT `abort-signal: func(signal-id: string)`) carries no error channel and is reachable by
 /// a guest at ANY trust tier (`live.rs`'s `ui::Host` impl applies no tier guard), unlike the
@@ -477,6 +504,37 @@ pub trait HostServices: Send + Sync {
         _details: Option<&Value>,
         _trigger_turn: bool,
     ) -> Result<(), String> {
+        Err("message injection not available".into())
+    }
+
+    /// [`Self::inject_message`] with an ACKNOWLEDGEMENT: the returned receiver resolves once the
+    /// message's fate is settled ([`InjectOutcome`]).
+    ///
+    /// # Why this exists next to the fire-and-forget one
+    ///
+    /// `inject_message` returns as soon as the host has *taken* the message; it deliberately says
+    /// nothing about whether the message reached the session, because a WASM guest is suspended
+    /// across the call and cannot await anything. A NATIVE caller that holds the only copy of the
+    /// data being announced — cyrup-ext-subagents' completion sink holds a background run's sole
+    /// terminal result file, which it deletes once delivery is reported — cannot use that
+    /// contract: "the host took it" is not "the session has it", and acting on the difference is
+    /// silent data loss.
+    ///
+    /// The default is the same deny as `inject_message`, so no guest and no existing backend is
+    /// affected by the addition.
+    ///
+    /// # Errors
+    ///
+    /// The seam is unavailable (no live session wired). A backend that returns `Ok` has ACCEPTED
+    /// responsibility for the message and must eventually resolve the receiver.
+    fn inject_message_ack(
+        &self,
+        _content: &str,
+        _custom_type: Option<&str>,
+        _display: bool,
+        _details: Option<&Value>,
+        _trigger_turn: bool,
+    ) -> Result<tokio::sync::oneshot::Receiver<InjectOutcome>, String> {
         Err("message injection not available".into())
     }
 

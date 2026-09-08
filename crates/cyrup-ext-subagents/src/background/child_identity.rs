@@ -12,12 +12,11 @@
 //!
 //! # What the port can and cannot represent
 //!
-//! cyrup's [`StepStatus`] carries neither a `workflowKey` nor a per-step `runId` (both are workflow
-//! runtime products, `VL-S2`), so on a real status the first two rungs are always empty and every
-//! child's identity is its positional `step:<index>`. The rung ORDER is still ported — as
-//! [`identity_from_parts`], a pure function over the three optional inputs — so the day either
-//! field lands the resolution keeps upstream's precedence without being re-derived, and so the
-//! order is pinned by a test today rather than by a comment.
+//! [`StepStatus::workflow_key`] and [`StepStatus::run_id`] (SCOPE_3d) are what populate the first
+//! two rungs on a real status: a workflow child resolves by its lane key, then by its own child
+//! run id, and only positionally as the fallback. What remains genuinely unrepresentable is the
+//! `DynamicGroup` splice residual described below — a dynamic group is still one entry whose
+//! members share an identity.
 //!
 //! `index` here is the index into [`RunStatus::steps`] — the SAME index space cyrup's other
 //! per-child surfaces use (`steer`'s `target_index`, the transcript view's `index`, the runner's
@@ -127,17 +126,25 @@ pub fn candidates_from_parts(
     out
 }
 
-/// pi `asyncStatusChildIdentity(step, index)` over a real [`StepStatus`]. cyrup's step record has
-/// no `workflowKey`/`runId` (module docs), so this is always the positional rung today.
+/// pi `asyncStatusChildIdentity(step, index)` over a real [`StepStatus`]: `workflowKey ?? runId
+/// ?? step:<index>`, off the step's own fields (SCOPE_3d).
 #[must_use]
-pub fn async_status_child_identity(_step: &StepStatus, index: usize) -> String {
-    identity_from_parts(None, None, index)
+pub fn async_status_child_identity(step: &StepStatus, index: usize) -> String {
+    identity_from_parts(
+        step.workflow_key.as_ref().map(|key| key.as_str()),
+        step.run_id.as_ref().map(|run_id| run_id.as_str()),
+        index,
+    )
 }
 
 /// pi `asyncStatusChildIdentityCandidates(step, index)` over a real [`StepStatus`].
 #[must_use]
-pub fn async_status_child_identity_candidates(_step: &StepStatus, index: usize) -> Vec<String> {
-    candidates_from_parts(None, None, index)
+pub fn async_status_child_identity_candidates(step: &StepStatus, index: usize) -> Vec<String> {
+    candidates_from_parts(
+        step.workflow_key.as_ref().map(|key| key.as_str()),
+        step.run_id.as_ref().map(|run_id| run_id.as_str()),
+        index,
+    )
 }
 
 /// pi `resolveAsyncStatusChild(status, childId)` (`child-identity.ts:24-47`, tool-path form with
@@ -329,6 +336,45 @@ mod tests {
                 assert_eq!((child.index, child.id.as_str()), (2, "step:2"));
             }
             other => panic!("expected a resolution, got {other:?}"),
+        }
+    }
+
+    /// SCOPE_3d — the first two rungs resolve on a real workflow status: a step carrying a
+    /// `workflow_key` answers to it (and its canonical id IS the key), one carrying only a
+    /// `run_id` answers to that, and both still answer positionally.
+    #[test]
+    fn workflow_steps_resolve_by_key_then_run_id() {
+        let mut status = status_with(&[StepState::Running, StepState::Running]);
+        if let Some(step) = status.steps.get_mut(0) {
+            step.workflow_key = crate::workflows::WorkflowKey::parse("lane.a").ok();
+            step.run_id = Some(RunId::from_token("childrun00001"));
+        }
+        if let Some(step) = status.steps.get_mut(1) {
+            step.run_id = Some(RunId::from_token("childrun00002"));
+        }
+        match resolve_async_status_child(&status, "lane.a") {
+            AsyncStatusChildResolution::Resolved(child) => {
+                assert_eq!((child.index, child.id.as_str()), (0, "lane.a"));
+            }
+            other => panic!("expected the keyed rung to resolve, got {other:?}"),
+        }
+        match resolve_async_status_child(&status, "childrun00002") {
+            AsyncStatusChildResolution::Resolved(child) => {
+                assert_eq!(
+                    (child.index, child.id.as_str()),
+                    (1, "childrun00002"),
+                    "a keyless step's canonical id is its run id rung"
+                );
+            }
+            other => panic!("expected the run-id rung to resolve, got {other:?}"),
+        }
+        // The keyed step still answers to its run id and its position, with the KEY as the
+        // canonical spelling (`child-identity.ts:32`).
+        match resolve_async_status_child(&status, "step:0") {
+            AsyncStatusChildResolution::Resolved(child) => {
+                assert_eq!(child.id, "lane.a");
+            }
+            other => panic!("expected the positional alias to resolve, got {other:?}"),
         }
     }
 

@@ -6,10 +6,12 @@
 
 use cyrup_agent::AgentMessage;
 use cyrup_core::EntryId;
+use cyrup_ext::host::HostServices;
 
 use crate::error::SessionServiceError;
 use crate::event::{AgentSessionEvent, PromptAccepted, StreamingBehavior, UserInput};
 
+use super::run::InjectionOffer;
 use super::{AgentSession, now_ms};
 
 impl AgentSession {
@@ -107,19 +109,88 @@ impl AgentSession {
         Ok(())
     }
 
+    /// Deliver one coalesced injection plan as ONE turn.
+    ///
+    /// Called only by the session's injection pump, which owns the batch and re-offers it on the
+    /// next idle edge when this reports [`InjectionOffer::AgentBusy`]. That ownership is why this
+    /// function has no queueing arm and no retry of its own: the two things the previous
+    /// implementation did here — `agent.steer` onto an active run, and a `spawn_run` whose
+    /// refusal was swallowed by the driver — are exactly the two ways an injected message used to
+    /// disappear.
+    ///
+    /// # Errors
+    ///
+    /// A durable append failure, or an agent fault that waiting cannot fix. A busy agent is NOT an
+    /// error: it is [`InjectionOffer::AgentBusy`].
+    pub(super) async fn deliver_injection_inbox(
+        &self,
+        plan: InjectionPlan,
+    ) -> Result<InjectionOffer, SessionServiceError> {
+        // The no-turn members first: they are independent of the run latch, and persisting them
+        // before a possible `AgentBusy` below means a re-offered batch never re-persists them.
+        for msg in plan.durable {
+            self.append_injected_message_durably(msg).await?;
+        }
+        if plan.turn.is_empty() {
+            return Ok(InjectionOffer::Taken);
+        }
+        // Pi `_runAgentPrompt(appMessage)`: the turn's input IS the injected message(s). On
+        // `Taken` the agent has claimed its latch with these messages already pushed onto the
+        // run's transcript, so `message_end` — and therefore the durable persist — necessarily
+        // follows; that is what makes acceptance a sufficient acknowledgement.
+        self.run_injection(plan.turn).await
+    }
+
+    /// Persist an injected message that asked for no turn, and surface it (Pi's else-branch,
+    /// agent-session.ts:1337-1370).
+    async fn append_injected_message_durably(
+        &self,
+        msg: AgentMessage,
+    ) -> Result<(), SessionServiceError> {
+        let AgentMessage::Custom {
+            kind,
+            payload,
+            details,
+            display,
+            ..
+        } = &msg
+        else {
+            return Ok(());
+        };
+        self.manager.lock().await.append_custom_message(
+            kind,
+            payload.clone(),
+            *display,
+            details.clone(),
+        )?;
+        self.fanout_emit(AgentSessionEvent::MessageStart {
+            message: msg.clone(),
+        })
+        .await;
+        self.fanout_emit(AgentSessionEvent::MessageEnd { message: msg })
+            .await;
+        Ok(())
+    }
+
     /// Inject a host-originated message into the live session and optionally trigger an agent turn
     /// (Pi `sendCustomMessage(message, { triggerTurn })`, agent-session.ts:1337-1370). Backs the
-    /// late-bound [`crate::host_services::LiveHostServices`] inject sink a background task drives
+    /// [`crate::host_services::LiveHostServices`] injection seam a background task drives
     /// (R-SA-101 / P-2) — the seam that surfaces a completed background result INTO the parent
-    /// session's turn loop instead of stderr. Reproduces Pi's three cases:
+    /// session's turn loop instead of stderr.
     ///
-    /// * **`custom_type = None`** — a plain user message: Pi `sendUserMessage`, which ALWAYS triggers a
-    ///   turn (steer/follow-up while streaming). `display`/`trigger_turn` don't apply to a user message.
-    /// * **`Some(kind)` while streaming** — queue the custom message onto the active run (Pi `steer`).
-    /// * **`Some(kind)`, idle, `trigger_turn`** — run a fresh turn OVER the custom message (Pi
-    ///   `_runAgentPrompt(appMessage)`, `spawn_run(vec![msg])`) — the `triggerTurn` branch cyrup's
-    ///   `send_custom_message` lacked.
-    /// * **`Some(kind)`, idle, no `trigger_turn`** — persist + surface durably (Pi's else-branch).
+    /// # This is a producer, not a router
+    ///
+    /// It builds the message and hands it to the session's injection pump. It deliberately does
+    /// NOT decide between steering an active run and starting a new one: that decision used to be
+    /// made here, from a `is_run_active()` read that was not atomic with the act that followed,
+    /// and both of its arms lost messages — a steer landing after the run loop's last drain point
+    /// strands forever, and concurrent `spawn_run`s all but one lost `Agent::prompt`'s latch CAS
+    /// and were warn-logged away. Scheduling belongs to the single consumer that owns the inbox.
+    ///
+    /// # Errors
+    ///
+    /// The plain-user-message arm propagates its prompt preflight. The custom arm fails only if
+    /// the pump is unreachable, in which case nothing was queued.
     pub async fn inject_message(
         &self,
         content: String,
@@ -136,43 +207,132 @@ impl AgentSession {
             let _ = Box::pin(self.send_user_message(content, None)).await?;
             return Ok(());
         };
-        let msg = AgentMessage::Custom {
-            kind: kind.clone(),
-            payload: serde_json::Value::String(content.clone()),
-            details: details.clone(),
-            // SUBA-094 — the field this branch used to drop. pi's `_runAgentPrompt(appMessage)`
-            // (`agent-session.ts:1505` @v0.84.4) runs the turn over the SAME object that carries
-            // `display`, and the interactive host gates drawing on `message.display`
-            // (`interactive-mode.ts:3609`), so a background completion whose predicate said
-            // `display: false` (`pi-subagents notify.ts:402` @v0.64.0) reaches the model and not
-            // the screen. Without the field the trigger-turn arm rendered every one of them.
-            display,
-            timestamp: Some(now_ms()),
-        };
-        // AGENT-030 — pi routes on `this.isStreaming`, the session latch `_isAgentRunActive`
-        // (agent-session.ts:900-901, consulted at :1477/:1485): in the post-`agent_end` gap the
-        // message steers the active loop instead of starting a second run.
-        if self.is_run_active() {
-            // Pi: while streaming, queue onto the active run (steer).
-            self.agent.steer(msg);
-        } else if trigger_turn {
-            // Pi `_runAgentPrompt(appMessage)`: run a turn whose input IS the injected message.
-            self.spawn_run(vec![msg]).await?;
-        } else {
-            // Pi else-branch: append durably + surface via message_start/message_end.
-            self.manager.lock().await.append_custom_message(
-                &kind,
-                serde_json::Value::String(content),
-                display,
-                details,
-            )?;
-            self.fanout_emit(AgentSessionEvent::MessageStart {
-                message: msg.clone(),
-            })
-            .await;
-            self.fanout_emit(AgentSessionEvent::MessageEnd { message: msg })
-                .await;
-        }
-        Ok(())
+        self.services
+            .host_services
+            .inject_message(&content, Some(&kind), display, details.as_ref(), trigger_turn)
+            .map_err(SessionServiceError::InjectUnavailable)
     }
+}
+
+/// One merge group: the messages that will become a single [`AgentMessage`].
+///
+/// A named struct rather than the four-element tuple this started as — `(Option<String>, bool,
+/// Vec<String>, Option<Value>)` has two fields that are trivially transposable and two more whose
+/// meaning is positional only.
+struct MergeGroup {
+    custom_type: Option<String>,
+    display: bool,
+    trigger_turn: bool,
+    bodies: Vec<String>,
+    details: Option<serde_json::Value>,
+}
+
+impl MergeGroup {
+    fn new(message: &crate::host_services::InjectMessage) -> Self {
+        Self {
+            custom_type: message.custom_type.clone(),
+            display: message.display,
+            trigger_turn: message.trigger_turn,
+            bodies: vec![message.content.clone()],
+            details: message.details.clone(),
+        }
+    }
+
+    /// Fold another message of the same kind in: bodies accumulate, the two flags OR (pi's
+    /// `items.some(..)`), and the first non-empty `details` wins — concatenating two opaque
+    /// renderer payloads would produce a value no renderer declared.
+    fn absorb(&mut self, message: &crate::host_services::InjectMessage) {
+        self.display = self.display || message.display;
+        self.trigger_turn = self.trigger_turn || message.trigger_turn;
+        self.bodies.push(message.content.clone());
+        if self.details.is_none() {
+            self.details = message.details.clone();
+        }
+    }
+}
+
+/// One coalesced batch, split by what it needs from the session.
+///
+/// A named struct rather than the `(Vec<AgentMessage>, Vec<AgentMessage>)` an earlier draft used:
+/// both halves have the SAME type, so a transposed destructuring compiles cleanly and would run
+/// the durable-only messages as turn input while persisting the turn input twice.
+#[derive(Debug, Default)]
+pub(super) struct InjectionPlan {
+    /// Messages whose delivery is a turn (`trigger_turn`), merged per group.
+    pub(super) turn: Vec<AgentMessage>,
+    /// Messages that asked for no turn: persisted and surfaced, never run.
+    pub(super) durable: Vec<AgentMessage>,
+}
+
+/// Split one coalesced inbox into an [`InjectionPlan`].
+///
+/// # The functional core of the injection pump
+///
+/// Pure: no I/O, no session, no latch, no channel. Everything the pump does that is worth
+/// reasoning about in isolation — how a fan-out's three completions become one turn, in what
+/// order, and which of them still need their own durable append — happens here, against explicit
+/// inputs.
+///
+/// Members are merged by `(custom_type, display, trigger_turn)` — in practice every member of a
+/// background-completion batch is a `subagent-notify` — with the bodies joined by a blank line and
+/// `display`/`trigger_turn` OR'd, which is pi's own batching (`sendCompletion` builds one message
+/// from an array of completion details and ORs their `triggerTurn`, `notify.ts:399-412` @v0.64.0).
+///
+/// A `custom_type: None` member is never merged: a plain user message is a different kind of turn
+/// input and must keep its own identity.
+pub(super) fn merge_injection_batch(
+    inbox: &[crate::host_services::InjectRequest],
+) -> InjectionPlan {
+    // Insertion-ordered grouping: the orchestrator reads the blocks in completion order, so a
+    // hash-ordered merge would scramble a fan-out's results.
+    let mut groups: Vec<MergeGroup> = Vec::new();
+    for req in inbox {
+        let message = &req.message;
+        let existing = message
+            .custom_type
+            .is_some()
+            .then(|| {
+                groups
+                    .iter()
+                    .position(|group| group.custom_type == message.custom_type)
+            })
+            .flatten();
+        match existing.and_then(|index| groups.get_mut(index)) {
+            Some(group) => group.absorb(message),
+            None => groups.push(MergeGroup::new(message)),
+        }
+    }
+
+    let mut plan = InjectionPlan::default();
+    for group in groups {
+        let MergeGroup {
+            custom_type,
+            display,
+            trigger_turn,
+            bodies,
+            details,
+        } = group;
+        let content = bodies.join("\n\n");
+        let msg = match custom_type {
+            Some(kind) => AgentMessage::Custom {
+                kind,
+                payload: serde_json::Value::String(content),
+                details,
+                // SUBA-094 — pi's `_runAgentPrompt(appMessage)` (`agent-session.ts:1505` @v0.84.4)
+                // runs the turn over the SAME object that carries `display`, and the interactive
+                // host gates drawing on `message.display` (`interactive-mode.ts:3609`), so a
+                // background completion whose predicate said `display: false` (`pi-subagents
+                // notify.ts:402` @v0.64.0) reaches the model and not the screen.
+                display,
+                timestamp: Some(now_ms()),
+            },
+            None => AgentMessage::user_text(content),
+        };
+        if trigger_turn {
+            plan.turn.push(msg);
+        } else {
+            plan.durable.push(msg);
+        }
+    }
+    plan
 }

@@ -449,83 +449,203 @@ pub fn resolve_model_inheritance(
 /// `temporar(?:ily)? unavailable` match exactly what pi's regexes do (and no more — e.g.
 /// `temporar(?:ily)? unavailable` matches `"temporarily unavailable"` but NOT `"temporary
 /// unavailable"`, matching pi).
+/// Wrap a string literal as a [`LowerLiteral`], checked at compile time.
+///
+/// The `const { … }` block is load-bearing: it forces const evaluation at the use site, so a
+/// non-lowercase literal fails the build rather than the first call.
+macro_rules! lower {
+    ($s:literal) => {
+        const { LowerLiteral::from_lowercase($s) }
+    };
+}
+/// Re-export into the module's item namespace so intra-doc links to [`lower!`] resolve:
+/// `macro_rules!` macros are only textually scoped, which rustdoc's path-based link
+/// resolution cannot see.
+#[expect(
+    unused_imports,
+    reason = "invocations resolve textually; the path import exists only so rustdoc's intra-doc links to `lower!` resolve"
+)]
+pub(crate) use lower;
+
+/// A pattern literal proven lowercase at compile time.
+///
+/// Private field; the only constructors are [`lower!`] and this `const fn`. A non-lowercase literal
+/// is a COMPILE error (`E0080`, naming the offending literal), not a silent non-match — which is
+/// what [`RETRYABLE_MODEL_FAILURE_PATTERNS`]' and [`CONTEXT_OVERFLOW_PATTERNS`]' doc comments
+/// previously asked a reader to guarantee by hand across ~50 rows, with no test asserting it.
+///
+/// The failure that motivates this is a SILENT FALSE NEGATIVE in a terminal classifier: a literal
+/// written `"Request too large"` compiles, passes clippy, passes the disjointness test, and never
+/// matches — so a real context overflow is classified retryable and the ladder burns every
+/// fallback model on an input that fits in none of them.
+///
+/// The byte walk is a SLICE PATTERN, not `bytes[i]`: the workspace denies
+/// `clippy::indexing_slicing`, and the indexing form passes `cargo build` while failing
+/// `cargo clippy` — the exact "suite green, policy violated" split this workspace has hit before.
+/// `clippy::panic` does not fire on `assert!` (only on `panic!`), so the assertion needs no opt-out.
+///
+/// ASCII-only is sufficient and deliberate: every literal in both tables is ASCII, and a non-ASCII
+/// needle could not reliably match a [`str::to_lowercase`]d haystack anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LowerLiteral(&'static str);
+
+impl LowerLiteral {
+    /// The only constructor. `const`, so [`lower!`] can force the check into a `const` block.
+    pub(crate) const fn from_lowercase(s: &'static str) -> Self {
+        let mut rest = s.as_bytes();
+        while let [first, tail @ ..] = rest {
+            assert!(
+                !first.is_ascii_uppercase(),
+                "pattern literal must be lowercase"
+            );
+            rest = tail;
+        }
+        Self(s)
+    }
+
+    /// Unwrap for the `str` method that consumes it. Correct here and only here: every caller in
+    /// [`line_matches`] feeds the result straight into `find`/`contains`/`starts_with` rather than
+    /// passing it on, so the invariant is not being discarded mid-flight.
+    pub(crate) const fn as_str(self) -> &'static str {
+        self.0
+    }
+}
+
+#[derive(PartialEq)]
 enum RetryPattern {
     /// Case-insensitive literal substring (pi `/quota/i`, `/forbidden/i`, `/auth(?:entication)?/i`
     /// — the last collapses to `"auth"` since any string containing `auth` matches regardless of
     /// the optional suffix).
-    Contains(&'static str),
+    Contains(LowerLiteral),
     /// A bare numeric HTTP-status token bounded by `\b` on both sides (pi `/\b429\b/`) — matches
     /// only when the digits are NOT adjacent to another word character `[A-Za-z0-9_]`.
-    WordNumber(&'static str),
+    ///
+    /// Digits have no case, so the [`LowerLiteral`] wrapper buys nothing here directly — it is
+    /// uniform with the other seven variants so that no row of either table is a raw `&str` a
+    /// future edit could quietly widen.
+    WordNumber(LowerLiteral),
     /// Case-insensitive `first.*second` on one line: `first` occurs, then `second` occurs at or
     /// after the end of that `first` match, within the same line (pi `/provider.*unavailable/i`).
-    Then(&'static str, &'static str),
+    Then(LowerLiteral, LowerLiteral),
     /// Case-insensitive `first.*(?:a|b|c)` on one line (pi `/model.*(?:load|fail|error)/i`).
-    ThenAny(&'static str, &'static [&'static str]),
+    ThenAny(LowerLiteral, &'static [LowerLiteral]),
     /// Case-insensitive `first.?second`: `first`, then an optional single character, then `second`
     /// (pi `/cold.?start/i` → `coldstart`/`cold start`/`cold-start`).
-    OptionalCharBetween(&'static str, &'static str),
+    OptionalCharBetween(LowerLiteral, LowerLiteral),
     /// Case-insensitive `first\s*second`: `first`, then zero or more whitespace, then `second`
     /// (pi `/rate\s*limit/i`).
-    OptionalWsBetween(&'static str, &'static str),
+    OptionalWsBetween(LowerLiteral, LowerLiteral),
     /// Case-insensitive `first\s+(?:a|b|c)`: `first`, then AT LEAST one whitespace character,
     /// then any of the alternatives (pi `/connection\s+(?:error|reset|closed|aborted)/i`, added
     /// by `d8d1408d` inside v0.47.1..v0.57.0 — SUBA-089). Distinct from
     /// [`Self::OptionalWsBetween`]: `connectionreset` is NOT a match.
-    WsThenAny(&'static str, &'static [&'static str]),
+    WsThenAny(LowerLiteral, &'static [LowerLiteral]),
     /// Case-insensitive `first(?:middle)?second`: `first`, then an optional literal `middle`, then
     /// `second` (pi `/temporar(?:ily)? unavailable/i` → first=`temporar`, middle=`ily`,
     /// second=` unavailable`; pi `/timed? out/i` → first=`time`, middle=`d`, second=` out`).
-    OptionalWordBetween(&'static str, &'static str, &'static str),
+    OptionalWordBetween(LowerLiteral, LowerLiteral, LowerLiteral),
 }
 
 /// The fixed retryable-failure pattern set (R-SA-039), in pi's exact `RETRYABLE_MODEL_FAILURE_PATTERNS`
 /// declaration order (`model-fallback.ts:278-314`).
 const RETRYABLE_MODEL_FAILURE_PATTERNS: &[RetryPattern] = &[
-    RetryPattern::OptionalWsBetween("rate", "limit"), // /rate\s*limit/i
-    RetryPattern::Contains("too many requests"),
-    RetryPattern::WordNumber("429"), // /\b429\b/
-    RetryPattern::Contains("quota"),
-    RetryPattern::Contains("billing"),
-    RetryPattern::Contains("credit"),
-    RetryPattern::Contains("auth"),         // /auth(?:entication)?/i
-    RetryPattern::Contains("unauthorized"), // /unauthori[sz]ed/i, US spelling
-    RetryPattern::Contains("unauthorised"), // /unauthori[sz]ed/i, UK spelling
-    RetryPattern::Contains("forbidden"),
-    RetryPattern::Contains("api key"),
-    RetryPattern::Contains("token expired"),
-    RetryPattern::Contains("invalid key"),
-    RetryPattern::Then("provider", "unavailable"), // /provider.*unavailable/i
-    RetryPattern::Then("model", "unavailable"),    // /model.*unavailable/i
-    RetryPattern::Then("model", "disabled"),       // /model.*disabled/i
-    RetryPattern::Then("model", "not found"),      // /model.*not found/i
-    RetryPattern::Contains("unknown model"),
-    RetryPattern::Contains("overloaded"),
-    RetryPattern::Contains("service unavailable"),
-    RetryPattern::OptionalWordBetween("temporar", "ily", " unavailable"), // /temporar(?:ily)? unavailable/i
+    RetryPattern::OptionalWsBetween(lower!("rate"), lower!("limit")), // /rate\s*limit/i
+    RetryPattern::Contains(lower!("too many requests")),
+    RetryPattern::WordNumber(lower!("429")), // /\b429\b/
+    RetryPattern::Contains(lower!("quota")),
+    RetryPattern::Contains(lower!("billing")),
+    RetryPattern::Contains(lower!("credit")),
+    RetryPattern::Contains(lower!("auth")),         // /auth(?:entication)?/i
+    RetryPattern::Contains(lower!("unauthorized")), // /unauthori[sz]ed/i, US spelling
+    RetryPattern::Contains(lower!("unauthorised")), // /unauthori[sz]ed/i, UK spelling
+    RetryPattern::Contains(lower!("forbidden")),
+    RetryPattern::Contains(lower!("api key")),
+    RetryPattern::Contains(lower!("token expired")),
+    RetryPattern::Contains(lower!("invalid key")),
+    RetryPattern::Then(lower!("provider"), lower!("unavailable")), // /provider.*unavailable/i
+    RetryPattern::Then(lower!("model"), lower!("unavailable")),    // /model.*unavailable/i
+    RetryPattern::Then(lower!("model"), lower!("disabled")),       // /model.*disabled/i
+    RetryPattern::Then(lower!("model"), lower!("not found")),      // /model.*not found/i
+    RetryPattern::Contains(lower!("unknown model")),
+    RetryPattern::Contains(lower!("overloaded")),
+    RetryPattern::Contains(lower!("service unavailable")),
+    RetryPattern::OptionalWordBetween(lower!("temporar"), lower!("ily"), lower!(" unavailable")), // /temporar(?:ily)? unavailable/i
     // SUBA-089 (`d8d1408d`, v0.57.0 `model-fallback.ts:428`; v0.64.0 `:496`): a dropped provider
     // connection is a provider failure. The same commit narrowed the ladder gate to
     // `isRetryableModelFailureAttempt` so this broader text never re-runs a child that already
     // did work — the two halves ship together.
-    RetryPattern::WsThenAny("connection", &["error", "reset", "closed", "aborted"]), // /connection\s+(?:error|reset|closed|aborted)/i
-    RetryPattern::Contains("connection refused"),
-    RetryPattern::Contains("fetch failed"),
-    RetryPattern::Contains("network error"),
-    RetryPattern::Contains("socket hang up"),
+    RetryPattern::WsThenAny(lower!("connection"), &[lower!("error"), lower!("reset"), lower!("closed"), lower!("aborted")]), // /connection\s+(?:error|reset|closed|aborted)/i
+    RetryPattern::Contains(lower!("connection refused")),
+    RetryPattern::Contains(lower!("fetch failed")),
+    RetryPattern::Contains(lower!("network error")),
+    RetryPattern::Contains(lower!("socket hang up")),
     // Added upstream at v0.43.0 (`model-fallback.ts:303`): a stream that ended without a
     // `finish_reason` is a truncated provider response, not a task failure.
-    RetryPattern::Contains("stream ended without finish_reason"),
-    RetryPattern::Contains("upstream"),
-    RetryPattern::OptionalWordBetween("time", "d", " out"), // /timed? out/i
-    RetryPattern::Contains("timeout"),
-    RetryPattern::WordNumber("502"),                    // /\b502\b/
-    RetryPattern::WordNumber("503"),                    // /\b503\b/
-    RetryPattern::WordNumber("504"),                    // /\b504\b/
-    RetryPattern::OptionalCharBetween("cold", "start"), // /cold.?start/i
-    RetryPattern::Contains("empty response"),
-    RetryPattern::Contains("no output"),
-    RetryPattern::ThenAny("model", &["load", "fail", "error"]), // /model.*(?:load|fail|error)/i
+    RetryPattern::Contains(lower!("stream ended without finish_reason")),
+    RetryPattern::Contains(lower!("upstream")),
+    RetryPattern::OptionalWordBetween(lower!("time"), lower!("d"), lower!(" out")), // /timed? out/i
+    RetryPattern::Contains(lower!("timeout")),
+    RetryPattern::WordNumber(lower!("502")),                    // /\b502\b/
+    RetryPattern::WordNumber(lower!("503")),                    // /\b503\b/
+    RetryPattern::WordNumber(lower!("504")),                    // /\b504\b/
+    RetryPattern::OptionalCharBetween(lower!("cold"), lower!("start")), // /cold.?start/i
+    RetryPattern::Contains(lower!("empty response")),
+    RetryPattern::Contains(lower!("no output")),
+    RetryPattern::ThenAny(lower!("model"), &[lower!("load"), lower!("fail"), lower!("error")]), // /model.*(?:load|fail|error)/i
 ];
+
+/// pi `CONTEXT_OVERFLOW_PATTERNS` (`model-fallback.ts:631-643`), in declaration order, re-typed
+/// over [`RetryPattern`] for the same reason its retryable sibling is: this crate takes no `regex`
+/// dependency, and pi's `.*`/`\s+` constructs do not reduce to substrings without introducing
+/// false positives (see [`RetryPattern`]'s own doc for the concrete regressions that produced).
+///
+/// **Deliberately disjoint from [`RETRYABLE_MODEL_FAILURE_PATTERNS`]** — upstream's explicit design
+/// note (`model-fallback.ts:624-630`): an overflow means the input was too large for the model's
+/// window, so retrying the same input on another model cannot succeed. A pattern in both sets would
+/// make the ladder burn every candidate on a guaranteed failure.
+///
+/// **Precision matters more here than in the retryable set, because this classifier is TERMINAL.**
+/// A false positive in [`RETRYABLE_MODEL_FAILURE_PATTERNS`] costs one extra attempt; a false
+/// positive here STOPS a ladder that would have recovered. That is why pattern 1 is four
+/// [`WsThenAny`] entries rather than one `ThenAny`: `ThenAny("context", …)` is
+/// `context.*(?:exceed|…)` over a whole line, which fires on `"the context of this request is
+/// unusual; the queue is too long"`.
+///
+/// Every literal is lowercase because [`line_matches`] receives an already-lowercased line.
+///
+/// [`WsThenAny`]: RetryPattern::WsThenAny
+const CONTEXT_OVERFLOW_PATTERNS: &[RetryPattern] = &[
+    // /context(?: length| window| limit)? (?:exceed|overflow|too long)/i
+    //
+    // The optional group's three branches each carry their own leading space, and a LITERAL space
+    // follows the group — so the regex is really four alternatives, one per branch plus the empty
+    // branch. `WsThenAny` is `first\s+(?:…)` (its [`line_matches`] arm asserts the whitespace run
+    // non-empty), which reproduces each exactly; the only widening is `\s+` for a single space,
+    // the same widening this module already accepts for pi's own
+    // `/connection\s+(?:error|reset|closed|aborted)/i` in the retryable set. Splitting into four
+    // keeps `contextexceeded` and `context … <unrelated clause> … too long` OUT, which a single
+    // `ThenAny` would admit.
+    RetryPattern::WsThenAny(lower!("context"), CONTEXT_OVERFLOW_TAILS),
+    RetryPattern::WsThenAny(lower!("context length"), CONTEXT_OVERFLOW_TAILS),
+    RetryPattern::WsThenAny(lower!("context window"), CONTEXT_OVERFLOW_TAILS),
+    RetryPattern::WsThenAny(lower!("context limit"), CONTEXT_OVERFLOW_TAILS),
+    RetryPattern::Contains(lower!("maximum context length")),  // /maximum context length/i
+    RetryPattern::Contains(lower!("too many tokens")),         // /too many tokens/i
+    RetryPattern::Contains(lower!("token limit")),             // /token limit/i
+    RetryPattern::Contains(lower!("context_length_exceeded")), // /context_length_exceeded/i
+    RetryPattern::Contains(lower!("length_required")),         // /length_required/i
+    RetryPattern::Then(lower!("maximum"), lower!("tokens")),           // /maximum.*tokens/i
+    RetryPattern::Then(lower!("prompt"), lower!("too long")),          // /prompt.*too long/i
+    RetryPattern::Then(lower!("input"), lower!("too long")),           // /input.*too long/i
+    RetryPattern::Then(lower!("exceeded"), lower!("context")),         // /exceeded.*context/i
+    RetryPattern::Then(lower!("context"), lower!("overflow")),         // /context.*overflow/i
+];
+
+/// The shared tail alternation of pi's first context-overflow regex,
+/// `(?:exceed|overflow|too long)` — hoisted because [`CONTEXT_OVERFLOW_PATTERNS`] expands that one
+/// regex into four [`RetryPattern::WsThenAny`] rows (see its doc) and the four must not drift.
+const CONTEXT_OVERFLOW_TAILS: &[LowerLiteral] =
+    &[lower!("exceed"), lower!("overflow"), lower!("too long")];
 
 /// Whether a byte is a regex `\w`/`\b`-boundary word character (`[A-Za-z0-9_]`).
 fn is_word_byte(b: u8) -> bool {
@@ -560,32 +680,65 @@ fn matches_word_number(hay: &str, num: &str) -> bool {
     false
 }
 
-/// Whether `line` (already lowercased) matches `pattern`. `line` is a single line — the `.*`/`\s*`
-/// constructs never cross a `\n` (JS `.`-no-newline), so [`is_retryable_model_failure`] applies
-/// this per line.
-fn line_matches(line: &str, pattern: &RetryPattern) -> bool {
+/// A single line of already-lowercased text.
+///
+/// [`line_matches`]' `.*`/`\s*` arms rely on BOTH facts — they scan with `find`/`contains` over the
+/// remainder of the slice, so a `\n` in the haystack would let a sequence pattern match across a
+/// line break, silently widening every `Then`/`ThenAny`/`WsThenAny` row (JS `.` does not match
+/// newline, so upstream cannot do that). Both were previously preconditions stated in
+/// `line_matches`' doc comment and checkable by nothing.
+///
+/// [`Self::split`] is the only constructor, so neither is a precondition any more.
+///
+/// `Copy`: this is a borrowed view (one `&str` wide), and [`line_matches`] takes it by value —
+/// the pattern loops call it once per pattern from inside an `FnMut` closure, which without `Copy`
+/// is a move out of a captured variable (E0507).
+#[derive(Clone, Copy)]
+pub(crate) struct LoweredLine<'a>(&'a str);
+
+impl<'a> LoweredLine<'a> {
+    /// Split already-lowercased text into lines. The caller lowercases ONCE and hands the whole
+    /// haystack here — which is exactly what [`is_retryable_model_failure`] and
+    /// [`is_context_overflow`] previously did by hand.
+    pub(crate) fn split(lowered: &'a str) -> impl Iterator<Item = LoweredLine<'a>> {
+        lowered.split('\n').map(LoweredLine)
+    }
+
+    /// Unwrap for the `str` methods that consume it — see [`LowerLiteral::as_str`] for why this is
+    /// the one shape of unwrapping that does not discard the invariant.
+    pub(crate) const fn as_str(&self) -> &'a str {
+        self.0
+    }
+}
+
+/// Whether `line` matches `pattern`. Both of this function's former preconditions ("already
+/// lowercased", "a single line") are now carried by [`LoweredLine`], and every literal's
+/// lowercase-ness by [`LowerLiteral`] — so the only thing left to get wrong here is the matching
+/// itself.
+fn line_matches(line: LoweredLine<'_>, pattern: &RetryPattern) -> bool {
+    let line = line.as_str();
     match pattern {
-        RetryPattern::Contains(needle) => line.contains(needle),
-        RetryPattern::WordNumber(num) => matches_word_number(line, num),
-        RetryPattern::Then(first, second) => match line.find(first) {
+        RetryPattern::Contains(needle) => line.contains(needle.as_str()),
+        RetryPattern::WordNumber(num) => matches_word_number(line, num.as_str()),
+        RetryPattern::Then(first, second) => match line.find(first.as_str()) {
             Some(pos) => line
-                .get(pos + first.len()..)
-                .is_some_and(|rest| rest.contains(second)),
+                .get(pos + first.as_str().len()..)
+                .is_some_and(|rest| rest.contains(second.as_str())),
             None => false,
         },
-        RetryPattern::ThenAny(first, seconds) => match line.find(first) {
+        RetryPattern::ThenAny(first, seconds) => match line.find(first.as_str()) {
             Some(pos) => line
-                .get(pos + first.len()..)
-                .is_some_and(|rest| seconds.iter().any(|second| rest.contains(second))),
+                .get(pos + first.as_str().len()..)
+                .is_some_and(|rest| seconds.iter().any(|second| rest.contains(second.as_str()))),
             None => false,
         },
         RetryPattern::OptionalCharBetween(first, second) => {
             let mut search = 0;
-            while let Some(rel) = line.get(search..).and_then(|s| s.find(first)) {
+            while let Some(rel) = line.get(search..).and_then(|s| s.find(first.as_str())) {
                 let start = search + rel;
-                if let Some(rest) = line.get(start + first.len()..)
-                    && (rest.starts_with(second)
-                        || skip_one_char(rest).is_some_and(|r| r.starts_with(second)))
+                if let Some(rest) = line.get(start + first.as_str().len()..)
+                    && (rest.starts_with(second.as_str())
+                        || skip_one_char(rest).is_some_and(|r| r.starts_with(second.as_str())))
                 {
                     return true;
                 }
@@ -595,12 +748,12 @@ fn line_matches(line: &str, pattern: &RetryPattern) -> bool {
         }
         RetryPattern::OptionalWsBetween(first, second) => {
             let mut search = 0;
-            while let Some(rel) = line.get(search..).and_then(|s| s.find(first)) {
+            while let Some(rel) = line.get(search..).and_then(|s| s.find(first.as_str())) {
                 let start = search + rel;
-                if let Some(rest) = line.get(start + first.len()..)
+                if let Some(rest) = line.get(start + first.as_str().len()..)
                     && rest
                         .trim_start_matches(char::is_whitespace)
-                        .starts_with(second)
+                        .starts_with(second.as_str())
                 {
                     return true;
                 }
@@ -610,13 +763,15 @@ fn line_matches(line: &str, pattern: &RetryPattern) -> bool {
         }
         RetryPattern::WsThenAny(first, alternatives) => {
             let mut search = 0;
-            while let Some(rel) = line.get(search..).and_then(|s| s.find(first)) {
+            while let Some(rel) = line.get(search..).and_then(|s| s.find(first.as_str())) {
                 let start = search + rel;
-                if let Some(rest) = line.get(start + first.len()..) {
+                if let Some(rest) = line.get(start + first.as_str().len()..) {
                     let after_ws = rest.trim_start_matches(char::is_whitespace);
                     // `\s+`: the whitespace run must be non-empty.
                     if after_ws.len() < rest.len()
-                        && alternatives.iter().any(|alt| after_ws.starts_with(alt))
+                        && alternatives
+                            .iter()
+                            .any(|alt| after_ws.starts_with(alt.as_str()))
                     {
                         return true;
                     }
@@ -627,13 +782,13 @@ fn line_matches(line: &str, pattern: &RetryPattern) -> bool {
         }
         RetryPattern::OptionalWordBetween(first, middle, second) => {
             let mut search = 0;
-            while let Some(rel) = line.get(search..).and_then(|s| s.find(first)) {
+            while let Some(rel) = line.get(search..).and_then(|s| s.find(first.as_str())) {
                 let start = search + rel;
-                if let Some(rest) = line.get(start + first.len()..)
-                    && (rest.starts_with(second)
+                if let Some(rest) = line.get(start + first.as_str().len()..)
+                    && (rest.starts_with(second.as_str())
                         || rest
-                            .strip_prefix(middle)
-                            .is_some_and(|r| r.starts_with(second)))
+                            .strip_prefix(middle.as_str())
+                            .is_some_and(|r| r.starts_with(second.as_str())))
                 {
                     return true;
                 }
@@ -745,11 +900,41 @@ pub fn is_retryable_model_failure(error: Option<&str>) -> bool {
     // Per-line so the `.*`/`\s*`/`.?` constructs never cross a newline (JS `.`-no-newline). A
     // `Contains`/`WordNumber` needle can never straddle a `\n` either, so per-line evaluation is
     // equivalent to whole-string for those and correct for the sequence patterns.
-    haystack.split('\n').any(|line| {
+    LoweredLine::split(&haystack).any(|line| {
         RETRYABLE_MODEL_FAILURE_PATTERNS
             .iter()
             .any(|p| line_matches(line, p))
     })
+}
+
+/// pi `isContextOverflow` (`model-fallback.ts:645-649`).
+///
+/// The `TOOL_FAILURE_PREFIX` guard is upstream's (`:647`) and is load-bearing: a TOOL that failed
+/// with a message mentioning a token limit is a tool failure, not a model context overflow.
+/// Misreading one as the other terminates a fallback ladder that would otherwise have recovered —
+/// the exact mirror of the regression [`is_tool_failure_prefix`]'s own doc records for the
+/// retryable set, where the same overlap re-ran a whole task on the next model.
+///
+/// Returns `false` for `None`/empty error text, matching pi's `if (!error) return false`.
+#[must_use]
+pub fn is_context_overflow(error: Option<&str>) -> bool {
+    let Some(error) = error else {
+        return false;
+    };
+    if error.trim().is_empty() {
+        return false;
+    }
+    // pi `:647`: the tool-failure guard runs FIRST and short-circuits the whole pattern set.
+    if is_tool_failure_prefix(error.trim()) {
+        return false;
+    }
+    let haystack = error.to_lowercase();
+    // Per line, so `.*`/`\s+` never cross a newline (JS `.`-no-newline) — identical to
+    // `is_retryable_model_failure`'s iteration and required by `line_matches`' contract. A
+    // `Contains` needle holds no `\n`, so it cannot straddle one either: per-line is equivalent
+    // for those and strictly correct for the rest.
+    LoweredLine::split(&haystack)
+        .any(|line| CONTEXT_OVERFLOW_PATTERNS.iter().any(|p| line_matches(line, p)))
 }
 
 /// The prefix/suffix of pi's second empty-output sentinel — `Subagent produced no output after
@@ -824,21 +1009,109 @@ pub fn is_retryable_model_failure_attempt(signal: &AttemptSignal) -> bool {
             .any(|message_error| message_error.trim() == error)
 }
 
-/// Format the "prior attempt failed" note appended into the next attempt's initial
-/// `recent_output`/progress context (R-SA-039's "append a note about the prior attempt into the
-/// next attempt's initial `recent_output`/progress context"), mirroring pi's
-/// `formatModelAttemptNote` (`model-fallback.ts:331-336`).
+/// One operator-facing ladder note — pi `attemptNotes` (`subagent-runner.ts:1026`,
+/// `execution.ts:1836`).
+///
+/// Upstream accumulates these as pre-formatted strings, each carrying a bracketed KIND tag
+/// (`[fallback]`, `[startup-retry]`, `[abort-recovery]`, `[readonly-continuation]`). The tag is not
+/// decoration — it is how an operator greps the delivered output, and how a surface would decide to
+/// render one kind differently from another. Carrying `Vec<String>` erases it, so any consumer
+/// wanting the kind back has to re-parse text it just formatted.
+///
+/// [`std::fmt::Display`] renders upstream's exact wording, so the delivered text is byte-identical
+/// to the three `format!`s this enum replaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttemptNote {
+    /// The ladder advanced to another candidate — pi `formatModelAttemptNote`
+    /// (`model-fallback.ts:651-656`), R-SA-039's "append a note about the prior attempt into the
+    /// next attempt's initial `recent_output`/progress context".
+    ModelAdvance {
+        failed: ModelId,
+        /// The trimmed failure text, or `"attempt failed"` when the attempt reported none —
+        /// resolved at construction so [`Display`](std::fmt::Display) stays total.
+        failure: String,
+        next: ModelId,
+    },
+    /// The input exceeded the model's context window — pi `subagent-runner.ts:1410` /
+    /// `execution.ts:2050`, byte-identical in both. Verbatim including the em dash: the second
+    /// sentence is the remediation instruction an operator acts on, not a log line.
+    ContextOverflow { failed: ModelId },
+    /// The child died before any model or tool activity and the SAME model is being relaunched —
+    /// `formatSubagentStartupRetryNote` (`subagent-startup-retry.ts:69-76`).
+    ///
+    /// cyrup-side: upstream's startup-retry ladder does not push into `attemptNotes` at this
+    /// point, so this variant has no single upstream line to cite (see §0.6).
+    StartupRetry {
+        model: String,
+        attempt: usize,
+        max_attempts: usize,
+        delay_ms: u64,
+    },
+    // UNPORTED upstream kinds, named here so the gap is greppable rather than invisible:
+    //   AbortRecovery        — `subagent-runner.ts:1401` / `execution.ts:2029`
+    //   ReadonlyContinuation — `execution.ts:2004`, added upstream in v0.66.0
+}
+
+impl std::fmt::Display for AttemptNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ModelAdvance {
+                failed,
+                failure,
+                next,
+            } => write!(
+                f,
+                "[fallback] {failed} failed: {failure}. Retrying with {next}."
+            ),
+            Self::ContextOverflow { failed } => write!(
+                f,
+                "[fallback] {failed} failed: context overflow — the input exceeds this model's \
+                 context window. Reduce the task input or use a model with a larger context \
+                 window."
+            ),
+            Self::StartupRetry {
+                model,
+                attempt,
+                max_attempts,
+                delay_ms,
+            } => write!(
+                f,
+                "[startup-retry] {model} exited before model or tool activity (attempt \
+                 {attempt}/{max_attempts}). Retrying the same model in {delay_ms}ms."
+            ),
+        }
+    }
+}
+
+/// Build an [`AttemptNote::ModelAdvance`], resolving pi's `attempt.error?.trim() || "attempt
+/// failed"` fallback (`model-fallback.ts:652`) once at construction.
 #[must_use]
 pub fn format_attempt_note(
     failed_model: &ModelId,
     error: Option<&str>,
     next_model: &ModelId,
-) -> String {
+) -> AttemptNote {
     let failure = error
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or("attempt failed");
-    format!("[fallback] {failed_model} failed: {failure}. Retrying with {next_model}.")
+    AttemptNote::ModelAdvance {
+        failed: failed_model.clone(),
+        failure: failure.to_string(),
+        next: next_model.clone(),
+    }
+}
+
+/// Build an [`AttemptNote::ContextOverflow`].
+///
+/// Upstream interpolates `attempt.model` — the `ModelAttempt` row's model, which at this point in
+/// the ladder is the same value as the loop's `model`. Uses `model` because the row is already
+/// borrowed mutably in this scope.
+#[must_use]
+pub fn context_overflow_note(failed_model: &ModelId) -> AttemptNote {
+    AttemptNote::ContextOverflow {
+        failed: failed_model.clone(),
+    }
 }
 
 // -------------------------------------------------------------------------------------------
@@ -926,6 +1199,12 @@ pub struct AttemptSignal {
     pub exit_code: Option<i32>,
     pub error: Option<String>,
     pub usage: Usage,
+    /// Assistant turns this attempt ran — pi's `result.usage.turns`, kept beside [`Self::usage`]
+    /// because [`cyrup_core::Usage`] deliberately has no turn concept (see
+    /// [`crate::exec::SingleResult::turns`]). Filled from
+    /// [`crate::exec::progress::AgentProgress::turn_count`] at the same three sites that fill
+    /// `usage`; `0` for a setup failure that never ran a child.
+    pub turns: u64,
     /// R-SA-036: a soft-interrupt timeout occurred on this attempt. Checked as a distinct branch
     /// strictly before [`is_retryable_model_failure`] is ever consulted — see
     /// [`run_fallback_ladder`]'s doc comment for why this ordering is load-bearing.
@@ -1113,11 +1392,13 @@ pub fn format_subagent_startup_retry_note(
     attempt: usize,
     max_attempts: usize,
     delay_ms: u64,
-) -> String {
-    format!(
-        "[startup-retry] {model} exited before model or tool activity (attempt \
-         {attempt}/{max_attempts}). Retrying the same model in {delay_ms}ms."
-    )
+) -> AttemptNote {
+    AttemptNote::StartupRetry {
+        model: model.to_string(),
+        attempt,
+        max_attempts,
+        delay_ms,
+    }
 }
 
 /// The terminal error once every startup attempt is spent
@@ -1175,9 +1456,13 @@ pub trait AttemptRunner {
     /// path). Returned verbatim inside [`FallbackOutcome::last_attempt`].
     type Attempt: Send;
 
-    /// Run one attempt against `model`, with `attempt_note` (R-SA-039's "note about the prior
-    /// attempt") injected into this attempt's initial context when this is not the ladder's first
-    /// candidate, and `output_snapshot` the R-SA-031 stat-snapshot the caller took of the output
+    /// Run one attempt against `model`, with `attempt_notes` the ladder's ACCUMULATED
+    /// operator-facing notes (pi `shared.attemptNotes` — R-SA-039's "note about the prior
+    /// attempt", plus every earlier startup-retry note), each to be injected, in order, into this
+    /// attempt's initial `recent_output`/progress context. pi seeds the WHOLE array into every
+    /// attempt (`recentOutput: [...shared.attemptNotes]`, `execution.ts:542`), so a second
+    /// relaunch sees both prior notes, not just the latest; empty for a ladder's first launch.
+    /// `output_snapshot` is the R-SA-031 stat-snapshot the caller took of the output
     /// file (if any) immediately before this call — [`run_fallback_ladder`] snapshots (via
     /// [`Self::snapshot_output_file`]) once per attempt but does not otherwise interpret the
     /// snapshot value itself, since that comparison is R-SA-031's `exec/output.rs`'s concern, not
@@ -1185,7 +1470,7 @@ pub trait AttemptRunner {
     async fn run_attempt(
         &mut self,
         model: &ModelId,
-        attempt_note: Option<&str>,
+        attempt_notes: &[AttemptNote],
     ) -> (AttemptSignal, Self::Attempt);
 
     /// Snapshot whatever output-file state R-SA-031 needs before this attempt spawns. Default
@@ -1226,6 +1511,39 @@ pub struct FallbackOutcome<A> {
     pub model_attempts: Vec<ModelAttempt>,
     /// The additive sum of every attempt's usage, including failed attempts (R-SA-040).
     pub aggregate_usage: Usage,
+    /// The additive sum of every attempt's assistant-turn count, including failed attempts — pi's
+    /// `sumUsage` (`execution.ts:134-141`) sums `turns` in the SAME object as the tokens and is
+    /// applied once per attempt (`:1924`), so this aggregate follows [`Self::aggregate_usage`]'s
+    /// R-SA-040 rule exactly. The value [`crate::exec::SingleResult::turns`] publishes.
+    pub aggregate_turns: u64,
+    /// Operator-facing notes accumulated across the ladder — pi `attemptNotes`
+    /// (`subagent-runner.ts:1026`, `execution.ts:1821`).
+    ///
+    /// Upstream uses this ONE array for two things, and so does cyrup: it is seeded into every
+    /// attempt's progress (`recentOutput: [...shared.attemptNotes]`, `execution.ts:542` — cyrup's
+    /// R-SA-039 injection via [`crate::exec::attempt_runner`]'s `append_recent_output`), and it is
+    /// joined and PREPENDED to the delivered output once the ladder settles (`:1432-1433`).
+    ///
+    /// Replacing the old single-note `Option<String>` channel is a fix, not a refactor: its
+    /// `.take()` carried only the most recent note, so a ladder that startup-retried and then
+    /// advanced a model showed the child one note where upstream shows it both.
+    pub attempt_notes: Vec<AttemptNote>,
+    /// The ladder ended on a context overflow — pi `contextOverflow`
+    /// (`subagent-runner.ts:1041`, set at `:1409`; `execution.ts:1976-1980`), classified by
+    /// [`is_context_overflow`]. TERMINAL, not a retry hint: the ladder breaks outright on it
+    /// (`model-fallback.ts:624-630`), because the next model with the same oversized input fails
+    /// the same way. Published as [`crate::exec::SingleResult::context_overflow`].
+    ///
+    /// DERIVED from [`Self::stop`] rather than tracked beside it, so a `true` here alongside a
+    /// non-overflow stop is not representable.
+    pub context_overflow: bool,
+    /// Why the ladder stopped — the single classification [`classify_attempt`] produced.
+    ///
+    /// `pub(crate)` and NOT published onto [`crate::exec::SingleResult`]: the run's terminal
+    /// STATUS is a different question, already answered by
+    /// [`crate::tui::intercom::resolve_subagent_result_status`], which folds in the
+    /// `stopped`/`interrupted`/`detached` facts this enum cannot see. See [`LadderStop`].
+    pub(crate) stop: LadderStop,
     /// The final [`AttemptSignal`] the ladder stopped on (success, exhaustion, timeout, or
     /// detach) — `None` only when `candidates` was empty to begin with (R-SA-038's ladder can
     /// legitimately be empty; the caller, not this function, decides how to treat that as a
@@ -1298,6 +1616,131 @@ pub struct FallbackOutcome<A> {
 /// `model_attempts`, zeroed `aggregate_usage`, and `last_signal`/`last_attempt` both `None` — it
 /// never calls `runner.run_attempt` at all in that case. Treating an empty ladder as a hard
 /// pre-spawn failure (there is no model to even try) is the caller's responsibility.
+/// Why the ladder stopped trying candidate models — mutually exclusive by construction, because
+/// [`classify_attempt`] returns exactly one.
+///
+/// **NOT a run status.** [`crate::tui::intercom::SubagentResultStatus`] is that, and
+/// [`crate::tui::intercom::resolve_subagent_result_status`] already computes it with upstream's own
+/// precedence (`detached ▸ stopped ▸ paused ▸ completed ▸ failed`, `result-intercom.ts:20-40`).
+/// Adding a second resolver here would be a competing source of truth for the same question.
+///
+/// This enum deliberately has no `Interrupted` or `Stopped` variant. Neither is visible in an
+/// [`AttemptSignal`]: `interrupted` lives on the runner's own per-attempt record (read by
+/// `SettledAttempt::from_ladder` as `record.interrupted`), and a stop is observed outside the
+/// ladder entirely. The ladder does not need either — the startup-retry interrupt branch sets
+/// `signal.success = true` before settling, so an interrupt reaches the ladder as a SUCCESS and the
+/// real flag is layered on afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LadderStop {
+    /// The attempt succeeded (including pi's paused-success interrupt).
+    Completed,
+    /// R-SA-036 — the deadline fired.
+    TimedOut,
+    /// R-SA-037 — the child detached.
+    Detached,
+    /// The input exceeded the model's context window; retrying another model cannot help.
+    ContextOverflow,
+    /// Any other terminal failure: a non-retryable error, the last candidate exhausted, startup
+    /// launches spent, or a cancelled startup backoff.
+    ModelFailure,
+}
+
+/// What the ladder does next for one settled attempt.
+///
+/// Exhaustive on purpose: a new variant fails to compile at the shell rather than falling into a
+/// default arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LadderStep {
+    /// Stop the ladder with this classification.
+    Settle(LadderStop),
+    /// Relaunch the SAME model after `delay_ms` (pi `execution.ts:1558-1619`). The wait itself is
+    /// I/O and stays in the shell; its three outcomes are not decidable here.
+    RetryStartup { delay_ms: u64 },
+    /// Every startup launch spent with still zero activity (pi `:1606-1618`).
+    StartupExhausted,
+    /// Advance to the next candidate.
+    AdvanceModel,
+}
+
+/// The ladder's ENTIRE decision precedence, as one pure function.
+///
+/// No `.await`, no `&mut`, no I/O — so the precedence is one readable `match` that can be asserted
+/// as a table instead of driven through a subprocess. That is the point: this ordering used to be
+/// expressed as the position of nine `break 'ladder` statements across a ninety-line loop, where
+/// moving one branch compiled cleanly and silently changed behaviour. The classic instance:
+/// placing the context-overflow check below `is_last_candidate` makes a ONE-MODEL ladder — an agent
+/// with no `fallback_models`, the common case — report `context_overflow: false` for exactly the
+/// runs that overflow most often.
+///
+/// Order, and the upstream rule each line ports:
+///
+/// 1. `timed_out` — R-SA-036, checked before any pattern classification runs at all;
+/// 2. `detached` — R-SA-037, likewise terminal;
+/// 3. `success` — including pi's paused-success interrupt;
+/// 4. startup retry — pi `execution.ts:1558`, BEFORE the model-fallback decision and before the
+///    last-candidate stop, because a child that never started says nothing about the MODEL;
+/// 5. context overflow — pi `subagent-runner.ts:1408`, ABOVE the last-candidate break;
+/// 6. last candidate, or not retryable — pi `:1413`;
+/// 7. otherwise advance.
+fn classify_attempt(
+    signal: &AttemptSignal,
+    is_last_candidate: bool,
+    startup_attempt_index: usize,
+) -> LadderStep {
+    if signal.timed_out {
+        return LadderStep::Settle(LadderStop::TimedOut);
+    }
+    if signal.detached {
+        return LadderStep::Settle(LadderStop::Detached);
+    }
+    if signal.success {
+        return LadderStep::Settle(LadderStop::Completed);
+    }
+
+    if is_retryable_subagent_startup_failure(signal) {
+        return match SUBAGENT_STARTUP_RETRY_DELAYS_MS.get(startup_attempt_index) {
+            Some(&delay_ms) => LadderStep::RetryStartup { delay_ms },
+            None => LadderStep::StartupExhausted,
+        };
+    }
+
+    // ── SCOPE_3j inserts `record_retryable_model_failure` HERE ──────────────────────────────
+    // pi calls it at `:1407`, immediately BEFORE `isContextOverflow` at `:1408`. Note the
+    // recording is a FILE WRITE (`model-exclusions.ts`'s persisted registry), so it cannot live
+    // inside this pure function: 3j must carry the decision out on a `LadderStep` payload and let
+    // the shell perform it.
+
+    // TERMINAL, not a retry hint: the next model with the same oversized input fails the same way
+    // (`model-fallback.ts:624-630`).
+    if is_context_overflow(signal.error.as_deref()) {
+        return LadderStep::Settle(LadderStop::ContextOverflow);
+    }
+
+    // Only reached for a non-timeout, non-detached failure: NOW (and only now) is the
+    // retryable-pattern classifier consulted (R-SA-039) — in its per-attempt form (SUBA-089), so a
+    // child that already ran tools is never re-run.
+    if is_last_candidate || !is_retryable_model_failure_attempt(signal) {
+        return LadderStep::Settle(LadderStop::ModelFailure);
+    }
+
+    LadderStep::AdvanceModel
+}
+
+/// How the shell continues after acting on a [`LadderStep`].
+///
+/// Exists so the loop has exactly ONE settle site: the three startup-retry sub-outcomes are decided
+/// by an `.await` and so cannot live in [`classify_attempt`], but they still funnel through here
+/// rather than each carrying its own copy of the settle-and-break.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LadderControl {
+    /// Run the same model again without advancing.
+    Relaunch,
+    /// Move to the next candidate.
+    NextCandidate,
+    /// Stop the whole ladder.
+    Stop(LadderStop),
+}
+
 pub async fn run_fallback_ladder<R: AttemptRunner + Send>(
     candidates: &[ModelId],
     runner: &mut R,
@@ -1305,9 +1748,19 @@ pub async fn run_fallback_ladder<R: AttemptRunner + Send>(
     let mut attempted_models = Vec::with_capacity(candidates.len());
     let mut model_attempts = Vec::with_capacity(candidates.len());
     let mut aggregate = Usage::default();
+    let mut aggregate_turns: u64 = 0;
     let mut last_signal: Option<AttemptSignal> = None;
     let mut last_attempt: Option<R::Attempt> = None;
-    let mut attempt_note: Option<String> = None;
+    // pi `const attemptNotes: string[] = []` (`subagent-runner.ts:1026`, `execution.ts:1821`):
+    // ONE accumulator serving both halves of the channel — seeded into every attempt's initial
+    // progress by the runner, and prepended to the delivered output by `exec::run_sync` once the
+    // ladder settles.
+    let mut attempt_notes: Vec<AttemptNote> = Vec::new();
+    // The ladder's single classification. `ModelFailure` is the honest default for the one path
+    // that never calls `classify_attempt` at all — an EMPTY candidate list, which settles nothing
+    // and attempts nothing. pi `let contextOverflow = false` (`subagent-runner.ts:1041`) is now
+    // derived from this rather than tracked beside it.
+    let mut ladder_stop = LadderStop::ModelFailure;
 
     'ladder: for (i, model) in candidates.iter().enumerate() {
         // pi `for (let startupAttemptIndex = 0; ; startupAttemptIndex++)` (`execution.ts:1518`):
@@ -1316,9 +1769,9 @@ pub async fn run_fallback_ladder<R: AttemptRunner + Send>(
         let mut startup_attempt_index = 0usize;
         loop {
             runner.snapshot_output_file(); // R-SA-031: snapshot immediately before each fresh spawn
-            let (mut signal, mut attempt) = runner
-                .run_attempt(model, attempt_note.take().as_deref())
-                .await; // R-SA-039: always a fresh child subprocess per candidate
+            // R-SA-039: always a fresh child subprocess per candidate, seeded with EVERY note
+            // accumulated so far (pi `execution.ts:542`).
+            let (mut signal, mut attempt) = runner.run_attempt(model, &attempt_notes).await;
 
             // pi records the candidate ONCE per model (`execution.ts:1536-1539`) — a startup
             // relaunch is the same rung of the ladder, not a new one.
@@ -1326,6 +1779,11 @@ pub async fn run_fallback_ladder<R: AttemptRunner + Send>(
                 attempted_models.push(model.clone());
             }
             add_usage(&mut aggregate, &signal.usage); // R-SA-040: additive, even for a failed attempt
+            // pi `sumUsage(aggregateUsage, result.usage)` (`execution.ts:1924` applying `:134-141`),
+            // which sums `turns` in the same object as the tokens — additive across failed attempts
+            // is upstream's rule, not a choice. `saturating_add` because the no-panic policy denies
+            // an overflowing `+` and a turn count has no meaningful saturation risk.
+            aggregate_turns = aggregate_turns.saturating_add(signal.turns);
 
             // ...but every LAUNCH gets its own row (`modelAttempts.push` is inside the inner loop),
             // so a run that relaunched three times shows three rows and the retry notes that
@@ -1340,128 +1798,118 @@ pub async fn run_fallback_ladder<R: AttemptRunner + Send>(
 
             let is_last_candidate = i + 1 == candidates.len();
 
-            // --- R-SA-036: timeout is a distinct branch, checked FIRST, before any retryable-error
-            // --- pattern classification runs at all. ---
-            if signal.timed_out {
-                last_signal = Some(signal);
-                last_attempt = Some(attempt);
-                break 'ladder;
-            }
-            // --- R-SA-037: detach is likewise terminal, checked before retry classification. ---
-            if signal.detached {
-                last_signal = Some(signal);
-                last_attempt = Some(attempt);
-                break 'ladder;
-            }
-
-            if signal.success {
-                last_signal = Some(signal);
-                last_attempt = Some(attempt);
-                break 'ladder;
-            }
-
-            // --- Startup retry (pi `execution.ts:1558-1619`), evaluated BEFORE the model-fallback
-            // --- decision and before the last-candidate stop: a child that never started says
-            // --- nothing about the MODEL, so advancing the ladder (or giving up on the last rung)
-            // --- would spend a fallback model on what is usually a concurrent-launch race. ---
-            let startup_failure = is_retryable_subagent_startup_failure(&signal);
-            let retry_delay_ms = SUBAGENT_STARTUP_RETRY_DELAYS_MS
-                .get(startup_attempt_index)
-                .copied();
-            if let (true, Some(delay_ms)) = (startup_failure, retry_delay_ms) {
-                let note = format_subagent_startup_retry_note(
-                    model.as_str(),
-                    startup_attempt_index + 1,
-                    SUBAGENT_STARTUP_RETRY_DELAYS_MS.len() + 1,
-                    delay_ms,
-                );
-                match runner
-                    .wait_startup_retry(std::time::Duration::from_millis(delay_ms))
-                    .await
-                {
-                    StartupRetryWait::Proceed => {}
-                    StartupRetryWait::Interrupted => {
-                        // pi `:1584-1592`: a soft interrupt during the backoff is a PAUSE, not a
-                        // failure — exit 0, cleared error, paused sentinel output.
-                        signal.success = true;
-                        signal.exit_code = Some(0);
-                        signal.error = None;
-                        runner.apply_startup_outcome(&mut attempt, &StartupOutcome::Interrupted);
-                        last_signal = Some(signal);
-                        last_attempt = Some(attempt);
-                        break 'ladder;
+            // The ENTIRE precedence lives in `classify_attempt` (pure). This match only ACTS on
+            // its answer — performing the I/O the decision implies and mutating the accumulators —
+            // and then funnels every path through the single settle below.
+            let control = match classify_attempt(&signal, is_last_candidate, startup_attempt_index)
+            {
+                LadderStep::Settle(stop) => {
+                    if stop == LadderStop::ContextOverflow {
+                        attempt_notes.push(context_overflow_note(model));
                     }
-                    StartupRetryWait::Cancelled => {
-                        let cancelled =
-                            "Subagent startup retry cancelled before relaunch.".to_string();
-                        signal.error = Some(cancelled.clone());
-                        if let Some(row) = model_attempts.last_mut() {
-                            row.error = Some(cancelled.clone());
+                    LadderControl::Stop(stop)
+                }
+                LadderStep::RetryStartup { delay_ms } => {
+                    let note = format_subagent_startup_retry_note(
+                        model.as_str(),
+                        startup_attempt_index + 1,
+                        SUBAGENT_STARTUP_RETRY_DELAYS_MS.len() + 1,
+                        delay_ms,
+                    );
+                    match runner
+                        .wait_startup_retry(std::time::Duration::from_millis(delay_ms))
+                        .await
+                    {
+                        StartupRetryWait::Proceed => {
+                            // pi `:1602-1604`: the note replaces this launch's error on its own
+                            // row and is injected into the relaunched child's context.
+                            //
+                            // The ROW takes the rendered text — `ModelAttempt::error` is a
+                            // serialized field and stays a `String`; the ACCUMULATOR takes the
+                            // typed note, which is the only form that survives to a consumer that
+                            // cares about the note's KIND.
+                            if let Some(row) = model_attempts.last_mut() {
+                                row.error = Some(note.to_string());
+                            }
+                            attempt_notes.push(note);
+                            LadderControl::Relaunch
                         }
-                        runner.apply_startup_outcome(
-                            &mut attempt,
-                            &StartupOutcome::Cancelled(cancelled),
-                        );
-                        last_signal = Some(signal);
-                        last_attempt = Some(attempt);
-                        break 'ladder;
+                        StartupRetryWait::Interrupted => {
+                            // pi `:1584-1592`: a soft interrupt during the backoff is a PAUSE, not
+                            // a failure — exit 0, cleared error, paused sentinel output. It
+                            // reaches the ladder as a SUCCESS; `SettledAttempt::from_ladder`
+                            // layers the real `interrupted` flag on from the runner's record.
+                            signal.success = true;
+                            signal.exit_code = Some(0);
+                            signal.error = None;
+                            runner
+                                .apply_startup_outcome(&mut attempt, &StartupOutcome::Interrupted);
+                            LadderControl::Stop(LadderStop::Completed)
+                        }
+                        StartupRetryWait::Cancelled => {
+                            let cancelled =
+                                "Subagent startup retry cancelled before relaunch.".to_string();
+                            signal.error = Some(cancelled.clone());
+                            if let Some(row) = model_attempts.last_mut() {
+                                row.error = Some(cancelled.clone());
+                            }
+                            runner.apply_startup_outcome(
+                                &mut attempt,
+                                &StartupOutcome::Cancelled(cancelled),
+                            );
+                            LadderControl::Stop(LadderStop::ModelFailure)
+                        }
                     }
                 }
-                // pi `:1602-1604`: the note replaces this launch's error on its own row and is
-                // injected into the relaunched child's context.
-                if let Some(row) = model_attempts.last_mut() {
-                    row.error = Some(note.clone());
+                LadderStep::StartupExhausted => {
+                    // Every launch spent, still zero activity (pi `:1606-1618`).
+                    let exhausted = format_subagent_startup_retry_exhausted_error(
+                        model.as_str(),
+                        startup_attempt_index + 1,
+                    );
+                    signal.error = Some(exhausted.clone());
+                    if let Some(row) = model_attempts.last_mut() {
+                        row.error = Some(exhausted.clone());
+                    }
+                    runner
+                        .apply_startup_outcome(&mut attempt, &StartupOutcome::Exhausted(exhausted));
+                    LadderControl::Stop(LadderStop::ModelFailure)
                 }
-                attempt_note = Some(note);
-                // `signal`/`attempt` are deliberately dropped here rather than parked in
-                // `last_signal`/`last_attempt`: `continue` always runs another attempt for the same
-                // model, which overwrites both before anything can read them (pi's `lastResult` is
-                // likewise overwritten on the next pass). Assigning them would be dead.
-                startup_attempt_index += 1;
-                continue;
-            }
-            if startup_failure {
-                // Every launch spent, still zero activity (pi `:1606-1618`).
-                let exhausted = format_subagent_startup_retry_exhausted_error(
-                    model.as_str(),
-                    startup_attempt_index + 1,
-                );
-                signal.error = Some(exhausted.clone());
-                if let Some(row) = model_attempts.last_mut() {
-                    row.error = Some(exhausted.clone());
+                LadderStep::AdvanceModel => {
+                    if let Some(next_model) = candidates.get(i + 1) {
+                        attempt_notes.push(format_attempt_note(
+                            model,
+                            signal.error.as_deref(),
+                            next_model,
+                        ));
+                    }
+                    LadderControl::NextCandidate
                 }
-                runner.apply_startup_outcome(&mut attempt, &StartupOutcome::Exhausted(exhausted));
-                last_signal = Some(signal);
-                last_attempt = Some(attempt);
-                break 'ladder;
-            }
+            };
 
-            if is_last_candidate {
-                last_signal = Some(signal);
-                last_attempt = Some(attempt);
-                break 'ladder;
+            // THE single settle site. Before this refactor there were nine, each repeating these
+            // same two assignments, and the ladder's precedence was the order they appeared in.
+            match control {
+                LadderControl::Relaunch => {
+                    // `signal`/`attempt` are deliberately dropped rather than parked in
+                    // `last_signal`/`last_attempt`: `continue` always runs another attempt for the
+                    // same model, which overwrites both before anything can read them (pi's
+                    // `lastResult` is likewise overwritten on the next pass).
+                    startup_attempt_index += 1;
+                    continue;
+                }
+                LadderControl::NextCandidate => {
+                    last_signal = Some(signal);
+                    last_attempt = Some(attempt);
+                    break;
+                }
+                LadderControl::Stop(stop) => {
+                    ladder_stop = stop;
+                    last_signal = Some(signal);
+                    last_attempt = Some(attempt);
+                    break 'ladder;
+                }
             }
-
-            // Only reached for a non-timeout, non-detached, non-last-candidate failure: NOW (and
-            // only now) is the retryable-pattern classifier consulted (R-SA-039) — in its
-            // per-attempt form (SUBA-089), so a child that already ran tools is never re-run.
-            if !is_retryable_model_failure_attempt(&signal) {
-                last_signal = Some(signal);
-                last_attempt = Some(attempt);
-                break 'ladder;
-            }
-
-            // Retryable, not the last candidate, not a timeout, not a detach: advance the ladder.
-            if let Some(next_model) = candidates.get(i + 1) {
-                attempt_note = Some(format_attempt_note(
-                    model,
-                    signal.error.as_deref(),
-                    next_model,
-                ));
-            }
-            last_signal = Some(signal);
-            last_attempt = Some(attempt);
-            break;
         }
     }
 
@@ -1469,6 +1917,12 @@ pub async fn run_fallback_ladder<R: AttemptRunner + Send>(
         attempted_models,
         model_attempts,
         aggregate_usage: aggregate,
+        aggregate_turns,
+        attempt_notes,
+        // DERIVED, not tracked separately: one source of truth for "why did the ladder stop", so
+        // `context_overflow: true` alongside a `TimedOut` stop is not representable here.
+        context_overflow: matches!(ladder_stop, LadderStop::ContextOverflow),
+        stop: ladder_stop,
         last_signal,
         last_attempt,
     }
@@ -2214,7 +2668,7 @@ mod tests {
     struct ScriptedRunner {
         /// One scripted `(AttemptSignal, attempt_label)` per call, consumed in order.
         script: Vec<(AttemptSignal, &'static str)>,
-        calls: Vec<(ModelId, Option<String>)>,
+        calls: Vec<(ModelId, Vec<AttemptNote>)>,
         snapshot_calls: u32,
     }
 
@@ -2235,10 +2689,9 @@ mod tests {
         async fn run_attempt(
             &mut self,
             model: &ModelId,
-            attempt_note: Option<&str>,
+            attempt_notes: &[AttemptNote],
         ) -> (AttemptSignal, Self::Attempt) {
-            self.calls
-                .push((model.clone(), attempt_note.map(str::to_string)));
+            self.calls.push((model.clone(), attempt_notes.to_vec()));
             let idx = self.calls.len() - 1;
             self.script[idx].clone()
         }
@@ -2254,6 +2707,7 @@ mod tests {
             exit_code: Some(0),
             error: None,
             usage,
+            turns: 0,
             timed_out: false,
             detached: false,
             message_errors: Vec::new(),
@@ -2267,6 +2721,7 @@ mod tests {
             exit_code: Some(1),
             error: Some(error.to_string()),
             usage,
+            turns: 0,
             timed_out: false,
             detached: false,
             message_errors: Vec::new(),
@@ -2280,6 +2735,7 @@ mod tests {
             exit_code: None,
             error: Some(error.to_string()),
             usage,
+            turns: 0,
             timed_out: true,
             detached: false,
             message_errors: Vec::new(),
@@ -2293,6 +2749,7 @@ mod tests {
             exit_code: None,
             error: None,
             usage,
+            turns: 0,
             timed_out: false,
             detached: true,
             message_errors: Vec::new(),
@@ -2619,9 +3076,8 @@ mod tests {
         assert!(
             runner.calls[1]
                 .1
-                .as_deref()
-                .unwrap_or_default()
-                .contains("429 rate limit"),
+                .iter()
+                .any(|n| n.to_string().contains("429 rate limit")),
             "the next attempt's initial context must carry a note about the prior failure"
         );
         assert!(outcome.last_signal.expect("some outcome").success);
@@ -2828,7 +3284,8 @@ mod tests {
 
     #[test]
     fn format_attempt_note_includes_failed_and_next_model_and_trimmed_error() {
-        let note = format_attempt_note(&model("a"), Some("  429 rate limit  "), &model("b"));
+        let note = format_attempt_note(&model("a"), Some("  429 rate limit  "), &model("b"))
+            .to_string();
         assert!(note.contains("a"));
         assert!(note.contains("b"));
         assert!(note.contains("429 rate limit"));
@@ -2837,8 +3294,199 @@ mod tests {
 
     #[test]
     fn format_attempt_note_falls_back_to_a_generic_phrase_when_error_is_absent() {
-        let note = format_attempt_note(&model("a"), None, &model("b"));
+        let note = format_attempt_note(&model("a"), None, &model("b")).to_string();
         assert!(note.contains("attempt failed"));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // classify_attempt — the ladder's ENTIRE precedence, as a table
+    //
+    // These replace what previously required driving a full `run_fallback_ladder` with a scripted
+    // subprocess runner: the decision is now a pure function, so each rung is one line.
+    // ---------------------------------------------------------------------------------------
+
+    /// A plain non-startup model failure: exited non-zero with a real provider error, and enough
+    /// activity that `is_retryable_subagent_startup_failure` does not claim it.
+    fn model_failure_signal(error: &str) -> AttemptSignal {
+        AttemptSignal {
+            success: false,
+            exit_code: Some(1),
+            error: Some(error.to_string()),
+            usage: Usage::default(),
+            turns: 1,
+            timed_out: false,
+            detached: false,
+            message_errors: vec![error.to_string()],
+            startup: StartupEvidence::default(),
+        }
+    }
+
+    /// THE regression this whole refactor exists to make unrepresentable: a ONE-MODEL ladder — an
+    /// agent with no `fallback_models`, the common case — must still classify an overflow as an
+    /// overflow. When the precedence was statement order, moving the overflow check below the
+    /// last-candidate break compiled cleanly and silently reported `context_overflow: false` here.
+    #[test]
+    fn a_single_candidate_overflow_is_classified_as_an_overflow_not_a_model_failure() {
+        let signal = model_failure_signal("context length exceeded: 200000 tokens");
+        assert_eq!(
+            classify_attempt(&signal, true, 0),
+            LadderStep::Settle(LadderStop::ContextOverflow)
+        );
+    }
+
+    /// The same signal on a NON-last candidate stops the ladder too — an overflow is terminal, it
+    /// never advances (`model-fallback.ts:624-630`).
+    #[test]
+    fn an_overflow_settles_rather_than_advancing_even_with_candidates_left() {
+        let signal = model_failure_signal("maximum context length is 8192 tokens");
+        assert_eq!(
+            classify_attempt(&signal, false, 0),
+            LadderStep::Settle(LadderStop::ContextOverflow)
+        );
+    }
+
+    /// Precedence, top to bottom. Each row is one rung of the ladder, and the table IS the
+    /// invariant that used to live in prose about which `break 'ladder` came first.
+    #[test]
+    fn the_precedence_is_timeout_then_detach_then_success_then_startup_then_overflow() {
+        // 1. timeout wins over everything, including an overflow-shaped error (R-SA-036).
+        let mut timed_out = model_failure_signal("context length exceeded");
+        timed_out.timed_out = true;
+        assert_eq!(
+            classify_attempt(&timed_out, false, 0),
+            LadderStep::Settle(LadderStop::TimedOut)
+        );
+
+        // 2. detach beats success and everything below it (R-SA-037).
+        let mut detached = model_failure_signal("context length exceeded");
+        detached.detached = true;
+        detached.success = true;
+        assert_eq!(
+            classify_attempt(&detached, false, 0),
+            LadderStep::Settle(LadderStop::Detached)
+        );
+
+        // 3. success beats the startup and overflow rungs.
+        let mut success = model_failure_signal("context length exceeded");
+        success.success = true;
+        assert_eq!(
+            classify_attempt(&success, false, 0),
+            LadderStep::Settle(LadderStop::Completed)
+        );
+
+        // 4. a startup failure is evaluated BEFORE the model-fallback decision, so it relaunches
+        //    the same model rather than spending a candidate on a launch race.
+        assert_eq!(
+            classify_attempt(&startup_failure_signal(), false, 0),
+            LadderStep::RetryStartup {
+                delay_ms: SUBAGENT_STARTUP_RETRY_DELAYS_MS[0]
+            }
+        );
+        // ...and once every launch is spent, it is terminal rather than falling through.
+        assert_eq!(
+            classify_attempt(
+                &startup_failure_signal(),
+                false,
+                SUBAGENT_STARTUP_RETRY_DELAYS_MS.len()
+            ),
+            LadderStep::StartupExhausted
+        );
+
+        // 5. a retryable failure with candidates left advances; the same one on the last candidate
+        //    settles (pi `:1413`).
+        let retryable = model_failure_signal("503 service unavailable");
+        assert_eq!(
+            classify_attempt(&retryable, false, 0),
+            LadderStep::AdvanceModel
+        );
+        assert_eq!(
+            classify_attempt(&retryable, true, 0),
+            LadderStep::Settle(LadderStop::ModelFailure)
+        );
+
+        // 6. a NON-retryable failure settles even with candidates left.
+        let fatal = model_failure_signal("the task was impossible");
+        assert_eq!(
+            classify_attempt(&fatal, false, 0),
+            LadderStep::Settle(LadderStop::ModelFailure)
+        );
+    }
+
+    /// A tool failure that merely MENTIONS a token limit is not an overflow — the
+    /// `TOOL_FAILURE_PREFIX` guard runs first (pi `model-fallback.ts:647`), so the ladder is free
+    /// to keep going rather than stopping on a guaranteed-terminal misread.
+    #[test]
+    fn a_tool_failure_mentioning_a_token_limit_is_not_classified_as_an_overflow() {
+        let signal = model_failure_signal("bash failed (exit 1): token limit");
+        assert_ne!(
+            classify_attempt(&signal, true, 0),
+            LadderStep::Settle(LadderStop::ContextOverflow)
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // LowerLiteral / LoweredLine — the two invariants that used to be doc comments
+    // ---------------------------------------------------------------------------------------
+
+    /// Every literal in BOTH tables is lowercase.
+    ///
+    /// This assertion is a belt-and-braces echo of a guarantee the compiler already enforces:
+    /// `lower!` runs `LowerLiteral::from_lowercase` inside a `const` block, so an uppercase
+    /// literal is `error[E0080]` at build time and this test could never run to observe it. It is
+    /// kept because it names the invariant in a place a reader greps, and because it also covers
+    /// the tails slice that the variants reference indirectly.
+    #[test]
+    fn every_pattern_literal_in_both_tables_is_lowercase() {
+        fn assert_lower(l: LowerLiteral) {
+            assert_eq!(
+                l.as_str(),
+                l.as_str().to_lowercase(),
+                "pattern literal `{}` is not lowercase — `line_matches` receives an \
+                 already-lowercased line, so it could never match",
+                l.as_str()
+            );
+        }
+        for pattern in RETRYABLE_MODEL_FAILURE_PATTERNS
+            .iter()
+            .chain(CONTEXT_OVERFLOW_PATTERNS.iter())
+        {
+            match pattern {
+                RetryPattern::Contains(a) | RetryPattern::WordNumber(a) => assert_lower(*a),
+                RetryPattern::Then(a, b)
+                | RetryPattern::OptionalCharBetween(a, b)
+                | RetryPattern::OptionalWsBetween(a, b) => {
+                    assert_lower(*a);
+                    assert_lower(*b);
+                }
+                RetryPattern::ThenAny(a, alts) | RetryPattern::WsThenAny(a, alts) => {
+                    assert_lower(*a);
+                    for alt in *alts {
+                        assert_lower(*alt);
+                    }
+                }
+                RetryPattern::OptionalWordBetween(a, b, c) => {
+                    assert_lower(*a);
+                    assert_lower(*b);
+                    assert_lower(*c);
+                }
+            }
+        }
+    }
+
+    /// `LoweredLine::split` is the only way to reach [`line_matches`], and it splits on `\n` — so
+    /// a sequence pattern can never match across a line break. `provider` on one line and
+    /// `unavailable` on the next is NOT `/provider.*unavailable/i` (JS `.` excludes newline).
+    #[test]
+    fn a_sequence_pattern_cannot_match_across_a_line_break() {
+        let across = "provider is fine\nsomething unavailable";
+        assert!(
+            !is_retryable_model_failure(Some(across)),
+            "`provider` and `unavailable` on two different lines must not match"
+        );
+        assert!(
+            is_retryable_model_failure(Some("provider foo is currently unavailable")),
+            "...but the same words on ONE line still do"
+        );
     }
 
     // ---------------------------------------------------------------------------------------
@@ -2853,6 +3501,7 @@ mod tests {
             exit_code: Some(1),
             error: Some("subagent attempt exited with code 1".to_string()),
             usage: Usage::default(),
+            turns: 0,
             timed_out: false,
             detached: false,
             message_errors: Vec::new(),
@@ -2983,7 +3632,7 @@ mod tests {
             250,
         );
         assert_eq!(
-            note,
+            note.to_string(),
             "[startup-retry] m1 exited before model or tool activity (attempt 1/4). Retrying the \
              same model in 250ms."
         );
@@ -3205,5 +3854,213 @@ mod tests {
         assert_eq!(outcome.attempted_models, vec![model("a"), model("b")]);
         assert_eq!(runner.calls.len(), 2);
         assert!(outcome.last_signal.expect("some outcome").success);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // is_context_overflow (pi `isContextOverflow`, `model-fallback.ts:645-649`) and the
+    // CONTEXT_OVERFLOW_PATTERNS set (`:631-643`)
+    // ---------------------------------------------------------------------------------------
+
+    /// One positive per upstream regex, in upstream's declaration order, plus multi-line and
+    /// mixed-case forms proving the per-line lowercased iteration.
+    #[test]
+    fn context_overflow_matches_every_upstream_pattern() {
+        for msg in [
+            "context exceeded",                          // pattern 1, empty optional branch
+            "context length exceeded",                   // pattern 1, ` length` branch
+            "Context window overflow",                   // pattern 1, ` window` branch
+            "request context limit exceeded",             // pattern 1, ` limit` branch
+            "maximum context length is 8192 tokens",     // /maximum context length/i
+            "request has too many tokens",               // /too many tokens/i
+            "per-minute token limit reached",            // /token limit/i
+            "error code: context_length_exceeded",       // /context_length_exceeded/i
+            "HTTP 411 length_required",                  // /length_required/i
+            "maximum of 4096 tokens per request",        // /maximum.*tokens/i
+            "the prompt you sent is way too long",       // /prompt.*too long/i
+            "input for this model was too long",         // /input.*too long/i
+            "you exceeded the model context",            // /exceeded.*context/i
+            "context buffer overflow detected",          // /context.*overflow/i
+            "first line is fine\nsecond line: token limit", // per-line, later line matches
+        ] {
+            assert!(is_context_overflow(Some(msg)), "{msg}");
+        }
+    }
+
+    /// §0.4's false-positive proof: pattern 1 is four `WsThenAny` rows, NOT one `ThenAny`, so an
+    /// unrelated clause between `context` and a tail word does not classify — and a missing
+    /// whitespace run (`contextexceeded`) does not either. This classifier is TERMINAL: a false
+    /// positive here stops a ladder that would have recovered, the opposite of the recoverable
+    /// direction a retryable false positive errs in.
+    #[test]
+    fn context_overflow_pattern_one_requires_the_tail_directly_after_real_whitespace() {
+        for msg in [
+            "the context of this request is unusual; the queue is too long",
+            "contextexceeded",
+            "context is fine",
+            "a context and, elsewhere, an exceed", // `context\s+` run not followed by a tail
+            // Upstream's own regex refuses this too: `context limit ` must be followed DIRECTLY
+            // by a tail, and `is` intervenes.
+            "the context limit is far away",
+        ] {
+            assert!(!is_context_overflow(Some(msg)), "{msg}");
+        }
+        // ...while the same words with the tail directly after the whitespace DO classify.
+        assert!(is_context_overflow(Some("context\t\texceeded")));
+    }
+
+    /// pi `:647`: the `TOOL_FAILURE_PREFIX` guard short-circuits the whole pattern set — a TOOL
+    /// that failed with a message mentioning a token limit is a tool failure, not a model context
+    /// overflow.
+    #[test]
+    fn a_tool_failure_mentioning_a_token_limit_is_not_a_context_overflow() {
+        assert!(!is_context_overflow(Some(
+            "bash failed (exit 1): token limit"
+        )));
+        assert!(!is_context_overflow(Some(
+            "mcp.server/write failed with exit code 2 context window overflow"
+        )));
+        // The same texts WITHOUT the tool prefix classify — the guard, not the patterns, is what
+        // refused them above.
+        assert!(is_context_overflow(Some("token limit")));
+    }
+
+    /// pi `if (!error) return false`, plus this module's blank-text discipline (identical to
+    /// [`is_retryable_model_failure`]).
+    #[test]
+    fn context_overflow_is_false_for_absent_or_blank_error() {
+        assert!(!is_context_overflow(None));
+        assert!(!is_context_overflow(Some("")));
+        assert!(!is_context_overflow(Some("   \n  ")));
+    }
+
+    /// Upstream's design note (`model-fallback.ts:624-630`): the two sets are deliberately
+    /// disjoint — a pattern in both would make the ladder burn every candidate on a guaranteed
+    /// failure. Structural, so an edit adding e.g. `"token limit"` to the retryable set fails
+    /// here rather than in production.
+    #[test]
+    fn the_overflow_and_retryable_pattern_sets_are_disjoint() {
+        for overflow in CONTEXT_OVERFLOW_PATTERNS {
+            assert!(
+                !RETRYABLE_MODEL_FAILURE_PATTERNS
+                    .iter()
+                    .any(|retryable| retryable == overflow),
+                "a pattern must never appear in both sets (model-fallback.ts:624-630)"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The ladder's overflow branch (pi `subagent-runner.ts:1408-1412`, `execution.ts:1976-1980`)
+    // ---------------------------------------------------------------------------------------
+
+    /// The §0.2 placement proof: the overflow check runs BEFORE the last-candidate break, so a
+    /// one-model ladder — an agent with no `fallback_models`, the common case — still records
+    /// the overflow and pushes the operator-facing note.
+    #[tokio::test]
+    async fn a_single_candidate_overflow_sets_the_flag_and_pushes_the_note() {
+        let candidates = vec![model("a")];
+        let mut runner = ScriptedRunner::new(vec![(
+            failed_signal("error code: context_length_exceeded", usage(10, 0, 0.0)),
+            "attempt-a",
+        )]);
+        let outcome = run_fallback_ladder(&candidates, &mut runner).await;
+
+        assert!(outcome.context_overflow);
+        assert_eq!(outcome.attempted_models, vec![model("a")]);
+        assert_eq!(
+            outcome.attempt_notes,
+            vec![context_overflow_note(&model("a"))],
+            "the note IS the remediation instruction and must reach the outcome"
+        );
+        assert!(!outcome.last_signal.expect("some outcome").success);
+    }
+
+    /// Upstream's order is overflow first, advance second (`:1408` before `:1413`): an error text
+    /// that ALSO matches a retryable pattern must still stop the ladder outright — the next model
+    /// with the same oversized input fails the same way.
+    #[tokio::test]
+    async fn an_overflow_breaks_the_ladder_even_when_the_text_also_reads_retryable() {
+        let error_text = "429 too many tokens";
+        assert!(
+            is_retryable_model_failure(Some(error_text)),
+            "sanity: this text must independently match the retryable classifier, or this test \
+             is not exercising the ordering at all"
+        );
+        assert!(is_context_overflow(Some(error_text)));
+
+        let candidates = vec![model("a"), model("b")];
+        let mut runner = ScriptedRunner::new(vec![
+            (failed_signal(error_text, usage(10, 0, 0.0)), "attempt-a"),
+            (ok_signal(usage(999, 999, 999.0)), "attempt-b"), // must never be reached
+        ]);
+        let outcome = run_fallback_ladder(&candidates, &mut runner).await;
+
+        assert!(outcome.context_overflow);
+        assert_eq!(
+            runner.calls.len(),
+            1,
+            "an overflow is TERMINAL: retrying the same input on another model cannot succeed"
+        );
+        assert_eq!(outcome.attempted_models, vec![model("a")]);
+    }
+
+    /// A ladder that never overflows reports the flag false and (when it advances) carries only
+    /// the advance notes.
+    #[tokio::test]
+    async fn a_ladder_without_overflow_reports_the_flag_false() {
+        let candidates = vec![model("a"), model("b")];
+        let mut runner = ScriptedRunner::new(vec![
+            (
+                failed_signal("429 rate limit", usage(10, 0, 0.0)),
+                "attempt-a",
+            ),
+            (ok_signal(usage(5, 5, 0.0)), "attempt-b"),
+        ]);
+        let outcome = run_fallback_ladder(&candidates, &mut runner).await;
+        assert!(!outcome.context_overflow);
+        assert_eq!(outcome.attempt_notes.len(), 1);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The accumulated note channel (pi `shared.attemptNotes`, seeded whole per attempt at
+    // `execution.ts:542`)
+    // ---------------------------------------------------------------------------------------
+
+    /// The lossiness fix: a third attempt sees BOTH prior notes (pi seeds
+    /// `recentOutput: [...shared.attemptNotes]` — the whole accumulated array), where the old
+    /// single-note `Option<String>.take()` channel handed it only the latest.
+    #[tokio::test]
+    async fn attempt_notes_accumulate_so_a_later_attempt_sees_every_prior_note() {
+        let candidates = vec![model("a"), model("b"), model("c")];
+        let mut runner = ScriptedRunner::new(vec![
+            (failed_signal("rate limit", usage(1, 0, 0.0)), "a"),
+            (
+                failed_signal("503 service unavailable", usage(1, 0, 0.0)),
+                "b",
+            ),
+            (ok_signal(usage(1, 1, 0.0)), "c"),
+        ]);
+        let outcome = run_fallback_ladder(&candidates, &mut runner).await;
+
+        assert!(runner.calls[0].1.is_empty(), "first launch carries no notes");
+        assert_eq!(runner.calls[1].1.len(), 1);
+        assert_eq!(
+            runner.calls[2].1.len(),
+            2,
+            "the third attempt must see EVERY prior note, not just the latest"
+        );
+        assert_eq!(
+            runner.calls[2].1[0], runner.calls[1].1[0],
+            "accumulation preserves earlier notes verbatim and in order"
+        );
+        assert!(
+            runner.calls[2].1[1]
+                .to_string()
+                .contains("503 service unavailable")
+        );
+        assert_eq!(
+            outcome.attempt_notes, runner.calls[2].1,
+            "the outcome publishes the same accumulator the last attempt was seeded with"
+        );
     }
 }

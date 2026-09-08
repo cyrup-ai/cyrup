@@ -85,8 +85,10 @@ pub struct GoalContinuationNotice {
 }
 
 /// pi `bounded` (`goal-driver.ts:19-22`): collapse all whitespace runs to single spaces, trim,
-/// then ellipsize with `…` (U+2026, ONE character) at [`MAX_ACTION_LENGTH`].
-fn bounded(value: &str) -> String {
+/// then ellipsize with `…` (U+2026, ONE character) at [`MAX_ACTION_LENGTH`]. Named for the
+/// TRUNCATING family (SCOPE_3 §A.4) — the rejecting family is `workflows::Bounded`, and upstream's
+/// name would shadow it.
+fn truncate_display(value: &str) -> String {
     let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.chars().count() > MAX_ACTION_LENGTH {
         let head: String = normalized.chars().take(MAX_ACTION_LENGTH - 1).collect();
@@ -358,7 +360,7 @@ fn ready_action_from_value(value: &StateNode, path_label: &str, depth: usize) ->
                     .and_then(StateNode::as_str)
                     .filter(|s| !s.trim().is_empty())
                 {
-                    return Some(bounded(found));
+                    return Some(truncate_display(found));
                 }
             }
             if value.get("status").and_then(StateNode::as_str) == Some("ready") {
@@ -368,7 +370,7 @@ fn ready_action_from_value(value: &StateNode, path_label: &str, depth: usize) ->
                         .and_then(StateNode::as_str)
                         .filter(|s| !s.trim().is_empty())
                     {
-                        return Some(bounded(found));
+                        return Some(truncate_display(found));
                     }
                 }
                 return Some(format!("Continue ready mission state at {path_label}"));
@@ -404,7 +406,7 @@ fn mission_state_action(
         .iter()
         .find(|item| item.status == MissionDecisionStatus::Open)
         .map(|decision| {
-            bounded(
+            truncate_display(
                 decision
                     .recommendation
                     .clone()
@@ -453,9 +455,9 @@ fn next_ready_action(
             "Resume retained child {} ({}) for: {}",
             retained.run_id,
             retained.agent,
-            bounded(&action)
+            truncate_display(&action)
         ),
-        None => bounded(&action),
+        None => truncate_display(&action),
     })
 }
 
@@ -532,7 +534,7 @@ pub fn collect_goal_continuation_notices(
         let used = record.usage.map_or(0, |u| u.tokens);
         let remaining = budget_tokens.saturating_sub(used);
         let message = [
-            format!("Goal mission needs attention: {}", bounded(&record.title)),
+            format!("Goal mission needs attention: {}", truncate_display(&record.title)),
             format!("Mission: {}", record.id),
             format!("Remaining budget: {remaining} tokens ({used}/{budget_tokens} used)"),
             format!(
@@ -1104,10 +1106,10 @@ mod tests {
     }
 
     #[test]
-    fn bounded_collapses_whitespace_and_ellipsizes_at_180_characters() {
-        assert_eq!(bounded("  a \n b\tc  "), "a b c");
+    fn truncate_display_collapses_whitespace_and_ellipsizes_at_180_characters() {
+        assert_eq!(truncate_display("  a \n b\tc  "), "a b c");
         let long = "x".repeat(400);
-        let result = bounded(&long);
+        let result = truncate_display(&long);
         assert_eq!(result.chars().count(), MAX_ACTION_LENGTH);
         assert!(result.ends_with('\u{2026}'));
     }

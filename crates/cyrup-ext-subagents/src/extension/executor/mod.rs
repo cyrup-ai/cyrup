@@ -26,7 +26,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::background::tracker::JobTracker;
 use crate::extension::executor::notices::ForegroundControlEntry;
-use crate::extension::executor::session_state::ParentModelMemory;
+use crate::extension::executor::session_state::{ParentModelMemory, ParentThinkingMemory};
 use crate::extension::executor::spawn_budget::SpawnBudget;
 use crate::registration::SubagentExtensionConfig;
 
@@ -59,6 +59,15 @@ pub struct SubagentExecutor {
     /// session's watcher is REPLACED on every `SessionStart`, and a bus recreated with it would
     /// hand every already-subscribed waiter a `Closed` receiver.
     completion_bus: crate::background::watch::CompletionBus,
+    /// `ASYNC_NOTIFY_BUG_REPORT` F3.5 — the claim/answer ledger the `wait` tool (and the headless
+    /// auto-drain) share with the completion watcher's delivery decorator
+    /// ([`crate::background::watch::InlineAnsweredSink`]), so a value a live wait already
+    /// surfaced inline is not injected a second time as a standalone notification.
+    ///
+    /// Executor-owned for the same reason `completion_bus` above is: the watcher is REPLACED on
+    /// every `SessionStart`, and a ledger recreated with it would drop the claims of a wait
+    /// already in flight.
+    inline_answers: crate::background::watch::InlineAnswerLedger,
     /// The late-bound live capability backend (P-1, reconciliation §2 item 1). Captured by
     /// [`cyrup_ext::native::NativeExtension::set_host_services`] (which the builder calls via
     /// `load_native_with_services` BEFORE `init`), so a background task / the `SessionStart` handler
@@ -127,6 +136,13 @@ pub struct SubagentExecutor {
     /// to an empty ladder. Read through [`SubagentExecutor::remembered_parent_model`], which owns
     /// the whole state machine; never read directly.
     parent_model_memory: std::sync::Mutex<ParentModelMemory>,
+    /// SCOPE_19/A1 — the thinking twin of [`Self::parent_model_memory`]: the last recognized
+    /// reasoning level the live parent session reported, so a dispatch that lands while
+    /// `HostServices::thinking_level()` momentarily answers `None` still inherits the level the
+    /// session has been reasoning at instead of silently dropping the child to its persona's (or
+    /// to off). Read through [`SubagentExecutor::remembered_parent_thinking`], which owns the whole
+    /// state machine; never read directly.
+    parent_thinking_memory: std::sync::Mutex<ParentThinkingMemory>,
     /// The control-notice debounce/actionability/dedup state machine (pi
     /// `extension/control-notices.ts`: its `pendingForegroundControlNotices` timer map + the
     /// `__piSubagentVisibleControlNotices` global dedup set). Held on the EXECUTOR — not rebuilt
@@ -152,6 +168,12 @@ pub struct SubagentExecutor {
     /// agent reaches each discovery consumer; cleared by [`Self::teardown_session`]
     /// (`clearRuntimeAgentsForPi`, `extension/index.ts:971`).
     runtime_agents: Arc<crate::discovery::runtime_registry::RuntimeAgentRegistry>,
+    /// SCOPE_3d — the session-scoped workflow resource registry (pi's
+    /// `Symbol.for("pi-subagents.workflow-resources.v1")` global, `workflow-resources.ts:45-56`).
+    /// Hung off the executor rather than a `static`/`OnceLock` for the same reason
+    /// `completion_bus` above is executor-owned: a `static` registry cannot be reset between
+    /// sessions, and pi's own store is scoped to the extension host, not the process.
+    workflow_resources: crate::workflows::WorkflowResourceRegistry,
 }
 
 impl Default for SubagentExecutor {
@@ -169,6 +191,7 @@ impl SubagentExecutor {
             completion_sink_override: None,
             completion_watcher: AsyncMutex::new(None),
             completion_bus: crate::background::watch::CompletionBus::new(),
+            inline_answers: crate::background::watch::InlineAnswerLedger::default(),
             host_services: Arc::new(OnceLock::new()),
             root_parent_session: Arc::new(std::sync::Mutex::new(None)),
             root_parent_session_name: Arc::new(std::sync::Mutex::new(None)),
@@ -178,6 +201,7 @@ impl SubagentExecutor {
             foreground_controls: Arc::new(std::sync::Mutex::new(HashMap::new())),
             spawn_budget: std::sync::Mutex::new(SpawnBudget::default()),
             parent_model_memory: std::sync::Mutex::new(ParentModelMemory::default()),
+            parent_thinking_memory: std::sync::Mutex::new(ParentThinkingMemory::default()),
             notices: Arc::new(AsyncMutex::new(
                 crate::tui::notices::ControlNoticeState::new(),
             )),
@@ -185,7 +209,18 @@ impl SubagentExecutor {
             runtime_agents: Arc::new(
                 crate::discovery::runtime_registry::RuntimeAgentRegistry::new(),
             ),
+            workflow_resources: crate::workflows::WorkflowResourceRegistry::new(),
         }
+    }
+
+    /// SCOPE_3d — the session-scoped workflow resource registry this executor owns (see the
+    /// field's doc). Register through it with a live [`crate::identity::SessionId`]; dispose a
+    /// session's registrations at `session_shutdown` via
+    /// [`crate::workflows::WorkflowResourceRegistry::dispose_session`] — issued permits remain
+    /// valid (pi `workflow-resources.ts:58`).
+    #[must_use]
+    pub fn workflow_resources(&self) -> &crate::workflows::WorkflowResourceRegistry {
+        &self.workflow_resources
     }
 
     /// SUBA-084 — pi's public `registerAgent({ pi, name, definition })` (`src/api/agents.ts:2`
@@ -269,6 +304,15 @@ impl SubagentExecutor {
     #[must_use]
     pub fn completion_bus(&self) -> crate::background::watch::CompletionBus {
         self.completion_bus.clone()
+    }
+
+    /// `ASYNC_NOTIFY_BUG_REPORT` F3.5 — a handle on this executor's inline-answer ledger (see the
+    /// field), for the `wait` surfaces that claim/answer runs and for the watcher install that
+    /// wraps the completion sink in [`crate::background::watch::InlineAnsweredSink`]. Cloning
+    /// shares the one underlying state, mirroring [`Self::completion_bus`].
+    #[must_use]
+    pub fn inline_answers(&self) -> crate::background::watch::InlineAnswerLedger {
+        self.inline_answers.clone()
     }
 
     /// Thread the intercom companion's real broker-backed delivery + clarify + steer channels into

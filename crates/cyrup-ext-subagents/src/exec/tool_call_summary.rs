@@ -258,7 +258,7 @@ mod tests {
 
     #[test]
     fn bash_call_truncates_the_short_preview_at_sixty_chars_but_not_the_expanded_one() {
-        let command = "echo ".to_string() + &"x".repeat(300);
+        let command = "echo ".to_string() + "x".repeat(300).as_str();
         let args = serde_json::json!({ "command": command });
         let text = format_tool_call("bash", &args, false);
         let expanded = format_tool_call("bash", &args, true);

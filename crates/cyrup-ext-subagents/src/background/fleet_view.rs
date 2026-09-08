@@ -530,6 +530,21 @@ fn format_async_fleet_lines(runs: &[ActiveRun], now: i64) -> Vec<String> {
 ///
 /// # Errors
 ///
+/// # Session scoping happens in the CALLER, deliberately
+///
+/// This function applies no session filter and must not: it is a pure formatter over inputs its
+/// callers have already scoped. Both do:
+///
+/// * `SubagentExecutor::status` passes `runs` from
+///   [`crate::background::run_status::list_active_runs`] with the current session id, and
+///   `foreground` from the live in-process control registry — entries only ever created by runs
+///   THIS process launched.
+/// * `tui/fleet.rs` filters both its tracked-job and remembered-foreground collections through
+///   `belongs_to_current_session` before rendering.
+///
+/// Recorded because an audit of this change counted `session_id` occurrences per file, found zero
+/// here, and concluded the fleet surface was unscoped. It is not. Adding a filter here would be
+/// redundant at best and, if the two layers ever disagreed, a second source of truth.
 /// Returns pi's child-safe refusal text as `Err` (cyrup surfaces `isError: true` as `Err`).
 pub fn format_fleet(
     foreground: &[ForegroundFleetEntry],

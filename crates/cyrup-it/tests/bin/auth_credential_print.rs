@@ -26,7 +26,7 @@
     clippy::indexing_slicing
 )]
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use tempfile::TempDir;
 
@@ -71,14 +71,12 @@ fn fixture() -> TempDir {
 /// `*_API_KEY` names is not good enough here: the failure this test guards against is the binary
 /// falling through to a real agent session, and `findInitialModel` will happily launch on ANY
 /// provider whose env key happens to be exported on the developer's machine — which would spend
-/// real tokens on a run that is supposed to be inert. Only `HOME`, the agent dir and `PATH` are
-/// reinstated, mirroring the `env -i` + allowlist shape of pi's own `test.sh`.
+/// real tokens on a run that is supposed to be inert. This file's hand-rolled `env_clear` +
+/// `PATH`-only allowlist was the reference the rest of the suite copied; it now goes through the
+/// shared `support::env::hermetic` (same shape, same allowlist discipline, one implementation).
 fn run(tmp: &TempDir, args: &[&str]) -> Run {
-    let out = Command::new(crate::support::bins::cyrup())
+    let out = crate::support::env::hermetic(crate::support::bins::cyrup(), tmp.path())
         .current_dir(tmp.path().join("work"))
-        .env_clear()
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
-        .env("HOME", tmp.path())
         .env("CYRUP_AGENT_DIR", tmp.path().join("agent"))
         .args(args)
         .stdin(Stdio::null())

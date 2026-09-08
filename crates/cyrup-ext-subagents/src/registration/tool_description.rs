@@ -49,7 +49,14 @@
 
 use std::path::PathBuf;
 
-/// pi `SUBAGENT_SAFETY_GUIDANCE` (`src/extension/tool-description.ts:9-15` @v0.34.0), BYTE-IDENTICAL.
+/// pi `SUBAGENT_SAFETY_GUIDANCE` (`src/extension/tool-description.ts:9-15` @v0.34.0).
+///
+/// SCOPE_19/§5.1 [CYRUP-DELTA] — no longer byte-identical: upstream's first bullet is *"Use
+/// { action: \"list\" } before execution and only run executable/non-disabled agents or chains."*,
+/// which mandates a discovery round trip before every execution to learn six builtins that ship
+/// compiled in and cannot change. The bullet keeps its safety half (only run executable/
+/// non-disabled) and scopes the `list` call to what it can actually reveal. Every other line is
+/// upstream's, and the appender contract below is unchanged.
 ///
 /// This is the block [`with_mandatory_safety_guidance`] guarantees survives a custom description:
 /// a deployment may replace every other word the orchestrator reads about delegation, but not
@@ -66,7 +73,7 @@ use std::path::PathBuf;
 /// from (`FULL_SUBAGENT_TOOL_DESCRIPTION`, `tool-description.ts:17-66` @v0.34.0), so the two
 /// constants come from ONE upstream revision rather than two.
 pub const SUBAGENT_SAFETY_GUIDANCE: &str = r#"SAFETY-CRITICAL SUBAGENT GUIDANCE:
-• Use { action: "list" } before execution and only run executable/non-disabled agents or chains.
+• Run only executable/non-disabled agents or chains; builtins (delegate, oracle, researcher, reviewer, scout, worker) are always executable — use { action: "list" } to check anything else.
 • Keep execution and management separate: omit action for SINGLE/PARALLEL/CHAIN execution; use action only for list/get/models/create/update/delete/status/interrupt/resume/append-step/doctor.
 • Async/background runs: launch with async:true only when work can proceed independently. Do not sleep or poll status just to wait; if this turn must block, use the wait tool. Otherwise continue useful work or respond and let completion notifications arrive.
 • Child-safety boundary: ordinary child subagents are not orchestrators and must not run subagents. Only explicitly configured fanout children may use the child-safe subagent tool, still bounded by depth/session limits.
@@ -74,7 +81,13 @@ pub const SUBAGENT_SAFETY_GUIDANCE: &str = r#"SAFETY-CRITICAL SUBAGENT GUIDANCE:
 • Artifacts/status essentials: chain outputs live under {chain_dir}; async runs expose asyncId/asyncDir with status.json, events.jsonl, output logs, and status via { action: "status", id }. Include output paths and residual risks when reporting results."#;
 
 /// pi `COMPACT_SUBAGENT_TOOL_DESCRIPTION` (`src/extension/tool-description.ts:68-88` @v0.34.0),
-/// verbatim except for ONE deleted line.
+/// verbatim except for ONE deleted line and ONE reworded bullet.
+///
+/// SCOPE_19/§5.1 [CYRUP-DELTA] — the reworded bullet: upstream's first EXECUTE line mandates a
+/// `list` call before every execution. The six builtins are compiled in and cannot change at
+/// runtime, so the bullet now names them and scopes `list` to project/user agents, chains, and
+/// disabled state — the same divergence, for the same reason, as `SUBAGENT_TOOL_DESCRIPTION`'s
+/// first bullet and `SUBAGENT_SAFETY_GUIDANCE`'s first bullet.
 ///
 /// `[CYRUP-DELTA]` — upstream `COMPACT_SUBAGENT_TOOL_DESCRIPTION` (`tool-description.ts:80`
 /// @v0.34.0) carries the bullet *"• Opt-in schedule actions: schedule, schedule-list,
@@ -95,7 +108,7 @@ pub const SUBAGENT_SAFETY_GUIDANCE: &str = r#"SAFETY-CRITICAL SUBAGENT GUIDANCE:
 pub const COMPACT_SUBAGENT_TOOL_DESCRIPTION: &str = r#"Delegate to subagents or manage definitions. Use exactly one mode per call.
 
 EXECUTE:
-• Before execution, call { action: "list" }; run only executable/non-disabled configured agents/chains.
+• Builtins always available: delegate, oracle, researcher, reviewer, scout, worker. Call { action: "list" } for project/user agents, chains, or disabled state; run only executable/non-disabled ones.
 • SINGLE {agent, task?}; PARALLEL {tasks:[{agent,task,count?,output?,reads?,progress?}], concurrency?, worktree?}; CHAIN {chain:[{agent,task?},{parallel:[...]}]}.
 • context can be "fresh" or "fork"; omitted uses each agent defaultContext, otherwise fresh. timeoutMs/maxRuntimeMs apply to foreground and async/background runs.
 • Chain templates may use {task}, {previous}, {chain_dir}, and named outputs. Parallel worktree isolation requires a clean git repo.
@@ -741,6 +754,11 @@ mod tests {
 
     /// The safety guidance is a PINNED constant: it is what every custom description is forced to
     /// carry, so an edit to it is a change to what every orchestrator is told it may do.
+    ///
+    /// SCOPE_19/§5.1: the pinned length moved (1333 → 1427) with the first bullet's rewording —
+    /// see the constant's `[CYRUP-DELTA]`. The pin's job is unchanged: any FURTHER edit must be a
+    /// deliberate, recorded act, and the builtins assertion below keeps the reworded bullet
+    /// honest.
     #[test]
     fn the_safety_guidance_is_pinned_to_pis_v0_34_0_text() {
         assert!(SUBAGENT_SAFETY_GUIDANCE.starts_with("SAFETY-CRITICAL SUBAGENT GUIDANCE:\n"));
@@ -751,8 +769,17 @@ mod tests {
         );
         assert_eq!(
             SUBAGENT_SAFETY_GUIDANCE.len(),
-            1333,
+            1427,
             "byte length is pinned"
+        );
+        assert!(
+            SUBAGENT_SAFETY_GUIDANCE
+                .contains("builtins (delegate, oracle, researcher, reviewer, scout, worker)"),
+            "the reworded first bullet names the six compiled-in builtins"
+        );
+        assert!(
+            !SUBAGENT_SAFETY_GUIDANCE.contains("before execution"),
+            "the guidance no longer mandates a discovery call before every execution (SCOPE_19)"
         );
         assert!(
             SUBAGENT_SAFETY_GUIDANCE.contains(

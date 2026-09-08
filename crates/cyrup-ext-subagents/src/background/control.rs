@@ -158,7 +158,9 @@ pub fn resolve_run_paths(
     let run_id = RunId::from_token(run_id_token);
     let paths = RunPaths::for_run(async_root, results_dir, &run_id);
     validate_contains_root(async_root, &paths.run_dir)?;
-    validate_contains_root(results_dir, &paths.result)?;
+    // The legacy root path is the one addressable by run id alone; the owned/staged locations are
+    // built from an `IndexSegment`, which cannot escape the results dir by construction.
+    validate_contains_root(results_dir, &paths.legacy_result_root)?;
     Ok(paths)
 }
 
@@ -182,8 +184,27 @@ pub fn resolve_run_paths(
 ///
 /// Returns [`SubagentError::Spawn`] (wrapping the underlying I/O error) if `status.json` exists
 /// but cannot be read or parsed, and no [`ResultFile`] exists to fall back on.
+/// Read a run's terminal [`ResultFile`], wherever it actually lives.
+///
+/// A payload is addressed by `(session, run)` once promoted, so the run id alone is not enough to
+/// find it. The status file records the owning session, which is why this reads status first and
+/// falls back to the legacy root path for runs whose status predates that field or is unreadable.
+///
+/// # Errors
+///
+/// As [`read_result_file`].
+async fn read_run_result(paths: &RunPaths) -> Result<Option<ResultFile>, SubagentError> {
+    if let Ok(Some(status)) = read_status_file(&paths.status).await
+        && let Some(session_id) = status.session_id.as_ref()
+        && let Some(path) = paths.resolve_result(session_id, &status.run_id).await
+    {
+        return read_result_file(&path).await;
+    }
+    read_result_file(&paths.legacy_result_root).await
+}
+
 pub async fn reconcile_before_control_op(paths: &RunPaths) -> Result<RunStatus, SubagentError> {
-    if let Some(result) = read_result_file(&paths.result).await? {
+    if let Some(result) = read_run_result(paths).await? {
         let mut status = read_status_file(&paths.status)
             .await?
             .unwrap_or_else(|| RunStatus::queued(result.run_id.clone(), result.mode, None));
@@ -248,6 +269,9 @@ fn terminal_status_from_result(result: &ResultFile, pid: Option<u32>) -> RunStat
         // reader (`fleet::collect_fleet_history`) will then treat this repaired run as belonging to
         // no session, exactly as pi's `status.sessionId === undefined` does.
         session_id: None,
+        // Likewise for the launching PROCESS: a repaired status cannot know which orchestrator
+        // owned the run, and guessing would let this instance claim another's completion.
+        completion_owner_id: None,
         mode: result.mode,
         state: result.state,
         pid,
@@ -359,6 +383,12 @@ pub enum InterruptOutcome {
     /// a second interrupt racing a first one's consumption is exactly the idempotency case
     /// R-SA-083 requires to be silently absorbed rather than treated as a protocol violation).
     NotRunning,
+    /// S4 — the run belongs to a DIFFERENT session, so this instance may not interrupt it.
+    ///
+    /// Same gate and same PERMISSIVE class as [`StopOutcome::NotInActiveSession`]; pi applies it
+    /// to every async control action (`async-stop-action.ts:34`,
+    /// `async-steering-action.ts:48`).
+    NotInActiveSession,
 }
 
 /// Delivers an interrupt request against the run identified by `run_id_token` (R-SA-079/081).
@@ -392,9 +422,18 @@ pub async fn interrupt(
     run_id_token: &str,
     source: impl Into<String>,
     reason: Option<String>,
+    current_session: Option<&crate::identity::SessionId>,
 ) -> Result<InterruptOutcome, SubagentError> {
     let paths = resolve_run_paths(async_root, results_dir, run_id_token)?;
     let status = reconcile_before_control_op(&paths).await?;
+
+    // S4 — before the state guard and before any request is written, so a refused interrupt
+    // leaves no trace in another session's control inbox.
+    if !crate::background::delivery::SessionGate::Permissive
+        .admits(current_session, status.session_id.as_ref())
+    {
+        return Ok(InterruptOutcome::NotInActiveSession);
+    }
 
     if status.state != RunState::Running {
         return Ok(InterruptOutcome::NotRunning);
@@ -809,10 +848,31 @@ pub enum StopOutcome {
         /// The child's step state, rendered with `run_status::step_state_label`.
         state: StepState,
     },
+    /// S4 — the run belongs to a DIFFERENT session, so this instance may not stop it.
+    ///
+    /// pi `async-stop-action.ts:34`:
+    /// `if (state.currentSessionId && status?.sessionId !== state.currentSessionId)`, whose message
+    /// is `"Async run '{id}' was not found in the active session."` with `isError: true`.
+    ///
+    /// PERMISSIVE ([`crate::background::delivery::SessionGate::Permissive`]): a host with no
+    /// session identity of its own still controls its runs. Distinct from [`Self::NotStoppable`]
+    /// because the run may be perfectly stoppable — just not by us.
+    NotInActiveSession,
 }
 
 /// Delivers a stop request against the run identified by `run_id_token` (G77 / SUBA-087; pi
 /// `stopAsyncRun`, `runs/foreground/async-stop-action.ts:24-86` @v0.64.0).
+///
+/// # The range claim above is now true; it was not
+///
+/// This doc declared the `:24-86` span while the port carried `:41` (cited three times), `:47`,
+/// `:48-68` and `:75` — and silently omitted `:34`, the session gate, seven lines above the state
+/// guard. Because `async_root` is per-cwd, that single missing branch let any cyrup instance stop
+/// any other instance's run given only its id, which every listing hands out. The gate is now
+/// applied below, before the state guard and before any request is written.
+///
+/// A range claim in a doc comment is a testable assertion. If you widen one, port every branch
+/// inside it or narrow the claim.
 ///
 /// Runs the same R-SA-079 reconciliation gate every other control op runs (upstream's own first act
 /// is `reconcileAsyncRun(target.asyncDir, { kill }).status`, `:33`), then applies upstream's
@@ -839,6 +899,7 @@ pub async fn stop(
     source: impl Into<String>,
     reason: Option<String>,
     child_id: Option<&str>,
+    current_session: Option<&crate::identity::SessionId>,
 ) -> Result<StopOutcome, SubagentError> {
     let paths = resolve_run_paths(async_root, results_dir, run_id_token)?;
     let status = match reconcile_before_control_op(&paths).await {
@@ -853,6 +914,19 @@ pub async fn stop(
         }
         Err(err) => return Err(err),
     };
+
+    // S4 — pi `async-stop-action.ts:34`, the gate that sits SEVEN LINES ABOVE the state guard
+    // ported just below and was the one line in `stopAsyncRun` never carried over. `async_root` is
+    // per-cwd (`background/artifact_roots.rs:281-284`), so without it any instance can stop any
+    // other instance's run given only its id — an id every listing hands out.
+    //
+    // Ordered BEFORE the state guard, matching upstream, and before ANY request is written: a
+    // refused stop must leave zero filesystem trace in another session's run directory.
+    if !crate::background::delivery::SessionGate::Permissive
+        .admits(current_session, status.session_id.as_ref())
+    {
+        return Ok(StopOutcome::NotInActiveSession);
+    }
 
     if !matches!(status.state, RunState::Running | RunState::Queued) {
         return Ok(StopOutcome::NotStoppable);
@@ -2709,7 +2783,7 @@ pub async fn poll_root_attachment(
     target_paths: &RunPaths,
     terminal_first_observed_at: Option<i64>,
 ) -> Result<(AttachmentPoll, Option<i64>), SubagentError> {
-    if let Some(result) = read_result_file(&target_paths.result).await? {
+    if let Some(result) = read_run_result(target_paths).await? {
         return Ok((AttachmentPoll::Ready(result), terminal_first_observed_at));
     }
 
@@ -2763,6 +2837,11 @@ pub struct ImportedAsyncRootResult {
     pub attempted_models: Vec<ModelId>,
     /// The target child's validated structured output, if any.
     pub structured_output: Option<serde_json::Value>,
+    /// Whether the imported run's targeted child ended on a context overflow — pi
+    /// `contextOverflow: imported.contextOverflow` (`subagent-runner.ts:767`). Read straight off
+    /// the target's own terminal `ResultFile` child, so an attached async root reports the same
+    /// terminal classification to the importing chain that it reported to its own caller.
+    pub context_overflow: bool,
 }
 
 /// Poll `target_paths` at `poll_interval` until the attached async root goes terminal, then return
@@ -2937,6 +3016,7 @@ fn build_imported_result(
             .map(|c| c.attempted_models.clone())
             .unwrap_or_default(),
         structured_output: child.and_then(|c| c.structured_output.clone()),
+        context_overflow: child.is_some_and(|c| c.context_overflow),
     }
 }
 
@@ -2958,8 +3038,8 @@ fn output_from_terminal_status(
         .unwrap_or_else(|| fallback_agent.to_string());
     let message = step.and_then(|s| s.error.clone()).unwrap_or_else(|| {
         format!(
-            "Attached async root {run_id} ended without a result file at {}.",
-            target_paths.result.display()
+            "Attached async root {run_id} ended without a result file under {}.",
+            target_paths.results_dir.display()
         )
     });
     ImportedAsyncRootResult {
@@ -2972,6 +3052,9 @@ fn output_from_terminal_status(
         model: None,
         attempted_models: Vec::new(),
         structured_output: None,
+        // There is no result file to read — the whole premise of this path — so there is no
+        // terminal overflow classification to import.
+        context_overflow: false,
     }
 }
 
@@ -3254,6 +3337,123 @@ mod tests {
     /// `stop` writes a real request file under `control/stop-requests/` for a `Running` run, and
     /// `consume_stop_request` reads-then-deletes it exactly once (pi `requestAsyncStop` /
     /// `consumeStopRequestPayload`, `runs/background/control-channel.ts:297-310,615-620` @v0.64.0).
+    /// S4 — the gate pi applies at `async-stop-action.ts:34`, which cyrup's port of that same
+    /// function (`control.rs`'s `:24-86` range claim) previously omitted while porting `:41`,
+    /// `:47`, `:48-68` and `:75`.
+    ///
+    /// `async_root` is per-cwd, so every concurrent instance can address every other instance's
+    /// runs by id — and every listing hands those ids out.
+    #[tokio::test]
+    async fn stop_refuses_a_run_owned_by_another_session_and_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let async_root = dir.path().join("async");
+        let results_dir = dir.path().join("results");
+        let run_id = RunId::from_token("foreignstop1");
+        let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
+        tokio::fs::create_dir_all(&paths.run_dir).await.expect("mkdir");
+
+        let mut status = RunStatus::queued(run_id.clone(), RunMode::Single, Some(std::process::id()));
+        status.state = RunState::Running;
+        status.session_id = crate::identity::SessionId::parse("session-OWNER");
+        write_atomic_json(&paths.status, &status).await.expect("write status");
+
+        let intruder = crate::identity::SessionId::parse("session-INTRUDER");
+        let outcome = stop(
+            &async_root,
+            &results_dir,
+            run_id.as_str(),
+            "stop-action",
+            None,
+            None,
+            intruder.as_ref(),
+        )
+        .await
+        .expect("stop resolves");
+
+        assert_eq!(outcome, StopOutcome::NotInActiveSession);
+        assert!(
+            !has_pending_stop_request(&paths.run_dir).await,
+            "a refused stop must leave ZERO filesystem trace in another session's run directory"
+        );
+
+        // ...and the owner can still stop it.
+        let owner = crate::identity::SessionId::parse("session-OWNER");
+        let outcome = stop(
+            &async_root,
+            &results_dir,
+            run_id.as_str(),
+            "stop-action",
+            None,
+            None,
+            owner.as_ref(),
+        )
+        .await
+        .expect("stop resolves");
+        assert_eq!(outcome, StopOutcome::Requested);
+        assert!(has_pending_stop_request(&paths.run_dir).await);
+    }
+
+    /// The PERMISSIVE half of the class (pi `state.currentSessionId && ...`): a headless host has
+    /// no session identity and must still be able to control its own runs. A strict-ified gate
+    /// would lock SDK embedders out entirely.
+    #[tokio::test]
+    async fn stop_still_works_for_a_host_with_no_session_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let async_root = dir.path().join("async");
+        let results_dir = dir.path().join("results");
+        let run_id = RunId::from_token("headlessstop");
+        let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
+        tokio::fs::create_dir_all(&paths.run_dir).await.expect("mkdir");
+
+        let mut status = RunStatus::queued(run_id.clone(), RunMode::Single, Some(std::process::id()));
+        status.state = RunState::Running;
+        status.session_id = crate::identity::SessionId::parse("session-ANY");
+        write_atomic_json(&paths.status, &status).await.expect("write status");
+
+        let outcome = stop(&async_root, &results_dir, run_id.as_str(), "stop-action", None, None, None)
+            .await
+            .expect("stop resolves");
+        assert_eq!(
+            outcome,
+            StopOutcome::Requested,
+            "a host with no session must not be locked out of control"
+        );
+    }
+
+    /// The same gate on `interrupt`, and the same zero-trace requirement.
+    #[tokio::test]
+    async fn interrupt_refuses_a_run_owned_by_another_session_and_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let async_root = dir.path().join("async");
+        let results_dir = dir.path().join("results");
+        let run_id = RunId::from_token("foreignintr1");
+        let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
+        tokio::fs::create_dir_all(&paths.run_dir).await.expect("mkdir");
+
+        let mut status = RunStatus::queued(run_id.clone(), RunMode::Single, Some(std::process::id()));
+        status.state = RunState::Running;
+        status.session_id = crate::identity::SessionId::parse("session-OWNER");
+        write_atomic_json(&paths.status, &status).await.expect("write status");
+
+        let intruder = crate::identity::SessionId::parse("session-INTRUDER");
+        let outcome = interrupt(
+            &async_root,
+            &results_dir,
+            run_id.as_str(),
+            "interrupt-action",
+            None,
+            intruder.as_ref(),
+        )
+        .await
+        .expect("interrupt resolves");
+
+        assert_eq!(outcome, InterruptOutcome::NotInActiveSession);
+        assert!(
+            !tokio::fs::try_exists(&paths.control_inbox).await.expect("check"),
+            "a refused interrupt must not write into another session's control inbox"
+        );
+    }
+
     #[tokio::test]
     async fn stop_writes_a_real_stop_request_that_is_consumed_exactly_once() {
         let (_dir, async_root, results_dir) = temp_roots();
@@ -3262,14 +3462,7 @@ mod tests {
         write_running_status(&paths, &run_id, RunMode::Single, Some(4242), Vec::new()).await;
 
         assert_eq!(
-            stop(
-                &async_root,
-                &results_dir,
-                run_id.as_str(),
-                "stop-action",
-                None,
-                None
-            )
+            stop(&async_root, &results_dir, run_id.as_str(), "stop-action", None, None, None)
             .await
             .expect("stop resolves"),
             StopOutcome::Requested
@@ -3495,14 +3688,7 @@ mod tests {
 
         // Unknown child → the resolver's not-found sentence, nothing written.
         assert_eq!(
-            stop(
-                &async_root,
-                &results_dir,
-                run_id.as_str(),
-                "stop-action",
-                None,
-                Some("step:9")
-            )
+            stop(&async_root, &results_dir, run_id.as_str(), "stop-action", None, Some("step:9"), None)
             .await
             .expect("stop resolves"),
             StopOutcome::ChildUnresolved(
@@ -3511,14 +3697,7 @@ mod tests {
         );
         // Completed child → not stoppable, with the facts the refusal is rendered from.
         assert_eq!(
-            stop(
-                &async_root,
-                &results_dir,
-                run_id.as_str(),
-                "stop-action",
-                None,
-                Some("step:0")
-            )
+            stop(&async_root, &results_dir, run_id.as_str(), "stop-action", None, Some("step:0"), None)
             .await
             .expect("stop resolves"),
             StopOutcome::ChildNotStoppable {
@@ -3530,14 +3709,7 @@ mod tests {
 
         // Running child → a targeted request lands, carrying index + resolved id.
         assert_eq!(
-            stop(
-                &async_root,
-                &results_dir,
-                run_id.as_str(),
-                "stop-action",
-                None,
-                Some("step:1")
-            )
+            stop(&async_root, &results_dir, run_id.as_str(), "stop-action", None, Some("step:1"), None)
             .await
             .expect("stop resolves"),
             StopOutcome::ChildRequested {
@@ -3546,14 +3718,7 @@ mod tests {
         );
         // Pending child → likewise stoppable (pi `isStoppableAsyncStatusStep`).
         assert!(matches!(
-            stop(
-                &async_root,
-                &results_dir,
-                run_id.as_str(),
-                "stop-action",
-                None,
-                Some("step:2")
-            )
+            stop(&async_root, &results_dir, run_id.as_str(), "stop-action", None, Some("step:2"), None)
             .await
             .expect("stop resolves"),
             StopOutcome::ChildRequested { .. }
@@ -3601,14 +3766,7 @@ mod tests {
         .await
         .expect("write status");
         assert_eq!(
-            stop(
-                &async_root,
-                &results_dir,
-                queued_id.as_str(),
-                "stop-action",
-                None,
-                None
-            )
+            stop(&async_root, &results_dir, queued_id.as_str(), "stop-action", None, None, None)
             .await
             .expect("stop resolves"),
             StopOutcome::Requested
@@ -3632,14 +3790,7 @@ mod tests {
             .await
             .expect("write");
         assert_eq!(
-            stop(
-                &async_root,
-                &results_dir,
-                paused_id.as_str(),
-                "stop-action",
-                None,
-                None
-            )
+            stop(&async_root, &results_dir, paused_id.as_str(), "stop-action", None, None, None)
             .await
             .expect("stop resolves"),
             StopOutcome::NotStoppable
@@ -3705,6 +3856,8 @@ mod tests {
                 success: false,
                 cwd: PathBuf::from("/tmp"),
                 session_file: None,
+                session_id: None,
+                completion_owner_id: None,
                 results: vec![child],
             }
         }
@@ -3715,19 +3868,27 @@ mod tests {
                 turn_budget: None,
                 turn_budget_exceeded: false,
                 wrap_up_requested: false,
+                child_run_id: None,
                 agent: "worker".to_string(),
                 task: String::new(),
                 exit_code,
                 usage: cyrup_core::Usage::default(),
+                turns: 0,
                 model: None,
                 attempted_models: Vec::new(),
                 model_attempts: Vec::new(),
                 final_output: None,
                 structured_output: None,
+                session_file: None,
+                output_state: Default::default(),
+                structured_output_path: None,
+                artifact_paths: None,
                 acceptance: None,
                 detached: false,
                 interrupted: false,
                 timed_out: false,
+                timeout_recovery: None,
+                context_overflow: false,
                 stopped,
                 process_signal: None,
                 error: None,
@@ -3807,7 +3968,7 @@ mod tests {
         let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
         write_running_status(&paths, &run_id, RunMode::Single, None, vec![]).await;
 
-        let outcome = interrupt(&async_root, &results_dir, "run00001", "user", None)
+        let outcome = interrupt(&async_root, &results_dir, "run00001", "user", None, None)
             .await
             .expect("interrupt succeeds");
 
@@ -3827,7 +3988,7 @@ mod tests {
         let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
         write_running_status(&paths, &run_id, RunMode::Single, None, vec![]).await;
 
-        let first = interrupt(&async_root, &results_dir, "run00002", "user", None)
+        let first = interrupt(&async_root, &results_dir, "run00002", "user", None, None)
             .await
             .expect("first interrupt succeeds");
         assert_eq!(first, InterruptOutcome::Delivered);
@@ -3838,7 +3999,7 @@ mod tests {
 
         // A second, near-simultaneous interrupt call against the SAME still-pending request must
         // be a silent no-op, not an error, and must not clobber the original request's contents.
-        let second = interrupt(&async_root, &results_dir, "run00002", "user", None)
+        let second = interrupt(&async_root, &results_dir, "run00002", "user", None, None)
             .await
             .expect("second interrupt does not error");
         assert_eq!(
@@ -3869,7 +4030,7 @@ mod tests {
             .await
             .expect("write paused status");
 
-        let outcome = interrupt(&async_root, &results_dir, "run00003", "user", None)
+        let outcome = interrupt(&async_root, &results_dir, "run00003", "user", None, None)
             .await
             .expect("interrupt on a paused run does not error");
 
@@ -3899,7 +4060,7 @@ mod tests {
             .await
             .expect("write complete status");
 
-        let outcome = interrupt(&async_root, &results_dir, "run00004", "user", None)
+        let outcome = interrupt(&async_root, &results_dir, "run00004", "user", None, None)
             .await
             .expect("interrupt on a terminal run does not error");
         assert_eq!(outcome, InterruptOutcome::NotRunning);
@@ -4420,9 +4581,11 @@ mod tests {
             success: true,
             cwd: PathBuf::from("/tmp"),
             session_file: None,
+            session_id: None,
+            completion_owner_id: None,
             results: Vec::new(),
         };
-        write_atomic_json(&paths.result, &result)
+        write_atomic_json(&paths.legacy_result_root, &result)
             .await
             .expect("write result file");
 
@@ -4490,9 +4653,11 @@ mod tests {
             success: true,
             cwd: PathBuf::from("/tmp"),
             session_file: None,
+            session_id: None,
+            completion_owner_id: None,
             results: Vec::new(),
         };
-        write_atomic_json(&paths.result, &result)
+        write_atomic_json(&paths.legacy_result_root, &result)
             .await
             .expect("write result");
 
@@ -4580,19 +4745,27 @@ mod tests {
             turn_budget: None,
             turn_budget_exceeded: false,
             wrap_up_requested: false,
+            child_run_id: None,
             agent: agent.to_string(),
             task: String::new(),
             exit_code,
             usage: cyrup_core::Usage::default(),
+            turns: 0,
             model: None,
             attempted_models: Vec::new(),
             model_attempts: Vec::new(),
             final_output: output.map(str::to_string),
             structured_output: None,
+            session_file: None,
+            output_state: Default::default(),
+            structured_output_path: None,
+            artifact_paths: None,
             acceptance: None,
             detached: false,
             interrupted: false,
             timed_out: false,
+            timeout_recovery: None,
+            context_overflow: false,
             stopped: false,
             process_signal: None,
             error: error.map(str::to_string),
@@ -4622,6 +4795,8 @@ mod tests {
             success,
             cwd: PathBuf::from("/tmp"),
             session_file,
+            session_id: None,
+            completion_owner_id: None,
             results: children,
         }
     }
@@ -4653,7 +4828,7 @@ mod tests {
             Some(session_file.clone()),
             vec![imported_child("worker", Some("root output"), 0, None)],
         );
-        write_atomic_json(&paths.result, &result)
+        write_atomic_json(&paths.legacy_result_root, &result)
             .await
             .expect("write result");
 
@@ -4689,7 +4864,7 @@ mod tests {
 
         // Write the terminal result only after the loop has already begun polling a still-running
         // target — proving the loop keeps polling and picks up the late result file.
-        let result_path = paths.result.clone();
+        let result_path = paths.legacy_result_root.clone();
         let late_run_id = run_id.clone();
         let writer = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(30)).await;
@@ -4749,7 +4924,7 @@ mod tests {
                 Some("root failed"),
             )],
         );
-        write_atomic_json(&paths.result, &result)
+        write_atomic_json(&paths.legacy_result_root, &result)
             .await
             .expect("write result");
 

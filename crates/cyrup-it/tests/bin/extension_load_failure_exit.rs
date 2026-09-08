@@ -29,7 +29,7 @@
 )]
 
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use tempfile::TempDir;
 
@@ -61,25 +61,14 @@ fn run(plant: bool, mode: &[&str]) -> (Run, TempDir) {
         plant_broken_extension(&agent_dir);
     }
 
-    let mut cmd = Command::new(crate::support::bins::cyrup());
+    // Hermetic by construction (`env_clear` + allowlist): the extension set under test is the one
+    // this fixture PLANTS, so no ambient built-in opt-in may join it (an ambient
+    // `CYRUP_INTERCOM=1` once detached 13 immortal `__intercom-broker`s per run), and no ambient
+    // credential, proxy or `CYRUP_HOME` redirect can reach the child. Incident log in
+    // `support/env.rs`; enforced by the `every_cyrup_spawn_site_is_hermetic` lint.
+    let mut cmd = crate::support::env::hermetic(crate::support::bins::cyrup(), tmp.path());
     cmd.current_dir(&work)
-        .env("HOME", tmp.path())
         .env("CYRUP_AGENT_DIR", &agent_dir)
-        .env_remove("ANTHROPIC_API_KEY")
-        .env_remove("OPENAI_API_KEY")
-        .env_remove("HTTP_PROXY")
-        .env_remove("HTTPS_PROXY")
-        // The extension set under test is the one this fixture PLANTS, so no ambient built-in
-        // opt-in may join it. `CYRUP_INTERCOM=1` alone satisfies `is_installed()`
-        // (`cyrup-intercom/src/extension.rs:630-631`, env var name at `:87`) despite the tempdir
-        // agent dir holding no `intercom/config.json`, and the attached companion detaches an
-        // immortal `__intercom-broker` — its shutdown check is armed only by a REGISTERED session's
-        // disconnect (1:1 with pi-intercom `broker/broker.ts:221`/`:429`), which a one-shot child
-        // never reaches. Measured: this crate's four binary-seam targets left 13 such processes per
-        // run, 0 under `env -u CYRUP_INTERCOM`.
-        .env_remove("CYRUP_INTERCOM")
-        .env_remove("CYRUP_SUBAGENTS")
-        .env_remove("CYRUP_PERMISSION_SYSTEM")
         .args(["--offline", "--no-session", "--model", "faux/faux-1"])
         .args(mode)
         .stdin(Stdio::null());

@@ -77,7 +77,10 @@ use cyrup_tools::ProcOps;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::event::AgentSessionEvent;
-use crate::host_services::InjectMessage;
+use crate::host_services::InjectRequest;
+use cyrup_ext::host::InjectOutcome;
+use inject::merge_injection_batch;
+use run::InjectionOffer;
 use crate::provider_swap::ProviderSwap;
 use crate::services::AgentSessionServices;
 use crate::subscriber::Fanout;
@@ -416,36 +419,23 @@ impl AgentSession {
         let handle = self.handle.clone();
         let arc = Arc::new(self);
         let _ = handle.weak.set(Arc::downgrade(&arc));
-        // Bind the late-bound message-injection sink (R-SA-101 / P-2): a background task calling
-        // `LiveHostServices::inject_message` (e.g. cyrup-ext-subagents' completion sink, or a native
-        // extension holding the P-1 host-services Arc) reaches THIS live session's turn loop. The sink
-        // upgrades a weak self-handle and spawns the async inject/turn on the captured runtime, so the
-        // SYNC caller never blocks for the whole turn. Bound only on a shared session — a by-value
-        // session has no post-run driver to run the turn anyway. If `into_shared` runs outside a tokio
-        // runtime (some by-value tests), the captured handle is `None` and the sink degrades to an
-        // `Err` rather than panicking (workspace denies `panic`).
-        let weak = Arc::downgrade(&arc);
-        let runtime = tokio::runtime::Handle::try_current().ok();
-        arc.services
-            .host_services
-            .set_inject_sink(Arc::new(move |msg: InjectMessage| {
-                let session = weak.upgrade().ok_or("inject_message: session dropped")?;
-                let runtime = runtime
-                    .clone()
-                    .ok_or("inject_message: no runtime to inject on")?;
-                runtime.spawn(async move {
-                    let _ = session
-                        .inject_message(
-                            msg.content,
-                            msg.custom_type,
-                            msg.display,
-                            msg.details,
-                            msg.trigger_turn,
-                        )
-                        .await;
-                });
-                Ok(())
-            }));
+        // Bind the message-injection seam (R-SA-101 / P-2): a background task calling
+        // `LiveHostServices::inject_message`/`inject_message_ack` (e.g. cyrup-ext-subagents'
+        // completion sink, or a native extension holding the P-1 host-services Arc) reaches THIS
+        // live session's turn loop. Bound only on a shared session — a by-value session has no
+        // post-run driver to run the turn anyway. If `into_shared` runs outside a tokio runtime
+        // (some by-value tests), no pump is spawned and the seam stays unbound, so injection
+        // reports itself unavailable rather than panicking (workspace denies `panic`).
+        //
+        // The sender is handed over ONLY when a consumer exists to drain it: binding a queue with
+        // no pump would accept messages that nothing could ever deliver, which is precisely the
+        // "acknowledged but lost" failure this seam was rebuilt to remove.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<InjectRequest>();
+            let weak = Arc::downgrade(&arc);
+            runtime.spawn(drive_injections(weak, rx));
+            arc.services.host_services.set_inject_sink(tx);
+        }
         // EXT-005: give the capability backend a LIVE readback of run activity + a real interrupt,
         // so a guest's `ctx.isIdle()`/`ctx.hasPendingMessages()` answer from this session and its
         // `ctx.abort()` stops the run that is in flight (Pi binds all three straight to the session,
@@ -612,6 +602,86 @@ impl AgentSession {
 impl Drop for AgentSession {
     fn drop(&mut self) {
         self.services.ext_host.invalidate_live(None);
+    }
+}
+
+/// The session's ONE injection consumer, and the owner of the pending inbox.
+///
+/// # Single-consumer is the correctness property, not an optimisation
+///
+/// Every injected message reaches the agent through this task and no other, so two background
+/// completions can never race each other for the run latch. The seam this replaced spawned an
+/// independent task per injection, and those tasks fought over `Agent::prompt`'s CAS: exactly one
+/// won and the losers were warn-logged away with their payloads already deleted.
+///
+/// # Holding the inbox is what makes "not yet" a schedule instead of an error
+///
+/// A message the agent cannot take right now stays here, owned, and is offered again on the next
+/// idle edge. Because nothing hands it to a queue that may never be drained (a steer landing past
+/// the run loop's last `poll_steering`/`poll_follow_up` strands with the session idle), there is
+/// no instant at which a message is nobody's responsibility — which is what lets the ack mean
+/// something.
+async fn drive_injections(
+    session: Weak<AgentSession>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<InjectRequest>,
+) {
+    let mut inbox: Vec<InjectRequest> = Vec::new();
+    loop {
+        if inbox.is_empty() {
+            match rx.recv().await {
+                Some(req) => inbox.push(req),
+                // Every producer is gone (the host services backend dropped): nothing more can
+                // ever arrive, and the inbox is empty, so there is nothing to answer for.
+                None => return,
+            }
+        }
+        // Coalesce ONLY what is already queued — never wait to batch, so a lone completion pays no
+        // added latency. pi batches too: `sendCompletion` takes an ARRAY of completion details and
+        // ORs their `triggerTurn` (`notify.ts:399-412` @v0.64.0), so one turn carrying three
+        // notifications is upstream's own shape — and it is what lets an orchestrator answer about
+        // a whole fan-out in a single turn instead of three sequential ones.
+        while let Ok(next) = rx.try_recv() {
+            inbox.push(next);
+        }
+        let Some(session) = session.upgrade() else {
+            for req in inbox.drain(..) {
+                req.ack.answer(InjectOutcome::SessionUnavailable);
+            }
+            return;
+        };
+        // A real await on the session's two idle latches (`driver_tx` is a `watch`, and the agent
+        // has its own run latch) — not a poll, and not a check-then-act. Returns immediately when
+        // the session is already idle.
+        session.wait_for_idle().await;
+        let plan = merge_injection_batch(&inbox);
+        // Exhaustive on purpose, with NO catch-all arm: the three outcomes demand three different
+        // responses, and folding the last two together (as "any error means try again") turns a
+        // permanent fault into an unbounded spin that delivers nothing and answers nobody.
+        match session.deliver_injection_inbox(plan).await {
+            Ok(InjectionOffer::Taken) => {
+                // In the transcript (or persisted on the no-turn path): the producers may release
+                // their copies.
+                for req in inbox.drain(..) {
+                    req.ack.answer(InjectOutcome::Accepted);
+                }
+            }
+            // A user prompt claimed the latch in the gap after `wait_for_idle` returned. Not a
+            // failure, and reported to nobody: the inbox still holds every message and the
+            // `wait_for_idle` at the top of the next iteration parks this task until that run
+            // settles. The yield only guarantees forward progress if the session flip-flops
+            // idle/busy faster than this loop can observe it.
+            Ok(InjectionOffer::AgentBusy) => tokio::task::yield_now().await,
+            // A fault that waiting cannot fix (no model selected, a poisoned append, …). Hand the
+            // messages back so their producers keep whatever they were announcing and can retry on
+            // their own terms — the alternative is holding an inbox nobody can deliver while the
+            // producers block on an answer that never comes.
+            Err(fault) => {
+                tracing::warn!(error = %fault, "session cannot accept injected messages");
+                for req in inbox.drain(..) {
+                    req.ack.answer(InjectOutcome::SessionUnavailable);
+                }
+            }
+        }
     }
 }
 

@@ -66,6 +66,7 @@ impl SubagentExecutor {
             timeout_ms,
             structured_output_schema,
             tool_budget,
+            thinking,
             turn_budget,
             usage_budget,
         } = request;
@@ -94,6 +95,15 @@ impl SubagentExecutor {
         // `RunnerConfig` field and no on-disk config-format change.
         if let Some(budget) = tool_budget.clone() {
             resolved_persona.tool_budget = Some(budget);
+        }
+        // SCOPE_19/A1 (async half of the caller `thinking` rung) — same fold, same reason as
+        // `tool_budget` directly above: the persona map IS what hop 2 dispatches from, so stamping
+        // the caller's explicit level here reaches `build_step_agent_config` as the agent's own
+        // `thinking:` — caller beats persona — with no per-step config-format change. The
+        // parent-session rung stays SEPARATE (`RunnerConfig::inherited_session_thinking` below),
+        // because it must sit UNDER the persona's own level, not over it.
+        if let Some(level) = thinking.clone() {
+            resolved_persona.thinking = Some(level);
         }
         let resolved_agents: BTreeMap<String, ResolvedAgentPersona> =
             BTreeMap::from([(agent_name.to_string(), resolved_persona)]);
@@ -463,6 +473,7 @@ impl SubagentExecutor {
             RunMode::Single => "single",
             RunMode::Parallel => "parallel",
             RunMode::Chain => "chain",
+            RunMode::Workflow => "workflow",
         };
 
         // Read before `cfg.worktree_base_dir` (a non-`Copy` `Option<PathBuf>`) is moved out of
@@ -487,6 +498,11 @@ impl SubagentExecutor {
             // launching session, carried into the one-shot config so the detached runner can stamp
             // it onto `status.json` and every session-scoped listing can honour it.
             session_id: self.current_session_id(),
+            // pi `completionOwnerId` — THIS process's identity, minted once per process
+            // (`shared/completion-owner.ts:10-14`). Stamped at spawn so the terminal result
+            // records who is entitled to consume it; the detached runner cannot derive this,
+            // because its own owner id is not the orchestrator's.
+            completion_owner_id: Some(crate::identity::current_completion_owner_id()),
             global_concurrency_limit: cfg.global_concurrency_limit as usize,
             worktree_base_dir: cfg.worktree_base_dir,
             max_subagent_depth: cfg.max_subagent_depth,
@@ -522,6 +538,12 @@ impl SubagentExecutor {
             // backend of its own and cannot re-read the parent later, so whatever is captured at
             // plan time is final for every step of the run.
             inherited_session_model: self.remembered_parent_model(),
+            // SCOPE_19/A1: the thinking half of the field above, resolved through the SAME
+            // remembered-value seam and final at plan time for the same reason — the detached
+            // runner cannot re-read the parent session later. Folded runner-side BELOW each
+            // persona's own `thinking:` (`build_step_agent_config`), so an inheriting step reasons
+            // at the parent's level and a persona that declares a level keeps it.
+            inherited_session_thinking: self.remembered_parent_thinking(),
             // SUBA-003: the model-scope policy in force at authorization time, baked into the
             // one-shot config so the detached hop-2 runner enforces the SAME policy the foreground
             // path does. Without it, `subagent({..., background: true})` would be an unpoliced way
@@ -701,6 +723,7 @@ mod tests {
 
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                thinking: None,
                 // SUBA-021: unbudgeted on this path (see the field doc).
                 usage_budget: None,
                 turn_budget: None,
@@ -833,6 +856,7 @@ mod tests {
 
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                thinking: None,
                 // SUBA-021: unbudgeted on this path (see the field doc).
                 usage_budget: None,
                 turn_budget: None,
@@ -909,6 +933,7 @@ mod tests {
         for artifacts in [None, Some(true), Some(false)] {
             let run_id = executor
                 .spawn_background(BackgroundSingleRequest {
+                    thinking: None,
                     // SUBA-021: unbudgeted on this path (see the field doc).
                     usage_budget: None,
                     turn_budget: None,
@@ -998,6 +1023,7 @@ mod tests {
         let before = u64::try_from(crate::time::now_epoch_millis()).unwrap_or(0);
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                thinking: None,
                 // SUBA-021: unbudgeted on this path (see the field doc).
                 usage_budget: None,
                 turn_budget: None,
@@ -1058,6 +1084,7 @@ mod tests {
         // and CPU until a human noticed and issued `interrupt`.
         let untimed = executor
             .spawn_background(BackgroundSingleRequest {
+                thinking: None,
                 // SUBA-021: unbudgeted on this path (see the field doc).
                 usage_budget: None,
                 turn_budget: None,
@@ -1117,6 +1144,7 @@ mod tests {
 
         let request = |exec: Arc<SubagentExecutor>, root: std::path::PathBuf| async move {
             exec.spawn_background(BackgroundSingleRequest {
+                thinking: None,
                 // SUBA-021: unbudgeted on this path (see the field doc).
                 usage_budget: None,
                 turn_budget: None,
@@ -1237,6 +1265,7 @@ mod tests {
 
             let run_id = executor
                 .spawn_background(BackgroundSingleRequest {
+                    thinking: None,
                     // SUBA-021: unbudgeted on this path (see the field doc).
                     usage_budget: None,
                     turn_budget: None,
@@ -1330,6 +1359,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                thinking: None,
                 // SUBA-021: unbudgeted on this path (see the field doc).
                 usage_budget: None,
                 turn_budget: None,
@@ -1399,6 +1429,7 @@ mod tests {
         });
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                thinking: None,
                 // SUBA-021: unbudgeted on this path (see the field doc).
                 usage_budget: None,
                 turn_budget: None,
@@ -1477,6 +1508,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
+                thinking: None,
                 // SUBA-021: unbudgeted on this path (see the field doc).
                 usage_budget: None,
                 turn_budget: None,

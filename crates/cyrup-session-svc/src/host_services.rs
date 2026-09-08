@@ -18,7 +18,8 @@ use cyrup_ext::caps::http::HttpCaps;
 use cyrup_ext::caps::proc::ProcCaps;
 use cyrup_ext::host::{
     ControlOp, CustomSpec, DialogOptions, ExecOutput, HostServices, HttpRequest, HttpResponse,
-    HttpStreamResponse, HumanInteractionLock, InteractiveOverlay, NotifyKind, ProcSpawnSpec,
+    HttpStreamResponse, HumanInteractionLock, InjectOutcome, InteractiveOverlay, NotifyKind,
+    ProcSpawnSpec,
 };
 use cyrup_provider::Provider;
 use cyrup_session::manager::SessionManager;
@@ -506,13 +507,110 @@ pub struct InjectMessage {
     pub trigger_turn: bool,
 }
 
-/// A fire-and-forget message-injection sink: [`LiveHostServices::inject_message`] forwards an
-/// [`InjectMessage`] here; the installed sink (bound by `AgentSession::into_shared`) spawns the async
-/// inject/turn on the live session and returns immediately, so the sync caller never blocks for the
-/// whole turn (the same sync→async bridge the [`ControlSink`] uses). `None` until bound (the default
-/// host, a headless-by-value session): `inject_message` then reports the seam unavailable, matching
-/// the trait's deny default.
-pub type InjectSink = Arc<dyn Fn(InjectMessage) -> Result<(), String> + Send + Sync>;
+/// The obligation to answer for one injected message, exactly once.
+///
+/// # Why this is a type, and why it implements `Drop`
+///
+/// The defect this seam was rebuilt to remove is an obligation that was silently dropped: the
+/// previous design spawned a task per injection and discarded its result (`let _ = …`), so a
+/// message that never reached the session was indistinguishable from one that did. Modelling the
+/// acknowledgement as a bare `Option<oneshot::Sender<_>>` reproduces that hazard one level up —
+/// every early return, every `continue`, every later refactor has to *remember* to answer.
+///
+/// Here, forgetting answers [`InjectOutcome::SessionUnavailable`]: the conservative outcome, which
+/// tells the producer to KEEP its copy of whatever the message announced. "Nobody answered" is
+/// therefore not a reachable state, and no caller's handling of a dropped channel is load-bearing.
+///
+/// [`Self::answer`] takes `self` by value, so an obligation cannot be discharged twice.
+pub struct InjectAck(Option<tokio::sync::oneshot::Sender<InjectOutcome>>);
+
+impl InjectAck {
+    /// A live obligation and the receiver that observes it.
+    #[must_use]
+    pub(crate) fn channel() -> (Self, tokio::sync::oneshot::Receiver<InjectOutcome>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (Self(Some(tx)), rx)
+    }
+
+    /// An obligation nobody is listening for — the fire-and-forget producers (a WASM guest is
+    /// suspended across the synchronous capability call and has nothing to await).
+    ///
+    /// This exists so the pump has ONE code path: it answers every request unconditionally rather
+    /// than branching on whether an answer is wanted, which is the branch a future edit would
+    /// forget.
+    #[must_use]
+    pub(crate) fn detached() -> Self {
+        Self(None)
+    }
+
+    /// Discharge the obligation. Consumes it, so it cannot be answered again.
+    pub fn answer(mut self, outcome: InjectOutcome) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(outcome);
+        }
+    }
+}
+
+impl Drop for InjectAck {
+    fn drop(&mut self) {
+        // Unanswered at drop: report the conservative outcome. A producer that receives this keeps
+        // its copy, so a dropped request costs a retry, never data.
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(InjectOutcome::SessionUnavailable);
+        }
+    }
+}
+
+/// Hand-written because [`tokio::sync::oneshot::Sender`] is not `Debug`; the only fact worth
+/// printing is whether the obligation is still outstanding.
+impl std::fmt::Debug for InjectAck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InjectAck")
+            .field("outstanding", &self.0.is_some())
+            .finish()
+    }
+}
+
+/// One injection request: the message, plus the obligation to answer for it.
+///
+/// The ack is what separates "the host took it" from "the session has it". A caller that holds the
+/// ONLY copy of the announced data (cyrup-ext-subagents' completion sink holds a background run's
+/// sole result payload and destroys it once delivery is reported) must not act on the former.
+#[derive(Debug)]
+pub struct InjectRequest {
+    /// The message to deliver.
+    pub message: InjectMessage,
+    /// Answered by the pump when the message's fate is settled. Never optional: a request that
+    /// nobody is listening for carries [`InjectAck::detached`], so there is no "no answer needed"
+    /// branch anywhere in the delivery path.
+    pub ack: InjectAck,
+}
+
+/// The message-injection seam: a SINGLE-CONSUMER queue drained by the per-session pump
+/// (`AgentSession::into_shared` spawns it). `None` until bound (the default host, a
+/// headless-by-value session): both `inject_message` and `inject_message_ack` then report the seam
+/// unavailable, matching the trait's deny default.
+///
+/// # Why a channel rather than the callback this replaced
+///
+/// The previous seam was `Arc<dyn Fn(InjectMessage) -> Result<(), String>>`, invoked by
+/// `into_shared`'s closure as `runtime.spawn(async { let _ = session.inject_message(..).await })`.
+/// Two structural defects came with that shape, and both cost delivered messages:
+///
+/// * **It acknowledged a spawn, not a delivery.** `Ok(())` was returned the instant a task was
+///   queued, and every error the real injection could produce was discarded by `let _ =`. The
+///   subagent completion sink read that `Ok` as "delivered" and deleted the run's result payload
+///   AND its index — so a message dropped further down had no on-disk trace and no way back.
+/// * **It fanned out into concurrent, racing injections.** Each spawned task independently
+///   consulted `is_run_active()` and then either steered onto a run that might already be past its
+///   last drain point, or called `spawn_run`, where all but one lost `Agent::prompt`'s latch CAS
+///   and were warn-logged away.
+///
+/// A single consumer removes the second defect by construction (nothing races anything), and the
+/// per-request `ack` removes the first (the sink learns the real outcome). Unbounded because the
+/// producer is a filesystem watcher that must never block; depth is bounded in practice by the
+/// number of in-flight background runs.
+pub type InjectSink = tokio::sync::mpsc::UnboundedSender<InjectRequest>;
 
 /// The live host-services backend (arch-08 §5.6).
 pub struct LiveHostServices {
@@ -944,12 +1042,45 @@ impl LiveHostServices {
         *Self::lock(&self.manager) = Some(manager);
     }
 
-    /// Attach the late-bound message-injection sink (R-SA-101 / P-2). `AgentSession::into_shared` binds
-    /// a sink that upgrades a weak self-handle and spawns the async inject/turn, so a background task
-    /// calling [`HostServices::inject_message`] reaches THIS session's live turn loop. Idempotent:
-    /// re-binding replaces the sink (a fresh session generation gets a fresh handle).
+    /// Attach the late-bound message-injection sink (R-SA-101 / P-2). `AgentSession::into_shared`
+    /// binds the sending half of its injection pump's queue, so a background task calling
+    /// [`HostServices::inject_message`] / [`HostServices::inject_message_ack`] reaches THIS
+    /// session's live turn loop. Idempotent: re-binding replaces the sender (a fresh session
+    /// generation gets a fresh pump).
     pub fn set_inject_sink(&self, sink: InjectSink) {
         *Self::lock(&self.inject_sink) = Some(sink);
+    }
+
+    /// The one place an [`InjectRequest`] is put on the wire, shared by the fire-and-forget and
+    /// acknowledged capability methods so the two cannot drift into different delivery routes.
+    ///
+    /// # Errors
+    ///
+    /// No sink bound (default host / headless-by-value session), or the pump has exited — in both
+    /// cases nothing was queued and the caller still owns whatever the message announced.
+    fn enqueue_injection(
+        &self,
+        content: &str,
+        custom_type: Option<&str>,
+        display: bool,
+        details: Option<&serde_json::Value>,
+        trigger_turn: bool,
+        ack: InjectAck,
+    ) -> Result<(), String> {
+        let sink = Self::lock(&self.inject_sink)
+            .clone()
+            .ok_or("message injection not wired to a live session")?;
+        sink.send(InjectRequest {
+            message: InjectMessage {
+                content: content.to_string(),
+                custom_type: custom_type.map(str::to_string),
+                display,
+                details: details.cloned(),
+                trigger_turn,
+            },
+            ack,
+        })
+        .map_err(|_| "session injection pump is no longer running".to_string())
     }
 
     /// Share the session's authoritative dynamic-tool view so a guest's `setActiveTools`/
@@ -1415,21 +1546,34 @@ impl HostServices for LiveHostServices {
         details: Option<&serde_json::Value>,
         trigger_turn: bool,
     ) -> Result<(), String> {
-        // Forward onto the late-bound inject sink (bound by `AgentSession::into_shared`), which spawns
-        // the async append/turn on the live session and returns immediately — the sync caller (guest
-        // or a native extension's background task) never blocks for the whole turn (R-SA-101 / P-2).
-        // No sink (default host / headless-by-value session) ⇒ the seam is unavailable, matching the
-        // trait deny default.
-        let sink = Self::lock(&self.inject_sink)
-            .clone()
-            .ok_or("message injection not wired to a live session")?;
-        sink(InjectMessage {
-            content: content.to_string(),
-            custom_type: custom_type.map(str::to_string),
+        // Enqueue onto the session's injection pump (bound by `AgentSession::into_shared`) with no
+        // ack: a WASM guest is suspended across this sync capability call and has nothing to await,
+        // so it learns only that the message was taken (R-SA-101 / P-2). Delivery itself is
+        // identical to the acknowledged path below — same queue, same single consumer, same
+        // scheduling — so a fire-and-forget caller is not a second, weaker delivery route.
+        // No sink (default host / headless-by-value session) ⇒ the seam is unavailable, matching
+        // the trait deny default.
+        self.enqueue_injection(
+            content,
+            custom_type,
             display,
-            details: details.cloned(),
+            details,
             trigger_turn,
-        })
+            InjectAck::detached(),
+        )
+    }
+
+    fn inject_message_ack(
+        &self,
+        content: &str,
+        custom_type: Option<&str>,
+        display: bool,
+        details: Option<&serde_json::Value>,
+        trigger_turn: bool,
+    ) -> Result<tokio::sync::oneshot::Receiver<InjectOutcome>, String> {
+        let (ack, rx) = InjectAck::channel();
+        self.enqueue_injection(content, custom_type, display, details, trigger_turn, ack)?;
+        Ok(rx)
     }
 
     fn control(&self, op: ControlOp) -> Result<(), String> {
@@ -2023,6 +2167,60 @@ mod tests {
     use cyrup_core::Tool;
     use cyrup_provider::faux::FauxProvider;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // =============================================================================================
+    // InjectAck — the obligation to answer, and what happens when nobody does
+    // =============================================================================================
+
+    #[tokio::test]
+    async fn answering_an_obligation_reports_the_outcome() {
+        let (ack, rx) = InjectAck::channel();
+        ack.answer(InjectOutcome::Accepted);
+        assert_eq!(rx.await, Ok(InjectOutcome::Accepted));
+    }
+
+    /// The linchpin of the whole delivery contract: a request that is dropped without an answer
+    /// must be indistinguishable from one that was explicitly refused, because the producer on the
+    /// other end holds the ONLY copy of whatever the message announced. Were this to resolve as an
+    /// error the caller had to interpret, the safety of the system would rest on that caller
+    /// choosing the conservative reading — which is exactly the assumption that lost results.
+    #[tokio::test]
+    async fn an_obligation_dropped_unanswered_reports_the_conservative_outcome() {
+        let (ack, rx) = InjectAck::channel();
+        drop(ack);
+        assert_eq!(
+            rx.await,
+            Ok(InjectOutcome::SessionUnavailable),
+            "a dropped obligation must answer for itself, never leave the caller guessing"
+        );
+    }
+
+    /// A whole request dropped in flight (the pump exiting mid-batch, a session torn down) answers
+    /// the same way, because the obligation travels inside it.
+    #[tokio::test]
+    async fn dropping_a_request_answers_through_the_obligation_it_carries() {
+        let (ack, rx) = InjectAck::channel();
+        let request = InjectRequest {
+            message: InjectMessage {
+                content: "background completion".to_string(),
+                custom_type: Some("subagent-notify".to_string()),
+                display: false,
+                details: None,
+                trigger_turn: true,
+            },
+            ack,
+        };
+        drop(request);
+        assert_eq!(rx.await, Ok(InjectOutcome::SessionUnavailable));
+    }
+
+    /// The fire-and-forget producers (WASM guests) share the delivery path; their obligation is
+    /// simply detached, which must not panic or block anything.
+    #[test]
+    fn a_detached_obligation_is_inert() {
+        InjectAck::detached().answer(InjectOutcome::Accepted);
+        drop(InjectAck::detached());
+    }
 
     /// A backend seeded with the real local process ops + a temp cwd (the `exec` grant path).
     fn svc_with(provider: Arc<dyn Provider>) -> LiveHostServices {

@@ -7,11 +7,15 @@
 //!
 //! Every requirement this module implements traces back to func-SA §1.1's binding, non-negotiable
 //! mechanism: a subagent run is ALWAYS a genuine OS subprocess re-exec of the `cyrup` binary
-//! itself. [`resolve_spawn_command`] resolves *which* binary via `std::env::current_exe()` (with a
-//! `CYRUP_SUBAGENT_BINARY` override), [`ChildSpawnSpec`] describes exactly how to invoke it, and
-//! [`SpawnedChild`] wraps the resulting real `tokio::process::Command` child, reading its stdout
-//! as NDJSON one line at a time — never an in-process object graph, never an in-process
-//! nested-agent turn loop, never an event-relay standing in for the child's own execution.
+//! itself. [`resolve_spawn_command`] resolves *which* binary through a five-tier ladder — a
+//! `CYRUP_SUBAGENT_BINARY` override, then `std::env::current_exe()` **if that path still exists**,
+//! then this process's own INODE via [`PROC_SELF_EXE`] (which is what keeps a spawn working after
+//! a rebuild replaces the running image, and hands the child a byte-identical build), then the
+//! deleted-marker-stripped path, then a `PATH` lookup — [`ChildSpawnSpec`] describes exactly
+//! how to invoke it, and [`SpawnedChild`] wraps the resulting real `tokio::process::Command`
+//! child, reading its stdout as NDJSON one line at a time — never an in-process object graph,
+//! never an in-process nested-agent turn loop, never an event-relay standing in for the child's
+//! own execution.
 //! Cancellation delegates entirely to [`crate::spawn::signal::terminate`]'s real SIGINT->SIGTERM
 //! ->SIGKILL OS-signal escalation (R-SA-059) — this module never invents a second, competing
 //! termination mechanism.
@@ -165,14 +169,55 @@ pub const SUBAGENT_BINARY_ENV_VAR: &str = "CYRUP_SUBAGENT_BINARY";
 /// structured payload among this crate's env vars; the rest carry a scalar or a comma-joined list
 /// of names (`MCP_DIRECT_TOOLS`).
 ///
-/// Read ONLY when [`SUBAGENT_BINARY_ENV_VAR`] is set and non-blank: tiers 2 and 3 resolve this
-/// crate's own binary, which by construction needs no leading argv, so honouring a stray value
-/// there would let the environment inject argv into an ordinary production run.
+/// Read ONLY when [`SUBAGENT_BINARY_ENV_VAR`] is set and non-blank: every later tier resolves
+/// this crate's own binary, which by construction needs no leading argv, so honouring a stray
+/// value there would let the environment inject argv into an ordinary production run.
 pub const SUBAGENT_BINARY_ARGS_ENV_VAR: &str = "CYRUP_SUBAGENT_BINARY_ARGS";
 
-/// The literal fallback executable name (R-SA-045 tier 3), resolved via `PATH` by the OS/`tokio`
-/// when `current_exe()` itself fails.
+/// The literal fallback executable name ([`resolve_spawn_command`] tier 5), resolved via `PATH` by
+/// the OS/`tokio` when no image of this process is reachable on disk at all.
 const FALLBACK_BINARY_NAME: &str = "cyrup";
+
+/// Linux's per-process magic symlink to the image this process is executing
+/// ([`resolve_spawn_command`] tier 3).
+///
+/// Not a path in the ordinary sense: the kernel resolves it directly to the executing inode, with
+/// no directory lookup, so it stays valid for this process's entire lifetime **even after the
+/// original file is renamed over or unlinked outright** (`cargo build` replacing
+/// `target/debug/cyrup` under a live session does exactly that). `execve` through it therefore
+/// cannot fail with `ENOENT` while we are alive.
+///
+/// It is also strictly MORE correct than re-execing a path: it gives the child the byte-identical
+/// image the parent is running, whereas the parent's original path may by now hold a different
+/// build entirely (a rebuild puts the NEW binary there) and `PATH` may hold an unrelated install.
+/// A subagent child must match its parent's protocol, agent definitions and flag surface, so
+/// "same inode" is the requirement, not "same path".
+///
+/// Absent on macOS/Windows, where the existence probe simply falls through to the next tier — no
+/// `#[cfg]` needed, and tier 3 stays unit-testable on any platform via the injected predicate.
+const PROC_SELF_EXE: &str = "/proc/self/exe";
+
+/// The marker Linux appends to `/proc/<pid>/exe` once the running image's inode is unlinked.
+///
+/// `std::env::current_exe()` reads that symlink and hands the suffixed string back as `Ok(..)`,
+/// **not** `Err(..)`, which is why tier 2 must probe for existence rather than trusting the `Ok`.
+const DELETED_EXE_MARKER: &str = " (deleted)";
+
+/// Recover the real on-disk path from a `current_exe()` result carrying [`DELETED_EXE_MARKER`]
+/// ([`resolve_spawn_command`] tier 4 — the route for platforms without [`PROC_SELF_EXE`]).
+///
+/// Returns `None` when there is no marker (the ordinary case), when the path is not UTF-8, or when
+/// stripping would leave an empty path.
+///
+/// Performs **no I/O**: the caller applies the injected existence predicate, keeping
+/// [`resolve_spawn_command_from`] deterministically testable without touching the filesystem.
+/// Because the caller probes the UNSTRIPPED path first, a file genuinely named `foo (deleted)`
+/// that exists is used verbatim and never reaches this function — which is what makes stripping
+/// exact rather than a heuristic.
+fn strip_deleted_exe_marker(exe: &Path) -> Option<PathBuf> {
+    let stripped = exe.to_str()?.strip_suffix(DELETED_EXE_MARKER)?;
+    (!stripped.is_empty()).then(|| PathBuf::from(stripped))
+}
 
 /// The resolved target binary + any base argv this crate's own build of `cyrup` always needs
 /// ahead of the per-run arguments [`ChildSpawnSpec`] appends (R-SA-045).
@@ -184,40 +229,84 @@ const FALLBACK_BINARY_NAME: &str = "cyrup";
 /// site that constructs a [`ChildSpawnSpec`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnCommand {
-    /// The resolved, executable path (or bare name, in the tier-3 `PATH`-lookup fallback case).
+    /// The resolved, executable path (or bare name, in the tier-5 `PATH`-lookup fallback case).
     pub binary: PathBuf,
     /// Argv entries that must precede every per-run argument this crate appends.
     pub base_args: Vec<String>,
 }
 
-/// Resolve which `cyrup` binary a spawned child re-execs, per R-SA-045's three-tier priority:
+impl SpawnCommand {
+    /// The `argv[0]` to present to the child, when it must differ from [`Self::binary`].
+    ///
+    /// [`resolve_spawn_command`] tier 3 execs through [`PROC_SELF_EXE`], which would otherwise
+    /// make the child see `argv[0] == "/proc/self/exe"` and show that in `ps` and in clap's
+    /// program name — unhelpful when reading a fleet of subagent children. Presenting the real
+    /// program name keeps that output honest without changing WHICH inode is executed.
+    ///
+    /// Derived rather than stored: a field on [`SpawnCommand`] would break all 93 struct literals
+    /// that construct one across this workspace, for a value that is a pure function of
+    /// [`Self::binary`]. The match is exact (not a `/proc` prefix heuristic) because tier 3 emits
+    /// exactly one path; an operator who points [`SUBAGENT_BINARY_ENV_VAR`] at that same magic
+    /// link wants identical treatment, so tier 1 landing here is correct too.
+    ///
+    /// `None` means "let the child's `argv[0]` default to [`Self::binary`]", which is right for
+    /// every other tier since those already name a real program path.
+    #[must_use]
+    pub fn arg0(&self) -> Option<&'static str> {
+        (self.binary == Path::new(PROC_SELF_EXE)).then_some(FALLBACK_BINARY_NAME)
+    }
+}
+
+/// Resolve which `cyrup` binary a spawned child re-execs, extending R-SA-045's priority ladder so
+/// it is TOTAL — no reachable state yields an unspawnable command:
 ///
 /// 1. `CYRUP_SUBAGENT_BINARY`, if set and non-blank (verbatim, no further resolution) — the
 ///    override escape hatch this crate's own tests use to substitute a scripted test binary.
-/// 2. `std::env::current_exe()`, canonicalized to an absolute path — the default, production
-///    path: a subagent always re-execs the exact binary that is currently running.
-/// 3. The literal string `"cyrup"`, resolved via `PATH` at spawn time — only reached if
-///    `current_exe()` itself fails (a rare, platform-dependent I/O failure), never treated as a
-///    hard error since a `PATH`-relative fallback is still a reasonable last resort per R-SA-045's
-///    own text.
+/// 2. `std::env::current_exe()`, **only if that path still exists** — the default for both a
+///    released install and `cargo run`. First because it keeps `argv[0]` and `ps` output natural.
+/// 3. [`PROC_SELF_EXE`], if present — reached when this process's own image was replaced or
+///    deleted while running (a rebuild of `target/debug/cyrup` under a live session), which makes
+///    `current_exe()` return an `Ok(..)` path that no longer exists. Re-execs this process's
+///    INODE, so it cannot `ENOENT` and the child is byte-identical to its parent.
+/// 4. The [`DELETED_EXE_MARKER`]-stripped form of tier 2's path, if it exists — the same recovery
+///    for platforms without `/proc`.
+/// 5. The literal string `"cyrup"`, resolved via `PATH` at spawn time — a genuine last resort (no
+///    `/proc`, no image on disk, or `current_exe()` itself failed). Never treated as a hard error
+///    since a `PATH`-relative fallback is still a reasonable last resort per R-SA-045's own text,
+///    but logged, because the child may then be a different build than this parent.
 ///
 /// This function never fails: every tier either produces a usable [`SpawnCommand`] or falls
-/// through to the next, and the final tier is infallible by construction.
+/// through to the next, and the final tier is infallible by construction. On Linux tier 3 makes
+/// that guarantee stronger than "never fails to RETURN" — it never fails to SPAWN.
 #[must_use]
 pub fn resolve_spawn_command() -> SpawnCommand {
-    resolve_spawn_command_from(|key| std::env::var(key).ok(), std::env::current_exe)
+    resolve_spawn_command_from(
+        |key| std::env::var(key).ok(),
+        std::env::current_exe,
+        Path::exists,
+    )
 }
 
-/// The pure core of [`resolve_spawn_command`], parameterized over the env lookup and
-/// `current_exe` resolver so the three-tier priority can be exercised deterministically in unit
-/// tests without mutating real process environment state (`std::env::set_var`/`remove_var` are
-/// `unsafe` as of the 2024 edition; this crate is `#![forbid(unsafe_code)]`, so tests inject
-/// lookup/resolver closures instead of touching the real environment at all — mirrors
-/// `spawn::depth`'s identical `resolve_effective_depth`/`resolve_effective_depth_from` split).
+/// The pure core of [`resolve_spawn_command`], parameterized over the env lookup, the
+/// `current_exe` resolver and the on-disk existence probe so the whole ladder can be exercised
+/// deterministically in unit tests without mutating real process environment state or touching
+/// the filesystem (`std::env::set_var`/`remove_var` are `unsafe` as of the 2024 edition; this
+/// crate is `#![forbid(unsafe_code)]`, so tests inject closures instead of touching the real
+/// environment at all — mirrors `spawn::depth`'s identical `resolve_effective_depth`/
+/// `resolve_effective_depth_from` split).
+///
+/// `path_exists` is the Rust analog of the `existsSync` dependency pi-subagents injects into its
+/// own resolver (`runs/shared/pi-spawn.ts:47`) and applies to every candidate it returns
+/// (`isRunnableNodeScript`, `:60-65`) — the discipline this port previously lacked at tier 2.
+/// Note it is a genuine liveness probe, not merely a directory-entry check: `Path::exists` stats
+/// through [`PROC_SELF_EXE`]'s magic link to the live inode, so tier 3 reports `true` even when
+/// the original file is gone.
 fn resolve_spawn_command_from(
     env_lookup: impl Fn(&str) -> Option<String>,
     current_exe: impl FnOnce() -> std::io::Result<PathBuf>,
+    path_exists: impl Fn(&Path) -> bool,
 ) -> SpawnCommand {
+    // Tier 1 — operator intent, verbatim.
     if let Some(bin) = env_lookup(SUBAGENT_BINARY_ENV_VAR)
         && !bin.trim().is_empty()
     {
@@ -231,11 +320,69 @@ fn resolve_spawn_command_from(
                 .unwrap_or_default(),
         };
     }
-    if let Ok(exe) = current_exe() {
+
+    let exe = current_exe();
+
+    // Tier 2 — the running binary's real path, while it is still there. Probed BEFORE any
+    // stripping, so a file genuinely named `… (deleted)` that exists is honoured verbatim.
+    if let Ok(exe) = &exe
+        && path_exists(exe)
+    {
         return SpawnCommand {
-            binary: exe,
+            binary: exe.clone(),
             base_args: Vec::new(),
         };
+    }
+
+    // Tier 3 — re-exec our own inode. This is the tier that turns a rebuild-while-running from
+    // ENOENT into a correct spawn, and it is the only candidate that survives the image being
+    // deleted outright. Deliberately NOT `#[cfg]`-gated: `/proc/self/exe` simply does not exist
+    // on macOS/Windows, so the probe falls through there on its own, leaving one code path on
+    // every platform and keeping this branch testable anywhere through `path_exists`.
+    let proc_self_exe = Path::new(PROC_SELF_EXE);
+    if path_exists(proc_self_exe) {
+        tracing::debug!(
+            stale = ?exe.as_ref().ok(),
+            "current_exe() no longer resolves to a file on disk (this process's image was \
+             replaced or removed while running); re-execing this process's own inode via \
+             {PROC_SELF_EXE}, which yields a child byte-identical to this parent"
+        );
+        return SpawnCommand {
+            binary: proc_self_exe.to_path_buf(),
+            base_args: Vec::new(),
+        };
+    }
+
+    // Tier 4 — no `/proc` (non-Linux): recover the path the kernel marked deleted.
+    if let Ok(exe) = &exe
+        && let Some(recovered) = strip_deleted_exe_marker(exe)
+        && path_exists(&recovered)
+    {
+        tracing::warn!(
+            stale = %exe.display(),
+            recovered = %recovered.display(),
+            "this process's executable was replaced while running and {PROC_SELF_EXE} is \
+             unavailable; re-execing the rebuilt binary at the same path, which may be a \
+             different build than this parent"
+        );
+        return SpawnCommand {
+            binary: recovered,
+            base_args: Vec::new(),
+        };
+    }
+
+    // Tier 5 — PATH.
+    match &exe {
+        Ok(stale) => tracing::warn!(
+            stale = %stale.display(),
+            "no on-disk image and no {PROC_SELF_EXE}; falling back to PATH-resolved \
+             \"{FALLBACK_BINARY_NAME}\", which may be a different build than this parent"
+        ),
+        Err(error) => tracing::warn!(
+            %error,
+            "current_exe() failed; falling back to PATH-resolved \"{FALLBACK_BINARY_NAME}\", \
+             which may be a different build than this parent"
+        ),
     }
     SpawnCommand {
         binary: PathBuf::from(FALLBACK_BINARY_NAME),
@@ -622,6 +769,16 @@ impl SpawnedChild {
             .stderr(std::process::Stdio::piped()); // R-SA-046
         #[cfg(unix)]
         {
+            // Tier 3 of `resolve_spawn_command` execs through `/proc/self/exe`, whose `argv[0]`
+            // would otherwise show up as that magic-link path in `ps` and in the child's own clap
+            // program name. Present the real program name instead; this changes only `argv[0]`,
+            // never WHICH inode is executed. `None` for every other tier, which already names a
+            // real program path. `arg0` is an inherent method on `tokio::process::Command` under
+            // `cfg(unix)`, so no extension-trait import is needed here either.
+            if let Some(arg0) = spec.command.arg0() {
+                command.arg0(arg0);
+            }
+
             // Give each child its own process group so this crate's own signal-escalation
             // ladder (`spawn::signal::terminate`, R-SA-059) can target exactly this child (and
             // any of its own descendants) without racing the parent orchestrator's own signal
@@ -1128,14 +1285,32 @@ mod tests {
         move |key| vars.get(key).map(|v| (*v).to_string())
     }
 
-    // ---- resolve_spawn_command: three-tier priority (R-SA-045) ----
+    /// Existence predicate answering `true` for EXACTLY the listed paths — the filesystem analog
+    /// of [`lookup_from`], so a ladder case can state precisely which candidates are on disk
+    /// without touching a real directory (and without the platform-dependence that would come
+    /// from probing the real `/proc`, which is what keeps the inode-tier cases below meaningful
+    /// on macOS and Windows too).
+    fn exists_only<'a>(paths: &'a [&'a str]) -> impl Fn(&Path) -> bool + 'a {
+        move |candidate| paths.iter().any(|p| Path::new(p) == candidate)
+    }
+
+    // ---- resolve_spawn_command: five-tier priority ladder (R-SA-045, extended) ----
+    //
+    // These cases assert TIER PRIORITY against synthetic paths that were never meant to be
+    // stat'ed, so they inject a constant existence predicate rather than touching the real
+    // filesystem. `|_| true` is the faithful translation for every case whose intended winner is
+    // tier 1 or tier 2; the one case whose intended winner is tier 5 injects `|_| false`, because
+    // a predicate claiming everything exists would let tier 3's `/proc/self/exe` probe win and
+    // silently change what that test asserts.
 
     #[test]
     fn resolve_spawn_command_prefers_the_env_override_when_set_and_non_blank() {
         let vars = StdHashMap::from([(SUBAGENT_BINARY_ENV_VAR, "/opt/scripted/fake-cyrup")]);
-        let resolved = resolve_spawn_command_from(lookup_from(vars), || {
-            Ok(PathBuf::from("/should/not/be/used"))
-        });
+        let resolved = resolve_spawn_command_from(
+            lookup_from(vars),
+            || Ok(PathBuf::from("/should/not/be/used")),
+            |_: &Path| true,
+        );
         assert_eq!(resolved.binary, PathBuf::from("/opt/scripted/fake-cyrup"));
         assert!(resolved.base_args.is_empty());
     }
@@ -1143,9 +1318,11 @@ mod tests {
     #[test]
     fn resolve_spawn_command_treats_a_blank_override_as_absent() {
         let vars = StdHashMap::from([(SUBAGENT_BINARY_ENV_VAR, "   ")]);
-        let resolved = resolve_spawn_command_from(lookup_from(vars), || {
-            Ok(PathBuf::from("/resolved/via/current-exe"))
-        });
+        let resolved = resolve_spawn_command_from(
+            lookup_from(vars),
+            || Ok(PathBuf::from("/resolved/via/current-exe")),
+            |_: &Path| true,
+        );
         assert_eq!(
             resolved.binary,
             PathBuf::from("/resolved/via/current-exe"),
@@ -1155,17 +1332,24 @@ mod tests {
 
     #[test]
     fn resolve_spawn_command_falls_back_to_current_exe_when_no_override_is_set() {
-        let resolved = resolve_spawn_command_from(lookup_from(StdHashMap::new()), || {
-            Ok(PathBuf::from("/proc/self/exe-resolved"))
-        });
+        let resolved = resolve_spawn_command_from(
+            lookup_from(StdHashMap::new()),
+            || Ok(PathBuf::from("/proc/self/exe-resolved")),
+            |_: &Path| true,
+        );
         assert_eq!(resolved.binary, PathBuf::from("/proc/self/exe-resolved"));
     }
 
     #[test]
     fn resolve_spawn_command_falls_back_to_literal_cyrup_when_current_exe_fails() {
-        let resolved = resolve_spawn_command_from(lookup_from(StdHashMap::new()), || {
-            Err(std::io::Error::other("current_exe unavailable"))
-        });
+        // `|_| false` — not `true` — is what preserves this test's intent: it asserts the last
+        // resort when NOTHING is resolvable, so every existence probe on the way down (including
+        // tier 3's `/proc/self/exe`) must answer "absent".
+        let resolved = resolve_spawn_command_from(
+            lookup_from(StdHashMap::new()),
+            || Err(std::io::Error::other("current_exe unavailable")),
+            |_: &Path| false,
+        );
         assert_eq!(resolved.binary, PathBuf::from(FALLBACK_BINARY_NAME));
     }
 
@@ -1178,9 +1362,11 @@ mod tests {
                 r#"["--launch","a b","x,y","say \"hi\""]"#,
             ),
         ]);
-        let resolved = resolve_spawn_command_from(lookup_from(vars), || {
-            Ok(PathBuf::from("/should/not/be/used"))
-        });
+        let resolved = resolve_spawn_command_from(
+            lookup_from(vars),
+            || Ok(PathBuf::from("/should/not/be/used")),
+            |_: &Path| true,
+        );
         assert_eq!(resolved.binary, PathBuf::from("/opt/wrapper/shim"));
         assert_eq!(
             resolved.base_args,
@@ -1208,9 +1394,11 @@ mod tests {
                 (SUBAGENT_BINARY_ENV_VAR, "/opt/scripted/fake-cyrup"),
                 (SUBAGENT_BINARY_ARGS_ENV_VAR, raw),
             ]);
-            let resolved = resolve_spawn_command_from(lookup_from(vars), || {
-                Ok(PathBuf::from("/should/not/be/used"))
-            });
+            let resolved = resolve_spawn_command_from(
+                lookup_from(vars),
+                || Ok(PathBuf::from("/should/not/be/used")),
+                |_: &Path| true,
+            );
             assert_eq!(
                 resolved.binary,
                 PathBuf::from("/opt/scripted/fake-cyrup"),
@@ -1226,14 +1414,17 @@ mod tests {
     #[test]
     fn resolve_spawn_command_ignores_base_args_without_a_binary_override() {
         let vars = StdHashMap::from([(SUBAGENT_BINARY_ARGS_ENV_VAR, r#"["--injected"]"#)]);
-        let resolved = resolve_spawn_command_from(lookup_from(vars), || {
-            Ok(PathBuf::from("/resolved/via/current-exe"))
-        });
+        let resolved = resolve_spawn_command_from(
+            lookup_from(vars),
+            || Ok(PathBuf::from("/resolved/via/current-exe")),
+            |_: &Path| true,
+        );
         assert_eq!(resolved.binary, PathBuf::from("/resolved/via/current-exe"));
         assert!(
             resolved.base_args.is_empty(),
-            "tiers 2 and 3 resolve this crate's own binary, which by construction needs no \
-             leading argv, so a stray args var must never inject argv into an ordinary run"
+            "every tier below the override resolves this crate's own binary, which by \
+             construction needs no leading argv, so a stray args var must never inject argv \
+             into an ordinary run"
         );
     }
 
@@ -1243,9 +1434,11 @@ mod tests {
             (SUBAGENT_BINARY_ENV_VAR, "   "),
             (SUBAGENT_BINARY_ARGS_ENV_VAR, r#"["--injected"]"#),
         ]);
-        let resolved = resolve_spawn_command_from(lookup_from(vars), || {
-            Ok(PathBuf::from("/resolved/via/current-exe"))
-        });
+        let resolved = resolve_spawn_command_from(
+            lookup_from(vars),
+            || Ok(PathBuf::from("/resolved/via/current-exe")),
+            |_: &Path| true,
+        );
         assert_eq!(resolved.binary, PathBuf::from("/resolved/via/current-exe"));
         assert!(
             resolved.base_args.is_empty(),
@@ -1266,6 +1459,159 @@ mod tests {
             !resolved.binary.as_os_str().is_empty(),
             "some non-empty binary path/name must always be resolved"
         );
+    }
+
+    // ---- resolve_spawn_command: the inode tier and its neighbours (tiers 3 and 4) ----
+    //
+    // The cases above only ever settle on tiers 1, 2 and 5, so without the cases below the entire
+    // tier-3 branch could be deleted and the suite would stay green — on the one branch that is
+    // the whole reason a subagent spawn survives its own binary being rebuilt underneath it.
+    // Tier 4 needs them even more: on Linux `/proc/self/exe` always exists, so tier 4 is
+    // unreachable in production there and an injected predicate is the ONLY way it ever executes.
+
+    #[test]
+    fn resolve_spawn_command_falls_back_to_the_running_inode_when_current_exe_was_deleted() {
+        // The exact production failure this ladder exists for: `cargo build` replaced
+        // `target/debug/cyrup` by rename while this process was executing it, so the kernel
+        // appends " (deleted)" to `/proc/<pid>/exe` and `current_exe()` hands that back as
+        // `Ok(..)` rather than `Err(..)`.
+        let resolved = resolve_spawn_command_from(
+            lookup_from(StdHashMap::new()),
+            || Ok(PathBuf::from("/build/target/debug/cyrup (deleted)")),
+            exists_only(&[PROC_SELF_EXE]),
+        );
+        assert_eq!(
+            resolved.binary,
+            PathBuf::from(PROC_SELF_EXE),
+            "a current_exe() path that no longer exists must fall through to the inode tier — \
+             returning it verbatim is precisely what made every subagent spawn fail with ENOENT"
+        );
+        assert!(
+            resolved.base_args.is_empty(),
+            "the inode tier resolves this crate's own binary, which needs no leading argv"
+        );
+    }
+
+    #[test]
+    fn resolve_spawn_command_falls_back_to_the_running_inode_when_current_exe_fails() {
+        let resolved = resolve_spawn_command_from(
+            lookup_from(StdHashMap::new()),
+            || Err(std::io::Error::other("current_exe unavailable")),
+            exists_only(&[PROC_SELF_EXE]),
+        );
+        assert_eq!(
+            resolved.binary,
+            PathBuf::from(PROC_SELF_EXE),
+            "the PATH fallback must not be reached while this process's own inode is still \
+             addressable: PATH may resolve to an entirely different build, whereas the inode is \
+             byte-identical to this parent"
+        );
+    }
+
+    #[test]
+    fn resolve_spawn_command_prefers_an_existing_current_exe_over_the_inode_tier() {
+        let resolved = resolve_spawn_command_from(
+            lookup_from(StdHashMap::new()),
+            || Ok(PathBuf::from("/usr/local/bin/cyrup")),
+            exists_only(&["/usr/local/bin/cyrup", PROC_SELF_EXE]),
+        );
+        assert_eq!(
+            resolved.binary,
+            PathBuf::from("/usr/local/bin/cyrup"),
+            "the ordinary case (released install or an untouched `cargo run` build) must keep \
+             naming the real program path so argv[0] and `ps` stay natural; the inode tier is \
+             strictly for when that path has gone"
+        );
+    }
+
+    #[test]
+    fn resolve_spawn_command_uses_a_real_file_named_deleted_verbatim_without_stripping() {
+        // Disambiguation guarantee: the UNSTRIPPED path is probed first, so a file whose name
+        // genuinely ends in the kernel's marker is honoured as-is. That ordering is what makes
+        // tier 4's strip exact rather than a heuristic — note both the odd name and its stripped
+        // neighbour exist here, so a resolver that stripped first would pick the wrong binary.
+        let odd = "/opt/builds/cyrup (deleted)";
+        let resolved = resolve_spawn_command_from(
+            lookup_from(StdHashMap::new()),
+            || Ok(PathBuf::from(odd)),
+            exists_only(&[odd, "/opt/builds/cyrup", PROC_SELF_EXE]),
+        );
+        assert_eq!(
+            resolved.binary,
+            PathBuf::from(odd),
+            "an existing file whose name really does end in \" (deleted)\" must be spawned \
+             verbatim, never stripped to a different neighbouring binary"
+        );
+    }
+
+    #[test]
+    fn resolve_spawn_command_recovers_the_stripped_path_when_the_inode_tier_is_unavailable() {
+        // The non-Linux route: no `/proc`, so the marker-stripped path is the last recovery
+        // before PATH.
+        let resolved = resolve_spawn_command_from(
+            lookup_from(StdHashMap::new()),
+            || Ok(PathBuf::from("/opt/cyrup/bin/cyrup (deleted)")),
+            exists_only(&["/opt/cyrup/bin/cyrup"]),
+        );
+        assert_eq!(
+            resolved.binary,
+            PathBuf::from("/opt/cyrup/bin/cyrup"),
+            "with no /proc to address the running inode, the rebuilt binary at the same path is \
+             a nearer answer than an unrelated PATH install"
+        );
+        assert!(resolved.base_args.is_empty());
+    }
+
+    #[test]
+    fn resolve_spawn_command_prefers_the_env_override_over_the_inode_tier() {
+        let vars = StdHashMap::from([(SUBAGENT_BINARY_ENV_VAR, "/opt/scripted/fake-cyrup")]);
+        let resolved = resolve_spawn_command_from(
+            lookup_from(vars),
+            || Ok(PathBuf::from("/build/target/debug/cyrup (deleted)")),
+            exists_only(&[PROC_SELF_EXE]),
+        );
+        assert_eq!(
+            resolved.binary,
+            PathBuf::from("/opt/scripted/fake-cyrup"),
+            "operator intent outranks every self-resolution tier, the inode tier included — a \
+             reordering that let /proc/self/exe win would silently ignore the override this \
+             crate's own integration tests depend on"
+        );
+    }
+
+    #[test]
+    fn arg0_presents_the_program_name_only_for_the_inode_tier() {
+        let inode_tier = SpawnCommand {
+            binary: PathBuf::from(PROC_SELF_EXE),
+            base_args: Vec::new(),
+        };
+        assert_eq!(
+            inode_tier.arg0(),
+            Some(FALLBACK_BINARY_NAME),
+            "exec'ing through the magic link must still present a readable argv[0], or every \
+             subagent child shows up as \"/proc/self/exe\" in `ps`"
+        );
+
+        for ordinary in [
+            "/usr/local/bin/cyrup",
+            FALLBACK_BINARY_NAME,
+            "/opt/scripted/fake-cyrup",
+            // Near-misses that must NOT be treated as the inode tier: the match is exact, not a
+            // `/proc` prefix heuristic.
+            "/proc/self/exe-resolved",
+            "/proc/1234/exe",
+        ] {
+            let command = SpawnCommand {
+                binary: PathBuf::from(ordinary),
+                base_args: Vec::new(),
+            };
+            assert_eq!(
+                command.arg0(),
+                None,
+                "a tier that already names a real program path must leave argv[0] alone: \
+                 {ordinary}"
+            );
+        }
     }
 
     // ---- ChildSpawnSpec::resolve_task_arg (R-SA-047) ----

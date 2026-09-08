@@ -118,7 +118,11 @@ impl AcpFailure {
             // `MissingSessionCwd` is the one worth naming: it is `session/prompt`'s realistic
             // failure for a session whose recorded cwd was deleted (`ACP-221`), and it must reach
             // the client as an error the connection survives, never as an auth prompt.
-            E::MissingSessionCwd(_)
+            // `InjectUnavailable` is a host-wiring fault: a background task tried to surface a
+            // message into a session whose injection seam is not bound. It is internal to this
+            // agent and never a credential problem, so it must not raise an Authenticate banner.
+            E::InjectUnavailable(_)
+            | E::MissingSessionCwd(_)
             | E::NoModelForSummarization
             | E::StreamingNeedsBehavior
             | E::ExtensionCommandNotQueueable(_)

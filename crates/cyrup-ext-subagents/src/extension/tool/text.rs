@@ -3,20 +3,26 @@
 
 use crate::background::{RunState, run_status};
 
-/// The `subagent` tool's full multi-section description (R-SA-128, C8) — ported verbatim from
+/// The `subagent` tool's full multi-section description (R-SA-128, C8) — ported from
 /// pi-subagents' registered tool description (`src/extension/index.ts:461-495`), the string the LLM
 /// actually reads to decide how to drive the tool. Reproducing it faithfully is what lets a caller
 /// discover the management (`action: "list"/"get"/…`), control (`status`/`interrupt`/`resume`/
 /// `append-step`), CHAIN, and PARALLEL shapes at all — not just the SINGLE shape the pre-C8 schema
 /// advertised. The pi tool-description executable spec (`test/unit/tool-description.test.ts`) pins
-/// several substrings of this text (the `action: "list"` inspect line, `executable/non-disabled`,
-/// `proactive skill subagent suggestions`, the `output?,reads?,progress?` PARALLEL shape, the
-/// `timeoutMs`/`maxRuntimeMs` `only for foreground runs` / `omit for async/background runs` note);
-/// this crate's own `subagent_tool_schema_exposes_the_full_pi_parameter_union` test re-pins them.
+/// several substrings of this text (`executable/non-disabled`, `proactive skill subagent
+/// suggestions`, the `output?,reads?,progress?` PARALLEL shape, the timeout note); this crate's own
+/// `subagent_tool_schema_exposes_the_full_pi_parameter_union` test re-pins them.
+///
+/// SCOPE_19/§5.1 [CYRUP-DELTA] — the first EXECUTION bullet diverges from upstream's *"Before
+/// executing, use { action: "list" } to inspect configured agents/chains."*: the six builtins ship
+/// compiled in (`resources/agents/`) and cannot change at runtime, so mandating a discovery call
+/// before every execution taxed the common case one round trip to learn a constant. The bullet now
+/// names the builtins with one-line purposes and scopes `list` to what it can actually reveal —
+/// project/user agents, chains, and disabled state.
 pub(crate) const SUBAGENT_TOOL_DESCRIPTION: &str = r#"Delegate to subagents or manage agent definitions.
 
 EXECUTION (use exactly ONE mode):
-• Before executing, use { action: "list" } to inspect configured agents/chains. Only execute agents listed as executable/non-disabled.
+• Builtin agents, always executable: delegate (inherit-model lightweight child), oracle (high-context decision consistency), researcher (focused research brief), reviewer (diffs/plans/PR validation), scout (fast codebase recon), worker (implementation). Use { action: "list" } when you need project- or user-defined agents and chains, or to check what is disabled; only execute agents listed as executable/non-disabled.
 • SINGLE: { agent, task? } - one task; omit task for self-contained agents
 • CHAIN: { chain: [{agent:"agent-a"}, {parallel:[{agent:"agent-b",count:3}]}] } - sequential pipeline with optional parallel fan-out
 • PARALLEL: { tasks: [{agent,task,count?,output?,reads?,progress?}, ...], concurrency?: number, worktree?: true } - concurrent execution (worktree: isolate each task in a git worktree)

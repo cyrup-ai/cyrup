@@ -252,7 +252,7 @@ pub(crate) fn assistant_message_from_event(
 ///
 /// This mirrors the `--resume` walk, which has read `c.display` off the persisted entry since it
 /// was written (`session_bind.rs`, pi `:3470`); the live path had no `display` to read until
-/// [`cyrup_agent::AgentMessage::Custom`] carried one.
+/// [`cyrup_session_svc::AgentMessage::Custom`] carried one.
 pub(crate) fn displayable_custom_message_from_event(
     ev: &AgentSessionEvent,
 ) -> Option<(String, String)> {

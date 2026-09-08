@@ -46,8 +46,12 @@ cyrup_acp::serve_stdio(host).await
 # }
 ```
 
-`serve` takes any transport rather than stdio, which is how `tests/end_to_end.rs` drives the real
-connection over a pair of in-memory channels with no process to spawn.
+This example hands back the same runtime every call, which is enough for one session. A host that
+serves more than one builds a fresh runtime per request, because `SessionManager` disposes the
+runtime it replaces — see `BinaryAcpHost` in `crates/cyrup/src/acp_host.rs`.
+
+`serve` takes any transport rather than stdio, which is how the tests drive the real connection over
+a pair of in-memory channels with no process to spawn.
 
 ## In-process, which is the inversion of upstream
 
@@ -112,13 +116,15 @@ table-testable without a connection. `connection` and `sessions` hold everything
 
 ## Tests
 
-`cargo test -p cyrup-acp` runs 243 unit tests and 5 end-to-end tests. The end-to-end file builds a
-real `AgentSessionRuntime` over the scripted `FauxProvider`, installs it behind `AcpHost`, and runs
-the shipped `serve()` over an in-memory transport — so the frames it asserts are the bytes a client
+`cargo test -p cyrup-acp` runs 243 unit tests and 8 integration tests. The integration tests build a
+real `AgentSessionRuntime` over the scripted `FauxProvider`, install it behind `AcpHost`, and run the
+shipped `serve()` over an in-memory transport — so the frames they assert are the bytes a client
 receives. No network, no credentials, no spawned process.
 
-`the_frame_sequence_is_stable` pins the exact ordered sequence for a tool-calling turn, so a change
-to what a client sees is named rather than discovered downstream.
+They cover a tool-calling turn with its structured diffs, terminal output from `bash`, session
+listing, loading and deletion, mode changes, replay ordering under a concurrent cancel, and teardown
+on stdin EOF. `the_frame_sequence_is_stable` pins the exact ordered sequence for a tool-calling turn,
+so a change to what a client sees is named rather than discovered downstream.
 
 ## Provenance
 
