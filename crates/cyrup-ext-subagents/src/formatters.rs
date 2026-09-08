@@ -59,13 +59,15 @@ pub fn format_model_thinking_opt(model: Option<&str>, thinking: Option<&str>) ->
     }
 }
 
-/// The lowercase mode string pi renders (`SubagentRunMode`): `single`/`parallel`/`chain`.
+/// The lowercase mode string pi renders (`SubagentRunMode`, `shared/types.ts:400`):
+/// `single`/`parallel`/`chain`/`workflow`.
 #[must_use]
 pub fn run_mode_label(mode: RunMode) -> &'static str {
     match mode {
         RunMode::Single => "single",
         RunMode::Parallel => "parallel",
         RunMode::Chain => "chain",
+        RunMode::Workflow => "workflow",
     }
 }
 

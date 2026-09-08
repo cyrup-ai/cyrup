@@ -1,5 +1,44 @@
 # PARITY-GAPS
 
+---
+
+## ⚠ 2026-09-06 — session scoping landed; this document was generated against STALE upstream tags
+
+**Version correction.** This analysis was generated against pi v0.84.1, pi-subagents v0.43.0 and
+pi-intercom v0.9.2. Verified with `git describe --tags` on 2026-09-06, the real upstreams are
+**pi v0.85.1**, **pi-subagents v0.65.1** (HEAD `7fe9dee1`, +50 commits) and **pi-intercom v0.10.1**.
+The 147 items below are therefore a **floor**, not a total, and every "unported" claim needs
+re-checking against the current tag before it is worked.
+
+**Closed by the session-scoping change.** Async subagent results were being delivered to, and
+**deleted by**, the wrong cyrup instance. `<results_dir>` is `<temp_root>/results/<cwd_key>`
+(`background/artifact_roots.rs:281-284`) — keyed by cwd, never by session — and the watcher listed
+it flat, so every concurrent instance in a directory consumed every other instance's results. Now
+closed:
+
+| area | what landed |
+|---|---|
+| result delivery | results partitioned on disk under `result-index/sessions/<enc(session)>/`; `read_dir(results_dir)` removed from the watcher; three-way `DeliveryDisposition` gate (`Unattributed` / `ObserveOnly` / `Deliver`); `delete_after_notify` clears every index |
+| identity | `identity::{SessionId, CompletionOwnerId, IndexSegment, ResultFileName}` — `ResultFile`/`RunStatus`/`RunnerConfig` now carry both identities |
+| control ops | session gates on `stop`, `interrupt`, `steer` and the async transcript view, with upstream's exact refusal strings and a zero-filesystem-trace guarantee on refusal |
+| job tracker | `resume_tracking` no longer adopts other instances' runs — which also stopped it re-widening delivery, since tracked run ids are a candidate source |
+| run-id resolver | prefix/exact resolution scoped before it acquires a caller (it is still unwired) |
+
+**`SUBA-031` is re-scoped.** It was filed as "`wait` scopes by cwd not session". The same root cause
+covered delivery, control, tracking and resolution; `wait` was simply the only surface that had
+already been fixed. One implementation now serves all of them —
+`background::delivery::SessionGate` for "may I act on this run?" and
+`OwnershipSnapshot::owns` for "may I consume this completion?".
+
+**Still open from that work** (upstream files with no cyrup counterpart, all session-scoped
+upstream): `completion-replay.ts` (287 LOC, `SUBA-056`), `wait-subscriptions.ts` (348),
+`terminal-run-index.ts` (138), `foreground-history.ts` (162),
+`async-{stop,steering,dismiss}-action.ts` (418 — cyrup applies their gates from its own control
+layer, but does not port the actions), `active-async-capacity.ts` (516 — per-session concurrency
+cap), `async-retention.ts` (912 — the async-root reaper).
+
+---
+
 > **SECOND REFRESH 2026-09-04, cyrup code HEAD `275c1f85`** (branch `claude/beautiful-feynman-odz1v5`,
 > five code commits off `main` = `a4805955`). **Seven of the eight above-medium rows below closed the
 > same day** — five `09a` rows on landed, both-sides-read code (`SUBA-085`, `SUBA-092`, `SUBA-082`,

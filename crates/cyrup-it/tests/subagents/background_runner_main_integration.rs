@@ -241,6 +241,7 @@ async fn happy_path_writes_status_then_result_both_terminal_and_consistent() {
         "exit_code": 0
     });
     let config = RunnerConfig {
+        completion_owner_id: None,
         turn_budget: None,
         permission_rules: None, // SUBA-073: no policy — the pre-field behaviour
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
@@ -261,7 +262,10 @@ async fn happy_path_writes_status_then_result_both_terminal_and_consistent() {
         ))],
         cwd: dir.path().to_path_buf(),
         session_file: None,
-        session_id: None,
+        // The session-partitioned result index refuses a session-less result outright
+        // (`write_result_file`, pi `result-files.ts:166`), so a runner expected to land a
+        // terminal ResultFile must carry the launching session's identity.
+        session_id: Some("it-session".to_string()),
         global_concurrency_limit: 20,
         worktree_base_dir: None,
         max_subagent_depth: 2,
@@ -274,6 +278,7 @@ async fn happy_path_writes_status_then_result_both_terminal_and_consistent() {
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
+        inherited_session_thinking: None,
         nested_route: None,
         nested_self: None,
         dynamic_fanout_max_items: None,
@@ -354,6 +359,7 @@ async fn result_file_lands_in_the_orchestrator_results_dir_not_a_re_derived_one(
 
     // The config carries the orchestrator's ABSOLUTE roots — the T0.4 fix.
     let config = RunnerConfig {
+        completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
@@ -374,7 +380,10 @@ async fn result_file_lands_in_the_orchestrator_results_dir_not_a_re_derived_one(
         ))],
         cwd: cwd.clone(),
         session_file: None,
-        session_id: None,
+        // The session-partitioned result index refuses a session-less result outright
+        // (`write_result_file`, pi `result-files.ts:166`), so a runner expected to land a
+        // terminal ResultFile must carry the launching session's identity.
+        session_id: Some("it-session".to_string()),
         global_concurrency_limit: 20,
         worktree_base_dir: None,
         max_subagent_depth: 2,
@@ -385,6 +394,7 @@ async fn result_file_lands_in_the_orchestrator_results_dir_not_a_re_derived_one(
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
+        inherited_session_thinking: None,
         nested_route: None,
         nested_self: None,
         dynamic_fanout_max_items: None,
@@ -499,6 +509,7 @@ async fn run_writes_real_events_jsonl_through_the_shared_bounded_writer() {
         "exit_code": 0
     });
     let config = RunnerConfig {
+        completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
@@ -519,7 +530,10 @@ async fn run_writes_real_events_jsonl_through_the_shared_bounded_writer() {
         ))],
         cwd: dir.path().to_path_buf(),
         session_file: None,
-        session_id: None,
+        // The session-partitioned result index refuses a session-less result outright
+        // (`write_result_file`, pi `result-files.ts:166`), so a runner expected to land a
+        // terminal ResultFile must carry the launching session's identity.
+        session_id: Some("it-session".to_string()),
         global_concurrency_limit: 20,
         worktree_base_dir: None,
         max_subagent_depth: 2,
@@ -532,6 +546,7 @@ async fn run_writes_real_events_jsonl_through_the_shared_bounded_writer() {
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
+        inherited_session_thinking: None,
         nested_route: None,
         nested_self: None,
         dynamic_fanout_max_items: None,
@@ -640,6 +655,7 @@ async fn forced_error_path_still_writes_status_then_result_both_terminal() {
         "exit_code": 7
     });
     let config = RunnerConfig {
+        completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
@@ -660,7 +676,10 @@ async fn forced_error_path_still_writes_status_then_result_both_terminal() {
         ))],
         cwd: dir.path().to_path_buf(),
         session_file: None,
-        session_id: None,
+        // The session-partitioned result index refuses a session-less result outright
+        // (`write_result_file`, pi `result-files.ts:166`), so a runner expected to land a
+        // terminal ResultFile must carry the launching session's identity.
+        session_id: Some("it-session".to_string()),
         global_concurrency_limit: 20,
         worktree_base_dir: None,
         max_subagent_depth: 2,
@@ -673,6 +692,7 @@ async fn forced_error_path_still_writes_status_then_result_both_terminal() {
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
+        inherited_session_thinking: None,
         nested_route: None,
         nested_self: None,
         dynamic_fanout_max_items: None,
@@ -700,9 +720,15 @@ async fn forced_error_path_still_writes_status_then_result_both_terminal() {
 }
 
 /// A run whose one-shot config never existed at all (e.g. a caller passed a bogus path) still
-/// reaches a terminal, consistent Failed status.json/ResultFile pair via `finish_run`'s own
-/// no-config error branch — proving R-SA-077's ordering invariant holds even on this crate's own
-/// internal-error exit path, not merely a subprocess exit-code failure.
+/// reaches a terminal Failed `status.json` via `finish_run`'s own no-config error branch —
+/// proving R-SA-077's terminality holds even on this crate's own internal-error exit path, not
+/// merely a subprocess exit-code failure.
+///
+/// The terminal `ResultFile`, by contrast, is REFUSED on this path: with no config there is no
+/// launching-session identity, and the session-partitioned result index refuses a session-less
+/// payload outright (`write_result_file`, pi `result-files.ts:166` throws) — an unattributable
+/// result could never be indexed, delivered, or cleaned up. `status.json` is written first and
+/// independently, so the terminal state still reaches every status reader.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn missing_config_file_still_reaches_a_terminal_failed_state() {
     let dir = tempfile::tempdir().expect("real tempdir");
@@ -733,19 +759,16 @@ async fn missing_config_file_still_reaches_a_terminal_failed_state() {
             .expect("status.json exists"),
     )
     .expect("parse status");
-    let result_file: ResultFile = serde_json::from_slice(
-        &tokio::fs::read(&run_paths.result)
-            .await
-            .expect("ResultFile exists"),
-    )
-    .expect("parse result");
 
     assert_eq!(status.state, RunState::Failed);
-    assert_eq!(result_file.state, RunState::Failed);
-    assert!(!result_file.success);
+    let result_file_exists = tokio::fs::try_exists(&run_paths.result)
+        .await
+        .expect("probe result path");
     assert!(
-        !result_file.results.is_empty(),
-        "a synthesized diagnostic result must be present even with no config at all"
+        !result_file_exists,
+        "a config-less run has no launching-session identity, and the session-partitioned index \
+         refuses a session-less result outright (pi `result-files.ts:166`) — a public ResultFile \
+         here would be an unattributable orphan"
     );
 }
 
@@ -780,6 +803,7 @@ async fn append_request_written_after_start_is_consumed_next_iteration() {
         .expect("mkdir run_dir");
 
     let config = RunnerConfig {
+        completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
@@ -797,7 +821,10 @@ async fn append_request_written_after_start_is_consumed_next_iteration() {
         steps: vec![RunnerStep::SingleStep(single_step("first", "first task"))],
         cwd: dir.path().to_path_buf(),
         session_file: None,
-        session_id: None,
+        // The session-partitioned result index refuses a session-less result outright
+        // (`write_result_file`, pi `result-files.ts:166`), so a runner expected to land a
+        // terminal ResultFile must carry the launching session's identity.
+        session_id: Some("it-session".to_string()),
         global_concurrency_limit: 20,
         worktree_base_dir: None,
         max_subagent_depth: 2,
@@ -810,6 +837,7 @@ async fn append_request_written_after_start_is_consumed_next_iteration() {
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
+        inherited_session_thinking: None,
         nested_route: None,
         nested_self: None,
         dynamic_fanout_max_items: None,
@@ -919,6 +947,7 @@ async fn late_interrupt_after_last_step_completes_does_not_downgrade_a_finished_
     // exactly the shape needed to race an interrupt against natural completion with nothing left
     // to legitimately pause.
     let config = RunnerConfig {
+        completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
@@ -936,7 +965,10 @@ async fn late_interrupt_after_last_step_completes_does_not_downgrade_a_finished_
         steps: vec![RunnerStep::SingleStep(single_step("only", "only task"))],
         cwd: dir.path().to_path_buf(),
         session_file: None,
-        session_id: None,
+        // The session-partitioned result index refuses a session-less result outright
+        // (`write_result_file`, pi `result-files.ts:166`), so a runner expected to land a
+        // terminal ResultFile must carry the launching session's identity.
+        session_id: Some("it-session".to_string()),
         global_concurrency_limit: 20,
         worktree_base_dir: None,
         max_subagent_depth: 2,
@@ -949,6 +981,7 @@ async fn late_interrupt_after_last_step_completes_does_not_downgrade_a_finished_
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
+        inherited_session_thinking: None,
         nested_route: None,
         nested_self: None,
         dynamic_fanout_max_items: None,
@@ -1085,6 +1118,7 @@ async fn depth_exhausted_run_rejects_the_whole_run_and_spawns_zero_real_processe
         .expect("mkdir run_dir");
 
     let config = RunnerConfig {
+        completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
@@ -1105,7 +1139,10 @@ async fn depth_exhausted_run_rejects_the_whole_run_and_spawns_zero_real_processe
         ))],
         cwd: dir.path().to_path_buf(),
         session_file: None,
-        session_id: None,
+        // The session-partitioned result index refuses a session-less result outright
+        // (`write_result_file`, pi `result-files.ts:166`), so a runner expected to land a
+        // terminal ResultFile must carry the launching session's identity.
+        session_id: Some("it-session".to_string()),
         global_concurrency_limit: 20,
         worktree_base_dir: None,
         // current_depth (0, absent from this test's own real env) >= max_depth (0): blocked.
@@ -1118,6 +1155,7 @@ async fn depth_exhausted_run_rejects_the_whole_run_and_spawns_zero_real_processe
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
+        inherited_session_thinking: None,
         nested_route: None,
         nested_self: None,
         dynamic_fanout_max_items: None,
@@ -1228,6 +1266,7 @@ async fn status_json_carries_live_current_tool_during_a_run() {
         .expect("mkdir run_dir");
 
     let config = RunnerConfig {
+        completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
@@ -1248,7 +1287,10 @@ async fn status_json_carries_live_current_tool_during_a_run() {
         ))],
         cwd: dir.path().to_path_buf(),
         session_file: None,
-        session_id: None,
+        // The session-partitioned result index refuses a session-less result outright
+        // (`write_result_file`, pi `result-files.ts:166`), so a runner expected to land a
+        // terminal ResultFile must carry the launching session's identity.
+        session_id: Some("it-session".to_string()),
         global_concurrency_limit: 20,
         worktree_base_dir: None,
         max_subagent_depth: 2,
@@ -1259,6 +1301,7 @@ async fn status_json_carries_live_current_tool_during_a_run() {
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
+        inherited_session_thinking: None,
         nested_route: None,
         nested_self: None,
         dynamic_fanout_max_items: None,
@@ -1354,6 +1397,7 @@ async fn interrupting_a_single_step_run_actually_signals_the_mid_flight_child() 
         .expect("mkdir run_dir");
 
     let config = RunnerConfig {
+        completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
@@ -1374,7 +1418,10 @@ async fn interrupting_a_single_step_run_actually_signals_the_mid_flight_child() 
         ))],
         cwd: dir.path().to_path_buf(),
         session_file: None,
-        session_id: None,
+        // The session-partitioned result index refuses a session-less result outright
+        // (`write_result_file`, pi `result-files.ts:166`), so a runner expected to land a
+        // terminal ResultFile must carry the launching session's identity.
+        session_id: Some("it-session".to_string()),
         global_concurrency_limit: 20,
         worktree_base_dir: None,
         max_subagent_depth: 2,
@@ -1385,6 +1432,7 @@ async fn interrupting_a_single_step_run_actually_signals_the_mid_flight_child() 
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
+        inherited_session_thinking: None,
         nested_route: None,
         nested_self: None,
         dynamic_fanout_max_items: None,
@@ -1501,6 +1549,7 @@ async fn runner_config_control_reaches_every_step_and_raises_real_events() {
         control: Option<cyrup_ext_subagents::exec::control::ResolvedControlConfig>,
     ) -> RunnerConfig {
         RunnerConfig {
+            completion_owner_id: None,
             turn_budget: None,
             permission_rules: None,
             // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
@@ -1519,7 +1568,10 @@ async fn runner_config_control_reaches_every_step_and_raises_real_events() {
             ))],
             cwd: dir.to_path_buf(),
             session_file: None,
-            session_id: None,
+            // The session-partitioned result index refuses a session-less result outright
+            // (`write_result_file`, pi `result-files.ts:166`), so a runner expected to land a
+            // terminal ResultFile must carry the launching session's identity.
+            session_id: Some("it-session".to_string()),
             global_concurrency_limit: 20,
             worktree_base_dir: None,
             max_subagent_depth: 2,
@@ -1530,6 +1582,7 @@ async fn runner_config_control_reaches_every_step_and_raises_real_events() {
             chain_dir: None,
             orchestrator_intercom_target: None,
             inherited_session_model: None,
+            inherited_session_thinking: None,
             nested_route: None,
             nested_self: None,
             dynamic_fanout_max_items: None,
@@ -1620,6 +1673,7 @@ async fn the_runner_writes_the_artifact_quadruple_and_honours_session_dir_and_sh
     step.skills = Some(Vec::new());
 
     let config = RunnerConfig {
+        completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
@@ -1636,7 +1690,10 @@ async fn the_runner_writes_the_artifact_quadruple_and_honours_session_dir_and_sh
         steps: vec![RunnerStep::SingleStep(step)],
         cwd: dir.path().to_path_buf(),
         session_file: None,
-        session_id: None,
+        // The session-partitioned result index refuses a session-less result outright
+        // (`write_result_file`, pi `result-files.ts:166`), so a runner expected to land a
+        // terminal ResultFile must carry the launching session's identity.
+        session_id: Some("it-session".to_string()),
         global_concurrency_limit: 20,
         worktree_base_dir: None,
         max_subagent_depth: 2,
@@ -1647,6 +1704,7 @@ async fn the_runner_writes_the_artifact_quadruple_and_honours_session_dir_and_sh
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
+        inherited_session_thinking: None,
         nested_route: None,
         nested_self: None,
         dynamic_fanout_max_items: None,
@@ -1747,6 +1805,7 @@ async fn the_runner_writes_no_artifacts_when_the_run_disabled_them() {
         "exit_code": 0
     });
     let config = RunnerConfig {
+        completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
@@ -1770,7 +1829,10 @@ async fn the_runner_writes_no_artifacts_when_the_run_disabled_them() {
         ))],
         cwd: dir.path().to_path_buf(),
         session_file: None,
-        session_id: None,
+        // The session-partitioned result index refuses a session-less result outright
+        // (`write_result_file`, pi `result-files.ts:166`), so a runner expected to land a
+        // terminal ResultFile must carry the launching session's identity.
+        session_id: Some("it-session".to_string()),
         global_concurrency_limit: 20,
         worktree_base_dir: None,
         max_subagent_depth: 2,
@@ -1781,6 +1843,7 @@ async fn the_runner_writes_no_artifacts_when_the_run_disabled_them() {
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
+        inherited_session_thinking: None,
         nested_route: None,
         nested_self: None,
         dynamic_fanout_max_items: None,
@@ -1817,6 +1880,7 @@ async fn an_already_passed_deadline_in_the_config_times_the_run_out_rather_than_
         "exit_code": 0
     });
     let config = RunnerConfig {
+        completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
@@ -1837,7 +1901,10 @@ async fn an_already_passed_deadline_in_the_config_times_the_run_out_rather_than_
         ))],
         cwd: dir.path().to_path_buf(),
         session_file: None,
-        session_id: None,
+        // The session-partitioned result index refuses a session-less result outright
+        // (`write_result_file`, pi `result-files.ts:166`), so a runner expected to land a
+        // terminal ResultFile must carry the launching session's identity.
+        session_id: Some("it-session".to_string()),
         global_concurrency_limit: 20,
         worktree_base_dir: None,
         max_subagent_depth: 2,
@@ -1848,6 +1915,7 @@ async fn an_already_passed_deadline_in_the_config_times_the_run_out_rather_than_
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
+        inherited_session_thinking: None,
         nested_route: None,
         nested_self: None,
         dynamic_fanout_max_items: None,
@@ -1916,6 +1984,7 @@ async fn stopping_a_mid_flight_run_ends_it_stopped_not_paused_and_not_failed() {
         .expect("mkdir run_dir");
 
     let config = RunnerConfig {
+        completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
@@ -1934,7 +2003,10 @@ async fn stopping_a_mid_flight_run_ends_it_stopped_not_paused_and_not_failed() {
         ))],
         cwd: dir.path().to_path_buf(),
         session_file: None,
-        session_id: None,
+        // The session-partitioned result index refuses a session-less result outright
+        // (`write_result_file`, pi `result-files.ts:166`), so a runner expected to land a
+        // terminal ResultFile must carry the launching session's identity.
+        session_id: Some("it-session".to_string()),
         global_concurrency_limit: 20,
         worktree_base_dir: None,
         max_subagent_depth: 2,
@@ -1945,6 +2017,7 @@ async fn stopping_a_mid_flight_run_ends_it_stopped_not_paused_and_not_failed() {
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
+        inherited_session_thinking: None,
         nested_route: None,
         nested_self: None,
         dynamic_fanout_max_items: None,
@@ -2159,6 +2232,7 @@ fn child_stop_chain_config(
     results_dir: &Path,
 ) -> RunnerConfig {
     RunnerConfig {
+        completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
         usage_budget: None,
@@ -2175,7 +2249,10 @@ fn child_stop_chain_config(
         ],
         cwd: dir.to_path_buf(),
         session_file: None,
-        session_id: None,
+        // The session-partitioned result index refuses a session-less result outright
+        // (`write_result_file`, pi `result-files.ts:166`), so a runner expected to land a
+        // terminal ResultFile must carry the launching session's identity.
+        session_id: Some("it-session".to_string()),
         global_concurrency_limit: 20,
         worktree_base_dir: None,
         max_subagent_depth: 2,
@@ -2186,6 +2263,7 @@ fn child_stop_chain_config(
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
+        inherited_session_thinking: None,
         nested_route: None,
         nested_self: None,
         dynamic_fanout_max_items: None,

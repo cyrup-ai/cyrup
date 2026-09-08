@@ -153,6 +153,7 @@ fn base_agent_config(model: &str) -> AgentConfig {
 
 fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
+        structured_output_dir: None,
         spawn_command: None,
         child_env: std::collections::HashMap::new(),
         turn_budget: None,
@@ -656,6 +657,7 @@ async fn a_stop_landing_with_a_timeout_ends_the_run_stopped_not_failed() {
         .expect("mkdir run dir");
 
     let config = RunnerConfig {
+        completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
@@ -674,7 +676,10 @@ async fn a_stop_landing_with_a_timeout_ends_the_run_stopped_not_failed() {
         ))],
         cwd: dir.path().to_path_buf(),
         session_file: None,
-        session_id: None,
+        // The session-partitioned result index refuses a session-less result outright
+        // (`write_result_file`, pi `result-files.ts:166`), so a runner expected to land a
+        // terminal ResultFile must carry the launching session's identity.
+        session_id: Some("it-session".to_string()),
         global_concurrency_limit: 20,
         worktree_base_dir: None,
         max_subagent_depth: 2,
@@ -685,6 +690,7 @@ async fn a_stop_landing_with_a_timeout_ends_the_run_stopped_not_failed() {
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
+        inherited_session_thinking: None,
         nested_route: None,
         nested_self: None,
         dynamic_fanout_max_items: None,

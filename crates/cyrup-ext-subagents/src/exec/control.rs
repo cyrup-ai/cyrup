@@ -1151,6 +1151,16 @@ impl ControlMonitor {
         self.activity_state
     }
 
+    /// The path the most recently started tool is operating on, while that call is still in
+    /// flight — pi `progress.currentPath` (`execution.ts:825`, cleared with `currentTool` at
+    /// `:819`). cyrup folds the per-event path tracking here rather than on
+    /// [`crate::exec::progress::AgentProgress`], so this accessor is what the timeout-recovery
+    /// summary (SUBA-3c, `execution.ts:1510`) reads for its `- active path:` line.
+    #[must_use]
+    pub fn current_path(&self) -> Option<&str> {
+        self.current_path.as_deref()
+    }
+
     /// pi `progress.activityState = undefined` on a soft interrupt (`execution.ts:1090`, and again
     /// at `:1113` once the interrupt settles): an intentionally paused run is NOT "needing
     /// attention", so a still-debouncing notice must stop being actionable the moment the pause

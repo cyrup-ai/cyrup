@@ -350,9 +350,17 @@ pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
     // `watchdog.configure` exists has no advertised way to say WHAT to configure.
     props.insert("scope".to_string(), serde_json::json!({ "type": "string", "enum": ["session", "user", "project"], "description": "Scope for action='watchdog.configure'. Defaults to session to avoid persistent settings writes unless user/project is explicit." }));
     props.insert("target".to_string(), serde_json::json!({ "type": "string", "enum": ["main", "children", "child"], "description": "Target for watchdog actions." }));
-    props.insert("thinking".to_string(), serde_json::json!({ "anyOf": [{ "type": "string" }, { "type": "boolean", "enum": [false] }], "description": "Thinking level for action='watchdog.configure' (off/minimal/low/medium/high/xhigh/max, inherit, or false for off)." }));
+    // SCOPE_19/A1 [CYRUP-DELTA] — the description no longer scopes `thinking` to
+    // `watchdog.configure`: the launch path honours it (rung 2 of the resolution ladder in
+    // `SubagentExecutor::run_foreground_impl`) and omitting it inherits the live parent session's
+    // level via `SubagentExecutor::remembered_parent_thinking`. Upstream never wired this param
+    // into launches at all; cyrup does, so the schema says so.
+    props.insert("thinking".to_string(), serde_json::json!({ "anyOf": [{ "type": "string" }, { "type": "boolean", "enum": [false] }], "description": "Reasoning level for the single-agent child (off/minimal/low/medium/high/xhigh/max, or false for off), like model. Omit it: the child inherits this session's level, which keeps model and effort aligned so the shared prompt prefix stays cacheable. Set it only to deliberately spend more or less reasoning than the parent; a model ':level' suffix wins over this parameter. Also configures action='watchdog.configure'." }));
     props.insert("id".to_string(), serde_json::json!({ "type": "string", "description": "Run id or prefix for action='status', action='interrupt', action='stop', action='resume', action='steer', or action='append-step'." }));
-    props.insert("runId".to_string(), serde_json::json!({ "type": "string", "description": "Target run ID for action='interrupt', action='stop', action='resume', action='steer', or action='append-step'. Defaults to the most recently active controllable run for interrupt. Prefer id for new calls." }));
+    // SCOPE_19/B [CYRUP-DELTA] — `runId` defers to `id` and now says so structurally: it carries
+    // `deprecated: true` and one pointer line instead of a description longer than the property it
+    // defers to. Dispatch still accepts it everywhere `id` is accepted.
+    props.insert("runId".to_string(), serde_json::json!({ "type": "string", "deprecated": true, "description": "Deprecated alias of id for action='interrupt', action='stop', action='resume', action='steer', or action='append-step'; still accepted. Prefer id." }));
     props.insert("dir".to_string(), serde_json::json!({ "type": "string", "description": "Async run directory for action='status', action='stop', action='resume', or action='steer'." }));
     props.insert("index".to_string(), serde_json::json!({ "type": "integer", "minimum": 0, "description": "Zero-based child index for actions that target a specific child or transcript." }));
     // SUBA-087 — pi `extension/schemas.ts:306` @v0.64.0, description VERBATIM. Advertised because
@@ -371,10 +379,11 @@ pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
     }));
     props.insert("lines".to_string(), serde_json::json!({ "type": "integer", "minimum": 1, "maximum": 500, "description": "Maximum transcript lines for action='status', view='transcript'. Defaults to 80." }));
     // SUBA-055 — pi `extension/schemas.ts:281` @v0.47.1 is `topic: Type.Optional(Type.String())`:
-    // no enum, no description. Reproduced exactly, including the absence of the description — an
-    // invented one would be cyrup-original model-facing text, and the valid set is already the
-    // unknown-topic message's job (`registration::guide::read_subagent_guide`).
-    props.insert("topic".to_string(), serde_json::json!({ "type": "string" }));
+    // no enum, no description.
+    // SCOPE_19/B [CYRUP-DELTA] — a description is added anyway: a caller-facing property with no
+    // description is a question the schema forces the model to spend a call answering. The valid
+    // set stays the unknown-topic message's job (`registration::guide::read_subagent_guide`).
+    props.insert("topic".to_string(), serde_json::json!({ "type": "string", "description": "Guide topic for action='guide'. Omitted: 'overview' (the packaged README)." }));
     props.insert("message".to_string(), serde_json::json!({ "type": "string", "description": "Follow-up message for action='resume' or non-terminal guidance for action='steer'. Use index to choose a child from multi-child runs." }));
     // SUBA-049 — pi `extension/schemas.ts:283` @v0.43.0, description VERBATIM. Advertised together
     // with its consumer in this same change (`SteerDeliveryMode` is read by `control_steer`, written
@@ -408,15 +417,23 @@ pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
         "description": "'fresh' or 'fork' to branch from parent session, or 'profile' to require the selected agent's declared defaultContext. Explicit fresh/fork overrides every child; profile ignores config defaultSubagentContext and fails when an agent has no defaultContext. If omitted, config defaultSubagentContext wins over each agent defaultContext; implicit fork needs a persisted parent session and leaf, else fresh."
     }));
     props.insert("chainDir".to_string(), serde_json::json!({ "type": "string", "description": "Persistent chain artifact directory; defaults to user-scoped temp storage." }));
-    props.insert("async".to_string(), serde_json::json!({ "type": "boolean", "description": "Run in background (default: false, or per config)" }));
-    // SUBA-N03: pi's VERBATIM descriptions (`extension/schemas.ts:265-266` @v0.34.0). These two
-    // read "Optional foreground-only timeout in ms; omit for async/background runs" until now —
-    // an instruction to the model that was both false upstream and, once the async branch started
-    // refusing the param, a self-fulfilling one. Upstream has always said the opposite.
-    props.insert("timeoutMs".to_string(), serde_json::json!({ "type": "integer", "minimum": 1, "description": "Optional run-level timeout in ms for foreground and async/background runs. Alias of maxRuntimeMs." }));
-    props.insert("maxRuntimeMs".to_string(), serde_json::json!({ "type": "integer", "minimum": 1, "description": "Alias of timeoutMs for optional run-level timeout in foreground and async/background runs." }));
+    // SCOPE_19/§4.1 [CYRUP-DELTA] — `async` states the completion contract the runtime message
+    // (`extension/host/slash_render.rs`'s `format_async_started_message`) only reveals AFTER the
+    // caller has already decided. The delivery mechanism is real (completion watcher → session
+    // notification), so the schema documents it at decision time.
+    props.insert("async".to_string(), serde_json::json!({ "type": "boolean", "description": "Run in background (default: false, or per config). On completion a summary notification is delivered into this session automatically; end your turn instead of polling (use the wait tool only when this turn must block)." }));
+    // SUBA-N03: pi's VERBATIM descriptions (`extension/schemas.ts:265-266` @v0.34.0) read
+    // "…Alias of maxRuntimeMs." / "Alias of timeoutMs…" — mutually circular, answering neither of
+    // the caller's questions (which one to use; what omitting does).
+    // SCOPE_19/B [CYRUP-DELTA] — `timeoutMs` is the advertised spelling and states its omitted
+    // behaviour; `maxRuntimeMs` carries `deprecated: true` and defers. Dispatch still accepts both
+    // and still cross-validates them (`resolve_foreground_timeout`).
+    props.insert("timeoutMs".to_string(), serde_json::json!({ "type": "integer", "minimum": 1, "description": "Optional run-level timeout in ms for foreground and async/background runs. Omitted: the agent's or configured default for foreground runs; async runs use the async default. Prefer this over maxRuntimeMs." }));
+    props.insert("maxRuntimeMs".to_string(), serde_json::json!({ "type": "integer", "minimum": 1, "deprecated": true, "description": "Deprecated alias of timeoutMs; still accepted." }));
     props.insert("agentScope".to_string(), serde_json::json!({ "type": "string", "description": "Agent discovery scope: 'user', 'project', or 'both' (default: 'both'; project wins on name collisions)" }));
-    props.insert("cwd".to_string(), serde_json::json!({ "type": "string" }));
+    // SCOPE_19/B [CYRUP-DELTA] — upstream leaves `cwd` undescribed; a property with no description
+    // makes a careful caller set it defensively. It is read by every execution mode.
+    props.insert("cwd".to_string(), serde_json::json!({ "type": "string", "description": "Working directory for the run (agent discovery root and base for relative paths). Default: the session's cwd." }));
     props.insert("artifacts".to_string(), serde_json::json!({ "type": "boolean", "description": "Write debug artifacts (default: true)" }));
     // SUBA-N06: `includeProgress` is advertised again, in pi's own position (between `artifacts`
     // and `share`, `schemas.ts:271-273` @v0.34.0) and with pi's description verbatim. It was
@@ -435,17 +452,29 @@ pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
     // ([`crate::exec::control::resolve_control_config`]) on the foreground path via
     // `SingleRunOverrides::control` and on the async path via `RunnerConfig::control`, and drives
     // the live attention/notice pipeline in both. pi gives the top-level entry no description of
-    // its own, so neither does this.
-    props.insert("control".to_string(), sj_control_overrides());
-    // pi's own description (`schemas.ts:286`) is kept VERBATIM, including its stale
-    // "Relative paths resolve against cwd" clause: pi's `resolveSingleOutputPath`
-    // (`single-output.ts:64-77`) only falls back to a cwd when no `relativeBaseDir` is supplied, and
-    // `runSinglePath` always supplies one (`resolveSingleRunOutputBaseDir`, `:2882`). Both sides
-    // therefore resolve a relative `output` against the run's scoped output dir; the sentence is
-    // upstream's inaccuracy, reproduced rather than silently corrected (parity over prose).
+    // its own.
+    // SCOPE_19/§5.2 [CYRUP-DELTA] — one clause is added anyway: a description-less optional
+    // property leaves "what does omitting it do" unanswered, which is this task's defect class.
+    props.insert("control".to_string(), {
+        let mut control = sj_control_overrides();
+        if let Some(obj) = control.as_object_mut() {
+            obj.insert(
+                "description".to_string(),
+                serde_json::json!("Live-control thresholds/channels for attention notices on this run. Omitted: the subagents.control config, else built-in defaults."),
+            );
+        }
+        control
+    });
+    // pi's own description (`schemas.ts:286`) kept its stale "Relative paths resolve against cwd"
+    // clause: pi's `resolveSingleOutputPath` (`single-output.ts:64-77`) only falls back to a cwd
+    // when no `relativeBaseDir` is supplied, and `runSinglePath` always supplies one
+    // (`resolveSingleRunOutputBaseDir`, `:2882`).
+    // SCOPE_19/B [CYRUP-DELTA] — the omitted behaviour is stated deliberately (upstream never says
+    // it): `outputMode` directly below marks its default and this property did not, which is what
+    // makes a careful caller set it defensively.
     props.insert("output".to_string(), serde_json::json!({
         "anyOf": [ { "type": "string" }, { "type": "boolean" } ],
-        "description": "Output file for single agent (string), or false to disable. Relative paths resolve against cwd."
+        "description": "Output file for single agent (string), or false to disable. Relative paths resolve against cwd. Omitted: the persona's own output: setting, else no file."
     }));
     props.insert("outputMode".to_string(), serde_json::json!({ "type": "string", "enum": ["inline", "file-only"], "description": "Return saved output inline (default) or only a concise file reference. file-only requires output to be a path." }));
     props.insert("skill".to_string(), serde_json::json!({
@@ -461,8 +490,18 @@ pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
     // unreachable from the SINGLE surface a model actually calls: `subagent({agent, task,
     // outputSchema})` parsed (the root schema is `additionalProperties: true`), dropped the schema
     // without error, and returned free prose. The only workaround was a one-item `tasks:[…]`.
-    // pi gives the top-level entry no description of its own, so neither does this.
-    props.insert("outputSchema".to_string(), sj_json_schema_object());
+    // pi gives the top-level entry no description of its own.
+    // SCOPE_19/§5.2 [CYRUP-DELTA] — one clause is added anyway, same rationale as `control` above.
+    props.insert("outputSchema".to_string(), {
+        let mut output_schema = sj_json_schema_object();
+        if let Some(obj) = output_schema.as_object_mut() {
+            obj.insert(
+                "description".to_string(),
+                serde_json::json!("JSON Schema the child's final output must satisfy; the result then carries typed JSON. Omitted: free-form text output."),
+            );
+        }
+        output_schema
+    });
     // SUBA-047 / pi `extension/schemas.ts:354` @v0.43.0 — `toolBudget:
     // Type.Optional(ToolBudgetOverride)`, shape at `:116-120` (`soft?`, `hard`, `block?`), with
     // upstream's description verbatim. In-baseline since before the ported tag.
@@ -492,22 +531,31 @@ pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
         "minimum": 1,
         "description": "Positive launches to add with action='grant-spawn-budget'. Root interactive parent with native user confirmation only; total grants cannot exceed the original configured cap."
     }));
-    props.insert("acceptance".to_string(), serde_json::json!({
-        "anyOf": [
-            { "type": "string", "enum": ["auto", "none", "attested", "checked", "verified", "reviewed"] },
-            { "type": "boolean", "enum": [false] },
-            { "type": "object", "additionalProperties": true }
-        ],
-        "description": "Optional acceptance policy. Omitted means auto-inferred; verified requires configured runtime commands."
-    }));
+    // SCOPE_19/A2 — the top-level `acceptance` is produced by the SAME builder the four nested
+    // acceptance slots use. It previously hand-inlined its own copy of the wide enum, which is
+    // exactly how `sj_acceptance_override`'s narrowing (see its doc: "none" and "verified" are
+    // hard-rejected by `validate_acceptance_input`) missed this property. No duplicate of the enum
+    // literal survives anywhere, so the next narrowing cannot miss a copy.
+    props.insert("acceptance".to_string(), {
+        let mut acceptance = sj_acceptance_override();
+        if let Some(obj) = acceptance.as_object_mut() {
+            obj.insert(
+                "description".to_string(),
+                serde_json::json!("Optional acceptance policy. Omit it (almost always right): the level is inferred from the task — read-only tasks verify nothing, write tasks require attested evidence. Explicit levels: auto, attested, checked; 'verified' additionally requires a verify[] command list inside an object policy."),
+            );
+        }
+        acceptance
+    });
     // The mission surface (`extension/schemas.ts:297-304` @v0.43.0), advertised together with its
     // dispatch arms: `mission.*` in the `action` enum above routes to
     // `crate::missions::handle_mission_action`, and `missionId`/`mission` additionally bind an
-    // EXECUTION call to a mission via `SubagentTool::execute`'s launch binding. Descriptions are
-    // upstream's own, verbatim.
+    // EXECUTION call to a mission via `SubagentTool::execute`'s launch binding.
+    // SCOPE_19/§5.3 [CYRUP-DELTA] — upstream's one-word descriptions ("Mission id.", "Attached
+    // run mode.") name no action at all; each now names its `mission.*` action in the first
+    // clause, the same convention `scope`/`target`/`lines`/`additional` already follow.
     props.insert(
         "missionId".to_string(),
-        serde_json::json!({ "type": "string", "description": "Mission id." }),
+        serde_json::json!({ "type": "string", "description": "Mission id for mission.show/update/resolve-decision/attach-run/close, or to bind an execution call to a mission." }),
     );
     props.insert("mission".to_string(), serde_json::json!({
         "anyOf": [
@@ -523,20 +571,20 @@ pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
     }));
     props.insert(
         "missionStatus".to_string(),
-        serde_json::json!({ "type": "string", "description": "Mission status." }),
+        serde_json::json!({ "type": "string", "description": "Mission status for mission.create/close." }),
     );
     props.insert("missionScope".to_string(), serde_json::json!({ "type": "string", "description": "Mission list scope: project (default) or global pointer index." }));
     props.insert(
         "runMode".to_string(),
-        serde_json::json!({ "type": "string", "description": "Attached run mode." }),
+        serde_json::json!({ "type": "string", "description": "Attached run mode for mission.attach-run. Omitted: 'external'." }),
     );
     props.insert(
         "runStatus".to_string(),
-        serde_json::json!({ "type": "string", "description": "Attached run status." }),
+        serde_json::json!({ "type": "string", "description": "Attached run status for mission.attach-run." }),
     );
     props.insert(
         "summary".to_string(),
-        serde_json::json!({ "type": "string", "description": "Mission close summary." }),
+        serde_json::json!({ "type": "string", "description": "Summary for mission.close, or the resolution text for mission.resolve-decision." }),
     );
 
     serde_json::json!({
@@ -926,7 +974,14 @@ mod tests {
         // tool-description executable spec pins (test/unit/tool-description.test.ts).
         let desc = SUBAGENT_TOOL_DESCRIPTION;
         for needle in [
-            "use { action: \"list\" } to inspect configured agents/chains",
+            // Was `"use { action: \"list\" } to inspect configured agents/chains"` — upstream's
+            // mandatory-discovery bullet. SCOPE_19/§5.1 replaced it deliberately (see the
+            // constant's [CYRUP-DELTA]): the six builtins are compiled in, so the description now
+            // names them and scopes `list` to project/user agents, chains, and disabled state.
+            // These two needles pin BOTH halves of the replacement — the builtins roster and the
+            // re-scoped list guidance — so the divergence stays a recorded, tested fact.
+            "delegate (inherit-model lightweight child), oracle (high-context decision consistency), researcher (focused research brief), reviewer (diffs/plans/PR validation), scout (fast codebase recon), worker (implementation)",
+            "Use { action: \"list\" } when you need project- or user-defined agents and chains",
             "executable/non-disabled",
             "proactive skill subagent suggestions",
             "output?,reads?,progress?",
@@ -1399,9 +1454,24 @@ mod tests {
             props["toolBudget"]["additionalProperties"],
             serde_json::json!(false)
         );
-        // pi gives the top-level `outputSchema` no description of its own, and the shape is the
-        // same open `JsonSchemaObject` the `tasks[]` item schema already used.
-        assert_eq!(props["outputSchema"], sj_json_schema_object());
+        // The shape is the same open `JsonSchemaObject` the `tasks[]` item schema already uses;
+        // SCOPE_19/§5.2 additionally merges a top-level description (pi gives none), so the pin
+        // compares the SHAPE fields and requires the description separately rather than demanding
+        // byte-equality with the bare builder.
+        assert_eq!(
+            props["outputSchema"]["type"],
+            sj_json_schema_object()["type"]
+        );
+        assert_eq!(
+            props["outputSchema"]["additionalProperties"],
+            sj_json_schema_object()["additionalProperties"]
+        );
+        assert!(
+            props["outputSchema"]["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("Omitted:")),
+            "outputSchema's description must state its omitted behaviour (SCOPE_19/§5.2)"
+        );
 
         let parsed: SubagentToolParams = serde_json::from_value(serde_json::json!({
             "agent": "x",

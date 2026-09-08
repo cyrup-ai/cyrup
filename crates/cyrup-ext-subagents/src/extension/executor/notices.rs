@@ -402,7 +402,16 @@ impl SubagentExecutor {
         }
         match crate::background::watch::install_completion_watcher_with_observer(
             results_dir,
-            self.effective_completion_sink(),
+            // ASYNC_NOTIFY_BUG_REPORT F3.5 — the EFFECTIVE sink (a test's `with_completion_sink`
+            // override included) wrapped in the inline-answer decorator, so a completion whose
+            // value a live `wait` already put in the transcript is suppressed — and its payload
+            // consumed against the decorator's receipt — instead of injected twice. With no wait
+            // ever claiming, the decorator is a transparent pass-through, so the inner sink's
+            // behaviour (including a test override's) is unchanged.
+            Arc::new(crate::background::watch::InlineAnsweredSink::new(
+                self.effective_completion_sink(),
+                self.inline_answers(),
+            )),
             // SUBA-034: pi's async-complete EVENT has several independent listeners
             // (`extension/index.ts:648-659` @v0.43.0 registers three; `wait-subscriptions.ts` adds
             // the wait wake-up). cyrup's one-observer seam could only model the mission sync, so
@@ -421,6 +430,22 @@ impl SubagentExecutor {
                     Arc::new(self.completion_bus.clone()),
                 ]),
             )),
+            // The identity pair that decides which completions this instance may consume.
+            //
+            // `results_dir` is per-cwd, so every concurrent cyrup instance in this directory sees
+            // every other's results; ownership is what separates them. The session comes from the
+            // live host services and the owner id is this PROCESS's, minted once
+            // (`identity::current_completion_owner_id`).
+            //
+            // Re-installing on a later `SessionStart` overwrites `self.completion_watcher` below,
+            // and `CompletionWatcherHandle::drop` aborts the previous drain task — which is
+            // cyrup's structural equivalent of pi's `deliveryEpoch` lease
+            // (`result-watcher.ts:232-236`): the old watcher cannot deliver against a stale
+            // identity because it no longer exists.
+            crate::background::delivery::ResultDeliveryOwnership::new(
+                crate::identity::SessionId::parse_opt(self.current_session_id().as_deref()),
+                Some(crate::identity::current_completion_owner_id()),
+            ),
         ) {
             Ok(handle) => {
                 *self.completion_watcher.lock().await = Some(handle);

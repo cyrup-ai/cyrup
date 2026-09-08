@@ -833,6 +833,32 @@ pub fn validate_file_only_requires_path(
     }
 }
 
+/// pi `hasSingleOutputChangedSinceSnapshot` (`runs/shared/single-output.ts`) — factored OUT of
+/// [`resolve_output_handoff`]'s inline match so the timeout-recovery path (SUBA-3c,
+/// `execution.ts:1496-1498`) can ask the same question without running the handoff:
+/// [`resolve_output_handoff`] only runs for `exit_code == 0`, which a timed-out child never has.
+///
+/// `None` when no snapshot was taken (upstream's `undefined`), which propagates to
+/// `required_output_missing: None` ⇒ a `not-requested` report status rather than a false
+/// accusation. "Changed" is `Some(true)` if the path did not exist at snapshot time but exists
+/// now, or its mtime OR size differs from the snapshot.
+#[must_use]
+pub fn has_output_changed_since_snapshot(
+    output_path: &Path,
+    before: Option<OutputFileSnapshot>,
+) -> Option<bool> {
+    let snapshot = before?;
+    let after = std::fs::metadata(output_path)
+        .ok()
+        .and_then(|meta| meta.modified().ok().map(|mtime| (mtime, meta.len())));
+    Some(match (snapshot.state, after) {
+        (None, None) => false,    // never existed, still doesn't: unchanged
+        (None, Some(_)) => true,  // didn't exist before, exists now: the child wrote it
+        (Some(_), None) => false, // existed before, gone now: nothing to read back
+        (Some(before_state), Some(after_state)) => before_state != after_state,
+    })
+}
+
 /// R-SA-031 (MUST) — reconcile the output-path handoff after the child has exited: compare the
 /// current on-disk state of `output_path` against `before`, and either read back the child's own
 /// write verbatim or persist the orchestrator's own `captured_output` to that path.
@@ -857,18 +883,9 @@ pub fn resolve_output_handoff(
     captured_output: &str,
     before: Option<OutputFileSnapshot>,
 ) -> OutputHandoff {
-    let after = std::fs::metadata(output_path)
-        .ok()
-        .and_then(|meta| meta.modified().ok().map(|mtime| (mtime, meta.len())));
-
-    let changed = match (before.and_then(|snap| snap.state), after) {
-        (None, None) => false,    // never existed, still doesn't: unchanged
-        (None, Some(_)) => true,  // didn't exist before, exists now: the child wrote it
-        (Some(_), None) => false, // existed before, gone now: nothing to read back
-        (Some(before_state), Some(after_state)) => before_state != after_state,
-    };
-    // No snapshot was ever taken for this attempt: treat as "assume changed" (see doc comment).
-    let changed = changed || before.is_none();
+    // No snapshot was ever taken for this attempt ⇒ "assume changed" (see doc comment); the
+    // shared predicate reports that case as `None`.
+    let changed = has_output_changed_since_snapshot(output_path, before).unwrap_or(true);
 
     if changed {
         match std::fs::read_to_string(output_path) {
@@ -1373,7 +1390,7 @@ fn format_bytes(bytes: usize) -> String {
 /// test obligation). Walks `max_bytes` down to the nearest valid boundary via
 /// `str::is_char_boundary` rather than a byte-slice-then-`from_utf8_lossy` approach, so the result
 /// is guaranteed valid UTF-8 with no replacement-character insertion at the cut point.
-fn utf8_safe_prefix(s: &str, max_bytes: usize) -> &str {
+pub(crate) fn utf8_safe_prefix(s: &str, max_bytes: usize) -> &str {
     if max_bytes >= s.len() {
         return s;
     }
@@ -1462,6 +1479,211 @@ fn count_lines(text: &str) -> usize {
         return 0;
     }
     text.split('\n').count()
+}
+
+// ============================================================================================
+// SCOPE_3e: ContainedPath + resolve_single_output_claim_path (pi `assertSafeExplicitOutput`,
+// host-command.ts:98-117, and `resolveSingleOutputClaimPath`, single-output.ts:175-185)
+// ============================================================================================
+
+/// Node `path.dirname` for the paths this module walks: the parent, or the path itself at the
+/// filesystem root (`path.dirname("/") === "/"`).
+fn dirname(path: &Path) -> std::path::PathBuf {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map_or_else(|| path.to_path_buf(), Path::to_path_buf)
+}
+
+/// A filesystem path parent proven to resolve inside a given root, by the two-phase realpath
+/// check (pi `assertSafeExplicitOutput`, `host-command.ts:98-117`).
+///
+/// Private fields; the ONLY constructor is [`ContainedPath::assert_within`], which performs the
+/// containment check on both sides of the `mkdir` — so a symlink planted between the two is
+/// caught by the second pass. [`Self::join_file_name`] is the only way to reach a concrete write
+/// target, and it takes a single file-name component, so the result cannot re-escape.
+///
+/// Upstream returns the validated parent as a bare string and the writer re-joins it with the RAW
+/// output path by convention; this type exists because that convention is one edit away from
+/// passing the unvalidated path to the writer with no compiler objection — in the one function in
+/// this family that can write outside the workflow cwd (SCOPE_3 §A.1's first rule).
+///
+/// `PartialEq` is derived and load-bearing: `execute_workflow_host_command` re-runs the guard
+/// after the command exits and compares the two results (`host-command.ts:220-222`, SCOPE_3e
+/// §0.8).
+///
+/// What this does NOT buy (§A.5): it does not defeat a symlink swapped between `assert_within`
+/// returning and the write running — that residual TOCTOU window is upstream's too, and the
+/// `O_EXCL` temp-file + rename in the workflow host-command writer is what narrows it. It proves
+/// the check *ran* and that its result is what the writer used; it does not prove the filesystem
+/// held still. No `Deserialize`, no `From<PathBuf>`, no public field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContainedPath {
+    /// The realpath'd root the parent was proven inside.
+    root: std::path::PathBuf,
+    /// The realpath'd, existing parent directory of the output path.
+    parent: std::path::PathBuf,
+}
+
+impl ContainedPath {
+    /// pi `assertSafeExplicitOutput` (`host-command.ts:98-117`) — the two-phase TOCTOU-resistant
+    /// guard:
+    ///
+    /// 1. `root = realpath(cwd)`;
+    /// 2. walk UP from `dirname(output_path)` to the nearest EXISTING ancestor;
+    /// 3. realpath that ancestor; reject if it is outside `root`;
+    /// 4. `mkdir -p dirname(output_path)`;
+    /// 5. realpath the now-existing parent; reject AGAIN if outside `root`;
+    /// 6. `lstat(output_path)`: if it exists it must be a REGULAR file with `nlink == 1`.
+    ///
+    /// Steps 3 and 5 are the same check either side of the `mkdir`, and that is the point: a
+    /// symlink planted between the two is caught by the second. Step 6 rejects a hard link
+    /// (`nlink > 1`) and any non-regular file — a symlink, FIFO or device would otherwise be
+    /// written through. `ENOENT` from the lstat is the normal path; any other errno propagates
+    /// (as its message — upstream rethrows the raw error object).
+    ///
+    /// The hard-link count needs `MetadataExt::nlink()`, which is Unix-only; on non-Unix targets
+    /// the regular-file half of step 6 still runs and the nlink half does not exist to check
+    /// ([CYRUP-DELTA, unrepresentable] — upstream reads `stat.nlink`, which Node reports as 0 on
+    /// Windows, making its `> 1` test vacuous there too).
+    ///
+    /// # Errors
+    ///
+    /// The two crafted messages, verbatim —
+    /// `runs.host('{key}') output resolves outside the workflow cwd.` for either containment
+    /// failure and `runs.host('{key}') output must be a regular, non-linked file path.` for the
+    /// lstat failure — plus raw I/O error text for realpath/mkdir/lstat faults, matching
+    /// upstream's propagated exceptions.
+    pub fn assert_within(
+        root: &Path,
+        output_path: &Path,
+        key: &str,
+    ) -> Result<Self, String> {
+        let outside =
+            || format!("runs.host('{key}') output resolves outside the workflow cwd.");
+        let root_real = std::fs::canonicalize(root).map_err(|error| error.to_string())?;
+        let output_parent = dirname(output_path);
+
+        // Step 2 — nearest existing ancestor (`while (!fs.existsSync(existingParent)) …`).
+        let mut existing_parent = output_parent.clone();
+        while !existing_parent.exists() {
+            let parent = dirname(&existing_parent);
+            if parent == existing_parent {
+                break;
+            }
+            existing_parent = parent;
+        }
+        // Step 3 — first containment check.
+        let existing_real =
+            std::fs::canonicalize(&existing_parent).map_err(|error| error.to_string())?;
+        if !existing_real.starts_with(&root_real) {
+            return Err(outside());
+        }
+        // Step 4 — create the parent.
+        std::fs::create_dir_all(&output_parent).map_err(|error| error.to_string())?;
+        // Step 5 — second containment check, over the now-existing parent.
+        let parent_real =
+            std::fs::canonicalize(&output_parent).map_err(|error| error.to_string())?;
+        if !parent_real.starts_with(&root_real) {
+            return Err(outside());
+        }
+        // Step 6 — the destination, if present, must be a regular, non-linked file.
+        match std::fs::symlink_metadata(output_path) {
+            Ok(metadata) => {
+                #[cfg(unix)]
+                let hard_linked = {
+                    use std::os::unix::fs::MetadataExt;
+                    metadata.nlink() > 1
+                };
+                #[cfg(not(unix))]
+                let hard_linked = false;
+                if !metadata.file_type().is_file() || hard_linked {
+                    return Err(format!(
+                        "runs.host('{key}') output must be a regular, non-linked file path."
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        Ok(Self {
+            root: root_real,
+            parent: parent_real,
+        })
+    }
+
+    /// The write target: the validated parent joined with a single file-name component (pi
+    /// `path.join(outputParent, path.basename(outputPath))`, `host-command.ts:120`). Takes an
+    /// `&OsStr` file NAME — callers pass a `Path::file_name` result, never a path — so the
+    /// result cannot re-escape the proven parent.
+    #[must_use]
+    pub fn join_file_name(&self, name: &std::ffi::OsStr) -> std::path::PathBuf {
+        self.parent.join(name)
+    }
+}
+
+/// Lexical dot-segment normalization — the normalizing half of Node `path.resolve`, which
+/// [`resolve_single_output_claim_path`] needs before it walks (`Path::file_name` yields `None`
+/// for a `..` tail where Node's `basename` returns `".."`, so the walk must never see one) and
+/// which the workflow host command applies to its explicit `cwd.join(output)` destination for
+/// the same `path.resolve` parity.
+pub(crate) fn normalize_lexically(path: &Path) -> std::path::PathBuf {
+    let mut normalized = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::RootDir
+            | std::path::Component::Prefix(_)
+            | std::path::Component::Normal(_) => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+/// pi `resolveSingleOutputClaimPath` (`single-output.ts:175-185`): canonicalize a path that does
+/// not exist yet. Walks up to the nearest existing ancestor, canonicalizes THAT, then re-joins
+/// the segments it skipped — so the result has a real, symlink-resolved prefix and a literal
+/// tail. [`std::fs::canonicalize`] alone cannot do this: it fails outright on a missing path.
+///
+/// The `if (parent === existing) break` guard (`:181`) is the filesystem-root terminator; in Rust
+/// that is [`dirname`] returning its input unchanged.
+///
+/// Infallible by signature, like upstream's is in practice: a relative input resolves against the
+/// process cwd (Node `path.resolve`), degrading to the path itself if the cwd is unreadable, and
+/// a canonicalize fault (the existing ancestor racing away) degrades to the lexical path — both
+/// degrades make the CLAIM COMPARISON in the workflow host command fail closed (a mismatch
+/// rejects the write), never open ([CYRUP-DELTA, mechanism]).
+#[must_use]
+pub fn resolve_single_output_claim_path(output_path: &Path) -> std::path::PathBuf {
+    let absolute = if output_path.is_absolute() {
+        normalize_lexically(output_path)
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => normalize_lexically(&cwd.join(output_path)),
+            Err(_) => normalize_lexically(output_path),
+        }
+    };
+    let mut existing = absolute;
+    let mut missing_segments: Vec<std::ffi::OsString> = Vec::new();
+    while !existing.exists() {
+        let Some(name) = existing.file_name().map(std::ffi::OsStr::to_os_string) else {
+            break;
+        };
+        missing_segments.insert(0, name);
+        let parent = dirname(&existing);
+        if parent == existing {
+            break;
+        }
+        existing = parent;
+    }
+    let resolved = std::fs::canonicalize(&existing).unwrap_or(existing);
+    missing_segments
+        .into_iter()
+        .fold(resolved, |resolved, segment| resolved.join(segment))
 }
 
 #[cfg(test)]
@@ -2076,6 +2298,41 @@ mod tests {
         assert!(snapshot_output_file(None).is_none());
     }
 
+    // ---- has_output_changed_since_snapshot (SUBA-3c; pi `hasSingleOutputChangedSinceSnapshot`) ----
+
+    /// The factored-out predicate answers the same question `resolve_output_handoff` asks, without
+    /// running the handoff — the timeout path's `required_output_missing` needs exactly this,
+    /// because the handoff only runs for `exit_code == 0` and a timed-out child never has that.
+    #[test]
+    fn changed_since_snapshot_is_none_without_a_snapshot_and_tracks_writes_with_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("output.md");
+
+        // No snapshot taken ⇒ `None` (upstream's `undefined`), which the summary reports as
+        // `not-requested` rather than a false accusation.
+        assert_eq!(has_output_changed_since_snapshot(&path, None), None);
+
+        // Snapshot of a not-yet-existing path; still absent ⇒ unchanged.
+        let before = snapshot_output_file(Some(&path)).expect("Some for a configured path");
+        assert_eq!(has_output_changed_since_snapshot(&path, Some(before)), Some(false));
+
+        // The child writes it ⇒ changed.
+        std::fs::write(&path, "the child's report").expect("child writes");
+        assert_eq!(has_output_changed_since_snapshot(&path, Some(before)), Some(true));
+
+        // Pre-existing file, untouched ⇒ unchanged; touched ⇒ changed (mtime/size heuristic).
+        let before = snapshot_output_file(Some(&path)).expect("Some for a configured path");
+        assert_eq!(has_output_changed_since_snapshot(&path, Some(before)), Some(false));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, "the child appended more").expect("child writes again");
+        assert_eq!(has_output_changed_since_snapshot(&path, Some(before)), Some(true));
+
+        // Existed at snapshot time, deleted since ⇒ nothing to read back ⇒ unchanged.
+        let before = snapshot_output_file(Some(&path)).expect("Some for a configured path");
+        std::fs::remove_file(&path).expect("delete");
+        assert_eq!(has_output_changed_since_snapshot(&path, Some(before)), Some(false));
+    }
+
     #[test]
     fn handoff_detects_and_reads_back_a_childs_own_write() {
         // Real filesystem I/O, no mocks (crate testing convention): snapshot a not-yet-existing
@@ -2632,6 +2889,109 @@ mod tests {
         assert_eq!(
             extract_child_written_output(&events, Some(&path), dir.path()),
             None
+        );
+    }
+
+    // ---- ContainedPath / resolve_single_output_claim_path (SCOPE_3e) ----
+
+    /// The happy path: a missing nested parent is created, both containment passes agree, and the
+    /// write target is the proven parent + the file name.
+    #[test]
+    fn contained_path_creates_and_proves_the_parent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let output = dir.path().join("reports/nested/out.log");
+        let contained =
+            ContainedPath::assert_within(dir.path(), &output, "gate").expect("inside the root");
+        assert!(output.parent().expect("parent").is_dir(), "the mkdir ran");
+        let target = contained.join_file_name(std::ffi::OsStr::new("out.log"));
+        assert!(target.ends_with("reports/nested/out.log"));
+        // Deterministic: a second run over unchanged state compares equal (the post-run guard's
+        // equality, §0.8).
+        let again =
+            ContainedPath::assert_within(dir.path(), &output, "gate").expect("still inside");
+        assert_eq!(contained, again);
+    }
+
+    /// A parent that REALLY lives outside the root — through a symlinked directory — is rejected
+    /// with upstream's message even though the lexical path looks contained.
+    #[cfg(unix)]
+    #[test]
+    fn contained_path_rejects_a_symlinked_escape() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("root");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::os::unix::fs::symlink(&outside, root.join("link")).expect("symlink");
+        let err = ContainedPath::assert_within(&root, &root.join("link/out.log"), "gate")
+            .expect_err("escapes");
+        assert_eq!(
+            err,
+            "runs.host('gate') output resolves outside the workflow cwd."
+        );
+    }
+
+    /// Step 6: an existing symlink or hard link at the destination is rejected; a plain regular
+    /// file is not.
+    #[cfg(unix)]
+    #[test]
+    fn contained_path_rejects_non_regular_and_hard_linked_destinations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let regular = dir.path().join("regular.log");
+        std::fs::write(&regular, "x").expect("write");
+        assert!(ContainedPath::assert_within(dir.path(), &regular, "gate").is_ok());
+
+        let linked = dir.path().join("linked.log");
+        std::fs::hard_link(&regular, &linked).expect("hard link");
+        let err = ContainedPath::assert_within(dir.path(), &linked, "gate")
+            .expect_err("nlink > 1 rejects");
+        assert_eq!(
+            err,
+            "runs.host('gate') output must be a regular, non-linked file path."
+        );
+
+        let sym = dir.path().join("sym.log");
+        std::os::unix::fs::symlink(&regular, &sym).expect("symlink");
+        let err = ContainedPath::assert_within(dir.path(), &sym, "gate")
+            .expect_err("a symlink is not a regular file under lstat");
+        assert_eq!(
+            err,
+            "runs.host('gate') output must be a regular, non-linked file path."
+        );
+    }
+
+    /// `resolveSingleOutputClaimPath`: the existing prefix is symlink-resolved, the missing tail
+    /// re-joined literally.
+    #[test]
+    fn claim_path_resolves_existing_prefix_and_keeps_missing_tail() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_dir = std::fs::canonicalize(dir.path()).expect("realpath");
+        let missing = dir.path().join("a/b/c.log");
+        assert_eq!(
+            resolve_single_output_claim_path(&missing),
+            real_dir.join("a/b/c.log")
+        );
+        // An existing path canonicalizes wholesale.
+        let file = dir.path().join("present.log");
+        std::fs::write(&file, "x").expect("write");
+        assert_eq!(
+            resolve_single_output_claim_path(&file),
+            real_dir.join("present.log")
+        );
+    }
+
+    /// The symlink-resolved prefix is what makes two spellings of one destination compare equal —
+    /// the claim-check's whole job.
+    #[cfg(unix)]
+    #[test]
+    fn claim_path_folds_symlinked_spellings_together() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).expect("mkdir");
+        std::os::unix::fs::symlink(&real, dir.path().join("alias")).expect("symlink");
+        assert_eq!(
+            resolve_single_output_claim_path(&dir.path().join("alias/x/y.log")),
+            resolve_single_output_claim_path(&dir.path().join("real/x/y.log")),
         );
     }
 }

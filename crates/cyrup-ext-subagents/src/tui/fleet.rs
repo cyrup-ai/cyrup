@@ -82,6 +82,7 @@ use super::fleet_transcript::{
     render_fleet_transcript,
 };
 use crate::background::{RunPaths, RunState, RunStatus};
+use crate::identity::SessionId;
 use crate::fork_context::ContextMode;
 use crate::formatters::{format_model_thinking_opt, format_tokens};
 
@@ -480,6 +481,72 @@ pub async fn collect_fleet_history(
     results_dir: &Path,
     current_session_id: Option<&str>,
 ) -> Result<Vec<AsyncRunView>, String> {
+    let candidates =
+        fleet_history_candidates(async_root, results_dir, current_session_id).await?;
+
+    let mut runs: Vec<AsyncRunView> = Vec::new();
+    for paths in candidates {
+        let Ok(bytes) = tokio::fs::read(&paths.status).await else {
+            continue;
+        };
+        let Ok(status) = serde_json::from_slice::<RunStatus>(&bytes) else {
+            continue;
+        };
+        // pi `async-status.ts:432` — `if (options.sessionId && status.sessionId !==
+        // options.sessionId) continue;`. The comparison is against the sessionId recorded ON THE
+        // RUN ([`crate::background::RunStatus::session_id`], stamped by the detached runner from
+        // the parent-session anchor), and an absent one loses to any present filter.
+        if let Some(current) = current_session_id
+            && status.session_id.as_ref().map(SessionId::as_str) != Some(current)
+        {
+            continue;
+        }
+        let session_id = status.session_id.as_ref().map(|s| s.as_str().to_string());
+        runs.push(AsyncRunView {
+            paths,
+            status,
+            session_id,
+            description: None,
+            context: None,
+            nested_children: Vec::new(),
+        });
+    }
+    Ok(runs)
+}
+
+/// The candidate run paths for [`collect_fleet_history`], newest first and bounded by
+/// [`MAX_FLEET_HISTORY_CANDIDATES`].
+///
+/// Upstream builds its candidate set from the run INDEXES when it wants terminal states
+/// (`async-status.ts:513-517`, `readRecentTerminalRunIndex` with the caller's `sessionId` and
+/// `entryLimit`) and only falls back to a directory scan under `repairScan` (`:501-502`). So the
+/// terminal-run index is tried first — its ids come back newest-first and already session-filtered,
+/// making the scan's mtime sort redundant on that path — and the full scan survives underneath as
+/// the fallback for an `Err` or an EMPTY index. That fallback is not defensive padding: it is what
+/// makes the index safe to consume before every producer has been running long enough to populate
+/// it, and it is the property that lets a marker be unlinked at any time without losing data.
+/// (An untracked still-ACTIVE run is the in-memory tracker's and `resume_tracking`'s to surface;
+/// upstream serves that corner from `active-run-index.ts`, which is unported.)
+async fn fleet_history_candidates(
+    async_root: &Path,
+    results_dir: &Path,
+    current_session_id: Option<&str>,
+) -> Result<Vec<RunPaths>, String> {
+    let session = SessionId::parse_opt(current_session_id);
+    if let Ok(ids) = crate::background::terminal_run_index::read_recent_terminal_run_index(
+        async_root,
+        session.as_ref(),
+        Some(MAX_FLEET_HISTORY_CANDIDATES),
+    )
+    .await
+        && !ids.is_empty()
+    {
+        return Ok(ids
+            .iter()
+            .map(|run_id| RunPaths::for_run(async_root, results_dir, run_id))
+            .collect());
+    }
+
     let mut entries = match tokio::fs::read_dir(async_root).await {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -500,6 +567,12 @@ pub async fn collect_fleet_history(
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
+        // pi `async-status.ts:502` — the reserved index dirs (`.terminal-runs`, `.active-runs`)
+        // sit inside the async root and are not runs. They carry no `status.json`, so the metadata
+        // probe below happened to drop them; that was accidental, and this is the guard.
+        if crate::background::terminal_run_index::is_reserved_async_root_entry(&name) {
+            continue;
+        }
         let run_id = crate::background::RunId::from_token(name);
         let paths = RunPaths::for_run(async_root, results_dir, &run_id);
         let Ok(meta) = tokio::fs::metadata(&paths.status).await else {
@@ -514,35 +587,7 @@ pub async fn collect_fleet_history(
     }
     candidates.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
     candidates.truncate(MAX_FLEET_HISTORY_CANDIDATES);
-
-    let mut runs: Vec<AsyncRunView> = Vec::new();
-    for (_, paths) in candidates {
-        let Ok(bytes) = tokio::fs::read(&paths.status).await else {
-            continue;
-        };
-        let Ok(status) = serde_json::from_slice::<RunStatus>(&bytes) else {
-            continue;
-        };
-        // pi `async-status.ts:432` — `if (options.sessionId && status.sessionId !==
-        // options.sessionId) continue;`. The comparison is against the sessionId recorded ON THE
-        // RUN ([`crate::background::RunStatus::session_id`], stamped by the detached runner from
-        // the parent-session anchor), and an absent one loses to any present filter.
-        if let Some(current) = current_session_id
-            && status.session_id.as_deref() != Some(current)
-        {
-            continue;
-        }
-        let session_id = status.session_id.clone();
-        runs.push(AsyncRunView {
-            paths,
-            status,
-            session_id,
-            description: None,
-            context: None,
-            nested_children: Vec::new(),
-        });
-    }
-    Ok(runs)
+    Ok(candidates.into_iter().map(|(_, paths)| paths).collect())
 }
 
 // =================================================================================================
@@ -1071,9 +1116,12 @@ pub fn transcript_target(item: &FleetItem, state: &FleetState) -> Option<Transcr
                 .clone()
                 .unwrap_or_else(|| state.base_cwd.clone());
             let artifacts_root = fleet_artifacts_root(state, &cwd);
-            // Delta 3 of `fleet_transcript`: pi's fifth `ArtifactPaths` field `transcriptPath` has
-            // no cyrup analogue, and the `.jsonl` event stream is the artifact cyrup writes in its
-            // place (`artifacts.rs:58`).
+            // Delta 3 of `fleet_transcript`: `ArtifactPaths::transcript_path` now EXISTS
+            // (SCOPE_3a made the bundle five-field, matching `shared/artifacts.ts:190`), but no
+            // writer emits `_transcript.jsonl` yet — the `.jsonl` event stream is still the
+            // artifact cyrup actually writes, so it remains the correct live-transcript target.
+            // When a transcript writer lands, switch this to `paths.transcript_path` under
+            // upstream's `transcriptWriter ? … : undefined` gate (`execution.ts:513`).
             let paths = crate::artifacts::artifact_paths(
                 &artifacts_root,
                 &item.run_id,
@@ -2237,6 +2285,95 @@ mod tests {
             context: None,
             nested_children: Vec::new(),
         }
+    }
+
+    /// Write a real on-disk run — `status.json` plus, when the state is indexed, its terminal-run
+    /// index marker — the way the producers ([`crate::background::runner_main`],
+    /// [`crate::background::reconcile`]) do it.
+    async fn settle_on_disk(
+        async_root: &Path,
+        run: &str,
+        state: RunState,
+        session_id: &str,
+        ended_at: i64,
+    ) {
+        let run_dir = async_root.join(run);
+        tokio::fs::create_dir_all(&run_dir).await.expect("mkdir run dir");
+        let mut status =
+            RunStatus::queued(RunId::from_token(run), RunMode::Single, Some(1));
+        status.state = state;
+        status.session_id = SessionId::parse(session_id);
+        status.ended_at = Some(ended_at);
+        tokio::fs::write(
+            run_dir.join("status.json"),
+            serde_json::to_vec(&status).expect("ser"),
+        )
+        .await
+        .expect("write status");
+        crate::background::terminal_run_index::update_terminal_run_index(&run_dir, &status)
+            .await
+            .expect("index write");
+    }
+
+    fn history_ids(runs: &[AsyncRunView]) -> Vec<String> {
+        runs.iter().map(|run| run.status.run_id.as_str().to_string()).collect()
+    }
+
+    /// The index-first path: with markers present, the history roster comes back newest-first and
+    /// session-scoped without needing the mtime scan's ordering (the two runs' `status.json`
+    /// mtimes are written in the OPPOSITE order of their `endedAt`s, so a scan-derived order would
+    /// invert this assertion).
+    #[tokio::test]
+    async fn fleet_history_is_served_from_the_terminal_run_index() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let async_root = tmp.path().join("async");
+        let results_dir = tmp.path().join("results");
+        // Written first (older mtime) but ended LATER — the index order must win.
+        settle_on_disk(&async_root, "newer1", RunState::Complete, "s1", 200).await;
+        settle_on_disk(&async_root, "older1", RunState::Failed, "s1", 100).await;
+        settle_on_disk(&async_root, "foreign1", RunState::Complete, "s2", 300).await;
+
+        let runs = collect_fleet_history(&async_root, &results_dir, Some("s1"))
+            .await
+            .expect("history collects");
+        assert_eq!(history_ids(&runs), vec!["newer1", "older1"], "newest first, s2 filtered");
+    }
+
+    /// The fallback: an EMPTY index (no producer has written a marker yet) falls through to the
+    /// full scan, and the scan must skip the reserved `.terminal-runs`/`.active-runs` entries
+    /// rather than treating them as runs.
+    #[tokio::test]
+    async fn fleet_history_falls_back_to_the_scan_when_the_index_is_empty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let async_root = tmp.path().join("async");
+        let results_dir = tmp.path().join("results");
+        // A run with a status but NO index marker (unattributed — the writer refuses it).
+        let run_dir = async_root.join("scanned1");
+        tokio::fs::create_dir_all(&run_dir).await.expect("mkdir");
+        let mut status =
+            RunStatus::queued(RunId::from_token("scanned1"), RunMode::Single, Some(1));
+        status.state = RunState::Complete;
+        tokio::fs::write(
+            run_dir.join("status.json"),
+            serde_json::to_vec(&status).expect("ser"),
+        )
+        .await
+        .expect("write status");
+        // Reserved index dirs sitting in the root, with decoy content the scan must not read.
+        for reserved in [".terminal-runs", ".active-runs"] {
+            let decoy = async_root.join(reserved);
+            tokio::fs::create_dir_all(&decoy).await.expect("mkdir reserved");
+            tokio::fs::write(decoy.join("status.json"), b"{}").await.expect("decoy");
+        }
+
+        let runs = collect_fleet_history(&async_root, &results_dir, None)
+            .await
+            .expect("history collects");
+        assert_eq!(
+            history_ids(&runs),
+            vec!["scanned1"],
+            "the scan serves the unindexed run and skips the reserved dirs"
+        );
     }
 
     fn step(agent: &str, state: StepState) -> StepStatus {

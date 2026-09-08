@@ -20,8 +20,8 @@ use crate::extension::host::slash_render::{
 use crate::extension::tool::SubagentTool;
 use crate::extension::tool::params::{
     SubagentToolParams, WATCHDOG_MUTATING_ACTION, foreground_timeout_default,
-    format_failed_single_run_output, resolve_execution_agent_scope, resolve_foreground_timeout,
-    validate_execution_acceptance,
+    format_failed_single_run_output, lower_launch_thinking, resolve_execution_agent_scope,
+    resolve_foreground_timeout, validate_execution_acceptance,
 };
 use crate::extension::tool::task_items::{
     expand_top_level_task_counts, find_duplicate_parallel_output, normalize_skill_input,
@@ -501,6 +501,12 @@ impl SubagentTool {
                 Some(raw) => parse_single_acceptance(raw).map_err(ToolError::new)?,
                 None => None,
             },
+            // SCOPE_19/A1 — the caller's reasoning level for the child (rung 2 of the launch
+            // resolution ladder; `run_foreground_impl` owns the fold). Validated HERE so an
+            // unrecognized level is refused at the tool boundary — this param used to be accepted
+            // on launches and silently discarded, and a named refusal is the contract that
+            // replaces that.
+            thinking: lower_launch_thinking(p.thinking.as_deref()).map_err(ToolError::new)?,
             share: p.share,
             session_dir: p.session_dir.clone(),
             artifacts: p.artifacts,
@@ -638,6 +644,10 @@ impl SubagentTool {
                 output: overrides.output.clone(),
                 output_mode: overrides.output_mode.clone(),
                 skills: overrides.skills.clone(),
+                // SCOPE_19/A1: the caller's explicit reasoning level, from the SAME lowered
+                // `overrides` bundle the foreground path consumes — so `{thinking, async:true}` is
+                // not a silently weaker call than the same request without `async`.
+                thinking: overrides.thinking.clone(),
                 share: overrides.share,
                 session_dir: overrides.session_dir.clone(),
                 artifacts: overrides.artifacts,

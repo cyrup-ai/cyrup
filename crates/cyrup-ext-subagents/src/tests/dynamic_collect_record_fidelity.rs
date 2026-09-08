@@ -212,12 +212,13 @@ async fn timed_out_output_path_and_artifact_paths_all_reach_the_record() {
             let mut result = StepResult::success(Some("wrote it".to_string()), None);
             result.exit_code = Some(0);
             result.saved_output_path = Some("/runs/chain/beta-report.md".to_string());
-            result.artifact_paths = Some(json!({
-                "inputPath": "/artifacts/run_beta_input.md",
-                "outputPath": "/artifacts/run_beta_output.md",
-                "jsonlPath": "/artifacts/run_beta.jsonl",
-                "metadataPath": "/artifacts/run_beta_meta.json",
-            }));
+            result.artifact_paths = Some(crate::artifacts::ArtifactPaths {
+                input_path: "/artifacts/run_beta_input.md".into(),
+                output_path: "/artifacts/run_beta_output.md".into(),
+                jsonl_path: "/artifacts/run_beta.jsonl".into(),
+                metadata_path: "/artifacts/run_beta_meta.json".into(),
+                transcript_path: "/artifacts/run_beta_transcript.jsonl".into(),
+            });
             result
         }
     }
@@ -246,7 +247,12 @@ async fn timed_out_output_path_and_artifact_paths_all_reach_the_record() {
     assert_eq!(
         records[1]["artifactPaths"]["outputPath"],
         json!("/artifacts/run_beta_output.md"),
-        "the artifact quadruple is spread through verbatim: {records:#?}"
+        "the artifact bundle is spread through verbatim: {records:#?}"
+    );
+    assert_eq!(
+        records[1]["artifactPaths"]["transcriptPath"],
+        json!("/artifacts/run_beta_transcript.jsonl"),
+        "pi's fifth field (`transcriptPath`, `shared/artifacts.ts:190`) rides the same spread: {records:#?}"
     );
     // ...and the timed-out child, which produced neither, carries neither key.
     assert!(records[0].get("outputPath").is_none());

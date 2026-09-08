@@ -168,6 +168,14 @@ struct RecordingInjectServices {
 }
 
 impl HostServices for RecordingInjectServices {
+    // The delivery watcher is session-scoped: `install_completion_watcher` builds its
+    // `ResultDeliveryOwnership` from `services.session_id()` + this process's minted
+    // `completion_owner_id`, and a session-less watcher owns nothing (`owns` refuses when either
+    // identity is absent). The recorded session must match the one the ResultFile carries.
+    fn session_id(&self) -> Option<String> {
+        Some("it-proof-session".to_string())
+    }
+
     fn inject_message(
         &self,
         content: &str,
@@ -188,6 +196,12 @@ impl HostServices for RecordingInjectServices {
 
 fn completed_result(run_id: &str) -> ResultFile {
     ResultFile {
+        // The identity pair `Attribution::classify` reads: a result with no session is
+        // `Unattributed` (nothing happens, pi `result-watcher.ts:408`), and one with a foreign
+        // owner is `ObserveOnly`. Delivery requires BOTH to match the watcher's own — the session
+        // `RecordingInjectServices::session_id` reports, and THIS process's minted owner id.
+        completion_owner_id: Some(cyrup_ext_subagents::identity::current_completion_owner_id()),
+        session_id: cyrup_ext_subagents::identity::SessionId::parse("it-proof-session"),
         id: RunId::from_token(run_id),
         run_id: RunId::from_token(run_id),
         agent: "researcher".to_string(),
@@ -215,13 +229,33 @@ async fn background_completion_injects_a_turn_triggering_message_on_the_real_hos
     tokio::fs::create_dir_all(&results_dir)
         .await
         .expect("mkdir results_dir");
-    let result_path = results_dir.join("run-notify-e.json");
-    cyrup_ext_subagents::background::atomic::write_atomic_json(
-        &result_path,
+    // Written THROUGH the session-partitioned index (stage → index → promote), exactly as the
+    // detached runner's `finish_run` does: the watcher's candidate enumeration is index-driven
+    // (pi `indexedResultCandidates`, `result-watcher.ts:634-644`) and never a directory scan of
+    // the results root, so a raw public payload with no index entry is invisible to the prime
+    // scan by design.
+    let session_id = cyrup_ext_subagents::identity::SessionId::parse("it-proof-session")
+        .expect("non-empty session id");
+    let written_at = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_millis(),
+    )
+    .expect("epoch millis fit i64");
+    cyrup_ext_subagents::background::result_index::write_async_result_file(
+        &cyrup_ext_subagents::background::result_index::ResultWrite {
+            results_dir: &results_dir,
+            session_id: &session_id,
+            run_id: &RunId::from_token("runproofe000000e"),
+            written_at,
+            async_dir: None,
+            tool_call_id: None,
+        },
         &completed_result("runproofe000000e"),
     )
     .await
-    .expect("write result");
+    .expect("write result through the session-partitioned index");
 
     // Bind the recording HostServices (P-1) into the executor, exactly as the builder's
     // `load_native_with_services` does in production, then install the REAL completion watcher —

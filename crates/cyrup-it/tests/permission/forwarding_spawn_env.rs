@@ -179,6 +179,7 @@ fn production_child_env(cwd: &Path, parent_id: &str) -> std::collections::HashMa
         runner: None, // SUBA-074: the native child, as before
     };
     let opts = RunOptions {
+        structured_output_dir: None,
         spawn_command: None,
         child_env: std::collections::HashMap::new(),
         turn_budget: None,

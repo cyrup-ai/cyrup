@@ -245,7 +245,8 @@ fn normalize_max_spawns_per_run(raw: &str) -> Option<u32> {
     raw.trim().parse::<u32>().ok().filter(|value| *value > 0)
 }
 
-/// pi `safeRootRunId` (`run-fanout-budget.ts:40-42`): everything outside `[A-Za-z0-9._-]` becomes
+/// pi `safeRootRunId` (`run-fanout-budget.ts:40-42`): everything outside the keep-set
+/// (ASCII alphanumerics plus `.`, `_` and `-`) becomes
 /// `_`, truncated to 120 characters, and an empty result falls back to a fresh UUID.
 ///
 /// This is a DIRECTORY-NAME sanitizer, not a validator: the descriptor keeps the caller's raw

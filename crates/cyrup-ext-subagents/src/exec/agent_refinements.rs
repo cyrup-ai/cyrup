@@ -163,8 +163,10 @@ fn number_or(value: Option<&Value>, default: f64) -> f64 {
     value.and_then(Value::as_f64).unwrap_or(default)
 }
 
-/// pi `safeAgentFileName` (`agent-refinements.ts:147-153`): the agent name, trimmed, must match
-/// `/^[A-Za-z0-9][A-Za-z0-9._-]*$/` and must not contain `..`; the file is `<name>.md`.
+/// pi `safeAgentFileName` (`agent-refinements.ts:147-153`): the agent name, trimmed, must start
+/// alphanumeric with every later char in the keep-set (ASCII alphanumerics plus `.`, `_` and `-`,
+/// no length cap — not the bounded workflow key grammar) and must not contain `..`; the file is
+/// `<name>.md`.
 ///
 /// # Errors
 ///

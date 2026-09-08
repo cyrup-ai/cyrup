@@ -441,10 +441,7 @@ async fn accumulate_run_status_into(
 ) -> Result<(), SubagentError> {
     for step in &status.steps {
         acc.add_usage(&step.usage);
-        // `StepStatus` (background/mod.rs) carries no explicit `turns` field of its own — turn
-        // count for a step lives on the `_meta.json` artifact (if any) for that step, folded in
-        // below via `load_meta_tree_from_dir`, not double-counted here.
-        acc.record_node(0, step.model.as_ref());
+        acc.record_node(step.turns, step.model.as_ref());
 
         // Shape 1 nested inside shape 2: this step's own artifact directory (if the runner wrote
         // one) may itself carry a `_meta.json` "children array" tree — e.g. this step's agent
@@ -470,7 +467,7 @@ async fn accumulate_run_status_into(
         for group in groups {
             for step in &group.children {
                 acc.add_usage(&step.usage);
-                acc.record_node(0, step.model.as_ref());
+                acc.record_node(step.turns, step.model.as_ref());
 
                 let step_artifact_dir = own_paths.run_dir.join("steps").join(step.agent.as_str());
                 if let Some(meta) = load_meta_tree_from_dir(&step_artifact_dir).await? {
@@ -1228,6 +1225,9 @@ mod tests {
             model: Some(ModelId::from(format!("{agent}-model"))),
             attempted_models: vec![ModelId::from(format!("{agent}-model"))],
             usage: usage(input, output, cost_total),
+            turns: 0,
+            context_overflow: false,
+            timeout_recovery: None,
             error: None,
             nested_run_ids: Vec::new(),
             started_at: Some(0),
@@ -1235,6 +1235,9 @@ mod tests {
             stop_requested: false,
             stop_requested_at: None,
             stopped: false,
+            workflow_key: None,
+            run_id: None,
+            session_name: None,
             telemetry: crate::background::StepTelemetry::default(),
         }
     }

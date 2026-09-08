@@ -33,6 +33,7 @@ use crate::error::SubagentError;
 
 use super::control::{reconcile_before_control_op, validate_safe_token};
 use super::{RunId, RunMode, RunPaths, RunState, RunStatus, StepState, StepStatus};
+use crate::identity::SessionId;
 
 // =================================================================================================
 // Label helpers — lowercase wire spellings matching pi's `state`/`mode`/step-`status` strings
@@ -102,6 +103,18 @@ pub(crate) fn progress_label(status: &RunStatus) -> String {
             Some(cur) => format!("step {}/{step_count}", cur.saturating_add(1)),
             None => format!("steps {step_count}"),
         },
+        RunMode::Workflow => {
+            // A workflow's inventory is discovered, not declared: there is no denominator to
+            // divide by until `inventoryComplete`. Report what is settled out of what is KNOWN,
+            // exactly as `Parallel` does — never `step n/N`, which would invent a total the
+            // script has not fixed.
+            let done = status
+                .steps
+                .iter()
+                .filter(|step| step.status.is_terminal())
+                .count();
+            format!("{done}/{} complete", status.steps.len().max(1))
+        }
     }
 }
 
@@ -119,6 +132,11 @@ fn step_line_label(status: &RunStatus, index: usize) -> String {
             status.chain_step_count.unwrap_or(status.steps.len().max(1))
         ),
         RunMode::Single => format!("Step {one_based}"),
+        // `"Child"` rather than `"Agent"`/`"Step"` because a workflow row is addressed by its
+        // `WorkflowKey`, not by position — `StepStatus::workflow_key` is what a caller actually
+        // names it by. The denominator is the DISCOVERED count, same rationale as the progress
+        // label above.
+        RunMode::Workflow => format!("Child {one_based}/{}", status.steps.len().max(1)),
     }
 }
 
@@ -244,7 +262,7 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
 /// run identity/state/mode/progress, pending appends, timestamps, dir, the authoritative terminal
 /// `Result:` reference (when its file exists), per-step lines, resume guidance for a non-running
 /// run, and the `Log`/`Events` artifact references (when they exist).
-fn format_status(status: &RunStatus, paths: &RunPaths) -> String {
+async fn format_status(status: &RunStatus, paths: &RunPaths) -> String {
     let mut lines: Vec<String> = Vec::new();
     lines.push(format!("Run: {}", status.run_id));
     // pi `run-status.ts:373-385` @v0.43.0: the DURABLE MISSION this run is bound to, read back
@@ -274,8 +292,15 @@ fn format_status(status: &RunStatus, paths: &RunPaths) -> String {
         format_iso8601_millis(status.last_update)
     ));
     lines.push(format!("Dir: {}", paths.run_dir.display()));
-    if paths.result.exists() {
-        lines.push(format!("Result: {}", paths.result.display()));
+    // Resolved rather than probed at a fixed path: a promoted payload lives under
+    // `result-owned/<enc(session)>/`, so testing the legacy root would report "no result" for
+    // every run this build completes.
+    if let Some(session_id) = status.session_id.as_ref()
+        && let Some(result_path) = paths.resolve_result(session_id, &status.run_id).await
+    {
+        lines.push(format!("Result: {}", result_path.display()));
+    } else if paths.legacy_result_root.exists() {
+        lines.push(format!("Result: {}", paths.legacy_result_root.display()));
     }
 
     for (index, step) in status.steps.iter().enumerate() {
@@ -306,6 +331,19 @@ fn format_status(status: &RunStatus, paths: &RunPaths) -> String {
             model_text,
             steering_suffix,
             error_text
+        ));
+        // SUBA-3c — pi `run-status.ts:630`: a step whose child was killed by its deadline with
+        // unreviewed tracked changes shows the two recovery lines under its step line (indent
+        // `"  "`). The status step carries the FULL summary; only the narrowed projection is
+        // rendered — an ordinary timeout (no `recoveryNeeded`) stays silent by the renderer's own
+        // early return.
+        let recovery_projection = step
+            .timeout_recovery
+            .as_ref()
+            .map(crate::exec::mutation_evidence::TimeoutRecoverySummary::project);
+        lines.extend(crate::exec::mutation_evidence::format_timeout_recovery_lines(
+            recovery_projection.as_ref(),
+            "  ",
         ));
         let step_log = paths.step_output_log(index);
         if step_log.exists() {
@@ -352,7 +390,7 @@ async fn inspect_paths(paths: &RunPaths) -> Result<Option<String>, SubagentError
             Some(dismissed_at) => {
                 format_display_dismissed_status(status.run_id.as_str(), dismissed_at)
             }
-            None => format_status(&status, paths),
+            None => format_status(&status, paths).await,
         })),
         Err(SubagentError::Spawn(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
@@ -395,6 +433,13 @@ pub(crate) async fn resolve_run_id(
 ) -> Result<Option<RunId>, SubagentError> {
     validate_safe_token(selector)?;
 
+    // pi `resolveTargetedAsyncRun` (`async-status.ts:235`) rejects the reserved index directories
+    // outright — `.terminal-runs` is a sibling of the run dirs inside the async root, so without
+    // this a targeted selector could "resolve" to the index itself.
+    if crate::background::terminal_run_index::is_reserved_async_root_entry(selector) {
+        return Ok(None);
+    }
+
     // Exact match first: a run directory, its status.json, or its terminal result file already
     // exists under this exact id.
     let exact = RunPaths::for_run(
@@ -404,7 +449,7 @@ pub(crate) async fn resolve_run_id(
     );
     if path_exists(&exact.run_dir).await
         || path_exists(&exact.status).await
-        || path_exists(&exact.result).await
+        || path_exists(&exact.legacy_result_root).await
     {
         return Ok(Some(RunId::from_token(selector.to_string())));
     }
@@ -423,6 +468,10 @@ pub(crate) async fn resolve_run_id(
             }
             if let Some(name) = entry.file_name().to_str()
                 && name.starts_with(selector)
+                // The reserved index dirs are not runs and must not count as (or toward an
+                // ambiguous set of) prefix matches (pi `async-status.ts:235`'s reject, applied to
+                // every prefix candidate at `:508`).
+                && !crate::background::terminal_run_index::is_reserved_async_root_entry(name)
             {
                 matches.push(name.to_string());
             }
@@ -623,6 +672,12 @@ pub async fn list_active_runs(
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
+        // pi `entry !== ACTIVE_RUN_INDEX_DIR && entry !== TERMINAL_RUN_INDEX_DIR`
+        // (`async-status.ts:502`): the reserved index dirs live inside the async root but are not
+        // runs — without this, every listing reconciles `.terminal-runs` as a status-less run.
+        if crate::background::terminal_run_index::is_reserved_async_root_entry(&name) {
+            continue;
+        }
         let run_id = RunId::from_token(name);
         let paths = RunPaths::for_run(async_root, results_dir, &run_id);
         // Reconcile before summarizing (R-SA-079); a run that reconciles to a terminal/paused
@@ -645,7 +700,7 @@ pub async fn list_active_runs(
         // (`async-status.ts:432`), applied AFTER the state filter for the same reason pi applies it
         // there: both are cheap rejections that run before any further per-run work.
         if let Some(wanted) = session_id
-            && status.session_id.as_deref() != Some(wanted)
+            && status.session_id.as_ref().map(SessionId::as_str) != Some(wanted)
         {
             continue;
         }
@@ -743,8 +798,8 @@ mod tests {
     /// (pi `steeringSuffix`, `run-status.ts:413,419` @v0.43.0). Without this the tool would say
     /// "Steering queued" and the status report would look identical whether the runner accepted
     /// the request or dropped it on the floor.
-    #[test]
-    fn a_steps_accepted_steers_are_rendered_in_pis_steering_suffix() {
+    #[tokio::test]
+    async fn a_steps_accepted_steers_are_rendered_in_pis_steering_suffix() {
         let dir = tempfile::tempdir().expect("tempdir");
         let id = RunId::from_token("steersuffix1".to_string());
         let paths = RunPaths::for_run(dir.path(), dir.path(), &id);
@@ -756,7 +811,7 @@ mod tests {
         step.telemetry.last_steer_at = Some(1_700_000_000_000);
         status.steps = vec![step];
 
-        let report = format_status(&status, &paths);
+        let report = format_status(&status, &paths).await;
         assert!(
             report.contains(
                 "Step 1: scout running, steering: 2 steers, last 2023-11-14T22:13:20.000Z"
@@ -768,23 +823,100 @@ mod tests {
         status.steps[0].telemetry.steer_count = Some(1);
         status.steps[0].telemetry.last_steer_at = None;
         assert!(
-            format_status(&status, &paths).contains(", steering: 1 steer"),
+            format_status(&status, &paths).await.contains(", steering: 1 steer"),
             "singular form"
         );
         status.steps[0].telemetry.steer_count = None;
-        let quiet = format_status(&status, &paths);
+        let quiet = format_status(&status, &paths).await;
         assert!(
             !quiet.contains("steering:"),
             "an unsteered step gets no suffix: {quiet}"
         );
     }
 
+    /// SUBA-3c — pi `run-status.ts:630`: a step killed by its deadline with unreviewed tracked
+    /// changes renders the two recovery lines under its step line at indent `"  "`, projected
+    /// from the FULL summary the status step carries; an ordinary timeout (no `recoveryNeeded`)
+    /// renders nothing.
+    #[tokio::test]
+    async fn a_steps_timeout_recovery_renders_the_projected_lines_in_the_report() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = RunId::from_token("recoveryrender1".to_string());
+        let paths = RunPaths::for_run(dir.path(), dir.path(), &id);
+        let mut status = RunStatus::queued(id, RunMode::Single, Some(1));
+        status.state = RunState::Failed;
+        let mut step = StepStatus::pending("coder");
+        step.status = StepState::Failed;
+        let evidence = crate::exec::mutation_evidence::TrackedMutationEvidence {
+            source: Default::default(),
+            tracked_only: true,
+            changed_files: vec!["src/half-written.rs".to_string()],
+            attempted_mutation: true,
+            truncated: false,
+            unavailable: None,
+        };
+        step.timeout_recovery = Some(crate::exec::mutation_evidence::build_timeout_recovery_summary(
+            crate::exec::mutation_evidence::TimeoutRecoveryInput {
+                termination: crate::exec::mutation_evidence::Termination::TimedOut,
+                evidence: &evidence,
+                required_output_missing: Some(true),
+                current_tool: None,
+                current_tool_args: None,
+                current_path: None,
+                session_file: None,
+                transcript_path: None,
+                artifact_paths: None,
+            },
+        ));
+        status.steps = vec![step];
+
+        let report = format_status(&status, &paths).await;
+        assert!(
+            report.contains(
+                "  Recovery needed: review the diff and artifacts before resuming or launching dependent stages."
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains(
+                "  Recovery evidence: requested report: missing; changed tracked files: src/half-written.rs (1); classification: timed-out-with-dirty-worktree"
+            ),
+            "{report}"
+        );
+
+        // An ordinary timeout — report written, or clean worktree — stays quiet (`:140`).
+        let quiet_evidence = crate::exec::mutation_evidence::TrackedMutationEvidence {
+            source: Default::default(),
+            tracked_only: true,
+            changed_files: Vec::new(),
+            attempted_mutation: false,
+            truncated: false,
+            unavailable: None,
+        };
+        status.steps[0].timeout_recovery =
+            Some(crate::exec::mutation_evidence::build_timeout_recovery_summary(
+                crate::exec::mutation_evidence::TimeoutRecoveryInput {
+                    termination: crate::exec::mutation_evidence::Termination::TimedOut,
+                    evidence: &quiet_evidence,
+                    required_output_missing: Some(true),
+                    current_tool: None,
+                    current_tool_args: None,
+                    current_path: None,
+                    session_file: None,
+                    transcript_path: None,
+                    artifact_paths: None,
+                },
+            ));
+        let quiet = format_status(&status, &paths).await;
+        assert!(!quiet.contains("Recovery"), "{quiet}");
+    }
+
     /// G77 — the `status` action's rendering of a stopped run: its own state word, and pi's
     /// verbatim not-resumable guidance INSTEAD of the `Revive:` line the same steps would
     /// otherwise earn. The step below deliberately carries an existing `session_file`, which is
     /// precisely the input that would produce a `Revive:` line without the stopped short-circuit.
-    #[test]
-    fn a_stopped_run_renders_its_own_state_word_and_refuses_to_offer_a_revive() {
+    #[tokio::test]
+    async fn a_stopped_run_renders_its_own_state_word_and_refuses_to_offer_a_revive() {
         let dir = tempfile::tempdir().expect("tempdir");
         let transcript = dir.path().join("session.jsonl");
         std::fs::write(&transcript, b"{}\n").expect("write transcript");
@@ -799,7 +931,7 @@ mod tests {
         step.error = Some(control::STOP_MESSAGE.to_string());
         status.steps = vec![step];
 
-        let report = format_status(&status, &paths);
+        let report = format_status(&status, &paths).await;
         assert!(report.contains("State: stopped"), "{report}");
         assert!(report.contains("Step 1: scout stopped"), "{report}");
         assert!(report.contains(STOPPED_NOT_RESUMABLE_GUIDANCE), "{report}");
@@ -981,7 +1113,7 @@ mod tests {
             let id = RunId::from_token(token);
             let paths = RunPaths::for_run(&async_root, &results_dir, &id);
             let mut status = running_status(&id, RunMode::Single, vec![StepStatus::pending("a")]);
-            status.session_id = session.map(str::to_string);
+            status.session_id = SessionId::parse_opt(session);
             write_status(&paths, &status).await;
         }
 
@@ -1115,6 +1247,7 @@ mod tests {
             &results_dir,
             "run0intr000",
             "interrupt-action",
+            None,
             None,
         )
         .await

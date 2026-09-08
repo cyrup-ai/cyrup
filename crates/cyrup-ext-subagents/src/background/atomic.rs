@@ -99,6 +99,28 @@ pub async fn write_atomic_json<T: serde::Serialize + Sync>(
     }
 }
 
+/// [`write_atomic_json`] with pi's implicit `mkdir -p`.
+///
+/// pi's `writeAtomicJson` creates the destination's parent itself
+/// (`shared/atomic-json.ts:56-58`, inside `createAtomicJsonWriter`, so BOTH exported writers do);
+/// cyrup's async [`write_atomic_json`] does not, and only the blocking
+/// [`write_private_atomic_json_blocking`] variant does. Every index path in
+/// [`crate::background::result_index`] and [`crate::background::terminal_run_index`] is several
+/// levels below its root and none of those levels is created anywhere else.
+///
+/// # Errors
+///
+/// A directory-creation or write failure.
+pub(crate) async fn write_atomic_json_creating_parent<T: serde::Serialize + Sync>(
+    path: &Path,
+    value: &T,
+) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    write_atomic_json(path, value).await
+}
+
 /// The SYNCHRONOUS, owner-only (`0600`) sibling of [`write_atomic_json`] — pi
 /// `writePrivateAtomicJson` (`pi-subagents/src/shared/atomic-json.ts:62`, i.e.
 /// `createAtomicJsonWriter({ mode: 0o600 })`), the writer the whole `missions/` subtree persists

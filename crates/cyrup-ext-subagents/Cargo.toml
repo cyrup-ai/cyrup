@@ -87,6 +87,11 @@ libc = { workspace = true }
 # out of the file name. Already a `[workspace.dependencies]` entry used by five sibling
 # crates; pure Rust, no C.
 base64 = { workspace = true }
+# SUBA-3c (`exec/mutation_evidence/`, pi `runs/shared/mutation-evidence.ts`): tracked-file status
+# and per-path fingerprinting for the timeout-recovery evidence a deadline kill collects. In-process
+# `gix` instead of a `git` subprocess — see the justifying comment on the `[workspace.dependencies]`
+# entry (default features only; the network features `cyrup-resources` pins are deliberately absent).
+gix = { workspace = true }
 # SHA-256 for the direct-MCP metadata-cache config-identity hash (`exec/mcp_direct_tools.rs`,
 # pi `computeMcpServerHash`) — the resolver validates a cached server's tool/resource metadata is
 # still current by hashing the resolution-relevant fields of its `mcp.json` definition and
@@ -103,6 +108,33 @@ unicode-normalization = { workspace = true }
 # on the `[workspace.dependencies]` entry.
 url = { workspace = true }
 tracing = "0.1.44"
+# SCOPE_3f (`workflows/scripted/{recovery,preview}.rs` ONLY): the acceptance-recovery classifier's
+# ~36 upstream regexes include tempered greedy tokens (a negative lookahead inside a bounded
+# repetition, `scripted-workflow.ts:1185-1188`) that the `regex` crate cannot express. Pure Rust,
+# already in this workspace's lockfile via `syntect`'s `default-fancy` — zero new transitive
+# crates. See the justifying comment on the `[workspace.dependencies]` entry.
+fancy-regex = { workspace = true }
+# SCOPE_3f (`workflows/scripted/`): the workflowScript runtime embeds V8 through `deno_core` — the
+# same engine core Deno itself ships. Chosen because the ONE correctness term that decides this
+# feature is whether the engine behaves the way the authoring model predicts, and the model's prior
+# is V8-in-Node (SCOPE_3f §0.2 bar (b)); every other engine is a different implementation with
+# different edge behaviour, error text and stack format. `deno_core` ops are natively async on
+# tokio, so a child launch is an op the script awaits — no handle/poll protocol (§3.2).
+#
+# V8 is C++. `Cargo.toml`'s rule is "no C dependency WHERE A PURE-RUST ALTERNATIVE EXISTS"; the
+# pure-Rust alternative (`boa_engine`) fails bar (b), which is the term the feature rests on. This
+# is the same carve-out already exercised for `aws-lc-sys`, `ring`, `tree-sitter` and `zstd-sys`.
+# `forbid(unsafe_code)` is a per-crate lint and is unaffected transitively (SCOPE_3f §1.3).
+#
+# `deno_runtime` is deliberately NOT a dependency: it is what would add `fetch`, `fs`, `net` and the
+# `setTimeout` global. `deno_core` alone lands exactly where upstream's `vm.createContext` lands —
+# ECMAScript intrinsics and our ops, nothing else (§0.3, §3.3).
+deno_core = { workspace = true }
+# The structural analyzer behind `action:"validate"` (§3.6): scope-aware free-identifier resolution,
+# so a script referencing `setTimeout`/`fetch`/`require` is rejected with a re-prompt BEFORE a child
+# is spent. V8 owns syntax; this owns structure. Version-aligned with the deno stack above.
+deno_ast = { workspace = true }
+deno_error = { workspace = true }
 # `tui/render.rs`'s pure fold-to-aggregate rendering functions (R-SA-106..113) return
 # `ratatui::text::Line`/`Span` values so a live terminal owner (`cyrup-tui`, out of scope for
 # this crate — see arch-SA §1.1/§6.1's crate-boundary rule) can paint them without this crate

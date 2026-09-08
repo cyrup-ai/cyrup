@@ -385,6 +385,71 @@ impl NativeExtension for SubagentsExtension {
                 // pi `register-main.ts:427-430` — AWAITED (upstream RETURNS the promise from its
                 // handler, so pi's runner awaits it too).
                 self.watchdog.handle_agent_end(&ctx.cwd).await;
+                // pi `if (!ctx.hasUI) await drainOutstandingWork({ state, events: pi.events });`
+                // (`extension/index.ts:784`) — the FIRST line of the goal-mission handler, so it
+                // runs after the watchdog and before the goal scan. Headless only: an interactive
+                // session has a next turn to be woken into, so blocking here would only delay a
+                // prompt the user is waiting on. No session identity (pi's throw at
+                // `auto-drain.ts:39`) means there is nothing scoping-safe to drain, so the block
+                // is skipped — draining unscoped would drain another session's runs.
+                if !ctx.has_ui
+                    && let Some(session_id) = crate::identity::SessionId::parse_opt(
+                        self.executor.current_session_id().as_deref(),
+                    )
+                {
+                    let roots = self.executor.config_snapshot().await.roots;
+                    let artifact_roots =
+                        crate::background::run_artifact_roots_in(&roots, &ctx.cwd);
+                    let probe = crate::background::auto_drain::FsDrainProbe {
+                        async_root: artifact_roots.async_root,
+                        results_dir: artifact_roots.results_dir,
+                    };
+                    let waiter = crate::background::auto_drain::SubagentDrainWaiter {
+                        // `enabled` is hard-coded TRUE: it is the `wait` TOOL's config gate, and
+                        // pi's drain passes no `enabled` at all (`deps.enabled === false` is the
+                        // check, `subagent-wait.ts:547`) — so the drain runs even when
+                        // CYRUP_SUBAGENT_WAIT_TOOL_ENABLED=0 disables the tool. Anything else
+                        // silently turns off headless result delivery with a convenience switch.
+                        deps: crate::background::wait::WaitDeps::for_cwd(
+                            &ctx.cwd,
+                            true,
+                            Some(session_id.as_str().to_string()),
+                            &roots,
+                        )
+                        .with_completion_bus(Some(self.executor.completion_bus()))
+                        // ASYNC_NOTIFY_BUG_REPORT F3.5 — the same ledger the wait tool shares,
+                        // so headless drains dedup identically.
+                        .with_inline_answers(Some(self.executor.inline_answers()))
+                        // The drain's literal flags (`auto-drain.ts:61-63`); see
+                        // [`crate::background::wait::WaitDeps::stop_on_attention`] for why the
+                        // first one is what keeps this loop from spinning.
+                        .with_stop_on_attention(false)
+                        .with_fail_on_failed_runs(true)
+                        .with_fail_on_attention(true),
+                    };
+                    if let Err(message) =
+                        crate::background::auto_drain::drain_outstanding_work(
+                            &session_id,
+                            crate::background::auto_drain::DEFAULT_AUTO_DRAIN_TIMEOUT_MS,
+                            &crate::time::now_epoch_millis,
+                            &probe,
+                            &waiter,
+                        )
+                        .await
+                    {
+                        // [CYRUP-DELTA in mechanism, not in behaviour] upstream THROWS out of the
+                        // handler (`auto-drain.ts:53,66`) — but that throw is not control flow: pi's
+                        // runner catches every handler error (`runner.ts:869-878`) and emits it to
+                        // the mode's `onError` listener, which headless — the only place this drain
+                        // fires — is print-mode's one `console.error` line (`print-mode.ts:101-103`).
+                        // Nothing fails, the handler loop continues. `on_event` returns a
+                        // `HookOutcome` (whose upstream analog, the `EventResult` types, carries no
+                        // error either — the error channel is the HOST'S catch), so cyrup emits the
+                        // equivalent diagnostic here directly. The drain has still been AWAITED,
+                        // which is the load-bearing part.
+                        tracing::warn!(%message, "auto-drain at agent_end did not complete");
+                    }
+                }
                 // pi's `agent_end` goal-mission handler (`extension/index.ts:585-601`).
                 let _ = self
                     .executor

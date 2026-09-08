@@ -63,6 +63,14 @@ pub struct SingleRunOverrides {
     /// [`crate::exec::acceptance::AcceptanceContract::heuristic_default`] (R-SA-023), which is
     /// exactly what pi's `acceptance: "auto"` / omitted means.
     pub acceptance: Option<crate::exec::acceptance::AcceptanceContract>,
+    /// SCOPE_19/A1 — the caller's explicit `thinking` level for the child, already lowered at the
+    /// tool boundary (`"false"` → `"off"`, `"inherit"` → `None`, anything else validated against
+    /// [`crate::watchdog::model_selection::THINKING_LEVELS`]). Rung 2 of the launch resolution
+    /// ladder: `run_foreground_impl` folds it ABOVE the persona's own `thinking:` and above the
+    /// parent-session rung, and below only a `:level` suffix on a caller-supplied `model` (which
+    /// `apply_thinking_suffix` never replaces without a fork override's licence). `None` = the
+    /// param was omitted (or said `inherit`), which defers to persona-then-parent-session.
+    pub thinking: Option<String>,
     /// pi `params.share` (`subagent-executor.ts:3354` `shareEnabled`).
     pub share: Option<bool>,
     /// pi `params.sessionDir` (`subagent-executor.ts:5044-5052`), still the RAW string: it is
@@ -190,6 +198,13 @@ pub struct BackgroundSingleRequest<'a> {
     pub context: Option<ContextRequest>,
     /// Per-call model override; `None` inherits (pi `async-execution.ts:1290-1295`).
     pub model_override: Option<ModelId>,
+    /// SCOPE_19/A1 — the caller's explicit `thinking` level, lowered exactly as
+    /// [`SingleRunOverrides::thinking`] is. `spawn_background` stamps it onto the resolved persona
+    /// (the same fold `tool_budget` uses), so hop 2's dispatch sees it as that agent's level —
+    /// caller beats persona — while the parent-session rung rides
+    /// [`crate::background::runner_main::RunnerConfig::inherited_session_thinking`] and is applied
+    /// runner-side only below the persona.
+    pub thinking: Option<String>,
     /// The resolved execution-time agent-discovery scope.
     pub agent_scope: AgentReadScope,
     /// SUBA-N04: the RAW wire `acceptance` policy (pi `AcceptanceOverride`) this run declares, or

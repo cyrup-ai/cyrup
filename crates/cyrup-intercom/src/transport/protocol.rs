@@ -1073,6 +1073,10 @@ impl ExactTarget {
 /// The full v0.9.2 tag set is modelled even where cyrup neither sends nor acts on a tag, because
 /// the union is also the *acceptance* set: a tag missing from here is an `unknown variant` decode
 /// error, i.e. a destroyed connection, for a frame a conforming pi peer sends as a matter of course.
+// A wire message: constructed, serialized, and dropped per send — never stored in bulk — and the
+// wide `Register` variant is the once-per-connection handshake, so boxing would buy nothing
+// (`clippy::large_enum_variant`).
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(
     tag = "type",

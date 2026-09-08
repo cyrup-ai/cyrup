@@ -474,6 +474,9 @@ impl Drop for CompactionCancelGuard<'_> {
 
 /// The reduced `session_before_compact` decision (L4 gap #5): cancel the compaction, or proceed with
 /// an optional extension-supplied compaction override.
+// `Proceed` carries the full compaction override; one value exists per compaction attempt and it
+// is consumed on the spot, so boxing would buy nothing (`clippy::large_enum_variant`).
+#[allow(clippy::large_enum_variant)]
 pub(super) enum BeforeCompactOutcome {
     /// A handler vetoed the compaction (Pi `{cancel:true}`).
     Cancel,

@@ -34,6 +34,7 @@ pub mod fork_context;
 /// The crate's single port of pi's `shared/formatters.ts` (`formatTokens`,
 /// `formatModelThinking`, the run-mode label) — see [`formatters`].
 pub mod formatters;
+pub mod identity;
 pub mod jsonl;
 pub mod missions;
 pub mod native_supervisor;
@@ -48,6 +49,7 @@ pub mod spawn;
 pub mod time;
 pub mod tui;
 pub mod watchdog;
+pub mod workflows;
 
 /// Crate-internal test modules relocated out of `tests/` (see [`tests`]'s own module doc):
 /// in-process tests that never needed a separate Cargo integration-test binary.

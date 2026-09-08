@@ -179,7 +179,7 @@ fn write_status_json(
         None,
     );
     status.state = cyrup_ext_subagents::background::RunState::Running;
-    status.session_id = session_id.map(str::to_string);
+    status.session_id = cyrup_ext_subagents::identity::SessionId::parse_opt(session_id);
     status.steps = vec![cyrup_ext_subagents::background::StepStatus::pending(
         agent.to_string(),
     )];

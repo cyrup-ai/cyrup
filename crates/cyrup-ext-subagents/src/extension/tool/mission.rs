@@ -22,7 +22,7 @@ pub(crate) struct MissionSyncCompletionObserver {
 
 #[async_trait::async_trait]
 impl crate::background::watch::CompletionObserver for MissionSyncCompletionObserver {
-    async fn observe(&self, notification: &crate::background::watch::CompletionNotification) {
+    async fn observe(&self, notification: &crate::background::watch::CompletionNotification) -> bool {
         let result = &notification.result;
         let async_dir = crate::background::RunDir::new(&self.async_root, &result.run_id);
         let event = serde_json::json!({
@@ -38,8 +38,15 @@ impl crate::background::watch::CompletionObserver for MissionSyncCompletionObser
         });
         // pi wraps this call in `try { … } catch { console.error(...) }` (`:654-658`) — mission
         // bookkeeping is never allowed to disturb the completion pipeline.
-        if let Err(e) = crate::missions::sync_mission_from_async_completion(&event) {
-            tracing::warn!("Failed to update mission from async completion: {e}");
+        // Returning `false` on failure preserves the cross-session mission observer index so this
+        // completion resurfaces on a later scan (pi `result-watcher.ts:414-419`, `:425`) — a
+        // mission that failed to reconcile must not lose its only pointer to the run.
+        match crate::missions::sync_mission_from_async_completion(&event) {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!("Failed to update mission from async completion: {e}");
+                false
+            }
         }
     }
 }
@@ -273,6 +280,8 @@ mod tests {
                     success: true,
                     cwd: dir.path().to_path_buf(),
                     session_file: None,
+                    session_id: None,
+                    completion_owner_id: None,
                     results: Vec::new(),
                 },
                 result_path: dir.path().join("results").join("bgrun000001.json"),

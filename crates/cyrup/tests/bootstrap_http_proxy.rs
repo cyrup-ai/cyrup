@@ -51,29 +51,28 @@ fn agent_dir(root: &Path, settings: &str) -> std::path::PathBuf {
     agent
 }
 
-/// `cyrup update --models` with every ambient proxy variable cleared, so the GLOBAL `httpProxy`
-/// setting is the only possible source of a proxy. `extra_env` adds the ambient variables a
-/// specific test wants to be the exception.
+/// `cyrup update --models` in a CLEARED environment (`env_clear` + `PATH`/`HOME`-to-tempdir +
+/// agent dir), so the GLOBAL `httpProxy` setting is the only possible source of a proxy AND no
+/// ambient credential can widen `refresh_model_catalogs`'s credential-gated provider set beyond
+/// the fixture key. `extra_env` adds the variables a specific test wants to be the exception.
+///
+/// `env_clear` rather than a proxy denylist: pi's `??=` gives an ambient variable precedence over
+/// the setting and `getProxyEnv` reads both cases of all four names, but proxies were never the
+/// only leak — an ambient `CYRUP_HOME` outranks the `HOME` set here (`cyrup-config/src/paths.rs`
+/// home ladder) and would hand the child the developer's real `auth.json`, and any of the ~45
+/// credential vars in `cyrup_provider::env_api_keys::CREDENTIAL_ENV_VARS` would gate a real
+/// provider into the refresh set. Clearing removes the names nobody has listed.
 fn run_update_models(agent: &Path, cwd: &Path, extra_env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cyrup"));
     cmd.args(["update", "--models"])
         .current_dir(cwd)
-        .env("CYRUP_AGENT_DIR", agent);
-    // pi's `??=` gives an ambient variable precedence over the setting, and `getProxyEnv` reads
-    // both cases of all four names — so all eight must go, or the ambient environment of whoever
-    // runs the suite silently decides the outcome.
-    for name in [
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "ALL_PROXY",
-        "NO_PROXY",
-        "http_proxy",
-        "https_proxy",
-        "all_proxy",
-        "no_proxy",
-    ] {
-        cmd.env_remove(name);
+        .env_clear();
+    if let Some(path) = std::env::var_os("PATH") {
+        cmd.env("PATH", path);
     }
+    // `cwd` is the test's own temp root; using it as HOME keeps every derived path inside the
+    // tempdir without changing what the assertions observe (the agent dir is explicit).
+    cmd.env("HOME", cwd).env("CYRUP_AGENT_DIR", agent);
     for (k, v) in extra_env {
         cmd.env(k, v);
     }

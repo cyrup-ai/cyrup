@@ -155,7 +155,10 @@ impl Tool for WaitTool {
         // SUBA-034: subscribe this wait to the orchestrator's completion bus, so a result observed
         // by THIS process's watcher releases the wait immediately rather than one poll interval
         // later. The poll under it is unchanged and remains the source of truth.
-        .with_completion_bus(Some(self.executor.completion_bus()));
+        .with_completion_bus(Some(self.executor.completion_bus()))
+        // ASYNC_NOTIFY_BUG_REPORT F3.4 — share the executor's inline-answer ledger, so the runs
+        // this wait answers inline are not re-announced as standalone notifications.
+        .with_inline_answers(Some(self.executor.inline_answers()));
         match crate::background::wait::wait_for_subagents(&parsed, &cancel, &deps).await {
             Ok(text) => Ok(ToolResult {
                 content: vec![cyrup_core::Content::text(text)],

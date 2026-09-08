@@ -82,6 +82,10 @@ pub struct BeforeCompactEvent {
 }
 
 /// The before-compact hook's decision (R-05-020).
+// `Custom` carries the full replacement summary; the value is produced at most once per
+// compaction and consumed immediately, never stored in bulk, so boxing would buy nothing
+// (`clippy::large_enum_variant`).
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "decision")]
 pub enum BeforeCompactDecision {

@@ -1,4 +1,4 @@
-//! `xtask` — the repo's own tooling. Two commands, both run by hand (there is no CI here; see
+//! `xtask` — the repo's own tooling. Three commands, all run by hand (there is no CI here; see
 //! README "Build"):
 //!
 //! * `gen-catalogs` — regenerate `crates/cyrup-provider/src/providers/catalog/*.json` and
@@ -7,6 +7,9 @@
 //!   --all-targets` does not reach, and RUN the two suites the everyday gate skips (`cyrup-ext`
 //!   with `wasm-host` off, and the gated `cyrup-it` seam suite). See [`features`] for the matrix
 //!   and why each row is in it.
+//! * `it` — run the gated `cyrup-it` seam suite alone, in a hermetic harness environment
+//!   (`env_clear` + [`IT_ENV_ALLOWLIST`]): the supported invocation on a machine whose shell
+//!   exports real provider credentials, guaranteed to spend zero tokens. See [`run_it`].
 //!
 //! # `gen-catalogs`
 //!
@@ -494,10 +497,111 @@ fn run() -> Result<(), String> {
         // hands it nothing: `run_gen_catalogs` is a pure rename of the old `run` body.
         "gen-catalogs" => run_gen_catalogs(),
         "feature-matrix" => features::run_matrix(&argv.collect::<Vec<_>>(), workspace_root()),
+        "it" => run_it(&argv.collect::<Vec<_>>()),
         other => Err(format!(
-            "unknown command {other:?} — commands are `gen-catalogs` and `feature-matrix` \
+            "unknown command {other:?} — commands are `gen-catalogs`, `feature-matrix` and `it` \
              (see each one's module docs for flags)"
         )),
+    }
+}
+
+/// Environment variables the hermetic integration-suite runner ([`run_it`]) reinstates after
+/// `env_clear()`. Everything the toolchain needs to build and run, and NOTHING that can name,
+/// carry or unlock a provider credential: no `*_API_KEY`/token vars, no `AWS_*`/`GOOGLE_*`
+/// ambient-credential triggers, no proxies, no `CYRUP_HOME`/`CYRUP_*` gates. `HOME` itself is
+/// safe to keep — the suite's in-process seams read credentials from env VARS (which are cleared
+/// here) and its spawned children are re-homed onto per-test tempdirs by
+/// `crates/cyrup-it/tests/support/env.rs::hermetic`.
+pub(crate) const IT_ENV_ALLOWLIST: &[&str] = &[
+    // process basics
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TERM",
+    "TMPDIR",
+    "TZ",
+    "LANG",
+    "LC_ALL",
+    // toolchain — the suite's build.rs runs nested `cargo build`s and a wasm32-wasip2 build
+    "CARGO",
+    "CARGO_HOME",
+    "CARGO_TARGET_DIR",
+    "CARGO_BUILD_JOBS",
+    "CARGO_INCREMENTAL",
+    "CARGO_TERM_COLOR",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+    "RUSTC",
+    "RUSTC_WRAPPER",
+    "RUSTFLAGS",
+    "RUST_BACKTRACE",
+    // the suite's own documented overrides (crates/cyrup-it/build.rs) — deliberate, named opt-ins
+    "CYRUP_IT_BIN_DIR",
+    "CYRUP_EXT_FIXTURE_COMPONENT",
+];
+
+/// `cargo xtask it [extra cargo-test args…]` — run the armed integration suite
+/// (`cargo test -p cyrup-it --features it`) in a **hermetic harness environment**: `env_clear()`
+/// plus [`IT_ENV_ALLOWLIST`], the `env -i` shape of pi's own `test.sh`.
+///
+/// This is the supported way to run the suite on a machine whose shell exports real provider
+/// credentials (`ANTHROPIC_API_KEY`, `AWS_PROFILE`, `CYRUP_HOME`, …). Run raw, the suite's §4 R5
+/// layer-3 guards (`crates/cyrup-it/tests/support/env.rs`) red immediately and name the leaked
+/// variables — by design, because in-process seams like `session_svc/model_registry.rs` read the
+/// process environment through `provider_is_configured(.., env: None)` (1:1 Pi parity,
+/// non-injectable), so ambient credentials would change what those tests observe. Under this
+/// wrapper the harness process itself starts clean, the guards pass, and the run is provably
+/// spend-free — spawned children were already hermetic by construction.
+fn run_it(extra: &[String]) -> Result<(), String> {
+    // Resolve the invoking cargo BEFORE clearing anything (cargo sets $CARGO for run targets).
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+
+    // Prefer the documented runner (docs/TEST-ARCHITECTURE.md §2.4:
+    // `cargo nextest run -p cyrup-it --features it,wasm-host`): process-per-test isolation is what
+    // several seam tests assume (`tests/mcp/http_oauth.rs` shares a process-global auth-store
+    // override and interferes with itself under plain `cargo test`'s in-process threading). Fall
+    // back to `cargo test` when nextest is not installed, and say so.
+    let has_nextest = Command::new(&cargo)
+        .args(["nextest", "--version"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+
+    let mut cmd = Command::new(&cargo);
+    cmd.current_dir(workspace_root());
+    if has_nextest {
+        cmd.args(["nextest", "run", "-p", "cyrup-it", "--features", "it,wasm-host"]);
+    } else {
+        println!(
+            "xtask it: cargo-nextest not installed; falling back to `cargo test` \
+             (docs/TEST-ARCHITECTURE.md §2.4 prefers nextest for process-per-test isolation)"
+        );
+        cmd.args(["test", "-p", "cyrup-it", "--features", "it"]);
+    }
+    cmd.args(extra);
+    apply_hermetic_env(&mut cmd);
+    let status = cmd
+        .status()
+        .map_err(|e| format!("cannot spawn cargo for the it suite: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("integration suite failed: {status}"))
+    }
+}
+
+/// `env_clear()` + [`IT_ENV_ALLOWLIST`] on a child cargo invocation. Shared by [`run_it`] and by
+/// every `feature-matrix` row (`features::run_matrix`), so the ONLY two documented ways to run
+/// the armed seam suite both start it from a credential-free harness environment.
+pub(crate) fn apply_hermetic_env(cmd: &mut Command) {
+    cmd.env_clear();
+    for key in IT_ENV_ALLOWLIST {
+        if let Some(value) = std::env::var_os(key) {
+            cmd.env(key, value);
+        }
     }
 }
 

@@ -736,7 +736,7 @@ pub trait TurnAgent: Send + Sync + 'static {
     /// (`crates/cyrup-core/src/message/usage.rs`) has the token counts and the cost but not the
     /// model's window, so a pure translation would have to invent `size`. The window lives on the
     /// session (`AgentSession::stats_context_usage`), which is why this is a call on the agent
-    /// rather than an arm of [`crate::translate::status_updates`].
+    /// rather than an arm of [`crate::turn::status_updates`].
     ///
     /// The default is `None` — "this agent has no usage to report" — which is the honest answer
     /// for a test double and is also what an implementor that has not opted in gets. **A wrapper
@@ -893,7 +893,7 @@ impl TurnAgent for RuntimeAgent {
 ///
 /// This is the whole of [`RuntimeAgent`]'s [`TurnAgent::snapshot`]; it is a free function taking
 /// `&dyn FsOps` so that the three-way classification below — which decides what
-/// [`crate::translate::tool_execution_end`] claims about a file, and therefore what bytes reach the
+/// `crate::translate::tool_execution_end` (private to that module) claims about a file, and therefore what bytes reach the
 /// client inside `Diff.new_text` — can be driven against a real `LocalFs` and a real confined
 /// `TraversalFs` in a temp dir rather than only through a live `AgentSessionRuntime` (`ACP-131`:
 /// the classifier was the sole production producer of a [`FileSnapshot`] and was instantiated by

@@ -69,21 +69,12 @@ pub fn mission_state_path(
     Ok(location.mission_dir.join(id).join("state.json"))
 }
 
-/// pi `validateStateKey` (`workflow-state.ts:21-26`) — `STATE_KEY_PATTERN`
-/// (`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`) with upstream's exact refusal text.
+/// pi `validateStateKey` (`workflow-state.ts:21-26`) — `STATE_KEY_PATTERN` is byte-identical to
+/// the workflow key grammar, so the check delegates to [`crate::workflows::WorkflowKey`] (the
+/// crate's ONE declaration of it, SCOPE_3 §A.3) while the refusal keeps upstream's exact text —
+/// the parser owns the grammar, this call site owns the wording.
 fn validate_state_key(value: &str) -> MissionResult<&str> {
-    let mut chars = value.chars();
-    let ok = match chars.next() {
-        Some(first) if first.is_ascii_alphanumeric() => {
-            let mut tail = 0usize;
-            chars.all(|c| {
-                tail += 1;
-                tail <= 127 && (c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
-            })
-        }
-        _ => false,
-    };
-    if ok {
+    if crate::workflows::WorkflowKey::parse(value).is_ok() {
         Ok(value)
     } else {
         Err(MissionError::invalid(

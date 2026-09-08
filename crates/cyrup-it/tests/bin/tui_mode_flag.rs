@@ -16,7 +16,7 @@
     clippy::indexing_slicing
 )]
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use tempfile::TempDir;
 
@@ -35,19 +35,12 @@ fn run_with(args: &[&str], bare: bool) -> (Run, TempDir) {
     let work = tmp.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
 
-    let mut cmd = Command::new(crate::support::bins::cyrup());
+    // Hermetic by construction (`env_clear` + allowlist, `support::env::hermetic`): no ambient
+    // credential, proxy, `CYRUP_HOME` redirect or built-in opt-in can reach the child. Enforced
+    // suite-wide by the `every_cyrup_spawn_site_is_hermetic` lint.
+    let mut cmd = crate::support::env::hermetic(crate::support::bins::cyrup(), tmp.path());
     cmd.current_dir(&work)
-        .env("HOME", tmp.path())
         .env("CYRUP_AGENT_DIR", &agent_dir)
-        .env_remove("ANTHROPIC_API_KEY")
-        .env_remove("OPENAI_API_KEY")
-        .env_remove("HTTP_PROXY")
-        .env_remove("HTTPS_PROXY")
-        // Never inherit an ambient built-in opt-in — see `unknown_flag_exit.rs` for why (a detached
-        // `__intercom-broker` outlives the run).
-        .env_remove("CYRUP_INTERCOM")
-        .env_remove("CYRUP_SUBAGENTS")
-        .env_remove("CYRUP_PERMISSION_SYSTEM")
         .args(["--offline", "--no-session", "--no-extensions"])
         .args(args);
     if !bare {

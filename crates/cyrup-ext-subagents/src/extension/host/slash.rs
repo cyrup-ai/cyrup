@@ -369,6 +369,9 @@ impl SubagentsExtension {
                     turn_budget: None,
                     structured_output_schema: None,
                     tool_budget: None,
+                    // SCOPE_19/A1: `/run` parses no `thinking=` token either — no caller rung on
+                    // this surface; the persona and parent-session rungs are applied downstream.
+                    thinking: None,
                     cwd,
                     agent_name: &parsed.agent,
                     task: &parsed.task,
@@ -827,6 +830,8 @@ impl SubagentsExtension {
                     turn_budget: None,
                     structured_output_schema: None,
                     tool_budget: None,
+                    // SCOPE_19/A1: no caller rung on this surface either.
+                    thinking: None,
                     cwd: &effective_cwd,
                     agent_name: &run.agent,
                     task: &run.task,

@@ -74,7 +74,8 @@ pub use export::{
 pub use factory::SessionFactory;
 pub use guest_providers::GuestProviderRegistry;
 pub use host_services::{
-    ControlSink, EditorTextMirror, InjectMessage, InjectSink, LiveHostServices, OverlayRequest,
+    ControlSink, EditorTextMirror, InjectAck, InjectMessage, InjectRequest, InjectSink,
+    LiveHostServices, OverlayRequest,
     OverlaySink, ThemeAccess, UiEffect, UiEffectSink, UiKind, UiReply, UiRequest, UiSink,
 };
 pub use provider_swap::{ProviderResolver, ProviderSwap};

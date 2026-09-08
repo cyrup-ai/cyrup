@@ -66,8 +66,6 @@ mod wasm_renderer_routing;
 mod wasm_thinking_level;
 mod wasm_tool_result_usage;
 
-/// §4 R5 layer 3: the suite's own process must not carry provider credentials into a run.
-#[test]
-fn no_ambient_provider_credentials() {
-    support::env::assert_no_ambient_provider_credentials();
-}
+// §4 R5 layer 3 — the ambient-credential guard now lives as a `#[test]` inside `support::env`
+// itself (plus the feature-gate guard and the hermetic-spawn lint), so every target that declares
+// `mod support` runs them without per-target wiring. Nothing to declare here.

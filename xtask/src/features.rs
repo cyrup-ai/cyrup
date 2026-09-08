@@ -285,10 +285,15 @@ pub fn run_matrix(flags: &[String], root: PathBuf) -> Result<(), String> {
         }
         ran += 1;
         println!("\n──── {}", combo.label());
-        let status = Command::new(cargo_bin())
-            .current_dir(&root)
-            .arg(combo.verb)
-            .args(combo.args)
+        let mut cmd = Command::new(cargo_bin());
+        cmd.current_dir(&root).arg(combo.verb).args(combo.args);
+        // Hermetic harness env for EVERY row (`env_clear` + crate::IT_ENV_ALLOWLIST). The build
+        // and check rows only need the toolchain, which the allowlist carries; the `cyrup-it` RUN
+        // row additionally must not start the seam suite with ambient provider credentials, or
+        // its §4 R5 layer-3 guards red on machines whose shells export real keys — the same
+        // guarantee `cargo xtask it` gives, kept in one place.
+        crate::apply_hermetic_env(&mut cmd);
+        let status = cmd
             .status()
             .map_err(|e| format!("cannot run cargo: {e}"))?;
         if !status.success() {

@@ -42,16 +42,16 @@
 //!   `cargo build -p cyrup --features faux --bin cyrup` (PROV-052 is not weakened: that is a
 //!   private, test-only build, and the shipped-graph invariant `faux_not_in_normal_build` asserts is
 //!   about `cargo tree -p cyrup --edges normal`, which no feature request here touches).
-//! * The eight hand-rolled hermetic-child builders were deliberately NOT collapsed into
-//!   `support::scratch::Scratch::command`. They are not interchangeable: `Scratch` puts `HOME` at
-//!   `<root>/home` and always sets `CYRUP_HOME`, while every builder below sets `HOME` to the temp
-//!   ROOT (the parent of `agent/`) and sets no `CYRUP_HOME` at all — so swapping them changes which
-//!   directory the binary under test resolves its config from. That is a behaviour rewrite, not an
-//!   import rewrite, and the migration brief forbids rewriting a test body. The collapse is still
-//!   worth doing; it is a separate, deliberate change with its own verification, and
-//!   `auth_credential_print`'s `env_clear` + allowlist (NOT a denylist of `*_API_KEY` names) is the
-//!   shape to collapse ONTO, because the failure being guarded against is the binary falling through
-//!   to a real agent session on whichever provider key happens to be exported.
+//! * The eight hand-rolled child builders are now collapsed onto `support::env::hermetic` — the
+//!   `env_clear` + allowlist shape `auth_credential_print` pioneered — exactly the deliberate,
+//!   separately-verified change the previous revision of this note deferred. Each builder KEEPS its
+//!   own `HOME` target (the temp root, parent of `agent/`) and still sets no `CYRUP_HOME`, so which
+//!   directory the binary resolves config from is unchanged; what changed is that the child no
+//!   longer inherits ANYTHING else — the per-file `env_remove` denylists (4–24 names, against ~45
+//!   credential vars in `cyrup_provider::env_api_keys::CREDENTIAL_ENV_VARS`, and never including
+//!   `CYRUP_HOME`, which OUTRANKS the `HOME` they set) are gone. The
+//!   `every_cyrup_spawn_site_is_hermetic` lint in `support::env` reds any regression to the old
+//!   shape, in this file or any future one.
 //! * `piped_stdin_trim` is the file that hung the whole suite: a detached `__intercom-broker`
 //!   grandchild inherited a harness pipe FD above 2, and `wait_with_output()` reads to EOF rather
 //!   than to child exit. Its stdio handling is byte-for-byte as the fix left it, and
@@ -115,23 +115,14 @@ mod faux_not_in_normal_build;
 // §4 R5, layer 3 — the ambient-environment guards.
 //
 // Layers 1 and 2 (hermetic children, injected config) cannot give you this: they make each CHILD
-// safe, but say nothing about the harness process the tests run in. These two turn "a test quietly
-// used a real API" into a named red at the top of the run instead of a surprise on an invoice.
-// They are the only two `#[test]`s in this target that were not drained from a source crate.
+// safe, but say nothing about the harness process the tests run in. The guards now live as
+// `#[test]`s inside `support::env` itself — together with the `every_cyrup_spawn_site_is_hermetic`
+// lint — so EVERY target that declares `mod support` runs them without per-target wiring, and a
+// new target cannot forget them.
 //
-// If they red on your machine, that is the guard working: `unset TOGETHER_API_KEY` (etc.) and
-// re-run. Deleting them is a two-line change, but do it deliberately — `TOGETHER_API_KEY` being
-// exported on the maintainer's box has ALREADY caused a test in this workspace to make a real
-// network call, and an ambient `CYRUP_INTERCOM=1` has already leaked 13 broker processes out of a
-// single run.
+// If they red on your machine, that is the guard working: run the suite through
+// `cargo run -p xtask -- it` (which re-execs it under a cleared environment) or unset the named
+// variables. `TOGETHER_API_KEY` being exported on the maintainer's box has ALREADY caused a test
+// in this workspace to make a real network call, and an ambient `CYRUP_INTERCOM=1` has already
+// leaked 13 broker processes out of a single run.
 // ==================================================================================================
-
-#[test]
-fn no_ambient_provider_credentials() {
-    support::env::assert_no_ambient_provider_credentials();
-}
-
-#[test]
-fn no_ambient_feature_gates() {
-    support::env::assert_no_ambient_feature_gates();
-}

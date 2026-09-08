@@ -30,7 +30,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::time::Duration;
 
@@ -105,41 +105,18 @@ impl Acp {
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&project).unwrap();
 
-        let mut child = Command::new(crate::support::bins::cyrup())
+        // Hermetic by construction (`env_clear` + allowlist via `support::env::hermetic`). The
+        // denylist this replaces was 24 names long and still grew one incident at a time: a
+        // developer box with Bedrock credentials in its environment made `session/prompt` resolve
+        // a real model and issue a real HTTPS request from a suite whose own doc says it is
+        // offline and credential-less — the observed failure was a live Bedrock 403 arriving
+        // where `NoModelSelected` was expected (`AWS_PROFILE`/`AWS_REGION` alone pass the
+        // provider's auth preflight). `env_clear` removes the names nobody has thought of yet,
+        // including `CYRUP_HOME`, which outranks the `HOME` set here. Enforced by the
+        // `every_cyrup_spawn_site_is_hermetic` lint; the placeholder credential a test wants back
+        // is injected explicitly below via `envs(env)`.
+        let mut child = crate::support::env::hermetic(crate::support::bins::cyrup(), &home)
             .current_dir(&project)
-            .env("HOME", &home)
-            .env_remove("ANTHROPIC_API_KEY")
-            .env_remove("OPENAI_API_KEY")
-            .env_remove("TOGETHER_API_KEY")
-            .env_remove("GEMINI_API_KEY")
-            // …and the ambient AWS ones. A developer box with Bedrock credentials in its
-            // environment made `session/prompt` resolve a real model and issue a real HTTPS
-            // request from a suite whose own doc says it is offline and credential-less — the
-            // observed failure was a live Bedrock 403 arriving where `NoModelSelected` was
-            // expected. `AWS_PROFILE`/`AWS_REGION` alone are enough for the provider's auth
-            // preflight to pass, so the whole family goes.
-            .env_remove("AWS_ACCESS_KEY_ID")
-            .env_remove("AWS_SECRET_ACCESS_KEY")
-            .env_remove("AWS_SESSION_TOKEN")
-            .env_remove("AWS_PROFILE")
-            .env_remove("AWS_REGION")
-            .env_remove("AWS_DEFAULT_REGION")
-            .env_remove("AWS_BEARER_TOKEN_BEDROCK")
-            .env_remove("AWS_CONTAINER_CREDENTIALS_FULL_URI")
-            .env_remove("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")
-            .env_remove("AWS_WEB_IDENTITY_TOKEN_FILE")
-            .env_remove("AZURE_API_KEY")
-            .env_remove("GROQ_API_KEY")
-            .env_remove("MISTRAL_API_KEY")
-            .env_remove("OPENROUTER_API_KEY")
-            .env_remove("XAI_API_KEY")
-            .env_remove("GOOGLE_API_KEY")
-            .env_remove("GOOGLE_GENERATIVE_AI_API_KEY")
-            .env_remove("HTTP_PROXY")
-            .env_remove("HTTPS_PROXY")
-            .env_remove("CYRUP_INTERCOM")
-            .env_remove("CYRUP_SUBAGENTS")
-            .env_remove("CYRUP_PERMISSION_SYSTEM")
             .arg("--acp")
             .args(extra)
             .envs(env.iter().copied())
@@ -272,7 +249,7 @@ impl Acp {
     fn position(&self, what: &str, pred: impl Fn(&Value) -> bool) -> usize {
         self.seen
             .iter()
-            .position(|f| pred(f))
+            .position(pred)
             .unwrap_or_else(|| panic!("no frame matching {what} in:\n{}", self.dump()))
     }
 

@@ -7,12 +7,13 @@
 //!
 //! 1. **[`validate_profile_name`] — the R-SA-142 path-traversal guard.** Profile (and, by the
 //!    same requirement text, provider-catalog) names are validated against a strict allowlist
-//!    regex, `^[A-Za-z0-9][A-Za-z0-9._-]*$`, **before** the name is used to construct any
+//!    regex — first char alphanumeric, then any number of characters from the keep-set
+//!    (ASCII alphanumerics plus `.`, `_` and `-`) — **before** the name is used to construct any
 //!    filesystem path. This is implemented as a hand-rolled byte scan rather than pulling in the
 //!    `regex` crate (not a workspace dependency as of this file, and unnecessary for a
 //!    fixed, tiny character-class check) — semantically identical to the regex the requirement
-//!    text specifies: first byte in `[A-Za-z0-9]`, every subsequent byte in
-//!    `[A-Za-z0-9._-]`, non-empty. This rejects `/`, `\`, and any leading `.`/`..`-shaped token
+//!    text specifies: first byte alphanumeric, every subsequent byte in the keep-set,
+//!    non-empty. This rejects `/`, `\`, and any leading `.`/`..`-shaped token
 //!    (a leading `.` is already excluded by the first-character class, so `.`/`..` themselves
 //!    and any `../`-prefixed traversal attempt are rejected at the very first byte, before the
 //!    scan even reaches a `/`).
@@ -62,7 +63,9 @@ use crate::error::SubagentError;
 // R-SA-142: path-token allowlist for profile/provider names
 // =================================================================================================
 
-/// Validates `name` against R-SA-142's strict allowlist: `^[A-Za-z0-9][A-Za-z0-9._-]*$`.
+/// Validates `name` against R-SA-142's strict allowlist: first char alphanumeric, then any
+/// number of keep-set characters (ASCII alphanumerics plus `.`, `_` and `-`). NOT the bounded
+/// workflow key grammar (`crate::workflows::WorkflowKey`): this allowlist has no length cap.
 ///
 /// This is a pure, filesystem-free string predicate: first byte MUST be an ASCII alphanumeric,
 /// every subsequent byte MUST be an ASCII alphanumeric, `.`, `_`, or `-`. Any other byte —
@@ -79,8 +82,8 @@ use crate::error::SubagentError;
 ///
 /// # Errors
 ///
-/// Returns [`SubagentError::UnsafePathToken`] if `name` is empty, starts with a byte outside
-/// `[A-Za-z0-9]`, or contains any byte outside `[A-Za-z0-9._-]`.
+/// Returns [`SubagentError::UnsafePathToken`] if `name` is empty, starts with a
+/// non-alphanumeric byte, or contains any byte outside the keep-set.
 pub fn validate_profile_name(name: &str) -> Result<(), SubagentError> {
     let mut bytes = name.bytes();
     let Some(first) = bytes.next() else {
@@ -102,7 +105,7 @@ pub fn validate_profile_name(name: &str) -> Result<(), SubagentError> {
     Ok(())
 }
 
-/// One byte of the allowlist's tail character class: `[A-Za-z0-9._-]`.
+/// One byte of the allowlist's tail character class (ASCII alphanumerics plus `.`, `_` and `-`).
 fn is_allowed_tail_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-'
 }

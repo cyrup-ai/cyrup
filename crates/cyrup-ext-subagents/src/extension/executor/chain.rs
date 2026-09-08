@@ -154,6 +154,11 @@ impl SubagentExecutor {
             // block folded with this call's own override, so a foreground chain/parallel step's child
             // stream is judged against the CONFIGURED attention thresholds instead of the hardcoded
             // defaults this path used to fall back to.
+            // SCOPE_19/A1: session-thinking inheritance for foreground `/chain`//`/parallel`
+            // steps — the effort half of the `remembered_parent_model` argument above, through the
+            // SAME remembered-value seam, so an inheriting step (no persona `thinking:`) reasons
+            // at the parent session's level exactly as the foreground single-run path does.
+            .with_inherited_session_thinking(self.remembered_parent_thinking())
             .with_control(Some(crate::exec::control::resolve_control_config(
                 cfg.control.as_ref(),
                 control_override.as_ref(),

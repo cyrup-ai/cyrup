@@ -64,10 +64,18 @@
 //! ("No active async runs **in this session**.") true; before the filter existed the message said
 //! the opposite of what the code did.
 //!
+//! That reasoning is **not specific to `wait`**. It applies to every surface reading these
+//! per-cwd roots, and for a long time `wait` was the only one that had it: result delivery
+//! (`background/watch/`), the job tracker's restore path and the control operations all listed the
+//! same shared directory with no ownership check at all. They now share one implementation of the
+//! rule — [`crate::background::delivery::SessionGate`] for "may I act on this run?" and
+//! [`crate::background::delivery::OwnershipSnapshot::owns`] for "may I consume this completion?".
+//!
 //! `session_id: None` (headless / unpersisted orchestrator) applies no filter, which is pi's own
 //! falsy-`sessionId` path — see [`super::run_status::list_active_runs`] for why an unattributed run
 //! is dropped when a filter IS supplied.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -197,6 +205,32 @@ pub struct WaitDeps {
     /// no-bus degradation to pure polling, and is what every construction that has no live watcher
     /// (tests, headless embedders) supplies.
     pub completion_bus: Option<crate::background::watch::CompletionBus>,
+    /// pi `deps.stopOnAttention` (`subagent-wait.ts:116,618`). `true` — the default and the `wait`
+    /// tool's behaviour — makes a needs-attention run end the wait. `false` is auto-drain's mode:
+    /// the drain re-enters this wait in a loop, so returning early on attention would spin it hot
+    /// for the whole drain deadline.
+    ///
+    /// `[CYRUP-DELTA]` upstream's escape with the flag off — `stopOnAttention ||
+    /// hasSupervisorTool(run)` (`:618-622`), so attention on an intercom-capable child still
+    /// breaks the wait — has no cyrup analog, because [`ActiveRun`] carries no per-run tool
+    /// inventory. With the flag off, cyrup waits through ALL attention, so such a child is bounded
+    /// by the drain's 30-minute deadline rather than surfacing at once.
+    pub stop_on_attention: bool,
+    /// pi `deps.failOnFailedRuns` (`subagent-wait.ts:118,708`): report a resolved wait as an ERROR
+    /// when any initially-tracked run ended failed. Off for the tool (a failed run is information,
+    /// not a tool failure); on for the drain, whose contract is "everything landed, or say so".
+    pub fail_on_failed_runs: bool,
+    /// pi `deps.failOnAttention` (`subagent-wait.ts:120,725`): likewise for unresolved attention.
+    pub fail_on_attention: bool,
+    /// `ASYNC_NOTIFY_BUG_REPORT` F3 — the claim/answer ledger shared with the completion
+    /// watcher's delivery decorator ([`crate::background::watch::InlineAnsweredSink`]). A live
+    /// wait CLAIMS the runs it is about to block on (holding same-run deliveries off before their
+    /// irrevocable enqueue — RC4) and records which of them its own response actually answered,
+    /// so the watcher suppresses a standalone notification whose value the transcript already
+    /// carries. `None` — the default, and what every construction that wired no ledger gets
+    /// (tests, headless embedders) — changes nothing: no claim is ever taken and every delivery
+    /// proceeds exactly as before, mirroring [`Self::completion_bus`]'s no-bus degradation.
+    pub inline_answers: Option<crate::background::watch::InlineAnswerLedger>,
 }
 
 impl WaitDeps {
@@ -218,6 +252,14 @@ impl WaitDeps {
             enabled,
             session_id,
             completion_bus: None,
+            // pi's defaults: `deps.stopOnAttention !== false` (`subagent-wait.ts:618`) and
+            // `deps.failOnFailedRuns === true` / `deps.failOnAttention === true` (`:708`,`:725`)
+            // — i.e. attention breaks the wait and neither outcome flips the result to an error
+            // unless a caller (auto-drain) opts in. Byte-identical behaviour for the `wait` tool.
+            stop_on_attention: true,
+            fail_on_failed_runs: false,
+            fail_on_attention: false,
+            inline_answers: None,
         }
     }
 
@@ -233,6 +275,45 @@ impl WaitDeps {
         bus: Option<crate::background::watch::CompletionBus>,
     ) -> Self {
         self.completion_bus = bus;
+        self
+    }
+
+    /// `ASYNC_NOTIFY_BUG_REPORT` F3.4 — attach the executor-owned
+    /// [`crate::background::watch::InlineAnswerLedger`], so this wait's claims can hold a
+    /// same-run completion delivery off and its inline answers can suppress the duplicate
+    /// standalone notification. Separate from [`Self::for_cwd`] for the same reason
+    /// [`Self::with_completion_bus`] is: the ledger is executor-owned (it must outlive any single
+    /// watcher install), while `for_cwd` is reachable from contexts that have no executor at all.
+    #[must_use]
+    pub fn with_inline_answers(
+        mut self,
+        ledger: Option<crate::background::watch::InlineAnswerLedger>,
+    ) -> Self {
+        self.inline_answers = ledger;
+        self
+    }
+
+    /// Override [`Self::stop_on_attention`] — auto-drain passes `false` so it can wait THROUGH a
+    /// needs-attention run instead of spinning on it.
+    #[must_use]
+    pub fn with_stop_on_attention(mut self, stop_on_attention: bool) -> Self {
+        self.stop_on_attention = stop_on_attention;
+        self
+    }
+
+    /// Override [`Self::fail_on_failed_runs`] — auto-drain passes `true` so a failed child makes
+    /// the drain throw rather than exit quietly.
+    #[must_use]
+    pub fn with_fail_on_failed_runs(mut self, fail_on_failed_runs: bool) -> Self {
+        self.fail_on_failed_runs = fail_on_failed_runs;
+        self
+    }
+
+    /// Override [`Self::fail_on_attention`] — auto-drain passes `true` so unresolved attention at
+    /// the end of the wait is surfaced as an error.
+    #[must_use]
+    pub fn with_fail_on_attention(mut self, fail_on_attention: bool) -> Self {
+        self.fail_on_attention = fail_on_attention;
         self
     }
 }
@@ -412,13 +493,27 @@ pub async fn wait_for_subagents(
         .completion_bus
         .as_ref()
         .map(super::watch::CompletionBus::subscribe);
+    // SCOPE_17 — the per-child blocks observed off the bus while this wait was in flight, keyed by
+    // run id so a re-published completion cannot overwrite the first observation (`or_insert_with`
+    // at the write site, never `insert`).
+    let mut observed_summaries: BTreeMap<String, String> = BTreeMap::new();
 
     let mut active = active_runs(params.id.as_deref(), deps).await?;
 
     if active.is_empty() {
-        return Ok(match &params.id {
-            Some(id) => format!("No active run matched \"{id}\". Nothing to wait for."),
-            None => "No active async runs in this session. Nothing to wait for.".to_string(),
+        // Nothing is running. That is NOT the same as "there is nothing to report": the runs this
+        // caller is asking about have very likely just finished, and their results are on disk
+        // right now. Denying their existence is what sent an orchestrator to `bash` to `cat` an
+        // artifact file it had already been told nothing about.
+        // ASYNC_NOTIFY_BUG_REPORT F3.4 — the claim for this branch is taken INSIDE
+        // `resolve_finished`, as soon as the run ids are known and before any payload is read.
+        // Claiming out here, after the await, would leave that read window unprotected (RC4).
+        return Ok(match resolve_finished(params, deps).await {
+            WaitResolution::Terminal(replay) => replay.render(),
+            WaitResolution::Unknown => match &params.id {
+                Some(id) => format!("No active run matched \"{id}\". Nothing to wait for."),
+                None => "No active async runs in this session. Nothing to wait for.".to_string(),
+            },
         });
     }
 
@@ -450,6 +545,20 @@ pub async fn wait_for_subagents(
         .map(|run| run_id_of(run).to_string())
         .collect();
     let initial_count = initial_ids.len();
+    // ASYNC_NOTIFY_BUG_REPORT F3.4/RC4 — claim the tracked runs BEFORE the first `done()` check,
+    // so the claim provably precedes any possible resolution: a delivery for one of these runs
+    // now holds off ([`super::watch::InlineAnsweredSink`]) until this wait either answers it
+    // inline (the standalone notification is then suppressed and its payload consumed against the
+    // decorator's receipt) or releases the claim un-answered — the guard's `Drop` runs on the
+    // timeout, abort and error returns alike, so a dead wait can never park a delivery.
+    let mut inline_claim = deps.inline_answers.as_ref().map(|ledger| {
+        ledger.claim(
+            &initial_ids
+                .iter()
+                .map(|id| super::RunId::from_token(id.clone()))
+                .collect::<Vec<_>>(),
+        )
+    });
     let mut pending: Vec<ActiveRun> = active
         .iter()
         .filter(|run| !needs_attention(run))
@@ -462,40 +571,56 @@ pub async fn wait_for_subagents(
         .collect();
 
     let done = |pending: &[ActiveRun], attention: &[ActiveRun]| -> bool {
-        // A run needing attention always breaks the wait, in either mode: the caller has to act on
-        // it (nudge/resume/interrupt) and blocking longer helps nothing.
-        if !attention.is_empty() {
+        // With the flag set — the default, and the `wait` tool's mode — a run needing attention
+        // breaks the wait in either mode: the caller has to act on it (nudge/resume/interrupt)
+        // and blocking longer helps nothing. With it off (auto-drain), attention does NOT end the
+        // wait — pi's `stopOnAttention || hasSupervisorTool(run)` gate (`subagent-wait.ts:618-622`;
+        // the supervisor-tool escape is the documented [CYRUP-DELTA] on
+        // [`WaitDeps::stop_on_attention`]).
+        if deps.stop_on_attention && !attention.is_empty() {
             return true;
         }
+        // An attention run is still ACTIVE: upstream's `isDone` counts membership in the FULL
+        // active set (`subagent-wait.ts:623-630`), of which `attention` is a subset — so with the
+        // short-circuit off it must keep the wait open rather than vanish from the accounting.
+        // (With the flag on, these terms are vacuous: `attention` is empty past the return above.)
+        let is_initial = |run: &&ActiveRun| initial_ids.iter().any(|id| id == run_id_of(run));
         if wait_for_all {
-            return pending
-                .iter()
-                .all(|run| !initial_ids.iter().any(|id| id == run_id_of(run)));
+            return !pending.iter().any(|run| is_initial(&run))
+                && !attention.iter().any(|run| is_initial(&run));
         }
-        let still_active_initial = pending
-            .iter()
-            .filter(|run| initial_ids.iter().any(|id| id == run_id_of(run)))
-            .count();
+        let still_active_initial = pending.iter().filter(is_initial).count()
+            + attention.iter().filter(is_initial).count();
         still_active_initial < initial_count
     };
 
     while !done(&pending, &attention) {
+        // pending + attention: upstream's abort/timeout messages name `activeInitialRuns` — the
+        // FULL active∩initial set (`subagent-wait.ts:640-651`). With `stop_on_attention` off (the
+        // drain), the wait can time out while ONLY attention runs remain, and a message built from
+        // `pending` alone would then claim "0 run(s) still active" about a live run. With the flag
+        // on, `attention` is empty at both sites (the `done` short-circuit exits first), so this
+        // changes nothing for the `wait` tool.
         if cancel.is_cancelled() {
+            let in_flight: Vec<ActiveRun> =
+                pending.iter().chain(attention.iter()).cloned().collect();
             return Err(format!(
                 "Wait aborted after {}. Still active: {}.",
                 format_duration(elapsed_ms(started_at)),
-                join_ids_with_state(&pending)
+                join_ids_with_state(&in_flight)
             ));
         }
         let elapsed = started_at.elapsed();
         if elapsed >= timeout {
+            let in_flight: Vec<ActiveRun> =
+                pending.iter().chain(attention.iter()).cloned().collect();
             return Err(format!(
                 "Wait timed out after {} with {} run(s) still active: {}. The runs are detached \
                  and keep going; call wait again or inspect with subagent({{ action: \"status\" \
                  }}).",
                 format_duration(timeout.as_millis().try_into().unwrap_or(u64::MAX)),
-                pending.len(),
-                join_ids_with_state(&pending)
+                in_flight.len(),
+                join_ids_with_state(&in_flight)
             ));
         }
 
@@ -528,6 +653,17 @@ pub async fn wait_for_subagents(
                     // instantly forever and spin this loop at 100% CPU, so it retires the
                     // subscription instead and the remainder of the wait polls.
                     outcome = receiver.recv() => {
+                        // SCOPE_17 — the wake arm already receives the completion; keeping its
+                        // summary is what lets a resolved wait ANSWER instead of merely reporting
+                        // a count. Filtered to `initial_ids` so a concurrent turn's run cannot
+                        // inject its output into this wait's report.
+                        if let Ok(event) = &outcome
+                            && initial_ids.iter().any(|id| id == event.run_id.as_str())
+                        {
+                            observed_summaries
+                                .entry(event.run_id.as_str().to_string())
+                                .or_insert_with(|| event.summary.clone());
+                        }
                         wake_closed = matches!(
                             outcome,
                             Err(tokio::sync::broadcast::error::RecvError::Closed)
@@ -569,7 +705,33 @@ pub async fn wait_for_subagents(
     }
 
     let terminal_runs = terminal_runs_for(&initial_ids, deps).await;
+    // ASYNC_NOTIFY_BUG_REPORT F2 — the shared resolution both renders read from (so neither can
+    // drift): drain the bus backlog the poll may have raced past (RC2), replay from disk whatever
+    // the bus never carried (RC3), and name what is still genuinely absent.
+    let resolved = resolve_results(
+        deps,
+        wake.as_mut(),
+        &initial_ids,
+        &mut observed_summaries,
+        &terminal_runs,
+    )
+    .await;
+    if let Some(claim) = inline_claim.as_mut() {
+        // F3.4 — the values this response actually carries: bus summary, exit drain, or disk
+        // replay alike. Recorded on the claim's release, consumed one-use by the watcher's
+        // decorator.
+        for run_id in &resolved.answered {
+            claim.answered(run_id);
+        }
+    }
     let (finished_count, terminal_summary) = summarize_terminal_runs(&terminal_runs);
+    // pi `failedAsyncCount = terminal.filter((run) => run.state === "failed" || run.state ===
+    // "partial").length` (`subagent-wait.ts:678`) — cyrup has no `Partial` variant, so the set is
+    // `Failed` alone. Feeds the two `deps.failOnFailedRuns` error flips below (`:708`, `:725`).
+    let failed_count = terminal_runs
+        .iter()
+        .filter(|status| status.state == RunState::Failed)
+        .count();
     // SUBA-060 / pi `resumeGuidance = formatResumeFirstFailedRunsNote(terminal)`
     // (`subagent-wait.ts:617`), interpolated at `:642`/`:660` immediately after the outcome clause
     // and before the attention note. Empty unless a failed run actually has a revivable child
@@ -603,17 +765,36 @@ pub async fn wait_for_subagents(
         } else {
             "attention required"
         };
-        let notification = if attention.is_empty() {
-            "Completion events have been observed; inspect status if the notification is not \
-             visible yet."
-        } else {
-            "Relevant completion/control events have been observed; inspect status if the \
+        let notification = if !attention.is_empty() {
+            // Attention-flavoured: describes control state, not values — unchanged (F2.3).
+            " Relevant completion/control events have been observed; inspect status if the \
              notification is not visible yet."
+        } else if resolved.unanswered.is_empty() {
+            // F2.3 — every terminal initial run's value is in this response; the `Results:`
+            // appendix IS the notification, so the "inspect status" hint would mislead.
+            ""
+        } else {
+            " Completion events have been observed; inspect status if the notification is not \
+             visible yet."
         };
-        return Ok(format!(
+        let text = format!(
             "Waited {elapsed} for {scope}; \
-             {status}.{outcome}{resume_guidance}{attention_note} {notification}"
-        ));
+             {status}.{outcome}{resume_guidance}{attention_note}{notification}"
+        );
+        // SCOPE_17 + ASYNC_NOTIFY_BUG_REPORT F2 — appended last, after the sentence is already
+        // complete. A wait that resolved through the poll now replays its values from the bus
+        // backlog (exit drain) or the still-on-disk payload, so the appendix is empty only when
+        // there is genuinely nothing to report.
+        let text = format!("{text}{}", resolved.appendix);
+        // pi `:706-710` — the SAME text either way; the flags only flip the result's error bit,
+        // which is what makes auto-drain throw instead of exiting quietly.
+        return if (deps.fail_on_failed_runs && failed_count > 0)
+            || (deps.fail_on_attention && !attention.is_empty())
+        {
+            Err(text)
+        } else {
+            Ok(text)
+        };
     }
 
     // First-completion mode.
@@ -637,16 +818,341 @@ pub async fn wait_for_subagents(
         format!("{finished_count} of {initial_count} run(s) finished")
     };
     let notification = if finished_count > 0 {
-        " Completion events for the finished run(s) have been observed; inspect status if the \
-         notification is not visible yet."
+        if resolved.unanswered.is_empty() {
+            // F2.3 — as in all-mode: every finished run's value is in this response.
+            ""
+        } else {
+            " Completion events for the finished run(s) have been observed; inspect status if the \
+             notification is not visible yet."
+        }
     } else {
+        // Attention-flavoured: describes control state, not values — unchanged (F2.3).
         " Relevant control events have been observed; inspect status if the notification is not \
          visible yet."
     };
-    Ok(format!(
+    let text = format!(
         "Waited {elapsed}; \
          {progress}.{outcome}{resume_guidance}{attention_note}{remainder}{notification}"
-    ))
+    );
+    // SCOPE_17 + ASYNC_NOTIFY_BUG_REPORT F2 — same appended block as the all-mode return above,
+    // same reasoning.
+    let text = format!("{text}{}", resolved.appendix);
+    // pi `:723-727` — as in the all-mode return above: same text, error bit per the deps flags.
+    if (deps.fail_on_failed_runs && failed_count > 0)
+        || (deps.fail_on_attention && !attention.is_empty())
+    {
+        Err(text)
+    } else {
+        Ok(text)
+    }
+}
+
+/// The per-child blocks for the runs this wait resolved, in `initial_ids` order.
+///
+/// Since ASYNC_NOTIFY_BUG_REPORT F2 the map this renders is fed by THREE sources — live bus
+/// events, the exit drain of the receiver's backlog, and the disk replay of a still-on-disk
+/// payload ([`resolve_results`]) — so a wait that resolved through the poll instead of the bus is
+/// no longer a value-less outcome. Empty only when there is genuinely nothing to report.
+fn format_observed_completions(initial_ids: &[String], observed: &BTreeMap<String, String>) -> String {
+    let blocks: Vec<&str> = initial_ids
+        .iter()
+        .filter_map(|id| observed.get(id).map(String::as_str))
+        .filter(|text| !text.trim().is_empty())
+        .collect();
+    if blocks.is_empty() {
+        return String::new();
+    }
+    format!("\n\nResults:\n\n{}", blocks.join("\n\n"))
+}
+
+/// Everything the response can say about the runs this wait tracked (`ASYNC_NOTIFY_BUG_REPORT`
+/// F2's shared render tail — both modes read from one resolution, so neither can drift).
+///
+/// Three sources, in decreasing order of freshness, first one wins per run:
+///   1. `observed_summaries` — bus events consumed by the wake arm while the wait was in flight.
+///   2. the EXIT DRAIN — events already buffered in the receiver when the poll won the race
+///      (RC2: the loop consumed at most one event per iteration, and the record poll routinely
+///      observes the terminal state first).
+///   3. the DISK REPLAY — the run's still-on-disk `ResultFile`, guaranteed present for a run that
+///      went terminal during this turn (RC3: consumption requires a delivered injection, and the
+///      injection pump cannot resolve before `wait_for_idle`).
+struct ResolvedResults {
+    /// Rendered `Results:` appendix (empty string when there is nothing to say).
+    appendix: String,
+    /// Terminal initial runs whose VALUE is still absent after all three sources (the
+    /// records-only replay fallback names steps and artifacts, not the child's answer). Gates the
+    /// trailing "inspect status" hint (F2.3): it renders only when this is non-empty.
+    unanswered: Vec<String>,
+    /// Run ids whose value this response actually carries — F3 records these on the claim.
+    answered: Vec<super::RunId>,
+}
+
+/// Build [`ResolvedResults`] for a live wait that has just resolved: drain the bus backlog, then
+/// replay from disk for every terminal run still missing a value.
+async fn resolve_results(
+    deps: &WaitDeps,
+    wake: Option<&mut tokio::sync::broadcast::Receiver<super::watch::CompletionEvent>>,
+    initial_ids: &[String],
+    observed_summaries: &mut BTreeMap<String, String>,
+    terminal_runs: &[super::RunStatus],
+) -> ResolvedResults {
+    // 1. Exit drain (F2.1): consume whatever is already buffered, applying the SAME `initial_ids`
+    //    filter and `or_insert_with` the wake arm uses, so a re-published completion cannot
+    //    overwrite the first observation and a concurrent turn's run cannot inject its output.
+    if let Some(receiver) = wake {
+        loop {
+            match receiver.try_recv() {
+                Ok(event) => {
+                    if initial_ids.iter().any(|id| id == event.run_id.as_str()) {
+                        observed_summaries
+                            .entry(event.run_id.as_str().to_string())
+                            .or_insert_with(|| event.summary.clone());
+                    }
+                }
+                // `Lagged` means MORE events landed than the bus buffered — keep draining, the
+                // remaining ones are still readable.
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break, // Empty | Closed
+            }
+        }
+    }
+
+    /// A non-empty per-run block — the same emptiness test [`format_observed_completions`]
+    /// applies, so "has a value" and "renders a block" cannot disagree.
+    fn has_value(summaries: &BTreeMap<String, String>, id: &str) -> bool {
+        summaries.get(id).is_some_and(|text| !text.trim().is_empty())
+    }
+
+    let mut answered: Vec<super::RunId> = initial_ids
+        .iter()
+        .filter(|id| has_value(observed_summaries, id))
+        .map(|id| super::RunId::from_token((*id).clone()))
+        .collect();
+
+    // 2. Disk replay (F2.2): `terminal_runs_for` has already produced the reconciled status for
+    //    every initial id, so the live path pays no second reconcile — it is one `RunPaths` away
+    //    from the same replay the already-finished branch performs.
+    let mut unanswered: Vec<String> = Vec::new();
+    for status in terminal_runs {
+        if has_value(observed_summaries, status.run_id.as_str()) {
+            continue;
+        }
+        let paths =
+            super::RunPaths::for_run(&deps.async_root, &deps.results_dir, &status.run_id);
+        let (block, carries_value) = terminal_block_for(status, &paths).await;
+        if carries_value {
+            answered.push(status.run_id.clone());
+        } else {
+            // The records-only fallback (steps + artifacts pointer) is reported, but it is not
+            // the child's answer — the hint stays honest and F3 must not suppress the standalone
+            // notification that may still carry it.
+            unanswered.push(status.run_id.as_str().to_string());
+        }
+        observed_summaries.insert(status.run_id.as_str().to_string(), block);
+    }
+
+    ResolvedResults {
+        appendix: format_observed_completions(initial_ids, observed_summaries),
+        unanswered,
+        answered,
+    }
+}
+
+/// What a `wait` with no active runs actually found.
+///
+/// The branch this replaces was a bare `if active.is_empty()` returning a fixed sentence, which
+/// conflated two very different facts: "this id names a run that already finished" and "this id
+/// names nothing at all". Naming them separately is what lets the first one answer with the run's
+/// own result.
+#[derive(Debug)]
+enum WaitResolution {
+    /// The request names run(s) that reached a terminal state; their outcome is replayed.
+    Terminal(TerminalReplay),
+    /// Nothing on disk matches — the only case that may say "nothing to wait for".
+    Unknown,
+}
+
+/// One or more finished runs, rendered as the answer to a wait that arrived after the fact.
+#[derive(Debug)]
+struct TerminalReplay {
+    /// How the caller addressed the runs (an id, or this session's recent history).
+    scope: String,
+    /// One `(run id, rendered block)` per run — the id is what lets the caller mark the value as
+    /// answered inline (`ASYNC_NOTIFY_BUG_REPORT` F2.5/F3.4); the render joins the blocks and is
+    /// byte-identical to when this held bare strings.
+    blocks: Vec<(super::RunId, String)>,
+}
+
+impl TerminalReplay {
+    fn render(&self) -> String {
+        format!(
+            "No runs are still active for {}; reporting the finished run(s).\n\n{}",
+            self.scope,
+            self.blocks
+                .iter()
+                .map(|(_, block)| block.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        )
+    }
+}
+
+/// Resolve a wait that found no active runs against the terminal records on disk.
+async fn resolve_finished(params: &WaitParams, deps: &WaitDeps) -> WaitResolution {
+    match params.id.as_deref() {
+        Some(id) => {
+            let Ok(Some(location)) = super::run_id_resolver::resolve_async_run_id(
+                id,
+                &deps.async_root,
+                &deps.results_dir,
+                deps.session_id
+                    .as_deref()
+                    .and_then(crate::identity::SessionId::parse)
+                    .as_ref(),
+            ) else {
+                return WaitResolution::Unknown;
+            };
+            let paths = super::RunPaths::for_run(
+                &deps.async_root,
+                &deps.results_dir,
+                &location.resolved_id,
+            );
+            // ASYNC_NOTIFY_BUG_REPORT F3.4/RC4 — claim BEFORE the payload read, not after it.
+            // `terminal_block` reconciles the run records and reads the result file; a watcher
+            // tick landing inside that window would otherwise reach the decorator's
+            // `take_answered` check before this response has recorded its answer, and the
+            // standalone duplicate would survive precisely in the "wait arrived just after the
+            // run finished" case this branch exists to serve. Held across the read, released on
+            // return.
+            let mut claim = deps
+                .inline_answers
+                .as_ref()
+                .map(|ledger| ledger.claim(std::slice::from_ref(&location.resolved_id)));
+            match terminal_block(&paths).await {
+                Some(block) => {
+                    if let Some(claim) = claim.as_mut() {
+                        claim.answered(&location.resolved_id);
+                    }
+                    WaitResolution::Terminal(TerminalReplay {
+                        scope: format!("run \"{id}\""),
+                        blocks: vec![(location.resolved_id.clone(), block)],
+                    })
+                }
+                None => WaitResolution::Unknown,
+            }
+        }
+        None => {
+            // `all` with nothing active: report this session's recently-finished runs, which is
+            // exactly the set a caller that just missed its completions is asking about.
+            let Some(session_id) = deps.session_id.as_deref() else {
+                return WaitResolution::Unknown;
+            };
+            let Some(session) = crate::identity::SessionId::parse(session_id) else {
+                return WaitResolution::Unknown;
+            };
+            let Ok(run_ids) = super::terminal_run_index::read_recent_terminal_run_index(
+                &deps.async_root,
+                Some(&session),
+                Some(TERMINAL_REPLAY_LIMIT),
+            )
+            .await
+            else {
+                return WaitResolution::Unknown;
+            };
+            // F3.4/RC4 — as in the single-id arm: the claim covers the whole replay, which reads
+            // up to `TERMINAL_REPLAY_LIMIT` payloads off disk. Taken before the first read so no
+            // delivery can slip past the decorator mid-loop.
+            let mut claim = deps
+                .inline_answers
+                .as_ref()
+                .map(|ledger| ledger.claim(&run_ids));
+            let mut blocks = Vec::new();
+            for run_id in run_ids {
+                let paths =
+                    super::RunPaths::for_run(&deps.async_root, &deps.results_dir, &run_id);
+                if let Some(block) = terminal_block(&paths).await {
+                    if let Some(claim) = claim.as_mut() {
+                        claim.answered(&run_id);
+                    }
+                    blocks.push((run_id, block));
+                }
+            }
+            if blocks.is_empty() {
+                WaitResolution::Unknown
+            } else {
+                WaitResolution::Terminal(TerminalReplay {
+                    scope: "this session".to_string(),
+                    blocks,
+                })
+            }
+        }
+    }
+}
+
+/// How many recently-finished runs an `all`-mode replay reports.
+const TERMINAL_REPLAY_LIMIT: usize = 10;
+
+/// One finished run's block: its per-child result text when the payload is still on disk, else its
+/// recorded steps plus a pointer to the artifacts that outlive the payload.
+///
+/// Never deletes anything. Consumption is the watcher's sole authority — a `wait` that consumed a
+/// payload would race the delivery that is about to notify the orchestrator about it.
+async fn terminal_block(paths: &super::RunPaths) -> Option<String> {
+    let status = super::control::reconcile_before_control_op(paths).await.ok()?;
+    if is_active(status.state) {
+        return None;
+    }
+    Some(terminal_block_for(&status, paths).await.0)
+}
+
+/// The rendered body for one already-reconciled terminal run, plus whether that body actually
+/// CARRIES the run's value (the payload's per-child summary) rather than the records-only
+/// fallback. Split out of [`terminal_block`] (`ASYNC_NOTIFY_BUG_REPORT` F2.2) so the LIVE wait
+/// path can reuse it without paying a second reconcile — [`terminal_runs_for`] has already
+/// produced exactly these statuses — and so [`resolve_results`] can tell an answered value from a
+/// pointer when deciding the trailing hint (F2.3) and the inline-answer set (F3).
+///
+/// Never deletes anything, same as [`terminal_block`]: consumption is the watcher's sole
+/// authority.
+async fn terminal_block_for(status: &super::RunStatus, paths: &super::RunPaths) -> (String, bool) {
+    let mut lines = vec![format!(
+        "{} ({})",
+        status.run_id,
+        super::run_status::run_state_label(status.state)
+    )];
+
+    let payload = match status.session_id.as_ref() {
+        Some(session_id) => paths.resolve_result(session_id, &status.run_id).await,
+        None => None,
+    };
+    let result = match &payload {
+        Some(path) => tokio::fs::read(path)
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<super::ResultFile>(&bytes).ok()),
+        None => None,
+    };
+
+    match result {
+        Some(result) => {
+            lines.push(super::watch::result_display_summary(&result));
+            (lines.join("\n"), true)
+        }
+        None => {
+            // The payload is gone (consumed by its delivery, or destroyed before it). The run's
+            // own records still describe what happened, so the answer is the steps plus a pointer
+            // rather than a shrug.
+            for step in &status.steps {
+                lines.push(format!(
+                    "{}: {}",
+                    step.agent,
+                    super::run_status::step_state_label(step.status)
+                ));
+            }
+            lines.push(format!("Artifacts: {}", paths.run_dir.display()));
+            (lines.join("\n"), false)
+        }
+    }
 }
 
 fn elapsed_ms(since: Instant) -> u64 {
@@ -695,6 +1201,14 @@ mod tests {
                 // what every pre-existing test in this module exercises — so the polling path stays
                 // covered exactly as before and only the two new tests opt into a bus.
                 completion_bus: None,
+                // The `wait` tool's defaults (pi `subagent-wait.ts:618,708,725`); the auto-drain
+                // tests override through the builders.
+                stop_on_attention: true,
+                fail_on_failed_runs: false,
+                fail_on_attention: false,
+                // No ledger — the documented degradation every pre-existing test exercises, same
+                // as `completion_bus: None` above.
+                inline_answers: None,
             }
         }
 
@@ -722,7 +1236,7 @@ mod tests {
             std::fs::create_dir_all(&paths.run_dir).expect("mkdir run dir");
             let mut status = RunStatus::queued(run_id.clone(), RunMode::Single, Some(1));
             status.state = state;
-            status.session_id = session_id.map(str::to_string);
+            status.session_id = crate::identity::SessionId::parse_opt(session_id);
             if attention {
                 status.telemetry.activity_state = Some(ActivityState::NeedsAttention);
             }
@@ -746,10 +1260,12 @@ mod tests {
                 success: true,
                 cwd: PathBuf::from("/tmp"),
                 session_file: None,
+                session_id: None,
+                completion_owner_id: None,
                 results: Vec::new(),
             };
             std::fs::write(
-                &paths.result,
+                &paths.legacy_result_root,
                 serde_json::to_string(&result).expect("serializes"),
             )
             .expect("write result file");
@@ -1046,6 +1562,111 @@ mod tests {
         assert!(text.contains(run_id.as_str()), "got: {text}");
     }
 
+    /// Auto-drain's mode (pi `stopOnAttention: false`, `auto-drain.ts:61`): a needs-attention run
+    /// does NOT break the wait — it is waited THROUGH, still counted as active, and therefore
+    /// bounded by the timeout. Without the accounting half of this (attention runs staying in the
+    /// "still active" count), `all: true` would report done while the run is live; without the
+    /// gate half, the drain loop would spin hot. The timeout message must also NAME the attention
+    /// run — upstream builds it from the full active∩initial set (`subagent-wait.ts:640-651`).
+    #[tokio::test]
+    async fn with_stop_on_attention_off_an_attention_run_is_waited_through_not_resolved() {
+        let fx = Fixture::new();
+        let run_id = RunId::new();
+        fx.write_status(&run_id, RunState::Running, true);
+
+        let deps = fx.deps(true).with_stop_on_attention(false);
+        let started = Instant::now();
+        let err = wait_for_subagents(
+            &WaitParams {
+                all: Some(true),
+                timeout_ms: Some(600),
+                ..WaitParams::default()
+            },
+            &CancelToken::new(),
+            &deps,
+        )
+        .await
+        .expect_err("with the flag off the wait must run out its window, not resolve on attention");
+        assert!(
+            started.elapsed() >= Duration::from_millis(550),
+            "it must actually have waited through the attention, took {:?}",
+            started.elapsed()
+        );
+        assert!(err.starts_with("Wait timed out after "), "got: {err}");
+        assert!(err.contains("1 run(s) still active"), "got: {err}");
+        assert!(
+            err.contains(run_id.as_str()),
+            "the attention run must be named as still active: {err}"
+        );
+    }
+
+    /// pi `deps.failOnFailedRuns` (`subagent-wait.ts:708`): the SAME summary text, with the
+    /// result's error bit flipped — which is what makes auto-drain throw on a failed child instead
+    /// of exiting quietly. The control half (default flags → `Ok` with the same content) is pinned
+    /// by [`a_failed_run_with_a_persisted_child_session_returns_resume_first_guidance`] above.
+    #[tokio::test]
+    async fn fail_on_failed_runs_reports_a_failed_outcome_as_an_error_with_the_same_text() {
+        let fx = Fixture::new();
+        let run_id = RunId::new();
+        fx.write_status(&run_id, RunState::Running, false);
+
+        let settle = {
+            let run_id = run_id.clone();
+            let paths = fx.paths(&run_id);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let mut status = RunStatus::queued(run_id, RunMode::Single, Some(1));
+                status.state = RunState::Failed;
+                status.ended_at = Some(crate::time::now_epoch_millis());
+                std::fs::write(
+                    &paths.status,
+                    serde_json::to_string(&status).expect("status serializes"),
+                )
+                .expect("write failed status");
+            })
+        };
+
+        let deps = fx.deps(true).with_fail_on_failed_runs(true);
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            wait_for_subagents(&WaitParams::default(), &CancelToken::new(), &deps),
+        )
+        .await
+        .expect("wait must resolve once the run fails")
+        .expect_err("a failed run must flip the resolved wait to an error");
+        settle.await.expect("settler task");
+
+        assert!(
+            err.starts_with("Waited "),
+            "the payload is the ordinary summary, not a new error shape: {err}"
+        );
+        assert!(err.contains("Outcome: 1 failed."), "got: {err}");
+    }
+
+    /// pi `deps.failOnAttention` (`subagent-wait.ts:725`): unresolved attention flips the resolved
+    /// wait's error bit, again with the SAME text the default mode returns as `Ok`.
+    #[tokio::test]
+    async fn fail_on_attention_reports_an_attention_resolution_as_an_error() {
+        let fx = Fixture::new();
+        let run_id = RunId::new();
+        fx.write_status(&run_id, RunState::Running, true);
+
+        let deps = fx.deps(true).with_fail_on_attention(true);
+        let err = wait_for_subagents(
+            &WaitParams {
+                all: Some(true),
+                ..WaitParams::default()
+            },
+            &CancelToken::new(),
+            &deps,
+        )
+        .await
+        .expect_err("attention must flip the resolved wait to an error");
+        assert!(err.contains("attention required"), "got: {err}");
+        assert!(err.contains("1 run(s) need attention"), "got: {err}");
+        assert!(err.contains(run_id.as_str()), "got: {err}");
+    }
+
     /// First-completion (default) vs `all: true`: with two runs in flight, settling ONE releases
     /// the default wait and leaves `all: true` still blocking. Both runs must be active when the
     /// wait starts — a run that was already terminal is not in the initial set and satisfies
@@ -1280,6 +1901,7 @@ mod tests {
             bus.publish(crate::background::watch::CompletionEvent {
                 run_id: settle_run,
                 outcome: crate::background::watch::ClassifiedOutcome::Completed,
+                summary: String::new(),
             });
         });
 
@@ -1331,6 +1953,7 @@ mod tests {
             bus.publish(crate::background::watch::CompletionEvent {
                 run_id: RunId::from_token("run-bus-spurious"),
                 outcome: crate::background::watch::ClassifiedOutcome::Completed,
+                summary: String::new(),
             });
             assert!(
                 tokio::time::timeout(Duration::from_millis(60), &mut waiting)
@@ -1345,6 +1968,7 @@ mod tests {
         bus.publish(crate::background::watch::CompletionEvent {
             run_id: run,
             outcome: crate::background::watch::ClassifiedOutcome::Completed,
+            summary: String::new(),
         });
         let text = tokio::time::timeout(Duration::from_secs(2), waiting)
             .await

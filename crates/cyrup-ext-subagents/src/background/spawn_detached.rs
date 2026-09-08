@@ -228,6 +228,14 @@ pub fn spawn_detached_runner_with_command(
 
     #[cfg(unix)]
     {
+        // `resolve_spawn_command` tier 3 execs through `/proc/self/exe` (the inode-pinned image of
+        // this process, valid even after a rebuild replaced the file). Present the real program
+        // name as `argv[0]` so a detached runner reads as `cyrup` in `ps` rather than as the magic
+        // link; this changes only `argv[0]`, never which inode is executed.
+        if let Some(arg0) = spawn_command.arg0() {
+            command.arg0(arg0);
+        }
+
         // New process group (pid == pgid): isolates the detached child from any signal sent to
         // the orchestrator's own process group (R-SA-070's "not signaled by the parent's process
         // group"). Inherent method on `tokio::process::Command` — no extension-trait import

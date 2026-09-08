@@ -14,7 +14,7 @@ use crate::exec::acceptance::AcceptanceContract;
 use crate::exec::agent_config::{AgentConfig, RunOptions};
 use crate::exec::drive_attempt::{DriveOutcome, drive_attempt};
 use crate::exec::fallback::{
-    AttemptRunner, AttemptSignal, StartupEvidence, StartupOutcome, StartupRetryWait,
+    AttemptNote, AttemptRunner, AttemptSignal, StartupEvidence, StartupOutcome, StartupRetryWait,
 };
 use crate::exec::output::{
     EMPTY_OUTPUT_ERROR, INTERRUPTED_FINAL_OUTPUT, detect_subagent_error, extract_final_output,
@@ -53,6 +53,13 @@ pub(crate) struct SpawnedChildAttemptRunner<'a> {
     /// (`runs/foreground/execution.ts:322,357`). Stable across fallback attempts for the same
     /// reason [`Self::skill_injection`] is: skill resolution never depends on the model.
     pub(crate) require_read_tool: bool,
+    /// How many of the ladder's accumulated attempt notes have already been delivered to
+    /// [`RunOptions::live_events`]'s note sink. The live fold is per-RUN and persists across
+    /// fallback attempts (unlike each attempt's own fresh `AgentProgress`), so [`Self::prepare_attempt`]
+    /// emits only the not-yet-seen tail — re-emitting the whole slice each attempt would duplicate
+    /// every earlier note in the one ring pi shows each note in exactly once (pi re-seeds a FRESH
+    /// `recentOutput` per attempt, `execution.ts:542`, so it never faces the question).
+    pub(crate) live_notes_emitted: usize,
 }
 
 /// The richer per-attempt payload [`SpawnedChildAttemptRunner::run_attempt`] returns alongside its
@@ -92,14 +99,14 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
     async fn run_attempt(
         &mut self,
         model: &ModelId,
-        attempt_note: Option<&str>,
+        attempt_notes: &[AttemptNote],
     ) -> (AttemptSignal, Self::Attempt) {
         let PreparedAttempt {
             mut child,
             mut progress,
             mut control,
             tool_diagnostic_path,
-        } = match self.prepare_attempt(model, attempt_note).await {
+        } = match self.prepare_attempt(model, attempt_notes).await {
             Ok(prepared) => prepared,
             Err(failure) => return *failure,
         };
@@ -179,6 +186,9 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
                 exit_code: Some(exit_code),
                 error,
                 usage: progress.usage.clone(),
+                // pi keeps `progress.turnCount` in lockstep with `result.usage.turns`
+                // (`execution.ts:1078-1079`); this port derives the one from the other.
+                turns: u64::from(progress.turn_count()),
                 timed_out: false,
                 // R-SA-037: set from the drive loop's detach observation — `true` when the child's
                 // NDJSON showed a blocking `contact_supervisor` ask (surfaced via `spawn_clarify`),
@@ -292,7 +302,7 @@ impl SpawnedChildAttemptRunner<'_> {
     async fn prepare_attempt(
         &mut self,
         model: &ModelId,
-        attempt_note: Option<&str>,
+        attempt_notes: &[AttemptNote],
     ) -> Result<PreparedAttempt, Box<(AttemptSignal, AttemptRecord)>> {
         let mut progress = AgentProgress {
             // pi's `startTime` local, captured at the very top of `runSingleAttempt` — before the
@@ -301,20 +311,28 @@ impl SpawnedChildAttemptRunner<'_> {
             started_at: Some(std::time::Instant::now()),
             ..AgentProgress::default()
         };
-        // pi seeds the ring with the ladder's attempt notes at construction time
-        // (`recentOutput: [...shared.attemptNotes]`, `runs/foreground/execution.ts:366`); this
-        // crate's ladder hands them down one at a time, so each is appended as it arrives.
-        if let Some(note) = attempt_note {
-            progress.append_recent_output(note);
-            // ...and onto the LIVE surface, which is the only place a user can actually read it:
-            // this attempt's own `progress` is compacted (`recent_output` emptied) before it
-            // becomes `SingleResult::progress`, exactly as pi's `compactCompletedProgress` does.
-            // pi has no second hop here only because its live stream and its settled snapshot are
-            // the same mutable object; cyrup's live surface folds the child's NDJSON, which a
-            // parent-side note never appears on. See [`LiveEventSink::emit_note`].
-            if let Some(sink) = &self.opts.live_events {
-                sink.emit_note(note);
+        // pi seeds the ring with the ladder's ACCUMULATED attempt notes at construction time
+        // (`recentOutput: [...shared.attemptNotes]`, `runs/foreground/execution.ts:542`) — the
+        // WHOLE array, in order, so a relaunched or advanced attempt sees every prior note rather
+        // than only the latest.
+        for note in attempt_notes {
+            progress.append_recent_output(&note.to_string());
+        }
+        // ...and onto the LIVE surface, which is the only place a user can actually read them:
+        // this attempt's own `progress` is compacted (`recent_output` emptied) before it becomes
+        // `SingleResult::progress`, exactly as pi's `compactCompletedProgress` does. pi has no
+        // second hop here only because its live stream and its settled snapshot are the same
+        // mutable object; cyrup's live surface folds the child's NDJSON, which a parent-side note
+        // never appears on. See [`LiveEventSink::emit_note`].
+        //
+        // Only the notes that arrived since the previous attempt: the live fold is per-RUN and
+        // persists across the ladder (see [`Self::live_notes_emitted`]), so re-emitting the whole
+        // slice would show every earlier note twice.
+        if let Some(sink) = &self.opts.live_events {
+            for note in attempt_notes.iter().skip(self.live_notes_emitted) {
+                sink.emit_note(&note.to_string());
             }
+            self.live_notes_emitted = attempt_notes.len();
         }
 
         // pi `runSingleAttempt`'s control locals (`execution.ts:245-246` @v0.34.0): the attempt's own
@@ -555,6 +573,7 @@ fn attempt_setup_failure(
             exit_code: None,
             error: Some(error),
             usage: Usage::default(),
+            turns: 0, // nothing ran, so no assistant turn was ever observed
             timed_out: false,
             detached: false,
             message_errors: Vec::new(), // nothing ran, so no message ever carried one
@@ -586,6 +605,7 @@ fn interrupted_attempt(
             exit_code: Some(0),
             error: None,
             usage: progress.usage.clone(),
+            turns: u64::from(progress.turn_count()),
             timed_out: false,
             detached: outcome.detached,
             message_errors: message_error_messages(&progress.message_end_events),
@@ -619,6 +639,7 @@ fn timed_out_attempt(
             exit_code: Some(raw_exit_code.unwrap_or(1)),
             error: spawn_error.or_else(|| Some("subagent attempt timed out".to_string())),
             usage: progress.usage.clone(),
+            turns: u64::from(progress.turn_count()),
             timed_out: true,
             detached: outcome.detached,
             message_errors: message_error_messages(&progress.message_end_events),

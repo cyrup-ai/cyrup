@@ -112,6 +112,7 @@ fn fixture_spawn_command(script_path: &Path) -> SpawnCommand {
 
 fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
+        structured_output_dir: None,
         spawn_command: None,
         child_env: std::collections::HashMap::new(),
         turn_budget: None,

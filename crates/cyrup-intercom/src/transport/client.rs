@@ -642,7 +642,7 @@ impl IntercomClient {
     /// `resolveTarget` (`v0.13.0 broker/client.ts:675-684`) — the CLIENT-side resolver, which
     /// returns `None` on ambiguity rather than raising.
     ///
-    /// Deliberately NOT [`crate::session_state::SessionState::resolve_target`], which raises two
+    /// Deliberately NOT [`crate::session_state::SharedIntercomState::resolve_target`], which raises two
     /// distinct disambiguation errors because a human is reading them; here an ambiguous name
     /// simply degrades to a plain name-routed send and the BROKER produces `E_AMBIGUOUS_TARGET`.
     /// The id → exact-name → id-prefix ladder is `findSessions`', so it reuses

@@ -43,9 +43,12 @@ pub mod control;
 pub mod fallback;
 pub mod mcp_direct_tools;
 pub mod model_scope;
+pub mod mutation_evidence;
 pub mod ndjson;
 pub mod output;
+pub mod output_state;
 pub mod permissions;
+pub mod result_summary;
 pub mod spawn_budget;
 pub mod structured;
 pub mod task_intent;
@@ -103,7 +106,7 @@ pub use progress::*;
 pub use run_result::*;
 pub use spawn_plan::*;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use cyrup_core::{ModelId, Usage};
 
@@ -168,6 +171,13 @@ pub const RECENT_OUTPUT_LINE_CHARS: usize = 2000;
 /// `self: bool`) cannot accept.
 pub(crate) fn is_false(value: &bool) -> bool {
     !*value
+}
+
+/// `skip_serializing_if` for a count whose absence and whose zero mean the same thing — the
+/// `u64` sibling of [`is_false`], and the same omit-when-default discipline
+/// `stopped`/`turn_budget_exceeded` already use.
+pub(crate) const fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 pub(crate) fn bound_output_line(line: &str) -> String {
@@ -426,6 +436,12 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         .as_ref()
         .map(|guard| guard.runtime().clone());
 
+    // pi `execution.ts:568` — the tracked-file baseline is taken BEFORE the first child spawns, so
+    // a deadline kill can be characterised against a known-good starting state. Deliberately
+    // outside the ladder: a relaunch on the next model must be measured against the ORIGINAL
+    // worktree, not against whatever the previous attempt left behind.
+    let mutation_snapshot = crate::exec::mutation_evidence::snapshot_tracked_mutations(&opts.cwd);
+
     let outcome = drive_fallback_ladder(
         agent,
         task,
@@ -457,11 +473,109 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         .as_ref()
         .map(|record| record.turn_budget.clone())
         .unwrap_or_default();
+
+    // pi `execution.ts:1474` — the final evidence collect, measured against the pre-ladder
+    // snapshot.
+    let mutation_evidence = crate::exec::mutation_evidence::collect_tracked_mutation_evidence(
+        &mutation_snapshot,
+        &opts.cwd,
+    );
+
+    // pi `result.artifactPaths` (`shared/types.ts:1349`, computed at `execution.ts:1826-1830`)
+    // under pi's own gate: `RunOptions::artifacts_dir` is only ever `Some` when the caller's
+    // artifact config is enabled (`artifactsDir && artifactConfig?.enabled !== false` — both the
+    // foreground dispatch and the step executor apply it before constructing the options), so the
+    // presence of the dir IS the gate. Same base/run-id/agent/index quadruple the artifact writers
+    // use, so the published bundle names the files actually written. Computed HERE, above the
+    // terminal preamble, because the recovery summary below names the transcript/output/metadata
+    // artifacts (pi `mutation-evidence.ts:180-182`) — a pure derivation over `opts`/`agent`, so
+    // hoisting it above the preamble changes nothing else.
+    let artifact_paths = opts.artifacts_dir.as_ref().map(|dir| {
+        crate::artifacts::artifact_paths(
+            dir,
+            opts.run_id
+                .as_ref()
+                .map_or("run", crate::background::RunId::as_str),
+            &agent.name,
+            opts.child_index,
+        )
+    });
+
+    // pi `execution.ts:1481-1488` — is the run's REQUESTED report missing? `None` when the run
+    // declared no output contract at all, which the summary reports as `not-requested` rather
+    // than an accusation.
+    let required_output_missing = if matches!(opts.output_mode, OutputMode::FileOnly)
+        && let Some(output_path) = opts.output_path.as_deref()
+    {
+        crate::exec::output::has_output_changed_since_snapshot(output_path, setup.output_snapshot)
+            .map(|changed| !changed)
+    } else {
+        // pi `!capture.structuredOutput().called` — cyrup's equivalent observable is the capture
+        // file, which `read_structured_output` already treats as the "was the tool called" test
+        // (`exec/structured.rs`). `None` when no schema was declared either.
+        structured_runtime
+            .as_ref()
+            .map(|runtime| !runtime.output_path.exists())
+    };
+
+    // pi `execution.ts:1489-1514` — the recovery summary for a deadline kill. Upstream's TWO
+    // production build sites both pass `termination: "timed-out"` (`execution.ts:1505`;
+    // `subagent-runner.ts:1485`, whose second disjunct `ctx.timeoutSignal?.aborted` is the
+    // run-level DEADLINE signal, which cyrup threads into this same `timed_out` via
+    // `RunOptions::deadline_at`). A foreground `run_sync` never observes a stop — see
+    // `SingleResult::stopped`'s own note: the stop verb is a background-control fact applied
+    // OUTSIDE this function — so `timed_out` is the whole of upstream's gate reachable here;
+    // `Termination::Stopped` stays a live wire variant for the tolerant readers.
+    let timeout_recovery = if timed_out {
+        let winning_progress = last_attempt.as_ref().map(|record| &record.progress);
+        Some(
+            crate::exec::mutation_evidence::build_timeout_recovery_summary(
+                crate::exec::mutation_evidence::TimeoutRecoveryInput {
+                    termination: crate::exec::mutation_evidence::Termination::TimedOut,
+                    evidence: &mutation_evidence,
+                    required_output_missing,
+                    // The winning attempt's own live context — the same source
+                    // `build_progress_snapshot` reads (pi `progress.currentTool` /
+                    // `progress.currentToolArgs` / `progress.currentPath`,
+                    // `execution.ts:1508-1510`). An empty args preview is upstream's falsy `""`
+                    // — filtered to `None` so the em-dash segment is omitted identically.
+                    current_tool: winning_progress
+                        .and_then(|progress| progress.current_tool.as_deref()),
+                    current_tool_args: winning_progress
+                        .map(|progress| progress.current_tool_args.as_str())
+                        .filter(|args| !args.is_empty()),
+                    current_path: last_attempt
+                        .as_ref()
+                        .and_then(|record| record.control.current_path()),
+                    // pi `sessionFile: options.sessionFile` (`:1511`) — the OPTION, not the
+                    // post-run resolved transcript (`resolve_result_session_file` runs later and
+                    // answers a different question).
+                    session_file: opts.fork_context.session_file_path.as_deref(),
+                    // pi `transcriptPath: shared.transcriptWriter ? shared.artifactPaths?.
+                    // transcriptPath : undefined` (`:1512`) — cyrup's artifact gate is the
+                    // presence of `artifacts_dir` (see `artifact_paths` above), so the bundle's
+                    // presence is the writer's presence.
+                    transcript_path: artifact_paths
+                        .as_ref()
+                        .map(|paths| paths.transcript_path.as_path()),
+                    artifact_paths: artifact_paths.as_ref(),
+                },
+            ),
+        )
+    } else {
+        None
+    };
+
     let final_output = apply_terminal_preamble(
         final_output,
         timed_out,
         opts.timeout_ms,
         &turn_budget_tracker,
+        // §0.1's one-interpolation-wide hole, filled: `execution.ts:1500-1502` splices the
+        // recovery message between the timeout message and the partial-output heading.
+        timeout_recovery
+            .as_ref()
+            .map(|summary| summary.message.as_str()),
     );
 
     let (final_output, full_output_for_reference, saved_output_path) = resolve_saved_output(
@@ -496,15 +610,37 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         exit_code, error, ..
     } = gates;
 
-    let (final_output, output_truncated) = finalize_delivered_output(
-        final_output,
+    // pi `execution.ts:2036-2040`: the explicit session FILE wins when it exists or the child
+    // demonstrably produced messages; otherwise a share-enabled run's `--session-dir` is scanned
+    // for the newest transcript. The same value `finish_run` stamps onto the terminal
+    // `status.session_file` one level up — without it, `resume`'s terminal-revival branch
+    // (R-SA-085) has nothing to revive from.
+    let session_file = resolve_result_session_file(opts, &progress).await;
+
+    // The delivered-output TAIL — `derive_output_state` + `prepend_attempt_notes` +
+    // `finalize_delivered_output` — as ONE pure function (SCOPE_3 §A.1): the legal order of those
+    // stages is [`assemble_delivered_output`]'s body rather than a claim about statement
+    // positions, and `output_state` is derived from `captured` inside it, so a note cannot flip
+    // an empty output to "present" structurally rather than positionally. Sits AFTER
+    // `apply_acceptance` because upstream evaluates acceptance against the RAW output
+    // (`outputForAcceptance = rawOutput`, `subagent-runner.ts:1439`) — a `[fallback] …` note can
+    // never satisfy or violate an agent contract.
+    let DeliveredOutput {
+        text: final_output,
+        output_state,
+        truncated: output_truncated,
+    } = assemble_delivered_output(DeliveredOutputParts {
+        captured: final_output.as_deref(),
+        stop: outcome.stop,
+        notes: &outcome.attempt_notes,
+        structured_output: structured_output.as_ref(),
+        saved_output_path: saved_output_path.as_deref(),
         full_output_for_reference,
-        saved_output_path.as_ref(),
         detached,
         exit_code,
-        agent.max_output,
-        opts.output_mode,
-    );
+        max_output: agent.max_output,
+        output_mode: opts.output_mode,
+    });
 
     let progress_snapshot = build_progress_snapshot(
         &progress,
@@ -537,15 +673,54 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         task: task.to_string(),
         exit_code,
         usage: outcome.aggregate_usage,
+        // The ladder aggregate, folded beside `aggregate_usage` (pi `sumUsage`,
+        // `execution.ts:134-141` applied per attempt at `:1924`) — additive across failed
+        // attempts, exactly like the tokens.
+        turns: outcome.aggregate_turns,
         model: winning_model,
         attempted_models: outcome.attempted_models,
         model_attempts: outcome.model_attempts,
         final_output,
         structured_output,
+        // pi `execution.ts:2036-2040` — see `resolve_result_session_file`.
+        session_file,
+        // SCOPE_3d — a foreground `run_sync` child is not a background run; the field is the
+        // async settle path's mirror of `StepStatus::run_id` (`runner_main/settle.rs`).
+        child_run_id: None,
+        output_state,
+        // pi `subagent-runner.ts:1588`: published only where the capture directory outlives the
+        // run (`RunOptions::structured_output_dir`, the async policy), and withheld from a
+        // timed-out or stopped run whose capture the child may not have finished writing. The
+        // foreground path (`structured_output_dir: None`) sweeps the directory, so publishing its
+        // path would name a deleted file. A foreground run never sets `stopped` (see that field's
+        // own note below), so `timed_out` is the whole of upstream's
+        // `timedOutAfterAcceptance || stoppedAfterAcceptance` gate reachable here.
+        structured_output_path: if timed_out {
+            None
+        } else {
+            opts.structured_output_dir
+                .as_ref()
+                .and(structured_runtime.as_ref())
+                .map(|runtime| runtime.output_path.clone())
+        },
+        // pi `result.artifactPaths` (`execution.ts:1826-1830`, stamped under the artifacts gate).
+        artifact_paths,
         acceptance: acceptance_ledger,
         detached,
         interrupted,
         timed_out,
+        // pi `result.timeoutRecovery` (`execution.ts:1503`, published `subagent-runner.ts:1616`)
+        // — built above, before the preamble spliced its `message` into the delivered output.
+        timeout_recovery,
+        // pi `contextOverflow: contextOverflow || undefined` (`subagent-runner.ts:1570`) — the
+        // ladder's terminal overflow classification, published beside its `timed_out`/`stopped`
+        // siblings in the "why did this child end" family.
+        // Read from the ladder's single classification rather than a separately-tracked bool, so
+        // there is one source of truth for "why did the ladder stop" (see
+        // [`crate::exec::fallback::LadderStop`]). NOT the run's terminal STATUS — that is
+        // `resolve_subagent_result_status`, which folds in the `stopped`/`interrupted`/`detached`
+        // facts the ladder cannot see.
+        context_overflow: outcome.stop == crate::exec::fallback::LadderStop::ContextOverflow,
         // G77/G104: pi's FOREGROUND executor never sets `result.stopped` — it only ever READS it
         // (`execution.ts:1086`/`:1571`/`:1689`), because the stop verb is a background-run control
         // request consumed by the detached runner (`subagent-runner.ts:2955-2984`), and a
@@ -655,6 +830,7 @@ async fn drive_fallback_ladder<'a>(
         // IS `Boolean(...?.length)` — a declared-but-unresolvable skill grants nothing, matching
         // upstream, which derives the flag from the RESOLVED list rather than the requested one.
         require_read_tool,
+        live_notes_emitted: 0,
     };
     run_fallback_ladder(candidates, &mut runner).await
 }
@@ -731,6 +907,43 @@ fn resolve_terminal_usage_budget(
     (usage_budget, error)
 }
 
+/// Resolve the session transcript this run's terminal [`SingleResult::session_file`] names — pi's
+/// two-branch chain at `execution.ts:2036-2040`, ported condition for condition:
+///
+/// ```text
+/// if (options.sessionFile && (existsSync(options.sessionFile) || result.messages?.length))
+///     result.sessionFile = options.sessionFile;
+/// else if (shareEnabled && options.sessionDir)
+///     result.sessionFile = findLatestSessionFile(options.sessionDir);
+/// ```
+///
+/// `options.sessionFile` is this port's [`ForkContext::session_file_path`] (the value
+/// `build_attempt_spawn_plan` pins the child to with `--session`), `result.messages?.length` is
+/// "the child demonstrably produced messages" — [`AgentProgress::message_end_events`] non-empty —
+/// and `findLatestSessionFile` is
+/// [`crate::registration::cost::find_latest_session_file_by_mtime`], the crate's one existing
+/// newest-`.jsonl` scan. A lookup failure degrades to `None` exactly like upstream's
+/// `if (sessionFile)` truthiness guard.
+async fn resolve_result_session_file(
+    opts: &RunOptions,
+    progress: &AgentProgress,
+) -> Option<PathBuf> {
+    if let Some(path) = opts.fork_context.session_file_path.as_ref()
+        && (path.exists() || !progress.message_end_events.is_empty())
+    {
+        return Some(path.clone());
+    }
+    if opts.share == Some(true)
+        && let Some(dir) = opts.session_dir.as_ref()
+    {
+        return crate::registration::cost::find_latest_session_file_by_mtime(dir)
+            .await
+            .ok()
+            .flatten();
+    }
+    None
+}
+
 /// The [`SingleResult`] shape every pre-spawn failure in [`run_sync`] returns: exit 1, no usage,
 /// no attempts, no artifacts — only the diagnosis.
 ///
@@ -746,15 +959,25 @@ pub(crate) fn pre_spawn_failure(agent: &AgentConfig, task: &str, error: String) 
         task: task.to_string(),
         exit_code: 1,
         usage: Usage::default(),
+        turns: 0,
         model: None,
         attempted_models: Vec::new(),
+        child_run_id: None,
         model_attempts: Vec::new(),
         final_output: None,
         structured_output: None,
+        // Nothing spawned, so nothing was produced — known-absent, not unknown.
+        output_state: crate::exec::output_state::SubagentOutputState::Absent,
+        session_file: None,
+        structured_output_path: None,
+        artifact_paths: None,
         acceptance: None,
         detached: false,
         interrupted: false,
         timed_out: false,
+        // Nothing spawned ⇒ no deadline fired and no worktree evidence exists to summarize.
+        timeout_recovery: None,
+        context_overflow: false,
         stopped: false,
         process_signal: None,
         error: Some(error),
@@ -913,13 +1136,33 @@ async fn prepare_ladder(
     // port of pi's `finally { if (!r?.detached) cleanupStructuredOutputRuntime(structuredRuntime); }`
     // (`runs/foreground/subagent-executor.ts:3780-3787` @v0.43.0). See that type's own doc for why
     // the end-of-function statement this replaces was wrong on BOTH halves.
+    //
+    // The base directory carries the caller's durability POLICY (`RunOptions::structured_output_dir`,
+    // see its doc): `None` is pi's foreground policy — capture under the swept scratch dir, guard
+    // armed — while `Some(dir)` is pi's async policy (`subagent-runner.ts:783-785`) — a run-scoped
+    // capture the guard never removes, because upstream never calls
+    // `cleanupStructuredOutputRuntime` on that path and the published
+    // `SingleResult::structured_output_path` must stay resolvable after the run ends. The two
+    // policies differ in exactly the one way upstream's two implementations differ, through one
+    // chokepoint; the detach `disarm` still applies to the foreground arm.
+    let structured_base_dir = opts
+        .structured_output_dir
+        .clone()
+        .unwrap_or_else(|| scratch_dir.clone());
     let structured_guard = opts
         .structured_output_schema
         .as_ref()
         .and_then(|schema| {
-            crate::exec::structured::create_structured_output_runtime(schema, &scratch_dir).ok()
+            crate::exec::structured::create_structured_output_runtime(schema, &structured_base_dir)
+                .ok()
         })
-        .map(crate::exec::structured::StructuredOutputCleanupGuard::new);
+        .map(|runtime| {
+            let mut guard = crate::exec::structured::StructuredOutputCleanupGuard::new(runtime);
+            if opts.structured_output_dir.is_some() {
+                guard.disarm();
+            }
+            guard
+        });
 
     Ok(LadderSetup {
         skill_injection,
@@ -996,19 +1239,33 @@ impl SettledAttempt {
 /// (`execution.ts:1241-1258`), so a timed-out run never also gets a turn-budget preamble even
 /// when both fired. That is why the three turn-budget arms are `else` on this branch and not a
 /// second independent `if`.
+///
+/// `recovery_message` is the timeout-recovery summary's `message` (SUBA-3c): pi splices it
+/// BETWEEN the timeout message and the partial-output heading (`execution.ts:1500-1502`), and
+/// only under `if (result.timedOut)` — a stopped child's summary is carried on the result field
+/// only, never in a preamble. Before this parameter existed, cyrup's port of `:824-829` was
+/// `execution.ts:1501` with the recovery interpolation deleted: a timed-out child's caller was
+/// told the run timed out and never told which tracked files it had already changed.
 fn apply_terminal_preamble(
     mut final_output: Option<String>,
     timed_out: bool,
     timeout_ms: Option<u64>,
     turn_budget_tracker: &crate::exec::turn_budget::TurnBudgetTracker,
+    recovery_message: Option<&str>,
 ) -> Option<String> {
     if timed_out {
         let timeout_message = format_timeout_message(timeout_ms.unwrap_or(0));
+        // pi `execution.ts:1500-1502`: the recovery summary sits BETWEEN the timeout message and
+        // the partial-output heading.
+        let head = match recovery_message {
+            Some(recovery) => format!("{timeout_message}\n\n{recovery}"),
+            None => timeout_message,
+        };
         let partial = final_output.clone().unwrap_or_default();
         final_output = Some(if partial.trim().is_empty() {
-            timeout_message
+            head
         } else {
-            format!("{timeout_message}\n\nPartial output before timeout:\n{partial}")
+            format!("{head}\n\nPartial output before timeout:\n{partial}")
         });
     } else if let Some(note) = turn_budget_tracker.terminal_note() {
         let body = final_output.clone().unwrap_or_default();
@@ -1314,13 +1571,138 @@ impl GateState {
     }
 }
 
+/// What the delivered-output tail consumes — [`assemble_delivered_output`]'s one input.
+///
+/// `pub(crate)`, not `pub`: [`LadderStop`](crate::exec::fallback::LadderStop) is `pub(crate)`, so
+/// a `pub` struct carrying it is E0446.
+pub(crate) struct DeliveredOutputParts<'a> {
+    /// The child's own captured text, as it stands entering the tail (post terminal-preamble,
+    /// post output-path handoff — exactly what the tail's three stages read) and BEFORE any
+    /// attempt note.
+    ///
+    /// [`DeliveredOutput::output_state`] is derived from THIS and nothing else — which is what
+    /// makes "a note must not manufacture output" a property of the type rather than of where a
+    /// statement sits (pi derives `outputState` from the producer's own view, never from
+    /// `outputForSummary`, `subagent-runner.ts:1442-1447`).
+    pub captured: Option<&'a str>,
+    /// Why the ladder stopped — `outcome.stop` (SCOPE_3 §A / 3b `fallback.rs`). NOT the run's
+    /// terminal status: that is [`crate::tui::intercom::resolve_subagent_result_status`], which
+    /// folds in the `stopped`/`interrupted`/`detached` facts this enum cannot see.
+    pub stop: crate::exec::fallback::LadderStop,
+    /// 3b's typed accumulator — `&[AttemptNote]`, not `&[String]`. Rendered through `Display`, so
+    /// the joined text is byte-identical to the pre-`AttemptNote` form.
+    pub notes: &'a [crate::exec::fallback::AttemptNote],
+    pub structured_output: Option<&'a serde_json::Value>,
+    pub saved_output_path: Option<&'a Path>,
+    pub full_output_for_reference: Option<String>,
+    /// The SETTLED detach fact (`signal.detached`), authoritative for R-SA-037's skip — see the
+    /// body's note on how it relates to [`Self::stop`].
+    pub detached: bool,
+    pub exit_code: i32,
+    pub max_output: crate::exec::output::OutputCap,
+    pub output_mode: OutputMode,
+}
+
+/// What the tail produces. Returning both together is the point: `output_state` and the delivered
+/// text are computed from one input in one place, so they cannot disagree about whether the child
+/// produced anything.
+pub(crate) struct DeliveredOutput {
+    pub text: Option<String>,
+    pub output_state: crate::exec::output_state::SubagentOutputState,
+    pub truncated: bool,
+}
+
+/// The delivered-output TAIL, as one pure function — pi `subagent-runner.ts:1442-1447` (state) +
+/// `:1432-1433` (notes) + `finalizeSingleOutput` (`single-output.ts:211-235`), in that order.
+///
+/// PURE. No `.await`, no I/O — following [`crate::exec::fallback`]'s `classify_attempt`, 3b's
+/// landed precedent for this shape in this crate (SCOPE_3 §A.1: precedence is never expressed as
+/// statement order across a long function).
+///
+/// Reaches exactly as far as the pipeline is contiguously pure. [`apply_terminal_preamble`] is
+/// NOT folded in: [`resolve_saved_output`] performs file I/O (it may write the orchestrator's own
+/// text to the output path) and `GateState::apply_acceptance` is `async`, and both sit between
+/// the preamble and this tail in [`run_sync`]. Pretending otherwise would mean hoisting a file
+/// write, which is a bigger and riskier change than SCOPE_3c is scoped for — stated here rather
+/// than discovered by the next reader.
+pub(crate) fn assemble_delivered_output(parts: DeliveredOutputParts<'_>) -> DeliveredOutput {
+    // Stage 1 — pi `:1442-1447`: `output_state` from the producer's own view of the output,
+    // BEFORE any note is prepended and BEFORE truncation replaces the text with its bounded form.
+    // Re-deriving it from the delivered text would give a different answer for a truncated,
+    // noted, or sentinel-replaced output.
+    let output_state = crate::exec::output_state::derive_output_state(
+        parts.captured,
+        parts.structured_output,
+        parts.saved_output_path.and_then(Path::to_str),
+    );
+
+    // Stage 2 — pi `:1432-1433`: the ladder's notes are prepended to the delivered output,
+    // separated by a blank line, and the whole thing trimmed. AFTER the state derivation above
+    // (a note must not turn an empty output into a "present" one — structural here, because the
+    // state was derived from `parts.captured`, which no stage in this function can have mutated)
+    // and BEFORE finalization below (the notes are part of the text that gets truncated).
+    let noted = prepend_attempt_notes(parts.captured.map(str::to_string), parts.notes);
+
+    // R-SA-037's skip, asserted against BOTH the settled fact and the ladder classification. The
+    // settled `detached` is authoritative and strictly wider: `classify_attempt` ranks a timeout
+    // ABOVE a detach, so a child that detached and then hit its deadline settles
+    // `stop: TimedOut` with `detached: true`. The disjunct adds the structural half — an assembly
+    // for a detach-classified ladder can never truncate, even if the settled flag were ever
+    // mis-threaded.
+    let detached =
+        parts.detached || matches!(parts.stop, crate::exec::fallback::LadderStop::Detached);
+
+    // Stage 3 — `finalizeSingleOutput`: strip acceptance fences, truncate, append/substitute the
+    // saved-output reference.
+    let (text, truncated) = finalize_delivered_output(
+        noted,
+        parts.full_output_for_reference,
+        parts.saved_output_path,
+        detached,
+        parts.exit_code,
+        parts.max_output,
+        parts.output_mode,
+    );
+
+    DeliveredOutput {
+        text,
+        output_state,
+        truncated,
+    }
+}
+
+/// Join `notes` with newlines and prepend them to `output`, separated by a blank line — pi
+/// `` `${attemptNotes.join("\n")}\n\n${outputForSummary}`.trim() `` (`subagent-runner.ts:1433`).
+///
+/// An absent or blank body yields the notes alone rather than a leading blank line, which is what
+/// upstream's trailing `.trim()` produces for the same input.
+fn prepend_attempt_notes(
+    output: Option<String>,
+    notes: &[crate::exec::fallback::AttemptNote],
+) -> Option<String> {
+    if notes.is_empty() {
+        return output;
+    }
+    // `Display` renders upstream's exact wording per kind, so the joined text is byte-identical to
+    // the pre-`AttemptNote` `Vec<String>` form (pi `attemptNotes.join("\n")`).
+    let joined = notes
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(match output {
+        Some(body) if !body.trim().is_empty() => format!("{joined}\n\n{body}").trim().to_string(),
+        _ => joined,
+    })
+}
+
 /// The delivered-output tail: strip acceptance-report fences, apply R-SA-042 truncation, then
 /// append (or, in `file-only` mode, substitute) the saved-output reference message. All three
 /// steps are skipped for a detached result (R-SA-037).
 pub(crate) fn finalize_delivered_output(
     mut final_output: Option<String>,
     full_output_for_reference: Option<String>,
-    saved_output_path: Option<&PathBuf>,
+    saved_output_path: Option<&Path>,
     detached: bool,
     exit_code: i32,
     max_output: crate::exec::output::OutputCap,
@@ -2434,5 +2816,188 @@ mod tests {
             .map(|mut entries| entries.next().is_some())
             .unwrap_or(false);
         assert!(!any_files);
+    }
+
+    // ---- prepend_attempt_notes (pi `subagent-runner.ts:1432-1433`) ----
+
+    /// pi `` `${attemptNotes.join("\n")}\n\n${outputForSummary}`.trim() `` — notes joined by
+    /// newline, blank line, then the body, trimmed.
+    #[test]
+    fn prepend_attempt_notes_joins_notes_then_a_blank_line_then_the_body() {
+        // Two real notes of DIFFERENT kinds — the join must render each through `Display` and
+        // separate them with a single newline, exactly as the pre-`AttemptNote` `Vec<String>`
+        // form did.
+        let notes = vec![
+            crate::exec::fallback::format_subagent_startup_retry_note("m1", 1, 4, 250),
+            crate::exec::fallback::context_overflow_note(&cyrup_core::ModelId::from("m1")),
+        ];
+        assert_eq!(
+            prepend_attempt_notes(Some("the answer".to_string()), &notes),
+            Some(format!("{}\n{}\n\nthe answer", notes[0], notes[1]))
+        );
+    }
+
+    /// No notes: the output passes through untouched — including `None`, so a run that never
+    /// entered a retry/fallback path serializes byte-for-byte as before this channel existed.
+    #[test]
+    fn prepend_attempt_notes_without_notes_is_the_identity() {
+        assert_eq!(prepend_attempt_notes(None, &[]), None);
+        assert_eq!(
+            prepend_attempt_notes(Some("body".to_string()), &[]),
+            Some("body".to_string())
+        );
+    }
+
+    /// An absent or blank body yields the notes alone — what upstream's trailing `.trim()`
+    /// produces for the same input (no leading blank line). The note text becomes the delivered
+    /// output, but NOT the run's `output_state`: [`assemble_delivered_output`] derives that from
+    /// `captured` before prepending, so an empty-output run that accumulated a note still reports
+    /// `Absent`.
+    #[test]
+    fn prepend_attempt_notes_with_a_blank_body_yields_the_notes_alone() {
+        let notes =
+            vec![crate::exec::fallback::context_overflow_note(&cyrup_core::ModelId::from("m1"))];
+        let rendered = notes[0].to_string();
+        assert_eq!(
+            prepend_attempt_notes(None, &notes).as_deref(),
+            Some(rendered.as_str())
+        );
+        assert_eq!(
+            prepend_attempt_notes(Some("   \n ".to_string()), &notes).as_deref(),
+            Some(rendered.as_str())
+        );
+    }
+
+    // ---- apply_terminal_preamble: the SUBA-3c recovery splice (pi `execution.ts:1500-1502`) ----
+
+    /// pi `execution.ts:1500-1502`: with partial output, the delivered text reads
+    /// `{timeout message}\n\n{recovery message}\n\nPartial output before timeout:\n{partial}`.
+    #[test]
+    fn terminal_preamble_splices_the_recovery_message_between_timeout_and_partial() {
+        let tracker = crate::exec::turn_budget::TurnBudgetTracker::default();
+        let out = apply_terminal_preamble(
+            Some("partial answer".to_string()),
+            true,
+            Some(5_000),
+            &tracker,
+            Some("Recovery summary:\n- termination: timed-out"),
+        );
+        assert_eq!(
+            out.as_deref(),
+            Some(format!(
+                "{}\n\nRecovery summary:\n- termination: timed-out\n\nPartial output before timeout:\npartial answer",
+                format_timeout_message(5_000)
+            ))
+            .as_deref()
+        );
+    }
+
+    /// …and `{timeout message}\n\n{recovery message}` when the child produced nothing.
+    #[test]
+    fn terminal_preamble_splices_the_recovery_message_alone_when_no_partial_exists() {
+        let tracker = crate::exec::turn_budget::TurnBudgetTracker::default();
+        let out = apply_terminal_preamble(None, true, Some(5_000), &tracker, Some("recovery"));
+        assert_eq!(
+            out.as_deref(),
+            Some(format!("{}\n\nrecovery", format_timeout_message(5_000))).as_deref()
+        );
+    }
+
+    /// Without a recovery message a timed-out run is byte-identical to the pre-SUBA-3c shape, and
+    /// a run that did not time out ignores the parameter entirely — upstream splices only under
+    /// `if (result.timedOut)` (`execution.ts:1495`), so a stopped child's summary is carried on
+    /// the field only, never in a preamble.
+    #[test]
+    fn terminal_preamble_without_recovery_or_timeout_is_unchanged() {
+        let tracker = crate::exec::turn_budget::TurnBudgetTracker::default();
+        assert_eq!(
+            apply_terminal_preamble(Some("partial".to_string()), true, Some(5_000), &tracker, None)
+                .as_deref(),
+            Some(format!(
+                "{}\n\nPartial output before timeout:\npartial",
+                format_timeout_message(5_000)
+            ))
+            .as_deref()
+        );
+        assert_eq!(
+            apply_terminal_preamble(
+                Some("answer".to_string()),
+                false,
+                None,
+                &tracker,
+                Some("recovery must be ignored"),
+            )
+            .as_deref(),
+            Some("answer")
+        );
+    }
+
+    // ---- assemble_delivered_output: the pure delivered-output tail (SCOPE_3 §A) ----
+
+    fn tail_parts<'a>(
+        captured: Option<&'a str>,
+        notes: &'a [crate::exec::fallback::AttemptNote],
+    ) -> DeliveredOutputParts<'a> {
+        DeliveredOutputParts {
+            captured,
+            stop: crate::exec::fallback::LadderStop::Completed,
+            notes,
+            structured_output: None,
+            saved_output_path: None,
+            full_output_for_reference: None,
+            detached: false,
+            exit_code: 0,
+            max_output: crate::exec::output::OutputCap::default(),
+            output_mode: OutputMode::Inline,
+        }
+    }
+
+    /// `output_state` is derived from `captured` — so an empty-output run that accumulated a
+    /// fallback note reports `Absent` STRUCTURALLY, even though the note becomes the delivered
+    /// text (pi derives `outputState` from the producer's own view, never from `outputForSummary`,
+    /// `subagent-runner.ts:1442-1447`).
+    #[test]
+    fn assemble_derives_output_state_from_captured_so_a_note_cannot_manufacture_output() {
+        let notes =
+            vec![crate::exec::fallback::context_overflow_note(&cyrup_core::ModelId::from("m1"))];
+        let delivered = assemble_delivered_output(tail_parts(None, &notes));
+        assert_eq!(
+            delivered.output_state,
+            crate::exec::output_state::SubagentOutputState::Absent
+        );
+        // The note IS the delivered text — exactly the old `prepend_attempt_notes` behaviour.
+        assert_eq!(delivered.text.as_deref(), Some(notes[0].to_string().as_str()));
+        assert!(!delivered.truncated);
+    }
+
+    /// A plain successful run passes through the tail unchanged: state `Present`, text intact.
+    #[test]
+    fn assemble_passes_a_plain_answer_through_unchanged() {
+        let delivered = assemble_delivered_output(tail_parts(Some("the answer"), &[]));
+        assert_eq!(delivered.text.as_deref(), Some("the answer"));
+        assert_eq!(
+            delivered.output_state,
+            crate::exec::output_state::SubagentOutputState::Present
+        );
+        assert!(!delivered.truncated);
+    }
+
+    /// R-SA-037 holds against the ladder CLASSIFICATION as well as the settled flag: an assembly
+    /// for a detach-classified ladder never truncates, even with the settled bool unset.
+    #[test]
+    fn assemble_skips_truncation_for_a_detach_classified_ladder() {
+        let long = "x".repeat(64 * 1024);
+        let mut parts = tail_parts(Some(long.as_str()), &[]);
+        parts.max_output = crate::exec::output::OutputCap { bytes: 16, lines: 1 };
+        parts.stop = crate::exec::fallback::LadderStop::Detached;
+        let delivered = assemble_delivered_output(parts);
+        assert_eq!(delivered.text.as_deref(), Some(long.as_str()));
+        assert!(!delivered.truncated);
+
+        // …while a non-detached assembly with the same cap DOES truncate.
+        let mut parts = tail_parts(Some(long.as_str()), &[]);
+        parts.max_output = crate::exec::output::OutputCap { bytes: 16, lines: 1 };
+        let delivered = assemble_delivered_output(parts);
+        assert!(delivered.truncated);
     }
 }

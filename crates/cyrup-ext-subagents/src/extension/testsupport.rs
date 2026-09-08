@@ -124,7 +124,7 @@ pub(crate) fn seed_orphaned_run(
     std::fs::create_dir_all(&paths.run_dir).expect("mkdir run dir");
     let mut status = crate::background::RunStatus::queued(id, RunMode::Chain, pid);
     status.state = RunState::Running;
-    status.session_id = session.map(str::to_string);
+    status.session_id = crate::identity::SessionId::parse_opt(session);
     let mut step = crate::background::StepStatus::pending("builder");
     step.status = StepState::Running;
     status.steps = vec![step];

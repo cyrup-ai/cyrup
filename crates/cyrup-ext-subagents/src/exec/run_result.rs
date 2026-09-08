@@ -2,6 +2,8 @@
 //! Split out of `exec/mod.rs`'s own "AgentConfig / RunOptions / SingleResult" section;
 //! [`crate::exec::agent_config`] is that section's input-contract half.
 
+use std::path::PathBuf;
+
 use cyrup_core::{ModelId, Usage};
 
 use crate::exec::acceptance::AcceptanceLedger;
@@ -25,6 +27,23 @@ pub struct SingleResult {
     pub task: String,
     pub exit_code: i32,
     pub usage: Usage,
+    /// Assistant turns this child ran — pi's `Usage.turns` (`shared/types.ts:262`), which upstream
+    /// folds INTO `result.usage` and this port keeps BESIDE [`Self::usage`].
+    ///
+    /// The split is forced and is the right shape: [`cyrup_core::Usage`] is the provider-accounting
+    /// type shared by every crate in this workspace and has no turn concept, while pi-subagents
+    /// declares its own six-field `Usage` that does. Folding a turn count into the shared struct
+    /// would push a subagent-run notion into provider accounting; folding it out of the port would
+    /// lose it.
+    ///
+    /// **Additive across the fallback ladder, including failed attempts**, exactly like
+    /// [`Self::usage`] — pi's `sumUsage` (`execution.ts:134-141`) sums `turns` in the same object
+    /// as the tokens and calls it once per attempt (`:1924`). The per-attempt value is
+    /// [`crate::exec::progress::AgentProgress::turn_count`] (`exec/progress.rs:150`), whose own
+    /// call site already names it "this port's `result.usage.turns`" (`exec/drive_attempt.rs:382`)
+    /// — it simply had nowhere to land.
+    #[serde(default, skip_serializing_if = "crate::exec::is_zero_u64")]
+    pub turns: u64,
     pub model: Option<ModelId>,
     pub attempted_models: Vec<ModelId>,
     pub model_attempts: Vec<ModelAttempt>,
@@ -47,6 +66,35 @@ pub struct SingleResult {
     /// consequences a caller may want to distinguish).
     pub interrupted: bool,
     pub timed_out: bool,
+    /// Bounded recovery evidence for a child killed by its deadline — pi
+    /// `SingleResult.timeoutRecovery` (`shared/types.ts:1249`, published `subagent-runner.ts:1616`),
+    /// built by [`crate::exec::mutation_evidence::build_timeout_recovery_summary`].
+    ///
+    /// `None` for every child that ended on its own. Present ⇒ the child was killed mid-flight and
+    /// this names the tracked files it had already changed, so a parent can review a dirty
+    /// worktree before resuming or launching a dependent stage. The parent-facing subset that
+    /// reaches a tool result is [`crate::exec::mutation_evidence::TimeoutRecoveryProjection`], NOT
+    /// this — the full summary carries session, transcript and artifact paths.
+    ///
+    /// `#[serde(default)]` + omit-when-absent so a `status.json`/result file written before this
+    /// field existed still round-trips (the same discipline `stopped`/`saved_output_path` follow).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_recovery: Option<crate::exec::mutation_evidence::TimeoutRecoverySummary>,
+    /// The input exceeded the model's context window — pi `SingleResult.contextOverflow`
+    /// (`shared/types.ts:1275`, set at `subagent-runner.ts:1409`, published `:1570`), classified
+    /// by [`crate::exec::fallback::is_context_overflow`].
+    ///
+    /// A TERMINAL classification, not a retry hint: the ladder breaks outright on it
+    /// (`model-fallback.ts:624-630`), because another model with the same oversized input fails
+    /// the same way. Surfaced onto `WaitCompletionChild.contextOverflow` (`shared/types.ts:1348`)
+    /// so a parent can shrink or re-decompose the task instead of re-running it unchanged.
+    ///
+    /// Upstream writes `contextOverflow: contextOverflow || undefined` (`:1570`) — the
+    /// `|| undefined` is exactly `skip_serializing_if`, so `false` is omitted from the wire rather
+    /// than written, and `#[serde(default)]` lets a result file written before this field existed
+    /// still round-trip.
+    #[serde(default, skip_serializing_if = "crate::exec::is_false")]
+    pub context_overflow: bool,
     /// G77/G104 — pi `SingleResult.stopped` (`shared/types.ts:879`, set by `runSubagent` at
     /// `subagent-runner.ts:2957`/`:2960`/`:2970`): this child was terminated by an explicit
     /// user/agent **stop** request, not by an interrupt, a deadline, or its own exit.
@@ -126,6 +174,64 @@ pub struct SingleResult {
     /// field existed still round-trips (the same discipline `control_events` below follows).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub saved_output_path: Option<String>,
+    /// The child's persisted session transcript — pi `SingleResult.sessionFile`, surfaced onto
+    /// `WaitCompletionChild.sessionFile` (`shared/types.ts:1341`) and read by `resume`'s
+    /// terminal-revival branch (R-SA-085), which REQUIRES it: `resolve_terminal_revival`
+    /// (`background/control.rs:2264-2267`) refuses outright for a step that carries none.
+    ///
+    /// [`crate::background::StepStatus::session_file`] is the same value one level up; without
+    /// this field it died at the `StepResult` → `SingleResult` projection
+    /// (`runner_main/settle.rs:397`), which is why a completion could never name the transcript a
+    /// caller needs in order to revive the child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_file: Option<PathBuf>,
+    /// This child's OWN background run id, when the step that produced this result launched a
+    /// real run — the producer of pi `WaitCompletionChild.runId` (`shared/types.ts:1340`), which
+    /// upstream copies straight off the child result.
+    ///
+    /// Named `child_run_id` rather than `run_id` to avoid colliding with the run-LEVEL id on
+    /// [`crate::background::ResultFile`]: this is the identity of the CHILD this entry describes,
+    /// not of the run whose result file carries it. Mirrored from
+    /// [`crate::background::StepStatus::run_id`] by `background/runner_main/settle.rs` when a
+    /// step settles; `None` for every step that never launched its own run (all of them, until
+    /// the workflow runtime populates the step field).
+    ///
+    /// `#[serde(default)]` + omit-when-absent so a `status.json`/result file written before this
+    /// field existed still round-trips (the same discipline `session_file` above follows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_run_id: Option<crate::background::RunId>,
+    /// pi `SingleResult.outputState` (`subagent-runner.ts:4476`) —
+    /// [`crate::exec::output_state::derive_output_state`] over this result's own three inputs,
+    /// computed ONCE at construction rather than re-derived by each reader.
+    ///
+    /// Upstream computes it once too, and the re-derivation is not equivalent: a reader seeing a
+    /// TRUNCATED [`Self::final_output`] (`output_truncated`) or a `final_output` replaced by the
+    /// stopped/timeout sentinel would get a different answer than the producer did.
+    #[serde(default)]
+    pub output_state: crate::exec::output_state::SubagentOutputState,
+    /// Where this child's structured output was written, when it survives the run — pi
+    /// `SingleResult.structuredOutputPath` (`subagent-runner.ts:1588`).
+    ///
+    /// `Some` only when [`crate::exec::RunOptions::structured_output_dir`] made the capture
+    /// run-scoped (the async path); `None` on the foreground path, where the capture directory is
+    /// swept by [`crate::exec::structured::StructuredOutputCleanupGuard`] and publishing its path
+    /// would name a file that no longer exists.
+    ///
+    /// Also `None` when the run timed out or was stopped AFTER acceptance, faithfully to
+    /// upstream's own `timedOutAfterAcceptance || stoppedAfterAcceptance ? undefined : …` gate
+    /// (`:1588`): the path would name a file the child may not have finished writing, and a
+    /// consumer that read it would see a truncated document rather than nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_output_path: Option<PathBuf>,
+    /// The child's artifact trail — pi `SingleResult.artifactPaths` (`shared/types.ts:1349`),
+    /// surfaced onto `WaitCompletionChild.artifactPaths` so a parent can reach the input, output,
+    /// JSONL, transcript and metadata of a child it never watched run.
+    ///
+    /// Typed rather than the `serde_json::Value` [`crate::spawn::chain_graph::StepResult`] used to
+    /// carry: the value was ALWAYS an [`crate::artifacts::ArtifactPaths`], and that untyped hop is
+    /// what let cyrup's four-field struct diverge unnoticed from upstream's five.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_paths: Option<crate::artifacts::ArtifactPaths>,
     /// Summarized `{text, expandedText}` tool-call previews observed across the winning attempt's
     /// transcript — R-SA-043's "only summarized `tool_calls`" compaction requirement (pi's
     /// `ToolCallSummary[]`, `utils.ts:368-373`). Each carries a short and an expanded argument

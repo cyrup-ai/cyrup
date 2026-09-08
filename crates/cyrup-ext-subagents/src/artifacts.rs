@@ -50,14 +50,16 @@ const ONE_DAY_MS: u128 = 24 * 60 * 60 * 1000;
 /// The default artifact-cleanup horizon (pi `DEFAULT_ARTIFACT_CONFIG.cleanupDays`, `shared/types.ts:1804`).
 pub const DEFAULT_CLEANUP_DAYS: u64 = 7;
 
-/// The four artifact paths for one run/agent/index (pi `ArtifactPaths`, `shared/types.ts:1044-1050`).
+/// The five artifact paths for one run/agent/index (pi `ArtifactPaths`, `shared/types.ts:1516-1522`).
 ///
 /// `Serialize` (camelCase, matching pi's own field names) because pi carries this bundle onto a
-/// result as `SingleResult.artifactPaths` (`shared/types.ts:901`) and spreads it verbatim into a
+/// result as `SingleResult.artifactPaths` (`shared/types.ts:1349`) and spreads it verbatim into a
 /// dynamic fan-out's collect records (`runs/shared/dynamic-fanout.ts:286`), where a chain author
-/// reads it through `{outputs.<collect.as>}`. Only serialization is derived: nothing reads one of
-/// these back off the wire, and pi's fifth field (`transcriptPath`) has no analogue in this port.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+/// reads it through `{outputs.<collect.as>}`. `Deserialize` too: this bundle now round-trips
+/// through [`crate::spawn::chain_graph::StepResult`] into the terminal
+/// [`crate::background::ResultFile`], and the wait-completions projector reads it back off that
+/// wire — both directions are live.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ArtifactPaths {
     /// `<base>_input.md` — the task the child was given.
@@ -68,6 +70,9 @@ pub struct ArtifactPaths {
     pub jsonl_path: PathBuf,
     /// `<base>_meta.json` — usage/model/exit-code metadata.
     pub metadata_path: PathBuf,
+    /// `<base>_transcript.jsonl` — the child's session-transcript capture (pi `transcriptPath`,
+    /// `shared/artifacts.ts:190`).
+    pub transcript_path: PathBuf,
 }
 
 /// Which of the four artifact files to write + the cleanup horizon (pi `ArtifactConfig`,
@@ -95,8 +100,21 @@ pub struct ArtifactConfig {
     pub include_jsonl: bool,
     /// Write `_meta.json` (pi `includeMetadata`, default `true`).
     pub include_metadata: bool,
+    /// Write `_transcript.jsonl` (pi `includeTranscript`, `DEFAULT_ARTIFACT_CONFIG` default `true`,
+    /// `shared/types.ts:2662-2671`; gated separately from the other four at
+    /// `subagent-runner.ts:851`/`:1801` and `execution.ts:1838`, read with upstream's `!== false`
+    /// semantics).
+    pub include_transcript: bool,
     /// Delete artifacts older than this many days on sweep (pi `cleanupDays`, default `7`).
     pub cleanup_days: u64,
+    /// Where a run's artifacts go (pi `ArtifactConfig.dir?: ArtifactDirPreference`,
+    /// `shared/types.ts:1528`). Without this field the preference could not travel to the detached
+    /// runner on [`crate::background::runner_main::RunnerConfig::artifact_config`] the way the
+    /// other toggles do — [`ArtifactDirPreference`] existed but only ever reached
+    /// [`resolve_artifacts_dir`] from the extension-level config, never from a per-run config.
+    /// `None` defers to that extension-level preference, exactly like every other omitted key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<ArtifactDirPreference>,
 }
 
 impl Default for ArtifactConfig {
@@ -108,7 +126,9 @@ impl Default for ArtifactConfig {
             include_output: true,
             include_jsonl: false,
             include_metadata: true,
+            include_transcript: true,
             cleanup_days: DEFAULT_CLEANUP_DAYS,
+            dir: None,
         }
     }
 }
@@ -271,7 +291,7 @@ fn safe_agent(agent: &str) -> String {
         .collect()
 }
 
-/// The four artifact paths for one run (pi `getArtifactPaths`, `shared/artifacts.ts:186-197`): base is
+/// The five artifact paths for one run (pi `getArtifactPaths`, `shared/artifacts.ts:182-193`): base is
 /// `<runId>_<safeAgent>[_<index>]`, with a per-fan-out `_<index>` suffix only when `index` is set.
 #[must_use]
 pub fn artifact_paths(
@@ -287,6 +307,7 @@ pub fn artifact_paths(
         output_path: dir.join(format!("{base}_output.md")),
         jsonl_path: dir.join(format!("{base}.jsonl")),
         metadata_path: dir.join(format!("{base}_meta.json")),
+        transcript_path: dir.join(format!("{base}_transcript.jsonl")),
     }
 }
 

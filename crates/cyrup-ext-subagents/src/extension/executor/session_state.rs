@@ -16,6 +16,16 @@ pub(crate) struct ParentModelMemory {
     session_id: Option<String>,
     last: Option<ModelId>,
 }
+
+/// SCOPE_19/A1 — the thinking twin of [`ParentModelMemory`]: the last recognized reasoning level
+/// observed on the live parent session, scoped to the session id it was observed under so one
+/// session's level never leaks into the next. Read and written only by
+/// [`SubagentExecutor::remembered_parent_thinking`].
+#[derive(Debug, Default)]
+pub(crate) struct ParentThinkingMemory {
+    session_id: Option<String>,
+    last: Option<String>,
+}
 impl SubagentExecutor {
     /// The captured parent-session anchor (`CYRUP_SUBAGENT_PARENT_SESSION`, R-SA-P1), if the root
     /// `SessionStart` handler has resolved it from [`cyrup_ext::host::HostServices::session_id`].
@@ -185,6 +195,57 @@ impl SubagentExecutor {
         let live = Self::normalize_parent_model(self.inherited_session_model());
         let mut memory = self
             .parent_model_memory
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if memory.session_id != session_id {
+            memory.last = None;
+        }
+        memory.session_id.clone_from(&session_id);
+        if session_id.is_none() {
+            return live;
+        }
+        if live.is_some() {
+            memory.last.clone_from(&live);
+        }
+        live.or_else(|| memory.last.clone())
+    }
+
+    /// SCOPE_19/A1 — the live PARENT session's reasoning level
+    /// ([`cyrup_ext::host::HostServices::thinking_level`]), read straight off the bound P-1 backend.
+    /// The thinking analog of [`Self::inherited_session_model`]: `None` when no live session backend
+    /// is bound (headless / SDK-embedder), when the session has no reasoning configured, or when the
+    /// reported value is not one of the recognized levels — an unrecognized spelling must never
+    /// become a child's `--model …:<suffix>`.
+    #[must_use]
+    pub fn inherited_session_thinking(&self) -> Option<String> {
+        self.host_services()
+            .and_then(|s| s.thinking_level())
+            .filter(|level| {
+                crate::watchdog::model_selection::THINKING_LEVELS.contains(&level.as_str())
+            })
+    }
+
+    /// SCOPE_19/A1 — the live PARENT session's reasoning level, remembered across a transient
+    /// `None`.
+    ///
+    /// The thinking twin of [`Self::remembered_parent_model`], and it exists for the same reason
+    /// that one does: [`cyrup_ext::host::HostServices::thinking_level`] is a live probe of the
+    /// bound session backend and can legitimately answer `None` mid-dispatch — no session bound
+    /// yet, a backend momentarily unbound, a level cleared and being re-selected. A child that
+    /// lands in that window would silently drop to its persona's level (or to off), running at a
+    /// different reasoning depth, and against a different request prefix, than the session it was
+    /// launched from. Keeping model and effort aligned is what lets the child serve the shared
+    /// prompt prefix from the parent's cache instead of re-billing it.
+    ///
+    /// Same state machine as the model memory, for the same reasons: a change of session id clears
+    /// the memory, a recognized live read overwrites it, a headless read (no session id to key on)
+    /// is returned WITHOUT being remembered, and the answer is `live ?? remembered`.
+    #[must_use]
+    pub fn remembered_parent_thinking(&self) -> Option<String> {
+        let session_id = self.root_parent_session();
+        let live = self.inherited_session_thinking();
+        let mut memory = self
+            .parent_thinking_memory
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if memory.session_id != session_id {
@@ -404,6 +465,7 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             session_file: None,
             session_id: None,
+            completion_owner_id: None,
             global_concurrency_limit: 4,
             worktree_base_dir: None,
             max_subagent_depth: 2,
@@ -414,6 +476,7 @@ mod tests {
             chain_dir: None,
             orchestrator_intercom_target: None,
             inherited_session_model: None,
+            inherited_session_thinking: None,
             model_scope: Some(scope.clone()),
             nested_route: None,
             nested_self: None,

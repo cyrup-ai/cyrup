@@ -71,10 +71,11 @@ impl SubagentExecutor {
             Err(err) => {
                 // pi `console.error("Failed to poll nested control inbox '...' for root '...':", error)`
                 // (`fanout-child.ts:122-124`): logged, never fatal — the next tick tries again.
-                eprintln!(
-                    "Failed to poll nested control inbox '{}' for root '{}': {err}",
-                    route.control_inbox.display(),
-                    route.root_run_id
+                tracing::error!(
+                    control_inbox = %route.control_inbox.display(),
+                    root_run_id = %route.root_run_id,
+                    error = %err,
+                    "failed to poll nested control inbox"
                 );
                 return;
             }
@@ -109,12 +110,12 @@ impl SubagentExecutor {
                 Err(err) => {
                     // pi: cache the resolved result for retry and KEEP the request file —
                     // `fanout-child.ts:109-113`.
-                    eprintln!(
-                        "Failed to write nested control result for request '{}' targeting '{}' via \
-                         inbox '{}'; keeping request for retry: {err}",
-                        request.request_id,
-                        request.target_run_id,
-                        route.control_inbox.display()
+                    tracing::error!(
+                        request_id = %request.request_id,
+                        target_run_id = %request.target_run_id,
+                        control_inbox = %route.control_inbox.display(),
+                        error = %err,
+                        "failed to write nested control result; keeping request for retry"
                     );
                     pending_results.insert(request.request_id.clone(), result);
                 }

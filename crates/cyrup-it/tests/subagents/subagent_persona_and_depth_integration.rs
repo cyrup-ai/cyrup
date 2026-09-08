@@ -179,6 +179,7 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
         .expect("mkdir run_dir");
 
     let config = RunnerConfig {
+        completion_owner_id: None,
         turn_budget: None,
         permission_rules: None, // SUBA-073: no policy — the pre-field behaviour
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
@@ -199,7 +200,10 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
         ))],
         cwd: dir.path().to_path_buf(),
         session_file: None,
-        session_id: None,
+        // The session-partitioned result index refuses a session-less result outright
+        // (`write_result_file`, pi `result-files.ts:166`), so a runner expected to land a
+        // terminal ResultFile must carry the launching session's identity.
+        session_id: Some("it-session".to_string()),
         global_concurrency_limit: 20,
         worktree_base_dir: None,
         max_subagent_depth: 5,
@@ -210,6 +214,7 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
+        inherited_session_thinking: None,
         nested_route: None,
         nested_self: None,
         dynamic_fanout_max_items: None,
@@ -392,6 +397,7 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
         .expect("mkdir run_dir");
 
     let config = RunnerConfig {
+        completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
@@ -413,7 +419,10 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
         ))],
         cwd: dir.path().to_path_buf(),
         session_file: None,
-        session_id: None,
+        // The session-partitioned result index refuses a session-less result outright
+        // (`write_result_file`, pi `result-files.ts:166`), so a runner expected to land a
+        // terminal ResultFile must carry the launching session's identity.
+        session_id: Some("it-session".to_string()),
         global_concurrency_limit: 20,
         worktree_base_dir: None,
         max_subagent_depth: 5,
@@ -424,6 +433,7 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
+        inherited_session_thinking: None,
         nested_route: None,
         nested_self: None,
         dynamic_fanout_max_items: None,
@@ -480,6 +490,7 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
 
 fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
+        structured_output_dir: None,
         spawn_command: None,
         child_env: std::collections::HashMap::new(),
         turn_budget: None,
@@ -602,6 +613,21 @@ async fn run_depth_echo_child(dir: &Path, agent: &AgentConfig) -> String {
     read_attempt_tee(dir)
 }
 
+/// The `value` the fixture's `echo_env` line reports for `env`, parsed per line rather than
+/// substring-matched against one serialized key order — the tee records the fixture's raw NDJSON,
+/// and JSON object key order is not part of its contract.
+fn tee_env_value(tee: &str, env: &str) -> Option<String> {
+    tee.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|value| value.get("env").and_then(serde_json::Value::as_str) == Some(env))
+        .and_then(|value| {
+            value
+                .get("value")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawned_child_inherits_incremented_depth_not_the_parent_envelope_verbatim() {
     let dir = tempfile::tempdir().expect("real tempdir");
@@ -619,13 +645,15 @@ async fn spawned_child_inherits_incremented_depth_not_the_parent_envelope_verbat
 
     let tee = run_depth_echo_child(dir.path(), &agent).await;
 
-    assert!(
-        tee.contains("\"env\":\"CYRUP_SUBAGENT_DEPTH\",\"type\":\"unknown\",\"value\":\"2\""),
+    assert_eq!(
+        tee_env_value(&tee, "CYRUP_SUBAGENT_DEPTH").as_deref(),
+        Some("2"),
         "the child MUST see CYRUP_SUBAGENT_DEPTH=2 (parent 1 + 1), never the parent's own 1 \
          verbatim — this is the C15 recursion-increment fix. tee:\n{tee}"
     );
-    assert!(
-        tee.contains("\"env\":\"CYRUP_SUBAGENT_MAX_DEPTH\",\"type\":\"unknown\",\"value\":\"5\""),
+    assert_eq!(
+        tee_env_value(&tee, "CYRUP_SUBAGENT_MAX_DEPTH").as_deref(),
+        Some("5"),
         "with no agent-level tightening the inherited ceiling 5 passes through unchanged. tee:\n{tee}"
     );
 }
@@ -646,12 +674,14 @@ async fn spawned_child_depth_env_applies_the_agents_tightening_only_max() {
 
     let tee = run_depth_echo_child(dir.path(), &agent).await;
 
-    assert!(
-        tee.contains("\"env\":\"CYRUP_SUBAGENT_DEPTH\",\"type\":\"unknown\",\"value\":\"1\""),
+    assert_eq!(
+        tee_env_value(&tee, "CYRUP_SUBAGENT_DEPTH").as_deref(),
+        Some("1"),
         "child depth must be parent 0 + 1 = 1. tee:\n{tee}"
     );
-    assert!(
-        tee.contains("\"env\":\"CYRUP_SUBAGENT_MAX_DEPTH\",\"type\":\"unknown\",\"value\":\"2\""),
+    assert_eq!(
+        tee_env_value(&tee, "CYRUP_SUBAGENT_MAX_DEPTH").as_deref(),
+        Some("2"),
         "the agent's tighter declared max (2) must win over the looser inherited ceiling (5) in \
          the child's spawn env. tee:\n{tee}"
     );
@@ -729,6 +759,7 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
     // already blocked — the same terminal state a genuinely deep chain reaches once the T0.3
     // increment has walked the inherited depth up to the ceiling across successive spawns.
     let config = RunnerConfig {
+        completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
@@ -749,7 +780,10 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
         ))],
         cwd: dir.path().to_path_buf(),
         session_file: None,
-        session_id: None,
+        // The session-partitioned result index refuses a session-less result outright
+        // (`write_result_file`, pi `result-files.ts:166`), so a runner expected to land a
+        // terminal ResultFile must carry the launching session's identity.
+        session_id: Some("it-session".to_string()),
         global_concurrency_limit: 20,
         worktree_base_dir: None,
         max_subagent_depth: 0,
@@ -760,6 +794,7 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
         chain_dir: None,
         orchestrator_intercom_target: None,
         inherited_session_model: None,
+        inherited_session_thinking: None,
         nested_route: None,
         nested_self: None,
         dynamic_fanout_max_items: None,

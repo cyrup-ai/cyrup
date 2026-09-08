@@ -1160,9 +1160,11 @@ mod tests {
             success: true,
             cwd: paths.run_dir.clone(),
             session_file: None,
+            session_id: None,
+            completion_owner_id: None,
             results: Vec::new(),
         };
-        crate::background::atomic::write_atomic_json(&paths.result, &result)
+        crate::background::atomic::write_atomic_json(&paths.legacy_result_root, &result)
             .await
             .expect("write terminal ResultFile");
         append_event_line(&paths.events, br#"{"kind":"run.completed"}"#).await;

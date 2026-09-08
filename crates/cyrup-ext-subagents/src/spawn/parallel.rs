@@ -782,7 +782,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn bounded_pool_never_exceeds_the_group_cap_across_real_child_processes() {
+    async fn spawn_pool_never_exceeds_the_group_cap_across_real_child_processes() {
         let dir = tempfile::tempdir().expect("real tempdir");
         let total_tasks = 8usize;
         let cap = 3usize;

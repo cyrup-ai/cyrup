@@ -27,6 +27,8 @@ impl SubagentExecutor {
         let roots = self.config_snapshot().await.roots;
         let async_root = default_async_root_in(&roots, cwd);
         let results_dir = default_results_dir_in(&roots, cwd);
+        let current_session =
+            crate::identity::SessionId::parse_opt(self.current_session_id().as_deref());
         let mut entries = match tokio::fs::read_dir(&async_root).await {
             Ok(entries) => entries,
             Err(err) => {
@@ -60,6 +62,12 @@ impl SubagentExecutor {
             let Some(name) = entry.file_name().to_str().map(str::to_string) else {
                 continue;
             };
+            // pi `async-status.ts:502` — the reserved index dirs (`.terminal-runs`,
+            // `.active-runs`) are inside the async root but are not runs; restoring one would
+            // reconcile it as a status-less run on every session start.
+            if crate::background::terminal_run_index::is_reserved_async_root_entry(&name) {
+                continue;
+            }
             let run_id = RunId::from_token(name);
             let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
 
@@ -71,6 +79,22 @@ impl SubagentExecutor {
                 continue;
             };
             if !matches!(outcome.status.state, RunState::Queued | RunState::Running) {
+                continue;
+            }
+
+            // S7 — pi `async-job-tracker.ts:658`/`:709` gate both lifecycle transitions on
+            // `state.currentSessionId`, PERMISSIVE: a host with no session identity restores
+            // everything, a host with one restores only its own.
+            //
+            // `async_root` is per-cwd (`background/artifact_roots.rs:281-284`), so this listing
+            // sees every concurrent instance's runs. Adopting a foreign one is not merely
+            // cosmetic: `JobTracker`'s run ids are a CANDIDATE SOURCE for the result watcher
+            // (pi `result-watcher.ts:641`), so an unscoped tracker would silently re-widen the
+            // delivery partitioning this change exists to establish.
+            if !crate::background::delivery::SessionGate::Permissive.admits(
+                current_session.as_ref(),
+                outcome.status.session_id.as_ref(),
+            ) {
                 continue;
             }
 
@@ -222,7 +246,7 @@ impl SubagentExecutor {
             let nested_children = read_nested_children(&job.paths, &status).await;
             tracked_jobs.push(AsyncRunView {
                 // The run's OWN recorded session, so `belongs_to_current_session` is a real test.
-                session_id: status.session_id.clone(),
+                session_id: status.session_id.as_ref().map(|s| s.as_str().to_string()),
                 paths: job.paths,
                 status,
                 description: None,
@@ -375,6 +399,19 @@ impl SubagentExecutor {
         }
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "Async run not found. Provide id or dir.".to_string())?;
+
+        // S5 — pi `run-status.ts:494`/`:521`, PERMISSIVE. A transcript is the run's full event
+        // stream, so an ungated `id`/`dir` lookup lets any instance read another instance's
+        // conversation out of the shared per-cwd root. Upstream's message, verbatim.
+        if !crate::background::delivery::SessionGate::Permissive.admits(
+            crate::identity::SessionId::parse_opt(self.current_session_id().as_deref()).as_ref(),
+            status.session_id.as_ref(),
+        ) {
+            return Err(
+                "Transcript view is only available for async runs owned by the current session."
+                    .to_string(),
+            );
+        }
 
         crate::background::fleet_view::format_async_run_transcript(
             &status,

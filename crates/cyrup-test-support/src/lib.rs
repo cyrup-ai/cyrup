@@ -41,8 +41,9 @@ pub mod tui;
 // ---- ergonomic top-level re-exports (the public API other crates' tests consume) ----
 
 pub use auth::{
-    api_key, get_real_auth_store, has_api_key, has_auth_for_provider, real_agent_dir,
-    real_auth_path, resolve_api_key, resolve_api_key_refreshing, resolve_api_key_refreshing_in,
+    LIVE_E2E_ENV, api_key, get_real_auth_store, has_api_key, has_auth_for_provider,
+    live_e2e_armed, real_agent_dir, real_auth_path, resolve_api_key, resolve_api_key_refreshing,
+    resolve_api_key_refreshing_in,
 };
 pub use differential::{
     agent_loop_kinds, assert_event_kinds, canonical_event, canonicalize_cross_impl,
@@ -770,10 +771,12 @@ mod smoke {
     }
 
     /// `API_KEY` skip constant (Pi utilities.ts:26): `ANTHROPIC_OAUTH_TOKEN` is preferred over
-    /// `ANTHROPIC_API_KEY`; `has_api_key` agrees with `api_key().is_some()`.
+    /// `ANTHROPIC_API_KEY`; `has_api_key` agrees with `api_key().is_some()` — and BOTH stay
+    /// `None`/`false` unless the operator armed live e2e with `CYRUP_LIVE_E2E=1`, no matter what
+    /// keys the shell exports (the deliberate deviation documented in `auth.rs`).
     #[test]
     fn api_key_skip_constant_matches_env_derivation() {
-        let expected = std::env::var("ANTHROPIC_OAUTH_TOKEN")
+        let ambient = std::env::var("ANTHROPIC_OAUTH_TOKEN")
             .ok()
             .filter(|s| !s.is_empty())
             .or_else(|| {
@@ -781,6 +784,11 @@ mod smoke {
                     .ok()
                     .filter(|s| !s.is_empty())
             });
+        let expected = if crate::auth::live_e2e_armed() {
+            ambient
+        } else {
+            None
+        };
         assert_eq!(api_key(), expected);
         assert_eq!(has_api_key(), expected.is_some());
     }

@@ -8,7 +8,9 @@
 //! model-scope diagnostic — SEVEN [`DoctorCheck`]s in the returned [`DoctorReport`], not six:
 //!
 //! (a) [`check_binary_resolution`] — resolvability of the `cyrup` binary used for subagent
-//!     re-exec, per R-SA-045's three-tier resolution (`crate::spawn::resolve_spawn_command`).
+//!     re-exec, per R-SA-045's five-tier resolution ladder
+//!     (`crate::spawn::resolve_spawn_command`: env override, the running image's path, that
+//!     image's inode via `/proc/self/exe`, the deleted-marker-stripped path, then `PATH`).
 //!     Per arch-SA §6.8's "Doctor check sequencing" note, this is the ONE check that spawns a
 //!     subprocess: a short-timeout `<binary> --version` probe, matching R-SA-045's resolution
 //!     intent without requiring a real model-probe spawn.
@@ -312,7 +314,7 @@ impl DoctorRunner {
 // =================================================================================================
 
 /// Check (a): resolvability of the `cyrup` binary used for subagent re-exec, per R-SA-045's
-/// three-tier resolution ([`spawn::resolve_spawn_command`]). Per arch-SA §6.8, this is the ONE
+/// five-tier resolution ladder ([`spawn::resolve_spawn_command`]). Per arch-SA §6.8, this is the ONE
 /// check in this module that spawns a subprocess: a short-timeout `<binary> --version` probe,
 /// bounded by [`VERSION_PROBE_TIMEOUT`] — proving the resolved binary is not merely a path that
 /// exists on disk, but one that actually executes and responds, without needing a real model-probe
@@ -361,7 +363,8 @@ async fn check_binary_resolution_for(resolved: &SpawnCommand) -> DoctorCheck {
     let mut argv = resolved.base_args.clone();
     argv.push("--version".to_string());
 
-    let probe = tokio::process::Command::new(&resolved.binary)
+    let mut probe_command = tokio::process::Command::new(&resolved.binary);
+    probe_command
         .args(&argv)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -376,8 +379,20 @@ async fn check_binary_resolution_for(resolved: &SpawnCommand) -> DoctorCheck {
         // negative-pgid logic is needed here. The pattern is already established in this crate at
         // `extension.rs`'s stream probe and `watchdog/lsp_diagnostics.rs`; this was the one site
         // that missed it.
-        .kill_on_drop(true)
-        .status();
+        .kill_on_drop(true);
+
+    #[cfg(unix)]
+    {
+        // `spawn::resolve_spawn_command` tier 3 execs through `/proc/self/exe` (this process's
+        // inode-pinned image, still valid after a rebuild replaced the file on disk). Present the
+        // real program name as `argv[0]` so the version probe reads as `cyrup` in `ps` rather than
+        // as the magic link; this changes only `argv[0]`, never which inode runs.
+        if let Some(arg0) = resolved.arg0() {
+            probe_command.arg0(arg0);
+        }
+    }
+
+    let probe = probe_command.status();
 
     match tokio::time::timeout(VERSION_PROBE_TIMEOUT, probe).await {
         Ok(Ok(status)) if status.success() => DoctorCheck::ok(

@@ -69,10 +69,13 @@ pub struct SubagentTool {
     allow_mutating_management: bool,
     /// R-SA-069 single-dispatch guard (pi `state.subagentInProgress`,
     /// `subagent-executor.ts:5327-5348` `executeWithSingleDispatchGuard`): rejects a second
-    /// non-`action` subagent call arriving while one is still in flight from this tool instance,
+    /// FOREGROUND subagent call arriving while one is still in flight from this tool instance,
     /// WITHOUT affecting the intentional parallel-mode fan-out that happens *inside* one accepted
-    /// dispatch. `action` calls (management/control) bypass this guard entirely, matching pi's
-    /// `if (params.action) return execute(...)` early return before the flag check.
+    /// dispatch. Two call shapes bypass this guard entirely, matching pi's two early returns
+    /// before the flag check: `action` calls (management/control, pi's `if (params.action) return
+    /// execute(...)`) and effectively-async dispatches ([`SubagentToolParams::is_background`],
+    /// pi's `if (!runsForeground) return execute(...)` — SCOPE_18): a detached launch returns
+    /// almost immediately, and pi never serialized it.
     dispatch_guard: DispatchGuard,
     /// The orchestrator's watchdog runtime (pi `deps.watchdog`, `subagent-executor.ts:300`), which
     /// the four `watchdog.*` actions read and write (`:4432`). `None` for a tool built outside the
@@ -221,13 +224,39 @@ impl Tool for SubagentTool {
             return self.route_action(action, &parsed, &effective_cwd).await;
         }
 
-        // R-SA-069 single-dispatch guard (pi `executeWithSingleDispatchGuard`,
-        // `subagent-executor.ts:5327-5348`): a second non-`action` subagent call arriving while one
-        // is still in flight from this tool instance is rejected outright (never queued), with pi's
-        // exact text; the slot is released once this dispatch fully completes, including on error
-        // (the RAII `DispatchToken`'s `Drop` — pi's `finally { subagentInProgress = false }`).
-        let Some(_dispatch_token) = self.dispatch_guard.try_acquire() else {
-            return Err(ToolError::new(duplicate_subagent_call_text()));
+        // SCOPE_18 — hoisted from below the guard so `is_background` can decide, before acquiring
+        // anything, whether this dispatch is even subject to R-SA-069 at all.
+        let cfg = self.executor.config_snapshot().await;
+        // SUBA-002 follow-up — the DEPTH guard must precede the charge. pi checks the recursion
+        // ceiling at `subagent-executor.ts:3297-3312`, well ahead of `reserveSubagentSpawns`
+        // (`:3434-3441`), so a dispatch the ceiling will refuse never spends a spawn from the
+        // per-SESSION budget. cyrup's own R-SA-055 guard lives one level down — inside
+        // `run_foreground`/`spawn_background`/`run_or_background_graph`, i.e. strictly AFTER this
+        // charge — so without this rung a depth-blocked call was billed and then rejected, and a
+        // subagent pinned at max depth could drain its parent session's budget by repeatedly asking
+        // for children it can never have. The downstream guards stay exactly as they are (they are
+        // the SAFETY-CRITICAL ones, ahead of discovery/IO); this is a pure env+config read that
+        // makes the ordering match pi's. It changes no charge COUNT: this remains the tool path's
+        // one and only reserve. [SCOPE_18: moved verbatim from its old position immediately before
+        // the depth-exceeded check below — still true, unchanged by the hoist.]
+        let depth = resolve_effective_depth(cfg.max_subagent_depth);
+
+        // R-SA-069 single-dispatch guard (pi `executeWithSingleDispatchGuard`): pi checks
+        // `subagentInProgress` ONLY when `runsForeground` is true (`!(dispatchParams.async ??
+        // deps.asyncByDefault)` — i.e. an effectively async dispatch is exempt, exactly like the
+        // `action` exemption above). `is_background` is that same `runsForeground` computation,
+        // already trusted at the three mode arms below (`routing.rs` single/parallel/chain);
+        // reusing it here — rather than re-deriving a second copy — is the whole fix. For a
+        // FOREGROUND dispatch the slot is released once this dispatch fully completes, including
+        // on error (the RAII `DispatchToken`'s `Drop` — pi's `finally { subagentInProgress =
+        // false }`); a background dispatch holds no token at all.
+        let _dispatch_token = if parsed.is_background(&cfg, depth.current_depth) {
+            None
+        } else {
+            match self.dispatch_guard.try_acquire() {
+                Some(token) => Some(token),
+                None => return Err(ToolError::new(duplicate_subagent_call_text())),
+            }
         };
 
         // pi `validateExecutionInput`'s mode-exclusivity gate (`subagent-executor.ts:1736-1754`,
@@ -268,19 +297,6 @@ impl Tool for SubagentTool {
         // routing call would instead bill each mode arm separately (and twice for a chain that
         // re-enters), which is the worse divergence; the over-charge only affects a call that was
         // going to error anyway.
-        let cfg = self.executor.config_snapshot().await;
-        // SUBA-002 follow-up — the DEPTH guard must precede the charge. pi checks the recursion
-        // ceiling at `subagent-executor.ts:3297-3312`, well ahead of `reserveSubagentSpawns`
-        // (`:3434-3441`), so a dispatch the ceiling will refuse never spends a spawn from the
-        // per-SESSION budget. cyrup's own R-SA-055 guard lives one level down — inside
-        // `run_foreground`/`spawn_background`/`run_or_background_graph`, i.e. strictly AFTER this
-        // charge — so without this rung a depth-blocked call was billed and then rejected, and a
-        // subagent pinned at max depth could drain its parent session's budget by repeatedly asking
-        // for children it can never have. The downstream guards stay exactly as they are (they are
-        // the SAFETY-CRITICAL ones, ahead of discovery/IO); this is a pure env+config read that
-        // makes the ordering match pi's. It changes no charge COUNT: this remains the tool path's
-        // one and only reserve.
-        let depth = resolve_effective_depth(cfg.max_subagent_depth);
         if crate::spawn::depth::is_blocked(&depth) {
             return Err(ToolError::new(
                 SubagentError::DepthExceeded {

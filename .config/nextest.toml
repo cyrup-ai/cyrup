@@ -85,3 +85,12 @@ broker = { max-threads = 4 }
 [[profile.default.overrides]]
 filter     = 'binary(intercom)'
 test-group = 'broker'
+
+[[profile.default.overrides]]
+# `ext::build_tier1` RUNS a real nested `cargo build` of the authored-extension crate
+# (`cyrup-ext-sdk` → wasm32-wasip2) — tier-1's whole subject. On a cold private target dir that is
+# legitimate multi-minute compilation, not a stall: measured 180.0s+ on first run of a machine,
+# which is exactly the default tripwire (60s × 3). Give this one test a longer leash; the tripwire
+# semantics stay — it still terminates, just after real-compile headroom (120s × 5 = 10 min).
+filter      = 'binary(ext) and test(build_tier1)'
+slow-timeout = { period = "120s", terminate-after = 5 }

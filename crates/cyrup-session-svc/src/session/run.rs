@@ -18,6 +18,25 @@ use crate::event::{
 
 use super::AgentSession;
 
+/// What came of offering a batch of injected messages to the agent.
+///
+/// # `AgentBusy` is an outcome, not an error
+///
+/// A background completion is never *refused*: nothing about it can be invalid, and no policy
+/// rejects it. The only thing that can happen other than acceptance is that another run holds the
+/// latch at this instant — a scheduling state that resolves on its own. Naming it here keeps it
+/// out of [`SessionServiceError`], where it would be indistinguishable from a fault, and keeps the
+/// caller's `match` exhaustive over the two things that can actually happen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InjectionOffer {
+    /// The agent claimed the latch with these messages as its run input. They are on the run's
+    /// transcript, so the `message_end` that persists them necessarily follows.
+    Taken,
+    /// Another run owns the latch. Nothing was consumed and nothing was persisted twice; the
+    /// caller still owns the batch.
+    AgentBusy,
+}
+
 /// The disposition of the `input` extension event (Pi `InputEventResult.action`, runner.ts:1100).
 /// A `transform` outcome rewrites the in-flight [`UserInput`] in place (via `EventPatch::Input`) and
 /// then reports `Continue`, exactly as Pi folds `currentText`/`currentImages` before continuing.
@@ -183,12 +202,90 @@ impl AgentSession {
     async fn drive_run(self: Arc<Self>, messages: Vec<AgentMessage>) {
         // The refusal used to be silent (`if let Ok`): a `RunActive`/`Empty` here left the session
         // with no run, no event, and no log line. It cannot be returned — this is the spawned
-        // driver — so it is logged at the one place that knows it happened.
-        let started = self.agent.prompt(messages).await;
-        if let Err(e) = &started {
-            tracing::warn!(error = %e, "prompt refused inside the run driver");
+        // driver — so it is logged at the one place that knows it happened. A caller that CAN act
+        // on the refusal uses [`Self::run_injection`] instead, which awaits the claim itself.
+        match self.agent.prompt(messages).await {
+            Ok(handle) => self.drive_accepted_run(handle).await,
+            Err(e) => {
+                tracing::warn!(error = %e, "prompt refused inside the run driver");
+                self.settle_run().await;
+            }
         }
-        if let Ok(handle) = started {
+    }
+
+    /// Start a run and REPORT whether the agent accepted it, then drive the post-run loop in the
+    /// background.
+    ///
+    /// # Why this exists beside `spawn_run`
+    ///
+    /// [`Self::spawn_run`] is fire-and-forget: it returns once the driver task is spawned, so its
+    /// caller cannot distinguish "the run started" from "`Agent::prompt` refused and the driver
+    /// logged it". That is tolerable for a user submission (the user is present, and the refusal
+    /// path is guarded by the preflight) and intolerable for an injected background completion,
+    /// whose producer holds the only copy of the announced result and deletes it once delivery is
+    /// reported. Awaiting the claim here is what turns that report into a fact.
+    ///
+    /// Only the CLAIM is awaited, not the turn: the post-run loop (retry / auto-compaction /
+    /// queued continuation) and the settle tail run on a spawned task exactly as they do for
+    /// `spawn_run`, so the injection pump is never blocked for the length of a model response.
+    ///
+    /// # Errors
+    ///
+    /// Only a genuine fault — no model selected, an empty run input, a hook or core failure.
+    /// A busy agent is [`InjectionOffer::AgentBusy`], not an error.
+    pub(super) async fn run_injection(
+        &self,
+        messages: Vec<AgentMessage>,
+    ) -> Result<InjectionOffer, SessionServiceError> {
+        let Some(this) = self.handle.get() else {
+            // An unbound by-value session has no post-run driver; the run is still claimed here,
+            // so the acceptance report stays truthful.
+            return Self::classify_claim(self.agent.prompt(messages).await.map(|_| ()));
+        };
+        // Flag the loop active BEFORE the claim, for the same reason `spawn_run` does: an
+        // immediate `wait_for_idle` must wait for the WHOLE loop, not just the first `agent_end`.
+        let _ = self.driver_tx.send(true);
+        match this.agent.prompt(messages).await {
+            Ok(handle) => {
+                tokio::spawn(async move { this.drive_accepted_run(handle).await });
+                Ok(InjectionOffer::Taken)
+            }
+            Err(e) => {
+                // Release the latch claimed for a run that never started. Without this the session
+                // reads "active" forever, `wait_for_idle` never returns, and the injection pump
+                // parks permanently — turning a momentary overlap into a permanent stall.
+                let _ = self.driver_tx.send(false);
+                Self::classify_claim(Err(e))
+            }
+        }
+    }
+
+    /// Split what `Agent::prompt` reports into the ONE outcome that is expected and the rest,
+    /// which are faults.
+    ///
+    /// # Why `RunActive` must not stay in `Err`
+    ///
+    /// [`cyrup_agent::AgentError::RunActive`] is the ordinary consequence of a user submission
+    /// owning the run latch — it recurs, it resolves by itself, and the only sane response is to
+    /// offer the messages again at the next idle edge. Every other variant
+    /// (`NoModelSelected`, `NoMessages`, `Hook`, `Core`, …) describes a session that will still be
+    /// unable to accept the same messages a moment later. A caller that receives both through one
+    /// channel cannot tell "wait" from "stop", and the natural catch-all — retry — turns a
+    /// permanent fault into an unbounded spin that answers nobody.
+    fn classify_claim(
+        claimed: Result<(), cyrup_agent::AgentError>,
+    ) -> Result<InjectionOffer, SessionServiceError> {
+        match claimed {
+            Ok(()) => Ok(InjectionOffer::Taken),
+            Err(cyrup_agent::AgentError::RunActive(_)) => Ok(InjectionOffer::AgentBusy),
+            Err(fault) => Err(SessionServiceError::from(fault)),
+        }
+    }
+
+    /// The post-run half of the driver, shared by [`Self::drive_run`] and [`Self::run_injection`]
+    /// so the settle tail exists exactly once.
+    async fn drive_accepted_run(self: Arc<Self>, handle: cyrup_agent::RunHandle) {
+        {
             let _ = handle.finished().await;
             // GAP-11: apply the event-tier control ops (set_model / set_thinking_level) a guest queued
             // from `on_message_end` / a mid-turn tool hook / `on_agent_end`. This runs at a STORE-FREE
@@ -218,6 +315,11 @@ impl AgentSession {
                 }
             }
         }
+        self.settle_run().await;
+    }
+
+    /// Pi `_runAgentPrompt`'s `finally` (agent-session.ts:1063-1072), in its exact order.
+    async fn settle_run(&self) {
         // Pi `_runAgentPrompt`'s `finally` opens with `this._systemPromptOverride = undefined;`
         // (agent-session.ts:1069 @v0.83.0), BEFORE the bash flush and the settle emit — a
         // `before_agent_start` replacement is scoped to its own run and must not survive into the

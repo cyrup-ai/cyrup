@@ -47,28 +47,12 @@ use super::{
     MissionUpdateInput,
 };
 
-/// pi `MISSION_ID_PATTERN` (`store.ts:32`): `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`. Implemented as a
-/// hand-rolled scan rather than a regex — this crate has no regex dependency, and the pattern is
-/// simple enough that a scan is both clearer and faster.
+/// pi `MISSION_ID_PATTERN` (`store.ts:32`): byte-identical to the workflow key grammar — one of
+/// the eleven upstream copies of that one pattern (SCOPE_3 §A.3) — so it delegates to
+/// [`crate::workflows::WorkflowKey`], the crate's ONE declaration of it, rather than carrying the
+/// hand-rolled scan this function used to be. The refusal wording stays this module's own.
 fn matches_mission_id_pattern(value: &str) -> bool {
-    let mut chars = value.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !first.is_ascii_alphanumeric() {
-        return false;
-    }
-    let mut tail_len = 0usize;
-    for c in chars {
-        tail_len += 1;
-        if tail_len > 127 {
-            return false;
-        }
-        if !(c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-') {
-            return false;
-        }
-    }
-    true
+    crate::workflows::WorkflowKey::parse(value).is_ok()
 }
 
 /// pi `DEFAULT_TERMINAL_MISSION_RETENTION` (`store.ts:39`).

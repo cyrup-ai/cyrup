@@ -410,6 +410,23 @@ pub struct RunOptions {
     pub timeout_ms: Option<u64>,
     pub output_path: Option<PathBuf>,
     pub output_mode: OutputMode,
+    /// Where this run's structured-output capture directory lives, and therefore whether it
+    /// OUTLIVES the run — pi's per-path `baseDir` argument to `createStructuredOutputRuntime`.
+    ///
+    /// `None` is pi's FOREGROUND policy (`subagent-executor.ts:3780-3787`): the capture goes under
+    /// [`crate::background::attempt_scratch_dir`] and
+    /// [`crate::exec::structured::StructuredOutputCleanupGuard`] removes it when the run ends, so
+    /// nothing is left behind and [`crate::exec::SingleResult::structured_output_path`] is `None`
+    /// — the value travels inline in [`crate::exec::SingleResult::structured_output`] instead.
+    ///
+    /// `Some(dir)` is pi's ASYNC policy (`subagent-runner.ts:783-785`): the capture goes in a
+    /// RUN-SCOPED directory beside the run's output file and is deliberately NOT swept — upstream
+    /// never calls `cleanupStructuredOutputRuntime` on that path — so the path stays resolvable
+    /// for a consumer reading the terminal `ResultFile` long after the run ended. This is what
+    /// makes `WaitCompletionChild.structuredOutputPath` (`shared/types.ts:1345`) worth publishing:
+    /// it is the escape hatch for a document over the 4 KiB inline limit
+    /// `wait-completions.ts:47-52` enforces.
+    pub structured_output_dir: Option<PathBuf>,
     /// SUBA-054 — the run's declared read paths, pi's `reads` binding at
     /// `runs/foreground/subagent-executor.ts:3869`:
     /// `readsOverride !== undefined ? readsOverride : agentConfig.defaultReads ?? false`.
@@ -654,8 +671,8 @@ pub struct RunOptions {
     pub usage_budget: Option<crate::exec::usage_budget::UsageBudgetConfig>,
     /// The `cyrup` binary this run's child re-execs, injected rather than resolved from the
     /// process environment. `None` means "nothing beyond what the environment says", so
-    /// [`crate::spawn::resolve_spawn_command`] answers and R-SA-045's three-tier priority is
-    /// unchanged — exactly the shape `thinking_ceiling` above already uses.
+    /// [`crate::spawn::resolve_spawn_command`] answers and R-SA-045's five-tier priority ladder
+    /// is unchanged — exactly the shape `thinking_ceiling` above already uses.
     ///
     /// This crate is `#![forbid(unsafe_code)]` and the 2024 edition made `std::env::set_var`
     /// `unsafe`, so nothing here may move the process environment to point a run at a different

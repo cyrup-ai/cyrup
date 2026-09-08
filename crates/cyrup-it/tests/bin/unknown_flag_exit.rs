@@ -23,7 +23,7 @@
     clippy::indexing_slicing
 )]
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use tempfile::TempDir;
 
@@ -41,25 +41,14 @@ fn run(extra: &[&str]) -> (Run, TempDir) {
     let work = tmp.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
 
-    let mut cmd = Command::new(crate::support::bins::cyrup());
+    // Hermetic by construction (`env_clear` + allowlist): no ambient credential, proxy,
+    // `CYRUP_HOME` redirect or built-in opt-in can reach the child — an ambient
+    // `CYRUP_INTERCOM=1` once detached 13 immortal `__intercom-broker`s per run. The incident log
+    // lives in `support/env.rs`; the `every_cyrup_spawn_site_is_hermetic` lint reds any other
+    // shape for this binary.
+    let mut cmd = crate::support::env::hermetic(crate::support::bins::cyrup(), tmp.path());
     cmd.current_dir(&work)
-        .env("HOME", tmp.path())
         .env("CYRUP_AGENT_DIR", &agent_dir)
-        // Never inherit an ambient key or proxy — this test must not be able to reach a network.
-        .env_remove("ANTHROPIC_API_KEY")
-        .env_remove("OPENAI_API_KEY")
-        .env_remove("HTTP_PROXY")
-        .env_remove("HTTPS_PROXY")
-        // ...and never inherit an ambient BUILT-IN OPT-IN either. `CYRUP_INTERCOM=1` alone
-        // satisfies `is_installed()` (`cyrup-intercom/src/extension.rs:630-631`, env var name at
-        // `:87`) even though this tempdir agent dir holds no `intercom/config.json`, so the child
-        // attaches intercom and detaches an immortal `__intercom-broker` (its shutdown check is
-        // armed only by a REGISTERED session's disconnect, 1:1 with pi-intercom
-        // `broker/broker.ts:221`/`:429`). Measured: this crate's four binary-seam targets left 13
-        // such processes per run, 0 under `env -u CYRUP_INTERCOM`.
-        .env_remove("CYRUP_INTERCOM")
-        .env_remove("CYRUP_SUBAGENTS")
-        .env_remove("CYRUP_PERMISSION_SYSTEM")
         .args([
             "--offline",
             "--no-session",

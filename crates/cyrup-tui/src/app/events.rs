@@ -135,7 +135,7 @@ impl<B: Backend> App<B> {
         // transcript cannot straddle that await while `self` is also the receiver.
         let stale = self.state.transcript.stale_extension_renders(&live);
         for item in stale {
-            let rendered = super::extension_render_impl::run_renderer(
+            let rendered = super::run_renderer(
                 ext_host,
                 item.next.surface,
                 item.next.key.clone(),

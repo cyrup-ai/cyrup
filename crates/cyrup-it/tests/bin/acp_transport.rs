@@ -17,7 +17,7 @@
 )]
 
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use tempfile::TempDir;
 
@@ -51,9 +51,10 @@ impl Run {
 
 /// Spawn `cyrup` with `args`, feed `stdin_frames` (newline-delimited), close stdin, and collect.
 ///
-/// The env is scrubbed of every provider credential **and** of the three built-in opt-ins, for the
-/// reasons `unknown_flag_exit`'s own comment gives: an ambient `CYRUP_INTERCOM=1` alone satisfies
-/// `is_installed()` and detaches an immortal broker per run.
+/// The child is hermetic (`env_clear` + allowlist via `support::env::hermetic`): credential-less
+/// is the SUBJECT here (`ACP-021`), so no ambient key, `CYRUP_HOME` redirect, proxy or built-in
+/// opt-in may leak in — an ambient `CYRUP_INTERCOM=1` alone satisfies `is_installed()` and
+/// detaches an immortal broker per run. Enforced by the `every_cyrup_spawn_site_is_hermetic` lint.
 fn run(args: &[&str], stdin_frames: &[&str]) -> (Run, TempDir) {
     let tmp = TempDir::new().unwrap();
     let agent_dir = tmp.path().join("agent");
@@ -61,19 +62,9 @@ fn run(args: &[&str], stdin_frames: &[&str]) -> (Run, TempDir) {
     let work = tmp.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
 
-    let mut cmd = Command::new(crate::support::bins::cyrup());
+    let mut cmd = crate::support::env::hermetic(crate::support::bins::cyrup(), tmp.path());
     cmd.current_dir(&work)
-        .env("HOME", tmp.path())
         .env("CYRUP_AGENT_DIR", &agent_dir)
-        .env_remove("ANTHROPIC_API_KEY")
-        .env_remove("OPENAI_API_KEY")
-        .env_remove("TOGETHER_API_KEY")
-        .env_remove("GEMINI_API_KEY")
-        .env_remove("HTTP_PROXY")
-        .env_remove("HTTPS_PROXY")
-        .env_remove("CYRUP_INTERCOM")
-        .env_remove("CYRUP_SUBAGENTS")
-        .env_remove("CYRUP_PERMISSION_SYSTEM")
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

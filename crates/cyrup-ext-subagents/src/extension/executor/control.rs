@@ -17,6 +17,7 @@ use crate::extension::tool::text::{
 };
 use crate::fork_context::ContextMode;
 use crate::spawn::chain_graph::{RunnerStep, SingleStepSpec};
+use crate::identity::SessionId;
 
 impl SubagentExecutor {
     /// `action: "interrupt"` (C5): deliver a soft, resumable interrupt (R-SA-084 — a *pause*
@@ -54,13 +55,26 @@ impl SubagentExecutor {
                     .ok_or_else(|| "No interrupt-capable run found in this session.".to_string())?
             }
         };
-        match control::interrupt(&async_root, &results_dir, &run_id, "interrupt-action", None).await
+        let current_session = crate::identity::SessionId::parse_opt(self.current_session_id().as_deref());
+        match control::interrupt(
+            &async_root,
+            &results_dir,
+            &run_id,
+            "interrupt-action",
+            None,
+            current_session.as_ref(),
+        )
+        .await
         {
             Ok(InterruptOutcome::Delivered | InterruptOutcome::AlreadyPending) => {
                 Ok(format!("Interrupt requested for async run {run_id}."))
             }
             Ok(InterruptOutcome::NotRunning) => Err(format!(
                 "No running async run with an interrupt-capable pid was found for '{run_id}'."
+            )),
+            // S4 (pi `async-stop-action.ts:34`) — upstream's exact refusal sentence.
+            Ok(InterruptOutcome::NotInActiveSession) => Err(format!(
+                "Async run '{run_id}' was not found in the active session."
             )),
             Err(e) => Err(e.to_string()),
         }
@@ -206,6 +220,7 @@ impl SubagentExecutor {
             None => resolved_async_id.unwrap_or_else(|| target.unwrap_or_default().to_string()),
         };
 
+        let current_session = crate::identity::SessionId::parse_opt(self.current_session_id().as_deref());
         match control::stop(
             &async_root,
             &results_dir,
@@ -213,6 +228,7 @@ impl SubagentExecutor {
             "stop-action",
             None,
             child_id,
+            current_session.as_ref(),
         )
         .await
         {
@@ -225,6 +241,11 @@ impl SubagentExecutor {
             )),
             Ok(control::StopOutcome::NotStoppable) => Err(format!(
                 "No running or queued async run was found for '{run_id}'."
+            )),
+            // S4 (pi `async-stop-action.ts:34`) — upstream's exact refusal sentence. Distinct from
+            // `NotStoppable`: the run may be perfectly stoppable, just not by this instance.
+            Ok(control::StopOutcome::NotInActiveSession) => Err(format!(
+                "Async run '{run_id}' was not found in the active session."
             )),
             // SUBA-087 — `async-stop-action.ts:51-57`: the resolver's own not-found/ambiguous
             // sentence, verbatim.
@@ -335,7 +356,9 @@ impl SubagentExecutor {
         // pi `:31-36`: `!state.currentSessionId || status.sessionId !== state.currentSessionId`.
         // Both halves, including the "this host has no session at all" one.
         let current_session = self.current_session_id();
-        if current_session.is_none() || status.session_id != current_session {
+        if current_session.is_none()
+            || status.session_id.as_ref().map(SessionId::as_str) != current_session.as_deref()
+        {
             return Err(format!(
                 "Recovered workflow '{run_id_text}' was not found in the active session."
             ));
@@ -359,7 +382,14 @@ impl SubagentExecutor {
         // re-reconcile before stamping — the result is authoritative and may have finished the run
         // between the read above and now, in which case there is nothing orphaned to dismiss.
         let mut latest = status;
-        if tokio::fs::try_exists(&paths.result).await.unwrap_or(false) {
+        // Resolved through the index: a promoted payload lives under `result-owned/`, so probing
+        // the legacy root alone would miss every result this build writes and skip the
+        // re-reconciliation upstream performs precisely when one exists.
+        let has_terminal_result = match latest.session_id.as_ref() {
+            Some(session_id) => paths.resolve_result(session_id, &latest.run_id).await.is_some(),
+            None => tokio::fs::try_exists(&paths.legacy_result_root).await.unwrap_or(false),
+        };
+        if has_terminal_result {
             let reconciled = crate::background::reconcile::reconcile_now(&paths, None)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -560,6 +590,20 @@ impl SubagentExecutor {
         })?;
 
         let run_id = status.run_id.as_str().to_string();
+
+        // S4 — pi `async-steering-action.ts:48`, PERMISSIVE, and ordered BEFORE the state guard
+        // exactly as upstream orders it. Steering injects text into a running child's prompt, so
+        // an ungated `id`/`dir` lookup over the shared per-cwd root would let one instance speak
+        // into another instance's agent.
+        if !crate::background::delivery::SessionGate::Permissive.admits(
+            SessionId::parse_opt(self.current_session_id().as_deref()).as_ref(),
+            status.session_id.as_ref(),
+        ) {
+            return Err(format!(
+                "Async run '{run_id}' was not found in the active session."
+            ));
+        }
+
         if !matches!(status.state, RunState::Running | RunState::Queued) {
             return Err(format!(
                 "Async run '{run_id}' is not running or queued and cannot be steered."
@@ -753,7 +797,14 @@ impl SubagentExecutor {
                 // silently swallowed and fall through to steering a child that may still be running
                 // its prior turn.
                 if let Err(e) =
-                    control::interrupt(&async_root, &results_dir, run_id, "async-resume", None)
+                    control::interrupt(
+                        &async_root,
+                        &results_dir,
+                        run_id,
+                        "async-resume",
+                        None,
+                        crate::identity::SessionId::parse_opt(self.current_session_id().as_deref()).as_ref(),
+                    )
                         .await
                 {
                     return Err(format!("Failed to interrupt async run {run_id}: {e}"));
