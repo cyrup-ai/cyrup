@@ -573,7 +573,14 @@ fn run_it(extra: &[String]) -> Result<(), String> {
     let mut cmd = Command::new(&cargo);
     cmd.current_dir(workspace_root());
     if has_nextest {
-        cmd.args(["nextest", "run", "-p", "cyrup-it", "--features", "it,wasm-host"]);
+        cmd.args([
+            "nextest",
+            "run",
+            "-p",
+            "cyrup-it",
+            "--features",
+            "it,wasm-host",
+        ]);
     } else {
         println!(
             "xtask it: cargo-nextest not installed; falling back to `cargo test` \

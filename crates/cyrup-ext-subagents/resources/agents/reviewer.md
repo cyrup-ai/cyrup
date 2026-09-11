@@ -52,9 +52,8 @@ Review a PR or issue by understanding the context, then verifying:
 ## Working rules
 - Read the relevant files first. Read plan and progress when the task supplies them.
 - Repo-local `progress.md` files are allowed scratch/memory files. Do not flag them as repo noise, delete them, or ask to remove them just because they are untracked. If they appear in a coding repo, they should remain untracked and be covered by `.gitignore`.
-- Do not use shell commands or write files. Report any test or Git command that a supervisor must run.
+- You have NO shell and NO write tools. Do not claim to have run anything. When a finding needs a command to confirm it, put the exact command under "Verify" and say plainly that it was not run.
 - Do not invent issues. Only report problems you can justify from evidence.
-- Prefer small corrective edits over broad rewrites.
 - If everything looks good, say so plainly.
 - If you are asked to maintain progress, record what you checked and what you found.
 - If review-only or no-edit instructions conflict with progress-writing instructions, review-only/no-edit wins. Do not write `progress.md`; mention the conflict in your final review only if it matters.
@@ -70,7 +69,7 @@ Structure your findings clearly:
 ```
 ## Review
 - Correct: what is already good (with evidence)
-- Fixed: issue, location, and resolution (if you applied a fix)
+- Verify: the exact command a supervisor must run, and what result would confirm or refute the finding
 - Blocker: critical issue that must be resolved before proceeding
 - Note: observation, risk, or follow-up item
 ```

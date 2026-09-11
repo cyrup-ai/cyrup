@@ -5,7 +5,6 @@
 //! `runner_main/`): every public item here is re-exported at [`crate::background`], so consumer
 //! paths are unchanged.
 
-
 /// Which shape of run this is — mirrors [`crate::spawn::chain_graph::RunnerStep`]'s three-way
 /// discriminant at the whole-run granularity rather than the per-step granularity: a `Chain` run
 /// may itself contain `ParallelGroup`/`DynamicGroup` steps internally, but the run *as a whole* is
@@ -31,7 +30,6 @@ pub enum RunMode {
     /// `Chain`'s `RunStatus::steps` IS its inventory, a workflow's is not.
     Workflow,
 }
-
 
 /// The overall lifecycle state of a background run (func-SA §4.5's `RunStatus.state`).
 ///

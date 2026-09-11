@@ -4,7 +4,7 @@
 //!
 //! # What it bounds, and why it is not [`crate::exec::spawn_budget`]
 //!
-//! [`crate::exec::spawn_budget`] is the PER-SESSION cap (`PI_SUBAGENT_MAX_SPAWNS_PER_SESSION`): a
+//! [`crate::exec::spawn_budget`] is the PER-SESSION cap (`CYRUP_SUBAGENT_MAX_SPAWNS_PER_SESSION`): a
 //! counter living in this process's memory, keyed by session id, reset when the session changes.
 //! It cannot bound a subtree, because every re-exec'd child is a fresh process with a fresh
 //! counter — a run that spawns a child that spawns a child pays once per process, not once per
@@ -69,17 +69,9 @@ use serde::{Deserialize, Serialize};
 /// when that child is fan-out authorized (pi `pi-args.ts:942-943`).
 pub const RUN_FANOUT_BUDGET_ENV: &str = "CYRUP_SUBAGENT_RUN_FANOUT_BUDGET";
 
-/// The upstream spelling of [`RUN_FANOUT_BUDGET_ENV`], honoured as a read-side compatibility alias
-/// so a subtree launched by a pi parent keeps claiming against the ledger that parent created.
-pub const RUN_FANOUT_BUDGET_ENV_PI_ALIAS: &str = "PI_SUBAGENT_RUN_FANOUT_BUDGET";
-
 /// pi `PI_SUBAGENT_MAX_SPAWNS_PER_RUN` (`shared/types.ts:2815`), in the `CYRUP_` family. The
 /// PER-RUN sibling of [`crate::exec::spawn_budget::MAX_SPAWNS_PER_SESSION_ENV`].
 pub const MAX_SPAWNS_PER_RUN_ENV: &str = "CYRUP_SUBAGENT_MAX_SPAWNS_PER_RUN";
-
-/// The upstream spelling of [`MAX_SPAWNS_PER_RUN_ENV`], honoured as a read-side compatibility
-/// alias.
-pub const MAX_SPAWNS_PER_RUN_ENV_PI_ALIAS: &str = "PI_SUBAGENT_MAX_SPAWNS_PER_RUN";
 
 /// pi `DEFAULT_MAX_SUBAGENT_SPAWNS_PER_RUN = 64` (`shared/types.ts:2807`).
 pub const DEFAULT_MAX_SPAWNS_PER_RUN: u32 = 64;
@@ -223,9 +215,7 @@ pub fn resolve_max_spawns_per_run_with(
     get: &dyn Fn(&str) -> Option<String>,
     configured: Option<u32>,
 ) -> u32 {
-    let from_env = get(MAX_SPAWNS_PER_RUN_ENV)
-        .or_else(|| get(MAX_SPAWNS_PER_RUN_ENV_PI_ALIAS))
-        .and_then(|raw| normalize_max_spawns_per_run(&raw));
+    let from_env = get(MAX_SPAWNS_PER_RUN_ENV).and_then(|raw| normalize_max_spawns_per_run(&raw));
     from_env
         .or_else(|| configured.filter(|value| *value > 0))
         .unwrap_or(DEFAULT_MAX_SPAWNS_PER_RUN)
@@ -698,7 +688,6 @@ impl MaxSpawnsPerRunSource {
     #[must_use]
     pub fn resolve_with(get: &dyn Fn(&str) -> Option<String>, configured: Option<u32>) -> Self {
         if get(MAX_SPAWNS_PER_RUN_ENV)
-            .or_else(|| get(MAX_SPAWNS_PER_RUN_ENV_PI_ALIAS))
             .and_then(|raw| normalize_max_spawns_per_run(&raw))
             .is_some()
         {
@@ -758,7 +747,7 @@ impl RunFanoutDoctor {
         root: &Path,
         configured: Option<u32>,
     ) -> Self {
-        let inherited = get(RUN_FANOUT_BUDGET_ENV).or_else(|| get(RUN_FANOUT_BUDGET_ENV_PI_ALIAS));
+        let inherited = get(RUN_FANOUT_BUDGET_ENV);
         match decode_run_fanout_budget_descriptor_in(root, inherited.as_deref()) {
             Ok(Some(descriptor)) => match run_fanout_budget_snapshot_in(root, &descriptor) {
                 Ok(snapshot) => Self::Inherited {
@@ -1199,17 +1188,9 @@ mod tests {
     fn no_wait(_: Duration) {}
 
     #[test]
-    fn the_env_names_are_the_cyrup_spelling_with_the_pi_one_as_a_read_side_alias() {
+    fn the_env_names_are_the_cyrup_spelling_only() {
         assert_eq!(RUN_FANOUT_BUDGET_ENV, "CYRUP_SUBAGENT_RUN_FANOUT_BUDGET");
-        assert_eq!(
-            RUN_FANOUT_BUDGET_ENV_PI_ALIAS,
-            "PI_SUBAGENT_RUN_FANOUT_BUDGET"
-        );
         assert_eq!(MAX_SPAWNS_PER_RUN_ENV, "CYRUP_SUBAGENT_MAX_SPAWNS_PER_RUN");
-        assert_eq!(
-            MAX_SPAWNS_PER_RUN_ENV_PI_ALIAS,
-            "PI_SUBAGENT_MAX_SPAWNS_PER_RUN"
-        );
         assert_eq!(DEFAULT_MAX_SPAWNS_PER_RUN, 64);
     }
 
@@ -1239,13 +1220,15 @@ mod tests {
     }
 
     #[test]
-    fn the_pi_alias_is_consulted_only_when_the_cyrup_spelling_is_unset() {
+    fn the_dropped_pi_spelling_is_ignored() {
+        // Hard rename: the upstream `PI_SUBAGENT_MAX_SPAWNS_PER_RUN` spelling is inert — alone it
+        // falls through to the default, and beside the real key it never wins.
         let alias_only =
-            |key: &str| (key == MAX_SPAWNS_PER_RUN_ENV_PI_ALIAS).then(|| "11".to_string());
-        assert_eq!(resolve_max_spawns_per_run_with(&alias_only, None), 11);
+            |key: &str| (key == "PI_SUBAGENT_MAX_SPAWNS_PER_RUN").then(|| "11".to_string());
+        assert_eq!(resolve_max_spawns_per_run_with(&alias_only, None), 64);
         let both = |key: &str| match key {
             MAX_SPAWNS_PER_RUN_ENV => Some("2".to_string()),
-            MAX_SPAWNS_PER_RUN_ENV_PI_ALIAS => Some("11".to_string()),
+            "PI_SUBAGENT_MAX_SPAWNS_PER_RUN" => Some("11".to_string()),
             _ => None,
         };
         assert_eq!(resolve_max_spawns_per_run_with(&both, None), 2);
@@ -1661,15 +1644,15 @@ mod tests {
     }
 
     #[test]
-    fn the_doctor_block_consults_the_pi_env_alias_only_when_the_cyrup_spelling_is_unset() {
+    fn the_doctor_block_ignores_the_dropped_pi_env_spelling() {
         let root = tempfile::tempdir().unwrap();
         let descriptor = create_run_fanout_budget_in(root.path(), "root-run-8", 2).unwrap();
         let encoded = encode_run_fanout_budget_descriptor_in(root.path(), &descriptor).unwrap();
         let alias_only =
-            |key: &str| (key == RUN_FANOUT_BUDGET_ENV_PI_ALIAS).then(|| encoded.clone());
+            |key: &str| (key == "PI_SUBAGENT_RUN_FANOUT_BUDGET").then(|| encoded.clone());
         assert!(matches!(
             RunFanoutDoctor::resolve_with(&alias_only, root.path(), None),
-            RunFanoutDoctor::Inherited { .. }
+            RunFanoutDoctor::Configured { .. }
         ));
     }
 

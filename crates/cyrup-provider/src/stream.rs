@@ -207,7 +207,8 @@ pub struct StreamOptions {
     /// Forwarded for cache routing / session affinity (func-01 R-01-039).
     pub session_id: Option<SessionId>,
     /// Caller-specified prompt-cache retention. `None` = unset: the encoder then consults the
-    /// `PI_CACHE_RETENTION` env var (Pi `resolveCacheRetention`, openai-completions.ts:141-149).
+    /// `CYRUP_CACHE_RETENTION` env var (Pi `resolveCacheRetention` over `PI_CACHE_RETENTION`,
+    /// openai-completions.ts:141-149).
     /// An explicit `Some(_)` always wins over the env. Additive, backward-compatible (defaults to
     /// `None`, which resolves to `Short` unless the env promotes it to `Long`).
     pub cache_retention: Option<CacheRetention>,

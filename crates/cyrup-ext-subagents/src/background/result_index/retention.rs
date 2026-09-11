@@ -117,7 +117,9 @@ async fn should_remove(results_dir: &Path, path: &Path, cutoff: i64) -> bool {
         return true;
     };
 
-    let has_public = locate::result_payload_location_from_index(results_dir, &entry).await.is_some();
+    let has_public = locate::result_payload_location_from_index(results_dir, &entry)
+        .await
+        .is_some();
     if has_public {
         return false;
     }
@@ -169,7 +171,10 @@ mod tests {
     }
 
     fn payload() -> Payload {
-        Payload { run_id: "run1".to_string(), session_id: "s1".to_string() }
+        Payload {
+            run_id: "run1".to_string(),
+            session_id: "s1".to_string(),
+        }
     }
 
     fn now_ms() -> i64 {
@@ -186,7 +191,9 @@ mod tests {
     async fn sweeping_an_empty_tree_removes_nothing() {
         let tmp = tempfile::tempdir().expect("tempdir");
         assert_eq!(
-            cleanup_result_indexes(tmp.path(), now_ms(), DEFAULT_MAX_AGE_MS).await.expect("sweep"),
+            cleanup_result_indexes(tmp.path(), now_ms(), DEFAULT_MAX_AGE_MS)
+                .await
+                .expect("sweep"),
             0
         );
     }
@@ -195,21 +202,28 @@ mod tests {
     async fn a_live_index_with_a_public_payload_survives() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let run = RunId::from_token("run1");
-        write_async_result_file(&ResultWrite {
-            results_dir: tmp.path(),
-            session_id: &session("s1"),
-            run_id: &run,
-            written_at: 1,
-            async_dir: None,
-            tool_call_id: None,
-        }, &payload())
-            .await
-            .expect("write");
+        write_async_result_file(
+            &ResultWrite {
+                results_dir: tmp.path(),
+                session_id: &session("s1"),
+                run_id: &run,
+                written_at: 1,
+                async_dir: None,
+                tool_call_id: None,
+            },
+            &payload(),
+        )
+        .await
+        .expect("write");
 
         // Even with an enormous "now", a live entry is kept: the payload still exists.
-        let removed = cleanup_result_indexes(tmp.path(), now_ms() + DEFAULT_MAX_AGE_MS * 10, DEFAULT_MAX_AGE_MS)
-            .await
-            .expect("sweep");
+        let removed = cleanup_result_indexes(
+            tmp.path(),
+            now_ms() + DEFAULT_MAX_AGE_MS * 10,
+            DEFAULT_MAX_AGE_MS,
+        )
+        .await
+        .expect("sweep");
         assert_eq!(removed, 0);
         assert!(paths::result_index_path(tmp.path(), &session("s1"), &run).is_file());
     }
@@ -221,8 +235,12 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let run = RunId::from_token("run1");
         let staged = paths::result_pending_path(tmp.path(), &session("s1"), &run);
-        tokio::fs::create_dir_all(staged.parent().expect("parent")).await.expect("mkdir");
-        tokio::fs::write(&staged, br#"{"runId":"run1","sessionId":"s1"}"#).await.expect("seed");
+        tokio::fs::create_dir_all(staged.parent().expect("parent"))
+            .await
+            .expect("mkdir");
+        tokio::fs::write(&staged, br#"{"runId":"run1","sessionId":"s1"}"#)
+            .await
+            .expect("seed");
         // Index it by hand so the entry exists without the payload being public.
         super::super::write::write_result_index_for_data(&ResultWrite {
             results_dir: tmp.path(),
@@ -235,9 +253,13 @@ mod tests {
         .await
         .expect("index");
 
-        let removed = cleanup_result_indexes(tmp.path(), now_ms() + DEFAULT_MAX_AGE_MS * 10, DEFAULT_MAX_AGE_MS)
-            .await
-            .expect("sweep");
+        let removed = cleanup_result_indexes(
+            tmp.path(),
+            now_ms() + DEFAULT_MAX_AGE_MS * 10,
+            DEFAULT_MAX_AGE_MS,
+        )
+        .await
+        .expect("sweep");
         assert_eq!(removed, 0, "a staged payload must protect its index");
     }
 
@@ -245,25 +267,35 @@ mod tests {
     async fn an_orphaned_index_older_than_the_cutoff_is_removed() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let run = RunId::from_token("run1");
-        write_async_result_file(&ResultWrite {
-            results_dir: tmp.path(),
-            session_id: &session("s1"),
-            run_id: &run,
-            written_at: 1,
-            async_dir: None,
-            tool_call_id: None,
-        }, &payload())
-            .await
-            .expect("write");
+        write_async_result_file(
+            &ResultWrite {
+                results_dir: tmp.path(),
+                session_id: &session("s1"),
+                run_id: &run,
+                written_at: 1,
+                async_dir: None,
+                tool_call_id: None,
+            },
+            &payload(),
+        )
+        .await
+        .expect("write");
         // Delete the payload: the index now points at nothing.
         tokio::fs::remove_file(paths::result_owned_path(tmp.path(), &session("s1"), &run))
             .await
             .expect("rm");
 
-        let removed = cleanup_result_indexes(tmp.path(), now_ms() + DEFAULT_MAX_AGE_MS * 10, DEFAULT_MAX_AGE_MS)
-            .await
-            .expect("sweep");
-        assert!(removed >= 1, "expected the orphaned entries to be swept, removed={removed}");
+        let removed = cleanup_result_indexes(
+            tmp.path(),
+            now_ms() + DEFAULT_MAX_AGE_MS * 10,
+            DEFAULT_MAX_AGE_MS,
+        )
+        .await
+        .expect("sweep");
+        assert!(
+            removed >= 1,
+            "expected the orphaned entries to be swept, removed={removed}"
+        );
         assert!(!paths::result_index_path(tmp.path(), &session("s1"), &run).exists());
     }
 
@@ -271,16 +303,19 @@ mod tests {
     async fn a_recent_orphan_is_kept_until_the_window_elapses() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let run = RunId::from_token("run1");
-        write_async_result_file(&ResultWrite {
-            results_dir: tmp.path(),
-            session_id: &session("s1"),
-            run_id: &run,
-            written_at: 1,
-            async_dir: None,
-            tool_call_id: None,
-        }, &payload())
-            .await
-            .expect("write");
+        write_async_result_file(
+            &ResultWrite {
+                results_dir: tmp.path(),
+                session_id: &session("s1"),
+                run_id: &run,
+                written_at: 1,
+                async_dir: None,
+                tool_call_id: None,
+            },
+            &payload(),
+        )
+        .await
+        .expect("write");
         tokio::fs::remove_file(paths::result_owned_path(tmp.path(), &session("s1"), &run))
             .await
             .expect("rm");
@@ -289,7 +324,10 @@ mod tests {
         let removed = cleanup_result_indexes(tmp.path(), now_ms(), DEFAULT_MAX_AGE_MS)
             .await
             .expect("sweep");
-        assert_eq!(removed, 0, "a fresh orphan must survive; a concurrent write may still be mid-flight");
+        assert_eq!(
+            removed, 0,
+            "a fresh orphan must survive; a concurrent write may still be mid-flight"
+        );
     }
 
     #[tokio::test]
@@ -300,7 +338,9 @@ mod tests {
         let junk = dir.join("junk.json");
         tokio::fs::write(&junk, b"not json").await.expect("seed");
 
-        let removed = cleanup_result_indexes(tmp.path(), now_ms(), DEFAULT_MAX_AGE_MS).await.expect("sweep");
+        let removed = cleanup_result_indexes(tmp.path(), now_ms(), DEFAULT_MAX_AGE_MS)
+            .await
+            .expect("sweep");
         assert_eq!(removed, 1);
         assert!(!junk.exists());
     }
@@ -309,20 +349,27 @@ mod tests {
     async fn payloads_are_never_removed_by_the_index_sweep() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let run = RunId::from_token("run1");
-        write_async_result_file(&ResultWrite {
-            results_dir: tmp.path(),
-            session_id: &session("s1"),
-            run_id: &run,
-            written_at: 1,
-            async_dir: None,
-            tool_call_id: None,
-        }, &payload())
-            .await
-            .expect("write");
+        write_async_result_file(
+            &ResultWrite {
+                results_dir: tmp.path(),
+                session_id: &session("s1"),
+                run_id: &run,
+                written_at: 1,
+                async_dir: None,
+                tool_call_id: None,
+            },
+            &payload(),
+        )
+        .await
+        .expect("write");
 
-        let _ = cleanup_result_indexes(tmp.path(), now_ms() + DEFAULT_MAX_AGE_MS * 10, DEFAULT_MAX_AGE_MS)
-            .await
-            .expect("sweep");
+        let _ = cleanup_result_indexes(
+            tmp.path(),
+            now_ms() + DEFAULT_MAX_AGE_MS * 10,
+            DEFAULT_MAX_AGE_MS,
+        )
+        .await
+        .expect("sweep");
         assert!(
             paths::result_owned_path(tmp.path(), &session("s1"), &run).is_file(),
             "the sweep must never touch a payload"
@@ -334,10 +381,17 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = paths::session_index_dir(tmp.path(), &session("s1"));
         tokio::fs::create_dir_all(&dir).await.expect("mkdir");
-        tokio::fs::write(dir.join("junk.json"), b"nope").await.expect("seed");
+        tokio::fs::write(dir.join("junk.json"), b"nope")
+            .await
+            .expect("seed");
 
-        let _ = cleanup_result_indexes(tmp.path(), now_ms(), DEFAULT_MAX_AGE_MS).await.expect("sweep");
-        assert!(!dir.exists(), "an emptied partition directory should not linger");
+        let _ = cleanup_result_indexes(tmp.path(), now_ms(), DEFAULT_MAX_AGE_MS)
+            .await
+            .expect("sweep");
+        assert!(
+            !dir.exists(),
+            "an emptied partition directory should not linger"
+        );
     }
 
     #[tokio::test]
@@ -349,20 +403,27 @@ mod tests {
         // before promoting gets published by whoever next walks the tree.
         let tmp = tempfile::tempdir().expect("tempdir");
         let run = RunId::from_token("run1");
-        write_pending_async_result_file(&ResultWrite {
-            results_dir: tmp.path(),
-            session_id: &session("s1"),
-            run_id: &run,
-            written_at: 1,
-            async_dir: None,
-            tool_call_id: None,
-        }, &payload())
-            .await
-            .expect("write");
+        write_pending_async_result_file(
+            &ResultWrite {
+                results_dir: tmp.path(),
+                session_id: &session("s1"),
+                run_id: &run,
+                written_at: 1,
+                async_dir: None,
+                tool_call_id: None,
+            },
+            &payload(),
+        )
+        .await
+        .expect("write");
 
-        let removed = cleanup_result_indexes(tmp.path(), now_ms() + DEFAULT_MAX_AGE_MS * 10, DEFAULT_MAX_AGE_MS)
-            .await
-            .expect("sweep");
+        let removed = cleanup_result_indexes(
+            tmp.path(),
+            now_ms() + DEFAULT_MAX_AGE_MS * 10,
+            DEFAULT_MAX_AGE_MS,
+        )
+        .await
+        .expect("sweep");
         assert_eq!(removed, 0, "a live result's index must never be swept");
         assert!(
             paths::result_owned_path(tmp.path(), &session("s1"), &run).is_file(),

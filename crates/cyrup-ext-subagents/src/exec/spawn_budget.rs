@@ -40,11 +40,6 @@ pub const MAX_GRANT_HISTORY: usize = 20;
 /// naming family.
 pub const MAX_SPAWNS_PER_SESSION_ENV: &str = "CYRUP_SUBAGENT_MAX_SPAWNS_PER_SESSION";
 
-/// The upstream spelling of [`MAX_SPAWNS_PER_SESSION_ENV`], honoured as a compatibility alias so a
-/// pi user's existing environment keeps working (the same aliasing convention the rest of this
-/// crate's env surface uses).
-pub const MAX_SPAWNS_PER_SESSION_ENV_PI_ALIAS: &str = "PI_SUBAGENT_MAX_SPAWNS_PER_SESSION";
-
 /// One recorded grant (pi `SpawnBudgetGrant`, `shared/types.ts`), kept so `details.spawnBudget`
 /// can show what was granted, when, and against which limit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,7 +108,6 @@ pub struct SpawnBudgetSnapshot {
 #[must_use]
 pub fn resolve_max_spawns_per_session(configured: u32) -> Option<u32> {
     let from_env = std::env::var(MAX_SPAWNS_PER_SESSION_ENV)
-        .or_else(|_| std::env::var(MAX_SPAWNS_PER_SESSION_ENV_PI_ALIAS))
         .ok()
         .and_then(|raw| raw.trim().parse::<u32>().ok());
     match from_env {

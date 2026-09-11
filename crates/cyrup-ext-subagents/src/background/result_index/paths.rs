@@ -122,7 +122,12 @@ pub(crate) fn result_index_paths(
     let names = encoded_json_file_names(run_id.as_str());
     session_index_dirs(results_dir, session_id)
         .into_iter()
-        .flat_map(|dir| names.iter().map(move |name| dir.join(name)).collect::<Vec<_>>())
+        .flat_map(|dir| {
+            names
+                .iter()
+                .map(move |name| dir.join(name))
+                .collect::<Vec<_>>()
+        })
         .collect()
 }
 
@@ -156,7 +161,12 @@ pub(crate) fn result_pending_paths(
     let names = encoded_json_file_names(run_id.as_str());
     pending_session_dirs(results_dir, session_id)
         .into_iter()
-        .flat_map(|dir| names.iter().map(move |name| dir.join(name)).collect::<Vec<_>>())
+        .flat_map(|dir| {
+            names
+                .iter()
+                .map(move |name| dir.join(name))
+                .collect::<Vec<_>>()
+        })
         .collect()
 }
 
@@ -201,7 +211,12 @@ pub(crate) fn result_owned_paths(
     let names = encoded_json_file_names(run_id.as_str());
     owned_session_dirs(results_dir, session_id)
         .into_iter()
-        .flat_map(|dir| names.iter().map(move |name| dir.join(name)).collect::<Vec<_>>())
+        .flat_map(|dir| {
+            names
+                .iter()
+                .map(move |name| dir.join(name))
+                .collect::<Vec<_>>()
+        })
         .collect()
 }
 
@@ -234,11 +249,7 @@ pub(crate) fn observer_index_dir(results_dir: &Path, observer: &str) -> PathBuf 
 }
 
 /// `<observer dir>/<enc(run)>.json` — pi `observerIndexPath` (`:99-101`).
-pub(crate) fn observer_index_path(
-    results_dir: &Path,
-    observer: &str,
-    run_id: &RunId,
-) -> PathBuf {
+pub(crate) fn observer_index_path(results_dir: &Path, observer: &str, run_id: &RunId) -> PathBuf {
     observer_index_dir(results_dir, observer).join(encoded_json_file_name(run_id.as_str()))
 }
 
@@ -288,7 +299,10 @@ mod tests {
     #[test]
     fn the_stem_budget_reserves_room_for_the_json_suffix() {
         assert_eq!(MAX_JSON_FILE_STEM_BYTES, 250);
-        assert_eq!(MAX_JSON_FILE_STEM_BYTES + ResultFileName::EXTENSION.len(), IndexSegment::MAX_BYTES);
+        assert_eq!(
+            MAX_JSON_FILE_STEM_BYTES + ResultFileName::EXTENSION.len(),
+            IndexSegment::MAX_BYTES
+        );
     }
 
     #[test]
@@ -296,7 +310,11 @@ mod tests {
         // The reason the budget is 250: a 255-byte stem plus ".json" would be 260 bytes.
         let long = "r".repeat(300);
         let name = encoded_json_file_name(&long);
-        assert!(name.len() <= IndexSegment::MAX_BYTES, "name was {} bytes", name.len());
+        assert!(
+            name.len() <= IndexSegment::MAX_BYTES,
+            "name was {} bytes",
+            name.len()
+        );
         assert!(name.ends_with(".json"));
     }
 
@@ -315,7 +333,10 @@ mod tests {
     #[test]
     fn the_run_and_observer_and_tool_call_layouts_match_upstream() {
         let run = RunId::from_token("run1");
-        assert_eq!(run_index_path(Path::new("/r"), &run), PathBuf::from("/r/result-index/runs/run1.json"));
+        assert_eq!(
+            run_index_path(Path::new("/r"), &run),
+            PathBuf::from("/r/result-index/runs/run1.json")
+        );
         assert_eq!(
             mission_observer_path(Path::new("/r"), &run),
             PathBuf::from("/r/result-index/observers/mission/run1.json")
@@ -367,8 +388,15 @@ mod tests {
         // The invariant `IndexSegment` exists for: a raw join would produce
         // `/r/result-index/sessions//home/u/s.jsonl`, i.e. an absolute path outside `/r`.
         let dir = session_index_dir(Path::new("/r"), &session("/home/u/s.jsonl"));
-        assert!(dir.starts_with("/r/result-index/sessions"), "escaped to {dir:?}");
-        assert_eq!(dir.components().count(), 5, "must be exactly one component deeper: {dir:?}");
+        assert!(
+            dir.starts_with("/r/result-index/sessions"),
+            "escaped to {dir:?}"
+        );
+        assert_eq!(
+            dir.components().count(),
+            5,
+            "must be exactly one component deeper: {dir:?}"
+        );
     }
 
     #[test]
@@ -377,9 +405,19 @@ mod tests {
         // than a traversal. The literal dots survive because `.` is in the unreserved set, which
         // is fine: only a separator can move you up a level.
         let dir = session_index_dir(Path::new("/r"), &session("../../../etc"));
-        assert!(dir.starts_with("/r/result-index/sessions"), "escaped to {dir:?}");
-        assert_eq!(dir.components().count(), 5, "must stay one component deep: {dir:?}");
-        assert!(!dir.to_string_lossy().contains("../"), "a real traversal segment: {dir:?}");
+        assert!(
+            dir.starts_with("/r/result-index/sessions"),
+            "escaped to {dir:?}"
+        );
+        assert_eq!(
+            dir.components().count(),
+            5,
+            "must stay one component deep: {dir:?}"
+        );
+        assert!(
+            !dir.to_string_lossy().contains("../"),
+            "a real traversal segment: {dir:?}"
+        );
     }
 
     #[test]
@@ -391,7 +429,9 @@ mod tests {
             let dir = session_index_dir(Path::new("/r"), &session(hostile));
             assert_eq!(dir.components().count(), 5, "{hostile} escaped: {dir:?}");
             assert!(
-                dir.file_name().and_then(std::ffi::OsStr::to_str).is_some_and(|n| n.starts_with("~sha256-")),
+                dir.file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .is_some_and(|n| n.starts_with("~sha256-")),
                 "{hostile} must hash, got {dir:?}"
             );
         }
@@ -409,8 +449,16 @@ mod tests {
     fn reads_fan_out_over_aliases_and_lead_with_the_write_location() {
         let id = session("/home/u/s.jsonl");
         let dirs = session_index_dirs(Path::new("/r"), &id);
-        assert_eq!(dirs.len(), 2, "a hashed id also exposes its pre-hash location");
-        assert_eq!(dirs[0], session_index_dir(Path::new("/r"), &id), "write location first");
+        assert_eq!(
+            dirs.len(),
+            2,
+            "a hashed id also exposes its pre-hash location"
+        );
+        assert_eq!(
+            dirs[0],
+            session_index_dir(Path::new("/r"), &id),
+            "write location first"
+        );
     }
 
     #[test]
@@ -420,7 +468,11 @@ mod tests {
         let run = RunId::from_token("/weird/run.jsonl");
         let paths = result_index_paths(Path::new("/r"), &id, &run);
         assert_eq!(paths.len(), 4, "got {paths:?}");
-        assert_eq!(paths[0], result_index_path(Path::new("/r"), &id, &run), "write path first");
+        assert_eq!(
+            paths[0],
+            result_index_path(Path::new("/r"), &id, &run),
+            "write path first"
+        );
     }
 
     #[test]

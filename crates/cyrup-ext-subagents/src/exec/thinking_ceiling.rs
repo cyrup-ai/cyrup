@@ -31,11 +31,6 @@ use crate::exec::spawn_plan::THINKING_LEVELS;
 /// [`crate::exec::capability_ceiling::CAPABILITY_CEILING_ENV`] is.
 pub const THINKING_CEILING_ENV: &str = "CYRUP_SUBAGENT_THINKING_CEILING";
 
-/// The upstream spelling of [`THINKING_CEILING_ENV`], honoured on READ only, so a cyrup child
-/// launched by a pi parent still inherits the bound. Same compatibility rule (and same read-only
-/// direction) as [`crate::exec::capability_ceiling::CAPABILITY_CEILING_ENV_PI_ALIAS`].
-pub const THINKING_CEILING_ENV_PI_ALIAS: &str = "PI_SUBAGENT_THINKING_CEILING";
-
 /// Rank of `level` within [`THINKING_LEVELS`] — its index, so `off` is `0` and therefore the
 /// TIGHTEST ceiling, and `max` is the loosest. `None` for an unrecognized level.
 ///
@@ -120,17 +115,15 @@ pub fn decode_thinking_ceiling(value: Option<&str>) -> Result<Option<String>, St
     }
 }
 
-/// This process's own inherited ceiling, read from [`THINKING_CEILING_ENV`] with
-/// [`THINKING_CEILING_ENV_PI_ALIAS`] as a fallback (pi reads `process.env[…]` directly at
-/// `execution.ts:1714` and `pi-args.ts:877`).
+/// This process's own inherited ceiling, read from [`THINKING_CEILING_ENV`] (pi reads
+/// `process.env[…]` directly at `execution.ts:1714` and `pi-args.ts:877`; the upstream
+/// `PI_SUBAGENT_THINKING_CEILING` spelling is no longer honoured).
 ///
 /// # Errors
 ///
 /// Propagates [`decode_thinking_ceiling`]'s fail-closed error.
 pub fn inherited_thinking_ceiling() -> Result<Option<String>, String> {
-    let raw = std::env::var(THINKING_CEILING_ENV)
-        .or_else(|_| std::env::var(THINKING_CEILING_ENV_PI_ALIAS))
-        .ok();
+    let raw = std::env::var(THINKING_CEILING_ENV).ok();
     decode_thinking_ceiling(raw.as_deref())
 }
 

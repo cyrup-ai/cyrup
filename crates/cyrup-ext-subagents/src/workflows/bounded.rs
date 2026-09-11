@@ -136,8 +136,14 @@ mod tests {
     #[test]
     fn bounded_utf16_counts_code_units_not_bytes() {
         assert!(BoundedUtf16::<2>::parse("éé").is_some(), "2 units, 4 bytes");
-        assert!(Bounded::<2>::parse("éé").is_none(), "the byte twin rejects it");
-        assert!(BoundedUtf16::<1>::parse("𝄞").is_none(), "a surrogate pair is 2 units");
+        assert!(
+            Bounded::<2>::parse("éé").is_none(),
+            "the byte twin rejects it"
+        );
+        assert!(
+            BoundedUtf16::<1>::parse("𝄞").is_none(),
+            "a surrogate pair is 2 units"
+        );
         assert!(BoundedUtf16::<2>::parse("𝄞").is_some());
     }
 

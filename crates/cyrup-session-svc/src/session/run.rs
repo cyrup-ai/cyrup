@@ -88,7 +88,9 @@ impl AgentSession {
         &self,
         input: impl Into<UserInput>,
     ) -> Result<EventStream<AgentSessionEvent>, SessionServiceError> {
-        self.prompt_run(input).await.map(|(_accepted, stream)| stream)
+        self.prompt_run(input)
+            .await
+            .map(|(_accepted, stream)| stream)
     }
 
     /// [`Self::prompt`] **plus the preflight's own answer**.

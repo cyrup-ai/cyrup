@@ -74,8 +74,7 @@ const MODE_ACP_INLINE: &str = "--mode=acp";
 /// **What it costs.** A client relying on that (silent) behaviour now sees a stderr line and exit
 /// 1 instead of a hung, unreadable child. That is the trade ACP-026 asks for, and it is stated here
 /// rather than left implicit because the string is user-visible.
-pub const NO_TERMINAL_MESSAGE: &str =
-    "cyrup: --terminal-login needs an interactive terminal (stdin and stdout must both be a TTY).\n\
+pub const NO_TERMINAL_MESSAGE: &str = "cyrup: --terminal-login needs an interactive terminal (stdin and stdout must both be a TTY).\n\
      Run `cyrup` yourself in a terminal and use /login to configure credentials.";
 
 /// Does `argv` — the process's own args **including** the binary name at index 0, matching
@@ -214,11 +213,17 @@ mod tests {
             argv(&["--mode", "json"])
         );
         // A trailing bare `--mode` is clap's problem, not this function's.
-        assert_eq!(strip(argv(&["--terminal-login", "--mode"])), argv(&["--mode"]));
+        assert_eq!(
+            strip(argv(&["--terminal-login", "--mode"])),
+            argv(&["--mode"])
+        );
         // Idempotent, and a no-op on an argv that never selected the gate.
         let plain = argv(&["--json", "hello"]);
         assert_eq!(strip(plain.clone()), plain);
-        assert_eq!(strip(strip(argv(&["--acp", "--terminal-login"]))), argv(&[]));
+        assert_eq!(
+            strip(strip(argv(&["--acp", "--terminal-login"]))),
+            argv(&[])
+        );
     }
 
     /// ACP-011's cross-test: the token this crate recognises is byte-identical to the one

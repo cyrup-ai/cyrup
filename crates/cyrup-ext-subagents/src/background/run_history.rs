@@ -191,6 +191,8 @@ mod tests {
             progress: None,
             runner: None,
             external_process: None,
+            // Test fixture: no child was planned, so there is no surface to report.
+            tool_surface: crate::exec::tool_surface::ResolvedToolSurface::default(),
         };
         let mut bad = ok.clone();
         bad.agent = "writer".to_string();

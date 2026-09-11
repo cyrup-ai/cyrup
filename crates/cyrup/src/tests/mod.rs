@@ -9,7 +9,7 @@
 //! The files that genuinely need the BINARY seam (`CARGO_BIN_EXE_cyrup`, real signals, a real
 //! `git` process) stay in `crates/cyrup/tests/`: exit codes, stderr text and stdout/stderr
 //! separation are only observable there. So does `tests/first_time_setup.rs`, for a different
-//! reason: it mutates process-global env (`CYRUP_EXPERIMENTAL` / `PI_EXPERIMENTAL`) through
+//! reason: it mutates process-global env (`CYRUP_EXPERIMENTAL`) through
 //! `unsafe { std::env::set_var }`, whose SAFETY note names its OWN test binary as the scope that
 //! makes the mutation sound. This crate is `#![forbid(unsafe_code)]` — un-cancellable by any
 //! inner `allow` — and the merged lib-test binary runs its tests on many threads, so the file

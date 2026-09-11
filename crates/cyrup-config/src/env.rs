@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use crate::error::ConfigError;
 
-/// Cache-retention policy honoured from `CYRUP_CACHE_RETENTION` (← `PI_CACHE_RETENTION`).
+/// Cache-retention policy honoured from `CYRUP_CACHE_RETENTION`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CacheRetention {
     #[default]
@@ -22,8 +22,8 @@ impl CacheRetention {
     }
 }
 
-/// Typed view over the `CYRUP_*` environment surface, with `PI_*` accepted as a migration
-/// fallback (documented; R-07-028). This is the ONLY place process env is read.
+/// Typed view over the `CYRUP_*` environment surface (R-07-028; the legacy `PI_*` spellings are
+/// no longer honoured). This is the ONLY place process env is read.
 #[derive(Clone, Debug, Default)]
 pub struct EnvVars {
     /// The RESOLVED home directory — [`crate::paths::cyrup_home_dir_from`]'s full ladder
@@ -48,11 +48,11 @@ pub struct EnvVars {
     pub visual: Option<String>,
     pub editor: Option<String>,
     pub http_proxy: Option<String>,
-    /// `CYRUP_CLEAR_ON_SHRINK` (← `PI_CLEAR_ON_SHRINK`) — true only when the value is exactly `"1"`
+    /// `CYRUP_CLEAR_ON_SHRINK` — true only when the value is exactly `"1"`
     /// (Pi `getClearOnShrink`, settings-manager.ts:1082). Used as the env fallback when the
     /// `terminal.clearOnShrink` setting is absent.
     pub clear_on_shrink: bool,
-    /// `CYRUP_HARDWARE_CURSOR` (← `PI_HARDWARE_CURSOR`) — true only when the value is exactly `"1"`
+    /// `CYRUP_HARDWARE_CURSOR` — true only when the value is exactly `"1"`
     /// (Pi `getShowHardwareCursor`, settings-manager.ts:1166). Env fallback for the
     /// `showHardwareCursor` setting.
     pub hardware_cursor: bool,
@@ -60,7 +60,7 @@ pub struct EnvVars {
 
 /// Port of Pi `isTruthyEnvFlag` (telemetry.ts:3-6, main.ts:95-98, package-manager.ts:42-46):
 /// a flag env is truthy only when it is exactly `1`, or case-insensitively `true`/`yes`. Pi does
-/// NOT trim or accept `on`, so `CYRUP_TELEMETRY=on` / `PI_TELEMETRY=on` must NOT enable telemetry
+/// NOT trim or accept `on`, so `CYRUP_TELEMETRY=on` must NOT enable telemetry
 /// (and likewise for `*_OFFLINE` / `*_SKIP_VERSION_CHECK`, which use the same flag predicate).
 fn truthy(s: &str) -> bool {
     s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
@@ -93,7 +93,7 @@ impl EnvVars {
         let home = crate::paths::cyrup_home_dir_from(lookup);
         // Pi normalizes every dir env var as it reads it — `getAgentDir()` is
         // `if (envDir) { return expandTildePath(envDir); }` (config.ts:515-521 @v0.83.0) and
-        // `getPackageDir()` the same for `PI_PACKAGE_DIR` (`:367-372`); the session-dir env tier is
+        // `getPackageDir()` the same for its package-dir env var (`:367-372`); the session-dir env tier is
         // `expandTildePath(envSessionDir)` at main.ts:625-628. `expandTildePath` IS `normalizePath`
         // (config.ts:498-500). CFG-036.
         let path =
@@ -101,11 +101,11 @@ impl EnvVars {
         // Resolved before the struct literal so the `path` closure's borrow of `home` ends before
         // `home` itself is moved into the field.
         let agent_dir = path(&crate::paths::ENV_AGENT_DIR_KEYS);
-        let session_dir = path(&["CYRUP_SESSION_DIR", "PI_CODING_AGENT_SESSION_DIR"]);
-        let package_dir = path(&["CYRUP_PACKAGE_DIR", "PI_PACKAGE_DIR"]);
+        let session_dir = path(&["CYRUP_SESSION_DIR"]);
+        let package_dir = path(&["CYRUP_PACKAGE_DIR"]);
         Self {
             home,
-            // CFG-076 — upstream has exactly ONE agent-dir env name, `PI_CODING_AGENT_DIR`, and
+            // CFG-076 — upstream has exactly ONE agent-dir env name (`PI_CODING_AGENT_DIR`), and
             // pi core, `pi-intercom` (`broker/paths.ts:27-38`, asserted at `broker/paths.test.ts:25`)
             // and `pi-subagents` (`src/shared/utils.ts:96`, `src/agents/agents.ts:1886`) all read
             // that same name — so upstream, one variable moves every tree at once. cyrup's rename
@@ -115,30 +115,28 @@ impl EnvVars {
             // `cyrup-ext-subagents/src/native_supervisor.rs:1772`). Reading BOTH here restores
             // upstream's one-name-one-tree property from the operator's side: whichever spelling is
             // set, core lands on the same directory the siblings do. The short name stays FIRST so
-            // the documented spelling wins when both are set. `PI_CODING_AGENT_DIR` remains last as
-            // the migration fallback (R-07-028).
+            // the documented spelling wins when both are set. The upstream `PI_CODING_AGENT_DIR`
+            // spelling is NOT honoured (hard rename, R-07-028).
             agent_dir,
             session_dir,
             package_dir,
-            offline: first(&["CYRUP_OFFLINE", "PI_OFFLINE"])
-                .as_deref()
-                .is_some_and(truthy),
-            skip_version_chk: first(&["CYRUP_SKIP_VERSION_CHECK", "PI_SKIP_VERSION_CHECK"])
+            offline: first(&["CYRUP_OFFLINE"]).as_deref().is_some_and(truthy),
+            skip_version_chk: first(&["CYRUP_SKIP_VERSION_CHECK"])
                 .as_deref()
                 .is_some_and(truthy),
             // TRI-STATE, unlike its two siblings above: unset / set-empty / set-truthy. Pi's
             // `isInstallTelemetryEnabled` branches on `telemetryEnv !== undefined`
-            // (telemetry.ts:8-12 @v0.83.0), so `PI_TELEMETRY=` takes the ENV branch and
+            // (telemetry.ts:8-12 @v0.83.0), so `CYRUP_TELEMETRY=` takes the ENV branch and
             // `isTruthyEnvFlag("")` is false at `:3-5` — an explicit OFF that beats the settings
             // value at `policy.rs:25-27`. Filtering the empty string here silently kept telemetry
-            // ON for `PI_TELEMETRY= cyrup …`, the ordinary way to neutralise an inherited variable
-            // (DRIFT-050).
-            telemetry: ["CYRUP_TELEMETRY", "PI_TELEMETRY"]
+            // ON for `CYRUP_TELEMETRY= cyrup …`, the ordinary way to neutralise an inherited
+            // variable (DRIFT-050).
+            telemetry: ["CYRUP_TELEMETRY"]
                 .iter()
                 .find_map(|k| text(k))
                 .as_deref()
                 .map(truthy),
-            cache_retention: first(&["CYRUP_CACHE_RETENTION", "PI_CACHE_RETENTION"])
+            cache_retention: first(&["CYRUP_CACHE_RETENTION"])
                 .as_deref()
                 .and_then(CacheRetention::parse)
                 .unwrap_or_default(),
@@ -146,10 +144,8 @@ impl EnvVars {
             editor: first(&["EDITOR"]),
             http_proxy: first(&["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"]),
             // Pi compares strictly to "1" (settings-manager.ts:1082,1166), not the broader truthy set.
-            clear_on_shrink: first(&["CYRUP_CLEAR_ON_SHRINK", "PI_CLEAR_ON_SHRINK"]).as_deref()
-                == Some("1"),
-            hardware_cursor: first(&["CYRUP_HARDWARE_CURSOR", "PI_HARDWARE_CURSOR"]).as_deref()
-                == Some("1"),
+            clear_on_shrink: first(&["CYRUP_CLEAR_ON_SHRINK"]).as_deref() == Some("1"),
+            hardware_cursor: first(&["CYRUP_HARDWARE_CURSOR"]).as_deref() == Some("1"),
         }
     }
 }
@@ -431,6 +427,7 @@ mod tests {
     /// setting it moves every tree at once. cyrup's rename split that name across crates —
     /// `CYRUP_AGENT_DIR` in core, `CYRUP_CODING_AGENT_DIR` in `cyrup-intercom` /
     /// `cyrup-ext-subagents` — so core now reads BOTH and an operator gets one tree either way.
+    /// The upstream `PI_CODING_AGENT_DIR` spelling is NOT honoured (hard rename).
     #[test]
     fn both_spellings_of_the_agent_dir_env_reach_the_core_resolver() {
         let long = EnvVars::from_lookup(|k| {
@@ -443,8 +440,8 @@ mod tests {
         });
         assert_eq!(short.agent_dir, Some(PathBuf::from("/opt/short")));
 
-        // The documented spelling wins when both are set, and the `PI_` migration fallback stays
-        // last.
+        // The documented spelling wins when both are set, and the legacy `PI_` spelling is
+        // ignored entirely.
         let both = EnvVars::from_lookup(|k| match k {
             "CYRUP_AGENT_DIR" => Some(OsString::from("/opt/short")),
             "CYRUP_CODING_AGENT_DIR" => Some(OsString::from("/opt/long")),
@@ -452,6 +449,13 @@ mod tests {
             _ => None,
         });
         assert_eq!(both.agent_dir, Some(PathBuf::from("/opt/short")));
+
+        // Only the dropped upstream spelling set → no agent-dir override at all.
+        let legacy_only = EnvVars::from_lookup(|k| match k {
+            "PI_CODING_AGENT_DIR" => Some(OsString::from("/opt/legacy")),
+            _ => None,
+        });
+        assert_eq!(legacy_only.agent_dir, None);
 
         let legacy = EnvVars::from_lookup(|k| match k {
             "CYRUP_CODING_AGENT_DIR" => Some(OsString::from("/opt/long")),
@@ -611,10 +615,10 @@ mod telemetry_tristate_tests {
             "set-but-empty is an explicit OFF, not an absent value"
         );
         assert_eq!(env_with(&[("CYRUP_TELEMETRY", "1")]).telemetry, Some(true));
-        // The alias carries the same tri-state.
-        assert_eq!(env_with(&[("PI_TELEMETRY", "")]).telemetry, Some(false));
-        assert_eq!(env_with(&[("PI_TELEMETRY", "true")]).telemetry, Some(true));
-        // Pi's precedence: the first key that is SET wins, even when it is empty.
+        // The legacy `PI_` spelling is ignored entirely (hard rename): set alone it is unset…
+        assert_eq!(env_with(&[("PI_TELEMETRY", "")]).telemetry, None);
+        assert_eq!(env_with(&[("PI_TELEMETRY", "true")]).telemetry, None);
+        // …and set alongside the real key it cannot flip the CYRUP empty-string OFF.
         assert_eq!(
             env_with(&[("CYRUP_TELEMETRY", ""), ("PI_TELEMETRY", "1")]).telemetry,
             Some(false)
@@ -655,12 +659,12 @@ mod telemetry_tristate_tests {
         assert!(!emptied.offline);
         assert!(!emptied.skip_version_chk);
         assert!(!emptied.clear_on_shrink);
-        // And an EMPTY first key must still fall through to a set second key for these, which is
-        // exactly what the telemetry field must NOT do.
-        let fallthrough = env_with(&[("CYRUP_OFFLINE", ""), ("PI_OFFLINE", "1")]);
+        // And an empty CYRUP key does NOT fall through anywhere: the legacy `PI_` spelling was
+        // dropped in the hard rename, so it can never re-enable a flag.
+        let no_fallthrough = env_with(&[("CYRUP_OFFLINE", ""), ("PI_OFFLINE", "1")]);
         assert!(
-            fallthrough.offline,
-            "the non-tri-state fields keep Pi's per-key empty filter"
+            !no_fallthrough.offline,
+            "the dropped `PI_*` spelling must be inert"
         );
     }
 }

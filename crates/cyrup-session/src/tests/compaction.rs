@@ -2577,7 +2577,7 @@ async fn f6_a_a_quota_error_fails_fast_even_with_retries_enabled() {
 async fn f6_b_summarization_is_isolated_from_the_session_cache_and_routing() {
     // "Summaries are standalone requests, so isolate routing and avoid cache writes that cannot be
     // reused" — `cacheRetention: "none"` + a fresh `sessionId` per call (`compaction.ts:570-575`).
-    // Leaving `cache_retention` unset lets the encoder resolve it from `PI_CACHE_RETENTION`
+    // Leaving `cache_retention` unset lets the encoder resolve it from `CYRUP_CACHE_RETENTION`
     // (defaulting to Short), billing a cache write on a one-shot request.
     let root = tempfile::tempdir().unwrap();
     let cwd = PathBuf::from("/proj/f6_cache");

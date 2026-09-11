@@ -289,7 +289,9 @@ mod tests {
             nested_paths.run_dir
         );
         assert!(
-            nested_paths.legacy_result_root.starts_with(&root_paths.run_dir),
+            nested_paths
+                .legacy_result_root
+                .starts_with(&root_paths.run_dir),
             "nested results must be scoped under the root run's tree, not the shared top-level \
              ResultsDir"
         );

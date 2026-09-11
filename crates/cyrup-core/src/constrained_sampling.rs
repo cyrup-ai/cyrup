@@ -94,22 +94,21 @@ static PREFER_STRICT_TOOL_SAMPLING: ConstrainedSampling =
         strict: StrictSampling::Prefer,
     });
 
-/// [`experimental_tool_sampling`] against an injected environment, so the `||` precedence is
+/// [`experimental_tool_sampling`] against an injected environment, so the flag check is
 /// exercisable without touching process state. Same shape as
 /// `cyrup_tui::status::experimental_features_enabled_from`.
 pub fn experimental_tool_sampling_from(
     get: impl Fn(&str) -> Option<String>,
 ) -> Option<&'static ConstrainedSampling> {
-    let enabled = get("CYRUP_EXPERIMENTAL").as_deref() == Some("1")
-        || get("PI_EXPERIMENTAL").as_deref() == Some("1");
+    let enabled = get("CYRUP_EXPERIMENTAL").as_deref() == Some("1");
     enabled.then_some(&PREFER_STRICT_TOOL_SAMPLING)
 }
 
 /// Pi `getExperimentalToolSampling` (`core/experimental.ts:7-9`): the strict-`prefer` JSON-schema
 /// declaration when the experimental flag is on, and nothing otherwise.
 ///
-/// `CYRUP_EXPERIMENTAL` is the renamed primary and `PI_EXPERIMENTAL` survives as the
-/// lower-precedence fallback — the same pair, in the same order, as
+/// `CYRUP_EXPERIMENTAL` is the renamed flag (pi `PI_EXPERIMENTAL`; the legacy spelling is no
+/// longer honoured) — the same name, checked the same way, as
 /// `cyrup::startup::are_experimental_features_enabled` (`startup.rs:76-84`) and
 /// `cyrup_tui::status::experimental_features_enabled` (`status.rs:474-483`). Upstream re-reads
 /// `process.env` on every call but only ever calls it while BUILDING a tool definition; the env is
@@ -178,17 +177,23 @@ mod tests {
             serde_json::json!({"type": "grammar", "variants": {"openai_lark": "start: /x/"}})
         );
     }
-    /// DoD 2 — either flag at the literal `"1"` yields pi's `PREFER_STRICT_TOOL_SAMPLING`; the
-    /// `CYRUP_*` primary and the `PI_*` fallback are independent, and nothing else turns it on.
+    /// DoD 2 — the `CYRUP_*` flag at the literal `"1"` yields pi's `PREFER_STRICT_TOOL_SAMPLING`;
+    /// the dropped `PI_*` spelling and every other value turn nothing on.
     #[test]
-    fn experimental_tool_sampling_reads_both_flags_and_nothing_else() {
+    fn experimental_tool_sampling_reads_the_cyrup_flag_and_nothing_else() {
         let prefer = ConstrainedSampling::Config(ConstrainedSamplingConfig::JsonSchema {
             strict: StrictSampling::Prefer,
         });
-        for key in ["CYRUP_EXPERIMENTAL", "PI_EXPERIMENTAL"] {
-            let got = experimental_tool_sampling_from(|k| (k == key).then(|| "1".to_string()));
-            assert_eq!(got, Some(&prefer), "{key}=1 must enable it");
-        }
+        let got = experimental_tool_sampling_from(|k| {
+            (k == "CYRUP_EXPERIMENTAL").then(|| "1".to_string())
+        });
+        assert_eq!(got, Some(&prefer), "CYRUP_EXPERIMENTAL=1 must enable it");
+        let legacy =
+            experimental_tool_sampling_from(|k| (k == "PI_EXPERIMENTAL").then(|| "1".to_string()));
+        assert_eq!(
+            legacy, None,
+            "the dropped PI_EXPERIMENTAL spelling must be inert"
+        );
         assert_eq!(experimental_tool_sampling_from(|_| None), None);
         for value in ["", "0", "true", "yes"] {
             assert_eq!(

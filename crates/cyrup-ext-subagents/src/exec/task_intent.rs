@@ -378,6 +378,30 @@ fn is_reviewer_style_agent(agent_lower: &str) -> bool {
     any_match(agent_lower, matcher)
 }
 
+/// pi `isReviewOrScoutLaneAgent` (`child-tool-plan.ts:70-72`) — `REVIEW_OR_SCOUT_AGENT_PATTERN`
+/// (`:66`) is `/\b(?:reviewer|scout)\b/i`, so `code-reviewer` and `Scout` match and `scouting`
+/// does not.
+///
+/// Deliberately a NAME test: the review/scout lane's tool contract is a property of what the agent
+/// is asked to BE, not of what it declared. Distinct from [`is_research_agent`]'s `\bscout\b` —
+/// that one is `task-intent.ts`'s read-only classifier and also matches
+/// `investigate`/`research(?:er)?`; conflating them would put `researcher` under a
+/// repository-tool contract it never had.
+///
+/// Unlike its two siblings above this takes the RAW name and lowercases internally: it is the only
+/// matcher in this module with an out-of-module caller
+/// ([`crate::exec::tool_surface::is_review_or_scout_lane_agent`]), so it cannot rely on an
+/// `agent_lower` convention that caller has no way to see.
+pub(crate) fn is_review_or_scout_lane_agent(agent_name: &str) -> bool {
+    fn matcher(text: &str, i: usize) -> Option<usize> {
+        if !boundary_before(text, i) {
+            return None;
+        }
+        alt_word(text, i, &["reviewer", "scout"])
+    }
+    any_match(&agent_name.to_lowercase(), matcher)
+}
+
 // -----------------------------------------------------------------------------------------------
 // FIX_OR_PATCH_IMPLEMENTATION_PATTERN (`task-intent.ts:73`)
 // -----------------------------------------------------------------------------------------------

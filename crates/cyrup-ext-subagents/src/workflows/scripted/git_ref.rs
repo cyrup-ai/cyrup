@@ -113,7 +113,10 @@ mod tests {
         let sha40 = "0123456789abcdef0123456789abcdef01234567";
         assert_eq!(sha40.len(), 40);
         assert!(!valid_git_ref(sha40));
-        assert!(!valid_git_ref(&sha40.to_uppercase()), "the upstream regex is /i");
+        assert!(
+            !valid_git_ref(&sha40.to_uppercase()),
+            "the upstream regex is /i"
+        );
         let sha64 = "a".repeat(64);
         assert!(!valid_git_ref(&sha64));
         // 39 hex digits is NOT a full commit id and passes this ground.

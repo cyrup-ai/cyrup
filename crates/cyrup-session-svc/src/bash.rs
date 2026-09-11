@@ -177,7 +177,10 @@ pub(crate) async fn run_bash(
     // edition 2024; see `crates/cyrup/src/main.rs`), so each spawn site pushes them per-child. The
     // `bash` tool already did (`cyrup-tools/src/tools/bash.rs`); this seam did not, so `!!cmd` and
     // the RPC `executeBash` saw a DIFFERENT environment from the identical command run as a tool.
-    env.push(("PI_CODING_AGENT".to_string(), "true".to_string()));
+    //
+    // [CYRUP-DELTA — KEY; hard rename] pi's key is `PI_CODING_AGENT` (`cli.ts:13` @v0.83.0);
+    // cyrup's public env surface is `CYRUP_*`-only, mirroring `cyrup-tools/src/tools/bash.rs`.
+    env.push(("CYRUP_CODING_AGENT".to_string(), "true".to_string()));
     // [CYRUP-DELTA — KEY *and* value; the key is a FORWARD-PORT from `cli.ts:14` @v0.84.1, which is
     // AHEAD of the ported tag] `AI_AGENT` does not exist anywhere in pi @v0.83.0
     // (`git -C pi grep -n AI_AGENT v0.83.0 -- packages/` → 0 hits; `cli.ts:13` @v0.83.0 sets only

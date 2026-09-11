@@ -153,6 +153,7 @@ fn base_agent_config(model: &str) -> AgentConfig {
 
 fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
+        host_available_builtins: None,
         structured_output_dir: None,
         spawn_command: None,
         child_env: std::collections::HashMap::new(),
@@ -657,6 +658,7 @@ async fn a_stop_landing_with_a_timeout_ends_the_run_stopped_not_failed() {
         .expect("mkdir run dir");
 
     let config = RunnerConfig {
+        host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
@@ -744,8 +746,15 @@ async fn a_stop_landing_with_a_timeout_ends_the_run_stopped_not_failed() {
             .expect("status.json exists"),
     )
     .expect("parse status.json");
+    let result_path = run_paths
+        .resolve_result(
+            status.session_id.as_ref().expect("session id present"),
+            &status.run_id,
+        )
+        .await
+        .expect("terminal result file exists");
     let result: ResultFile = serde_json::from_slice(
-        &tokio::fs::read(&run_paths.result)
+        &tokio::fs::read(&result_path)
             .await
             .expect("ResultFile exists"),
     )

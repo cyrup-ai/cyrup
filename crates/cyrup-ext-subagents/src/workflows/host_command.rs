@@ -228,12 +228,14 @@ pub fn normalize_workflow_host_command_params(
     let timeout_ms = params.get("timeoutMs").and_then(Value::as_f64);
     let timeout_ms = match timeout_ms {
         Some(raw)
-            if raw.fract() == 0.0 && raw >= 1.0 && raw <= {
-                #[allow(clippy::cast_precision_loss)]
-                {
-                    MAX_TIMEOUT_MS as f64
-                }
-            } =>
+            if raw.fract() == 0.0
+                && raw >= 1.0
+                && raw <= {
+                    #[allow(clippy::cast_precision_loss)]
+                    {
+                        MAX_TIMEOUT_MS as f64
+                    }
+                } =>
         {
             raw as u64
         }
@@ -283,8 +285,7 @@ pub fn normalize_workflow_host_command_params(
         Some(raw) => {
             let text = raw.as_str();
             let trimmed = text.map(str::trim).filter(|provider| !provider.is_empty());
-            let raw_has_control = text
-                .is_some_and(|text| text.contains(['\r', '\n', '\u{0}']));
+            let raw_has_control = text.is_some_and(|text| text.contains(['\r', '\n', '\u{0}']));
             match trimmed {
                 Some(provider) if !raw_has_control && provider.len() <= 64 => {
                     Some(provider.to_string())
@@ -456,7 +457,9 @@ fn write_default_output(output_path: &Path, capture: &str) -> Result<(), String>
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(output_path).map_err(|error| error.to_string())?;
+    let mut file = options
+        .open(output_path)
+        .map_err(|error| error.to_string())?;
     file.write_all(capture.as_bytes())
         .map_err(|error| error.to_string())
 }
@@ -850,7 +853,9 @@ pub async fn execute_workflow_host_command(
             Err(_) => true,
         };
         if escapes {
-            return Err(format!("runs.host('{key}') output escapes the workflow cwd."));
+            return Err(format!(
+                "runs.host('{key}') output escapes the workflow cwd."
+            ));
         }
     }
     // Step 3 — the guard (explicit) or the plain mkdir (default), both before the spawn.
@@ -1117,7 +1122,14 @@ mod tests {
             )
         );
         assert_eq!(
-            settle_workflow_host_command(false, false, Some(0), None, Some("verification-failed"), 5),
+            settle_workflow_host_command(
+                false,
+                false,
+                Some(0),
+                None,
+                Some("verification-failed"),
+                5
+            ),
             (
                 WorkflowHostCommandState::Failed,
                 Some("Process-tree cleanup failed: verification-failed.".to_string())
@@ -1179,7 +1191,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&output).expect("meta").permissions().mode();
+            let mode = std::fs::metadata(&output)
+                .expect("meta")
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
     }
@@ -1290,8 +1305,7 @@ mod tests {
         .await
         .expect("resolves");
         assert_eq!(result.state, WorkflowHostCommandState::Passed);
-        let written =
-            std::fs::read_to_string(dir.path().join("reports/out.log")).expect("written");
+        let written = std::fs::read_to_string(dir.path().join("reports/out.log")).expect("written");
         assert_eq!(written, "captured");
         assert!(
             !dir.path().join("unused-default.log").exists(),
@@ -1388,7 +1402,12 @@ mod tests {
         )
         .await
         .expect("resolves");
-        assert_eq!(result.state, WorkflowHostCommandState::Passed, "{:?}", result.error);
+        assert_eq!(
+            result.state,
+            WorkflowHostCommandState::Passed,
+            "{:?}",
+            result.error
+        );
         let leaked: i32 = std::fs::read_to_string(&pid_file)
             .expect("pid recorded")
             .trim()

@@ -490,7 +490,7 @@ pub struct OpenAiCodexEndpoints {
     /// browser flow's token exchange. Upstream uses the constant regardless of what the listener
     /// actually bound, and so does this port.
     pub redirect_uri: String,
-    /// `None` resolves `CYRUP_OAUTH_CALLBACK_HOST`/`PI_OAUTH_CALLBACK_HOST` at login time, which
+    /// `None` resolves `CYRUP_OAUTH_CALLBACK_HOST` at login time, which
     /// is what `getCallbackHost()` does per login (`openai-codex.ts:44-46`, `:363`).
     pub callback_host: Option<String>,
     /// `0` binds an ephemeral port; production is [`CALLBACK_PORT`].

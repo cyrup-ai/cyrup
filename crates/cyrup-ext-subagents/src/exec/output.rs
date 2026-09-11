@@ -1553,13 +1553,8 @@ impl ContainedPath {
     /// failure and `runs.host('{key}') output must be a regular, non-linked file path.` for the
     /// lstat failure — plus raw I/O error text for realpath/mkdir/lstat faults, matching
     /// upstream's propagated exceptions.
-    pub fn assert_within(
-        root: &Path,
-        output_path: &Path,
-        key: &str,
-    ) -> Result<Self, String> {
-        let outside =
-            || format!("runs.host('{key}') output resolves outside the workflow cwd.");
+    pub fn assert_within(root: &Path, output_path: &Path, key: &str) -> Result<Self, String> {
+        let outside = || format!("runs.host('{key}') output resolves outside the workflow cwd.");
         let root_real = std::fs::canonicalize(root).map_err(|error| error.to_string())?;
         let output_parent = dirname(output_path);
 
@@ -2314,23 +2309,38 @@ mod tests {
 
         // Snapshot of a not-yet-existing path; still absent ⇒ unchanged.
         let before = snapshot_output_file(Some(&path)).expect("Some for a configured path");
-        assert_eq!(has_output_changed_since_snapshot(&path, Some(before)), Some(false));
+        assert_eq!(
+            has_output_changed_since_snapshot(&path, Some(before)),
+            Some(false)
+        );
 
         // The child writes it ⇒ changed.
         std::fs::write(&path, "the child's report").expect("child writes");
-        assert_eq!(has_output_changed_since_snapshot(&path, Some(before)), Some(true));
+        assert_eq!(
+            has_output_changed_since_snapshot(&path, Some(before)),
+            Some(true)
+        );
 
         // Pre-existing file, untouched ⇒ unchanged; touched ⇒ changed (mtime/size heuristic).
         let before = snapshot_output_file(Some(&path)).expect("Some for a configured path");
-        assert_eq!(has_output_changed_since_snapshot(&path, Some(before)), Some(false));
+        assert_eq!(
+            has_output_changed_since_snapshot(&path, Some(before)),
+            Some(false)
+        );
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(&path, "the child appended more").expect("child writes again");
-        assert_eq!(has_output_changed_since_snapshot(&path, Some(before)), Some(true));
+        assert_eq!(
+            has_output_changed_since_snapshot(&path, Some(before)),
+            Some(true)
+        );
 
         // Existed at snapshot time, deleted since ⇒ nothing to read back ⇒ unchanged.
         let before = snapshot_output_file(Some(&path)).expect("Some for a configured path");
         std::fs::remove_file(&path).expect("delete");
-        assert_eq!(has_output_changed_since_snapshot(&path, Some(before)), Some(false));
+        assert_eq!(
+            has_output_changed_since_snapshot(&path, Some(before)),
+            Some(false)
+        );
     }
 
     #[test]

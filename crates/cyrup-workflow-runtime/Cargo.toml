@@ -1,0 +1,23 @@
+[package]
+name = "cyrup-workflow-runtime"
+description = "workflowScript's deno_core extension (ops + prelude.js), split into its own crate so a consumer's build.rs can snapshot it (WORKFLOW_1 SCOPE_3f §7) — a build.rs can never import from the crate whose build it is running, which is exactly what cyrup-ext-subagents's own ops need."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The engine core itself: `extension!`, `#[op2]`, `OpState`, and `snapshot::create_snapshot` (the
+# last of these is used by `build_snapshot`, called from a CONSUMER's build.rs — see lib.rs).
+deno_core = { workspace = true }
+deno_error = { workspace = true }
+# `WorkflowOpsBridge` is `dyn`-safe only because its async methods are boxed by this attribute
+# (native `async fn` in a trait cannot be part of a `dyn Trait`).
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

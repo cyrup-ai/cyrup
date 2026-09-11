@@ -3,19 +3,20 @@
 //! every exit into [`super::finish::finish_run`] (R-SA-077). Split out of
 //! `background/runner_main.rs`; ports pi `runs/background/subagent-runner.ts`.
 
-use crate::background::{RunId, RunPaths, RunState, RunStatus};
-use crate::background::atomic::write_atomic_json;
-use crate::background::flat_index::pending_step_statuses_for;
-use crate::error::SubagentError;
-use std::path::Path;
-use std::sync::Arc;
 use super::config::{RunnerConfig, effective_run_paths, load_runner_config};
-use super::control_watcher::{init_control_flags, install_ignored_sigusr2_handler, spawn_control_watcher};
+use super::control_watcher::{
+    init_control_flags, install_ignored_sigusr2_handler, spawn_control_watcher,
+};
 use super::events::open_run_events;
 use super::finish::{finish_run, settle_loop_outcome};
 use super::status::{SharedStatus, TelemetryMsg, lock_status, spawn_telemetry_task};
 use super::turn_loop::run_inner;
-
+use crate::background::atomic::write_atomic_json;
+use crate::background::flat_index::pending_step_statuses_for;
+use crate::background::{RunId, RunPaths, RunState, RunStatus};
+use crate::error::SubagentError;
+use std::path::Path;
+use std::sync::Arc;
 
 // =================================================================================================
 // run — the hop-2 main loop entry point
@@ -224,7 +225,10 @@ pub(super) async fn ensure_run_directories(run_paths: &RunPaths) {
 ///
 /// `None` means the status could not be published and the terminal `Failed` record has already
 /// been written by [`finish_run`] — the caller returns without running a single step.
-pub(super) async fn publish_initial_status(config: &RunnerConfig, run_paths: &RunPaths) -> Option<RunStatus> {
+pub(super) async fn publish_initial_status(
+    config: &RunnerConfig,
+    run_paths: &RunPaths,
+) -> Option<RunStatus> {
     let mut status =
         RunStatus::queued(config.run_id.clone(), config.mode, Some(std::process::id()));
     // pi `...(config.sessionId ? { sessionId: config.sessionId } : {})` (`subagent-runner.ts:2088`):

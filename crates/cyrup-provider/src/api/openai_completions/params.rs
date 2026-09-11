@@ -51,7 +51,7 @@ pub(crate) fn build_body(model: &Model, ctx: &Context, opts: &StreamOptions) -> 
 // byte-identical ports of both, shared with anthropic-messages and openai-responses.
 
 /// Env-aware `build_body`: `env` is the provider-scoped overlay (Pi `options.env`) consulted by
-/// [`resolve_cache_retention`] for the `PI_CACHE_RETENTION` fallback.
+/// [`resolve_cache_retention`] for the `CYRUP_CACHE_RETENTION` fallback.
 /// `[CYRUP-DELTA]` — fallible where pi's `buildParams` throws. `convertTools` can throw for a
 /// `strict: "require"` tool on a provider without strict mode (`constrained-sampling.ts:91-95`
 /// @v0.83.0); upstream that unwinds into `stream`'s catch and becomes the turn's terminal error

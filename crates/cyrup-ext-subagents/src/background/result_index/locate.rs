@@ -171,11 +171,7 @@ pub async fn resolve_payload(
 /// question for diagnostics and for callers reasoning about the layout — not something they should
 /// answer by re-deriving the encoding.
 #[must_use]
-pub fn owned_payload_path(
-    results_dir: &Path,
-    session_id: &SessionId,
-    run_id: &RunId,
-) -> PathBuf {
+pub fn owned_payload_path(results_dir: &Path, session_id: &SessionId, run_id: &RunId) -> PathBuf {
     paths::result_owned_path(results_dir, session_id, run_id)
 }
 
@@ -254,11 +250,7 @@ async fn locate_payload(
 }
 
 /// Every owned location this run's payload could be at, write location first.
-fn owned_candidates(
-    results_dir: &Path,
-    session_id: &SessionId,
-    run_id: &RunId,
-) -> Vec<PathBuf> {
+fn owned_candidates(results_dir: &Path, session_id: &SessionId, run_id: &RunId) -> Vec<PathBuf> {
     paths::result_owned_paths(results_dir, session_id, run_id)
 }
 
@@ -276,9 +268,12 @@ pub(crate) async fn pending_result_location(
     run_id: &RunId,
     file: &ResultFileName,
 ) -> Option<ResultPayloadLocation> {
-    let pending_path =
-        exists::first_existing(&paths::result_pending_paths(results_dir, session_id, run_id))
-            .await?;
+    let pending_path = exists::first_existing(&paths::result_pending_paths(
+        results_dir,
+        session_id,
+        run_id,
+    ))
+    .await?;
     if !pending_payload_matches(&pending_path, session_id, run_id).await {
         return None;
     }
@@ -319,7 +314,9 @@ pub(crate) fn payload_run_id(value: &serde_json::Value) -> Option<String> {
 }
 
 fn non_empty_str(value: Option<&serde_json::Value>) -> Option<&str> {
-    value.and_then(serde_json::Value::as_str).filter(|s| !s.is_empty())
+    value
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
 }
 
 /// Read the session index entry for one run, following the alias fan-out.
@@ -402,7 +399,8 @@ pub async fn result_payload_path_for_indexed_run(
         }
     };
 
-    let Some(entry) = ResultIndexEntry::parse(&bytes).filter(|entry| &entry.run_id == run_id) else {
+    let Some(entry) = ResultIndexEntry::parse(&bytes).filter(|entry| &entry.run_id == run_id)
+    else {
         let _ = tokio::fs::remove_file(&entry_path).await;
         return None;
     };
@@ -449,8 +447,10 @@ mod tests {
         clippy::indexing_slicing
     )]
 
+    use super::super::write::{
+        ResultWrite, write_async_result_file, write_pending_async_result_file,
+    };
     use super::*;
-    use super::super::write::{ResultWrite, write_async_result_file, write_pending_async_result_file};
 
     fn session(v: &str) -> SessionId {
         SessionId::parse(v).expect("non-empty")
@@ -464,29 +464,38 @@ mod tests {
     }
 
     fn payload(run: &str, sess: &str) -> Payload {
-        Payload { run_id: run.to_string(), session_id: sess.to_string() }
+        Payload {
+            run_id: run.to_string(),
+            session_id: sess.to_string(),
+        }
     }
 
     #[tokio::test]
     async fn a_public_payload_resolves_to_its_public_path() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let run = RunId::from_token("run1");
-        write_async_result_file(&ResultWrite {
-            results_dir: tmp.path(),
-            session_id: &session("s1"),
-            run_id: &run,
-            written_at: 1,
-            async_dir: None,
-            tool_call_id: None,
-        }, &payload("run1", "s1"))
-            .await
-            .expect("write");
+        write_async_result_file(
+            &ResultWrite {
+                results_dir: tmp.path(),
+                session_id: &session("s1"),
+                run_id: &run,
+                written_at: 1,
+                async_dir: None,
+                tool_call_id: None,
+            },
+            &payload("run1", "s1"),
+        )
+        .await
+        .expect("write");
 
         let found = result_payload_path_for_session_run(tmp.path(), &session("s1"), &run)
             .await
             .expect("no io error")
             .expect("found");
-        assert_eq!(found, paths::result_owned_path(tmp.path(), &session("s1"), &run));
+        assert_eq!(
+            found,
+            paths::result_owned_path(tmp.path(), &session("s1"), &run)
+        );
     }
 
     #[tokio::test]
@@ -494,16 +503,19 @@ mod tests {
         // The self-healing property: a runner that died before promoting does not strand the file.
         let tmp = tempfile::tempdir().expect("tempdir");
         let run = RunId::from_token("run1");
-        write_pending_async_result_file(&ResultWrite {
-            results_dir: tmp.path(),
-            session_id: &session("s1"),
-            run_id: &run,
-            written_at: 1,
-            async_dir: None,
-            tool_call_id: None,
-        }, &payload("run1", "s1"))
-            .await
-            .expect("write");
+        write_pending_async_result_file(
+            &ResultWrite {
+                results_dir: tmp.path(),
+                session_id: &session("s1"),
+                run_id: &run,
+                written_at: 1,
+                async_dir: None,
+                tool_call_id: None,
+            },
+            &payload("run1", "s1"),
+        )
+        .await
+        .expect("write");
         assert!(!paths::result_owned_path(tmp.path(), &session("s1"), &run).exists());
 
         let found = result_payload_path_for_session_run(tmp.path(), &session("s1"), &run)
@@ -522,16 +534,19 @@ mod tests {
     async fn a_foreign_session_cannot_resolve_another_sessions_run() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let run = RunId::from_token("run1");
-        write_pending_async_result_file(&ResultWrite {
-            results_dir: tmp.path(),
-            session_id: &session("s1"),
-            run_id: &run,
-            written_at: 1,
-            async_dir: None,
-            tool_call_id: None,
-        }, &payload("run1", "s1"))
-            .await
-            .expect("write");
+        write_pending_async_result_file(
+            &ResultWrite {
+                results_dir: tmp.path(),
+                session_id: &session("s1"),
+                run_id: &run,
+                written_at: 1,
+                async_dir: None,
+                tool_call_id: None,
+            },
+            &payload("run1", "s1"),
+        )
+        .await
+        .expect("write");
 
         let found = result_payload_path_for_session_run(tmp.path(), &session("s2"), &run)
             .await
@@ -545,52 +560,75 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let run = RunId::from_token("run1");
         let staged = paths::result_pending_path(tmp.path(), &session("s1"), &run);
-        tokio::fs::create_dir_all(staged.parent().expect("parent")).await.expect("mkdir");
-        tokio::fs::write(&staged, br#"{"runId":"OTHER","sessionId":"s1"}"#).await.expect("seed");
+        tokio::fs::create_dir_all(staged.parent().expect("parent"))
+            .await
+            .expect("mkdir");
+        tokio::fs::write(&staged, br#"{"runId":"OTHER","sessionId":"s1"}"#)
+            .await
+            .expect("seed");
 
         let file = ResultFileName::for_run(&run);
-        assert!(pending_result_location(tmp.path(), &session("s1"), &run, &file).await.is_none());
+        assert!(
+            pending_result_location(tmp.path(), &session("s1"), &run, &file)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
     async fn the_run_index_resolves_a_run_by_id_alone() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let run = RunId::from_token("run1");
-        write_async_result_file(&ResultWrite {
-            results_dir: tmp.path(),
-            session_id: &session("s1"),
-            run_id: &run,
-            written_at: 1,
-            async_dir: None,
-            tool_call_id: None,
-        }, &payload("run1", "s1"))
-            .await
-            .expect("write");
+        write_async_result_file(
+            &ResultWrite {
+                results_dir: tmp.path(),
+                session_id: &session("s1"),
+                run_id: &run,
+                written_at: 1,
+                async_dir: None,
+                tool_call_id: None,
+            },
+            &payload("run1", "s1"),
+        )
+        .await
+        .expect("write");
 
-        let found = result_payload_path_for_indexed_run(tmp.path(), &run).await.expect("found");
-        assert_eq!(found, paths::result_owned_path(tmp.path(), &session("s1"), &run));
+        let found = result_payload_path_for_indexed_run(tmp.path(), &run)
+            .await
+            .expect("found");
+        assert_eq!(
+            found,
+            paths::result_owned_path(tmp.path(), &session("s1"), &run)
+        );
     }
 
     #[tokio::test]
     async fn a_stale_run_index_entry_is_unlinked() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let run = RunId::from_token("run1");
-        write_async_result_file(&ResultWrite {
-            results_dir: tmp.path(),
-            session_id: &session("s1"),
-            run_id: &run,
-            written_at: 1,
-            async_dir: None,
-            tool_call_id: None,
-        }, &payload("run1", "s1"))
-            .await
-            .expect("write");
+        write_async_result_file(
+            &ResultWrite {
+                results_dir: tmp.path(),
+                session_id: &session("s1"),
+                run_id: &run,
+                written_at: 1,
+                async_dir: None,
+                tool_call_id: None,
+            },
+            &payload("run1", "s1"),
+        )
+        .await
+        .expect("write");
         // Delete the payload, leaving the index pointing at nothing.
         tokio::fs::remove_file(paths::result_owned_path(tmp.path(), &session("s1"), &run))
             .await
             .expect("rm");
 
-        assert!(result_payload_path_for_indexed_run(tmp.path(), &run).await.is_none());
+        assert!(
+            result_payload_path_for_indexed_run(tmp.path(), &run)
+                .await
+                .is_none()
+        );
         assert!(
             !paths::run_index_path(tmp.path(), &run).exists(),
             "a stale accelerator entry must be swept, not re-read forever"
@@ -602,10 +640,16 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let run = RunId::from_token("run1");
         let index = paths::run_index_path(tmp.path(), &run);
-        tokio::fs::create_dir_all(index.parent().expect("parent")).await.expect("mkdir");
+        tokio::fs::create_dir_all(index.parent().expect("parent"))
+            .await
+            .expect("mkdir");
         tokio::fs::write(&index, b"not json").await.expect("seed");
 
-        assert!(result_payload_path_for_indexed_run(tmp.path(), &run).await.is_none());
+        assert!(
+            result_payload_path_for_indexed_run(tmp.path(), &run)
+                .await
+                .is_none()
+        );
         assert!(!index.exists());
     }
 
@@ -628,22 +672,30 @@ mod tests {
         let run = RunId::from_token("run1");
         let async_dir = tmp.path().join("adir");
         tokio::fs::create_dir_all(&async_dir).await.expect("mkdir");
-        tokio::fs::write(async_dir.join("mission.json"), b"{}").await.expect("bind");
+        tokio::fs::write(async_dir.join("mission.json"), b"{}")
+            .await
+            .expect("bind");
 
-        write_async_result_file(&ResultWrite {
-            results_dir: tmp.path(),
-            session_id: &session("s1"),
-            run_id: &run,
-            written_at: 1,
-            async_dir: Some(&async_dir),
-            tool_call_id: None,
-        }, &payload("run1", "s1"))
+        write_async_result_file(
+            &ResultWrite {
+                results_dir: tmp.path(),
+                session_id: &session("s1"),
+                run_id: &run,
+                written_at: 1,
+                async_dir: Some(&async_dir),
+                tool_call_id: None,
+            },
+            &payload("run1", "s1"),
+        )
         .await
         .expect("write");
 
         let found = result_payload_path_for_mission_observer_run(tmp.path(), &run)
             .await
             .expect("a mission-bound run is visible to any instance");
-        assert_eq!(found, paths::result_owned_path(tmp.path(), &session("s1"), &run));
+        assert_eq!(
+            found,
+            paths::result_owned_path(tmp.path(), &session("s1"), &run)
+        );
     }
 }

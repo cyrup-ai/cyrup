@@ -99,16 +99,15 @@ mod retention;
 mod write;
 
 pub use entry::{IndexVersion, ResultIndexEntry};
-pub use exists::indexed_result_exists;
 pub use enumerate::{
     ResultCandidate, mission_observer_result_candidate_files, result_candidate_files_for_session,
     result_candidate_files_for_tool_call, result_candidates_for_session, result_files_for_session,
 };
+pub use exists::indexed_result_exists;
 pub use locate::{
-    ConsumablePayload, PayloadResolution, PayloadState, ResultPayloadLocation,
-    owned_payload_path, resolve_payload,
-    result_payload_path_for_indexed_run, result_payload_path_for_mission_observer_run,
-    result_payload_path_for_session_run,
+    ConsumablePayload, PayloadResolution, PayloadState, ResultPayloadLocation, owned_payload_path,
+    resolve_payload, result_payload_path_for_indexed_run,
+    result_payload_path_for_mission_observer_run, result_payload_path_for_session_run,
 };
 pub use promote::PromotionState;
 pub use remove::{remove_mission_observer_index, remove_result_index};

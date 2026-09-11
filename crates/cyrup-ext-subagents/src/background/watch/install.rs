@@ -74,7 +74,9 @@ pub fn install_completion_watcher_with_observer(
 ) -> Result<CompletionWatcherHandle, SubagentError> {
     let watcher = ResultsWatcher::new(results_dir);
     let (poll_watcher, rx) = watcher.install()?;
-    let task = tokio::spawn(drive_completion_watcher(watcher, rx, sink, observer, ownership));
+    let task = tokio::spawn(drive_completion_watcher(
+        watcher, rx, sink, observer, ownership,
+    ));
     Ok(CompletionWatcherHandle {
         _poll_watcher: poll_watcher,
         task,
@@ -376,11 +378,8 @@ async fn deliver_pending_completions(
                 if let Some(observer) = observer {
                     observer.observe(&notification).await;
                 }
-                result_index::remove_mission_observer_index(
-                    watcher.results_dir(),
-                    owned.run_id(),
-                )
-                .await;
+                result_index::remove_mission_observer_index(watcher.results_dir(), owned.run_id())
+                    .await;
 
                 // ---- Phase 2: CONCURRENT delivery. The ack can be parked for a whole turn, so
                 // it must never park the scan; the fleet's join sites settle it (consume on
@@ -507,7 +506,9 @@ mod tests {
         use crate::identity::{CompletionOwnerId, SessionId};
 
         let (_dir, results_dir) = temp_results_dir();
-        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir results_dir");
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir results_dir");
 
         let session_a = SessionId::parse("session-A").expect("non-empty");
         let session_b = SessionId::parse("session-B").expect("non-empty");
@@ -607,7 +608,6 @@ mod tests {
         drop(handle_a);
     }
 
-
     /// The dangling-index repair, end to end through the real drain loop: a completed run whose
     /// payload was taken by an index-blind process must reach the orchestrator as a LOUD
     /// notification carrying what the run's own records still hold, and must leave no index
@@ -617,7 +617,9 @@ mod tests {
         use crate::background::result_index;
 
         let (_dir, results_dir) = temp_results_dir();
-        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir");
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir");
 
         let result = result_with_children(
             "run-stolen",
@@ -631,7 +633,9 @@ mod tests {
 
         // An index-blind sibling consumes the payload and leaves the index untouched — the exact
         // residue this repair exists for.
-        tokio::fs::remove_file(&payload).await.expect("steal the payload");
+        tokio::fs::remove_file(&payload)
+            .await
+            .expect("steal the payload");
         let session = result.session_id.clone().expect("fixture session");
         assert!(
             result_index::result_candidates_for_session(&results_dir, &session)
@@ -652,15 +656,17 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         let messages = delivered.lock().await.clone();
-        assert_eq!(messages.len(), 1, "exactly one loss notification: {messages:?}");
+        assert_eq!(
+            messages.len(),
+            1,
+            "exactly one loss notification: {messages:?}"
+        );
         assert!(
             messages[0].display,
             "a lost result is never delivered silently"
         );
         assert!(
-            messages[0]
-                .content
-                .contains("removed before delivery"),
+            messages[0].content.contains("removed before delivery"),
             "{}",
             messages[0].content
         );

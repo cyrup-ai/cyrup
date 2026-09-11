@@ -2,10 +2,9 @@
 //! open/append primitives every other runner_main submodule logs through. Split out of
 //! `background/runner_main.rs`; ports pi `runs/background/subagent-runner.ts`.
 
+use super::config::RunnerConfig;
 use crate::background::RunPaths;
 use crate::jsonl::BoundedJsonlWriter;
-use super::config::RunnerConfig;
-
 
 /// pi `ASYNC_EVENTS_MAX_BYTES_ENV = "PI_SUBAGENT_ASYNC_EVENTS_MAX_BYTES"`
 /// (`runs/background/subagent-runner.ts:307` @v0.64.0, added at v0.31.0) in this crate's `CYRUP_`
@@ -13,10 +12,6 @@ use super::config::RunnerConfig;
 /// [`crate::jsonl::DEFAULT_JSONL_CAP_BYTES`] — the same 50 MiB as upstream's
 /// `DEFAULT_MAX_ASYNC_EVENTS_BYTES` (`:306`).
 pub const ASYNC_EVENTS_MAX_BYTES_ENV: &str = "CYRUP_SUBAGENT_ASYNC_EVENTS_MAX_BYTES";
-
-/// The upstream spelling of [`ASYNC_EVENTS_MAX_BYTES_ENV`], honoured as a read-side compatibility
-/// alias (the convention `exec/spawn_budget.rs` and `exec/capability_ceiling.rs` document).
-pub const ASYNC_EVENTS_MAX_BYTES_ENV_PI_ALIAS: &str = "PI_SUBAGENT_ASYNC_EVENTS_MAX_BYTES";
 
 /// pi `maxAsyncEventsBytes()` (`subagent-runner.ts:318-324` @v0.64.0), over an injected lookup:
 /// unset or empty → the default; `Number(raw)` not finite or negative → the default; otherwise
@@ -27,7 +22,7 @@ pub const ASYNC_EVENTS_MAX_BYTES_ENV_PI_ALIAS: &str = "PI_SUBAGENT_ASYNC_EVENTS_
 /// documented contract, and noted so nobody reads the difference as a port error.
 #[must_use]
 pub fn resolve_async_events_cap_bytes(get: &dyn Fn(&str) -> Option<String>) -> u64 {
-    let raw = get(ASYNC_EVENTS_MAX_BYTES_ENV).or_else(|| get(ASYNC_EVENTS_MAX_BYTES_ENV_PI_ALIAS));
+    let raw = get(ASYNC_EVENTS_MAX_BYTES_ENV);
     let Some(raw) = raw.filter(|value| !value.is_empty()) else {
         return crate::jsonl::DEFAULT_JSONL_CAP_BYTES;
     };
@@ -111,10 +106,7 @@ pub(super) async fn append_event(
 
 #[cfg(test)]
 mod async_events_cap_tests {
-    use super::{
-        ASYNC_EVENTS_MAX_BYTES_ENV, ASYNC_EVENTS_MAX_BYTES_ENV_PI_ALIAS,
-        resolve_async_events_cap_bytes,
-    };
+    use super::{ASYNC_EVENTS_MAX_BYTES_ENV, resolve_async_events_cap_bytes};
     use crate::jsonl::DEFAULT_JSONL_CAP_BYTES;
 
     fn with(pairs: &'static [(&'static str, &'static str)]) -> u64 {
@@ -152,14 +144,18 @@ mod async_events_cap_tests {
         assert_eq!(with(&[(ASYNC_EVENTS_MAX_BYTES_ENV, "0")]), 0);
     }
 
-    /// The `PI_` spelling is a fallback, never an override.
+    /// The dropped upstream `PI_` spelling is inert (hard rename): alone it yields the default,
+    /// and beside the real key it never wins.
     #[test]
-    fn the_pi_alias_is_consulted_only_when_the_cyrup_spelling_is_unset() {
-        assert_eq!(with(&[(ASYNC_EVENTS_MAX_BYTES_ENV_PI_ALIAS, "2048")]), 2048);
+    fn the_dropped_pi_spelling_is_ignored() {
+        assert_eq!(
+            with(&[("PI_SUBAGENT_ASYNC_EVENTS_MAX_BYTES", "2048")]),
+            DEFAULT_JSONL_CAP_BYTES
+        );
         assert_eq!(
             with(&[
                 (ASYNC_EVENTS_MAX_BYTES_ENV, "4096"),
-                (ASYNC_EVENTS_MAX_BYTES_ENV_PI_ALIAS, "2048"),
+                ("PI_SUBAGENT_ASYNC_EVENTS_MAX_BYTES", "2048"),
             ]),
             4096
         );

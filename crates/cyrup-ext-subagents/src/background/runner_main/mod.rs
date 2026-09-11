@@ -85,10 +85,7 @@ mod turn_loop;
 
 pub use config::{ConfigConsumeOutcome, RunnerConfig, read_and_delete_config};
 pub use entry::{RunnerOverrides, run, run_with};
-pub use events::{
-    ASYNC_EVENTS_MAX_BYTES_ENV, ASYNC_EVENTS_MAX_BYTES_ENV_PI_ALIAS,
-    resolve_async_events_cap_bytes,
-};
+pub use events::{ASYNC_EVENTS_MAX_BYTES_ENV, resolve_async_events_cap_bytes};
 pub(crate) use executor::ExecSingleStepExecutor;
 
 #[cfg(test)]
@@ -107,7 +104,6 @@ mod tests {
     use crate::spawn::chain_graph::{RunnerStep, SingleStepSpec};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
-
 
     pub(super) fn single_step(agent: &str, task: &str) -> SingleStepSpec {
         SingleStepSpec {
@@ -246,6 +242,8 @@ mod tests {
                 progress: None,
                 runner: None,
                 external_process: None,
+                // Test fixture: no child was planned, so there is no surface to report.
+                tool_surface: crate::exec::tool_surface::ResolvedToolSurface::default(),
             }],
         };
         write_atomic_json(&target_paths.legacy_result_root, &target_result)
@@ -301,6 +299,7 @@ mod tests {
             orchestrator_intercom_target: None,
             inherited_session_model: None,
             inherited_session_thinking: None,
+            host_available_builtins: None,
             model_scope: None,
             nested_route: None,
             nested_self: None,

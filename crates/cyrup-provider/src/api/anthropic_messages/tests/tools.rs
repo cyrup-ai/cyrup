@@ -87,10 +87,10 @@ fn constrained_sampling_drives_anthropic_strict_tools() {
     );
     // Its VALUE is the plain ephemeral marker for "short" retention. `build_body` passes no
     // env overlay, so `resolve_cache_retention` falls through to the ambient
-    // `PI_CACHE_RETENTION` (`:371-378`, pi `:49-57`); pin the overlay so an exported "long" in
-    // the developer's shell cannot swap in the 1h-ttl variant — that branch is pinned
+    // `CYRUP_CACHE_RETENTION` (`:371-378`, pi `:49-57`); pin the overlay so an exported "long"
+    // in the developer's shell cannot swap in the 1h-ttl variant — that branch is pinned
     // separately by `tools_encode_eager_streaming_and_cache_control`.
-    let short = ProviderEnv::from([("PI_CACHE_RETENTION".into(), "short".into())]);
+    let short = ProviderEnv::from([("CYRUP_CACHE_RETENTION".into(), "short".into())]);
     let pinned = build_params(&m, &ctx, &StreamOptions::default(), Some(&short), false)
         .expect("supports_strict_tools satisfies the `prefer` tool");
     assert_eq!(

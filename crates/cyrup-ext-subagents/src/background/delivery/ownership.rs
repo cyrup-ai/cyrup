@@ -36,7 +36,11 @@ impl OwnershipSnapshot {
     /// session identity.
     #[must_use]
     pub fn empty() -> Self {
-        Self { current_session: None, owner: None, claimed: Vec::new() }
+        Self {
+            current_session: None,
+            owner: None,
+            claimed: Vec::new(),
+        }
     }
 
     /// Build a snapshot directly. Mainly for tests; production takes one from
@@ -47,7 +51,11 @@ impl OwnershipSnapshot {
         owner: Option<CompletionOwnerId>,
         claimed: Vec<SessionId>,
     ) -> Self {
-        Self { current_session, owner, claimed }
+        Self {
+            current_session,
+            owner,
+            claimed,
+        }
     }
 
     /// This orchestrator's current session, if it has one.
@@ -104,7 +112,11 @@ impl OwnershipSnapshot {
     /// is nothing for it to be denied. An embedder that wants async completions must supply a
     /// session identity. This is deliberate; do not "fix" it into an accept-all.
     #[must_use]
-    pub fn owns(&self, session_id: &SessionId, completion_owner_id: Option<&CompletionOwnerId>) -> bool {
+    pub fn owns(
+        &self,
+        session_id: &SessionId,
+        completion_owner_id: Option<&CompletionOwnerId>,
+    ) -> bool {
         let Some(owner) = self.owner.as_ref() else {
             return false;
         };
@@ -249,10 +261,16 @@ mod tests {
     #[test]
     fn owns_requires_both_identities() {
         let snap = OwnershipSnapshot::new(Some(sid("s1")), Some(oid("o1")), Vec::new());
-        assert!(snap.owns(&sid("s1"), Some(&oid("o1"))), "own session + own owner");
+        assert!(
+            snap.owns(&sid("s1"), Some(&oid("o1"))),
+            "own session + own owner"
+        );
         assert!(!snap.owns(&sid("s2"), Some(&oid("o1"))), "foreign session");
         assert!(!snap.owns(&sid("s1"), Some(&oid("o2"))), "foreign owner");
-        assert!(!snap.owns(&sid("s1"), None), "no owner recorded on the result");
+        assert!(
+            !snap.owns(&sid("s1"), None),
+            "no owner recorded on the result"
+        );
     }
 
     #[test]
@@ -278,14 +296,18 @@ mod tests {
     #[test]
     fn a_claimed_predecessor_session_is_owned() {
         let snap = OwnershipSnapshot::new(Some(sid("s2")), Some(oid("o1")), vec![sid("s1")]);
-        assert!(snap.owns(&sid("s1"), Some(&oid("o1"))), "claimed predecessor");
+        assert!(
+            snap.owns(&sid("s1"), Some(&oid("o1"))),
+            "claimed predecessor"
+        );
         assert!(snap.owns(&sid("s2"), Some(&oid("o1"))), "current");
         assert!(!snap.owns(&sid("s3"), Some(&oid("o1"))), "neither");
     }
 
     #[test]
     fn readable_sessions_lead_with_the_current_one_and_never_duplicate() {
-        let snap = OwnershipSnapshot::new(Some(sid("s1")), Some(oid("o1")), vec![sid("s1"), sid("s0")]);
+        let snap =
+            OwnershipSnapshot::new(Some(sid("s1")), Some(oid("o1")), vec![sid("s1"), sid("s0")]);
         assert_eq!(snap.readable_sessions(), vec![sid("s1"), sid("s0")]);
     }
 
@@ -301,9 +323,18 @@ mod tests {
         let own = ResultDeliveryOwnership::new(Some(sid("s1")), Some(oid("o1")));
         assert!(!own.claim_predecessor(None, Some("s1")), "no file");
         assert!(!own.claim_predecessor(Some("s1"), None), "no runtime id");
-        assert!(!own.claim_predecessor(Some("sX"), Some("s1")), "file != runtime");
-        assert!(!own.claim_predecessor(Some("sX"), Some("sX")), "runtime != current");
-        assert!(own.claim_predecessor(Some("s1"), Some("s1")), "all three agree");
+        assert!(
+            !own.claim_predecessor(Some("sX"), Some("s1")),
+            "file != runtime"
+        );
+        assert!(
+            !own.claim_predecessor(Some("sX"), Some("sX")),
+            "runtime != current"
+        );
+        assert!(
+            own.claim_predecessor(Some("s1"), Some("s1")),
+            "all three agree"
+        );
     }
 
     #[test]
@@ -330,7 +361,10 @@ mod tests {
         // with arbitrary eviction passes a naive test and fails this one.
         let own = ResultDeliveryOwnership::new(Some(sid("s1")), Some(oid("o1")));
         assert!(own.claim_predecessor(Some("s1"), Some("s1")));
-        assert!(own.claim_predecessor(Some("s1"), Some("s1")), "re-claim is admitted");
+        assert!(
+            own.claim_predecessor(Some("s1"), Some("s1")),
+            "re-claim is admitted"
+        );
         let snap = own.snapshot();
         assert_eq!(snap.claimed, vec![sid("s1")], "no duplicate entry");
     }

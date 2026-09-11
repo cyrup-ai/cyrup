@@ -217,13 +217,12 @@ fn child_output_path(child: &SingleResult) -> Option<String> {
 fn inline_preview(child: &SingleResult) -> Option<String> {
     let output = child.final_output.as_deref().unwrap_or("");
     // pi `referenceOnly` (`:201`) — the body is just a pointer to a file, not the answer.
-    let reference_only = child.saved_output_path.is_some()
-        && output.trim_start().starts_with("Output saved to:");
+    let reference_only =
+        child.saved_output_path.is_some() && output.trim_start().starts_with("Output saved to:");
     let raw = if child.output_state == SubagentOutputState::Absent || reference_only {
         structured_output_text(child.structured_output.as_ref())
     } else if is_degenerate_output(output) {
-        structured_output_text(child.structured_output.as_ref())
-            .or_else(|| non_empty(Some(output)))
+        structured_output_text(child.structured_output.as_ref()).or_else(|| non_empty(Some(output)))
     } else {
         non_empty(Some(output))
     };
@@ -252,7 +251,9 @@ fn structured_output_text(value: Option<&serde_json::Value>) -> Option<String> {
 
 /// JS `value || next` on a string: empty (after trim) is falsy.
 fn non_empty(value: Option<&str>) -> Option<String> {
-    value.filter(|text| !text.trim().is_empty()).map(str::to_string)
+    value
+        .filter(|text| !text.trim().is_empty())
+        .map(str::to_string)
 }
 
 /// Build the `subagent-notify` [`CompletionMessage`] for `result`, reproducing pi's `notify.ts`
@@ -337,7 +338,9 @@ pub fn format_missing_payload_message(report: &LossReport) -> CompletionMessage 
         report.agent.as_str()
     };
     let mut lines: Vec<String> = vec![
-        format!("Background task completed but its result payload was removed before delivery: **{agent}**"),
+        format!(
+            "Background task completed but its result payload was removed before delivery: **{agent}**"
+        ),
         String::new(),
     ];
 
@@ -411,7 +414,6 @@ pub fn format_undeliverable_message(result: &ResultFile) -> CompletionMessage {
         suppressible: false,
     }
 }
-
 
 #[cfg(test)]
 mod tests {

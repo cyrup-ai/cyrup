@@ -80,9 +80,18 @@ mod tests {
 
         // --- a caller WITH a session: both classes agree, always ---
         for gate in [SessionGate::Strict, SessionGate::Permissive] {
-            assert!(gate.admits(Some(&mine), Some(&mine)), "{gate:?}: own record");
-            assert!(!gate.admits(Some(&mine), Some(&theirs)), "{gate:?}: foreign record");
-            assert!(!gate.admits(Some(&mine), None), "{gate:?}: unattributed record");
+            assert!(
+                gate.admits(Some(&mine), Some(&mine)),
+                "{gate:?}: own record"
+            );
+            assert!(
+                !gate.admits(Some(&mine), Some(&theirs)),
+                "{gate:?}: foreign record"
+            );
+            assert!(
+                !gate.admits(Some(&mine), None),
+                "{gate:?}: unattributed record"
+            );
         }
 
         // --- a caller WITHOUT a session: the ONLY place the classes differ ---

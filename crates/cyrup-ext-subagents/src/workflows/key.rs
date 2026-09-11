@@ -104,15 +104,18 @@ mod tests {
         }
         for bad in [
             "",
-            ".a",          // first char must be alphanumeric
+            ".a", // first char must be alphanumeric
             "-a",
             "_a",
-            "a b",         // space is outside the alphabet
+            "a b", // space is outside the alphabet
             "a/b",
-            "ключ",        // non-ASCII
+            "ключ", // non-ASCII
             &"a".repeat(129),
         ] {
-            assert!(WorkflowKey::parse(bad).is_err(), "{bad:?} should be rejected");
+            assert!(
+                WorkflowKey::parse(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
         }
     }
 
@@ -125,7 +128,10 @@ mod tests {
         let sibling = WorkflowKey::parse("lane2").expect("valid");
         assert!(child.is_descendant_of(&root));
         assert!(!root.is_descendant_of(&root), "not reflexive");
-        assert!(!sibling.is_descendant_of(&root), "prefix without dot is not descent");
+        assert!(
+            !sibling.is_descendant_of(&root),
+            "prefix without dot is not descent"
+        );
         assert!(!root.is_descendant_of(&child));
     }
 

@@ -52,7 +52,7 @@ impl ColorMode {
     /// subprocess is skipped.
     ///
     /// It goes through [`crate::image::detect_capabilities_with_overrides`] rather than the bare
-    /// sniff so `CYRUP_TRUE_COLOR`/`PI_TRUE_COLOR` reaches the colour depth: upstream reads this as
+    /// sniff so `CYRUP_TRUE_COLOR` reaches the colour depth: upstream reads this as
     /// `getCapabilities().trueColor`
     /// (`coding-agent/src/modes/interactive/theme/theme.ts:630`), and `getCapabilities` is the
     /// override-layered accessor (`tui/src/terminal-image.ts:164-172`).

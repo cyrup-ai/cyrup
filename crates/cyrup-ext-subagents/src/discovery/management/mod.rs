@@ -658,10 +658,22 @@ mod tests {
         // The 8 R-SA-132 builtins load from resources/agents alongside the discovered agents.
         assert!(t.contains("- reviewer (builtin"), "{t}");
         assert!(t.contains("- scout (builtin"), "{t}");
-        // Discovered user/project agents render with the exact pi line shape.
-        assert!(t.contains("- my-user-agent (user): A user agent"), "{t}");
+        // Discovered user/project agents render with the pi line shape plus cyrup's trailing
+        // `, tools:` segment ([CYRUP-DELTA], see `handle_list`): neither of these agents declared
+        // a `tools:` key, so both are UNPINNED — the child keeps its own default built-in set,
+        // which is NOT the same statement as "no tools".
         assert!(
-            t.contains("- my-project-agent (project): A project agent"),
+            t.contains("- my-user-agent (user, tools: (unpinned)): A user agent"),
+            "{t}"
+        );
+        assert!(
+            t.contains("- my-project-agent (project, tools: (unpinned)): A project agent"),
+            "{t}"
+        );
+        // A pinned builtin renders its actual surface, so a parent reading `list` sees what an
+        // agent can do BEFORE it writes a prompt that assumes a capability.
+        assert!(
+            t.contains("- reviewer (builtin, tools: read, grep, find, ls, intercom):"),
             "{t}"
         );
         // No chains authored -> the empty-chains sentinel.
@@ -699,9 +711,9 @@ mod tests {
             .await
             .expect("list ok");
         let t = out.text;
-        assert!(t.contains("- my-project-agent (project)"), "{t}");
+        assert!(t.contains("- my-project-agent (project, tools:"), "{t}");
         assert!(
-            !t.contains("- my-user-agent (user)"),
+            !t.contains("- my-user-agent (user,"),
             "project scope must hide user agents: {t}"
         );
         // Builtins remain visible under any named scope (they are orthogonal to the user/project axis).
@@ -1259,9 +1271,11 @@ mod tests {
         let list = handle_management_action(&cfg, "list", &mreq(None, None, None, None))
             .await
             .expect("list ok");
+        // The `, tools:` segment is appended LAST, so every pi-shaped leading segment
+        // (`source`, `context`, `aliases`) keeps its exact position and order.
         assert!(
             list.text
-                .contains("- seer (user, aliases: prophet, diviner): Sees"),
+                .contains("- seer (user, aliases: prophet, diviner, tools: (unpinned)): Sees"),
             "{}",
             list.text
         );

@@ -124,11 +124,12 @@ pub fn resolve_agent_dir(home: &Path) -> PathBuf {
 /// [`resolve_agent_dir`] with its environment supplied — the workspace's one agent-dir ladder
 /// ([`cyrup_config::paths::cyrup_agent_dir_from`]) resolved against `home`.
 ///
-/// Reads whatever [`cyrup_config::paths::ENV_AGENT_DIR_KEYS`] holds — today all three spellings.
-/// The middle one, `CYRUP_CODING_AGENT_DIR`, is the fix rather than a widening: `cyrup_config` has
-/// read it since CFG-076, this function read only the outer two, and the gap meant an operator
-/// setting the long spelling moved the binary's layout while this crate's agent memory, run
-/// history, settings, prompts and sessions stayed in the old tree.
+/// Reads whatever [`cyrup_config::paths::ENV_AGENT_DIR_KEYS`] holds — today the two `CYRUP_*`
+/// spellings (the upstream `PI_CODING_AGENT_DIR` leg was dropped in the hard rename). The second
+/// one, `CYRUP_CODING_AGENT_DIR`, is the fix rather than a widening: `cyrup_config` has read it
+/// since CFG-076 (back when the ladder was three keys, this function read only two of them), and
+/// the gap meant an operator setting the long spelling moved the binary's layout while this
+/// crate's agent memory, run history, settings, prompts and sessions stayed in the old tree.
 #[must_use]
 pub fn resolve_agent_dir_from(home: &Path, env: EnvLookup<'_>) -> PathBuf {
     cyrup_config::paths::cyrup_agent_dir_from(home, env)

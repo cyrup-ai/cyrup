@@ -56,10 +56,19 @@ fn acp_wins_over_the_non_tty_print_fallback() {
         AppMode::Acp
     );
     // The other four modes are byte-identical to what they were before the variant existed.
-    assert_eq!(resolve_app_mode(&parse(&["--rpc"]), false, false), AppMode::Rpc);
-    assert_eq!(resolve_app_mode(&parse(&["--json"]), false, false), AppMode::Json);
+    assert_eq!(
+        resolve_app_mode(&parse(&["--rpc"]), false, false),
+        AppMode::Rpc
+    );
+    assert_eq!(
+        resolve_app_mode(&parse(&["--json"]), false, false),
+        AppMode::Json
+    );
     assert_eq!(resolve_app_mode(&parse(&[]), false, false), AppMode::Print);
-    assert_eq!(resolve_app_mode(&parse(&[]), true, true), AppMode::Interactive);
+    assert_eq!(
+        resolve_app_mode(&parse(&[]), true, true),
+        AppMode::Interactive
+    );
     // ACP-002 — `should_take_over_stdout` needs no change and must NOT gain an exemption: the ACP
     // host writes JSON-RPC frames to stdout and a stray library line would corrupt them.
     assert!(should_take_over_stdout(&parse(&["--acp"]), AppMode::Acp));

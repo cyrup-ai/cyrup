@@ -66,8 +66,12 @@ pub(crate) async fn promote_pending_result_file(
     // pi `:260`'s `file !== path.basename(file) || !file.endsWith(".json")` guard is discharged by
     // `file` being a `ResultFileName` — it cannot be anything else. That is the guard upstream
     // repeats at `:260`, `:294` and `:307`.
-    let Some(pending_path) =
-        exists::first_existing(&paths::result_pending_paths(results_dir, session_id, run_id)).await
+    let Some(pending_path) = exists::first_existing(&paths::result_pending_paths(
+        results_dir,
+        session_id,
+        run_id,
+    ))
+    .await
     else {
         return PromotionState::None;
     };
@@ -100,8 +104,7 @@ pub(crate) async fn promote_pending_result_file(
             }
         }
         Err(error) => {
-            if errno::is_absent(&error) || errno::is_access_denied(&error) || is_exists(&error)
-            {
+            if errno::is_absent(&error) || errno::is_access_denied(&error) || is_exists(&error) {
                 let pending_exists = exists::is_existing_file(&pending_path).await;
                 let result_exists = exists::is_existing_file(&result_path).await;
                 if pending_exists {
@@ -161,7 +164,9 @@ mod tests {
     }
 
     fn payload() -> Payload {
-        Payload { run_id: "run1".to_string() }
+        Payload {
+            run_id: "run1".to_string(),
+        }
     }
 
     #[test]
@@ -177,19 +182,21 @@ mod tests {
     async fn a_pending_payload_promotes_later() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let run = RunId::from_token("run1");
-        write_pending_async_result_file(&ResultWrite {
-            results_dir: tmp.path(),
-            session_id: &session("s1"),
-            run_id: &run,
-            written_at: 1,
-            async_dir: None,
-            tool_call_id: None,
-        }, &payload())
+        write_pending_async_result_file(
+            &ResultWrite {
+                results_dir: tmp.path(),
+                session_id: &session("s1"),
+                run_id: &run,
+                written_at: 1,
+                async_dir: None,
+                tool_call_id: None,
+            },
+            &payload(),
+        )
         .await
         .expect("write");
 
-        let state =
-            promote_pending_result_file(tmp.path(), &session("s1"), &run, true).await;
+        let state = promote_pending_result_file(tmp.path(), &session("s1"), &run, true).await;
         assert_eq!(state, PromotionState::Promoted);
         assert!(paths::result_owned_path(tmp.path(), &session("s1"), &run).is_file());
     }
@@ -209,14 +216,17 @@ mod tests {
         // The convergence property: whoever loses the race still learns the truth.
         let tmp = tempfile::tempdir().expect("tempdir");
         let run = RunId::from_token("run1");
-        write_pending_async_result_file(&ResultWrite {
-            results_dir: tmp.path(),
-            session_id: &session("s1"),
-            run_id: &run,
-            written_at: 1,
-            async_dir: None,
-            tool_call_id: None,
-        }, &payload())
+        write_pending_async_result_file(
+            &ResultWrite {
+                results_dir: tmp.path(),
+                session_id: &session("s1"),
+                run_id: &run,
+                written_at: 1,
+                async_dir: None,
+                tool_call_id: None,
+            },
+            &payload(),
+        )
         .await
         .expect("write");
 
@@ -243,16 +253,23 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let run = RunId::from_token("run1");
         let owned = paths::result_owned_path(tmp.path(), &session("s1"), &run);
-        tokio::fs::create_dir_all(owned.parent().expect("parent")).await.expect("mkdir");
-        tokio::fs::write(&owned, b"{\"old\":true}").await.expect("seed");
-        write_pending_async_result_file(&ResultWrite {
-            results_dir: tmp.path(),
-            session_id: &session("s1"),
-            run_id: &run,
-            written_at: 1,
-            async_dir: None,
-            tool_call_id: None,
-        }, &payload())
+        tokio::fs::create_dir_all(owned.parent().expect("parent"))
+            .await
+            .expect("mkdir");
+        tokio::fs::write(&owned, b"{\"old\":true}")
+            .await
+            .expect("seed");
+        write_pending_async_result_file(
+            &ResultWrite {
+                results_dir: tmp.path(),
+                session_id: &session("s1"),
+                run_id: &run,
+                written_at: 1,
+                async_dir: None,
+                tool_call_id: None,
+            },
+            &payload(),
+        )
         .await
         .expect("write");
 
@@ -261,6 +278,9 @@ mod tests {
             PromotionState::Promoted
         );
         let bytes = tokio::fs::read(&owned).await.expect("read");
-        assert!(!String::from_utf8_lossy(&bytes).contains("old"), "must be replaced");
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("old"),
+            "must be replaced"
+        );
     }
 }

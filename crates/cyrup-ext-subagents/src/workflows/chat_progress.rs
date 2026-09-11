@@ -132,9 +132,7 @@ pub fn is_same_git_repository_identity(
     right: Option<&GitRepositoryIdentity>,
 ) -> bool {
     match (left, right) {
-        (Some(left), Some(right)) => {
-            left.common_dir == right.common_dir || left.root == right.root
-        }
+        (Some(left), Some(right)) => left.common_dir == right.common_dir || left.root == right.root,
         (None, _) | (_, None) => false,
     }
 }
@@ -150,7 +148,9 @@ pub fn is_same_git_repository(left_cwd: &Path, right_cwd: &Path) -> bool {
 
 /// pi `normalizeRequestedMode` (`chat-progress.ts:67-73`): absent ⇒ `auto`; a non-string or
 /// unknown string ⇒ the error listing the mode words.
-fn normalize_requested_mode(value: Option<&serde_json::Value>) -> Result<WorkflowChatProgressMode, String> {
+fn normalize_requested_mode(
+    value: Option<&serde_json::Value>,
+) -> Result<WorkflowChatProgressMode, String> {
     let Some(value) = value else {
         return Ok(WorkflowChatProgressMode::Auto);
     };
@@ -635,10 +635,16 @@ mod tests {
         assert_eq!(row.state, WorkflowChatProgressRowState::Complete);
         assert_eq!(row.run_id, None, "an omitted runId CLEARS the stale one");
         assert_eq!(row.duration_ms, Some(42));
-        assert_eq!(row.label.as_deref(), Some("Lane A"), "trimmed, and kept when omitted or blank");
+        assert_eq!(
+            row.label.as_deref(),
+            Some("Lane A"),
+            "trimmed, and kept when omitted or blank"
+        );
         assert_eq!(row.phase.as_deref(), Some("verify"), "reused updates phase");
         assert_eq!(
-            row.preflight.as_ref().and_then(|lane| lane.decision.as_deref()),
+            row.preflight
+                .as_ref()
+                .and_then(|lane| lane.decision.as_deref()),
             Some("first"),
             "the first lane wins; the second lookup cannot overwrite it"
         );

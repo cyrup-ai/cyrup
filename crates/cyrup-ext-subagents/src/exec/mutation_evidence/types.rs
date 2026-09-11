@@ -316,7 +316,10 @@ mod tests {
 
     use super::*;
 
-    fn minimal_summary(termination: Termination, recovery: Option<RecoveryNeeded>) -> TimeoutRecoverySummary {
+    fn minimal_summary(
+        termination: Termination,
+        recovery: Option<RecoveryNeeded>,
+    ) -> TimeoutRecoverySummary {
         TimeoutRecoverySummary {
             termination,
             changed_files: Vec::new(),
@@ -351,7 +354,10 @@ mod tests {
             json.get("reason"),
             Some(&serde_json::json!("timed-out-with-dirty-worktree"))
         );
-        assert_eq!(json.get("termination"), Some(&serde_json::json!("timed-out")));
+        assert_eq!(
+            json.get("termination"),
+            Some(&serde_json::json!("timed-out"))
+        );
         let round: TimeoutRecoverySummary = serde_json::from_value(json).unwrap();
         assert_eq!(round, some);
 
@@ -410,11 +416,23 @@ mod tests {
         assert_eq!(projection.changed_files.len(), MAX_TIMEOUT_FILES);
         assert!(projection.truncated, "its own slice dropped entries");
         assert!(projection.recovery_needed);
-        assert_eq!(projection.reason, Some(RecoveryReason::TimedOutWithDirtyWorktree));
+        assert_eq!(
+            projection.reason,
+            Some(RecoveryReason::TimedOutWithDirtyWorktree)
+        );
         assert_eq!(projection.report_status, Some(ReportStatus::Missing));
         let json = serde_json::to_value(&projection).unwrap();
-        for leaked in ["message", "warning", "sessionFile", "transcriptPath", "artifactPaths"] {
-            assert!(json.get(leaked).is_none(), "{leaked} must never cross into a projection");
+        for leaked in [
+            "message",
+            "warning",
+            "sessionFile",
+            "transcriptPath",
+            "artifactPaths",
+        ] {
+            assert!(
+                json.get(leaked).is_none(),
+                "{leaked} must never cross into a projection"
+            );
         }
     }
 
@@ -439,7 +457,10 @@ mod tests {
             unavailable: None,
         };
         let json = serde_json::to_value(&snapshot).unwrap();
-        assert_eq!(json.get("source"), Some(&serde_json::json!("tracked-files")));
+        assert_eq!(
+            json.get("source"),
+            Some(&serde_json::json!("tracked-files"))
+        );
         assert_eq!(json.get("trackedOnly"), Some(&serde_json::json!(true)));
         assert_eq!(json.get("gitRoot"), Some(&serde_json::json!("/repo")));
         assert_eq!(

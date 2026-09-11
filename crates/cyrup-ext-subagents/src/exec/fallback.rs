@@ -555,7 +555,7 @@ const RETRYABLE_MODEL_FAILURE_PATTERNS: &[RetryPattern] = &[
     RetryPattern::Contains(lower!("quota")),
     RetryPattern::Contains(lower!("billing")),
     RetryPattern::Contains(lower!("credit")),
-    RetryPattern::Contains(lower!("auth")),         // /auth(?:entication)?/i
+    RetryPattern::Contains(lower!("auth")), // /auth(?:entication)?/i
     RetryPattern::Contains(lower!("unauthorized")), // /unauthori[sz]ed/i, US spelling
     RetryPattern::Contains(lower!("unauthorised")), // /unauthori[sz]ed/i, UK spelling
     RetryPattern::Contains(lower!("forbidden")),
@@ -574,7 +574,15 @@ const RETRYABLE_MODEL_FAILURE_PATTERNS: &[RetryPattern] = &[
     // connection is a provider failure. The same commit narrowed the ladder gate to
     // `isRetryableModelFailureAttempt` so this broader text never re-runs a child that already
     // did work — the two halves ship together.
-    RetryPattern::WsThenAny(lower!("connection"), &[lower!("error"), lower!("reset"), lower!("closed"), lower!("aborted")]), // /connection\s+(?:error|reset|closed|aborted)/i
+    RetryPattern::WsThenAny(
+        lower!("connection"),
+        &[
+            lower!("error"),
+            lower!("reset"),
+            lower!("closed"),
+            lower!("aborted"),
+        ],
+    ), // /connection\s+(?:error|reset|closed|aborted)/i
     RetryPattern::Contains(lower!("connection refused")),
     RetryPattern::Contains(lower!("fetch failed")),
     RetryPattern::Contains(lower!("network error")),
@@ -585,13 +593,16 @@ const RETRYABLE_MODEL_FAILURE_PATTERNS: &[RetryPattern] = &[
     RetryPattern::Contains(lower!("upstream")),
     RetryPattern::OptionalWordBetween(lower!("time"), lower!("d"), lower!(" out")), // /timed? out/i
     RetryPattern::Contains(lower!("timeout")),
-    RetryPattern::WordNumber(lower!("502")),                    // /\b502\b/
-    RetryPattern::WordNumber(lower!("503")),                    // /\b503\b/
-    RetryPattern::WordNumber(lower!("504")),                    // /\b504\b/
+    RetryPattern::WordNumber(lower!("502")), // /\b502\b/
+    RetryPattern::WordNumber(lower!("503")), // /\b503\b/
+    RetryPattern::WordNumber(lower!("504")), // /\b504\b/
     RetryPattern::OptionalCharBetween(lower!("cold"), lower!("start")), // /cold.?start/i
     RetryPattern::Contains(lower!("empty response")),
     RetryPattern::Contains(lower!("no output")),
-    RetryPattern::ThenAny(lower!("model"), &[lower!("load"), lower!("fail"), lower!("error")]), // /model.*(?:load|fail|error)/i
+    RetryPattern::ThenAny(
+        lower!("model"),
+        &[lower!("load"), lower!("fail"), lower!("error")],
+    ), // /model.*(?:load|fail|error)/i
 ];
 
 /// pi `CONTEXT_OVERFLOW_PATTERNS` (`model-fallback.ts:631-643`), in declaration order, re-typed
@@ -629,16 +640,16 @@ const CONTEXT_OVERFLOW_PATTERNS: &[RetryPattern] = &[
     RetryPattern::WsThenAny(lower!("context length"), CONTEXT_OVERFLOW_TAILS),
     RetryPattern::WsThenAny(lower!("context window"), CONTEXT_OVERFLOW_TAILS),
     RetryPattern::WsThenAny(lower!("context limit"), CONTEXT_OVERFLOW_TAILS),
-    RetryPattern::Contains(lower!("maximum context length")),  // /maximum context length/i
-    RetryPattern::Contains(lower!("too many tokens")),         // /too many tokens/i
-    RetryPattern::Contains(lower!("token limit")),             // /token limit/i
+    RetryPattern::Contains(lower!("maximum context length")), // /maximum context length/i
+    RetryPattern::Contains(lower!("too many tokens")),        // /too many tokens/i
+    RetryPattern::Contains(lower!("token limit")),            // /token limit/i
     RetryPattern::Contains(lower!("context_length_exceeded")), // /context_length_exceeded/i
-    RetryPattern::Contains(lower!("length_required")),         // /length_required/i
-    RetryPattern::Then(lower!("maximum"), lower!("tokens")),           // /maximum.*tokens/i
-    RetryPattern::Then(lower!("prompt"), lower!("too long")),          // /prompt.*too long/i
-    RetryPattern::Then(lower!("input"), lower!("too long")),           // /input.*too long/i
-    RetryPattern::Then(lower!("exceeded"), lower!("context")),         // /exceeded.*context/i
-    RetryPattern::Then(lower!("context"), lower!("overflow")),         // /context.*overflow/i
+    RetryPattern::Contains(lower!("length_required")),        // /length_required/i
+    RetryPattern::Then(lower!("maximum"), lower!("tokens")),  // /maximum.*tokens/i
+    RetryPattern::Then(lower!("prompt"), lower!("too long")), // /prompt.*too long/i
+    RetryPattern::Then(lower!("input"), lower!("too long")),  // /input.*too long/i
+    RetryPattern::Then(lower!("exceeded"), lower!("context")), // /exceeded.*context/i
+    RetryPattern::Then(lower!("context"), lower!("overflow")), // /context.*overflow/i
 ];
 
 /// The shared tail alternation of pi's first context-overflow regex,
@@ -933,8 +944,11 @@ pub fn is_context_overflow(error: Option<&str>) -> bool {
     // `is_retryable_model_failure`'s iteration and required by `line_matches`' contract. A
     // `Contains` needle holds no `\n`, so it cannot straddle one either: per-line is equivalent
     // for those and strictly correct for the rest.
-    LoweredLine::split(&haystack)
-        .any(|line| CONTEXT_OVERFLOW_PATTERNS.iter().any(|p| line_matches(line, p)))
+    LoweredLine::split(&haystack).any(|line| {
+        CONTEXT_OVERFLOW_PATTERNS
+            .iter()
+            .any(|p| line_matches(line, p))
+    })
 }
 
 /// The prefix/suffix of pi's second empty-output sentinel — `Subagent produced no output after
@@ -3284,8 +3298,8 @@ mod tests {
 
     #[test]
     fn format_attempt_note_includes_failed_and_next_model_and_trimmed_error() {
-        let note = format_attempt_note(&model("a"), Some("  429 rate limit  "), &model("b"))
-            .to_string();
+        let note =
+            format_attempt_note(&model("a"), Some("  429 rate limit  "), &model("b")).to_string();
         assert!(note.contains("a"));
         assert!(note.contains("b"));
         assert!(note.contains("429 rate limit"));
@@ -3866,20 +3880,20 @@ mod tests {
     #[test]
     fn context_overflow_matches_every_upstream_pattern() {
         for msg in [
-            "context exceeded",                          // pattern 1, empty optional branch
-            "context length exceeded",                   // pattern 1, ` length` branch
-            "Context window overflow",                   // pattern 1, ` window` branch
-            "request context limit exceeded",             // pattern 1, ` limit` branch
-            "maximum context length is 8192 tokens",     // /maximum context length/i
-            "request has too many tokens",               // /too many tokens/i
-            "per-minute token limit reached",            // /token limit/i
-            "error code: context_length_exceeded",       // /context_length_exceeded/i
-            "HTTP 411 length_required",                  // /length_required/i
-            "maximum of 4096 tokens per request",        // /maximum.*tokens/i
-            "the prompt you sent is way too long",       // /prompt.*too long/i
-            "input for this model was too long",         // /input.*too long/i
-            "you exceeded the model context",            // /exceeded.*context/i
-            "context buffer overflow detected",          // /context.*overflow/i
+            "context exceeded",                             // pattern 1, empty optional branch
+            "context length exceeded",                      // pattern 1, ` length` branch
+            "Context window overflow",                      // pattern 1, ` window` branch
+            "request context limit exceeded",               // pattern 1, ` limit` branch
+            "maximum context length is 8192 tokens",        // /maximum context length/i
+            "request has too many tokens",                  // /too many tokens/i
+            "per-minute token limit reached",               // /token limit/i
+            "error code: context_length_exceeded",          // /context_length_exceeded/i
+            "HTTP 411 length_required",                     // /length_required/i
+            "maximum of 4096 tokens per request",           // /maximum.*tokens/i
+            "the prompt you sent is way too long",          // /prompt.*too long/i
+            "input for this model was too long",            // /input.*too long/i
+            "you exceeded the model context",               // /exceeded.*context/i
+            "context buffer overflow detected",             // /context.*overflow/i
             "first line is fine\nsecond line: token limit", // per-line, later line matches
         ] {
             assert!(is_context_overflow(Some(msg)), "{msg}");
@@ -4042,7 +4056,10 @@ mod tests {
         ]);
         let outcome = run_fallback_ladder(&candidates, &mut runner).await;
 
-        assert!(runner.calls[0].1.is_empty(), "first launch carries no notes");
+        assert!(
+            runner.calls[0].1.is_empty(),
+            "first launch carries no notes"
+        );
         assert_eq!(runner.calls[1].1.len(), 1);
         assert_eq!(
             runner.calls[2].1.len(),

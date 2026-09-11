@@ -91,10 +91,9 @@ impl SubagentExecutor {
             // cosmetic: `JobTracker`'s run ids are a CANDIDATE SOURCE for the result watcher
             // (pi `result-watcher.ts:641`), so an unscoped tracker would silently re-widen the
             // delivery partitioning this change exists to establish.
-            if !crate::background::delivery::SessionGate::Permissive.admits(
-                current_session.as_ref(),
-                outcome.status.session_id.as_ref(),
-            ) {
+            if !crate::background::delivery::SessionGate::Permissive
+                .admits(current_session.as_ref(), outcome.status.session_id.as_ref())
+            {
                 continue;
             }
 

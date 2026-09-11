@@ -172,49 +172,32 @@ pub const KEYRING_HELPER_MAX_BYTES: usize = 1024 * 1024;
 /// [`run_keyring_helper`] and nothing else.
 pub const KEYRING_HELPER_SUBCOMMAND: &str = "__mcp-keyring-helper";
 
-/// `PI_MCP_ADAPTER_TEST_AUTH_STORE` — the backend override, matched by **exact** string equality
-/// against `memory` | `sizelimited` | `unavailable` | `keyrevoked`.
-pub const TEST_AUTH_STORE_ENV: [&str; 2] = [
-    "CYRUP_MCP_TEST_AUTH_STORE",
-    "PI_MCP_ADAPTER_TEST_AUTH_STORE",
-];
+/// The backend override (pi `PI_MCP_ADAPTER_TEST_AUTH_STORE`), matched by **exact** string
+/// equality against `memory` | `sizelimited` | `unavailable` | `keyrevoked`.
+pub const TEST_AUTH_STORE_ENV: &str = "CYRUP_MCP_TEST_AUTH_STORE";
 
-/// `PI_MCP_ADAPTER_DISABLE_AUTH_CACHE` — `== "1"` disables. Any other value (`"true"`, `"0"`, empty)
-/// leaves the cache **enabled** (MCP-259).
-pub const AUTH_CACHE_DISABLED_ENV: [&str; 2] = [
-    "CYRUP_MCP_DISABLE_AUTH_CACHE",
-    "PI_MCP_ADAPTER_DISABLE_AUTH_CACHE",
-];
+/// `== "1"` disables (pi `PI_MCP_ADAPTER_DISABLE_AUTH_CACHE`). Any other value (`"true"`, `"0"`,
+/// empty) leaves the cache **enabled** (MCP-259).
+pub const AUTH_CACHE_DISABLED_ENV: &str = "CYRUP_MCP_DISABLE_AUTH_CACHE";
 
-/// `PI_MCP_ADAPTER_DISABLE_KEYRING_RECOVERY` — `== "1"` disables recovery entirely.
-pub const KEYRING_RECOVERY_DISABLED_ENV: [&str; 2] = [
-    "CYRUP_MCP_DISABLE_KEYRING_RECOVERY",
-    "PI_MCP_ADAPTER_DISABLE_KEYRING_RECOVERY",
-];
+/// `== "1"` disables recovery entirely (pi `PI_MCP_ADAPTER_DISABLE_KEYRING_RECOVERY`).
+pub const KEYRING_RECOVERY_DISABLED_ENV: &str = "CYRUP_MCP_DISABLE_KEYRING_RECOVERY";
 
-/// `PI_MCP_ADAPTER_KEYRING_RECOVERY_KEYCTL` — overrides the `keyctl` program path (trimmed; blank ⇒
-/// `"keyctl"`).
-pub const KEYRING_RECOVERY_KEYCTL_ENV: [&str; 2] = [
-    "CYRUP_MCP_KEYRING_RECOVERY_KEYCTL",
-    "PI_MCP_ADAPTER_KEYRING_RECOVERY_KEYCTL",
-];
+/// Overrides the `keyctl` program path (trimmed; blank ⇒ `"keyctl"`; pi
+/// `PI_MCP_ADAPTER_KEYRING_RECOVERY_KEYCTL`).
+pub const KEYRING_RECOVERY_KEYCTL_ENV: &str = "CYRUP_MCP_KEYRING_RECOVERY_KEYCTL";
 
-/// `PI_MCP_ADAPTER_KEYRING_RECOVERY_HELPER` — overrides the helper. Upstream's default resolves
+/// Overrides the helper (pi `PI_MCP_ADAPTER_KEYRING_RECOVERY_HELPER`). Upstream's default resolves
 /// `./mcp-keyring-helper.cjs` against `import.meta.url`; the port's default is
 /// `std::env::current_exe()`, so this now names a **program** rather than a script.
 ///
 /// `PI_MCP_ADAPTER_KEYRING_RECOVERY_NODE` deliberately **does not port**: it names a JavaScript
 /// interpreter and there is none (13f *Out of scope*).
-pub const KEYRING_RECOVERY_HELPER_ENV: [&str; 2] = [
-    "CYRUP_MCP_KEYRING_RECOVERY_HELPER",
-    "PI_MCP_ADAPTER_KEYRING_RECOVERY_HELPER",
-];
+pub const KEYRING_RECOVERY_HELPER_ENV: &str = "CYRUP_MCP_KEYRING_RECOVERY_HELPER";
 
-/// `PI_MCP_ADAPTER_TEST_LINUX_KEYRING_RECOVERY` — `== "1"` forces the recovery path on non-Linux.
-pub const TEST_LINUX_KEYRING_RECOVERY_ENV: [&str; 2] = [
-    "CYRUP_MCP_TEST_LINUX_KEYRING_RECOVERY",
-    "PI_MCP_ADAPTER_TEST_LINUX_KEYRING_RECOVERY",
-];
+/// `== "1"` forces the recovery path on non-Linux (pi
+/// `PI_MCP_ADAPTER_TEST_LINUX_KEYRING_RECOVERY`).
+pub const TEST_LINUX_KEYRING_RECOVERY_ENV: &str = "CYRUP_MCP_TEST_LINUX_KEYRING_RECOVERY";
 
 /// The `source` label every store-side parse failure is reported against.
 const STORE_SOURCE: &str = "OS secure credential store";
@@ -232,17 +215,15 @@ pub fn process_env() -> EnvFn {
     Arc::new(|key: &str| std::env::var(key).ok())
 }
 
-/// Dual-read `CYRUP_MCP_<SUFFIX>` then `PI_MCP_ADAPTER_<SUFFIX>` (MCP-282) — the convention
-/// `cyrup_config::env` already uses for `["CYRUP_AGENT_DIR", "PI_CODING_AGENT_DIR"]` and
-/// `cyrup_provider::auth::oauth::callback` for `["CYRUP_OAUTH_CALLBACK_HOST", "PI_OAUTH_CALLBACK_HOST"]`.
-/// `CYRUP_*` wins.
-fn env_first(env: &EnvFn, names: &[&str; 2]) -> Option<String> {
-    names.iter().find_map(|name| env(name))
+/// Single-name read of a `CYRUP_MCP_<SUFFIX>` variable (MCP-282; the upstream
+/// `PI_MCP_ADAPTER_<SUFFIX>` spellings are no longer honoured — hard rename).
+fn env_lookup(env: &EnvFn, name: &str) -> Option<String> {
+    env(name)
 }
 
 /// `process.env[X] === '1'` — strict, so `"true"` and `"0"` do **not** trip it.
-fn env_is_one(env: &EnvFn, names: &[&str; 2]) -> bool {
-    env_first(env, names).as_deref() == Some("1")
+fn env_is_one(env: &EnvFn, name: &str) -> bool {
+    env_lookup(env, name).as_deref() == Some("1")
 }
 
 /// Seconds since the Unix epoch. A clock before the epoch yields `0` rather than panicking.
@@ -1266,7 +1247,7 @@ impl AuthSecretStore for FailingRemoveStore {
 /// needs it. `cyrup_ext::caps::proc::ProcCaps`'s `with_kill_grace` / `with_write_stdin_timeout` are
 /// the in-tree precedent for exactly this shape.
 fn select_backend(env: &EnvFn, service: &str) -> Arc<dyn AuthSecretStore> {
-    match env_first(env, &TEST_AUTH_STORE_ENV)
+    match env_lookup(env, TEST_AUTH_STORE_ENV)
         .as_deref()
         .and_then(SimulatedFault::from_env_value)
     {
@@ -1317,10 +1298,10 @@ pub fn cause_chain_contains_key_revoked(error: &(dyn std::error::Error + 'static
 /// `isLinuxKeyringRecoveryEnabled()` — disabled by `…_DISABLE_KEYRING_RECOVERY == "1"`; otherwise
 /// enabled on Linux, or anywhere when `…_TEST_LINUX_KEYRING_RECOVERY == "1"`.
 fn is_linux_keyring_recovery_enabled(env: &EnvFn) -> bool {
-    if env_is_one(env, &KEYRING_RECOVERY_DISABLED_ENV) {
+    if env_is_one(env, KEYRING_RECOVERY_DISABLED_ENV) {
         return false;
     }
-    cfg!(target_os = "linux") || env_is_one(env, &TEST_LINUX_KEYRING_RECOVERY_ENV)
+    cfg!(target_os = "linux") || env_is_one(env, TEST_LINUX_KEYRING_RECOVERY_ENV)
 }
 
 /// `shouldAttemptLinuxKeyringRecovery(error)` — **both** halves required.
@@ -1392,12 +1373,12 @@ impl RecoveryInvocation {
     /// `PI_MCP_ADAPTER_KEYRING_RECOVERY_NODE` has no counterpart: after MCP-260 the re-execed
     /// program *is* the `cyrup` binary and there is no interpreter to name.
     fn resolve(env: &EnvFn) -> Result<Self, AuthSecretStoreError> {
-        let keyctl = env_first(env, &KEYRING_RECOVERY_KEYCTL_ENV)
+        let keyctl = env_lookup(env, KEYRING_RECOVERY_KEYCTL_ENV)
             .map(|raw| raw.trim().to_string())
             .filter(|trimmed| !trimmed.is_empty())
             .unwrap_or_else(|| "keyctl".to_string());
 
-        match env_first(env, &KEYRING_RECOVERY_HELPER_ENV)
+        match env_lookup(env, KEYRING_RECOVERY_HELPER_ENV)
             .map(|raw| raw.trim().to_string())
             .filter(|trimmed| !trimmed.is_empty())
         {
@@ -2189,7 +2170,7 @@ impl McpAuthStore {
     /// (MCP-259).
     #[must_use]
     pub fn is_cache_enabled(&self) -> bool {
-        !env_is_one(&self.inner.env, &AUTH_CACHE_DISABLED_ENV)
+        !env_is_one(&self.inner.env, AUTH_CACHE_DISABLED_ENV)
     }
 
     /// `resetAuthEntryCache()` — clears the cache **only**, leaving the backend read counter alone.
@@ -4373,7 +4354,7 @@ mod tests {
         for (value, expected_reads) in [("1", 2_u64), ("true", 1), ("0", 1), ("", 1)] {
             let owned = value.to_string();
             let (store, backend, _dir) = store_with_env(Arc::new(move |key: &str| {
-                (key == AUTH_CACHE_DISABLED_ENV[1]).then(|| owned.clone())
+                (key == AUTH_CACHE_DISABLED_ENV).then(|| owned.clone())
             }));
             assert!(store.auth_entry("srv").unwrap().is_none());
             assert!(store.auth_entry("srv").unwrap().is_none());
@@ -4382,14 +4363,14 @@ mod tests {
     }
 
     #[test]
-    fn cyrup_prefixed_names_win_the_dual_read() {
+    fn the_dropped_pi_spelling_is_ignored() {
+        // Hard rename: `PI_MCP_ADAPTER_DISABLE_AUTH_CACHE=1` must NOT disable the cache.
         let env: EnvFn = Arc::new(|key: &str| match key {
-            "CYRUP_MCP_DISABLE_AUTH_CACHE" => Some("1".to_string()),
-            "PI_MCP_ADAPTER_DISABLE_AUTH_CACHE" => Some("0".to_string()),
+            "PI_MCP_ADAPTER_DISABLE_AUTH_CACHE" => Some("1".to_string()),
             _ => None,
         });
         let (store, _backend, _dir) = store_with_env(env);
-        assert!(!store.is_cache_enabled());
+        assert!(store.is_cache_enabled());
     }
 
     #[test]
@@ -4489,9 +4470,8 @@ mod tests {
                 std::io::Error::other("KeyRevoked"),
             ))),
         };
-        let forced: EnvFn = Arc::new(|key: &str| {
-            (key == TEST_LINUX_KEYRING_RECOVERY_ENV[0]).then(|| "1".to_string())
-        });
+        let forced: EnvFn =
+            Arc::new(|key: &str| (key == TEST_LINUX_KEYRING_RECOVERY_ENV).then(|| "1".to_string()));
         assert!(should_attempt_recovery(&forced, &revoked));
 
         let disabled: EnvFn = Arc::new(|key: &str| match key {

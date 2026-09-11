@@ -68,11 +68,19 @@ fn async_dir_for_run(cwd: &Path, run_id: &RunId, roots: &crate::paths::Roots) ->
 /// pi's `details` for a confirmed async launch — `{ mode, runId, results: [], asyncId, asyncDir }`
 /// (`runs/background/async-execution.ts:1191` and `:1563` @v0.43.0), shared by all three async
 /// arms so the `asyncDir` key can never again be present on one and missing on another.
+///
+/// `surface` adds cyrup's own `resolvedTools` key. **[CYRUP-DELTA], no upstream analog.** An async
+/// launch returns BEFORE any child settles, so this reply is the parent's only synchronous chance
+/// to learn what the child it just started can actually do — and subagent tools are not inherited
+/// from the launching session, which is precisely the assumption an async launch is most likely to
+/// have made silently. `None` omits the key entirely, which is what the PARALLEL and CHAIN arms
+/// pass: those name many agents, and one flattened surface would be a claim about none of them.
 pub(crate) fn async_launch_details(
     mode: &str,
     run_id: &RunId,
     cwd: &Path,
     roots: &crate::paths::Roots,
+    surface: Option<&crate::exec::tool_surface::ResolvedToolSurface>,
 ) -> serde_json::Value {
     let mut details = serde_json::Map::new();
     details.insert(
@@ -93,6 +101,14 @@ pub(crate) fn async_launch_details(
             "asyncDir".to_string(),
             serde_json::Value::String(dir.to_string_lossy().into_owned()),
         );
+    }
+    // Appended LAST so every pi-shaped key above keeps its position for a consumer reading the
+    // payload positionally. A serialization failure degrades to "the key is absent" rather than
+    // failing a launch that already succeeded.
+    if let Some(surface) = surface
+        && let Ok(value) = serde_json::to_value(surface)
+    {
+        details.insert("resolvedTools".to_string(), value);
     }
     serde_json::Value::Object(details)
 }
@@ -1122,6 +1138,7 @@ mod tests {
             &run_id,
             dir.path(),
             &crate::paths::Roots::from_env(),
+            None,
         );
         assert_eq!(details.get("mode").and_then(|v| v.as_str()), Some("single"));
         assert_eq!(
@@ -1190,6 +1207,7 @@ mod tests {
             &run_id,
             dir.path(),
             &crate::paths::Roots::from_env(),
+            None,
         );
         let async_dir = PathBuf::from(
             details

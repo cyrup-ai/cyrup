@@ -78,13 +78,13 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::event::AgentSessionEvent;
 use crate::host_services::InjectRequest;
-use cyrup_ext::host::InjectOutcome;
-use inject::merge_injection_batch;
-use run::InjectionOffer;
 use crate::provider_swap::ProviderSwap;
 use crate::services::AgentSessionServices;
 use crate::subscriber::Fanout;
 use crate::tools::DynamicToolState;
+use cyrup_ext::host::InjectOutcome;
+use inject::merge_injection_batch;
+use run::InjectionOffer;
 
 use adapters::{SessionActivityHandle, SessionCatalogHandle};
 

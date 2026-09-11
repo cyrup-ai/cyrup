@@ -97,7 +97,7 @@ pub struct SessionConfig {
     /// cli/startup-ui.ts:73).
     ///
     /// Defaults to `false` so an SDK embedder's `build()` performs no network I/O it did not ask
-    /// for. The bin sets it to `!(--offline || CYRUP_OFFLINE || PI_OFFLINE)` (`main.rs`), which is
+    /// for. The bin sets it to `!(--offline || CYRUP_OFFLINE)` (`main.rs`), which is
     /// pi's own gate — `isOfflineModeEnabled()`, package-manager.ts:42-46, consulted at `:1261`.
     pub install_missing_packages: bool,
     /// Runtime mode (drives non-prompting trust + the extension `ctx.mode`/`ctx.hasUI`).
@@ -441,6 +441,28 @@ fn select_active_tools(
         .filter(|t| keep(t.name()) && !exclude.contains(t.name()))
         .cloned()
         .collect()
+}
+
+/// pi `sdk.ts:258`'s `allowedToolNames` —
+/// `options.tools ?? (options.noTools === "all" ? [] : undefined)` — the SESSION-level allowlist.
+///
+/// A DIFFERENT value from [`select_active_tools`]' initial BUILT-IN selection (`sdk.ts:261-262`),
+/// and the arms below are deliberately written in the same shape and order as that function's
+/// `keep` closure so the two can be diffed by eye. They part company on exactly one arm:
+/// [`NoTools::Builtin`] empties the built-in selection but leaves `allowedToolNames` `undefined`,
+/// which is what keeps extension tools active (`agent-session.ts:406-410` → `:2742-2745`). Narrowing
+/// that arm to `Some(∅)` is the one way to over-filter and would break plan-mode and the permission
+/// companion; see [`NoTools`]'s own doc.
+///
+/// `None` is "nothing pinned the surface"; `Some(∅)` — which an explicit `tools: []` and
+/// `NoTools::All` both produce — is an allowlist that denies everything.
+fn resolve_allowed_tool_names(cfg: &SessionConfig) -> Option<std::collections::HashSet<String>> {
+    match (&cfg.tools, cfg.no_tools) {
+        // Explicit allowlist wins (Pi `options.tools`), INCLUDING an explicit empty one.
+        (Some(allow), _) => Some(allow.iter().cloned().collect()),
+        (None, Some(NoTools::All)) => Some(std::collections::HashSet::new()),
+        (None, Some(NoTools::Builtin)) | (None, None) => None,
+    }
 }
 
 /// A synthetic-skill override closure (Pi `DefaultResourceLoader.skillsOverride`): transforms the
@@ -1074,6 +1096,14 @@ impl SessionBuilder {
         let configured_default_tools = settings.effective().default_tools();
         let base_tools = select_active_tools(&visible, &cfg, configured_default_tools.as_deref());
         let read_available = base_tools.iter().any(|t| t.name() == "read");
+        // pi `AgentSession._allowedToolNames` / `_excludedToolNames` (`sdk.ts:258-259` →
+        // `agent-session.ts:395-396`). Resolved HERE, next to the built-in selection they are
+        // derived from and ahead of BOTH consumers — `ext_host.active_tools_filtered` below and the
+        // `AgentSessionServices` literal that carries them to `refresh_extension_tools` — so one
+        // binding serves both and the two paths cannot drift.
+        let allowed_tool_names = resolve_allowed_tool_names(&cfg);
+        let excluded_tool_names: std::collections::HashSet<String> =
+            cfg.exclude_tools.iter().cloned().collect();
 
         // ---- 4a. the LIVE host-services backend (arch-08 §5.6) — built BEFORE the extension host so
         // the SAME instance is injected into every wasm load (auto-discovery here + an explicit
@@ -1244,7 +1274,7 @@ impl SessionBuilder {
         // is CLONED during assembly unless `isOfflineModeEnabled()` (package-manager.ts:1260-1271).
         // The flag is threaded rather than read here because `cyrup-resources` performs no env
         // lookups and this crate has no `NetworkPolicy`; the bin resolves `--offline`/`CYRUP_OFFLINE`
-        // /`PI_OFFLINE` and sets it (`cyrup/src/main.rs`).
+        // and sets it (`cyrup/src/main.rs`).
         disc.install_missing_packages = cfg.install_missing_packages;
         let report = discover(&disc, cancel.token()).await?;
         // TUI-006: the discovery pass's structured diagnostics (shadowed same-name skills, a
@@ -1496,7 +1526,16 @@ impl SessionBuilder {
         // an extension OVERRIDE of a built-in contributes the override's text, not the built-in's.
         // In cyrup neither happened: a guest could register a fully-described tool and the model
         // was never told it existed.
-        let active_tools = ext_host.active_tools(&base_tools)?;
+        // #2835: FILTERED. `--tools`/`--no-tools` must bound the extension-contributed tools too,
+        // not only the built-ins already selected into `base_tools` (pi applies `isAllowedTool` to
+        // `allCustomTools`, `agent-session.ts:2680-2686`). One filter here is enough for BOTH the
+        // model's tool array and the system prompt: `prompt_tools` below starts from the
+        // already-filtered `base_tools` and can only GROW by entries drawn from this value.
+        let active_tools = ext_host.active_tools_filtered(
+            &base_tools,
+            allowed_tool_names.as_ref(),
+            &excluded_tool_names,
+        )?;
 
         // pi's `definitionRegistry`: base first, then each custom/extension tool `set` over it by
         // NAME — so an override replaces the built-in's entry rather than adding a second one, and
@@ -1701,7 +1740,7 @@ impl SessionBuilder {
         ));
         let eff = settings.effective();
         // Provider attribution + opencode session headers (Pi sdk.ts:323-330, #20). Telemetry is the
-        // env override (`CYRUP_TELEMETRY`/`PI_TELEMETRY`) else the `enableInstallTelemetry` setting.
+        // env override (`CYRUP_TELEMETRY`) else the `enableInstallTelemetry` setting.
         let env = cyrup_config::EnvVars::from_process();
         let telemetry_enabled = env
             .telemetry
@@ -2050,6 +2089,8 @@ impl SessionBuilder {
             catalog_overlay,
             context: context_store,
             ext_host,
+            allowed_tool_names,
+            excluded_tool_names,
             guest_providers,
             model: resolved_model,
             system_prompt,
@@ -3491,4 +3532,171 @@ mod tests {
         );
         assert_eq!(model.cost.output, 75.0);
     }
+
+    // ================================================================================================
+    // #2835 — `--tools` must bound the EXTENSION tools too, not only the built-ins.
+    //
+    // Driven against the real seam rather than a whole `SessionBuilder::build()`, which is this
+    // crate's house pattern for tool-surface tests (`host_services.rs`'s `all_tools` pair calls
+    // `attach_dynamic_tools` directly for the same reason). `session_surface` below reproduces
+    // `build()`'s own three steps verbatim — `select_active_tools`, then
+    // `resolve_allowed_tool_names` + `active_tools_filtered`, then the `prompt_tools` merge — so a
+    // change to any of them reaches these assertions.
+    // ================================================================================================
+
+    struct DynamicToolExt;
+    #[async_trait::async_trait]
+    impl cyrup_ext::NativeExtension for DynamicToolExt {
+        fn id(&self) -> cyrup_core::ExtensionId {
+            "dynamic".into()
+        }
+        async fn init(&self, api: &mut cyrup_ext::InitApi) -> Result<(), cyrup_ext::ExtError> {
+            api.register_tool(std::sync::Arc::new(NamedTool(
+                "dynamic_tool",
+                serde_json::json!({}),
+            )));
+            Ok(())
+        }
+        async fn on_event(
+            &self,
+            _ev: &cyrup_ext::HostEvent,
+            _ctx: &cyrup_ext::HostCtx,
+        ) -> cyrup_ext::HookOutcome {
+            cyrup_ext::HookOutcome::Noop
+        }
+    }
+
+    /// The active tool set and the prompt-visible tool set a session would build from `cfg`, with
+    /// one extension contributing `dynamic_tool`.
+    ///
+    /// Returns `(active, prompt)`. They are separate because pi's #2835 test asserts on
+    /// `getActiveToolNames()` AND on `systemPrompt`; in cyrup both derive from `prompt_tools`, and
+    /// the point of the second is that ONE filter at the `active_tools_filtered` call covers both.
+    async fn session_surface(cfg: &super::SessionConfig) -> (Vec<String>, Vec<String>) {
+        let host = cyrup_ext::ExtensionHost::new(cyrup_ext::HostConfig {
+            mode: cyrup_ext::ExtMode::Tui,
+            has_ui: false,
+            cwd: std::path::PathBuf::from("."),
+        });
+        host.load_native(std::sync::Arc::new(DynamicToolExt))
+            .await
+            .unwrap();
+
+        // `builder.rs`: the built-in selection, then the session-level allow/deny pair.
+        let visible: Vec<std::sync::Arc<dyn cyrup_core::Tool>> = ALL_BUILTIN_TOOLS
+            .iter()
+            .copied()
+            .map(|name| {
+                std::sync::Arc::new(NamedTool(name, serde_json::json!({})))
+                    as std::sync::Arc<dyn cyrup_core::Tool>
+            })
+            .collect();
+        let base_tools = super::select_active_tools(&visible, cfg, None);
+        let allowed = super::resolve_allowed_tool_names(cfg);
+        let excluded: std::collections::HashSet<String> = cfg.exclude_tools.iter().cloned().collect();
+
+        let active_tools = host
+            .active_tools_filtered(&base_tools, allowed.as_ref(), &excluded)
+            .unwrap();
+
+        // `builder.rs`'s `prompt_tools`: base first, then each extension tool `set` over it by name.
+        let mut prompt_tools: Vec<std::sync::Arc<dyn cyrup_core::Tool>> = base_tools.clone();
+        for t in active_tools.iter() {
+            if let Some(slot) = prompt_tools.iter_mut().find(|b| b.name() == t.name()) {
+                *slot = t.clone();
+            } else {
+                prompt_tools.push(t.clone());
+            }
+        }
+
+        let mut active: Vec<String> = active_tools.iter().map(|t| t.name().to_string()).collect();
+        let mut prompt: Vec<String> = prompt_tools.iter().map(|t| t.name().to_string()).collect();
+        active.sort();
+        prompt.sort();
+        (active, prompt)
+    }
+
+    /// pi #2835, "allows only explicitly listed built-in and extension tools". The allowlist names
+    /// one built-in and one EXTENSION tool; nothing else survives, in the prompt either.
+    ///
+    /// **Failed before this change**: `active_tools` appended every registered extension tool
+    /// unconditionally, so `dynamic_tool` arrived whether or not it was listed — and so did every
+    /// other ambient extension tool.
+    #[tokio::test]
+    async fn a_tools_allowlist_filters_extension_tools() {
+        let mut cfg = super::SessionConfig::new("/tmp", "/tmp/agent");
+        cfg.tools = Some(names(&["read", "dynamic_tool"]));
+
+        let (active, prompt) = session_surface(&cfg).await;
+        assert_eq!(active, names(&["dynamic_tool", "read"]));
+        assert_eq!(
+            prompt,
+            names(&["dynamic_tool", "read"]),
+            "one filter must narrow the system prompt too: `prompt_tools` starts from the \
+             already-filtered base and grows only by `active_tools` entries"
+        );
+        assert!(!prompt.contains(&"bash".to_string()));
+        assert!(!prompt.contains(&"edit".to_string()));
+    }
+
+    /// pi #2835, "disables all tools when the allowlist is empty". `tools: []` is a CONFIGURED empty
+    /// allowlist (`Some(∅)`), not "unset" — it denies everything, extension tools included.
+    ///
+    /// **Failed before this change**: the built-ins went to zero and every extension tool survived.
+    #[tokio::test]
+    async fn an_empty_allowlist_disables_extension_tools_too() {
+        let mut cfg = super::SessionConfig::new("/tmp", "/tmp/agent");
+        cfg.tools = Some(Vec::new());
+
+        let (active, prompt) = session_surface(&cfg).await;
+        assert!(active.is_empty(), "got {active:?}");
+        assert!(prompt.is_empty(), "the prompt would say `(none)`; got {prompt:?}");
+    }
+
+    /// The ONE way to over-filter, guarded. `--no-builtin-tools` empties the BUILT-IN selection but
+    /// leaves pi's `allowedToolNames` `undefined` (`sdk.ts:258`), so every extension tool stays
+    /// active. Narrowing this arm to `Some(∅)` would break plan-mode and the permission companion.
+    #[tokio::test]
+    async fn no_builtin_tools_still_keeps_extension_tools() {
+        let mut cfg = super::SessionConfig::new("/tmp", "/tmp/agent");
+        cfg.no_tools = Some(super::NoTools::Builtin);
+
+        assert!(
+            super::resolve_allowed_tool_names(&cfg).is_none(),
+            "`NoTools::Builtin` must resolve to NO allowlist, not to an empty one"
+        );
+        let (active, _) = session_surface(&cfg).await;
+        assert_eq!(active, names(&["dynamic_tool"]));
+    }
+
+    /// `NoTools::All` is the arm that DOES deny everything — the pair that proves the two variants
+    /// are not interchangeable.
+    #[tokio::test]
+    async fn no_tools_all_denies_extension_tools() {
+        let mut cfg = super::SessionConfig::new("/tmp", "/tmp/agent");
+        cfg.no_tools = Some(super::NoTools::All);
+
+        assert_eq!(
+            super::resolve_allowed_tool_names(&cfg),
+            Some(std::collections::HashSet::new())
+        );
+        let (active, _) = session_surface(&cfg).await;
+        assert!(active.is_empty(), "got {active:?}");
+    }
+
+    /// pi `excludedToolNames = options.excludeTools` (`sdk.ts:259`) applies to extension tools with
+    /// no allowlist in play at all.
+    #[tokio::test]
+    async fn exclude_tools_removes_an_extension_tool() {
+        let mut cfg = super::SessionConfig::new("/tmp", "/tmp/agent");
+        cfg.exclude_tools = names(&["dynamic_tool"]);
+
+        let (active, _) = session_surface(&cfg).await;
+        assert!(
+            !active.contains(&"dynamic_tool".to_string()),
+            "got {active:?}"
+        );
+        assert!(active.contains(&"read".to_string()), "got {active:?}");
+    }
+
 }

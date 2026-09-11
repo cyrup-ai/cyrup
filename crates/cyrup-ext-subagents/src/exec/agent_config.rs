@@ -704,6 +704,16 @@ pub struct RunOptions {
     ///
     /// It costs production no parameter and defaults to empty.
     pub child_env: std::collections::HashMap<String, String>,
+    /// pi `hostAvailableBuiltins` (`child-tool-plan.ts:198`, carried on the runner ctx/config at
+    /// `subagent-runner.ts:236,702`) — the builtin tool names the LAUNCHING process's host registry
+    /// reported, observed ONCE by [`crate::exec::tool_surface::host_builtin_tool_names`] and threaded
+    /// here unmodified, exactly as every other field in this struct is (nothing is recomputed
+    /// mid-ladder).
+    ///
+    /// `None` means UNKNOWN, never "empty": [`crate::exec::tool_surface::resolve_tool_surface`] skips
+    /// the intersection entirely, so absence of evidence is never reported as evidence of absence.
+    /// `Some(vec![])` is the opposite — a real observation of nothing.
+    pub host_available_builtins: Option<Vec<String>>,
 }
 
 /// A live per-line sink installed via [`RunOptions::live_events`]: [`crate::exec::run_sync`]'s per-attempt driver

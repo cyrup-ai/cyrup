@@ -498,6 +498,14 @@ impl SubagentExecutor {
             // launching session, carried into the one-shot config so the detached runner can stamp
             // it onto `status.json` and every session-scoped listing can honour it.
             session_id: self.current_session_id(),
+            // pi `hostAvailableBuiltins` (`async-execution.ts:976,1392,1775`): the LIVE host tool
+            // registry, observed HERE at plan time — THIS process holds the `HostServices` handle —
+            // and carried into the one-shot config, because the detached runner has no host-services
+            // backend and its own registry is not this one. Without it every async/background run
+            // launches with the host intersection inert.
+            host_available_builtins: crate::exec::tool_surface::host_builtin_tool_names(
+                self.host_services().as_deref(),
+            ),
             // pi `completionOwnerId` — THIS process's identity, minted once per process
             // (`shared/completion-owner.ts:10-14`). Stamped at spawn so the terminal result
             // records who is entitled to consume it; the detached runner cannot derive this,

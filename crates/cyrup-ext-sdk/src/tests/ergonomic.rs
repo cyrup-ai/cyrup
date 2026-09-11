@@ -826,13 +826,16 @@ fn bash_command_decodes_the_host_options_bag() {
         "call-9",
         "echo hi",
         "/work",
-        r#"{"timeoutMs":1500,"env":{"PI_MODEL":"opus"},"envRemove":["SECRET"]}"#,
+        r#"{"timeoutMs":1500,"env":{"CYRUP_MODEL":"opus"},"envRemove":["SECRET"]}"#,
     );
     assert_eq!(cmd.call_id, "call-9");
     assert_eq!(cmd.command, "echo hi");
     assert_eq!(cmd.cwd, "/work");
     assert_eq!(cmd.timeout_ms, Some(1500));
-    assert_eq!(cmd.env, vec![("PI_MODEL".to_string(), "opus".to_string())]);
+    assert_eq!(
+        cmd.env,
+        vec![("CYRUP_MODEL".to_string(), "opus".to_string())]
+    );
     assert_eq!(cmd.env_remove, vec!["SECRET".to_string()]);
 }
 

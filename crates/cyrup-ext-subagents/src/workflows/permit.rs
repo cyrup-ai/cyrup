@@ -344,11 +344,17 @@ mod tests {
         assert_eq!(permit.authorize_host("ci", "  npm test "), Ok(()));
         assert_eq!(
             permit.authorize_host("ci", "rm -rf /"),
-            Err("The command for runs.host('ci') is not allowed for workflow resource 'run-ci'.".to_string())
+            Err(
+                "The command for runs.host('ci') is not allowed for workflow resource 'run-ci'."
+                    .to_string()
+            )
         );
         assert_eq!(
             permit.authorize_host("other", "npm test"),
-            Err("The command for runs.host('other') is not allowed for workflow resource 'run-ci'.".to_string())
+            Err(
+                "The command for runs.host('other') is not allowed for workflow resource 'run-ci'."
+                    .to_string()
+            )
         );
     }
 
@@ -357,8 +363,14 @@ mod tests {
     fn issue_rejects_bad_inputs_with_upstreams_messages() {
         let dup = WorkflowResourceAuthority {
             host: Some(vec![
-                WorkflowResourceHostAuthority { key: key("ci"), command: "a".to_string() },
-                WorkflowResourceHostAuthority { key: key("ci"), command: "b".to_string() },
+                WorkflowResourceHostAuthority {
+                    key: key("ci"),
+                    command: "a".to_string(),
+                },
+                WorkflowResourceHostAuthority {
+                    key: key("ci"),
+                    command: "b".to_string(),
+                },
             ]),
         };
         assert_eq!(
@@ -377,7 +389,10 @@ mod tests {
         };
         assert_eq!(
             WorkflowResourcePermit::issue(input("s", over)).err(),
-            Some("Workflow resource host authority must be an array of at most 32 grants.".to_string())
+            Some(
+                "Workflow resource host authority must be an array of at most 32 grants."
+                    .to_string()
+            )
         );
         let nul = WorkflowResourceAuthority {
             host: Some(vec![WorkflowResourceHostAuthority {
@@ -412,7 +427,9 @@ mod tests {
                 .expect("issues");
         assert_eq!(
             permit.consume("tampered").err(),
-            Some("Workflow resource permit does not match the resolved workflow script.".to_string())
+            Some(
+                "Workflow resource permit does not match the resolved workflow script.".to_string()
+            )
         );
         let consumption = permit.consume("script").expect("still available");
         assert_eq!(consumption.authority.host, None);

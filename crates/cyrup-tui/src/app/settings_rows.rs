@@ -106,8 +106,8 @@ pub(crate) fn settings_rows(
             .with_description("Register skills as /skill:name commands"),
         // TUI-041 — these two getters resolve `setting → env → false`
         // (`cyrup-config/src/settings.rs`, `.unwrap_or(env.hardware_cursor)` /
-        // `.unwrap_or(env.clear_on_shrink)`, sourced from `CYRUP_HARDWARE_CURSOR`/`PI_HARDWARE_CURSOR`
-        // and `CYRUP_CLEAR_ON_SHRINK`/`PI_CLEAR_ON_SHRINK`). The grid used to build both rows against
+        // `.unwrap_or(env.clear_on_shrink)`, sourced from `CYRUP_HARDWARE_CURSOR`
+        // and `CYRUP_CLEAR_ON_SHRINK`). The grid used to build both rows against
         // a **default** `EnvVars`, i.e. an env-blind read, while the RUNTIME used
         // `EnvVars::from_process()` (`crates/cyrup/src/main.rs`) — so with either variable set and
         // nothing persisted, `/settings` reported `false` for behaviour that was on and toggling the

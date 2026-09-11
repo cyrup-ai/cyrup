@@ -52,16 +52,13 @@ const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_REQUEST_HEAD: usize = 8 * 1024;
 
 /// The host the callback server binds — `getCallbackHost()` (`openrouter.ts:25-27`,
-/// `openai-codex.ts:44-46`): the `PI_OAUTH_CALLBACK_HOST` provider-env value, else `127.0.0.1`.
-///
-/// cyrup checks `CYRUP_OAUTH_CALLBACK_HOST` first and keeps `PI_OAUTH_CALLBACK_HOST` as a
-/// lower-precedence fallback, which is this workspace's standing rename convention for pi's
-/// `PI_*` variables (`cyrup-config/src/env.rs:68-91`).
+/// `openai-codex.ts:44-46`): the `CYRUP_OAUTH_CALLBACK_HOST` provider-env value (pi
+/// `PI_OAUTH_CALLBACK_HOST`; the legacy spelling is no longer honoured), else `127.0.0.1`.
 pub async fn callback_host(ctx: &dyn AuthContext, env: Option<&ProviderEnv>) -> String {
-    for name in ["CYRUP_OAUTH_CALLBACK_HOST", "PI_OAUTH_CALLBACK_HOST"] {
-        if let Some(host) = crate::env_api_keys::get_provider_env_value(name, ctx, env).await {
-            return host;
-        }
+    if let Some(host) =
+        crate::env_api_keys::get_provider_env_value("CYRUP_OAUTH_CALLBACK_HOST", ctx, env).await
+    {
+        return host;
     }
     DEFAULT_CALLBACK_HOST.to_string()
 }
@@ -1127,12 +1124,14 @@ mod tests {
         let empty = MapCtx(BTreeMap::new());
         assert_eq!(callback_host(&empty, None).await, "127.0.0.1");
 
+        // The dropped legacy `PI_` spelling is inert — alone it falls back to the default…
         let pi_only = MapCtx(BTreeMap::from([(
             "PI_OAUTH_CALLBACK_HOST".to_string(),
             "0.0.0.0".to_string(),
         )]));
-        assert_eq!(callback_host(&pi_only, None).await, "0.0.0.0");
+        assert_eq!(callback_host(&pi_only, None).await, "127.0.0.1");
 
+        // …and set alongside the real key it never wins.
         let both = MapCtx(BTreeMap::from([
             ("PI_OAUTH_CALLBACK_HOST".to_string(), "0.0.0.0".to_string()),
             ("CYRUP_OAUTH_CALLBACK_HOST".to_string(), "::1".to_string()),

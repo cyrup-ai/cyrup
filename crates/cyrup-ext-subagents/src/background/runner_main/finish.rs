@@ -3,17 +3,16 @@
 //! routes through. Split out of `background/runner_main.rs`; ports
 //! pi `runs/background/subagent-runner.ts`.
 
+use super::config::RunnerConfig;
+use super::events::append_event;
+use super::turn_loop::LoopOutcome;
+use crate::background::atomic::write_atomic_json;
 use crate::background::result_index::{self, ResultWrite};
 use crate::background::{ResultFile, RunMode, RunPaths, RunState, RunStatus};
-use crate::background::atomic::write_atomic_json;
 use crate::error::SubagentError;
 use crate::exec::SingleResult;
 use crate::jsonl::BoundedJsonlWriter;
 use std::path::PathBuf;
-use super::config::RunnerConfig;
-use super::events::append_event;
-use super::turn_loop::LoopOutcome;
-
 
 /// Fold [`run_inner`](super::turn_loop::run_inner)'s outcome into the terminal `(state, results, error)` triple [`finish_run`]
 /// records, appending the matching terminal `subagent.run.*` event for each shape on the way.
@@ -267,6 +266,9 @@ pub(super) async fn finish_run(
             error: Some(error.clone()),
             saved_output_path: None,
             tool_calls: Vec::new(),
+            // A SYNTHESIZED run-level failure: no step ran, so no child was planned and no surface
+            // exists to publish.
+            tool_surface: crate::exec::tool_surface::ResolvedToolSurface::default(),
             output_truncated: false,
             control_events: Vec::new(),
             progress: None,
@@ -379,7 +381,6 @@ pub(super) async fn finish_run(
         );
     }
 
-
     // Best-effort run-history recording (pi's `recordRun`, `run-history.ts`): one line per
     // top-level result appended to `<agent_dir>/run-history.jsonl` (pi `getHistoryPath()`,
     // `runs/shared/run-history.ts:23-25` @v0.43.0 — the DURABLE agent dir, deliberately not the
@@ -391,7 +392,8 @@ pub(super) async fn finish_run(
     // whose roots were redirected records its history with them instead of in the real user's agent
     // dir — see [`crate::background::run_history_path_for`].
     let async_root = run_paths.run_dir.parent().unwrap_or(&run_paths.run_dir);
-    crate::background::record_run_history(async_root, status.started_at, &result_file.results).await;
+    crate::background::record_run_history(async_root, status.started_at, &result_file.results)
+        .await;
 }
 
 /// Write the terminal [`ResultFile`] through the session-partitioned index.
@@ -456,7 +458,6 @@ async fn write_result_file(
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -466,9 +467,9 @@ mod tests {
         clippy::indexing_slicing
     )]
 
-    use super::*;
     use super::super::run;
     use super::super::tests::{run_paths_in, single_step};
+    use super::*;
     use crate::background::control;
     use crate::background::{RunId, RunMode};
     use crate::spawn::chain_graph::RunnerStep;
@@ -483,8 +484,6 @@ mod tests {
             run_id,
         )
     }
-
-
 
     // ---------------------------------------------------------------------------------------
     // Second-pass adversarial-review regression: `run()`'s control-inbox-directory creation step
@@ -549,6 +548,7 @@ mod tests {
             orchestrator_intercom_target: None,
             inherited_session_model: None,
             inherited_session_thinking: None,
+            host_available_builtins: None,
             model_scope: None,
             nested_route: None,
             nested_self: None,
@@ -651,6 +651,8 @@ mod tests {
                 progress: None,
                 runner: None,
                 external_process: None,
+                // Test fixture: no child was planned, so there is no surface to report.
+                tool_surface: crate::exec::tool_surface::ResolvedToolSurface::default(),
             }],
             dir.path().to_path_buf(),
             None,
@@ -691,9 +693,10 @@ mod tests {
         )
         .await;
 
-        let result_bytes_after_second_call = tokio::fs::read(&terminal_result_path(&run_paths, &run_id))
-            .await
-            .expect("ResultFile still exists after the second finish_run call");
+        let result_bytes_after_second_call =
+            tokio::fs::read(&terminal_result_path(&run_paths, &run_id))
+                .await
+                .expect("ResultFile still exists after the second finish_run call");
         let result_after_second_call: ResultFile =
             serde_json::from_slice(&result_bytes_after_second_call).expect("valid JSON");
         assert_eq!(
@@ -765,11 +768,18 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let run_id = RunId::from_token("run-no-session");
         let run_paths = run_paths_in(dir.path(), &run_id);
-        tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run_dir");
-        tokio::fs::create_dir_all(dir.path().join("results")).await.expect("mkdir results_dir");
+        tokio::fs::create_dir_all(&run_paths.run_dir)
+            .await
+            .expect("mkdir run_dir");
+        tokio::fs::create_dir_all(dir.path().join("results"))
+            .await
+            .expect("mkdir results_dir");
 
         let status = RunStatus::queued(run_id.clone(), RunMode::Single, Some(1));
-        assert!(status.session_id.is_none(), "precondition: no launching session");
+        assert!(
+            status.session_id.is_none(),
+            "precondition: no launching session"
+        );
 
         finish_run(
             &run_paths,
@@ -783,11 +793,15 @@ mod tests {
         .await;
 
         assert!(
-            tokio::fs::try_exists(&run_paths.status).await.expect("check status"),
+            tokio::fs::try_exists(&run_paths.status)
+                .await
+                .expect("check status"),
             "the terminal status must still be recorded"
         );
         assert!(
-            !tokio::fs::try_exists(&terminal_result_path(&run_paths, &run_id)).await.expect("check result"),
+            !tokio::fs::try_exists(&terminal_result_path(&run_paths, &run_id))
+                .await
+                .expect("check result"),
             "an unattributable result must NOT be written, not even unindexed"
         );
     }

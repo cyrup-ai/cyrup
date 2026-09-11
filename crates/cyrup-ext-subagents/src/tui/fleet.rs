@@ -82,9 +82,9 @@ use super::fleet_transcript::{
     render_fleet_transcript,
 };
 use crate::background::{RunPaths, RunState, RunStatus};
-use crate::identity::SessionId;
 use crate::fork_context::ContextMode;
 use crate::formatters::{format_model_thinking_opt, format_tokens};
+use crate::identity::SessionId;
 
 // =================================================================================================
 // Tunables (pi `fleet.ts:20-23`)
@@ -481,8 +481,7 @@ pub async fn collect_fleet_history(
     results_dir: &Path,
     current_session_id: Option<&str>,
 ) -> Result<Vec<AsyncRunView>, String> {
-    let candidates =
-        fleet_history_candidates(async_root, results_dir, current_session_id).await?;
+    let candidates = fleet_history_candidates(async_root, results_dir, current_session_id).await?;
 
     let mut runs: Vec<AsyncRunView> = Vec::new();
     for paths in candidates {
@@ -2298,9 +2297,10 @@ mod tests {
         ended_at: i64,
     ) {
         let run_dir = async_root.join(run);
-        tokio::fs::create_dir_all(&run_dir).await.expect("mkdir run dir");
-        let mut status =
-            RunStatus::queued(RunId::from_token(run), RunMode::Single, Some(1));
+        tokio::fs::create_dir_all(&run_dir)
+            .await
+            .expect("mkdir run dir");
+        let mut status = RunStatus::queued(RunId::from_token(run), RunMode::Single, Some(1));
         status.state = state;
         status.session_id = SessionId::parse(session_id);
         status.ended_at = Some(ended_at);
@@ -2316,7 +2316,9 @@ mod tests {
     }
 
     fn history_ids(runs: &[AsyncRunView]) -> Vec<String> {
-        runs.iter().map(|run| run.status.run_id.as_str().to_string()).collect()
+        runs.iter()
+            .map(|run| run.status.run_id.as_str().to_string())
+            .collect()
     }
 
     /// The index-first path: with markers present, the history roster comes back newest-first and
@@ -2336,7 +2338,11 @@ mod tests {
         let runs = collect_fleet_history(&async_root, &results_dir, Some("s1"))
             .await
             .expect("history collects");
-        assert_eq!(history_ids(&runs), vec!["newer1", "older1"], "newest first, s2 filtered");
+        assert_eq!(
+            history_ids(&runs),
+            vec!["newer1", "older1"],
+            "newest first, s2 filtered"
+        );
     }
 
     /// The fallback: an EMPTY index (no producer has written a marker yet) falls through to the
@@ -2350,8 +2356,7 @@ mod tests {
         // A run with a status but NO index marker (unattributed — the writer refuses it).
         let run_dir = async_root.join("scanned1");
         tokio::fs::create_dir_all(&run_dir).await.expect("mkdir");
-        let mut status =
-            RunStatus::queued(RunId::from_token("scanned1"), RunMode::Single, Some(1));
+        let mut status = RunStatus::queued(RunId::from_token("scanned1"), RunMode::Single, Some(1));
         status.state = RunState::Complete;
         tokio::fs::write(
             run_dir.join("status.json"),
@@ -2362,8 +2367,12 @@ mod tests {
         // Reserved index dirs sitting in the root, with decoy content the scan must not read.
         for reserved in [".terminal-runs", ".active-runs"] {
             let decoy = async_root.join(reserved);
-            tokio::fs::create_dir_all(&decoy).await.expect("mkdir reserved");
-            tokio::fs::write(decoy.join("status.json"), b"{}").await.expect("decoy");
+            tokio::fs::create_dir_all(&decoy)
+                .await
+                .expect("mkdir reserved");
+            tokio::fs::write(decoy.join("status.json"), b"{}")
+                .await
+                .expect("decoy");
         }
 
         let runs = collect_fleet_history(&async_root, &results_dir, None)

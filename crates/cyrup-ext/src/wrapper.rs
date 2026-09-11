@@ -137,7 +137,7 @@ impl Tool for RegisteredTool {
     /// coding built-ins depend on: `read`, `edit`, `write` and the shared `ShellTool` engine —
     /// pi's `createShellToolDefinition`, so `powershell` inherits it — each return
     /// [`cyrup_core::experimental_tool_sampling`], which is `Some` only under
-    /// `CYRUP_EXPERIMENTAL=1`/`PI_EXPERIMENTAL=1` and `None` otherwise.
+    /// `CYRUP_EXPERIMENTAL=1` and `None` otherwise.
     fn constrained_sampling(&self) -> Option<&cyrup_core::ConstrainedSampling> {
         self.inner.constrained_sampling()
     }

@@ -55,9 +55,65 @@ struct SingleBackgroundDispatch<'a> {
     overrides: &'a SingleRunOverrides,
     /// Already validated + de-aliased by `resolve_foreground_timeout`.
     timeout_ms: Option<u64>,
+    /// The surface this route already resolved for `agent`, threaded rather than re-resolved so a
+    /// foreground reply and an async reply publish byte-identical `resolvedTools`. `None` when the
+    /// name did not resolve — the existing "unknown agent" path owns that failure.
+    tool_surface: Option<&'a crate::exec::tool_surface::ResolvedToolSurface>,
 }
 
 impl SubagentTool {
+    /// The tool surface `agent` would launch with, or `None` when the name does not resolve.
+    ///
+    /// **Deliberately ceiling-free.** A capability ceiling can only ever NARROW a surface
+    /// (`spawn_plan.rs`'s SUBA-072 `declared.retain(|t| allowed.contains(t))`) and can only ever
+    /// ADD to `pinned`, so what is published here is a strict SUPERSET of what the launch itself
+    /// resolves with the ceiling applied — a display path may over-report a tool the ceiling later
+    /// removes, never under-report one. The ceiling is not resolvable here in any case: it hangs
+    /// off [`crate::exec::RunOptions::parent_session_id`], which does not exist until the executor
+    /// builds the run, and reaching for it would trade a sound approximation for a duplicated
+    /// resolution.
+    ///
+    /// An unresolvable name returns `None` rather than an error: pi's own
+    /// `applySingleAgentLaunchDefaults` bails silently on an unknown agent
+    /// (`subagent-executor.ts:1932`) and leaves the existing "unknown agent" path to report it, and
+    /// a second name-resolution error message here would race that one.
+    fn resolve_launch_surface(
+        &self,
+        cwd: &Path,
+        roots: &crate::paths::Roots,
+        agent: &str,
+        step_tools: Option<&Vec<crate::discovery::types::ToolRef>>,
+        depth: crate::spawn::depth::DepthEnvelope,
+    ) -> Option<crate::exec::tool_surface::ResolvedToolSurface> {
+        let definition = self
+            .executor
+            .resolve_agent(
+                cwd,
+                agent,
+                crate::discovery::types::AgentReadScope::Both,
+                roots,
+            )
+            .ok()?;
+        let mut config = crate::exec::AgentConfig::from_agent_definition(&definition, depth);
+        // A per-step `tools:` OVERRIDES the persona's own list — `background/runner_main/
+        // executor.rs`'s `if step.tools.is_some() { agent.tools = step.tools.clone(); }`. Both
+        // production lowerings (`tool_task_to_spec`, `chain_step_to_runner_step`) hard-code `None`
+        // today, so this is a no-op; it is here because a gate that read only the persona would
+        // start returning WRONG verdicts the day either of them stops, and a wrong refusal is the
+        // exact failure this gate exists to prevent.
+        if let Some(tools) = step_tools {
+            config.tools = Some(tools.clone());
+        }
+        // The HOST slot stays `None` here, unlike every launch path: this is a DISPLAY
+        // path with no `RunOptions` in hand, and a surface rendered for `action:"list"` is a
+        // statement about the AGENT, not about one launch's host snapshot. Intersecting it against
+        // this process's live registry would make a listing's verdict depend on when it was asked.
+        // `structured_output: false` for the same reason the HOST slot above is `None`: a listing has
+        // no launch behind it, so it has no `outputSchema` either. pi's `internalTools`
+        // (`child-tool-plan.ts:456`) is a grant the RUN makes, and there is no run here.
+        crate::exec::tool_surface::resolve_tool_surface(&config, false, None, None, false, cwd).ok()
+    }
+
     /// The comma-joined discovered agent names (or `"none"`) pi's "Provide exactly one mode. Agents:
     /// …" error lists (`subagent-executor.ts:1137`: `agents.map((a) => a.name).join(", ") ||
     /// "none"`). Discovery failures degrade to an empty list rather than propagating — this string
@@ -359,7 +415,14 @@ impl SubagentTool {
         // `applyForceTopLevelAsyncOverride` ever sees it), so `forceTopLevelAsync` still wins over
         // an agent that declares `async: false`, exactly as upstream.
         let cfg = self.executor.config_snapshot().await;
-        let depth = resolve_effective_depth(cfg.max_subagent_depth).current_depth;
+        let envelope = resolve_effective_depth(cfg.max_subagent_depth);
+        let depth = envelope.current_depth;
+
+        // Resolved ONCE and kept: the async arm republishes this exact value as the launch reply's
+        // `resolvedTools`, so the parent learns what the child it just started can actually do
+        // without waiting for it to settle.
+        let launch_surface = self.resolve_launch_surface(cwd, &cfg.roots, agent, None, envelope);
+
         let p_with_defaults;
         let fill_async = launch_defaults.0.filter(|_| p.r#async.is_none());
         let fill_acceptance = launch_defaults.3.clone().filter(|_| p.acceptance.is_none());
@@ -413,6 +476,7 @@ impl SubagentTool {
                     model,
                     overrides: &overrides,
                     timeout_ms,
+                    tool_surface: launch_surface.as_ref(),
                 })
                 .await;
         }
@@ -587,6 +651,7 @@ impl SubagentTool {
             model,
             overrides,
             timeout_ms,
+            tool_surface,
         } = dispatch;
         let run_id = self
             .executor
@@ -674,6 +739,11 @@ impl SubagentTool {
                 &run_id,
                 cwd,
                 &self.executor.config_snapshot().await.roots,
+                // [CYRUP-DELTA] `resolvedTools` — an async launch returns before any child settles,
+                // so this reply is the parent's only synchronous chance to learn what the child it
+                // just started can actually do. Threaded from `route_single`'s gate, not
+                // re-resolved.
+                tool_surface,
             )),
             terminate: TerminateHint::Unspecified,
             ..Default::default()
@@ -1602,6 +1672,9 @@ impl SubagentTool {
                     &run_id,
                     cwd,
                     &self.executor.config_snapshot().await.roots,
+                    // A top-level PARALLEL launch names many agents; one flattened surface would be
+                    // a claim about none of them, so the key is omitted.
+                    None,
                 )),
                 terminate: TerminateHint::Unspecified,
                 ..Default::default()
@@ -1773,6 +1846,8 @@ impl SubagentTool {
                     &run_id,
                     cwd,
                     &self.executor.config_snapshot().await.roots,
+                    // As PARALLEL: a chain names many agents.
+                    None,
                 )),
                 terminate: TerminateHint::Unspecified,
                 ..Default::default()

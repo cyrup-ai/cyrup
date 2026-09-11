@@ -37,7 +37,9 @@ impl CompletionOwnerId {
     /// Exposed for tests that need two distinct owners to model two processes.
     #[must_use]
     pub fn new() -> Self {
-        Self(Arc::from(uuid::Uuid::new_v4().as_simple().to_string().as_str()))
+        Self(Arc::from(
+            uuid::Uuid::new_v4().as_simple().to_string().as_str(),
+        ))
     }
 
     /// Wraps an already-known owner token — the deserialization/round-trip path. `None` for the

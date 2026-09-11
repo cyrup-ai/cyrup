@@ -178,9 +178,12 @@ async fn runtime_agent_is_listed_by_management_list() {
             .await
             .expect("list ok");
         assert!(!out.is_error, "{}", out.text);
+        // The trailing `, tools:` segment is cyrup's ([CYRUP-DELTA], see `handle_list`); this
+        // runtime agent declares no `tools:`, so its surface is UNPINNED.
         assert!(
-            out.text
-                .contains("- runtime-helper (runtime, aliases: helper): Runtime helper"),
+            out.text.contains(
+                "- runtime-helper (runtime, aliases: helper, tools: (unpinned)): Runtime helper"
+            ),
             "scope {scope:?}: {}",
             out.text
         );

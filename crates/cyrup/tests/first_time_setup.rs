@@ -102,13 +102,13 @@ fn returns_false_when_settings_json_already_exists() {
 }
 
 /// `areExperimentalFeaturesEnabled` (experimental.ts) is `process.env.PI_EXPERIMENTAL === "1"` — a
-/// STRICT equality, not the truthy-flag predicate `PI_TELEMETRY`/`PI_OFFLINE` use, so `true`/`yes`
-/// must NOT enable it. `CYRUP_EXPERIMENTAL` is the renamed primary and `PI_EXPERIMENTAL` survives as
-/// the lower-precedence fallback (`cyrup-config/src/env.rs:68-91` convention).
+/// STRICT equality, not the truthy-flag predicate the telemetry/offline vars use, so `true`/`yes`
+/// must NOT enable it. `CYRUP_EXPERIMENTAL` is the renamed flag; the legacy `PI_EXPERIMENTAL`
+/// spelling is no longer honoured (hard rename).
 ///
 /// One test owns the process env so nothing here races; no other test in this binary reads it.
 #[test]
-fn experimental_flag_is_strict_one_under_either_name() {
+fn experimental_flag_is_strict_one_under_the_cyrup_name_only() {
     // Injected lookups, not process mutation. `set_var` races EVERY concurrent reader of the
     // environment in this binary — not merely readers of these two keys, because it may reallocate
     // the whole `environ` array under a concurrent `getenv` for any key at all. With 16 tests here
@@ -117,10 +117,10 @@ fn experimental_flag_is_strict_one_under_either_name() {
     let pinned = |k: &'static str, v: &'static str| move |q: &str| (q == k).then(|| v.to_string());
 
     assert!(!are_experimental_features_enabled_from(&unset));
-    assert!(are_experimental_features_enabled_from(&pinned(
-        "PI_EXPERIMENTAL",
-        "1"
-    )));
+    assert!(
+        !are_experimental_features_enabled_from(&pinned("PI_EXPERIMENTAL", "1")),
+        "the dropped PI_EXPERIMENTAL spelling must be inert"
+    );
     assert!(are_experimental_features_enabled_from(&pinned(
         "CYRUP_EXPERIMENTAL",
         "1"

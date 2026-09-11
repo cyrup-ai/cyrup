@@ -726,7 +726,11 @@ mod tests {
             } else {
                 TrustOutcome::Untrusted
             };
-            assert_eq!(decide_trust(TrustInputs { mode, ..base }), expected, "{mode:?}");
+            assert_eq!(
+                decide_trust(TrustInputs { mode, ..base }),
+                expected,
+                "{mode:?}"
+            );
         }
     }
 

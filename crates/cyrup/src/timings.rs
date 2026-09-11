@@ -1,5 +1,6 @@
 //! Startup timing instrumentation (Pi `core/timings.ts`). A faithful port of `resetTimings`/`time`/
-//! `printTimings`: when enabled by `CYRUP_TIMING=1` (or Pi's `PI_TIMING=1`), each [`time`] call
+//! `printTimings`: when enabled by `CYRUP_TIMING=1` (Pi's `PI_TIMING=1`; the legacy spelling is
+//! no longer honoured), each [`time`] call
 //! records the elapsed milliseconds since the previous mark IN ITS NAMESPACE, and [`print_timings`]
 //! writes one titled group per namespace to **stderr** (never stdout — the protocol stream stays
 //! clean).
@@ -14,27 +15,24 @@
 //! `"Startup Timings: main"`, so a second namespace was unexpressible and the extension-loading
 //! phase — the most common cause of a slow start — was invisible.
 //!
-//! Separately, `PI_STARTUP_BENCHMARK`/`CYRUP_STARTUP_BENCHMARK` (Pi main.ts:800) requests the
+//! Separately, `CYRUP_STARTUP_BENCHMARK` (Pi main.ts:800, `PI_STARTUP_BENCHMARK`) requests the
 //! interactive-init benchmark; the bin gates it to interactive mode via [`startup_benchmark_enabled`]
 //! and reports the same "only supports interactive mode" error in the one-shot modes.
 
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-/// Whether startup timings are enabled (`CYRUP_TIMING=1` / `PI_TIMING=1`).
+/// Whether startup timings are enabled (`CYRUP_TIMING=1`).
 ///
 /// Pi reads its `ENABLED` once at module load (`timings.ts:6`), so the answer cannot change
 /// mid-process; the `OnceLock` reproduces that (and keeps `time` off the env-var path per mark).
 fn timing_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(std::env::var("CYRUP_TIMING").ok().as_deref(), Some("1"))
-            || matches!(std::env::var("PI_TIMING").ok().as_deref(), Some("1"))
-    })
+    *ENABLED.get_or_init(|| matches!(std::env::var("CYRUP_TIMING").ok().as_deref(), Some("1")))
 }
 
-/// Whether the interactive startup benchmark is requested (`CYRUP_STARTUP_BENCHMARK` / Pi
-/// `PI_STARTUP_BENCHMARK`, truthy `1`/`true`/`yes`).
+/// Whether the interactive startup benchmark is requested (`CYRUP_STARTUP_BENCHMARK`, truthy
+/// `1`/`true`/`yes`; Pi `PI_STARTUP_BENCHMARK`).
 pub fn startup_benchmark_enabled() -> bool {
     fn truthy(v: Option<String>) -> bool {
         matches!(
@@ -43,7 +41,6 @@ pub fn startup_benchmark_enabled() -> bool {
         )
     }
     truthy(std::env::var("CYRUP_STARTUP_BENCHMARK").ok())
-        || truthy(std::env::var("PI_STARTUP_BENCHMARK").ok())
 }
 
 /// Which table a mark lands in (Pi `type TimingLabel = "main" | "extensions"`, timings.ts:12).

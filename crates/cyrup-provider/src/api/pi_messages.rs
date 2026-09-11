@@ -312,9 +312,9 @@ pub(crate) fn build_headers(opts: &StreamOptions, api_key: &str) -> HeaderMap {
 /// 1:1 port of Pi's `resolveCacheRetention` (pi-messages.ts:337-343).
 ///
 /// **Deliberately unlike every other converter in this directory**: an unset retention stays unset
-/// (`None`) so the *backend's* default applies — only the legacy `PI_CACHE_RETENTION=long` opt-in
-/// is mapped. `anthropic-messages`/`openai-completions` default to `"short"` instead; copying them
-/// here would silently override a gateway's own policy.
+/// (`None`) so the *backend's* default applies — only the `CYRUP_CACHE_RETENTION=long` opt-in
+/// (pi `PI_CACHE_RETENTION`) is mapped. `anthropic-messages`/`openai-completions` default to
+/// `"short"` instead; copying them here would silently override a gateway's own policy.
 pub(crate) fn resolve_cache_retention(
     cache_retention: Option<CacheRetention>,
     env: Option<&ProviderEnv>,
@@ -322,7 +322,7 @@ pub(crate) fn resolve_cache_retention(
     if let Some(c) = cache_retention {
         return Some(c);
     }
-    if provider_env_value("PI_CACHE_RETENTION", env).as_deref() == Some("long") {
+    if provider_env_value("CYRUP_CACHE_RETENTION", env).as_deref() == Some("long") {
         return Some(CacheRetention::Long);
     }
     None
@@ -1134,16 +1134,16 @@ mod tests {
             resolve_cache_retention(Some(CacheRetention::Short), Some(&env)),
             Some(CacheRetention::Short)
         );
-        // `PI_CACHE_RETENTION=long` is the one legacy opt-in Pi maps.
+        // `CYRUP_CACHE_RETENTION=long` is the one env opt-in mapped (pi `PI_CACHE_RETENTION`).
         let mut long = ProviderEnv::new();
-        long.insert("PI_CACHE_RETENTION".to_string(), "long".to_string());
+        long.insert("CYRUP_CACHE_RETENTION".to_string(), "long".to_string());
         assert_eq!(
             resolve_cache_retention(None, Some(&long)),
             Some(CacheRetention::Long)
         );
         // Any other value is ignored (Pi tests `=== "long"`).
         let mut other = ProviderEnv::new();
-        other.insert("PI_CACHE_RETENTION".to_string(), "short".to_string());
+        other.insert("CYRUP_CACHE_RETENTION".to_string(), "short".to_string());
         assert_eq!(resolve_cache_retention(None, Some(&other)), None);
     }
 

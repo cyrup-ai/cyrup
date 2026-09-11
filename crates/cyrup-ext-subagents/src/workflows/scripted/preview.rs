@@ -152,7 +152,10 @@ mod tests {
         let interpolated_task =
             preview_simple_workflow_run(Some("return runs.run(`k`, { task: `has ${x}` });"))
                 .expect("a clean key keeps the anchored form matching");
-        assert_eq!(interpolated_task.task, None, "an interpolated task is unreadable");
+        assert_eq!(
+            interpolated_task.task, None,
+            "an interpolated task is unreadable"
+        );
         assert_eq!(interpolated_task.agent, None);
     }
 }

@@ -52,13 +52,14 @@ pub fn stable_json(value: &serde_json::Value) -> String {
 /// digest output does not implement `LowerHex`, so `{:x}` does not compile on it.
 #[must_use]
 pub fn stable_json_digest(value: &serde_json::Value) -> String {
-    Sha256::digest(stable_json(value).as_bytes())
-        .iter()
-        .fold(String::with_capacity(64), |mut out, byte| {
+    Sha256::digest(stable_json(value).as_bytes()).iter().fold(
+        String::with_capacity(64),
+        |mut out, byte| {
             use std::fmt::Write as _;
             let _ = write!(out, "{byte:02x}");
             out
-        })
+        },
+    )
 }
 
 #[cfg(test)]

@@ -6,8 +6,10 @@ the same ground, see [Command line](cli.md); for the on-disk equivalents, see
 
 ## How values are read
 
-Each core variable has a `PI_*` migration alias. Both spellings are checked, `CYRUP_*` first, and
-the first one set to a non-empty value wins.
+Every variable is `CYRUP_*`-prefixed. The `PI_*` spellings that earlier builds accepted as
+migration aliases are no longer read anywhere: a `PI_*` variable in the environment is ignored
+(and the stale session/agency `PI_*` names are actively stripped from `bash` children — see
+"Variables cyrup sets for you" below).
 
 **Truthiness is narrow, and it is not the same everywhere.** The core flags below accept exactly
 `1`, `true` and `yes` — `true` and `yes` case-insensitively — and the value is **not** trimmed. `on`
@@ -18,17 +20,17 @@ literal string `1`. Each table below says which rule applies.
 
 ## Core
 
-| Variable | `PI_*` alias | Values | Default | Meaning |
-|---|---|---|---|---|
-| `CYRUP_AGENT_DIR` | `CYRUP_CODING_AGENT_DIR`, then `PI_CODING_AGENT_DIR` | path | `~/.cyrup/agent` | The agent directory, holding `settings.json`, `auth.json`, `trust.json` and friends |
-| `CYRUP_SESSION_DIR` | `PI_CODING_AGENT_SESSION_DIR` | path | `<agent dir>/sessions` | Session storage root; beats the `sessionDir` setting, loses to `--session-dir` |
-| `CYRUP_PACKAGE_DIR` | `PI_PACKAGE_DIR` | path | `<agent dir>/packages` | Installed-package root |
-| `CYRUP_OFFLINE` | `PI_OFFLINE` | `1`, `true`, `yes` | off | Disable startup network operations; same as `--offline` |
-| `CYRUP_SKIP_VERSION_CHECK` | `PI_SKIP_VERSION_CHECK` | `1`, `true`, `yes` | off | Disable the package update check only; telemetry is unaffected |
-| `CYRUP_TELEMETRY` | `PI_TELEMETRY` | tri-state, see below | *unset* | Override the `enableInstallTelemetry` setting |
-| `CYRUP_CACHE_RETENTION` | `PI_CACHE_RETENTION` | `short`, `long` | `short` | Cache retention policy; trimmed and case-insensitive, anything else falls back to `short` |
-| `CYRUP_CLEAR_ON_SHRINK` | `PI_CLEAR_ON_SHRINK` | exactly `1` | off | Fallback for the `terminal.clearOnShrink` setting |
-| `CYRUP_HARDWARE_CURSOR` | `PI_HARDWARE_CURSOR` | exactly `1` | off | Fallback for the `showHardwareCursor` setting |
+| Variable | Values | Default | Meaning |
+|---|---|---|---|
+| `CYRUP_AGENT_DIR` | path | `~/.cyrup/agent` | The agent directory, holding `settings.json`, `auth.json`, `trust.json` and friends. `CYRUP_CODING_AGENT_DIR` is read as a fallback |
+| `CYRUP_SESSION_DIR` | path | `<agent dir>/sessions` | Session storage root; beats the `sessionDir` setting, loses to `--session-dir` |
+| `CYRUP_PACKAGE_DIR` | path | `<agent dir>/packages` | Installed-package root |
+| `CYRUP_OFFLINE` | `1`, `true`, `yes` | off | Disable startup network operations; same as `--offline` |
+| `CYRUP_SKIP_VERSION_CHECK` | `1`, `true`, `yes` | off | Disable the package update check only; telemetry is unaffected |
+| `CYRUP_TELEMETRY` | tri-state, see below | *unset* | Override the `enableInstallTelemetry` setting |
+| `CYRUP_CACHE_RETENTION` | `short`, `long` | `short` | Cache retention policy; trimmed and case-insensitive, anything else falls back to `short` |
+| `CYRUP_CLEAR_ON_SHRINK` | exactly `1` | off | Fallback for the `terminal.clearOnShrink` setting |
+| `CYRUP_HARDWARE_CURSOR` | exactly `1` | off | Fallback for the `showHardwareCursor` setting |
 
 Path values are expanded for a leading `~`, a Windows `~\`, and `file://` URLs. A relative path is
 left relative.
@@ -69,7 +71,7 @@ and `trust.json` exactly where they were. Only the two agent-dir variables move 
 temporary directory.
 
 **The config layer reads both agent-dir spellings, in that order: `CYRUP_AGENT_DIR`, then
-`CYRUP_CODING_AGENT_DIR`, then `PI_CODING_AGENT_DIR`.** That is deliberate — intercom and subagents
+`CYRUP_CODING_AGENT_DIR`.** That is deliberate — intercom and subagents
 only ever read the long spelling, so setting the long one alone puts core and those two extensions
 under the same root rather than splitting them. Setting `CYRUP_AGENT_DIR` wins for core and leaves
 the extensions on their own default. The two variables still mean different directories when unset:
@@ -87,9 +89,6 @@ it applies to a broker process started with no `CYRUP_CODING_AGENT_DIR` in its e
 spawner always sets one. Setting either variable moves the intercom directory with the agent
 directory, so the two stay together.
 
-`PI_CODING_AGENT_DIR` — note the `PI_` prefix — is the alias for `CYRUP_AGENT_DIR`, not for
-`CYRUP_CODING_AGENT_DIR`. The names cross over.
-
 ## Feature opt-ins
 
 The three native extensions and the experimental gate are off by default. These use the wider
@@ -101,7 +100,7 @@ literal string `1`.
 | `CYRUP_SUBAGENTS` | `1`, `true`, `on`, `yes` | Install the [subagents](../extensions/subagents.md) extension |
 | `CYRUP_PERMISSION_SYSTEM` | `1`, `true`, `on`, `yes` | Install [the permission system](../extensions/permissions.md) even with no policy file |
 | `CYRUP_INTERCOM` | `1`, `true`, `on`, `yes` | Install [intercom](../extensions/intercom.md) |
-| `CYRUP_EXPERIMENTAL` (alias `PI_EXPERIMENTAL`) | exactly `1` | Enable experimental features, including the first-run setup wizard |
+| `CYRUP_EXPERIMENTAL` | exactly `1` | Enable experimental features, including the first-run setup wizard |
 
 **A config file arms these too.** Subagents also switch on when `<agent dir>/subagents/config.json`
 or `.cyrup/subagents/config.json` exists. Intercom switches on when
@@ -112,14 +111,14 @@ policy file is on disk. Set `"enabled": false` in the extension's `config.json` 
 
 ## The share viewer
 
-| Variable | Alias | Default | Meaning |
-|---|---|---|---|
-| `CYRUP_SHARE_VIEWER_URL` | *none* | `https://pi.dev/session/` | Base URL of the viewer link `/share` prints |
+| Variable | Default | Meaning |
+|---|---|---|
+| `CYRUP_SHARE_VIEWER_URL` | `https://pi.dev/session/` | Base URL of the viewer link `/share` prints |
 
 `/share` publishes the session as a secret GitHub gist and then reports two lines: `Share URL:
-<base>#<gist id>` and `Gist: <the gist URL>`. This variable replaces the base. It has no `PI_*`
-alias, and an empty value counts as unset — `CYRUP_SHARE_VIEWER_URL=` falls back to the default
-rather than producing a bare `#<id>`.
+<base>#<gist id>` and `Gist: <the gist URL>`. This variable replaces the base. An empty value
+counts as unset — `CYRUP_SHARE_VIEWER_URL=` falls back to the default rather than producing a bare
+`#<id>`.
 
 The default is the one pi ships, carried over unchanged; cyrup only concatenates the base and the
 gist id and prints the result, and makes no request to it. Whether that viewer renders your gist is
@@ -194,9 +193,9 @@ route all three of these must hold: `GOOGLE_APPLICATION_CREDENTIALS` points at a
 
 ### OAuth callback
 
-| Variable | Alias | Default | Meaning |
-|---|---|---|---|
-| `CYRUP_OAUTH_CALLBACK_HOST` | `PI_OAUTH_CALLBACK_HOST` | `127.0.0.1` | Host the OAuth loopback listener binds for `/login` |
+| Variable | Default | Meaning |
+|---|---|---|
+| `CYRUP_OAUTH_CALLBACK_HOST` | `127.0.0.1` | Host the OAuth loopback listener binds for `/login` |
 
 ### Variables that name a provider cyrup does not have
 
@@ -218,7 +217,7 @@ Read only when the [subagents](../extensions/subagents.md) extension is installe
 | Variable | Values | Meaning |
 |---|---|---|
 | `CYRUP_SUBAGENT_MAX_DEPTH` | integer | Recursion ceiling; a malformed value is treated as unset |
-| `CYRUP_SUBAGENT_MAX_SPAWNS_PER_SESSION` (alias `PI_SUBAGENT_MAX_SPAWNS_PER_SESSION`) | number | Per-session spawn cap |
+| `CYRUP_SUBAGENT_MAX_SPAWNS_PER_SESSION` | number | Per-session spawn cap |
 | `CYRUP_SUBAGENT_TOOL_BUDGET` | JSON | Tool budget handed to each child |
 | `CYRUP_SUBAGENT_WAIT_TOOL_ENABLED` | see below | Enable or disable the background `wait` tool |
 | `CYRUP_SUBAGENT_EXTRA_AGENT_DIRS` | path list | Extra read-only directories to discover agent files in |
@@ -279,8 +278,8 @@ directory — `~/.cyrup/agent/intercom/` by default, moved by either `CYRUP_AGEN
 
 These are **not inputs**. cyrup exports them into the environment of every command the `bash` tool
 runs, so a script invoked by the agent can see which session it is part of. Setting them yourself
-before launching cyrup has no effect — both the `CYRUP_*` and `PI_*` spellings are stripped from the
-child environment and repopulated.
+before launching cyrup has no effect — both the `CYRUP_*` and legacy `PI_*` spellings are stripped
+from the child environment and repopulated (the stale `PI_CODING_AGENT` marker is stripped too).
 
 | Variable | Value |
 |---|---|

@@ -167,8 +167,7 @@ fn location_belongs_to(
         .ok()
         .and_then(|bytes| serde_json::from_slice::<crate::background::RunStatus>(&bytes).ok())
         .and_then(|status| status.session_id);
-    crate::background::delivery::SessionGate::Permissive
-        .admits(current_session, recorded.as_ref())
+    crate::background::delivery::SessionGate::Permissive.admits(current_session, recorded.as_ref())
 }
 
 /// Resolve `id` (an EXACT id or a unique PREFIX) to its on-disk [`AsyncRunLocation`] over
@@ -195,8 +194,7 @@ pub fn resolve_async_run_id(
     {
         return Ok(Some(exact));
     }
-    let mut matches =
-        find_async_run_prefix_matches(id, async_root, results_dir, current_session);
+    let mut matches = find_async_run_prefix_matches(id, async_root, results_dir, current_session);
     if matches.len() > 1 {
         let labels = matches
             .iter()
@@ -276,8 +274,10 @@ mod tests {
         let async_root = dir.path().join("async");
         let results_dir = dir.path().join("results");
 
-        for (id, session) in [("deadbeef0001", "session-MINE"), ("deadbeef0002", "session-THEIRS")]
-        {
+        for (id, session) in [
+            ("deadbeef0001", "session-MINE"),
+            ("deadbeef0002", "session-THEIRS"),
+        ] {
             let run_id = RunId::from_token(id);
             let paths = crate::background::RunPaths::for_run(&async_root, &results_dir, &run_id);
             std::fs::create_dir_all(&paths.run_dir).expect("mkdir");

@@ -277,7 +277,7 @@ pub trait Summarizer: Send + Sync {
 /// 1. **`cache_retention: None`** and **a fresh `session_id`** — "Summaries are standalone
 ///    requests, so isolate routing and avoid cache writes that cannot be reused"
 ///    (`compaction.ts:570-575`). Leaving `cache_retention` unset would let the encoder resolve it
-///    from `PI_CACHE_RETENTION` (defaulting to `Short`), billing a prompt-cache write on a
+///    from `CYRUP_CACHE_RETENTION` (defaulting to `Short`), billing a prompt-cache write on a
 ///    one-shot request that can never be read back; leaving `session_id` unset would ride the
 ///    summarization along on the live session's cache-routing affinity.
 /// 2. **`reasoning: req.thinking`** — the level the caller already gated through

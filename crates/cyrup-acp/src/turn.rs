@@ -2283,7 +2283,10 @@ mod tests {
         assert_eq!(update.size, 200_000);
         let cost = update.cost.expect("the cost rides along");
         assert!((cost.amount - 0.125).abs() < f64::EPSILON);
-        assert_eq!(cost.currency, "USD", "the currency `/session`'s own line prints");
+        assert_eq!(
+            cost.currency, "USD",
+            "the currency `/session`'s own line prints"
+        );
 
         assert!(
             usage_update(&stats(Some(cyrup_session_svc::StatsContextUsage {
@@ -2335,7 +2338,11 @@ mod tests {
             .iter()
             .filter(|u| u["sessionUpdate"] == "usage_update")
             .collect();
-        assert_eq!(usage.len(), 1, "once per settle, not once per event: {json:?}");
+        assert_eq!(
+            usage.len(),
+            1,
+            "once per settle, not once per event: {json:?}"
+        );
         assert_eq!(usage[0]["used"], 1_000);
         assert_eq!(usage[0]["size"], 200_000);
         assert_eq!(usage[0]["cost"]["currency"], "USD");

@@ -30,7 +30,7 @@ pub use services::{
     CannedResponses, ControlOp, DENIED_EXEC, DENIED_NET, DENIED_UI, DenyServices, DialogOptions,
     ExecOutput, FsCaps, GuestState, HostServices, HttpRequest, HttpResponse, HttpStreamResponse,
     HumanInteractionGuard, HumanInteractionLock, InjectOutcome, NotifyKind, OAuthEvent,
-    ProcSpawnSpec,
-    ProviderReduction, RecordingServices, SharedBus, UiChrome, WidgetEffect, WidgetPlacement,
+    ProcSpawnSpec, ProviderReduction, RecordingServices, SharedBus, UiChrome, WidgetEffect,
+    WidgetPlacement,
 };
 pub use store_state::HostState;

@@ -57,6 +57,8 @@ pub mod thinking_ceiling;
 pub mod tool_availability;
 pub mod tool_budget;
 pub mod tool_call_summary;
+/// The resolved child tool surface + the pre-spawn task-claim gate.
+pub mod tool_surface;
 pub mod turn_budget;
 pub mod usage_budget;
 
@@ -474,6 +476,15 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         .map(|record| record.turn_budget.clone())
         .unwrap_or_default();
 
+    // The WINNING attempt's tool surface — taken here, beside `turn_budget_tracker`, because
+    // `last_attempt` is MOVED into `winning_attempt_state` further down. Reading the last attempt
+    // (not the first) is the point: on a model-fallback ladder the surface published must be the
+    // one belonging to the child that actually produced the delivered output.
+    let winning_tool_surface = last_attempt
+        .as_ref()
+        .map(|record| record.tool_surface.clone())
+        .unwrap_or_default();
+
     // pi `execution.ts:1474` — the final evidence collect, measured against the pre-ladder
     // snapshot.
     let mutation_evidence = crate::exec::mutation_evidence::collect_tracked_mutation_evidence(
@@ -738,6 +749,8 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned()),
         tool_calls: progress.summarized_tool_calls(),
+        // What the child COULD do, beside `tool_calls`' record of what it DID.
+        tool_surface: winning_tool_surface,
         output_truncated,
         progress: progress_snapshot,
         // pi `result.controlEvents = allControlEvents.length ? allControlEvents : undefined`
@@ -983,6 +996,8 @@ pub(crate) fn pre_spawn_failure(agent: &AgentConfig, task: &str, error: String) 
         error: Some(error),
         saved_output_path: None,
         tool_calls: Vec::new(),
+        // Nothing was planned or spawned, so there is no resolved surface to publish.
+        tool_surface: crate::exec::tool_surface::ResolvedToolSurface::default(),
         output_truncated: false,
         control_events: Vec::new(),
         progress: None,
@@ -2855,8 +2870,9 @@ mod tests {
     /// `Absent`.
     #[test]
     fn prepend_attempt_notes_with_a_blank_body_yields_the_notes_alone() {
-        let notes =
-            vec![crate::exec::fallback::context_overflow_note(&cyrup_core::ModelId::from("m1"))];
+        let notes = vec![crate::exec::fallback::context_overflow_note(
+            &cyrup_core::ModelId::from("m1"),
+        )];
         let rendered = notes[0].to_string();
         assert_eq!(
             prepend_attempt_notes(None, &notes).as_deref(),
@@ -2911,8 +2927,14 @@ mod tests {
     fn terminal_preamble_without_recovery_or_timeout_is_unchanged() {
         let tracker = crate::exec::turn_budget::TurnBudgetTracker::default();
         assert_eq!(
-            apply_terminal_preamble(Some("partial".to_string()), true, Some(5_000), &tracker, None)
-                .as_deref(),
+            apply_terminal_preamble(
+                Some("partial".to_string()),
+                true,
+                Some(5_000),
+                &tracker,
+                None
+            )
+            .as_deref(),
             Some(format!(
                 "{}\n\nPartial output before timeout:\npartial",
                 format_timeout_message(5_000)
@@ -2958,15 +2980,19 @@ mod tests {
     /// `subagent-runner.ts:1442-1447`).
     #[test]
     fn assemble_derives_output_state_from_captured_so_a_note_cannot_manufacture_output() {
-        let notes =
-            vec![crate::exec::fallback::context_overflow_note(&cyrup_core::ModelId::from("m1"))];
+        let notes = vec![crate::exec::fallback::context_overflow_note(
+            &cyrup_core::ModelId::from("m1"),
+        )];
         let delivered = assemble_delivered_output(tail_parts(None, &notes));
         assert_eq!(
             delivered.output_state,
             crate::exec::output_state::SubagentOutputState::Absent
         );
         // The note IS the delivered text — exactly the old `prepend_attempt_notes` behaviour.
-        assert_eq!(delivered.text.as_deref(), Some(notes[0].to_string().as_str()));
+        assert_eq!(
+            delivered.text.as_deref(),
+            Some(notes[0].to_string().as_str())
+        );
         assert!(!delivered.truncated);
     }
 
@@ -2988,7 +3014,10 @@ mod tests {
     fn assemble_skips_truncation_for_a_detach_classified_ladder() {
         let long = "x".repeat(64 * 1024);
         let mut parts = tail_parts(Some(long.as_str()), &[]);
-        parts.max_output = crate::exec::output::OutputCap { bytes: 16, lines: 1 };
+        parts.max_output = crate::exec::output::OutputCap {
+            bytes: 16,
+            lines: 1,
+        };
         parts.stop = crate::exec::fallback::LadderStop::Detached;
         let delivered = assemble_delivered_output(parts);
         assert_eq!(delivered.text.as_deref(), Some(long.as_str()));
@@ -2996,7 +3025,10 @@ mod tests {
 
         // …while a non-detached assembly with the same cap DOES truncate.
         let mut parts = tail_parts(Some(long.as_str()), &[]);
-        parts.max_output = crate::exec::output::OutputCap { bytes: 16, lines: 1 };
+        parts.max_output = crate::exec::output::OutputCap {
+            bytes: 16,
+            lines: 1,
+        };
         let delivered = assemble_delivered_output(parts);
         assert!(delivered.truncated);
     }

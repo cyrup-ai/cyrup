@@ -177,7 +177,7 @@ async fn rpc_and_interactive_modes_do_refresh() {
 }
 
 /// Offline still wins in the refreshing modes — the mode gate is an ADDITIONAL narrowing, never a
-/// replacement for `PI_OFFLINE`/`CYRUP_OFFLINE` (Pi guards on both: `!offlineMode && appMode === "rpc"`).
+/// replacement for `CYRUP_OFFLINE` (Pi guards on both: `!offlineMode && appMode === "rpc"`).
 #[tokio::test]
 async fn offline_still_suppresses_the_refreshing_modes() {
     for mode in [AppMode::Rpc, AppMode::Interactive] {

@@ -323,19 +323,16 @@ pub const ENV_HOME: &str = "CYRUP_HOME";
 
 /// The agent-directory override, in precedence order.
 ///
-/// CFG-076: upstream has exactly ONE name, `PI_CODING_AGENT_DIR`. cyrup's rename split it — core
-/// took the short `CYRUP_AGENT_DIR` (what `--help` advertises) while `cyrup-intercom` and
-/// `cyrup-ext-subagents`' supervisor took the mechanical long form `CYRUP_CODING_AGENT_DIR`.
-/// Reading all three from ONE place is what actually restores upstream's one-name-one-tree
-/// property. Before this constant, `cyrup-config` read all three while four other resolvers read
-/// subsets, so a `CYRUP_CODING_AGENT_DIR` moved the binary's layout and left
-/// `cyrup-ext-subagents`' agent memory, run history, settings, prompts and sessions behind in the
-/// un-relocated tree (MCP-139 gap 1, "the agent-dir consolidation did not happen").
-pub const ENV_AGENT_DIR_KEYS: [&str; 3] = [
-    "CYRUP_AGENT_DIR",
-    ENV_CODING_AGENT_DIR,
-    "PI_CODING_AGENT_DIR",
-];
+/// CFG-076: upstream has exactly ONE name, `PI_CODING_AGENT_DIR` — no longer honoured after the
+/// hard rename. cyrup's rename split it — core took the short `CYRUP_AGENT_DIR` (what `--help`
+/// advertises) while `cyrup-intercom` and `cyrup-ext-subagents`' supervisor took the mechanical
+/// long form `CYRUP_CODING_AGENT_DIR`. Reading both from ONE place is what actually restores
+/// upstream's one-name-one-tree property. Before this constant, `cyrup-config` read every
+/// spelling while four other resolvers read subsets, so a `CYRUP_CODING_AGENT_DIR` moved the
+/// binary's layout and left `cyrup-ext-subagents`' agent memory, run history, settings, prompts
+/// and sessions behind in the un-relocated tree (MCP-139 gap 1, "the agent-dir consolidation did
+/// not happen").
+pub const ENV_AGENT_DIR_KEYS: [&str; 2] = ["CYRUP_AGENT_DIR", ENV_CODING_AGENT_DIR];
 
 /// The sibling-port spelling of the agent-dir override, named on its own because two resolvers
 /// read it OUTSIDE the ladder above and must spell it identically:
@@ -505,7 +502,8 @@ mod tests {
                 "{key} must move the agent dir"
             );
         }
-        // Documented precedence: short name, then the sibling spelling, then the `PI_` fallback.
+        // Documented precedence: short name, then the sibling spelling. The dropped upstream
+        // `PI_` spelling is inert even when set.
         let all = env(&[
             ("CYRUP_AGENT_DIR", "/short"),
             ("CYRUP_CODING_AGENT_DIR", "/long"),
@@ -514,6 +512,11 @@ mod tests {
         assert_eq!(
             super::cyrup_agent_dir_from(&home, &all),
             PathBuf::from("/short")
+        );
+        // The dropped spelling alone: no override, the default layout wins.
+        assert_eq!(
+            super::cyrup_agent_dir_from(&home, &env(&[("PI_CODING_AGENT_DIR", "/legacy")])),
+            home.join(".cyrup").join("agent")
         );
         // Unset: `<home>/.cyrup/agent`.
         assert_eq!(

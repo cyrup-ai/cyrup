@@ -40,7 +40,10 @@ pub fn project_timeout_recovery(
     // `as_object` is `None` for null, scalars AND arrays — pi's `!value || typeof value !==
     // "object" || Array.isArray(value)` triple in one probe (`:117`).
     let source = value?.as_object()?;
-    let termination = match source.get("termination").and_then(serde_json::Value::as_str) {
+    let termination = match source
+        .get("termination")
+        .and_then(serde_json::Value::as_str)
+    {
         Some("timed-out") => Termination::TimedOut,
         Some("stopped") => Termination::Stopped,
         _ => return None, // whole-object reject (`:118`)
@@ -56,7 +59,10 @@ pub fn project_timeout_recovery(
         .take(MAX_TIMEOUT_FILES)
         .cloned()
         .collect();
-    let report_status = match source.get("reportStatus").and_then(serde_json::Value::as_str) {
+    let report_status = match source
+        .get("reportStatus")
+        .and_then(serde_json::Value::as_str)
+    {
         Some("missing") => Some(ReportStatus::Missing),
         Some("written") => Some(ReportStatus::Written),
         Some("not-requested") => Some(ReportStatus::NotRequested),
@@ -175,11 +181,23 @@ mod tests {
         assert_eq!(projection.termination, Termination::TimedOut);
         assert_eq!(projection.changed_files, vec!["src/a.rs", "src/b.rs"]);
         assert!(projection.recovery_needed);
-        assert_eq!(projection.reason, Some(RecoveryReason::TimedOutWithDirtyWorktree));
+        assert_eq!(
+            projection.reason,
+            Some(RecoveryReason::TimedOutWithDirtyWorktree)
+        );
         assert_eq!(projection.report_status, Some(ReportStatus::Missing));
         let json = serde_json::to_value(&projection).unwrap();
-        for leaked in ["message", "warning", "sessionFile", "transcriptPath", "artifactPaths"] {
-            assert!(json.get(leaked).is_none(), "{leaked} leaked into the projection");
+        for leaked in [
+            "message",
+            "warning",
+            "sessionFile",
+            "transcriptPath",
+            "artifactPaths",
+        ] {
+            assert!(
+                json.get(leaked).is_none(),
+                "{leaked} leaked into the projection"
+            );
         }
     }
 
@@ -190,7 +208,10 @@ mod tests {
         assert_eq!(project_timeout_recovery(Some(&bad_termination)), None);
 
         let mut missing_termination = recovery_payload();
-        missing_termination.as_object_mut().unwrap().remove("termination");
+        missing_termination
+            .as_object_mut()
+            .unwrap()
+            .remove("termination");
         assert_eq!(project_timeout_recovery(Some(&missing_termination)), None);
 
         let mut non_array = recovery_payload();
@@ -198,9 +219,18 @@ mod tests {
         assert_eq!(project_timeout_recovery(Some(&non_array)), None);
 
         assert_eq!(project_timeout_recovery(None), None);
-        assert_eq!(project_timeout_recovery(Some(&serde_json::json!(null))), None);
-        assert_eq!(project_timeout_recovery(Some(&serde_json::json!([1, 2]))), None);
-        assert_eq!(project_timeout_recovery(Some(&serde_json::json!("text"))), None);
+        assert_eq!(
+            project_timeout_recovery(Some(&serde_json::json!(null))),
+            None
+        );
+        assert_eq!(
+            project_timeout_recovery(Some(&serde_json::json!([1, 2]))),
+            None
+        );
+        assert_eq!(
+            project_timeout_recovery(Some(&serde_json::json!("text"))),
+            None
+        );
     }
 
     #[test]
@@ -235,10 +265,16 @@ mod tests {
         assert_eq!(projection.reason, None);
 
         let mut reason_only = recovery_payload();
-        reason_only.as_object_mut().unwrap().remove("recoveryNeeded");
+        reason_only
+            .as_object_mut()
+            .unwrap()
+            .remove("recoveryNeeded");
         let projection = project_timeout_recovery(Some(&reason_only)).unwrap();
         assert!(!projection.recovery_needed);
-        assert_eq!(projection.reason, Some(RecoveryReason::TimedOutWithDirtyWorktree));
+        assert_eq!(
+            projection.reason,
+            Some(RecoveryReason::TimedOutWithDirtyWorktree)
+        );
     }
 
     #[test]
@@ -307,7 +343,10 @@ mod tests {
         // …and `:144` — the count carries `+`.
         assert!(evidence_line.contains("(20+)"), "{evidence_line}");
         // `reason` absent → classification falls back to termination (`:147`).
-        assert!(evidence_line.ends_with("classification: timed-out"), "{evidence_line}");
+        assert!(
+            evidence_line.ends_with("classification: timed-out"),
+            "{evidence_line}"
+        );
     }
 
     #[test]

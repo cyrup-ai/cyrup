@@ -135,8 +135,7 @@ const INLINE_CLAIM_MAX_WAIT: Duration =
 /// `Drop` (which runs on timeout, abort and panic alike) is dropped here rather than pinning a
 /// delivery until [`INLINE_CLAIM_MAX_WAIT`].
 const CLAIM_HARD_TTL: Duration = Duration::from_millis(
-    crate::background::wait::DEFAULT_TIMEOUT_MS
-        + crate::background::wait::DEFAULT_POLL_INTERVAL_MS,
+    crate::background::wait::DEFAULT_TIMEOUT_MS + crate::background::wait::DEFAULT_POLL_INTERVAL_MS,
 );
 
 /// The ledger's shared state. `answered` is one-use and [`DEDUP_TTL`]-pruned; `claimed` is
@@ -355,11 +354,370 @@ impl CompletionSink for InlineAnsweredSink {
         // so a leaked claim degrades to "deliver normally" instead of parking this task forever.
         // Parking ONE delivery task is harmless only because F1 made deliveries concurrent; this
         // decorator must not be installed without F1.
-        let _ = tokio::time::timeout(INLINE_CLAIM_MAX_WAIT, self.ledger.claim_released(run_id))
-            .await;
+        let _ =
+            tokio::time::timeout(INLINE_CLAIM_MAX_WAIT, self.ledger.claim_released(run_id)).await;
         if self.ledger.take_answered(run_id) {
             return CompletionDelivery::delivered(run_id.clone());
         }
         self.inner.deliver(run_id, message).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
+
+    use super::super::message::{format_completion_message, format_undeliverable_message};
+    use super::super::tests::{child_result, result_with_children};
+    use super::*;
+    use crate::background::RunState;
+    use tokio::sync::Mutex as AsyncMutex;
+
+    /// What actually reached the inner sink — i.e. what actually reached the session.
+    type Delivered = Arc<AsyncMutex<Vec<CompletionMessage>>>;
+
+    /// A capturing inner sink — the same shape [`super::super::install`]'s tests use, so "the
+    /// notification was injected" is observable as a recorded push rather than inferred from a
+    /// return value. [`InlineAnsweredSink`] reports `Delivered` for a SUPPRESSED message too (the
+    /// value reached the orchestrator on the `wait` channel), so the return value alone cannot
+    /// tell suppression from delivery — this can.
+    #[derive(Clone, Default)]
+    struct CapturingSink {
+        delivered: Delivered,
+    }
+
+    #[async_trait::async_trait]
+    impl CompletionSink for CapturingSink {
+        async fn deliver(&self, run_id: &RunId, message: CompletionMessage) -> CompletionDelivery {
+            self.delivered.lock().await.push(message);
+            CompletionDelivery::delivered(run_id.clone())
+        }
+    }
+
+    /// A decorated sink plus a handle on what got past it.
+    fn wired(ledger: &InlineAnswerLedger) -> (InlineAnsweredSink, Delivered) {
+        let inner = CapturingSink::default();
+        let delivered = Arc::clone(&inner.delivered);
+        (
+            InlineAnsweredSink::new(Arc::new(inner), ledger.clone()),
+            delivered,
+        )
+    }
+
+    /// The ordinary value-carrying completion — the ONLY suppressible shape (F3.2). The inner
+    /// assertion is load-bearing: if `format_completion_message` ever stopped setting the flag,
+    /// every suppression test below would pass vacuously through the pass-through arm.
+    fn suppressible(run: &str, output: &str) -> CompletionMessage {
+        let result = result_with_children(
+            run,
+            RunState::Complete,
+            true,
+            None,
+            vec![child_result("worker", Some(output), 0)],
+        );
+        let message = format_completion_message(&result);
+        assert!(
+            message.suppressible,
+            "F3.2: an ordinary completion is suppressible"
+        );
+        message
+    }
+
+    /// A delivery-FAILURE report — never suppressible, whatever the ledger says.
+    fn undeliverable(run: &str, output: &str) -> CompletionMessage {
+        let result = result_with_children(
+            run,
+            RunState::Complete,
+            true,
+            None,
+            vec![child_result("worker", Some(output), 0)],
+        );
+        let message = format_undeliverable_message(&result);
+        assert!(
+            !message.suppressible,
+            "F3.2: a delivery-failure report is never suppressible"
+        );
+        message
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The one-use suppression authority
+    // ---------------------------------------------------------------------------------------
+
+    /// One inline answer authorises suppressing exactly ONE standalone notification — the same
+    /// one-use-authority discipline [`crate::background::delivery::DeliveryReceipt`] enforces for
+    /// consumption. A `take_answered` that failed to REMOVE the entry would silently swallow every
+    /// later completion for the run, which is a worse defect than the duplicate it fixes.
+    #[tokio::test]
+    async fn an_inline_answer_suppresses_exactly_one_standalone_notification() {
+        let ledger = InlineAnswerLedger::default();
+        let (sink, delivered) = wired(&ledger);
+        let run = RunId::from_token("run-once");
+
+        let mut claim = ledger.claim(std::slice::from_ref(&run));
+        claim.answered(&run);
+        drop(claim);
+
+        let first = sink.deliver(&run, suppressible("run-once", "VALUE")).await;
+        assert!(
+            matches!(first, CompletionDelivery::Delivered(_)),
+            "the value IS in the transcript, so the payload is consumable"
+        );
+        assert!(
+            delivered.lock().await.is_empty(),
+            "the duplicate must not be injected"
+        );
+
+        let second = sink.deliver(&run, suppressible("run-once", "VALUE")).await;
+        assert!(matches!(second, CompletionDelivery::Delivered(_)));
+        assert_eq!(
+            delivered.lock().await.len(),
+            1,
+            "one answer authorises one suppression; the next delivery goes through"
+        );
+    }
+
+    /// A wait that timed out, aborted or panicked answered NOTHING. Its guard's `Drop` still runs,
+    /// and that release must not manufacture an authority — suppressing here would destroy a
+    /// background child's only answer.
+    #[tokio::test]
+    async fn a_claim_released_without_an_answer_lets_the_notification_through() {
+        let ledger = InlineAnswerLedger::default();
+        let (sink, delivered) = wired(&ledger);
+        let run = RunId::from_token("run-unanswered");
+
+        drop(ledger.claim(std::slice::from_ref(&run)));
+        assert!(!ledger.is_claimed(&run), "Drop releases the claim");
+
+        let delivery = sink
+            .deliver(&run, suppressible("run-unanswered", "VALUE"))
+            .await;
+        assert!(matches!(delivery, CompletionDelivery::Delivered(_)));
+        assert_eq!(
+            delivered.lock().await.len(),
+            1,
+            "an unanswered run is delivered normally"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // RC4: the hold-off
+    // ---------------------------------------------------------------------------------------
+
+    /// **The end-to-end regression this whole task exists to fix.**
+    ///
+    /// [`HostServicesCompletionSink::deliver`] enqueues into the session pump and only THEN awaits
+    /// the ack, so cancelling the await cannot retract the injection: the only sound suppression
+    /// point is before the enqueue. A delivery for a run a live `wait` is blocked on must therefore
+    /// HOLD OFF until that wait either answers it inline or releases its claim. Without the
+    /// hold-off the watcher wins the race, the message is already in the pump, and the orchestrator
+    /// receives the same value twice — the reported defect.
+    #[tokio::test]
+    async fn a_delivery_holds_off_until_the_covering_wait_releases_its_claim() {
+        let ledger = InlineAnswerLedger::default();
+        let (sink, delivered) = wired(&ledger);
+        let run = RunId::from_token("run-rc4");
+
+        // A live `wait` claims the run BEFORE the watcher's delivery starts — RC4's window.
+        let mut claim = ledger.claim(std::slice::from_ref(&run));
+
+        let deliver = sink.deliver(&run, suppressible("run-rc4", "INLINE-VALUE"));
+        tokio::pin!(deliver);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut deliver)
+                .await
+                .is_err(),
+            "a delivery must not reach the pump while a wait covering the run is in flight"
+        );
+        assert!(delivered.lock().await.is_empty());
+
+        // The wait renders the value and returns.
+        claim.answered(&run);
+        drop(claim);
+
+        let delivery = tokio::time::timeout(Duration::from_secs(5), deliver)
+            .await
+            .expect("releasing the claim wakes the held delivery");
+        assert!(matches!(delivery, CompletionDelivery::Delivered(_)));
+        assert!(
+            delivered.lock().await.is_empty(),
+            "the value reached the orchestrator on the wait channel; the duplicate is suppressed"
+        );
+    }
+
+    /// The other half of the same race, and the reason the hold-off is not simply a drop: a wait
+    /// that holds a claim and then releases it WITHOUT answering must let the held delivery
+    /// through, not swallow it.
+    #[tokio::test]
+    async fn a_held_delivery_is_released_and_delivered_when_the_wait_answers_nothing() {
+        let ledger = InlineAnswerLedger::default();
+        let (sink, delivered) = wired(&ledger);
+        let run = RunId::from_token("run-rc4-timeout");
+
+        let claim = ledger.claim(std::slice::from_ref(&run));
+        let deliver = sink.deliver(&run, suppressible("run-rc4-timeout", "VALUE"));
+        tokio::pin!(deliver);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut deliver)
+                .await
+                .is_err()
+        );
+
+        drop(claim); // the wait timed out
+
+        tokio::time::timeout(Duration::from_secs(5), deliver)
+            .await
+            .expect("the release wakes the held delivery");
+        assert_eq!(
+            delivered.lock().await.len(),
+            1,
+            "nobody answered this run, so its notification must arrive"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Never suppress, never park
+    // ---------------------------------------------------------------------------------------
+
+    /// A delivery-failure report carries information no `wait` could ever have surfaced. The early
+    /// return must fire BEFORE both the hold-off and `take_answered` — the trailing assertion is
+    /// what pins that ordering: a mis-placed check would burn the one-use authority here and let a
+    /// genuinely duplicate notification through later.
+    #[tokio::test]
+    async fn a_delivery_failure_report_is_never_suppressed_and_never_burns_the_authority() {
+        let ledger = InlineAnswerLedger::default();
+        let (sink, delivered) = wired(&ledger);
+        let run = RunId::from_token("run-undeliverable");
+
+        let mut claim = ledger.claim(std::slice::from_ref(&run));
+        claim.answered(&run);
+        drop(claim);
+
+        let delivery = sink
+            .deliver(&run, undeliverable("run-undeliverable", "VALUE"))
+            .await;
+        assert!(matches!(delivery, CompletionDelivery::Delivered(_)));
+        assert_eq!(
+            delivered.lock().await.len(),
+            1,
+            "a delivery-failure report must always reach the session"
+        );
+        assert!(
+            ledger.take_answered(&run),
+            "the non-suppressible path must not consume the inline answer"
+        );
+    }
+
+    /// A claim that somehow outlived every `Drop` must degrade to "deliver normally" rather than
+    /// park a delivery task forever.
+    ///
+    /// Virtual time: [`InlineAnswerLedger::claim_released`] awaits a `watch` generation, NOT a
+    /// timer, so the runtime goes idle and tokio auto-advances straight to
+    /// [`INLINE_CLAIM_MAX_WAIT`] — 30 real minutes in ~0 wall-clock.
+    #[tokio::test(start_paused = true)]
+    async fn a_leaked_claim_degrades_to_delivering_normally_instead_of_parking_forever() {
+        let ledger = InlineAnswerLedger::default();
+        let (sink, delivered) = wired(&ledger);
+        let run = RunId::from_token("run-leaked-claim");
+
+        // Held for the whole test and never answered — the failure this bound exists for.
+        let _claim = ledger.claim(std::slice::from_ref(&run));
+        assert!(ledger.is_claimed(&run));
+
+        let delivery = sink
+            .deliver(&run, suppressible("run-leaked-claim", "VALUE"))
+            .await;
+        assert!(matches!(delivery, CompletionDelivery::Delivered(_)));
+        assert_eq!(
+            delivered.lock().await.len(),
+            1,
+            "past INLINE_CLAIM_MAX_WAIT the delivery must go through, not park"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Bounded by construction
+    // ---------------------------------------------------------------------------------------
+
+    /// Two concurrent waits — the `wait` tool and the headless auto-drain — can cover the same run.
+    /// One guard's drop must not release the other's claim, or the surviving wait's delivery stops
+    /// being held off half-way through.
+    #[test]
+    fn two_waits_covering_the_same_run_refcount_the_claim() {
+        let ledger = InlineAnswerLedger::default();
+        let run = RunId::from_token("run-two-waits");
+
+        let first = ledger.claim(std::slice::from_ref(&run));
+        let second = ledger.claim(std::slice::from_ref(&run));
+        assert!(ledger.is_claimed(&run));
+
+        drop(first);
+        assert!(
+            ledger.is_claimed(&run),
+            "one guard's drop must not release the other wait's claim"
+        );
+
+        drop(second);
+        assert!(!ledger.is_claimed(&run));
+    }
+
+    /// [`InlineAnswerClaim::answered`] is idempotent per id, so a wait that marks the same run
+    /// twice still authorises exactly one suppression.
+    #[test]
+    fn marking_the_same_run_answered_twice_authorises_one_suppression() {
+        let ledger = InlineAnswerLedger::default();
+        let run = RunId::from_token("run-idempotent");
+
+        let mut claim = ledger.claim(std::slice::from_ref(&run));
+        claim.answered(&run);
+        claim.answered(&run);
+        drop(claim);
+
+        assert!(ledger.take_answered(&run));
+        assert!(!ledger.take_answered(&run));
+    }
+
+    /// Both maps are bounded by construction.
+    ///
+    /// Driven with a FUTURE `now` rather than a back-dated `Instant`: [`CLAIM_HARD_TTL`] is 30m1s
+    /// and `Instant` is boot-relative, so `Instant::now() - CLAIM_HARD_TTL` panics outright on a
+    /// host with under 31 minutes of uptime (routine in CI containers). The boundaries are walked
+    /// in TTL order ([`DEDUP_TTL`] 10m < [`CLAIM_HARD_TTL`] 30m1s), which is also the order
+    /// production hits them.
+    #[test]
+    fn both_ledger_maps_are_pruned_at_their_own_ttl() {
+        let run = RunId::from_token("run-stale");
+        let now = Instant::now();
+        let mut state = LedgerState::default();
+        state.claimed.insert(run.clone(), (1, now));
+        state.answered.insert(run.clone(), now);
+
+        InlineAnswerLedger::prune(&mut state, now + Duration::from_secs(1));
+        assert!(
+            state.claimed.contains_key(&run),
+            "inside both TTLs, nothing is evicted"
+        );
+        assert!(state.answered.contains_key(&run));
+
+        InlineAnswerLedger::prune(&mut state, now + DEDUP_TTL + Duration::from_secs(1));
+        assert!(
+            !state.answered.contains_key(&run),
+            "an answer past DEDUP_TTL can no longer authorise a suppression"
+        );
+        assert!(
+            state.claimed.contains_key(&run),
+            "DEDUP_TTL (10m) must not evict a claim bounded by CLAIM_HARD_TTL (30m1s)"
+        );
+
+        InlineAnswerLedger::prune(&mut state, now + CLAIM_HARD_TTL + Duration::from_secs(1));
+        assert!(
+            !state.claimed.contains_key(&run),
+            "a claim that outlived every Drop is hard-pruned rather than pinning a delivery"
+        );
     }
 }

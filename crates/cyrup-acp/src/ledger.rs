@@ -1273,7 +1273,9 @@ mod tests {
     /// preview after `upto` lines have been written is the last `window` of them — a window that
     /// slides, not a string that grows.
     fn tail_window(upto: usize, window: usize) -> String {
-        (upto.saturating_sub(window)..upto).map(corpus_line).collect()
+        (upto.saturating_sub(window)..upto)
+            .map(corpus_line)
+            .collect()
     }
 
     /// ACP-140 — the case the real producer reaches on every flush of any command past
@@ -1283,8 +1285,14 @@ mod tests {
     fn a_slid_window_resyncs_on_the_overlap() {
         let mut appender = TerminalAppender::default();
         // Four lines fit in the window, so the first two pushes still grow.
-        assert_eq!(appender.push(&tail_window(1, 4)), Push::Append(corpus_line(0)));
-        assert_eq!(appender.push(&tail_window(2, 4)), Push::Append(corpus_line(1)));
+        assert_eq!(
+            appender.push(&tail_window(1, 4)),
+            Push::Append(corpus_line(0))
+        );
+        assert_eq!(
+            appender.push(&tail_window(2, 4)),
+            Push::Append(corpus_line(1))
+        );
         // From here the window is full and every later preview has dropped its head. Before this
         // fix each of these was `Push::Desynced` — forever, for the rest of the command.
         assert_eq!(
@@ -1292,7 +1300,10 @@ mod tests {
             Push::Resync([corpus_line(2), corpus_line(3), corpus_line(4)].concat()),
             "three lines were written between flushes; the fourth is the overlap"
         );
-        assert_eq!(appender.push(&tail_window(6, 4)), Push::Resync(corpus_line(5)));
+        assert_eq!(
+            appender.push(&tail_window(6, 4)),
+            Push::Resync(corpus_line(5))
+        );
         assert_eq!(
             appender.push(&tail_window(9, 4)),
             Push::Resync([corpus_line(6), corpus_line(7), corpus_line(8)].concat())

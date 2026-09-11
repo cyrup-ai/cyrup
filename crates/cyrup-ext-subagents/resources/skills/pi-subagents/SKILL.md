@@ -132,15 +132,17 @@ subagent({
 Builtin agents load at the lowest priority. Project agents override user agents,
 and user/project agents override builtins with the same name.
 
-| Agent | Purpose | Model | Typical output / role |
+| Agent | Purpose | Tools | Typical output / role |
 |-------|---------|-------|------------------------|
-| `scout` | Fast codebase recon | inherits default | Writes `context.md` handoff material |
-| `worker` | Implementation and approved oracle handoffs | inherits default | Single-writer implementation with decision escalation |
-| `reviewer` | Review-and-fix specialist | inherits default | Can edit/fix reviewed code |
-| `researcher` | Web research brief generator | inherits default | Writes `research.md` |
-| `delegate` | Lightweight generic delegate | inherits default | No fixed output; generic delegated work |
-| `oracle` | Decision-consistency advisory review | inherits default | Advisory review, intercom coordination |
-| `advisor` | Claude Code-compatible alias for `oracle` | inherits default | Same advisory role as `oracle` |
+| `scout` | Fast codebase recon | read, grep, find, ls, bash, write, intercom | Writes `context.md` handoff material |
+| `worker` | Implementation and approved oracle handoffs | read, grep, find, ls, bash, edit, write, contact_supervisor | Single-writer implementation with decision escalation |
+| `reviewer` | Read-only review specialist | read, grep, find, ls, intercom | Evidence-backed findings; **cannot edit, write or run shell commands** |
+| `researcher` | Research brief generator | read, grep, find, ls, write, intercom | Writes `research.md`; no shell |
+| `delegate` | Lightweight generic delegate | read, grep, find, ls, bash, edit, write, contact_supervisor | No fixed output; generic delegated work |
+| `oracle` | Decision-consistency advisory review | read, grep, find, ls, bash, intercom | Advisory review, intercom coordination |
+| `advisor` | Claude Code-compatible alias for `oracle` | (same as `oracle`) | Same advisory role as `oracle` |
+
+**A subagent's tools are NOT inherited from your session.** A child's surface is pinned by its own agent definition (`tools:`), narrowed by `excludeTools` and by any capability ceiling. Telling a child in its task prompt that it "has bash" does not give it bash. Check with `subagent({ action: "get", agent: "<name>" })`, or read the `tools:` field in `subagent({ action: "list" })`, before you write a prompt that assumes a capability.
 
 Builtin agents inherit the current Pi default model unless a run, user setting, or project setting overrides `model`. Override builtin defaults before copying full agent files when a small tweak is enough.
 

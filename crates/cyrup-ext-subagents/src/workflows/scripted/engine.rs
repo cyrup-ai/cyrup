@@ -33,12 +33,23 @@
 //! ([`WORKFLOW_DEFAULT_TIMEOUT_MS`] when the caller supplies none), and settlement by
 //! [`WORKFLOW_SETTLE_DRAIN_TIMEOUT_MS`]. The teardown order is fixed and is stated at
 //! [`run_workflow_script`].
+//!
+//! # The snapshot and the ops crate (§7)
+//!
+//! The `#[op2]` ops, the `extension!` declaration and `js/prelude.js` live in the
+//! `cyrup-workflow-runtime` crate, not here: a `build.rs` can never import from the crate whose
+//! build it is running, and this crate's own `build.rs` (new, alongside this file) needs exactly
+//! that extension to produce `WORKFLOW_SNAPSHOT`. [`RunSharedBridge`] is the thin adapter from
+//! [`RunShared`] to that crate's `WorkflowOpsBridge` trait, seeded into `OpState` directly after
+//! `JsRuntime::new` — never through the extension's `options`/`state` — because a snapshot reused
+//! across many different workflow runs must never have any one run's state baked into it.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cyrup_core::cancel::CancelToken;
+use cyrup_workflow_runtime::{ObservationKind, WorkflowOpsBridge};
 use serde_json::{Map, Value, json};
 use tokio::sync::watch;
 
@@ -196,17 +207,18 @@ pub type WorkflowPermitClaim = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>
 /// pi `continueAfterAbortWhenChildrenSettled` (`:1109`).
 pub type WorkflowFlushEligibility = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 /// pi `onTrace` (`:1124`).
-pub type WorkflowTraceCallback =
-    Arc<dyn Fn(&WorkflowScriptTraceEntry, usize) + Send + Sync>;
+pub type WorkflowTraceCallback = Arc<dyn Fn(&WorkflowScriptTraceEntry, usize) + Send + Sync>;
 /// pi `onLanePlan` (`:1125`).
 pub type WorkflowLanePlanCallback = Arc<dyn Fn(&[WorkflowLanePlan]) + Send + Sync>;
 /// pi `onEmit` (`:1126`) — fallible: a persistence failure aborts the run.
-pub type WorkflowEmitCallback =
-    Arc<
-        dyn Fn(Vec<Value>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
-            + Send
-            + Sync,
-    >;
+pub type WorkflowEmitCallback = Arc<
+    dyn Fn(
+            Vec<Value>,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+        + Send
+        + Sync,
+>;
 /// pi `onHostStep` (`:1119`).
 pub type WorkflowHostStepCallback = Arc<dyn Fn(&HostStepNode) + Send + Sync>;
 /// pi `registerStopChild` (`:1123`) — `Some(stop)` before the run, `None` at settlement.
@@ -375,7 +387,10 @@ impl RunShared {
     }
 
     fn record_fatal(&self, message: String, error_kind: Option<WorkflowScriptErrorKind>) {
-        let mut fatal = self.fatal.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut fatal = self
+            .fatal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if fatal.is_none() {
             *fatal = Some(PendingFailure {
                 message,
@@ -457,7 +472,10 @@ impl RunShared {
     /// Allocate the next steer/host record id. Deliberately NOT a handle: §3.2's op model means
     /// the future is the operation, so this id never leaves the host — it exists only so the
     /// settlement scan can name which `runs.steer`/`runs.host` call went unobserved.
-    #[allow(dead_code, reason = "the guest allocates correlation ids; kept for host-side callers")]
+    #[allow(
+        dead_code,
+        reason = "the guest allocates correlation ids; kept for host-side callers"
+    )]
     fn next_op_id(&self) -> u64 {
         let mut inner = self.lock();
         inner.next_op_id += 1;
@@ -471,8 +489,7 @@ impl RunShared {
     /// only the first stage — making every multi-stage lane fail settlement with a spurious
     /// "unawaited runs.run launch(es)". Upstream cannot key this way (it has no host-side identity
     /// for a promise); here the launch key IS the identity.
-    pub(crate) fn mark_observed(&self, kind: super::ops::ObservationKind, key: &str, call_id: u64) {
-        use super::ops::ObservationKind;
+    pub(crate) fn mark_observed(&self, kind: ObservationKind, key: &str, call_id: u64) {
         let mut inner = self.lock();
         match kind {
             ObservationKind::Run => {
@@ -505,7 +522,9 @@ impl RunShared {
     /// Captured `console.*` (`:770-776`). An unknown level is dropped, as upstream drops it.
     pub(crate) fn record_console(&self, level: &str, text: String) {
         if let Some(level) = WorkflowConsoleLevel::parse(level) {
-            self.lock().console.push(WorkflowConsoleEntry { level, text });
+            self.lock()
+                .console
+                .push(WorkflowConsoleEntry { level, text });
         }
     }
 
@@ -554,7 +573,10 @@ impl RunShared {
         {
             let inner = self.lock();
             if let Some(barrier) = &inner.recovery_barrier {
-                return Err(recovery_barrier_message(barrier, &format!("state.set('{key}')")));
+                return Err(recovery_barrier_message(
+                    barrier,
+                    &format!("state.set('{key}')"),
+                ));
             }
         }
         assert_workflow_json_value(&value, &format!("state.set('{key}') value"))?;
@@ -562,23 +584,78 @@ impl RunShared {
     }
 }
 
-/// The handle the ops reach the run through, stored in `deno_core`'s [`deno_core::OpState`].
-///
-/// Cheap to clone (one `Arc`), because every op clones it out of `OpState` rather than holding the
-/// borrow across an `.await` — `OpState` is a `RefCell` and holding it across a suspension point
-/// would panic the moment two ops overlapped, which under §3.2 is the normal case.
+/// Bridges [`RunShared`] to `cyrup_workflow_runtime`'s `WorkflowOpsBridge` (§7) — the ONLY thing
+/// that crate's ops can reach outside their own crate. A thin newtype rather than an
+/// `impl … for RunShared` directly: several of `RunShared`'s own operations (`run_launch`,
+/// `run_status`, …) take `&Arc<RunShared>`, not `&RunShared`, because they clone the `Arc` to move
+/// an owned handle into a spawned task — a bridge trait's `&self` cannot manufacture that `Arc`
+/// back out of a bare reference, so this wrapper simply holds it.
 #[derive(Clone)]
-pub(crate) struct WorkflowOpState {
-    shared: Arc<RunShared>,
-}
+struct RunSharedBridge(Arc<RunShared>);
 
-impl WorkflowOpState {
-    pub(crate) fn new(shared: Arc<RunShared>) -> Self {
-        Self { shared }
+#[async_trait::async_trait]
+impl WorkflowOpsBridge for RunSharedBridge {
+    async fn launch(&self, envelope: Value) -> Result<Value, String> {
+        let envelope: LaunchEnvelope = serde_json::from_value(envelope)
+            .map_err(|error| format!("Invalid workflow launch envelope: {error}"))?;
+        let delivery = run_launch(&self.0, envelope).await?;
+        serde_json::to_value(&delivery)
+            .map_err(|error| format!("Workflow launch result could not be persisted: {error}"))
     }
 
-    pub(crate) fn shared(&self) -> &Arc<RunShared> {
-        &self.shared
+    async fn status(&self, key_or_run_id: String) -> Result<Value, String> {
+        let result = run_status(&self.0, &key_or_run_id).await?;
+        serde_json::to_value(&result)
+            .map_err(|error| format!("Workflow status result could not be persisted: {error}"))
+    }
+
+    async fn steer(
+        &self,
+        call_id: u64,
+        key: String,
+        message: String,
+        options: Value,
+    ) -> Result<Value, String> {
+        let options: WorkflowSteerOptions = serde_json::from_value(options)
+            .map_err(|error| format!("Invalid runs.steer options: {error}"))?;
+        let result = run_steer(&self.0, call_id, &key, &message, options).await?;
+        serde_json::to_value(&result)
+            .map_err(|error| format!("Workflow steer result could not be persisted: {error}"))
+    }
+
+    async fn host_command(
+        &self,
+        call_id: u64,
+        key: String,
+        params: Value,
+    ) -> Result<Value, String> {
+        let result = run_host_command(&self.0, call_id, &key, params).await?;
+        serde_json::to_value(&result)
+            .map_err(|error| format!("Workflow host result could not be persisted: {error}"))
+    }
+
+    fn observe(&self, kind: ObservationKind, key: String, call_id: u64) {
+        self.0.mark_observed(kind, &key, call_id);
+    }
+
+    fn record_lane_plan(&self, lanes_json: String) {
+        self.0.record_lane_plan(&lanes_json);
+    }
+
+    async fn emit(&self, value: Value) -> Result<(), String> {
+        self.0.emit(value).await
+    }
+
+    fn record_console(&self, level: String, text: String) {
+        self.0.record_console(&level, text);
+    }
+
+    async fn state_get(&self, key: String) -> Result<Option<Value>, String> {
+        self.0.state_get(&key).await
+    }
+
+    async fn state_set(&self, key: String, value: Value) -> Result<(), String> {
+        self.0.state_set(&key, value).await
     }
 }
 
@@ -595,7 +672,9 @@ fn stopped_child_result(key: &str, message: &str) -> WorkflowScriptChildResult {
 }
 
 /// pi `workflowStringMetadata` (`:1628-1636`): the display metadata copied onto trace entries.
-fn workflow_string_metadata(params: &Map<String, Value>) -> (Option<String>, Option<String>, Option<String>) {
+fn workflow_string_metadata(
+    params: &Map<String, Value>,
+) -> (Option<String>, Option<String>, Option<String>) {
     let field = |name: &str| {
         params
             .get(name)
@@ -655,10 +734,17 @@ fn is_zero_usage(usage: Option<&Value>) -> bool {
     let Some(usage) = usage.and_then(Value::as_object) else {
         return false;
     };
-    let zero = |field: &str| usage.get(field).map_or(0.0, |v| v.as_f64().unwrap_or(f64::NAN)) == 0.0;
+    let zero = |field: &str| {
+        usage
+            .get(field)
+            .map_or(0.0, |v| v.as_f64().unwrap_or(f64::NAN))
+            == 0.0
+    };
     let cost_zero = match usage.get("cost") {
         Some(Value::Object(cost)) => {
-            cost.get("total").map_or(0.0, |v| v.as_f64().unwrap_or(f64::NAN)) == 0.0
+            cost.get("total")
+                .map_or(0.0, |v| v.as_f64().unwrap_or(f64::NAN))
+                == 0.0
         }
         _ => true,
     };
@@ -810,7 +896,9 @@ fn parse_workflow_resume_reference(
 /// cross the JSON boundary loses `results` and keeps everything else. Structurally, a
 /// [`serde_json::Value`] is always JSON, so the assert can only fail on a non-finite number — the
 /// drop-`results` arm is retained because it is upstream's behaviour at this exact seam.
-fn omit_non_json_workflow_result_metadata(result: &WorkflowScriptChildResult) -> WorkflowScriptChildResult {
+fn omit_non_json_workflow_result_metadata(
+    result: &WorkflowScriptChildResult,
+) -> WorkflowScriptChildResult {
     let mut normalized = result.clone();
     let results_ok = normalized
         .results
@@ -837,7 +925,10 @@ fn workflow_return_recovery_hint(children: &[WorkflowScriptChildResult]) -> Stri
                 fields.push(format!("runId={}", truncate_chars(run_id, 500)));
             }
             if let Some(reference) = &child.output_reference {
-                fields.push(format!("outputReference={}", truncate_chars(reference, 500)));
+                fields.push(format!(
+                    "outputReference={}",
+                    truncate_chars(reference, 500)
+                ));
             }
             if let Some(artifact) = child.artifact_paths.first() {
                 fields.push(format!("artifact={}", truncate_chars(artifact, 500)));
@@ -903,12 +994,18 @@ pub(crate) async fn run_status(
         let inner = shared.lock();
         let known = inner.children.get(&key);
         (
-            known.and_then(|child| child.run_id.clone()).unwrap_or_else(|| key.clone()),
+            known
+                .and_then(|child| child.run_id.clone())
+                .unwrap_or_else(|| key.clone()),
             known.and_then(|child| child.run_id.clone()),
             inner.finishing,
         )
     };
-    let mut started = trace_entry(WorkflowScriptOperation::Status, &key, WorkflowScriptTraceState::Started);
+    let mut started = trace_entry(
+        WorkflowScriptOperation::Status,
+        &key,
+        WorkflowScriptTraceState::Started,
+    );
     started.run_id = known_run_id;
     shared.push_trace(started);
     if finishing {
@@ -1012,7 +1109,10 @@ pub(crate) async fn run_steer(
         let steer_key = key.clone();
         let steer_message = message.clone();
         shared
-            .on_main(async move { host.steer(&steer_key, &steer_message, options, cancel).await })
+            .on_main(async move {
+                host.steer(&steer_key, &steer_message, options, cancel)
+                    .await
+            })
             .await
             .and_then(|outcome| outcome)
     };
@@ -1063,10 +1163,8 @@ pub(crate) async fn run_host_command(
     raw_params: Value,
 ) -> Result<WorkflowHostCommandResult, String> {
     let key = validate_key(Some(&Value::String(key.to_string())), "runs.host")?;
-    let params = normalize_workflow_host_command_params(
-        &raw_params,
-        &format!("runs.host('{key}') params"),
-    )?;
+    let params =
+        normalize_workflow_host_command_params(&raw_params, &format!("runs.host('{key}') params"))?;
     {
         let inner = shared.lock();
         if let Some(barrier) = &inner.recovery_barrier {
@@ -1135,111 +1233,109 @@ pub(crate) async fn run_host_command(
             .await
             .and_then(|outcome| outcome)
     };
-        match outcome {
-            Ok(result) => {
-                let detail_raw = [
-                    result.error.clone().unwrap_or_default(),
-                    {
-                        let stderr = result.stderr.trim();
-                        if stderr.is_empty() {
-                            result.stdout.trim().to_string()
-                        } else {
-                            stderr.to_string()
-                        }
-                    },
-                ]
-                .into_iter()
-                .filter(|part| !part.is_empty())
-                .collect::<Vec<_>>()
-                .join(" ");
-                let detail: String = truncate_chars(
-                    detail_raw.split_whitespace().collect::<Vec<_>>().join(" ").trim(),
-                    200,
-                );
-                let state = match result.state {
-                    WorkflowHostCommandState::Stopped => HostStepState::Cancelled,
-                    _ if result.ok => HostStepState::Done,
-                    _ => HostStepState::Error,
-                };
-                let mut step = started_step.clone();
-                step.state = state;
-                step.verdict = (state == HostStepState::Done).then_some(HostStepVerdict::Pass);
-                step.reason_code = (!result.ok).then(|| match result.state {
-                    WorkflowHostCommandState::TimedOut => "timed_out".to_string(),
-                    WorkflowHostCommandState::Stopped => "aborted".to_string(),
-                    _ => "command_failed".to_string(),
-                });
-                step.detail = (!detail.is_empty()).then(|| detail.clone());
-                step.report_path = params.output.clone().or_else(|| {
-                    result
-                        .output_path
-                        .file_name()
-                        .map(|name| name.to_string_lossy().to_string())
-                });
-                step.exit_code = result.exit_code.map(Into::into);
-                step.updated_at = now_ms().into();
-                shared.host_step_changed(&step);
-                let mut entry = trace_entry(
-                    WorkflowScriptOperation::Host,
-                    &key,
-                    if result.ok {
-                        WorkflowScriptTraceState::Completed
-                    } else if result.state == WorkflowHostCommandState::Stopped {
-                        WorkflowScriptTraceState::Stopped
-                    } else {
-                        WorkflowScriptTraceState::Failed
-                    },
-                );
-                entry.duration_ms = Some(result.duration_ms);
-                if !result.ok {
-                    entry.error = Some(
-                        result
-                            .error
-                            .clone()
-                            .unwrap_or_else(|| "Host command failed.".to_string()),
-                    );
-                }
-                shared.push_trace(entry);
-                shared.bump();
-                if result.ok {
-                    Ok(result)
+    match outcome {
+        Ok(result) => {
+            let detail_raw = [result.error.clone().unwrap_or_default(), {
+                let stderr = result.stderr.trim();
+                if stderr.is_empty() {
+                    result.stdout.trim().to_string()
                 } else {
-                    let fallback = result
+                    stderr.to_string()
+                }
+            }]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+            let detail: String = truncate_chars(
+                detail_raw
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .trim(),
+                200,
+            );
+            let state = match result.state {
+                WorkflowHostCommandState::Stopped => HostStepState::Cancelled,
+                _ if result.ok => HostStepState::Done,
+                _ => HostStepState::Error,
+            };
+            let mut step = started_step.clone();
+            step.state = state;
+            step.verdict = (state == HostStepState::Done).then_some(HostStepVerdict::Pass);
+            step.reason_code = (!result.ok).then(|| match result.state {
+                WorkflowHostCommandState::TimedOut => "timed_out".to_string(),
+                WorkflowHostCommandState::Stopped => "aborted".to_string(),
+                _ => "command_failed".to_string(),
+            });
+            step.detail = (!detail.is_empty()).then(|| detail.clone());
+            step.report_path = params.output.clone().or_else(|| {
+                result
+                    .output_path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+            });
+            step.exit_code = result.exit_code.map(Into::into);
+            step.updated_at = now_ms().into();
+            shared.host_step_changed(&step);
+            let mut entry = trace_entry(
+                WorkflowScriptOperation::Host,
+                &key,
+                if result.ok {
+                    WorkflowScriptTraceState::Completed
+                } else if result.state == WorkflowHostCommandState::Stopped {
+                    WorkflowScriptTraceState::Stopped
+                } else {
+                    WorkflowScriptTraceState::Failed
+                },
+            );
+            entry.duration_ms = Some(result.duration_ms);
+            if !result.ok {
+                entry.error = Some(
+                    result
                         .error
                         .clone()
-                        .unwrap_or_else(|| {
-                            format!(
-                                "exit code {}",
-                                result
-                                    .exit_code
-                                    .map_or_else(|| "unknown".to_string(), |code| code.to_string())
-                            )
-                        });
-                    let text = if detail.is_empty() { fallback } else { detail };
-                    Err(format!("Host command '{key}' failed: {text}"))
-                }
-            }
-            Err(error) => {
-                let mut step = started_step.clone();
-                step.state = HostStepState::Error;
-                step.reason_code = Some("execution_failed".to_string());
-                step.detail = Some(truncate_chars(
-                    &error.split_whitespace().collect::<Vec<_>>().join(" "),
-                    200,
-                ));
-                step.updated_at = now_ms().into();
-                shared.host_step_changed(&step);
-                let mut entry = trace_entry(
-                    WorkflowScriptOperation::Host,
-                    &key,
-                    WorkflowScriptTraceState::Failed,
+                        .unwrap_or_else(|| "Host command failed.".to_string()),
                 );
-                entry.duration_ms = Some(started.elapsed().as_millis() as u64);
-                entry.error = Some(error.clone());
-                shared.push_trace(entry);
-                shared.bump();
-                Err(error)
             }
+            shared.push_trace(entry);
+            shared.bump();
+            if result.ok {
+                Ok(result)
+            } else {
+                let fallback = result.error.clone().unwrap_or_else(|| {
+                    format!(
+                        "exit code {}",
+                        result
+                            .exit_code
+                            .map_or_else(|| "unknown".to_string(), |code| code.to_string())
+                    )
+                });
+                let text = if detail.is_empty() { fallback } else { detail };
+                Err(format!("Host command '{key}' failed: {text}"))
+            }
+        }
+        Err(error) => {
+            let mut step = started_step.clone();
+            step.state = HostStepState::Error;
+            step.reason_code = Some("execution_failed".to_string());
+            step.detail = Some(truncate_chars(
+                &error.split_whitespace().collect::<Vec<_>>().join(" "),
+                200,
+            ));
+            step.updated_at = now_ms().into();
+            shared.host_step_changed(&step);
+            let mut entry = trace_entry(
+                WorkflowScriptOperation::Host,
+                &key,
+                WorkflowScriptTraceState::Failed,
+            );
+            entry.duration_ms = Some(started.elapsed().as_millis() as u64);
+            entry.error = Some(error.clone());
+            shared.push_trace(entry);
+            shared.bump();
+            Err(error)
+        }
     }
 }
 
@@ -1273,7 +1369,9 @@ pub(crate) async fn run_launch(
         Err(error) => return Err(error),
     };
     let Some(params) = envelope.params.as_object().cloned() else {
-        return Err(format!("runs.run('{key}', params) requires a params object."));
+        return Err(format!(
+            "runs.run('{key}', params) requires a params object."
+        ));
     };
     let generated_lane_key = envelope.generated_lane_key.as_deref().and_then(|lane| {
         (WorkflowKey::parse(lane).is_ok() && key.starts_with(&format!("{lane}.")))
@@ -1355,13 +1453,17 @@ pub(crate) async fn run_launch(
             "runs.run('{key}') accepts one child via {{ agent, task }}; use runs.all(...) and JavaScript control flow for orchestration."
         ));
     }
-    if params.get("worktree").is_some_and(|value| !value.is_boolean()) {
+    if params
+        .get("worktree")
+        .is_some_and(|value| !value.is_boolean())
+    {
         return Err(format!("runs.run('{key}') worktree must be true or false."));
     }
     if let Some(base_ref) = params.get("baseRef")
-        && !base_ref.as_str().is_some_and(valid_git_ref) {
-            return Err(format!("runs.run('{key}') {BASE_REF_VALIDATION_ERROR}"));
-        }
+        && !base_ref.as_str().is_some_and(valid_git_ref)
+    {
+        return Err(format!("runs.run('{key}') {BASE_REF_VALIDATION_ERROR}"));
+    }
     if let Some(gate) = params.get("gate") {
         if !gate.as_str().is_some_and(|text| !text.trim().is_empty()) {
             return Err(format!(
@@ -1431,7 +1533,7 @@ pub(crate) async fn run_launch(
     let is_batch = batch.is_some();
     let admission_cell = {
         let mut inner = shared.lock();
-        
+
         match &batch {
             Some((id, _)) => inner
                 .batch_admissions
@@ -1571,7 +1673,12 @@ pub(crate) async fn run_launch(
                     shared_task.push_trace(entry);
                 }
                 shared_task.bump();
-                Ok(deliver_launch(shared, &task_key, &effective, collect_failure))
+                Ok(deliver_launch(
+                    shared,
+                    &task_key,
+                    &effective,
+                    collect_failure,
+                ))
             }
             Err(error) => {
                 let failure = WorkflowScriptChildResult {
@@ -1609,7 +1716,12 @@ pub(crate) async fn run_launch(
                 };
                 shared_task.trace_changed();
                 shared_task.bump();
-                Ok(deliver_launch(shared, &task_key, &effective, collect_failure))
+                Ok(deliver_launch(
+                    shared,
+                    &task_key,
+                    &effective,
+                    collect_failure,
+                ))
             }
         }
     }
@@ -1669,7 +1781,10 @@ fn deliver_launch(
                 && recovery.reason == "acceptance-metadata-rejected"
         });
         if !result.ok && !result.stopped && !recoverable {
-            let reason = result.error.clone().unwrap_or_else(|| result.output.clone());
+            let reason = result
+                .error
+                .clone()
+                .unwrap_or_else(|| result.output.clone());
             let message = if result.detached {
                 format!("Run '{key}' detached: {reason}")
             } else {
@@ -1729,9 +1844,10 @@ async fn run_child(
                 }
                 for call in &admission_calls {
                     if let Some(barrier) = &inner.recovery_barrier
-                        && !is_explicit_read_only_recovery_review(&call.params) {
-                            return Err(recovery_barrier_message(barrier, &call.key));
-                        }
+                        && !is_explicit_read_only_recovery_review(&call.params)
+                    {
+                        return Err(recovery_barrier_message(barrier, &call.key));
+                    }
                 }
             }
             let host = shared.host.clone();
@@ -1772,7 +1888,10 @@ async fn run_child(
         .unwrap_or_else(|| shared.child_cancel.child_token());
 
     // Resume resolution (`:2208-2233`).
-    let resume_input = match (&resume_reference, params.get("resume").and_then(Value::as_str)) {
+    let resume_input = match (
+        &resume_reference,
+        params.get("resume").and_then(Value::as_str),
+    ) {
         (Some(reference), _) => Some(WorkflowResumeInput::Reference(reference.clone())),
         (None, Some(resume)) if shared.host.supports_resolve_resume() => {
             Some(WorkflowResumeInput::RunId(resume.to_string()))
@@ -1813,7 +1932,9 @@ async fn run_child(
             ),
         };
         if resume_reference.is_some() && resolved_run_id.is_empty() {
-            return Err("Keyed workflow receipt resume resolved without a retained run id.".to_string());
+            return Err(
+                "Keyed workflow receipt resume resolved without a retained run id.".to_string(),
+            );
         }
         if matches!(resolved, WorkflowResolvedResume::Reference(_)) {
             let mut seen = HashSet::new();
@@ -1837,9 +1958,9 @@ async fn run_child(
                 if let Some(continuation) = predecessor.and_then(|child| child.continuation.clone())
                     && continuation.run_ids.last().map(String::as_str)
                         == Some(resolved_run_id.as_str())
-                    {
-                        list = continuation.run_ids;
-                    }
+                {
+                    list = continuation.run_ids;
+                }
             }
             resolved_lineage = Some(list);
         }
@@ -1858,9 +1979,7 @@ async fn run_child(
     let result = {
         let recheck = {
             let inner = shared.lock();
-            inner.finishing
-                || inner.stopped_launches.contains(key)
-                || child_cancel.is_cancelled()
+            inner.finishing || inner.stopped_launches.contains(key) || child_cancel.is_cancelled()
         };
         if recheck {
             let text = {
@@ -1944,15 +2063,16 @@ async fn run_child(
     let mut normalized = result;
     if let Some(lineage) = resolved_lineage
         && !lineage.is_empty()
-            && let Some(run_id) = normalized.run_id.clone() {
-                let mut seen = HashSet::new();
-                let run_ids: Vec<String> = lineage
-                    .into_iter()
-                    .chain(std::iter::once(run_id))
-                    .filter(|id| seen.insert(id.clone()))
-                    .collect();
-                normalized.continuation = Some(WorkflowContinuation { run_ids });
-            }
+        && let Some(run_id) = normalized.run_id.clone()
+    {
+        let mut seen = HashSet::new();
+        let run_ids: Vec<String> = lineage
+            .into_iter()
+            .chain(std::iter::once(run_id))
+            .filter(|id| seen.insert(id.clone()))
+            .collect();
+        normalized.continuation = Some(WorkflowContinuation { run_ids });
+    }
     Ok(normalized)
 }
 
@@ -2023,30 +2143,11 @@ const WORKFLOW_HEAP_SLACK_BYTES: usize = 16 * 1024 * 1024;
 /// emit log, all of which are the model's own data.
 const WORKFLOW_HEAP_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 
-deno_core::extension!(
-    cyrup_workflow,
-    ops = [
-        crate::workflows::scripted::ops::op_runs_launch,
-        crate::workflows::scripted::ops::op_runs_status,
-        crate::workflows::scripted::ops::op_runs_steer,
-        crate::workflows::scripted::ops::op_runs_host,
-        crate::workflows::scripted::ops::op_workflow_observe,
-        crate::workflows::scripted::ops::op_runs_lane_plan,
-        crate::workflows::scripted::ops::op_workflow_emit,
-        crate::workflows::scripted::ops::op_workflow_log,
-        crate::workflows::scripted::ops::op_workflow_state_get,
-        crate::workflows::scripted::ops::op_workflow_state_set,
-    ],
-    // `include_js_files!` resolves `dir` against CARGO_MANIFEST_DIR, not this source file.
-    js = [ dir "src/workflows/scripted/js", "prelude.js" ],
-    options = { shared: Arc<RunShared> },
-    state = |state, options| {
-        state.put(WorkflowOpState::new(options.shared));
-    },
-    docs = "The workflowScript runtime (SCOPE_3f §3.2). These ops are the ONLY capability the \
-            agent's script can reach; `deno_runtime` is deliberately not a dependency, so there is \
-            no fetch/fs/net/setTimeout to remove.",
-);
+/// The V8 startup snapshot for the workflow extension (§7). Built by this crate's OWN `build.rs`,
+/// which depends on `cyrup-workflow-runtime` (a normal, non-circular `[build-dependencies]` edge —
+/// see that crate's module doc for why the extension itself cannot live in THIS crate) and writes
+/// the bytes to this crate's `OUT_DIR`.
+static WORKFLOW_SNAPSHOT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/workflow.snapshot"));
 
 /// A thread-safe stop button for a running isolate (BLOCKER-2).
 ///
@@ -2081,11 +2182,7 @@ pub(crate) struct WorkflowGuestError {
 }
 
 impl IsolateThread {
-    fn spawn(
-        shared: Arc<RunShared>,
-        script: String,
-        state_enabled: bool,
-    ) -> Result<Self, String> {
+    fn spawn(shared: Arc<RunShared>, script: String, state_enabled: bool) -> Result<Self, String> {
         // Ops forward here so children run on the multi-thread pool while the isolate stays put.
         let main = tokio::runtime::Handle::current();
         let (handle_tx, handle_rx) = std::sync::mpsc::channel::<deno_core::v8::IsolateHandle>();
@@ -2146,13 +2243,27 @@ fn run_isolate(
     // evaluation, and `deno_unsync::spawn` needs a live runtime context at that moment.
     local.block_on(async move {
         let mut runtime = deno_core::JsRuntime::new(deno_core::RuntimeOptions {
-            extensions: vec![cyrup_workflow::init(shared.clone())],
+            // §7: the identical extension declaration used to build `WORKFLOW_SNAPSHOT` is
+            // supplied again here — `deno_core` recognises it by name against the loaded snapshot
+            // and skips re-executing its JS; ops still bind normally either way (see
+            // `cyrup_workflow_runtime`'s module doc).
+            extensions: vec![cyrup_workflow_runtime::cyrup_workflow::init()],
+            startup_snapshot: Some(WORKFLOW_SNAPSHOT),
             // §5.3: a deliberate cap, not an inherited default.
             create_params: Some(
                 deno_core::v8::CreateParams::default().heap_limits(0, WORKFLOW_HEAP_LIMIT_BYTES),
             ),
             ..Default::default()
         });
+
+        // §7 Part A: the bridge is seeded into `OpState` here, AFTER construction, rather than
+        // through the extension's `options`/`state` — a snapshot reused across many different
+        // workflow runs must never have any one run's state baked into it, and the build-time
+        // snapshot pass that produced `WORKFLOW_SNAPSHOT` has no live run to build one from at all.
+        {
+            let bridge: Arc<dyn WorkflowOpsBridge> = Arc::new(RunSharedBridge(shared.clone()));
+            runtime.op_state().borrow_mut().put(bridge);
+        }
 
         let isolate_handle = runtime.v8_isolate().thread_safe_handle();
         if handle_tx.send(isolate_handle.clone()).is_err() {
@@ -2165,7 +2276,10 @@ fn run_isolate(
             let shared = shared.clone();
             let handle = isolate_handle.clone();
             runtime.add_near_heap_limit_callback(move |current, _initial| {
-                shared.record_fatal("workflowScript exceeded its memory budget.".to_string(), None);
+                shared.record_fatal(
+                    "workflowScript exceeded its memory budget.".to_string(),
+                    None,
+                );
                 handle.terminate_execution();
                 current + WORKFLOW_HEAP_SLACK_BYTES
             });
@@ -2176,8 +2290,7 @@ fn run_isolate(
 
         // The host compiles; the guest may not. Upstream's asymmetry (`new vm.Script` against
         // `codeGeneration: { strings: false }`, `:916`) reproduced exactly.
-        let wrapped =
-            format!("globalThis.__cyrupWorkflowRun((async () => {{\n{script}\n}})())");
+        let wrapped = format!("globalThis.__cyrupWorkflowRun((async () => {{\n{script}\n}})())");
         let promise = runtime
             .execute_script("workflow-script.js", wrapped)
             .map_err(|error| guest_error(format_guest_error(&error.to_string())))?;
@@ -2215,7 +2328,9 @@ fn run_isolate(
         };
         if !outcome.ok {
             return Err(WorkflowGuestError {
-                message: outcome.message.unwrap_or_else(|| "Workflow script failed.".to_string()),
+                message: outcome
+                    .message
+                    .unwrap_or_else(|| "Workflow script failed.".to_string()),
                 error_kind: outcome.error_kind,
                 error_phase: outcome.error_phase,
             });
@@ -2425,7 +2540,10 @@ pub async fn run_workflow_script(
         return Err(fail("workflowScript must not be empty.".into(), None));
     }
     if options.timeout_ms == Some(0) {
-        return Err(fail("workflow script timeout must be a positive integer.".into(), None));
+        return Err(fail(
+            "workflow script timeout must be a positive integer.".into(),
+            None,
+        ));
     }
     if options.global_concurrency_limit == Some(0) {
         return Err(fail(
@@ -2683,11 +2801,12 @@ pub async fn run_workflow_script(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
-    let finish_error = |message: String, kind: Option<WorkflowScriptErrorKind>| WorkflowScriptError {
-        message,
-        partial: partial(&shared),
-        error_kind: kind,
-    };
+    let finish_error =
+        |message: String, kind: Option<WorkflowScriptErrorKind>| WorkflowScriptError {
+            message,
+            partial: partial(&shared),
+            error_kind: kind,
+        };
 
     match outcome {
         GuestOutcome::Fatal => {
@@ -2698,9 +2817,7 @@ pub async fn run_workflow_script(
             Err(finish_error(failure.message, failure.error_kind))
         }
         GuestOutcome::TimedOut => Err(finish_error(
-            format!(
-                "Workflow script timed out after {effective_timeout_ms}ms.",
-            ),
+            format!("Workflow script timed out after {effective_timeout_ms}ms.",),
             Some(WorkflowScriptErrorKind::Timeout),
         )),
         GuestOutcome::Cancelled => {
@@ -2796,7 +2913,10 @@ pub async fn run_workflow_script(
                                 .launch_order
                                 .iter()
                                 .filter(|key| {
-                                    inner.launches.get(*key).is_some_and(|launch| !launch.observed)
+                                    inner
+                                        .launches
+                                        .get(*key)
+                                        .is_some_and(|launch| !launch.observed)
                                 })
                                 .cloned()
                                 .collect::<Vec<_>>(),
@@ -2921,7 +3041,10 @@ mod tests {
                     ..Default::default()
                 });
             }
-            let agent = params.get("agent").and_then(Value::as_str).unwrap_or("worker");
+            let agent = params
+                .get("agent")
+                .and_then(Value::as_str)
+                .unwrap_or("worker");
             Ok(WorkflowScriptChildResult {
                 key: key_owned.clone(),
                 ok: true,
@@ -3055,14 +3178,19 @@ if (results[11].ok) {
 }
 return { shipped: false };
 "#;
-        let result = run_workflow_script(options(host.clone(), script)).await.unwrap();
+        let result = run_workflow_script(options(host.clone(), script))
+            .await
+            .unwrap();
         assert_eq!(
             result.value,
             json!({ "shipped": true, "fix": "output of fix", "count": 12 })
         );
         // BLOCKER-2's regression: a suspending launch import would serialize this to peak == 1.
         let peak = host.peak.load(Ordering::SeqCst);
-        assert!(peak >= 12, "expected 12 concurrent children, saw peak {peak}");
+        assert!(
+            peak >= 12,
+            "expected 12 concurrent children, saw peak {peak}"
+        );
         assert_eq!(result.emits, vec![json!({ "first": "output of c0" })]);
         assert_eq!(result.console.len(), 1);
         assert_eq!(result.console[0].level, WorkflowConsoleLevel::Log);
@@ -3086,14 +3214,22 @@ runs.run("orphan", { agent: "worker", task: "T" });
 const kept = await runs.run("kept", { agent: "worker", task: "T" });
 return { kept: kept.ok };
 "#;
-        let error = run_workflow_script(options(host, script)).await.unwrap_err();
+        let error = run_workflow_script(options(host, script))
+            .await
+            .unwrap_err();
         assert_eq!(
             error.message,
             "workflowScript completed with unawaited runs.run launch(es): 'orphan'. For ordinary parallel fanout use await runs.all([{key, agent, task}, ...]); do not read .output from unawaited launches."
         );
         assert_eq!(error.error_kind, None, "completion errors carry no kind");
         // The partial is the point: the trace and children survive the failure.
-        assert!(error.partial.trace.iter().any(|entry| entry.key == "orphan"));
+        assert!(
+            error
+                .partial
+                .trace
+                .iter()
+                .any(|entry| entry.key == "orphan")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3102,13 +3238,18 @@ return { kept: kept.ok };
         host.detach_keys.push("d".into());
         let host = Arc::new(host);
         let script = r#"return await runs.run("d", { agent: "worker", task: "T" });"#;
-        let error = run_workflow_script(options(host, script)).await.unwrap_err();
+        let error = run_workflow_script(options(host, script))
+            .await
+            .unwrap_err();
         assert!(
             error.message.contains("Run 'd' detached: child detached"),
             "got: {}",
             error.message
         );
-        assert_eq!(error.error_kind, Some(WorkflowScriptErrorKind::DetachedChild));
+        assert_eq!(
+            error.error_kind,
+            Some(WorkflowScriptErrorKind::DetachedChild)
+        );
         assert_eq!(error.partial.children.len(), 1);
         assert!(error.partial.children[0].detached);
     }
@@ -3149,7 +3290,10 @@ return { firstError, badKey };
         // A child that never settles: the guest blocks in poll (which epoch deliberately does not
         // interrupt, BLOCKER-1) and the run's tokio timeout is what fires.
         let host = Arc::new(FakeHost::new(Duration::from_secs(3600)));
-        let mut opts = options(host, r#"return await runs.run("slow", { agent: "worker", task: "T" });"#);
+        let mut opts = options(
+            host,
+            r#"return await runs.run("slow", { agent: "worker", task: "T" });"#,
+        );
         opts.timeout_ms = Some(600);
         let error = run_workflow_script(opts).await.unwrap_err();
         assert_eq!(error.message, "Workflow script timed out after 600ms.");
@@ -3256,7 +3400,10 @@ return { gatedOk: gated.ok, barred, reviewOk: review.ok };
         // only `state.set`/`runs.steer`/`runs.host` barrier rejections surface bare.
         assert_eq!(
             object.get("barred").unwrap().as_str().unwrap(),
-            format!("Run 'after' failed: {}", recovery_barrier_message("gated", "after"))
+            format!(
+                "Run 'after' failed: {}",
+                recovery_barrier_message("gated", "after")
+            )
         );
         assert_eq!(object.get("reviewOk"), Some(&json!(true)));
     }
@@ -3290,12 +3437,15 @@ return { text };
         }
         let host = Arc::new(FakeHost::new(Duration::from_millis(10)));
         let state = Arc::new(MemoryState(Mutex::new(HashMap::new())));
-        let mut opts = options(host, r#"
+        let mut opts = options(
+            host,
+            r#"
 await state.set("progress", { step: 2 });
 const read = await state.get("progress");
 const missing = await state.get("absent");
 return { read, missing: missing === undefined ? "undefined" : "present" };
-"#);
+"#,
+        );
         opts.state = Some(state);
         let result = run_workflow_script(opts).await.unwrap();
         assert_eq!(

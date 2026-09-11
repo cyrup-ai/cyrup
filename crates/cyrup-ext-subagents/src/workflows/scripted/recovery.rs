@@ -82,182 +82,317 @@ fn scrub(task: &str, patterns: &[&LazyLock<Regex>]) -> Result<String, fancy_rege
 /// pi `RECOVERY_REVIEW_MUTATION_VERB_PATTERN` — flags `/i`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static MUTATION_VERB_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)\b(?:add(?:ing)?|append(?:ing)?|apply(?:ing)?|cherry[ -]pick(?:ing)?|change|changing|clean(?:ing)?|commit(?:ting)?|cop(?:y|ying)|create|creating|delete|deleting|edit(?:ing)?|fix(?:ing)?|implement(?:ing)?|insert(?:ing)?|make|making|merge|merging|mov(?:e|ing)|modify(?:ing)?|mutate|mutating|open(?:ing)?|patch(?:ing)?|prepend(?:ing)?|push(?:ing)?|rebase|rebasing|refactor(?:ing)?|remove|removing|rename|renaming|replace|replacing|revert(?:ing)?|revise|revising|rewrite|rewriting|sav(?:e|ing)|stag(?:e|ing)|stash(?:ing)?|tag(?:ging)?|touch(?:ing)?|update|updating|write|writing)\b"##));
+static MUTATION_VERB_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    build(
+        r##"(?i)\b(?:add(?:ing)?|append(?:ing)?|apply(?:ing)?|cherry[ -]pick(?:ing)?|change|changing|clean(?:ing)?|commit(?:ting)?|cop(?:y|ying)|create|creating|delete|deleting|edit(?:ing)?|fix(?:ing)?|implement(?:ing)?|insert(?:ing)?|make|making|merge|merging|mov(?:e|ing)|modify(?:ing)?|mutate|mutating|open(?:ing)?|patch(?:ing)?|prepend(?:ing)?|push(?:ing)?|rebase|rebasing|refactor(?:ing)?|remove|removing|rename|renaming|replace|replacing|revert(?:ing)?|revise|revising|rewrite|rewriting|sav(?:e|ing)|stag(?:e|ing)|stash(?:ing)?|tag(?:ging)?|touch(?:ing)?|update|updating|write|writing)\b"##,
+    )
+});
 
 /// pi `RECOVERY_REVIEW_READ_ONLY_PATTERN` — flags `/i`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static READ_ONLY_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)\b(?:read[- ]only|review only|only return findings|return findings only|suggest fixes only|without\s+(?:editing|modifying|changing|writing|touching)|do not\s+(?:edit|modify|change|write|touch)|don't\s+(?:edit|modify|change|write|touch)|must not\s+(?:edit|modify|change|write|touch))\b"##));
+static READ_ONLY_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    build(
+        r##"(?i)\b(?:read[- ]only|review only|only return findings|return findings only|suggest fixes only|without\s+(?:editing|modifying|changing|writing|touching)|do not\s+(?:edit|modify|change|write|touch)|don't\s+(?:edit|modify|change|write|touch)|must not\s+(?:edit|modify|change|write|touch))\b"##,
+    )
+});
 
 /// pi `RECOVERY_REVIEW_NO_MUTATION_CLAUSE_PATTERN` — flags `/gi`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static NO_MUTATION_CLAUSE_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)\b(?:do not|don't|must not)\s+(?:edit|modify|change|write|touch)(?:\s+files?)?(?:\s*,\s*(?:commit|push|comment|merge|launch(?:\s+subagents?)?)(?=\s*(?:,|\bor\b|[.;!?\n)]|$)))*(?:\s*,?\s*or\s+(?:commit|push|comment|merge|launch(?:\s+subagents?)?)(?=\s*(?:[.;!?\n)]|$)))?"##));
+static NO_MUTATION_CLAUSE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    build(
+        r##"(?i)\b(?:do not|don't|must not)\s+(?:edit|modify|change|write|touch)(?:\s+files?)?(?:\s*,\s*(?:commit|push|comment|merge|launch(?:\s+subagents?)?)(?=\s*(?:,|\bor\b|[.;!?\n)]|$)))*(?:\s*,?\s*or\s+(?:commit|push|comment|merge|launch(?:\s+subagents?)?)(?=\s*(?:[.;!?\n)]|$)))?"##,
+    )
+});
 
 /// pi `RECOVERY_REVIEW_DELIVERABLE_PATTERN` — flags `/gi`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static DELIVERABLE_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)\b(?:compose|create|draft|prepare|produce|write)\s+(?:(?:a|an|the|your)\s+)?(?:findings?|review|report|summary|analysis|recommendations?)(?:\s+(?:to|at|in)\s+\S+)?"##));
+static DELIVERABLE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    build(
+        r##"(?i)\b(?:compose|create|draft|prepare|produce|write)\s+(?:(?:a|an|the|your)\s+)?(?:findings?|review|report|summary|analysis|recommendations?)(?:\s+(?:to|at|in)\s+\S+)?"##,
+    )
+});
 
 /// pi `RECOVERY_REVIEW_CONTEXT_OBJECT_PATTERN` — flags `/gi`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static CONTEXT_OBJECT_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)\breview\s+(?:(?:the|this|that|saved)\s+)?(?:patch|diff|changes?|implementation|report)\b"##));
+static CONTEXT_OBJECT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    build(
+        r##"(?i)\breview\s+(?:(?:the|this|that|saved)\s+)?(?:patch|diff|changes?|implementation|report)\b"##,
+    )
+});
 
 /// pi `RECOVERY_REVIEW_MUTATION_NOUN_CONTEXT_PATTERN` — flags `/gi`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static MUTATION_NOUN_CONTEXT_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)\b(?:later\s+real\s+)?update\s+imperatives?\b"##));
+static MUTATION_NOUN_CONTEXT_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| build(r##"(?i)\b(?:later\s+real\s+)?update\s+imperatives?\b"##));
 
 /// pi `RECOVERY_REVIEW_PRIOR_FIX_CONTEXT_PATTERN` — flags `/gi`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static PRIOR_FIX_CONTEXT_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)\bthe\s+prior\s+fix\s+keeps\b"##));
+static PRIOR_FIX_CONTEXT_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| build(r##"(?i)\bthe\s+prior\s+fix\s+keeps\b"##));
 
 /// pi `RECOVERY_REVIEW_DETECTION_CONTEXT_PATTERN` — flags `/gi`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static DETECTION_CONTEXT_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)\b(?:mutation\s+detection\s+now\s+includes\s+move\/rename\/copy\s+file\s+mutation\s+imperatives|delegation\s+detection\s+now\s+blocks\s+get\/let\/have\/tell\/ask\s+follow-up\s+forms)(?=[,.;!?\n]|\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b|$)"##));
+static DETECTION_CONTEXT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    build(
+        r##"(?i)\b(?:mutation\s+detection\s+now\s+includes\s+move\/rename\/copy\s+file\s+mutation\s+imperatives|delegation\s+detection\s+now\s+blocks\s+get\/let\/have\/tell\/ask\s+follow-up\s+forms)(?=[,.;!?\n]|\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b|$)"##,
+    )
+});
 
 /// pi `RECOVERY_REVIEW_PATTERN_CHANGE_CONTEXT_PATTERN` — flags `/gi`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static PATTERN_CHANGE_CONTEXT_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)\bRECOVERY_REVIEW_MUTATION_VERB_PATTERN\s+now\s+includes\s+append,\s+prepend,\s+and\s+sav(?:e|ing)\b(?=\s*(?:[,.;!?\n)]|$))"##));
+static PATTERN_CHANGE_CONTEXT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    build(
+        r##"(?i)\bRECOVERY_REVIEW_MUTATION_VERB_PATTERN\s+now\s+includes\s+append,\s+prepend,\s+and\s+sav(?:e|ing)\b(?=\s*(?:[,.;!?\n)]|$))"##,
+    )
+});
 
 /// pi `RECOVERY_REVIEW_GIT_PATTERN_CHANGE_CONTEXT_PATTERN` — flags `/gi`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static GIT_PATTERN_CHANGE_CONTEXT_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)\bfixed\s+mutating\s+git\s+follow-up\s+bypasses\b|\b(?:added|adding)\s+[a-z][a-z-]*(?:\/[a-z][a-z-]*)*(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+)[a-z][a-z-]*(?:\/[a-z][a-z-]*)*)*\s+to\s+the\s+(?:mutation\s+imperative|mutating\s+git\s+command)\s+pattern\b|\band\s+[a-z][a-z-]*(?:\/[a-z][a-z-]*)*(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+)[a-z][a-z-]*(?:\/[a-z][a-z-]*)*)*\s+to\s+the\s+mutating\s+git\s+command\s+pattern\b"##));
+static GIT_PATTERN_CHANGE_CONTEXT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    build(
+        r##"(?i)\bfixed\s+mutating\s+git\s+follow-up\s+bypasses\b|\b(?:added|adding)\s+[a-z][a-z-]*(?:\/[a-z][a-z-]*)*(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+)[a-z][a-z-]*(?:\/[a-z][a-z-]*)*)*\s+to\s+the\s+(?:mutation\s+imperative|mutating\s+git\s+command)\s+pattern\b|\band\s+[a-z][a-z-]*(?:\/[a-z][a-z-]*)*(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+)[a-z][a-z-]*(?:\/[a-z][a-z-]*)*)*\s+to\s+the\s+mutating\s+git\s+command\s+pattern\b"##,
+    )
+});
 
 /// pi `RECOVERY_REVIEW_VALIDATION_EVIDENCE_PATTERN` — flags `/gi`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static VALIDATION_EVIDENCE_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)\bvalidation(?:\s+after\s+fix)?\s*:"##));
+static VALIDATION_EVIDENCE_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| build(r##"(?i)\bvalidation(?:\s+after\s+fix)?\s*:"##));
 
 /// pi `RECOVERY_REVIEW_CONTRACT_PROHIBITION_PATTERN` — flags `/gi`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static CONTRACT_PROHIBITION_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)\b(?:do not|don't|must not)\s+(?:mutate\s+durable\s+state|launch\s+(?:mutating|destructive|mutating\/destructive)\s+work)(?:\s+or\s+(?:mutate\s+durable\s+state|launch\s+(?:mutating|destructive|mutating\/destructive)\s+work))*"##));
+static CONTRACT_PROHIBITION_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    build(
+        r##"(?i)\b(?:do not|don't|must not)\s+(?:mutate\s+durable\s+state|launch\s+(?:mutating|destructive|mutating\/destructive)\s+work)(?:\s+or\s+(?:mutate\s+durable\s+state|launch\s+(?:mutating|destructive|mutating\/destructive)\s+work))*"##,
+    )
+});
 
 /// pi `RECOVERY_REVIEW_ONLY_REVIEW_CONTRACT_PATTERN` — flags `/gi`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static ONLY_REVIEW_CONTRACT_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)\bmay\s+only\s+launch\s+explicit\s+read-only\s+review\s+children\s+with\s+acceptance:false\b"##));
+static ONLY_REVIEW_CONTRACT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    build(
+        r##"(?i)\bmay\s+only\s+launch\s+explicit\s+read-only\s+review\s+children\s+with\s+acceptance:false\b"##,
+    )
+});
 
 /// pi `RECOVERY_REVIEW_BLOCKED_CONTEXT_FRAGMENT_PATTERN` — flags `/gi`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static BLOCKED_CONTEXT_FRAGMENT_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)\bstate\.set, runs\.host, runs\.steer, ordinary\/mutating children, and destructive command wording are blocked(?=[,.;!?\n)\]}]|$)"##));
+static BLOCKED_CONTEXT_FRAGMENT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    build(
+        r##"(?i)\bstate\.set, runs\.host, runs\.steer, ordinary\/mutating children, and destructive command wording are blocked(?=[,.;!?\n)\]}]|$)"##,
+    )
+});
 
 /// pi `RECOVERY_REVIEW_REGRESSION_EVIDENCE_PATTERN` — flags `/gi`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static REGRESSION_EVIDENCE_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)\b(?:existing regressions cover plain rm and git clean\/reset\/restore|prior regressions covering rm\/git clean as evidence only)(?=[,.;!?\n)\]}]|$)"##));
+static REGRESSION_EVIDENCE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    build(
+        r##"(?i)\b(?:existing regressions cover plain rm and git clean\/reset\/restore|prior regressions covering rm\/git clean as evidence only)(?=[,.;!?\n)\]}]|$)"##,
+    )
+});
 
 /// pi `RECOVERY_REVIEW_BLOCKED_QUOTED_EXAMPLE_PATTERN` — flags `/gi`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static BLOCKED_QUOTED_EXAMPLE_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+")(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+)(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+"))*\s+(?:is|are|remains?)\s+(?:blocked|(?:an?\s+)?blocked\s+examples?)(?=[,.;!?\n)\]}]|$)"##));
+static BLOCKED_QUOTED_EXAMPLE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    build(
+        r##"(?i)(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+")(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+)(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+"))*\s+(?:is|are|remains?)\s+(?:blocked|(?:an?\s+)?blocked\s+examples?)(?=[,.;!?\n)\]}]|$)"##,
+    )
+});
 
 /// pi `RECOVERY_REVIEW_CONTEXT_QUOTED_EXAMPLE_PATTERN` — flags `/gi`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static CONTEXT_QUOTED_EXAMPLE_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)\b(?:examples?|phrasing|forms|variants):\s*(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+")(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+)(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+"))*"##));
+static CONTEXT_QUOTED_EXAMPLE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    build(
+        r##"(?i)\b(?:examples?|phrasing|forms|variants):\s*(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+")(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+)(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+"))*"##,
+    )
+});
 
 /// pi `RECOVERY_REVIEW_LISTED_BLOCKED_EXAMPLE_PATTERN` — flags `/gim`, ported as `(?im)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static LISTED_BLOCKED_EXAMPLE_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?im)(?:^|[.;!?\n]\s*)blocked\s+examples:\s*(?:\r?\n[ \t]*(?:[-*]|\d+[.)])\s+[^\r\n]+)+"##));
+static LISTED_BLOCKED_EXAMPLE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    build(
+        r##"(?im)(?:^|[.;!?\n]\s*)blocked\s+examples:\s*(?:\r?\n[ \t]*(?:[-*]|\d+[.)])\s+[^\r\n]+)+"##,
+    )
+});
 
 /// pi `RECOVERY_REVIEW_BLOCKS_QUOTED_EXAMPLE_PATTERN` — flags `/gi`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static BLOCKS_QUOTED_EXAMPLE_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)\b(?:this\s+)?blocks?\s+examples?\s+like\s+(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+")(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+)(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+"))*"##));
+static BLOCKS_QUOTED_EXAMPLE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    build(
+        r##"(?i)\b(?:this\s+)?blocks?\s+examples?\s+like\s+(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+")(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+)(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+"))*"##,
+    )
+});
 
 /// pi `RECOVERY_REVIEW_EXAMPLES_LIKE_BLOCKED_PATTERN` — flags `/gi`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static EXAMPLES_LIKE_BLOCKED_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)\bexamples?\s+like\s+(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+")(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+)(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+"))*\s+(?:is|are|remains?)\s+blocked\b"##));
+static EXAMPLES_LIKE_BLOCKED_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    build(
+        r##"(?i)\bexamples?\s+like\s+(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+")(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+)(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+"))*\s+(?:is|are|remains?)\s+blocked\b"##,
+    )
+});
 
 /// pi `RECOVERY_REVIEW_QUOTED_VISIBLE_BLOCKED_PATTERN` — flags `/gi`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static QUOTED_VISIBLE_BLOCKED_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)(?:\b(?:(?:the\s+)?examples?|commands?\s+hidden\s+in)\s+|(?:^|[\s(\[{]))(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+")(?:(?:\s*,\s*(?:and\s+|or\s+)?|\s+(?:and|or)\s+)(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+"))*\s+(?:(?:is|are|remains?)\s+)?visible\s+and\s+blocked\b"##));
+static QUOTED_VISIBLE_BLOCKED_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    build(
+        r##"(?i)(?:\b(?:(?:the\s+)?examples?|commands?\s+hidden\s+in)\s+|(?:^|[\s(\[{]))(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+")(?:(?:\s*,\s*(?:and\s+|or\s+)?|\s+(?:and|or)\s+)(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+"))*\s+(?:(?:is|are|remains?)\s+)?visible\s+and\s+blocked\b"##,
+    )
+});
 
 /// pi `RECOVERY_REVIEW_PROMPTS_LIKE_BLOCKED_PATTERN` — flags `/gi`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static PROMPTS_LIKE_BLOCKED_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)\bdescribed\s+prompts?\s+like\s+Run\s+git\s+rebase\s+main,\s+git\s+rebase\s+main,\s+Run\s+git\s+cherry-pick\s+abc123,\s+cherry-pick\s+abc123,\s+and\s+Stage\s+the\s+changed\s+files\s+as\s+blocked\b"##));
+static PROMPTS_LIKE_BLOCKED_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    build(
+        r##"(?i)\bdescribed\s+prompts?\s+like\s+Run\s+git\s+rebase\s+main,\s+git\s+rebase\s+main,\s+Run\s+git\s+cherry-pick\s+abc123,\s+cherry-pick\s+abc123,\s+and\s+Stage\s+the\s+changed\s+files\s+as\s+blocked\b"##,
+    )
+});
 
 /// pi `RECOVERY_REVIEW_GIT_MUTATIONS_BROADER_CONTEXT_PATTERN` — flags `/gi`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static GIT_MUTATIONS_BROADER_CONTEXT_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)\bpositive\s+git\s+mutations\s+are\s+broader:\s*git\s+branch\s+-D\s+old,\s+git\s+tag\s+-d\s+v1\.0,\s+git\s+stash,\s+git\s+revert\s+abc123,\s+and\s+natural\s+cherry\s+pick\s+abc123\s+now\s+trips?\s+the\s+recovery\s+barrier\b"##));
+static GIT_MUTATIONS_BROADER_CONTEXT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    build(
+        r##"(?i)\bpositive\s+git\s+mutations\s+are\s+broader:\s*git\s+branch\s+-D\s+old,\s+git\s+tag\s+-d\s+v1\.0,\s+git\s+stash,\s+git\s+revert\s+abc123,\s+and\s+natural\s+cherry\s+pick\s+abc123\s+now\s+trips?\s+the\s+recovery\s+barrier\b"##,
+    )
+});
 
 /// pi `RECOVERY_REVIEW_GIT_COVERAGE_CONTEXT_PATTERN` — flags `/gi`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static GIT_COVERAGE_CONTEXT_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)\bbroadened\s+positive\s+git\s+mutation\s+coverage\s+for\s+natural\s+`cherry\s+pick`,\s+`revert`,\s+`stash`,\s+`tag`,\s+plus\s+git\s+`branch\|revert\|stash\|tag`"##));
+static GIT_COVERAGE_CONTEXT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    build(
+        r##"(?i)\bbroadened\s+positive\s+git\s+mutation\s+coverage\s+for\s+natural\s+`cherry\s+pick`,\s+`revert`,\s+`stash`,\s+`tag`,\s+plus\s+git\s+`branch\|revert\|stash\|tag`"##,
+    )
+});
 
 /// pi `RECOVERY_REVIEW_REGRESSION_QUOTED_EXAMPLE_PATTERN` — flags `/gi`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static REGRESSION_QUOTED_EXAMPLE_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)\b(?:added\s+)?exact\s+regressions?\s+for\s+(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+")(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+)(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+"))*"##));
+static REGRESSION_QUOTED_EXAMPLE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    build(
+        r##"(?i)\b(?:added\s+)?exact\s+regressions?\s+for\s+(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+")(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+)(?:`[^`\n]+`|'[^'\n]+'|"[^"\n]+"))*"##,
+    )
+});
 
 /// pi `RECOVERY_REVIEW_REGRESSION_ANAPHORIC_EXAMPLE_PATTERN` — flags `/gi`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static REGRESSION_ANAPHORIC_EXAMPLE_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)\b(?:added\s+)?exact\s+regressions?\s+for\s+(?:do|run|execute|perform|apply)\s+(?:it|that|this|(?:the\s+)?(?:(?:previous(?:ly)?|prior|above|quoted|blocked)\s+){0,4}(?:command|example|operation|action|phrase|instruction|request))(?:[\s,]+(?:now|still|again|really|actually|immediately)){0,3}[\s,]+anyway(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+)(?:do|run|execute|perform|apply)\s+(?:it|that|this|(?:the\s+)?(?:(?:previous(?:ly)?|prior|above|quoted|blocked)\s+){0,4}(?:command|example|operation|action|phrase|instruction|request))(?:[\s,]+(?:now|still|again|really|actually|immediately)){0,3}[\s,]+anyway)*"##));
+static REGRESSION_ANAPHORIC_EXAMPLE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    build(
+        r##"(?i)\b(?:added\s+)?exact\s+regressions?\s+for\s+(?:do|run|execute|perform|apply)\s+(?:it|that|this|(?:the\s+)?(?:(?:previous(?:ly)?|prior|above|quoted|blocked)\s+){0,4}(?:command|example|operation|action|phrase|instruction|request))(?:[\s,]+(?:now|still|again|really|actually|immediately)){0,3}[\s,]+anyway(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+)(?:do|run|execute|perform|apply)\s+(?:it|that|this|(?:the\s+)?(?:(?:previous(?:ly)?|prior|above|quoted|blocked)\s+){0,4}(?:command|example|operation|action|phrase|instruction|request))(?:[\s,]+(?:now|still|again|really|actually|immediately)){0,3}[\s,]+anyway)*"##,
+    )
+});
 
 /// pi `RECOVERY_REVIEW_REGRESSION_FOLLOWED_BY_ANAPHORIC_PATTERN` — flags `/gi`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static REGRESSION_FOLLOWED_BY_ANAPHORIC_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)\badded\s+(?:exact\s+)?regressions?\s+for\s+quoted\s+rm\s+remaining\s+blocked\s+followed\s+by\s+execute\s+the\s+previous\s+command\b(?=\s*(?:[,.;!?\n)]|\bwhile\b|$))"##));
+static REGRESSION_FOLLOWED_BY_ANAPHORIC_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    build(
+        r##"(?i)\badded\s+(?:exact\s+)?regressions?\s+for\s+quoted\s+rm\s+remaining\s+blocked\s+followed\s+by\s+execute\s+the\s+previous\s+command\b(?=\s*(?:[,.;!?\n)]|\bwhile\b|$))"##,
+    )
+});
 
 /// pi `RECOVERY_REVIEW_REGRESSION_FOLLOWED_BY_NAMED_RM_PATTERN` — flags `/gi`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static REGRESSION_FOLLOWED_BY_NAMED_RM_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)\b(?:added\s+)?(?:exact\s+)?regressions?\s+for\s+quoted\s+rm\s+remaining\s+blocked\s+followed\s+by\s+(?:do|run|execute|perform|apply)\s+(?:it|that|this|(?:the\s+)?(?:(?:previous(?:ly)?|prior|above|quoted|blocked)\s+){0,4}(?:command|example|operation|action|phrase|instruction|request))(?:[\s,]+(?:now|still|again|really|actually|immediately)){0,3}(?:[\s,]+anyway)?(?=\s*(?:[,.;!?\n)]|\bwhile\b|$))"##));
+static REGRESSION_FOLLOWED_BY_NAMED_RM_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    build(
+        r##"(?i)\b(?:added\s+)?(?:exact\s+)?regressions?\s+for\s+quoted\s+rm\s+remaining\s+blocked\s+followed\s+by\s+(?:do|run|execute|perform|apply)\s+(?:it|that|this|(?:the\s+)?(?:(?:previous(?:ly)?|prior|above|quoted|blocked)\s+){0,4}(?:command|example|operation|action|phrase|instruction|request))(?:[\s,]+(?:now|still|again|really|actually|immediately)){0,3}(?:[\s,]+anyway)?(?=\s*(?:[,.;!?\n)]|\bwhile\b|$))"##,
+    )
+});
 
 /// pi `RECOVERY_REVIEW_BLOCKED_LIVE_VARIANT_CONTEXT_PATTERN` — flags `/gi`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static BLOCKED_LIVE_VARIANT_CONTEXT_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)\b(?:while\s+)?keeping\s+live-command\s+variants\s+such\s+as\s+followed\s+by\s+execute\s+the\s+previous\s+command\s+then\s+update\s+tests\s+blocked\b(?=\s*(?:[,.;!?\n)]|$))"##));
+static BLOCKED_LIVE_VARIANT_CONTEXT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    build(
+        r##"(?i)\b(?:while\s+)?keeping\s+live-command\s+variants\s+such\s+as\s+followed\s+by\s+execute\s+the\s+previous\s+command\s+then\s+update\s+tests\s+blocked\b(?=\s*(?:[,.;!?\n)]|$))"##,
+    )
+});
 
 /// pi `RECOVERY_REVIEW_ANAPHORIC_REFERENCES_CONTEXT_PATTERN` — flags `/gi`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static ANAPHORIC_REFERENCES_CONTEXT_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)\bdirect\s+anaphoric\s+references\s+now\s+include\s+numeric\s+and\s+word\s+ordinals\s+through\s+tenth\s+plus\s+one,\s+so\s+(?:do|run|execute|perform|apply)\s+(?:it|that|this|(?:the\s+)?(?:(?:\d+(?:st|nd|rd|th)|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|last|next|previous(?:ly)?|prior|above|quoted|blocked)\s+){0,4}(?:command|example|operation|action|phrase|instruction|request|one))(?:[\s,]+(?:right|now|still|again|really|actually|immediately)){0,4}[\s,]+anyway(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+)(?:do|run|execute|perform|apply)\s+(?:it|that|this|(?:the\s+)?(?:(?:\d+(?:st|nd|rd|th)|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|last|next|previous(?:ly)?|prior|above|quoted|blocked)\s+){0,4}(?:command|example|operation|action|phrase|instruction|request|one))(?:[\s,]+(?:right|now|still|again|really|actually|immediately)){0,4}[\s,]+anyway)*\s+(?:is|are|remains?)\s+blocked\b(?:\s+after\s+quoted\s+destructive\s+examples\s+are\s+scrubbed)?"##));
+static ANAPHORIC_REFERENCES_CONTEXT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    build(
+        r##"(?i)\bdirect\s+anaphoric\s+references\s+now\s+include\s+numeric\s+and\s+word\s+ordinals\s+through\s+tenth\s+plus\s+one,\s+so\s+(?:do|run|execute|perform|apply)\s+(?:it|that|this|(?:the\s+)?(?:(?:\d+(?:st|nd|rd|th)|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|last|next|previous(?:ly)?|prior|above|quoted|blocked)\s+){0,4}(?:command|example|operation|action|phrase|instruction|request|one))(?:[\s,]+(?:right|now|still|again|really|actually|immediately)){0,4}[\s,]+anyway(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+)(?:do|run|execute|perform|apply)\s+(?:it|that|this|(?:the\s+)?(?:(?:\d+(?:st|nd|rd|th)|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|last|next|previous(?:ly)?|prior|above|quoted|blocked)\s+){0,4}(?:command|example|operation|action|phrase|instruction|request|one))(?:[\s,]+(?:right|now|still|again|really|actually|immediately)){0,4}[\s,]+anyway)*\s+(?:is|are|remains?)\s+blocked\b(?:\s+after\s+quoted\s+destructive\s+examples\s+are\s+scrubbed)?"##,
+    )
+});
 
 /// pi `RECOVERY_REVIEW_NO_ANAPHORIC_MUTATION_CLAUSE_PATTERN` — flags `/gi`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static NO_ANAPHORIC_MUTATION_CLAUSE_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)\b(?:do not|don't|must not)\s+(?:do|run|execute|perform|apply)\s+(?:it|that|this|(?:the\s+)?(?:(?:\d+(?:st|nd|rd|th)|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|last|next|previous(?:ly)?|prior|above|quoted|blocked)\s+){0,4}(?:command|example|operation|action|phrase|instruction|request|one))(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n—–-]){0,80}"##));
+static NO_ANAPHORIC_MUTATION_CLAUSE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    build(
+        r##"(?i)\b(?:do not|don't|must not)\s+(?:do|run|execute|perform|apply)\s+(?:it|that|this|(?:the\s+)?(?:(?:\d+(?:st|nd|rd|th)|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|last|next|previous(?:ly)?|prior|above|quoted|blocked)\s+){0,4}(?:command|example|operation|action|phrase|instruction|request|one))(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n—–-]){0,80}"##,
+    )
+});
 
 /// pi `RECOVERY_REVIEW_NO_DELEGATION_CLAUSE_PATTERN` — flags `/gi`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static NO_DELEGATION_CLAUSE_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)\b(?:do not|don't|must not)\s+(?:(?:launch|start|spawn|run)\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*(?:workers?|reviewers?|agents?|subagents?|children|child|runs?)|(?:get|let|request|hand\s+off|assign|use|have|tell)\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*(?:workers?|reviewers?|agents?|subagents?|children|child)|(?:get|let|have|tell|request)\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*(?:review|implementation|fix(?:es)?|changes?|follow-up)\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*\b(?:from|with|via|by)\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*(?:workers?|reviewers?|agents?|subagents?|children|child)|ask\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*(?:(?:workers?|reviewers?|agents?|subagents?|children|child)\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*\b(?:continue|implement|review|fix|edit|write|modify|change|patch|update|delete|remove|create|follow-up)|(?:review|implementation|fix(?:es)?|changes?|follow-up)\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*\b(?:from|via)\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*(?:workers?|reviewers?|agents?|subagents?|children|child)))\b"##));
+static NO_DELEGATION_CLAUSE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    build(
+        r##"(?i)\b(?:do not|don't|must not)\s+(?:(?:launch|start|spawn|run)\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*(?:workers?|reviewers?|agents?|subagents?|children|child|runs?)|(?:get|let|request|hand\s+off|assign|use|have|tell)\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*(?:workers?|reviewers?|agents?|subagents?|children|child)|(?:get|let|have|tell|request)\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*(?:review|implementation|fix(?:es)?|changes?|follow-up)\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*\b(?:from|with|via|by)\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*(?:workers?|reviewers?|agents?|subagents?|children|child)|ask\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*(?:(?:workers?|reviewers?|agents?|subagents?|children|child)\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*\b(?:continue|implement|review|fix|edit|write|modify|change|patch|update|delete|remove|create|follow-up)|(?:review|implementation|fix(?:es)?|changes?|follow-up)\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*\b(?:from|via)\b(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n])*(?:workers?|reviewers?|agents?|subagents?|children|child)))\b"##,
+    )
+});
 
 /// pi `RECOVERY_REVIEW_DELEGATION_PATTERN` — flags `/i`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static DELEGATION_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)\b(?:launch|start|spawn|run)\b[^,.;!?\n]*(?:workers?|reviewers?|agents?|subagents?|children|child|runs?)\b|\b(?:delegate|hand\s+off|assign)\s+(?:remediation|implementation(?:\s+follow-up)?|changes?|fix(?:es)?|follow-up)\s+to\s+(?:(?:a|an|the)\s+)?(?:workers?|reviewers?|agents?|subagents?|children|child)\b|\b(?:get|let|have|tell|request)\b[^,.;!?\n]*(?:workers?|reviewers?|agents?|subagents?|children|child)\b[^,.;!?\n]*\b(?:continue|implement|review|fix|edit|write|modify|change|patch|update|delete|remove|create|follow-up)\b|\b(?:get|let|have|tell|request)\b[^,.;!?\n]*(?:review|implementation|fix(?:es)?|changes?|follow-up)\b[^,.;!?\n]*\b(?:from|with|via|by)\b[^,.;!?\n]*(?:workers?|reviewers?|agents?|subagents?|children|child)\b|\bask\b[^,.;!?\n]*(?:(?:workers?|reviewers?|agents?|subagents?|children|child)\b[^,.;!?\n]*\b(?:continue|implement|review|fix|edit|write|modify|change|patch|update|delete|remove|create|follow-up)|(?:review|implementation|fix(?:es)?|changes?|follow-up)\b[^,.;!?\n]*\b(?:from|via)\b[^,.;!?\n]*(?:workers?|reviewers?|agents?|subagents?|children|child))\b|\buse\b[^,.;!?\n]*(?:workers?|reviewers?|agents?|subagents?|children|child|runs?)\s+(?:for|to)\s+(?:implementation|follow-up|remediation|fix|edit|write|modify|change|patch|update|delete|remove|create)\b"##));
+static DELEGATION_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    build(
+        r##"(?i)\b(?:launch|start|spawn|run)\b[^,.;!?\n]*(?:workers?|reviewers?|agents?|subagents?|children|child|runs?)\b|\b(?:delegate|hand\s+off|assign)\s+(?:remediation|implementation(?:\s+follow-up)?|changes?|fix(?:es)?|follow-up)\s+to\s+(?:(?:a|an|the)\s+)?(?:workers?|reviewers?|agents?|subagents?|children|child)\b|\b(?:get|let|have|tell|request)\b[^,.;!?\n]*(?:workers?|reviewers?|agents?|subagents?|children|child)\b[^,.;!?\n]*\b(?:continue|implement|review|fix|edit|write|modify|change|patch|update|delete|remove|create|follow-up)\b|\b(?:get|let|have|tell|request)\b[^,.;!?\n]*(?:review|implementation|fix(?:es)?|changes?|follow-up)\b[^,.;!?\n]*\b(?:from|with|via|by)\b[^,.;!?\n]*(?:workers?|reviewers?|agents?|subagents?|children|child)\b|\bask\b[^,.;!?\n]*(?:(?:workers?|reviewers?|agents?|subagents?|children|child)\b[^,.;!?\n]*\b(?:continue|implement|review|fix|edit|write|modify|change|patch|update|delete|remove|create|follow-up)|(?:review|implementation|fix(?:es)?|changes?|follow-up)\b[^,.;!?\n]*\b(?:from|via)\b[^,.;!?\n]*(?:workers?|reviewers?|agents?|subagents?|children|child))\b|\buse\b[^,.;!?\n]*(?:workers?|reviewers?|agents?|subagents?|children|child|runs?)\s+(?:for|to)\s+(?:implementation|follow-up|remediation|fix|edit|write|modify|change|patch|update|delete|remove|create)\b"##,
+    )
+});
 
 /// pi `RECOVERY_REVIEW_ANAPHORIC_MUTATION_PATTERN` — flags `/i`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static ANAPHORIC_MUTATION_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)\b(?:do|run|execute|perform|apply)\s+(?:it|that|this|(?:the\s+)?(?:(?:\d+(?:st|nd|rd|th)|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|last|next|previous(?:ly)?|prior|above|quoted|blocked)\s+){0,4}(?:command|example|operation|action|phrase|instruction|request|one))(?!(?:\s+(?:(?:now|still|also|already)\s+)*(?:is|are|remains?)\s+blocked\b))(?:(?:[\s,]+\w+){0,4}[\s,]+anyway|(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n]){0,80})(?=\s*(?:[,.;!?\n)]|\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b|$))"##));
+static ANAPHORIC_MUTATION_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    build(
+        r##"(?i)\b(?:do|run|execute|perform|apply)\s+(?:it|that|this|(?:the\s+)?(?:(?:\d+(?:st|nd|rd|th)|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|last|next|previous(?:ly)?|prior|above|quoted|blocked)\s+){0,4}(?:command|example|operation|action|phrase|instruction|request|one))(?!(?:\s+(?:(?:now|still|also|already)\s+)*(?:is|are|remains?)\s+blocked\b))(?:(?:[\s,]+\w+){0,4}[\s,]+anyway|(?:(?!\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b)[^,.;!?\n]){0,80})(?=\s*(?:[,.;!?\n)]|\b(?:and|but|then|however|nevertheless|nonetheless|yet)\b|$))"##,
+    )
+});
 
 /// pi `RECOVERY_REVIEW_DESTRUCTIVE_COMMAND_PATTERN` — flags `/i`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static DESTRUCTIVE_COMMAND_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)(?:^|[\s;,.`'"(\[{])(?:\S*\/)?(?:rm|rmdir|unlink|truncate|mv|cp|chmod|chown)\b|\bgit\b(?:\s+(?:-[A-Za-z](?:\s+(?:"[^"\n]*"|'[^'\n]*'|\S+))?|--(?:git-dir|work-tree|namespace|exec-path|config-env)(?:=(?:"[^"\n]*"|'[^'\n]*'|\S+)|\s+(?:"[^"\n]*"|'[^'\n]*'|\S+))|--[A-Za-z0-9-]+(?:=(?:"[^"\n]*"|'[^'\n]*'|\S+))?))*\s+(?:add|branch|cherry-pick|clean|commit|merge|rebase|reset|restore|revert|stash|tag|checkout|switch)\b"##));
+static DESTRUCTIVE_COMMAND_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    build(
+        r##"(?i)(?:^|[\s;,.`'"(\[{])(?:\S*\/)?(?:rm|rmdir|unlink|truncate|mv|cp|chmod|chown)\b|\bgit\b(?:\s+(?:-[A-Za-z](?:\s+(?:"[^"\n]*"|'[^'\n]*'|\S+))?|--(?:git-dir|work-tree|namespace|exec-path|config-env)(?:=(?:"[^"\n]*"|'[^'\n]*'|\S+)|\s+(?:"[^"\n]*"|'[^'\n]*'|\S+))|--[A-Za-z0-9-]+(?:=(?:"[^"\n]*"|'[^'\n]*'|\S+))?))*\s+(?:add|branch|cherry-pick|clean|commit|merge|rebase|reset|restore|revert|stash|tag|checkout|switch)\b"##,
+    )
+});
 
 /// pi `RECOVERY_REVIEW_DASH_LIVE_ACTION_PATTERN` — flags `/i`, ported as `(?i)`; `g` is expressed by
 /// the call form (`replace_all`), never by pattern text. Literal `[` inside character classes
 /// is `\\[`-escaped for the Rust engine's class syntax ([CYRUP-DELTA, syntax], same class).
-static DASH_LIVE_ACTION_PATTERN: LazyLock<Regex> = LazyLock::new(|| build(r##"(?i)(?:[—–]|--|\s-\s|:|\s\/\s)\s*(?:then\s+)?(?:(?:add|append|apply|change|cherry[ -]pick|clean|commit|copy|create|delete|edit|fix|implement|insert|make|merge|move|modify|mutate|open|patch|prepend|push|rebase|refactor|remove|rename|replace|revert|revise|rewrite|save|stage|stash|tag|touch|update|write)\b|(?:launch|start|spawn|run)\b[^,.;!?\n]*(?:workers?|reviewers?|agents?|subagents?|children|child|runs?)\b|(?:\S*\/)?(?:rm|rmdir|unlink|truncate|mv|cp|chmod|chown)\b|git\b[^,.;!?\n]*\b(?:add|branch|cherry-pick|clean|commit|merge|rebase|reset|restore|revert|stash|tag|checkout|switch)\b)"##));
+static DASH_LIVE_ACTION_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    build(
+        r##"(?i)(?:[—–]|--|\s-\s|:|\s\/\s)\s*(?:then\s+)?(?:(?:add|append|apply|change|cherry[ -]pick|clean|commit|copy|create|delete|edit|fix|implement|insert|make|merge|move|modify|mutate|open|patch|prepend|push|rebase|refactor|remove|rename|replace|revert|revise|rewrite|save|stage|stash|tag|touch|update|write)\b|(?:launch|start|spawn|run)\b[^,.;!?\n]*(?:workers?|reviewers?|agents?|subagents?|children|child|runs?)\b|(?:\S*\/)?(?:rm|rmdir|unlink|truncate|mv|cp|chmod|chown)\b|git\b[^,.;!?\n]*\b(?:add|branch|cherry-pick|clean|commit|merge|rebase|reset|restore|revert|stash|tag|checkout|switch)\b)"##,
+    )
+});
 
 /// The 12-pattern `taskDestructiveCommandText` scrub (`:1195-1207`), in source order.
 static DESTRUCTIVE_COMMAND_SCRUB: &[&LazyLock<Regex>] = &[
@@ -434,8 +569,6 @@ mod tests {
         }
         map
     }
-
-
 
     #[test]
     fn all_thirty_six_patterns_compile() {

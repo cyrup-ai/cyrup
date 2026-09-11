@@ -40,8 +40,7 @@ use cyrup::{
     build_inputs, diagnostics, interactive, migrations, normalize_short_aliases,
     partition_extension_flags, predispatch, prelaunch, render_help, resolve_app_mode,
     run_acp_dispatch, run_json_dispatch, run_print_dispatch, run_rpc_dispatch, select_provider,
-    session_launch,
-    should_take_over_stdout, spawn_abort_on_signal, timings,
+    session_launch, should_take_over_stdout, spawn_abort_on_signal, timings,
 };
 use cyrup_config::{AuthStore, EnvVars};
 use cyrup_sdk::core::CancelToken;
@@ -519,7 +518,7 @@ async fn run() -> anyhow::Result<i32> {
     // session assembly, exactly as Pi's resource loader does — `packageManager.resolve()` with no
     // `onMissing` (resource-loader.ts:403,549 @v0.83.0) reaches `installMissing`
     // (package-manager.ts:1260-1271), which installs unless `isOfflineModeEnabled()` (`:42-46`).
-    // That predicate is `PI_OFFLINE` upstream and `--offline`/`CYRUP_OFFLINE`/`PI_OFFLINE` here,
+    // That predicate is `PI_OFFLINE` upstream and `--offline`/`CYRUP_OFFLINE` here,
     // already folded into `overrides.offline` above. It is the ONLY gate upstream has, so no
     // settings key or extra flag is invented for it.
     config.install_missing_packages = !overrides.offline;

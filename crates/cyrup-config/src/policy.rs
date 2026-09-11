@@ -53,7 +53,7 @@ impl NetworkPolicy {
     /// Gated on the offline kill switch ALONE, matching upstream exactly: pi's only control is
     /// `PI_OFFLINE` (`model-runtime.ts:161`, `main.ts:524,863-866`) — there is no settings key and
     /// no dedicated env var for the catalog refresh, and inventing one here would be a divergence.
-    /// `--offline` / `CYRUP_OFFLINE` / `PI_OFFLINE` therefore mean NO fetch, full stop.
+    /// `--offline` / `CYRUP_OFFLINE` therefore mean NO fetch, full stop.
     ///
     /// This is only the *network* half of the gate. The persisted overlay is still loaded from disk
     /// when this returns `false` — an offline run keeps the catalogs it saw last time, and in every
@@ -106,7 +106,7 @@ mod tests {
         let p = NetworkPolicy::resolve(&s, &env, &CliConfigOverrides::default());
         assert!(p.allow_model_catalog_refresh());
 
-        // `CYRUP_OFFLINE` / `PI_OFFLINE` (env tier) alone is enough.
+        // `CYRUP_OFFLINE` (env tier) alone is enough.
         let env_offline = EnvVars {
             offline: true,
             ..Default::default()

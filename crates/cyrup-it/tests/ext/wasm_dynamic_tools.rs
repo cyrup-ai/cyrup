@@ -144,3 +144,77 @@ async fn a_second_extension_does_not_steal_the_first_ones_tools() {
         other => panic!("unexpected demo_echo result: {other:?}"),
     }
 }
+
+/// #2835, the SECOND materialization path. `AgentSession::refresh_extension_tools` — the drain that
+/// carries a post-`init` registration onto the LIVE agent — calls `active_tools_filtered(&[], …)`
+/// with the session's allowlist, and it is the ONLY path a late tool takes.
+///
+/// Fixing just the builder's path would leave the whole defect reachable through this one: a tool
+/// registered from a `session_start` handler, which is exactly what pi's #2835 regression fixture
+/// does, would merge straight into `DynamicToolState` and onto the agent with the allowlist never
+/// consulted — and every builder-level test would still pass.
+///
+/// Driven through a REAL guest registration rather than a stub, so the thing being filtered is a
+/// genuinely late-arriving descriptor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_registered_tool_is_filtered_too() {
+    let bytes = std::fs::read(fixture::component()).expect("read fixture component bytes");
+    let host = cyrup_ext::ExtensionHost::with_wasm(fixture::cfg()).expect("host with wasm runtime");
+    host.load_wasm("demo".into(), &bytes, Arc::new(DenyServices))
+        .await
+        .expect("load + init the live wasm extension");
+
+    host.dispatcher()
+        .dispatch_notify(
+            &HostEvent::SessionStart {
+                reason: "startup".into(),
+                previous_session_file: None,
+            },
+            &CancelToken::new(),
+        )
+        .await;
+
+    // Unrestricted: the late tool is there. This is the precondition — without it the assertion
+    // below would pass for the wrong reason.
+    assert!(
+        host.active_tools(&[])
+            .expect("active tools")
+            .iter()
+            .any(|t| t.name() == "demo_late"),
+        "precondition: the late tool must exist before we assert it is filtered"
+    );
+
+    // A session pinned to `tools: ["read"]`, exactly as `refresh_extension_tools` would ask.
+    let allow: std::collections::HashSet<String> = ["read".to_string()].into();
+    let filtered = host
+        .active_tools_filtered(&[], Some(&allow), &std::collections::HashSet::new())
+        .expect("active tools");
+    assert!(
+        !filtered.iter().any(|t| t.name() == "demo_late"),
+        "a tool registered AFTER init must still be bounded by the session's allowlist; got {:?}",
+        filtered
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect::<Vec<_>>()
+    );
+
+    // And the allowlist that DOES name it lets it through, so this is a filter and not a blanket
+    // refusal of late registrations.
+    let allow: std::collections::HashSet<String> = ["demo_late".to_string()].into();
+    assert!(
+        host.active_tools_filtered(&[], Some(&allow), &std::collections::HashSet::new())
+            .expect("active tools")
+            .iter()
+            .any(|t| t.name() == "demo_late")
+    );
+
+    // `excludeTools` reaches it too.
+    let exclude: std::collections::HashSet<String> = ["demo_late".to_string()].into();
+    assert!(
+        !host
+            .active_tools_filtered(&[], None, &exclude)
+            .expect("active tools")
+            .iter()
+            .any(|t| t.name() == "demo_late")
+    );
+}

@@ -103,7 +103,10 @@ mod tests {
     #[test]
     fn parse_rejects_only_the_empty_string() {
         assert!(SessionId::parse("").is_none());
-        assert_eq!(SessionId::parse("s1").map(|s| s.as_str().to_string()), Some("s1".to_string()));
+        assert_eq!(
+            SessionId::parse("s1").map(|s| s.as_str().to_string()),
+            Some("s1".to_string())
+        );
     }
 
     #[test]
@@ -161,6 +164,9 @@ mod tests {
 
         let present: Holder =
             serde_json::from_str("{\"session_id\":\"s\"}").expect("present is legal");
-        assert_eq!(present.session_id.as_ref().map(SessionId::as_str), Some("s"));
+        assert_eq!(
+            present.session_id.as_ref().map(SessionId::as_str),
+            Some("s")
+        );
     }
 }

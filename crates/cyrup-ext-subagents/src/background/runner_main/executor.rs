@@ -3,9 +3,13 @@
 //! and background paths. Split out of `background/runner_main.rs`; ports
 //! pi `runs/background/subagent-runner.ts`.
 
+use super::settle::child_stopped_step_result;
+use super::status::TelemetryMsg;
 use crate::background::RunId;
 use crate::background::child_stop::ChildStopRegistry;
+use crate::background::control;
 use crate::error::SubagentError;
+use crate::exec;
 use crate::exec::{AgentConfig, ResolvedAgentPersona, RunOptions, SingleResult};
 use crate::fork_context::{ContextMode, ForkContext};
 use crate::spawn::chain_graph::{ChainRunContext, SingleStepExecutor, SingleStepSpec, StepResult};
@@ -13,11 +17,6 @@ use crate::spawn::depth::DepthEnvelope;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use crate::exec;
-use crate::background::control;
-use super::settle::child_stopped_step_result;
-use super::status::TelemetryMsg;
-
 
 // =================================================================================================
 // ExecSingleStepExecutor — the real, subprocess-spawning SingleStepExecutor (func-SA §1.1)
@@ -109,6 +108,16 @@ pub(crate) struct ExecSingleStepExecutor {
     /// no live session at plan time) leaves each step on its persona's own level, exactly as
     /// before this seam existed.
     pub(crate) inherited_session_thinking: Option<String>,
+    /// The launching process's host builtin-tool observation (pi `config.hostAvailableBuiltins`),
+    /// threaded into every dispatched step's [`crate::exec::RunOptions::host_available_builtins`].
+    ///
+    /// Two feeders, because this executor has two constructors: the FOREGROUND `/chain`//`/parallel`
+    /// walk observes the live host directly ([`Self::foreground`]'s caller has `HostServices` in
+    /// hand), and the detached hop-2 runner reads
+    /// [`RunnerConfig::host_available_builtins`](super::RunnerConfig::host_available_builtins) — it is
+    /// a separate OS process whose own registry is not the parent's. `None` is UNKNOWN and skips the
+    /// intersection.
+    pub(crate) host_available_builtins: Option<Vec<String>>,
     /// The effective `subagents.modelScope` policy for this run (SUBA-003), carried from the
     /// orchestrator via [`RunnerConfig::model_scope`](super::RunnerConfig::model_scope) (background) or handed directly by
     /// [`Self::foreground`]. Consumed by [`Self::run_single`], where a per-step `model:` override
@@ -225,6 +234,19 @@ impl ExecSingleStepExecutor {
     /// `model_scope` is the cwd's effective `subagents.modelScope` policy (SUBA-003), resolved by
     /// the same orchestrator discovery pass that produced `resolved_agents`, so a foreground chain
     /// step's `model:` override is policed by exactly the policy the single-run path enforces.
+    ///
+    /// `host_available_builtins` is this walk's observation of the LIVE host tool registry (pi
+    /// `hostAvailableBuiltins`), taken by the caller — which is the process that HAS the
+    /// `HostServices` handle — and threaded onto every step this executor dispatches.
+    ///
+    /// Eight parameters is one over clippy's threshold, and deliberately so.
+    /// `host_available_builtins` is not a `with_*` value: it is as fundamental as
+    /// `inherited_session_model` above, and a builder would let the one production caller silently
+    /// forget it — leaving the FOREGROUND `/chain`//`/parallel` walk launching with `None` while
+    /// every other path carries a real observation. The same trade is taken by this call's own
+    /// caller (`extension::executor::chain`'s `run_chain_foreground_with_control`) and by
+    /// [`crate::exec::spawn_plan::build_attempt_spawn_plan_with_read_requirement`].
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub(crate) fn foreground(
         depth: DepthEnvelope,
@@ -234,6 +256,7 @@ impl ExecSingleStepExecutor {
         inherited_session_model: Option<cyrup_core::ModelId>,
         model_scope: Option<crate::exec::model_scope::ModelScopeConfig>,
         spawn_command: Option<crate::spawn::SpawnCommand>,
+        host_available_builtins: Option<Vec<String>>,
     ) -> Self {
         Self {
             depth,
@@ -251,13 +274,14 @@ impl ExecSingleStepExecutor {
             orchestrator_intercom_target,
             run_id,
             inherited_session_model,
+            host_available_builtins,
             // Set separately via `with_inherited_session_thinking` — same rationale as `control`
-            // below: it keeps this constructor under clippy's argument threshold, and the value is
-            // resolved by the caller's own plan phase (`remembered_parent_thinking`), not by the
-            // single discovery pass the positional arguments all come from.
+            // below: the value is resolved by the caller's own plan phase
+            // (`remembered_parent_thinking`), not by the single discovery pass the positional
+            // arguments all come from.
             inherited_session_thinking: None,
             model_scope,
-            // Set separately via `with_control` rather than as a seventh positional argument — see
+            // Set separately via `with_control` rather than as a positional argument — see
             // that method's doc.
             control: None,
             // Same rationale, via `with_include_progress`.
@@ -292,9 +316,9 @@ impl ExecSingleStepExecutor {
     }
 
     /// SCOPE_19/A1 — install the live parent session's reasoning level for this walk's inheriting
-    /// steps (see the field's doc). A builder step for the same reasons [`Self::with_control`] is
-    /// one: [`Self::foreground`] stays under clippy's argument threshold, and the value comes from
-    /// the caller's own plan phase rather than the discovery pass.
+    /// steps (see the field's doc). A builder step for the same reason [`Self::with_control`] is
+    /// one: the value comes from the caller's own plan phase rather than the discovery pass that
+    /// produced [`Self::foreground`]'s positional arguments.
     #[must_use]
     pub(crate) fn with_inherited_session_thinking(mut self, thinking: Option<String>) -> Self {
         self.inherited_session_thinking = thinking;
@@ -304,9 +328,8 @@ impl ExecSingleStepExecutor {
     /// Install this run's `includeProgress` flag (SUBA-N06) — R-SA-043 compaction's opt-out,
     /// threaded onto every dispatched step's [`crate::exec::RunOptions::include_progress`].
     ///
-    /// A builder step for the same two reasons [`Self::with_control`] is one: [`Self::foreground`]
-    /// stays at six positional arguments, and the value is not a product of the single discovery
-    /// pass those six all come from.
+    /// A builder step for the same reason [`Self::with_control`] is one: [`Self::foreground`] takes
+    /// only values produced by the single discovery pass, and this is not one of them.
     #[must_use]
     pub(crate) fn with_include_progress(mut self, include_progress: Option<bool>) -> Self {
         self.include_progress = include_progress;
@@ -315,11 +338,11 @@ impl ExecSingleStepExecutor {
 
     /// Install this run's already-resolved live-control config (SUBA-N05).
     ///
-    /// A builder step rather than a [`Self::foreground`] parameter for two reasons: it keeps that
-    /// constructor at six arguments (clippy's `too_many_arguments` threshold is seven), and it
-    /// mirrors how the value actually flows — every caller resolves it with
+    /// A builder step rather than a [`Self::foreground`] parameter because it mirrors how the value
+    /// actually flows — every caller resolves it with
     /// [`crate::exec::control::resolve_control_config`] at a different point in its own plan phase,
-    /// whereas the six positional arguments are all products of the single discovery pass.
+    /// whereas that constructor's positional arguments are all products of the single discovery
+    /// pass.
     #[must_use]
     pub(crate) fn with_control(
         mut self,
@@ -601,6 +624,11 @@ impl ExecSingleStepExecutor {
         RunOptions {
             spawn_command: self.spawn_command.clone(),
             child_env: self.child_env.clone(),
+            // pi `hostAvailableBuiltins` — the LAUNCHING process's host observation, applied per
+            // step exactly as the run-level budgets below are. The one lowering both feeders share:
+            // the foreground `/chain`//`/parallel` walk sets the field from its live host, the
+            // detached hop-2 runner from its `RunnerConfig`.
+            host_available_builtins: self.host_available_builtins.clone(),
             // SUBA-021 — the RUN-level usage budget applied per step, exactly as `turn_budget`
             // below is (pi applies one `AsyncExecutionParams.usageBudget` across the whole run
             // rather than giving each step a fresh one).
@@ -1043,10 +1071,9 @@ mod tests {
         clippy::indexing_slicing
     )]
 
-    use super::*;
     use super::super::tests::single_step;
+    use super::*;
     use crate::spawn::parallel::GlobalConcurrencyLimit;
-
 
     // ---------------------------------------------------------------------------------------
     // T0.1 / C13: an unresolved step agent is dispatched as `Unknown agent: <name>` (a step
@@ -1065,6 +1092,7 @@ mod tests {
         let executor = ExecSingleStepExecutor {
             spawn_command: None,
             child_env: std::collections::HashMap::new(),
+            host_available_builtins: None,
             // SUBA-021: unbudgeted on this path (see the field doc).
             usage_budget: None,
             turn_budget: None,
@@ -1200,8 +1228,10 @@ mod tests {
         assert_eq!(step_result.timeout_recovery.as_ref(), Some(&summary));
 
         // Hop 2: the status surface (`record_step_outcome`'s single-slot arm).
-        let step =
-            crate::spawn::chain_graph::RunnerStep::SingleStep(single_step("coder", "write the module"));
+        let step = crate::spawn::chain_graph::RunnerStep::SingleStep(single_step(
+            "coder",
+            "write the module",
+        ));
         let mut status = crate::background::RunStatus::queued(
             RunId::from_token("run-3c-test".to_string()),
             crate::background::RunMode::Single,
@@ -1210,7 +1240,10 @@ mod tests {
         status.steps = vec![crate::background::StepStatus::pending("coder")];
         super::super::status::record_step_outcome(&mut status, &(0..1), &step, &step_result, None);
         assert_eq!(
-            status.steps.first().and_then(|s| s.timeout_recovery.as_ref()),
+            status
+                .steps
+                .first()
+                .and_then(|s| s.timeout_recovery.as_ref()),
             Some(&summary),
             "the status step carries the FULL summary (pi `shared/types.ts:1917`)"
         );
@@ -1233,5 +1266,121 @@ mod tests {
             serde_json::from_value(serde_json::to_value(&terminal).expect("serialize"))
                 .expect("round-trip");
         assert_eq!(round.timeout_recovery, Some(summary));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The host observation (pi `hostAvailableBuiltins`) reaches every dispatched step.
+    //
+    // `build_step_run_options` is the ONE lowering both of this executor's constructors share:
+    // the foreground `/chain`//`/parallel` walk sets `host_available_builtins` from the live
+    // host, the detached hop-2 runner from its `RunnerConfig`. Pinning it here therefore covers
+    // both feeders at the single point where forgetting it would silently disarm the host
+    // intersection for a whole chain.
+    // ---------------------------------------------------------------------------------------
+
+    /// A `ChainRunContext` sufficient to drive `build_step_run_options`.
+    fn host_test_ctx(cwd: &std::path::Path) -> ChainRunContext {
+        ChainRunContext {
+            cwd: cwd.to_path_buf(),
+            deadline_at: None,
+            timeout_ms: None,
+            cancel: cyrup_core::CancelToken::new(),
+            global_limit: GlobalConcurrencyLimit::new(4),
+            worktree_base_dir: None,
+            original_task: String::new(),
+            chain_dir: None,
+            dynamic_fanout_max_items: None,
+            step_slot: crate::spawn::chain_graph::StepSlot::Exclusive(0),
+        }
+    }
+
+    /// The hop-2 feeder's half: an executor built as `turn_loop` builds it (a struct literal fed
+    /// from `RunnerConfig`) forwards its observation onto every step's `RunOptions`.
+    #[test]
+    fn the_step_executor_forwards_the_observation_to_every_step() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let executor = ExecSingleStepExecutor {
+            spawn_command: None,
+            child_env: std::collections::HashMap::new(),
+            host_available_builtins: Some(vec!["read".to_string()]),
+            usage_budget: None,
+            turn_budget: None,
+            permission_rules: None,
+            depth: DepthEnvelope {
+                current_depth: 0,
+                max_depth: 5,
+            },
+            interrupted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            interrupt_cancel: cyrup_core::CancelToken::new(),
+            child_stops: None,
+            telemetry: None,
+            share: None,
+            artifacts_dir: None,
+            artifact_config: crate::artifacts::ArtifactConfig::default(),
+            resolved_agents: Arc::new(BTreeMap::new()),
+            orchestrator_intercom_target: None,
+            run_id: None,
+            inherited_session_model: None,
+            inherited_session_thinking: None,
+            model_scope: None,
+            control: None,
+            include_progress: None,
+            run_dir: None,
+        };
+
+        let opts = executor.build_step_run_options(
+            &single_step("reviewer", "review the change"),
+            &host_test_ctx(dir.path()),
+            Vec::new(),
+            crate::exec::fallback::ModelOverride::Inherit,
+            None,
+        );
+
+        assert_eq!(
+            opts.host_available_builtins,
+            Some(vec!["read".to_string()]),
+            "the run-level observation must reach the step's RunOptions, or `resolve_tool_surface` \
+             sees UNKNOWN and skips the intersection for every step of the run"
+        );
+    }
+
+    /// The FOREGROUND feeder's half. Without this nothing pins the `/chain`//`/parallel` path: it
+    /// is the one launch path whose observation arrives as a constructor argument, so dropping the
+    /// argument would compile and simply leave every foreground chain step launching with `None`.
+    #[test]
+    fn the_foreground_chain_executor_carries_the_observation() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let executor = ExecSingleStepExecutor::foreground(
+            DepthEnvelope {
+                current_depth: 0,
+                max_depth: 5,
+            },
+            Arc::new(BTreeMap::new()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(vec!["read".to_string()]),
+        );
+
+        assert_eq!(
+            executor.host_available_builtins,
+            Some(vec!["read".to_string()]),
+            "the constructor's 8th argument must land on the field"
+        );
+
+        let opts = executor.build_step_run_options(
+            &single_step("reviewer", "review the change"),
+            &host_test_ctx(dir.path()),
+            Vec::new(),
+            crate::exec::fallback::ModelOverride::Inherit,
+            None,
+        );
+        assert_eq!(
+            opts.host_available_builtins,
+            Some(vec!["read".to_string()]),
+            "and must then be forwarded onto every step this foreground walk dispatches"
+        );
     }
 }
