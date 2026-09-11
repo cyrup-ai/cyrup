@@ -853,7 +853,7 @@ mod bash_operations_tests {
                     cancel: CancelToken::new(),
                     timeout: Some(Duration::from_secs(5)),
                     env: vec![("A".into(), "1".into())],
-                    env_remove: vec!["PI_SESSION_ID".into()],
+                    env_remove: vec!["CYRUP_SESSION_ID".into()],
                 },
             )
             .await
@@ -872,7 +872,7 @@ mod bash_operations_tests {
         assert_eq!(seen[0].command, "echo hi");
         assert_eq!(seen[0].cwd, Path::new("/tmp"));
         assert_eq!(seen[0].env, vec![("A".to_string(), "1".to_string())]);
-        assert_eq!(seen[0].env_remove, vec!["PI_SESSION_ID".to_string()]);
+        assert_eq!(seen[0].env_remove, vec!["CYRUP_SESSION_ID".to_string()]);
         assert!(
             !seen[0].shell.program.as_os_str().is_empty(),
             "the adapter must resolve a shell itself, not leave it to `LocalProc`'s baked default"

@@ -18,7 +18,6 @@ use super::{
     TokenTotals,
 };
 
-
 /// Per-step status entry inside a [`RunStatus`] (func-SA §4.5).
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -182,7 +181,6 @@ pub struct ParallelGroupStatus {
     /// `tui::fleet_status`) that already walk it.
     pub children: Vec<StepStatus>,
 }
-
 
 /// The on-disk `status.json` record for one background run (func-SA §4.5; arch-SA §3.6).
 ///
@@ -423,7 +421,6 @@ impl RunStatus {
     }
 }
 
-
 /// The on-disk terminal result record for one finished background run (func-SA §4.5; arch-SA
 /// §3.6). Written **exactly once**, at process exit, strictly **after** the final `status.json`
 /// write (R-SA-077) — presence of this file in `ResultsDir` is the single authoritative "truly
@@ -656,7 +653,10 @@ mod tests {
         let legacy = serde_json::to_value(StepStatus::pending("researcher")).expect("serializes");
         let object = legacy.as_object().expect("a step is an object");
         for key in ["workflowKey", "runId", "sessionName"] {
-            assert!(!object.contains_key(key), "{key} must be omitted while absent");
+            assert!(
+                !object.contains_key(key),
+                "{key} must be omitted while absent"
+            );
         }
         let decoded: StepStatus = serde_json::from_value(legacy).expect("legacy decode");
         assert_eq!(decoded.workflow_key, None);

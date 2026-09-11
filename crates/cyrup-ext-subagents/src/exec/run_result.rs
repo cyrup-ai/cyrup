@@ -239,6 +239,25 @@ pub struct SingleResult {
     pub tool_calls: Vec<ToolCallSummary>,
     /// Whether [`crate::exec::output::truncate_output`] actually cut the delivered `final_output` (R-SA-042).
     pub output_truncated: bool,
+    /// The tool surface this child ACTUALLY launched with — the value behind its `--tools` CSV,
+    /// carried up from [`crate::exec::spawn_plan::AttemptSpawnPlan::tool_surface`] through the
+    /// winning [`crate::exec::attempt_runner::AttemptRecord`].
+    ///
+    /// Distinct from [`Self::tool_calls`], which is what the child DID; this is what it COULD do.
+    /// A parent that reads only the child's prose has no other way to learn it: subagent tools are
+    /// never inherited from the launching session, and the SUBA-045 diagnostic
+    /// ([`crate::exec::tool_availability`]) reports the INVERSE case and DELETES itself on every
+    /// healthy run (`tool_availability.rs:105-108`), so before this field the healthy-path surface
+    /// was computed by the child and then discarded.
+    ///
+    /// `#[serde(default)]` + omit-when-default so a `status.json`/result file written before this
+    /// field existed still round-trips — the same discipline [`Self::control_events`] and
+    /// [`Self::artifact_paths`] follow.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::exec::tool_surface::is_default_surface"
+    )]
+    pub tool_surface: crate::exec::tool_surface::ResolvedToolSurface,
     /// pi `result.controlEvents` (`execution.ts:1112`/`:1260`): every live-control event the
     /// WINNING attempt raised, in raise order, plus the post-settlement completion-guard raise
     /// (`:1234`). Empty for a run whose control config is disabled, whose `notifyOn` excluded both

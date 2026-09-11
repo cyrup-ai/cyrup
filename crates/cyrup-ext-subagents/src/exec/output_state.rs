@@ -105,8 +105,7 @@ mod tests {
             serde_json::to_string(&SubagentOutputState::Present).unwrap_or_default(),
             "\"present\""
         );
-        let decoded: SubagentOutputState =
-            serde_json::from_str("\"absent\"").unwrap_or_default();
+        let decoded: SubagentOutputState = serde_json::from_str("\"absent\"").unwrap_or_default();
         assert_eq!(decoded, SubagentOutputState::Absent);
         assert_eq!(SubagentOutputState::default(), SubagentOutputState::Unknown);
     }

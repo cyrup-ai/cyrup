@@ -26,7 +26,9 @@ pub(crate) async fn is_existing_file(path: &Path) -> bool {
 }
 
 /// pi `firstExistingResultFile` (`result-files.ts:88-93`) — the first alias that exists.
-pub(crate) async fn first_existing(candidates: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {
+pub(crate) async fn first_existing(
+    candidates: &[std::path::PathBuf],
+) -> Option<std::path::PathBuf> {
     for candidate in candidates {
         if is_existing_file(candidate).await {
             return Some(candidate.clone());

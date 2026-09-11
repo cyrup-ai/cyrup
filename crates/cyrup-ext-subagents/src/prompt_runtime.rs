@@ -2026,8 +2026,7 @@ impl NativeExtension for SubagentPromptRuntime {
             );
             if let Some(session_id) = session_id {
                 let roots = crate::paths::Roots::from_env();
-                let artifact_roots =
-                    crate::background::run_artifact_roots_in(&roots, &_ctx.cwd);
+                let artifact_roots = crate::background::run_artifact_roots_in(&roots, &_ctx.cwd);
                 let probe = crate::background::auto_drain::FsDrainProbe {
                     async_root: artifact_roots.async_root,
                     results_dir: artifact_roots.results_dir,

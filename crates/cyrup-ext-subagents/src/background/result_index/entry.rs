@@ -161,7 +161,12 @@ mod tests {
 
     #[test]
     fn every_required_field_is_required() {
-        for missing in ["\"runId\":\"r1\",", "\"sessionId\":\"s1\",", "\"file\":\"r1.json\",", "\"writtenAt\":123"] {
+        for missing in [
+            "\"runId\":\"r1\",",
+            "\"sessionId\":\"s1\",",
+            "\"file\":\"r1.json\",",
+            "\"writtenAt\":123",
+        ] {
             let json = entry_json("").replace(missing, "");
             assert!(
                 ResultIndexEntry::parse(json.as_bytes()).is_none(),

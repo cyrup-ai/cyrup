@@ -1630,6 +1630,8 @@ dependencies = [
  "cyrup-session",
  "cyrup-session-svc",
  "cyrup-test-support",
+ "cyrup-tools",
+ "cyrup-workflow-runtime",
  "deno_ast",
  "deno_core",
  "deno_error",
@@ -2002,6 +2004,17 @@ dependencies = [
  "tokio-stream",
  "unicode-segmentation",
  "uuid",
+]
+
+[[package]]
+name = "cyrup-workflow-runtime"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "deno_core",
+ "deno_error",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -148,6 +148,12 @@ impl SubagentExecutor {
                 // function already took. `None` for every ordinary configuration, which leaves each
                 // step resolving its command from the environment as before.
                 cfg.spawn_command.clone(),
+                // pi `hostAvailableBuiltins` (`runs/foreground/execution.ts:446`): the LIVE host
+                // tool registry, observed HERE because this walk's process is the one holding the
+                // `HostServices` handle, and threaded onto every step this executor dispatches — the
+                // SAME observation the foreground single-run path takes for its own `RunOptions`.
+                // `None` (headless embedder) is UNKNOWN and skips the intersection.
+                crate::exec::tool_surface::host_builtin_tool_names(self.host_services().as_deref()),
             )
             // SUBA-N05 (pi `controlConfig: input.controlConfig` on every per-step `runSync`,
             // `chain-execution.ts:322,491,733` @v0.34.0): the extension-level `subagents.control`

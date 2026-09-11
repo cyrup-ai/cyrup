@@ -41,8 +41,8 @@ pub mod tui;
 // ---- ergonomic top-level re-exports (the public API other crates' tests consume) ----
 
 pub use auth::{
-    LIVE_E2E_ENV, api_key, get_real_auth_store, has_api_key, has_auth_for_provider,
-    live_e2e_armed, real_agent_dir, real_auth_path, resolve_api_key, resolve_api_key_refreshing,
+    LIVE_E2E_ENV, api_key, get_real_auth_store, has_api_key, has_auth_for_provider, live_e2e_armed,
+    real_agent_dir, real_auth_path, resolve_api_key, resolve_api_key_refreshing,
     resolve_api_key_refreshing_in,
 };
 pub use differential::{

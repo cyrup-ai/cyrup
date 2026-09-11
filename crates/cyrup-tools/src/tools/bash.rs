@@ -301,7 +301,12 @@ impl Tool for ShellTool {
         // Deliberately OUTSIDE the `expose_session_environment` gate: that flag is Pi's
         // `exposeSessionEnvironment` and covers only the five session keys (bash.ts:171-181); these
         // two come from `process.env` unconditionally and are never scrubbed.
-        env.push(("PI_CODING_AGENT".to_string(), "true".to_string()));
+        //
+        // [CYRUP-DELTA — KEY; hard rename] pi's key is `PI_CODING_AGENT` (`cli.ts:13` @v0.83.0);
+        // cyrup renamed the whole public env surface to `CYRUP_*`, and the stale upstream
+        // spelling is DELETED from the child via `config::session_env_scrub_keys` so a
+        // pi-flavoured parent cannot leak it through.
+        env.push(("CYRUP_CODING_AGENT".to_string(), "true".to_string()));
         // [CYRUP-DELTA — KEY *and* value; the key is a FORWARD-PORT from `cli.ts:14` @v0.84.1, which
         // is AHEAD of the ported tag] `AI_AGENT` does not exist anywhere in pi @v0.83.0
         // (`git -C pi grep -n AI_AGENT v0.83.0 -- packages/` → 0 hits; `cli.ts:13` @v0.83.0 sets
@@ -749,7 +754,7 @@ mod tests {
     /// PROV-011 DoD 1/2 — the tool's opt-in tracks the experimental flag and nothing else.
     ///
     /// Flag-aware by construction: with the flag unset (the default `cargo test` environment) the
-    /// declaration must be ABSENT, and under `CYRUP_EXPERIMENTAL=1` / `PI_EXPERIMENTAL=1` it must be
+    /// declaration must be ABSENT, and under `CYRUP_EXPERIMENTAL=1` it must be
     /// pi's `{type:"json_schema", strict:"prefer"}`. Running the suite either way exercises the
     /// matching branch, and the assertion also pins the tool to
     /// `cyrup_core::experimental_tool_sampling` rather than to some private copy of the value.

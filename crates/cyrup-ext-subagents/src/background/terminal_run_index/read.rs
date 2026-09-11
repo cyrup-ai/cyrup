@@ -50,7 +50,12 @@ async fn session_dirs(
         Err(e) => return Err(SubagentError::Spawn(e)),
     };
     while let Some(entry) = entries.next_entry().await.map_err(SubagentError::Spawn)? {
-        if entry.file_type().await.map_err(SubagentError::Spawn)?.is_dir() {
+        if entry
+            .file_type()
+            .await
+            .map_err(SubagentError::Spawn)?
+            .is_dir()
+        {
             dirs.push(entry.path());
         }
     }
@@ -71,7 +76,12 @@ async fn marker_files(dir: &Path) -> Result<Vec<(PathBuf, String)>, SubagentErro
         Err(e) => return Err(SubagentError::Spawn(e)),
     };
     while let Some(entry) = entries.next_entry().await.map_err(SubagentError::Spawn)? {
-        if !entry.file_type().await.map_err(SubagentError::Spawn)?.is_file() {
+        if !entry
+            .file_type()
+            .await
+            .map_err(SubagentError::Spawn)?
+            .is_file()
+        {
             continue;
         }
         if let Some(name) = entry.file_name().to_str()
@@ -102,7 +112,10 @@ async fn recent_marker_files(
     if let Some(limit) = limit {
         markers.truncate(limit);
     }
-    Ok(markers.into_iter().map(|(dir, name)| dir.join(name)).collect())
+    Ok(markers
+        .into_iter()
+        .map(|(dir, name)| dir.join(name))
+        .collect())
 }
 
 /// The run ids of recently-terminal runs, newest first — pi `readRecentTerminalRunIndex`
@@ -151,9 +164,9 @@ pub async fn read_recent_terminal_run_index(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(_) => None,
         };
-        let Some(entry) = entry.filter(|entry| {
-            session_id.is_none_or(|wanted| &entry.session_id == wanted)
-        }) else {
+        let Some(entry) =
+            entry.filter(|entry| session_id.is_none_or(|wanted| &entry.session_id == wanted))
+        else {
             remove_invalid_marker(&marker).await;
             continue;
         };
@@ -162,8 +175,7 @@ pub async fn read_recent_terminal_run_index(
         // (never the marker path's): the marker name encodes the directory leaf, and the two can
         // legitimately disagree. Note pi's run-id clause is guarded (`status.runId && …`), so an
         // empty recorded run id does NOT invalidate the marker.
-        let status =
-            read_status_file(&RunDir::new(async_root, &entry.run_id).status()).await?;
+        let status = read_status_file(&RunDir::new(async_root, &entry.run_id).status()).await?;
         let agrees = status.as_ref().is_some_and(|status| {
             is_indexed_state(status.state)
                 && status.session_id.as_ref() == Some(&entry.session_id)
@@ -213,7 +225,9 @@ mod tests {
         ended_at: i64,
     ) {
         let async_dir = async_root.join(run);
-        tokio::fs::create_dir_all(&async_dir).await.expect("mkdir run dir");
+        tokio::fs::create_dir_all(&async_dir)
+            .await
+            .expect("mkdir run dir");
         let mut status = RunStatus::queued(RunId::from_token(run), RunMode::Single, Some(1));
         status.state = state;
         status.session_id = Some(session(session_id));
@@ -224,7 +238,9 @@ mod tests {
         )
         .await
         .expect("write status");
-        update_terminal_run_index(&async_dir, &status).await.expect("index write");
+        update_terminal_run_index(&async_dir, &status)
+            .await
+            .expect("index write");
     }
 
     fn marker_count(async_root: &Path) -> usize {
@@ -245,7 +261,9 @@ mod tests {
     #[tokio::test]
     async fn an_absent_index_reads_as_empty_not_an_error() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let runs = read_recent_terminal_run_index(tmp.path(), None, None).await.expect("ok");
+        let runs = read_recent_terminal_run_index(tmp.path(), None, None)
+            .await
+            .expect("ok");
         assert!(runs.is_empty());
         let scoped = read_recent_terminal_run_index(tmp.path(), Some(&session("s1")), None)
             .await
@@ -282,14 +300,24 @@ mod tests {
         settle_run(tmp.path(), "runa", RunState::Complete, "s1", 100).await;
         settle_run(tmp.path(), "runb", RunState::Complete, "s2", 200).await;
 
-        let all = read_recent_terminal_run_index(tmp.path(), None, None).await.expect("ok");
-        assert_eq!(ids(&all), vec!["runb", "runa"], "no filter lists every session");
+        let all = read_recent_terminal_run_index(tmp.path(), None, None)
+            .await
+            .expect("ok");
+        assert_eq!(
+            ids(&all),
+            vec!["runb", "runa"],
+            "no filter lists every session"
+        );
 
         let scoped = read_recent_terminal_run_index(tmp.path(), Some(&session("s1")), None)
             .await
             .expect("ok");
         assert_eq!(ids(&scoped), vec!["runa"]);
-        assert_eq!(marker_count(tmp.path()), 2, "a scoped read of one partition deletes nothing");
+        assert_eq!(
+            marker_count(tmp.path()),
+            2,
+            "a scoped read of one partition deletes nothing"
+        );
     }
 
     #[tokio::test]
@@ -301,7 +329,9 @@ mod tests {
         settle_run(tmp.path(), "run2", RunState::Complete, "s1", 200).await;
         settle_run(tmp.path(), "run3", RunState::Complete, "s1", 300).await;
         // Invalidate the NEWEST candidate's live status by removing its run directory.
-        tokio::fs::remove_dir_all(tmp.path().join("run3")).await.expect("rm run3");
+        tokio::fs::remove_dir_all(tmp.path().join("run3"))
+            .await
+            .expect("rm run3");
 
         let runs = read_recent_terminal_run_index(tmp.path(), Some(&session("s1")), Some(2))
             .await
@@ -330,7 +360,10 @@ mod tests {
             .await
             .expect("ok");
         assert_eq!(ids(&runs), vec!["good1"]);
-        assert!(!dir.join("0000000000000200-junk.json").exists(), "junk marker must be unlinked");
+        assert!(
+            !dir.join("0000000000000200-junk.json").exists(),
+            "junk marker must be unlinked"
+        );
     }
 
     #[tokio::test]
@@ -352,14 +385,20 @@ mod tests {
             .await
             .expect("ok");
         assert!(runs.is_empty());
-        assert_eq!(marker_count(tmp.path()), 0, "the stale marker must be unlinked");
+        assert_eq!(
+            marker_count(tmp.path()),
+            0,
+            "the stale marker must be unlinked"
+        );
     }
 
     #[tokio::test]
     async fn a_marker_whose_run_status_is_gone_is_unlinked() {
         let tmp = tempfile::tempdir().expect("tempdir");
         settle_run(tmp.path(), "run1", RunState::Complete, "s1", 100).await;
-        tokio::fs::remove_dir_all(tmp.path().join("run1")).await.expect("rm run dir");
+        tokio::fs::remove_dir_all(tmp.path().join("run1"))
+            .await
+            .expect("rm run dir");
 
         let runs = read_recent_terminal_run_index(tmp.path(), Some(&session("s1")), None)
             .await
@@ -378,15 +417,25 @@ mod tests {
         let s2_dir = session_index_dir(tmp.path(), &session("s2"));
         let s1_dir = session_index_dir(tmp.path(), &session("s1"));
         std::fs::create_dir_all(&s1_dir).expect("mkdir s1");
-        let marker = std::fs::read_dir(&s2_dir).expect("ls").next().expect("one").expect("entry");
+        let marker = std::fs::read_dir(&s2_dir)
+            .expect("ls")
+            .next()
+            .expect("one")
+            .expect("entry");
         std::fs::copy(marker.path(), s1_dir.join(marker.file_name())).expect("copy");
 
         let runs = read_recent_terminal_run_index(tmp.path(), Some(&session("s1")), None)
             .await
             .expect("ok");
         assert!(runs.is_empty());
-        assert!(!s1_dir.join(marker.file_name()).exists(), "the foreign marker must be unlinked");
-        assert!(s2_dir.join(marker.file_name()).exists(), "s2's own marker is untouched");
+        assert!(
+            !s1_dir.join(marker.file_name()).exists(),
+            "the foreign marker must be unlinked"
+        );
+        assert!(
+            s2_dir.join(marker.file_name()).exists(),
+            "s2's own marker is untouched"
+        );
     }
 
     #[tokio::test]
@@ -402,11 +451,22 @@ mod tests {
             .await
             .expect("ok");
         assert_eq!(ids(&runs), vec!["run1"], "one row per run");
-        assert_eq!(marker_count(tmp.path()), 1, "the older duplicate must be unlinked");
+        assert_eq!(
+            marker_count(tmp.path()),
+            1,
+            "the older duplicate must be unlinked"
+        );
         let dir = session_index_dir(tmp.path(), &session("s1"));
-        let survivor = std::fs::read_dir(dir).expect("ls").next().expect("one").expect("entry");
+        let survivor = std::fs::read_dir(dir)
+            .expect("ls")
+            .next()
+            .expect("one")
+            .expect("entry");
         assert!(
-            survivor.file_name().to_string_lossy().starts_with("0000000000000200-"),
+            survivor
+                .file_name()
+                .to_string_lossy()
+                .starts_with("0000000000000200-"),
             "the NEWEST marker survives: {:?}",
             survivor.file_name()
         );
@@ -423,6 +483,9 @@ mod tests {
             .expect("corrupt");
 
         let result = read_recent_terminal_run_index(tmp.path(), Some(&session("s1")), None).await;
-        assert!(result.is_err(), "a corrupt status must propagate, got {result:?}");
+        assert!(
+            result.is_err(),
+            "a corrupt status must propagate, got {result:?}"
+        );
     }
 }

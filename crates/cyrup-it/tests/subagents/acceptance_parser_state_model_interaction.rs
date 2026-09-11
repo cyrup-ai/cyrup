@@ -101,6 +101,7 @@ fn agent_config(name: &str) -> AgentConfig {
 /// artifact the AUTHORITATIVE report source (`execution.ts:1680-1701`).
 fn run_options(cwd: &Path, output_path: &Path) -> RunOptions {
     RunOptions {
+        host_available_builtins: None,
         structured_output_dir: None,
         spawn_command: None,
         child_env: std::collections::HashMap::new(),

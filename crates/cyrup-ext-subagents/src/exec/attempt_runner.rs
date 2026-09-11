@@ -90,6 +90,14 @@ pub(crate) struct AttemptRecord {
     /// Unarmed on every path that never reached the drive loop (a spawn failure) and on every run
     /// that declared no budget.
     pub(crate) turn_budget: crate::exec::turn_budget::TurnBudgetTracker,
+    /// The tool surface this attempt actually launched the child with, taken off
+    /// [`crate::exec::spawn_plan::AttemptSpawnPlan::tool_surface`] on the same line as
+    /// [`PreparedAttempt::tool_diagnostic_path`] and carried out so `run_sync` can publish the
+    /// WINNING attempt's value on [`crate::exec::run_result::SingleResult::tool_surface`].
+    ///
+    /// Default (unpinned/empty) on every path that never built a plan — a setup failure has no
+    /// surface to report, and inventing one would be a claim about a child that never existed.
+    pub(crate) tool_surface: crate::exec::tool_surface::ResolvedToolSurface,
 }
 
 #[async_trait::async_trait]
@@ -106,6 +114,7 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
             mut progress,
             mut control,
             tool_diagnostic_path,
+            tool_surface,
         } = match self.prepare_attempt(model, attempt_notes).await {
             Ok(prepared) => prepared,
             Err(failure) => return *failure,
@@ -134,7 +143,7 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
         // pi returns from `runSingleAttempt` on an interrupt BEFORE any exit-code re-diagnosis, so
         // this branch stays ahead of every diagnosis below.
         if outcome.interrupted {
-            return interrupted_attempt(progress, control, &outcome);
+            return interrupted_attempt(progress, control, tool_surface, &outcome);
         }
 
         let (raw_exit_code, spawn_error, process_signal) = match &outcome.exit_status {
@@ -151,6 +160,7 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
             return timed_out_attempt(
                 progress,
                 control,
+                tool_surface,
                 &outcome,
                 raw_exit_code,
                 spawn_error,
@@ -213,6 +223,7 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
                 final_output,
                 interrupted: false,
                 control,
+                tool_surface,
             },
         )
     }
@@ -276,6 +287,10 @@ struct PreparedAttempt {
     /// SUBA-045: taken off the plan before `plan.spec` was moved into the spawn, and read back by
     /// the diagnosis cascade (pi's `toolDiagnosticPath` local, `execution.ts:1072`).
     tool_diagnostic_path: Option<PathBuf>,
+    /// Taken off the plan on the same line and for the same reason as
+    /// [`Self::tool_diagnostic_path`]: `plan.spec` moves into the spawn immediately below, so any
+    /// value the settle path needs has to leave the plan first.
+    tool_surface: crate::exec::tool_surface::ResolvedToolSurface,
 }
 
 /// What [`SpawnedChildAttemptRunner::resolve_attempt_exit`] concluded about a settled attempt.
@@ -415,6 +430,7 @@ impl SpawnedChildAttemptRunner<'_> {
         // verdict. Without this, the model-fallback ladder could attribute attempt N's missing
         // tools to attempt N+1's startup crash.
         let tool_diagnostic_path = plan.tool_diagnostic_path;
+        let tool_surface = plan.tool_surface;
         if let Some(path) = tool_diagnostic_path.as_deref() {
             let _ = std::fs::remove_file(path);
         }
@@ -435,6 +451,7 @@ impl SpawnedChildAttemptRunner<'_> {
             progress,
             control,
             tool_diagnostic_path,
+            tool_surface,
         })
     }
 
@@ -585,6 +602,8 @@ fn attempt_setup_failure(
             final_output: None,
             interrupted: false,
             control,
+            // Nothing was planned or spawned, so there is no surface to report.
+            tool_surface: crate::exec::tool_surface::ResolvedToolSurface::default(),
         },
     )
 }
@@ -597,6 +616,7 @@ fn attempt_setup_failure(
 fn interrupted_attempt(
     progress: AgentProgress,
     control: crate::exec::control::ControlMonitor,
+    tool_surface: crate::exec::tool_surface::ResolvedToolSurface,
     outcome: &DriveOutcome,
 ) -> (AttemptSignal, AttemptRecord) {
     (
@@ -618,6 +638,9 @@ fn interrupted_attempt(
             final_output: Some(INTERRUPTED_FINAL_OUTPUT.to_string()),
             interrupted: true,
             control,
+            // A child DID launch on this path, so the surface it launched with is real and is
+            // published exactly as the success path publishes it.
+            tool_surface,
         },
     )
 }
@@ -628,6 +651,7 @@ fn interrupted_attempt(
 fn timed_out_attempt(
     progress: AgentProgress,
     control: crate::exec::control::ControlMonitor,
+    tool_surface: crate::exec::tool_surface::ResolvedToolSurface,
     outcome: &DriveOutcome,
     raw_exit_code: Option<i32>,
     spawn_error: Option<String>,
@@ -653,6 +677,8 @@ fn timed_out_attempt(
             final_output,
             interrupted: false,
             control,
+            // As on the interrupt path: a child launched, so its surface is real.
+            tool_surface,
         },
     )
 }

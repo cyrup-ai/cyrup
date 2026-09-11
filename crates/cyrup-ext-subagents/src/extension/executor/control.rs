@@ -16,8 +16,8 @@ use crate::extension::tool::text::{
     dismiss_not_running_refusal,
 };
 use crate::fork_context::ContextMode;
-use crate::spawn::chain_graph::{RunnerStep, SingleStepSpec};
 use crate::identity::SessionId;
+use crate::spawn::chain_graph::{RunnerStep, SingleStepSpec};
 
 impl SubagentExecutor {
     /// `action: "interrupt"` (C5): deliver a soft, resumable interrupt (R-SA-084 — a *pause*
@@ -55,7 +55,8 @@ impl SubagentExecutor {
                     .ok_or_else(|| "No interrupt-capable run found in this session.".to_string())?
             }
         };
-        let current_session = crate::identity::SessionId::parse_opt(self.current_session_id().as_deref());
+        let current_session =
+            crate::identity::SessionId::parse_opt(self.current_session_id().as_deref());
         match control::interrupt(
             &async_root,
             &results_dir,
@@ -220,7 +221,8 @@ impl SubagentExecutor {
             None => resolved_async_id.unwrap_or_else(|| target.unwrap_or_default().to_string()),
         };
 
-        let current_session = crate::identity::SessionId::parse_opt(self.current_session_id().as_deref());
+        let current_session =
+            crate::identity::SessionId::parse_opt(self.current_session_id().as_deref());
         match control::stop(
             &async_root,
             &results_dir,
@@ -386,8 +388,13 @@ impl SubagentExecutor {
         // the legacy root alone would miss every result this build writes and skip the
         // re-reconciliation upstream performs precisely when one exists.
         let has_terminal_result = match latest.session_id.as_ref() {
-            Some(session_id) => paths.resolve_result(session_id, &latest.run_id).await.is_some(),
-            None => tokio::fs::try_exists(&paths.legacy_result_root).await.unwrap_or(false),
+            Some(session_id) => paths
+                .resolve_result(session_id, &latest.run_id)
+                .await
+                .is_some(),
+            None => tokio::fs::try_exists(&paths.legacy_result_root)
+                .await
+                .unwrap_or(false),
         };
         if has_terminal_result {
             let reconciled = crate::background::reconcile::reconcile_now(&paths, None)
@@ -796,16 +803,16 @@ impl SubagentExecutor {
                 // result immediately, before any follow-up delivery is attempted — it must never be
                 // silently swallowed and fall through to steering a child that may still be running
                 // its prior turn.
-                if let Err(e) =
-                    control::interrupt(
-                        &async_root,
-                        &results_dir,
-                        run_id,
-                        "async-resume",
-                        None,
-                        crate::identity::SessionId::parse_opt(self.current_session_id().as_deref()).as_ref(),
-                    )
-                        .await
+                if let Err(e) = control::interrupt(
+                    &async_root,
+                    &results_dir,
+                    run_id,
+                    "async-resume",
+                    None,
+                    crate::identity::SessionId::parse_opt(self.current_session_id().as_deref())
+                        .as_ref(),
+                )
+                .await
                 {
                     return Err(format!("Failed to interrupt async run {run_id}: {e}"));
                 }

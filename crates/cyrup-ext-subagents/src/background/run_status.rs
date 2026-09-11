@@ -341,10 +341,12 @@ async fn format_status(status: &RunStatus, paths: &RunPaths) -> String {
             .timeout_recovery
             .as_ref()
             .map(crate::exec::mutation_evidence::TimeoutRecoverySummary::project);
-        lines.extend(crate::exec::mutation_evidence::format_timeout_recovery_lines(
-            recovery_projection.as_ref(),
-            "  ",
-        ));
+        lines.extend(
+            crate::exec::mutation_evidence::format_timeout_recovery_lines(
+                recovery_projection.as_ref(),
+                "  ",
+            ),
+        );
         let step_log = paths.step_output_log(index);
         if step_log.exists() {
             lines.push(format!("  Output: {}", step_log.display()));
@@ -823,7 +825,9 @@ mod tests {
         status.steps[0].telemetry.steer_count = Some(1);
         status.steps[0].telemetry.last_steer_at = None;
         assert!(
-            format_status(&status, &paths).await.contains(", steering: 1 steer"),
+            format_status(&status, &paths)
+                .await
+                .contains(", steering: 1 steer"),
             "singular form"
         );
         status.steps[0].telemetry.steer_count = None;
@@ -855,19 +859,21 @@ mod tests {
             truncated: false,
             unavailable: None,
         };
-        step.timeout_recovery = Some(crate::exec::mutation_evidence::build_timeout_recovery_summary(
-            crate::exec::mutation_evidence::TimeoutRecoveryInput {
-                termination: crate::exec::mutation_evidence::Termination::TimedOut,
-                evidence: &evidence,
-                required_output_missing: Some(true),
-                current_tool: None,
-                current_tool_args: None,
-                current_path: None,
-                session_file: None,
-                transcript_path: None,
-                artifact_paths: None,
-            },
-        ));
+        step.timeout_recovery = Some(
+            crate::exec::mutation_evidence::build_timeout_recovery_summary(
+                crate::exec::mutation_evidence::TimeoutRecoveryInput {
+                    termination: crate::exec::mutation_evidence::Termination::TimedOut,
+                    evidence: &evidence,
+                    required_output_missing: Some(true),
+                    current_tool: None,
+                    current_tool_args: None,
+                    current_path: None,
+                    session_file: None,
+                    transcript_path: None,
+                    artifact_paths: None,
+                },
+            ),
+        );
         status.steps = vec![step];
 
         let report = format_status(&status, &paths).await;
@@ -893,8 +899,8 @@ mod tests {
             truncated: false,
             unavailable: None,
         };
-        status.steps[0].timeout_recovery =
-            Some(crate::exec::mutation_evidence::build_timeout_recovery_summary(
+        status.steps[0].timeout_recovery = Some(
+            crate::exec::mutation_evidence::build_timeout_recovery_summary(
                 crate::exec::mutation_evidence::TimeoutRecoveryInput {
                     termination: crate::exec::mutation_evidence::Termination::TimedOut,
                     evidence: &quiet_evidence,
@@ -906,7 +912,8 @@ mod tests {
                     transcript_path: None,
                     artifact_paths: None,
                 },
-            ));
+            ),
+        );
         let quiet = format_status(&status, &paths).await;
         assert!(!quiet.contains("Recovery"), "{quiet}");
     }

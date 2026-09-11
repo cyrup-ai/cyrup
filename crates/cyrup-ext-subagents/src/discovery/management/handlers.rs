@@ -206,12 +206,30 @@ pub(crate) fn handle_list(
             } else {
                 format!(", aliases: {}", a.aliases.join(", "))
             };
+            // [CYRUP-DELTA] — pi `handleList` (`agent-management.ts:774` @v0.43.0) renders
+            // `- <name> (<source>[, context][, aliases]): <description>` and stops. The `, tools:`
+            // segment is cyrup's, added deliberately: pi's `handleGet` is the only surface that
+            // shows tools, so a parent following the documented `list` -> pick -> prompt flow never
+            // saw a tool list BEFORE it wrote a prompt that assumed one — and subagent tools are
+            // not inherited from the launching session, so that assumption is exactly the one that
+            // silently fails. Appended LAST, so every pi-shaped prefix stays byte-identical and a
+            // consumer parsing the leading segments is unaffected.
+            //
+            // `(unpinned)` rather than an empty list when the agent declares no `tools:` key: that
+            // child keeps its OWN default built-in set, which is not the same statement as "no
+            // tools" (which an explicitly-empty `tools:` would mean, and which renders as `tools: `
+            // with an empty list).
+            let tools = super::render::tool_list_str(a).map_or_else(
+                || ", tools: (unpinned)".to_string(),
+                |t| format!(", tools: {t}"),
+            );
             lines.push(format!(
-                "- {} ({}{}{}): {}",
+                "- {} ({}{}{}{}): {}",
                 a.name,
                 source_str(a.source),
                 ctx,
                 aliases,
+                tools,
                 a.description
             ));
         }

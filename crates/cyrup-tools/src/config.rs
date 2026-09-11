@@ -43,12 +43,17 @@ pub const SESSION_ENV_SUFFIXES: [&str; 5] = [
 /// which are exactly the ones Pi deletes and which a pi-flavoured parent (or a script that still
 /// reads them) would otherwise see with a stale value. A subagent run is a real re-exec of the
 /// `cyrup` binary, so the inheritance path is live.
+///
+/// The legacy `PI_CODING_AGENT` agency marker rides along (hard rename): cyrup pushes only
+/// `CYRUP_CODING_AGENT`, and a pi-flavoured parent's stale `PI_CODING_AGENT` must not survive
+/// into the child either. Deletion of the dead spelling is hygiene, not exposure.
 pub fn session_env_scrub_keys() -> Vec<String> {
-    let mut keys = Vec::with_capacity(SESSION_ENV_SUFFIXES.len() * 2);
+    let mut keys = Vec::with_capacity(SESSION_ENV_SUFFIXES.len() * 2 + 1);
     for suffix in SESSION_ENV_SUFFIXES {
         keys.push(format!("CYRUP_{suffix}"));
         keys.push(format!("PI_{suffix}"));
     }
+    keys.push("PI_CODING_AGENT".to_string());
     keys
 }
 

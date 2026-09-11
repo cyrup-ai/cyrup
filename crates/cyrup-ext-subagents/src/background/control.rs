@@ -3350,12 +3350,17 @@ mod tests {
         let results_dir = dir.path().join("results");
         let run_id = RunId::from_token("foreignstop1");
         let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
-        tokio::fs::create_dir_all(&paths.run_dir).await.expect("mkdir");
+        tokio::fs::create_dir_all(&paths.run_dir)
+            .await
+            .expect("mkdir");
 
-        let mut status = RunStatus::queued(run_id.clone(), RunMode::Single, Some(std::process::id()));
+        let mut status =
+            RunStatus::queued(run_id.clone(), RunMode::Single, Some(std::process::id()));
         status.state = RunState::Running;
         status.session_id = crate::identity::SessionId::parse("session-OWNER");
-        write_atomic_json(&paths.status, &status).await.expect("write status");
+        write_atomic_json(&paths.status, &status)
+            .await
+            .expect("write status");
 
         let intruder = crate::identity::SessionId::parse("session-INTRUDER");
         let outcome = stop(
@@ -3403,16 +3408,29 @@ mod tests {
         let results_dir = dir.path().join("results");
         let run_id = RunId::from_token("headlessstop");
         let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
-        tokio::fs::create_dir_all(&paths.run_dir).await.expect("mkdir");
+        tokio::fs::create_dir_all(&paths.run_dir)
+            .await
+            .expect("mkdir");
 
-        let mut status = RunStatus::queued(run_id.clone(), RunMode::Single, Some(std::process::id()));
+        let mut status =
+            RunStatus::queued(run_id.clone(), RunMode::Single, Some(std::process::id()));
         status.state = RunState::Running;
         status.session_id = crate::identity::SessionId::parse("session-ANY");
-        write_atomic_json(&paths.status, &status).await.expect("write status");
-
-        let outcome = stop(&async_root, &results_dir, run_id.as_str(), "stop-action", None, None, None)
+        write_atomic_json(&paths.status, &status)
             .await
-            .expect("stop resolves");
+            .expect("write status");
+
+        let outcome = stop(
+            &async_root,
+            &results_dir,
+            run_id.as_str(),
+            "stop-action",
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("stop resolves");
         assert_eq!(
             outcome,
             StopOutcome::Requested,
@@ -3428,12 +3446,17 @@ mod tests {
         let results_dir = dir.path().join("results");
         let run_id = RunId::from_token("foreignintr1");
         let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
-        tokio::fs::create_dir_all(&paths.run_dir).await.expect("mkdir");
+        tokio::fs::create_dir_all(&paths.run_dir)
+            .await
+            .expect("mkdir");
 
-        let mut status = RunStatus::queued(run_id.clone(), RunMode::Single, Some(std::process::id()));
+        let mut status =
+            RunStatus::queued(run_id.clone(), RunMode::Single, Some(std::process::id()));
         status.state = RunState::Running;
         status.session_id = crate::identity::SessionId::parse("session-OWNER");
-        write_atomic_json(&paths.status, &status).await.expect("write status");
+        write_atomic_json(&paths.status, &status)
+            .await
+            .expect("write status");
 
         let intruder = crate::identity::SessionId::parse("session-INTRUDER");
         let outcome = interrupt(
@@ -3449,7 +3472,9 @@ mod tests {
 
         assert_eq!(outcome, InterruptOutcome::NotInActiveSession);
         assert!(
-            !tokio::fs::try_exists(&paths.control_inbox).await.expect("check"),
+            !tokio::fs::try_exists(&paths.control_inbox)
+                .await
+                .expect("check"),
             "a refused interrupt must not write into another session's control inbox"
         );
     }
@@ -3462,7 +3487,15 @@ mod tests {
         write_running_status(&paths, &run_id, RunMode::Single, Some(4242), Vec::new()).await;
 
         assert_eq!(
-            stop(&async_root, &results_dir, run_id.as_str(), "stop-action", None, None, None)
+            stop(
+                &async_root,
+                &results_dir,
+                run_id.as_str(),
+                "stop-action",
+                None,
+                None,
+                None
+            )
             .await
             .expect("stop resolves"),
             StopOutcome::Requested
@@ -3688,7 +3721,15 @@ mod tests {
 
         // Unknown child → the resolver's not-found sentence, nothing written.
         assert_eq!(
-            stop(&async_root, &results_dir, run_id.as_str(), "stop-action", None, Some("step:9"), None)
+            stop(
+                &async_root,
+                &results_dir,
+                run_id.as_str(),
+                "stop-action",
+                None,
+                Some("step:9"),
+                None
+            )
             .await
             .expect("stop resolves"),
             StopOutcome::ChildUnresolved(
@@ -3697,7 +3738,15 @@ mod tests {
         );
         // Completed child → not stoppable, with the facts the refusal is rendered from.
         assert_eq!(
-            stop(&async_root, &results_dir, run_id.as_str(), "stop-action", None, Some("step:0"), None)
+            stop(
+                &async_root,
+                &results_dir,
+                run_id.as_str(),
+                "stop-action",
+                None,
+                Some("step:0"),
+                None
+            )
             .await
             .expect("stop resolves"),
             StopOutcome::ChildNotStoppable {
@@ -3709,7 +3758,15 @@ mod tests {
 
         // Running child → a targeted request lands, carrying index + resolved id.
         assert_eq!(
-            stop(&async_root, &results_dir, run_id.as_str(), "stop-action", None, Some("step:1"), None)
+            stop(
+                &async_root,
+                &results_dir,
+                run_id.as_str(),
+                "stop-action",
+                None,
+                Some("step:1"),
+                None
+            )
             .await
             .expect("stop resolves"),
             StopOutcome::ChildRequested {
@@ -3718,7 +3775,15 @@ mod tests {
         );
         // Pending child → likewise stoppable (pi `isStoppableAsyncStatusStep`).
         assert!(matches!(
-            stop(&async_root, &results_dir, run_id.as_str(), "stop-action", None, Some("step:2"), None)
+            stop(
+                &async_root,
+                &results_dir,
+                run_id.as_str(),
+                "stop-action",
+                None,
+                Some("step:2"),
+                None
+            )
             .await
             .expect("stop resolves"),
             StopOutcome::ChildRequested { .. }
@@ -3766,7 +3831,15 @@ mod tests {
         .await
         .expect("write status");
         assert_eq!(
-            stop(&async_root, &results_dir, queued_id.as_str(), "stop-action", None, None, None)
+            stop(
+                &async_root,
+                &results_dir,
+                queued_id.as_str(),
+                "stop-action",
+                None,
+                None,
+                None
+            )
             .await
             .expect("stop resolves"),
             StopOutcome::Requested
@@ -3790,7 +3863,15 @@ mod tests {
             .await
             .expect("write");
         assert_eq!(
-            stop(&async_root, &results_dir, paused_id.as_str(), "stop-action", None, None, None)
+            stop(
+                &async_root,
+                &results_dir,
+                paused_id.as_str(),
+                "stop-action",
+                None,
+                None,
+                None
+            )
             .await
             .expect("stop resolves"),
             StopOutcome::NotStoppable
@@ -3899,6 +3980,8 @@ mod tests {
                 progress: None,
                 runner: None,
                 external_process: None,
+                // Test fixture: no child was planned, so there is no surface to report.
+                tool_surface: crate::exec::tool_surface::ResolvedToolSurface::default(),
             }
         }
 
@@ -4776,6 +4859,8 @@ mod tests {
             progress: None,
             runner: None,
             external_process: None,
+            // Test fixture: no child was planned, so there is no surface to report.
+            tool_surface: crate::exec::tool_surface::ResolvedToolSurface::default(),
         }
     }
 

@@ -22,7 +22,10 @@ pub(crate) struct MissionSyncCompletionObserver {
 
 #[async_trait::async_trait]
 impl crate::background::watch::CompletionObserver for MissionSyncCompletionObserver {
-    async fn observe(&self, notification: &crate::background::watch::CompletionNotification) -> bool {
+    async fn observe(
+        &self,
+        notification: &crate::background::watch::CompletionNotification,
+    ) -> bool {
         let result = &notification.result;
         let async_dir = crate::background::RunDir::new(&self.async_root, &result.run_id);
         let event = serde_json::json!({

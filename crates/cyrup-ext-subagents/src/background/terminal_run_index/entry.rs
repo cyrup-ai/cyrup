@@ -162,9 +162,7 @@ mod tests {
     use super::*;
 
     fn entry_json(extra: &str) -> String {
-        format!(
-            "{{\"version\":1,\"runId\":\"r1\",\"sessionId\":\"s1\",\"endedAt\":123{extra}}}"
-        )
+        format!("{{\"version\":1,\"runId\":\"r1\",\"sessionId\":\"s1\",\"endedAt\":123{extra}}}")
     }
 
     #[test]
@@ -217,7 +215,11 @@ mod tests {
 
     #[test]
     fn every_required_field_is_required() {
-        for missing in ["\"runId\":\"r1\",", "\"sessionId\":\"s1\",", ",\"endedAt\":123"] {
+        for missing in [
+            "\"runId\":\"r1\",",
+            "\"sessionId\":\"s1\",",
+            ",\"endedAt\":123",
+        ] {
             let json = entry_json("").replace(missing, "");
             assert!(
                 TerminalRunIndexEntry::parse(json.as_bytes()).is_none(),

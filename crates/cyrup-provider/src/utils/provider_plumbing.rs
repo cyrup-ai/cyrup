@@ -41,7 +41,8 @@ pub(crate) fn provider_env_value(name: &str, env: Option<&ProviderEnv>) -> Optio
 }
 
 /// The `resolveCacheRetention` ladder over an arbitrary env lookup: an explicit caller value wins;
-/// otherwise `PI_CACHE_RETENTION == "long"` promotes to `Long`; otherwise `Short`.
+/// otherwise `CYRUP_CACHE_RETENTION == "long"` promotes to `Long`; otherwise `Short` (pi reads
+/// `PI_CACHE_RETENTION`; the spelling is renamed with the rest of the public env surface).
 ///
 /// The `lookup` seam exists for `bedrock-converse-stream`, whose `EnvSource` distinguishes the
 /// scoped overlay from the ambient process environment so its resolution tests never depend on the
@@ -53,7 +54,7 @@ pub(crate) fn resolve_cache_retention_with(
     if let Some(c) = cache_retention {
         return c;
     }
-    if lookup("PI_CACHE_RETENTION").as_deref() == Some("long") {
+    if lookup("CYRUP_CACHE_RETENTION").as_deref() == Some("long") {
         return CacheRetention::Long;
     }
     CacheRetention::Short
@@ -61,7 +62,7 @@ pub(crate) fn resolve_cache_retention_with(
 
 /// 1:1 port of Pi `resolveCacheRetention` — `anthropic-messages.ts:46-54`,
 /// `openai-completions.ts:141-149` and `openai-responses.ts:47-55` declare the identical ladder:
-/// an explicit caller value wins; otherwise `PI_CACHE_RETENTION == "long"` promotes to `Long`;
+/// an explicit caller value wins; otherwise `CYRUP_CACHE_RETENTION == "long"` promotes to `Long`;
 /// otherwise `Short`.
 pub(crate) fn resolve_cache_retention(
     cache_retention: Option<CacheRetention>,

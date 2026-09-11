@@ -276,7 +276,10 @@ mod tests {
     #[test]
     fn a_session_path_encodes_to_the_shape_pi_produces() {
         // JS: encodeURIComponent("/home/u/s.jsonl") === "%2Fhome%2Fu%2Fs.jsonl"
-        assert_eq!(encode_uri_component("/home/u/s.jsonl"), "%2Fhome%2Fu%2Fs.jsonl");
+        assert_eq!(
+            encode_uri_component("/home/u/s.jsonl"),
+            "%2Fhome%2Fu%2Fs.jsonl"
+        );
     }
 
     // --- portability predicate ------------------------------------------------------------
@@ -291,7 +294,9 @@ mod tests {
 
     #[test]
     fn windows_reserved_names_are_rejected_bare_and_before_a_dot() {
-        for name in ["con", "CON", "prn", "aux", "nul", "com1", "COM9", "lpt1", "lpt9"] {
+        for name in [
+            "con", "CON", "prn", "aux", "nul", "com1", "COM9", "lpt1", "lpt9",
+        ] {
             assert!(is_windows_reserved_name(name), "{name} must be reserved");
         }
         assert!(is_windows_reserved_name("con.txt"));
@@ -345,7 +350,11 @@ mod tests {
     #[test]
     fn an_over_long_value_falls_back_to_the_hash() {
         let long = "a".repeat(IndexSegment::MAX_BYTES + 1);
-        assert!(IndexSegment::encode(&long).as_str().starts_with(HASHED_INDEX_SEGMENT_PREFIX));
+        assert!(
+            IndexSegment::encode(&long)
+                .as_str()
+                .starts_with(HASHED_INDEX_SEGMENT_PREFIX)
+        );
     }
 
     #[test]
@@ -404,7 +413,10 @@ mod tests {
     fn an_over_long_value_has_no_historical_alias() {
         // The historical branch also enforces the byte budget, so there is nothing to fall back to.
         let long = "a".repeat(IndexSegment::MAX_BYTES + 1);
-        assert_eq!(IndexSegment::aliases(&long, IndexSegment::MAX_BYTES).len(), 1);
+        assert_eq!(
+            IndexSegment::aliases(&long, IndexSegment::MAX_BYTES).len(),
+            1
+        );
     }
 
     #[test]
@@ -427,7 +439,15 @@ mod tests {
         // `result-files.ts:16`'s MAX_JSON_FILE_STEM_BYTES pattern: a value that fits at 255 but
         // not at 250 must hash under the smaller budget.
         let value = "a".repeat(252);
-        assert!(!IndexSegment::encode_bounded(&value, 255).as_str().starts_with(HASHED_INDEX_SEGMENT_PREFIX));
-        assert!(IndexSegment::encode_bounded(&value, 250).as_str().starts_with(HASHED_INDEX_SEGMENT_PREFIX));
+        assert!(
+            !IndexSegment::encode_bounded(&value, 255)
+                .as_str()
+                .starts_with(HASHED_INDEX_SEGMENT_PREFIX)
+        );
+        assert!(
+            IndexSegment::encode_bounded(&value, 250)
+                .as_str()
+                .starts_with(HASHED_INDEX_SEGMENT_PREFIX)
+        );
     }
 }

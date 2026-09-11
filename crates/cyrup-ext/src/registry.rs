@@ -6,7 +6,7 @@ use crate::error::ExtError;
 use crate::provider::{ModelRegistrySink, ProviderHub, ProviderRegistration};
 use cyrup_core::{ExecMode, ExtensionId, Tool};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 /// What a guest sends to register a tool (arch-08 §3.5). `parameters` stays JSON-Schema (Pi-interop,
@@ -1303,7 +1303,37 @@ impl ExtensionRegistry {
 
     /// Merge a base tool set (built-ins) with extension tools; extension tools override by name
     /// (R-08-012/014). Stable order: base order first, then new extension-only tools.
+    ///
+    /// The UNRESTRICTED form — [`Self::active_tools_filtered`] with no allowlist and no denylist.
+    /// Every non-production caller in the workspace keeps this arity.
     pub fn active_tools(&self, base: &[Arc<dyn Tool>]) -> Result<Vec<Arc<dyn Tool>>, ExtError> {
+        self.active_tools_filtered(base, None, &HashSet::new())
+    }
+
+    /// [`Self::active_tools`] under the session's tool selection — pi `_refreshToolRegistry`'s
+    /// `isAllowedTool` (`agent-session.ts:2676-2677` @v0.83.0), which applies the session's `tools`
+    /// allowlist and `excludeTools` denylist to `allCustomTools` (`:2680-2686`) — the EXTENSION and
+    /// SDK tools — and not only to the built-ins. Regression #2835.
+    ///
+    /// `allow: None` is "no allowlist configured" (pi's `allowedToolNames === undefined`), NOT
+    /// "allow nothing": `Some(∅)` is the empty allowlist that denies everything. The two are
+    /// different states and `--no-builtin-tools` depends on the difference — it empties the BUILT-IN
+    /// selection while leaving `allowedToolNames` `undefined`, which is what keeps extension tools
+    /// active (`sdk.ts:258`, `cyrup-session-svc/src/builder.rs`'s `NoTools` doc).
+    ///
+    /// Only the APPEND loop is filtered. The override loop over `base` is not: `base` has already
+    /// been through `select_active_tools`, and an override shares its base tool's name, so it is
+    /// allowed by construction — testing it again could only ever reject a name the caller just
+    /// selected.
+    pub fn active_tools_filtered(
+        &self,
+        base: &[Arc<dyn Tool>],
+        allow: Option<&HashSet<String>>,
+        exclude: &HashSet<String>,
+    ) -> Result<Vec<Arc<dyn Tool>>, ExtError> {
+        let is_allowed = |name: &str| {
+            allow.is_none_or(|a| a.contains(name)) && !exclude.contains(name)
+        };
         let g = self.lock_read()?;
         let mut out: Vec<Arc<dyn Tool>> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1318,6 +1348,7 @@ impl ExtensionRegistry {
         }
         for n in &g.tool_order {
             if !seen.contains(n)
+                && is_allowed(n)
                 && let Some(t) = g.tools.get(n)
             {
                 out.push(t.clone());

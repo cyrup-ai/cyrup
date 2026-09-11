@@ -106,15 +106,19 @@ impl DrainProbe for FsDrainProbe {
         // for it itself, exactly as pi's `isNotFoundError(error) ⇒ []` does. What is left is
         // upstream's rethrow case — the root EXISTS and its listing failed — carrying pi's own
         // wording so the headless stderr line reads the same in both implementations.
-        list_active_runs(&self.async_root, &self.results_dir, Some(session_id.as_str()))
-            .await
-            .map(|runs| !runs.is_empty())
-            .map_err(|error| {
-                format!(
-                    "Failed to list async runs in '{}': {error}",
-                    self.async_root.display()
-                )
-            })
+        list_active_runs(
+            &self.async_root,
+            &self.results_dir,
+            Some(session_id.as_str()),
+        )
+        .await
+        .map(|runs| !runs.is_empty())
+        .map_err(|error| {
+            format!(
+                "Failed to list async runs in '{}': {error}",
+                self.async_root.display()
+            )
+        })
     }
 }
 
@@ -194,8 +198,13 @@ pub async fn drain_outstanding_work(
                  session '{session_id}'."
             ));
         }
-        if let Err(text) = waiter.wait_all(u64::try_from(remaining_ms).unwrap_or(0)).await {
-            return Err(format!("Auto-drain failed for session '{session_id}': {text}."));
+        if let Err(text) = waiter
+            .wait_all(u64::try_from(remaining_ms).unwrap_or(0))
+            .await
+        {
+            return Err(format!(
+                "Auto-drain failed for session '{session_id}': {text}."
+            ));
         }
     }
     Ok(())
@@ -283,7 +292,11 @@ mod tests {
     impl DrainWaiter for ScriptedWaiter {
         async fn wait_all(&self, timeout_ms: u64) -> Result<String, String> {
             self.timeouts.lock().expect("lock").push(timeout_ms);
-            self.answers.lock().expect("lock").pop().unwrap_or(Ok(String::new()))
+            self.answers
+                .lock()
+                .expect("lock")
+                .pop()
+                .unwrap_or(Ok(String::new()))
         }
     }
 
@@ -294,8 +307,15 @@ mod tests {
         let err = drain_outstanding_work(&session("s1"), 0, &|| 0, &probe, &waiter)
             .await
             .expect_err("zero is not a positive timeout");
-        assert_eq!(err, "Auto-drain timeoutMs must be a positive finite number.");
-        assert_eq!(probe.calls.load(Ordering::SeqCst), 0, "refused before any probe");
+        assert_eq!(
+            err,
+            "Auto-drain timeoutMs must be a positive finite number."
+        );
+        assert_eq!(
+            probe.calls.load(Ordering::SeqCst),
+            0,
+            "refused before any probe"
+        );
     }
 
     #[tokio::test]
@@ -305,7 +325,10 @@ mod tests {
         drain_outstanding_work(&session("s1"), 1000, &|| 0, &probe, &waiter)
             .await
             .expect("nothing to drain is success");
-        assert!(waiter.timeouts.lock().expect("lock").is_empty(), "the wait was never entered");
+        assert!(
+            waiter.timeouts.lock().expect("lock").is_empty(),
+            "the wait was never entered"
+        );
     }
 
     #[tokio::test]
@@ -442,8 +465,7 @@ mod tests {
         let async_root = tmp.path().join("async");
         let results_dir = tmp.path().join("results");
         let run_id = crate::background::RunId::new();
-        let paths =
-            crate::background::RunPaths::for_run(&async_root, &results_dir, &run_id);
+        let paths = crate::background::RunPaths::for_run(&async_root, &results_dir, &run_id);
         std::fs::create_dir_all(&paths.run_dir).expect("mkdir");
         // This process's own pid, so the reconcile step inside `list_active_runs` sees a live
         // runner and keeps the run Running instead of repairing it to Failed.
@@ -457,7 +479,10 @@ mod tests {
         status.last_update = crate::time::now_epoch_millis();
         std::fs::write(&paths.status, serde_json::to_vec(&status).expect("ser")).expect("write");
 
-        let probe = FsDrainProbe { async_root, results_dir };
+        let probe = FsDrainProbe {
+            async_root,
+            results_dir,
+        };
         assert_eq!(
             probe.has_outstanding_work(&session("owner"), 0).await,
             Ok(true),

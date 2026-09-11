@@ -682,4 +682,45 @@ mod tests {
             0
         );
     }
+
+    /// The OBSERVATION SEAM, asserted as the exact expression all three `&self` launch sites use.
+    ///
+    /// This is what can actually break in the threading, and none of it is provable from the
+    /// `RunOptions` literals themselves:
+    ///
+    /// * the `.as_deref()` coercion — `host_services()` hands back `Option<Arc<dyn HostServices>>`
+    ///   and `host_builtin_tool_names` takes `Option<&dyn HostServices>`; `.as_ref()` yields
+    ///   `Option<&Arc<_>>` and does NOT coerce;
+    /// * the late-bind ordering — the `OnceLock` is filled by `set_host_services` before `init`,
+    ///   so a launch site running after `init` really does see a bound host; and
+    /// * unbound → UNKNOWN — a headless embedder yields `None`, which makes `resolve_tool_surface`
+    ///   skip the intersection rather than report every tool missing.
+    ///
+    /// Driving this through `build_foreground_run_options` instead would mean constructing a
+    /// private 22-field `ForegroundRunOptionsInput` — built at exactly one production site and
+    /// never in a test — to re-prove that `field: expr` assigns `expr`.
+    #[test]
+    fn the_observation_seam_reads_the_live_host() {
+        let executor = SubagentExecutor::new();
+
+        // No host bound (headless / SDK-embedder default): UNKNOWN, never "nothing is available".
+        assert_eq!(
+            crate::exec::tool_surface::host_builtin_tool_names(executor.host_services().as_deref()),
+            None,
+            "an unbound host must read as UNKNOWN, so the intersection is skipped rather than \
+             refusing every review lane on a headless host"
+        );
+
+        executor.set_host_services(Arc::new(crate::exec::testsupport::RowsHost(Some(vec![
+            serde_json::json!({"name": "read", "sourceInfo": {"source": "builtin"}}),
+            serde_json::json!({"name": "grep", "sourceInfo": {"source": "builtin"}}),
+        ]))));
+
+        assert_eq!(
+            crate::exec::tool_surface::host_builtin_tool_names(executor.host_services().as_deref()),
+            Some(vec!["read".to_string(), "grep".to_string()]),
+            "once a host is bound, the seam the three `&self` launch sites call must report its \
+             builtin rows"
+        );
+    }
 }

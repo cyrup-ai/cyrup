@@ -198,6 +198,7 @@ async fn build_run(dir: &Path, roots: &Roots, run_token: &str, child_id: &str) -
     tokio::fs::create_dir_all(&run_paths.run_dir).await.unwrap();
 
     let config = RunnerConfig {
+        host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
         permission_rules: None, // SUBA-073: no policy — the pre-field behaviour
@@ -298,7 +299,16 @@ async fn interrupting_a_background_run_cascades_to_its_live_async_descendants() 
 
     // The run itself paused — the pre-existing half of the behavior, asserted so a regression that
     // broke it while keeping the cascade would still be caught.
-    let result: ResultFile = read_json(&harness.run_paths.result).await;
+    let status: RunStatus = read_json(&harness.run_paths.status).await;
+    let result_path = harness
+        .run_paths
+        .resolve_result(
+            status.session_id.as_ref().expect("session id present"),
+            &status.run_id,
+        )
+        .await
+        .expect("terminal result exists");
+    let result: ResultFile = read_json(&result_path).await;
     assert_eq!(result.state, RunState::Paused);
 
     // The half this test exists for: the DESCENDANT's own control inbox.
@@ -371,7 +381,16 @@ async fn a_delivered_timeout_request_fails_the_run_and_cascades_to_descendants()
     // 2. Terminal FAILURE, not a resumable pause. This is the distinction the whole second verb
     //    exists for: `Paused` here would mean an expired deadline left a run something could
     //    legitimately resume.
-    let result: ResultFile = read_json(&harness.run_paths.result).await;
+    let status: RunStatus = read_json(&harness.run_paths.status).await;
+    let result_path = harness
+        .run_paths
+        .resolve_result(
+            status.session_id.as_ref().expect("session id present"),
+            &status.run_id,
+        )
+        .await
+        .expect("terminal result exists");
+    let result: ResultFile = read_json(&result_path).await;
     assert_eq!(
         result.state,
         RunState::Failed,
@@ -485,7 +504,16 @@ async fn a_delivered_stop_request_stops_the_run_and_cascades_to_descendants() {
     );
 
     // 2. A THIRD terminal verdict, not either of the other two.
-    let result: ResultFile = read_json(&harness.run_paths.result).await;
+    let status: RunStatus = read_json(&harness.run_paths.status).await;
+    let result_path = harness
+        .run_paths
+        .resolve_result(
+            status.session_id.as_ref().expect("session id present"),
+            &status.run_id,
+        )
+        .await
+        .expect("terminal result exists");
+    let result: ResultFile = read_json(&result_path).await;
     assert_eq!(
         result.state,
         RunState::Stopped,

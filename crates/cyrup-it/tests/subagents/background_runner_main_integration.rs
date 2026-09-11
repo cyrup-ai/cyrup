@@ -172,6 +172,37 @@ fn single_step(agent: &str, task: &str) -> SingleStepSpec {
     }
 }
 
+/// Reads and parses `<run_dir>/status.json`.
+async fn read_status(run_paths: &RunPaths) -> RunStatus {
+    serde_json::from_slice(
+        &tokio::fs::read(&run_paths.status)
+            .await
+            .expect("status.json exists"),
+    )
+    .expect("parse status.json")
+}
+
+/// Reads back the terminal [`ResultFile`] for a run whose `status.json` is already on disk,
+/// resolving through [`RunPaths::resolve_result`] exactly the way every production reader
+/// (`background::control`, `background::reconcile`, `background::wait`) does. Every fixture in
+/// this file launches with a session id — the session-partitioned result index refuses a
+/// session-less result outright (pi `result-files.ts:166`) — so the terminal payload always lives
+/// under `resolve_result`'s owned location, never at the bare [`RunPaths::legacy_result_root`].
+async fn read_terminal_result(run_paths: &RunPaths, status: &RunStatus) -> ResultFile {
+    let path = run_paths
+        .resolve_result(
+            status
+                .session_id
+                .as_ref()
+                .expect("this file's fixtures always launch with a session id"),
+            &status.run_id,
+        )
+        .await
+        .expect("terminal result file exists");
+    serde_json::from_slice(&tokio::fs::read(&path).await.expect("read ResultFile"))
+        .expect("parse ResultFile")
+}
+
 async fn run_against_fixture(
     dir: &Path,
     script: &serde_json::Value,
@@ -209,18 +240,8 @@ async fn run_against_fixture(
 
     result.expect("run() itself never returns Err");
 
-    let status: RunStatus = serde_json::from_slice(
-        &tokio::fs::read(&run_paths.status)
-            .await
-            .expect("status.json exists"),
-    )
-    .expect("parse status.json");
-    let result_file: ResultFile = serde_json::from_slice(
-        &tokio::fs::read(&run_paths.result)
-            .await
-            .expect("ResultFile exists"),
-    )
-    .expect("parse ResultFile");
+    let status = read_status(&run_paths).await;
+    let result_file = read_terminal_result(&run_paths, &status).await;
 
     (status, result_file)
 }
@@ -241,6 +262,7 @@ async fn happy_path_writes_status_then_result_both_terminal_and_consistent() {
         "exit_code": 0
     });
     let config = RunnerConfig {
+        host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
         permission_rules: None, // SUBA-073: no policy — the pre-field behaviour
@@ -359,6 +381,7 @@ async fn result_file_lands_in_the_orchestrator_results_dir_not_a_re_derived_one(
 
     // The config carries the orchestrator's ABSOLUTE roots — the T0.4 fix.
     let config = RunnerConfig {
+        host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
@@ -419,7 +442,7 @@ async fn result_file_lands_in_the_orchestrator_results_dir_not_a_re_derived_one(
         .join("results");
     let provisional = RunPaths::for_run(&roots.async_root, &buggy_results_dir, &run_id);
     assert_ne!(
-        provisional.result, orchestrator_paths.result,
+        provisional.legacy_result_root, orchestrator_paths.legacy_result_root,
         "the buggy provisional result path must differ from the orchestrator's, else this test \
          proves nothing"
     );
@@ -443,6 +466,13 @@ async fn result_file_lands_in_the_orchestrator_results_dir_not_a_re_derived_one(
     .await;
     result.expect("run() itself never returns Err");
 
+    // Ordering + consistency: status.json THEN ResultFile, both terminal and mutually consistent.
+    let status = read_status(&orchestrator_paths).await;
+    let session_id = status
+        .session_id
+        .as_ref()
+        .expect("this fixture launches with a session id");
+
     // BOTH the status.json and the terminal ResultFile must be found in the ORCHESTRATOR's dirs.
     assert!(
         tokio::fs::try_exists(&orchestrator_paths.status)
@@ -452,36 +482,26 @@ async fn result_file_lands_in_the_orchestrator_results_dir_not_a_re_derived_one(
         orchestrator_paths.status
     );
     assert!(
-        tokio::fs::try_exists(&orchestrator_paths.result)
+        orchestrator_paths
+            .resolve_result(session_id, &run_id)
             .await
-            .unwrap_or(false),
+            .is_some(),
         "the terminal ResultFile must land in the orchestrator's results dir (the whole point of \
          C7): {:?}",
-        orchestrator_paths.result
+        orchestrator_paths.legacy_result_root
     );
 
     // And NOTHING may land at the divergent, re-derived location.
     assert!(
-        !tokio::fs::try_exists(&provisional.result)
+        provisional
+            .resolve_result(session_id, &run_id)
             .await
-            .unwrap_or(false),
+            .is_none(),
         "the ResultFile must NOT be written to the divergent re-derived results dir (C7): {:?}",
-        provisional.result
+        provisional.legacy_result_root
     );
 
-    // Ordering + consistency: status.json THEN ResultFile, both terminal and mutually consistent.
-    let status: RunStatus = serde_json::from_slice(
-        &tokio::fs::read(&orchestrator_paths.status)
-            .await
-            .expect("status.json exists"),
-    )
-    .expect("parse status.json");
-    let result_file: ResultFile = serde_json::from_slice(
-        &tokio::fs::read(&orchestrator_paths.result)
-            .await
-            .expect("ResultFile exists"),
-    )
-    .expect("parse ResultFile");
+    let result_file = read_terminal_result(&orchestrator_paths, &status).await;
     assert_eq!(status.state, RunState::Complete);
     assert_eq!(result_file.state, RunState::Complete);
     assert!(result_file.success);
@@ -509,6 +529,7 @@ async fn run_writes_real_events_jsonl_through_the_shared_bounded_writer() {
         "exit_code": 0
     });
     let config = RunnerConfig {
+        host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
@@ -655,6 +676,7 @@ async fn forced_error_path_still_writes_status_then_result_both_terminal() {
         "exit_code": 7
     });
     let config = RunnerConfig {
+        host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
@@ -761,7 +783,7 @@ async fn missing_config_file_still_reaches_a_terminal_failed_state() {
     .expect("parse status");
 
     assert_eq!(status.state, RunState::Failed);
-    let result_file_exists = tokio::fs::try_exists(&run_paths.result)
+    let result_file_exists = tokio::fs::try_exists(&run_paths.legacy_result_root)
         .await
         .expect("probe result path");
     assert!(
@@ -803,6 +825,7 @@ async fn append_request_written_after_start_is_consumed_next_iteration() {
         .expect("mkdir run_dir");
 
     let config = RunnerConfig {
+        host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
@@ -884,12 +907,8 @@ async fn append_request_written_after_start_is_consumed_next_iteration() {
 
     outcome.expect("run() itself never returns Err");
 
-    let result_file: ResultFile = serde_json::from_slice(
-        &tokio::fs::read(&run_paths.result)
-            .await
-            .expect("ResultFile exists"),
-    )
-    .expect("parse result");
+    let status = read_status(&run_paths).await;
+    let result_file = read_terminal_result(&run_paths, &status).await;
 
     assert_eq!(
         result_file.results.len(),
@@ -947,6 +966,7 @@ async fn late_interrupt_after_last_step_completes_does_not_downgrade_a_finished_
     // exactly the shape needed to race an interrupt against natural completion with nothing left
     // to legitimately pause.
     let config = RunnerConfig {
+        host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
@@ -1050,12 +1070,7 @@ async fn late_interrupt_after_last_step_completes_does_not_downgrade_a_finished_
             .expect("status.json exists"),
     )
     .expect("parse status.json");
-    let result_file: ResultFile = serde_json::from_slice(
-        &tokio::fs::read(&run_paths.result)
-            .await
-            .expect("ResultFile exists"),
-    )
-    .expect("parse result");
+    let result_file = read_terminal_result(&run_paths, &status).await;
 
     assert_eq!(
         status.state,
@@ -1118,6 +1133,7 @@ async fn depth_exhausted_run_rejects_the_whole_run_and_spawns_zero_real_processe
         .expect("mkdir run_dir");
 
     let config = RunnerConfig {
+        host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
@@ -1187,12 +1203,7 @@ async fn depth_exhausted_run_rejects_the_whole_run_and_spawns_zero_real_processe
             .expect("status.json exists"),
     )
     .expect("parse status.json");
-    let result_file: ResultFile = serde_json::from_slice(
-        &tokio::fs::read(&run_paths.result)
-            .await
-            .expect("ResultFile exists"),
-    )
-    .expect("parse ResultFile");
+    let result_file = read_terminal_result(&run_paths, &status).await;
 
     assert_eq!(
         status.state,
@@ -1266,6 +1277,7 @@ async fn status_json_carries_live_current_tool_during_a_run() {
         .expect("mkdir run_dir");
 
     let config = RunnerConfig {
+        host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
@@ -1397,6 +1409,7 @@ async fn interrupting_a_single_step_run_actually_signals_the_mid_flight_child() 
         .expect("mkdir run_dir");
 
     let config = RunnerConfig {
+        host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
@@ -1490,12 +1503,7 @@ async fn interrupting_a_single_step_run_actually_signals_the_mid_flight_child() 
             .expect("status.json exists"),
     )
     .expect("parse status.json");
-    let result_file: ResultFile = serde_json::from_slice(
-        &tokio::fs::read(&run_paths.result)
-            .await
-            .expect("ResultFile exists"),
-    )
-    .expect("parse ResultFile");
+    let result_file = read_terminal_result(&run_paths, &status).await;
 
     assert_eq!(
         status.state,
@@ -1549,6 +1557,7 @@ async fn runner_config_control_reaches_every_step_and_raises_real_events() {
         control: Option<cyrup_ext_subagents::exec::control::ResolvedControlConfig>,
     ) -> RunnerConfig {
         RunnerConfig {
+            host_available_builtins: None,
             completion_owner_id: None,
             turn_budget: None,
             permission_rules: None,
@@ -1673,6 +1682,7 @@ async fn the_runner_writes_the_artifact_quadruple_and_honours_session_dir_and_sh
     step.skills = Some(Vec::new());
 
     let config = RunnerConfig {
+        host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
@@ -1805,6 +1815,7 @@ async fn the_runner_writes_no_artifacts_when_the_run_disabled_them() {
         "exit_code": 0
     });
     let config = RunnerConfig {
+        host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
@@ -1880,6 +1891,7 @@ async fn an_already_passed_deadline_in_the_config_times_the_run_out_rather_than_
         "exit_code": 0
     });
     let config = RunnerConfig {
+        host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
@@ -1984,6 +1996,7 @@ async fn stopping_a_mid_flight_run_ends_it_stopped_not_paused_and_not_failed() {
         .expect("mkdir run_dir");
 
     let config = RunnerConfig {
+        host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
@@ -2071,12 +2084,7 @@ async fn stopping_a_mid_flight_run_ends_it_stopped_not_paused_and_not_failed() {
             .expect("status.json exists"),
     )
     .expect("parse status.json");
-    let result_file: ResultFile = serde_json::from_slice(
-        &tokio::fs::read(&run_paths.result)
-            .await
-            .expect("ResultFile exists"),
-    )
-    .expect("parse ResultFile");
+    let result_file = read_terminal_result(&run_paths, &status).await;
 
     assert_eq!(
         status.state,
@@ -2232,6 +2240,7 @@ fn child_stop_chain_config(
     results_dir: &Path,
 ) -> RunnerConfig {
     RunnerConfig {
+        host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
@@ -2355,12 +2364,7 @@ async fn a_child_scoped_stop_stops_one_chain_step_and_the_next_step_still_comple
             .expect("status.json exists"),
     )
     .expect("parse status.json");
-    let result_file: ResultFile = serde_json::from_slice(
-        &tokio::fs::read(&run_paths.result)
-            .await
-            .expect("ResultFile exists"),
-    )
-    .expect("parse ResultFile");
+    let result_file = read_terminal_result(&run_paths, &status).await;
 
     // The RUN is not stopped — it ran on and ended on its steps' own exit codes.
     assert_eq!(
@@ -2535,12 +2539,7 @@ async fn a_child_scoped_stop_for_a_pending_step_is_queued_and_skips_it_when_reac
             .expect("status.json exists"),
     )
     .expect("parse status.json");
-    let result_file: ResultFile = serde_json::from_slice(
-        &tokio::fs::read(&run_paths.result)
-            .await
-            .expect("ResultFile exists"),
-    )
-    .expect("parse ResultFile");
+    let result_file = read_terminal_result(&run_paths, &status).await;
 
     assert_eq!(status.state, RunState::Failed, "{status:?}");
     assert_eq!(
@@ -2641,6 +2640,7 @@ async fn a_child_scoped_stop_kills_one_fan_out_member_and_its_siblings_still_com
         .await
         .expect("mkdir run_dir");
     let config = RunnerConfig {
+        host_available_builtins: None,
         mode: RunMode::Parallel,
         steps: vec![RunnerStep::ParallelGroup(ParallelGroupSpec {
             steps: vec![

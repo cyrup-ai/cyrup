@@ -49,9 +49,7 @@ const MISSION_BINDING_FILE: &str = "mission.json";
 /// # Errors
 ///
 /// Only a session-index write failure. Auxiliary index failures are logged and swallowed.
-pub(crate) async fn write_result_index_for_data(
-    request: &ResultWrite<'_>,
-) -> std::io::Result<()> {
+pub(crate) async fn write_result_index_for_data(request: &ResultWrite<'_>) -> std::io::Result<()> {
     let ResultWrite {
         results_dir,
         session_id,
@@ -78,8 +76,7 @@ pub(crate) async fn write_result_index_for_data(
 
     // pi `:145-149` — lookup by run id.
     if let Err(error) =
-        write_atomic_json_creating_parent(&paths::run_index_path(results_dir, run_id), &entry)
-            .await
+        write_atomic_json_creating_parent(&paths::run_index_path(results_dir, run_id), &entry).await
     {
         tracing::warn!(
             run_id = %run_id,
@@ -107,7 +104,9 @@ pub(crate) async fn write_result_index_for_data(
     // one index that is read cross-session, so writing it for every run would hand every instance
     // a candidate list containing every other instance's results and undo the partitioning.
     if let Some(async_dir) = async_dir
-        && tokio::fs::try_exists(async_dir.join(MISSION_BINDING_FILE)).await.unwrap_or(false)
+        && tokio::fs::try_exists(async_dir.join(MISSION_BINDING_FILE))
+            .await
+            .unwrap_or(false)
         && let Err(error) = write_atomic_json_creating_parent(
             &paths::mission_observer_path(results_dir, run_id),
             &entry,
@@ -263,14 +262,12 @@ mod tests {
     }
 
     fn payload() -> Payload {
-        Payload { run_id: "run1".to_string() }
+        Payload {
+            run_id: "run1".to_string(),
+        }
     }
 
-    async fn write_for(
-        dir: &Path,
-        async_dir: Option<&Path>,
-        tool_call: Option<&str>,
-    ) -> RunId {
+    async fn write_for(dir: &Path, async_dir: Option<&Path>, tool_call: Option<&str>) -> RunId {
         let run = RunId::from_token("run1");
         write_result_index_for_data(&ResultWrite {
             results_dir: dir,
@@ -292,7 +289,10 @@ mod tests {
 
         let session_entry = paths::result_index_path(tmp.path(), &session("s1"), &run);
         assert!(session_entry.is_file(), "session index missing");
-        assert!(paths::run_index_path(tmp.path(), &run).is_file(), "run index missing");
+        assert!(
+            paths::run_index_path(tmp.path(), &run).is_file(),
+            "run index missing"
+        );
     }
 
     #[tokio::test]
@@ -328,7 +328,11 @@ mod tests {
         // pi's `nonEmptyString(data.toolCallId)` guard — "" is not an id.
         let tmp = tempfile::tempdir().expect("tempdir");
         write_for(tmp.path(), None, Some("")).await;
-        assert!(!paths::result_index_root(tmp.path()).join("tool-calls").exists());
+        assert!(
+            !paths::result_index_root(tmp.path())
+                .join("tool-calls")
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -345,7 +349,9 @@ mod tests {
         );
 
         // Bind it, rewrite -> observer entry appears.
-        tokio::fs::write(async_dir.join(MISSION_BINDING_FILE), b"{}").await.expect("bind");
+        tokio::fs::write(async_dir.join(MISSION_BINDING_FILE), b"{}")
+            .await
+            .expect("bind");
         let run = write_for(tmp.path(), Some(&async_dir), None).await;
         assert!(paths::mission_observer_path(tmp.path(), &run).is_file());
     }
@@ -375,14 +381,17 @@ mod tests {
     async fn a_terminal_write_stages_indexes_and_promotes() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let run = RunId::from_token("run1");
-        let state = write_async_result_file(&ResultWrite {
-            results_dir: tmp.path(),
-            session_id: &session("s1"),
-            run_id: &run,
-            written_at: 1,
-            async_dir: None,
-            tool_call_id: None,
-        }, &payload())
+        let state = write_async_result_file(
+            &ResultWrite {
+                results_dir: tmp.path(),
+                session_id: &session("s1"),
+                run_id: &run,
+                written_at: 1,
+                async_dir: None,
+                tool_call_id: None,
+            },
+            &payload(),
+        )
         .await
         .expect("write");
 
@@ -411,14 +420,17 @@ mod tests {
         // always find a payload it can see, and can never see one it cannot find.
         let tmp = tempfile::tempdir().expect("tempdir");
         let run = RunId::from_token("run1");
-        write_pending_async_result_file(&ResultWrite {
-            results_dir: tmp.path(),
-            session_id: &session("s1"),
-            run_id: &run,
-            written_at: 1,
-            async_dir: None,
-            tool_call_id: None,
-        }, &payload())
+        write_pending_async_result_file(
+            &ResultWrite {
+                results_dir: tmp.path(),
+                session_id: &session("s1"),
+                run_id: &run,
+                written_at: 1,
+                async_dir: None,
+                tool_call_id: None,
+            },
+            &payload(),
+        )
         .await
         .expect("write");
 
@@ -436,32 +448,41 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let run_a = RunId::from_token("runa");
         let run_b = RunId::from_token("runb");
-        write_pending_async_result_file(&ResultWrite {
-            results_dir: tmp.path(),
-            session_id: &session("s1"),
-            run_id: &run_a,
-            written_at: 1,
-            async_dir: None,
-            tool_call_id: None,
-        }, &payload())
-            .await
-            .expect("a");
-        write_pending_async_result_file(&ResultWrite {
-            results_dir: tmp.path(),
-            session_id: &session("s2"),
-            run_id: &run_b,
-            written_at: 1,
-            async_dir: None,
-            tool_call_id: None,
-        }, &payload())
-            .await
-            .expect("b");
+        write_pending_async_result_file(
+            &ResultWrite {
+                results_dir: tmp.path(),
+                session_id: &session("s1"),
+                run_id: &run_a,
+                written_at: 1,
+                async_dir: None,
+                tool_call_id: None,
+            },
+            &payload(),
+        )
+        .await
+        .expect("a");
+        write_pending_async_result_file(
+            &ResultWrite {
+                results_dir: tmp.path(),
+                session_id: &session("s2"),
+                run_id: &run_b,
+                written_at: 1,
+                async_dir: None,
+                tool_call_id: None,
+            },
+            &payload(),
+        )
+        .await
+        .expect("b");
 
         let dir_a = paths::pending_session_dir(tmp.path(), &session("s1"));
         let dir_b = paths::pending_session_dir(tmp.path(), &session("s2"));
         assert_ne!(dir_a, dir_b, "sessions must not share a staging directory");
         assert!(dir_a.join("runa.json").is_file());
-        assert!(!dir_a.join("runb.json").exists(), "s1 must not see s2's payload");
+        assert!(
+            !dir_a.join("runb.json").exists(),
+            "s1 must not see s2's payload"
+        );
     }
 
     #[tokio::test]
@@ -470,16 +491,19 @@ mod tests {
         // two (pi `result-files.ts:180-182`); this pins the mapping for the success arm.
         let tmp = tempfile::tempdir().expect("tempdir");
         let run = RunId::from_token("run1");
-        let state = write_async_result_file(&ResultWrite {
-            results_dir: tmp.path(),
-            session_id: &session("s1"),
-            run_id: &run,
-            written_at: 1,
-            async_dir: None,
-            tool_call_id: None,
-        }, &payload())
-            .await
-            .expect("write");
+        let state = write_async_result_file(
+            &ResultWrite {
+                results_dir: tmp.path(),
+                session_id: &session("s1"),
+                run_id: &run,
+                written_at: 1,
+                async_dir: None,
+                tool_call_id: None,
+            },
+            &payload(),
+        )
+        .await
+        .expect("write");
         assert_eq!(state, PayloadState::Owned);
     }
 }

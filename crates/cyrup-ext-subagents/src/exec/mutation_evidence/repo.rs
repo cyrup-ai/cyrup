@@ -18,7 +18,9 @@ use std::path::Path;
 use gix::bstr::ByteSlice as _;
 use sha2::{Digest as _, Sha256};
 
-use super::types::{FingerprintKind, MAX_HASH_BYTES, MAX_TRACKED_PATHS, TrackedMutationFingerprint};
+use super::types::{
+    FingerprintKind, MAX_HASH_BYTES, MAX_TRACKED_PATHS, TrackedMutationFingerprint,
+};
 
 /// Discover the repository `cwd` sits in. A non-repository `cwd` is the ordinary case, not an
 /// error — the caller records the message as `unavailable`.

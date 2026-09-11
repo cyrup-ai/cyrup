@@ -4,7 +4,6 @@
 //! `runner_main/`): every public item here is re-exported at [`crate::background`], so consumer
 //! paths are unchanged.
 
-
 /// An opaque run-id token minted at spawn time — a short, URL/filesystem-safe random token with
 /// **no pre-flight uniqueness check** against the filesystem or any registry (R-SA-072): the
 /// child run directory's existence is established later, via `mkdir` at spawn time, not by this

@@ -110,7 +110,7 @@ pub(super) fn build_params(
 }
 
 /// pi `resolveCacheRetention` (`bedrock-converse-stream.ts:640-648`): explicit wins, else
-/// `PI_CACHE_RETENTION=long` promotes, else `"short"`.
+/// `CYRUP_CACHE_RETENTION=long` promotes, else `"short"`.
 ///
 /// The ladder itself is the shared one; only the lookup differs, because bedrock reads through
 /// [`EnvSource`] rather than a bare overlay (its ambient map is a test seam).

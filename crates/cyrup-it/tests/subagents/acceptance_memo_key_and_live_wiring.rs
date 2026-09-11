@@ -837,6 +837,7 @@ fn runner_config(
     step: SingleStepSpec,
 ) -> RunnerConfig {
     RunnerConfig {
+        host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
         permission_rules: None, // SUBA-073: no policy — the pre-field behaviour

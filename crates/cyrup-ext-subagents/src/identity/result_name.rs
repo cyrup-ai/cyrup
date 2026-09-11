@@ -136,7 +136,10 @@ mod tests {
 
     #[test]
     fn parse_accepts_a_plain_json_component() {
-        assert_eq!(ResultFileName::parse("abc123.json").map(|f| f.as_str().to_string()), Some("abc123.json".to_string()));
+        assert_eq!(
+            ResultFileName::parse("abc123.json").map(|f| f.as_str().to_string()),
+            Some("abc123.json".to_string())
+        );
     }
 
     // --- the traversal cases upstream re-checks at three call sites ------------------------

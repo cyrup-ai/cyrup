@@ -150,14 +150,19 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut s = status(RunState::Complete, Some("s1"));
         s.ended_at = None; // force the `?? lastUpdate` rung (pi `:52`)
-        update_terminal_run_index(&tmp.path().join("run1"), &s).await.expect("write");
+        update_terminal_run_index(&tmp.path().join("run1"), &s)
+            .await
+            .expect("write");
 
         let markers = markers_under(tmp.path());
         assert_eq!(markers.len(), 1);
         let name = markers[0].file_name().unwrap().to_str().unwrap();
-        assert_eq!(name, "0000000000000042-run1.json", "endedAt fell back to lastUpdate");
-        let entry =
-            TerminalRunIndexEntry::parse(&std::fs::read(&markers[0]).expect("read")).expect("parses");
+        assert_eq!(
+            name, "0000000000000042-run1.json",
+            "endedAt fell back to lastUpdate"
+        );
+        let entry = TerminalRunIndexEntry::parse(&std::fs::read(&markers[0]).expect("read"))
+            .expect("parses");
         assert_eq!(entry.run_id.as_str(), "run1");
         assert_eq!(entry.session_id.as_str(), "s1");
         assert_eq!(entry.ended_at, 42);
@@ -170,12 +175,14 @@ mod tests {
         let mut s = status(RunState::Complete, Some("s1"));
         s.run_id = RunId::from_token("");
         s.ended_at = Some(7);
-        update_terminal_run_index(&tmp.path().join("dirname1"), &s).await.expect("write");
+        update_terminal_run_index(&tmp.path().join("dirname1"), &s)
+            .await
+            .expect("write");
 
         let markers = markers_under(tmp.path());
         assert_eq!(markers.len(), 1);
-        let entry =
-            TerminalRunIndexEntry::parse(&std::fs::read(&markers[0]).expect("read")).expect("parses");
+        let entry = TerminalRunIndexEntry::parse(&std::fs::read(&markers[0]).expect("read"))
+            .expect("parses");
         assert_eq!(entry.run_id.as_str(), "dirname1");
     }
 
@@ -184,7 +191,9 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut s = status(RunState::Complete, Some("s1"));
         s.ended_at = Some(99);
-        update_terminal_run_index(&tmp.path().join("run1"), &s).await.expect("write");
+        update_terminal_run_index(&tmp.path().join("run1"), &s)
+            .await
+            .expect("write");
         let markers = markers_under(tmp.path());
         let name = markers[0].file_name().unwrap().to_str().unwrap();
         assert!(name.starts_with("0000000000000099-"), "got {name}");

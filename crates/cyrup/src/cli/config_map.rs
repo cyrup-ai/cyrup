@@ -120,7 +120,7 @@ impl Cli {
         // like Pi's `getHomeDir()` (`process.env.HOME || homedir()`, package-manager.ts:217) and
         // trust-manager.ts:185. `SessionConfig::new` defaults `home` to the agent dir; override it here.
         config.home = dirs.home.clone();
-        // Thread the resolved package dir (CLI `--package-dir` > `CYRUP_PACKAGE_DIR`/`PI_PACKAGE_DIR`
+        // Thread the resolved package dir (CLI `--package-dir` > `CYRUP_PACKAGE_DIR`
         // env > `<agent_dir>/packages` default; env.rs:156-160) so the session builder reads installed
         // packages from the SAME root the `install` subcommand writes to
         // (`PackageStore::new(dirs.package_dir, Some(dirs.cwd))`, subcommands.rs:396). Pi resolves ONE

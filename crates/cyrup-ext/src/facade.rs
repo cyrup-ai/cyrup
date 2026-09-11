@@ -633,9 +633,31 @@ impl ExtensionHost {
     /// runner)` + `wrapRegisteredTools(baseToolDefinitions…)`, agent-session.ts:2506-2515). That
     /// wrapper is the only producer of `ToolResult::added_tool_names`: a tool never sets the field
     /// itself upstream, the host derives it from the active-set diff around `execute`.
+    ///
+    /// The UNRESTRICTED form — [`Self::active_tools_filtered`] with no allowlist and no denylist.
     pub fn active_tools(&self, base: &[Arc<dyn Tool>]) -> Result<Vec<Arc<dyn Tool>>, ExtError> {
+        self.active_tools_filtered(base, None, &std::collections::HashSet::new())
+    }
+
+    /// [`Self::active_tools`] under the session's tool selection, delegating to
+    /// [`crate::registry::Registry::active_tools_filtered`] — pi `_refreshToolRegistry`'s
+    /// `isAllowedTool` applied to `allCustomTools` (`agent-session.ts:2676-2686` @v0.83.0), i.e. to
+    /// the EXTENSION and SDK tools and not only to the built-ins. Regression #2835.
+    ///
+    /// `allow: None` is "no allowlist configured" (pi's `allowedToolNames === undefined`), NOT
+    /// "allow nothing": `Some(∅)` denies everything, and `--no-builtin-tools` maps to `None`.
+    ///
+    /// Keeps this method's existing two-step intact: [`Self::refresh_tools`] first, so a tool a
+    /// guest registered after `init` is materialized before it is filtered, and only then the
+    /// `active_tool_source` wrapper map over whatever survived.
+    pub fn active_tools_filtered(
+        &self,
+        base: &[Arc<dyn Tool>],
+        allow: Option<&std::collections::HashSet<String>>,
+        exclude: &std::collections::HashSet<String>,
+    ) -> Result<Vec<Arc<dyn Tool>>, ExtError> {
         self.refresh_tools()?;
-        let merged = self.registry.active_tools(base)?;
+        let merged = self.registry.active_tools_filtered(base, allow, exclude)?;
         let Some(src) = self.active_tool_source.read().ok().and_then(|g| g.clone()) else {
             return Ok(merged);
         };

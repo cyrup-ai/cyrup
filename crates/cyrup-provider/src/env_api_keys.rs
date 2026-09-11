@@ -479,7 +479,12 @@ mod tests {
     fn credential_env_inventory_covers_every_name_this_file_reads() {
         let source = include_str!("env_api_keys.rs");
         // Env-var names that appear in this file but are NOT provider credentials.
-        let exceptions = ["HOME", "CREDENTIAL_ENV_VARS", "UPPER_SNAKE", "SOMETHING_API_KEY"];
+        let exceptions = [
+            "HOME",
+            "CREDENTIAL_ENV_VARS",
+            "UPPER_SNAKE",
+            "SOMETHING_API_KEY",
+        ];
 
         let mut missing = Vec::new();
         for raw in source.split('"').skip(1).step_by(2) {

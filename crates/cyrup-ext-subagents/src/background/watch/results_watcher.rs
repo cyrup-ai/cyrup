@@ -419,7 +419,10 @@ impl ResultsWatcher {
                     agent: result.agent.clone(),
                     mtime_epoch_secs: mtime,
                 };
-                if matches!(self.check_and_mark_seen(&key).await, SeenOutcome::AlreadyNotified) {
+                if matches!(
+                    self.check_and_mark_seen(&key).await,
+                    SeenOutcome::AlreadyNotified
+                ) {
                     continue;
                 }
                 observed.push(ObservedResult { result, path });
@@ -514,10 +517,12 @@ impl ResultsWatcher {
     async fn note_absent_payload(&self, run_id: &RunId) -> MissingPayloadVerdict {
         let consecutive = {
             let mut missing = self.missing_payload.lock().await;
-            let entry = missing.entry(run_id.as_str().to_string()).or_insert(MissingEntry {
-                consecutive: 0,
-                inserted_at: Instant::now(),
-            });
+            let entry = missing
+                .entry(run_id.as_str().to_string())
+                .or_insert(MissingEntry {
+                    consecutive: 0,
+                    inserted_at: Instant::now(),
+                });
             entry.consecutive = entry.consecutive.saturating_add(1);
             entry.consecutive
         };
@@ -573,7 +578,6 @@ impl ResultsWatcher {
             })
             .collect();
     }
-
 
     /// Destroy one DELIVERED result: its payload, then its index entries.
     ///
@@ -853,7 +857,9 @@ mod tests {
         // enumeration walks this instance's own index partition rather than listing the shared
         // directory.
         let (_dir, results_dir) = temp_results_dir();
-        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir");
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir");
         let result = sample_result("run00009", RunState::Complete, true);
         publish_result(&results_dir, &result).await;
         let path = owned_path(&results_dir, "run00009");
@@ -895,7 +901,9 @@ mod tests {
         // straight into the shared directory (what a pre-change runner did) makes it
         // undiscoverable. It is bounded, self-clearing, and never delivered to the wrong instance.
         let (_dir, results_dir) = temp_results_dir();
-        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir");
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir");
         let result = sample_result("run00777", RunState::Complete, true);
         write_atomic_json(&results_dir.join("run00777.json"), &result)
             .await
@@ -906,7 +914,10 @@ mod tests {
             scan_own(&watcher).await.is_empty(),
             "an unindexed payload has no index entry, so nothing enumerates it"
         );
-        assert!(results_dir.join("run00777.json").exists(), "and nothing deletes it");
+        assert!(
+            results_dir.join("run00777.json").exists(),
+            "and nothing deletes it"
+        );
     }
 
     #[tokio::test]
@@ -914,7 +925,9 @@ mod tests {
         // pi's candidate source #2 (`result-watcher.ts:641`, `state.asyncJobs.keys()`): a run this
         // process is actively tracking is a candidate regardless of index state.
         let (_dir, results_dir) = temp_results_dir();
-        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir");
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir");
         let result = sample_result("run00778", RunState::Complete, true);
         write_atomic_json(&results_dir.join("run00778.json"), &result)
             .await
@@ -1075,11 +1088,15 @@ mod tests {
     #[tokio::test]
     async fn a_vanished_payload_is_declared_lost_with_its_recovered_output() {
         let (_dir, results_dir) = temp_results_dir();
-        tokio::fs::create_dir_all(&results_dir).await.expect("mkdir");
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir");
 
         // A completed run, with the run directory a real runner leaves behind.
         let async_dir = results_dir.parent().expect("parent").join("async/run00500");
-        tokio::fs::create_dir_all(&async_dir).await.expect("mkdir run dir");
+        tokio::fs::create_dir_all(&async_dir)
+            .await
+            .expect("mkdir run dir");
         let mut status = crate::background::RunStatus::queued(
             RunId::from_token("run00500"),
             crate::background::RunMode::Single,
@@ -1147,7 +1164,11 @@ mod tests {
         let message = super::super::message::format_missing_payload_message(report);
         assert!(message.display, "a loss always needs to be seen");
         assert!(message.trigger_turn);
-        assert!(message.content.contains("actual answer"), "{}", message.content);
+        assert!(
+            message.content.contains("actual answer"),
+            "{}",
+            message.content
+        );
         assert!(
             message.content.contains(&async_dir.display().to_string()),
             "the artifacts pointer must be present: {}",

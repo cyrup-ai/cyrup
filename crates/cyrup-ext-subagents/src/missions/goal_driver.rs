@@ -534,7 +534,10 @@ pub fn collect_goal_continuation_notices(
         let used = record.usage.map_or(0, |u| u.tokens);
         let remaining = budget_tokens.saturating_sub(used);
         let message = [
-            format!("Goal mission needs attention: {}", truncate_display(&record.title)),
+            format!(
+                "Goal mission needs attention: {}",
+                truncate_display(&record.title)
+            ),
             format!("Mission: {}", record.id),
             format!("Remaining budget: {remaining} tokens ({used}/{budget_tokens} used)"),
             format!(

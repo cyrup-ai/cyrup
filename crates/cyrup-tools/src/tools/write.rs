@@ -154,7 +154,7 @@ mod tests {
     /// PROV-011 DoD 1/2 — the tool's opt-in tracks the experimental flag and nothing else.
     ///
     /// Flag-aware by construction: with the flag unset (the default `cargo test` environment) the
-    /// declaration must be ABSENT, and under `CYRUP_EXPERIMENTAL=1` / `PI_EXPERIMENTAL=1` it must be
+    /// declaration must be ABSENT, and under `CYRUP_EXPERIMENTAL=1` it must be
     /// pi's `{type:"json_schema", strict:"prefer"}`. Running the suite either way exercises the
     /// matching branch, and the assertion also pins the tool to
     /// `cyrup_core::experimental_tool_sampling` rather than to some private copy of the value.

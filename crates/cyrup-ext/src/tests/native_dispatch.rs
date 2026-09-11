@@ -1817,3 +1817,149 @@ async fn ext034_an_excluded_seam_defers_the_drain_instead_of_re_entering() {
         .await;
     assert_eq!(seen.lock().unwrap().len(), 1, "deferred, not lost");
 }
+
+// ---------------------------------------------------------------------------
+// #2835: the allowlist/denylist form, and the unrestricted wrapper it is built from.
+// ---------------------------------------------------------------------------
+struct TwoToolsExt {
+    id: ExtensionId,
+}
+struct NamedTool {
+    name: &'static str,
+    schema: Value,
+}
+#[async_trait::async_trait]
+impl Tool for NamedTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn parameters(&self) -> &Value {
+        &self.schema
+    }
+    async fn execute(
+        &self,
+        _call_id: ToolCallId,
+        _params: Value,
+        _cancel: CancelToken,
+        _on_update: cyrup_core::ToolUpdateSink,
+    ) -> Result<ToolResult, ToolError> {
+        Ok(ToolResult {
+            content: vec![Content::text(self.name)],
+            details: None,
+            terminate: TerminateHint::Unspecified,
+            ..Default::default()
+        })
+    }
+}
+#[async_trait::async_trait]
+impl NativeExtension for TwoToolsExt {
+    fn id(&self) -> ExtensionId {
+        self.id.clone()
+    }
+    async fn init(&self, api: &mut InitApi) -> Result<(), crate::ExtError> {
+        api.register_tool(Arc::new(NamedTool {
+            name: "dynamic_tool",
+            schema: json!({"type": "object"}),
+        }));
+        api.register_tool(Arc::new(NamedTool {
+            name: "other_tool",
+            schema: json!({"type": "object"}),
+        }));
+        Ok(())
+    }
+    async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        HookOutcome::Noop
+    }
+}
+
+async fn two_tool_host() -> ExtensionHost {
+    let host = ExtensionHost::new(cfg());
+    host.load_native(Arc::new(TwoToolsExt {
+        id: "two-tools".into(),
+    }))
+    .await
+    .unwrap();
+    host
+}
+
+fn names(tools: &[Arc<dyn Tool>]) -> Vec<String> {
+    tools.iter().map(|t| t.name().to_string()).collect()
+}
+
+/// Guards the nine existing `active_tools` callers: the wrapper must stay the UNRESTRICTED form.
+/// If someone "simplifies" it into the filtered one with an empty allowlist, every one of them
+/// silently starts receiving nothing.
+#[tokio::test]
+async fn active_tools_is_still_unrestricted() {
+    let host = two_tool_host().await;
+    let mut active = names(&host.active_tools(&[]).unwrap());
+    active.sort();
+    assert_eq!(active, ["dynamic_tool", "other_tool"]);
+}
+
+/// pi `isAllowedTool` (`agent-session.ts:2676-2686`): the allowlist bounds the EXTENSION tools too.
+#[tokio::test]
+async fn an_allowlist_filters_extension_tools() {
+    let host = two_tool_host().await;
+    let allow: std::collections::HashSet<String> = ["dynamic_tool".to_string()].into();
+    let active = host
+        .active_tools_filtered(&[], Some(&allow), &std::collections::HashSet::new())
+        .unwrap();
+    assert_eq!(names(&active), ["dynamic_tool"]);
+}
+
+/// `None` is "no allowlist configured" (pi's `undefined`) and `Some(∅)` is "deny everything". The
+/// two are different states and `--no-builtin-tools` depends on the difference.
+#[tokio::test]
+async fn an_empty_allowlist_is_not_an_absent_one() {
+    let host = two_tool_host().await;
+    let empty = std::collections::HashSet::new();
+    assert!(
+        host.active_tools_filtered(&[], Some(&empty), &empty)
+            .unwrap()
+            .is_empty(),
+        "`Some(∅)` denies everything"
+    );
+    assert_eq!(
+        host.active_tools_filtered(&[], None, &empty).unwrap().len(),
+        2,
+        "`None` is no allowlist at all, not an empty one"
+    );
+}
+
+/// The denylist applies to extension tools as well, and wins over an allowlist that named the tool.
+#[tokio::test]
+async fn a_denylist_removes_an_extension_tool() {
+    let host = two_tool_host().await;
+    let exclude: std::collections::HashSet<String> = ["dynamic_tool".to_string()].into();
+    let active = host.active_tools_filtered(&[], None, &exclude).unwrap();
+    assert_eq!(names(&active), ["other_tool"]);
+
+    let allow: std::collections::HashSet<String> =
+        ["dynamic_tool".to_string(), "other_tool".to_string()].into();
+    let active = host
+        .active_tools_filtered(&[], Some(&allow), &exclude)
+        .unwrap();
+    assert_eq!(names(&active), ["other_tool"], "excludeTools wins");
+}
+
+/// The override loop over `base` is deliberately NOT filtered: `base` has already been through
+/// `select_active_tools`, and an override shares its base tool's name, so it is allowed by
+/// construction. A `read` override must therefore survive an allowlist that names `read`.
+#[tokio::test]
+async fn a_builtin_override_survives_the_filter() {
+    let host = ExtensionHost::new(cfg());
+    host.load_native(Arc::new(ReadOverrideExt {
+        id: "override".into(),
+    }))
+    .await
+    .unwrap();
+    let builtins: Vec<Arc<dyn Tool>> = vec![Arc::new(BuiltinRead {
+        schema: json!({"type": "object"}),
+    })];
+    let allow: std::collections::HashSet<String> = ["read".to_string()].into();
+    let active = host
+        .active_tools_filtered(&builtins, Some(&allow), &std::collections::HashSet::new())
+        .unwrap();
+    assert_eq!(names(&active), ["read"]);
+}

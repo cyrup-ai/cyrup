@@ -9,22 +9,35 @@ use super::super::types::{
 };
 use super::helpers::{context_str, override_scope_str, source_str};
 
-/// pi `formatAgentDetail` (`agent-management.ts:665-701`).
-pub(crate) fn format_agent_detail(a: &AgentDefinition) -> String {
+/// One agent's declared `tools:` list, flattened for display: builtin and extension-path entries
+/// bare and in declaration order, then every `mcp:` selector, exactly as pi's `formatAgentDetail`
+/// orders them. `None` when the agent declared no `tools:` key at all (an UNPINNED surface — the
+/// child keeps its own default built-in set), which is a different statement from `Some("")`.
+///
+/// Extracted so [`format_agent_detail`] and
+/// [`crate::discovery::management::handlers::handle_list`] share ONE flattener: `list` is the
+/// surface a parent reads before it writes a prompt, so the two must never disagree about what an
+/// agent's tools are.
+pub(crate) fn tool_list_str(a: &AgentDefinition) -> Option<String> {
+    let tools = a.tools.as_ref()?;
     let mut tools_out: Vec<String> = Vec::new();
-    if let Some(tools) = &a.tools {
-        for tool in tools {
-            match tool {
-                ToolRef::Builtin(n) | ToolRef::ExtensionPath(n) => tools_out.push(n.clone()),
-                ToolRef::Mcp(_) => {}
-            }
-        }
-        for tool in tools {
-            if let ToolRef::Mcp(n) = tool {
-                tools_out.push(format!("mcp:{n}"));
-            }
+    for tool in tools {
+        match tool {
+            ToolRef::Builtin(n) | ToolRef::ExtensionPath(n) => tools_out.push(n.clone()),
+            ToolRef::Mcp(_) => {}
         }
     }
+    for tool in tools {
+        if let ToolRef::Mcp(n) = tool {
+            tools_out.push(format!("mcp:{n}"));
+        }
+    }
+    Some(tools_out.join(", "))
+}
+
+/// pi `formatAgentDetail` (`agent-management.ts:665-701`).
+pub(crate) fn format_agent_detail(a: &AgentDefinition) -> String {
+    let tools_out = tool_list_str(a).unwrap_or_default();
 
     let mut lines: Vec<String> = vec![
         format!("Agent: {} ({})", a.name, source_str(a.source)),
@@ -56,7 +69,7 @@ pub(crate) fn format_agent_detail(a: &AgentDefinition) -> String {
         ));
     }
     if !tools_out.is_empty() {
-        lines.push(format!("Tools: {}", tools_out.join(", ")));
+        lines.push(format!("Tools: {tools_out}"));
     }
     if !a.skills.is_empty() {
         lines.push(format!("Skills: {}", a.skills.join(", ")));

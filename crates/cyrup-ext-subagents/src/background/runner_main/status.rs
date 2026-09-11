@@ -3,12 +3,11 @@
 //! mutation (mark/record/refresh helpers). Split out of `background/runner_main.rs`; ports
 //! pi `runs/background/subagent-runner.ts`.
 
-use crate::background::{ParallelGroupStatus, RunPaths, RunStatus, StepState, StepStatus};
 use crate::background::atomic::write_atomic_json;
+use crate::background::{ParallelGroupStatus, RunPaths, RunStatus, StepState, StepStatus};
 use crate::exec::SingleResult;
 use crate::spawn::chain_graph::{RunnerStep, StepResult};
 use std::sync::Arc;
-
 
 /// The agent name shown for one [`RunnerStep`] in a `subagent.step.*` `events.jsonl` line — the
 /// step's own agent for a single/import step, or a synthesized group label.
@@ -78,7 +77,10 @@ pub(super) fn lock_status(shared: &SharedStatus) -> std::sync::MutexGuard<'_, Ru
 
 /// Atomically write the current shared status to `status.json` (R-SA-076): clone under the lock,
 /// then write with the lock RELEASED so no `std::sync::Mutex` guard is ever held across the `.await`.
-pub(super) async fn write_shared_status(run_paths: &RunPaths, shared: &SharedStatus) -> std::io::Result<()> {
+pub(super) async fn write_shared_status(
+    run_paths: &RunPaths,
+    shared: &SharedStatus,
+) -> std::io::Result<()> {
     let snapshot = lock_status(shared).clone();
     write_atomic_json(&run_paths.status, &snapshot).await
 }
@@ -248,7 +250,12 @@ pub(super) fn promote_interrupted_results_to_stopped(results: &mut [SingleResult
 ///   cursor onward — which is the same set here, since a step before the cursor is already
 ///   terminal and `is_terminal()` skips it either way;
 /// * the message is the fixed [`control::STOP_MESSAGE`](crate::background::control::STOP_MESSAGE), not a computed one.
-pub(super) fn mark_remaining_stopped(status: &mut RunStatus, from_index: usize, total: usize, message: &str) {
+pub(super) fn mark_remaining_stopped(
+    status: &mut RunStatus,
+    from_index: usize,
+    total: usize,
+    message: &str,
+) {
     let now = crate::time::now_epoch_millis();
     for index in from_index..total {
         if let Some(step) = status.steps.get_mut(index)
@@ -463,12 +470,13 @@ mod tests {
         clippy::indexing_slicing
     )]
 
-    use super::*;
     use super::super::tests::single_step;
+    use super::*;
     use crate::background::control;
-    use crate::background::flat_index::{flat_base, flat_range, flat_total, pending_step_statuses_for};
+    use crate::background::flat_index::{
+        flat_base, flat_range, flat_total, pending_step_statuses_for,
+    };
     use crate::background::{RunId, RunMode, RunState};
-
 
     /// SUBA-093 — a `ParallelGroup`'s per-member outcomes land on the members' OWN flat status
     /// entries, not collapsed onto one entry for the whole group (pi's per-member settle,
@@ -599,7 +607,13 @@ mod tests {
             fail_fast_skipped: vec![false, false],
         };
         let aggregate = group_result.aggregate.clone();
-        record_step_outcome(&mut status, &(0..2), &group_step, &aggregate, Some(&group_result));
+        record_step_outcome(
+            &mut status,
+            &(0..2),
+            &group_step,
+            &aggregate,
+            Some(&group_result),
+        );
 
         // Per-member arm (pi `subagent-runner.ts:4165`).
         assert_eq!(status.steps[0].timeout_recovery, None);
@@ -607,7 +621,10 @@ mod tests {
         // Group-children sweep — the `parallel_groups` reader sees the same truth.
         let groups = status.parallel_groups.as_ref().expect("group recorded");
         assert_eq!(groups[0].children[0].timeout_recovery, None);
-        assert_eq!(groups[0].children[1].timeout_recovery.as_ref(), Some(&summary));
+        assert_eq!(
+            groups[0].children[1].timeout_recovery.as_ref(),
+            Some(&summary)
+        );
     }
 
     /// SUBA-093 review fix — a step that owns NO flat slot settles nothing.
@@ -849,6 +866,8 @@ mod tests {
             progress: None,
             runner: None,
             external_process: None,
+            // Test fixture: no child was planned, so there is no surface to report.
+            tool_surface: crate::exec::tool_surface::ResolvedToolSurface::default(),
         };
         let mut results = vec![
             settled(

@@ -561,7 +561,7 @@ impl EffectiveSettings {
     }
 
     /// `showHardwareCursor` — the setting takes precedence, then the
-    /// `CYRUP_HARDWARE_CURSOR`/`PI_HARDWARE_CURSOR` env (true only when exactly `"1"`), else false
+    /// `CYRUP_HARDWARE_CURSOR` env (true only when exactly `"1"`), else false
     /// (Pi settings-manager.ts:1165-1167).
     pub fn show_hardware_cursor(&self, env: &crate::env::EnvVars) -> bool {
         self.merged
@@ -570,7 +570,7 @@ impl EffectiveSettings {
     }
 
     /// `clearOnShrink` — the `terminal.clearOnShrink` setting takes precedence, then the
-    /// `CYRUP_CLEAR_ON_SHRINK`/`PI_CLEAR_ON_SHRINK` env (true only when exactly `"1"`), else false
+    /// `CYRUP_CLEAR_ON_SHRINK` env (true only when exactly `"1"`), else false
     /// (Pi `getClearOnShrink`, settings-manager.ts:1077-1083).
     pub fn clear_on_shrink(&self, env: &crate::env::EnvVars) -> bool {
         self.merged

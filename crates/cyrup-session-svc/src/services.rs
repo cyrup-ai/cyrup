@@ -134,6 +134,20 @@ pub struct AgentSessionServices {
     pub context: Arc<ContextStore>,
     /// The extension host with native built-ins loaded; both seams are wired to the agent.
     pub ext_host: Arc<ExtensionHost>,
+    /// pi `AgentSession._allowedToolNames` (`agent-session.ts:359`, bound at `:395`) — the session's
+    /// tool allowlist, resolved ONCE from `SessionConfig` by
+    /// [`crate::builder::resolve_allowed_tool_names`] and carried because BOTH tool-materialization
+    /// paths need it, exactly as upstream's `_refreshToolRegistry` reads this field on both of its
+    /// call paths (`:2612` via `refreshTools`, `:2812` on the initial build).
+    ///
+    /// `None` is "nothing pinned the surface" (pi's `undefined`), `Some(∅)` is an explicit empty
+    /// allowlist that denies everything. `--no-builtin-tools` maps to `None` — it empties the
+    /// BUILT-IN selection without forbidding extension tools (`sdk.ts:258`, and
+    /// [`crate::builder::NoTools`]'s doc).
+    pub allowed_tool_names: Option<std::collections::HashSet<String>>,
+    /// pi `AgentSession._excludedToolNames` (`agent-session.ts:360`, bound at `:396`; `sdk.ts:259`).
+    /// Applied on both paths alongside [`Self::allowed_tool_names`].
+    pub excluded_tool_names: std::collections::HashSet<String>,
     /// The shared model-registry sink bound to `ext_host` (Pi `bindCore`): guest-registered providers
     /// realized as concrete `Provider`s. The session UNIONs their catalogs into the model registry and
     /// installs the owning provider on a matching `set_model` (arch-08 §5.6). Empty until a guest

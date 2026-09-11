@@ -195,7 +195,7 @@ pub fn spawn_model_catalog_refresh_with(
     configured_providers: Vec<String>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     // Print/JSON stop here: Pi refreshes in rpc and interactive only, so a scripted run must issue
-    // no request. Offline / `--offline` / `CYRUP_OFFLINE` / `PI_OFFLINE` stops here too. So does
+    // no request. Offline / `--offline` / `CYRUP_OFFLINE` stops here too. So does
     // having no configured provider: there is nothing whose catalog we are entitled to fetch.
     if !mode_refreshes_catalogs(mode)
         || !policy.allow_model_catalog_refresh()

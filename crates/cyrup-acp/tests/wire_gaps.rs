@@ -136,7 +136,8 @@ fn session_load_on_the_live_id_rebuilds_once_and_evicts_the_outgoing_runtime() {
                 .await,
         );
         assert!(
-            index_of_response(&frames, load) < index_of_update(&frames, "available_commands_update"),
+            index_of_response(&frames, load)
+                < index_of_update(&frames, "available_commands_update"),
             "ACP-212: a load must re-advertise commands, and after its own response"
         );
     });
@@ -255,7 +256,8 @@ fn a_cancel_during_a_long_replay_is_observed_before_the_load_response() {
                 .await,
         );
         assert!(
-            index_of_response(&frames, load) < index_of_update(&frames, "available_commands_update"),
+            index_of_response(&frames, load)
+                < index_of_update(&frames, "available_commands_update"),
             "ACP-217: the command advertisement follows the response"
         );
     });

@@ -65,7 +65,7 @@ async fn a_guest_supplied_bash_backend_runs_the_command_and_streams_its_output()
                 on_data: &mut sink,
                 cancel: CancelToken::new(),
                 timeout: None,
-                env: vec![("PI_MODEL".into(), "opus".into())],
+                env: vec![("CYRUP_MODEL".into(), "opus".into())],
                 env_remove: Vec::new(),
             },
         )

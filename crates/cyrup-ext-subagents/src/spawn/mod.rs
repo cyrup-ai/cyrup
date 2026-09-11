@@ -68,10 +68,6 @@ pub const TASK_ARGV_INLINE_THRESHOLD: usize = 8000;
 /// delivery keeps the task out of argv entirely.
 pub const TASK_DELIVERY_ENV: &str = "CYRUP_SUBAGENT_TASK_DELIVERY";
 
-/// The upstream spelling of [`TASK_DELIVERY_ENV`], honoured as a read-side compatibility alias
-/// (the same convention `exec/spawn_budget.rs` and `exec/capability_ceiling.rs` document).
-pub const TASK_DELIVERY_ENV_PI_ALIAS: &str = "PI_SUBAGENT_TASK_DELIVERY";
-
 /// pi `SubagentTaskDelivery = "auto" | "file"` (`pi-args.ts:85`): the two delivery modes the env
 /// override can select. Any value other than (case-insensitive, trimmed) `file` is `Auto`, as
 /// upstream's `resolveSubagentTaskDelivery` (`:87-93`) — there is no third mode and no error path.
@@ -86,11 +82,11 @@ pub enum TaskDelivery {
 
 /// pi `resolveSubagentTaskDelivery(env)` (`pi-args.ts:87-93`): `env[...]?.trim().toLowerCase()
 /// === "file" ? "file" : "auto"`, over an injected lookup so the decision is testable without
-/// touching process env. [`TASK_DELIVERY_ENV`] wins; [`TASK_DELIVERY_ENV_PI_ALIAS`] is consulted
-/// only when the `CYRUP_` spelling is unset.
+/// touching process env. Only [`TASK_DELIVERY_ENV`] is consulted (the upstream
+/// `PI_SUBAGENT_TASK_DELIVERY` spelling is no longer honoured).
 #[must_use]
 pub fn resolve_task_delivery(get: &dyn Fn(&str) -> Option<String>) -> TaskDelivery {
-    let raw = get(TASK_DELIVERY_ENV).or_else(|| get(TASK_DELIVERY_ENV_PI_ALIAS));
+    let raw = get(TASK_DELIVERY_ENV);
     match raw {
         Some(value) if value.trim().eq_ignore_ascii_case("file") => TaskDelivery::File,
         _ => TaskDelivery::Auto,
@@ -1743,20 +1739,20 @@ mod tests {
         assert_eq!(resolve_task_delivery(&env_of(&[])), TaskDelivery::Auto);
     }
 
-    /// The `PI_` spelling is a fallback, never an override: consulted only when the `CYRUP_`
-    /// spelling is unset.
+    /// The dropped upstream `PI_SUBAGENT_TASK_DELIVERY` spelling is inert (hard rename): alone
+    /// it selects nothing, and beside the real key it never wins.
     #[test]
-    fn the_pi_alias_is_consulted_only_when_the_cyrup_spelling_is_unset() {
+    fn the_dropped_pi_spelling_is_ignored() {
         assert_eq!(
-            resolve_task_delivery(&env_of(&[(TASK_DELIVERY_ENV_PI_ALIAS, "file")])),
-            TaskDelivery::File
+            resolve_task_delivery(&env_of(&[("PI_SUBAGENT_TASK_DELIVERY", "file")])),
+            TaskDelivery::Auto
         );
         assert_eq!(
             resolve_task_delivery(&env_of(&[
-                (TASK_DELIVERY_ENV, "auto"),
-                (TASK_DELIVERY_ENV_PI_ALIAS, "file"),
+                (TASK_DELIVERY_ENV, "file"),
+                ("PI_SUBAGENT_TASK_DELIVERY", "auto"),
             ])),
-            TaskDelivery::Auto
+            TaskDelivery::File
         );
     }
 

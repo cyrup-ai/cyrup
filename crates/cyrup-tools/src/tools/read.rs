@@ -93,7 +93,7 @@ impl Tool for ReadTool {
     }
 
     /// Pi `constrainedSampling: getExperimentalToolSampling()` (`core/tools/read.ts:222`
-    /// @v0.84.2). With `CYRUP_EXPERIMENTAL=1`/`PI_EXPERIMENTAL=1` this asks a strict-capable route
+    /// @v0.84.2). With `CYRUP_EXPERIMENTAL=1` this asks a strict-capable route
     /// to constrain generation to the declared schema; `prefer` degrades silently elsewhere.
     fn constrained_sampling(&self) -> Option<&cyrup_core::ConstrainedSampling> {
         cyrup_core::experimental_tool_sampling()
@@ -798,7 +798,7 @@ mod tests {
     /// PROV-011 DoD 1/2 — the tool's opt-in tracks the experimental flag and nothing else.
     ///
     /// Flag-aware by construction: with the flag unset (the default `cargo test` environment) the
-    /// declaration must be ABSENT, and under `CYRUP_EXPERIMENTAL=1` / `PI_EXPERIMENTAL=1` it must be
+    /// declaration must be ABSENT, and under `CYRUP_EXPERIMENTAL=1` it must be
     /// pi's `{type:"json_schema", strict:"prefer"}`. Running the suite either way exercises the
     /// matching branch, and the assertion also pins the tool to
     /// `cyrup_core::experimental_tool_sampling` rather than to some private copy of the value.

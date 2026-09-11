@@ -179,6 +179,7 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
         .expect("mkdir run_dir");
 
     let config = RunnerConfig {
+        host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
         permission_rules: None, // SUBA-073: no policy — the pre-field behaviour
@@ -307,12 +308,16 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
             .expect("status.json"),
     )
     .expect("parse status.json");
-    let result_file: ResultFile = serde_json::from_slice(
-        &tokio::fs::read(&run_paths.result)
-            .await
-            .expect("ResultFile"),
-    )
-    .expect("parse ResultFile");
+    let result_path = run_paths
+        .resolve_result(
+            status.session_id.as_ref().expect("session id present"),
+            &status.run_id,
+        )
+        .await
+        .expect("terminal result file exists");
+    let result_file: ResultFile =
+        serde_json::from_slice(&tokio::fs::read(&result_path).await.expect("ResultFile"))
+            .expect("parse ResultFile");
     assert!(
         status.state.is_terminal(),
         "run must reach a terminal state: {status:?}"
@@ -397,6 +402,7 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
         .expect("mkdir run_dir");
 
     let config = RunnerConfig {
+        host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
@@ -490,6 +496,7 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
 
 fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
+        host_available_builtins: None,
         structured_output_dir: None,
         spawn_command: None,
         child_env: std::collections::HashMap::new(),
@@ -759,6 +766,7 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
     // already blocked — the same terminal state a genuinely deep chain reaches once the T0.3
     // increment has walked the inherited depth up to the ceiling across successive spawns.
     let config = RunnerConfig {
+        host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
@@ -832,12 +840,16 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
             .expect("status.json"),
     )
     .expect("parse status.json");
-    let result_file: ResultFile = serde_json::from_slice(
-        &tokio::fs::read(&run_paths.result)
-            .await
-            .expect("ResultFile"),
-    )
-    .expect("parse ResultFile");
+    let result_path = run_paths
+        .resolve_result(
+            status.session_id.as_ref().expect("session id present"),
+            &status.run_id,
+        )
+        .await
+        .expect("terminal result file exists");
+    let result_file: ResultFile =
+        serde_json::from_slice(&tokio::fs::read(&result_path).await.expect("ResultFile"))
+            .expect("parse ResultFile");
 
     assert_eq!(
         status.state,

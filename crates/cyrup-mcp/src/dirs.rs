@@ -8,9 +8,8 @@
 //! expansion) and defaults to `join(homedir(), ".pi", "agent")`. cyrup already resolves the same
 //! concept, better: `cyrup_config::ConfigDirs::agent_dir` is a `PathBuf` **field** populated by
 //! `ConfigDirs::resolve` from the CLI flag, then the shared agent-dir ladder
-//! (`cyrup_config::paths::ENV_AGENT_DIR_KEYS` — `$CYRUP_AGENT_DIR`, `$CYRUP_CODING_AGENT_DIR`,
-//! `$PI_CODING_AGENT_DIR`), then
-//! `<home>/.cyrup/agent`. So [`McpDirs`] takes that resolved path as a constructor argument —
+//! (`cyrup_config::paths::ENV_AGENT_DIR_KEYS` — `$CYRUP_AGENT_DIR`, `$CYRUP_CODING_AGENT_DIR`),
+//! then `<home>/.cyrup/agent`. So [`McpDirs`] takes that resolved path as a constructor argument —
 //! exactly the way `cyrup_ext_subagents::extension::subagent_extension_for_env` takes it — and adds
 //! only the *filenames* hanging off it.
 //!

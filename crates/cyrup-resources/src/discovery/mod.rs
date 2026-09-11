@@ -194,7 +194,7 @@ pub struct DiscoveryConfig {
     /// So `true` is pi's resource-loader behaviour and `false` is pi's startup-ui behaviour, and
     /// `false` is the default: a caller that has not thought about the network gets the pass that
     /// touches no network, and the bin turns it on for the session build unless
-    /// `--offline`/`CYRUP_OFFLINE`/`PI_OFFLINE` is set (`SessionConfig::install_missing_packages`).
+    /// `--offline`/`CYRUP_OFFLINE` is set (`SessionConfig::install_missing_packages`).
     /// npm and OCI sources are unaffected — they never reach this arm (R-09-021, CFG-009).
     pub install_missing_packages: bool,
     /// Packages DECLARED in `settings.json` (`packages: [...]`), per settings layer. Pi's ONLY

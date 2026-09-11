@@ -597,7 +597,13 @@ fn step_item(
         agent: text(step.agent.as_deref(), None),
         context: step.context,
         started_at: finite(step.started_at),
-        duration_ms: duration_of(step.duration_ms, step.started_at, step.ended_at, None, state),
+        duration_ms: duration_of(
+            step.duration_ms,
+            step.started_at,
+            step.ended_at,
+            None,
+            state,
+        ),
         current_tool: text(step.current_tool.as_deref(), None),
         current_tool_started_at: finite(step.current_tool_started_at),
         current_path: text(step.current_path.as_deref(), None),
@@ -620,7 +626,10 @@ fn step_item(
 /// pi `hostItem` (`workflow-checklist.ts:218-236`). `key: None` is pi's defaulted `host.id`.
 fn host_item(host: &HostStepNode, phase: &str, key: Option<&str>) -> WorkflowChecklistItem {
     let key = key.unwrap_or(&host.id);
-    let stale = host.freshness.as_ref().and_then(|freshness| freshness.stale);
+    let stale = host
+        .freshness
+        .as_ref()
+        .and_then(|freshness| freshness.stale);
     let source = StateSource {
         status: Some(host.state.as_str()),
         verdict: host.verdict.map(HostStepVerdict::as_str),
@@ -737,8 +746,7 @@ fn trace_sources(trace: &[WorkflowChecklistTraceEntry]) -> Vec<WorkflowChecklist
             .operation
             .as_deref()
             .is_some_and(|operation| operation != "run" && operation != "host");
-        if operation_excluded || entry.key.is_empty() || state == "delivered" || state == "missed"
-        {
+        if operation_excluded || entry.key.is_empty() || state == "delivered" || state == "missed" {
             continue;
         }
         if let Some(existing) = latest.iter_mut().find(|existing| existing.key == entry.key) {
@@ -819,11 +827,7 @@ fn ensure_phase(phases: &mut Vec<WorkflowChecklistPhase>, label: &str) {
 /// pi `add` (`workflow-checklist.ts:279-281`). The phase list is a `Vec` with linear lookup —
 /// phase order is observable (`[...phases.values()]`), so this is an insertion-ordered map, never
 /// a `BTreeMap`/`HashMap` (SCOPE_3d §0.16, restated by SCOPE_3e's DoD).
-fn add_item(
-    phases: &mut Vec<WorkflowChecklistPhase>,
-    label: &str,
-    item: WorkflowChecklistItem,
-) {
+fn add_item(phases: &mut Vec<WorkflowChecklistPhase>, label: &str, item: WorkflowChecklistItem) {
     if let Some(phase) = phases.iter_mut().find(|phase| phase.label == label) {
         phase.items.push(item);
         return;
@@ -908,8 +912,7 @@ fn merge_node_step(
         ..StateSource::default()
     };
     let node_state = checklist_state(&node_source);
-    let merged_state =
-        merge_node_status(node_state, step_state, trace, &step.status, node.status);
+    let merged_state = merge_node_status(node_state, step_state, trace, &step.status, node.status);
 
     let mut merged = step.clone();
     merged.status = merged_state.as_status_word().to_string();
@@ -1006,7 +1009,11 @@ fn phase_state_cascade(phase: &WorkflowChecklistPhase) -> WorkflowChecklistState
 /// the phase state via [`phase_state_cascade`].
 fn finalize_phase(phase: &mut WorkflowChecklistPhase) {
     let count_state = |state: WorkflowChecklistState| {
-        phase.items.iter().filter(|item| item.state == state).count()
+        phase
+            .items
+            .iter()
+            .filter(|item| item.state == state)
+            .count()
     };
     phase.total = phase.items.len();
     phase.done = count_state(WorkflowChecklistState::Complete);
@@ -1080,7 +1087,10 @@ pub fn project_workflow_checklist(input: &WorkflowChecklistInput) -> WorkflowChe
     // replaces the value but keeps the first position).
     let mut host_by_id: Vec<&HostStepNode> = Vec::new();
     for host in &input.host_steps {
-        if let Some(slot) = host_by_id.iter_mut().find(|existing| existing.id == host.id) {
+        if let Some(slot) = host_by_id
+            .iter_mut()
+            .find(|existing| existing.id == host.id)
+        {
             *slot = host;
         } else {
             host_by_id.push(host);
@@ -1099,10 +1109,7 @@ pub fn project_workflow_checklist(input: &WorkflowChecklistInput) -> WorkflowChe
         // This is behaviour-identical for every graph cyrup can currently produce (nothing
         // writes the field); SCOPE_3f restores the first arm in the same expression when it adds
         // `host_step` to the node.
-        let host = host_by_id
-            .iter()
-            .copied()
-            .find(|host| host.id == node.id);
+        let host = host_by_id.iter().copied().find(|host| host.id == node.id);
         let phase_fallback = host.map_or(node.label.as_str(), |host| host.label.as_str());
         let phase_label = key_text(
             phase_by_node
@@ -1131,9 +1138,10 @@ pub fn project_workflow_checklist(input: &WorkflowChecklistInput) -> WorkflowChe
         if !matches.is_empty() {
             for index in matches {
                 used_steps.insert(index);
-                let Some(step) = steps.get(index) else { continue };
-                let trace_entry =
-                    trace_lookup(&trace, step_key(step).unwrap_or(node.id.as_str()));
+                let Some(step) = steps.get(index) else {
+                    continue;
+                };
+                let trace_entry = trace_lookup(&trace, step_key(step).unwrap_or(node.id.as_str()));
                 let lane = workflow_preflight_lane_for_runtime_key(
                     preflight,
                     &node.id,
@@ -1230,10 +1238,7 @@ pub fn project_workflow_checklist(input: &WorkflowChecklistInput) -> WorkflowChe
         let lane = workflow_preflight_lane_for_runtime_key(
             preflight,
             &entry.key,
-            &[
-                entry.generated_lane_key.as_deref(),
-                entry.phase.as_deref(),
-            ],
+            &[entry.generated_lane_key.as_deref(), entry.phase.as_deref()],
         );
         let item = trace_item(entry, phases.len(), lane);
         let phase_label = item.phase.clone();
@@ -1257,9 +1262,8 @@ pub fn project_workflow_checklist(input: &WorkflowChecklistInput) -> WorkflowChe
         .iter()
         .flat_map(|phase| phase.items.iter())
         .collect();
-    let count_state = |state: WorkflowChecklistState| {
-        all.iter().filter(|item| item.state == state).count()
-    };
+    let count_state =
+        |state: WorkflowChecklistState| all.iter().filter(|item| item.state == state).count();
     let bottleneck = all
         .iter()
         .copied()
@@ -1377,7 +1381,9 @@ fn lowercase_output_label(error: &str) -> String {
     let mut previous: Option<char> = None;
     let mut index = 0usize;
     while index < error.len() {
-        let Some(rest) = error.get(index..) else { break };
+        let Some(rest) = error.get(index..) else {
+            break;
+        };
         if rest.starts_with(NEEDLE) && !previous.is_some_and(is_word_char) {
             output.push_str("output:");
             index += NEEDLE.len();
@@ -1615,7 +1621,9 @@ mod tests {
 
     use super::*;
     use crate::background::{WorkflowPhase, WorkflowRunMode};
-    use crate::workflows::host_step::{HostStepFreshness, HostStepKind, HostStepState, HostStepVersion};
+    use crate::workflows::host_step::{
+        HostStepFreshness, HostStepKind, HostStepState, HostStepVersion,
+    };
 
     fn step(key: &str, status: &str) -> WorkflowChecklistStep {
         WorkflowChecklistStep {
@@ -1849,10 +1857,21 @@ mod tests {
         let merged = trace_sources(&trace);
         assert_eq!(merged.len(), 1);
         let row = &merged[0];
-        assert_eq!(row.state, "completed", "reused preserved the accumulated state");
-        assert_eq!(row.agent.as_deref(), Some("coder"), "absent fields do not clear");
+        assert_eq!(
+            row.state, "completed",
+            "reused preserved the accumulated state"
+        );
+        assert_eq!(
+            row.agent.as_deref(),
+            Some("coder"),
+            "absent fields do not clear"
+        );
         assert_eq!(row.duration_ms, Some(1200.0));
-        assert_eq!(row.label.as_deref(), Some("Lane"), "reused still updates other fields");
+        assert_eq!(
+            row.label.as_deref(),
+            Some("Lane"),
+            "reused still updates other fields"
+        );
     }
 
     /// The four-way status cascade.
@@ -1918,16 +1937,34 @@ mod tests {
             Some(0.0)
         );
         assert_eq!(
-            duration_of(None, Some(100.0), Some(50.0), None, WorkflowChecklistState::Complete),
+            duration_of(
+                None,
+                Some(100.0),
+                Some(50.0),
+                None,
+                WorkflowChecklistState::Complete
+            ),
             Some(0.0),
             "end before start clamps at 0"
         );
         assert_eq!(
-            duration_of(None, Some(100.0), None, Some(400.0), WorkflowChecklistState::Running),
+            duration_of(
+                None,
+                Some(100.0),
+                None,
+                Some(400.0),
+                WorkflowChecklistState::Running
+            ),
             Some(300.0)
         );
         assert_eq!(
-            duration_of(None, None, Some(50.0), Some(400.0), WorkflowChecklistState::Complete),
+            duration_of(
+                None,
+                None,
+                Some(50.0),
+                Some(400.0),
+                WorkflowChecklistState::Complete
+            ),
             None,
             "no startedAt ⇒ no duration"
         );
@@ -1967,10 +2004,7 @@ mod tests {
                     node_ids: vec!["step-0".to_string()],
                 }],
             )),
-            steps: vec![
-                step("step-0", "running"),
-                step("orphan", "queued"),
-            ],
+            steps: vec![step("step-0", "running"), step("orphan", "queued")],
             host_steps: vec![host("ci.gate", HostStepState::Running)],
             preflight: None,
             trace: vec![WorkflowChecklistTraceEntry {
@@ -2001,13 +2035,13 @@ mod tests {
         assert_eq!(workflow.items.len(), 2);
         assert_eq!(workflow.items[0].key, "orphan");
         assert_eq!(workflow.items[1].key, "trace.only");
-        assert_eq!(
-            workflow.items[1].state,
-            WorkflowChecklistState::Complete
-        );
+        assert_eq!(workflow.items[1].state, WorkflowChecklistState::Complete);
         // Pass 3's host phase used the host label, not "Workflow".
         let host_phase = &projection.phases[3];
-        assert_eq!(host_phase.items[0].kind, Some(WorkflowChecklistItemKind::Host));
+        assert_eq!(
+            host_phase.items[0].kind,
+            Some(WorkflowChecklistItemKind::Host)
+        );
         assert_eq!(host_phase.items[0].state, WorkflowChecklistState::Running);
         // The bottleneck is the FIRST lowest-priority item: both running items tie at 2; the
         // graph node was inserted first.
@@ -2022,7 +2056,10 @@ mod tests {
         let mut done_host = host("gate", HostStepState::Done);
         done_host.verdict = Some(HostStepVerdict::Pass);
         let input = WorkflowChecklistInput {
-            graph: Some(graph(vec![node("gate", WorkflowNodeStatus::Running)], Vec::new())),
+            graph: Some(graph(
+                vec![node("gate", WorkflowNodeStatus::Running)],
+                Vec::new(),
+            )),
             host_steps: vec![done_host],
             ..WorkflowChecklistInput::default()
         };
@@ -2099,7 +2136,10 @@ mod tests {
         );
         // includeItems=true ⇒ the bottleneck's error is OFF (already on its own row) while
         // include_output stays at its true default.
-        assert_eq!(lines[5], ">   bottleneck · test · bash 1m 5s · 3 tools · out:report");
+        assert_eq!(
+            lines[5],
+            ">   bottleneck · test · bash 1m 5s · 3 tools · out:report"
+        );
 
         // includeItems=false ⇒ item rows disappear and the bottleneck error turns ON.
         let collapsed = format_workflow_checklist_text(&projection, "", false);
@@ -2109,8 +2149,10 @@ mod tests {
             "  bottleneck · test · bash 1m 5s · 3 tools · out:report · \
              error:NoOutput: kept, output: lowered"
         );
-        assert!(format_workflow_checklist_text(&WorkflowChecklistProjection::default(), "", true)
-            .is_empty());
+        assert!(
+            format_workflow_checklist_text(&WorkflowChecklistProjection::default(), "", true)
+                .is_empty()
+        );
     }
 
     /// `stateLabel` renames only running; `formatDurationText` switches at 60s; the phase
@@ -2125,7 +2167,9 @@ mod tests {
         assert_eq!(format_duration_text(125_000.0), "2m 5s");
 
         let mut phase = new_phase("Solo");
-        phase.items.push(host_item(&host("a", HostStepState::Done), "Solo", None));
+        phase
+            .items
+            .push(host_item(&host("a", HostStepState::Done), "Solo", None));
         finalize_phase(&mut phase);
         assert_eq!(
             format_workflow_checklist_phase(&phase),
@@ -2148,7 +2192,10 @@ mod tests {
         assert_eq!(lowercase_output_label("Output: x"), "output: x");
         assert_eq!(lowercase_output_label("NoOutput: x"), "NoOutput: x");
         assert_eq!(lowercase_output_label("9Output:"), "9Output:");
-        assert_eq!(lowercase_output_label("a Output: b -Output:"), "a output: b -output:");
+        assert_eq!(
+            lowercase_output_label("a Output: b -Output:"),
+            "a output: b -output:"
+        );
         assert_eq!(lowercase_output_label("é Output:"), "é output:");
     }
 

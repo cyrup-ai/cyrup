@@ -3,26 +3,35 @@
 //! absorption, and per-step dispatch. Split out of `background/runner_main.rs`; ports
 //! pi `runs/background/subagent-runner.ts`.
 
-use crate::background::{RunId, RunPaths, RunStatus};
-use crate::background::child_stop::{ChildStatusWord, child_status_event};
-use crate::background::control::ChainAppendRequest;
-use crate::background::flat_index::{flat_base, flat_range, flat_total, pending_step_statuses_for};
-use crate::error::SubagentError;
-use crate::exec::SingleResult;
-use crate::jsonl::BoundedJsonlWriter;
-use crate::spawn::chain_graph::{ChainRunContext, OutputRegistry, RunnerStep, SingleStepExecutor, StepResult, walk_chain};
-use crate::spawn::depth::DepthEnvelope;
-use crate::spawn::parallel::GlobalConcurrencyLimit;
-use std::sync::Arc;
-use crate::background::control;
-use crate::background::cascade;
 use super::config::RunnerConfig;
 use super::control_watcher::ControlFlags;
 use super::events::append_event;
 use super::executor::ExecSingleStepExecutor;
-use super::settle::{StepDisposition, cascade_to_descendants, imported_root_to_single_result, settle_step_result, skip_child_stopped_step};
-use super::status::{SharedStatus, TelemetryMsg, lock_status, mark_remaining_paused, mark_remaining_stopped, mark_remaining_timed_out, mark_step_running, promote_interrupted_results_to_stopped, record_step_outcome, refresh_workflow_graph, step_display_agent, step_elapsed_ms, timeout_message, write_shared_status};
-
+use super::settle::{
+    StepDisposition, cascade_to_descendants, imported_root_to_single_result, settle_step_result,
+    skip_child_stopped_step,
+};
+use super::status::{
+    SharedStatus, TelemetryMsg, lock_status, mark_remaining_paused, mark_remaining_stopped,
+    mark_remaining_timed_out, mark_step_running, promote_interrupted_results_to_stopped,
+    record_step_outcome, refresh_workflow_graph, step_display_agent, step_elapsed_ms,
+    timeout_message, write_shared_status,
+};
+use crate::background::cascade;
+use crate::background::child_stop::{ChildStatusWord, child_status_event};
+use crate::background::control;
+use crate::background::control::ChainAppendRequest;
+use crate::background::flat_index::{flat_base, flat_range, flat_total, pending_step_statuses_for};
+use crate::background::{RunId, RunPaths, RunStatus};
+use crate::error::SubagentError;
+use crate::exec::SingleResult;
+use crate::jsonl::BoundedJsonlWriter;
+use crate::spawn::chain_graph::{
+    ChainRunContext, OutputRegistry, RunnerStep, SingleStepExecutor, StepResult, walk_chain,
+};
+use crate::spawn::depth::DepthEnvelope;
+use crate::spawn::parallel::GlobalConcurrencyLimit;
+use std::sync::Arc;
 
 // =================================================================================================
 // run_inner — the step loop itself
@@ -371,6 +380,11 @@ fn build_chain_context(
         // SCOPE_19/A1: and the parent session's reasoning level, carried the same way and for the
         // same reason — this detached process cannot probe the parent's thinking level itself.
         inherited_session_thinking: config.inherited_session_thinking.clone(),
+        // pi `ctx.hostAvailableBuiltins` (`subagent-runner.ts:3703`): the LAUNCHING orchestrator's
+        // host observation, carried the same way and for the same reason as the two fields above —
+        // this detached process has no host-services backend, and its own tool registry is not the
+        // parent's, so re-reading here would answer a different question.
+        host_available_builtins: config.host_available_builtins.clone(),
         // SUBA-003: the model-scope policy the orchestrator authorized this run under, carried in
         // the one-shot config for the same reason as the two fields above — this process performs
         // no discovery and reads no settings.
@@ -811,7 +825,11 @@ pub(super) async fn run_import_async_root(
 /// Append a [`ChainAppendRequest`]'s steps to the in-loop `steps` list AND `status.steps`
 /// (R-SA-095's "only then extend its own in-loop step list/`status.json`'s `steps`/
 /// `chain_step_count`" — both updated together so they never observably diverge).
-pub(super) fn append_steps(steps: &mut Vec<RunnerStep>, status: &mut RunStatus, request: &ChainAppendRequest) {
+pub(super) fn append_steps(
+    steps: &mut Vec<RunnerStep>,
+    status: &mut RunStatus,
+    request: &ChainAppendRequest,
+) {
     for step in &request.steps {
         // SUBA-093: an appended step extends the FLAT list by its own width, and only at the tail,
         // so no already-published flat base is disturbed.

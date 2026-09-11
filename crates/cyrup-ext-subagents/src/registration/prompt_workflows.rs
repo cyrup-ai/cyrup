@@ -25,7 +25,7 @@
 //!    analog is [`super::resources::bundled_prompt_files`], which resolves the SAME bundled root
 //!    through `cyrup_resources::resolve_manifest`;
 //! 2. `<agentDir>/prompts` (`getAgentDir()`, `shared/utils.ts:72-77` — cyrup: `CYRUP_AGENT_DIR`/
-//!    `PI_CODING_AGENT_DIR`, else `<home>/.cyrup/agent`);
+//!    `CYRUP_CODING_AGENT_DIR`, else `<home>/.cyrup/agent`);
 //! 3. `<cwd>/.cyrup/prompts` (`getProjectConfigDir(cwd)`, `shared/utils.ts:68-70`, whose argument
 //!    at this call site is `ctx.cwd` verbatim — NOT a discovered project root).
 //!

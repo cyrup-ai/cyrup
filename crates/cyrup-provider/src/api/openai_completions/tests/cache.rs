@@ -17,15 +17,15 @@ fn prompt_cache_key_for_openai_with_session() {
 }
 
 // Gap 2: Pi `resolveCacheRetention` (openai-completions.ts:141-149) — when the caller did not
-// set retention, `PI_CACHE_RETENTION == "long"` promotes to Long; an explicit value wins.
+// set retention, `CYRUP_CACHE_RETENTION == "long"` promotes to Long; an explicit value wins.
 #[test]
-fn pi_cache_retention_env_promotes_long() {
+fn cache_retention_env_promotes_long() {
     use std::collections::BTreeMap;
     let m = openai_model();
     let mut env = BTreeMap::new();
-    env.insert("PI_CACHE_RETENTION".to_string(), "long".to_string());
+    env.insert("CYRUP_CACHE_RETENTION".to_string(), "long".to_string());
 
-    // Unset caller retention + PI_CACHE_RETENTION=long (scoped overlay) => promoted to Long,
+    // Unset caller retention + CYRUP_CACHE_RETENTION=long (scoped overlay) => promoted to Long,
     // which (on api.openai.com, supportsLongCacheRetention) emits `prompt_cache_retention`.
     let opts = StreamOptions {
         cache_retention: None,
@@ -54,6 +54,14 @@ fn pi_cache_retention_env_promotes_long() {
     let empty = BTreeMap::new();
     assert_eq!(
         resolve_cache_retention(None, Some(&empty)),
+        CacheRetention::Short
+    );
+
+    // Hard rename: the dropped `PI_CACHE_RETENTION` spelling alone promotes nothing.
+    let mut legacy = BTreeMap::new();
+    legacy.insert("PI_CACHE_RETENTION".to_string(), "long".to_string());
+    assert_eq!(
+        resolve_cache_retention(None, Some(&legacy)),
         CacheRetention::Short
     );
 }

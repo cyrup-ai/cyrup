@@ -59,10 +59,6 @@ pub const CAPABILITY_CEILING_VERSION: u32 = 1;
 /// `exec/spawn_budget.rs`'s [`crate::exec::spawn_budget::MAX_SPAWNS_PER_SESSION_ENV`] documents.
 pub const CAPABILITY_CEILING_ENV: &str = "CYRUP_SUBAGENT_CAPABILITY_CEILING_V1";
 
-/// The upstream spelling of [`CAPABILITY_CEILING_ENV`], honoured as a read-side compatibility alias
-/// so a pi user's existing environment keeps bounding cyrup children.
-pub const CAPABILITY_CEILING_ENV_PI_ALIAS: &str = "PI_SUBAGENT_CAPABILITY_CEILING_V1";
-
 /// pi's `values.length > 256` cap (`capability-ceiling.ts:76`).
 const MAX_LIST_ENTRIES: usize = 256;
 /// pi's `Buffer.byteLength(value.trim()) > 256` cap in `validateText` (`:59`).
@@ -433,9 +429,7 @@ pub fn resolve_capability_ceiling(
 pub fn resolve_current_capability_ceiling(
     session_id: Option<&str>,
 ) -> Result<Option<ResolvedCapabilityCeiling>, String> {
-    let raw = std::env::var(CAPABILITY_CEILING_ENV)
-        .or_else(|_| std::env::var(CAPABILITY_CEILING_ENV_PI_ALIAS))
-        .ok();
+    let raw = std::env::var(CAPABILITY_CEILING_ENV).ok();
     let inherited = decode_capability_ceiling(raw.as_deref())?;
     Ok(resolve_capability_ceiling(session_id, inherited))
 }

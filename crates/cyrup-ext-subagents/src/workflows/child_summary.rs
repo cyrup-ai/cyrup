@@ -173,7 +173,11 @@ pub struct WorkflowChildSummaryInput<'a> {
 /// `Vec` that stands in for it so the output preserves **insertion order** (SCOPE_3d §0.16: a
 /// `BTreeMap` would silently re-sort the inventory, a `HashMap` would randomize it, and
 /// `indexmap` is not a dependency of this crate).
-fn upsert(rows: &mut Vec<(WorkflowKey, WorkflowChildRow)>, key: WorkflowKey, row: WorkflowChildRow) {
+fn upsert(
+    rows: &mut Vec<(WorkflowKey, WorkflowChildRow)>,
+    key: WorkflowKey,
+    row: WorkflowChildRow,
+) {
     if let Some(slot) = rows.iter_mut().find(|(existing, _)| *existing == key) {
         slot.1 = row;
     } else {
@@ -612,7 +616,9 @@ pub fn parse_workflow_child_summary(
         // Rule 12 (`:163`) — an `activity` (even an empty one: presence, not non-emptiness) on a
         // child whose state is not `running`.
         if activity.is_some() && state != WorkflowChildState::Running {
-            return Err(err("workflowChildren child activity requires running state."));
+            return Err(err(
+                "workflowChildren child activity requires running state.",
+            ));
         }
         children.push(WorkflowChildRow {
             child_id,
@@ -645,10 +651,7 @@ pub fn parse_workflow_child_summary(
     // Rule 16 (`:169`) — the two required ids, blank or over 4096 bytes, parent first.
     Ok(Some(WorkflowChildSummary {
         version: SummaryVersion,
-        parent_tool_call_id: required_id(
-            parent_tool_call_id,
-            "workflowChildren.parentToolCallId",
-        )?,
+        parent_tool_call_id: required_id(parent_tool_call_id, "workflowChildren.parentToolCallId")?,
         workflow_run_id: required_id(workflow_run_id, "workflowChildren.workflowRunId")?,
         inventory_complete,
         workflow_state,
@@ -735,11 +738,21 @@ mod tests {
             ..base_input()
         })
         .expect("builds");
-        assert_eq!(summary.children.len(), 1, "the bad key is dropped, not an error");
+        assert_eq!(
+            summary.children.len(),
+            1,
+            "the bad key is dropped, not an error"
+        );
         let row = summary.children.first().expect("one row");
         assert_eq!(row.state, WorkflowChildState::Completed);
-        assert_eq!(row.run_id, None, "the completed entry carried no runId; the old one drops");
-        assert_eq!(row.agent, None, "the trace pass ignores the entry's own agent");
+        assert_eq!(
+            row.run_id, None,
+            "the completed entry carried no runId; the old one drops"
+        );
+        assert_eq!(
+            row.agent, None,
+            "the trace pass ignores the entry's own agent"
+        );
     }
 
     /// Pass 2: the `launchResolved` guard gates `agent` ONLY; `StepState::Complete` (wire
@@ -764,7 +777,10 @@ mod tests {
         assert_eq!(summary.children.len(), 2);
         let first = summary.children.first().expect("row 0");
         assert_eq!(first.state, WorkflowChildState::Pending);
-        assert_eq!(first.agent, None, "a pending step must not report its intended agent");
+        assert_eq!(
+            first.agent, None,
+            "a pending step must not report its intended agent"
+        );
         assert_eq!(
             first.session_name.as_ref().map(Bounded::as_str),
             Some("Lane A"),
@@ -772,8 +788,14 @@ mod tests {
         );
         let second = summary.children.get(1).expect("row 1");
         assert_eq!(second.state, WorkflowChildState::Completed);
-        assert_eq!(second.agent.as_ref().map(Bounded::as_str), Some("real-agent"));
-        assert_eq!(second.run_id.as_ref().map(Bounded::as_str), Some("runbtoken001"));
+        assert_eq!(
+            second.agent.as_ref().map(Bounded::as_str),
+            Some("real-agent")
+        );
+        assert_eq!(
+            second.run_id.as_ref().map(Bounded::as_str),
+            Some("runbtoken001")
+        );
     }
 
     /// Pass 3: the five-way precedence, the `Rejected` arm (the only live producer in cyrup),
@@ -821,8 +843,14 @@ mod tests {
         .expect("builds");
         let first = summary.children.first().expect("row 0");
         assert_eq!(first.state, WorkflowChildState::Rejected);
-        assert_eq!(first.agent.as_ref().map(Bounded::as_str), Some("child-agent"));
-        assert_eq!(first.run_id.as_ref().map(Bounded::as_str), Some("child-run"));
+        assert_eq!(
+            first.agent.as_ref().map(Bounded::as_str),
+            Some("child-agent")
+        );
+        assert_eq!(
+            first.run_id.as_ref().map(Bounded::as_str),
+            Some("child-run")
+        );
         assert_eq!(
             first.session_name.as_ref().map(Bounded::as_str),
             Some("Session R"),
@@ -830,7 +858,11 @@ mod tests {
         );
         assert_eq!(first.thinking.as_ref().map(Bounded::as_str), Some("high"));
         let second = summary.children.get(1).expect("row 1");
-        assert_eq!(second.state, WorkflowChildState::Stopped, "stopped outranks ok");
+        assert_eq!(
+            second.state,
+            WorkflowChildState::Stopped,
+            "stopped outranks ok"
+        );
         // pi's find takes the FIRST `typeof === "object"` element — the ARRAY — and reads nothing
         // off it: the rejected acceptance behind it is invisible, so the child settles Failed with
         // no result-side identity. The port mirrors that exactly.
@@ -870,7 +902,10 @@ mod tests {
         let row = live.children.first().expect("live row");
         assert_eq!(row.state, WorkflowChildState::Running);
         assert_eq!(row.agent.as_ref().map(Bounded::as_str), Some("live-agent"));
-        assert!(row.activity.is_some(), "the progress pass is the only activity source");
+        assert!(
+            row.activity.is_some(),
+            "the progress pass is the only activity source"
+        );
 
         // Inventory-complete on a stopped workflow: stragglers become `stopped`, and the sweep
         // runs BEFORE progress, so the settled row no longer accepts the overlay.
@@ -1077,8 +1112,8 @@ mod tests {
             ),
         ];
         for (payload, expected) in cases {
-            let error = parse_workflow_child_summary(Some(&payload))
-                .expect_err("payload must be rejected");
+            let error =
+                parse_workflow_child_summary(Some(&payload)).expect_err("payload must be rejected");
             assert_eq!(error.message(), expected);
         }
     }
@@ -1100,9 +1135,18 @@ mod tests {
             thinking: Some("low"),
             activity: &raw,
         });
-        assert_eq!(progress.agent, "", "over-bound agent collapses to the empty string");
-        assert_eq!(progress.session_name.as_ref().map(Bounded::as_str), Some("Sess"));
-        assert_eq!(progress.activity.tool_count, None, "negative counters are dropped");
+        assert_eq!(
+            progress.agent, "",
+            "over-bound agent collapses to the empty string"
+        );
+        assert_eq!(
+            progress.session_name.as_ref().map(Bounded::as_str),
+            Some("Sess")
+        );
+        assert_eq!(
+            progress.activity.tool_count, None,
+            "negative counters are dropped"
+        );
         assert_eq!(
             progress.activity.turn_count,
             Some(serde_json::Number::from(2u32))

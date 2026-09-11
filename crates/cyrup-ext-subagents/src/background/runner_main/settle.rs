@@ -3,20 +3,25 @@
 //! imported-async-root conversion. Split out of `background/runner_main.rs`; ports
 //! pi `runs/background/subagent-runner.ts`.
 
+use super::config::RunnerConfig;
+use super::events::append_event;
+use super::status::{
+    lock_status, mark_remaining_paused, mark_remaining_timed_out,
+    promote_interrupted_results_to_stopped, record_step_outcome, refresh_workflow_graph,
+    step_display_agent, step_elapsed_ms, timeout_message, write_shared_status,
+};
+use super::turn_loop::{LoopOutcome, TurnLoopIo};
 use crate::background::StepState;
-use crate::background::child_stop::{ChildStatusWord, ChildStopRecord, child_status_event, mark_child_stopped};
+use crate::background::cascade;
+use crate::background::child_stop::{
+    ChildStatusWord, ChildStopRecord, child_status_event, mark_child_stopped,
+};
+use crate::background::control;
 use crate::background::flat_index::flat_total;
 use crate::error::SubagentError;
 use crate::exec::SingleResult;
 use crate::jsonl::BoundedJsonlWriter;
 use crate::spawn::chain_graph::{ParallelGroupSpec, RunnerStep, StepResult};
-use crate::background::control;
-use crate::background::cascade;
-use super::config::RunnerConfig;
-use super::events::append_event;
-use super::status::{lock_status, mark_remaining_paused, mark_remaining_timed_out, promote_interrupted_results_to_stopped, record_step_outcome, refresh_workflow_graph, step_display_agent, step_elapsed_ms, timeout_message, write_shared_status};
-use super::turn_loop::{LoopOutcome, TurnLoopIo};
-
 
 /// What [`run_inner`](super::turn_loop::run_inner)'s loop does next once a dispatched step's outcome has been recorded.
 pub(super) enum StepDisposition {
@@ -117,7 +122,8 @@ pub(super) async fn settle_step_result(
     let mut child_stopped: Option<crate::background::child_stop::ChildStoppedSummary> = None;
     // SUBA-093 — per-MEMBER child stops settled inside a fan-out, each of which gets pi's two
     // terminal events of its own.
-    let mut group_child_stops: Vec<(usize, crate::background::child_stop::ChildStoppedSummary)> = Vec::new();
+    let mut group_child_stops: Vec<(usize, crate::background::child_stop::ChildStoppedSummary)> =
+        Vec::new();
     {
         let mut guard = lock_status(status);
         let s = &mut *guard;
@@ -233,7 +239,11 @@ pub(super) async fn settle_step_result(
                     Some(outcome) => step_result_to_single_result_with(identity, outcome),
                     None => skipped_member_result(
                         identity,
-                        collapsed.fail_fast_skipped.get(offset).copied().unwrap_or(false),
+                        collapsed
+                            .fail_fast_skipped
+                            .get(offset)
+                            .copied()
+                            .unwrap_or(false),
                     ),
                 };
                 single.child_run_id = member_child_run_ids.get(offset).cloned().flatten();
@@ -630,6 +640,12 @@ pub(super) fn step_result_to_single_result_with(
         error: result.error.clone(),
         saved_output_path: result.saved_output_path.clone(),
         tool_calls: Vec::new(),
+        // [`crate::spawn::chain_graph::StepResult`] is the chain walker's own compact projection and
+        // carries no tool surface, so a step projected back into a `SingleResult` has none either.
+        // Deliberately NOT re-resolved from the agent here: this function is pure and has neither
+        // the persona nor the run options, and a surface guessed from a name is exactly the kind of
+        // unverified claim `tool_surface` exists to replace.
+        tool_surface: crate::exec::tool_surface::ResolvedToolSurface::default(),
         output_truncated: false,
         // SUBA-N05: the step's raised control events, carried through `StepResult` rather than
         // dropped — this is the only channel by which an ASYNC run's control events reach the
@@ -704,6 +720,9 @@ pub(super) fn imported_root_to_single_result(
         error: imported.error.clone(),
         saved_output_path: None,
         tool_calls: Vec::new(),
+        // R-SA-097 chain-root attachment POLLS an already-launched async run and never spawns a
+        // child of its own, so this process planned no surface.
+        tool_surface: crate::exec::tool_surface::ResolvedToolSurface::default(),
         output_truncated: false,
         control_events: Vec::new(),
         progress: None,

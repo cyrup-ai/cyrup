@@ -63,7 +63,12 @@ pub async fn remove_result_index(
     remove_quietly(&paths::run_index_path(results_dir, run_id)).await;
     // pi `:207-213` — the tool-call accelerator, when the caller knows the id.
     if let Some(tool_call_id) = tool_call_id.filter(|id| !id.is_empty()) {
-        remove_quietly(&paths::tool_call_index_path(results_dir, tool_call_id, run_id)).await;
+        remove_quietly(&paths::tool_call_index_path(
+            results_dir,
+            tool_call_id,
+            run_id,
+        ))
+        .await;
     }
     // pi `:214-218` — the observer band is always cleared, mission-bound or not: an unconditional
     // unlink of a path that usually does not exist is cheaper and safer than deciding first.
@@ -104,8 +109,10 @@ mod tests {
         clippy::indexing_slicing
     )]
 
+    use super::super::write::{
+        ResultWrite, write_async_result_file, write_pending_async_result_file,
+    };
     use super::*;
-    use super::super::write::{ResultWrite, write_async_result_file, write_pending_async_result_file};
 
     fn session(v: &str) -> SessionId {
         SessionId::parse(v).expect("non-empty")
@@ -119,7 +126,10 @@ mod tests {
     }
 
     fn payload() -> Payload {
-        Payload { run_id: "run1".to_string(), session_id: "s1".to_string() }
+        Payload {
+            run_id: "run1".to_string(),
+            session_id: "s1".to_string(),
+        }
     }
 
     #[tokio::test]
@@ -128,16 +138,21 @@ mod tests {
         let run = RunId::from_token("run1");
         let async_dir = tmp.path().join("adir");
         tokio::fs::create_dir_all(&async_dir).await.expect("mkdir");
-        tokio::fs::write(async_dir.join("mission.json"), b"{}").await.expect("bind");
+        tokio::fs::write(async_dir.join("mission.json"), b"{}")
+            .await
+            .expect("bind");
 
-        write_async_result_file(&ResultWrite {
-            results_dir: tmp.path(),
-            session_id: &session("s1"),
-            run_id: &run,
-            written_at: 1,
-            async_dir: Some(&async_dir),
-            tool_call_id: Some("tc1"),
-        }, &payload())
+        write_async_result_file(
+            &ResultWrite {
+                results_dir: tmp.path(),
+                session_id: &session("s1"),
+                run_id: &run,
+                written_at: 1,
+                async_dir: Some(&async_dir),
+                tool_call_id: Some("tc1"),
+            },
+            &payload(),
+        )
         .await
         .expect("write");
 
@@ -149,10 +164,19 @@ mod tests {
 
         remove_result_index(tmp.path(), Some(&session("s1")), &run, Some("tc1")).await;
 
-        assert!(!paths::result_index_path(tmp.path(), &session("s1"), &run).exists(), "session");
+        assert!(
+            !paths::result_index_path(tmp.path(), &session("s1"), &run).exists(),
+            "session"
+        );
         assert!(!paths::run_index_path(tmp.path(), &run).exists(), "run");
-        assert!(!paths::tool_call_index_path(tmp.path(), "tc1", &run).exists(), "tool-call");
-        assert!(!paths::mission_observer_path(tmp.path(), &run).exists(), "observer");
+        assert!(
+            !paths::tool_call_index_path(tmp.path(), "tc1", &run).exists(),
+            "tool-call"
+        );
+        assert!(
+            !paths::mission_observer_path(tmp.path(), &run).exists(),
+            "observer"
+        );
     }
 
     #[tokio::test]
@@ -160,16 +184,19 @@ mod tests {
         // A surviving staged copy would be re-promoted and re-delivered as a new completion.
         let tmp = tempfile::tempdir().expect("tempdir");
         let run = RunId::from_token("run1");
-        write_pending_async_result_file(&ResultWrite {
-            results_dir: tmp.path(),
-            session_id: &session("s1"),
-            run_id: &run,
-            written_at: 1,
-            async_dir: None,
-            tool_call_id: None,
-        }, &payload())
-            .await
-            .expect("write");
+        write_pending_async_result_file(
+            &ResultWrite {
+                results_dir: tmp.path(),
+                session_id: &session("s1"),
+                run_id: &run,
+                written_at: 1,
+                async_dir: None,
+                tool_call_id: None,
+            },
+            &payload(),
+        )
+        .await
+        .expect("write");
         assert!(paths::result_pending_path(tmp.path(), &session("s1"), &run).is_file());
 
         remove_result_index(tmp.path(), Some(&session("s1")), &run, None).await;
@@ -180,16 +207,19 @@ mod tests {
     async fn removing_without_a_session_still_clears_the_run_and_observer_entries() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let run = RunId::from_token("run1");
-        write_async_result_file(&ResultWrite {
-            results_dir: tmp.path(),
-            session_id: &session("s1"),
-            run_id: &run,
-            written_at: 1,
-            async_dir: None,
-            tool_call_id: None,
-        }, &payload())
-            .await
-            .expect("write");
+        write_async_result_file(
+            &ResultWrite {
+                results_dir: tmp.path(),
+                session_id: &session("s1"),
+                run_id: &run,
+                written_at: 1,
+                async_dir: None,
+                tool_call_id: None,
+            },
+            &payload(),
+        )
+        .await
+        .expect("write");
 
         remove_result_index(tmp.path(), None, &run, None).await;
         assert!(!paths::run_index_path(tmp.path(), &run).exists());
@@ -201,16 +231,19 @@ mod tests {
     async fn removing_twice_is_a_no_op() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let run = RunId::from_token("run1");
-        write_async_result_file(&ResultWrite {
-            results_dir: tmp.path(),
-            session_id: &session("s1"),
-            run_id: &run,
-            written_at: 1,
-            async_dir: None,
-            tool_call_id: None,
-        }, &payload())
-            .await
-            .expect("write");
+        write_async_result_file(
+            &ResultWrite {
+                results_dir: tmp.path(),
+                session_id: &session("s1"),
+                run_id: &run,
+                written_at: 1,
+                async_dir: None,
+                tool_call_id: None,
+            },
+            &payload(),
+        )
+        .await
+        .expect("write");
         remove_result_index(tmp.path(), Some(&session("s1")), &run, None).await;
         // Must not panic or error — a crash between delivery and cleanup replays this.
         remove_result_index(tmp.path(), Some(&session("s1")), &run, None).await;
@@ -219,8 +252,13 @@ mod tests {
     #[tokio::test]
     async fn removing_from_an_empty_dir_is_a_no_op() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        remove_result_index(tmp.path(), Some(&session("s1")), &RunId::from_token("x"), Some("t"))
-            .await;
+        remove_result_index(
+            tmp.path(),
+            Some(&session("s1")),
+            &RunId::from_token("x"),
+            Some("t"),
+        )
+        .await;
         remove_mission_observer_index(tmp.path(), &RunId::from_token("x")).await;
     }
 
@@ -231,21 +269,29 @@ mod tests {
         let run = RunId::from_token("run1");
         let async_dir = tmp.path().join("adir");
         tokio::fs::create_dir_all(&async_dir).await.expect("mkdir");
-        tokio::fs::write(async_dir.join("mission.json"), b"{}").await.expect("bind");
-        write_async_result_file(&ResultWrite {
-            results_dir: tmp.path(),
-            session_id: &session("s1"),
-            run_id: &run,
-            written_at: 1,
-            async_dir: Some(&async_dir),
-            tool_call_id: None,
-        }, &payload())
+        tokio::fs::write(async_dir.join("mission.json"), b"{}")
+            .await
+            .expect("bind");
+        write_async_result_file(
+            &ResultWrite {
+                results_dir: tmp.path(),
+                session_id: &session("s1"),
+                run_id: &run,
+                written_at: 1,
+                async_dir: Some(&async_dir),
+                tool_call_id: None,
+            },
+            &payload(),
+        )
         .await
         .expect("write");
 
         remove_mission_observer_index(tmp.path(), &run).await;
 
-        assert!(!paths::mission_observer_path(tmp.path(), &run).exists(), "observer cleared");
+        assert!(
+            !paths::mission_observer_path(tmp.path(), &run).exists(),
+            "observer cleared"
+        );
         assert!(
             paths::result_owned_path(tmp.path(), &session("s1"), &run).is_file(),
             "payload must survive for its owner"

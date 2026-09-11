@@ -847,7 +847,10 @@ async fn execute_bash_routes_through_an_operations_override_instead_of_the_local
     // (TOOL-031) lives on this path and an override that never saw it would run user commands in a
     // measurably different environment from the local branch.
     let env_keys: Vec<&str> = seen[0].2.iter().map(|(k, _)| k.as_str()).collect();
-    assert!(env_keys.contains(&"PI_CODING_AGENT"), "got: {env_keys:?}");
+    assert!(
+        env_keys.contains(&"CYRUP_CODING_AGENT"),
+        "got: {env_keys:?}"
+    );
     assert!(env_keys.contains(&"AI_AGENT"), "got: {env_keys:?}");
 
     // ABSENCE — the local shell never ran this command.

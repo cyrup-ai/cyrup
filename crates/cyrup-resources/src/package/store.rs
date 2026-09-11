@@ -23,8 +23,8 @@ impl PackageStore {
     }
 
     /// The packages root dir for a scope: `global_dir` itself (which IS the package dir —
-    /// `<agent_dir>/packages` by default, or whatever `--package-dir`/`CYRUP_PACKAGE_DIR`/
-    /// `PI_PACKAGE_DIR` resolved to) or `<project>/.cyrup/packages`.
+    /// `<agent_dir>/packages` by default, or whatever `--package-dir`/`CYRUP_PACKAGE_DIR`
+    /// resolved to) or `<project>/.cyrup/packages`.
     ///
     /// **CFG-054.** The Global arm used to be `global_dir.join("packages")`. Every caller passes
     /// `dirs.package_dir`, which already ends in `packages` (`cyrup-config/src/env.rs:191-196`), so

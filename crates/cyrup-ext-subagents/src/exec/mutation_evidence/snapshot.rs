@@ -181,8 +181,15 @@ mod tests {
             email: "test@example.invalid".into(),
             time: "946684800 +0000",
         };
-        repo.commit_as(signature, signature, "HEAD", "seed", tree, Vec::<gix::ObjectId>::new())
-            .expect("commit");
+        repo.commit_as(
+            signature,
+            signature,
+            "HEAD",
+            "seed",
+            tree,
+            Vec::<gix::ObjectId>::new(),
+        )
+        .expect("commit");
 
         // Refresh the on-disk index from HEAD so the status baseline (HEAD-tree vs index vs
         // worktree) sees a clean repository — `commit_as` writes objects and refs, not the index.
@@ -216,10 +223,17 @@ mod tests {
 
         let snapshot = snapshot_tracked_mutations(dir.path());
         assert_eq!(snapshot.unavailable, None);
-        assert!(snapshot.dirty_files.is_empty(), "{:?}", snapshot.dirty_files);
+        assert!(
+            snapshot.dirty_files.is_empty(),
+            "{:?}",
+            snapshot.dirty_files
+        );
         assert!(!snapshot.truncated);
         assert_eq!(
-            snapshot.git_root.as_deref().map(|p| p.canonicalize().unwrap()),
+            snapshot
+                .git_root
+                .as_deref()
+                .map(|p| p.canonicalize().unwrap()),
             Some(dir.path().canonicalize().unwrap())
         );
 
@@ -271,7 +285,11 @@ mod tests {
 
         // Untouched by the child → fingerprint identical → NOT reported.
         let evidence = collect_tracked_mutation_evidence(&snapshot, dir.path());
-        assert!(evidence.changed_files.is_empty(), "{:?}", evidence.changed_files);
+        assert!(
+            evidence.changed_files.is_empty(),
+            "{:?}",
+            evidence.changed_files
+        );
         assert!(!evidence.attempted_mutation);
 
         // Child touches it further → fingerprint moved → reported.

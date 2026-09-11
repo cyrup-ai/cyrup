@@ -1688,6 +1688,8 @@ mod tests {
             progress: None,
             runner: None,
             external_process: None,
+            // Test fixture: no child was planned, so there is no surface to report.
+            tool_surface: crate::exec::tool_surface::ResolvedToolSurface::default(),
         };
 
         // Exactly the bytes `extension.rs:4926` / `background/runner_main.rs:2612` write.

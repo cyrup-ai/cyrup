@@ -366,6 +366,11 @@ pub async fn run_external_cli(
         error,
         saved_output_path: saved_output_path.map(|path| path.display().to_string()),
         tool_calls: Vec::new(),
+        // An external-cli agent is forbidden to declare `tools:` and never crosses cyrup's own
+        // `--tools` seam, so it has no cyrup tool surface. Default (unpinned) is exact: it is also
+        // what makes `ResolvedToolSurface::grants` answer `Unknown` for every name on this arm, so
+        // the pre-spawn claim gate is a no-op for external runners by construction.
+        tool_surface: crate::exec::tool_surface::ResolvedToolSurface::default(),
         output_truncated,
         control_events: Vec::new(),
         progress: None,

@@ -121,7 +121,10 @@ pub fn build_timeout_recovery_summary(input: TimeoutRecoveryInput<'_>) -> Timeou
         lines.push(format!("- transcript: {}", path.display())); // :180
     }
     if let Some(artifacts) = input.artifact_paths {
-        lines.push(format!("- output artifact: {}", artifacts.output_path.display())); // :181
+        lines.push(format!(
+            "- output artifact: {}",
+            artifacts.output_path.display()
+        )); // :181
         lines.push(format!(
             "- metadata artifact: {}",
             artifacts.metadata_path.display()
@@ -242,12 +245,8 @@ mod tests {
     #[test]
     fn conditional_lines_render_in_upstream_order_with_the_em_dash() {
         let dirty = evidence(&["a.rs"], false);
-        let artifacts = crate::artifacts::artifact_paths(
-            Path::new("/artifacts"),
-            "run-1",
-            "coder",
-            Some(2),
-        );
+        let artifacts =
+            crate::artifacts::artifact_paths(Path::new("/artifacts"), "run-1", "coder", Some(2));
         let mut built = input(Termination::TimedOut, &dirty, Some(true));
         built.current_tool = Some("edit");
         built.current_tool_args = Some("src/main.rs");
@@ -308,7 +307,10 @@ mod tests {
         let dirty = evidence(&refs, false);
         let summary = build_timeout_recovery_summary(input(Termination::TimedOut, &dirty, None));
         assert_eq!(summary.changed_files.len(), MAX_TIMEOUT_FILES);
-        assert!(summary.truncated, "its own slice dropped entries (pi `:187`)");
+        assert!(
+            summary.truncated,
+            "its own slice dropped entries (pi `:187`)"
+        );
         // The summary MESSAGE's marker: three ASCII dots plus a count (pi `:110`) — deliberately
         // NOT the renderer's single-U+2026 `", …"`.
         assert!(summary.message.contains(", ... (5 more)"));

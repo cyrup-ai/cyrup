@@ -55,13 +55,10 @@ pub fn has_api_key() -> bool {
     api_key().is_some()
 }
 
-/// The real cyrup agent dir (`$CYRUP_AGENT_DIR`, else `$PI_CODING_AGENT_DIR`, else
-/// `~/.cyrup/agent`) — Pi `PI_AGENT_DIR`, utilities.ts:117.
+/// The real cyrup agent dir (`$CYRUP_AGENT_DIR`, else `~/.cyrup/agent`) — Pi `PI_AGENT_DIR`,
+/// utilities.ts:117 (the legacy `PI_CODING_AGENT_DIR` spelling is no longer honoured).
 pub fn real_agent_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("CYRUP_AGENT_DIR") {
-        return PathBuf::from(dir);
-    }
-    if let Ok(dir) = std::env::var("PI_CODING_AGENT_DIR") {
         return PathBuf::from(dir);
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());

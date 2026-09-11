@@ -1,5 +1,5 @@
 //! ASSEMBLED proof that the bin's `Cli::to_session_config` threads a NON-DEFAULT package dir
-//! (`--package-dir` / `CYRUP_PACKAGE_DIR` / `PI_PACKAGE_DIR`) into `SessionConfig.package_dir`, so a
+//! (`--package-dir` / `CYRUP_PACKAGE_DIR`) into `SessionConfig.package_dir`, so a
 //! package installed into a CUSTOM package dir loads into the assembled session.
 //!
 //! This closes the documented residual of the install no-op fix (f5eee19): the session-svc/resources
@@ -14,7 +14,7 @@
 //! resource-loader.ts:222-224; the package manager roots user-scope installs at `this.agentDir`,
 //! package-manager.ts:899,1650,2002,2029), so an install into a configured dir is ALWAYS visible to
 //! the assembled session. cyrup splits the package root into its own `dirs.package_dir` knob
-//! (`ConfigDirs::resolve`, env.rs:156-160: CLI > `CYRUP_PACKAGE_DIR`/`PI_PACKAGE_DIR` > default), which
+//! (`ConfigDirs::resolve`, env.rs:156-160: CLI > `CYRUP_PACKAGE_DIR` > default), which
 //! `install` honors (`PackageStore::new(dirs.package_dir, Some(dirs.cwd))`, subcommands.rs:396); this
 //! test proves the session path now honors the SAME resolved value.
 //!
@@ -123,7 +123,7 @@ async fn custom_package_dir_install_loads_into_assembled_session() {
 
     // Resolve dirs through the EXACT path the bin uses (main.rs:157 `ConfigDirs::resolve(&overrides,
     // &env)`). `CliConfigOverrides.package_dir` is the `--package-dir` slot; `EnvVars.package_dir` is
-    // `CYRUP_PACKAGE_DIR`/`PI_PACKAGE_DIR` — both funnel into `dirs.package_dir`.
+    // `CYRUP_PACKAGE_DIR` — both funnel into `dirs.package_dir`.
     let overrides = CliConfigOverrides {
         agent_dir: Some(fx.agent_dir.clone()),
         cwd: Some(fx.cwd.clone()),

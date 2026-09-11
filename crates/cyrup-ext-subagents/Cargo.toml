@@ -20,8 +20,20 @@ workspace = true
 # opts in.
 test-fixtures = []
 
+[build-dependencies]
+# WORKFLOW_1 §7: builds the V8 startup snapshot at compile time. The extension itself (ops +
+# `extension!` + `js/prelude.js`) lives in `cyrup-workflow-runtime`, not here, because a build
+# script can never import from the crate whose build it is running — see that crate's module doc
+# and this crate's own `build.rs`.
+cyrup-workflow-runtime = { workspace = true }
+
 [dependencies]
 cyrup-core = { workspace = true }
+# WORKFLOW_1 §7: the workflowScript ops + `extension!` declaration + `js/prelude.js`, used at real
+# runtime by `workflows/scripted/engine.rs` (which bridges them to `RunShared` through
+# `WorkflowOpsBridge`) alongside this crate's own `build.rs`, which uses it to produce the startup
+# snapshot `engine.rs` loads back via `include_bytes!`.
+cyrup-workflow-runtime = { workspace = true }
 # `src/tui/fleet_overlay.rs:43` names `cyrup_ext::{InteractiveOverlay, OverlayKey,
 # OverlayKeyCode, OverlayLine, OverlayOutcome}` (and `fleet_theme.rs`, `tui/notices.rs`,
 # `background/watch.rs` follow), all re-exported only under `wasm-host`
@@ -167,6 +179,19 @@ required-features = ["test-fixtures"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# TEST-ONLY oracle for `exec/tool_surface.rs::host_builtin_tool_names_track_the_tool_registry`.
+# `HOST_BUILTIN_TOOL_NAMES` is the closed set of built-in tool names `ToolRegistry::with_builtins`
+# installs, in wire order — the vocabulary a host observation is validated against. Extension tools
+# are merged in AFTER the allowlist filter
+# (`cyrup-session-svc/src/builder.rs:1075` -> `:1499` -> `cyrup-ext/src/registry.rs:1319`), so the
+# CSV proves nothing about them. `cyrup_tools::BUILTIN_NAMES` answers a DIFFERENT question (which
+# tools the registry installs, in wire order). The two coincide today and the test fails the build
+# the day they stop — but the sets stay separately stated, and production code in this crate never
+# names `cyrup_tools`, exactly as `cyrup-permission-system/Cargo.toml:112` does for its own
+# `BUILT_IN_TOOL_NAMES`. An alias would silently widen a REFUSAL vocabulary to any name a future
+# registry adds, which is the dangerous direction. No new compile surface: `cyrup-tools` is already
+# normal-reachable through `cyrup-ext` with the same default features.
+cyrup-tools = { workspace = true }
 # CROSS-CRATE CONFORMANCE, TEST-ONLY (MCP-141/142/146/370). `exec/mcp_direct_tools.rs` is the READER
 # of `<agent_dir>/mcp-cache.json`; `cyrup-mcp` is its WRITER, and the two also have to agree on the
 # name a direct MCP tool is registered under. They share an on-disk file rather than a type — on

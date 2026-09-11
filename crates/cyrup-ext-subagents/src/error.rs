@@ -115,6 +115,24 @@ pub enum SubagentError {
     #[error("{0}")]
     CapabilityCeilingViolation(String),
 
+    /// The launch's tool contract cannot be satisfied. Three producers, all upstream throws and
+    /// all carrying pi's verbatim text:
+    ///
+    /// * the host runtime does not provide a required `read` (pi `child-tool-plan.ts:384-389`);
+    /// * the effective surface holds `subagent_supervisor` without fanout authorization (`:421-423`);
+    /// * a `reviewer`/`scout` launch's permitted, non-excluded repository-inspection tools are
+    ///   host-missing (`:531-543`, the review-LANE contract).
+    ///
+    /// Fail-CLOSED for the same reason [`Self::CapabilityCeilingViolation`] is: a review lane
+    /// without repository access cannot produce a review, and returning one anyway would report
+    /// success for work that never happened.
+    ///
+    /// Carries pi's verbatim text as the whole message. Not retryable — no
+    /// `RETRYABLE_MODEL_FAILURE_PATTERNS` needle matches it, so the fallback ladder stops on
+    /// attempt 1 rather than re-running the same impossible launch on every candidate model.
+    #[error("{0}")]
+    ToolContractUnsatisfiable(String),
+
     /// SUBA-078 — the run's effective reasoning level exceeds the configured `subagents.maxThinking`
     /// ceiling (pi `assertThinkingWithinCeiling`, `shared/thinking-ceiling.ts:42-55` @v0.57.0), or
     /// the INHERITED ceiling itself was malformed, so the run was REFUSED before any child spawned.

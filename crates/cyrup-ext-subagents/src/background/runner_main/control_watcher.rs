@@ -2,16 +2,18 @@
 //! the control-inbox watcher task, and the steer / child-stop routers it drives. Split out of
 //! `background/runner_main.rs`; ports pi `runs/background/subagent-runner.ts`.
 
-use crate::background::{RunPaths, RunState, StepState};
-use crate::background::child_identity::{async_status_child_identity, positional_child_identity};
-use crate::background::child_stop::{ChildStatusWord, ChildStopMarking, ChildStopRecord, ChildStopRegistry, child_status_event, mark_child_stop_requested};
-use crate::jsonl::BoundedJsonlWriter;
-use std::sync::Arc;
-use crate::background::control;
 use super::entry::run_id_from_paths;
 use super::events::append_event;
 use super::status::{SharedStatus, lock_status, write_shared_status};
-
+use crate::background::child_identity::{async_status_child_identity, positional_child_identity};
+use crate::background::child_stop::{
+    ChildStatusWord, ChildStopMarking, ChildStopRecord, ChildStopRegistry, child_status_event,
+    mark_child_stop_requested,
+};
+use crate::background::control;
+use crate::background::{RunPaths, RunState, StepState};
+use crate::jsonl::BoundedJsonlWriter;
+use std::sync::Arc;
 
 /// R-SA-082: control-inbox watcher, installed with the mandatory synchronous startup check
 /// performed FIRST (catches a request written in the race window before the watcher attaches),
@@ -602,8 +604,8 @@ mod tests {
         clippy::indexing_slicing
     )]
 
-    use super::*;
     use super::super::ExecSingleStepExecutor;
+    use super::*;
     use crate::background::{RunId, RunMode, RunStatus};
     use crate::spawn::depth::DepthEnvelope;
     use std::collections::BTreeMap;
@@ -786,6 +788,7 @@ mod tests {
         let executor = ExecSingleStepExecutor {
             spawn_command: None,
             child_env: std::collections::HashMap::new(),
+            host_available_builtins: None,
             // SUBA-021: unbudgeted on this path (see the field doc).
             usage_budget: None,
             turn_budget: None,
@@ -840,6 +843,7 @@ mod tests {
                 max_depth: 5,
             },
             Arc::new(BTreeMap::new()),
+            None,
             None,
             None,
             None,

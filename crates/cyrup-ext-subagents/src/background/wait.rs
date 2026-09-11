@@ -589,8 +589,8 @@ pub async fn wait_for_subagents(
             return !pending.iter().any(|run| is_initial(&run))
                 && !attention.iter().any(|run| is_initial(&run));
         }
-        let still_active_initial = pending.iter().filter(is_initial).count()
-            + attention.iter().filter(is_initial).count();
+        let still_active_initial =
+            pending.iter().filter(is_initial).count() + attention.iter().filter(is_initial).count();
         still_active_initial < initial_count
     };
 
@@ -853,7 +853,10 @@ pub async fn wait_for_subagents(
 /// events, the exit drain of the receiver's backlog, and the disk replay of a still-on-disk
 /// payload ([`resolve_results`]) — so a wait that resolved through the poll instead of the bus is
 /// no longer a value-less outcome. Empty only when there is genuinely nothing to report.
-fn format_observed_completions(initial_ids: &[String], observed: &BTreeMap<String, String>) -> String {
+fn format_observed_completions(
+    initial_ids: &[String],
+    observed: &BTreeMap<String, String>,
+) -> String {
     let blocks: Vec<&str> = initial_ids
         .iter()
         .filter_map(|id| observed.get(id).map(String::as_str))
@@ -920,7 +923,9 @@ async fn resolve_results(
     /// A non-empty per-run block — the same emptiness test [`format_observed_completions`]
     /// applies, so "has a value" and "renders a block" cannot disagree.
     fn has_value(summaries: &BTreeMap<String, String>, id: &str) -> bool {
-        summaries.get(id).is_some_and(|text| !text.trim().is_empty())
+        summaries
+            .get(id)
+            .is_some_and(|text| !text.trim().is_empty())
     }
 
     let mut answered: Vec<super::RunId> = initial_ids
@@ -937,8 +942,7 @@ async fn resolve_results(
         if has_value(observed_summaries, status.run_id.as_str()) {
             continue;
         }
-        let paths =
-            super::RunPaths::for_run(&deps.async_root, &deps.results_dir, &status.run_id);
+        let paths = super::RunPaths::for_run(&deps.async_root, &deps.results_dir, &status.run_id);
         let (block, carries_value) = terminal_block_for(status, &paths).await;
         if carries_value {
             answered.push(status.run_id.clone());
@@ -1068,8 +1072,7 @@ async fn resolve_finished(params: &WaitParams, deps: &WaitDeps) -> WaitResolutio
                 .map(|ledger| ledger.claim(&run_ids));
             let mut blocks = Vec::new();
             for run_id in run_ids {
-                let paths =
-                    super::RunPaths::for_run(&deps.async_root, &deps.results_dir, &run_id);
+                let paths = super::RunPaths::for_run(&deps.async_root, &deps.results_dir, &run_id);
                 if let Some(block) = terminal_block(&paths).await {
                     if let Some(claim) = claim.as_mut() {
                         claim.answered(&run_id);
@@ -1098,7 +1101,9 @@ const TERMINAL_REPLAY_LIMIT: usize = 10;
 /// Never deletes anything. Consumption is the watcher's sole authority — a `wait` that consumed a
 /// payload would race the delivery that is about to notify the orchestrator about it.
 async fn terminal_block(paths: &super::RunPaths) -> Option<String> {
-    let status = super::control::reconcile_before_control_op(paths).await.ok()?;
+    let status = super::control::reconcile_before_control_op(paths)
+        .await
+        .ok()?;
     if is_active(status.state) {
         return None;
     }
@@ -1168,7 +1173,34 @@ fn elapsed_ms(since: Instant) -> u64 {
 )]
 mod tests {
     use super::*;
+    use crate::background::watch::{
+        ClassifiedOutcome, CompletionBus, CompletionEvent, InlineAnswerLedger,
+    };
     use crate::background::{RunId, RunMode, RunPaths, RunStatus};
+
+    /// A completion event for `run` carrying `summary` — the input BOTH the wake arm and the exit
+    /// drain consume, and both filter it against `initial_ids`.
+    fn completion(run: &RunId, summary: &str) -> CompletionEvent {
+        CompletionEvent {
+            run_id: run.clone(),
+            outcome: ClassifiedOutcome::Completed,
+            summary: summary.to_string(),
+        }
+    }
+
+    /// A terminal [`RunStatus`] whose recorded session matches the one `watch::tests`' published
+    /// payloads carry.
+    ///
+    /// The session is REQUIRED, not decoration: [`terminal_block_for`] resolves the payload through
+    /// [`RunPaths::resolve_result`], which is session-partitioned, so a `session_id: None` status
+    /// can only ever take the records-only fallback — which is exactly why every pre-existing test
+    /// in this module still sees the "inspect status" hint.
+    fn terminal_status(run: &RunId) -> RunStatus {
+        let mut status = RunStatus::queued(run.clone(), RunMode::Single, Some(1));
+        status.state = RunState::Complete;
+        status.session_id = crate::identity::SessionId::parse_opt(Some("test-session"));
+        status
+    }
 
     struct Fixture {
         _dir: tempfile::TempDir,
@@ -2028,5 +2060,425 @@ mod tests {
         assert!(!is_active(RunState::Failed));
         // G77: a stopped run is terminal, so it is never "active" — `wait` must not block on one.
         assert!(!is_active(RunState::Stopped));
+    }
+
+    // =======================================================================================
+    // ASYNC_NOTIFY_BUG_REPORT F2 — the resolution both renders are built from
+    // =======================================================================================
+
+    /// RC2, directly. The poll routinely wins the race against the bus, and the loop consumed at
+    /// most ONE event per iteration — so an event still sitting in this wait's receiver at loop
+    /// exit was dropped on the floor and the response carried a COUNT where the child's answer
+    /// belonged. That is the defect that sent an orchestrator to `bash`/`cat` for a value it had
+    /// already been handed.
+    #[tokio::test]
+    async fn the_exit_drain_recovers_an_event_the_poll_raced_past() {
+        let fx = Fixture::new();
+        let run = RunId::from_token("run-exit-drain");
+        let bus = CompletionBus::new();
+        let mut wake = bus.subscribe();
+        // Buffered and never polled by a wake arm — exactly the state the loop exits in.
+        bus.publish(completion(&run, "worker:\nDRAINED-ANSWER"));
+
+        let mut observed = BTreeMap::new();
+        let resolved = resolve_results(
+            &fx.deps(true),
+            Some(&mut wake),
+            &[run.as_str().to_string()],
+            &mut observed,
+            &[],
+        )
+        .await;
+
+        assert!(
+            resolved.appendix.contains("DRAINED-ANSWER"),
+            "the buffered event IS this run's answer: {}",
+            resolved.appendix
+        );
+        assert_eq!(resolved.answered, vec![run.clone()]);
+        assert!(
+            resolved.unanswered.is_empty(),
+            "nothing is missing, so the hint must not render"
+        );
+    }
+
+    /// The drain applies the SAME `initial_ids` filter the wake arm does: a run started by a
+    /// concurrent turn must not inject its output into this wait's report.
+    #[tokio::test]
+    async fn the_exit_drain_ignores_a_concurrent_turns_run() {
+        let fx = Fixture::new();
+        let mine = RunId::from_token("run-mine");
+        let theirs = RunId::from_token("run-theirs");
+        let bus = CompletionBus::new();
+        let mut wake = bus.subscribe();
+        bus.publish(completion(&theirs, "worker:\nNOT-MINE"));
+
+        let mut observed = BTreeMap::new();
+        let resolved = resolve_results(
+            &fx.deps(true),
+            Some(&mut wake),
+            &[mine.as_str().to_string()],
+            &mut observed,
+            &[],
+        )
+        .await;
+
+        assert!(resolved.appendix.is_empty(), "{}", resolved.appendix);
+        assert!(resolved.answered.is_empty());
+    }
+
+    /// `or_insert_with`, never `insert`: a re-published completion cannot overwrite the first
+    /// observation, so the wake arm's summary survives the drain that runs after it.
+    #[tokio::test]
+    async fn a_republished_completion_cannot_overwrite_the_first_observation() {
+        let fx = Fixture::new();
+        let run = RunId::from_token("run-republished");
+        let bus = CompletionBus::new();
+        let mut wake = bus.subscribe();
+        bus.publish(completion(&run, "worker:\nSECOND"));
+
+        let mut observed = BTreeMap::new();
+        observed.insert(run.as_str().to_string(), "worker:\nFIRST".to_string());
+        let resolved = resolve_results(
+            &fx.deps(true),
+            Some(&mut wake),
+            &[run.as_str().to_string()],
+            &mut observed,
+            &[],
+        )
+        .await;
+
+        assert!(resolved.appendix.contains("FIRST"), "{}", resolved.appendix);
+        assert!(
+            !resolved.appendix.contains("SECOND"),
+            "{}",
+            resolved.appendix
+        );
+    }
+
+    /// RC3, directly. A wait that resolved through the POLL never saw a bus event at all — but the
+    /// run's payload is still on disk (consumption requires a DELIVERED injection, and the pump
+    /// cannot resolve before the session goes idle), so the value is recoverable.
+    ///
+    /// And it must NOT be deleted: consumption is the watcher's sole authority, and a `wait` that
+    /// consumed a payload would race the very delivery about to notify the orchestrator about it.
+    #[tokio::test]
+    async fn a_terminal_run_with_no_bus_event_is_replayed_from_its_on_disk_payload() {
+        use crate::background::watch::tests::{child_result, publish_result, result_with_children};
+
+        let fx = Fixture::new();
+        let run = RunId::from_token("run-disk-replay");
+        let result = result_with_children(
+            "run-disk-replay",
+            RunState::Complete,
+            true,
+            None,
+            vec![child_result("worker", Some("REPLAYED-ANSWER"), 0)],
+        );
+        publish_result(&fx.results_dir, &result).await;
+
+        let status = terminal_status(&run);
+        let mut observed = BTreeMap::new();
+        let resolved = resolve_results(
+            &fx.deps(true),
+            None, // no bus at all — the pure-poll shape
+            &[run.as_str().to_string()],
+            &mut observed,
+            std::slice::from_ref(&status),
+        )
+        .await;
+
+        assert!(
+            resolved.appendix.contains("REPLAYED-ANSWER"),
+            "the still-on-disk payload IS the answer: {}",
+            resolved.appendix
+        );
+        assert_eq!(resolved.answered, vec![run.clone()]);
+        assert!(resolved.unanswered.is_empty());
+
+        let payload = crate::background::result_index::owned_payload_path(
+            &fx.results_dir,
+            &crate::identity::SessionId::parse("test-session").expect("non-empty"),
+            &run,
+        );
+        assert!(
+            payload.exists(),
+            "the replay must never delete the payload it read — consumption is the watcher's"
+        );
+    }
+
+    /// The records-only fallback names steps and artifacts, NOT the child's answer. Such a run
+    /// stays `unanswered`, which is what keeps the hint honest AND what stops F3 from suppressing a
+    /// standalone notification that may still carry the value.
+    #[tokio::test]
+    async fn a_terminal_run_whose_payload_is_gone_is_reported_but_left_unanswered() {
+        let fx = Fixture::new();
+        let run = RunId::from_token("run-no-payload");
+        let status = terminal_status(&run);
+
+        let mut observed = BTreeMap::new();
+        let resolved = resolve_results(
+            &fx.deps(true),
+            None,
+            &[run.as_str().to_string()],
+            &mut observed,
+            std::slice::from_ref(&status),
+        )
+        .await;
+
+        assert!(resolved.answered.is_empty(), "a pointer is not an answer");
+        assert_eq!(resolved.unanswered, vec!["run-no-payload".to_string()]);
+        assert!(
+            resolved.appendix.contains("Artifacts:"),
+            "the fallback still reports what it knows: {}",
+            resolved.appendix
+        );
+    }
+
+    /// F2.3. The "inspect status if the notification is not visible yet" sentence is a POINTER to a
+    /// value that is elsewhere. When the response already carries the value it is simply false.
+    ///
+    /// Ordering note: the settler publishes only AFTER the wait is provably in its loop (a
+    /// `broadcast::Receiver` never sees pre-`subscribe()` values), and publishes a SECOND time after
+    /// settling so the exit drain covers the case where the poll won the race. Either path puts the
+    /// value in the response, which is precisely F2's claim.
+    #[tokio::test]
+    async fn the_inspect_status_hint_is_dropped_once_the_response_carries_the_value() {
+        let fx = Fixture::new();
+        let run = RunId::from_token("run-hint-answered");
+        fx.write_status(&run, RunState::Running, false);
+
+        let bus = CompletionBus::new();
+        let deps = WaitDeps {
+            poll_interval: Duration::from_millis(MIN_POLL_INTERVAL_MS),
+            completion_bus: Some(bus.clone()),
+            ..fx.deps(true)
+        };
+
+        let async_root = fx.async_root.clone();
+        let results_dir = fx.results_dir.clone();
+        let settle_run = run.clone();
+        let settler = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            bus.publish(completion(&settle_run, "worker:\nINLINE-ANSWER"));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Fixture::settle(&async_root, &results_dir, &settle_run);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            bus.publish(completion(&settle_run, "worker:\nINLINE-ANSWER"));
+        });
+
+        let text = tokio::time::timeout(
+            Duration::from_secs(15),
+            wait_for_subagents(&WaitParams::default(), &CancelToken::new(), &deps),
+        )
+        .await
+        .expect("the wait resolves once the run settles")
+        .expect("wait ok");
+        settler.await.expect("settler task");
+
+        assert!(
+            text.contains("INLINE-ANSWER"),
+            "the value must be in the response: {text}"
+        );
+        assert!(text.contains("Results:"), "{text}");
+        assert!(
+            !text.contains("inspect status"),
+            "the appendix IS the notification; the hint would mislead: {text}"
+        );
+    }
+
+    /// The control, and it is not decoration: with NO value recovered the hint must still render,
+    /// so the assertion above cannot pass merely because the sentence was deleted outright.
+    ///
+    /// (`Fixture::settle` writes only `legacy_result_root`, which `RunPaths::resolve_result` does
+    /// not probe, so the replay legitimately falls back to records-only here.)
+    #[tokio::test]
+    async fn the_inspect_status_hint_still_renders_when_no_value_was_recovered() {
+        let fx = Fixture::new();
+        let run = RunId::from_token("run-hint-unanswered");
+        fx.write_status(&run, RunState::Running, false);
+
+        let async_root = fx.async_root.clone();
+        let results_dir = fx.results_dir.clone();
+        let settle_run = run.clone();
+        let settler = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Fixture::settle(&async_root, &results_dir, &settle_run);
+        });
+
+        let text = tokio::time::timeout(
+            Duration::from_secs(15),
+            wait_for_subagents(&WaitParams::default(), &CancelToken::new(), &fx.deps(true)),
+        )
+        .await
+        .expect("the wait resolves")
+        .expect("wait ok");
+        settler.await.expect("settler task");
+
+        assert!(text.contains("1 of 1 run(s) finished"), "{text}");
+        assert!(
+            text.contains("inspect status"),
+            "with no value in the response the pointer is the only honest answer: {text}"
+        );
+    }
+
+    // =======================================================================================
+    // ASYNC_NOTIFY_BUG_REPORT F3.4 — the claim/answer lifecycle
+    // =======================================================================================
+
+    /// F3.4 end to end through the real wait. The response carries the run's value, so after the
+    /// wait returns the ledger holds exactly ONE redeemable suppression authority for it — which is
+    /// precisely what [`crate::background::watch::InlineAnsweredSink`] redeems to keep the duplicate
+    /// standalone notification out of the transcript. And the claim's `Drop` really ran, so no
+    /// delivery is left parked.
+    #[tokio::test]
+    async fn a_wait_that_answers_a_run_inline_leaves_one_redeemable_suppression() {
+        let fx = Fixture::new();
+        let run = RunId::from_token("run-inline-answered");
+        fx.write_status(&run, RunState::Running, false);
+
+        let bus = CompletionBus::new();
+        let ledger = InlineAnswerLedger::default();
+        let deps = WaitDeps {
+            poll_interval: Duration::from_millis(MIN_POLL_INTERVAL_MS),
+            completion_bus: Some(bus.clone()),
+            inline_answers: Some(ledger.clone()),
+            ..fx.deps(true)
+        };
+
+        let async_root = fx.async_root.clone();
+        let results_dir = fx.results_dir.clone();
+        let settle_run = run.clone();
+        let settler = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            bus.publish(completion(&settle_run, "worker:\nLEDGER-ANSWER"));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Fixture::settle(&async_root, &results_dir, &settle_run);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            bus.publish(completion(&settle_run, "worker:\nLEDGER-ANSWER"));
+        });
+
+        let text = tokio::time::timeout(
+            Duration::from_secs(15),
+            wait_for_subagents(&WaitParams::default(), &CancelToken::new(), &deps),
+        )
+        .await
+        .expect("the wait resolves")
+        .expect("wait ok");
+        settler.await.expect("settler task");
+
+        assert!(text.contains("LEDGER-ANSWER"), "{text}");
+        assert!(
+            !ledger.is_claimed(&run),
+            "the guard's Drop must run on the success path, or a delivery stays parked"
+        );
+        assert!(
+            ledger.take_answered(&run),
+            "the value this response carried is redeemable exactly once"
+        );
+        assert!(!ledger.take_answered(&run), "…and only once");
+    }
+
+    /// `Drop` runs on the ERROR paths too. A wait that timed out answered nothing, so it must leave
+    /// neither a claim (which would park a delivery for up to `INLINE_CLAIM_MAX_WAIT`) nor an
+    /// authority (which would suppress a notification whose value nobody has ever seen).
+    #[tokio::test]
+    async fn a_timed_out_wait_releases_its_claim_without_authorising_a_suppression() {
+        let fx = Fixture::new();
+        let run = RunId::from_token("run-timeout-claim");
+        fx.write_status(&run, RunState::Running, false);
+
+        let ledger = InlineAnswerLedger::default();
+        let deps = WaitDeps {
+            inline_answers: Some(ledger.clone()),
+            ..fx.deps(true)
+        };
+        let params = WaitParams {
+            timeout_ms: Some(300),
+            ..WaitParams::default()
+        };
+
+        let err = wait_for_subagents(&params, &CancelToken::new(), &deps)
+            .await
+            .expect_err("a hung run times out");
+        assert!(err.contains("timed out"), "{err}");
+        assert!(
+            !ledger.is_claimed(&run),
+            "Drop must release the claim on the timeout path"
+        );
+        assert!(
+            !ledger.take_answered(&run),
+            "a timed-out wait answered nothing"
+        );
+    }
+
+    /// The same guarantee on the ABORT path — the host cancelling the turn.
+    #[tokio::test]
+    async fn an_aborted_wait_releases_its_claim_without_authorising_a_suppression() {
+        let fx = Fixture::new();
+        let run = RunId::from_token("run-abort-claim");
+        fx.write_status(&run, RunState::Running, false);
+
+        let ledger = InlineAnswerLedger::default();
+        let deps = WaitDeps {
+            inline_answers: Some(ledger.clone()),
+            ..fx.deps(true)
+        };
+        let cancel = CancelToken::new();
+        let canceller = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                cancel.cancel();
+            })
+        };
+
+        let err = wait_for_subagents(&WaitParams::default(), &cancel, &deps)
+            .await
+            .expect_err("an aborted wait reports the abort");
+        canceller.await.expect("canceller task");
+        assert!(err.contains("aborted"), "{err}");
+        assert!(
+            !ledger.is_claimed(&run),
+            "Drop must release the claim on the abort path"
+        );
+        assert!(!ledger.take_answered(&run));
+    }
+
+    /// The documented degradation, pinned explicitly so "the ledger is optional" cannot quietly
+    /// become "the ledger is required": [`WaitDeps::for_cwd`] wires none, and a wait with none
+    /// behaves exactly as every pre-existing test in this module already asserts.
+    #[tokio::test]
+    async fn a_wait_with_no_ledger_is_unchanged() {
+        let fx = Fixture::new();
+        assert!(fx.deps(true).inline_answers.is_none());
+
+        let sandbox = tempfile::tempdir().expect("tempdir");
+        let roots = crate::paths::Roots::sandboxed(sandbox.path());
+        let production = WaitDeps::for_cwd(sandbox.path(), true, None, &roots);
+        assert!(
+            production.inline_answers.is_none(),
+            "for_cwd must keep the no-ledger degradation as the default"
+        );
+
+        let run = RunId::from_token("run-no-ledger");
+        fx.write_status(&run, RunState::Running, false);
+        let async_root = fx.async_root.clone();
+        let results_dir = fx.results_dir.clone();
+        let settle_run = run.clone();
+        let settler = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Fixture::settle(&async_root, &results_dir, &settle_run);
+        });
+
+        let text = tokio::time::timeout(
+            Duration::from_secs(15),
+            wait_for_subagents(&WaitParams::default(), &CancelToken::new(), &fx.deps(true)),
+        )
+        .await
+        .expect("the wait resolves")
+        .expect("wait ok");
+        settler.await.expect("settler task");
+        assert!(text.contains("1 of 1 run(s) finished"), "{text}");
     }
 }

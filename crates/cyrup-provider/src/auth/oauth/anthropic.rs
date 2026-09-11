@@ -382,7 +382,7 @@ impl CallbackHandler for AnthropicCallbackHandler {
 pub struct AnthropicOAuth {
     authorize_url: String,
     token_url: String,
-    /// `None` resolves `CYRUP_OAUTH_CALLBACK_HOST`/`PI_OAUTH_CALLBACK_HOST` at login time, which
+    /// `None` resolves `CYRUP_OAUTH_CALLBACK_HOST` at login time, which
     /// is what upstream's module-level `CALLBACK_HOST` const does (`anthropic.ts:32`).
     callback_host: Option<String>,
     callback_port: u16,

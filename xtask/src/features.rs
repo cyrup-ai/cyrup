@@ -293,9 +293,7 @@ pub fn run_matrix(flags: &[String], root: PathBuf) -> Result<(), String> {
         // its §4 R5 layer-3 guards red on machines whose shells export real keys — the same
         // guarantee `cargo xtask it` gives, kept in one place.
         crate::apply_hermetic_env(&mut cmd);
-        let status = cmd
-            .status()
-            .map_err(|e| format!("cannot run cargo: {e}"))?;
+        let status = cmd.status().map_err(|e| format!("cannot run cargo: {e}"))?;
         if !status.success() {
             eprintln!("FAIL  {}\n      {}", combo.label(), combo.why);
             failed.push(combo.label());

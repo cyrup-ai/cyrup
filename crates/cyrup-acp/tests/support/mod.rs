@@ -323,13 +323,7 @@ pub fn index_of_update(frames: &[Value], kind: &str) -> usize {
     frames
         .iter()
         .position(|v| v["params"]["update"]["sessionUpdate"].as_str() == Some(kind))
-        .unwrap_or_else(|| {
-            panic!(
-                "no {kind} in {} frames:\n{}",
-                frames.len(),
-                dump(frames)
-            )
-        })
+        .unwrap_or_else(|| panic!("no {kind} in {} frames:\n{}", frames.len(), dump(frames)))
 }
 
 /// A readable frame dump for an assertion message: one line per frame, in wire order.
@@ -340,10 +334,9 @@ pub fn dump(frames: &[Value]) -> String {
         .map(|(i, f)| {
             let kind = f["params"]["update"]["sessionUpdate"].as_str().map_or_else(
                 || {
-                    f.get("method").and_then(Value::as_str).map_or_else(
-                        || format!("<response {}>", f["id"]),
-                        ToString::to_string,
-                    )
+                    f.get("method")
+                        .and_then(Value::as_str)
+                        .map_or_else(|| format!("<response {}>", f["id"]), ToString::to_string)
                 },
                 ToString::to_string,
             );

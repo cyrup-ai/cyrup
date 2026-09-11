@@ -304,7 +304,9 @@ mod tests {
              orchestrator's own run_artifact_roots derivation (C7)"
         );
         assert!(
-            !paths.results_dir.starts_with("/home/me/.cyrup/subagents/async"),
+            !paths
+                .results_dir
+                .starts_with("/home/me/.cyrup/subagents/async"),
             "the results dir must never be nested under the async tree"
         );
     }

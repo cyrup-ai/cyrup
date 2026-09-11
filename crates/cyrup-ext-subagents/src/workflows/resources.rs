@@ -286,9 +286,8 @@ impl WorkflowResourceRegistry {
             ));
         };
         // Builtins first, then the caller session's registrations (`:191`-adjacent lookup order).
-        let resource: Option<Arc<WorkflowResourceDefinition>> = find_builtin(&name)
-            .map(Arc::new)
-            .or_else(|| {
+        let resource: Option<Arc<WorkflowResourceDefinition>> =
+            find_builtin(&name).map(Arc::new).or_else(|| {
                 session_id.and_then(|session_id| {
                     self.inner
                         .lock()
@@ -450,9 +449,7 @@ fn resolve_run_ci(args: &Map<String, Value>) -> Result<WorkflowResourceExpansion
     }
     let command = match args.get("command") {
         None => "npm test",
-        Some(Value::String(command))
-            if command == "npm test" || command == "npm run typecheck" =>
-        {
+        Some(Value::String(command)) if command == "npm test" || command == "npm run typecheck" => {
             command
         }
         Some(_) => {
@@ -600,8 +597,14 @@ mod tests {
         assert_eq!(resolved.provenance.id.len(), 36, "hyphenated UUID (§0.22)");
         assert_eq!(resolved.provenance.id.matches('-').count(), 4);
         assert_eq!(resolved.provenance, *resolved.permit.provenance());
-        let consumption = resolved.permit.consume(&resolved.script).expect("digest matches");
-        assert_eq!(consumption.authority.host, None, "review grants no host commands");
+        let consumption = resolved
+            .permit
+            .consume(&resolved.script)
+            .expect("digest matches");
+        assert_eq!(
+            consumption.authority.host, None,
+            "review grants no host commands"
+        );
     }
 
     /// The `run-ci` builtin: defaults, the exact upstream script rendering (key order and all),
@@ -616,7 +619,12 @@ mod tests {
         );
         resolved.permit.consume(&resolved.script).expect("consumes");
         assert_eq!(resolved.permit.authorize_host("ci", "npm test"), Ok(()));
-        assert!(resolved.permit.authorize_host("ci", "npm run typecheck").is_err());
+        assert!(
+            resolved
+                .permit
+                .authorize_host("ci", "npm run typecheck")
+                .is_err()
+        );
 
         // Explicit args, including a JS-integer-shaped float timeout.
         let explicit = expect_ok(registry.resolve(
@@ -624,7 +632,11 @@ mod tests {
             Some(&json!({ "command": "npm run typecheck", "timeoutMs": 5_000.0 })),
             None,
         ));
-        assert!(explicit.script.contains("\"command\":\"npm run typecheck\""));
+        assert!(
+            explicit
+                .script
+                .contains("\"command\":\"npm run typecheck\"")
+        );
         assert!(explicit.script.contains("\"timeoutMs\":5000,"));
     }
 
@@ -719,11 +731,12 @@ mod tests {
         let registry = WorkflowResourceRegistry::new();
         let session_a = session("session-a");
         let session_b = session("session-b");
-        let definition = |version: u32, resolve: WorkflowResourceResolve| WorkflowResourceDefinition {
-            name: WorkflowKey::parse("custom").expect("valid"),
-            version,
-            resolve,
-        };
+        let definition =
+            |version: u32, resolve: WorkflowResourceResolve| WorkflowResourceDefinition {
+                name: WorkflowKey::parse("custom").expect("valid"),
+                version,
+                resolve,
+            };
         let ok_resolve: WorkflowResourceResolve = Arc::new(|_| {
             Ok(WorkflowResourceExpansion {
                 script: "return 1;".to_string(),
@@ -732,16 +745,21 @@ mod tests {
         });
         assert_eq!(
             registry
-                .register(&session_a, WorkflowResourceDefinition {
-                    name: WorkflowKey::parse("review").expect("valid"),
-                    version: 1,
-                    resolve: Arc::clone(&ok_resolve),
-                })
+                .register(
+                    &session_a,
+                    WorkflowResourceDefinition {
+                        name: WorkflowKey::parse("review").expect("valid"),
+                        version: 1,
+                        resolve: Arc::clone(&ok_resolve),
+                    }
+                )
                 .err(),
             Some("Workflow resource 'review' is a protected builtin.".to_string())
         );
         assert_eq!(
-            registry.register(&session_a, definition(0, Arc::clone(&ok_resolve))).err(),
+            registry
+                .register(&session_a, definition(0, Arc::clone(&ok_resolve)))
+                .err(),
             Some("Workflow definition version must be a positive safe integer.".to_string())
         );
         assert_eq!(
@@ -778,48 +796,67 @@ mod tests {
         // Third-party resolver errors: blank is the resolver's OWN bug (upstream's throw), long
         // ones truncate on a char boundary.
         let blank: WorkflowResourceResolve = Arc::new(|_| Err("   ".to_string()));
-        let long: WorkflowResourceResolve =
-            Arc::new(|_| Err(format!("{}é", "x".repeat(4095))));
-        drop(registry.register(&session_b, WorkflowResourceDefinition {
-            name: WorkflowKey::parse("blank").expect("valid"),
-            version: 1,
-            resolve: blank,
-        }).expect("registers"));
+        let long: WorkflowResourceResolve = Arc::new(|_| Err(format!("{}é", "x".repeat(4095))));
+        drop(
+            registry
+                .register(
+                    &session_b,
+                    WorkflowResourceDefinition {
+                        name: WorkflowKey::parse("blank").expect("valid"),
+                        version: 1,
+                        resolve: blank,
+                    },
+                )
+                .expect("registers"),
+        );
         // The handle above was dropped, disposing it — register again under a kept handle.
         let _blank_reg = registry
-            .register(&session_b, WorkflowResourceDefinition {
-                name: WorkflowKey::parse("blank").expect("valid"),
-                version: 1,
-                resolve: Arc::new(|_| Err("   ".to_string())),
-            })
+            .register(
+                &session_b,
+                WorkflowResourceDefinition {
+                    name: WorkflowKey::parse("blank").expect("valid"),
+                    version: 1,
+                    resolve: Arc::new(|_| Err("   ".to_string())),
+                },
+            )
             .expect("registers");
         let _long_reg = registry
-            .register(&session_b, WorkflowResourceDefinition {
-                name: WorkflowKey::parse("long").expect("valid"),
-                version: 1,
-                resolve: long,
-            })
+            .register(
+                &session_b,
+                WorkflowResourceDefinition {
+                    name: WorkflowKey::parse("long").expect("valid"),
+                    version: 1,
+                    resolve: long,
+                },
+            )
             .expect("registers");
         assert_eq!(
             expect_err(registry.resolve(&json!("blank"), None, Some(&session_b))),
             "Workflow resource returned an invalid error."
         );
         let truncated = expect_err(registry.resolve(&json!("long"), None, Some(&session_b)));
-        assert_eq!(truncated.len(), 4095, "the 2-byte 'é' straddling 4096 is dropped whole");
+        assert_eq!(
+            truncated.len(),
+            4095,
+            "the 2-byte 'é' straddling 4096 is dropped whole"
+        );
         assert!(truncated.chars().all(|c| c == 'x'));
 
         // A blank script is the resolver's own bug too.
         let _blank_script = registry
-            .register(&session_b, WorkflowResourceDefinition {
-                name: WorkflowKey::parse("empty-script").expect("valid"),
-                version: 1,
-                resolve: Arc::new(|_| {
-                    Ok(WorkflowResourceExpansion {
-                        script: "  ".to_string(),
-                        host_commands: None,
-                    })
-                }),
-            })
+            .register(
+                &session_b,
+                WorkflowResourceDefinition {
+                    name: WorkflowKey::parse("empty-script").expect("valid"),
+                    version: 1,
+                    resolve: Arc::new(|_| {
+                        Ok(WorkflowResourceExpansion {
+                            script: "  ".to_string(),
+                            host_commands: None,
+                        })
+                    }),
+                },
+            )
             .expect("registers");
         assert_eq!(
             expect_err(registry.resolve(&json!("empty-script"), None, Some(&session_b))),

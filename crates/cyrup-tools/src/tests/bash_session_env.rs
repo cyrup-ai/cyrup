@@ -229,13 +229,13 @@ fn the_guideline_uses_pi_v0_84_1_softened_phrasing() {
 /// TOOL-031 — the agent-identity markers reach the child.
 ///
 /// pi sets them on `process.env` in `cli.ts` before `main()` — `PI_CODING_AGENT = "true"`
-/// (v0.83.0 `cli.ts:13`, i.e. present at the ported tag) and `AI_AGENT = "pi"` (v0.84.1
-/// `cli.ts:14`, mirrored in `rpc-entry.ts:7-8`) — so every `bash` child inherits both through
-/// `getShellEnv()`'s `{...process.env}` (`utils/shell.ts:130-133`, consumed at `bash.ts:100`).
+/// (v0.83.0 `cli.ts:13`, i.e. present at the ported tag; cyrup's hard rename spells it
+/// `CYRUP_CODING_AGENT`) and `AI_AGENT = "pi"` (v0.84.1 `cli.ts:14`, mirrored in
+/// `rpc-entry.ts:7-8`) — so every `bash` child inherits both through `getShellEnv()`'s
+/// `{...process.env}` (`utils/shell.ts:130-133`, consumed at `bash.ts:100`).
 /// cyrup's bin declines the process-global `set_var`, so the tool pushes them per child.
 ///
-/// RED before the fix (both rendered empty — `grep -rn 'PI_CODING_AGENT\|AI_AGENT' crates/`
-/// returned only `cyrup-config/src/env.rs`'s unrelated `*_DIR` fallbacks); GREEN after.
+/// RED before the fix (both rendered empty); GREEN after.
 #[tokio::test]
 async fn bash_child_sees_the_agent_identity_markers() {
     let dir = tempfile::tempdir().unwrap();
@@ -244,7 +244,7 @@ async fn bash_child_sees_the_agent_identity_markers() {
         .execute(
             cid(),
             serde_json::json!({
-                "command": r#"printf '[%s][%s]\n' "${PI_CODING_AGENT-}" "${AI_AGENT-}""#
+                "command": r#"printf '[%s][%s]\n' "${CYRUP_CODING_AGENT-}" "${AI_AGENT-}""#
             }),
             CancelToken::new(),
             noop_sink(),
@@ -277,7 +277,7 @@ async fn identity_markers_survive_expose_session_environment_off() {
         .execute(
             cid(),
             serde_json::json!({
-                "command": r#"printf '[%s][%s][%s]\n' "${PI_CODING_AGENT-}" "${AI_AGENT-}" "${CYRUP_SESSION_ID-}""#
+                "command": r#"printf '[%s][%s][%s]\n' "${CYRUP_CODING_AGENT-}" "${AI_AGENT-}" "${CYRUP_SESSION_ID-}""#
             }),
             CancelToken::new(),
             noop_sink(),
@@ -306,8 +306,9 @@ async fn identity_markers_survive_expose_session_environment_off() {
 /// but the assertion is deliberately scoped to the `[CYRUP-DELTA` marker itself, because
 /// `CYRUP-DELTA` is the grep this project's parity sweeps run.)
 ///
-/// Presence before absence: `PI_CODING_AGENT`, which IS at the ported tag, must still be pushed
-/// beside it — this test must not be satisfiable by deleting the forward-ported marker.
+/// Presence before absence: the agency marker (pi `PI_CODING_AGENT`, renamed
+/// `CYRUP_CODING_AGENT`), which IS at the ported tag, must still be pushed beside it — this test
+/// must not be satisfiable by deleting the forward-ported marker.
 ///
 /// Mirrors `cyrup-session-svc`'s `the_forward_ported_ai_agent_marker_names_its_key_and_its_tag`,
 /// which pins the immediate-bash seam's copy of the same annotation.
@@ -316,8 +317,8 @@ fn cfg069_the_bash_tool_delta_names_the_forward_ported_key_and_its_tag() {
     let src = include_str!("../tools/bash.rs");
 
     assert!(
-        src.contains(r#"env.push(("PI_CODING_AGENT".to_string(), "true".to_string()));"#),
-        "the at-tag marker `PI_CODING_AGENT` (cli.ts:13 @v0.83.0) must still be pushed"
+        src.contains(r#"env.push(("CYRUP_CODING_AGENT".to_string(), "true".to_string()));"#),
+        "the agency marker (pi cli.ts:13 @v0.83.0, hard-renamed) must still be pushed"
     );
 
     let push = r#"env.push(("AI_AGENT".to_string(), "cyrup".to_string()));"#;

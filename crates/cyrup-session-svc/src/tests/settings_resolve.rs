@@ -398,7 +398,7 @@ async fn missing_settings_declared_package_is_reported_not_fatal() {
 /// (resource-loader.ts:403,549 @v0.83.0), so a declared git package with no working tree is cloned
 /// unless `isOfflineModeEnabled()` (package-manager.ts:1260-1271). cyrup carries that decision on
 /// the config because `cyrup-resources` reads no environment; the bin sets it from
-/// `--offline`/`CYRUP_OFFLINE`/`PI_OFFLINE`.
+/// `--offline`/`CYRUP_OFFLINE`.
 ///
 /// The two directions are asserted TOGETHER, and that is the point: a threading line that was
 /// dropped, or a field that was landed and never read, produces the SAME message in both runs.

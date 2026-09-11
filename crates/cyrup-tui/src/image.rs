@@ -19,15 +19,14 @@
 //! # Capability environment overrides
 //!
 //! The env sniff can be overridden per capability (Pi `detectCapabilities`,
-//! `tui/src/terminal-image.ts:139-162`). Each capability reads `CYRUP_*` first and falls back to
-//! `PI_*` only when the `CYRUP_*` key is unset, matching [`crate::experimental_features_enabled`]'s
-//! precedence (`status.rs`).
+//! `tui/src/terminal-image.ts:139-162`). Each capability reads its `CYRUP_*` key (the legacy
+//! `PI_*` spellings are no longer honoured).
 //!
 //! | Variable | Accepted values | Effect |
 //! |---|---|---|
-//! | `CYRUP_IMAGE_PROTOCOL` / `PI_IMAGE_PROTOCOL` | `kitty`, `iterm2`, `none`, `0` (case-insensitive) | Forces the inline-image protocol; `none`/`0` force the half-block fallback |
-//! | `CYRUP_TRUE_COLOR` / `PI_TRUE_COLOR` | `1`, `0` | Forces 24-bit color on/off |
-//! | `CYRUP_HYPERLINKS` / `PI_HYPERLINKS` | `1`, `0` | Forces OSC-8 hyperlink emission on/off |
+//! | `CYRUP_IMAGE_PROTOCOL` | `kitty`, `iterm2`, `none`, `0` (case-insensitive) | Forces the inline-image protocol; `none`/`0` force the half-block fallback |
+//! | `CYRUP_TRUE_COLOR` | `1`, `0` | Forces 24-bit color on/off |
+//! | `CYRUP_HYPERLINKS` | `1`, `0` | Forces OSC-8 hyperlink emission on/off |
 //!
 //! Two behaviours are worth spelling out:
 //!
@@ -37,7 +36,7 @@
 //! * `IMAGE_PROTOCOL=none` is **not** the same as leaving it unset: `none` (and `0`) is an explicit
 //!   "no native graphics", while an unset or unrecognised value leaves the sniff's answer alone.
 //! * A *set* hyperlinks override suppresses the tmux probe entirely — [`detect_capabilities`] never
-//!   runs `tmux display-message` when `CYRUP_HYPERLINKS`/`PI_HYPERLINKS` already answers the
+//!   runs `tmux display-message` when `CYRUP_HYPERLINKS` already answers the
 //!   question (`terminal-image.ts:145-147`, where the probe is a lazy `() => boolean`).
 
 use std::collections::HashMap;
@@ -567,7 +566,7 @@ impl TerminalCapabilities {
 ///
 /// The probe is handed over as the function **item**, not as a pre-computed `bool`: Pi's parameter
 /// is lazy (`tmuxForwardsHyperlink: () => boolean = probeTmuxHyperlinks`, terminal-image.ts:143),
-/// so a set `CYRUP_HYPERLINKS`/`PI_HYPERLINKS` short-circuits it and no `tmux` subprocess is
+/// so a set `CYRUP_HYPERLINKS` short-circuits it and no `tmux` subprocess is
 /// spawned at all.
 pub fn detect_capabilities() -> TerminalCapabilities {
     detect_capabilities_with_overrides(|k| std::env::var(k).ok(), probe_tmux_hyperlinks)
@@ -584,8 +583,8 @@ fn parse_bool_capability_override(value: Option<&str>) -> Option<bool> {
     }
 }
 
-/// Pi's `PI_IMAGE_PROTOCOL` three-way (terminal-image.ts:148-154), which has *four* outcomes and so
-/// needs a nested `Option`:
+/// Pi's image-protocol three-way (`PI_IMAGE_PROTOCOL` upstream, terminal-image.ts:148-154; cyrup
+/// `CYRUP_IMAGE_PROTOCOL`), which has *four* outcomes and so needs a nested `Option`:
 ///
 /// * `Some(Some(protocol))` — force that protocol (`kitty`, `iterm2`).
 /// * `Some(None)` — force "no native graphics" (`none`, `0`); the half-block raster is used.
@@ -607,18 +606,6 @@ fn parse_image_protocol_override(value: Option<&str>) -> Option<Option<ImageProt
     }
 }
 
-/// Resolve one capability override's raw string: the `CYRUP_*` key wins when set, `PI_*` is the
-/// fallback (house convention, `status.rs:479-484`). The STRING is resolved before it is parsed —
-/// unlike the boolean-OR shape at `status.rs:481-483` — so a `CYRUP_*` that is set but not a legal
-/// value (`CYRUP_TRUE_COLOR=true`) does not silently fall through to `PI_TRUE_COLOR`.
-fn capability_override_value(
-    env: &impl Fn(&str) -> Option<String>,
-    cyrup_key: &str,
-    pi_key: &str,
-) -> Option<String> {
-    env(cyrup_key).or_else(|| env(pi_key))
-}
-
 /// [`detect_capabilities`] against an injected environment and an injected tmux probe — Pi
 /// `detectCapabilities` (terminal-image.ts:143-162). This is the env-override layer, sitting
 /// strictly between the sniff ([`detect_capabilities_from`]) and the cache
@@ -636,18 +623,12 @@ pub fn detect_capabilities_with_overrides(
     env: impl Fn(&str) -> Option<String>,
     probe: impl FnOnce() -> bool,
 ) -> TerminalCapabilities {
-    let hyperlinks = parse_bool_capability_override(
-        capability_override_value(&env, "CYRUP_HYPERLINKS", "PI_HYPERLINKS").as_deref(),
-    );
+    let hyperlinks = parse_bool_capability_override(env("CYRUP_HYPERLINKS").as_deref());
     let mut caps = detect_capabilities_from(&env, hyperlinks.unwrap_or_else(probe));
-    if let Some(images) = parse_image_protocol_override(
-        capability_override_value(&env, "CYRUP_IMAGE_PROTOCOL", "PI_IMAGE_PROTOCOL").as_deref(),
-    ) {
+    if let Some(images) = parse_image_protocol_override(env("CYRUP_IMAGE_PROTOCOL").as_deref()) {
         caps.images = images;
     }
-    if let Some(true_color) = parse_bool_capability_override(
-        capability_override_value(&env, "CYRUP_TRUE_COLOR", "PI_TRUE_COLOR").as_deref(),
-    ) {
+    if let Some(true_color) = parse_bool_capability_override(env("CYRUP_TRUE_COLOR").as_deref()) {
         caps.true_color = true_color;
     }
     if let Some(hyperlinks) = hyperlinks {

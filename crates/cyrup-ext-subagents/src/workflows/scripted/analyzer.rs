@@ -36,8 +36,8 @@
 
 use std::collections::BTreeSet;
 
-use deno_ast::view::NodeTrait;
 use deno_ast::SourceRanged;
+use deno_ast::view::NodeTrait;
 use deno_ast::{MediaType, ModuleSpecifier, ParseParams};
 
 use super::types::WorkflowScriptValidationError;
@@ -157,9 +157,7 @@ fn unavailable_global_message(name: &str, state_enabled: bool) -> String {
         "require" | "module" | "exports" | "process" | "Buffer" | "__dirname" | "__filename" => {
             " workflowScript is not a Node module; it is a plain statement body evaluated in a sandbox with no module system."
         }
-        "Deno" => {
-            " The host op bridge is not part of the workflow surface."
-        }
+        "Deno" => " The host op bridge is not part of the workflow surface.",
         "state" if !state_enabled => {
             " state.get/state.set require a mission; this run was started with mission:false."
         }
@@ -215,12 +213,13 @@ pub fn analyze_workflow_script(
     options: AnalyzerOptions,
 ) -> Result<AnalysisReport, WorkflowScriptValidationError> {
     let wrapped = format!("{WRAPPER_PREFIX}{script}{WRAPPER_SUFFIX}");
-    let specifier = ModuleSpecifier::parse("file:///workflow-script.js")
-        .map_err(|error| WorkflowScriptValidationError {
+    let specifier = ModuleSpecifier::parse("file:///workflow-script.js").map_err(|error| {
+        WorkflowScriptValidationError {
             message: format!("workflowScript analyzer could not build a specifier: {error}"),
             line: None,
             column: None,
-        })?;
+        }
+    })?;
     let parsed = deno_ast::parse_program(ParseParams {
         specifier,
         text: wrapped.clone().into(),
@@ -358,7 +357,9 @@ impl WorkflowVisitor<'_> {
 /// (`scripted-workflow.ts:1579`).
 fn position(node: deno_ast::view::Node<'_>) -> (Option<u32>, Option<u32>) {
     let line = u32::try_from(node.start_line()).unwrap_or(1).max(1);
-    let column = u32::try_from(node.start_column()).unwrap_or(0).saturating_add(1);
+    let column = u32::try_from(node.start_column())
+        .unwrap_or(0)
+        .saturating_add(1);
     (Some(line), Some(column))
 }
 
@@ -415,11 +416,23 @@ mod tests {
     use super::*;
 
     fn analyze(script: &str) -> AnalysisReport {
-        analyze_workflow_script(script, AnalyzerOptions { state_enabled: false }).unwrap()
+        analyze_workflow_script(
+            script,
+            AnalyzerOptions {
+                state_enabled: false,
+            },
+        )
+        .unwrap()
     }
 
     fn analyze_with_state(script: &str) -> AnalysisReport {
-        analyze_workflow_script(script, AnalyzerOptions { state_enabled: true }).unwrap()
+        analyze_workflow_script(
+            script,
+            AnalyzerOptions {
+                state_enabled: true,
+            },
+        )
+        .unwrap()
     }
 
     #[test]
@@ -452,7 +465,9 @@ return { shipped: true, at: Date.now(), refs: runs.refs([a, b]) };
 
         assert_eq!(analyze("async function g() {} return 1;").errors.len(), 1);
         assert_eq!(
-            analyze("const o = { async m() {} }; return 1;").errors.len(),
+            analyze("const o = { async m() {} }; return 1;")
+                .errors
+                .len(),
             1
         );
         // A NON-async helper is the documented alternative and must stay legal.
@@ -469,7 +484,10 @@ return { shipped: true, at: Date.now(), refs: runs.refs([a, b]) };
             message.contains("Workflows have no timer"),
             "the message must teach the rule, not just report an absence: {message}"
         );
-        assert!(message.contains("Await a runs.* call instead."), "{message}");
+        assert!(
+            message.contains("Await a runs.* call instead."),
+            "{message}"
+        );
 
         for (script, needle) in [
             ("const r = await fetch(\"http://x\"); return r;", "'fetch'"),
@@ -477,12 +495,18 @@ return { shipped: true, at: Date.now(), refs: runs.refs([a, b]) };
             ("return Buffer.from(\"x\").length;", "'Buffer'"),
             ("return process.env.HOME;", "'process'"),
             ("return structuredClone({});", "'structuredClone'"),
-            ("return new TextEncoder().encode(\"x\").length;", "'TextEncoder'"),
+            (
+                "return new TextEncoder().encode(\"x\").length;",
+                "'TextEncoder'",
+            ),
             ("return Deno.core.ops;", "'Deno'"),
         ] {
             let report = analyze(script);
             assert!(
-                report.errors.iter().any(|error| error.message.contains(needle)),
+                report
+                    .errors
+                    .iter()
+                    .any(|error| error.message.contains(needle)),
                 "{needle} not reported for `{script}`: {:?}",
                 report.errors
             );

@@ -33,7 +33,7 @@ supported for multi-line values.
 | `description` | One-line summary shown in listings and to the orchestrating model. Required |
 | `package` | Package namespace; makes the runtime name `<package>.<name>` |
 | `alias`, `aliases` | Alternate names the agent also answers to |
-| `tools` | Tool allowlist. Omit for all built-ins; an empty list means no tools |
+| `tools` | Tool allowlist, and the crate's normative statement of the key. Present (even empty) = an explicit allowlist: the child is spawned `--tools <csv>` (or `--no-tools` when the resolved list is empty), further narrowed by `excludeTools` and by any capability ceiling's `allowedTools`. Omitted = unpinned: the child keeps its OWN default built-in set (`read`, `bash`, `edit`, `write`, or whatever its `defaultTools` setting says) — NOT all eight built-ins. Tools are never inherited from the launching session. The allowlist is enforced over the eight built-ins (`read`, `bash`, `powershell`, `edit`, `write`, `grep`, `find`, `ls`) only; extension-supplied tools (`intercom`, `contact_supervisor`, `subagent`, `mcp:` selectors) are merged in afterwards, so naming them here is a declaration consumed by the tool-availability diagnostic, not a filter |
 | `model` | Model this agent runs on |
 | `fallbackModels` | Models to try when the primary is unavailable |
 | `thinking` | Thinking level for the child, for example `high` or `off` |

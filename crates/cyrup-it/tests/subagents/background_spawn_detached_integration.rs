@@ -572,6 +572,7 @@ async fn detached_runner_survives_orchestrator_death_and_writes_terminal_files()
     // fragile against this type's own serde shape) — one SingleStep, matching
     // `background_runner_main_integration.rs`'s own identical `single_step` helper shape.
     let runner_config = RunnerConfig {
+        host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
         permission_rules: None, // SUBA-073: no policy — the pre-field behaviour
@@ -693,12 +694,23 @@ async fn detached_runner_survives_orchestrator_death_and_writes_terminal_files()
          DI-SA-8/R-SA-070"
     );
 
+    // The session-partitioned result index refuses a session-less result outright (pi
+    // `result-files.ts:166`), so this run's terminal payload (launched with `session_id: Some(...)`
+    // above) lives under `RunPaths::resolve_result`'s owned location, never at the bare
+    // `RunPaths::legacy_result_root`.
+    let session_id = cyrup_ext_subagents::identity::SessionId::parse("it-session")
+        .expect("non-empty session id");
+
     // Poll for the terminal files the runner writes as its very last acts (R-SA-077: status.json
     // strictly before ResultFile) — generous bound, matching this file's other timing-tolerant
     // tests, since this runs concurrently with the rest of the crate's real-subprocess test suite.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
-        if run_paths.result.exists() {
+        if run_paths
+            .resolve_result(&session_id, &run_id)
+            .await
+            .is_some()
+        {
             break;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -719,8 +731,12 @@ async fn detached_runner_survives_orchestrator_death_and_writes_terminal_files()
     let status: cyrup_ext_subagents::background::RunStatus =
         serde_json::from_slice(&std::fs::read(&run_paths.status).expect("status.json exists"))
             .expect("status.json parses");
+    let result_path = run_paths
+        .resolve_result(&session_id, &run_id)
+        .await
+        .expect("terminal result file exists");
     let result_file: cyrup_ext_subagents::background::ResultFile =
-        serde_json::from_slice(&std::fs::read(&run_paths.result).expect("ResultFile exists"))
+        serde_json::from_slice(&std::fs::read(&result_path).expect("ResultFile exists"))
             .expect("ResultFile parses");
 
     let stdout_contents = std::fs::read_to_string(&runner_stdout_log).unwrap_or_default();
@@ -797,6 +813,7 @@ async fn interrupting_a_running_step_pauses_rather_than_fails_the_run() {
     // has real remaining work to cut short (R-SA-084 marks the NOT-yet-dispatched step(s) Paused
     // too — see `mark_remaining_paused`'s own doc).
     let runner_config = RunnerConfig {
+        host_available_builtins: None,
         completion_owner_id: None,
         turn_budget: None,
         permission_rules: None,
@@ -956,8 +973,15 @@ async fn interrupting_a_running_step_pauses_rather_than_fails_the_run() {
     // non-terminal" (that property describes `RunState`'s own transition-graph semantics — Paused
     // can still transition onward to Running/Failed on a LATER run — not whether THIS process
     // writes a result record for its own now-ended lifetime).
+    let result_path = run_paths
+        .resolve_result(
+            status.session_id.as_ref().expect("session id present"),
+            &status.run_id,
+        )
+        .await
+        .expect("terminal result file exists (R-SA-077 covers Paused too)");
     let result_file: cyrup_ext_subagents::background::ResultFile = serde_json::from_slice(
-        &std::fs::read(&run_paths.result).expect("ResultFile exists (R-SA-077 covers Paused too)"),
+        &std::fs::read(&result_path).expect("ResultFile exists (R-SA-077 covers Paused too)"),
     )
     .expect("ResultFile parses");
     assert_eq!(

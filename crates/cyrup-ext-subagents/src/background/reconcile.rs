@@ -426,11 +426,9 @@ async fn repair_from_result(
     // healthy runner's own write would (pi `updateTerminalRunIndex` via `updateActiveRunIndex`,
     // `active-run-index.ts:100-108`) — or a run whose runner died is invisible to the index while
     // being perfectly visible to the full scan. Best-effort: the index is advisory.
-    if let Err(err) = crate::background::terminal_run_index::update_terminal_run_index(
-        &paths.run_dir,
-        &repaired,
-    )
-    .await
+    if let Err(err) =
+        crate::background::terminal_run_index::update_terminal_run_index(&paths.run_dir, &repaired)
+            .await
     {
         tracing::warn!(
             run_id = %repaired.run_id,
@@ -549,11 +547,9 @@ async fn synthesize_failure(
 
     // As in `repair_from_result` above: a synthesized terminal state indexes like a real one, so
     // the session that launched this stale-dead run can still find it through the index.
-    if let Err(err) = crate::background::terminal_run_index::update_terminal_run_index(
-        &paths.run_dir,
-        status,
-    )
-    .await
+    if let Err(err) =
+        crate::background::terminal_run_index::update_terminal_run_index(&paths.run_dir, status)
+            .await
     {
         tracing::warn!(
             run_id = %status.run_id,
@@ -689,6 +685,10 @@ fn synthesize_step_results(status: &RunStatus, diagnostic: &str) -> Vec<crate::e
             error: Some(step.error.clone().unwrap_or_else(|| diagnostic.to_string())),
             saved_output_path: None,
             tool_calls: Vec::new(),
+            // A run reconstructed from a CRASHED runner's on-disk remains never observed a spawn
+            // plan, so it has no tool surface to report and no task text was ever scanned. Default
+            // is the honest value here, not a placeholder.
+            tool_surface: crate::exec::tool_surface::ResolvedToolSurface::default(),
             output_truncated: false,
             control_events: Vec::new(),
             progress: None,
@@ -740,6 +740,8 @@ fn placeholder_result(
         error: Some(diagnostic.to_string()),
         saved_output_path: None,
         tool_calls: Vec::new(),
+        // As above: nothing about this result was observed from a live child.
+        tool_surface: crate::exec::tool_surface::ResolvedToolSurface::default(),
         output_truncated: false,
         control_events: Vec::new(),
         progress: None,

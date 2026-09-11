@@ -129,11 +129,11 @@ pub use install::{
     CompletionWatcherHandle, install_completion_watcher, install_completion_watcher_with_observer,
 };
 pub use message::{CompletionMessage, completion_notice_display, format_completion_message};
-pub use observer::{
-    CompletionBus, CompletionEvent, CompletionObserver, CompositeCompletionObserver,
-};
 pub use message::{
     format_missing_payload_message, format_undeliverable_message, result_display_summary,
+};
+pub use observer::{
+    CompletionBus, CompletionEvent, CompletionObserver, CompositeCompletionObserver,
 };
 pub use results_watcher::{
     CompletionNotification, DEDUP_TTL, LossReport, MAX_PROCESSING_ATTEMPTS,
@@ -145,8 +145,15 @@ pub use sink::{
     InlineAnsweredSink, LoggingCompletionSink,
 };
 
+/// Fixtures shared by this module's own submodule tests and by [`crate::background::wait`]'s
+/// (`ASYNC_NOTIFY_BUG_REPORT` F2's disk replay is rendered from a REAL published payload, and
+/// [`crate::exec::SingleResult`] derives no `Default` — so open-coding a child result at the
+/// second call site would be a 35-field literal drifting against this one).
+///
+/// Matches this crate's own `exec::testsupport` / `extension::testsupport` convention:
+/// test-only, `pub(crate)`, helper constructors only.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(clippy::expect_used)]
 
     use crate::background::{ResultFile, RunId, RunMode, RunState};
@@ -155,24 +162,24 @@ mod tests {
     use std::path::PathBuf;
 
     /// The session every watcher test's results belong to.
-    pub(super) fn test_session() -> SessionId {
+    pub(crate) fn test_session() -> SessionId {
         SessionId::parse("test-session").expect("non-empty")
     }
 
     /// The process every watcher test's results were launched by.
-    pub(super) fn test_owner() -> CompletionOwnerId {
+    pub(crate) fn test_owner() -> CompletionOwnerId {
         CompletionOwnerId::parse("test-owner").expect("non-empty")
     }
 
     /// Ownership matching [`test_session`]/[`test_owner`] — an instance that OWNS the fixtures.
-    pub(super) fn owning() -> crate::background::delivery::ResultDeliveryOwnership {
+    pub(crate) fn owning() -> crate::background::delivery::ResultDeliveryOwnership {
         crate::background::delivery::ResultDeliveryOwnership::new(
             Some(test_session()),
             Some(test_owner()),
         )
     }
 
-    pub(super) fn temp_results_dir() -> (tempfile::TempDir, PathBuf) {
+    pub(crate) fn temp_results_dir() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("real tempdir");
         let results_dir = dir.path().join("results");
         (dir, results_dir)
@@ -184,19 +191,25 @@ mod tests {
     /// makes it discoverable, and that is the point of the change: an unindexed payload is
     /// invisible to the enumerator.
     /// Where `publish_result` promotes a fixture's payload.
-    pub(super) fn published_path(results_dir: &std::path::Path, result: &ResultFile) -> PathBuf {
+    pub(crate) fn published_path(results_dir: &std::path::Path, result: &ResultFile) -> PathBuf {
         crate::background::result_index::owned_payload_path(
             results_dir,
-            result.session_id.as_ref().expect("fixture carries a session"),
+            result
+                .session_id
+                .as_ref()
+                .expect("fixture carries a session"),
             &result.run_id,
         )
     }
 
-    pub(super) async fn publish_result(results_dir: &std::path::Path, result: &ResultFile) {
+    pub(crate) async fn publish_result(results_dir: &std::path::Path, result: &ResultFile) {
         crate::background::result_index::write_async_result_file(
             &crate::background::result_index::ResultWrite {
                 results_dir,
-                session_id: result.session_id.as_ref().expect("fixture carries a session"),
+                session_id: result
+                    .session_id
+                    .as_ref()
+                    .expect("fixture carries a session"),
                 run_id: &result.run_id,
                 written_at: 1,
                 async_dir: None,
@@ -208,7 +221,7 @@ mod tests {
         .expect("publish fixture result");
     }
 
-    pub(super) fn sample_result(run_id: &str, state: RunState, success: bool) -> ResultFile {
+    pub(crate) fn sample_result(run_id: &str, state: RunState, success: bool) -> ResultFile {
         ResultFile {
             id: RunId::from_token(run_id),
             run_id: RunId::from_token(run_id),
@@ -228,7 +241,7 @@ mod tests {
     // Completion notification (C6): format + install + deliver-exactly-once + delete
     // ---------------------------------------------------------------------------------------
 
-    pub(super) fn child_result(
+    pub(crate) fn child_result(
         agent: &str,
         final_output: Option<&str>,
         exit_code: i32,
@@ -270,10 +283,12 @@ mod tests {
             progress: None,
             runner: None,
             external_process: None,
+            // Test fixture: no child was planned, so there is no surface to report.
+            tool_surface: crate::exec::tool_surface::ResolvedToolSurface::default(),
         }
     }
 
-    pub(super) fn result_with_children(
+    pub(crate) fn result_with_children(
         run_id: &str,
         state: RunState,
         success: bool,

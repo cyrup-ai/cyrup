@@ -29,8 +29,10 @@ pub(crate) fn is_unaddressable(error: &io::Error) -> bool {
 /// so this must be silent.
 #[must_use]
 pub(crate) fn is_absent(error: &io::Error) -> bool {
-    matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory)
-        || error.raw_os_error() == Some(libc::ENOTDIR)
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    ) || error.raw_os_error() == Some(libc::ENOTDIR)
         || is_unaddressable(error)
 }
 
@@ -75,7 +77,10 @@ mod tests {
     fn enametoolong_is_unaddressable_and_absent_but_not_denied() {
         let e = errno(libc::ENAMETOOLONG);
         assert!(is_unaddressable(&e));
-        assert!(is_absent(&e), "an unaddressable candidate is skipped like a missing one");
+        assert!(
+            is_absent(&e),
+            "an unaddressable candidate is skipped like a missing one"
+        );
         assert!(!is_access_denied(&e));
     }
 
@@ -100,7 +105,13 @@ mod tests {
 
     #[test]
     fn enumeration_swallows_both_families_but_not_a_real_fault() {
-        for code in [libc::ENOENT, libc::ENOTDIR, libc::EPERM, libc::EACCES, libc::ENAMETOOLONG] {
+        for code in [
+            libc::ENOENT,
+            libc::ENOTDIR,
+            libc::EPERM,
+            libc::EACCES,
+            libc::ENAMETOOLONG,
+        ] {
             assert!(is_ignorable_listing_error(&errno(code)), "errno {code}");
         }
         // EIO is a genuine fault and must propagate out of enumeration.

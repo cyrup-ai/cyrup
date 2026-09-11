@@ -84,7 +84,19 @@ impl AgentSession {
         }
         // `&[]` = "no built-in base": what comes back is exactly the extension-contributed set,
         // which is what merges into the registry (the built-ins are already in it).
-        let ext_tools = match self.services.ext_host.active_tools(&[]) {
+        //
+        // #2835: FILTERED, through the session-scoped selection resolved once at build time. This is
+        // the SECOND of pi's two `_refreshToolRegistry` call paths (`:2612` via `refreshTools`; the
+        // builder is `:2812`), and upstream reads `_allowedToolNames`/`_excludedToolNames` — session
+        // FIELDS, not call-site locals — on both for exactly this reason. A tool registered after
+        // `init`, which is precisely what the #2835 regression's `dynamic_tool` is, arrives here and
+        // nowhere else: leaving this path unfiltered would keep the whole defect reachable while
+        // every builder-level test passed.
+        let ext_tools = match self.services.ext_host.active_tools_filtered(
+            &[],
+            self.services.allowed_tool_names.as_ref(),
+            &self.services.excluded_tool_names,
+        ) {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!(error = %e, "extension tool refresh failed; the late tool stays invisible");

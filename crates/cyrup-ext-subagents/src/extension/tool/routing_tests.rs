@@ -1760,3 +1760,56 @@ async fn stop_reports_an_unknown_child_with_upstreams_not_found_text() {
     );
     assert!(!crate::background::control::has_pending_stop_request(&paths.run_dir).await);
 }
+
+/// Unit A: a task that "grants" a tool the agent does not declare is NO LONGER refused.
+///
+/// The deleted prose scanner sat above every other SINGLE-arm validation, so it decided the call
+/// before anything else could. This pins its removal by ORDERING rather than by a spawn: the agent
+/// resolves (an unresolvable name skipped the gate, so that would prove nothing), its `tools:` list
+/// omits `bash`, and the task states the exact false grant from the reported bug — while a
+/// deliberately malformed `toolBudget` fails a validator that ran strictly AFTER the gate.
+///
+/// Pre-fix this call died with `Agent 'clerk' cannot honour this task…`; the budget validator was
+/// never reached. Post-fix the budget error wins, which is only possible with the gate gone.
+#[tokio::test]
+async fn a_task_that_claims_an_undeclared_tool_no_longer_refuses() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let agents_dir = dir.path().join(".cyrup").join("agents");
+    std::fs::create_dir_all(&agents_dir).expect("mkdir agents dir");
+    std::fs::write(
+        agents_dir.join("clerk.md"),
+        "---\nname: clerk\ndescription: A shell-less reviewer\ntools: read, grep\n---\nBody.\n",
+    )
+    .expect("write agent fixture");
+    let tool = scoped_tool(dir.path()).await;
+
+    for r#async in [false, true] {
+        let message = dispatch_tool(
+            &tool,
+            serde_json::json!({
+                "agent": "clerk",
+                "task": "You have full read/bash/grep access. You MAY run `cargo check`.",
+                "async": r#async,
+                "toolBudget": { "hard": 0 }
+            }),
+        )
+        .await
+        .expect_err("hard: 0 is not a valid budget")
+        .to_string();
+
+        assert!(
+            message.contains("toolBudget.hard must be an integer >= 1."),
+            "async={async}: the validator that ran BELOW the deleted gate must now decide this \
+             call; got {message}"
+        );
+        assert!(
+            !message.contains("cannot honour this task"),
+            "async={async}: the tool-claim refusal is deleted and must never be raised; got \
+             {message}"
+        );
+        assert!(
+            !message.contains("Subagent tools are NOT inherited"),
+            "async={async}: no launch path may emit the deleted refusal's body; got {message}"
+        );
+    }
+}

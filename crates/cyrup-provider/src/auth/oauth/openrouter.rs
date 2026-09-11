@@ -312,7 +312,7 @@ impl CallbackHandler for OpenRouterCallbackHandler {
 pub struct OpenRouterOAuth {
     authorize_url: String,
     token_url: String,
-    /// `None` resolves `CYRUP_OAUTH_CALLBACK_HOST`/`PI_OAUTH_CALLBACK_HOST` at login time, which
+    /// `None` resolves `CYRUP_OAUTH_CALLBACK_HOST` at login time, which
     /// is what upstream's `getCallbackHost()` does per login (`openrouter.ts:25-27`, `:141`).
     callback_host: Option<String>,
 }

@@ -922,7 +922,10 @@ mod tests {
             "version": 1, "lanes": [{ "key": "a".repeat(129) }],
         })))
         .expect_err("129 chars fails the grammar");
-        assert!(grammar_message.contains("must be 1-128 characters"), "{grammar_message}");
+        assert!(
+            grammar_message.contains("must be 1-128 characters"),
+            "{grammar_message}"
+        );
 
         let length_message = normalize_workflow_preflight(Some(&json!({
             "version": 1, "lanes": [{ "key": "a".repeat(257) }],
@@ -937,7 +940,10 @@ mod tests {
             "version": 1, "lanes": [{ "key": "a\u{1}b" }],
         })))
         .expect_err("a control char becomes a space and fails the grammar");
-        assert!(control_message.contains("must be 1-128 characters"), "{control_message}");
+        assert!(
+            control_message.contains("must be 1-128 characters"),
+            "{control_message}"
+        );
     }
 
     /// The length rule counts UTF-16 code units via `BoundedUtf16<256>`: 200 astral characters
@@ -970,7 +976,10 @@ mod tests {
                 json!({ "version": 1, "lanes": [], "extra": 1 }),
                 "preflight contains unsupported field 'extra'.",
             ),
-            (json!({ "version": 2, "lanes": [] }), "preflight.version must be 1."),
+            (
+                json!({ "version": 2, "lanes": [] }),
+                "preflight.version must be 1.",
+            ),
             (
                 json!({ "version": 1, "coverage": "half", "lanes": [] }),
                 "preflight.coverage must be 'complete' or 'partial'.",
@@ -1033,9 +1042,8 @@ mod tests {
         let lanes: Vec<serde_json::Value> = (0..64)
             .map(|i| json!({ "key": format!("lane{i}"), "decision": "d".repeat(256) }))
             .collect();
-        let message =
-            normalize_workflow_preflight(Some(&json!({ "version": 1, "lanes": lanes })))
-                .expect_err("over 16 KiB of canonical JSON");
+        let message = normalize_workflow_preflight(Some(&json!({ "version": 1, "lanes": lanes })))
+            .expect_err("over 16 KiB of canonical JSON");
         assert!(
             message.starts_with("preflight canonical JSON is ")
                 && message.ends_with(" bytes; maximum is 16384."),
@@ -1062,15 +1070,18 @@ mod tests {
             { "key": "lane.stage" },
             { "key": "other" },
         ]));
-        let exact =
-            workflow_preflight_lane_for_runtime_key(Some(&preflight), "lane.stage", &[])
-                .expect("exact");
+        let exact = workflow_preflight_lane_for_runtime_key(Some(&preflight), "lane.stage", &[])
+            .expect("exact");
         assert_eq!(exact.key.as_str(), "lane.stage");
 
         let root =
             workflow_preflight_lane_for_runtime_key(Some(&preflight), "lane.stage.child", &[])
                 .expect("root");
-        assert_eq!(root.key.as_str(), "lane.stage", "LONGEST root, not the first declared");
+        assert_eq!(
+            root.key.as_str(),
+            "lane.stage",
+            "LONGEST root, not the first declared"
+        );
 
         let preferred = workflow_preflight_lane_for_runtime_key(
             Some(&preflight),
@@ -1078,7 +1089,11 @@ mod tests {
             &[None, Some("missing"), Some("other")],
         )
         .expect("preferred");
-        assert_eq!(preferred.key.as_str(), "other", "first matching preferred key wins");
+        assert_eq!(
+            preferred.key.as_str(),
+            "other",
+            "first matching preferred key wins"
+        );
 
         assert!(
             workflow_preflight_lane_for_runtime_key(Some(&preflight), "unrelated", &[]).is_none()
@@ -1091,7 +1106,11 @@ mod tests {
     fn key_matching_is_a_three_way_disjunction() {
         let lane = WorkflowKey::parse("lane").expect("valid");
         assert!(workflow_key_matches_preflight_lane("lane", &lane, None));
-        assert!(workflow_key_matches_preflight_lane("lane.stage", &lane, None));
+        assert!(workflow_key_matches_preflight_lane(
+            "lane.stage",
+            &lane,
+            None
+        ));
         assert!(
             workflow_key_matches_preflight_lane("generated.42", &lane, Some("lane")),
             "an auto-generated child is covered by the lane that generated it"
@@ -1115,7 +1134,10 @@ mod tests {
         let unsettled = workflow_preflight_warnings(Some(&preflight), &trace, false);
         assert_eq!(
             unsettled,
-            vec!["Preflight advisory: workflow key 'stray' launched without a declared lane.".to_string()]
+            vec![
+                "Preflight advisory: workflow key 'stray' launched without a declared lane."
+                    .to_string()
+            ]
         );
 
         let settled =
@@ -1128,7 +1150,9 @@ mod tests {
                 "Preflight advisory: declared lane 'lane' was not launched.".to_string(),
             ]
         );
-        assert!(workflow_preflight_warnings::<WorkflowScriptTraceEntry>(None, &[], true).is_empty());
+        assert!(
+            workflow_preflight_warnings::<WorkflowScriptTraceEntry>(None, &[], true).is_empty()
+        );
     }
 
     /// `warning_limit` keeps 15 and the omission count includes the displaced sixteenth.
@@ -1144,9 +1168,7 @@ mod tests {
             Some("Preflight advisory: 5 additional mismatch warning(s) omitted.")
         );
         assert!(
-            warnings
-                .first()
-                .is_some_and(|w| w.contains("'k0'")),
+            warnings.first().is_some_and(|w| w.contains("'k0'")),
             "the first 15 real warnings survive"
         );
     }

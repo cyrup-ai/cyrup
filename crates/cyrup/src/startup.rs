@@ -3,7 +3,7 @@
 //! `modes/interactive/components/first-time-setup.ts`).
 //!
 //! `shouldRunFirstTimeSetup` (startup-ui.ts:115-133) fires the first-run wizard only when ALL hold:
-//! official distribution, `*_EXPERIMENTAL=1`, the default agent dir, and no existing `settings.json`.
+//! official distribution, `CYRUP_EXPERIMENTAL=1`, the default agent dir, and no existing `settings.json`.
 //! `isOfficialDistribution` (startup-ui.ts:36-42) compares the RUNNING build's
 //! `(packageName, appName, configDirName)` triple — read at runtime from `package.json` /
 //! `pkg.piConfig` (config.ts:488-491) — against the constants naming the distribution this source
@@ -73,26 +73,26 @@ pub fn is_official_distribution() -> bool {
     is_official_distribution_of(&distribution())
 }
 
-/// Port of `areExperimentalFeaturesEnabled` (experimental.ts): `*_EXPERIMENTAL=1`.
+/// Port of `areExperimentalFeaturesEnabled` (experimental.ts): `CYRUP_EXPERIMENTAL=1`.
 pub fn are_experimental_features_enabled() -> bool {
     are_experimental_features_enabled_from(&|k| std::env::var(k).ok())
 }
 
 /// [`are_experimental_features_enabled`] over an injected lookup.
 ///
-/// The gate is strict-`"1"` under EITHER name, and that is what a caller wants to pin: proving it
+/// The gate is strict-`"1"` under the one `CYRUP_EXPERIMENTAL` name (the legacy `PI_EXPERIMENTAL`
+/// spelling is no longer honoured), and that is what a caller wants to pin: proving it
 /// by exporting `CYRUP_EXPERIMENTAL` means mutating the process environment, which races every
-/// concurrent reader in the same binary — not just readers of these two keys, because `set_var` can
+/// concurrent reader in the same binary — not just readers of this key, because `set_var` can
 /// reallocate the whole `environ` array under a concurrent `getenv` for any key at all.
 #[must_use]
 pub fn are_experimental_features_enabled_from(get: &dyn Fn(&str) -> Option<String>) -> bool {
     get("CYRUP_EXPERIMENTAL").is_some_and(|v| v == "1")
-        || get("PI_EXPERIMENTAL").is_some_and(|v| v == "1")
 }
 
 /// Port of `shouldRunFirstTimeSetup` (startup-ui.ts:115-133): official distribution AND experimental
 /// features AND default agent dir AND no existing `settings.json`. `agent_dir_overridden` reflects
-/// whether `$CYRUP_AGENT_DIR` / `$PI_CODING_AGENT_DIR` was set (Pi's `process.env[ENV_AGENT_DIR]`,
+/// whether `$CYRUP_AGENT_DIR` / `$CYRUP_CODING_AGENT_DIR` was set (Pi's `process.env[ENV_AGENT_DIR]`,
 /// startup-ui.ts:128); it is a parameter because the bin has already resolved the env into
 /// [`cyrup_config::EnvVars`] by this point.
 pub fn should_run_first_time_setup(settings_path: &Path, agent_dir_overridden: bool) -> bool {

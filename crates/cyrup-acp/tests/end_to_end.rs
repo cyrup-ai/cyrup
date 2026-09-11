@@ -165,11 +165,15 @@ fn the_frame_sequence_is_stable() {
     in_local_set(|| async {
         let mut h = Harness::start(vec![
             faux_assistant_message(
-                vec![faux_tool_call("edit", json!({"path": "hello.txt", "edits": [{"oldText": "two", "newText": "TWO"}]}))],
+                vec![faux_tool_call(
+                    "edit",
+                    json!({"path": "hello.txt", "edits": [{"oldText": "two", "newText": "TWO"}]}),
+                )],
                 StopReason::ToolUse,
             ),
             faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
-        ]).await;
+        ])
+        .await;
         let session = h.open_session().await;
         let id = h
             .client
@@ -180,13 +184,14 @@ fn the_frame_sequence_is_stable() {
         let kinds: Vec<String> = frames
             .iter()
             .map(|f| {
-                f["params"]["update"]["sessionUpdate"]
-                    .as_str()
-                    .map_or_else(|| "<response>".to_string(), |k| {
+                f["params"]["update"]["sessionUpdate"].as_str().map_or_else(
+                    || "<response>".to_string(),
+                    |k| {
                         f["params"]["update"]["status"]
                             .as_str()
                             .map_or_else(|| k.to_string(), |st| format!("{k}:{st}"))
-                    })
+                    },
+                )
             })
             .collect();
 
@@ -219,15 +224,22 @@ fn a_bash_call_streams_terminal_output() {
     in_local_set(|| async {
         let mut h = Harness::start(vec![
             faux_assistant_message(
-                vec![faux_tool_call("bash", json!({"command": "echo cyrup-acp-e2e"}))],
+                vec![faux_tool_call(
+                    "bash",
+                    json!({"command": "echo cyrup-acp-e2e"}),
+                )],
                 StopReason::ToolUse,
             ),
             faux_assistant_message(vec![faux_text("ok")], StopReason::Stop),
-        ]).await;
+        ])
+        .await;
         let session = h.open_session().await;
         let id = h
             .client
-            .request("session/prompt", json!({"sessionId": session, "prompt": [{"type":"text","text":"echo"}]}))
+            .request(
+                "session/prompt",
+                json!({"sessionId": session, "prompt": [{"type":"text","text":"echo"}]}),
+            )
             .await;
         let frames = h.client.drain_until(|v| is_response_to(v, id)).await;
 

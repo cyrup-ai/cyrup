@@ -429,9 +429,7 @@ pub struct WorkflowPreflightLane {
 /// pi `WorkflowPreflightCoverage` (`shared/types.ts:111`) — whether the declared lanes claim to
 /// cover the whole plan. `Partial` is the DEFAULT when `coverage` is omitted
 /// (`workflow-preflight.ts:106`), not an error.
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum WorkflowPreflightCoverage {
     /// The declared lanes cover the whole plan.

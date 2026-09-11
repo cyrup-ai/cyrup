@@ -88,7 +88,6 @@ fn stats_row(app: &App<TestBackend>) -> String {
 #[test]
 fn xp_marker_appears_when_experimental_features_are_enabled() {
     let restore_cyrup = std::env::var("CYRUP_EXPERIMENTAL").ok();
-    let restore_pi = std::env::var("PI_EXPERIMENTAL").ok();
 
     // --- the pure predicate: `=== "1"`, nothing else counts (`experimental.ts:2`) -------------
     let env = |c: Option<&'static str>, p: Option<&'static str>| {
@@ -100,8 +99,8 @@ fn xp_marker_appears_when_experimental_features_are_enabled() {
     };
     assert!(experimental_features_enabled_from(env(Some("1"), None)));
     assert!(
-        experimental_features_enabled_from(env(None, Some("1"))),
-        "PI_* survives as fallback"
+        !experimental_features_enabled_from(env(None, Some("1"))),
+        "the dropped PI_* spelling must be inert"
     );
     assert!(!experimental_features_enabled_from(env(None, None)));
     assert!(!experimental_features_enabled_from(env(Some("0"), None)));
@@ -111,7 +110,6 @@ fn xp_marker_appears_when_experimental_features_are_enabled() {
     );
 
     // --- the wiring: launching with the flag set must reach the footer ------------------------
-    set_env("PI_EXPERIMENTAL", None);
     set_env("CYRUP_EXPERIMENTAL", Some("1"));
     assert!(experimental_features_enabled(), "sanity: the env is armed");
 
@@ -157,5 +155,4 @@ fn xp_marker_appears_when_experimental_features_are_enabled() {
     );
 
     set_env("CYRUP_EXPERIMENTAL", restore_cyrup.as_deref());
-    set_env("PI_EXPERIMENTAL", restore_pi.as_deref());
 }

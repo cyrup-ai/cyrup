@@ -800,7 +800,8 @@ async fn bash_execution_update_omits_id_when_the_caller_supplied_none() {
 /// RED before this pass: cyrup's bin declines the process-global `set_var`, so each spawn site has
 /// to push the pair itself. The `bash` TOOL did; `crate::bash::run_bash` did not — so `!!cmd` in
 /// the TUI and the RPC `executeBash` handed the child a DIFFERENT environment from the identical
-/// command run as a tool. Both `${PI_CODING_AGENT-}` expansions below rendered empty.
+/// command run as a tool. Both marker expansions below rendered empty. (The agency marker is
+/// hard-renamed to `CYRUP_CODING_AGENT`.)
 #[tokio::test]
 async fn immediate_bash_carries_the_agent_identity_markers() {
     let fx = fixture();
@@ -812,7 +813,7 @@ async fn immediate_bash_carries_the_agent_identity_markers() {
 
     let result = session
         .execute_bash(
-            r#"printf '[%s][%s]\n' "${PI_CODING_AGENT-}" "${AI_AGENT-}""#,
+            r#"printf '[%s][%s]\n' "${CYRUP_CODING_AGENT-}" "${AI_AGENT-}""#,
             BashOptions {
                 exclude_from_context: false,
                 id: None,
@@ -837,15 +838,16 @@ async fn immediate_bash_carries_the_agent_identity_markers() {
 /// name the KEY and the TAG, not only the value — otherwise a later v0.84.1 uplift reads the site
 /// as already-done-at-tag and never records that cyrup ran ahead of the baseline.
 ///
-/// Presence before absence: `PI_CODING_AGENT`, which IS at the ported tag, must still be pushed
-/// beside it — this test must not be satisfiable by deleting the forward-ported marker.
+/// Presence before absence: the agency marker (pi `PI_CODING_AGENT`, hard-renamed
+/// `CYRUP_CODING_AGENT`), which IS at the ported tag, must still be pushed beside it — this test
+/// must not be satisfiable by deleting the forward-ported marker.
 #[test]
 fn the_forward_ported_ai_agent_marker_names_its_key_and_its_tag() {
     let src = include_str!("../bash.rs");
 
     assert!(
-        src.contains(r#"env.push(("PI_CODING_AGENT".to_string(), "true".to_string()));"#),
-        "the at-tag marker `PI_CODING_AGENT` (cli.ts:13 @v0.83.0) must still be pushed"
+        src.contains(r#"env.push(("CYRUP_CODING_AGENT".to_string(), "true".to_string()));"#),
+        "the agency marker (pi cli.ts:13 @v0.83.0, hard-renamed) must still be pushed"
     );
 
     let push = r#"env.push(("AI_AGENT".to_string(), "cyrup".to_string()));"#;

@@ -144,10 +144,10 @@ const ENVELOPE_VERSION: u8 = 1;
 /// descendants in `ps` output.
 pub const CLEANUP_TOKEN_ENV: &str = "CYRUP_MCP_REQUEST_HEADERS_CLEANUP_TOKEN";
 
-/// `PI_MCP_ADAPTER_TEST_FAIL_PS` (`request-headers-command.ts:17`) — the fault injector upstream's
-/// suite uses to prove the fail-closed preflight. Dual-read `CYRUP_MCP_*` first, the convention
-/// [`crate::credentials`] documents (MCP-282).
-const TEST_FAIL_PS_ENV: [&str; 2] = ["CYRUP_MCP_TEST_FAIL_PS", "PI_MCP_ADAPTER_TEST_FAIL_PS"];
+/// The fault injector upstream's suite uses to prove the fail-closed preflight (pi
+/// `PI_MCP_ADAPTER_TEST_FAIL_PS`, `request-headers-command.ts:17`; the legacy spelling is no
+/// longer honoured — MCP-282 hard rename).
+const TEST_FAIL_PS_ENV: &str = "CYRUP_MCP_TEST_FAIL_PS";
 
 // ===================================================================================================
 // 2 · Errors
@@ -301,14 +301,10 @@ impl HttpRequestCommandEnvelope {
 // 5 · POSIX process discovery (`request-headers-command.ts:12-60`)
 // ===================================================================================================
 
-/// `process.env.PI_MCP_ADAPTER_TEST_FAIL_PS === "1"` (`request-headers-command.ts:17`) — strict
-/// equality, so `"true"` does not trip it.
+/// `process.env.PI_MCP_ADAPTER_TEST_FAIL_PS === "1"` (`request-headers-command.ts:17`; cyrup
+/// `CYRUP_MCP_TEST_FAIL_PS`) — strict equality, so `"true"` does not trip it.
 fn test_fail_ps() -> bool {
-    TEST_FAIL_PS_ENV
-        .iter()
-        .find_map(|name| std::env::var(name).ok())
-        .as_deref()
-        == Some("1")
+    std::env::var(TEST_FAIL_PS_ENV).ok().as_deref() == Some("1")
 }
 
 /// `runPosixPs(args)` (`request-headers-command.ts:16`).

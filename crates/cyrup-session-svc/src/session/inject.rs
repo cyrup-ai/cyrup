@@ -209,7 +209,13 @@ impl AgentSession {
         };
         self.services
             .host_services
-            .inject_message(&content, Some(&kind), display, details.as_ref(), trigger_turn)
+            .inject_message(
+                &content,
+                Some(&kind),
+                display,
+                details.as_ref(),
+                trigger_turn,
+            )
             .map_err(SessionServiceError::InjectUnavailable)
     }
 }

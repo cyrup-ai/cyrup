@@ -91,8 +91,8 @@ pub use child_summary::{
 };
 pub use display_text::{sanitize_display_text, truncate_display, truncate_to_bytes};
 pub use host_command::{
-    HostCommandKind, WorkflowHostCommandParams, WorkflowHostCommandResult,
-    WorkflowHostCommandRole, WorkflowHostCommandState, execute_workflow_host_command,
+    HostCommandKind, WorkflowHostCommandParams, WorkflowHostCommandResult, WorkflowHostCommandRole,
+    WorkflowHostCommandState, execute_workflow_host_command,
     normalize_workflow_host_command_params, resolve_workflow_host_output_claim_path,
 };
 pub use host_step::{
@@ -100,6 +100,11 @@ pub use host_step::{
     HostStepState, HostStepVerdict, HostStepVersion,
 };
 pub use key::{WorkflowKey, WorkflowKeyError};
+pub use permit::{
+    WorkflowResourceAuthority, WorkflowResourceConsumption, WorkflowResourceExpansionState,
+    WorkflowResourceHostAuthority, WorkflowResourceInvocation, WorkflowResourcePermit,
+    WorkflowResourcePermitInput, WorkflowResourceProvenance, WorkflowResourceProvenanceKind,
+};
 pub use preflight::{
     WORKFLOW_PREFLIGHT_MAX_BYTES, WORKFLOW_PREFLIGHT_MAX_CLAIMS, WORKFLOW_PREFLIGHT_MAX_DEPTH,
     WORKFLOW_PREFLIGHT_MAX_LANES, WORKFLOW_PREFLIGHT_MAX_STRING_LENGTH,
@@ -107,14 +112,8 @@ pub use preflight::{
     WorkflowTraceLike, annotate_workflow_preflight_trace, format_workflow_preflight,
     format_workflow_preflight_plan_summary, format_workflow_preflight_summary,
     format_workflow_preflight_warning_summary, format_workflow_preflight_warnings,
-    normalize_workflow_preflight, validate_workflow_preflight,
-    workflow_key_matches_preflight_lane, workflow_preflight_lane_for_runtime_key,
-    workflow_preflight_warnings,
-};
-pub use permit::{
-    WorkflowResourceAuthority, WorkflowResourceConsumption, WorkflowResourceExpansionState,
-    WorkflowResourceHostAuthority, WorkflowResourceInvocation, WorkflowResourcePermit,
-    WorkflowResourcePermitInput, WorkflowResourceProvenance, WorkflowResourceProvenanceKind,
+    normalize_workflow_preflight, validate_workflow_preflight, workflow_key_matches_preflight_lane,
+    workflow_preflight_lane_for_runtime_key, workflow_preflight_warnings,
 };
 pub use resources::{
     ResolvedWorkflowResource, WorkflowResourceDefinition, WorkflowResourceExpansion,
@@ -123,14 +122,13 @@ pub use resources::{
 };
 pub use stable_json::{stable_json, stable_json_digest};
 pub use types::{
+    AcceptanceRecoveryMetadata, LaneMetadataVersion, WorkflowContinuation, WorkflowLaneMetadata,
+    WorkflowLaneMode, WorkflowOutputPathMapping, WorkflowRequestedContext, WorkflowResolvedContext,
+    WorkflowResumability, WorkflowTerminalOutcome, WorkflowTerminalOutcomeReason,
+};
+pub use types::{
     PreflightVersion, SummaryVersion, WorkflowChildActivity, WorkflowChildRow, WorkflowChildState,
     WorkflowChildSummary, WorkflowPreflight, WorkflowPreflightCoverage, WorkflowPreflightLane,
     WorkflowPreflightMode, WorkflowScriptChildResult, WorkflowScriptOperation,
     WorkflowScriptTraceEntry, WorkflowScriptTraceState, WorkflowState,
-};
-pub use types::{
-    AcceptanceRecoveryMetadata, LaneMetadataVersion, WorkflowContinuation, WorkflowLaneMetadata,
-    WorkflowLaneMode, WorkflowOutputPathMapping, WorkflowRequestedContext,
-    WorkflowResolvedContext, WorkflowResumability, WorkflowTerminalOutcome,
-    WorkflowTerminalOutcomeReason,
 };

@@ -522,18 +522,17 @@ impl Component for StatusLine {
 /// `coding-agent/src/core/experimental.ts:1-3`: `return process.env.PI_EXPERIMENTAL === "1"`) —
 /// the predicate gating the footer's `• xp` marker (`footer.ts:162`).
 ///
-/// `CYRUP_EXPERIMENTAL` is the renamed primary and `PI_EXPERIMENTAL` survives as the
-/// lower-precedence fallback, exactly as `crates/cyrup/src/startup.rs:76-84` reads it for the
-/// first-run wizard. Both must be the literal `"1"`; any other value is off.
+/// `CYRUP_EXPERIMENTAL` is the renamed flag (the legacy `PI_EXPERIMENTAL` spelling is no longer
+/// honoured), exactly as `crates/cyrup/src/startup.rs:76-84` reads it for the first-run wizard.
+/// It must be the literal `"1"`; any other value is off.
 pub fn experimental_features_enabled() -> bool {
     experimental_features_enabled_from(|k| std::env::var(k).ok())
 }
 
-/// [`experimental_features_enabled`] against an injected environment, so the precedence can be
+/// [`experimental_features_enabled`] against an injected environment, so the flag can be
 /// tested without mutating the process env (same seam as `ColorMode::detect_from`).
 pub fn experimental_features_enabled_from(get: impl Fn(&str) -> Option<String>) -> bool {
     get("CYRUP_EXPERIMENTAL").as_deref() == Some("1")
-        || get("PI_EXPERIMENTAL").as_deref() == Some("1")
 }
 
 /// Sanitize an extension status for single-line display (`footer.ts:12-18`): CR/LF/Tab → space,

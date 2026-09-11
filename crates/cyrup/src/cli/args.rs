@@ -191,7 +191,7 @@ pub struct Cli {
     pub tui_mode: Option<TuiMode>,
 
     // ---- network / diagnostics (args.ts:178,184) ----
-    /// Disable startup network operations (same as `PI_OFFLINE=1`).
+    /// Disable startup network operations (same as `CYRUP_OFFLINE=1`).
     #[arg(long = "offline")]
     pub offline: bool,
     /// Force verbose startup (raises stderr log verbosity; never pollutes the protocol stream).

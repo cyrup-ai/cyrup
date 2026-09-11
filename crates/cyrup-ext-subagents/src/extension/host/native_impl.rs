@@ -398,8 +398,7 @@ impl NativeExtension for SubagentsExtension {
                     )
                 {
                     let roots = self.executor.config_snapshot().await.roots;
-                    let artifact_roots =
-                        crate::background::run_artifact_roots_in(&roots, &ctx.cwd);
+                    let artifact_roots = crate::background::run_artifact_roots_in(&roots, &ctx.cwd);
                     let probe = crate::background::auto_drain::FsDrainProbe {
                         async_root: artifact_roots.async_root,
                         results_dir: artifact_roots.results_dir,
@@ -427,15 +426,14 @@ impl NativeExtension for SubagentsExtension {
                         .with_fail_on_failed_runs(true)
                         .with_fail_on_attention(true),
                     };
-                    if let Err(message) =
-                        crate::background::auto_drain::drain_outstanding_work(
-                            &session_id,
-                            crate::background::auto_drain::DEFAULT_AUTO_DRAIN_TIMEOUT_MS,
-                            &crate::time::now_epoch_millis,
-                            &probe,
-                            &waiter,
-                        )
-                        .await
+                    if let Err(message) = crate::background::auto_drain::drain_outstanding_work(
+                        &session_id,
+                        crate::background::auto_drain::DEFAULT_AUTO_DRAIN_TIMEOUT_MS,
+                        &crate::time::now_epoch_millis,
+                        &probe,
+                        &waiter,
+                    )
+                    .await
                     {
                         // [CYRUP-DELTA in mechanism, not in behaviour] upstream THROWS out of the
                         // handler (`auto-drain.ts:53,66`) — but that throw is not control flow: pi's

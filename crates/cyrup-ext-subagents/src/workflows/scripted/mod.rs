@@ -88,9 +88,7 @@
 //! ```text
 //! mod.rs        facade + the contract, the ruling, and the rejection record. No logic.
 //! engine.rs     the run/validate entry points, the orchestration state, the isolate lifecycle
-//! ops.rs        the #[op2] layer — the whole capability surface (§3.2)
 //! analyzer.rs   deno_ast structural analysis: nested-async + enumerated globals (§3.6)
-//! js/prelude.js the kept half of upstream's WORKER_SOURCE, as source (§3.4)
 //! recovery.rs   the acceptance-recovery review classifier (:1150-1320)
 //! git_ref.rs    valid_git_ref + BASE_REF_VALIDATION_ERROR
 //! permit.rs     WorkflowChildPermit + its three-state lifecycle
@@ -99,12 +97,17 @@
 //! settlement.rs the one pure unawaited-work precedence decision
 //! types.rs      the eleven public types (:997-1101)
 //! ```
+//!
+//! The `#[op2]` layer, the extension declaration, and `js/prelude.js` (§3.2/§3.4) moved out to the
+//! `cyrup-workflow-runtime` crate (WORKFLOW_1 §7): a `build.rs` can never import from the crate
+//! whose build it is running, so the V8 startup snapshot this crate's own `build.rs` now produces
+//! needed them to live somewhere else. `engine.rs` depends on that crate as an ordinary dependency
+//! and bridges it to `RunShared` through [`cyrup_workflow_runtime::WorkflowOpsBridge`].
 
 mod analyzer;
 mod engine;
 mod git_ref;
 mod json_value;
-mod ops;
 mod permit;
 mod preview;
 mod recovery;
@@ -117,18 +120,24 @@ pub use analyzer::{
 };
 pub use engine::{
     NESTED_WORKFLOW_REFUSAL, RunWorkflowScriptOptions, WORKFLOW_ASSEMBLY_FLUSH_TIMEOUT_MS,
-    WORKFLOW_CHILD_MARKER, WORKFLOW_DEFAULT_TIMEOUT_MS, refuse_nested_workflow,
-    WORKFLOW_SETTLE_DRAIN_TIMEOUT_MS, WorkflowEmitCallback, WorkflowHostStepCallback,
-    WorkflowLanePlanCallback, WorkflowLaunchAdmission, WorkflowPermitClaim, WorkflowResolvedResume,
-    WorkflowResumeInput, WorkflowRunCall, WorkflowScriptHost, WorkflowStateStore,
-    WorkflowStopChild, WorkflowTraceCallback, run_workflow_script, validate_workflow_script,
+    WORKFLOW_CHILD_MARKER, WORKFLOW_DEFAULT_TIMEOUT_MS, WORKFLOW_SETTLE_DRAIN_TIMEOUT_MS,
+    WorkflowEmitCallback, WorkflowHostStepCallback, WorkflowLanePlanCallback,
+    WorkflowLaunchAdmission, WorkflowPermitClaim, WorkflowResolvedResume, WorkflowResumeInput,
+    WorkflowRunCall, WorkflowScriptHost, WorkflowStateStore, WorkflowStopChild,
+    WorkflowTraceCallback, refuse_nested_workflow, run_workflow_script, validate_workflow_script,
 };
-pub use ops::ObservationKind;
+// `ObservationKind` and the op/extension declaration that used to live in this crate's own
+// `ops.rs` now live in `cyrup-workflow-runtime` (WORKFLOW_1 §7): a `build.rs` can never import
+// from the crate whose build it is running, so the ops had to move out before this crate could
+// grow one. `cyrup-ext-subagents/build.rs` depends on that crate to build the V8 startup snapshot;
+// `engine.rs` depends on it (as an ordinary dependency) to drive the runtime and to implement
+// [`cyrup_workflow_runtime::WorkflowOpsBridge`] over `RunShared`.
+pub use cyrup_workflow_runtime::ObservationKind;
 pub use git_ref::{BASE_REF_VALIDATION_ERROR, valid_git_ref};
 pub use json_value::{assert_workflow_json_value, format_workflow_json_preview};
 pub use permit::{
-    WorkflowChildContext, WorkflowChildPermit, WorkflowChildPermitError,
-    WorkflowChildPermitInput, WorkflowChildPermitInputError, WorkflowChildPermitLaunch,
+    WorkflowChildContext, WorkflowChildPermit, WorkflowChildPermitError, WorkflowChildPermitInput,
+    WorkflowChildPermitInputError, WorkflowChildPermitLaunch,
 };
 pub use preview::{SimpleWorkflowRunPreview, preview_simple_workflow_run};
 pub use recovery::{

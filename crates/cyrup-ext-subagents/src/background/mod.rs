@@ -94,7 +94,9 @@ pub use artifact_roots::{
 };
 pub(crate) use artifact_roots::{cwd_key, temp_root_dir, temp_root_dir_from};
 pub use records::{ParallelGroupStatus, ResultFile, RunStatus, StepStatus};
-pub use run_history::{RunHistoryEntry, record_run_history, run_history_path, run_history_path_for};
+pub use run_history::{
+    RunHistoryEntry, record_run_history, run_history_path, run_history_path_for,
+};
 pub use run_id::RunId;
 pub use run_id_resolver::{
     AsyncRunLocation, ResolveRunIdError, find_async_run_prefix_matches, resolve_async_run_id,

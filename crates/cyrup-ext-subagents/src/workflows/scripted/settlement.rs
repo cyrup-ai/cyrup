@@ -101,11 +101,16 @@ mod tests {
 
     #[test]
     fn runs_beat_steers_beat_hosts() {
-        let decision =
-            CompletionSettlement::decide(keys(&["a", "b"]), keys(&["s"]), keys(&["h"]));
-        assert_eq!(decision, CompletionSettlement::UnawaitedRuns(keys(&["a", "b"])));
+        let decision = CompletionSettlement::decide(keys(&["a", "b"]), keys(&["s"]), keys(&["h"]));
+        assert_eq!(
+            decision,
+            CompletionSettlement::UnawaitedRuns(keys(&["a", "b"]))
+        );
         let decision = CompletionSettlement::decide(vec![], keys(&["s"]), keys(&["h"]));
-        assert_eq!(decision, CompletionSettlement::UnawaitedSteers(keys(&["s"])));
+        assert_eq!(
+            decision,
+            CompletionSettlement::UnawaitedSteers(keys(&["s"]))
+        );
         let decision = CompletionSettlement::decide(vec![], vec![], keys(&["h"]));
         assert_eq!(decision, CompletionSettlement::UnawaitedHosts(keys(&["h"])));
     }

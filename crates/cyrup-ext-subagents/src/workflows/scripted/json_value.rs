@@ -108,7 +108,10 @@ mod tests {
         // (3 units exactly).
         assert_eq!(format_workflow_json_preview(&value, 3).unwrap(), "\"😀");
         // No ellipsis appended.
-        assert_eq!(format_workflow_json_preview(&value, 100).unwrap(), "\"😀😀\"");
+        assert_eq!(
+            format_workflow_json_preview(&value, 100).unwrap(),
+            "\"😀😀\""
+        );
     }
 
     #[test]
