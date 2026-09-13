@@ -9,6 +9,9 @@ pub(crate) mod background;
 pub(crate) mod chain;
 pub(crate) mod control;
 pub(crate) mod foreground;
+pub(crate) mod foreground_actions;
+pub(crate) mod foreground_control;
+pub(crate) mod foreground_history;
 pub(crate) mod nested_control;
 pub(crate) mod notices;
 pub(crate) mod paths;
@@ -18,6 +21,9 @@ pub(crate) mod resolve;
 pub(crate) mod session_state;
 pub(crate) mod spawn_budget;
 pub(crate) mod status;
+pub(crate) mod workflow;
+pub(crate) mod workflow_controllers;
+pub(crate) mod workflow_steering;
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -28,6 +34,7 @@ use crate::background::tracker::JobTracker;
 use crate::extension::executor::notices::ForegroundControlEntry;
 use crate::extension::executor::session_state::{ParentModelMemory, ParentThinkingMemory};
 use crate::extension::executor::spawn_budget::SpawnBudget;
+use crate::extension::executor::workflow_controllers::WorkflowController;
 use crate::registration::SubagentExtensionConfig;
 
 /// The shared executor both the `subagent` tool and every slash-command handler dispatch through
@@ -59,6 +66,14 @@ pub struct SubagentExecutor {
     /// session's watcher is REPLACED on every `SessionStart`, and a bus recreated with it would
     /// hand every already-subscribed waiter a `Closed` receiver.
     completion_bus: crate::background::watch::CompletionBus,
+    /// This executor's consumed-payload record (pi `SubagentState.completedResults`,
+    /// `shared/types.ts:2260`): the seam that keeps a completion visible to `wait` after its
+    /// payload has been consumed and deleted (`watch/install.rs`'s delete-last).
+    ///
+    /// Owned here for the same reason [`Self::completion_bus`] above is: the session's completion
+    /// watcher is REPLACED on every `SessionStart`, and a store recreated with it would drop every
+    /// record a `wait` in flight is about to read.
+    wait_completions: std::sync::Arc<crate::background::wait_completions::WaitCompletionStore>,
     /// `ASYNC_NOTIFY_BUG_REPORT` F3.5 — the claim/answer ledger the `wait` tool (and the headless
     /// auto-drain) share with the completion watcher's delivery decorator
     /// ([`crate::background::watch::InlineAnsweredSink`]), so a value a live wait already
@@ -120,6 +135,41 @@ pub struct SubagentExecutor {
     /// pi `fanout-child.ts:53-128`) to service an interrupt/resume request a grandparent orchestrator
     /// addressed at a run nested inside THIS process.
     foreground_controls: Arc<std::sync::Mutex<HashMap<String, ForegroundControlEntry>>>,
+    /// pi `state.workflowControllers` (`shared/types.ts:2269-2270`; created `subagent-executor.ts:4828`,
+    /// populated `:5098`, drained `:5272`/`:5796`, aborted-and-cleared `extension/index.ts:1038-1041`):
+    /// every workflow shell THIS process is currently driving, keyed by its workflow run id
+    /// (WORKFLOW_6 §2).
+    ///
+    /// Keyed by [`crate::background::RunId`], not `String` — unlike `foreground_controls` above,
+    /// which is keyed by `String` only because `resolve_nested_control_request` and
+    /// `is_live_foreground_run` do PREFIX matching over its keys (`nested_control.rs:200-210`).
+    /// Nothing prefix-matches a workflow id: every consumer does an exact `has(runId)`/`keys()`, so
+    /// the typed key is free and keeps the parse at the boundary.
+    ///
+    /// `std::sync::Mutex`, matching `foreground_controls`: every access is a short synchronous
+    /// insert/remove/contains with no `.await` inside the critical section.
+    workflow_controllers: Arc<std::sync::Mutex<HashMap<crate::background::RunId, WorkflowController>>>,
+    /// pi `state.foregroundRuns` (`shared/types.ts`; written by `rememberForegroundRun`,
+    /// `subagent-executor.ts:749-753`; bounded at `:716-722`): settled foreground runs still worth
+    /// inspecting, keyed by run id (WORKFLOW_7 §2.5).
+    ///
+    /// Distinct from `foreground_controls` above in exactly one way that matters: an entry here is
+    /// created when a run SETTLES, and `foreground_controls`' entry for the SAME id is removed at
+    /// that exact point (`foreground.rs::settle_foreground_run`) — the two maps are disjoint by
+    /// construction, which is what `tui/fleet.rs`'s `!active_foreground_ids.contains(...)` assumes
+    /// and what pi's own `fleet-view.ts:406-408` filter re-checks.
+    ///
+    /// A SUPERSET of what `persist_foreground_run_history` writes to disk: every settled status is
+    /// remembered here; only the four RESTORABLE ones (`foreground_history::record::RESTORABLE`)
+    /// are ever persisted.
+    foreground_runs: Arc<
+        std::sync::Mutex<
+            HashMap<
+                crate::background::RunId,
+                crate::extension::executor::foreground_history::ForegroundHistoryRun,
+            >,
+        >,
+    >,
     /// The per-SESSION subagent spawn budget (pi `SubagentState.subagentSpawns`,
     /// `shared/types.ts:842`: `{ sessionId: string | null; count: number }`). Charged UP FRONT by
     /// [`Self::reserve_subagent_spawns`] at every accepted execution dispatch, so a run that later
@@ -191,6 +241,9 @@ impl SubagentExecutor {
             completion_sink_override: None,
             completion_watcher: AsyncMutex::new(None),
             completion_bus: crate::background::watch::CompletionBus::new(),
+            wait_completions: Arc::new(
+                crate::background::wait_completions::WaitCompletionStore::default(),
+            ),
             inline_answers: crate::background::watch::InlineAnswerLedger::default(),
             host_services: Arc::new(OnceLock::new()),
             root_parent_session: Arc::new(std::sync::Mutex::new(None)),
@@ -199,6 +252,8 @@ impl SubagentExecutor {
             delivery: Arc::new(crate::tui::intercom::NoTransportChannel),
             clarify: Arc::new(crate::tui::intercom::AskLock::new_with_no_live_channel()),
             foreground_controls: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            workflow_controllers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            foreground_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             spawn_budget: std::sync::Mutex::new(SpawnBudget::default()),
             parent_model_memory: std::sync::Mutex::new(ParentModelMemory::default()),
             parent_thinking_memory: std::sync::Mutex::new(ParentThinkingMemory::default()),
@@ -304,6 +359,16 @@ impl SubagentExecutor {
     #[must_use]
     pub fn completion_bus(&self) -> crate::background::watch::CompletionBus {
         self.completion_bus.clone()
+    }
+
+    /// A handle on this executor's consumed-payload record (see the field), for the `wait`
+    /// surfaces that resolve a completion the watcher has already deleted. Cloning the `Arc`
+    /// shares the one map, mirroring [`Self::completion_bus`].
+    #[must_use]
+    pub fn wait_completions(
+        &self,
+    ) -> std::sync::Arc<crate::background::wait_completions::WaitCompletionStore> {
+        Arc::clone(&self.wait_completions)
     }
 
     /// `ASYNC_NOTIFY_BUG_REPORT` F3.5 — a handle on this executor's inline-answer ledger (see the

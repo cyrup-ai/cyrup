@@ -32,11 +32,21 @@ use crate::context::{Context, ToolDef};
 use crate::model::{Modality, Model, ModelCost};
 use crate::stream::sse::decode_sse_bytes;
 use crate::stream::{CacheRetention, StreamEvent, StreamOptions};
+use crate::utils::provider_plumbing::EnvSource;
 use cyrup_core::{
     ApiId, AssistantMessage, Content, Message, ModelThinkingLevel, ProviderId, StopReason,
     ToolCall, ToolCallId, Usage,
 };
 use serde_json::{Map, Value, json};
+
+/// An `EnvSource` with an explicit (possibly empty) ambient map, so no test can be influenced by
+/// the developer's shell (mirrors `bedrock_converse_stream::tests::env_source`).
+fn env_source<'a>(overlay: Option<&'a ProviderEnv>, ambient: &'a ProviderEnv) -> EnvSource<'a> {
+    EnvSource {
+        overlay,
+        ambient: Some(ambient),
+    }
+}
 
 fn auth_with(api_key: Option<&str>) -> AuthResult {
     AuthResult {

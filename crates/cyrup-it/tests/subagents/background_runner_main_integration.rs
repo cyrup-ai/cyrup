@@ -2189,6 +2189,7 @@ async fn stopping_a_mid_flight_run_ends_it_stopped_not_paused_and_not_failed() {
         &results_dir,
         run_id.as_str(),
         None,
+        None,
     )
     .await
     .expect_err("resume must refuse a stopped run");

@@ -243,7 +243,7 @@ fn constrained_sampling_drives_completions_strict_flag() {
 
     ctx.tools = vec![tool(StrictSampling::Require)];
     assert_eq!(
-        build_body_with_env(&model(), &ctx, &StreamOptions::default(), None),
+        build_body_with_env(&model(), &ctx, &StreamOptions::default(), EnvSource::default()),
         Err(ConstrainedSamplingError(
             "Tool \"calc\" requires JSON-schema constrained sampling, but strict tools are unsupported."
                 .to_string()

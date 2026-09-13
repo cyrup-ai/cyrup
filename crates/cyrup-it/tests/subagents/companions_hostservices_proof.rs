@@ -211,6 +211,8 @@ fn completed_result(run_id: &str) -> ResultFile {
         cwd: PathBuf::from("/tmp"),
         session_file: None,
         results: Vec::new(),
+        workflow_children: None,
+        workflow_receipt: None,
     }
 }
 

@@ -54,7 +54,6 @@ mod capabilities;
 mod config;
 mod convert;
 mod driver;
-mod env;
 mod errors;
 mod events;
 mod failure;

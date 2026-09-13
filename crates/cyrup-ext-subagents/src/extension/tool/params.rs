@@ -85,6 +85,14 @@ pub(crate) fn normalize_public_subagent_execution(
 pub(crate) struct SubagentToolParams {
     pub(crate) agent: Option<String>,
     pub(crate) task: Option<String>,
+    /// pi `workflowScript` (`extension/schemas.ts:348`) — an inline JavaScript statement body,
+    /// executed by [`crate::workflows::scripted::run_workflow_script`].
+    ///
+    /// A FOURTH execution mode, mutually exclusive with `agent`/`tasks`/`chain` and with `action`
+    /// (except `action: "validate"`, which checks a script without running it —
+    /// `schemas.ts:288`). Note the asymmetry is enforced by CONTROL FLOW, not by the mode gate:
+    /// `Tool::execute` dispatches `action` and returns at `mod.rs:222-224`, above the gate.
+    pub(crate) workflow_script: Option<String>,
     pub(crate) action: Option<String>,
     pub(crate) id: Option<String>,
     pub(crate) run_id: Option<String>,
@@ -499,6 +507,9 @@ impl SubagentToolParams {
         }
         if self.task.is_some() {
             keys.push("task");
+        }
+        if self.workflow_script.is_some() {
+            keys.push("workflowScript");
         }
         if self.action.is_some() {
             keys.push("action");

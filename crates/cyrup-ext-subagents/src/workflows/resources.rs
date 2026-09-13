@@ -20,8 +20,8 @@ use crate::identity::SessionId;
 
 use super::key::WorkflowKey;
 use super::permit::{
-    WorkflowResourceAuthority, WorkflowResourceHostAuthority, WorkflowResourcePermit,
-    WorkflowResourcePermitInput, WorkflowResourceProvenance,
+    WorkflowResourceAuthority, WorkflowResourceHostAuthority, WorkflowResourceId,
+    WorkflowResourcePermit, WorkflowResourcePermitInput, WorkflowResourceProvenance,
 };
 use super::stable_json::stable_json_digest;
 
@@ -324,7 +324,11 @@ impl WorkflowResourceRegistry {
         }
         // `randomUUID()` — the HYPHENATED 36-char form (SCOPE_3d §0.22), which lands on the wire
         // as `WorkflowResourceProvenance.id`; deliberately not `RunId::new`'s `as_simple` idiom.
-        let resource_id = uuid::Uuid::new_v4().to_string();
+        // A hyphenated UUIDv4 always matches `WorkflowResourceId`'s grammar (WORKFLOW_3 §0.10), so
+        // this `ok_or_else` names an internal-error diagnostic that never actually fires rather
+        // than `.expect`ing it away (this crate denies `clippy::expect_used` outside tests).
+        let resource_id = WorkflowResourceId::parse(&uuid::Uuid::new_v4().to_string())
+            .ok_or_else(|| "internal error: minted resource id failed its own grammar.".to_string())?;
         let permit = WorkflowResourcePermit::issue(WorkflowResourcePermitInput {
             resource_name: resource.name.clone(),
             resource_version: resource.version,
@@ -592,10 +596,14 @@ mod tests {
             resolved.script,
             "return (await runs.run(\"review\", { agent: \"reviewer\", task: \"check the diff \\\"now\\\"\" })).output;"
         );
-        assert_eq!(resolved.provenance.version, 1);
+        assert_eq!(resolved.provenance.version.value(), 1);
         assert_eq!(resolved.provenance.name.as_str(), "review");
-        assert_eq!(resolved.provenance.id.len(), 36, "hyphenated UUID (§0.22)");
-        assert_eq!(resolved.provenance.id.matches('-').count(), 4);
+        assert_eq!(
+            resolved.provenance.id.as_str().len(),
+            36,
+            "hyphenated UUID (§0.22)"
+        );
+        assert_eq!(resolved.provenance.id.as_str().matches('-').count(), 4);
         assert_eq!(resolved.provenance, *resolved.permit.provenance());
         let consumption = resolved
             .permit

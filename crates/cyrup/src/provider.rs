@@ -36,7 +36,7 @@
 //! Hence every entry point takes the loaded [`ModelFile`]; pass `&ModelFile::default()` when there
 //! is deliberately no user config in play.
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, LazyLock};
 
 use anyhow::bail;
 use cyrup_config::ModelFile;
@@ -44,29 +44,28 @@ use cyrup_config::models_store::FileModelsStore;
 use cyrup_config::policy::NetworkPolicy;
 use cyrup_provider::unconfigured::UnconfiguredProvider;
 use cyrup_provider::{
-    CatalogOverlay, CreateModelsOptions, Credential, InMemoryCredentialStore, Models, ModelsStore,
-    Provider, RefreshOptions, RemoteCatalog,
+    CatalogOverlay, CatalogOverlaySlot, CreateModelsOptions, Credential, InMemoryCredentialStore,
+    ModelCatalogService, Models, ModelsStore, Provider, RefreshOptions, RemoteCatalog,
 };
 use cyrup_sdk::core::ProviderId;
 
-/// The process-wide runtime model-catalog overlay (DRIFT-007).
+/// The process-wide runtime model-catalog overlay (DRIFT-007 + XAI_3).
 ///
-/// `None` — the value at process start and after any failure — means "embedded catalogs only",
-/// which is exactly the pre-DRIFT-007 behavior. A slot rather than a `OnceLock` because the
-/// background refresh re-installs a newer overlay when one arrives; every registry build here is
-/// already constructed fresh per call ([`composed_registry`]), so the next read simply picks it up
-/// with no live mutation and no lock on the streaming path.
-static CATALOG_OVERLAY: RwLock<Option<Arc<CatalogOverlay>>> = RwLock::new(None);
+/// An empty slot — the value at process start and after any failure — means "embedded catalogs
+/// only", which is exactly the pre-DRIFT-007 behavior. `CatalogOverlaySlot` rather than a bare
+/// `RwLock<Option<..>>` because it is now the SAME type
+/// [`AgentSessionServices::catalog_overlay`](cyrup_session_svc::AgentSessionServices) reads through
+/// — [`model_catalog_service`] hands out THIS slot, so a session built with it installs into and
+/// reads from the identical place every trigger below does. Every registry build here is already
+/// constructed fresh per call ([`composed_registry`]), so the next read simply picks up a fresher
+/// install with no live mutation and no lock on the streaming path.
+static CATALOG_OVERLAY: LazyLock<Arc<CatalogOverlaySlot>> =
+    LazyLock::new(|| Arc::new(CatalogOverlaySlot::new()));
 
 fn active_catalog_overlay() -> Option<Arc<CatalogOverlay>> {
-    // A poisoned lock degrades to "no overlay" — never a panic, never fewer models than embedded.
-    CATALOG_OVERLAY.read().ok().and_then(|g| g.clone())
-}
-
-fn install_catalog_overlay(overlay: Option<Arc<CatalogOverlay>>) {
-    if let Ok(mut slot) = CATALOG_OVERLAY.write() {
-        *slot = overlay;
-    }
+    // Poison-safe by construction — `CatalogOverlaySlot::load` degrades to "no overlay", never a
+    // panic, never fewer models than embedded (R-00-009).
+    CATALOG_OVERLAY.load()
 }
 
 /// The disk-backed remote catalog: `<agent_dir>/models-store.json` behind the pi.dev fetcher, with
@@ -76,7 +75,10 @@ fn remote_catalog(dirs: &cyrup_config::ConfigDirs) -> Arc<RemoteCatalog> {
     let store: Arc<dyn ModelsStore> = Arc::new(FileModelsStore::for_dirs(dirs));
     Arc::new(
         RemoteCatalog::new(store)
-            .with_local_generated_at(cyrup_provider::builtin_model_data_generated_at()),
+            .with_local_generated_at(cyrup_provider::builtin_model_data_generated_at())
+            .with_local_generated_at_by_provider(
+                cyrup_provider::builtin_model_data_generated_at_by_provider(),
+            ),
     )
 }
 
@@ -124,9 +126,16 @@ pub fn pi_dev_catalog_providers(configured: &[String]) -> Vec<String> {
 pub async fn restore_model_catalog(dirs: &cyrup_config::ConfigDirs) {
     let catalog = remote_catalog(dirs);
     let all_ids = all_provider_ids();
-    let refs: Vec<&str> = all_ids.iter().map(String::as_str).collect();
-    let overlay = catalog.load_overlay(&refs).await;
-    install_catalog_overlay((!overlay.is_empty()).then(|| Arc::new(overlay)));
+    // CACHE_ONLY never fetches, so nothing is in the fetch list — this reads the store, never the
+    // network, exactly as the disk-only restore this replaces did.
+    let _ = cyrup_provider::catalog_refresh::refresh_and_install(
+        &catalog,
+        &[],
+        &all_ids,
+        RefreshOptions::CACHE_ONLY,
+        &CATALOG_OVERLAY,
+    )
+    .await;
 }
 
 /// **The modes that are allowed to touch the network for catalogs — and only those.**
@@ -206,15 +215,16 @@ pub fn spawn_model_catalog_refresh_with(
     let all_ids = all_provider_ids();
     let configured_providers = pi_dev_catalog_providers(&configured_providers);
     Some(tokio::spawn(async move {
-        let refs: Vec<&str> = configured_providers.iter().map(String::as_str).collect();
         // Best-effort: per-provider errors are collected, not propagated, and are deliberately not
         // surfaced to the user — a catalog that could not be refreshed is simply the embedded one.
-        let _errors = catalog
-            .refresh_providers(&refs, RefreshOptions::network())
-            .await;
-        let all_refs: Vec<&str> = all_ids.iter().map(String::as_str).collect();
-        let overlay = catalog.load_overlay(&all_refs).await;
-        install_catalog_overlay((!overlay.is_empty()).then(|| Arc::new(overlay)));
+        let _errors = cyrup_provider::catalog_refresh::refresh_and_install(
+            &catalog,
+            &configured_providers,
+            &all_ids,
+            RefreshOptions::network(),
+            &CATALOG_OVERLAY,
+        )
+        .await;
     }))
 }
 
@@ -270,19 +280,29 @@ pub async fn refresh_model_catalogs_with(
     catalog: Arc<RemoteCatalog>,
     configured: Vec<String>,
 ) -> Result<(), String> {
-    let errors = {
-        let configured = pi_dev_catalog_providers(&configured);
-        let refs: Vec<&str> = configured.iter().map(String::as_str).collect();
-        match tokio::time::timeout(
-            MODELS_REFRESH_TIMEOUT,
-            catalog.refresh_providers(&refs, RefreshOptions::forced()),
-        )
-        .await
-        {
-            Ok(errors) => errors,
-            // `if (result.aborted) throw new Error("Model catalog refresh timed out.")` (`:411-413`).
-            Err(_elapsed) => return Err("Model catalog refresh timed out.".to_string()),
-        }
+    let all_ids = all_provider_ids();
+    let configured = pi_dev_catalog_providers(&configured);
+    // The install half is now `refresh_and_install`'s (XAI_3) — the same fetch-then-reload-then-
+    // install sequence [`restore_model_catalog`]/[`spawn_model_catalog_refresh_with`] run, sharing
+    // this process's ONE overlay slot. The 15s bound still wraps the WHOLE sequence (Pi's own
+    // `AbortController` scope, `:403-404`): a timeout drops the future mid-flight — including a
+    // not-yet-reached install — so a timed-out run never installs a partial result, exactly as
+    // today.
+    let errors = match tokio::time::timeout(
+        MODELS_REFRESH_TIMEOUT,
+        cyrup_provider::catalog_refresh::refresh_and_install(
+            &catalog,
+            &configured,
+            &all_ids,
+            RefreshOptions::forced(),
+            &CATALOG_OVERLAY,
+        ),
+    )
+    .await
+    {
+        Ok(errors) => errors,
+        // `if (result.aborted) throw new Error("Model catalog refresh timed out.")` (`:411-413`).
+        Err(_elapsed) => return Err("Model catalog refresh timed out.".to_string()),
     };
 
     if !errors.is_empty() {
@@ -295,15 +315,39 @@ pub async fn refresh_model_catalogs_with(
             .join("; ");
         return Err(format!("Could not refresh model catalogs: {details}"));
     }
-
-    // The freshly persisted catalogs are the overlay this process would read from here on. Nothing
-    // else runs in a `cyrup update --models` process, but installing it keeps the in-memory view and
-    // the store from disagreeing for any caller that follows.
-    let all_ids = all_provider_ids();
-    let all_refs: Vec<&str> = all_ids.iter().map(String::as_str).collect();
-    let overlay = catalog.load_overlay(&all_refs).await;
-    install_catalog_overlay((!overlay.is_empty()).then(|| Arc::new(overlay)));
     Ok(())
+}
+
+/// The shared catalog service handed to `SessionBuilder` (XAI_3). The network posture is resolved
+/// HERE because `cyrup-session-svc` deliberately has no `NetworkPolicy`
+/// (`session-svc/src/builder.rs:1277-1279`) — the same threading rule `install_missing_packages`
+/// already follows.
+///
+/// It takes NO provider list: the credential-gated set is resolved per call by the session
+/// (FINDING 4), so a `/login` during the session is picked up without rebuilding this. An offline
+/// run gets a `CACHE_ONLY` service — `/model` still reloads the persisted overlay from disk and
+/// reports a clean result, and never issues a request.
+///
+/// Shares THIS process's `CATALOG_OVERLAY` slot — not a fresh one — so a session built with this
+/// service observes exactly the same installs [`restore_model_catalog`],
+/// [`spawn_model_catalog_refresh_with`] and [`refresh_model_catalogs_with`] make, and its own
+/// `/model` refresh is in turn visible to `active_catalog_overlay()` for the rest of this process.
+pub fn model_catalog_service(
+    dirs: &cyrup_config::ConfigDirs,
+    policy: NetworkPolicy,
+    mode: cyrup_config::trust::AppMode,
+) -> Arc<ModelCatalogService> {
+    let catalog = remote_catalog(dirs);
+    let options = if mode_refreshes_catalogs(mode) && policy.allow_model_catalog_refresh() {
+        RefreshOptions::network()
+    } else {
+        RefreshOptions::CACHE_ONLY
+    };
+    Arc::new(
+        ModelCatalogService::new(catalog, Arc::clone(&CATALOG_OVERLAY))
+            .with_overlay_providers(all_provider_ids())
+            .with_options(options),
+    )
 }
 
 /// The composed registry (built-ins + `models.json`) over an optional runtime `--api-key`

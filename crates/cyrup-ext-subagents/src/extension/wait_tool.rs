@@ -158,15 +158,39 @@ impl Tool for WaitTool {
         .with_completion_bus(Some(self.executor.completion_bus()))
         // ASYNC_NOTIFY_BUG_REPORT F3.4 — share the executor's inline-answer ledger, so the runs
         // this wait answers inline are not re-announced as standalone notifications.
-        .with_inline_answers(Some(self.executor.inline_answers()));
-        match crate::background::wait::wait_for_subagents(&parsed, &cancel, &deps).await {
-            Ok(text) => Ok(ToolResult {
-                content: vec![cyrup_core::Content::text(text)],
-                details: Some(serde_json::json!({ "mode": "management" })),
-                terminate: TerminateHint::Unspecified,
-                ..Default::default()
-            }),
-            Err(message) => Err(ToolError::new(message)),
+        .with_inline_answers(Some(self.executor.inline_answers()))
+        // The executor-owned consumed-payload record, so a completion the watcher already
+        // delivered and deleted still resolves for a wait that lands a moment later.
+        .with_wait_completions(self.executor.wait_completions());
+        let outcome = crate::background::wait::wait_for_subagents(&parsed, &cancel, &deps).await;
+        // cyrup's `Tool::execute` returns `Result<ToolResult, ToolError>` and the host maps `Err`
+        // onto the result's error flag (`cyrup-core/src/tool.rs`: "Tools signal failure by
+        // returning `Err(ToolError)`"), which is the same observable as pi's `isError`.
+        //
+        // It carries no loss. Upstream's error `result(…, true)` sites all pass TWO arguments —
+        // the third, `completions`, is supplied only at the two terminal returns
+        // (`subagent-wait.ts:752`, `:769`) — so the sole errored-result-with-completions case is
+        // the `failOnFailedRuns`/`failOnAttention` flip (`:751`/`:768`). The `wait` TOOL leaves
+        // both flags `false` (`WaitDeps::for_cwd`, `background/wait.rs`, overridden nowhere
+        // above), so for THIS caller `is_error()` implies `completions.is_empty()`. Auto-drain —
+        // the one caller that does set them — takes the whole `WaitOutcome` and keeps everything.
+        if outcome.is_error() {
+            return Err(ToolError::new(outcome.text));
         }
+        // pi `completionUsage(completions)` → `AgentToolResult.usage` (`subagent-wait.ts:318`,
+        // `:338`, `:345`); `ToolResult::usage` is `Option<cyrup_core::Usage>`, which is exactly
+        // `completion_usage`'s return type — no conversion.
+        let usage = outcome.usage();
+        // pi's `details` — `mode`, `results: []`, `completions` when non-empty, and the
+        // `wait: { reason: "window_elapsed", … }` block a timed-out wait now carries instead of
+        // failing the call.
+        let details = Some(outcome.details());
+        Ok(ToolResult {
+            content: vec![cyrup_core::Content::text(outcome.text)],
+            usage,
+            details,
+            terminate: TerminateHint::Unspecified,
+            ..Default::default()
+        })
     }
 }

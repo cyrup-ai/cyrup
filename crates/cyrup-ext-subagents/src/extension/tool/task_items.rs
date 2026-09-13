@@ -753,6 +753,24 @@ pub(crate) fn count_requested_subagent_spawns(
     params: &SubagentToolParams,
     cfg: &SubagentExtensionConfig,
 ) -> u32 {
+    // WORKFLOW_2 — a workflow discovers its children at runtime, so there is no static count to
+    // bill. The worst case IN FLIGHT is its concurrency ceiling, which is what the engine actually
+    // enforces (it seeds its semaphore from
+    // `global_concurrency_limit.unwrap_or(DEFAULT_GLOBAL_CONCURRENCY_LIMIT)`) — bill that. Billing
+    // 0 would let a workflow fan out entirely unbilled against `max_subagent_spawns_per_session`;
+    // billing "unbounded" would refuse every workflow on a session that had already spent
+    // anything.
+    //
+    // NOTE the path: the constant is `crate::spawn::parallel`'s (`parallel.rs:36`, `usize = 20`),
+    // NOT a `workflows::scripted` re-export — `scripted/mod.rs`'s `pub use engine::{…}` does not
+    // include it.
+    //
+    // Placed first purely for readability: the mode-exclusivity gate in `Tool::execute` has
+    // already guaranteed exactly one mode is set by the time this runs.
+    if params.workflow_script.is_some() {
+        return u32::try_from(crate::spawn::parallel::DEFAULT_GLOBAL_CONCURRENCY_LIMIT)
+            .unwrap_or(u32::MAX);
+    }
     if let Some(tasks) = params.tasks.as_ref() {
         return u32::try_from(tasks.len()).unwrap_or(u32::MAX);
     }

@@ -159,6 +159,8 @@ mod tests {
             session_id,
             completion_owner_id,
             results: Vec::new(),
+            workflow_children: None,
+            workflow_receipt: None,
         }
     }
 

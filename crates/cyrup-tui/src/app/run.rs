@@ -174,6 +174,11 @@ impl App<InlineBackend<Stdout>> {
         // events and final outcome. Installed for the same reason `tree_nav_rx` is — the flow must
         // not run on this task, or no keystroke could ever answer its prompts.
         let mut login_rx = self.install_login_channel();
+        // The `/model` catalog-refresh channel (XAI_4). Installed for the same reason `login_rx` is:
+        // the refresh is a 15 s-bounded network round trip, so it must not run on this task — the
+        // picker Pi renders BEFORE the refresh starts (`model-selector.ts:153-158`) would otherwise
+        // not reach a frame until the refresh settled.
+        let mut model_refresh_rx = self.install_model_refresh_channel();
         // The `/compact` outcome channel (TUI-055). Installed for exactly the same reason as
         // `tree_nav_rx`: a 10–20 s provider call awaited on THIS task freezes every other arm, so
         // the compaction status band Pi shows for the whole operation never reaches a frame.
@@ -428,6 +433,7 @@ impl App<InlineBackend<Stdout>> {
                 Some(warning) = tmux_warning_rx.recv() => self.on_tmux_warning(warning)?,
                 Some(theme) = theme_switch_rx.recv() => self.on_theme_switch(&mut ctx, theme).await?,
                 Some(msg) = login_rx.recv() => self.on_login_msg(msg)?,
+                Some(msg) = model_refresh_rx.recv() => self.on_model_refresh_msg(&mut ctx, msg)?,
                 Some(msg) = tree_nav_rx.recv() => self.on_tree_nav_msg(&mut ctx, msg).await?,
                 Some(msg) = share_rx.recv() => self.on_share_msg(msg)?,
                 // A refutable pattern: a `None` from a closed stream does NOT match `Some(ev)`, so

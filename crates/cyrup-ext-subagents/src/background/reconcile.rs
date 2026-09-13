@@ -586,6 +586,8 @@ async fn synthesize_failure(
         session_id: status.session_id.clone(),
         completion_owner_id: status.completion_owner_id.clone(),
         results: synthesized_results,
+        workflow_children: None,
+        workflow_receipt: None,
     };
 
     // pi `stale-run-reconciler.ts:283` writes the repaired result only `if (repair.result.sessionId)`.
@@ -921,6 +923,8 @@ mod tests {
             session_id: None,
             completion_owner_id: None,
             results: Vec::new(),
+            workflow_children: None,
+            workflow_receipt: None,
         };
         crate::background::atomic::write_atomic_json(&paths.legacy_result_root, &result)
             .await
@@ -984,6 +988,8 @@ mod tests {
             session_id: None,
             completion_owner_id: None,
             results: Vec::new(),
+            workflow_children: None,
+            workflow_receipt: None,
         };
         crate::background::atomic::write_atomic_json(&paths.legacy_result_root, &result)
             .await
@@ -1047,6 +1053,8 @@ mod tests {
             session_id: None,
             completion_owner_id: None,
             results: Vec::new(),
+            workflow_children: None,
+            workflow_receipt: None,
         };
         crate::background::atomic::write_atomic_json(&paths.legacy_result_root, &result)
             .await

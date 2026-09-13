@@ -306,6 +306,13 @@ fn oauth_remaps_tool_names_to_claude_code() {
     }];
     let m = model();
     // build_params with is_oauth=true via direct call.
-    let body = build_params(&m, &ctx, &StreamOptions::default(), None, true).unwrap();
+    let body = build_params(
+        &m,
+        &ctx,
+        &StreamOptions::default(),
+        EnvSource::default(),
+        true,
+    )
+    .unwrap();
     assert_eq!(body["tools"][0]["name"], "Bash");
 }

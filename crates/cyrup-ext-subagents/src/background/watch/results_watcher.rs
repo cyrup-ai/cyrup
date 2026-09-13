@@ -62,6 +62,26 @@ pub const MISSING_PAYLOAD_GRACE_SCANS: u32 = 3;
 // CompletionNotification
 // =================================================================================================
 
+/// Which custody band a notification was observed through.
+///
+/// The three bands already exist as three arms of `deliver_pending_completions`
+/// (`watch/install.rs:318`, `:352`, `:373`), and they are already treated differently — only
+/// [`Self::Ours`] carries an entitlement to consume. Until now that distinction was visible only in
+/// the arm an observer was called from, which made it invisible TO the observer. An observer whose
+/// correctness depends on the band (pi's own recording position, `result-watcher.ts:408`/`:428`) —
+/// [`crate::background::wait_completions::WaitCompletionStore`] is the first — cannot be written
+/// without this field; adding it is the same "the answer travels in the type" move
+/// `deliver_pending_completions`'s own doc argues for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompletionBand {
+    /// This instance's own partition, ownership confirmed. The only consumable band.
+    Ours,
+    /// A live session that is not ours. Observed; the payload is left for its owner.
+    Foreign,
+    /// Reached through a cross-session band (tracked ids, mission observer). No entitlement.
+    Observed,
+}
+
 /// One notified-but-not-yet-deleted result, surfaced to the caller's own turn/prompt-handling path
 /// (R-SA-101: "MUST re-enter the orchestrator's normal turn/prompt-handling path"). This module
 /// does not itself know how to inject a message into a live session — that is a later phase's
@@ -71,14 +91,20 @@ pub const MISSING_PAYLOAD_GRACE_SCANS: u32 = 3;
 pub struct CompletionNotification {
     /// The parsed terminal result.
     pub result: ResultFile,
-    /// The on-disk path this result was read from — needed by
-    /// [`ResultsWatcher::consume`] to destroy the correct file.
+    /// The on-disk path this result was read from. Populated only for
+    /// [`CompletionBand::Observed`] (the tracked-run-id / mission-observer bands, which address a
+    /// payload directly rather than through this instance's own index partition):
+    /// [`ResultsWatcher::consume`] takes a
+    /// [`crate::background::result_index::ConsumablePayload`], not this path, so the other two
+    /// construction sites pass [`PathBuf::new`].
     pub result_path: PathBuf,
     /// `true` if this notification is being surfaced only because [`MAX_PROCESSING_ATTEMPTS`] was
     /// exceeded (R-SA-102's retry bound) — the caller should treat this as a terminal
     /// "give up, log/alert" signal rather than attempting normal turn-re-entry delivery again, since
     /// every prior attempt already failed.
     pub exhausted: bool,
+    /// Which custody band this notification was reached through — see [`CompletionBand`].
+    pub band: CompletionBand,
 }
 
 // =================================================================================================
@@ -162,6 +188,12 @@ pub struct ObservedResult {
 }
 
 /// What [`ResultsWatcher::inspect_candidate`] decided about one candidate.
+///
+/// `clippy::large_enum_variant` is deliberately allowed here, mirroring
+/// `registration::slash_commands`/`spawn::chain_graph`'s own precedent for the identical shape:
+/// `Ready`'s payload (widened again by WORKFLOW_3's `ResultFile` growth) is the whole POINT of
+/// this variant.
+#[allow(clippy::large_enum_variant)]
 enum CandidateOutcome {
     Ready(ResolvedCandidate),
     Missing(LossReport),

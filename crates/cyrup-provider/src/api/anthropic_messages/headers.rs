@@ -7,7 +7,7 @@ use crate::auth::AuthResult;
 use crate::context::Context;
 use crate::model::Model;
 use crate::stream::{CacheRetention, StreamOptions};
-use crate::utils::provider_plumbing::resolve_cache_retention;
+use crate::utils::provider_plumbing::{EnvSource, resolve_cache_retention};
 
 /// The Anthropic API version header value the SDK pins by default.
 pub(super) const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -121,7 +121,8 @@ pub(crate) fn build_headers(
             headers.insert("anthropic-beta".to_string(), Some(betas.join(",")));
         }
         // Session-affinity header when caching is enabled and the compat flag is set.
-        let cache = resolve_cache_retention(opts.cache_retention, auth.env.as_ref());
+        let cache =
+            resolve_cache_retention(opts.cache_retention, EnvSource::new(auth.env.as_ref()));
         if cache != CacheRetention::None
             && get_anthropic_compat(model).send_session_affinity_headers
             && let Some(sid) = &opts.session_id

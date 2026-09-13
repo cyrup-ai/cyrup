@@ -4,7 +4,7 @@
 //! pi `runs/background/subagent-runner.ts`.
 
 use super::entry::run_id_from_paths;
-use super::finish::finish_run;
+use super::finish::{WorkflowResultFields, finish_run};
 use crate::background::{RunId, RunMode, RunPaths, RunState, RunStatus};
 use crate::error::SubagentError;
 use crate::exec::ResolvedAgentPersona;
@@ -474,6 +474,7 @@ pub(super) async fn load_runner_config(
                 "runner-config.json was already consumed (double-invocation of the runner \
                  subcommand against the same --config path); nothing to run"
                     .to_string(),
+                WorkflowResultFields::default(),
             )
             .await;
             None
@@ -493,6 +494,7 @@ pub(super) async fn load_runner_config(
                 PathBuf::new(),
                 None,
                 format!("failed to read runner-config.json: {err}"),
+                WorkflowResultFields::default(),
             )
             .await;
             None

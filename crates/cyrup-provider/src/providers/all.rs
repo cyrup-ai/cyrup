@@ -120,6 +120,7 @@ use crate::providers::{
 };
 use crate::remote_catalog::CatalogOverlay;
 use crate::utils::http_date::parse_iso8601_utc_ms;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// The generation manifest for the compiled-in catalogs under `providers/catalog/` (Pi
@@ -143,6 +144,55 @@ pub fn builtin_model_data_generated_at() -> Option<i64> {
     serde_json::from_str::<Manifest>(BUILTIN_CATALOG_MANIFEST_JSON)
         .ok()
         .and_then(|m| parse_iso8601_utc_ms(&m.generated_at))
+}
+
+/// Per-provider staleness floors from the manifest's `catalogs` map, in epoch ms (XAI_1).
+///
+/// Most catalogs come from one pinned pi revision and are covered by
+/// [`builtin_model_data_generated_at`]. `xai` is fetched live at generation time
+/// (`xtask/src/live_catalog.rs`) and is therefore NEWER than the global stamp, so a floor of the
+/// global value alone would accept a persisted overlay older than the embedded rows and let it
+/// shadow them — the failure #7016 fixed, reintroduced here specifically for xai. Each entry is
+/// `max(per-catalog fetchedAt, global generatedAt)`, so this can only ever RAISE a floor relative
+/// to the global one, never lower one.
+///
+/// Entries with no `fetchedAt`, or one that does not parse, are omitted — [`RemoteCatalog`]'s
+/// [`load_overlay`] then falls back to the global floor for that provider, exactly as it did
+/// before this function existed.
+///
+/// [`RemoteCatalog`]: crate::remote_catalog::RemoteCatalog
+/// [`load_overlay`]: crate::remote_catalog::RemoteCatalog::load_overlay
+pub fn builtin_model_data_generated_at_by_provider() -> BTreeMap<String, i64> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Manifest {
+        generated_at: String,
+        #[serde(default)]
+        catalogs: BTreeMap<String, Entry>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Entry {
+        #[serde(default)]
+        fetched_at: Option<String>,
+    }
+
+    let Ok(manifest) = serde_json::from_str::<Manifest>(BUILTIN_CATALOG_MANIFEST_JSON) else {
+        return BTreeMap::new();
+    };
+    let global = parse_iso8601_utc_ms(&manifest.generated_at);
+    manifest
+        .catalogs
+        .into_iter()
+        .filter_map(|(provider, entry)| {
+            let fetched_at = entry.fetched_at.as_deref().and_then(parse_iso8601_utc_ms)?;
+            let floor = match global {
+                Some(g) => fetched_at.max(g),
+                None => fetched_at,
+            };
+            Some((provider, floor))
+        })
+        .collect()
 }
 
 /// Every built-in provider that is implemented in this crate, freshly constructed over a shared

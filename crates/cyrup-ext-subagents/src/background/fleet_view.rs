@@ -44,9 +44,13 @@
 //!    keeps the output path per step, on [`super::StepTelemetry::output_file`]), so the no-index
 //!    transcript form falls back to the per-step ladder rather than a run-wide output artifact.
 //! 4. **Foreground rows are thinner.** pi's `foregroundControls` entry carries `updatedAt`, token
-//!    and turn counters; cyrup's `ForegroundControlEntry` carries the interrupt token, the live
-//!    message-route coordinates and the activity state. [`ForegroundFleetEntry`] is exactly that
-//!    subset, and the row shape is otherwise pi's verbatim.
+//!    and turn counters; cyrup's `ForegroundControlEntry` (WORKFLOW_6) now ALSO carries session
+//!    and workflow identity (`session_id`/`parent_workflow_run_id`/`workflow_key`/`cwd`/
+//!    `session_name`/`active_children`), but [`ForegroundFleetEntry`] still projects only the
+//!    original four the TEXT fleet renderer reads plus the two (`session_id`,
+//!    `parent_workflow_run_id`) later gates need (WORKFLOW_11's S6 filter, `run-status.ts:611`) —
+//!    [`format_foreground_fleet_lines`] itself reads only the original four, so the rendered row
+//!    shape is unchanged.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -376,6 +380,13 @@ pub struct ForegroundFleetEntry {
     pub current_index: Option<usize>,
     /// The run's live control activity state (pi `control.currentActivityState`).
     pub activity_state: Option<ActivityState>,
+    /// pi `control.sessionId` (`fleet-view.ts:404`). Carried, NOT filtered on — see this module's
+    /// delta 4 and WORKFLOW_6 §3.3 (`fleet_state`'s own doc explains why stamping the CURRENT
+    /// session onto every entry would be wrong).
+    pub session_id: Option<crate::identity::SessionId>,
+    /// pi `control.parentWorkflowRunId` — WORKFLOW_11's S6 filter key, plumbed here so that task is
+    /// the gate alone and not a gate plus a projection change.
+    pub parent_workflow_run_id: Option<crate::background::RunId>,
 }
 
 /// pi `formatForegroundFleetLines` (`fleet-view.ts:233-255`).
@@ -1032,6 +1043,8 @@ mod tests {
                 current_agent: Some("reviewer".to_string()),
                 current_index: Some(2),
                 activity_state: Some(ActivityState::NeedsAttention),
+                session_id: None,
+                parent_workflow_run_id: None,
             }],
             &[],
             false,

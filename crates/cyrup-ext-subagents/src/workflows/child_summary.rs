@@ -10,7 +10,7 @@
 
 use serde_json::Value;
 
-use crate::background::{StepState, StepStatus};
+use crate::background::{RunId, StepState, StepStatus};
 
 use super::bounded::Bounded;
 use super::key::WorkflowKey;
@@ -672,6 +672,47 @@ impl RawChildShape {
     fn deserialize_from(value: &Value) -> Result<Self, serde_json::Error> {
         serde::Deserialize::deserialize(value)
     }
+}
+
+/// One [`StepStatus`] per settled workflow child, in launch order.
+///
+/// A workflow's steps are DISCOVERED, so this is the only inventory `status.steps` can ever have —
+/// there is no declared `RunnerStep` list to flatten the way `workflow_graph_from_run`
+/// (`workflow_graph.rs:708`) or `pending_step_statuses_for` (`flat_index.rs:99`) expect.
+///
+/// [`StepStatus::pending`] then mutate: the struct derives no [`Default`] (`records.rs:22`) and
+/// `pending` is its only constructor (`records.rs:148`).
+///
+/// The `agent ?? key` fallback is safe by construction: a child with no resolved agent also has no
+/// `run_id`, so [`workflow_child_summary`]'s `launch_resolved` guard (`:272`) drops the field
+/// before it can be displayed as an agent name.
+#[must_use]
+pub fn workflow_step_statuses(children: &[WorkflowScriptChildResult]) -> Vec<StepStatus> {
+    children
+        .iter()
+        .map(|child| {
+            let mut step =
+                StepStatus::pending(child.agent.clone().unwrap_or_else(|| child.key.clone()));
+            // Precedence matches `workflow_child_summary`'s pass 3 (`:302-312`) minus `detached`
+            // and `rejected`, neither of which `StepState` can represent: a detached child is
+            // reported through the receipt's resume entry, and acceptance rejection is a pass-3
+            // classification the steps pass never sees.
+            step.status = match (child.ok, child.stopped) {
+                (_, true) => StepState::Stopped,
+                (true, _) => StepState::Complete,
+                (false, _) => StepState::Failed,
+            };
+            // §2.2 — both fields exist for exactly this. `WorkflowKey::parse` is fallible
+            // (`key.rs:30`); a key the engine accepted parses here too, and a parse failure
+            // degrades the row's provenance rather than dropping the step.
+            step.workflow_key = crate::workflows::WorkflowKey::parse(&child.key).ok();
+            step.run_id = child.run_id.as_deref().map(RunId::from_token);
+            step.stopped = child.stopped;
+            step.interrupted = child.interrupted;
+            step.error = child.error.clone();
+            step
+        })
+        .collect()
 }
 
 #[cfg(test)]

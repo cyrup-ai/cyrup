@@ -89,7 +89,10 @@
 
 mod entry;
 mod enumerate;
-mod errno;
+// `pub(crate)`, not private: WORKFLOW_3's `workflows::receipt` module (outside this subtree)
+// needs `errno::is_absent` through the same door WORKFLOW_4's `wait_completions` will reuse for
+// `is_access_denied` — one declaration, made once, here.
+pub(crate) mod errno;
 mod exists;
 mod locate;
 mod paths;
@@ -105,9 +108,10 @@ pub use enumerate::{
 };
 pub use exists::indexed_result_exists;
 pub use locate::{
-    ConsumablePayload, PayloadResolution, PayloadState, ResultPayloadLocation, owned_payload_path,
-    resolve_payload, result_payload_path_for_indexed_run,
-    result_payload_path_for_mission_observer_run, result_payload_path_for_session_run,
+    ConsumablePayload, PayloadResolution, PayloadState, ResultPayloadLocation,
+    fallback_result_payload_path_for_session_run, owned_payload_path, resolve_payload,
+    result_payload_path_for_indexed_run, result_payload_path_for_mission_observer_run,
+    result_payload_path_for_session_run,
 };
 pub use promote::PromotionState;
 pub use remove::{remove_mission_observer_index, remove_result_index};

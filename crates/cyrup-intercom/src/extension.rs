@@ -98,6 +98,32 @@ pub struct IntercomExtension {
     /// `nativeSupervisorChannelAvailable` (`v0.10.1 index.ts:1504`), probed ONCE at construction the
     /// way [`read_child_orchestrator_metadata`] is, never re-read inside `init`.
     native_supervisor_channel: bool,
+    /// Whether intercom is genuinely INSTALLED (`CYRUP_INTERCOM`, or an
+    /// `<agent_dir>/intercom/config.json`), as opposed to this extension having attached only
+    /// through the child-metadata escape hatch in [`intercom_extension_for_env_concrete`], where
+    /// `metadata.is_some()` short-circuits the install gate.
+    ///
+    /// Used together with [`Self::native_supervisor_channel`] to decide who owns the bare tool
+    /// name `intercom` — see [`Self::init`] for the full argument. Probed ONCE at construction,
+    /// never re-read inside `init`, exactly as `native_supervisor_channel` above.
+    ///
+    /// ⚠ "This extension stands down" is NOT the same claim as "the other side stands up". The
+    /// subagents crate's native fallback needs BOTH `!intercom_available` AND `intercom` present in
+    /// `required_child_tools`; ownership here is decided against
+    /// [`Self::native_supervisor_channel`] alone, which is the term that governs whether that side
+    /// can register AT ALL. [`Self::init`] spells out the one state where both stand down, and why
+    /// that is intended.
+    ///
+    /// Both sides read the install marker at `<agent_dir>/intercom/config.json` over the SAME
+    /// agent-dir ladder — `cyrup_config::paths::cyrup_agent_dir_from`, i.e. `<home>/.cyrup/agent`.
+    /// That agreement is load-bearing and was once broken; see
+    /// [`crate::paths::agent_dir_path_from`]'s "Why the `/agent` component is load-bearing".
+    ///
+    /// Scope note: this pair governs the `intercom` name only. The separate `contact_supervisor`
+    /// gap — installed + native channel leaves that tool registered by neither provider — is NOT
+    /// addressed here and is not made worse; closing it needs a broker-vs-native routing decision
+    /// of its own.
+    installed: bool,
     clarify: Arc<IntercomClarifyChannel>,
     delivery: Arc<IntercomDeliveryChannel>,
     steer: Arc<IntercomSteerChannel>,
@@ -137,6 +163,11 @@ impl IntercomExtension {
             agent_dir,
             metadata,
             native_supervisor_channel: crate::identity::native_supervisor_channel_available(),
+            // "This attachment owns the name" — what every caller that did not reach the
+            // force-attach path means. `intercom_extension_for_env_concrete`, the ONE production
+            // constructor and the only one that has already probed the install state, overrides it
+            // via [`Self::with_installed`].
+            installed: true,
             clarify,
             delivery,
             steer,
@@ -148,6 +179,15 @@ impl IntercomExtension {
     #[must_use]
     pub fn with_native_supervisor_channel(mut self, available: bool) -> Self {
         self.native_supervisor_channel = available;
+        self
+    }
+
+    /// Override the install probe instead of reading the process environment — for
+    /// [`intercom_extension_for_env_concrete`], which has already computed it, and for tests, which
+    /// must not mutate process-global env state. See [`Self::installed`].
+    #[must_use]
+    pub fn with_installed(mut self, installed: bool) -> Self {
+        self.installed = installed;
         self
     }
 
@@ -456,9 +496,47 @@ impl NativeExtension for IntercomExtension {
     }
 
     async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
-        // `intercom` is always registered; `contact_supervisor` only for a subagent child with
-        // orchestrator metadata (index.ts:1162-1163,1425).
-        api.register_tool(Arc::new(IntercomTool::new(self.state.clone())));
+        // `contact_supervisor` only for a subagent child with orchestrator metadata
+        // (index.ts:1162-1163,1425).
+        //
+        // Upstream registers `intercom` UNCONDITIONALLY (`pi-intercom index.ts:2088`) and is right
+        // to: there an uninstalled intercom is an ABSENT npm package, so nothing else can claim the
+        // name. cyrup diverges by force-attaching this extension for any bridged child even with no
+        // install (`intercom_extension_for_env_concrete`), so an unconditional registration can
+        // DUPLICATE the subagents crate's `NativeChildIntercomTool` — and a duplicate tool name is
+        // a hard extension-load failure that stops the child booting at all.
+        //
+        // Stand down ONLY when BOTH hold: we are here purely by force-attach (`!installed`) AND the
+        // native provider is present and functional (`native_supervisor_channel`, i.e.
+        // `CYRUP_SUBAGENT_SUPERVISOR_CHANNEL_DIR` is set). That var is exactly what the native
+        // fallback's own metadata requires (every lookup there is `?`-terminated), and it is the
+        // root of its request/reply channel — so when it is ABSENT the native side registers
+        // nothing at all and this extension is the only possible provider.
+        //
+        // The CONVERSE does not hold, and the asymmetry matters: a channel dir being PRESENT does
+        // not guarantee the native side claims the name. Its gate has a SECOND term — `intercom`
+        // must appear in `required_child_tools` (`native_supervisor.rs`'s
+        // `native_child_intercom_fallback_should_register`) — and upstream's
+        // `legacySupervisorPairing` filter DROPS `intercom` from that list when the persona also
+        // declares `contact_supervisor` (`exec/tool_surface.rs`'s `required_child_tools`). So for
+        // such a persona, with no install, NEITHER side registers `intercom`.
+        //
+        // That is intended, not a hole to plug here: the child still gets `contact_supervisor` from
+        // the native side (whose own gate does NOT read `required_child_tools`), and it matches
+        // upstream, where an uninstalled intercom is an absent package and the paired alias is
+        // explicitly legacy plumbing rather than a requirement (pi #1207). Widening this guard to
+        // cover it would re-introduce the duplicate in exactly the case upstream removed the name
+        // for, and would drag this crate into reading `required_child_tools`.
+        //
+        // ⚠ Gating on `!installed` ALONE is a real, measured defect, not a hypothetical: a
+        // BACKGROUND child is bridged (so this extension attaches) but has no channel dir, because
+        // the detached runner resolves its parent-session anchor independently of the orchestrator
+        // target it was handed. Standing down there leaves ZERO providers for a name the persona
+        // REQUIRES, and the child refuses to start with "requested unavailable child tools:
+        // intercom".
+        if self.installed || !self.native_supervisor_channel {
+            api.register_tool(Arc::new(IntercomTool::new(self.state.clone())));
+        }
         // `v0.10.1 index.ts:1505-1507`:
         //   `if (childOrchestratorMetadata && !nativeSupervisorChannelAvailable) { pi.registerTool(…) }`
         // A child launched through the NATIVE supervisor channel must not also be handed the legacy
@@ -953,12 +1031,17 @@ pub fn intercom_extension_for_env_concrete(
         return Ok(None);
     }
     let metadata = read_child_orchestrator_metadata();
-    if metadata.is_none() && !is_installed(&intercom_dir) {
+    // Probed once, used twice: the attach gate immediately below, and the name-ownership decision
+    // in `init` (see [`IntercomExtension::installed`]).
+    let installed = is_installed(&intercom_dir);
+    // The force-attach: a bridged child attaches even with no install so the supervisor surface
+    // stays reachable. Whether it also OWNS the `intercom` name is decided in `init`.
+    if metadata.is_none() && !installed {
         return Ok(None);
     }
-    Ok(Some(Arc::new(IntercomExtension::new(
-        agent_dir, cwd, config, metadata,
-    )?)))
+    Ok(Some(Arc::new(
+        IntercomExtension::new(agent_dir, cwd, config, metadata)?.with_installed(installed),
+    )))
 }
 
 /// The default agent dir (`~/.cyrup` or `$CYRUP_CODING_AGENT_DIR`) — a convenience for a caller that

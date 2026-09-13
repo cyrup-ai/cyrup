@@ -213,6 +213,51 @@ fn is_executable(path: &Path) -> bool {
 ///
 /// Upstream's two refusals: a spawn/timeout failure, and a non-zero exit with the probe's own
 /// stderr (or stdout) quoted.
+/// `Command::spawn`, retrying briefly on `ETXTBSY` ("Text file busy").
+///
+/// `ETXTBSY` means the kernel refused to exec a file because some process still holds it open for
+/// WRITING. It is transient by construction, and on a multi-threaded process it arises without
+/// anyone writing the binary at exec time: a concurrent `fork` inherits every non-`O_CLOEXEC`
+/// descriptor, so if any thread has the target open for write when another thread forks, the fork
+/// child pins that write handle until its own `exec` clears it — and every `exec` of that path in
+/// between fails. cyrup spawns children from many threads at once, which is exactly that shape.
+///
+/// It is equally reachable in production without a fork race: probing an external CLI while a
+/// package manager rewrites it in place returns the same errno.
+///
+/// A bounded retry is the standard remedy (the same one cargo, npm and Bazel apply) because the
+/// window is a fork-to-exec gap — microseconds, not seconds. The budget is deliberately small: this
+/// must never mask a genuinely busy binary by stalling a probe that has its own timeout.
+#[cfg(unix)]
+fn spawn_probe(command: &mut tokio::process::Command) -> std::io::Result<tokio::process::Child> {
+    /// ~100 ms total. A fork-to-exec window is orders of magnitude shorter.
+    const MAX_ATTEMPTS: u32 = 10;
+    const BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+
+    let mut attempt = 0;
+    loop {
+        match command.spawn() {
+            Err(error)
+                if error.raw_os_error() == Some(nix::libc::ETXTBSY)
+                    && attempt + 1 < MAX_ATTEMPTS =>
+            {
+                attempt += 1;
+                // A blocking sleep, deliberately: `Command::spawn` is synchronous, the wait is
+                // bounded at 100 ms, and yielding to the async scheduler here would let this task
+                // be rescheduled onto a worker mid-retry for no benefit.
+                std::thread::sleep(BACKOFF);
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Non-unix has no `ETXTBSY` exec semantics to work around.
+#[cfg(not(unix))]
+fn spawn_probe(command: &mut tokio::process::Command) -> std::io::Result<tokio::process::Child> {
+    command.spawn()
+}
+
 async fn probe_with_timeout(
     binary_path: &Path,
     args: &[String],
@@ -235,8 +280,7 @@ async fn probe_with_timeout(
     {
         command.process_group(0);
     }
-    let mut child = command
-        .spawn()
+    let mut child = spawn_probe(&mut command)
         .map_err(|error| format!("External CLI {label} preflight failed: {error}"))?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let stdout = child.stdout.take();

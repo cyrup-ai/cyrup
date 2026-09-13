@@ -8,12 +8,12 @@ use super::options::AnthropicThinkingDisplay;
 use super::tools::convert_tools;
 use crate::api::compat::sanitize_surrogates;
 use crate::api::openai_completions::transform_messages_with;
-use crate::auth::ProviderEnv;
 use crate::context::Context;
 use crate::model::Model;
 use crate::stream::StreamOptions;
 use crate::utils::constrained_sampling::ConstrainedSamplingError;
 use crate::utils::deferred_tools::split_deferred_tools;
+use crate::utils::provider_plumbing::EnvSource;
 use crate::utils::simple_options::{adjust_max_tokens_for_thinking, clamp_max_tokens_to_context};
 use cyrup_core::ThinkingLevel;
 use serde_json::{Map, Value, json};
@@ -48,7 +48,7 @@ fn map_thinking_level_to_effort(model: &Model, level: ThinkingLevel) -> String {
 // Test-only fixture wrapper: the deny-list allowance the crate's `mod tests` blocks carry.
 #[allow(clippy::expect_used)]
 pub(crate) fn build_body(model: &Model, ctx: &Context, opts: &StreamOptions) -> Value {
-    build_params(model, ctx, opts, None, false)
+    build_params(model, ctx, opts, EnvSource::default(), false)
         .expect("fixture declares no unsatisfiable constrained sampling")
 }
 
@@ -63,7 +63,7 @@ pub(crate) fn build_params(
     model: &Model,
     ctx: &Context,
     opts: &StreamOptions,
-    env: Option<&ProviderEnv>,
+    env: EnvSource<'_>,
     is_oauth: bool,
 ) -> Result<Value, ConstrainedSamplingError> {
     let compat = get_anthropic_compat(model);

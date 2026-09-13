@@ -102,6 +102,97 @@ pub enum WorkflowResourceExpansionState {
     Resolved,
 }
 
+/// A resolved workflow resource's unique id — pi `RESOURCE_ID_PATTERN`
+/// (`workflow-receipt.ts:17`): `^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`.
+///
+/// A DISTINCT grammar from [`WorkflowKey`], not a widening of it: the `:` is admitted here and
+/// nowhere else, and the producer is `randomUUID()`'s hyphenated form, which this grammar accepts
+/// and the key grammar also would — the two are kept apart so neither can silently absorb the
+/// other's alphabet.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(transparent)]
+pub struct WorkflowResourceId(String);
+
+impl WorkflowResourceId {
+    /// The only fallible constructor.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        let mut chars = value.chars();
+        let first = chars.next()?;
+        if !first.is_ascii_alphanumeric() {
+            return None;
+        }
+        let mut tail = 0usize;
+        for c in chars {
+            tail += 1;
+            if tail > 127 || !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-')) {
+                return None;
+            }
+        }
+        Some(Self(value.to_string()))
+    }
+
+    /// Borrows the id for comparison, display and serialization boundaries.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for WorkflowResourceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Deserializes THROUGH [`WorkflowResourceId::parse`] — the `key.rs` idiom (WORKFLOW_3 §0.9).
+impl<'de> serde::Deserialize<'de> for WorkflowResourceId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).ok_or_else(|| {
+            serde::de::Error::custom(
+                "workflow resource id must match ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+            )
+        })
+    }
+}
+
+/// A resource version — pi `1..=1_000_000` (`workflow-receipt.ts:262`). The bound is upstream's
+/// and is a property of the VALUE, so it lives on the value rather than being re-checked by every
+/// reader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(transparent)]
+pub struct WorkflowResourceVersion(u32);
+
+impl WorkflowResourceVersion {
+    /// The only fallible constructor: `1..=1_000_000` (pi `Number.isInteger(version) && 1 <=
+    /// version <= 1_000_000`; deserializing as `u32` rather than `f64` already subsumes
+    /// `Number.isInteger`).
+    #[must_use]
+    pub fn parse(value: u32) -> Option<Self> {
+        if (1..=1_000_000).contains(&value) {
+            Some(Self(value))
+        } else {
+            None
+        }
+    }
+
+    /// The validated version number.
+    #[must_use]
+    pub fn value(self) -> u32 {
+        self.0
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for WorkflowResourceVersion {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = u32::deserialize(deserializer)?;
+        Self::parse(raw).ok_or_else(|| {
+            serde::de::Error::custom("workflow resource version must be 1..=1_000_000")
+        })
+    }
+}
+
 /// Audit provenance for a resolved workflow resource — pi `WorkflowResourceProvenance`
 /// (`shared/types.ts:152-159`): three literal-typed fields, the resource identity, and a
 /// **hyphenated** UUID (`randomUUID()`, SCOPE_3d §0.22 — not `RunId`'s `as_simple` form).
@@ -116,14 +207,16 @@ pub struct WorkflowResourceProvenance {
     pub kind: WorkflowResourceProvenanceKind,
     /// The resource's registered name.
     pub name: WorkflowKey,
-    /// The resource's registered version.
-    pub version: u32,
+    /// The resource's registered version, bounded `1..=1_000_000` by construction — pi
+    /// `parseWorkflowResource`'s bound (`workflow-receipt.ts:262`), previously unenforced.
+    pub version: WorkflowResourceVersion,
     /// Always `"named"`.
     pub invocation: WorkflowResourceInvocation,
     /// Always `"resolved"`.
     pub expansion: WorkflowResourceExpansionState,
-    /// The resolution's unique id — hyphenated UUID v4.
-    pub id: String,
+    /// The resolution's unique id — hyphenated UUID v4, grammar-checked by construction — pi
+    /// `RESOURCE_ID_PATTERN` (`workflow-receipt.ts:17`), previously unenforced.
+    pub id: WorkflowResourceId,
 }
 
 /// The two-state resource permit lifecycle (pi `WorkflowResourcePermitRecord.state`,
@@ -144,10 +237,14 @@ pub struct WorkflowResourcePermitInput {
     /// The resource's registered name. pi's `required(resourceName)` non-empty-trimmed check is
     /// subsumed by the type: the key grammar admits no whitespace and no empty string.
     pub resource_name: WorkflowKey,
-    /// The resource's registered version (positive).
+    /// The resource's registered version (positive). NOT [`WorkflowResourceVersion`]: this is a
+    /// DIFFERENT, upstream check (`workflow-child-permit.ts:172`'s own "positive integer", no
+    /// upper bound) from `parseWorkflowResource`'s `1..=1_000_000` — two independent validations
+    /// upstream never unifies, so this field keeps its own weaker rule and its own message.
     pub resource_version: u32,
-    /// The resolution's unique id (hyphenated UUID).
-    pub resource_id: String,
+    /// The resolution's unique id (hyphenated UUID). pi's `required(resourceId)` non-empty-trimmed
+    /// check is subsumed by the type, exactly as the sibling comment on `resource_name` says.
+    pub resource_id: WorkflowResourceId,
     /// The [`stable_json_digest`] of the resolved script text.
     pub script_digest: String,
     /// The raw authority the resolver declared; validated and clone-stored by `issue`.
@@ -205,19 +302,26 @@ impl WorkflowResourcePermit {
     /// `resource_id`/`script_digest`, `"resourceVersion must be a positive integer."`, or one of
     /// [`clone_workflow_resource_authority`]'s three authority rejections.
     pub fn issue(input: WorkflowResourcePermitInput) -> Result<Self, String> {
-        let resource_id = required(&input.resource_id, "resourceId")?;
         let script_digest = required(&input.script_digest, "scriptDigest")?;
         if input.resource_version < 1 {
             return Err("resourceVersion must be a positive integer.".to_string());
         }
+        // `WorkflowResourceVersion`'s own bound (`1..=1_000_000`) is a DIFFERENT, stricter rule
+        // than the bare `>= 1` check just above (see the field doc on
+        // `WorkflowResourcePermitInput::resource_version`); reusing the SAME upstream message for
+        // a version this permit family never itself produces above 1_000_000 keeps one wording
+        // for "resourceVersion is not usable" rather than inventing a second.
+        let Some(version) = WorkflowResourceVersion::parse(input.resource_version) else {
+            return Err("resourceVersion must be a positive integer.".to_string());
+        };
         let authority = clone_workflow_resource_authority(&input.authority)?;
         let provenance = WorkflowResourceProvenance {
             kind: WorkflowResourceProvenanceKind::Workflow,
             name: input.resource_name.clone(),
-            version: input.resource_version,
+            version,
             invocation: WorkflowResourceInvocation::Named,
             expansion: WorkflowResourceExpansionState::Resolved,
-            id: resource_id,
+            id: input.resource_id.clone(),
         };
         Ok(Self {
             resource_name: input.resource_name,
@@ -304,11 +408,15 @@ mod tests {
         WorkflowKey::parse(raw).expect("valid key")
     }
 
+    fn resource_id(raw: &str) -> WorkflowResourceId {
+        WorkflowResourceId::parse(raw).expect("valid resource id")
+    }
+
     fn input(script: &str, authority: WorkflowResourceAuthority) -> WorkflowResourcePermitInput {
         WorkflowResourcePermitInput {
             resource_name: key("run-ci"),
             resource_version: 1,
-            resource_id: "11111111-2222-4333-8444-555555555555".to_string(),
+            resource_id: resource_id("11111111-2222-4333-8444-555555555555"),
             script_digest: stable_json_digest(&serde_json::Value::String(script.to_string())),
             authority,
         }
@@ -404,16 +512,24 @@ mod tests {
             WorkflowResourcePermit::issue(input("s", nul)).err(),
             Some("Workflow resource host grant requires a non-empty command of at most 16384 bytes without NUL.".to_string())
         );
-        let mut blank_id = input("s", WorkflowResourceAuthority::default());
-        blank_id.resource_id = " ".to_string();
-        assert_eq!(
-            WorkflowResourcePermit::issue(blank_id).err(),
-            Some("resourceId must be a non-empty trimmed string.".to_string())
-        );
+        // `resourceId`'s blank/untrimmed rejection is now STRUCTURAL: `WorkflowResourceId` is the
+        // field's type, so a blank value cannot reach `issue` at all (WORKFLOW_3 §0.10) — the
+        // rejection moved to the type's own constructor.
+        assert_eq!(WorkflowResourceId::parse(" "), None);
+        assert_eq!(WorkflowResourceId::parse(""), None);
         let mut zero_version = input("s", WorkflowResourceAuthority::default());
         zero_version.resource_version = 0;
         assert_eq!(
             WorkflowResourcePermit::issue(zero_version).err(),
+            Some("resourceVersion must be a positive integer.".to_string())
+        );
+        // WORKFLOW_3 §0.10: `WorkflowResourceVersion`'s stricter `1..=1_000_000` upper bound
+        // (absent from this permit family's own historical `>= 1` check) is now enforced here too,
+        // reusing the SAME message rather than inventing a second one for an upstream-unmodeled case.
+        let mut huge_version = input("s", WorkflowResourceAuthority::default());
+        huge_version.resource_version = 1_000_001;
+        assert_eq!(
+            WorkflowResourcePermit::issue(huge_version).err(),
             Some("resourceVersion must be a positive integer.".to_string())
         );
     }

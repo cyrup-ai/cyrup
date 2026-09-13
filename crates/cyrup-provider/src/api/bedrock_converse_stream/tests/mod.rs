@@ -20,7 +20,6 @@ use super::blocks::*;
 use super::config::*;
 use super::convert::*;
 use super::driver::*;
-use super::env::*;
 use super::errors::*;
 use super::events::*;
 use super::failure::*;
@@ -35,6 +34,7 @@ use crate::auth::{AuthResult, ProviderEnv};
 use crate::context::{Context, ToolDef};
 use crate::model::{Modality, Model, ModelCost};
 use crate::stream::{CacheRetention, StreamEvent, StreamOptions};
+use crate::utils::provider_plumbing::EnvSource;
 use cyrup_core::{
     ApiId, AssistantMessage, CancelToken, Content, Message, ModelThinkingLevel, StopReason,
     ToolCall, ToolCallId, Usage,

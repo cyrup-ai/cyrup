@@ -1813,3 +1813,64 @@ async fn a_task_that_claims_an_undeclared_tool_no_longer_refuses() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// WORKFLOW_6 §4 — `route_workflow_mode`'s workflow-controller lifecycle: registered before the
+// engine runs, settled unconditionally after it, on BOTH the success and the failure arm.
+// ---------------------------------------------------------------------------------------------
+
+/// A childless workflow script never touches `foreground_controls` at all (no `runs.run(...)`
+/// call), so this isolates the controller lifecycle from the foreground-child registration path
+/// §1-§3 add: register-before, settle-after, and nothing left over.
+#[tokio::test]
+async fn workflow_mode_registers_and_settles_its_controller_around_a_successful_run() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let executor = Arc::new(SubagentExecutor::new());
+    arm_scoped_missions(&executor, dir.path()).await;
+    let tool = SubagentTool::new(executor.clone(), dir.path().to_path_buf());
+
+    assert!(
+        executor.live_workflow_run_ids().is_empty(),
+        "precondition: nothing registered before the call"
+    );
+
+    let result = dispatch_tool(&tool, serde_json::json!({ "workflowScript": "return 42;" }))
+        .await
+        .expect("a trivial childless workflow script must succeed");
+
+    assert!(
+        tool_text(&result).contains("Workflow completed with 0 child run(s). Return: 42"),
+        "{}",
+        tool_text(&result)
+    );
+    assert!(
+        executor.live_workflow_run_ids().is_empty(),
+        "the workflow controller registered before the engine ran must be settled (removed) \
+         once the call returns — a leaked entry would make WORKFLOW_10 over-count live workflows \
+         forever"
+    );
+}
+
+/// The FAILURE arm settles the controller exactly as unconditionally as the success arm — §4.4's
+/// own point: a workflow that failed is exactly as settled as one that succeeded.
+#[tokio::test]
+async fn workflow_mode_settles_its_controller_even_when_the_script_fails() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let executor = Arc::new(SubagentExecutor::new());
+    arm_scoped_missions(&executor, dir.path()).await;
+    let tool = SubagentTool::new(executor.clone(), dir.path().to_path_buf());
+
+    let err = dispatch_tool(
+        &tool,
+        serde_json::json!({ "workflowScript": "throw new Error('boom');" }),
+    )
+    .await
+    .expect_err("a script that throws must fail the call");
+    assert!(err.to_string().contains("boom"), "{err}");
+
+    assert!(
+        executor.live_workflow_run_ids().is_empty(),
+        "the controller must be settled on the FAILURE arm too — leaving it behind would make \
+         WORKFLOW_8's dismiss refusal permanent for this id"
+    );
+}

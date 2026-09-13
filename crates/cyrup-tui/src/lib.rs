@@ -187,7 +187,9 @@ pub use markdown::{
     render as render_markdown, render_with_hyperlink_support as render_markdown_with_hyperlinks,
     render_with_text_color as render_markdown_with_text_color, trim_partial_closing_fence,
 };
-pub use model_selector::{ModelEntry, ModelSelector};
+pub use model_selector::{
+    MODEL_REFRESH_TIMEOUT, ModelEntry, ModelRefreshMsg, ModelSelector, refresh_outcome_rows,
+};
 pub use native_modifiers::{
     ModifierKey, ModifierProbe, clear_native_modifier_probe, host_platform,
     is_apple_terminal_session, is_native_modifier_pressed, normalize_native_shift_enter,

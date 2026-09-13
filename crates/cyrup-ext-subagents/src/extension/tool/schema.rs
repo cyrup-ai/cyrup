@@ -323,6 +323,28 @@ pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
     let mut props = serde_json::Map::new();
     props.insert("agent".to_string(), serde_json::json!({ "type": "string", "description": "Agent name (SINGLE mode) or target for management get/update/delete" }));
     props.insert("task".to_string(), serde_json::json!({ "type": "string", "description": "Task (SINGLE mode, optional for self-contained agents)" }));
+    // WORKFLOW_2 — pi `extension/schemas.ts:348`, description TRIMMED to what this build actually
+    // offers. An advertised capability that refuses is worse than an unadvertised one.
+    //
+    // [CYRUP-DELTA, narrower] upstream advertises "Normally async unless asyncByDefault:false",
+    // mission `state`, and `runs.host`. This build runs workflows in the FOREGROUND and grants
+    // neither state nor runs.host, and for those two the guest surface genuinely OMITS what it
+    // does not grant (`js/prelude.js:574,578` in `cyrup-workflow-runtime`), so advertising them
+    // would describe members the model cannot discover. `runs.steer` is deliberately NOT listed
+    // either — but note that one is present-and-refusing rather than absent (`prelude.js:288-309`
+    // installs it; `engine.rs:1105` refuses it), so omitting it is a choice about noise, not
+    // discoverability.
+    props.insert("workflowScript".to_string(), serde_json::json!({
+        "type": "string",
+        "minLength": 1,
+        "description": "Inline JavaScript statement body run as a workflow. Use explicit return, \
+            top-level await, plain helper functions, or explicit Promise chains. Nested async \
+            function, arrow, and method helpers are rejected. Globals: runs.run, runs.all, \
+            runs.lanes, runs.ref, runs.refs, runs.status, emit, console, and standard JavaScript \
+            only — no filesystem, shell, Pi tools, or host globals. Runs in the foreground: omit \
+            async or pass async:false. Cannot combine with agent, tasks, chain, or action (except \
+            action:'validate')."
+    }));
     props.insert(
         "action".to_string(),
         serde_json::json!({
@@ -809,13 +831,21 @@ mod tests {
             vec![
                 // SUBA-055 added `guide` with `registration::guide::read_subagent_guide`, at pi's
                 // own position for it: upstream reads `… "models", "children.list", "guide",
-                // "create", …` (`shared/types.ts:2084` @v0.47.1). `children.list` is NOT ported —
-                // it lists retained children under a `parentWorkflowRunId` that this build has no
-                // concept of — so `guide` follows `models` directly here.
+                // "create", …` (`shared/types.ts:2084` @v0.47.1). `children.list` is still NOT
+                // ported — but WORKFLOW_2 changed the REASON, so restate it rather than let a
+                // reader conclude the verb is now free to add: `workflowScript` IS ported now, so
+                // the old "this build has no concept of a `parentWorkflowRunId`" no longer holds.
+                // What `children.list` needs is RETAINED children, and this build retains none —
+                // `WorkflowRunHost`'s `settled` vec dies with the tool call, and retention arrives
+                // with the async/detached workflow shape (WORKFLOW_3/WORKFLOW_13). So `guide`
+                // still follows `models` directly here.
                 "list",
                 "get",
                 "models",
                 "guide",
+                // WORKFLOW_2 — pi's own index for `validate`: upstream `SUBAGENT_ACTIONS`
+                // (`shared/types.ts:2760`) reads `… "guide", "validate", "create", …`.
+                "validate",
                 "create",
                 "update",
                 "delete",

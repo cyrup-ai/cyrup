@@ -46,13 +46,13 @@
 
 use crate::HeaderMap;
 use crate::api::{ApiImpl, EventSink};
-use crate::auth::{AuthResult, ProviderEnv};
+use crate::auth::AuthResult;
 use crate::context::Context;
 use crate::error::ProviderError;
 use crate::model::Model;
 use crate::stream::sse::{SseFrame, SseRequest, build_client_for_target, open_sse};
 use crate::stream::{CacheRetention, StreamEvent, StreamOptions};
-use crate::utils::provider_plumbing::{now_millis, provider_env_value};
+use crate::utils::provider_plumbing::{EnvSource, now_millis, provider_env_value};
 use crate::utils::provider_retry::ProviderRetry;
 use cyrup_core::{
     ApiId, AssistantMessage, AssistantMessageDiagnostic, CancelToken, Content, Cost,
@@ -181,8 +181,12 @@ impl ApiImpl for PiMessagesApi {
 
         // gap-08 #2: `before_provider_request` may inspect/replace the outbound body (Pi
         // `options?.onPayload?.(payload, model)`, pi-messages.ts:377-380).
-        let body =
-            crate::stream::apply_on_payload(opts, model, build_payload(model, ctx, opts)).await;
+        let body = crate::stream::apply_on_payload(
+            opts,
+            model,
+            build_payload_with_env(model, ctx, opts, EnvSource::new(opts.env.as_ref())),
+        )
+        .await;
         // PROV-042: `transformHeaders` runs LAST over the fully-assembled set (pi
         // `models.ts:657` @v0.84.4); its return value is what goes on the wire.
         let headers =
@@ -317,7 +321,7 @@ pub(crate) fn build_headers(opts: &StreamOptions, api_key: &str) -> HeaderMap {
 /// `"short"` instead; copying them here would silently override a gateway's own policy.
 pub(crate) fn resolve_cache_retention(
     cache_retention: Option<CacheRetention>,
-    env: Option<&ProviderEnv>,
+    env: EnvSource<'_>,
 ) -> Option<CacheRetention> {
     if let Some(c) = cache_retention {
         return Some(c);
@@ -344,7 +348,17 @@ fn cache_retention_wire(retention: CacheRetention) -> &'static str {
 /// (`systemPrompt?`, `messages`, `tools`). The nested `options` object carries only Pi's six keys;
 /// a key whose value is `undefined` in Pi is OMITTED here rather than emitted as `null`, matching
 /// `JSON.stringify`, which drops `undefined` properties.
-pub(crate) fn build_payload(model: &Model, ctx: &Context, opts: &StreamOptions) -> Value {
+///
+/// Env-aware entry point: `env` drives [`resolve_cache_retention`]'s `CYRUP_CACHE_RETENTION`
+/// fallback. Production always calls this from `PiMessagesApi::run`, deriving `env` from
+/// `opts.env` (unchanged behaviour); tests that need to pin the process environment call this
+/// directly with an explicit [`EnvSource`] ambient (TEST_ENV_HERMETICITY).
+pub(crate) fn build_payload_with_env(
+    model: &Model,
+    ctx: &Context,
+    opts: &StreamOptions,
+    env: EnvSource<'_>,
+) -> Value {
     let mut options = Map::new();
     if let Some(t) = opts.temperature {
         options.insert("temperature".to_string(), json!(t));
@@ -357,7 +371,7 @@ pub(crate) fn build_payload(model: &Model, ctx: &Context, opts: &StreamOptions) 
     if let Some(level) = opts.reasoning.level() {
         options.insert("reasoning".to_string(), json!(level));
     }
-    if let Some(r) = resolve_cache_retention(opts.cache_retention, opts.env.as_ref()) {
+    if let Some(r) = resolve_cache_retention(opts.cache_retention, env) {
         options.insert("cacheRetention".to_string(), json!(cache_retention_wire(r)));
     }
     if let Some(sid) = &opts.session_id {
@@ -372,6 +386,13 @@ pub(crate) fn build_payload(model: &Model, ctx: &Context, opts: &StreamOptions) 
         "context": serde_json::to_value(ctx).unwrap_or(Value::Null),
         "options": Value::Object(options),
     })
+}
+
+/// Test-only convenience wrapper for [`build_payload_with_env`], deriving `env` from `opts.env` —
+/// exactly what the production call site in `PiMessagesApi::run` does.
+#[cfg(test)]
+pub(crate) fn build_payload(model: &Model, ctx: &Context, opts: &StreamOptions) -> Value {
+    build_payload_with_env(model, ctx, opts, EnvSource::new(opts.env.as_ref()))
 }
 
 // ---------------------------------------------------------------------------
@@ -998,6 +1019,7 @@ fn merge_tool_call(tc: &mut ToolCall, raw: Option<&Value>) {
 mod tests {
     use super::*;
     use crate::api::channel;
+    use crate::auth::ProviderEnv;
     use crate::auth::types::ModelAuth;
     use crate::model::{Modality, ModelCost};
     use crate::stream::sse::decode_sse_bytes;
@@ -1040,14 +1062,26 @@ mod tests {
         }
     }
 
+    /// An `EnvSource` with an explicit (possibly empty) ambient map, so no test can be influenced
+    /// by the developer's shell (mirrors `bedrock_converse_stream::tests::env_source`).
+    fn env_source<'a>(overlay: Option<&'a ProviderEnv>, ambient: &'a ProviderEnv) -> EnvSource<'a> {
+        EnvSource {
+            overlay,
+            ambient: Some(ambient),
+        }
+    }
+
     fn auth_with(api_key: Option<&str>) -> AuthResult {
         AuthResult {
             auth: ModelAuth {
                 api_key: api_key.map(String::from),
                 ..Default::default()
             },
-            // An EMPTY provider env is what keeps `resolve_cache_retention` — and, in the loopback
-            // tests, proxy resolution — independent of the developer's shell.
+            // NOT a shield for `resolve_cache_retention` (TEST_ENV_HERMETICITY): that reads
+            // `opts.env` — an overlay `build_payload_with_env` wraps in its own `EnvSource` — never
+            // `auth.env`, and an empty overlay always falls through to `std::env::var` regardless.
+            // This empty map only scopes what DOES read `auth.env` in the loopback tests below:
+            // proxy-target resolution (`build_client_for_target`).
             env: Some(ProviderEnv::new()),
             source: None,
         }
@@ -1116,35 +1150,57 @@ mod tests {
 
     /// MIRROR: the defaults path. `undefined` properties are dropped by `JSON.stringify`, so an
     /// options object with nothing set must serialize to `{}` — not to a bag of nulls.
+    ///
+    /// Needs `build_payload_with_env` directly, with an explicit empty `ambient`
+    /// (TEST_ENV_HERMETICITY): `StreamOptions::default()` carries no overlay at all, so
+    /// `resolve_cache_retention` falls straight through to the process environment, and a
+    /// `CYRUP_CACHE_RETENTION=long` in the developer's shell would insert `cacheRetention` here.
     #[test]
     fn payload_omits_unset_options() {
         let m = model();
-        let body = build_payload(&m, &user_ctx("hi"), &StreamOptions::default());
+        let empty = ProviderEnv::new();
+        let body = build_payload_with_env(
+            &m,
+            &user_ctx("hi"),
+            &StreamOptions::default(),
+            env_source(None, &empty),
+        );
         assert_eq!(body["options"], json!({}));
     }
 
     /// Pi's `resolveCacheRetention` for pi-messages returns **undefined** when unset — the backend
     /// default applies. This is NOT `anthropic-messages`' `"short"` default; a regression to that
     /// would show up here.
+    ///
+    /// Every leg pins an explicit (possibly empty) `ambient` (TEST_ENV_HERMETICITY) rather than
+    /// relying on an empty overlay, which does not shield this lookup from the real process
+    /// environment.
     #[test]
     fn cache_retention_stays_unset_unless_asked() {
-        let env = ProviderEnv::new();
-        assert_eq!(resolve_cache_retention(None, Some(&env)), None);
+        let empty = ProviderEnv::new();
         assert_eq!(
-            resolve_cache_retention(Some(CacheRetention::Short), Some(&env)),
+            resolve_cache_retention(None, env_source(None, &empty)),
+            None
+        );
+        assert_eq!(
+            resolve_cache_retention(Some(CacheRetention::Short), env_source(None, &empty)),
             Some(CacheRetention::Short)
         );
-        // `CYRUP_CACHE_RETENTION=long` is the one env opt-in mapped (pi `PI_CACHE_RETENTION`).
+        // `CYRUP_CACHE_RETENTION=long` is the one env opt-in mapped (pi `PI_CACHE_RETENTION`) —
+        // the process environment, not a caller overlay, so it is injected via `ambient`.
         let mut long = ProviderEnv::new();
         long.insert("CYRUP_CACHE_RETENTION".to_string(), "long".to_string());
         assert_eq!(
-            resolve_cache_retention(None, Some(&long)),
+            resolve_cache_retention(None, env_source(None, &long)),
             Some(CacheRetention::Long)
         );
         // Any other value is ignored (Pi tests `=== "long"`).
         let mut other = ProviderEnv::new();
         other.insert("CYRUP_CACHE_RETENTION".to_string(), "short".to_string());
-        assert_eq!(resolve_cache_retention(None, Some(&other)), None);
+        assert_eq!(
+            resolve_cache_retention(None, env_source(None, &other)),
+            None
+        );
     }
 
     /// Pi's header object, in order: authorization / accept / content-type, then the caller's

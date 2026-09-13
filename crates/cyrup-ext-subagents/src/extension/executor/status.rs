@@ -175,7 +175,7 @@ impl SubagentExecutor {
     /// `false` (it only ever shows active work, `fleet-status.ts:182`).
     ///
     /// Everything the live registries and the on-disk status records actually know is threaded
-    /// through, including three things that used to be dropped on the floor:
+    /// through, including four things that used to be dropped on the floor:
     ///
     /// * **`session_id`** now comes from each run's OWN recorded
     ///   [`crate::background::RunStatus::session_id`], not from stamping the current session onto
@@ -190,18 +190,19 @@ impl SubagentExecutor {
     ///   `fleet-status.ts`'s whole nested tree rendered as absent.
     /// * **`ForegroundControlView::current_tool`/`current_path`/`activity_state`/`mode`** are read
     ///   off the live control entry rather than left at their `Default`.
-    ///
-    /// One field is still populated empty, for a stated reason:
-    /// * `foreground_runs` — cyrup keeps no settled-foreground registry (pi's
-    ///   `state.foregroundRuns`); its foreground control entry is removed the moment the run
-    ///   settles, which is the same registry `background::fleet_view` documents as delta 4.
+    /// * **`foreground_runs`** (WORKFLOW_7) — settled foreground runs this process remembers
+    ///   (pi's `state.foregroundRuns`), projected from [`Self::foreground_runs_views`]. Populated
+    ///   from the SAME in-memory record `persist_foreground_run_history` writes to disk, so it
+    ///   survives a restart within this session and is restored (STRICT, session-scoped) on the
+    ///   next one. `tui/fleet.rs`'s own session filter over this field was written ahead of a real
+    ///   producer and was dead until now.
     pub async fn fleet_state(
         &self,
         cwd: &Path,
         include_history: bool,
         fleet_inspector_open: bool,
     ) -> crate::tui::fleet_state::FleetState {
-        use crate::tui::fleet_state::{AsyncRunView, FleetState, ForegroundControlView};
+        use crate::tui::fleet_state::{AsyncRunView, FleetState, ForegroundChildView, ForegroundControlView};
 
         let services = self.host_services();
         let current_session_id = services.as_ref().and_then(|s| s.session_id());
@@ -216,7 +217,10 @@ impl SubagentExecutor {
                 .iter()
                 .map(|(run_id, entry)| ForegroundControlView {
                     run_id: run_id.clone(),
-                    session_id: current_session_id.clone(),
+                    // WORKFLOW_6 §3.3 — the entry's OWN recorded session, not a stamp:
+                    // `fleet.ts:63-65`'s `belongsToCurrentSession` is a real test on this axis now,
+                    // matching what the async half already does (this method's own doc, above).
+                    session_id: entry.session_id.as_ref().map(|s| s.as_str().to_string()),
                     current_agent: entry.current_agent.clone(),
                     current_index: entry.current_index,
                     activity_state: entry.current_activity_state,
@@ -229,7 +233,17 @@ impl SubagentExecutor {
                     description: entry.description.clone(),
                     started_at: entry.started_at,
                     updated_at: entry.updated_at,
-                    cwd: Some(cwd.to_path_buf()),
+                    // The entry's own cwd, falling back to the caller's for an entry registered
+                    // before this field existed.
+                    cwd: entry.cwd.clone().or_else(|| Some(cwd.to_path_buf())),
+                    // `ForegroundControlView::active_children` has been a permanently-empty `Vec`
+                    // since it was added; project the real map now, sorted by index — which a
+                    // `BTreeMap`'s iteration order already gives.
+                    active_children: entry
+                        .active_children
+                        .values()
+                        .map(ForegroundChildView::from)
+                        .collect(),
                     ..ForegroundControlView::default()
                 })
                 .collect()
@@ -272,7 +286,12 @@ impl SubagentExecutor {
             ),
             parent_session_file,
             foreground_controls,
-            foreground_runs: Vec::new(),
+            // WORKFLOW_7 §3.3 — pi `state.foregroundRuns` (`fleet.ts:211`). Was `Vec::new()` with a
+            // stated reason; the reason is gone (see this method's own doc, above).
+            // `tui/fleet.rs:418`'s `belongs_to_current_session` filter — written with this
+            // collection in mind and dead until now — becomes load-bearing with this line and
+            // needs no change of its own.
+            foreground_runs: self.foreground_runs_views(),
             tracked_jobs,
             history_jobs: Vec::new(),
             fleet_inspector_open,
@@ -436,6 +455,8 @@ impl SubagentExecutor {
                     current_agent: entry.current_agent.clone(),
                     current_index: entry.current_index,
                     activity_state: entry.current_activity_state,
+                    session_id: entry.session_id.clone(),
+                    parent_workflow_run_id: entry.parent_workflow_run_id.clone(),
                 },
             )
             .collect();

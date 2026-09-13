@@ -962,7 +962,10 @@ fn truncate_chars(value: &str, max: usize) -> String {
 // The operations behind the ops (§3.2)
 //
 // Each is a plain `async fn`: the future IS the operation's lifetime, so `runs.all` of twelve is
-// twelve concurrent futures on the parent runtime. `ops.rs` is the thin `#[op2]` layer over these.
+// twelve concurrent futures on the parent runtime. The thin `#[op2]` layer over these lives in the
+// `cyrup-workflow-runtime` crate (WORKFLOW_1 §7), never in this one: a `build.rs` can never import
+// from the crate whose build it is running, and `cyrup-ext-subagents/build.rs` needs that
+// extension to produce the V8 startup snapshot. See `scripted/mod.rs`'s note for the full move.
 // ------------------------------------------------------------------------------------------------
 
 /// The `launch` envelope the guest posts — upstream's worker `run` call args (`:283-291`).
@@ -2100,7 +2103,20 @@ pub const NESTED_WORKFLOW_REFUSAL: &str = "workflowScript cannot be started from
 /// Refuse a `workflowScript` request that originated inside a workflow child (§6.3).
 ///
 /// Returns the verbatim refusal when the request carries [`WORKFLOW_CHILD_MARKER`] **and** asks to
-/// start a script. The subagent tool calls this at dispatch; SCOPE_3g wires the call site.
+/// start a script.
+///
+/// WORKFLOW_2 wires the call site, in `extension/tool/mod.rs`'s `Tool::execute`, BEFORE the
+/// request is deserialized — `SubagentToolParams` carries neither `workflowScriptPath` nor
+/// `workflow` nor the marker, so a post-parse check could not see two of the three
+/// `starts_a_script` disjuncts below.
+///
+/// Note the transport, because it is not the request: this function's marker conjunct is
+/// satisfied only because the dispatch site stamps [`WORKFLOW_CHILD_MARKER`] onto the request map
+/// when `WORKFLOW_CHILD_ENV` (`extension::executor::workflow`, a private module — hence no
+/// intra-doc link) is present in the process
+/// environment. A model-authored tool call can never carry the marker itself, and the only other
+/// producer is this engine (in-process, when building `launch_params`), so without that env
+/// transport the refusal could only ever fire on a request the host had synthesized.
 #[must_use]
 pub fn refuse_nested_workflow(request: &Map<String, Value>) -> Option<&'static str> {
     let inside_workflow_child = request
@@ -2216,6 +2232,34 @@ impl IsolateThread {
 }
 
 /// The isolate thread body: build the runtime, install the sandbox, evaluate, drive the event loop.
+/// Serializes V8 ISOLATE CONSTRUCTION across threads.
+///
+/// `deno_core` 0.411.0 guards concurrent snapshot-deserializing isolate creation for
+/// [denoland/deno#15590](https://github.com/denoland/deno/issues/15590) — but only on Windows
+/// (`runtime/setup.rs:271`'s `if cfg!(windows) && has_snapshot && ...`). On every other platform
+/// `v8::Isolate::new(params)` with a `snapshot_blob` runs unguarded, and two threads deserializing
+/// the same snapshot at once corrupt V8 internals. The observable symptom is an ABORT, not an
+/// error: `vector.h: libc++ Hardening assertion __n < size() failed: vector[] index out of bounds`,
+/// with the whole process killed by SIGABRT — a panic across the V8 FFI boundary cannot unwind, so
+/// there is nothing to catch.
+///
+/// This is not a test-only concern. [`IsolateThread::spawn`] gives every workflow run its OWN OS
+/// thread, so two concurrent `workflowScript` tool calls in one process take exactly the racing
+/// path.
+///
+/// ⚠ The lock covers CONSTRUCTION ONLY and must never be held across script execution or an
+/// `.await`. Isolate creation is microseconds and is the only racing region; holding it longer
+/// would serialize every workflow run in the process and silently undo `runs.all`'s concurrency.
+fn v8_isolate_init_lock() -> std::sync::MutexGuard<'static, ()> {
+    static ISOLATE_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // `unwrap`/`expect` are DENY workspace-wide. A poisoned lock here carries no data to be
+    // inconsistent — the guard protects a V8-internal critical section, not a Rust value — so
+    // recovering is strictly better than aborting a workflow that would otherwise succeed.
+    ISOLATE_INIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn run_isolate(
     main: &tokio::runtime::Handle,
     shared: Arc<RunShared>,
@@ -2242,106 +2286,132 @@ fn run_isolate(
     // synchronous `execute_script`: the prelude and the agent's script both call ops during
     // evaluation, and `deno_unsync::spawn` needs a live runtime context at that moment.
     local.block_on(async move {
-        let mut runtime = deno_core::JsRuntime::new(deno_core::RuntimeOptions {
-            // §7: the identical extension declaration used to build `WORKFLOW_SNAPSHOT` is
-            // supplied again here — `deno_core` recognises it by name against the loaded snapshot
-            // and skips re-executing its JS; ops still bind normally either way (see
-            // `cyrup_workflow_runtime`'s module doc).
-            extensions: vec![cyrup_workflow_runtime::cyrup_workflow::init()],
-            startup_snapshot: Some(WORKFLOW_SNAPSHOT),
-            // §5.3: a deliberate cap, not an inherited default.
-            create_params: Some(
-                deno_core::v8::CreateParams::default().heap_limits(0, WORKFLOW_HEAP_LIMIT_BYTES),
-            ),
-            ..Default::default()
-        });
+        // ⚠ The guard is scoped to THIS BLOCK — construction only. A bare
+        // `let _isolate_init = ...;` here would bind it to the enclosing `async move` block and
+        // hold a `std` mutex across every `.await` below, serializing all concurrent workflow runs
+        // and pinning a non-`Send` guard across suspension points. See `v8_isolate_init_lock`.
+        let mut runtime = {
+            let _isolate_init = v8_isolate_init_lock();
+            deno_core::JsRuntime::new(deno_core::RuntimeOptions {
+                // §7: the identical extension declaration used to build `WORKFLOW_SNAPSHOT` is
+                // supplied again here — `deno_core` recognises it by name against the loaded
+                // snapshot and skips re-executing its JS; ops still bind normally either way (see
+                // `cyrup_workflow_runtime`'s module doc).
+                extensions: vec![cyrup_workflow_runtime::cyrup_workflow::init()],
+                startup_snapshot: Some(WORKFLOW_SNAPSHOT),
+                // §5.3: a deliberate cap, not an inherited default.
+                create_params: Some(
+                    deno_core::v8::CreateParams::default()
+                        .heap_limits(0, WORKFLOW_HEAP_LIMIT_BYTES),
+                ),
+                ..Default::default()
+            })
+        };
 
-        // §7 Part A: the bridge is seeded into `OpState` here, AFTER construction, rather than
-        // through the extension's `options`/`state` — a snapshot reused across many different
-        // workflow runs must never have any one run's state baked into it, and the build-time
-        // snapshot pass that produced `WORKFLOW_SNAPSHOT` has no live run to build one from at all.
-        {
-            let bridge: Arc<dyn WorkflowOpsBridge> = Arc::new(RunSharedBridge(shared.clone()));
-            runtime.op_state().borrow_mut().put(bridge);
-        }
-
-        let isolate_handle = runtime.v8_isolate().thread_safe_handle();
-        if handle_tx.send(isolate_handle.clone()).is_err() {
-            return Err(guest_error("Workflow supervisor stopped.".to_string()));
-        }
-
-        // BLOCKER-3: RAISE the limit and stop the script; never let V8 reach its own OOM `abort()`.
-        // cyrup-ext's rule holds here too — the host never crashes.
-        {
-            let shared = shared.clone();
-            let handle = isolate_handle.clone();
-            runtime.add_near_heap_limit_callback(move |current, _initial| {
-                shared.record_fatal(
-                    "workflowScript exceeded its memory budget.".to_string(),
-                    None,
-                );
-                handle.terminate_execution();
-                current + WORKFLOW_HEAP_SLACK_BYTES
-            });
-        }
-
-        let host_enabled = shared.host.supports_host();
-        install_sandbox(&mut runtime, state_enabled, host_enabled).map_err(guest_error)?;
-
-        // The host compiles; the guest may not. Upstream's asymmetry (`new vm.Script` against
-        // `codeGeneration: { strings: false }`, `:916`) reproduced exactly.
-        let wrapped = format!("globalThis.__cyrupWorkflowRun((async () => {{\n{script}\n}})())");
-        let promise = runtime
-            .execute_script("workflow-script.js", wrapped)
-            .map_err(|error| guest_error(format_guest_error(&error.to_string())))?;
-
-        let resolved = runtime.resolve(promise);
-        let value = runtime
-            .with_event_loop_promise(resolved, deno_core::PollEventLoopOptions::default())
-            .await
-            .map_err(|error| workflow_guest_error(&error))?;
-
-        // §6 DL-3 — upstream's `Promise.allSettled([...steers, ...hostCalls])` (`:1826`).
+        // The isolate must be DISPOSED under the same lock it was CREATED under: V8 mutates
+        // process-global state in both `Isolate::New` and `Isolate::Dispose`, and deno_core
+        // guards neither off-Windows. Serializing construction alone left a create-vs-dispose
+        // race that still aborted the process ~10% of the time under load.
         //
-        // In the op model that IS the event loop: a `runs.steer`/`runs.host` the script never
-        // awaited is a still-pending op, and running the loop to completion settles exactly the set
-        // upstream awaits. Bounded, because `WorkflowScriptHost` is a trait an embedder implements
-        // — "the impl honours cancel" is an assumption, not a guarantee, and `runs.host`'s own
-        // timeoutMs may be up to 24h. On expiry the ops are dropped with the runtime, which is
-        // upstream's `worker.terminate()` shape.
-        let _ = tokio::time::timeout(
-            Duration::from_millis(WORKFLOW_SETTLE_DRAIN_TIMEOUT_MS),
-            runtime.run_event_loop(deno_core::PollEventLoopOptions::default()),
-        )
-        .await;
+        // The body is wrapped in an inner `async` block purely so it has exactly ONE exit: its
+        // `?`s and early `return`s resolve to the block's value instead of jumping past the
+        // guarded disposal below. Execution is NOT inside the lock — only creation and
+        // disposal are, so two concurrent workflow runs still execute fully in parallel.
+        let outcome = async {
 
-        let outcome = {
-            deno_core::scope!(scope, runtime);
-            let local_value = deno_core::v8::Local::new(scope, value);
-            deno_core::serde_v8::from_v8::<GuestOutcomeEnvelope>(scope, local_value).map_err(
-                |error| WorkflowGuestError {
+            // §7 Part A: the bridge is seeded into `OpState` here, AFTER construction, rather than
+            // through the extension's `options`/`state` — a snapshot reused across many different
+            // workflow runs must never have any one run's state baked into it, and the build-time
+            // snapshot pass that produced `WORKFLOW_SNAPSHOT` has no live run to build one from at all.
+            {
+                let bridge: Arc<dyn WorkflowOpsBridge> = Arc::new(RunSharedBridge(shared.clone()));
+                runtime.op_state().borrow_mut().put(bridge);
+            }
+
+            let isolate_handle = runtime.v8_isolate().thread_safe_handle();
+            if handle_tx.send(isolate_handle.clone()).is_err() {
+                return Err(guest_error("Workflow supervisor stopped.".to_string()));
+            }
+
+            // BLOCKER-3: RAISE the limit and stop the script; never let V8 reach its own OOM `abort()`.
+            // cyrup-ext's rule holds here too — the host never crashes.
+            {
+                let shared = shared.clone();
+                let handle = isolate_handle.clone();
+                runtime.add_near_heap_limit_callback(move |current, _initial| {
+                    shared.record_fatal(
+                        "workflowScript exceeded its memory budget.".to_string(),
+                        None,
+                    );
+                    handle.terminate_execution();
+                    current + WORKFLOW_HEAP_SLACK_BYTES
+                });
+            }
+
+            let host_enabled = shared.host.supports_host();
+            install_sandbox(&mut runtime, state_enabled, host_enabled).map_err(guest_error)?;
+
+            // The host compiles; the guest may not. Upstream's asymmetry (`new vm.Script` against
+            // `codeGeneration: { strings: false }`, `:916`) reproduced exactly.
+            let wrapped = format!("globalThis.__cyrupWorkflowRun((async () => {{\n{script}\n}})())");
+            let promise = runtime
+                .execute_script("workflow-script.js", wrapped)
+                .map_err(|error| guest_error(format_guest_error(&error.to_string())))?;
+
+            let resolved = runtime.resolve(promise);
+            let value = runtime
+                .with_event_loop_promise(resolved, deno_core::PollEventLoopOptions::default())
+                .await
+                .map_err(|error| workflow_guest_error(&error))?;
+
+            // §6 DL-3 — upstream's `Promise.allSettled([...steers, ...hostCalls])` (`:1826`).
+            //
+            // In the op model that IS the event loop: a `runs.steer`/`runs.host` the script never
+            // awaited is a still-pending op, and running the loop to completion settles exactly the set
+            // upstream awaits. Bounded, because `WorkflowScriptHost` is a trait an embedder implements
+            // — "the impl honours cancel" is an assumption, not a guarantee, and `runs.host`'s own
+            // timeoutMs may be up to 24h. On expiry the ops are dropped with the runtime, which is
+            // upstream's `worker.terminate()` shape.
+            let _ = tokio::time::timeout(
+                Duration::from_millis(WORKFLOW_SETTLE_DRAIN_TIMEOUT_MS),
+                runtime.run_event_loop(deno_core::PollEventLoopOptions::default()),
+            )
+            .await;
+
+            let outcome = {
+                deno_core::scope!(scope, runtime);
+                let local_value = deno_core::v8::Local::new(scope, value);
+                deno_core::serde_v8::from_v8::<GuestOutcomeEnvelope>(scope, local_value).map_err(
+                    |error| WorkflowGuestError {
+                        message: format!("Workflow return could not be persisted: {error}"),
+                        error_kind: None,
+                        error_phase: Some("return-serialization".to_string()),
+                    },
+                )?
+            };
+            if !outcome.ok {
+                return Err(WorkflowGuestError {
+                    message: outcome
+                        .message
+                        .unwrap_or_else(|| "Workflow script failed.".to_string()),
+                    error_kind: outcome.error_kind,
+                    error_phase: outcome.error_phase,
+                });
+            }
+            serde_json::to_string(&outcome.value.unwrap_or(Value::Null)).map_err(|error| {
+                WorkflowGuestError {
                     message: format!("Workflow return could not be persisted: {error}"),
                     error_kind: None,
                     error_phase: Some("return-serialization".to_string()),
-                },
-            )?
-        };
-        if !outcome.ok {
-            return Err(WorkflowGuestError {
-                message: outcome
-                    .message
-                    .unwrap_or_else(|| "Workflow script failed.".to_string()),
-                error_kind: outcome.error_kind,
-                error_phase: outcome.error_phase,
-            });
+                }
+            })
         }
-        serde_json::to_string(&outcome.value.unwrap_or(Value::Null)).map_err(|error| {
-            WorkflowGuestError {
-                message: format!("Workflow return could not be persisted: {error}"),
-                error_kind: None,
-                error_phase: Some("return-serialization".to_string()),
-            }
-        })
+        .await;
+        {
+            let _isolate_dispose = v8_isolate_init_lock();
+            drop(runtime);
+        }
+        outcome
     })
 }
 
@@ -2495,11 +2565,23 @@ pub fn validate_workflow_script(
 /// on an `(async () => { … })()` wrapper would *evaluate* it, so the body is wrapped in a function
 /// expression that is compiled and immediately discarded.
 fn compile_check(script: &str) -> Option<super::types::WorkflowScriptValidationError> {
+    // ⚠ Held for this isolate's WHOLE life, unlike `run_isolate`'s create/dispose-only guard.
+    //
+    // Not an inconsistency — the two are different shapes. `run_isolate` executes arbitrary guest
+    // script for up to the workflow's whole timeout, so locking its execution would serialize
+    // concurrent workflow runs. This function only PARSES one script in a throwaway isolate: no
+    // ops, no prelude, no snapshot, no I/O, no await, microseconds end to end. Serializing it
+    // costs nothing measurable and buys the last piece of correctness — measured, this was the
+    // final residual abort (~4% of full-suite runs) once create-vs-create and create-vs-dispose
+    // were closed, because even a bare `execute_script` mutates process-global V8 state that a
+    // concurrent `Isolate::New`/`Dispose` on another thread is also touching.
+    let _isolate_whole_life = v8_isolate_init_lock();
     let mut runtime = deno_core::JsRuntime::new(deno_core::RuntimeOptions::default());
     // Compiling `(async function () { <body> })` parses the body without executing a statement of
     // it, which is exactly the check upstream gets from acorn.
     let probe = format!("(async function () {{\n{script}\n}});");
-    match runtime.execute_script("workflow-script-validate.js", probe) {
+    let compiled = runtime.execute_script("workflow-script-validate.js", probe);
+    let outcome = match compiled {
         Ok(_) => None,
         Err(error) => {
             let raw = error.to_string();
@@ -2518,7 +2600,11 @@ fn compile_check(script: &str) -> Option<super::types::WorkflowScriptValidationE
                 column: None,
             })
         }
-    }
+    };
+    // Explicit, so the isolate is disposed while `_isolate_whole_life` is still held rather than
+    // at the closing brace, where the guard would already have been released.
+    drop(runtime);
+    outcome
 }
 
 /// pi `runWorkflowScript` (`scripted-workflow.ts:1717-2284`).
@@ -3161,6 +3247,61 @@ mod tests {
         let broken = validate_workflow_script("return {", false).unwrap();
         assert!(!broken.ok);
         assert!(!broken.errors[0].message.is_empty());
+    }
+
+    /// STRESS: many workflow isolates EXECUTING concurrently, overlapping each other and a stream
+    /// of short-lived `validate` isolates being created and disposed on other threads.
+    ///
+    /// This is the shape production takes when a model emits two `subagent workflowScript` calls in
+    /// one assistant message: the tool inherits `ExecMode::Parallel`, so `execute_parallel`
+    /// `joinset.spawn`s both into the SAME process, and each `run_isolate` takes its own OS thread.
+    /// Separate cwds and separate per-run tokio runtimes do not isolate V8 — `Isolate::New` and
+    /// `Isolate::Dispose` mutate process-global state shared by every thread.
+    ///
+    /// An unsynchronized overlap does not fail an assertion here — it ABORTS the process (SIGABRT,
+    /// libc++ `vector[] index out of bounds`), because a panic cannot unwind across the V8 FFI
+    /// boundary. So the property under test is "the process survives", and the only way to observe
+    /// a regression is that this test takes the whole harness down with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_workflow_isolates_do_not_race_v8_global_state() {
+        let script = r#"
+const items = [];
+for (let i = 0; i < 4; i++) items.push({ key: "c" + i, agent: "worker", task: "T" + i });
+const results = await runs.all(items);
+return { count: results.length };
+"#;
+        for round in 0..6 {
+            let mut tasks: Vec<tokio::task::JoinHandle<Result<(), String>>> = Vec::new();
+            // Long-lived isolates, executing guest script concurrently with each other.
+            for _ in 0..6 {
+                let host = Arc::new(FakeHost::new(Duration::from_millis(15)));
+                let opts = options(host, script);
+                tasks.push(tokio::spawn(async move {
+                    run_workflow_script(opts)
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| error.message)
+                }));
+            }
+            // Short-lived validate isolates created AND disposed while the above are mid-execution.
+            for _ in 0..6 {
+                tasks.push(tokio::spawn(async {
+                    for _ in 0..4 {
+                        validate_workflow_script("return 1;", false).map_err(|e| e.to_string())?;
+                        validate_workflow_script("return {", false).map_err(|e| e.to_string())?;
+                    }
+                    Ok(())
+                }));
+            }
+            for task in tasks {
+                let settled = task.await.map_err(|e| e.to_string());
+                assert!(settled.is_ok(), "round {round}: isolate task panicked");
+                assert!(
+                    settled.unwrap_or(Ok(())).is_ok(),
+                    "round {round}: a concurrent workflow isolate failed"
+                );
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

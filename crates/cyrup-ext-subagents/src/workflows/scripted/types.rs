@@ -226,7 +226,7 @@ pub struct WorkflowScriptResult {
 
 /// The partial result a FAILED workflow still yields — pi `Omit<WorkflowScriptResult, "value">`
 /// (`scripted-workflow.ts:1091`). **The partial is the point**: a failed workflow still yields
-/// its trace, children, console and emits, and SCOPE_3g's settlement reads them.
+/// its trace, children, console and emits, and WORKFLOW_3's settlement reads them.
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct WorkflowScriptPartial {
     /// Every `emit(...)` value delivered before the failure.

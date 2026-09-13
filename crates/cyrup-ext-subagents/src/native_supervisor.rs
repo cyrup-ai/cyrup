@@ -1871,15 +1871,35 @@ pub fn native_child_client_should_register(agent_dir: &Path) -> bool {
 }
 
 /// `$CYRUP_CODING_AGENT_DIR` (absolute verbatim, else resolved against `cwd`) if set and non-blank,
-/// else `<home>/.cyrup`.
+/// else `<home>/.cyrup/agent`.
 ///
 /// # The home half is no longer a copy
 ///
 /// This used to spell out `CYRUP_HOME` -> `HOME` -> `std::env::home_dir` -> `temp_dir` itself,
 /// "byte-identical to `cyrup_intercom::paths::agent_dir_path_from`, which the dependency edge
-/// forbids importing" — two private copies kept in step by a pinning test. Both now call
-/// [`cyrup_config::paths::cyrup_dir_from`], so there is one ladder and the pinning test asserts a
-/// shared implementation rather than a coincidence.
+/// forbids importing" — two private copies kept in step by a pinning test. Both now go through
+/// [`cyrup_config::paths`], so there is one ladder and the pinning test asserts a shared
+/// implementation rather than a coincidence.
+///
+/// # The `/agent` component is load-bearing — do not drop it again
+///
+/// The tail was `<home>/.cyrup` (`cyrup_dir_from`) and is now `<home>/.cyrup/agent`
+/// ([`cyrup_config::paths::cyrup_agent_dir_from`], the ladder `ConfigDirs::agent_dir` itself
+/// resolves, `cyrup-config/src/env.rs:222-227`). pi's own `getAgentDirPath` is `<home>/.pi/agent`;
+/// the `/agent` had been dropped on both sides of the port.
+///
+/// It matters because THIS function decides, in a child process, whether intercom looks installed
+/// — [`intercom_supervisor_channel_available`] joins `intercom/config.json` onto the result. The
+/// intercom extension answers the same question against the dir the binary hands it, which is
+/// `ConfigDirs::agent_dir`. With the two spellings disagreeing, a file-based install
+/// (`<agent_dir>/intercom/config.json`, no `CYRUP_INTERCOM`) made the extension claim the bare
+/// `intercom` tool while this side concluded intercom was absent and registered
+/// [`NativeChildIntercomTool`] under the same name — a duplicate registration, which is a hard
+/// extension-load failure that stops the child booting at all. Same directory, same answer, one
+/// provider.
+///
+/// Note this does NOT affect [`supervisor_channel_root`], which is `temp_root_dir()`-based and
+/// carries no agent-dir component — so the channel-dir signal those gates also read is unchanged.
 ///
 /// The OVERRIDE half stays local on purpose: `$CYRUP_CODING_AGENT_DIR` here resolves a relative
 /// value against `cwd`, which is `getAgentDirPath`'s contract and is NOT what
@@ -1904,11 +1924,17 @@ pub fn intercom_agent_dir_from(
             }
         };
     }
-    // THE home ladder, shared. The adapter exists because this function's `env` seam is
-    // `String`-shaped — it is fed by `SubagentsExtension::env_lookup`, which layers
+    // THE agent-dir ladder, shared with `ConfigDirs::agent_dir` and with
+    // `cyrup_intercom::paths::agent_dir_path_from`. The adapter exists because this function's
+    // `env` seam is `String`-shaped — it is fed by `SubagentsExtension::env_lookup`, which layers
     // `SubagentExtensionConfig::env_overrides` over the process environment — while the shared
     // ladder is `OsString`-shaped so a non-UTF-8 path cannot be dropped to the next rung.
-    cyrup_config::paths::cyrup_dir_from(&|key| env(key).map(std::ffi::OsString::from))
+    //
+    // `$CYRUP_CODING_AGENT_DIR` already returned above, so the only override still reachable here
+    // is `CYRUP_AGENT_DIR` — exactly the one that must move in lockstep with the binary.
+    let adapter = |key: &str| env(key).map(std::ffi::OsString::from);
+    let home = cyrup_config::paths::cyrup_home_dir_from(&adapter).unwrap_or_else(std::env::temp_dir);
+    cyrup_config::paths::cyrup_agent_dir_from(&home, &adapter)
 }
 
 #[cfg(test)]
@@ -2358,7 +2384,9 @@ mod tests {
             ),
             PathBuf::from("/work/rel/agent")
         );
-        // A blank one is ignored; CYRUP_HOME beats HOME; the suffix is `.cyrup`.
+        // A blank one is ignored; CYRUP_HOME beats HOME; the suffix is `.cyrup/agent` — the SAME
+        // directory `ConfigDirs::agent_dir` resolves, which is what keeps the intercom-install
+        // answer identical on both sides of the crate boundary (see the fn doc).
         assert_eq!(
             intercom_agent_dir_from(
                 &|k| match k {
@@ -2369,11 +2397,23 @@ mod tests {
                 },
                 None
             ),
-            PathBuf::from("/h1/.cyrup")
+            PathBuf::from("/h1/.cyrup/agent")
         );
         assert_eq!(
             intercom_agent_dir_from(&|k| (k == "HOME").then(|| "/h2".to_string()), None),
-            PathBuf::from("/h2/.cyrup")
+            PathBuf::from("/h2/.cyrup/agent")
+        );
+        // `CYRUP_AGENT_DIR` moves it, in lockstep with the binary's own resolution.
+        assert_eq!(
+            intercom_agent_dir_from(
+                &|k| match k {
+                    "CYRUP_AGENT_DIR" => Some("/opt/alt-agent".to_string()),
+                    "HOME" => Some("/h2".to_string()),
+                    _ => None,
+                },
+                None
+            ),
+            PathBuf::from("/opt/alt-agent")
         );
     }
 

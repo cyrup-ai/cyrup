@@ -374,6 +374,8 @@ This area covers `cyrup/crates/cyrup-core` (message/type model, JSONL serializat
 | ~~PROV-069~~ | ~~critical~~ **CLOSED 2026-08-15** | port-bug | S | The model's `max_tokens` never reached the request, so the server applied its own ceiling — **CLOSED 2026-08-15** in `e677555`. **Root cause:** `GenConfig::max_tokens` has no production writer (`grep -rn '\.max_tokens(' crates/ | grep -v tests` is empty; the builder at `agent.rs:2294` is test-only), and the body emitted the key only when that option was `Some`, so it was never emitted at all. **The catalog's `max_tokens` — all 1087 rows, regenerated from pinned `b0c2a90e`, reconciled field-by-field, covered by tests — was decorative.** **MEASURED against the live provider, not inferred:** the same prompt to `moonshotai/Kimi-K3` with `max_tokens` omitted returns `finish_reason: length` at `completion_tokens: 2048` (**Together's default cap**), of which **1438 were reasoning tokens** — leaving ~610 for the visible answer; with `max_tokens: 131072` it returns `finish_reason: stop` at 3135 tokens. Fix sends the caller's ceiling when present and the model's otherwise, which is upstream's own rule at `anthropic-messages.ts:989` (`options?.maxTokens ?? model.maxTokens`) and the stated intent of `adjustMaxTokensForThinking`; recorded as a `CYRUP-DELTA` because `openai-completions.ts:716` guards on the caller value alone. **Test note:** every other wire test hand-supplies `max_tokens: Some(...)`, proving serialisation and hiding the only path that ships — 7112 tests passed while the product sent no ceiling. Verified RED by removing the fallback. **Two wrong diagnoses recorded so they are not retried:** the agent loop is a faithful port (`agent.rs:593` == `agent-loop.ts:196-200`) and was never implicated; and a port of pi's `isRecoverableLength` was drafted and REVERTED because it routes a truncated turn into `run_auto_compaction`, which at 3% of a 1M window trades truncation for compaction spam — it treats the symptom. **`PROV-068` compounds this** (reasoning pinned to `high` burns the ceiling) but is a separate defect and remains open. |
 | PROV-070 | low | cyrup-original | S | **`moonshotai/Kimi-K3` is a Together roster row cyrup ships and pi does not — the first deliberate ADDITION to a ported provider catalog, and it had no row in this file.** Landed `2add245` (2026-08-15). The model is `providers/together.rs:278-288` (`cost(3.0, 15.0, 0.3)`, `1_000_000` context, `131_072` max_tokens, `together_compat(false, Some(ThinkingFormat::Together))`), under a 21-line provenance comment at `:257-277` recording that every value except `max_tokens` was MEASURED from `GET https://api.together.xyz/v1/models` on 2026-08-15 and that `131_072` was verified with a live request that returned `finish_reason: stop`. Upstream's `together.models.ts` @`b0c2a90e` stops at K2.7-Code — K3 shipped 2026-07-26, after the pinned revision — so this is a signed-off divergence, not drift. **It is GUARDED, which is why the severity is `low`**: sweep 10's roster test was renamed and widened to `full_catalog_ported_from_pi_plus_recorded_additions` (`:442`), asserting `models.len() == 20 + ADDITIONS.len()` (`:448`) against `const ADDITIONS: &[&str] = &["moonshotai/Kimi-K3"]` (`:447`), so an ACCIDENTAL extra row still fails while a NAMED one does not. **NOT a regeneration hazard — checked, against the obvious assumption from `PROV-018`/`PROV-060`:** `together` has no entry in the generator's `CATALOGS` at all (`xtask/src/main.rs:65-66`: "cyrup hand-ports Together's rows as Rust literals … so this generator cannot own them") and the manifest note restates the exception (`xtask/src/main.rs:588`), so nothing regenerates this roster and the `DELTAS` table is the wrong instrument for it. **The live hook is `PROV-068`, which is still open at `high`:** this row's `thinking_level_map` is `None` (`providers/together.rs:286`) where both Kimi siblings — K2.6 (`:247`) and K2.7-Code (`:290`) — pass `Some(m())`, and `m` (`:100`) is `level_map(&[("minimal", None), ("low", None), ("medium", None)])`, i.e. the three explicit nulls `get_supported_thinking_levels` (`collection.rs:787-810`) reads as UNSUPPORTED — `Some(None) => false` at `:800`. `None` was chosen deliberately so K3 keeps the full ladder while `PROV-068` is open, and the reasoning is in-source at `providers/together.rs:272-277`. **`PROV-068` must revisit this row either way it resolves** — if explicit-null comes to mean "supported, send no provider value" the asymmetry is pointless; if it keeps meaning "unsupported" then the siblings are the bug and K3 is the template. **RESIDUAL, one line:** `xtask/src/main.rs:65` still says cyrup "hand-ports Together's **20** rows"; it is 21 (re-verified 2026-09-04: now at `:74`, text unchanged). — **`PROV-068` RESOLVED 2026-09-04, REFUTED — this row's "either way" is settled, not pointless.** `PROV-068` closed on the "unsupported" reading, and the siblings are NOT the bug: `together-models.test.ts:24` @v0.83.0 shows the K2.6 map `{minimal: null, low: null, medium: null}` is pi's own catalog data, not a cyrup invention, so K2.6/K2.7-Code's two-rung ladder is a correct port. K3's `thinking_level_map: None` therefore stays exactly what `together.rs`'s comment (updated in the same commit, `24b6ffe`) now says: a deliberate cyrup-original choice for a model with no upstream row to copy, not a hedge against an open question. This item's own severity and scope are otherwise unchanged — it is still the one-line `xtask` residual above. |
 
+| PROV-071 | medium | tooling | L | **Every embedded catalog is frozen at `b0c2a90e` for the same structural reason — this was never an xai defect** — 39/39 of pi's `*.models.ts` modules at HEAD `71dca871b` are the post-`a9f6a3159` re-export of gitignored data, so `git show` recovers nothing for ANY provider at any revision after `b0c2a90e`. `XAI_1` unfroze ONE (`xai`) by fetching `https://pi.dev/api/models/providers/<id>`, which serves rows pre-shaped into cyrup's native `Model` JSON — a materially lower-effort route than porting `generate-models.ts`'s per-provider transform. The other 34 are NOT fixed by XAI_1..XAI_4 and are tracked here as unscheduled follow-up. Amends `DRIFT-009`, whose bolded prohibition on seeding from pi.dev was scoped to the blocked four (where `git show` WAS available) and does not reach a provider for which the pinned path is provably dead. See also `PROV-018`, `PROV-039`, `PROV-060`. |
+
 ## PROV-003 — `ApiKeyAuth` has no `login`; `Models` has no `login`/`logout` (OAuth flow half closed)
 
 **Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** confirmed (partially closed)
@@ -1914,6 +1916,79 @@ not close `PROV-014`**, which is the actual port work.
 
 **Verify** — The `[CYRUP-DELTA]` grep finds it; a test asserting `ApiRegistry` constructs nothing until the first `get`, so the "same observable laziness" claim is pinned rather than asserted.
 
+
+## PROV-071 — The embedded catalog floor is frozen for every provider, not just the four that are empty
+
+**Kind** tooling · **Severity** medium · **Effort** L · **Confidence** confirmed · **Filed** 2026-09-13
+
+**upstream** — `a9f6a3159` (`feat(ai): separate generated model data (#6765)`, 2026-07-17) added
+`packages/ai/src/providers/data/` to `.gitignore` and rewrote every `*.models.ts` into an 8-line
+re-export of that now-gitignored, models.dev-fetched JSON. At HEAD `71dca871b` (2026-09-11) **all 39
+provider modules are that shape** — verified by reading every one, not sampled. `b0c2a90e` is
+`a9f6a3159`'s direct parent and the only revision at which any of them is a data literal.
+
+**cyrup** — `xtask gen-catalogs` recovers catalogs with `git show` against `b0c2a90e`
+(`xtask/src/main.rs`, `PROV-018`/`PROV-060`). That mechanism is therefore **permanently incapable of
+producing anything newer, for any provider** — not only for the four with no rows at all
+(`DRIFT-009`). The 31 "present" catalogs are frozen at 2026-07-17 exactly as hard as the four empty
+ones; they simply fail silently, as stale data rather than as missing data.
+
+**Impact** — Three things, and the third is why this is filed rather than left as a note.
+
+1. **Scope was mis-stated across passes.** The catalog-floor discussion has been framed as
+   "`DRIFT-009`: four catalogs short". The real shape is "35 catalogs frozen, four of them at zero
+   rows". `PROV-054`…`PROV-059` were the visible symptoms for one provider; the same latent drift
+   applies to the other 30 and is unmeasured.
+2. **A stale catalog does not degrade to 'missing'.** As `01-cyrup-core-and-provider.md:211` already
+   records, cyrup's resolvers invent a default wherever the catalog is silent, so a stale row
+   degrades to *confidently wrong* — wrong price, wrong context window, wrong compat flag, no
+   symptom.
+3. **The fix now has a demonstrated route, and it is cheap.** `XAI_1` fetches
+   `https://pi.dev/api/models/providers/xai` at generation time. pi serves that endpoint **already
+   shaped into cyrup's native `Model` JSON** — exclusions applied, api unified — so no
+   models.dev-shape transform and no port of `generate-models.ts` (3000+ lines, heavy per-provider
+   hardcoding) is required. The remaining 34 are mechanically similar *once the plumbing exists*,
+   which it now does (`xtask/src/live_catalog.rs`, `LIVE_CATALOGS`). **NOT assumed complete without
+   doing it** — each provider needs its endpoint verified and its assertions rewritten (see the Fix).
+
+**Amends `DRIFT-009`, and the amendment is load-bearing.** That row says seeding from the pi.dev
+artifact is *"an explicit owner decision … which this item's own rewrite forbids in bold"*. The
+prohibition was correct in its own scope: it was written against a proposal to seed the **blocked
+four** from pi.dev *instead of* from git, before `PROV-060` showed `git show` at `b0c2a90e` was
+available. It does not reach a provider for which the pinned path is provably dead — `xai.models.ts`
+has been a re-export since `a9f6a3159`, so no revision yields newer rows and there is no `git show`
+to prefer. **The decision recorded here is narrow: pi.dev is a permitted source when, and only when,
+the pinned-revision path cannot reach the data for that provider.** Seeding from pi.dev to avoid the
+work of reading git remains forbidden.
+
+**Reachability is environment-specific and both measurements are real.** `DRIFT-009` and
+`00-residual-ledger.md:195` record `curl https://models.dev/api.json` → `CONNECT tunnel failed,
+response 403` (re-measured 2026-09-05) and build an escalation on it. From this workspace on
+**2026-09-13**: `models.dev/api.json` → **200**, `pi.dev/api/models/providers/xai` → **200**. Neither
+is authoritative; the block belongs to the sandbox's egress policy, not to the hosts. **Re-measure,
+date the measurement, and do not inherit either value.**
+
+**Fix** — Generalize `LIVE_CATALOGS` to the remaining 34, and do it as ONE piece of work with the
+assertion change, not two:
+(1) verify `https://pi.dev/api/models/providers/<id>` for each provider (a 404 there means that
+    provider stays on the pinned path and must be said so, not silently skipped);
+(2) **rewrite the count/roster assertions in the same change.** `providers/fleet.rs`'s
+    `EXPECTED_COUNTS` pins an exact model count per provider. That is a valid fact about a commit
+    while a catalog is git-pinned, and a scheduled failure the moment it is live-fetched — re-running
+    `gen-catalogs` turns it red with no code change. `XAI_2` does this for xai (removes the count,
+    asserts instead what pi's generator hardcodes: protocol, provider tag, `baseUrl`, the exclusion
+    set, non-empty) and is the worked example to copy. Generalizing the fetch without this ships 34
+    scheduled failures;
+(3) keep the global `generatedAt`/`source` as the floor for whatever remains pinned — moving it to
+    follow a live fetch discards every other provider's valid persisted overlay (pi #7016).
+
+**Verify** — `gen-catalogs --roster <rev>` accounts for every upstream module across all three
+buckets and exits 0; `catalog_manifest.json` names a per-provider source for each live catalog with
+its own `fetchedAt`/`revision`.
+
+**NOT closed by XAI_1..XAI_4.** Those four tasks fix xai's data, its stale assertions, and the
+runtime refresh path. The other 34 catalogs are untouched and unscheduled. This row is the record
+that they are stale, not merely un-audited.
 
 ## Coverage
 

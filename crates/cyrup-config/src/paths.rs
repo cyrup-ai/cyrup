@@ -388,17 +388,6 @@ pub fn cyrup_home_override_from(env: EnvLookup<'_>) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// `<home>/.cyrup` — the directory `cyrup-intercom` and `cyrup-ext-subagents`' supervisor each
-/// derived through their own private copy of the home ladder.
-///
-/// Takes the library terminal ([`std::env::temp_dir`]) because both callers are libraries.
-#[must_use]
-pub fn cyrup_dir_from(env: EnvLookup<'_>) -> PathBuf {
-    cyrup_home_dir_from(env)
-        .unwrap_or_else(std::env::temp_dir)
-        .join(".cyrup")
-}
-
 /// The ENVIRONMENT tier of a directory override: the first non-blank key, `~`-expanded against
 /// `home`. `None` when no key is set, so a caller with further tiers (a CLI flag, a default) can
 /// layer them itself.
@@ -544,16 +533,6 @@ mod tests {
         );
     }
 
-    /// `<home>/.cyrup` — the answer `cyrup-intercom` and `cyrup-ext-subagents`' supervisor each
-    /// derived through a private copy of the home ladder, kept in step by a pinning test.
-    #[test]
-    fn the_cyrup_dir_hangs_off_the_same_home() {
-        let lookup = env(&[("CYRUP_HOME", "/sandbox"), ("HOME", "/real")]);
-        assert_eq!(
-            super::cyrup_dir_from(&lookup),
-            PathBuf::from("/sandbox/.cyrup")
-        );
-    }
     use super::*;
 
     #[test]

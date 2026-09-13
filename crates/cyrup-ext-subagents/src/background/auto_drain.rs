@@ -33,7 +33,7 @@
 use std::path::PathBuf;
 
 use crate::background::run_status::list_active_runs;
-use crate::background::wait::{WaitDeps, WaitParams, wait_for_subagents};
+use crate::background::wait::{WaitDeps, WaitOutcome, WaitParams, wait_for_subagents};
 use crate::identity::SessionId;
 
 /// pi `DEFAULT_AUTO_DRAIN_TIMEOUT_MS` (`auto-drain.ts:7`) — 30 minutes.
@@ -64,14 +64,19 @@ pub trait DrainProbe: Send + Sync {
     ) -> Result<bool, String>;
 }
 
-/// pi `AutoDrainDeps.wait` (`auto-drain.ts:13-17`) — one bounded wait-for-everything.
+/// pi `AutoDrainDeps.wait` (`auto-drain.ts:15-19`) — one bounded wait-for-everything.
 ///
-/// `Err(text)` is pi's `waitResult.isError` with `resultText(waitResult)` as the payload — the
-/// shape [`crate::background::wait::wait_for_subagents`] already returns.
+/// Returns the whole [`crate::background::wait::WaitOutcome`], because the drain's caller wants
+/// the same three facts pi's `AgentToolResult<Details>` carries: upstream reads
+/// `waitResult.isError` (`auto-drain.ts:73`) and `resultText(waitResult)` (`:23-25`, `:74`) off
+/// one value. Keeping `Result` at this one boundary would reintroduce the `Ok`/`Err` flip
+/// [`crate::background::wait::wait_for_subagents`] no longer makes — and would re-break the
+/// timeout, since a window that merely elapsed is NOT an error upstream and must let the loop
+/// reach its own deadline check.
 #[async_trait::async_trait]
 pub trait DrainWaiter: Send + Sync {
     /// Block until everything tracked at entry is finished, or `timeout_ms` elapses.
-    async fn wait_all(&self, timeout_ms: u64) -> Result<String, String>;
+    async fn wait_all(&self, timeout_ms: u64) -> WaitOutcome;
 }
 
 /// pi `hasOutstandingWork` (`auto-drain.ts:26-34`).
@@ -137,7 +142,7 @@ pub struct SubagentDrainWaiter {
 
 #[async_trait::async_trait]
 impl DrainWaiter for SubagentDrainWaiter {
-    async fn wait_all(&self, timeout_ms: u64) -> Result<String, String> {
+    async fn wait_all(&self, timeout_ms: u64) -> WaitOutcome {
         // pi `wait({ all: true, timeoutMs: remainingMs }, undefined, …)` (`auto-drain.ts:56-58`):
         // the `undefined` AbortSignal is a fresh, never-cancelled token — the turn is already
         // ending, so there is nothing left to abort the drain with.
@@ -170,11 +175,14 @@ impl DrainWaiter for SubagentDrainWaiter {
 /// * a work-discovery fault from `probe` — pi's `hasWork` throw, propagated UNCHANGED (it is not
 ///   wrapped in the `Auto-drain failed for session …` phrasing, because upstream never catches it
 ///   to re-word it; see [`DrainProbe::has_outstanding_work`]);
-/// * the deadline elapsed with work still active;
+/// * the deadline elapsed with work still active — this is ALSO what a window-elapsed wait falls
+///   through to on the next lap, since [`crate::background::wait::WaitVerdict::WindowElapsed`] is
+///   not an error (pi `:73-75`);
 /// * the underlying wait reported an error — see [`WaitDeps::fail_on_failed_runs`] /
 ///   [`WaitDeps::fail_on_attention`], which are what make a failed child or unresolved attention
-///   an error here rather than a quiet exit. (pi's `|| "bg_wait returned an error without
-///   details"` fallback at `:66` is unreachable: cyrup's wait never returns an empty message.)
+///   an error here rather than a quiet exit. A window-elapsed wait is deliberately **not** one of
+///   these; it is the bullet above. (pi's `|| "bg_wait returned an error without details"`
+///   fallback at `:66` is unreachable: cyrup's wait never returns an empty message.)
 pub async fn drain_outstanding_work(
     session_id: &SessionId,
     timeout_ms: u64,
@@ -198,12 +206,19 @@ pub async fn drain_outstanding_work(
                  session '{session_id}'."
             ));
         }
-        if let Err(text) = waiter
+        let outcome = waiter
             .wait_all(u64::try_from(remaining_ms).unwrap_or(0))
-            .await
-        {
+            .await;
+        // pi `:73-75`. A WINDOW-ELAPSED wait is deliberately NOT an error here: the loop falls
+        // through, re-probes, and the `remaining_ms <= 0` check above (`:194-200`) raises
+        // upstream's own `Auto-drain timed out after {N}ms …` (`auto-drain.ts:58-59`) on the next
+        // lap — which is the message a drain that ran out of time should carry, instead of the
+        // wrapped `Auto-drain failed for session '…': Wait timed out after …` this branch used to
+        // produce.
+        if outcome.is_error() {
             return Err(format!(
-                "Auto-drain failed for session '{session_id}': {text}."
+                "Auto-drain failed for session '{session_id}': {}.",
+                outcome.text
             ));
         }
     }
@@ -223,6 +238,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use crate::background::wait::WaitVerdict;
 
     fn session(v: &str) -> SessionId {
         SessionId::parse(v).expect("non-empty")
@@ -272,13 +288,18 @@ mod tests {
     }
 
     /// A waiter recording each granted timeout and answering from a script.
+    ///
+    /// Scripted as whole [`WaitOutcome`]s rather than `Result`s since WORKFLOW_5: the drain reads
+    /// `is_error()` off the value, so a double that could only say `Ok`/`Err` could no longer
+    /// express the outcome that matters most here — a WINDOW-ELAPSED wait, which is not an error
+    /// and must let the loop reach its own deadline check.
     struct ScriptedWaiter {
-        answers: Mutex<Vec<Result<String, String>>>,
+        answers: Mutex<Vec<WaitOutcome>>,
         timeouts: Mutex<Vec<u64>>,
     }
 
     impl ScriptedWaiter {
-        fn new(answers: Vec<Result<String, String>>) -> Self {
+        fn new(answers: Vec<WaitOutcome>) -> Self {
             let mut answers = answers;
             answers.reverse();
             Self {
@@ -288,15 +309,41 @@ mod tests {
         }
     }
 
+    /// A scripted resolution that is not an error — the `Ok(text)` of every pre-WORKFLOW_5 lap.
+    fn lap(text: &str) -> WaitOutcome {
+        WaitOutcome::plain(
+            text.to_string(),
+            WaitVerdict::Resolved {
+                failed_runs: 0,
+                attention_runs: 0,
+                reported_as_error: false,
+            },
+        )
+    }
+
+    /// A scripted resolution the deps flags reported as an error — auto-drain's
+    /// `failOnFailedRuns` case (pi `:751`), which is the only way `wait_all` can hand the drain an
+    /// error now.
+    fn failed_lap(text: &str) -> WaitOutcome {
+        WaitOutcome::plain(
+            text.to_string(),
+            WaitVerdict::Resolved {
+                failed_runs: 1,
+                attention_runs: 0,
+                reported_as_error: true,
+            },
+        )
+    }
+
     #[async_trait::async_trait]
     impl DrainWaiter for ScriptedWaiter {
-        async fn wait_all(&self, timeout_ms: u64) -> Result<String, String> {
+        async fn wait_all(&self, timeout_ms: u64) -> WaitOutcome {
             self.timeouts.lock().expect("lock").push(timeout_ms);
             self.answers
                 .lock()
                 .expect("lock")
                 .pop()
-                .unwrap_or(Ok(String::new()))
+                .unwrap_or_else(|| lap(""))
         }
     }
 
@@ -335,7 +382,7 @@ mod tests {
     async fn work_added_while_draining_extends_the_loop_until_the_probe_clears() {
         // pi's stated contract: "including work added while draining" — two laps, then clear.
         let probe = ScriptedProbe::new(&[true, true, false]);
-        let waiter = ScriptedWaiter::new(vec![Ok("lap one".into()), Ok("lap two".into())]);
+        let waiter = ScriptedWaiter::new(vec![lap("lap one"), lap("lap two")]);
         drain_outstanding_work(&session("s1"), 1000, &|| 0, &probe, &waiter)
             .await
             .expect("drained after two laps");
@@ -352,7 +399,7 @@ mod tests {
             if tick == 0 { 0 } else { 10_000 }
         };
         let probe = ScriptedProbe::new(&[true, true]);
-        let waiter = ScriptedWaiter::new(vec![Ok("lap".into())]);
+        let waiter = ScriptedWaiter::new(vec![lap("lap")]);
         let err = drain_outstanding_work(&session("sess-a"), 500, &now, &probe, &waiter)
             .await
             .expect_err("the deadline must end the drain");
@@ -366,7 +413,7 @@ mod tests {
     #[tokio::test]
     async fn a_failing_wait_surfaces_as_pi_verbatim() {
         let probe = ScriptedProbe::new(&[true]);
-        let waiter = ScriptedWaiter::new(vec![Err("1 run failed".into())]);
+        let waiter = ScriptedWaiter::new(vec![failed_lap("1 run failed")]);
         let err = drain_outstanding_work(&session("sess-a"), 1000, &|| 0, &probe, &waiter)
             .await
             .expect_err("a wait error must end the drain");
@@ -382,7 +429,7 @@ mod tests {
             i64::try_from(ticks.fetch_add(1, Ordering::SeqCst)).unwrap_or(i64::MAX) * 100
         };
         let probe = ScriptedProbe::new(&[true, true, false]);
-        let waiter = ScriptedWaiter::new(vec![Ok(String::new()), Ok(String::new())]);
+        let waiter = ScriptedWaiter::new(vec![lap(""), lap("")]);
         drain_outstanding_work(&session("s1"), 1000, &now, &probe, &waiter)
             .await
             .expect("drains");

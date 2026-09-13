@@ -172,12 +172,42 @@ impl Tool for SubagentTool {
 
     async fn execute(
         &self,
-        _call_id: ToolCallId,
+        call_id: ToolCallId,
         params: serde_json::Value,
         cancel: CancelToken,
         on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
-        let parsed: SubagentToolParams = serde_json::from_value(params)
+        // WORKFLOW_2 / WORKFLOW_1 §6.3 — refuse a nested `workflowScript` at the boundary that
+        // actually leaks. `runs.run` already refuses one in the guest (`prelude.js:186` in
+        // `cyrup-workflow-runtime`), but a CHILD AGENT calling this tool with a `workflowScript`
+        // never goes through `runs.run`.
+        //
+        // It must run BEFORE `from_value`: `SubagentToolParams` carries neither
+        // `workflowScriptPath`, nor `workflow`, nor the marker key, so a post-parse check cannot
+        // see two of `refuse_nested_workflow`'s three `starts_a_script` disjuncts.
+        //
+        // The marker reaches this PROCESS through the child's environment, not through the request
+        // — a model-authored tool call cannot carry it. Stamping it onto the request map from the
+        // env is what lets `refuse_nested_workflow`'s two-conjunct check apply UNCHANGED, and it is
+        // the half of §6.3 that WORKFLOW_1 left unwired: the only other producer of the marker is
+        // the engine itself (`engine.rs:1905`), i.e. in-process, so the refusal could never fire on
+        // a model-authored request. Reading `std::env::var_os` is fine here — `clippy.toml` bans
+        // `set_var`/`remove_var` only.
+        let mut request = params;
+        if std::env::var_os(crate::extension::executor::workflow::WORKFLOW_CHILD_ENV).is_some()
+            && let Some(map) = request.as_object_mut()
+        {
+            map.insert(
+                crate::workflows::scripted::WORKFLOW_CHILD_MARKER.to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
+        if let Some(map) = request.as_object()
+            && let Some(refusal) = crate::workflows::scripted::refuse_nested_workflow(map)
+        {
+            return Err(ToolError::new(refusal));
+        }
+        let parsed: SubagentToolParams = serde_json::from_value(request)
             .map_err(|e| ToolError::new(format!("invalid subagent tool call: {e}")))?;
 
         // Observe the full parsed pi-union once, keeping every field live under the workspace's
@@ -264,10 +294,24 @@ impl Tool for SubagentTool {
         // NON-EMPTY `chain`/`tasks` array, not merely by the field being present — an explicit
         // `tasks: []` or `chain: []` MUST fall through to this "provide exactly one mode" error
         // rather than silently executing as an empty parallel run / empty chain.
+        //
+        // WORKFLOW_2: a `workflowScript` is a FOURTH mode. The blank-after-trim test mirrors the
+        // existing arms' non-empty-array test and upstream's own `workflowScript must not be
+        // empty.` — a `workflowScript: ""` must fall through to this same error rather than be
+        // dispatched and then refused by the engine.
+        let has_workflow = parsed
+            .workflow_script
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty());
         let has_chain = parsed.chain.as_ref().is_some_and(|c| !c.is_empty());
         let has_tasks = parsed.tasks.as_ref().is_some_and(|t| !t.is_empty());
-        let has_single = !has_chain && !has_tasks && parsed.agent.is_some();
-        if usize::from(has_chain) + usize::from(has_tasks) + usize::from(has_single) != 1 {
+        let has_single = !has_chain && !has_tasks && !has_workflow && parsed.agent.is_some();
+        if usize::from(has_chain)
+            + usize::from(has_tasks)
+            + usize::from(has_single)
+            + usize::from(has_workflow)
+            != 1
+        {
             return Err(ToolError::new(format!(
                 "Provide exactly one mode. Agents: {}",
                 self.discovered_agent_names_joined(&effective_cwd).await
@@ -345,7 +389,14 @@ impl Tool for SubagentTool {
             explicit_mission,
         )?;
 
-        let outcome = if has_tasks {
+        // WORKFLOW_2: `has_workflow` is checked FIRST because `route_workflow_mode` owns its own
+        // concurrency semantics and should not read as an afterthought to the other three. Arm
+        // ORDER is free here — `parsed` was rebound to a `&SubagentToolParams` above, so all four
+        // arms share one shared reference and nothing is moved (note: `parsed`, never `&parsed`).
+        let outcome = if has_workflow {
+            self.route_workflow_mode(&call_id, parsed, &effective_cwd, on_update, cancel)
+                .await
+        } else if has_tasks {
             self.route_parallel_mode(parsed, &effective_cwd, cancel)
                 .await
         } else if has_chain {
@@ -353,7 +404,8 @@ impl Tool for SubagentTool {
         } else {
             // C19: SINGLE mode is the one shape wired for live progress today — its foreground
             // child's NDJSON stream is folded and forwarded through `on_update` (`route_single` ->
-            // `run_foreground_streaming`). The tool-driven PARALLEL/CHAIN shapes still surface
+            // `run_foreground_streaming`). WORKFLOW is the second (above, same mechanism, one
+            // forwarding sink per child). The tool-driven PARALLEL/CHAIN shapes still surface
             // progress only on completion; streaming their fan-out is the remaining live-progress
             // work (their per-child folds would multiplex through the same
             // `SubagentUpdatePayload.progress[]`).

@@ -10,7 +10,7 @@ fn oauth_canonicalized_markers_match_active_tools() {
         cache_retention: Some(CacheRetention::None),
         ..Default::default()
     };
-    let body = build_params(&opus_4_6(), &ctx, &opts, None, true).unwrap();
+    let body = build_params(&opus_4_6(), &ctx, &opts, EnvSource::default(), true).unwrap();
 
     assert_eq!(tool_names(&body), ["base_tool", "Read"]);
     assert_eq!(body["tools"][1]["defer_loading"], json!(true));
@@ -26,7 +26,14 @@ fn oauth_names_are_normalized_before_the_prior_usage_check() {
     // marker is `read` — same tool after canonicalization, so nothing defers.
     let mut ctx = deferred_ctx(vec![tool_def("base_tool"), tool_def("read")], &["read"]);
     ctx.messages[1] = tc_assistant(&[("call_1", "Read")]);
-    let body = build_params(&opus_4_6(), &ctx, &StreamOptions::default(), None, true).unwrap();
+    let body = build_params(
+        &opus_4_6(),
+        &ctx,
+        &StreamOptions::default(),
+        EnvSource::default(),
+        true,
+    )
+    .unwrap();
 
     assert_eq!(tool_names(&body), ["base_tool", "Read"]);
     assert!(
@@ -66,7 +73,14 @@ fn oauth_dedupe_collapses_case_variants_even_with_the_flag_off() {
         ],
     };
     // Tool references ON (opus 4.6).
-    let body = build_params(&opus_4_6(), &ctx, &StreamOptions::default(), None, true).unwrap();
+    let body = build_params(
+        &opus_4_6(),
+        &ctx,
+        &StreamOptions::default(),
+        EnvSource::default(),
+        true,
+    )
+    .unwrap();
     assert_eq!(tool_names(&body), ["Read"]);
     assert_eq!(body["tools"][0]["description"], "Canonical definition");
 
@@ -75,11 +89,25 @@ fn oauth_dedupe_collapses_case_variants_even_with_the_flag_off() {
         id: "claude-haiku-4-5".into(),
         ..model()
     };
-    let body = build_params(&haiku, &ctx, &StreamOptions::default(), None, true).unwrap();
+    let body = build_params(
+        &haiku,
+        &ctx,
+        &StreamOptions::default(),
+        EnvSource::default(),
+        true,
+    )
+    .unwrap();
     assert_eq!(tool_names(&body), ["Read"]);
 
     // Non-OAuth normalizer is the identity, so both survive — no silent collapse.
-    let body = build_params(&opus_4_6(), &ctx, &StreamOptions::default(), None, false).unwrap();
+    let body = build_params(
+        &opus_4_6(),
+        &ctx,
+        &StreamOptions::default(),
+        EnvSource::default(),
+        false,
+    )
+    .unwrap();
     assert_eq!(tool_names(&body), ["read", "Read"]);
 }
 

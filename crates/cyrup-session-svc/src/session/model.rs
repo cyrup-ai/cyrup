@@ -216,9 +216,10 @@ impl AgentSession {
         for m in cyrup_provider::default_models(cyrup_provider::CreateModelsOptions {
             credentials: None,
             auth_context: None,
-            // The pi.dev overlay loaded once at session-build time (DRIFT-007). Already in memory,
-            // so this SYNC, hot registry read stays free of disk and network I/O.
-            catalog_overlay: self.services.catalog_overlay.clone(),
+            // The LIVE pi.dev overlay (DRIFT-007 + XAI_3). One `RwLock` read + one `Arc` clone —
+            // the same cost as the by-value `.clone()` this replaces — so this SYNC, hot registry
+            // read stays free of disk and network I/O while now observing a mid-session refresh.
+            catalog_overlay: self.services.catalog_overlay.load(),
         })
         .get_models(None)
         {
@@ -254,6 +255,44 @@ impl AgentSession {
             .into_iter()
             .filter(|m| self.has_configured_auth(m))
             .collect()
+    }
+
+    /// Trigger — or JOIN — the single in-flight whole-catalog refresh, bounded by `cancel`
+    /// (pi `refreshModelCatalogs(this.session.modelRuntime, controller.signal)`,
+    /// `modes/interactive/model-catalog-refresh.ts:46-51`).
+    ///
+    /// The BOUND is the caller's, matching pi exactly: the coordinator is timeout-agnostic and the
+    /// 15s budget lives at the call site (`interactive-mode.ts:4872-4876`). Cancelling the token
+    /// stops THIS call and nobody else's.
+    ///
+    /// The credential-gated provider list is resolved HERE, on every call, from
+    /// `services.auth` — the same `AuthStore` instance `/login` writes through
+    /// (`cyrup-tui/src/app/login.rs:342`). pi resolves each provider's credential inside the refresh
+    /// (`models.ts:420-421`) rather than from a captured list, so `/login` followed by `/model`
+    /// refreshes the provider the user just configured. Freezing this list anywhere is FINDING 4.
+    ///
+    /// A refresh that completes installs into the session's live overlay slot, so the very next
+    /// [`Self::available_model_catalog`] read reflects it — including models released since this
+    /// binary was built.
+    ///
+    /// `Ok`-shaped by construction: a session with no wired service (an embedder, the SDK, a test)
+    /// gets a clean empty result, because "this host does not refresh catalogs" is a configuration,
+    /// not a failure.
+    pub async fn refresh_model_catalogs(
+        &self,
+        cancel: cyrup_core::CancelToken,
+    ) -> cyrup_provider::CatalogRefreshResult {
+        let Some(svc) = self.services.model_catalog.as_ref() else {
+            return cyrup_provider::CatalogRefreshResult::default();
+        };
+        // pi `Models.refresh`'s per-provider `if (!credential) return;` (`models.ts:296`, `:420-421`),
+        // hoisted to one pass. `radius` is excluded by the service's own fetch path.
+        let configured: Vec<String> = cyrup_provider::all_providers()
+            .iter()
+            .filter(|p| self.services.auth.has_auth(p.id(), None))
+            .map(|p| p.id().as_str().to_string())
+            .collect();
+        svc.refresh(cancel, configured).await
     }
 
     /// The provider-attribution + session-affinity headers this session attaches to provider requests

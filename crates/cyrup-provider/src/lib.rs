@@ -16,6 +16,7 @@ pub mod api;
 pub mod auth;
 pub mod cache_stats;
 pub mod catalog;
+pub mod catalog_refresh;
 pub mod collection;
 pub mod config_provider;
 pub mod context;
@@ -64,6 +65,10 @@ pub use cache_stats::{
     NOISE_FLOOR_TOKENS, NoPrices, collect_cache_misses, compute_cache_waste, detect_cache_miss,
 };
 pub use catalog::{builtin_catalog, load_catalog};
+pub use catalog_refresh::{
+    CatalogOverlaySlot, CatalogRefreshCoordinator, CatalogRefreshResult, ModelCatalogService,
+    refresh_and_install,
+};
 pub use collection::{
     CreateModelsOptions, EXTENDED_THINKING_LEVELS, Models, ModelsRefreshOptions,
     ModelsRefreshResult, clamp_thinking_level, create_models, get_supported_thinking_levels,
@@ -95,11 +100,13 @@ pub use models_store::{
 pub use provider::{Provider, RefreshModelsContext};
 pub use providers::all::{
     BUILTIN_CATALOG_MANIFEST_JSON, all_images_providers, all_providers, all_providers_with,
-    all_providers_with_overlay, builtin_model_data_generated_at, default_images_models,
-    default_models,
+    all_providers_with_overlay, builtin_model_data_generated_at,
+    builtin_model_data_generated_at_by_provider, default_images_models, default_models,
 };
 pub use providers::builtin_provider_oauth;
-pub use providers::fleet::{FLEET, FleetCatalog, FleetSpec, fleet_providers_with, fleet_spec};
+pub use providers::fleet::{
+    FLEET, FleetCatalog, FleetSpec, FleetWire, fleet_providers_with, fleet_spec,
+};
 pub use providers::{
     ANTHROPIC_BASE_URL, ANTHROPIC_FLEET, ANTHROPIC_PROVIDER_ID, AnthropicFleetSpec, anthropic_auth,
     anthropic_fleet_providers_with, anthropic_fleet_spec, anthropic_models, anthropic_provider,

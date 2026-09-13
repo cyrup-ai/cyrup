@@ -13,15 +13,15 @@
 #![allow(clippy::expect_used, clippy::panic)] // a build script's only failure channel is a panic
 
 fn main() {
-    // Cargo already reruns this build script whenever `cyrup-workflow-runtime` (a
-    // `[build-dependencies]` edge) changes, via its own unit-graph fingerprinting — that is
-    // independent of `rerun-if-changed`, which exists only for file-system inputs a build script
-    // reads directly. This build script reads none, so the only line needed is for itself.
     println!("cargo:rerun-if-changed=build.rs");
 
-    let snapshot = cyrup_workflow_runtime::build_snapshot().unwrap_or_else(|error| {
+    let (snapshot, files) = cyrup_workflow_runtime::build_snapshot().unwrap_or_else(|error| {
         panic!("cyrup-ext-subagents build.rs: workflow snapshot build failed: {error:?}")
     });
+
+    for path in files {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
 
     let out_dir = std::env::var_os("OUT_DIR").expect("cargo always sets OUT_DIR for build scripts");
     let out_path = std::path::Path::new(&out_dir).join("workflow.snapshot");

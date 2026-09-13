@@ -58,7 +58,7 @@ use crate::error::ProviderError;
 use crate::model::Model;
 use crate::stream::StreamOptions;
 use crate::stream::sse::{SseRequest, build_client_for_target, open_sse};
-use crate::utils::provider_plumbing::provider_env_value;
+use crate::utils::provider_plumbing::{EnvSource, provider_env_value};
 use crate::utils::provider_retry::ProviderRetry;
 use cyrup_core::{ApiId, CancelToken};
 use std::sync::Arc;
@@ -261,9 +261,14 @@ fn is_placeholder_api_key(api_key: &str) -> bool {
 pub fn resolve_project(env: Option<&ProviderEnv>) -> Result<String, ProviderError> {
     provider_env_value(
         crate::providers::google_vertex::GOOGLE_CLOUD_PROJECT_ENV,
-        env,
+        EnvSource::new(env),
     )
-    .or_else(|| provider_env_value(crate::providers::google_vertex::GCLOUD_PROJECT_ENV, env))
+    .or_else(|| {
+        provider_env_value(
+            crate::providers::google_vertex::GCLOUD_PROJECT_ENV,
+            EnvSource::new(env),
+        )
+    })
     .ok_or_else(|| ProviderError::Transport(MISSING_PROJECT_MESSAGE.into()))
 }
 
@@ -271,7 +276,7 @@ pub fn resolve_project(env: Option<&ProviderEnv>) -> Result<String, ProviderErro
 pub fn resolve_location(env: Option<&ProviderEnv>) -> Result<String, ProviderError> {
     provider_env_value(
         crate::providers::google_vertex::GOOGLE_CLOUD_LOCATION_ENV,
-        env,
+        EnvSource::new(env),
     )
     .ok_or_else(|| ProviderError::Transport(MISSING_LOCATION_MESSAGE.into()))
 }

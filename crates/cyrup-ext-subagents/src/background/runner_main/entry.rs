@@ -8,7 +8,7 @@ use super::control_watcher::{
     init_control_flags, install_ignored_sigusr2_handler, spawn_control_watcher,
 };
 use super::events::open_run_events;
-use super::finish::{finish_run, settle_loop_outcome};
+use super::finish::{WorkflowResultFields, finish_run, settle_loop_outcome};
 use super::status::{SharedStatus, TelemetryMsg, lock_status, spawn_telemetry_task};
 use super::turn_loop::run_inner;
 use crate::background::atomic::write_atomic_json;
@@ -205,6 +205,10 @@ pub async fn run_with(
         config.cwd.clone(),
         config.session_file.clone(),
         final_error.unwrap_or_default(),
+        // This is the ordinary chain/parallel/single runner tail — never a workflow terminal
+        // write (WORKFLOW_3 §3c: a future async workflow arm is the first caller to supply a
+        // non-default value here, via `apply_workflow_settlement_plan`).
+        WorkflowResultFields::default(),
     )
     .await;
 
@@ -276,6 +280,7 @@ pub(super) async fn publish_initial_status(
             config.cwd.clone(),
             config.session_file.clone(),
             "internal error: Queued -> Running transition was rejected".to_string(),
+            WorkflowResultFields::default(),
         )
         .await;
         return None;
@@ -289,6 +294,7 @@ pub(super) async fn publish_initial_status(
             config.cwd.clone(),
             config.session_file.clone(),
             format!("failed to write initial status.json: {err}"),
+            WorkflowResultFields::default(),
         )
         .await;
         return None;
@@ -341,6 +347,7 @@ pub(super) async fn ensure_control_inbox_dir(
             config.cwd.clone(),
             config.session_file.clone(),
             format!("failed to create control-inbox directory: {err}"),
+            WorkflowResultFields::default(),
         )
         .await;
         return None;

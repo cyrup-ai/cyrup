@@ -674,11 +674,13 @@ pub trait Selector: Send {
     ///
     /// A targeted accessor rather than an `Any` downcast, in the same spirit as
     /// [`Self::external_edit_text`]/[`Self::apply_external_edit`] above (also overridden by exactly
-    /// one implementor). The `/login` dialog is the only selector whose content is mutated by
-    /// something *other* than a key press: the spawned login task pushes `AuthEvent`s and prompts at
-    /// it through [`crate::app::App::apply_login_msg`], which needs `&mut LoginDialog` out of the
-    /// `Box<dyn Selector>` the slot holds. Pi has the same need and solves it by keeping a typed
-    /// `dialog` local in scope across the `await` (`interactive-mode.ts:5379-5403`).
+    /// one implementor). Two selectors have their content mutated by something *other* than a key
+    /// press: the `/login` dialog (the spawned login task pushes `AuthEvent`s and prompts at it
+    /// through [`crate::app::App::apply_login_msg`]) and the `/model` picker (a spawned catalog
+    /// refresh pushes settled rows through [`crate::app::App::apply_model_refresh`], via
+    /// [`Self::as_model_selector`]). Both need a typed `&mut` out of the `Box<dyn Selector>` the
+    /// slot holds. Pi has the same need and solves it by keeping a typed `dialog` / component local
+    /// in scope across the `await` (`interactive-mode.ts:5379-5403`, `model-selector.ts:191-206`).
     fn as_login_dialog(&mut self) -> Option<&mut crate::login_dialog::LoginDialog> {
         None
     }
@@ -692,6 +694,17 @@ pub trait Selector: Send {
     /// the input slot, so the chrome ([`crate::app::App::set_settings_row_value`]) needs the
     /// concrete list back out of the `Box<dyn Selector>` to do the same write.
     fn as_settings_mut(&mut self) -> Option<&mut crate::settings_selector::SettingsSelector> {
+        None
+    }
+    /// Downcast to the `/model` picker, if that is what occupies the slot — `None` (the default) for
+    /// every other selector, in the same targeted-accessor spirit as [`Self::as_login_dialog`].
+    ///
+    /// The SECOND selector whose content is mutated by something other than a key press: the spawned
+    /// catalog refresh pushes its settled status, error and rebuilt model list at it through
+    /// [`crate::app::App::apply_model_refresh`]. Pi has the same need and answers it the same way —
+    /// `refreshModels()` writes `this.refreshStatusMessage` / `this.errorMessage` on the component
+    /// instance it is a method of (`model-selector.ts:191-206`).
+    fn as_model_selector(&mut self) -> Option<&mut crate::model_selector::ModelSelector> {
         None
     }
     /// Adopt the live `tui.editor.*` table so an embedded [`crate::text_input::Input`] resolves word

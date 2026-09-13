@@ -136,7 +136,7 @@ pub use observer::{
     CompletionBus, CompletionEvent, CompletionObserver, CompositeCompletionObserver,
 };
 pub use results_watcher::{
-    CompletionNotification, DEDUP_TTL, LossReport, MAX_PROCESSING_ATTEMPTS,
+    CompletionBand, CompletionNotification, DEDUP_TTL, LossReport, MAX_PROCESSING_ATTEMPTS,
     MISSING_PAYLOAD_GRACE_SCANS, MissingPayloadVerdict, ObservedResult, RESULTS_DIR_POLL_INTERVAL,
     RecoveredStep, ResolvedCandidate, ResultsWatcher, ScanOutcome,
 };
@@ -234,6 +234,8 @@ pub(crate) mod tests {
             session_id: Some(test_session()),
             completion_owner_id: Some(test_owner()),
             results: Vec::new(),
+            workflow_children: None,
+            workflow_receipt: None,
         }
     }
 
@@ -307,6 +309,8 @@ pub(crate) mod tests {
             session_id: Some(test_session()),
             completion_owner_id: Some(test_owner()),
             results: children,
+            workflow_children: None,
+            workflow_receipt: None,
         }
     }
 }

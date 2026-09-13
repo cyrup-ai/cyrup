@@ -704,59 +704,52 @@ fn fireworks_openai_completions_rows_carry_pi_s_openai_compat() {
 // those rows are pinned to the ported tag by the generator's `DELTAS` table and are called out
 // individually here.
 
-/// **PROV-054 — the highest-severity row on this surface, and it is the protocol, not a flag.**
+/// **PROV-054, finished by upstream and widened here (XAI_2).**
 ///
-/// pi routes `xai/grok-4.5` over the Responses API: `XAI_RESPONSES_MODEL_ID = "grok-4.5"`
-/// (`ai/scripts/generate-models.ts:378` @v0.83.0) selects it at `:1408`
-/// (`const useResponsesApi = modelId === XAI_RESPONSES_MODEL_ID`) and gives it
-/// `XAI_RESPONSES_COMPAT = { supportsLongCacheRetention: false }` (`:390-392`) plus
-/// `XAI_RESPONSES_EFFORT_LEVEL_MAP = { off: null, minimal: null }` (`:386-389`). The generated
-/// output agrees: `xai.models.ts:25-42` @`b0c2a90e` is `api: "openai-responses"`.
+/// PROV-054 filed ONE row on the wrong protocol: pi routed `xai/grok-4.5` over the Responses API via
+/// `XAI_RESPONSES_MODEL_ID` while cyrup shipped it on `openai-completions`, so cyrup built a
+/// Chat-Completions body — `messages[]`, no `reasoning` object, a different SSE grammar — and POSTed
+/// it to the Completions path for the xai DEFAULT model. Every request diverged wholesale.
 ///
-/// cyrup carried the pre-move row from `91585d9a`: `api: "openai-completions"`, the three old
-/// `supportsStore`/`supportsDeveloperRole`/`supportsReasoningEffort` flags, no `thinkingLevelMap`
-/// and no `supportsLongCacheRetention`. `WireProvider` dispatches on `model.api` (`wire.rs:215`),
-/// so cyrup built a Chat-Completions body — `messages[]`, no `reasoning` object, a different SSE
-/// grammar — and POSTed it to the Completions path for **the xai default model**
-/// (`cyrup-config/src/model.rs:1075` maps `"xai" => "grok-4.5"`). Every request diverged wholesale.
+/// That per-model switch is GONE upstream: `ai/scripts/generate-models.ts:1869-1894` @v0.85.1 emits
+/// every xai row with `api: "openai-responses"` (`:1877`), `provider: "xai"` (`:1879`),
+/// `baseUrl: "https://api.x.ai/v1"` (`:1880`) and `compat: { ...XAI_RESPONSES_COMPAT }` (`:1881`,
+/// defined `:433-435`). So the claim worth pinning is no longer "one row is the responses model" —
+/// it is "the provider is a Responses provider", asserted per row, for every row.
 ///
-/// Pre-fix this test is RED on all four assertions.
+/// **This test names no model id and no count, deliberately.** xai's catalog is re-downloaded from
+/// pi.dev on every `gen-catalogs` run (XAI_1), so ids and counts are what xAI is selling this week.
+/// Only the four fields above are asserted, because pi HARDCODES all four and that source is in git
+/// at a tag. XAI_1's `assert_eq!(map.len(), 7)` is deleted rather than re-pinned: the ladder is
+/// models.dev data (`applyModelsDevReasoningOptionMetadata` at `:2946-2949` runs BEFORE the xai
+/// fallback at `:911-919`, which only fires when the map is undefined), `supportsOpenAiXhigh`
+/// (`:540-549`) does not match `grok-4.6` yet that row carries `xhigh`, and one download already
+/// produced three different maps. Nothing is lost: no cyrup code path can break vendor metadata, and
+/// `thinkingLevelMap` deserialization is covered by `fleet.rs`'s deepseek test against a git-pinned
+/// catalog.
 #[test]
-fn xai_grok_4_5_is_routed_over_the_responses_api() {
+fn every_xai_row_is_routed_over_the_responses_api() {
     let models = selection();
-    let m = pick(&models, "xai", "grok-4.5");
+    let rows = models.get_models(Some("xai"));
+    assert!(!rows.is_empty(), "xai must ship a catalog");
 
-    assert_eq!(
-        m.api.as_str(),
-        "openai-responses",
-        "grok-4.5 is the xai DEFAULT model; on openai-completions every request is the wrong \
-         protocol, not merely the wrong flag"
-    );
-
-    // `thinkingLevelMap: {off: null, minimal: null}` — the two levels pi SUPPRESSES for this model.
-    let map = m
-        .thinking_level_map
-        .as_ref()
-        .expect("grok-4.5 carries pi's XAI_RESPONSES_EFFORT_LEVEL_MAP");
-    assert_eq!(map.get("off"), Some(&None));
-    assert_eq!(map.get("minimal"), Some(&None));
-    assert_eq!(map.len(), 2, "pi maps exactly off and minimal");
-
-    // `supportsLongCacheRetention: false`. Absent, the resolver's detector defaults it TRUE for
-    // xai, so cyrup would offer a retention xAI rejects (`api/compat.rs`).
-    let compat = crate::api::compat::get_responses_compat(&m);
-    assert!(
-        !compat.supports_long_cache_retention,
-        "pi's XAI_RESPONSES_COMPAT sets supportsLongCacheRetention: false"
-    );
-
-    // MIRROR: the two rows either side of it stay on Completions, so this pins the per-row api and
-    // not a whole-provider switch (`xai.models.ts:10` and `:47` @b0c2a90e).
-    for id in ["grok-4.3", "grok-build-0.1"] {
+    for m in &rows {
         assert_eq!(
-            pick(&models, "xai", id).api.as_str(),
-            "openai-completions",
-            "{id} is NOT the responses model"
+            m.api.as_str(),
+            "openai-responses",
+            "{}: on openai-completions every request is the wrong protocol, not merely the wrong \
+             flag — and this provider carries the xai default model",
+            m.id
+        );
+        assert_eq!(m.provider.as_str(), "xai", "{} provider tag", m.id);
+        assert_eq!(m.base_url.as_str(), "https://api.x.ai/v1", "{} baseUrl", m.id);
+        // `supportsLongCacheRetention: false`. Absent, the resolver's detector defaults it TRUE for
+        // xai, so cyrup would offer a retention xAI rejects (`api/compat.rs`). Upstream spreads
+        // XAI_RESPONSES_COMPAT onto EVERY row, so this is a per-row assertion.
+        assert!(
+            !crate::api::compat::get_responses_compat(m).supports_long_cache_retention,
+            "{}: pi's XAI_RESPONSES_COMPAT sets supportsLongCacheRetention: false",
+            m.id
         );
     }
 }
@@ -911,11 +904,11 @@ fn every_model_the_regeneration_added_now_resolves() {
 
 /// **PROV-058 — 16 ids cyrup offered, autocompleted and would have billed, that pi had retired.**
 ///
-/// The five xai rows are not models.dev churn: pi drops them by NAME through
+/// The five xai rows in `RETIRED` are not models.dev churn: pi drops them by NAME through
 /// `XAI_BUILTIN_EXCLUDED_MODEL_IDS` (`ai/scripts/generate-models.ts:379-385` @v0.83.0, applied at
-/// `:2078`), so this half is confirmed at the PORTED TAG, not just at `b0c2a90e`. An id gone
-/// upstream is usually gone at the vendor too, so the reachable outcome was a model that appears
-/// in `/model`, is selectable, and then fails at the API. Pre-fix: RED on all 16.
+/// `:2078`), so that half is confirmed at the PORTED TAG. The set has since grown a sixth id; the
+/// whole set is asserted separately below, because it is hardcoded upstream and therefore the one
+/// xai fact that is still safe to pin now that the catalog is live-fetched (XAI_2).
 #[test]
 fn every_model_upstream_retired_is_gone() {
     let models = selection();
@@ -945,8 +938,31 @@ fn every_model_upstream_retired_is_gone() {
         );
     }
 
-    // The xai exclusion list is exhaustive: pi ships exactly three xai models.
-    assert_eq!(models.get_models(Some("xai")).len(), 3);
+    // XAI_2 — pi's exclusion set, verbatim and in full (`generate-models.ts:425-432` @v0.85.1,
+    // applied `:2433`). Five ids at v0.83.0, six now: `grok-build-0.1` joined after the ported tag,
+    // and cyrup shipped that row until xai's catalog became live-fetched (XAI_1).
+    //
+    // This replaces `assert_eq!(get_models(Some("xai")).len(), 3)`. The count was a fact about
+    // September 2026, on a catalog that re-downloads itself; the exclusion SET is a fact about pi's
+    // source, and only moves when pi edits it — which is a signal worth catching.
+    const XAI_EXCLUDED: &[&str] = &[
+        "grok-3",
+        "grok-3-fast",
+        "grok-4.20-0309-non-reasoning",
+        "grok-4.20-0309-reasoning",
+        "grok-build-0.1",
+        "grok-code-fast-1",
+    ];
+    for id in XAI_EXCLUDED {
+        assert!(
+            models.get_model("xai", id).is_none(),
+            "{id} is excluded by name upstream and must not be offered"
+        );
+    }
+    assert!(
+        !models.get_models(Some("xai")).is_empty(),
+        "excluding the retired ids must not empty the provider"
+    );
 }
 
 /// **PROV-059 — the field differences are behavioural, not cosmetic.**
@@ -1033,10 +1049,16 @@ fn the_codex_gpt_5_6_context_window_stays_at_the_ported_tags_272k() {
 
 /// **PROV-060 — the manifest must describe a provenance the data actually has.**
 ///
-/// Before the regeneration `generatedAt`/`source` named `b0c2a90e` while the note itself conceded
-/// that 31 of the 35 files came from `91585d9a` — a drift guard reporting a floor the data did not
-/// sit on. Now one revision generates every file, and the manifest records it per provider so the
-/// claim is machine-checkable rather than prose.
+/// Before the `b0c2a90e` regeneration `generatedAt`/`source` named `b0c2a90e` while the note itself
+/// conceded that 31 of the 35 files came from `91585d9a` — a drift guard reporting a floor the data
+/// did not sit on. That regeneration made one revision generate every file, with the manifest
+/// recording provenance per provider so the claim was machine-checkable rather than prose — even
+/// though, at the time, there was no split left to describe.
+///
+/// **XAI_1 gives the map a REAL split to check.** `xai` is now fetched LIVE from
+/// `https://pi.dev/api/models/providers/xai` on every `gen-catalogs` run instead of extracted from
+/// the `b0c2a90e` pin, so its `source` is a URL and its `fetchedAt`/`revision` are its own, not
+/// `pi@b0c2a90e`. The carve-out below is that datum, checked rather than asserted away.
 #[test]
 fn the_catalog_manifest_names_one_revision_per_provider() {
     let raw = include_str!("../providers/catalog_manifest.json");
@@ -1054,12 +1076,26 @@ fn the_catalog_manifest_names_one_revision_per_provider() {
         "every embedded catalog must name its source module"
     );
     for (name, entry) in per_provider {
-        assert_eq!(
-            entry["source"].as_str(),
-            Some(source),
-            "{name} names a different revision from the manifest's own — that split is exactly \
-             what PROV-060 filed"
-        );
+        if name == "xai" {
+            // XAI_1 — the one live-fetched catalog. PROV-060 built this map precisely so a
+            // provenance split is a DATUM rather than a footnote; this is that datum.
+            assert_eq!(
+                entry["source"].as_str(),
+                Some("https://pi.dev/api/models/providers/xai"),
+                "xai's source is the live endpoint, not the pinned revision"
+            );
+            assert!(
+                entry["fetchedAt"].is_string() || entry["fetchedAt"].is_null(),
+                "xai's fetchedAt is its own live provenance (string) or null (never fetched)"
+            );
+        } else {
+            assert_eq!(
+                entry["source"].as_str(),
+                Some(source),
+                "{name} names a different revision from the manifest's own — that split is \
+                 exactly what PROV-060 filed"
+            );
+        }
         assert!(
             entry["module"]
                 .as_str()

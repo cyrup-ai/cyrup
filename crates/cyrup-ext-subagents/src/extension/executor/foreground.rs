@@ -11,6 +11,7 @@ use crate::exec::fallback::{provider_of, resolve_model_inheritance};
 use crate::exec::{AgentConfig, RunOptions, SingleResult};
 use crate::extension::EXTENSION_ID;
 use crate::extension::executor::SubagentExecutor;
+use crate::extension::executor::foreground_control::{ForegroundChildEntry, begin_foreground_child};
 use crate::extension::executor::notices::{ForegroundControlEntry, ForegroundControlNotifier};
 use crate::extension::executor::paths::{
     drive_foreground_run_sync, write_foreground_output_artifacts,
@@ -136,6 +137,27 @@ struct ForegroundRunOptionsInput<'a> {
     artifacts_enabled: bool,
     /// Borrowed: the caller writes the artifact quadruple into the same root.
     art_dir: &'a Path,
+    /// WORKFLOW_14 — [`ForegroundRunRequest::workflow_steer`], borrowed. The three
+    /// [`RunOptions`] steer paths are derived from it; `register_foreground_controls` stores the
+    /// same handle on the child's entry, so the spawn side and the control side cannot disagree
+    /// about where this child's inbox is.
+    workflow_steer: Option<&'a crate::extension::executor::foreground_control::ForegroundChildSteerHandle>,
+}
+
+/// The borrowed identity triple [`SubagentExecutor::register_foreground_controls`] stamps onto a
+/// fresh [`ForegroundControlEntry`] (WORKFLOW_6 §4.2) — a struct, not three more positional args,
+/// because that function is already at five and `clippy::too_many_arguments` is live.
+struct ForegroundControlIdentity<'a> {
+    /// The run's effective working directory (pi `ForegroundRunControl.cwd`).
+    cwd: &'a Path,
+    /// `Some` only for a child launched by `WorkflowRunHost::launch`.
+    parent_workflow_run_id: Option<&'a RunId>,
+    /// The workflow lane key that child was launched under.
+    workflow_key: Option<&'a crate::workflows::WorkflowKey>,
+    /// WORKFLOW_14 — borrowed from [`ForegroundRunRequest::workflow_steer`], the SAME value
+    /// [`SubagentExecutor::build_foreground_run_options`] derived this child's three spawn paths
+    /// from. `Some` iff `parent_workflow_run_id` is `Some`.
+    workflow_steer: Option<&'a crate::extension::executor::foreground_control::ForegroundChildSteerHandle>,
 }
 
 impl SubagentExecutor {
@@ -195,6 +217,10 @@ impl SubagentExecutor {
                 model_override,
                 timeout_ms,
                 cancel: CancelToken::new(),
+                // This flat entry point has no `workflowScript` concept at all.
+                parent_workflow_run_id: None,
+                workflow_key: None,
+                workflow_steer: None,
             },
             None,
         )
@@ -267,6 +293,9 @@ impl SubagentExecutor {
             task,
             timeout_ms,
             cancel,
+            parent_workflow_run_id,
+            workflow_key,
+            workflow_steer,
             ..
         } = req;
 
@@ -306,10 +335,23 @@ impl SubagentExecutor {
             session_dir,
             artifacts_enabled: art_cfg.enabled,
             art_dir: &art_dir,
+            workflow_steer: workflow_steer.as_ref(),
         });
 
-        self.register_foreground_controls(&run_id, &run_options, &agent, task)
-            .await;
+        self.register_foreground_controls(
+            &run_id,
+            &run_options,
+            &agent,
+            task,
+            ForegroundControlIdentity {
+                cwd,
+                parent_workflow_run_id: parent_workflow_run_id.as_ref(),
+                workflow_key: workflow_key.as_ref(),
+                // The SAME handle the run options above were derived from — one value, both sides.
+                workflow_steer: workflow_steer.as_ref(),
+            },
+        )
+        .await;
 
         let art_paths =
             write_foreground_input_artifact(&art_cfg, &art_dir, &run_id, &agent.name, task);
@@ -324,9 +366,22 @@ impl SubagentExecutor {
         )
         .await;
 
+        // WORKFLOW_7 — pi `rememberForegroundRun` (`subagent-executor.ts:4057`), on the settle
+        // path with the results in hand. BEFORE `settle_foreground_run`, whose own doc calls out
+        // an ordering that must not be disturbed: this call touches only `foreground_runs` (a
+        // DIFFERENT map from the one `settle_foreground_run` drops an entry from), so it cannot
+        // race that ordering either way, but placing it here keeps every foreground-history write
+        // together, ahead of teardown, in one place.
+        self.remember_foreground_run(&run_id, crate::background::RunMode::Single, cwd, &[&result]);
+
         self.settle_foreground_run(&run_id, &control_notifier).await;
 
         write_foreground_output_artifacts(&art_paths, &art_cfg, run_id.as_str(), &result);
+
+        // pi `persistForegroundRunHistory` (`foreground-history.ts:136`), after the in-memory
+        // record exists. Bounded, 0600, atomic; a write failure never alters the `SingleResult`
+        // the caller observes, exactly as `record_run_history`'s own best-effort contract.
+        self.persist_foreground_run_history_for(cwd).await;
 
         // R-SA-058: the per-attempt raw-stdout tee `run_sync` writes to
         // `<attempt_scratch_dir(cwd)>/attempt-<n>.jsonl` (SUBA-072: `<temp_root_dir>/scratch/
@@ -712,10 +767,17 @@ impl SubagentExecutor {
             session_dir,
             artifacts_enabled,
             art_dir,
+            workflow_steer,
         } = input;
         RunOptions {
             spawn_command,
-            child_env: std::collections::HashMap::new(),
+            // WORKFLOW_2 — threaded from the caller's [`SingleRunOverrides::child_env`] instead of
+            // being hardcoded empty. Every non-workflow caller still passes the `Default` (an
+            // empty map), so this is behaviour-preserving for them; `WorkflowRunHost` uses it to
+            // set `WORKFLOW_CHILD_ENV` on the child's `Command`, which is how a workflow child's
+            // own `subagent` tool learns to refuse a nested `workflowScript`. `RunOptions`
+            // layers this FIRST, so the crate's identity/depth/child-role entries still win.
+            child_env: overrides.child_env,
             // pi `hostAvailableBuiltins` (`subagent-executor.ts:3895`): the LIVE host tool registry,
             // observed HERE — the one place on this path that holds the `HostServices` handle — and
             // carried on `RunOptions` to `resolve_tool_surface`, which never re-reads it. `None` (a
@@ -828,14 +890,30 @@ impl SubagentExecutor {
             orchestrator_intercom_target: self.orchestrator_intercom_target(),
             run_id: Some(run_id.clone()),
             child_index: Some(0),
-            // G90: a FOREGROUND single run has no async run directory and therefore no steer
-            // inbox — pi supplies `steerInboxDir` only from the background runner, and
-            // `control_steer` refuses a foreground run outright for exactly this reason.
-            steer_inbox_dir: None,
-            // SUBA-049: same reason, for the return half — a foreground run has no run directory,
-            // so there is nowhere to write an acknowledgment or a capability record.
-            steer_ack_dir: None,
-            steer_capability_path: None,
+            // G90 held while a foreground run had no async run directory at all, and it still holds
+            // for a foreground SINGLE run: `control_steer` refuses one outright
+            // (`STEER_FOREGROUND_RUN_REFUSAL`, `foreground_actions/steer.rs`) for exactly that
+            // reason, and `workflow_steer` is `None` on every such call. WORKFLOW_14 narrowed it —
+            // a foreground WORKFLOW child's control root is the workflow's own run directory
+            // (WORKFLOW_13), so all three paths are real for it. `None` here now means "not a
+            // workflow child", not "impossible".
+            //
+            // ALL THREE OR NONE — derived from ONE handle so they cannot be populated apart. The
+            // ack dir without the inbox is a return path for a request that can never arrive; the
+            // capability file without the ack dir tells a parent the child CAN be steered and then
+            // never answers. `exec/mod.rs` creates each one pre-spawn from these very fields.
+            // CARRIED, not recomputed: this is the same `PathBuf` the parent will write a steer
+            // into (`ForegroundChildSteerHandle::deliver`), so parent-writes-where-child-reads is
+            // true by construction. Re-deriving it here would make it true only while two
+            // derivations agree — see the handle's own doc for what that cost last time.
+            steer_inbox_dir: workflow_steer.map(|h| h.inbox_dir.clone()),
+            // SUBA-049: the return half. Derived, because the READ side
+            // (`control::take_steer_acks`) is a run-dir-scoped scan by design and shares that
+            // derivation verbatim with the async path.
+            steer_ack_dir: workflow_steer
+                .map(|h| crate::background::control::steer_acks_dir(&h.run_dir, h.index)),
+            steer_capability_path: workflow_steer
+                .map(|h| crate::background::control::steer_capability_path(&h.run_dir, h.index)),
             // pi's shared `execute` entry's `controlConfig = resolveControlConfig(deps.config.control,
             // effectiveParams.control)` (`subagent-executor.ts:3385` @v0.34.0), read by
             // `runSinglePath` off `ExecutionContextData.controlConfig`: the extension-level
@@ -872,34 +950,79 @@ impl SubagentExecutor {
         run_options: &RunOptions,
         agent: &AgentDefinition,
         task: &str,
+        identity: ForegroundControlIdentity<'_>,
     ) {
         {
-            let mut controls = self
-                .foreground_controls
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            controls.insert(
-                run_id.as_str().to_string(),
-                ForegroundControlEntry {
-                    interrupt: run_options.interrupt.clone(),
-                    current_agent: Some(agent.name.clone()),
-                    current_index: Some(0),
-                    current_activity_state: None,
-                    // This entry point is pi's `runSinglePath`; its run shape is `single`.
-                    mode: crate::background::RunMode::Single,
+            let now = crate::time::now_epoch_millis();
+            let description = Some(task.to_string()).filter(|t| !t.trim().is_empty());
+            let mut entry = ForegroundControlEntry {
+                interrupt: run_options.interrupt.clone(),
+                // Derived below by `begin_foreground_child`, from the child this call registers at
+                // flat index 0 — never hand-written here (WORKFLOW_6 §1.3).
+                current_agent: None,
+                current_index: None,
+                current_activity_state: None,
+                // This entry point is pi's `runSinglePath`; its run shape is `single`.
+                mode: crate::background::RunMode::Single,
+                description: None,
+                current_tool: None,
+                current_path: None,
+                turn_count: None,
+                tool_count: None,
+                tokens: None,
+                started_at: now,
+                updated_at: now,
+                // WORKFLOW_6 SUBTASK1. `current_session_id()` is cyrup's `state.currentSessionId`
+                // (`session_state.rs:55`), read off the live P-1 backend, and `parse_opt` is the
+                // ONLY way a `SessionId` is constructed from an untyped read.
+                session_id: crate::identity::SessionId::parse_opt(
+                    self.current_session_id().as_deref(),
+                ),
+                parent_workflow_run_id: identity.parent_workflow_run_id.cloned(),
+                workflow_key: identity.workflow_key.cloned(),
+                cwd: Some(identity.cwd.to_path_buf()),
+                session_name: None,
+                active_children: std::collections::BTreeMap::new(),
+            };
+            // pi registers the run's control with `activeChildren: new Map()` and then calls
+            // `beginForegroundChild` per child (`subagent-executor.ts:7028` + `foreground-control.ts`).
+            // A cyrup foreground SINGLE run has exactly one child, at flat index 0.
+            begin_foreground_child(
+                &mut entry,
+                ForegroundChildEntry {
+                    index: 0,
+                    agent: agent.name.clone(),
+                    session_name: None,
                     // pi `description: task` (`runs/foreground/execution.ts`'s control registration)
                     // — the caller's own task text, which is what the roster row identifies the run
                     // by (`fleet.ts:723`) and the detail pane prints as `Task` (`fleet.ts:434-437`).
-                    description: Some(task.to_string()).filter(|t| !t.trim().is_empty()),
+                    description,
+                    started_at: now,
+                    updated_at: now,
+                    current_activity_state: None,
                     current_tool: None,
                     current_path: None,
                     turn_count: None,
                     tool_count: None,
                     tokens: None,
-                    started_at: crate::time::now_epoch_millis(),
-                    updated_at: crate::time::now_epoch_millis(),
+                    interrupt: run_options.interrupt.clone(),
+                    // WORKFLOW_14 — `Some` exactly for a workflow child, cloned from the SAME
+                    // handle `build_foreground_run_options` derived this child's three spawn paths
+                    // from. This is what turns `steer_workflow_foreground`'s delivery arm from
+                    // unreachable into the live path: the parent resolves this entry out of
+                    // `foreground_controls`, reads the handle, and writes into the very
+                    // `steer-targets/<index>/` the child was spawned watching.
+                    steer: identity.workflow_steer.cloned(),
                 },
             );
+            // Byte-identical to the pre-WORKFLOW_6 hand-written values: after `begin_foreground_child`,
+            // `entry.current_agent == Some(agent.name)`, `entry.current_index == Some(0)` and
+            // `entry.description == Some(task)` whenever `task` is non-blank — nothing renders
+            // differently, and `entry.active_children` is now real instead of absent.
+            self.foreground_controls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(run_id.as_str().to_string(), entry);
         }
 
         // The notice machine's own live-state projection (R-SA-116 check 1: an unknown run is not
@@ -943,7 +1066,19 @@ impl SubagentExecutor {
                 .foreground_controls
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            controls.remove(run_id.as_str());
+            if let Some(entry) = controls.remove(run_id.as_str()) {
+                // WORKFLOW_6 §1.1 — the identity this entry carried for its lifetime, read HERE
+                // (not only stamped at registration) so `workflow_key`/`parent_workflow_run_id`
+                // have a genuine production reader ahead of WORKFLOW_7/WORKFLOW_11's own gates on
+                // them. Purely observational: the entry was already being dropped on the floor.
+                tracing::debug!(
+                    run_id = %run_id,
+                    session_id = ?entry.session_id.as_ref().map(crate::identity::SessionId::as_str),
+                    parent_workflow_run_id = ?entry.parent_workflow_run_id.as_ref().map(RunId::as_str),
+                    workflow_key = ?entry.workflow_key.as_ref().map(crate::workflows::WorkflowKey::as_str),
+                    "foreground control settled"
+                );
+            }
         }
         // ...and the notice machine's projection of the same fact (pi's single
         // `state.foregroundControls` map serves both roles), together with the pending-timer abort
@@ -1239,5 +1374,111 @@ mod tests {
              patterns: anthropic/*, together/*.",
             "the caller must see pi's verbatim violation text, naming the model AND the patterns"
         );
+    }
+
+    /// WORKFLOW_6 §1.3/§4.2 — `register_foreground_controls` DERIVES `current_agent`/
+    /// `current_index`/`description` from the child it registers at flat index 0 (never
+    /// hand-writes them), and stamps the [`ForegroundControlIdentity`] WORKFLOW_6 threads down
+    /// from `WorkflowRunHost::launch` onto the entry — the exact invariant §5#2 names.
+    #[tokio::test]
+    async fn register_foreground_controls_derives_the_entry_and_stamps_workflow_identity() {
+        let executor = SubagentExecutor::new();
+        let run_id = RunId::new();
+        let agent = gate_agent(Some(NON_ANTHROPIC), &[]);
+        let cwd = PathBuf::from("/proj");
+        let run_options = crate::exec::testsupport::base_opts(&cwd, &[NON_ANTHROPIC]);
+        let parent = RunId::new();
+        let key = crate::workflows::WorkflowKey::parse("lane.a").expect("valid key");
+        let steer = crate::extension::executor::foreground_control::ForegroundChildSteerHandle {
+            inbox_dir: PathBuf::from("/runs/wf-1/control/steer-targets/3"),
+            run_dir: PathBuf::from("/runs/wf-1"),
+            index: 3,
+        };
+
+        executor
+            .register_foreground_controls(
+                &run_id,
+                &run_options,
+                &agent,
+                "do the thing",
+                ForegroundControlIdentity {
+                    cwd: &cwd,
+                    parent_workflow_run_id: Some(&parent),
+                    workflow_key: Some(&key),
+                    workflow_steer: Some(&steer),
+                },
+            )
+            .await;
+
+        let controls = executor
+            .foreground_controls()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = controls.get(run_id.as_str()).expect("registered");
+        // Derived, not hand-written — byte-identical to the pre-WORKFLOW_6 inline values.
+        assert_eq!(entry.current_agent.as_deref(), Some("worker"));
+        assert_eq!(entry.current_index, Some(0));
+        assert_eq!(entry.description.as_deref(), Some("do the thing"));
+        assert_eq!(entry.active_children.len(), 1, "one child, at flat index 0");
+        // Stamped from the identity WORKFLOW_6 threads through `ForegroundRunRequest` ->
+        // `run_foreground_impl` -> `ForegroundControlIdentity`.
+        assert_eq!(entry.parent_workflow_run_id, Some(parent.clone()));
+        assert_eq!(
+            entry.workflow_key.as_ref().map(crate::workflows::WorkflowKey::as_str),
+            Some("lane.a")
+        );
+        assert_eq!(entry.cwd, Some(cwd.clone()));
+        // WORKFLOW_14 — the steer handle rides the SAME identity, and its index is the child's flat
+        // index within the WORKFLOW, deliberately distinct from the `active_children` key (0).
+        let child = entry.active_children.get(&0).expect("child at flat index 0");
+        let handle = child.steer.as_ref().expect("a workflow child carries a steer handle");
+        assert_eq!(handle.run_dir, PathBuf::from("/runs/wf-1"));
+        assert_eq!(handle.index, 3);
+        assert_eq!(
+            handle.inbox_dir,
+            PathBuf::from("/runs/wf-1/control/steer-targets/3"),
+            "the handle must carry the child's OWN inbox — the runner's `steer-requests/` intake \
+             queue is drained by a watch loop a foreground workflow does not have"
+        );
+    }
+
+    /// A plain (non-workflow) registration carries `parent_workflow_run_id == None` — §5#3: a
+    /// future steering gate keyed on this field must never mistake a bare foreground run for a
+    /// workflow child.
+    #[tokio::test]
+    async fn register_foreground_controls_carries_no_workflow_identity_for_a_plain_run() {
+        let executor = SubagentExecutor::new();
+        let run_id = RunId::new();
+        let agent = gate_agent(Some(NON_ANTHROPIC), &[]);
+        let cwd = PathBuf::from("/proj");
+        let run_options = crate::exec::testsupport::base_opts(&cwd, &[NON_ANTHROPIC]);
+
+        executor
+            .register_foreground_controls(
+                &run_id,
+                &run_options,
+                &agent,
+                "do the thing",
+                ForegroundControlIdentity {
+                    cwd: &cwd,
+                    parent_workflow_run_id: None,
+                    workflow_key: None,
+                    workflow_steer: None,
+                },
+            )
+            .await;
+
+        let controls = executor
+            .foreground_controls()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = controls.get(run_id.as_str()).expect("registered");
+        assert_eq!(entry.parent_workflow_run_id, None);
+        assert_eq!(entry.workflow_key, None);
+        // WORKFLOW_14's invariant, the other half: `steer.is_some() == parent_workflow_run_id
+        // .is_some()`. A plain foreground run has no run directory, so it carries no handle and
+        // `steer_workflow_foreground` refuses it with upstream's optional-`steer` sentence.
+        let child = entry.active_children.get(&0).expect("child at flat index 0");
+        assert!(child.steer.is_none());
     }
 }

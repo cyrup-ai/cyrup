@@ -200,10 +200,26 @@ pub(crate) const SUBAGENT_ACTIONS: &[&str] = &[
     // `… "models", "children.list", "guide", "create", …`). `children.list` is NOT added with it
     // and the reason is recorded rather than left to inference: upstream's `children.list` lists
     // RETAINED children — completed single runs held open for follow-up under a
-    // `parentWorkflowRunId` — which is part of the unported `workflowScript` shape, so the verb
-    // would advertise a listing that is always empty. That residual stays open under SUBA-005's
-    // unowned-verb list; this half is the `guide` action and its packaged docs.
+    // `parentWorkflowRunId`.
+    //
+    // WORKFLOW_2 UPDATE: `workflowScript` is no longer unported, so the old wording ("part of the
+    // unported `workflowScript` shape") is retired — but the verb still stays out, for a reason
+    // that outlived it. `children.list` needs RETENTION, and this build retains nothing: the
+    // foreground `WorkflowRunHost`'s `settled` list is dropped with the tool call, so the listing
+    // would still always be empty. Retention arrives with the async/detached workflow shape
+    // (WORKFLOW_3/WORKFLOW_13); until then the residual stays open under SUBA-005's unowned-verb
+    // list. This half is the `guide` action and its packaged docs.
     "guide",
+    // WORKFLOW_2 — pi `action: "validate"` with `workflowScript` (`extension/schemas.ts:337`;
+    // dispatched at `runs/foreground/subagent-executor.ts:4929`): structurally check a script
+    // without running it. Dispatched by `route_action`'s `"validate"` arm in this same change, per
+    // the advertise-vs-dispatch invariant.
+    //
+    // POSITION VERIFIED against upstream `SUBAGENT_ACTIONS` (`shared/types.ts:2760`), which reads
+    // `… "models", "children.list", "guide", "validate", "create", …`. cyrup omits
+    // `children.list` (see the note above), so `validate` follows `guide` directly here — pi's own
+    // index, not an append.
+    "validate",
     "create",
     "update",
     "delete",
@@ -956,6 +972,12 @@ mod tests {
                     tokens: None,
                     started_at: crate::time::now_epoch_millis(),
                     updated_at: crate::time::now_epoch_millis(),
+                    session_id: None,
+                    parent_workflow_run_id: None,
+                    workflow_key: None,
+                    cwd: None,
+                    session_name: None,
+                    active_children: std::collections::BTreeMap::new(),
                 },
             );
         }

@@ -7,12 +7,11 @@ use super::tools::{convert_tools, deferred_tool_names, message_has_tool_use};
 use crate::api::compat::{
     DeferredToolsMode, MaxTokensField, clamp_openai_prompt_cache_key, get_compat,
 };
-use crate::auth::ProviderEnv;
 use crate::context::{Context, ToolDef};
 use crate::model::Model;
 use crate::stream::{CacheRetention, StreamOptions};
 use crate::utils::constrained_sampling::ConstrainedSamplingError;
-use crate::utils::provider_plumbing::resolve_cache_retention;
+use crate::utils::provider_plumbing::{EnvSource, resolve_cache_retention};
 use cyrup_core::ModelThinkingLevel;
 use serde_json::{Map, Value, json};
 
@@ -42,7 +41,7 @@ pub(super) fn reasoning_effort(level: ModelThinkingLevel) -> Option<&'static str
 // Test-only fixture wrapper: the deny-list allowance the crate's `mod tests` blocks carry.
 #[allow(clippy::expect_used)]
 pub(crate) fn build_body(model: &Model, ctx: &Context, opts: &StreamOptions) -> Value {
-    build_body_with_env(model, ctx, opts, None)
+    build_body_with_env(model, ctx, opts, EnvSource::default())
         .expect("fixture declares no unsatisfiable constrained sampling")
 }
 
@@ -50,8 +49,9 @@ pub(crate) fn build_body(model: &Model, ctx: &Context, opts: &StreamOptions) -> 
 // (openai-completions.ts:141-149) live in `crate::utils::provider_plumbing`: this file carried
 // byte-identical ports of both, shared with anthropic-messages and openai-responses.
 
-/// Env-aware `build_body`: `env` is the provider-scoped overlay (Pi `options.env`) consulted by
-/// [`resolve_cache_retention`] for the `CYRUP_CACHE_RETENTION` fallback.
+/// Env-aware `build_body`: `env` carries the provider-scoped overlay (Pi `options.env`) consulted
+/// by [`resolve_cache_retention`] for the `CYRUP_CACHE_RETENTION` fallback, plus (test-only) the
+/// ambient override an [`EnvSource`] adds over a bare overlay (TEST_ENV_HERMETICITY).
 /// `[CYRUP-DELTA]` — fallible where pi's `buildParams` throws. `convertTools` can throw for a
 /// `strict: "require"` tool on a provider without strict mode (`constrained-sampling.ts:91-95`
 /// @v0.83.0); upstream that unwinds into `stream`'s catch and becomes the turn's terminal error
@@ -61,7 +61,7 @@ pub(crate) fn build_body_with_env(
     model: &Model,
     ctx: &Context,
     opts: &StreamOptions,
-    env: Option<&ProviderEnv>,
+    env: EnvSource<'_>,
 ) -> Result<Value, ConstrainedSamplingError> {
     let compat = get_compat(model);
     let cache = resolve_cache_retention(opts.cache_retention, env);

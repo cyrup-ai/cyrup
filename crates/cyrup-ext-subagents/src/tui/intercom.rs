@@ -1078,6 +1078,8 @@ mod tests {
             session_id: None,
             completion_owner_id: None,
             results: vec![sample_single_result("delegate", "did the thing")],
+            workflow_children: None,
+            workflow_receipt: None,
         };
 
         let payload = IntercomPayload::from_result(&result);
@@ -1122,6 +1124,8 @@ mod tests {
             session_id: None,
             completion_owner_id: None,
             results: vec![a, b],
+            workflow_children: None,
+            workflow_receipt: None,
         };
 
         let payload = IntercomPayload::from_result(&result);
@@ -1455,6 +1459,8 @@ mod tests {
             session_id: None,
             completion_owner_id: None,
             results: vec![done_child, stopped_child],
+            workflow_children: None,
+            workflow_receipt: None,
         };
 
         let payload = IntercomPayload::from_result(&result);

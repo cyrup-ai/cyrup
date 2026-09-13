@@ -1,12 +1,16 @@
-//! The OpenAI-completions provider fleet (arch-01 §5). Every Pi provider whose models speak the
-//! [`openai-completions`](crate::api::openai_completions) wire protocol, ported as
-//! [`WireProvider`]s with their FULL catalogs extracted verbatim from Pi's generated
-//! `providers/<id>.models.ts` files. They differ only in id/name/base URL, env-key, and catalog;
-//! the shared compat matrix ([`crate::api::compat`]) drives every per-provider behavior.
+//! The Pi provider fleet (arch-01 §5). Every Pi provider that is a plain [`WireProvider`] over an
+//! embedded catalog plus an env-key auth. They differ only in id/name/base URL, env-key, catalog,
+//! and the wire protocol their rows speak ([`FleetWire`]); the shared compat matrix
+//! ([`crate::api::compat`]) drives every per-provider behavior.
 //!
-//! Mirrors `providers/{ant-ling,baseten,cerebras,deepseek,groq,huggingface,moonshotai,moonshotai-cn,nvidia,
-//! openrouter,qwen-token-plan,qwen-token-plan-cn,qwen-token-plan-individual,xai,xiaomi,
-//! xiaomi-token-plan-*,zai,zai-coding-cn}.ts` + their `.models.ts` catalogs.
+//! The set was named for `openai-completions` because nineteen of the twenty members speak it, and
+//! for a while the twentieth had a single Responses row (PROV-054, `xai/grok-4.5`). That framing is
+//! retired: pi moved xai's WHOLE catalog onto the Responses API
+//! (`ai/scripts/generate-models.ts:1877` @v0.85.1 hardcodes `api: "openai-responses"` for every row
+//! it emits for the provider). Membership never meant anything about protocol at runtime —
+//! [`WireProvider`] dispatches per row on `model.api` (`wire.rs:215`) — so each member now DECLARES
+//! its protocol in [`FleetSpec::wire`] and the test checks rows against that declaration instead of
+//! a hand-kept exception (XAI_2).
 //!
 //! # Members without an embedded catalog (PROV-014, DRIFT-009)
 //!
@@ -55,6 +59,8 @@ pub struct FleetSpec {
     /// `"Moonshot AI CN API key"` (`providers/moonshotai-cn.ts:11`) — which is why it is a table
     /// column rather than a format string.
     pub auth_name: &'static str,
+    /// The wire protocol this member's rows speak — see [`FleetWire`].
+    pub wire: FleetWire,
     /// Where this member's rows come from — see [`FleetCatalog`].
     pub catalog: FleetCatalog,
     /// Upstream's `createProvider({ baseUrl })` (`Provider.baseUrl`, PROV-017) for the members
@@ -75,6 +81,37 @@ pub enum FleetCatalog {
     Dynamic,
 }
 
+/// The wire protocol every row of a fleet member's catalog speaks.
+///
+/// A DECLARATION, not a hint: the catalog test asserts each row's `api` against it, and the
+/// `fleet!` macro cannot accept a member that does not state one.
+///
+/// It replaces an exception that decayed twice. It began as
+/// `|| (*id == "xai" && m.id == "grok-4.5")`, which at least pinned WHICH row could deviate, and was
+/// widened by XAI_1 to `|| *id == "xai"` — where `*id` is loop-constant, so `m.api` stopped being
+/// read at all for xai and a row on ANY protocol passed. An exception list cannot assert a positive;
+/// a declaration can. It is also release-proof: it names a protocol, never a model id or a count, so
+/// it survives every future xAI release unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FleetWire {
+    /// `openai-completions` — nineteen of the twenty members, including all four
+    /// [`FleetCatalog::Dynamic`] ones, whose overlay rows are `openai-completions` upstream.
+    Completions,
+    /// `openai-responses` — `xai` alone (`ai/scripts/generate-models.ts:1877` @v0.85.1).
+    Responses,
+}
+
+impl FleetWire {
+    /// The `Model::api` value every row of a member declaring this protocol must carry.
+    #[must_use]
+    pub fn api(self) -> &'static str {
+        match self {
+            Self::Completions => crate::known_api::OPENAI_COMPLETIONS,
+            Self::Responses => crate::known_api::OPENAI_RESPONSES,
+        }
+    }
+}
+
 /// The catalog half of a `fleet!` row: a file stem embeds `catalog/<stem>.json`; `dynamic(<url>)`
 /// declares a member with no embedded rows and the provider-level `baseUrl` upstream's
 /// `createProvider` call carries.
@@ -91,13 +128,14 @@ macro_rules! fleet_catalog {
 }
 
 macro_rules! fleet {
-    ($($id:literal => ($const:ident, $name:literal, $env:literal, $auth:literal, $($catalog:tt)+)),* $(,)?) => {
+    ($($id:literal => ($const:ident, $name:literal, $env:literal, $auth:literal, $wire:ident, $($catalog:tt)+)),* $(,)?) => {
         $(
             pub const $const: FleetSpec = FleetSpec {
                 id: $id,
                 name: $name,
                 env_var: $env,
                 auth_name: $auth,
+                wire: FleetWire::$wire,
                 catalog: fleet_catalog!($($catalog)+).0,
                 base_url: fleet_catalog!($($catalog)+).1,
             };
@@ -109,7 +147,7 @@ macro_rules! fleet {
 }
 
 fleet! {
-    "ant-ling"              => (ANT_LING, "Ant Ling", "ANT_LING_API_KEY", "Ant Ling API key", "ant-ling"),
+    "ant-ling"              => (ANT_LING, "Ant Ling", "ANT_LING_API_KEY", "Ant Ling API key", Completions, "ant-ling"),
     // DRIFT-009 — `providers/baseten.ts:6-14` @v0.84.4, registered `all.ts:95`; a v0.84.x
     // addition (`c1019d920`, 2026-08-03 — absent at the ported baseline v0.83.0). models.dev
     // source `baseten`, generated by `generate-models.ts::processBasetenModels` (`:1256-1345`),
@@ -121,15 +159,15 @@ fleet! {
     // `zai-org/GLM-5.2` (`test/baseten-models.test.ts:19-54`), which is also cyrup's default
     // model for the provider (`cyrup-config/src/model/defaults.rs:37`). See the module doc for
     // why the rows themselves are not embedded.
-    "baseten"               => (BASETEN, "Baseten", "BASETEN_API_KEY", "Baseten API key", dynamic("https://inference.baseten.co/v1")),
-    "cerebras"              => (CEREBRAS, "Cerebras", "CEREBRAS_API_KEY", "Cerebras API key", "cerebras"),
-    "deepseek"              => (DEEPSEEK, "DeepSeek", "DEEPSEEK_API_KEY", "DeepSeek API key", "deepseek"),
-    "groq"                  => (GROQ, "Groq", "GROQ_API_KEY", "Groq API key", "groq"),
-    "huggingface"           => (HUGGINGFACE, "Hugging Face", "HF_TOKEN", "Hugging Face token", "huggingface"),
-    "moonshotai"            => (MOONSHOTAI, "Moonshot AI", "MOONSHOT_API_KEY", "Moonshot AI API key", "moonshotai"),
-    "moonshotai-cn"         => (MOONSHOTAI_CN, "Moonshot AI CN", "MOONSHOT_API_KEY", "Moonshot AI API key", "moonshotai-cn"),
-    "nvidia"                => (NVIDIA, "NVIDIA", "NVIDIA_API_KEY", "NVIDIA API key", "nvidia"),
-    "openrouter"            => (OPENROUTER, "OpenRouter", "OPENROUTER_API_KEY", "OpenRouter API key", "openrouter"),
+    "baseten"               => (BASETEN, "Baseten", "BASETEN_API_KEY", "Baseten API key", Completions, dynamic("https://inference.baseten.co/v1")),
+    "cerebras"              => (CEREBRAS, "Cerebras", "CEREBRAS_API_KEY", "Cerebras API key", Completions, "cerebras"),
+    "deepseek"              => (DEEPSEEK, "DeepSeek", "DEEPSEEK_API_KEY", "DeepSeek API key", Completions, "deepseek"),
+    "groq"                  => (GROQ, "Groq", "GROQ_API_KEY", "Groq API key", Completions, "groq"),
+    "huggingface"           => (HUGGINGFACE, "Hugging Face", "HF_TOKEN", "Hugging Face token", Completions, "huggingface"),
+    "moonshotai"            => (MOONSHOTAI, "Moonshot AI", "MOONSHOT_API_KEY", "Moonshot AI API key", Completions, "moonshotai"),
+    "moonshotai-cn"         => (MOONSHOTAI_CN, "Moonshot AI CN", "MOONSHOT_API_KEY", "Moonshot AI API key", Completions, "moonshotai-cn"),
+    "nvidia"                => (NVIDIA, "NVIDIA", "NVIDIA_API_KEY", "NVIDIA API key", Completions, "nvidia"),
+    "openrouter"            => (OPENROUTER, "OpenRouter", "OPENROUTER_API_KEY", "OpenRouter API key", Completions, "openrouter"),
     // PROV-014 — `providers/qwen-token-plan.ts:6-15` @v0.84.4 (identical at v0.83.0), registered at
     // `all.ts:118`. models.dev source `alibaba-token-plan`; the ids upstream's own test pins as
     // present (`qwen-token-plan-models.test.ts:42-58` @v0.84.4): MiniMax-M2.5, deepseek-v3.2,
@@ -138,24 +176,26 @@ fleet! {
     // row `compat: { thinkingFormat: "qwen", supportsDeveloperRole: false, supportsStore: false }`
     // (`generate-models.ts:2308-2313`), `reasoning_effort` only on the deepseek-v4-*/glm-5* rows
     // (`:306-316`). See the module doc for why the rows themselves are not embedded.
-    "qwen-token-plan"       => (QWEN_TOKEN_PLAN, "Qwen Token Plan", "QWEN_TOKEN_PLAN_API_KEY", "Qwen Token Plan API key", dynamic("https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1")),
+    "qwen-token-plan"       => (QWEN_TOKEN_PLAN, "Qwen Token Plan", "QWEN_TOKEN_PLAN_API_KEY", "Qwen Token Plan API key", Completions, dynamic("https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1")),
     // PROV-014 — `providers/qwen-token-plan-cn.ts:6-15` @v0.84.4 (identical at v0.83.0),
     // `all.ts:119`. models.dev source `alibaba-token-plan-cn`; same id set as the international
     // plan, China endpoint, its own key.
-    "qwen-token-plan-cn"    => (QWEN_TOKEN_PLAN_CN, "Qwen Token Plan CN", "QWEN_TOKEN_PLAN_CN_API_KEY", "Qwen Token Plan CN API key", dynamic("https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1")),
+    "qwen-token-plan-cn"    => (QWEN_TOKEN_PLAN_CN, "Qwen Token Plan CN", "QWEN_TOKEN_PLAN_CN_API_KEY", "Qwen Token Plan CN API key", Completions, dynamic("https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1")),
     // VERSION LAG (v0.83.0 → v0.84.4): `providers/qwen-token-plan-individual.ts:6-15`, added at
     // `c03d78bdc` (#7659), `all.ts:120`. The international endpoint and the SAME env var as
     // `qwen-token-plan` (`env-api-keys.ts:83`: `"qwen-token-plan-individual":
     // "QWEN_TOKEN_PLAN_API_KEY"`), narrowed to the eight-model personal allowlist
     // (`generate-models.ts:324-336`; `qwen-token-plan-models.test.ts:60-69`).
-    "qwen-token-plan-individual" => (QWEN_TOKEN_PLAN_INDIVIDUAL, "Qwen Token Plan Individual", "QWEN_TOKEN_PLAN_API_KEY", "Qwen Token Plan Individual API key", dynamic("https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1")),
-    "xai"                   => (XAI, "xAI", "XAI_API_KEY", "xAI API key", "xai"),
-    "xiaomi"                => (XIAOMI, "Xiaomi", "XIAOMI_API_KEY", "Xiaomi API key", "xiaomi"),
-    "xiaomi-token-plan-ams" => (XIAOMI_TP_AMS, "Xiaomi Token Plan AMS", "XIAOMI_TOKEN_PLAN_AMS_API_KEY", "Xiaomi Token Plan AMS API key", "xiaomi-token-plan-ams"),
-    "xiaomi-token-plan-cn"  => (XIAOMI_TP_CN, "Xiaomi Token Plan CN", "XIAOMI_TOKEN_PLAN_CN_API_KEY", "Xiaomi Token Plan CN API key", "xiaomi-token-plan-cn"),
-    "xiaomi-token-plan-sgp" => (XIAOMI_TP_SGP, "Xiaomi Token Plan SGP", "XIAOMI_TOKEN_PLAN_SGP_API_KEY", "Xiaomi Token Plan SGP API key", "xiaomi-token-plan-sgp"),
-    "zai"                   => (ZAI, "Z.AI", "ZAI_API_KEY", "Z.AI API key", "zai"),
-    "zai-coding-cn"         => (ZAI_CODING_CN, "Z.AI Coding CN", "ZAI_CODING_CN_API_KEY", "Z.AI Coding CN API key", "zai-coding-cn"),
+    "qwen-token-plan-individual" => (QWEN_TOKEN_PLAN_INDIVIDUAL, "Qwen Token Plan Individual", "QWEN_TOKEN_PLAN_API_KEY", "Qwen Token Plan Individual API key", Completions, dynamic("https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1")),
+    // XAI_2 — the one Responses member, and the one whose catalog is LIVE-FETCHED (XAI_1). The
+    // declaration is what a freshly downloaded file gets checked against.
+    "xai"                   => (XAI, "xAI", "XAI_API_KEY", "xAI API key", Responses, "xai"),
+    "xiaomi"                => (XIAOMI, "Xiaomi", "XIAOMI_API_KEY", "Xiaomi API key", Completions, "xiaomi"),
+    "xiaomi-token-plan-ams" => (XIAOMI_TP_AMS, "Xiaomi Token Plan AMS", "XIAOMI_TOKEN_PLAN_AMS_API_KEY", "Xiaomi Token Plan AMS API key", Completions, "xiaomi-token-plan-ams"),
+    "xiaomi-token-plan-cn"  => (XIAOMI_TP_CN, "Xiaomi Token Plan CN", "XIAOMI_TOKEN_PLAN_CN_API_KEY", "Xiaomi Token Plan CN API key", Completions, "xiaomi-token-plan-cn"),
+    "xiaomi-token-plan-sgp" => (XIAOMI_TP_SGP, "Xiaomi Token Plan SGP", "XIAOMI_TOKEN_PLAN_SGP_API_KEY", "Xiaomi Token Plan SGP API key", Completions, "xiaomi-token-plan-sgp"),
+    "zai"                   => (ZAI, "Z.AI", "ZAI_API_KEY", "Z.AI API key", Completions, "zai"),
+    "zai-coding-cn"         => (ZAI_CODING_CN, "Z.AI Coding CN", "ZAI_CODING_CN_API_KEY", "Z.AI Coding CN API key", Completions, "zai-coding-cn"),
 }
 
 impl FleetSpec {
@@ -243,7 +283,6 @@ mod tests {
     use super::*;
     use crate::api::openai_completions::build_body;
     use crate::context::Context;
-    use crate::known_api::OPENAI_COMPLETIONS;
     use crate::provider::Provider;
     use crate::stream::StreamOptions;
     use cyrup_core::ModelThinkingLevel;
@@ -260,11 +299,14 @@ mod tests {
         ("moonshotai-cn", 10),
         ("nvidia", 20),
         ("openrouter", 271),
-        // PROV-058: pi's generator drops five xai ids via `XAI_BUILTIN_EXCLUDED_MODEL_IDS`
-        // (`ai/scripts/generate-models.ts:379-385` @v0.83.0, consumed at `:2078`) — `grok-3`,
-        // `grok-3-fast`, `grok-4.20-0309-non-reasoning`, `grok-4.20-0309-reasoning` and
-        // `grok-code-fast-1`. cyrup shipped all five until the catalogs were regenerated.
-        ("xai", 3),
+        // xai is DELIBERATELY ABSENT from this table (XAI_2). Every other entry counts a catalog
+        // recovered from the pinned pi revision, where the row count is a property of a commit and
+        // cannot move on its own. xai's catalog is re-downloaded from
+        // https://pi.dev/api/models/providers/xai on every `gen-catalogs` run (XAI_1), so its row
+        // count is a property of what xAI is selling this week — pinning it schedules a red test for
+        // the next model launch, which is the event this whole change exists to absorb. xai's rows
+        // are checked by the invariant loop below instead: non-empty, and every generator-hardcoded
+        // field. Add nothing here for a live-fetched catalog.
         ("xiaomi", 6),
         // The three token-plan catalogs dropped to 3 in pi `cc2db980`, which stopped cloning the
         // API-billing Xiaomi catalog into every region (see `catalog_data.rs`, PROV-004).
@@ -277,32 +319,50 @@ mod tests {
 
     #[test]
     fn every_catalog_parses_with_expected_count() {
+        // Counts, for the git-pinned catalogs only (see the note in EXPECTED_COUNTS).
         for (id, count) in EXPECTED_COUNTS {
             let spec = fleet_spec(id).unwrap_or_else(|| panic!("no spec for {id}"));
+            assert_eq!(spec.models().len(), *count, "catalog count mismatch for {id}");
+        }
+
+        // Invariants, for EVERY member that ships rows — pinned or live-fetched. None of these
+        // names a model id or a count, so they hold across any future catalog refresh.
+        for spec in FLEET.iter().filter(|s| !s.is_dynamic()) {
             let models = spec.models();
-            assert_eq!(models.len(), *count, "catalog count mismatch for {id}");
-            // Every model is openai-completions and tagged with the provider id — EXCEPT
-            // `xai/grok-4.5`, which pi routes over the Responses API (PROV-054). The fleet is
-            // named for the protocol its members mostly speak, not one they all speak:
-            // `WireProvider` dispatches per `model.api` (`wire.rs:215`), so a single Responses row
-            // inside an otherwise-completions catalog is exactly what upstream has and what cyrup
-            // must reproduce. The carve-out is spelled as an id, not a count, so a SECOND row
-            // drifting off the completions protocol still fails here.
+            // A parse failure yields an empty catalog silently (`FleetSpec::models` uses
+            // `unwrap_or_default`), so this is the guard that a live download landing as garbage
+            // fails loudly instead of shipping a provider with no models.
+            assert!(!models.is_empty(), "{} parsed to an empty catalog", spec.id);
+            // Every row speaks the protocol its member DECLARES. Asserts the POSITIVE: an xai row
+            // that regressed to Completions fails here, which neither the original `grok-4.5`
+            // carve-out nor XAI_1's whole-provider widening could see.
+            let api = spec.wire.api();
             assert!(
-                models.iter().all(|m| m.api.as_str() == OPENAI_COMPLETIONS
-                    || (*id == "xai" && m.id.as_str() == "grok-4.5")),
-                "{id} api"
+                models.iter().all(|m| m.api.as_str() == api),
+                "{}: every row must be `{api}`, the protocol its FleetSpec::wire declares",
+                spec.id
             );
             assert!(
-                models.iter().all(|m| m.provider.as_str() == *id),
-                "{id} provider tag"
+                models.iter().all(|m| m.provider.as_str() == spec.id),
+                "{} provider tag",
+                spec.id
             );
-            // baseUrl is always present in the generated catalog.
             assert!(
                 models.iter().all(|m| !m.base_url.is_empty()),
-                "{id} baseUrl"
+                "{} baseUrl",
+                spec.id
             );
         }
+
+        // The declaration is checkable in BOTH directions: exactly one member is on Responses
+        // today, and it is xai. A second one arriving without a ledger entry is the signal that this
+        // module's framing needs revisiting again.
+        let responses: Vec<&str> = FLEET
+            .iter()
+            .filter(|s| s.wire == FleetWire::Responses)
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(responses, ["xai"]);
     }
 
     #[test]

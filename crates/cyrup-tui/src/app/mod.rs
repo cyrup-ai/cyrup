@@ -188,7 +188,7 @@ use crate::login_dialog::{
     LoginDialog, LoginFinished, LoginUiMsg, TuiAuthInteraction, notify_auth_dialog,
     show_auth_prompt,
 };
-use crate::model_selector::{ModelEntry, ModelSelector};
+use crate::model_selector::{ModelEntry, ModelRefreshMsg, ModelSelector};
 use crate::overlay::{ExtensionOverlay, Overlay, OverlayOutcome};
 use crate::selector::{CheckboxSelector, ListSelector, Selector, SelectorKind, SelectorOutcome};
 use crate::session_selector::{SessionRow, SessionSelector, SessionSelectorOutcome};
@@ -314,6 +314,16 @@ pub struct App<B: Backend> {
     /// by construction (that is what `AuthInteraction` is for), so an unattended one cannot
     /// complete.
     login_tx: Option<tokio::sync::mpsc::UnboundedSender<LoginUiMsg>>,
+    /// Where a spawned `/model` catalog refresh posts its settled outcome — installed by
+    /// [`App::install_model_refresh_channel`], which [`App::run`] calls once at startup (the same
+    /// shape as [`Self::login_tx`]).
+    ///
+    /// `None` means no run loop is servicing the channel (an embedder, a widget test).
+    /// [`App::begin_model_catalog_refresh`] then skips the spawn and the picker still opens over
+    /// the cached catalog — cyrup's pre-XAI_4 behaviour, and what every `open_model_selector`
+    /// test relies on. There is deliberately NO inline fallback: awaiting a 15 s network refresh
+    /// on the run loop's task would freeze every other arm for its whole duration.
+    model_refresh_tx: Option<tokio::sync::mpsc::UnboundedSender<ModelRefreshMsg>>,
     /// Where [`App::login_provider_inputs`] sources the provider registry Pi reads off
     /// `modelRuntime` (`getLoginProviderOptions`, `interactive-mode.ts:4939`).
     ///

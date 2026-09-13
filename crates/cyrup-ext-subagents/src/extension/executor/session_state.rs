@@ -275,6 +275,11 @@ impl SubagentExecutor {
         // (`extension/index.ts:971` @v0.64.0): a rebuilt session never inherits the previous
         // session's in-process agents; outstanding registration handles become no-ops.
         self.runtime_agents().clear();
+        // WORKFLOW_6 §2.4 — pi `extension/index.ts:1038-1041`: a workflow continuation retains its
+        // launch context, so it is ABORTED before the session's state is torn down — a reload must
+        // not be able to launch through a context that no longer exists. Abort-then-clear, never
+        // clear-then-abort.
+        self.abort_and_clear_workflow_controllers();
     }
 }
 

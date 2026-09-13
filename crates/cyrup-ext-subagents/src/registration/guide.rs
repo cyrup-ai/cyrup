@@ -191,11 +191,20 @@ mod tests {
         assert_eq!(
             actions.get(at - 1).copied(),
             Some("models"),
-            "pi `shared/types.ts:1968` @v0.47.1 orders `… \"models\", \"children.list\", \
-             \"guide\", \"create\", …`; cyrup omits the unported `children.list`, so `guide` \
+            "pi `shared/types.ts:2760` orders `… \"models\", \"children.list\", \"guide\", \
+             \"validate\", \"create\", …`; cyrup omits the unported `children.list`, so `guide` \
              follows `models` directly"
         );
-        assert_eq!(actions.get(at + 1).copied(), Some("create"));
+        // WORKFLOW_2: `validate` now occupies pi's own slot between `guide` and `create`
+        // (`shared/types.ts:2760`). Before it was ported this asserted `create`, which is what
+        // makes this test the SIXTH pinning site for a new verb in this family — it pins `guide`'s
+        // SUCCESSOR, so adding any verb at pi's real index here goes red even when the
+        // `assert_eq!` on the whole list in `schema.rs` has already been updated.
+        assert_eq!(
+            actions.get(at + 1).copied(),
+            Some("validate"),
+            "pi orders `… \"guide\", \"validate\", \"create\", …` (`shared/types.ts:2760`)"
+        );
     }
 
     /// The packaged docs are the ones a model reads to recover the tool surface, so the

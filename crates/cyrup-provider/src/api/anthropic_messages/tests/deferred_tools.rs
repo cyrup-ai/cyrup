@@ -261,11 +261,24 @@ fn the_safety_valve_promotes_every_tool_back_when_all_are_deferred() {
 fn cache_control_marks_the_last_immediate_tool_never_a_deferred_one() {
     // Pi passes `undefined` cacheControl to the deferred convertTools call (:1015-1021), so
     // the cache breakpoint stays inside the stable prefix.
+    //
+    // `StreamOptions::default()` leaves `cache_retention` unset, so this depends on
+    // `resolve_cache_retention`'s env fallback resolving to "short" (TEST_ENV_HERMETICITY): an
+    // explicit empty `ambient` pins that, rather than an empty overlay that would still fall
+    // through to the developer's real `CYRUP_CACHE_RETENTION`.
     let ctx = deferred_ctx(
         vec![tool_def("base_tool"), tool_def("late_tool")],
         &["late_tool"],
     );
-    let body = build_body(&opus_4_6(), &ctx, &StreamOptions::default());
+    let empty = ProviderEnv::new();
+    let body = build_params(
+        &opus_4_6(),
+        &ctx,
+        &StreamOptions::default(),
+        env_source(None, &empty),
+        false,
+    )
+    .expect("fixture declares no unsatisfiable constrained sampling");
     assert_eq!(
         body["tools"][0]["cache_control"],
         json!({ "type": "ephemeral" })
@@ -279,12 +292,23 @@ fn cache_control_lands_on_the_displaced_sibling_not_the_reference_block() {
     // The last block of a reference-bearing user message is now a displaced `text`, and
     // `applyLastUserCacheControl` marks it there (Pi :1259-1268). Only true when the
     // tool-result batch is the LAST message.
+    //
+    // Same hermeticity note as `cache_control_marks_the_last_immediate_tool_never_a_deferred_one`:
+    // an explicit empty `ambient` pins the "short" default (TEST_ENV_HERMETICITY).
     let mut ctx = deferred_ctx(
         vec![tool_def("base_tool"), tool_def("late_tool")],
         &["late_tool"],
     );
     ctx.messages.pop(); // drop the trailing user turn
-    let body = build_body(&opus_4_6(), &ctx, &StreamOptions::default());
+    let empty = ProviderEnv::new();
+    let body = build_params(
+        &opus_4_6(),
+        &ctx,
+        &StreamOptions::default(),
+        env_source(None, &empty),
+        false,
+    )
+    .expect("fixture declares no unsatisfiable constrained sampling");
     let content = tool_result_content(&body);
     assert_eq!(
         content.last().expect("last block"),

@@ -12,6 +12,11 @@ use super::RunId;
 /// on.
 const STATUS_FILE_NAME: &str = "status.json";
 
+/// `events.jsonl` — the one file name both [`RunPaths::for_run`] and [`RunDir::events`] must
+/// agree on (mirrors [`STATUS_FILE_NAME`]'s own reasoning; added for
+/// [`crate::workflows::read_workflow_receipt`]'s absent-receipt probe, WORKFLOW_3 §0.9).
+const EVENTS_FILE_NAME: &str = "events.jsonl";
+
 /// The filesystem directory, keyed by run id, holding one background run's `status.json`,
 /// `events.jsonl`, control-inbox files, append-request files, output/log files, and (once
 /// terminal) its human-readable run-log — everything **except** the terminal [`ResultFile`](crate::background::ResultFile)
@@ -56,6 +61,15 @@ impl RunDir {
     #[must_use]
     pub fn status(&self) -> PathBuf {
         self.0.join(STATUS_FILE_NAME)
+    }
+
+    /// `<run_dir>/events.jsonl`, without requiring a results dir — the sibling of
+    /// [`RunDir::status`], added for [`crate::workflows::read_workflow_receipt`]'s absent-receipt
+    /// probe: it needs to tell "the run directory shows no sign of the run" apart from "the
+    /// workflow may still be active", and neither probe should re-spell either file-name literal.
+    #[must_use]
+    pub fn events(&self) -> PathBuf {
+        self.0.join(EVENTS_FILE_NAME)
     }
 }
 
@@ -120,7 +134,7 @@ impl RunPaths {
         let dir = run_dir.as_path().to_path_buf();
         Self {
             status: dir.join(STATUS_FILE_NAME),
-            events: dir.join("events.jsonl"),
+            events: dir.join(EVENTS_FILE_NAME),
             control_inbox: dir.join("control").join("interrupt.json"),
             append_dir: dir.join("append-requests"),
             runner_stdout_log: dir.join("runner.stdout.log"),

@@ -15,7 +15,7 @@ use crate::model::Model;
 use crate::stream::{CacheRetention, StreamOptions};
 use crate::utils::constrained_sampling::ConstrainedSamplingError;
 use crate::utils::deferred_tools::split_deferred_tools;
-use crate::utils::provider_plumbing::resolve_cache_retention;
+use crate::utils::provider_plumbing::{EnvSource, resolve_cache_retention};
 use cyrup_core::ModelThinkingLevel;
 use serde_json::{Map, Value, json};
 
@@ -93,7 +93,7 @@ pub(super) fn try_build_params(
             default_strict: Some(false),
         },
     )?;
-    let cache = resolve_cache_retention(opts.cache_retention, env);
+    let cache = resolve_cache_retention(opts.cache_retention, EnvSource::new(env));
 
     let mut obj = Map::new();
     obj.insert("model".to_string(), json!(model.id.as_str()));

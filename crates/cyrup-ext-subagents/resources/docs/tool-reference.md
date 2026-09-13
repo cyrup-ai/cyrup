@@ -45,6 +45,7 @@ With an `action`, the tool is in **management** or **control** mode.
 | `watchdog.check` | management | Run one watchdog review now |
 | `watchdog.configure` | management | Change the watchdog config |
 | `watchdog.recommend-model` | management | Suggest a watchdog review model |
+| `validate` | management | Structurally check a `workflowScript` without running it |
 
 An unknown action is answered with a did-you-mean suggestion drawn from this list, except that a
 destructive candidate (`delete`, `eject`, `reset`, `stop`, `interrupt`, …) is only suggested under a
@@ -56,6 +57,7 @@ deliberately stricter rule, so a loose typo is never nudged toward a destructive
 |---|---|---|
 | `agent` | single, management | Agent name, or the management target |
 | `task` | single | The task text; optional for self-contained agents |
+| `workflowScript` | workflow | Inline JavaScript statement body run as a workflow |
 | `action` | management, control | See the table above; omit for execution mode |
 | `tasks` | parallel | Array of `{agent, task, …}` |
 | `chain` | chain | Array of ordered steps |

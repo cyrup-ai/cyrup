@@ -74,6 +74,13 @@ pub use executor::requests::{
     BackgroundSingleRequest, BackgroundStepsSpec, ForegroundRunRequest, GraphRunOutcome,
     SingleRunOverrides, StatusViewSelector,
 };
+// WORKFLOW_14 — a field type of the publicly re-exported `ForegroundRunRequest`, so it must be
+// reachable at the same visibility or the field is a private interface.
+pub use executor::foreground_control::ForegroundChildSteerHandle;
+// WORKFLOW_6 §3.3 — `tui::fleet_state` (outside this module tree) projects the live registry's
+// own child record onto its `ForegroundChildView`; re-exported at crate visibility rather than
+// widening `executor`'s own privacy, matching every other cross-tree reference above.
+pub(crate) use executor::foreground_control::ForegroundChildEntry;
 pub use host::SubagentsExtension;
 pub use host::registration::{
     INSTALL_ENV_VAR, RegistrationMode, is_installed, is_installed_with, registration_mode_from_env,

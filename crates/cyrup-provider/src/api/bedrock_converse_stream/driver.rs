@@ -3,7 +3,6 @@
 
 use super::blocks::Decoder;
 use super::config::resolve_client_config;
-use super::env::EnvSource;
 use super::errors::{format_bedrock_error, format_bedrock_service_error};
 use super::events::dispatch_frame;
 use super::failure::{
@@ -22,6 +21,7 @@ use crate::model::Model;
 use crate::stream::sse::build_client_for_target_forcing_http1;
 use crate::stream::{StreamEvent, StreamOptions};
 use crate::utils::error_body::normalize_error_body;
+use crate::utils::provider_plumbing::EnvSource;
 use crate::utils::provider_retry::{ProviderRetry, is_retryable_provider_error, retry_delay_ms};
 use cyrup_core::{ApiId, CancelToken, StopReason};
 use futures::StreamExt;

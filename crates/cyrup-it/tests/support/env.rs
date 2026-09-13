@@ -72,8 +72,15 @@ pub const FEATURE_GATE_KEYS: &[&str] = &[
 /// Variables that redirect a child's config/credential RESOLUTION rather than carrying a
 /// credential themselves. `CYRUP_HOME` is the dangerous one: it outranks the `HOME` a test sets,
 /// so an ambient value re-roots the child at the developer's real `auth.json`/`models.json`.
-pub const CONFIG_REDIRECT_KEYS: &[&str] =
-    &["CYRUP_HOME", "CYRUP_AGENT_DIR", "CYRUP_CODING_AGENT_DIR"];
+/// `CYRUP_CACHE_RETENTION` redirects `cyrup-provider`'s cache-retention resolution the same way
+/// (TEST_ENV_HERMETICITY) — an ambient value flips which rung of `resolveCacheRetention`'s ladder
+/// a child resolves to, independent of what any test configured.
+pub const CONFIG_REDIRECT_KEYS: &[&str] = &[
+    "CYRUP_HOME",
+    "CYRUP_AGENT_DIR",
+    "CYRUP_CODING_AGENT_DIR",
+    "CYRUP_CACHE_RETENTION",
+];
 
 /// Ambient proxies. Not credentials, but they decide where a child's traffic GOES, and a test
 /// that asserts "no network" must not have its child silently tunnelled through one.

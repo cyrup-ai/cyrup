@@ -296,13 +296,16 @@ impl<B: Backend> App<B> {
             eff.default_provider().unwrap_or_default(),
             eff.default_model().unwrap_or_default(),
         ));
+        // XAI_4/D9 — the `models.is_empty()` early return is GONE. Pi's `showModelSelector`
+        // (`interactive-mode.ts:4987`) opens unconditionally and lets the constructor's refresh
+        // populate the list. cyrup's guard turned the one manual "go fetch catalogs" affordance into
+        // a dead end for exactly the users who need it: the five providers that ship zero embedded
+        // rows by design (`baseten`, the three `qwen-token-plan*`, `radius` —
+        // `catalog_data.rs::DYNAMIC_ONLY_PROVIDERS`) produce an empty catalog until a refresh lands,
+        // so a user configured on only those could not open `/model` to trigger one. An empty picker
+        // is also the BETTER message: `scope_line` already renders pi's own
+        // "Only showing models from configured providers. Use /login to add providers."
         let models = model_entries(session);
-        if models.is_empty() {
-            self.state
-                .transcript
-                .push_status("no models available (configure providers)");
-            return;
-        }
         if let Some(term) = search.as_deref()
             && let Some(model) =
                 crate::model_selector::find_exact_model_reference_match(&models, term)
@@ -321,6 +324,115 @@ impl<B: Backend> App<B> {
         }
         // No term, or a partial with no exact match → the picker, pre-filtered to the term if any.
         self.open_model_selector(models, search);
+        self.begin_model_catalog_refresh(session);
+    }
+
+    /// Fire the background catalog refresh the `/model` picker shows its status for — Pi's
+    /// `void this.refreshModels()`, the LAST statement of `ModelSelectorComponent`'s constructor
+    /// (`model-selector.ts:158`), after the snapshot has already been rendered.
+    ///
+    /// Three properties are load-bearing, all of them upstream's:
+    ///
+    /// * **The picker is already open and drawn.** Nothing here awaits; the refresh cannot delay,
+    ///   empty or close it. (`handle_model_command` is `async` for `set_model` only — do not await
+    ///   `refresh_model_catalogs` on that task.)
+    /// * **The `Refreshing model catalogs…` row is set SYNCHRONOUSLY**, here rather than inside the
+    ///   task, because upstream's is a field initializer (`:64`) evaluated before any async work — so
+    ///   the very first frame carries it. NOT set in `ModelSelector::new`, which the session-less
+    ///   constructors also use and which would pin a "Refreshing…" row nothing ever clears (exactly
+    ///   what `set_refresh_status`'s doc warns about). The command arm's `frames.request()` after
+    ///   `execute_command` is what paints that first frame.
+    /// * **The 15 s budget lives HERE**, not in the coordinator: upstream's component owns its own
+    ///   `AbortController` and `setTimeout` (`:72`, `:185-188`) while `refreshModelCatalogs` is
+    ///   timeout-agnostic. XAI_3's API takes the token for the same reason.
+    fn begin_model_catalog_refresh(&mut self, session: &Arc<AgentSession>) {
+        let Some(tx) = self.model_refresh_tx.clone() else {
+            // No run loop servicing the channel (an embedder, a widget test): the picker still opens
+            // over the cached catalog, which is the pre-XAI_4 behaviour exactly.
+            return;
+        };
+        // Pi's field initializer (`:64`), synchronous and before the spawn.
+        if let Some(picker) = self.model_selector_mut() {
+            picker.set_refresh_status("Refreshing model catalogs…", false);
+            picker.set_error_message(None);
+        }
+        self.state.model_refresh_epoch = self.state.model_refresh_epoch.wrapping_add(1);
+        let epoch = self.state.model_refresh_epoch;
+        // One token used for all three of upstream's purposes (`:72`): the deadline fires it,
+        // `close_selector` fires it, and the settled refresh clears it.
+        // Do NOT cancel a previous token here — see D7.
+        let cancel = CancelToken::new();
+        self.state.model_refresh_cancel = Some(cancel.clone());
+
+        // `setTimeout(() => { timedOut = true; abort(); }, 15_000)` (`:186-188`). The second arm is
+        // upstream's `clearTimeout` (`:217`): the token is cancelled once the refresh settles or the
+        // picker closes, and this task exits instead of holding a timer for the full budget.
+        let deadline = cancel.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                () = tokio::time::sleep(crate::MODEL_REFRESH_TIMEOUT) => deadline.cancel(),
+                () = deadline.cancelled() => {}
+            }
+        });
+
+        let session = session.clone();
+        tokio::spawn(async move {
+            // XAI_3 returns `timed_out: true` when THIS token fires, joins any refresh already in
+            // flight (the startup one, or a previous `/model` open) rather than starting a second,
+            // and resolves the credential-gated provider list itself from `services.auth` — so a
+            // `/login` earlier in this session is picked up here with no extra wiring.
+            let result = session.refresh_model_catalogs(cancel.clone()).await;
+            cancel.cancel(); // `finally { clearTimeout(...) }` (`:216-218`)
+            let _ = tx.send(ModelRefreshMsg { epoch, result });
+        });
+    }
+
+    /// The open `/model` picker, if one occupies the input slot — the `login_dialog_mut` shape
+    /// (`app/login.rs:204-209`).
+    fn model_selector_mut(&mut self) -> Option<&mut ModelSelector> {
+        self.state
+            .selector
+            .as_mut()
+            .filter(|s| s.kind == SelectorKind::Model)
+            .and_then(|s| s.inner.as_model_selector())
+    }
+
+    /// Write a settled catalog refresh into the open `/model` picker — Pi `refreshModels()`'s tail
+    /// (`model-selector.ts:191-213`), in upstream's exact order: rows first, then
+    /// `loadModelsFromSnapshot()`, then re-apply the live filter.
+    ///
+    /// Dropped silently when the picker has closed or been reopened (Pi's `if (this.closed) return`,
+    /// `:192`/`:210`) — see [`ModelRefreshMsg::epoch`] for why `SelectorKind` alone is not enough.
+    pub fn apply_model_refresh(&mut self, session: &Arc<AgentSession>, msg: ModelRefreshMsg) {
+        if msg.epoch != self.state.model_refresh_epoch {
+            return; // stale: from a picker that has since closed or been reopened
+        }
+        self.state.model_refresh_cancel = None;
+        // Pi's `getError()` (`model-runtime.ts:426-435`), minus `availabilityError` which cyrup has
+        // no counterpart for: the `models.json` load error plus every per-provider composition error,
+        // joined exactly as upstream joins them.
+        let runtime_error = session.services().startup_diagnostics.models.join("\n\n");
+        let (status, error) =
+            crate::model_selector::refresh_outcome_rows(&msg.result, Some(runtime_error.as_str()));
+        // Read the rebuilt catalog BEFORE taking `&mut` on the picker: `model_entries` borrows the
+        // session, not `self`, and keeping the two borrows disjoint is what lets this stay one pass.
+        // `available_model_catalog` rebuilds the registry from XAI_3's live overlay slot on every
+        // call — so a model released since this binary was built arrives here with no extra plumbing.
+        let models = model_entries(session);
+        let Some(picker) = self.model_selector_mut() else {
+            return; // closed (Esc/confirm) since this refresh started; epoch matched, nothing to paint
+        };
+        // `refreshStatusMessage = ""` opens every upstream branch (`:192`, `:210`); an empty message
+        // is `set_refresh_status`'s own documented clear.
+        match status {
+            Some((message, success)) => picker.set_refresh_status(message, success),
+            None => picker.set_refresh_status("", false),
+        }
+        picker.set_error_message(error);
+        // `loadModelsFromSnapshot()` + `filterModels(searchInput.getValue())` (`:207-208`).
+        // `set_models` keeps the live query; `filtered()` is computed from `self.input`, so the
+        // re-filter is implicit.
+        picker.set_models(models);
     }
 
     /// Open an arbitrary boxed [`Selector`] in the input slot under `kind` (the seam for the bespoke
@@ -752,6 +864,16 @@ impl<B: Backend> App<B> {
     /// re-applies the editor text, so a stack of submenus restores it exactly once.
     pub(crate) fn close_selector(&mut self, cancelled: bool) {
         if let Some(active) = self.state.selector.take() {
+            // Pi `ModelSelectorComponent.dispose()` (`model-selector.ts:221-226`): unmounting the
+            // picker fires its `refreshAbortController`. Through XAI_3's coordinator that drops this
+            // caller's waiter guard, which aborts the SHARED operation only if nobody else was
+            // waiting — so Esc (or confirm) stops paying for a refresh no one is reading without
+            // killing the startup refresh another caller may still be joined to.
+            if active.kind == SelectorKind::Model
+                && let Some(cancel) = self.state.model_refresh_cancel.take()
+            {
+                cancel.cancel();
+            }
             if cancelled && let Some(theme) = active.restore_theme {
                 self.set_theme(theme);
             }

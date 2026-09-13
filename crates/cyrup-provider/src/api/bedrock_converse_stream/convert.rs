@@ -2,7 +2,6 @@
 //! `convertToolConfig`).
 
 use super::capabilities::{supports_prompt_caching, supports_thinking_signature};
-use super::env::EnvSource;
 use super::options::BedrockToolChoice;
 use crate::api::compat::sanitize_surrogates;
 use crate::api::openai_completions::transform_messages_with;
@@ -12,6 +11,7 @@ use crate::stream::CacheRetention;
 use crate::utils::constrained_sampling::{
     ConstrainedSamplingError, json_schema_tool_parameters, resolve_json_schema_strict_sampling,
 };
+use crate::utils::provider_plumbing::EnvSource;
 use base64::Engine as _;
 use cyrup_core::{Content, Message};
 use serde_json::{Map, Value, json};

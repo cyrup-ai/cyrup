@@ -37,6 +37,25 @@ pub struct ModelEntry {
     pub scoped: bool,
 }
 
+/// The `/model` picker's own catalog-refresh budget — Pi `const timeoutMs = 15_000`
+/// (`model-selector.ts:185`). It belongs to the CALLER, not the coordinator: upstream's
+/// `refreshModelCatalogs` respects whatever signal it is handed and imposes no deadline of its own.
+pub const MODEL_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// A settled `/model` catalog refresh, travelling from the spawned task back to the run loop
+/// (Pi's `refreshModels()` tail, `model-selector.ts:191-213`).
+///
+/// `epoch` is Pi's per-component `this.closed` guard (`:192`, `:210`), expressed for a slot that can
+/// be reoccupied: cyrup's picker is a `Box<dyn Selector>` in ONE slot, so "is my picker still the
+/// open one?" cannot be answered by `SelectorKind` alone — close-and-reopen produces a second picker
+/// of the same kind, and a 15 s-late timeout from the first would otherwise paint over the second's
+/// success row.
+#[derive(Debug)]
+pub struct ModelRefreshMsg {
+    pub epoch: u64,
+    pub result: cyrup_provider::CatalogRefreshResult,
+}
+
 impl ModelEntry {
     /// The fuzzy search text (Pi `getModelSelectorSearchText`, `model-search.ts:16-19`): provider-first
     /// so exact provider-prefixed queries rank before proxy-provider ids.
@@ -282,21 +301,47 @@ impl ModelSelector {
         self.selected = 0;
     }
 
+    /// Replace the catalog in place, preserving the live search, the scope toggle and the cursor
+    /// rule (Pi `loadModelsFromSnapshot`, `model-selector.ts:161-181`, which `refreshModels` calls
+    /// before re-applying the filter at `:207`).
+    ///
+    /// Deliberately NOT `*self = ModelSelector::new(models)`: that resets the embedded `Input`, the
+    /// scope and the highlight, so a refresh landing while the user is three characters into a query
+    /// would throw the query away — the opposite of the in-place update this exists for. Sorting
+    /// goes through [`Self::sort_models`] rather than `new`'s comparator because a picker opened
+    /// through `with_default_model` already ranks the persisted default second, and a refresh must
+    /// not silently re-rank it.
+    ///
+    /// Cursor rule is pi's, not "keep the highlight": re-find the session's active model
+    /// (`m.current`) in the filtered view; only if it is absent clamp `self.selected`.
+    pub fn set_models(&mut self, models: Vec<ModelEntry>) {
+        self.models = models;
+        self.sort_models();
+        self.has_scoped = self.models.iter().any(|m| m.scoped);
+        // Upstream cannot reach this: its `scopedModels` come from the session, not the refresh.
+        // Here a refresh CAN drop the last scoped row, and a `Scoped` scope over an empty set would
+        // render a permanently empty picker with no way back except `⇥` on a hidden toggle.
+        if !self.has_scoped {
+            self.scope = Scope::All;
+        }
+        // `currentIndex >= 0 ? currentIndex : Math.min(selectedIndex, max(0, len - 1))` (`:179-181`).
+        let filtered_len = self.filtered().len();
+        self.selected = self
+            .filtered()
+            .iter()
+            .position(|m| m.current)
+            .unwrap_or_else(|| self.selected.min(filtered_len.saturating_sub(1)));
+    }
+
     /// Set the catalog-refresh status row (Pi `refreshStatusMessage`/`refreshStatusSuccess`,
     /// `:172-184`): `success` colours it `success`, otherwise `muted`. An empty message clears it,
     /// exactly like upstream's `refreshStatusMessage = ""` (`:172`, `:191`).
     ///
-    /// **BLOCKED, not unfinished.** Upstream's producer is `refreshModels()`
-    /// (`model-selector.ts:162-200`), which the constructor fires at `:136` — so the user action
-    /// that should reach this is *opening `/model`*. cyrup cannot run it from here: the driver of
-    /// that refresh is `ModelRuntime.refresh`, and `AgentSession` exposes no analogue —
-    /// `available_model_catalog()` is a snapshot, `AgentSessionServices`
-    /// (`cyrup-session-svc/src/services.rs:84-152`) publishes `catalog_overlay` but not the live
-    /// `cyrup_provider::Collection` that owns `Collection::refresh` (`collection.rs:317`), and the
-    /// one refresh cyrup does run (`cyrup::provider::spawn_model_catalog_refresh`,
-    /// `crates/cyrup/src/provider.rs:132`) is a detached bin-level task with no channel back into
-    /// `App`. Unblocking it is a `cyrup-session-svc` API addition plus a `ModelRefreshMsg` channel
-    /// alongside `install_login_channel` (`app.rs:2045`) — both outside this crate's edit scope.
+    /// Produced by [`crate::app::App::begin_model_catalog_refresh`] (the in-flight
+    /// `Refreshing model catalogs…` row, set synchronously before the spawn) and
+    /// [`crate::app::App::apply_model_refresh`] (the settled row, via [`ModelRefreshMsg`]).
+    /// [`Self::new`] does **not** seed the in-flight string: session-less constructors
+    /// (`App::open_model_selector` from tests) would pin a row nothing ever clears.
     pub fn set_refresh_status(&mut self, message: impl Into<String>, success: bool) {
         let message = message.into();
         self.refresh_status = if message.is_empty() {
@@ -310,9 +355,8 @@ impl ModelSelector {
     /// `\n`-separated line renders in `error` and the whole block replaces the `Model Name:` /
     /// `No matching models` row (`:299-311`).
     ///
-    /// **BLOCKED** on the same missing seam as [`Self::set_refresh_status`] — every one of
-    /// upstream's four assignments to `errorMessage` (`:174`, `:176`, `:178`, `:180`) is a branch
-    /// on a `modelRuntime.refresh()` result.
+    /// Produced by [`crate::app::App::apply_model_refresh`] from [`refresh_outcome_rows`] over a
+    /// settled [`ModelRefreshMsg`]. An empty / `None` message restores the `Model Name:` footer.
     pub fn set_error_message(&mut self, message: Option<String>) {
         self.error_message = message.filter(|m| !m.is_empty());
     }
@@ -463,6 +507,54 @@ impl ModelSelector {
             ));
         }
         lines
+    }
+}
+
+/// The picker's refresh outcome → its two rows, in pi's exact branch order
+/// (`model-selector.ts:193-206`). Returns `(refresh_status, error_message)` for
+/// [`ModelSelector::set_refresh_status`] / [`ModelSelector::set_error_message`]; `None` clears.
+///
+/// `runtime_error` is pi's `this.modelRuntime.getError()` (`model-runtime.ts:426-435`): the
+/// `models.json` load error plus every per-provider composition error, joined with `"\n\n"`. cyrup
+/// carries exactly those two on `AgentSessionServices::startup_diagnostics.models`; upstream's third
+/// source, `availabilityError`, has no counterpart because cyrup runs no availability pass.
+///
+/// **`[CYRUP-DELTA]`** — the first arm is `timed_out || aborted`, where pi's is
+/// `result.aborted && timedOut`. pi's spare `aborted` falls through to its success arm and reports
+/// "Model catalogs refreshed."; in cyrup `aborted` means XAI_3's coordinator cancelled the operation
+/// before `load_overlay` installed anything, so the catalog provably did not change and the success
+/// row would be false. The strings are unchanged; only the predicate widens.
+#[must_use]
+pub fn refresh_outcome_rows(
+    result: &cyrup_provider::CatalogRefreshResult,
+    runtime_error: Option<&str>,
+) -> (Option<(String, bool)>, Option<String>) {
+    // Every pi branch opens with `refreshStatusMessage = ""` (`:192`, `:210`), so the default here is
+    // "no status row" and only the success arm sets one.
+    if result.timed_out || result.aborted {
+        return (
+            None,
+            Some("Model refresh timed out; showing cached models.".to_string()),
+        );
+    }
+    let ids: Vec<&str> = result.errors.keys().map(String::as_str).collect();
+    match ids.as_slice() {
+        [] => match runtime_error.filter(|e| !e.is_empty()) {
+            Some(e) => (None, Some(e.to_string())),
+            None => (Some(("Model catalogs refreshed.".to_string(), true)), None),
+        },
+        [id] => (
+            None,
+            Some(format!("Could not refresh {id}; showing cached models.")),
+        ),
+        many => (
+            None,
+            Some(format!(
+                "Could not refresh {} model catalogs ({}); showing cached models.",
+                many.len(),
+                many.join(", ")
+            )),
+        ),
     }
 }
 
@@ -677,6 +769,10 @@ impl Selector for ModelSelector {
         self.input.paste(text);
         self.selected = 0;
         SelectorOutcome::Redraw
+    }
+
+    fn as_model_selector(&mut self) -> Option<&mut ModelSelector> {
+        Some(self)
     }
 }
 

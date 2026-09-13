@@ -5,12 +5,11 @@ use super::capabilities::{
     supports_adaptive_thinking,
 };
 use super::convert::{build_system_prompt, convert_messages, convert_tool_config};
-use super::env::EnvSource;
 use super::options::{BedrockOptions, BedrockThinkingDisplay};
 use crate::context::Context;
 use crate::model::Model;
 use crate::stream::{CacheRetention, StreamOptions};
-use crate::utils::provider_plumbing::resolve_cache_retention_with;
+use crate::utils::provider_plumbing::{EnvSource, resolve_cache_retention_with};
 use crate::utils::simple_options::{adjust_max_tokens_for_thinking, clamp_max_tokens_to_context};
 use cyrup_core::ThinkingLevel;
 use serde_json::{Map, Value, json};
