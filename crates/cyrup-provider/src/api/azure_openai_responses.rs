@@ -36,7 +36,7 @@ use crate::model::Model;
 use crate::stream::StreamOptions;
 use crate::stream::sse::SseRequest;
 use crate::utils::constrained_sampling::ConstrainedSamplingError;
-use crate::utils::provider_plumbing::{connect_sse, provider_env_value};
+use crate::utils::provider_plumbing::{EnvSource, connect_sse, provider_env_value};
 use cyrup_core::{ApiId, CancelToken, ModelThinkingLevel};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
@@ -216,7 +216,7 @@ fn resolve_deployment_name(
         return name.to_string();
     }
     let map = parse_deployment_name_map(
-        provider_env_value("AZURE_OPENAI_DEPLOYMENT_NAME_MAP", env).as_deref(),
+        provider_env_value("AZURE_OPENAI_DEPLOYMENT_NAME_MAP", EnvSource::new(env)).as_deref(),
     );
     map.get(model.id.as_str())
         .filter(|s| !s.is_empty())
@@ -269,7 +269,7 @@ fn resolve_azure_config(
     let api_version = azure
         .and_then(|o| o.azure_api_version.clone())
         .filter(|s| !s.is_empty())
-        .or_else(|| provider_env_value("AZURE_OPENAI_API_VERSION", env))
+        .or_else(|| provider_env_value("AZURE_OPENAI_API_VERSION", EnvSource::new(env)))
         .unwrap_or_else(|| DEFAULT_AZURE_API_VERSION.to_string());
 
     // `options?.azureBaseUrl?.trim() || env?.trim() || undefined`.
@@ -278,7 +278,7 @@ fn resolve_azure_config(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .or_else(|| {
-            provider_env_value("AZURE_OPENAI_BASE_URL", env)
+            provider_env_value("AZURE_OPENAI_BASE_URL", EnvSource::new(env))
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
         });
@@ -287,7 +287,7 @@ fn resolve_azure_config(
     let resource_name = azure
         .and_then(|o| o.azure_resource_name.clone())
         .filter(|s| !s.is_empty())
-        .or_else(|| provider_env_value("AZURE_OPENAI_RESOURCE_NAME", env));
+        .or_else(|| provider_env_value("AZURE_OPENAI_RESOURCE_NAME", EnvSource::new(env)));
 
     if resolved.is_none()
         && let Some(resource) = resource_name.filter(|s| !s.is_empty())

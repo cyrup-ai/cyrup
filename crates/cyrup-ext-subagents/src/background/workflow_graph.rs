@@ -65,9 +65,10 @@ pub enum WorkflowRunMode {
     /// One single agent invocation.
     Single,
     /// A script-driven workflow run — pi `WorkflowGraphSnapshot.mode` is typed `SubagentRunMode`
-    /// (`shared/types.ts:105`, `:400`) and therefore carries all FOUR shapes. This enum was
-    /// originally ported with three because the fourth was unreachable before
-    /// [`crate::background::RunMode::Workflow`] existed; it is not a narrower type upstream.
+    /// (`shared/types.ts:105`, `:400`) and therefore carries all FOUR shapes. The fourth
+    /// (`RunMode::Workflow`) is reachable from the foreground producer (`route_workflow_mode`);
+    /// `workflow_graph_from_run` (`:708`) is **not** its projection path (it needs a `RunnerStep`
+    /// list a script-driven run does not have).
     Workflow,
 }
 

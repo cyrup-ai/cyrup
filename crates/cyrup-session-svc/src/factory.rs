@@ -34,6 +34,9 @@ pub struct SessionFactory {
     /// runs on each rebuild too (`main.ts:687-706` @v0.83.0). SEAM-065.
     trust_store: Option<Arc<TrustStore>>,
     trust_prompt: Option<TrustPromptFn>,
+    /// The shared catalog service re-applied to every session this factory builds (XAI_3). `None`
+    /// ⇒ each rebuilt session gets its own disk-only overlay slot, exactly as before this existed.
+    model_catalog_service: Option<Arc<cyrup_provider::ModelCatalogService>>,
 }
 
 impl SessionFactory {
@@ -50,6 +53,7 @@ impl SessionFactory {
             provider_resolver: None,
             trust_store: None,
             trust_prompt: None,
+            model_catalog_service: None,
         }
     }
 
@@ -65,6 +69,16 @@ impl SessionFactory {
     #[must_use]
     pub fn trust_prompt(mut self, prompt: TrustPromptFn) -> Self {
         self.trust_prompt = Some(prompt);
+        self
+    }
+
+    /// Wire the shared [`cyrup_provider::ModelCatalogService`] into every session this factory
+    /// builds or rebuilds (XAI_3, FINDING 3) — forwarded to [`SessionBuilder::model_catalog_service`]
+    /// at every `build`/`build_with_parent`/`build_from_manager` call, so a cwd-switch or fork keeps
+    /// sharing the SAME live overlay slot rather than reloading a fresh one from disk.
+    #[must_use]
+    pub fn model_catalog_service(mut self, svc: Arc<cyrup_provider::ModelCatalogService>) -> Self {
+        self.model_catalog_service = Some(svc);
         self
     }
 
@@ -168,6 +182,9 @@ impl SessionFactory {
         if let Some(prompt) = &self.trust_prompt {
             builder = builder.trust_prompt(prompt.clone());
         }
+        if let Some(svc) = &self.model_catalog_service {
+            builder = builder.model_catalog_service(svc.clone());
+        }
         for ext in &self.native_extensions {
             builder = builder.with_native_extension(ext.clone());
         }
@@ -199,6 +216,9 @@ impl SessionFactory {
         }
         if let Some(prompt) = &self.trust_prompt {
             builder = builder.trust_prompt(prompt.clone());
+        }
+        if let Some(svc) = &self.model_catalog_service {
+            builder = builder.model_catalog_service(svc.clone());
         }
         for ext in &self.native_extensions {
             builder = builder.with_native_extension(ext.clone());

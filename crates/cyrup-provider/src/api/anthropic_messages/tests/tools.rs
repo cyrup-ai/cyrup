@@ -91,8 +91,14 @@ fn constrained_sampling_drives_anthropic_strict_tools() {
     // in the developer's shell cannot swap in the 1h-ttl variant — that branch is pinned
     // separately by `tools_encode_eager_streaming_and_cache_control`.
     let short = ProviderEnv::from([("CYRUP_CACHE_RETENTION".into(), "short".into())]);
-    let pinned = build_params(&m, &ctx, &StreamOptions::default(), Some(&short), false)
-        .expect("supports_strict_tools satisfies the `prefer` tool");
+    let pinned = build_params(
+        &m,
+        &ctx,
+        &StreamOptions::default(),
+        EnvSource::new(Some(&short)),
+        false,
+    )
+    .expect("supports_strict_tools satisfies the `prefer` tool");
     assert_eq!(
         pinned["tools"][0]["cache_control"],
         json!({"type": "ephemeral"})
@@ -101,7 +107,13 @@ fn constrained_sampling_drives_anthropic_strict_tools() {
     // (c) `require` on a model without strict tools fails the whole turn, with pi's text.
     ctx.tools = vec![strict_tool(StrictSampling::Require)];
     assert_eq!(
-        build_params(&model(), &ctx, &StreamOptions::default(), None, false),
+        build_params(
+            &model(),
+            &ctx,
+            &StreamOptions::default(),
+            EnvSource::default(),
+            false
+        ),
         Err(ConstrainedSamplingError(
             "Tool \"Edit\" requires JSON-schema constrained sampling, but strict tools are unsupported."
                 .to_string()

@@ -1238,6 +1238,8 @@ mod tests {
             workflow_key: None,
             run_id: None,
             session_name: None,
+            interrupted: false,
+            output_path_mapping: None,
             telemetry: crate::background::StepTelemetry::default(),
         }
     }

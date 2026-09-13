@@ -245,6 +245,8 @@ mod tests {
                 // Test fixture: no child was planned, so there is no surface to report.
                 tool_surface: crate::exec::tool_surface::ResolvedToolSurface::default(),
             }],
+            workflow_children: None,
+            workflow_receipt: None,
         };
         write_atomic_json(&target_paths.legacy_result_root, &target_result)
             .await

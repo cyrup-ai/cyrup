@@ -23,9 +23,12 @@
 //!    naming what was still active. Dropping the future (the host abandoning the call) likewise
 //!    tears everything down — this loop owns no task, no thread and no spawned work.
 //!
-//! A third, quieter guarantee: a run that trips the `needs_attention` heuristic ALSO ends the wait,
-//! in either mode. A child that went idle or blocked on a decision would otherwise stall the loop
-//! until the timeout, and the caller is exactly who has to act on it.
+//! A third, quieter guarantee: with [`WaitDeps::stop_on_attention`] set (the default, and the
+//! `wait` tool's own mode), a run that trips the `needs_attention` heuristic ALSO ends the wait, in
+//! either mode. A child that went idle or blocked on a decision would otherwise stall the loop
+//! until the timeout, and the caller is exactly who has to act on it. Auto-drain is the documented
+//! exception: with the flag off it waits THROUGH attention instead of resolving on it, bounded by
+//! its own deadline rather than short-circuiting early — see the flag's own doc for why.
 //!
 //! # Wake mechanism (SUBA-034)
 //!
@@ -49,6 +52,29 @@
 //! 500 ms is a separate R-SA-098 decision.
 //!
 //! `completion_bus: None` is upstream's own no-bus degradation — pure polling, exactly as before.
+//!
+//! # Payload resolution
+//!
+//! A resolved wait reports the terminal PAYLOADS it covered, not merely a count:
+//! [`super::wait_completions::collect_wait_completions`] projects every initially-tracked run that
+//! reached a terminal state into a [`super::wait_completions::WaitCompletion`], which is what lands
+//! on [`WaitOutcome::completions`] and, from there, on the tool result's `details.completions`.
+//!
+//! Resolution goes through [`super::result_index::result_payload_path_for_session_run`], which is
+//! session-partitioned: a **staged** payload is visible to the session that owns it, and another
+//! session's staged payload is not resolvable through this path at all.
+//!
+//! The in-process [`super::wait_completions::WaitCompletionStore`] is consulted FIRST — it is what
+//! survives the completion watcher's delete-last, because it is registered ahead of
+//! [`super::watch::CompletionBus`] in the watcher's composite observer
+//! (`extension/executor/notices.rs:419-431`). That ordering is what closes the wake-then-read race:
+//! a wait that wakes on the bus and immediately re-reads finds the store already holding what the
+//! watcher is about to delete.
+//!
+//! A third rung — durable replay across a **process restart** — does not exist yet; its producer
+//! has not landed. Until it does, a run whose payload is gone AND whose in-process record has
+//! expired contributes only its records-only fallback (steps + an artifacts pointer), never the
+//! child's own answer.
 //!
 //! # Scoping (SUBA-031)
 //!
@@ -82,6 +108,7 @@ use std::time::{Duration, Instant};
 use cyrup_core::CancelToken;
 
 use super::run_status::{ActiveRun, list_active_runs};
+use super::wait_completions::WaitCompletion;
 use super::{ActivityState, RunState};
 
 /// States that mean a run is still in flight (pi `ACTIVE_STATES`, `runs/background/wait.ts:55` @v0.34.0). Matches exactly
@@ -205,7 +232,24 @@ pub struct WaitDeps {
     /// no-bus degradation to pure polling, and is what every construction that has no live watcher
     /// (tests, headless embedders) supplies.
     pub completion_bus: Option<crate::background::watch::CompletionBus>,
-    /// pi `deps.stopOnAttention` (`subagent-wait.ts:116,618`). `true` — the default and the `wait`
+    /// The in-process record of payloads this process's watcher already consumed and deleted (pi
+    /// `deps.state.completedResults`, read by `collectWaitCompletions` at
+    /// `wait-completions.ts:164`). Populated by
+    /// [`crate::background::wait_completions::WaitCompletionStore`]'s
+    /// [`crate::background::watch::CompletionObserver`] impl, registered first in the watcher's
+    /// composite (`extension/executor/notices.rs:419-431`).
+    ///
+    /// `Arc` rather than a borrow because [`WaitDeps`] is `Clone` and constructed well before the
+    /// wait runs.
+    ///
+    /// **Not `Option`, unlike [`Self::completion_bus`].** For the bus the two states differ
+    /// behaviourally — no subscription at all versus a subscription that never fires — so `None`
+    /// says something `Some(empty)` cannot. For the store they are the same state: an empty map
+    /// IS "this process has consumed nothing", which is exactly right for every caller with no
+    /// live watcher (headless embedders, harnesses) and yields the pre-WORKFLOW_4 behaviour —
+    /// resolution falls straight through to the on-disk rungs (`wait_completions/collect.rs:43-47`).
+    pub wait_completions: std::sync::Arc<crate::background::wait_completions::WaitCompletionStore>,
+    /// pi `deps.stopOnAttention` (`subagent-wait.ts:116,653,657`). `true` — the default and the `wait`
     /// tool's behaviour — makes a needs-attention run end the wait. `false` is auto-drain's mode:
     /// the drain re-enters this wait in a loop, so returning early on attention would spin it hot
     /// for the whole drain deadline.
@@ -216,11 +260,11 @@ pub struct WaitDeps {
     /// inventory. With the flag off, cyrup waits through ALL attention, so such a child is bounded
     /// by the drain's 30-minute deadline rather than surfacing at once.
     pub stop_on_attention: bool,
-    /// pi `deps.failOnFailedRuns` (`subagent-wait.ts:118,708`): report a resolved wait as an ERROR
+    /// pi `deps.failOnFailedRuns` (`subagent-wait.ts:118,751`): report a resolved wait as an ERROR
     /// when any initially-tracked run ended failed. Off for the tool (a failed run is information,
     /// not a tool failure); on for the drain, whose contract is "everything landed, or say so".
     pub fail_on_failed_runs: bool,
-    /// pi `deps.failOnAttention` (`subagent-wait.ts:120,725`): likewise for unresolved attention.
+    /// pi `deps.failOnAttention` (`subagent-wait.ts:120,768`): likewise for unresolved attention.
     pub fail_on_attention: bool,
     /// `ASYNC_NOTIFY_BUG_REPORT` F3 — the claim/answer ledger shared with the completion
     /// watcher's delivery decorator ([`crate::background::watch::InlineAnsweredSink`]). A live
@@ -252,6 +296,9 @@ impl WaitDeps {
             enabled,
             session_id,
             completion_bus: None,
+            wait_completions: std::sync::Arc::new(
+                crate::background::wait_completions::WaitCompletionStore::default(),
+            ),
             // pi's defaults: `deps.stopOnAttention !== false` (`subagent-wait.ts:618`) and
             // `deps.failOnFailedRuns === true` / `deps.failOnAttention === true` (`:708`,`:725`)
             // — i.e. attention breaks the wait and neither outcome flips the result to an error
@@ -275,6 +322,22 @@ impl WaitDeps {
         bus: Option<crate::background::watch::CompletionBus>,
     ) -> Self {
         self.completion_bus = bus;
+        self
+    }
+
+    /// Attach the executor-owned consumed-payload record, so a wait that lands after the watcher
+    /// has delivered and deleted a payload still reports that completion.
+    ///
+    /// Separate from [`Self::for_cwd`] for the same reason [`Self::with_completion_bus`] and
+    /// [`Self::with_inline_answers`] are: the store is executor-owned (it must outlive any single
+    /// watcher install — the watcher is REPLACED on every `SessionStart`), while `for_cwd` is
+    /// reachable from contexts that have no executor at all.
+    #[must_use]
+    pub fn with_wait_completions(
+        mut self,
+        store: std::sync::Arc<crate::background::wait_completions::WaitCompletionStore>,
+    ) -> Self {
+        self.wait_completions = store;
         self
     }
 
@@ -447,28 +510,212 @@ fn join_ids_with_state(runs: &[ActiveRun]) -> String {
         .join(", ")
 }
 
+/// How a wait ended — pi's `isError` bit and its `details.wait` block, as the set of mutually
+/// exclusive outcomes they actually encode (SCOPE_3 §A.1 row 2).
+///
+/// # Why an enum and not `is_error: bool`
+///
+/// The two non-resolutions that a `bool` cannot tell apart are exactly the two cyrup already got
+/// wrong: an ABORT is an error upstream (`subagent-wait.ts:677`) and a TIMEOUT is **not**
+/// (`windowElapsedResult`, `:360-378`, raised at `:679-685`) — it returns a successful result
+/// carrying `details.wait = { reason: "window_elapsed", … }`. Collapsing them to one flag is how
+/// the current `Err(...)` timeout survived review, and it is what makes auto-drain report
+/// `Auto-drain failed for session '…': Wait timed out after …` where upstream reports
+/// `Auto-drain timed out after {N}ms with background work still active in session '…'`
+/// (`auto-drain.ts:58-59`, reachable only because `:73`'s `isError` check is false for a window
+/// that merely elapsed).
+///
+/// Every variant names one upstream `return` site. Adding one forces every reader's `match` to
+/// decide, which a `bool` never does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WaitVerdict {
+    /// The tool is switched off — pi `:577`. Not an error: upstream calls bare `result(text)`.
+    Disabled,
+    /// Nothing was active and nothing terminal was replayable — pi `:644-646`. Not an error.
+    NothingToWait,
+    /// A run listing faulted, at entry (pi `:600-609`) or mid-loop (pi `:686-699`). Error.
+    ListingFailed,
+    /// An id prefix matched several active runs — pi `:619`. Error.
+    AmbiguousId,
+    /// The turn was aborted — pi `:677`. Error.
+    Aborted,
+    /// The wait window elapsed — pi `windowElapsedResult` (`:360-378`), raised at `:679-685`.
+    /// **Not an error**, and the only verdict carrying structure: `activeRunIds` is what upstream
+    /// puts on `details.wait` so a caller can re-target the runs it was waiting on without
+    /// re-listing.
+    WindowElapsed {
+        /// pi `activeInitialRuns.map((run) => run.id)` (`:683`) — the initial∩active set at the
+        /// moment the window closed, ids only (their states are already in the text).
+        active_run_ids: Vec<String>,
+    },
+    /// Projecting the terminal payloads faulted — pi `:709-719`'s catch. Error. This is where
+    /// [`super::wait_completions::collect_wait_completions`]' `Err` lands, and the ONLY place it
+    /// can: a projection rejection is a reported wait, never a propagated one.
+    CompletionsFailed,
+    /// The wait resolved. Error **iff** the deps flags say so — pi `:751`/`:768`.
+    Resolved {
+        /// pi `failedAsyncCount` (`:713`). Kept beside the flag because the two terminal renders
+        /// and the verdict are built from one evaluation, not three.
+        failed_runs: usize,
+        /// pi `relevantAttention.length` (`:721`, `:725`).
+        attention_runs: usize,
+        /// `(deps.fail_on_failed_runs && failed_runs > 0) || (deps.fail_on_attention &&
+        /// attention_runs > 0)` — pi `:751`/`:768` verbatim, evaluated ONCE at construction.
+        /// SCOPE_2's predicate is unchanged in wording; only what it selects between changes.
+        reported_as_error: bool,
+    },
+}
+
+/// The full outcome of one wait — pi's `result(text, isError, completions)` (`:337-352`), which is
+/// a single `AgentToolResult`, not a `Result`.
+///
+/// Replacing `Result<String, String>` is not a refactor for its own sake: upstream carries THREE
+/// things out of this function and the old signature could carry one. The error bit belongs on the
+/// value precisely because a wait can resolve successfully AND report failed runs
+/// ([`WaitDeps::fail_on_failed_runs`], pi `:751`) — which `Err` cannot express without discarding
+/// the completions that justify it.
+#[derive(Clone, Debug)]
+pub struct WaitOutcome {
+    /// The rendered summary — every existing `Ok`/`Err` string lands here unchanged.
+    pub text: String,
+    /// How it ended.
+    pub verdict: WaitVerdict,
+    /// pi `details.completions` (`shared/types.ts:1408`). Empty is upstream's `undefined` — the key
+    /// is omitted, never emitted as `[]` (pi `:349`).
+    pub completions: Vec<WaitCompletion>,
+}
+
+impl WaitOutcome {
+    /// THE constructor — pi `result(text, isError, completions)` (`:337-352`).
+    ///
+    /// The workflow-receipt append (`:339-341`) happens HERE rather than at each call site, for
+    /// the reason upstream does it inside `result()`: both terminal returns must get it and
+    /// neither may be able to forget. WORKFLOW_3 is what makes `workflow_receipt_path`
+    /// non-`None`; before it, this loop is a no-op.
+    ///
+    /// It appends AFTER `text` is already complete — including after `ASYNC_NOTIFY_BUG_REPORT`
+    /// F2's `resolved.appendix` — which is upstream's order and keeps the receipt lines last.
+    #[must_use]
+    pub fn new(text: String, verdict: WaitVerdict, completions: Vec<WaitCompletion>) -> Self {
+        let mut text = text;
+        for completion in &completions {
+            if let Some(path) = completion.workflow_receipt_path.as_deref() {
+                text.push_str(&format!(
+                    "\nWorkflow receipt [{}]: {path}",
+                    completion.run_id
+                ));
+            }
+        }
+        Self {
+            text,
+            verdict,
+            completions,
+        }
+    }
+
+    /// A non-resolution: a verdict with no completions to carry. Every `result(text, true)` site
+    /// upstream (`:577`, `:608`, `:619`, `:677`, `:698`, `:718`) passes exactly two arguments —
+    /// §0.2 — so this is not a shortcut, it is the faithful shape.
+    #[must_use]
+    pub fn plain(text: String, verdict: WaitVerdict) -> Self {
+        Self::new(text, verdict, Vec::new())
+    }
+
+    /// pi's `...(isError ? { isError: true } : {})` (`:344`), derived rather than stored.
+    ///
+    /// The `match` is exhaustive on purpose: a new [`WaitVerdict`] variant must not silently
+    /// inherit "not an error". No `_ =>` arm — SCOPE_3 §A.1 row 2 and §3's grep #4.
+    #[must_use]
+    pub fn is_error(&self) -> bool {
+        match &self.verdict {
+            WaitVerdict::Disabled
+            | WaitVerdict::NothingToWait
+            | WaitVerdict::WindowElapsed { .. } => false,
+            WaitVerdict::ListingFailed
+            | WaitVerdict::AmbiguousId
+            | WaitVerdict::Aborted
+            | WaitVerdict::CompletionsFailed => true,
+            WaitVerdict::Resolved {
+                reported_as_error, ..
+            } => *reported_as_error,
+        }
+    }
+
+    /// pi's `details` object — `result()`'s (`:346-350`) and `windowElapsedResult()`'s
+    /// (`:367-376`) as the one value they are on the wire.
+    ///
+    /// Built HERE, not in `extension/wait_tool.rs`, because upstream builds it inside the two
+    /// result constructors: a second consumer must not have to re-derive the shape, and
+    /// `results: []` (`:348`/`:369`) is exactly the kind of key an open-coded caller forgets —
+    /// cyrup's current object (`wait_tool.rs:165`) omits it, so a pi consumer reading
+    /// `details.results` gets `undefined` where upstream gives `[]`.
+    #[must_use]
+    pub fn details(&self) -> serde_json::Value {
+        let mut details = serde_json::json!({ "mode": "management", "results": [] });
+        // §0.5e: this `let … else` compiles on the pinned stable toolchain (verified 2026-09-12
+        // against rustc 1.97.1, edition 2024). Do not rewrite it into an unwrap/expect — the
+        // workspace denies both (`Cargo.toml:101-102`).
+        let Some(map) = details.as_object_mut() else {
+            return details; // unreachable: the literal above is an object
+        };
+        if !self.completions.is_empty()
+            && let Ok(value) = serde_json::to_value(&self.completions)
+        {
+            // pi omits the key entirely when the list is empty (`:349`).
+            map.insert("completions".into(), value);
+        }
+        if let WaitVerdict::WindowElapsed { active_run_ids } = &self.verdict {
+            map.insert(
+                "wait".into(),
+                serde_json::json!({
+                    "reason": "window_elapsed",
+                    "timedOut": true,
+                    "activeRunIds": active_run_ids,
+                    // Always present, always empty: pi emits the key unconditionally (`:374`) and
+                    // cyrup has no background-work PROVIDER registry at all — the same unported
+                    // second disjunct `auto_drain.rs:83-90` documents. Emitting `[]` keeps a pi
+                    // consumer's destructuring valid; omitting it would hand it `undefined`.
+                    "activeProviderItems": [],
+                }),
+            );
+        }
+        details
+    }
+
+    /// pi `completionUsage(completions)` → `AgentToolResult.usage` (`:318`, `:338`, `:345`),
+    /// already composed with `toAgentToolUsage` inside
+    /// [`super::wait_completions::completion_usage`]. `None` for a wait over children that
+    /// reported no usage, which omits the key.
+    #[must_use]
+    pub fn usage(&self) -> Option<cyrup_core::Usage> {
+        super::wait_completions::completion_usage(&self.completions)
+    }
+}
+
 /// Block until the targeted background runs finish, the timeout elapses, or the turn is aborted —
 /// pi `waitForSubagents` (`runs/background/wait.ts:264-394` @v0.34.0).
 ///
-/// Returns `Ok(text)` for a resolved wait and `Err(text)` for the three non-resolutions (a listing
-/// failure, an ambiguous id prefix, a timeout, an abort), matching how every other control action
-/// in this crate maps onto the tool result's error flag.
-///
-/// # Errors
-///
-/// See above — the `Err` payload is the human-readable summary, never a bare error code.
+/// Returns a [`WaitOutcome`] naming exactly how the wait ended — pi's `result(text, isError,
+/// completions)` (`subagent-wait.ts:337-352`) collapsed onto one value, the way every other
+/// control action in this crate maps its own outcome onto the tool result's error flag. There is
+/// no outer `Result`: every fallible step inside resolves to a [`WaitVerdict`] rather than a
+/// propagated error — see [`WaitVerdict`]'s own doc for why an ABORT is an error and a TIMEOUT is
+/// not.
 pub async fn wait_for_subagents(
     params: &WaitParams,
     cancel: &CancelToken,
     deps: &WaitDeps,
-) -> Result<String, String> {
+) -> WaitOutcome {
     if !deps.enabled {
-        return Ok(format!(
-            "Wait tool is disabled by config.waitTool or {WAIT_TOOL_ENABLED_ENV}; returning \
-             immediately without blocking background subagent runs. Active runs keep going, and \
-             you can inspect them with subagent({{ action: \"status\" }}) or wait for completion \
-             notifications."
-        ));
+        return WaitOutcome::plain(
+            format!(
+                "Wait tool is disabled by config.waitTool or {WAIT_TOOL_ENABLED_ENV}; returning \
+                 immediately without blocking background subagent runs. Active runs keep going, \
+                 and you can inspect them with subagent({{ action: \"status\" }}) or wait for \
+                 completion notifications."
+            ),
+            WaitVerdict::Disabled,
+        );
     }
 
     let poll_interval = deps
@@ -498,7 +745,12 @@ pub async fn wait_for_subagents(
     // at the write site, never `insert`).
     let mut observed_summaries: BTreeMap<String, String> = BTreeMap::new();
 
-    let mut active = active_runs(params.id.as_deref(), deps).await?;
+    // pi `:600-609` — upstream reports a listing failure as a wait RESULT, not as a throw that
+    // escapes `waitForSubagents`. `active_runs` already carries the human-readable message.
+    let mut active = match active_runs(params.id.as_deref(), deps).await {
+        Ok(active) => active,
+        Err(text) => return WaitOutcome::plain(text, WaitVerdict::ListingFailed),
+    };
 
     if active.is_empty() {
         // Nothing is running. That is NOT the same as "there is nothing to report": the runs this
@@ -508,13 +760,18 @@ pub async fn wait_for_subagents(
         // ASYNC_NOTIFY_BUG_REPORT F3.4 — the claim for this branch is taken INSIDE
         // `resolve_finished`, as soon as the run ids are known and before any payload is read.
         // Claiming out here, after the await, would leave that read window unprotected (RC4).
-        return Ok(match resolve_finished(params, deps).await {
-            WaitResolution::Terminal(replay) => replay.render(),
-            WaitResolution::Unknown => match &params.id {
-                Some(id) => format!("No active run matched \"{id}\". Nothing to wait for."),
-                None => "No active async runs in this session. Nothing to wait for.".to_string(),
+        return WaitOutcome::plain(
+            match resolve_finished(params, deps).await {
+                WaitResolution::Terminal(replay) => replay.render(),
+                WaitResolution::Unknown => match &params.id {
+                    Some(id) => format!("No active run matched \"{id}\". Nothing to wait for."),
+                    None => {
+                        "No active async runs in this session. Nothing to wait for.".to_string()
+                    }
+                },
             },
-        });
+            WaitVerdict::NothingToWait,
+        );
     }
 
     let mut effective_id = params.id.clone();
@@ -527,12 +784,15 @@ pub async fn wait_for_subagents(
         if exact.len() == 1 {
             active = exact;
         } else if active.len() > 1 {
-            return Err(format!(
-                "Ambiguous async run id prefix \"{id}\" matched {} active runs: {}. Pass a longer \
-                 id.",
-                active.len(),
-                join_ids(&active)
-            ));
+            return WaitOutcome::plain(
+                format!(
+                    "Ambiguous async run id prefix \"{id}\" matched {} active runs: {}. Pass a \
+                     longer id.",
+                    active.len(),
+                    join_ids(&active)
+                ),
+                WaitVerdict::AmbiguousId,
+            );
         }
         // Narrow to the single resolved id so later polls cannot pick up a different prefix match.
         effective_id = active.first().map(|run| run_id_of(run).to_string());
@@ -604,24 +864,37 @@ pub async fn wait_for_subagents(
         if cancel.is_cancelled() {
             let in_flight: Vec<ActiveRun> =
                 pending.iter().chain(attention.iter()).cloned().collect();
-            return Err(format!(
-                "Wait aborted after {}. Still active: {}.",
-                format_duration(elapsed_ms(started_at)),
-                join_ids_with_state(&in_flight)
-            ));
+            return WaitOutcome::plain(
+                format!(
+                    "Wait aborted after {}. Still active: {}.",
+                    format_duration(elapsed_ms(started_at)),
+                    join_ids_with_state(&in_flight)
+                ),
+                WaitVerdict::Aborted,
+            );
         }
         let elapsed = started_at.elapsed();
         if elapsed >= timeout {
             let in_flight: Vec<ActiveRun> =
                 pending.iter().chain(attention.iter()).cloned().collect();
-            return Err(format!(
-                "Wait timed out after {} with {} run(s) still active: {}. The runs are detached \
-                 and keep going; call wait again or inspect with subagent({{ action: \"status\" \
-                 }}).",
-                format_duration(timeout.as_millis().try_into().unwrap_or(u64::MAX)),
-                in_flight.len(),
-                join_ids_with_state(&in_flight)
-            ));
+            // pi `activeInitialRuns.map((run) => run.id)` (`:683`). `in_flight` is cyrup's
+            // `activeInitialRuns` — pending ∪ attention, already the set the message's
+            // `n run(s) still active` count comes from — so the ids and the text cannot disagree.
+            let active_run_ids: Vec<String> = in_flight
+                .iter()
+                .map(|run| run_id_of(run).to_string())
+                .collect();
+            return WaitOutcome::plain(
+                format!(
+                    "Wait timed out after {} with {} run(s) still active: {}. The runs are \
+                     detached and keep going; call wait again or inspect with subagent({{ action: \
+                     \"status\" }}).",
+                    format_duration(timeout.as_millis().try_into().unwrap_or(u64::MAX)),
+                    in_flight.len(),
+                    join_ids_with_state(&in_flight)
+                ),
+                WaitVerdict::WindowElapsed { active_run_ids },
+            );
         }
 
         // Escape hatch #1 + #2, in one place: never sleep past the deadline, and wake instantly on
@@ -691,7 +964,10 @@ pub async fn wait_for_subagents(
             }
         }
 
-        active = active_runs(effective_id.as_deref(), deps).await?;
+        active = match active_runs(effective_id.as_deref(), deps).await {
+            Ok(active) => active,
+            Err(text) => return WaitOutcome::plain(text, WaitVerdict::ListingFailed),
+        };
         pending = active
             .iter()
             .filter(|run| !needs_attention(run))
@@ -726,18 +1002,40 @@ pub async fn wait_for_subagents(
     }
     let (finished_count, terminal_summary) = summarize_terminal_runs(&terminal_runs);
     // pi `failedAsyncCount = terminal.filter((run) => run.state === "failed" || run.state ===
-    // "partial").length` (`subagent-wait.ts:678`) — cyrup has no `Partial` variant, so the set is
-    // `Failed` alone. Feeds the two `deps.failOnFailedRuns` error flips below (`:708`, `:725`).
+    // "partial").length` (`subagent-wait.ts:713`) — cyrup has no `Partial` variant, so the set is
+    // `Failed` alone. Feeds the two `deps.failOnFailedRuns` error flips below (`:751`, `:768`).
     let failed_count = terminal_runs
         .iter()
         .filter(|status| status.state == RunState::Failed)
         .count();
     // SUBA-060 / pi `resumeGuidance = formatResumeFirstFailedRunsNote(terminal)`
-    // (`subagent-wait.ts:617`), interpolated at `:642`/`:660` immediately after the outcome clause
+    // (`subagent-wait.ts:617`), interpolated at `:750`/`:767` immediately after the outcome clause
     // and before the attention note. Empty unless a failed run actually has a revivable child
     // session, so an ordinary wait is unchanged.
     let resume_guidance =
         super::resume_guidance::format_resume_first_failed_runs_note(&terminal_runs);
+    // NEW — pi `:716`, inside the try whose catch is `result(message, true)` (`:717-719`). A
+    // collection failure is a REPORTED wait, never a propagated error and never a silently empty
+    // completions list: the caller asked what finished, and "I could not tell" is an answer it
+    // must receive as text.
+    //
+    // Two cyrup-only consequences of returning here, both deliberate and both already the timeout
+    // path's behaviour: `resolved.appendix` is discarded — upstream's catch likewise returns only
+    // the message — and `inline_claim`'s guard drops un-answered, releasing the claim without
+    // authorising a suppression (ASYNC_NOTIFY_BUG_REPORT F3.4, the same shape
+    // `a_timed_out_wait_releases_its_claim_without_authorising_a_suppression` pins).
+    let completions = match super::wait_completions::collect_wait_completions(
+        &terminal_runs,
+        &deps.wait_completions,
+        &deps.results_dir,
+    )
+    .await
+    {
+        Ok(completions) => completions,
+        Err(error) => {
+            return WaitOutcome::plain(error.to_string(), WaitVerdict::CompletionsFailed);
+        }
+    };
     let attention_note = if attention.is_empty() {
         String::new()
     } else {
@@ -754,6 +1052,10 @@ pub async fn wait_for_subagents(
     } else {
         format!(" Outcome: {terminal_summary}.")
     };
+    // pi `formatCompletionRecovery(completions)` (`subagent-wait.ts:732`) — empty unless a
+    // TIMED-OUT child left tracked changes without its requested report, so an ordinary wait is
+    // unchanged.
+    let recovery_note = format_completion_recovery(&completions);
 
     if wait_for_all {
         let scope = match &params.id {
@@ -779,22 +1081,26 @@ pub async fn wait_for_subagents(
         };
         let text = format!(
             "Waited {elapsed} for {scope}; \
-             {status}.{outcome}{resume_guidance}{attention_note}{notification}"
+             {status}.{outcome}{recovery_note}{resume_guidance}{attention_note}{notification}"
         );
         // SCOPE_17 + ASYNC_NOTIFY_BUG_REPORT F2 — appended last, after the sentence is already
         // complete. A wait that resolved through the poll now replays its values from the bus
         // backlog (exit drain) or the still-on-disk payload, so the appendix is empty only when
         // there is genuinely nothing to report.
         let text = format!("{text}{}", resolved.appendix);
-        // pi `:706-710` — the SAME text either way; the flags only flip the result's error bit,
+        // pi `:749-753` — the SAME text either way; the flags only flip the result's error bit,
         // which is what makes auto-drain throw instead of exiting quietly.
-        return if (deps.fail_on_failed_runs && failed_count > 0)
-            || (deps.fail_on_attention && !attention.is_empty())
-        {
-            Err(text)
-        } else {
-            Ok(text)
-        };
+        let reported_as_error = (deps.fail_on_failed_runs && failed_count > 0)
+            || (deps.fail_on_attention && !attention.is_empty());
+        return WaitOutcome::new(
+            text,
+            WaitVerdict::Resolved {
+                failed_runs: failed_count,
+                attention_runs: attention.len(),
+                reported_as_error,
+            },
+            completions,
+        );
     }
 
     // First-completion mode.
@@ -832,19 +1138,23 @@ pub async fn wait_for_subagents(
     };
     let text = format!(
         "Waited {elapsed}; \
-         {progress}.{outcome}{resume_guidance}{attention_note}{remainder}{notification}"
+         {progress}.{outcome}{recovery_note}{resume_guidance}{attention_note}{remainder}{notification}"
     );
     // SCOPE_17 + ASYNC_NOTIFY_BUG_REPORT F2 — same appended block as the all-mode return above,
     // same reasoning.
     let text = format!("{text}{}", resolved.appendix);
-    // pi `:723-727` — as in the all-mode return above: same text, error bit per the deps flags.
-    if (deps.fail_on_failed_runs && failed_count > 0)
-        || (deps.fail_on_attention && !attention.is_empty())
-    {
-        Err(text)
-    } else {
-        Ok(text)
-    }
+    // pi `:766-770` — as in the all-mode return above: same text, error bit per the deps flags.
+    let reported_as_error = (deps.fail_on_failed_runs && failed_count > 0)
+        || (deps.fail_on_attention && !attention.is_empty());
+    WaitOutcome::new(
+        text,
+        WaitVerdict::Resolved {
+            failed_runs: failed_count,
+            attention_runs: attention.len(),
+            reported_as_error,
+        },
+        completions,
+    )
 }
 
 /// The per-child blocks for the runs this wait resolved, in `initial_ids` order.
@@ -866,6 +1176,35 @@ fn format_observed_completions(
         return String::new();
     }
     format!("\n\nResults:\n\n{}", blocks.join("\n\n"))
+}
+
+/// pi `formatCompletionRecovery` (`subagent-wait.ts:354-358`) — the bounded recovery route for
+/// every timed-out child a wait covered, or empty.
+///
+/// Empty for an ordinary wait: [`crate::exec::mutation_evidence::format_timeout_recovery_lines`]
+/// returns nothing unless `recovery_needed` is set (pi `mutation-evidence.ts:140`), which requires
+/// a TIMED-OUT child that left tracked changes without its requested report. That gate is what
+/// keeps a routine timeout quiet, and that function's own doc already names this call site as its
+/// `""`-indent consumer (`exec/mutation_evidence/project.rs:93-95`: *"Indent widths in use: `""`
+/// (SCOPE_3i / pi `subagent-wait.ts:357`)"*).
+fn format_completion_recovery(completions: &[WaitCompletion]) -> String {
+    let lines: Vec<String> = completions
+        .iter()
+        .flat_map(|completion| &completion.results)
+        .flat_map(|child| {
+            // pi `formatTimeoutRecoveryLines(child.timeoutRecovery)` (`:356`) — the default
+            // `indent = ""` (pi `mutation-evidence.ts:138`), which is this surface's width.
+            crate::exec::mutation_evidence::format_timeout_recovery_lines(
+                child.timeout_recovery.as_ref(),
+                "",
+            )
+        })
+        .collect();
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("\n{}", lines.join("\n"))
+    }
 }
 
 /// Everything the response can say about the runs this wait tracked (`ASYNC_NOTIFY_BUG_REPORT`
@@ -1241,6 +1580,9 @@ mod tests {
                 // No ledger — the documented degradation every pre-existing test exercises, same
                 // as `completion_bus: None` above.
                 inline_answers: None,
+                wait_completions: std::sync::Arc::new(
+                    crate::background::wait_completions::WaitCompletionStore::default(),
+                ),
             }
         }
 
@@ -1295,6 +1637,8 @@ mod tests {
                 session_id: None,
                 completion_owner_id: None,
                 results: Vec::new(),
+                workflow_children: None,
+                workflow_receipt: None,
             };
             std::fs::write(
                 &paths.legacy_result_root,
@@ -1309,7 +1653,7 @@ mod tests {
         let fx = Fixture::new();
         let text = wait_for_subagents(&WaitParams::default(), &CancelToken::new(), &fx.deps(true))
             .await
-            .expect("no runs is not an error");
+            .text;
         assert_eq!(
             text,
             "No active async runs in this session. Nothing to wait for."
@@ -1356,7 +1700,7 @@ mod tests {
         )
         .await
         .expect("a session-scoped wait must not block on another session's run")
-        .expect("no in-scope runs is not an error");
+        .text;
         assert_eq!(
             text,
             "No active async runs in this session. Nothing to wait for."
@@ -1399,7 +1743,7 @@ mod tests {
         )
         .await
         .expect("wait must resolve once the run settles")
-        .expect("a settled run is not an error");
+        .text;
         settle.await.expect("settler task");
 
         assert!(
@@ -1461,7 +1805,7 @@ mod tests {
         )
         .await
         .expect("wait must resolve once the run reaches a terminal state")
-        .expect("a failed run is reported, not errored");
+        .text;
         settle.await.expect("settler task");
 
         assert!(
@@ -1491,7 +1835,7 @@ mod tests {
         fx.write_status(&run_id, RunState::Running, false);
 
         let started = Instant::now();
-        let err = wait_for_subagents(
+        let outcome = wait_for_subagents(
             &WaitParams {
                 timeout_ms: Some(400),
                 ..WaitParams::default()
@@ -1499,8 +1843,7 @@ mod tests {
             &CancelToken::new(),
             &fx.deps(true),
         )
-        .await
-        .expect_err("a timeout is reported as an error result");
+        .await;
         assert!(
             started.elapsed() >= Duration::from_millis(350),
             "it must actually have waited"
@@ -1509,6 +1852,19 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "and not far past the deadline"
         );
+        // A timeout is NOT an error (§0.1): it resolves to `WindowElapsed`, never `is_error()`.
+        assert!(!outcome.is_error(), "a timeout must not be an error result");
+        let WaitVerdict::WindowElapsed { active_run_ids } = &outcome.verdict else {
+            panic!(
+                "a timeout must resolve to WindowElapsed, got {:?}",
+                outcome.verdict
+            );
+        };
+        assert!(
+            active_run_ids.contains(&run_id.as_str().to_string()),
+            "the wedged run must be named in active_run_ids: {active_run_ids:?}"
+        );
+        let err = &outcome.text;
         assert!(err.starts_with("Wait timed out after "), "got: {err}");
         assert!(err.contains("1 run(s) still active"), "got: {err}");
         assert!(
@@ -1544,13 +1900,12 @@ mod tests {
             ..fx.deps(true)
         };
         let started = Instant::now();
-        let err = tokio::time::timeout(
+        let outcome = tokio::time::timeout(
             Duration::from_secs(10),
             wait_for_subagents(&WaitParams::default(), &cancel, &deps),
         )
         .await
-        .expect("cancellation must break the wait, not wait out the 30s poll")
-        .expect_err("an aborted wait is reported as an error result");
+        .expect("cancellation must break the wait, not wait out the 30s poll");
         canceller.await.expect("canceller task");
 
         assert!(
@@ -1558,6 +1913,16 @@ mod tests {
             "cancellation must wake the sleep immediately, took {:?}",
             started.elapsed()
         );
+        assert_eq!(
+            outcome.verdict,
+            WaitVerdict::Aborted,
+            "an abort is an error result"
+        );
+        assert!(
+            outcome.is_error(),
+            "an aborted wait is reported as an error result"
+        );
+        let err = outcome.text;
         assert!(err.starts_with("Wait aborted after "), "got: {err}");
         assert!(
             err.contains(run_id.as_str()),
@@ -1584,7 +1949,7 @@ mod tests {
             &fx.deps(true),
         )
         .await
-        .expect("attention resolves the wait");
+        .text;
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "it must not have polled at all"
@@ -1608,7 +1973,7 @@ mod tests {
 
         let deps = fx.deps(true).with_stop_on_attention(false);
         let started = Instant::now();
-        let err = wait_for_subagents(
+        let outcome = wait_for_subagents(
             &WaitParams {
                 all: Some(true),
                 timeout_ms: Some(600),
@@ -1617,13 +1982,20 @@ mod tests {
             &CancelToken::new(),
             &deps,
         )
-        .await
-        .expect_err("with the flag off the wait must run out its window, not resolve on attention");
+        .await;
         assert!(
             started.elapsed() >= Duration::from_millis(550),
             "it must actually have waited through the attention, took {:?}",
             started.elapsed()
         );
+        // With the flag off the wait must run out its window — not resolve on attention — and a
+        // window that merely elapsed is NOT an error (§0.1).
+        assert!(
+            !outcome.is_error(),
+            "a window-elapsed wait through attention must not be an error result"
+        );
+        assert!(matches!(outcome.verdict, WaitVerdict::WindowElapsed { .. }));
+        let err = outcome.text;
         assert!(err.starts_with("Wait timed out after "), "got: {err}");
         assert!(err.contains("1 run(s) still active"), "got: {err}");
         assert!(
@@ -1659,15 +2031,26 @@ mod tests {
         };
 
         let deps = fx.deps(true).with_fail_on_failed_runs(true);
-        let err = tokio::time::timeout(
+        let outcome = tokio::time::timeout(
             Duration::from_secs(10),
             wait_for_subagents(&WaitParams::default(), &CancelToken::new(), &deps),
         )
         .await
-        .expect("wait must resolve once the run fails")
-        .expect_err("a failed run must flip the resolved wait to an error");
+        .expect("wait must resolve once the run fails");
         settle.await.expect("settler task");
 
+        assert!(
+            outcome.is_error(),
+            "a failed run must flip the resolved wait to an error"
+        );
+        assert!(matches!(
+            outcome.verdict,
+            WaitVerdict::Resolved {
+                reported_as_error: true,
+                ..
+            }
+        ));
+        let err = outcome.text;
         assert!(
             err.starts_with("Waited "),
             "the payload is the ordinary summary, not a new error shape: {err}"
@@ -1684,7 +2067,7 @@ mod tests {
         fx.write_status(&run_id, RunState::Running, true);
 
         let deps = fx.deps(true).with_fail_on_attention(true);
-        let err = wait_for_subagents(
+        let outcome = wait_for_subagents(
             &WaitParams {
                 all: Some(true),
                 ..WaitParams::default()
@@ -1692,8 +2075,19 @@ mod tests {
             &CancelToken::new(),
             &deps,
         )
-        .await
-        .expect_err("attention must flip the resolved wait to an error");
+        .await;
+        assert!(
+            outcome.is_error(),
+            "attention must flip the resolved wait to an error"
+        );
+        assert!(matches!(
+            outcome.verdict,
+            WaitVerdict::Resolved {
+                reported_as_error: true,
+                ..
+            }
+        ));
+        let err = outcome.text;
         assert!(err.contains("attention required"), "got: {err}");
         assert!(err.contains("1 run(s) need attention"), "got: {err}");
         assert!(err.contains(run_id.as_str()), "got: {err}");
@@ -1745,7 +2139,7 @@ mod tests {
         )
         .await
         .expect("first-completion must return as soon as ONE of the two settles")
-        .expect("not an error");
+        .text;
         settle.await.expect("settler task");
         assert!(text.contains("1 of 2 run(s) finished"), "got: {text}");
         assert!(text.contains("1 run(s) still in flight"), "got: {text}");
@@ -1781,7 +2175,7 @@ mod tests {
         fx.write_status(&a, RunState::Running, false);
         fx.write_status(&b, RunState::Running, false);
 
-        let err = wait_for_subagents(
+        let outcome = wait_for_subagents(
             &WaitParams {
                 id: Some("abc".to_string()),
                 ..WaitParams::default()
@@ -1789,8 +2183,14 @@ mod tests {
             &CancelToken::new(),
             &fx.deps(true),
         )
-        .await
-        .expect_err("an ambiguous prefix must be rejected");
+        .await;
+        assert_eq!(
+            outcome.verdict,
+            WaitVerdict::AmbiguousId,
+            "an ambiguous prefix must be rejected"
+        );
+        assert!(outcome.is_error());
+        let err = outcome.text;
         assert!(err.starts_with("Ambiguous async run id prefix \"abc\" matched 2 active runs:"));
         assert!(err.ends_with("Pass a longer id."), "got: {err}");
     }
@@ -1809,7 +2209,7 @@ mod tests {
             &fx.deps(true),
         )
         .await
-        .expect("no match is not an error");
+        .text;
         assert_eq!(text, "No active run matched \"nope\". Nothing to wait for.");
     }
 
@@ -1823,7 +2223,7 @@ mod tests {
         let started = Instant::now();
         let text = wait_for_subagents(&WaitParams::default(), &CancelToken::new(), &fx.deps(false))
             .await
-            .expect("disabled is not an error");
+            .text;
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(
             text.starts_with("Wait tool is disabled by config.waitTool or "),
@@ -1940,7 +2340,7 @@ mod tests {
         let started = Instant::now();
         let text = wait_for_subagents(&WaitParams::default(), &CancelToken::new(), &deps)
             .await
-            .expect("wait resolves on the published completion");
+            .text;
         let elapsed = started.elapsed();
         settler.await.expect("settler task");
 
@@ -2005,7 +2405,7 @@ mod tests {
         let text = tokio::time::timeout(Duration::from_secs(2), waiting)
             .await
             .expect("the wait resolves once the run genuinely settles")
-            .expect("wait ok");
+            .text;
         assert!(text.contains("1 of 1 run(s) finished"), "{text}");
     }
 
@@ -2042,7 +2442,7 @@ mod tests {
         let started = Instant::now();
         let text = wait_for_subagents(&WaitParams::default(), &CancelToken::new(), &deps)
             .await
-            .expect("wait still resolves with a dead bus");
+            .text;
         settler.await.expect("settler task");
         assert!(text.contains("1 of 1 run(s) finished"), "{text}");
         assert!(
@@ -2273,7 +2673,7 @@ mod tests {
         )
         .await
         .expect("the wait resolves once the run settles")
-        .expect("wait ok");
+        .text;
         settler.await.expect("settler task");
 
         assert!(
@@ -2312,7 +2712,7 @@ mod tests {
         )
         .await
         .expect("the wait resolves")
-        .expect("wait ok");
+        .text;
         settler.await.expect("settler task");
 
         assert!(text.contains("1 of 1 run(s) finished"), "{text}");
@@ -2364,7 +2764,7 @@ mod tests {
         )
         .await
         .expect("the wait resolves")
-        .expect("wait ok");
+        .text;
         settler.await.expect("settler task");
 
         assert!(text.contains("LEDGER-ANSWER"), "{text}");
@@ -2398,9 +2798,13 @@ mod tests {
             ..WaitParams::default()
         };
 
-        let err = wait_for_subagents(&params, &CancelToken::new(), &deps)
-            .await
-            .expect_err("a hung run times out");
+        let outcome = wait_for_subagents(&params, &CancelToken::new(), &deps).await;
+        assert!(
+            !outcome.is_error(),
+            "a timeout is not an error result (§0.1)"
+        );
+        assert!(matches!(outcome.verdict, WaitVerdict::WindowElapsed { .. }));
+        let err = outcome.text;
         assert!(err.contains("timed out"), "{err}");
         assert!(
             !ledger.is_claimed(&run),
@@ -2433,10 +2837,15 @@ mod tests {
             })
         };
 
-        let err = wait_for_subagents(&WaitParams::default(), &cancel, &deps)
-            .await
-            .expect_err("an aborted wait reports the abort");
+        let outcome = wait_for_subagents(&WaitParams::default(), &cancel, &deps).await;
         canceller.await.expect("canceller task");
+        assert_eq!(
+            outcome.verdict,
+            WaitVerdict::Aborted,
+            "an aborted wait reports the abort"
+        );
+        assert!(outcome.is_error());
+        let err = outcome.text;
         assert!(err.contains("aborted"), "{err}");
         assert!(
             !ledger.is_claimed(&run),
@@ -2477,7 +2886,7 @@ mod tests {
         )
         .await
         .expect("the wait resolves")
-        .expect("wait ok");
+        .text;
         settler.await.expect("settler task");
         assert!(text.contains("1 of 1 run(s) finished"), "{text}");
     }

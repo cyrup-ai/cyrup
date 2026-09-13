@@ -219,6 +219,20 @@ pub enum SubagentError {
     #[error("Async run '{0}' was stopped and cannot be resumed. Start a new run instead.")]
     ResumeStopped(String),
 
+    /// S4 — a resume was requested against a run owned by a DIFFERENT session (pi
+    /// `async-resume.ts:477`, reached from `async-steering-action.ts:203`'s `{ sessionId:
+    /// input.state.currentSessionId ?? undefined }`).
+    ///
+    /// PERMISSIVE ([`crate::background::delivery::SessionGate::Permissive`]), like `stop`,
+    /// `interrupt` and `steer`: a host with no session identity of its own still revives its own
+    /// runs; only a caller who DOES have a session, and whose session disagrees with the run's
+    /// (or, when the reconciled status carries none, with the terminal
+    /// [`crate::background::ResultFile`]'s own), is refused. The message is pi's own sentence,
+    /// reproduced verbatim because it is what the model reads back from a refused
+    /// `action: "resume"` — byte-identical to `stop`'s and `steer`'s own session-gate refusal.
+    #[error("Async run '{0}' was not found in the active session.")]
+    ResumeNotInActiveSession(String),
+
     /// Subprocess spawn or I/O failure.
     #[error("spawn failed: {0}")]
     Spawn(#[from] std::io::Error),

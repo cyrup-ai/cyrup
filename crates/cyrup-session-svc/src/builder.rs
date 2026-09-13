@@ -512,6 +512,14 @@ pub struct SessionBuilder {
     /// prompt's chosen option carries updates (`:40-44`, `:92-93`). `None` ⇒ no saved decisions are
     /// visible and nothing is persisted (embedders/tests). SEAM-065.
     trust_store: Option<Arc<TrustStore>>,
+    /// The shared catalog service this session's [`AgentSessionServices::catalog_overlay`] slot
+    /// comes from, and that [`crate::session::AgentSession::refresh_model_catalogs`] triggers
+    /// through (XAI_3). `None` ⇒ the session builds its OWN disk-only slot via
+    /// [`Self::load_persisted_catalog_overlay`] — today's exact behavior, and what every embedder /
+    /// SDK caller / test that never wires one still gets.
+    ///
+    /// [`AgentSessionServices::catalog_overlay`]: crate::services::AgentSessionServices::catalog_overlay
+    model_catalog_service: Option<Arc<cyrup_provider::ModelCatalogService>>,
     /// The interactive project-trust prompt (pi `selectProjectTrustOption` → `ctx.ui.select`,
     /// `project-trust.ts:28-44`, `:90-94`). Invoked **only** when the tiered decision comes back
     /// [`TrustOutcome::NeedsPrompt`], i.e. after `pre_trust_extension_verdict` and the store —
@@ -588,9 +596,22 @@ impl SessionBuilder {
             context_files_override: None,
             trust_store: None,
             trust_prompt: None,
+            model_catalog_service: None,
             #[cfg(test)]
             force_pre_trust_wasm_failure: false,
         }
+    }
+
+    /// Wire the shared [`cyrup_provider::ModelCatalogService`] this session refreshes through and
+    /// shares its live overlay slot with (XAI_3, FINDING 3). When set, the session's
+    /// `catalog_overlay` is `svc.overlay()` — the SAME slot the service's other trigger(s) install
+    /// into — so a refresh completing anywhere reaches this session's very next registry read with
+    /// no rebuild. `None` (the default) keeps today's behavior exactly: a disk-only overlay loaded
+    /// once at build time into a slot nothing else shares.
+    #[must_use]
+    pub fn model_catalog_service(mut self, svc: Arc<cyrup_provider::ModelCatalogService>) -> Self {
+        self.model_catalog_service = Some(svc);
+        self
     }
 
     /// Force the EXT-003 native-only fallback in the pre-trust project-trust pass: the pass behaves
@@ -726,7 +747,10 @@ impl SessionBuilder {
                 agent_dir.join(cyrup_config::models_store::MODELS_STORE_FILE_NAME),
             ));
         let catalog = cyrup_provider::RemoteCatalog::new(store)
-            .with_local_generated_at(cyrup_provider::builtin_model_data_generated_at());
+            .with_local_generated_at(cyrup_provider::builtin_model_data_generated_at())
+            .with_local_generated_at_by_provider(
+                cyrup_provider::builtin_model_data_generated_at_by_provider(),
+            );
         let ids: Vec<String> = cyrup_provider::all_providers()
             .iter()
             .map(|p| p.id().as_str().to_string())
@@ -1311,19 +1335,27 @@ impl SessionBuilder {
         let (model_file, model_file_error) =
             cyrup_config::load_models_file_reporting(&cfg.agent_dir.join("models.json"));
         startup_diagnostics.models.extend(model_file_error);
-        // The persisted pi.dev catalog overlay (DRIFT-007), loaded from disk ONLY. This is the
-        // cache-only restore Pi performs at `agent-session-services.ts:180`
-        // (`refresh({ allowNetwork: false })`): a session build must never block on a network call,
-        // and an offline run must still see the catalogs it saw last time. A refresh that ADDS to
-        // this cache is the running mode's fire-and-forget job (Pi `main.ts:863-866`).
-        let catalog_overlay = Self::load_persisted_catalog_overlay(&cfg.agent_dir).await;
+        // The runtime pi.dev catalog overlay slot (DRIFT-007 + XAI_3, FINDING 3). An injected
+        // service's slot is SHARED with whatever else refreshes through that service (the binary's
+        // background trigger, this session's own `/model` refresh) — that sharing is the whole fix.
+        // With no service, the slot is fresh and disk-only: the cache-only restore Pi performs at
+        // `agent-session-services.ts:180` (`refresh({ allowNetwork: false })`) — a session build
+        // must never block on a network call, and an offline run must still see the catalogs it saw
+        // last time.
+        let catalog_overlay: Arc<cyrup_provider::CatalogOverlaySlot> =
+            match &self.model_catalog_service {
+                Some(svc) => svc.overlay(),
+                None => Arc::new(cyrup_provider::CatalogOverlaySlot::with_overlay(
+                    Self::load_persisted_catalog_overlay(&cfg.agent_dir).await,
+                )),
+            };
         // Surface composition errors (a provider block Pi would `throw` on) once, at startup, rather
         // than on every catalog read.
         {
             let base = cyrup_provider::default_models(cyrup_provider::CreateModelsOptions {
                 credentials: None,
                 auth_context: None,
-                catalog_overlay: catalog_overlay.clone(),
+                catalog_overlay: catalog_overlay.load(),
             })
             .get_models(None);
             let (_, errors) = model_file.compose(&base);
@@ -2087,6 +2119,7 @@ impl SessionBuilder {
             startup_diagnostics,
             model_config,
             catalog_overlay,
+            model_catalog: self.model_catalog_service,
             context: context_store,
             ext_host,
             allowed_tool_names,

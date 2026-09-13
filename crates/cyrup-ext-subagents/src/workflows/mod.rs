@@ -50,6 +50,9 @@
 //! preflight.rs      the preflight normalizer, advisory warnings, formatters (SCOPE_3e SUBTASK1)
 //! checklist.rs      the checklist projection + formatters (SCOPE_3e SUBTASK2)
 //! host_command.rs   the runs.host executor — the family's one shell/write module (SCOPE_3e SUBTASK3)
+//! lane_metadata.rs  normalize_workflow_lane_metadata / assert_workflow_lane_key (WORKFLOW_3 SUBTASK0a)
+//! receipt.rs        the durable terminal evidence record: build/write/read (WORKFLOW_3 SUBTASK1)
+//! settlement.rs     how a settled workflow's terminal payload is assembled (WORKFLOW_3 SUBTASK2)
 //! ```
 
 mod bounded;
@@ -60,10 +63,13 @@ mod display_text;
 mod host_command;
 mod host_step;
 mod key;
+mod lane_metadata;
 mod permit;
 mod preflight;
+mod receipt;
 mod resources;
 pub mod scripted;
+mod settlement;
 mod stable_json;
 mod types;
 
@@ -87,7 +93,7 @@ pub use checklist::{
 pub use child_summary::{
     WorkflowChildLiveProgress, WorkflowChildProgressInput, WorkflowChildSummaryError,
     WorkflowChildSummaryInput, parse_workflow_child_summary, workflow_child_activity,
-    workflow_child_progress, workflow_child_summary,
+    workflow_child_progress, workflow_child_summary, workflow_step_statuses,
 };
 pub use display_text::{sanitize_display_text, truncate_display, truncate_to_bytes};
 pub use host_command::{
@@ -97,13 +103,20 @@ pub use host_command::{
 };
 pub use host_step::{
     HOST_STEP_MAX_COUNT, HostStepFreshness, HostStepKind, HostStepMonitorKind, HostStepNode,
-    HostStepState, HostStepVerdict, HostStepVersion,
+    HostStepState, HostStepVerdict, HostStepVersion, assert_unique_host_step_ids,
 };
 pub use key::{WorkflowKey, WorkflowKeyError};
+pub use lane_metadata::{
+    LaneMetadataError, WORKFLOW_LANE_CLAIM_MAX_BYTES, WORKFLOW_LANE_CLAIMS_MAX,
+    WORKFLOW_LANE_KEY_MAX_BYTES, WORKFLOW_LANE_OUTPUT_PATHS_MAX,
+    WORKFLOW_LANE_OUTPUT_PATH_MAX_BYTES, WORKFLOW_LANE_SOURCE_REF_MAX_BYTES,
+    assert_workflow_lane_key, normalize_workflow_lane_metadata,
+};
 pub use permit::{
     WorkflowResourceAuthority, WorkflowResourceConsumption, WorkflowResourceExpansionState,
-    WorkflowResourceHostAuthority, WorkflowResourceInvocation, WorkflowResourcePermit,
-    WorkflowResourcePermitInput, WorkflowResourceProvenance, WorkflowResourceProvenanceKind,
+    WorkflowResourceHostAuthority, WorkflowResourceId, WorkflowResourceInvocation,
+    WorkflowResourcePermit, WorkflowResourcePermitInput, WorkflowResourceProvenance,
+    WorkflowResourceProvenanceKind, WorkflowResourceVersion,
 };
 pub use preflight::{
     WORKFLOW_PREFLIGHT_MAX_BYTES, WORKFLOW_PREFLIGHT_MAX_CLAIMS, WORKFLOW_PREFLIGHT_MAX_DEPTH,
@@ -115,10 +128,28 @@ pub use preflight::{
     normalize_workflow_preflight, validate_workflow_preflight, workflow_key_matches_preflight_lane,
     workflow_preflight_lane_for_runtime_key, workflow_preflight_warnings,
 };
+pub use receipt::{
+    BuildWorkflowReceipt, ResolveWorkflowReceiptResume, ResumableEntry, WORKFLOW_RECEIPT_FILE,
+    WORKFLOW_RECEIPT_VERSION, WorkflowReceipt, WorkflowReceiptEntry, WorkflowReceiptError,
+    WorkflowReceiptRef, WorkflowReceiptResume, WorkflowReceiptState, WorkflowReceiptVersion,
+    WorkflowRecoveryAction, WorkflowRecoveryCall, WorkflowRecoveryResume,
+    WorkflowTerminalResolution, build_workflow_receipt, read_workflow_receipt,
+    resolve_workflow_receipt_resume, resolve_workflow_receipt_resume_entry,
+    workflow_receipt_path, write_workflow_receipt,
+};
 pub use resources::{
     ResolvedWorkflowResource, WorkflowResourceDefinition, WorkflowResourceExpansion,
     WorkflowResourceRegistration, WorkflowResourceRegistry, WorkflowResourceResolution,
     WorkflowResourceResolve,
+};
+pub use settlement::{
+    DetachedChildSettlement, EVIDENCE_PERSISTENCE_FAILED, INTERRUPTED_DETACHED_CHILD,
+    PlanWorkflowSettlement, SettledWorkflowStatus, UNSUPPORTED_DETACHED_WORKFLOW_CONTINUATION,
+    WorkflowBudgetSignals, WorkflowCompletionEvent, WorkflowSettlementPlan,
+    apply_detached_child_settlement, classify_workflow_settlement,
+    find_workflow_settlement_step, output_path_mappings_of, plan_workflow_settlement,
+    promote_settled_paused_workflow, with_workflow_children, workflow_output_path_mapping_summary,
+    workflow_recovery_actions, workflow_terminal_outcome_for_result,
 };
 pub use stable_json::{stable_json, stable_json_digest};
 pub use types::{

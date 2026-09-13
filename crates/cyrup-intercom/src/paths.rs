@@ -1,7 +1,7 @@
 //! Agent-dir / intercom-dir resolution + runtime-dir/file mode restriction — a faithful
-//! port of `pi-intercom/broker/paths.ts`, retargeted to cyrup's `~/.cyrup` home (the port doc §7.3;
-//! `crates/cyrup-ext-subagents/src/background/mod.rs:1086-1100` resolves the same `<home>/.cyrup`
-//! root from `CYRUP_HOME`/`HOME`).
+//! port of `pi-intercom/broker/paths.ts`, retargeted to cyrup's `~/.cyrup/agent` agent dir (the
+//! port doc §7.3), which is the one [`cyrup_config::paths::cyrup_agent_dir_from`] resolves and the
+//! one `ConfigDirs::agent_dir` hands every subsystem.
 //!
 //! What lives here is the part of `paths.ts` that is NOT transport-specific: the
 //! cyrup-home/agent-dir/intercom-dir resolution ([`agent_dir_path`], [`intercom_dir_path`]) and the
@@ -37,19 +37,49 @@ pub const INTERCOM_RUNTIME_FILE_MODE: u32 = 0o600;
 pub const ENV_CODING_AGENT_DIR: &str = cyrup_config::paths::ENV_CODING_AGENT_DIR;
 
 /// Resolve the agent directory (`getAgentDirPath`, `paths.ts:27-38`): `$CYRUP_CODING_AGENT_DIR`
-/// (absolute verbatim, else resolved against `cwd`) if set and non-blank, else `<home>/.cyrup`.
+/// (absolute verbatim, else resolved against `cwd`) if set and non-blank, else
+/// `<home>/.cyrup/agent`.
 ///
 /// pi uses `<home>/.pi/agent`, with `<home>` resolved from pi's `homeDir: string = homedir()`
 /// default parameter (Node's `os.homedir()`, which on POSIX checks `$HOME` and, failing that,
 /// consults the system password database for the real user's home directory — total whenever the
 /// OS has ANY notion of a home dir for the running user).
 ///
-/// cyrup uses `<home>/.cyrup` (the port doc §7.3), with `<home>` resolved the same way: `CYRUP_HOME`
-/// first (a cyrup-only additive override with no pi counterpart, mirroring `subagents_home`,
-/// `cyrup-ext-subagents/src/background/mod.rs:1096-1100`), then `HOME`, then — mirroring
-/// `os.homedir()`'s passwd-db fallback — `std::env::home_dir()` (checks `$HOME` then falls back to
-/// the platform's real-user-home lookup), and only as a truly last resort (no home dir resolvable
-/// at all) the OS temp dir, so this remains total.
+/// cyrup uses `<home>/.cyrup/agent` — pi's `/agent` component KEPT, because that is what makes this
+/// the same directory every other cyrup subsystem is handed. `<home>` is resolved in three rungs:
+/// the shared ladder's ENV rungs first (`CYRUP_HOME`, a cyrup-only additive override with no pi
+/// counterpart, then `HOME`); then this function's own `home_dir` seam — which is what mirrors
+/// `os.homedir()`'s passwd-db fallback, since the caller passes `std::env::home_dir` (it checks
+/// `$HOME`, then the platform's real-user-home lookup); and only as a truly last resort, when no
+/// home dir is resolvable at all, the OS temp dir — so this remains total.
+///
+/// Which ENV-rung primitive that is, and why it cannot be the full ladder, is recorded at the call
+/// site rather than restated here.
+///
+/// # Why the `/agent` component is load-bearing
+///
+/// This tail used to be `<home>/.cyrup`, dropping pi's `/agent`. That was a port bug with a real
+/// consequence, not a cosmetic one: the extension itself never sees this function's result — the
+/// binary passes `ConfigDirs::agent_dir` (`<home>/.cyrup/agent`,
+/// `cyrup-config/src/env.rs:222-227`) into [`crate::extension::intercom_extension_for_env_concrete`]
+/// — so the two spellings named two different directories. Intercom's state landed under
+/// `<home>/.cyrup/agent/intercom/` (where `extension-state/` actually is), while this ladder, the
+/// broker ([`crate::broker`]) and `cyrup-ext-subagents`' mirrored copy all looked under
+/// `<home>/.cyrup/intercom/`.
+///
+/// The visible failure was a DUPLICATE `intercom` tool: the extension read its install marker at the
+/// caller-supplied dir and claimed the name, while the subagents crate read the same marker at the
+/// old spelling, concluded intercom was absent, and registered its own native fallback under the
+/// same name — a hard extension-load error that stopped the child booting. Keeping `/agent` makes
+/// the two answers identical by construction. Also note `<agent_dir>/<subsystem>/config.json` is the
+/// established convention (`cyrup-ext-subagents`' own `is_installed` reads
+/// `<agent_dir>/subagents/config.json` the same way).
+///
+/// The agent-dir ENV overrides are honoured through
+/// [`cyrup_config::paths::cyrup_agent_dir_from`] rather than re-spelled here, so a `CYRUP_AGENT_DIR`
+/// that moves `ConfigDirs::agent_dir` moves this in lockstep. `$CYRUP_CODING_AGENT_DIR` keeps its
+/// own branch above: its relative-against-`cwd` contract is `getAgentDirPath`'s and is NOT what the
+/// shared ladder does (that one `~`-expands against home).
 #[must_use]
 pub fn agent_dir_path() -> PathBuf {
     agent_dir_path_from(
@@ -96,7 +126,10 @@ pub fn agent_dir_path_from(
     let home = cyrup_config::paths::cyrup_home_override_from(&|key| env(key).map(OsString::from))
         .or_else(home_dir)
         .unwrap_or_else(std::env::temp_dir);
-    home.join(".cyrup")
+    // THE agent-dir ladder, shared with `ConfigDirs::agent_dir`. `$CYRUP_CODING_AGENT_DIR` already
+    // returned above, so the only override this can still match is `CYRUP_AGENT_DIR` — which is
+    // exactly the one that must stay in lockstep with the binary's own resolution.
+    cyrup_config::paths::cyrup_agent_dir_from(&home, &|key| env(key).map(OsString::from))
 }
 
 /// `<agentDir>/intercom` (`getIntercomDirPath`, `paths.ts:40-42`).
@@ -205,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_dir_blank_override_falls_through_to_home_dot_cyrup() {
+    fn agent_dir_blank_override_falls_through_to_home_dot_cyrup_agent() {
         let dir = agent_dir_path_from(
             |k| match k {
                 ENV_CODING_AGENT_DIR => Some("   ".to_string()),
@@ -215,7 +248,7 @@ mod tests {
             || None,
             Some(PathBuf::from("/cwd")),
         );
-        assert_eq!(dir, PathBuf::from("/home/me/.cyrup"));
+        assert_eq!(dir, PathBuf::from("/home/me/.cyrup/agent"));
     }
 
     /// Regression proof for the home-directory-fallback divergence: pi's `homedir()` default
@@ -231,7 +264,7 @@ mod tests {
             || Some(PathBuf::from("/real/os/home")),
             Some(PathBuf::from("/cwd")),
         );
-        assert_eq!(dir, PathBuf::from("/real/os/home/.cyrup"));
+        assert_eq!(dir, PathBuf::from("/real/os/home/.cyrup/agent"));
     }
 
     /// `CYRUP_HOME` and `HOME` both take priority over the `home_dir` OS fallback (order-of-
@@ -245,7 +278,7 @@ mod tests {
             || Some(PathBuf::from("/real/os/home")),
             Some(PathBuf::from("/cwd")),
         );
-        assert_eq!(dir, PathBuf::from("/env/home/.cyrup"));
+        assert_eq!(dir, PathBuf::from("/env/home/.cyrup/agent"));
     }
 
     /// The OS temp dir remains the absolute last resort only when even the `home_dir` fallback is
@@ -253,17 +286,17 @@ mod tests {
     #[test]
     fn agent_dir_falls_back_to_temp_dir_only_when_home_dir_also_unresolvable() {
         let dir = agent_dir_path_from(|_| None, || None, Some(PathBuf::from("/cwd")));
-        assert_eq!(dir, std::env::temp_dir().join(".cyrup"));
+        assert_eq!(dir, std::env::temp_dir().join(".cyrup").join("agent"));
     }
 
     #[test]
     fn socket_path_is_intercom_dir_broker_sock() {
-        let agent = PathBuf::from("/home/me/.cyrup");
+        let agent = PathBuf::from("/home/me/.cyrup/agent");
         let intercom = intercom_dir_path(&agent);
-        assert_eq!(intercom, PathBuf::from("/home/me/.cyrup/intercom"));
+        assert_eq!(intercom, PathBuf::from("/home/me/.cyrup/agent/intercom"));
         assert_eq!(
             unix_socket_path(&intercom),
-            PathBuf::from("/home/me/.cyrup/intercom/broker.sock")
+            PathBuf::from("/home/me/.cyrup/agent/intercom/broker.sock")
         );
     }
 

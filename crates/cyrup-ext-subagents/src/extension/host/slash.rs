@@ -875,6 +875,10 @@ impl SubagentsExtension {
                     model_override: model,
                     timeout_ms: None,
                     cancel: CancelToken::new(),
+                    // The slash surface has no `workflowScript` concept.
+                    parent_workflow_run_id: None,
+                    workflow_key: None,
+                    workflow_steer: None,
                 },
                 None,
             )

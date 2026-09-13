@@ -40,7 +40,7 @@ use crate::error::ProviderError;
 use crate::model::Model;
 use crate::stream::StreamOptions;
 use crate::stream::sse::SseRequest;
-use crate::utils::provider_plumbing::connect_sse;
+use crate::utils::provider_plumbing::{EnvSource, connect_sse};
 use claude_code::resolve_is_oauth;
 use cyrup_core::{ApiId, CancelToken};
 use headers::{build_headers, resolve_url};
@@ -105,7 +105,13 @@ impl ApiImpl for AnthropicMessagesApi {
         let is_oauth = resolve_is_oauth(model, auth);
         // PROV-011: an unsatisfiable `constrainedSampling` fails the turn before any HTTP, with
         // pi's own message.
-        let params = match build_params(model, ctx, opts, auth.env.as_ref(), is_oauth) {
+        let params = match build_params(
+            model,
+            ctx,
+            opts,
+            EnvSource::new(auth.env.as_ref()),
+            is_oauth,
+        ) {
             Ok(p) => p,
             Err(e) => {
                 let e = ProviderError::from(e);

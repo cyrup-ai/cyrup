@@ -6,13 +6,18 @@
 //! because pi gets it from the JS runtime / a vendor SDK. Collapsing them *improves* the 1:1
 //! pi→cyrup mapping — one upstream function now maps to one cyrup function again.
 //!
+//! - [`EnvSource`] — the overlay/ambient pair [`provider_env_value`] and [`resolve_cache_retention`]
+//!   both resolve through, promoted here from a `bedrock-converse-stream`-private test seam
+//!   (formerly `api/bedrock_converse_stream/env.rs`): a bare optional overlay can say "this
+//!   variable is X" but never "this variable is ABSENT", so an empty map passed as a supposed
+//!   shield still fell through to the real process environment (TEST_ENV_HERMETICITY).
 //! - [`provider_env_value`] — pi's single `getProviderEnvValue` (`provider-env.ts:44-52`), which
 //!   had been ported five times.
 //! - [`resolve_cache_retention`] — pi declares `resolveCacheRetention` once per api file, but the
 //!   `anthropic-messages` / `openai-completions` / `openai-responses` / `bedrock-converse-stream`
-//!   bodies are the same ladder; [`resolve_cache_retention_with`] is the env-agnostic core the
-//!   bedrock leg drives with its own `EnvSource` test seam. `pi-messages` is deliberately NOT one
-//!   of them — see the note on its own copy.
+//!   bodies are the same ladder; [`resolve_cache_retention_with`] is the env-agnostic core every
+//!   leg drives through an [`EnvSource`]. `pi-messages` is deliberately NOT one of them — see the
+//!   note on its own copy.
 //! - [`now_millis`] — no upstream counterpart: pi writes `Date.now()`.
 //! - [`connect_sse`] — no upstream counterpart: pi's api files hand the request to a vendor SDK
 //!   client, so "build a proxy-aware client, open the SSE stream, fire `onResponse`" is cyrup's
@@ -29,15 +34,56 @@ use cyrup_core::CancelToken;
 use futures::Stream;
 use std::pin::Pin;
 
-/// Resolve a provider env value (Pi `getProviderEnvValue`, provider-env.ts:44-52): the scoped
-/// `env` overlay wins over the process environment, and an empty string counts as absent (JS `||`).
-pub(crate) fn provider_env_value(name: &str, env: Option<&ProviderEnv>) -> Option<String> {
-    if let Some(map) = env
-        && let Some(v) = map.get(name).filter(|v| !v.is_empty())
-    {
-        return Some(v.clone());
+/// Env lookup for the resolution helpers.
+///
+/// `overlay` is pi's `options.env` (scoped, wins). `ambient` is the process environment; it is a
+/// **test seam**: production constructs it with [`EnvSource::new`], which leaves it `None` and
+/// falls through to [`std::env::var`], while the resolution tests inject a map so they never depend
+/// on the ambient AWS configuration of whatever machine runs them.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct EnvSource<'a> {
+    pub(crate) overlay: Option<&'a ProviderEnv>,
+    pub(crate) ambient: Option<&'a ProviderEnv>,
+}
+
+impl<'a> EnvSource<'a> {
+    pub(crate) fn new(overlay: Option<&'a ProviderEnv>) -> Self {
+        EnvSource {
+            overlay,
+            ambient: None,
+        }
     }
-    std::env::var(name).ok().filter(|v| !v.is_empty())
+
+    /// pi `getProviderEnvValue(name, env)`: the scoped overlay first, then the process env. Empty
+    /// values are skipped (pi's `||` chain treats `""` as absent).
+    pub(crate) fn get(&self, name: &str) -> Option<String> {
+        if let Some(map) = self.overlay
+            && let Some(v) = map.get(name).filter(|v| !v.is_empty())
+        {
+            return Some(v.clone());
+        }
+        self.ambient(name)
+    }
+
+    /// pi `getProviderEnvValue(name)` with **no** env argument (`bedrock-converse-stream.ts:144`):
+    /// the process environment only, deliberately ignoring the scoped overlay.
+    pub(crate) fn ambient(&self, name: &str) -> Option<String> {
+        match self.ambient {
+            Some(map) => map.get(name).filter(|v| !v.is_empty()).cloned(),
+            None => std::env::var(name).ok().filter(|v| !v.is_empty()),
+        }
+    }
+}
+
+/// Resolve a provider env value (Pi `getProviderEnvValue`, provider-env.ts:44-52): the scoped
+/// overlay wins over the process environment, and an empty string counts as absent (JS `||`).
+///
+/// Takes an [`EnvSource`] rather than a bare `Option<&ProviderEnv>` because a `ProviderEnv` can say
+/// "this variable is X" but never "this variable is ABSENT" — an empty map is indistinguishable
+/// from no map, so it falls through to `std::env::var` and the caller silently inherits the
+/// developer's shell. `EnvSource::ambient` is the statement the map cannot make.
+pub(crate) fn provider_env_value(name: &str, env: EnvSource<'_>) -> Option<String> {
+    env.get(name)
 }
 
 /// The `resolveCacheRetention` ladder over an arbitrary env lookup: an explicit caller value wins;
@@ -66,9 +112,9 @@ pub(crate) fn resolve_cache_retention_with(
 /// otherwise `Short`.
 pub(crate) fn resolve_cache_retention(
     cache_retention: Option<CacheRetention>,
-    env: Option<&ProviderEnv>,
+    env: EnvSource<'_>,
 ) -> CacheRetention {
-    resolve_cache_retention_with(cache_retention, |name| provider_env_value(name, env))
+    resolve_cache_retention_with(cache_retention, |name| env.get(name))
 }
 
 /// Current unix time in milliseconds (0 on a clock error — never panics).

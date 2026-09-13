@@ -203,6 +203,28 @@ pub struct ForegroundChildView {
     pub current_path: Option<String>,
 }
 
+/// WORKFLOW_6 §3.3 — project the live registry's own child record onto the FleetView's shape.
+/// `model`/`thinking` stay `None`: no control event carries them yet, and that is a different
+/// task's.
+impl From<&crate::extension::ForegroundChildEntry> for ForegroundChildView {
+    fn from(child: &crate::extension::ForegroundChildEntry) -> Self {
+        Self {
+            index: child.index,
+            agent: child.agent.clone(),
+            description: child.description.clone(),
+            started_at: child.started_at,
+            updated_at: child.updated_at,
+            model: None,
+            thinking: None,
+            tokens: child.tokens,
+            tool_count: child.tool_count,
+            turn_count: child.turn_count,
+            current_tool: child.current_tool.clone(),
+            current_path: child.current_path.clone(),
+        }
+    }
+}
+
 /// pi `ForegroundRunControl` (`shared/types.ts:1503-1543`) — one live foreground run, as
 /// `fleet.ts:142-172` and `fleet-status.ts:149-179` read it.
 ///

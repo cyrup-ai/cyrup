@@ -550,26 +550,38 @@ pub enum WorkflowLaneMode {
 
 /// Bounded, versioned lane metadata attached to a workflow child launch — pi
 /// `WorkflowLaneMetadata` (`shared/types.ts:168-175`). The guest validates the raw object
-/// (`validateLaneMetadata`, `scripted-workflow.ts:606-624`) before it ever reaches this type.
+/// (`validateLaneMetadata`, `scripted-workflow.ts:606-624`) before it ever reaches this type, and
+/// [`crate::workflows::normalize_workflow_lane_metadata`] (WORKFLOW_3 SUBTASK0a) re-validates it
+/// on every OTHER path a value can reach this struct from (a receipt read off disk, a lane
+/// re-parsed at settlement) — which is what `key: WorkflowKey` and `#[serde(deny_unknown_fields)]`
+/// below make structural rather than a check every one of those callers must remember.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkflowLaneMetadata {
     /// Always `1`; any other value fails to parse.
     pub version: LaneMetadataVersion,
-    /// The lane's key — raw, consumers parse ([`WorkflowScriptTraceEntry::key`]'s rationale).
-    pub key: String,
+    /// The lane's key. Grammar-checked and bounded BY CONSTRUCTION: the lane key grammar
+    /// (`lane-metadata.ts:41`) is byte-identical to [`WorkflowKey`]'s, and its 128-byte ceiling
+    /// (pi `WORKFLOW_LANE_KEY_MAX_BYTES`) IS that grammar's own ceiling — so both of upstream's
+    /// checks dissolve into this field's type, and this struct's derived `Deserialize` routes
+    /// the field through [`WorkflowKey`]'s own parser (WORKFLOW_3 §0.9). The previous *"raw,
+    /// consumers parse"* rationale no longer applies now that a validator exists.
+    pub key: WorkflowKey,
     /// The lane's advisory mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<WorkflowLaneMode>,
-    /// The upstream source ref the lane claims to build on.
+    /// The upstream source ref the lane claims to build on (pi
+    /// `WORKFLOW_LANE_SOURCE_REF_MAX_BYTES`, 128 bytes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_ref: Option<String>,
-    /// What the lane claims to cover (max 20 × 160 bytes, guest-enforced).
+    pub source_ref: Option<Bounded<128>>,
+    /// What the lane claims to cover (pi `WORKFLOW_LANE_CLAIMS_MAX`/`WORKFLOW_LANE_CLAIM_MAX_BYTES`:
+    /// max 20 × 160 bytes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub claims: Option<Vec<String>>,
-    /// Output paths the lane claims (max 10 × 256 bytes, guest-enforced).
+    pub claims: Option<Vec<Bounded<160>>>,
+    /// Output paths the lane claims (pi `WORKFLOW_LANE_OUTPUT_PATHS_MAX`/
+    /// `WORKFLOW_LANE_OUTPUT_PATH_MAX_BYTES`: max 10 × 256 bytes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_paths: Option<Vec<String>>,
+    pub output_paths: Option<Vec<Bounded<256>>>,
 }
 
 /// A partial-terminal outcome — pi `WorkflowTerminalOutcome` (`shared/types.ts:135-138`):

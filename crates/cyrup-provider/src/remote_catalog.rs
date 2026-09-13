@@ -432,6 +432,13 @@ pub struct RemoteCatalog {
     base_url: String,
     store: Arc<dyn ModelsStore>,
     local_generated_at: Option<i64>,
+    /// Per-provider staleness floors (XAI_1), keyed by provider id. Consulted by [`load_overlay`]
+    /// in preference to `local_generated_at` when a provider has an entry; empty by default, which
+    /// is exactly [`with_local_generated_at`]'s pre-existing behavior for every provider.
+    ///
+    /// [`load_overlay`]: Self::load_overlay
+    /// [`with_local_generated_at`]: Self::with_local_generated_at
+    local_generated_at_by_provider: BTreeMap<String, i64>,
     request_timeout: Duration,
     auth_ctx: Arc<dyn crate::auth::AuthContext>,
     inflight: Mutex<BTreeMap<String, Arc<RefreshDedup>>>,
@@ -443,6 +450,7 @@ impl RemoteCatalog {
             base_url: DEFAULT_CATALOG_BASE_URL.to_string(),
             store,
             local_generated_at: None,
+            local_generated_at_by_provider: BTreeMap::new(),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             auth_ctx: Arc::new(EnvAuthContext),
             inflight: Mutex::new(BTreeMap::new()),
@@ -477,6 +485,21 @@ impl RemoteCatalog {
         self
     }
 
+    /// Per-provider staleness floors (XAI_1): `xai`'s embedded rows are fetched live at generation
+    /// time, so its floor is NEWER than the global [`with_local_generated_at`] stamp — without
+    /// this, [`load_overlay`] would accept a persisted overlay older than the embedded rows and let
+    /// it shadow them (the exact failure pi #7016 fixed, reintroduced here specifically for xai).
+    /// Defaults to empty, which is exactly [`with_local_generated_at`]'s pre-existing behavior for
+    /// every provider that has no entry in `map`.
+    ///
+    /// [`with_local_generated_at`]: Self::with_local_generated_at
+    /// [`load_overlay`]: Self::load_overlay
+    #[must_use]
+    pub fn with_local_generated_at_by_provider(mut self, map: BTreeMap<String, i64>) -> Self {
+        self.local_generated_at_by_provider = map;
+        self
+    }
+
     #[must_use]
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
@@ -496,9 +519,16 @@ impl RemoteCatalog {
         let mut entries: Vec<(String, Vec<Model>)> = Vec::new();
         for id in provider_ids {
             let stored = self.store.read(id, None).await.ok().flatten();
+            // Per-provider floor when one exists (XAI_1), else the global stamp — never the other
+            // way round, so a provider with no per-provider entry keeps today's behavior exactly.
+            let floor = self
+                .local_generated_at_by_provider
+                .get(*id)
+                .copied()
+                .or(self.local_generated_at);
             // Pi filters the overlay to `model.provider === provider.id` (`:59`): a body that
             // mislabels its provider must not leak into another provider's catalog.
-            let models: Vec<Model> = remote_models(stored.as_ref(), self.local_generated_at)
+            let models: Vec<Model> = remote_models(stored.as_ref(), floor)
                 .iter()
                 .filter(|m| m.provider.as_str() == *id)
                 .cloned()

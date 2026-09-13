@@ -18,12 +18,18 @@ fn prompt_cache_key_for_openai_with_session() {
 
 // Gap 2: Pi `resolveCacheRetention` (openai-completions.ts:141-149) — when the caller did not
 // set retention, `CYRUP_CACHE_RETENTION == "long"` promotes to Long; an explicit value wins.
+//
+// Every leg below states its env input through an explicit `EnvSource` with a non-`None`
+// `ambient` (TEST_ENV_HERMETICITY): an *empty overlay* alone does not shield this test from the
+// developer's shell (`provider_env_value` falls through to `std::env::var` whenever the overlay
+// lacks the key), only a pinned, explicit `ambient` does.
 #[test]
 fn cache_retention_env_promotes_long() {
     use std::collections::BTreeMap;
     let m = openai_model();
     let mut env = BTreeMap::new();
     env.insert("CYRUP_CACHE_RETENTION".to_string(), "long".to_string());
+    let empty = BTreeMap::new();
 
     // Unset caller retention + CYRUP_CACHE_RETENTION=long (scoped overlay) => promoted to Long,
     // which (on api.openai.com, supportsLongCacheRetention) emits `prompt_cache_retention`.
@@ -31,7 +37,13 @@ fn cache_retention_env_promotes_long() {
         cache_retention: None,
         ..Default::default()
     };
-    let body = build_body_with_env(&m, &Context::default(), &opts, Some(&env)).unwrap();
+    let body = build_body_with_env(
+        &m,
+        &Context::default(),
+        &opts,
+        env_source(Some(&env), &empty),
+    )
+    .unwrap();
     assert_eq!(body["prompt_cache_retention"], "24h");
 
     // Explicit caller value wins over env: Short stays Short (no 24h).
@@ -39,29 +51,37 @@ fn cache_retention_env_promotes_long() {
         cache_retention: Some(CacheRetention::Short),
         ..Default::default()
     };
-    let body = build_body_with_env(&m, &Context::default(), &opts, Some(&env)).unwrap();
+    let body = build_body_with_env(
+        &m,
+        &Context::default(),
+        &opts,
+        env_source(Some(&env), &empty),
+    )
+    .unwrap();
     assert!(body.get("prompt_cache_retention").is_none());
 
-    // resolve_cache_retention precedence, directly (overlay-driven, deterministic).
+    // resolve_cache_retention precedence, directly — deterministic now that `ambient` is pinned
+    // empty, not merely because the overlay is populated.
     assert_eq!(
-        resolve_cache_retention(None, Some(&env)),
+        resolve_cache_retention(None, env_source(Some(&env), &empty)),
         CacheRetention::Long
     );
     assert_eq!(
-        resolve_cache_retention(Some(CacheRetention::None), Some(&env)),
+        resolve_cache_retention(Some(CacheRetention::None), env_source(Some(&env), &empty)),
         CacheRetention::None
     );
-    let empty = BTreeMap::new();
     assert_eq!(
-        resolve_cache_retention(None, Some(&empty)),
+        resolve_cache_retention(None, env_source(None, &empty)),
         CacheRetention::Short
     );
 
-    // Hard rename: the dropped `PI_CACHE_RETENTION` spelling alone promotes nothing.
+    // Hard rename: the dropped `PI_CACHE_RETENTION` spelling alone promotes nothing — including
+    // when the real ambient shell has `CYRUP_CACHE_RETENTION` exported, since `ambient` here is
+    // pinned empty rather than inherited.
     let mut legacy = BTreeMap::new();
     legacy.insert("PI_CACHE_RETENTION".to_string(), "long".to_string());
     assert_eq!(
-        resolve_cache_retention(None, Some(&legacy)),
+        resolve_cache_retention(None, env_source(Some(&legacy), &empty)),
         CacheRetention::Short
     );
 }

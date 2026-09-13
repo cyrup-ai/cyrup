@@ -70,6 +70,7 @@ pub mod resume_guidance;
 pub mod run_status;
 pub mod tracker;
 pub mod wait;
+pub mod wait_completions;
 
 // Kept here (not in a submodule): sibling modules resolve `super::ModelId` through this private
 // import binding (`fleet_view.rs:472,644`), exactly as they did before the decomposition.

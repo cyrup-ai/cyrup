@@ -22,6 +22,12 @@ pub enum RunMode {
     /// A declarative multi-child graph driven by a workflow script — pi `SubagentRunMode`'s
     /// `"workflow"` (`shared/types.ts:400`).
     ///
+    /// Produced exclusively by the FOREGROUND arm (`route_workflow_mode` in
+    /// `extension/tool/routing.rs`); the background runner (`background/runner_main/`) never
+    /// emits this mode (§0.6: async detachment was cut, `runs.all` already supplies real
+    /// concurrency). The existing "steps are discovered rather than declared" paragraph below
+    /// is exactly what `chain_step_count: None` + §3.3's `workflow_step_statuses` implement.
+    ///
     /// Distinct from [`Self::Chain`], which is a linear list this crate's own runner walks: a
     /// workflow is driven by a SCRIPT that decides at runtime which children to launch, in what
     /// shape, and how to react to each result. The run's steps are therefore discovered as it

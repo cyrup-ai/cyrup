@@ -375,6 +375,14 @@ pub struct AppState {
     /// screen: `cancel()` fires it so a flow blocked on something other than a prompt (a callback
     /// server, a device-code poll) also unwinds. `None` whenever no login is in flight.
     pub(super) login_cancel: Option<CancelToken>,
+    /// The `/model` picker generation the in-flight refresh belongs to (Pi's per-component `closed`
+    /// flag, `model-selector.ts:74`). Bumped on every open; a settled [`crate::ModelRefreshMsg`]
+    /// whose epoch is stale is DROPPED.
+    pub(super) model_refresh_epoch: u64,
+    /// The open picker's `refreshAbortController` (`model-selector.ts:72`), used for all three of
+    /// Pi's purposes: the 15 s deadline fires it, `dispose()` fires it (`:225`), and the settled
+    /// refresh clears it (Pi's `finally { clearTimeout }`). `None` when no refresh is in flight.
+    pub(super) model_refresh_cancel: Option<CancelToken>,
     /// Provider ids whose STORED credential is an OAuth one — cyrup's standing copy of the half of
     /// pi's `modelRuntime.snapshot.auth` that `isUsingOAuth` reads
     /// (`model-runtime.ts:458-460`, pi v0.84.1: `this.snapshot.auth.get(providerId)?.type ===
@@ -526,6 +534,8 @@ impl AppState {
             login_auth_type_options: None,
             pending_login_prompt: None,
             login_cancel: None,
+            model_refresh_epoch: 0,
+            model_refresh_cancel: None,
             oauth_credential_providers: std::collections::BTreeSet::new(),
             known_tool_definitions: std::collections::HashMap::new(),
             extension_completion_query: None,

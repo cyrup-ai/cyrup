@@ -45,6 +45,23 @@ impl<B: Backend> App<B> {
         rx
     }
 
+    /// Install the off-task `/model` catalog-refresh channel and hand back its receiver.
+    ///
+    /// [`App::run`] calls this once at startup, exactly like [`Self::install_login_channel`]. Without
+    /// it [`Self::handle_model_command`] opens the picker with no refresh at all — which is cyrup's
+    /// behaviour before XAI_4, and the reason `ModelSelector::set_refresh_status` had never had a
+    /// producer.
+    ///
+    /// `pub` so `tests/*.rs` can drive a whole refresh without standing up a run loop (the crate's
+    /// established run-loop-only testing seam, same as [`Self::install_login_channel`]).
+    pub fn install_model_refresh_channel(
+        &mut self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<ModelRefreshMsg> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ModelRefreshMsg>();
+        self.model_refresh_tx = Some(tx);
+        rx
+    }
+
     /// Install the off-task `/compact` channel and hand back its receiver (TUI-055).
     ///
     /// [`App::run`] calls this once at startup, exactly like [`Self::install_tree_nav_channel`].

@@ -754,6 +754,19 @@ impl App<InlineBackend<Stdout>> {
         Ok(())
     }
 
+    pub(crate) fn on_model_refresh_msg(
+        &mut self,
+        ctx: &mut RunCtx,
+        msg: crate::model_selector::ModelRefreshMsg,
+    ) -> Result<(), TuiError> {
+        // A spawned `/model` catalog refresh settled (Pi `refreshModels()`'s tail,
+        // `model-selector.ts:191-213`): write the status/error rows, rebuild the list from the
+        // now-installed overlay, and re-apply the live search — picker still open.
+        self.apply_model_refresh(&ctx.session, msg);
+        self.frames.request();
+        Ok(())
+    }
+
     pub(crate) async fn on_tree_nav_msg(
         &mut self,
         ctx: &mut RunCtx,

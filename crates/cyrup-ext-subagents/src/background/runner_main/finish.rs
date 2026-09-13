@@ -171,6 +171,58 @@ async fn terminal_result_exists(run_paths: &RunPaths, status: &RunStatus) -> boo
     }
 }
 
+/// The two [`ResultFile`] fields a settled workflow contributes to a terminal write — pi's
+/// `status.workflowChildren`/`publicResult.workflowReceipt` spreads
+/// (`workflow-settlement.ts:231`, `:235`).
+///
+/// [`Default`] (both `None`) for every one of [`finish_run`]'s six current callers, none of which
+/// is a workflow today — §0.6 cut the detached async runner; the foreground path (§3.2) never
+/// calls this (it writes the terminal status itself). Pointer: §4.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct WorkflowResultFields {
+    /// [`ResultFile::workflow_children`].
+    pub workflow_children: Option<crate::workflows::WorkflowChildSummary>,
+    /// [`ResultFile::workflow_receipt`] — built only when BOTH a receipt and a path exist
+    /// (`workflow-settlement.ts:235`), never inserted-then-removed (`:238`).
+    pub workflow_receipt: Option<crate::workflows::WorkflowReceiptRef>,
+}
+
+/// Stamp a [`crate::workflows::WorkflowSettlementPlan`] onto the terminal records — the ONE
+/// function a workflow terminal path calls instead of open-coding the assembly (upstream
+/// open-codes it twice, at `runs/foreground/subagent-executor.ts:5722-5727` and `:5768-5777`; the
+/// deduplicated form is `planWorkflowSettlement`, whose sole upstream caller is
+/// `workflow-detach-reconcile.ts:228`).
+///
+/// Lives beside [`finish_run`] rather than inside it: `finish_run` is R-SA-077's write-ordering
+/// funnel and has six callers today, none of which is a workflow. The async arm was cut (§0.6);
+/// the foreground path writes its own terminal status via `settle_foreground_workflow` (§3.2).
+/// Pointer: §4.
+///
+/// `#[allow(dead_code)]` outside `#[cfg(test)]`: this task's own unit test below is this
+/// function's only caller; the production foreground path never reaches it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn apply_workflow_settlement_plan(
+    plan: &crate::workflows::WorkflowSettlementPlan,
+    status: &mut RunStatus,
+) -> WorkflowResultFields {
+    *status = plan.status.clone();
+    WorkflowResultFields {
+        workflow_children: plan.status.workflow_children.clone(),
+        workflow_receipt: match (&plan.receipt, &plan.receipt_path) {
+            (Some(receipt), Some(path)) => Some(crate::workflows::WorkflowReceiptRef {
+                path: path.clone(),
+                receipt: receipt.clone(),
+            }),
+            _ => None,
+        },
+    }
+}
+
+// `finish_run` was already at clippy's `too_many_arguments` ceiling (seven) before WORKFLOW_3;
+// `workflow` is the one addition this task's own doc anticipated ("a struct is the better
+// shape") — it IS a struct, bundling two fields into one parameter rather than two, but the
+// pre-existing seven were out of this task's scope to redesign.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn finish_run(
     run_paths: &RunPaths,
     mut status: RunStatus,
@@ -179,6 +231,7 @@ pub(super) async fn finish_run(
     cwd: PathBuf,
     session_file: Option<PathBuf>,
     error: String,
+    workflow: WorkflowResultFields,
 ) {
     if terminal_result_exists(run_paths, &status).await {
         tracing::warn!(
@@ -362,6 +415,8 @@ pub(super) async fn finish_run(
         session_id: status.session_id.clone(),
         completion_owner_id: status.completion_owner_id.clone(),
         results,
+        workflow_children: workflow.workflow_children,
+        workflow_receipt: workflow.workflow_receipt,
     };
     let result_write = write_result_file(run_paths, &status, &result_file).await;
 
@@ -657,6 +712,7 @@ mod tests {
             dir.path().to_path_buf(),
             None,
             String::new(),
+            WorkflowResultFields::default(),
         )
         .await;
 
@@ -690,6 +746,7 @@ mod tests {
             PathBuf::new(),
             None,
             "runner-config.json was already consumed".to_string(),
+            WorkflowResultFields::default(),
         )
         .await;
 
@@ -738,6 +795,7 @@ mod tests {
             dir.path().to_path_buf(),
             None,
             "boom".to_string(),
+            WorkflowResultFields::default(),
         )
         .await;
 
@@ -789,6 +847,7 @@ mod tests {
             dir.path().to_path_buf(),
             None,
             "boom".to_string(),
+            WorkflowResultFields::default(),
         )
         .await;
 
@@ -803,6 +862,57 @@ mod tests {
                 .await
                 .expect("check result"),
             "an unattributable result must NOT be written, not even unindexed"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // WORKFLOW_3 §3c — apply_workflow_settlement_plan
+    // ---------------------------------------------------------------------------------------
+
+    /// `apply_workflow_settlement_plan` overwrites the caller's status with the plan's settled
+    /// one and projects exactly the two `ResultFile` fields a workflow contributes — both only
+    /// when BOTH a receipt and a path exist, never inserted-then-removed.
+    #[test]
+    fn apply_workflow_settlement_plan_projects_workflow_children_and_receipt_together() {
+        let run_id = RunId::from_token("wf-run-0001");
+        let mut status = RunStatus::queued(run_id.clone(), crate::background::RunMode::Workflow, Some(1));
+        status.state = RunState::Running;
+
+        let run_dir_name = crate::identity::RunDirName::for_run(&run_id);
+        let receipt = crate::workflows::build_workflow_receipt(crate::workflows::BuildWorkflowReceipt {
+            workflow_run_id: &run_dir_name,
+            state: crate::workflows::WorkflowReceiptState::Complete,
+            children: &[],
+            host_steps: &[],
+            workflow_children: None,
+            resource: None,
+            terminal_outcome: None,
+            created_at: Some(1_000),
+        })
+        .expect("builds");
+
+        let plan = crate::workflows::plan_workflow_settlement(crate::workflows::PlanWorkflowSettlement {
+            status: &status,
+            summary: "done".to_string(),
+            trace: &[],
+            receipt: Some(receipt),
+            receipt_path: Some(PathBuf::from("/tmp/workflow-receipt.json")),
+            receipt_persistence_error: None,
+            resolution: None,
+            terminal_outcome: None,
+            now: Some(2_000),
+            event_metadata: serde_json::Map::new(),
+        });
+
+        let mut caller_status = status;
+        let fields = apply_workflow_settlement_plan(&plan, &mut caller_status);
+
+        assert_eq!(caller_status.state, plan.status.state);
+        assert!(fields.workflow_children.is_some(), "the settled inventory is projected");
+        assert_eq!(
+            fields.workflow_receipt.as_ref().map(|r| r.path.clone()),
+            Some(PathBuf::from("/tmp/workflow-receipt.json")),
+            "a receipt with a path projects both together"
         );
     }
 
@@ -837,6 +947,7 @@ mod tests {
             run_cwd.clone(),
             Some(session_file.clone()),
             String::new(),
+            WorkflowResultFields::default(),
         )
         .await;
 
@@ -929,6 +1040,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 None,
                 control::STOP_MESSAGE.to_string(),
+                WorkflowResultFields::default(),
             )
             .await;
 

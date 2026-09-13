@@ -228,6 +228,30 @@ pub struct HostStepNode {
     pub deadline_at: Option<serde_json::Number>,
 }
 
+/// pi `assertUniqueHostStepIds` (`runs/shared/host-step-status.ts:116-122`) — no two host steps
+/// in the same collection may share an `id`.
+///
+/// A `Vec` scan, not a `HashSet` build: [`HOST_STEP_MAX_COUNT`] is 32, so the quadratic form is
+/// bounded at 496 comparisons and preserves upstream's FIRST-duplicate-wins message (the SECOND
+/// occurrence of a repeated id is what triggers the error, naming that id — identical to a
+/// forward `Set`-membership scan's own observable behaviour).
+///
+/// # Errors
+///
+/// `Invalid host step '<source>': duplicate host step id '<id>'.`, verbatim.
+pub fn assert_unique_host_step_ids(host_steps: &[HostStepNode], source: &str) -> Result<(), String> {
+    for (index, step) in host_steps.iter().enumerate() {
+        let duplicate = host_steps.iter().take(index).any(|earlier| earlier.id == step.id);
+        if duplicate {
+            return Err(format!(
+                "Invalid host step '{source}': duplicate host step id '{}'.",
+                step.id
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -262,6 +286,40 @@ mod tests {
             "id": "x", "label": "x", "state": "pending", "updatedAt": 0,
         });
         assert!(serde_json::from_value::<HostStepNode>(bad_kind).is_err());
+    }
+
+    fn node(id: &str) -> HostStepNode {
+        HostStepNode {
+            version: HostStepVersion,
+            kind: HostStepKind,
+            monitor_kind: HostStepMonitorKind::Ci,
+            id: id.to_string(),
+            label: id.to_string(),
+            role: None,
+            provider: None,
+            state: HostStepState::Running,
+            verdict: None,
+            reason_code: None,
+            detail: None,
+            target: None,
+            freshness: None,
+            report_path: None,
+            exit_code: None,
+            updated_at: serde_json::Number::from(0),
+            deadline_at: None,
+        }
+    }
+
+    /// pi `assertUniqueHostStepIds`: distinct ids pass; the SECOND occurrence of a repeated id
+    /// triggers the rejection, naming that id — first-duplicate-wins, upstream's own message.
+    #[test]
+    fn assert_unique_host_step_ids_rejects_the_second_occurrence_of_a_repeat() {
+        assert!(assert_unique_host_step_ids(&[node("a"), node("b")], "status").is_ok());
+        assert_eq!(
+            assert_unique_host_step_ids(&[node("a"), node("b"), node("a")], "status"),
+            Err("Invalid host step 'status': duplicate host step id 'a'.".to_string())
+        );
+        assert!(assert_unique_host_step_ids(&[], "status").is_ok());
     }
 
     /// The wire words are pi's exactly — the checklist state derivation compares against them.

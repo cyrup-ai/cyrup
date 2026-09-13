@@ -24,8 +24,8 @@ pub mod together;
 
 pub use all::{
     BUILTIN_CATALOG_MANIFEST_JSON, all_images_providers, all_providers, all_providers_with,
-    all_providers_with_overlay, builtin_model_data_generated_at, default_images_models,
-    default_models,
+    all_providers_with_overlay, builtin_model_data_generated_at,
+    builtin_model_data_generated_at_by_provider, default_images_models, default_models,
 };
 pub use amazon_bedrock::*;
 pub use anthropic::{

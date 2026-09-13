@@ -36,6 +36,9 @@
 //! * [`CompletionOwnerId`] / [`current_completion_owner_id`] — pi `shared/completion-owner.ts:10-14`
 //! * [`IndexSegment`] — pi `runs/background/index-segment.ts` (whole file)
 //! * [`ResultFileName`] — pi's traversal guard, `result-files.ts:260`, `:294`, `:307`
+//! * [`RunDirName`] — pi's OTHER traversal guard, `assertSafeRunId`
+//!   (`workflows/workflow-receipt.ts:19-25`) — a run id reaching a receipt path rather than a
+//!   result-file name (WORKFLOW_3 §0.9)
 //!
 //! # File layout — one file, one concern
 //!
@@ -45,14 +48,17 @@
 //! owner_id.rs      CompletionOwnerId — the launching process, + its OnceLock mint
 //! path_segment.rs  IndexSegment — encoding a value into ONE safe path component
 //! result_name.rs   ResultFileName — the traversal guard, at parse
+//! run_dir_name.rs  RunDirName — the OTHER traversal guard, at parse (WORKFLOW_3)
 //! ```
 
 mod owner_id;
 mod path_segment;
 mod result_name;
+mod run_dir_name;
 mod session_id;
 
 pub use owner_id::{CompletionOwnerId, current_completion_owner_id};
 pub use path_segment::IndexSegment;
 pub use result_name::ResultFileName;
+pub use run_dir_name::RunDirName;
 pub use session_id::SessionId;

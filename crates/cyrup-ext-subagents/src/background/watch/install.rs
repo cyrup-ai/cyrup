@@ -9,7 +9,8 @@ use super::message::{
 };
 use super::observer::CompletionObserver;
 use super::results_watcher::{
-    CompletionNotification, RESULTS_DIR_POLL_INTERVAL, ResolvedCandidate, ResultsWatcher,
+    CompletionBand, CompletionNotification, RESULTS_DIR_POLL_INTERVAL, ResolvedCandidate,
+    ResultsWatcher,
 };
 use super::sink::CompletionSink;
 use crate::background::delivery::{Attribution, CompletionDelivery, ResultDeliveryOwnership};
@@ -319,6 +320,7 @@ async fn deliver_pending_completions(
             result: observed.result,
             result_path: observed.path,
             exhausted: false,
+            band: CompletionBand::Observed,
         };
         let observed_cleanly = match observer {
             Some(observer) => observer.observe(&notification).await,
@@ -353,6 +355,7 @@ async fn deliver_pending_completions(
                     result: foreign.result().clone(),
                     result_path: PathBuf::new(),
                     exhausted: false,
+                    band: CompletionBand::Foreign,
                 };
                 let observed_cleanly = match observer {
                     Some(observer) => observer.observe(&notification).await,
@@ -374,6 +377,7 @@ async fn deliver_pending_completions(
                     result: owned.result().clone(),
                     result_path: PathBuf::new(),
                     exhausted,
+                    band: CompletionBand::Ours,
                 };
                 if let Some(observer) = observer {
                     observer.observe(&notification).await;

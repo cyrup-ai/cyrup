@@ -57,6 +57,7 @@
 //!   audit fails saying so.
 
 mod features;
+mod live_catalog;
 mod tsdata;
 
 use std::collections::BTreeMap;
@@ -85,15 +86,20 @@ struct CatalogSpec {
     images_provider: Option<&'static str>,
 }
 
-/// The 35 embedded catalogs, each bound to its upstream source module.
+/// The 34 embedded catalogs generated from the pinned revision, each bound to its upstream source
+/// module. [`LIVE_CATALOGS`] below carries the 35th — `xai` — whose rows are fetched live instead
+/// (XAI_1): pi's `xai.models.ts` became a re-export of gitignored, network-generated data at
+/// `a9f6a3159` (`b0c2a90e`'s direct child) and has stayed that way, so no revision this generator
+/// could pin would ever recover anything newer for it.
 ///
-/// This is 34 of pi's 35 `*.models.ts` modules plus `openrouter-images.json`. The two asymmetries
-/// are deliberate and both are ledgered:
+/// This is 33 of pi's remaining 34 pinned-revision `*.models.ts` modules plus
+/// `openrouter-images.json`. The asymmetries are deliberate and all ledgered:
 ///
 /// * `together.models.ts` has **no** catalog file — cyrup hand-ports Together's 20 rows as Rust
 ///   literals in `providers/together.rs::together_models()`, so this generator cannot own them.
 /// * `openrouter-images.json` has no `*.models.ts` counterpart (PROV-065); its rows are the
 ///   `openrouter` sub-record of `packages/ai/src/image-models.generated.ts`.
+/// * `xai.models.ts` moved to [`LIVE_CATALOGS`] (XAI_1); see that table's doc comment.
 const CATALOGS: &[CatalogSpec] = &[
     spec("amazon-bedrock"),
     spec("ant-ling"),
@@ -127,7 +133,6 @@ const CATALOGS: &[CatalogSpec] = &[
     },
     spec("openrouter"),
     spec("vercel-ai-gateway"),
-    spec("xai"),
     spec("xiaomi-token-plan-ams"),
     spec("xiaomi-token-plan-cn"),
     spec("xiaomi-token-plan-sgp"),
@@ -135,6 +140,26 @@ const CATALOGS: &[CatalogSpec] = &[
     spec("zai-coding-cn"),
     spec("zai"),
 ];
+
+/// Catalogs whose rows are fetched LIVE, because the pinned-revision path cannot reach them.
+///
+/// `CATALOGS` above is `git show` against `DEFAULT_REV`. For xai that mechanism is permanently
+/// dead: `xai.models.ts` is a two-line re-export of gitignored data from `a9f6a3159` (`b0c2a90e`'s
+/// direct child) onward, so the newest rows any revision can yield are already stale on the day the
+/// pin was taken. pi publishes the shaped rows at the URL below — the same endpoint the RUNTIME
+/// overlay reads (`cyrup-provider/src/remote_catalog.rs`) — so the embedded floor comes from there
+/// and the two mechanisms can no longer disagree.
+///
+/// This is the THIRD roster bucket, alongside `CATALOGS` and `UNPORTED`, and `account_for_roster`
+/// consults all three. The other 34 catalogs are affected by the same upstream change and are
+/// deliberately NOT here (XAI_5 is the ledger entry that defers them).
+const LIVE_CATALOGS: &[live_catalog::LiveCatalogSpec] = &[live_catalog::LiveCatalogSpec {
+    file: "xai",
+    provider: "xai",
+    url: "https://pi.dev/api/models/providers/xai",
+    module: "packages/ai/src/providers/xai.models.ts",
+    item: "XAI_1",
+}];
 
 const fn spec(name: &'static str) -> CatalogSpec {
     CatalogSpec {
@@ -617,7 +642,21 @@ fn run_gen_catalogs() -> Result<(), String> {
     if let Some(rev) = args.roster.clone() {
         return run_roster(&args, &rev);
     }
-    let generated = generate_all(&args)?;
+
+    // Live catalogs FIRST: the manifest carries their provenance, so it has to be built after them.
+    let live = live_catalog::refresh(LIVE_CATALOGS, &live_catalog::fetch_with_curl)?;
+    for (spec, outcome) in &live {
+        if let live_catalog::LiveOutcome::Skipped { why } = outcome {
+            // Non-fatal, exactly like the UNPORTED table's "declare and skip cleanly" precedent:
+            // `<file>.json` and its manifest entry are left byte-for-byte as they are.
+            println!(
+                "gen-catalogs: {}.json left unchanged — live fetch skipped ({why})",
+                spec.file
+            );
+        }
+    }
+
+    let generated = generate_all(&args, &live)?;
 
     if args.diff {
         return report_diff(&args, &generated);
@@ -656,10 +695,12 @@ fn run_gen_catalogs() -> Result<(), String> {
     }
 
     println!(
-        "gen-catalogs: wrote {} of {} files from pi@{}",
+        "gen-catalogs: wrote {} of {} files — {} from pi@{}, {} live",
         differing.len(),
         generated.len(),
-        args.rev
+        CATALOGS.len(),
+        args.rev,
+        LIVE_CATALOGS.len()
     );
     for name in &differing {
         println!("  updated {name}");
@@ -674,6 +715,8 @@ fn run_gen_catalogs() -> Result<(), String> {
 struct Roster {
     /// Modules [`CATALOGS`] generates a catalog from, in upstream order.
     embedded: Vec<&'static CatalogSpec>,
+    /// Modules [`LIVE_CATALOGS`] fetches live instead (XAI_1) — the third roster bucket.
+    live: Vec<&'static live_catalog::LiveCatalogSpec>,
     /// [`UNPORTED`] entries pi ships at this revision.
     unported_present: Vec<&'static Unported>,
     /// [`UNPORTED`] entries pi does **not** ship at this revision — the four DRIFT-009 modules
@@ -686,12 +729,14 @@ struct Roster {
 ///
 /// Pure so the accounting is testable without a pi checkout: the shell ([`run_roster`]) owns the
 /// `git ls-tree` and this owns the decision. Two conditions are hard errors, and both are silent
-/// today: a module pi ships that neither table names (a provider appeared and no catalog was
-/// filed — DRIFT-009's original failure), and a [`CATALOGS`] entry pi no longer ships (cyrup would
-/// keep embedding a retired provider, and a plain `gen-catalogs` run would fail far less legibly,
-/// on a missing `git show`).
+/// today: a module pi ships that none of the three tables names (a provider appeared and no
+/// catalog was filed — DRIFT-009's original failure), and a [`CATALOGS`] or [`LIVE_CATALOGS`]
+/// entry pi no longer ships (cyrup would keep embedding — or fetching — a retired provider, and a
+/// plain `gen-catalogs` run would fail far less legibly, on a missing `git show` or a 404 from the
+/// live endpoint).
 fn account_for_roster(upstream_stems: &[String]) -> Result<Roster, String> {
     let mut embedded = Vec::new();
+    let mut live = Vec::new();
     let mut unported_present = Vec::new();
     let mut unaccounted = Vec::new();
 
@@ -701,6 +746,8 @@ fn account_for_roster(upstream_stems: &[String]) -> Result<Roster, String> {
             .find(|c| c.images_provider.is_none() && c.file == stem)
         {
             embedded.push(spec);
+        } else if let Some(l) = LIVE_CATALOGS.iter().find(|l| l.file == stem) {
+            live.push(l);
         } else if let Some(u) = UNPORTED.iter().find(|u| u.stem == stem) {
             unported_present.push(u);
         } else {
@@ -711,7 +758,8 @@ fn account_for_roster(upstream_stems: &[String]) -> Result<Roster, String> {
         return Err(format!(
             "pi ships {} provider module(s) this generator has never heard of: {}. Each one is a \
              catalog cyrup does not embed. File it, then add it to CATALOGS (if its rows are \
-             extractable) or to UNPORTED with the ledger item that owns the absence — a roster \
+             extractable from a pinned revision), to LIVE_CATALOGS (if the rows must instead be \
+             fetched live), or to UNPORTED with the ledger item that owns the absence — a roster \
              that cannot disagree with the tree is how DRIFT-009 went four catalogs stale.",
             unaccounted.len(),
             unaccounted.join(", ")
@@ -722,13 +770,15 @@ fn account_for_roster(upstream_stems: &[String]) -> Result<Roster, String> {
         .iter()
         .filter(|c| c.images_provider.is_none())
         .map(|c| c.file)
+        .chain(LIVE_CATALOGS.iter().map(|l| l.file))
         .filter(|file| !upstream_stems.iter().any(|s| s == file))
         .collect();
     if !retired.is_empty() {
         return Err(format!(
-            "CATALOGS generates {} catalog(s) pi does not ship at this revision: {}. Either the \
-             revision is older than the port (expected for --rev b0c2a90e, not for a tag) or \
-             upstream retired the provider and the embedded catalog must be retired with it.",
+            "CATALOGS/LIVE_CATALOGS generate {} catalog(s) pi does not ship at this revision: {}. \
+             Either the revision is older than the port (expected for --rev b0c2a90e, not for a \
+             tag) or upstream retired the provider and the embedded (or live) catalog must be \
+             retired with it.",
             retired.len(),
             retired.join(", ")
         ));
@@ -740,6 +790,7 @@ fn account_for_roster(upstream_stems: &[String]) -> Result<Roster, String> {
         .collect();
     Ok(Roster {
         embedded,
+        live,
         unported_present,
         unported_absent,
     })
@@ -811,12 +862,16 @@ fn run_roster(args: &Args, rev: &str) -> Result<(), String> {
     }
 
     println!(
-        "gen-catalogs --roster {rev}: {} provider module(s) upstream — {} embedded, {} accounted \
-         for as unported",
+        "gen-catalogs --roster {rev}: {} provider module(s) upstream — {} embedded, {} \
+         live-fetched, {} accounted for as unported",
         stems.len(),
         roster.embedded.len(),
+        roster.live.len(),
         roster.unported_present.len()
     );
+    for l in &roster.live {
+        println!("  live-fetched {} — {} — {}", l.file, l.item, l.url);
+    }
     for u in &roster.unported_present {
         let reason = match u.reason {
             UnportedReason::HandPorted => "hand-ported",
@@ -842,7 +897,10 @@ fn catalog_path(out: &Path, name: &str) -> PathBuf {
 }
 
 /// Generate every catalog body plus the manifest, in a stable order.
-fn generate_all(args: &Args) -> Result<Vec<(String, String)>, String> {
+fn generate_all(
+    args: &Args,
+    live: &[(&'static live_catalog::LiveCatalogSpec, live_catalog::LiveOutcome)],
+) -> Result<Vec<(String, String)>, String> {
     let mut out = Vec::new();
     for spec in CATALOGS {
         let src = git_show(
@@ -856,10 +914,12 @@ fn generate_all(args: &Args) -> Result<Vec<(String, String)>, String> {
         body.push('\n');
         out.push((spec.file.to_string(), body));
     }
-    out.push((
-        "catalog_manifest".to_string(),
-        manifest_json(args, out.len()),
-    ));
+    for (spec, outcome) in live {
+        if let live_catalog::LiveOutcome::Fetched { body, .. } = outcome {
+            out.push((spec.file.to_string(), body.clone()));
+        }
+    }
+    out.push(("catalog_manifest".to_string(), manifest_json(args, live)?));
     Ok(out)
 }
 
@@ -959,11 +1019,16 @@ fn git_show(pi: &Path, rev: &str, path: &str) -> Result<String, String> {
 /// The regenerated `catalog_manifest.json`.
 ///
 /// PROV-060 asked for a **per-provider** revision map so that a provenance split can never again be
-/// described by one value. After this generator runs there is no split — every catalog comes from
-/// one revision — but the map is emitted anyway, because the absence of a split is exactly the
-/// claim that needs to be machine-checkable.
-fn manifest_json(args: &Args, catalog_count: usize) -> String {
+/// described by one value. Since XAI_1 there IS a split — 34 catalogs from one pinned revision, one
+/// (`xai`) fetched live — and the map is what makes it machine-checkable instead of prose.
+fn manifest_json(
+    args: &Args,
+    live: &[(&'static live_catalog::LiveCatalogSpec, live_catalog::LiveOutcome)],
+) -> Result<String, String> {
     let source = format!("pi@{}", args.rev);
+    let pinned_count = CATALOGS.len();
+    let live_count = LIVE_CATALOGS.len();
+    let catalog_count = pinned_count + live_count; // D5 — must stay 35
     let generated_at = if args.rev == DEFAULT_REV {
         DEFAULT_REV_TIMESTAMP.to_string()
     } else {
@@ -996,24 +1061,33 @@ fn manifest_json(args: &Args, catalog_count: usize) -> String {
     let note = format!(
         "Machine-readable counterpart of the provenance prose in src/tests/catalog_data.rs. All \
          {catalog_count} embedded catalogs under providers/catalog/*.json are generated by \
-         `cargo run -p xtask -- gen-catalogs` from a SINGLE pi revision — {source} \
-         ({generated_at}) — so `generatedAt` and `source` describe every file, and `catalogs` below \
-         records the per-provider source module so a future split cannot be hidden behind one value \
-         (PROV-060). Re-run `cargo run -p xtask -- gen-catalogs --check` to prove it. `generatedAt` \
-         is the staleness floor for the pi.dev overlay (DRIFT-007): a persisted remote catalog whose \
-         Last-Modified is not strictly newer than this is discarded whole, so upgrading cyrup can \
-         never leave a pre-upgrade overlay shadowing freshly refreshed embedded data. PROV-039: the \
-         value must be the LATEST extraction revision. IRREDUCIBLE RESIDUE (PROV-060), stated here \
-         and not only in the ledger: b0c2a90e is 13 days EARLIER than the ported tag v0.83.0 \
-         (2026-07-30). From a9f6a3159 (b0c2a90e's direct child) onward pi gitignores \
-         packages/ai/src/providers/data/ and every *.models.ts is a two-line re-export, so the \
-         catalog data for that 13-day window is not in git at any tag and is NOT measurable from a \
-         checkout. Any claim of catalog parity at v0.83.0 is a claim about b0c2a90e plus an \
-         unbounded delta. EXCEPTIONS: providers/together.rs hand-ports Together's rows as Rust \
-         literals and has no file here; and {delta_count} signed-off ROW divergences from \
-         {source} are carried by the generator's DELTAS table, which is the complete list — \
-         {delta_summary}. KNOWN INCOMPLETENESS in the GPT-5.6 price-cut forward-port, recorded so a \
-         reader does not mistake the current state for a decision: at v0.84.1 upstream applies \
+         `cargo run -p xtask -- gen-catalogs`. {pinned_count} of them come from a SINGLE pinned pi \
+         revision — {source} ({generated_at}) — which is what top-level `generatedAt` and `source` \
+         describe. {live_count} (xai) is fetched LIVE from \
+         https://pi.dev/api/models/providers/xai on every run and carries its own \
+         `fetchedAt`/`revision` under `catalogs` below, because pi's `xai.models.ts` has been a \
+         re-export of gitignored data since a9f6a3159 and NO revision can yield newer rows \
+         (XAI_1). `catalogs` records the per-provider source so that split is machine-checkable \
+         rather than prose (PROV-060) — this is the split that map was built for. Per-provider \
+         `fetchedAt` is the staleness floor for that provider's pi.dev overlay and takes \
+         precedence over the global `generatedAt`; the global value remains the floor for every \
+         other catalog and must not be moved to follow a live fetch, or every other provider's \
+         valid persisted overlay would be discarded. Re-run `cargo run -p xtask -- gen-catalogs \
+         --check` to prove it. `generatedAt` is the staleness floor for the pi.dev overlay \
+         (DRIFT-007): a persisted remote catalog whose Last-Modified is not strictly newer than \
+         this is discarded whole, so upgrading cyrup can never leave a pre-upgrade overlay \
+         shadowing freshly refreshed embedded data. PROV-039: the value must be the LATEST \
+         extraction revision. IRREDUCIBLE RESIDUE (PROV-060), stated here and not only in the \
+         ledger: b0c2a90e is 13 days EARLIER than the ported tag v0.83.0 (2026-07-30). From \
+         a9f6a3159 (b0c2a90e's direct child) onward pi gitignores packages/ai/src/providers/data/ \
+         and every *.models.ts is a two-line re-export, so the catalog data for that 13-day window \
+         is not in git at any tag and is NOT measurable from a checkout. Any claim of catalog \
+         parity at v0.83.0 is a claim about b0c2a90e plus an unbounded delta. EXCEPTIONS: \
+         providers/together.rs hand-ports Together's rows as Rust literals and has no file here; \
+         and {delta_count} signed-off ROW divergences from {source} are carried by the \
+         generator's DELTAS table, which is the complete list — {delta_summary}. KNOWN \
+         INCOMPLETENESS in the GPT-5.6 price-cut forward-port, recorded so a reader does not \
+         mistake the current state for a decision: at v0.84.1 upstream applies \
          OPENAI_GPT_56_STANDARD_COSTS to FOUR provider families — openai, the derived azure clone, \
          openai-codex, and cloudflare-ai-gateway ('Cloudflare AI Gateway passes OpenAI usage through \
          at OpenAI list prices', ai/scripts/generate-models.ts:2311-2315 @v0.84.1) — but cyrup \
@@ -1036,6 +1110,30 @@ fn manifest_json(args: &Args, catalog_count: usize) -> String {
             ]),
         ));
     }
+    for (spec, outcome) in live {
+        let (fetched_at, revision) = match outcome {
+            live_catalog::LiveOutcome::Fetched {
+                fetched_at,
+                revision,
+                ..
+            } => (
+                fetched_at.clone().map_or(Val::Null, Val::Str),
+                revision.clone().map_or(Val::Null, Val::Str),
+            ),
+            // D6 — a failed fetch must not revert provenance to a revision the data does not sit
+            // on: carry the previous manifest's entry forward instead.
+            live_catalog::LiveOutcome::Skipped { .. } => carry_forward(&args.out, spec.file),
+        };
+        catalogs.push((
+            spec.file.to_string(),
+            Val::Obj(vec![
+                ("source".to_string(), Val::Str(spec.url.to_string())),
+                ("module".to_string(), Val::Str(spec.module.to_string())), // D7
+                ("fetchedAt".to_string(), fetched_at),
+                ("revision".to_string(), revision),
+            ]),
+        ));
+    }
 
     let manifest = Val::Obj(vec![
         ("generatedAt".to_string(), Val::Str(generated_at)),
@@ -1045,7 +1143,31 @@ fn manifest_json(args: &Args, catalog_count: usize) -> String {
     ]);
     let mut body = manifest.to_json();
     body.push('\n');
-    body
+    Ok(body)
+}
+
+/// A live catalog's manifest provenance, carried forward from the manifest already on disk when
+/// its fetch is skipped (D6) — NEVER reverted to `pi@b0c2a90e`, which is a revision the live data
+/// never sat on. Never fails the run: a missing file, unreadable JSON, or no entry for `file` all
+/// degrade to `(Val::Null, Val::Null)`, exactly the shape a first-ever run (no manifest yet on
+/// disk) would produce.
+fn carry_forward(out_dir: &Path, file: &str) -> (Val, Val) {
+    let previous = std::fs::read_to_string(catalog_path(out_dir, "catalog_manifest"))
+        .ok()
+        .and_then(|src| tsdata::parse_json(&src).ok());
+    let entry = previous
+        .as_ref()
+        .and_then(|doc| doc.get("catalogs"))
+        .and_then(|catalogs| catalogs.get(file));
+    let fetched_at = entry
+        .and_then(|e| e.get("fetchedAt"))
+        .cloned()
+        .unwrap_or(Val::Null);
+    let revision = entry
+        .and_then(|e| e.get("revision"))
+        .cloned()
+        .unwrap_or(Val::Null);
+    (fetched_at, revision)
 }
 
 fn git_show_commit_date(pi: &Path, rev: &str) -> Result<String, String> {
@@ -1280,7 +1402,12 @@ mod tests {
     /// provider (or a new cyrup catalog) forces somebody to look here.
     #[test]
     fn the_catalog_roster_is_the_35_embedded_files() {
-        assert_eq!(CATALOGS.len(), 35);
+        assert_eq!(CATALOGS.len(), 34, "xai moved to LIVE_CATALOGS (XAI_1)");
+        assert_eq!(
+            CATALOGS.len() + LIVE_CATALOGS.len(),
+            35,
+            "the roster is 35 total across the two tables"
+        );
         let images: Vec<&str> = CATALOGS
             .iter()
             .filter(|c| c.images_provider.is_some())
@@ -1291,13 +1418,18 @@ mod tests {
 
     #[test]
     fn module_paths_default_to_the_provider_models_module() {
-        let xai = CATALOGS.iter().find(|c| c.file == "xai").unwrap();
-        assert_eq!(xai.module_path(), "providers/xai.models.ts");
+        // `xai` moved to `LIVE_CATALOGS` (XAI_1); `zai` is an arbitrary other `spec(..)` entry
+        // that still defaults its module path from its own file stem.
+        let zai = CATALOGS.iter().find(|c| c.file == "zai").unwrap();
+        assert_eq!(zai.module_path(), "providers/zai.models.ts");
         let img = CATALOGS
             .iter()
             .find(|c| c.file == "openrouter-images")
             .unwrap();
         assert_eq!(img.module_path(), "image-models.generated.ts");
+
+        let xai = LIVE_CATALOGS.iter().find(|l| l.file == "xai").unwrap();
+        assert_eq!(xai.module, "packages/ai/src/providers/xai.models.ts");
     }
 
     /// A signed-off divergence that upstream has already dropped is a no-op nobody would be told
@@ -1478,7 +1610,9 @@ mod tests {
         let stems = upstream_stems_at_v0_84_4();
         assert_eq!(stems.len(), 39);
         let roster = account_for_roster(&stems).unwrap();
-        assert_eq!(roster.embedded.len(), 34);
+        assert_eq!(roster.embedded.len(), 33, "xai moved to LIVE_CATALOGS (XAI_1)");
+        assert_eq!(roster.live.len(), 1);
+        assert_eq!(roster.live[0].file, "xai");
         assert!(roster.unported_absent.is_empty());
 
         let mut blocked: Vec<&str> = roster
@@ -1515,7 +1649,8 @@ mod tests {
             .collect();
         assert_eq!(stems.len(), 35);
         let roster = account_for_roster(&stems).unwrap();
-        assert_eq!(roster.embedded.len(), 34);
+        assert_eq!(roster.embedded.len(), 33, "xai moved to LIVE_CATALOGS (XAI_1)");
+        assert_eq!(roster.live.len(), 1);
         assert_eq!(roster.unported_present.len(), 1);
         assert_eq!(roster.unported_absent.len(), 4);
     }
@@ -1543,7 +1678,8 @@ mod tests {
         assert!(err.contains("does not ship"), "{err}");
     }
 
-    /// A stem in both tables would make the accounting ambiguous and hide whichever branch lost.
+    /// A stem in more than one table would make the accounting ambiguous and hide whichever
+    /// branch lost. Three tables now that `LIVE_CATALOGS` exists (XAI_1), so the check is pairwise.
     #[test]
     fn the_two_roster_tables_are_disjoint() {
         for u in UNPORTED {
@@ -1553,6 +1689,20 @@ mod tests {
                     .any(|c| c.images_provider.is_none() && c.file == u.stem),
                 "{} is in both CATALOGS and UNPORTED",
                 u.stem
+            );
+            assert!(
+                !LIVE_CATALOGS.iter().any(|l| l.file == u.stem),
+                "{} is in both LIVE_CATALOGS and UNPORTED",
+                u.stem
+            );
+        }
+        for l in LIVE_CATALOGS {
+            assert!(
+                !CATALOGS
+                    .iter()
+                    .any(|c| c.images_provider.is_none() && c.file == l.file),
+                "{} is in both CATALOGS and LIVE_CATALOGS",
+                l.file
             );
         }
     }

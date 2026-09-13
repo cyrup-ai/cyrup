@@ -376,6 +376,35 @@ pub async fn result_payload_path_for_session_run(
     )
 }
 
+/// The STAGED payload path for a session/run, skipping the index entirely.
+///
+/// pi `fallbackResultPayloadPathForSessionRun` (`result-files.ts:300-304`). Distinct from
+/// [`result_payload_path_for_session_run`], which consults the index FIRST: this is the recovery
+/// path for a caller whose index read failed with a permission fault
+/// (`wait-completions.ts:175-184`), where the staged location is still reachable because it is
+/// addressed directly rather than through the unreadable index directory.
+///
+/// Upstream's variant asserts the payload match through `assertPendingResultPayloadMatches`
+/// (`result-files.ts:254-257`), which lets a read fault throw; cyrup reuses the swallowing
+/// [`pending_result_location`] — and therefore `pending_payload_matches` (`locate.rs:288`) — so an
+/// unreadable staged file degrades to "no fallback path" rather than to a second error on the
+/// recovery path. That is the better behaviour on a path that exists *because* the first read
+/// faulted, and it is the only observable difference from upstream.
+///
+/// Returns a plain [`PathBuf`], never a [`ConsumablePayload`]: this is a READ address for a wait,
+/// and a wait must never be able to destroy a payload the watcher still owns.
+#[must_use = "the recovered path is the whole point of calling this"]
+pub async fn fallback_result_payload_path_for_session_run(
+    results_dir: &Path,
+    session_id: &SessionId,
+    run_id: &RunId,
+) -> Option<PathBuf> {
+    let file = ResultFileName::for_run(run_id);
+    pending_result_location(results_dir, session_id, run_id, &file)
+        .await
+        .map(|location| location.path)
+}
+
 /// The payload path for a run known only by id, via the run index.
 ///
 /// pi `resultPayloadPathForIndexedRun` (`result-files.ts:352-372`), including its self-healing

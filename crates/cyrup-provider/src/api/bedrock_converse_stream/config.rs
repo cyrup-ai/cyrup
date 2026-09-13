@@ -1,11 +1,11 @@
 //! Client configuration (pi `bedrock-converse-stream.ts:136-220`).
 
-use super::env::EnvSource;
 use super::options::BedrockOptions;
 use super::url::url_host;
 use crate::auth::AuthResult;
 use crate::model::Model;
 use crate::stream::StreamOptions;
+use crate::utils::provider_plumbing::EnvSource;
 
 /// The dummy credential pair upstream installs when `AWS_BEDROCK_SKIP_AUTH=1`
 /// (`bedrock-converse-stream.ts:186-189`).

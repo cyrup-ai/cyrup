@@ -22,13 +22,13 @@ use super::params::*;
 use super::transform::*;
 use crate::api::channel;
 use crate::api::compat::{DeferredToolsMode, ModelCompat, get_compat};
-use crate::auth::{AuthResult, ModelAuth};
+use crate::auth::{AuthResult, ModelAuth, ProviderEnv};
 use crate::context::{Context, ToolDef};
 use crate::model::{Modality, Model, ModelCost};
 use crate::stream::sse::decode_sse_bytes;
 use crate::stream::{CacheRetention, StreamEvent, StreamOptions};
 use crate::utils::hash::short_hash;
-use crate::utils::provider_plumbing::resolve_cache_retention;
+use crate::utils::provider_plumbing::{EnvSource, resolve_cache_retention};
 use cyrup_core::{
     ApiId, AssistantMessage, Content, Message, ModelThinkingLevel, StopReason, ToolCall,
     ToolCallId, Usage,
@@ -57,6 +57,15 @@ fn model() -> Model {
         thinking_level_map: None,
         compat: None,
         headers: None,
+    }
+}
+
+/// An `EnvSource` with an explicit (possibly empty) ambient map, so no test can be influenced by
+/// the developer's shell (mirrors `bedrock_converse_stream::tests::env_source`).
+fn env_source<'a>(overlay: Option<&'a ProviderEnv>, ambient: &'a ProviderEnv) -> EnvSource<'a> {
+    EnvSource {
+        overlay,
+        ambient: Some(ambient),
     }
 }
 

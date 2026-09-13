@@ -60,6 +60,40 @@ pub(crate) struct ForegroundControlEntry {
     /// on every control-event activity-state transition, which is the only liveness signal cyrup's
     /// foreground registry observes.
     pub(crate) updated_at: i64,
+    /// pi `ForegroundRunControl.sessionId` (`shared/types.ts:2145-2146`), whose own comment is
+    /// *"required for public fleet projection"*. The gate key WORKFLOW_11's S6 filter and
+    /// `fleet-view.ts:404` both read. `Option<SessionId>`, NEVER `Option<String>`: the whole
+    /// session-partitioning programme exists because an opaque token compared as a raw string is
+    /// how two instances consume each other's runs (`identity/session_id.rs`).
+    pub(crate) session_id: Option<crate::identity::SessionId>,
+    /// pi `ForegroundRunControl.parentWorkflowRunId` (`:2141-2142`) — the workflow shell that owns
+    /// this live child. `None` for a plain foreground run; `Some` only for a child launched by
+    /// `WorkflowRunHost::launch`. This is `controlIsLiveInWorkflow`'s first term
+    /// (`workflow-foreground-steering.ts:32-35`) and S6's filter key (`run-status.ts:611`).
+    pub(crate) parent_workflow_run_id: Option<RunId>,
+    /// pi `ForegroundRunControl.workflowKey` (`:2143-2144`) — the stable lane key this child was
+    /// launched under. Typed, like every other key read in this crate, so a malformed value cannot
+    /// enter through this door (`workflows/key.rs`: no `Deserialize` derive, `parse` is the only
+    /// constructor).
+    pub(crate) workflow_key: Option<crate::workflows::WorkflowKey>,
+    /// pi `ForegroundRunControl.cwd` (`:2150-2151`) — the effective working directory live
+    /// transcript artifacts resolve against (`fleet.ts:344`). Carried on the ENTRY rather than
+    /// re-derived by each reader, which is what `fleet_state` does today (`status.rs:231`) and is
+    /// wrong the moment a workflow child runs in a different cwd from the tool call.
+    pub(crate) cwd: Option<std::path::PathBuf>,
+    /// pi `ForegroundRunControl.sessionName` (`:2153-2154`) — the child session's display name.
+    /// Synced up from the live child by `sync_current_child` exactly as upstream does
+    /// (`foreground-control.ts:41`), never written directly.
+    pub(crate) session_name: Option<String>,
+    /// pi `ForegroundRunControl.activeChildren` (`:2173-2174`) — the live children this run is
+    /// independently tracking. A `BTreeMap`, not a `HashMap`: every upstream reader sorts the keys
+    /// before use (`run-status.ts:689`, `workflow-foreground-steering.ts:135`, `fleet.ts:223`), and
+    /// an ordered map makes that sort a no-op instead of a per-render allocation.
+    ///
+    /// `.is_empty()` is the predicate WORKFLOW_7/WORKFLOW_11 gate on — pi's
+    /// `(control.activeChildren?.size ?? 0) > 0`.
+    pub(crate) active_children:
+        std::collections::BTreeMap<usize, crate::extension::executor::foreground_control::ForegroundChildEntry>,
 }
 
 /// How long [`ForegroundControlNotifier::flush`] waits for the notice pump to acknowledge that it
@@ -313,33 +347,23 @@ impl SubagentExecutor {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(entry) = controls.get_mut(run_id.as_str()) {
-                    entry.current_activity_state = Some(event.to);
-                    // The SAME write also refreshes the run's live telemetry: pi's control record
-                    // carries `currentTool`/`currentPath`/`turnCount`/`toolCount`/`tokens`
-                    // (`shared/types.ts:1510-1523`) and the fleet roster renders all five
-                    // (`fleet.ts:252-255,399-404`). Every one of them already rides on the control
-                    // event; leaving them unread is what made the live rows show a name and nothing
-                    // else. `None` on an event never clobbers a value a previous event supplied —
-                    // a control event reports what it observed, not a full snapshot.
-                    if event.current_tool.is_some() {
-                        entry.current_tool = event.current_tool.clone();
-                    }
-                    if event.current_path.is_some() {
-                        entry.current_path = event.current_path.clone();
-                    }
-                    if let Some(turns) = event.turns {
-                        entry.turn_count = Some(turns);
-                    }
-                    if let Some(tools) = event.tool_count {
-                        entry.tool_count = Some(u64::from(tools));
-                    }
-                    if let Some(tokens) = event.tokens {
-                        entry.tokens = Some(tokens);
-                    }
-                    // pi `control.updatedAt = Date.now()` alongside the activity write
-                    // (`subagent-executor.ts:549-570` @v0.43.0) — the FleetView's newest-first sort
-                    // key (`fleet.ts:142`).
-                    entry.updated_at = crate::time::now_epoch_millis();
+                    // WORKFLOW_6 §1.2 — fold telemetry onto the CHILD and sync the entry's
+                    // current-child view up from it, rather than writing the entry's fields
+                    // directly. `entry.current_tool`/`current_path`/`turn_count`/`tool_count`/
+                    // `tokens` (`fleet.ts:252-255,399-404`) and `entry.updated_at` (the
+                    // FleetView's newest-first sort key, `fleet.ts:142`) end up identical to the
+                    // pre-WORKFLOW_6 direct writes while there is one child; correct once there is
+                    // more than one. `None` on an event never clobbers a value a previous event
+                    // supplied — a control event reports what it observed, not a full snapshot —
+                    // which `update_foreground_child` preserves verbatim. A cyrup foreground SINGLE
+                    // run's only child is always flat index 0; `event.index` is honoured anyway so
+                    // a future PARALLEL/CHAIN control registration needs no change here.
+                    let child_index = event.index.map(|i| i as usize).unwrap_or(0);
+                    crate::extension::executor::foreground_control::update_foreground_child(
+                        entry,
+                        child_index,
+                        event,
+                    );
                 }
             }
             // (3) the `notifyChannels.includes("event")` CHANNEL gate (`:521`). `shouldNotifyControlEvent`
@@ -418,6 +442,13 @@ impl SubagentExecutor {
             // both now hang off a `CompositeCompletionObserver` in the same registration order.
             Some(Arc::new(
                 crate::background::watch::CompositeCompletionObserver::new(vec![
+                    // MUST run first: this is pi's own recording position
+                    // (`result-watcher.ts:428-435`, before the unlink), and it must also precede
+                    // the completion bus below so a `wait` that wakes on the bus publish finds the
+                    // record already there — registering the bus first would let a wait wake, look,
+                    // and find nothing (`background::wait_completions::WaitCompletionStore`'s own
+                    // doc has the full ordering argument).
+                    self.wait_completions(),
                     // pi `asyncCompleteHandler`'s third subscriber (`extension/index.ts:655`):
                     // `syncMissionFromAsyncCompletion(payload)`. A background run that carries a
                     // `mission.json` binding gets its mission reconciled the moment its result file is
@@ -589,6 +620,12 @@ mod tests {
                     tokens: None,
                     started_at: crate::time::now_epoch_millis(),
                     updated_at: crate::time::now_epoch_millis(),
+                    session_id: None,
+                    parent_workflow_run_id: None,
+                    workflow_key: None,
+                    cwd: None,
+                    session_name: None,
+                    active_children: std::collections::BTreeMap::new(),
                 },
             );
         }
@@ -673,6 +710,12 @@ mod tests {
                     tokens: None,
                     started_at: crate::time::now_epoch_millis(),
                     updated_at: crate::time::now_epoch_millis(),
+                    session_id: None,
+                    parent_workflow_run_id: None,
+                    workflow_key: None,
+                    cwd: None,
+                    session_name: None,
+                    active_children: std::collections::BTreeMap::new(),
                 },
             );
         }
@@ -1099,6 +1142,12 @@ mod tests {
                     tokens: None,
                     started_at: crate::time::now_epoch_millis(),
                     updated_at: crate::time::now_epoch_millis(),
+                    session_id: None,
+                    parent_workflow_run_id: None,
+                    workflow_key: None,
+                    cwd: None,
+                    session_name: None,
+                    active_children: std::collections::BTreeMap::new(),
                 },
             );
         }

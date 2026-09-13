@@ -640,7 +640,7 @@ impl ExtensionHost {
     }
 
     /// [`Self::active_tools`] under the session's tool selection, delegating to
-    /// [`crate::registry::Registry::active_tools_filtered`] — pi `_refreshToolRegistry`'s
+    /// [`crate::registry::ExtensionRegistry::active_tools_filtered`] — pi `_refreshToolRegistry`'s
     /// `isAllowedTool` applied to `allCustomTools` (`agent-session.ts:2676-2686` @v0.83.0), i.e. to
     /// the EXTENSION and SDK tools and not only to the built-ins. Regression #2835.
     ///

@@ -295,6 +295,14 @@ fn terminal_status_from_result(result: &ResultFile, pid: Option<u32>) -> RunStat
         // real terminal outcome, so the display-only dismissal marker must NOT survive it. This
         // constructor builds the record from scratch, so the marker is simply never set.
         display_dismissed_at: None,
+        // WORKFLOW_3 §3b: no run-level error/tool-call-id survives outside a `RunStatus` this
+        // build never wrote, but `workflow_children`/`workflow_receipt_path` ARE recorded on the
+        // authoritative `ResultFile` itself — carried through the repair for the same reason
+        // `cwd`/`session_file` are, immediately above.
+        error: None,
+        tool_call_id: None,
+        workflow_children: result.workflow_children.clone(),
+        workflow_receipt_path: result.workflow_receipt.as_ref().map(|r| r.path.clone()),
         telemetry: crate::background::RunTelemetry::default(),
     }
 }
@@ -866,10 +874,10 @@ pub enum StopOutcome {
 /// # The range claim above is now true; it was not
 ///
 /// This doc declared the `:24-86` span while the port carried `:41` (cited three times), `:47`,
-/// `:48-68` and `:75` — and silently omitted `:34`, the session gate, seven lines above the state
-/// guard. Because `async_root` is per-cwd, that single missing branch let any cyrup instance stop
-/// any other instance's run given only its id, which every listing hands out. The gate is now
-/// applied below, before the state guard and before any request is written.
+/// `:48-68`, `:69-73` and `:75` — and silently omitted `:34`, the session gate, seven lines above
+/// the state guard. Because `async_root` is per-cwd, that single missing branch let any cyrup
+/// instance stop any other instance's run given only its id, which every listing hands out. The
+/// gate is now applied below, before the state guard and before any request is written.
 ///
 /// A range claim in a doc comment is a testable assertion. If you widen one, port every branch
 /// inside it or narrow the claim.
@@ -934,6 +942,7 @@ pub async fn stop(
 
     let Some(child_id) = child_id else {
         deliver_stop_request(&paths.run_dir, source, reason).await?;
+        clear_stopped_run_activity(&paths, status).await;
         return Ok(StopOutcome::Requested);
     };
 
@@ -954,7 +963,27 @@ pub async fn stop(
     let mut request = StopRequest::for_child(source, child.index, Some(child.id.clone()));
     request.reason = reason;
     request_async_stop(&paths.run_dir, request).await?;
+    clear_stopped_run_activity(&paths, status).await;
     Ok(StopOutcome::ChildRequested { child_id: child.id })
+}
+
+/// pi `async-stop-action.ts:69-73`: once a stop request is on disk the run's live activity flag is
+/// a lie — a `needs_attention`/`active_long_running` notice for a run that is being torn down is
+/// the one notice the user can do nothing about. Upstream drops it off the in-memory `asyncJobs`
+/// record; cyrup's tracker holds no such field (`tracker.rs:99` — it reads status from disk), so
+/// the carrier is the same pair [`crate::background::child_stop::mark_child_stop_requested`] uses
+/// one file over: `telemetry.activity_state` + `last_update`.
+///
+/// Best-effort by construction: the stop request is already durably written and IS the stop. A
+/// failed status rewrite must never turn a delivered stop into an error, exactly as upstream's
+/// `if (tracked)` silently does nothing when the job is untracked.
+async fn clear_stopped_run_activity(paths: &RunPaths, mut status: RunStatus) {
+    if status.telemetry.activity_state.is_none() {
+        return; // nothing to clear; do not rewrite status.json for a no-op
+    }
+    status.telemetry.activity_state = None;
+    status.last_update = crate::time::now_epoch_millis();
+    let _ = write_atomic_json(&paths.status, &status).await;
 }
 
 /// Parent side, addressed by run DIRECTORY: atomically write an [`InterruptRequest`] into
@@ -1209,7 +1238,7 @@ pub async fn write_steer_request_to_dir(
 ///
 /// `Relaxed` is sufficient: the only requirement is that each caller gets a distinct, increasing
 /// value, which `fetch_add` guarantees on its own — no other memory is being published through it.
-fn next_steer_request_id() -> String {
+pub(crate) fn next_steer_request_id() -> String {
     static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     format!("{seq:016x}-{}", uuid::Uuid::new_v4().as_simple())
@@ -2151,8 +2180,15 @@ pub enum ResumeOutcome {
 
 /// Resolves a `resume` request against the run identified by `run_id_token` (R-SA-079/085/086).
 ///
-/// Runs the R-SA-079 reconciliation gate first, then dispatches on the reconciled overall
-/// `state`:
+/// Runs the R-SA-079 reconciliation gate first, then the S4 session-membership gate (pi
+/// `async-resume.ts:477`, reached from `async-steering-action.ts:203`'s `{ sessionId:
+/// input.state.currentSessionId ?? undefined }`) — see [`resume_session_gate_admits`] for the
+/// two-term disjunction it applies — BEFORE dispatching on the reconciled overall `state`, so a
+/// foreign run is refused as foreign and never as `stopped` or no-transcript. PERMISSIVE, like
+/// `stop`/`interrupt`/`steer`: a headless or SDK host with no session identity of its own still
+/// resumes its own runs.
+///
+/// Then dispatches on the reconciled overall `state`:
 ///
 /// - **`Running`** (R-SA-086): resolves exactly one running step — `requested_step_index` if
 ///   given (and that step is genuinely `Running`), or auto-selected as the single running step if
@@ -2180,18 +2216,35 @@ pub enum ResumeOutcome {
 /// # Errors
 ///
 /// Returns [`SubagentError::UnsafePathToken`] for an unsafe `run_id_token`,
-/// [`SubagentError::ResumeNoTranscript`] per the terminal-revival contract above,
-/// [`SubagentError::AgentNotFound`] if `requested_step_index` (or the Running-branch auto-
-/// selection) does not resolve to a genuinely running step, or a wrapped I/O error from the
-/// reconciliation read.
+/// [`SubagentError::ResumeNotInActiveSession`] when `current_session` is set and disagrees with
+/// both the reconciled status's session and (when the status carries none) the terminal
+/// [`super::ResultFile`]'s own, [`SubagentError::ResumeNoTranscript`] per the terminal-revival
+/// contract above, [`SubagentError::AgentNotFound`] if `requested_step_index` (or the
+/// Running-branch auto-selection) does not resolve to a genuinely running step, or a wrapped I/O
+/// error from the reconciliation read.
 pub async fn resume(
     async_root: &Path,
     results_dir: &Path,
     run_id_token: &str,
     requested_step_index: Option<usize>,
+    current_session: Option<&crate::identity::SessionId>,
 ) -> Result<ResumeOutcome, SubagentError> {
     let paths = resolve_run_paths(async_root, results_dir, run_id_token)?;
     let status = reconcile_before_control_op(&paths).await?;
+
+    // S4 — pi `async-resume.ts:477`, reached from `async-steering-action.ts:203`'s `{ sessionId:
+    // input.state.currentSessionId ?? undefined }`.
+    //
+    // PERMISSIVE, like `stop`/`interrupt`/`steer` (`options.sessionId && …`): a headless or SDK
+    // host with no identity of its own still revives its own runs.
+    //
+    // Ordered ahead of EVERY state branch below, matching upstream: a foreign run is refused as
+    // foreign, never as `stopped` or `no-transcript`.
+    if !resume_session_gate_admits(&paths, &status, current_session).await? {
+        return Err(SubagentError::ResumeNotInActiveSession(
+            status.run_id.as_str().to_string(),
+        ));
+    }
 
     if status.state == RunState::Running {
         return resolve_running_selection(&status, requested_step_index);
@@ -2210,6 +2263,34 @@ pub async fn resume(
     }
 
     resolve_terminal_revival(&status, requested_step_index)
+}
+
+/// pi `async-resume.ts:477`'s two-term disjunction, as an admission predicate.
+///
+/// Reads the `ResultFile` only when the status has no session of its own — the normal repair path
+/// in [`reconcile_before_control_op`] PRESERVES `status.session_id`, so the extra read is confined
+/// to the corrupt/foreign-status branch it exists for: `terminal_status_from_result` deliberately
+/// rebuilds a repaired status with `session_id: None`, so a status-only gate would refuse every
+/// corrupt-status revival even for its rightful owner, while the `ResultFile` still carries the
+/// truth.
+async fn resume_session_gate_admits(
+    paths: &RunPaths,
+    status: &RunStatus,
+    current: Option<&crate::identity::SessionId>,
+) -> Result<bool, SubagentError> {
+    use crate::background::delivery::SessionGate;
+    if current.is_none() {
+        return Ok(true); // PERMISSIVE's whole point (`options.sessionId &&`).
+    }
+    if SessionGate::Permissive.admits(current, status.session_id.as_ref()) {
+        return Ok(true);
+    }
+    if status.session_id.is_none()
+        && let Some(result) = read_run_result(paths).await?
+    {
+        return Ok(SessionGate::Permissive.admits(current, result.session_id.as_ref()));
+    }
+    Ok(false)
 }
 
 /// R-SA-086: select exactly one currently-`Running` step to steer, never spawning anything.
@@ -2738,6 +2819,13 @@ pub async fn list_pending_appends(
 // =================================================================================================
 
 /// The observable outcome of one [`poll_root_attachment`] tick.
+///
+/// `clippy::large_enum_variant` is deliberately allowed here, mirroring
+/// `registration::slash_commands`/`spawn::chain_graph`'s own precedent for the identical shape:
+/// `Ready`'s `ResultFile` payload (widened again by WORKFLOW_3's `workflow_children`/
+/// `workflow_receipt` fields) is the whole POINT of this variant, and boxing it would only move
+/// the allocation rather than remove it.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, PartialEq)]
 pub enum AttachmentPoll {
     /// The target run's terminal [`ResultFile`] was found — authoritative, regardless of what its
@@ -3334,151 +3422,6 @@ mod tests {
     // G77 — the `stop` control verb (pi `stopAsyncRun` / `StopRequest` / `consumeStopRequest`)
     // ---------------------------------------------------------------------------------------
 
-    /// `stop` writes a real request file under `control/stop-requests/` for a `Running` run, and
-    /// `consume_stop_request` reads-then-deletes it exactly once (pi `requestAsyncStop` /
-    /// `consumeStopRequestPayload`, `runs/background/control-channel.ts:297-310,615-620` @v0.64.0).
-    /// S4 — the gate pi applies at `async-stop-action.ts:34`, which cyrup's port of that same
-    /// function (`control.rs`'s `:24-86` range claim) previously omitted while porting `:41`,
-    /// `:47`, `:48-68` and `:75`.
-    ///
-    /// `async_root` is per-cwd, so every concurrent instance can address every other instance's
-    /// runs by id — and every listing hands those ids out.
-    #[tokio::test]
-    async fn stop_refuses_a_run_owned_by_another_session_and_writes_nothing() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let async_root = dir.path().join("async");
-        let results_dir = dir.path().join("results");
-        let run_id = RunId::from_token("foreignstop1");
-        let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
-        tokio::fs::create_dir_all(&paths.run_dir)
-            .await
-            .expect("mkdir");
-
-        let mut status =
-            RunStatus::queued(run_id.clone(), RunMode::Single, Some(std::process::id()));
-        status.state = RunState::Running;
-        status.session_id = crate::identity::SessionId::parse("session-OWNER");
-        write_atomic_json(&paths.status, &status)
-            .await
-            .expect("write status");
-
-        let intruder = crate::identity::SessionId::parse("session-INTRUDER");
-        let outcome = stop(
-            &async_root,
-            &results_dir,
-            run_id.as_str(),
-            "stop-action",
-            None,
-            None,
-            intruder.as_ref(),
-        )
-        .await
-        .expect("stop resolves");
-
-        assert_eq!(outcome, StopOutcome::NotInActiveSession);
-        assert!(
-            !has_pending_stop_request(&paths.run_dir).await,
-            "a refused stop must leave ZERO filesystem trace in another session's run directory"
-        );
-
-        // ...and the owner can still stop it.
-        let owner = crate::identity::SessionId::parse("session-OWNER");
-        let outcome = stop(
-            &async_root,
-            &results_dir,
-            run_id.as_str(),
-            "stop-action",
-            None,
-            None,
-            owner.as_ref(),
-        )
-        .await
-        .expect("stop resolves");
-        assert_eq!(outcome, StopOutcome::Requested);
-        assert!(has_pending_stop_request(&paths.run_dir).await);
-    }
-
-    /// The PERMISSIVE half of the class (pi `state.currentSessionId && ...`): a headless host has
-    /// no session identity and must still be able to control its own runs. A strict-ified gate
-    /// would lock SDK embedders out entirely.
-    #[tokio::test]
-    async fn stop_still_works_for_a_host_with_no_session_identity() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let async_root = dir.path().join("async");
-        let results_dir = dir.path().join("results");
-        let run_id = RunId::from_token("headlessstop");
-        let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
-        tokio::fs::create_dir_all(&paths.run_dir)
-            .await
-            .expect("mkdir");
-
-        let mut status =
-            RunStatus::queued(run_id.clone(), RunMode::Single, Some(std::process::id()));
-        status.state = RunState::Running;
-        status.session_id = crate::identity::SessionId::parse("session-ANY");
-        write_atomic_json(&paths.status, &status)
-            .await
-            .expect("write status");
-
-        let outcome = stop(
-            &async_root,
-            &results_dir,
-            run_id.as_str(),
-            "stop-action",
-            None,
-            None,
-            None,
-        )
-        .await
-        .expect("stop resolves");
-        assert_eq!(
-            outcome,
-            StopOutcome::Requested,
-            "a host with no session must not be locked out of control"
-        );
-    }
-
-    /// The same gate on `interrupt`, and the same zero-trace requirement.
-    #[tokio::test]
-    async fn interrupt_refuses_a_run_owned_by_another_session_and_writes_nothing() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let async_root = dir.path().join("async");
-        let results_dir = dir.path().join("results");
-        let run_id = RunId::from_token("foreignintr1");
-        let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
-        tokio::fs::create_dir_all(&paths.run_dir)
-            .await
-            .expect("mkdir");
-
-        let mut status =
-            RunStatus::queued(run_id.clone(), RunMode::Single, Some(std::process::id()));
-        status.state = RunState::Running;
-        status.session_id = crate::identity::SessionId::parse("session-OWNER");
-        write_atomic_json(&paths.status, &status)
-            .await
-            .expect("write status");
-
-        let intruder = crate::identity::SessionId::parse("session-INTRUDER");
-        let outcome = interrupt(
-            &async_root,
-            &results_dir,
-            run_id.as_str(),
-            "interrupt-action",
-            None,
-            intruder.as_ref(),
-        )
-        .await
-        .expect("interrupt resolves");
-
-        assert_eq!(outcome, InterruptOutcome::NotInActiveSession);
-        assert!(
-            !tokio::fs::try_exists(&paths.control_inbox)
-                .await
-                .expect("check"),
-            "a refused interrupt must not write into another session's control inbox"
-        );
-    }
-
     #[tokio::test]
     async fn stop_writes_a_real_stop_request_that_is_consumed_exactly_once() {
         let (_dir, async_root, results_dir) = temp_roots();
@@ -3541,6 +3484,65 @@ mod tests {
                 .await
                 .expect("second consume")
                 .is_none()
+        );
+    }
+
+    /// pi `async-stop-action.ts:69-73` (WORKFLOW_8): once a stop request is on disk the run's live
+    /// activity flag is a lie, and this is the whole-run success arm's half of that contract —
+    /// `stop` must clear `telemetry.activity_state` and bump `last_update` on the SAME record the
+    /// request above was written against, distinct from `stop_with_a_child_id_...`'s child-scoped
+    /// arm below.
+    #[tokio::test]
+    async fn stop_clears_the_runs_live_activity_state_and_bumps_last_update() {
+        let (_dir, async_root, results_dir) = temp_roots();
+        let run_id = RunId::from_token("stopactivity1");
+        let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
+        tokio::fs::create_dir_all(&paths.run_dir)
+            .await
+            .expect("mkdir");
+
+        let mut status = RunStatus::queued(run_id.clone(), RunMode::Single, Some(4243));
+        status
+            .advance_state(RunState::Running)
+            .expect("Queued -> Running");
+        status.telemetry.activity_state = Some(super::super::ActivityState::NeedsAttention);
+        let seeded_last_update = status.last_update;
+        write_atomic_json(&paths.status, &status)
+            .await
+            .expect("write status");
+
+        // A real, observable gap so the bumped `last_update` is provably LATER, never a
+        // same-millisecond tie with the seeded value.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        assert_eq!(
+            stop(
+                &async_root,
+                &results_dir,
+                run_id.as_str(),
+                "stop-action",
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("stop resolves"),
+            StopOutcome::Requested
+        );
+
+        let reread: RunStatus =
+            serde_json::from_slice(&tokio::fs::read(&paths.status).await.expect("read status"))
+                .expect("parse status");
+        assert!(
+            reread.telemetry.activity_state.is_none(),
+            "a delivered stop must clear the run's live activity flag: {:?}",
+            reread.telemetry.activity_state
+        );
+        assert!(
+            reread.last_update > seeded_last_update,
+            "last_update must be bumped past the seeded value ({} vs seeded {})",
+            reread.last_update,
+            seeded_last_update
         );
     }
 
@@ -3811,6 +3813,72 @@ mod tests {
         assert!(check_stop_inbox_now(&paths).await.expect("probe").is_none());
     }
 
+    /// pi `async-stop-action.ts:69-73` runs unconditionally after `deliverStopRequest` — it is NOT
+    /// inside the `if (child)` branch — so the child-scoped arm clears the SAME run-level
+    /// `telemetry.activity_state` the whole-run arm does, distinct from the PER-STEP
+    /// `StepTelemetry.activity_state` `mark_child_stop_requested` already clears
+    /// (`child_stop.rs`'s own test covers that half; this one covers the run-level twin).
+    #[tokio::test]
+    async fn stop_with_a_child_id_also_clears_the_runs_own_activity_state_and_bumps_last_update() {
+        let (_dir, async_root, results_dir) = temp_roots();
+        let run_id = RunId::from_token("childstopact1");
+        let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
+        let mut live = super::super::StepStatus::pending("live-agent");
+        live.status = StepState::Running;
+
+        let mut status =
+            RunStatus::queued(run_id.clone(), RunMode::Chain, Some(std::process::id()));
+        status
+            .advance_state(RunState::Running)
+            .expect("Queued -> Running");
+        status.steps = vec![live];
+        status.telemetry.activity_state = Some(super::super::ActivityState::ActiveLongRunning);
+        let seeded_last_update = status.last_update;
+        tokio::fs::create_dir_all(&paths.run_dir)
+            .await
+            .expect("mkdir");
+        write_atomic_json(&paths.status, &status)
+            .await
+            .expect("write status");
+
+        // A real, observable gap so the bumped `last_update` is provably LATER, never a
+        // same-millisecond tie with the seeded value.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        assert_eq!(
+            stop(
+                &async_root,
+                &results_dir,
+                run_id.as_str(),
+                "stop-action",
+                None,
+                Some("step:0"),
+                None,
+            )
+            .await
+            .expect("stop resolves"),
+            StopOutcome::ChildRequested {
+                child_id: "step:0".to_string()
+            }
+        );
+
+        let reread: RunStatus =
+            serde_json::from_slice(&tokio::fs::read(&paths.status).await.expect("read status"))
+                .expect("parse status");
+        assert!(
+            reread.telemetry.activity_state.is_none(),
+            "a child-scoped stop must ALSO clear the RUN-level activity flag: {:?}",
+            reread.telemetry.activity_state
+        );
+        assert!(
+            reread.last_update > seeded_last_update,
+            "last_update must be bumped past the seeded value on the child-scoped arm too ({} vs \
+             seeded {})",
+            reread.last_update,
+            seeded_last_update
+        );
+    }
+
     /// pi `stopAsyncRun`'s actionability guard (`async-stop-action.ts:41`): only `running` or
     /// `queued`. A `Paused` run is refused — NOT silently absorbed the way a duplicate `interrupt`
     /// is — and nothing is written.
@@ -3909,7 +3977,7 @@ mod tests {
             .await
             .expect("write");
 
-        let err = resume(&async_root, &results_dir, run_id.as_str(), None)
+        let err = resume(&async_root, &results_dir, run_id.as_str(), None, None)
             .await
             .expect_err("a stopped run must not be resumable");
         assert!(
@@ -3940,6 +4008,8 @@ mod tests {
                 session_id: None,
                 completion_owner_id: None,
                 results: vec![child],
+                workflow_children: None,
+                workflow_receipt: None,
             }
         }
         fn child(exit_code: i32, stopped: bool) -> crate::exec::SingleResult {
@@ -4226,7 +4296,7 @@ mod tests {
         running_step.status = StepState::Running;
         write_running_status(&paths, &run_id, RunMode::Single, None, vec![running_step]).await;
 
-        let outcome = resume(&async_root, &results_dir, "run00007", None)
+        let outcome = resume(&async_root, &results_dir, "run00007", None, None)
             .await
             .expect("resume on a running run succeeds");
 
@@ -4250,7 +4320,7 @@ mod tests {
         )
         .await;
 
-        let outcome = resume(&async_root, &results_dir, "run00008", None)
+        let outcome = resume(&async_root, &results_dir, "run00008", None, None)
             .await
             .expect("resume auto-selects the sole running step");
 
@@ -4269,7 +4339,7 @@ mod tests {
         let pending_step = super::super::StepStatus::pending("writer");
         write_running_status(&paths, &run_id, RunMode::Chain, None, vec![pending_step]).await;
 
-        let result = resume(&async_root, &results_dir, "run00009", Some(0)).await;
+        let result = resume(&async_root, &results_dir, "run00009", Some(0), None).await;
         assert!(
             result.is_err(),
             "explicitly requesting a Pending (not-yet-started) step must fail, never silently \
@@ -4304,7 +4374,7 @@ mod tests {
             .await
             .expect("write complete status");
 
-        let outcome = resume(&async_root, &results_dir, "run00010", None)
+        let outcome = resume(&async_root, &results_dir, "run00010", None, None)
             .await
             .expect("resume on a terminal run with a real transcript succeeds");
 
@@ -4344,7 +4414,7 @@ mod tests {
             .await
             .expect("write failed status");
 
-        let result = resume(&async_root, &results_dir, "run00011", None).await;
+        let result = resume(&async_root, &results_dir, "run00011", None, None).await;
 
         assert!(
             matches!(result, Err(SubagentError::ResumeNoTranscript)),
@@ -4375,13 +4445,79 @@ mod tests {
             .await
             .expect("write paused status");
 
-        let outcome = resume(&async_root, &results_dir, "run00012", None)
+        let outcome = resume(&async_root, &results_dir, "run00012", None, None)
             .await
             .expect("resume on a Paused run succeeds");
 
         assert!(
             matches!(outcome, ResumeOutcome::RespawnFromTranscript { .. }),
             "Paused is a terminal-for-resume-purposes revival target, not a steer target: {outcome:?}"
+        );
+    }
+
+    /// S4 — pi `async-resume.ts:477`, reached via `async-steering-action.ts:203`'s `{ sessionId:
+    /// input.state.currentSessionId ?? undefined }`. PERMISSIVE, and — the important case — never
+    /// conflated with the steering notice's own session concept
+    /// (`foreground_actions::steer::append_steering_notice`'s `currentSessionId`, which is the
+    /// RUN's own session; this gate's `current_session` is instead the CALLER's). One run owned by
+    /// `session-OWNER`, one caller on `session-CALLER`: the two values cannot be conflated without
+    /// this test failing.
+    #[tokio::test]
+    async fn resume_refuses_a_run_owned_by_another_session_and_admits_a_headless_caller() {
+        let (_dir, async_root, results_dir) = temp_roots();
+        let run_id = RunId::from_token("run0resumesess");
+        let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
+        tokio::fs::create_dir_all(&paths.run_dir)
+            .await
+            .expect("mkdir");
+
+        let mut running_step = super::super::StepStatus::pending("researcher");
+        running_step.status = StepState::Running;
+        let mut status =
+            RunStatus::queued(run_id.clone(), RunMode::Single, Some(std::process::id()));
+        status
+            .advance_state(RunState::Running)
+            .expect("Queued -> Running");
+        status.steps = vec![running_step];
+        status.session_id = crate::identity::SessionId::parse("session-OWNER");
+        write_atomic_json(&paths.status, &status)
+            .await
+            .expect("write status");
+
+        let caller = crate::identity::SessionId::parse("session-CALLER");
+        let err = resume(
+            &async_root,
+            &results_dir,
+            "run0resumesess",
+            None,
+            caller.as_ref(),
+        )
+        .await
+        .expect_err("a foreign session must be refused");
+        assert_eq!(
+            err.to_string(),
+            "Async run 'run0resumesess' was not found in the active session."
+        );
+
+        // The owner may still resume it (PERMISSIVE, own session).
+        let owner = crate::identity::SessionId::parse("session-OWNER");
+        assert!(
+            resume(
+                &async_root,
+                &results_dir,
+                "run0resumesess",
+                None,
+                owner.as_ref()
+            )
+            .await
+            .is_ok()
+        );
+
+        // A headless caller (no session identity at all) is likewise admitted.
+        assert!(
+            resume(&async_root, &results_dir, "run0resumesess", None, None)
+                .await
+                .is_ok()
         );
     }
 
@@ -4667,6 +4803,8 @@ mod tests {
             session_id: None,
             completion_owner_id: None,
             results: Vec::new(),
+            workflow_children: None,
+            workflow_receipt: None,
         };
         write_atomic_json(&paths.legacy_result_root, &result)
             .await
@@ -4739,6 +4877,8 @@ mod tests {
             session_id: None,
             completion_owner_id: None,
             results: Vec::new(),
+            workflow_children: None,
+            workflow_receipt: None,
         };
         write_atomic_json(&paths.legacy_result_root, &result)
             .await
@@ -4883,6 +5023,8 @@ mod tests {
             session_id: None,
             completion_owner_id: None,
             results: children,
+            workflow_children: None,
+            workflow_receipt: None,
         }
     }
 

@@ -126,8 +126,8 @@ pub use engine::{
     WorkflowRunCall, WorkflowScriptHost, WorkflowStateStore, WorkflowStopChild,
     WorkflowTraceCallback, refuse_nested_workflow, run_workflow_script, validate_workflow_script,
 };
-// `ObservationKind` and the op/extension declaration that used to live in this crate's own
-// `ops.rs` now live in `cyrup-workflow-runtime` (WORKFLOW_1 §7): a `build.rs` can never import
+// `ObservationKind` and the op/extension declaration that used to live in this crate's own op
+// module now live in `cyrup-workflow-runtime` (WORKFLOW_1 §7): a `build.rs` can never import
 // from the crate whose build it is running, so the ops had to move out before this crate could
 // grow one. `cyrup-ext-subagents/build.rs` depends on that crate to build the V8 startup snapshot;
 // `engine.rs` depends on it (as an ordinary dependency) to drive the runtime and to implement

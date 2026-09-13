@@ -521,6 +521,8 @@ async fn the_startup_retry_note_reaches_the_live_progress_surface_of_the_relaunc
                 model_override: None,
                 timeout_ms: None,
                 cancel: CancelToken::new(),
+                parent_workflow_run_id: None,
+                workflow_key: None,
             },
             on_update,
         ),

@@ -121,6 +121,20 @@ pub struct StepStatus {
     /// keeps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_name: Option<String>,
+    /// pi `WorkflowStatusStep.interrupted` (`workflow-settlement.ts:18`) — NOT on the base
+    /// `AsyncStatus["steps"][number]`; the settlement family adds it.
+    ///
+    /// Written by [`crate::workflows::apply_detached_child_settlement`] and read by
+    /// [`crate::workflows::classify_workflow_settlement`] — which is why it cannot be folded into
+    /// [`Self::stopped`] or into [`StepState::Paused`]: the classifier distinguishes a step that
+    /// FAILED with an interruption from one that merely failed, and that distinction is what
+    /// selects `interrupted-child` over `failed-child`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interrupted: bool,
+    /// pi `WorkflowStatusStep.outputPathMapping` (`:17`) — the requested→saved remap, stamped by
+    /// the detach reconciler and carried into the public child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_path_mapping: Option<crate::workflows::WorkflowOutputPathMapping>,
     /// Live activity telemetry folded from this step's child events (pi
     /// `subagent-runner.ts:2706-2861`) — flattened so its members serialize at the same top level
     /// of the `status.json` step object pi writes them at (`shared/types.ts:598-632`).
@@ -152,6 +166,8 @@ impl StepStatus {
             workflow_key: None,
             run_id: None,
             session_name: None,
+            interrupted: false,
+            output_path_mapping: None,
             telemetry: StepTelemetry::default(),
         }
     }
@@ -296,6 +312,38 @@ pub struct RunStatus {
     ///   whose result lands later comes back with its real outcome rather than staying hidden.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_dismissed_at: Option<i64>,
+    /// pi `AsyncStatus.error` (`shared/types.ts`) — the RUN-LEVEL error, written by
+    /// [`crate::workflows::promote_settled_paused_workflow`] (the
+    /// [`crate::workflows::UNSUPPORTED_DETACHED_WORKFLOW_CONTINUATION`] diagnostic has no other
+    /// home) and by [`crate::workflows::plan_workflow_settlement`]'s
+    /// [`crate::workflows::EVIDENCE_PERSISTENCE_FAILED`] promotion.
+    ///
+    /// **Distinct from [`StepStatus::error`]**, which is per-step and already existed — do not
+    /// confuse the two.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// pi `AsyncStatus.toolCallId` (`shared/types.ts:387`) — the host tool-call id, retained when
+    /// it differs from [`Self::run_id`]. Read by
+    /// [`crate::workflows::with_workflow_children`]'s `status.toolCallId ?? status.runId`
+    /// fallback, and is the value [`crate::background::result_index::ResultWrite::tool_call_id`]
+    /// wants (`background/runner_main/finish.rs` currently hard-codes that write parameter to
+    /// `None`; this field is where a future caller would source it from).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// pi `AsyncStatus.workflowChildren` (`workflow-settlement.ts:231`) — the run's own live/final
+    /// child inventory, mirrored onto [`crate::background::ResultFile::workflow_children`] at
+    /// settlement. An in-flight workflow reports its inventory with its `inventory_complete` flag
+    /// still `false` before it settles; only [`crate::workflows::with_workflow_children`] ever
+    /// flips that flag to settled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_children: Option<crate::workflows::WorkflowChildSummary>,
+    /// pi `AsyncStatus.workflowReceiptPath` — the exact reference returned by successful current
+    /// workflow receipt publication. `None` unless a receipt was actually written; deliberately
+    /// does NOT gain a sibling `stopped` field — cyrup carries the stop verdict on
+    /// [`Self::state`] alone (`status.stopped ? true : undefined` becomes
+    /// `(state == RunState::Stopped).then_some(true)` at every reader).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_receipt_path: Option<std::path::PathBuf>,
     /// Run-wide live activity roll-ups + the workflow-graph snapshot (pi's top-level
     /// `statusPayload` telemetry, `subagent-runner.ts:2085-2120`) — flattened so its members
     /// serialize at the same top level of `status.json` pi writes them at.
@@ -332,6 +380,10 @@ impl RunStatus {
             parallel_groups: None,
             // SUBA-057: a freshly minted run has never been display-dismissed.
             display_dismissed_at: None,
+            error: None,
+            tool_call_id: None,
+            workflow_children: None,
+            workflow_receipt_path: None,
             telemetry: RunTelemetry::default(),
         }
     }
@@ -474,6 +526,20 @@ pub struct ResultFile {
     /// Per-child results, in the same fixed order as [`RunStatus::steps`] (R-SA-051 ordering
     /// preserved).
     pub results: Vec<SingleResult>,
+    /// pi `status.workflowChildren` (`workflow-settlement.ts:231`) — the FINAL child inventory of
+    /// a workflow run, stamped complete by settlement (its `inventory_complete` flag set) and by
+    /// nothing else.
+    ///
+    /// `None` for every non-workflow run. Read by a future wait-completion projector onto
+    /// `WaitCompletion.workflowChildren`, which additionally REJECTS a summary whose
+    /// `workflow_run_id` does not match the run it was found on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_children: Option<crate::workflows::WorkflowChildSummary>,
+    /// pi `publicResult.workflowReceipt` (`workflow-settlement.ts:235`) — `{ path, receipt }`,
+    /// present only when a receipt was actually written (upstream deletes the key otherwise,
+    /// `:238`; here the key is built conditionally and never inserted-then-removed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_receipt: Option<crate::workflows::WorkflowReceiptRef>,
 }
 
 #[cfg(test)]
@@ -632,6 +698,8 @@ mod tests {
             session_id: None,
             completion_owner_id: None,
             results: Vec::new(),
+            workflow_children: None,
+            workflow_receipt: None,
         };
         let json = serde_json::to_string(&result).expect("serializes");
         let back: ResultFile = serde_json::from_str(&json).expect("deserializes");

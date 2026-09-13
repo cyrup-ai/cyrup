@@ -276,6 +276,13 @@ async fn format_status(status: &RunStatus, paths: &RunPaths) -> String {
         Err(e) => lines.push(format!("Warning: Mission binding unavailable: {e}")),
     }
     lines.push(format!("State: {}", run_state_label(status.state)));
+    // pi `status.error ? \`Error: ${status.error}\` : undefined` (`run-status.ts:581`) — the
+    // RUN-level error (`RunStatus::error`, distinct from a per-step `StepStatus::error`), placed
+    // between `State:` and `Mode:` exactly as upstream's own neighbouring lines are (WORKFLOW_3
+    // §3b).
+    if let Some(error) = status.error.as_deref() {
+        lines.push(format!("Error: {error}"));
+    }
     lines.push(format!("Mode: {}", run_mode_label(status.mode)));
     lines.push(format!("Progress: {}", progress_label(status)));
     if let Some(pending) = status.pending_appends
@@ -351,6 +358,14 @@ async fn format_status(status: &RunStatus, paths: &RunPaths) -> String {
         if step_log.exists() {
             lines.push(format!("  Output: {}", step_log.display()));
         }
+    }
+
+    // pi `if (status.workflowReceiptPath) lines.push(\`Workflow receipt: ${...}\`)`
+    // (`run-status.ts:697`) — immediately before `Session:` upstream, which cyrup's own report has
+    // no equivalent line for; the transferable anchor is upstream's OWN relative order —
+    // immediately before the resume-guidance line that follows (WORKFLOW_3 §3b).
+    if let Some(path) = status.workflow_receipt_path.as_ref() {
+        lines.push(format!("Workflow receipt: {}", path.display()));
     }
 
     if status.state != RunState::Running {
@@ -1380,7 +1395,7 @@ mod tests {
         let running = running_status(&running_id, RunMode::Single, vec![running_step]);
         write_status(&running_paths, &running).await;
 
-        let steer = control::resume(&async_root, &results_dir, "run0live000", None)
+        let steer = control::resume(&async_root, &results_dir, "run0live000", None, None)
             .await
             .expect("resume on a running run resolves");
         assert_eq!(
@@ -1399,7 +1414,7 @@ mod tests {
         dead.advance_state(RunState::Failed).expect("-> Failed");
         write_status(&dead_paths, &dead).await;
 
-        let revival = control::resume(&async_root, &results_dir, "run0dead000", None).await;
+        let revival = control::resume(&async_root, &results_dir, "run0dead000", None, None).await;
         assert!(
             matches!(revival, Err(SubagentError::ResumeNoTranscript)),
             "a terminal run with no transcript takes the revival branch and hard-fails: {revival:?}"
@@ -1418,7 +1433,7 @@ mod tests {
             .expect("-> Complete");
         write_status(&revive_paths, &revive).await;
 
-        let respawn = control::resume(&async_root, &results_dir, "run0revive0", None)
+        let respawn = control::resume(&async_root, &results_dir, "run0revive0", None, None)
             .await
             .expect("resume on a terminal run with a transcript resolves");
         assert_eq!(

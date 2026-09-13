@@ -6,7 +6,7 @@ use crate::auth::AuthResult;
 use crate::context::Context;
 use crate::model::Model;
 use crate::stream::{CacheRetention, StreamOptions};
-use crate::utils::provider_plumbing::resolve_cache_retention;
+use crate::utils::provider_plumbing::{EnvSource, resolve_cache_retention};
 
 /// Pi `hasHeader` (openai-responses.ts:28-35): a header is "present" only when set to a non-empty,
 /// non-`None` value (case-insensitive name match).
@@ -56,7 +56,7 @@ pub(super) fn build_headers(
     );
 
     // Session headers (openai-responses.ts:211-216). Gated on cache retention != none.
-    let cache = resolve_cache_retention(opts.cache_retention, auth.env.as_ref());
+    let cache = resolve_cache_retention(opts.cache_retention, EnvSource::new(auth.env.as_ref()));
     let compat = get_responses_compat(model);
     // PROV-033: the three-way branch (openai-responses.ts:233-241 @v0.83.0). The former
     // `send_session_id_header` gate was a flag pi DELETED (#6496, `packages/ai/CHANGELOG.md:168`),

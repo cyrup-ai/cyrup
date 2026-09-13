@@ -95,6 +95,23 @@ pub struct SingleRunOverrides {
     /// truthiness gate (`progress: params.includeProgress ? allProgress : undefined`,
     /// `subagent-executor.ts:3819`).
     pub include_progress: Option<bool>,
+    /// WORKFLOW_2 — extra entries for the CHILD's environment, threaded straight onto
+    /// [`crate::exec::RunOptions::child_env`] (`exec/agent_config.rs:706`).
+    ///
+    /// This is that field's FIRST production caller: its doc carries a "# Zero production callers,
+    /// and why it keeps its place" heading saying in so many words that a value which must reach a
+    /// CHILD goes on the CHILD's `Command`, never on this process's environment — which is also
+    /// why `clippy.toml` bans `std::env::set_var` outright. `WorkflowRunHost` uses it to set
+    /// [`crate::extension::executor::workflow::WORKFLOW_CHILD_ENV`], so a workflow child's own
+    /// `subagent` tool can refuse a NESTED `workflowScript`.
+    ///
+    /// Layered onto `SpawnSpec::env_overlay` and applied FIRST, so the crate's own identity, depth
+    /// and child-role entries overwrite it: a caller may ADD to the child's environment, it may
+    /// not rewrite the invariants that decide what the child is allowed to do.
+    ///
+    /// Empty (the `Default`) = "no extra child env", which is what every non-workflow caller
+    /// passes and reproduces the pre-WORKFLOW_2 behavior exactly.
+    pub child_env: std::collections::HashMap<String, String>,
     /// SUBA-043: pi `params.outputSchema` (`extension/schemas.ts:351` @v0.43.0), read on the
     /// single path at `runs/foreground/subagent-executor.ts:3651,3671`. Threaded straight onto
     /// [`crate::exec::RunOptions::structured_output_schema`], which is what creates the run's
@@ -128,7 +145,7 @@ pub struct SingleRunOverrides {
     pub usage_budget: Option<crate::exec::usage_budget::UsageBudgetConfig>,
 }
 
-/// The seven inputs one foreground single run needs, bundled into one borrowed request so
+/// The nine inputs one foreground single run needs, bundled into one borrowed request so
 /// [`crate::extension::SubagentExecutor::run_foreground_streaming`] and the shared `run_foreground_impl` stay within
 /// the argument-count budget (the non-streaming [`crate::extension::SubagentExecutor::run_foreground`] keeps its
 /// original flat signature for backward compatibility and builds this internally). All fields
@@ -159,6 +176,33 @@ pub struct ForegroundRunRequest<'a> {
     /// the tool call (user Esc / turn abort) drives the running child through the real
     /// SIGINT→SIGTERM→SIGKILL escalation instead of being silently dropped at this seam.
     pub cancel: CancelToken,
+    /// WORKFLOW_6 §4.2 — pi `params.workflowParentRunId` (`subagent-executor.ts:2141`, `:3335`) —
+    /// the workflow shell that owns this child, stamped onto its
+    /// [`crate::extension::executor::notices::ForegroundControlEntry::parent_workflow_run_id`].
+    /// `None` on every non-workflow path, which is every caller except
+    /// `WorkflowRunHost::launch`.
+    pub parent_workflow_run_id: Option<crate::background::RunId>,
+    /// WORKFLOW_6 §4.2 — pi `params.workflowKey` — the lane key this child was launched under.
+    pub workflow_key: Option<crate::workflows::WorkflowKey>,
+    /// WORKFLOW_14 — where this child's steer requests are written and its answers read.
+    ///
+    /// `Some` exactly when `parent_workflow_run_id` is `Some`: a WORKFLOW child's control root is
+    /// the workflow's own run directory (WORKFLOW_13, `extension/tool/routing.rs`'s
+    /// `ensure_accessible_dir`), so
+    /// [`crate::background::control::step_steer_inbox_dir`] /
+    /// [`crate::background::control::steer_acks_dir`] /
+    /// [`crate::background::control::steer_capability_path`] have somewhere to be rooted. A plain
+    /// foreground SINGLE run has no run directory and keeps `None` — `foreground.rs`'s G90 note
+    /// holds for it, and only for it.
+    ///
+    /// ONE field feeds BOTH halves: `build_foreground_run_options` derives the three
+    /// [`crate::exec::RunOptions`] paths the CHILD is spawned against, and
+    /// `register_foreground_controls` stores the same handle on the child's
+    /// [`crate::extension::executor::foreground_control::ForegroundChildEntry`] so the PARENT can
+    /// address it. Deriving both from one value is what makes the two sides incapable of
+    /// disagreeing about the index.
+    pub workflow_steer:
+        Option<crate::extension::executor::foreground_control::ForegroundChildSteerHandle>,
 }
 
 /// The inputs one BACKGROUND single run needs, bundled into one borrowed request so

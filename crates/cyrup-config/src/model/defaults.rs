@@ -21,7 +21,16 @@ pub fn default_model_per_provider(provider: &str) -> Option<&'static str> {
         "github-copilot" => "gpt-5.4",
         "openrouter" => "moonshotai/kimi-k2.6",
         "vercel-ai-gateway" => "zai/glm-5.1",
-        "xai" => "grok-4.5",
+        // VERSION LAG (v0.84.1 → v0.85.1), and the ONE row of this table chased ahead of the rest.
+        // `git show v0.85.1:packages/coding-agent/src/core/model-resolver.ts:35` reads
+        // `xai: "grok-4.6"`. Cite the TAG, not HEAD: ADR-0006 pins the parity target to a tag, and
+        // HEAD carries unreleased churn — HEAD also moves `radius` to "balanced" while v0.85.1 keeps
+        // "auto", which is what cyrup has, so chasing HEAD would have caused a regression.
+        //
+        // It is chased alone because it is the only one of v0.85.1's four changed rows whose id the
+        // embedded catalog carries (`grok-4.6` arrived with XAI_1's live fetch). See the test below
+        // for the other three and why they are blocked.
+        "xai" => "grok-4.6",
         "groq" => "openai/gpt-oss-120b",
         "cerebras" => "zai-glm-4.7",
         "zai" => "glm-5.1",
@@ -245,15 +254,21 @@ mod tests {
         assert_eq!(chosen.provider.as_str(), "qwen-token-plan");
     }
 
-    /// CFG-019 + CFG-041: `defaultModelPerProvider` must equal pi v0.84.1's 40 entries key for key
-    /// AND in order — `Object.keys(defaultModelPerProvider)` IS the launch scan order at step 4
+    /// CFG-019 + CFG-041: `defaultModelPerProvider` must equal pi's 40 entries key for key AND in
+    /// order — `Object.keys(defaultModelPerProvider)` IS the launch scan order at step 4
     /// (`model-resolver.ts:683-692` @v0.84.1), so a missing or misplaced key changes which model a
     /// user launches on.
     ///
     /// Red at HEAD: 37 entries; `xai` was the retired `grok-4.20-0309-reasoning`; `radius`,
     /// `baseten` and `qwen-token-plan-individual` were absent entirely.
+    ///
+    /// **Pinned at v0.84.1 with NAMED exceptions, not silently mixed.** v0.85.1 moved four rows;
+    /// `CHASED` is what cyrup took, `DEFERRED` is what it did not and why. The last loop is the one
+    /// that matters now that catalogs are live: a curated default naming an id the catalog no longer
+    /// carries is NOT inert — `first_default_or_first` finds no match, skips the provider entirely,
+    /// and the user silently lands on `available.first()` instead. That must be loud.
     #[test]
-    fn default_model_per_provider_matches_pi_v0_84_1_key_for_key_and_in_order() {
+    fn default_model_per_provider_matches_pi_and_every_default_resolves() {
         // `git show v0.84.1:packages/coding-agent/src/core/model-resolver.ts`, `:20-61`.
         const PI: &[(&str, &str)] = &[
             ("amazon-bedrock", "us.anthropic.claude-opus-4-6-v1"),
@@ -300,11 +315,66 @@ mod tests {
             ("xiaomi-token-plan-ams", "mimo-v2.5-pro"),
             ("xiaomi-token-plan-sgp", "mimo-v2.5-pro"),
         ];
+
+        /// v0.85.1 rows cyrup has chased (`model-resolver.ts:35` @v0.85.1).
+        const CHASED: &[(&str, &str)] = &[("xai", "grok-4.6")];
+
+        /// v0.85.1 rows cyrup has NOT chased, and why. `cerebras` is chaseable but belongs to no
+        /// filed item; the two `glm-5.3` rows are BLOCKED — `catalog/zai.json` and
+        /// `catalog/zai-coding-cn.json` ship `glm-4.5-air, glm-4.7, glm-5-turbo, glm-5.1, glm-5.2,
+        /// glm-5v-turbo` and no `glm-5.3`, so naming it would drop both providers out of the scan
+        /// (XAI_5).
+        const DEFERRED: &[(&str, &str)] = &[
+            ("cerebras", "gpt-oss-120b"),
+            ("zai", "glm-5.3"),
+            ("zai-coding-cn", "glm-5.3"),
+        ];
+
+        let expected: Vec<(&str, &str)> = PI
+            .iter()
+            .map(|(k, v)| {
+                let chased = CHASED.iter().find(|(ck, _)| ck == k).map(|(_, cv)| *cv);
+                (*k, chased.unwrap_or(*v))
+            })
+            .collect();
         let ours: Vec<(&str, &str)> = KNOWN_PROVIDERS
             .iter()
             .map(|p| (*p, default_model_per_provider(p).unwrap_or("<missing>")))
             .collect();
-        assert_eq!(ours, PI.to_vec());
+        assert_eq!(ours, expected);
         assert_eq!(KNOWN_PROVIDERS.len(), 40);
+
+        // The deferral is an assertion, not a comment: chasing a DEFERRED row without moving it out
+        // of this array fails here.
+        for (key, v0_85_1) in DEFERRED {
+            assert_ne!(
+                default_model_per_provider(key),
+                Some(*v0_85_1),
+                "{key} was chased to v0.85.1's value — move it from DEFERRED to CHASED and say in \
+                 the commit which catalog now carries that id"
+            );
+        }
+
+        // THE GUARD. Every curated default must name a model the shipped catalog actually carries.
+        // Providers with no embedded rows are skipped: the four dynamic fleet members and `radius`
+        // get their catalogs at runtime, and `cyrup-provider`'s own
+        // `every_registered_provider_has_a_non_empty_catalog` already asserts which those are, so a
+        // silently-empty catalog cannot hide here.
+        for provider in cyrup_provider::all_providers() {
+            let id = provider.id().as_str();
+            let Some(default_id) = default_model_per_provider(id) else {
+                continue;
+            };
+            if provider.models().is_empty() {
+                continue;
+            }
+            assert!(
+                provider.models().iter().any(|m| m.id.as_str() == default_id),
+                "{id}'s curated default `{default_id}` is not in its catalog — \
+                 `first_default_or_first` will skip {id} entirely and launch the user on whatever \
+                 sorts first. Either the upstream table moved (chase it) or the model was retired \
+                 (pick its successor)."
+            );
+        }
     }
 }

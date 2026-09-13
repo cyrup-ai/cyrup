@@ -2,9 +2,9 @@
 //! `bedrock-converse-stream.ts:580-586` and friends).
 
 use super::config::configured_bedrock_region;
-use super::env::EnvSource;
 use super::options::BedrockOptions;
 use crate::model::Model;
+use crate::utils::provider_plumbing::EnvSource;
 use cyrup_core::ThinkingLevel;
 
 /// pi `getModelMatchCandidates` (`bedrock-converse-stream.ts:580-586`): for the model id and (when

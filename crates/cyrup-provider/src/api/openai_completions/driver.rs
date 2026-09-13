@@ -11,7 +11,7 @@ use crate::error::ProviderError;
 use crate::model::Model;
 use crate::stream::sse::SseRequest;
 use crate::stream::{CacheRetention, StreamOptions};
-use crate::utils::provider_plumbing::{connect_sse, resolve_cache_retention};
+use crate::utils::provider_plumbing::{EnvSource, connect_sse, resolve_cache_retention};
 use cyrup_core::{ApiId, CancelToken};
 use std::sync::Arc;
 
@@ -73,7 +73,8 @@ impl ApiImpl for OpenAiCompletionsApi {
         // Resolve compat + the effective cache retention once (Pi `stream` L179-181), so both the
         // header build (session affinity) and the body build see the same view.
         let compat = get_compat(model);
-        let cache = resolve_cache_retention(opts.cache_retention, auth.env.as_ref());
+        let env = EnvSource::new(auth.env.as_ref());
+        let cache = resolve_cache_retention(opts.cache_retention, env);
         // Pi: `cacheSessionId = cacheRetention === "none" ? undefined : options?.sessionId` (L181).
         let cache_session_id = match cache {
             CacheRetention::None => None,
@@ -82,7 +83,7 @@ impl ApiImpl for OpenAiCompletionsApi {
 
         // PROV-011: an unsatisfiable `constrainedSampling` fails the turn before any HTTP, with
         // pi's own message — upstream `buildParams` throws into `stream`'s catch.
-        let params = match build_body_with_env(model, ctx, opts, auth.env.as_ref()) {
+        let params = match build_body_with_env(model, ctx, opts, env) {
             Ok(p) => p,
             Err(e) => {
                 let e = ProviderError::from(e);

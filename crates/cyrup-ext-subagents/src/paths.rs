@@ -50,9 +50,10 @@
 //! Two more carried their own copies and no longer do, by two different routes:
 //! `crate::discovery::skills` calls [`crate::paths::home_dir`] in this module, and
 //! `crate::native_supervisor::intercom_agent_dir_from` calls
-//! `cyrup_config::paths::cyrup_dir_from` directly — it cannot come through here, because the
-//! `String`-shaped `env` seam it takes is fed by `SubagentsExtension::env_lookup` (which layers
-//! `SubagentExtensionConfig::env_overrides`), while this module's seams are `OsString`-shaped.
+//! `cyrup_config::paths::cyrup_home_dir_from` + `cyrup_config::paths::cyrup_agent_dir_from`
+//! directly — it cannot come through here, because the `String`-shaped `env` seam it takes is fed
+//! by `SubagentsExtension::env_lookup` (which layers `SubagentExtensionConfig::env_overrides`),
+//! while this module's seams are `OsString`-shaped.
 //!
 //! # Why `CYRUP_HOME` comes first, and why that check is load-bearing
 //!

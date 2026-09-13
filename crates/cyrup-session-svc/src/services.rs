@@ -117,26 +117,31 @@ pub struct AgentSessionServices {
     /// (CFG-002). Empty when the file is absent or unreadable; failures land in
     /// [`StartupDiagnostics::models`].
     pub model_config: Arc<cyrup_config::ModelFile>,
-    /// The persisted pi.dev model-catalog overlay for this session, loaded ONCE from
-    /// `<agent_dir>/models-store.json` at build time (DRIFT-007; Pi `ModelRuntime`'s
-    /// `modelsStore` + `withRemoteCatalog`, model-runtime.ts:139-151).
+    /// The LIVE pi.dev model-catalog overlay for this session (DRIFT-007 + XAI_3).
     ///
-    /// Loaded from DISK ONLY — building a session never touches the network. `None` (no cache, no
-    /// agent dir, stale-vs-builtins, unreadable file) means "embedded catalogs only", i.e. exactly
-    /// the pre-DRIFT-007 behavior. The overlay can only add or replace models by id, so it is
-    /// structurally incapable of shrinking the registry
+    /// Was `Option<Arc<CatalogOverlay>>`, captured ONCE at build time — which meant a refresh could
+    /// never reach `/model`: the installer wrote the binary's own static
+    /// (`cyrup/src/provider.rs`) and `full_model_registry` read this by-value copy. It is now the
+    /// shared slot BOTH write, so a model released mid-session is visible on the very next registry
+    /// read, with no rebuild, no `set_provider` race and no lock on the streaming path.
+    ///
+    /// Still loaded from DISK ONLY at build time — building a session never touches the network. An
+    /// empty slot means "embedded catalogs only", i.e. exactly the pre-DRIFT-007 behavior, and the
+    /// overlay can only add or replace models by id, so it cannot shrink the registry
     /// ([`cyrup_provider::remote_catalog::merge_models`]).
-    ///
-    /// Held as an `Arc` because [`crate::session::AgentSession::full_model_catalog`] is SYNC and hot:
-    /// it rebuilds the registry on every read, so the overlay must already be in memory.
-    pub catalog_overlay: Option<Arc<cyrup_provider::CatalogOverlay>>,
+    pub catalog_overlay: Arc<cyrup_provider::CatalogOverlaySlot>,
+    /// The shared catalog service this session refreshes through, or `None` when the host wired
+    /// none (embedders, SDK consumers, tests) — in which case `/model` has nothing to trigger and
+    /// [`crate::session::AgentSession::refresh_model_catalogs`] is a clean no-op.
+    pub model_catalog: Option<Arc<cyrup_provider::ModelCatalogService>>,
     /// Session-scoped context cache (context files + skill pointers).
     pub context: Arc<ContextStore>,
     /// The extension host with native built-ins loaded; both seams are wired to the agent.
     pub ext_host: Arc<ExtensionHost>,
     /// pi `AgentSession._allowedToolNames` (`agent-session.ts:359`, bound at `:395`) — the session's
     /// tool allowlist, resolved ONCE from `SessionConfig` by
-    /// [`crate::builder::resolve_allowed_tool_names`] and carried because BOTH tool-materialization
+    /// `crate::builder::resolve_allowed_tool_names` (private — hence no intra-doc link) and carried
+    /// because BOTH tool-materialization
     /// paths need it, exactly as upstream's `_refreshToolRegistry` reads this field on both of its
     /// call paths (`:2612` via `refreshTools`, `:2812` on the initial build).
     ///

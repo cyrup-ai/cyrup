@@ -213,6 +213,7 @@ mod tests {
     use super::super::tests::sample_result;
     use super::*;
     use crate::background::RunState;
+    use crate::background::watch::CompletionBand;
     use std::path::PathBuf;
     use tokio::sync::Mutex as AsyncMutex;
 
@@ -234,6 +235,7 @@ mod tests {
             result: sample_result("run-bus-1", RunState::Complete, false),
             result_path: PathBuf::from("/tmp/run-bus-1.json"),
             exhausted: false,
+            band: CompletionBand::Ours,
         };
         bus.observe(&notification).await;
 
@@ -251,6 +253,7 @@ mod tests {
             result: sample_result("run-bus-2", RunState::Complete, true),
             result_path: PathBuf::from("/tmp/run-bus-2.json"),
             exhausted: false,
+            band: CompletionBand::Ours,
         })
         .await;
         // A subscriber taken AFTER the publish sees nothing — which is exactly why
@@ -299,6 +302,7 @@ mod tests {
                 result: sample_result("run-fanout", RunState::Complete, true),
                 result_path: PathBuf::from("/tmp/run-fanout.json"),
                 exhausted: false,
+                band: CompletionBand::Ours,
             })
             .await;
 

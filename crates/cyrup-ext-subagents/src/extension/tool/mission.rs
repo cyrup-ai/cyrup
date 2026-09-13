@@ -286,9 +286,12 @@ mod tests {
                     session_id: None,
                     completion_owner_id: None,
                     results: Vec::new(),
+                    workflow_children: None,
+                    workflow_receipt: None,
                 },
                 result_path: dir.path().join("results").join("bgrun000001.json"),
                 exhausted: false,
+                band: crate::background::watch::CompletionBand::Ours,
             })
             .await;
 

@@ -1128,6 +1128,9 @@ mod tests {
         // built-in floor stamp installed, so the staleness guard is exercised, not bypassed.
         let overlay = crate::remote_catalog::RemoteCatalog::new(store)
             .with_local_generated_at(crate::providers::builtin_model_data_generated_at())
+            .with_local_generated_at_by_provider(
+                crate::providers::builtin_model_data_generated_at_by_provider(),
+            )
             .load_overlay(&["radius"])
             .await;
         let restored = overlay.apply(Arc::new(radius_provider()));

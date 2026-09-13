@@ -1163,6 +1163,8 @@ mod tests {
             session_id: None,
             completion_owner_id: None,
             results: Vec::new(),
+            workflow_children: None,
+            workflow_receipt: None,
         };
         crate::background::atomic::write_atomic_json(&paths.legacy_result_root, &result)
             .await
