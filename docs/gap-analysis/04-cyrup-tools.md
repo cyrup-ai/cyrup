@@ -84,6 +84,171 @@ This area covers `crates/cyrup-tools` — the seven built-in tools (`read`, `wri
 > is cleared by `TOOL-035`.
 
 
+> ### PROVENANCE CORRECTION — 2026-09-14. The pins below are revised; **this file was not re-read.**
+>
+> Everything above this block is history and is correct as written. The passes it narrates were
+> audited against **pi `v0.84.1`** (with `v0.83.0` as the ported baseline that governs
+> classification); the newest whole-file pass is **2026-09-04, re-verified at cyrup `2571969`**, with
+> per-item measurement and closure stamps running to 2026-09-05 and to cyrup `0c4d5bf1`. Every
+> citation, closure and severity below still means exactly what it meant at those pins, and **nothing
+> in this block re-verifies any of it. No item was re-read, no row was re-derived, no count, severity
+> or status changed.** This block states only how old the file is.
+>
+> | | audited at (history — do not rewrite) | current pin (authoritative, per `README.md`'s baselines table) | window this file has never measured |
+> |---|---|---|---|
+> | `pi` | `v0.83.0` ported / **`v0.84.1`** drift | **`v0.85.1`** | `v0.84.1..v0.85.1` — `packages/coding-agent` **338 files, +25 297 / −5 625**; 711 non-merge commits repo-wide; releases v0.84.2 · v0.84.3 · v0.84.4 · v0.85.0 · v0.85.1. All seven tool modules under `core/tools/` shrank 60–90% in this window (renderer extraction), so **every `read.ts:` / `bash.ts:` / `edit.ts:` / `grep.ts:` line offset cited in this file and in `crates/cyrup-tools` points at different code at v0.85.1 than it named at v0.84.1** |
+> | `cyrup` | `2571969` (2026-09-04) / `0c4d5bf1` | **`b28d3ff`** — ledger's last recorded code baseline is `824a539e` | `2571969..b28d3ff` = **1 506 files, +219 934 / −41 853**, 48 non-merge commits under `crates/`+`xtask`. From the ledger's own baseline, `824a539e..b28d3ff` = **453 files, +98 509 / −15 880**, 31 commits. (`9aeba769..b28d3ff` is docs-only) |
+> | `pi-subagents` · `pi-permission-system` · `pi-intercom` | `v0.47.1` · `v0.8.0` · `v0.10.1`, each recorded above as not touching this area | **`v0.67.0`** · `v0.8.0` · **`v0.13.0`** — the latter two re-checked 2026-09-14, no new release | that "does not touch this area" finding was made at the older tags |
+> | `pi-mcp-adapter` · `pi-acp` · `code_puppy_core_plugins` | — | `v2.33.0` · `v0.0.33` · `v0.0.50` | areas 13 · 15 · 14 |
+>
+> **Two of this file's scoping sentences are stale as a consequence, corrected here without touching
+> any row.** (1) The opening sentence's "the seven built-in tools" is now eight: `powershell` landed
+> upstream in this window (`80e62761f`, absent at v0.84.1) and **is already ported** —
+> `crates/cyrup-tools/src/tools/powershell.rs`, `BUILTIN_NAMES: [&str; 8]` with `powershell` third in
+> pi's literal order (`registry.rs:21-30`), `ShellConfig::resolve_powershell` (`ops/shell.rs:292-311`),
+> the `PS>` renderer (`crates/cyrup-tui/src/transcript/tool_builtin.rs:541`) and the subagent tool
+> surface (`crates/cyrup-ext-subagents/src/exec/tool_surface.rs:74`,`:97`). (2) The recorded "drift
+> baseline pi v0.84.1" understates the port: cyrup at `b28d3ff` has already chased material that
+> lands inside this window — `constrainedSampling` on four tools, the `defaultTools` setting
+> (`CFG-079`), `modelThinkingLevels` storage, `fullscreenExitOutput`/`fullscreenCopyOnSelect`
+> (`CFG-078`), the `clear_queue` RPC command (`SEAM-116`) and the json-event wire projection
+> (`SEAM-117`) — the last two **against v0.84.4**, a tag this file's header does not mention. A
+> planner sizing the gap from the raw 338-file diff will over-count by a large margin; the real
+> unmeasured window for several surfaces here is **`v0.84.4..v0.85.1` (223 files, +17 908 / −3 954)**.
+
+## UNVERIFIED — 2026-09-14 census of the `v0.84.1..v0.85.1` window (leads, not items)
+
+**Nothing in this section is an item.** No `TOOL-` id is assigned, because id assignment belongs to a
+pass that read both sides and this one did not read both sides everywhere. No row in `## Open items`
+is opened, closed or re-ranked by anything here. Each entry states what was read on which side.
+
+Census method: upstream read only via `git -C tmp/pi show <tag>:<path>` and
+`git diff v0.84.1..v0.85.1`, covering `packages/coding-agent/src/core/tools/**`,
+`src/utils/{shell,tools-manager,text}.ts` and `packages/agent/src/harness/tools/{bash,edit,write,read,path-utils}.ts`
+plus `packages/agent/src/harness/{types.ts,env/nodejs.ts,utils/output-capture.ts}`; cyrup read at
+`b28d3ff` across `crates/cyrup-tools/src/{tools,ops,registry.rs,config.rs,details.rs}`.
+
+### Prompt-visible strings — the confidently-readable drift
+
+- **`write` tool: the byte count is gone from the result text** · S — upstream
+  `packages/agent/src/harness/tools/write.ts:36` @v0.85.1; CHANGELOG 0.85.0 "Fixed the write tool
+  reporting UTF-16 code-unit counts as byte counts by removing the misleading count (#8979)".
+  `Successfully wrote ${content.length} bytes to ${path}` became `Successfully wrote to ${path}` — the
+  count is gone entirely, not corrected to a UTF-8 count. **Read on both sides, and this lands on a
+  deliberate cyrup fidelity decision**: `crates/cyrup-tools/src/tools/write.rs:128-135` computes
+  `let len_utf16 = input.content.encode_utf16().count();` under the comment "Pi reports
+  `content.length` — JS string length = UTF-16 code units — not the UTF-8 byte count, and uses the
+  verb 'Successfully wrote' (write.ts:222). Match both exactly." That deliberate match is now the
+  divergence. Three cyrup tests assert the old string (`src/tests/tools.rs:577`,`:1823`,
+  `src/tests/isolation.rs:361`).
+- **`bash` tool description: "Returns stdout and stderr." → "Returns combined stdout and stderr."** · S
+  — upstream `packages/agent/src/harness/tools/bash.ts:9` @v0.85.1. cyrup still emits the v0.84.1
+  wording at `crates/cyrup-tools/src/tools/bash.rs:149`. A prompt-visible, byte-for-byte surface; this
+  is the confidently-readable half of the bash entry below.
+
+### Shell and execution environment
+
+- **Bash: env-level bounded capture, disk spill, durable checkpoints** · M — upstream
+  `packages/agent/src/harness/tools/bash.ts:9`,`:57`,`:99`; `harness/types.ts:292-360`;
+  `harness/utils/output-capture.ts` (new, 238 lines); `harness/env/nodejs.ts:32`,`:417-425` @v0.85.1.
+  Shell output capture moved out of the tool and into the execution environment: `ShellExecOptions`
+  lost `onStdout`/`onStderr` and gained
+  `capture?: {limits:{maxBytes,maxLines,retain:"head"|"tail"}, spill?:boolean}` plus
+  `onUpdate(update, context)`; `exec` returns `ShellExecResult` (exit code + truncation metadata +
+  `spillPath`) with text delivered as `replace`/`append`/`slide`/`metadata` deltas; `NodeExecutionEnv`
+  grew an 8 MiB `SPILL_HIGH_WATER_MARK` and reports the child's exit SIGNAL alongside its code; the
+  100 ms update throttle became a 2 s durable checkpoint interval
+  (`BASH_UPDATE_THROTTLE_MS` → `BASH_CHECKPOINT_INTERVAL_MS = 2_000`). **Upstream read; cyrup read
+  only at the description string and the module header** — cyrup already streams combined
+  stdout+stderr (`tools/bash.rs:1`), so the capture rework is largely a mechanism difference. **Lead
+  only** for the spill/checkpoint model.
+- **`taskkill` resolved from System32 instead of PATH** · S — upstream
+  `packages/coding-agent/src/utils/shell.ts:215-233` @v0.85.1: `killProcessTree` on win32 spawns
+  `join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe")` rather than the bare
+  name, and attaches a no-op `child.once("error")` so a failed spawn cannot crash the process. **Read
+  on both sides.** cyrup uses the bare name at `crates/cyrup-tools/src/ops/local/signal.rs:42`,`:79`,
+  `:151` and again at `crates/cyrup-ext-subagents/src/spawn/signal.rs:436`, so on Windows a
+  `taskkill.exe` earlier on PATH is executed — the hazard upstream's own comment ("so cleanup does not
+  depend on PATH") names. Small, security-adjacent. Note the Node-specific half of upstream's fix (the
+  async `error` event) has no cyrup analogue and is excluded below.
+
+### Per-call context
+
+- **Per-call `cwd` on every built-in tool (`ctx?.cwd || cwd`)** · L — upstream
+  `packages/coding-agent/src/core/tools/ls.ts:70`,`:83` @v0.85.1, same pattern in `read.ts`,
+  `edit.ts`, `write.ts`, `grep.ts`, `find.ts`: every `execute` gained a trailing
+  `ctx?: ExtensionContext` and resolves relative paths against `ctx?.cwd || cwd` rather than the
+  construction-time `cwd` (at v0.84.1 `ls.ts:111`,`:129` read `resolveToCwd(path || ".", cwd)` with no
+  ctx at all). **Both sides read.** cyrup's `Tool` trait has no ctx/cwd parameter —
+  `crates/cyrup-core/src/tool.rs:328-334` is `execute(&self, call_id, params, cancel, on_update)` — so
+  every built-in resolves against the cwd captured at registry construction
+  (`ToolRegistry::with_builtins(cwd, …)`, `crates/cyrup-tools/src/registry.rs:69`), and any upstream
+  mechanism that hands a tool a different cwd for one call has no analogue here. **Whether pi actually
+  varies `ctx.cwd` per call was NOT verified** — that needs a read of the dispatch site in
+  `packages/agent`.
+
+### Refactors that are the natural place for drift to hide
+
+- **Tool renderers extracted to `core/tools/renderers/*`** · M — upstream
+  `packages/coding-agent/src/core/tools/renderers/{read,write,edit,bash,grep,find,ls,index}.ts`
+  @v0.85.1 (all new, 963 lines) with the matching deletions from the seven tool modules; `bash.ts` was
+  simultaneously generalised into `createShellToolDefinition(cwd, ShellToolConfig, options)` so
+  powershell could reuse it. **Upstream read at both tags; the move itself declares no behaviour
+  change**, and cyrup renders through a different decomposition it already documents
+  (`crates/cyrup-tui/src/transcript/tool_builtin.rs`, per-name dispatch, `Builtin::Shell("PS>")` at
+  `:541`). **Filed as a lead because the extraction is exactly the moment per-renderer output drift
+  would have crept in, and no renderer's output was diffed line by line.** This is also the change
+  that invalidates the line offsets named in the provenance block above.
+- **`fd`/`rg` bootstrap: release resolution, musl assets, status callback** · S — upstream
+  `packages/coding-agent/src/utils/tools-manager.ts:104-133`,`:262-268`,`:339-400` @v0.85.1.
+  `getLatestVersion` no longer calls `api.github.com` (anonymous 60/hr quota, exhausted behind shared
+  egress) — it issues a `redirect:"manual"` GET to `https://github.com/<repo>/releases/latest` and
+  reads the tag from the Location header; Linux `fd` assets moved gnu→musl and `rg` arm64 likewise;
+  `ensureTool(tool, silent)` became `ensureTool(tool, onStatus)`; download failures walk the Error
+  `cause` chain, depth-capped at 5. **Upstream read at both tags.** cyrup has no analogue at all —
+  `grep -rn 'api.github.com' --include=*.rs crates/` hits only the Copilot token URL, and cyrup-tools
+  runs grep/find in-process over the `ignore` crate (`ops/mod.rs:245-291`). **Recorded not as a gap
+  but because this area's `ops` seam documents pi's `ensureTool("rg")` call at `ops/mod.rs:259`, and
+  that citation is now stale** (see the offset warning above).
+
+### cyrup-side surfaces landed in this window with no ledger row
+
+- **`bash` stamps `CYRUP_CODING_AGENT`, not `PI_CODING_AGENT`** · S — **the highest-value entry in
+  this section, and a lead against a CLOSED row that is left untouched.**
+  `crates/cyrup-tools/src/tools/bash.rs:309` now pushes `CYRUP_CODING_AGENT=true` into every child
+  instead of `PI_CODING_AGENT=true`, and `crates/cyrup-tools/src/config.rs:47-56`
+  (`session_env_scrub_keys()`) actively DELETES an inherited `PI_CODING_AGENT` from the child; same
+  flip in `cyrup-session-svc/src/bash.rs`. `TOOL-031` is CLOSED in `## Open items` ("CLOSED 2026-08-15 — the
+  residual was already gone at HEAD") for the defect "`bash` stamps no agent-identity variable into
+  the child — neither `PI_CODING_AGENT` nor v0.84.1's `AI_AGENT`", and its Verify is
+  `bash 'echo ${AI_AGENT:-ABSENT} ${PI_CODING_AGENT:-ABSENT}'` returning neither ABSENT. **That
+  verification is RED at `b28d3ff`** and the child no longer sees the upstream spelling at all, so the
+  closure is reopened as stated, whether or not the rename is defensible. cyrup and the ledger were
+  read at `b28d3ff`; **pi's `cli.ts:13` at v0.83.0 was NOT re-read this pass**, so the upstream half is
+  inherited from the item's own text. **`TOOL-031`'s row and status are unchanged by this census.**
+
+### Cleared in this window — read and deliberately not filed
+
+- **`powershell`, the eighth built-in tool** — already ported, ahead of this file's recorded baseline;
+  see the provenance block above.
+- **`getExperimentalToolSampling` / `constrainedSampling` on read, write, edit, bash** — already
+  ported. Upstream added `core/experimental.ts:1`,`:5-8`; cyrup gates it on the experimental flag on
+  all four (`tools/{read.rs:98, write.rs:93, edit.rs:241, bash.rs:263}`), each with a test asserting it
+  appears exactly when the flag is on.
+- **`edit` single-object input coercion** (pi 0.84.3 / #7835) — already ported and already citing the
+  v0.85.1 offsets: `crates/cyrup-tools/src/tools/edit.rs:124-135` cites `edit.ts:130-131` and
+  `:134-135` and implements both arms plus the legacy `oldText`/`newText` append ordering.
+- **`defaultTools` setting** — already ported as `CFG-079`
+  (`crates/cyrup-config/src/settings/effective.rs:182-206`, round-trip test at
+  `settings/tests/getters.rs:491-504` distinguishing unset from empty).
+- **Windows `taskkill.exe` absolute-path fix, Node half** (pi 0.84.4 / #6596,
+  `packages/agent/src/harness/env/nodejs.ts:259-275`) — the no-op `error` listener is a defence against
+  Node's asynchronous spawn-error event and has no cyrup analogue. **Only the PATH-resolution half is
+  filed above.**
+- `harness/tools/read.ts` (17 lines) — read in full: `Context` threading plus one signature widening
+  (`ReadImageProcessor` gains a fourth argument). No change to truncation, offset/limit, MIME detection
+  or the emitted text.
+
 ## Status since the 1806375 / 9219dcd baseline
 
 | ID | Status | Note |
@@ -187,7 +352,7 @@ Fourteen items closed, four partially closed, nothing overturned, no previously-
 | ~~TOOL-038~~ | ~~medium~~ **CLOSED 2026-08-14** | cyrup-original | S | On Windows with no bash, `bash` silently falls back to `cmd.exe /C`; pi refuses to run — **CLOSED 2026-08-14**: sweep 1 — `ops/shell.rs` `try_detect()`'s Windows arm is pi's verbatim `No bash shell found.` throw with the searched-paths list; no `cmd.exe` arm exists. `detect()` survives only as the infallible `Default` path, degrading to `bash -c` with a `[CYRUP-DELTA]`. |
 | ~~TOOL-011~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `find` path-globs match the relative path; pi/fd match the absolute path — **CLOSED 2026-08-14**: sweep 1 — and FIX THE ITEM'S VERIFY rather than copying it forward: "assert `/src/**/*.ts` returns the same set as `src/**/*.ts`" is wrong about fd, which compares the ABSOLUTE candidate path, so a leading-slash pattern anchors at the filesystem root and matches nothing under a tmp repo. The genuine divergence is case (a) — a pattern naming an ancestor above the search root — and that is what the landed test pins. The confidence-medium caveat (fd not vendored) still applies. |
 | ~~TOOL-014~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `edit`'s access-failure body diverges from pi's `Error code: <ERRNO>` — **CLOSED 2026-08-14**: sweep 1 — the errno mapping exists in `error.rs` (`errno_name`/`io_errno`/`errno_code_of`) and is consumed by `ops/local.rs`'s `access` AND `read_dir`, so TOOL-029 reuses it as the item anticipated. The factually-wrong comment at `edit.rs` is deleted. |
-| TOOL-015 | low | not-ported | M | `edit` does not declare `renderShell: "self"`; nothing reads `render_kind` (residual only) — **FIX SITE: `crates/cyrup-tui/**` + `crates/cyrup-core`, NOT `crates/cyrup-tools`.** **2026-08-14, still open**: sweep 1 — kept open as a pure TOOL-022 residual; the built-in half is done (`EditTool::render_kind()` returns `SelfRendered` at `cyrup-tools/src/tools/edit.rs:131-132`, pinned at `src/tests/pi_tool_semantics.rs:66-78`). Sweep 6 re-verified: what remains is only "give the value a consumer" (cluster C5), and `grep -rn 'render_kind' crates` still shows zero branching sites in cyrup-tui. **FIX SITE CORRECTED 2026-08-14 (sweep 8): `cyrup-tui` + `cyrup-core` is NOT sufficient — `cyrup-tui` has no tool-metadata channel at all, so a producer must be added in `crates/cyrup-session-svc` in the same commit. See the correction block under TOOL-022.** **STILL OPEN 2026-08-15 — re-verified at HEAD `68bbd39`: `grep -rn 'render_kind\|ToolRenderKind' crates/cyrup-tui/` is still zero, so the residual is real and unchanged. Reported BLOCKED, with the size measured and the sweep-8 `cyrup-session-svc` limb questioned, in the 2026-08-15 block under `TOOL-022` — this row and that one are ONE change and must be scheduled together.** **STILL OPEN 2026-09-04 — re-verified at HEAD `2571969`, same grep, same zero. Unchanged.** |
+| TOOL-015 | ~~low~~ **CLOSED 2026-09-14** | not-ported | M | `edit` does not declare `renderShell: "self"`; nothing reads `render_kind` (residual only) — **FIX SITE: `crates/cyrup-tui/**` + `crates/cyrup-core`, NOT `crates/cyrup-tools`.** **2026-08-14, still open**: sweep 1 — kept open as a pure TOOL-022 residual; the built-in half is done (`EditTool::render_kind()` returns `SelfRendered` at `cyrup-tools/src/tools/edit.rs:131-132`, pinned at `src/tests/pi_tool_semantics.rs:66-78`). Sweep 6 re-verified: what remains is only "give the value a consumer" (cluster C5), and `grep -rn 'render_kind' crates` still shows zero branching sites in cyrup-tui. **FIX SITE CORRECTED 2026-08-14 (sweep 8): `cyrup-tui` + `cyrup-core` is NOT sufficient — `cyrup-tui` has no tool-metadata channel at all, so a producer must be added in `crates/cyrup-session-svc` in the same commit. See the correction block under TOOL-022.** **STILL OPEN 2026-08-15 — re-verified at HEAD `68bbd39`: `grep -rn 'render_kind\|ToolRenderKind' crates/cyrup-tui/` is still zero, so the residual is real and unchanged. Reported BLOCKED, with the size measured and the sweep-8 `cyrup-session-svc` limb questioned, in the 2026-08-15 block under `TOOL-022` — this row and that one are ONE change and must be scheduled together.** **STILL OPEN 2026-09-04 — re-verified at HEAD `2571969`, same grep, same zero. Unchanged.** — **CLOSED 2026-09-14** (re-audit at `9aeba769`, both sides read; what the closing code DOES was audited, not merely that it exists). **BOTH halves of the claim are now false.** **(a) Producer**, the half this row already conceded: `EditTool` overrides `render_kind()` → `ToolRenderKind::SelfRendered` (`crates/cyrup-tools/src/tools/edit.rs:196-198`), pinned by the named unit test `edit_declares_self_rendering_and_the_others_do_not` (`crates/cyrup-tools/src/tests/pi_tool_semantics.rs:79-101`). **(b) The residual this row was actually held open on — "zero sites in `crates/` branch on the value" — is DISCHARGED.** The value now has a full wire and a real consumer: `ToolInfo.render_kind` (`crates/cyrup-session-svc/src/tools.rs:41`, filled at `:223` from `t.render_kind()`, `#[serde(skip)]` so pi's `{name,description,parameters,promptSnippet?,active?}` wire shape is untouched) → `AppState::known_tool_definitions`, populated two ways (a live per-tool-start `session.tool_definition(tool_name)` lookup at `crates/cyrup-tui/src/app/events.rs:291-297`, and a bind-time `refresh_known_tool_definitions` at `crates/cyrup-tui/src/app/session_bind.rs:153-161`, so `/resume` replay is covered too) → `ToolRun::definition: Option<ToolRenderKind>` (`crates/cyrup-tui/src/transcript/entry.rs:400-408`) → `crates/cyrup-tui/src/transcript/tool_render.rs:95-122`, which computes `shell` from `run.definition` with the built-in table only as the SECOND tier (pi's `toolDefinition.renderShell ?? builtInToolDefinition.renderShell ?? "default"`, `tool-execution.ts:108-116`) and then does `if shell == ToolRenderKind::SelfRendered { return self_rendered_lines(...) }`. That is a branch on the KIND — precisely what this row's Fix clause demanded ("cyrup-tui should branch on the kind rather than on the run name"). `self_rendered_lines` (`tool_render.rs:163-197`) drops the tinted `Box(1,1)` shell and the untinted leading Spacer for a self-rendered tool; its `own_edit_component` arm re-applies a box ONLY for cyrup's built-in `edit` renderers and is explicitly skipped when an extension supplied `rendered_call`/`rendered_result` — so a guest tool declaring `renderShell:"self"` is no longer double-framed, which is this row's ENTIRE stated Impact. **Verify, both limbs satisfied:** limb (a) by `pi_tool_semantics.rs:79-101`; limb (b) — the TUI check over a guest-shaped tool — by `crates/cyrup-tui/src/tests/tool_render_shell.rs:54-77,:94-113`, which registers a NON-built-in `FramedTool("self_framed", SelfRendered)` into a real `AgentSession` (so nothing can be answered by the `Builtin::Edit` hard-code) and asserts on rendered CELLS: `a_self_rendered_definition_omits_the_default_shell` (`:149`) asserts column 0 and no pending-bg, `a_default_definition_keeps_the_state_tinted_shell` (`:178`) is the discriminating negative control, and `the_live_tool_start_lookup_resolves_the_shell_without_a_bind_refresh` (`:209`) covers the `events.rs` path independently of the bind refresh. **Not upstream drift — settled at BOTH tags, so the close is not an artifact of a moved upstream:** `renderShell: "self"` is declared at the ported baseline (`packages/coding-agent/src/core/tools/edit.ts:306` @v0.83.0) and at current (`edit.ts:158` @v0.85.1), with the option typed at `core/extensions/types.ts:466-467` @v0.85.1. **NOT vouched for:** the 4-of-7 built-in `Default` coverage recorded as a negative result is test coverage, not behaviour. **Falsification — this closure rests on an OBSERVATION (the branch and the cell-level tests), not an argument, so it reopens only by measurement:** if `tool_render.rs`'s `if shell == ToolRenderKind::SelfRendered` guard is removed or is made to read `run.name` instead of `run.definition`, or if `crates/cyrup-session-svc/src/tools.rs:223` stops calling `t.render_kind()` (making every `ToolInfo.render_kind` the `Default` fallback and silently re-framing every guest tool while BOTH TUI tests still pass, since they construct their own session), the row reopens. A cheap standing guard worth adding: assert `AgentSession::tool_definition("edit").render_kind == SelfRendered` end-to-end from the session registry — no current test does this, `tool_render_shell.rs` only exercises a synthetic `FramedTool`. |
 | ~~TOOL-016~~ | ~~low~~ **CLOSED 2026-08-14** | upstream-drift | M | `constrainedSampling` has no representation in cyrup's tool model — **CLOSED 2026-08-14**: sweep 6 — **closed under `PROV-011`, not under this row, which is why no tools pass noticed.** `cyrup_core::Tool::constrained_sampling()` is on the vtable (`cyrup-core/src/tool.rs:156`, type in `cyrup-core/src/constrained_sampling.rs`), the WIT `tool-descriptor` carries `constrained-sampling`, and `cyrup-agent/src/agent.rs:829` copies it onto the runtime tool; pinned end-to-end by `cyrup-agent/src/tests/agent_loop.rs::prov011_a_tools_constrained_sampling_declaration_reaches_the_provider`. **Do not add opt-ins to cyrup-tools' built-ins**: no pi built-in declares `constrainedSampling` (three grep hits at v0.83.0, all in `extensions/types.ts:463` and `tool-definition-wrapper.ts:14`/`:42`), so that would be a divergence *from* pi. |
 | ~~TOOL-017~~ | ~~low~~ **CLOSED 2026-09-04** | not-ported | M | `read`'s compact `docs` classification arm is unported (residual only) — **CLOSED 2026-09-04**: the blocking PRODUCT DECISION was taken and the arm is ported. `cyrup_config::asset_dir()` (`crates/cyrup-config/src/paths.rs:179-182`, resolver `resolve_asset_dir` at `:184-`) is now cyrup's shipped-docs root — a three-tier port of pi's `getPackageDir` (`$CYRUP_ASSET_DIR` escape hatch, the single-file-binary `README.md`-sibling check, then the nearest `Cargo.toml` ancestor). The `docs` arm itself is `docs_classification` (`crates/cyrup-tui/src/transcript/tool_args.rs:424-438`), wired into `compact_read_classification` AHEAD of the resource-name set exactly as `read.ts:136-137` orders it (`tool_args.rs:506-511`), with the `SKILL.md`/`docs`/`resource` three-way precedence intact end to end (`:474-522`). Landed in commit `2daaa32` ("pi parity sweep — 25 defects closed"), inside the `4fb5e40..HEAD` window this pass measures. Pinned by `x7b_reads_under_the_asset_root_classify_as_docs` and `x7c_the_docs_guard_needs_the_separator` (`crates/cyrup-tui/src/transcript/tests/x_group.rs:222-272`), which construct real paths under `asset_dir()` and assert the `README.md`/`docs/`-prefix/`docs/AGENTS.md`-precedence/no-separator cases named in the upstream function. The in-source blocker note this row's 2026-08-15 edition cited is gone — `grep -rn "shipped-docs\|getPiDocsClassification"` now resolves to the doc comment on `docs_classification` itself, not to an absence. |
 | ~~TOOL-018~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `edit` fuzzy matcher returns not-found where pi returns duplicate-occurrences — **CLOSED 2026-08-14**: sweep 1 — the CODE option was taken, not the documentation option: the divergence was not forced (Rust `str::find("")` is `Some(0)`, identical to JS), so a `[CYRUP-DELTA]` would have been an accepted-divergence in disguise. The one genuinely unobservable difference (empty content + empty needle: pi -1 vs cyrup 0) is documented in-source. |
@@ -1118,7 +1283,7 @@ to **TOOL-007** as one shell-surface decision; the coupling is stated in both it
 table.
 
 *Covered — the cross-tag citation sweep (critique finding 9), and it found a real defect.* This file
-declares pi **v0.84.1** as its oracle (line 3) while `README.md:224-225` requires classification
+declares pi **v0.84.1** as its oracle (line 3) while `README.md:267-268` requires classification
 against the ported tag v0.83.0. The prior pass justified that with a version-lag sweep — but that
 sweep was scoped to `packages/coding-agent/src/core/tools/`, and **four of this area's upstream files
 live outside it**. Every file cited by an open item was re-diffed across the tags:
@@ -1146,7 +1311,7 @@ now labelled and will not be scheduled as a port regression. The seven purely-nu
 no finding — in each case the code was byte-identical and only the addressing moved — and the
 v0.83.0 equivalents are recorded above rather than rewritten into every item, because this file's
 declared oracle is v0.84.1 and re-anchoring it wholesale would introduce more error than it removes
-(`README.md:224-225`: do not fix a citation by shifting it).
+(`README.md:267-268`: do not fix a citation by shifting it).
 
 *Covered — the tracker test (critique finding 14).* Every open item was re-read against "does this
 propose a change with a named fix site, or only a decision?". **None in this area is a tracker**, so
@@ -1165,7 +1330,7 @@ gets `from_utf8_lossy` garbage where pi shows an image) but it needs a PNG with 
 pre-`acTL` chunks, which is not an ordinary path; the rule applied across all three of this repair
 agent's files is "meets a README:106-107 condition **and** the triggering path is one a user takes in
 ordinary use". (c) **Re-anchoring every v0.84.1 citation in this file to v0.83.0** — rejected in
-favour of the offset table above, for the shifting hazard `README.md:224-225` names.
+favour of the offset table above, for the shifting hazard `README.md:267-268` names.
 
 *Still blind after this pass.* The sweep diffed the upstream files **cited by open items**; it did
 not enumerate `packages/coding-agent/src/utils/` as a surface, which is how `paths.ts` was missed in

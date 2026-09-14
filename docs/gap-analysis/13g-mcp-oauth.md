@@ -63,6 +63,112 @@ being `pub(crate)` — all rest on the WASM-guest capability model and do not ap
 
 ---
 
+> ### PROVENANCE CORRECTION — 2026-09-14. The pins below are revised; **this file was not re-read.**
+>
+> Everything in this file is history and is correct as written. It was audited against
+> **`pi-mcp-adapter` v2.25.0** — that is the tag its prose, its unit obligations and every upstream
+> citation in it were read at, and it stays. **Nothing in this block re-verifies any of it: no unit
+> was re-read, no obligation re-derived, no count, severity, verdict or status changed.** This block
+> states only how stale the file is; the section after it is a worklist, not a finding.
+>
+> | | audited at (history — do not rewrite) | current pin (authoritative, per `README.md`'s baselines table) | window this file has never measured |
+> |---|---|---|---|
+> | `pi-mcp-adapter` | **`v2.25.0`** (the plan's tag) | **`v2.33.0`** *(was v2.32.1)* | `v2.25.0..v2.33.0` = **211 files, +27 961 / −2 129**, 113 non-merge commits. Two segments of that range are measured elsewhere and are NOT this file's blind spot: `v2.25.0..v2.26.1` by [`13-cyrup-mcp.md`](13-cyrup-mcp.md)'s *Retarget* section, `v2.26.1..v2.32.1` by [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md)'s 2026-09-04 re-audit. **`v2.32.1..v2.33.0` = 123 files, +9 455 / −1 352, 33 non-merge commits, is measured by nobody.** That is the unmeasured window, and the census below is its lead list |
+> | `cyrup` | **deliberately unpinned** — this file cites cyrup by symbol and file only, and its header says so | code HEAD **`b28d3ff`**; the ledger's last recorded code baseline is `824a539e` | **Not expressible.** With no sha ever recorded here there is no window to name: the staleness of a cyrup claim in this file cannot be bounded, only re-read. For scale, `crates/cyrup-mcp` at `b28d3ff` is **43 `.rs` files / 79 930 lines** under `src` — 29 top-level modules plus the `proxy/` tree |
+> | `pi` · `pi-subagents` · `pi-permission-system` · `pi-intercom` · `pi-acp` · `code_puppy_core_plugins` | — | `v0.85.1` · `v0.67.0` · `v0.8.0` · `v0.13.0` · `v0.0.33` · `v0.0.50` (ported surface byte-identical across all 39 tags) | out of this area's scope |
+
+### UNVERIFIED — 2026-09-14 census of the `v2.32.1..v2.33.0` window (leads, not units)
+
+**Nothing in this section is a port unit.** No `MCP-NNN` id is assigned — id allocation belongs to a
+pass that read both sides, and this one did not read the cyrup side everywhere. Numbering resumes
+from **`MCP-539`** when such a pass files it. **No unit in this file is opened, closed, re-ranked or
+re-verdicted here, and no status cell in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) moves.**
+
+Method: upstream read only via `git -C tmp/pi-mcp-adapter show v2.33.0:<path>` and
+`git diff v2.32.1..v2.33.0 -- <path>`; cyrup read at `b28d3ff`. Each entry names which side was read;
+where only one side was read it says so and is a lead with half its evidence missing. An absence
+stated as "grep = 0" is a grep over `crates/cyrup-mcp/src`, not proof that a differently-named
+counterpart does not exist.
+
+#### New surfaces
+
+- **`mcp-auth-fetch.ts` — origin-scoped service headers, timeouts, redirect fail-closed** · L ·
+  UPSTREAM READ IN FULL; **cyrup side NOT READ.** New file, 125 lines: `:11 resolveOAuthHeaders(values,
+  commands)` (missing env → `TypeError`, empty value → throw, every failure collapsed to a value-free
+  `TypeError` so a header constructor cannot leak a secret); `:49 createOAuthFetch(serverUrl,
+  getHeaders, signal, {timeout, delegate})` — service headers **only** when `url.origin === origin`,
+  SDK headers win on collision, `redirect: "error"` on any request that carried service headers, fetch
+  failures on protected requests collapsed to a bare `TypeError`; `:96 oauthHeaderResolver` (resolve
+  once per leg, cache success OR failure, never in storage); `:112 authFetch`; `:120
+  createOAuthAwareFetch`; `resolveOAuthRequestTimeoutMs` reading `PI_MCP_OAUTH_REQUEST_TIMEOUT_MS`
+  over a 30 s default. Consumed at `mcp-auth-flow.ts:278` (`probeAuthDiscovery`, command-free), `:433`,
+  `:516`, `:853`, `:1058`; `mcp-oauth-provider.ts:284`/`:317`/`:362`
+  (`throwIfHeaderResolutionFailed` inside `throwIfInactive`, "because the SDK can swallow refresh fetch
+  errors and attempt browser authorization"); `server-manager.ts:1238-1243` and `:1317-1324`. Upstream
+  `0829964` (#535). A new fetch layer between the adapter and the MCP SDK's OAuth machinery:
+  configured `headers` now accompany discovery, dynamic registration, code exchange and refresh — but
+  **only at the configured MCP URL's origin, never at a discovered issuer** — and origin-bound headers
+  are deliberately no longer put in SDK `requestInit` (`server-manager.ts:1269`: the SDK reuses those
+  defaults for cross-origin OAuth endpoints). The preliminary challenge probe is command-free by
+  construction; a failed header resolution latches and stops the SDK's browser-authorization fallback
+  and any token persistence. NEW PORT UNIT and **the most security-shaped thing in the window** — the
+  same class of defect the v2.26.1 retarget already caught once for `requestHeadersCommand`
+  (`MCP-069a`, `MCP-115a`) and that `MCP-500` guards for `URL_BOUND_AUTH_FIELDS`. It also **reshapes
+  the recorded `MCP-115`/`MCP-115a` obligations**, because the header path through `connectHttpClient`
+  is no longer a single `requestInit`. The v2.33.0 README pins the contrast that must survive the
+  port: configured `headers` are origin-scoped, `requestHeadersCommand` output is **not** (it follows
+  the fetch, signs cross-origin OAuth too, and overrides even SDK `Authorization`). **All three rows
+  are untouched.**
+- **`PI_MCP_OAUTH_LOG` transaction diagnostics** · S · UPSTREAM READ IN FULL; the transaction surface
+  it observes is unported, so it cannot exist in cyrup. New file `oauth-diagnostics.ts` (31 lines):
+  `:13 logOAuthDiagnostic(event, details)` — four events
+  `oauth_transaction_{waiting,acquired,completed,failed}`, NDJSON append to `$PI_MCP_OAUTH_LOG` with
+  `mkdir` 0o700 / `appendFile` 0o600, a `randomUUID` transaction id, `durationMs`, and a catch-all
+  that swallows every failure ("Optional diagnostics must not affect credential persistence or lock
+  cleanup"). Emitted from `mcp-oauth-provider.ts:291-313`. An opt-in, credential-free observability
+  channel for the new lock contention. NEW PORT UNIT, small and strictly additive — worth filing
+  **separately** from the lock, because it is the only thing that will make the lock debuggable and
+  because the "never let diagnostics affect persistence" rule is a real constraint on where the calls
+  sit. Sits next to the existing `MCP-478` tracer (`trace.rs:499`, recorded `implemented`) but is a
+  different channel. The lock itself is filed in [`13f`](13f-mcp-credentials.md).
+
+#### Changes to existing units
+
+- **`{port}` dynamic loopback OAuth redirect URIs (RFC 8252)** · M · UPSTREAM READ IN FULL; cyrup
+  side not read (`crates/cyrup-mcp/src/oauth.rs` not opened). `mcp-auth-flow.ts:328-400
+  parseOAuthRedirectUri` — at most one `{port}` placeholder, it must be the authority's port,
+  `http://` plus localhost/127.0.0.1/::1 only, parsed against a stand-in port then re-substituted; the
+  `OAuthRedirectTarget` union gains `port?`, `dynamicPort`, `resolveRedirectUri(port)`; the "localhost
+  redirectUri must include an explicit numeric port" error is **removed**. `mcp-auth-flow.ts:462-484`:
+  `strictPort` becomes `!redirectTarget.dynamicPort` and `config.redirectUri` is rewritten from
+  `getOAuthCallbackPort()` after the listener binds. `types.ts:398`'s `OAuthConfig.redirectUri` doc
+  comment changes. Upstream `cb8e316` (#483). A pre-registered client can now declare
+  `http://127.0.0.1:{port}/callback` and let the OS assign the port. Change to this file's
+  `parseOAuthRedirectUri` / callback-server units (ids not identified in this pass). It interacts with
+  the open **`MCP-522`** (HTTPS callbacks completed manually) and **`MCP-525`** (idle listener
+  release), both table-B rows whose TypeScript has not been read: all three touch the same
+  `ensureCallbackServer` / `strictPort` / release path and **one read pass should cover them
+  together**. **Both rows untouched.**
+- **Stale dynamic-client re-registration and refresh-capable credential preservation** · M · UPSTREAM
+  READ IN FULL; **cyrup side NOT READ.** `mcp-oauth-provider.ts:270` adds a `staleRedirectClientId`
+  field; `:488-494` marks a stored registration whose `redirectUris` no longer contain the current
+  `redirectUrl`; `:745-748` promotes it to `invalidatedClientId` on the `invalid_grant` path so the
+  NEXT `clientInformation()` makes the SDK re-register with the current callback URI; `:331-334`
+  `throwIfInactive` now also calls `authFetch.throwIfHeaderResolutionFailed`. `mcp-auth-flow.ts:500-520`:
+  a redirect-URI mismatch **no longer clears tokens when a `refreshToken` exists** ("Refresh does not
+  send redirect_uri; preserve refresh-capable credentials") — the `clearTokens` import is gone. Also
+  `mcp-auth.ts:731`/`:746-756`: `readAuthEntry` gains a `cache` behaviour flag separable from
+  `migrateLegacy`, and provider reads pass `{migrateLegacy: ctx !== undefined, cache: true}` so a read
+  outside a real auth context neither migrates nor writes. Upstream `6dfeaa1` (#503), `f6cabbd`
+  lineage. Two paired fixes: a stale dynamic registration is kept alive long enough to try its
+  refresh and then invalidated so the client re-registers rather than looping; and a redirect-URI
+  mismatch stops destroying credentials that can still be refreshed. Change to this file's
+  provider/flow units, and an **extension of the open `MCP-524` and `MCP-523`**; the
+  `migrateLegacy`/`cache` split also touches [`13f`](13f-mcp-credentials.md)'s entry-cache unit. This
+  is exactly the class of fix that is invisible in a fresh port and only bites on a re-auth after a
+  callback-port change, so it belongs in the ledger even though nothing in cyrup implements the
+  surrounding flow yet. **Both rows untouched.**
+
 ### How it lands
 
 | # | adapter capability | upstream mechanism | cyrup mechanism | verdict |

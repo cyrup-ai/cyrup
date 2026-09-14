@@ -8,6 +8,363 @@ three corrections to `09`'s existing evidence (see `## Corpus health`). `PARITY-
 found one of them factually wrong at HEAD, the correction is written below rather than applied there,
 so a single maintainer can reconcile all of them in one pass.
 
+> ### PROVENANCE CORRECTION 2026-09-14 — pins re-derived; this file was NOT re-read
+>
+> **Audited at (history — unchanged, and correct as written):** upstream `pi-subagents` **v0.57.0**,
+> against **v0.47.1** as the window's opening tag, cyrup HEAD `6db22a7`; re-audited 2026-09-04 at cyrup
+> HEAD `2571969`, with batch-3/4 closures recorded against code at or before `824a539e`. Every
+> `git show v0.47.1:<path>` / `git show v0.57.0:<path>` / `git show v0.64.0:<path>` citation in this
+> file records what somebody actually read at that tag. **None of them may be rewritten to a newer
+> tag.**
+>
+> **Current pins:** pi-subagents **v0.67.0**. cyrup code HEAD **`b28d3ff`** (README records `9aeba769`
+> as the last CODE commit, `824a539e` superseded; `9aeba769..b28d3ff` is docs-only).
+>
+> **Therefore unmeasured by this file:** upstream **`v0.57.0..v0.67.0`** = 207 files, +24 658 / −9 124,
+> 54 net-new source files, 5 deletions — of which this file's own **non-exhaustive skim** of
+> `v0.57.0..v0.64.0` filed exactly one item (`SUBA-092`) and says in its own words to treat that range
+> as unaudited rather than clean, and **`v0.64.0..v0.67.0` (159 files, +10 919 / −6 444, 30 net-new
+> source files) has been touched by no pass at all**. On the cyrup side, **`824a539e..b28d3ff`** is
+> unmeasured here.
+>
+> **This correction re-read nothing.** No item was re-verified, no closure re-checked, no severity or
+> count changed. Only the pins moved.
+>
+> **Three corrections to recorded pins, stated and not applied:**
+> 1. **The README baselines row names a feature that does not exist at v0.67.0.** It lists the
+>    `v0.64.0..v0.67.0` window as carrying "in-process pi child sessions, **bounded SSH project
+>    execution**, watchdog model-fallback chains, per-child async completion notification". Three are
+>    real and present at the tag. **SSH is not.** It landed in `f0e28ced` (+946 / 24 files),
+>    `0a70860b` and `8d16488a` on 2026-09-09 and was removed the same day by `eef119aa` "refactor:
+>    remove unreleased SSH and Orca experiments (#2124)" (−1 690) **before the tag was cut**:
+>    `git cat-file -e v0.67.0:<path>` fails for all five `ssh-*.ts` modules and
+>    `git ls-tree -r --name-only v0.67.0 -- src | grep -i ssh` is empty. The same revert also removed
+>    `test/unit/ghostty-inspector.test.ts` and gutted `orca-progress-tabs.ts` (−78). A pass reading only
+>    the README will hunt a subsystem that exists at no tag it is permitted to cite.
+> 2. **This file's deferral of the workflow subsystem has expired and reads as current.** `09a`
+>    dismisses `v0.57.0..v0.64.0` as "dominated by the still-out-of-scope `workflowScript`/watchdog
+>    subsystems", and `09a:3350` states that the receipt / child-summary / one-use-permit /
+>    detach-reconcile layer is "unreachable without the `workflowScript` runtime and a Workflow RunMode
+>    the port cannot represent". **Both clauses are false at `b28d3ff`** — `crates/cyrup-workflow-runtime`
+>    is a crate, `crates/cyrup-ext-subagents/src/workflows/` carries `preflight.rs`, `resources.rs`,
+>    `receipt.rs`, `host_command.rs`, `checklist.rs`, `lane_metadata.rs` and `scripted/engine.rs`, and
+>    `RunMode::Workflow` is minted in production at `extension/tool/routing.rs:600`. Those surfaces are
+>    now **in scope and unaudited**, which is worse than out-of-scope because the exclusion still reads
+>    as current.
+> 3. **The area's ported baseline has no single value.** See the same correction in `09`: the crate's
+>    own in-source citations run v0.43.0=611, v0.64.0=330, v0.57.0=120, v0.47.1=98, with one v0.66.0 and
+>    zero v0.65.x/v0.67.0. A surface absent from cyrup but stamped `@v0.64.0` elsewhere in the crate is
+>    a miss, not lag.
+
+## UNVERIFIED census 2026-09-14 — `v0.57.0..v0.67.0` leads
+
+**Nothing in this section is a finding.** These are leads from a census pass that read both sides at
+the pins above; none has been through this file's adversarial refutation pass, none carries a `SUBA-`
+id, and id assignment belongs to a pass that verifies both sides. **No item, closure, severity or
+count elsewhere in this file was changed by this census.**
+
+**Ownership caveat, stated plainly:** every lead below sits in `v0.57.0..v0.67.0`, which is **outside
+this file's own `## Scope` line** (`v0.47.1..v0.57.0`). They are recorded here as the area's
+drift-holder for want of a better home; the structurally correct home is a
+**`09b-cyrup-ext-subagents-v0.67-drift.md`**, on the precedent that created this file. Whoever
+reconciles it must state which of the two owns `v0.57.0..v0.64.0`, since this file's one-item skim
+already overlaps the front of the window. Three leads point elsewhere: `turnBudget` (see `09`, bears on
+`SUBA-008`), MCP config sources (overlaps `13c-mcp-servers.md`), supervisor-UI rendering (may belong to
+area 11).
+
+Sizes are the census's own estimate on this file's `S`/`M`/`L` scale. Where a lead says one side was
+not read, that is literal — treat it as a lead with a missing half, not a defect.
+
+**Self-citations by line number are as-read before this block was inserted.** A `09a:NNN` offset is
+short by **352 lines** against this file at HEAD, and a `09:NNN` offset by **209 lines** against `09`;
+both files gained a provenance block and a census ahead of their bodies in the same pass. Follow the
+item id, not the offset.
+
+### Architecture
+
+- **In-process pi child sessions replace the spawned-child-process model.** `L` — `d9bc62f8`. Upstream
+  stopped launching children as `pi` subprocesses: the argv/env contract (`pi-args.ts`, 925L), the
+  NDJSON child wire protocol (`child-protocol.ts`, 415L), the startup-retry ladder
+  (`subagent-startup-retry.ts`) and the post-exit stdio guard were all DELETED, replaced by an
+  injectable `ChildSessionFactory` calling `createAgentSession` in-process over one shared
+  `ModelRuntime` (`src/runs/shared/child-session.ts:1-10`, `child-launch.ts:1-6`,
+  `src/runs/background/run-child-session.ts:1-8` @v0.67.0); background children get host-package API
+  identity through a computed `JITI_ALIAS` map (`runner-aliases.ts`). cyrup resolves its own binary
+  (`current_exe` with a 5-tier fallback, `spawn/mod.rs:360-386`), assembles a `ChildSpawnSpec`
+  (`spawn/mod.rs:402`) and drives a real `tokio::process::Child` (`exec/spawn_plan.rs:7-11`).
+  **The single largest architectural divergence in the window, and it invalidates the mechanism a large
+  fraction of this crate is written against.** Blast radius reaches at least area 10:
+  `exec/spawn_plan.rs:28-36` declares the env overlay a CROSS-CRATE CONTRACT that
+  cyrup-permission-system's `forwarding_spawn_env.rs` drives a real child against. **The census did NOT
+  establish that cyrup should follow** — cyrup is already one binary containing cyrup-agent/cyrup-session,
+  so in-process may be cheaper for it than for pi, or the subprocess may be a deliberate isolation
+  choice. That is the design question this lead exists to force; **no `[CYRUP-DELTA]` anywhere in
+  `spawn_plan.rs` or `spawn/mod.rs` records such a decision.**
+
+### Model resolution, recovery and provider routing
+
+- **Watchdog bounded model-fallback chains (`fallbackModels`).** `M` — `baf18d5d`. Upstream added an
+  ordered fallback chain at three settings scopes (`watchdog/settings.ts:114-116`, `:224`/`:235`/`:247`;
+  `types.ts:89-90,96-97`), with `review.ts:260-278` building candidates from `main.model ?? inherited`
+  plus `main.fallbackModels`, advancing only on a retryable attempt failure, bailing on context
+  overflow, and throwing "No usable watchdog model candidates." cyrup's
+  `watchdog/settings.rs:162`/`:171` is field-for-field identical **minus** `fallbackModels`
+  (`grep -rniE 'fallback_models|fallbackModels' crates/cyrup-ext-subagents/src/watchdog/` = 0). One of
+  the README's four headline claims — **verified real and present at v0.67.0**. Reuses machinery cyrup
+  has (`is_retryable_model_failure_attempt`, landed for `SUBA-089`). **Not checked:** whether cyrup's
+  watchdog review has a candidate-loop shape that can accept a ladder at all, so the size covers the
+  schema+parse half with the loop unestimated.
+- **Abort-recovery resume plan for provider/transport aborts.** `M` — `src/runs/shared/abort-recovery.ts:3-14`
+  @v0.67.0 (119L): `ABORT_RECOVERY_PROMPT`, `AbortRecoveryPlan = {action:"resume"} | {action:"settle"}`,
+  `PROVIDER_ABORT_PATTERN`, `ABORT_ERROR_PATTERN`, and `TOOL_FAILURE_PREFIX` to exclude plain tool
+  failures; entered in `v0.47.1..v0.67.0`, sited upstream at `subagent-runner.ts:1401` /
+  `execution.ts:2029`. **cyrup's side is a self-declared gap, not an inference:**
+  `exec/fallback.rs:1064-1065` names `AbortRecovery` inside a comment block headed "UNPORTED upstream
+  kinds, named here so the gap is greppable rather than invisible". **That in-source note is the
+  strongest evidence class this census produced**; the item is already scoped by the porters and is
+  filed under no id in `09` or `09a`.
+- **Read-only model continuation after a native 429.** `M` — `51907287`;
+  `readonly-model-continuation.ts:4-13`, `readonly-session-evidence.ts:1` (307L),
+  `readonly-drain-observation.ts:1-6` @v0.67.0. A child that has provably done only read-only work and
+  hits a retryable 429 is continued ONCE on a compatible alternate model, on hashed session-entry
+  evidence plus a host assessment of retained-input support and context capacity including prompt
+  overhead. cyrup names it unported at `exec/fallback.rs:1066` with the correct upstream tag — **the only
+  v0.66.0 citation anywhere in the crate.** **Caveat that must survive:** all three upstream modules go
+  out of their way to say they are inert by default ("No runner enables continuation through this
+  module", "Never changes drain/query behavior"), so a port must settle whether any v0.67.0 path reaches
+  them before sizing. The call graph was not traced; treat the size as an upper bound on a feature that
+  may be dormant upstream too.
+- **OpenCode session-routing headers on subagent-internal model calls.** `S` —
+  `src/shared/opencode-session-headers.ts:13-20` @v0.67.0 (30L, `OPENCODE_HOST = "opencode.ai"`,
+  hostname-exact, `undefined` for every other provider). Upstream's own note: pi's session path emits
+  these from coding-agent's provider-attribution merge, but subagent-internal calls (watchdog review,
+  permission arbiter, task-mutation arbiter, prompt audit) stream through bare Agents that bypass it,
+  and without them OpenCode falls back to client-IP affinity and **loses prompt-cache routing** (pi
+  issue #4847). `grep -rniE 'opencode' crates/cyrup-ext-subagents/src` = 0. All four named call sites
+  have cyrup counterparts (`watchdog/review.rs`, `watchdog/permission_arbiter.rs`, `exec/task_intent.rs`,
+  `prompt_runtime.rs`). **The symptom is a cost/latency regression, not a wrong answer, so it will never
+  surface as a failing test** — which is why it belongs in a census. Not verified: whether cyrup's
+  provider layer has a per-request header seam these can attach to; if not, the size is larger.
+- **`config.modelResponseAliases` validation.** `S` — `src/shared/model-response-aliases.ts:1-12`
+  @v0.67.0 (13L); `grep -rniE 'response_alias|responseAlias'` = 0. **Filed at low confidence about
+  IMPORTANCE, not existence:** what consumes `modelResponseAliases` at v0.67.0 was not traced, so this
+  may be a config key cyrup silently ignores (harmless until someone sets it) or a **resolution rung in
+  the model ladder**, which would make it a real behavioural gap colliding with `SUBA-088`'s residuals
+  about `providerOverrides` and bare-id qualification. **Resolving that consumer is the first thing the
+  next pass should do with this row.**
+
+### Async completion and workflow children
+
+- **Per-child async completion notification for workflow children (`onChildSettled`).** `M` — `aa579dc7`.
+  A workflow run now wakes its parent as EACH async child settles rather than only when the whole fan-out
+  completes: `src/runs/background/notify.ts:57-65` (`IncrementalChildCompletion` naming the workflow run,
+  child key, exact child run/attempt id, outcome, saved output reference and whether the workflow is still
+  running), `:325-340` (`formatIncrementalChildCompletion`), `scripted-workflow.ts:1172,1197` and
+  `:2016-2036` (fires per settle, swallows callback throw), `subagent-executor.ts:120,5567-5580`.
+  `grep -rniE 'incremental_child|on_child_settled|child_settled'` = 0. One of the README's four headline
+  claims — **verified real and present at v0.67.0**. **The delivery path is NOT the one the commit subject
+  advertises:** the commit's own later chore steps stripped the `notify.ts` delivery integration as dead,
+  and the live path sends directly via `pi.sendMessage` from `subagent-executor.ts:5579` using the
+  formatter as a plain formatter. **A port that followed the commit subject would build the wrong seam.**
+  Relevance is now real rather than theoretical because cyrup landed `crates/cyrup-workflow-runtime` and
+  `workflows/scripted/engine.rs` — this file's deferral of the subsystem has expired.
+
+### Discovery and advertisement
+
+- **`<advertised_subagents>` catalog injected into the PARENT's system prompt.** `M` —
+  `src/agents/advertised-agent-prompt.ts:1-9` @v0.67.0 (94L net-new): renders the discovered agent set as
+  an escaped XML block appended to the parent session's system prompt, bounded at
+  `MAX_ADVERTISED_AGENTS = 16` / `MAX_CATALOG_BYTES = 12_288` / `MAX_DESCRIPTION_BYTES = 512`, filtered
+  through `isAgentAllowedByCapabilityCeiling`, idempotently replaceable via `ADVERTISED_AGENTS_BLOCK`;
+  wired at `extension/index.ts:23`, `:542-548`, `:818`. `grep -rniE 'MAX_ADVERTISED|advertised_subagents'`
+  = 0 (the only `advertised` hits are unrelated prose in `exec/spawn_budget.rs:10` and
+  `exec/acceptance/lattice/lowering.rs`). **Directly changes what the PARENT model can see and therefore
+  which subagents it will ever delegate to** — the advertisement class README blind-spot 4 says is
+  repeatedly mis-scored. Second consumer of `capability_ceiling`, which cyrup already has in 5 files.
+  **Not verified:** how cyrup currently advertises agents to the parent, so whether this replaces an
+  existing mechanism or adds a missing one is open.
+- **`subagents.agentScanDirs` — settings-driven agent discovery directories.** `S` — `59d920f9`;
+  `src/agents/agents.ts:197`, `:1186-1192` (parse + "Subagent settings in '<file>' have invalid
+  'agentScanDirs'; expected an array of non-empty strings."), `:1208`. `grep -rniE 'scan_dirs|scanDirs'`
+  = 0. A discovery-source change, so it interacts with the source-rank ladder `SUBA-084`'s closure
+  established (`AgentSource::Runtime` at rank 4) — **where a scan-dir agent sits in that ranking is the
+  design question, and upstream's rank assignment was not read.** Low blast radius alone, but discovery
+  is the front of the whole area.
+
+### Worktrees
+
+- **`worktreeProvider: "auto"|"native"|"worktrunk"`.** `M` — `c29ae865`; `src/extension/config.ts:146-147`
+  (validator, `config.worktreeProvider must be "auto", "native", or "worktrunk"`),
+  `src/runs/background/async-execution.ts:788-792`, `:1102`, `:1159`, `:1617-1621`
+  (`managedWorktreeProvider`, `shouldDeferWorktreeCwd`). `grep -rniE 'worktree_provider|worktrunk'` = 0;
+  cyrup has only the native path (`spawn/worktree.rs`). **The interesting half is not the third-party
+  integration but the deferred-cwd control flow** — `worktrunk` defers cwd resolution to an external
+  manager, which changes WHEN a child's cwd is known and is why it reaches four sites rather than one,
+  on the same async-execution seam cyrup's background runner mirrors. `shouldDeferWorktreeCwd` itself
+  was not read, so the deferral semantics are unverified.
+- **Plan-only worktree cleanup action and the cleanup-plan manifest.** `L` — `36d3a28f`;
+  `src/runs/shared/worktree-cleanup-plan.ts:19-24` @v0.67.0 (`WORKTREE_CLEANUP_PLAN_VERSION = 1`,
+  `TTL 30 min`, `MAX_DISCOVERED_HANDOFFS = 256`, `MAX_PLAN_ENTRIES = 512`,
+  `MAX_METADATA_FILE_BYTES = 2 MiB`), `:1-18`; 869 net-new lines, and the landing commit also touches
+  `extension/schemas.ts` (+6) and `tool-description.ts` — i.e. **a new advertised tool action**.
+  `grep -rniE 'worktree_cleanup|cleanup_plan'` = 0; cyrup has only immediate removal
+  (`spawn/worktree.rs:20` `cleanup_worktrees`, "best-effort removal of every worktree + branch", called
+  at `:865`). **Two distinct gaps stacked:** the unadvertised tool action, and the absence of any dry-run
+  path in cyrup's destructive cleanup. cyrup does carry `AuthorityAction::DestructiveCleanup`
+  (`registration/authority.rs:129`), so a plan-then-confirm shape has somewhere to land — **but what that
+  gate currently guards was not read, so the connection is a hypothesis.**
+- **Bounded worktree setup-command execution.** `M` — `src/runs/shared/worktree-setup-command.ts:5-18`
+  @v0.67.0 (190L): one wrapper carrying `signal`, `deadlineAt`, `hookTimeoutMs` ("Only the existing
+  configured setup-hook timeout, not a new Git budget"), `maxBuffer` ("Worktrunk uses 128 KiB; Git and
+  hooks use spawnSync's 1 MiB default"), `acceptedExitCodes` ("Read-only probes may define negative
+  answers as completed commands") and `onSpawn`, built on `createOwnedProcessTreeController`.
+  **UPSTREAM SIDE ONLY** — the option surface was read at the tag; `spawn/worktree.rs`'s spawn sites were
+  not, so the census **cannot assert cyrup lacks these bounds.** Recorded because it is adjacent to a
+  defect class this area has been burned by twice: `SUBA-069` (the worktree-setup-hook timeout default,
+  30000 not 5000) and `SUBA-095` (an unbounded post-loop `child.wait()` in the external-CLI runner). A
+  third unbounded spawn path in the same crate is worth confirming or refuting rather than assuming.
+
+### Inspectors
+
+- **Terminal-neutral inspector plugin architecture + Ghostty plugin.** `M` — `06a2525e`;
+  `src/inspectors/types.ts:4-5` (`INSPECTOR_ACTIONS`), `plugins.ts:6-8`
+  (`createBuiltinInspectorPlugins()` → herdr, ghostty), `ghostty/plugin.ts:9-15`
+  (`available: darwin && TERM_PROGRAM==='ghostty'`), `ghostty/actions.ts:6-15` (static Ghostty 1.3
+  AppleScript, `on run argv`), `herdr/plugin.ts:12-15`, plus 3 renames lifting `inspector-runner.ts` /
+  `session-roots-codec.ts` / `shell-command.ts` out of `herdr/`. `grep -rniE 'InspectorPlugin|ghostty'`
+  = 0; cyrup's inspector code is herdr-shaped across `tui/fleet*.rs`, `extension/host/slash.rs`,
+  `extension/executor/paths.rs`, `missions/store.rs` (13 files mention `inspector`). **Two separable
+  leads that should not be merged:** (a) the missing Ghostty backend — anyone not running Herdr has no
+  child inspector at all; (b) the missing abstraction — cyrup's herdr assumptions are spread across 13
+  files, so adding any second terminal costs more each pass. The rename also means **any cyrup citation
+  naming `inspectors/herdr/{inspector-runner,session-roots-codec,shell-command}.ts` is unresolvable at
+  v0.67.0**; cyrup was not grepped for those specific paths.
+
+### Surfacing — capability present, surface absent
+
+- **`/subagents-steer` host slash command.** `S` — `f0c5b722` (+66 in `slash-commands.ts`, +23 in
+  `child-identity.ts`). Exhaustive extraction on both sides at three tags (not grep):
+  `git show v0.67.0:src/slash/slash-commands.ts | grep -oE '"subagents?[a-z0-9-]*"'` yields 19 names
+  including `"subagents-steer"`; the same extraction at v0.57.0 and v0.47.1 yields 18 and 17 **without**
+  it, so it entered in-window. cyrup registers 11 names at `registration/slash_commands.rs:135-147` and
+  `steer` is not among them. **Deliberately narrow — only this one name entered in this window;** the
+  five other missing names are in-baseline and belong to `09`'s `SUBA-005` tracker (see Exclusions). The
+  underlying steer capability exists in cyrup, so this is a surfacing gap, not a capability gap.
+- **Supervisor request/reply rendering (`intercom/supervisor-ui.ts`).** `M` —
+  `src/intercom/supervisor-ui.ts:5-18` @v0.67.0 (244L pi-tui `Component`;
+  `SUPERVISOR_REQUEST_MESSAGE_TYPE = "subagent_supervisor_request"`,
+  `SUPERVISOR_REPLY_ENTRY_TYPE = "subagent_supervisor_reply"`,
+  `SupervisorReason = "need_decision"|"interview_request"|"progress_update"`), with
+  `native-supervisor-channel.ts` churning 399 lines in-window. **cyrup has the WIRE and not the
+  presentation:** `native_supervisor.rs:211-224` ports `SupervisorReason` and its tokens (citing
+  `native-supervisor-channel.ts:29-55`), `exec/control.rs:530` maps
+  `ControlEventReason::SupervisorRequest`, and `grep -rniE 'supervisor_request|supervisor_reply'` finds
+  no renderer. The delivered-but-never-rendered shape README blind-spot 4 names explicitly. cyrup draws
+  through ratatui, so the drawing layer is substrate — **but per blind-spot 3 that carve-out covers
+  drawing only**, and the message-type constants, the reason→header mapping and the reply-entry contract
+  are portable behaviour. Area 11 may own part of this; `11-cyrup-intercom.md` was not checked, so the
+  ownership assignment is provisional.
+
+### Child identity and cwd
+
+- **Human-readable child session names (`sessionName` → `pi.setSessionName`).** `S` — `5ed2a4d4`;
+  `src/shared/child-session-name.ts:4-14` @v0.67.0: derived at launch from agent name + task or workflow
+  node label, threaded (1) into the child runtime config where the prompt runtime calls
+  `pi.setSessionName(...)` so the child's own session file is identifiable in `pi --resume`, and (2) into
+  the `sessionName` field of result/progress payloads. cyrup's `session_name` hits are unrelated intercom
+  env plumbing (`exec/spawn_plan.rs:1101,4025,4150`) plus a struct-literal `session_name: None` at
+  `registration/cost.rs:1240`. **Unusually cheap because the host call already exists in cyrup**
+  (`crates/cyrup-tui/src/app/execute_misc.rs:890` `session.set_session_name(&name)`); what is missing is
+  the derivation and the two threading paths. The `cost.rs:1240` `None` is suggestive of a field carved
+  out and never filled — **that struct's definition was not read, so the connection is a lead inside a
+  lead.**
+- **Launch-cwd preflight.** `S` — `src/runs/shared/launch-cwd.ts:3-16` @v0.67.0 (16L net-new):
+  `preflightLaunchCwd(requestedCwd, effectiveCwd)` aborts with "Subagent launch aborted: cwd is not a
+  directory: <p>" / "… cwd does not exist: <p>", each suffixed `\n(resolved from "<requested>")` when the
+  effective cwd differs — the suffix exists so the operator can see the cwd they typed was rewritten
+  before it failed. cyrup's only hit is a test assertion string
+  (`tests/verify_memo_and_redaction.rs:386`), no production path. Small, **but exactly where a static
+  read is weakest per README blind-spot 2** — what cyrup does today on a missing cwd is a spawn error
+  surfaced from somewhere else, and whether that error is intelligible is unobserved. The current failure
+  output was not reproduced, so the user-visible delta is a hypothesis.
+- **Forked-session cwd alignment (`alignForkedSessionCwd`).** `S` —
+  `src/shared/fork-session-cwd.ts:10-12` @v0.67.0 (27L): "Keep Pi from restoring a forked session into
+  the parent's cwd instead of the child launch cwd" — rewrites `cwd` on the persisted session entries of
+  the forked file before the child reads it. `grep -rniE 'align_forked|forked_session_cwd'` = 0; cyrup's
+  fork path is `fork_context.rs`, in which no cwd rewrite was found. **A silent-wrong-behaviour shape
+  (a forked child working in the wrong tree) rather than a missing feature**, which is why it is worth a
+  lead at 27 lines. **CAVEAT: `fork_context.rs` was not read in full**, so cyrup may align the cwd by a
+  different mechanism — e.g. passing cwd explicitly at launch. Absence of the identifier is not absence
+  of the behaviour here.
+
+### MCP and liveness
+
+- **Agent-plugin and package (npm/git) MCP server config sources.** `M` —
+  `src/runs/shared/mcp-config-sources.ts:7-13` @v0.67.0 (422 net-new lines: `PACKAGE_CONFIG_ROOT="npm"`,
+  `PACKAGE_GIT_ROOT="git"`, `PLUGIN_SCHEMA`, `PLUGIN_MCP_SCHEMA`, `PLUGIN_NAME_PATTERN`,
+  `PLUGIN_STDIO_FIELDS`, `PLUGIN_HTTP_FIELDS`), `:15-31` (`McpServerDefinition` incl.
+  `requestHeadersCommand`, `auth: "oauth"|"bearer"|false`, `bearerToken`), consumed at
+  `mcp-direct-tool-allowlist.ts:7`. cyrup's `exec/mcp_direct_tools.rs:337`/`:514`/`:543` is an
+  mcp.json-only merge with **no plugin or package rung**. **Changes WHICH MCP servers a child can be
+  granted direct tools from, so it silently narrows cyrup's `directTools` resolution rather than
+  erroring — a missing-source failure, the hardest kind to notice.** Overlaps `13c-mcp-servers.md`,
+  which owns MCP config sources for the adapter port; **13c was not checked for an existing row**, and
+  the two must not book the same work twice.
+- **Retained nested-route liveness tracking and the pi-web session-liveness provider.** `M` —
+  `src/runs/background/retained-nested-route-tracker.ts:1-13` @v0.67.0 (96L: `shouldUseNativeFsWatch`,
+  `hasLiveNestedDescendants`, `projectNestedEvents`, `DEFAULT_POLL_INTERVAL_MS = 5000`,
+  `REFRESH_DEBOUNCE_MS = 25`) and `src/integrations/pi-web-session-liveness.ts:4-5`
+  (`@agegr/pi-web/session-liveness/v1`, 73L). cyrup has the projection primitive
+  (`spawn/nested_events.rs`) and **neither consumer**. Grouped as one lead because both answer "is this
+  still alive" over that primitive. **The pi-web half may be out of scope for cyrup entirely — there is
+  no cyrup-web — and that was not established; the tracker half is host-independent and is the part that
+  matters. The size covers the tracker alone.**
+
+### Exclusions worth preserving (negative results from the same pass)
+
+- **"Bounded SSH project execution" is not real at v0.67.0** — see correction 1 in the provenance block.
+  The most important negative result of the pass.
+- **The workflow surfaces new in this window are ALREADY PORTED, which reverses this file's recorded
+  position.** Upstream's `workflow-preflight.ts` (297L new), `workflow-resources.ts` (225L new),
+  `workflow-settlement.ts` (249L new), `workflow-checklist.ts` (436L), `host-command.ts` (235L new),
+  `lane-metadata.ts` (126L new) and `host-step-status.ts` (231L new) all have cyrup counterparts at
+  `b28d3ff`, with `HostStep` matching 163 times across the crate. **Correspondence was established by
+  module NAME and presence only — this is an exclusion from the CENSUS (no net-new surface) and
+  explicitly NOT a parity claim.** A field-level sweep of those seven pairs is the highest-value
+  follow-up this census can point at, precisely because the deferral means nobody has ever compared
+  them.
+- **Five other missing slash names are out of window, not unnoticed.** `subagents-detach`,
+  `subagents-refine`, `subagent-slash` and `subagent-slash-text` are present already at v0.47.1;
+  `subagents-inspect-rpc` entered in `v0.47.1..v0.57.0`. They belong to `09`'s `SUBA-005` tracker.
+  cyrup registers 11 of upstream's 19 names. Recorded so the next pass knows the extraction was run.
+- **The whole scheduled-runs subsystem, including `quiet` opt-in completion (`ad8d329a`), is mis-scoped
+  rather than absent-and-portable.** Upstream has a full schedule surface at v0.67.0
+  (`scheduled-runs.ts:57`, `:312`, `:453-461`, `:617-618`, `:651`, `:658`, `:669`; `extension/rpc.ts:502-508`;
+  `schemas.ts:314`; the predicate at `notify.ts:322`). cyrup has none: `ScheduleRecord`/`ScheduleOrigin`
+  grep to doc comments only, and `background/watch/message.rs:515-516` states outright that cyrup's
+  `ResultFile` "carries neither `source` nor `scheduleOrigin`". **Filing `quiet` as a leaf of a
+  subsystem that does not exist would be false precision** — the real gap is the parent, it is
+  in-baseline, and it is already visible through `SUBA-090`'s notify work and the `SUBA-005` tracker.
+- **`turnBudget` residual state survives at v0.67.0**, which is why the `turnBudget` lead in `09` must
+  not be overstated. After `94ecb662` removed the controls, `git grep -i turnbudget v0.67.0 -- src`
+  still returns `intercom/result-intercom.ts:29`, `async-job-tracker.ts:197-198`, `:501-502`, `:721`,
+  `async-resume.ts:325`, `:390-393` (`initialTurnBudget`), `async-status.ts:6` (`TurnBudgetState` still
+  exported). Upstream deleted the CONTROL surface and kept state plumbing. **Any fix sketch that says
+  "delete cyrup's `exec/turn_budget.rs`" is wrong on its face.** Those residual sites were not read
+  field-by-field.
+- **`src/runs/shared/completion-evidence.ts` (89L, new) is partially present, so it is excluded rather
+  than filed.** Its `MISSING_IMPLEMENTATION_MUTATION_MESSAGE` string is already cyrup's at
+  `exec/mod.rs:1489`, and the surrounding machinery exists (`exec/completion_guard.rs`,
+  `exec/mutation_evidence/`). What upstream added is the extraction of a PLAN object around the existing
+  guard — a refactor shape, not a behaviour cyrup could be shown to lack. A field-level read of the
+  plan's diagnostics against `exec/mutation_evidence/project.rs` would settle it.
+- **The four renames in `v0.64.0..v0.67.0`** — R090/R067/R100 lifting the three inspector files out of
+  `herdr/`, and R068 `api/pi-args.ts` → `api/child-tool-plan.ts` — are the mechanical half of the
+  inspector-plugin and in-process-child changes. Recorded separately because they are why the net-new
+  count is exactly 30 and not 34, and why any cyrup citation naming those paths is **unresolvable, not
+  merely stale**, at v0.67.0.
+
+
 ## Scope
 
 **Port measured:** `crates/cyrup-ext-subagents/` at cyrup HEAD `6db22a7`
@@ -74,7 +431,7 @@ grepping the current tree for the behaviour *by identifier and by concept*, in b
 snake_case, plus the env-var spellings, plus the crate's own tests — the port's tests are treated as
 evidence of presence, and several candidate findings died there.
 
-**Severity** is `docs/gap-analysis/README.md:509-512` applied literally: `critical` = data loss,
+**Severity** is `docs/gap-analysis/README.md:552-555` applied literally: `critical` = data loss,
 silent wrong output, a permission bypass, or a crash on a normal path, **with no reachability
 qualifier**. **Effort** is `S` under a day · `M` a few days · `L` a week+ or needs design.
 **`[CYRUP-DELTA]`** in a port comment marks a deliberate divergence and is a decision, not a gap —
@@ -284,7 +641,7 @@ Upstream spawns the first with `--tools read` and the second with `--tools read`
 `--no-extensions` and with MCP direct tools and tool-extension paths stripped. Because the agents
 axis *is* enforced and the ceiling *is* propagated to the child env, **the ceiling presents as armed
 while two of its three axes silently permit exactly the widening it exists to prevent.** That is a
-permission bypass under `README.md:510`, hence `critical`.
+permission bypass under `README.md:553`, hence `critical`.
 
 **Fix** — In `exec/spawn_plan.rs`, feed the already-resolved `capability_ceiling` into the tool plan:
 (a) `explicit_tool_allowlist = agent.tools.is_some() || !effective_mcp_tools.is_empty() || ceiling_allowed_tools.is_some()`, mirroring `pi-args.ts:473-476`; (b) intersect `builtin_tools` and the
@@ -361,7 +718,7 @@ mutual-exclusion error for declaring both spellings is also absent. The child-si
 machinery is fully ported and permanently unreachable.
 
 **Severity note (correction applied).** Filed `critical`; corrected to `medium` by the refutation
-pass, on three grounds read literally against `README.md:510`. (1) This is not a bypass of an
+pass, on three grounds read literally against `README.md:553`. (1) This is not a bypass of an
 *enforcing* system: a cyrup subagent child is still gated by `cyrup-permission-system`, wired into
 every spawn, with the child→parent ask-forwarding spool live at `spawn/nested_events.rs:781`; upstream
 itself documents `permissions` as **opt-in** and leaves bash to pi-guard. (2) Upstream's own normal

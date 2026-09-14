@@ -68,6 +68,64 @@ port starts from an empty baseline and writes it from observed failures.
 
 ---
 
+> ### PROVENANCE CORRECTION — 2026-09-14. The pins below are revised; **this file was not re-read.**
+>
+> Everything in this file is history and is correct as written. It was audited against
+> **`pi-mcp-adapter` v2.25.0** — that is the tag its prose, its unit obligations and every upstream
+> citation in it were read at, and it stays. **Nothing in this block re-verifies any of it: no unit
+> was re-read, no obligation re-derived, no count, severity, verdict or status changed.** This block
+> states only how stale the file is; the section after it is a worklist, not a finding.
+>
+> | | audited at (history — do not rewrite) | current pin (authoritative, per `README.md`'s baselines table) | window this file has never measured |
+> |---|---|---|---|
+> | `pi-mcp-adapter` | **`v2.25.0`** (the plan's tag) | **`v2.33.0`** *(was v2.32.1)* | `v2.25.0..v2.33.0` = **211 files, +27 961 / −2 129**, 113 non-merge commits. Two segments of that range are measured elsewhere and are NOT this file's blind spot: `v2.25.0..v2.26.1` by [`13-cyrup-mcp.md`](13-cyrup-mcp.md)'s *Retarget* section, `v2.26.1..v2.32.1` by [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md)'s 2026-09-04 re-audit. **`v2.32.1..v2.33.0` = 123 files, +9 455 / −1 352, 33 non-merge commits, is measured by nobody.** That is the unmeasured window, and the census below is its lead list |
+> | `cyrup` | **deliberately unpinned** — this file cites cyrup by symbol and file only, and its header says so | code HEAD **`b28d3ff`**; the ledger's last recorded code baseline is `824a539e` | **Not expressible.** With no sha ever recorded here there is no window to name: the staleness of a cyrup claim in this file cannot be bounded, only re-read. For scale, `crates/cyrup-mcp` at `b28d3ff` is **43 `.rs` files / 79 930 lines** under `src` — 29 top-level modules plus the `proxy/` tree |
+> | `pi` · `pi-subagents` · `pi-permission-system` · `pi-intercom` · `pi-acp` · `code_puppy_core_plugins` | — | `v0.85.1` · `v0.67.0` · `v0.8.0` · `v0.13.0` · `v0.0.33` · `v0.0.50` (ported surface byte-identical across all 39 tags) | out of this area's scope |
+
+### UNVERIFIED — 2026-09-14 census of the `v2.32.1..v2.33.0` window (leads, not units)
+
+**Nothing in this section is a port unit.** No `MCP-NNN` id is assigned — id allocation belongs to a
+pass that read both sides, and this one did not read the cyrup side everywhere. Numbering resumes
+from **`MCP-539`** when such a pass files it. **No unit in this file is opened, closed, re-ranked or
+re-verdicted here, and no status cell in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) moves.**
+
+Method: upstream read only via `git -C tmp/pi-mcp-adapter show v2.33.0:<path>` and
+`git diff v2.32.1..v2.33.0 -- <path>`; cyrup read at `b28d3ff`. Each entry names which side was read;
+where only one side was read it says so and is a lead with half its evidence missing. An absence
+stated as "grep = 0" is a grep over `crates/cyrup-mcp/src`, not proof that a differently-named
+counterpart does not exist.
+
+#### Changes to existing units
+
+- **Sampling routes through `ModelRegistry.complete`; the auth probe is deleted** · M · BOTH SIDES
+  READ (upstream in full; cyrup by symbol). `sampling-handler.ts` drops
+  `import { complete } from "@earendil-works/pi-ai/compat"`; `SamplingModelRegistry` changes from
+  `Pick<ModelRegistry, "getAvailable" | "getApiKeyAndHeaders">` to
+  `Pick<…, "getAvailable" | "complete">`; `resolveSamplingModel` becomes **synchronous**, returns
+  `Model<Api>` instead of `{model, apiKey, headers}`, and the entire sequential per-candidate
+  `getApiKeyAndHeaders` loop plus the `No configured auth for MCP sampling model. …` aggregate error
+  are **deleted** — it now returns `candidates[0]` or throws `No Pi model is available for MCP
+  sampling`. Provider authentication, environment and base-URL handling move wholly to the host: the
+  adapter no longer probes credentials per candidate, so the first candidate wins outright and a
+  candidate with no usable auth fails at call time rather than being skipped. cyrup:
+  `crates/cyrup-mcp/src/sampling.rs:445 async fn resolve_sampling_model`, with `sampling.rs:19` and
+  `:82` documenting `cyrup_provider::Models::get_auth` as the port of `getApiKeyAndHeaders`.
+  **Lead against `MCP-452`**, which the 2026-09-04 re-audit moved to `implemented` — against the
+  v2.32.1 shape. cyrup now implements a candidate-ordering-plus-auth-probe that upstream has deleted.
+  **This is REVERSE LAG**: the question is whether cyrup should follow (delete the probe, delegate to
+  the host) or keep the probe as a deliberate divergence, and it needs a ruling rather than a silent
+  carry-forward. Also touches `MCP-455` (`confirm_sampling`, `owner.rs:802`), which is unaffected.
+  **`MCP-452`'s row and status are untouched.**
+
+#### What this window did not touch here
+
+No net-new surface in the window lands in this section. `sampling-handler.ts` is the only file this
+section owns that changed at all: `git diff --name-only v2.32.1..v2.33.0` does not list
+`elicitation-handler.ts` or `mcp-trace.ts`, so both are byte-unchanged across the window. That is
+a negative result and is recorded as one — this section is the weakest surface in the port
+(`13i`: 31 of 50 units with no implementation at all, per the 2026-08-21 census), and the reason is
+unbuilt units, not upstream motion.
+
 ### How it lands
 
 | adapter capability | upstream mechanism | cyrup mechanism | verdict |

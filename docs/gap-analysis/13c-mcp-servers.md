@@ -62,6 +62,104 @@ reports the six places it has fallen behind rather than restating the algorithm.
 
 ---
 
+> ### PROVENANCE CORRECTION — 2026-09-14. The pins below are revised; **this file was not re-read.**
+>
+> Everything in this file is history and is correct as written. It was audited against
+> **`pi-mcp-adapter` v2.25.0** — that is the tag its prose, its unit obligations and every upstream
+> citation in it were read at, and it stays. **Nothing in this block re-verifies any of it: no unit
+> was re-read, no obligation re-derived, no count, severity, verdict or status changed.** This block
+> states only how stale the file is; the section after it is a worklist, not a finding.
+>
+> | | audited at (history — do not rewrite) | current pin (authoritative, per `README.md`'s baselines table) | window this file has never measured |
+> |---|---|---|---|
+> | `pi-mcp-adapter` | **`v2.25.0`** (the plan's tag) | **`v2.33.0`** *(was v2.32.1)* | `v2.25.0..v2.33.0` = **211 files, +27 961 / −2 129**, 113 non-merge commits. Two segments of that range are measured elsewhere and are NOT this file's blind spot: `v2.25.0..v2.26.1` by [`13-cyrup-mcp.md`](13-cyrup-mcp.md)'s *Retarget* section, `v2.26.1..v2.32.1` by [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md)'s 2026-09-04 re-audit. **`v2.32.1..v2.33.0` = 123 files, +9 455 / −1 352, 33 non-merge commits, is measured by nobody.** That is the unmeasured window, and the census below is its lead list |
+> | `cyrup` | **deliberately unpinned** — this file cites cyrup by symbol and file only, and its header says so | code HEAD **`b28d3ff`**; the ledger's last recorded code baseline is `824a539e` | **Not expressible.** With no sha ever recorded here there is no window to name: the staleness of a cyrup claim in this file cannot be bounded, only re-read. For scale, `crates/cyrup-mcp` at `b28d3ff` is **43 `.rs` files / 79 930 lines** under `src` — 29 top-level modules plus the `proxy/` tree |
+> | `pi` · `pi-subagents` · `pi-permission-system` · `pi-intercom` · `pi-acp` · `code_puppy_core_plugins` | — | `v0.85.1` · `v0.67.0` · `v0.8.0` · `v0.13.0` · `v0.0.33` · `v0.0.50` (ported surface byte-identical across all 39 tags) | out of this area's scope |
+
+### UNVERIFIED — 2026-09-14 census of the `v2.32.1..v2.33.0` window (leads, not units)
+
+**Nothing in this section is a port unit.** No `MCP-NNN` id is assigned — id allocation belongs to a
+pass that read both sides, and this one did not read the cyrup side everywhere. Numbering resumes
+from **`MCP-539`** when such a pass files it. **No unit in this file is opened, closed, re-ranked or
+re-verdicted here, and no status cell in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) moves.**
+
+Method: upstream read only via `git -C tmp/pi-mcp-adapter show v2.33.0:<path>` and
+`git diff v2.32.1..v2.33.0 -- <path>`; cyrup read at `b28d3ff`. Each entry names which side was read;
+where only one side was read it says so and is a lead with half its evidence missing. An absence
+stated as "grep = 0" is a grep over `crates/cyrup-mcp/src`, not proof that a differently-named
+counterpart does not exist.
+
+#### New surfaces
+
+- **`http-ca.ts` — connection-owned CA dispatcher (`validateCaFile` / `createCaFetch`)** · M ·
+  UPSTREAM READ IN FULL; cyrup side is a grep-absence only (`ca_file` = 0 hits). New file, 49 lines:
+  `:8 validateCaFile`, `:20 createCaFetch`; `server-manager.ts:340` calls `validateCaFile(definition)`
+  at the top of `connect`; `:1273 let caFetch = createCaFetch(definition)`; `:1389-1403` transfers
+  dispatcher ownership to the connected transport's `close`/`onclose`; `:1436 finally { await
+  caFetch?.close() }`. A whole new transport-trust surface: HTTPS-only and url-only validation, PEM
+  bundle parsed with every cert fed through `X509Certificate` (fail closed), an undici
+  `Agent({connect:{ca}})` scoped to the resolved MCP **origin** only (other origins fall through to
+  `globalThis.fetch`), `redirect: "error"` on every trust-bearing request **including same-origin**,
+  env interpolation and `~` via `resolveConfigPath`, and a dispatcher lifetime tied to the transport
+  rather than the process. NEW PORT UNIT. Mechanism seam: cyrup links `rmcp` and owns no fetch stack,
+  so this lands as an rmcp/reqwest `ClientBuilder` with `add_root_certificate` +
+  `tls_built_in_root_certs(false)` + `redirect::Policy::none()` — the origin-scoping and
+  fail-closed-redirect rules are the behaviour to preserve, not the `undici` mechanism. Schedule
+  beside `MCP-115`/`MCP-115a`, which own the unbuilt `connectHttpClient` this hangs off. The config
+  half is in [`13b`](13b-mcp-config.md).
+- **macOS Local Network Privacy diagnosis for literal private/link-local HTTP endpoints** · M ·
+  UPSTREAM READ IN FULL; cyrup side not read. `server-manager.ts:88 isLiteralLocalAddress` (a
+  `BlockList` over 10/8, 172.16/12, 192.168/16, 169.254/16, fc00::/7, fe80::/10); `:102
+  localNetworkFailureCodes` (recursive over `cause` and `AggregateError.errors` with a cycle guard,
+  matching EHOSTUNREACH/ENETUNREACH/EACCES); `:1020-1026` the `darwin`-gated hint inside
+  `enrichHttpConnectionError`, preserving `{ cause: error }`; `:1331-1342` an SSE-only fetch wrapper
+  that captures the fetch failure `EventSource` discards, re-attached at `:1366` as an
+  `AggregateError` so the code survives to the diagnosis. Upstream `2c861d7` (#544). The new arm sits
+  **before** the existing HTTP-503 transient arm, and the wording is deliberately hedged — the hint
+  says routing/firewall can also cause it, and hostnames are never resolved for this diagnostic. NEW
+  PORT UNIT, and it should be scheduled **with `MCP-507`** (recorded `missing`), since both are arms
+  of the same `enrichHttpConnectionError` and the function itself is unbuilt. Low port value on
+  non-macOS hosts, but the SSE cause-preservation half is platform-independent and is the part that
+  is easy to lose.
+
+#### Changes to existing units
+
+- **`ServerEntry.inheritEnv` — per-server stdio environment-inheritance opt-out** · S · UPSTREAM
+  READ IN FULL; cyrup grep 0. `types.ts:433 inheritEnv?: boolean`; `server-manager.ts:1742-1751
+  function resolveEnv(env, serverName, literalEnv = false, inheritEnv = true)` with the
+  `if (inheritEnv)` guard around the `process.env` copy; `server-manager.ts:860` passes
+  `definition.inheritEnv !== false`; `config.ts:584`/`:591` add `inheritEnv` to the url and socket
+  layered drop lists. `inheritEnv: false` suppresses the wholesale `process.env` copy into the stdio
+  child (and its disposable SDK negotiation sibling under `protocolVersion: "auto"` /
+  `"2026-07-28"`), while SDK platform defaults and explicit `env` overlays survive. The v2.33.0
+  README pins **three explicit non-boundaries** that keep full inheritance regardless: npm/npx cache
+  resolution subprocesses, `!command` secret helpers, and the `requestHeadersCommand` helper. cyrup:
+  `grep -rn 'inherit_env' crates/cyrup-mcp/src` = 0 and `grep -rn 'fn resolve_env\|std::env::vars'
+  crates/cyrup-mcp/src/server_manager.rs` = 0 — consistent with **`MCP-101`** (still `partial`),
+  whose recorded obligation already reads "No `resolveEnv` … the full-process-env copy, the
+  `literalEnv === true` verbatim arm". **Lead against `MCP-101`: restate its obligation at the
+  four-argument v2.33.0 signature before it is worked**, or the port ships the three-argument shape
+  and `inheritEnv` becomes a second pass. **The row is untouched.**
+- **`directToolCount` on the per-server status snapshot** · S · UPSTREAM READ IN FULL; cyrup grep 0
+  for `direct_tool_count`. `types.ts:42 readonly directToolCount: number` on
+  `McpServerStatusSnapshot`; `mcp-status.ts:27 const directToolCount = disabled ? 0 :
+  state.directToolCounts?.get(name) ?? 0`, with the explicit note that it is the **last active sync
+  result**, not a fresh resolution; `state.ts directToolCounts: Map<string, number>`; `init.ts:175`
+  constructs it; `index.ts:499-506` refills it from `result.specs` on every tool-surface sync. A
+  seventh key on the per-server snapshot, counting tools currently registered directly with Pi
+  (resource tools included), deliberately **not** recomputed at read time so a frozen direct surface
+  keeps its registrations visible while the server is in failure backoff. **Lead against `MCP-137`**
+  (recorded `missing` — "`createMcpStatusSnapshot` does not exist … the per-server six-key object"):
+  the obligation is now a **seven**-key object. Also touches `MCP-032` (`updateStatusBar`, 13a,
+  `partial`). **Both rows untouched.**
+
+#### One correction to this file's own text
+
+- **`13c:1003`** states the agent-dir ladder as `CYRUP_AGENT_DIR → PI_CODING_AGENT_DIR →
+  <home>/.cyrup/agent`. The middle rung was deleted workspace-wide at `dd44b3c`
+  (`crates/cyrup-config/src/paths.rs:335`), so a PLANNED unit here is prescribed against a precedent
+  that no longer exists. See the same lead in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md).
+
 ### How it lands
 
 | adapter capability | upstream mechanism | cyrup mechanism | verdict |

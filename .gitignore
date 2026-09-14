@@ -19,3 +19,8 @@ tmp/
 # here in the meantime so it does not show up as untracked noise or get committed by accident).
 .cyrup-subagent-scratch/
 .claude/worktrees/
+
+# Python bytecode from docs/gap-analysis/scripts/ (count_open_items.py is imported
+# as a module by tooling that reuses its parser, which drops a __pycache__ beside it).
+__pycache__/
+*.py[cod]

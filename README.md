@@ -75,8 +75,8 @@ the command palette.
 
 - **40 built-in providers** over 10 wire APIs, with 35 embedded model catalogs. Anthropic, OpenAI,
   Google, Bedrock, Vertex, Copilot, OpenRouter, Groq, Together, Mistral, Fireworks and more.
-- **The built-in tool set**: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, over an
-  `FsOps`/`ProcOps` interface that tests substitute.
+- **The built-in tool set**: `read`, `bash`, `powershell`, `edit`, `write`, `grep`, `find`, `ls`, over
+  an `FsOps`/`ProcOps` interface that tests substitute.
 - **A session tree on disk** as JSONL, with compaction, forking, import and export.
 - **Five run modes.** The terminal interface, plus `--mode print`, `--mode json` and `--mode rpc`
   for scripting and embedding, and `--mode acp` to run as an

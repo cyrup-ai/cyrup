@@ -51,6 +51,91 @@ upstream conformance cases that transfer verbatim.
 
 ---
 
+> ### PROVENANCE CORRECTION — 2026-09-14. The pins below are revised; **this file was not re-read.**
+>
+> Everything in this file is history and is correct as written. It was audited against
+> **`pi-mcp-adapter` v2.25.0** — that is the tag its prose, its unit obligations and every upstream
+> citation in it were read at, and it stays. **Nothing in this block re-verifies any of it: no unit
+> was re-read, no obligation re-derived, no count, severity, verdict or status changed.** This block
+> states only how stale the file is; the section after it is a worklist, not a finding.
+>
+> | | audited at (history — do not rewrite) | current pin (authoritative, per `README.md`'s baselines table) | window this file has never measured |
+> |---|---|---|---|
+> | `pi-mcp-adapter` | **`v2.25.0`** (the plan's tag) | **`v2.33.0`** *(was v2.32.1)* | `v2.25.0..v2.33.0` = **211 files, +27 961 / −2 129**, 113 non-merge commits. Two segments of that range are measured elsewhere and are NOT this file's blind spot: `v2.25.0..v2.26.1` by [`13-cyrup-mcp.md`](13-cyrup-mcp.md)'s *Retarget* section, `v2.26.1..v2.32.1` by [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md)'s 2026-09-04 re-audit. **`v2.32.1..v2.33.0` = 123 files, +9 455 / −1 352, 33 non-merge commits, is measured by nobody.** That is the unmeasured window, and the census below is its lead list |
+> | `cyrup` | **deliberately unpinned** — this file cites cyrup by symbol and file only, and its header says so | code HEAD **`b28d3ff`**; the ledger's last recorded code baseline is `824a539e` | **Not expressible.** With no sha ever recorded here there is no window to name: the staleness of a cyrup claim in this file cannot be bounded, only re-read. For scale, `crates/cyrup-mcp` at `b28d3ff` is **43 `.rs` files / 79 930 lines** under `src` — 29 top-level modules plus the `proxy/` tree |
+> | `pi` · `pi-subagents` · `pi-permission-system` · `pi-intercom` · `pi-acp` · `code_puppy_core_plugins` | — | `v0.85.1` · `v0.67.0` · `v0.8.0` · `v0.13.0` · `v0.0.33` · `v0.0.50` (ported surface byte-identical across all 39 tags) | out of this area's scope |
+
+### UNVERIFIED — 2026-09-14 census of the `v2.32.1..v2.33.0` window (leads, not units)
+
+**Nothing in this section is a port unit.** No `MCP-NNN` id is assigned — id allocation belongs to a
+pass that read both sides, and this one did not read the cyrup side everywhere. Numbering resumes
+from **`MCP-539`** when such a pass files it. **No unit in this file is opened, closed, re-ranked or
+re-verdicted here, and no status cell in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) moves.**
+
+Method: upstream read only via `git -C tmp/pi-mcp-adapter show v2.33.0:<path>` and
+`git diff v2.32.1..v2.33.0 -- <path>`; cyrup read at `b28d3ff`. Each entry names which side was read;
+where only one side was read it says so and is a lead with half its evidence missing. An absence
+stated as "grep = 0" is a grep over `crates/cyrup-mcp/src`, not proof that a differently-named
+counterpart does not exist.
+
+#### New surfaces
+
+- **`mcp({ action: "install", url, server?, target? })` — one-URL server install** · L · UPSTREAM
+  READ IN FULL; cyrup side a grep-absence (no install mode anywhere in `crates/cyrup-mcp/src`).
+  `index.ts:1190 async function executeInstall(targetState, rawUrl, requestedName, target, cwd,
+  signal)`, dispatched at `index.ts:1498`; new file `mcp-install.ts` (60 lines) with `:28
+  normalizeMcpInstallRequest`, `:17 deriveServerName`, `:54 canonicalMcpServerUrl`; persistence via
+  `withFileMutationQueue(destination, …)` + `writeSharedServerEntry`. A **tenth gateway mode** with a
+  full provisional-install transaction: derive a name from the hostname (`local-mcp` for loopback);
+  reject credentials, fragments and non-HTTPS-non-loopback URLs; reuse an existing entry whose
+  canonical URL matches rather than rewriting it; refuse a name collision against a different
+  endpoint; refuse promotion of a runtime-registered server; **connect to validate**, and only then
+  persist `{url}` to global (`getPiGlobalConfigPath`) or project (`.mcp.json`) — with rollback of
+  config, lifecycle, the manager connection, all five metadata maps and the failure record on any
+  failure. `auth_required` is **not** a failure: it chains into `executeAuthStart` and returns
+  `status: "awaiting_auth"`. Exclusive mode refuses a project target that is not the active config
+  path; programmatic config refuses install outright. NEW PORT UNIT. The writer half already exists —
+  `crates/cyrup-mcp/src/config.rs:3847 write_shared_server_entry`, used from `panel_host.rs:414`/`:434`
+  — so what is missing is the mode, the URL validator, the provisional/rollback transaction, and a
+  `withFileMutationQueue` equivalent, which is itself unported (`grep -rn 'file_mutation_queue'
+  crates/cyrup-mcp/src` = 0, so cross-process write serialisation is an unfiled seam gap of its own).
+  The suppression half that keeps a validating server out of the metadata cache and the slash-command
+  surface is `provisionalInstalls`, filed in [`13a`](13a-mcp-activation.md).
+- **Background auth watcher and the `mcp-oauth-status` message** · M · UPSTREAM READ IN FULL; cyrup
+  side partially read. `proxy-modes.ts:133 emitAuthStatus` — `state.sendMessage({customType:
+  "mcp-oauth-status", …, details:{server, status, nextAction:{connect}}}, {triggerTurn: true})`;
+  `:150 ensureBackgroundAuthWatcher` (one watcher per server in a `WeakMap` keyed on state, re-checks
+  `getAuthStatus` before reporting failure, closes the connection and clears the failure record on
+  success); `:543-551` `executeAuthStart` now opens the browser itself for a remote/HTTPS redirect
+  and starts the watcher for a loopback one; `:237-256 formatManualAuthInstructions` rewritten around
+  "the adapter is watching". `mcp-auth-flow.ts:57 AuthenticateOptions.openAuthorizationUrl`, used at
+  `:973-979` in place of `open()`. `git grep mcp-oauth-status v2.32.1` is **empty** — the custom type
+  is new at this tag. `mcp({ action: "auth-start" })` stops being a copy-the-URL-back ritual: the
+  adapter opens the URL, watches the loopback callback, and on consent emits a turn-triggering custom
+  message telling the agent to connect. Pasted `auth-complete` survives as the remote/headless
+  fallback. cyrup has the browser seam (`crates/cyrup-mcp/src/state.rs:123`, `runtime.rs:403`
+  `open_browser`) but nothing emits an `mcp-oauth-status` message (grep 0). NEW PORT UNIT, and it is
+  the `triggerTurn` seam again — **`MCP-027a`** (13a, recorded `missing`, filed by the v2.26.1
+  retarget as "`sendMessage`'s `triggerTurn` pre-turn convergence gate") is the exact prerequisite,
+  so schedule this after it. **`MCP-027a`'s row is untouched.**
+
+#### Changes to existing units
+
+- **Gateway description and search result learn about search mode and install** · S · UPSTREAM READ
+  IN FULL; cyrup side not read this pass (`crates/cyrup-mcp/src/proxy/description.rs` was listed, not
+  opened). `direct-tools.ts:312 buildProxyDescription`'s opening line now names URL installation;
+  `:320-329` adds a `Search-mode servers (…)` paragraph computed from config; `:339` adds an
+  `mcp({ action: "install", url })` usage line; `:348` changes the auth-start usage line from "Start
+  manual OAuth and get a browser URL" to "Open OAuth and watch for completion"; `index.ts:1404-1406`
+  adds two gateway params `url` and `target`, and `index.ts:1456-1457` joins both to the
+  `hasGatewayMode` predicate. That predicate is what makes nested-`args` gateway params fail with
+  top-level guidance (`MCP-520`); it must learn the two new keys or `mcp({ url: …, args: {} })`
+  misroutes. **`13d:299`** (the parameter table) and **`13d:371`** (the usage block) carry the old
+  text verbatim and are stale; **`13d:747-772`** narrates the old `executeAuthStart`. This also
+  amends the still-open **`MCP-518`** (gateway description as a pure function of config) and
+  **`MCP-520`** — **both rows untouched**. Because the description string is a prompt-cache key, a
+  partial copy is worse than none.
+
 ### How it lands
 
 | adapter capability | upstream mechanism | cyrup mechanism | verdict |
