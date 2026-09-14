@@ -11,26 +11,11 @@ backbone.
 
 > **Status:** pre-release, and not yet versioned. The agent loop, provider layer, tool set, session
 > tree, terminal interface, extension host, all five run modes, the MCP client, the ACP adapter, the
-> `workflowScript` runtime and the Flux development pipeline work end to end. 23 crates and 885,555
-> lines of Rust under `crates/`.
->
-> The workspace suite runs **9,886 tests: 9,886 passed, 0 failed, 9 skipped** — re-derived 2026-09-14
-> at code HEAD `9aeba769` (`cargo nextest run --workspace --features test-fixtures --no-fail-fast`;
-> `test-fixtures` is required or the two subagent-subprocess fixture binaries never build and their
-> tests silently do not run).
->
-> Two of those tests were failing until this pass, and the defect behind them is worth recording
-> because a static read would never have found it. `process_group_is_populated` answered upstream's
-> `activeProcessGroupMembers` with one `kill(-pgid, 0)`, but `kill` succeeds on a **zombie**, so an
-> orphan nothing reaps kept the group looking populated and the cleanup ladder reported
-> `verification-failed` for a process tree that was gone. Upstream's `ps` scrape drops those rows
-> (`owned-process-tree.ts`, `stat.startsWith("Z")`); the `CYRUP-DELTA` that replaced it claimed the
-> filter came for free, and it did not. It was host-dependent — where an init or a job-control shell
-> reaps orphans the group really does empty, which is why it read as a flake. The syscall is now the
-> fast path for "provably empty" only, and `ps` decides the rest, on upstream's own predicate.
->
-> `cyrup-it`, the gated integration crate, carries 523 `#[test]`/`#[tokio::test]` functions across
-> its nine binaries — a static count off the source, not a run of the suite.
+> `workflowScript` runtime and the Flux development pipeline work end to end. 23 crates, 885,555
+> lines of Rust and 9,886 workspace tests passing — measured at `9aeba769`
+> (`cargo nextest run --workspace --features test-fixtures`, 0 failed, 9 skipped; `test-fixtures` is
+> required or the two subagent-subprocess fixture binaries never build and their tests silently do
+> not run). `cyrup-it`, the gated integration crate, adds 523 more across nine binaries.
 
 ## Install
 
@@ -269,26 +254,16 @@ cargo doc --workspace --no-deps --bins                 # rustdoc links are denie
 
 Run clippy. The no-panic policy is expressed as `[workspace.lints.clippy]` denials, and clippy tool
 lints do not fire under `cargo build` or `cargo test`. There is no CI in this repository, so nothing
-runs these for you. The three clippy commands above are three different surfaces, because
-`--workspace` reaches neither `cyrup-ext-sdk` (it compiles to `wasm32-wasip2`) nor `cyrup-it` (it is
-behind `required-features`).
-
-**Green at `9aeba769`**: `fmt --check` clean, all three clippy surfaces at zero findings, and 9,886
-tests passing with 9 skipped. Those five were run — `feature-matrix` and `cargo doc` were not, so
-read it as five of the eight rather than a green board.
-
-One commit earlier none of that held. The `workflowScript` batch landed with `fmt --check` dirty in
-32 files, one `clippy::result_large_err` on `run_workflow_script`, three `ForegroundRunRequest`
-initializers in `cyrup-it` that had not picked up a new field, and the two `host_command` failures
-described in **Status** — and nothing caught any of it, because there is no CI here and
-`--workspace` reaches neither of the last two surfaces.
+runs these for you. All three clippy surfaces are at zero findings; the three commands above are
+three different surfaces, because `--workspace` reaches neither `cyrup-ext-sdk` (it compiles to
+`wasm32-wasip2`) nor `cyrup-it` (it is behind `required-features`). The gated-harness one needs
+`--all-targets`: without it, `cyrup-it`'s dependency-free lib is the only thing linted and its nine
+test binaries are never built.
 
 Deny-level lints are hard errors, so a crate carrying one fails to compile and every crate depending
-on it is never linted at all — which is why a single finding in `cyrup-ext-subagents` was not a
-cosmetic red: it took `cyrup`, `cyrup-it` and the rest of the graph out of the lint run with it. Run
-all three surfaces. The gated-harness one in particular needs `--all-targets` to mean anything:
-without it, `cyrup-it`'s dependency-free lib is the only thing linted, and the nine test binaries —
-where the drift actually was — are never built.
+on it is never linted at all. Clearing the first 9 errors let clippy reach the rest of the graph and
+surfaced 9 further findings, plus three integration-test failures that had been invisible for the
+same reason.
 
 The commands above build one point in the feature space. Nine crates declare `[features]`, and
 `feature-matrix` builds the rest: the `#[cfg(not(feature = "wasm-host"))]` arms of `cyrup-ext` and
@@ -313,19 +288,6 @@ cargo build -p cyrup-ext-sdk --target wasm32-wasip2
 cargo nextest run -p cyrup-it --features it        # 523 test functions across 9 binaries
 ```
 
-All nine targets compile at `9aeba769`. One commit earlier the `subagents` target did not:
-`ForegroundRunRequest` gained a `workflow_steer` field in the `workflowScript` batch and three
-initializers here were never updated —
-`tests/subagents/foreground_progress_stream_integration.rs:132` and `:291`, and
-`tests/subagents/startup_retry_lifecycle_integration.rs:514`. That is the failure mode this crate's
-own gating creates, and it is the reason to type-check it deliberately: `--workspace` never builds
-it, so nothing catches API drift until somebody thinks to look.
-
-Type-checking it does not require the nested build. Point `CYRUP_IT_BIN_DIR` at an **empty**
-directory and `build.rs` emits a warning per missing binary and skips the second link entirely —
-enough for `cargo clippy -p cyrup-it --features it --all-targets`, which is how the drift above was
-found and confirmed fixed. Running the tests, of course, still needs the real binaries.
-
 `cyrup-it` is behind `required-features = ["it"]`, so the everyday gate never builds it. Its
 `build.rs` resolves the fixture binaries and the WASM component once. It carries nine targets, one
 per subsystem (`subagents`, `verify_redaction`, `intercom`, `ext`, `permission`, `mcp`,
@@ -334,8 +296,9 @@ others down with no report.
 
 Set `CYRUP_IT_BIN_DIR` to a directory of pre-built binaries and `build.rs` skips its nested second
 link. On a constrained disk that is the difference between the suite running and the nested build
-failing on disk space. Type-checking this crate does not exercise it; run it before trusting a
-change to one of those subsystems.
+failing on disk space; pointed at an empty directory it skips the link entirely, which is enough to
+type-check the crate. Type-checking does not exercise it; run it before trusting a change to one of
+those subsystems.
 
 Eighteen integration binaries remain in-crate under `crates/*/tests/`, each because it needs a process
 of its own: it mutates the process environment, spawns the shipped `cyrup` binary, or pins a
@@ -353,8 +316,7 @@ Two conventions:
 Behavioural differences from Pi are tracked in the open, in
 [`docs/gap-analysis/`](docs/gap-analysis/README.md), so an unported feature is not mistaken for a
 bug. 85 rows are open across the area files: no `critical`, no `high`, 11 `medium`, 74 `low`, with
-590 closed. `docs/gap-analysis/scripts/count_open_items.py` produces those counts, re-derived
-2026-09-14.
+590 closed. `docs/gap-analysis/scripts/count_open_items.py` produces those counts.
 
 **Nothing is open above `medium`.** Read that as "no row currently carries a `critical` or `high`
 severity", not as "nothing serious is left": whatever is open is a floor rather than a total, and the
@@ -362,23 +324,16 @@ set above `medium` has turned over completely inside a single pass before.
 
 Two things bound those counts harder than the counts themselves do.
 
-**The ledger lags the code by a full feature.** The last pass that re-read area files measured at
-`824a539e`; the `workflowScript` runtime and `cyrup-workflow-runtime` landed after it — 31 code
-commits, 453 files, +98,179 / −15,880 under `crates/` — and **no area file has been re-read against
-that**. A count of 85 is a count of what the ledger last looked at, not of what the port contains.
+**The ledger lags the code.** It last read area files at `824a539e`; the `workflowScript` runtime
+and `cyrup-workflow-runtime` landed after it — 453 files, +98,509 / −15,880 under `crates/` — and
+no area file has been re-read against them. A count of 85 is what the ledger last looked at, not
+what the port contains.
 
-**The ledger lags the upstreams.** Every "latest tag" was re-measured 2026-09-14 and three of the
-seven had moved — `pi` by two releases, `pi-subagents` by three, `pi-mcp-adapter` by one. Those
-windows are measured below and **nothing in them is filed**. See
-[`ADR-0006`](docs/adr/ADR-0006-upstream-chase-cadence.md) for the cadence and where the resulting
-items are meant to live.
-
-Concretely, the zombie defect in **Status** was a confirmed port bug — both sides read, upstream at a
-named tag, and a failing test that reproduced it — and it never carried a row. It was found by
-running the suite during this refresh, which is precisely the kind of thing a static ledger does not
-find: the ledger had read that `CYRUP-DELTA` and accepted its reasoning, because the reasoning is
-plausible and only an execution disagrees with it. It is written up as §0f of
-[`REPRO-LOG.md`](docs/gap-analysis/REPRO-LOG.md).
+**The ledger lags the upstreams.** Three of the seven have tagged releases past the ones the area
+files were measured against — `pi` by two, `pi-subagents` by three, `pi-mcp-adapter` by one — and
+nothing in those windows is filed. They are measured below.
+[`ADR-0006`](docs/adr/ADR-0006-upstream-chase-cadence.md) records the cadence and where the
+resulting items live.
 
 The ledger is mostly a static analysis. Items are evidenced by reading both sources rather than by
 running anything, its measured error rate has run near 12%, and it lags the code. Treat an entry as a
@@ -404,7 +359,7 @@ cyrup tracks seven upstream projects, six TypeScript and one Python. The core is
 standalone Pi extensions, since Pi core ships no permission system, no MCP client and no editor
 protocol of its own. Flux follows `code_puppy_core_plugins`, which is Python.
 
-Latest tags re-measured 2026-09-14 with `git ls-remote --tags`; every window below is
+Latest tags as of 2026-09-14, from `git ls-remote --tags`; every window below is
 `git diff --shortstat <baseline>..<tag>` against a freshly fetched clone.
 
 | upstream | followed by | ported baseline | latest tag | baseline → latest |
@@ -417,8 +372,8 @@ Latest tags re-measured 2026-09-14 with `git ls-remote --tags`; every window bel
 | `code_puppy_core_plugins` (Python) | `cyrup-flux` | v0.0.6 | **v0.0.50** | ported surface byte-identical |
 | `svkozak/pi-acp` | `cyrup-acp` | v0.0.33 | v0.0.33, the newest upstream | — |
 
-Three upstreams tagged new releases since the ledger last measured, and those windows are the
-unfiled work:
+Three of them have tagged releases past the ones the area files were measured against. Those
+windows are the unfiled work:
 
 | window | opened by | size |
 |---|---|---|
@@ -426,13 +381,12 @@ unfiled work:
 | `pi-subagents` v0.64.0..v0.67.0 | 170 non-merge commits | 370 files, +42,205 / −24,183; `src/` alone is 159 files, +10,919 / −6,444 with 30 net-new source files — in-process pi child sessions, bounded SSH project execution, watchdog model-fallback chains, per-child async completion notification |
 | `pi-mcp-adapter` v2.32.1..v2.33.0 | 33 non-merge commits | 123 files, +9,455 / −1,352 — one-URL server install, per-server HTTPS CA bundles, per-server env-inheritance opt-out, `directTools: "search"` lazy activation, trusted local Claude-plugin bundles, cross-process OAuth credential transactions |
 
-`pi-permission-system`, `pi-intercom` and `pi-acp` published no new tag; each was re-checked against
-the remote rather than inherited from the prior record.
+`pi-permission-system`, `pi-intercom` and `pi-acp` have published nothing newer.
 
-The Flux row's version gap is still not a behaviour gap: the ported surface (`flux_bootstrap/`) is
-byte-identical at every one of the 39 tags between `v0.0.6` and `v0.0.50`, re-checked tag by tag.
+The Flux row's version gap is not a behaviour gap: the ported surface (`flux_bootstrap/`) is
+byte-identical at every one of the 39 tags between `v0.0.6` and `v0.0.50`.
 
-The pi-acp row remains the newest. `cyrup-acp` speaks the
+The pi-acp row is the newest. `cyrup-acp` speaks the
 [Agent Client Protocol](https://agentclientprotocol.com) over stdio so an editor — Zed is the
 reference client — can drive cyrup the way it drives any other ACP agent: `initialize`,
 `session/new`, `session/prompt` and the rest, with the turn streamed back as `session/update`
