@@ -32,6 +32,7 @@ With an `action`, the tool is in **management** or **control** mode.
 | `stop` | control | Stop a run |
 | `dismiss` | control | Clear a recovered workflow with no live runner from the display |
 | `append-step` | control | Add a step to a running chain |
+| `inspect` | control | Read one run's (or one child's) transcript tail and final output |
 | `doctor` | management | Discovery diagnostics |
 | `guide` | management | Read this packaged documentation |
 | `mission.create` | management | Open a mission |
@@ -86,7 +87,8 @@ deliberately stricter rule, so a loose typo is never nudged toward a destructive
 | `agentScope` | management | Which discovery scopes to read or write |
 | `id`, `runId`, `dir` | control | Address a run by id or by directory |
 | `index` | control | Zero-based child index within a run |
-| `view`, `lines` | `status` | Fleet or transcript view, and transcript line cap |
+| `view`, `lines` | `status`, `inspect` | Fleet or transcript view, and transcript/message line cap |
+| `childId` | `stop`, `inspect` | Address one child by its workflow key, child run id, or `step:<n>` |
 | `message` | `steer`, `resume` | Guidance or follow-up text |
 | `mode` | `steer` | `steer`, `follow_up` or `auto` |
 | `additional` | `grant-spawn-budget` | Positive launches to add |

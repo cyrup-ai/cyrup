@@ -39,6 +39,12 @@ pub trait CompletionObserver: Send + Sync {
 /// subscribers exactly as pi's `SUBAGENT_ASYNC_COMPLETE_EVENT` does (`extension/index.ts:648-659`
 /// @v0.43.0 registers three listeners on the one event; `wait-subscriptions.ts` adds a fourth).
 ///
+/// All four are now real: SCOPE_11 landed the fourth as
+/// `extension/executor/wait_subscriptions.rs`'s `WaitSubscriptionCompletionObserver`, registered
+/// LAST in `extension/executor/notices.rs`'s composite so the
+/// [`crate::background::wait_completions::WaitCompletionStore`] record member #1 writes is already
+/// present when a fired subscription reads its completion back.
+///
 /// Before this existed the install seam took a single `Option<Arc<dyn CompletionObserver>>`, which
 /// could model pi's mission-sync listener and nothing else — so the `wait` wake-up had nowhere to
 /// attach. Each member is awaited in registration order and none may fail the pipeline, matching

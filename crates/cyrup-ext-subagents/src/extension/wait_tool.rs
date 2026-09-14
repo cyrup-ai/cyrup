@@ -29,6 +29,12 @@ fn wait_tool_description(enabled: bool) -> String {
                 again — keeping N in flight.\n\
                 • { all: true } — block until EVERY active run in this session is finished.\n\
                 • { id: \"...\" } — wait for one specific run (id or prefix) to finish.\n\
+                • { id: \"...\", nonBlocking: true } — resolve the prefix once, persist an \
+                exact-run wake subscription, and return immediately. This session is woken on \
+                completion, failure, attention, reconciliation failure, or timeout — including in \
+                a later turn, and including after the result payload has been cleaned up. \
+                Requires id; cannot be combined with all. Inspect armed subscriptions with \
+                subagent({ action: \"status\" }).\n\
                 • { timeoutMs: 600000 } — stop waiting after N ms (the runs keep going regardless; \
                 default 30 min)\n\n\
                 wait also returns when a run needs attention (a child that went idle or blocked \
@@ -49,7 +55,7 @@ fn wait_tool_description(enabled: bool) -> String {
 }
 
 /// JSON Schema for [`WaitTool`]'s parameters (pi `WaitParams`, `runs/background/wait.ts:96-108` @v0.34.0).
-fn wait_tool_parameters() -> serde_json::Value {
+pub(crate) fn wait_tool_parameters() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {
@@ -65,6 +71,16 @@ fn wait_tool_parameters() -> serde_json::Value {
                 "type": "integer",
                 "minimum": 1,
                 "description": "Give up after this many milliseconds (default 1800000 = 30 minutes). The runs are detached and keep going."
+            },
+            // SCOPE_11. This key and `WaitParams::non_blocking` MUST land together: the schema
+            // below closes with `additionalProperties: false`, so a caller passing `nonBlocking`
+            // against an un-edited schema is rejected by the host before `serde` sees it — and
+            // `WaitParams` carries `#[serde(default)]` without `deny_unknown_fields`, so an
+            // un-edited struct would silently DROP the key. Either half alone is a no-op, in
+            // opposite directions.
+            "nonBlocking": {
+                "type": "boolean",
+                "description": "Arm a durable wake subscription for the exact run `id` resolves to and return immediately instead of blocking. Requires id; cannot be combined with all. The session is woken on completion, failure, attention, reconciliation failure, or timeout, even in a later turn."
             }
         },
         "additionalProperties": false
@@ -161,7 +177,20 @@ impl Tool for WaitTool {
         .with_inline_answers(Some(self.executor.inline_answers()))
         // The executor-owned consumed-payload record, so a completion the watcher already
         // delivered and deleted still resolves for a wait that lands a moment later.
-        .with_wait_completions(self.executor.wait_completions());
+        .with_wait_completions(self.executor.wait_completions())
+        // SCOPE_11 — pi `wait-tool.ts:33`'s
+        // `...(subscriptions && ctx?.hasUI ? { subscribe: (input) => subscriptions.arm(input) } : {})`.
+        //
+        // Upstream's `ctx?.hasUI` is a per-CALL tool context; cyrup's `Tool::execute` has no such
+        // parameter, and its `has_ui` lives on `HostCtx` at the `SessionStart` edge instead. The
+        // gate is therefore applied where the fact is actually known — the manager is INSTALLED
+        // only for a session with a UI (`extension/host/native_impl.rs`'s `SessionStart` arm) — so
+        // a headless runtime simply has no manager here and `wait_for_subagents` takes pi's own
+        // `!deps.subscribe` refusal. Same observable, one fewer place for the two to disagree.
+        .with_subscribe(self.executor.wait_subscriptions().map(|manager| {
+            let arming: Arc<dyn crate::background::wait::WaitSubscriptionArming> = manager;
+            crate::background::wait::WaitSubscribeHook::new(arming)
+        }));
         let outcome = crate::background::wait::wait_for_subagents(&parsed, &cancel, &deps).await;
         // cyrup's `Tool::execute` returns `Result<ToolResult, ToolError>` and the host maps `Err`
         // onto the result's error flag (`cyrup-core/src/tool.rs`: "Tools signal failure by

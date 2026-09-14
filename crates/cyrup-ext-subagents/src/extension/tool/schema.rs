@@ -861,6 +861,11 @@ mod tests {
                 "stop",
                 "dismiss",
                 "append-step",
+                // SCOPE_12 — [CYRUP-DELTA], and the only entry here with no upstream index:
+                // upstream reaches `inspect-rpc.ts` through a slash command only, so `inspect`
+                // is absent from its `SUBAGENT_ACTIONS`. It sits at the end of the control band,
+                // advertised in the same change that gave `route_action` its dispatch arm.
+                "inspect",
                 "doctor",
                 "mission.create",
                 "mission.list",

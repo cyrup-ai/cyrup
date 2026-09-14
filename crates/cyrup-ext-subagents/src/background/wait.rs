@@ -217,6 +217,20 @@ pub struct WaitParams {
     /// Give up after this many milliseconds ([`DEFAULT_TIMEOUT_MS`] when unset or non-positive).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// pi `SubagentWaitParams.nonBlocking` (`extension/schemas.ts:407-409`): resolve `id` once,
+    /// persist an exact-run wake subscription ([`super::wait_subscriptions`]) and return
+    /// IMMEDIATELY instead of blocking. The session is then woken on completion, failure,
+    /// attention, reconciliation failure or timeout — including in a later turn.
+    ///
+    /// Requires `id` and is incompatible with `all` (pi `subagent-wait.ts:561-566`): a
+    /// registration binds ONE exact run identity, which a fleet-wide wait has no way to name.
+    ///
+    /// ⚠ The tool's JSON Schema (`extension/wait_tool.rs`'s `wait_tool_parameters`) ends with
+    /// `"additionalProperties": false` and this struct carries `#[serde(default)]` without
+    /// `deny_unknown_fields` — so editing one and not the other is a silent no-op in OPPOSITE
+    /// directions (host rejection versus a serde drop). They move together or not at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub non_blocking: Option<bool>,
 }
 
 /// Injected environment for [`wait_for_subagents`] — the two run-storage roots, the poll cadence,
@@ -283,6 +297,74 @@ pub struct WaitDeps {
     /// (tests, headless embedders) — changes nothing: no claim is ever taken and every delivery
     /// proceeds exactly as before, mirroring [`Self::completion_bus`]'s no-bus degradation.
     pub inline_answers: Option<crate::background::watch::InlineAnswerLedger>,
+    /// SCOPE_11 — the durable-subscription arming seam, pi's `deps.subscribe`
+    /// (`subagent-wait.ts:597`), supplied by `wait-tool.ts:33` as
+    /// `...(subscriptions && ctx?.hasUI ? { subscribe: (input) => subscriptions.arm(input) } : {})`.
+    ///
+    /// `None` is upstream's own no-manager state and carries upstream's own refusal: a runtime
+    /// with no long-lived manager, or with no UI, cannot honour a wake that arrives after the
+    /// turn ends, so `nonBlocking` is REFUSED rather than silently downgraded to a blocking wait.
+    /// That mirrors [`Self::completion_bus`]'s no-bus degradation in shape while differing in
+    /// kind, deliberately: a missing bus costs latency, a missing manager costs the whole
+    /// guarantee the caller asked for.
+    pub subscribe: Option<WaitSubscribeHook>,
+}
+
+/// [`WaitDeps::subscribe`]'s payload — pi's `deps.subscribe` closure.
+///
+/// A newtype rather than a bare `Arc<dyn …>` for one mechanical reason: [`WaitDeps`] derives
+/// [`Debug`], and a trait object cannot. Wrapping it here keeps the hand-written `Debug` to three
+/// lines instead of restating all fourteen `WaitDeps` fields.
+#[derive(Clone)]
+pub struct WaitSubscribeHook(std::sync::Arc<dyn WaitSubscriptionArming>);
+
+impl WaitSubscribeHook {
+    /// Wrap a live arming seam — in production
+    /// [`super::wait_subscriptions::WaitSubscriptionManager`].
+    #[must_use]
+    pub fn new(arming: std::sync::Arc<dyn WaitSubscriptionArming>) -> Self {
+        Self(arming)
+    }
+
+    /// pi `deps.subscribe(input)` (`:597`).
+    ///
+    /// # Errors
+    ///
+    /// Whatever the manager refuses with — in practice
+    /// [`super::wait_subscriptions::NO_SESSION_IDENTITY`] or a failed record write. Upstream
+    /// catches the throw and reports it as an error result (`:598-600`); so does the caller here.
+    pub async fn arm(
+        &self,
+        input: super::wait_subscriptions::ArmWaitSubscriptionInput,
+    ) -> Result<super::wait_subscriptions::WaitSubscriptionRecord, crate::error::SubagentError>
+    {
+        self.0.arm(input).await
+    }
+}
+
+impl std::fmt::Debug for WaitSubscribeHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WaitSubscribeHook")
+    }
+}
+
+/// The one method the `wait` tool needs off the subscription manager — pi's
+/// `Pick<WaitSubscriptionManager, "arm">` (`wait-tool.ts:12`).
+///
+/// A trait, not the concrete manager, because `background/wait.rs` must not depend on the
+/// executor-owned lifecycle that builds one; the manager's own deps are injected from
+/// `extension/executor/` for the same layering reason.
+#[async_trait::async_trait]
+pub trait WaitSubscriptionArming: Send + Sync {
+    /// pi `arm` (`wait-subscriptions.ts:290-308`).
+    ///
+    /// # Errors
+    ///
+    /// See [`WaitSubscribeHook::arm`].
+    async fn arm(
+        &self,
+        input: super::wait_subscriptions::ArmWaitSubscriptionInput,
+    ) -> Result<super::wait_subscriptions::WaitSubscriptionRecord, crate::error::SubagentError>;
 }
 
 impl WaitDeps {
@@ -315,6 +397,9 @@ impl WaitDeps {
             fail_on_failed_runs: false,
             fail_on_attention: false,
             inline_answers: None,
+            // pi's own no-manager shape: `wait-tool.ts:33` omits `subscribe` entirely unless the
+            // extension holds a manager AND `ctx.hasUI`.
+            subscribe: None,
         }
     }
 
@@ -361,6 +446,16 @@ impl WaitDeps {
         ledger: Option<crate::background::watch::InlineAnswerLedger>,
     ) -> Self {
         self.inline_answers = ledger;
+        self
+    }
+
+    /// SCOPE_11 — attach the executor-owned subscription manager, so `{ id, nonBlocking: true }`
+    /// arms a durable wake instead of being refused. Separate from [`Self::for_cwd`] for exactly
+    /// the reason [`Self::with_completion_bus`] is: the manager is executor-owned and must outlive
+    /// any single wait, while `for_cwd` is reachable from contexts that have no executor at all.
+    #[must_use]
+    pub fn with_subscribe(mut self, subscribe: Option<WaitSubscribeHook>) -> Self {
+        self.subscribe = subscribe;
         self
     }
 
@@ -560,6 +655,24 @@ pub enum WaitVerdict {
     /// [`super::wait_completions::collect_wait_completions`]' `Err` lands, and the ONLY place it
     /// can: a projection rejection is a reported wait, never a propagated one.
     CompletionsFailed,
+    /// SCOPE_11 — `{ id, nonBlocking: true }` armed a durable subscription and returned at once
+    /// (pi `:596`). **Not an error**: upstream's return there is a bare `result(text)`.
+    ///
+    /// Carries the token because it is the handle a caller uses to recognize the wake when it
+    /// arrives, and because `subagent({ action: "status" })` renders the same value — the text
+    /// already names it, and a consumer must not have to parse prose to get it back.
+    SubscriptionArmed {
+        /// The armed record's identity — [`super::wait_subscriptions::WaitSubscriptionRecord::token`].
+        token: super::wait_subscriptions::SubscriptionToken,
+    },
+    /// SCOPE_11 — the non-blocking form was REFUSED. Error.
+    ///
+    /// One variant for upstream's four refusal sites (`:561` no `id`, `:564` combined with `all`,
+    /// `:592` no manager or no UI, `:598` the `arm` itself threw) rather than four, because a
+    /// reader's `match` has nothing different to do for them: every one of them means "this call
+    /// did not register a wake, and did not block either". Which refusal it was lives in
+    /// [`WaitOutcome::text`], where upstream also keeps it.
+    SubscriptionRefused,
     /// The wait resolved. Error **iff** the deps flags say so — pi `:751`/`:768`.
     Resolved {
         /// pi `failedAsyncCount` (`:713`). Kept beside the flag because the two terminal renders
@@ -638,10 +751,12 @@ impl WaitOutcome {
         match &self.verdict {
             WaitVerdict::Disabled
             | WaitVerdict::NothingToWait
+            | WaitVerdict::SubscriptionArmed { .. }
             | WaitVerdict::WindowElapsed { .. } => false,
             WaitVerdict::ListingFailed
             | WaitVerdict::AmbiguousId
             | WaitVerdict::Aborted
+            | WaitVerdict::SubscriptionRefused
             | WaitVerdict::CompletionsFailed => true,
             WaitVerdict::Resolved {
                 reported_as_error, ..
@@ -726,6 +841,27 @@ pub async fn wait_for_subagents(
         );
     }
 
+    // SCOPE_11 / pi `:561-566` — BEFORE any listing, because neither rejection depends on what is
+    // on disk. A registration binds ONE exact run identity, so a prefix-less or fleet-wide
+    // non-blocking wait has nothing to bind and must say so rather than silently blocking.
+    if params.non_blocking == Some(true) {
+        if params.id.is_none() {
+            return WaitOutcome::plain(
+                "Non-blocking wait subscriptions require id so the registration can bind one \
+                 exact run identity."
+                    .to_string(),
+                WaitVerdict::SubscriptionRefused,
+            );
+        }
+        if params.all == Some(true) {
+            return WaitOutcome::plain(
+                "nonBlocking cannot be combined with all; subscribe to one exact run id."
+                    .to_string(),
+                WaitVerdict::SubscriptionRefused,
+            );
+        }
+    }
+
     let poll_interval = deps
         .poll_interval
         .max(Duration::from_millis(MIN_POLL_INTERVAL_MS));
@@ -804,6 +940,61 @@ pub async fn wait_for_subagents(
         }
         // Narrow to the single resolved id so later polls cannot pick up a different prefix match.
         effective_id = active.first().map(|run| run_id_of(run).to_string());
+    }
+
+    // SCOPE_11 / pi `:590-600` — THE arming site, and its position is the whole point: after the
+    // ambiguity rejection at `:586` and after the id has been narrowed to ONE exact run, so the
+    // record binds the resolved identity rather than the prefix the caller typed. Both are kept:
+    // `run_id` is the exact id, `requested_id` is what the user asked for.
+    //
+    // Upstream reaches here only when a candidate matched (`selected` is defined); cyrup's
+    // equivalent guard is the `active.is_empty()` return above, which already answered
+    // `No active run matched "…"`.
+    //
+    // `[CYRUP-DELTA]` upstream's candidate list spans async runs AND remembered detached
+    // FOREGROUND runs (`:581-584`, `activeDetachedForegroundRuns`), so its `selected.kind` can be
+    // either. cyrup's `wait` lists async runs only (`active_runs` → `list_active_runs`), so this
+    // site can only ever arm [`super::wait_subscriptions::WaitTargetKind::Async`]. The foreground
+    // target kind and its whole reconcile branch are still ported, because the manager restores
+    // records written by ANY producer and a record's format cannot be half-implemented.
+    if params.non_blocking == Some(true)
+        && let Some(id) = params.id.as_deref()
+        && let Some(exact) = effective_id.as_deref()
+    {
+        let Some(subscribe) = deps.subscribe.as_ref() else {
+            // pi `:591-593` — the `ctx?.hasUI`/no-manager refusal (`wait-tool.ts:33`), with pi's
+            // `bg_wait` spelled as cyrup's own tool name.
+            return WaitOutcome::plain(
+                format!(
+                    "Non-blocking wait subscriptions require a long-lived interactive subagent \
+                     runtime; this runtime can only use blocking {} calls.",
+                    crate::extension::wait_tool::WAIT_TOOL_NAME
+                ),
+                WaitVerdict::SubscriptionRefused,
+            );
+        };
+        let input = super::wait_subscriptions::ArmWaitSubscriptionInput {
+            target_kind: super::wait_subscriptions::WaitTargetKind::Async,
+            run_id: super::RunId::from_token(exact.to_string()),
+            requested_id: id.to_string(),
+            timeout_ms: timeout.as_millis().try_into().unwrap_or(u64::MAX),
+        };
+        // pi `:595-600` — the arm's own throw is reported as an error RESULT, never propagated.
+        return match subscribe.arm(input).await {
+            Ok(record) => WaitOutcome::plain(
+                format!(
+                    "Armed wait subscription {} for exact async run {exact}. Returning \
+                     immediately; this session will be woken on completion, failure, attention, \
+                     reconciliation failure, or timeout. Inspect armed subscriptions with \
+                     subagent({{ action: \"status\" }}).",
+                    record.token
+                ),
+                WaitVerdict::SubscriptionArmed {
+                    token: record.token,
+                },
+            ),
+            Err(error) => WaitOutcome::plain(error.to_string(), WaitVerdict::SubscriptionRefused),
+        };
     }
 
     // The set of runs in flight when the wait began. In first-completion mode we return as soon as
@@ -1591,6 +1782,10 @@ mod tests {
                 wait_completions: std::sync::Arc::new(
                     crate::background::wait_completions::WaitCompletionStore::default(),
                 ),
+                // SCOPE_11 — no manager, which is upstream's own headless/no-UI shape and what
+                // every pre-existing test in this module exercises. The `nonBlocking` tests below
+                // opt into a fake arming seam explicitly.
+                subscribe: None,
             }
         }
 
@@ -2897,5 +3092,265 @@ mod tests {
         .text;
         settler.await.expect("settler task");
         assert!(text.contains("1 of 1 run(s) finished"), "{text}");
+    }
+
+    // =============================================================================================
+    // SCOPE_11 — `{ id, nonBlocking: true }`
+    // =============================================================================================
+
+    /// The three stub seams a real [`crate::background::wait_subscriptions::WaitSubscriptionManager`]
+    /// needs. Used rather than a fake arming closure so this test exercises the REAL `arm` — the
+    /// on-disk record it asserts is the one production writes, not one the test wrote for itself.
+    mod subscription_stubs {
+        use crate::background::wait_completions::WaitCompletion;
+        use crate::background::wait_subscriptions::{
+            ForegroundSubscriptionProbe, ForegroundTargetState, SubscriptionNotifier,
+            SubscriptionOutcome, SubscriptionSessions, WaitSubscriptionRecord,
+        };
+
+        pub(super) struct Sessions(pub(super) Option<&'static str>);
+
+        impl SubscriptionSessions for Sessions {
+            fn current_session_id(&self) -> Option<crate::identity::SessionId> {
+                crate::identity::SessionId::parse_opt(self.0)
+            }
+        }
+
+        pub(super) struct SilentNotifier;
+
+        #[async_trait::async_trait]
+        impl SubscriptionNotifier for SilentNotifier {
+            async fn notify(
+                &self,
+                _record: &WaitSubscriptionRecord,
+                _outcome: SubscriptionOutcome,
+                _detail: &str,
+                _completion: Option<&WaitCompletion>,
+            ) -> bool {
+                true
+            }
+        }
+
+        pub(super) struct NoForeground;
+
+        impl ForegroundSubscriptionProbe for NoForeground {
+            fn probe(&self, _run_id: &crate::background::RunId) -> Option<ForegroundTargetState> {
+                None
+            }
+        }
+    }
+
+    fn subscription_manager(
+        fx: &Fixture,
+        subs_dir: &std::path::Path,
+        session_id: Option<&'static str>,
+    ) -> std::sync::Arc<crate::background::wait_subscriptions::WaitSubscriptionManager> {
+        crate::background::wait_subscriptions::WaitSubscriptionManager::new(
+            crate::background::wait_subscriptions::WaitSubscriptionDeps {
+                subscriptions_dir: subs_dir.to_path_buf(),
+                async_root: fx.async_root.clone(),
+                results_dir: fx.results_dir.clone(),
+                sessions: std::sync::Arc::new(subscription_stubs::Sessions(session_id)),
+                notifier: std::sync::Arc::new(subscription_stubs::SilentNotifier),
+                foreground: std::sync::Arc::new(subscription_stubs::NoForeground),
+                wait_completions: std::sync::Arc::new(
+                    crate::background::wait_completions::WaitCompletionStore::default(),
+                ),
+            },
+        )
+    }
+
+    /// SUBTASK2 — the feature: the wait RETURNS instead of blocking, and it leaves a durable
+    /// record behind.
+    ///
+    /// The run stays `Running` for the whole test and the poll interval is set to ten seconds, so
+    /// a blocking wait could not return in under that. Returning fast alone would not be enough —
+    /// a stub that simply returned would pass it — which is why the `<token>.json` on disk is
+    /// asserted too, and why the token in the verdict must be the file's own name.
+    #[tokio::test]
+    async fn a_non_blocking_wait_arms_a_subscription_and_returns_immediately() {
+        let fx = Fixture::new();
+        let subs = fx.async_root.parent().expect("temp root").join("subs");
+        let run = RunId::from_token("run-1".to_string());
+        fx.write_status_for_session(&run, RunState::Running, false, Some("sess-a"));
+
+        let manager = subscription_manager(&fx, &subs, Some("sess-a"));
+        let mut deps = fx.deps(true);
+        deps.session_id = Some("sess-a".to_string());
+        // Far longer than this test's own budget: a blocking wait sleeps at least this long
+        // before it re-lists, so "returned" and "blocked" cannot be confused.
+        deps.poll_interval = Duration::from_secs(10);
+        let arming: std::sync::Arc<dyn WaitSubscriptionArming> = manager;
+        deps.subscribe = Some(WaitSubscribeHook::new(arming));
+
+        let params = WaitParams {
+            id: Some("run".to_string()),
+            non_blocking: Some(true),
+            timeout_ms: Some(60 * 60 * 1000),
+            ..WaitParams::default()
+        };
+        let started = Instant::now();
+        let outcome = wait_for_subagents(&params, &CancelToken::new(), &deps).await;
+        assert!(
+            started.elapsed() < deps.poll_interval,
+            "a non-blocking wait must not pay even one poll interval: {:?}",
+            started.elapsed()
+        );
+
+        let WaitVerdict::SubscriptionArmed { token } = &outcome.verdict else {
+            panic!("expected SubscriptionArmed, got {:?}", outcome.verdict);
+        };
+        assert!(!outcome.is_error(), "pi `:596` is a bare non-error result");
+        assert_eq!(
+            outcome.text,
+            format!(
+                "Armed wait subscription {token} for exact async run run-1. Returning \
+                 immediately; this session will be woken on completion, failure, attention, \
+                 reconciliation failure, or timeout. Inspect armed subscriptions with subagent({{ \
+                 action: \"status\" }})."
+            )
+        );
+        // The durable half: a real record, named for the token the verdict carries.
+        let path = subs.join(format!("{token}.json"));
+        let bytes = std::fs::read(&path).expect("the record is on disk");
+        let record = crate::background::wait_subscriptions::parse_record(&bytes)
+            .expect("and it parses back");
+        assert_eq!(&record.token, token);
+        // pi keeps BOTH ids: the resolved exact one it binds, and the prefix the caller typed.
+        assert_eq!(record.run_id.as_str(), "run-1");
+        assert_eq!(record.requested_id, "run");
+        assert_eq!(
+            record.target_kind,
+            crate::background::wait_subscriptions::WaitTargetKind::Async
+        );
+    }
+
+    /// pi `:561-566` — both rejections, BEFORE any listing (there is no run on disk here at all,
+    /// and neither refusal depends on one).
+    #[tokio::test]
+    async fn a_non_blocking_wait_requires_an_id_and_refuses_all() {
+        let fx = Fixture::new();
+        let deps = fx.deps(true);
+
+        let no_id = wait_for_subagents(
+            &WaitParams {
+                non_blocking: Some(true),
+                ..WaitParams::default()
+            },
+            &CancelToken::new(),
+            &deps,
+        )
+        .await;
+        assert_eq!(no_id.verdict, WaitVerdict::SubscriptionRefused);
+        assert!(no_id.is_error());
+        assert_eq!(
+            no_id.text,
+            "Non-blocking wait subscriptions require id so the registration can bind one exact \
+             run identity."
+        );
+
+        let with_all = wait_for_subagents(
+            &WaitParams {
+                id: Some("run-1".to_string()),
+                all: Some(true),
+                non_blocking: Some(true),
+                ..WaitParams::default()
+            },
+            &CancelToken::new(),
+            &deps,
+        )
+        .await;
+        assert_eq!(with_all.verdict, WaitVerdict::SubscriptionRefused);
+        assert_eq!(
+            with_all.text,
+            "nonBlocking cannot be combined with all; subscribe to one exact run id."
+        );
+    }
+
+    /// pi `:591-593` / `wait-tool.ts:33`'s `ctx?.hasUI` gate: with no manager the request is
+    /// REFUSED, never silently downgraded to a blocking wait. `WaitDeps::for_cwd` leaves
+    /// `subscribe: None`, so this is also the default every headless embedder gets.
+    #[tokio::test]
+    async fn a_non_blocking_wait_with_no_manager_is_refused() {
+        let fx = Fixture::new();
+        let run = RunId::from_token("run-1".to_string());
+        fx.write_status(&run, RunState::Running, false);
+        let deps = fx.deps(true);
+        assert!(deps.subscribe.is_none());
+
+        let outcome = wait_for_subagents(
+            &WaitParams {
+                id: Some("run-1".to_string()),
+                non_blocking: Some(true),
+                ..WaitParams::default()
+            },
+            &CancelToken::new(),
+            &deps,
+        )
+        .await;
+        assert_eq!(outcome.verdict, WaitVerdict::SubscriptionRefused);
+        assert!(outcome.is_error());
+        assert_eq!(
+            outcome.text,
+            "Non-blocking wait subscriptions require a long-lived interactive subagent runtime; \
+             this runtime can only use blocking wait calls."
+        );
+    }
+
+    /// The arm's own refusal is reported as an error RESULT, never propagated (pi `:598-600`).
+    #[tokio::test]
+    async fn a_non_blocking_wait_reports_the_arms_own_refusal() {
+        let fx = Fixture::new();
+        let subs = fx.async_root.parent().expect("temp root").join("subs");
+        let run = RunId::from_token("run-1".to_string());
+        fx.write_status(&run, RunState::Running, false);
+        // The manager has no session identity, so `arm` throws pi's `:292`.
+        let manager = subscription_manager(&fx, &subs, None);
+        let mut deps = fx.deps(true);
+        let arming: std::sync::Arc<dyn WaitSubscriptionArming> = manager;
+        deps.subscribe = Some(WaitSubscribeHook::new(arming));
+
+        let outcome = wait_for_subagents(
+            &WaitParams {
+                id: Some("run-1".to_string()),
+                non_blocking: Some(true),
+                ..WaitParams::default()
+            },
+            &CancelToken::new(),
+            &deps,
+        )
+        .await;
+        assert_eq!(outcome.verdict, WaitVerdict::SubscriptionRefused);
+        assert_eq!(
+            outcome.text,
+            crate::background::wait_subscriptions::NO_SESSION_IDENTITY
+        );
+        assert!(
+            !subs.exists() || std::fs::read_dir(&subs).map(Iterator::count).unwrap_or(0) == 0,
+            "a refused arm writes nothing"
+        );
+    }
+
+    /// `nonBlocking` must survive the wire in BOTH directions: the JSON Schema advertises it and
+    /// `WaitParams` deserializes it. Editing one without the other is a silent no-op — a host
+    /// rejection one way, a serde drop the other.
+    #[test]
+    fn non_blocking_is_advertised_by_the_schema_and_parsed_by_the_params() {
+        let schema = crate::extension::wait_tool::wait_tool_parameters();
+        assert!(
+            schema["properties"]["nonBlocking"].is_object(),
+            "the schema closes with additionalProperties:false, so an unadvertised key is \
+             rejected by the host before serde ever sees it: {schema}"
+        );
+        let parsed: WaitParams =
+            serde_json::from_value(serde_json::json!({ "id": "run-1", "nonBlocking": true }))
+                .expect("parses");
+        assert_eq!(parsed.non_blocking, Some(true));
+        // And it round-trips under pi's camelCase spelling.
+        let value = serde_json::to_value(&parsed).expect("serializes");
+        assert_eq!(value["nonBlocking"], serde_json::json!(true));
+        // Omitted stays omitted, never `false` — pi's `...(x ? {x} : {})` discipline.
+        let bare = serde_json::to_value(WaitParams::default()).expect("serializes");
+        assert!(bare.get("nonBlocking").is_none(), "{bare}");
     }
 }

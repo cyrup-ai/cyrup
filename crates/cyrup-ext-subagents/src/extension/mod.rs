@@ -67,7 +67,7 @@ mod host;
 // models against `registry_models` — the same catalog binding every model-facing command here uses.
 pub(crate) mod models;
 mod tool;
-mod wait_tool;
+pub(crate) mod wait_tool;
 
 pub use executor::SubagentExecutor;
 pub use executor::requests::{

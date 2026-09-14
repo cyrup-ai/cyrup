@@ -46,6 +46,23 @@ const RESULTS_SUBDIR: &str = "results";
 /// and every persisted run tree hangs off `TEMP_ROOT_DIR` (`shared/types.ts:2689-2695` @v0.64.0).
 const SCRATCH_SUBDIR: &str = "scratch";
 
+/// Path segment, under [`temp_root_dir`], holding one `<token>.json` per armed durable wait
+/// subscription ([`crate::background::wait_subscriptions`]). A FOURTH sibling of
+/// [`ASYNC_SUBDIR`]/[`RESULTS_SUBDIR`]/[`SCRATCH_SUBDIR`], keyed by the same [`cwd_key`].
+///
+/// pi's own directory is `path.join(path.dirname(ASYNC_DIR), "wait-subscriptions")`
+/// (`wait-subscriptions.ts:106`), which resolves to `<TEMP_ROOT_DIR>/wait-subscriptions` because
+/// pi's `ASYNC_DIR` is one FLAT, non-cwd-keyed directory (`shared/types.ts:2733`). cyrup's async
+/// root carries a `<cwd_key>` level, so the literal `dirname` would resolve to `<scratch>/async` —
+/// shared by every cwd and one level too high. This leaf is upstream's *sibling-of-the-async-root*
+/// shape re-expressed in cyrup's layering, which `background/wait.rs:87-99` states outright: the
+/// cwd partition is the OUTER one, the session filter the inner one.
+///
+/// Deliberately NOT under [`RESULTS_SUBDIR`]: `spawn_retention_sweep`
+/// (`extension/executor/notices.rs:633`) walks the results dir with two reapers, and a live wake
+/// registration is not a result.
+const SUBSCRIPTIONS_SUBDIR: &str = "wait-subscriptions";
+
 /// One segment of a temp-scope id, with every character outside the keep-set — ASCII
 /// alphanumerics plus `.`, `_` and `-`, i.e. [`crate::workflows::WorkflowKey`]'s alphabet —
 /// collapsed to a single `-` and leading/trailing `-` stripped; an empty result becomes
@@ -305,6 +322,22 @@ pub fn run_artifact_roots_in(roots: &crate::paths::Roots, cwd: &Path) -> RunArti
         async_root: scratch.join(ASYNC_SUBDIR).join(&key),
         results_dir: scratch.join(RESULTS_SUBDIR).join(&key),
     }
+}
+
+/// The per-`cwd` directory [`crate::background::wait_subscriptions`] keeps its armed
+/// `<token>.json` records in: `<temp_root_dir>/wait-subscriptions/<cwd_key>`.
+///
+/// The same arithmetic, against the same resolved [`crate::paths::Roots`] and the same
+/// [`cwd_key`], as [`run_artifact_roots_in`] — so a subscription armed by one process is found by
+/// the next process to open the same working directory. Pure path arithmetic; creation is the
+/// caller's job ([`crate::background::wait_subscriptions::WaitSubscriptionManager::arm`] does it
+/// once per arm, mirroring pi's `fs.mkdirSync(subscriptionsDir, { recursive: true })`).
+#[must_use]
+pub fn wait_subscriptions_dir_in(roots: &crate::paths::Roots, cwd: &Path) -> PathBuf {
+    roots
+        .run_scratch()
+        .join(SUBSCRIPTIONS_SUBDIR)
+        .join(cwd_key(cwd))
 }
 
 /// The per-`cwd` directory `exec::run_sync` writes its per-attempt raw-stdout tee

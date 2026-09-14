@@ -86,7 +86,13 @@ mod turn_loop;
 pub use config::{ConfigConsumeOutcome, RunnerConfig, read_and_delete_config};
 pub use entry::{RunnerOverrides, run, run_with};
 pub use events::{ASYNC_EVENTS_MAX_BYTES_ENV, resolve_async_events_cap_bytes};
+// `mod finish` is private, so a `pub(crate)` item inside it is unreachable from outside this
+// module tree. SCOPE_8's reconciler (`extension/executor/workflow_detach/`) is the first
+// production caller of the settlement-plan stamper, which is why the pair is re-exported here
+// rather than the caller reaching for `finish_run` — see that module's own write-path doc for why
+// `finish_run` itself must NOT be widened or called.
 pub(crate) use executor::ExecSingleStepExecutor;
+pub(crate) use finish::{WorkflowResultFields, apply_workflow_settlement_plan};
 
 #[cfg(test)]
 mod tests {

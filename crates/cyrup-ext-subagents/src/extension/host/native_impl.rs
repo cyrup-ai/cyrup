@@ -367,7 +367,21 @@ impl NativeExtension for SubagentsExtension {
                 // message (with `triggerTurn`) and has its result file deleted (R-SA-099/101). When the
                 // P-1 host-services slot is bound this installs the live turn-injecting
                 // `HostServicesCompletionSink` (R-SA-101); otherwise the stderr LoggingCompletionSink.
-                self.executor.install_completion_watcher(&ctx.cwd).await;
+                // SCOPE_11 — pi `waitSubscriptionManager.restore()` (`extension/index.ts:971`),
+                // ordered AFTER `install_completion_watcher` so the composite observer's slot is
+                // already shared (the observer resolves the manager LATE, so the order is not
+                // load-bearing — this position is upstream's, where restore follows the watcher).
+                //
+                // `ctx.has_ui` is pi's own gate, relocated from `wait-tool.ts:33`'s per-call
+                // `ctx?.hasUI` to the one edge where cyrup actually knows it: a headless runtime
+                // (`cyrup -p …`) ends its whole task in a single turn, so a wake scheduled for a
+                // later turn could never be received. With no manager installed,
+                // `{ nonBlocking: true }` takes pi's own `!deps.subscribe` refusal.
+                if ctx.has_ui {
+                    self.executor.install_wait_subscriptions(&ctx.cwd).await;
+                } else {
+                    self.executor.dispose_wait_subscriptions();
+                }
 
                 // pi `fleetStatus.setContext(ctx)` (`tui/fleet-status.ts:271-288`): arm the
                 // always-on fleet status widget for this session and paint it once. See
@@ -472,6 +486,11 @@ impl NativeExtension for SubagentsExtension {
                 // pi `runtimeCleanup`'s `mainWatchdog.dispose()` (`extension/index.ts:416`) and
                 // `register-main.ts:434-437`'s own `session_shutdown` handler.
                 self.watchdog.dispose();
+                // SCOPE_11 — pi `waitSubscriptionManager.dispose()` (`extension/index.ts:1009`):
+                // stop the reconcile timer and drop the in-memory map. The RECORDS stay on disk —
+                // that is the entire point of the durable half, and the next session's `restore()`
+                // is what picks them up.
+                self.executor.dispose_wait_subscriptions();
                 self.executor.teardown_session().await;
                 // pi `fleetStatus.dispose()` — clear the widget and drop every piece of
                 // registration state (`tui/fleet-status.ts:290-299,533-563`).
