@@ -119,6 +119,9 @@ fn agent_config(name: &str) -> AgentConfig {
 /// through `AcceptanceContract::heuristic_default` — pi's `level: "auto"` (`acceptance.ts:127`).
 fn run_options(cwd: &Path) -> RunOptions {
     RunOptions {
+        // SCOPE_3j: no cached-exclusion registry for a fixture run — nothing is filtered and
+        // nothing is recorded, which is this field's documented `None` behaviour.
+        model_exclusions: None,
         host_available_builtins: None,
         structured_output_dir: None,
         spawn_command: None,

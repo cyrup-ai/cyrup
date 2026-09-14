@@ -73,7 +73,63 @@ pub struct ForegroundChildSteerHandle {
     pub index: usize,
 }
 
+/// Whether this child can take a steer request RIGHT NOW — pi's
+/// `if (!childSessionControls)` branch (`subagent-executor.ts:3860-3861`), answered from the
+/// child's published capability record instead of an in-process session object.
+///
+/// Three distinguishable facts, and collapsing any two of them is how this surface lies:
+///
+/// | capability read | fact | variant |
+/// |---|---|---|
+/// | `None` | the child has not reached its runtime yet | [`Self::NotRunningYet`] — RETRYABLE |
+/// | `Some(c)` with `!c.supported` | its host cannot inject messages at all | [`Self::Unsupported`] — terminal |
+/// | `Some(c)` with `c.supported` | steerable | [`Self::Ready`] |
+///
+/// Before this existed all three looked identical from the parent: every one of them fell through
+/// to a file drop and then to [`crate::extension::tool::text::STEER_ACK_TIMEOUT`] expiring, and the
+/// surface reported the same queued receipt for a child that was booting, a child that could never
+/// take guidance, and a child that was merely busy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChildSteerReadiness {
+    /// The child published `supported: true`: deliver.
+    Ready,
+    /// No capability record yet. pi's `CHILD_SESSION_NOT_RUNNING_YET`
+    /// ([`crate::extension::tool::text::CHILD_SESSION_NOT_RUNNING_YET`]) — the caller RETRIES,
+    /// because the window between "control registered" and "child running" is ordinary and short.
+    NotRunningYet,
+    /// The child published `supported: false`: its host cannot inject messages at all, and no
+    /// amount of waiting changes that. A genuine failure, not a timeout.
+    Unsupported,
+}
+
 impl ForegroundChildSteerHandle {
+    /// Read this child's published capability and classify it — see [`ChildSteerReadiness`].
+    ///
+    /// Called BEFORE the request write on every delivery path, which is what gives the poll in
+    /// [`crate::extension::executor::workflow::WorkflowRunHost`]'s `steer` something to poll on:
+    /// a request written first and classified second would already be on disk by the time the
+    /// caller learned the child is not there to read it.
+    ///
+    /// The capability is republished by the child on every capability re-bind, not only once at
+    /// start (`prompt_runtime.rs`'s `publish_capability` — `set_host_services` is late-bound, so a
+    /// single publish at session start would pin `supported: false` on every child), so a `None`
+    /// read is genuinely "not yet" and never "never".
+    ///
+    /// ⚠ `run_dir` + [`Self::index`], not a leaf: [`crate::background::control::read_steer_capability`]
+    /// takes the run root and appends `control/steer-capabilities/<index>.json` itself, which is the
+    /// same derivation the CHILD was handed as `CYRUP_SUBAGENT_STEER_CAPABILITY`
+    /// (`build_foreground_run_options`). One derivation, both sides.
+    pub(crate) async fn readiness(&self) -> ChildSteerReadiness {
+        match crate::background::control::read_steer_capability(&self.run_dir, self.index).await {
+            None => ChildSteerReadiness::NotRunningYet,
+            // The record carries a `pid` so a stale file from a dead process is detectable. This
+            // surface does not act on it — a dead child's ack simply never arrives and the budget
+            // expires — but it is deliberately not dropped from the read.
+            Some(capability) if capability.supported => ChildSteerReadiness::Ready,
+            Some(_) => ChildSteerReadiness::Unsupported,
+        }
+    }
+
     /// Deliver one steer request straight into this child's own inbox, returning the minted request
     /// id for the caller to await an acknowledgment against.
     ///
@@ -168,6 +224,25 @@ pub(crate) struct ForegroundChildEntry {
 /// state. Every field below is a verbatim line of upstream's assignment list, minus the ones
 /// cyrup's entry does not carry (`inputTokens`/`outputTokens`/`window`/`windowPeak`/`model`/
 /// `thinking`/`lastActivityAt`/`currentToolStartedAt`/`detach`).
+///
+/// # Upstream's `:60`, `control.steer = child.steer`, is deliberately NOT ported — and this is why
+///
+/// It mirrors the child's handle onto the parent entry, filling pi's
+/// `ForegroundRunControl.steer` (`shared/types.ts:2187`, declared as
+/// `steer?: ForegroundChildControl["steer"]`). cyrup has **no reader for that mirror**: every
+/// consumer of a foreground child's steer handle reaches it through the child map instead —
+/// `workflow_steering.rs`'s delivery arm does `target.control.active_children.get(&index)` and then
+/// `child.steer.as_ref()`, and [`crate::extension::executor::workflow::WorkflowRunHost`]'s
+/// `runs.steer` mints its own handle from the index it launched the key at. A
+/// [`ForegroundControlEntry::steer`] added today would be written on every control event and read
+/// nowhere, which `dead_code` reports and which this module already refuses once above for
+/// `finishForegroundChild`: ports land WITH their first call site, never ahead of one.
+///
+/// So this is a recorded decision, not the silent drop WORKFLOW_6 made — the drop that left the
+/// whole handle unowned. The line is ported the moment something reads the mirror (a fleet TUI
+/// steer action, or multi-child foreground steering that needs a run-level "current child"
+/// channel); until then the child map IS the propagation path, and
+/// [`begin_foreground_child`] below is the half that carries the handle onto it.
 fn sync_current_child(entry: &mut ForegroundControlEntry, child: &ForegroundChildEntry) {
     entry.current_agent = Some(child.agent.clone());
     entry.session_name = child.session_name.clone();

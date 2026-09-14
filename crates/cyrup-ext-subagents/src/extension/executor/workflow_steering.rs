@@ -41,7 +41,9 @@ use std::sync::PoisonError;
 
 use crate::background::{RunDir, RunId, RunMode, RunState};
 use crate::extension::executor::SubagentExecutor;
+use crate::extension::executor::foreground_control::ChildSteerReadiness;
 use crate::extension::executor::notices::ForegroundControlEntry;
+use crate::extension::tool::text::CHILD_SESSION_NOT_RUNNING_YET;
 use crate::identity::SessionId;
 
 /// pi `WorkflowForegroundSteeringTarget` (`workflow-foreground-steering.ts:11-15`).
@@ -309,6 +311,31 @@ impl SubagentExecutor {
             ));
         };
 
+        // pi `:3860-3861`, consumed BEFORE the write. The control entry registers before the
+        // spawned child reaches its runtime, so "there is a live control" does not imply "there is
+        // a child to read this". Classifying first is what keeps three different facts — booting,
+        // unsteerable, merely busy — from all rendering as one queued receipt that expires.
+        match handle.readiness().await {
+            ChildSteerReadiness::Ready => {}
+            // RETRYABLE, and said as such: this surface has no poll to hand it to (pi's
+            // `steerWorkflowChildByKey` does, and that is `WorkflowRunHost::steer`), so the caller
+            // is the retry loop. Returning the bare sentence rather than a receipt is upstream's
+            // own shape — the reason is the whole answer, and no request id exists yet to correlate.
+            ChildSteerReadiness::NotRunningYet => {
+                return Err(CHILD_SESSION_NOT_RUNNING_YET.to_string());
+            }
+            // pi's `catch` arm at `:3867-3869`, reached here at capability-publish time rather
+            // than call time because cyrup's child publishes the answer instead of throwing it.
+            // Terminal: a host that cannot inject messages will not start being able to.
+            ChildSteerReadiness::Unsupported => {
+                return Err(format!(
+                    "Steering failed for foreground run {} (request -): child {index} cannot be \
+                     steered.",
+                    target.control_run_id
+                ));
+            }
+        }
+
         // pi `:149` — `await child.steer({message, mode})`. The child's OWN inbox, addressed
         // directly, because a foreground workflow runs in THIS process: there is no runner watch
         // loop to drain an intake queue on its behalf. `source` distinguishes this route in the
@@ -319,11 +346,23 @@ impl SubagentExecutor {
             .map_err(|e| e.to_string())?;
 
         // SUBA-049's whole point, and it applies identically here: a queued file drop is not a
-        // delivery. `None` is `pending`, NOT a failure — the request is on disk and a child that
-        // reaches a safe point later still takes it.
+        // delivery. No ack inside the budget is NOT a failure — the request is on disk and a child
+        // that reaches a safe point later still takes it.
+        //
+        // ⚠ The no-ack word is `queued`, NOT the async arm's `pending`, and the two surfaces stay
+        // split on purpose. pi's foreground receipt has no `pending` word at all
+        // (`workflow-foreground-steering.ts:158`: `deliveryStatus: outcome.state === "delivered" ?
+        // "delivered" : "queued"`), and its no-ack contract at `:112-114` is stated as *"no
+        // acknowledgment leaves an honest, unaddressed QUEUED receipt"*. `pending` belongs to the
+        // ASYNC surface (`foreground_actions/steer.rs`), where it is upstream's own text and stays.
+        // Two words for two surfaces, each its own upstream's; a third would be invented.
+        //
+        // The SENTENCE names the child index as well as the run, which pi's does not: this arm
+        // defaults `index` over a multi-child `active_children` map a dozen lines up, so a receipt
+        // that named only the run would not say which child took the guidance.
         let outcome = Self::await_steer_ack(&handle.run_dir, &request_id, Some(handle.index)).await;
         let state = match outcome.as_ref() {
-            None => "pending",
+            None => "queued",
             Some(ack) => ack.state.as_str(),
         };
         let text = format!(
@@ -331,7 +370,7 @@ impl SubagentExecutor {
             target.control_run_id
         );
         // The async arm's own classification, kept identical: a `failed` ack is an error RESULT,
-        // `pending`/`queued`/`delivered` are ordinary successes because the request is still live.
+        // `queued`/`delivered` are ordinary successes because the request is still live.
         // (The script-facing `WorkflowRunHost::steer` returns `Failed` as a receipt VALUE instead —
         // it has a `WorkflowSteerResult::error` to carry it; this surface has only a sentence.)
         match outcome {
@@ -453,6 +492,41 @@ mod tests {
             serde_json::to_vec(&status).expect("serialize status"),
         )
         .expect("write status.json");
+    }
+
+    /// Publish the child's own steering capability record, exactly as a booted child's
+    /// `prompt_runtime` does (`STEER_CAPABILITY_ENV` → `publish_capability`). Nothing delivers
+    /// without one: `ForegroundChildSteerHandle::readiness` reads THIS file to tell a child that has
+    /// not reached its runtime from one whose host cannot inject at all.
+    async fn publish_capability(run_dir: &std::path::Path, index: usize, supported: bool) {
+        crate::background::control::write_steer_capability_at(
+            &crate::background::control::steer_capability_path(run_dir, index),
+            &crate::background::control::SteerCapability {
+                kind: "steer-capability".to_string(),
+                protocol_version: 1,
+                index,
+                // A real pid, because `write_steer_capability_at` refuses a zero one — the same
+                // guard that makes a stale record from a dead process detectable.
+                pid: 4242,
+                ready_at: 1,
+                supported,
+            },
+        )
+        .await
+        .expect("the child's capability must publish");
+    }
+
+    /// How many steer requests are sitting in `inbox`. `0` for a directory that was never created,
+    /// which is the assertion every refusal arm needs: a refused steer writes NOTHING.
+    fn requests_in(inbox: &std::path::Path) -> usize {
+        std::fs::read_dir(inbox)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
+                    .count()
+            })
+            .unwrap_or(0)
     }
 
     /// Gate `:22` — no active parent session refuses BEFORE the registry is even consulted.
@@ -668,6 +742,9 @@ mod tests {
             run_dir: run_dir.clone(),
             index: 0,
         };
+        // The child has reached its runtime and its host can inject — without this record the arm
+        // below answers `CHILD_SESSION_NOT_RUNNING_YET` instead, and correctly so.
+        publish_capability(&run_dir, 0, true).await;
         {
             let mut controls = executor
                 .foreground_controls
@@ -694,10 +771,12 @@ mod tests {
             .await
             .expect("a child WITH a steer handle must deliver, not refuse");
 
-        // No ack can arrive (no child is running), so `pending` is the correct outcome — the
-        // request is on disk and a child reaching a safe point later still takes it.
+        // No ack can arrive (the capability record is a fixture; no child process is watching the
+        // inbox), so `queued` is the correct outcome — the request is on disk and a child reaching
+        // a safe point later still takes it. `queued`, NOT the async surface's `pending`: pi's
+        // foreground receipt has no `pending` word at all (`:158`).
         assert!(
-            answer.starts_with("Steering pending for workflow child-1 child 0 (request "),
+            answer.starts_with("Steering queued for workflow child-1 child 0 (request "),
             "got: {answer}"
         );
         assert!(
@@ -730,6 +809,116 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("request is json");
         assert_eq!(parsed["message"], "tighten the scope");
         assert_eq!(parsed["targetIndex"], 0);
+    }
+
+    /// §4.3, the fact this surface used to be unable to state. A live control whose child has NOT
+    /// yet published a capability record is a child that has not reached its runtime — upstream's
+    /// `CHILD_SESSION_NOT_RUNNING_YET` (`subagent-executor.ts:3860-3861`), which
+    /// `steerWorkflowChildByKey` POLLS on (`:4501-4502`) rather than treating as a refusal.
+    ///
+    /// Before the readiness gate, this case and "the child cannot be steered at all" and "the child
+    /// is merely busy" were indistinguishable: all three dropped a file, waited out
+    /// `STEER_ACK_TIMEOUT` and reported the same queued receipt. The second assertion is the one
+    /// that matters most — NOTHING is written, so the classification happens before the request
+    /// exists and a retry cannot pile up duplicates in a booting child's inbox.
+    #[tokio::test]
+    async fn steer_workflow_foreground_reports_an_unbooted_child_as_not_running_yet() {
+        let executor = SubagentExecutor::new();
+        with_session(&executor, "session-a");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workflow_run_id = RunId::new();
+        executor.register_workflow_controller(&workflow_run_id, CancelToken::new());
+        write_running_workflow_status(dir.path(), &workflow_run_id, Some("session-a"));
+
+        let run_dir = dir.path().join("wf-run");
+        let inbox = crate::background::control::step_steer_inbox_dir(&run_dir, 0);
+        let handle = crate::extension::executor::foreground_control::ForegroundChildSteerHandle {
+            inbox_dir: inbox.clone(),
+            run_dir: run_dir.clone(),
+            index: 0,
+        };
+        // Deliberately NO `publish_capability` — the control registered, the child has not booted.
+        {
+            let mut controls = executor
+                .foreground_controls
+                .lock()
+                .expect("foreground_controls lock");
+            controls.insert(
+                "child-1".to_string(),
+                control_entry(
+                    Some("session-a"),
+                    Some(&workflow_run_id),
+                    one_active_child(Some(handle)),
+                ),
+            );
+        }
+
+        let err = must_err(
+            executor
+                .steer_workflow_foreground(&workflow_run_id, "hello", None, None, dir.path())
+                .await,
+            "an unbooted child must report the retryable reason",
+        );
+        assert_eq!(err, "Child session is not running yet.");
+        assert_eq!(
+            requests_in(&inbox),
+            0,
+            "the classification happens BEFORE the write, so a retry cannot duplicate requests"
+        );
+    }
+
+    /// The other half of §4.3, and the one a timeout can never tell you: a child whose host cannot
+    /// inject messages at all published `supported: false`, which is terminal. Waiting it out would
+    /// turn a knowable failure into a queued receipt that expires — the exact conflation the
+    /// capability record was added to remove (`control.rs`'s `SteerCapability` doc).
+    #[tokio::test]
+    async fn steer_workflow_foreground_refuses_a_child_whose_host_cannot_inject() {
+        let executor = SubagentExecutor::new();
+        with_session(&executor, "session-a");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workflow_run_id = RunId::new();
+        executor.register_workflow_controller(&workflow_run_id, CancelToken::new());
+        write_running_workflow_status(dir.path(), &workflow_run_id, Some("session-a"));
+
+        let run_dir = dir.path().join("wf-run");
+        let inbox = crate::background::control::step_steer_inbox_dir(&run_dir, 0);
+        let handle = crate::extension::executor::foreground_control::ForegroundChildSteerHandle {
+            inbox_dir: inbox.clone(),
+            run_dir: run_dir.clone(),
+            index: 0,
+        };
+        publish_capability(&run_dir, 0, false).await;
+        {
+            let mut controls = executor
+                .foreground_controls
+                .lock()
+                .expect("foreground_controls lock");
+            controls.insert(
+                "child-1".to_string(),
+                control_entry(
+                    Some("session-a"),
+                    Some(&workflow_run_id),
+                    one_active_child(Some(handle)),
+                ),
+            );
+        }
+
+        let err = must_err(
+            executor
+                .steer_workflow_foreground(&workflow_run_id, "hello", None, None, dir.path())
+                .await,
+            "an unsupported child must refuse, never queue",
+        );
+        assert_eq!(
+            err,
+            "Steering failed for foreground run child-1 (request -): child 0 cannot be steered."
+        );
+        assert_ne!(
+            err, "Child session is not running yet.",
+            "`supported: false` is terminal; conflating it with the retryable reason would make the \
+             caller retry forever"
+        );
+        assert_eq!(requests_in(&inbox), 0, "a refusal writes nothing");
     }
 
     /// The delivery arm's index defaulting, and the ONE arm that still refuses: with no `index` and

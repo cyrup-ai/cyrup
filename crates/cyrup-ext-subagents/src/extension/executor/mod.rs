@@ -58,6 +58,14 @@ pub struct SubagentExecutor {
     /// and retained here so the watch stays live for the session's lifetime (dropping it stops the
     /// watch). Re-installing replaces (and thereby tears down) any prior handle.
     completion_watcher: AsyncMutex<Option<crate::background::watch::CompletionWatcherHandle>>,
+    /// The detached retention sweep scheduled alongside that watcher (pi's
+    /// `resultIndexCleanupTimer`, `extension/index.ts:445-452`).
+    ///
+    /// Retained for the same reason upstream retains its timer handle and `clearTimeout`s it at
+    /// teardown (`extension/index.ts:1044`): `install_completion_watcher` is re-run on EVERY
+    /// `SessionStart`, and without an abort a rapid session loop would stack one sleeping sweep per
+    /// start. Aborting is also all that is needed — the sweep holds nothing but a path.
+    retention_sweep: AsyncMutex<Option<tokio::task::JoinHandle<()>>>,
     /// SUBA-034 — the in-process completion bus (pi's `SUBAGENT_ASYNC_COMPLETE_EVENT`). Published
     /// into by the watcher installed above (as one member of its observer fan-out) and subscribed
     /// to by the `wait` tool, so a wait wakes on the observation of a terminal result instead of
@@ -248,6 +256,14 @@ pub struct SubagentExecutor {
     /// `completion_bus` above is executor-owned: a `static` registry cannot be reset between
     /// sessions, and pi's own store is scoped to the extension host, not the process.
     workflow_resources: crate::workflows::WorkflowResourceRegistry,
+    /// SCOPE_3j — the cached model-exclusion registry (pi `runs/shared/model-exclusions.ts`'s
+    /// module-global `exclusions`/`loaded` state), owned here for the same reason
+    /// `workflow_resources` above is: a `static` registry cannot be reset between sessions, and
+    /// pi's own store is scoped to the extension host, not the process.
+    ///
+    /// One store per executor, shared by every concurrent run it drives — which is what makes a
+    /// failure recorded by one run visible to the next one's ladder without a reload.
+    model_exclusions: Arc<crate::exec::model_exclusions::ModelExclusionStore>,
 }
 
 impl Default for SubagentExecutor {
@@ -264,6 +280,7 @@ impl SubagentExecutor {
             tracker: Arc::new(JobTracker::new()),
             completion_sink_override: None,
             completion_watcher: AsyncMutex::new(None),
+            retention_sweep: AsyncMutex::new(None),
             completion_bus: crate::background::watch::CompletionBus::new(),
             wait_completions: Arc::new(
                 crate::background::wait_completions::WaitCompletionStore::default(),
@@ -290,6 +307,9 @@ impl SubagentExecutor {
                 crate::discovery::runtime_registry::RuntimeAgentRegistry::new(),
             ),
             workflow_resources: crate::workflows::WorkflowResourceRegistry::new(),
+            model_exclusions: Arc::new(
+                crate::exec::model_exclusions::ModelExclusionStore::from_env(),
+            ),
         }
     }
 
@@ -301,6 +321,28 @@ impl SubagentExecutor {
     #[must_use]
     pub fn workflow_resources(&self) -> &crate::workflows::WorkflowResourceRegistry {
         &self.workflow_resources
+    }
+
+    /// Re-root the cached-exclusion registry once the extension's real [`crate::paths::Roots`] are
+    /// known.
+    ///
+    /// [`Self::new`] has no config to read, so it seeds the store from the process environment;
+    /// [`crate::extension::host`] then replaces it with one rooted on the config's own roots before
+    /// the executor is shared. `&mut self` is the enforcement: this can only happen while the
+    /// executor is still sole-owned, so no run can observe the store changing under it.
+    pub(crate) fn replace_model_exclusions(
+        &mut self,
+        store: Arc<crate::exec::model_exclusions::ModelExclusionStore>,
+    ) {
+        self.model_exclusions = store;
+    }
+
+    /// SCOPE_3j — the cached model-exclusion registry this executor owns (see the field's doc).
+    /// Cloned onto every [`crate::exec::RunOptions`] this executor builds, so the ladder both
+    /// filters against it and records into it.
+    #[must_use]
+    pub fn model_exclusions(&self) -> Arc<crate::exec::model_exclusions::ModelExclusionStore> {
+        Arc::clone(&self.model_exclusions)
     }
 
     /// SUBA-084 — pi's public `registerAgent({ pi, name, definition })` (`src/api/agents.ts:2`

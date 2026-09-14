@@ -426,6 +426,13 @@ impl SubagentExecutor {
         {
             return;
         }
+        // SUBA-056 — point the consumed-payload store's DURABLE mirror at the same directory the
+        // watcher is about to be installed over, so every completion this session observes is
+        // written to `<results_dir>/completion-replay/` before its payload is unlinked. Overwriting
+        // rather than write-once is deliberate: this method re-runs on every `SessionStart`, and a
+        // later session may have a different cwd.
+        self.wait_completions().set_replay_dir(results_dir.clone());
+        let sweep_dir = results_dir.clone();
         match crate::background::watch::install_completion_watcher_with_observer(
             results_dir,
             // ASYNC_NOTIFY_BUG_REPORT F3.5 — the EFFECTIVE sink (a test's `with_completion_sink`
@@ -445,7 +452,7 @@ impl SubagentExecutor {
             Some(Arc::new(
                 crate::background::watch::CompositeCompletionObserver::new(vec![
                     // MUST run first: this is pi's own recording position
-                    // (`result-watcher.ts:428-435`, before the unlink), and it must also precede
+                    // (`result-watcher.ts:432-433`, before the unlink), and it must also precede
                     // the completion bus below so a `wait` that wakes on the bus publish finds the
                     // record already there — registering the bus first would let a wait wake, look,
                     // and find nothing (`background::wait_completions::WaitCompletionStore`'s own
@@ -482,6 +489,13 @@ impl SubagentExecutor {
         ) {
             Ok(handle) => {
                 *self.completion_watcher.lock().await = Some(handle);
+                // pi `extension/index.ts:445-452` — the retention timer is armed right after the
+                // watcher, and only when the watcher actually installed: a degraded install has no
+                // session to sweep for.
+                let sweep = spawn_retention_sweep(sweep_dir, RETENTION_SWEEP_DELAY);
+                if let Some(previous) = self.retention_sweep.lock().await.replace(sweep) {
+                    previous.abort();
+                }
             }
             Err(_) => {
                 // Degrade gracefully: no watcher this session (e.g. the results dir vanished between
@@ -573,7 +587,83 @@ impl SubagentExecutor {
     /// best-effort failure path).
     pub async fn stop_completion_watcher(&self) {
         *self.completion_watcher.lock().await = None;
+        // pi `clearTimeout(resultIndexCleanupTimer)` (`extension/index.ts:1044`): the sweep exists
+        // to serve the watcher, so it goes down with it rather than firing into a torn-down
+        // session's directory half a minute later.
+        if let Some(sweep) = self.retention_sweep.lock().await.take() {
+            sweep.abort();
+        }
     }
+}
+
+/// pi's `resultIndexCleanupTimer` delay (`extension/index.ts:451`) — 30 s after install.
+const RETENTION_SWEEP_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// pi's `resultIndexCleanupTimer` (`extension/index.ts:445-452`) — a one-shot, detached,
+/// best-effort retention sweep `delay` after the completion watcher is installed.
+///
+/// # Why delayed and detached, rather than at install or on an interval
+///
+/// Upstream's `unref` (`:452`) is the point: the sweep must never hold the process open and must
+/// never sit in front of session start. `tokio::spawn` + `sleep` is the direct analog — a detached
+/// task the runtime abandons at shutdown, so a session that ends inside the delay simply never
+/// sweeps, exactly as an `unref`'d timer behaves. Its `JoinHandle` is retained by the caller only
+/// so a re-install can `abort` the previous one (upstream's `clearTimeout` at `:1044`); nothing
+/// awaits it.
+///
+/// # Two sweeps, one schedule
+///
+/// * [`crate::background::result_index::cleanup_result_indexes`] at
+///   [`crate::background::result_index::DEFAULT_MAX_AGE_MS`] (24 h) — pi `:447`. This is its FIRST
+///   call site in cyrup; the index sweep was previously unreachable outside its own tests.
+/// * [`crate::background::completion_replay::cleanup_completion_replay_if_due`] (SUBA-056).
+///   Upstream drives replay retention only from the write path (`completion-replay.ts:207`) and
+///   cyrup keeps that too; this schedule is the SECOND driver because the write path only fires
+///   when a completion is DELIVERED — an orchestrator that restarts after its runs completed
+///   elsewhere would otherwise never sweep the records those runs left behind. The 60 s throttle
+///   makes the overlap free: whichever driver fires first does the work and the other is one map
+///   lookup.
+///
+/// `max_age_ms` for the replay sweep is [`crate::background::watch::DEDUP_TTL`], the same value
+/// every record is written with, so a record's `expires_at` and its archive's age-out coincide.
+///
+/// `delay` is a parameter rather than a constant read inside so the sweep's BODY can be exercised
+/// without a test sleeping out the production window; production has exactly one caller and it
+/// passes [`RETENTION_SWEEP_DELAY`].
+pub(crate) fn spawn_retention_sweep(
+    results_dir: std::path::PathBuf,
+    delay: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        match crate::background::result_index::cleanup_result_indexes(
+            &results_dir,
+            crate::time::now_epoch_millis(),
+            crate::background::result_index::DEFAULT_MAX_AGE_MS,
+        )
+        .await
+        {
+            Ok(removed) if removed > 0 => {
+                tracing::debug!(removed, "swept stale subagent result indexes");
+            }
+            Ok(_) => {}
+            // pi `:449` logs and moves on; a retention failure must never be louder than the work
+            // it was cleaning up after.
+            Err(error) => {
+                tracing::warn!(%error, "Failed to clean stale subagent result indexes");
+            }
+        }
+        crate::background::completion_replay::cleanup_completion_replay_if_due(
+            &results_dir,
+            crate::time::now_epoch_millis(),
+            crate::background::watch::DEDUP_TTL
+                .as_millis()
+                .try_into()
+                .unwrap_or(i64::MAX),
+            crate::background::completion_replay::CLEANUP_INTERVAL_MS,
+        )
+        .await;
+    })
 }
 
 #[cfg(test)]
@@ -589,6 +679,97 @@ mod tests {
     use crate::extension::testsupport::FixedSessionIdHost;
     use crate::extension::testsupport::arm_scoped_missions;
     use crate::extension::testsupport::scoped_missions;
+
+    /// SUBTASK4 — the retention schedule. Two halves, because both were missing:
+    ///
+    /// * the SWEEP itself. `cleanup_result_indexes` had no call site anywhere outside its own
+    ///   `#[cfg(test)]` module before this — cyrup's index retention was dead code — and the replay
+    ///   sweep is new. Driven here with a zero delay so the assertion is about the body, not about
+    ///   sleeping out the production window.
+    /// * the SCHEDULE. Installing the watcher must arm it, tearing the watcher down must cancel it
+    ///   (pi's `clearTimeout`, `extension/index.ts:1044`), and the same install must point the
+    ///   consumed-payload store's durable mirror at the same directory — without that last step the
+    ///   whole replay tier is inert in production no matter how well it works in isolation.
+    #[tokio::test]
+    async fn the_retention_sweep_is_scheduled_after_the_watcher_installs() {
+        use crate::background::RunId;
+        use crate::background::completion_replay::{
+            CompletionReplayWrite, completion_replay_path, write_completion_replay,
+        };
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let results_dir = tmp.path().join("results");
+
+        // An index entry that cannot be parsed — removed with no age check
+        // (`result_index/retention.rs`'s `should_remove`), which is what lets this assert without
+        // back-dating an mtime. `result-index` is `result_index/paths.rs`'s `RESULT_INDEX_DIR`.
+        let corrupt_index = results_dir.join("result-index").join("corrupt.json");
+        tokio::fs::create_dir_all(corrupt_index.parent().expect("parent"))
+            .await
+            .expect("mkdir");
+        tokio::fs::write(&corrupt_index, b"{not json".as_slice())
+            .await
+            .expect("write");
+
+        // An already-expired replay record: the sweep's second half.
+        let run = RunId::from_token("r1");
+        let session = crate::identity::SessionId::parse("s1").expect("non-empty");
+        write_completion_replay(&CompletionReplayWrite {
+            results_dir: &results_dir,
+            run_id: &run,
+            session_id: &session,
+            completion: &crate::background::wait_completions::WaitCompletion {
+                run_id: "r1".to_string(),
+                ..Default::default()
+            },
+            data: &serde_json::json!({}),
+            now: crate::time::now_epoch_millis() - 1_000_000,
+            ttl_ms: 1,
+        })
+        .await
+        .expect("write replay");
+        let replay = completion_replay_path(&results_dir, &run);
+        assert!(replay.exists() && corrupt_index.exists());
+
+        spawn_retention_sweep(results_dir.clone(), std::time::Duration::ZERO)
+            .await
+            .expect("the sweep task runs to completion");
+        assert!(
+            !corrupt_index.exists(),
+            "cleanup_result_indexes finally has a caller"
+        );
+        assert!(
+            !replay.exists(),
+            "and the expired replay record is swept too"
+        );
+
+        // The schedule, end to end through the real install path.
+        let roots = crate::paths::Roots::sandboxed(tmp.path());
+        let cwd = tmp.path().join("project");
+        tokio::fs::create_dir_all(&cwd).await.expect("mkdir cwd");
+        let executor =
+            SubagentExecutor::with_config(crate::registration::SubagentExtensionConfig {
+                roots: roots.clone(),
+                ..Default::default()
+            });
+        executor.install_completion_watcher(&cwd).await;
+
+        assert!(
+            executor.retention_sweep.lock().await.is_some(),
+            "installing the watcher arms the sweep"
+        );
+        assert_eq!(
+            executor.wait_completions().replay_dir(),
+            Some(default_results_dir_in(&roots, &cwd)),
+            "and points the durable mirror at the directory the watcher watches"
+        );
+
+        executor.stop_completion_watcher().await;
+        assert!(
+            executor.retention_sweep.lock().await.is_none(),
+            "tearing the watcher down cancels it (pi `clearTimeout`, `extension/index.ts:1044`)"
+        );
+    }
 
     /// T6 parity regression (pi `fanout-child.ts:53-128`): a nested-control "interrupt" request
     /// targeting a run this executor has registered in `foreground_controls` must fire that run's

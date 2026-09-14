@@ -59,6 +59,11 @@ mod session_id;
 
 pub use owner_id::{CompletionOwnerId, current_completion_owner_id};
 pub use path_segment::IndexSegment;
+// The RAW `encodeURIComponent` pair, re-exported beside [`IndexSegment`] rather than copied into
+// its one consumer: [`crate::background::completion_replay`]'s on-disk names are pi's raw encoding
+// (`completion-replay.ts:41-43`), NOT an `IndexSegment`, and there must be exactly one
+// implementation of that encoding in the crate.
+pub(crate) use path_segment::{decode_uri_component, encode_uri_component};
 pub use result_name::ResultFileName;
 pub use run_dir_name::RunDirName;
 pub use session_id::SessionId;

@@ -581,8 +581,17 @@ pub struct RunOptions {
     /// its live model turn. Without the env var the child never learns the path exists, and the
     /// whole verb is a write-only file drop — which is exactly what it was.
     ///
-    /// `None` on the foreground path (no async run directory exists), matching upstream's own
-    /// `if (input.steerInboxDir)` guard.
+    /// `Some` on every path that has a control root to hang the directory off: a background/async
+    /// child (the async run dir) and — since WORKFLOW_14 — a foreground WORKFLOW child, whose
+    /// control root is the WORKFLOW's own run directory (WORKFLOW_13), carried to
+    /// `build_foreground_run_options` on
+    /// [`crate::extension::executor::foreground_control::ForegroundChildSteerHandle`].
+    ///
+    /// `None` only for a plain (non-workflow) foreground SINGLE run, which has no run directory of
+    /// any kind and no reachable steer route either — `action: "steer"` refuses it outright
+    /// (`STEER_FOREGROUND_RUN_REFUSAL`) and `runs.steer` cannot address it, so a control tree built
+    /// for one would be written by nobody. Upstream's `if (input.steerInboxDir)` guard survives for
+    /// exactly that case and for embedders that supply no control tree at all.
     pub steer_inbox_dir: Option<PathBuf>,
     /// SUBA-049 — this child's OWN steer-acknowledgment directory
     /// (`<run_dir>/control/steer-acks/<flatIndex>/`), handed over as
@@ -669,6 +678,22 @@ pub struct RunOptions {
     /// text. `None` means unbudgeted, which is every run that does not ask for one: upstream has no
     /// default usage budget any more than it has a default turn budget.
     pub usage_budget: Option<crate::exec::usage_budget::UsageBudgetConfig>,
+    /// SCOPE_3j — the cached model-exclusion registry this run filters its ladder against and
+    /// records retryable model failures into (pi `runs/shared/model-exclusions.ts`).
+    ///
+    /// Threaded here rather than reached through a `static` for the reason
+    /// [`crate::extension::executor`] states for `completion_bus`/`workflow_resources`: a process
+    /// global cannot be reset between sessions, and upstream's own store is scoped to the extension
+    /// host, not the process. `Arc` because the same store is shared by every attempt of every
+    /// concurrent run under one executor — it is the one field on this struct that is not `Copy` or
+    /// cheaply cloned data, and cloning the `Arc` is the point.
+    ///
+    /// `None` means "no cross-run memory": nothing is filtered and nothing is recorded, which is
+    /// exactly the behaviour every caller had before this field existed. That is the honest default
+    /// for an embedder with no scratch root, and it keeps this field from silently turning a
+    /// headless test into one that writes to a shared file.
+    pub model_exclusions:
+        Option<std::sync::Arc<crate::exec::model_exclusions::ModelExclusionStore>>,
     /// The `cyrup` binary this run's child re-execs, injected rather than resolved from the
     /// process environment. `None` means "nothing beyond what the environment says", so
     /// [`crate::spawn::resolve_spawn_command`] answers and R-SA-045's five-tier priority ladder

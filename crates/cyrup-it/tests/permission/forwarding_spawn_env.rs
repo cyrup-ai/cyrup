@@ -179,6 +179,9 @@ fn production_child_env(cwd: &Path, parent_id: &str) -> std::collections::HashMa
         runner: None, // SUBA-074: the native child, as before
     };
     let opts = RunOptions {
+        // SCOPE_3j: no cached-exclusion registry for a fixture run — nothing is filtered and
+        // nothing is recorded, which is this field's documented `None` behaviour.
+        model_exclusions: None,
         host_available_builtins: None,
         structured_output_dir: None,
         spawn_command: None,

@@ -112,6 +112,9 @@ fn base_agent_config(model: &str) -> AgentConfig {
 
 fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
+        // SCOPE_3j: no cached-exclusion registry for a fixture run — nothing is filtered and
+        // nothing is recorded, which is this field's documented `None` behaviour.
+        model_exclusions: None,
         host_available_builtins: None,
         structured_output_dir: None,
         spawn_command: None,

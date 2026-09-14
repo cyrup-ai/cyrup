@@ -1,7 +1,7 @@
 ---
-stage: exec
-status: in-progress
-updated: 2026-09-13 02:04
+stage: aug
+status: done
+updated: 2026-09-14 06:00
 ---
 
 # SCOPE_8 — detached-workflow-child completion reconciliation

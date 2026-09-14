@@ -180,6 +180,7 @@ impl SubagentsExtension {
             }
             None => SubagentExecutor::new(),
         };
+        let mut executor = executor;
         // pi `const fleetViewEnabled = config.fleetView !== false` +
         // `const fleetViewPlacement = resolveFleetViewPlacement(config.fleetViewPlacement)`
         // (`extension/index.ts:333-334`), consumed by the `fleetStatus` construction at `:378-383`.
@@ -198,6 +199,23 @@ impl SubagentsExtension {
         // this point (no other clone of `executor.config` can exist yet), so a `try_lock` here is
         // guaranteed to succeed; falling through to the default on the (unreachable) contended
         // case keeps this constructor infallible rather than needing `async`/panic.
+        // SCOPE_3j — the cached-exclusion registry is rooted on the CONFIG's roots, not on the
+        // process environment `SubagentExecutor::new` had to guess from: those agree in production
+        // and differ for any caller that injected a sandboxed `Roots`, which is exactly the caller
+        // that must not write into the real per-user store.
+        executor.replace_model_exclusions(Arc::new(
+            crate::exec::model_exclusions::ModelExclusionStore::new(&roots),
+        ));
+        // pi `applyModelExclusionsConfig(config)` (`extension/config.ts:237-240`), run once as the
+        // config lands. A malformed TTL is refused with upstream's own config-layer sentence and
+        // the store keeps the 24-hour default — an unusable exclusion policy must not take the
+        // whole extension down at construction, which is infallible by design here.
+        if let Err(error) = crate::exec::model_exclusions::apply_model_exclusions_config(
+            executor.model_exclusions().as_ref(),
+            config.model_exclusions.as_ref(),
+        ) {
+            tracing::warn!("[cyrup-ext-subagents] {error}");
+        }
         if let Ok(mut guard) = executor.config_cell().try_lock() {
             *guard = config;
         }

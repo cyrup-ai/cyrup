@@ -122,6 +122,19 @@ pub struct SubagentExtensionConfig {
     /// (shared/types.ts:1720-1724/1772): the per-run cap on how many items a dynamic fan-out may expand to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chain: Option<ExtensionChainConfig>,
+    /// SCOPE_3j — pi `ExtensionConfig.modelExclusions?: { defaultTtlMs?: number }`
+    /// (`shared/types.ts:2560-2563`, field `:2628`): how long a recorded model failure keeps that
+    /// model out of the fallback ladder.
+    ///
+    /// Absent is NOT "no exclusions" and not "unlimited" — it falls through to
+    /// [`crate::exec::model_exclusions::DEFAULT_MODEL_EXCLUSION_TTL_MS`] (24 h), the same
+    /// absent-falls-to-the-next-rung shape `max_subagent_spawns_per_run` above has. Setting the key
+    /// is ALSO what arms retroactive shortening: pi's `shortenExisting` is
+    /// `config.modelExclusions?.defaultTtlMs !== undefined` (`extension/config.ts:239`), never a
+    /// bare `true`, so lowering the TTL takes effect on entries already on disk while the built-in
+    /// default never rewrites anything.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_exclusions: Option<ModelExclusionsConfig>,
     /// Proactive skill-subagent suggestion config — pi
     /// `ExtensionConfig.proactiveSkillSubagents?: ProactiveSkillSubagentsConfig | false`
     /// (shared/types.ts:1726-1731 interface, :1779 field): an object of tuning knobs, or the literal `false` to disable the
@@ -459,6 +472,7 @@ impl Default for SubagentExtensionConfig {
             parallel: None,
             control: None,
             chain: None,
+            model_exclusions: None,
             proactive_skill_subagents: None,
             default_session_dir: None,
             spawn_command: None,
@@ -655,6 +669,21 @@ pub struct TopLevelParallelConfig {
     pub max_tasks: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<u32>,
+}
+
+/// SCOPE_3j — pi `ExtensionConfig.modelExclusions` (`shared/types.ts:2560-2563`): the nested
+/// `modelExclusions: { defaultTtlMs? }` object of [`SubagentExtensionConfig`].
+///
+/// A nested object rather than a flat `modelExclusionsDefaultTtlMs` key, matching upstream's shape
+/// and this struct's own house style for optional knobs (`parallel`, `chain`, `control`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ModelExclusionsConfig {
+    /// pi `defaultTtlMs`. Validated by
+    /// [`crate::exec::model_exclusions::validate_model_exclusions_config`] before it can reach the
+    /// store, with upstream's own config-layer message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_ttl_ms: Option<i64>,
 }
 
 /// pi `ExtensionChainConfig` (shared/types.ts:1720-1724): the nested `chain: { dynamicFanout?: { maxItems? } }`

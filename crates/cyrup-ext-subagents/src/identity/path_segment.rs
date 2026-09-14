@@ -135,7 +135,12 @@ fn hashed_segment(value: &str) -> String {
 /// not match `encodeURIComponent`, so a custom `AsciiSet` would be required regardless, and this
 /// is an on-disk format better pinned by the unit tests below than by a third party's set
 /// definition.
-fn encode_uri_component(value: &str) -> String {
+///
+/// `pub(crate)` because [`crate::background::completion_replay`] addresses its files with the RAW
+/// encoder rather than through [`IndexSegment`] — pi `completion-replay.ts:41-43` and
+/// `async-retention.ts:505` both do, and the `~sha256-` fallback [`IndexSegment::encode_bounded`]
+/// applies would put a long or non-portable run id's record at a name pi cannot find.
+pub(crate) fn encode_uri_component(value: &str) -> String {
     const UNRESERVED_PUNCT: &[u8] = b"-_.!~*'()";
     let mut out = String::with_capacity(value.len());
     for &byte in value.as_bytes() {
@@ -146,6 +151,56 @@ fn encode_uri_component(value: &str) -> String {
         }
     }
     out
+}
+
+/// JavaScript `decodeURIComponent`, returning `None` exactly where JS throws `URIError`.
+///
+/// The inverse of [`encode_uri_component`], needed by
+/// [`crate::background::completion_replay`]'s directory sweep to recover a run id from a file name
+/// (pi `runIdFromReplayFile`, `completion-replay.ts:149-157`). Two rejection cases, both of which
+/// upstream converts to `undefined` via its `try`/`catch`:
+///
+/// * a malformed escape (`%`, `%A`, `%ZZ`) — JS throws `URIError`;
+/// * an escape sequence that decodes to invalid UTF-8 — JS also throws `URIError`, and Rust cannot
+///   construct the `String` either. Decoding into `Vec<u8>` and validating ONCE at the end is what
+///   makes a multi-byte character spread across several `%XX` escapes decode correctly; validating
+///   per-escape would reject every non-ASCII round-trip.
+///
+/// Deliberately permissive about escape CASE (`%2f` decodes like `%2F`), exactly as JS is. That is
+/// safe only because the caller re-encodes and compares against the original file name
+/// (pi `:153`'s `safeRunFile(runId) === file`) — the round-trip, not this decoder, is what rejects
+/// a non-canonical name.
+pub(crate) fn decode_uri_component(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes.get(index) {
+            Some(b'%') => {
+                let high = bytes.get(index + 1).copied().and_then(hex_nibble)?;
+                let low = bytes.get(index + 2).copied().and_then(hex_nibble)?;
+                out.push(high * 16 + low);
+                index += 3;
+            }
+            Some(&byte) => {
+                out.push(byte);
+                index += 1;
+            }
+            None => break,
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// One hexadecimal digit's value, or `None` for anything else — the `%XX` half of
+/// [`decode_uri_component`].
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// pi `isPortableSegment` (`index-segment.ts:22-30`).
