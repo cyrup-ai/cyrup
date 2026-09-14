@@ -98,7 +98,12 @@ impl<B: Backend> App<B> {
                     .and_then(crate::commands::path_command_argument),
             )),
             "share" => cmd(C::Share),
-            "copy" => cmd(C::Copy),
+            // `if (text === "/copy") { await this.handleCopyCommand(); … }`
+            // (`interactive-mode.ts:3007-3010` @v0.85.1) — NO options object, so `preferSelection`
+            // is falsy and `/copy` always copies the last assistant message (TUI-097).
+            "copy" => cmd(C::Copy {
+                prefer_selection: false,
+            }),
             // TUI-080 — `/name` with no argument is a GETTER upstream, not a usage error. This arm
             // used to print `usage: /name <session name>` unconditionally, so a user who typed
             // `/name` to CHECK the session's name was told they had used the command wrong, and the

@@ -63,14 +63,17 @@ fn ctrl_l_opens_the_model_selector_unfiltered() {
     );
 }
 
-/// Ctrl+X copies the last assistant message — `void this.handleCopyCommand()` (`:2612`), the
-/// identical handler `/copy` runs, so it must be the identical command.
+/// Ctrl+X runs the same handler `/copy` runs — but NOT with the same options: upstream is
+/// `void this.handleCopyCommand({ flashConfirmation: true, preferSelection: true })`
+/// (`interactive-mode.ts:2894-2897` @v0.85.1), while `/copy` passes nothing (`:3008`). TUI-097.
 #[test]
 fn ctrl_x_runs_the_copy_command() {
     let mut app = new_app();
     assert_eq!(
         app.handle_input(&ctrl('x')),
-        AppAction::Command(AppCommand::Copy)
+        AppAction::Command(AppCommand::Copy {
+            prefer_selection: true
+        })
     );
 }
 

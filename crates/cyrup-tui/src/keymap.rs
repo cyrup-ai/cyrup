@@ -657,8 +657,20 @@ impl Key {
                 // meant `{"app.model.select": "f5"}` silently bound nothing. Found by TUI-008's own
                 // round-trip test, which used `f9` as an arbitrary second key.
                 //
-                // `clear` (`keys.ts:119`) is deliberately absent: crossterm's `KeyCode` has no
-                // counterpart, so there is nothing to map it to.
+                // TUI-073 — **[CYRUP-DELTA]**. `clear` IS a pi `SpecialKey` (`keys.ts:119`
+                // @v0.85.1) with real sequence tables (`:379`, `:399`, `:413`), real reverse-lookup
+                // rows (`:429-432`, which spell `ctrl+clear` and `shift+clear`) and a real
+                // `matchesKey` arm (`:990-994`) — pi binds `{"app.interrupt": "clear"}` happily.
+                // crossterm's `KeyCode` enumerates no counterpart, so cyrup cannot. It used to fall
+                // through to the `_ => Err(KeySpec)` arm below, which told the user their spec was
+                // INVALID — indistinguishable from a typo. Reject it with its own diagnostic
+                // instead. No upstream default uses `clear`
+                // (`git show v0.85.1:packages/tui/src/keybindings.ts | grep '"clear"'` -> nothing),
+                // so no default chord is dead; only a hand-written config can reach this.
+                //
+                // The literal token is reported, not `s`, so `"ctrl+clear"` also reads
+                // `unsupported key "clear"` rather than blaming the whole spec.
+                "clear" => return Err(TuiError::UnsupportedKey("clear".to_string())),
                 "insert" | "ins" => code = Some(KeyCode::Insert),
                 other
                     if other.strip_prefix('f').is_some_and(|d| {

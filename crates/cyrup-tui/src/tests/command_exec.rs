@@ -93,7 +93,11 @@ fn lifecycle_commands_route_with_arguments() {
     );
     assert_eq!(
         submit(&mut app, "/copy"),
-        AppAction::Command(AppCommand::Copy)
+        // TUI-097 — `/copy` calls `handleCopyCommand()` with NO options
+        // (`interactive-mode.ts:3008` @v0.85.1), so `preferSelection` is falsy.
+        AppAction::Command(AppCommand::Copy {
+            prefer_selection: false
+        })
     );
     assert_eq!(
         submit(&mut app, "/session"),

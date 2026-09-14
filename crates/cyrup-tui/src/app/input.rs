@@ -500,9 +500,14 @@ impl<B: Backend> App<B> {
                     value: hidden.to_string(),
                 })
             }
-            // `app.message.copy` (Ctrl+X): `void this.handleCopyCommand()` (`:2612`) — the identical
-            // handler `/copy` runs, so it is the identical command.
-            Action::MessageCopy => AppAction::Command(AppCommand::Copy),
+            // `app.message.copy` (Ctrl+X): `void this.handleCopyCommand({ flashConfirmation: true,
+            // preferSelection: true })` (`interactive-mode.ts:2894-2897` @v0.85.1) — the same
+            // handler `/copy` runs, but NOT with the same options. `preferSelection` is what lets a
+            // live alternate-screen selection win over the last assistant message, and it rides the
+            // KEYSTROKE only (`/copy` passes nothing, `:3008`).
+            Action::MessageCopy => AppAction::Command(AppCommand::Copy {
+                prefer_selection: true,
+            }),
             // `app.session.new/tree/fork/resume` (`:2615-2618`) → `handleClearCommand`,
             // `showTreeSelector`, `showUserMessageSelector`, `showSessionSelector` — i.e. exactly
             // what `/new`, `/tree`, `/fork` and `/resume` dispatch to in `run_command`. All four

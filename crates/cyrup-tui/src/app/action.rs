@@ -185,8 +185,21 @@ pub enum AppCommand {
     Import(Option<String>),
     /// `/share` — publish the session as a secret gist (`handleShareCommand`).
     Share,
-    /// `/copy` — copy the last assistant message to the clipboard (`handleCopyCommand`).
-    Copy,
+    /// `/copy` and `app.message.copy` — pi's `handleCopyCommand(options)`
+    /// (`interactive-mode.ts:6134-6162` @v0.85.1).
+    ///
+    /// **TUI-097.** Upstream the two entry points are NOT the same call: the keybinding passes
+    /// `{ flashConfirmation: true, preferSelection: true }` (`:2894-2897`) while `/copy` passes no
+    /// options at all (`:3007-3010`), and the selection leg is gated on `options.preferSelection`
+    /// (`:6138`). cyrup carried a unit variant with no discriminator, so `/copy` inherited the
+    /// keystroke's selection preference — a behaviour no upstream tag has: at v0.83.0
+    /// `handleCopyCommand()` took no options and BOTH entry points always copied the last
+    /// assistant message. `flash_confirmation` is deliberately NOT modelled here; it is a separate
+    /// axis (the alternate-screen `flash` vs `showStatus`) and a separate row.
+    Copy {
+        /// Pi's `options.preferSelection` — `true` only from `app.message.copy` (`:2896`).
+        prefer_selection: bool,
+    },
     /// `app.message.copy` pressed while `/tree` owns the input slot: copy the HIGHLIGHTED entry's
     /// full text to the clipboard (pi `TreeList.copySelected`, `tree-selector.ts:627-630`, wired to
     /// the consumer at `interactive-mode.ts:5297-5308`). Carries the entry id; the run loop resolves

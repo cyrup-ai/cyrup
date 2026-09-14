@@ -267,3 +267,79 @@ fn tui068_session_delete_noninvasive_resolves_and_defaults_to_ctrl_backspace() {
     let plain = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
     assert_eq!(km.action_for(&plain), None);
 }
+
+/// **TUI-073.** `clear` is a real pi `SpecialKey` (`packages/tui/src/keys.ts:119` @v0.85.1) with
+/// sequence tables at `:379`/`:399`/`:413`, reverse-lookup rows at `:429-432` (which spell
+/// `ctrl+clear` and `shift+clear`) and a `matchesKey` arm at `:990-994` — pi accepts and binds
+/// `{"app.interrupt": "clear"}`. crossterm's `KeyCode` has no counterpart, so cyrup cannot bind it;
+/// what it used to do was report `invalid key spec: clear`, which is what it also says for a typo.
+///
+/// FAILS before the fix: clauses 1-3 do not compile (`TuiError::UnsupportedKey` does not exist) and
+/// clause 4 asserts the wrong `reason` string.
+#[test]
+fn tui073_clear_is_rejected_with_an_unsupported_key_diagnostic() {
+    use crate::error::TuiError;
+
+    // 1. The bare spelling.
+    assert!(
+        matches!(Key::parse("clear"), Err(TuiError::UnsupportedKey(ref k)) if k == "clear"),
+        "`clear` must report as unsupported, not as unparseable"
+    );
+    assert_eq!(
+        Key::parse("clear").unwrap_err().to_string(),
+        "unsupported key \"clear\"",
+        "the exact string the user reads"
+    );
+
+    // 2. The modified spellings pi's `:431-432` show are real upstream specs. The reported token is
+    //    the unsupported KEY, not the whole chord.
+    for spec in ["ctrl+clear", "shift+clear"] {
+        assert!(
+            matches!(Key::parse(spec), Err(TuiError::UnsupportedKey(ref k)) if k == "clear"),
+            "{spec} must name `clear`, not the whole spec"
+        );
+        assert_eq!(
+            Key::parse(spec).unwrap_err().to_string(),
+            "unsupported key \"clear\"",
+            "{spec}"
+        );
+    }
+
+    // 3. A typo is still a typo — the whole point of the row is that the two are distinguishable.
+    assert!(
+        matches!(Key::parse("clrea"), Err(TuiError::KeySpec(ref s)) if s == "clrea"),
+        "an unknown multi-character token is still an invalid spec"
+    );
+    assert_eq!(
+        Key::parse("clrea").unwrap_err().to_string(),
+        "invalid key spec: clrea"
+    );
+}
+
+/// **TUI-073, the CFG-038 half.** One `clear` entry must not take the document down with it: the
+/// key is dropped, that entry's action ends up UNBOUND (pi's never-matching-`KeyId` outcome, not a
+/// revert to the default), every other entry applies, and the user gets exactly one issue naming
+/// the id and the new diagnostic.
+#[test]
+fn tui073_a_clear_entry_is_reported_once_and_does_not_break_the_document() {
+    let mut km = Keymap::default();
+    let issues = km
+        .merge_json(r#"{"app.interrupt": "clear", "app.exit": "f7"}"#)
+        .expect("the document itself is well-formed JSON");
+
+    assert_eq!(issues.len(), 1, "exactly one rejected key: {issues:?}");
+    assert_eq!(issues[0].id, "app.interrupt");
+    assert_eq!(issues[0].reason, "unsupported key \"clear\"");
+
+    // The sibling entry landed.
+    assert_eq!(
+        km.action_for(&KeyEvent::new(KeyCode::F(7), KeyModifiers::NONE)),
+        Some(Action::Quit)
+    );
+    // ...and `app.interrupt` is unbound, NOT back on its `escape` default.
+    assert_eq!(
+        km.action_for(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        None,
+        "a rejected key still replaces the default, exactly as a never-matching KeyId does"
+    );
+}
