@@ -365,6 +365,68 @@ lived one day (`496185f6e`/`2ff8ba622` → `5133c9284`, all inside v0.84.3) and 
 
 ---
 
+## 0f. AMENDMENT 2026-09-14 — a port bug the ledger had read and accepted, caught by running the suite
+
+> **A measurement, at cyrup HEAD `68facb9b`, fixed at `9aeba769`.** Instrument: the workspace test
+> suite itself (`cargo nextest run --workspace --features test-fixtures --no-fail-fast`), plus a
+> standalone `fork`/`killpg`/`waitpid` probe to isolate the mechanism. This row is here because it
+> is the cleanest example this directory has of the population §5 warns about: an item that
+> **survives a static read indefinitely** because the reasoning written next to the code is
+> plausible, and only an execution disagrees with it.
+
+### `crates/cyrup-ext-subagents/src/workflows/host_command.rs` — the group-emptiness probe counted zombies as live (no id; filed nowhere, found by running)
+
+**Observed.** Two tests failed reproducibly (5/5), not flakily:
+`workflows::host_command::tests::a_timeout_settles_timed_out` and
+`::a_cancelled_token_settles_stopped`. Both asserted a settle reason and got
+`Process-tree cleanup failed: verification-failed.` instead.
+
+**Mechanism, isolated.** `process_group_is_populated` answered upstream's
+`activeProcessGroupMembers` (`owned-process-tree.ts:24-35` @`v0.67.0`) with a single
+`kill(-pgid, 0)`. Its `CYRUP-DELTA` justified dropping upstream's `ps` scrape like this:
+
+> No subprocess, no locale dependency, no zombie-state parsing (a zombie is already unsignalable,
+> which is upstream's `stat.startsWith("Z")` filter for free).
+
+**That sentence is false, and it is the whole defect.** A zombie is an unreaped exit status holding
+a process-table entry; POSIX `kill()` **succeeds** on it and never returns `ESRCH`. The standalone
+probe — fork, `setpgid`, `exec sh -c 'sleep 30'`, `killpg(SIGTERM)`, `waitpid` the shell only —
+prints `group still POPULATED after reaping the leader` with `ps` showing `Z sleep` in the group.
+Upstream's regex filter (`match[3]!.startsWith("Z")`) exists precisely because `ps` reports those
+rows and they must not count.
+
+**Why a reading would not have caught it.** The delta's claim is the kind that reads as a
+simplification rather than a behaviour change — same predicate, fewer moving parts — and both sides
+had been read. It is also **host-dependent**: where `init` or a job-control shell reaps orphans
+promptly, the group really does empty and the tests pass, so on a developer laptop the failure
+looks like a flake and on a reaper-less container it is deterministic. Every ingredient for an item
+that never gets filed.
+
+**Scope beyond the tests.** Not test-only. Any `runs.host` command whose shell forks a descendant
+(`sh -c '… &'`, and any pipeline) settles `failed` with `verification-failed` on a host without a
+reaper, for a process tree that is gone in every sense upstream means.
+
+**Fixed at `9aeba769`.** The syscall stays as a fast path conclusive in one direction only — `ESRCH`
+proves empty and spawns nothing, the common answer — and anything else consults
+`ps -axo pid=,pgid=,stat=` and counts non-`Z` members, which is upstream's predicate verbatim. cyrup
+therefore still spawns `ps` strictly less often than upstream, which spawns it on every poll.
+`the_clean_exit_sweep_reaps_leaked_descendants` was **agreeing with the bug**: it asserted the leaked
+descendant was `kill(pid, 0) == ESRCH`, which additionally demands that the host's reaper has
+already run. It now asserts the production predicate, no live process. 18/18 green, 5/5 runs, and
+~9× faster on this module because the ladder no longer waits out both verification windows against a
+group that was never going to empty.
+
+**What this says about the method.** §5's closing argument is that most items do not survive a live
+run unchanged. This is the converse and the more expensive case: an item that was never filed at all,
+because the static read had a written rationale to agree with. The three other reds found the same
+way this pass — `fmt --check` dirty in 32 files, a `clippy::result_large_err` hard error that
+silently dropped every downstream crate from the lint run, and a `cyrup-it` target that had not
+compiled since `ForegroundRunRequest` gained a field — were each invisible for the same structural
+reason: **nothing runs the gates here, and `--workspace` reaches neither the guest SDK nor the gated
+harness.**
+
+---
+
 ## Header — what was run, where, and with what honesty about scope
 
 | | |

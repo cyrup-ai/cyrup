@@ -11,20 +11,23 @@ backbone.
 
 > **Status:** pre-release, and not yet versioned. The agent loop, provider layer, tool set, session
 > tree, terminal interface, extension host, all five run modes, the MCP client, the ACP adapter, the
-> `workflowScript` runtime and the Flux development pipeline work end to end. 23 crates and 885,246
+> `workflowScript` runtime and the Flux development pipeline work end to end. 23 crates and 885,555
 > lines of Rust under `crates/`.
 >
-> The workspace suite runs **9,884 tests: 9,882 passed, 2 failed, 9 skipped** — re-derived 2026-09-14
-> at code HEAD `68facb9b` (`cargo nextest run --workspace --features test-fixtures --no-fail-fast`;
+> The workspace suite runs **9,886 tests: 9,886 passed, 0 failed, 9 skipped** — re-derived 2026-09-14
+> at code HEAD `9aeba769` (`cargo nextest run --workspace --features test-fixtures --no-fail-fast`;
 > `test-fixtures` is required or the two subagent-subprocess fixture binaries never build and their
-> tests silently do not run). Both failures are
-> `cyrup-ext-subagents workflows::host_command::tests::*`, reproducible rather than flaky, and both
-> the same defect: `process_group_is_populated` answers upstream's `activeProcessGroupMembers` with
-> one `kill(-pgid, 0)`, but `kill` succeeds on a **zombie**, so an orphan nothing reaps keeps the
-> group looking populated and the cleanup ladder reports `verification-failed`. Upstream's `ps`
-> scrape drops those rows (`owned-process-tree.ts`, `stat.startsWith("Z")`); the `CYRUP-DELTA` that
-> replaced it claims the filter comes for free, and it does not. It is host-dependent — where an
-> init or a job-control shell reaps orphans, the group really does empty.
+> tests silently do not run).
+>
+> Two of those tests were failing until this pass, and the defect behind them is worth recording
+> because a static read would never have found it. `process_group_is_populated` answered upstream's
+> `activeProcessGroupMembers` with one `kill(-pgid, 0)`, but `kill` succeeds on a **zombie**, so an
+> orphan nothing reaps kept the group looking populated and the cleanup ladder reported
+> `verification-failed` for a process tree that was gone. Upstream's `ps` scrape drops those rows
+> (`owned-process-tree.ts`, `stat.startsWith("Z")`); the `CYRUP-DELTA` that replaced it claimed the
+> filter came for free, and it did not. It was host-dependent — where an init or a job-control shell
+> reaps orphans the group really does empty, which is why it read as a flake. The syscall is now the
+> fast path for "provably empty" only, and `ps` decides the rest, on upstream's own predicate.
 >
 > `cyrup-it`, the gated integration crate, carries 523 `#[test]`/`#[tokio::test]` functions across
 > its nine binaries — a static count off the source, not a run of the suite.
@@ -259,7 +262,7 @@ cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy -p cyrup-ext-sdk --target wasm32-wasip2   # --workspace does not reach the guest SDK
 cargo clippy -p cyrup-it --features it --all-targets   # nor the gated harness
-cargo nextest run --workspace --features test-fixtures # 9,884 tests; 2 fail, see Status
+cargo nextest run --workspace --features test-fixtures # 9,886 tests, 9 skipped
 cargo run -p xtask -- feature-matrix                   # non-default feature combos, and runs the integration suite
 cargo doc --workspace --no-deps --bins                 # rustdoc links are denied, not warned
 ```
@@ -270,23 +273,22 @@ runs these for you. The three clippy commands above are three different surfaces
 `--workspace` reaches neither `cyrup-ext-sdk` (it compiles to `wasm32-wasip2`) nor `cyrup-it` (it is
 behind `required-features`).
 
-**Measured 2026-09-14 at `68facb9b`, the gates are red, and it is worth knowing which way.**
-`cargo fmt --all -- --check` reports diffs in 32 files, 22 of them under `cyrup-ext-subagents`.
-`cargo clippy --workspace --all-targets -- -D warnings` stops on **one** finding —
-`clippy::result_large_err` on `workflows/scripted/engine.rs`'s
-`Result<WorkflowScriptResult, WorkflowScriptError>`, whose `Err` variant is at least 128 bytes. The
-workspace suite has the two `host_command` failures named in **Status**, and the gated integration
-crate does not compile (see **The integration suite**). All four are in the `workflowScript` batch;
-nothing that predates it is red.
+**Green at `9aeba769`**: `fmt --check` clean, all three clippy surfaces at zero findings, and 9,886
+tests passing with 9 skipped. Those five were run — `feature-matrix` and `cargo doc` were not, so
+read it as five of the eight rather than a green board.
+
+One commit earlier none of that held. The `workflowScript` batch landed with `fmt --check` dirty in
+32 files, one `clippy::result_large_err` on `run_workflow_script`, three `ForegroundRunRequest`
+initializers in `cyrup-it` that had not picked up a new field, and the two `host_command` failures
+described in **Status** — and nothing caught any of it, because there is no CI here and
+`--workspace` reaches neither of the last two surfaces.
 
 Deny-level lints are hard errors, so a crate carrying one fails to compile and every crate depending
-on it is never linted at all — which is why one finding in `cyrup-ext-subagents` is not a cosmetic
-red. Re-running with `-A clippy::result_large_err` reaches the whole graph and finds **nothing
-else**, so this time the crates behind it were hiding no second wave; the last time it happened,
-clearing the first 9 errors surfaced 9 further findings plus three integration-test failures that had
-been invisible for the same reason. The guest-SDK surface is clean. The gated-harness surface needs
-`--all-targets` to mean anything — without it `cyrup-it`'s dependency-free lib is all that gets
-linted — and with it, that crate does not compile at all; see **The integration suite**.
+on it is never linted at all — which is why a single finding in `cyrup-ext-subagents` was not a
+cosmetic red: it took `cyrup`, `cyrup-it` and the rest of the graph out of the lint run with it. Run
+all three surfaces. The gated-harness one in particular needs `--all-targets` to mean anything:
+without it, `cyrup-it`'s dependency-free lib is the only thing linted, and the nine test binaries —
+where the drift actually was — are never built.
 
 The commands above build one point in the feature space. Nine crates declare `[features]`, and
 `feature-matrix` builds the rest: the `#[cfg(not(feature = "wasm-host"))]` arms of `cyrup-ext` and
@@ -311,16 +313,18 @@ cargo build -p cyrup-ext-sdk --target wasm32-wasip2
 cargo nextest run -p cyrup-it --features it        # 523 test functions across 9 binaries
 ```
 
-**Measured 2026-09-14 at `68facb9b`, the `subagents` target of this crate does not compile.**
+All nine targets compile at `9aeba769`. One commit earlier the `subagents` target did not:
 `ForegroundRunRequest` gained a `workflow_steer` field in the `workflowScript` batch and three
-initializers in the harness were not updated —
+initializers here were never updated —
 `tests/subagents/foreground_progress_stream_integration.rs:132` and `:291`, and
-`tests/subagents/startup_retry_lifecycle_integration.rs:514`. Those three are the only errors the run
-reported, but the remaining eight targets were not independently confirmed: `build.rs`'s nested
-second link wants ~15 GB and exhausted the disk on the retry, which is the constraint
-`CYRUP_IT_BIN_DIR` below exists for. So the 523 figure is a count of source, not of tests that
-currently run. This is the failure mode the crate's own gating creates: `--workspace` never builds
-it, so nothing catches the drift until somebody runs the suite.
+`tests/subagents/startup_retry_lifecycle_integration.rs:514`. That is the failure mode this crate's
+own gating creates, and it is the reason to type-check it deliberately: `--workspace` never builds
+it, so nothing catches API drift until somebody thinks to look.
+
+Type-checking it does not require the nested build. Point `CYRUP_IT_BIN_DIR` at an **empty**
+directory and `build.rs` emits a warning per missing binary and skips the second link entirely —
+enough for `cargo clippy -p cyrup-it --features it --all-targets`, which is how the drift above was
+found and confirmed fixed. Running the tests, of course, still needs the real binaries.
 
 `cyrup-it` is behind `required-features = ["it"]`, so the everyday gate never builds it. Its
 `build.rs` resolves the fixture binaries and the WASM component once. It carries nine targets, one
@@ -369,9 +373,12 @@ windows are measured below and **nothing in them is filed**. See
 [`ADR-0006`](docs/adr/ADR-0006-upstream-chase-cadence.md) for the cadence and where the resulting
 items are meant to live.
 
-Concretely, the zombie defect in **Status** is a confirmed port bug — both sides read, upstream at a
-named tag, and a failing test that reproduces it — and it carries no row. It was found by running the
-suite during this refresh, which is the kind of thing a static ledger does not find.
+Concretely, the zombie defect in **Status** was a confirmed port bug — both sides read, upstream at a
+named tag, and a failing test that reproduced it — and it never carried a row. It was found by
+running the suite during this refresh, which is precisely the kind of thing a static ledger does not
+find: the ledger had read that `CYRUP-DELTA` and accepted its reasoning, because the reasoning is
+plausible and only an execution disagrees with it. It is written up as §0f of
+[`REPRO-LOG.md`](docs/gap-analysis/REPRO-LOG.md).
 
 The ledger is mostly a static analysis. Items are evidenced by reading both sources rather than by
 running anything, its measured error rate has run near 12%, and it lags the code. Treat an entry as a
