@@ -643,6 +643,7 @@ impl SubagentTool {
             workflow_run_id.clone(),
             std::sync::Arc::clone(&status),
             run_dir.clone(),
+            async_root.clone(),
         ));
 
         // Field order mirrors `RunWorkflowScriptOptions`' own declaration order, so this block can

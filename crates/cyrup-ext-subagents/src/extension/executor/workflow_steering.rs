@@ -636,6 +636,83 @@ mod tests {
         );
     }
 
+    /// DoD manual-confirmation 2, mechanised: a workflow child WITH a steer handle must actually
+    /// deliver — the request file lands in the child's OWN inbox (the directory it was spawned
+    /// watching), and the answer is a `Steering ...` sentence, never the optional-`steer` refusal.
+    ///
+    /// This is the case the pre-WORKFLOW_14 tree could not reach at all, and the one an earlier
+    /// revision got wrong in a way no assertion caught: writing to the runner's `steer-requests/`
+    /// intake queue (drained only by `runner_main::control_watcher`, which a foreground workflow
+    /// does not run) instead of `steer-targets/<index>/`. Asserting the PATH, not just the return
+    /// string, is what makes that regression impossible to reintroduce silently.
+    #[tokio::test]
+    async fn steer_workflow_foreground_delivers_into_the_childs_own_inbox() {
+        let executor = SubagentExecutor::new();
+        with_session(&executor, "session-a");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workflow_run_id = RunId::new();
+        executor.register_workflow_controller(&workflow_run_id, CancelToken::new());
+        write_running_workflow_status(dir.path(), &workflow_run_id, Some("session-a"));
+
+        // The workflow's own run dir (WORKFLOW_13) and this child's flat index within it.
+        let run_dir = dir.path().join("wf-run");
+        let inbox = crate::background::control::step_steer_inbox_dir(&run_dir, 0);
+        let handle = crate::extension::executor::foreground_control::ForegroundChildSteerHandle {
+            inbox_dir: inbox.clone(),
+            run_dir: run_dir.clone(),
+            index: 0,
+        };
+        {
+            let mut controls = executor
+                .foreground_controls
+                .lock()
+                .expect("foreground_controls lock");
+            controls.insert(
+                "child-1".to_string(),
+                control_entry(
+                    Some("session-a"),
+                    Some(&workflow_run_id),
+                    one_active_child(Some(handle)),
+                ),
+            );
+        }
+
+        let answer = executor
+            .steer_workflow_foreground(&workflow_run_id, "tighten the scope", None, None, dir.path())
+            .await
+            .expect("a child WITH a steer handle must deliver, not refuse");
+
+        // No ack can arrive (no child is running), so `pending` is the correct outcome — the
+        // request is on disk and a child reaching a safe point later still takes it.
+        assert!(
+            answer.starts_with("Steering pending for workflow child-1 child 0 (request "),
+            "got: {answer}"
+        );
+        assert!(!answer.contains("does not support steering"), "got: {answer}");
+
+        // THE path assertion: the request is in the child's own inbox.
+        let written: Vec<_> = std::fs::read_dir(&inbox)
+            .expect("the child's inbox must exist and be readable")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".json"))
+            .collect();
+        assert_eq!(written.len(), 1, "exactly one request in {inbox:?}: {written:?}");
+
+        // And NOT in the runner intake queue, which nothing would ever drain here.
+        let intake = crate::background::control::steer_requests_dir(&run_dir);
+        assert!(
+            !intake.exists() || std::fs::read_dir(&intake).map(|d| d.count()).unwrap_or(0) == 0,
+            "nothing may be written to the runner intake queue {intake:?}"
+        );
+
+        // The payload is addressed to this child and carries the message verbatim.
+        let body = std::fs::read_to_string(inbox.join(&written[0])).expect("read request");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("request is json");
+        assert_eq!(parsed["message"], "tighten the scope");
+        assert_eq!(parsed["targetIndex"], 0);
+    }
+
     /// The delivery arm's index defaulting, and the ONE arm that still refuses: with no `index` and
     /// exactly one active child, the sole index is used — and a child carrying NO steer handle
     /// (`steer: None`, i.e. not a workflow child) lands on upstream's own optional-`steer` refusal
