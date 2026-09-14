@@ -24,6 +24,23 @@ pub enum TuiError {
     #[error("invalid key spec: {0}")]
     KeySpec(String),
 
+    /// A key spec names a key upstream supports but this backend cannot represent.
+    ///
+    /// TUI-073. `clear` is a pi `SpecialKey` (`packages/tui/src/keys.ts:119` @v0.85.1) with real
+    /// sequence tables (`:379`, `:399`, `:413`), real reverse-lookup rows (`:429-432`, including
+    /// `"\x1bOe" => "ctrl+clear"` and `"\x1b[e" => "shift+clear"`) and a real `matchesKey` arm
+    /// (`:990-994`), so pi accepts `{"app.interrupt": "clear"}` and binds it. crossterm's `KeyCode`
+    /// (crossterm-0.29 `event.rs:1226-1288`) enumerates no counterpart, so cyrup cannot bind it at
+    /// all.
+    ///
+    /// **[CYRUP-DELTA]** — a mechanism difference forced by the backend, reported honestly rather
+    /// than silently: the entry is still rejected (the action ends up unbound, which is pi's own
+    /// never-matching-`KeyId` outcome), but the user is told the key is UNSUPPORTED rather than
+    /// that they mistyped it. Inventing an approximation (`KeyCode::Null`, say) would be behaviour
+    /// pi does not have.
+    #[error("unsupported key \"{0}\"")]
+    UnsupportedKey(String),
+
     /// A JSON keybindings document was malformed (spec/tui/07 §3.9; `core/keybindings.ts:14-262`).
     #[error("invalid keybindings json: {0}")]
     Keybindings(String),

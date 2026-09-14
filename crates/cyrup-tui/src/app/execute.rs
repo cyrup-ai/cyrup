@@ -49,7 +49,7 @@ impl<B: Backend> App<B> {
             // catch-alls in the sub-dispatchers are what catch that.
             C::ApplySetting { .. }
             | C::ConfirmSelectionAsDefault { .. }
-            | C::Copy
+            | C::Copy { .. }
             | C::CycleModel(_)
             | C::CycleThinking
             | C::LoginCommand(_)

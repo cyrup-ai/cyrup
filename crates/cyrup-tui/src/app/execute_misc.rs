@@ -8,6 +8,43 @@ use super::*;
 /// `SetThinking` arm and its persisting `ConfirmSelectionAsDefault` sibling, which must agree on
 /// what a valid level is or `/thinking` and `Ctrl+S` could disagree.
 impl<B: Backend> App<B> {
+    /// Pi's selection leg of `handleCopyCommand` — the FOUR-part conjunction at
+    /// `interactive-mode.ts:6137-6145` @v0.85.1:
+    ///
+    /// ```ts
+    /// if (options.preferSelection && this.ui instanceof TuiAltScreen &&
+    ///     !this.ui.getCopyOnSelect() && this.ui.hasActiveSelection()) { … }
+    /// ```
+    ///
+    /// **TUI-097.** cyrup's guard carried only the last clause, so `/copy` inherited a preference
+    /// upstream gives to the KEYSTROKE alone (`:2896` vs `:3008`), and copy-on-select — which puts
+    /// the selection on the clipboard the moment it is made (CFG-078) — did not release Ctrl+X back
+    /// to the last assistant message the way `!getCopyOnSelect()` does.
+    ///
+    /// `self.altscreen.is_some()` is `this.ui instanceof TuiAltScreen`; `selection_text().is_some()`
+    /// is `hasActiveSelection()` — `tui-alt-screen.ts:293-295` @v0.85.1 defines the latter as
+    /// `getActiveSelectionText() !== undefined`, and `:285-287` makes `getCopyOnSelect()` a plain
+    /// field read, so both are literal equivalents rather than adjacent behaviour.
+    pub(crate) fn prefers_active_selection(&self, prefer_selection: bool) -> bool {
+        prefer_selection
+            && !self.fullscreen_copy_on_select
+            && self
+                .altscreen
+                .as_ref()
+                .and_then(AltScreen::selection_text)
+                .is_some()
+    }
+
+    /// Pi's `this.ui instanceof TuiAltScreen && this.ui.hasActiveSelection()` on its own, so a test
+    /// can assert it set up the precondition the four-part guard is supposed to weigh.
+    #[cfg(test)]
+    pub(crate) fn has_active_selection_for_test(&self) -> bool {
+        self.altscreen
+            .as_ref()
+            .and_then(AltScreen::selection_text)
+            .is_some()
+    }
+
     /// Pi `_addPersistedDefaultToNonEmptyScope` (`agent-session.ts:1658-1670`), run after a model
     /// is persisted as the default.
     ///
@@ -922,19 +959,22 @@ impl<B: Backend> App<B> {
                 None => self.state.transcript.push_warning("Usage: /name <name>"),
             },
 
-            // ADR-0005 §B-11: with an active alternate-screen selection, `/copy` copies THAT
-            // rather than the last assistant message — upstream asks
-            // `getSelectionBounds() !== undefined` first (`tui-alt-screen.ts:545`) and copies the
-            // selection when it answers yes. This arm was specified in B-11 and never wired, which
-            // is what left `selection::has_selection` dead: selecting text and running `/copy`
-            // silently copied the wrong thing.
-            C::Copy
-                if self
-                    .altscreen
-                    .as_ref()
-                    .and_then(AltScreen::selection_text)
-                    .is_some() =>
-            {
+            // **TUI-097.** Pi's selection leg is a FOUR-part conjunction, in this order
+            // (`handleCopyCommand`, `interactive-mode.ts:6137-6145` @v0.85.1):
+            //
+            // ```ts
+            // if (options.preferSelection && this.ui instanceof TuiAltScreen &&
+            //     !this.ui.getCopyOnSelect() && this.ui.hasActiveSelection()) { … }
+            // ```
+            //
+            // ADR-0005 §B-11 was decided against v0.84.1, where `handleCopyCommand` had no
+            // selection leg at all, and at the ported baseline v0.83.0 (`:5617`) both entry points
+            // already always copied the last assistant message — so the unconditional preference
+            // this arm used to carry matched no upstream version at any tag. Two clauses were
+            // missing: `preferSelection` (the keystroke passes it at `:2896`, `/copy` does not at
+            // `:3008`) and `!getCopyOnSelect()` (with copy-on-select ON the selection is already on
+            // the clipboard, so Ctrl+X must fall through to the last message).
+            C::Copy { prefer_selection } if self.prefers_active_selection(prefer_selection) => {
                 let Some(text) = self.altscreen.as_ref().and_then(AltScreen::selection_text) else {
                     return;
                 };
@@ -950,7 +990,7 @@ impl<B: Backend> App<B> {
                 }
             }
 
-            C::Copy => match session.last_assistant_text().await {
+            C::Copy { .. } => match session.last_assistant_text().await {
                 Some(text) => {
                     let n = text.chars().count();
                     // Pi's `handleCopyCommand` (interactive-mode.ts:6002-6019) wraps the write in a

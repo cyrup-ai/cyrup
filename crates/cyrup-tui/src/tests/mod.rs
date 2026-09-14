@@ -50,6 +50,7 @@ mod command_exec;
 mod commands;
 mod compaction_status;
 mod confirm_as_default_dispatch;
+mod copy_entry_points;
 mod dialog_envelope_spacers;
 mod diff;
 mod edit_preview;
