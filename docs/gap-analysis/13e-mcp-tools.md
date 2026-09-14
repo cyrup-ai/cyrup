@@ -58,6 +58,154 @@ not one — cyrup's own gate (`ExtHooks::before_tool_call` → `cyrup-permission
 *before* the call on the arguments and never inspects the result, so MCP tool **output** is
 unfiltered text entering the model's context under either system.
 
+> ### PROVENANCE CORRECTION — 2026-09-14. The pins below are revised; **this file was not re-read.**
+>
+> Everything in this file is history and is correct as written. It was audited against
+> **`pi-mcp-adapter` v2.25.0** — that is the tag its prose, its unit obligations and every upstream
+> citation in it were read at, and it stays. **Nothing in this block re-verifies any of it: no unit
+> was re-read, no obligation re-derived, no count, severity, verdict or status changed.** This block
+> states only how stale the file is; the section after it is a worklist, not a finding.
+>
+> | | audited at (history — do not rewrite) | current pin (authoritative, per `README.md`'s baselines table) | window this file has never measured |
+> |---|---|---|---|
+> | `pi-mcp-adapter` | **`v2.25.0`** (the plan's tag) | **`v2.33.0`** *(was v2.32.1)* | `v2.25.0..v2.33.0` = **211 files, +27 961 / −2 129**, 113 non-merge commits. Two segments of that range are measured elsewhere and are NOT this file's blind spot: `v2.25.0..v2.26.1` by [`13-cyrup-mcp.md`](13-cyrup-mcp.md)'s *Retarget* section, `v2.26.1..v2.32.1` by [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md)'s 2026-09-04 re-audit. **`v2.32.1..v2.33.0` = 123 files, +9 455 / −1 352, 33 non-merge commits, is measured by nobody.** That is the unmeasured window, and the census below is its lead list |
+> | `cyrup` | **deliberately unpinned** — this file cites cyrup by symbol and file only, and its header says so | code HEAD **`b28d3ff`**; the ledger's last recorded code baseline is `824a539e` | **Not expressible.** With no sha ever recorded here there is no window to name: the staleness of a cyrup claim in this file cannot be bounded, only re-read. For scale, `crates/cyrup-mcp` at `b28d3ff` is **43 `.rs` files / 79 930 lines** under `src` — 29 top-level modules plus the `proxy/` tree |
+> | `pi` · `pi-subagents` · `pi-permission-system` · `pi-intercom` · `pi-acp` · `code_puppy_core_plugins` | — | `v0.85.1` · `v0.67.0` · `v0.8.0` · `v0.13.0` · `v0.0.33` · `v0.0.50` (ported surface byte-identical across all 39 tags) | out of this area's scope |
+
+### UNVERIFIED — 2026-09-14 census of the `v2.32.1..v2.33.0` window (leads, not units)
+
+**Nothing in this section is a port unit.** No `MCP-NNN` id is assigned — id allocation belongs to a
+pass that read both sides, and this one did not read the cyrup side everywhere. Numbering resumes
+from **`MCP-539`** when such a pass files it. **No unit in this file is opened, closed, re-ranked or
+re-verdicted here, and no status cell in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) moves.**
+
+Method: upstream read only via `git -C tmp/pi-mcp-adapter show v2.33.0:<path>` and
+`git diff v2.32.1..v2.33.0 -- <path>`; cyrup read at `b28d3ff`. Each entry names which side was read;
+where only one side was read it says so and is a lead with half its evidence missing. An absence
+stated as "grep = 0" is a grep over `crates/cyrup-mcp/src`, not proof that a differently-named
+counterpart does not exist.
+
+#### New surfaces
+
+- **`directTools: "search"` lazy registration and search-triggered activation** · L · UPSTREAM READ
+  IN FULL; the `lazy` bit does not exist in cyrup (grep 0). `types.ts:700 DirectToolSpec.lazy?:
+  boolean`; `direct-tools.ts:190-206` sets `lazy = true` with `toolFilter = true`; `index.ts:270-275`
+  `lazyDirectTools` / `searchActivatedTools`; `:347 holdLazyToolsInactive`; `:361
+  activateSearchMatches`; `:313` folds `lazy` into `directToolFingerprint` so a mode-only flip
+  re-registers; `:457-470` the search↔eager transition arms; `:296 eagerCount` excludes lazy specs
+  from the 75-tool advisory; `:1576-1581 hasSearchModeSpecs` forces the gateway to stay registered
+  **even under `disableProxyTool`**. Tools are registered with real schemas but held OUT of the
+  active set; `mcp({ search })` is the only activation path, adds matches additively (never
+  deactivates), and prefixes the result with `Activated as direct tools: …` plus a
+  `details.activated` array. Flipping a server search→eager must activate tools Pi already knows (Pi
+  does not re-activate on re-registration); eager→search must hold them out. Dropping the gateway
+  while any spec is lazy would strand every held tool, hence the `disableProxyTool` override. NEW
+  PORT UNIT and the largest new model-facing surface in the window. The nearest built cyrup surface is
+  `extension.rs:214 sync_tool_surface` with the fingerprint diff at `extension.rs:278` (STATUS's
+  `MCP-217` closure cite, not re-read here). It cuts across `MCP-217`, `MCP-038` /
+  `fallback_deactivated_tools` (`extension.rs:355`) and the `disableProxyTool` decision — **do not
+  schedule it as a leaf.** The type-widening half is in [`13b`](13b-mcp-config.md); the panel half in
+  [`13h`](13h-mcp-tui.md).
+- **`connectAndReport` — `mcp({ connect })` activates newly discovered direct tools** · M · UPSTREAM
+  READ IN FULL; cyrup side not read this pass beyond knowing `sync_tool_surface` exists at
+  `extension.rs:214`. `index.ts:1172 connectAndReport`; `:262-266 registeredDirectToolServers`,
+  `registeredDirectToolVersions`, `reportedDirectToolNamesByServer`; `:277
+  forgetReportedDirectToolName`; `:1537` the `params.connect` arm now returns `connectAndReport(...)`
+  instead of `executeConnect` plus a bare `syncToolSurface`. Connect now attributes and REPORTS the
+  direct tools its own result produced, as `addedToolNames`, so they become available at the correct
+  point in the transcript. The correctness machinery is the substance: a per-tool registration
+  **version counter** distinguishes a re-registration from a no-op; a per-server reported-name set
+  consumes each discovery name exactly once across overlapping connects; removal clears the record so
+  a stale or fallback reactivation is reportable again; lazy (search-mode) tools are excluded because
+  they load on search, not on connect. NEW PORT UNIT layered on `MCP-217`. Without the three
+  bookkeeping maps the report double-counts or misattributes across concurrent connects.
+- **`session-approvals.ts` — session-branch-persisted approval grants** · M · BOTH SIDES READ for
+  half (a); upstream only for half (b). New file, 187 lines: `:7 MCP_APPROVAL_CUSTOM_TYPE =
+  "mcp-approval-v1"`; `:40 computeToolArgumentsHash`; `:44 computeToolDefinitionHash` over
+  `{originalName, inputSchema, resourceUri, uiResourceUri}`; `:55 makeToolApprovalKey(server, tool,
+  definitionHash, argsHash)` NUL-joined; `:95 isSessionApprovalEntry` (exact-key-set + sha256-hex
+  validation); `:120 createSessionApprovalWriter`; `:135 rememberToolApproval`; `:163
+  restoreSessionApprovalState`. Wiring: `tool-approval.ts:140`/`:179` call `rememberToolApproval`;
+  `init.ts:184-193` builds the writer from `pi.appendEntry` guarded by `owner.isActive()`;
+  `init.ts:243` restores at init; `index.ts:692` re-restores after async startup; `index.ts:820
+  pi.on("session_tree", …)` restores on branch navigation, rejecting a stale `sessionManager`.
+  **(a)** the approval cache key gains a DEFINITION hash, so a tool whose schema or resource URI
+  changed no longer reuses an old grant — cyrup `crates/cyrup-mcp/src/state.rs:392` is
+  `approval_cache_key(server, original_tool, args)`, **three** components, and `proxy/approval.rs:303`
+  is its only production caller. That is a live readable divergence at HEAD and a **lead against
+  `MCP-232`** (recorded `implemented` by the 2026-09-04 re-audit against the v2.32.1 shape — version
+  lag, not regression). **(b)** grants and MCP-UI iframe consent decisions are written as non-LLM
+  custom entries on the active Pi session branch and restored on resume and branch navigation; only
+  names and hashes persist, never arguments, results or secrets; headless `approval_required`,
+  `allow_once`, denials and abstentions deliberately create no record. NEW PORT UNIT: cyrup has no
+  session-branch **read** (`grep -rn 'get_branch\|session_tree' crates/cyrup-mcp/src` = 0) but does
+  have the **write** verb (`crates/cyrup-mcp/src/owner.rs:503 fn append_entry`), so the missing seam
+  is the read. **`MCP-232`'s row is untouched.**
+
+#### Changes to existing units
+
+- **Approval brokers are consulted BEFORE the session-grant cache** · S · BOTH SIDES READ.
+  `tool-approval.ts`'s `ensureToolCallApproved` moves the `approvedToolCalls` lookup from before
+  `requestBrokerApproval` to after it; `deny` now blocks a call that matches a cached grant **without
+  revoking that grant**; only `abstain` / no-claim reaches the cache. Upstream `45757f5` (#536). The
+  v2.33.0 README pins it: "Brokered approval runs for every resolved MCP call reaching the approval
+  gate, including calls matching session grants restored from the active branch, regardless of
+  `approveTools` configuration." An ordering inversion with a real consequence — a broker can now veto
+  a call the user blanket-approved for the session. cyrup `proxy/approval.rs:303` does the cache
+  lookup FIRST, matching the pre-v2.33.0 order. Lead against `MCP-232`. **Partially n/a:** the broker
+  itself is `MCP-233`'s recorded cut (`proxy/approval.rs:270-283` documents cyrup's `before_tool_call`
+  permission gate as the structural broker, with no `abstain`), so what survives to port is the
+  ordering relative to whatever cyrup's gate is — which the cut note's own reasoning makes
+  non-obvious. **Worth an explicit ruling rather than a silent carry-forward.**
+- **`formatServerNamespace` — provider-safe, length-bounded, injective server namespaces** · S ·
+  UPSTREAM READ IN FULL; cyrup has no namespace-proxy surface. `types.ts:521-543` — moved out of
+  `mcp-references.ts` into `types.ts`: `ENCODED_SERVER_NAMESPACE_MARKER = "_mcpns_"`,
+  `MAX_SERVER_NAMESPACE_LENGTH = 59` (the 64-char provider limit minus `mcp__`),
+  `encodeServerNamespace` (`_` → `__`, non-alphanumeric → `_<hex>_`, with a prefix code that keeps the
+  encoding injective), and a sha256-16-hex tail under an `_mcpns__h_` prefix when the namespace
+  exceeds 59. `mcp-references.ts:70 namespaceProxyName` now delegates. Upstream `22682de` (#529). The
+  old `namespaceServerPart` hex-joined every code point of any non-simple name and had no length
+  bound, so long names produced over-limit tool names or collided; the replacement is injective by
+  construction and bounded, and the hash is taken over the ASCII **encoding** rather than the raw name
+  (lone surrogates and U+FFFD share UTF-8 bytes). **Lead against `MCP-513`** (recorded `missing`):
+  this is a correction to its SPEC, not a defect — its recorded obligation says "provider-safe
+  sanitisation", and that phrase now means this exact algorithm; its upstream cite list (`8285d35`,
+  `2dafdc4`, `34f4c2c`) should gain `22682de`. The function's second consumer is now the Claude-plugin
+  loader's shadow detection (`config.ts:358-366`), so `MCP-513` and that loader unit share a
+  primitive. **The row is untouched.**
+- **`outputSchema` carried end to end for `structuredContent`** · S · UPSTREAM READ IN FULL; cyrup
+  grep for `output_schema` in `crates/cyrup-mcp/src` = 0 (the hits are all in `cyrup-ext-subagents`,
+  an unrelated surface). `types.ts:90 McpTool.outputSchema`; `types.ts:685 ToolMetadata.outputSchema`;
+  `types.ts:726 CachedTool.outputSchema`; `tool-metadata.ts:111 buildToolMetadata` propagates it;
+  `metadata-cache.ts:235 reconstructToolMetadata` and `:303 serializeTools` both round-trip it;
+  `tool-metadata.ts:163` adds `hasSchemaDescriptions(schema, includeRoot)`. A server-advertised output
+  schema is now stored in tool metadata AND in the on-disk metadata cache, surviving refreshes, so
+  callers can be told the result lands at `data.structuredContent`. Change to `MCP-207`/`MCP-217`
+  here **and** to the cached-tool serialisation half in [`13c`](13c-mcp-servers.md) (`MCP-139`-adjacent).
+  **SPLIT WARNING: the cache round-trip is 13c's and the metadata build is 13e's; they must land
+  together or a refresh drops the field.** Note that today `outputSchema`'s only consumer is
+  `mcp-code.ts`'s `tools.describe()`, which is **Cut 4** — so the port value is the metadata/cache
+  plumbing, and whether cyrup wants the field at all is arguably an open decision.
+- **Output guard delegates to host truncation semantics** · M · BOTH SIDES READ (upstream in full;
+  cyrup by symbol). `mcp-output-guard.ts` now imports `DEFAULT_MAX_BYTES`, `DEFAULT_MAX_LINES`,
+  `formatSize`, `truncateHead` and `TruncationResult` from `@earendil-works/pi-coding-agent`;
+  `DEFAULT_MCP_OUTPUT_MAX_BYTES`/`_LINES` are aliases of the host constants instead of `50 * 1024` /
+  `2000`; the adapter's own 25-line `truncateHead` is **deleted**; `guardMcpOutput` truncates once to
+  classify and once for the preview budget, then re-formats the notice with the preview's real counts;
+  `McpOutputGuardDetails` gains **ten** keys — `truncatedBy`, `totalLines`, `totalBytes`,
+  `outputLines`, `outputBytes`, `lastLinePartial`, `firstLineExceedsLimit`, `maxLines`, `maxBytes`.
+  MCP output truncation stops being adapter-owned arithmetic and becomes the host's, while MCP
+  artifact spill-to-file is retained; the details payload grows from 4 size keys to 14 and now carries
+  a truncation CLASSIFICATION. cyrup: `crates/cyrup-mcp/src/config.rs:1253 pub const
+  DEFAULT_MCP_OUTPUT_MAX_BYTES: u64 = 50 * 1024` and `renderers.rs:1533 fn truncate_head(text,
+  max_bytes, max_lines)`. **LEDGER CORRECTION, recorded not applied:** `13e-mcp-tools.md:378` justifies
+  `MCP-226`'s `hand-written` verdict by saying cyrup's `cyrup_tools::truncate`/`output` "never emit a
+  partial line and format `50.0KB`, not `50.0 KiB`" — upstream has now deleted its own implementation
+  in favour of exactly the host helper that rationale rejected, which **inverts the verdict's
+  premise**. Whether `MCP-226` stays `hand-written` or becomes `host-verb` is an open question, and
+  `13b-mcp-config.md:543` / `13e-mcp-tools.md:837`'s hardcoded `50 * 1024` / `2000` defaults are no
+  longer upstream's source of truth. **`MCP-226`'s row, verdict and status are untouched.**
+
 ### How it lands
 
 | adapter capability | upstream mechanism | cyrup mechanism | verdict |

@@ -88,7 +88,7 @@ core code-puppy, not in the plugin, and `FLUX-002` turns on that fact.
 ## Status table (every item from every prior pass)
 
 **There are no prior passes.** This section is declared, and empty, per the item format
-(`README.md:434-435`): every area file carries a status table covering every item from every prior
+(`README.md:477-478`): every area file carries a status table covering every item from every prior
 analysis, and for area 14 that set is empty. The seven `FLUX-NNN` ids below are all filed by this
 pass. Nothing in this area has ever been closed, refuted, superseded or misdescribed, so there is
 nothing to re-audit — the next pass audits the rows in `## Open items` directly.
@@ -267,7 +267,7 @@ unconditionally on; the other three are opt-in and a user who never armed them n
 `crates/cyrup-ext-subagents/src/extension.rs:5750`,
 `crates/cyrup-ext-subagents/src/registration/resources.rs:46` and
 `crates/cyrup-intercom/src/resources.rs:41`. `grep -rn 'CARGO_MANIFEST_DIR' docs/gap-analysis/*.md`
-returns only `01-cyrup-core-and-provider.md:985`, an unrelated test-time suggestion.
+returns only `01-cyrup-core-and-provider.md:1335`, an unrelated test-time suggestion.
 **Fix** — Embed rather than resolve. `crates/cyrup-flux/Cargo.toml:13-17` already declares
 `include = ["src/**/*.rs", "resources/**", "Cargo.toml"]`, so the tree is in the package; make it in
 the BINARY too. Either (a) `include_dir!` the `resources/` tree and materialise it under
@@ -540,7 +540,7 @@ lookup — an extension shortcut is not a rebindable `Keybinding`, so there is n
 against"), so no `keybindings.json` edit reaches it. **There is no supported way to turn flux off
 either:** `flux_extension_for_env` (`crates/cyrup-flux/src/lib.rs:49-53`) has exactly one `None`
 branch, `CYRUP_SUBAGENT_CHILD=1`, which is the subagent-child signal and not a user setting.
-**This makes flux the FIRST LIVE INSTANCE of an already-open residual** — `06-cyrup-ext.md:251`
+**This makes flux the FIRST LIVE INSTANCE of an already-open residual** — `06-cyrup-ext.md:384`
 (`EXT-039`, PARTIALLY CLOSED 2026-08-14) reads "**RESIDUAL (area 07): call `resolve_shortcuts`,
 invert `app/input.rs:81-93`, thread `shortcut_diagnostics` into
 `startup_diagnostics.extensions`.**" — *quoted verbatim, and its middle citation is the right site:
@@ -742,8 +742,8 @@ EditorKeymap`); `crates/cyrup-ext/src/registry.rs:905-965` (`resolve_shortcuts` 
 extension.rs:96-97`; `crates/cyrup/src/cli.rs:946`; `spec/flux.md` (§0.4 rename map `:115-129`,
 §3.4.1-§3.4.3 `:547-715`, §5 `:852-883`, the mapping table `:828-848`), `spec/flux/README.md`,
 `docs/guide/extensions/flux.md`, the repository `../../README.md:80-95`, and this directory's
-`README.md:406-445`
-(item format, kind vocabulary, severity rubric), `docs/gap-analysis/06-cyrup-ext.md:251`
+`README.md:449-488`
+(item format, kind vocabulary, severity rubric), `docs/gap-analysis/06-cyrup-ext.md:384`
 (`EXT-039`), and `docs/gap-analysis/09-cyrup-ext-subagents.md` in full as the structural template.
 
 ### Read first-hand upstream, at tags only
@@ -833,7 +833,7 @@ refactor). `git log --oneline 4fb5e40..HEAD -- crates/cyrup-flux` (one commit, d
 
 ### Handoffs to other areas
 
-- **`FLUX-004`'s missing half belongs to `EXT-039`** (`06-cyrup-ext.md:251`, PARTIALLY CLOSED
+- **`FLUX-004`'s missing half belongs to `EXT-039`** (`06-cyrup-ext.md:384`, PARTIALLY CLOSED
   2026-08-14), whose open residual is literally "call `resolve_shortcuts` … thread
   `shortcut_diagnostics` into `startup_diagnostics.extensions`". Flux is the first shipped extension
   that makes that residual cost something. **`EXT-039` should be re-read for severity now that it has
@@ -849,8 +849,8 @@ refactor). `git log --oneline 4fb5e40..HEAD -- crates/cyrup-flux` (one commit, d
   proposed in the row stays entirely inside this crate.
 - **`README.md` and `00-residual-ledger.md` need three edits this file cannot make**, since neither is
   in this area's partition: (a) a `[14-cyrup-flux.md]` row in the Contents table
-  (`README.md:227-240`) with the totals re-derived; (b) a `code_puppy_core_plugins/` row in
-  `## Baselines measured against` (`README.md:384-391`) — **updated this pass**: HEAD `8c6f852`
+  (`README.md:270-283`) with the totals re-derived; (b) a `code_puppy_core_plugins/` row in
+  `## Baselines measured against` (`README.md:427-434`) — **updated this pass**: HEAD `8c6f852`
   (was `8de5184`), ported baseline `v0.0.6`, **latest tag now `v0.0.40`** (was recorded as `v0.0.6`
   with "no version lag to sweep yet" — that statement is now false as a tag-distance claim, though
   the diff-stat sweep above found the content delta is still empty), plus `code_puppy` HEAD `38f74d4`,

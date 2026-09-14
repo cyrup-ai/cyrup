@@ -1,6 +1,139 @@
 # 06 — cyrup-ext (the extension host)
 
-This area covers the extension host itself: the event catalog and dispatch reduction (`cyrup-ext/src/{event,dispatch,facade,registry}.rs`), the WIT world and its wasmtime runtime (`cyrup-ext/wit/world.wit`, `cyrup-ext/src/host/`), the native built-in extension path (`cyrup-ext/src/native.rs`), the guest SDK (`cyrup-ext-sdk/`), and the `cyrup-session-svc` and `cyrup-tui` wiring that is the only production consumer of any of it. It is measured against `pi/packages/coding-agent/src/core/extensions/` at the ported baseline **pi v0.83.0** — `types.ts`, `runner.ts`, `loader.ts` — with post-baseline drift measured against **pi v0.84.1**. The standing caveat is that cyrup's WASM Component Model host is a deliberate *mechanism* divergence from pi's jiti/TypeScript loader; the *semantics* of the event, registration and context surfaces are fully in scope.
+This area covers the extension host itself: the event catalog and dispatch reduction (`cyrup-ext/src/{event,dispatch,facade,registry}.rs`), the WIT world and its wasmtime runtime (`cyrup-ext/wit/world.wit`, `cyrup-ext/src/host/`), the native built-in extension path (`cyrup-ext/src/native.rs`), the guest SDK (`cyrup-ext-sdk/`), and the `cyrup-session-svc` and `cyrup-tui` wiring that is the only production consumer of any of it. It is measured against `pi/packages/coding-agent/src/core/extensions/` at the ported baseline **pi v0.83.0** — `types.ts`, `runner.ts`, `loader.ts` — with post-baseline drift measured against **pi v0.84.1** (the latest tag *at the time of that reading*; the latest tag is now **v0.85.1**, and `v0.84.1..v0.85.1` is unmeasured here — see the provenance block below). The standing caveat is that cyrup's WASM Component Model host is a deliberate *mechanism* divergence from pi's jiti/TypeScript loader; the *semantics* of the event, registration and context surfaces are fully in scope.
+
+> ## PROVENANCE — PINS CORRECTED 2026-09-14. THIS FILE WAS NOT RE-AUDITED.
+>
+> **Pin correction only.** Nothing in this file was re-read, no code was compiled or run, and no
+> upstream source was opened by the pass that wrote this block. It exists so a reader can tell at a
+> glance how stale everything below it is. Every dated block beneath this one records what somebody
+> actually read at the time and is **correct as history** — its tags and shas must not be re-stamped.
+>
+> | | audited at — history, unchanged | current, 2026-09-14 | therefore unmeasured |
+> |---|---|---|---|
+> | `cyrup/` | HEAD **`2571969`**, the last baseline sweep (`RECOUNTED 2026-09-04` under `## Open items`, authoritative over every block above it); individual rows were edited as late as 2026-09-05 | HEAD **`b28d3ff`**. The ledger's last recorded code baseline is **`824a539e`** | `2571969..b28d3ff` — no part of this file has been read against it |
+> | `pi/` | **v0.83.0** for parity, **v0.84.1** for drift; the 2026-09-04 sweep adds a `--stat`-only skim of `v0.84.1..v0.84.4` scoped to `packages/coding-agent/src/core/extensions/`, which filed `EXT-075` and strengthened `EXT-S04` and read nothing else | **v0.85.1** | **`v0.84.1..v0.85.1`** in full, and `v0.84.1..v0.84.4` at anything finer than a diff-stat of one directory |
+>
+> Other upstreams, re-checked 2026-09-14 and unchanged: `pi-permission-system` **v0.8.0**,
+> `pi-intercom` **v0.13.0**, `pi-acp` **v0.0.33**, `code_puppy_core_plugins` **v0.0.50** (ported
+> surface byte-identical across all 39 tags). `pi-subagents` is now **v0.67.0** and `pi-mcp-adapter`
+> **v2.33.0**; neither is this area's upstream.
+>
+> **What this costs a reader.** Every `upstream-drift` row here was classified against v0.84.1, and
+> the standing "cyrup's WASM host is a deliberate mechanism divergence, the semantics are in scope"
+> caveat was written when pi's only extension mechanism was the jiti/TypeScript loader. At v0.85.1
+> pi carries a second one — `packages/chord` — which did not exist at any tag this file has read.
+> Every `closed` verdict was reached against cyrup at `2571969` or earlier and is unverified at
+> `b28d3ff`. The `## UNVERIFIED census` immediately below is a lead list drawn from that window; it
+> is not a re-audit and closes nothing.
+
+## UNVERIFIED census 2026-09-14 — leads, not findings
+
+Three candidate surfaces: one from the `v0.84.1..v0.85.1` upstream window, two from
+`824a539e..b28d3ff` on the cyrup side.
+
+**Read this as a lead list.** No entry is audited. No entry carries a ledger id — id assignment
+belongs to a pass that has read both sides. **No row in `## Open items` was opened, closed,
+re-severitied or otherwise touched.** Where an entry bears on a row that already exists, it is
+recorded as a lead against that row's id and the row is left exactly as it stands.
+
+### Upstream: a second extension mechanism appeared in the window
+
+- **`@earendil-works/chord` — watch, do not port (yet)** — L. `packages/chord/README.md:1-12`,
+  `PLANNING.md:3-40 @v0.85.1`; first commit `28b49a6b3` (2026-08-28); **0 files at v0.84.4 → 39 files
+  at v0.85.0**, `+10 840`, and `v0.85.0..v0.85.1` is empty — a single-release drop of a complete
+  package, and the only package added in the whole window. It is an application-composition runtime
+  for plugin/extension systems, deliberately not a pi package (PLANNING.md §2 forbids any
+  `@earendil-works/pi-*` import and bans Session/Harness/server/client/TUI/model/tool/hook from
+  becoming chord concepts). Six layers: strict-JSON contract + a Go-style invocation `Context` with
+  AbortSignal cancellation; service tokens with singleton/keyed providers; replicated state; a
+  1 267-line delta tracker; a transport-neutral remote-service wire grammar; and a facet host with
+  dependency-ordered activation, reverse-order disposal and hot reload, fed by an esbuild bundler
+  and a SHA-256-verified `node:vm` loader.
+
+  **The judgement splits three ways and a single yes/no would be wrong.**
+
+  **(a) Already production, and on a surface cyrup ports.** `packages/agent/src/harness/context.ts:1-25 @v0.85.1`
+  imports `Context`, `ContextKey`, `createContextKey`, `withCancel`, `withAbortSignal`,
+  `withoutAbortSignal`, `withContextValue`, `awaitWithContext`, `BACKGROUND_CONTEXT`, `TODO_CONTEXT`
+  from `@earendil-works/chord/context` and re-exports them as the harness's own context type;
+  `harness/session/types.ts:1,10` re-exports `JsonValue`; `harness/agent-harness.ts:1` takes
+  `JsonRepresentation`; `packages/protocol/package.json:42` and `packages/client/src/client.ts:18-19`
+  depend on chord outright. That file **does not exist at v0.84.1** — pi's production harness context
+  was re-founded on chord inside this window.
+
+  **(b) Not in scope yet.** Facets, service tokens, replicated state, delta, wire grammar, bundler and
+  vm loader have exactly one pi consumer: `packages/coding-agent/src/experimental/` (47 files,
+  `+9 324`, also net-new in the window), reachable only via the `./experimental/plugin` subpath
+  (`package.json:25-26`) and excluded from the published artifact (`"!dist/experimental"`, `:32`). The
+  OLD extension system is still present and still the production path at v0.85.1 —
+  `src/core/extensions/{index,loader,runner,types,wrapper}.ts` all still exist. PLANNING.md:3 says in
+  its own words: "Symmetric RPC and structural generation replacement remain planned. This is not a
+  stable public API contract yet."
+
+  **(c) Strategic.** chord is visibly positioned as the successor to `core/extensions/`:
+  `examples/plugins/pi-example-plugin/src/{contract,session,tui}.ts @v0.85.1` declares worker/session/tui
+  facets against `defineService<T>("pi.example-plugin.greeting")` with a `ReplicatedState` member —
+  the multi-process extension shape cyrup-ext solves a completely different way. cyrup-ext has no
+  counterpart to any of it: `grep -rniI "replicated|defineService|facet" crates/cyrup-ext/ crates/cyrup-ext-sdk/`
+  returns only unrelated substring hits, and `crates/cyrup-ext/wit/world.wit` (1 200 lines) has no
+  service-token, keyed-instance, replicated-state or per-process-facet concept.
+
+  **Recommended filing when this is worked: two things, not one.** A `tracker (lead)` in this area —
+  "chord: watch, do not port" — carrying (b) and (c) and an explicit escalation condition: chord
+  enters the work set when ANY of these is true at a pi tag — `src/experimental/` loses the
+  `experimental` prefix; `core/extensions/` is deleted; a shipped release loads a chord facet bundle
+  on the default CLI path; or `packages/chord` declares a stable public API. Plus a **separate** real
+  drift item for slice (a), cross-referenced from `12-upstream-drift-pi-core.md` because it lands in
+  `packages/agent`, not in `coding-agent/src/core/extensions/`. **No new area file** — chord's centre
+  of gravity (plugin composition, lifecycle, dependency-ordered activation, loading) is verbatim this
+  area's charter, it must be judged on exactly the mechanism-divergence axis this area already
+  carries, and the area-13/15 precedent for a counted area of its own is for upstreams that are
+  *decided port targets*. chord is not one.
+
+  **Evidence standard:** upstream read on the chord side and on every consumer side, **except**
+  `src/delta/index.ts` (1 267 lines) and `src/facets/host.ts` (906), which rest on the package's own
+  README/PLANNING prose — not an upstream read under this directory's rules. The cyrup side was read
+  only far enough to establish ABSENCE (crate + WIT inventory, negative greps). Nobody has compared
+  chord's Context semantics against cyrup-agent's cancellation model, so **slice (a) is a lead, not a
+  verified defect.**
+
+### cyrup-side changes at `b28d3ff` with no ledger row
+
+- **`--tools` allowlist now applies to extension/SDK tools** — M. New
+  `ExtensionHost::active_tools_filtered(base, allow, exclude)` at
+  `crates/cyrup-ext/src/facade.rs:653` and `ExtensionRegistry::active_tools_filtered` in
+  `registry.rs`, routed from `crates/cyrup-session-svc/src/builder.rs:1566`. It ports pi
+  `_refreshToolRegistry`'s `isAllowedTool` over `allCustomTools` (the code cites
+  `agent-session.ts:2676-2686`). Before it, `select_active_tools` filtered only `registry.visible(..)`
+  and extension tools were merged in afterwards **unfiltered** — a child pinned to `read,grep`
+  launched holding every extension tool the host had. `allow: None` vs `Some(∅)` is made load-bearing
+  so `--no-builtin-tools` keeps working. **A real, user-visible tool-scoping defect that existed in
+  cyrup and is now fixed, with no ledger id anywhere:** `grep -rn '2835\|isAllowedTool' docs/gap-analysis`
+  returns zero, and neither this area nor area 08 has a row for it. **Interacts with `SEAM-118`**
+  (`08:608`, CLOSED 2026-09-05, `--no-builtin-tools`), which turns on the same `None`/`Some(∅)`
+  distinction — worth checking that closure still reads true. Cyrup side read at `b28d3ff`; the
+  upstream `agent-session.ts` lines are the code comment's claim, **not verified against the pi clone**.
+- **`HostServices::inject_message_ack` + `InjectOutcome`** — S. A new `InjectOutcome` enum and a
+  default-deny `inject_message_ack` trait method in `crates/cyrup-ext/src/host/services.rs`,
+  re-exported from `host/mod.rs`: an acknowledging variant of `inject_message` returning a oneshot
+  `Receiver<InjectOutcome>`, added for a native caller that holds the only copy of the data it
+  announces (the subagents completion sink, which deletes a terminal result file once delivery is
+  reported). Its doc argues fire-and-forget injection is silent data loss for such a caller.
+  **cyrup-original surface with no upstream counterpart named and no ledger row.** `ICOM-029`
+  (`11:347`) is closed and covered only the `details` parameter. This area's open set does not mention
+  it. Low-ish value on its own, but it is a new public host-services API that no area file
+  inventories — and this area's event/host-surface counts (`06:1917`, 31 vs 33) are exactly the
+  figures such an addition invalidates. Cyrup-only read.
+
+---
+
+## Audit history — everything from here down predates 2026-09-14
+
+Unchanged. Each block below records what somebody actually read at the time and is correct as
+history; the provenance block at the top of this file says how stale that makes it. The
+`## Open items` table further down remains the authority for what is open in this area — the census
+above opened nothing, closed nothing and re-severitied nothing.
 
 > **Re-audited 2026-08-12, cyrup HEAD `a9000b1`** (branch `david/cyrup`, working tree clean; last **code** commit `04c1ba2`), upstream **pi v0.83.0** (ported baseline) with the version-lag sweep run against **v0.84.1**.
 >
@@ -1732,7 +1865,7 @@ Taken with `EXT-054`, **neither of cyrup's two controls stands between an instal
 
 **3. Doc-comment-as-truth is not evidence.** `crates/cyrup-ext/src/registry.rs:49` documented the stored field as being there "so the agent loop can forward it", and `host/live.rs:1788-1796` documented `WasmTool`'s accessor as closing `PROV-011` at BOTH ends — while the agent loop hard-coded `None` and the wrapper between them dropped the value. Three separate doc comments described a working end-to-end path that did not exist. **A prose claim that a value "reaches" somewhere is not evidence; the only evidence is a test that reads it at the far end.**
 
-**4. A field whose absence is defined to behave like its default cannot fail loudly.** `constrainedSampling` absent and `constrainedSampling: false` are defined by pi to be identical (`packages/ai/README.md:483`), so erasing a real declaration produces no error, no warning and a perfectly well-formed request — just an unconstrained one. Any future field with a "null behaves like the default" contract needs an explicit far-end test, because it has no failure mode of its own.
+**4. A field whose absence is defined to behave like its default cannot fail loudly.** `constrainedSampling` absent and `constrainedSampling: false` are defined by pi to be identical (`packages/ai/README.md:526`), so erasing a real declaration produces no error, no warning and a perfectly well-formed request — just an unconstrained one. Any future field with a "null behaves like the default" contract needs an explicit far-end test, because it has no failure mode of its own.
 
 **5. Citation forensics — the two failure modes have DIFFERENT fixes and must not be conflated.** A **uniform offset** across a cluster of citations means **version lag** (a real pi revision, just not the ported tag) and is fixed by re-tagging. Citations **converging on one number across unrelated symbols** (here `extensions/types.ts:1043` doing duty for `AgentToolResult`, `UserBashEventResult` and `ToolResultEventResult`) means **invention**. Corroborating tell found in `host/services.rs`: every citation ADDED by the recent EXT-021/EXT-047 work (`:151`, `:154`, `:164`, `:167`, `:170-175`) is exact while every citation from the block's original import is ~6 low — so rot is confined to the import and is not systematic misreading by one author.
 

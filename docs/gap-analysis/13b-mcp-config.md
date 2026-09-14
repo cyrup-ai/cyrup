@@ -61,6 +61,131 @@ non-obvious obligation in this section.
 
 ---
 
+> ### PROVENANCE CORRECTION — 2026-09-14. The pins below are revised; **this file was not re-read.**
+>
+> Everything in this file is history and is correct as written. It was audited against
+> **`pi-mcp-adapter` v2.25.0** — that is the tag its prose, its unit obligations and every upstream
+> citation in it were read at, and it stays. **Nothing in this block re-verifies any of it: no unit
+> was re-read, no obligation re-derived, no count, severity, verdict or status changed.** This block
+> states only how stale the file is; the section after it is a worklist, not a finding.
+>
+> | | audited at (history — do not rewrite) | current pin (authoritative, per `README.md`'s baselines table) | window this file has never measured |
+> |---|---|---|---|
+> | `pi-mcp-adapter` | **`v2.25.0`** (the plan's tag) | **`v2.33.0`** *(was v2.32.1)* | `v2.25.0..v2.33.0` = **211 files, +27 961 / −2 129**, 113 non-merge commits. Two segments of that range are measured elsewhere and are NOT this file's blind spot: `v2.25.0..v2.26.1` by [`13-cyrup-mcp.md`](13-cyrup-mcp.md)'s *Retarget* section, `v2.26.1..v2.32.1` by [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md)'s 2026-09-04 re-audit. **`v2.32.1..v2.33.0` = 123 files, +9 455 / −1 352, 33 non-merge commits, is measured by nobody.** That is the unmeasured window, and the census below is its lead list |
+> | `cyrup` | **deliberately unpinned** — this file cites cyrup by symbol and file only, and its header says so | code HEAD **`b28d3ff`**; the ledger's last recorded code baseline is `824a539e` | **Not expressible.** With no sha ever recorded here there is no window to name: the staleness of a cyrup claim in this file cannot be bounded, only re-read. For scale, `crates/cyrup-mcp` at `b28d3ff` is **43 `.rs` files / 79 930 lines** under `src` — 29 top-level modules plus the `proxy/` tree |
+> | `pi` · `pi-subagents` · `pi-permission-system` · `pi-intercom` · `pi-acp` · `code_puppy_core_plugins` | — | `v0.85.1` · `v0.67.0` · `v0.8.0` · `v0.13.0` · `v0.0.33` · `v0.0.50` (ported surface byte-identical across all 39 tags) | out of this area's scope |
+
+### UNVERIFIED — 2026-09-14 census of the `v2.32.1..v2.33.0` window (leads, not units)
+
+**Nothing in this section is a port unit.** No `MCP-NNN` id is assigned — id allocation belongs to a
+pass that read both sides, and this one did not read the cyrup side everywhere. Numbering resumes
+from **`MCP-539`** when such a pass files it. **No unit in this file is opened, closed, re-ranked or
+re-verdicted here, and no status cell in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) moves.**
+
+Method: upstream read only via `git -C tmp/pi-mcp-adapter show v2.33.0:<path>` and
+`git diff v2.32.1..v2.33.0 -- <path>`; cyrup read at `b28d3ff`. Each entry names which side was read;
+where only one side was read it says so and is a lead with half its evidence missing. An absence
+stated as "grep = 0" is a grep over `crates/cyrup-mcp/src`, not proof that a differently-named
+counterpart does not exist.
+
+#### New surfaces
+
+- **`claudePlugins` root config key and its validator** · M · UPSTREAM READ IN FULL; cyrup grep 0.
+  `types.ts:652 interface ClaudePluginConfig {path, mcp?, skills?}`; `types.ts:666
+  McpConfig.claudePlugins?: ClaudePluginConfig[]`; `config.ts:742 parseClaudePlugins`; in
+  `mergeConfigs`, `const claudePlugins = next.claudePlugins ?? base.claudePlugins` — **whole-array
+  replace, never merged**; `config.ts:634-637` `expandImports` carries it through. This is a
+  **fourth root key** on `McpConfig` (previously `mcpServers`/`imports`/`settings`). Validation is
+  per-entry and warn-and-skip, not fail: a non-array warns and yields `[]`; an entry needs a
+  non-empty string `path`; `mcp`/`skills` must be booleans if present; at least one of the two must
+  be `true`. NEW PORT UNIT. Structurally it is `MCP-502` (`pi.mcp` package manifests) again: a config
+  SOURCE the six-rung `ConfigContext::sources()` ladder has no rung for. `config.rs:3231` was **not**
+  re-read at HEAD; that cite is carried from STATUS.
+- **`claude-plugin-loader.ts` — trusted local Claude plugin bundles** · L · UPSTREAM READ IN FULL
+  (first 140 lines line by line, remainder by symbol); cyrup absent by grep. New file, 365 lines:
+  `:15 loadClaudePluginBundles(plugins, cwd, validateConfig, {mcp, skills})`; `:84 resolvePluginPath`
+  (`~` expansion, cwd-relative resolve); `:90 resolvePluginRoot` (existsSync + isDirectory +
+  realpath); `:104 readPluginManifest` (`.claude-plugin/plugin.json` optional, kebab-case `name`
+  regex, containment check, three-state `manifest | null | false` return); `:49
+  resolveContainedComponent(pluginRoot, ".mcp.json", "file", …)`; `:68` the skills directory. Wired at
+  `config.ts:348 resolveConfiguredClaudePluginMcp`, `:352 discoverConfiguredClaudePluginSkills`,
+  `:356 mergeClaudePluginMcpDefaults`. An explicit local trust boundary yielding both MCP server
+  defaults and Pi skill paths: plugin servers are **lowest** precedence; first explicitly listed
+  plugin wins same-name conflicts; conflicts are detected on the **normalised** namespace
+  (`formatServerNamespace`), not the raw name, and a shadowed plugin server is dropped with a named
+  warning; component symlinks escaping the configured directory are rejected;
+  `${CLAUDE_PLUGIN_ROOT}` is expanded in plugin MCP fields and set in stdio children. **No discovery,
+  download, install, update or hook execution** — the adapter reads only inside directories the user
+  named. NEW PORT UNIT and the largest new config surface in the window. The containment/realpath
+  rules are the security-relevant half and must be ported as *behaviour*, not as `fs` calls. The
+  already-ported `crates/cyrup-mcp/src/agent_plugin.rs` is the shape to follow, and the
+  namespace-collision rule couples this to `MCP-513`.
+- **`normalizeProgrammaticConfig` — API-boundary cwd snapshot for programmatic plugin paths** · S ·
+  UPSTREAM READ; depends entirely on the unit above, which cyrup also lacks. `index.ts:97
+  resolveProgrammaticClaudePluginPath`, `:103 normalizeProgrammaticConfig`, called at
+  `createMcpAdapter` (`index.ts:1619`); `index.ts:250` and `init.ts:141` do the session-time half.
+  Relative `claudePlugins[].path` values supplied through the programmatic `config` are resolved
+  against `process.cwd()` **once**, at factory creation, so early model-facing registration and later
+  session startup cannot resolve the same relative path to two different bundles. File-based config
+  keeps resolving against the active project cwd. NEW PORT UNIT (small) — the kind of ordering rule
+  that is invisible until it is wrong, so it should be filed rather than folded into the loader unit.
+  Note the interaction with `MCP-394`'s `programmaticConfig` branch, which cyrup already implements at
+  `commands.rs:426-437`.
+
+#### Changes to existing units
+
+- **`ServerEntry.caFile` — per-server HTTPS PEM trust bundle (config half)** · S · BOTH SIDES READ.
+  `types.ts:438 caFile?: string`; **`config.ts:553 URL_BOUND_AUTH_FIELDS` is now SIX entries** with
+  `caFile` appended; `config.ts:576` (command arm) and `:592` (socket arm) add `caFile` to the
+  layered drop list. A higher-precedence source that repoints `url`, or switches the entry to
+  stdio/socket, must drop the inherited `caFile` or a private trust anchor follows the URL to a new
+  endpoint. cyrup `crates/cyrup-mcp/src/config.rs:2274` is `pub const URL_BOUND_AUTH_FIELDS: [&str;
+  4]` and `grep -rn 'ca_file\|caFile' crates/cyrup-mcp/src` = 0. Change to `MCP-053`
+  (`mergeServerMaps`) and `MCP-069` (`ServerEntry`), and it **amends the open `MCP-500`**, whose
+  recorded obligation says the array is FIVE. Land `MCP-500` at six. The transport half is in
+  [`13c`](13c-mcp-servers.md). **`MCP-500`'s row, severity and status are untouched.**
+- **Exclusive config mode honours an explicit `--mcp-config` override** · S · UPSTREAM READ; cyrup
+  side NOT read for this behaviour. `getEffectivePiGlobalConfigPath` is **deleted**; its three call
+  sites now read `getPiGlobalConfigPath(overridePath)` directly (`config.ts:256` in
+  `getMcpDiscoverySummary`, `:451` in `getConfigSources`). Previously the helper discarded
+  `overridePath` whenever `PI_MCP_CONFIG_MODE=exclusive`, so exclusive mode always loaded the
+  agent-global config; it now honours the override. Exclusive mode also now runs the Claude-plugin
+  resolve on its return path (`config.ts:334 return resolveConfiguredClaudePluginMcp(config, cwd)`),
+  the sole exception to exclusive-mode file isolation. Upstream `f7c5e4d`/`f7ce8d4` (#498). I located
+  only cyrup's `--mcp-config` handling (`config.rs:2042`, `:3123`), not its exclusive-mode branch.
+  Cheap to verify, and a silent wrong-file-loaded bug if cyrup copied the pre-v2.33.0 shape.
+- **`getConfigPathFromArgv` — equals form, last-wins, `--` terminator, value guard** · S · BOTH
+  SIDES READ. `utils.ts` replaces the one-line `process.argv.indexOf("--mcp-config")` with a forward
+  scan from index 2 that stops at `--`, accepts `--mcp-config=<path>` (including paths containing
+  `=`), rejects a following value starting with `-` or `@`, and lets a LATER occurrence overwrite an
+  earlier one. Upstream `97253eb` (#515). **This is a pinned fidelity claim that is now wrong:**
+  `crates/cyrup-mcp/src/config.rs:2042-2044` says "Reproduced including its limitation:
+  `--mcp-config=path` is **not** supported and yields `None`", the implementation at `:2059` does
+  that, and `config.rs:6004` is a test asserting it. Doc comment, implementation and test move
+  together. `13a-mcp-activation.md:221`, `:232` and `:1269` narrate the old scan and need the same
+  correction.
+- **`directTools: "search"` — the type widening** · S · BOTH SIDES READ. `types.ts:466
+  directTools?: boolean | string[] | "search"` (`ServerEntry`); `types.ts:591 directTools?: boolean |
+  "search"` (`McpSettings`). `mcp-references.ts:69-85` shows the two read sites that must treat it as
+  `true` for REGISTRATION while differing on ACTIVATION (`isMcpServerDirectlyRegistered`,
+  `resolveDirectSelection`). cyrup `config.rs:907` is `pub direct_tools: Option<BoolOrList>`,
+  `config.rs:1134` is `pub direct_tools: Option<bool>`, and `config.rs:1375 fn direct_tools(&self)
+  -> bool { self.direct_tools == Some(true) }` is the accessor that needs a third state. Change to
+  `MCP-069` and `MCP-503`. **`MCP-503`'s "24 → 26 keys" count is UNCHANGED at v2.33.0** — no
+  `McpSettings` key was added, one type widened — but `McpConfig`'s **root**-key count moved 3 → 4,
+  which no row tracks. Separately verified harmless: `crates/cyrup-ext-subagents/src/exec/mcp_direct_tools.rs`
+  does not read `directTools` at all, and `directTools` is not one of the 15 hashed identity keys, so
+  the in-tree reader's digest is unaffected. The activation half is in [`13e`](13e-mcp-tools.md).
+
+#### Counts this window moves (recorded, not applied)
+
+`ServerEntry` is **32** fields at v2.33.0 (30 at v2.32.1, plus `inheritEnv` and `caFile`).
+`McpSettings` is still **26**. `McpConfig` root keys: 3 → **4**. `URL_BOUND_AUTH_FIELDS`: 3 → 4 → 5 →
+**6**. `mergeServerMaps`'s per-transport delete lists are **not** the same list as
+`URL_BOUND_AUTH_FIELDS` and also grew — `caFile` into the command (`config.ts:576`) and socket
+(`:592`) arms, `inheritEnv` into the url (`:584`) and socket (`:591`) arms. **`13b:409`'s
+§*mergeServerMaps* step 3 carries the old lists**; it is left standing as correct at v2.25.0.
+
 ### How it lands
 
 | adapter capability | upstream mechanism | cyrup mechanism | verdict |

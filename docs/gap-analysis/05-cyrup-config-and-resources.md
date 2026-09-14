@@ -1,6 +1,187 @@
 # 05 — cyrup-config + cyrup-resources
 
-Covers `cyrup/crates/cyrup-config` (settings, auth store, trust, model resolution, config values, login) and `cyrup/crates/cyrup-resources` (packages, discovery, skills/prompts/themes), plus the launch-path glue in `cyrup/crates/cyrup/src/main.rs`, `migrations.rs`, `cli.rs` and `cyrup-session-svc/src/builder.rs` that consumes them. Measured against `pi/packages/coding-agent/src/core/{settings-manager,model-resolver,model-runtime,models-store,model-config,auth-storage,trust-manager,project-trust,package-manager,provider-composer,resource-loader,prompt-templates,skills,slash-commands,keybindings,resolve-config-value}.ts`, `src/{config,migrations,main}.ts`, `src/utils/paths.ts` and `modes/interactive/theme/theme.ts` — read at the explicit tags **v0.83.0** (the ported baseline) and **v0.84.1** (upstream latest) rather than a floating HEAD.
+Covers `cyrup/crates/cyrup-config` (settings, auth store, trust, model resolution, config values, login) and `cyrup/crates/cyrup-resources` (packages, discovery, skills/prompts/themes), plus the launch-path glue in `cyrup/crates/cyrup/src/main.rs`, `migrations.rs`, `cli.rs` and `cyrup-session-svc/src/builder.rs` that consumes them. Measured against `pi/packages/coding-agent/src/core/{settings-manager,model-resolver,model-runtime,models-store,model-config,auth-storage,trust-manager,project-trust,package-manager,provider-composer,resource-loader,prompt-templates,skills,slash-commands,keybindings,resolve-config-value}.ts`, `src/{config,migrations,main}.ts`, `src/utils/paths.ts` and `modes/interactive/theme/theme.ts` — read at the explicit tags **v0.83.0** (the ported baseline) and **v0.84.1** (the latest tag *at the time of that reading*; the latest tag is now **v0.85.1** — see the provenance block below) rather than a floating HEAD.
+
+> ## PROVENANCE — PINS CORRECTED 2026-09-14. THIS FILE WAS NOT RE-AUDITED.
+>
+> **Pin correction only.** Nothing in this file was re-read, no code was compiled or run, and no
+> upstream source was opened by the pass that wrote this block. It exists so a reader can tell at a
+> glance how stale everything below it is. Every dated block beneath this one records what somebody
+> actually read at the time and is **correct as history** — its tags and shas must not be re-stamped.
+>
+> | | audited at — history, unchanged | current, 2026-09-14 | therefore unmeasured |
+> |---|---|---|---|
+> | `cyrup/` | HEAD **`2571969`**, the last whole-file pass (`### 2026-09-04`, authoritative below); individual rows were edited as late as 2026-09-05 | HEAD **`b28d3ff`**. The ledger's last recorded code baseline is **`824a539e`** | `2571969..b28d3ff` — no part of this file has been read against it |
+> | `pi/` | **v0.83.0** for parity, **v0.84.1** for drift; the 2026-09-04 block adds a `--stat`-only skim of `v0.84.1..v0.84.4` that filed `CFG-078`/`CFG-079` and read nothing else | **v0.85.1** | **`v0.84.1..v0.85.1`** in full, and `v0.84.1..v0.84.4` at anything finer than a diff-stat |
+>
+> Other upstreams, re-checked 2026-09-14: `pi-permission-system` **v0.8.0**, `pi-intercom` **v0.13.0**,
+> `pi-acp` **v0.0.33** and `code_puppy_core_plugins` **v0.0.50** are all unchanged (the ported
+> `code_puppy` surface is byte-identical across all 39 tags). `pi-subagents` is now **v0.67.0** and
+> `pi-mcp-adapter` **v2.33.0**; neither is this area's upstream, but `CFG-067` cites `pi-subagents`
+> **v0.64.0** throughout and that citation is history, not a claim about the latest tag.
+>
+> **What this costs a reader.** Every `upstream-drift` row here was classified against v0.84.1. A row
+> that says "absent upstream" or "unchanged upstream" is a statement about v0.84.1 and carries no
+> weight at v0.85.1. Every `closed` verdict was reached against cyrup at `2571969` or earlier and is
+> unverified at `b28d3ff`. The `## UNVERIFIED census` immediately below is a lead list drawn from
+> that window; it is not a re-audit and closes nothing.
+
+## UNVERIFIED census 2026-09-14 — leads, not findings
+
+Fourteen candidate surfaces from the `v0.84.1..v0.85.1` window (and from `824a539e..b28d3ff` on the
+cyrup side), recorded so the next pass starts from a worklist instead of from zero.
+
+**Read this as a lead list.** No entry is audited. No entry carries a ledger id — id assignment
+belongs to a pass that has read both sides, and several entries below say in their own words which
+side was not read. **No row in `## Open items` was opened, closed, re-severitied or otherwise
+touched.** Where an entry contradicts a row that already exists, it is recorded as a lead against
+that row's id and the row is left exactly as it stands. Sizes are the census agent's estimate.
+
+### Skills and the system prompt
+
+- **Root `.md` files must declare skill frontmatter** — S. `packages/agent/src/harness/skills.ts:259-263,272,280 @v0.85.1`;
+  CHANGELOG 0.84.3, "#7805". `loadSkillFromFile` now computes `isDeclaredSkill` (basename ===
+  `SKILL.md`) and gates diagnostics on it, so a loose root `.md` with absent or empty-description
+  frontmatter is skipped silently instead of reported broken. cyrup's
+  `crates/cyrup-resources/src/discovery/scan.rs:147-151` calls `load_one_skill` for ANY direct `.md`
+  child under `include_root_files` with no declared-skill gate, and its own comment cites the
+  pre-fix range (`skills.ts:221-269`). A repo with `README.md`/`AGENTS.md` in a skills root should
+  therefore still emit broken-skill diagnostics. **Not verified:** `load_one_skill` /
+  `skill.rs:171` was not followed, so the user-visible effect is unconfirmed.
+- **Skills loader error handling and frontmatter type guards** — M. `core/skills.ts:117-121,279-345 @v0.85.1`.
+  Read failures now warn rather than being swallowed; frontmatter parse failures warn only for a
+  file literally named `SKILL.md`; `validateDescription` takes `unknown` and type-checks;
+  `frontmatter.name` is used only when it is a string. **Upstream read at both tags; cyrup side only
+  partially read** — `crates/cyrup-resources/src/skill.rs` exists and cites `formatSkillsForPrompt`
+  at `:126`, but its diagnostic emission and non-`SKILL.md` handling were not compared.
+- **Skills prompt section gated on read OR bash** — S. `core/system-prompt.ts:45-46,66-67,161-162 @v0.85.1`.
+  `skillFileReadTool = ["read","bash"].find(t => tools.includes(t))` replaces the `hasRead` gate in
+  both prompt branches, and the chosen tool name is passed into `formatSkillsForPrompt` so the
+  instruction names a tool the model actually has. cyrup gates on `read` alone —
+  `crates/cyrup-session/src/prompt/builder.rs:166`, with the v0.84.1 predicate quoted at `:43`/`:165`
+  — so a `bash`-without-`read` selection silently drops the whole skills block, and cyrup's
+  `format_skills_for_prompt` equivalent takes no tool-name argument. Both sides read.
+
+### Config, settings and auth I/O
+
+- **BOM tolerance on every config / JSON / text read path** — M. New
+  `packages/coding-agent/src/utils/text.ts:1-9 @v0.85.1` (`splitBom`/`stripBom`), applied at ~14 read
+  sites: `settings-manager.ts:407,628`, `auth-storage.ts:216,366,501`, `trust-manager.ts:105`,
+  `keybindings.ts:363`, `model-config.ts:267`, `models-store.ts:63`, `resource-loader.ts:61,82`,
+  `pi-manifest.ts:19`, `package-manager.ts:1504,1886`, `config.ts:494`, `cli/file-processor.ts:77`.
+  cyrup has BOM handling only in the edit tool (`cyrup-tools/src/tools/edit.rs:299`) and in shell
+  output decoding (`cyrup-tools/src/output.rs:15-25`); every config reader parses raw —
+  `cyrup-config/src/settings/layer.rs:50`, `auth.rs:61`, `keybindings.rs:321`, `models_store.rs:250`.
+  serde_json rejects a leading U+FEFF, so a Windows-authored `settings.json` or `auth.json` fails to
+  load where pi v0.85.1 loads it. Both sides read.
+- **Settings load errors carry the file path; startup diagnostics deduplicated and routed** — M.
+  New `core/settings-diagnostics.ts:1-25 @v0.85.1`; `SettingsError.path` at `settings-manager.ts:199,205`;
+  `main.ts:896,898`. The message became `Invalid settings file <path>: <msg>`, dropping v0.84.1's
+  `(<context>, <scope> settings) <msg>`; `deduplicateDiagnostics` was added; interactive runs now get
+  diagnostics handed to `InteractiveMode` as `startupDiagnostics` instead of printed, and `--help` /
+  `--list-models` print them before exiting. cyrup's `ScopedError` is `{scope, message}` with no path
+  (`cyrup-config/src/settings/manager.rs:33,71-76,532`) and `crates/cyrup/src/bootstrap.rs:112-122`
+  formats exactly v0.84.1's shape, with no dedup and no interactive suppression. **Three separable
+  behaviours** — message format, dedup, print-vs-render routing. Both sides read.
+- **`auth.json` permissions applied on creation only** — S. `core/auth-storage.ts:24,63-66,104-107,185-188 @v0.85.1`.
+  All three post-write `chmodSync(authPath, 0o600)` calls were removed; the mode now rides only on
+  `writeFileSync` options, leaving an administrator-managed mode or ACL on an existing file intact.
+  **Upstream read at both tags; cyrup side only grepped** — `cyrup-config/src/auth.rs:2` documents
+  "0600 perms" and `:871` asserts `mode == 0o600`, but whether cyrup re-applies the mode on every
+  write was not read.
+- **Terminal capability overrides (`terminal.hyperlinks` / `.images` / `.trueColor`)** — M.
+  `core/settings-manager.ts:45-47,1132-1140 @v0.85.1`, applied at `main.ts:10,849` via
+  `setCapabilityOverrides(...)`; `images: false` maps to `{images: null}`, `"auto"` means no override.
+  cyrup's `EffectiveSettings` has `images.autoResize` / `images.blockImages`
+  (`cyrup-config/src/settings/effective.rs:421,428`) but nothing for the three `terminal.*` keys and
+  no `set_capability_overrides` seam; `cyrup-tui/src/image.rs:861` sniffs hyperlink support from the
+  terminal rather than a setting. Both sides searched. **Probably co-owned with area 07.**
+- **WSL keybinding defaults and `app.thinking.save`** — S. `core/keybindings.ts` (v0.84.1..v0.85.1
+  diff): new `useWindowsKeybindings(platform, env)` — Windows defaults now also apply under WSL,
+  detected as `platform === "linux" && (WSL_DISTRO_NAME || WSL_INTEROP)` — plus a new
+  `app.thinking.save` action bound to `ctrl+s`. `grep -rn 'WSL_DISTRO_NAME|WSL_INTEROP|thinking.save'`
+  over `crates/` finds nothing relevant; `cyrup-config/src/keybindings.rs` has no WSL branch and no
+  `app.thinking.save`. Both sides searched. **Co-owned with area 07** (the TUI consumes the binding).
+
+### Model resolution and `models.json`
+
+- **Per-model thinking level in `findInitialModel`** — S. `core/model-resolver.ts:629,640,665-671,679-682 @v0.85.1`,
+  caller `core/sdk.ts:218`. A `modelThinkingLevels` option is now consulted at step 2 (first scoped
+  model) and step 3 (saved default), precedence `scopedModel.thinkingLevel ?? perModel ??
+  defaultThinkingLevel ?? DEFAULT_THINKING_LEVEL`. cyrup stores and reads the setting
+  (`cyrup-config/src/settings/effective.rs:69-90`) and applies it in the session builder
+  (`cyrup-session-svc/src/builder.rs:2336-2344`), but `cyrup-config/src/model/select.rs:237-305` takes
+  no `model_thinking_levels` and does `first.thinking_level.or(default_thinking_level)` at step 2 and
+  `default_thinking_level` at step 3 — the per-model override is skipped where upstream ranks it above
+  the global default. **Needs a read of whether `builder.rs`'s later `.or_else` recovers the value in
+  each arm.** Both sides read.
+- **`findModelDefaults` for models.json / extension model definitions** — S.
+  `core/provider-composer.ts:168-176,209,227 @v0.85.1`. A new declared model no longer inherits from
+  `models[0]` unconditionally: exact id match, then first model with the same `api` (from
+  `definition.api ?? config.api`), then first `openai-completions`, then `models[0]`. cyrup
+  `cyrup-config/src/model/compose.rs:178-181` is exactly the v0.84.1 shape
+  (`existing.map_or_else(|| models.first(), |i| models.get(i))`), so a declared
+  anthropic-messages model on a mixed-API provider inherits the wrong row's defaults. Both sides read.
+- **model-config compat schema: five new per-model flags** — S. `core/model-config.ts:78,112,123,125,137 @v0.85.1`.
+  `models.json` validation gained `openai-completions.supportsFinishReason`,
+  `openai-completions.vllmPriority`, `openai-responses.supportsAdditionalTools`,
+  `openai-responses.supportsMaxOutputTokens`, `anthropic-messages.supportsMidConvoEffort`.
+  **Upstream read at both tags; cyrup side only partially checked** — `supports_finish_reason` is
+  ported and closed as DRIFT-021 per `12-upstream-drift-pi-core.md`, the other four were not searched
+  for under `crates/cyrup-config/src/model/`. A user-facing `models.json` key that cyrup's schema
+  rejects is a hard failure, so this is worth a cheap exhaustive check.
+- **Curated default model table — three rows still lagged** — S. `core/model-resolver.ts:35-38 @v0.85.1`:
+  `xai` grok-4.5→grok-4.6, `cerebras` zai-glm-4.7→gpt-oss-120b, `zai` glm-5.1→glm-5.3,
+  `zai-coding-cn` glm-5.1→glm-5.3. cyrup already knows — `cyrup-config/src/model/defaults.rs:24-37`
+  chases `xai` alone and documents in-source that the other three are blocked because the embedded
+  catalog carries no row for those ids. **Recorded so a later pass does not re-derive it, and so the
+  blocker (catalog refresh) is visible as the actual work**, not as a new finding. Both sides read.
+  *Lead against `CFG-019` / `CFG-041`.*
+
+### cyrup-side changes at `b28d3ff` with no ledger row
+
+- **`PI_*` environment aliases deleted workspace-wide** — S. Commit `dd44b3c` removed every
+  `first(&["CYRUP_X", "PI_X"])` dual-key lookup: `EnvVars` now reads CYRUP_-only for `offline`,
+  `skip_version_check`, `telemetry`, `cache_retention`, `clear_on_shrink`, `hardware_cursor`,
+  `session_dir`, `package_dir` (`cyrup-config/src/env.rs:123`); `ENV_AGENT_DIR_KEYS` dropped from 3
+  spellings to 2 (`paths.rs:335`); tests were flipped to assert the `PI_` spelling is inert; and
+  `cyrup_config::paths::cyrup_dir_from` was deleted outright. **No gap-analysis file was touched by
+  `dd44b3c`.** *Lead against `CFG-076`:* its CLOSED row (`05:593`) states verbatim that
+  `ENV_AGENT_DIR_KEYS` (`paths.rs:328-329`) "now lists all three spellings … in precedence order",
+  which is false at `b28d3ff` — the array is two entries and `PI_CODING_AGENT_DIR` is asserted inert
+  by a new test. **The consolidation that row closed still stands; only its evidence text is stale**,
+  and the row is left as it is. Whether the deletion is itself a divergence to file depends on an
+  owner decision the ledger has not recorded — `grep -rn 'R-07-028' docs/gap-analysis` is empty, so
+  the "migration fallback (R-07-028)" the code used to cite is unverifiable from this workspace.
+  Cyrup side read at `b28d3ff`.
+- **`xai` default chased to grok-4.6, with a named-exception test** — S.
+  `cyrup-config/src/model/defaults.rs:33`, CHASED/DEFERRED arrays at `:320-327`, plus a catalog guard
+  asserting every curated default resolves inside its provider's catalog. Two ledger assertions go
+  stale as a result: (a) `CFG-019`/`CFG-041`'s closures and `05:802` pin the map to "pi v0.84.1's 40
+  entries key-for-key", which is no longer the assertion the code makes; (b) `PROV-054`'s CLOSED row
+  (`01:709`, `01:1920`) frames the grok-4.5 wire-API fix as being "on the default path" because
+  `CFG-045` makes grok-4.5 the xai default, and grok-4.5 is no longer the default. `catalog/xai.json`
+  at `b28d3ff` has grok-4.3, grok-4.5 and grok-4.6 all `openai-responses`, **so `PROV-054`'s substance
+  survives — only its default-path framing is stale.** The v0.85.1 upstream line was not read from
+  the pi clone; it is the code comment's claim.
+- **`AppMode::Acp` and `decide_trust` gated on a new `can_prompt`** — S. `cyrup-config/src/trust.rs`:
+  a five-variant `AppMode`, `is_interactive` split into `is_interactive` + `can_prompt`, step 5 now
+  `input.mode.can_prompt()`, with a written CYRUP-DELTA (pi-acp spawns `pi --mode rpc` so every
+  untrusted project resolves Untrusted, whereas cyrup's in-process ACP host prompts). Area 15 owns the
+  variant itself (`ACP-002`, `15:277/314/328`). **What area 15 does not own is the knock-on:**
+  `R-07-009`'s "only interactive mode may prompt" rule is quoted in this file's and area 08's trust
+  prose, and `AppMode` is now 5-valued for every exhaustive match in 05/08/10.
+  `grep -rn 'R-07-009' docs/gap-analysis` returns zero, so the rule the code cites has no ledger text
+  to check against. Cyrup side read at `b28d3ff`.
+
+---
+
+## Audit history — everything from here down predates 2026-09-14
+
+Unchanged. Each block below records what somebody actually read at the time and is correct as
+history; the provenance block at the top of this file says how stale that makes it. The
+`## Open items` table further down remains the authority for what is open in this area — the census
+above opened nothing, closed nothing and re-severitied nothing.
 
 > **Re-audited 2026-08-12, cyrup HEAD `04c1ba2`** (working tree clean; `a9000b1` is docs-only), against
 > **pi v0.83.0** for parity and **pi v0.84.1** for version lag. **16 items left the open set**
@@ -253,10 +434,10 @@ Covers `cyrup/crates/cyrup-config` (settings, auth store, trust, model resolutio
 > **Findings from the same sweep that got no new id, and why** — recorded so nobody re-derives them:
 > `markdown.mermaid` → `CFG-040`; the deep-merge recursion depth → `CFG-012` (**superseded**; upstream
 > moved TO cyrup's behaviour — do not "fix" it); `PI_TUI_WRITE_LOG` → `TUI-040`;
-> `PI_SHARE_VIEWER_URL` → `TUI-063`; `SystemRoot` / `WINDIR` → `12-upstream-drift-pi-core.md:1075`
+> `PI_SHARE_VIEWER_URL` → `TUI-063`; `SystemRoot` / `WINDIR` → `12-upstream-drift-pi-core.md:1294`
 > (the `ensureTool` N/A); `LLAMA_BASE_URL` / `HF_HOME` / `HF_TOKEN_PATH` → `EXT-027`;
 > `PI_CONFIG_DIR` / `PI_SERVER_DIR` / `PI_RADIUS_URL` / `PI_RADIUS_SERVER_URL` →
-> `12-upstream-drift-pi-core.md:1073` (`packages/server` is outside the dependency closure);
+> `12-upstream-drift-pi-core.md:1292` (`packages/server` is outside the dependency closure);
 > `PNPM_HOME` → `SEAM-078`; the process-global `PI_CODING_AGENT` set → `TOOL-031` / `PARITY-GAPS`
 > PB-5; the `HTTP_PROXY` mechanism difference → `PROV-047`; the `NO_PROXY` case-folding "gap" →
 > **not a defect**, retired in `CFG-060`'s body; `CYRUP_SHELL` → **not a cyrup-original**, it is the
@@ -399,7 +580,7 @@ Covers `cyrup/crates/cyrup-config` (settings, auth store, trust, model resolutio
 | CFG-063 | low | not-ported | S | `PI_TUI_DEBUG` and `PI_DEBUG_REDRAW` — the two upstream render-debug env vars — have no counterpart, so the cursor/viewport bug class has no instrument — **filed 2026-08-14** (env-var surface). **FIX SITE: `crates/cyrup-tui` (area 07).** Sibling of `TUI-040`. |
 | CFG-064 | low | not-ported | S | `isWindowsTerminalSession()` is unported — `SSH_CLIENT` / `SSH_CONNECTION` / `SSH_TTY` are read nowhere — so Ctrl+Backspace degrades to Backspace on Windows Terminal, and the bug direction flips over SSH — **filed 2026-08-14** (env-var surface). **FIX SITE: `crates/cyrup-tui` (area 07).** |
 | CFG-065 | low | not-ported | S | `isWslEnvironment()` (`WSL_DISTRO_NAME` / `WSL_INTEROP`) and its git-HEAD polling fallback are unported, so the footer branch indicator goes stale on `/mnt/<drive>` repos where inotify never fires — **filed 2026-08-14** (env-var surface). **FIX SITE: `crates/cyrup-tui` (area 07).** |
-| CFG-066 | low | not-ported | S | The clipboard backend's two load gates — `TERMUX_VERSION` and `hasDisplay` (`DISPLAY` / `WAYLAND_DISPLAY`) — are unported, so the backend is attempted unconditionally on headless Linux and under Termux — **filed 2026-08-14** (env-var surface). Distinct from the known clipboard-TEXT gap at `12-upstream-drift-pi-core.md:820-828`. **STILL OPEN 2026-09-04 — NOT closed by adjacent new work, stated so it is not mistaken for done:** `crates/cyrup-tui/src/clipboard.rs` is new since the baseline (a full port of pi's `copyToClipboard` write chain) and DOES read `TERMUX_VERSION`/`WAYLAND_DISPLAY`/`DISPLAY` (`ClipboardEnv::from_process`, `clipboard.rs:79-88`) — but only to pick which platform CLI to shell out to (`clipboard_write_plan`), the port of `clipboard.ts:104-160`. It does not gate whether the **native** backend (`arboard`) is constructed at all, which is this item's actual claim (pi `clipboard-native.ts:31`'s `loadClipboardNative()` guard) — `crates/cyrup-tui/src/app/event_extract.rs:106` still calls `arboard::Clipboard::new()` unconditionally for the Ctrl+V image-paste read path, with no Termux/headless-Linux gate. Different upstream file, different cyrup call site; this row is unaffected by the write-chain port. |
+| CFG-066 | low | not-ported | S | The clipboard backend's two load gates — `TERMUX_VERSION` and `hasDisplay` (`DISPLAY` / `WAYLAND_DISPLAY`) — are unported, so the backend is attempted unconditionally on headless Linux and under Termux — **filed 2026-08-14** (env-var surface). Distinct from the known clipboard-TEXT gap at `12-upstream-drift-pi-core.md:1039-1047`. **STILL OPEN 2026-09-04 — NOT closed by adjacent new work, stated so it is not mistaken for done:** `crates/cyrup-tui/src/clipboard.rs` is new since the baseline (a full port of pi's `copyToClipboard` write chain) and DOES read `TERMUX_VERSION`/`WAYLAND_DISPLAY`/`DISPLAY` (`ClipboardEnv::from_process`, `clipboard.rs:79-88`) — but only to pick which platform CLI to shell out to (`clipboard_write_plan`), the port of `clipboard.ts:104-160`. It does not gate whether the **native** backend (`arboard`) is constructed at all, which is this item's actual claim (pi `clipboard-native.ts:31`'s `loadClipboardNative()` guard) — `crates/cyrup-tui/src/app/event_extract.rs:106` still calls `arboard::Clipboard::new()` unconditionally for the Ctrl+V image-paste read path, with no Termux/headless-Linux gate. Different upstream file, different cyrup call site; this row is unaffected by the write-chain port. |
 | CFG-067 | ~~medium~~ medium — **PARTIALLY CLOSED 2026-09-04, NARROWED AGAIN 2026-09-05** | not-ported | M | Twelve `pi-subagents` env vars have no `CYRUP_` counterpart — three of them are budget/ceiling caps and one is a security kill switch — **NARROWED 2026-09-04: nine of twelve remain unported; three landed since this row was filed.** `git log 4fb5e40..HEAD -- crates/cyrup-ext-subagents` surfaced work that ports `PI_SUBAGENT_STEER_CAPABILITY` and `PI_SUBAGENT_STEER_ACK_DIR` verbatim (`crate::prompt_runtime::STEER_CAPABILITY_ENV` / `STEER_ACK_DIR_ENV`, consumed in `exec/agent_config.rs`, `exec/spawn_plan.rs`) and `PI_SUBAGENT_CAPABILITY_CEILING_V1` — one of the three named budget/ceiling caps — as `crate::exec::capability_ceiling::CAPABILITY_CEILING_ENV = "CYRUP_SUBAGENT_CAPABILITY_CEILING_V1"`, with the PI spelling honoured as a read-side compat alias (`CAPABILITY_CEILING_ENV_PI_ALIAS`, `capability_ceiling.rs:60-64`, `:424-425`). `grep -rn` for the remaining nine spellings (`TOOL_TIMEOUT_MS`, `TASK_DELIVERY`, `RUN_FANOUT_BUDGET`, `MAX_SPAWNS_PER_RUN`, `TOOL_BUDGET_ZERO_AUTH`, `ASYNC_EVENTS_MAX_BYTES`, `RUNTIME_ACKNOWLEDGED_EXTENSIONS`, `LLM_INTENT_ARBITER`, `PACKAGE_ROOT`) across `crates/cyrup-ext-subagents/src` and `crates/cyrup-intercom/src` still returns nothing — this row stays open for those nine. **FIX SITE: `crates/cyrup-ext-subagents` (area 09); this row exists so the enumeration is not lost while area 09 has no item for any of them.** **PARTIALLY CLOSED 2026-09-04 — commit `91ca02e` (`feat(subagents): CFG-067 …`), three of the nine ported, six re-scoped; the row stays OPEN at medium for the six.** Ported, each at pi-subagents **v0.64.0** (ADR-0006 latest tag) with a `CYRUP_` spelling and — where an operator sets it — the `PI_` spelling as read-side alias: **(1)** `PI_SUBAGENT_TASK_DELIVERY` (`runs/shared/pi-args.ts:76-102`, consumed `:822`; new at v0.48.0, `darwin` leg at v0.63.0) → `crates/cyrup-ext-subagents/src/spawn/mod.rs` `TASK_DELIVERY_ENV` / `TaskDelivery` / `resolve_task_delivery` / `should_deliver_task_via_file` / `ChildSpawnSpec::resolve_task_arg_with`, the shell `resolve_task_arg` reading env + `cfg!(target_os = "macos")`; **(2)** `PI_SUBAGENT_TOOL_BUDGET_ZERO_AUTH` (`runs/shared/tool-budget.ts:5,16-24,74-80`; child read `subagent-prompt-runtime.ts:693`; parent write `pi-args.ts:1032`) → `exec/tool_budget.rs` `TOOL_BUDGET_ZERO_AUTH_ENV` / `HardMinimum::{One,Zero}` / `HardMinimum::from_env` / `validate_tool_budget_config_with` / `decode_tool_budget_env(value, minimum)`, wired at the child-side decode in `prompt_runtime.rs` (`HardMinimum::from_env(get)`) — **security note (review 2026-09-04):** with the gate ported, the pre-existing decode-error policy in `prompt_runtime.rs` (a malformed `CYRUP_SUBAGENT_TOOL_BUDGET` payload is `tracing::warn`ed and DROPPED, the child runs UNBUDGETED) now also covers an UNAUTHORISED `{"hard":0}` — upstream's `decodeToolBudgetEnv` throws out of module init and the child never starts (`tool-budget.ts:74-80`), cyrup starts it with no budget at all. Pre-existing divergence (the parent is the only writer, so it needs a tampered environment), recorded here as the security-relevant half of it; `prompt_runtime::tests::a_zero_budget_is_honoured_only_with_the_parents_authorisation` pins the current behaviour; **(3)** `PI_SUBAGENT_ASYNC_EVENTS_MAX_BYTES` (`runs/background/subagent-runner.ts:306-324`; v0.31.0) → `background/runner_main.rs` `ASYNC_EVENTS_MAX_BYTES_ENV` / `resolve_async_events_cap_bytes`, and `open_run_events` now opens `events.jsonl` through `BoundedJsonlWriter::create_with_cap` with it (it called `create`, which has no cap input, before). Tests: `spawn::tests::{task_delivery_is_file_only_for_the_trimmed_lowercased_word_file, the_pi_alias_is_consulted_only_when_the_cyrup_spelling_is_unset, should_deliver_task_via_file_has_upstreams_three_legs, file_delivery_spills_even_a_short_task, macos_spills_every_task_regardless_of_length_or_env}`, `exec::tool_budget::tests::{a_zero_hard_budget_is_rejected_unless_the_parent_authorised_it, zero_authorisation_requires_the_exact_string_one, a_zero_budget_blocks_the_first_browsing_call}`, `prompt_runtime::tests::a_zero_budget_is_honoured_only_with_the_parents_authorisation`, `background::runner_main::async_events_cap_tests::{the_cap_override_follows_pis_number_coercion, the_pi_alias_is_consulted_only_when_the_cyrup_spelling_is_unset}`; crate suite 2679/2679. **Still open — six, each re-derived at v0.64.0 in the detail section:** `TOOL_TIMEOUT_MS`, `RUN_FANOUT_BUDGET`, `MAX_SPAWNS_PER_RUN`, `RUNTIME_ACKNOWLEDGED_EXTENSIONS`, `LLM_INTENT_ARBITER` — every one names a MECHANISM cyrup lacks (a per-tool child timeout, a run-fan-out claims ledger, an extension-acknowledgement protocol, an LLM intent arbiter), so a bare env constant would be a knob wired to nothing — and `PI_CODING_AGENT_PACKAGE_ROOT`, which is **inapplicable** (Node package-root resolution; cyrup's child is the `cyrup` binary via `CYRUP_SUBAGENT_BINARY`). **Cross-ref 2026-09-04 (batch-2 ledger audit):** the unauthorised-`{"hard":0}` decode-drop divergence this row records (child runs UNBUDGETED where pi's child refuses to start) is now its own row, `CFG-080` (low), so the census counts it — **`CFG-080` CLOSED 2026-09-04 at `9a7c0fdb`: the decode error is refused rather than dropped, so the description of the drop policy earlier in this row is history, not HEAD.** **NARROWED AGAIN 2026-09-05 — commits `063cfe6f` + `5a4d456e`, two of the six remaining ported, so this row is now open for FOUR.** The two that landed are the pair the 2026-09-04 disposition table had blocked on ONE missing mechanism: `RUN_FANOUT_BUDGET` ("Porting the var without the ledger is impossible") and `MAX_SPAWNS_PER_RUN` ("deliberately not ported ahead of the ledger"). `063cfe6f` ports the ledger — the whole of pi-subagents **v0.64.0** `src/runs/shared/run-fanout-budget.ts` as `crates/cyrup-ext-subagents/src/exec/run_fanout_budget.rs`: `RunFanoutBudgetDescriptor`/`Snapshot`/`Rejection` (`shared/types.ts:760-778`), `create_run_fanout_budget_in` (`:79-89`, the `0o700` ledger dir + exclusive `manifest.json` + `safeRootRunId`'s `[^A-Za-z0-9._-] -> _` scrub at `:40-42`), `validate_run_fanout_budget_descriptor_in` (`:91-106`, incl. `validateDirectory`'s canonicalising managed-root containment check `:65-77`), read/write/encode/decode of the descriptor (`:108-136`, base64url being the spawn-boundary form), `run_fanout_budget_snapshot_in` (`:209-213`) over `claimCount`'s `/^\d{6}\.json$/` slots (`:200-207`), `claim_run_fanout_batch_in`/`_with_commit_in` (`:220-272`) — all-or-nothing admission under `withAdmissionLock` (`:168-198`: exclusive-`mkdir` lock, `owner.json`, pi's `[10,25,50,100,200,500,1000,2000,4000]` ladder, stale-owner reclaim gated on a `kill(pid, 0)` liveness probe `:156-166`, token-checked release) — and the two verbatim formatters (`:274-280`); plus `MAX_SPAWNS_PER_RUN_ENV = "CYRUP_SUBAGENT_MAX_SPAWNS_PER_RUN"` (+ the `PI_` spelling as a read-side alias) and `resolve_max_spawns_per_run` from `shared/types.ts:2807-2818`. `5a4d456e` gives both vars the operator-visible consumer this row's `Verify` clause names: pi `formatRunFanoutSection` (`extension/doctor.ts:180-193`) as `RunFanoutDoctor` + `MaxSpawnsPerRunSource`, rendered as `buildDoctorReport`'s `"Run fan-out budget"` block (`:256-258`) by `registration/doctor.rs`, and `SubagentExtensionConfig.max_subagent_spawns_per_run` (pi `ExtensionConfig.maxSubagentSpawnsPerRun?`, `shared/types.ts:2550`) as the resolver's middle rung. **Deltas, each at its match site:** `RunFanoutLimitError` (a subclass callers `instanceof`) becomes the `RunFanoutError::{Limit, Invalid}` enum; `process.kill(pid, 0)` becomes `nix::sys::signal::kill(pid, None)` (`#![forbid(unsafe_code)]`), `EPERM` still meaning alive; the retry ladder is upstream's UNCLAMPED base, since `PI_SUBAGENT_FS_RETRY_MAX_TOTAL_MS` is not one of this row's twelve names; every filesystem root is a parameter of an `_in` function so no rule reads the process environment or the real temp root. **Asymmetry worth naming:** `0` means UNLIMITED on the per-SESSION cap and means "fall through to the next rung" on the per-RUN one — upstream's, via `normalizeMaxSubagentSpawnsPerRun`'s `> 0` filter, documented now at both resolvers. Tests: 27 in `exec::run_fanout_budget::tests` plus the `Run fan-out budget` assertions in `registration::doctor::tests::build_doctor_report_has_four_filesystem_dirs_and_per_source_counts`; RED established by mutation (eight rules replaced with their plausible naive forms across the two commits, nine tests failing and all passing after). `cargo nextest run -p cyrup-ext-subagents` 2833/2833; clippy `--all-targets -D warnings` and `RUSTDOCFLAGS='-D warnings' cargo doc --no-deps` clean. **Still open — four:** `TOOL_TIMEOUT_MS` (needs the `effectiveToolTimeoutMs` / `DEFAULT_FAST_TOOL_TIMEOUT_TOOLS` subsystem and its parent-side per-tool-call timer, `runs/shared/tool-timeout.ts` + `foreground/execution.ts:1316-1333`, still absent), `RUNTIME_ACKNOWLEDGED_EXTENSIONS` and the parent-side WRITER of `TOOL_BUDGET_ZERO_AUTH` (both **SUBA-063**'s, owned there), and `LLM_INTENT_ARBITER` (needs a model-backed `createTaskMutationArbiter` to switch off; cyrup has only the heuristic `exec/task_intent.rs::classify_task_mutation_intent`). `PI_CODING_AGENT_PACKAGE_ROOT` remains **inapplicable**, recorded not ported. **RESIDUALS of this pass (each low, none blocking):** the ledger is not yet CREATED or CLAIMED against on any live run path — no executor entry calls `create_run_fanout_budget`, `spawn_plan.rs` does not yet write `RUN_FANOUT_BUDGET_ENV` into the fan-out-authorized child overlay (pi `pi-args.ts:942-943`), and no dispatch calls `claim_run_fanout_batch_in` (pi `subagent-executor.ts:6477`, `:5229`, `background/subagent-runner.ts:3991`); the mechanism and its doctor surface exist, the enforcement wiring is the next slice and needs an area-09 item. **The doctor block now SAYS so (batch-4 review, `RunFanoutDoctor::lines`):** it renders a `[CYRUP-DELTA]` line — *"- enforcement: NOT WIRED — no run creates or claims against this budget yet, so the limit above is reported but not applied"* — because until that slice lands `- configured limit: 64 (default)` describes a cap no run applies and `- usage: available after a run starts` can never become true, which is exactly the "misleading doctor surface" this row's own 2026-09-04 disposition refused to ship the resolved number ahead of. Disclosing it in the ledger alone is not disclosing it to the operator reading `/subagents-doctor`. Two defects in the same pass's own output were fixed with it: `with_admission_lock` released the lock on a straight-line statement, so a panic in the caller-supplied `commit` closure of `claim_run_fanout_batch_with_commit_in` leaked `admission.lock` under a LIVE pid — never reclaimed by `admission_lock_is_stale`, so every later admission for that run timed out — where upstream releases in a `finally` (`run-fanout-budget.ts:201-204`); it is a drop guard now, pinned by `a_panic_inside_the_commit_closure_still_releases_the_admission_lock` (RED without the guard). And `lines()` degraded the usage line to EMPTY via `strip_prefix(...).unwrap_or_default()` if the formatter's prefix ever changed; it degrades to the whole sentence now. Also unported with it: pi's `Spawn budget` doctor section (the per-session budget IS ported, only its doctor block is not), the `SteeringRecoveryDescriptor.runFanoutBudget` recovery leg, and `PI_SUBAGENT_FS_RETRY_MAX_TOTAL_MS`'s clamp on the shared retry ladder. **UNFIXED AT MERGE, caught by the batch-4 regression gate after the review round closed and recorded rather than filed:** the CLAIM rollback in the same function (`run_fanout_budget.rs:888-902`) got none of the panic-safety the LOCK got — it rolls back only under `if outcome.is_err()`, so a panicking (or inner-`Err`-returning) `commit` permanently burns the batch's slots where upstream's `catch` at `run-fanout-budget.ts:257-262` unlinks them, and `033e8c79`'s own test asserts the divergent `used == 2` (upstream: 1) as correct. See the detail block. |
 | CFG-068 | medium | cyrup-original | S | `CYRUP_HOME` is invented, live in shipped builds, and takes precedence over `$HOME` at four sites at once — undocumented in `--help` and described in-source as a test knob — **filed 2026-08-14** (env-var surface). Needs an owner decision: promote it or confine it to test builds. **STILL OPEN 2026-09-04, no owner decision made:** `3f9380f` consolidated the mechanism into one place (`cyrup_config::paths::ENV_HOME` / `cyrup_home_dir_from`, `crates/cyrup-config/src/paths.rs:320`), but its own doc comment still reads *"Nothing in this workspace sets it outside tests, where it is the sandbox lever that keeps a run's artifacts out of the developer's real home"* — i.e. still live in production code, still not `#[cfg(test)]`-gated, and `grep -rn CYRUP_HOME crates/cyrup/src` is still zero, so `--help` still does not document it. The row's underlying claim is unchanged; only its citation moved. |
 | ~~CFG-069~~ | ~~low~~ **CLOSED 2026-08-15** | cyrup-original | S | `AI_AGENT` is written into every bash and subagent child; the KEY does not exist at the ported tag (it is a v0.84.1 addition) and the `[CYRUP-DELTA]` lines flag only its VALUE — **CLOSED 2026-08-15, and the row was HALF DONE when it reached this pass.** Upstream re-derived at both tags: `git -C pi grep -n 'AI_AGENT' v0.83.0 -- packages/` → 0 hits, and `git show v0.83.0:.../cli.ts` line 13 is `process.env.PI_CODING_AGENT = "true";` with nothing after it, while v0.84.1's `cli.ts:14` adds `process.env.AI_AGENT = "pi";`. Of the three sites the row names, **`crates/cyrup-session-svc/src/bash.rs` was already fixed in batch B** (delta at `:164-172`, test `the_forward_ported_ai_agent_marker_names_its_key_and_its_tag`) and the row did not say so. The other two landed here: `crates/cyrup-tools/src/tools/bash.rs` (delta above the `env.push`, test `cfg069_the_bash_tool_delta_names_the_forward_ported_key_and_its_tag` in `src/tests/bash_session_env.rs`) and `crates/cyrup-ext-subagents/src/exec/mod.rs` (delta above the `env_overlay.insert`, test `cfg069_the_spawn_overlay_delta_names_the_forward_ported_key_and_its_tag`). All three deltas now name the KEY, the tag it comes from (`@v0.84.1`) and its ABSENCE at `v0.83.0`; each test slices the source between the last `[CYRUP-DELTA` marker and the write itself, so prose elsewhere in the file cannot satisfy it — `CYRUP-DELTA` is the grep the parity sweeps run. Each also asserts `PI_CODING_AGENT` is still written beside it, so the test cannot be satisfied by deleting the forward-ported marker. **Taken deliberately as a recorded forward-port, not pinned to a v0.84.1 uplift item** — the marker is how a hook or script tells an agent shell from a human one, and removing it would leave the uplift with a hole. **Site count corrected: the fix spans three crates, not the one this slice was routed for (`cyrup-tools`).** |
@@ -568,7 +749,7 @@ Covers `cyrup/crates/cyrup-config` (settings, auth store, trust, model resolutio
 
 **Kind** not-ported · **Severity** medium · **Effort** S · **Confidence** confirmed
 
-**cyrup** — `crates/cyrup/src/migrations.rs:26-36` `run_migrations` makes exactly four calls — `migrate_auth_to_auth_json` (`:27`), `migrate_sessions_from_agent_root` (`:28`), `migrate_tools_to_bin` (`:29`), `migrate_extension_system` (`:30`). Re-read at HEAD in this pass; there is no keybindings step. The only justification is the in-source comment at `migrations.rs:9-10` — "The keybindings-config migration is intentionally NOT ported here: cyrup's keybindings store (`cyrup-tui`) has no legacy on-disk shape to migrate from" — which is the self-certifying kind `docs/gap-analysis/README.md:208-212` says must not be treated as a decision of record, and which is **factually wrong about the read path as well**. The read path is `crates/cyrup/src/main.rs:1622-1629` (reads `<agent_dir>/keybindings.json`) → `crates/cyrup-tui/src/app/shell.rs:159-172` (the pre-split file cited this as lines 951-963) `load_keybindings_json` → six `merge_json` calls; `crates/cyrup-tui/src/keymap.rs:487-493` is `for (id, value) in keybindings_object(json)? { if let Some(action) = Action::from_id(&id) { … } }`, so an unrecognised id is dropped with **no diagnostic**. `grep -n migrat crates/cyrup-tui/src/{keymap,app,editor}.rs` returns zero; no alias table exists anywhere in the crate.
+**cyrup** — `crates/cyrup/src/migrations.rs:26-36` `run_migrations` makes exactly four calls — `migrate_auth_to_auth_json` (`:27`), `migrate_sessions_from_agent_root` (`:28`), `migrate_tools_to_bin` (`:29`), `migrate_extension_system` (`:30`). Re-read at HEAD in this pass; there is no keybindings step. The only justification is the in-source comment at `migrations.rs:9-10` — "The keybindings-config migration is intentionally NOT ported here: cyrup's keybindings store (`cyrup-tui`) has no legacy on-disk shape to migrate from" — which is the self-certifying kind `docs/gap-analysis/README.md:251-255` says must not be treated as a decision of record, and which is **factually wrong about the read path as well**. The read path is `crates/cyrup/src/main.rs:1622-1629` (reads `<agent_dir>/keybindings.json`) → `crates/cyrup-tui/src/app/shell.rs:159-172` (the pre-split file cited this as lines 951-963) `load_keybindings_json` → six `merge_json` calls; `crates/cyrup-tui/src/keymap.rs:487-493` is `for (id, value) in keybindings_object(json)? { if let Some(action) = Action::from_id(&id) { … } }`, so an unrecognised id is dropped with **no diagnostic**. `grep -n migrat crates/cyrup-tui/src/{keymap,app,editor}.rs` returns zero; no alias table exists anywhere in the crate.
 
 **upstream** — `pi/packages/coding-agent/src/migrations.ts:312` @v0.83.0 — `migrateKeybindingsConfigFile();`, the fourth of five calls in `runMigrations` (`:305-315`). Body at `:157-174`: read `<agentDir>/keybindings.json`, call `migrateKeybindingsConfig`, and if `migrated` write it back as `${JSON.stringify(config, null, 2)}\n`. `pi/packages/coding-agent/src/core/keybindings.ts:209-269` holds `KEYBINDING_NAME_MIGRATIONS` — **59** legacy→modern entries (the critique's "~30" undercounts): 21 → `tui.editor.*` (`cursorUp` → `tui.editor.cursorUp`, `:210`), 4 → `tui.input.*`, 6 → `tui.select.*`, 28 → `app.*` (`interrupt` → `app.interrupt` `:241`, `deleteSessionNoninvasive` → `app.session.deleteNoninvasive` `:268`). `migrateKeybindingsConfig` (`:289-309`) also **drops** a legacy key when its modern twin is already present (`:301-304`) and reorders through `orderKeybindingsConfig` (`:311-327`). It is applied a **second** time on every read at `keybindings.ts:366` inside `loadFromFile` (`:363-367`), which both `KeybindingsManager.create` (`:348-352`) and `reload()` (`:354-357`) go through. Both files are byte-identical at v0.83.0 and v0.84.1, so this is a baseline miss, not drift.
 
@@ -1307,7 +1488,7 @@ Covers `cyrup/crates/cyrup-config` (settings, auth store, trust, model resolutio
 
 **cyrup** — no `isWslEnvironment` and no `WSL_*` read anywhere.
 
-**Impact** — pi POLLS git HEAD instead of relying on filesystem watch events specifically when a repo sits on a 9p `/mnt/<drive>` mount under WSL, because inotify does not fire there. Without it the footer's branch indicator goes stale after a checkout for exactly the users the fallback was added for. `WSL_INTEROP` is filed alongside `WSL_DISTRO_NAME` because WSL2 sets it even when `WSL_DISTRO_NAME` is scrubbed. `12-upstream-drift-pi-core.md:1061` records `footer-data-provider.ts` as read first-hand — this predicate was not carried across.
+**Impact** — pi POLLS git HEAD instead of relying on filesystem watch events specifically when a repo sits on a 9p `/mnt/<drive>` mount under WSL, because inotify does not fire there. Without it the footer's branch indicator goes stale after a checkout for exactly the users the fallback was added for. `WSL_INTEROP` is filed alongside `WSL_DISTRO_NAME` because WSL2 sets it even when `WSL_DISTRO_NAME` is scrubbed. `12-upstream-drift-pi-core.md:1280` records `footer-data-provider.ts` as read first-hand — this predicate was not carried across.
 
 **Fix** — **FIX SITE: `crates/cyrup-tui` (area 07), in the footer data provider.** Port both halves — the env predicate and the `/mnt/<drive>` path test — and switch the branch source to polling when both hold.
 
@@ -1321,7 +1502,7 @@ Covers `cyrup/crates/cyrup-config` (settings, auth store, trust, model resolutio
 
 **cyrup** — no `TERMUX_*` read anywhere; `grep -rn '"DISPLAY"' crates --include='*.rs'` → 0.
 
-**Impact** — upstream refuses to even LOAD the native clipboard module under Termux (where the prebuilt `.node` cannot load and the require throws at import time) or on headless Linux (CI, ssh without X forwarding, a container). cyrup attempts the backend unconditionally. **Adjacent to but distinct from** the known clipboard-text gap at `12-upstream-drift-pi-core.md:820-828`, which is about READING text; this is about whether the backend is loaded at all. Note `12-upstream-drift-pi-core.md:822` already cites `WAYLAND_DISPLAY` for the v0.84.1 `wl-paste` TEXT-read branch (`clipboard.ts:54`) — a different call site at a different tag; the v0.83.0 `hasDisplay` gate is unfiled.
+**Impact** — upstream refuses to even LOAD the native clipboard module under Termux (where the prebuilt `.node` cannot load and the require throws at import time) or on headless Linux (CI, ssh without X forwarding, a container). cyrup attempts the backend unconditionally. **Adjacent to but distinct from** the known clipboard-text gap at `12-upstream-drift-pi-core.md:1039-1047`, which is about READING text; this is about whether the backend is loaded at all. Note `12-upstream-drift-pi-core.md:1041` already cites `WAYLAND_DISPLAY` for the v0.84.1 `wl-paste` TEXT-read branch (`clipboard.ts:54`) — a different call site at a different tag; the v0.83.0 `hasDisplay` gate is unfiled.
 
 **Fix** — gate the clipboard backend's construction on the same two predicates before any platform call is attempted.
 
@@ -1484,7 +1665,7 @@ Covers `cyrup/crates/cyrup-config` (settings, auth store, trust, model resolutio
 
 **upstream** — `pi/packages/coding-agent/src/extensions/llama/huggingface.ts:53` reads it to locate `$XDG_CACHE_HOME/huggingface/token`.
 
-**Impact** — the NAME exists on both sides for unrelated purposes, so a name-only diff scores it as parity while cyrup simultaneously (a) has a cyrup-original use of it and (b) is missing pi's use of it. pi's use belongs to the llama.cpp gap already owned by `EXT-027` (`06-cyrup-ext.md:601`) with `DRIFT-032` (`12-upstream-drift-pi-core.md:712`) as tracker; the cyrup-original use is filed here.
+**Impact** — the NAME exists on both sides for unrelated purposes, so a name-only diff scores it as parity while cyrup simultaneously (a) has a cyrup-original use of it and (b) is missing pi's use of it. pi's use belongs to the llama.cpp gap already owned by `EXT-027` (`06-cyrup-ext.md:734`) with `DRIFT-032` (`12-upstream-drift-pi-core.md:931`) as tracker; the cyrup-original use is filed here.
 
 **Fix** — none required for the cyrup side; record the double meaning so neither direction is closed by the other. Note the adjacent grep trap `DRIFT-032` already warns about at `12-…:725`: `HF_TOKEN` appears as a literal in cyrup, but only as a provider-catalog name, never as a token-file search path.
 
@@ -1599,7 +1780,7 @@ Covers `cyrup/crates/cyrup-config` (settings, auth store, trust, model resolutio
 
 **Impact** — **maximally reachable, and load-bearing for a shipped surface.** It changes the name of every prompt template on every session start for every user, and `crates/cyrup-flux` depends on it outright: flux contributes its prompts as a **directory** rather than as files precisely so the namespace survives, and the in-source comment at `crates/cyrup-flux/src/extension.rs:128-131` states the dependency verbatim — *"This one line is why `/flux/new` is `/flux/new` and not `/new`."* **Under pi's rule the fifteen `/flux/*` commands do not flatten — they VANISH**: `bundled_prompts_dir()` (`crates/cyrup-flux/src/resources.rs:27-29`) contributes `<resources>/prompts`, whose only child is the directory `flux/`, so a non-recursive `readdirSync` of it finds no `.md` at all and registers nothing. The five `_docs/*.md` files one level deeper are the skip rule earning its keep in the same tree: without the `_`-prefix refusal cyrup would register `/flux/_docs/README`, `/flux/_docs/pipeline`, `/flux/_docs/synopsis`, `/flux/_docs/about` and `/flux/_docs/cheatsheet` as commands. Left untracked, the failure mode is not a missed defect but an *inflicted* one: a surface sweep reading `prompt-templates.ts:136` sees "(non-recursive)" in the docstring, files the recursion as drift, and removes it.
 
-**Fix** — none. This row IS the fix; it exists so the divergence is a decision of record rather than an unexplained branch, which is the same job `CFG-070` does for the credential-resolver env names. **One real residual, and it is documentation-only:** six source sites cite `spec/namespaced-prompt-templates.md` as the governing spec (`discovery.rs:1753`, `:1759`; `prompt.rs:15`, `:34`, `:57`; `tests/resources/prompt_namespaces.rs:14`) and **that file is not in `spec/`** — `spec/flux.md:62-63` already notes the absence in passing. Either write it or re-point the six citations at this row; a `[CYRUP-DELTA]` whose authority is a file nobody can read is the shape `docs/gap-analysis/README.md:719-721` says to treat as an unverifiable claim rather than a decision of record.
+**Fix** — none. This row IS the fix; it exists so the divergence is a decision of record rather than an unexplained branch, which is the same job `CFG-070` does for the credential-resolver env names. **One real residual, and it is documentation-only:** six source sites cite `spec/namespaced-prompt-templates.md` as the governing spec (`discovery.rs:1753`, `:1759`; `prompt.rs:15`, `:34`, `:57`; `tests/resources/prompt_namespaces.rs:14`) and **that file is not in `spec/`** — `spec/flux.md:62-63` already notes the absence in passing. Either write it or re-point the six citations at this row; a `[CYRUP-DELTA]` whose authority is a file nobody can read is the shape `docs/gap-analysis/README.md:719-764` says to treat as an unverifiable claim rather than a decision of record.
 
 **Verify** — already pinned, and no test-coverage sub-gap should be filed against this: nine `npt_*` cases in `crates/cyrup-resources/src/tests/resources/prompt_namespaces.rs` cover name derivation and expansion (`:25`), the dir-names-only skip rules (`:81`), the depth cap warning once per refused dir (`:115`), symlink policy (`:167`), `load_with_root` derivation edges (`:217`) and its non-UTF-8 component error (`:285`), load-error-becomes-warning (`:312`), precedence shadowing and case collision (`:344`), and — the one that guards the four call sites this row enumerates — `npt_all_directory_and_single_file_call_sites` (`:367`).
 

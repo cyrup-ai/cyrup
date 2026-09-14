@@ -8,6 +8,395 @@ reference client — drive cyrup over ACP JSON-RPC 2.0 on stdio. The editor send
 new tool tier or a new provider — it is a **fourth front-end** beside the TUI, `--mode rpc` and
 print/json, and everything below the front-end is the `AgentSession` those three already drive.
 
+> ### PROVENANCE CORRECTION 2026-09-14 — pins re-derived; this file was NOT re-read
+>
+> **Audited at (history — unchanged, and correct as written):** upstream `svkozak/pi-acp` **v0.0.33**.
+> Every `git -C tmp/pi-acp show v0.0.33:<path>` citation in this file records what somebody actually
+> read at that tag and **must not be rewritten**. The cyrup side was written as a **design**, against a
+> crate that did not exist; the `CORRECTED 2026-09-05` paragraph below amended that against `0aefd08` /
+> `ef4448d`.
+>
+> **Current pins:** `pi-acp` **v0.0.33** — **unchanged, re-checked**; still the newest tag, no new
+> upstream release, and `v0.0.33..HEAD` touches no `src/` path. **The upstream side of this file is not
+> stale.** cyrup code HEAD **`b28d3ff`** (README records `9aeba769` as the last CODE commit and
+> `824a539e` superseded; `9aeba769..b28d3ff` is docs-only).
+>
+> **Therefore unmeasured by this file: the cyrup side alone, `824a539e..b28d3ff`.** Six commits touch
+> `crates/cyrup-acp` in that range — `0aefd08`, `772ed8d`, `cb290d1`, `623afd3`, `8de7460`, `dd44b3c` —
+> and **three of them post-date the 2026-09-05 correction and are recorded nowhere in this directory.**
+> `cb290d1`'s own message is currently the only implementation-status record area 15 has, and it lives
+> in `git log`.
+>
+> **This correction re-read nothing.** No unit was re-verified, no severity re-derived, no row opened or
+> closed, no count changed. Only the pins moved, and the census below is a worklist of **UNVERIFIED
+> leads**.
+>
+> **The CORRECTED 2026-09-05 paragraph is itself now stale in three measurable ways**, recorded and not
+> applied: "12 modules, 18 043 lines" → **12 modules / 20 112 src lines**, plus **1 067 lines of
+> `tests/`** and 1 493 lines of `crates/cyrup-it/tests/bin/acp_{transport,session}.rs`; "216 unit tests"
+> → **243 inline + 8 in `tests/`**; and **its one surviving caveat is the one that is now false** — "the
+> tool-call streaming and structured-diff paths in particular are unit-tested but were never exercised
+> end to end (no credentials to complete a `session/prompt`)" was retired by `772ed8d`, which added
+> `crates/cyrup-acp/tests/end_to_end.rs` (a real `cyrup_acp::serve` over a `Lines` transport against
+> `FauxProvider` behind the real `AcpHost` trait, with `a_tool_calling_turn_streams_to_the_client` at
+> `:37` and `a_bash_call_streams_terminal_output` at `:223`) and `crates/cyrup-it/tests/bin/acp_session.rs:78`'s
+> offline `--model faux/faux-1 --offline` harness. **Any re-audit that trusts that caveat will re-file
+> ACP-128/131/135/139/140 as unverified.**
+>
+> Other upstream pins re-checked and unchanged: `pi-permission-system` v0.8.0, `pi-intercom` v0.13.0.
+> `pi` is now v0.85.1, `pi-subagents` v0.67.0 and `pi-mcp-adapter` v2.33.0 — none of them this area's
+> upstream.
+
+## UNVERIFIED census 2026-09-14 — leads against the current pins
+
+**Nothing in this section is a finding.** These are leads from a census pass that read
+`crates/cyrup-acp` at `b28d3ff` on the cyrup side and `pi-acp` at `v0.0.33` on the upstream side;
+nothing was built or run, and no `ACP-` id below is being re-rated. **No row in §6, no severity, no
+`verified`/`single-source` marking and no count elsewhere in this file was changed by this census.**
+Where a lead says one side was not read, that is literal.
+
+**Self-citations by line number in this section are omitted deliberately** — this block was inserted
+ahead of §1, so every `15-cyrup-acp.md:NNNN` offset the census recorded is shifted by its length.
+Sections are named instead.
+
+### The structural finding — this file has no status axis
+
+§6 opens "This table is the authority for what is open in area 15" and then lists all 150 units with
+`sev | id | title | eff | area | verification`. **There is no status column, so every one of the 150
+rows still reads as open work** in a crate that implements essentially all of them — including all 7
+criticals, each with a named guard: `ACP-057` `turn.rs:35`; `ACP-121` `turn.rs:35`; `ACP-145`
+`permission.rs:18`; `ACP-146` `permission.rs:284`; `ACP-209` `sessions.rs:860-895`; `ACP-219`
+`sessions.rs:2318-2335`; `ACP-291` `commands.rs:1103-1157`. **This is the single highest-value
+staleness in the area.** `L`
+
+Area 13 solved exactly this by splitting. The shape the census proposes, recorded as a lead:
+
+1. **Create `15-cyrup-acp-STATUS.md`** as the openness authority, mirroring `13-cyrup-mcp-STATUS.md`:
+   a Provenance block naming the audited upstream tag, the cyrup sha and the fact that nothing was
+   built or run; a census table; a per-area (4a–4e) rollup; a critical/high open-work section; and one
+   row per unit — `| id | sev | status | title | evidence-or-unmet-obligation |`.
+2. **Demote §6** to `## 6. Unit inventory`, keeping it as the authority for the inventory, the severity
+   scale and the `verified`/`single-source` provenance, with a pointer line to the STATUS file — exactly
+   as `13-cyrup-mcp.md`'s canonical table points at its STATUS file.
+3. **Give §5 a `decided` column** with the code cite per row (see below).
+4. **Strike or date-stamp §8.**
+5. **Open an id range for units the implementation filed** (the five `NEW` markers), the way `09a` got
+   its own id space.
+6. **Fix the README's four claims** and its `test/` file count in the same pass.
+7. **Reconcile the denominator** in the STATUS provenance: 150 live + 18 refuted = 168.
+
+**The status vocabulary must be wider than 13's.** The census found four outcomes `implemented` /
+`partial` / `missing` cannot express: `superseded` (the plan row was answered the other way),
+`built-unreachable` (the mechanism exists and is unit-tested; the behaviour has no live path),
+`built-by-absence` (`ACP-160`, whose deliverable was that a field NOT exist — `turn.rs:13` and
+`translate.rs:343` both assert it in prose, and without such a status it reads as missing forever), and
+`duplicate`.
+
+### Census result, and the cheapest way to re-run it
+
+Of the 150 live rows: **145 built** (many with a deliberate, marked divergence), **1 partial**
+(`ACP-294`), **2 built-unreachable** (`ACP-060`, `ACP-220`), **2 superseded** (`ACP-059`, `ACP-125`),
+plus `ACP-055` built under `ACP-014`'s id as a duplicate. **Exactly three ids appear nowhere in
+`crates/` — ACP-055, ACP-059, ACP-125 — and those are precisely the three rulings that are not
+"built".** That correspondence is the mechanical check for any re-audit:
+
+```
+comm -23 <(grep -o '^| ACP-[0-9]\{3\}' 15-cyrup-acp.md | sed 's/| //' | sort -u) \
+         <(grep -rho 'ACP-[0-9]\{3\}' crates/ --include='*.rs' | sort -u)
+```
+
+**Divergence here is deliberate, not drift.** 91 `CYRUP-DELTA` blocks across all 12 modules
+(commands.rs 18, sessions.rs 14, permission.rs 12, config_options.rs 10, turn.rs 9, ledger.rs 6,
+startup.rs 6, translate.rs 5, connection.rs 4, ids.rs 3, error.rs 2, lib.rs 2), each in the two-part
+"what differs / what it costs" form `lib.rs:100-104` prescribes. The census found **no divergence from
+the plan lacking a marker except `ACP-125`**, which is superseded silently — the shape the marker
+convention exists to prevent. One factual error inside a marker: `commands.rs:294-312` calls
+`/changelog` "a ninth command"; upstream `agent.ts:64-104` advertises **eight** and changelog is the
+eighth.
+
+### Rulings the current vocabulary cannot carry
+
+- **`ACP-059` — superseded by decision.** `S` — upstream `agent.ts:330-339` treats `rawModelsCount === 0`
+  as `authRequired` + `cleanupFailedNewSession`. `ACP-Q7` is decided the other way at
+  `sessions.rs:1997-2008`: a session with no resolvable model is **not** refused, because the `model`
+  config option is advertised on that very response and `--terminal-login` exists for the
+  credential-less first run. **The reversal is recorded under the QUESTION id and never under the unit
+  id**, so a grep for ACP-059 finds nothing and the row reads as unstarted. §5's ACP-Q7 row needs to
+  stop saying "unanswerable".
+- **`ACP-060` — built-unreachable.** `S` — `sessions.rs:2010-2030`. `decorate_new_session` returns `Ok`
+  on every path (it carries `#[allow(clippy::unnecessary_wraps)]`), so `new_session`'s `Err` arm and
+  `cleanup_failed_new_session` never run in production. The code states this and names what would make
+  it live: reversing ACP-Q7, a fallible `session_surface`, or any post-build validation.
+- **`ACP-220` — verify provably unsatisfiable while ACP-Q7 stands.** `S` — `sessions.rs:2011-2029` says
+  so outright. `purge_partial_session_file` exists and is tested
+  (`a_partial_session_file_is_purged_only_from_inside_the_sessions_root`), but its production caller
+  cannot be reached, so the tabled verify — "assert the file `session/new` created is gone" — is
+  unwritable. **A plan row whose verify is unsatisfiable is not a row a porter can close**; the STATUS
+  file should carry it as an unmet obligation.
+- **`ACP-125` — superseded by mechanism, with no written trace on either side.** `S` — upstream
+  `session.ts:317` / `:327` (`setStartupInfo` / `sendStartupInfoIfPending`, called from `agent.ts:370`
+  and `:393`). cyrup has no pending flag: `HandlerOutcome::with_follow_up` (`lib.rs:204-211`) carries
+  the prelude as a value drained exactly once by `respond_then_notify` (`:213-217`), so "call the send
+  twice; exactly one notification is enqueued" is **unexpressible rather than satisfied**. The one
+  supersession in the area with no `CYRUP-DELTA`; it should get one.
+- **`ACP-055` — duplicate of `ACP-014`.** `S` — the `authenticate` handler is registered inline at
+  `connection.rs:320-332` with the comment "`ACP-014` — a successful no-op". ACP-055 is a duplicate the
+  surveys filed twice into different areas (4a and 4b) and no adversary pass struck. Cheap, but it is
+  one of the three ids the code does not carry, so it reads as a gap in any mechanical census.
+- **`ACP-294` — the clearest partial in the area, with a named residual owed to another crate.** `S` —
+  `config_options.rs:122-146` declares `EMBEDDED_CONTEXT_ENV = "CYRUP_ACP_ENABLE_EMBEDDED_CONTEXT"` in
+  `cyrup-acp`, not in `cyrup_config::env_keys` where the unit asks for it, "because this crate cannot
+  add a constant to `cyrup-config` (that file belongs to another owner)", with the move filed as an
+  interface change. The half that matters (a pure, table-testable predicate taking the value as an
+  argument) is done. **Exactly the row an "unmet obligation" column exists for, and invisible today.**
+
+### Document-level staleness
+
+- **The README carries four surviving "not ported" claims about `pi-acp`.** `S` — `README.md:11-12`
+  ("Two more are TypeScript and **not** ported: `pi-mcp-adapter` (area 13) and `pi-acp` (area 15)"),
+  `:60` (area 15 "specifies code that does not exist yet"), `:129-130` ("which has also never been
+  ported"), and the baselines row at `:197` ("**not ported** — area 15 is the plan"), **stamped
+  "re-checked 2026-09-14"** — so the error is being actively refreshed rather than merely aging.
+  `git ls-tree -r 824a539e -- crates/cyrup-acp` is empty; the crate is net-new from `0aefd08`. The same
+  row also still says "3 265 lines of `test/` across 25 files" where this file's own provenance block
+  corrected that to **33 files**. Fix both in one edit.
+- **§5 — 38 of 46 open questions are decided in code, and §5 records none of it.** `M` — §5 presents all
+  46 as open ("Nothing here may be guessed"). The code cites 38, ~25 with an explicit `, decided —`
+  heading carrying rationale and cost: Q1 (`Cargo.toml:366-379`), Q5 (`error.rs:82`),
+  Q7 (`sessions.rs:1997`), Q9 (`config_options.rs:178`), Q12 (`:502`), Q15/Q16 (`startup.rs:31,62`),
+  Q17 (`commands.rs:1312`), Q18 (`:254`), Q19 (`config_options.rs:659`), Q20 (`:34`),
+  Q23 (`translate.rs:488`), Q24 (`:252`), Q27 (`ledger.rs:765`), Q30 (`sessions.rs:128`),
+  Q31 (`:63`), Q32 (`:2242`), Q33 (`:881`), Q34 (`:686`), Q35 (`:2171`), Q36 (`:2344`), Q37 (`:2318`),
+  Q38/Q40/Q41/Q42/Q43/Q44 (`commands.rs:1285,263,428,555,671,762`). **Unanswered anywhere in code:
+  Q4, Q6, Q8, Q10, Q11, Q21, Q28, Q29** — all eight need either an observed Zed or a product owner.
+  The largest single block of false openness after §6, and **Q1 is listed as blocking "the crate's
+  existence" for a crate that shipped.**
+- **§8 Sequencing — every phase is built.** `S` — "Phase 0 — answer two questions before writing code"
+  (ACP-Q1, ACP-Q30, both decided in code), Phases 1–6, and "the first three units a porter should pick
+  up" (ACP-Q1 as work; ACP-002+ACP-021 as one change; ACP-153 before ACP-121). All done:
+  `AppMode::Acp` at `crates/cyrup-config/src/trust.rs:248`, the first branch of `resolve_app_mode` at
+  `crates/cyrup/src/cli/runtime_mode.rs:16`, the `require_model` override at
+  `crates/cyrup/src/main.rs:746-787`, the turn actor at `crates/cyrup-acp/src/turn.rs`. **A live "pick
+  these up first" list naming three finished items is actively misleading to the next planner.**
+- **Five NEW units the port filed that the plan has no ids for.** `M` — `commands.rs:506`, `:803`,
+  `:1178`; `sessions.rs:400`, `:1749`, each marked ``(`NEW`, area 4d/4e)``: the `/name` failure-update
+  turn, upstream's `/name` catch arm, which directory `/export` writes into, checking the live session's
+  own reported path into a `SessionFile`, and resolving the file the live session is writing.
+  **`cb290d1` names two of them as real defects** — `/export` reading the live session's cwd without
+  checking the id matches, and `session/delete` leaving the deleted session's binding installed. Port
+  units discovered by building, which is the normal direction of travel, and they have no home: §6
+  carries only `ACP-NNN` rows and the inventory is closed at 150.
+- **The crate says 168 units, this file says 150.** `S` — `lib.rs:22` vs §6's header. Both are right
+  about different sets: `grep -c '^| ACP-'` over the tables gives 150 live and `grep -c '^| ~~ACP-'`
+  gives 18 refuted. The crate counts the refuted ones because it cites three (`ACP-152`, `ACP-264`,
+  `ACP-270`) in code where a reader would otherwise go looking for an implementation. Not a defect, but
+  a number that will be read as a contradiction and re-derived by hand.
+
+### Post-merge review history that no file records
+
+`cb290d1` "fix(acp): close 19 verified gaps, and wire two features that were built but never called" is
+itself a status ledger: a post-merge review produced 22 gaps that survived adversarial refutation (24
+more were refuted and dropped), 19 closed there and 3 in `8de7460`. **The whole 22-gap cycle has no
+trace in `docs/gap-analysis/`.** `M` — it names three REAL DEFECTS in the merged crate:
+
+- **`ACP-005`** — `run_acp_dispatch` disposed on no path, so **stdin EOF, the normal way an editor exits,
+  emitted no `session_shutdown` and left every tracked detached bash process group alive**.
+  `SessionManager::shutdown` now takes the slot, stops the turn actor and config pump, and awaits
+  `dispose()`, idempotently. Regression-tested by `crates/cyrup-it/tests/bin/acp_transport.rs:79`
+  (the real stdin-EOF path) and `acp_session.rs:306` ("ACP-024: every stdin outcome exits 0").
+- **`ACP-004`** — the broken-pipe guard read `Error::message`, but the SDK builds transport failures as
+  `Error::internal_error().data(..)` whose message is the literal "Internal error", **so the guard could
+  never match** and an ordinary hang-up exited 1 with stderr noise.
+- **`ACP-140`** — "terminal desync was permanent, not a single dropped chunk: once bash output passed the
+  preview limit the client's view never resynced." `Push::Desynced` on a slid window becomes
+  `Push::Resync` (`ledger.rs:769`); the desynced-FINAL path falls back to a text content block under a
+  `CYRUP-DELTA`. Now exercised end to end by `tests/end_to_end.rs:223`.
+
+Plus two features **built, unit-tested and never called**: `AcpTurnAgent` inherited `TurnAgent::usage`'s
+`None` default so the editor's context meter never filled, and `ACP-072`'s echo had zero non-test
+callers, so a no-op `session/set_mode` still answered `{}` and said nothing. **Both rows read
+`verified` in §6 and were rated as design intent — the finding for the ledger is that the merge did not
+close them and a later pass did.**
+
+### Built, with the evidence a STATUS file would carry
+
+Recorded compactly; each is a lead that the row is built, not a re-rating of the row.
+
+- **`ACP-057` / `ACP-121` / `ACP-122`** — off-loop build, settle-once, ordering. `M` — two criticals and
+  a high, asserted on the wire. `a_later_request_is_answered_while_session_new_is_still_building`
+  (`acp_transport.rs:161-195`) sends id 3 after id 2 and asserts id 3 answers while id 2 still builds;
+  `TurnActor::on_event` settles only on `AgentSettled` (`turn.rs:97`), pinned by
+  `a_prompt_settles_once_and_a_cancel_is_not_queued_behind_it` (`acp_session.rs:754`); ordering has one
+  enforcement point, `respond_then_notify`, and `HandlerOutcome` makes "respond, then notify" the only
+  expressible shape.
+- **`ACP-145` / `ACP-146` / `ACP-150`** — the permission seam. `M` — the two criticals the plan
+  deliberately scheduled last. `permission.rs:18` opens on the finding that made ACP-145 critical
+  ("`UiKind::Select` *is* the tool-permission dialog in cyrup"); option ids minted as `choice-<n>`
+  (`:238`); ACP-146's two fixed options byte-for-byte upstream's (`:96`) with an `if let` handler and no
+  `_` arm on purpose (`:324`); ACP-150's invariant at `:383`. 26 inline tests. **The byte-for-byte claim
+  is the code's, not the census's** — the upstream shape was read only through this file's quotations.
+- **`ACP-209` / `ACP-225`** — single-flight restore. `M` — `RestoreGate` (`sessions.rs:860-895`) isolates
+  the critical section from the runtime; the hazard is spelled at `:878` ("two `AgentSession`s each hold
+  their own append fd over one file. Nothing errors"); ACP-Q33 decided at `:881`, ACP-225 at `:891`.
+  Pinned by `session_load_on_the_live_id_rebuilds_once_and_evicts_the_outgoing_runtime`
+  (`tests/wire_gaps.rs:54`). **Residual to hand off, not close here:** the same race is still open for
+  `cyrup-tui`'s `/resume` and `switch_session` generally — area 07/08.
+- **`ACP-291` / `ACP-288`** — `/export` path composition. `M` — the code names it "the one unguarded
+  destructive path in the whole port" and answers with a type: `ExportPath` has exactly one constructor
+  (`commands.rs:1157`), the sanitiser is "a boundary check, not decoration" (`:1103`), and the
+  destination directory is a separate `NEW` unit (`:1178`). Hardened twice — original sanitiser plus
+  `cb290d1`'s id-match fix.
+- **`ACP-218` / `ACP-219` / `ACP-224`** — `session/delete`. `M` — ACP-219 (critical) implemented
+  dispose-first with the reason spelled (unlinking the live session's file without disposing leaves the
+  held `O_APPEND` fd appending to an unlinked inode), ACP-Q37 decided at `sessions.rs:2318`; ACP-218
+  diverges under a `CYRUP-DELTA` at `:2350` ("trash-first, against upstream's permanent unlink") with
+  ACP-Q36 decided at `:2344`. `cb290d1` records the wire-visible consequence: deleting the live session
+  settles an in-flight prompt as `cancelled` rather than `Replaced`, which is ACP-224's stated cost.
+  Pinned by `deleting_the_live_session_removes_its_file_and_leaves_no_stub` (`acp_session.rs:942`).
+- **`ACP-153` / `ACP-154` / `ACP-155` / `ACP-156`** — the four in-process highs. `M` — ACP-155 is the
+  crate's stated load-bearing structure (`lib.rs:60-80`): turn actor / dialog bridge / config pump, with
+  `TurnSink::notify` a plain `fn` "so there is no `await` for a maintainer to put a round trip behind".
+  ACP-154 reports `cancelled` under a delta at `turn.rs:372`; ACP-156 decided at `translate.rs:228`
+  with ACP-Q24 at `:252`. `the_transport_ending_disposes_the_live_session` (`wire_gaps.rs:281`) covers
+  teardown. **All four are `single-source` in §6 — adversary-filed, survey-unseen — and all four turned
+  out to be right and were implemented.**
+- **`ACP-222` / `ACP-223` / `ACP-229` / `ACP-230`** — sessions-root and id resolution. `M` — "the
+  filename is a **hint**, the header is the **authority**" (`sessions.rs:35`); "one level of descent,
+  always" (ACP-Q31); a relative sessions root is **refused, not anchored**, with the refusal string at
+  `:278`; a symlinked session file is resolved and listed — the direction §3's cut says cyrup takes and
+  upstream does not, now settled in code in the corrected direction.
+- **`ACP-212` / `ACP-217`** — load teardown and replay-before-response. `M` — ACP-226's statement-order
+  correction is a delta at `sessions.rs:2069` ("validation precedes teardown, where upstream's follows
+  it"); ACP-Q35 decided at `:2171` (replay runs from the spawned task, not the dispatch loop);
+  `cb290d1` records ACP-217's dead `load_session` deleted, and the two tests it listed as blocked on a
+  real `ConnectionTo`/`Responder` landed in `8de7460`.
+- **`ACP-128` / `ACP-129` / `ACP-131` / `ACP-135`** — tool-call surfacing, status, structured diff. `M` —
+  ACP-Q23 decided at `translate.rs:488`: **do not** emit a `tool_call_update` on every streaming delta
+  (upstream does), because per-delta forces `LazyArgs` materialisation. ACP-129's monotonic-status rule
+  carries deltas at `ledger.rs:610` (announcing the same id twice replaces rather than duplicates) and
+  `:722` (an empty update is not sent). All now driven by a real connection rather than fixture events.
+- **`ACP-139` / `ACP-141`** — terminal `_meta` protocol and exit code. `S` — ACP-Q27 decided at
+  `ledger.rs:765`: cyrup **could** distinguish `ExitStatus::{Killed, TimedOut, Signaled}` and knows more
+  than pi did; the code states which way it went. Exercised by `tests/end_to_end.rs:223`.
+- **`ACP-015` / `ACP-016` / `ACP-022`** — the auth classifier. `M` — `AcpFailure::classify` is the typed
+  replacement for upstream's eleven-substring list; ACP-Q5 decided at `error.rs:82` (**no**, a failed MCP
+  server does not classify as auth-required) with the `'not configured'` arm annotated at `:523`. The
+  plan's named regression (`… 200000 tokens, however you requested 214031 tokens` must not classify,
+  because `403` appears inside `214031`) has a home in `error.rs`'s 6 inline tests. **`auth-required.ts`
+  was not read line by line, so the eleven-substring→typed mapping is unverified upstream.**
+- **`ACP-017`** — built in the reversed form ACP-Q7 chose. `S` — instead of refusing `session/new`, the
+  modelless session says so in-band and says it first: `MODEL_FALLBACK_PREFIX = "Warning: "`
+  (`startup.rs:277`, spelled once so it cannot drift from `crates/cyrup/src/interactive.rs`'s
+  `push_warning`), emitted ahead of the markdown prelude at `:330-336`. The code records that an
+  earlier version wrote only half of this, so a credential-less first run in Zed looked successful and
+  learned otherwise one round trip later — **the exact failure mode a plan-only file cannot catch.**
+- **`ACP-025`** — a model row. `S` — the one unit whose verify was "write a `CYRUP-DELTA`", and the
+  marker is where the unit said it would be, **in another crate**:
+  `crates/cyrup-session-svc/src/builder.rs:2815-2842`, `AppMode::Acp => (ExtMode::Rpc, true)`, with the
+  cost spelled ("an extension cannot tell an ACP client from an RPC client"). **A STATUS file must be
+  able to cite outside `crates/cyrup-acp`.**
+- **`ACP-018`** — built, with an undocumented-in-plan side effect now documented in code. `S` —
+  `config.no_themes = self.no_themes || mode == AppMode::Acp` (`crates/cyrup/src/cli/config_map.rs:150-165`),
+  scoped to themes alone; consequence the plan did not state: `--no-themes` becomes a no-op under
+  `--acp`, and `--theme` still names a path that is never read. **Tension with ACP-066:**
+  `startup.rs:146` records "ACP-066, decided: themes ARE included" in the prelude inventory, so the
+  prelude can list themes for a session that discovered none. Worth one line of verification — both
+  sites were read, neither was run.
+- **`ACP-065`** — built with `decided`: "**no `models` payload and no `_meta.piAcp` shim**. The `model`
+  config option carries the same information in the spec-sanctioned place, and a second source of truth
+  is a second thing that can disagree" (`sessions.rs:1993-1996`). Also closes ACP-Q14 by making it moot.
+  `S`
+- **`ACP-070` / `ACP-272`** — built as **seven of eight**. `S` — `pub const BUILTINS: [Builtin; 7]`
+  (`commands.rs:289-320`) drops `/changelog` under a delta with a stated re-add condition. §6's severity
+  correction for ACP-070 ("two of the eight advertised built-ins have no dispatch path") is resolved:
+  `export` has a real dispatch arm plus a path sanitiser; `changelog` is cut. See the "ninth command"
+  error above.
+- **`ACP-069` / `ACP-269`** — settled in the reversed direction. `S` — extension commands **are**
+  advertised (`commands.rs:1300-1312`), because `AgentSession::prepare`'s step 0 is
+  `try_execute_extension_command` and cyrup's TUI already advertises them. The comment states
+  "`ACP-Q17` is settled by this, and `ACP-069`'s `includeExtensionCommands: false` follows it rather
+  than the reverse." **Both rows still sit in §6 as open and ACP-Q17 still sits in §5 as an unsettled
+  contradiction between them.**
+- **`ACP-072` / `ACP-077` / `ACP-Q20`** — built, with the shape diverging from what §6's rows describe.
+  `M` — ACP-Q20 decided against the plan's own pinned counts: "the setters do not notify, the pump does"
+  (`config_options.rs:34`), with one stated exception ACP-072 needs (`:795`). Pinned by
+  `set_mode_answers_empty_and_the_pump_reports_the_applied_level` (`acp_session.rs:615`) and
+  `a_rename_produces_exactly_one_session_info_update_from_the_pump` (`:538`).
+- **`ACP-208`** — built, with a known-accepted defect. `S` — ACP-Q32 decided at `sessions.rs:2242` to
+  KEEP the offset cursor despite the instability the question describes (a session touched between pages
+  re-sorts; the client skips one row and sees another twice). Two deltas at the same surface:
+  `parseInt`'s leniency reproduced rather than `str::parse`'s strictness (`:595`), and `nextCursor`
+  omitted on the last page rather than sent as `null` (`:2252`). **A legitimate outcome that a plan-only
+  file records as an open question rather than as accepted risk.**
+- **`ACP-267` / `ACP-271` / `ACP-290` / `ACP-263` / `ACP-080`** — the `AvailableCommand` projection.
+  `M` — five rows, four deltas: `argumentHint` carried as `AvailableCommandInput::Unstructured` where
+  upstream omitted `input`; the projection is **sorted** under a delta "because the catalog is not
+  ordered"; `location` replaced by `sourceInfo.scope` "because `location` does not exist"
+  (`commands.rs:1243`); ACP-Q38 decided — a nameless row is dropped (`:1285`); **built-ins advertised
+  FIRST where upstream put them last** (`:1432`). That last is a client-visible change to palette order
+  that ACP-071 describes in upstream's terms — **worth one explicit STATUS row so a later byte-parity
+  audit does not "fix" it back.**
+- **`ACP-283` … `ACP-289`** — the six built-in command handlers. `M` — the densest `CYRUP-DELTA` cluster
+  in the crate and the clearest demonstration that divergence is deliberate: `/compact` refuses while a
+  turn is running with a cyrup-original string (`commands.rs:465-479`); `/session`'s two `typeof` guards
+  collapse and one branch becomes unreachable (`:543`) with ACP-Q43 decided "the five lines only"
+  (`:671`) and cyrup's `${:.3}` cost format (`:655`); `/name` emits its own `session_info_update` and
+  claims the pump's copy (`:720`), refuses an empty name before the setter and cuts the version-skew
+  hint (`:743`), ACP-Q44 decided at `:762`; `/export`'s guard and empty-path branches are gone,
+  overwrite is parity (`:1124`). `cb290d1` lists 283/284/285/286/288/289 as closed in that pass.
+- **`ACP-266` / `ACP-281`** — `ACP-266` built as an invariant rather than code:
+  `UserInput { expand_templates: true }` at the prompt site (`sessions.rs:2582-2583`), matching §6's
+  severity correction (critical→low) that the originally-invoked mechanism was impossible. **`ACP-281`
+  the census could NOT settle** — the cyrup citation was read but `agent-client-protocol-schema` 1.7.0's
+  derive attributes were not, so whether the reject-the-turn divergence (no `VecSkipError` on
+  `PromptRequest.prompt`, no `#[serde(other)]` on `ContentBlock`) still holds at the pinned version is
+  unverified on one side. Flagged, not asserted. `S`
+- **4a bulk** — ACP-001, 002, 003, 006, 010, 011, 013, 012, 014, 021, 023, 024, 026 all built. `M` —
+  `connection.rs:318-332`; `config_options.rs:102-146`, `:222`, `:238`;
+  `crates/cyrup/src/predispatch.rs:62,82`; `acp_terminal_login_cmd.rs`; `signals.rs:367-371`;
+  `main.rs:285-299`, `:398`. ACP-010 rebrands the setup-method constants under a delta against upstream
+  `auth.ts:3,18,19`; ACP-013's ACP-Q3 is settled by actually shipping the flag; ACP-021 is asserted
+  credential-less at `acp_transport.rs:104`. **Filed as one row because each is a direct hit with no
+  divergence worth a separate line; the STATUS file should still carry them individually with these
+  cites.**
+- **4b bulk** — ACP-050, 051, 052, 053, 054, 056, 058, 061, 062, 063, 064, 066, 068, 071, 073, 075, 078,
+  079, 081, 082 all built. `M` — `config_options.rs:167`, `:178`, `:446`, `:492`, `:502`, `:644`,
+  `:659`, `:1034-1040`; `startup.rs:31`, `:62`, `:146`, `:226`; `sessions.rs:1272`, `:1361`, `:1491`,
+  `:1928-2062`. **`ACP-052`'s test note is worth carrying forward as a permanent divergence from
+  upstream's wire bytes that no unit predicted:** the byte-for-byte fixture cannot pass because
+  `AgentCapabilities.auth` is required and always emits `"auth":{}`.
+- **4c bulk** — ACP-120, 123, 124, 126, 127, 130, 132, 133, 134, 136, 137, 138, 142, 143, 144, 147, 148,
+  149, 151, 157, 158, 159, 160 all built. `M` — `translate.rs` (the pure
+  `(event, ledger) -> Vec<SessionUpdate>` core, 28 inline tests); `ledger.rs:33`, `:89`, `:911`;
+  `turn.rs:13`, `:229`, `:362-372`, `:453`, `:539-578`; `permission.rs:109`, `:131`. ACP-124 rebrands
+  `_meta.piAcp` under a delta at `turn.rs:453` ("putting another product's name in a cyrup transcript");
+  ACP-142 ports `Retrying…` byte-for-byte with `AutoRetryEnd` gated success-only at `:549`; ACP-157 adds
+  powershell as a second shell tool. **`ACP-160` is the `built-by-absence` case.**
+- **4d bulk** — ACP-200 … ACP-228 (nineteen rows) all built. `M` — `sessions.rs:400`, `:429`, `:439`,
+  `:465`, `:523`, `:651`, `:679`, `:757`, `:1629`, `:1749`, `:2087`, `:2159`, `:2265`, `:2949`, `:3289`,
+  `:4159`. ACP-204 "one `updatedAt` format, not two"; ACP-205's sentinel/clip/join leaves three of
+  upstream's four fallbacks unreachable and the flicker gone; ACP-227 the leading blank line; ACP-228's
+  explicit clear reports `null`, recorded as a delta. ACP-Q34 decided twice (`:686`, `:4159`) toward the
+  richer ten-variant `ToolKind` mapping. The eviction is a `session_shutdown{reason:"quit"}` rather than
+  a `SessionReplaced`, under a delta at `:1629`. **4d is the area whose adversary pass struck nothing,
+  and every filed unit turned out implementable.**
+- **4e bulk** — ACP-268, 276–280, 282, 292, 293, 295, 296 all built. `M` — `commands.rs:32`, `:38`,
+  `:120`, `:254`, `:414`, `:428`, `:1457-1480`; `sessions.rs:2574-2584`. ACP-268 reads `skill:` gating
+  off the session, never a free `fn(cwd)`, because `pi-settings.ts` is cut for trust-bypass reasons;
+  ACP-282's name split is on a literal space, not on whitespace, under a delta at `:414`. **ACP-295 and
+  ACP-296 are the two rows whose deliverable was a recorded ordering difference rather than code, and
+  both have their note.**
+
+### Calibration datum worth carrying out of this area
+
+This file filed **36 `single-source` units** (adversary-filed, survey-unseen) and treated them as
+provisional. Every single-source row the census checked — ACP-021, ACP-022, ACP-023, ACP-078, ACP-079,
+ACP-153, ACP-154, ACP-155, ACP-156, ACP-221, ACP-222, ACP-291 — turned out to be real and is
+implemented; area 4d, whose adversary pass struck nothing, likewise had all 19 of its live rows land.
+**`single-source` in this directory has been treating true findings as provisional.** Recorded as a
+lead for the README's own calibration notes, not applied there.
+
+
 > **Provenance.** Upstream is **`svkozak/pi-acp` v0.0.33**, MIT © Sergii Kozak. Clone HEAD is
 > `d1cffc0` = `v0.0.33-2-gd1cffc0`; **both commits past the tag are README-only** and the
 > `v0.0.33..HEAD` window touches no `src/` path, so the tag and HEAD are the same port target.

@@ -7,6 +7,21 @@
 
 ## Provenance
 
+> ### PROVENANCE CORRECTION — 2026-09-14. The pins below are revised; **this file was not re-read.**
+>
+> Everything in this file is history and is correct as written. Its 2026-08-21 census was audited
+> against **`pi-mcp-adapter` v2.26.1** (`fafae21`) and its 2026-09-04 re-audit against **v2.32.1**
+> (`10a4536`); both stay. **Nothing in this block re-verifies any of it: no unit was re-read, no
+> obligation re-derived, no count, severity or status changed, and no row moved between
+> `implemented` / `partial` / `missing` / `not-applicable`.** This block states only how stale the
+> file is.
+>
+> | | audited at (history — do not rewrite) | current pin (authoritative, per `README.md`'s baselines table) | window this file has never measured |
+> |---|---|---|---|
+> | `pi-mcp-adapter` | **`v2.26.1`** (2026-08-21 census) / **`v2.32.1`** (2026-09-04 re-audit) | **`v2.33.0`** *(was v2.32.1)* | `v2.25.0..v2.33.0` = **211 files, +27 961 / −2 129**, 113 non-merge commits. Two segments of that range are measured elsewhere and are NOT this file's blind spot: `v2.25.0..v2.26.1` by [`13-cyrup-mcp.md`](13-cyrup-mcp.md)'s *Retarget* section, `v2.26.1..v2.32.1` by this file's own 2026-09-04 re-audit. **`v2.32.1..v2.33.0` = 123 files, +9 455 / −1 352, 33 non-merge commits, is measured by nobody.** That is the unmeasured window, and the census below is its lead list |
+> | `cyrup` | not recorded as a sha in either pass — the 2026-09-04 re-audit is the docs commit `11b9994a`, which **does not resolve in this repository** (`git cat-file -e` fails), so even that indirection is dead | code HEAD **`b28d3ff`**; the ledger's last recorded code baseline is `824a539e` | **Not expressible**, for the reason in the middle cell. The re-audit's own narration — `crates/cyrup-mcp` at **79 942 lines / 30 modules** across six landed waves — is the only cyrup-side anchor it left. At `b28d3ff` the crate is **43 `.rs` files / 79 930 lines** under `src` |
+> | `pi` · `pi-subagents` · `pi-permission-system` · `pi-intercom` · `pi-acp` · `code_puppy_core_plugins` | — | `v0.85.1` · `v0.67.0` · `v0.8.0` · `v0.13.0` · `v0.0.33` · `v0.0.50` (ported surface byte-identical across all 39 tags) | out of this area's scope |
+
 > **Superseded in part on 2026-09-04.** See *Re-audit — 2026-09-04, at `pi-mcp-adapter`
 > v2.32.1* below: the clone is now at **v2.32.1**, the census here is stale by roughly 150 units, and
 > 31 rows in the unit table have been re-ruled in place.
@@ -29,6 +44,67 @@ any single row below as a lead rather than a verdict.
 
 **What this is not.** No row here was verified by building or running anything; every ruling is a
 reading of source. `cut` and `open-decision` units are reported `not-applicable` and are NOT work.
+
+
+## UNVERIFIED — 2026-09-14 census of the `v2.32.1..v2.33.0` window (leads, not status)
+
+**Nothing in this section changes a status.** No row below the fold moves between `implemented`,
+`partial`, `missing` and `not-applicable`; no severity, no count and no census total is touched. No
+`MCP-NNN` id is assigned to anything new — numbering resumes from **`MCP-539`** when a pass that
+read both sides files it. This is a worklist.
+
+Census method: upstream read only via `git -C tmp/pi-mcp-adapter show v2.33.0:<path>` and
+`git diff v2.32.1..v2.33.0`; cyrup read at `b28d3ff`. cyrup's `credentials.rs`, `oauth.rs`,
+`proxy/description.rs`, `commands.rs` (the logout path) and the consent surface were **not opened**.
+Absence claims of the form "grep = 0 hits" are greps over `crates/cyrup-mcp/src` at `b28d3ff`, not
+proof that a differently-named counterpart does not exist.
+
+### Two surfaces this file owns
+
+- **`cyrup-mcp` credential env switches collapsed to single-name `CYRUP_MCP_*`** · S · BOTH SIDES
+  READ at `b28d3ff`. `crates/cyrup-mcp/src/credentials.rs:177` is
+  `pub const TEST_AUTH_STORE_ENV: &str = "CYRUP_MCP_TEST_AUTH_STORE"`, and so are its five siblings:
+  all six `[&str; 2]` dual-name constants became plain `&str`, `env_first` became `env_lookup`, and
+  the six `PI_MCP_ADAPTER_*` spellings are no longer honoured. `request_headers_command.rs` lost
+  `PI_MCP_ADAPTER_TEST_FAIL_PS` the same way. **Lead against `MCP-282`** (recorded `implemented` at
+  `:1141` on the evidence "declares all six switches as `[&str; 2]` pairs with `CYRUP_MCP_*` first"):
+  that evidence is false at `b28d3ff` and the behaviour it describes is gone. An implemented-unit's
+  evidence invalidated, not a new gap. **The row is untouched.**
+- **The in-tree dual-read precedent `13f` cites no longer exists** · S · cyrup side read at
+  `b28d3ff`. `crates/cyrup-provider/src/auth/oauth/callback.rs:55-63` reads one key,
+  `CYRUP_OAUTH_CALLBACK_HOST`, defaulting to `127.0.0.1`; the `PI_OAUTH_CALLBACK_HOST` fallback is
+  gone, and per `dd44b3c`'s own message that is a behaviour flip — a `PI_`-only environment now
+  resolves `127.0.0.1` where it used to resolve whatever that variable said (tests at
+  `callback.rs:1129-1136` pin `0.0.0.0` as now inert). `crates/cyrup-config/src/paths.rs:335` is the
+  same story for the agent dir. **Lead against every PLANNED unit that prescribes the convention**:
+  `13f-mcp-credentials.md:297`, `:315`, `:873`, `:1432`, `:1439`, `:1713` and `13a:240`, `:1129`,
+  `:2187`, `:2462`, `13c:1003` all state a `CYRUP_* → PI_* → default` ladder as the established
+  in-tree precedent. The middle rung is deleted workspace-wide, so an unbuilt unit is currently
+  specified against a precedent that no longer exists.
+
+### Rows whose recorded obligation or evidence the window invalidates
+
+Version lag, not regression: every one of these was true at the tag its pass read. **No status cell
+is edited.** Each is a lead to restate the obligation *before* the unit is worked, because working
+it against the recorded text ships the v2.32.1 shape and makes the delta a second pass.
+
+| row | recorded | at v2.33.0 | filed in |
+|---|---|---|---|
+| `MCP-500` | `URL_BOUND_AUTH_FIELDS` "is five fields", cited `config.ts:525` | **six**, at `config.ts:553` (`caFile`). Schedule with `MCP-501` as one change, now three-way | 13b |
+| `MCP-101` (`partial`) | `resolveEnv(env, serverName, literalEnv)` | four-argument: `resolveEnv(env, serverName, literalEnv = false, inheritEnv = true)`, `server-manager.ts:1742-1751` | 13c |
+| `MCP-137` (`missing`) | "the per-server **six**-key object" | **seven** keys — `directToolCount` joins `McpServerStatusSnapshot` (`types.ts:42`) | 13c |
+| `MCP-513` (`missing`) | "provider-safe sanitisation" | a named algorithm: `formatServerNamespace`, `types.ts:521-543`, 59-char cap + sha256-16 tail. Add `22682de` (#529) to its cite list; it has a second consumer now | 13e |
+| `MCP-232` (`implemented`) | 3-component approval cache key, cache consulted before the broker | key gains a **definition hash**; broker now runs **before** the cache. `crates/cyrup-mcp/src/state.rs:392` is the 3-component form, `proxy/approval.rs:303` the old order | 13e |
+| `MCP-226` (`implemented`, `hand-written`) | verdict justified at `13e:378` by cyrup's truncation differing from the adapter's own | upstream **deleted** its `truncateHead` and adopted the host's. The verdict's premise is inverted and the classification is an open question; `13b:543` / `13e:837`'s `50 * 1024` / `2000` are no longer upstream's source of truth | 13e |
+| `MCP-452` (`implemented`) | cyrup's per-candidate auth probe matches upstream | **reverse lag** — upstream deleted the probe for `ModelRegistry.complete`. Needs a ruling, not a carry | 13i |
+| `MCP-507` (`missing`) | the transient-503 arm of `enrichHttpConnectionError` | the function gained a macOS Local Network Privacy arm *before* the 503 one. Read and schedule the two together | 13c |
+| `MCP-524`, `MCP-522`, `MCP-525`, `MCP-531` | table-B rows whose TypeScript has never been read | all four are extended by this window (credential transactions · `{port}` redirects and listener release · theme fallback). One read pass per cluster covers both tags | 13f/13g/13h |
+| `MCP-027a` (`missing`) | `sendMessage`'s `triggerTurn` pre-turn convergence gate | now a **hard prerequisite**: the new `mcp-oauth-status` message is delivered through exactly that gate | 13a |
+
+**One seam gap this window exposes that no row holds.** `withFileMutationQueue` — the host-supplied
+cross-process config-write serialiser the new install path runs every persist through — has no cyrup
+counterpart (`grep -rn 'file_mutation_queue' crates/cyrup-mcp/src` = 0). That is independent of the
+install unit and is currently unfiled.
 
 ## Re-audit — 2026-09-04, at `pi-mcp-adapter` v2.32.1
 
@@ -309,7 +385,7 @@ all tests — so no deployed digest had to be invalidated.
    `resolveConfigPath(undefined)`. Upstream's digest for the stdio fixture is
    `2190558e470a75c0f992989bd1799b374e669deecb8093e4118a1a9419068cf4`; cyrup produced `4dd46c1f…`
    and now produces upstream's, pinned by
-   `the_socket_key_is_no_longer_a_divergence_from_upstream`. 13c-mcp-servers.md:1753 ("Keep `socket`
+   `the_socket_key_is_no_longer_a_divergence_from_upstream`. 13c-mcp-servers.md:1851 ("Keep `socket`
    … in the pre-image despite Cut 3") was right and is now satisfied.
 
 2. **The `lenient` cluster — three divergences, one root cause. CLOSED.** `config.rs` read `auth`,
@@ -563,7 +639,7 @@ file this unit does not own.
   failure and swallows everything else — but no consumer of `is_credential_store_failure` currently
   sits downstream of this conversion, so it is a latent hazard rather than a live bug. Fix shape:
   make `AuthStoreError` `Clone`, or give `ManagerError` a `CredentialStore` arm.
-* **`13c-mcp-servers.md:1110-1113`'s MCP-100 attribution is wrong.** It says
+* **`13c-mcp-servers.md:1208-1211`'s MCP-100 attribution is wrong.** It says
   `MCP connection for <name> was closed while connecting` is reachable "when the generation advanced
   **without** the attempt being aborted (what `reconnect`/`closeAll` can produce)". Upstream writes
   `closeGenerations` at exactly two places, `server-manager.ts:1098` and `:1146`, and **both** abort
@@ -1392,12 +1468,12 @@ Read as a partial order; anything not named as a predecessor is independent.
 holds only `hand-written`, `rmcp`, `host-verb`, `extension-owned`, `open-decision` and `cut`. The
 section file says so directly: *"The section's three `host-addition` neighbours (`HA-1` late tool
 registration, `HA-2` argument completions, `HA-3` overlay geometry) are owned elsewhere and none of
-them gates sampling, elicitation or tracing"* (`13i-mcp-protocol-and-verification.md:1718`). `HA-2`
+them gates sampling, elicitation or tracing"* (`13i-mcp-protocol-and-verification.md:1776`). `HA-2`
 and `HA-3` have **no** contact surface in 13i at all; they appear on 13h units (`MCP-382`, and
 `MCP-395` for `HA-1`'s command leg).
 
 The single point of contact is `MCP-498`'s note
-(`13i-mcp-protocol-and-verification.md:1648-1651`): on a cold cache cyrup exposes only the `mcp`
+(`13i-mcp-protocol-and-verification.md:1706-1709`): on a cold cache cyrup exposes only the `mcp`
 proxy tool unless `HA-1` is built, so the upstream test's "a direct MCP tool is registered before
 `agent_start`" assertion is about the **warm** path here.
 

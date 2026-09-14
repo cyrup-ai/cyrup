@@ -70,6 +70,90 @@ to the approval section. The seam is stated below.
 
 ---
 
+> ### PROVENANCE CORRECTION — 2026-09-14. The pins below are revised; **this file was not re-read.**
+>
+> Everything in this file is history and is correct as written. It was audited against
+> **`pi-mcp-adapter` v2.25.0** — that is the tag its prose, its unit obligations and every upstream
+> citation in it were read at, and it stays. **Nothing in this block re-verifies any of it: no unit
+> was re-read, no obligation re-derived, no count, severity, verdict or status changed.** This block
+> states only how stale the file is; the section after it is a worklist, not a finding.
+>
+> | | audited at (history — do not rewrite) | current pin (authoritative, per `README.md`'s baselines table) | window this file has never measured |
+> |---|---|---|---|
+> | `pi-mcp-adapter` | **`v2.25.0`** (the plan's tag) | **`v2.33.0`** *(was v2.32.1)* | `v2.25.0..v2.33.0` = **211 files, +27 961 / −2 129**, 113 non-merge commits. Two segments of that range are measured elsewhere and are NOT this file's blind spot: `v2.25.0..v2.26.1` by [`13-cyrup-mcp.md`](13-cyrup-mcp.md)'s *Retarget* section, `v2.26.1..v2.32.1` by [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md)'s 2026-09-04 re-audit. **`v2.32.1..v2.33.0` = 123 files, +9 455 / −1 352, 33 non-merge commits, is measured by nobody.** That is the unmeasured window, and the census below is its lead list |
+> | `cyrup` | **deliberately unpinned** — this file cites cyrup by symbol and file only, and its header says so | code HEAD **`b28d3ff`**; the ledger's last recorded code baseline is `824a539e` | **Not expressible.** With no sha ever recorded here there is no window to name: the staleness of a cyrup claim in this file cannot be bounded, only re-read. For scale, `crates/cyrup-mcp` at `b28d3ff` is **43 `.rs` files / 79 930 lines** under `src` — 29 top-level modules plus the `proxy/` tree |
+> | `pi` · `pi-subagents` · `pi-permission-system` · `pi-intercom` · `pi-acp` · `code_puppy_core_plugins` | — | `v0.85.1` · `v0.67.0` · `v0.8.0` · `v0.13.0` · `v0.0.33` · `v0.0.50` (ported surface byte-identical across all 39 tags) | out of this area's scope |
+
+### UNVERIFIED — 2026-09-14 census of the `v2.32.1..v2.33.0` window (leads, not units)
+
+**Nothing in this section is a port unit.** No `MCP-NNN` id is assigned — id allocation belongs to a
+pass that read both sides, and this one did not read the cyrup side everywhere. Numbering resumes
+from **`MCP-539`** when such a pass files it. **No unit in this file is opened, closed, re-ranked or
+re-verdicted here, and no status cell in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) moves.**
+
+Method: upstream read only via `git -C tmp/pi-mcp-adapter show v2.33.0:<path>` and
+`git diff v2.32.1..v2.33.0 -- <path>`; cyrup read at `b28d3ff`. Each entry names which side was read;
+where only one side was read it says so and is a lead with half its evidence missing. An absence
+stated as "grep = 0" is a grep over `crates/cyrup-mcp/src`, not proof that a differently-named
+counterpart does not exist.
+
+#### New surfaces
+
+- **Cross-process OAuth credential transactions (`mcp-refresh-lock.ts` + `withAuthEntryTransaction`)**
+  · L · UPSTREAM READ IN FULL; **cyrup side NOT READ** — `crates/cyrup-mcp/src/credentials.rs` and
+  `oauth.rs` were listed, not opened, so nothing below says what cyrup does today. New file
+  `mcp-refresh-lock.ts` (62 lines): `:11 sharedRefreshLockRoot()` = `~/.pi-mcp-adapter`, shared across
+  agent and import dirs for the OS user **because keychain ACCOUNTS are shared**; `:19
+  acquireRefreshLock` (`fs-native-extensions` `tryLock` on a sha256-named file opened `a+` 0o600 under
+  `refresh-locks-v2/` 0o700, jittered 50-100 ms retry, and the explicit rule **never to unlink the
+  inode**); `:50 withRefreshLock`. `mcp-auth.ts:866 withAuthEntryTransaction(serverName, operation,
+  signal)` = lock + `invalidateAuthEntryCache` + `AsyncLocalStorage.run`; `:862
+  currentAuthTransaction`. `mcp-oauth-provider.ts:291 withAuthTransaction`; `:595-605 saveTokens` now
+  MERGES onto a freshly read entry via `saveAuthEntry` instead of `updateTokens`, and skips the
+  inactive check while the transaction still owns the lock ("a refresh may have rotated remotely
+  before cancellation was observed"). Call sites: `mcp-auth-flow.ts:421`, `:500`, `:528`, `:625`,
+  `:1042`, `:1132`; `oauth.ts:46 updateMcpOAuthTokensForUrl` becomes async. Upstream `5c1ea6b` (#546),
+  `f30c4e7` lineage. Every credential read-modify-write is now serialised across Pi processes by an
+  advisory file lock keyed on the server name, with the entry cache invalidated on entry so a stale
+  in-process copy cannot win; token saves merge rather than replace, so a credential another process
+  just authorised is preserved rather than deleted. NEW PORT UNIT for the lock itself, and it
+  **enlarges the still-open `MCP-524`** ("token invalidation preserves credentials replaced by another
+  process"), which was filed from the v2.32.1 changelog and whose TypeScript has never been read —
+  `MCP-524` and this are the same problem at two tags and should be read and scheduled together.
+  Rust mechanism note: `fs2`/`fs4` advisory locks are the analogue; the `AsyncLocalStorage`
+  transaction marker maps to a task-local. **`MCP-524`'s row is untouched.**
+
+#### Flagged uncertain — may be `not-applicable`, needs a ruling either way
+
+- **`ConsentManager.restoreDecision` and persisted iframe consent** · S · UPSTREAM READ IN FULL;
+  **cyrup side NOT READ** — I did not open cyrup's consent surface and cannot say whether
+  `ConsentManager` is ported or fell under Cut 2. `consent-manager.ts`'s constructor gains
+  `persistDecision?: SessionApprovalWriter`; `registerDecision` splits into `applyDecision` + persist;
+  a new `restoreDecision(serverName, approved)` carries the rule that a restored `always`-mode
+  APPROVAL is discarded (cannot be reused) while a restored **denial still applies** and a later grant
+  still overrides it. Consent decisions become durable across resume and branch navigation, with that
+  asymmetry. **`13-cyrup-mcp.md:554` records `consent-manager.ts` as "cut with Cut 2" because its only
+  consumers are `ui-server.ts`/`ui-session.ts`.** That premise is false at v2.33.0: `session-approvals.ts:169`
+  calls `state.consentManager.clear()` and `:185` calls `restoreDecision`, and the tool-grant restore
+  it is entangled with is **not** cut. If the cut still holds this is `not-applicable` and should be
+  recorded as a deliberate cut in the manner of `MCP-535`/`MCP-536`, not worked. Either way **it needs
+  a row**, because the entanglement is structural. The tool-grant half is filed in
+  [`13e`](13e-mcp-tools.md).
+
+#### Corrections to this file's own text (leads against the prose, not against a row)
+
+- **`13f:297` and `:1439`** cite `cyrup_provider::auth::oauth::callback` reading
+  `["CYRUP_OAUTH_CALLBACK_HOST","PI_OAUTH_CALLBACK_HOST"]` and `cyrup_config::env` reading
+  `["CYRUP_AGENT_DIR","PI_CODING_AGENT_DIR"]` as the in-tree convention a PLANNED unit should follow.
+  **Both citations are dead at `b28d3ff`**: `crates/cyrup-provider/src/auth/oauth/callback.rs:55-63`
+  reads one key with a `127.0.0.1` default, and `crates/cyrup-config/src/paths.rs:335` is the same
+  story for the agent dir — `dd44b3c` deleted the `PI_*` rung workspace-wide, and its own commit
+  message records that as a behaviour flip (tests at `callback.rs:1129-1136` pin `0.0.0.0` as now
+  inert). **`13f:399`, `:873`, `:1432` and `:1713`** rest on the same premise. An unbuilt unit is
+  currently specified against a precedent that no longer exists; the fix is to restate the convention
+  as single-name `CYRUP_*`, not to leave the ladder. See the same lead, with the `MCP-282` half, in
+  [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md).
+
 ### How it lands
 
 | adapter capability | upstream mechanism | cyrup mechanism | verdict |

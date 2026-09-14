@@ -2,6 +2,237 @@
 
 This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, editor, footer, selectors, themes, images, keymap, autocomplete, startup panel, terminal negotiation) plus the TUI wiring in `cyrup/crates/cyrup/src/main.rs`. It is measured against `pi/packages/tui/` (rendering primitives and terminal control) and `pi/packages/coding-agent/src/modes/interactive/` (components and `interactive-mode.ts`).
 
+> ## PROVENANCE — PINS CORRECTED 2026-09-14. THIS FILE WAS NOT RE-AUDITED.
+>
+> **Pin correction only.** Nothing in this file was re-read, no code was compiled or run, and no
+> upstream source was opened by the pass that wrote this block. It exists so a reader can tell at a
+> glance how stale everything below it is. Every dated block beneath this one records what somebody
+> actually read at the time and is **correct as history** — its tags and shas must not be re-stamped.
+>
+> | | audited at — history, unchanged | current, 2026-09-14 | therefore unmeasured |
+> |---|---|---|---|
+> | `cyrup/` | HEAD **`2571969`**, the last whole-file pass (`### Reconciliation 2026-09-04`); individual rows were edited as late as 2026-09-05 | HEAD **`b28d3ff`**. The ledger's last recorded code baseline is **`824a539e`** | `2571969..b28d3ff` — no part of this file has been read against it |
+> | `pi/` | **v0.84.1** for version lag, **v0.83.0** read directly wherever a finding had to be classified `not-ported` vs `upstream-drift` | **v0.85.1** | **`v0.84.1..v0.85.1`** = 45 files, `+4 478 / −347` under `packages/tui` alone, plus everything under `modes/interactive/` |
+>
+> **The v0.84.1 pin above is ALSO wrong in the conservative direction: parts of `cyrup-tui` are
+> ported AHEAD of it, to v0.84.3.** That is not inference — the crate says so in its own module docs:
+> `crates/cyrup-tui/src/altscreen/mouse.rs:3` and `altscreen/wheel.rs:3` both read "@v0.84.3";
+> `keymap.rs:2007-2008` pins its defaults to "pi's verbatim … @v0.84.3"; and `keymap.rs:2041-2045`
+> states outright that the bare `ctrl+up`/`ctrl+down` prompt-nav chords "joined those key sets by
+> @v0.84.3, which is the tree this port reads. Version lag in the table, not a divergence here." **A
+> census that assumes a flat v0.84.1 baseline for this area will file already-closed items** — three
+> of the exclusions the 2026-09-14 census recorded (the `/` `-` word-selection joiners,
+> `copyOnSelect`, the prompt-nav chords) are direct consequences. **This area has a per-module
+> baseline range of roughly v0.84.1–v0.84.3, not a single tag**, and it should be recorded that way
+> the next time the header is rewritten by a pass that has actually read the modules.
+>
+> Other upstreams, re-checked 2026-09-14 and unchanged: `pi-permission-system` **v0.8.0**,
+> `pi-intercom` **v0.13.0**, `pi-acp` **v0.0.33**, `code_puppy_core_plugins` **v0.0.50**.
+> `pi-subagents` is now **v0.67.0**, `pi-mcp-adapter` **v2.33.0**; neither is this area's upstream.
+>
+> **What this costs a reader.** Every `upstream-drift` row here was classified against v0.84.1 (or,
+> per the paragraph above, silently against v0.84.3 in some modules). Every `closed` verdict was
+> reached against cyrup at `2571969` or earlier and is unverified at `b28d3ff`. The
+> `## UNVERIFIED census` immediately below is a lead list drawn from that window; it is not a
+> re-audit and closes nothing. Note also that **`ADR-0005` scoped the alt-screen feature at v0.84.1**,
+> so several deliberate cuts recorded below were decided against a surface that has since grown —
+> which is a fact about the cost of the cut, not a reopening of it.
+
+## UNVERIFIED census 2026-09-14 — leads, not findings
+
+Twelve candidate surfaces from the `v0.84.1..v0.85.1` window (`packages/tui` = 45 files,
+`+4 478 / −347`), plus one ledger-text defect found on the cyrup side at `b28d3ff`.
+
+**Read this as a lead list.** No entry is audited. No entry carries a ledger id — id assignment
+belongs to a pass that has read both sides, and several entries below say in their own words which
+side was not read. **No row in `## Open items` was opened, closed, re-severitied or otherwise
+touched.** Where an entry bears on a row that already exists, it is recorded as a lead against that
+row's id and the row is left exactly as it stands. Sizes are the census agent's estimate.
+
+### Mouse and pointer
+
+- **Component-level mouse dispatch protocol** — L, and **the largest single TUI gap in this window**.
+  `packages/tui/src/tui.ts:25,46,81,123 @v0.85.1` (`TuiMouseEvent`, `TuiMouseEventResult`,
+  `dispatchMouseEvent`, `Component.handleMouse?`), `components/mouse-region.ts:12`, README "Mouse
+  Input" (+40 lines in-window). Net-new: a normalized pointer protocol over the renderer's raw SGR
+  handling. `TuiAltScreen` hit-tests components and overlays and delivers component-local x/y,
+  absolute screenX/screenY, bounds, button, modifiers, click count and wheel delta;
+  `TuiMouseEventResult` returns `handled` / `capture` / `focus` / `render` (coalesced repaint,
+  defaulting on for press/click/drag/wheel, off for move/release). `Container` and `Box` route to
+  nested children from last-frame geometry so hover does not force a child rerender (`components/box.ts`
+  `handleMouse` + `mouseLayout` cache). `MouseRegion` adds mouse behaviour to any component without
+  changing its rendering. Overlay handles gained `getBounds()`. Six built-ins implement `handleMouse`
+  in-window: editor (click into the autocomplete list), input, select-list, settings-list, box,
+  scroll-view. v0.85.1 then fixes a regression **of this very system** — hover changing selection and
+  recentering autocomplete/settings lists so clicks target a different item — landing
+  `getVisibleRange()` and an explicit `// Hover must not change selection` guard in both lists.
+  cyrup's `Component` trait (`crates/cyrup-tui/src/component.rs:16-24`) declares exactly two methods,
+  `render` and `invalidate` — no mouse method, no hit-test seam. Mouse handling exists ONLY at the
+  renderer level in `crates/cyrup-tui/src/altscreen/`: `mouse.rs` (arms the terminal's reporting
+  modes and explicitly "never interprets a report"), `wheel.rs`, `selection.rs`, `scrollbar_drag.rs`;
+  `grep -rniI "MouseRegion|mouse_region" crates/cyrup-tui/src/` is zero. A click inside an
+  overlay/list/editor-autocomplete in cyrup's fullscreen mode has no path to that component. Both
+  sides read. **Not verified: whether cyrup's fullscreen mode renders any of the affected overlays at
+  all** — if the selectors are inline-mode-only the blast radius is much smaller than the API gap
+  suggests, and that decides the severity. Settle it before filing one. Interacts with **ADR-0005
+  §Decision B**, whose unit list predates this protocol.
+- **Alt-modifier 5× mouse-wheel scroll** — S, self-contained.
+  `tui-alt-screen.ts:75` (`ALT_WHEEL_SCROLL_MULTIPLIER = 5`) and `:970`
+  (`(button & 8) !== 0 ? wheelScrollLines * ALT_WHEEL_SCROLL_MULTIPLIER : wheelScrollLines`) @v0.85.1,
+  added v0.85.1 (#9166). cyrup's router is `crates/cyrup-tui/src/altscreen/wheel.rs`, whose own module
+  doc pins it to `tui-alt-screen.ts:675-686 @v0.84.3` and which takes `scroll_multiplier` only from
+  the constructor option (`wheel.rs:56`); no modifier test anywhere in the file. Both sides read.
+  **Not verified: whether crossterm's `MouseEvent` surfaces the Alt modifier on wheel events in this
+  build** — that is the only thing between this and a one-line fix, and it must be checked first.
+- **`scrollToEndIndicator` — clickable jump-to-end label** — M. `tui-alt-screen.ts:180`
+  (`scrollToEndIndicator?: () => string`), `:242`, plus `ScrollToEndIndicatorRect` /
+  `scrollToEndIndicatorRect` @v0.85.1 (v0.85.0, #9080): a clickable label centred on the last row of a
+  `follow: "end"` primary scroll view while it is scrolled away from the end; clicking resumes
+  end-following. cyrup has the underlying ACTION — `altscreen/scroll.rs:391` ("Jump to the last row
+  and re-arm the tail follow — pi's `scrollToEnd`") and `altscreen/mod.rs:316` — but no indicator:
+  `grep -rniI "scrolltoend|scroll_to_end|jump_to_end|jump-to-end" crates/cyrup-tui/src/` returns only
+  those three sites, all naming the action. Both sides read. **Depends on the component-mouse entry
+  above for the CLICK half; the render half is independent and could ship alone.**
+- **Scrollbar track/thumb style split and the v0.84.4 scrollbar redesign** — M, **must be decomposed
+  before any of it is filed.** `components/scroll-view.ts:12-13,27 @v0.85.1` splits `scrollbarStyle`
+  into `scrollbarTrackStyle` (default `\x1b[90m…`) and `scrollbarThumbStyle` (`\x1b[37m…`);
+  `layout.ts` replaces `styleScrollbarCell` with `getScrollbarGeometry(box, includeHiddenAuto = false)`
+  and `replaceScrollbarCell(..., preserveTargetBackground)`; CHANGELOG [0.84.4] adds muted thin tracks,
+  contrasting proportional two-cell-minimum thumbs, background preservation without foreground
+  inheritance, an unstyled reserved column in `always` mode, hidden-`auto` reveal on pointer entry,
+  same-colour thumb expansion on hover, and track-click jumping. cyrup models ONE scrollbar colour —
+  `crates/cyrup-tui/src/theme.rs:541,:591,:1067-1094` carries only `scrollbarThumb` (with the
+  `?? selectedBg` fallback correctly ported), and `altscreen/scroll.rs:32-33` records the thumb styled
+  from `interactive-mode.ts:918-923`, the pre-split call. `ScrollbarMode::{Hidden,Auto,Always}` exist
+  (`scroll.rs:81-89`) and hover + thumb drag are ported (`altscreen/scrollbar_drag.rs`), **so this is
+  not a wholesale gap — it is a set of refinements on a ported base.** Both sides read only at the
+  level of which styles exist. **Not verified per sub-behaviour:** which of {two-cell minimum,
+  background preservation, hidden-auto reveal, hover expansion, track-click jump} cyrup already does.
+  One lead that splits into up to five.
+
+### Alt-screen
+
+- **Alternate-screen transcript search** — L, **a tracker, not a defect**.
+  `packages/tui/src/alt-screen-search.ts:1-327 @v0.85.1` is net-new; `keybindings.ts` adds
+  `tui.altScreen.search` (ctrl+shift+f), `searchNext` (enter/ctrl+g), `searchPrevious`
+  (shift+enter/ctrl+shift+g), `searchClose`; `tui-alt-screen.ts` adds `ActiveSearch`,
+  `AltScreenSearchIndex`, `SearchHighlightRange` and the three search styles. It grew from nothing at
+  v0.84.1 across three releases: incremental primary-scroll-view search (v0.84.2), a bordered
+  placeholder input with muted result count and right-aligned clickable key/arrow buttons plus
+  open-shortcut toggling (v0.84.4), then a perf pass caching unchanged results, indexing ASCII runs
+  and limiting highlight work to visible matches (v0.85.0); plus fixes for snap-back during manual
+  scrolling and fragmented SGR mouse input leaking into the query. `ScrollView.scrollTo(target,
+  { disableFollow: true })` exists specifically to serve the search reveal. **cyrup has deliberately
+  not ported this and says so in its own source** — `altscreen/keys.rs:52-54` ("the four
+  `tui.altScreen.search*` ids (`:192-207`) are deliberately absent: ADR-0005 §Decision C enumerates
+  EIGHT, and transcript search is not among §Decision B's units at all"), `altscreen/mod.rs:98`,
+  `altscreen/scroll.rs:39-40,:301` (`disableFollow` has no writer because its only caller is the
+  unported search reveal), `keymap.rs:1993-1994`. **This is a decision of record (`docs/adr/ADR-0005-alt-screen-tui-mode.md`);
+  do not file it as a parity bug.** What is worth recording is that **the cut surface roughly tripled
+  in the window** — a net-new 327-line module plus a panel, an index and a highlight model — which is
+  material to any future reopening of Decision B. Both sides read. Escalation condition: only if
+  ADR-0005 is revisited.
+
+### Terminal capability and input negotiation
+
+- **Zed terminal capability detection** — S, **the cleanest small candidate in the window**.
+  `terminal-image.ts:113 @v0.85.1`: `termProgram === "alacritty" || "vscode" || "zed"` returns
+  `{images: null, trueColor: true, hyperlinks: true}` (v0.85.0, #8828). cyrup's port is
+  `crates/cyrup-tui/src/image.rs:771-848` (`detect_capabilities_on_platform`), a faithful port of the
+  v0.84.1 chain — kitty, ghostty, wezterm, warp, iterm, then `:825`
+  `if has("WT_SESSION") || term_program == "vscode" || term_program == "alacritty"`, then jetbrains,
+  then the Windows console, then `conservative(has_true_color)`. **`zed` is absent, so under Zed
+  cyrup falls through to conservative: OSC-8 hyperlinks off and truecolor only if `COLORTERM` is
+  exactly `truecolor`/`24bit`.** Both sides read in full. The env-override layer upstream added in the
+  same window IS already ported under cyrup names (`image.rs:27-29,:626-631,:586-587`) — **only the
+  `zed` literal is missing, not the mechanism.**
+- **Escape-vs-sequence timeout split, SSH widening, `PI_TUI_ESC_TIMEOUT`** — S, **with a live overlap
+  the filer must handle.** `terminal.ts:119` (`DEFAULT_SSH_ESCAPE_TIMEOUT_MS = 100`), `:126-134`
+  (`resolveEscapeTimeoutMs`), `:217` @v0.85.1; `stdin-buffer.ts`
+  (`DEFAULT_SEQUENCE_TIMEOUT_MS = 50`, `DEFAULT_ESCAPE_TIMEOUT_MS = 10`, `escapeTimeout?`, and
+  `const timeoutMs = this.buffer === ESC ? this.escapeTimeoutMs : this.timeoutMs`). The single 10 ms
+  reassembly timeout became two; `resolveEscapeTimeoutMs` reads `PI_TUI_ESC_TIMEOUT` and otherwise
+  returns 100 ms when `SSH_CONNECTION`/`SSH_TTY` is set. Landed v0.84.2 (#7899), fixing split
+  `Alt+Enter` over SSH being misread as Escape. **`TUI-045` is CLOSED (`07:557`, `:497`)** and cyrup
+  shipped `crates/cyrup-tui/src/escape_reassembly.rs`, an event-driven state machine rather than a
+  byte-buffer timer, whose doc at `:33` cites pi's pre-split `setTimeout(this.timeoutMs)` — 10 ms
+  (`:262`, `:284`). cyrup's timing constants are `app/input_reader.rs:19` (`INPUT_POLL_INTERVAL =
+  100ms`) and `:25` (`HELD_FLUSH_INTERVAL = 20ms`); `grep -rniI "ESC_TIMEOUT|esc_timeout" crates/` is
+  zero and there is no SSH detection anywhere in `cyrup-tui`, so **the knob and the SSH widening have
+  no counterpart.** Both sides read. **Do not skip this caveat:** the mechanisms are not comparable
+  term-for-term — cyrup releases held escapes on a 20 ms idle flush, not a per-buffer timeout — so
+  whether a 100 ms-latency SSH link reproduces the upstream bug in cyrup is **unknown and cannot be
+  settled statically**. This area's own Coverage section already says negotiation items need a live
+  terminal (see `TUI-040`). **File as a lead requiring live repro, never as a confirmed defect.**
+  *Lead against `TUI-045`.*
+
+### Components and markdown
+
+- **Autocomplete base-directory-first ordering for nested path results** — M, **with a mechanism
+  difference any item must state.** `autocomplete.ts:724-737 @v0.85.1` (`getBaseDirSuggestions`, a
+  second `walkDirectoryWithFd(..., maxDepth = 1)`), `:749-760` (merge with dedupe by path, base-dir
+  entries first); `walkDirectoryWithFd` gained `maxDepth?` emitting `--max-depth`. Two fd invocations
+  now, concatenated base-dir-first with a `Set` dedupe before scoring (v0.84.4, #8669). cyrup's
+  backend is `crates/cyrup-tui/src/autocomplete.rs:804-853`: `list_files` calls `fd_list`, which
+  spawns `fd` ONCE with no query and no `--max-depth`, takes `limit` lines and `files.sort()` — plain
+  alphabetical — falling back to an in-process BFS `walk_list` (`:863-880`) when fd is absent. So
+  cyrup has no base-dir-first notion and no depth-1 pass, **but it also does not replicate upstream's
+  per-query fd invocation at all: the shapes differ at the root**, and the doc at `:813-815` pins the
+  argument list to `autocomplete.ts:124-146 @v0.84.3`. Both sides read. **Not verified: where cyrup
+  scores/ranks candidates downstream of `list_files`, and therefore whether the ordering difference
+  is user-visible at all.** Establish that before assigning a severity.
+- **LaTeX relational-algebra join symbols, and control-space parsing across line endings** — S,
+  **the cheapest verifiable candidate here.** `latex.ts:66 @v0.85.1` adds `bowtie` ⋈, `Join`,
+  `ltimes` ⋉, `rtimes` ⋊, `leftouterjoin` ⟕, `rightouterjoin` ⟖, `fullouterjoin` ⟗ to the symbol
+  table and the same seven names to the command list at `:310` (v0.85.0, #9050). Separately in-window
+  (v0.84.2): required arguments starting on a new line parsed as empty, and control spaces split
+  across line endings dropping complete expressions to raw source — the scanner now consumes `\n`
+  and `\r\n` as a space. cyrup's port is `crates/cyrup-tui/src/markdown/latex.rs` (2 242 lines; this
+  area's Coverage at `:3014` records it "already ported"), and
+  `grep -n "bowtie|ltimes|rtimes|outerjoin|⋈"` over it returns **zero** — the seven symbols are
+  absent. Both sides read **for the symbol half only**; the control-space/newline half was NOT read on
+  the cyrup side and must be marked one-sided if filed. Low user-visible impact.
+- **`SettingsList.selectItem(id)` and the submenu `navigateTo` close option** — S, **cyrup side NOT
+  READ.** `components/settings-list.ts @v0.85.1`: `submenu?: (currentValue, done: (selectedValue?,
+  options?: { navigateTo?: string }) => Component)`, a new `selectItem(id): void` (no-op when the id
+  is not found) and `navigateAfterClose: string | null`, so a submenu's `done` can ask the parent to
+  move its cursor to a named item after closing. The upstream change is confirmed from the diff.
+  cyrup's counterparts — `crates/cyrup-tui/src/settings_selector.rs`, `submenu_selector.rs`,
+  `app/settings_rows.rs` — were not opened. **This area's own Coverage flags exactly this risk at
+  `:3045`** ("Selector internals were sampled, not swept", naming `settings_selector.rs`). Recorded so
+  the gap is visible; it needs a cyrup-side read before it is a candidate proper.
+- **`Loader` embedded working-indicator seam** — S, **cyrup side NOT READ.**
+  `components/loader.ts @v0.85.1`: `updateDisplay()` split into a `protected getRenderedIndicator():
+  string` plus its caller, and `override invalidate()` now calls `super.invalidate()` then
+  `updateDisplay()`; the empty-frame test moved from `frame.length > 0` to
+  `renderedFrame.length > 0`. CHANGELOG [0.85.0], #8799. Partly a refactor for extensibility (low port
+  value alone) and partly a real behaviour change — invalidation re-derives the display instead of
+  leaving a stale cached frame. cyrup's candidates, `crates/cyrup-tui/src/status_indicator.rs` and
+  `status.rs`, were not opened. Recorded so it is not silently dropped.
+
+### Ledger text invalidated by cyrup-side change
+
+- **`TUI-040`'s prescribed fix now cites a convention that no longer exists** — S. Commit `dd44b3c`
+  removed every `PI_*` alias in `cyrup-tui`, including the whole dual-lookup helper
+  (`capability_override_value` and the `PI_IMAGE_PROTOCOL` / `PI_TRUE_COLOR` / `PI_HYPERLINKS` /
+  `PI_EXPERIMENTAL` lookups in `image.rs` and `status.rs`), matching the workspace-wide deletion in
+  `crates/cyrup-config/src/env.rs:123`. `TUI-040` is OPEN ("No `PI_TUI_WRITE_LOG` equivalent") and its
+  Fix at `07:2011` reads "Add a `CYRUP_TUI_WRITE_LOG` (accepting `PI_TUI_WRITE_LOG` as an alias,
+  consistent with the env aliasing in `crates/cyrup-config/src/env.rs`)". **The aliasing it points at
+  is gone, so following that Fix as written would introduce the only `PI_` alias left in the
+  workspace.** The item's substance is untouched — no `write_log` exists in `cyrup-tui` at `b28d3ff`.
+  Both sides read at `b28d3ff`. *Lead against `TUI-040`: its Fix text needs rewording; its severity,
+  status and subject do not change, and the row is left as it stands.*
+
+---
+
+## Audit history — everything from here down predates 2026-09-14
+
+Unchanged. Each block below records what somebody actually read at the time and is correct as
+history; the provenance block at the top of this file says how stale that makes it. The
+`## Open items` table further down remains the authority for what is open in this area — the census
+above opened nothing, closed nothing and re-severitied nothing.
+
 > **Re-audited 2026-08-12, cyrup HEAD `04c1ba2` (last code commit; working tree clean at `a9000b1`, docs-only), against pi `v0.84.1`.**
 >
 > The version-lag items in this file were measured against pi **`v0.84.1`**, with pi **`v0.83.0`** — the tag cyrup was ported from — read directly wherever a finding had to be classified `not-ported` (absent at the baseline too) versus `upstream-drift` (landed in the `v0.83.0..v0.84.1` window: 627 files, +52291/−17556). Every `closed` verdict below was reached by reading the Rust at HEAD **and** the TypeScript at the tag; no closure rests on a commit message.
@@ -1630,7 +1861,7 @@ The third line reads `self.col`, i.e. the **live pre-undo** column, and merely c
 > **Re-rated `low` → `medium` in the 2026-08-12 repair pass, and the ADR-0001 justification struck.**
 > The prior text read "Severity stays low as a deliberate ADR-0001 divergence". That is not admissible
 > here for two independent reasons. **(1) The ADR does not exist in this workspace** —
-> `PARITY-GAPS.md:709` records it as unreadable, and README:208-212 says a code comment or item
+> `PARITY-GAPS.md:734` records it as unreadable, and README:208-212 says a code comment or item
 > invoking an ADR id to justify a divergence is an unverifiable claim, not a decision of record.
 > **(2) Even a real ADR would not hold the rating down**, because README:213-215 and PARITY-GAPS both
 > state that there is no accepted-divergence category and that a mechanism difference which *costs
@@ -2374,7 +2605,7 @@ The conversation is still in the transcript and still in the session file, but t
 
 **upstream** — `pi/packages/tui/src/keybindings.ts:34` (id) and `:121` (`defaultKeys: "ctrl+c"`, "Copy selection"); consumed at `pi/packages/tui/src/components/editor.ts:654` `if (kb.matches(data, "tui.input.copy")) { return; }`; doc row `pi/packages/coding-agent/docs/keybindings.md:73`.
 
-**Impact** — this is the ONE id whose whole job is to tell the editor *not* to consume a key, so the app tier gets it. Upstream, rebinding `tui.input.copy` to `ctrl+q` makes the editor forward Ctrl+Q to the parent. In cyrup the rebind is accepted, migrated, and discarded. Stock behaviour is accidentally right — `EditorKeymap::default()` binds no `ctrl+c`, so it falls through to `Action::Clear` — so this is **config-inertness, not a default-chord break**, which is why it stayed invisible: TUI-028 named it only inside its prose ("`tui.input.copy` also has no cyrup destination at all", `07-cyrup-tui.md:692`) and its Fix section never listed it, so TUI-028's closure did not cover it and no step ever owned it.
+**Impact** — this is the ONE id whose whole job is to tell the editor *not* to consume a key, so the app tier gets it. Upstream, rebinding `tui.input.copy` to `ctrl+q` makes the editor forward Ctrl+Q to the parent. In cyrup the rebind is accepted, migrated, and discarded. Stock behaviour is accidentally right — `EditorKeymap::default()` binds no `ctrl+c`, so it falls through to `Action::Clear` — so this is **config-inertness, not a default-chord break**, which is why it stayed invisible: TUI-028 named it only inside its prose ("`tui.input.copy` also has no cyrup destination at all", `07-cyrup-tui.md:923`) and its Fix section never listed it, so TUI-028's closure did not cover it and no step ever owned it.
 
 **Fix** — add `EditorAction::PassThrough` (name it for what it does upstream: the editor declines the key) with a `"tui.input.copy" | "input.copy"` arm in `from_id`, bound to nothing by default, and have `InputEditor::handle_input` return early when it resolves — the port of `editor.ts:654`'s bare `return`.
 
@@ -2429,7 +2660,7 @@ The conversation is still in the transcript and still in the session file, but t
 
 **upstream** — `pi/packages/coding-agent/src/core/keybindings.ts:42` (id) and `:151-154` (`defaultKeys: "ctrl+backspace"`, "Delete session when query is empty"); consumed at `pi/packages/coding-agent/src/modes/interactive/components/session-selector.ts:592-600`; rename entry `deleteSessionNoninvasive` at `:268`; doc row `pi/packages/coding-agent/docs/keybindings.md:105`.
 
-**Impact** — in `/resume` with an empty search query, upstream Ctrl+Backspace opens the delete-confirmation for the highlighted session (`session-selector.ts:599` `startDeleteConfirmationForSelectedSession()`). In cyrup the event falls to the catch-all at `session_selector.rs:1013` — `if key.code == KeyCode::Backspace { self.backspace(); }`, which **does not check modifiers** — so Ctrl+Backspace runs a no-op backspace on an already-empty query and the user sees nothing happen. The non-empty-query half (forward to the input, re-filter) is also absent. The id was invisible to nine sweeps because it *does* appear in `crates/cyrup-config/src/keybindings.rs:106,178` and in CFG-048's prose at `05-cyrup-config-and-resources.md:381` — but only as evidence for the **rename table**, never as an unbound action.
+**Impact** — in `/resume` with an empty search query, upstream Ctrl+Backspace opens the delete-confirmation for the highlighted session (`session-selector.ts:599` `startDeleteConfirmationForSelectedSession()`). In cyrup the event falls to the catch-all at `session_selector.rs:1013` — `if key.code == KeyCode::Backspace { self.backspace(); }`, which **does not check modifiers** — so Ctrl+Backspace runs a no-op backspace on an already-empty query and the user sees nothing happen. The non-empty-query half (forward to the input, re-filter) is also absent. The id was invisible to nine sweeps because it *does* appear in `crates/cyrup-config/src/keybindings.rs:106,178` and in CFG-048's prose at `05-cyrup-config-and-resources.md:562` — but only as evidence for the **rename table**, never as an unbound action.
 
 **Fix** — add `SessionAction::DeleteNoninvasive` with the `"app.session.deleteNoninvasive"` arm in `from_id`, default `ctrl+backspace` in `SessionKeymap::default()`, and port `session-selector.ts:592-600`: on an empty query start the delete confirmation for the selected session; otherwise fall through to the query input and re-filter. Resolve it **before** the `KeyCode::Backspace` catch-all at `session_selector.rs:1013`, which today swallows the modifier.
 
@@ -3060,7 +3291,7 @@ must decide.
 **OQ-07-1 — Does cyrup build an alt-screen / fullscreen TUI mode at all? (TUI-019)**
 
 - **Status:** undecided in any readable document. The prior "deliberate ADR-0001 divergence"
-  justification is withdrawn — `PARITY-GAPS.md:709` records ADR-0001 as unreadable in this workspace,
+  justification is withdrawn — `PARITY-GAPS.md:734` records ADR-0001 as unreadable in this workspace,
   and README:208-212 forbids resting an item on an unverifiable ADR reference. **No decision of record
   exists**, so the previous `low` was encoding a decision nobody made.
 - **Blocked on the answer:** the alt-screen `App` variant, mouse capture, the scrollbar, semantic

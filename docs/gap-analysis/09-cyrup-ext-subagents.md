@@ -7,6 +7,220 @@ no version string; v0.43.0 is the `PARITY-GAPS.md` inference, and every upstream
 settled with `git show v0.43.0:<path>` or `git show v0.47.1:<path>`, never clone HEAD, because
 clone-HEAD line numbers and file existence both mislead here).
 
+> ### PROVENANCE CORRECTION 2026-09-14 — pins re-derived; this file was NOT re-read
+>
+> **Audited at (history — unchanged, and correct as written):** pi-subagents **v0.43.0** (the
+> inferred ported baseline) and **v0.47.1** (then-latest), cyrup HEAD `04c1ba2`, reconciled at
+> `380c713`. Every `git show v0.43.0:<path>` / `git show v0.47.1:<path>` citation in this file records
+> what somebody actually read at that tag. **None of them may be rewritten to a newer tag** — doing so
+> fabricates verification that never happened.
+>
+> **Current pins:** pi-subagents **v0.67.0**. cyrup code HEAD **`b28d3ff`** (the README baselines
+> table records `9aeba769` as the last CODE commit and marks `824a539e` superseded; `9aeba769..b28d3ff`
+> is docs-only, so `b28d3ff` and `9aeba769` are byte-identical under `crates/`, and the area rows below
+> are pinned to code at or before `824a539e`).
+>
+> **Therefore unmeasured by this file:** upstream **`v0.47.1..v0.67.0`** entire — of which
+> `v0.47.1..v0.57.0` is covered by `09a` and **`v0.57.0..v0.67.0` is covered by no file** — and the
+> cyrup side **`824a539e..b28d3ff`**, which is where the whole `workflowScript` runtime and the
+> net-new `cyrup-workflow-runtime` crate landed.
+>
+> **This correction re-read nothing.** No row was re-verified, no severity re-derived, no count
+> changed, no item opened or closed. Only the pins moved. The census below is a worklist of
+> **UNVERIFIED leads**, not findings.
+>
+> **A second pin correction, recorded and not applied:** the "≈v0.43.0" ported baseline is
+> contradicted by this crate's own in-source citations —
+> `grep -rhoE 'v0\.[0-9]+\.[0-9]+' crates/cyrup-ext-subagents/src | sort | uniq -c | sort -rn` at
+> `b28d3ff` returns v0.43.0=611, v0.34.0=334, **v0.64.0=330**, v0.57.0=120, v0.47.1=98, v0.62.0=6,
+> v0.63.0=5, v0.66.0=1, and zero citations of v0.65.x or v0.67.0. **This crate has no single baseline
+> and the README's one-number cell cannot express that.** The practical consequence for every row
+> below: a surface absent from cyrup but stamped `@v0.64.0` elsewhere in the same crate is a **miss**,
+> not lag. Other upstream pins re-checked and unchanged: `pi-permission-system` v0.8.0,
+> `pi-intercom` v0.13.0, `pi-acp` v0.0.33.
+
+## UNVERIFIED census 2026-09-14 — leads against the current pins
+
+**Nothing in this section is a finding.** These are leads collected by a census pass reading source on
+both sides at the pins above; none has been through an adversarial refutation, none carries a `SUBA-`
+id, and id assignment belongs to a pass that verifies both sides. **No open-item row, severity or
+count elsewhere in this file was changed by this census.** Where a lead bears on an existing item it
+names that item; the item's row is untouched.
+
+Sizes are the census's own estimate on the same `S`/`M`/`L` scale this file uses.
+
+**Self-citations by line number are as-read before this block was inserted.** A `09:NNN` offset
+below is short by **209 lines** against this file at HEAD, and a `09a:NNN` offset by **352 lines**
+against `09a` at HEAD; both files gained a provenance block and a census ahead of their bodies in
+the same pass. Follow the item id, not the offset.
+
+### Corpus health and provenance
+
+- **243 in-source cyrup citations now name upstream files that do not exist at v0.67.0.** `S` —
+  `git cat-file -e v0.67.0:<path>` fails for all of `src/runs/shared/pi-args.ts`,
+  `child-protocol.ts`, `subagent-startup-retry.ts`, `turn-budget.ts` and `src/shared/post-exit-stdio-guard.ts`;
+  cyrup-side counts by `grep -rc` over `crates/cyrup-ext-subagents/src` are pi-args 171, child-protocol 44,
+  subagent-startup-retry 14, turn-budget 14, post-exit-stdio-guard 0. Four were deleted by `d9bc62f8`
+  (the in-process migration), `turn-budget.ts` by `94ecb662`. **Tag-stamped citations (`@v0.64.0`) stay
+  resolvable and are not the problem**; bare ones become *unresolvable, not merely stale* — the same
+  trap `09a`'s restructure-trap section documents for `extension.rs`, running in the opposite
+  direction. This is the citation-lint case the README already owns.
+- **The recorded ≈v0.43.0 baseline is contradicted by the crate's own citations.** `S` — see the
+  provenance block above. Counter-evidence for the README's first standing hazard ("census the
+  baseline, do not inherit it").
+- **The `workflowScript` port is pinned to v0.66.0 and nothing in the code says so.** `S` — recovered
+  only by line-number archaeology: `workflows/scripted/engine.rs:1` and `:2610` cite
+  `scripted-workflow.ts:1717-2284`; that file is 2 284 lines at v0.66.0 with `:1717` =
+  `export async function runWorkflowScript(`, and 2 514 lines at v0.67.0 where `:1717` is
+  `dynamic = true;`. Zero `@vX.Y.Z` markers exist anywhere in `src/workflows/` or
+  `cyrup-workflow-runtime/`. Two leads: the crate should record its tag, and **`v0.66.0..v0.67.0` on
+  `src/workflows/` is an unmeasured drift window over the freshest code in the crate**.
+
+### workflowScript — ported, and mostly ungranted
+
+The subsystem `09:1306` (blind spot 2) called "the biggest unaudited mass" now exists:
+`crates/cyrup-ext-subagents/src/workflows/` is 27 files / 19 957 lines, `crates/cyrup-workflow-runtime`
+is 926 lines of src, the tool advertises `workflowScript` (`extension/tool/schema.rs:337`) and
+`route_workflow_mode` (`extension/tool/routing.rs:523`) mints a real `RunMode::Workflow` run dir.
+Upstream v0.66.0's `src/workflows/` is 9 files / 4 414 lines; all nine have counterparts.
+
+- **`SUBA-016`'s `BLOCKED on workflowScript` rating is stale.** `M` — the stated hard prerequisite is
+  satisfied. `schedule.*` is still undispatched and the code says so twice
+  (`extension/executor/foreground_actions/stop.rs:215`, `registration/authority.rs:66`), so the item
+  stays open, but its **XL / BLOCKED** rating and its whole blocking paragraph (`09:517-523`) are wrong
+  and must be rewritten before anyone plans against them. `scheduled-runs.ts` was not read this pass,
+  so the residual size is unmeasured.
+- **Async/detached workflows are permanently refused; upstream's `workflowScript` default IS async.** `L`
+  — `routing.rs:544-549` rejects `async: true` outright and `:537` calls the refusal permanent (§0.6);
+  upstream `extension/schemas.ts:348` @v0.66.0 reads "Normally async unless `asyncByDefault:false`",
+  `config.ts:235-236` returns `config.asyncByDefault !== false`, `tool-description.ts:35` says
+  "Async/background runs are the normal default". **This is the root of the group: `children.list`
+  retention, durable completion replay, `schedule.*` and the WORKFLOW_3/WORKFLOW_13 forward references
+  are all downstream of detachment.** The ledger has no "accepted divergence" category for it.
+- **`runs.host` ported (1 594 lines) but never granted.** `M` — `workflows/host_command.rs` is fully
+  ported with one production consumer (`exec/output.rs`), but `WorkflowRunHost` never overrides
+  `supports_host()` and `routing.rs:691` passes `on_host_step: None`;
+  `cyrup-workflow-runtime/src/js/prelude.js:574` deletes `surface.host`, so `runs.host` is `undefined`
+  rather than refusing. `workflows/host_step.rs` is in the same state. Upstream:
+  `src/workflows/host-command.ts` @v0.66.0 (235L, net-new since v0.57.0).
+- **Mission workflow `state.get`/`state.set` unwired.** `M` — `routing.rs:672` passes `state: None` and
+  both the run arm and the `validate` arm hard-code `state_enabled: false` (`:553`, `:1497`), so
+  `globalThis.state` is never installed. `missions/workflow_state.rs` exists.
+  `PARITY-GAPS.md:1385` names `src/missions/workflow-state.ts` as unported *because its only consumer
+  was unported* — the consumer now exists and declines the capability, which moves the item from
+  **not-ported to unwired**.
+- **Workflow RESOURCE provenance unwired.** `M` — `workflows/resources.rs` (883L) and `permit.rs` (574L)
+  are ported and the executor owns a `WorkflowResourceRegistry` (`extension/executor/mod.rs:227`), but
+  `routing.rs:659` passes `one_use_permit: None` and `:863` `resource: None`, and cyrup's 48 advertised
+  keys (`extension/tool/schema.rs`) contain `workflowScript` and none of `workflow` / `args` /
+  `workflowScriptPath` (upstream `extension/schemas.ts:282-395` @v0.66.0 has all four). This is also
+  why `runs.host` stays off — `lib.rs`'s op doc says host is registered only for `workflow`-provenance
+  runs.
+- **Seven more upstream workflow-level params unadvertised while their modules are ported.** `M` —
+  `globalConcurrencyLimit`, `maxSubagentSpawnsPerRun`, `preflight`, `chatProgress`, `isolation`,
+  `baseRef`, `lane` all sit at top level in `extension/schemas.ts:282-395` @v0.66.0; none is in cyrup's
+  advertised list. Yet `workflows/preflight.rs` is 1 306 lines, `chat_progress.rs` 652,
+  `lane_metadata.rs` 16 122 bytes, `scripted/git_ref.rs` is `valid_git_ref` (= `baseRef`), and
+  `exec/run_fanout_budget.rs` is 1 667 lines whose config key exists (`registration/mod.rs:108`) but is
+  never a tool param. **One cause, so probably one row with a sub-list, not seven rows.**
+- **`checklist.rs` (2 301 lines) and `chat_progress.rs` (652 lines) have NO production caller.** `M` —
+  `git grep project_workflow_checklist` and `resolve_workflow_chat_progress` at `b28d3ff` return only
+  the module and its `mod.rs` re-export. ~2 950 lines of ported, tested, dead code, distinct from the
+  param gap because wiring `chatProgress`/`preflight` as params would still not reach the checklist
+  projection. Exactly the class `09:1085-1099` blind spot 6 predicted would recur.
+- **Three live `RunWorkflowScriptOptions` callbacks passed `None`, each with its reason in-line.** `S` —
+  `routing.rs:674` `register_stop_child: None`, `:682` `on_lane_plan: None` (`runs.lanes` still works;
+  only the advisory plan callback is undelivered), `:689` `on_emit: None` with a two-part reason
+  (quadratic re-forwarding; emit is the one callback whose failure is fatal). `on_trace: None` is
+  deliberate and correct. **`on_emit` is the one with real cost** — live emit forwarding is absent and
+  the code says it needs an engine change, not a wiring change; `register_stop_child` becomes
+  load-bearing the moment async workflows exist.
+- **`extension/executor/workflow.rs`'s module doc contradicts its own code.** `S` — `:4-11` says the
+  file implements "the two REQUIRED trait methods and nothing else" and that keyed resume is "PRESENT
+  AND REFUSING"; `:578-583` says keyed receipt resume **is** available, `supports_resolve_resume`
+  returns `true` with a full `resolve_resume` at `:585-617`, and `supports_steer` returns `true` at
+  `:624`. Documentation-only, but it is the header a later pass reads first and it under-reports the
+  port. cyrup side only.
+- **Does `cyrup-workflow-runtime` need its own area file?** `M` — the net-new crate is `Cargo.toml` (23),
+  `src/lib.rs` (322: the `WorkflowOpsBridge` trait, 12 `#[op2]` ops, `build_snapshot`) and
+  `src/js/prelude.js` (604: the guest sandbox and every guest-side validation error string), consumed
+  twice by `cyrup-ext-subagents` (a `[build-dependencies]` edge from `build.rs`, and `engine.rs:2166`
+  `include_bytes!` / `:2301` `startup_snapshot`). **The census's read, offered as a lead not a ruling:
+  no peer area file.** It has no upstream of its own — it is one half of ONE upstream file
+  (`scripted-workflow.ts`'s 960-line `WORKER_SOURCE`, `:34-995` @v0.66.0), split purely by a Cargo
+  constraint the crate states explicitly, and a peer file would split one upstream unit across two
+  areas. The shape that fits is a `## workflowScript runtime` section here, or a
+  `09b-cyrup-workflowscript.md` covering BOTH `src/workflows/` and this crate — which the ~20 900-line
+  size does justify. `prelude.js`'s error strings are product surface (`scripted/mod.rs:20` says so)
+  and need a home either way.
+
+### Tool surface and verb census
+
+- **`SUBA-005`'s verb census is stale in both directions: 32 advertised vs 57 upstream.** `S` — upstream
+  `src/shared/types.ts:2757` @v0.66.0 has **57** `SUBAGENT_ACTIONS`; `extension/tool/text.rs:195-258`
+  has **32** (adds `guide`, `validate`, `dismiss`, `grant-spawn-budget`, `mission.resolve-decision`
+  since the recorded 27). `09:353`'s "27 … 50 @v0.43.0 and 53 @v0.47.1" and `09a:3344`'s "30 vs 52" are
+  both superseded. Newly-unowned verb families visible at v0.66.0: `worktree.cleanup`, `lane.status`,
+  `lane.recordMerge`, `lane.recordSupersession`, `refine`, `refine.show`, `inspector.open/status`,
+  `project.open/status`, `debug.run`, plus the nine `schedule.*`. **Tracker maintenance, not new work —
+  but `SUBA-005` is the index other rows route to, so a stale count there mis-sizes the area.**
+- **`append-step` is still dispatched by cyrup; upstream deleted it between v0.47.1 and v0.57.0.** `S` —
+  `SUBAGENT_ACTIONS` contains it at v0.43.0 and v0.47.1 and not at v0.57.0, v0.64.0 or v0.66.0;
+  `extension/tool/text.rs:195-258` still lists it and `schema.rs` advertises the whole array as the
+  `action` enum, so the verb is live on the model-facing surface. **CAUTION:** `09a:3344` already notes
+  `−append-step … via 7ece6f35` and routed it to `SUBA-005` as census rather than work, so this may be
+  knowingly-unfiled — check `SUBA-005`'s body before filing.
+- **cyrup still advertises the v0.34-era execution surface upstream deleted: `tasks`, `chain`,
+  `concurrency`, `chainDir`, `clarify`.** `L` — none is in `extension/schemas.ts:282-395` @v0.66.0;
+  `extension/tool/schema.rs` inserts all five and `route_chain_mode`/`route_parallel_mode` are still
+  live arms. `09:1306` predicted exactly this but framed it as blocked behind the unported runtime;
+  **the runtime is now ported and the two surfaces coexist**, so the deferred question — retire, keep
+  both, or document the divergence — is answerable and schedulable. A scope/decision lead, not a defect
+  claim.
+- **`turnBudget`: cyrup carries a live implementation upstream deleted inside the window — bears on
+  `SUBA-008`.** `M` — `94ecb662` "refactor: remove turn budget controls (#1579)" (after v0.57.0) deleted
+  `src/runs/shared/turn-budget.ts` (98L) and stripped it from `agents.ts`, `agent-management.ts`,
+  `agent-serializer.ts`, `runtime-agent-registry.ts`, `api/delegation.ts`, `api/preflight.ts`,
+  `extension/schemas.ts`, `launch-contract.ts`, `slash/delegation-*.ts`, `execution.ts` (−95) and
+  `subagent-runner.ts` (−217); `git cat-file -e v0.67.0:src/runs/shared/turn-budget.ts` fails. cyrup's
+  `exec/turn_budget.rs:166`/`:326` is live on the production path (`exec/spawn_plan.rs:807`) with result
+  fields at `exec/run_result.rs:126,134`. **`stale-port` class — but "delete `turn_budget.rs`" is NOT
+  the obvious fix**: upstream removed the CONTROLS and kept residual `turnBudget`/`turnBudgetExceeded`
+  STATE through `async-job-tracker.ts` and `async-resume.ts` at v0.67.0. The right question is which
+  half of `SUBA-008`'s surface still has an upstream counterpart, and that needs a field-by-field read
+  of those two files at the tag, which this census did not do. `SUBA-008`'s row is unchanged.
+
+### Ledger maintenance — paragraphs that now point the wrong way
+
+- **Blind spot 4 is closed: `run-fanout-budget.ts` is ported.** `S` — `09:1085-1099` blind spot 4 said
+  it was "deliberately not filed, because the hard rules require citing a named tag. Pick it up on the
+  next tag." It was picked up: `exec/run_fanout_budget.rs:1-20` is 1 667 lines under the port's own id
+  `CFG-067`, with a directory-backed claims ledger crossing the spawn boundary via
+  `RUN_FANOUT_BUDGET_ENV`, config key at `registration/mod.rs:108` and doctor surface at
+  `extension/executor/reports.rs:110`. The blind-spot entry should be retired; the residual (the
+  `maxSubagentSpawnsPerRun` TOOL PARAM is still unadvertised) is the seven-params lead above. **Upstream
+  side not read — this is a code-side observation plus the port's own citation.**
+- **`## Coverage` and `## Blind spots` are materially stale on this subsystem.** `S` — blind spot 2
+  ("the biggest unaudited mass is `workflowScript` … treat this area's open count as a floor by a wide
+  margin") no longer describes the crate; blind spot 3 lists `scripted-workflow.ts` (502 lines) as "not
+  read at all on the upstream side" where it is now the crate's largest ported unit; blind spot 4 is
+  closed; and `09:929`'s `SUBA-055` closure note declines `children.list` as "part of the unported
+  `workflowScript` shape" where `extension/tool/text.rs:203-213` has **already retired that wording in
+  the code** and replaced it with the real reason (no retention — the foreground host's `settled` list
+  dies with the tool call, so the listing would always be empty). Pure ledger maintenance, but these
+  are the paragraphs a planner reads to size the area.
+
+### Where the cross-file work lands
+
+The census's `v0.57.0..v0.67.0` leads are filed in `09a` for want of a better home, and `09a`'s scope
+line binds it to `v0.47.1..v0.57.0`. **A `09b-cyrup-ext-subagents-v0.67-drift.md` is the structurally
+correct home**, on the precedent that created `09a`. `PARITY-GAPS.md`'s `VL-S2` (`:1174-1175`,
+`workflowScript` + `chatProgress` as a large unported port bug citing `extension.rs:5327-5338`) and
+`PARITY-PLAN.md:1033`/`:1396` are the cross-file owners of the workflow rows above and are stale in
+the same direction; `PARITY-GAPS.md:1562` still lists `workflows/scripted-workflow.ts` as unread
+upstream. None of those files was touched by this census.
+
+
 > **Re-audited 2026-08-12, cyrup HEAD `04c1ba2`** (last code commit; tree clean at docs-only
 > `a9000b1`), against **pi-subagents `v0.43.0`** (ported baseline) and **`v0.47.1`** (latest tag).
 >

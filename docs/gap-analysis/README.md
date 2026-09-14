@@ -200,6 +200,49 @@ a deletion — `SEAM-035`…`SEAM-046` never existed, and area 08 records the ch
 **Read upstream with `git -C <repo> show <tag>:<path>`, never from a working tree.** Clone-HEAD line
 numbers and file existence both mislead; items have named files that never existed at any tag.
 
+### Which area file is pinned where, and what each is blind to
+
+The table above is the state of the **upstreams**. It cannot answer the question a planner actually
+asks — *how stale is the file I am about to open?* — because every area file carries its own pin, set
+when that file was last read, and those pins have never agreed with each other or with the table
+above. Recovering them meant grepping sixteen headers. This is that grep, done once, on 2026-09-14.
+
+**Read it as staleness, not as work.** A blind window is a range in which this directory has no
+opinion; it is not a backlog and it is not a count. **Where an area file states its own per-module
+range, that range wins over the single tag in this column** — area 07 is the live example, and area
+09 is the live warning. Nothing in this table re-verifies any file; it only says how old each one is.
+
+| area file(s) | pinned at, per its own header (history — do not rewrite) | blind window | 2026-09-14 census |
+|---|---|---|---|
+| `01` · `02` · `03` · `05` · `06` · `12` | pi **v0.83.0** ported / **v0.84.1** drift target | `v0.84.1..v0.85.1` | censused as UNVERIFIED leads; nothing filed |
+| `04` · `08` | pi **v0.84.1** (area 08 also skimmed `modes/rpc/` + `json-event.ts` to v0.84.4) | `v0.84.1..v0.85.1` | censused as UNVERIFIED leads; nothing filed. **The pin understates the port**: `powershell`, `defaultTools`, `clear_queue` and the json-event projection are already chased to v0.84.2–v0.84.4 |
+| `07` | pi **v0.84.1** declared — but the crate's own module docs cite **@v0.84.3** (`altscreen/{mouse,wheel}.rs`, `keymap.rs:2041-2045`) | `v0.84.1..v0.85.1` for `packages/tui` + `modes/interactive/`; `packages/chord` is net-new and unowned | censused as UNVERIFIED leads. **Its header records a per-module range of v0.84.1–v0.84.3, not a single tag; believe that over this row** |
+| `09` | pi-subagents **≈v0.43.0** ported (inferred) / **v0.47.1** measured. The crate's own citation census — v0.43.0 × 611, **v0.64.0 × 330**, v0.57.0 × 120 — says it has no single baseline | `v0.47.1..v0.67.0`, of which `v0.47.1..v0.57.0` is area 09a's | censused as UNVERIFIED leads |
+| `09a` | pi-subagents **v0.47.1 → v0.57.0** by its `## Scope`; `v0.57.0..v0.64.0` skimmed, one item filed | `v0.57.0..v0.67.0` | censused as UNVERIFIED leads, filed into 09a as the drift-holder. **No file's scope covers `v0.57.0..v0.67.0`; a `09b` is the structurally correct home**, on the precedent that created 09a |
+| `10` | pi-permission-system **v0.8.0** = the latest tag | none | not censused — nothing to census |
+| `11` | pi-intercom **v0.9.2** ported (corrected from v0.7.0) / **v0.10.1** measured; its own body flags `v0.10.1..v0.12.0` as *unopened* | `v0.10.1..v0.13.0` | **not censused this pass** |
+| `13` · `13a`–`13i` | pi-mcp-adapter **v2.25.0**; `13-cyrup-mcp.md`'s *Retarget* section also holds **v2.26.1** | `v2.32.1..v2.33.0`. `v2.25.0..v2.26.1` is held by that retarget section and `v2.26.1..v2.32.1` by `13-cyrup-mcp-STATUS.md` | censused as UNVERIFIED leads; no `MCP-` id assigned, numbering resumes from `MCP-539` |
+| `13-cyrup-mcp-STATUS.md` | pi-mcp-adapter **v2.26.1** (2026-08-21 census) / **v2.32.1** (2026-09-04 re-audit) | `v2.32.1..v2.33.0` | censused as UNVERIFIED leads; **no status cell moved** |
+| `14` | code_puppy_core_plugins **v0.0.6** ported / **v0.0.40** measured | `v0.0.40..v0.0.50` — **empty on the ported surface**, which is byte-identical across all 39 tags | not censused; the second upstream (`code_puppy` itself) is a separate, unpinned question — see `FLUX-007` |
+| `15` | pi-acp **v0.0.33** = the latest tag | none upstream. Its *cyrup* side is the stale axis: three commits touching `crates/cyrup-acp` post-date its last correction | censused; its own provenance block carries the correction |
+
+**Two things this table makes visible that no single file could.** (1) **The directory holds at least
+five different pins against `pi` alone** — v0.83.0, v0.84.1, v0.84.3, v0.84.4 and v0.85.1 — and the
+difference between them is not uniformly staleness: areas 04, 07 and 08 are ported *ahead* of their
+recorded pin on specific surfaces, so a census that assumes the recorded tag files already-closed
+work. (2) **One upstream window is owned by no file at all**: pi-subagents `v0.57.0..v0.67.0` falls
+outside area 09's settled range and outside 09a's declared `## Scope`, so leads filed into 09a sit
+under a scope line that excludes them.
+
+> **LINE-CITATION SHIFT, stated so nobody re-verifies against the wrong line.** Inserting this
+> section moved **43 lines** into this file immediately above *Three standing hazards*. Every
+> `README.md:<line>` citation elsewhere in this directory that named a line **at or after old line
+> 203** is now short by 43 — `:208-212` → `:251-255`, `:224-225` → `:267-268`, `:509-512` →
+> `:552-555`. Citations above 203 (`:3-4`, `:68`, `:106-107`, `:133`, `:196-199`) are unaffected.
+> Those citations live in files this pass does not own and were **not** edited; this note is the
+> repair instruction, and it is one more instance of the dangling-citation problem *Work this
+> directory owns* already names.
+
 Three standing hazards:
 
 - **A recorded baseline is an unverified claim, and a wrong one silently reclassifies work.**

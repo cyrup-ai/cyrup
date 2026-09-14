@@ -54,6 +54,66 @@ exists.
 
 ---
 
+> ### PROVENANCE CORRECTION — 2026-09-14. The pins below are revised; **this file was not re-read.**
+>
+> Everything in this file is history and is correct as written. Its body was audited against
+> **`pi-mcp-adapter` v2.25.0**, and its *Retarget — v2.25.0 → v2.26.1* section against **v2.26.1**;
+> both stay, because they record what somebody actually read. **Nothing in this block re-verifies any
+> of it: no unit was re-read, no obligation re-derived, no count, severity, verdict or status
+> changed.** This block states only how stale the file is.
+>
+> | | audited at (history — do not rewrite) | current pin (authoritative, per `README.md`'s baselines table) | window this file has never measured |
+> |---|---|---|---|
+> | `pi-mcp-adapter` | **`v2.25.0`** body / **`v2.26.1`** retarget section | **`v2.33.0`** *(was v2.32.1)* | `v2.25.0..v2.33.0` = **211 files, +27 961 / −2 129**, 113 non-merge commits. Two segments of that range are measured elsewhere and are NOT this file's blind spot: `v2.25.0..v2.26.1` by [`13-cyrup-mcp.md`](13-cyrup-mcp.md)'s *Retarget* section, `v2.26.1..v2.32.1` by [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md)'s 2026-09-04 re-audit. **`v2.32.1..v2.33.0` = 123 files, +9 455 / −1 352, 33 non-merge commits, is measured by nobody.** That is the unmeasured window, and the census below is its lead list |
+> | `cyrup` | **deliberately unpinned** — this file cites cyrup by symbol and file only, and its header says so | code HEAD **`b28d3ff`**; the ledger's last recorded code baseline is `824a539e` | **Not expressible.** With no sha ever recorded here there is no window to name: the staleness of a cyrup claim in this file cannot be bounded, only re-read. For scale, `crates/cyrup-mcp` at `b28d3ff` is **43 `.rs` files / 79 930 lines** under `src` — 29 top-level modules plus the `proxy/` tree |
+> | `pi` · `pi-subagents` · `pi-permission-system` · `pi-intercom` · `pi-acp` · `code_puppy_core_plugins` | — | `v0.85.1` · `v0.67.0` · `v0.8.0` · `v0.13.0` · `v0.0.33` · `v0.0.50` (ported surface byte-identical across all 39 tags) | out of this area's scope |
+
+## UNVERIFIED — 2026-09-14 census of the `v2.32.1..v2.33.0` window (leads, not items)
+
+**Nothing in this section is a port unit.** No `MCP-NNN` id is assigned — id allocation belongs to a
+pass that read both sides, and this one did not read the cyrup side everywhere. Numbering, when it
+resumes, continues from **`MCP-539`** (the highest id the v2.32.1 pass allocated), and the section
+ranges in *§ Which section owns which unit ids* govern which file takes each. **No row in the
+canonical table is opened, closed, re-ranked or re-verdicted by anything here, and no severity,
+status or count moves.**
+
+Census method: upstream read only via `git -C tmp/pi-mcp-adapter show v2.33.0:<path>` and
+`git diff v2.32.1..v2.33.0 -- <path>`, never from the clone's working tree; cyrup read at `b28d3ff`.
+`mcp-panel.ts` (+698 changed lines) and `mcp-setup-panel.ts` (+722) were **sampled, not read**, so
+the two 13h leads drawn from them are low-resolution. Every "cyrup has none" below that rests on a
+`grep` says so in place; the 2026-08-21 adversarial pass overturned 15 rulings for exactly that
+failure mode.
+
+**This file drew no new surfaces of its own** — every candidate in the window lands in 13a–13i and is
+filed there. What it did draw is three of *its own* statements that the window falsifies. Each is a
+lead against the text named; the text is left standing because it is correct at the tag it was
+written at.
+
+- **`13-cyrup-mcp.md:237`** — the v2.25.0 → v2.26.1 delta table records `URL_BOUND_AUTH_FIELDS` as
+  **3 → 4**. The true series is 3 (v2.25.0) → 4 (v2.26.1) → 5 (v2.32.1) → **6** (v2.33.0: `caFile`
+  appended, `config.ts:553`). The still-open `MCP-500` records the array as **five**; it is six, and
+  landing it at five ships the same credential-leak shape a second time. See *13b · `ServerEntry.caFile`*.
+- **`13-cyrup-mcp.md:904`** — the `C-4` seam row calls `getConfigPathFromArgv` "the literal upstream
+  mechanism. No flag-read-back gap exists". Upstream `97253eb` (#515) replaced that function whole:
+  equals-form support, a `--` terminator, a `-`/`@` value guard, and last-occurrence-wins.
+  `crates/cyrup-mcp/src/config.rs:2042-2044` documents the OLD shape as a deliberately reproduced
+  limitation and `config.rs:6004` is a test asserting it. Doc comment, implementation and test have
+  to move together. See *13b · `getConfigPathFromArgv`*.
+- **`13-cyrup-mcp.md:554`** — the Cut-2 table rules `consent-manager.ts` cut *because* a grep at
+  v2.25.0 shows its only consumers are `ui-server.ts` and `ui-session.ts`. At v2.33.0 there is a
+  third: `session-approvals.ts`, which calls `state.consentManager.clear()` and `restoreDecision`
+  while restoring **tool-approval** grants — and that surface is not cut. The cut may still be
+  right; its stated reason is not. See *13f · `ConsentManager.restoreDecision`*.
+
+Scale of the unmeasured window, for sizing only: non-test, non-`dist/` TypeScript grew **72 → 84
+files** and **28 787 → 32 041 lines**, with **eight net-new production modules** —
+`claude-plugin-loader.ts`, `http-ca.ts`, `mcp-install.ts`, `mcp-auth-fetch.ts`,
+`mcp-refresh-lock.ts`, `oauth-diagnostics.ts`, `session-approvals.ts`, `mcp-panel-theme.ts`. All six
+headline features the `README.md` baselines row names were located in source and are filed in the
+section files. Beyond the tag, the clone's HEAD `23c2852` is a further **9 commits / 74 files /
++3 231 / −1 377**, untagged and therefore deliberately not measured — but note `#572` ("preserve
+built-in Agent Plugin boundaries") is already in it and touches the plugin surface this census filed.
+
 ## Retarget — v2.26.1 → v2.32.1 (pointer)
 
 **Dated 2026-09-04.** The clone moved again, to **v2.32.1** (`10a4536`). The delta is **147 files /

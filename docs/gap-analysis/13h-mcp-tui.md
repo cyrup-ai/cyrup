@@ -77,6 +77,80 @@ over existing host verbs.
 
 ---
 
+> ### PROVENANCE CORRECTION — 2026-09-14. The pins below are revised; **this file was not re-read.**
+>
+> Everything in this file is history and is correct as written. It was audited against
+> **`pi-mcp-adapter` v2.25.0** — that is the tag its prose, its unit obligations and every upstream
+> citation in it were read at, and it stays. **Nothing in this block re-verifies any of it: no unit
+> was re-read, no obligation re-derived, no count, severity, verdict or status changed.** This block
+> states only how stale the file is; the section after it is a worklist, not a finding.
+>
+> | | audited at (history — do not rewrite) | current pin (authoritative, per `README.md`'s baselines table) | window this file has never measured |
+> |---|---|---|---|
+> | `pi-mcp-adapter` | **`v2.25.0`** (the plan's tag) | **`v2.33.0`** *(was v2.32.1)* | `v2.25.0..v2.33.0` = **211 files, +27 961 / −2 129**, 113 non-merge commits. Two segments of that range are measured elsewhere and are NOT this file's blind spot: `v2.25.0..v2.26.1` by [`13-cyrup-mcp.md`](13-cyrup-mcp.md)'s *Retarget* section, `v2.26.1..v2.32.1` by [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md)'s 2026-09-04 re-audit. **`v2.32.1..v2.33.0` = 123 files, +9 455 / −1 352, 33 non-merge commits, is measured by nobody.** That is the unmeasured window, and the census below is its lead list |
+> | `cyrup` | **deliberately unpinned** — this file cites cyrup by symbol and file only, and its header says so | code HEAD **`b28d3ff`**; the ledger's last recorded code baseline is `824a539e` | **Not expressible.** With no sha ever recorded here there is no window to name: the staleness of a cyrup claim in this file cannot be bounded, only re-read. For scale, `crates/cyrup-mcp` at `b28d3ff` is **43 `.rs` files / 79 930 lines** under `src` — 29 top-level modules plus the `proxy/` tree |
+> | `pi` · `pi-subagents` · `pi-permission-system` · `pi-intercom` · `pi-acp` · `code_puppy_core_plugins` | — | `v0.85.1` · `v0.67.0` · `v0.8.0` · `v0.13.0` · `v0.0.33` · `v0.0.50` (ported surface byte-identical across all 39 tags) | out of this area's scope |
+
+### UNVERIFIED — 2026-09-14 census of the `v2.32.1..v2.33.0` window (leads, not units)
+
+**Nothing in this section is a port unit.** No `MCP-NNN` id is assigned — id allocation belongs to a
+pass that read both sides, and this one did not read the cyrup side everywhere. Numbering resumes
+from **`MCP-539`** when such a pass files it. **No unit in this file is opened, closed, re-ranked or
+re-verdicted here, and no status cell in [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) moves.**
+
+Method: upstream read only via `git -C tmp/pi-mcp-adapter show v2.33.0:<path>` and
+`git diff v2.32.1..v2.33.0 -- <path>`; cyrup read at `b28d3ff`. Each entry names which side was read;
+where only one side was read it says so and is a lead with half its evidence missing. An absence
+stated as "grep = 0" is a grep over `crates/cyrup-mcp/src`, not proof that a differently-named
+counterpart does not exist.
+
+**Resolution warning specific to this file.** `mcp-panel.ts` (+698 changed lines) and
+`mcp-setup-panel.ts` (+722) — 1 420 of the window's ~9 455 added lines — were **sampled, not read
+line by line**. The theme refactor accounts for most of that churn, but a behavioural change could be
+hiding inside it, so the three leads below are low-resolution and the panels' non-theme changes are
+**neither censused nor cleared**.
+
+#### Changes to existing units
+
+- **Panels take the host `Theme`; `mcp-panel-theme.ts` frame and theme adapter** · M · BOTH SIDES
+  READ at low resolution. New file `mcp-panel-theme.ts` (104 lines): `:4 class McpPanelFrame
+  implements Component`, built on `DynamicBorder` from `@earendil-works/pi-coding-agent` and
+  `truncateToWidth`/`visibleWidth` from `@earendil-works/pi-tui`; `:52 interface McpPanelTheme`; `:86
+  createMcpPanelTheme(theme?: Theme)`. `commands.ts:545`, `:659`, `:739` — three `ctx.ui.custom`
+  callbacks change `(tui, _theme, keybindings, done)` to `(tui, theme, …)` and pass `theme` through to
+  `createMcpSetupPanel`/`createMcpPanel`. The 1 420 changed panel lines are almost entirely
+  `fg(t.x, …)` → `this.theme.x(…)`. Upstream `977577f` (#510). Both panels stop carrying their own
+  hardcoded colour tables and render through Pi's active theme and shared TUI components, with a
+  documented plain-text fallback when a host supplies a theme with no styling methods. cyrup:
+  `crates/cyrup-mcp/src/ui.rs:691 struct PanelTheme` and `:734 struct SetupTheme`, with `ui.rs:731`
+  explicitly documenting `SetupTheme` as the port of `mcp-setup-panel.ts`'s `DEFAULT_THEME` — **cyrup
+  ported the hardcoded tables upstream has just deleted.** Change to this file's panel units. This is
+  also the second sighting of the same theme-fallback obligation as the open **`MCP-531`** ("status
+  updates fall back to plain text when a host supplies a theme with no styling methods"), a table-B
+  row — read the two together. **`MCP-531`'s row is untouched.**
+- **`logoutServer` closes the connection before clearing credentials** · S · UPSTREAM READ IN FULL;
+  **cyrup side NOT READ** (`crates/cyrup-mcp/src/commands.rs` has a `logout` path; I did not open it).
+  `commands.ts:363-375` — `removeAuth` moves INSIDE the same `try` as `state.manager.close(serverName)`
+  and now runs after it; the two distinct failure notifications collapse into one
+  `Failed to disconnect or clear OAuth credentials for "…"`; the intermediate
+  `state.owner?.throwIfInactive()` between them is gone. Ordering and error-reporting change on
+  `/mcp logout`: a live connection is torn down before its credentials are removed, so a still-open
+  transport cannot re-persist what was just cleared, and the "credentials cleared but connection could
+  not be closed" half-state message disappears. Small, **byte-exact-message-bearing**, and exactly the
+  kind of thing a port copies from the old tag without noticing. It interacts with the credential
+  transaction work in [`13f`](13f-mcp-credentials.md), since `removeAuth` now runs inside
+  `withAuthEntryTransaction` (`mcp-auth-flow.ts:1132`).
+- **Panel no longer marks a reconnect as cached when no cache entry was restored** · S · UPSTREAM
+  READ (in diff); **cyrup side NOT READ.** `mcp-panel.ts` moves `server.hasCachedData = true` INSIDE
+  the `if` arm that actually assigns `this.cache.servers[server.name] = entry` and calls
+  `rebuildServerTools`, instead of setting it unconditionally after the block; the `(not cached)`
+  label at the row renderer is the observable. Upstream `34de8e3` (#501), issue #497. A one-line scope
+  fix — tiny, but exactly the kind of scope error a port reproduces faithfully, so it is worth a row
+  rather than a mention. **Note the same diff hunk also shows the panel learning `directTools:
+  "search"`** (`selected === "search"` → `toolFilter = true`, "search-activated tools are still direct
+  tools for the panel"), which couples this file to the search-mode unit in
+  [`13e`](13e-mcp-tools.md).
+
 ### How it lands
 
 | # | adapter capability | upstream mechanism | cyrup mechanism | verdict |

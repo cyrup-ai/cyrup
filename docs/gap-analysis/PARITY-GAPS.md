@@ -10,6 +10,26 @@ pi-intercom v0.9.2. Verified with `git describe --tags` on 2026-09-06, the real 
 The 147 items below are therefore a **floor**, not a total, and every "unported" claim needs
 re-checking against the current tag before it is worked.
 
+> **PIN CORRECTION — 2026-09-14. Two of the three tags in the paragraph above are themselves now
+> stale, and this file was NOT re-read.** The 2026-09-06 sentence records what `git describe --tags`
+> returned on that date and stays as written. Re-measured against `README.md`'s baselines table, the
+> current tags are **pi `v0.85.1`** (unchanged), **pi-subagents `v0.67.0`** (*not* v0.65.1 — v0.66.0
+> and v0.67.0 have since been cut) and **pi-intercom `v0.13.0`** (*not* v0.10.1 — re-checked
+> 2026-09-14 and still the newest). The two upstreams this file counts separately are
+> **`pi-mcp-adapter` v2.33.0** and **`pi-acp` v0.0.33**, and `code_puppy_core_plugins` is **v0.0.50**.
+> **No item below is re-read, re-classified, re-ranked or re-counted by this note.** Its only effect
+> is that "re-check against the current tag" now names a different tag for two upstreams — which is
+> exactly the failure mode the `pi-intercom` v0.7.0 error demonstrated: an inherited pin that nobody
+> re-measured parked real in-baseline defects in "version lag" for months.
+>
+> **Line-citation shift from this edit, stated so nobody re-verifies against the wrong line.** This
+> note and the baselines-table corrections below it moved lines into this file at three points.
+> A `PARITY-GAPS.md:<line>` citation written elsewhere needs **+20** if it named old line 13-96,
+> **+24** for old 97-116, and **+25** for old 117 and after — so `:19` → `:39`, `:306` → `:331`,
+> `:508` → `:533`, `:931` → `:956`, `:1360` → `:1385`, `:1537` → `:1562`. Old lines 1-12 are
+> unaffected. Those citations live in `docs/adr/**`, `docs/PARITY-PLAN.md` and the area files, none
+> of which this pass owns; they were **not** edited, and this is the repair instruction.
+
 **Closed by the session-scoping change.** Async subagent results were being delivered to, and
 **deleted by**, the wrong cyrup instance. `<results_dir>` is `<temp_root>/results/<cwd_key>`
 (`background/artifact_roots.rs:281-284`) — keyed by cwd, never by session — and the watcher listed
@@ -93,7 +113,11 @@ completeness critique found and this pass fixed:
 
 Two baselines were corrected in the previous edition and still hold: `pi-subagents` latest is
 **v0.47.1** (not v0.43.0) and `pi-intercom` latest is **v0.10.1** (not v0.9.2); `pi-intercom`'s
-**ported** baseline is **v0.9.2**, not v0.7.0 — see the §1d note.
+**ported** baseline is **v0.9.2**, not v0.7.0 — see the §1d note. *(**Pin correction 2026-09-14**:
+the two **ported** baselines in that sentence stand — `pi-subagents` ≈v0.43.0 and `pi-intercom`
+v0.9.2 — but both **latest** figures have moved again. Latest is now `pi-subagents` **v0.67.0** and
+`pi-intercom` **v0.13.0**. The sentence is left as written because it records a correction that was
+true when it was made; only the currency claim in the word "latest" is superseded.)*
 
 This document is the work-facing companion to `00-residual-ledger.md`. The ledger ranks; the area
 files hold the evidence; this file is organised by **gap class**, so someone doing the work sees the
@@ -107,13 +131,14 @@ difference costs behaviour, the entry says so and stays on the list as work.**
 
 | | |
 |---|---|
-| cyrup HEAD | **`824a539e`** — last CODE commit of the 2026-09-04→05 batch-3 (eleventh-edition) pass (`fix(tui,session-svc,ext,intercom): TUI-046 DRIFT-041 EXT-006 ICOM-054 review fixes`, branch `claude/parity-batch3`, 51 commits off `main` = `3e9633c4`, 23 of them touching `crates/`/`xtask`). The docs commit that wrote this row cannot cite its own sha; a status is measured against code. *Superseded: `6cf2cb9f` (batch 2), `275c1f85` (second pass).* **Re-measure before trusting any status.** |
-| `pi` | ported baseline **v0.83.0** → latest **v0.84.4** (HEAD `6aedd1066`) · delta v0.83.0..v0.84.4 = 775 files, +68 885 / −20 827 |
-| `pi-subagents` | ported baseline **≈v0.43.0** (inferred — the crate records no version string) → latest **v0.64.0** (HEAD `a5f401e8`) · delta v0.43.0..v0.64.0 = 485 files, +92 664 / −18 069 |
-| `pi-permission-system` | ported baseline **v0.7.1** → latest **v0.8.0** (HEAD `9affcc9`) · delta 28 files, +4 023 / −1 851 — **re-checked 2026-09-04, unchanged from every prior edition's figure** |
-| `pi-intercom` | ported baseline **v0.9.2** *(prior docs said v0.7.0 — wrong, see §1d)* → latest **v0.13.0** (HEAD `199279a`, re-measured 2026-09-04, superseding the `v0.12.0` figure recorded 2026-08-27) · true window `v0.9.2..v0.13.0` = 26 files, +4 701 / −976 |
-| `code_puppy_core_plugins` | ported baseline **v0.0.6** *(not recorded in-crate; see `FLUX-007`)* → latest **v0.0.40** (HEAD `8c6f852`) · 139 files, +11 071 / −3 822 across the whole repo, but the *ported* surface (`flux_bootstrap/`) is byte-identical `v0.0.6..v0.0.40` — area 14's own re-derivation this pass |
-| `pi-mcp-adapter` | **counted separately** — area 13 (this repository's own work; the earlier "owned by the MCP team" note was wrong). Clone re-pulled and **area 13 RE-AUDITED against `v2.32.1` on 2026-09-04** (`11b9994a`), superseding the prior "not re-measured here" note: `v2.26.1..v2.32.1` = 147 files, +16 014 / −1 001, **72 commits** (68 `--no-merges`). Its census stays outside §0 by the standing counting rule |
+| cyrup HEAD | **`824a539e`** — last CODE commit of the 2026-09-04→05 batch-3 (eleventh-edition) pass (`fix(tui,session-svc,ext,intercom): TUI-046 DRIFT-041 EXT-006 ICOM-054 review fixes`, branch `claude/parity-batch3`, 51 commits off `main` = `3e9633c4`, 23 of them touching `crates/`/`xtask`). The docs commit that wrote this row cannot cite its own sha; a status is measured against code. *Superseded: `6cf2cb9f` (batch 2), `275c1f85` (second pass).* **Re-measure before trusting any status.** **Pin correction 2026-09-14:** `824a539e` is itself superseded — `README.md`'s baselines table records the last CODE commit as **`9aeba769`** and the ledger's current cyrup pin as **`b28d3ff`** (`9aeba769..b28d3ff` is docs-only). `824a539e..9aeba769` is **32 code commits / 453 files / +98 509 / −15 880** under `crates/`+`xtask`, and no item in this file has been read against it. |
+| `pi` | ported baseline **v0.83.0** → latest **v0.84.4** (HEAD `6aedd1066`) · delta v0.83.0..v0.84.4 = 775 files, +68 885 / −20 827. **Pin correction 2026-09-14: latest is now `v0.85.1`.** `v0.83.0..v0.85.1` = 1 087 files, +142 846 / −23 694; the newly opened `v0.84.4..v0.85.1` = 708 files, +96 348 / −25 254 is unmeasured by this file |
+| `pi-subagents` | ported baseline **≈v0.43.0** (inferred — the crate records no version string) → latest **v0.64.0** (HEAD `a5f401e8`) · delta v0.43.0..v0.64.0 = 485 files, +92 664 / −18 069. **Pin correction 2026-09-14: latest is now `v0.67.0`.** `v0.43.0..v0.67.0` = 613 files, +123 871 / −31 254. Two further cautions recorded and not applied: the ≈v0.43.0 ported baseline is contradicted by the crate's own citation census (v0.64.0 × 330), and **`v0.57.0..v0.67.0` is owned by no area file** — area 09 is settled at v0.47.1 and 09a's `## Scope` stops at v0.57.0 |
+| `pi-permission-system` | ported baseline **v0.7.1** → latest **v0.8.0** (HEAD `9affcc9`) · delta 28 files, +4 023 / −1 851 — **re-checked 2026-09-04 and again 2026-09-14, unchanged from every prior edition's figure; `v0.8.0` is still the newest tag** |
+| `pi-intercom` | ported baseline **v0.9.2** *(prior docs said v0.7.0 — wrong, see §1d)* → latest **v0.13.0** (HEAD `199279a`, re-measured 2026-09-04, superseding the `v0.12.0` figure recorded 2026-08-27) · true window `v0.9.2..v0.13.0` = 26 files, +4 701 / −976 — **re-checked 2026-09-14, `v0.13.0` is still the newest tag and the figures re-measure identical.** Area 11 itself measures parity only to **v0.10.1**, so `v0.10.1..v0.13.0` is unopened there |
+| `code_puppy_core_plugins` | ported baseline **v0.0.6** *(not recorded in-crate; see `FLUX-007`)* → latest **v0.0.40** (HEAD `8c6f852`) · 139 files, +11 071 / −3 822 across the whole repo, but the *ported* surface (`flux_bootstrap/`) is byte-identical `v0.0.6..v0.0.40` — area 14's own re-derivation this pass. **Pin correction 2026-09-14: latest is now `v0.0.50`**, 190 files / +16 472 / −4 288 across the whole repo, and the ported surface re-checked tag-by-tag is **byte-identical at all 39 intervening tags** — so the blind window is empty on the surface this directory owns |
+| `pi-mcp-adapter` | **counted separately** — area 13 (this repository's own work; the earlier "owned by the MCP team" note was wrong). Clone re-pulled and **area 13 RE-AUDITED against `v2.32.1` on 2026-09-04** (`11b9994a`), superseding the prior "not re-measured here" note: `v2.26.1..v2.32.1` = 147 files, +16 014 / −1 001, **72 commits** (68 `--no-merges`). Its census stays outside §0 by the standing counting rule. **Pin correction 2026-09-14: latest is now `v2.33.0`**, and `v2.32.1..v2.33.0` = **123 files, +9 455 / −1 352, 33 non-merge commits** is measured by no pass — area 13's files carry it as an UNVERIFIED census with no `MCP-` ids assigned. Also recorded: the re-audit sha `11b9994a` cited in this row **does not resolve in this repository** |
+| `pi-acp` | **added 2026-09-14 — this table had no row for it at all.** **counted separately** — area 15, excluded from §0 by the same standing rule that excludes area 13. Its file was written as a plan for code that did not exist; **`crates/cyrup-acp` now does exist**, so the "not ported" framing inherited from earlier editions is itself a stale pin. Ported baseline: none recorded. Latest tag **v0.0.33**, re-checked 2026-09-14 and still the newest; `v0.0.33..HEAD` touches no `src/` path, so there is no upstream drift window. Its stale axis is the **cyrup** side — `crates/cyrup-acp` exists now and three commits touching it post-date area 15's last correction |
 
 Read upstream with `git -C <repo> show <tag>:<path>`, never from a working tree — clone-HEAD line
 numbers and file existence both mislead. §7 says how much of this was first-hand.

@@ -140,6 +140,225 @@ This area tracks behavior that `pi/` core (packages `ai/`, `agent/`, `coding-age
 > this file after `DRIFT-026`, **in the same function**.
 
 
+> ### PROVENANCE CORRECTION — 2026-09-14. The pins below are revised; **this file was not re-read.**
+>
+> Everything above this block is history and is correct as written. The passes it narrates were
+> **measured against pi `v0.84.1`** (the ported baseline being `v0.83.0`); the newest whole-file pass
+> is **2026-09-04 at cyrup `2571969`**, with batch-3/4 closure stamps running to 2026-09-05. Every
+> citation, closure and severity below still means exactly what it meant at those pins, and **nothing
+> in this block re-verifies any of it. No item was re-read, no row was re-derived, no count, severity
+> or status changed.** This block states only how old the file is — which, for the area whose whole
+> job is measuring drift, is the file's most important property.
+>
+> | | audited at (history — do not rewrite) | current pin (authoritative, per `README.md`'s baselines table) | window this file has never measured |
+> |---|---|---|---|
+> | `pi` | `v0.83.0` ported / **`v0.84.1`** drift | **`v0.85.1`** | `v0.84.1..v0.85.1`, 711 non-merge commits over releases v0.84.2 · v0.84.3 · v0.84.4 · v0.85.0 · v0.85.1 — `packages/agent` **215 files, +55 070 / −11 263**; `packages/coding-agent` **338 files, +25 297 / −5 625**; `packages/ai` **94 files, +7 355 / −948**; `packages/tui` **45 files, +4 478 / −347**; plus a **sixth package that did not exist at v0.84.1: `packages/chord`, 39 files, +10 840 / −0**, landed whole in the v0.85.0 release (`28b49a6b3`, 2026-08-28) |
+> | `cyrup` | `2571969` (2026-09-04) | **`b28d3ff`** — ledger's last recorded code baseline is `824a539e` | `2571969..b28d3ff` = **1 506 files, +219 934 / −41 853**, 48 non-merge commits under `crates/`+`xtask`. From the ledger's own baseline, `824a539e..b28d3ff` = **453 files, +98 509 / −15 880**, 31 commits. (`9aeba769..b28d3ff` is docs-only) |
+> | `pi-subagents` | `v0.47.1` (pinned elsewhere, not this area's) | **`v0.67.0`** | areas 09 / 09a |
+> | `pi-permission-system` · `pi-intercom` · `pi-acp` | `v0.8.0` · `v0.10.1` · — | `v0.8.0` · **`v0.13.0`** · `v0.0.33` — all re-checked 2026-09-14; no new release for permission-system or acp | areas 10 · 11 · 15 |
+> | `pi-mcp-adapter` · `code_puppy_core_plugins` | — | `v2.33.0` · `v0.0.50` (ported surface byte-identical across all 39 tags) | areas 13 · 14 |
+>
+> **The whole-repo delta this area's header quotes (`v0.83.0..v0.84.1` = 627 files, +52 291 / −17 556)
+> is now `v0.83.0..v0.85.1` = 1 087 files, +142 846 / −23 694 across 1 050 non-merge commits.** Read
+> every row below as measured against the smaller, older number.
+
+## UNVERIFIED — 2026-09-14 census of the `v0.84.1..v0.85.1` window (leads, not items)
+
+**Nothing in this section is an item.** No `DRIFT-` id is assigned, because id assignment belongs to
+a pass that read both sides and this one did not read both sides everywhere. No row in
+`## Open items` — or in `## Leads — not yet evidenced` — is opened, closed or re-ranked by anything
+here. Each entry states what was read on which side, and where only one side was read it says so.
+
+Census method: upstream read only via `git -C tmp/pi show <tag>:<path>` and
+`git diff v0.84.1..v0.85.1`. cyrup read at `b28d3ff`, mostly by identifier grep across `crates/`;
+where a cyrup file was actually opened the entry says so.
+
+### Persisted-message and streaming primitives (cyrup-core's wire format)
+
+- **`ToolCall.namespace` round-tripped through OpenAI Responses streaming, replay and proxying** · M
+  — upstream `packages/ai/src/types.ts:380`; `api/openai-responses-shared.ts:265` (`canReplayNamespace`),
+  `:276-278`/`:287-289` (replay), `:491`/`:512` (stream start), `:715`/`:731` (stream end). v0.84.2
+  (#7709) added a `namespace` field for dynamically loaded / namespaced Responses tools, preserved on
+  the streamed block and replayed next turn — but only when the call came from the same model or the
+  tool is currently a deferred tool; the same commit widened `isDifferentModel` into an explicit
+  `isSameModel`/`isDifferentModel` pair. **Both sides read.** cyrup's `ToolCall`
+  (`crates/cyrup-core/src/message/tool_call.rs:17-32`) carries only `id`, `name`, `arguments`,
+  `thought_signature`, and its hand-written `Serialize` (`:34-45`) hard-codes a 4-or-5 field struct —
+  **so adding `namespace` touches the JSONL wire format, not just the provider.** Assigned here rather
+  than to area 01 for that reason. Area 02 records the proxy half of the same upstream commit.
+- **`AssistantMessage.endTurn` from Codex's terminal `end_turn`** · S — upstream
+  `packages/ai/src/types.ts:444-448`; `api/openai-codex-responses.ts:741-744`, with `mapCodexEvents`
+  re-signatured at `:717-720` and `:1511`. v0.84.2 (#7766), explicitly diagnostics-only and documented
+  as not affecting agent control flow. **Both sides read.** cyrup's `AssistantMessage`
+  (`crates/cyrup-core/src/message/assistant.rs:30-90`) has no `end_turn`; `grep -rn end_turn
+  crates/cyrup-provider/src` finds only Anthropic/Bedrock raw-stop-reason strings. A persisted-field
+  change, hence this area.
+- **`AssistantMessageFrameEncoder` / `reduceAssistantMessageFrames()` — a compact persistable
+  streaming format** · L — upstream `packages/ai/src/utils/assistant-message-frame.ts` @v0.85.1 (new,
+  490 lines; its test is 606), exported from `src/index.ts:39`. v0.85.0 added a frame union
+  (`text_delta`, `toolcall_checkpoint`, `toolcall_delta`, …) plus a reducer that rebuilds the message;
+  terminal settlement is deliberately excluded and must be persisted separately, and v0.85.0 also
+  fixed the frames to preserve `providerThinkingLevel`. `grep -rn
+  'AssistantMessageFrame\|assistant_message_frame\|reduce_assistant_message_frames' crates/
+  --include=*.rs` returns nothing — **entirely unported**; both sides checked (absence is the
+  cyrup-side reading). Assigned here because it is a persistence/streaming primitive with no home in
+  cyrup-provider, and it is consumed by pi's agent-side durable-retry work.
+- **`uuidv7(timestampMs?)` rewritten: follower timestamps, 41-bit monotonic sequence, `crypto`
+  required** · S — upstream `packages/ai/src/utils/uuid.ts:1-45` @v0.85.1 (whole file replaced),
+  v0.84.2. The generator takes an optional timestamp for deriving follower ids (preserved verbatim,
+  bypassing the monotonic floor), uses a BigInt 41-bit sequence that throws when exhausted, validates
+  the timestamp range, drops the `Math.random` fallback for `globalThis.crypto.getRandomValues`, and
+  changes the byte layout (bytes 10-11 now carry sequence bits). `grep -rn 'fn uuidv7\|uuid_v7'
+  crates/ --include=*.rs` returns nothing, **but no search was made for an alternative id scheme under
+  a different name, so the cyrup side is UNVERIFIED.** Upstream consumers include the Codex adapter,
+  so id ordering is observable on the wire.
+
+### The harness restructuring — strategic drift, not defects
+
+- **`legacy-v3.ts` — upstream now declares cyrup's session format "legacy" and specifies its
+  migration** · L — upstream `packages/agent/src/harness/session/jsonl/legacy-v3.ts:19-90` @v0.85.1
+  (new, 539 lines) and `packages/agent/docs/harness.md` Appendix B @v0.85.1 (new). The importer reads
+  the coding-agent v3 JSONL format into the v4 harness model, and its `LegacyV3*Entry` interfaces
+  enumerate **exactly the entry set cyrup implements**: message, custom, custom_message,
+  branch_summary, compaction, model_change, thinking_level_change, active_tools_change, session_info,
+  label. Appendix B is the normative spec: `custom_message` → custom agent message;
+  `label`/`session_info` → values that leave the tree (latest by file position wins, targets resolved
+  to the nearest retained ancestor); the three `*_change` nodes disappear from the tree and become
+  total main-lane configuration; legacy `firstKeptEntryId` resolves and materializes as `retainedTail`
+  and "Format 4 never exposes or persists that field"; v3 ISO timestamps → Unix ms; v3 ids re-minted
+  as UUIDv7 time-prefixed from the legacy timestamp with all references remapped; a
+  `{source:"v3-import"}` aggregate usage row on first v4 write. **Upstream read in full; cyrup read at
+  `crates/cyrup-session/src/{header.rs,entry.rs}`.** This is strategic drift, not a defect, with two
+  concrete uses: (1) `legacy-v3.ts` is a better fidelity oracle for cyrup's entry model than
+  `session-manager.ts` prose, because it enumerates every field cyrup must round-trip (`details`,
+  `usage`, `fromHook` preserved; absent `fromHook` normalizes to false); (2) it forces the open
+  question of whether cyrup-session follows coding-agent v3 or tracks the harness to v4. **No area
+  file owns this today.** Its executable conformance suite is `test/harness/jsonl-v3-migration.test.ts`
+  (2 013 lines).
+- **New `src/harness/runtime/**` durable drive layer and the operation state machine** · L — **the
+  largest single change in the window.** Upstream `packages/agent/src/harness/runtime/{lane,harness,
+  reducer,restore,progress,transcript,types,drive}.ts` + `drive/*.ts` @v0.85.1 (27 files, all added;
+  `lane.ts` alone 2 012 lines); `harness/session/types.ts:75-341`;
+  `harness/execution/{assistant,tools,effect-gate}.ts` (added); `docs/harness.md` Parts 3-4. A
+  persisted operation state machine: `OperationMeta`/`OperationState` with at-states starting,
+  checkpoint, assistant ready/effect-pending/retry-wait, tools, deferred suspended/effect-pending,
+  summary deciding/ready/effect-pending/retry-wait, navigation ready-to-commit
+  (`session/types.ts:249-330`); four lane primitives `accept`/`drive`/`requestAbort`/`inspectExecution`;
+  an intent-then-settlement two-commit protocol around every provider request and tool call; tagged
+  errors (`LaneBusy`, `OperationMismatch`, `NoActiveRun`, `NothingToResume`, `NothingToCompact`,
+  `InvalidNavigation`, `HarnessFault`, `HarnessClosed`) at `src/harness/result.ts:53-105`. The session
+  model gained lanes, bound values/lists, atomic commits, fork policy and a usage ledger.
+  **Upstream read at the docs/type level ONLY — the 27 runtime implementation files were not opened.**
+  cyrup has no counterpart: its run loop is process-local with an in-memory `RunCtx`
+  (`crates/cyrup-agent/src/agent/run/mod.rs`) and no durable operation records. **Area 02's
+  `AGENT-028` tracker already records `packages/agent/src/harness/**` as owned by no area file; this
+  window makes that blind spot ~6k source lines larger and gives it a normative spec to be audited
+  against.** The right next move is a decision (does cyrup model pi's harness at all), not a port.
+- **`Context` threaded through every FileSystem / Shell / harness async method** · M — upstream
+  `packages/agent/src/harness/context.ts` @v0.85.1 (new, re-exports `@earendil-works/chord`);
+  `harness/types.ts:266-300`,`:380-386`; `package.json:60` (new dep `@earendil-works/chord ^0.85.1`);
+  `docs/harness.md` §0.2. A Go-style `Context` (cancellation + deadline + typed values + telemetry
+  parentage) became a REQUIRED trailing argument on every asynchronous public harness, lane, Session,
+  Branch, repository and storage method, and every per-call `abortSignal?: AbortSignal` on
+  `FileSystem` (all 17 methods) and on `Shell.exec` was deleted in favour of `context.abortSignal`.
+  The docs state the rule: "Shared receivers never retain a caller Context or discover one through
+  AsyncLocalStorage"; "Context is process-local invocation authority, never durable data".
+  **Upstream read.** cyrup already threads an explicit cancellation handle rather than an ambient one
+  (`self.cancel.child()` at `crates/cyrup-agent/src/agent/run/turn.rs:125`,`:187` and
+  `tools/exec.rs:287`), so **the cancellation half converges rather than diverges**; what has no cyrup
+  counterpart is the typed-value / telemetry-parentage half. Recording this is also what makes most of
+  the window's per-file churn (prompt-templates.ts, path-utils.ts, skills.ts, read.ts and much of
+  compaction.ts) legitimately excludable as pure threading. **`packages/chord` itself is a scoping
+  decision, not a port target**: its facet/service/state/bundler machinery is experimental, but its
+  Context and strict-JSON slice is already the type of pi's production agent harness, and
+  `packages/protocol` and `packages/client` depend on chord outright — so the two halves must be
+  filed separately, and this area owns the Context/JsonValue half because it lands in
+  `packages/agent`, not in `coding-agent/src/core/extensions/`.
+- **Harness telemetry schema reshaped** · M — upstream `packages/agent/src/harness/telemetry.ts`
+  @v0.85.1 (80 changed lines). Hook-point enum renamed and trimmed: `before_resume`→`before_drive`,
+  `run_abort`→`operation_abort`, `fact_update`→`value_update`, `write_pending` removed; the
+  mutation-reason enum lost `failure_drain` (now `["normal","abort_reconcile"]`). The session-mutation
+  span became "One committed session transaction": `pi.session.mutation`/`pi.session.item_type`
+  (entry|record|lane|fact) were replaced by `pi.session.item_count` and a required
+  `pi.session.item_kinds: string[]` (entry|usage|value|list), `pi.session.seq` split into
+  `pi.session.first_seq`/`pi.session.last_seq`, `pi.session.id` added, and
+  `pi.lane.name`/`pi.operation.id` became optional caller-supplied; the parent-span set widened from
+  `[pi.harness.step, pi.harness.run]` to `[pi.harness.run, pi.harness.compaction,
+  pi.harness.navigation, pi.harness.turn, pi.harness.checkpoint]`. **Upstream read; the cyrup side was
+  NOT read.** This file already cites `harness/telemetry.ts` three times, so it tracks the file — but
+  nobody has opened cyrup's telemetry emitter to see which of these names it mirrors. Listed so the
+  rename set is on record; **someone must read the cyrup side before this becomes an item.**
+
+### Deferred responses
+
+- **`ModelRuntime.streamDeferred`** · S — upstream
+  `packages/coding-agent/src/core/model-runtime.ts:647-666` @v0.85.1: `fetchDeferred` was split, with
+  a new `streamDeferred(model, handle, options): AssistantMessageEventStream` returning the lazy
+  stream and `fetchDeferred` becoming `this.streamDeferred(...).result()`. **Upstream read at both
+  tags; the cyrup side was NOT read** — deferred responses live in cyrup-provider and were not opened.
+  Lead only; the `packages/ai` half of the same split is recorded in area 01 as growth on `PROV-040`.
+
+### cyrup-side surfaces landed in this window, and a sha problem
+
+- **`baseten` registered — the last unregistered v0.84.x built-in** · S, **lower confidence than the
+  rest of this section.** `crates/cyrup-provider/src/providers/all.rs`'s module table row 95 now reads
+  "✓ fleet (dynamic catalog) — DRIFT-009" and `DYNAMIC_ONLY_PROVIDERS` widened to five; `baseten`
+  joins the fleet as a `FleetCatalog::Dynamic` member, requiring `ThinkingFormat::Baseten`, and the
+  module doc flipped from "NOT REGISTERED — v0.84.x addition (no ledger id yet)" to "All 40 of pi
+  v0.84.4's built-in providers are registered". **The confidence problem is a citation one, and it is
+  a lead against `DRIFT-009` whose row is left untouched**: that row already carries a "2026-09-05,
+  PARTIAL (batch-4) … the registration half of contribution (1) is CLOSED" paragraph citing
+  `e4078e3a` + `ccd14981`, **and neither sha exists in this repository** (`git cat-file -e` fails for
+  both), so either the row was written against rewritten history or it describes this same work.
+  Independently: the residual lead in `00-residual-ledger.md` — "`baseten` … is now the one
+  unregistered v0.84.x built-in, with no row (area 01)" — is **unambiguously false at `b28d3ff`**. The
+  crate maps to area 01 while the assertion lives here; `PROV-014` (PARTIALLY CLOSED) is the area-01
+  neighbour to re-check.
+
+### Cleared in this window — read and deliberately not filed
+
+- **`packages/agent/src/agent.ts` is BYTE-UNCHANGED across `v0.84.1..v0.85.1`** — the window's most
+  load-bearing negative result, recorded in full in area 02.
+- **`tui-main-screen.ts`'s `BoundedTerminalWriter` / `MAX_RENDER_WRITE_CHARS = 1 MiB` chunked writes**
+  — fixes pi #8028, a crash when image-heavy output made one render exceed V8's maximum string length.
+  A JavaScript-engine limit with no Rust analogue; cyrup writes through ratatui's cell buffer rather
+  than concatenating one terminal string per frame, and the surrogate-pair-preserving split logic is a
+  UTF-16 artifact. **N/A by substrate**, recorded so the absence is not later read as an oversight.
+- **v0.85.0 BREAKING: removal of coding-agent env-var defaults from `pi-tui`** (`PI_DEBUG_REDRAW` →
+  `PI_TUI_DEBUG_REDRAW`, `pi-tui-` log prefixes, crash dumps to OS temp) — a library/application
+  boundary change for a published npm package. cyrup has no such boundary and
+  `grep -rniI "debug_redraw|crash_dump" crates/` returns ZERO. No portable behaviour.
+- **SIGWINCH self-signal made best-effort under restricted seccomp** (`terminal.ts`, v0.85.0 #8898) —
+  `grep -rniI "sigwinch" crates/` returns ZERO; cyrup never self-signals, taking resize through
+  crossterm's `Event::Resize`. No crash to inherit. **But the absence raises its own unexamined
+  question — does cyrup refresh dimensions after SIGCONT? — which was NOT investigated.**
+- **Alternate-screen per-frame allocation churn reduction (~9-18×, v0.84.2)** — an optimization of
+  pi's own ANSI string-composition renderer; cyrup renders through a cell buffer with its own
+  double-buffer diff, so the pass being optimized has no counterpart.
+- **Narrow subpath exports, the Chord dependency removal in `packages/ai`, `utils/sleep.ts`, the
+  Mistral SDK→native transport swap, `providers/faux.ts` optional-key spreading** — all recorded as
+  cleared in area 01, which owns them.
+- **`packages/coding-agent/src/experimental/**` (47 files, +9 324, net-new)** — reachable only via the
+  `./experimental/plugin` subpath export and explicitly excluded from the published artifact
+  (`"!dist/experimental"`); the production extension path is untouched. **Excluded as a port target,
+  not from the record**: its existence is the primary evidence for the chord escalation condition.
+- **`src/client/remote-session.ts`, `src/client/transcript.ts`, `src/server/create-harness.ts`
+  deleted** — relocation, not removal: `src/client/index.ts` became
+  `export * from "@earendil-works/pi-client"`. cyrup has no port of any of the three, so the deletion
+  changes nothing here; if `pi-client` is to be tracked it needs its own scoping decision.
+
+### What this census did not cover
+
+The four packages this area names were measured by four separate passes with different scopes, and
+none of them read everything. Unread and port-relevant: `packages/agent/src/harness/agent-harness.ts`
+(+545/−431), `src/harness/hooks.ts` (new, 533 lines), all 27 files of `src/harness/runtime/**` and all
+3 of `src/harness/execution/**`, `session/session.ts` (+385/−204), `jsonl/storage.ts` (+309/−205),
+`jsonl/repo.ts` (+315/−126), `memory.ts` (+403/−131) and the new `commit.ts`/`fork.ts`/
+`fork-policy.ts`/`values.ts`; `packages/coding-agent/src/modes/interactive/**` (interactive-mode.ts
+alone +737, area 07's); `packages/chord/src/delta/index.ts` (1 267 lines) and `src/facets/host.ts`
+(906), for which only `README.md`/`PLANNING.md` were read — **a README is not an upstream read under
+this ledger's rules**; and all of `packages/tui/test/**` (+1 900 lines).
+
 ## Status since the c8bd2ab baseline
 
 | ID | Status | Note |
@@ -159,7 +378,7 @@ This area tracks behavior that `pi/` core (packages `ai/`, `agent/`, `coding-age
 | DRIFT-013 | still-open | Z.AI `max_completion_tokens`. One-token fix; upstream's trailing `\|\| isZai` confirmed at `openai-completions.ts:1478-1485`. Uniquely owned by this area — no duplicate elsewhere. *(Table-cell pipes escaped this repair pass; the raw `\|\|` was splitting this row into five columns in every Markdown renderer.)* |
 | DRIFT-014 | still-open | DNS/transport literals. **Kind corrected to `not-ported`** — `git diff v0.83.0..v0.84.1 -- packages/ai/src/utils/retry.ts` is empty, so all seven literals existed at the ported baseline. This will not be swept up by a rebase. |
 | DRIFT-015 | **partially closed** · **duplicate-of: `EXT-019`** (markdown-transformer half; `TUI-034` carries the renderer half) | The `019e4ad6` native-provider half landed: `cyrup-ext/wit/world.wit:277-278` declares `register-provider`/`unregister-provider`. `scoped-models`, `render-options`/`output-pad` and markdown transformers are still absent from the world. Remainder open below. Overlaps `PARITY-GAPS` VL-P21. |
-| DRIFT-016 | still-open · **kind corrected** · **duplicate-of: `SESS-019`** | `Current date:` in the system prompt. **Re-derived two-sided this repair pass:** `git grep 'Current date' v0.83.0 -- packages/coding-agent/src` returns **nothing** — the removal predates the *ported* baseline, so this is `stale-port` (cyrup carries behaviour upstream deleted), not `upstream-drift`. `SESS-019` (`03-cyrup-session.md:382`, medium) owns the same footer plus the extra leading newline and the `project_context` wording. |
+| DRIFT-016 | still-open · **kind corrected** · **duplicate-of: `SESS-019`** | `Current date:` in the system prompt. **Re-derived two-sided this repair pass:** `git grep 'Current date' v0.83.0 -- packages/coding-agent/src` returns **nothing** — the removal predates the *ported* baseline, so this is `stale-port` (cyrup carries behaviour upstream deleted), not `upstream-drift`. `SESS-019` (`03-cyrup-session.md:520`, medium) owns the same footer plus the extra leading newline and the `project_context` wording. |
 | DRIFT-017 | **closed** | Bash session env. `cyrup-tools/src/tools/bash.rs:153` runs the unconditional scrub (`session_env_scrub_keys()`, the load-bearing half) **ahead of** the `expose_session_environment` gate at `:154`; `:156-176` repopulate the five vars; `spawn_hook` applied **last** at `:179-183`. Upstream `resolveSpawnContext` at `v0.84.1` `bash.ts:163-189` is the same delete→repopulate→hook order, guideline gate at `:334`. cyrup's scrub list is a deliberate, documented **superset** (`CYRUP_*` **and** `PI_*`, `cyrup-tools/src/config.rs:41-48`). |
 | DRIFT-018 | still-open · **kind corrected** · **duplicate-of: `PROV-011`** | Constrained sampling. **Re-derived two-sided this repair pass:** `packages/ai/src/api/constrained-sampling.ts` (148 lines, 7 exports) exists at **`v0.83.0`** and is already imported there by `anthropic-messages.ts:40`, `azure-openai-responses.ts:18`, `bedrock-converse-stream.ts:57`, `google-shared.ts:8` and `mistral-conversations.ts:28` — so this is `not-ported`, not `upstream-drift`, and a rebase will never sweep it up. `PROV-011` (`01-…:154`, medium, four affected sites) is strictly broader and owns the fix; `TOOL-016` and `EXT-024` own the tool-model and WIT halves. |
 | DRIFT-019 | **partially closed** · **kind corrected** · **duplicate-of: `PROV-014`** | The `pi-messages` wire API and Radius OAuth landed (`cyrup-provider/src/api/pi_messages.rs`, `auth/oauth/radius.rs`, id registered at `auth/oauth/load.rs:59`). The **provider registrations** are still absent. **Re-derived two-sided this repair pass:** `git ls-tree v0.83.0 packages/ai/src/providers/` already lists `radius.ts`, `radius-config.ts`, `qwen-token-plan.ts` and `qwen-token-plan-cn.ts` — three of the four missing registrations are `not-ported` at the ported baseline; only `qwen-token-plan-individual.ts` is genuine `v0.84.1` drift (`PARITY-GAPS` VL-P2). The critic's independent re-derivation is recorded so it is **not re-litigated**: `grep -rn "radius\|qwen" crates/cyrup-provider/src/providers/all.rs` is empty across the **whole file**, not merely `:145-243`, so the `fleet!`-macro grep trap does not rescue this — the gap is real. `PROV-014` (`01-…:168`, medium) owns it. |
@@ -181,7 +400,7 @@ This area tracks behavior that `pi/` core (packages `ai/`, `agent/`, `coding-age
 | DRIFT-035 | still-open · **duplicate-of: `SESS-019`** | TEST DEFECT: prompt tests pin DRIFT-016. Both assertions survive unannotated at `prompt/tests.rs:82` and `:113`. **Re-derived this repair pass:** the footer is absent from `packages/coding-agent/src` at **both** tags (only historical `test/fixtures/*.jsonl` transcripts contain the string), so the assertions pin a pre-baseline stale port, not lag. Same footer as `SESS-019`; must land in the same change as `DRIFT-016`. |
 | DRIFT-036 | still-open | TEST DEFECT: `settle()` fixed 50 ms sleep, verbatim unchanged at `summarization_retry_events.rs:98-104`. |
 | ~~DRIFT-037~~ | **refuted / withdrawn** | Compaction `retainedTail` / required `firstKeptEntryId`. **Refuted on both sides.** (1) cyrup already declares `#[serde(default, skip_serializing_if = "Option::is_none")] first_kept_entry_id: Option<EntryId>` at `cyrup-session/src/entry.rs:75-79`, four lines above the `usage` sibling the filing reasoned from — the pattern *is* applied. (2) `retainedTail` lives on the **harness-v2** `CompactionEntry` (`harness/session/types.ts:44-51`), which has no `firstKeptEntryId` at all, while the coding-agent format cyrup actually ports still declares `firstKeptEntryId: string` **required** (`session-manager.ts:69`, `compaction/compaction.ts:90`). (3) It is not delta drift: `git grep -l retainedTail v0.83.0` already lists it. Residue — interop with harness-v2-written sessions — folded into DRIFT-040. ID retained so this call can be re-audited. |
-| ~~DRIFT-038~~ | **superseded by `CFG-018`** | `resolve_scope` exact-reference short-circuit. The defect is **real and confirmed on both sides** (`cyrup-config/src/model.rs:256-280` vs `model-resolver.ts:290-307`), and the auditor's evidence correction stands — `find_exact_model_reference_match` **does** exist in the workspace, at `cyrup-tui/src/model_selector.rs:380` with the ambiguity rule tested at `:651`, and `resolve_scope` still does not call it. But this is the same function, defect, severity, effort and fix as `CFG-018` (`05-cyrup-config-and-resources.md:253-268`), filed in the area that owns `cyrup-config`. Carrying it twice inflates the backlog and risks two people fixing one line. **Work it as `CFG-018`**; fold the `model_selector.rs:380` pointer into that item. |
+| ~~DRIFT-038~~ | **superseded by `CFG-018`** | `resolve_scope` exact-reference short-circuit. The defect is **real and confirmed on both sides** (`cyrup-config/src/model.rs:256-280` vs `model-resolver.ts:290-307`), and the auditor's evidence correction stands — `find_exact_model_reference_match` **does** exist in the workspace, at `cyrup-tui/src/model_selector.rs:380` with the ambiguity rule tested at `:651`, and `resolve_scope` still does not call it. But this is the same function, defect, severity, effort and fix as `CFG-018` (`05-cyrup-config-and-resources.md:434-449`), filed in the area that owns `cyrup-config`. Carrying it twice inflates the backlog and risks two people fixing one line. **Work it as `CFG-018`**; fold the `model_selector.rs:380` pointer into that item. |
 | DRIFT-039 | still-open · **duplicate-of: `AGENT-019`** | TEST DEFECT: parallel-tool test asserts wall-clock and completion order. All three assertions unchanged at HEAD. **Literally the same test** as `AGENT-019` (`02-…:677`) — `crates/cyrup-agent/src/tests/agent_loop.rs:327`. Fix it once; this item's body carries the better fix sketch (the `agent-loop.test.ts:589-612` rendezvous), so merge that into `AGENT-019` rather than working both. |
 | DRIFT-040 | **TRACKER** (excluded from the severity count) · **LEAD — not yet evidenced** · **duplicate-of: `PARITY-GAPS` VL-P22** | pi harness-v2 rearchitecture. Absorbs DRIFT-037's residue (harness-v2 session-format interop). The three load-bearing claims — the `agent-harness.ts` rewrite (`+420/−996`), `docs/harness-v2.md` (`+2124/−367`) and the sqlite-node rebuild (`+12598/−3479`) — were **carried forward unverified** in the prior pass and are **still** unverified: this repair pass re-derived the six items whose *kind* was in doubt and did not spend the budget here. It proposes no work and says so, so it is a tracker in `## Leads — not yet evidenced`, outside the item count. |
 | ~~DRIFT-041~~ | **CLOSED 2026-09-05** | Session HTML export is a 131-line text dump against pi's 5,021-line templated document. **Ported in full 2026-09-05** (batch-3, code `ce81dba9`): the base64 `SessionData` payload, the five byte-identical `v0.84.4` assets, the theme feed (first production consumer of `Theme::resolve_export`), and a `CssColor` parse boundary for the palette arithmetic. ~~One residual, low: `renderedTools` — which pi's own `exportFromFile` also omits.~~ **That residual list was WRONG and is corrected 2026-09-05 by the batch-3 ledger pass:** there is a second, larger one. `session_data()` emits only `{header, entries, leafId}`, so the exported document silently loses its **System Prompt** and **Available Tools** sections on all three live export paths, where pi always passes `this.state` (`agent-session.ts:3439` @v0.84.4). Filed as **`DRIFT-054`** (medium) — and **CLOSED 2026-09-05** by batch 4 (code `16b38c93`), which threads `AgentSession::export_state()` (the manager's leaf + `agent.state.systemPrompt` + `agent.state.tools`) through all three live export paths, exactly as pi's `exportSessionToHtml(sm, this.state, …)` does (`core/export-html/index.ts:263-270`, called from `agent-session.ts:3439`). `renderedTools` remains a genuine low residual. See the row and the detail section below. |
@@ -189,7 +408,7 @@ This area tracks behavior that `pi/` core (packages `ai/`, `agent/`, `coding-age
 | ~~DRIFT-043~~ | **rejected — not filed** | Detached-child registry. Duplicate of `SEAM-S03`, and its lead mechanism claim is wrong. See `## Coverage`. |
 | ~~DRIFT-044~~ | **rejected — not filed** | `AI_AGENT` never stamped. Duplicate of `PB-5`, which is strictly broader. See `## Coverage`. |
 | DRIFT-045 | **new** | Ctrl+V never reads clipboard **text**, only images. |
-| DRIFT-046 | **new** · **duplicate-of: `TOOL-036`** | `normalizeWindowsShellPath` unported. **Duplicate found this repair pass and missing from the ledger's F4 table:** `TOOL-036` (`04-…:462`, low) covers the same `paths.ts:67-73` / `:83-85` port *and* the `os.homedir()` half `DRIFT-046` omits, in the crate (`cyrup-tools/src/path.rs`) that actually owns the normalizer. `PARITY-GAPS.md:652` already couples the two under the same Windows-is-a-target question. |
+| DRIFT-046 | **new** · **duplicate-of: `TOOL-036`** | `normalizeWindowsShellPath` unported. **Duplicate found this repair pass and missing from the ledger's F4 table:** `TOOL-036` (`04-…:462`, low) covers the same `paths.ts:67-73` / `:83-85` port *and* the `os.homedir()` half `DRIFT-046` omits, in the crate (`cyrup-tools/src/path.rs`) that actually owns the normalizer. `PARITY-GAPS.md:677` already couples the two under the same Windows-is-a-target question. |
 | DRIFT-047 | **new** · **duplicate-of: `PARITY-GAPS` VL-P5** | `packages/telemetry` and the `pi.ai.request` span contract absent. The item's own refuter note already says to resolve by **extending VL-P5**, not opening a second L-sized workstream; the marker makes that machine-readable. Only the span schema is incremental. |
 | DRIFT-048 | **new** | Google converter reads the tool-call-id rule off the **source** message's model, not the target model. Uniquely owned here. |
 | DRIFT-049 | **new** · **severity medium → high** · **duplicate-of: `SEAM-047`** | SIGTERM/SIGHUP never disposes the runtime; in RPC mode it never exits at all. **Raised to high this repair pass:** area 08 rates `SEAM-047` (`08-…:105`) high and `PARITY-GAPS` **PB-30** names both IDs at high — a defect cannot carry two severities, and a high that reads as medium falls off a planner's high list. `SEAM-008` and `SEAM-059` are the sibling signal-path items. Schedule once, in area 08. |
@@ -506,7 +725,7 @@ openai-completions row appearing with the block copied onto it fails). Both asse
 compat via `get_compat`, not only the declared `Option`s — the declared-value check alone would pass
 against a catalog that had lost its compat block entirely.
 
-**Bookkeeping** — `PROV-061` (`01-cyrup-core-and-provider.md:300`, `:1638`) is **superseded**, not
+**Bookkeeping** — `PROV-061` (`01-cyrup-core-and-provider.md:650`, `:1638`) is **superseded**, not
 overturned: its analysis of the *provenance* was right and its removal was the right call at the
 time. Its row and body should be annotated rather than reverted.
 
@@ -582,7 +801,7 @@ time. Its row and body should be annotated rather than reverted.
 > **`SEAM-008` is NOT closed by this** and was re-scoped rather than inherited — see area 08.
 >
 > **Severity and ownership corrected 2026-08-12 (repair pass).** This is the same defect area 08
-> files as **`SEAM-047`** (`08-cyrup-session-svc-and-modes.md:105`), which rates it **high**, and
+> files as **`SEAM-047`** (`08-cyrup-session-svc-and-modes.md:260`), which rates it **high**, and
 > `PARITY-GAPS` **PB-30** names both IDs at high. A defect cannot carry two severities, and a high
 > filed as a medium drops off a planner's high list — so it is raised here to match. **Schedule it
 > once, in area 08**, together with the sibling signal-path items `SEAM-008` (the 143/129 codes are
@@ -598,7 +817,7 @@ time. Its row and body should be annotated rather than reverted.
 
 **Fix** — Move disposal into the signal path rather than relying on the mode loop. In `signals.rs`, on the **first** signal: cancel `session_cancel` (not just the TUI token), await `runtime.dispose()` with a bounded grace, then exit `143`/`129` per signal, mirroring `rpc-mode.ts:366-383` + `:724-741`. Register the handler for RPC mode explicitly — today it is the one mode with no path from a signal to `run_rpc`. Keep the existing repeat-signal force-exit at `:97-100` as the escalation.
 
-**Verify** — Integration test per mode: send SIGTERM to a running cyrup and assert (a) the process exits `143` without a second signal, (b) a registered extension observed `session_shutdown`, (c) the session file is flushed. An RPC-mode case is mandatory — it is the one that fails today. **Bookkeeping:** `SEAM-S02` (`08-cyrup-session-svc-and-modes.md:520`) is now **stale** — it says the second signal is swallowed and cyrup is "ABSENT", but `signals.rs:97-100` implements the repeat force-exit with pi's exact `130`/`143`/`129` codes. Re-audit `SEAM-S02` as closed and let this item replace it.
+**Verify** — Integration test per mode: send SIGTERM to a running cyrup and assert (a) the process exits `143` without a second signal, (b) a registered extension observed `session_shutdown`, (c) the session file is flushed. An RPC-mode case is mandatory — it is the one that fails today. **Bookkeeping:** `SEAM-S02` (`08-cyrup-session-svc-and-modes.md:675`) is now **stale** — it says the second signal is swallowed and cyrup is "ABSENT", but `signals.rs:97-100` implements the repeat force-exit with pi's exact `130`/`143`/`129` codes. Re-audit `SEAM-S02` as closed and let this item replace it.
 
 ## ~~DRIFT-004~~ — ~~medium~~ **CLOSED 2026-09-05** — RPC `bash`: `UserBashEventResult.operations` backend seam unported
 
@@ -865,7 +1084,7 @@ generator would not help even though `node`/`npm`/`bun` ARE installed here, beca
 > **Re-derived two-sided 2026-08-12 (repair pass), replacing a commit hash with evidence at the
 > ported tag.** Every cited line already exists at **`v0.83.0`**, so `24e5cc04` (#6148) is
 > pre-baseline: this is a **port omission**, not version lag. `PROV-021`
-> (`01-cyrup-core-and-provider.md:226`, medium) already records that correction verbatim
+> (`01-cyrup-core-and-provider.md:576`, medium) already records that correction verbatim
 > ("Kind corrected: filed `upstream-drift`, it is a **port bug** against v0.83.0"), names the exact
 > cyrup line to change (`env_api_keys.rs:39`), and gives an in-tree template for the bespoke
 > `ApiKeyAuth` (`providers/cloudflare.rs:71-113`). Work it as `PROV-021`.
@@ -918,7 +1137,7 @@ generator would not help even though `node`/`npm`/`bun` ARE installed here, beca
 > ported tag.** The footer is absent from `packages/coding-agent/src` at **`v0.83.0`**, not merely at
 > `v0.84.1` — so `f4e9ca74` landed *before* cyrup's baseline and this is a **stale port** (cyrup
 > carries behaviour upstream deleted), not version lag. It will not be swept up by a rebase.
-> `SESS-019` (`03-cyrup-session.md:382`, medium) owns the same footer plus the extra leading newline
+> `SESS-019` (`03-cyrup-session.md:520`, medium) owns the same footer plus the extra leading newline
 > and the `project_context` wording drift; work it there.
 
 **cyrup** — `cyrup/crates/cyrup-session/src/prompt/builder.rs:330-340` `emit_footer` writes `"\n\nCurrent date: {:04}-{:02}-{:02}"` at `:335`, unconditionally.
@@ -938,7 +1157,7 @@ generator would not help even though `node`/`npm`/`bun` ARE installed here, beca
 > **Re-derived two-sided 2026-08-12 (repair pass), replacing a commit hash with evidence at the
 > ported tag.** `constrained-sampling.ts` exists at **`v0.83.0`** and is already consumed there by
 > five APIs, so this predates cyrup's baseline: it is a **port omission**, not version lag, and a
-> rebase will never sweep it up. **`PROV-011`** (`01-cyrup-core-and-provider.md:154`, medium, effort
+> rebase will never sweep it up. **`PROV-011`** (`01-cyrup-core-and-provider.md:504`, medium, effort
 > L) is strictly broader — it enumerates all four consuming sites, distinguishes the resolver from
 > the already-ported `supports_strict_mode` flag, and names two sites that are actively *wrong*
 > rather than merely absent. `TOOL-016` owns the tool-model half and `EXT-024` the WIT half. Work it
@@ -964,7 +1183,7 @@ generator would not help even though `node`/`npm`/`bun` ARE installed here, beca
 > `qwen-token-plan-cn.ts` and `qwen-token-plan-cn.models.ts`. Only `qwen-token-plan-individual.ts`
 > (+ `.models.ts`) is new at `v0.84.1`. So **three of the four registrations are port omissions at
 > the ported baseline**, not version lag; only the fourth is drift (`PARITY-GAPS` VL-P2).
-> `PROV-014` (`01-cyrup-core-and-provider.md:168`, medium) already carries exactly this correction
+> `PROV-014` (`01-cyrup-core-and-provider.md:518`, medium) already carries exactly this correction
 > in its title ("a v0.83.0 port bug, not lag") and owns `cyrup-provider`.
 >
 > **The critic's independent re-derivation of the cyrup half, recorded so it is not re-litigated:**
@@ -1052,7 +1271,7 @@ generator would not help even though `node`/`npm`/`bun` ARE installed here, beca
 > unconfirmed claim that `model-runtime.ts` gained `+274/-82` in the delta. **Do not act on these
 > citations without re-deriving both sides.** It is listed in `## Leads — not yet evidenced` with
 > the two commands that would settle it, and it is **excluded from the item count** because it
-> proposes no work. `CFG-020` (`05-cyrup-config-and-resources.md:335`) owns the cyrup-side question
+> proposes no work. `CFG-020` (`05-cyrup-config-and-resources.md:516`) owns the cyrup-side question
 > and is in the area that owns `cyrup-config`.
 
 **cyrup** — There is no cyrup `ModelRuntime` type; the reported hits are doc citations in `cyrup-session-svc/src/services.rs` and `cyrup-session-svc/tests/settings_resolve.rs`. *(Unverified this pass.)*
@@ -1067,7 +1286,7 @@ generator would not help even though `node`/`npm`/`bun` ARE installed here, beca
 
 ## DRIFT-024 — AGENTS.md loaded twice in nested git worktrees
 
-**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** high · **duplicate-of: `SESS-013`** (`03-cyrup-session.md:172`, medium) — better evidenced there: it names both load-bearing guards (`resource-loader.ts:108` worktree-prefix, `:113` canonical `.git`) and the `isShadowed` gate at `:140-142`, and routes the realpath helper to `SESS-036`.
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** high · **duplicate-of: `SESS-013`** (`03-cyrup-session.md:310`, medium) — better evidenced there: it names both load-bearing guards (`resource-loader.ts:108` worktree-prefix, `:113` canonical `.git`) and the `isShadowed` gate at `:140-142`, and routes the realpath helper to `SESS-036`.
 
 **cyrup** — `cyrup/crates/cyrup-session/src/prompt/context_files.rs` (173 lines) de-duplicates only by exact path — `seen.insert(cf.path.clone())` at `:118` and `:136` and nowhere else — and the file contains no worktree/shadow logic at all.
 
@@ -1081,7 +1300,7 @@ generator would not help even though `node`/`npm`/`bun` ARE installed here, beca
 
 ## DRIFT-025 — `${@:-default}` prompt-template defaults render literally
 
-**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** high · **duplicate-of: `CFG-017`** (`05-cyrup-config-and-resources.md:419`) — the area that owns `cyrup-resources`, where the fix lands.
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** high · **duplicate-of: `CFG-017`** (`05-cyrup-config-and-resources.md:600`) — the area that owns `cyrup-resources`, where the fix lands.
 
 **cyrup** — `cyrup/crates/cyrup-resources/src/prompt.rs:243-246`: the `:-` branch requires `!num.is_empty() && num.bytes().all(|b| b.is_ascii_digit())`, so `${@:-none}` and `${ARGUMENTS:-none}` fall through; the `${@:N}` branch at `:258-264` then rejects them on the digits-only `start_str` guard, returning `None`.
 
@@ -1095,7 +1314,7 @@ generator would not help even though `node`/`npm`/`bun` ARE installed here, beca
 
 ## DRIFT-027 — openai-completions has no `deferredToolsMode: "kimi"`
 
-**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** high · **duplicate-of: `PROV-025`** (`01-cyrup-core-and-provider.md:338`) — which records the kind correction this one does not (`types.ts:567` declares `deferredToolsMode?: "kimi"` at **v0.83.0**, so it is a port bug, not lag) and warns that `getDeferredToolNames` is a different accessor from `splitDeferredTools`.
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** high · **duplicate-of: `PROV-025`** (`01-cyrup-core-and-provider.md:688`) — which records the kind correction this one does not (`types.ts:567` declares `deferredToolsMode?: "kimi"` at **v0.83.0**, so it is a port bug, not lag) and warns that `getDeferredToolNames` is a different accessor from `splitDeferredTools`.
 
 **cyrup** — `grep -rnE 'deferred_tools_mode|deferredToolsMode' crates --include='*.rs'` → 0. Neither `ModelCompat` (`cyrup/crates/cyrup-provider/src/api/compat.rs:73-168`) nor `ResolvedCompat` (`:205-230`) carries the field, so a catalog entry declaring it is silently dropped.
 
@@ -1114,7 +1333,7 @@ generator would not help even though `node`/`npm`/`bun` ARE installed here, beca
 > **Re-derived two-sided 2026-08-12 (repair pass), replacing a commit hash with evidence at the
 > ported tag.** `getUsageCostBreakdown` is declared at `usage-totals.ts:37` at **`v0.83.0`** with a
 > live consumer already wired there, so `2fd38684` (#6671) is pre-baseline: a **port omission**, not
-> version lag. **`PROV-036`** (`01-cyrup-core-and-provider.md:550`, low) owns it and is better
+> version lag. **`PROV-036`** (`01-cyrup-core-and-provider.md:900`, low) owns it and is better
 > evidenced — it records that the *totals* half **is** already ported
 > (`add_usage_totals`, `cyrup-tui/src/status.rs:168`, called from `app/events_fold.rs:96` and `status.rs:153`),
 > so only the breakdown is missing, and it names pi's `usageBreakdown.length > 1` render gate. Work
@@ -1151,7 +1370,7 @@ generator would not help even though `node`/`npm`/`bun` ARE installed here, beca
 
 **Impact** — No local-model workflow: cyrup cannot drive a llama.cpp router or discover models on Hugging Face.
 
-**Fix** — Large, self-contained feature port. **Note the crate has changed with the classification:** upstream ships this as a *bundled extension* under `packages/coding-agent/src/extensions/`, not as a provider, which is why **`EXT-027`** (`06-cyrup-ext.md:601`, "pi's bundled llama.cpp router extension has no counterpart") is the owning item and area 06 the owning area — not `cyrup-provider` as this item's prior Fix assumed. Defer until DRIFT-019 / `PROV-014` and DRIFT-009 / `PROV-018` are settled.
+**Fix** — Large, self-contained feature port. **Note the crate has changed with the classification:** upstream ships this as a *bundled extension* under `packages/coding-agent/src/extensions/`, not as a provider, which is why **`EXT-027`** (`06-cyrup-ext.md:734`, "pi's bundled llama.cpp router extension has no counterpart") is the owning item and area 06 the owning area — not `cyrup-provider` as this item's prior Fix assumed. Defer until DRIFT-019 / `PROV-014` and DRIFT-009 / `PROV-018` are settled.
 
 **Verify** — n/a while tracking.
 
@@ -1230,7 +1449,7 @@ generator would not help even though `node`/`npm`/`bun` ARE installed here, beca
 
 **Impact** — On every `/login` OAuth flow — the first thing a new user does — cyrup prints a URL and a hint telling the user to click it. The hint is not a link, so clicking does nothing, and no browser opens; the user must select and copy the URL out of a raw-mode TUI by hand. pi lands the user in the browser with zero interaction.
 
-**Fix** — Two halves, and **only the first is new here.** (a) Add `crates/cyrup-tui/src/open_browser.rs` porting `open-browser.ts:10-24` verbatim — `std::process::Command` with `open` / `rundll32 url.dll,FileProtocolHandler` / `xdg-open`, `.spawn()` detached, errors ignored, explicitly **not** through a shell — and call it at the end of `login_dialog.rs::show_auth` (`:221`). Leave `show_device_code` alone: upstream deliberately does not open a browser there. (b) The OSC-8 half is an instance of an already-filed class — **`TUI-020` — OSC-8 hyperlink capability detected and tested but never emitted** (`07-cyrup-tui.md:398`). Cross-reference it rather than duplicating the emitter work; the substrate cyrup needs already exists (`cyrup-tui/src/image.rs:430-444` `HYPERLINKS`/`hyperlinks_supported`/`seed_hyperlink_support`, and `render_with_hyperlink_support` re-exported at `cyrup-tui/src/lib.rs:147`). The escape must be emitted at **paint** time, not stored in the cell text (see the note at `cyrup-tui/src/markdown.rs:136`).
+**Fix** — Two halves, and **only the first is new here.** (a) Add `crates/cyrup-tui/src/open_browser.rs` porting `open-browser.ts:10-24` verbatim — `std::process::Command` with `open` / `rundll32 url.dll,FileProtocolHandler` / `xdg-open`, `.spawn()` detached, errors ignored, explicitly **not** through a shell — and call it at the end of `login_dialog.rs::show_auth` (`:221`). Leave `show_device_code` alone: upstream deliberately does not open a browser there. (b) The OSC-8 half is an instance of an already-filed class — **`TUI-020` — OSC-8 hyperlink capability detected and tested but never emitted** (`07-cyrup-tui.md:629`). Cross-reference it rather than duplicating the emitter work; the substrate cyrup needs already exists (`cyrup-tui/src/image.rs:430-444` `HYPERLINKS`/`hyperlinks_supported`/`seed_hyperlink_support`, and `render_with_hyperlink_support` re-exported at `cyrup-tui/src/lib.rs:147`). The escape must be emitted at **paint** time, not stored in the cell text (see the note at `cyrup-tui/src/markdown.rs:136`).
 
 **Verify** — Inject a spawn hook so a test asserts `open_browser` is invoked exactly once with the auth URL on `show_auth` and **zero** times on `show_device_code`, matching `login-dialog.ts:111` vs `:118-131`. The link-target assertion belongs to `TUI-020`'s test.
 
@@ -1259,7 +1478,7 @@ generator would not help even though `node`/`npm`/`bun` ARE installed here, beca
 
 ## DRIFT-046 — `normalizeWindowsShellPath` unported: Git-Bash / MSYS / Cygwin / WSL drive paths unconverted
 
-**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** high · **duplicate-of: `TOOL-036`** — *found this repair pass and missing from the ledger's F4 table*. `TOOL-036` (`04-cyrup-tools.md:462`, low) covers the same `paths.ts:67-73` body and the same `:83-85` placement, **plus** the `os.homedir()` half this item omits (`cyrup-tools/src/path.rs:91-93` resolves `$HOME` only, so `~` is broken on Windows independently of the drive-path rule), and it lands in the crate that actually owns the normalizer. `PARITY-GAPS.md:652` already couples the two under one Windows-is-a-declared-target question — answer that once for `PB-19`, `DRIFT-046`, `TOOL-036` and `TOOL-038`.
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** high · **duplicate-of: `TOOL-036`** — *found this repair pass and missing from the ledger's F4 table*. `TOOL-036` (`04-cyrup-tools.md:627`, low) covers the same `paths.ts:67-73` body and the same `:83-85` placement, **plus** the `os.homedir()` half this item omits (`cyrup-tools/src/path.rs:91-93` resolves `$HOME` only, so `~` is broken on Windows independently of the drive-path rule), and it lands in the crate that actually owns the normalizer. `PARITY-GAPS.md:677` already couples the two under one Windows-is-a-declared-target question — answer that once for `PB-19`, `DRIFT-046`, `TOOL-036` and `TOOL-038`.
 
 **cyrup** — `grep -rnE 'normalize_windows_shell_path|cygdrive' crates --include='*.rs'` → 0. cyrup's path normalization has no Windows drive-form branch at all. **Scope caveat, stated so this is not overrated:** the workspace carries only six `cfg(windows)`/`target_os = "windows"` sites, so Windows is barely a target today — it is worth filing precisely because it will be invisible until someone tries. See blind spot 5.
 
@@ -1313,7 +1532,7 @@ generator would not help even though `node`/`npm`/`bun` ARE installed here, beca
 
 **Impact** — **The base title is already satisfied for cyrup by accident**, and saying so is the point of filing this narrowly: a Rust binary's `argv[0]` is already `cyrup`, whereas Node's is `node`, which is the entire reason pi needs the assignment. What is actually lost is the **role suffix**. pi advertises an RPC-mode process as `pi-rpc`, so an operator can `pkill pi-rpc`, spot a stuck RPC child in `ps`, or pick it out in Activity Monitor without touching a user's interactive session. In cyrup an `--mode rpc` process, a `__subagent-runner` child and an `__intercom-broker` child all appear as plain `cyrup`, so recovering from a hung background process means reading `ps -f` command lines and killing by PID. This compounds `DRIFT-049` / `SEAM-047`: the RPC process a supervisor cannot stop with SIGTERM is also the one it cannot identify.
 
-**Fix** — Set the per-process **name** (not the environment) after mode resolution in `crates/cyrup/src/main.rs::run`: `prctl(PR_SET_NAME)` on Linux and the macOS equivalent — a two-platform `cfg` block or a small crate such as `proctitle`. Use `cyrup` for interactive, `cyrup-rpc` when `--mode rpc` resolves (mirroring `rpc-entry.ts:6`), and distinct names in `subagent_runner_cmd::dispatch` and `intercom_broker_cmd::dispatch`. **Correct the comment at `main.rs:53-57` in the same change:** its `unsafe`/edition-2024 rationale covers only the `std::env::set_var` half — process naming is a syscall against the current process, not a mutation of the shared environment, so it does not carry that hazard, and the comment currently reads as if the whole block were unimplementable. The `PI_CODING_AGENT` / `AI_AGENT` half of that same comment is **already filed** as `TOOL-031` (`04-cyrup-tools.md:416-430`) and `PARITY-GAPS` **PB-5** — do not re-file it here; PB-5 is where the "add to the per-child env vector rather than `unsafe set_var`" placement decision gets made.
+**Fix** — Set the per-process **name** (not the environment) after mode resolution in `crates/cyrup/src/main.rs::run`: `prctl(PR_SET_NAME)` on Linux and the macOS equivalent — a two-platform `cfg` block or a small crate such as `proctitle`. Use `cyrup` for interactive, `cyrup-rpc` when `--mode rpc` resolves (mirroring `rpc-entry.ts:6`), and distinct names in `subagent_runner_cmd::dispatch` and `intercom_broker_cmd::dispatch`. **Correct the comment at `main.rs:53-57` in the same change:** its `unsafe`/edition-2024 rationale covers only the `std::env::set_var` half — process naming is a syscall against the current process, not a mutation of the shared environment, so it does not carry that hazard, and the comment currently reads as if the whole block were unimplementable. The `PI_CODING_AGENT` / `AI_AGENT` half of that same comment is **already filed** as `TOOL-031` (`04-cyrup-tools.md:581-595`) and `PARITY-GAPS` **PB-5** — do not re-file it here; PB-5 is where the "add to the per-child env vector rather than `unsafe set_var`" placement decision gets made.
 
 **Verify** — `cyrup --mode rpc`, then `ps -o comm= -p <pid>` returns `cyrup-rpc`; an interactive session returns `cyrup`; a live `__subagent-runner` child returns its own name. All three return `cyrup` today.
 
@@ -1698,7 +1917,7 @@ the rest is adjudicated, which closes the "zero mentions anywhere in the directo
   behaviour for cyrup.
 - **`bun/cli.ts:13` `process.env.PI_CODING_AGENT = "true"`** (and `rpc-entry.ts:7`, plus
   `v0.84.1`'s `AI_AGENT` at `rpc-entry.ts:8`) → **already filed, not re-filed**: `TOOL-031`
-  (`04-cyrup-tools.md:416-430`) and `PARITY-GAPS` **PB-5**, both of which already cite `cli.ts:13`
+  (`04-cyrup-tools.md:581-595`) and `PARITY-GAPS` **PB-5**, both of which already cite `cli.ts:13`
   and `rpc-entry.ts:7` and already note that `main.rs:53-57`'s `unsafe` rationale covers only the
   process-global-mutation half. The prior pass had already rejected a duplicate of this as
   `DRIFT-044`; that rejection stands.
@@ -1759,8 +1978,8 @@ and the next auditor does not assume this file covered it: `sanitize-unicode.ts`
 
 **Rejected with reason (do not re-derive).**
 
-- **Detached-child registry** (proposed `DRIFT-043`, medium) — **rejected on two independent grounds.** (1) Duplicate: `SEAM-S03 — No detached-child registry: setsid-detached bash children are not killed from any signal/teardown path` already exists at `08-cyrup-session-svc-and-modes.md:537-547`, same kind, severity, effort and upstream citations (`shell.ts:175-194`, `bash.ts:108`/`:142`). (2) The lead **mechanism claim is wrong**: `execute_bash` takes its token as `self.session_cancel.child_token()` (`session.rs:4480`) and `runtime.dispose()` ends in `self.session_cancel.cancel()` (`session.rs:2424`), so in interactive mode the first signal → `App::run` returns → `main.rs:575` disposes → the child token **is** cancelled → `cyrup-tools/src/ops/local.rs:506-511` `send_sigkill_tree` killpg's the group. Print/JSON dispose the same way. The panic path is not "kills nothing" either: `ops/local.rs:461` sets `cmd.kill_on_drop(true)`, so unwinding SIGKILLs the direct shell (grandchildren do survive — single-pid kill, not killpg). What actually leaks is narrower — the `std::process::exit` at `signals.rs:99` (destructors do not run) and **RPC mode, where nothing observes the signal at all** — and that is filed as **DRIFT-049**, not as a registry item.
-- **`AI_AGENT` never stamped** (proposed `DRIFT-044`, low) — **rejected as a duplicate.** `PB-5 · PI_CODING_AGENT is never stamped into the environment (and AI_AGENT is the v0.84.1 half)` already exists at `PARITY-GAPS.md:63-66`, cites the same two upstream sites (`cli.ts:14`, `rpc-entry.ts:8`) and is strictly **broader** (it also covers `PI_CODING_AGENT`). The facts are right (`git grep AI_AGENT v0.83.0 -- packages/` → 0; `v0.84.1` `cli.ts:14`, `rpc-entry.ts:8`, `README.md:669`; `grep -rnE 'AI_AGENT' crates` → 0), but filing twice splits one small change across two backlogs — and the two entries gave **contradictory fixes** (PB-5: add to the per-child env vector to avoid `unsafe set_var`; the proposal: explicitly do **not** do that). **Resolve inside PB-5**, and decide the placement question there.
+- **Detached-child registry** (proposed `DRIFT-043`, medium) — **rejected on two independent grounds.** (1) Duplicate: `SEAM-S03 — No detached-child registry: setsid-detached bash children are not killed from any signal/teardown path` already exists at `08-cyrup-session-svc-and-modes.md:692-702`, same kind, severity, effort and upstream citations (`shell.ts:175-194`, `bash.ts:108`/`:142`). (2) The lead **mechanism claim is wrong**: `execute_bash` takes its token as `self.session_cancel.child_token()` (`session.rs:4480`) and `runtime.dispose()` ends in `self.session_cancel.cancel()` (`session.rs:2424`), so in interactive mode the first signal → `App::run` returns → `main.rs:575` disposes → the child token **is** cancelled → `cyrup-tools/src/ops/local.rs:506-511` `send_sigkill_tree` killpg's the group. Print/JSON dispose the same way. The panic path is not "kills nothing" either: `ops/local.rs:461` sets `cmd.kill_on_drop(true)`, so unwinding SIGKILLs the direct shell (grandchildren do survive — single-pid kill, not killpg). What actually leaks is narrower — the `std::process::exit` at `signals.rs:99` (destructors do not run) and **RPC mode, where nothing observes the signal at all** — and that is filed as **DRIFT-049**, not as a registry item.
+- **`AI_AGENT` never stamped** (proposed `DRIFT-044`, low) — **rejected as a duplicate.** `PB-5 · PI_CODING_AGENT is never stamped into the environment (and AI_AGENT is the v0.84.1 half)` already exists at `PARITY-GAPS.md:83-86`, cites the same two upstream sites (`cli.ts:14`, `rpc-entry.ts:8`) and is strictly **broader** (it also covers `PI_CODING_AGENT`). The facts are right (`git grep AI_AGENT v0.83.0 -- packages/` → 0; `v0.84.1` `cli.ts:14`, `rpc-entry.ts:8`, `README.md:669`; `grep -rnE 'AI_AGENT' crates` → 0), but filing twice splits one small change across two backlogs — and the two entries gave **contradictory fixes** (PB-5: add to the per-child env vector to avoid `unsafe set_var`; the proposal: explicitly do **not** do that). **Resolve inside PB-5**, and decide the placement question there.
 - **`packages/server` rewrite** (`05e89b418` + the new `server.ts`/`sessions.ts`/`protocol.ts`/`connection.ts`/`listener.ts`/`snapshots.ts` + `transports/unix/`) — `pi-server` is **not** in coding-agent's dependency closure at either tag (checked `package.json` both sides), and the experimental CLI's `runServer`/`runClient` are context interfaces with no implementation in coding-agent src (`cli/experimental/commands/server.ts:19-21, :44`). Nothing behavioural to port yet. `pi-protocol` + `pi-client` **did** enter the closure and are already filed as VL-P23.
 - ~~**`packages/evals` and root `scripts/`** — dev/release tooling with no runtime behaviour~~ — **PARTLY RETRACTED 2026-08-12 (repair pass).** The `packages/evals` half stands, and the `816237c10 target baseline x64 CPUs` check stands (cyrup has no `.cargo/config.toml` and no `target-cpu` in `[profile.release]`, `Cargo.toml:219-224`, so the SIGILL hazard does not exist here). **The root `scripts/` half was wrong and it cost `DRIFT-009` its Fix.** `scripts/diff-model-catalog.mjs` is a purpose-built catalog **drift differ** and `scripts/publish-model-catalog.mjs` documents the published-artifact schema; together with `packages/ai/scripts/generate-models.ts` they are the regeneration source `DRIFT-009` declared did not exist. "No runtime behaviour" was true and irrelevant: the question the item was answering was about a generated artifact's **provenance**, which is exactly what build tooling holds. See `## Coverage → The lesson DRIFT-009 taught` for the rule this produced.
 - **`ensureTool("fd"|"rg")`** (`tools-manager.ts`, 371 lines, zero cyrup hits) — genuinely N/A: cyrup's grep and find are in-process ports over the `ignore`/`grep`/`globset` crates with the delta documented in-file (`cyrup-tools/src/tools/grep.rs:1-2`, `find.rs:1-2`). There is no external binary to download.
