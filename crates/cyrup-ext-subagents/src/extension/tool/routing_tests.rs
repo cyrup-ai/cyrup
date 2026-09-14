@@ -1874,3 +1874,370 @@ async fn workflow_mode_settles_its_controller_even_when_the_script_fails() {
          WORKFLOW_8's dismiss refusal permanent for this id"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// WORKFLOW_19 — `runs.host` is a real verb, and its evidence reaches the receipt.
+// ---------------------------------------------------------------------------------------------
+
+/// End to end through the real engine, the real guest realm and the real `tokio::process` runner:
+/// a script runs one passing and one failing host command, and the receipt records BOTH, ONCE
+/// each, TERMINAL.
+///
+/// Three distinct regressions are pinned here, and each one has a different failure signature:
+///
+/// * `supports_host()` false ⇒ `prelude.js:574` deletes the property and the script dies with a
+///   `TypeError` on `runs.host` — never the Rust refusal string, which the deleted surface makes
+///   unreachable from the guest.
+/// * `on_host_step: None` ⇒ the run SUCCEEDS and `hostSteps` is simply ABSENT (it is
+///   `skip_serializing_if = "Vec::is_empty"`, so the silent-failure shape is a missing key, not an
+///   empty array).
+/// * a blind `push` instead of an upsert-by-id ⇒ two nodes per command, which
+///   `assert_unique_host_step_ids` rejects — turning this successful workflow into a
+///   `ToolError` reading "workflow completed but its receipt is invalid".
+///
+/// The failing command is caught, not propagated: `run_host_command` turns a non-`ok` result into
+/// an `Err`, which is a REJECTED PROMISE in the guest, so an uncaught `runs.host("bad", …)` would
+/// fail the whole workflow rather than returning its verdict as a value.
+#[tokio::test]
+async fn workflow_host_commands_land_in_the_receipt_once_each_and_terminal() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let executor = Arc::new(SubagentExecutor::new());
+    arm_scoped_missions(&executor, dir.path()).await;
+    let tool = SubagentTool::new(executor.clone(), dir.path().to_path_buf());
+
+    let script = r#"
+        const gate = await runs.host("gate", { kind: "command", command: "exit 0", timeoutMs: 30000, role: "gate" });
+        let failure = null;
+        try {
+            await runs.host("bad", { kind: "command", command: "exit 7", timeoutMs: 30000 });
+        } catch (error) {
+            failure = String((error && error.message) || error);
+        }
+        return { state: gate.state, ok: gate.ok, exitCode: gate.exitCode, failure };
+    "#;
+
+    let result = dispatch_tool(&tool, serde_json::json!({ "workflowScript": script }))
+        .await
+        .expect("the host commands are caught, so the workflow itself must succeed");
+
+    let text = tool_text(&result);
+    assert!(
+        text.contains("\"state\": \"passed\"") || text.contains("\"state\":\"passed\""),
+        "the passing command's verdict must reach the script: {text}"
+    );
+    assert!(
+        text.contains("Host command 'bad' failed: Command exited with code 7."),
+        "the failing command must reject with upstream's own message: {text}"
+    );
+
+    let details = result
+        .details
+        .as_ref()
+        .expect("the settlement folds details");
+    let steps = details["workflowReceipt"]["receipt"]["hostSteps"]
+        .as_array()
+        .expect(
+            "`hostSteps` is omitted entirely when empty, so a missing key here IS the \
+             `on_host_step: None` regression",
+        );
+
+    let mut observed: Vec<(String, String, String)> = steps
+        .iter()
+        .map(|step| {
+            (
+                step["id"].as_str().unwrap_or_default().to_string(),
+                step["state"].as_str().unwrap_or_default().to_string(),
+                step["reasonCode"].as_str().unwrap_or("-").to_string(),
+            )
+        })
+        .collect();
+    observed.sort();
+    assert_eq!(
+        observed,
+        vec![
+            (
+                "bad".to_string(),
+                "error".to_string(),
+                "command_failed".to_string()
+            ),
+            ("gate".to_string(), "done".to_string(), "-".to_string()),
+        ],
+        "two commands, two nodes, both terminal — a `running` entry is the upsert bug and four \
+         entries would not have produced a receipt at all"
+    );
+    assert_eq!(
+        steps[0]["verdict"].as_str(),
+        Some("pass"),
+        "the passing gate carries the settled verdict, in the engine's emission order"
+    );
+    assert_eq!(steps[0]["exitCode"].as_i64(), Some(0));
+    assert_eq!(steps[1]["exitCode"].as_i64(), Some(7));
+}
+
+/// The FAILURE arm carries the same evidence. A workflow that lets `runs.host` throw settles
+/// through `settle_foreground_workflow`'s error branch with `error.partial` — which carries no
+/// host steps of its own — so wiring only the success arm would lose the terminal node in exactly
+/// the case it matters most: the workflow died because the command failed.
+#[tokio::test]
+async fn a_workflow_that_dies_on_a_host_command_still_records_the_step() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let executor = Arc::new(SubagentExecutor::new());
+    arm_scoped_missions(&executor, dir.path()).await;
+    let tool = SubagentTool::new(executor.clone(), dir.path().to_path_buf());
+
+    let script = r#"
+        await runs.host("gate", { kind: "command", command: "exit 9", timeoutMs: 30000, role: "gate" });
+        return "unreachable";
+    "#;
+
+    let error = dispatch_tool(&tool, serde_json::json!({ "workflowScript": script }))
+        .await
+        .expect_err("an uncaught host-command rejection must fail the workflow");
+    assert!(
+        error.to_string().contains("Host command 'gate' failed"),
+        "{error}"
+    );
+
+    let details = error
+        .details
+        .as_ref()
+        .expect("the failure arm folds details too — that is what `with_details` is for");
+    let steps = details["workflowReceipt"]["receipt"]["hostSteps"]
+        .as_array()
+        .expect("the failure arm must carry the host steps");
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0]["id"].as_str(), Some("gate"));
+    assert_eq!(
+        steps[0]["state"].as_str(),
+        Some("error"),
+        "terminal, not the `running` node the op emitted first"
+    );
+    assert_eq!(steps[0]["reasonCode"].as_str(), Some("command_failed"));
+    assert_eq!(steps[0]["exitCode"].as_i64(), Some(9));
+}
+
+// ---------------------------------------------------------------------------------------------
+// WORKFLOW_20 — `state.get`/`state.set`: the mission scratchpad, bound end to end through the
+// real `execute` seam. The binding `tool/mod.rs` already resolved for every mode is what decides
+// whether `state` exists at all, so both halves are asserted here: a bound run gets a durable
+// file, an unbound one is refused by the ANALYZER (before an isolate is spent) rather than
+// discovering a bare `ReferenceError` from inside the guest.
+// ---------------------------------------------------------------------------------------------
+
+/// The durability proof, and the one that costs a second process upstream: two SEPARATE tool
+/// calls against the same `missionId`, where the second reads what the first wrote. Nothing is
+/// shared between them but `<missionDir>/<id>/state.json` — the workflow run id, the isolate, the
+/// engine's `RunShared` and the store itself are all freshly built per call.
+#[tokio::test]
+async fn a_mission_bound_workflow_script_carries_state_across_two_calls() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let executor = Arc::new(SubagentExecutor::new());
+    arm_scoped_missions(&executor, dir.path()).await;
+    let tool = SubagentTool::new(executor, dir.path().to_path_buf());
+
+    let location = crate::missions::resolve_mission_store_location(
+        dir.path(),
+        Some(&scoped_missions(dir.path())),
+        None,
+    );
+    let record = crate::missions::create_mission(
+        &location,
+        &crate::missions::MissionCreateInput {
+            title: "Scratchpad".to_string(),
+            objective: "prove the state survives the run".to_string(),
+            ..Default::default()
+        },
+        crate::time::now_epoch_millis(),
+        None,
+    )
+    .expect("the mission the workflow attaches to");
+
+    let first = dispatch_tool(
+        &tool,
+        serde_json::json!({
+            "missionId": record.id,
+            "workflowScript": "await state.set(\"seen\", { n: 1 }); return await state.get(\"seen\");",
+        }),
+    )
+    .await
+    .expect("a mission-bound workflowScript may use state");
+    assert!(
+        tool_text(&first).contains("Return: {\"n\":1}"),
+        "the value round-tripped through the store within the run: {}",
+        tool_text(&first)
+    );
+
+    let second = dispatch_tool(
+        &tool,
+        serde_json::json!({
+            "missionId": record.id,
+            "workflowScript":
+                "const prior = await state.get(\"seen\"); \
+                 await state.set(\"seen\", { n: (prior ? prior.n : 0) + 1 }); \
+                 return await state.get(\"seen\");",
+        }),
+    )
+    .await
+    .expect("the second call binds the same mission and therefore the same scratchpad");
+    assert!(
+        tool_text(&second).contains("Return: {\"n\":2}"),
+        "a SECOND run read the first run's write — if this says n:1 the store is per-run, not \
+         per-mission: {}",
+        tool_text(&second)
+    );
+
+    let state_path =
+        crate::missions::mission_state_path(&location, &record.id).expect("state path");
+    let raw = std::fs::read_to_string(&state_path).expect("the scratchpad is a real file on disk");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&raw).expect("valid JSON"),
+        serde_json::json!({ "seen": { "n": 2 } }),
+        "the evidence a workflow can close on: {}",
+        state_path.display()
+    );
+}
+
+/// The 256 KiB ceiling is the ONE invariant the engine does not also enforce (`engine.rs` bounds
+/// no value's size), so a refusal carrying this sentence can only have come from the ported
+/// `MissionWorkflowState` — it is the end-to-end proof that the call site wired the real store and
+/// not a look-alike.
+#[tokio::test]
+async fn a_mission_bound_workflow_script_still_hits_the_256_kib_ceiling() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let executor = Arc::new(SubagentExecutor::new());
+    arm_scoped_missions(&executor, dir.path()).await;
+    let tool = SubagentTool::new(executor, dir.path().to_path_buf());
+
+    let location = crate::missions::resolve_mission_store_location(
+        dir.path(),
+        Some(&scoped_missions(dir.path())),
+        None,
+    );
+    let record = crate::missions::create_mission(
+        &location,
+        &crate::missions::MissionCreateInput {
+            title: "Overflow".to_string(),
+            objective: "prove the ceiling still bites".to_string(),
+            ..Default::default()
+        },
+        crate::time::now_epoch_millis(),
+        None,
+    )
+    .expect("mission");
+
+    let error = dispatch_tool(
+        &tool,
+        serde_json::json!({
+            "missionId": record.id,
+            "workflowScript": "await state.set(\"big\", \"x\".repeat(300000)); return \"unreachable\";",
+        }),
+    )
+    .await
+    .expect_err("an over-budget set must fail the workflow, not truncate the value");
+    assert!(
+        error
+            .to_string()
+            .contains("Mission state exceeds the 256 KiB limit ("),
+        "{error}"
+    );
+    assert!(
+        !crate::missions::mission_state_path(&location, &record.id)
+            .expect("state path")
+            .exists(),
+        "the size check runs BEFORE the write, so a refused set leaves no file behind"
+    );
+}
+
+/// An UNBOUND workflow is refused by the analyzer, before an isolate is spent — and with the
+/// message the analyzer actually emits, which names the unavailable global and teaches the rule.
+/// The engine's own "Workflow state is unavailable without a mission." op refusal is defence in
+/// depth that stays unreachable from the guest: with `state_enabled` false `globalThis.state` is
+/// never installed at all, so a run that got this far would see a bare `ReferenceError`. That is
+/// exactly what the analyzer exists to prevent.
+#[tokio::test]
+async fn an_unbound_workflow_script_is_refused_by_the_analyzer_not_the_guest() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let executor = Arc::new(SubagentExecutor::new());
+    arm_scoped_missions(&executor, dir.path()).await;
+    let tool = SubagentTool::new(executor, dir.path().to_path_buf());
+
+    let expected = "workflowScript referenced an unavailable global 'state'. Available globals \
+                    are runs, emit, console, and standard ECMAScript built-ins only. \
+                    state.get/state.set require a mission; this run was started with \
+                    mission:false.";
+
+    // A bare `workflowScript` never auto-creates a mission: `workflow_objective` reads `task` /
+    // `tasks[]` / `chain[]` only and never looks at `workflowScript`, so there is no objective to
+    // create one from. Unbound stays unbound.
+    let bare = dispatch_tool(
+        &tool,
+        serde_json::json!({ "workflowScript": "return await state.get(\"seen\");" }),
+    )
+    .await
+    .expect_err("a workflow with no mission may not use state");
+    assert!(bare.to_string().contains(expected), "{bare}");
+    assert!(
+        !bare.to_string().contains("ReferenceError"),
+        "the analyzer must win the race with the guest realm: {bare}"
+    );
+
+    // `mission: false` is the EXPLICIT opt-out and must land in exactly the same place —
+    // `prepare_mission_launch` returns `Ok(None)` for it, so `state_enabled` is false by the same
+    // single derivation rather than by a second branch.
+    let opted_out = dispatch_tool(
+        &tool,
+        serde_json::json!({
+            "mission": false,
+            "workflowScript": "return await state.get(\"seen\");",
+        }),
+    )
+    .await
+    .expect_err("mission:false is explicitly unbound, not 'resolve from ambient context'");
+    assert!(opted_out.to_string().contains(expected), "{opted_out}");
+}
+
+/// The flip side of the analyzer gate, and the reason `state_enabled` may never be two literals:
+/// the very `state.get(...)` reference the previous test refuses must be ADMITTED once a mission
+/// is bound. A build that hard-coded `false` at the validate call would reject this before the
+/// engine ever saw it, even though the store is right there.
+#[tokio::test]
+async fn the_analyzer_admits_state_exactly_when_the_run_has_a_mission() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let executor = Arc::new(SubagentExecutor::new());
+    arm_scoped_missions(&executor, dir.path()).await;
+    let tool = SubagentTool::new(executor, dir.path().to_path_buf());
+
+    let location = crate::missions::resolve_mission_store_location(
+        dir.path(),
+        Some(&scoped_missions(dir.path())),
+        None,
+    );
+    let record = crate::missions::create_mission(
+        &location,
+        &crate::missions::MissionCreateInput {
+            title: "Admitted".to_string(),
+            objective: "prove the analyzer agrees with the store".to_string(),
+            ..Default::default()
+        },
+        crate::time::now_epoch_millis(),
+        None,
+    )
+    .expect("mission");
+
+    let result = dispatch_tool(
+        &tool,
+        serde_json::json!({
+            "missionId": record.id,
+            "workflowScript":
+                "const missing = await state.get(\"seen\"); \
+                 return { missing: missing === undefined };",
+        }),
+    )
+    .await
+    .expect("the identical script an unbound run refuses must pass once a mission is bound");
+    assert!(
+        tool_text(&result).contains("Return: {\"missing\":true}"),
+        "an absent key reaches the guest as `undefined`, not as a refusal: {}",
+        tool_text(&result)
+    );
+}

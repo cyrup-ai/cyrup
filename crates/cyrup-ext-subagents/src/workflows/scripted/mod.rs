@@ -124,7 +124,8 @@ pub use engine::{
     WorkflowEmitCallback, WorkflowHostStepCallback, WorkflowLanePlanCallback,
     WorkflowLaunchAdmission, WorkflowPermitClaim, WorkflowResolvedResume, WorkflowResumeInput,
     WorkflowRunCall, WorkflowScriptHost, WorkflowStateStore, WorkflowStopChild,
-    WorkflowTraceCallback, refuse_nested_workflow, run_workflow_script, validate_workflow_script,
+    WorkflowStopChildRegistrar, WorkflowTraceCallback, refuse_nested_workflow, run_workflow_script,
+    validate_workflow_script,
 };
 // `ObservationKind` and the op/extension declaration that used to live in this crate's own op
 // module now live in `cyrup-workflow-runtime` (WORKFLOW_1 §7): a `build.rs` can never import

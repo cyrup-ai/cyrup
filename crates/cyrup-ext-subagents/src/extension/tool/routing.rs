@@ -525,6 +525,14 @@ impl SubagentTool {
         call_id: &ToolCallId,
         p: &SubagentToolParams,
         cwd: &Path,
+        // WORKFLOW_20 — the mission this dispatch is bound to, ALREADY resolved by
+        // `tool/mod.rs`'s single `prepare_mission_binding_for_dispatch` seam, which runs for every
+        // mode before the mode gate. It is passed DOWN rather than re-resolved here because
+        // `prepare_mission_launch` is side-effecting (it marks an attached mission Active, and
+        // CREATES one for a `mission: {...}` object) — resolving a second time would write twice
+        // per tool call. Its `location` + `mission_id` are exactly the two values a mission
+        // scratchpad needs.
+        mission: Option<&crate::missions::MissionLaunchBinding>,
         on_update: ToolUpdateSink,
         cancel: CancelToken,
     ) -> Result<ToolResult, ToolError> {
@@ -548,11 +556,36 @@ impl SubagentTool {
             ));
         }
 
+        // WORKFLOW_20 — pi `subagent-executor.ts:4139`, the `workflowScript` branch's ONE caller
+        // of `createMissionWorkflowState`. A workflow bound to a mission gets that mission's
+        // durable scratchpad (`<missionDir>/<id>/state.json`, surviving the run AND the process);
+        // an unbound one gets no `state` global at all, and the analyzer says so by name.
+        //
+        // Built unconditionally for a bound mission, even when the script never mentions `state`:
+        // `MissionWorkflowState` is lazy (`values: None` until first access), so this costs one
+        // mission-id validation and zero I/O — and deferring it is not an option anyway, because
+        // `state_enabled` must be known BEFORE the validation below.
+        let state: Option<std::sync::Arc<dyn crate::workflows::scripted::WorkflowStateStore>> =
+            match mission {
+                Some(binding) => Some(std::sync::Arc::new(
+                    crate::missions::MissionWorkflowStateStore::create(
+                        &binding.location,
+                        &binding.mission_id,
+                    )
+                    .map_err(|e| ToolError::new(e.to_string()))?,
+                )),
+                None => None,
+            };
+        // ONE derivation, TWO consumers that must never disagree: the analyzer below and the
+        // engine's own `state_enabled` (which it derives from `options.state.is_some()` and feeds
+        // to `__cyrupWorkflowInstall`, `prelude.js:578`). Two literals is how a build ends up
+        // ACCEPTING a `state.get(...)` the run then refuses at the op — the worst of both — or
+        // refusing one it would have served.
+        let state_enabled = state.is_some();
+
         // Structural validation BEFORE a child is spent — this port's stated advantage over
         // upstream, which discovers a bad global as a runtime ReferenceError after the fact.
-        // `state_enabled: false` matches this build's `state: None` below; passing `true` would
-        // ACCEPT a `state.get(...)` the run then refuses at the op, which is the worst of both.
-        let report = crate::workflows::scripted::validate_workflow_script(script, false)
+        let report = crate::workflows::scripted::validate_workflow_script(script, state_enabled)
             .map_err(ToolError::new)?;
         if !report.ok {
             // The findings are re-prompts. ONE formatter, shared with the `validate` action arm —
@@ -649,6 +682,18 @@ impl SubagentTool {
             async_root.clone(),
         ));
 
+        // WORKFLOW_19 — the receipt's host-step evidence, accumulated from `on_host_step` below.
+        //
+        // This is the ONLY channel: neither `WorkflowScriptResult` nor `WorkflowScriptPartial`
+        // carries a `host_steps` field, so unlike `on_trace` (which is `None` precisely BECAUSE the
+        // trace comes back complete) leaving this callback unsupplied silently drops every host
+        // step on the floor and leaves `BuildWorkflowReceipt::host_steps` empty.
+        //
+        // `std::sync::Mutex`, matching the `status` record above: `WorkflowHostStepCallback` is a
+        // plain `Fn`, not async, so no guard is ever held across an `.await`.
+        let host_steps: std::sync::Arc<std::sync::Mutex<Vec<crate::workflows::HostStepNode>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
         // Field order mirrors `RunWorkflowScriptOptions`' own declaration order, so this block can
         // be diffed against the struct line by line. The struct has no `Default`, so all thirteen
         // are named.
@@ -666,12 +711,34 @@ impl SubagentTool {
                 global_concurrency_limit: None,
                 host: std::sync::Arc::clone(&host)
                     as std::sync::Arc<dyn crate::workflows::scripted::WorkflowScriptHost>,
-                // No mission state -> the verbatim "Workflow state is unavailable without a
-                // mission." refusal at the ops, AND `globalThis.state` is never installed in the
-                // guest realm (`prelude.js:578`, via the engine's `state_enabled` derivation).
-                state: None,
-                // No external stop channel in a foreground tool call.
-                register_stop_child: None,
+                // WORKFLOW_20 — `Some` exactly when this dispatch bound a mission, from the ONE
+                // derivation above. `None` means `globalThis.state` is never installed in the
+                // guest realm (`prelude.js:578`, via the engine's own `options.state.is_some()`),
+                // which is why the analyzer already refused the script above rather than letting
+                // the guest discover a bare `ReferenceError`; the engine's verbatim "Workflow
+                // state is unavailable without a mission." op refusal stays unreachable defence in
+                // depth behind both.
+                state,
+                // WORKFLOW_18 — pi `registerStopChild` (`subagent-executor.ts:5691-5694`). The
+                // engine calls this with `Some(stop)` once before the run and `None` at
+                // settlement, and BOTH arms are load-bearing: the `Some` arm is the only way an
+                // operator can reach a single child of a live workflow (`control_stop`'s workflow
+                // branch), and the `None` arm is what RELEASES the engine's captured run state —
+                // the closure holds the whole `Arc<RunShared>`, so a registry that only ever
+                // inserted would pin every child result, trace entry and console line of this run
+                // for the life of the process.
+                register_stop_child: Some({
+                    let executor = std::sync::Arc::clone(&self.executor);
+                    let run_id = workflow_run_id.clone();
+                    std::sync::Arc::new(
+                        move |stop: Option<crate::workflows::scripted::WorkflowStopChild>| {
+                            match stop {
+                                Some(stop) => executor.register_workflow_child_stop(&run_id, stop),
+                                None => executor.clear_workflow_child_stop(&run_id),
+                            }
+                        },
+                    )
+                }),
                 // `None`, NOT a caller-side journal. The engine OWNS the trace and returns it
                 // COMPLETE on both arms (`WorkflowScriptResult::trace`, and
                 // `WorkflowScriptError::partial.trace` on failure). `on_trace` is pure telemetry —
@@ -680,15 +747,100 @@ impl SubagentTool {
                 on_trace: None,
                 // `runs.lanes` still WORKS; only the advisory plan callback is undelivered.
                 on_lane_plan: None,
-                // `None`, for TWO reasons. (a) `emit` hands the callback the WHOLE accumulated
-                // snapshot every time, so a per-value forwarder re-forwards everything on every
-                // emit, quadratically — and `WorkflowScriptResult::emits` already carries the final
-                // list. (b) STRONGER: this is the ONE callback whose failure ABORTS the run, so a
-                // forwarder that errors kills the workflow. Live emit forwarding is a real feature,
-                // but it needs a delta the engine does not offer.
-                on_emit: None,
-                // `supports_host()` is false, so no host step can be produced.
-                on_host_step: None,
+                // WORKFLOW_21 — live `emit()` forwarding. This was `None` for TWO reasons, and both
+                // are now answered rather than merely overruled.
+                //
+                // (a) WAS: `emit` handed the callback the WHOLE accumulated snapshot every time, so
+                // a per-value forwarder re-forwarded everything on every emit, quadratically. GONE:
+                // [`WorkflowEmitCallback`] is now `Fn(Value, usize)` — ONE value and its zero-based
+                // index — which is the engine delta this wiring waited on. The index is what makes
+                // the stream idempotent across the engine's own rollback: a failed append was not
+                // persisted, so index N is free again.
+                //
+                // (b) WAS, and STILL IS: this is the ONE callback whose failure ABORTS the run
+                // (`engine.rs`'s `emit` pops the value, records a fatal and returns `Err`). The
+                // answer is not that the risk went away — it is that this forwarder HAS NO ERROR
+                // PATH. A UI sink that cannot take an update is not a reason to kill a workflow,
+                // and a progress sink has no concept of rejecting the emitted VALUE, which is the
+                // only failure that would legitimately abort. So a poisoned lock DROPS the update
+                // and the closure returns `Ok(())` unconditionally. ⚠ The next reader's instinct
+                // will be to propagate — do not. Every `Err` returned from here is a dropped UI
+                // update converted into a dead workflow.
+                //
+                // ⚠ This future is polled ON THE ISOLATE THREAD, inside a live deno op: the bridge
+                // impl forwards `emit` straight to `RunShared::emit` without hopping through
+                // `RunShared::main_handle` the way every other host call does. The whole body is
+                // therefore one `std::sync::Mutex` lock and one synchronous `FnMut(ToolUpdate)`
+                // call — the same discipline `child_sink` keeps, never held across an `.await`.
+                // Anything slower here stalls the workflow AND the children already running, and a
+                // `tokio::sync::Mutex` "to be safe" would put an `.await` inside the op. Routing
+                // these through the `TelemetryEvent` drain (where `on_host_step` lives) is the
+                // other tempting wrong fix: that queue exists for INFALLIBLE telemetry and would
+                // silently discard the abort semantics upstream and cyrup both implement.
+                //
+                // The wording matches the settled `Emitted:` line this same function renders below,
+                // down to the 200-char bound, so the live line and the receipt read alike.
+                on_emit: Some({
+                    let sink = host.update_sink();
+                    std::sync::Arc::new(move |value: serde_json::Value, index: usize| {
+                        let sink = std::sync::Arc::clone(&sink);
+                        Box::pin(async move {
+                            let preview = crate::workflows::scripted::format_workflow_json_preview(
+                                &value, 200,
+                            )
+                            .unwrap_or_else(|| "undefined".to_string());
+                            if let Ok(mut sink) = sink.lock() {
+                                sink(cyrup_core::ToolUpdate {
+                                    content: vec![cyrup_core::Content::text(format!(
+                                        "Workflow emit #{index}: {preview}"
+                                    ))],
+                                    // No `SubagentUpdatePayload` shape describes a workflow emit,
+                                    // and `render_subagent_result` falls back to the first text
+                                    // block when `details` does not parse as one — so `None` is
+                                    // both honest and renderable.
+                                    details: None,
+                                    terminate: cyrup_core::TerminateHint::Unspecified,
+                                });
+                            }
+                            Ok(())
+                        })
+                            as std::pin::Pin<
+                                Box<dyn std::future::Future<Output = Result<(), String>> + Send>,
+                            >
+                    })
+                }),
+                // WORKFLOW_19 — `supports_host()` is now true, so host steps are produced and this
+                // is the one way they reach the receipt.
+                //
+                // Like `on_emit` since WORKFLOW_21, `on_host_step` delivers ONE node per call — but
+                // unlike it, off the isolate thread through the telemetry drain, because a host
+                // step is pure telemetry with no failure semantics. Accumulating is correct here —
+                // and it is also the only option, per the note on `host_steps` above.
+                //
+                // ⚠ UPSERT BY ID, never push. The engine emits each command TWICE — a `Running`
+                // node when the op starts and a terminal one when it settles — both carrying the
+                // same `HostStepNode::id`, which IS the workflow key. A blind push does not merely
+                // double the receipt: `build_workflow_receipt` runs `assert_unique_host_step_ids`
+                // (Rule 11), so the duplicate turns a successful workflow into a `ToolError` at
+                // `settle_foreground_workflow`'s own receipt `map_err`. The same reasoning covers
+                // two `runs.host("gate", …)` calls sharing a key: the engine's cap counts CALL ids
+                // while the receipt's uniqueness is over NODE ids, so same-key calls must collapse
+                // last-write-wins rather than be disambiguated — the id is upstream's.
+                on_host_step: Some({
+                    let steps = std::sync::Arc::clone(&host_steps);
+                    std::sync::Arc::new(move |node: &crate::workflows::HostStepNode| {
+                        // A poisoned lock is RECOVERED, not skipped: the guarded value is a plain
+                        // `Vec` that a panicking peer cannot have left torn, and dropping the node
+                        // would lose exactly the evidence the receipt exists to carry.
+                        let mut steps = steps
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        match steps.iter_mut().find(|step| step.id == node.id) {
+                            Some(existing) => *existing = node.clone(),
+                            None => steps.push(node.clone()),
+                        }
+                    })
+                }),
             },
         )
         .await;
@@ -699,6 +851,24 @@ impl SubagentTool {
         // behind would make WORKFLOW_10 count a dead workflow forever and make WORKFLOW_8's
         // dismiss refusal permanent for this id.
         self.executor.settle_workflow_controller(&workflow_run_id);
+        // WORKFLOW_18 — upstream's settlement tail deletes from BOTH maps unconditionally
+        // (`subagent-executor.ts:5926-5927`), and so does this one. It is NOT a substitute for the
+        // registrar's `None` arm above (that one runs inside the engine, deliberately ahead of any
+        // drain that could block) and it is not redundant with it either: the `None` arm is skipped
+        // on a panic path, and a stop handle left behind pins the run's whole `Arc<RunShared>`.
+        // `clear_workflow_child_stop` is idempotent precisely so both can run.
+        self.executor.clear_workflow_child_stop(&workflow_run_id);
+
+        // WORKFLOW_19 — snapshot the accumulated evidence ONCE, here, for BOTH settlement arms.
+        //
+        // The engine flushes and joins its telemetry drain before `run_workflow_script` returns
+        // (`engine.rs`'s `TelemetryEvent::Flush` + the bounded join on `telemetry_drain`), so every
+        // node the run produced has already been delivered by this point — there is no late arrival
+        // to race.
+        let host_steps: Vec<crate::workflows::HostStepNode> = host_steps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
 
         match outcome {
             Ok(result) => {
@@ -748,6 +918,7 @@ impl SubagentTool {
                         &run_dir_name,
                         crate::workflows::WorkflowReceiptState::Complete,
                         &result.children,
+                        &host_steps,
                         &result.trace,
                         text.clone(),
                     )
@@ -795,6 +966,10 @@ impl SubagentTool {
                         &run_dir_name,
                         crate::workflows::WorkflowReceiptState::Failed,
                         &error.partial.children,
+                        // The SAME evidence on the failure arm. A workflow that throws out of
+                        // `runs.host` settles here, and that is exactly the case the terminal host
+                        // step matters most in — the partial carries no host steps of its own.
+                        &host_steps,
                         &error.partial.trace,
                         message.clone(),
                     )
@@ -833,6 +1008,7 @@ impl SubagentTool {
         run_dir_name: &crate::identity::RunDirName,
         receipt_state: crate::workflows::WorkflowReceiptState,
         children: &[crate::workflows::WorkflowScriptChildResult],
+        host_steps: &[crate::workflows::HostStepNode],
         trace: &[crate::workflows::WorkflowScriptTraceEntry],
         summary: String,
     ) -> Result<serde_json::Value, String> {
@@ -858,7 +1034,10 @@ impl SubagentTool {
                 workflow_run_id: run_dir_name,
                 state: receipt_state,
                 children,
-                host_steps: &[], // `on_host_step: None` in this build — WORKFLOW_19
+                // WORKFLOW_19 — the nodes `on_host_step` accumulated, upserted by id so Rule 11's
+                // `assert_unique_host_step_ids` (which would otherwise fail the whole receipt, and
+                // with it the workflow) sees one terminal entry per command.
+                host_steps,
                 workflow_children: None,
                 resource: None, // `one_use_permit: None` in this build
                 terminal_outcome: None,
@@ -1487,8 +1666,15 @@ impl SubagentTool {
             // this signature carries no `on_update` and no `cancel`: the arm cannot stream or
             // spawn even by accident.
             //
-            // `state_enabled` is `false`: this build grants no mission state, and the flag exists
-            // precisely because `state` is only a legal global when the run has a mission.
+            // `state_enabled` is `false` HERE, and deliberately so even though WORKFLOW_20 made
+            // the WORKFLOW arm's flag conditional. The two surfaces differ because this one is
+            // required to be side-effect-free: deriving a real flag would mean resolving the
+            // mission, and `prepare_mission_launch` marks an attached mission Active and CREATES
+            // one for a `mission: {...}` object — a validation call must do neither. So a preflight
+            // `action: "validate"` reports the STRICTEST verdict: a script it accepts runs
+            // anywhere, while one using `state` is reported unavailable here and still runs when
+            // dispatched with a `missionId`. Widening this is a separate decision (WORKFLOW_20 §4),
+            // not a drive-by.
             //
             // A script that merely FAILS validation is `Ok(report)` with `ok: false` — the
             // function's own doc says so — so the findings are rendered as ordinary text, exactly

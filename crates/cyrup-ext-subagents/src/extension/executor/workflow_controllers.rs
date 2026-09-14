@@ -5,10 +5,13 @@
 //! Port of `state.workflowControllers` (`subagent-executor.ts:5095-5098` insert, `:5272` rollback,
 //! `:5796` settlement `finally`; `extension/index.ts:1038-1041` abort-then-clear teardown).
 //!
-//! `workflowChildStops` — the SIBLING registry pi creates alongside this one — is deliberately OUT
-//! OF SCOPE here: cyrup already has its seam (`register_stop_child` on
-//! [`crate::workflows::scripted::RunWorkflowScriptOptions`], currently passed `None` at the
-//! `route_workflow_mode` call site). See WORKFLOW_1 §4 for why it is a different task's.
+//! `workflowChildStops` — the SIBLING registry pi creates alongside this one — was out of scope
+//! here and landed as its own map in [`super::workflow_child_stops`] (WORKFLOW_18), fed by the
+//! `register_stop_child` seam on [`crate::workflows::scripted::RunWorkflowScriptOptions`] that the
+//! `route_workflow_mode` call site now supplies. The two maps stay separate for upstream's own
+//! reason: a controller aborts a WORKFLOW, a stop handle stops ONE CHILD of one. The only place
+//! they meet is `abort_and_clear_workflow_controllers` below, which tears both down together
+//! exactly as `extension/index.ts:1038-1042` does.
 //!
 //! pi's `topLevelResume` is likewise NOT ported here as a standalone member
 //! (`is_top_level_resume`): it is a pure read with no in-scope caller yet — its one real consumer
@@ -151,11 +154,18 @@ impl SubagentExecutor {
             .cloned()
     }
 
-    /// pi `extension/index.ts:1038-1041` — abort every live controller, THEN clear.
+    /// pi `extension/index.ts:1038-1042` — abort every live controller, THEN clear, THEN clear the
+    /// SIBLING child-stop map.
     ///
     /// Order is upstream's and is load-bearing: *"Workflow continuations retain their launch
     /// context; abort them before teardown so a reload cannot launch through a stale context."*
     /// Clearing first would drop the only handle able to stop them.
+    ///
+    /// WORKFLOW_18 — `state.workflowChildStops?.clear()` (`extension/index.ts:1042`) is the very
+    /// next statement upstream, and it belongs here rather than at the `teardown_session` call
+    /// site: a teardown that cleared only this map would leave every stop handle holding its run's
+    /// whole `Arc<RunShared>` for the life of the process
+    /// (see [`super::workflow_child_stops`]'s lifetime contract).
     pub(crate) fn abort_and_clear_workflow_controllers(&self) {
         let mut controllers = self
             .workflow_controllers
@@ -177,6 +187,12 @@ impl SubagentExecutor {
             controller.abort();
         }
         controllers.clear();
+        // Released BEFORE the child-stop map is taken: `std::sync::Mutex` is not reentrant and
+        // these are two independent locks, so the second acquisition must be a separate,
+        // un-nested statement — the same point this file's `register_workflow_controller` makes
+        // about its own `live_workflow_run_ids()` call.
+        drop(controllers);
+        self.clear_workflow_child_stops();
     }
 }
 

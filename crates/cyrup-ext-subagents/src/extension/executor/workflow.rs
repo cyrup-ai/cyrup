@@ -5,10 +5,13 @@
 //! two REQUIRED trait methods and nothing else: every optional capability keeps the trait's
 //! default, which is upstream's own "unavailable in this host" refusal.
 //!
-//! Note precisely what that buys, because it differs per capability: `runs.host` and `state` are
-//! genuinely ABSENT from the guest realm (`cyrup-workflow-runtime`'s `js/prelude.js:574,578`),
-//! while keyed resume is PRESENT AND REFUSING (`engine.rs:1105`, `:1908`). `runs.steer` is now
-//! wired (WORKFLOW_14). Do not describe all four as "absent".
+//! Note precisely what that buys, because it differs per capability: `state` is genuinely ABSENT
+//! from the guest realm (`cyrup-workflow-runtime`'s `js/prelude.js:578`), while keyed resume is
+//! PRESENT AND REFUSING (`engine.rs:1105`, `:1908`). `runs.steer` is now wired (WORKFLOW_14) and
+//! `runs.host` is now wired (WORKFLOW_19) — [`WorkflowScriptHost::supports_host`] is what installs
+//! the guest property at all (`prelude.js:574` deletes it when the flag is false), so flipping it
+//! is not a refinement of the refusal, it is the difference between a verb and a `TypeError`. Do
+//! not describe all four as "absent".
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -23,6 +26,7 @@ use crate::background::control::{SteerAckState, SteerDeliveryMode};
 use crate::exec::SingleResult;
 use crate::extension::executor::SubagentExecutor;
 use crate::extension::executor::foreground_control::ForegroundChildSteerHandle;
+use crate::extension::executor::notices::ForegroundControlEntry;
 use crate::extension::executor::requests::ForegroundRunRequest;
 use crate::extension::tool::params::{SubagentToolParams, resolve_execution_agent_scope};
 use crate::extension::tool::text::STEER_ACK_TIMEOUT;
@@ -33,9 +37,11 @@ use crate::workflows::scripted::{
     WorkflowSteerOptions, WorkflowSteerResult, WorkflowSteerState, WorkflowSteerTarget,
 };
 use crate::workflows::{
-    WorkflowContinuation, WorkflowKey, WorkflowLaneMetadata, WorkflowRequestedContext,
-    WorkflowResumability, WorkflowScriptChildResult, assert_workflow_lane_key,
-    normalize_workflow_lane_metadata, workflow_terminal_outcome_for_result,
+    WorkflowContinuation, WorkflowHostCommandParams, WorkflowHostCommandResult, WorkflowKey,
+    WorkflowLaneMetadata, WorkflowRequestedContext, WorkflowResumability,
+    WorkflowScriptChildResult, assert_workflow_lane_key, execute_workflow_host_command,
+    normalize_workflow_lane_metadata, resolve_workflow_host_output_claim_path,
+    workflow_terminal_outcome_for_result,
 };
 
 /// Set on every workflow child's environment so the child's own `subagent` tool can refuse a
@@ -78,6 +84,59 @@ fn child_sink(shared: &SharedUpdateSink) -> ToolUpdateSink {
     })
 }
 
+/// The `output` a LIVE child carries out of [`WorkflowScriptHost::status`] (WORKFLOW_17).
+///
+/// The live arm reports `ok: true`, meaning *the status query succeeded* — NOT that the child
+/// succeeded, which is not yet knowable. It has no choice: `run_status` re-wraps any host result
+/// with `ok == false` as `Err(format!("Status '{key}' failed: {output}"))`
+/// (`workflows/scripted/engine.rs:1046-1050`) and files a `Failed` trace entry (`:1036`), so a
+/// running child answered with `ok: false` would still reach the script as a THROWN ERROR and the
+/// arm would have swapped one misleading failure for another. Running-ness therefore has to ride in
+/// the payload, and this line is it: the word `running` comes first so a script that prints nothing
+/// but `status.output` still says the true thing.
+///
+/// Absent counters are OMITTED, never rendered as `0`. The fields are `Option<u64>`
+/// (`notices.rs:48-52`) precisely because "no control event has folded a count yet" is not "zero
+/// turns", and a fabricated `0 turns` is exactly the confident-but-wrong evidence this change
+/// exists to remove. The separator is the inline stats line's own (`tui/events.rs:329-340`), so the
+/// two live progress renderings read alike.
+///
+/// The parent-level fields are read, not `active_children[&0]`: `sync_current_child`
+/// (`foreground_control.rs:171-176`) keeps them derived from that child, and the two index spaces
+/// are NOT the same — an `active_children` key is the child's index within its own foreground run
+/// (always `0` for a workflow child, `foreground.rs:989-993`) while [`LaunchIdentity::index`] is
+/// the workflow-flat index. Reading the derived fields cannot conflate them.
+fn live_activity_line(control: &ForegroundControlEntry) -> String {
+    let mut parts: Vec<String> = vec!["running".to_string()];
+    if let Some(state) = control.current_activity_state {
+        // The wire word, matching `ActivityState`'s own `rename_all = "snake_case"`
+        // (`background/telemetry.rs:22-31`), so the line and the status JSON agree.
+        parts.push(
+            match state {
+                crate::background::ActivityState::ActiveLongRunning => "active_long_running",
+                crate::background::ActivityState::NeedsAttention => "needs_attention",
+            }
+            .to_string(),
+        );
+    }
+    if let Some(tool) = control.current_tool.as_deref() {
+        parts.push(match control.current_path.as_deref() {
+            Some(path) => format!("⚒ {tool} {path}"),
+            None => format!("⚒ {tool}"),
+        });
+    }
+    if let Some(turns) = control.turn_count {
+        parts.push(format!("{turns} turns"));
+    }
+    if let Some(tools) = control.tool_count {
+        parts.push(format!("{tools} tools"));
+    }
+    if let Some(tokens) = control.tokens {
+        parts.push(format!("{tokens} tokens"));
+    }
+    parts.join(" · ")
+}
+
 /// The identity fields the engine's auto-resume relaunch drops.
 ///
 /// The engine relaunches the SAME key on auto-resume (`engine.rs:2045`) with params rebuilt from
@@ -108,9 +167,18 @@ pub(crate) struct WorkflowRunHost {
     /// makes WORKFLOW the SECOND streaming mode: `route_parallel_mode`/`route_chain_mode` still
     /// take no `on_update` at all.
     on_update: SharedUpdateSink,
-    /// Settled children by key, in launch order — the ONLY thing [`WorkflowScriptHost::status`]
-    /// can answer from in a foreground host, because a launch does not return until its child
-    /// settles. A `Vec`, not a map, because `runs.status` may be asked by key OR by run id
+    /// Settled children by key, in launch order — [`WorkflowScriptHost::status`]'s FIRST arm, and
+    /// the only one that can carry a child's real OUTCOME, because a launch does not return until
+    /// its child settles.
+    ///
+    /// ⚠ It is no longer the only thing `status` can answer from, and this doc used to say it was.
+    /// WORKFLOW_17 added the live arm: a still-running child is answered out of the executor's
+    /// `foreground_controls` registry by [`WorkflowRunHost::live_child_status`], so polling an
+    /// in-flight child reports progress instead of claiming the key was never launched. "A launch
+    /// does not return until its child settles" constrains what THIS struct can hold; it never
+    /// constrained what the host can observe.
+    ///
+    /// A `Vec`, not a map, because `runs.status` may be asked by key OR by run id
     /// (`prelude.js:311`'s `status(keyOrRunId)`) and the order is the launch order the engine's
     /// own `child_order` records.
     ///
@@ -177,6 +245,22 @@ impl WorkflowRunHost {
             next_child_index: AtomicUsize::new(0),
             publish_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// The host's share of the one real sink, for the live `emit()` forwarder `routing.rs` passes
+    /// as `RunWorkflowScriptOptions::on_emit` (WORKFLOW_21).
+    ///
+    /// An accessor rather than `pub(crate)` on the field or on [`SharedUpdateSink`]: `routing.rs`
+    /// is a different module, the alias' doc is written for a type that stays private to this one,
+    /// and the only thing the caller legitimately needs is a share to lock. It spells the type out
+    /// for exactly that reason.
+    ///
+    /// The forwarder built on this must hold the lock the same way [`child_sink`] does — across one
+    /// synchronous `sink(update)` and never across an `.await` — because it is the SAME mutex the
+    /// per-child forwarding sinks minted by [`WorkflowScriptHost::launch`] hold from the main pool
+    /// while children stream, and unlike them it is polled on the isolate thread inside a live op.
+    pub(crate) fn update_sink(&self) -> Arc<Mutex<ToolUpdateSink>> {
+        Arc::clone(&self.on_update)
     }
 
     /// The ONE place a child's steer handle is built — used by both `launch` (which hands it to
@@ -363,6 +447,93 @@ impl WorkflowRunHost {
                 .unwrap_or_default(),
         }
     }
+
+    /// [`WorkflowScriptHost::status`]'s LIVE arm: the still-running child this workflow launched
+    /// under `key_or_run_id`, or `None` when no such child is in flight (WORKFLOW_17).
+    ///
+    /// The registry is the executor's `foreground_controls` (`mod.rs:137`), which holds an entry
+    /// for EXACTLY the duration of a child's run: `register_foreground_controls` inserts it keyed
+    /// by the child's real run id (`foreground.rs:1022-1025`) and `settle_foreground_run` `remove`s
+    /// it (`foreground.rs:1063-1069`). Presence therefore IS liveness — nothing empties a
+    /// surviving entry, because this crate has no `end_foreground_child` counterpart to
+    /// `begin_foreground_child` — which is why this predicate needs neither
+    /// `control_is_live_in_workflow`'s `!active_children.is_empty()` term nor its session term
+    /// (`workflow_steering.rs:84-92`), even though it copies that resolver's lock → filter → clone
+    /// shape verbatim. The session term is redundant here for a second reason: the scope is
+    /// `self.workflow_run_id`, which is process-local and minted by this very tool call
+    /// (`routing.rs:583`), so a foreign instance's control entry can never match it.
+    ///
+    /// ⚠ The run id is the MAP KEY, not a field on the entry — the same reason
+    /// `resolve_workflow_foreground_steering_target` carries it out as `(k.clone(), c.clone())`
+    /// (`workflow_steering.rs:210-222`). That is also why [`LaunchIdentity`] grows no `run_id`
+    /// field: `RunId::new()` is called inside `resolve_run_channels` (`foreground.rs:641`) and
+    /// reaches `launch` only in `run_foreground_streaming`'s return tuple — i.e. AFTER the child
+    /// has settled, at which point arm 1 already answers. A field filled there would be `None` for
+    /// every running child's entire lifetime, dead in exactly the window a live status needs it.
+    ///
+    /// The guest addresses either form (`prelude.js:311`'s `status(keyOrRunId)`), so both the lane
+    /// key and the map key are accepted.
+    fn live_child_status(&self, key_or_run_id: &str) -> Option<WorkflowScriptChildResult> {
+        // Cloned OUT of the lock, never read through it: `foreground_controls` is a
+        // `std::sync::Mutex` shared with every live run's notifier pump, and this is called from an
+        // async fn. `unwrap_or_else(PoisonError::into_inner)` because `unwrap_used`/`expect_used`
+        // are DENY workspace-wide (`Cargo.toml:101-104`) and a poisoned registry must degrade a
+        // status poll, not panic the workflow that is polling.
+        let (run_id, control) = {
+            let controls = self
+                .executor
+                .foreground_controls
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            controls
+                .iter()
+                .find(|(run_id, control)| {
+                    control.parent_workflow_run_id.as_ref() == Some(&self.workflow_run_id)
+                        && (control.workflow_key.as_ref().map(WorkflowKey::as_str)
+                            == Some(key_or_run_id)
+                            || run_id.as_str() == key_or_run_id)
+                })
+                .map(|(run_id, control)| (run_id.clone(), control.clone()))?
+        };
+
+        // The lane key comes off the ENTRY, not from the argument, so a run-id-addressed poll still
+        // answers with the key the script launched: `WorkflowScriptChildResult::key` is a KEY, and
+        // echoing a run id into it would hand the script a second, wrong identity for the child.
+        // `None` is `launch`'s documented degraded-provenance branch (`WorkflowKey::parse(key).ok()`
+        // on a key the engine generated, which always parses); with no lane key there is nothing
+        // truthful to name the child by, so it falls through to the unknown arm rather than guess.
+        let key = control.workflow_key.as_ref()?.as_str().to_string();
+
+        // `launched` is the launch-side half of the identity, and it is written BEFORE the spawn
+        // await — the `launched.entry(key)` insert precedes the `run_foreground_streaming().await`
+        // in `launch` — so it is populated for the child's whole running lifetime. That ordering is
+        // what makes this arm possible at all.
+        let agent = self
+            .launched
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+            .map(|identity| identity.agent.clone());
+
+        // `..Default::default()` (the derive is on the struct itself, `workflows/types.rs:309`)
+        // rather than twenty hand-written `None`/`false` fields. Every one of them is absent for the
+        // same single reason: the child HAS NOT SETTLED. `stopped`/`interrupted`/`detached` are
+        // false because no terminal event has happened, `error`/`structured_output`/`resumability`/
+        // `continuation`/`artifact_paths`/`results` are empty because there is no outcome yet — and
+        // inventing one is the failure mode this whole change removes. Arm 1 replaces all of it the
+        // moment there IS an outcome.
+        Some(WorkflowScriptChildResult {
+            key,
+            // See [`live_activity_line`]: `ok` answers "did the status QUERY succeed", not "did the
+            // child succeed". `engine.rs:1046-1050` leaves no other option that meets the objective
+            // without widening the engine's own gate.
+            ok: true,
+            agent,
+            run_id: Some(run_id),
+            output: live_activity_line(&control),
+            ..WorkflowScriptChildResult::default()
+        })
+    }
 }
 
 #[async_trait::async_trait]
@@ -547,19 +718,39 @@ impl WorkflowScriptHost for WorkflowRunHost {
         Ok(mapped)
     }
 
-    /// A foreground host has no live child registry — a launch does not return until its child
-    /// settles — so this answers from the settled list only, by key first and then by run id (the
-    /// guest passes either, `prelude.js:311`'s `status(keyOrRunId)`, which coerces a non-string
-    /// to `""`).
+    /// `runs.status(keyOrRunId)` — THREE arms: settled, then LIVE, then unknown (WORKFLOW_17).
     ///
-    /// An unknown key is an ERROR, not an empty result: `runs.status` on a child that was never
-    /// launched is a script bug, and the message is a re-prompt.
+    /// This answered from the settled list alone, and its own doc justified that with *"a
+    /// foreground host has no live child registry — a launch does not return until its child
+    /// settles"*. The premise is true of the child's RESULT and false of its STATUS, which is the
+    /// entire point of a status verb. The host has no live registry; the EXECUTOR does, and the host
+    /// holds an `Arc` to it.
+    ///
+    /// What the settled-only host did to a script that polled an in-flight child was emit
+    /// *"names no launched child in this workflow"* — wrong twice over, because the key HAS been
+    /// launched and the sentence invites the author to add a launch that already exists. The engine
+    /// makes that worse rather than catching it: for an in-flight child `run_status` cannot resolve
+    /// a run id (it reads settled children only, `engine.rs:996-1006`) and hands this method the raw
+    /// KEY, so there is deliberately no engine-side notion of "running" — that answer comes entirely
+    /// from here.
+    ///
+    /// The guest passes either form (`prelude.js:311`'s `status(keyOrRunId)`, which coerces a
+    /// non-string to `""`); both arms accept both.
+    ///
+    /// An unknown key is still an ERROR, not an empty result: `runs.status` on a child that was
+    /// never launched is a script bug, and the message is a re-prompt. It is now reached only when
+    /// the key is in neither the settled list nor the live registry, which is the only case the
+    /// wording was ever true for.
     async fn status(
         &self,
         key_or_run_id: &str,
         _cancel: CancelToken,
     ) -> Result<WorkflowScriptChildResult, String> {
-        let found = self.settled.lock().ok().and_then(|settled| {
+        // Arm 1 — SETTLED, unchanged, and it wins whenever it exists: a real outcome is strictly
+        // more informative than a live snapshot. The one window where both arms can match is an
+        // auto-resume relaunch of a key that already failed once (`engine.rs:2045`), which answers
+        // from the first attempt until the retry settles and `launch`'s upsert-in-place replaces it.
+        let settled = self.settled.lock().ok().and_then(|settled| {
             settled
                 .iter()
                 .find(|c| c.key == key_or_run_id)
@@ -570,9 +761,21 @@ impl WorkflowScriptHost for WorkflowRunHost {
                 })
                 .cloned()
         });
-        found.ok_or_else(|| {
-            format!("runs.status('{key_or_run_id}') names no launched child in this workflow.")
-        })
+        if let Some(settled) = settled {
+            return Ok(settled);
+        }
+
+        // Arm 2 — LIVE. The child is still running, so it has no outcome to report; what it has is
+        // evidence, and [`Self::live_child_status`] carries it (real run id, agent, activity line,
+        // live counters) as an `Ok` the script can inspect rather than an error it must catch.
+        if let Some(live) = self.live_child_status(key_or_run_id) {
+            return Ok(live);
+        }
+
+        // Arm 3 — UNKNOWN.
+        Err(format!(
+            "runs.status('{key_or_run_id}') names no launched child in this workflow."
+        ))
     }
 
     /// Keyed receipt resume is available because this host writes receipts into a real run dir
@@ -736,6 +939,101 @@ impl WorkflowScriptHost for WorkflowRunHost {
             error,
         })
     }
+
+    /// WORKFLOW_19 — the guest sees `runs.host` ONLY because of this flag.
+    ///
+    /// `prelude.js:574` is `if (!hostEnabled) delete surface.host;`, and `hostEnabled` is read off
+    /// this method (`engine.rs`'s `shared.host.supports_host()` at install time). So while
+    /// [`Self::host_command`] without this would be dead code, this without
+    /// [`Self::host_command`] would be worse than dead: the property would exist and every call
+    /// would take the trait default's `runs.host is unavailable in this host context.` The two
+    /// land together, as `supports_steer`/`steer` did.
+    ///
+    /// It is true unconditionally because its two prerequisites are unconditional for a
+    /// foreground workflow: a resolved request cwd (`self.cwd`, `extension/tool/mod.rs:205`) to
+    /// run the command in, and a real run directory (`self.run_dir`, WORKFLOW_13) to write the
+    /// default capture into. Neither is optional at this point in the call.
+    fn supports_host(&self) -> bool {
+        true
+    }
+
+    /// `runs.host(key, params)` — run a gate/CI command on the host and hand the script its
+    /// verdict.
+    ///
+    /// `params` arrives ALREADY NORMALIZED: `run_host_command` calls
+    /// [`crate::workflows::normalize_workflow_host_command_params`] before it reaches this host
+    /// (and before the `supports_host` gate, so a malformed-params script gets the normalizer's
+    /// message even in a host that refuses the verb), and that function's own doc names itself the
+    /// ONLY validating boundary. Re-validating here would be a second, divergent boundary; this
+    /// method therefore treats `params` as plain data and adds exactly the two arguments a
+    /// normalized param set cannot carry — where the command runs, and where its capture lands.
+    async fn host_command(
+        &self,
+        key: &str,
+        params: WorkflowHostCommandParams,
+        cancel: CancelToken,
+    ) -> Result<WorkflowHostCommandResult, String> {
+        // The REQUEST cwd, the one `Tool::execute`'s `resolve_requested_cwd` already resolved and
+        // the same one every child of this workflow is launched in — never `std::env::current_dir`,
+        // which is this process's ambient state and would silently disagree with the `cwd` the
+        // caller asked for (the same reason `clippy.toml` bans `std::env::set_var`).
+        //
+        // For an EXPLICIT `params.output` this is also the containment root:
+        // `execute_workflow_host_command` runs `ContainedPath::assert_within(cwd, …)` against it
+        // before and after the spawn. Handing it a different root than the command's own working
+        // directory would make "relative to the cwd" mean two things at once.
+        let cwd = self.cwd.as_path();
+
+        // The default capture destination, which nothing but this host can mint: it is used only
+        // when the script named no `output`, and in that branch the runner does a plain
+        // `create_dir_all` + `write_default_output` with NO containment check — so the path must be
+        // one this host owns outright rather than anything derived from guest input. `self.run_dir`
+        // is exactly that: the workflow's own directory, created up front by `route_workflow_mode`
+        // and already the home of `status.json` and the receipt.
+        //
+        // `key` is safe as a file name by construction and is re-proved on the way in: the guest
+        // pattern is `/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/` (`prelude.js:87`) and the engine
+        // re-checks it through `validate_key` → `WorkflowKey::parse` before this method is
+        // reached. No separator, no leading dot, so the `join` cannot escape `host/`.
+        let default_output_path = self.run_dir.join("host").join(format!("{key}.log"));
+
+        // Claim the DEFAULT destination and only the default one.
+        //
+        // The claim is the post-run equality check `resolve_workflow_host_output_claim_path(
+        // &output_path) == claimed` (`host_command.rs:907-912`), which catches a command that
+        // replaced its own output directory with a symlink between the claim and the write. The
+        // default branch has no other guard at all — it is a plain write — so this is the whole of
+        // its protection, and the host can state the claim exactly because in that branch
+        // `output_path` IS `default_output_path`.
+        //
+        // The EXPLICIT branch gets `None`, deliberately. There the runner already re-runs
+        // `ContainedPath::assert_within` and requires it to EQUAL the pre-spawn result, which is
+        // the same symlink-swap defence; claiming as well would buy nothing and would force this
+        // host to re-derive the runner's private `cwd.join(output)` normalization. A claim that
+        // disagrees with the runner's own derivation fails CLOSED — a hard
+        // `output path changed after it was claimed.` on a command that did nothing wrong — so
+        // duplicating that derivation is a liability, not a belt.
+        let claimed_output_path = params
+            .output
+            .is_none()
+            .then(|| resolve_workflow_host_output_claim_path(&default_output_path));
+
+        // `&params` / `&cancel`: the trait hands this host OWNED values (the engine clones them per
+        // call at `engine.rs`'s `host_params`/`cancel` bindings) while the runner borrows.
+        //
+        // `cancel` is the engine's `child_cancel`, the token it cancels at settlement — so a
+        // command still running when the workflow settles drains as `Stopped`
+        // (→ `HostStepState::Cancelled`) rather than hanging the settlement behind its timeout.
+        execute_workflow_host_command(
+            key,
+            &params,
+            cwd,
+            &default_output_path,
+            claimed_output_path.as_deref(),
+            &cancel,
+        )
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -749,23 +1047,53 @@ mod tests {
 
     use super::*;
 
-    /// A host whose `launched` map already carries `key` at `index`, as `launch` would have left it.
-    fn host_with(run_dir: PathBuf, key: &str, index: usize) -> WorkflowRunHost {
+    /// A bare host rooted at a REAL `cwd` and `run_dir` — what `runs.host` needs, since it spawns
+    /// a process in the one and writes its capture into the other.
+    fn host_rooted_at(cwd: PathBuf, run_dir: PathBuf) -> WorkflowRunHost {
         let workflow_run_id = crate::background::RunId::new();
         let status = Arc::new(Mutex::new(crate::background::RunStatus::queued(
             workflow_run_id.clone(),
             crate::background::RunMode::Workflow,
             None,
         )));
-        let host = WorkflowRunHost::new(
+        WorkflowRunHost::new(
             Arc::new(SubagentExecutor::new()),
-            PathBuf::from("/proj"),
+            cwd,
             Box::new(|_| {}),
             workflow_run_id,
             status,
             run_dir.clone(),
             run_dir,
-        );
+        )
+    }
+
+    /// The normalizer's OUTPUT, as the engine hands it to the host — never a hand-rolled shape the
+    /// normalizer would have rejected, because `host_command`'s contract is "already normalized".
+    fn host_params(
+        command: &str,
+        timeout_ms: u64,
+        output: Option<&str>,
+    ) -> WorkflowHostCommandParams {
+        // The key is OMITTED, never `null`: the normalizer refuses a present-but-null `output`
+        // ("must be a non-empty relative path"), so `json!({"output": None::<&str>})` would build
+        // a param set the engine could never hand this host.
+        let mut raw = serde_json::json!({
+            "kind": "command",
+            "command": command,
+            "timeoutMs": timeout_ms,
+        });
+        if let Some(output) = output
+            && let Some(map) = raw.as_object_mut()
+        {
+            map.insert("output".to_string(), Value::String(output.to_string()));
+        }
+        crate::workflows::normalize_workflow_host_command_params(&raw, "runs.host('gate') params")
+            .expect("the fixture params must normalize")
+    }
+
+    /// A host whose `launched` map already carries `key` at `index`, as `launch` would have left it.
+    fn host_with(run_dir: PathBuf, key: &str, index: usize) -> WorkflowRunHost {
+        let host = host_rooted_at(PathBuf::from("/proj"), run_dir);
         if let Ok(mut launched) = host.launched.lock() {
             launched.insert(
                 key.to_string(),
@@ -908,5 +1236,399 @@ mod tests {
                 "mode {mode:?}"
             );
         }
+    }
+
+    /// Register a live foreground control exactly as `register_foreground_controls` would
+    /// (`foreground.rs:1022-1025`): keyed by the child's real run id, stamped with the owning
+    /// workflow and lane key. Returns that run id, because it is the MAP KEY and not a field — the
+    /// same shape `resolve_workflow_foreground_steering_target` has to carry out by hand.
+    fn register_live_child(
+        host: &WorkflowRunHost,
+        parent_workflow_run_id: Option<&crate::background::RunId>,
+        key: &str,
+        counters: (Option<u64>, Option<u64>, Option<u64>),
+    ) -> String {
+        let run_id = crate::background::RunId::new().as_str().to_string();
+        let (turn_count, tool_count, tokens) = counters;
+        let entry = ForegroundControlEntry {
+            interrupt: CancelToken::new(),
+            current_agent: Some("worker".to_string()),
+            current_index: Some(0),
+            current_activity_state: Some(crate::background::ActivityState::ActiveLongRunning),
+            mode: crate::background::RunMode::Single,
+            description: Some("narrow the diff".to_string()),
+            current_tool: Some("Edit".to_string()),
+            current_path: Some("src/lib.rs".to_string()),
+            turn_count,
+            tool_count,
+            tokens,
+            started_at: 0,
+            updated_at: 0,
+            session_id: None,
+            parent_workflow_run_id: parent_workflow_run_id.cloned(),
+            workflow_key: WorkflowKey::parse(key).ok(),
+            cwd: None,
+            session_name: None,
+            active_children: std::collections::BTreeMap::new(),
+        };
+        host.executor
+            .foreground_controls
+            .lock()
+            .unwrap()
+            .insert(run_id.clone(), entry);
+        run_id
+    }
+
+    /// THE OBJECTIVE. A poll against a running child must return `Ok` carrying live evidence, not
+    /// the "names no launched child" error — and `ok` must be `true`, because
+    /// `engine.rs:1046-1050` re-wraps an `ok == false` host result as
+    /// `Err("Status '<key>' failed: …")` and the script would still see a thrown error.
+    #[tokio::test]
+    async fn status_reports_a_live_child_with_ok_true_and_its_real_run_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = host_with(dir.path().join("wf"), "lane", 0);
+        let run_id = register_live_child(
+            &host,
+            Some(&host.workflow_run_id),
+            "lane",
+            (Some(3), Some(12), Some(4096)),
+        );
+
+        let result = host
+            .status("lane", CancelToken::new())
+            .await
+            .expect("a LIVE child must not be reported as never launched");
+
+        assert!(
+            result.ok,
+            "ok means the status QUERY succeeded; false becomes a thrown error"
+        );
+        assert_eq!(result.key, "lane");
+        assert_eq!(
+            result.agent.as_deref(),
+            Some("worker"),
+            "from the launch identity"
+        );
+        assert_eq!(
+            result.run_id.as_deref(),
+            Some(run_id.as_str()),
+            "the live child's REAL run id, read as the foreground_controls map key"
+        );
+        assert_eq!(
+            result.output,
+            "running · active_long_running · ⚒ Edit src/lib.rs · 3 turns · 12 tools · 4096 tokens"
+        );
+        // Not settled: there is no outcome to report yet, and inventing one is the failure this
+        // change removes.
+        assert!(!result.stopped && !result.interrupted && !result.detached);
+        assert!(result.error.is_none());
+        assert!(result.results.is_empty());
+    }
+
+    /// The guest may address either form (`prelude.js:311`'s `status(keyOrRunId)`), and for a live
+    /// child the run id IS the map key. The answer still names the LANE KEY, never the run id —
+    /// `WorkflowScriptChildResult::key` is a key.
+    #[tokio::test]
+    async fn status_answers_a_live_child_addressed_by_its_run_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = host_with(dir.path().join("wf"), "lane", 0);
+        let run_id = register_live_child(
+            &host,
+            Some(&host.workflow_run_id),
+            "lane",
+            (None, None, None),
+        );
+
+        let result = host
+            .status(&run_id, CancelToken::new())
+            .await
+            .expect("a run-id-addressed poll must resolve the same child");
+
+        assert_eq!(result.key, "lane", "the launched key, not the run id");
+        assert_eq!(result.run_id.as_deref(), Some(run_id.as_str()));
+        // Absent counters are OMITTED, never rendered as `0`: `None` is "nothing folded yet", and
+        // a fabricated `0 turns` would be confident and wrong.
+        assert_eq!(
+            result.output,
+            "running · active_long_running · ⚒ Edit src/lib.rs"
+        );
+    }
+
+    /// The live arm is scoped to THIS workflow. A concurrent workflow's child — or a plain
+    /// foreground run that happens to share a lane name — must not be reported as this host's.
+    #[tokio::test]
+    async fn status_ignores_a_live_child_owned_by_another_workflow() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = host_with(dir.path().join("wf"), "lane", 0);
+        let other = crate::background::RunId::new();
+        register_live_child(&host, Some(&other), "lane", (Some(1), None, None));
+        register_live_child(&host, None, "lane", (Some(1), None, None));
+
+        let error = host
+            .status("lane", CancelToken::new())
+            .await
+            .expect_err("neither entry belongs to this workflow");
+        assert_eq!(
+            error,
+            "runs.status('lane') names no launched child in this workflow."
+        );
+    }
+
+    /// Arm 3 still refuses: a key in neither the settled list nor the live registry is a script
+    /// bug, and the message is the re-prompt. This is the only case its wording was ever true for.
+    #[tokio::test]
+    async fn status_still_refuses_a_key_that_was_never_launched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = host_with(dir.path().join("wf"), "lane", 0);
+        register_live_child(
+            &host,
+            Some(&host.workflow_run_id),
+            "lane",
+            (None, None, None),
+        );
+
+        let error = host
+            .status("other", CancelToken::new())
+            .await
+            .expect_err("an unknown key must still refuse");
+        assert_eq!(
+            error,
+            "runs.status('other') names no launched child in this workflow."
+        );
+    }
+
+    /// Arm 1 wins over arm 2: a settled result is strictly more informative than a live snapshot,
+    /// so a stale control entry can never mask a real outcome.
+    #[tokio::test]
+    async fn a_settled_result_wins_over_a_live_control_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = host_with(dir.path().join("wf"), "lane", 0);
+        register_live_child(
+            &host,
+            Some(&host.workflow_run_id),
+            "lane",
+            (Some(9), None, None),
+        );
+        host.settled
+            .lock()
+            .unwrap()
+            .push(WorkflowScriptChildResult {
+                key: "lane".to_string(),
+                ok: true,
+                agent: Some("worker".to_string()),
+                run_id: Some("settled-run".to_string()),
+                output: "done".to_string(),
+                ..WorkflowScriptChildResult::default()
+            });
+
+        let result = host
+            .status("lane", CancelToken::new())
+            .await
+            .expect("settled answers");
+        assert_eq!(result.output, "done");
+        assert_eq!(result.run_id.as_deref(), Some("settled-run"));
+    }
+
+    // --------------------------------------------------------------------------------------
+    // WORKFLOW_19 — `runs.host`
+    // --------------------------------------------------------------------------------------
+
+    /// DoD 1: the flag is what installs the guest property at all. With it false `prelude.js:574`
+    /// deletes `runs.host` and the script gets a `TypeError`, not upstream's refusal string — so
+    /// this assertion is the difference between the verb existing and not existing.
+    #[test]
+    fn the_host_surface_is_advertised() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = host_rooted_at(dir.path().to_path_buf(), dir.path().join("wf"));
+        assert!(host.supports_host());
+    }
+
+    /// The happy path, end to end through the real runner: a passing command settles `passed`, and
+    /// its capture lands at the DEFAULT destination this host minted — under the workflow's own
+    /// run directory, not under the request cwd, because the script named no `output` and the
+    /// runner's default branch does no containment check at all.
+    #[tokio::test]
+    async fn a_passing_command_captures_into_the_workflows_own_run_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path().join("proj");
+        let run_dir = dir.path().join("wf");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        std::fs::create_dir_all(&run_dir).expect("run dir");
+        let host = host_rooted_at(cwd.clone(), run_dir.clone());
+
+        let result = host
+            .host_command(
+                "gate",
+                host_params("printf 'out'; printf 'err' >&2", 30_000, None),
+                CancelToken::new(),
+            )
+            .await
+            .expect("a command that runs resolves, whatever its exit code");
+
+        assert_eq!(
+            result.state,
+            crate::workflows::WorkflowHostCommandState::Passed
+        );
+        assert!(result.ok);
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.stdout, "out");
+        assert_eq!(result.stderr, "err");
+        assert_eq!(result.output_path, run_dir.join("host").join("gate.log"));
+        assert_eq!(
+            std::fs::read_to_string(&result.output_path)
+                .expect("the capture must be written")
+                .len(),
+            6,
+            "the capture holds both streams"
+        );
+    }
+
+    /// The command runs in the REQUEST cwd — `self.cwd`, the one `Tool::execute` resolved — and
+    /// never in this process's ambient `std::env::current_dir`, which is what a workflow launched
+    /// with an explicit `cwd` would otherwise silently get.
+    #[tokio::test]
+    async fn the_command_runs_in_the_request_cwd() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path().join("proj");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        std::fs::write(cwd.join("marker.txt"), "here").expect("marker");
+        let host = host_rooted_at(cwd, dir.path().join("wf"));
+
+        let result = host
+            .host_command(
+                "gate",
+                host_params("cat marker.txt", 30_000, None),
+                CancelToken::new(),
+            )
+            .await
+            .expect("resolves");
+
+        assert!(result.ok, "{:?}", result.error);
+        assert_eq!(result.stdout, "here");
+    }
+
+    /// A non-zero exit is a business OUTCOME, not a technical failure: it comes back as `Ok` with
+    /// `state: failed`, so the engine can map it onto a terminal `HostStepNode` and only THEN
+    /// reject the guest promise. An `Err` here would skip that mapping and leave the receipt
+    /// carrying a `Running` step for a command that has plainly finished.
+    #[tokio::test]
+    async fn a_failing_command_is_a_result_not_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path().join("proj");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let host = host_rooted_at(cwd, dir.path().join("wf"));
+
+        let result = host
+            .host_command(
+                "bad",
+                host_params("exit 3", 30_000, None),
+                CancelToken::new(),
+            )
+            .await
+            .expect("a failing command still RESOLVES");
+
+        assert_eq!(
+            result.state,
+            crate::workflows::WorkflowHostCommandState::Failed
+        );
+        assert!(!result.ok);
+        assert_eq!(result.exit_code, Some(3));
+        assert_eq!(result.error.as_deref(), Some("Command exited with code 3."));
+    }
+
+    /// DoD 3: the timeout path is real, not simulated — a command that outlives its budget settles
+    /// `timed-out` (which the engine renders as `state: "error"` + `reasonCode: "timed_out"`;
+    /// there is no `timedOut` host-step state).
+    #[tokio::test]
+    async fn a_command_that_outlives_its_budget_settles_timed_out() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path().join("proj");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let host = host_rooted_at(cwd, dir.path().join("wf"));
+
+        let result = host
+            .host_command(
+                "slow",
+                host_params("sleep 30", 250, None),
+                CancelToken::new(),
+            )
+            .await
+            .expect("a timeout still RESOLVES");
+
+        assert_eq!(
+            result.state,
+            crate::workflows::WorkflowHostCommandState::TimedOut
+        );
+        assert!(!result.ok);
+        assert!(
+            result.exit_code.is_none(),
+            "the ladder killed it, so there is no exit code to report"
+        );
+        // The STATE is asserted, not the message. `settle_workflow_host_command`'s precedence puts
+        // a process-tree cleanup fault ahead of the timeout sentence, and whether the group sweep
+        // can verify itself empty is a property of the sandbox this test runs in, not of this
+        // host — `workflows::host_command::tests::a_timeout_settles_timed_out` pins that exact
+        // sentence at the layer that owns it.
+        assert!(result.error.is_some(), "a timeout always carries a reason");
+    }
+
+    /// An EXPLICIT `output` is resolved against the request cwd, not the run directory — and this
+    /// host passes no claim on that branch, so a correctly-behaving command must not trip
+    /// `output path changed after it was claimed.`
+    #[tokio::test]
+    async fn an_explicit_output_lands_under_the_request_cwd() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path().join("proj");
+        std::fs::create_dir_all(cwd.join("reports")).expect("cwd");
+        let host = host_rooted_at(cwd.clone(), dir.path().join("wf"));
+
+        let result = host
+            .host_command(
+                "gate",
+                host_params("printf 'x'", 30_000, Some("reports/gate.log")),
+                CancelToken::new(),
+            )
+            .await
+            .expect("resolves");
+
+        assert!(result.ok, "{:?}", result.error);
+        assert_eq!(result.output_path, cwd.join("reports/gate.log"));
+        assert_eq!(
+            std::fs::read_to_string(&result.output_path).expect("written"),
+            "x"
+        );
+        assert!(
+            !dir.path().join("wf").join("host").exists(),
+            "an explicit output must not also mint the default destination"
+        );
+    }
+
+    /// The engine's `child_cancel` reaches the child: a workflow aborted mid-command settles
+    /// `stopped` (→ `HostStepState::Cancelled`) instead of holding settlement hostage to the
+    /// command's own timeout.
+    #[tokio::test]
+    async fn an_aborted_workflow_stops_the_command() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path().join("proj");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let host = host_rooted_at(cwd, dir.path().join("wf"));
+        let cancel = CancelToken::new();
+
+        let ticket = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            ticket.cancel();
+        });
+
+        let result = host
+            .host_command("slow", host_params("sleep 30", 60_000, None), cancel)
+            .await
+            .expect("an abort still RESOLVES");
+
+        assert_eq!(
+            result.state,
+            crate::workflows::WorkflowHostCommandState::Stopped
+        );
+        assert!(!result.ok);
     }
 }

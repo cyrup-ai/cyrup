@@ -100,7 +100,13 @@ impl SubagentExecutor {
     /// known `Some`. THEN registry liveness (`:23`, the WORKFLOW_6 registry — checked before any
     /// disk read). THEN the on-disk status read (`:24-27`). THEN the session-ownership gate
     /// (`:28`).
-    async fn active_workflow_error(
+    ///
+    /// `pub(crate)` since WORKFLOW_18: the stop-side action
+    /// ([`SubagentExecutor::stop_workflow_child_action`]) runs these SAME four gates rather than a
+    /// second copy of them — the fourth is `SessionGate::Strict`, and stopping another session's
+    /// child is exactly the cross-session hazard it exists to prevent. Widened visibility only;
+    /// not one gate, not one sentence, and not the order has changed.
+    pub(crate) async fn active_workflow_error(
         &self,
         workflow_run_id: &RunId,
         async_root: &Path,
