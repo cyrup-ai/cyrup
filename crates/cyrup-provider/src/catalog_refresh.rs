@@ -188,7 +188,9 @@ impl Drop for WaiterGuard {
             return;
         };
         let still_current = match slot.lock() {
-            Ok(guard) => guard.as_ref().is_some_and(|i| i.generation == self.generation),
+            Ok(guard) => guard
+                .as_ref()
+                .is_some_and(|i| i.generation == self.generation),
             Err(_) => false,
         };
         if still_current {
@@ -331,7 +333,9 @@ impl CatalogRefreshCoordinator {
         });
         // A panicked task degrades to `aborted`; NO-PANIC policy.
         let candidate: SharedFut = async move {
-            handle.await.unwrap_or_else(|_| CatalogRefreshResult::aborted())
+            handle
+                .await
+                .unwrap_or_else(|_| CatalogRefreshResult::aborted())
         }
         .map(Arc::new)
         .boxed()

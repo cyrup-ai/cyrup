@@ -258,8 +258,7 @@ mod tests {
                 "a controller registered under the caller's own spelling must still block dismiss",
             );
         assert_eq!(
-            err,
-            "Workflow 'run0regprefix1' still has a live controller and cannot be dismissed.",
+            err, "Workflow 'run0regprefix1' still has a live controller and cannot be dismissed.",
             "the resolved CANONICAL id names the run in the refusal, even though the registry hit \
              came from the caller's own (prefix) spelling"
         );

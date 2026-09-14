@@ -185,7 +185,10 @@ fn sync_current_child(entry: &mut ForegroundControlEntry, child: &ForegroundChil
 /// pi `beginForegroundChild` (`:101-137`): insert the child, then derive the entry's "current
 /// child" view from it — never hand-write `current_agent`/`current_index`/`description` at the
 /// call site.
-pub(crate) fn begin_foreground_child(entry: &mut ForegroundControlEntry, child: ForegroundChildEntry) {
+pub(crate) fn begin_foreground_child(
+    entry: &mut ForegroundControlEntry,
+    child: ForegroundChildEntry,
+) {
     let index = child.index;
     entry.active_children.insert(index, child);
     // `expect`/`unwrap` are DENY workspace-wide (`Cargo.toml:101-104`) — re-read through the map.
@@ -355,7 +358,10 @@ mod tests {
             "None on a later event must not clobber turn_count either"
         );
         assert_eq!(
-            entry.active_children.get(&0).map(|c| c.current_tool.clone()),
+            entry
+                .active_children
+                .get(&0)
+                .map(|c| c.current_tool.clone()),
             Some(Some("bash".to_string())),
             "the CHILD's own record must carry the same value the entry was synced from"
         );

@@ -215,12 +215,10 @@ impl WorkflowReceiptResume {
                 };
                 Ok(Self::Resumable { latest_run_id })
             }
-            WorkflowResumability::NotResumable { reason } => {
-                Ok(Self::NotResumable {
-                    latest_run_id,
-                    reason,
-                })
-            }
+            WorkflowResumability::NotResumable { reason } => Ok(Self::NotResumable {
+                latest_run_id,
+                reason,
+            }),
         }
     }
 }
@@ -292,10 +290,7 @@ impl serde::Serialize for WorkflowReceiptEntry {
         match &self.resume {
             WorkflowReceiptResume::Resumable { latest_run_id } => {
                 map.serialize_entry("latestRunId", latest_run_id.as_str())?;
-                map.serialize_entry(
-                    "resumability",
-                    &serde_json::json!({ "state": "resumable" }),
-                )?;
+                map.serialize_entry("resumability", &serde_json::json!({ "state": "resumable" }))?;
             }
             WorkflowReceiptResume::NotResumable {
                 latest_run_id,
@@ -578,7 +573,9 @@ pub fn build_workflow_receipt(
         .map_err(WorkflowReceiptError::Invalid)?;
     // Rule 12.
     let created_at = serde_json::Number::from(
-        input.created_at.unwrap_or_else(crate::time::now_epoch_millis),
+        input
+            .created_at
+            .unwrap_or_else(crate::time::now_epoch_millis),
     );
     Ok(WorkflowReceipt {
         version: WorkflowReceiptVersion,
@@ -665,8 +662,7 @@ pub fn read_workflow_receipt(
     let receipt_path = run_dir.join(WORKFLOW_RECEIPT_FILE);
     match read_workflow_receipt_file(&receipt_path) {
         Ok(value) => {
-            let receipt =
-                parse_workflow_receipt(&value, &receipt_path.display().to_string())?;
+            let receipt = parse_workflow_receipt(&value, &receipt_path.display().to_string())?;
             if receipt.workflow_run_id.as_str() != run.as_str() {
                 return Err(WorkflowReceiptError::Invalid(format!(
                     "Workflow receipt '{}' is stale: workflowRunId does not match.",
@@ -709,12 +705,18 @@ fn parse_terminal_outcome(
         )));
     };
     if map.get("state").and_then(Value::as_str) != Some("partial") {
-        return Err(WorkflowReceiptError::Invalid(format!("{label} is invalid.")));
+        return Err(WorkflowReceiptError::Invalid(format!(
+            "{label} is invalid."
+        )));
     }
     let reason = match map.get("reason").and_then(Value::as_str) {
         Some("budget_exhausted") => WorkflowTerminalOutcomeReason::BudgetExhausted,
         Some("timeout") => WorkflowTerminalOutcomeReason::Timeout,
-        _ => return Err(WorkflowReceiptError::Invalid(format!("{label} is invalid."))),
+        _ => {
+            return Err(WorkflowReceiptError::Invalid(format!(
+                "{label} is invalid."
+            )));
+        }
     };
     Ok(WorkflowTerminalOutcome::Partial { reason })
 }
@@ -744,8 +746,10 @@ fn parse_acceptance_recovery_metadata(
     let Some(report_hash) = map.get("reportHash").and_then(Value::as_str) else {
         return Err(invalid());
     };
-    let hash_ok =
-        report_hash.len() == 64 && report_hash.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c));
+    let hash_ok = report_hash.len() == 64
+        && report_hash
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c));
     if !hash_ok {
         return Err(invalid());
     }
@@ -909,7 +913,10 @@ fn parse_entry(
     // The remaining "trust-cast" fields: upstream never validates them (a bare TS `as` cast,
     // `:296`), so a shape that does not match the expected type is treated as absent, never an
     // error.
-    let agent = map.get("agent").and_then(Value::as_str).and_then(Bounded::parse);
+    let agent = map
+        .get("agent")
+        .and_then(Value::as_str)
+        .and_then(Bounded::parse);
     let requested_context = match map.get("requestedContext").and_then(Value::as_str) {
         Some("fresh") => Some(WorkflowRequestedContext::Fresh),
         Some("fork") => Some(WorkflowRequestedContext::Fork),
@@ -1213,9 +1220,8 @@ pub fn resolve_workflow_receipt_resume_entry(
             "Keyed workflow receipt resume requires latest: true.".to_string(),
         ));
     }
-    let key = WorkflowKey::parse(&input.reference.key).map_err(|_| {
-        WorkflowReceiptError::Invalid("keyed resume key is invalid.".to_string())
-    })?;
+    let key = WorkflowKey::parse(&input.reference.key)
+        .map_err(|_| WorkflowReceiptError::Invalid("keyed resume key is invalid.".to_string()))?;
     let trimmed_run_id = input.reference.workflow_run_id.trim();
     let Some(run_dir_name) = RunDirName::parse(trimmed_run_id) else {
         return Err(WorkflowReceiptError::Invalid(

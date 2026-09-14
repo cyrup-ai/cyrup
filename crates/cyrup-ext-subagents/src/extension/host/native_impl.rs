@@ -359,7 +359,9 @@ impl NativeExtension for SubagentsExtension {
                 // foreground twin of `resume_tracking`'s `restoreActiveJobs`. Ordered AFTER the
                 // parent-session anchor capture (above) so `current_session_id()` is bound: the
                 // restore is STRICT and an unbound session restores nothing at all.
-                self.executor.restore_foreground_run_history_for(&ctx.cwd).await;
+                self.executor
+                    .restore_foreground_run_history_for(&ctx.cwd)
+                    .await;
                 // C6: install the background-completion watcher (notify.ts / result-watcher.ts) so a
                 // detached run that finishes during this session surfaces its `subagent-notify`
                 // message (with `triggerTurn`) and has its result file deleted (R-SA-099/101). When the

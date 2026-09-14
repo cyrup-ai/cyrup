@@ -322,7 +322,11 @@ mod tests {
         // Counts, for the git-pinned catalogs only (see the note in EXPECTED_COUNTS).
         for (id, count) in EXPECTED_COUNTS {
             let spec = fleet_spec(id).unwrap_or_else(|| panic!("no spec for {id}"));
-            assert_eq!(spec.models().len(), *count, "catalog count mismatch for {id}");
+            assert_eq!(
+                spec.models().len(),
+                *count,
+                "catalog count mismatch for {id}"
+            );
         }
 
         // Invariants, for EVERY member that ships rows — pinned or live-fetched. None of these

@@ -523,6 +523,10 @@ async fn the_startup_retry_note_reaches_the_live_progress_surface_of_the_relaunc
                 cancel: CancelToken::new(),
                 parent_workflow_run_id: None,
                 workflow_key: None,
+                // WORKFLOW_14: `Some` exactly when `parent_workflow_run_id` is `Some`. This is a
+                // plain foreground run with no workflow shell above it, so there is no run
+                // directory to root a steer index in.
+                workflow_steer: None,
             },
             on_update,
         ),

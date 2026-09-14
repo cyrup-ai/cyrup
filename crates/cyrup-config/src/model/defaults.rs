@@ -369,7 +369,10 @@ mod tests {
                 continue;
             }
             assert!(
-                provider.models().iter().any(|m| m.id.as_str() == default_id),
+                provider
+                    .models()
+                    .iter()
+                    .any(|m| m.id.as_str() == default_id),
                 "{id}'s curated default `{default_id}` is not in its catalog — \
                  `first_default_or_first` will skip {id} entirely and launch the user on whatever \
                  sorts first. Either the upstream table moved (chase it) or the model was retired \

@@ -23,19 +23,19 @@ use crate::background::control::{SteerAckState, SteerDeliveryMode};
 use crate::exec::SingleResult;
 use crate::extension::executor::SubagentExecutor;
 use crate::extension::executor::foreground_control::ForegroundChildSteerHandle;
-use crate::extension::tool::text::STEER_ACK_TIMEOUT;
 use crate::extension::executor::requests::ForegroundRunRequest;
 use crate::extension::tool::params::{SubagentToolParams, resolve_execution_agent_scope};
+use crate::extension::tool::text::STEER_ACK_TIMEOUT;
 use crate::fork_context::ContextRequest;
+use crate::workflows::scripted::{
+    WORKFLOW_CHILD_MARKER, WorkflowLaunchAdmission, WorkflowResolvedResume,
+    WorkflowResolvedResumeReference, WorkflowResumeInput, WorkflowScriptHost, WorkflowSteerMode,
+    WorkflowSteerOptions, WorkflowSteerResult, WorkflowSteerState, WorkflowSteerTarget,
+};
 use crate::workflows::{
     WorkflowContinuation, WorkflowKey, WorkflowLaneMetadata, WorkflowRequestedContext,
     WorkflowResumability, WorkflowScriptChildResult, assert_workflow_lane_key,
     normalize_workflow_lane_metadata, workflow_terminal_outcome_for_result,
-};
-use crate::workflows::scripted::{
-    WORKFLOW_CHILD_MARKER, WorkflowLaunchAdmission, WorkflowResumeInput, WorkflowResolvedResume,
-    WorkflowResolvedResumeReference, WorkflowScriptHost, WorkflowSteerMode, WorkflowSteerOptions,
-    WorkflowSteerResult, WorkflowSteerState, WorkflowSteerTarget,
 };
 
 /// Set on every workflow child's environment so the child's own `subagent` tool can refuse a
@@ -202,9 +202,13 @@ impl WorkflowRunHost {
         // `runs.all` children can reorder their writes and a later write can carry fewer steps.
         let _write = self.publish_lock.lock().await;
         let snapshot = {
-            let Ok(settled) = self.settled.lock() else { return };
+            let Ok(settled) = self.settled.lock() else {
+                return;
+            };
             let steps = crate::workflows::workflow_step_statuses(&settled);
-            let Ok(mut status) = self.status.lock() else { return };
+            let Ok(mut status) = self.status.lock() else {
+                return;
+            };
             status.steps = steps;
             status.current_step = status.steps.len().checked_sub(1);
             // NOT `advance_state` — the state is not changing. `touch()` (`records.rs:471`) is the
@@ -787,21 +791,35 @@ mod tests {
         let run_dir = dir.path().join("wf");
         let host = host_with(run_dir.clone(), "lane", 2);
 
-        assert!(host.supports_steer(), "the engine gates on this BEFORE calling steer");
+        assert!(
+            host.supports_steer(),
+            "the engine gates on this BEFORE calling steer"
+        );
 
         let receipt = host
-            .steer("lane", "narrow the diff", WorkflowSteerOptions::default(), CancelToken::new())
+            .steer(
+                "lane",
+                "narrow the diff",
+                WorkflowSteerOptions::default(),
+                CancelToken::new(),
+            )
             .await
             .expect("a launched key must yield a receipt");
 
         assert_eq!(receipt.key, "lane");
         assert_eq!(receipt.state, WorkflowSteerState::Queued);
         assert_eq!(receipt.delivery_status.as_deref(), Some("pending"));
-        assert!(receipt.request_id.is_some(), "the receipt must carry its correlation id");
+        assert!(
+            receipt.request_id.is_some(),
+            "the receipt must carry its correlation id"
+        );
         assert!(receipt.error.is_none());
         let targets = receipt.targets.expect("one target, this key's child");
         assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].index, 2, "the WORKFLOW-flat index this key was launched at");
+        assert_eq!(
+            targets[0].index, 2,
+            "the WORKFLOW-flat index this key was launched at"
+        );
 
         // Delivered into the child's own inbox at the same index — not the runner intake queue.
         let inbox = crate::background::control::step_steer_inbox_dir(&run_dir, 2);
@@ -820,7 +838,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let host = host_with(dir.path().join("wf"), "lane", 0);
         let error = host
-            .steer("other", "hi", WorkflowSteerOptions::default(), CancelToken::new())
+            .steer(
+                "other",
+                "hi",
+                WorkflowSteerOptions::default(),
+                CancelToken::new(),
+            )
             .await
             .expect_err("an unlaunched key must refuse");
         assert_eq!(
@@ -879,7 +902,11 @@ mod tests {
                 .expect("one request");
             let body = std::fs::read_to_string(entry.path()).expect("read");
             let parsed: serde_json::Value = serde_json::from_str(&body).expect("json");
-            assert_eq!(parsed.get("mode").and_then(|m| m.as_str()), expected, "mode {mode:?}");
+            assert_eq!(
+                parsed.get("mode").and_then(|m| m.as_str()),
+                expected,
+                "mode {mode:?}"
+            );
         }
     }
 }

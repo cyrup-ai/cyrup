@@ -875,40 +875,49 @@ mod tests {
     #[test]
     fn apply_workflow_settlement_plan_projects_workflow_children_and_receipt_together() {
         let run_id = RunId::from_token("wf-run-0001");
-        let mut status = RunStatus::queued(run_id.clone(), crate::background::RunMode::Workflow, Some(1));
+        let mut status = RunStatus::queued(
+            run_id.clone(),
+            crate::background::RunMode::Workflow,
+            Some(1),
+        );
         status.state = RunState::Running;
 
         let run_dir_name = crate::identity::RunDirName::for_run(&run_id);
-        let receipt = crate::workflows::build_workflow_receipt(crate::workflows::BuildWorkflowReceipt {
-            workflow_run_id: &run_dir_name,
-            state: crate::workflows::WorkflowReceiptState::Complete,
-            children: &[],
-            host_steps: &[],
-            workflow_children: None,
-            resource: None,
-            terminal_outcome: None,
-            created_at: Some(1_000),
-        })
-        .expect("builds");
+        let receipt =
+            crate::workflows::build_workflow_receipt(crate::workflows::BuildWorkflowReceipt {
+                workflow_run_id: &run_dir_name,
+                state: crate::workflows::WorkflowReceiptState::Complete,
+                children: &[],
+                host_steps: &[],
+                workflow_children: None,
+                resource: None,
+                terminal_outcome: None,
+                created_at: Some(1_000),
+            })
+            .expect("builds");
 
-        let plan = crate::workflows::plan_workflow_settlement(crate::workflows::PlanWorkflowSettlement {
-            status: &status,
-            summary: "done".to_string(),
-            trace: &[],
-            receipt: Some(receipt),
-            receipt_path: Some(PathBuf::from("/tmp/workflow-receipt.json")),
-            receipt_persistence_error: None,
-            resolution: None,
-            terminal_outcome: None,
-            now: Some(2_000),
-            event_metadata: serde_json::Map::new(),
-        });
+        let plan =
+            crate::workflows::plan_workflow_settlement(crate::workflows::PlanWorkflowSettlement {
+                status: &status,
+                summary: "done".to_string(),
+                trace: &[],
+                receipt: Some(receipt),
+                receipt_path: Some(PathBuf::from("/tmp/workflow-receipt.json")),
+                receipt_persistence_error: None,
+                resolution: None,
+                terminal_outcome: None,
+                now: Some(2_000),
+                event_metadata: serde_json::Map::new(),
+            });
 
         let mut caller_status = status;
         let fields = apply_workflow_settlement_plan(&plan, &mut caller_status);
 
         assert_eq!(caller_status.state, plan.status.state);
-        assert!(fields.workflow_children.is_some(), "the settled inventory is projected");
+        assert!(
+            fields.workflow_children.is_some(),
+            "the settled inventory is projected"
+        );
         assert_eq!(
             fields.workflow_receipt.as_ref().map(|r| r.path.clone()),
             Some(PathBuf::from("/tmp/workflow-receipt.json")),

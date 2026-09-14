@@ -678,7 +678,13 @@ mod tests {
         }
 
         let answer = executor
-            .steer_workflow_foreground(&workflow_run_id, "tighten the scope", None, None, dir.path())
+            .steer_workflow_foreground(
+                &workflow_run_id,
+                "tighten the scope",
+                None,
+                None,
+                dir.path(),
+            )
             .await
             .expect("a child WITH a steer handle must deliver, not refuse");
 
@@ -688,7 +694,10 @@ mod tests {
             answer.starts_with("Steering pending for workflow child-1 child 0 (request "),
             "got: {answer}"
         );
-        assert!(!answer.contains("does not support steering"), "got: {answer}");
+        assert!(
+            !answer.contains("does not support steering"),
+            "got: {answer}"
+        );
 
         // THE path assertion: the request is in the child's own inbox.
         let written: Vec<_> = std::fs::read_dir(&inbox)
@@ -697,7 +706,11 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .filter(|n| n.ends_with(".json"))
             .collect();
-        assert_eq!(written.len(), 1, "exactly one request in {inbox:?}: {written:?}");
+        assert_eq!(
+            written.len(),
+            1,
+            "exactly one request in {inbox:?}: {written:?}"
+        );
 
         // And NOT in the runner intake queue, which nothing would ever drain here.
         let intake = crate::background::control::steer_requests_dir(&run_dir);

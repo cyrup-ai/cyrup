@@ -3626,7 +3626,8 @@ mod tests {
             .collect();
         let base_tools = super::select_active_tools(&visible, cfg, None);
         let allowed = super::resolve_allowed_tool_names(cfg);
-        let excluded: std::collections::HashSet<String> = cfg.exclude_tools.iter().cloned().collect();
+        let excluded: std::collections::HashSet<String> =
+            cfg.exclude_tools.iter().cloned().collect();
 
         let active_tools = host
             .active_tools_filtered(&base_tools, allowed.as_ref(), &excluded)
@@ -3683,7 +3684,10 @@ mod tests {
 
         let (active, prompt) = session_surface(&cfg).await;
         assert!(active.is_empty(), "got {active:?}");
-        assert!(prompt.is_empty(), "the prompt would say `(none)`; got {prompt:?}");
+        assert!(
+            prompt.is_empty(),
+            "the prompt would say `(none)`; got {prompt:?}"
+        );
     }
 
     /// The ONE way to over-filter, guarded. `--no-builtin-tools` empties the BUILT-IN selection but
@@ -3731,5 +3735,4 @@ mod tests {
         );
         assert!(active.contains(&"read".to_string()), "got {active:?}");
     }
-
 }

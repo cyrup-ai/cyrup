@@ -464,26 +464,86 @@ fn write_default_output(output_path: &Path, capture: &str) -> Result<(), String>
         .map_err(|error| error.to_string())
 }
 
-/// §0.17's one-syscall group-emptiness probe.
+/// The cheap half of the group-emptiness probe: is `pgid`'s group **provably** empty?
 ///
-/// Does any process remain in `pgid`'s group? pi `activeProcessGroupMembers`
-/// (`owned-process-tree.ts:24-35`) answers this by spawning `ps -axo pid=,pgid=,stat=` and
-/// regex-matching its stdout. `kill(-pgid, 0)` is the same question as a single syscall: POSIX
-/// specifies signal 0 as an existence-and-permission probe that delivers nothing, and `ESRCH`
-/// means "no process in that group". No subprocess, no locale dependency, no zombie-state parsing
-/// (a zombie is already unsignalable, which is upstream's `stat.startsWith("Z")` filter for
-/// free).
-///
-/// [CYRUP-DELTA, mechanism] — same predicate, one syscall instead of a `ps` scrape.
+/// `kill(-pgid, 0)` is POSIX's existence-and-permission probe — it delivers nothing, and `ESRCH`
+/// means "no process in that group". `ESRCH` is therefore conclusive in ONE direction only:
+/// `true` here means empty and needs no second opinion. Anything else means "at least one process
+/// table entry survives in that group", which is **not** the same question upstream asks — see
+/// [`process_group_is_populated`].
 #[cfg(unix)]
-fn process_group_is_populated(pgid: i32) -> bool {
-    !matches!(
+fn process_group_is_provably_empty(pgid: i32) -> bool {
+    matches!(
         nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(-pgid),
             None::<nix::sys::signal::Signal>
         ),
         Err(nix::errno::Errno::ESRCH)
     )
+}
+
+/// Does any **live** process remain in `pgid`'s group? pi `activeProcessGroupMembers`
+/// (`owned-process-tree.ts:24-35`) answers this by spawning `ps -axo pid=,pgid=,stat=`,
+/// regex-matching its stdout, and **dropping every row whose state starts with `Z`**.
+///
+/// That `Z` filter is load-bearing and cannot be had from `kill` alone. A zombie is an unreaped
+/// exit status, not a running process: it holds a process-table entry, so `kill(pid, 0)` on it
+/// **succeeds** rather than returning `ESRCH`. Whenever the command's shell forks a descendant
+/// (`sh -c 'sleep 30'` does), the ladder kills the group, reaps only the direct child, and the
+/// orphaned grandchild's status sits unreaped wherever it reparented to. On a host whose `init`
+/// reaps promptly it vanishes and nobody notices; on one that does not — a container without a
+/// reaper, the common CI case — `kill(-pgid, 0)` keeps answering "populated" forever and the
+/// ladder reports `verification-failed` for a process tree that is, in every sense upstream
+/// means, gone.
+///
+/// So the syscall stays as a fast path and `ps` decides the rest:
+///
+/// 1. [`process_group_is_provably_empty`] — one syscall. `ESRCH` ⇒ empty, and no subprocess is
+///    spawned. This is the overwhelmingly common answer and the reason the probe is still cheap.
+/// 2. Otherwise ask `ps`, exactly as upstream does, and count only non-`Z` members.
+/// 3. If `ps` cannot be run or exits non-zero, report populated. That is the conservative answer
+///    — it can only make the ladder wait out its window and report a cleanup failure it might
+///    have forgiven, never the reverse — and it is what this function did unconditionally before
+///    the `Z` filter existed.
+///
+/// [CYRUP-DELTA, mechanism] — upstream spawns `ps` on **every** poll; cyrup spawns it only once
+/// the one-syscall fast path has failed to settle the question, so an empty group still costs a
+/// single syscall and no process. The predicate itself is upstream's, `Z` filter included.
+#[cfg(unix)]
+async fn process_group_is_populated(pgid: i32) -> bool {
+    if process_group_is_provably_empty(pgid) {
+        return false;
+    }
+    match tokio::process::Command::new("ps")
+        .args(["-axo", "pid=,pgid=,stat="])
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => {
+            group_has_live_member(&String::from_utf8_lossy(&output.stdout), pgid)
+        }
+        // `ps` missing, unexecutable, or failing: keep the pre-`Z`-filter answer.
+        _ => true,
+    }
+}
+
+/// The `ps` row parser, split out so it is testable without a process tree.
+///
+/// One row is `<pid> <pgid> <stat>`; upstream's regex is `/^\s*(\d+)\s+(\d+)\s+(\S+)/` and its
+/// filter is `Number(match[2]) !== processGroupId || match[3].startsWith("Z")`. Rows that do not
+/// parse are skipped rather than counted, which is upstream's `if (!match) continue`.
+#[cfg(unix)]
+fn group_has_live_member(ps_stdout: &str, pgid: i32) -> bool {
+    ps_stdout.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        let (Some(pid), Some(row_pgid), Some(stat)) = (fields.next(), fields.next(), fields.next())
+        else {
+            return false;
+        };
+        // `(\d+)` for BOTH numeric captures, not just the one we compare: a row whose pid does not
+        // parse did not match upstream's regex either, and upstream skipped it.
+        pid.parse::<i32>().is_ok() && row_pgid.parse::<i32>() == Ok(pgid) && !stat.starts_with('Z')
+    })
 }
 
 /// pi `waitUntilGroupTerminal` (`owned-process-tree.ts:39-53`): poll
@@ -493,7 +553,7 @@ fn process_group_is_populated(pgid: i32) -> bool {
 async fn wait_until_group_empty(pgid: i32, window: std::time::Duration) -> bool {
     let deadline = tokio::time::Instant::now() + window;
     loop {
-        if !process_group_is_populated(pgid) {
+        if !process_group_is_populated(pgid).await {
             return true;
         }
         let now = tokio::time::Instant::now();
@@ -561,7 +621,7 @@ async fn cleanup_after_clean_exit(pgid: Option<i32>) -> Option<String> {
     match kill(target, Signal::SIGKILL) {
         Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
         Err(_) => {
-            if process_group_is_populated(pgid) {
+            if process_group_is_populated(pgid).await {
                 return Some("signal-failed".to_string());
             }
         }
@@ -1414,29 +1474,99 @@ mod tests {
             .parse()
             .expect("a pid");
         // The sweep's SIGTERM reached the backgrounded sleep through the group.
+        //
+        // "Gone" is asserted the way the production predicate defines it — no LIVE process — and
+        // deliberately not as `kill(pid, 0) == ESRCH`. ESRCH additionally requires that whatever
+        // the orphan reparented to has already reaped it, which is the host's business and not
+        // this sweep's: on a container without a reaper the exit status sits there indefinitely.
+        // Asserting ESRCH here is what made this test agree with the zombie-blind probe that
+        // `process_group_is_populated` replaced.
         assert!(
-            matches!(
-                nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(leaked),
-                    None::<nix::sys::signal::Signal>
-                ),
-                Err(nix::errno::Errno::ESRCH)
-            ),
-            "the leaked descendant was reaped by the clean-exit sweep"
+            !process_is_live(leaked),
+            "the leaked descendant was killed by the clean-exit sweep"
         );
     }
 
-    /// The group probe is one syscall and answers exactly the `ps` question.
+    /// Is `pid` a live process? Absent ⇒ no; present but `Z` ⇒ no (an unreaped exit status is not
+    /// a process). The single-pid twin of [`group_has_live_member`], for tests that hold a pid
+    /// rather than a group.
     #[cfg(unix)]
-    #[test]
-    fn the_group_probe_reports_emptiness() {
+    fn process_is_live(pid: i32) -> bool {
+        let Ok(output) = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+        else {
+            return false;
+        };
+        // `ps -p` exits non-zero when the pid is absent, and prints nothing.
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .split_whitespace()
+                .next()
+                .is_some_and(|stat| !stat.starts_with('Z'))
+    }
+
+    /// The group probe answers exactly the `ps` question, on both of its arms.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_group_probe_reports_emptiness() {
         assert!(
-            !process_group_is_populated(i32::MAX - 1),
+            !process_group_is_populated(i32::MAX - 1).await,
             "an unused pgid reports empty (ESRCH)"
         );
-        // Our own process group is populated by definition.
+        // Our own process group is populated by definition, and by a LIVE member (this test), so
+        // the `ps` arm has to agree with the syscall arm here.
         let own_group = nix::unistd::getpgrp().as_raw();
-        assert!(process_group_is_populated(own_group));
+        assert!(process_group_is_populated(own_group).await);
+    }
+
+    /// The fast path is conclusive in one direction only, and that asymmetry is the whole design:
+    /// `ESRCH` proves empty, while "signalable" proves nothing about liveness.
+    #[cfg(unix)]
+    #[test]
+    fn the_syscall_fast_path_is_conclusive_only_for_emptiness() {
+        assert!(
+            process_group_is_provably_empty(i32::MAX - 1),
+            "an unused pgid is provably empty"
+        );
+        assert!(
+            !process_group_is_provably_empty(nix::unistd::getpgrp().as_raw()),
+            "our own group is not provably empty"
+        );
+    }
+
+    /// The defect this parser exists for: a group holding nothing but an unreaped exit status is
+    /// EMPTY in upstream's sense, and `kill(-pgid, 0)` cannot say so because a zombie is
+    /// signalable. `ps` rows are the only thing that can, so parse them the way upstream does.
+    #[cfg(unix)]
+    #[test]
+    fn zombie_rows_do_not_count_as_live_members() {
+        // `ps -axo pid=,pgid=,stat=` output: leading whitespace, three columns, one row per
+        // process. 4242 is the group under test.
+        let only_a_zombie = "  4242  4242 Z\n  4243  4242 Z+\n  9001  9001 S\n";
+        assert!(
+            !group_has_live_member(only_a_zombie, 4242),
+            "a group holding only unreaped exit statuses is empty"
+        );
+
+        let one_survivor = "  4242  4242 Z\n  4243  4242 S\n";
+        assert!(
+            group_has_live_member(one_survivor, 4242),
+            "one non-zombie member keeps the group populated"
+        );
+
+        // Other groups are never counted, whatever their state.
+        assert!(
+            !group_has_live_member("  9001  9001 R\n", 4242),
+            "a live process in a DIFFERENT group is not this group's member"
+        );
+
+        // Upstream's `if (!match) continue`: unparseable rows are skipped, not counted.
+        assert!(
+            !group_has_live_member("garbage\n\n  notapid  4242 S\n", 4242),
+            "rows that do not parse are skipped rather than counted"
+        );
+        assert!(!group_has_live_member("", 4242), "no rows, no members");
     }
 
     /// The wire shape: kebab-case state, `exitCode: null` always present, `error` omitted when

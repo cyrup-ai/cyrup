@@ -147,10 +147,7 @@ mod tests {
     fn resolve_in_always_yields_a_direct_child() {
         let name = RunDirName::parse("abc12345").expect("valid");
         let resolved = name.resolve_in(Path::new("/var/tmp/cyrup-subagents"));
-        assert_eq!(
-            resolved,
-            PathBuf::from("/var/tmp/cyrup-subagents/abc12345")
-        );
+        assert_eq!(resolved, PathBuf::from("/var/tmp/cyrup-subagents/abc12345"));
     }
 
     #[test]
@@ -163,9 +160,6 @@ mod tests {
     fn deserialize_accepts_a_valid_token_and_serialize_stays_transparent() {
         let parsed: RunDirName = serde_json::from_str("\"abc12345\"").expect("valid");
         assert_eq!(parsed.as_str(), "abc12345");
-        assert_eq!(
-            serde_json::to_string(&parsed).expect("ser"),
-            "\"abc12345\""
-        );
+        assert_eq!(serde_json::to_string(&parsed).expect("ser"), "\"abc12345\"");
     }
 }

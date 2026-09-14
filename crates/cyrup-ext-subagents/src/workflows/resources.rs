@@ -327,8 +327,10 @@ impl WorkflowResourceRegistry {
         // A hyphenated UUIDv4 always matches `WorkflowResourceId`'s grammar (WORKFLOW_3 §0.10), so
         // this `ok_or_else` names an internal-error diagnostic that never actually fires rather
         // than `.expect`ing it away (this crate denies `clippy::expect_used` outside tests).
-        let resource_id = WorkflowResourceId::parse(&uuid::Uuid::new_v4().to_string())
-            .ok_or_else(|| "internal error: minted resource id failed its own grammar.".to_string())?;
+        let resource_id =
+            WorkflowResourceId::parse(&uuid::Uuid::new_v4().to_string()).ok_or_else(|| {
+                "internal error: minted resource id failed its own grammar.".to_string()
+            })?;
         let permit = WorkflowResourcePermit::issue(WorkflowResourcePermitInput {
             resource_name: resource.name.clone(),
             resource_version: resource.version,

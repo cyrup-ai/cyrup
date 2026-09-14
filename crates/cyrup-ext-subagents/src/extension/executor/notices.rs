@@ -92,8 +92,10 @@ pub(crate) struct ForegroundControlEntry {
     ///
     /// `.is_empty()` is the predicate WORKFLOW_7/WORKFLOW_11 gate on — pi's
     /// `(control.activeChildren?.size ?? 0) > 0`.
-    pub(crate) active_children:
-        std::collections::BTreeMap<usize, crate::extension::executor::foreground_control::ForegroundChildEntry>,
+    pub(crate) active_children: std::collections::BTreeMap<
+        usize,
+        crate::extension::executor::foreground_control::ForegroundChildEntry,
+    >,
 }
 
 /// How long [`ForegroundControlNotifier::flush`] waits for the notice pump to acknowledge that it

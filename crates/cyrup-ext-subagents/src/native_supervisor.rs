@@ -1933,7 +1933,8 @@ pub fn intercom_agent_dir_from(
     // `$CYRUP_CODING_AGENT_DIR` already returned above, so the only override still reachable here
     // is `CYRUP_AGENT_DIR` — exactly the one that must move in lockstep with the binary.
     let adapter = |key: &str| env(key).map(std::ffi::OsString::from);
-    let home = cyrup_config::paths::cyrup_home_dir_from(&adapter).unwrap_or_else(std::env::temp_dir);
+    let home =
+        cyrup_config::paths::cyrup_home_dir_from(&adapter).unwrap_or_else(std::env::temp_dir);
     cyrup_config::paths::cyrup_agent_dir_from(&home, &adapter)
 }
 

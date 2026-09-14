@@ -742,7 +742,12 @@ fn every_xai_row_is_routed_over_the_responses_api() {
             m.id
         );
         assert_eq!(m.provider.as_str(), "xai", "{} provider tag", m.id);
-        assert_eq!(m.base_url.as_str(), "https://api.x.ai/v1", "{} baseUrl", m.id);
+        assert_eq!(
+            m.base_url.as_str(),
+            "https://api.x.ai/v1",
+            "{} baseUrl",
+            m.id
+        );
         // `supportsLongCacheRetention: false`. Absent, the resolver's detector defaults it TRUE for
         // xai, so cyrup would offer a retention xAI rejects (`api/compat.rs`). Upstream spreads
         // XAI_RESPONSES_COMPAT onto EVERY row, so this is a per-row assertion.
