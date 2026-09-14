@@ -231,6 +231,23 @@ pub fn qualify_model_candidate(
 ///
 /// Returns the ladder plus every violation observed, so a caller (and a test) can see the warnings
 /// rather than having to scrape a log.
+///
+/// # The cached-exclusion filter is the LAST step (SCOPE_3j)
+///
+/// `exclusions` is pi's `filterFallbackCandidates(candidates, {onExcluded, ignoreExclusion})` at
+/// `model-fallback.ts:506-509` — upstream's own position, after its `seen`/scope loop and after the
+/// allowlist filter, because a candidate that the registry has never heard of must still be
+/// dropped when `available_models` does not carry it, and a candidate the registry HAS heard of is
+/// worth a diagnostic only if it would otherwise have been attempted.
+///
+/// It lives here rather than in [`build_model_candidates`] because that function is
+/// `#[must_use] -> Vec<ModelId>` whose doc promises it *"never fails and never panics"*: upstream
+/// `throw`s the zero-candidates error from inside the builder, and turning the cyrup builder into a
+/// `Result` would change five call sites (two of them `pub`, one in another module) for a
+/// diagnostic the existing empty-ladder site (`exec/mod.rs`) can render instead. So the evidence is
+/// RETURNED, in the same "ladder plus what was observed" shape the scope warnings already use.
+///
+/// `None` degrades to exactly the pre-SCOPE_3j behaviour: no filter, empty evidence.
 #[must_use]
 pub fn build_model_candidates_scoped(
     model_override: &ModelOverride,
@@ -239,7 +256,12 @@ pub fn build_model_candidates_scoped(
     available_models: &[ModelId],
     preferred_provider: Option<&ProviderId>,
     scope: Option<&ModelScopeConfig>,
-) -> (Vec<ModelId>, Vec<ModelScopeViolation>) {
+    exclusions: Option<&crate::exec::model_exclusions::ModelExclusionStore>,
+) -> (
+    Vec<ModelId>,
+    Vec<ModelScopeViolation>,
+    crate::exec::model_exclusions::ModelExclusionEvidence,
+) {
     let candidates = build_model_candidates(
         model_override,
         agent_primary_model,
@@ -261,7 +283,34 @@ pub fn build_model_candidates_scoped(
             }
         }
     }
-    (candidates, violations)
+
+    let Some(store) = exclusions else {
+        return (
+            candidates,
+            violations,
+            crate::exec::model_exclusions::ModelExclusionEvidence::default(),
+        );
+    };
+    // pi's `ignoreExclusion` (`model-fallback.ts:508`): a `model-unavailable` exclusion for a model
+    // that is back in `available_models` is stale, and honouring it would pin a working model out
+    // for the whole TTL over a transient availability blip.
+    let ignore = |candidate: &ModelId,
+                  exclusion: &crate::exec::model_exclusions::ModelExclusion| {
+        crate::exec::model_exclusions::ignore_stale_model_unavailable_exclusion(
+            candidate,
+            exclusion,
+            available_models,
+        )
+    };
+    let (filtered, evidence) = crate::exec::model_exclusions::filter_fallback_candidates(
+        store,
+        &candidates,
+        crate::exec::model_exclusions::FilterOptions {
+            ignore_exclusion: Some(&ignore),
+            ..crate::exec::model_exclusions::FilterOptions::default()
+        },
+    );
+    (filtered, violations, evidence)
 }
 
 /// Resolve one subagent attempt's effective [`ModelOverride`], folding in the INHERITED parent
@@ -461,10 +510,10 @@ macro_rules! lower {
 /// Re-export into the module's item namespace so intra-doc links to [`lower!`] resolve:
 /// `macro_rules!` macros are only textually scoped, which rustdoc's path-based link
 /// resolution cannot see.
-#[expect(
-    unused_imports,
-    reason = "invocations resolve textually; the path import exists only so rustdoc's intra-doc links to `lower!` resolve"
-)]
+///
+/// Since SCOPE_3j it also carries real traffic — [`crate::exec::model_exclusions`] builds pi's
+/// `AUTH_FAILURE_PATTERNS` and `MODEL_UNAVAILABLE_PATTERN` over the same checked literals — so the
+/// `#[expect(unused_imports)]` this used to need would now be unfulfilled.
 pub(crate) use lower;
 
 /// A pattern literal proven lowercase at compile time.
@@ -511,8 +560,14 @@ impl LowerLiteral {
     }
 }
 
-#[derive(PartialEq)]
-enum RetryPattern {
+/// `pub(crate)` so [`crate::exec::model_exclusions`] can express pi's `AUTH_FAILURE_PATTERNS`
+/// (`model-exclusions.ts:35-41`) and `MODEL_UNAVAILABLE_PATTERN` (`model-fallback.ts:318`) over the
+/// SAME rows this module already carries, rather than growing a second matcher whose idea of "auth
+/// failure" could drift from this one's. [`line_matches`] and [`any_line_matches`] are widened for
+/// the same reason; `Debug` exists so the subset assertion in that module can name the row it
+/// failed on.
+#[derive(Debug, PartialEq)]
+pub(crate) enum RetryPattern {
     /// Case-insensitive literal substring (pi `/quota/i`, `/forbidden/i`, `/auth(?:entication)?/i`
     /// — the last collapses to `"auth"` since any string containing `auth` matches regardless of
     /// the optional suffix).
@@ -544,11 +599,41 @@ enum RetryPattern {
     /// `second` (pi `/temporar(?:ily)? unavailable/i` → first=`temporar`, middle=`ily`,
     /// second=` unavailable`; pi `/timed? out/i` → first=`time`, middle=`d`, second=` out`).
     OptionalWordBetween(LowerLiteral, LowerLiteral, LowerLiteral),
+    /// Case-insensitive `\b(?:a|b|c)\b`: any of the alternatives, each bounded by `\b` on BOTH
+    /// sides (pi `REQUEST_SHAPE_FAILURE_PATTERN`, `model-fallback.ts:608`; pi's
+    /// `PROVISIONING_FAILURE_PATTERNS` last row, `:624`).
+    ///
+    /// The boundaries are the whole point and the reason this is not a set of
+    /// [`Self::Contains`] rows: `invalid_request_error` must not be matched inside
+    /// `not_invalid_request_errors`, and `bad request` inside `bad requests` is a different
+    /// sentence. It shares [`matches_word_literal`] with [`Self::WordNumber`] — that function was
+    /// already the `\b` scanner, only restricted to ASCII digits by its caller.
+    WordAlternatives(&'static [LowerLiteral]),
+    /// Case-insensitive `^first(?:a|b|c)\b`: the LINE begins with `first`, immediately followed by
+    /// one of the alternatives, followed by a `\b` (pi
+    /// `/^npm (?:install|ci|uninstall|exec|run)\b/i`, `model-fallback.ts:621`).
+    ///
+    /// Anchored, unlike every other variant here. `npm install` inside a sentence is a mention;
+    /// `npm install` at the start of the error text is the command that failed.
+    LineStartThenAnyWord(LowerLiteral, &'static [LowerLiteral]),
+    /// Case-insensitive `\bfirst\b[^\n]*second\d+`: a word-bounded `first`, then anywhere later on
+    /// the same line a literal `second` followed by AT LEAST one ASCII digit (pi
+    /// `/\bnpm\b[^\n]*failed with code \d+/i` and its `exited with code` sibling,
+    /// `model-fallback.ts:622-623`).
+    ///
+    /// The trailing `\d+` is not decoration: `npm ... failed with code` on its own is prose, while
+    /// `npm ... failed with code 1` is an exit status, and only the latter establishes that the
+    /// CHILD ENVIRONMENT failed rather than the model.
+    WordThenDigits(LowerLiteral, LowerLiteral),
 }
 
 /// The fixed retryable-failure pattern set (R-SA-039), in pi's exact `RETRYABLE_MODEL_FAILURE_PATTERNS`
 /// declaration order (`model-fallback.ts:278-314`).
-const RETRYABLE_MODEL_FAILURE_PATTERNS: &[RetryPattern] = &[
+///
+/// `pub(crate)` for [`crate::exec::model_exclusions::auth::AUTH_FAILURE_PATTERNS`]'s subset
+/// assertion — upstream's auth table is a strict subset of this one, and a test that can read both
+/// is what keeps it that way after an edit to either.
+pub(crate) const RETRYABLE_MODEL_FAILURE_PATTERNS: &[RetryPattern] = &[
     RetryPattern::OptionalWsBetween(lower!("rate"), lower!("limit")), // /rate\s*limit/i
     RetryPattern::Contains(lower!("too many requests")),
     RetryPattern::WordNumber(lower!("429")), // /\b429\b/
@@ -674,13 +759,18 @@ fn skip_one_char(s: &str) -> Option<&str> {
     }
 }
 
-/// `\b<num>\b`: does `num` (ASCII digits) appear on a word boundary anywhere in `hay`?
-fn matches_word_number(hay: &str, num: &str) -> bool {
+/// `\b<needle>\b`: does `needle` appear bounded by word boundaries anywhere in `hay`?
+///
+/// Generalised from its original ASCII-digits-only form (`matches_word_number`) when
+/// [`RetryPattern::WordAlternatives`] arrived: the boundary rule is identical for `429` and for
+/// `invalid_request_error`, and a second scanner would have been a second place to get `\b` wrong.
+/// `needle` is still ASCII by [`LowerLiteral`]'s own contract, so `needle.len()` is a char boundary.
+fn matches_word_literal(hay: &str, needle: &str) -> bool {
     let bytes = hay.as_bytes();
     let mut search_start = 0;
-    while let Some(rel) = hay.get(search_start..).and_then(|s| s.find(num)) {
+    while let Some(rel) = hay.get(search_start..).and_then(|s| s.find(needle)) {
         let start = search_start + rel;
-        let end = start + num.len();
+        let end = start + needle.len();
         let before_ok = start == 0 || bytes.get(start - 1).is_none_or(|&b| !is_word_byte(b));
         let after_ok = bytes.get(end).is_none_or(|&b| !is_word_byte(b));
         if before_ok && after_ok {
@@ -726,11 +816,11 @@ impl<'a> LoweredLine<'a> {
 /// lowercased", "a single line") are now carried by [`LoweredLine`], and every literal's
 /// lowercase-ness by [`LowerLiteral`] — so the only thing left to get wrong here is the matching
 /// itself.
-fn line_matches(line: LoweredLine<'_>, pattern: &RetryPattern) -> bool {
+pub(crate) fn line_matches(line: LoweredLine<'_>, pattern: &RetryPattern) -> bool {
     let line = line.as_str();
     match pattern {
         RetryPattern::Contains(needle) => line.contains(needle.as_str()),
-        RetryPattern::WordNumber(num) => matches_word_number(line, num.as_str()),
+        RetryPattern::WordNumber(num) => matches_word_literal(line, num.as_str()),
         RetryPattern::Then(first, second) => match line.find(first.as_str()) {
             Some(pos) => line
                 .get(pos + first.as_str().len()..)
@@ -807,7 +897,59 @@ fn line_matches(line: LoweredLine<'_>, pattern: &RetryPattern) -> bool {
             }
             false
         }
+        RetryPattern::WordAlternatives(alternatives) => alternatives
+            .iter()
+            .any(|alternative| matches_word_literal(line, alternative.as_str())),
+        RetryPattern::LineStartThenAnyWord(first, alternatives) => {
+            // `^` — the LINE, not the haystack: `LoweredLine` already split on `\n`, which is what
+            // makes a JS `^` without the `m` flag and this per-line walk agree on single-line input
+            // and this one stricter on multi-line input (upstream's `^` would only ever match the
+            // very first line; matching any line is the conservative direction for a classifier
+            // that DAMPS recording rather than triggering it).
+            let Some(rest) = line.strip_prefix(first.as_str()) else {
+                return false;
+            };
+            alternatives.iter().any(|alternative| {
+                rest.strip_prefix(alternative.as_str()).is_some_and(|tail| {
+                    // `\b` after the alternative.
+                    tail.as_bytes().first().is_none_or(|&b| !is_word_byte(b))
+                })
+            })
+        }
+        RetryPattern::WordThenDigits(first, second) => {
+            if !matches_word_literal(line, first.as_str()) {
+                return false;
+            }
+            let mut search = 0;
+            while let Some(rel) = line.get(search..).and_then(|s| s.find(second.as_str())) {
+                let start = search + rel;
+                if let Some(rest) = line.get(start + second.as_str().len()..)
+                    && rest.as_bytes().first().is_some_and(u8::is_ascii_digit)
+                {
+                    return true;
+                }
+                search = start + 1;
+            }
+            false
+        }
     }
+}
+
+/// Does any line of `text` match any row of `patterns`?
+///
+/// The shared shape of every classifier in this module — lowercase ONCE, split into lines so the
+/// `.*`/`\s+` constructs never cross a `\n` (JS `.`-no-newline), then try every row against every
+/// line. `pub(crate)` because [`crate::exec::model_exclusions`] evaluates pi's own
+/// `AUTH_FAILURE_PATTERNS` and `MODEL_UNAVAILABLE_PATTERN` tables and must do so identically.
+///
+/// Deliberately WITHOUT [`is_tool_failure_prefix`]: that guard belongs to the two classifiers that
+/// upstream applies it in ([`is_retryable_model_failure`] `:326`, [`is_context_overflow`] `:647`),
+/// and pi's auth/model-unavailable tables are matched against a stored `reason` with no such guard.
+#[must_use]
+pub(crate) fn any_line_matches(text: &str, patterns: &[RetryPattern]) -> bool {
+    let haystack = text.to_lowercase();
+    LoweredLine::split(&haystack)
+        .any(|line| patterns.iter().any(|pattern| line_matches(line, pattern)))
 }
 
 /// pi `TOOL_FAILURE_PREFIX` (`model-fallback.ts:316-323`), hand-rolled for the same reason the
@@ -907,15 +1049,10 @@ pub fn is_retryable_model_failure(error: Option<&str>) -> bool {
     if is_tool_failure_prefix(error.trim()) {
         return false;
     }
-    let haystack = error.to_lowercase();
     // Per-line so the `.*`/`\s*`/`.?` constructs never cross a newline (JS `.`-no-newline). A
     // `Contains`/`WordNumber` needle can never straddle a `\n` either, so per-line evaluation is
     // equivalent to whole-string for those and correct for the sequence patterns.
-    LoweredLine::split(&haystack).any(|line| {
-        RETRYABLE_MODEL_FAILURE_PATTERNS
-            .iter()
-            .any(|p| line_matches(line, p))
-    })
+    any_line_matches(error, RETRYABLE_MODEL_FAILURE_PATTERNS)
 }
 
 /// pi `isContextOverflow` (`model-fallback.ts:645-649`).
@@ -939,16 +1076,11 @@ pub fn is_context_overflow(error: Option<&str>) -> bool {
     if is_tool_failure_prefix(error.trim()) {
         return false;
     }
-    let haystack = error.to_lowercase();
     // Per line, so `.*`/`\s+` never cross a newline (JS `.`-no-newline) — identical to
     // `is_retryable_model_failure`'s iteration and required by `line_matches`' contract. A
     // `Contains` needle holds no `\n`, so it cannot straddle one either: per-line is equivalent
     // for those and strictly correct for the rest.
-    LoweredLine::split(&haystack).any(|line| {
-        CONTEXT_OVERFLOW_PATTERNS
-            .iter()
-            .any(|p| line_matches(line, p))
-    })
+    any_line_matches(error, CONTEXT_OVERFLOW_PATTERNS)
 }
 
 /// The prefix/suffix of pi's second empty-output sentinel — `Subagent produced no output after
@@ -1021,6 +1153,146 @@ pub fn is_retryable_model_failure_attempt(signal: &AttemptSignal) -> bool {
             .message_errors
             .iter()
             .any(|message_error| message_error.trim() == error)
+}
+
+// -------------------------------------------------------------------------------------------
+// SCOPE_3j: recording a retryable model failure into the cached-exclusion registry
+// -------------------------------------------------------------------------------------------
+
+/// pi `REQUEST_SHAPE_FAILURE_PATTERN` (`model-fallback.ts:608`),
+/// `/\b(?:bad[ _]request|invalid[ _]argument|invalid_request_error)\b/i`, expanded to the five
+/// `\b`-bounded literals its two character classes stand for.
+///
+/// Upstream's own note (`:606-607`) is the whole justification and is not paraphrasable: *"Request-shape
+/// failures can match broad fallback signals such as 'upstream', but do not establish that the model
+/// is unhealthy for subsequent requests."* A malformed request excluded the model for 24 h on the
+/// strength of the word `upstream` appearing in the provider's 400.
+const REQUEST_SHAPE_FAILURE_PATTERNS: &[RetryPattern] = &[RetryPattern::WordAlternatives(&[
+    lower!("bad request"),
+    lower!("bad_request"),
+    lower!("invalid argument"),
+    lower!("invalid_argument"),
+    lower!("invalid_request_error"),
+])];
+
+/// pi `PROVISIONING_FAILURE_PATTERNS` (`model-fallback.ts:620-625`).
+///
+/// Ported deliberately, not by accident: upstream's rationale (`:610-619`) is that a package whose
+/// name contains the substring `model` next to a sentence containing `failed` matches
+/// [`RETRYABLE_MODEL_FAILURE_PATTERNS`] even though **no model request ever happened** — the
+/// failure was `npm install` into the child's extension prefix, or a preflight script. Retrying a
+/// different model cannot fix the environment, so the record is kept only long enough to damp
+/// repeated attempts ([`PROVISIONING_FAILURE_TTL_MS`]) instead of blaming the model for the default
+/// 24 h, and it never re-stamps (`preserve_existing`).
+///
+/// Dropping this arm silently would have been the expensive mistake: without it a broken `npm`
+/// prefix takes the *working* model out of every ladder on the machine for a day.
+const PROVISIONING_FAILURE_PATTERNS: &[RetryPattern] = &[
+    // /^npm (?:install|ci|uninstall|exec|run)\b/i
+    RetryPattern::LineStartThenAnyWord(
+        lower!("npm "),
+        &[
+            lower!("install"),
+            lower!("ci"),
+            lower!("uninstall"),
+            lower!("exec"),
+            lower!("run"),
+        ],
+    ),
+    // /\bnpm\b[^\n]*failed with code \d+/i
+    RetryPattern::WordThenDigits(lower!("npm"), lower!("failed with code ")),
+    // /\bnpm\b[^\n]*exited with code \d+/i
+    RetryPattern::WordThenDigits(lower!("npm"), lower!("exited with code ")),
+    // /\bpreflight\b/i
+    RetryPattern::WordAlternatives(&[lower!("preflight")]),
+];
+
+/// pi `PROVISIONING_FAILURE_TTL_MS` (`model-fallback.ts:627`) — 15 minutes.
+const PROVISIONING_FAILURE_TTL_MS: i64 = 15 * 60_000;
+
+/// pi `isProvisioningFailure` (`model-fallback.ts:629-631`).
+fn is_provisioning_failure(error: &str) -> bool {
+    any_line_matches(error, PROVISIONING_FAILURE_PATTERNS)
+}
+
+/// Whether this settled attempt should record a cached model exclusion — pi
+/// `recordRetryableModelFailure`'s four guards plus its call-site guard, as ONE pure predicate
+/// (`model-fallback.ts:633-635` and `runs/background/subagent-runner.ts:1554-1555` /
+/// `runs/foreground/execution.ts:2065-2066`).
+///
+/// It is a predicate rather than the recording itself because the recording is a FILE WRITE into
+/// [`crate::exec::model_exclusions`]' persisted registry: [`classify_attempt`] is pure and stays
+/// pure, so the decision is asked here and the write is performed by the shell
+/// ([`run_fallback_ladder`]).
+///
+/// # The guards, in upstream's order, and why each is there
+///
+/// 0. [`is_retryable_model_failure_attempt`] — upstream's CALL-SITE guard, computed once per
+///    attempt and checked before the function is entered at all. It is not redundant with guard 1
+///    below: it additionally consults `tool_count`/`message_count`, which a text classifier cannot
+///    see, so a child that already ran ten tools and then hit `connection reset` records nothing.
+/// 1. [`is_retryable_model_failure`] — upstream's own first inner guard, a SECOND and broader text
+///    check. Kept because upstream keeps it; it is the one that survives if the call site ever
+///    loosens.
+/// 2. [`is_context_overflow`] — an overflow says the INPUT was too large, not that the model is
+///    unhealthy. Excluding the model over it would take a working model out of every later ladder
+///    because one task was too big. This is that function's third call site (SCOPE_3b).
+/// 3. [`REQUEST_SHAPE_FAILURE_PATTERNS`] — see that constant's doc.
+/// 4. [`is_empty_output_sentinel`] (pi `isTransientNoOutputFailure`, `:592-595`) — a cold-start
+///    empty response must not mark a model unhealthy. Reused rather than re-derived: it is the same
+///    predicate [`is_retryable_model_failure_attempt`] already consults.
+#[must_use]
+pub fn should_record_retryable_model_failure(signal: &AttemptSignal) -> bool {
+    if !is_retryable_model_failure_attempt(signal) {
+        return false;
+    }
+    let Some(error) = signal.error.as_deref() else {
+        return false;
+    };
+    if error.is_empty() {
+        return false;
+    }
+    if !is_retryable_model_failure(Some(error)) || is_context_overflow(Some(error)) {
+        return false;
+    }
+    if any_line_matches(error, REQUEST_SHAPE_FAILURE_PATTERNS) || is_empty_output_sentinel(error) {
+        return false;
+    }
+    true
+}
+
+/// pi `recordRetryableModelFailure` (`model-fallback.ts:633-642`) — the write half.
+///
+/// The guards live in [`should_record_retryable_model_failure`]; this performs the store write the
+/// decision implies, splitting the full candidate id into the provider/model halves an exclusion is
+/// keyed on ([`crate::exec::model_exclusions::parse_model_key`], pi's `parseModelKey` at `:638`).
+///
+/// A provisioning failure takes upstream's TTL override AND `preserveExisting` (`:641`) — the two
+/// travel together, and omitting the second makes every repeated `npm install` failure re-stamp a
+/// fresh fifteen-minute window, which is the behaviour the flag exists to prevent.
+pub async fn record_retryable_model_failure(
+    store: &crate::exec::model_exclusions::ModelExclusionStore,
+    model: &ModelId,
+    error: &str,
+) {
+    use crate::exec::model_exclusions::{
+        ModelExclusionTarget, RecordModelFailure, parse_model_key,
+    };
+
+    let key = parse_model_key(model.as_str());
+    let target = ModelExclusionTarget::Model {
+        model_id: key.model_id,
+        provider: key.provider,
+    };
+    let provisioning = is_provisioning_failure(error);
+    store
+        .record_model_failure(RecordModelFailure {
+            target,
+            reason: Some(error.to_string()),
+            ttl_ms: provisioning.then_some(PROVISIONING_FAILURE_TTL_MS),
+            preserve_existing: provisioning,
+        })
+        .await;
 }
 
 /// One operator-facing ladder note — pi `attemptNotes` (`subagent-runner.ts:1026`,
@@ -1676,6 +1948,31 @@ pub(crate) enum LadderStep {
     AdvanceModel,
 }
 
+impl LadderStep {
+    /// Did [`classify_attempt`] reach the model-failure section — the point at which pi records a
+    /// cached model exclusion (`subagent-runner.ts:1555`, `execution.ts:2066`)?
+    ///
+    /// This is the ONE fact the shell needs in order to perform a write the pure classifier cannot,
+    /// and it lives here rather than as a `matches!` at the call site so it stays next to the enum
+    /// whose order defines it. The `match` is exhaustive on purpose: a new variant must state which
+    /// side of that line it falls on rather than inheriting an answer from a `_` arm.
+    ///
+    /// `false` for the four steps returned ABOVE the recording point — a timeout, a detach, a
+    /// success, and both startup-retry outcomes. A child that never started says nothing about the
+    /// MODEL, which is exactly why upstream's startup ladder sits above the model-fallback decision.
+    #[must_use]
+    pub(crate) const fn reached_model_failure_classification(self) -> bool {
+        match self {
+            Self::RetryStartup { .. } | Self::StartupExhausted => false,
+            Self::Settle(stop) => match stop {
+                LadderStop::TimedOut | LadderStop::Detached | LadderStop::Completed => false,
+                LadderStop::ContextOverflow | LadderStop::ModelFailure => true,
+            },
+            Self::AdvanceModel => true,
+        }
+    }
+}
+
 /// The ladder's ENTIRE decision precedence, as one pure function.
 ///
 /// No `.await`, no `&mut`, no I/O — so the precedence is one readable `match` that can be asserted
@@ -1718,11 +2015,14 @@ fn classify_attempt(
         };
     }
 
-    // ── SCOPE_3j inserts `record_retryable_model_failure` HERE ──────────────────────────────
-    // pi calls it at `:1407`, immediately BEFORE `isContextOverflow` at `:1408`. Note the
-    // recording is a FILE WRITE (`model-exclusions.ts`'s persisted registry), so it cannot live
-    // inside this pure function: 3j must carry the decision out on a `LadderStep` payload and let
-    // the shell perform it.
+    // pi records the cached model exclusion HERE — `subagent-runner.ts:1555` /
+    // `execution.ts:2066`, immediately BEFORE `isContextOverflow` at `:1556` / `:2067`. The
+    // recording is a FILE WRITE into `exec::model_exclusions`' persisted registry, so it cannot
+    // live inside this pure function. The precedence position is preserved instead by
+    // `LadderStep::reached_model_failure_classification` — every step returned from THIS point
+    // down answers `true`, every step returned above it `false` — and the shell asks
+    // `should_record_retryable_model_failure` (pure, all five guards) on exactly those steps and
+    // performs the write itself.
 
     // TERMINAL, not a retry hint: the next model with the same oversized input fails the same way
     // (`model-fallback.ts:624-630`).
@@ -1758,6 +2058,7 @@ enum LadderControl {
 pub async fn run_fallback_ladder<R: AttemptRunner + Send>(
     candidates: &[ModelId],
     runner: &mut R,
+    exclusions: Option<&crate::exec::model_exclusions::ModelExclusionStore>,
 ) -> FallbackOutcome<R::Attempt> {
     let mut attempted_models = Vec::with_capacity(candidates.len());
     let mut model_attempts = Vec::with_capacity(candidates.len());
@@ -1815,8 +2116,26 @@ pub async fn run_fallback_ladder<R: AttemptRunner + Send>(
             // The ENTIRE precedence lives in `classify_attempt` (pure). This match only ACTS on
             // its answer — performing the I/O the decision implies and mutating the accumulators —
             // and then funnels every path through the single settle below.
-            let control = match classify_attempt(&signal, is_last_candidate, startup_attempt_index)
+            let step = classify_attempt(&signal, is_last_candidate, startup_attempt_index);
+
+            // SCOPE_3j — pi `recordRetryableModelFailure(candidate ?? run.model ?? step.model,
+            // error)` (`subagent-runner.ts:1555`, `execution.ts:2066`), at its own precedence
+            // position: immediately after the per-attempt retryable classification and BEFORE the
+            // context-overflow branch acts. The classifier decided, above, that this attempt
+            // reached that point; the predicate decides whether it qualifies; the write happens
+            // HERE because it is a write and `classify_attempt` is pure.
+            //
+            // `exclusions = None` (a headless embedder, or a caller that wants no cross-run memory)
+            // degrades to exactly today's behaviour: nothing is recorded and nothing is filtered.
+            if let Some(store) = exclusions
+                && step.reached_model_failure_classification()
+                && should_record_retryable_model_failure(&signal)
+                && let Some(error) = signal.error.as_deref()
             {
+                record_retryable_model_failure(store, model, error).await;
+            }
+
+            let control = match step {
                 LadderStep::Settle(stop) => {
                     if stop == LadderStop::ContextOverflow {
                         attempt_notes.push(context_overflow_note(model));
@@ -2365,13 +2684,14 @@ mod tests {
             &available,
             None,
         );
-        let (policed, violations) = build_model_candidates_scoped(
+        let (policed, violations, _exclusions) = build_model_candidates_scoped(
             &ModelOverride::Inherit,
             Some(&primary),
             &fallbacks,
             &available,
             None,
             Some(&scope),
+            None,
         );
 
         assert_eq!(
@@ -2397,13 +2717,14 @@ mod tests {
     fn the_primary_candidate_is_not_double_reported_by_the_ladder_check() {
         let primary = model("openai/gpt-5-nano");
         let available = vec![primary.clone()];
-        let (candidates, violations) = build_model_candidates_scoped(
+        let (candidates, violations, _exclusions) = build_model_candidates_scoped(
             &ModelOverride::Inherit,
             Some(&primary),
             &[],
             &available,
             None,
             Some(&armed_scope(&["anthropic/*"])),
+            None,
         );
         assert_eq!(candidates, vec![primary]);
         assert!(
@@ -2844,7 +3165,7 @@ mod tests {
             ),
             (ok_signal(usage(999, 999, 999.0)), "attempt-b"), // must never be reached
         ]);
-        let outcome = run_fallback_ladder(&candidates, &mut runner).await;
+        let outcome = run_fallback_ladder(&candidates, &mut runner, None).await;
 
         assert_eq!(outcome.attempted_models, vec![model("a")]);
         assert_eq!(
@@ -3036,7 +3357,7 @@ mod tests {
     #[tokio::test]
     async fn empty_ladder_never_calls_the_runner() {
         let mut runner = ScriptedRunner::new(Vec::new());
-        let outcome = run_fallback_ladder(&[], &mut runner).await;
+        let outcome = run_fallback_ladder(&[], &mut runner, None).await;
         assert!(outcome.attempted_models.is_empty());
         assert!(outcome.model_attempts.is_empty());
         assert!(outcome.last_signal.is_none());
@@ -3052,7 +3373,7 @@ mod tests {
             (ok_signal(usage(10, 5, 0.1)), "attempt-a"),
             (ok_signal(usage(999, 999, 999.0)), "attempt-b"), // must never be reached
         ]);
-        let outcome = run_fallback_ladder(&candidates, &mut runner).await;
+        let outcome = run_fallback_ladder(&candidates, &mut runner, None).await;
 
         assert_eq!(outcome.attempted_models, vec![model("a")]);
         assert_eq!(
@@ -3074,7 +3395,7 @@ mod tests {
             ),
             (ok_signal(usage(5, 5, 0.0)), "attempt-b"),
         ]);
-        let outcome = run_fallback_ladder(&candidates, &mut runner).await;
+        let outcome = run_fallback_ladder(&candidates, &mut runner, None).await;
 
         assert_eq!(outcome.attempted_models, vec![model("a"), model("b")]);
         assert_eq!(
@@ -3109,7 +3430,7 @@ mod tests {
             ),
             (ok_signal(usage(1, 1, 0.0)), "attempt-b"), // must never be reached
         ]);
-        let outcome = run_fallback_ladder(&candidates, &mut runner).await;
+        let outcome = run_fallback_ladder(&candidates, &mut runner, None).await;
 
         assert_eq!(outcome.attempted_models, vec![model("a")]);
         assert_eq!(
@@ -3127,7 +3448,7 @@ mod tests {
             failed_signal("rate limit", usage(10, 0, 0.0)),
             "attempt-a",
         )]);
-        let outcome = run_fallback_ladder(&candidates, &mut runner).await;
+        let outcome = run_fallback_ladder(&candidates, &mut runner, None).await;
 
         assert_eq!(
             runner.calls.len(),
@@ -3148,7 +3469,7 @@ mod tests {
             ),
             (ok_signal(usage(30, 3, 3.0)), "c"),
         ]);
-        let outcome = run_fallback_ladder(&candidates, &mut runner).await;
+        let outcome = run_fallback_ladder(&candidates, &mut runner, None).await;
 
         assert_eq!(outcome.attempted_models.len(), 3);
         assert_eq!(outcome.aggregate_usage.input, 10 + 20 + 30);
@@ -3188,7 +3509,7 @@ mod tests {
             (ok_signal(usage(999, 999, 999.0)), "attempt-b"), // must NEVER be reached
         ]);
 
-        let outcome = run_fallback_ladder(&candidates, &mut runner).await;
+        let outcome = run_fallback_ladder(&candidates, &mut runner, None).await;
 
         assert_eq!(
             runner.calls.len(),
@@ -3221,7 +3542,7 @@ mod tests {
             (ok_signal(usage(1, 1, 0.0)), "attempt-b"), // must NEVER be reached
         ]);
 
-        let outcome = run_fallback_ladder(&candidates, &mut runner).await;
+        let outcome = run_fallback_ladder(&candidates, &mut runner, None).await;
 
         assert_eq!(
             runner.calls.len(),
@@ -3250,7 +3571,7 @@ mod tests {
             (ok_signal(usage(5, 5, 0.0)), "attempt-b"),
         ]);
 
-        let outcome = run_fallback_ladder(&candidates, &mut runner).await;
+        let outcome = run_fallback_ladder(&candidates, &mut runner, None).await;
 
         assert_eq!(
             runner.calls.len(),
@@ -3269,7 +3590,7 @@ mod tests {
             (failed_signal("503", usage(1, 0, 0.0)), "b"),
             (ok_signal(usage(1, 0, 0.0)), "c"),
         ]);
-        let _ = run_fallback_ladder(&candidates, &mut runner).await;
+        let _ = run_fallback_ladder(&candidates, &mut runner, None).await;
         assert_eq!(
             runner.snapshot_calls, 3,
             "R-SA-031: the output file must be snapshotted immediately before EVERY fresh attempt"
@@ -3482,6 +3803,21 @@ mod tests {
                     assert_lower(*a);
                     assert_lower(*b);
                     assert_lower(*c);
+                }
+                RetryPattern::WordAlternatives(alts) => {
+                    for alt in *alts {
+                        assert_lower(*alt);
+                    }
+                }
+                RetryPattern::LineStartThenAnyWord(a, alts) => {
+                    assert_lower(*a);
+                    for alt in *alts {
+                        assert_lower(*alt);
+                    }
+                }
+                RetryPattern::WordThenDigits(a, b) => {
+                    assert_lower(*a);
+                    assert_lower(*b);
                 }
             }
         }
@@ -3825,7 +4161,7 @@ mod tests {
             (failed, "attempt-a"),
             (ok_signal(usage(1, 1, 0.0)), "attempt-b"), // must never be reached
         ]);
-        let outcome = run_fallback_ladder(&candidates, &mut runner).await;
+        let outcome = run_fallback_ladder(&candidates, &mut runner, None).await;
 
         assert_eq!(outcome.attempted_models, vec![model("a")]);
         assert_eq!(
@@ -3852,7 +4188,7 @@ mod tests {
             (uncorroborated, "attempt-a"),
             (ok_signal(usage(1, 1, 0.0)), "attempt-b"),
         ]);
-        let outcome = run_fallback_ladder(&candidates, &mut runner).await;
+        let outcome = run_fallback_ladder(&candidates, &mut runner, None).await;
         assert_eq!(outcome.attempted_models, vec![model("a")]);
         assert_eq!(runner.calls.len(), 1);
 
@@ -3864,7 +4200,7 @@ mod tests {
             (corroborated, "attempt-a"),
             (ok_signal(usage(1, 1, 0.0)), "attempt-b"),
         ]);
-        let outcome = run_fallback_ladder(&candidates, &mut runner).await;
+        let outcome = run_fallback_ladder(&candidates, &mut runner, None).await;
         assert_eq!(outcome.attempted_models, vec![model("a"), model("b")]);
         assert_eq!(runner.calls.len(), 2);
         assert!(outcome.last_signal.expect("some outcome").success);
@@ -3977,7 +4313,7 @@ mod tests {
             failed_signal("error code: context_length_exceeded", usage(10, 0, 0.0)),
             "attempt-a",
         )]);
-        let outcome = run_fallback_ladder(&candidates, &mut runner).await;
+        let outcome = run_fallback_ladder(&candidates, &mut runner, None).await;
 
         assert!(outcome.context_overflow);
         assert_eq!(outcome.attempted_models, vec![model("a")]);
@@ -4007,7 +4343,7 @@ mod tests {
             (failed_signal(error_text, usage(10, 0, 0.0)), "attempt-a"),
             (ok_signal(usage(999, 999, 999.0)), "attempt-b"), // must never be reached
         ]);
-        let outcome = run_fallback_ladder(&candidates, &mut runner).await;
+        let outcome = run_fallback_ladder(&candidates, &mut runner, None).await;
 
         assert!(outcome.context_overflow);
         assert_eq!(
@@ -4030,7 +4366,7 @@ mod tests {
             ),
             (ok_signal(usage(5, 5, 0.0)), "attempt-b"),
         ]);
-        let outcome = run_fallback_ladder(&candidates, &mut runner).await;
+        let outcome = run_fallback_ladder(&candidates, &mut runner, None).await;
         assert!(!outcome.context_overflow);
         assert_eq!(outcome.attempt_notes.len(), 1);
     }
@@ -4054,7 +4390,7 @@ mod tests {
             ),
             (ok_signal(usage(1, 1, 0.0)), "c"),
         ]);
-        let outcome = run_fallback_ladder(&candidates, &mut runner).await;
+        let outcome = run_fallback_ladder(&candidates, &mut runner, None).await;
 
         assert!(
             runner.calls[0].1.is_empty(),
@@ -4079,5 +4415,364 @@ mod tests {
             outcome.attempt_notes, runner.calls[2].1,
             "the outcome publishes the same accumulator the last attempt was seeded with"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // SCOPE_3j — recording a retryable model failure into the cached-exclusion registry
+    // ---------------------------------------------------------------------------------------
+
+    use crate::exec::model_exclusions::{
+        ModelExclusionStore, ModelExclusionTarget, RecordModelFailure,
+    };
+
+    fn exclusion_store(dir: &std::path::Path) -> ModelExclusionStore {
+        ModelExclusionStore::with_paths(dir.join("model-exclusions.json"), dir.join("auth.json"))
+    }
+
+    /// The whole point of the port, at the ladder level: a model that failed with a rate limit is
+    /// RECORDED, so the next run's ladder does not spend an attempt rediscovering it.
+    #[tokio::test]
+    async fn an_advancing_retryable_failure_records_a_cached_exclusion() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = exclusion_store(dir.path());
+        let candidates = vec![model("openai/gpt-4"), model("anthropic/sonnet")];
+        let mut runner = ScriptedRunner::new(vec![
+            (model_failure_signal("429 rate limit exceeded"), "attempt-a"),
+            (ok_signal(usage(1, 1, 0.0)), "attempt-b"),
+        ]);
+
+        let outcome = run_fallback_ladder(&candidates, &mut runner, Some(&store)).await;
+
+        assert_eq!(outcome.stop, LadderStop::Completed);
+        assert!(
+            store.is_excluded("gpt-4", Some("openai")),
+            "the failed candidate was not recorded"
+        );
+        assert!(
+            !store.is_excluded("sonnet", Some("anthropic")),
+            "the candidate that SUCCEEDED must not be excluded"
+        );
+    }
+
+    /// SCOPE_3b's third consumer, and the guard that matters most: an overflow says the INPUT was
+    /// too large, not that the model is unhealthy. Recording it would take a working model out of
+    /// every later ladder because one task was too big.
+    #[tokio::test]
+    async fn a_context_overflow_never_records_an_exclusion() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = exclusion_store(dir.path());
+        let candidates = vec![model("openai/gpt-4")];
+        let mut runner = ScriptedRunner::new(vec![(
+            model_failure_signal("context length exceeded: 200000 tokens"),
+            "attempt-a",
+        )]);
+
+        let outcome = run_fallback_ladder(&candidates, &mut runner, Some(&store)).await;
+
+        assert_eq!(outcome.stop, LadderStop::ContextOverflow);
+        assert!(!store.is_excluded("gpt-4", Some("openai")));
+    }
+
+    /// A timeout and a detach are terminal ABOVE the recording point (`classify_attempt`'s rungs 1
+    /// and 2), so neither may blame the model — even when the error text reads retryable.
+    #[tokio::test]
+    async fn a_timeout_whose_text_reads_retryable_records_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = exclusion_store(dir.path());
+        let candidates = vec![model("openai/gpt-4")];
+        let mut runner = ScriptedRunner::new(vec![(
+            timed_out_signal("upstream 503 service unavailable", usage(0, 0, 0.0)),
+            "attempt-a",
+        )]);
+
+        let outcome = run_fallback_ladder(&candidates, &mut runner, Some(&store)).await;
+
+        assert_eq!(outcome.stop, LadderStop::TimedOut);
+        assert!(!store.is_excluded("gpt-4", Some("openai")));
+    }
+
+    /// The precedence fact the shell relies on, as a table. Everything returned ABOVE the recording
+    /// point answers `false`; everything at or below it answers `true`.
+    #[test]
+    fn only_the_steps_at_or_below_the_recording_point_reach_the_model_failure_classification() {
+        for step in [
+            LadderStep::Settle(LadderStop::TimedOut),
+            LadderStep::Settle(LadderStop::Detached),
+            LadderStep::Settle(LadderStop::Completed),
+            LadderStep::RetryStartup { delay_ms: 1 },
+            LadderStep::StartupExhausted,
+        ] {
+            assert!(
+                !step.reached_model_failure_classification(),
+                "{step:?} is returned above the recording point"
+            );
+        }
+        for step in [
+            LadderStep::Settle(LadderStop::ContextOverflow),
+            LadderStep::Settle(LadderStop::ModelFailure),
+            LadderStep::AdvanceModel,
+        ] {
+            assert!(
+                step.reached_model_failure_classification(),
+                "{step:?} is returned at or below the recording point"
+            );
+        }
+    }
+
+    /// Guard 3, upstream's own note: a request-shape failure can match the broad `upstream` signal
+    /// without establishing that the MODEL is unhealthy for later requests.
+    #[test]
+    fn a_request_shape_failure_is_refused_even_though_its_text_is_retryable() {
+        let signal =
+            model_failure_signal("upstream returned invalid_request_error: messages[0] is empty");
+        assert!(
+            is_retryable_model_failure_attempt(&signal),
+            "precondition: the ladder itself still treats this as retryable"
+        );
+        assert!(!should_record_retryable_model_failure(&signal));
+    }
+
+    /// Guard 4: a cold-start empty response is retryable but says nothing about the model's health.
+    #[test]
+    fn an_empty_output_sentinel_is_refused() {
+        let signal = model_failure_signal(crate::exec::output::EMPTY_OUTPUT_ERROR);
+        assert!(is_retryable_model_failure_attempt(&signal));
+        assert!(!should_record_retryable_model_failure(&signal));
+    }
+
+    /// A plain provider failure passes every guard — the positive control for the four above.
+    #[test]
+    fn a_plain_provider_failure_is_recorded() {
+        assert!(should_record_retryable_model_failure(
+            &model_failure_signal("503 service unavailable")
+        ));
+    }
+
+    /// `\b` on BOTH sides: `invalid_request_error` inside a longer word is a different token.
+    #[test]
+    fn the_request_shape_alternation_is_word_bounded_on_both_sides() {
+        assert!(any_line_matches(
+            "provider said: bad request",
+            REQUEST_SHAPE_FAILURE_PATTERNS
+        ));
+        assert!(any_line_matches(
+            "invalid_argument: tools[0]",
+            REQUEST_SHAPE_FAILURE_PATTERNS
+        ));
+        assert!(!any_line_matches(
+            "not_invalid_request_errors_here",
+            REQUEST_SHAPE_FAILURE_PATTERNS
+        ));
+        assert!(!any_line_matches(
+            "badrequest",
+            REQUEST_SHAPE_FAILURE_PATTERNS
+        ));
+    }
+
+    /// The provisioning arm's three shapes, and the two near-misses that prove each bound.
+    #[test]
+    fn the_provisioning_patterns_match_commands_and_exit_statuses_not_prose() {
+        assert!(is_provisioning_failure("npm install failed"));
+        assert!(is_provisioning_failure("npm ci"));
+        assert!(is_provisioning_failure(
+            "child prep: npm ERR! the step failed with code 1"
+        ));
+        assert!(is_provisioning_failure(
+            "npm run build exited with code 254"
+        ));
+        assert!(is_provisioning_failure("preflight script refused"));
+
+        // `^` — a mention mid-sentence is not the command that failed.
+        assert!(!is_provisioning_failure("we ran npm install yesterday"));
+        // `\b` after the alternative.
+        assert!(!is_provisioning_failure("npm installer crashed"));
+        // `\d+` — without an exit status this is prose, not a status line.
+        assert!(!is_provisioning_failure("npm did not fail with code"));
+        // `\bnpm\b` — the word, not a substring.
+        assert!(!is_provisioning_failure("npmx failed with code 1"));
+    }
+
+    /// A broken child environment must not blame the model for a day: upstream's fifteen-minute
+    /// window, and `preserveExisting` so a repeated failure does not re-stamp it.
+    #[tokio::test]
+    async fn a_provisioning_failure_gets_the_short_window_and_never_re_stamps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = exclusion_store(dir.path());
+        let failure = "npm install failed with code 1: model-router install error";
+        assert!(
+            is_retryable_model_failure(Some(failure)),
+            "precondition: this environment failure trips the broad model-failure table"
+        );
+
+        record_retryable_model_failure(&store, &model("openai/gpt-4"), failure).await;
+        let first = store
+            .find_model_exclusion(&model("openai/gpt-4"), None, None)
+            .unwrap();
+        assert!(
+            first.expires_at - first.recorded_at <= 15 * 60_000,
+            "a provisioning failure took the full default TTL"
+        );
+
+        record_retryable_model_failure(&store, &model("openai/gpt-4"), failure).await;
+        let second = store
+            .find_model_exclusion(&model("openai/gpt-4"), None, None)
+            .unwrap();
+        assert_eq!(
+            first.expires_at, second.expires_at,
+            "preserve_existing did not hold: the window was re-stamped"
+        );
+    }
+
+    /// An ordinary provider failure keeps the full default TTL — the control for the test above.
+    #[tokio::test]
+    async fn an_ordinary_provider_failure_keeps_the_default_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = exclusion_store(dir.path());
+        record_retryable_model_failure(&store, &model("openai/gpt-4"), "429 rate limit").await;
+        let recorded = store
+            .find_model_exclusion(&model("openai/gpt-4"), None, None)
+            .unwrap();
+        assert!(recorded.expires_at - recorded.recorded_at > 15 * 60_000);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // SCOPE_3j — the ladder filter and its zero-candidates evidence
+    // ---------------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn an_excluded_candidate_is_dropped_from_the_ladder_as_its_last_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = exclusion_store(dir.path());
+        store
+            .record_model_failure(RecordModelFailure::new(
+                ModelExclusionTarget::Model {
+                    model_id: ModelId::from("gpt-4"),
+                    provider: Some(ProviderId::from("openai")),
+                },
+                Some("429 rate limit".to_string()),
+            ))
+            .await;
+
+        let available = vec![model("openai/gpt-4"), model("anthropic/sonnet")];
+        let (candidates, _violations, evidence) = build_model_candidates_scoped(
+            &ModelOverride::Inherit,
+            Some(&model("openai/gpt-4")),
+            &[model("anthropic/sonnet")],
+            &available,
+            None,
+            None,
+            Some(&store),
+        );
+
+        assert_eq!(candidates, vec![model("anthropic/sonnet")]);
+        assert_eq!(evidence.excluded_count(), 1);
+        assert_eq!(
+            evidence.shown().first().map(|e| e.candidate.clone()),
+            Some(model("openai/gpt-4"))
+        );
+    }
+
+    /// With no store the ladder is byte-identical to the pre-SCOPE_3j one — the degradation path
+    /// every headless embedder and every existing fixture takes.
+    #[test]
+    fn without_a_store_the_ladder_is_unchanged_and_the_evidence_is_empty() {
+        let available = vec![model("openai/gpt-4")];
+        let (candidates, _violations, evidence) = build_model_candidates_scoped(
+            &ModelOverride::Inherit,
+            Some(&model("openai/gpt-4")),
+            &[],
+            &available,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(candidates, vec![model("openai/gpt-4")]);
+        assert_eq!(evidence.excluded_count(), 0);
+        assert_eq!(evidence.zero_usable_candidates_error(), None);
+    }
+
+    /// Every candidate excluded: the operator gets upstream's sentence plus the reason and expiry
+    /// for each drop, instead of a bare "empty fallback ladder".
+    #[tokio::test]
+    async fn an_entirely_excluded_ladder_renders_the_zero_candidates_error_with_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = exclusion_store(dir.path());
+        store
+            .record_model_failure(RecordModelFailure::new(
+                ModelExclusionTarget::Provider {
+                    provider: ProviderId::from("openai"),
+                },
+                Some("401 unauthorized".to_string()),
+            ))
+            .await;
+
+        let available = vec![model("openai/gpt-4")];
+        let (candidates, _violations, evidence) = build_model_candidates_scoped(
+            &ModelOverride::Inherit,
+            Some(&model("openai/gpt-4")),
+            &[],
+            &available,
+            None,
+            None,
+            Some(&store),
+        );
+
+        assert!(candidates.is_empty());
+        let rendered = evidence.zero_usable_candidates_error().unwrap();
+        assert!(
+            rendered.starts_with(crate::exec::model_exclusions::ZERO_USABLE_MODEL_CANDIDATES_ERROR),
+            "{rendered}"
+        );
+        assert!(rendered.contains("reason: 401 unauthorized"), "{rendered}");
+        assert!(rendered.contains("provider: openai"), "{rendered}");
+    }
+
+    /// pi's `candidates.length > 0` precondition (`model-fallback.ts:514`): a ladder that was
+    /// ALREADY empty is not an exclusion problem and must keep its own message.
+    #[test]
+    fn an_already_empty_ladder_does_not_gain_a_bogus_exclusion_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = exclusion_store(dir.path());
+        let (candidates, _violations, evidence) = build_model_candidates_scoped(
+            &ModelOverride::Inherit,
+            Some(&model("openai/gpt-4")),
+            &[],
+            &[], // nothing is available at all
+            None,
+            None,
+            Some(&store),
+        );
+        assert!(candidates.is_empty());
+        assert_eq!(evidence.zero_usable_candidates_error(), None);
+    }
+
+    /// The escape hatch: a `model-unavailable` exclusion for a model that is back in
+    /// `available_models` must not pin it out for the rest of the TTL.
+    #[tokio::test]
+    async fn a_stale_model_unavailable_exclusion_is_ignored_once_the_model_is_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = exclusion_store(dir.path());
+        store
+            .record_model_failure(RecordModelFailure::new(
+                ModelExclusionTarget::Model {
+                    model_id: ModelId::from("gpt-4"),
+                    provider: Some(ProviderId::from("openai")),
+                },
+                Some("model not found: gpt-4".to_string()),
+            ))
+            .await;
+
+        let available = vec![model("openai/gpt-4")];
+        let (candidates, _violations, evidence) = build_model_candidates_scoped(
+            &ModelOverride::Inherit,
+            Some(&model("openai/gpt-4")),
+            &[],
+            &available,
+            None,
+            None,
+            Some(&store),
+        );
+        assert_eq!(candidates, vec![model("openai/gpt-4")]);
+        assert_eq!(evidence.excluded_count(), 0);
     }
 }

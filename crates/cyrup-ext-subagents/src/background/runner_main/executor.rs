@@ -633,6 +633,13 @@ impl ExecSingleStepExecutor {
             // below is (pi applies one `AsyncExecutionParams.usageBudget` across the whole run
             // rather than giving each step a fresh one).
             usage_budget: self.usage_budget,
+            // SCOPE_3j — the detached hop-2 runner holds no executor to inherit a store from, so it
+            // builds its own from the environment. That is not a second registry: it resolves to
+            // the SAME on-disk file the foreground wrote, which is the whole reason the store is
+            // persisted rather than merely in-process.
+            model_exclusions: Some(std::sync::Arc::new(
+                crate::exec::model_exclusions::ModelExclusionStore::from_env(),
+            )),
             // SUBA-008 — pi `turnBudget: ctx.turnBudget` on every step's `runSubagentProcess`
             // call (`subagent-runner.ts:1409`): the RUN-level budget, applied per step, exactly
             // as upstream applies one `AsyncExecutionParams.turnBudget` to every step of an async

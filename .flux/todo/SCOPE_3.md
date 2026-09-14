@@ -1,7 +1,7 @@
 ---
-stage: aug
-status: done
-updated: 2026-09-06 14:20
+stage: qa
+status: completed
+updated: 2026-09-14 06:00
 ---
 
 # SCOPE_3 — wait completions resolve through the session index (INDEX)
@@ -13,6 +13,127 @@ whose absence would otherwise force a field to be `None` forever.
 **This file is now an index.** The work is split across `SCOPE_3a` … `SCOPE_3j`, each independently
 executable. This file holds the shared premise, the shared TYPE CONTRACT (§A — read it before
 writing a line of any task), the verified anchors and the dependency order that all of them assume.
+
+---
+
+## 0.0 ⚠ RE-AUGMENTED 2026-09-14 — **THIS INDEX'S OBJECTIVE IS LANDED**
+
+> Branch `claude/subagents-scope`, cut from `main` at `d53763b`. Every claim below was re-checked
+> against the tree as it is NOW, by opening the files. **No `git` command was run** (flux rule);
+> where the old text asserted a commit-vs-working-tree distinction, that distinction is simply gone
+> — every anchor named here is an ordinary file on disk.
+>
+> **Read this section before believing any line number elsewhere in this file. Every line number
+> in §0–§4 below predates ~15 k LOC of landed work and almost all of them are now wrong.** They are
+> preserved (per flux's "add precision, never remove scope") with a corrected value beside them.
+
+### 0.0.1 What exists now
+
+`wait-completions.ts` (213 LOC) is **fully ported**, in four files under
+`crates/cyrup-ext-subagents/src/background/wait_completions/` (675 LOC total):
+
+| file | LOC | contents |
+|---|---|---|
+| `wait_completions/mod.rs` | 45 | facade + the module narrative; re-exports all seven public items |
+| `wait_completions/project.rs` | 365 | `WaitCompletion`, `WaitCompletionChild`, `CompletionUsage`, `CompletionProjectionError`, `to_wait_completion`, `project_structured_output`, `completion_usage` |
+| `wait_completions/record.rs` | 152 | `WaitCompletionStore` + its `CompletionObserver` impl |
+| `wait_completions/collect.rs` | 113 | `collect_wait_completions` — the three-rung resolution |
+
+Nine of the eleven rows in §1 have executed. **Two remain open, both still in `.flux/todo/`:**
+
+* **`SCOPE_3j`** (`todo/SCOPE_3j.md`, `stage: aug, status: done`) — model-exclusion registry. Its
+  insertion point is now a **literal comment block in the landed code**:
+  `exec/fallback.rs:1721-1725`, inside `classify_attempt`, reading
+  `── SCOPE_3j inserts record_retryable_model_failure HERE ──`. 3b landed the §A types that make it
+  a one-line change, exactly as this index predicted — and it also recorded the one thing 3j must
+  respect: *"the recording is a FILE WRITE … so it cannot live inside this pure function: 3j must
+  carry the decision out on a `LadderStep` payload and let the shell perform it."*
+* **`SCOPE_4`** (`todo/SCOPE_4.md`, `stage: aug, status: done`) — durable completion replay, the sole
+  producer of `archivePath`. Its absence is **declared in the landed code**, not forgotten:
+  `wait_completions/project.rs:44-48` (`WaitCompletion::archive_path`, "Its producer — SCOPE_4's
+  durable completion-replay writer — has not landed yet") and `collect.rs:104-107` (pi's third rung
+  `readCompletionReplay` is stubbed with a named TODO for SCOPE_4). §0.3's "one legitimate
+  dependency" was correct and is still the only one.
+
+Every other `WaitCompletionChild` field has a real producer — see the corrected field map in §2.
+
+### 0.0.2 Landed-status of the nine, with proof
+
+| § 1 row | landed? | proof (file:line, current tree) |
+|---|---|---|
+| **3a** `SingleResult` completeness | ✅ | `exec/run_result.rs`: `turns:46`, `session_file:187`, `output_state:211`, `structured_output_path:225`, `artifact_paths:234` |
+| **3b** `context_overflow` + §A foundation | ✅ | `exec/run_result.rs:97` `context_overflow`; `exec/fallback.rs`: `lower!` macro `:456`, `LowerLiteral` `:490`, `LoweredLine` `:708`, `AttemptNote` `:1038`, `LadderStop` `:1648`, `LadderStep` `:1667`, `classify_attempt` `:1699`, `LadderControl` `:1749` |
+| **3c** mutation evidence + timeout recovery | ✅ | `exec/mutation_evidence/` (6 files: `mod/project/repo/snapshot/summary/types.rs`); `run_result.rs:82` `timeout_recovery: Option<TimeoutRecoverySummary>` |
+| **3d** workflow foundations | ✅ | `workflows/bounded.rs` (160), `workflows/key.rs` (150), `workflows/child_summary.rs`, `workflows/chat_progress.rs`, `workflows/resources.rs`; `RunMode::Workflow` at `background/state.rs:22-27` |
+| **3e** workflow gates | ✅ | `workflows/preflight.rs`, `workflows/checklist.rs`, `workflows/host_command.rs` (1594) |
+| **WORKFLOW_1** scripted workflow | ✅ | `workflows/scripted/` (engine.rs ≥ 2949 LOC, types.rs, …) |
+| **WORKFLOW_2** the vertical slice | ✅ | `extension/tool/routing.rs:523` `route_workflow_mode`, `:700` calls `crate::workflows::scripted::run_workflow_script`; `extension/tool/params.rs:89` documents the tool parameter |
+| **WORKFLOW_3** receipt + settlement | ✅ | `workflows/receipt.rs`, `workflows/settlement.rs`; `WaitCompletion::workflow_receipt_path` populated (`project.rs:38-39`), appended inside `WaitOutcome::new` (`wait.rs:599+`) |
+| **WORKFLOW_4** `wait_completions/` + the two `result_index` exports | ✅ | the four files above; `result_index/mod.rs:110-115` now exports **both** `result_payload_path_for_session_run` (`locate.rs:361`) **and** `fallback_result_payload_path_for_session_run` (`locate.rs:397`) |
+| **WORKFLOW_5** `WaitOutcome` + rewires | ✅ | `wait.rs:531` `WaitVerdict`, `:578` `WaitOutcome`, `:629` `is_error`, `:653` `details`, `:690` `usage`; `auto_drain.rs:79` `wait_all -> WaitOutcome`; `extension/wait_tool.rs:178-191` keeps text + usage + details |
+
+### 0.0.3 The §A type contract HELD — all five gates pass, with two caveats
+
+Run verbatim from the repo root (`C=crates/cyrup-ext-subagents`), 2026-09-14:
+
+* **gate 1** (key grammar declared once) — **one hit, not a violation**:
+  `extension/executor/workflow.rs:995`, a doc comment *quoting* the pattern
+  (`` pattern is `/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/` (`prelude.js:87`) ``) while explaining the
+  engine's own check. The only *code* copy is `workflows/key.rs`. **Amend the gate** to
+  `| grep -v '^\s*//'` or accept a comment-only hit; do not "fix" it by deleting the comment.
+* **gate 2** (no `derive(Deserialize)` on a §A newtype) — **empty. Clean.**
+* **gate 3** — `workflows/key.rs` has exactly **1** hand-written `impl<'de> serde::Deserialize<'de>`;
+  `grep -rn 'deserialize_with' $C/src/workflows/` is **empty**. The AMENDED form of this gate (§A.3's
+  2026-09-06 amendment) is the one that passes; the pre-amendment form would fail the compliant
+  implementation. `workflows/bounded.rs:59` and `:104` carry the same idiom for `Bounded<N>` /
+  `BoundedUtf16<N>`.
+* **gate 4** (no `_ =>` on a §A domain enum) — **empty. Clean.**
+* **gate 5** (no second bounded-string helper) — **four hits, none a violation**:
+  * `workflows/preflight.rs:193` `normalize_display_string` — a *normalizer* that **calls**
+    `BoundedUtf16::<256>::parse` as its length predicate; its doc comment (`:183-187`) argues
+    exactly this and cites "SCOPE_3e §0.6, SCOPE_3 §3 gate 5". Compliant by construction.
+  * `background/watch/observer.rs:119` `bounded_completion_summary` and
+    `extension/executor/foreground_history/record.rs:149` `bounded_tail` (+ its test at `:412`) —
+    **truncating** helpers, i.e. §A.4's *other* family, which §A.4 explicitly says are free
+    functions and NOT `Bounded<N>`.
+  * **Amend the gate** to also exclude `workflows/display_text.rs` and to say that a hit whose body
+    delegates to `Bounded`/`BoundedUtf16` passes. The truncating family landed as
+    `workflows/display_text.rs:153` `truncate_display` (UTF-16 units) and `:175` `truncate_to_bytes`
+    (UTF-8 bytes, reserves room for the ellipsis), plus `:82` `sanitize_display_text` — exactly the
+    split §A.4 prescribed.
+
+`WorkflowKey` is consumed by **24** files today (`workflows/` × 13, `background/` × 5,
+`extension/executor/` × 4, `missions/` × 2, `registration/profiles.rs`) — §A.3's "single
+highest-value type" claim is borne out.
+
+### 0.0.4 Upstream has MOVED since these specs were written
+
+The oracle is `/home/user/cyrup/tmp/pi-subagents` (a read-only clone). **The
+`../../../workspace/pi-subagents/…` links in this file and its siblings do not resolve on this
+machine** — `/home/user/workspace` does not exist; substitute `tmp/pi-subagents`.
+
+| file | LOC in this spec | LOC now |
+|---|---|---|
+| `background/wait-completions.ts` | 213 | 213 (unchanged) |
+| `background/completion-replay.ts` | (SCOPE_4: 287) | 287 (unchanged) |
+| `shared/model-exclusions.ts` | **374** | **385** |
+| `background/subagent-wait.ts` | — | 842 |
+| `background/result-watcher.ts` | — | 795 |
+| `background/result-files.ts` | — | 519 |
+| `workflows/*.ts` (9 files) | **4418** | **4712** — `scripted-workflow.ts` **2284 → 2553**, `workflow-checklist.ts` 436, `workflow-receipt.ts` 384, `workflow-preflight.ts` 297, `workflow-settlement.ts` 249, `host-command.ts` 235, `workflow-resources.ts` 236, `workflow-child-summary.ts` 170, `chat-progress.ts` 152 |
+
+The `KEY_PATTERN` census in §A.3 is likewise low now: `grep -rn` for the grammar finds **17 sites
+across 14 files** upstream, not 11 across 9. §A.3's argument is *strengthened*, not weakened.
+
+### 0.0.5 What a future session should do with this file
+
+1. **Do not re-run this family.** Re-executing any of the nine rows would duplicate landed code and
+   would trip the §A gates it was written to satisfy.
+2. The only live work this index still points at is **`SCOPE_3j`** and **`SCOPE_4`**, both of which
+   have their own augmented task files and their own in-code insertion markers (§0.0.1).
+3. Treat §1's dependency graph as **history**. Its one still-binding rule is the WORKFLOW_2 lesson
+   (§1's inserted block): *a task's DoD MUST name a command a human can run.* That rule outlived the
+   family and applies to `SCOPE_3j`/`SCOPE_4`.
 
 ---
 
@@ -217,6 +338,30 @@ In production `wait_for_subagents` (`background/wait.rs:434-745`) re-reads each 
 run's `status.json` (`terminal_runs_for`, `:349-369`), folds it into bucket counts
 (`summarize_terminal_runs`, `:372-405`), and returns a rendered sentence. Nothing more.
 
+> **CORRECTED 2026-09-14 — the premise is now HISTORY; `wait` DOES read payloads.**
+> `wait.rs` is **2893 lines** (was ~850). Current anchors:
+>
+> | thing | was | **is now** |
+> |---|---|---|
+> | `wait_for_subagents` | `:434` | **`wait.rs:704`** |
+> | `terminal_runs_for` | `:349` | **`:438`** |
+> | `summarize_terminal_runs` | `:372` | **`:461`** |
+> | `WaitParams` / `WaitDeps` | `:200`/`:217` | **`:200` / `:217`** (unchanged) |
+> | `WaitDeps::stop_on_attention` / `fail_on_failed_runs` / `fail_on_attention` | `:217`/`:221`/`:223` | **`:262` / `:266` / `:268`** |
+> | the three builders | `:273`/`:281`/`:289` | **`:362` / `:370` / `:378`** |
+> | the two terminal returns | `:697-703`/`:738-744` | folded into `WaitVerdict::Resolved { failed_runs, attention_runs, reported_as_error }` (**`:556-566`**, `reported_as_error` at `:565`) and returned via `WaitOutcome::new` at **`:1095`** and **`:1149`** |
+>
+> The `grep -n "paths.result"` result still holds *literally* (that spelling appears nowhere), but
+> the conclusion drawn from it does not: WORKFLOW_4/5 landed, and production `wait` now calls
+> **`super::wait_completions::collect_wait_completions(&terminal_runs, &deps.wait_completions,
+> &deps.results_dir)` at `wait.rs:1027-1036`**, whose `Err` becomes
+> `WaitOutcome::plain(error.to_string(), WaitVerdict::CompletionsFailed)` — never a propagated
+> error (`:1034`). The recovery note 3c/WORKFLOW_5 owed is `format_completion_recovery`
+> (**`wait.rs:1190`**), called at **`:1058`**, alongside `format_observed_completions` (**`:1166`**).
+> `WaitDeps` gained **`wait_completions: Arc<WaitCompletionStore>`** at **`wait.rs:251`** — and note
+> its deliberate non-`Option`-ness, argued in its own doc (`:237-250`): an empty store *is* "this
+> process has consumed nothing", unlike `completion_bus` (`:234`) where the two states differ.
+
 ### 0.2 The tree moved. SCOPE_2 has EXECUTED — and its output is UNCOMMITTED
 
 Re-verified 2026-09-06 05:06 against cyrup HEAD **`c10e6482`** ("refactor: decompose the subagents
@@ -247,6 +392,31 @@ pi's `waitResult.isError` + `resultText(waitResult)` — "the shape `wait_for_su
 returns". When WORKFLOW_5 replaces that return with `WaitOutcome`, the consumption seams to update are the
 call at `:115`, the `Err(text)` handling at `:169-170`, and that `:55-56` doc contract.
 
+> **CORRECTED 2026-09-14 — §0.2 is entirely superseded, in both halves.**
+>
+> **(a) The uncommitted-tree warning no longer applies.** There is no `c10e6482` working-tree
+> distinction left to defend: `background/{auto_drain.rs,result_index/,terminal_run_index/,delivery/}`
+> and `src/identity/` are ordinary files on disk on branch `claude/subagents-scope` (cut from `main`
+> at `d53763b`), and `cargo fmt --all --check` / `clippy -D warnings` / `nextest` are all green on
+> it. The *rule* it protected — **no `git` command during exec/qa/aug** — still stands and was
+> honoured by this augment. `/home/user/cyrup/tmp/pi-subagents` (not `../../../workspace/…`) is the
+> oracle on this machine.
+>
+> **(b) The WORKFLOW_5 rewire has LANDED.** `auto_drain.rs` is now **544 lines**, not 372, and the
+> three named seams are all converted:
+>
+> | seam | old | **now** |
+> |---|---|---|
+> | the `DrainWaiter` contract | `Result<String,String>` | **`auto_drain.rs:79`** — `async fn wait_all(&self, timeout_ms: u64) -> WaitOutcome` |
+> | the `:55-56` doc contract | "the shape `wait_for_subagents` already returns" | **`:67-74`** — now argues the opposite: keeping `Result` here "would reintroduce the `Ok`/`Err` flip … and would re-break the timeout, since a window that merely elapsed is NOT an error upstream" |
+> | the call | `:115` | **`:145-158`** (`SubagentDrainWaiter::wait_all`, forwarding a fresh `CancelToken`) |
+> | the `Err(text)` handling | `:169-170` | **`:160-200`** — `drain_outstanding_work`'s doc now enumerates the four error sources, and explicitly excludes `WaitVerdict::WindowElapsed` from them |
+> | the test doubles | — | **`:292-345`** scripted as whole `WaitOutcome`s ("since WORKFLOW_5") |
+>
+> Both mechanisms are **not** left standing: the `Ok`/`Err` flip is gone, replaced by the single
+> evaluation inside `WaitVerdict::Resolved::reported_as_error` (`wait.rs:565`) that
+> `WaitOutcome::is_error` (`:629`) reads.
+
 ### 0.3 The completeness rule
 
 **No field is permitted to be a declared-but-never-populated `Option`.** An earlier revision of this
@@ -271,6 +441,29 @@ specified in full by **SCOPE_4** (`completion-replay.ts`, its SUBTASK1 names the
 record shape and `archivePath` explicitly). WORKFLOW_4 leaves the two named seams for it and nothing
 else.
 
+> **CORRECTED 2026-09-14 — the workflow-runtime gap §0.3 discovered is CLOSED, and the
+> completeness rule HELD.**
+>
+> * The four-way grep that returned **0** now returns **175 matches**. `pi-subagents/src/workflows/`
+>   (9 files, now 4712 LOC) is ported across **18 files** in
+>   `crates/cyrup-ext-subagents/src/workflows/`: `bounded.rs chat_progress.rs checklist.rs
+>   child_summary.rs display_text.rs host_command.rs host_step.rs key.rs lane_metadata.rs mod.rs
+>   permit.rs preflight.rs receipt.rs resources.rs scripted/ settlement.rs stable_json.rs types.rs`.
+> * `RunMode` is **no longer** `Single | Parallel | Chain`: `background/state.rs:22-27` adds
+>   **`Workflow`**, doc'd as "Produced exclusively by the FOREGROUND arm (`route_workflow_mode` in
+>   `extension/tool/routing.rs`)".
+> * **The completeness rule was honoured.** `wait_completions/project.rs:63-67` states it in code:
+>   *"Every field here has a real producer on `crate::exec::SingleResult` … none is a residual
+>   placeholder waiting on a future task. The one exception, `archivePath` …"* — i.e. exactly the one
+>   legitimate dependency this section named, and no other. The two seams WORKFLOW_4 was told to leave
+>   are `project.rs:44-50` (the declared-but-unset `archive_path`, with the wire-shape argument for
+>   declaring it anyway) and `collect.rs:104-107` (the stubbed third rung, `readCompletionReplay`).
+> * `workflowReceiptPath` and `workflowChildren` were correctly re-attributed here to WORKFLOW_3, and
+>   both are now populated: `WaitCompletion::workflow_receipt_path` (`project.rs:38-39`) and
+>   `workflow_children: Option<crate::workflows::WorkflowChildSummary>` (`project.rs:53-54`), whose
+>   corruption is the **one** place the tolerant projector refuses to degrade
+>   (`CompletionProjectionError`, `project.rs:126-137`).
+
 ---
 
 ## 1. The nine tasks
@@ -288,6 +481,14 @@ else.
 | **WORKFLOW_3** | Workflow terminal writers — receipt + settlement (writes both payload keys) | 615 | **WORKFLOW_2** | — |
 | **WORKFLOW_4** | `background/wait_completions/` + the two `result_index` exports | `wait-completions.ts` (213) | 3a, 3b, 3c, WORKFLOW_3 | — |
 | **WORKFLOW_5** | `wait.rs` `WaitOutcome`, collector wiring, `wait_tool`, `auto_drain` **rewire** (§0.2) | `subagent-wait.ts:319-360,674-744` | WORKFLOW_4 | — |
+
+> **STATUS 2026-09-14 — nine of eleven rows have EXECUTED.** See §0.0.2 for the per-row proof.
+> Open: **3j** (insertion point marked in landed code at `exec/fallback.rs:1721-1725`) and
+> **SCOPE_4** (`archivePath`; seams marked at `wait_completions/project.rs:44-48` and
+> `collect.rs:104-107`). Their task files are the only two of the eleven still in `.flux/todo/`;
+> the other nine are no longer on disk anywhere under `.flux/`. Upstream LOC in the table above are
+> stale for two rows: `model-exclusions.ts` is **385** (not 374) and `workflows/*` is **4712** (not
+> 4418), with `scripted-workflow.ts` at **2553** (not 2284).
 
 **The §A column is a hard ordering constraint**, not advice. A task may not re-declare a type
 another task owns, and may not open-code a grammar or a bound that §A already names. **3d moved
@@ -328,6 +529,30 @@ first is what makes 3j a one-line change instead of a hoist.
 > If it cannot, the task is a library fragment and belongs folded into the slice that consumes it.
 > `missions/workflow_state.rs` and `missions/goal_driver.rs` both already self-document as having no
 > caller — the same defect, and worth an audit before more porting.
+>
+> #### ✅ RESOLVED 2026-09-14 — WORKFLOW_2 landed, and so did the audit it asked for
+>
+> * **The zero-caller grep is dead.** `grep -rn 'run_workflow_script' crates/ --include=*.rs | grep
+>   -v 'workflows/scripted/'` now returns **seven** hits, and the load-bearing one is a real call:
+>   `extension/tool/routing.rs:700` → `crate::workflows::scripted::run_workflow_script(…)`, reached
+>   from `route_workflow_mode` (**`routing.rs:523`**). The tool parameter is documented at
+>   `extension/tool/params.rs:89`; `workflow_child_stops.rs:537` drives it from a test.
+> * **`RunMode::Workflow` has a producer** — `background/state.rs:22-27` names `route_workflow_mode`
+>   as the *exclusive* one, and states that `background/runner_main/` never mints it.
+> * **The audit's two named files now have callers too**, so that trailing claim is stale:
+>   `missions::MissionWorkflowStateStore::create` is called at **`extension/tool/routing.rs:571`**,
+>   and `missions::collect_goal_continuation_notices` at
+>   **`extension/executor/notices.rs:523`**.
+> * Since WORKFLOW_2, the surface kept growing on the same seam — **WORKFLOW_17-21** landed the
+>   `workflowScript` runtime (`runs.status`, the child-stop registry at
+>   `extension/executor/workflow_child_stops.rs`, `runs.host`, workflow `state.get`/`state.set`, live
+>   emit forwarding), and **9aeba76** rewrote the process-group probe
+>   (`workflows/host_command.rs:473-560` — `process_group_is_provably_empty` / one-syscall
+>   `ESRCH` fast path, then `process_group_is_populated` polled at `VERIFY_INTERVAL`) and **boxed**
+>   the engine error: `run_workflow_script` now returns
+>   `Result<WorkflowScriptResult, Box<WorkflowScriptError>>` (`workflows/scripted/engine.rs:2663`,
+>   with the size rationale at `:2655-2660`). Any future task quoting an engine signature must use
+>   the boxed form.
 
 **3j was found while augmenting 3b**, not during the original split:
 `pi-subagents/src/runs/shared/model-exclusions.ts` (374 LOC) is unscheduled in every SCOPE file and
@@ -354,6 +579,24 @@ already known to be down. Same class of omission as the workflow runtime in §0.
 | payload struct | — | `ResultFile` (`background/records.rs:373-419`) |
 | child struct | `SingleResult` (`shared/types.ts:1228-1300`) | `exec/run_result.rs:23-196`, `#[serde(rename_all = "camelCase")]` |
 
+### §2 RE-VERIFIED 2026-09-14 — every "MISSING"/"absent" row is now LANDED
+
+| what | cyrup @ `c10e6482` (old) | **cyrup NOW** |
+|---|---|---|
+| the module | **absent** | `background/wait_completions/` — 4 files, 675 LOC (§0.0.1) |
+| call site | `wait.rs:642-656` | **`wait.rs:1027-1036`**, inside `resolve`'s terminal block; `Err` → `WaitVerdict::CompletionsFailed` at `:1034` |
+| the `result()` builder | `wait.rs` returns `Result<String,String>`; `wait_tool.rs:159-167` discards all but text | **`WaitOutcome`** (`wait.rs:578-696`): `new` `:599`, `plain` `:620`, `is_error` `:629`, `details` `:653`, `usage` `:690`. `extension/wait_tool.rs:178-191` now keeps **text + usage + details** |
+| usage roll-up | `ToolResult::usage`; fold precedent `registration/cost.rs:118-124` | `completion_usage` (`wait_completions/project.rs`) returns `Option<cyrup_core::Usage>` — **no conversion needed**, per `wait_tool.rs:180-183`. `CompletionUsage` (`project.rs:105-122`) is the six-field pi-shaped wire type, deliberately **not** `cyrup_core::Usage` (which has no `turns`). `ToolResult::usage` is `cyrup-core/src/tool.rs:32`; `CostUsage::add_usage` is `registration/cost.rs:118` |
+| recovery note | absent — 3c producer, WORKFLOW_5 consumer | **`wait.rs:1190`** `format_completion_recovery`, called `:1058`; sibling `format_observed_completions` `:1166` |
+| index lookup | **LANDED** — `locate.rs:187-203`, exported `mod.rs:100-103` | **`locate.rs:361`**, exported `result_index/mod.rs:110-115` |
+| EACCES fallback | **MISSING** — body exists as `pending_result_location` (`locate.rs:96-112`, `pub(crate)`) | **LANDED and `pub`** — `fallback_result_payload_path_for_session_run` (**`locate.rs:397-405`**), exported at `result_index/mod.rs:112`; still delegates to `pending_result_location` (**`locate.rs:265`**, `pub(crate)`) |
+| errno predicate | `result_index/errno.rs:44-48` — `pub(crate)` inside a **private** `mod errno` | **`errno.rs:47-50`**, and `mod errno` is now reachable from `wait_completions` (`collect.rs:7` does `use crate::background::result_index::{self, errno};`). `is_absent` is the sibling used at `collect.rs:97` |
+| public path | `ResultFileName::for_run` + `resolve_in` | **`identity/result_name.rs:50`** / **`:96`** (struct at `:40`) — unchanged, and `collect.rs:50-51` is the caller |
+| the store | **MISSING** — `watch/install.rs:151-159` records nothing | **`WaitCompletionStore`** (`wait_completions/record.rs:32-35`), a `Mutex<HashMap<RunId, RecordedCompletion>>` with poison recovery; registered **FIRST** in the watcher's `CompositeCompletionObserver` at **`extension/executor/notices.rs:445-464`** (`self.wait_completions()` at `:453`, ahead of `MissionSyncCompletionObserver` `:459` and the `CompletionBus` `:463`) — the ordering argument is in that comment and in `record.rs`'s own doc |
+| TTL | `watch::DEDUP_TTL` (`results_watcher.rs:39`, 10 min) — reuse | **reused**: `results_watcher.rs:40`, imported by `record.rs:8-10` |
+| payload struct | `ResultFile` (`records.rs:373-419`) | **`records.rs:483`** — but note `to_wait_completion` deliberately takes `&serde_json::Value`, **not** `ResultFile`, because `ResultFile` is a *validating* type and would turn a best-effort projection into a hard read failure (`project.rs:7-15`) |
+| child struct | `exec/run_result.rs:23-196` | **`exec/run_result.rs:25`** (320 LOC total), still `#[serde(rename_all = "camelCase")]` at `:24` |
+
 ### The field map — which task supplies each
 
 | `WaitCompletionChild` field | supplied by |
@@ -377,6 +620,24 @@ already known to be down. Same class of omission as the workflow runtime in §0.
 `terminal_state == Complete && results.iter().all(|r| r.exit_code == 0)`. The derived value is
 identical to what upstream stores; adding a redundant field would create two sources of truth for
 one fact.
+
+> **FIELD MAP RE-VERIFIED 2026-09-14 — every row has a producer except `archivePath`.**
+> `WaitCompletionChild` is `wait_completions/project.rs:69-103`; `WaitCompletion` is `:30-56` (struct at `:32`).
+>
+> | field | producer as landed |
+> |---|---|
+> | `agent` `usage` `model` `error` `structuredOutput` | `SingleResult` (`run_result.rs:26/29/47/160/51`) |
+> | `success` | **derived, as specified** — `Option<bool>` from the payload's `exitCode`, doc'd at `project.rs:80-84`; `Option` rather than `bool` so a payload with no `exitCode` **omits** the key instead of claiming failure. The run-level predicate it mirrors moved to **`runner_main/finish.rs:338`** (and `:28`), not `:246` |
+> | `runId` (child) | `project.rs:86-88` — tries cyrup's `childRunId` **then** pi's `runId` |
+> | `sessionFile` `outputState` `structuredOutputPath` `artifactPaths` | 3a: `run_result.rs:187 / :211 / :225 / :234` |
+> | `contextOverflow` | 3b: `run_result.rs:97`; on the wire it is `bool` with `skip_serializing_if = "crate::exec::is_false"` (`project.rs:97-99`) — pi writes the key only when `true`. Its value comes from `outcome.stop == LadderStop::ContextOverflow` (**`exec/mod.rs:731-734`**) |
+> | `timeoutRecovery` | 3c: `run_result.rs:82` (`TimeoutRecoverySummary`), projected to `TimeoutRecoveryProjection` (`project.rs:102`) |
+> | `workflowChildren` / `workflowReceiptPath` (run level) | WORKFLOW_3: `project.rs:53-54` / `:38-39` |
+> | `archivePath` (run **and** child level) | **SCOPE_4, still open** — declared and unset at `project.rs:44-50`; see §0.0.1 |
+>
+> `STRUCTURED_OUTPUT_INLINE_LIMIT_BYTES = 4 * 1024` (pi `wait-completions.ts:45`) is
+> `project.rs:22`, and `WaitCompletion` carries **no output text** by design (`project.rs:26-29`,
+> pi's own note at `wait-completions.ts:54-59`).
 
 ---
 
@@ -430,6 +691,57 @@ offered and declined (§A.1).
 
 Baseline at `cf26010`: 4794 passed / 0 failed / 8 ignored. Clippy exit 0.
 
+> **GATES RE-VERIFIED 2026-09-14 — new baseline, and two gate commands need amending.**
+>
+> **Current green baseline** on `claude/subagents-scope` (cut from `main` at `d53763b`), verified
+> on this exact commit — there are **no** pre-existing failures to attribute anything to:
+>
+> ```bash
+> cargo fmt --all -- --check                              # clean (repo-wide no-op; format only
+>                                                         # what you touch: cargo fmt -p cyrup-ext-subagents)
+> cargo clippy --workspace --all-targets -- -D warnings   # clean
+> cargo nextest run --workspace                           # 9913 run, 9913 passed, 9 skipped
+> ```
+>
+> `4794 passed / 8 ignored` at `cf26010` is superseded by **9913 passed / 9 skipped**. Toolchain is
+> rustc 1.98.1 + cargo-nextest 0.9.144, `CARGO_INCREMENTAL=0`, already installed — install nothing.
+> The `--features test-fixtures` form above is still valid (the feature exists,
+> `cyrup-ext-subagents/Cargo.toml:21`, gating the `cyrup-subagent-fixture` bin via
+> `required-features` at `:168`/`:178`), and §3's argument for `--workspace` over
+> `cargo check -p cyrup-ext-subagents` still holds — `SingleResult`, `RunMode`, `WaitOutcome` and
+> `wait_for_subagents` are all `pub` with cross-crate callers.
+>
+> **Gate 1 and gate 5 now produce non-empty output on a COMPLIANT tree.** Both hits are explained in
+> §0.0.3; use these amended forms so a future session does not "fix" compliant code:
+>
+> ```bash
+> C=crates/cyrup-ext-subagents
+>
+> # 1 (amended). Exclude comment lines — the grammar is quoted in prose at
+> #   extension/executor/workflow.rs:995 while explaining pi's own check.
+> grep -rn 'A-Za-z0-9._-' $C/src --include=*.rs \
+>   | grep -v 'workflows/key.rs' | grep -v ':[0-9]*: *//'                      # MUST be empty
+>
+> # 5 (amended). The TRUNCATING family is not this type (§A.4) and lives in display_text.rs;
+> #   a normalizer that DELEGATES to Bounded/BoundedUtf16 is compliant, not a tenth copy.
+> grep -rn 'fn bounded\|fn bounded_text\|fn normalize_display' $C/src \
+>   | grep -v 'workflows/bounded.rs' | grep -v 'workflows/display_text.rs'
+> #   Current expected hits, all compliant — verify each still delegates rather than re-implements:
+> #     workflows/preflight.rs:193          normalize_display_string  -> BoundedUtf16::<256>::parse
+> #     background/watch/observer.rs:119    bounded_completion_summary (truncating family)
+> #     extension/executor/foreground_history/record.rs:149  bounded_tail (truncating family)
+> ```
+>
+> Gates **2, 3 and 4 are empty/passing as written** — gate 3 in its AMENDED (§A.3, 2026-09-06) form
+> only; the pre-amendment form counted `deserialize_with` attributes and would **fail** the correct
+> implementation. `workflows/key.rs` carries exactly one hand-written
+> `impl<'de> serde::Deserialize<'de>`; `workflows/bounded.rs:59`/`:104` carry the same idiom for
+> `Bounded<N>`/`BoundedUtf16<N>`.
+>
+> **Multi-session caution still applies** (`pgrep -a cargo`, `df -h /`, `df -h /tmp` before any
+> gate), and the flux rule that produced §0.2's warning is unchanged: **no `git` command at all**
+> during aug/exec/qa.
+
 ---
 
 ## 4. Shared research notes
@@ -468,6 +780,53 @@ Baseline at `cf26010`: 4794 passed / 0 failed / 8 ignored. Clippy exit 0.
   and the `#[cfg(test)]` fixture at `:836-840`) — §0.1's premise still holds. SUBA-060
   `resume_guidance` + `attention_note` landed with SCOPE_2 (`wait.rs:655-668`, interpolated in the
   two text builders at `:691-694`/`:735-737`); 3c/WORKFLOW_5's recovery note joins them at those builders.
+
+### §4 RE-VERIFIED 2026-09-14 — corrected anchors
+
+Every bullet above dates from the 2026-09-06 05:06 sweep and is superseded where it names a line.
+
+* **Oracle path.** `/home/user/cyrup/tmp/pi-subagents` — **not** `../../../workspace/pi-subagents`,
+  which does not exist on this machine. Every `[…](../../../workspace/…)` link in this file and in
+  `SCOPE_3j.md` / `SCOPE_4.md` is dead; read the corresponding file under `tmp/pi-subagents/src/`.
+  Upstream LOC drift is tabulated in §0.0.4.
+* **`result_index::result_payload_path_for_session_run`** is `locate.rs:361-378` (not `:187-203`);
+  it still consults the index first and falls through to `pending_result_location`
+  (`locate.rs:265`) at `:373`. `fallback_result_payload_path_for_session_run` is
+  `locate.rs:397-405`, whose doc (`:382-396`) states it is the *recovery* path — addressed directly
+  rather than through an unreadable index directory. `owned_payload_path` is `:174`,
+  `owned_candidates` `:253`, `payload_run_id` `:310`.
+* **`background/child_identity.rs`'s gap is closed.** Its module doc now reads
+  *"`StepStatus::workflow_key` and `StepStatus::run_id` (SCOPE_3d) are what populate the first two
+  rungs"* (`child_identity.rs:14-18`). What remains genuinely unrepresentable is only the
+  `DynamicGroup` splice residual (SUBA-093), recorded there.
+* **Clock/error helpers unchanged**: `crate::time::now_epoch_millis()` (`time.rs:18`),
+  `epoch_millis(SystemTime)` (`:26`), `SubagentError::Spawn(#[from] std::io::Error)`
+  (`error.rs:205-206`) — and `collect.rs` is the live example of wrapping into `Spawn`, including
+  `io::Error::new(InvalidData, …)` for a JSON/projection fault (`collect.rs:83-95`).
+* **The observer seam.** `background/watch/install.rs` takes
+  `Option<Arc<dyn CompletionObserver>>` (`:70-79`, `:210`, `:305`) and runs the observer band
+  **before** the unlink, retiring the cross-session obligation only once every observer ran cleanly
+  (`:325-334`, pi `result-watcher.ts:408,425,428`). The `CompositeCompletionObserver` that fans it
+  out to three listeners is built at `extension/executor/notices.rs:445-464`.
+* **The three-rung resolution as landed** (`collect.rs:37-113`): (1) `WaitCompletionStore::get`;
+  (2) session index, EACCES-recovered once via the fallback builder, else the public path;
+  (3) public path alone for an unattributed run. A late-arriving record is re-checked after an
+  `is_absent` read (`collect.rs:97-103`) — a race the original spec did not name. **Read-only by
+  contract**: nothing here mints or touches a `ConsumablePayload`, so "a wait must not be able to
+  destroy what it reads" (`collect.rs:16-19`).
+* **§A types, as landed**: `LowerLiteral` `exec/fallback.rs:490` (+ the compile-time-checked
+  `lower!` macro `:456`), `LoweredLine<'a>` `:708`, `AttemptNote` `:1038`, `LadderStop` `:1648`
+  (`pub(crate)`), `LadderStep` `:1667`, plus an unforeseen but contract-compliant sibling
+  `LadderControl` `:1749` ("exists so the loop has exactly ONE settle site"). `classify_attempt`
+  `:1699` is the pure precedence function §A.1 demanded, with the seven-step order in its doc.
+  §A.2's CORRECTED note held: there is no `SingleResult::terminal_reason()`, and
+  `resolve_subagent_result_status` (`tui/intercom.rs:286`, over `SubagentResultStatus` `:127`)
+  remains the single run-status resolver, pinned by
+  `resolve_subagent_result_status_reproduces_pis_branch_order` (`tui/intercom.rs:1190`).
+* **`Bounded`/`WorkflowKey` reach**: `workflows/bounded.rs` (160 LOC) is consumed by
+  `preflight.rs`, `types.rs`, `lane_metadata.rs`, `receipt.rs`, `child_summary.rs`;
+  `workflows/key.rs` (150 LOC) by 24 files across `workflows/`, `background/`,
+  `extension/executor/`, `missions/` and `registration/profiles.rs`.
 
 ---
 

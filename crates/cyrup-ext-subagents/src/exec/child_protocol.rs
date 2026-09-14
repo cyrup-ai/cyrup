@@ -185,6 +185,52 @@ impl Default for BoundedByteTail {
     }
 }
 
+/// The `{ text, truncated }` pair pi's `utf8Tail` returns (`shared/utf8.ts:7`).
+///
+/// A named pair rather than a tuple: the two fields are a `String` and a `bool`, and a tuple
+/// destructure at a call site has no compiler-checked order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundedText {
+    /// The retained tail.
+    pub text: String,
+    /// Whether anything was cut from the FRONT of the input.
+    pub truncated: bool,
+}
+
+/// pi `utf8Tail` (`shared/utf8.ts:7-11`) — the LAST `max_bytes` of `value`, trimmed to a UTF-8
+/// boundary, with whether anything was cut.
+///
+/// Implemented over [`BoundedByteTail`] rather than as a second boundary walk: that type is
+/// already this crate's port of upstream's `trimToUtf8Boundary` (`child-protocol.ts:370-375`), and
+/// a second copy of a boundary walk is exactly the duplication a shared primitive exists to
+/// prevent. The streaming type keeps a tail across many pushes; this is the same thing with one.
+///
+/// `truncated` is decided on the INPUT's byte length, before any trimming — `value.len()` on a
+/// `&str` IS its UTF-8 byte length, so this is exactly upstream's
+/// `Buffer.from(value, "utf-8").length <= maxBytes` (`utf8.ts:8`). A value at exactly `max_bytes`
+/// is NOT truncated, and the boundary trim that follows may drop a further 1-3 bytes without
+/// changing that answer.
+///
+/// One divergence, stated rather than left silent: `max_bytes == 0` yields a 1-byte tail where
+/// upstream yields `""`, because [`BoundedByteTail::new`] clamps to a positive integer
+/// (`child_protocol.rs`'s `max_bytes.max(1)`, mirroring upstream's own precondition). No caller
+/// passes 0 — the only one in this crate is `ARCHIVE_TEXT_LIMIT_BYTES` (64 KiB).
+#[must_use]
+pub fn utf8_tail(value: &str, max_bytes: usize) -> BoundedText {
+    if value.len() <= max_bytes {
+        return BoundedText {
+            text: value.to_string(),
+            truncated: false,
+        };
+    }
+    let mut tail = BoundedByteTail::new(max_bytes);
+    tail.push(value.as_bytes());
+    BoundedText {
+        text: tail.text(),
+        truncated: true,
+    }
+}
+
 // ------------------------------------------------------------------------------------------------
 // projectChildLifecycle (child-protocol.ts:394-401)
 // ------------------------------------------------------------------------------------------------

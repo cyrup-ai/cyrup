@@ -227,7 +227,13 @@ fn match_prefixed_token(bytes: &[u8], start: usize) -> Option<usize> {
 /// into the arbiter's prompt AND into the on-disk audit log. This walks the string the way the
 /// regex does: at every `\b`, try the `Bearer` alternation and then the prefixed-token
 /// alternation, both ASCII-case-insensitively.
-fn redact_secret_values(value: &str) -> String {
+/// `pub(crate)` for [`crate::exec::model_exclusions::sanitize_model_exclusion_diagnostic`], which is
+/// the port of upstream's `sanitizeModelExclusionDiagnostic` and calls the SAME `redactSecretValues`
+/// this is (`model-fallback.ts:301`). Widening beats a second redactor: this one's behaviour —
+/// including the case-insensitivity that is a security property, not a formatting nicety — is
+/// pinned by tests in this module, and a second implementation would be a second thing to get
+/// wrong on a path that reaches both a log and the operator's terminal.
+pub(crate) fn redact_secret_values(value: &str) -> String {
     let bytes = value.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut index = 0usize;

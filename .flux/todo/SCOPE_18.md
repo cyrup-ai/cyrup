@@ -1,7 +1,7 @@
 ---
-stage: aug
-status: done
-updated: 2026-09-13 09:52
+stage: qa
+status: completed
+updated: 2026-09-14 06:00
 ---
 
 # SCOPE_18 — the foreground child steer handle (`ForegroundChildControl.steer`)
@@ -28,7 +28,412 @@ definition anywhere in the crate).
 
 ---
 
+## §0.0 — ⚠⚠ RE-AUGMENT 2026-09-14 — **MOST OF THIS TASK HAS ALREADY LANDED**, in a narrower shape
+
+> Verified against the live tree at `/home/user/cyrup`, branch `claude/subagents-scope` (cut from
+> `main` @ `d53763b`), read file by file. **Nothing below removes a requirement.** Where the tree
+> already satisfies a requirement the citation is corrected and the section is marked ✅; where the
+> tree does something *different* from what a section prescribes, BOTH are recorded side by side and
+> the divergence is called out; where a requirement is genuinely still open it is marked ❌ and is
+> the real remaining work.
+
+### 0.0.1 Environment corrections that apply to EVERY citation in this file
+
+| the file says | the truth here |
+|---|---|
+| `/home/d0m17bw/workspace/cyrup` | **`/home/user/cyrup`**. Every cyrup path below is relative to `crates/cyrup-ext-subagents/src/`. |
+| `/home/d0m17bw/workspace/pi-subagents` @ `57278d82` | **ABSENT from this machine.** There is no pi checkout anywhere. **Every `pi …:NNN` citation in this document is UNVERIFIED by this pass** — treat pi line numbers as indicative, not as addresses. The pi *semantics* quoted in-file are preserved verbatim and are still the contract. |
+| `[WORKFLOW_6](WORKFLOW_6.md)`, `WORKFLOW_7.md`, `WORKFLOW_8.md`, `WORKFLOW_12.md`, `WORKFLOW_13.md` | **None of these files exist anywhere under `.flux/`** (`todo/`, `done/`, `backlog/`, `review/`, `research/`). Every such link in this document is dangling. Their **code** landed; their task files did not travel to this repo. `.flux/todo/` holds `WORKFLOW_17`–`WORKFLOW_21` only. |
+| `cyrup @ f8bec9ee` | Superseded. `main` has moved a long way: WORKFLOW_17–21 landed (the whole `workflowScript` runtime surface — live `runs.status`, the child-stop registry, `runs.host`, workflow `state.get/set`, live emit forwarding), plus `9aeba76` (process-group probe rewrite in `workflows/host_command.rs`, boxed `WorkflowScriptError`). **Effectively every cyrup line number in §1–§8 has shifted.** Corrected numbers are tabulated below. |
+
+**The tree is GREEN on this commit** (`cargo fmt --all -- --check` clean, `cargo clippy --workspace
+--all-targets -- -D warnings` clean, `cargo nextest run --workspace` 9913/9913). Anything that goes
+red is the implementor's.
+
+### 0.0.2 The headline: `WORKFLOW_7` **HAS** landed, and a task the code calls **`WORKFLOW_14` — which IS this objective — has landed too**
+
+§0's dependency note (*"WORKFLOW_7 — **NOT LANDED**; `extension/executor/workflow_steering.rs` does
+not exist and `control_is_live_in_workflow` has no definition anywhere in the crate"*) is **STALE**.
+
+* `extension/executor/workflow_steering.rs` **exists**, 773 lines: `control_is_live_in_workflow`
+  (`:84-95`), `active_workflow_error` (`:109-149`), `resolve_workflow_foreground_steering_target`
+  (`:157-245`), `steer_workflow_foreground` (`:253-337`), plus its own test module from `:340`.
+* `WORKFLOW_13` landed: a workflow owns a **real run directory**, and that is where the landed design
+  roots the steer control tree.
+* The in-tree docs attribute the delivery work to **`WORKFLOW_14`** by name
+  (`workflow_steering.rs:14`, `foreground_control.rs:160`, `foreground.rs:142/160/900/1015`,
+  `requests.rs:188`, `foreground_actions/steer.rs:275`). That is this task's objective, shipped.
+
+**⚠ But it shipped NARROWED, and the narrowing changes what this document's OBJECTIVE means:**
+
+> The landed design gives a steer handle to a **foreground WORKFLOW child only**, rooted in the
+> **workflow's own run directory** (WORKFLOW_13). It does **not** give one to a **plain (non-workflow)
+> foreground SINGLE run**, and it does **not** build the `fg-<run_id>/` scratch control tree §1
+> prescribes. A plain foreground run still receives `None` for all three `RunOptions` steer paths and
+> is still unsteerable.
+
+That is a deliberate, documented choice (`foreground.rs:897-904`: *"G90 … still holds for a
+foreground SINGLE run … WORKFLOW_14 narrowed it … `None` here now means 'not a workflow child', not
+'impossible'"*), and it is consistent with §0.6's scope boundary — §0.6 already says the only routes
+to `child.steer` in pi require a workflow. **So §1.1/§1.3/§1.4/§2's "unconditional `Some`" are now a
+DECISION, not a defect: do the plain-run half only if it is still wanted, and say so explicitly.
+Do not assume it, and do not silently drop it either.**
+
+### 0.0.3 Per-section verdict
+
+| § | requirement | verdict | where it actually is |
+|---|---|---|---|
+| 1.1 | `foreground_run_control_dir` in `background/artifact_roots.rs` | ❌ **NOT BUILT** — zero hits workspace-wide. Not needed by the landed (workflow-rooted) design. | `attempt_scratch_dir` is `artifact_roots.rs:325` (`_in` at `:333`); `cwd_key` at `:246`. Spec's `:325-337` / `:246` ✅ still correct. |
+| 1.2 | `request_direct_steer` in `background/control.rs` | ✅ **BUILT, different name & home** — `ForegroundChildSteerHandle::deliver`, `extension/executor/foreground_control.rs:97-127`. §0.4's dead-drop defect is correctly avoided and explicitly documented. | see 0.0.4 |
+| 1.3 | thread the path through `RunChannels` / `ForegroundRunOptionsInput` | ✅ **BUILT, different seam** — the *handle* rides `ForegroundRunRequest::workflow_steer`, not a path on `RunChannels`. | see 0.0.5 |
+| 1.4 | teardown of `fg-<run_id>/` in `settle_foreground_run` | ❌ **NOT BUILT**, and **not applicable** under the landed design (no per-run leaf exists; the tree is inside the workflow's own run dir). | `settle_foreground_run` is now `foreground.rs:1058-1095`. |
+| 2 | populate the three `RunOptions` steer fields; kill the circular comment | ✅ **BUILT** (conditionally, not unconditionally) — `foreground.rs:913-920`; circular comment replaced at `:897-911`. | see 0.0.6 |
+| 2 | correct the **three stale doc claims** | ❌ **ALL THREE STILL STALE.** Real, in-scope, outstanding work. | see 0.0.6 |
+| 3 | `ForegroundChildSteer` type + `ForegroundChildEntry::steer` + fill + propagate | ⚠ **HALF BUILT.** Type + entry field + `register_foreground_controls` fill + `begin_foreground_child` propagation all ✅. `ForegroundControlEntry::steer` + the `sync_current_child` assignment ❌. | see 0.0.7 |
+| 4 | real delivery replacing the refusal | ✅ **BUILT** — `workflow_steering.rs:253-337`. `await_steer_ack` is already `pub(crate)` and was **not** copied. | see 0.0.8 |
+| 4.2 | the no-ack word is **`queued`**, never `pending` | ⚠ **DIVERGENT** — the tree ships **`pending`** on both surfaces. | see 0.0.8 |
+| 4.3 | `CHILD_SESSION_NOT_RUNNING_YET` via the capability record | ❌ **NOT BUILT AT ALL.** The constant does not exist; `read_steer_capability` has **zero production callers**. §6 invariant 7 is unmet. | see 0.0.9 |
+| 5 | `WorkflowRunHost::supports_steer` + `steer` | ✅ **BUILT** — `extension/executor/workflow.rs:827-829` and `:835-936`. | see 0.0.10 |
+| 5.1 | select by `(parent_workflow_run_id, workflow_key, active_children non-empty)` | ⚠ **DIVERGENT** — the host resolves the index from its **own `launched` map**, never scanning `foreground_controls`. Stronger on lane identity, weaker on liveness. | see 0.0.10 |
+| 5.2 | **poll** to the ack deadline | ❌ **NOT BUILT.** No loop, no 10 ms sleep, `cancel` is `_cancel`. | see 0.0.10 |
+| 5.3 | four-state receipt incl. `Missed`, via a `workflow_steer_receipt` port | ❌ **NOT BUILT.** `WorkflowSteerState::Missed` is produced **nowhere** in the crate; the mapping is inline, not a named helper. | see 0.0.10 |
+| 0.6 / 6.10 | plain foreground run still refused | ✅ **HOLDS** — `text.rs:116` fired at `foreground_actions/steer.rs:136`, *after* the workflow route at `:115-125`. | |
+| 0.1 | *"Add a one-line note to WORKFLOW_8"* | ❌ **IMPOSSIBLE HERE** — no `WORKFLOW_8.md` exists under `.flux/`. The naming trap it warns of is real and now worse: `extension/executor/foreground_actions/steer.rs` hosts **both** `control_steer` (`:74`) **and** `await_steer_ack` (`:265`). |
+
+### 0.0.4 §1.2 — what shipped instead of `request_direct_steer`
+
+**File:** `extension/executor/foreground_control.rs` (the handle lives beside the entry it hangs off,
+not in `background/control.rs`). `#[derive(Clone, Debug)]`, and **`pub`, not `pub(crate)`** — it is a
+field type of the `pub` `ForegroundRunRequest`, re-exported at `extension/mod.rs:79`.
+
+```rust
+// foreground_control.rs:56-74 — THREE fields, not §3's five.
+pub struct ForegroundChildSteerHandle {
+    pub inbox_dir: std::path::PathBuf,   // carried, never re-derived (the whole point)
+    pub run_dir:   std::path::PathBuf,   // the WORKFLOW's run dir; the ack half derives off it
+    pub index:     usize,                // flat index WITHIN THE WORKFLOW
+}
+
+// foreground_control.rs:97-127 — the exact function §1.2 specifies, minus the `PathBuf` return.
+pub(crate) async fn deliver(
+    &self,
+    message: &str,
+    mode: Option<crate::background::control::SteerDeliveryMode>,
+    source: &str,                                   // NOT `Option<&str>`
+) -> Result<String, crate::error::SubagentError>    // NOT `(PathBuf, String)`
+```
+
+Every §1.2 requirement is met by it: blank-message `SubagentError::Management("steer message must not
+be empty.")` (`:105-109`); `id: control::next_steer_request_id()` (`:113`) — **the private minter is
+still `pub(crate)` and was NOT widened** (`background/control.rs:1241`; §1.2's "do not widen" ✅);
+`mode: mode.filter(|m| *m != SteerDeliveryMode::Steer)` (`:120`); `target_index: Some(self.index)`
+(`:121`); and the write goes to **`self.inbox_dir`** (`:125`), i.e. the carried
+`step_steer_inbox_dir` value — **never `steer_requests_dir`**. §6 invariant 4 ✅. The doc at `:40-52`
+records that an earlier revision *did* commit exactly §0.4's dead-drop bug, which is independent
+confirmation that §0.4 was right.
+
+**⚠ Note the two-namespace hazard the spec did not name:** `handle.index` is the child's flat index
+**within the workflow**; the key into `ForegroundControlEntry::active_children` is its index **within
+its own foreground run** (always `0`). The landed code documents this at `workflow_steering.rs:285-289`
+and `foreground_control.rs:66-73`. §1.1's "index is always 0" reasoning applies only to the latter.
+
+**Corrected `background/control.rs` citations — §8's whole block is shifted:**
+
+| symbol | §8 says | **now** |
+|---|---|---|
+| `control_inbox_dir` | `:618` | `:618` ✅ |
+| `SteerRequest` / the id-ordering contract | `:1128-1138` / `:1140-1149` | `struct` at `:1132` |
+| `steer_requests_dir` | `:1165` | **`:1186`** |
+| `step_steer_inbox_dir` | `:1174` | **`:1195`** |
+| `write_steer_request_to_dir` | `:1196` | **`:1217`** |
+| `next_steer_request_id` (**still private/`pub(crate)`**) | `:1217` | **`:1241`** |
+| `request_async_steer_with_mode` | `:1258` | **`:1279`** |
+| `enqueue_step_steer` | `:1293` | **`:1314`** |
+| `consume_steer_requests` | `:1354` | **`:1375`** (`consume_steer_requests_from_dir` at `:1334`) |
+| `SteerDeliveryMode` | `:1376` | **`:1397`** (`as_str` `:1427`, `next` `:1438`) |
+| `MAX_STEER_QUEUE_SIZE` | `:1430` | **`:1451`** |
+| `SteerAckState` | `:1448-1458` | **`:1469-1480`**, `as_str` → `"delivered"`/`"queued"`/`"failed"` at **`:1485-1491`** |
+| `SteerAck` | `:1476` | **`:1497`** |
+| `SteerCapability` | `:1506` | **`:1527`** |
+| `steer_capability_path` | `:1530` | **`:1551`** |
+| **`steer_acks_dir` (PLURAL)** | `:1536` | **`:1557`** — §0.5 correction #2 **STANDS**: there is still no `steer_ack_dir` function; the singular name is only the `RunOptions` field (`exec/agent_config.rs:611`) and the env var. |
+| `read_steer_capability` | `:1671` | **`:1692`** |
+| `take_steer_acks` | `:1706` | **`:1727`** |
+
+### 0.0.5 §1.3 — the seam that was actually used
+
+`RunChannels` (`foreground.rs:75-96`) did **not** gain a `fg_control_dir`. The handle itself rides the
+request instead, which satisfies §1.3's real goal (**one value, both sides**) more directly:
+
+* `ForegroundRunRequest::workflow_steer: Option<ForegroundChildSteerHandle>` — `extension/executor/requests.rs:205`, doc at `:188-204` (*"ONE field feeds BOTH halves … Deriving both from one value is what makes the two sides incapable of disagreeing about the index."*).
+* Destructured in `run_foreground_impl` at `foreground.rs:302`.
+* → `ForegroundRunOptionsInput::workflow_steer: Option<&'a ForegroundChildSteerHandle>` (`foreground.rs:142-147`), passed at `:342`.
+* → `ForegroundControlIdentity::workflow_steer` (`foreground.rs:160-164`), passed at `:355` with the comment *"The SAME handle the run options above were derived from — one value, both sides."*
+* Minted in exactly one place: `WorkflowRunHost::child_steer_handle(index)` — `extension/executor/workflow.rs:270-276` — called by `launch` (`:696`, `workflow_steer: Some(self.child_steer_handle(index))`) and by `steer` (`:882`). Its doc names this as the single-construction-point invariant.
+
+**Corrected `foreground.rs` structural citations:**
+
+| item | §8 says | **now** |
+|---|---|---|
+| `RunChannels` | (implied `:612-710`) | `:75-96` |
+| `ForegroundRunOptionsInput` | `:96-140` / `:103-140` | **`:105-151`** (`workflow_steer` at `:142-147`) |
+| `ForegroundControlIdentity` | — | **`:153-166`** (`workflow_steer` at `:160-164`) |
+| `run_foreground_impl` | `:365-380` for the scratch note | **fn at `:267`**; the *"why the scratch root is NOT deleted"* comment is at **`:390-403`** |
+| `resolve_run_channels` | `:612-710` | **`:626`** |
+| `build_foreground_run_options` | (§2 `:865-872`) | **`:749`**; the steer fields at **`:913-920`** |
+| `child_index: Some(0)` | `:832` | **`:884`** |
+| `register_foreground_controls` | `:903`, fill at `:949` | **`:951`**, fill at **`:1019`** |
+| `settle_foreground_run` | `:1003-1040` | **`:1058-1095`** (the `std::sync::Mutex` section §1.4 warns about is **`:1069-1086`**, and it still holds no `.await` — the rule's home is `extension/executor/mod.rs:150-151`, not `:145-147`) |
+| the `foreground_controls` map | `mod.rs:134` | **`extension/executor/mod.rs:138`** |
+
+### 0.0.6 §2 — what shipped, and the three docs that are STILL WRONG
+
+The circular G90 comment is **gone**. `foreground.rs:897-911` now carries the real reason, and the
+three fields at **`:913-920`** are:
+
+```rust
+steer_inbox_dir: workflow_steer.map(|h| h.inbox_dir.clone()),
+steer_ack_dir:   workflow_steer.map(|h| crate::background::control::steer_acks_dir(&h.run_dir, h.index)),
+steer_capability_path:
+                 workflow_steer.map(|h| crate::background::control::steer_capability_path(&h.run_dir, h.index)),
+```
+
+`steer_acks_dir` **plural** ✅ (§0.5 correction #2 confirmed live). `ALL THREE OR NONE` is stated and
+enforced by deriving from one `Option` (`:906-912`). §2's unconditional `Some(control::…(input.fg_control_dir, 0))`
+form did **not** ship and cannot, because there is no `fg_control_dir`.
+
+**❌ STILL OPEN — §7 DoD bullet 4. All three stale doc claims survive verbatim and are now
+demonstrably false for a foreground WORKFLOW child:**
+
+1. **`exec/agent_config.rs:584-585`** — *"`None` on the foreground path (no async run directory exists), matching upstream's own `if (input.steerInboxDir)` guard."* (field `steer_inbox_dir` at `:586`; `steer_ack_dir` at `:598`; `steer_capability_path` at `:611`.)
+2. **`prompt_runtime.rs:1409-1411`** — *"`Some` only when the parent handed this child a [`STEER_INBOX_ENV`] path — i.e. only for a background/async child, which is the only kind that has an async run directory to steer through."* The first clause stays; the parenthetical is false.
+3. **`exec/spawn_plan.rs:1304-1305`** — *"Absent on the foreground path, so a foreground child is byte-identical to before."* **and `:1318-1321`** — *"a foreground child — which has no run directory and therefore neither path — is byte-identical to before."* (The env overlay itself is `:1300-1341`; `STEER_INBOX_ENV` write at `:1311-1314`, `STEER_CAPABILITY_ENV` at `:1327-1330`, `STEER_ACK_DIR_ENV` at `:1337-1340`.)
+
+**Creation is confirmed still not this task's job:** `exec/mod.rs` does `create_dir_all` for the
+scratch root at **`:1101-1102`**, the inbox at **`:1117-1119`**, the acks at **`:1127-1129`**, and the
+capability's parent at **`:1131-1136`** — unconditionally, best-effort, on every path. §1.3's "do not
+add a fourth `create_dir_all`" ✅ still correct. (§8's `:1101-1135` is close enough; use `:1101-1136`.)
+
+### 0.0.7 §3 — three quarters built; name the missing quarter as a DECISION
+
+* ✅ `ForegroundChildEntry::steer: Option<ForegroundChildSteerHandle>` — `foreground_control.rs:164`
+  (`interrupt` is now at **`:154`**, not `:43`; the struct starts at `:131`).
+* ✅ Filled by `register_foreground_controls` at `foreground.rs:1019`: `steer: identity.workflow_steer.cloned()`.
+* ✅ `begin_foreground_child` (`foreground_control.rs:188-197`) — the child is MOVED in, so the field
+  travels with it, exactly as §3 predicted the caller-side guard would work.
+* ✅ The test fixtures §3 flagged already carry the field: `base_entry()` at **`:251-273`** and
+  `child()` at **`:275-296`** (`steer: None` at `:294`). §8's `:132-171` is stale. A **third** fixture
+  the spec did not know about must also be kept in sync: `workflow_steering.rs:361-389`
+  (`control_entry`) and `:391-…` (`one_active_child(steer: Option<ForegroundChildSteerHandle>)`).
+* ❌ **`ForegroundControlEntry` has NO `steer` field** — `extension/executor/notices.rs:20-97`; its
+  fields are `interrupt` `:23`, `current_agent` `:26`, `current_index` `:28`,
+  `current_activity_state` `:34`, `mode` `:38`, `description` `:41`, `current_tool` `:44`,
+  `current_path` `:46`, `turn_count` `:48`, `tool_count` `:50`, `tokens` `:52`, `started_at` `:57`,
+  `updated_at` `:62`, `session_id` `:68`, `parent_workflow_run_id` **`:73`** ✅, `workflow_key`
+  **`:78`** (§8 said `:79`), `cwd` **`:83`** ✅, `session_name` `:87`, `active_children` **`:95`** ✅.
+* ❌ **`sync_current_child` (`foreground_control.rs:171-183`) does NOT assign `steer`** — the eleven
+  assignments are `current_agent`/`session_name`/`current_index`/`description`/
+  `current_activity_state`/`current_tool`/`current_path`/`turn_count`/`tool_count`/`tokens`/
+  `interrupt`. §0.2's dropped line `control.steer = child.steer` (pi `:60`) is **still dropped.**
+  The omission list §0.2 points at is now the doc at `:167-170`, and `steer` is still not on it.
+
+**⚠ Mechanism note the implementor needs:** under the landed design **nothing would read**
+`ForegroundControlEntry::steer`. Every consumer reaches the handle through the child map —
+`workflow_steering.rs:291` (`target.control.active_children.get(&index)`) then `:301`
+(`child.steer.as_ref()`). Adding the mirror today ships an unread field, which trips §7's own
+*"no dead-code warnings"* bullet and the crate's stated policy of not shipping ports ahead of their
+first call site (`foreground_control.rs:4-9` does exactly that for `finishForegroundChild`).
+**So: either (a) record the decision explicitly in the `sync_current_child` doc — "pi's
+`ForegroundRunControl.steer` mirror (`shared/types.ts:2187`) has no cyrup reader; every consumer goes
+through `active_children`" — closing §0.2 by documentation rather than by code, or (b) land the mirror
+together with its first reader.** §6 invariant 5 is currently **half met**: `begin_foreground_child`
+propagates, `sync_current_child` has nowhere to propagate to.
+
+### 0.0.8 §4 — built; two divergences to rule on
+
+`steer_workflow_foreground` — `extension/executor/workflow_steering.rs:253-337`:
+
+```rust
+pub(crate) async fn steer_workflow_foreground(
+    &self,
+    workflow_run_id: &RunId,
+    message: &str,
+    mode: Option<crate::background::control::SteerDeliveryMode>,
+    index: Option<usize>,
+    async_root: &Path,
+) -> Result<String, String>
+```
+
+* index defaulting (pi `:133-137`) at `:267-284` — `active_children` is a `BTreeMap`, so `.keys()` is already sorted. ✅
+* `"Foreground run '{}' child {index} is not live."` at **`:291-296`**. ✅
+* `"Foreground run '{}' child {index} does not support steering."` at **`:302-307`** — §6 invariant 6 ✅, kept as the fallback exactly as §4.1 required.
+* delivery at **`:313-317`**: `handle.deliver(message, mode, "workflow-steer-action")`. **§4.1's `Some("steer-action")` is not what shipped** — the two live source strings are `"workflow-steer-action"` (tool surface) and `"workflow-script-steer"` (`workflow.rs:884`, script surface). Keep them distinguishable.
+* ack at **`:324`**: `Self::await_steer_ack(&handle.run_dir, &request_id, Some(handle.index)).await`.
+
+**✅ `await_steer_ack` is ALREADY `pub(crate)` and was NOT copied** — but its home moved, and §4.1's
+⚠ and §8's citation are both wrong now:
+
+| item | §8 says | **now** |
+|---|---|---|
+| `control_steer` | `extension/executor/control.rs:529` | **`extension/executor/foreground_actions/steer.rs:74`** |
+| the plain-foreground refusal | `control.rs:574` | **`foreground_actions/steer.rs:136`** (reached only after the workflow route at `:115-125`) |
+| `await_steer_ack` (**private — must become `pub(crate)`**) | `control.rs:690-710` | **`foreground_actions/steer.rs:265-271` — already `pub(crate)`. Requirement satisfied; do nothing.** |
+| — | — | **NEW:** `await_steer_ack_within(run_dir, request_id, index, budget)` at **`:280-300`**, added by WORKFLOW_14 so `runs.steer`'s `ackTimeoutMs` is honoured instead of silently retargeted. |
+| `STEER_ACK_TIMEOUT` (3 s) | `text.rs:177` | `text.rs:177` ✅ (`STEER_ACK_POLL_INTERVAL` at `:182`) |
+| `STEER_FOREGROUND_RUN_REFUSAL` | `text.rs:116` | `text.rs:116` ✅ |
+
+**⚠ DIVERGENCE 1 — §4.2's receipt table and §6 invariant 8 are NOT what shipped.**
+`workflow_steering.rs:325-332` renders
+
+```rust
+let state = match outcome.as_ref() { None => "pending", Some(ack) => ack.state.as_str() };
+let text = format!("Steering {state} for workflow {} child {index} (request {request_id}).",
+                   target.control_run_id);
+```
+
+so the no-ack word is **`pending`**, and the sentence names *"workflow {run} child {index}"*, not
+§4.2's *"foreground run {id}"*. The landed code argues for this at `:334-336` (it deliberately keeps
+the async arm's classification). **§4.2 forbids exactly this** (*"this surface uses `queued` … Do not
+unify the two and do not invent a fourth word"*), and §6 invariant 8 says *"never `pending`"*. The same
+word also appears on the script surface (`workflow.rs:912`, `delivery_status: Some("pending")` under
+`WorkflowSteerState::Queued`, and `workflow.rs:933` `.map_or("pending", …)` for the per-target state).
+**Rule on this explicitly**: either change the two sites to `"queued"` (and the §4.2 sentence shape),
+or amend §4.2/§6.8 with the reason. Do not leave the spec and the tree disagreeing in silence.
+
+**⚠ DIVERGENCE 2 — the `Failed` convention is now split on purpose, and the spec should record it.**
+The TOOL surface returns a `Failed` ack as `Err` (`workflow_steering.rs:333-336`); the SCRIPT surface
+returns it as `Ok(receipt)` with `WorkflowSteerResult::error` set (`workflow.rs:900-909` explains
+why: `Err` throws in the guest and discards the request id). Two surfaces, two conventions — both
+correct for their caller. Preserve both.
+
+### 0.0.9 §4.3 — ❌ **the single largest piece of real work left**
+
+* `CHILD_SESSION_NOT_RUNNING_YET` **does not exist anywhere in the crate** (grep: zero hits).
+* **`control::read_steer_capability` (`background/control.rs:1692`) has ZERO production callers.**
+  Its only two callers in the whole workspace are tests:
+  `crates/cyrup-ext-subagents/src/tests/steer_delivery_integration.rs:675` and `:753`.
+* So the three-way distinction §4.3 calls *"the whole of §4.3"* is **not made**. A child that has not
+  yet reached its runtime (`None`) and a child whose host cannot inject at all (`Some(c)` with
+  `!c.supported`) are today indistinguishable from each other and from a slow child: both simply fall
+  through to `await_steer_ack`'s 3 s timeout and report `pending`.
+* **§6 invariant 7 is UNMET**, and §5.2's poll has nothing to poll on until this lands — the two are
+  a single unit of work, not two.
+* The capability record itself is intact and still says what §4.3 relies on: `SteerCapability` at
+  `control.rs:1527` (with its `pid`), `steer_capability_path` at `:1551`, and the child publishes it
+  from `prompt_runtime.rs` (`STEER_CAPABILITY_ENV` read at `:2345`, threaded onto the runtime at
+  `:2393`). §4.3's republish-on-every-`activate` claim should be re-checked against
+  `prompt_runtime.rs`'s `publish_capability` before it is relied on — §8's `:334-345` is stale
+  (the child-side env reads are now `:2332-2345`, not `:2336-2349`).
+
+### 0.0.10 §5 — built, but by a different mechanism; three sub-requirements unmet
+
+`impl WorkflowScriptHost for WorkflowRunHost` — `extension/executor/workflow.rs:540`. **§8's `:228` /
+`launch :229` / `status :388` are all stale**, and the impl is no longer two methods:
+
+| method | line | note |
+|---|---|---|
+| `launch` | `:541` | still blocking — §5.2's premise holds |
+| `status` | `:744` | |
+| `supports_steer` → `true` | **`:827-829`** | ✅ §7 bullet 6 |
+| `steer` | **`:835-936`** | ✅ real |
+| `supports_host` → `true` | `:963` | WORKFLOW_19, landed since this spec |
+| `host_command` | `:970` | WORKFLOW_19 |
+| `child_steer_handle` (private) | `:270-276` | the single mint point |
+| `self.workflow_run_id` | **`:198`** (§8 said `:118`) | |
+
+Engine side re-verified: trait `WorkflowScriptHost` at `workflows/scripted/engine.rs:122`; the
+`supports_steer` default (`false`) at **`:160-162`**; the default refusal *"Workflow steering is
+unavailable in this host."* at **`:172`**; the live capability gate `shared.host.supports_steer()` at
+**`:1126`** and the same refusal at **`:1145`**. (§8's `:160-173` / `:1089` / `:1106-1108` are stale.)
+`workflows/scripted/types.rs` numbers are **unchanged and correct**: `WorkflowSteerMode` `:71`,
+`WorkflowSteerOptions` `:83`, **`WorkflowSteerState` `:99-108` (four variants — §0.5 correction #4
+STANDS)**, `WorkflowSteerTarget` `:113-121`, `WorkflowSteerResult` `:126-146`.
+
+**⚠ DIVERGENCE — §5.1's predicate did not ship, and what did ship is different in kind.**
+`steer` never touches `foreground_controls`. It resolves the index from the host's own launch ledger
+(`workflow.rs:846-856`):
+
+```rust
+let index = {
+    let launched = self.launched.lock().unwrap_or_else(PoisonError::into_inner);
+    launched.get(key).map(|identity| identity.index)
+        .ok_or_else(|| format!("runs.steer('{key}') names no launched child in this workflow."))?
+};
+```
+
+This is **stronger** than §5.1's three-term find on the two identity terms — a `WorkflowRunHost` is
+constructed for exactly one workflow, and `launched` is keyed by lane key, so
+`(parent_workflow_run_id, workflow_key)` hold by construction — and **weaker** on the third: the
+`active_children` non-empty term, i.e. *is the child still live*, is not checked at all. (A
+three-term scan of that exact shape **does** exist in this file, at `workflow.rs:491`, used by
+`status`: `control.parent_workflow_run_id.as_ref() == Some(&self.workflow_run_id) && …` — that is the
+pattern to reuse if §5.1's liveness term is reinstated.) There is also an extra guard §5 did not ask
+for and which is worth keeping: an explicit `options.index` naming a different child is **refused**
+(`:860-869`), never silently retargeted.
+
+**❌ §5.2 — there is NO poll.** No deadline, no loop, no `Math.min(10, …)` sleep; the `cancel`
+parameter is bound as `_cancel` and never read. One shot, then `await_steer_ack_within` (`:892-898`,
+budget from `options.ack_timeout_ms` or `STEER_ACK_TIMEOUT`) times out. A lane that is registered but
+not yet spawned therefore gets `Queued`/`pending`, not a retry. §6 invariant 9's second half is unmet.
+
+**❌ §5.3 — the receipt is three-state in practice.** `WorkflowSteerState::Missed` is **produced
+nowhere in the crate**; its only non-definition occurrence is the engine's trace mapping at
+`engine.rs:1167`. The mapping is inline at `workflow.rs:910-922` — there is **no `workflow_steer_receipt`
+helper**, so §7's bullet naming one is unmet as written. The receipt construction at `:924-935` does
+fill `targets` with a single `WorkflowSteerTarget { index: u32::try_from(index).unwrap_or(u32::MAX),
+state, reason }` (§5.3 ✅) and constructs **every field explicitly** — §5.2's ⚠ was right and remains
+right: **`WorkflowSteerResult` still has no `Default` derive** (`types.rs:126`), so any new
+construction site must spell all six fields out.
+
+### 0.0.11 §6 invariant scoreboard, as of this pass
+
+| # | status | evidence |
+|---|---|---|
+| 1 | ✅ **for a workflow child only** | `foreground.rs:913-920` → `spawn_plan.rs:1300-1341` |
+| 2 | **N/A** — no `fg-<run_id>` tree exists | `resume_tracking` at `extension/executor/status.rs:26`, its `read_dir` at `:32` ✅ (citation still good) |
+| 3 | **N/A** (follows from 2) | the scratch-root rationale survives at `foreground.rs:390-403` |
+| 4 | ✅ | `foreground_control.rs:125` writes `self.inbox_dir`. `route_steer_requests` at `background/runner_main/control_watcher.rs:334`; the *"silently dead again"* invariant at **`:765-768`** (§8 said `:762-769`) |
+| 5 | ⚠ **HALF** | `begin_foreground_child` ✅ `:188-197`; `sync_current_child` ❌ `:171-183` (no target field) |
+| 6 | ✅ | `workflow_steering.rs:302-307` |
+| 7 | ❌ **UNMET** | §0.0.9 |
+| 8 | ⚠ **DIVERGENT** (`pending`, not `queued`) | `workflow_steering.rs:325`, `workflow.rs:912`/`:933` |
+| 9 | ⚠ **HALF** | selection by `launched` not by the three-term find; no poll; no `Missed` |
+| 10 | ✅ | `text.rs:116` fired at `foreground_actions/steer.rs:136` |
+| 11 | ✅ | the four gates live in `active_workflow_error`, `workflow_steering.rs:109-149` — session present `:121-122`, controller registry `:126-128`, status read `:133-141`, `SessionGate::Strict` `:145-151` |
+
+### 0.0.12 §7 Definition of done — what is left
+
+| bullet | status |
+|---|---|
+| `foreground_run_control_dir` + `RunChannels`/`ForegroundRunOptionsInput` threading | ❌ open **as a decision** (§0.0.2): the landed design does not need it; build it only if the plain-run half is still in scope |
+| `request_direct_steer` writing into `step_steer_inbox_dir`, `target_index` pinned, id from the private minter | ✅ **done** as `ForegroundChildSteerHandle::deliver` |
+| three steer paths populated; circular comment replaced | ✅ **done** (conditionally on workflow) |
+| the three stale doc claims corrected | ❌ **OPEN — real work, in scope, uncontroversial** |
+| `ForegroundChildSteer` type, both `steer` fields, fill, propagation, fixtures compile | ⚠ **3/4 done**; `ForegroundControlEntry::steer` + `sync_current_child` open as a decision (§0.0.7) |
+| `await_steer_ack` `pub(crate)` (not copied) + real delivery + retryable unpublished capability + no-handle refusal | ⚠ visibility ✅, delivery ✅, refusal ✅, **retryable capability ❌ (§0.0.9)** |
+| `supports_steer()` true; selection; poll; four states via `workflow_steer_receipt` | ⚠ `supports_steer` ✅, delivery ✅, **selection divergent, poll ❌, `Missed` ❌, helper ❌** |
+| plain foreground still refused; WORKFLOW_7's four gates unchanged | ✅ |
+| `fg-<run_id>` removed on settle, outside the lock | **N/A** under the landed design |
+| `cargo clippy --workspace --all-targets` exits 0, no new `allow`s, no dead code | ✅ **today** — the baseline is green; keep it so. ⚠ This bullet is what makes §0.0.7's "don't ship an unread field" argument binding. |
+
+### 0.0.13 Verification commands for the implementor (read-only)
+
+```
+rg -n 'foreground_run_control_dir|request_direct_steer|CHILD_SESSION_NOT_RUNNING_YET' crates/cyrup-ext-subagents   # expect: nothing
+rg -n 'WorkflowSteerState::Missed' crates/cyrup-ext-subagents                                                       # expect: engine.rs:1167 only
+rg -n 'read_steer_capability' crates/cyrup-ext-subagents                                                            # expect: definition + 2 test callers
+```
+
+Format only what is touched: `cargo fmt -p cyrup-ext-subagents`. `cargo fmt --all` is a repo-wide
+no-op today and must stay one.
+
+---
+
 ## §0 — Why this task exists, and why it is smaller than it looks
+
+> ⚠ **2026-09-14:** read [§0.0](#00--%EF%B8%8F%EF%B8%8F-re-augment-2026-09-14) FIRST. WORKFLOW_7 **has** landed and
+> `extension/executor/workflow_steering.rs` **exists** — the dependency note above is stale. Most of
+> §1–§5 is already in the tree, in a narrower, workflow-rooted shape. §0.0.3 has the per-section verdict.
 
 ### 0.1 Nobody owned it
 
@@ -163,6 +568,14 @@ scope**; cyrup's fleet TUI has no steer action to wire it to yet.
 ---
 
 ## §1 SUBTASK1 — a control tree for a foreground run, and a direct-drop request writer
+
+> ⚠ **2026-09-14 — §0.0.4/§0.0.5.** §1.2 is **BUILT** as `ForegroundChildSteerHandle::deliver`
+> (`extension/executor/foreground_control.rs:97-127`), not as `request_direct_steer`; §0.4's dead-drop
+> defect is correctly avoided. §1.3 is **BUILT** via `ForegroundRunRequest::workflow_steer`
+> (`requests.rs:205`), not via a path on `RunChannels`. §1.1 and §1.4 are **NOT BUILT** and are not
+> needed by the landed design — they are the plain-(non-workflow)-foreground half, which is now an
+> explicit decision, not a defect. Every `background/control.rs` line number below is shifted; the
+> correction table is in §0.0.4.
 
 ### 1.1 `foreground_run_control_dir`
 
@@ -329,6 +742,12 @@ removal is strictly the `fg-<run_id>/` leaf.
 
 ## §2 SUBTASK2 — populate the three `RunOptions` fields
 
+> ⚠ **2026-09-14 — §0.0.6.** The three fields **are populated** (`foreground.rs:913-920`) and the
+> circular comment **is gone** (`:897-911`) — but conditionally, `Some` iff the child is a workflow
+> child, since there is no `fg_control_dir`. `steer_acks_dir` plural confirmed (now `control.rs:1557`).
+> **The three stale doc claims below are ALL STILL STALE** and are genuine open work:
+> `exec/agent_config.rs:584-585`, `prompt_runtime.rs:1409-1411`, `exec/spawn_plan.rs:1304-1305` + `:1318-1321`.
+
 **File:** [`foreground.rs:865-872`](../../../workspace/cyrup/crates/cyrup-ext-subagents/src/extension/executor/foreground.rs),
 in `build_foreground_run_options`.
 
@@ -375,6 +794,14 @@ three are load-bearing documentation a reader will trust over the code:
    byte-identical to before"* at `:1319-1320`.
 
 ## §3 SUBTASK3 — the handle on `ForegroundChildEntry`
+
+> ⚠ **2026-09-14 — §0.0.7.** Built as `ForegroundChildSteerHandle` (`foreground_control.rs:56-74`) with
+> **three** fields (`inbox_dir`/`run_dir`/`index`) — no `ack_dir`, no `capability_path`.
+> `ForegroundChildEntry::steer` ✅ `:164`, filled at `foreground.rs:1019` ✅, propagated by
+> `begin_foreground_child` ✅. **`ForegroundControlEntry::steer` and the `sync_current_child`
+> assignment are STILL MISSING** — and under the landed design nothing would read them, so close
+> §0.2 by documenting the decision or land the mirror with its first reader. Fixture line numbers are
+> now `:251-296`, plus a third fixture at `workflow_steering.rs:361-…`.
 
 **File:** [`foreground_control.rs:43`](../../../workspace/cyrup/crates/cyrup-ext-subagents/src/extension/executor/foreground_control.rs),
 next to `interrupt`.
@@ -472,6 +899,13 @@ literally — `foreground_control.rs`'s `base_entry()`/`child()` (`:132-171`) �
 ```
 
 ## §4 SUBTASK4 — real delivery, replacing WORKFLOW_7 §1.6's refusal
+
+> ⚠ **2026-09-14 — §0.0.8/§0.0.9.** This file **exists** and the delivery arm **is real**
+> (`workflow_steering.rs:253-337`). `await_steer_ack` is **already `pub(crate)`** and lives at
+> `extension/executor/foreground_actions/steer.rs:265` — not `control.rs:690`; no visibility change is
+> needed. **Two open items:** the no-ack word shipped as **`pending`**, which §4.2 and §6.8 forbid
+> (rule on it); and **§4.3 is entirely unbuilt** — `CHILD_SESSION_NOT_RUNNING_YET` does not exist and
+> `read_steer_capability` has zero production callers, so §6 invariant 7 is unmet.
 
 **File:** `extension/executor/workflow_steering.rs` — **created by WORKFLOW_7**, which has not
 landed. This task replaces exactly one line of it: the arm WORKFLOW_7 §1.6 leaves at
@@ -598,6 +1032,13 @@ single publish at `session_start` would pin `supported: false` on every child). 
 genuinely "not yet", never "never".
 
 ## §5 SUBTASK5 — `WorkflowRunHost::steer`, the second consumer
+
+> ⚠ **2026-09-14 — §0.0.10.** `supports_steer()` is **already `true`** (`workflow.rs:827`) and `steer`
+> is **already real** (`:835-936`). But it uses a **different mechanism**: it resolves the index from
+> the host's own `launched` ledger (`:846-856`), never scanning `foreground_controls`. **There is NO
+> poll loop** (§5.2 unbuilt, `cancel` is `_cancel`) and **`WorkflowSteerState::Missed` is produced
+> nowhere in the crate** (§5.3 unbuilt, no `workflow_steer_receipt` helper). `WorkflowSteerResult`
+> still has no `Default` (`types.rs:126`) — §5.2's ⚠ stands. Host impl is at `:540`, not `:228`.
 
 **File:** [`workflow.rs:228`](../../../workspace/cyrup/crates/cyrup-ext-subagents/src/extension/executor/workflow.rs),
 in `impl WorkflowScriptHost for WorkflowRunHost`, beside `launch` (`:229`) and `status` (`:388`).
@@ -761,6 +1202,14 @@ Without this subtask the feature is unreachable by a user: a workflow script's `
 * `cargo clippy --workspace --all-targets` exits 0 with no new `allow`s and no dead-code warnings.
 
 ## §8 Research notes & citations
+
+> ⚠ **2026-09-14 — §0.0.1.** The two checkout paths below do not exist on this machine: the repo is
+> `/home/user/cyrup` and there is **no pi checkout at all**, so every `pi …:NNN` citation here is
+> unverified by this pass. The cyrup commit `f8bec9ee` is long superseded — **nearly every cyrup line
+> number in this block is shifted.** Corrected tables: `background/control.rs` in §0.0.4,
+> `extension/executor/foreground.rs` in §0.0.5, `foreground_control.rs`/`notices.rs` in §0.0.7,
+> `control.rs`/`text.rs`/`foreground_actions/steer.rs` in §0.0.8, `workflow.rs`/`engine.rs`/`types.rs`
+> in §0.0.10. The final line of this file (`/home/d0m17bw/.flux/…`) is a stale self-reference.
 
 **Upstream** (`/home/d0m17bw/workspace/pi-subagents` @ `57278d82`)
 

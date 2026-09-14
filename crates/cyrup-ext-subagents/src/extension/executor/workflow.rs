@@ -25,11 +25,13 @@ use serde_json::{Map, Value};
 use crate::background::control::{SteerAckState, SteerDeliveryMode};
 use crate::exec::SingleResult;
 use crate::extension::executor::SubagentExecutor;
-use crate::extension::executor::foreground_control::ForegroundChildSteerHandle;
+use crate::extension::executor::foreground_control::{
+    ChildSteerReadiness, ForegroundChildSteerHandle,
+};
 use crate::extension::executor::notices::ForegroundControlEntry;
 use crate::extension::executor::requests::ForegroundRunRequest;
 use crate::extension::tool::params::{SubagentToolParams, resolve_execution_agent_scope};
-use crate::extension::tool::text::STEER_ACK_TIMEOUT;
+use crate::extension::tool::text::{CHILD_SESSION_NOT_RUNNING_YET, STEER_ACK_TIMEOUT};
 use crate::fork_context::ContextRequest;
 use crate::workflows::scripted::{
     WORKFLOW_CHILD_MARKER, WorkflowLaunchAdmission, WorkflowResolvedResume,
@@ -473,6 +475,46 @@ impl WorkflowRunHost {
     ///
     /// The guest addresses either form (`prelude.js:311`'s `status(keyOrRunId)`), so both the lane
     /// key and the map key are accepted.
+    /// pi `steerWorkflowChildByKey`'s own control find (`subagent-executor.ts:4491-4493`) — the
+    /// liveness half of [`WorkflowScriptHost::steer`]'s poll:
+    ///
+    /// ```ts
+    /// const control = [...state.foregroundControls.values()].find((candidate) =>
+    ///     candidate.parentWorkflowRunId === input.workflowRunId
+    ///     && candidate.workflowKey === input.key
+    ///     && (candidate.activeChildren?.size ?? 0) > 0);
+    /// ```
+    ///
+    /// All three terms, and note the middle one: `workflowKey`, NOT `sessionId`. That is the
+    /// difference between this predicate and `workflow_steering.rs`'s `control_is_live_in_workflow`,
+    /// and it is the whole point — the session term identifies an OWNER, the key term identifies a
+    /// LANE. Reusing the session predicate here would match any live child of this workflow and
+    /// steer the wrong one on a multi-lane script. The session term is not needed in exchange:
+    /// `self.workflow_run_id` is minted by this very tool call (`routing.rs`), so it is unique to
+    /// this process and no foreign instance's entry can carry it.
+    ///
+    /// This is the LIVENESS gate only; the INDEX still comes from [`Self::launched`], which is
+    /// strictly stronger on identity (a `WorkflowRunHost` exists for exactly one workflow and
+    /// `launched` is keyed by lane key, so both identity terms hold by construction there) and is
+    /// the only place the flat index a handle addresses was ever minted. Deriving the index from a
+    /// scan would be a second minting site for the one number that must agree between the spawn and
+    /// the write.
+    ///
+    /// Cloned nothing and held nothing: a `bool` out of a short synchronous section, because
+    /// `foreground_controls` is a `std::sync::Mutex` and this is polled from an async loop.
+    fn lane_has_live_child(&self, key: &str) -> bool {
+        let controls = self
+            .executor
+            .foreground_controls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        controls.values().any(|control| {
+            control.parent_workflow_run_id.as_ref() == Some(&self.workflow_run_id)
+                && control.workflow_key.as_ref().map(WorkflowKey::as_str) == Some(key)
+                && !control.active_children.is_empty()
+        })
+    }
+
     fn live_child_status(&self, key_or_run_id: &str) -> Option<WorkflowScriptChildResult> {
         // Cloned OUT of the lock, never read through it: `foreground_controls` is a
         // `std::sync::Mutex` shared with every live run's notifier pump, and this is called from an
@@ -533,6 +575,109 @@ impl WorkflowRunHost {
             output: live_activity_line(&control),
             ..WorkflowScriptChildResult::default()
         })
+    }
+}
+
+/// How one `runs.steer` attempt ended — the input [`workflow_steer_receipt`] classifies.
+///
+/// pi's `steerWorkflowChildByKey` hands `workflowSteerReceipt` a loose object and lets the receipt
+/// builder read whichever fields are present (`subagent-executor.ts:4319-4334`). These three
+/// variants are the same three shapes it actually passes, made exhaustive so a new outcome cannot
+/// be added without deciding which of the four receipt states it is.
+enum WorkflowSteerOutcome {
+    /// The request was WRITTEN into the child's inbox. `ack` is the child's answer within the
+    /// remaining budget, or `None` when none arrived.
+    Acked {
+        request_id: String,
+        ack: Option<crate::background::control::SteerAck>,
+    },
+    /// A live route existed and refused — today only a child that published
+    /// `supported: false`. Terminal, and distinct from [`Self::NoRoute`]: the child answered.
+    Refused(String),
+    /// No live steering route inside the budget, or the call was cancelled — pi `:4537`.
+    NoRoute(String),
+}
+
+/// pi `workflowSteerReceipt` (`subagent-executor.ts:4319-4334`) — the ONE place a `runs.steer`
+/// receipt is built, so its state word, its `deliveryStatus` refinement and its per-target record
+/// cannot drift apart.
+///
+/// The four states and where each comes from:
+///
+/// | condition | state | pi |
+/// |---|---|---|
+/// | ack `delivered` | [`WorkflowSteerState::Delivered`] | `:4325` |
+/// | ack `queued`, **or no ack inside the budget** | [`WorkflowSteerState::Queued`] | `:4325` |
+/// | ack `failed`, or a live route refused | [`WorkflowSteerState::Failed`] | `:4323-4324` |
+/// | no live route before the deadline / cancelled | [`WorkflowSteerState::Missed`] | `:4537` |
+///
+/// ⚠ No acknowledgment inside the budget is `Queued`, NEVER `Missed`. `Missed` means the message
+/// missed its target; a pending file drop has not missed — it is on disk, addressed, and a child
+/// that reaches a safe point later still takes it (SUBA-049). Collapsing the two would tell a
+/// script its guidance was lost when it is in fact in flight.
+///
+/// ⚠ A `Failed` outcome is returned as `Ok(receipt)` by [`WorkflowScriptHost::steer`], NOT `Err` —
+/// the opposite of the tool-side arm in `workflow_steering.rs`, and deliberately so. The engine's
+/// `Ok` arm maps [`WorkflowSteerState::Failed`] onto a failed trace entry and reads
+/// [`WorkflowSteerResult::error`], which exists precisely so a failed steer is a VALUE a script can
+/// inspect; `Err` would throw in the guest and discard the request id. The tool surface has no
+/// receipt to carry a failure, so it uses `Err`. Two surfaces, two conventions, each correct for
+/// its own caller.
+///
+/// The per-target `state` word is derived from the receipt state rather than re-read off the ack:
+/// the field is loose upstream (any string), and two independent renderings of one outcome is the
+/// drift this helper exists to remove. `delivery_status` is pi's `"delivered"`/`"queued"` pair
+/// (`workflow-foreground-steering.ts:158`) and is OMITTED where nothing was delivered at all —
+/// `null` there would read as a fourth delivery word.
+fn workflow_steer_receipt(
+    key: &str,
+    index: usize,
+    outcome: WorkflowSteerOutcome,
+) -> WorkflowSteerResult {
+    let (state, request_id, error) = match outcome {
+        WorkflowSteerOutcome::Acked { request_id, ack } => match ack {
+            None => (WorkflowSteerState::Queued, Some(request_id), None),
+            Some(ack) => match ack.state {
+                SteerAckState::Delivered => (WorkflowSteerState::Delivered, Some(request_id), None),
+                SteerAckState::Queued => (WorkflowSteerState::Queued, Some(request_id), None),
+                // The ack's own `message` IS the reason for a refusal — e.g. upstream's
+                // `Follow-up queue is full (20 messages).` — so it is what the script reads.
+                SteerAckState::Failed => (
+                    WorkflowSteerState::Failed,
+                    Some(request_id),
+                    Some(ack.message),
+                ),
+            },
+        },
+        // No request was ever written on either arm, so there is no id to correlate against.
+        WorkflowSteerOutcome::Refused(reason) => (WorkflowSteerState::Failed, None, Some(reason)),
+        WorkflowSteerOutcome::NoRoute(reason) => (WorkflowSteerState::Missed, None, Some(reason)),
+    };
+
+    let word = match state {
+        WorkflowSteerState::Queued => "queued",
+        WorkflowSteerState::Delivered => "delivered",
+        WorkflowSteerState::Missed => "missed",
+        WorkflowSteerState::Failed => "failed",
+    };
+
+    WorkflowSteerResult {
+        key: key.to_string(),
+        state,
+        request_id,
+        delivery_status: matches!(
+            state,
+            WorkflowSteerState::Queued | WorkflowSteerState::Delivered
+        )
+        .then(|| word.to_string()),
+        // The one child this key addresses. `try_from` rather than `as`: the field is `u32` and a
+        // saturating conversion is honest where a truncating cast is not.
+        targets: Some(vec![WorkflowSteerTarget {
+            index: u32::try_from(index).unwrap_or(u32::MAX),
+            state: word.to_string(),
+            reason: error.clone(),
+        }]),
+        error,
     }
 }
 
@@ -828,16 +973,27 @@ impl WorkflowScriptHost for WorkflowRunHost {
         true
     }
 
-    /// `runs.steer(key, message, options)` from inside the script.
+    /// `runs.steer(key, message, options)` from inside the script — pi `steerWorkflowChildByKey`
+    /// (`subagent-executor.ts:4477-4541`).
     ///
     /// The same file-drop-then-await-ack pair the async action and the tool-side workflow route
     /// use, against this workflow's own run directory — never a second transport.
+    ///
+    /// # Why this POLLS, and why that is what makes the method non-vacuous
+    ///
+    /// [`Self::launch`] does not return until its child settles, so `runs.steer` is only ever
+    /// reachable from a CONCURRENT lane of the guest script. The steered lane can therefore be
+    /// anywhere in its life when the call lands, including the ordinary window between "the engine
+    /// recorded the launch" and "the spawned child reached its runtime" — which is precisely what
+    /// upstream's own loop exists for (`:4490`, `:4539`), and its comment at `:4501` says so:
+    /// *"the control registers before its child session exists; keep polling until the steer can
+    /// route."* One budget covers the whole loop, not each attempt.
     async fn steer(
         &self,
         key: &str,
         message: &str,
         options: WorkflowSteerOptions,
-        _cancel: CancelToken,
+        cancel: CancelToken,
     ) -> Result<WorkflowSteerResult, String> {
         // The engine has already proved `key` names a launched child (its own "requires a prior
         // runs.run/runs.all launch with that key" gate), so this resolves the index the host minted
@@ -880,64 +1036,100 @@ impl WorkflowScriptHost for WorkflowRunHost {
         // The child's OWN inbox, via the same handle `launch` spawned it against — pi's
         // `child.steer(...)` direct line, not the runner intake queue this process never drains.
         let handle = self.child_steer_handle(index);
-        let request_id = handle
-            .deliver(message, Some(mode), "workflow-script-steer")
-            .await
-            .map_err(|e| e.to_string())?;
 
-        // The caller's own budget when they set one — see `await_steer_ack_within`'s doc.
+        // pi `:4488-4489` — ONE budget for the whole loop, not one per attempt. The caller's own
+        // when they set it; see `await_steer_ack_within`'s doc for why accepting `ackTimeoutMs` and
+        // then waiting the default anyway would be a silent retarget of their request.
         let budget = options
             .ack_timeout_ms
             .map_or(STEER_ACK_TIMEOUT, std::time::Duration::from_millis);
-        let ack = SubagentExecutor::await_steer_ack_within(
-            &self.run_dir,
-            &request_id,
-            Some(index),
-            budget,
-        )
-        .await;
+        let deadline = std::time::Instant::now() + budget;
 
-        // ⚠ No acknowledgment inside the budget is `Queued`, NEVER `Missed`. `Missed` means the
-        // message missed its target; a pending file drop has not missed — it is on disk, and a
-        // child that reaches a safe point later still takes it (SUBA-049).
-        //
-        // ⚠ A `Failed` ack is returned as `Ok(receipt)` here, NOT `Err` — the opposite of the
-        // tool-side arm in `workflow_steering.rs`, and deliberately so. The engine's own `Ok` arm
-        // maps `WorkflowSteerState::Failed` onto a failed trace entry and reads `receipt.error`,
-        // and `WorkflowSteerResult::error` exists precisely so a failed steer is a VALUE a script
-        // can inspect. `Err` would throw in the guest and discard the request id. The tool surface
-        // has no receipt to carry the failure, so it uses `Err`: two surfaces, two conventions,
-        // each correct for its own caller.
-        let (state, delivery_status, error) = match ack.as_ref() {
-            None => (WorkflowSteerState::Queued, Some("pending"), None),
-            Some(ack) => match ack.state {
-                SteerAckState::Delivered => {
-                    (WorkflowSteerState::Delivered, Some("delivered"), None)
+        loop {
+            // pi `:4491-4493` — the lane must have a LIVE child before a request is written for it.
+            // Two independent facts, checked in order, because they become true at different times
+            // and a single check would conflate them: the control registry says this lane has a
+            // running child at all, and the child's own capability record says that child's runtime
+            // is up and can take an injection.
+            if self.lane_has_live_child(key) {
+                match handle.readiness().await {
+                    ChildSteerReadiness::Ready => {
+                        let request_id = handle
+                            .deliver(message, Some(mode), "workflow-script-steer")
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        // The REMAINING budget, not a fresh one: the deadline bounds finding the
+                        // route AND hearing back, exactly as upstream's single `deadline` does.
+                        // `await_steer_ack_within` always performs one read before testing its own
+                        // deadline, so a zero remainder still gets an honest look rather than an
+                        // automatic `queued`.
+                        let ack = SubagentExecutor::await_steer_ack_within(
+                            &self.run_dir,
+                            &request_id,
+                            Some(index),
+                            deadline.saturating_duration_since(std::time::Instant::now()),
+                        )
+                        .await;
+                        return Ok(workflow_steer_receipt(
+                            key,
+                            index,
+                            WorkflowSteerOutcome::Acked { request_id, ack },
+                        ));
+                    }
+                    // pi `:4633` — the ONLY retryable outcome, and retryable only while budget
+                    // remains. The control registers before the child's runtime does, which is
+                    // ordinary and short-lived; anything else in this `match` is the answer.
+                    //
+                    // At the deadline upstream returns the LAST ATTEMPT'S receipt rather than
+                    // falling through to `:4668`'s `missed`, and the distinction it draws is worth
+                    // keeping: a lane whose control was never found had no route at all
+                    // (`Missed`), while one whose control was found and whose child never booted
+                    // has a knowable reason (`Failed` carrying it). Collapsing the two would throw
+                    // away the only sentence that says WHY.
+                    ChildSteerReadiness::NotRunningYet => {
+                        if std::time::Instant::now() >= deadline {
+                            return Ok(workflow_steer_receipt(
+                                key,
+                                index,
+                                WorkflowSteerOutcome::Refused(
+                                    CHILD_SESSION_NOT_RUNNING_YET.to_string(),
+                                ),
+                            ));
+                        }
+                    }
+                    // Terminal: a host that cannot inject messages will not start being able to,
+                    // so waiting out the budget would only turn a knowable `failed` into a `missed`.
+                    ChildSteerReadiness::Unsupported => {
+                        return Ok(workflow_steer_receipt(
+                            key,
+                            index,
+                            WorkflowSteerOutcome::Refused(format!(
+                                "Workflow child '{key}' cannot be steered: its host cannot inject \
+                                 messages."
+                            )),
+                        ));
+                    }
                 }
-                SteerAckState::Queued => (WorkflowSteerState::Queued, Some("queued"), None),
-                SteerAckState::Failed => {
-                    (WorkflowSteerState::Failed, None, Some(ack.message.clone()))
-                }
-            },
-        };
+            }
 
-        Ok(WorkflowSteerResult {
-            key: key.to_string(),
-            state,
-            request_id: Some(request_id),
-            delivery_status: delivery_status.map(str::to_string),
-            // The one child this key addresses. `try_from` rather than `as`: the field is `u32` and
-            // a saturating conversion is honest where a truncating cast is not.
-            targets: Some(vec![WorkflowSteerTarget {
-                index: u32::try_from(index).unwrap_or(u32::MAX),
-                state: ack
-                    .as_ref()
-                    .map_or("pending", |ack| ack.state.as_str())
-                    .to_string(),
-                reason: error.clone(),
-            }]),
-            error,
-        })
+            // pi `:4667-4668`. cyrup has no async status file for a FOREGROUND child, so upstream's
+            // three status-derived `missed` arms (`:4643`, `:4662`, `:4665`) collapse into this one
+            // — the lane had no live steering route inside the budget, which is the same fact those
+            // three report by three different routes.
+            if cancel.is_cancelled() || std::time::Instant::now() >= deadline {
+                return Ok(workflow_steer_receipt(
+                    key,
+                    index,
+                    WorkflowSteerOutcome::NoRoute(format!(
+                        "Workflow child '{key}' had no live steering route."
+                    )),
+                ));
+            }
+            // pi `:4539` — `Math.min(10, …)`. The same 10 ms, deliberately NOT
+            // `STEER_ACK_POLL_INTERVAL`: that one paces the ACK read inside `await_steer_ack_within`,
+            // a different loop waiting on a different event.
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     /// WORKFLOW_19 — the guest sees `runs.host` ONLY because of this flag.
@@ -1111,13 +1303,15 @@ mod tests {
 
     /// DoD manual-confirmation 1: `runs.steer` returns a RECEIPT, never upstream's
     /// "Workflow steering is unavailable in this host." (which `supports_steer() == true` makes
-    /// unreachable at the engine's own gate). With no child running, no ack can arrive, so the
-    /// receipt is `Queued` + `pending` — the request is on disk and is still live.
+    /// unreachable at the engine's own gate). The lane is live and the child has published its
+    /// capability, so the request is written on the first pass of the poll; no ack can arrive from a
+    /// fixture, so the receipt is `Queued` + `queued` — the request is on disk and is still live.
     #[tokio::test]
     async fn steer_returns_a_queued_receipt_and_delivers_to_the_childs_inbox() {
         let dir = tempfile::tempdir().expect("tempdir");
         let run_dir = dir.path().join("wf");
-        let host = host_with(run_dir.clone(), "lane", 2);
+        let host = host_with_live_lane(run_dir.clone(), "lane", 2);
+        publish_capability(&run_dir, 2, true).await;
 
         assert!(
             host.supports_steer(),
@@ -1136,7 +1330,9 @@ mod tests {
 
         assert_eq!(receipt.key, "lane");
         assert_eq!(receipt.state, WorkflowSteerState::Queued);
-        assert_eq!(receipt.delivery_status.as_deref(), Some("pending"));
+        // `queued`, never `pending`: a fourth delivery word on a receipt whose state is already
+        // `queued` says nothing the state does not, and `pending` is the ASYNC surface's own text.
+        assert_eq!(receipt.delivery_status.as_deref(), Some("queued"));
         assert!(
             receipt.request_id.is_some(),
             "the receipt must carry its correlation id"
@@ -1147,6 +1343,10 @@ mod tests {
         assert_eq!(
             targets[0].index, 2,
             "the WORKFLOW-flat index this key was launched at"
+        );
+        assert_eq!(
+            targets[0].state, "queued",
+            "the per-target word is DERIVED from the receipt state, so the two cannot drift"
         );
 
         // Delivered into the child's own inbox at the same index — not the runner intake queue.
@@ -1200,6 +1400,200 @@ mod tests {
         );
     }
 
+    /// §5.2's poll, and the state it produces. A lane whose control entry never appears has no live
+    /// steering route, and the honest answer at the deadline is `Missed` — the FOURTH receipt state,
+    /// which nothing in this crate could produce before.
+    ///
+    /// ⚠ And nothing is written. That is the difference between `Missed` and `Queued`: a queued
+    /// receipt promises a file is on disk for the child to find, so answering `Queued` here would
+    /// promise a delivery to a child that does not exist.
+    ///
+    /// `ack_timeout_ms` is the caller's own budget and it bounds the WHOLE loop, so a 60 ms budget
+    /// makes this test cost 60 ms rather than `STEER_ACK_TIMEOUT`'s three seconds.
+    #[tokio::test]
+    async fn steer_reports_missed_when_the_lane_never_becomes_live() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run_dir = dir.path().join("wf");
+        // Launched (so the index resolves) but NO foreground control — the lane is registered and
+        // not yet spawned, which is precisely the window the poll exists for.
+        let host = host_with(run_dir.clone(), "lane", 0);
+        let options = WorkflowSteerOptions {
+            ack_timeout_ms: Some(60),
+            ..WorkflowSteerOptions::default()
+        };
+
+        let receipt = host
+            .steer("lane", "hi", options, CancelToken::new())
+            .await
+            .expect("a launched key must yield a receipt, never an Err");
+
+        assert_eq!(receipt.state, WorkflowSteerState::Missed);
+        assert_eq!(
+            receipt.error.as_deref(),
+            Some("Workflow child 'lane' had no live steering route.")
+        );
+        assert!(
+            receipt.request_id.is_none(),
+            "no request was ever written, so there is no id to correlate against"
+        );
+        assert!(receipt.delivery_status.is_none(), "nothing was delivered");
+        let targets = receipt.targets.expect("one target, this key's child");
+        assert_eq!(targets[0].state, "missed");
+        assert_eq!(
+            requests_in(&crate::background::control::step_steer_inbox_dir(
+                &run_dir, 0
+            )),
+            0,
+            "a missed steer must not leave a file promising a delivery"
+        );
+    }
+
+    /// The OTHER deadline arm, and the reason the two are not one. A lane whose control IS live but
+    /// whose child never reaches its runtime does not report "no live steering route" — there WAS a
+    /// route, and the reason it could not be used is knowable. pi returns the last attempt's receipt
+    /// at `:4633` for exactly this, rather than falling through to `:4668`'s `missed`.
+    #[tokio::test]
+    async fn steer_reports_failed_with_the_reason_when_a_live_lane_never_boots() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run_dir = dir.path().join("wf");
+        // Live control, and NO capability ever published.
+        let host = host_with_live_lane(run_dir.clone(), "lane", 0);
+        let options = WorkflowSteerOptions {
+            ack_timeout_ms: Some(60),
+            ..WorkflowSteerOptions::default()
+        };
+
+        let receipt = host
+            .steer("lane", "hi", options, CancelToken::new())
+            .await
+            .expect("a launched key must yield a receipt");
+
+        assert_eq!(receipt.state, WorkflowSteerState::Failed);
+        assert_eq!(
+            receipt.error.as_deref(),
+            Some("Child session is not running yet."),
+            "the reason is the whole value of this arm over a bare `Missed`"
+        );
+        assert_eq!(
+            requests_in(&crate::background::control::step_steer_inbox_dir(
+                &run_dir, 0
+            )),
+            0,
+            "the readiness gate runs before the write on every pass of the poll"
+        );
+    }
+
+    /// The poll RETRIES rather than answering, which is the whole of pi `:4501-4502`. The lane is
+    /// live but its child has not published a capability when the call starts; it publishes 50 ms
+    /// in, and the steer delivers instead of reporting `Missed`.
+    ///
+    /// Without the retry this is a `Missed` (or, before the readiness gate, a file dropped for a
+    /// child that might never read it) — a concurrent lane steering a sibling that is still booting
+    /// is the ordinary case, not the exotic one, because `launch` blocks until its child settles and
+    /// `runs.steer` is therefore only ever called from a concurrent lane.
+    #[tokio::test]
+    async fn steer_polls_until_the_child_publishes_its_capability() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run_dir = dir.path().join("wf");
+        let host = host_with_live_lane(run_dir.clone(), "lane", 0);
+
+        let late = run_dir.clone();
+        let publisher = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            publish_capability(&late, 0, true).await;
+        });
+
+        let options = WorkflowSteerOptions {
+            // Twenty times the 50 ms boot — ample headroom for the 10 ms poll to see the
+            // capability land — and well under `STEER_ACK_TIMEOUT`, so the remainder spent waiting
+            // for an ack no fixture can send stays a fraction of a second.
+            ack_timeout_ms: Some(1_000),
+            ..WorkflowSteerOptions::default()
+        };
+        let receipt = host
+            .steer("lane", "narrow the diff", options, CancelToken::new())
+            .await
+            .expect("a launched key must yield a receipt");
+        publisher.await.expect("the publisher task must not panic");
+
+        assert_eq!(
+            receipt.state,
+            WorkflowSteerState::Queued,
+            "the poll must outlast the child's boot, not answer Missed at the first look"
+        );
+        assert!(receipt.request_id.is_some());
+        assert_eq!(
+            requests_in(&crate::background::control::step_steer_inbox_dir(
+                &run_dir, 0
+            )),
+            1,
+            "exactly one request — a retry loop must not write on every pass"
+        );
+    }
+
+    /// `supported: false` is TERMINAL and is answered immediately. Polling it to the deadline would
+    /// turn a knowable `Failed` into a `Missed` and cost the script the reason.
+    #[tokio::test]
+    async fn steer_reports_failed_for_a_child_whose_host_cannot_inject() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run_dir = dir.path().join("wf");
+        let host = host_with_live_lane(run_dir.clone(), "lane", 0);
+        publish_capability(&run_dir, 0, false).await;
+
+        let receipt = host
+            .steer(
+                "lane",
+                "hi",
+                WorkflowSteerOptions::default(),
+                CancelToken::new(),
+            )
+            .await
+            .expect("a failed steer is a RECEIPT here, never an Err — `Err` throws in the guest");
+
+        assert_eq!(receipt.state, WorkflowSteerState::Failed);
+        assert_eq!(
+            receipt.error.as_deref(),
+            Some("Workflow child 'lane' cannot be steered: its host cannot inject messages.")
+        );
+        assert!(
+            receipt.delivery_status.is_none(),
+            "nothing was delivered, so the queued/delivered refinement is omitted, not null"
+        );
+        let targets = receipt.targets.expect("one target");
+        assert_eq!(targets[0].state, "failed");
+        assert_eq!(targets[0].reason.as_deref(), receipt.error.as_deref());
+        assert_eq!(
+            requests_in(&crate::background::control::step_steer_inbox_dir(
+                &run_dir, 0
+            )),
+            0,
+            "a child that cannot be injected into gets no file"
+        );
+    }
+
+    /// pi `:4536`'s first term. An already-cancelled call answers on the first pass instead of
+    /// burning the budget — the guest asked to stop, and a receipt is still owed.
+    #[tokio::test]
+    async fn steer_answers_missed_immediately_when_the_call_is_cancelled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run_dir = dir.path().join("wf");
+        let host = host_with(run_dir, "lane", 0);
+        let cancel = CancelToken::new();
+        cancel.cancel();
+
+        let started = std::time::Instant::now();
+        let receipt = host
+            .steer("lane", "hi", WorkflowSteerOptions::default(), cancel)
+            .await
+            .expect("a cancelled steer still owes a receipt");
+
+        assert_eq!(receipt.state, WorkflowSteerState::Missed);
+        assert!(
+            started.elapsed() < STEER_ACK_TIMEOUT,
+            "cancellation must short-circuit the budget, not wait it out"
+        );
+    }
+
     /// An OMITTED mode is not an unrecognised one: it means "the caller did not say", which is
     /// `SteerDeliveryMode::Steer`. `Steer` is normalised OFF the wire, so the request carries no
     /// `mode` field at all — while `follow_up` is carried verbatim.
@@ -1213,7 +1607,8 @@ mod tests {
         ] {
             let dir = tempfile::tempdir().expect("tempdir");
             let run_dir = dir.path().join("wf");
-            let host = host_with(run_dir.clone(), "lane", 0);
+            let host = host_with_live_lane(run_dir.clone(), "lane", 0);
+            publish_capability(&run_dir, 0, true).await;
             let options = WorkflowSteerOptions {
                 mode,
                 ..WorkflowSteerOptions::default()
@@ -1269,7 +1664,12 @@ mod tests {
             workflow_key: WorkflowKey::parse(key).ok(),
             cwd: None,
             session_name: None,
-            active_children: std::collections::BTreeMap::new(),
+            // NON-EMPTY, exactly as `register_foreground_controls` leaves it: it calls
+            // `begin_foreground_child` with the run's one child at index 0 before the entry is ever
+            // visible. `lane_has_live_child` reads this term (pi `:4493`'s
+            // `activeChildren.size > 0`), so an empty map here would describe a control entry this
+            // crate never actually publishes.
+            active_children: one_active_child(),
         };
         host.executor
             .foreground_controls
@@ -1277,6 +1677,80 @@ mod tests {
             .unwrap()
             .insert(run_id.clone(), entry);
         run_id
+    }
+
+    /// The single child a foreground SINGLE run has, at its own run-local index `0` — NOT the flat
+    /// workflow index, which is a different namespace and lives on the steer handle
+    /// (`foreground_control.rs`'s `ForegroundChildSteerHandle::index` doc).
+    fn one_active_child() -> std::collections::BTreeMap<
+        usize,
+        crate::extension::executor::foreground_control::ForegroundChildEntry,
+    > {
+        let mut children = std::collections::BTreeMap::new();
+        children.insert(
+            0,
+            crate::extension::executor::foreground_control::ForegroundChildEntry {
+                index: 0,
+                agent: "worker".to_string(),
+                session_name: None,
+                description: None,
+                started_at: 0,
+                updated_at: 0,
+                current_activity_state: None,
+                current_tool: None,
+                current_path: None,
+                turn_count: None,
+                tool_count: None,
+                tokens: None,
+                interrupt: CancelToken::new(),
+                // `runs.steer` never reads this — it mints its own handle from the index it
+                // launched the key at (`child_steer_handle`) — so `None` is the honest fixture.
+                steer: None,
+            },
+        );
+        children
+    }
+
+    /// Publish the child's own steering capability, as a booted child's `prompt_runtime` does.
+    /// `steer` will not write a request without one — that is the whole of the readiness gate.
+    async fn publish_capability(run_dir: &std::path::Path, index: usize, supported: bool) {
+        crate::background::control::write_steer_capability_at(
+            &crate::background::control::steer_capability_path(run_dir, index),
+            &crate::background::control::SteerCapability {
+                kind: "steer-capability".to_string(),
+                protocol_version: 1,
+                index,
+                // A real pid: `write_steer_capability_at` refuses a zero one.
+                pid: 4242,
+                ready_at: 1,
+                supported,
+            },
+        )
+        .await
+        .expect("the child's capability must publish");
+    }
+
+    /// How many steer requests reached `inbox`. `0` for a directory that was never created, which
+    /// is what every non-delivering arm must assert.
+    fn requests_in(inbox: &std::path::Path) -> usize {
+        std::fs::read_dir(inbox)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// A host with `key` launched at `index` AND a live foreground control for that lane — the two
+    /// halves `steer` requires before it will write anything: the launch ledger supplies the index,
+    /// the control registry supplies liveness.
+    fn host_with_live_lane(run_dir: PathBuf, key: &str, index: usize) -> WorkflowRunHost {
+        let host = host_with(run_dir, key, index);
+        let workflow_run_id = host.workflow_run_id.clone();
+        register_live_child(&host, Some(&workflow_run_id), key, (None, None, None));
+        host
     }
 
     /// THE OBJECTIVE. A poll against a running child must return `Ok` carrying live evidence, not

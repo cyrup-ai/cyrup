@@ -116,6 +116,26 @@ pub(crate) fn dismiss_not_running_refusal(run_id: &str, state: RunState) -> Stri
 pub(crate) const STEER_FOREGROUND_RUN_REFUSAL: &str = "action='steer' currently supports live async Cyrup \
      child sessions only; use action='interrupt' or action='resume' for foreground runs.";
 
+/// pi `CHILD_SESSION_NOT_RUNNING_YET` (`subagent-executor.ts:4336`) — the foreground steer
+/// closure's first branch: *"the control exists, the child session does not yet"*
+/// (`:3860-3861`'s `if (!childSessionControls) return { state: "failed", reason: … }`).
+///
+/// It exists because the registration and the session are two events in that order: upstream's
+/// `beginForegroundChild` runs at `:3842` and `onChildSession` only at `:3899`, so there is a real
+/// window in which a control entry is live and cannot yet be steered. cyrup has the same window for
+/// the same reason — `register_foreground_controls` inserts the entry before the spawned child has
+/// reached its runtime — and its signal for the fact is the child's own published capability record
+/// ([`crate::background::control::read_steer_capability`], whose `None` is documented as exactly
+/// this: *"the child has not reached its runtime yet"*).
+///
+/// ⚠ It is RETRYABLE, never a refusal. `steerWorkflowChildByKey` polls on this precise reason
+/// (`:4501-4502`) rather than answering with it, which is what
+/// [`crate::extension::executor::workflow::WorkflowRunHost`]'s `steer` loop does here. The
+/// tool-side arm has no loop to hand it to, so it reports the sentence and the caller retries —
+/// which is still strictly better than the alternative it replaced, an unconditional file drop
+/// that reported `queued` for a child that might never exist.
+pub(crate) const CHILD_SESSION_NOT_RUNNING_YET: &str = "Child session is not running yet.";
+
 /// The fanout-child's restricted tool description — pi's exact 3-line text, joined with `\n`
 /// (`extension/fanout-child.ts:177-181` @v0.43.0; the same block sat at `:159-163` @v0.34.0). It
 /// tells the model up front which management/control actions remain available and which mutation

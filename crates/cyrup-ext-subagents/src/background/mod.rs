@@ -38,6 +38,7 @@ pub mod auto_drain;
 pub mod cascade;
 pub mod child_identity;
 pub mod child_stop;
+pub mod completion_replay;
 pub mod control;
 pub mod delivery;
 pub mod flat_index;

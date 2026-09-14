@@ -499,6 +499,119 @@ mod tests {
         }
     }
 
+    /// A [`CompletionSink`] that inspects the filesystem from INSIDE `deliver` — the one moment
+    /// strictly between "the completion was recorded" and "its payload was unlinked".
+    ///
+    /// The record must already exist when `deliver` is entered, because the delivery's receipt is
+    /// what authorises `settle_delivery`'s `watcher.consume(payload, receipt)` (`install.rs`'s
+    /// delete-last). A sink positioned here is the only observer between the two, and it is what
+    /// makes the ordering test FAIL for a record-after-delivery placement that "records the
+    /// completion" just as truthfully.
+    struct OrderingSink {
+        results_dir: PathBuf,
+        replay_existed_at_delivery: Arc<std::sync::atomic::AtomicBool>,
+        payload_existed_at_delivery: Arc<std::sync::atomic::AtomicBool>,
+        payload_path: PathBuf,
+    }
+
+    #[async_trait::async_trait]
+    impl CompletionSink for OrderingSink {
+        async fn deliver(
+            &self,
+            run_id: &crate::background::RunId,
+            _message: CompletionMessage,
+        ) -> CompletionDelivery {
+            use std::sync::atomic::Ordering;
+            self.replay_existed_at_delivery.store(
+                crate::background::completion_replay::completion_replay_path(
+                    &self.results_dir,
+                    run_id,
+                )
+                .exists(),
+                Ordering::SeqCst,
+            );
+            self.payload_existed_at_delivery
+                .store(self.payload_path.exists(), Ordering::SeqCst);
+            CompletionDelivery::delivered(run_id.clone())
+        }
+    }
+
+    /// SUBA-056's ordering law, ported verbatim from pi `result-watcher.ts:432-433`:
+    ///
+    /// > Recorded before dedupe and before the unlink below so bg_wait can use the in-memory record
+    /// > or its bounded durable replay after cleanup.
+    ///
+    /// This asserts ORDERING, not presence. Presence alone passes with the record written after
+    /// delivery, which is exactly the refactor the architecture would still let compile: observation
+    /// is Phase 1 and synchronous, the delivery is Phase 2 and spawned, and moving the persist into
+    /// the spawned task would still "record the completion" — just after the payload it exists to
+    /// outlive is already gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_replay_record_is_written_before_the_payload_is_deleted() {
+        use crate::background::wait_completions::WaitCompletionStore;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (_dir, results_dir) = temp_results_dir();
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir results_dir");
+
+        let result = result_with_children(
+            "run-replay-order",
+            RunState::Complete,
+            true,
+            None,
+            vec![child_result("worker", Some("the answer"), 0)],
+        );
+        let payload_path = published_path(&results_dir, &result);
+        publish_result(&results_dir, &result).await;
+
+        let replay_seen = Arc::new(AtomicBool::new(false));
+        let payload_seen = Arc::new(AtomicBool::new(false));
+        let sink = OrderingSink {
+            results_dir: results_dir.clone(),
+            replay_existed_at_delivery: Arc::clone(&replay_seen),
+            payload_existed_at_delivery: Arc::clone(&payload_seen),
+            payload_path: payload_path.clone(),
+        };
+
+        // The real observer seam, with its durable mirror armed exactly as
+        // `SubagentExecutor::install_completion_watcher` arms it.
+        let store = Arc::new(WaitCompletionStore::default());
+        store.set_replay_dir(results_dir.clone());
+        let handle = install_completion_watcher_with_observer(
+            results_dir.clone(),
+            Arc::new(sink),
+            Some(Arc::clone(&store) as Arc<dyn CompletionObserver>),
+            owning(),
+        )
+        .expect("watcher installs");
+
+        // The unlink now lives in `settle_delivery`, reached only once the spawned delivery task
+        // joins — so poll for the payload's ABSENCE rather than assuming it is synchronous with
+        // `deliver`.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && payload_path.exists() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            !payload_path.exists(),
+            "the payload must be consumed after delivery (R-SA-099 delete-last)"
+        );
+
+        assert!(
+            payload_seen.load(Ordering::SeqCst),
+            "sanity: the sink runs BEFORE the unlink, or this test proves nothing"
+        );
+        assert!(
+            replay_seen.load(Ordering::SeqCst),
+            "the durable replay record must already exist when the sink is entered — \
+             recorded before dedupe and before the unlink (`result-watcher.ts:432-433`)"
+        );
+
+        drop(handle);
+    }
+
     /// THE acceptance test for this change: two cyrup instances, one shared results directory.
     ///
     /// Reproduces the reported defect — runs launched by pid 488520 were consumed and deleted by

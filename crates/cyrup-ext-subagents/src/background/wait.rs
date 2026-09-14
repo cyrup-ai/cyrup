@@ -67,14 +67,22 @@
 //! The in-process [`super::wait_completions::WaitCompletionStore`] is consulted FIRST — it is what
 //! survives the completion watcher's delete-last, because it is registered ahead of
 //! [`super::watch::CompletionBus`] in the watcher's composite observer
-//! (`extension/executor/notices.rs:419-431`). That ordering is what closes the wake-then-read race:
+//! (`extension/executor/notices.rs`'s `CompositeCompletionObserver`, where
+//! `self.wait_completions()` is the FIRST member). That ordering is what closes the wake-then-read
+//! race:
 //! a wait that wakes on the bus and immediately re-reads finds the store already holding what the
 //! watcher is about to delete.
 //!
-//! A third rung — durable replay across a **process restart** — does not exist yet; its producer
-//! has not landed. Until it does, a run whose payload is gone AND whose in-process record has
-//! expired contributes only its records-only fallback (steps + an artifacts pointer), never the
-//! child's own answer.
+//! # Resolving a completion after cleanup (SUBA-056)
+//!
+//! A resolved wait reports each terminal run's completion through
+//! [`super::wait_completions::collect_wait_completions`], which resolves in three rungs: the
+//! in-process record, the payload on disk, and — when the watcher has already delivered and
+//! UNLINKED the payload — the durable replay record in [`super::completion_replay`]. The record is
+//! written BEFORE the unlink (pi `result-watcher.ts:432-433`), which is the entire reason a `wait`
+//! arriving after cleanup resolves instead of reporting a completion it demonstrably observed as
+//! absent. It survives a process restart, which the in-process record does not, and expires at
+//! [`super::watch::DEDUP_TTL`].
 //!
 //! # Scoping (SUBA-031)
 //!
@@ -236,8 +244,8 @@ pub struct WaitDeps {
     /// `deps.state.completedResults`, read by `collectWaitCompletions` at
     /// `wait-completions.ts:164`). Populated by
     /// [`crate::background::wait_completions::WaitCompletionStore`]'s
-    /// [`crate::background::watch::CompletionObserver`] impl, registered first in the watcher's
-    /// composite (`extension/executor/notices.rs:419-431`).
+    /// [`crate::background::watch::CompletionObserver`] impl, registered FIRST in the watcher's
+    /// composite (`extension/executor/notices.rs`'s `CompositeCompletionObserver`).
     ///
     /// `Arc` rather than a borrow because [`WaitDeps`] is `Clone` and constructed well before the
     /// wait runs.

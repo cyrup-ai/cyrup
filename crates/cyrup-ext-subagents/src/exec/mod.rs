@@ -42,6 +42,7 @@ pub mod completion_guard;
 pub mod control;
 pub mod fallback;
 pub mod mcp_direct_tools;
+pub mod model_exclusions;
 pub mod model_scope;
 pub mod mutation_evidence;
 pub mod ndjson;
@@ -376,10 +377,20 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         crate::runner::dispatch::RunnerDispatch::NativePi => {}
     }
 
-    let candidates = resolve_model_candidates(agent, opts);
+    let (candidates, exclusion_evidence) = resolve_model_candidates(agent, opts);
     if candidates.is_empty() {
-        let error = "no candidate model available for this subagent run (empty fallback ladder)"
-            .to_string();
+        // SCOPE_3j — pi throws `ZERO_USABLE_MODEL_CANDIDATES_ERROR` with bounded evidence from
+        // inside `buildModelCandidates` (`model-fallback.ts:512-520`); cyrup's builder is
+        // infallible by documented contract, so the same sentence is rendered at this existing
+        // empty-ladder site instead. `None` reproduces upstream's own precondition (`:514`): a
+        // ladder that was ALREADY empty before the exclusion filter ran is not an exclusion
+        // problem, and keeps the message it has always had.
+        let error = exclusion_evidence
+            .zero_usable_candidates_error()
+            .unwrap_or_else(|| {
+                "no candidate model available for this subagent run (empty fallback ladder)"
+                    .to_string()
+            });
         return pre_spawn_failure(agent, task, error);
     }
 
@@ -795,19 +806,33 @@ fn depth_guard_failure(agent: &AgentConfig, task: &str) -> Option<SingleResult> 
 /// (`runs/foreground/execution.ts:1885` @v0.64.0) — the agent's own `subagents.defaultProvider`
 /// stamp, else the parent session's provider — under which a bare candidate id is qualified to
 /// `provider/id` before it reaches `--model`.
-fn resolve_model_candidates(agent: &AgentConfig, opts: &RunOptions) -> Vec<ModelId> {
-    let (candidates, _scope_warnings) = crate::exec::fallback::build_model_candidates_scoped(
-        &opts.model_override,
-        agent.model.as_ref(),
-        &agent.fallback_models,
-        &opts.available_models,
-        agent
-            .model_provider
-            .as_ref()
-            .or(opts.preferred_provider.as_ref()),
-        opts.model_scope.as_ref(),
-    );
-    candidates
+/// SCOPE_3j: the ladder's LAST construction step is now the cached-exclusion filter, so this
+/// returns the evidence alongside it. A model the last run proved to be rate-limited is dropped
+/// here rather than re-attempted, and when that empties the ladder the evidence is what turns the
+/// caller's generic "empty fallback ladder" refusal into upstream's
+/// [`crate::exec::model_exclusions::ZERO_USABLE_MODEL_CANDIDATES_ERROR`] with the reason and expiry
+/// for each dropped candidate.
+fn resolve_model_candidates(
+    agent: &AgentConfig,
+    opts: &RunOptions,
+) -> (
+    Vec<ModelId>,
+    crate::exec::model_exclusions::ModelExclusionEvidence,
+) {
+    let (candidates, _scope_warnings, exclusion_evidence) =
+        crate::exec::fallback::build_model_candidates_scoped(
+            &opts.model_override,
+            agent.model.as_ref(),
+            &agent.fallback_models,
+            &opts.available_models,
+            agent
+                .model_provider
+                .as_ref()
+                .or(opts.preferred_provider.as_ref()),
+            opts.model_scope.as_ref(),
+            opts.model_exclusions.as_deref(),
+        );
+    (candidates, exclusion_evidence)
 }
 
 /// Step 4: drive the model-fallback ladder, spawning one REAL child OS process per attempt via
@@ -845,7 +870,10 @@ async fn drive_fallback_ladder<'a>(
         require_read_tool,
         live_notes_emitted: 0,
     };
-    run_fallback_ladder(candidates, &mut runner).await
+    // SCOPE_3j: the ladder shell performs the cached-exclusion write for every attempt that reaches
+    // the model-failure classification, so the store travels with the run rather than being read
+    // from a process global.
+    run_fallback_ladder(candidates, &mut runner, opts.model_exclusions.as_deref()).await
 }
 
 /// The WINNING attempt's progress fold AND its live-control monitor (pi keeps both as locals of
@@ -2011,7 +2039,7 @@ mod tests {
         agent.model_provider = Some(cyrup_core::ProviderId::from("openai-codex"));
         let mut opts = base_opts(dir.path(), &["gpt-5", "gpt-5-mini"]);
         opts.preferred_provider = Some(cyrup_core::ProviderId::from("anthropic"));
-        let candidates = resolve_model_candidates(&agent, &opts);
+        let (candidates, _exclusions) = resolve_model_candidates(&agent, &opts);
         assert_eq!(
             candidates,
             vec![
@@ -2039,12 +2067,12 @@ mod tests {
 
         // (b) with no agent provider, the PARENT session's provider (pi `currentProvider`) applies.
         let agent = sample_agent_config("gpt-5", &[]);
-        let candidates = resolve_model_candidates(&agent, &opts);
+        let (candidates, _exclusions) = resolve_model_candidates(&agent, &opts);
         assert_eq!(candidates, vec![ModelId::from("anthropic/gpt-5")]);
 
         // (c) with neither, the id ships exactly as written — the pre-SUBA-088 argv.
         opts.preferred_provider = None;
-        let candidates = resolve_model_candidates(&agent, &opts);
+        let (candidates, _exclusions) = resolve_model_candidates(&agent, &opts);
         assert_eq!(candidates, vec![ModelId::from("gpt-5")]);
     }
 

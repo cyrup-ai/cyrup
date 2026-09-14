@@ -121,6 +121,65 @@ pub(crate) async fn write_atomic_json_creating_parent<T: serde::Serialize + Sync
     write_atomic_json(path, value).await
 }
 
+/// The ASYNC, owner-only (`0600`) sibling of [`write_atomic_json`] — pi `writePrivateAtomicJson`
+/// (`shared/atomic-json.ts:62`) for callers that are already inside an async context.
+///
+/// Identical semantics to [`write_private_atomic_json_blocking`]: it creates the parent, chmods the
+/// temp file to `0600` BEFORE the rename so the private mode is in effect the instant the file
+/// becomes visible, and reuses this module's [`unique_temp_path`] + [`rename_with_backoff`] — a
+/// third entry point onto one implementation, not a third implementation.
+///
+/// It exists because [`crate::background::completion_replay`] writes from the completion watcher's
+/// SYNCHRONOUS observe phase (`watch/install.rs`'s Phase 1, inline in the scan loop), where the
+/// blocking variant's `std::thread::sleep` rename backoff would park the reactor thread for up to
+/// ~0.6 s under contention ([`MAX_RENAME_ATTEMPTS`] × [`RETRY_MAX_DELAY`]) — and that scan loop is
+/// exactly the path `ASYNC_NOTIFY_BUG_REPORT` RC1 proved must never block.
+///
+/// It deliberately does NOT delegate to [`write_atomic_json`]: that would rename before the chmod,
+/// leaving the record world-readable for the window in between. `0600` is not cosmetic here — a
+/// replay record embeds a child's completion and its archive can embed 64 KiB of that child's
+/// output, and `results_dir` is a shared per-cwd directory every cyrup instance in the project can
+/// read.
+///
+/// # Errors
+///
+/// Serialization, `mkdir`, write, chmod, or a rename that exhausts the retry budget. The temp file
+/// is best-effort removed on every error path.
+pub(crate) async fn write_private_atomic_json<T: serde::Serialize + Sync>(
+    path: &Path,
+    value: &T,
+) -> io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(value)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let tmp = unique_temp_path(path)?;
+
+    if let Err(write_err) = tokio::fs::write(&tmp, &bytes).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(write_err);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Err(mode_err) =
+            tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).await
+        {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(mode_err);
+        }
+    }
+
+    match rename_with_backoff(&tmp, path).await {
+        Ok(()) => Ok(()),
+        Err(rename_err) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            Err(rename_err)
+        }
+    }
+}
+
 /// The SYNCHRONOUS, owner-only (`0600`) sibling of [`write_atomic_json`] — pi
 /// `writePrivateAtomicJson` (`pi-subagents/src/shared/atomic-json.ts:62`, i.e.
 /// `createAtomicJsonWriter({ mode: 0o600 })`), the writer the whole `missions/` subtree persists

@@ -1407,8 +1407,11 @@ pub struct SubagentPromptRuntime {
     /// untouched and this half of the runtime costs nothing.
     tool_budget: Option<ToolBudgetGuard>,
     /// G90 / pi `registerSteeringInbox` (`subagent-prompt-runtime.ts:328-470`). `Some` only when
-    /// the parent handed this child a [`STEER_INBOX_ENV`] path — i.e. only for a background/async
-    /// child, which is the only kind that has an async run directory to steer through.
+    /// the parent handed this child a [`STEER_INBOX_ENV`] path — i.e. only for a child the parent
+    /// gave a control root to: a background/async child (the async run dir) or, since WORKFLOW_14,
+    /// a foreground WORKFLOW child (the workflow's own run dir). The child side has never had a
+    /// foreground/background distinction and still has none — it reads three env vars and attaches
+    /// a watcher — so widening the set of parents that supply them changed nothing here.
     steering: Option<Arc<SteeringInbox>>,
     /// pi `registerChildWatchdog(pi)` (`subagent-prompt-runtime.ts:477`). `Some` only when the
     /// parent armed this child through

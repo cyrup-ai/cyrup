@@ -1301,8 +1301,10 @@ fn env_control_channels(
     // = input.steerInboxDir`): hand this child the path to its OWN steer inbox. `run_sync` creates
     // the directory before the spawn so the child's watcher has something to attach to on its very
     // first tick, exactly as upstream's child-side `start()` does its own `mkdirSync` — see
-    // [`crate::prompt_runtime::SteeringInbox`]. Absent on the foreground path, so a foreground child
-    // is byte-identical to before.
+    // [`crate::prompt_runtime::SteeringInbox`]. Present for every child the parent gave a control
+    // root to — a background/async child, and (WORKFLOW_14) a foreground WORKFLOW child, whose root
+    // is the workflow's own run directory. Absent only for a plain (non-workflow) foreground SINGLE
+    // run, which has no run directory of any kind, so THAT child is byte-identical to before.
     if let Some(inbox) = opts
         .steer_inbox_dir
         .as_deref()
@@ -1317,8 +1319,10 @@ fn env_control_channels(
     // SUBA-049 (pi `runs/shared/pi-args.ts:764-768` @v0.43.0: `if (input.steerCapabilityPath)
     // env[SUBAGENT_STEER_CAPABILITY_ENV] = …; if (input.steerAckDir) env[SUBAGENT_STEER_ACK_DIR_ENV]
     // = …`): the RETURN half of the same channel. Both are written under the same `if (…)` shape
-    // upstream uses, so a foreground child — which has no run directory and therefore neither path —
-    // is byte-identical to before.
+    // upstream uses, and both travel with the inbox above — ALL THREE OR NONE is enforced one layer
+    // up, where the three are derived from a single handle (`build_foreground_run_options`). So a
+    // plain (non-workflow) foreground child — which has no run directory and therefore none of the
+    // three paths — is byte-identical to before, and a foreground WORKFLOW child gets all three.
     if let Some(path) = opts
         .steer_capability_path
         .as_deref()

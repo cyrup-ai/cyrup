@@ -792,6 +792,9 @@ impl SubagentExecutor {
             // SUBA-021 — pi `config.usageBudget` (`subagent-runner.ts:172`), the caller's single
             // rung. The terminal check lives at `run_sync`'s settle (`exec/mod.rs`).
             usage_budget: overrides.usage_budget,
+            // SCOPE_3j — the executor-owned cached-exclusion registry, cloned per run so every
+            // foreground ladder filters against and records into the one store this session has.
+            model_exclusions: Some(self.model_exclusions()),
             // SUBA-008 — the three-rung chain [`SubagentExecutor::resolve_run_agent`] resolved
             // (caller > frontmatter > config).
             turn_budget,
@@ -901,6 +904,18 @@ impl SubagentExecutor {
             // a foreground WORKFLOW child's control root is the workflow's own run directory
             // (WORKFLOW_13), so all three paths are real for it. `None` here now means "not a
             // workflow child", not "impossible".
+            //
+            // ⚠ AND IT STAYS `None` FOR ONE, deliberately. An earlier plan for this change gave a
+            // plain foreground run its own scratch-rooted control tree
+            // (`<temp>/scratch/<cwd_key>/fg-<run_id>/`) so the three paths could be unconditional.
+            // That tree would have no writer: the only two routes to a foreground child's steer
+            // handle both REQUIRE a workflow — `resolve_workflow_foreground_steering_target` gates
+            // on `parent_workflow_run_id` and `runs.steer` is a `workflowScript` verb — and
+            // `action: "steer"` refuses a plain foreground run outright by design
+            // (`STEER_FOREGROUND_RUN_REFUSAL`, upstream-faithful at `subagent-executor.ts:3217`).
+            // So it would have cost three `create_dir_all`s and a teardown per foreground run to
+            // create directories nothing could ever address. Widening the refusal is what makes
+            // that tree worth building; until then, this `None` is the honest answer.
             //
             // ALL THREE OR NONE — derived from ONE handle so they cannot be populated apart. The
             // ack dir without the inbox is a return path for a request that can never arrive; the

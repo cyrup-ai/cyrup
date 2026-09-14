@@ -11,7 +11,7 @@
 //! to read at either of the two paths [`collect_wait_completions`] otherwise tries: the promoted
 //! payload is gone and the session index that pointed at it is retired in the same operation. pi
 //! closes exactly this gap by recording the projected completion at the moment it is observed,
-//! before the unlink (`result-watcher.ts:428-435`). [`WaitCompletionStore`] is that record, wired
+//! before the unlink (`result-watcher.ts:432-433`). [`WaitCompletionStore`] is that record, wired
 //! onto the same [`crate::background::watch::CompletionObserver`] seam the completion bus already
 //! uses — see its own doc for the registration-order argument.
 //!
@@ -24,6 +24,15 @@
 //! record.rs    WaitCompletionStore (+ its CompletionObserver impl)
 //! collect.rs   collect_wait_completions — the three-rung resolution a wait reads through
 //! ```
+//!
+//! # The durable tier underneath
+//!
+//! [`WaitCompletionStore`] survives the unlink but not the PROCESS. The record it writes is
+//! therefore mirrored into [`crate::background::completion_replay`] — pi's `persistence` argument
+//! (`wait-completions.ts:130`), carried here by [`ReplayPersistence`] — and
+//! [`collect_wait_completions`]' third rung reads it back. That is what makes a `wait` issued in a
+//! LATER process, or after [`crate::background::watch::DEDUP_TTL`], still report a completion
+//! whose payload was delivered and deleted.
 //!
 //! # Tolerant by policy, strict at one seam
 //!
@@ -42,4 +51,10 @@ pub use project::{
     CompletionProjectionError, CompletionUsage, WaitCompletion, WaitCompletionChild,
     completion_usage, project_structured_output, to_wait_completion,
 };
-pub use record::WaitCompletionStore;
+pub use record::{ReplayPersistence, WaitCompletionStore};
+
+// The shared `nonEmptyString` predicate, re-exported for
+// [`crate::background::completion_replay`]'s archive projector: it reads the SAME raw payload this
+// module projects, through the same rule, and upstream keeps a second copy of the function that
+// cyrup deliberately does not.
+pub(crate) use project::non_empty;
