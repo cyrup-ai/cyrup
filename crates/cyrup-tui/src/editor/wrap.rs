@@ -31,7 +31,12 @@ impl InputEditor {
         let width = self.view_width.max(1);
         let mut map = Vec::with_capacity(self.lines.len());
         for (logical, line) in self.lines.iter().enumerate() {
-            for (start, len) in word_wrap_line(line, width) {
+            // pi hands `wordWrapLine` the MARKER-MERGED grapheme list
+            // (`editor.ts:1837`: `wordWrapLine(line, width, [...this.segment(line, "grapheme")])`),
+            // which is what keeps a `[paste #N …]` marker whole across a wrap.
+            let joined: String = line.iter().collect();
+            let segs = self.wrap_segments(line, &joined);
+            for (start, len) in word_wrap_line(line, width, Some(&segs)) {
                 map.push(VisualLine {
                     logical,
                     start,
@@ -60,9 +65,81 @@ impl InputEditor {
         let count: usize = self
             .lines
             .iter()
-            .map(|line| word_wrap_line(line, width).len())
+            .map(|line| {
+                // The SAME segmentation `visual_line_map` uses — pi's two `wordWrapLine` callers
+                // (`editor.ts:1020` `layoutText`, `:1837` `buildVisualLineMap`) both pass the merged
+                // list. Left on plain graphemes this path would SIZE the editor box from a different
+                // row count than the map it is DRAWN from reports.
+                let joined: String = line.iter().collect();
+                let segs = self.wrap_segments(line, &joined);
+                word_wrap_line(line, width, Some(&segs)).len()
+            })
             .sum();
         count.max(1)
+    }
+
+    /// The grapheme-granularity segments of `line` **with every valid `[paste #N …]` marker merged
+    /// into one atomic segment** — pi's `this.segment(line, "grapheme")` (`editor.ts:377-379` =
+    /// `segmentWithMarkers(text, graphemeSegmenter, this.validPasteIds())`, merge logic at
+    /// `:46-98`). This is exactly what both real `wordWrapLine` callers pass as `preSegmented`
+    /// (`:1020` `layoutText`, `:1837` `buildVisualLineMap`).
+    ///
+    /// The grapheme-granularity twin of [`word_segments`](Self::word_segments): one pass over
+    /// `joined.grapheme_indices(true)` with a [`marker_spans`](Self::marker_spans) cursor, emitting
+    /// the merged marker once at its first base segment and skipping the rest (`:71-86`). It carries
+    /// the segment TEXT rather than only boundaries — which is why it is not derived from
+    /// [`marker_grapheme_boundaries`](Self::marker_grapheme_boundaries) — because the wrap loop
+    /// measures each segment with [`display_width`] and tests it with `is_whitespace_seg` /
+    /// `is_cjk_break`.
+    ///
+    /// [`WrapSeg::atomic`] here comes from the `validIds`-gated [`marker_spans`](Self::marker_spans)
+    /// where pi re-tests every segment syntactically with `isPasteMarker` (`:34-36`). The two
+    /// coincide: an unregistered marker is never merged, so it is never a single segment, so
+    /// `isPasteMarker` never sees one whole. (An equivalence note, not a `CYRUP-DELTA`.)
+    ///
+    /// Costs one `String` + `Vec` per logical line per call, on a path (`render`, `cursor_in`) pi
+    /// runs identically: `word_wrap_line` already joins each line and `marker_spans` already runs
+    /// per line on the cursor path.
+    pub(super) fn wrap_segments<'a>(&self, line: &[char], joined: &'a str) -> Vec<WrapSeg<'a>> {
+        let markers = self.marker_spans(line);
+        let mut out: Vec<WrapSeg<'a>> = Vec::with_capacity(line.len());
+        let mut col = 0usize;
+        let mut mi = 0usize;
+        for (byte, g) in joined.grapheme_indices(true) {
+            let start = col;
+            col += g.chars().count();
+            // "Skip past markers that are entirely before this segment" (`editor.ts:71-73`).
+            while markers.get(mi).is_some_and(|&(_, end, _)| end <= start) {
+                mi += 1;
+            }
+            match markers.get(mi) {
+                // "This segment falls inside a marker" (`:78`): emit the merged segment once, at the
+                // marker's first base segment, and skip the rest (`:80-92`).
+                Some(&(ms, me, _)) if start >= ms && start < me => {
+                    if start == ms {
+                        // `text.slice(marker.start, marker.end)` (`:82`) — from the marker's first
+                        // byte, `me - ms` chars on. No-panic: a `None` anywhere degrades to the base
+                        // cluster, which only costs the merge, never correctness of the tiling.
+                        let text = joined.get(byte..).map_or(g, |rest| {
+                            rest.char_indices()
+                                .nth(me.saturating_sub(ms))
+                                .map_or(rest, |(b, _)| rest.get(..b).unwrap_or(rest))
+                        });
+                        out.push(WrapSeg {
+                            start: ms,
+                            text,
+                            atomic: true,
+                        });
+                    }
+                }
+                _ => out.push(WrapSeg {
+                    start,
+                    text: g,
+                    atomic: false,
+                }),
+            }
+        }
+        out
     }
 
     /// Map the cursor `(row, col)` to its index in `map` (`editor.ts:1742` `find_current_visual_line`):
@@ -479,8 +556,41 @@ fn is_cjk_break(g: &str) -> bool {
     })
 }
 
+/// One segment of the wrap input — pi's `Intl.SegmentData` as `wordWrapLine` reads it
+/// (`editor.ts:136-140`), plus the `isPasteMarker(grapheme)` bit (`:34-36`) upstream re-derives
+/// from the segment text at each use.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct WrapSeg<'a> {
+    /// `seg.index` — a **char** column into the line (cyrup's buffer is `Vec<char>`, so char
+    /// indices are its `string.slice` offsets).
+    pub(super) start: usize,
+    /// `seg.segment`.
+    pub(super) text: &'a str,
+    /// `isPasteMarker(seg.segment)`: a whole merged `[paste #N …]` marker, i.e. a COMPOSITE
+    /// segment — the only kind that is wider than one cluster and still splittable.
+    pub(super) atomic: bool,
+}
+
+/// Plain extended grapheme clusters of `s` as wrap segments — upstream's
+/// `[...graphemeSegmenter.segment(line)]` default (`editor.ts:132`). Never composite, hence
+/// `atomic: false` throughout.
+fn grapheme_wrap_segments(s: &str) -> Vec<WrapSeg<'_>> {
+    let mut segs: Vec<WrapSeg<'_>> = Vec::with_capacity(s.len());
+    let mut col = 0usize;
+    for g in s.graphemes(true) {
+        segs.push(WrapSeg {
+            start: col,
+            text: g,
+            atomic: false,
+        });
+        col += g.chars().count();
+    }
+    segs
+}
+
 /// Word-aware wrap of one logical line into `(start_col, len)` visual segments fitting `width`
-/// **display columns** — a 1:1 port of `wordWrapLine` (`editor.ts:114-206`). An empty line yields
+/// **display columns** — a 1:1 port of `wordWrapLine` (`editor.ts:121-213 @v0.85.1`,
+/// byte-identical to `:114-206 @v0.83.0`). An empty line yields
 /// one zero-length segment. `width` is assumed `>= 1` (callers clamp). The returned columns are
 /// char indices into `line` (cyrup's buffer is `Vec<char>`, so char indices are its `string.slice`),
 /// and the segments tile the line contiguously.
@@ -488,68 +598,91 @@ fn is_cjk_break(g: &str) -> bool {
 /// The three things the previous implementation got wrong, all from measuring `n - start <= width`
 /// over a `&[char]` — a CHAR COUNT:
 ///
-/// 1. **Width.** Upstream accumulates `visibleWidth(grapheme)` (`:139-143`), so 24 CJK ideographs
+/// 1. **Width.** Upstream accumulates `visibleWidth(grapheme)` (`:145`), so 24 CJK ideographs
 ///    are 48 columns, not 24. At a layout width of 39 the char count said "fits", the map reported
 ///    one visual line, four ideographs rendered past the right edge and — because
 ///    [`crate::editor::InputEditor::cursor_in`] resolves the caret through that same map — the caret left the frame.
 /// 2. **Granularity.** Upstream iterates GRAPHEMES and breaks at a cluster's own start index
-///    (`:157-160`), so a break never lands inside a cluster. Breaking at `start + width` char-wise
+///    (`:164-167`), so a break never lands inside a cluster. Breaking at `start + width` char-wise
 ///    put `👨` on one row and a bare `\u{200d}👩‍👧‍👦` on the next.
 /// 3. **CJK break opportunities.** Upstream records a wrap opportunity between any two adjacent
-///    non-space graphemes when either is CJK (`:191-198`), because CJK text has no spaces to break
+///    non-space graphemes when either is CJK (`:198-205`), because CJK text has no spaces to break
 ///    at. Without it a whole CJK paragraph is one unbreakable "word".
 ///
 /// The loop below is upstream's, statement for statement: an overflow check that first tries to
 /// backtrack to the last recorded opportunity and otherwise force-breaks at the current cluster's
-/// start (`:145-161`), then the advance and the opportunity bookkeeping (`:180-199`).
+/// start (`:149-168`), then the advance and the opportunity bookkeeping (`:188-206`).
 ///
-/// [CYRUP-DELTA] `:163-178` handles a single segment wider than `maxWidth` by *recursively*
-/// re-wrapping it, which upstream needs because its segmenter merges a whole `[paste #N …]` marker
-/// into one atomic segment. cyrup's segments are plain extended grapheme clusters — never composite
-/// — so there is nothing to re-wrap: an over-wide cluster (a wide emoji at `width == 1`) is
-/// indivisible and takes a row of its own. That is where upstream's recursion converges for a
-/// splittable segment, and it is also the case upstream cannot express at all: `wordWrapLine("👨",
-/// 1)` recurses on itself forever.
-pub(super) fn word_wrap_line(line: &[char], width: usize) -> Vec<(usize, usize)> {
+/// `pre_segmented` is upstream's optional `preSegmented` parameter (`:121`, consumed at `:132` as
+/// `preSegmented ?? [...graphemeSegmenter.segment(line)]`). Both real callers pass the
+/// MARKER-MERGED list — `wordWrapLine(line, W, [...this.segment(line, "grapheme")])` at `:1020`
+/// and `:1837` — so a whole `[paste #N …]` marker is ONE segment and the wrap breaks before it or
+/// after it, never inside it. `None` reproduces the default segmenter: plain extended grapheme
+/// clusters, none of them composite.
+///
+/// Three of upstream's guards exist only because a segment may be composite: `isWs` excludes a
+/// merged marker (`:147`) — the marker text holds spaces and `is_whitespace_seg` is *contains*, so
+/// unguarded a whole marker reads as whitespace — and the two `cjkBreakRegex` tests exclude one
+/// likewise (`:200-201`).
+///
+/// [CYRUP-DELTA] `:170-186` re-wraps an over-wide segment by *recursing* with no `preSegmented`.
+/// That is ported here for the case it was written for — a COMPOSITE segment, i.e. a marker too
+/// wide for the frame, which is splittable at grapheme granularity — and gated on exactly that.
+/// A single grapheme CLUSTER wider than `width` (a wide emoji at `width == 1`) is indivisible, and
+/// upstream's branch cannot express it: `wordWrapLine("👨", 1)` re-enters with the same input and
+/// recurses forever. That case keeps cyrup's terminating branch — the cluster takes a row of its
+/// own, which is where upstream's recursion converges for anything splittable.
+/// Cited: `editor.ts:170-186 @v0.85.1` (identical at `v0.83.0 :163-178`).
+pub(super) fn word_wrap_line(
+    line: &[char],
+    width: usize,
+    pre_segmented: Option<&[WrapSeg<'_>]>,
+) -> Vec<(usize, usize)> {
     let width = width.max(1);
     let n = line.len();
-    // `if (!line || maxWidth <= 0) return [{ text: "", startIndex: 0, endIndex: 0 }]` (`:115-117`).
+    // `if (!line || maxWidth <= 0) return [{ text: "", startIndex: 0, endIndex: 0 }]` (`:122-124`).
     if n == 0 {
         return vec![(0, 0)];
     }
     let s: String = line.iter().collect();
-    // `if (lineWidth <= maxWidth) return [{ text: line, ... }]` (`:119-122`).
+    // `if (lineWidth <= maxWidth) return [{ text: line, ... }]` (`:126-129`).
     if display_width(&s) <= width {
         return vec![(0, n)];
     }
 
-    // `const segments = [...graphemeSegmenter.segment(line)]` (`:125`), carrying each cluster's
-    // start index — `seg.index` upstream, a char column here.
-    let mut segs: Vec<(usize, &str)> = Vec::with_capacity(n);
-    let mut col = 0usize;
-    for g in s.graphemes(true) {
-        segs.push((col, g));
-        col += g.chars().count();
-    }
+    // `const segments = preSegmented ?? [...graphemeSegmenter.segment(line)]` (`:132`).
+    let fallback: Vec<WrapSeg<'_>>;
+    let segs: &[WrapSeg<'_>] = match pre_segmented {
+        Some(pre) => pre,
+        None => {
+            fallback = grapheme_wrap_segments(&s);
+            &fallback
+        }
+    };
 
     let mut chunks: Vec<(usize, usize)> = Vec::new();
     let mut current_width = 0usize;
     let mut chunk_start = 0usize;
-    // `wrapOppIndex` / `wrapOppWidth` (`:131-133`), as one `Option` so `-1` cannot leak.
+    // `wrapOppIndex` / `wrapOppWidth` (`:138-140`), as one `Option` so `-1` cannot leak.
     let mut wrap_opp: Option<(usize, usize)> = None;
 
     for i in 0..segs.len() {
-        let Some(&(char_index, grapheme)) = segs.get(i) else {
+        let Some(seg) = segs.get(i) else {
             continue;
         };
-        let g_width = display_width(grapheme);
-        let is_ws = is_whitespace_seg(grapheme);
+        let char_index = seg.start;
+        let g_width = display_width(seg.text);
+        // `const isWs = !isPasteMarker(grapheme) && isWhitespaceChar(grapheme)` (`:147`). The guard
+        // is load-bearing: `[paste #1 1500 chars]` contains two spaces and `is_whitespace_seg` is
+        // `any`, so an unguarded merged marker reads as whitespace and records a break opportunity
+        // after itself that upstream does not have.
+        let is_ws = !seg.atomic && is_whitespace_seg(seg.text);
 
-        // "Overflow check before advancing" (`:145-161`).
+        // "Overflow check before advancing" (`:149-168`).
         if current_width + g_width > width {
             match wrap_opp {
                 // "Backtrack to last wrap opportunity (the remaining content plus the current
-                // grapheme still fits within maxWidth)" (`:147-153`).
+                // grapheme still fits within maxWidth)" (`:151-156`).
                 Some((opp_index, opp_width))
                     if current_width.saturating_sub(opp_width) + g_width <= width =>
                 {
@@ -557,7 +690,7 @@ pub(super) fn word_wrap_line(line: &[char], width: usize) -> Vec<(usize, usize)>
                     chunk_start = opp_index;
                     current_width = current_width.saturating_sub(opp_width);
                 }
-                // "No viable wrap opportunity: force-break at current position" (`:154-160`).
+                // "No viable wrap opportunity: force-break at current position" (`:157-165`).
                 _ if chunk_start < char_index => {
                     chunks.push((chunk_start, char_index - chunk_start));
                     chunk_start = char_index;
@@ -568,8 +701,41 @@ pub(super) fn word_wrap_line(line: &[char], width: usize) -> Vec<(usize, usize)>
             wrap_opp = None;
         }
 
-        // `if (gWidth > maxWidth)` (`:163`) — see the [CYRUP-DELTA] above.
+        // `if (gWidth > maxWidth)` (`:170`) — see the [CYRUP-DELTA] above.
         if g_width > width {
+            if seg.atomic {
+                // "Single atomic segment wider than maxWidth (e.g. paste marker in a narrow
+                // terminal). Re-wrap it at grapheme granularity." (`:171-186`). The segment stays
+                // logically atomic for cursor movement / editing — the split is purely visual.
+                //
+                // The backtrack arm above cannot have fired (it needs `… + g_width <= width` and
+                // `g_width > width`), so `chunk_start == char_index` here and the sub-chunks tile on
+                // from it without a gap.
+                let seg_len = seg.text.chars().count();
+                let sub = line
+                    .get(char_index..char_index.saturating_add(seg_len))
+                    .unwrap_or(&[]);
+                let sub_chunks = word_wrap_line(sub, width, None);
+                let last = sub_chunks.len().saturating_sub(1);
+                for (j, &(sc_start, sc_len)) in sub_chunks.iter().enumerate() {
+                    if j < last {
+                        chunks.push((char_index.saturating_add(sc_start), sc_len));
+                    }
+                }
+                if let Some(&(sc_start, sc_len)) = sub_chunks.get(last) {
+                    let last_text: String = sub
+                        .get(sc_start..sc_start.saturating_add(sc_len))
+                        .unwrap_or(&[])
+                        .iter()
+                        .collect();
+                    chunk_start = char_index.saturating_add(sc_start);
+                    current_width = display_width(&last_text);
+                }
+                wrap_opp = None;
+                continue;
+            }
+            // A single grapheme cluster: indivisible, so it takes a row of its own instead of
+            // recursing on itself forever — the [CYRUP-DELTA] above.
             if chunk_start < char_index {
                 chunks.push((chunk_start, char_index - chunk_start));
             }
@@ -579,25 +745,33 @@ pub(super) fn word_wrap_line(line: &[char], width: usize) -> Vec<(usize, usize)>
             continue;
         }
 
-        // "Advance" (`:181`).
+        // "Advance" (`:189`).
         current_width += g_width;
 
-        // "Record wrap opportunity" (`:183-199`): whitespace followed by non-whitespace (multiple
+        // "Record wrap opportunity" (`:191-206`): whitespace followed by non-whitespace (multiple
         // spaces join; the break point is after the last space), or a boundary where either side is
-        // CJK.
-        if let Some(&(next_index, next)) = segs.get(i + 1)
-            // Upstream spells this as two arms — whitespace→non-whitespace (`:187-189`) and the CJK
-            // boundary (`:190-198`) — that assign the same pair. Merged into one predicate because
-            // clippy's `if_same_then_else` rejects the duplicated arm; `is_ws || cjk || cjk` under a
-            // shared `!next_is_ws` is exactly the disjunction of the two upstream guards.
-            && !is_whitespace_seg(next)
-            && (is_ws || is_cjk_break(grapheme) || is_cjk_break(next))
-        {
-            wrap_opp = Some((next_index, current_width));
+        // CJK. Upstream's two arms (`:196-198`, `:199-206`) assign the same pair; where cyrup used
+        // to merge them into one predicate to keep clippy's `if_same_then_else` quiet they now stay
+        // apart, because each carries its own marker guard and the two bodies differ.
+        if let Some(next) = segs.get(i + 1) {
+            let is_opp = if is_ws {
+                // `if (isWs && next && (isPasteMarker(next.segment) || !isWhitespaceChar(next.segment)))`
+                // (`:196`). The `next.atomic ||` term is what lets the space BEFORE a marker be a
+                // break point at all — the marker's own text contains spaces.
+                next.atomic || !is_whitespace_seg(next.text)
+            } else {
+                // `:199-206`, with `isCjk` / `nextIsCjk` each gated on `!isPasteMarker` (`:200-201`).
+                !is_whitespace_seg(next.text)
+                    && ((!seg.atomic && is_cjk_break(seg.text))
+                        || (!next.atomic && is_cjk_break(next.text)))
+            };
+            if is_opp {
+                wrap_opp = Some((next.start, current_width));
+            }
         }
     }
 
-    // "Push final chunk" (`:202`).
+    // "Push final chunk" (`:210`).
     chunks.push((chunk_start, n.saturating_sub(chunk_start)));
     chunks
 }
