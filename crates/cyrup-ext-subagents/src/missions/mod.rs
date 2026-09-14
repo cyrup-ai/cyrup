@@ -70,8 +70,8 @@ pub use store::{
 };
 pub use types::*;
 pub use workflow_state::{
-    MISSION_STATE_MAX_BYTES, MissionWorkflowState, create_mission_workflow_state,
-    mission_state_path,
+    MISSION_STATE_MAX_BYTES, MissionWorkflowState, MissionWorkflowStateStore,
+    create_mission_workflow_state, mission_state_path,
 };
 
 use std::path::{Path, PathBuf};

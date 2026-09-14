@@ -211,9 +211,39 @@ pub type WorkflowTraceCallback = Arc<dyn Fn(&WorkflowScriptTraceEntry, usize) + 
 /// pi `onLanePlan` (`:1125`).
 pub type WorkflowLanePlanCallback = Arc<dyn Fn(&[WorkflowLanePlan]) + Send + Sync>;
 /// pi `onEmit` (`:1126`) — fallible: a persistence failure aborts the run.
+///
+/// Delivered ONE value at a time, with its **zero-based index** in the accumulated emit list.
+///
+/// **Append ordering and rollback are part of the contract, not an implementation detail.** The
+/// engine pushes the value, calls this, and `pop()`s it again when the call fails
+/// ([`RunShared::emit`]): **a failed append was NOT persisted**, and index N is free for the next
+/// emit. That sentence is what lets a receiver reason about a gap; without it a rollback and a
+/// dropped update are indistinguishable. Conversely the index is what makes a forwarder
+/// idempotent — a receiver that has already seen index N ignores a repeat.
+///
+/// **[CYRUP-DELTA]** upstream's `onEmit` is `(emits: unknown[]) => void`
+/// (`scripted-workflow.ts:1198`), re-handed the WHOLE accumulated array on every call
+/// (`options.onEmit?.([...emits])`, `:2171`), synchronous, and signalling failure by throwing.
+/// This alias differs on three axes:
+///
+/// 1. **Per-value + index**, where pi re-hands the accumulated list. The accumulated form makes any
+///    live forwarder quadratic — N emits forward N(N+1)/2 values — and makes "has this value
+///    already been forwarded?" unanswerable across the engine's own `pop()` rollback, because the
+///    two sides can then disagree about what was persisted. Per-value + index is what makes live
+///    forwarding possible at all, which is why `routing.rs` could only pass `None` before it.
+/// 2. **Async**, where pi is synchronous — a sync callback would force the embedder to block the
+///    isolate thread inside a running op (§5.5).
+/// 3. **`Result`**, where pi throws — the `Err` arm IS upstream's `catch` at `:2174-2180`, with the
+///    same rollback and the same verbatim message.
+///
+/// **What it costs:** a receiver that wants the accumulated list must re-accumulate. That cost is
+/// nominal, because the complete list comes back anyway in
+/// [`WorkflowScriptResult::emits`] on the success arm and in `WorkflowScriptError::partial.emits`
+/// on every terminal failure arm — this stream is ADDITIVE, never a replacement for it.
 pub type WorkflowEmitCallback = Arc<
     dyn Fn(
-            Vec<Value>,
+            Value,
+            usize,
         )
             -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
         + Send
@@ -536,17 +566,24 @@ impl RunShared {
             self.record_fatal(message.clone(), None);
             return Err(message);
         }
-        let snapshot = {
+        // The index is read PRE-push, inside the same critical section as the push: it is the slot
+        // this value is about to occupy, and reading it here is the only way it cannot disagree
+        // with what the push did. `len() - 1` after the fact would say the same thing at the cost
+        // of a `checked_sub` — `unwrap_used`/`expect_used` are DENY workspace-wide
+        // (`Cargo.toml:101-104`) — for an arithmetic fact this read already states exactly.
+        // `value` is cloned rather than moved because the callback below needs it after the push.
+        let (forwarded, index) = {
             let mut inner = self.lock();
-            inner.emits.push(value);
-            inner.emits.clone()
+            let index = inner.emits.len();
+            inner.emits.push(value.clone());
+            (value, index)
         };
         let Some(on_emit) = &self.on_emit else {
             return Ok(());
         };
         // Awaited, not blocked on: §5.5. A sync callback here would force the embedder to block
         // the isolate thread inside a running op.
-        if let Err(error) = on_emit(snapshot).await {
+        if let Err(error) = on_emit(forwarded, index).await {
             self.lock().emits.pop();
             let message = format!("Workflow emit could not be persisted: {error}");
             self.record_fatal(message.clone(), None);
@@ -3312,6 +3349,116 @@ return { count: results.length };
                 );
             }
         }
+    }
+
+    /// Build an `on_emit` that records every `(value, index)` it is handed into `recorded`, and
+    /// answers with `outcome` — the two shapes the tests below need, in one place so the closure's
+    /// coercion to [`WorkflowEmitCallback`] is spelled out once.
+    fn recording_on_emit(
+        recorded: Arc<std::sync::Mutex<Vec<(Value, usize)>>>,
+        outcome: Result<(), String>,
+    ) -> WorkflowEmitCallback {
+        Arc::new(move |value: Value, index: usize| {
+            let recorded = Arc::clone(&recorded);
+            let outcome = outcome.clone();
+            Box::pin(async move {
+                recorded.lock().unwrap().push((value, index));
+                outcome
+            })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+        })
+    }
+
+    /// WORKFLOW_21 — the per-value delta: each `emit(...)` is handed to the callback EXACTLY ONCE,
+    /// carrying the zero-based index it occupies, and the final `result.emits` still carries the
+    /// whole list.
+    ///
+    /// "Exactly once" is the assertion the old `Vec<Value>` shape could not satisfy: it re-handed
+    /// the whole accumulated list on every call, so these three emits delivered SIX values and
+    /// `{step: 1}` reappeared twice. There was also no index to check. Both halves of this test are
+    /// therefore regression guards for the same bug: the count, and `result.emits` staying complete
+    /// (§1b — the stream is additive, never a replacement).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn emit_delivers_each_value_once_with_its_index_and_keeps_the_final_list() {
+        let host = Arc::new(FakeHost::new(Duration::from_millis(5)));
+        let script = r#"
+emit({ step: 1 });
+await runs.run("a", { agent: "worker", task: "T" });
+emit({ step: 2 });
+emit({ step: 3 });
+return "done";
+"#;
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut opts = options(host, script);
+        opts.on_emit = Some(recording_on_emit(Arc::clone(&recorded), Ok(())));
+        let result = run_workflow_script(opts).await.unwrap();
+
+        assert_eq!(result.value, json!("done"));
+        assert_eq!(
+            *recorded.lock().unwrap(),
+            vec![
+                (json!({ "step": 1 }), 0),
+                (json!({ "step": 2 }), 1),
+                (json!({ "step": 3 }), 2),
+            ]
+        );
+        // §1b: the stream is additive. The complete list still comes back on the success arm.
+        assert_eq!(
+            result.emits,
+            vec![
+                json!({ "step": 1 }),
+                json!({ "step": 2 }),
+                json!({ "step": 3 })
+            ]
+        );
+    }
+
+    /// WORKFLOW_21 — the half of the contract the alias' doc states and every forwarder relies on:
+    /// **a failed append was NOT persisted**. `emit` is the ONE callback whose failure aborts the
+    /// run, and the rollback is what keeps the index space honest — the value the callback rejected
+    /// is gone from `partial.emits`, so its index is free for whatever emits next.
+    ///
+    /// The script deliberately does NOT `await` its emits, because `globalThis.emit`
+    /// (`prelude.js:559-563`) returns the op promise and pi's does not await it either. So the
+    /// SECOND `emit` may well be dispatched before the run loop observes the first one's fatal —
+    /// which is precisely why this asserts on the index rather than on the call count. Every
+    /// rejected append was rolled back, so every one of them was handed index **0**: that is the
+    /// "index N is free again" clause of the contract, observed rather than asserted in prose.
+    ///
+    /// This is also why `routing.rs`'s forwarder has no error path: everything below is what a
+    /// dropped UI update would cost a workflow if it propagated.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rejected_emit_aborts_the_run_and_is_rolled_back_out_of_the_partial() {
+        let host = Arc::new(FakeHost::new(Duration::from_millis(5)));
+        let script = r#"
+emit({ step: 1 });
+emit({ step: 2 });
+return "done";
+"#;
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut opts = options(host, script);
+        opts.on_emit = Some(recording_on_emit(
+            Arc::clone(&recorded),
+            Err("sink is gone".to_string()),
+        ));
+        let error = run_workflow_script(opts).await.unwrap_err();
+
+        // Upstream's verbatim wording (`scripted-workflow.ts:2174-2180`), unchanged by the delta.
+        assert_eq!(
+            error.message,
+            "Workflow emit could not be persisted: sink is gone"
+        );
+        let recorded = recorded.lock().unwrap().clone();
+        // The first emit reached the callback, and reached it as index 0.
+        assert_eq!(recorded.first(), Some(&(json!({ "step": 1 }), 0)));
+        // Every rejected append was rolled back, so every call — however many the unawaited
+        // dispatch got in before the fatal landed — saw index 0 free.
+        assert!(
+            recorded.iter().all(|(_, index)| *index == 0),
+            "a rolled-back append must free its index, saw {recorded:?}"
+        );
+        // Rolled back: nothing was persisted, and the partial says so on the failure arm.
+        assert!(error.partial.emits.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
