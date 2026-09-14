@@ -108,9 +108,9 @@ pub use host_step::{
 pub use key::{WorkflowKey, WorkflowKeyError};
 pub use lane_metadata::{
     LaneMetadataError, WORKFLOW_LANE_CLAIM_MAX_BYTES, WORKFLOW_LANE_CLAIMS_MAX,
-    WORKFLOW_LANE_KEY_MAX_BYTES, WORKFLOW_LANE_OUTPUT_PATHS_MAX,
-    WORKFLOW_LANE_OUTPUT_PATH_MAX_BYTES, WORKFLOW_LANE_SOURCE_REF_MAX_BYTES,
-    assert_workflow_lane_key, normalize_workflow_lane_metadata,
+    WORKFLOW_LANE_KEY_MAX_BYTES, WORKFLOW_LANE_OUTPUT_PATH_MAX_BYTES,
+    WORKFLOW_LANE_OUTPUT_PATHS_MAX, WORKFLOW_LANE_SOURCE_REF_MAX_BYTES, assert_workflow_lane_key,
+    normalize_workflow_lane_metadata,
 };
 pub use permit::{
     WorkflowResourceAuthority, WorkflowResourceConsumption, WorkflowResourceExpansionState,
@@ -134,8 +134,8 @@ pub use receipt::{
     WorkflowReceiptRef, WorkflowReceiptResume, WorkflowReceiptState, WorkflowReceiptVersion,
     WorkflowRecoveryAction, WorkflowRecoveryCall, WorkflowRecoveryResume,
     WorkflowTerminalResolution, build_workflow_receipt, read_workflow_receipt,
-    resolve_workflow_receipt_resume, resolve_workflow_receipt_resume_entry,
-    workflow_receipt_path, write_workflow_receipt,
+    resolve_workflow_receipt_resume, resolve_workflow_receipt_resume_entry, workflow_receipt_path,
+    write_workflow_receipt,
 };
 pub use resources::{
     ResolvedWorkflowResource, WorkflowResourceDefinition, WorkflowResourceExpansion,
@@ -146,10 +146,10 @@ pub use settlement::{
     DetachedChildSettlement, EVIDENCE_PERSISTENCE_FAILED, INTERRUPTED_DETACHED_CHILD,
     PlanWorkflowSettlement, SettledWorkflowStatus, UNSUPPORTED_DETACHED_WORKFLOW_CONTINUATION,
     WorkflowBudgetSignals, WorkflowCompletionEvent, WorkflowSettlementPlan,
-    apply_detached_child_settlement, classify_workflow_settlement,
-    find_workflow_settlement_step, output_path_mappings_of, plan_workflow_settlement,
-    promote_settled_paused_workflow, with_workflow_children, workflow_output_path_mapping_summary,
-    workflow_recovery_actions, workflow_terminal_outcome_for_result,
+    apply_detached_child_settlement, classify_workflow_settlement, find_workflow_settlement_step,
+    output_path_mappings_of, plan_workflow_settlement, promote_settled_paused_workflow,
+    with_workflow_children, workflow_output_path_mapping_summary, workflow_recovery_actions,
+    workflow_terminal_outcome_for_result,
 };
 pub use stable_json::{stable_json, stable_json_digest};
 pub use types::{

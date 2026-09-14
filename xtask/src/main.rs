@@ -899,7 +899,10 @@ fn catalog_path(out: &Path, name: &str) -> PathBuf {
 /// Generate every catalog body plus the manifest, in a stable order.
 fn generate_all(
     args: &Args,
-    live: &[(&'static live_catalog::LiveCatalogSpec, live_catalog::LiveOutcome)],
+    live: &[(
+        &'static live_catalog::LiveCatalogSpec,
+        live_catalog::LiveOutcome,
+    )],
 ) -> Result<Vec<(String, String)>, String> {
     let mut out = Vec::new();
     for spec in CATALOGS {
@@ -1023,7 +1026,10 @@ fn git_show(pi: &Path, rev: &str, path: &str) -> Result<String, String> {
 /// (`xai`) fetched live — and the map is what makes it machine-checkable instead of prose.
 fn manifest_json(
     args: &Args,
-    live: &[(&'static live_catalog::LiveCatalogSpec, live_catalog::LiveOutcome)],
+    live: &[(
+        &'static live_catalog::LiveCatalogSpec,
+        live_catalog::LiveOutcome,
+    )],
 ) -> Result<String, String> {
     let source = format!("pi@{}", args.rev);
     let pinned_count = CATALOGS.len();
@@ -1610,7 +1616,11 @@ mod tests {
         let stems = upstream_stems_at_v0_84_4();
         assert_eq!(stems.len(), 39);
         let roster = account_for_roster(&stems).unwrap();
-        assert_eq!(roster.embedded.len(), 33, "xai moved to LIVE_CATALOGS (XAI_1)");
+        assert_eq!(
+            roster.embedded.len(),
+            33,
+            "xai moved to LIVE_CATALOGS (XAI_1)"
+        );
         assert_eq!(roster.live.len(), 1);
         assert_eq!(roster.live[0].file, "xai");
         assert!(roster.unported_absent.is_empty());
@@ -1649,7 +1659,11 @@ mod tests {
             .collect();
         assert_eq!(stems.len(), 35);
         let roster = account_for_roster(&stems).unwrap();
-        assert_eq!(roster.embedded.len(), 33, "xai moved to LIVE_CATALOGS (XAI_1)");
+        assert_eq!(
+            roster.embedded.len(),
+            33,
+            "xai moved to LIVE_CATALOGS (XAI_1)"
+        );
         assert_eq!(roster.live.len(), 1);
         assert_eq!(roster.unported_present.len(), 1);
         assert_eq!(roster.unported_absent.len(), 4);

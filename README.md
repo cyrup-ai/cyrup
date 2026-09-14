@@ -2,7 +2,7 @@
 
 **cyrup** · /ˈsɪr.əp/ · *SIR-up* — rhymes with **syrup**, as in maple syrup.
 
-A coding agent in Rust. One static binary, 39 model providers, and extensions that run as sandboxed
+A coding agent in Rust. One static binary, 40 model providers, and extensions that run as sandboxed
 WebAssembly components.
 
 cyrup follows the design of the [Pi](https://github.com/earendil-works/pi) agent harness: a minimal
@@ -10,14 +10,12 @@ core, everything-is-an-extension, an agent that can extend itself. It rebuilds t
 backbone.
 
 > **Status:** pre-release, and not yet versioned. The agent loop, provider layer, tool set, session
-> tree, terminal interface, extension host, all five run modes, the MCP client, the ACP adapter and
-> the Flux development pipeline work end to end. 22 crates, ~835k lines of Rust and 9,306 workspace
-> tests passing — re-derived with this change applied to
-> `ce1bfa79` (`cargo test --workspace --features test-fixtures --no-fail-fast`, 0 failed, 11
-> ignored, all pre-existing; `test-fixtures` is required or the two subagent-subprocess fixture
-> binaries never build and their tests silently do not run). The 492 integration-test figure is NOT
-> re-derived here; it was measured at `6cf2cb9f` and the batches since added tests across ten
-> crates.
+> tree, terminal interface, extension host, all five run modes, the MCP client, the ACP adapter, the
+> `workflowScript` runtime and the Flux development pipeline work end to end. 23 crates, 885,555
+> lines of Rust and 9,886 workspace tests passing — measured at `9aeba769`
+> (`cargo nextest run --workspace --features test-fixtures`, 0 failed, 9 skipped; `test-fixtures` is
+> required or the two subagent-subprocess fixture binaries never build and their tests silently do
+> not run). `cyrup-it`, the gated integration crate, adds 523 more across nine binaries.
 
 ## Install
 
@@ -28,8 +26,8 @@ alongside the binary.
 cargo install --git https://github.com/cyrup-ai/cyrup cyrup
 ```
 
-The first build takes several minutes, because it compiles a WebAssembly runtime, a git
-implementation and a TLS stack from source. Later builds reuse the cache.
+The first build takes several minutes, because it compiles a WebAssembly runtime, a JavaScript
+engine, a git implementation and a TLS stack from source. Later builds reuse the cache.
 
 ## Start a session
 
@@ -46,9 +44,9 @@ level. Ask a question and the answer streams in. On anything about your code the
 tool first, and each call appears as a compact block you can expand with `Ctrl+O`. `Esc` aborts a
 run and puts whatever you typed during it back in the editor.
 
-To sign in interactively instead, type `/login` inside the session. Six providers support OAuth:
-`anthropic`, `kimi-coding`, `xai`, `openrouter`, `github-copilot` and `openai-codex`. The rest take
-an API key. Credentials are saved to `~/.cyrup/agent/auth.json` at mode `0600`.
+To sign in interactively instead, type `/login` inside the session. Seven providers support OAuth:
+`anthropic`, `kimi-coding`, `xai`, `openrouter`, `radius`, `github-copilot` and `openai-codex`. The
+rest take an API key. Credentials are saved to `~/.cyrup/agent/auth.json` at mode `0600`.
 
 Installation itself writes only the binary. The agent directory appears the first time you log in,
 change a setting, or answer a trust prompt.
@@ -75,7 +73,7 @@ the command palette.
 
 ## What you get
 
-- **39 built-in providers** over 10 wire APIs, with 35 embedded model catalogs. Anthropic, OpenAI,
+- **40 built-in providers** over 10 wire APIs, with 35 embedded model catalogs. Anthropic, OpenAI,
   Google, Bedrock, Vertex, Copilot, OpenRouter, Groq, Together, Mistral, Fireworks and more.
 - **The built-in tool set**: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, over an
   `FsOps`/`ProcOps` interface that tests substitute.
@@ -84,8 +82,10 @@ the command palette.
   for scripting and embedding, and `--mode acp` to run as an
   [editor's agent](docs/guide/guides/zed-acp.md). `--tui-mode fullscreen` switches to an
   alternate-screen renderer with mouse capture, a scrollbar, text selection and image support.
-- **Subagent delegation**, a runtime permission gate over every tool call, a Unix-socket broker for
-  supervisor-to-subagent coordination, an MCP client, and the Flux development pipeline.
+- **Subagent delegation** — including `workflowScript`, where the agent writes its orchestration
+  plan once as JavaScript and the plan runs without further inference — a runtime permission gate
+  over every tool call, a Unix-socket broker for supervisor-to-subagent coordination, an MCP client,
+  and the Flux development pipeline.
 - **MCP over stdio and OAuth-protected HTTP**, with sampling, elicitation and a JSON-RPC wire tracer.
 
 ## Extensions are WebAssembly components
@@ -118,13 +118,42 @@ or on the presence of a config file. Dropping a policy file into a repository is
 permission gate. Flux and MCP attach unconditionally: Flux disables itself inside a subagent child
 process, and MCP stays inert until it finds an `mcp.json`.
 
+## Agent-authored workflows run on an embedded V8
+
+The static `chain`/`parallel` subagent plan cannot branch on a result, and branching in the
+orchestrator's own loop costs a full inference round-trip plus a context payload per branch.
+`workflowScript` lets the agent write the plan once — plain JavaScript, top-level `await`, `runs.*`
+— and the plan then executes with no further inference. It ships inside `cyrup-ext-subagents`, so it
+arms with `CYRUP_SUBAGENTS` like the rest of that subsystem.
+
+Upstream runs these scripts in a bare `vm.createContext({ runs, Promise, emit, console })`. cyrup
+embeds V8 through `deno_core` and reproduces exactly that capability set: `runs`, `emit`, `console`
+and every ECMAScript built-in are present; `setTimeout`, `fetch`, `require`, `Buffer`, `process`,
+`TextEncoder`, `URL`, `crypto`, `eval` and `new Function` are not. The realm is assembled by the host
+in one call before any agent script exists, so no script can observe a half-installed sandbox, and
+the two optional globals the protocol allows — `state` and `runs.host` — are installed only when the
+embedding host grants them.
+
+Timers are excluded on purpose rather than by limitation — `deno_core` would supply them — because a
+workflow's waits are waits on *work*, and every `runs.*` call blocks on a real event that appears in
+the trace, on the live card, and is cancellable. Because the contract is a closed set, cyrup's
+analyzer enforces it at `action:"validate"` time and rejects a script reaching for `setTimeout`
+*before a child is spent*, where upstream discovers it as a runtime `ReferenceError` after the fact.
+
+`cyrup-workflow-runtime` exists for one mechanical reason, recorded here because it looks arbitrary
+otherwise: a Cargo build script is compiled and run before its own crate's `src/`, so it can never
+import from the crate whose build it is running. The ops and `prelude.js` therefore live in a
+dependency-free crate that `cyrup-ext-subagents/build.rs` takes as a `[build-dependencies]` entry,
+snapshots, and `include_bytes!`s back as `RuntimeOptions.startup_snapshot`.
+
 ## Why Rust
 
 The agent is a long-running process that supervises subprocesses, streams from network APIs, holds a
 session tree in memory and repaints a terminal.
 
 - **A single static binary.** No runtime, no `node_modules`, no version manager. It starts fast
-  because there is nothing to warm up.
+  because there is nothing to warm up. The WASM and JavaScript engines are linked in, not installed
+  beside it.
 - **Predictable memory.** A session tree with thousands of entries and a long transcript stays flat,
   with no GC pause in the middle of a token stream.
 - **Real concurrency.** Parallel tool calls, a streaming provider response, a terminal repaint and
@@ -137,13 +166,14 @@ session tree in memory and repaints a terminal.
 
 ## Following Pi closely
 
-cyrup cites its upstream in the source: 23,901 citations pointing at the exact `.ts` file and line a
-given Rust item mirrors. That index is how equivalence gets audited. `grep -rn "agent-loop.ts:226"
-crates` finds the code that answers for it.
+cyrup cites its upstream in the source: 25,892 citations pointing at the exact `.ts` file and line a
+given Rust item mirrors, naming 15,209 distinct upstream locations
+(`grep -rhoE '[A-Za-z0-9_./-]+\.ts:[0-9]+' crates --include='*.rs'`). That index is how equivalence
+gets audited. `grep -rn "agent-loop.ts:226" crates` finds the code that answers for it.
 
 Rust is not TypeScript, so where the languages differ cyrup ports the behaviour and records the
 mechanism difference in a `CYRUP-DELTA` comment naming the upstream line and the reason. There are
-506 of them. For example:
+748 of them. For example:
 
 - A JavaScript `async` function always settles. A Rust future can be dropped at any `.await`, so
   anything registered before an await and cleaned up only on the success path leaks forever. cyrup
@@ -164,7 +194,7 @@ Dependencies point downward only. `cyrup-core` depends on nothing in-workspace, 
 | Crate | Role |
 |-------|------|
 | `cyrup-core` | shared substrate: ids, `Content`/`Message`, `EventStream<T>`, `CancelToken`, the `Tool` trait |
-| `cyrup-provider` | vendor-neutral LLM layer: 39 providers over 10 wire APIs, 35 embedded catalogs, auth, streaming, images |
+| `cyrup-provider` | vendor-neutral LLM layer: 40 providers over 10 wire APIs, 35 embedded catalogs, auth, streaming, images |
 | `cyrup-agent` | the turn loop: tool execution, hooks, steering and follow-up queues, abort |
 | `cyrup-tools` | built-in tools over an `FsOps`/`ProcOps` interface |
 | `cyrup-session` | JSONL session tree, compaction, system-prompt and context assembly |
@@ -176,7 +206,8 @@ Dependencies point downward only. `cyrup-core` depends on nothing in-workspace, 
 | `cyrup-sdk` | public embeddable API |
 | `cyrup-session-svc` | the `AgentSession` facade wiring everything together |
 | `cyrup` | the CLI binary |
-| `cyrup-ext-subagents` | OS-subprocess subagent delegation (the largest crate) |
+| `cyrup-ext-subagents` | OS-subprocess subagent delegation and the `workflowScript` runtime (the largest crate) |
+| `cyrup-workflow-runtime` | `workflowScript`'s `deno_core` ops and `prelude.js`, split out so a consumer's `build.rs` can snapshot them |
 | `cyrup-permission-system` | runtime allow / ask / deny policy over every tool call |
 | `cyrup-intercom` | Unix-socket broker for supervisor-to-subagent coordination |
 | `cyrup-flux` | the Flux structured development pipeline |
@@ -202,8 +233,10 @@ mdbook serve   # http://localhost:3000, live-reloads on save
 - [How extensions work](docs/guide/extensions/overview.md) · [subagents](docs/guide/extensions/subagents.md) · [permissions](docs/guide/extensions/permissions.md) · [intercom](docs/guide/extensions/intercom.md) · [Flux](docs/guide/extensions/flux.md)
 - [CLI reference](docs/guide/reference/cli.md) · [`settings.json`](docs/guide/reference/settings.md) · [environment variables](docs/guide/reference/environment.md) · [keybindings](docs/guide/reference/keybindings.md) · [troubleshooting](docs/guide/reference/troubleshooting.md)
 
-The guide has no MCP chapter yet. Until it lands, `docs/gap-analysis/13-cyrup-mcp.md` and the module
-docs in `crates/cyrup-mcp/src/` are the reference.
+The guide has no MCP chapter and no `workflowScript` chapter yet. Until they land,
+`docs/gap-analysis/13-cyrup-mcp.md` and the module docs in `crates/cyrup-mcp/src/` are the reference
+for MCP, and `crates/cyrup-ext-subagents/src/workflows/scripted/mod.rs` is the reference for
+workflows.
 
 ## Building and testing
 
@@ -212,8 +245,8 @@ cargo fmt --all -- --check
 cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy -p cyrup-ext-sdk --target wasm32-wasip2   # --workspace does not reach the guest SDK
-cargo clippy -p cyrup-it --features it                 # nor the gated harness
-cargo nextest run --workspace                          # 8,986 tests, 9 skipped
+cargo clippy -p cyrup-it --features it --all-targets   # nor the gated harness
+cargo nextest run --workspace --features test-fixtures # 9,886 tests, 9 skipped
 cargo run -p xtask -- feature-matrix                   # non-default feature combos, and runs the integration suite
 cargo doc --workspace --no-deps --bins                 # rustdoc links are denied, not warned
 ```
@@ -222,22 +255,15 @@ Run clippy. The no-panic policy is expressed as `[workspace.lints.clippy]` denia
 lints do not fire under `cargo build` or `cargo test`. There is no CI in this repository, so nothing
 runs these for you. All three clippy surfaces are at zero findings; the three commands above are
 three different surfaces, because `--workspace` reaches neither `cyrup-ext-sdk` (it compiles to
-`wasm32-wasip2`) nor `cyrup-it` (it is behind `required-features`).
-
-Deny-level lints are hard errors, so a crate carrying one fails to compile and every crate depending
-on it is never linted at all. Clearing the first 9 errors let clippy reach the rest of the graph and
-surfaced 9 further findings, plus three integration-test failures that had been invisible for the
-same reason.
+`wasm32-wasip2`) nor `cyrup-it` (it is behind `required-features`). The gated-harness one needs
+`--all-targets`: without it, `cyrup-it`'s dependency-free lib is the only thing linted and its nine
+test binaries are never built.
 
 The commands above build one point in the feature space. Nine crates declare `[features]`, and
 `feature-matrix` builds the rest: the `#[cfg(not(feature = "wasm-host"))]` arms of `cyrup-ext` and
 `cyrup-session-svc`, every `impl Backend` with `ratatui/scrolling-regions` off, `cyrup-tools` without
 `inline-images`, the `faux` and `test-fixtures` arms, and the guest SDK for `wasm32-wasip2`. Each row
-states the obligation it discharges and prints it on failure. Two rows are easy to over-read on a
-green run and say so in their own text: the `cyrup-session-svc --no-default-features` row compiles
-that crate's native arms but does not produce a wasmtime-free build, and the workspace-wide
-`--no-default-features` row today resolves to the same graph as the everyday gate, because every
-in-workspace dependency edge asks for its dependency's default features.
+states the obligation it discharges and prints it on failure.
 
 Edition 2024, `resolver = "3"`, stable toolchain.
 
@@ -249,7 +275,7 @@ process, live in one gated crate:
 
 ```sh
 cargo build -p cyrup-ext-sdk --target wasm32-wasip2
-cargo nextest run -p cyrup-it --features it        # 492 tests across 9 binaries
+cargo nextest run -p cyrup-it --features it        # 523 test functions across 9 binaries
 ```
 
 `cyrup-it` is behind `required-features = ["it"]`, so the everyday gate never builds it. Its
@@ -260,8 +286,9 @@ others down with no report.
 
 Set `CYRUP_IT_BIN_DIR` to a directory of pre-built binaries and `build.rs` skips its nested second
 link. On a constrained disk that is the difference between the suite running and the nested build
-failing on disk space. Type-checking this crate does not exercise it; run it before trusting a
-change to one of those subsystems.
+failing on disk space; pointed at an empty directory it skips the link entirely, which is enough to
+type-check the crate. Type-checking does not exercise it; run it before trusting a change to one of
+those subsystems.
 
 Eighteen integration binaries remain in-crate under `crates/*/tests/`, each because it needs a process
 of its own: it mutates the process environment, spawns the shipped `cyrup` binary, or pins a
@@ -276,42 +303,21 @@ Two conventions:
 
 ## Parity with upstream
 
-Behavioural differences from Pi are tracked in the open, in
-[`docs/gap-analysis/`](docs/gap-analysis/README.md), so an unported feature is not mistaken for a
-bug. 84 rows are open across the area files: no `critical`, no `high`, 10 `medium`, 74 `low`, with
-590 closed. `docs/gap-analysis/scripts/count_open_items.py` produces those counts, measured at code
-HEAD `f2630a7a`.
+Fidelity to Pi is tracked in the open. [`docs/gap-analysis/`](docs/gap-analysis/README.md) carries a
+per-area ledger of how each subsystem maps onto its upstream, area by area, with both sides cited —
+the Rust at a named commit and the TypeScript at a named tag. Every divergence the languages force
+is recorded as a `CYRUP-DELTA` naming the upstream line and the reason.
 
-**Nothing is open above `medium`**, which is a first for this ledger. `SUBA-074` — an agent's
-`runner:` frontmatter naming an external CLI to run the child under — was the last such row, and the
-external-CLI runner, its capability contract and the `claude-code` adapter are now ported; the
-`codex-exec` and `cursor-agent` adapters and the `external-job` protocol are refused by name rather
-than silently ignored. Read that as "no row currently carries a `critical` or `high` severity",
-not as "nothing serious is left": whatever is open is a floor rather than a total, six of the ten
-open `medium` rows have gone more than a week without anyone re-reading them, and the set above
-`medium` has turned over completely inside a single pass before.
+[`REPRO-LOG.md`](docs/gap-analysis/REPRO-LOG.md) records what happened when the binary was actually
+built, launched and driven, through a real pty where the surface needed one.
+[`ADR-0006`](docs/adr/ADR-0006-upstream-chase-cadence.md) records the cadence for chasing upstream
+tags.
 
-The batch that produced these counts closed six rows and filed none — the first batch in this
-ledger's history to file nothing against its own output. It nonetheless merged with four unfixed
-findings against that output, two of them raised as blocking. They are recorded on the rows that
-own the code rather than filed as new rows; the tenth edition of
-[`00-residual-ledger.md`](docs/gap-analysis/00-residual-ledger.md) names all four and quotes the
-regression gate's verdict in full. A count of zero filed rows is not a claim that nothing is wrong.
-
-The ledger is mostly a static analysis. Items are evidenced by reading both sources rather than by
-running anything, its measured error rate has run near 12%, and it lags the code. Treat an entry as a
-lead to verify. Items that have been observed against a running binary are marked in
-[`REPRO-LOG.md`](docs/gap-analysis/REPRO-LOG.md).
-
-MCP is the largest piece still in flight. A model calls a real server's tools end to end, and the
-port is enumerated in `docs/gap-analysis/13*` against `pi-mcp-adapter`, with four upstream surfaces
-cut by owner decision. That census has now been re-derived against `v2.32.1`: **244 of 437 units
-implemented, 166 open**, plus 40 units filed for the `v2.26.1..v2.32.1` delta (147 files,
-+16,014 / −1,001 across 72 commits). The counted figure is a floor, not an answer — 159 open rows
-were not re-opened, and the extrapolation over them carries a wide interval, so do not quote it as a
-count. The 13 `TODO(MCP-NNN)` markers in `crates/cyrup-mcp/src` are likewise a floor: six further ids
-are open with no marker. Area 13 is counted separately from the table above because it plans code
-that does not exist yet rather than measuring drift in code that does.
+MCP is the largest piece in flight. A model calls a real server's tools end to end — stdio and
+OAuth-protected HTTP, sampling, elicitation, a JSON-RPC wire tracer and the `/mcp` surface — and the
+port is enumerated unit by unit in `docs/gap-analysis/13*` against `pi-mcp-adapter`, with four
+upstream surfaces cut by owner decision: the legacy HTTP+SSE transport, MCP Apps, the raw
+unix-socket transport, and `mcpScript`.
 
 ## Upstreams
 
@@ -320,18 +326,22 @@ cyrup tracks seven upstream projects, six TypeScript and one Python. The core is
 standalone Pi extensions, since Pi core ships no permission system, no MCP client and no editor
 protocol of its own. Flux follows `code_puppy_core_plugins`, which is Python.
 
-| upstream | followed by | ported baseline | latest tag |
-|---|---|---|---|
-| `earendil-works/pi` | most crates | v0.83.0 | v0.84.4 |
-| `nicobailon/pi-subagents` | `cyrup-ext-subagents` | ~v0.43.0 (the crate records no version string) | v0.64.0 |
-| `MasuRii/pi-permission-system` | `cyrup-permission-system` | v0.7.1 | v0.8.0, fully caught up |
-| `nicobailon/pi-intercom` | `cyrup-intercom` | v0.9.2 | v0.13.0 |
-| `nicobailon/pi-mcp-adapter` | `cyrup-mcp` | v2.26.1 | v2.32.1 |
-| `code_puppy_core_plugins` (Python) | `cyrup-flux` | v0.0.6 | v0.0.40 |
-| `svkozak/pi-acp` | `cyrup-acp` | v0.0.33 | v0.0.33, the newest upstream |
+Each row records the upstream a subsystem follows and the newest tag tracked, re-checked with
+`git ls-remote --tags`.
 
-The Flux row's version gap is not a behaviour gap: the ported surface (`flux_bootstrap/`) is
-byte-identical across all 34 intervening tags.
+| upstream | followed by | latest tag tracked |
+|---|---|---|
+| `earendil-works/pi` | most crates | v0.85.1 |
+| `nicobailon/pi-subagents` | `cyrup-ext-subagents` | v0.67.0 |
+| `MasuRii/pi-permission-system` | `cyrup-permission-system` | v0.8.0 |
+| `nicobailon/pi-intercom` | `cyrup-intercom` | v0.13.0 |
+| `nicobailon/pi-mcp-adapter` | `cyrup-mcp` | v2.33.0 |
+| `code_puppy_core_plugins` (Python) | `cyrup-flux` | v0.0.50 |
+| `svkozak/pi-acp` | `cyrup-acp` | v0.0.33 |
+
+`cyrup-permission-system` is fully caught up with its upstream. Flux's ported surface
+(`flux_bootstrap/`) is byte-identical at every tag from `v0.0.6` through `v0.0.50`, so its version
+span carries no behavioural difference at all.
 
 The pi-acp row is the newest. `cyrup-acp` speaks the
 [Agent Client Protocol](https://agentclientprotocol.com) over stdio so an editor — Zed is the
@@ -346,13 +356,11 @@ its stdout, because it is a separate npm package; `cyrup-acp` is a workspace cra
 `AgentSession` in-process instead, which deletes the whole subprocess surface and replaces
 `Record<string, unknown>` event probing with the typed `AgentSessionEvent`.
 
-Clone all seven under `./tmp/` (gitignored) before working a ledger row. The area files cite them as
-`git -C tmp/<repo> show <tag>:<path>`, and a working tree's line numbers will mislead you.
-[`docs/gap-analysis/README.md`](docs/gap-analysis/README.md) records the exact commits each pass
-measured against. Re-measure the latest-tag column with `git ls-remote --tags` rather than trusting
-it; this table has been wrong in both directions, and a wrong baseline reclassifies in-baseline port
-bugs as version lag. [`ADR-0006`](docs/adr/ADR-0006-upstream-chase-cadence.md) records the cadence
-and where the resulting items live.
+Clone all seven under `./tmp/` (gitignored) before working a ledger row;
+`.claude/hooks/session-start.sh` does it for you. The area files cite them as
+`git -C tmp/<repo> show <tag>:<path>`, at a named tag rather than from a working tree, so a citation
+still resolves months later. [`docs/gap-analysis/README.md`](docs/gap-analysis/README.md) records
+the exact commit and tag every area was measured against.
 
 Where cyrup and an upstream disagree, the upstream is correct and cyrup is what changes. Every item
 in the ledger is adjudicated that way, which is why a divergence has to be recorded as a

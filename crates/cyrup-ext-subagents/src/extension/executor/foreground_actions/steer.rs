@@ -352,10 +352,8 @@ fn append_steering_notice(
     }
     // Upstream's `catch {}`: the action result and status remain authoritative if diagnostic
     // notification persistence fails.
-    let _ = crate::artifacts::append_jsonl(
-        &paths.events,
-        &serde_json::Value::Object(line).to_string(),
-    );
+    let _ =
+        crate::artifacts::append_jsonl(&paths.events, &serde_json::Value::Object(line).to_string());
 }
 
 #[cfg(test)]

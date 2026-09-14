@@ -75,7 +75,14 @@ pub fn fetch_with_curl(url: &str) -> Result<Fetched, String> {
     let header_path =
         std::env::temp_dir().join(format!("xtask-live-headers-{}", std::process::id()));
     let out = Command::new("curl")
-        .args(["--silent", "--show-error", "--fail", "--location", "--max-time", "20"])
+        .args([
+            "--silent",
+            "--show-error",
+            "--fail",
+            "--location",
+            "--max-time",
+            "20",
+        ])
         .arg("--dump-header")
         .arg(&header_path)
         .arg(url)

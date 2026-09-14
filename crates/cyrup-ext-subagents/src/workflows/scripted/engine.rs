@@ -2318,7 +2318,6 @@ fn run_isolate(
         // guarded disposal below. Execution is NOT inside the lock — only creation and
         // disposal are, so two concurrent workflow runs still execute fully in parallel.
         let outcome = async {
-
             // §7 Part A: the bridge is seeded into `OpState` here, AFTER construction, rather than
             // through the extension's `options`/`state` — a snapshot reused across many different
             // workflow runs must never have any one run's state baked into it, and the build-time
@@ -2353,7 +2352,8 @@ fn run_isolate(
 
             // The host compiles; the guest may not. Upstream's asymmetry (`new vm.Script` against
             // `codeGeneration: { strings: false }`, `:916`) reproduced exactly.
-            let wrapped = format!("globalThis.__cyrupWorkflowRun((async () => {{\n{script}\n}})())");
+            let wrapped =
+                format!("globalThis.__cyrupWorkflowRun((async () => {{\n{script}\n}})())");
             let promise = runtime
                 .execute_script("workflow-script.js", wrapped)
                 .map_err(|error| guest_error(format_guest_error(&error.to_string())))?;
@@ -2613,14 +2613,23 @@ fn compile_check(script: &str) -> Option<super::types::WorkflowScriptValidationE
 ///
 /// [`WorkflowScriptError`] carrying the partial (trace, children, console, emits) — the partial is
 /// the point; SCOPE_3g's settlement reads it.
+///
+/// It is BOXED, matching `runner_main/executor.rs`'s and `cyrup-mcp/src/runtime.rs`'s convention
+/// for the same reason: [`WorkflowScriptError`] carries a whole [`WorkflowScriptPartial`] — four
+/// `Vec`s at 24 bytes each, plus a 24-byte `String` and the padded `Option` — which lands on
+/// clippy's 128-byte `result_large_err` threshold, and it (rightly) refuses to widen the `Ok`
+/// return of the workflow's one hot path by that much for the sake of nine cold failure arms. `Box<WorkflowScriptError>` derefs to the same fields, so callers reading
+/// `error.message` / `error.partial` are unchanged.
 #[allow(clippy::too_many_lines)]
 pub async fn run_workflow_script(
     options: RunWorkflowScriptOptions,
-) -> Result<WorkflowScriptResult, WorkflowScriptError> {
-    let fail = |message: String, kind: Option<WorkflowScriptErrorKind>| WorkflowScriptError {
-        message,
-        partial: WorkflowScriptPartial::default(),
-        error_kind: kind,
+) -> Result<WorkflowScriptResult, Box<WorkflowScriptError>> {
+    let fail = |message: String, kind: Option<WorkflowScriptErrorKind>| {
+        Box::new(WorkflowScriptError {
+            message,
+            partial: WorkflowScriptPartial::default(),
+            error_kind: kind,
+        })
     };
     if options.script.trim().is_empty() {
         return Err(fail("workflowScript must not be empty.".into(), None));
@@ -2887,12 +2896,13 @@ pub async fn run_workflow_script(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
-    let finish_error =
-        |message: String, kind: Option<WorkflowScriptErrorKind>| WorkflowScriptError {
+    let finish_error = |message: String, kind: Option<WorkflowScriptErrorKind>| {
+        Box::new(WorkflowScriptError {
             message,
             partial: partial(&shared),
             error_kind: kind,
-        };
+        })
+    };
 
     match outcome {
         GuestOutcome::Fatal => {

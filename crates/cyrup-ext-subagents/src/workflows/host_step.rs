@@ -239,9 +239,15 @@ pub struct HostStepNode {
 /// # Errors
 ///
 /// `Invalid host step '<source>': duplicate host step id '<id>'.`, verbatim.
-pub fn assert_unique_host_step_ids(host_steps: &[HostStepNode], source: &str) -> Result<(), String> {
+pub fn assert_unique_host_step_ids(
+    host_steps: &[HostStepNode],
+    source: &str,
+) -> Result<(), String> {
     for (index, step) in host_steps.iter().enumerate() {
-        let duplicate = host_steps.iter().take(index).any(|earlier| earlier.id == step.id);
+        let duplicate = host_steps
+            .iter()
+            .take(index)
+            .any(|earlier| earlier.id == step.id);
         if duplicate {
             return Err(format!(
                 "Invalid host step '{source}': duplicate host step id '{}'.",

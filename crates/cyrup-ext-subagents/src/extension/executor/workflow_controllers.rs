@@ -84,7 +84,8 @@ impl SubagentExecutor {
         run_id: &RunId,
         abort: CancelToken,
     ) -> WorkflowController {
-        let session_id = crate::identity::SessionId::parse_opt(self.current_session_id().as_deref());
+        let session_id =
+            crate::identity::SessionId::parse_opt(self.current_session_id().as_deref());
         let controller = WorkflowController::new(abort, session_id);
         self.workflow_controllers
             .lock()
@@ -252,8 +253,14 @@ mod tests {
 
         executor.abort_and_clear_workflow_controllers();
 
-        assert!(abort_a.is_cancelled(), "every live controller must be aborted");
-        assert!(abort_b.is_cancelled(), "every live controller must be aborted");
+        assert!(
+            abort_a.is_cancelled(),
+            "every live controller must be aborted"
+        );
+        assert!(
+            abort_b.is_cancelled(),
+            "every live controller must be aborted"
+        );
         assert!(
             executor.live_workflow_run_ids().is_empty(),
             "the map must be cleared after abort"
@@ -309,7 +316,10 @@ mod tests {
         ));
         let run_id = RunId::new();
         let controller = executor.register_workflow_controller(&run_id, CancelToken::new());
-        assert_eq!(controller.session_id().map(|s| s.as_str()), Some("session-a"));
+        assert_eq!(
+            controller.session_id().map(|s| s.as_str()),
+            Some("session-a")
+        );
         assert!(controller.started_at() > 0);
     }
 }

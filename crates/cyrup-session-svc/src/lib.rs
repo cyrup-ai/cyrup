@@ -57,14 +57,14 @@ pub use command::{SessionCommand, SessionCommandOutput};
 /// a direct `cyrup-agent` dependency.
 pub use cyrup_agent::AgentMessage;
 pub use cyrup_ext::NotifyKind;
+/// Re-exported so a front-end can name the `/model` refresh result (XAI_4's status strings) without
+/// a direct `cyrup-provider` dependency.
+pub use cyrup_provider::CatalogRefreshResult;
 /// The streaming delta carried on [`AgentSessionEvent::MessageUpdate`]. Re-exported because it is
 /// already part of this crate's public surface (the variant's `assistant_message_event` payload) —
 /// without it a consumer cannot match on the seam's own event without taking a direct
 /// `cyrup-provider` dependency. `cyrup-modes`' wire projection is the first such consumer.
 pub use cyrup_provider::StreamEvent;
-/// Re-exported so a front-end can name the `/model` refresh result (XAI_4's status strings) without
-/// a direct `cyrup-provider` dependency.
-pub use cyrup_provider::CatalogRefreshResult;
 pub use error::SessionServiceError;
 pub use event::{
     AgentSessionEvent, DeliverAs, InputSource, PromptAccepted, PromptOptions, StreamingBehavior,
@@ -121,13 +121,13 @@ pub use cyrup_config::trust::{TrustDecision, TrustEntry, TrustOption};
 /// Re-exported so the TUI `/settings` selector can read the merged config + the default-trust enum
 /// for its grid rows without a direct `cyrup-config` dependency.
 pub use cyrup_config::{DefaultProjectTrust, EffectiveSettings, EnvVars};
+/// Re-exported because it is the argument type of [`AgentSession::refresh_model_catalogs`] — the
+/// project's single `AbortSignal` equivalent (`cyrup-core/src/cancel.rs:9`, arch-00 §3.2).
+pub use cyrup_core::CancelToken;
 pub use cyrup_core::EventStream;
 /// Re-exported so front-ends can name the thinking level [`AgentSession::set_thinking_level`] takes
 /// and the entry id the RPC `fork` targets without a direct `cyrup-core` dependency.
 pub use cyrup_core::{Content, EntryId, ModelThinkingLevel};
-/// Re-exported because it is the argument type of [`AgentSession::refresh_model_catalogs`] — the
-/// project's single `AbortSignal` equivalent (`cyrup-core/src/cancel.rs:9`, arch-00 §3.2).
-pub use cyrup_core::CancelToken;
 /// Re-exported so an embedder can name the synthetic-resource override closures' element types
 /// ([`SessionBuilder::skills_override`]/[`SessionBuilder::context_files_override`]) without a direct
 /// `cyrup-resources`/`cyrup-session` dependency.

@@ -305,7 +305,8 @@ deno_core::extension!(
 ///
 /// Returns `Err` only if V8 itself fails to produce a snapshot — a `deno_core`/V8 defect, not a
 /// caller mistake.
-pub fn build_snapshot() -> Result<(Box<[u8]>, Vec<std::path::PathBuf>), deno_core::error::CoreError> {
+pub fn build_snapshot() -> Result<(Box<[u8]>, Vec<std::path::PathBuf>), deno_core::error::CoreError>
+{
     let output = deno_core::snapshot::create_snapshot(
         deno_core::snapshot::CreateSnapshotOptions {
             cargo_manifest_dir: env!("CARGO_MANIFEST_DIR"),

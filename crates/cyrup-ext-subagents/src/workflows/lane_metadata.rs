@@ -25,7 +25,14 @@ pub const WORKFLOW_LANE_OUTPUT_PATHS_MAX: usize = 10;
 
 /// The top-level allow-list — pi's `assertKnownFields(value, [...], label)` call
 /// (`lane-metadata.ts:48`).
-const LANE_METADATA_FIELDS: [&str; 6] = ["version", "key", "mode", "sourceRef", "claims", "outputPaths"];
+const LANE_METADATA_FIELDS: [&str; 6] = [
+    "version",
+    "key",
+    "mode",
+    "sourceRef",
+    "claims",
+    "outputPaths",
+];
 
 /// A rejected lane — every `throw` in `normalizeWorkflowLaneMetadata`/`assertWorkflowLaneKey`,
 /// carrying upstream's message verbatim (the caller's `label` already interpolated).
@@ -151,7 +158,9 @@ pub fn normalize_workflow_lane_metadata(
         .and_then(Value::as_f64)
         .is_some_and(|version| version == 1.0);
     if !version_ok {
-        return Err(LaneMetadataError::new(format!("{label}.version must be 1.")));
+        return Err(LaneMetadataError::new(format!(
+            "{label}.version must be 1."
+        )));
     }
     // Rules 4+5 — both of upstream's `key` checks (bound + grammar) collapse into ONE
     // `WorkflowKey::parse` call: the grammar is byte-identical and its 128-byte ceiling IS
@@ -187,7 +196,9 @@ pub fn normalize_workflow_lane_metadata(
     // Rule 9 — `outputPaths`, optional.
     let output_paths = match map.get("outputPaths") {
         None => None,
-        Some(value) => Some(lane_bounded_string_array::<WORKFLOW_LANE_OUTPUT_PATH_MAX_BYTES>(
+        Some(value) => Some(lane_bounded_string_array::<
+            WORKFLOW_LANE_OUTPUT_PATH_MAX_BYTES,
+        >(
             value,
             &format!("{label}.outputPaths"),
             WORKFLOW_LANE_OUTPUT_PATHS_MAX,
@@ -285,15 +296,11 @@ mod tests {
     fn rejects_a_non_object() {
         assert_eq!(
             normalize_workflow_lane_metadata(Some(&serde_json::json!("nope")), "lane"),
-            Err(LaneMetadataError::new(
-                "lane must be a plain JSON object."
-            ))
+            Err(LaneMetadataError::new("lane must be a plain JSON object."))
         );
         assert_eq!(
             normalize_workflow_lane_metadata(Some(&serde_json::json!(null)), "lane"),
-            Err(LaneMetadataError::new(
-                "lane must be a plain JSON object."
-            ))
+            Err(LaneMetadataError::new("lane must be a plain JSON object."))
         );
     }
 
@@ -353,7 +360,8 @@ mod tests {
 
     #[test]
     fn rejects_control_characters_the_bound_check_alone_does_not_catch() {
-        let value = serde_json::json!({ "version": 1, "key": "lane.a", "sourceRef": "line1\nline2" });
+        let value =
+            serde_json::json!({ "version": 1, "key": "lane.a", "sourceRef": "line1\nline2" });
         assert_eq!(
             normalize_workflow_lane_metadata(Some(&value), "lane"),
             Err(LaneMetadataError::new(
@@ -380,7 +388,9 @@ mod tests {
         });
         assert_eq!(
             normalize_workflow_lane_metadata(Some(&too_long), "lane"),
-            Err(LaneMetadataError::new("lane.claims[0] must be a non-empty string."))
+            Err(LaneMetadataError::new(
+                "lane.claims[0] must be a non-empty string."
+            ))
         );
     }
 
@@ -392,7 +402,10 @@ mod tests {
         )
         .expect("parses")
         .expect("present");
-        assert_eq!(assert_workflow_lane_key(None, Some(&key("lane.a")), "lane"), Ok(()));
+        assert_eq!(
+            assert_workflow_lane_key(None, Some(&key("lane.a")), "lane"),
+            Ok(())
+        );
         assert_eq!(assert_workflow_lane_key(Some(&lane), None, "lane"), Ok(()));
         assert_eq!(
             assert_workflow_lane_key(Some(&lane), Some(&key("lane.a")), "lane"),

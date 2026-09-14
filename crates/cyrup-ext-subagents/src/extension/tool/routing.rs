@@ -3,7 +3,9 @@
 
 use std::path::{Path, PathBuf};
 
-use cyrup_core::{CancelToken, ModelId, TerminateHint, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
+use cyrup_core::{
+    CancelToken, ModelId, TerminateHint, ToolCallId, ToolError, ToolResult, ToolUpdateSink,
+};
 
 use crate::background::{RunId, RunMode};
 use crate::discovery::discover_agents;
@@ -591,7 +593,9 @@ impl SubagentTool {
         let run_dir = run_dir_name.resolve_in(&async_root);
         crate::background::ensure_accessible_dir(&run_dir)
             .await
-            .map_err(|e| ToolError::new(format!("workflow run directory could not be created: {e}")))?;
+            .map_err(|e| {
+                ToolError::new(format!("workflow run directory could not be created: {e}"))
+            })?;
 
         // THE FIRST PRODUCTION `RunMode::Workflow` IN THE CRATE.
         let mut status = crate::background::RunStatus::queued(
@@ -600,9 +604,8 @@ impl SubagentTool {
             // §2.1 — this process drives it; reconcile.rs step 4 must be able to probe us.
             Some(std::process::id()),
         );
-        status.session_id = crate::identity::SessionId::parse_opt(
-            self.executor.current_session_id().as_deref(),
-        );
+        status.session_id =
+            crate::identity::SessionId::parse_opt(self.executor.current_session_id().as_deref());
         status.cwd = Some(cwd.to_path_buf());
         // §2.3 — the REAL parent tool call id. `with_workflow_children` (settlement.rs:102-105) falls
         // back to the run id when this is None; the real value is strictly better and is in hand.
@@ -850,17 +853,18 @@ impl SubagentTool {
 
         // 2. Build the receipt. `workflow_children: None` stays — the PLAN fills it
         //    (`settlement.rs:692-701`), which is the whole reason the composer exists.
-        let receipt = crate::workflows::build_workflow_receipt(crate::workflows::BuildWorkflowReceipt {
-            workflow_run_id: run_dir_name,
-            state: receipt_state,
-            children,
-            host_steps: &[],          // `on_host_step: None` in this build — WORKFLOW_19
-            workflow_children: None,
-            resource: None,           // `one_use_permit: None` in this build
-            terminal_outcome: None,
-            created_at: None,
-        })
-        .map_err(|error| format!("workflow completed but its receipt is invalid: {error}"))?;
+        let receipt =
+            crate::workflows::build_workflow_receipt(crate::workflows::BuildWorkflowReceipt {
+                workflow_run_id: run_dir_name,
+                state: receipt_state,
+                children,
+                host_steps: &[], // `on_host_step: None` in this build — WORKFLOW_19
+                workflow_children: None,
+                resource: None, // `one_use_permit: None` in this build
+                terminal_outcome: None,
+                created_at: None,
+            })
+            .map_err(|error| format!("workflow completed but its receipt is invalid: {error}"))?;
 
         // 3. Persist it, and carry the OUTCOME rather than swallowing it.
         let (receipt_path, receipt_persistence_error) =
@@ -870,18 +874,19 @@ impl SubagentTool {
             };
 
         // 4. WORKFLOW_3's composer. Its first production call site.
-        let plan = crate::workflows::plan_workflow_settlement(crate::workflows::PlanWorkflowSettlement {
-            status: &settled,
-            summary,
-            trace,
-            receipt: Some(receipt),
-            receipt_path,
-            receipt_persistence_error,
-            resolution: None,
-            terminal_outcome: None,
-            now: None,
-            event_metadata: serde_json::Map::new(),
-        });
+        let plan =
+            crate::workflows::plan_workflow_settlement(crate::workflows::PlanWorkflowSettlement {
+                status: &settled,
+                summary,
+                trace,
+                receipt: Some(receipt),
+                receipt_path,
+                receipt_persistence_error,
+                resolution: None,
+                terminal_outcome: None,
+                now: None,
+                event_metadata: serde_json::Map::new(),
+            });
 
         // 5. The terminal status write — now carrying `workflow_children` and `workflow_receipt_path`,
         //    which `control.rs:305` / `wait.rs:602` / `run_status.rs:367` /
@@ -891,7 +896,10 @@ impl SubagentTool {
             .map_err(|e| format!("workflow terminal status could not be written: {e}"))?;
 
         if let Some(map) = base_details.as_object_mut() {
-            map.insert("workflowRunId".to_string(), serde_json::json!(plan.status.run_id.as_str()));
+            map.insert(
+                "workflowRunId".to_string(),
+                serde_json::json!(plan.status.run_id.as_str()),
+            );
             if let (Some(receipt), Some(path)) = (&plan.receipt, &plan.receipt_path) {
                 map.insert(
                     "workflowReceipt".to_string(),
@@ -1493,7 +1501,9 @@ impl SubagentTool {
                 let report = crate::workflows::scripted::validate_workflow_script(script, false)
                     .map_err(ToolError::new)?;
                 Ok(ToolResult {
-                    content: vec![cyrup_core::Content::text(render_validation_findings(&report))],
+                    content: vec![cyrup_core::Content::text(render_validation_findings(
+                        &report,
+                    ))],
                     details: Some(serde_json::json!({
                         "action": "validate",
                         "ok": report.ok,

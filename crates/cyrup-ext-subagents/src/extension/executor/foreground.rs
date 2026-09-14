@@ -11,7 +11,9 @@ use crate::exec::fallback::{provider_of, resolve_model_inheritance};
 use crate::exec::{AgentConfig, RunOptions, SingleResult};
 use crate::extension::EXTENSION_ID;
 use crate::extension::executor::SubagentExecutor;
-use crate::extension::executor::foreground_control::{ForegroundChildEntry, begin_foreground_child};
+use crate::extension::executor::foreground_control::{
+    ForegroundChildEntry, begin_foreground_child,
+};
 use crate::extension::executor::notices::{ForegroundControlEntry, ForegroundControlNotifier};
 use crate::extension::executor::paths::{
     drive_foreground_run_sync, write_foreground_output_artifacts,
@@ -141,7 +143,8 @@ struct ForegroundRunOptionsInput<'a> {
     /// [`RunOptions`] steer paths are derived from it; `register_foreground_controls` stores the
     /// same handle on the child's entry, so the spawn side and the control side cannot disagree
     /// about where this child's inbox is.
-    workflow_steer: Option<&'a crate::extension::executor::foreground_control::ForegroundChildSteerHandle>,
+    workflow_steer:
+        Option<&'a crate::extension::executor::foreground_control::ForegroundChildSteerHandle>,
 }
 
 /// The borrowed identity triple [`SubagentExecutor::register_foreground_controls`] stamps onto a
@@ -157,7 +160,8 @@ struct ForegroundControlIdentity<'a> {
     /// WORKFLOW_14 — borrowed from [`ForegroundRunRequest::workflow_steer`], the SAME value
     /// [`SubagentExecutor::build_foreground_run_options`] derived this child's three spawn paths
     /// from. `Some` iff `parent_workflow_run_id` is `Some`.
-    workflow_steer: Option<&'a crate::extension::executor::foreground_control::ForegroundChildSteerHandle>,
+    workflow_steer:
+        Option<&'a crate::extension::executor::foreground_control::ForegroundChildSteerHandle>,
 }
 
 impl SubagentExecutor {
@@ -1424,14 +1428,23 @@ mod tests {
         // `run_foreground_impl` -> `ForegroundControlIdentity`.
         assert_eq!(entry.parent_workflow_run_id, Some(parent.clone()));
         assert_eq!(
-            entry.workflow_key.as_ref().map(crate::workflows::WorkflowKey::as_str),
+            entry
+                .workflow_key
+                .as_ref()
+                .map(crate::workflows::WorkflowKey::as_str),
             Some("lane.a")
         );
         assert_eq!(entry.cwd, Some(cwd.clone()));
         // WORKFLOW_14 — the steer handle rides the SAME identity, and its index is the child's flat
         // index within the WORKFLOW, deliberately distinct from the `active_children` key (0).
-        let child = entry.active_children.get(&0).expect("child at flat index 0");
-        let handle = child.steer.as_ref().expect("a workflow child carries a steer handle");
+        let child = entry
+            .active_children
+            .get(&0)
+            .expect("child at flat index 0");
+        let handle = child
+            .steer
+            .as_ref()
+            .expect("a workflow child carries a steer handle");
         assert_eq!(handle.run_dir, PathBuf::from("/runs/wf-1"));
         assert_eq!(handle.index, 3);
         assert_eq!(
@@ -1478,7 +1491,10 @@ mod tests {
         // WORKFLOW_14's invariant, the other half: `steer.is_some() == parent_workflow_run_id
         // .is_some()`. A plain foreground run has no run directory, so it carries no handle and
         // `steer_workflow_foreground` refuses it with upstream's optional-`steer` sentence.
-        let child = entry.active_children.get(&0).expect("child at flat index 0");
+        let child = entry
+            .active_children
+            .get(&0)
+            .expect("child at flat index 0");
         assert!(child.steer.is_none());
     }
 }

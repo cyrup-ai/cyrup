@@ -202,7 +202,9 @@ impl SubagentExecutor {
         include_history: bool,
         fleet_inspector_open: bool,
     ) -> crate::tui::fleet_state::FleetState {
-        use crate::tui::fleet_state::{AsyncRunView, FleetState, ForegroundChildView, ForegroundControlView};
+        use crate::tui::fleet_state::{
+            AsyncRunView, FleetState, ForegroundChildView, ForegroundControlView,
+        };
 
         let services = self.host_services();
         let current_session_id = services.as_ref().and_then(|s| s.session_id());

@@ -804,7 +804,12 @@ mod tests {
         steps[0].workflow_key = Some(key("lane.a"));
         steps[0].session_file = Some(path.to_path_buf());
         assert_eq!(
-            find_workflow_settlement_step(&steps, "unrelated-run", Some(&key("lane.a")), Some(path)),
+            find_workflow_settlement_step(
+                &steps,
+                "unrelated-run",
+                Some(&key("lane.a")),
+                Some(path)
+            ),
             Some(0)
         );
         // Missing either precondition must not fall back.
@@ -827,7 +832,12 @@ mod tests {
             step.session_file = Some(path.to_path_buf());
         }
         assert_eq!(
-            find_workflow_settlement_step(&steps, "unrelated-run", Some(&key("lane.a")), Some(path)),
+            find_workflow_settlement_step(
+                &steps,
+                "unrelated-run",
+                Some(&key("lane.a")),
+                Some(path)
+            ),
             None,
             "two candidates resolve to nothing, never the first"
         );
@@ -841,7 +851,12 @@ mod tests {
         steps[0].session_file = Some(path.to_path_buf());
         steps[0].run_id = Some(RunId::from_token("already-launched"));
         assert_eq!(
-            find_workflow_settlement_step(&steps, "unrelated-run", Some(&key("lane.a")), Some(path)),
+            find_workflow_settlement_step(
+                &steps,
+                "unrelated-run",
+                Some(&key("lane.a")),
+                Some(path)
+            ),
             None
         );
     }
@@ -1081,7 +1096,10 @@ mod tests {
             extra,
         };
         let value = serde_json::to_value(&event).expect("serializes");
-        assert_eq!(value["type"], serde_json::json!("subagent.workflow.completed"));
+        assert_eq!(
+            value["type"],
+            serde_json::json!("subagent.workflow.completed")
+        );
         assert_eq!(
             value["state"],
             serde_json::json!("overridden"),
@@ -1205,6 +1223,9 @@ mod tests {
             plan.receipt_path,
             Some(PathBuf::from("/tmp/workflow-receipt.json"))
         );
-        assert_eq!(plan.receipt.as_ref().map(|r| r.state), Some(WorkflowReceiptState::Complete));
+        assert_eq!(
+            plan.receipt.as_ref().map(|r| r.state),
+            Some(WorkflowReceiptState::Complete)
+        );
     }
 }

@@ -1331,9 +1331,8 @@ impl ExtensionRegistry {
         allow: Option<&HashSet<String>>,
         exclude: &HashSet<String>,
     ) -> Result<Vec<Arc<dyn Tool>>, ExtError> {
-        let is_allowed = |name: &str| {
-            allow.is_none_or(|a| a.contains(name)) && !exclude.contains(name)
-        };
+        let is_allowed =
+            |name: &str| allow.is_none_or(|a| a.contains(name)) && !exclude.contains(name);
         let g = self.lock_read()?;
         let mut out: Vec<Arc<dyn Tool>> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();

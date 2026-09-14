@@ -148,7 +148,8 @@ pub struct SubagentExecutor {
     ///
     /// `std::sync::Mutex`, matching `foreground_controls`: every access is a short synchronous
     /// insert/remove/contains with no `.await` inside the critical section.
-    workflow_controllers: Arc<std::sync::Mutex<HashMap<crate::background::RunId, WorkflowController>>>,
+    workflow_controllers:
+        Arc<std::sync::Mutex<HashMap<crate::background::RunId, WorkflowController>>>,
     /// pi `state.foregroundRuns` (`shared/types.ts`; written by `rememberForegroundRun`,
     /// `subagent-executor.ts:749-753`; bounded at `:716-722`): settled foreground runs still worth
     /// inspecting, keyed by run id (WORKFLOW_7 §2.5).
