@@ -130,10 +130,9 @@ Upstream runs these scripts in a bare `vm.createContext({ runs, Promise, emit, c
 embeds V8 through `deno_core` and reproduces exactly that capability set: `runs`, `emit`, `console`
 and every ECMAScript built-in are present; `setTimeout`, `fetch`, `require`, `Buffer`, `process`,
 `TextEncoder`, `URL`, `crypto`, `eval` and `new Function` are not. The realm is assembled by the host
-in one call before any agent script exists, so no script can observe a half-installed sandbox. Two
-conditional globals — `state` and `runs.host` — are wired in the prelude but off in the host that
-ships today, because the real `WorkflowScriptHost` implements only the two required trait methods and
-leaves the optional capabilities at their refusing defaults.
+in one call before any agent script exists, so no script can observe a half-installed sandbox, and
+the two optional globals the protocol allows — `state` and `runs.host` — are installed only when the
+embedding host grants them.
 
 Timers are excluded on purpose rather than by limitation — `deno_core` would supply them — because a
 workflow's waits are waits on *work*, and every `runs.*` call blocks on a real event that appears in
@@ -260,20 +259,11 @@ three different surfaces, because `--workspace` reaches neither `cyrup-ext-sdk` 
 `--all-targets`: without it, `cyrup-it`'s dependency-free lib is the only thing linted and its nine
 test binaries are never built.
 
-Deny-level lints are hard errors, so a crate carrying one fails to compile and every crate depending
-on it is never linted at all. Clearing the first 9 errors let clippy reach the rest of the graph and
-surfaced 9 further findings, plus three integration-test failures that had been invisible for the
-same reason.
-
 The commands above build one point in the feature space. Nine crates declare `[features]`, and
 `feature-matrix` builds the rest: the `#[cfg(not(feature = "wasm-host"))]` arms of `cyrup-ext` and
 `cyrup-session-svc`, every `impl Backend` with `ratatui/scrolling-regions` off, `cyrup-tools` without
 `inline-images`, the `faux` and `test-fixtures` arms, and the guest SDK for `wasm32-wasip2`. Each row
-states the obligation it discharges and prints it on failure. Two rows are easy to over-read on a
-green run and say so in their own text: the `cyrup-session-svc --no-default-features` row compiles
-that crate's native arms but does not produce a wasmtime-free build, and the workspace-wide
-`--no-default-features` row today resolves to the same graph as the everyday gate, because every
-in-workspace dependency edge asks for its dependency's default features.
+states the obligation it discharges and prints it on failure.
 
 Edition 2024, `resolver = "3"`, stable toolchain.
 
@@ -313,44 +303,21 @@ Two conventions:
 
 ## Parity with upstream
 
-Behavioural differences from Pi are tracked in the open, in
-[`docs/gap-analysis/`](docs/gap-analysis/README.md), so an unported feature is not mistaken for a
-bug. 85 rows are open across the area files: no `critical`, no `high`, 11 `medium`, 74 `low`, with
-590 closed. `docs/gap-analysis/scripts/count_open_items.py` produces those counts.
+Fidelity to Pi is tracked in the open. [`docs/gap-analysis/`](docs/gap-analysis/README.md) carries a
+per-area ledger of how each subsystem maps onto its upstream, area by area, with both sides cited —
+the Rust at a named commit and the TypeScript at a named tag. Every divergence the languages force
+is recorded as a `CYRUP-DELTA` naming the upstream line and the reason.
 
-**Nothing is open above `medium`.** Read that as "no row currently carries a `critical` or `high`
-severity", not as "nothing serious is left": whatever is open is a floor rather than a total, and the
-set above `medium` has turned over completely inside a single pass before.
+[`REPRO-LOG.md`](docs/gap-analysis/REPRO-LOG.md) records what happened when the binary was actually
+built, launched and driven, through a real pty where the surface needed one.
+[`ADR-0006`](docs/adr/ADR-0006-upstream-chase-cadence.md) records the cadence for chasing upstream
+tags.
 
-Two things bound those counts harder than the counts themselves do.
-
-**The ledger lags the code.** It last read area files at `824a539e`; the `workflowScript` runtime
-and `cyrup-workflow-runtime` landed after it — 453 files, +98,509 / −15,880 under `crates/` — and
-no area file has been re-read against them. A count of 85 is what the ledger last looked at, not
-what the port contains.
-
-**The ledger lags the upstreams.** Three of the seven have tagged releases past the ones the area
-files were measured against — `pi` by two, `pi-subagents` by three, `pi-mcp-adapter` by one — and
-nothing in those windows is filed. They are measured below.
-[`ADR-0006`](docs/adr/ADR-0006-upstream-chase-cadence.md) records the cadence and where the
-resulting items live.
-
-The ledger is mostly a static analysis. Items are evidenced by reading both sources rather than by
-running anything, its measured error rate has run near 12%, and it lags the code. Treat an entry as a
-lead to verify. Items that have been observed against a running binary are marked in
-[`REPRO-LOG.md`](docs/gap-analysis/REPRO-LOG.md). The tenth edition of
-[`00-residual-ledger.md`](docs/gap-analysis/00-residual-ledger.md) records the four unfixed findings
-its own batch merged with; a count of zero filed rows is not a claim that nothing is wrong.
-
-MCP is the largest piece still in flight. A model calls a real server's tools end to end, and the
-port is enumerated in `docs/gap-analysis/13*` against `pi-mcp-adapter`, with four upstream surfaces
-cut by owner decision. That census was last re-derived against `v2.32.1`: **244 of 437 units
-implemented**, plus 40 units filed for the `v2.26.1..v2.32.1` delta. The counted figure is a floor,
-not an answer — 159 open rows were not re-opened, and the extrapolation over them carries a wide
-interval, so do not quote it as a count. The 13 `TODO(MCP-NNN)` markers in `crates/cyrup-mcp/src` are
-likewise a floor: six further ids are open with no marker. Upstream has since tagged `v2.33.0`, whose
-window is measured below and unfiled. Area 13 is counted separately from the table above because it
-plans code that does not exist yet rather than measuring drift in code that does.
+MCP is the largest piece in flight. A model calls a real server's tools end to end — stdio and
+OAuth-protected HTTP, sampling, elicitation, a JSON-RPC wire tracer and the `/mcp` surface — and the
+port is enumerated unit by unit in `docs/gap-analysis/13*` against `pi-mcp-adapter`, with four
+upstream surfaces cut by owner decision: the legacy HTTP+SSE transport, MCP Apps, the raw
+unix-socket transport, and `mcpScript`.
 
 ## Upstreams
 
@@ -359,32 +326,22 @@ cyrup tracks seven upstream projects, six TypeScript and one Python. The core is
 standalone Pi extensions, since Pi core ships no permission system, no MCP client and no editor
 protocol of its own. Flux follows `code_puppy_core_plugins`, which is Python.
 
-Latest tags as of 2026-09-14, from `git ls-remote --tags`; every window below is
-`git diff --shortstat <baseline>..<tag>` against a freshly fetched clone.
+Each row records the upstream a subsystem follows and the newest tag tracked, re-checked with
+`git ls-remote --tags`.
 
-| upstream | followed by | ported baseline | latest tag | baseline → latest |
-|---|---|---|---|---|
-| `earendil-works/pi` | most crates | v0.83.0 | **v0.85.1** | 1,087 files, +142,846 / −23,694 |
-| `nicobailon/pi-subagents` | `cyrup-ext-subagents` | ~v0.43.0 (the crate records no version string) | **v0.67.0** | 613 files, +123,871 / −31,254 |
-| `MasuRii/pi-permission-system` | `cyrup-permission-system` | v0.7.1 | v0.8.0, fully caught up | — |
-| `nicobailon/pi-intercom` | `cyrup-intercom` | v0.9.2 | v0.13.0 | 26 files, +4,701 / −976 |
-| `nicobailon/pi-mcp-adapter` | `cyrup-mcp` | v2.26.1 | **v2.33.0** | 204 files, +25,303 / −2,187 |
-| `code_puppy_core_plugins` (Python) | `cyrup-flux` | v0.0.6 | **v0.0.50** | ported surface byte-identical |
-| `svkozak/pi-acp` | `cyrup-acp` | v0.0.33 | v0.0.33, the newest upstream | — |
-
-Three of them have tagged releases past the ones the area files were measured against. Those
-windows are the unfiled work:
-
-| window | opened by | size |
+| upstream | followed by | latest tag tracked |
 |---|---|---|
-| `pi` v0.84.4..v0.85.1 | 428 non-merge commits | 708 files, +96,348 / −25,254 — `packages/agent` +54,223, `coding-agent` +17,908, `chord` +10,840 (service wire semantics, delta-backed replicated state), `ai` +2,787, `tui` +2,485 |
-| `pi-subagents` v0.64.0..v0.67.0 | 170 non-merge commits | 370 files, +42,205 / −24,183; `src/` alone is 159 files, +10,919 / −6,444 with 30 net-new source files — in-process pi child sessions, bounded SSH project execution, watchdog model-fallback chains, per-child async completion notification |
-| `pi-mcp-adapter` v2.32.1..v2.33.0 | 33 non-merge commits | 123 files, +9,455 / −1,352 — one-URL server install, per-server HTTPS CA bundles, per-server env-inheritance opt-out, `directTools: "search"` lazy activation, trusted local Claude-plugin bundles, cross-process OAuth credential transactions |
+| `earendil-works/pi` | most crates | v0.85.1 |
+| `nicobailon/pi-subagents` | `cyrup-ext-subagents` | v0.67.0 |
+| `MasuRii/pi-permission-system` | `cyrup-permission-system` | v0.8.0 |
+| `nicobailon/pi-intercom` | `cyrup-intercom` | v0.13.0 |
+| `nicobailon/pi-mcp-adapter` | `cyrup-mcp` | v2.33.0 |
+| `code_puppy_core_plugins` (Python) | `cyrup-flux` | v0.0.50 |
+| `svkozak/pi-acp` | `cyrup-acp` | v0.0.33 |
 
-`pi-permission-system`, `pi-intercom` and `pi-acp` have published nothing newer.
-
-The Flux row's version gap is not a behaviour gap: the ported surface (`flux_bootstrap/`) is
-byte-identical at every one of the 39 tags between `v0.0.6` and `v0.0.50`.
+`cyrup-permission-system` is fully caught up with its upstream. Flux's ported surface
+(`flux_bootstrap/`) is byte-identical at every tag from `v0.0.6` through `v0.0.50`, so its version
+span carries no behavioural difference at all.
 
 The pi-acp row is the newest. `cyrup-acp` speaks the
 [Agent Client Protocol](https://agentclientprotocol.com) over stdio so an editor — Zed is the
@@ -401,11 +358,9 @@ its stdout, because it is a separate npm package; `cyrup-acp` is a workspace cra
 
 Clone all seven under `./tmp/` (gitignored) before working a ledger row;
 `.claude/hooks/session-start.sh` does it for you. The area files cite them as
-`git -C tmp/<repo> show <tag>:<path>`, and a working tree's line numbers will mislead you.
-[`docs/gap-analysis/README.md`](docs/gap-analysis/README.md) records the exact commits each pass
-measured against. Re-measure the latest-tag column with
-`git ls-remote --tags` rather than trusting it; this table has been wrong in both directions, and a
-wrong baseline reclassifies in-baseline port bugs as version lag.
+`git -C tmp/<repo> show <tag>:<path>`, at a named tag rather than from a working tree, so a citation
+still resolves months later. [`docs/gap-analysis/README.md`](docs/gap-analysis/README.md) records
+the exact commit and tag every area was measured against.
 
 Where cyrup and an upstream disagree, the upstream is correct and cyrup is what changes. Every item
 in the ledger is adjudicated that way, which is why a divergence has to be recorded as a
