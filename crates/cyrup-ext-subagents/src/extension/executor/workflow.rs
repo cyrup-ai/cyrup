@@ -27,10 +27,15 @@ use crate::extension::tool::text::STEER_ACK_TIMEOUT;
 use crate::extension::executor::requests::ForegroundRunRequest;
 use crate::extension::tool::params::{SubagentToolParams, resolve_execution_agent_scope};
 use crate::fork_context::ContextRequest;
-use crate::workflows::WorkflowScriptChildResult;
+use crate::workflows::{
+    WorkflowContinuation, WorkflowKey, WorkflowLaneMetadata, WorkflowRequestedContext,
+    WorkflowResumability, WorkflowScriptChildResult, assert_workflow_lane_key,
+    normalize_workflow_lane_metadata, workflow_terminal_outcome_for_result,
+};
 use crate::workflows::scripted::{
-    WORKFLOW_CHILD_MARKER, WorkflowLaunchAdmission, WorkflowScriptHost, WorkflowSteerMode,
-    WorkflowSteerOptions, WorkflowSteerResult, WorkflowSteerState, WorkflowSteerTarget,
+    WORKFLOW_CHILD_MARKER, WorkflowLaunchAdmission, WorkflowResumeInput, WorkflowResolvedResume,
+    WorkflowResolvedResumeReference, WorkflowScriptHost, WorkflowSteerMode, WorkflowSteerOptions,
+    WorkflowSteerResult, WorkflowSteerState, WorkflowSteerTarget,
 };
 
 /// Set on every workflow child's environment so the child's own `subagent` tool can refuse a
@@ -130,6 +135,10 @@ pub(crate) struct WorkflowRunHost {
     status: Arc<Mutex<crate::background::RunStatus>>,
     /// Where that record lives: `run_dir_name.resolve_in(&async_root)`, already created by §3.1.
     run_dir: PathBuf,
+    /// The async root under which *any* workflow receipt may be found. Required by
+    /// `resolve_resume` because the reference may name a *different* workflow's run dir
+    /// (W13 §3.1 already resolves it once per `route_workflow_mode`).
+    async_root: PathBuf,
     /// Monotonic flat child index source for steer handles (WORKFLOW_14). Assigned at first launch
     /// of a key and reused on auto-resume; never re-assigned.
     next_child_index: AtomicUsize,
@@ -153,6 +162,7 @@ impl WorkflowRunHost {
         workflow_run_id: crate::background::RunId,
         status: Arc<Mutex<crate::background::RunStatus>>,
         run_dir: PathBuf,
+        async_root: PathBuf,
     ) -> Self {
         Self {
             executor,
@@ -163,6 +173,7 @@ impl WorkflowRunHost {
             workflow_run_id,
             status,
             run_dir,
+            async_root,
             next_child_index: AtomicUsize::new(0),
             publish_lock: tokio::sync::Mutex::new(()),
         }
@@ -210,16 +221,56 @@ impl WorkflowRunHost {
         .await;
     }
 
+    /// Guest `params.lane` → typed metadata. Invalid lane fails the launch BEFORE spawn so a
+    /// mismatched key cannot reach `build_workflow_receipt` Rule 5. Absent lane is `Ok(None)`.
+    fn parse_child_lane(
+        key: &str,
+        raw: Option<&serde_json::Value>,
+    ) -> Result<Option<WorkflowLaneMetadata>, String> {
+        let lane = normalize_workflow_lane_metadata(raw, &format!("runs.run('{key}') lane"))
+            .map_err(|e| e.to_string())?;
+        if let Some(ref lane) = lane {
+            let parsed = WorkflowKey::parse(key)
+                .map_err(|_| format!("runs.run('{key}') has an invalid key."))?;
+            assert_workflow_lane_key(
+                Some(lane),
+                Some(&parsed),
+                &format!("runs.run('{key}') lane"),
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(lane)
+    }
+
+    /// First-launch `context` plus the auto-resume remembered request. `Profile` has no
+    /// `WorkflowRequestedContext` counterpart — `None` is correct.
+    fn requested_context_for(
+        &self,
+        key: &str,
+        child: &SubagentToolParams,
+    ) -> Option<WorkflowRequestedContext> {
+        let request = child.context_override().or_else(|| {
+            self.launched
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(key)
+                .and_then(|id| id.context)
+        })?;
+        match request {
+            ContextRequest::Fresh => Some(WorkflowRequestedContext::Fresh),
+            ContextRequest::Fork => Some(WorkflowRequestedContext::Fork),
+            ContextRequest::Profile => None,
+        }
+    }
+
     /// Map one settled [`SingleResult`] onto the wire shape the engine hands back to the guest.
-    ///
-    /// Every field left `None` names the task that fills it, because that list is exactly what a
-    /// follow-up task would otherwise have to re-derive from scratch.
     fn map_child_result(
         &self,
         key: &str,
         run_id: &crate::background::RunId,
         child: &SubagentToolParams,
         result: &SingleResult,
+        lane: Option<WorkflowLaneMetadata>,
     ) -> WorkflowScriptChildResult {
         WorkflowScriptChildResult {
             key: key.to_string(),
@@ -242,22 +293,42 @@ impl WorkflowRunHost {
             detached: result.detached,
             interrupted: result.interrupted,
             structured_output: result.structured_output.clone(),
-            lane: None,
-            terminal_outcome: None,
-            // [WORKFLOW_3] carried by the settlement receipt, which this task deliberately does
-            // not write.
-            requested_context: None,
+            lane,
+            terminal_outcome: workflow_terminal_outcome_for_result(
+                crate::workflows::WorkflowBudgetSignals::from_single_result(result),
+            ),
+            requested_context: self.requested_context_for(key, child),
+            // CUT: SingleResult has no per-attempt context flag and ModelAttempt
+            // (exec/fallback.rs:1144-1150) has none either. WorkflowResolvedContext::Mixed
+            // (types.rs:653-665) is underivable. A two-valued fill that can never produce Mixed
+            // would be trusted and wrong. See WORKFLOW_15 §1.6.
             resolved_context: None,
             output_reference: result.saved_output_path.clone(),
-            // [WORKFLOW_3] acceptance-recovery metadata; `scripted/recovery.rs` is its reader.
+            // CUT: AcceptanceRecoveryMetadata requires report_path + report_hash (types.rs:618-630).
+            // AcceptanceLedger (exec/acceptance/model/types.rs:575) has neither; the only writers
+            // of those two fields in this crate are tests (scripted/recovery.rs:735, engine.rs:3492).
+            // See WORKFLOW_15 §1.6.
             recovery: None,
-            // [WORKFLOW_3] this host never relocates a child's output, so there is no mapping.
+            // Settled None: this host never relocates a child's output. saved_output_path already
+            // populates output_reference.
             output_path_mapping: None,
-            // [unscheduled] the external-adapter family is unported; the field's own doc says so.
+            // Unported family; the field's own doc says so.
             external_adapter: None,
-            // [WORKFLOW_3] the receipt carries both.
-            resumability: None,
-            continuation: None,
+            resumability: Some(match result.session_file.as_ref() {
+                Some(_) => WorkflowResumability::Resumable,
+                None if result.stopped => WorkflowResumability::NotResumable {
+                    reason: "child was stopped before a session was persisted".to_string(),
+                },
+                None if result.interrupted => WorkflowResumability::NotResumable {
+                    reason: "child was interrupted before a session was persisted".to_string(),
+                },
+                None => WorkflowResumability::NotResumable {
+                    reason: "child persisted no session file".to_string(),
+                },
+            }),
+            continuation: Some(WorkflowContinuation {
+                run_ids: vec![run_id.to_string()],
+            }),
             // `SingleResult::artifact_paths` is `Option<ArtifactPaths>` — five NAMED `PathBuf`s,
             // not a list. Flattened in the struct's own declaration order (input, output, jsonl,
             // metadata, transcript) so the wire list is stable across runs. `to_string_lossy`
@@ -303,6 +374,8 @@ impl WorkflowScriptHost for WorkflowRunHost {
         // not a child param, and it must reach the child as ENV below, never as a task argument.
         let mut params = params;
         params.remove(WORKFLOW_CHILD_MARKER);
+
+        let lane = Self::parse_child_lane(key, params.get("lane"))?;
 
         // The guest has already rejected `workflowScript` (`prelude.js:186`), `action` (`:189`)
         // and `tasks`/`chain`/`parallel`/`concurrency`/`chainDir` (`:191-195`) on a launch, so
@@ -454,7 +527,7 @@ impl WorkflowScriptHost for WorkflowRunHost {
             .await
             .map_err(|e| e.to_string())?;
 
-        let mapped = self.map_child_result(key, &run_id, &child, &result);
+        let mapped = self.map_child_result(key, &run_id, &child, &result, lane);
 
         // Upsert in place, never push. Upsert-IN-PLACE rather than remove+push, because launch
         // order is what `status` and the engine's own `child_order` both assume.
@@ -496,6 +569,48 @@ impl WorkflowScriptHost for WorkflowRunHost {
         found.ok_or_else(|| {
             format!("runs.status('{key_or_run_id}') names no launched child in this workflow.")
         })
+    }
+
+    /// Keyed receipt resume is available because this host writes receipts into a real run dir
+    /// (WORKFLOW_13) and records per-child resumability (WORKFLOW_15). Both are load-bearing: without
+    /// the first there is no receipt to read, without the second every entry is `not-resumable`.
+    fn supports_resolve_resume(&self) -> bool {
+        true
+    }
+
+    async fn resolve_resume(
+        &self,
+        reference: WorkflowResumeInput,
+        _cancel: CancelToken,
+        _index: Option<u64>,
+    ) -> Result<WorkflowResolvedResume, String> {
+        match reference {
+            WorkflowResumeInput::RunId(run_id) => Ok(WorkflowResolvedResume::RunId(run_id)),
+
+            WorkflowResumeInput::Reference(reference) => {
+                let async_root = self.async_root.clone();
+                let resolved_entry = tokio::task::spawn_blocking(move || {
+                    crate::workflows::resolve_workflow_receipt_resume_entry(
+                        crate::workflows::ResolveWorkflowReceiptResume {
+                            reference: &reference,
+                            async_root: &async_root,
+                            assert_resumable: None,
+                        },
+                    )
+                })
+                .await
+                .map_err(|e| format!("workflow receipt resume resolution panicked: {e}"))
+                .and_then(|inner| {
+                    inner.map_err(|e| format!("workflow receipt resume resolution failed: {e}"))
+                })?;
+
+                let resolved_ref = WorkflowResolvedResumeReference {
+                    run_id: resolved_entry.latest_run_id().to_string(),
+                    run_ids: Some(resolved_entry.entry().continuation.run_ids.clone()),
+                };
+                Ok(WorkflowResolvedResume::Reference(resolved_ref))
+            }
+        }
     }
 
     /// WORKFLOW_14 — the workflow owns a run directory (WORKFLOW_13), so the file-drop transport
@@ -616,5 +731,155 @@ impl WorkflowScriptHost for WorkflowRunHost {
             }]),
             error,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
+
+    use super::*;
+
+    /// A host whose `launched` map already carries `key` at `index`, as `launch` would have left it.
+    fn host_with(run_dir: PathBuf, key: &str, index: usize) -> WorkflowRunHost {
+        let workflow_run_id = crate::background::RunId::new();
+        let status = Arc::new(Mutex::new(crate::background::RunStatus::queued(
+            workflow_run_id.clone(),
+            crate::background::RunMode::Workflow,
+            None,
+        )));
+        let host = WorkflowRunHost::new(
+            Arc::new(SubagentExecutor::new()),
+            PathBuf::from("/proj"),
+            Box::new(|_| {}),
+            workflow_run_id,
+            status,
+            run_dir.clone(),
+            run_dir,
+        );
+        if let Ok(mut launched) = host.launched.lock() {
+            launched.insert(
+                key.to_string(),
+                LaunchIdentity {
+                    agent: "worker".to_string(),
+                    model: None,
+                    agent_scope: None,
+                    context: None,
+                    index,
+                },
+            );
+        }
+        host
+    }
+
+    /// DoD manual-confirmation 1: `runs.steer` returns a RECEIPT, never upstream's
+    /// "Workflow steering is unavailable in this host." (which `supports_steer() == true` makes
+    /// unreachable at the engine's own gate). With no child running, no ack can arrive, so the
+    /// receipt is `Queued` + `pending` — the request is on disk and is still live.
+    #[tokio::test]
+    async fn steer_returns_a_queued_receipt_and_delivers_to_the_childs_inbox() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run_dir = dir.path().join("wf");
+        let host = host_with(run_dir.clone(), "lane", 2);
+
+        assert!(host.supports_steer(), "the engine gates on this BEFORE calling steer");
+
+        let receipt = host
+            .steer("lane", "narrow the diff", WorkflowSteerOptions::default(), CancelToken::new())
+            .await
+            .expect("a launched key must yield a receipt");
+
+        assert_eq!(receipt.key, "lane");
+        assert_eq!(receipt.state, WorkflowSteerState::Queued);
+        assert_eq!(receipt.delivery_status.as_deref(), Some("pending"));
+        assert!(receipt.request_id.is_some(), "the receipt must carry its correlation id");
+        assert!(receipt.error.is_none());
+        let targets = receipt.targets.expect("one target, this key's child");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].index, 2, "the WORKFLOW-flat index this key was launched at");
+
+        // Delivered into the child's own inbox at the same index — not the runner intake queue.
+        let inbox = crate::background::control::step_steer_inbox_dir(&run_dir, 2);
+        let count = std::fs::read_dir(&inbox)
+            .expect("the child's inbox must exist")
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
+            .count();
+        assert_eq!(count, 1, "exactly one request in {inbox:?}");
+    }
+
+    /// The engine proves the key was launched before calling us, but a host that trusted that
+    /// blindly would mint a fresh index for an unknown key and steer a child that does not exist.
+    #[tokio::test]
+    async fn steer_refuses_a_key_this_host_never_launched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = host_with(dir.path().join("wf"), "lane", 0);
+        let error = host
+            .steer("other", "hi", WorkflowSteerOptions::default(), CancelToken::new())
+            .await
+            .expect_err("an unlaunched key must refuse");
+        assert_eq!(
+            error,
+            "runs.steer('other') names no launched child in this workflow."
+        );
+    }
+
+    /// An explicit `index` that names a different child cannot be honoured. Quietly steering this
+    /// key's child instead is the silent-retarget failure the mode mapping also refuses to make.
+    #[tokio::test]
+    async fn steer_refuses_an_explicit_index_that_addresses_another_child() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = host_with(dir.path().join("wf"), "lane", 2);
+        let options = WorkflowSteerOptions {
+            index: Some(5),
+            ..WorkflowSteerOptions::default()
+        };
+        let error = host
+            .steer("lane", "hi", options, CancelToken::new())
+            .await
+            .expect_err("a mismatched explicit index must refuse");
+        assert_eq!(
+            error,
+            "runs.steer('lane') index 5 does not address this child (index 2)."
+        );
+    }
+
+    /// An OMITTED mode is not an unrecognised one: it means "the caller did not say", which is
+    /// `SteerDeliveryMode::Steer`. `Steer` is normalised OFF the wire, so the request carries no
+    /// `mode` field at all — while `follow_up` is carried verbatim.
+    #[tokio::test]
+    async fn an_omitted_mode_defaults_to_steer_and_follow_up_is_carried() {
+        for (mode, expected) in [
+            (None, None),
+            (Some(WorkflowSteerMode::Steer), None),
+            (Some(WorkflowSteerMode::FollowUp), Some("follow_up")),
+            (Some(WorkflowSteerMode::Auto), Some("auto")),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let run_dir = dir.path().join("wf");
+            let host = host_with(run_dir.clone(), "lane", 0);
+            let options = WorkflowSteerOptions {
+                mode,
+                ..WorkflowSteerOptions::default()
+            };
+            host.steer("lane", "go", options, CancelToken::new())
+                .await
+                .expect("every mode must deliver, none may refuse");
+
+            let inbox = crate::background::control::step_steer_inbox_dir(&run_dir, 0);
+            let entry = std::fs::read_dir(&inbox)
+                .expect("inbox")
+                .filter_map(Result::ok)
+                .find(|e| e.file_name().to_string_lossy().ends_with(".json"))
+                .expect("one request");
+            let body = std::fs::read_to_string(entry.path()).expect("read");
+            let parsed: serde_json::Value = serde_json::from_str(&body).expect("json");
+            assert_eq!(parsed.get("mode").and_then(|m| m.as_str()), expected, "mode {mode:?}");
+        }
     }
 }
