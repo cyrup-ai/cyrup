@@ -22,6 +22,7 @@ pub(crate) mod session_state;
 pub(crate) mod spawn_budget;
 pub(crate) mod status;
 pub(crate) mod workflow;
+pub(crate) mod workflow_child_stops;
 pub(crate) mod workflow_controllers;
 pub(crate) mod workflow_steering;
 
@@ -150,6 +151,28 @@ pub struct SubagentExecutor {
     /// insert/remove/contains with no `.await` inside the critical section.
     workflow_controllers:
         Arc<std::sync::Mutex<HashMap<crate::background::RunId, WorkflowController>>>,
+    /// pi `state.workflowChildStops` (`shared/types.ts:2315-2316`; created
+    /// `subagent-executor.ts:4958`, written by the engine's `registerStopChild` registrar at
+    /// `:5691-5694`, deleted at settlement `:5927`, cleared at teardown `extension/index.ts:1042`):
+    /// the live per-child stop handle of every workflow shell THIS process is driving, keyed the
+    /// same way `workflow_controllers` above is (WORKFLOW_18 §2.1).
+    ///
+    /// A SEPARATE map from `workflow_controllers`, deliberately and for upstream's own reason: a
+    /// controller aborts a WORKFLOW, a stop handle stops ONE CHILD of one. Fusing them into a
+    /// single entry would make "stop child b" abort the run.
+    ///
+    /// ⚠ The value pins the engine's whole `Arc<RunShared>` — every child result, trace entry and
+    /// console line of the run. The registrar's `None` arm MUST remove the entry, never tombstone
+    /// it; see [`workflow_child_stops`]'s module doc for the full lifetime contract.
+    ///
+    /// `std::sync::Mutex`, matching both siblings: every access is a short synchronous
+    /// insert/remove/clone with no `.await` inside the critical section, and the handle itself is
+    /// a synchronous callback the engine invokes from arbitrary host threads.
+    workflow_child_stops: Arc<
+        std::sync::Mutex<
+            HashMap<crate::background::RunId, crate::workflows::scripted::WorkflowStopChild>,
+        >,
+    >,
     /// pi `state.foregroundRuns` (`shared/types.ts`; written by `rememberForegroundRun`,
     /// `subagent-executor.ts:749-753`; bounded at `:716-722`): settled foreground runs still worth
     /// inspecting, keyed by run id (WORKFLOW_7 §2.5).
@@ -254,6 +277,7 @@ impl SubagentExecutor {
             clarify: Arc::new(crate::tui::intercom::AskLock::new_with_no_live_channel()),
             foreground_controls: Arc::new(std::sync::Mutex::new(HashMap::new())),
             workflow_controllers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            workflow_child_stops: Arc::new(std::sync::Mutex::new(HashMap::new())),
             foreground_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             spawn_budget: std::sync::Mutex::new(SpawnBudget::default()),
             parent_model_memory: std::sync::Mutex::new(ParentModelMemory::default()),

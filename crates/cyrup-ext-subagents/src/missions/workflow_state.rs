@@ -24,12 +24,14 @@
 //! ready action (`missions/goal-driver.ts:89`).
 //!
 //! [`create_mission_workflow_state`] has exactly ONE caller upstream —
-//! `runs/foreground/subagent-executor.ts:4139`, inside the `workflowScript` branch — and cyrup has
-//! no `workflowScript` runtime at all (the identifier appears nowhere in this crate; see
-//! `extension.rs::normalize_public_subagent_execution`'s own note on that gap). It is ported here,
-//! in full and with its own tests, so that the `workflowScript` port is a call-site change rather
-//! than a second port of this file; it is deliberately NOT wired into a made-up cyrup-only
-//! surface, because upstream exposes no other one.
+//! `runs/foreground/subagent-executor.ts:4139`, inside the `workflowScript` branch. When this file
+//! was ported cyrup had no `workflowScript` runtime at all, so it was ported in full and with its
+//! own tests precisely so that wiring one up later would be a CALL-SITE change rather than a
+//! second port of this file. That bet paid: cyrup now has that runtime, and the whole of the
+//! wiring is [`MissionWorkflowStateStore`] below plus one `state: Some(...)` at
+//! `extension/tool/routing.rs`'s WORKFLOW arm — this module's rules were not touched to get there.
+//! It is still deliberately NOT wired into a made-up cyrup-only surface, because upstream exposes
+//! no other one.
 //!
 //! # [CYRUP-DELTA] `assertWorkflowJsonValue`
 //!
@@ -253,6 +255,79 @@ pub fn create_mission_workflow_state(
     })
 }
 
+/// [`MissionWorkflowState`] behind the engine's [`WorkflowStateStore`] trait — the adapter that
+/// turns this module's "wiring status" note into a call-site change.
+///
+/// Upstream needs no equivalent type: its `{ path, get, set }` object already satisfies the
+/// engine's structural contract at `subagent-executor.ts:4139`. Rust needs a nominal impl because
+/// the two signatures disagree twice — [`MissionWorkflowState::get`] takes `&mut self` (the lazy
+/// once-only load mutates the cached map, so the FIRST read is a write) and both halves return
+/// [`MissionResult`], while the trait is `&self` and `Result<_, String>`.
+///
+/// [`tokio::sync::Mutex`] rather than [`std::sync::RwLock`]/[`std::sync::Mutex`] for two
+/// independent reasons: a reader/writer split would buy nothing when `get` needs `&mut` just like
+/// `set`, and the lock is taken inside an `async fn`, where a contended `std::sync` guard would
+/// block the executor thread outright instead of yielding.
+///
+/// [`WorkflowStateStore`]: crate::workflows::scripted::WorkflowStateStore
+#[derive(Debug)]
+pub struct MissionWorkflowStateStore {
+    inner: tokio::sync::Mutex<MissionWorkflowState>,
+}
+
+impl MissionWorkflowStateStore {
+    /// pi `createMissionWorkflowState(...)` as the `workflowScript` branch consumes it — the
+    /// constructor takes exactly what [`create_mission_workflow_state`] takes, because it IS that
+    /// call plus the lock.
+    ///
+    /// Construction does **zero** I/O: [`MissionWorkflowState`] is lazy (`values: None` until the
+    /// first access), so only [`mission_state_path`]'s traversal guard runs here. That is what
+    /// makes it safe for the call site to build a store for every mission-bound workflow, even one
+    /// whose script never mentions `state` — and the call site has no choice, since the resulting
+    /// `is_some()` must be known before the script is validated.
+    ///
+    /// # Errors
+    ///
+    /// [`MissionError::Invalid`] when `mission_id` is not a valid mission id.
+    pub fn create(location: &MissionStoreLocation, mission_id: &str) -> MissionResult<Self> {
+        Ok(Self {
+            inner: tokio::sync::Mutex::new(create_mission_workflow_state(location, mission_id)?),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::workflows::scripted::WorkflowStateStore for MissionWorkflowStateStore {
+    /// Delegates, and ONLY delegates. The key grammar is [`validate_state_key`]'s (and the
+    /// engine's own `validate_key` before that); the 256 KiB ceiling and the lazy load are
+    /// [`MissionWorkflowState::get`]'s. A second check here would be a second place to get it
+    /// wrong.
+    ///
+    /// [`MissionError`]'s `Display` is deliberately verbatim upstream text (`Invalid(String)`
+    /// renders bare, with no prefix), so `to_string` hands the guest exactly the refusal the port
+    /// promises — no wrapper sentence is added.
+    async fn get(&self, key: &str) -> Result<Option<Value>, String> {
+        let mut guard = self.inner.lock().await;
+        // `MissionWorkflowState` is BLOCKING `std::fs`. The whole-file read is bounded by
+        // `MISSION_STATE_MAX_BYTES` (256 KiB) and happens at most once per run (the map is
+        // authoritative afterwards), so it is taken inline rather than through `spawn_blocking` —
+        // which would need the `&mut` guard to cross a thread boundary for a read that is, at
+        // worst, a quarter-megabyte off the page cache.
+        guard.get(key).map_err(|e| e.to_string())
+    }
+
+    /// Delegates to [`MissionWorkflowState::set`], which validates the key, validates the value
+    /// (`assert_workflow_json_value`, already called at its own line — not re-called here),
+    /// measures the SERIALIZED candidate against the 256 KiB ceiling, writes atomically, and only
+    /// then adopts the map. The size ceiling is the one invariant the engine does not also
+    /// enforce, which makes its refusal the proof that this adapter is delegating rather than
+    /// re-implementing.
+    async fn set(&self, key: &str, value: Value) -> Result<(), String> {
+        let mut guard = self.inner.lock().await;
+        guard.set(key, value).map_err(|e| e.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -396,6 +471,86 @@ mod tests {
             err.to_string().contains("root must be a JSON object"),
             "{err}"
         );
+    }
+
+    /// WORKFLOW_20 — the adapter proven where it is actually consumed: through the engine's
+    /// trait, over the real file. The SECOND store is the cross-process durability proof without
+    /// paying for a subprocess — two stores share nothing but `state.json`, so a value the second
+    /// one reads back can only have come off disk.
+    #[tokio::test]
+    async fn the_store_round_trips_through_the_file_behind_the_engine_trait() {
+        use crate::workflows::scripted::WorkflowStateStore as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let loc = location(tmp.path());
+        let store = MissionWorkflowStateStore::create(&loc, "m-1").unwrap();
+        assert_eq!(store.get("phase").await.unwrap(), None);
+        store
+            .set("phase", serde_json::json!({"step": 2, "done": false}))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get("phase").await.unwrap(),
+            Some(serde_json::json!({"step": 2, "done": false}))
+        );
+
+        let reopened = MissionWorkflowStateStore::create(&loc, "m-1").unwrap();
+        assert_eq!(
+            reopened.get("phase").await.unwrap(),
+            Some(serde_json::json!({"step": 2, "done": false}))
+        );
+        let raw = std::fs::read_to_string(mission_state_path(&loc, "m-1").unwrap()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&raw).unwrap(),
+            serde_json::json!({"phase": {"step": 2, "done": false}}),
+            "the whole object is rewritten on every set, so the file IS the state"
+        );
+    }
+
+    /// The adapter's `map_err` is the whole of its error handling, and that is the point:
+    /// [`MissionError::Invalid`] renders BARE, so upstream's refusals reach the guest
+    /// character-for-character with no wrapper sentence prepended.
+    ///
+    /// The 256 KiB refusal carries extra weight: nothing in the engine bounds a value's size, so
+    /// that sentence can ONLY have come from [`MissionWorkflowState::set`]. If it ever stops
+    /// appearing, the adapter has stopped delegating.
+    #[tokio::test]
+    async fn the_store_forwards_upstreams_refusals_verbatim_and_writes_nothing() {
+        use crate::workflows::scripted::WorkflowStateStore as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let loc = location(tmp.path());
+        let store = MissionWorkflowStateStore::create(&loc, "m-1").unwrap();
+
+        let huge = Value::String("x".repeat(MISSION_STATE_MAX_BYTES + 10));
+        let err = store.set("big", huge).await.unwrap_err();
+        assert!(
+            err.starts_with("Mission state exceeds the 256 KiB limit ("),
+            "{err}"
+        );
+
+        let expected = "state key must be 1-128 characters using letters, numbers, '.', '_' or \
+                        '-', and start with a letter or number.";
+        assert_eq!(store.get("has space").await.unwrap_err(), expected);
+        assert_eq!(
+            store.set("nope/slash", Value::Null).await.unwrap_err(),
+            expected
+        );
+
+        assert!(
+            !mission_state_path(&loc, "m-1").unwrap().exists(),
+            "every call above was refused, so nothing may have been written"
+        );
+    }
+
+    /// The traversal guard runs at CONSTRUCTION, not on first use — which is what lets the call
+    /// site build a store for every mission-bound workflow and still fail the tool call, rather
+    /// than discovering a malformed id from inside the guest realm.
+    #[test]
+    fn the_store_refuses_a_traversing_mission_id_at_construction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loc = location(tmp.path());
+        assert!(MissionWorkflowStateStore::create(&loc, "../escape").is_err());
     }
 
     #[test]

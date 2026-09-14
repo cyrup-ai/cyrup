@@ -73,15 +73,23 @@ impl SubagentExecutor {
     /// '{runId}' is {status}; stop only supports pending or running children.`, and success with
     /// `Stop requested for child {child.id} in async run {id}.` naming the RESOLVED identity. The
     /// written request then carries `targetIndex`/`childId`, and the runner stops that one step
-    /// while the run stays alive. The `workflowControllers` child-stop branch
-    /// (`subagent-executor.ts:6122-6155`) is the unported workflow subsystem, as below.
+    /// while the run stays alive.
     ///
-    /// The two `Workflow …` strings are the `workflowControllers` fast path and the `mode ===
-    /// "workflow"` reload-recovery refusal. Both are gated on upstream's fourth run mode
-    /// (`SubagentRunMode = "single" | "parallel" | "chain" | "workflow"`, `shared/types.ts:231`) and
-    /// its `state.workflowControllers` registry (`shared/types.ts:1590`); [`crate::background::RunMode`] has
-    /// three variants and this crate has no controller registry, so both branches would be dead code
-    /// today. They enter scope with the WorkflowScript runtime, not before.
+    /// WORKFLOW_18 — the `workflowChildStops` branch (`subagent-executor.ts:6668-6704`) IS ported,
+    /// as the first thing the id-addressed block below does: an id this process is driving as a
+    /// workflow, addressed WITH a `child_id`, stops that one child through the in-process registry
+    /// ([`crate::extension::executor::workflow_child_stops`]) and never touches the async store.
+    /// Its two sentences are cyrup's own (`Stopped workflow {id} child '{key}'.` and `Workflow
+    /// '{id}' has no live child '{key}'.`) because the gate ahead of them is cyrup's own: upstream
+    /// admits on registry membership alone, this crate runs `active_workflow_error`'s four gates,
+    /// including the `SessionGate::Strict` one that keeps a stop inside its own session.
+    ///
+    /// The two `Workflow …` strings above remain unported, and they are a DIFFERENT branch: the
+    /// whole-workflow abort (`:4776`) and the `mode === "workflow"` reload-recovery refusal
+    /// (`:4801`). Aborting a whole workflow is [`crate::extension::executor::workflow_controllers`]'s
+    /// verb on its own map, reached from its own surface, and reload recovery has no cyrup analogue
+    /// yet — so a workflow id addressed with no `child_id` is deliberately left on the async-store
+    /// path it already took.
     ///
     /// `Async run '{id}' was not found in the active session.` is `stopAsyncRun`'s session-scope
     /// guard (`status?.sessionId !== state.currentSessionId`). [`crate::background::RunStatus`] records no
@@ -113,6 +121,32 @@ impl SubagentExecutor {
         if let Some(id) = target
             && dir.is_none()
         {
+            // WORKFLOW_18 — pi's `action === "stop"` workflow-child branch
+            // (`subagent-executor.ts:6668-6704`): an id THIS process is DRIVING as a workflow
+            // routes to the in-process child-stop registry and never touches the async store.
+            // Positioned exactly where `control_steer` puts its own workflow branch
+            // (`steer.rs:115`, ahead of `is_live_foreground_run`) and for the same reason — the
+            // classifications below were all written when a workflow-owned child had no route at
+            // all. Exact-match only (`live_workflow_run_id_for`'s own doc): a prefix match here
+            // would stop a child of the WRONG workflow.
+            //
+            // Gated on `child_id`, which is upstream's own gate (`:6671`, `if (params.childId !==
+            // undefined)`). `child_id` carries the workflow LAUNCH KEY — the string `runs.run("a",
+            // …)` named, which is what the engine's stop closure keys on. With no child selector
+            // the caller asked to stop the WHOLE workflow: a different verb on a different map
+            // (`WorkflowController::abort`, WORKFLOW_6), explicitly out of this task's scope, so
+            // that call is left on exactly the path it already took.
+            //
+            // No `reason` is threaded: neither `control_stop` nor upstream's stop action carries
+            // one, so `None` takes the engine's own default message rather than inventing a
+            // parameter for the sake of one.
+            if let Some(key) = child_id
+                && let Some(workflow_run_id) = self.live_workflow_run_id_for(id)
+            {
+                return self
+                    .stop_workflow_child_action(&workflow_run_id, key, None, &async_root)
+                    .await;
+            }
             // pi `:4796`: the selector named a run nested inside another run's subtree. Real id,
             // wrong scope — never reported as a missing async run.
             if self.resolves_to_nested_run(id).await {

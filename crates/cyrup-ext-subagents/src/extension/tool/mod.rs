@@ -394,8 +394,19 @@ impl Tool for SubagentTool {
         // ORDER is free here — `parsed` was rebound to a `&SubagentToolParams` above, so all four
         // arms share one shared reference and nothing is moved (note: `parsed`, never `&parsed`).
         let outcome = if has_workflow {
-            self.route_workflow_mode(&call_id, parsed, &effective_cwd, on_update, cancel)
-                .await
+            // WORKFLOW_20 — WORKFLOW is the one arm that reads the binding it was already given:
+            // a mission-bound workflowScript gets that mission's durable `state` scratchpad.
+            // `as_ref()` is a shared borrow that ends with the call, so the settle half's own
+            // `mission_binding.as_ref()` below is unaffected.
+            self.route_workflow_mode(
+                &call_id,
+                parsed,
+                &effective_cwd,
+                mission_binding.as_ref(),
+                on_update,
+                cancel,
+            )
+            .await
         } else if has_tasks {
             self.route_parallel_mode(parsed, &effective_cwd, cancel)
                 .await
