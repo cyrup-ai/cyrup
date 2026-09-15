@@ -447,8 +447,9 @@ impl SubagentExecutor {
             )),
             // SUBA-034: pi's async-complete EVENT has several independent listeners
             // (`extension/index.ts:648-659` @v0.43.0 registers three; `wait-subscriptions.ts` adds
-            // the wait wake-up). cyrup's one-observer seam could only model the mission sync, so
-            // both now hang off a `CompositeCompletionObserver` in the same registration order.
+            // a FOURTH, which SCOPE_11 landed as the last member below). cyrup's one-observer seam
+            // could only model the mission sync, so all four now hang off a
+            // `CompositeCompletionObserver` in the same registration order.
             Some(Arc::new(
                 crate::background::watch::CompositeCompletionObserver::new(vec![
                     // MUST run first: this is pi's own recording position
@@ -468,6 +469,20 @@ impl SubagentExecutor {
                     }),
                     // SUBA-034: the wake-up every in-flight `wait` is selecting on.
                     Arc::new(self.completion_bus.clone()),
+                    // SCOPE_11: pi's FOURTH listener (`wait-subscriptions.ts`'s own
+                    // `pi.events.on(SUBAGENT_ASYNC_COMPLETE_EVENT, reconcile)`, `:285`).
+                    //
+                    // MUST run LAST, and for the mirror image of why the store runs first: a
+                    // subscription reconciling here reads the completion back through the
+                    // three-rung reader, whose FIRST rung is the record member #1 writes. Register
+                    // it earlier and every fired subscription falls through to the on-disk rungs
+                    // for no reason — or, once the payload is unlinked, to the replay record that
+                    // may not have been written yet.
+                    Arc::new(
+                        crate::extension::executor::wait_subscriptions::WaitSubscriptionCompletionObserver::new(
+                            self.wait_subscription_slot(),
+                        ),
+                    ),
                 ]),
             )),
             // The identity pair that decides which completions this instance may consume.

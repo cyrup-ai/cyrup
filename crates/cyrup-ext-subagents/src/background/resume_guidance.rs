@@ -20,13 +20,13 @@
 //!   [`super::wait`].
 //! * `formatAsyncReviveCommand` → the shared command builder both of the others call. Ported as
 //!   [`format_async_revive_command`].
-//! * `formatResumeFirstFailedRunDetail` → `wait-subscriptions.ts:183` ONLY. That module
-//!   (`runs/background/wait-subscriptions.ts`) is unported in cyrup and tracked as PARITY-GAPS
-//!   **VL-S8**; it is the *only* call site upstream. Porting the formatter now would add a `pub fn`
-//!   with no caller in this crate, and an unreachable capability is the defect class this backlog
-//!   keeps filing (SUBA-043/SUBA-047). It is therefore owed BY VL-S8 — whoever lands wait
-//!   subscriptions writes it there, over [`format_async_revive_command`], which is the only part
-//!   of it that carries real logic. Recorded here so it is not re-derived as a missing function.
+//! * `formatResumeFirstFailedRunDetail` → `wait-subscriptions.ts:255` ONLY (`:183` at the v0.41.0
+//!   tag this note was first written against; same call, one site, unchanged). **This debt is now
+//!   PAID.** `runs/background/wait-subscriptions.ts` is ported as
+//!   [`crate::background::wait_subscriptions`], so the formatter has the caller it was waiting for
+//!   and lands here as [`format_resume_first_failed_run_detail`], built over
+//!   [`format_async_revive_command`] exactly as this note predicted — that shared builder is the
+//!   only part of it that carries real logic.
 //!
 //! # Mapping upstream's `AsyncRunSummary` onto cyrup's [`RunStatus`]
 //!
@@ -118,6 +118,43 @@ pub fn format_resume_first_failed_runs_note(runs: &[RunStatus]) -> String {
         " Resume-first: {guidance} before reporting failure or launching a replacement. Launch a \
          replacement only if revive fails or the user explicitly asks for one."
     )
+}
+
+/// pi `formatResumeFirstFailedRunDetail` (`resume-guidance.ts:32-39`) — the SINGULAR twin of
+/// [`format_resume_first_failed_runs_note`], and the `detail` a settled async wait subscription
+/// carries (`wait-subscriptions.ts:255`, its only call site upstream at every tag).
+///
+/// Three differences from the plural form, all of them upstream's and all of them load-bearing:
+///
+/// 1. **No leading space.** The plural note returns `` ` Resume-first: …` `` because its caller
+///    interpolates it directly after an outcome clause; this one is a whole `detail` string in its
+///    own right and is interpolated after `": {outcome}. "` (`:191`), which already supplies the
+///    separator.
+/// 2. **It gates on the RUN's state itself** (`:33`), not on filtering a list: a subscription that
+///    settles `completed`/`stopped`/`paused` gets `None` here and falls back to its caller's
+///    "Inspect the run status for its final output."
+/// 3. **It is singular by construction** — one run, one command — so it never reaches the plural
+///    form's "N failed runs have persisted child sessions" branch.
+///
+/// **`[CYRUP-DELTA]`** upstream's `formatIntercomDetachGuidance` short-circuit (`:34-35`) is NOT
+/// ported, for the same reason it is absent from [`format_resume_first_failed_runs_note`]: that
+/// branch arrived upstream after the shape this module was ported against, it reads
+/// `step.execution?.status === "detached"` which cyrup's [`super::StepStatus`] has no field for,
+/// and adding it to one of the two formatters and not the other would make them disagree. Both
+/// are owed together, by whoever ports the detach-guidance surface.
+#[must_use]
+pub fn format_resume_first_failed_run_detail(run: &RunStatus) -> Option<String> {
+    // pi `:33` — only a FAILED run has resume-first guidance to give.
+    if run.state != RunState::Failed {
+        return None;
+    }
+    let command = format_async_revive_command(run)?;
+    Some(format!(
+        "Resume-first: failed run \"{}\" has a persisted child session. Revive the original run \
+         with {command} before reporting failure or launching a replacement. Launch a replacement \
+         only if revive fails or the user explicitly asks for one.",
+        run.run_id.as_str()
+    ))
 }
 
 #[cfg(test)]
@@ -319,5 +356,50 @@ mod tests {
              replacement. Launch a replacement only if revive fails or the user explicitly asks \
              for one."
         );
+    }
+
+    /// SCOPE_11 — the SINGULAR detail, `wait-subscriptions.ts:255`'s only argument.
+    ///
+    /// Three properties the plural form does not have, each asserted: no leading space, a `None`
+    /// for a run that is not `failed`, and a `None` for a failed run with nothing revivable (which
+    /// is what makes the call site's `?? "Inspect the run status for its final output."` fallback
+    /// reachable).
+    #[test]
+    fn the_singular_resume_first_detail_is_the_wait_subscription_wake_text() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = dir.path().join("child.jsonl");
+        std::fs::write(&transcript, b"{}").expect("write transcript");
+
+        let failed = run_with(
+            RunState::Failed,
+            vec![step(StepState::Failed, Some(transcript.clone()))],
+            None,
+        );
+        let detail =
+            format_resume_first_failed_run_detail(&failed).expect("a revivable failed run");
+        assert_eq!(
+            detail,
+            "Resume-first: failed run \"run-1\" has a persisted child session. Revive the original \
+             run with subagent({ action: \"resume\", id: \"run-1\", message: \"Continue from the \
+             persisted child session and report the result.\" }) before reporting failure or \
+             launching a replacement. Launch a replacement only if revive fails or the user \
+             explicitly asks for one."
+        );
+        assert!(
+            !detail.starts_with(' '),
+            "unlike the plural note, this one is a whole detail string and carries no leading space"
+        );
+
+        // Not failed: pi `:33`.
+        let complete = run_with(
+            RunState::Complete,
+            vec![step(StepState::Complete, Some(transcript))],
+            None,
+        );
+        assert_eq!(format_resume_first_failed_run_detail(&complete), None);
+
+        // Failed, but nothing to revive: pi `:37`.
+        let unrevivable = run_with(RunState::Failed, vec![step(StepState::Failed, None)], None);
+        assert_eq!(format_resume_first_failed_run_detail(&unrevivable), None);
     }
 }

@@ -260,6 +260,18 @@ pub(crate) const SUBAGENT_ACTIONS: &[&str] = &[
     // "stop", "dismiss", "append-step", …`). Dispatched by `route_control_action`.
     "dismiss",
     "append-step",
+    // SCOPE_12 — [CYRUP-DELTA]: `inspect` is cyrup's OWN verb. Every other entry in this slice is
+    // upstream's, with a named parity item; this one is not, because upstream's `inspect-rpc.ts`
+    // is reached ONLY through the `/subagents-inspect-rpc` slash command and `inspect` does not
+    // appear in its `SUBAGENT_ACTIONS` (`shared/types.ts:2760` @v0.64.0). cyrup exposes the same
+    // reply through the tool surface as well, so a model can read a child's transcript tail and
+    // final output without a host widget. Dispatched by `route_action`'s `"inspect"` arm in this
+    // same change, per the advertise-vs-dispatch invariant this slice's doc above records.
+    //
+    // Positioned after `append-step` and before `doctor`, i.e. at the end of the control band: it
+    // has no upstream index to honour, and the control verbs it sits with are the ones it reads
+    // the same artifacts as.
+    "inspect",
     "doctor",
     "mission.create",
     "mission.list",

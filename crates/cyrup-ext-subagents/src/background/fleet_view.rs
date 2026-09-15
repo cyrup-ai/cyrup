@@ -705,8 +705,241 @@ fn append_transcript_body(lines: &mut Vec<String>, source: &str, body: &[String]
     }
 }
 
-/// pi `sessionMessageLine` + `readSessionTranscriptTail` (`fleet-view.ts:176-205`): the last
-/// resort — parse the persisted session JSONL tail into `role: text` lines, counting (not
+/// One structured content part of a session JSONL record — pi `SessionTranscriptMessage`
+/// (`fleet-view.ts:177-187` @7fe9dee1).
+///
+/// Upstream grew this type when `inspect-rpc.ts` needed the session tail STRUCTURED rather than
+/// collapsed to `role: text` prose: the inspect reply lists the tail message-by-message
+/// (`inspect-rpc.ts:290-299`) and picks a terminal assistant message's text parts out of it
+/// (`:221-231`). cyrup's port previously had only the collapsed form (`content_text`), which is
+/// upstream's own older `contentText` — so the parser is now the structured one and
+/// [`session_message_line`] is re-expressed on top of it, which is exactly upstream's layering
+/// (`sessionMessageLine` calls `sessionMessageParts`, `:224-230`). ONE parser, not two.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionTranscriptMessage {
+    /// The record's `message.role` (or the record's own `role`).
+    pub role: String,
+    /// Which shape of content part this is.
+    pub kind: SessionMessageKind,
+    /// The part's rendered text — verbatim for a text part, a bounded preview for the two tool
+    /// shapes.
+    pub text: String,
+    /// The tool name, for the two tool shapes that declare one.
+    pub name: Option<String>,
+    /// pi's `isError?: boolean`, which upstream only ever sets to `true` (`:213`). A plain `bool`
+    /// rather than `Option<bool>`: the only consumer
+    /// ([`crate::background::inspect_rpc`]'s `to_reply_message`) emits the key only when true, so
+    /// `Some(false)` and `None` would be indistinguishable by construction.
+    pub is_error: bool,
+    /// Ordinal of the session record this part came from, so a consumer can regroup the several
+    /// parts one record yields (pi `:184-186`). `None` until
+    /// [`read_session_messages_tail`] stamps it — [`session_message_parts`] itself does not know
+    /// the record's position, exactly as upstream's does not (`:245` stamps it).
+    pub record_index: Option<usize>,
+}
+
+/// pi `SessionTranscriptMessage["kind"]` (`fleet-view.ts:180`). An enum with an exhaustive match,
+/// never a `String`: the set is closed by the parser that produces it.
+///
+/// `Serialize`/`Deserialize` are derived because this kind IS a wire field of
+/// [`crate::background::inspect_rpc::InspectReplyMessage`] (pi `inspect-rpc.ts:36`), and
+/// `camelCase` is upstream's own spelling there (`"text" | "toolCall" | "toolResult"`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionMessageKind {
+    /// A plain text part, or the JSON preview of an unrecognised `content`-bearing part.
+    Text,
+    /// A `toolCall`/`tool_call` part.
+    ToolCall,
+    /// A `toolResult`/`tool_result` part.
+    ToolResult,
+}
+
+/// pi `readSessionMessagesTail`'s return (`fleet-view.ts:234`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionMessagesTail {
+    /// Parsed content parts, newest last, at most `max_messages` of them.
+    pub messages: Vec<SessionTranscriptMessage>,
+    /// Read failures and malformed-line counts, in pi's own wording.
+    pub warnings: Vec<String>,
+    /// The byte window was cut, or parts were dropped to fit `max_messages` (pi `:253`).
+    pub truncated: bool,
+}
+
+/// pi `sessionMessageParts` (`fleet-view.ts:189-222`) — one session JSONL record's content parts.
+///
+/// A record with no resolvable `role` yields nothing (`:194`), a whitespace-only text part is
+/// dropped (`:196`, `:203`), and an unrecognised object carrying `content` degrades to a bounded
+/// JSON preview (`:216-219`) rather than disappearing.
+fn session_message_parts(record: &serde_json::Value) -> Vec<SessionTranscriptMessage> {
+    let message = record
+        .get("message")
+        .filter(|m| m.is_object())
+        .unwrap_or(record);
+    let Some(role) = message.get("role").and_then(serde_json::Value::as_str) else {
+        return Vec::new();
+    };
+    let part = |kind: SessionMessageKind, text: String, name: Option<String>, is_error: bool| {
+        SessionTranscriptMessage {
+            role: role.to_string(),
+            kind,
+            text,
+            name,
+            is_error,
+            record_index: None,
+        }
+    };
+    let Some(content) = message.get("content") else {
+        return Vec::new();
+    };
+    if let Some(text) = content.as_str() {
+        // pi `:196` — a string content is one text part, unless it is blank.
+        return if text.trim().is_empty() {
+            Vec::new()
+        } else {
+            vec![part(
+                SessionMessageKind::Text,
+                text.to_string(),
+                None,
+                false,
+            )]
+        };
+    }
+    let Some(entries) = content.as_array() else {
+        return Vec::new();
+    };
+    let mut parts: Vec<SessionTranscriptMessage> = Vec::new();
+    for entry in entries {
+        let Some(entry) = entry.as_object() else {
+            continue;
+        };
+        if let Some(text) = entry.get("text").and_then(serde_json::Value::as_str) {
+            if !text.trim().is_empty() {
+                parts.push(part(
+                    SessionMessageKind::Text,
+                    text.to_string(),
+                    None,
+                    false,
+                ));
+            }
+            continue;
+        }
+        let kind = entry
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let declared_name = entry
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| entry.get("toolName").and_then(serde_json::Value::as_str));
+        if kind == "toolCall" || kind == "tool_call" {
+            // pi `:207` — an undeclared tool name renders as the literal `tool`.
+            let name = declared_name.unwrap_or("tool");
+            let args = entry
+                .get("args")
+                .map(|a| format!(" {}", stringify_json_preview(a)))
+                .unwrap_or_default();
+            parts.push(part(
+                SessionMessageKind::ToolCall,
+                format!("[tool: {name}{args}]"),
+                Some(name.to_string()),
+                false,
+            ));
+            continue;
+        }
+        if kind == "toolResult" || kind == "tool_result" {
+            // pi `:212` — unlike a tool CALL, a result with no declared name carries none.
+            let result = entry
+                .get("result")
+                .map(|r| format!(": {}", stringify_json_preview(r)))
+                .unwrap_or_default();
+            parts.push(part(
+                SessionMessageKind::ToolResult,
+                format!("[tool result{result}]"),
+                declared_name.map(str::to_string),
+                entry.get("isError") == Some(&serde_json::Value::Bool(true)),
+            ));
+            continue;
+        }
+        if let Some(content) = entry.get("content") {
+            let preview = stringify_json_preview(content);
+            if !preview.trim().is_empty() {
+                parts.push(part(SessionMessageKind::Text, preview, None, false));
+            }
+        }
+    }
+    parts
+}
+
+/// pi `readSessionMessagesTail` (`fleet-view.ts:232-254`) — the STRUCTURED session tail, behind the
+/// same [`read_contained_text_tail`] gate the prose tail uses.
+///
+/// `pub(crate)` rather than private because SCOPE_12's `inspect_rpc` needs it and MUST NOT grow a
+/// second containment gate: exposing this one function keeps [`read_contained_text_tail`]'s five
+/// refusals (no trusted root, outside every root, symlink, non-regular file, and the re-check
+/// against both canonicalized sides) as the crate's single session-file dereference point.
+///
+/// [CYRUP-DELTA] upstream additionally takes `trustedFiles` and `trustedSessionFileRoot`
+/// (`:234`), a per-call allowance letting a RECORDED session file be read even when it sits
+/// outside every configured root. cyrup has no counterpart anywhere
+/// (`grep -rn "trusted_session_file_root" src/` is empty) and inventing one here would widen the
+/// gate for a read surface, which is the wrong direction — so a session file outside the trusted
+/// roots is refused, and that refusal is pinned by a test.
+pub(crate) fn read_session_messages_tail(
+    session_file: &Path,
+    max_messages: usize,
+    trusted_roots: &[PathBuf],
+) -> SessionMessagesTail {
+    let tail = read_contained_text_tail(
+        session_file,
+        max_messages.saturating_mul(4).max(max_messages),
+        trusted_roots,
+        "session",
+    );
+    let mut warnings = Vec::new();
+    if let Some(error) = tail.error.as_ref() {
+        warnings.push(format!(
+            "Session read failed for {}: {error}",
+            session_file.display()
+        ));
+    }
+    let mut parsed_messages: Vec<SessionTranscriptMessage> = Vec::new();
+    let mut malformed = 0usize;
+    let mut record_index = 0usize;
+    for raw in &tail.lines {
+        if raw.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<serde_json::Value>(raw) {
+            Ok(parsed) => {
+                for mut part in session_message_parts(&parsed) {
+                    part.record_index = Some(record_index);
+                    parsed_messages.push(part);
+                }
+            }
+            Err(_) => malformed = malformed.saturating_add(1),
+        }
+        // pi `:249` — incremented for EVERY non-blank line, malformed ones included, so a record
+        // ordinal names a line of the file rather than a position in the parsed list.
+        record_index = record_index.saturating_add(1);
+    }
+    if malformed > 0 {
+        warnings.push(format!(
+            "Skipped {malformed} malformed session tail line{}.",
+            if malformed == 1 { "" } else { "s" }
+        ));
+    }
+    let total = parsed_messages.len();
+    let messages = parsed_messages.split_off(total.saturating_sub(max_messages));
+    SessionMessagesTail {
+        truncated: tail.truncated || total > messages.len(),
+        messages,
+        warnings,
+    }
+}
+
+/// pi `sessionMessageLine` + `readSessionTranscriptTail` (`fleet-view.ts:224-230`, `:256-274`): the
+/// last resort — parse the persisted session JSONL tail into `role: text` lines, counting (not
 /// swallowing) malformed records.
 fn read_session_transcript_tail(
     session_file: &Path,
@@ -751,72 +984,25 @@ fn read_session_transcript_tail(
     (kept, warnings)
 }
 
-/// pi `sessionMessageLine` (`fleet-view.ts:176-185`) + `contentText` (`:157-174`).
+/// pi `sessionMessageLine` (`fleet-view.ts:224-230`) — the COLLAPSED form, expressed on top of
+/// [`session_message_parts`] exactly as upstream expresses it: one parser, two renderings.
+///
+/// The `role` comes from the first part (pi `:229`'s `parts[0]!.role`), which is the record's own
+/// role for every part it yields.
 fn session_message_line(record: &serde_json::Value) -> Option<String> {
-    let message = record
-        .get("message")
-        .filter(|m| m.is_object())
-        .unwrap_or(record);
-    let role = message.get("role")?.as_str()?;
-    let text = content_text(message.get("content")).trim().to_string();
+    let parts = session_message_parts(record);
+    let role = parts.first()?.role.clone();
+    let text = parts
+        .iter()
+        .map(|part| part.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
     if text.is_empty() {
         return None;
     }
     Some(format!("{role}: {text}"))
-}
-
-/// pi `contentText` (`fleet-view.ts:157-174`) — flatten a message's content into plain text,
-/// summarising tool calls/results rather than dropping them.
-fn content_text(content: Option<&serde_json::Value>) -> String {
-    let Some(content) = content else {
-        return String::new();
-    };
-    if let Some(s) = content.as_str() {
-        return s.to_string();
-    }
-    let Some(parts) = content.as_array() else {
-        return String::new();
-    };
-    parts
-        .iter()
-        .map(|part| {
-            let Some(entry) = part.as_object() else {
-                return String::new();
-            };
-            if let Some(text) = entry.get("text").and_then(serde_json::Value::as_str) {
-                return text.to_string();
-            }
-            let kind = entry
-                .get("type")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            if kind == "toolCall" || kind == "tool_call" {
-                let name = entry
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .or_else(|| entry.get("toolName").and_then(serde_json::Value::as_str))
-                    .unwrap_or("tool");
-                let args = entry
-                    .get("args")
-                    .map(|a| format!(" {}", stringify_json_preview(a)))
-                    .unwrap_or_default();
-                return format!("[tool: {name}{args}]");
-            }
-            if kind == "toolResult" || kind == "tool_result" {
-                let result = entry
-                    .get("result")
-                    .map(|r| format!(": {}", stringify_json_preview(r)))
-                    .unwrap_or_default();
-                return format!("[tool result{result}]");
-            }
-            entry
-                .get("content")
-                .map(stringify_json_preview)
-                .unwrap_or_default()
-        })
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// pi `stringifyJsonPreview` (`fleet-view.ts:150-155`) — 240 chars, then a single-char ellipsis.

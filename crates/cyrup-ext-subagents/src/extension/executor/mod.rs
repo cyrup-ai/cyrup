@@ -21,9 +21,11 @@ pub(crate) mod resolve;
 pub(crate) mod session_state;
 pub(crate) mod spawn_budget;
 pub(crate) mod status;
+pub(crate) mod wait_subscriptions;
 pub(crate) mod workflow;
 pub(crate) mod workflow_child_stops;
 pub(crate) mod workflow_controllers;
+pub(crate) mod workflow_detach;
 pub(crate) mod workflow_steering;
 
 use std::collections::HashMap;
@@ -83,6 +85,15 @@ pub struct SubagentExecutor {
     /// watcher is REPLACED on every `SessionStart`, and a store recreated with it would drop every
     /// record a `wait` in flight is about to read.
     wait_completions: std::sync::Arc<crate::background::wait_completions::WaitCompletionStore>,
+    /// SCOPE_11 — this session's durable wait-subscription manager
+    /// ([`crate::background::wait_subscriptions`]), or `None` when none is installed.
+    ///
+    /// Installed on `SessionStart` and only for a session with a UI (pi's `ctx?.hasUI` gate,
+    /// `wait-tool.ts:33`); torn down on `SessionShutdown`. A slot rather than a value, and a
+    /// SHARED slot rather than a snapshot, because the completion observer registered into the
+    /// watcher's composite must reach whichever manager is current at observation time — the two
+    /// are rebuilt on independent `SessionStart` edges.
+    wait_subscriptions: wait_subscriptions::WaitSubscriptionSlot,
     /// `ASYNC_NOTIFY_BUG_REPORT` F3.5 — the claim/answer ledger the `wait` tool (and the headless
     /// auto-drain) share with the completion watcher's delivery decorator
     /// ([`crate::background::watch::InlineAnsweredSink`]), so a value a live wait already
@@ -285,6 +296,7 @@ impl SubagentExecutor {
             wait_completions: Arc::new(
                 crate::background::wait_completions::WaitCompletionStore::default(),
             ),
+            wait_subscriptions: Arc::new(std::sync::Mutex::new(None)),
             inline_answers: crate::background::watch::InlineAnswerLedger::default(),
             host_services: Arc::new(OnceLock::new()),
             root_parent_session: Arc::new(std::sync::Mutex::new(None)),

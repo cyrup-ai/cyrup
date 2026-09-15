@@ -380,7 +380,29 @@ impl SubagentExecutor {
             .await
             .map_err(|e| e.to_string())?;
             if !transcript {
-                return Ok(run_status::format_run_list(&runs));
+                // SCOPE_11 — pi `run-status.ts:390-393`, the ONE place upstream renders armed
+                // subscriptions: `[formatAsyncRunList(runs), waitSubscriptions].filter(Boolean)
+                // .join("\n\n")`. Not the by-id form below, not the by-dir form, and not the
+                // fleet view above — upstream renders it here and nowhere else.
+                //
+                // No session filtering happens here and none is needed: `armed()` is
+                // session-scoped BY CONSTRUCTION (its only two writers are `arm`, which stamps the
+                // live session, and `restore`, which is gated on it). `filter(Boolean)` is the
+                // `None` drop.
+                let armed = self
+                    .wait_subscriptions()
+                    .map(|manager| manager.armed())
+                    .unwrap_or_default();
+                let subscriptions =
+                    crate::background::wait_subscriptions::format_wait_subscriptions(
+                        &armed,
+                        crate::time::now_epoch_millis(),
+                    );
+                let runs = run_status::format_run_list(&runs);
+                return Ok(match subscriptions {
+                    Some(subscriptions) => format!("{runs}\n\n{subscriptions}"),
+                    None => runs,
+                });
             }
             match runs.as_slice() {
                 [only] => resolved_id = Some(only.status.run_id.as_str().to_string()),
@@ -440,6 +462,65 @@ impl SubagentExecutor {
             lines,
             &self.transcript_session_roots(cwd, &roots),
         )
+    }
+
+    /// SCOPE_12 — `action: "inspect"`: one run's (or one child's) transcript tail and final
+    /// output, read back out of the canonical artifacts.
+    ///
+    /// A pure dispatcher's counterpart, shaped exactly like [`Self::control_status_view`]: this
+    /// method owns resolving the roots, the current session and the clock from the executor, and
+    /// [`crate::background::inspect_rpc::build_inspect_reply`] owns everything downstream of that.
+    ///
+    /// # The trusted roots are the TRANSCRIPT view's
+    ///
+    /// Upstream's inspect confines its session reads to `state.trustedSessionRoots`
+    /// (`inspect-rpc.ts:374`) — cyrup's [`crate::extension::executor::paths::trusted_session_roots`]
+    /// — unioned with `status.sessionRoot`, which cyrup's [`crate::background::RunStatus`] does not
+    /// carry. This passes [`Self::transcript_session_roots`] instead, and the choice is recorded
+    /// rather than left to inference: inspect and `view: "transcript"` dereference the SAME
+    /// recorded `sessionFile` from the SAME per-cwd artifact roots, so confining them differently
+    /// would mean one surface could read a child transcript the other refuses. The containment
+    /// MECHANISM is the one gate either way
+    /// ([`crate::background::fleet_view::read_session_messages_tail`]).
+    ///
+    /// # The request id
+    ///
+    /// [CYRUP-DELTA] upstream's `requestId` correlates a widget reply with the slash command that
+    /// asked for it. A TOOL CALL is self-correlating — the result returns to its own call — so
+    /// there is no caller-supplied token here and a fixed one is stamped. The slash entry point
+    /// ([`crate::background::inspect_rpc::handle_inspect_rpc_args`]) still carries the real thing.
+    pub async fn control_inspect(
+        &self,
+        cwd: &Path,
+        async_id: &str,
+        child_id: Option<&str>,
+        lines: Option<i64>,
+    ) -> crate::background::inspect_rpc::InspectReply {
+        /// Matches `is_valid_request_id`, so the reply is never rewritten to `invalid`.
+        const TOOL_REQUEST_ID: &str = "tool";
+
+        let roots = self.config_snapshot().await.roots;
+        let async_root = default_async_root_in(&roots, cwd);
+        let results_dir = default_results_dir_in(&roots, cwd);
+        let current_session =
+            crate::identity::SessionId::parse_opt(self.current_session_id().as_deref());
+        crate::background::inspect_rpc::build_inspect_reply(
+            &crate::background::inspect_rpc::InspectRequest {
+                request_id: TOOL_REQUEST_ID.to_string(),
+                async_id: async_id.to_string(),
+                child_id: child_id.map(str::to_string),
+                lines,
+            },
+            &crate::background::inspect_rpc::InspectDeps {
+                async_root: &async_root,
+                results_dir: &results_dir,
+                current_session: current_session.as_ref(),
+                trusted_roots: &self.transcript_session_roots(cwd, &roots),
+                // ONE clock read, threaded through the replay filter and its re-verification.
+                now: crate::time::now_epoch_millis(),
+            },
+        )
+        .await
     }
 
     /// The live foreground runs the fleet view renders (pi `[...state.foregroundControls.values()]`,

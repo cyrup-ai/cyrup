@@ -67,11 +67,16 @@ pub mod watch;
 pub const DEFAULT_ASYNC_CHILD_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 
 pub mod fleet_view;
+// SCOPE_12 — the inspect RPC surface, a sibling of `completion_replay`/`fleet_view` (it composes
+// both). Registered here rather than under `extension/` because it is a BACKGROUND-artifact
+// reader: everything it touches is a run's on-disk status, payload, replay record and archive.
+pub mod inspect_rpc;
 pub mod resume_guidance;
 pub mod run_status;
 pub mod tracker;
 pub mod wait;
 pub mod wait_completions;
+pub mod wait_subscriptions;
 
 // Kept here (not in a submodule): sibling modules resolve `super::ModelId` through this private
 // import binding (`fleet_view.rs:472,644`), exactly as they did before the decomposition.
@@ -93,6 +98,7 @@ mod workflow_graph;
 pub use artifact_roots::{
     RunArtifactRoots, attempt_scratch_dir, attempt_scratch_dir_in, ensure_accessible_dir,
     results_dir_for_async_root, run_artifact_roots, run_artifact_roots_in,
+    wait_subscriptions_dir_in,
 };
 pub(crate) use artifact_roots::{cwd_key, temp_root_dir, temp_root_dir_from};
 pub use records::{ParallelGroupStatus, ResultFile, RunStatus, StepStatus};

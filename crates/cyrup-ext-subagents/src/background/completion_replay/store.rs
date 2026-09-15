@@ -172,12 +172,15 @@ pub async fn read_completion_replay(
 
 /// pi `readCompletionArchive` (`:237-246`), whose tolerant parser is `parseArchive` (`:165-183`).
 ///
-/// # This has no in-crate consumer yet, and that is expected
+/// # Its consumer is inspect's archive ladder
 ///
-/// Upstream's only caller is `inspect-rpc.ts:262`, which cyrup has not ported. It is in this
-/// module's surface because the archive is half the on-disk format: a writer with no reader cannot
-/// be validated, and this module's own tests are its first consumer. The upstream caller is cited
-/// so a later dead-code sweep does not remove the reader half of a format.
+/// SCOPE_12 landed the port of upstream's only caller, `inspect-rpc.ts:261`: the archive is what
+/// [`crate::background::inspect_rpc::read_result_output`] reads once the payload is gone and the
+/// replay record has answered, selecting the entry that belongs to the run (or to the child the
+/// request named) and then following it to an output artifact, a session transcript, or the
+/// retained tail text. Before that this function had no in-crate consumer but its own tests, which
+/// was expected and is recorded here because the paragraph that said so would otherwise be a lie
+/// the next reader trusts.
 ///
 /// Upstream distinguishes "absent" (`undefined`, `:243`) from "malformed" (it throws, `:240`), and
 /// so does this: `Ok(None)` for absent, `Err` for malformed. Collapsing them would let a corrupt

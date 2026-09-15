@@ -2241,3 +2241,80 @@ async fn the_analyzer_admits_state_exactly_when_the_run_has_a_mission() {
         tool_text(&result)
     );
 }
+
+/// SCOPE_12's advertise-vs-dispatch invariant, pinned for `inspect` — the rule
+/// `text.rs::SUBAGENT_ACTIONS` records and `schema.rs:349-360` enforces by DERIVING the JSON
+/// Schema enum from that one slice: the enum entry and the dispatch arm land in the same change.
+///
+/// **Pre-fix this goes red twice over**: without the `SUBAGENT_ACTIONS` entry the verb is not
+/// advertised, and without the `route_action` arm the tool answers
+/// `Unknown action: inspect. …` instead of a `ToolResult`.
+#[tokio::test]
+async fn inspect_is_both_advertised_and_dispatched() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tool = scoped_tool(dir.path()).await;
+    tool.executor()
+        .set_host_services(Arc::new(crate::extension::testsupport::FixedSessionHost(
+            "session-a",
+        )));
+    crate::extension::testsupport::seed_orphaned_run(
+        dir.path(),
+        "run0inspect0",
+        Some("session-a"),
+        Some(std::process::id()),
+    );
+
+    assert!(
+        crate::extension::tool::text::subagent_actions().contains(&"inspect"),
+        "the verb must be advertised in the ONE list the schema enum is derived from"
+    );
+
+    let result = dispatch_tool(
+        &tool,
+        serde_json::json!({ "action": "inspect", "id": "run0inspect0" }),
+    )
+    .await
+    .expect("inspect dispatches through the tool");
+    let text = tool_text(&result);
+    assert!(
+        !text.contains("Unknown action"),
+        "it must reach the handler, not the did-you-mean arm: {text}"
+    );
+    assert!(text.contains("Run: run0inspect0"), "{text}");
+    assert!(text.contains("State: running"), "{text}");
+    // The full wire reply rides along in `details`, so a widget host reads the same object
+    // upstream's `encodeInspectReply` would have emitted.
+    let details = result.details.expect("the reply object");
+    assert_eq!(details["kind"], "pi-subagents.inspect-reply");
+    assert_eq!(details["version"], 1);
+    assert_eq!(details["asyncId"], "run0inspect0");
+    assert!(details.get("error").is_none(), "{details}");
+
+    // A run owned by ANOTHER session is refused at the tool boundary too, with the code — the
+    // partition does not stop at `read_output.rs`.
+    crate::extension::testsupport::seed_orphaned_run(
+        dir.path(),
+        "run0foreign0",
+        Some("session-b"),
+        Some(std::process::id()),
+    );
+    let result = dispatch_tool(
+        &tool,
+        serde_json::json!({ "action": "inspect", "id": "run0foreign0" }),
+    )
+    .await
+    .expect("a refusal is still a ToolResult, not a ToolError");
+    assert_eq!(
+        result.details.expect("the reply object")["error"]["code"],
+        "foreign_session"
+    );
+
+    // And the verb needs a target: `id` (or `runId`), the `status` arm's own precedence.
+    let error = dispatch_tool(&tool, serde_json::json!({ "action": "inspect" }))
+        .await
+        .expect_err("no id");
+    assert!(
+        error.to_string().contains("action='inspect' requires id"),
+        "{error}"
+    );
+}

@@ -151,6 +151,11 @@ impl DrainWaiter for SubagentDrainWaiter {
                 id: None,
                 all: Some(true),
                 timeout_ms: Some(timeout_ms),
+                // SCOPE_11 — the drain must BLOCK: its whole contract is "everything landed by
+                // the time this returns", which a wake arriving in a later turn cannot satisfy
+                // (there is no later turn — this runs at `agent_end`). Upstream never passes
+                // `nonBlocking` here either, and `:564` would reject it anyway alongside `all`.
+                non_blocking: None,
             },
             &cyrup_core::CancelToken::new(),
             &self.deps,

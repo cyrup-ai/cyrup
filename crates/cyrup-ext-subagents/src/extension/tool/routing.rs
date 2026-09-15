@@ -1601,6 +1601,39 @@ impl SubagentTool {
             "status" | "interrupt" | "stop" | "dismiss" | "resume" | "steer" | "append-step" => {
                 self.route_control_action(action, p, cwd).await
             }
+            // SCOPE_12 — [CYRUP-DELTA]: `inspect` is cyrup's own verb (see `text.rs`'s
+            // `SUBAGENT_ACTIONS` entry for why upstream has none), and it is its OWN arm rather
+            // than a member of the control band above. That placement is the point: inspect is a
+            // READ, so it must NOT go through `route_control_action`, whose first act is the
+            // authority consult (`:2044-2082`). `AuthorityAction::for_tool_action`
+            // (`registration/authority.rs`) returns `None` for read verbs and must keep doing so —
+            // routing a read through the consult would make reading a child's output a
+            // confirm-gated operation.
+            //
+            // Params: the `status` arm's own `id`-first precedence (`:2090`, pi
+            // `params.id ?? params.runId`), and `childId`/`lines` exactly as `stop` and the
+            // transcript view already read them. No new schema property is needed.
+            "inspect" => {
+                let Some(target) = p.id.as_deref().or(p.run_id.as_deref()) else {
+                    return Err(ToolError::new(
+                        "action='inspect' requires id (or runId) naming the async run to inspect.",
+                    ));
+                };
+                let reply = self
+                    .executor
+                    .control_inspect(cwd, target, p.child_id.as_deref(), p.lines)
+                    .await;
+                Ok(ToolResult {
+                    content: vec![cyrup_core::Content::text(
+                        crate::background::inspect_rpc::respond::render_inspect_reply(&reply),
+                    )],
+                    // The full wire reply rides along, so a host that DOES render the widget shape
+                    // reads the same object upstream's `encodeInspectReply` would have emitted.
+                    details: serde_json::to_value(&reply).ok(),
+                    terminate: TerminateHint::Unspecified,
+                    ..Default::default()
+                })
+            }
             // SUBA-046 — pi `subagent-executor.ts:4457-4527` @v0.43.0, in upstream's own dispatch
             // position (after the management CRUD, before `children.list`/`doctor`).
             "grant-spawn-budget" => self.route_grant_spawn_budget(p).await,
