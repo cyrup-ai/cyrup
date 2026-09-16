@@ -47,10 +47,15 @@
 //!    and turn counters; cyrup's `ForegroundControlEntry` (WORKFLOW_6) now ALSO carries session
 //!    and workflow identity (`session_id`/`parent_workflow_run_id`/`workflow_key`/`cwd`/
 //!    `session_name`/`active_children`), but [`ForegroundFleetEntry`] still projects only the
-//!    original four the TEXT fleet renderer reads plus the two (`session_id`,
-//!    `parent_workflow_run_id`) later gates need (WORKFLOW_11's S6 filter, `run-status.ts:611`) —
+//!    original four the TEXT fleet renderer reads plus `session_id` and `parent_workflow_run_id` —
 //!    [`format_foreground_fleet_lines`] itself reads only the original four, so the rendered row
 //!    shape is unchanged.
+//!
+//!    ⚠ SCOPE_10's S6 filter (`run-status.ts:609-613`) does NOT read this entry, and must not be
+//!    "simplified" to: its third term is `(control.activeChildren?.size ?? 0) > 0`, and
+//!    [`ForegroundFleetEntry`] carries no `active_children`, so the term is not evaluable from a
+//!    row shaped for RENDERING. S6 has its own projection,
+//!    [`super::run_status::LiveWorkflowControlCandidate`], built beside the registry it reads.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};

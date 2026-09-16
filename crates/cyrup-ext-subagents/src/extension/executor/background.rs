@@ -295,6 +295,9 @@ impl SubagentExecutor {
                     .as_ref(),
                     agent.permission_rules.as_ref(),
                 ),
+                // SCOPE_9: a fresh top-level async run, never a resume — it charges the
+                // session's cap in its own right.
+                transfer_from: None,
                 steps: vec![RunnerStep::SingleStep(step)],
                 mode: RunMode::Single,
                 session_file: fork_context.session_file_path,
@@ -372,6 +375,52 @@ impl SubagentExecutor {
     /// spawns nothing (not even the detached runner process itself). Otherwise returns
     /// [`SubagentError`] if the run directory cannot be created, the one-shot config cannot be
     /// written, or the detached spawn itself fails.
+    /// SCOPE_9 — the resolved [`CapacityOptions`](crate::background::active_async_capacity::CapacityOptions)
+    /// this process uses for every capacity decision.
+    ///
+    /// The root comes from `cfg.roots`, never a re-read of the environment
+    /// (`background/artifact_roots.rs`'s stated reason: "the optional form put this decision in the
+    /// callee, where it could be answered differently from the same decision made two frames up"),
+    /// and the abandoned-slot policy is resolved EXACTLY ONCE here so the "absent means default"
+    /// rung cannot be applied twice with different answers.
+    pub(crate) fn capacity_options(
+        cfg: &crate::registration::SubagentExtensionConfig,
+        live_workflow_run_ids: std::collections::HashSet<RunId>,
+    ) -> crate::background::active_async_capacity::CapacityOptions {
+        crate::background::active_async_capacity::CapacityOptions::new(
+            crate::background::active_async_capacity_root_in(&cfg.roots),
+        )
+        .with_live_workflow_run_ids(live_workflow_run_ids)
+        .with_abandoned_slot_release(
+            crate::background::active_async_capacity::resolve_abandoned_slot_release(
+                cfg.capacity
+                    .as_ref()
+                    .and_then(|capacity| capacity.abandoned_slot_release_after_ms),
+            ),
+        )
+    }
+
+    /// SCOPE_9 — give the slot back on an error path between the claim and `Ok(run_id)`.
+    ///
+    /// `None` (no cap configured, or no session) is a no-op. A rollback that reports `false` is
+    /// logged rather than escalated: the caller is already returning an error, and the only shapes
+    /// that produce `false` — the slot was reclaimed under us, or it has already been bound to a
+    /// runner — both mean the slot is no longer this failed spawn's to release.
+    async fn rollback_capacity(
+        capacity: Option<&mut crate::background::active_async_capacity::ActiveAsyncCapacityHandle>,
+        run_id: &RunId,
+    ) {
+        if let Some(handle) = capacity
+            && !handle.rollback().await
+        {
+            tracing::warn!(
+                run_id = %run_id,
+                "active-async capacity slot could not be rolled back after a failed spawn; \
+                 reconciliation will reclaim it once the run's status is readable"
+            );
+        }
+    }
+
     pub async fn spawn_background_steps(
         &self,
         cwd: &Path,
@@ -394,6 +443,7 @@ impl SubagentExecutor {
             turn_budget,
             permission_rules,
             usage_budget,
+            transfer_from,
         } = spec;
         let cfg = self.config_snapshot().await;
         // R-SA-055 (SAFETY-CRITICAL): the depth guard runs FIRST — before run-directory creation
@@ -463,6 +513,92 @@ impl SubagentExecutor {
         crate::background::ensure_accessible_dir(&run_paths.run_dir)
             .await
             .map_err(SubagentError::Spawn)?;
+
+        // Hoisted out of the `RunnerConfig` literal below: see `model_scope` there.
+        let model_scope = Self::resolve_model_scope(cwd, &cfg.roots)?;
+
+        // =========================================================================================
+        // SCOPE_9/SUBTASK4 — the per-SESSION active-async capacity gate
+        // =========================================================================================
+        //
+        // Position is upstream's own (`subagent-executor.ts:6793-6814` @v0.66.0): AFTER the depth
+        // guard and after the roots exist (the owner record stores `async_dir = run_paths.run_dir`),
+        // BEFORE the `RunnerConfig` is built. Charging here rather than in `spawn_background`
+        // covers both entry points at once — that one delegates to this function — so the cap can
+        // never be double-charged, and all five callers inherit the gate for free.
+        //
+        // # The eligibility gate, term by term
+        //
+        // Upstream gates on `depth === 0 && !inheritedNestedRouteValue &&
+        // !effectiveParams.workflowParentRunId`. The first two terms are already bound above. The
+        // third has NO cyrup input — `BackgroundStepsSpec` carries no workflow-parent marker, only
+        // the FOREGROUND request does — and it is left unthreaded deliberately, because there is no
+        // cyrup path it could distinguish: `route_workflow_mode` refuses the async workflow shape
+        // outright (`extension/tool/routing.rs:598-599`), so a workflow's children run in the
+        // foreground of the workflow shell, and a child that itself backgrounds a subagent does so
+        // from a DESCENDANT process, where `depth > 0` and an inherited nested route already
+        // exclude it. Threading a field through five call sites to re-express a condition the first
+        // two terms already imply would be scope for no behaviour.
+        //
+        // # No session id means no gate — the run is simply not partitionable
+        //
+        // `current_session_id()` is an `Option<String>` (headless, unpersisted, or no host services
+        // bound) and `SessionId` cannot be built from `None`. Upstream asserts non-null
+        // (`state.currentSessionId!`); cyrup, whose headless surfaces are real, SKIPS the gate
+        // instead. Refusing every headless async spawn would be a visible behaviour change for a
+        // cap that could not be enforced anyway — a run with no session belongs to no pool.
+        let capacity_options = Self::capacity_options(&cfg, self.live_workflow_run_ids());
+        let capacity_limit =
+            crate::background::active_async_capacity::resolve_max_active_async_runs_per_session(
+                cfg.max_active_async_runs_per_session,
+            );
+        let capacity_session =
+            crate::identity::SessionId::parse_opt(self.current_session_id().as_deref());
+        let top_level_async = depth.current_depth == 0 && inherited_nested_route.is_none();
+        // # A resume TRANSFERS, it does not acquire
+        //
+        // Upstream branches the very same gate on `target.source === "async"`
+        // (`subagent-executor.ts:2085-2098` @v0.68.0): a resume of an async run hands the SOURCE
+        // run's already-held slot to the new run instead of taking a second one. `transfer_from`
+        // is that discriminator, set by `control_resume`'s terminal-revival arm — the only cyrup
+        // caller that resumes an async run at all. Without it a revive double-charges the session,
+        // and at `max_active_async_runs_per_session = 1` the source run's own retained slot makes
+        // the revive refuse ITSELF with the exhausted sentence.
+        //
+        // `transfer` needs no unconfigured-cap arm of its own: its no-source-slot fall-through IS
+        // `acquire` (pi `:513`), which answers `Ok(None)` there — upstream takes the identical
+        // route, pool scan included, and a session that never claimed a slot has no pool to list.
+        //
+        // `acquire` returns `Ok(None)` for an unconfigured cap (pi `:456`), so an install that
+        // never set `maxActiveAsyncRunsPerSession` performs zero extra filesystem work here.
+        let mut capacity = match capacity_session.as_ref().filter(|_| top_level_async) {
+            Some(session) => match transfer_from.as_ref() {
+                Some(source_run_id) => crate::background::active_async_capacity::transfer(
+                    crate::background::active_async_capacity::TransferInput {
+                        session_id: session,
+                        limit: capacity_limit,
+                        source_run_id,
+                        run_id: &run_id,
+                        async_dir: &run_paths.run_dir,
+                    },
+                    &capacity_options,
+                )
+                .await?,
+                None => crate::background::active_async_capacity::acquire(
+                    crate::background::active_async_capacity::AcquireInput {
+                        session_id: session,
+                        limit: capacity_limit,
+                        run_id: &run_id,
+                        kind:
+                            crate::background::active_async_capacity::ActiveAsyncCapacityKind::Runner,
+                        async_dir: &run_paths.run_dir,
+                    },
+                    &capacity_options,
+                )
+                .await?,
+            },
+            None => None,
+        };
 
         // Captured before `steps` moves into `runner_config` below — pi's `flatAgents`/`firstAgents`
         // (`async-execution.ts:749-768,794-795` @v0.34.0), needed only for the `subagent.nested.started`
@@ -555,8 +691,10 @@ impl SubagentExecutor {
             // SUBA-003: the model-scope policy in force at authorization time, baked into the
             // one-shot config so the detached hop-2 runner enforces the SAME policy the foreground
             // path does. Without it, `subagent({..., background: true})` would be an unpoliced way
-            // around an enforcing `modelScope`.
-            model_scope: Self::resolve_model_scope(cwd, &cfg.roots)?,
+            // around an enforcing `modelScope`. Resolved ABOVE the capacity claim (SCOPE_9): every
+            // fallible step between the claim and `Ok(run_id)` must roll the slot back explicitly,
+            // and a `?` buried inside this struct literal cannot.
+            model_scope,
             // Nested-route inheritance (pi `config.nestedRoute`/`config.nestedSelf`,
             // `async-execution.ts:727-731,989-993` @v0.34.0): carried verbatim so the detached runner (were it
             // ever to relay ITS OWN descendants further, a later unit's concern) inherits the SAME
@@ -591,9 +729,14 @@ impl SubagentExecutor {
         };
 
         let cfg_path = run_paths.run_dir.join("runner-config.json");
-        write_atomic_json(&cfg_path, &runner_config)
-            .await
-            .map_err(SubagentError::Spawn)?;
+        // SCOPE_9: first of the two fallible steps between the claim and `Ok(run_id)`. A
+        // held-but-never-spawned slot is a PERMANENT leak no reconcile can clear — there is no
+        // `status.json` for any verdict to read — so every early return past the claim rolls back
+        // explicitly. A `Drop` guard cannot do this: `rollback` is `async`.
+        if let Err(error) = write_atomic_json(&cfg_path, &runner_config).await {
+            Self::rollback_capacity(capacity.as_mut(), &run_id).await;
+            return Err(SubagentError::Spawn(error));
+        }
 
         // Tier 2 for a DETACHED child: this runner is a separate process that re-resolves its own
         // binary and paths from the environment it inherits, so `cfg.spawn_command` is handed to it
@@ -605,13 +748,41 @@ impl SubagentExecutor {
             .spawn_command
             .clone()
             .unwrap_or_else(crate::spawn::resolve_spawn_command);
-        let pid = crate::background::spawn_detached::spawn_detached_runner_with_command(
+        let pid = match crate::background::spawn_detached::spawn_detached_runner_with_command(
             &resolved_command,
             &cfg_path,
             &run_paths.runner_stdout_log,
             &run_paths.runner_stderr_log,
             &crate::background::parent_anchor::detached_runner_env_overlay_in(&cfg.roots),
-        )?;
+        ) {
+            Ok(pid) => pid,
+            Err(error) => {
+                // SCOPE_9: the second fallible step past the claim, and the one that actually
+                // happens in the field (a missing or unexecutable subagent binary).
+                Self::rollback_capacity(capacity.as_mut(), &run_id).await;
+                return Err(error);
+            }
+        };
+
+        // SCOPE_9 — pi `markStarted` (`async-execution.ts:1409`, `:1422`), at its exact position:
+        // the first statement after the spawn is CONFIRMED. §D3: the identity bound is the runner
+        // pid, cyrup's only start-proof, and binding it is what promotes the slot from a
+        // rollbackable reservation to a real run whose slot only reconciliation may reclaim.
+        //
+        // A failure here is logged and NOT propagated: the detached runner is already running, and
+        // failing the spawn over a bookkeeping write would orphan a live process. The handle
+        // releases the slot itself when the durable bind cannot land (see `mark_started`), so the
+        // worst case is one extra admission, never a permanently held slot.
+        if let Some(handle) = capacity.as_mut()
+            && let Err(error) = handle.mark_started(pid).await
+        {
+            tracing::warn!(
+                run_id = %run_id,
+                %error,
+                "failed to bind the active-async capacity slot to the runner pid; the run is \
+                 unaffected and the slot has been released"
+            );
+        }
 
         // pi `executeAsyncChain`/`executeAsyncSingle` (`async-execution.ts:1198-1565` @v0.43.0): once
         // hop 1's pid is CONFIRMED (never before — an unconfirmed spawn must not appear in the root's
@@ -708,7 +879,333 @@ mod tests {
     use crate::discovery::types::AgentReadScope;
     use crate::fork_context::ContextRequest;
     use cyrup_core::ModelId;
+    use std::path::PathBuf;
     use std::sync::Arc;
+
+    // ---------------------------------------------------------------------------------------
+    // SCOPE_9/SUBTASK4 — the per-session active-async capacity gate at the spawn path.
+    // ---------------------------------------------------------------------------------------
+
+    /// A `BackgroundSingleRequest` with nothing set beyond the agent and task, so the capacity
+    /// assertions below are about the SLOT and not about step configuration.
+    fn bare_background_request<'a>(cwd: &'a Path) -> BackgroundSingleRequest<'a> {
+        BackgroundSingleRequest {
+            thinking: None,
+            usage_budget: None,
+            turn_budget: None,
+            structured_output_schema: None,
+            tool_budget: None,
+            cwd,
+            agent_name: "worker",
+            task: "do something",
+            context: Some(ContextRequest::Fresh),
+            model_override: None,
+            agent_scope: AgentReadScope::Both,
+            acceptance: None,
+            control: None,
+            include_progress: None,
+            output: None,
+            output_mode: None,
+            skills: None,
+            share: None,
+            session_dir: None,
+            artifacts: None,
+            timeout_ms: None,
+        }
+    }
+
+    /// How many slots the capacity pool for `session` holds under a sandboxed root.
+    async fn capacity_slots(root: &Path, session: &str) -> usize {
+        let roots = crate::paths::Roots::sandboxed(root);
+        let session = crate::identity::SessionId::parse(session).expect("non-empty");
+        let pool = crate::background::active_async_capacity::session_pool_dir(
+            &crate::background::active_async_capacity_root_in(&roots),
+            &session,
+        );
+        crate::background::active_async_capacity::key::occupied_slots(&pool)
+            .await
+            .expect("listing")
+            .len()
+    }
+
+    /// The ONE owner record the pool holds — the assertion target for a transfer, which must move
+    /// a slot rather than add one.
+    async fn only_capacity_owner(
+        root: &Path,
+        session: &str,
+    ) -> crate::background::active_async_capacity::ActiveAsyncCapacityOwner {
+        let roots = crate::paths::Roots::sandboxed(root);
+        let session = crate::identity::SessionId::parse(session).expect("non-empty");
+        let pool = crate::background::active_async_capacity::session_pool_dir(
+            &crate::background::active_async_capacity_root_in(&roots),
+            &session,
+        );
+        let slots = crate::background::active_async_capacity::key::occupied_slots(&pool)
+            .await
+            .expect("listing");
+        let [slot] = slots.as_slice() else {
+            panic!("expected exactly one occupied slot, got {slots:?}");
+        };
+        crate::background::active_async_capacity::read_owner(slot)
+            .await
+            .expect("owner.json")
+    }
+
+    /// SCOPE_9 — **the leak test.** Between the claim and `Ok(run_id)` there are two fallible
+    /// steps, and a held-but-never-spawned slot is a PERMANENT leak that no reconcile can clear:
+    /// there is no `status.json` for any release verdict to read, so the slot's owner sits at the
+    /// "status file is missing or unreadable" rung forever.
+    ///
+    /// Driven through the real spawn path with a `spawn_command` that cannot exec — the shape
+    /// `registration/mod.rs`'s `#[serde(skip)]` override exists for.
+    #[tokio::test]
+    async fn a_failed_detached_spawn_rolls_the_slot_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executor = SubagentExecutor::new();
+        executor.set_host_services(Arc::new(crate::extension::testsupport::FixedSessionHost(
+            "cap-rollback",
+        )));
+        {
+            let mut cfg = executor.config_cell().lock().await;
+            cfg.roots = crate::paths::Roots::sandboxed(dir.path());
+            cfg.max_active_async_runs_per_session = Some(1);
+            cfg.spawn_command = Some(crate::spawn::SpawnCommand {
+                binary: dir.path().join("no-such-binary"),
+                base_args: Vec::new(),
+            });
+        }
+
+        let error = executor
+            .spawn_background(bare_background_request(dir.path()))
+            .await
+            .expect_err("a spawn command that cannot exec must fail the spawn");
+        assert!(
+            matches!(error, SubagentError::Spawn(_)),
+            "the spawn failure itself must surface, not a capacity error: {error}"
+        );
+        assert_eq!(
+            capacity_slots(dir.path(), "cap-rollback").await,
+            0,
+            "the claim must be rolled back on every early return past it"
+        );
+    }
+
+    /// SCOPE_9 §Q2 — a run with no session identity cannot be partitioned, so the gate is SKIPPED
+    /// rather than the spawn refused. Refusing every headless async spawn would be a visible
+    /// behaviour change for a cap that could not be enforced anyway.
+    #[tokio::test]
+    async fn a_spawn_with_no_session_id_claims_no_slot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // NO `set_host_services` — `current_session_id()` is `None`, the headless case.
+        let executor = SubagentExecutor::new();
+        {
+            let mut cfg = executor.config_cell().lock().await;
+            cfg.roots = crate::paths::Roots::sandboxed(dir.path());
+            cfg.max_active_async_runs_per_session = Some(1);
+            // `true(1)` execs and exits immediately: hop 1 is genuinely spawned and confirmed,
+            // which is all this test needs, without a real runner writing into the sandbox.
+            cfg.spawn_command = Some(crate::spawn::SpawnCommand {
+                binary: PathBuf::from("true"),
+                base_args: Vec::new(),
+            });
+        }
+
+        for _ in 0..3 {
+            executor
+                .spawn_background(bare_background_request(dir.path()))
+                .await
+                .expect("a headless async spawn is never capacity-refused");
+        }
+        assert!(
+            !crate::background::active_async_capacity_root_in(&crate::paths::Roots::sandboxed(
+                dir.path()
+            ))
+            .exists(),
+            "an unpartitionable run must not create a pool at all"
+        );
+    }
+
+    /// SCOPE_9 — the gate, end to end through `spawn_background_steps`: two top-level async spawns
+    /// in ONE session at `limit = 1`, the second refused with upstream's verbatim sentence.
+    #[tokio::test]
+    async fn a_second_top_level_async_spawn_at_the_cap_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executor = SubagentExecutor::new();
+        executor.set_host_services(Arc::new(crate::extension::testsupport::FixedSessionHost(
+            "cap-session",
+        )));
+        {
+            let mut cfg = executor.config_cell().lock().await;
+            cfg.roots = crate::paths::Roots::sandboxed(dir.path());
+            cfg.max_active_async_runs_per_session = Some(1);
+            cfg.spawn_command = Some(crate::spawn::SpawnCommand {
+                binary: PathBuf::from("true"),
+                base_args: Vec::new(),
+            });
+        }
+
+        executor
+            .spawn_background(bare_background_request(dir.path()))
+            .await
+            .expect("the first top-level async spawn fits");
+        assert_eq!(capacity_slots(dir.path(), "cap-session").await, 1);
+
+        let refused = executor
+            .spawn_background(bare_background_request(dir.path()))
+            .await
+            .expect_err("the session is at its cap");
+        assert_eq!(
+            refused.to_string(),
+            "Active async run capacity exhausted: 1/1 used.",
+            "pi `active-async-capacity.ts:74` verbatim"
+        );
+        assert!(matches!(
+            refused,
+            SubagentError::ActiveAsyncCapacityExhausted(_)
+        ));
+        assert_eq!(
+            capacity_slots(dir.path(), "cap-session").await,
+            1,
+            "a refused admission takes no slot of its own"
+        );
+    }
+
+    /// SCOPE_9 — **the transfer, driven through `action: "resume"`.** pi branches the capacity
+    /// gate on `target.source === "async"` and calls `transferActiveAsyncCapacity` there
+    /// (`subagent-executor.ts:2085-2098` @v0.68.0); cyrup's equivalent moment is
+    /// `control_resume`'s terminal-revival arm, which is the only caller that resumes an async
+    /// run at all.
+    ///
+    /// Driven end to end through the PRODUCTION verb — `control_resume`, not `transfer` — at a cap
+    /// of 1, with the source run still holding the session's only slot. Two facts are asserted,
+    /// and only a transfer produces both: the pool still holds exactly ONE slot (an `acquire`
+    /// would either refuse the revive with the exhausted sentence or add a second one), and that
+    /// slot is now the REVIVED run's, at `generation` 1 with the source recorded as its
+    /// `source_run_id` breadcrumb — the two fields `transfer` alone writes.
+    #[tokio::test]
+    async fn a_revive_transfers_the_source_runs_slot_rather_than_charging_the_cap_twice() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // `revive_from_transcript` resolves the revived persona against the ORIGINAL run's own
+        // recorded cwd, so the agent has to be discoverable there.
+        let agents_dir = dir.path().join(".cyrup").join("agents");
+        std::fs::create_dir_all(&agents_dir).expect("mkdir agents dir");
+        std::fs::write(
+            agents_dir.join("worker.md"),
+            "---\nname: worker\ndescription: The revived persona\n---\nBody.\n",
+        )
+        .expect("write worker fixture");
+
+        let executor = SubagentExecutor::new();
+        executor.set_host_services(Arc::new(crate::extension::testsupport::FixedSessionHost(
+            "cap-revive",
+        )));
+        {
+            let mut cfg = executor.config_cell().lock().await;
+            cfg.roots = crate::paths::Roots::sandboxed(dir.path());
+            cfg.max_active_async_runs_per_session = Some(1);
+            // `true(1)` execs and exits immediately: both hops are genuinely spawned and confirmed
+            // (so `mark_started` binds a real pid) without a runner writing into the sandbox.
+            cfg.spawn_command = Some(crate::spawn::SpawnCommand {
+                binary: PathBuf::from("true"),
+                base_args: Vec::new(),
+            });
+        }
+
+        // The source run, admitted through the real gate: the session's one slot, generation 0.
+        let source_run_id = executor
+            .spawn_background(bare_background_request(dir.path()))
+            .await
+            .expect("the first top-level async spawn fits");
+        let before = only_capacity_owner(dir.path(), "cap-revive").await;
+        assert_eq!(before.run_id, source_run_id);
+        assert_eq!(before.generation, 0);
+        assert_eq!(before.source_run_id, None);
+
+        // Settle it exactly as `finish_run` does — a terminal status whose step carries a
+        // persisted transcript, which is what `control::resume` needs to resolve a revival, and
+        // what `transfer` re-reads to decide the slot is no longer a live run's.
+        let roots = crate::paths::Roots::sandboxed(dir.path());
+        let async_root =
+            crate::extension::executor::paths::default_async_root_in(&roots, dir.path());
+        let results_dir =
+            crate::extension::executor::paths::default_results_dir_in(&roots, dir.path());
+        let source_paths = RunPaths::for_run(&async_root, &results_dir, &source_run_id);
+        let session_file = dir.path().join("source-session.jsonl");
+        std::fs::write(&session_file, "").expect("write dummy transcript");
+        let mut status = crate::background::RunStatus::queued(
+            source_run_id.clone(),
+            RunMode::Single,
+            Some(4242),
+        );
+        status
+            .advance_state(crate::background::RunState::Running)
+            .expect("Queued -> Running");
+        let mut step = crate::background::StepStatus::pending("worker");
+        step.status = crate::background::StepState::Complete;
+        step.session_file = Some(session_file.clone());
+        status.steps = vec![step];
+        status
+            .advance_state(crate::background::RunState::Complete)
+            .expect("Running -> Complete");
+        status.cwd = Some(dir.path().to_path_buf());
+        status.session_id = crate::identity::SessionId::parse("cap-revive");
+        write_atomic_json(&source_paths.status, &status)
+            .await
+            .expect("write terminal status fixture");
+
+        let confirmation = executor
+            .control_resume(
+                dir.path(),
+                Some(source_run_id.as_str()),
+                Some("carry on"),
+                None,
+                None,
+            )
+            .await
+            .expect(
+                "a revive at a cap of 1 must take over the source run's slot, not refuse itself \
+                 with the exhausted sentence",
+            );
+        let revived_run_id = confirmation
+            .lines()
+            .find_map(|line| line.strip_prefix("Revived run: "))
+            .expect("the confirmation names the revived run")
+            .to_string();
+        assert_ne!(revived_run_id, source_run_id.as_str());
+
+        assert_eq!(
+            capacity_slots(dir.path(), "cap-revive").await,
+            1,
+            "a revive is ONE operator-visible run continuing: the session must still hold exactly \
+             one slot, never a second one charged for the same work"
+        );
+        let after = only_capacity_owner(dir.path(), "cap-revive").await;
+        assert_eq!(
+            after.run_id.as_str(),
+            revived_run_id,
+            "the slot must now be the revived run's"
+        );
+        assert_eq!(
+            after.source_run_id.as_ref().map(RunId::as_str),
+            Some(source_run_id.as_str()),
+            "`transfer`'s breadcrumb, the only thing that lets `inspect_active_async_capacity_owner` \
+             answer 'the slot moved' rather than 'it vanished'"
+        );
+        assert_eq!(
+            after.generation, 1,
+            "the generation bump is what invalidates the source run's stale handle; an `acquire` \
+             would have written a fresh generation-0 record instead"
+        );
+        assert_eq!(
+            after.slot, before.slot,
+            "the SAME slot index, moved in place"
+        );
+        assert_eq!(
+            after.reservation_token, before.reservation_token,
+            "a transfer rewrites the owner in place; it does not re-reserve"
+        );
+    }
 
     /// SUBA-N03, the load-bearing half: the six formerly-refused SINGLE-mode overrides are not
     /// merely ACCEPTED on the async path, they genuinely reach the detached hop-2 runner.

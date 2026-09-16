@@ -1829,6 +1829,7 @@ mod tests {
         fn settle(async_root: &std::path::Path, results_dir: &std::path::Path, run_id: &RunId) {
             let paths = RunPaths::for_run(async_root, results_dir, run_id);
             let result = crate::background::ResultFile {
+                schedule_origin: None,
                 id: run_id.clone(),
                 run_id: run_id.clone(),
                 agent: "worker".to_string(),
@@ -2077,6 +2078,57 @@ mod tests {
         assert!(
             err.contains("The runs are detached and keep going"),
             "got: {err}"
+        );
+    }
+
+    /// `wait`'s own view of "what is still running" is
+    /// [`super::run_status::list_active_runs`], and that listing now enumerates the ACTIVE-run
+    /// index rather than the async root — so this is the wait path reaching
+    /// [`crate::background::active_run_index::read_live_active_run_ids`] end to end, through
+    /// [`wait_for_subagents`] and nothing else.
+    ///
+    /// Both runs are `running` on disk and only one carries an index marker, which is the single
+    /// asymmetry a directory scan cannot see: a scan would name two runs in `active_run_ids`.
+    #[tokio::test]
+    async fn the_wait_sees_the_active_runs_the_index_lists() {
+        let fx = Fixture::new();
+        let indexed = RunId::from_token("run0waitidx");
+        let unindexed = RunId::from_token("run0waitscan");
+        fx.write_status(&indexed, RunState::Running, false);
+        fx.write_status(&unindexed, RunState::Running, false);
+        let paths = fx.paths(&indexed);
+        let status: RunStatus = serde_json::from_slice(
+            &std::fs::read(&paths.status).expect("read the status just written"),
+        )
+        .expect("status parses");
+        crate::background::active_run_index::update_active_run_index(&paths.run_dir, &status)
+            .await
+            .expect("index the launch");
+
+        let outcome = wait_for_subagents(
+            &WaitParams {
+                timeout_ms: Some(400),
+                ..WaitParams::default()
+            },
+            &CancelToken::new(),
+            &fx.deps(true),
+        )
+        .await;
+        let WaitVerdict::WindowElapsed { active_run_ids } = &outcome.verdict else {
+            panic!(
+                "a timeout must resolve to WindowElapsed, got {:?}",
+                outcome.verdict
+            );
+        };
+        assert_eq!(
+            active_run_ids,
+            &vec![indexed.as_str().to_string()],
+            "the wait waited on exactly the index's listing"
+        );
+        assert!(
+            !outcome.text.contains(unindexed.as_str()),
+            "the unindexed run is not in the report: {}",
+            outcome.text
         );
     }
 

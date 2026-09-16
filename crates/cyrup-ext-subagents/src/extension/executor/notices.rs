@@ -507,9 +507,34 @@ impl SubagentExecutor {
                 // pi `extension/index.ts:445-452` — the retention timer is armed right after the
                 // watcher, and only when the watcher actually installed: a degraded install has no
                 // session to sweep for.
-                let sweep = spawn_retention_sweep(sweep_dir, RETENTION_SWEEP_DELAY);
+                //
+                // SCOPE_14 — the same arming point gains a THIRD stage: the async-root reaper.
+                // It is armed here, and only here, for the same reason the first two are: the
+                // reaper exists to serve a session's own working directory, and a degraded install
+                // has no session to sweep for. The two registries are handed over as HANDLES so the
+                // pass reads the live protected set a minute from now rather than a stale snapshot
+                // of it.
+                let cancel = CancelToken::new();
+                let sweep = RetentionSweepHandle {
+                    handle: spawn_retention_sweep(
+                        sweep_dir,
+                        Some(AsyncRetentionSchedule::new(
+                            &roots,
+                            cwd,
+                            Arc::clone(self.tracker()),
+                            self.workflow_controller_registry(),
+                            // SUBA-016 — the SLOT, resolved at sweep time, so a schedule fired by
+                            // a later session is protected too.
+                            self.scheduled_run_slot(),
+                            cancel.clone(),
+                        )),
+                        RETENTION_SWEEP_DELAY,
+                        ASYNC_RETENTION_SCHEDULE_DELAY,
+                    ),
+                    cancel,
+                };
                 if let Some(previous) = self.retention_sweep.lock().await.replace(sweep) {
-                    previous.abort();
+                    previous.cancel_and_abort();
                 }
             }
             Err(_) => {
@@ -605,14 +630,26 @@ impl SubagentExecutor {
         // pi `clearTimeout(resultIndexCleanupTimer)` (`extension/index.ts:1044`): the sweep exists
         // to serve the watcher, so it goes down with it rather than firing into a torn-down
         // session's directory half a minute later.
+        //
+        // With the async-retention stage this abort can now land MID-PASS, after a rename and
+        // before the `remove_dir_all`. That is safe by construction — `.deleting-run-*` plus its
+        // marker IS the designed intermediate state, and the next pass in this scope completes it
+        // (`async_retention::sweep`'s crash-safety table). It is also the reason that pass must
+        // never sleep inside itself: a pass parked between batches would be killed here by every
+        // session that ends inside the window.
         if let Some(sweep) = self.retention_sweep.lock().await.take() {
-            sweep.abort();
+            sweep.cancel_and_abort();
         }
     }
 }
 
 /// pi's `resultIndexCleanupTimer` delay (`extension/index.ts:451`) — 30 s after install.
 const RETENTION_SWEEP_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// pi `ASYNC_RETENTION_DELAY_MS` (`runs/background/async-retention.ts:16`) as pi itself uses it:
+/// `extension/index.ts:613`'s one-shot post-activation `setTimeout`, 60 s after install — NOT an
+/// inter-batch pause (nothing in `async-retention.ts` reads the constant at all).
+const ASYNC_RETENTION_SCHEDULE_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// pi's `resultIndexCleanupTimer` (`extension/index.ts:445-452`) — a one-shot, detached,
 /// best-effort retention sweep `delay` after the completion watcher is installed.
@@ -647,7 +684,9 @@ const RETENTION_SWEEP_DELAY: std::time::Duration = std::time::Duration::from_sec
 /// passes [`RETENTION_SWEEP_DELAY`].
 pub(crate) fn spawn_retention_sweep(
     results_dir: std::path::PathBuf,
+    async_retention: Option<AsyncRetentionSchedule>,
     delay: std::time::Duration,
+    async_delay: std::time::Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         tokio::time::sleep(delay).await;
@@ -678,7 +717,163 @@ pub(crate) fn spawn_retention_sweep(
             crate::background::completion_replay::CLEANUP_INTERVAL_MS,
         )
         .await;
+
+        // Stage 3. `saturating_sub` rather than a second full sleep, so the async pass begins one
+        // whole `async_delay` after INSTALL no matter how long stages 1-2 took — which is what
+        // makes the stagger a property of the schedule rather than of the machine.
+        let Some(schedule) = async_retention else {
+            return;
+        };
+        tokio::time::sleep(async_delay.saturating_sub(delay)).await;
+        let report = schedule.run_pass().await;
+        tracing::debug!(
+            acquired = report.acquired,
+            scanned = report.scanned,
+            deleted_runs = report.deleted_runs,
+            reaped_tombstones = report.reaped_tombstones,
+            repaired_runs = report.repaired_runs,
+            errors = report.errors.len(),
+            "swept retained async subagent run state"
+        );
     })
+}
+
+/// Everything the async-retention stage needs, owned, because it runs a minute after the call site
+/// that built it and holds no `&self`.
+///
+/// The two registries are HANDLES and not snapshots, deliberately: a protected-run set captured at
+/// install time would protect the runs that were live a minute ago and leave every run launched
+/// since unprotected — which is exactly the reap this stage must never perform. [`Self::protected_run_ids`]
+/// reads both at sweep time instead.
+pub(crate) struct AsyncRetentionSchedule {
+    /// `<temp_root>/async/<cwd_key>` — the tree the pass reaps.
+    async_root: std::path::PathBuf,
+    /// `<temp_root>/results/<cwd_key>` — read for the pass's liveness guards, never written by it.
+    results_dir: std::path::PathBuf,
+    /// `<run_scratch>/wait-subscriptions/<cwd_key>` — the fail-closed fourth guard, which must see
+    /// ANOTHER instance's subscriptions and therefore reads the directory rather than this
+    /// session's in-memory set.
+    wait_subscriptions_dir: std::path::PathBuf,
+    /// pi `state.asyncJobs` (`extension/index.ts:605`) — this process's live background jobs.
+    tracker: Arc<crate::background::tracker::JobTracker>,
+    /// pi `state.workflowControllers?.keys()` (`extension/index.ts:605`) — the live workflow
+    /// shells this process is driving.
+    workflow_controllers:
+        crate::extension::executor::workflow_controllers::WorkflowControllerRegistry,
+    /// SUBA-016 — pi `scheduledRunManager.referencedAsyncRunIds()` (`extension/index.ts:612`),
+    /// upstream's THIRD protected source. A SLOT, not a manager: the manager is rebuilt on every
+    /// `SessionStart` edge and this stage outlives one, so a captured handle would protect the
+    /// schedules of a session that has already ended.
+    scheduled_runs: crate::background::scheduled_runs::ScheduledRunSlot,
+    /// Fired by [`SubagentExecutor::stop_completion_watcher`] before it aborts the task, so a
+    /// teardown that lands mid-pass gets a clean stop at the next checkpoint.
+    cancel: CancelToken,
+}
+
+impl AsyncRetentionSchedule {
+    /// Assemble the stage from the same `(roots, cwd)` pair `install_completion_watcher` already
+    /// holds. Every path comes from the one place that owns it — never re-derived by string
+    /// arithmetic, which is what `artifact_roots.rs`'s own C7 note warns about.
+    pub(crate) fn new(
+        roots: &crate::paths::Roots,
+        cwd: &Path,
+        tracker: Arc<crate::background::tracker::JobTracker>,
+        workflow_controllers: crate::extension::executor::workflow_controllers::WorkflowControllerRegistry,
+        scheduled_runs: crate::background::scheduled_runs::ScheduledRunSlot,
+        cancel: CancelToken,
+    ) -> Self {
+        Self {
+            async_root: default_async_root_in(roots, cwd),
+            results_dir: default_results_dir_in(roots, cwd),
+            wait_subscriptions_dir: crate::background::wait_subscriptions_dir_in(roots, cwd),
+            tracker,
+            workflow_controllers,
+            scheduled_runs,
+            cancel,
+        }
+    }
+
+    /// pi `extension/index.ts:604-608`'s `protectedRunIds`, read at SWEEP time.
+    ///
+    /// ALL THREE of upstream's sources since SUBA-016: the tracked async jobs, the live workflow
+    /// controllers, and every async run this project's schedules still reference
+    /// ([`crate::background::scheduled_runs::ScheduledRunManager::referenced_async_run_ids`]).
+    /// The third used to be recorded as a `[CYRUP-DELTA]` with no analogue; it has one now, and
+    /// without it a reaped run directory would leave `schedule.delete`'s active-run guard unable
+    /// to confirm the run ended.
+    ///
+    /// **No state filter**, matching upstream's bare `state.asyncJobs.keys()`: a TERMINAL but
+    /// still-tracked job is protected too, because the point is "this process still has a handle on
+    /// it", not "it is still running".
+    ///
+    /// Both locks are short, synchronous and released before this returns, so the owned set can
+    /// then be carried across the pass's `.await`s — the shape `completion_replay::retention`
+    /// already uses, and the reason this crate never holds a `std::sync::MutexGuard` across an
+    /// await.
+    async fn protected_run_ids(&self) -> std::collections::BTreeSet<RunId> {
+        let mut ids: std::collections::BTreeSet<RunId> = self
+            .tracker
+            .snapshot()
+            .into_iter()
+            .map(|job| job.run_id)
+            .collect();
+        ids.extend(
+            crate::extension::executor::workflow_controllers::registry_live_workflow_run_ids(
+                &self.workflow_controllers,
+            ),
+        );
+        // The manager is resolved here, at sweep time, and the guard is dropped before the await.
+        let manager = self
+            .scheduled_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(manager) = manager {
+            ids.extend(manager.referenced_async_run_ids().await);
+        }
+        ids
+    }
+
+    /// One bounded pass, on the production policy.
+    async fn run_pass(&self) -> crate::background::async_retention::AsyncRetentionResult {
+        let protected = self.protected_run_ids().await;
+        let maintenance_root =
+            crate::background::async_retention::maintenance_root(&self.async_root);
+        let identity = crate::background::async_retention::RetentionLockIdentity::current();
+        let options = crate::background::async_retention::AsyncRetentionOptions {
+            cancel: Some(&self.cancel),
+            ..crate::background::async_retention::AsyncRetentionOptions::new(
+                &self.async_root,
+                &self.results_dir,
+                &self.wait_subscriptions_dir,
+                &maintenance_root,
+                &protected,
+                &identity,
+                crate::time::now_epoch_millis(),
+            )
+        };
+        crate::background::async_retention::cleanup_async_retention(&options).await
+    }
+}
+
+/// The retention sweep task plus the token that stops it cleanly.
+///
+/// `abort()` alone drops the future wherever it happens to be — which stage 3 is designed to
+/// survive (an aborted pass leaves a `.deleting-run-*` tombstone and its marker, the designed
+/// intermediate state the next pass completes) but need not suffer. Firing the token first gives
+/// the in-flight pass a checkpoint to stop at, record `cancelled`, release its lock and write its
+/// maintenance line; the `abort` then bounds how long that is allowed to take.
+pub(crate) struct RetentionSweepHandle {
+    handle: tokio::task::JoinHandle<()>,
+    cancel: CancelToken,
+}
+
+impl RetentionSweepHandle {
+    /// pi `clearTimeout(resultIndexCleanupTimer)` (`extension/index.ts:1044`) — cancel, then abort.
+    pub(crate) fn cancel_and_abort(self) {
+        self.cancel.cancel();
+        self.handle.abort();
+    }
 }
 
 #[cfg(test)]
@@ -746,9 +941,17 @@ mod tests {
         let replay = completion_replay_path(&results_dir, &run);
         assert!(replay.exists() && corrupt_index.exists());
 
-        spawn_retention_sweep(results_dir.clone(), std::time::Duration::ZERO)
-            .await
-            .expect("the sweep task runs to completion");
+        // Stages 1-2 in isolation (`None` = no async stage): this half of the test is about the
+        // index/replay bodies, and stage 3 has its own tests below, which drive it through the same
+        // function with a real schedule.
+        spawn_retention_sweep(
+            results_dir.clone(),
+            None,
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+        )
+        .await
+        .expect("the sweep task runs to completion");
         assert!(
             !corrupt_index.exists(),
             "cleanup_result_indexes finally has a caller"
@@ -783,6 +986,371 @@ mod tests {
         assert!(
             executor.retention_sweep.lock().await.is_none(),
             "tearing the watcher down cancels it (pi `clearTimeout`, `extension/index.ts:1044`)"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // SCOPE_14 — the async-retention stage: it is armed by the real install, it is staggered
+    // behind the first two, and the live registries it protects against are read at SWEEP time.
+    // ---------------------------------------------------------------------------------------
+
+    /// 60 days — past `ASYNC_RETENTION_MS`, so these runs are reapable on the DEFAULT policy.
+    const RETENTION_TEST_AGE_MS: i64 = 60 * 24 * 60 * 60 * 1000;
+
+    /// A terminal run directory old enough to reap, under a real async root.
+    ///
+    /// Both mtimes are backdated as well as the recorded timestamps, because `statusTimestamp`
+    /// takes the MAX of the logical field and both mtimes — a freshly created directory would make
+    /// the run `recent` however old its `ended_at` said it was.
+    async fn seed_reapable_run(async_root: &Path, token: &str) -> std::path::PathBuf {
+        let at = crate::time::now_epoch_millis() - RETENTION_TEST_AGE_MS;
+        let dir = async_root.join(token);
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("mkdir run dir");
+        let mut status = crate::background::RunStatus::queued(
+            RunId::from_token(token.to_string()),
+            crate::background::RunMode::Single,
+            None,
+        );
+        status.state = crate::background::RunState::Complete;
+        status.started_at = at;
+        status.last_update = at;
+        status.ended_at = Some(at);
+        let status_path = dir.join("status.json");
+        tokio::fs::write(
+            &status_path,
+            serde_json::to_vec(&status).expect("serialize status"),
+        )
+        .await
+        .expect("write status");
+        let stamp = filetime::FileTime::from_unix_time(at / 1000, 0);
+        filetime::set_file_mtime(&status_path, stamp).expect("backdate status.json");
+        filetime::set_file_mtime(&dir, stamp).expect("backdate run dir");
+        dir
+    }
+
+    /// Let every already-spawned task reach its next `.await` WITHOUT parking the runtime, so a
+    /// paused clock cannot auto-advance while we are looking.
+    async fn settle() {
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Spin on ready work only — never a `sleep` — until `ready` holds. On a paused clock this is
+    /// the one way to wait for real filesystem work without letting virtual time run away.
+    async fn spin_until(mut ready: impl FnMut() -> bool) -> bool {
+        for _ in 0..200_000 {
+            if ready() {
+                return true;
+            }
+            tokio::task::yield_now().await;
+        }
+        ready()
+    }
+
+    fn empty_workflow_registry()
+    -> crate::extension::executor::workflow_controllers::WorkflowControllerRegistry {
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    /// SUBTASK3 — the three cleanup stages share one task and are staggered 30 s / 30 s / 60 s.
+    ///
+    /// Sequential stages in one task cannot overlap by construction; what the third adds is a LATER
+    /// START, which is upstream's own choice (`extension/index.ts:451` arms the index/replay sweep
+    /// at 30 s, `:613` the async pass at 60 s). Asserted against a virtual clock: at 31 s the first
+    /// two have done their work and the third has not started; at 61 s it has.
+    #[tokio::test(start_paused = true)]
+    async fn the_three_cleanup_jobs_are_staggered() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let roots = crate::paths::Roots::sandboxed(tmp.path());
+        let cwd = tmp.path().join("project");
+        tokio::fs::create_dir_all(&cwd).await.expect("mkdir cwd");
+        let results_dir = default_results_dir_in(&roots, &cwd);
+        let async_root = default_async_root_in(&roots, &cwd);
+        tokio::fs::create_dir_all(&async_root)
+            .await
+            .expect("mkdir async root");
+
+        // Stage 1's observable effect: an unparseable index entry, removed with no age check.
+        let corrupt_index = results_dir.join("result-index").join("corrupt.json");
+        tokio::fs::create_dir_all(corrupt_index.parent().expect("parent"))
+            .await
+            .expect("mkdir");
+        tokio::fs::write(&corrupt_index, b"{not json".as_slice())
+            .await
+            .expect("write");
+
+        // Stage 3's observable effects: a reapable orphan, and the maintenance line every pass
+        // writes whether or not it deletes anything.
+        let orphan = seed_reapable_run(&async_root, "orphan").await;
+        let maintenance_log = crate::background::async_retention::maintenance_log_path(
+            &crate::background::async_retention::maintenance_root(&async_root),
+        );
+
+        let handle = spawn_retention_sweep(
+            results_dir.clone(),
+            Some(AsyncRetentionSchedule::new(
+                &roots,
+                &cwd,
+                Arc::new(crate::background::tracker::JobTracker::new()),
+                empty_workflow_registry(),
+                Arc::new(std::sync::Mutex::new(None)),
+                CancelToken::new(),
+            )),
+            RETENTION_SWEEP_DELAY,
+            ASYNC_RETENTION_SCHEDULE_DELAY,
+        );
+
+        // Let the task register its FIRST timer before moving the clock — advancing first would
+        // make its `sleep` deadline relative to the already-advanced now.
+        settle().await;
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        assert!(
+            spin_until(|| !corrupt_index.exists()).await,
+            "stages 1-2 fire at RETENTION_SWEEP_DELAY"
+        );
+        assert!(
+            !maintenance_log.exists(),
+            "and stage 3 has NOT started 31 s in — it is armed for 60 s"
+        );
+        assert!(orphan.exists());
+
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        handle.await.expect("the sweep task runs to completion");
+
+        assert!(
+            maintenance_log.exists(),
+            "stage 3 fires one whole ASYNC_RETENTION_SCHEDULE_DELAY after install"
+        );
+        assert!(!orphan.exists(), "and it reaps the orphan it was armed for");
+    }
+
+    /// SUBTASK3 — the same schedule, reached through the REAL install and torn down by the real
+    /// teardown. Extends `the_retention_sweep_is_scheduled_after_the_watcher_installs` with the
+    /// async stage's own effect: without this the stage could be perfectly correct and still never
+    /// run in production.
+    #[tokio::test(start_paused = true)]
+    async fn the_async_retention_pass_is_armed_by_the_watcher_install_and_cancelled_by_teardown() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let roots = crate::paths::Roots::sandboxed(tmp.path());
+        let cwd = tmp.path().join("project");
+        tokio::fs::create_dir_all(&cwd).await.expect("mkdir cwd");
+        let async_root = default_async_root_in(&roots, &cwd);
+        tokio::fs::create_dir_all(&async_root)
+            .await
+            .expect("mkdir async root");
+        let orphan = seed_reapable_run(&async_root, "orphan").await;
+        let maintenance_log = crate::background::async_retention::maintenance_log_path(
+            &crate::background::async_retention::maintenance_root(&async_root),
+        );
+
+        let executor =
+            SubagentExecutor::with_config(crate::registration::SubagentExtensionConfig {
+                roots: roots.clone(),
+                ..Default::default()
+            });
+        executor.install_completion_watcher(&cwd).await;
+        assert!(
+            executor.retention_sweep.lock().await.is_some(),
+            "installing the watcher arms the sweep"
+        );
+
+        // One second of virtual time at a time, settling in between. A single 61 s jump would not
+        // do: stage 3's own `sleep` is registered only AFTER stages 1-2 finish, so its deadline
+        // would be measured from the already-advanced clock and never fire.
+        // The wait must ADVANCE, not spin. `spin_until` is a busy `yield_now` loop, and on a paused
+        // clock a busy runtime never auto-advances — so once the manual advances below ran out it
+        // could not make progress, it could only burn 200_000 yields and report a failure that was
+        // really "the sweep's real filesystem work lost a race under load". That is what made this
+        // test fail in `--workspace` runs while passing in isolation.
+        //
+        // Advancing one second at a time is load-bearing and not a stylistic choice: stage 3's own
+        // `sleep` is registered only AFTER stages 1-2 finish, so a single 61 s jump would measure
+        // its deadline from the already-advanced clock and never fire. The bound is generous
+        // because each iteration also has to let real file I/O land, not because the arming is slow.
+        let mut armed = false;
+        for _ in 0..600 {
+            if maintenance_log.exists() {
+                armed = true;
+                break;
+            }
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+            settle().await;
+        }
+        assert!(
+            armed || maintenance_log.exists(),
+            "the install really did arm the async-retention pass"
+        );
+        assert!(
+            !orphan.exists(),
+            "and it reaped the orphan in this session's own async root"
+        );
+
+        executor.stop_completion_watcher().await;
+        assert!(
+            executor.retention_sweep.lock().await.is_none(),
+            "tearing the watcher down cancels it (pi `clearTimeout`, `extension/index.ts:1044`)"
+        );
+    }
+
+    /// SUBTASK4 — a run the LIVE tracker holds is never reaped, however old it is and whatever its
+    /// on-disk state says.
+    ///
+    /// Driven through `spawn_retention_sweep` with a real `JobTracker`, not through
+    /// `cleanup_async_retention`'s `protected_run_ids` argument: the argument was always easy to
+    /// satisfy, and what was missing was the wiring that fills it.
+    #[tokio::test]
+    async fn a_run_tracked_by_the_live_tracker_is_never_reaped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let roots = crate::paths::Roots::sandboxed(tmp.path());
+        let cwd = tmp.path().join("project");
+        tokio::fs::create_dir_all(&cwd).await.expect("mkdir cwd");
+        let async_root = default_async_root_in(&roots, &cwd);
+        let results_dir = default_results_dir_in(&roots, &cwd);
+        tokio::fs::create_dir_all(&async_root)
+            .await
+            .expect("mkdir async root");
+        let tracked = seed_reapable_run(&async_root, "tracked").await;
+        let free = seed_reapable_run(&async_root, "free").await;
+
+        let run_id = RunId::from_token("tracked".to_string());
+        let tracker = Arc::new(crate::background::tracker::JobTracker::new());
+        tracker
+            .track_restored(
+                run_id.clone(),
+                crate::background::RunPaths::for_run(&async_root, &results_dir, &run_id),
+                0,
+            )
+            .await;
+
+        spawn_retention_sweep(
+            results_dir.clone(),
+            Some(AsyncRetentionSchedule::new(
+                &roots,
+                &cwd,
+                Arc::clone(&tracker),
+                empty_workflow_registry(),
+                Arc::new(std::sync::Mutex::new(None)),
+                CancelToken::new(),
+            )),
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+        )
+        .await
+        .expect("the sweep task runs to completion");
+
+        assert!(
+            tracked.exists(),
+            "a run this process still has a handle on is never a candidate"
+        );
+        assert!(!free.exists(), "while its unheld neighbour is reaped");
+
+        let line = match crate::background::async_retention::read_last_maintenance_line(
+            &crate::background::async_retention::maintenance_root(&async_root),
+        )
+        .await
+        {
+            crate::background::async_retention::MaintenanceLogRead::Line(line) => line,
+            other => panic!("expected a maintenance line, got {other:?}"),
+        };
+        assert_eq!(line.skipped.get("runtime-reference").copied(), Some(1));
+        tracker.stop_and_clear().await;
+    }
+
+    /// SUBTASK4 — and neither is a run held by a live workflow controller, which is the worst case
+    /// this stage could produce: a workflow shell's run tree deleted mid-flight.
+    #[tokio::test]
+    async fn a_live_workflow_controller_protects_its_run_tree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let roots = crate::paths::Roots::sandboxed(tmp.path());
+        let cwd = tmp.path().join("project");
+        tokio::fs::create_dir_all(&cwd).await.expect("mkdir cwd");
+        let async_root = default_async_root_in(&roots, &cwd);
+        tokio::fs::create_dir_all(&async_root)
+            .await
+            .expect("mkdir async root");
+        let driven = seed_reapable_run(&async_root, "driven").await;
+
+        let executor = SubagentExecutor::new();
+        executor.register_workflow_controller(
+            &RunId::from_token("driven".to_string()),
+            CancelToken::new(),
+        );
+
+        spawn_retention_sweep(
+            default_results_dir_in(&roots, &cwd),
+            Some(AsyncRetentionSchedule::new(
+                &roots,
+                &cwd,
+                Arc::new(crate::background::tracker::JobTracker::new()),
+                executor.workflow_controller_registry(),
+                executor.scheduled_run_slot(),
+                CancelToken::new(),
+            )),
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+        )
+        .await
+        .expect("the sweep task runs to completion");
+
+        assert!(driven.exists());
+        let line = match crate::background::async_retention::read_last_maintenance_line(
+            &crate::background::async_retention::maintenance_root(&async_root),
+        )
+        .await
+        {
+            crate::background::async_retention::MaintenanceLogRead::Line(line) => line,
+            other => panic!("expected a maintenance line, got {other:?}"),
+        };
+        assert_eq!(line.skipped.get("runtime-reference").copied(), Some(1));
+    }
+
+    /// The protected set is read at SWEEP time, not at ARM time.
+    ///
+    /// A snapshot taken when the watcher installs would protect the workflows that were live a
+    /// minute ago and leave every workflow LAUNCHED SINCE unprotected — the exact reap this stage
+    /// must never perform, and the reason `AsyncRetentionSchedule` holds registry handles.
+    #[tokio::test]
+    async fn the_protected_set_is_read_when_the_pass_runs_not_when_it_is_armed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let roots = crate::paths::Roots::sandboxed(tmp.path());
+        let cwd = tmp.path().join("project");
+        tokio::fs::create_dir_all(&cwd).await.expect("mkdir cwd");
+        let async_root = default_async_root_in(&roots, &cwd);
+        tokio::fs::create_dir_all(&async_root)
+            .await
+            .expect("mkdir async root");
+        let late = seed_reapable_run(&async_root, "late").await;
+
+        let executor = SubagentExecutor::new();
+        let schedule = AsyncRetentionSchedule::new(
+            &roots,
+            &cwd,
+            Arc::new(crate::background::tracker::JobTracker::new()),
+            executor.workflow_controller_registry(),
+            executor.scheduled_run_slot(),
+            CancelToken::new(),
+        );
+        // Registered AFTER the schedule was built — i.e. after the arm, before the pass.
+        executor.register_workflow_controller(
+            &RunId::from_token("late".to_string()),
+            CancelToken::new(),
+        );
+
+        spawn_retention_sweep(
+            default_results_dir_in(&roots, &cwd),
+            Some(schedule),
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+        )
+        .await
+        .expect("the sweep task runs to completion");
+
+        assert!(
+            late.exists(),
+            "a workflow launched after the sweep was armed must still be protected by it"
         );
     }
 

@@ -424,7 +424,13 @@ fn validate_plain_json(value: &Value, path: &str, depth: u32) -> Result<(), Stri
 
 /// pi `normalizeArgs` (`workflow-resources.ts:128-138`) — the discriminated-union form upstream
 /// commit `1deda864` landed: `Result<Map, String>`, never an optional-field bag.
-fn normalize_args(value: Option<&Value>) -> Result<Map<String, Value>, String> {
+///
+/// `pub(crate)` (re-exported as [`crate::workflows::normalize_workflow_args`]) because upstream
+/// has a SECOND caller outside this file: `parseScheduleTarget`
+/// (`runs/background/scheduled-runs.ts:293`) runs a persisted schedule's `target.args` through
+/// exactly this normalisation on every read. Two implementations of "what a workflow's args may
+/// be" would let a schedule persist args the workflow runtime then refuses.
+pub(crate) fn normalize_args(value: Option<&Value>) -> Result<Map<String, Value>, String> {
     let Some(value) = value else {
         return Ok(Map::new());
     };

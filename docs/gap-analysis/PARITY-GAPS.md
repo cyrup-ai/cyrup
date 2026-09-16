@@ -57,7 +57,14 @@ upstream): ~~`completion-replay.ts` (287 LOC, `SUBA-056`)~~ — **CLOSED**, port
 `terminal-run-index.ts` (138), `foreground-history.ts` (162),
 `async-{stop,steering,dismiss}-action.ts` (418 — cyrup applies their gates from its own control
 layer, but does not port the actions), `active-async-capacity.ts` (516 — per-session concurrency
-cap), `async-retention.ts` (912 — the async-root reaper).
+cap), `async-retention.ts` (912 — the async-root reaper; its RUN half is ported in full as
+`background/async_retention/` — policy, batched cursor-windowed scan, tombstone markers,
+wait-reference reader, the cross-instance lock, the destructive rename-then-delete sweep, the
+report and its maintenance log — and runs as the third stage of `spawn_retention_sweep`, 60 s after
+a session installs its completion watcher, with `/subagents-doctor`'s `Async retention` block as
+its operator-visible surface. STILL OPEN: the results-side half (`:839-896` plus `resultSkipReason`
+`:483-511`), which cyrup instead owns through `completion_replay::retention` +
+`result_index::retention` rather than through a second sweep over the same directories).
 
 ---
 

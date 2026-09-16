@@ -240,6 +240,13 @@ pub const CHECK_CHAIN_DISCOVERY: &str = "chain-discovery";
 /// Check (f): provider/model catalog freshness.
 pub const CHECK_PROVIDER_CATALOG_FRESHNESS: &str = "provider-catalog-freshness";
 
+/// SCOPE_14: the async-root reaper's last recorded pass, read back from its maintenance log.
+///
+/// **Appended, never inserted.** [`DoctorReport`]'s order is fixed and stable across releases
+/// (see its own doc), so a new check goes at the end of [`DoctorRunner::run`]'s vec and every
+/// existing index keeps its meaning.
+pub const CHECK_ASYNC_RETENTION: &str = "async-retention";
+
 /// SUBA-035: the active `subagents.modelScope` policy — enforcement is live
 /// (`exec/model_scope.rs`) but nothing surfaced it, so an operator debugging "why did my model
 /// choice not apply" got no hint from `/subagents-doctor` that a scope policy was filtering it.
@@ -282,7 +289,7 @@ impl DoctorRunner {
     /// top-level doc), so this method has no `Result` return type at all — a caller can always
     /// render *something*, even in a maximally broken environment.
     pub async fn run(&self) -> DoctorReport {
-        let (binary, temp_dir, config, discovery_result, catalog) = tokio::join!(
+        let (binary, temp_dir, config, discovery_result, catalog, async_retention) = tokio::join!(
             check_binary_resolution(),
             check_temp_dir_writable(&self.async_root),
             check_config_json(&self.config_json_path),
@@ -291,6 +298,11 @@ impl DoctorRunner {
                 self.provider_catalog_path.as_deref(),
                 &self.discovery_config,
             ),
+            // SCOPE_14 (h). DERIVED from `async_root` rather than carried as a field of its own:
+            // the maintenance root is pure path arithmetic over the very directory check (b)
+            // already names, so a separate field could only ever disagree with it — or, worse, be
+            // left `None` by a caller and silently disable the check.
+            check_async_retention(&self.async_root),
         );
 
         let (agents, chains, model_scope) = discovery_result;
@@ -304,6 +316,9 @@ impl DoctorRunner {
                 chains,
                 catalog,
                 model_scope,
+                // (h) APPENDED. Never inserted above: every index in this vec is part of the
+                // report's stable contract.
+                async_retention,
             ],
         }
     }
@@ -862,6 +877,19 @@ async fn check_provider_catalog_freshness(
     }
 }
 
+/// Check (h): what the last async-retention pass in `async_root`'s scope did (SCOPE_14).
+///
+/// Takes the ASYNC ROOT, not the maintenance root, so there is exactly one place in the crate that
+/// knows how the second is derived from the first.
+async fn check_async_retention(async_root: &Path) -> DoctorCheck {
+    let maintenance_root = crate::background::async_retention::maintenance_root(async_root);
+    AsyncRetentionDoctor::resolve(&maintenance_root)
+        .await
+        .check(&crate::background::async_retention::maintenance_log_path(
+            &maintenance_root,
+        ))
+}
+
 /// Coarse, human-readable duration rendering for doctor detail/remedy strings (e.g. "3d 4h",
 /// "45m") — deliberately not a general-purpose formatter, just enough precision for an operator
 /// skimming a doctor report.
@@ -946,6 +974,251 @@ pub struct DoctorReportInput<'a> {
     /// no environment of its own; [`crate::exec::run_fanout_budget::RunFanoutDoctor::resolve`] is
     /// the production constructor.
     pub run_fanout: crate::exec::run_fanout_budget::RunFanoutDoctor,
+    /// SCOPE_9 — the already-resolved `Active async capacity` block (pi
+    /// `formatActiveAsyncCapacitySection`, `extension/doctor.ts:188-199` @v0.66.0). Resolved by the
+    /// caller, like [`Self::run_fanout`], because measuring it RECONCILES the session's pool — a
+    /// filesystem side effect that has no business inside a report formatter.
+    pub active_async_capacity: ActiveAsyncCapacityDoctor,
+    /// SCOPE_14 — the already-resolved `Async retention` block. Resolved by the caller, like
+    /// [`Self::run_fanout`] and [`Self::active_async_capacity`], because reading it is I/O and this
+    /// report performs none of its own beyond the `Filesystem` section's four existence stats.
+    pub async_retention: AsyncRetentionDoctor,
+}
+
+/// pi `formatActiveAsyncCapacitySection` (`extension/doctor.ts:188-199` @v0.66.0) as a VALUE: the
+/// reconciled snapshot, resolved once so the report itself touches no filesystem.
+///
+/// Carries only the snapshot because that is upstream's only variable input — the other two lines
+/// are constant prose describing the policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ActiveAsyncCapacityDoctor {
+    /// `{ used, limit }` for the current session, after reconciliation. `limit: 0` means the
+    /// opt-in cap is disabled, and is rendered as `unlimited` — upstream's
+    /// `${snapshot.limit || "unlimited"}` (`:195`).
+    pub snapshot: crate::background::active_async_capacity::ActiveAsyncCapacitySnapshot,
+}
+
+impl ActiveAsyncCapacityDoctor {
+    /// The block's lines, from `extension/doctor.ts:194-198`, with the `release:` line rewritten
+    /// for cyrup's actual mechanism.
+    #[must_use]
+    pub fn lines(&self) -> Vec<String> {
+        vec![
+            format!(
+                "- usage: {}/{} used",
+                self.snapshot.used,
+                if self.snapshot.limit == 0 {
+                    "unlimited".to_string()
+                } else {
+                    self.snapshot.limit.to_string()
+                }
+            ),
+            "- scope: top-level async runs in the current parent session; foreground and nested \
+             children are not charged again"
+                .to_string(),
+            // [CYRUP-DELTA] — upstream's sentence names its process-terminal proof, which cyrup
+            // does not have (SCOPE_9 §D3). Saying so is the operator-visible half of that
+            // substitution: the slot comes back when the run is terminal AND its runner pid is
+            // confirmed gone, or on the abandoned-timeout ladder for a failed run with a dead pid
+            // and stale activity; `false` keeps unknown-liveness slots.
+            "- release: terminal state plus a confirmed-gone runner pid, or abandoned-timeout for \
+             failed runs with a dead runner pid and stale activity when enabled; false keeps \
+             unknown-liveness slots"
+                .to_string(),
+        ]
+    }
+}
+
+/// SCOPE_14 — the `Async retention` block of `/subagents-doctor`, as a VALUE.
+///
+/// # Why this is a resolved value and not a probe the formatter makes
+///
+/// [`ActiveAsyncCapacityDoctor`]'s reason, for a different mechanism: the answer lives on disk, in
+/// a file written by a DETACHED task in a possibly different process minutes or days ago
+/// ([`crate::background::async_retention::append_maintenance_log`]), and reading it is I/O.
+/// [`build_doctor_report`] performs none, so [`Self::resolve`] is called by
+/// [`crate::extension::SubagentExecutor::run_doctor`] and the formatter renders what it
+/// found.
+///
+/// # Why a log line and not the sweep itself
+///
+/// The report must never RUN a retention pass. A pass takes a cross-instance lock, renames run
+/// trees and deletes them; `/subagents-doctor` is a read-only inventory that an operator may run
+/// at any moment, including while a real pass holds that lock. So the doctor reads the pass's own
+/// record instead — which is also the only thing it COULD read, the pass having no in-process
+/// state to inspect.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AsyncRetentionDoctor {
+    /// No maintenance log in this scope: retention has not run here yet. A fresh install, or a
+    /// session younger than the 60 s schedule delay. Not actionable and not a fault.
+    NeverRun,
+    /// The last line of the log could not be parsed — a record written by a NEWER build, or a
+    /// process killed mid-append. Reported, never treated as a broken installation.
+    Unreadable,
+    /// The last recorded pass.
+    LastPass(Box<crate::background::async_retention::MaintenanceLogLine>),
+}
+
+impl AsyncRetentionDoctor {
+    /// Read `<maintenance_root>/async-retention-maintenance.jsonl`'s last line.
+    ///
+    /// `maintenance_root` is [`crate::background::async_retention::maintenance_root`] of the SAME
+    /// async root the `Filesystem` block names, so the block describes the scope the operator is
+    /// actually in.
+    pub async fn resolve(maintenance_root: &Path) -> Self {
+        match crate::background::async_retention::read_last_maintenance_line(maintenance_root).await
+        {
+            crate::background::async_retention::MaintenanceLogRead::Absent => Self::NeverRun,
+            crate::background::async_retention::MaintenanceLogRead::Unreadable => Self::Unreadable,
+            crate::background::async_retention::MaintenanceLogRead::Line(line) => {
+                Self::LastPass(line)
+            }
+        }
+    }
+
+    /// The block's lines.
+    ///
+    /// Deterministic for a given input: the counts come from a
+    /// [`std::collections::BTreeMap`]-backed report and the top skip reason breaks ties on the
+    /// reason's own byte order, so two operators reading the same log see the same text.
+    #[must_use]
+    pub fn lines(&self) -> Vec<String> {
+        match self {
+            Self::NeverRun => vec![
+                "- last pass: never (no retention pass has run in this scope yet)".to_string(),
+                format!(
+                    "- policy: run trees older than {} days are reaped, at most {} candidates per \
+                     pass",
+                    crate::background::async_retention::ASYNC_RETENTION_DAYS,
+                    crate::background::async_retention::ASYNC_RETENTION_BATCH_SIZE
+                ),
+            ],
+            Self::Unreadable => vec![
+                "- last pass: unreadable (the maintenance log's last line does not parse)"
+                    .to_string(),
+            ],
+            Self::LastPass(line) => {
+                let mut lines = vec![format!(
+                    "- last pass: scanned {}, reaped {} run(s) and {} tombstone(s), repaired {}",
+                    line.scanned, line.deleted_runs, line.reaped_tombstones, line.repaired_runs
+                )];
+                if !line.acquired {
+                    // The single most misleading state to render as a bare zero: nothing was
+                    // scanned because another instance in this shared scope held the lock, NOT
+                    // because there was nothing to do.
+                    lines.push(
+                        "- lock: another cyrup instance in this directory held the retention lock"
+                            .to_string(),
+                    );
+                }
+                if line.cancelled {
+                    lines.push(
+                        "- cancelled: the pass stopped at a checkpoint (the session was torn down)"
+                            .to_string(),
+                    );
+                }
+                lines.push(format!(
+                    "- kept: {}",
+                    format_skip_summary(&line.skipped).unwrap_or_else(|| "nothing".to_string())
+                ));
+                if line.errors > 0 {
+                    lines.push(format!(
+                        "- errors: {}{}",
+                        line.errors,
+                        line.first_error
+                            .as_deref()
+                            .map(|first| format!(" — first: {first}"))
+                            .unwrap_or_default()
+                    ));
+                }
+                lines.push(format!(
+                    "- coverage: {} entr(ies) listed, {}",
+                    line.raw_reads,
+                    if line.source_exhausted.get("runs").copied().unwrap_or(false) {
+                        "the whole async root was covered this pass"
+                    } else {
+                        "the batch budget was reached — more will be swept next pass"
+                    }
+                ));
+                lines
+            }
+        }
+    }
+
+    /// The same finding as one [`DoctorCheck`], for [`DoctorRunner::run`]'s structured matrix.
+    ///
+    /// **Never `Fail`.** A diagnostic that cannot read its own diagnostic is not a broken
+    /// installation, and neither is a scope where another instance happens to hold the lock; both
+    /// are `Warn`. A fresh install is `Ok` — there is nothing for an operator to do about a pass
+    /// that has not been due yet.
+    #[must_use]
+    pub fn check(&self, log_path: &Path) -> DoctorCheck {
+        match self {
+            Self::NeverRun => DoctorCheck::ok(
+                CHECK_ASYNC_RETENTION,
+                "async retention has not run in this scope yet",
+            ),
+            Self::Unreadable => DoctorCheck::warn(
+                CHECK_ASYNC_RETENTION,
+                "the async-retention maintenance log's last line does not parse",
+                format!(
+                    "inspect {} — a record written by a newer build, or a line truncated by a \
+                     killed process",
+                    log_path.display()
+                ),
+            ),
+            Self::LastPass(line) if line.errors > 0 => DoctorCheck::warn(
+                CHECK_ASYNC_RETENTION,
+                format!(
+                    "the last async-retention pass recorded {} error(s){}",
+                    line.errors,
+                    line.first_error
+                        .as_deref()
+                        .map(|first| format!(": {first}"))
+                        .unwrap_or_default()
+                ),
+                format!("inspect {}", log_path.display()),
+            ),
+            Self::LastPass(line) if !line.acquired => DoctorCheck::warn(
+                CHECK_ASYNC_RETENTION,
+                "another cyrup instance held the async-retention lock, so the last pass did nothing",
+                format!(
+                    "expected while another instance is sweeping this directory; a lock that never \
+                     clears is left at {}",
+                    log_path
+                        .parent()
+                        .unwrap_or(log_path)
+                        .join(crate::background::async_retention::LOCK_NAME)
+                        .display()
+                ),
+            ),
+            Self::LastPass(line) => DoctorCheck::ok(
+                CHECK_ASYNC_RETENTION,
+                format!(
+                    "last pass scanned {}, reaped {} run(s) and {} tombstone(s); kept {}",
+                    line.scanned,
+                    line.deleted_runs,
+                    line.reaped_tombstones,
+                    format_skip_summary(&line.skipped).unwrap_or_else(|| "nothing".to_string())
+                ),
+            ),
+        }
+    }
+}
+
+/// `"12 recent, 3 non-terminal"` — every skip reason and its count, in the map's own (byte) order,
+/// so the rendered line is deterministic. `None` for an empty tally.
+fn format_skip_summary(skipped: &std::collections::BTreeMap<String, usize>) -> Option<String> {
+    if skipped.is_empty() {
+        return None;
+    }
+    Some(
+        skipped
+            .iter()
+            .map(|(reason, count)| format!("{count} {reason}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
 }
 
 /// Per-`AgentSource` tallies for one population (agents or chains), rendered as pi's
@@ -1175,6 +1448,22 @@ pub fn build_doctor_report(input: &DoctorReportInput) -> String {
     lines.push(String::new());
     lines.push("Run fan-out budget".to_string());
     lines.extend(input.run_fanout.lines());
+
+    // SCOPE_9 — pi renders this block from `buildDoctorReport` immediately after the fan-out one
+    // (`extension/doctor.ts` @v0.66.0). It is the operator-visible half of the per-session cap:
+    // without it an operator hitting `Active async run capacity exhausted` has nowhere to read
+    // what the cap is or why a slot is still held.
+    lines.push(String::new());
+    lines.push("Active async capacity".to_string());
+    lines.extend(input.active_async_capacity.lines());
+
+    // SCOPE_14 — the async-root reaper's only operator-visible surface. Without this block an
+    // operator has no way at all to tell whether retention is running in this directory, whether it
+    // is being blocked by another instance's lock, or why a root is still growing: the pass is
+    // detached, holds no in-process state, and typically ran in a process that has since exited.
+    lines.push(String::new());
+    lines.push("Async retention".to_string());
+    lines.extend(input.async_retention.lines());
 
     lines.join("\n")
 }
@@ -1437,6 +1726,257 @@ mod tests {
             );
             assert!(check.remedy.is_some());
         }
+    }
+
+    /// (b)'s uid-INDEPENDENT fixture: a temp-scope root whose path is already a regular FILE
+    /// cannot be created as a directory by any uid, so this `Fail` is asserted unconditionally.
+    ///
+    /// It exists because the chmod fixture above asserts NOTHING when the suite runs as uid 0 —
+    /// which containers and CI commonly do — leaving check (b)'s failure arm entirely uncovered in
+    /// exactly the environments this crate is usually tested in.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn temp_dir_writable_fails_when_the_root_path_is_not_a_directory() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let occupied = dir.path().join("async-root");
+        std::fs::write(&occupied, b"a regular file sitting where the root must go")
+            .expect("write file");
+
+        let check = check_temp_dir_writable(&occupied).await;
+        assert_eq!(
+            check.status,
+            CheckStatus::Fail,
+            "a root that cannot be created must report Fail for every uid: {check:?}"
+        );
+        assert!(check.remedy.is_some());
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // SCOPE_14 — the async-retention block: the reaper's only operator-visible surface.
+    // -----------------------------------------------------------------------------------------
+
+    /// Write a real maintenance line through the real writer, so these tests prove the
+    /// writer/reader pair and not a hand-built struct the writer never produces.
+    async fn write_last_pass(
+        async_root: &Path,
+        mutate: impl FnOnce(&mut crate::background::async_retention::AsyncRetentionResult),
+    ) {
+        let mut result = crate::background::async_retention::AsyncRetentionResult {
+            acquired: true,
+            scanned: 12,
+            deleted_runs: 2,
+            reaped_tombstones: 1,
+            repaired_runs: 1,
+            raw_reads: 14,
+            ..Default::default()
+        };
+        result.source_exhausted.insert("runs".to_string(), true);
+        crate::background::async_retention::increment(&mut result.skipped, "recent");
+        mutate(&mut result);
+        crate::background::async_retention::append_maintenance_log(
+            &crate::background::async_retention::maintenance_root(async_root),
+            &result,
+            1_700_000_000_000,
+            &["run:a".to_string()],
+        )
+        .await
+        .expect("append the maintenance line");
+    }
+
+    #[tokio::test]
+    async fn the_async_retention_check_reports_the_last_pass() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_last_pass(dir.path(), |_| {}).await;
+
+        let check = check_async_retention(dir.path()).await;
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert_eq!(check.name, CHECK_ASYNC_RETENTION);
+        assert!(check.detail.contains("scanned 12"), "{}", check.detail);
+        assert!(check.detail.contains("2 run(s)"), "{}", check.detail);
+        assert!(check.detail.contains("1 recent"), "{}", check.detail);
+        assert!(check.remedy.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_async_retention_check_warns_on_a_pass_that_recorded_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_last_pass(dir.path(), |result| {
+            result.errored_candidates = 1;
+            result
+                .errors
+                .push("permission denied (os error 13)".to_string());
+        })
+        .await;
+
+        let check = check_async_retention(dir.path()).await;
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(
+            check.detail.contains("permission denied"),
+            "{}",
+            check.detail
+        );
+        let remedy = check.remedy.expect("a Warn always carries a remedy");
+        assert!(
+            remedy.contains(crate::background::async_retention::MAINTENANCE_LOG_NAME),
+            "the remedy must name the log an operator has to open: {remedy}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_async_retention_check_warns_when_another_instance_held_the_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_last_pass(dir.path(), |result| {
+            result.acquired = false;
+            result.scanned = 0;
+            result.deleted_runs = 0;
+            result.reaped_tombstones = 0;
+            result.repaired_runs = 0;
+            result.skipped.clear();
+            crate::background::async_retention::increment(&mut result.skipped, "lock-busy");
+        })
+        .await;
+
+        let check = check_async_retention(dir.path()).await;
+        assert_eq!(
+            check.status,
+            CheckStatus::Warn,
+            "a pass that did nothing because another instance was sweeping must not read as a \
+             healthy zero"
+        );
+        let remedy = check.remedy.expect("a Warn always carries a remedy");
+        assert!(
+            remedy.contains(crate::background::async_retention::LOCK_NAME),
+            "{remedy}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_maintenance_log_is_ok_not_warn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let check = check_async_retention(dir.path()).await;
+        assert_eq!(
+            check.status,
+            CheckStatus::Ok,
+            "a fresh install, or a session younger than the 60 s schedule delay, is not actionable"
+        );
+        assert!(check.remedy.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_maintenance_line_warns_and_never_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let maintenance_root = crate::background::async_retention::maintenance_root(dir.path());
+        tokio::fs::create_dir_all(&maintenance_root)
+            .await
+            .expect("mkdir");
+        tokio::fs::write(
+            crate::background::async_retention::maintenance_log_path(&maintenance_root),
+            b"{not json\n".as_slice(),
+        )
+        .await
+        .expect("write");
+
+        let check = check_async_retention(dir.path()).await;
+        assert_eq!(
+            check.status,
+            CheckStatus::Warn,
+            "a diagnostic that cannot read its own diagnostic is not a broken installation"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_doctor_report_order_is_unchanged_and_the_new_check_is_appended() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runner = DoctorRunner {
+            async_root: dir.path().join("async"),
+            config_json_path: dir.path().join("config.json"),
+            discovery_config: empty_discovery_config(),
+            provider_catalog_path: None,
+        };
+
+        let report = runner.run().await;
+        let names: Vec<&str> = report.checks.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                CHECK_BINARY_RESOLUTION,
+                CHECK_TEMP_DIR_WRITABLE,
+                CHECK_CONFIG_JSON,
+                CHECK_AGENT_DISCOVERY,
+                CHECK_CHAIN_DISCOVERY,
+                CHECK_PROVIDER_CATALOG_FRESHNESS,
+                CHECK_MODEL_SCOPE,
+                CHECK_ASYNC_RETENTION,
+            ],
+            "indices 0..6 keep their meaning; the new check is APPENDED at index 7"
+        );
+        assert!(report.find(CHECK_ASYNC_RETENTION).is_some());
+    }
+
+    #[tokio::test]
+    async fn the_inventory_report_renders_what_the_last_pass_did() {
+        // The user-facing half: `/subagents-doctor` renders an INVENTORY, and without this block an
+        // operator has no way to tell whether retention is running in this directory at all.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_last_pass(dir.path(), |_| {}).await;
+        let retention = AsyncRetentionDoctor::resolve(
+            &crate::background::async_retention::maintenance_root(dir.path()),
+        )
+        .await;
+
+        let discovered = AgentDiscoveryResult::default();
+        let report = build_doctor_report(&DoctorReportInput {
+            cwd: Path::new("/tmp/project"),
+            async_available: true,
+            configured_session_dir: "not configured".to_string(),
+            current_session_file: None,
+            current_session_id: None,
+            session_error: None,
+            temp_root_dir: dir.path().to_path_buf(),
+            async_runs_dir: dir.path().to_path_buf(),
+            results_dir: dir.path().to_path_buf(),
+            chain_runs_dir: dir.path().to_path_buf(),
+            discovered: Ok(&discovered),
+            run_fanout: run_fanout_default(),
+            active_async_capacity: ActiveAsyncCapacityDoctor::default(),
+            async_retention: retention,
+        });
+
+        assert!(report.contains("Async retention"), "{report}");
+        assert!(report.contains("scanned 12"), "{report}");
+        assert!(
+            report.contains("reaped 2 run(s) and 1 tombstone(s)"),
+            "{report}"
+        );
+        assert!(report.contains("- kept: 1 recent"), "{report}");
+        assert!(
+            report.contains("the whole async root was covered this pass"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn a_scope_that_has_never_swept_says_so_and_still_states_the_policy() {
+        let lines = AsyncRetentionDoctor::NeverRun.lines();
+        assert!(lines[0].contains("never"), "{lines:?}");
+        assert!(
+            lines[1].contains("30 days") && lines[1].contains("100 candidates"),
+            "an operator who has never seen a pass still needs to know what one would do: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn the_rendered_skip_summary_is_deterministic() {
+        let mut skipped = std::collections::BTreeMap::new();
+        skipped.insert("recent".to_string(), 3);
+        skipped.insert("non-terminal".to_string(), 1);
+        assert_eq!(
+            format_skip_summary(&skipped).as_deref(),
+            Some("1 non-terminal, 3 recent")
+        );
+        assert_eq!(
+            format_skip_summary(&std::collections::BTreeMap::new()),
+            None
+        );
     }
 
     #[cfg(unix)]
@@ -1790,8 +2330,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[cfg(unix)]
     async fn doctor_runner_reports_exactly_the_expected_warn_fail_subset_a_sa_16() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().expect("real tempdir");
 
         // A healthy, discoverable agent (no model override) so (d) is Ok and (f) is Ok
@@ -1801,11 +2339,21 @@ mod tests {
         // Misconfiguration 1: config.json is simply absent (R-SA-131/A-SA-16's own fixture wording).
         let config_json_path = dir.path().join("config.json"); // never written
 
-        // Misconfiguration 2: the async-root temp-scope directory is unwritable (chmod 0o500).
-        let async_root = dir.path().join("unwritable-async-root");
-        std::fs::create_dir_all(&async_root).expect("mkdir");
-        std::fs::set_permissions(&async_root, std::fs::Permissions::from_mode(0o500))
-            .expect("chmod read-only");
+        // Misconfiguration 2: the async-root temp-scope directory cannot be used as a directory at
+        // all — its path is already a regular FILE, which `create_dir_all` refuses for EVERY uid.
+        //
+        // The original fixture here was a chmod 0o500 directory, which root bypasses: under uid 0
+        // — containers and CI commonly are — the whole strict-subset assertion below was skipped,
+        // so this end-to-end test asserted nothing beyond the report's length in exactly the
+        // environments it usually runs in. The chmod fixture is still exercised, for non-root, by
+        // `temp_dir_writable_fails_for_a_real_read_only_directory`, and its uid-independent twin
+        // by `temp_dir_writable_fails_when_the_root_path_is_not_a_directory`.
+        let async_root = dir.path().join("occupied-async-root");
+        std::fs::write(
+            &async_root,
+            b"a regular file sitting where the temp-scope root must go",
+        )
+        .expect("write the blocking file");
 
         let discovery_config = AgentDiscoveryConfig {
             project_agent_dirs: vec![dir.path().join("agents")],
@@ -1821,21 +2369,12 @@ mod tests {
 
         let report = runner.run().await;
 
-        // Restore permissions so the tempdir guard can clean up regardless of assertion outcome.
-        std::fs::set_permissions(&async_root, std::fs::Permissions::from_mode(0o700))
-            .expect("restore permissions for cleanup");
-
         assert_eq!(
             report.checks.len(),
-            7,
-            "all six R-SA-131 checks plus SUBA-035's model-scope diagnostic must always be present"
+            8,
+            "all six R-SA-131 checks plus SUBA-035's model-scope diagnostic and SCOPE_14's \
+             async-retention check must always be present"
         );
-
-        if running_as_root() {
-            // Root bypasses the unwritable-directory fixture; skip the strict subset assertion in
-            // that environment (still asserts the OTHER checks' behavior below).
-            return;
-        }
 
         // `CHECK_BINARY_RESOLUTION` is excluded from this strict-subset assertion: under `cargo
         // test`, `std::env::current_exe()` (R-SA-045 tier 2) resolves to the TEST HARNESS binary
@@ -1940,6 +2479,8 @@ mod tests {
             chain_runs_dir: chain_runs.clone(),
             discovered: Ok(&discovered),
             run_fanout: run_fanout_default(),
+            active_async_capacity: ActiveAsyncCapacityDoctor::default(),
+            async_retention: AsyncRetentionDoctor::NeverRun,
         };
 
         let report = build_doctor_report(&input);
@@ -2042,6 +2583,8 @@ mod tests {
             chain_runs_dir: PathBuf::from("/tmp/subagents/chain-runs"),
             discovered: Ok(&discovered),
             run_fanout: run_fanout_default(),
+            active_async_capacity: ActiveAsyncCapacityDoctor::default(),
+            async_retention: AsyncRetentionDoctor::NeverRun,
         };
 
         let report = build_doctor_report(&input);
@@ -2086,6 +2629,8 @@ mod tests {
             chain_runs_dir: PathBuf::from("/tmp/subagents/chain-runs"),
             discovered: Err("malformed subagents settings: agentOverrides must be an object"),
             run_fanout: run_fanout_default(),
+            active_async_capacity: ActiveAsyncCapacityDoctor::default(),
+            async_retention: AsyncRetentionDoctor::NeverRun,
         };
 
         let report = build_doctor_report(&input);
@@ -2144,6 +2689,8 @@ mod tests {
             chain_runs_dir: chain_runs,
             discovered: Ok(&discovered),
             run_fanout: run_fanout_default(),
+            active_async_capacity: ActiveAsyncCapacityDoctor::default(),
+            async_retention: AsyncRetentionDoctor::NeverRun,
         };
 
         let report = build_doctor_report(&input);

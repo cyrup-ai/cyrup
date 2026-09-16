@@ -1208,6 +1208,7 @@ mod tests {
         fn write_result(&self, run_id: &RunId, session_id: Option<&str>) {
             let paths = self.paths(run_id);
             let result = crate::background::ResultFile {
+                schedule_origin: None,
                 id: run_id.clone(),
                 run_id: run_id.clone(),
                 agent: "worker".to_string(),

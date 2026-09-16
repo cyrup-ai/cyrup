@@ -422,18 +422,19 @@ async fn repair_from_result(
 
     crate::background::atomic::write_atomic_json(&paths.status, &repaired).await?;
 
-    // The repaired record is terminal, so it must enter the terminal-run index exactly as a
-    // healthy runner's own write would (pi `updateTerminalRunIndex` via `updateActiveRunIndex`,
-    // `active-run-index.ts:100-108`) — or a run whose runner died is invisible to the index while
-    // being perfectly visible to the full scan. Best-effort: the index is advisory.
+    // The repaired record is terminal, so it must enter the index exactly as a healthy runner's
+    // own write would (pi `updateActiveRunIndex`, `stale-run-reconciler.ts:286`) — or a run whose
+    // runner died is invisible to the index while being perfectly visible to the full scan.
+    // SCOPE_9/SUBTASK5 routes it through the active-run index, so the dead runner's stale ACTIVE
+    // marker is released in the same call that files the terminal one. Best-effort: advisory.
     if let Err(err) =
-        crate::background::terminal_run_index::update_terminal_run_index(&paths.run_dir, &repaired)
+        crate::background::active_run_index::update_active_run_index(&paths.run_dir, &repaired)
             .await
     {
         tracing::warn!(
             run_id = %repaired.run_id,
             error = %err,
-            "failed to write terminal-run index marker; the run's own terminal record is unaffected"
+            "failed to update the async run index; the run's own terminal record is unaffected"
         );
     }
 
@@ -546,15 +547,16 @@ async fn synthesize_failure(
     crate::background::atomic::write_atomic_json(&paths.status, status).await?;
 
     // As in `repair_from_result` above: a synthesized terminal state indexes like a real one, so
-    // the session that launched this stale-dead run can still find it through the index.
+    // the session that launched this stale-dead run can still find it through the index — and its
+    // active marker, which the dead runner never got to release, goes with it (pi
+    // `updateActiveRunIndex`, `stale-run-reconciler.ts:382`).
     if let Err(err) =
-        crate::background::terminal_run_index::update_terminal_run_index(&paths.run_dir, status)
-            .await
+        crate::background::active_run_index::update_active_run_index(&paths.run_dir, status).await
     {
         tracing::warn!(
             run_id = %status.run_id,
             error = %err,
-            "failed to write terminal-run index marker; the run's own terminal record is unaffected"
+            "failed to update the async run index; the run's own terminal record is unaffected"
         );
     }
 
@@ -588,6 +590,10 @@ async fn synthesize_failure(
         results: synthesized_results,
         workflow_children: None,
         workflow_receipt: None,
+        // A repair synthesized from `status.json`, which carries no origin. Reading one back would
+        // need the schedule store, and this function reconciles on a DEAD runner's behalf in a
+        // process that may share none of its configuration.
+        schedule_origin: None,
     };
 
     // pi `stale-run-reconciler.ts:283` writes the repaired result only `if (repair.result.sessionId)`.
@@ -702,7 +708,15 @@ fn synthesize_step_results(status: &RunStatus, diagnostic: &str) -> Vec<crate::e
         .collect()
 }
 
-fn placeholder_result(
+/// A [`crate::exec::SingleResult`] for a run that produced no readable child of its own.
+///
+/// `pub(crate)` since SUBA-016: a scheduled workflow fire has exactly the same problem — the
+/// workflow's answer is its RETURN VALUE, not a child's transcript, so its published result would
+/// otherwise carry no children at all and the completion notice would render `(no output)` for a
+/// run that succeeded. That caller takes this placeholder and overwrites `exit_code`,
+/// `final_output`, `output_state` and `error`, which is strictly better than a second
+/// forty-field literal that would drift from this one the next time a field is added.
+pub(crate) fn placeholder_result(
     agent: &str,
     mode: crate::background::RunMode,
     diagnostic: &str,
@@ -912,6 +926,7 @@ mod tests {
             .expect("write status");
 
         let result = ResultFile {
+            schedule_origin: None,
             id: run_id.clone(),
             run_id: run_id.clone(),
             agent: "researcher".to_string(),
@@ -977,6 +992,7 @@ mod tests {
             .expect("write status");
 
         let result = ResultFile {
+            schedule_origin: None,
             id: run_id.clone(),
             run_id: run_id.clone(),
             agent: "researcher".to_string(),
@@ -1042,6 +1058,7 @@ mod tests {
             .expect("write status");
 
         let result = ResultFile {
+            schedule_origin: None,
             id: run_id.clone(),
             run_id,
             agent: "researcher".to_string(),

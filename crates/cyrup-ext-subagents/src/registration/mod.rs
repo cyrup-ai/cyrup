@@ -135,6 +135,31 @@ pub struct SubagentExtensionConfig {
     /// default never rewrites anything.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_exclusions: Option<ModelExclusionsConfig>,
+    /// SCOPE_9 — pi `ExtensionConfig.maxActiveAsyncRunsPerSession?: number` (validated
+    /// `extension/config.ts:164-168` @v0.66.0, resolved by `resolveMaxActiveAsyncRunsPerSession`,
+    /// `active-async-capacity.ts:80-83`): the cap on how many TOP-LEVEL async runs one
+    /// orchestrator SESSION may have in flight at once.
+    ///
+    /// `None` (the key absent) and `Some(0)` BOTH mean unlimited — upstream's resolver maps a
+    /// non-integer, a negative AND `0` to `undefined`, and `acquireActiveAsyncCapacity` returns
+    /// `undefined` (claims nothing at all) for an `undefined` limit. Same asymmetry as
+    /// [`Self::max_subagent_spawns_per_session`] above, opposite to
+    /// [`Self::max_subagent_spawns_per_run`]; all three are documented at their resolvers.
+    ///
+    /// Distinct from [`Self::global_concurrency_limit`], which is a PROCESS-wide cap on concurrent
+    /// child processes across every run mode. This one is per session, counts only top-level async
+    /// runs, and is durable on disk — which is what lets two cyrup instances sharing a working
+    /// directory stop consuming each other's headroom.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_active_async_runs_per_session: Option<u32>,
+    /// SCOPE_9 — pi `ExtensionConfig.capacity?: { abandonedSlotReleaseAfterMs?: number | false }`
+    /// (validated `extension/config.ts:86-98` @v0.66.0).
+    ///
+    /// A nested object rather than a flat key, matching upstream's shape and this struct's own
+    /// house style for optional knobs ([`Self::parallel`], [`Self::chain`],
+    /// [`Self::model_exclusions`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<CapacityConfig>,
     /// Proactive skill-subagent suggestion config — pi
     /// `ExtensionConfig.proactiveSkillSubagents?: ProactiveSkillSubagentsConfig | false`
     /// (shared/types.ts:1726-1731 interface, :1779 field): an object of tuning knobs, or the literal `false` to disable the
@@ -330,6 +355,13 @@ pub struct SubagentExtensionConfig {
     /// accept an unknown key inside the block, and upstream refuses one loudly.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub missions: Option<crate::missions::MissionStoreConfig>,
+    /// SUBA-016 — pi `ExtensionConfig.scheduledRuns?: ScheduledRunsConfig`
+    /// (`shared/types.ts:2501-2506`, field `:2651` @v0.68.0): durable schedules.
+    ///
+    /// `None` (the key omitted) ENABLES scheduled runs with every default — see
+    /// [`Self::scheduled_runs_enabled`] for why that is upstream's polarity and not an oversight.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheduled_runs: Option<ScheduledRunsConfig>,
     /// SUBA-059 — pi `ExtensionConfig.artifactConfig?: Pick<ArtifactConfig, "cleanupDays">`
     /// (`shared/types.ts:1859` @v0.47.1, *"Artifact cleanup retention. Set cleanupDays to 0 to
     /// disable cleanup."*), read at `extension/index.ts:369-370` as
@@ -473,6 +505,11 @@ impl Default for SubagentExtensionConfig {
             control: None,
             chain: None,
             model_exclusions: None,
+            // Absent, not `Some(0)`: `0` and absent both resolve to "unlimited", but only absent
+            // says the operator never expressed an opinion — and an absent key is what keeps
+            // `acquire` from touching the filesystem at all on a stock install.
+            max_active_async_runs_per_session: None,
+            capacity: None,
             proactive_skill_subagents: None,
             default_session_dir: None,
             spawn_command: None,
@@ -488,6 +525,7 @@ impl Default for SubagentExtensionConfig {
             fleet_view_placement: None,
             wait_tool: None,
             missions: None,
+            scheduled_runs: None,
             artifact_config: None,
             artifact_dir: None,
             authority_policy: None,
@@ -521,6 +559,47 @@ impl SubagentExtensionConfig {
     /// Upstream's typed refusals — see [`authority::validate_authority_policy`].
     pub fn validate_authority_policy(raw: &serde_json::Value) -> Result<(), String> {
         authority::validate_authority_policy(raw.get("authorityPolicy"), "config.authorityPolicy")
+    }
+
+    /// SUBA-016 — pi `scheduledRunsEnabled` (`runs/background/scheduled-runs.ts:96`):
+    /// `config.scheduledRuns?.enabled !== false`.
+    ///
+    /// Read through this accessor, NEVER inline. The polarity is a TRI-STATE and it is the
+    /// opposite of the obvious one: absent and `true` both ENABLE, and only the literal `false`
+    /// disables. That is why [`ScheduledRunsConfig::enabled`] is an `Option<bool>` rather than the
+    /// plain `bool` [`Self::async_by_default`] uses - a plain `bool` with `#[serde(default)]`
+    /// would disable scheduled runs by default for every existing config on disk, silently.
+    #[must_use]
+    pub fn scheduled_runs_enabled(&self) -> bool {
+        self.scheduled_runs
+            .as_ref()
+            .and_then(|config| config.enabled)
+            != Some(false)
+    }
+
+    /// SUBA-016 - pi `resolveMaxPending` (`scheduled-runs.ts:387-390`): an integer `>= 1`, else
+    /// [`crate::background::scheduled_runs::DEFAULT_MAX_PENDING`].
+    #[must_use]
+    pub fn scheduled_runs_max_pending(&self) -> u32 {
+        self.scheduled_runs
+            .as_ref()
+            .and_then(|config| config.max_pending)
+            .filter(|value| *value >= 1)
+            .unwrap_or(crate::background::scheduled_runs::DEFAULT_MAX_PENDING)
+    }
+
+    /// SUBA-016 - pi `deps.storeRoot` (`scheduled-runs.ts:100`), the third parameter of
+    /// `scheduledRunStorePath`.
+    ///
+    /// Configuring one also flips `ScheduleStore::project_cwd` to `None` (pi `:960`), which
+    /// DISABLES `assertScheduleRoot`'s containment checks - the root is then a sandbox the
+    /// operator chose, and there is no project to contain it within. That coupling is recorded
+    /// here, at the key that causes it, because the store itself cannot see the config.
+    #[must_use]
+    pub fn scheduled_runs_store_root(&self) -> Option<std::path::PathBuf> {
+        self.scheduled_runs
+            .as_ref()
+            .and_then(|config| config.store_root.clone())
     }
 
     /// SUBA-048 — the artifact-directory preference this process resolves runs against: pi
@@ -658,6 +737,22 @@ pub struct HookSpec {
 // Nested config objects (pi shared/types.ts:829-882) — the shapes pi's ExtensionConfig nests
 // -------------------------------------------------------------------------------------------
 
+/// SUBA-016 - pi `ScheduledRunsConfig` (`shared/types.ts:2501-2506` @v0.68.0).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledRunsConfig {
+    /// pi `enabled?` (`:2502`) - a TRI-STATE. See
+    /// [`SubagentExtensionConfig::scheduled_runs_enabled`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// pi `maxPending?` (`:2503`) - the cap on schedules with pending work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_pending: Option<u32>,
+    /// pi `storeRoot?` (`:2505`): *"Absolute or `~/` root for per-project durable schedules."*
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_root: Option<std::path::PathBuf>,
+}
+
 /// pi `TopLevelParallelConfig` (shared/types.ts:1715-1718): the nested `parallel: { maxTasks?, concurrency? }`
 /// object of [`SubagentExtensionConfig`]. Both fields are optional; an omitted field defers to the
 /// hardcoded pi default via [`SubagentExtensionConfig::parallel_max_tasks`] /
@@ -684,6 +779,101 @@ pub struct ModelExclusionsConfig {
     /// store, with upstream's own config-layer message.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_ttl_ms: Option<i64>,
+}
+
+/// SCOPE_9 — pi `ExtensionConfig.capacity` (`extension/config.ts:86-98` @v0.66.0): the nested
+/// `capacity: { abandonedSlotReleaseAfterMs? }` object of [`SubagentExtensionConfig`].
+///
+/// Validated by [`crate::background::active_async_capacity::validate_capacity_config`] before the
+/// extension finishes coming up, with upstream's own config-layer message — the same shape
+/// [`ModelExclusionsConfig`] has.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CapacityConfig {
+    /// pi `capacity.abandonedSlotReleaseAfterMs`: how long a FAILED run whose runner pid is
+    /// confirmed gone may sit on its capacity slot before reconciliation reclaims it — or the
+    /// literal JSON `false`, meaning never reclaim on that ladder at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub abandoned_slot_release_after_ms: Option<AbandonedSlotRelease>,
+}
+
+/// SCOPE_9 — the THREE-STATE `capacity.abandonedSlotReleaseAfterMs` value.
+///
+/// `Option<AbandonedSlotRelease>` is genuinely three states, and collapsing any two of them is the
+/// bug this type exists to make unrepresentable:
+///
+/// | JSON | Rust | meaning |
+/// |---|---|---|
+/// | key absent | `None` | unset — falls through to `DEFAULT_ABANDONED_SLOT_RELEASE_AFTER_MS` (20 min) |
+/// | `false` | `Some(Never)` | the abandoned-timeout ladder is DISABLED; an unknown-proof slot is kept forever |
+/// | `900000` | `Some(After(900_000))` | an explicit threshold in milliseconds |
+///
+/// An `Option<Duration>` cannot express `Never`, and a `0` sentinel would collide with upstream's
+/// "not a positive integer ⇒ use the default" rung (`active-async-capacity.ts:87`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AbandonedSlotRelease {
+    /// JSON `false` — pi's `value === false` arm (`active-async-capacity.ts:86`). NEVER release an
+    /// abandoned slot on the timeout ladder.
+    Never,
+    /// JSON integer milliseconds.
+    After(i64),
+}
+
+/// Emits `false` or the bare number — never an object, never a tagged variant.
+///
+/// Hand-written because `#[serde(untagged)]` on an enum with a unit variant cannot produce the
+/// literal `false`. The in-crate precedent for a hand-written pair is
+/// [`crate::background::terminal_run_index::TerminalIndexVersion`].
+impl serde::Serialize for AbandonedSlotRelease {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Never => serializer.serialize_bool(false),
+            Self::After(ms) => serializer.serialize_i64(*ms),
+        }
+    }
+}
+
+/// Deserializes **through** the validator, the discipline
+/// [`crate::identity::SessionId`]'s own `Deserialize` states: a shape upstream would reject is a
+/// hard error here rather than a silently-normalized value.
+///
+/// `true` is an error because upstream's guard is `value !== false` — the literal `true` falls into
+/// its "not a number" arm and is refused by `validateCapacityConfig`
+/// (`extension/config.ts:89-97`), never silently treated as "enabled".
+impl<'de> serde::Deserialize<'de> for AbandonedSlotRelease {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = AbandonedSlotRelease;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("`false` or an integer number of milliseconds")
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                if value {
+                    Err(E::custom(
+                        "config.capacity.abandonedSlotReleaseAfterMs must be false or an integer",
+                    ))
+                } else {
+                    Ok(AbandonedSlotRelease::Never)
+                }
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(AbandonedSlotRelease::After(value))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                i64::try_from(value)
+                    .map(AbandonedSlotRelease::After)
+                    .map_err(|_| E::custom("abandonedSlotReleaseAfterMs does not fit in an i64"))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
 }
 
 /// pi `ExtensionChainConfig` (shared/types.ts:1720-1724): the nested `chain: { dynamicFanout?: { maxItems? } }`

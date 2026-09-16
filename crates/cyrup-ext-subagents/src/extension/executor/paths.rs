@@ -897,6 +897,7 @@ mod tests {
                     usage_budget: None,
                     turn_budget: None,
                     permission_rules: None,
+                    transfer_from: None,
                     steps: vec![step],
                     mode: RunMode::Single,
                     session_file: None,

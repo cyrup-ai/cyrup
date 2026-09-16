@@ -3997,6 +3997,7 @@ mod tests {
     fn imported_state_propagates_stopped_ahead_of_exit_code_and_pause() {
         fn result_with(state: RunState, child: crate::exec::SingleResult) -> ResultFile {
             ResultFile {
+                schedule_origin: None,
                 id: RunId::from_token("importstop01"),
                 run_id: RunId::from_token("importstop01"),
                 agent: "worker".to_string(),
@@ -4792,6 +4793,7 @@ mod tests {
             .await
             .expect("mkdir results_dir");
         let result = ResultFile {
+            schedule_origin: None,
             id: run_id.clone(),
             run_id: run_id.clone(),
             agent: "researcher".to_string(),
@@ -4866,6 +4868,7 @@ mod tests {
             .await
             .expect("mkdir results_dir");
         let result = ResultFile {
+            schedule_origin: None,
             id: run_id.clone(),
             run_id: run_id.clone(),
             agent: "researcher".to_string(),
@@ -5012,6 +5015,7 @@ mod tests {
         children: Vec<SingleResult>,
     ) -> ResultFile {
         ResultFile {
+            schedule_origin: None,
             id: run_id.clone(),
             run_id: run_id.clone(),
             agent: "root-agent".to_string(),

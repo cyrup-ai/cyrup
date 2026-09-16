@@ -18,6 +18,14 @@
 //! than either input. That is the whole security property, and without it — the state cyrup was in
 //! — a child could be granted a capability set wider than its parent's simply by asking.
 //!
+//! It also bounds one thing that is not a run at all: a SCHEDULE. A ceilinged session may not
+//! persist a scheduled run, because the schedule would outlive the handle that registered the
+//! ceiling and fire under no ceiling whatsoever — the bound would be escaped simply by waiting.
+//! [`crate::background::scheduled_runs::ceiling_gate`] consults
+//! [`resolve_current_capability_ceiling`] before a schedule may be written, and refuses on any
+//! ceiling of any shape. It is a CREATE-time gate only: winding an already-running schedule down
+//! must keep working while a ceiling is active, or the schedule wedges forever.
+//!
 //! # Where it lives
 //!
 //! Two places, exactly as upstream:

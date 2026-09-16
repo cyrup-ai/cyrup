@@ -201,6 +201,7 @@ mod tests {
             .await
             .expect("write target status");
         let target_result = ResultFile {
+            schedule_origin: None,
             id: target_id.clone(),
             run_id: target_id.clone(),
             agent: "researcher".to_string(),

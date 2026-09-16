@@ -137,6 +137,11 @@ pub use receipt::{
     resolve_workflow_receipt_resume, resolve_workflow_receipt_resume_entry, workflow_receipt_path,
     write_workflow_receipt,
 };
+/// pi `normalizeWorkflowArgs` (`workflow-resources.ts:128-138`), named here as upstream names it
+/// at its second call site — a persisted schedule's `target.args`
+/// (`runs/background/scheduled-runs.ts:293`), read by
+/// [`crate::background::scheduled_runs::parse_schedule_target`].
+pub(crate) use resources::normalize_args as normalize_workflow_args;
 pub use resources::{
     ResolvedWorkflowResource, WorkflowResourceDefinition, WorkflowResourceExpansion,
     WorkflowResourceRegistration, WorkflowResourceRegistry, WorkflowResourceResolution,

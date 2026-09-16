@@ -9,19 +9,27 @@
 //!
 //! Upstream's caller is the `onDetachedExit` closure (`subagent-executor.ts:3951-3976`), fired by
 //! `execution.ts:2364` when a child detached through `detachForeground` eventually terminates.
-//! **cyrup has none of that machinery**: [`crate::exec::SingleResult::detached`] is a FLAG on a
-//! returned result (set by the drive loop when a blocking `contact_supervisor` ask is surfaced),
-//! not a "return the tool call early and keep the child running" mechanism, and nothing fires on
-//! the detached child's later exit. Building that mechanism is foreground-lifecycle work this task
-//! does not own.
+//! **cyrup's equivalent moment is earlier, not absent.** `detachForeground` returns the tool call
+//! early and leaves the child running, so upstream has to wait for an exit it no longer drives;
+//! cyrup's drive loop keeps driving a detached child to its real exit — a blocking
+//! `contact_supervisor` ask fires `spawn_clarify` and the loop CONTINUES
+//! (`exec/drive_attempt.rs:345-367`), the answer riding back over the broker rather than this
+//! stdout pipe — so [`crate::exec::SingleResult::detached`] arrives on an ALREADY-SETTLED result.
+//! Upstream's two moments ("the workflow parks at paused", "its detached child exits") therefore
+//! collapse into one, at the foreground workflow's settlement:
+//! [`crate::extension::executor::workflow::WorkflowRunHost`] records each detached child's settled
+//! result as it is returned from `launch`, `extension/tool/routing.rs`'s failure arm parks a
+//! `detached-child` rejection at `Paused` (pi's own shape, `subagent-executor.ts:5757-5763`), and
+//! its `reconcile_detached_workflow_children` drives this reconciler over each of them.
 //!
 //! So the reconciler's input is the run DIRECTORY plus a settled child result. Every value
 //! upstream reads off in-process state has a durable source — `state.asyncJobs.get(id)?.asyncDir`
 //! becomes [`RunPaths`], `readStatus(asyncDir)` becomes
 //! [`read_status_file`](crate::background::control::read_status_file), the result file becomes
 //! [`RunPaths::resolve_result`] — and upstream itself already falls back to the disk path when the
-//! job is absent, so the durable source is the PRIMARY, not a degradation. Wiring this to a future
-//! detach hook is then a one-line call rather than a rewrite.
+//! job is absent, so the durable source is the PRIMARY, not a degradation. The caller supplies
+//! only what disk genuinely cannot hold: the child run id (a FOREGROUND child writes no
+//! `ResultFile`, so nothing on disk names it), its `SingleResult`, and the script trace.
 //!
 //! The one piece that cannot come off disk is `state.foregroundControls`, which the identity
 //! back-fill (`identity.rs`) needs. SCOPE_8 §Y-1 named two shapes; this module takes **(a)** — the
@@ -169,18 +177,18 @@ pub(crate) struct DetachedWorkflowChildCompletion<'a> {
 /// be able to demote a status that was already promoted, which it can only do if classification
 /// and the receipt pass both happen before the plan is composed.
 ///
-/// `#[cfg_attr(not(test), allow(dead_code))]`: cyrup has no detach hook to fire this (see the
-/// module doc), so this function's own tests are its only callers until a foreground
-/// detach-lifecycle task builds one. The attribute is on the DRIVER precisely so it can come OFF
-/// [`crate::background::runner_main::apply_workflow_settlement_plan`], which this function is the
-/// first production caller of.
+/// **The detach hook exists.** Its production caller is
+/// `SubagentTool::reconcile_detached_workflow_children` (`extension/tool/routing.rs`), driven from
+/// the workflow settlement arm that parks a detached-child rejection at `Paused` — which is why the
+/// `#[cfg_attr(not(test), allow(dead_code))]` that used to sit here is gone, along with the one it
+/// had already taken off
+/// [`crate::background::runner_main::apply_workflow_settlement_plan`].
 ///
 /// # Errors
 ///
 /// [`SubagentError::Management`] when a settlement invariant refuses (the settlement helpers yield
 /// `String`), or when the reconciled result has no session to be attributed to; [`SubagentError::Spawn`]
 /// for an I/O fault reading the status or the prior result file.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn reconcile_detached_workflow_child_completion(
     input: DetachedWorkflowChildCompletion<'_>,
 ) -> Result<bool, SubagentError> {
@@ -432,11 +440,13 @@ async fn publish_reconciled_settlement(
         .await
         .map_err(SubagentError::Spawn)?;
 
-    // 2 — `:256`'s cyrup counterpart. Self-gated on `is_indexed_state` and on `session_id`, so it
-    // is called unconditionally with no branch of our own, and best-effort exactly as
-    // `finish.rs:352-366` treats it: an advisory index that failed to write must never fail the
+    // 2 — `:256`'s cyrup counterpart, now through SCOPE_9/SUBTASK5's router (pi
+    // `updateActiveRunIndex`, `workflow-detach-reconcile.ts:255`) — the exact line SCOPE_8 flagged
+    // and was forbidden to change. Self-gated on `is_indexed_state` and on `session_id` inside the
+    // terminal writer, so it is called unconditionally with no branch of our own, and best-effort
+    // exactly as `finish.rs` treats it: an advisory index that failed to write must never fail the
     // settlement that was completing.
-    if let Err(error) = crate::background::terminal_run_index::update_terminal_run_index(
+    if let Err(error) = crate::background::active_run_index::update_active_run_index(
         &input.run_paths.run_dir,
         settled,
     )
@@ -565,11 +575,14 @@ async fn append_event(
 
 /// The published payload (`:232-247`), narrowed to the fields [`ResultFile`] actually has.
 ///
-/// Six upstream keys have no home and are NOT invented here (SCOPE_8 §W-7): `toolCallId`,
+/// Five upstream keys have no home and are NOT invented here (SCOPE_8 §W-7): `toolCallId`,
 /// `asyncDir`, `workflow` (script state), `reconciledFromDetachedChild` (which survives on the
-/// completion event's `extra`), `scheduleOrigin` (no field anywhere in the crate) and `summary`.
-/// Widening `ResultFile` is out of scope — its wire shape is read by `wait`, the results watcher
-/// and the completion projector.
+/// completion event's `extra`) and `summary`. Widening [`ResultFile`] for those stays out of
+/// scope — its wire shape is read by `wait`, the results watcher and the completion projector.
+///
+/// SUBA-016 UPDATE: the sixth, `scheduleOrigin`, is no longer among them —
+/// [`ResultFile::schedule_origin`] exists, and this function CARRIES IT OVER from the payload it
+/// supersedes rather than dropping it.
 fn reconciled_result_file(
     plan: &WorkflowSettlementPlan,
     settled: &RunStatus,
@@ -609,6 +622,10 @@ fn reconciled_result_file(
         results: children,
         workflow_children: workflow_fields.workflow_children,
         workflow_receipt: workflow_fields.workflow_receipt,
+        // CARRIED OVER, never dropped: this payload SUPERSEDES the one already on disk, so a
+        // reconciled scheduled run that lost its origin here would stop naming its schedule in
+        // the completion notice exactly when the run needed explaining most.
+        schedule_origin: existing.and_then(|existing| existing.schedule_origin.clone()),
     }
 }
 

@@ -179,6 +179,23 @@ impl SubagentExecutor {
             .await
             .map_err(|e| format!("Failed to dismiss async run {run_id_text}: {e}"))?;
 
+        // SCOPE_9/SUBTASK5 — pi `updateActiveRunIndex(asyncDir, "complete")`
+        // (`async-dismiss-action.ts:77`): a dismissed run is gone from every active listing
+        // (`list_active_runs` already drops it on the marker), so leaving its active-run marker
+        // behind would make the index disagree with the listing it exists to accelerate. The
+        // RELEASE alone is ported, not a synthesized terminal state: dismissal terminates nothing
+        // (see `RunStatus::display_dismissed_at`), so nothing terminal may be filed for it.
+        // Best-effort and logged — the dismissal itself has already been recorded.
+        if let Err(error) =
+            crate::background::active_run_index::release_active_run_index(&paths.run_dir).await
+        {
+            tracing::warn!(
+                run_id = %run_id_text,
+                %error,
+                "failed to release the async active-run index marker for a dismissed run"
+            );
+        }
+
         // pi `:67-74`: re-reconcile and refuse if the run turned out not to be running after all.
         //
         // Upstream's `reconcileAsyncRun` returns `status: null` for a record carrying the marker
@@ -201,9 +218,6 @@ impl SubagentExecutor {
         // pi `:76-79`: `state.asyncJobs.delete(...)` / `state.fleetJobs?.delete(...)`. cyrup's
         // single in-memory job map is the [`JobTracker`]; the fleet widget has no separate map of
         // its own — it renders from `list_active_runs`, which already drops the dismissed run.
-        //
-        // (Upstream's `updateActiveRunIndex(asyncDir, "complete")` at `:75` has no counterpart:
-        // `background/active-run-index.ts` is unported crate-wide, so there is no index to update.)
         //
         // pi `:76-77`. `JobTracker::untrack` is a `HashMap::remove` (`tracker.rs:297`) — removing
         // an absent key is a no-op, exactly like `Map.delete`, so the second call is free when the

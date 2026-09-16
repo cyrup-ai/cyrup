@@ -65,7 +65,7 @@ use std::path::PathBuf;
 /// **Why the v0.34.0 tag and not v0.43.0** — and why this needed no authored text, contrary to the
 /// gap-analysis row that declined it twice. v0.43.0 rewrote this constant around `workflowScript`
 /// (`tool-description.ts:9-15` @v0.43.0: *"omit action for workflowScript execution"*), a
-/// `node:vm` JS sandbox this crate does not implement (`extension.rs`'s own note, and SUBA-016).
+/// `node:vm` JS sandbox this crate does not implement (`extension.rs`'s own note).
 /// v0.34.0's text is written around SINGLE/PARALLEL/CHAIN and names
 /// `list/get/models/create/update/delete/status/interrupt/resume/append-step/doctor` — every one of
 /// which is in [`crate::extension`]'s advertised action list today — so it describes cyrup's actual
@@ -89,17 +89,37 @@ pub const SUBAGENT_SAFETY_GUIDANCE: &str = r#"SAFETY-CRITICAL SUBAGENT GUIDANCE:
 /// disabled state — the same divergence, for the same reason, as `SUBAGENT_TOOL_DESCRIPTION`'s
 /// first bullet and `SUBAGENT_SAFETY_GUIDANCE`'s first bullet.
 ///
-/// `[CYRUP-DELTA]` — upstream `COMPACT_SUBAGENT_TOOL_DESCRIPTION` (`tool-description.ts:80`
-/// @v0.34.0) carries the bullet *"• Opt-in schedule actions: schedule, schedule-list,
-/// schedule-status, schedule-cancel. Schedule only explicit delayed runs the user asked for."*.
-/// It is dropped here because `scheduledRuns` is unported (SUBA-016, blocked on `workflowScript`),
-/// so advertising those four verbs would reproduce exactly the advertise-vs-refuse defect SUBA-046
-/// was filed for: a model that reads the description and calls `schedule` lands on the
-/// unknown-action arm. This is a DELETION of an upstream line naming an unported subsystem, not
-/// authored text — the same convention `extension.rs`'s `SUBAGENT_ACTIONS` already documents
-/// ("This is cyrup's CURRENT surface, not upstream's full 53"), and
-/// `the_compact_description_advertises_no_verb_cyrup_cannot_dispatch` enforces it mechanically
-/// rather than by assertion.
+/// `[CYRUP-DELTA]`, RESOLVED by SUBA-016 — the schedule bullet is back, in the vocabulary that
+/// actually exists.
+///
+/// This delta used to record the DELETION of upstream's `v0.34.0` line
+/// (`tool-description.ts:80`: *"• Opt-in schedule actions: schedule, schedule-list,
+/// schedule-status, schedule-cancel."*) because `scheduledRuns` was unported, and it said that
+/// restoring that line was what would make the guard test pass again with the subsystem back in.
+///
+/// **That vocabulary no longer exists upstream.** At `v0.68.0`,
+/// `src/extension/tool-description.ts:43` names `schedule.*` inside the management-discovery
+/// bullet and adds *"Schedules take script inputs, not direct children"* — there is no
+/// `schedule-list`/`schedule-status`/`schedule-cancel` to restore, and the four-verb denylist the
+/// guard used to carry would now FAIL on a correct change, because `.contains("schedule")` matches
+/// the `schedule.*` text the description is supposed to carry.
+///
+/// So the MANAGE / CONTROL block below names `schedule.*`, in upstream's OWN wildcard form and in
+/// upstream's own position — the management-discovery bullet. A nine-verb list was written first
+/// and then cut to the wildcard, and the reason is a pin rather than taste: the compact form is
+/// held under 2 KiB by `compact_mode_returns_the_short_form_and_full_mode_returns_the_full_one`,
+/// which IS the reason the compact form exists, and that budget had 33 bytes left. The compact
+/// text already names only a SUBSET of what dispatches — it names neither `mission.*` nor
+/// `watchdog.*` at all — so a wildcard here is the form it was already using implicitly, made
+/// explicit and made checkable.
+///
+/// The nine verbs are enumerated where a model can afford to read them: the packaged
+/// `tool-reference` guide topic, which `the_tool_reference_topic_names_every_dispatched_verb`
+/// holds to naming every dispatched action, plus each one's `description` in the tool schema.
+///
+/// The guard was converted from a hard-coded denylist into the mechanical check it was always
+/// trying to be: every verb the compact text names, wildcard or exact, must exist in
+/// `SUBAGENT_ACTIONS`. That closes the class instead of moving the goalposts.
 ///
 /// Every other verb this text names — `list`, `get`, `models`, `create`, `update`, `delete`,
 /// `eject`, `disable`, `enable`, `reset`, `doctor`, `status`, `interrupt`, `resume`, `steer`,
@@ -115,7 +135,7 @@ EXECUTE:
 • If list shows proactive skill subagent suggestions, use a small fresh-context fanout only when the task is broad enough.
 
 MANAGE / CONTROL:
-• Use action without execution fields: list, get, models, create, update, delete, eject, disable, enable, reset, doctor.
+• Use action without execution fields: list, get, models, create, update, delete, eject, disable, enable, reset, doctor, schedule.*.
 • Async control actions: status, interrupt, resume, steer, append-step. Use status view:"fleet" for active-run overview, view:"transcript" to tail child output, and steer for non-terminal live guidance. Use id/runId prefixes carefully; use index for a specific child.
 
 ASYNC / WAIT:
@@ -710,22 +730,72 @@ mod tests {
     /// cannot dispatch, because a model that reads the description and calls one lands on the
     /// unknown-action arm — the exact advertise-vs-refuse defect SUBA-046 was filed for.
     ///
-    /// The four `schedule*` verbs upstream's line 80 carries are the only ones the deletion covers;
-    /// if a later sweep lands `scheduledRuns` (SUBA-016), restoring that line is what makes this
-    /// test keep passing with it back in.
+    /// SUBA-016 rewrote the first half. It used to be a HARD-CODED four-verb denylist
+    /// (`schedule`, `schedule-list`, `schedule-status`, `schedule-cancel`) standing in for
+    /// "unported subsystems", and it could only ever police the one family someone remembered to
+    /// list — while `.contains("schedule")` would now fail on the CORRECT text, because
+    /// `schedule.create` really does dispatch.
+    ///
+    /// It is now the mechanical check it was always trying to be: **every verb the compact
+    /// text names must be a member of `SUBAGENT_ACTIONS`**. That
+    /// closes the whole class — the next family to land is covered without an edit here, and a
+    /// family that is described but never wired fails immediately.
     #[test]
     fn the_compact_description_advertises_no_verb_cyrup_cannot_dispatch() {
-        for verb in [
-            "schedule",
-            "schedule-list",
-            "schedule-status",
-            "schedule-cancel",
-        ] {
+        // A named verb is `family.verb` (`mission.create`, `watchdog.recommend-model`,
+        // `schedule.run-due`) or `family.*`, upstream's own wildcard form. Scanned OUT OF THE TEXT
+        // rather than listed, which is the whole point.
+        //
+        // The one explicit exclusion is ARTIFACT FILE NAMES — the ASYNC / WAIT block legitimately
+        // mentions `status.json` and `events.jsonl`. It is a list of non-verb SUFFIXES, not of
+        // verbs, which is what makes it different in kind from the denylist this replaced: it
+        // never needs an edit when a verb family lands, only if a new FILE TYPE is mentioned.
+        const FILE_SUFFIXES: &[&str] = &["json", "jsonl", "md", "txt", "ts", "rs", "js"];
+        let actions = crate::extension::subagent_actions();
+        let mut exact: Vec<String> = Vec::new();
+        let mut families: Vec<String> = Vec::new();
+        for token in COMPACT_SUBAGENT_TOOL_DESCRIPTION.split(|c: char| {
+            !(c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' || c == '*')
+        }) {
+            let token = token.trim_matches(['.', '-']);
+            let Some((head, tail)) = token.split_once('.') else {
+                continue;
+            };
+            if head.is_empty() || tail.is_empty() || !head.chars().all(|c| c.is_ascii_alphabetic())
+            {
+                continue;
+            }
+            if tail == "*" {
+                families.push(head.to_string());
+            } else if !FILE_SUFFIXES.contains(&tail)
+                && tail.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            {
+                exact.push(token.to_string());
+            }
+        }
+        assert!(
+            !exact.is_empty() || !families.is_empty(),
+            "precondition: the compact text names at least one verb or family, else this guard is vacuous"
+        );
+        for verb in &exact {
             assert!(
-                !COMPACT_SUBAGENT_TOOL_DESCRIPTION.contains(verb),
-                "compact text advertises unported verb '{verb}'"
+                actions.contains(&verb.as_str()),
+                "compact text advertises '{verb}', which `route_action` cannot dispatch"
             );
         }
+        for family in &families {
+            let prefix = format!("{family}.");
+            assert!(
+                actions.iter().any(|action| action.starts_with(&prefix)),
+                "compact text advertises the '{family}.*' family, which `route_action` cannot dispatch"
+            );
+        }
+        // The family this guard was rewritten for must really be among them, or the scan above is
+        // matching nothing and the rewrite is untested.
+        assert!(
+            families.iter().any(|family| family == "schedule"),
+            "the compact text must name the schedule family it now dispatches: exact={exact:?} families={families:?}"
+        );
         // …while every verb it DOES name is one this crate answers.
         for verb in [
             "list",
