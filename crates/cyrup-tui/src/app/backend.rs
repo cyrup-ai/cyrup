@@ -356,14 +356,25 @@ mod tests {
     #[test]
     fn get_cursor_position_returns_the_tracked_anchor_without_querying_the_terminal() {
         let anchor = Position::new(4, 9);
-        let mut backend = InlineBackend::with_anchor(SharedBuf::new(), anchor);
-        let started = std::time::Instant::now();
+        let buf = SharedBuf::new();
+        let mut backend = InlineBackend::with_anchor(buf.clone(), anchor);
         let got = backend.get_cursor_position().unwrap();
+
+        // "Without querying the terminal" is asserted from the BYTES, not from the clock. An
+        // earlier revision bounded `Instant::elapsed()` at 250ms on the theory that only a real DSR
+        // round-trip could approach crossterm's 2000ms timeout, and that nothing on this path does
+        // I/O whose latency could legitimately reach it. That reasoning was sound about I/O and
+        // wrong about scheduling: under a full-workspace `cargo nextest` run this process competes
+        // with ~10 others, and the assertion lost that race repeatedly across sessions — a red that
+        // never indicated a defect and cost a re-run every time.
+        //
+        // The DSR request is `ESC [ 6 n`. A backend that ANSWERS from its tracked anchor never
+        // emits it; one that ASKS must. That is the real property, and it is deterministic.
+        let written = String::from_utf8(buf.bytes()).expect("the backend writes UTF-8");
         assert!(
-            started.elapsed() < std::time::Duration::from_millis(250),
-            "get_cursor_position took {:?} — a backend that ANSWERS never approaches crossterm's \
-             2000ms DSR timeout",
-            started.elapsed()
+            !written.contains("\x1b[6n"),
+            "get_cursor_position issued a DSR cursor-position request instead of answering from \
+             its tracked anchor: {written:?}"
         );
         assert_eq!(got, anchor);
     }

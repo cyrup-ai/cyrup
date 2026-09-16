@@ -287,6 +287,23 @@ pub(crate) const SUBAGENT_ACTIONS: &[&str] = &[
     "watchdog.check",
     "watchdog.configure",
     "watchdog.recommend-model",
+    // SUBA-016 — the nine `schedule.*` verbs, at upstream's own index: `shared/types.ts:2760`
+    // @v0.68.0 ends `… "watchdog.recommend-model", "schedule.create", "schedule.list",
+    // "schedule.show", "schedule.history", "schedule.pause", "schedule.resume", "schedule.run",
+    // "schedule.run-due", "schedule.delete"`. Dispatched by `route_action`'s `schedule.*` arm
+    // through `ScheduledRunAction::from_wire` in this same change, per the advertise-vs-dispatch
+    // invariant — and `DESTRUCTIVE_MANAGEMENT_ACTIONS` below has carried `schedule.delete` since
+    // SUBA-065, deliberately ahead of this dispatch, so the stricter did-you-mean rule applies to
+    // it from the first call.
+    "schedule.create",
+    "schedule.list",
+    "schedule.show",
+    "schedule.history",
+    "schedule.pause",
+    "schedule.resume",
+    "schedule.run",
+    "schedule.run-due",
+    "schedule.delete",
 ];
 
 /// SUBA-065 — pi `DESTRUCTIVE_MANAGEMENT_ACTIONS`

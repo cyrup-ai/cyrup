@@ -213,6 +213,38 @@ pub(crate) struct SubagentToolParams {
     pub(crate) run_mode: Option<String>,
     pub(crate) run_status: Option<String>,
     pub(crate) summary: Option<String>,
+    /// SUBA-016 — the nine `schedule.*` parameters (`extension/schemas.ts:279`, `:311-318` and
+    /// `:345` @v0.68.0), read by [`crate::background::scheduled_runs`] through
+    /// [`Self::schedule_action_params`].
+    ///
+    /// `name` is upstream's `:279` and is shared with nothing else on this surface today.
+    pub(crate) name: Option<String>,
+    /// `at` (`:311`) — a one-shot delay or a zoned ISO timestamp for `schedule.create`.
+    pub(crate) at: Option<String>,
+    /// `every` (`:312`) — the fixed interval for a recurring `schedule.create`.
+    pub(crate) every: Option<String>,
+    /// `sessionOnly` (`:313`) — the schedule fires only for its creating session.
+    pub(crate) session_only: Option<bool>,
+    /// `quiet` (`:314`). Raw [`serde_json::Value`], for the reason `thinking` and `additional`
+    /// are: upstream answers a non-boolean with `quiet must be a boolean.`, which a model can act
+    /// on, and a serde rejection is not.
+    pub(crate) quiet: Option<serde_json::Value>,
+    /// `on` (`:315`) — the RESERVED calendar selector, `anyOf[string, integer]`. Declared and
+    /// refused, so a model that tries a calendar schedule gets upstream's actionable sentence
+    /// instead of a schema rejection. Raw for the same reason.
+    pub(crate) on: Option<serde_json::Value>,
+    /// `timezone` (`:316`) — the other reserved calendar parameter. Declared and refused.
+    pub(crate) timezone: Option<String>,
+    /// `overlap` (`:317`) — `"skip"` is the only supported policy.
+    pub(crate) overlap: Option<String>,
+    /// `catchUp` (`:318`) — `"none"` or `"latest"`; `latest` is the default.
+    pub(crate) catch_up: Option<String>,
+    /// `baseRef` (`:345`) — the worktree base ref. See
+    /// [`crate::background::scheduled_runs::tool::BASE_REF_UNSUPPORTED`] for why a value here is
+    /// refused rather than silently dropped.
+    pub(crate) base_ref: Option<String>,
+    /// `args` — the workflow arguments a scheduled run executes with.
+    pub(crate) args: Option<serde_json::Value>,
 }
 
 impl SubagentToolParams {
@@ -233,6 +265,54 @@ impl SubagentToolParams {
             run_status: self.run_status.clone(),
             agent: self.agent.clone(),
             summary: self.summary.clone(),
+        }
+    }
+
+    /// The scheduled-run projection (`scheduled-runs.ts`'s `SubagentParamsLike` reads), built from
+    /// the SAME parsed tool call the execution arms read — a `schedule.create` and an execution
+    /// call share `workflowScript`/`args`/`cwd`/`timeoutMs`/`context`/`async`.
+    ///
+    /// ⚠ This function lives HERE, in `extension/tool/`, and not in
+    /// `background/scheduled_runs/tool.rs`, and that placement is load-bearing:
+    /// `every_advertised_schema_property_is_read_outside_provided_keys` walks ONLY the
+    /// `src/extension/` tree, so a read that lived under `background/` would not count and every
+    /// one of the nine new properties would report as advertised-but-unwired. It is the same
+    /// reason [`Self::mission_action_params`] lives here.
+    pub(crate) fn schedule_action_params(
+        &self,
+    ) -> crate::background::scheduled_runs::ScheduledRunActionParams {
+        crate::background::scheduled_runs::ScheduledRunActionParams {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            at: self.at.clone(),
+            every: self.every.clone(),
+            session_only: self.session_only,
+            quiet: self.quiet.clone(),
+            on: self.on.clone(),
+            timezone: self.timezone.clone(),
+            overlap: self.overlap.clone(),
+            catch_up: self.catch_up.clone(),
+            base_ref: self.base_ref.clone(),
+            workflow_script: self.workflow_script.clone(),
+            args: self.args.clone(),
+            agent: self.agent.clone(),
+            task: self.task.clone(),
+            tasks: self.tasks.clone(),
+            chain: self.chain.clone(),
+            context: self.context.clone(),
+            r#async: self.r#async,
+            cwd: self.cwd.clone(),
+            timeout_ms: self.timeout_ms,
+            mission_id: self.mission_id.clone(),
+            mission: self.mission.clone(),
+            mission_update: self.mission_update.clone(),
+            mission_status: self.mission_status.clone(),
+            mission_scope: self.mission_scope.clone(),
+            // pi `validateExecutionAcceptance(params)` inside `sanitizeTarget` (`:446`). Run here,
+            // where the whole dispatch is visible: the validator walks `tasks[i]`, `chain[i]` and
+            // `chain[i].parallel[j]` as well as the top-level policy, and `background/` can see
+            // none of that.
+            acceptance_errors: validate_execution_acceptance(self),
         }
     }
 
@@ -645,6 +725,39 @@ impl SubagentToolParams {
         }
         if self.summary.is_some() {
             keys.push("summary");
+        }
+        if self.name.is_some() {
+            keys.push("name");
+        }
+        if self.at.is_some() {
+            keys.push("at");
+        }
+        if self.every.is_some() {
+            keys.push("every");
+        }
+        if self.session_only.is_some() {
+            keys.push("sessionOnly");
+        }
+        if self.quiet.is_some() {
+            keys.push("quiet");
+        }
+        if self.on.is_some() {
+            keys.push("on");
+        }
+        if self.timezone.is_some() {
+            keys.push("timezone");
+        }
+        if self.overlap.is_some() {
+            keys.push("overlap");
+        }
+        if self.catch_up.is_some() {
+            keys.push("catchUp");
+        }
+        if self.base_ref.is_some() {
+            keys.push("baseRef");
+        }
+        if self.args.is_some() {
+            keys.push("args");
         }
         keys
     }

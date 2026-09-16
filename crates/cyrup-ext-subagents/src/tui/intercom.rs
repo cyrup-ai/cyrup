@@ -1067,6 +1067,7 @@ mod tests {
         let secret_session = PathBuf::from("/var/run/CONTROL_INBOX_ROUTE_LEAK_CANARY.json");
 
         let result = crate::background::ResultFile {
+            schedule_origin: None,
             id: RunId::from_token("run00000000000001"),
             run_id: RunId::from_token("run00000000000001"),
             agent: "delegate".to_string(),
@@ -1113,6 +1114,7 @@ mod tests {
         };
 
         let result = crate::background::ResultFile {
+            schedule_origin: None,
             id: RunId::from_token("run00000000000002"),
             run_id: RunId::from_token("run00000000000002"),
             agent: "orchestrator".to_string(),
@@ -1448,6 +1450,7 @@ mod tests {
         let done_child = sample_single_result("scout", "found it");
 
         let result = crate::background::ResultFile {
+            schedule_origin: None,
             id: RunId::from_token("stoppedrun00001"),
             run_id: RunId::from_token("stoppedrun00001"),
             agent: "scout".to_string(),

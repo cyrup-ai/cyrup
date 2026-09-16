@@ -33,6 +33,19 @@
 //!   [`crate::spawn::nested_events::NestedRoute`] addressing type and [`RunPaths::nested`]'s pure subpath-naming rule; the
 //!   actual recursive liveness roll-up belongs to `background/reconcile.rs`/`tracker.rs`.
 
+// SCOPE_9 — the per-SESSION active-async capacity pool and the active-run index it routes
+// through. Registered here rather than under `extension/` for `terminal_run_index`'s reason: both
+// are BACKGROUND-artifact writers, addressing run directories and a scratch root.
+pub mod active_async_capacity;
+pub mod active_run_index;
+// SCOPE_10 — the bounded JSON snapshot of the current session's async runs. A BACKGROUND-artifact
+// reader like `inspect_rpc` beside it: everything it projects comes from a run's reconciled
+// `status.json` and the in-memory job list built from it.
+// SCOPE_13 — async-root retention: the policy, the batched scan and the run tombstones. A
+// BACKGROUND-artifact surface like the two index modules beside it: everything it addresses is a
+// run directory under the per-`cwd` async root.
+pub mod async_retention;
+pub mod async_status_snapshot;
 pub mod atomic;
 pub mod auto_drain;
 pub mod cascade;
@@ -73,6 +86,12 @@ pub mod fleet_view;
 pub mod inspect_rpc;
 pub mod resume_guidance;
 pub mod run_status;
+// SUBA-016 part A — scheduled runs: the persisted schedule record, its project-local
+// store, and the create-time capability-ceiling gate. A BACKGROUND-artifact surface like
+// `completion_replay`/`wait_subscriptions` beside it, with one decision that deliberately
+// differs from both: its store is PROJECT-local, never under the reboot-disposable run
+// scratch root (see that module's own doc).
+pub mod scheduled_runs;
 pub mod tracker;
 pub mod wait;
 pub mod wait_completions;
@@ -96,12 +115,12 @@ mod telemetry;
 mod workflow_graph;
 
 pub use artifact_roots::{
-    RunArtifactRoots, attempt_scratch_dir, attempt_scratch_dir_in, ensure_accessible_dir,
-    results_dir_for_async_root, run_artifact_roots, run_artifact_roots_in,
-    wait_subscriptions_dir_in,
+    RunArtifactRoots, active_async_capacity_root_in, active_async_capacity_session_dir,
+    attempt_scratch_dir, attempt_scratch_dir_in, ensure_accessible_dir, results_dir_for_async_root,
+    run_artifact_roots, run_artifact_roots_in, wait_subscriptions_dir_in,
 };
 pub(crate) use artifact_roots::{cwd_key, temp_root_dir, temp_root_dir_from};
-pub use records::{ParallelGroupStatus, ResultFile, RunStatus, StepStatus};
+pub use records::{ParallelGroupStatus, ResultFile, RunStatus, ScheduleOrigin, StepStatus};
 pub use run_history::{
     RunHistoryEntry, record_run_history, run_history_path, run_history_path_for,
 };

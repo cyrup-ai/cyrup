@@ -27,15 +27,36 @@ use crate::exec::result_summary::extract_result_summary;
 /// detached-foreground completion, or a schedule-launched run. The predicate is identical at
 /// `v0.43.0:notify.ts:173` (minus the `scheduleOrigin` clause) and `v0.57.0:notify.ts:239`.
 ///
-/// Cyrup's [`ResultFile`] carries neither `source` (every completion this crate observes is an
-/// async background run — detached-foreground completions are not ported) nor `scheduleOrigin`
-/// (durable schedules are not ported), so the first and third clauses are vacuously false here and
-/// the decision reduces to the [`classify_outcome`] status: displayed iff the outcome is anything
-/// but [`ClassifiedOutcome::Completed`]. When either input lands, OR it in here — this is the one
-/// place the predicate lives.
+/// Cyrup's [`ResultFile`] carries no `source` (every completion this crate observes is an async
+/// background run — detached-foreground completions are not ported), so the FIRST clause is still
+/// vacuously false here.
+///
+/// SUBA-016 landed the THIRD: [`ResultFile::schedule_origin`] exists, and it is OR'd in below
+/// exactly as this doc asked for. A scheduled run that succeeds IS displayed, because nobody was
+/// watching when it fired — "your nightly sweep ran and it was fine" is the whole point of having
+/// scheduled it, and a silent success is indistinguishable from a schedule that never fired.
 #[must_use]
-pub fn completion_notice_display(outcome: ClassifiedOutcome) -> bool {
-    outcome != ClassifiedOutcome::Completed
+pub fn completion_notice_display(
+    outcome: ClassifiedOutcome,
+    schedule_origin: Option<&crate::background::ScheduleOrigin>,
+) -> bool {
+    outcome != ClassifiedOutcome::Completed || schedule_origin.is_some()
+}
+
+/// pi `scheduledCompletionTriggersTurn` (`notify.ts:362-365`):
+/// `!(origin?.quiet === true && outcome === "completed")`.
+///
+/// This is what `quiet` MEANS, and it is narrower than it sounds: a quiet schedule's SUCCESSFUL
+/// completion is still delivered and still displayed — it just does not wake the parent's turn.
+/// Quiet is "do not interrupt me", never "do not tell me". A quiet schedule that FAILS wakes the
+/// turn like any other, which is the half a looser reading would have silently dropped.
+#[must_use]
+pub fn scheduled_completion_triggers_turn(
+    schedule_origin: Option<&crate::background::ScheduleOrigin>,
+    outcome: ClassifiedOutcome,
+) -> bool {
+    !(schedule_origin.is_some_and(|origin| origin.quiet == Some(true))
+        && outcome == ClassifiedOutcome::Completed)
 }
 
 /// The `subagent-notify` message a completed background run produces (pi `sendCompletion`,
@@ -287,13 +308,23 @@ pub fn format_completion_message(result: &ResultFile) -> CompletionMessage {
         summary
     };
 
-    // pi's `content` array: header, "", displaySummary, then (only if a session line exists) ""
-    // and the session line, joined by "\n" (`notify.ts:87-95`).
+    // pi's `content` array: header, "", the schedule line when there is one, "", displaySummary,
+    // then (only if a session line exists) "" and the session line, joined by "\n"
+    // (`notify.ts:343-356`).
     let mut lines: Vec<String> = vec![
         format!("Background task {status}: **{agent}**"),
         String::new(),
-        display_summary,
     ];
+    if let Some(origin) = &result.schedule_origin {
+        // pi `:341-342`, verbatim — the NAME when it has one, the id otherwise, and the id always.
+        lines.push(format!(
+            "Scheduled run from **{}** (schedule {}).",
+            origin.name.as_deref().unwrap_or(origin.id.as_str()),
+            origin.id
+        ));
+        lines.push(String::new());
+    }
+    lines.push(display_summary);
     if let Some(session_file) = &result.session_file {
         lines.push(String::new());
         lines.push(format!("Session file: {}", session_file.display()));
@@ -302,10 +333,11 @@ pub fn format_completion_message(result: &ResultFile) -> CompletionMessage {
     CompletionMessage {
         custom_type: "subagent-notify".to_string(),
         content: lines.join("\n"),
-        display: completion_notice_display(outcome),
-        // pi: `triggerTurn: result.triggerTurn !== false` (`notify.ts:605`) — `ResultFile` carries
-        // no `triggerTurn`, so the default (`true`) is the only reachable value.
-        trigger_turn: true,
+        display: completion_notice_display(outcome, result.schedule_origin.as_ref()),
+        // pi: `triggerTurn: result.triggerTurn !== false && scheduledCompletionTriggersTurn(...)`
+        // (`notify.ts:776`). `ResultFile` carries no `triggerTurn`, so the first conjunct is
+        // always `true`; the second is SUBA-016's `quiet`.
+        trigger_turn: scheduled_completion_triggers_turn(result.schedule_origin.as_ref(), outcome),
         // The one value-carrying completion shape: a `wait` that already surfaced this run's value
         // inline may suppress the standalone duplicate (`ASYNC_NOTIFY_BUG_REPORT` F3).
         suppressible: true,
@@ -534,7 +566,10 @@ mod tests {
             msg.trigger_turn,
             "hidden is not inert: the completion still re-enters the turn loop"
         );
-        assert!(!completion_notice_display(ClassifiedOutcome::Completed));
+        assert!(!completion_notice_display(
+            ClassifiedOutcome::Completed,
+            None
+        ));
     }
 
     /// Every non-`completed` status satisfies upstream's `detail.status !== "completed"` clause, so
@@ -588,7 +623,7 @@ mod tests {
             ClassifiedOutcome::Paused,
             ClassifiedOutcome::Stopped,
         ] {
-            assert!(completion_notice_display(outcome), "{outcome:?}");
+            assert!(completion_notice_display(outcome, None), "{outcome:?}");
         }
     }
 }

@@ -128,7 +128,10 @@ pub use classify::{ClassifiedOutcome, classify_outcome};
 pub use install::{
     CompletionWatcherHandle, install_completion_watcher, install_completion_watcher_with_observer,
 };
-pub use message::{CompletionMessage, completion_notice_display, format_completion_message};
+pub use message::{
+    CompletionMessage, completion_notice_display, format_completion_message,
+    scheduled_completion_triggers_turn,
+};
 pub use message::{
     format_missing_payload_message, format_undeliverable_message, result_display_summary,
 };
@@ -223,6 +226,7 @@ pub(crate) mod tests {
 
     pub(crate) fn sample_result(run_id: &str, state: RunState, success: bool) -> ResultFile {
         ResultFile {
+            schedule_origin: None,
             id: RunId::from_token(run_id),
             run_id: RunId::from_token(run_id),
             agent: "researcher".to_string(),
@@ -298,6 +302,7 @@ pub(crate) mod tests {
         children: Vec<SingleResult>,
     ) -> ResultFile {
         ResultFile {
+            schedule_origin: None,
             id: RunId::from_token(run_id),
             run_id: RunId::from_token(run_id),
             agent: "worker".to_string(),

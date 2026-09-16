@@ -592,6 +592,7 @@ mod tests {
     /// as an empty string. Serializing the real struct is what makes the test able to fail.
     fn payload(run: &RunId, owner: &SessionId, outputs: &[&str]) -> serde_json::Value {
         let file = ResultFile {
+            schedule_origin: None,
             id: run.clone(),
             run_id: run.clone(),
             agent: "agent0".to_string(),

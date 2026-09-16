@@ -1201,6 +1201,8 @@ async fn spawn_background_steps_bakes_the_configured_dynamic_fanout_max_items_in
                 // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
                 // call that does not ask for one runs unbudgeted. This fixture asks for none.
                 usage_budget: None,
+                // SCOPE_9: a fresh run, not a resume — nothing to transfer a capacity slot from.
+                transfer_from: None,
                 // SUBA-N03: this fixture drives the generic step-graph entry point, which
                 // carries none of the SINGLE-mode overrides.
                 run_id: cyrup_ext_subagents::background::RunId::new(),

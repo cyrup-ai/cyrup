@@ -156,6 +156,31 @@ struct LaunchIdentity {
     index: usize,
 }
 
+/// One workflow child that detached, carried out of [`WorkflowScriptHost::launch`] with the
+/// settled result the drive loop returned for it.
+///
+/// The three fields are exactly what
+/// [`reconcile_detached_workflow_child_completion`](crate::extension::executor::workflow_detach::reconcile_detached_workflow_child_completion)
+/// needs and cannot recover from disk: the child's run id (a foreground child writes no
+/// `ResultFile`, so nothing on disk names it), its settled [`SingleResult`], and the lane it was
+/// launched under. Everything else that reconciler reads — the workflow's status, the prior
+/// payload, the receipt — it resolves from the run directory itself.
+#[derive(Clone)]
+pub(crate) struct DetachedWorkflowChild {
+    /// The engine's lane key, and this record's upsert identity.
+    pub(crate) key: String,
+    /// The child's real run id — [`WorkflowScriptHost::launch`]'s own
+    /// `run_foreground_streaming` return, never `SingleResult::child_run_id` (`None` on every
+    /// foreground run by construction).
+    pub(crate) run_id: crate::background::RunId,
+    /// `key` parsed as a lane key, for the reconciler's by-key settlement rung. `None` on the
+    /// impossible branch (`WorkflowKey::parse` is fallible and the engine generated this key), and
+    /// `None` there simply disables the identity back-fill, which is the safe verdict.
+    pub(crate) workflow_key: Option<WorkflowKey>,
+    /// The settled result, cloned out of the launch.
+    pub(crate) result: SingleResult,
+}
+
 /// One workflow run's launch bridge.
 pub(crate) struct WorkflowRunHost {
     /// Shared with the tool — `SubagentTool` already holds an `Arc<SubagentExecutor>`, so the host
@@ -191,6 +216,20 @@ pub(crate) struct WorkflowRunHost {
     /// (`engine.rs:2045`), and a duplicate entry would make `status` answer from the stale first
     /// attempt forever.
     settled: Mutex<Vec<WorkflowScriptChildResult>>,
+    /// The children that DETACHED, by key, in launch order — see [`DetachedWorkflowChild`].
+    ///
+    /// This is cyrup's `onDetachedExit` (pi `subagent-executor.ts:3951-3976`, fired by
+    /// `execution.ts:2364`). Upstream needs a callback because its `detachForeground` returns the
+    /// tool call early and leaves the child running; cyrup's drive loop keeps driving a detached
+    /// child to its real exit (`exec/drive_attempt.rs:345-367` fires the clarify ask and continues,
+    /// the answer riding back over the broker), so the detached child's COMPLETION is observed
+    /// right here, in `launch`'s return, with its settled [`SingleResult`] in hand. Recording it is
+    /// the whole difference between a hook and no hook.
+    ///
+    /// The same `Mutex` discipline and the same ⚠ UPSERT-BY-KEY rule as `settled` above, for the
+    /// same reason: an auto-resume relaunch of a key mints a NEW child run id, and a pushed
+    /// duplicate would hand the reconciler the abandoned attempt's run id as well as the live one.
+    detached: Mutex<Vec<DetachedWorkflowChild>>,
     /// What each key was FIRST launched with — see [`LaunchIdentity`].
     launched: Mutex<HashMap<String, LaunchIdentity>>,
     /// WORKFLOW_6 §4.3 — the ONE workflow run id for the whole call (minted by `routing.rs` BEFORE
@@ -239,6 +278,7 @@ impl WorkflowRunHost {
             cwd,
             on_update: Arc::new(Mutex::new(on_update)),
             settled: Mutex::new(Vec::new()),
+            detached: Mutex::new(Vec::new()),
             launched: Mutex::new(HashMap::new()),
             workflow_run_id,
             status,
@@ -247,6 +287,22 @@ impl WorkflowRunHost {
             next_child_index: AtomicUsize::new(0),
             publish_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Every child that detached during this workflow run, in launch order.
+    ///
+    /// Drained by value rather than borrowed for the same reason [`Self::update_sink`] is an
+    /// accessor: `routing.rs` is a different module, and the settlement path needs an owned
+    /// snapshot it can hold across the reconciler's `.await`s — which the field's
+    /// `std::sync::Mutex` guard must never be alive across.
+    ///
+    /// Empty for every workflow whose children all ran to a normal exit, which is the overwhelming
+    /// majority: a detach is a child blocking on a `contact_supervisor` clarify ask (R-SA-037).
+    pub(crate) fn detached_children(&self) -> Vec<DetachedWorkflowChild> {
+        self.detached
+            .lock()
+            .map(|detached| detached.to_vec())
+            .unwrap_or_default()
     }
 
     /// The host's share of the one real sink, for the live `emit()` forwarder `routing.rs` passes
@@ -855,6 +911,30 @@ impl WorkflowScriptHost for WorkflowRunHost {
             match settled.iter_mut().find(|c| c.key == mapped.key) {
                 Some(existing) => *existing = mapped.clone(),
                 None => settled.push(mapped.clone()),
+            }
+        }
+
+        // THE DETACH HOOK. `result.detached` is the drive loop's settled R-SA-037 observation
+        // (`exec/fallback.rs:1527`'s field, carried through `SettledAttempt`), and this line is the
+        // moment it becomes actionable: the detached child has now EXITED, and its result is the
+        // evidence `reconcile_detached_workflow_child_completion` settles the paused workflow from.
+        // Recorded here rather than derived at settlement from `mapped.detached`, because the
+        // reconciler takes a `SingleResult` and `WorkflowScriptChildResult` is the lossy guest-wire
+        // projection of one — `exit_code`, `interrupted` and `session_file` are all absent from it.
+        //
+        // Same upsert-in-place rule as `settled` above, and for the same reason.
+        if result.detached
+            && let Ok(mut detached) = self.detached.lock()
+        {
+            let entry = DetachedWorkflowChild {
+                key: key.to_string(),
+                run_id: run_id.clone(),
+                workflow_key: WorkflowKey::parse(key).ok(),
+                result: result.clone(),
+            };
+            match detached.iter_mut().find(|c| c.key == entry.key) {
+                Some(existing) => *existing = entry,
+                None => detached.push(entry),
             }
         }
 

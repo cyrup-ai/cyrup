@@ -198,15 +198,30 @@ impl SubagentExecutor {
     /// foreground match — that must fall through to the async resolver, whose
     /// [`crate::error::SubagentError::AmbiguousRunId`] is the accurate diagnosis.
     pub(crate) fn is_live_foreground_run(&self, selector: &str) -> bool {
+        self.resolve_live_foreground_run(selector).is_some()
+    }
+
+    /// [`Self::is_live_foreground_run`]'s answer with the KEY it matched, for the one caller that
+    /// needs the entry rather than the classification: SCOPE_10's live-foreground transcript
+    /// (pi `run-status.ts:412-416`, `const control = deps.state?.foregroundControls.get(resolved.id)`).
+    ///
+    /// Split out rather than duplicated because the matching rule — exact first, then a UNIQUE
+    /// prefix, with an ambiguous prefix deliberately declining — is the rule, and two copies of it
+    /// would be two rules. `is_live_foreground_run` is now this function's `is_some()`.
+    pub(crate) fn resolve_live_foreground_run(&self, selector: &str) -> Option<String> {
         let controls = self
             .foreground_controls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if controls.contains_key(selector) {
-            return true;
+            return Some(selector.to_string());
         }
         let mut matches = controls.keys().filter(|id| id.starts_with(selector));
-        matches.next().is_some() && matches.next().is_none()
+        let first = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(first.clone())
     }
 
     /// G77 — `resolveSubagentRunId(...).kind === "nested"` for the one caller that has to refuse it

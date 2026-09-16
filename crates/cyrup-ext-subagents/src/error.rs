@@ -171,6 +171,21 @@ pub enum SubagentError {
     #[error("{0}")]
     SpawnLimitExceeded(String),
 
+    /// SCOPE_9 — the per-SESSION active-async cap is full, so a new top-level async run was
+    /// REFUSED before any run directory was created or any process spawned (pi
+    /// `ActiveAsyncCapacityError`, `runs/background/active-async-capacity.ts:70-78` @v0.66.0).
+    ///
+    /// Carries upstream's message verbatim as the WHOLE payload — `Active async run capacity
+    /// exhausted: {used}/{limit} used.` (`:74`, trailing period included) — so the refusal reads
+    /// byte-identically on the tool and slash surfaces, exactly as [`Self::SpawnLimitExceeded`]
+    /// above does for the per-session spawn budget.
+    ///
+    /// Distinct from [`Self::SpawnLimitExceeded`]: that one is a CUMULATIVE budget (claims are
+    /// never released), this one is a CONCURRENCY cap whose slots come back as runs reach a
+    /// terminal state and are reconciled.
+    #[error("{0}")]
+    ActiveAsyncCapacityExhausted(String),
+
     /// Acceptance-gate evaluation rejected an otherwise-clean run (R-SA-011/033).
     #[error("acceptance rejected: {0}")]
     AcceptanceRejected(String),

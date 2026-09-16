@@ -64,14 +64,61 @@ pub use entry::{TERMINAL_RUN_INDEX_DIR, TerminalIndexVersion, TerminalRunIndexEn
 pub use read::read_recent_terminal_run_index;
 pub use update::update_terminal_run_index;
 
-/// `true` for a reserved index directory that sits inside the async root but is not a run.
+/// pi `RUN_TOMBSTONE_PREFIX` (`runs/background/async-retention.ts:23` @`v0.68.0`) — the name
+/// prefix [`crate::background::async_retention`] renames a run tree onto before deleting it.
+///
+/// # Why the literal lives HERE and not in `async_retention`
+///
+/// A `.deleting-run-<uuid>` directory is created **inside the async root**, beside the run
+/// directories, and a tombstone can outlive the pass that minted it (that is exactly what
+/// [`crate::background::async_retention::ASYNC_RETENTION_TOMBSTONE_GRACE_MS`] exists for). The
+/// reserved-name vocabulary belongs with the predicate that enforces it —
+/// [`is_reserved_async_root_entry`] — for the same reason `.active-runs` was named here before
+/// `active_run_index` existed: so the guard does not have to be revisited when the module that
+/// writes the name lands.
+pub const RUN_TOMBSTONE_PREFIX: &str = ".deleting-run-";
+
+/// The per-`cwd` maintenance directory [`crate::background::async_retention`] keeps its
+/// run-tombstone markers in (and that SCOPE_14's retention lock and cursor will join):
+/// `<async_root>/.async-retention/`.
+///
+/// [CYRUP-DELTA] pi derives its `maintenanceRoot` as `path.dirname(asyncDirRoot)`
+/// (`async-retention.ts:658`), which works because pi's `DIRS.async` is FLAT — one directory for
+/// every project. cyrup's async root is already per-`cwd`
+/// ([`crate::background::run_artifact_roots`]), so `dirname` would be
+/// `<run_scratch>/async/`, shared by EVERY working directory on the machine: a lock there would
+/// serialise retention across unrelated projects and a cursor there would be meaningless. Nesting
+/// the maintenance root INSIDE the async root keys it by `cwd` for free, at the cost of one more
+/// arm on [`is_reserved_async_root_entry`] — which this module was already growing for
+/// [`RUN_TOMBSTONE_PREFIX`].
+pub const ASYNC_RETENTION_MAINTENANCE_DIR: &str = ".async-retention";
+
+/// `true` for a reserved entry that sits inside the async root but is not a run.
 ///
 /// pi `entry !== ACTIVE_RUN_INDEX_DIR && entry !== TERMINAL_RUN_INDEX_DIR`
-/// (`async-status.ts:235`, `:502`). `.active-runs` is named here even though
-/// `active-run-index.ts` is unported, so the guard does not have to be revisited when it lands.
+/// (`async-status.ts:235`, `:502`), plus the two names cyrup's async-root retention introduces.
+/// `.active-runs` was named here before `active_run_index.rs` existed, so the guard did not have
+/// to be revisited when it landed.
+///
+/// # The prefix arm is a correctness property, not a tidiness one
+///
+/// Six call sites, across five production scanners, treat every subdirectory of the async root as
+/// a run and funnel through this predicate: [`crate::tui::fleet`]'s history roster,
+/// `run_status::resolve_run_id`'s exact and prefix arms, `run_status::active_run_candidates`,
+/// [`crate::background::resolve_async_run_id`] and the executor's status listing. Without the
+/// [`RUN_TOMBSTONE_PREFIX`] arm a tombstone that outlives its pass appears in
+/// `/subagents-fleet`, becomes an ambiguous prefix match in `resolve_run_id`, and mints a phantom
+/// `AsyncRunLocation` (`run_id_resolver.rs`: *"`async_dir.exists()` below is TRUE for it and
+/// would otherwise mint a phantom `AsyncRunLocation`"*).
+///
+/// This is deliberately still **not** a dot-glob: `.hidden` is not reserved, and the test below
+/// pins that.
 #[must_use]
 pub fn is_reserved_async_root_entry(name: &str) -> bool {
-    name == TERMINAL_RUN_INDEX_DIR || name == ".active-runs"
+    name == TERMINAL_RUN_INDEX_DIR
+        || name == ".active-runs"
+        || name == ASYNC_RETENTION_MAINTENANCE_DIR
+        || name.starts_with(RUN_TOMBSTONE_PREFIX)
 }
 
 #[cfg(test)]
@@ -93,5 +140,27 @@ mod tests {
         // A dot prefix alone is NOT reserved — upstream's guard is two literal names, not a glob.
         assert!(!is_reserved_async_root_entry(".hidden"));
         assert!(!is_reserved_async_root_entry(""));
+    }
+
+    /// The async-root retention names (SCOPE_13). A `.deleting-run-*` tombstone is a DIRECTORY
+    /// inside the async root that can outlive the pass that minted it, so every async-root
+    /// scanner must skip it — this is the arm that makes that true, and it is a PREFIX arm
+    /// because the suffix is a fresh random id per tombstone.
+    #[test]
+    fn the_tombstone_prefix_is_a_reserved_async_root_entry() {
+        assert!(is_reserved_async_root_entry(".deleting-run-abc"));
+        assert!(is_reserved_async_root_entry(RUN_TOMBSTONE_PREFIX));
+        assert!(is_reserved_async_root_entry(
+            ".deleting-run-0123456789abcdef0123456789abcdef"
+        ));
+        assert!(is_reserved_async_root_entry(
+            ASYNC_RETENTION_MAINTENANCE_DIR
+        ));
+        // Still not a dot-glob, and still not a prefix match against a bare run id.
+        assert!(!is_reserved_async_root_entry(".hidden"));
+        assert!(!is_reserved_async_root_entry("deleting-run-abc"));
+        assert!(!is_reserved_async_root_entry(
+            "0123456789abcdef0123456789abcdef"
+        ));
     }
 }

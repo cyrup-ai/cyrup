@@ -2208,6 +2208,10 @@ async fn stopping_a_mid_flight_run_ends_it_stopped_not_paused_and_not_failed() {
         &async_root,
         &results_dir,
         run_id.as_str(),
+        // SCOPE_10 S6 — `RunStatusRenderDeps::default()` is upstream's `deps.state === undefined`:
+        // no live registries, so no steer hints. This assertion is about a STOPPED run's own state
+        // word, which the S6 block (gated on `mode == workflow && state == running`) never touches.
+        &cyrup_ext_subagents::background::run_status::RunStatusRenderDeps::default(),
     )
     .await
     .expect("status renders")

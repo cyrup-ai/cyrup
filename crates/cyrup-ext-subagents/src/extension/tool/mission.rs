@@ -275,6 +275,7 @@ mod tests {
         observer
             .observe(&crate::background::watch::CompletionNotification {
                 result: crate::background::ResultFile {
+                    schedule_origin: None,
                     id: run_id.clone(),
                     run_id: run_id.clone(),
                     agent: "scout".to_string(),

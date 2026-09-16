@@ -90,6 +90,38 @@ impl SubagentExecutor {
             cfg.default_session_dir.as_deref(),
         );
 
+        // SCOPE_9 — measured here, not in the formatter: reading the snapshot RECONCILES the
+        // session's pool (see `active_async_capacity::sweep`), and a report builder must not have
+        // filesystem side effects. With no session id there is no pool to measure, so the block
+        // renders the configured limit against zero usage — upstream's own
+        // `: { used: 0, limit: limit ?? 0 }` arm (`doctor.ts:193`).
+        let capacity_limit =
+            crate::background::active_async_capacity::resolve_max_active_async_runs_per_session(
+                cfg.max_active_async_runs_per_session,
+            );
+        let capacity_snapshot = match crate::identity::SessionId::parse_opt(session_id.as_deref()) {
+            Some(session) => {
+                crate::background::active_async_capacity::get_active_async_capacity_snapshot(
+                    &session,
+                    capacity_limit,
+                    &Self::capacity_options(&cfg, self.live_workflow_run_ids()),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    crate::background::active_async_capacity::ActiveAsyncCapacitySnapshot {
+                        used: 0,
+                        limit: capacity_limit.unwrap_or(0),
+                    }
+                })
+            }
+            None => crate::background::active_async_capacity::ActiveAsyncCapacitySnapshot {
+                used: 0,
+                limit: capacity_limit.unwrap_or(0),
+            },
+        };
+
+        // Captured before `artifact_roots` is moved field-by-field into the input below.
+        let async_retention_scope = artifact_roots.async_root.clone();
         let input = DoctorReportInput {
             cwd,
             // A background/async run is a re-exec of this very binary; async is available whenever
@@ -109,6 +141,17 @@ impl SubagentExecutor {
             run_fanout: crate::exec::run_fanout_budget::RunFanoutDoctor::resolve(
                 cfg.max_subagent_spawns_per_run,
             ),
+            active_async_capacity: crate::registration::doctor::ActiveAsyncCapacityDoctor {
+                snapshot: capacity_snapshot,
+            },
+            // SCOPE_14 — resolved here, for `run_fanout`'s reason: reading the reaper's own record
+            // is I/O, and `build_doctor_report` does none. The maintenance root is derived from the
+            // SAME async root the `Filesystem` block above names, so the block always describes the
+            // scope the operator is actually in.
+            async_retention: crate::registration::doctor::AsyncRetentionDoctor::resolve(
+                &crate::background::async_retention::maintenance_root(&async_retention_scope),
+            )
+            .await,
         };
         build_doctor_report(&input)
     }
@@ -647,6 +690,63 @@ mod tests {
         assert!(
             report.contains(&format!("Requested model setting:\n  {bare}")),
             "the raw bare id must still be surfaced alongside the resolved full id: {report}"
+        );
+    }
+
+    /// SCOPE_14 — `/subagents-doctor` really renders what the async-root reaper last did.
+    ///
+    /// The reaper runs detached, holds no in-process state, and typically ran in a process that has
+    /// since exited, so its maintenance line is the ONLY thing any later process can read. This
+    /// drives the REAL `SubagentExecutor::run_doctor` — the body behind both
+    /// `SlashCommandName::SubagentsDoctor` and the `subagent` tool's `doctor` action — end to end,
+    /// and fails against a build where the block is absent or resolved from the wrong scope.
+    #[tokio::test]
+    async fn run_doctor_report_surfaces_the_last_async_retention_pass() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let roots = crate::paths::Roots::sandboxed(dir.path());
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(&cwd).expect("mkdir cwd");
+        let executor =
+            SubagentExecutor::with_config(crate::registration::SubagentExtensionConfig {
+                roots: roots.clone(),
+                ..Default::default()
+            });
+
+        let before = executor.run_doctor(&cwd, None).await;
+        assert!(
+            before.contains("- last pass: never"),
+            "a scope that has never swept must say so rather than render a silent zero: {before}"
+        );
+
+        // A real pass's record, written by the real writer into the scope this cwd resolves to.
+        let async_root = crate::background::run_artifact_roots_in(&roots, &cwd).async_root;
+        let maintenance_root = crate::background::async_retention::maintenance_root(&async_root);
+        let mut result = crate::background::async_retention::AsyncRetentionResult {
+            acquired: true,
+            scanned: 7,
+            deleted_runs: 3,
+            reaped_tombstones: 1,
+            ..Default::default()
+        };
+        crate::background::async_retention::increment(&mut result.skipped, "runtime-reference");
+        crate::background::async_retention::append_maintenance_log(
+            &maintenance_root,
+            &result,
+            crate::time::now_epoch_millis(),
+            &[],
+        )
+        .await
+        .expect("append the maintenance line");
+
+        let after = executor.run_doctor(&cwd, None).await;
+        assert!(after.contains("Async retention"), "{after}");
+        assert!(
+            after.contains("scanned 7, reaped 3 run(s) and 1 tombstone(s)"),
+            "the block must report the pass that actually ran in THIS cwd's scope: {after}"
+        );
+        assert!(
+            after.contains("- kept: 1 runtime-reference"),
+            "including WHY runs were spared, which is the whole content of the report: {after}"
         );
     }
 

@@ -47,6 +47,15 @@ With an `action`, the tool is in **management** or **control** mode.
 | `watchdog.configure` | management | Change the watchdog config |
 | `watchdog.recommend-model` | management | Suggest a watchdog review model |
 | `validate` | management | Structurally check a `workflowScript` without running it |
+| `schedule.create` | management | Create a durable schedule that runs a `workflowScript` |
+| `schedule.list` | management | List this project's schedules, session-only ones marked |
+| `schedule.show` | management | Show one schedule |
+| `schedule.history` | management | List one schedule's recorded runs |
+| `schedule.pause` | management | Stop a schedule firing, keeping it |
+| `schedule.resume` | management | Let a paused schedule fire again |
+| `schedule.run` | management | Fire one schedule now, without consuming its next slot |
+| `schedule.run-due` | management | Fire every schedule that is due right now |
+| `schedule.delete` | management | Remove a schedule and its history |
 
 An unknown action is answered with a did-you-mean suggestion drawn from this list, except that a
 destructive candidate (`delete`, `eject`, `reset`, `stop`, `interrupt`, …) is only suggested under a
@@ -96,7 +105,36 @@ deliberately stricter rule, so a loose typo is never nudged toward a destructive
 | `missionId`, `mission`, `missionUpdate`, `missionStatus`, `missionScope` | `mission.*` | Mission payloads |
 | `runMode`, `runStatus`, `summary` | `mission.attach-run` | Run binding fields |
 | `id`, `summary` | `mission.resolve-decision` | Decision id and its resolution text |
+| `name` | `schedule.create` | Display name; omitted, it is derived from the script target |
+| `at`, `every` | `schedule.create` | Exactly one: a `+10m` delay or zoned ISO stamp, or `30m`/`6h`/`2d`/`2w` |
+| `sessionOnly` | `schedule.create` | Fire only while the creating session is alive |
+| `quiet` | `schedule.create`, `schedule.run` | Deliver the completion without waking a turn |
+| `overlap`, `catchUp` | `schedule.create` | `skip` only; `none` or `latest` (default `latest`) |
+| `on`, `timezone` | `schedule.create` | Reserved for calendar schedules, refused today |
+| `baseRef` | `schedule.create` | Reserved; refused rather than run against the wrong tree |
+| `args` | workflow, `schedule.create` | Arguments object the `workflowScript` runs with |
 | `config` | management | Extension config fragment for the call |
+
+### Schedules
+
+A schedule is a durable instruction to run a `workflowScript` in a project directory, once at a
+time or on a fixed interval. It is stored under the project, not the session, so it outlives the
+terminal that created it and fires in whichever session is live when it comes due — unless it was
+created with `sessionOnly: true`, which binds it to its creating session and to no other.
+
+```
+{ action: "schedule.create", every: "6h", name: "nightly sweep",
+  workflowScript: "return runs.run('main', { agent: 'reviewer', task: 'sweep' })" }
+```
+
+A fired schedule produces a real run: it charges this session's spawn budget, is addressable by
+`action: "interrupt"`, writes a status, a receipt and a result, and delivers a completion that names
+the schedule it came from. `overlap: "skip"` is enforced with an exclusive lock file, so two cyrup
+instances sharing one project cannot double-launch the same occurrence. `catchUp: "latest"` (the
+default) fires ONCE at the most recent missed slot after a long sleep rather than replaying a
+backlog; `catchUp: "none"` records the missed occurrences instead of firing them.
+
+Due schedules fire on their own — `schedule.run-due` only forces the same pass early.
 
 ### Structured output
 

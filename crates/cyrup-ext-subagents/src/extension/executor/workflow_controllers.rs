@@ -29,6 +29,29 @@ use cyrup_core::CancelToken;
 use crate::background::RunId;
 use crate::extension::executor::SubagentExecutor;
 
+/// The live workflow-controller map, shareable — pi `state.workflowControllers`
+/// (`shared/types.ts:2270`) as a handle rather than a snapshot.
+pub(crate) type WorkflowControllerRegistry =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<RunId, WorkflowController>>>;
+
+/// Every run id the registry names, right now.
+///
+/// A free function so a holder of a [`WorkflowControllerRegistry`] with no
+/// [`SubagentExecutor`] in reach reads it the same way the executor does — same poison recovery,
+/// same short critical section, one implementation. The guard is dropped before the [`HashSet`] is
+/// returned, which is what lets a caller build the set and then `.await`: this crate never holds a
+/// `std::sync::MutexGuard` across an await point (`tracker.rs`'s module note).
+pub(crate) fn registry_live_workflow_run_ids(
+    registry: &WorkflowControllerRegistry,
+) -> HashSet<RunId> {
+    registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .keys()
+        .cloned()
+        .collect()
+}
+
 /// One live in-process workflow shell — pi's `AbortController` value in
 /// `state.workflowControllers` (`shared/types.ts:2270`), plus the two facts every cyrup consumer
 /// of the registry needs and upstream reads off the run's on-disk status instead.
@@ -123,12 +146,21 @@ impl SubagentExecutor {
     /// WORKFLOW_10 feeds to `inspectActiveAsyncCapacityOwner`. Returns a [`HashSet`], the set type
     /// those call sites want, not a `Vec` they would each have to re-collect.
     pub(crate) fn live_workflow_run_ids(&self) -> HashSet<RunId> {
-        self.workflow_controllers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .keys()
-            .cloned()
-            .collect()
+        registry_live_workflow_run_ids(&self.workflow_controllers)
+    }
+
+    /// A shared handle on the registry itself, for a caller that must read it LATER rather than
+    /// now.
+    ///
+    /// [`Self::live_workflow_run_ids`] answers "which workflows are live at this instant", which is
+    /// what every in-turn gate wants. The async-retention sweep
+    /// (`AsyncRetentionSchedule` (`extension/executor/notices.rs`)) is armed at session start
+    /// and runs a minute later, detached, with no `&self` in reach — and a set captured at arm time
+    /// would protect the workflows that were live a minute ago while leaving every workflow LAUNCHED
+    /// since unprotected, which is the worst case that sweep can produce. So it holds the registry
+    /// and reads it at sweep time, through [`registry_live_workflow_run_ids`].
+    pub(crate) fn workflow_controller_registry(&self) -> WorkflowControllerRegistry {
+        std::sync::Arc::clone(&self.workflow_controllers)
     }
 
     /// pi `state.workflowControllers?.has(runId)` (`workflow-foreground-steering.ts:23`) —
