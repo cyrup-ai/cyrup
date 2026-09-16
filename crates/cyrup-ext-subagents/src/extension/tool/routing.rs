@@ -606,497 +606,41 @@ impl SubagentTool {
         )
         .map_err(ToolError::new)?;
 
-        // WORKFLOW_6/WORKFLOW_3 §3d — ONE workflow run id for the whole call, minted BEFORE the
-        // engine runs. It is three things at once and all three need it up front:
-        //   1. the `workflow_controllers` key for the lifetime of this call (pi `:5095-5098`),
-        //   2. every child's `parent_workflow_run_id` (pi `prepareWorkflowChildLaunchParams`,
-        //      `:5633`/`:5900`, whose `parentWorkflowRunId: workflowRunId` reaches the child's
-        //      control entry at `:7019`),
-        //   3. the receipt's directory name and the id the receipt cross-checks itself against.
-        // Pre-WORKFLOW_6 it was minted after `run_workflow_script` returned, which made (1) and (2)
-        // impossible.
-        let workflow_run_id = crate::background::RunId::new();
-        let run_dir_name = crate::identity::RunDirName::for_run(&workflow_run_id);
-
-        // The run dir the receipt was already being written into (`attach_workflow_receipt`), created up
-        // front now, because it is a real run directory from this point on — not a drop box.
-        // `ensure_accessible_dir` is REQUIRED, not defensive: `write_atomic_json` has no implicit
-        // `mkdir -p` (`atomic.rs:105-107`).
-        let async_root = crate::extension::executor::paths::default_async_root_in(&cfg.roots, cwd);
-        let run_dir = run_dir_name.resolve_in(&async_root);
-        crate::background::ensure_accessible_dir(&run_dir)
-            .await
-            .map_err(|e| {
-                ToolError::new(format!("workflow run directory could not be created: {e}"))
-            })?;
-
-        // THE FIRST PRODUCTION `RunMode::Workflow` IN THE CRATE.
-        let mut status = crate::background::RunStatus::queued(
-            workflow_run_id.clone(),
-            crate::background::RunMode::Workflow,
-            // §2.1 — this process drives it; reconcile.rs step 4 must be able to probe us.
-            Some(std::process::id()),
-        );
-        status.session_id =
-            crate::identity::SessionId::parse_opt(self.executor.current_session_id().as_deref());
-        status.cwd = Some(cwd.to_path_buf());
-        // §2.3 — the REAL parent tool call id. `with_workflow_children` (settlement.rs:102-105) falls
-        // back to the run id when this is None; the real value is strictly better and is in hand.
-        status.tool_call_id = Some(call_id.as_str().to_string());
-        // A workflow's step count is DISCOVERED, not declared — exactly what `state.rs:31`'s own doc says
-        // distinguishes it from a Chain. Leave it None; §3.3 fills `steps` as children settle.
-        status.chain_step_count = None;
-        // ⚠ §2.5 — MUST happen before the engine runs. `Queued -> Complete` is not a legal transition,
-        // so an instantly-succeeding workflow would fail its terminal write from `Queued`.
-        status
-            .advance_state(crate::background::RunState::Running)
-            .map_err(|e| ToolError::new(e.to_string()))?;
-        crate::background::atomic::write_atomic_json(&run_dir.join("status.json"), &status)
-            .await
-            .map_err(|e| ToolError::new(format!("workflow status could not be written: {e}")))?;
-
-        // ONE record, shared. The host refreshes `steps` in place as children settle (§3.3) and
-        // §3.2's terminal write starts from whatever the host last published — never from a
-        // second, divergent copy that would silently drop the `last_update` the host advanced.
-        // `std::sync::Mutex`: every access here is a short synchronous clone with no `.await`
-        // inside the critical section (the host's own `publish_steps` is written to guarantee it).
-        let status = std::sync::Arc::new(std::sync::Mutex::new(status));
-
-        // pi `const controller = new AbortController(); state.workflowControllers.set(workflowRunId,
-        // controller)` — with cyrup's ONE abort mechanism, which is the token already threaded into
-        // `RunWorkflowScriptOptions::cancel` below, so an abort through the registry aborts the real
-        // engine run.
-        let _controller = self
-            .executor
-            .register_workflow_controller(&workflow_run_id, cancel.clone());
-
-        let host = std::sync::Arc::new(crate::extension::executor::workflow::WorkflowRunHost::new(
-            std::sync::Arc::clone(&self.executor),
-            cwd.to_path_buf(),
-            // Moved, not cloned — `WorkflowRunHost::new` does the `Arc<Mutex<…>>` wrap that lets
-            // each child borrow a forwarding share of this one sink.
-            on_update,
-            workflow_run_id.clone(),
-            std::sync::Arc::clone(&status),
-            run_dir.clone(),
-            async_root.clone(),
-        ));
-
-        // WORKFLOW_19 — the receipt's host-step evidence, accumulated from `on_host_step` below.
-        //
-        // This is the ONLY channel: neither `WorkflowScriptResult` nor `WorkflowScriptPartial`
-        // carries a `host_steps` field, so unlike `on_trace` (which is `None` precisely BECAUSE the
-        // trace comes back complete) leaving this callback unsupplied silently drops every host
-        // step on the floor and leaves `BuildWorkflowReceipt::host_steps` empty.
-        //
-        // `std::sync::Mutex`, matching the `status` record above: `WorkflowHostStepCallback` is a
-        // plain `Fn`, not async, so no guard is ever held across an `.await`.
-        let host_steps: std::sync::Arc<std::sync::Mutex<Vec<crate::workflows::HostStepNode>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-
-        // Field order mirrors `RunWorkflowScriptOptions`' own declaration order, so this block can
-        // be diffed against the struct line by line. The struct has no `Default`, so all thirteen
-        // are named.
-        let outcome = crate::workflows::scripted::run_workflow_script(
-            crate::workflows::scripted::RunWorkflowScriptOptions {
-                script: script.to_string(),
-                // No resource provenance is wired in this build.
-                one_use_permit: None,
-                timeout_ms,
-                // The workspace's ONE abort flag — no subsystem invents its own.
-                cancel: Some(cancel),
-                continue_after_abort_when_children_settled: None,
-                // -> `DEFAULT_GLOBAL_CONCURRENCY_LIMIT` (`spawn/parallel.rs:36`, 20), which is
-                // exactly what `count_requested_subagent_spawns` bills the session for.
-                global_concurrency_limit: None,
-                host: std::sync::Arc::clone(&host)
-                    as std::sync::Arc<dyn crate::workflows::scripted::WorkflowScriptHost>,
-                // WORKFLOW_20 — `Some` exactly when this dispatch bound a mission, from the ONE
-                // derivation above. `None` means `globalThis.state` is never installed in the
-                // guest realm (`prelude.js:578`, via the engine's own `options.state.is_some()`),
-                // which is why the analyzer already refused the script above rather than letting
-                // the guest discover a bare `ReferenceError`; the engine's verbatim "Workflow
-                // state is unavailable without a mission." op refusal stays unreachable defence in
-                // depth behind both.
-                state,
-                // WORKFLOW_18 — pi `registerStopChild` (`subagent-executor.ts:5691-5694`). The
-                // engine calls this with `Some(stop)` once before the run and `None` at
-                // settlement, and BOTH arms are load-bearing: the `Some` arm is the only way an
-                // operator can reach a single child of a live workflow (`control_stop`'s workflow
-                // branch), and the `None` arm is what RELEASES the engine's captured run state —
-                // the closure holds the whole `Arc<RunShared>`, so a registry that only ever
-                // inserted would pin every child result, trace entry and console line of this run
-                // for the life of the process.
-                register_stop_child: Some({
-                    let executor = std::sync::Arc::clone(&self.executor);
-                    let run_id = workflow_run_id.clone();
-                    std::sync::Arc::new(
-                        move |stop: Option<crate::workflows::scripted::WorkflowStopChild>| {
-                            match stop {
-                                Some(stop) => executor.register_workflow_child_stop(&run_id, stop),
-                                None => executor.clear_workflow_child_stop(&run_id),
-                            }
-                        },
-                    )
-                }),
-                // `None`, NOT a caller-side journal. The engine OWNS the trace and returns it
-                // COMPLETE on both arms (`WorkflowScriptResult::trace`, and
-                // `WorkflowScriptError::partial.trace` on failure). `on_trace` is pure telemetry —
-                // its own doc says it "never decides workflow outcomes" — so accumulating from it
-                // would be a second copy of data that is already handed back.
-                on_trace: None,
-                // `runs.lanes` still WORKS; only the advisory plan callback is undelivered.
-                on_lane_plan: None,
-                // WORKFLOW_21 — live `emit()` forwarding. This was `None` for TWO reasons, and both
-                // are now answered rather than merely overruled.
-                //
-                // (a) WAS: `emit` handed the callback the WHOLE accumulated snapshot every time, so
-                // a per-value forwarder re-forwarded everything on every emit, quadratically. GONE:
-                // [`WorkflowEmitCallback`] is now `Fn(Value, usize)` — ONE value and its zero-based
-                // index — which is the engine delta this wiring waited on. The index is what makes
-                // the stream idempotent across the engine's own rollback: a failed append was not
-                // persisted, so index N is free again.
-                //
-                // (b) WAS, and STILL IS: this is the ONE callback whose failure ABORTS the run
-                // (`engine.rs`'s `emit` pops the value, records a fatal and returns `Err`). The
-                // answer is not that the risk went away — it is that this forwarder HAS NO ERROR
-                // PATH. A UI sink that cannot take an update is not a reason to kill a workflow,
-                // and a progress sink has no concept of rejecting the emitted VALUE, which is the
-                // only failure that would legitimately abort. So a poisoned lock DROPS the update
-                // and the closure returns `Ok(())` unconditionally. ⚠ The next reader's instinct
-                // will be to propagate — do not. Every `Err` returned from here is a dropped UI
-                // update converted into a dead workflow.
-                //
-                // ⚠ This future is polled ON THE ISOLATE THREAD, inside a live deno op: the bridge
-                // impl forwards `emit` straight to `RunShared::emit` without hopping through
-                // `RunShared::main_handle` the way every other host call does. The whole body is
-                // therefore one `std::sync::Mutex` lock and one synchronous `FnMut(ToolUpdate)`
-                // call — the same discipline `child_sink` keeps, never held across an `.await`.
-                // Anything slower here stalls the workflow AND the children already running, and a
-                // `tokio::sync::Mutex` "to be safe" would put an `.await` inside the op. Routing
-                // these through the `TelemetryEvent` drain (where `on_host_step` lives) is the
-                // other tempting wrong fix: that queue exists for INFALLIBLE telemetry and would
-                // silently discard the abort semantics upstream and cyrup both implement.
-                //
-                // The wording matches the settled `Emitted:` line this same function renders below,
-                // down to the 200-char bound, so the live line and the receipt read alike.
-                on_emit: Some({
-                    let sink = host.update_sink();
-                    std::sync::Arc::new(move |value: serde_json::Value, index: usize| {
-                        let sink = std::sync::Arc::clone(&sink);
-                        Box::pin(async move {
-                            let preview = crate::workflows::scripted::format_workflow_json_preview(
-                                &value, 200,
-                            )
-                            .unwrap_or_else(|| "undefined".to_string());
-                            if let Ok(mut sink) = sink.lock() {
-                                sink(cyrup_core::ToolUpdate {
-                                    content: vec![cyrup_core::Content::text(format!(
-                                        "Workflow emit #{index}: {preview}"
-                                    ))],
-                                    // No `SubagentUpdatePayload` shape describes a workflow emit,
-                                    // and `render_subagent_result` falls back to the first text
-                                    // block when `details` does not parse as one — so `None` is
-                                    // both honest and renderable.
-                                    details: None,
-                                    terminate: cyrup_core::TerminateHint::Unspecified,
-                                });
-                            }
-                            Ok(())
-                        })
-                            as std::pin::Pin<
-                                Box<dyn std::future::Future<Output = Result<(), String>> + Send>,
-                            >
-                    })
-                }),
-                // WORKFLOW_19 — `supports_host()` is now true, so host steps are produced and this
-                // is the one way they reach the receipt.
-                //
-                // Like `on_emit` since WORKFLOW_21, `on_host_step` delivers ONE node per call — but
-                // unlike it, off the isolate thread through the telemetry drain, because a host
-                // step is pure telemetry with no failure semantics. Accumulating is correct here —
-                // and it is also the only option, per the note on `host_steps` above.
-                //
-                // ⚠ UPSERT BY ID, never push. The engine emits each command TWICE — a `Running`
-                // node when the op starts and a terminal one when it settles — both carrying the
-                // same `HostStepNode::id`, which IS the workflow key. A blind push does not merely
-                // double the receipt: `build_workflow_receipt` runs `assert_unique_host_step_ids`
-                // (Rule 11), so the duplicate turns a successful workflow into a `ToolError` at
-                // `settle_foreground_workflow`'s own receipt `map_err`. The same reasoning covers
-                // two `runs.host("gate", …)` calls sharing a key: the engine's cap counts CALL ids
-                // while the receipt's uniqueness is over NODE ids, so same-key calls must collapse
-                // last-write-wins rather than be disambiguated — the id is upstream's.
-                on_host_step: Some({
-                    let steps = std::sync::Arc::clone(&host_steps);
-                    std::sync::Arc::new(move |node: &crate::workflows::HostStepNode| {
-                        // A poisoned lock is RECOVERED, not skipped: the guarded value is a plain
-                        // `Vec` that a panicking peer cannot have left torn, and dropping the node
-                        // would lose exactly the evidence the receipt exists to carry.
-                        let mut steps = steps
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        match steps.iter_mut().find(|step| step.id == node.id) {
-                            Some(existing) => *existing = node.clone(),
-                            None => steps.push(node.clone()),
-                        }
-                    })
-                }),
+        // WORKFLOW_6/WORKFLOW_3 §3d + SUBA-016 — the launch itself lives in
+        // [`crate::extension::executor::workflow_launch`], because a scheduled fire needs the SAME
+        // block with the tool-call inputs stubbed and a second copy would diverge on the first of
+        // the five behaviours (controller registration, `register_stop_child`, `on_emit`,
+        // `on_host_step`, the terminal receipt write) that someone forgot. This arm supplies the
+        // tool-call halves: the real `call_id`, the real progress sink, and the LIVE session read
+        // that a scheduled fire replaces with a pinned snapshot.
+        let prepared = crate::extension::executor::workflow_launch::prepare_workflow_run(
+            crate::extension::executor::workflow_launch::PrepareWorkflowRun {
+                cfg: &cfg,
+                cwd,
+                session_id: crate::identity::SessionId::parse_opt(
+                    self.executor.current_session_id().as_deref(),
+                ),
+                tool_call_id: Some(call_id.as_str().to_string()),
+                // A tool call delivers its own result as the `ToolResult` it returns, so nothing
+                // ever consults the owner. Unchanged from the inline block.
+                completion_owner_id: None,
             },
         )
-        .await;
-
-        // WORKFLOW_6 §4.4 — pi's settlement `finally` (`subagent-executor.ts:5789-5799`):
-        // "Idempotent cleanup only". Unconditional and ahead of the Ok/Err match, because a
-        // workflow that FAILED is exactly as settled as one that succeeded — leaving the entry
-        // behind would make WORKFLOW_10 count a dead workflow forever and make WORKFLOW_8's
-        // dismiss refusal permanent for this id.
-        self.executor.settle_workflow_controller(&workflow_run_id);
-        // WORKFLOW_18 — upstream's settlement tail deletes from BOTH maps unconditionally
-        // (`subagent-executor.ts:5926-5927`), and so does this one. It is NOT a substitute for the
-        // registrar's `None` arm above (that one runs inside the engine, deliberately ahead of any
-        // drain that could block) and it is not redundant with it either: the `None` arm is skipped
-        // on a panic path, and a stop handle left behind pins the run's whole `Arc<RunShared>`.
-        // `clear_workflow_child_stop` is idempotent precisely so both can run.
-        self.executor.clear_workflow_child_stop(&workflow_run_id);
-
-        // WORKFLOW_19 — snapshot the accumulated evidence ONCE, here, for BOTH settlement arms.
-        //
-        // The engine flushes and joins its telemetry drain before `run_workflow_script` returns
-        // (`engine.rs`'s `TelemetryEvent::Flush` + the bounded join on `telemetry_drain`), so every
-        // node the run produced has already been delivered by this point — there is no late arrival
-        // to race.
-        let host_steps: Vec<crate::workflows::HostStepNode> = host_steps
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-
-        match outcome {
-            Ok(result) => {
-                let preview =
-                    crate::workflows::scripted::format_workflow_json_preview(&result.value, 1_000)
-                        .unwrap_or_else(|| "undefined".to_string());
-                let mut text = format!(
-                    "Workflow completed with {} child run(s). Return: {preview}",
-                    result.children.len()
-                );
-                if !result.emits.is_empty() {
-                    let rendered: Vec<String> = result
-                        .emits
-                        .iter()
-                        .map(|value| {
-                            crate::workflows::scripted::format_workflow_json_preview(value, 200)
-                                .unwrap_or_else(|| "undefined".to_string())
-                        })
-                        .collect();
-                    text.push_str(&format!(" Emitted: {}", rendered.join(", ")));
-                }
-                text.push_str(&format!(" Trace: {} event(s).", result.trace.len()));
-                // §3.2: settle via the composer (first production caller of plan_workflow_settlement).
-                let details = self
-                    .settle_foreground_workflow(
-                        serde_json::json!({
-                            // The inline surface's typed payloads
-                            // (`IntercomPayload::from_group_children`) are keyed to
-                            // `StepResult`/`SingleResult`, not to `WorkflowScriptChildResult`, and
-                            // no conversion exists — so v1 attaches the children as plain JSON
-                            // rather than inventing a lossy `StepResult` shim that a follow-up
-                            // task would have to unpick. `WorkflowScriptChildResult` derives
-                            // `Serialize` with `rename_all = "camelCase"`, so this is upstream's
-                            // own wire shape. `RunMode::Workflow` already exists and is already
-                            // rendered as "workflow" elsewhere, so the mode label is the real one,
-                            // not a placeholder.
-                            "mode": "workflow",
-                            // Cloned: `&result.children` is also borrowed below, for the receipt.
-                            "children": result.children.clone(),
-                            "trace": result.trace.len(),
-                            "emits": result.emits,
-                            "console": result.console,
-                        }),
-                        &status,
-                        crate::background::RunState::Complete,
-                        &run_dir,
-                        &run_dir_name,
-                        crate::workflows::WorkflowReceiptState::Complete,
-                        &result.children,
-                        &host_steps,
-                        &result.trace,
-                        text.clone(),
-                    )
-                    .await
-                    .map_err(ToolError::new)?;
-                Ok(ToolResult {
-                    content: vec![cyrup_core::Content::text(text)],
-                    details: Some(details),
-                    terminate: TerminateHint::Unspecified,
-                    ..Default::default()
-                })
-            }
-            Err(error) => {
-                // The partial IS the point of this error type: a failed workflow still yields its
-                // trace, children, console and emits, and they must reach the caller.
-                let mut message = error.message.clone();
-                let detached: Vec<&str> = error
-                    .partial
-                    .children
-                    .iter()
-                    .filter(|c| c.detached)
-                    .map(|c| c.key.as_str())
-                    .collect();
-                if !detached.is_empty() {
-                    // A detach with no real failed child is upstream's `paused` shape, which this
-                    // build cannot represent as a run state — so it is reported as a failure that
-                    // names the detached keys rather than as a resumable pause.
-                    message.push_str(&format!(
-                        " Detached child run(s): {}. This build cannot resume a detached workflow.",
-                        detached.join(", ")
-                    ));
-                }
-                message.push_str(&format!(
-                    " Partial: {} child run(s), {} trace event(s).",
-                    error.partial.children.len(),
-                    error.partial.trace.len()
-                ));
-                // §3.2 failure arm: trace now reaches the composer (with_workflow_children reads it).
-                match self
-                    .settle_foreground_workflow(
-                        serde_json::json!({}),
-                        &status,
-                        crate::background::RunState::Failed,
-                        &run_dir,
-                        &run_dir_name,
-                        crate::workflows::WorkflowReceiptState::Failed,
-                        &error.partial.children,
-                        // The SAME evidence on the failure arm. A workflow that throws out of
-                        // `runs.host` settles here, and that is exactly the case the terminal host
-                        // step matters most in — the partial carries no host steps of its own.
-                        &host_steps,
-                        &error.partial.trace,
-                        message.clone(),
-                    )
-                    .await
-                {
-                    Ok(details) => Err(ToolError::new(message).with_details(details)),
-                    Err(e) => Err(ToolError::new(format!("{message} {e}"))),
-                }
-            }
-        }
-    }
-
-    /// §3d rules 1-3: build the receipt from `children`, persist it, and fold
-    /// `workflowRunId`/`workflowReceipt` onto `base_details` — or, when persistence fails (an
-    /// ENVIRONMENT fault), log/omit the receipt rather than failing the workflow, mirroring
-    /// upstream's success-arm `try/catch` around `writeWorkflowReceipt`
-    /// (`subagent-executor.ts:5728-5730`).
-    ///
-    /// A malformed child (a bad/duplicate key, a resumable child with no run id) is a DIFFERENT
-    /// kind of fault — a real defect in the engine's own output — and is surfaced as an `Err`
-    /// rather than swallowed.
-    /// The ONE terminal writer for a foreground workflow (WORKFLOW_3 §3c's production caller).
-    ///
-    /// Order is WORKFLOW_3's: advance the status, build the receipt, persist it, hand the persistence
-    /// OUTCOME (path or error) to [`crate::workflows::plan_workflow_settlement`], then write the status
-    /// the plan produced. The composer owns the `evidence-persistence-failed` promotion, the
-    /// `workflow_children` projection and the `workflow_receipt_path` stamp; this function owns only
-    /// the two writes and the details map.
-    #[allow(clippy::too_many_arguments)]
-    async fn settle_foreground_workflow(
-        &self,
-        mut base_details: serde_json::Value,
-        status: &std::sync::Arc<std::sync::Mutex<crate::background::RunStatus>>,
-        terminal: crate::background::RunState,
-        run_dir: &Path,
-        run_dir_name: &crate::identity::RunDirName,
-        receipt_state: crate::workflows::WorkflowReceiptState,
-        children: &[crate::workflows::WorkflowScriptChildResult],
-        host_steps: &[crate::workflows::HostStepNode],
-        trace: &[crate::workflows::WorkflowScriptTraceEntry],
-        summary: String,
-    ) -> Result<serde_json::Value, String> {
-        // 1. Terminal status FIRST — `plan_workflow_settlement` DERIVES `success` from `status.state`
-        //    (`settlement.rs:709`) and never advances it itself. Snapshot out of the shared record so
-        //    no std guard is alive across the awaits below.
-        let settled = {
-            let mut guard = status
-                .lock()
-                .map_err(|_| "workflow status lock was poisoned".to_string())?;
-            // The engine's returned `children` is the COMPLETE settled list — authoritative over
-            // whatever `publish_steps` last managed to write.
-            guard.steps = crate::workflows::workflow_step_statuses(children);
-            guard.current_step = guard.steps.len().checked_sub(1);
-            guard.advance_state(terminal).map_err(|e| e.to_string())?;
-            guard.clone()
-        };
-
-        // 2. Build the receipt. `workflow_children: None` stays — the PLAN fills it
-        //    (`settlement.rs:692-701`), which is the whole reason the composer exists.
-        let receipt =
-            crate::workflows::build_workflow_receipt(crate::workflows::BuildWorkflowReceipt {
-                workflow_run_id: run_dir_name,
-                state: receipt_state,
-                children,
-                // WORKFLOW_19 — the nodes `on_host_step` accumulated, upserted by id so Rule 11's
-                // `assert_unique_host_step_ids` (which would otherwise fail the whole receipt, and
-                // with it the workflow) sees one terminal entry per command.
-                host_steps,
-                workflow_children: None,
-                resource: None, // `one_use_permit: None` in this build
-                terminal_outcome: None,
-                created_at: None,
-            })
-            .map_err(|error| format!("workflow completed but its receipt is invalid: {error}"))?;
-
-        // 3. Persist it, and carry the OUTCOME rather than swallowing it.
-        let (receipt_path, receipt_persistence_error) =
-            match crate::workflows::write_workflow_receipt(run_dir, &receipt) {
-                Ok(path) => (Some(path), None),
-                Err(error) => (None, Some(error.to_string())),
-            };
-
-        // 4. WORKFLOW_3's composer. Its first production call site.
-        let plan =
-            crate::workflows::plan_workflow_settlement(crate::workflows::PlanWorkflowSettlement {
-                status: &settled,
-                summary,
-                trace,
-                receipt: Some(receipt),
-                receipt_path,
-                receipt_persistence_error,
-                resolution: None,
-                terminal_outcome: None,
-                now: None,
-                event_metadata: serde_json::Map::new(),
-            });
-
-        // 5. The terminal status write — now carrying `workflow_children` and `workflow_receipt_path`,
-        //    which `control.rs:305` / `wait.rs:602` / `run_status.rs:367` /
-        //    `wait_completions/project.rs:39,184` have been reading for nothing.
-        crate::background::atomic::write_atomic_json(&run_dir.join("status.json"), &plan.status)
-            .await
-            .map_err(|e| format!("workflow terminal status could not be written: {e}"))?;
-
-        if let Some(map) = base_details.as_object_mut() {
-            map.insert(
-                "workflowRunId".to_string(),
-                serde_json::json!(plan.status.run_id.as_str()),
-            );
-            if let (Some(receipt), Some(path)) = (&plan.receipt, &plan.receipt_path) {
-                map.insert(
-                    "workflowReceipt".to_string(),
-                    serde_json::json!({ "path": path, "receipt": receipt }),
-                );
-            }
-            if let Some(children) = &plan.status.workflow_children {
-                map.insert("workflowChildren".to_string(), serde_json::json!(children));
-            }
-            // Always empty until WORKFLOW_15 records per-child resumability
-            // (`workflow_recovery_actions` filters on `entry.resume.is_resumable()`,
-            // `settlement.rs:413-432`). Surfaced anyway so the wiring is provably correct now and
-            // starts reporting the moment WORKFLOW_15 lands.
-            if !plan.recovery.is_empty() {
-                map.insert("recovery".to_string(), serde_json::json!(plan.recovery));
-            }
-        }
-        Ok(base_details)
+        .await?;
+        crate::extension::executor::workflow_launch::drive_workflow_run(
+            &self.executor,
+            prepared,
+            crate::extension::executor::workflow_launch::DriveWorkflowRun {
+                cfg: &cfg,
+                cwd,
+                script,
+                timeout_ms,
+                state,
+                on_update,
+                cancel,
+            },
+        )
+        .await
     }
 
     /// Lower every advertised SINGLE-mode param into the one [`SingleRunOverrides`] bundle both of
@@ -1688,6 +1232,113 @@ impl SubagentTool {
                     ..Default::default()
                 })
             }
+            // SUBA-016 — the nine `schedule.*` actions, in the dispatch position upstream gives
+            // them: after the `mission.*` arm, before `validate`. `subagent-executor.ts` dispatches
+            // `schedule.*` between `append-step` and `dismiss`, which is the neighbourhood
+            // `route_control_action`'s own doc already names.
+            //
+            // `schedule.delete` is in `DESTRUCTIVE_MANAGEMENT_ACTIONS` (`text.rs:299-312`), which
+            // has carried it since SUBA-065 — so the stricter did-you-mean rule applies to it
+            // automatically from the first call.
+            schedule_action
+                if crate::background::scheduled_runs::ScheduledRunAction::from_wire(
+                    schedule_action,
+                )
+                .is_some() =>
+            {
+                let Some(schedule_action) =
+                    crate::background::scheduled_runs::ScheduledRunAction::from_wire(
+                        schedule_action,
+                    )
+                else {
+                    // Unreachable: the guard above already resolved it.
+                    return Err(ToolError::new(format!(
+                        "unknown subagent action '{action}'"
+                    )));
+                };
+                // The six mutating verbs are refused from a child-safe fanout tool, with the same
+                // sentence the mutating `mission.*` verbs already get: a fanout child may read
+                // what the project has scheduled and may not schedule, resume or fire anything.
+                if !self.allow_mutating_management && schedule_action.is_mutating() {
+                    return Err(ToolError::new(format!(
+                        "Action '{action}' is not available from child-safe subagent fanout mode."
+                    )));
+                }
+                // SUBA-064 — `registration/authority.rs:64-74` has mapped `schedule.create` to
+                // `AuthorityAction::ScheduleCreate` since before this verb dispatched, with a note
+                // saying exactly that. This is the dispatch that finally consults it, through the
+                // SAME three-arm gate `route_control_action` applies to `stop`/`steer` — one
+                // policy surface, not a second one that could drift. `for_tool_action` returns
+                // `None` for the other eight verbs, so only `schedule.create` is gated, which is
+                // upstream's own mapping.
+                if let Some(policy_action) =
+                    crate::registration::authority::AuthorityAction::for_tool_action(action)
+                {
+                    use crate::registration::authority as auth;
+                    let policy = self.executor.config_snapshot().await.authority_policy;
+                    match auth::resolve_authority_decision(policy_action, policy.as_ref()) {
+                        auth::AuthorityDecision::Auto => {}
+                        auth::AuthorityDecision::Forbid => {
+                            return Err(ToolError::new(auth::forbidden_message(action)));
+                        }
+                        auth::AuthorityDecision::Confirm => {
+                            let Some(services) = self.executor.host_services() else {
+                                return Err(ToolError::new(auth::no_ui_message(action)));
+                            };
+                            if !services.confirm(
+                                &auth::confirm_prompt(action),
+                                &auth::confirm_message(action),
+                                &cyrup_ext::host::DialogOptions::default(),
+                            ) {
+                                // A user declining is a CHOICE, not a failure — `Ok`, not `Err`,
+                                // exactly as the control arm's own decline branch is.
+                                return Ok(ToolResult {
+                                    content: vec![cyrup_core::Content::text(
+                                        auth::declined_message(action),
+                                    )],
+                                    details: Some(serde_json::json!({ "mode": "management" })),
+                                    terminate: TerminateHint::Unspecified,
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                    }
+                }
+                let Some(manager) = self.executor.scheduled_runs() else {
+                    // pi `:544` — the gate answers BEFORE the switch. cyrup reaches the same
+                    // sentence from the absent manager, because `install_scheduled_runs` is what
+                    // reads the config and it declines to install when the key says `false`.
+                    return Err(ToolError::new(
+                        crate::background::scheduled_runs::SCHEDULED_RUNS_DISABLED,
+                    ));
+                };
+                // pi `handleToolCall`'s outer `try/catch` (`:558-560`) turns EVERY thrown error
+                // into `textResult(message, …, isError = true)`. cyrup's `ToolResult` carries no
+                // `isError` flag — its error channel is `Err(ToolError)`, which the runtime renders
+                // as an `is_error` tool result carrying the text — so upstream's error-flagged
+                // result maps onto `Err` here. That is the SAME mapping
+                // `route_management_action` already performs for `outcome.is_error`, and the
+                // details survive it: `ToolError::with_details` carries the `schedules` payload
+                // through, so a refusal is not stripped of its evidence.
+                //
+                // The refusals really are refusals, not failures: a `schedule.create` that names a
+                // calendar trigger, a store that already holds twenty pending schedules, or a
+                // `schedule.delete` on a live run all reach the model as text it can act on within
+                // the same turn.
+                match manager
+                    .handle_action(schedule_action, &p.schedule_action_params())
+                    .await
+                {
+                    Ok(outcome) if !outcome.is_error => Ok(ToolResult {
+                        content: vec![cyrup_core::Content::text(outcome.text)],
+                        details: Some(outcome.details),
+                        terminate: TerminateHint::Unspecified,
+                        ..Default::default()
+                    }),
+                    Ok(outcome) => Err(ToolError::new(outcome.text).with_details(outcome.details)),
+                    Err(error) => Err(ToolError::new(error.to_string())),
+                }
+            }
             // WORKFLOW_2 / pi `action: "validate"` with `workflowScript`
             // (`extension/schemas.ts:288`). Synchronous, because validation authority is already
             // split — V8 owns syntax via `compile_check`'s throwaway isolate, the Rust analyzer
@@ -2071,9 +1722,10 @@ impl SubagentTool {
     ) -> Result<ToolResult, ToolError> {
         // SUBA-064 / pi `subagent-executor.ts:4412-4423` @v0.43.0. The authority consult sits
         // BEFORE dispatch and covers `stop`→`stopRun`, `steer`→`steerRun` (and `schedule.create`
-        // →`scheduleCreate` once SUBA-016 lands). Every other control verb is ungated upstream and
-        // must stay ungated here, which is why the mapping returns `None` for them rather than
-        // this arm defaulting to "gated".
+        // →`scheduleCreate`, which SUBA-016 landed: `route_action`'s `schedule.*` arm runs this
+        // same three-arm gate, so the mapping has one meaning on both surfaces). Every other
+        // control verb is ungated upstream and must stay ungated here, which is why the mapping
+        // returns `None` for them rather than this arm defaulting to "gated".
         if let Some(policy_action) =
             crate::registration::authority::AuthorityAction::for_tool_action(action)
         {
@@ -2650,3 +2302,10 @@ fn render_validation_findings(
 #[cfg(test)]
 #[path = "routing_tests.rs"]
 mod tests;
+
+/// SUBA-016 part B's end-to-end suite — a `#[path]` sibling for the same reason
+/// [`tests`](self::tests) is one: it drives `Tool::execute` and the installed
+/// `ScheduledRunManager`, both of which live inside this private module tree.
+#[cfg(test)]
+#[path = "scheduled_runs_tests.rs"]
+mod scheduled_runs_tests;

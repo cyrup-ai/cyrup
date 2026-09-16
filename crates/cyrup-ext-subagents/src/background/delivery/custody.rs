@@ -148,6 +148,7 @@ mod tests {
         completion_owner_id: Option<CompletionOwnerId>,
     ) -> ResultFile {
         ResultFile {
+            schedule_origin: None,
             id: RunId::from_token("run1"),
             run_id: RunId::from_token("run1"),
             agent: "worker".to_string(),

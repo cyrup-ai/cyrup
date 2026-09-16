@@ -434,6 +434,25 @@ pub struct BackgroundStepsSpec {
     /// EVERY step, exactly as [`Self::turn_budget`] is (pi enforces one `usageBudget` across a
     /// whole async run rather than one per step).
     pub usage_budget: Option<crate::exec::usage_budget::UsageBudgetConfig>,
+    /// SCOPE_9 — the run whose active-async capacity slot this spawn TAKES OVER rather than
+    /// charging the session a second time for (pi `target.source === "async"` selecting
+    /// `transferActiveAsyncCapacity` over `acquireActiveAsyncCapacity`,
+    /// `subagent-executor.ts:2085-2098` @v0.68.0).
+    ///
+    /// `Some(source)` is the RESUME shape, and today has exactly one producer:
+    /// [`crate::extension::SubagentExecutor::control_resume`]'s terminal-revival arm
+    /// (`revive_from_transcript`), which IS cyrup's whole `target.source == "async"` population —
+    /// `control::resume` resolves its target out of the per-cwd ASYNC root and refuses anything it
+    /// cannot reconcile there, so every revive is the resume of an async run. A revive that
+    /// acquired afresh would charge the cap twice for what the operator sees as one run, and at
+    /// `max_active_async_runs_per_session = 1` the source's own still-held slot would make the
+    /// revive refuse itself.
+    ///
+    /// `None` is every ordinary admission. A `Some` whose source holds no slot is NOT an error:
+    /// [`crate::background::active_async_capacity::transfer`] falls through to an ordinary
+    /// admission there (pi `:513`), which is what a revive of a run whose slot reconciliation
+    /// already reclaimed must do.
+    pub transfer_from: Option<RunId>,
 }
 
 /// G92: the three optional `status` VIEW selectors pi carries as separate params

@@ -1113,6 +1113,7 @@ async fn a_resumable_entry_keeps_its_existing_latest_run_id_and_falls_back_to_th
 
 fn existing_result(run_id: &RunId, results: Vec<SingleResult>) -> ResultFile {
     ResultFile {
+        schedule_origin: None,
         id: run_id.clone(),
         run_id: run_id.clone(),
         agent: "workflow".to_string(),
@@ -1260,35 +1261,90 @@ fn arm_b_backfills_terminal_outcome_from_the_receipt_entry() {
     );
 }
 
-#[test]
-fn arm_b_backfills_output_path_mapping_from_the_step() {
-    // `:89` — the rung whose cyrup carrier is `StepStatus::output_path_mapping`, which is what
-    // `workflow_output_path_mapping_summary` renders for the operator.
-    let run_id = RunId::from_token("wf1");
+/// `:89` + `:222-227` — a NON-settling step's `output_path_mapping` (cyrup's carrier for
+/// upstream's `outputPathMapping` key; [`SingleResult`] has no such field, SCOPE_8 §W-7) survives
+/// the Arm-B rebuild and reaches the operator through the settled summary this reconciler
+/// journals.
+///
+/// Driven through the PRODUCTION reconcile. The earlier shape of this test called
+/// `workflow_output_path_mapping_summary` over the very `status.steps` it had just built by hand
+/// — proving the formatter's own arithmetic, never the rebuild — and asserted nothing about the
+/// children it computed beyond their count.
+///
+/// The sibling lane is already settled so that this child is the LAST open one: a still-open
+/// sibling keeps the workflow `paused`, and a paused workflow journals no completion line at all
+/// (`another_open_detached_child_keeps_the_workflow_paused_and_logs_no_completion`).
+#[tokio::test]
+async fn a_sibling_steps_output_path_mapping_survives_the_rebuild_and_reaches_the_summary() {
+    let fixture = Fixture::new();
     let mapping = crate::workflows::WorkflowOutputPathMapping {
         requested_path: "report.md".to_string(),
         saved_path: "/tmp/out/report.md".to_string(),
     };
-    let mut step = detached_step("b", "lane.b", Some("siblingrun"));
-    step.output_path_mapping = Some(mapping.clone());
-    let status = paused_workflow(
-        &run_id,
-        vec![detached_step("a", "lane.a", Some(CHILD)), step],
-    );
+    let mut sibling = detached_step("b", "lane.b", Some("siblingrun"));
+    sibling.status = StepState::Complete;
+    sibling.telemetry.activity_state = None;
+    sibling.output_path_mapping = Some(mapping.clone());
+    fixture
+        .seed(&paused_workflow(
+            &fixture.run_id,
+            vec![detached_step("a", "lane.a", Some(CHILD)), sibling],
+        ))
+        .await;
     let result = child_result(CHILD);
 
-    let children = workflow_result_children(&status, CHILD, &result, None, None);
+    assert!(
+        reconcile_detached_workflow_child_completion(completion(
+            &fixture.run_paths,
+            &result,
+            None,
+            &[]
+        ))
+        .await
+        .expect("reconciles")
+    );
 
-    assert_eq!(children.len(), 2);
+    // Arm B ran in production: with no prior payload on disk the children are rebuilt from
+    // `status.steps`, one per step, only the settling child carrying this result's output.
+    let published = fixture.read_result().await;
+    assert_eq!(published.results.len(), 2, "rebuilt from `status.steps`");
+    assert_eq!(published.results[0].final_output.as_deref(), Some("done"));
     assert_eq!(
-        crate::workflows::workflow_output_path_mapping_summary(status.steps.iter().filter_map(
-            |step| {
-                step.output_path_mapping
-                    .as_ref()
-                    .map(|m| (step.workflow_key.as_ref().map(WorkflowKey::as_str), m))
-            }
-        )),
-        " Output path mappings: 'lane.b': requested report.md -> saved /tmp/out/report.md."
+        published.results[1]
+            .child_run_id
+            .as_ref()
+            .map(RunId::as_str),
+        Some("siblingrun")
+    );
+    assert_eq!(published.results[1].final_output.as_deref(), Some(""));
+    assert_eq!(
+        published.results[1].exit_code, 0,
+        "`:84` — a `Complete` step publishes as a success"
+    );
+
+    // The settled status kept the sibling's mapping — nothing in the rebuild clears it…
+    let settled = fixture.read_status().await;
+    assert_eq!(
+        settled.steps[1].output_path_mapping.as_ref(),
+        Some(&mapping)
+    );
+
+    // …and the mapping clause is concatenated onto the summary the completion line carries, which
+    // is the only place an operator ever reads it (SCOPE_8 §Y-5).
+    let events = fixture.events().await;
+    let line = events
+        .lines()
+        .find(|line| line.contains("subagent.workflow.completed"))
+        .expect("a promoted workflow journals its completion");
+    let event: serde_json::Value = serde_json::from_str(line).expect("valid json line");
+    let summary = event["summary"]
+        .as_str()
+        .expect("the completion line carries the settled summary");
+    assert!(
+        summary.ends_with(
+            " Output path mappings: 'lane.b': requested report.md -> saved /tmp/out/report.md."
+        ),
+        "{summary}"
     );
 }
 
@@ -1544,8 +1600,13 @@ async fn the_terminal_index_marker_is_written_for_a_settled_workflow() {
     );
 }
 
+/// SCOPE_8 deferred the ACTIVE run index to SCOPE_9 and guarded the deferral with
+/// `no_active_run_index_is_created`. SCOPE_9 has landed it: this call site now routes through
+/// `update_active_run_index`, so the index root DOES appear — and what must be asserted instead is
+/// the property that matters, that the settled run holds NO active marker once the terminal one is
+/// written.
 #[tokio::test]
-async fn no_active_run_index_is_created() {
+async fn the_settlement_releases_the_active_run_index_marker() {
     let fixture = Fixture::new();
     fixture
         .seed(&paused_workflow(
@@ -1577,10 +1638,18 @@ async fn no_active_run_index_is_created() {
     assert_eq!(
         names,
         vec![
+            ".active-runs".to_string(),
             ".terminal-runs".to_string(),
             fixture.run_id.as_str().to_string()
         ],
-        "the ACTIVE run index is SCOPE_9's surface and must not appear here"
+        "both index roots, and nothing else, sit beside the run directory"
+    );
+    assert_eq!(
+        crate::background::active_run_index::read_active_run_index(&fixture.async_root()).await,
+        Some(Vec::new()),
+        "a settled run must hold no active marker — the terminal index is written FIRST and the \
+         active entry released after it, so a process dying between the two leaves the run in both \
+         indexes rather than in neither"
     );
 }
 

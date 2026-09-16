@@ -706,6 +706,7 @@ mod tests {
                 .expect("write status");
 
             let file = ResultFile {
+                schedule_origin: None,
                 id: run.clone(),
                 run_id: run.clone(),
                 agent: "researcher".to_string(),

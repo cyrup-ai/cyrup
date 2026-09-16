@@ -245,12 +245,15 @@ impl SubagentExecutor {
     /// targets and the exact commands that stop each, rather than guessing one.
     ///
     /// Upstream's target list is `discoverStopTargets` = current-session queued/running async runs
-    /// (`formatAsyncStopTarget`, `:168-178`) PLUS scheduled runs (`scheduledStopTargets`, `:180-196`).
-    /// The `schedule.*` family is unported (it is the one part of pi's `SUBAGENT_ACTIONS` this
-    /// crate's schema deliberately omits, "MUST NOT be advertised until their manager exists"), so
-    /// the scheduled half contributes nothing here and only the async half renders — which is
-    /// exactly what upstream's own `scheduledStopTargets` `catch { return []; }` produces for a
-    /// runtime with no schedule store.
+    /// (`formatAsyncStopTarget`, `:187-198`) PLUS scheduled runs (`scheduledStopTargets`,
+    /// `:199-214`), and SUBA-016 landed the second half: a schedule that is armed and not yet
+    /// running is stoppable by PAUSING it, which is upstream's own `actionLabel` and its own
+    /// command. Without it a user who asks what they can stop is shown the running work and not
+    /// the work that is about to start — which is the half they can still do something about.
+    ///
+    /// Upstream's own `catch { return []; }` is reproduced by the `else` on the manager lookup: a
+    /// runtime with scheduled runs disabled contributes no scheduled targets and still renders the
+    /// async half.
     pub async fn format_stop_targets(&self, cwd: &Path) -> Result<String, String> {
         let roots = self.config_snapshot().await.roots;
         let async_root = default_async_root_in(&roots, cwd);
@@ -262,7 +265,30 @@ impl SubagentExecutor {
         )
         .await
         .map_err(|e| e.to_string())?;
-        if runs.is_empty() {
+        // pi `scheduledStopTargets` (`slash-commands.ts:199-214`): not paused, no active run, and
+        // an armed `nextRunAt` — i.e. a fire that has not happened yet and still can be prevented.
+        let mut scheduled: Vec<crate::background::scheduled_runs::ScheduleRecord> =
+            match self.scheduled_runs() {
+                Some(manager) => {
+                    let (records, _diagnostics) = manager.store().list().await;
+                    records
+                        .into_iter()
+                        .filter(|record| {
+                            !record.paused
+                                && record.active_run_id.is_none()
+                                && record.trigger.next_run_at().is_some()
+                        })
+                        .collect()
+                }
+                None => Vec::new(),
+            };
+        scheduled.sort_by(|left, right| {
+            left.trigger
+                .next_run_at()
+                .unwrap_or_default()
+                .cmp(right.trigger.next_run_at().unwrap_or_default())
+        });
+        if runs.is_empty() && scheduled.is_empty() {
             return Ok(
                 "No active current-session async runs or scheduled subagent runs to stop."
                     .to_string(),
@@ -285,6 +311,19 @@ impl SubagentExecutor {
                 "  stop async run: subagent({{ action: \"stop\", id: \"{id}\" }})"
             ));
             lines.push(format!("  slash: /subagents-stop {id}"));
+        }
+        for schedule in &scheduled {
+            lines.push(format!("- {} · {}", schedule.id, schedule.name));
+            lines.push(format!(
+                "  scheduled · {}",
+                schedule.trigger.next_run_at().unwrap_or("no next run")
+            ));
+            // pi `commandForTarget` (`:181-185`) — a schedule is stopped by PAUSING it, not by
+            // `action: "stop"`, which addresses a RUN and would find nothing.
+            lines.push(format!(
+                "  pause schedule: subagent({{ action: \"schedule.pause\", id: \"{}\" }})",
+                schedule.id
+            ));
         }
         Ok(lines.join("\n"))
     }

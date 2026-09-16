@@ -41,7 +41,17 @@ impl SubagentExecutor {
     ///   foreground and the `--background` shape;
     /// * `/chain`, `/parallel`, `/run-chain` — [`crate::extension::SubagentsExtension::run_or_background_chain`], the
     ///   single wrapper all three share, billed over the lowered graph
-    ///   ([`crate::extension::tool::task_items::count_graph_requested_spawns`]).
+    ///   ([`crate::extension::tool::task_items::count_graph_requested_spawns`]);
+    /// * SUBA-016 — **a FIRED SCHEDULE**, billed `1` inside
+    ///   [`crate::background::scheduled_runs::launch`] through
+    ///   [`crate::background::scheduled_runs::ScheduleLauncher::reserve_spawn_slot`], immediately
+    ///   BEFORE the `active.lock` claim so a refusal costs no lock. This is a FOURTH route into
+    ///   execution and it needs its own charge rather than inheriting one: `Tool::execute`
+    ///   dispatches `action` and RETURNS above this charge (`extension/tool/mod.rs`), so a
+    ///   `schedule.run`/`schedule.run-due` that launched a run through `route_action` would spend
+    ///   a child the session never paid for — and the timer fires runs with no tool call at all.
+    ///   A refused fire records `FailedLaunch` carrying this function's own message and ADVANCES
+    ///   `nextRunAt`, so a schedule at the cap does not hot-retry on every tick.
     ///
     /// The tool path never re-enters the slash wrapper (it reaches
     /// [`Self::run_or_background_graph`] via `route_chain_mode`/`route_parallel_mode`), so no

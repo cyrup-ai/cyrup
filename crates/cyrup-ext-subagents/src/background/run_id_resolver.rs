@@ -317,4 +317,50 @@ mod tests {
             .expect("no error");
         assert!(headless.is_some(), "a headless host is not filtered");
     }
+
+    /// SCOPE_13 — a run tombstone (`.deleting-run-*`,
+    /// [`crate::background::async_retention`]) is a DIRECTORY inside the async root, so without
+    /// the prefix arm on
+    /// [`crate::background::terminal_run_index::is_reserved_async_root_entry`] this resolver
+    /// would mint a phantom [`AsyncRunLocation`] for it — the failure mode the guard at the top
+    /// of `resolve_async_dir` names verbatim — and would let it poison an otherwise unique
+    /// prefix into an `Ambiguous` error.
+    #[test]
+    fn a_run_tombstone_never_resolves_and_never_makes_a_prefix_ambiguous() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let async_root = dir.path().join("async");
+        let results_dir = dir.path().join("results");
+        std::fs::create_dir_all(&async_root).expect("mkdir async_root");
+        std::fs::create_dir_all(&results_dir).expect("mkdir results_dir");
+        std::fs::create_dir_all(async_root.join("deadbeef0001")).expect("mkdir run dir");
+        // Two maintenance entries the reaper creates in this same root.
+        std::fs::create_dir_all(async_root.join(".deleting-run-deadbeef0001-1"))
+            .expect("mkdir tombstone");
+        std::fs::create_dir_all(async_root.join(".async-retention")).expect("mkdir maintenance");
+
+        // Addressed directly, the tombstone is not a run.
+        let direct = resolve_async_run_id(
+            ".deleting-run-deadbeef0001-1",
+            &async_root,
+            &results_dir,
+            None,
+        );
+        assert!(
+            matches!(direct, Ok(None)),
+            "a tombstone must never mint an AsyncRunLocation: {direct:?}"
+        );
+        let maintenance = resolve_async_run_id(".async-retention", &async_root, &results_dir, None);
+        assert!(matches!(maintenance, Ok(None)), "{maintenance:?}");
+
+        // And it does not count toward a prefix match, so the real run still resolves uniquely.
+        let by_prefix = resolve_async_run_id("deadbeef", &async_root, &results_dir, None)
+            .expect("the tombstone must not make this prefix ambiguous")
+            .expect("the real run still resolves");
+        assert_eq!(by_prefix.resolved_id.as_str(), "deadbeef0001");
+        assert_eq!(
+            find_async_run_prefix_matches(".deleting", &async_root, &results_dir, None).len(),
+            0,
+            "and no prefix ever enumerates a tombstone"
+        );
+    }
 }

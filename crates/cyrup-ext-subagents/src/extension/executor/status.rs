@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::background::{RunId, RunPaths, RunState, run_status};
 use crate::extension::executor::SubagentExecutor;
+use crate::extension::executor::foreground_transcript;
 use crate::extension::executor::paths::{default_async_root_in, default_results_dir_in};
 use crate::extension::executor::requests::StatusViewSelector;
 use crate::extension::host::native_impl::read_nested_children;
@@ -372,47 +373,64 @@ impl SubagentExecutor {
                         .to_string(),
                 );
             }
-            let runs = run_status::list_active_runs(
-                &async_root,
-                &results_dir,
-                self.current_session_id().as_deref(),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-            if !transcript {
-                // SCOPE_11 — pi `run-status.ts:390-393`, the ONE place upstream renders armed
-                // subscriptions: `[formatAsyncRunList(runs), waitSubscriptions].filter(Boolean)
-                // .join("\n\n")`. Not the by-id form below, not the by-dir form, and not the
-                // fleet view above — upstream renders it here and nowhere else.
-                //
-                // No session filtering happens here and none is needed: `armed()` is
-                // session-scoped BY CONSTRUCTION (its only two writers are `arm`, which stamps the
-                // live session, and `restore`, which is gated on it). `filter(Boolean)` is the
-                // `None` drop.
-                let armed = self
-                    .wait_subscriptions()
-                    .map(|manager| manager.armed())
-                    .unwrap_or_default();
-                let subscriptions =
-                    crate::background::wait_subscriptions::format_wait_subscriptions(
-                        &armed,
-                        crate::time::now_epoch_millis(),
-                    );
-                let runs = run_status::format_run_list(&runs);
-                return Ok(match subscriptions {
-                    Some(subscriptions) => format!("{runs}\n\n{subscriptions}"),
-                    None => runs,
-                });
-            }
-            match runs.as_slice() {
-                [only] => resolved_id = Some(only.status.run_id.as_str().to_string()),
-                [] => return Err("No active async run transcript is available.".to_string()),
-                many => {
-                    return Err(format!(
-                        "Transcript view requires an id when {} active async runs exist. Use \
+            // SCOPE_10 — pi `run-status.ts:367-371`. Runs BEFORE the `listAsyncRuns` fallback
+            // below (`:381`): a live foreground run in THIS session is the answer to a bare
+            // `view: "transcript"`, and only if there is none does the async listing get a turn.
+            let foreground = if transcript {
+                crate::identity::SessionId::parse_opt(self.current_session_id().as_deref())
+                    .and_then(|current| self.most_recent_live_foreground_run(&current))
+            } else {
+                None
+            };
+            if let Some(run_id) = foreground {
+                // pi `return inspectSubagentStatus({ ...params, id: foreground.runId }, deps)`
+                // (`:371`) — a RE-ENTRY with the resolved id, which lands in the by-id foreground
+                // arm of branch (4) below. Assigning `resolved_id` is that re-entry without the
+                // second pass over branches already taken.
+                resolved_id = Some(run_id);
+            } else {
+                let runs = run_status::list_active_runs(
+                    &async_root,
+                    &results_dir,
+                    self.current_session_id().as_deref(),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                if !transcript {
+                    // SCOPE_11 — pi `run-status.ts:390-393`, the ONE place upstream renders armed
+                    // subscriptions: `[formatAsyncRunList(runs), waitSubscriptions].filter(Boolean)
+                    // .join("\n\n")`. Not the by-id form below, not the by-dir form, and not the
+                    // fleet view above — upstream renders it here and nowhere else.
+                    //
+                    // No session filtering happens here and none is needed: `armed()` is
+                    // session-scoped BY CONSTRUCTION (its only two writers are `arm`, which stamps the
+                    // live session, and `restore`, which is gated on it). `filter(Boolean)` is the
+                    // `None` drop.
+                    let armed = self
+                        .wait_subscriptions()
+                        .map(|manager| manager.armed())
+                        .unwrap_or_default();
+                    let subscriptions =
+                        crate::background::wait_subscriptions::format_wait_subscriptions(
+                            &armed,
+                            crate::time::now_epoch_millis(),
+                        );
+                    let runs = run_status::format_run_list(&runs);
+                    return Ok(match subscriptions {
+                        Some(subscriptions) => format!("{runs}\n\n{subscriptions}"),
+                        None => runs,
+                    });
+                }
+                match runs.as_slice() {
+                    [only] => resolved_id = Some(only.status.run_id.as_str().to_string()),
+                    [] => return Err("No active async run transcript is available.".to_string()),
+                    many => {
+                        return Err(format!(
+                            "Transcript view requires an id when {} active async runs exist. Use \
                          subagent({{ action: \"status\", view: \"fleet\" }}) to choose one.",
-                        many.len()
-                    ));
+                            many.len()
+                        ));
+                    }
                 }
             }
         }
@@ -420,18 +438,56 @@ impl SubagentExecutor {
         // (4) the ordinary id/dir resolution. pi precedence (`run-status.ts:131`): a bare `id` (no
         // `dir`) resolves by id; otherwise a present `dir` resolves the directory directly.
         if !transcript {
+            // S6 — the renderer is HANDED the two live registries it may not lock across an
+            // `.await`; see `run_status::RunStatusRenderDeps`.
+            let deps = self.run_status_render_deps();
             return match (resolved_id.as_deref(), dir) {
-                (Some(id), None) => run_status::inspect_status_by_id(&async_root, &results_dir, id)
-                    .await
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| "Async run not found. Provide id or dir.".to_string()),
-                (_, Some(dir)) => run_status::inspect_status_by_dir(Path::new(dir), &results_dir)
-                    .await
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| "Async run not found. Provide id or dir.".to_string()),
+                (Some(id), None) => {
+                    run_status::inspect_status_by_id(&async_root, &results_dir, id, &deps)
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| "Async run not found. Provide id or dir.".to_string())
+                }
+                (_, Some(dir)) => {
+                    run_status::inspect_status_by_dir(Path::new(dir), &results_dir, &deps)
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| "Async run not found. Provide id or dir.".to_string())
+                }
                 // Unreachable: branch (3) either returned or filled `resolved_id`.
                 (None, None) => Err("Async run not found. Provide id or dir.".to_string()),
             };
+        }
+
+        // SCOPE_10 — pi `run-status.ts:412-416`: `resolveSubagentRunId(...).kind === "foreground"`
+        // is answered by the `foreground_controls` registry itself
+        // (`nested_control.rs`'s `resolve_live_foreground_run`, exact-then-unique-prefix, the same
+        // rule every other selector honours). A live foreground run has no `status.json` to
+        // reconcile, so this MUST run before the async resolution below — without it the id falls
+        // through to `Async run not found. Provide id or dir.`
+        if let Some(id) = resolved_id.as_deref()
+            && dir.is_none()
+            && let Some(control_run_id) = self.resolve_live_foreground_run(id)
+        {
+            // Cloned out of the lock section: the entry derives `Clone` for exactly this, and
+            // everything below is `async`/IO.
+            let control = {
+                let controls = self
+                    .foreground_controls
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                controls.get(&control_run_id).cloned()
+            };
+            if let Some(control) = control {
+                let state = self.live_foreground_transcript_state(cwd).await;
+                return foreground_transcript::format_live_foreground_transcript(
+                    &control,
+                    &control_run_id,
+                    &state,
+                    index,
+                    lines,
+                );
+            }
         }
 
         let (status, paths) = match (resolved_id.as_deref(), dir) {
@@ -521,6 +577,104 @@ impl SubagentExecutor {
             },
         )
         .await
+    }
+
+    /// S6 — pi's `deps` subset the single-run status renderer reads
+    /// (`run-status.ts:609-613`), materialised from this executor's two live registries.
+    ///
+    /// Built HERE rather than read inside the renderer for the reason
+    /// [`run_status::RunStatusRenderDeps`] states at length: both registries are
+    /// `std::sync::Mutex`es and the renderer is `async`, so the projection crosses the boundary
+    /// as a value and no lock is ever held across an `.await`.
+    fn run_status_render_deps(&self) -> run_status::RunStatusRenderDeps {
+        let foreground_controls: Vec<run_status::LiveWorkflowControlCandidate> = {
+            let controls = self
+                .foreground_controls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            controls
+                .iter()
+                .map(|(run_id, entry)| run_status::LiveWorkflowControlCandidate {
+                    run_id: run_id.clone(),
+                    session_id: entry.session_id.clone(),
+                    parent_workflow_run_id: entry.parent_workflow_run_id.clone(),
+                    // `active_children` is a `BTreeMap`, so these keys are already ascending
+                    // and pi's `:687` numeric sort is a no-op — see the candidate's own doc.
+                    child_indexes: entry.active_children.keys().copied().collect(),
+                })
+                .collect()
+        };
+        run_status::RunStatusRenderDeps {
+            current_session: crate::identity::SessionId::parse_opt(
+                self.current_session_id().as_deref(),
+            ),
+            live_workflow_run_ids: self.live_workflow_run_ids(),
+            foreground_controls,
+        }
+    }
+
+    /// pi `run-status.ts:368-370` — the live foreground control a bare `view: "transcript"`
+    /// resolves to, session-filtered and most-recently-updated first.
+    ///
+    /// # `:368` IS expressible as `Some(&current)` equality, and S6's `:611` is not
+    ///
+    /// The asymmetry is upstream's and is worth naming: `:367`'s `deps.state?.currentSessionId`
+    /// truthiness guard makes the current session known-`Some` before `:368` compares, so the
+    /// `None`/`None` row that makes S6's comparison unrepresentable as a
+    /// [`crate::background::delivery::SessionGate`] simply cannot arise here. The caller performs
+    /// that hoist by passing a `&SessionId`.
+    ///
+    /// # `[CYRUP-DELTA, unrepresentable]` — `state.lastForegroundControlId` has no port
+    ///
+    /// Upstream's `:369` prefers the control the host last activated
+    /// (`controls.find((c) => c.runId === deps.state?.lastForegroundControlId)`) and only then
+    /// falls back to `:370`'s `updatedAt` DESC sort. cyrup writes no such field — upstream's five
+    /// writers are `extension/index.ts:472,954`, `subagent-executor.ts:545,551` and
+    /// `async-job-tracker.ts:759`, none of which has a cyrup counterpart — so the selection
+    /// degenerates to `:370` alone. That is a DEGRADATION, not an equivalence: with two live
+    /// controls in one session the host's own last-activated one may not be the most recently
+    /// updated. [`ForegroundControlEntry::updated_at`] is bumped on every control-event
+    /// transition, so the fallback is the sharpest signal in the tree today; porting the field is
+    /// a separate task with its own writers.
+    ///
+    /// The run-id tie-break is cyrup's: upstream's `sort` is stable over a `Map`'s insertion
+    /// order, and a `HashMap` has none, so ties resolve ascending by id rather than
+    /// unpredictably.
+    fn most_recent_live_foreground_run(
+        &self,
+        current: &crate::identity::SessionId,
+    ) -> Option<String> {
+        let controls = self
+            .foreground_controls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        controls
+            .iter()
+            // `:368` — the control list is SESSION-FILTERED.
+            .filter(|(_, entry)| entry.session_id.as_ref() == Some(current))
+            .max_by(|(left_id, left), (right_id, right)| {
+                left.updated_at
+                    .cmp(&right.updated_at)
+                    .then_with(|| right_id.cmp(left_id))
+            })
+            .map(|(run_id, _)| run_id.clone())
+    }
+
+    /// The `deps.state` subset [`foreground_transcript::format_live_foreground_transcript`] reads
+    /// (pi `run-status.ts:265` plus the `:249` gate's left-hand side).
+    async fn live_foreground_transcript_state(
+        &self,
+        cwd: &Path,
+    ) -> foreground_transcript::LiveForegroundTranscriptState {
+        let services = self.host_services();
+        foreground_transcript::LiveForegroundTranscriptState {
+            current_session: crate::identity::SessionId::parse_opt(
+                self.current_session_id().as_deref(),
+            ),
+            parent_session_file: services.as_ref().and_then(|s| s.session_file()),
+            base_cwd: cwd.to_path_buf(),
+            artifact_dir_preference: self.config_snapshot().await.artifact_dir_preference(),
+        }
     }
 
     /// The live foreground runs the fleet view renders (pi `[...state.foregroundControls.values()]`,
@@ -647,6 +801,280 @@ mod tests {
         assert_eq!(
             err,
             "Child-safe subagent status requires an id when no foreground run is active."
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // SCOPE_10 SUBTASK3 — the live-foreground transcript, its `:249` gate and its `:368` selector.
+    //
+    // Every test below fails on the pre-SCOPE_10 tree for one shared reason: a foreground run id
+    // was not resolvable at all here (`run_status::resolve_run_id` scans only ASYNC run
+    // directories), so `view: "transcript"` answered every one of these inputs with
+    // `Async run not found. Provide id or dir.` and the no-id branch never consulted
+    // `foreground_controls`.
+    // ---------------------------------------------------------------------------------------
+
+    use crate::extension::executor::foreground_control::ForegroundChildEntry;
+    use crate::extension::executor::notices::ForegroundControlEntry;
+    use crate::extension::testsupport::FixedSessionIdHost;
+    use std::sync::Arc;
+
+    fn child(index: usize, agent: &str) -> ForegroundChildEntry {
+        ForegroundChildEntry {
+            index,
+            agent: agent.to_string(),
+            session_name: None,
+            description: None,
+            started_at: 0,
+            updated_at: 0,
+            current_activity_state: None,
+            current_tool: None,
+            current_path: None,
+            turn_count: None,
+            tool_count: None,
+            tokens: None,
+            interrupt: cyrup_core::CancelToken::new(),
+            steer: None,
+        }
+    }
+
+    fn register_control(
+        executor: &SubagentExecutor,
+        run_id: &str,
+        session: Option<&str>,
+        updated_at: i64,
+        children: &[usize],
+    ) {
+        let entry = ForegroundControlEntry {
+            interrupt: cyrup_core::CancelToken::new(),
+            current_agent: None,
+            current_index: None,
+            current_activity_state: None,
+            mode: crate::background::RunMode::Single,
+            description: None,
+            current_tool: None,
+            current_path: None,
+            turn_count: None,
+            tool_count: None,
+            tokens: None,
+            started_at: 0,
+            updated_at,
+            session_id: session.and_then(crate::identity::SessionId::parse),
+            parent_workflow_run_id: None,
+            workflow_key: None,
+            cwd: None,
+            session_name: None,
+            active_children: children
+                .iter()
+                .map(|index| (*index, child(*index, "scout")))
+                .collect(),
+        };
+        executor
+            .foreground_controls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(run_id.to_string(), entry);
+    }
+
+    fn transcript_view<'a>() -> StatusViewSelector<'a> {
+        StatusViewSelector {
+            view: Some("transcript"),
+            lines: None,
+            index: None,
+        }
+    }
+
+    /// pi `run-status.ts:249-251`, STRICT: a foreground run owned by ANOTHER session is refused
+    /// with upstream's verbatim sentence rather than rendered. `foreground_controls` is a
+    /// per-process registry, but two cyrup instances share one cwd and one artifact root, and the
+    /// transcript is the child's whole conversation.
+    #[tokio::test]
+    async fn a_foreground_transcript_of_a_foreign_run_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executor = SubagentExecutor::new();
+        executor.set_host_services(Arc::new(FixedSessionIdHost {
+            id: Some("session-a".to_string()),
+            file: None,
+        }));
+        register_control(&executor, "fg0000000001", Some("session-b"), 0, &[0]);
+
+        let err = executor
+            .control_status_view(
+                dir.path(),
+                Some("fg0000000001"),
+                None,
+                false,
+                transcript_view(),
+            )
+            .await
+            .expect_err("a foreign foreground run is refused");
+        assert_eq!(
+            err,
+            "Foreground run 'fg0000000001' is not owned by the current session."
+        );
+    }
+
+    /// `:249`'s FIRST arm, `!state.currentSessionId` — the arm that distinguishes
+    /// `SessionGate::Strict` from `Permissive`. A host with no session identity is refused even
+    /// though the control it is asking about records no session either, because with no identity
+    /// there is nothing to establish ownership WITH.
+    #[tokio::test]
+    async fn a_foreground_transcript_with_no_session_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // No host services bound at all: `current_session_id()` is `None`.
+        let executor = SubagentExecutor::new();
+        register_control(&executor, "fg0000000001", None, 0, &[0]);
+
+        let err = executor
+            .control_status_view(
+                dir.path(),
+                Some("fg0000000001"),
+                None,
+                false,
+                transcript_view(),
+            )
+            .await
+            .expect_err("a sessionless host cannot own a foreground run");
+        assert_eq!(
+            err,
+            "Foreground run 'fg0000000001' is not owned by the current session."
+        );
+    }
+
+    /// `:368` — the no-id transcript branch consults `foreground_controls` FIRST, and the list it
+    /// consults is SESSION-FILTERED. The foreign control below is deliberately the most recently
+    /// updated one, so an unfiltered `:370` sort would pick it.
+    #[tokio::test]
+    async fn the_transcript_control_list_is_session_filtered() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executor = SubagentExecutor::new();
+        executor.set_host_services(Arc::new(FixedSessionIdHost {
+            id: Some("session-a".to_string()),
+            file: None,
+        }));
+        register_control(&executor, "fgown0000001", Some("session-a"), 10, &[0]);
+        register_control(&executor, "fgforeign001", Some("session-b"), 999, &[0]);
+
+        let report = executor
+            .control_status_view(dir.path(), None, None, false, transcript_view())
+            .await
+            .expect("the session's own live foreground run answers a bare transcript request");
+        assert!(report.contains("Run: fgown0000001"), "{report}");
+        assert!(report.contains("State: live foreground"), "{report}");
+        assert!(!report.contains("fgforeign001"), "{report}");
+    }
+
+    /// `:370` — among the session's OWN live controls, the most recently updated wins.
+    ///
+    /// [CYRUP-DELTA] upstream's `:369` first prefers `state.lastForegroundControlId`, which cyrup
+    /// does not record; see `most_recent_live_foreground_run`'s own note. This test pins the
+    /// fallback that remains, which is the whole selection here.
+    #[tokio::test]
+    async fn the_no_id_transcript_prefers_the_most_recently_updated_live_control() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executor = SubagentExecutor::new();
+        executor.set_host_services(Arc::new(FixedSessionIdHost {
+            id: Some("session-a".to_string()),
+            file: None,
+        }));
+        register_control(&executor, "fgolder00001", Some("session-a"), 10, &[0]);
+        register_control(&executor, "fgnewer00001", Some("session-a"), 20, &[0]);
+
+        let report = executor
+            .control_status_view(dir.path(), None, None, false, transcript_view())
+            .await
+            .expect("a live foreground run answers a bare transcript request");
+        assert!(report.contains("Run: fgnewer00001"), "{report}");
+    }
+
+    /// `:259` — a control with no active child REPORTS that, as a rendered line, instead of
+    /// failing. The distinction matters: "there is nothing to show yet" is an answer, and an
+    /// error would send the caller looking for a broken run.
+    #[tokio::test]
+    async fn a_live_foreground_transcript_with_no_active_child_reports_it_rather_than_failing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executor = SubagentExecutor::new();
+        executor.set_host_services(Arc::new(FixedSessionIdHost {
+            id: Some("session-a".to_string()),
+            file: None,
+        }));
+        register_control(&executor, "fg0000000001", Some("session-a"), 0, &[]);
+
+        let report = executor
+            .control_status_view(
+                dir.path(),
+                Some("fg0000000001"),
+                None,
+                false,
+                transcript_view(),
+            )
+            .await
+            .expect("no active child is a rendered notice, not an error");
+        assert_eq!(
+            report,
+            "Run: fg0000000001\nState: live foreground\nTranscript unavailable: no active \
+             foreground child."
+        );
+    }
+
+    /// `:260-262` — with several children live and no `index`, the refusal ENUMERATES the
+    /// indexes, so the caller's next call is a copy-edit rather than a guess.
+    #[tokio::test]
+    async fn a_live_foreground_transcript_requires_an_index_when_several_children_are_active() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executor = SubagentExecutor::new();
+        executor.set_host_services(Arc::new(FixedSessionIdHost {
+            id: Some("session-a".to_string()),
+            file: None,
+        }));
+        register_control(&executor, "fg0000000001", Some("session-a"), 0, &[0, 2]);
+
+        let err = executor
+            .control_status_view(
+                dir.path(),
+                Some("fg0000000001"),
+                None,
+                false,
+                transcript_view(),
+            )
+            .await
+            .expect_err("an ambiguous child selection is refused");
+        assert_eq!(
+            err,
+            "Transcript view requires index for foreground run 'fg0000000001'. Active child \
+             indexes: 0, 2."
+        );
+
+        // …and naming one of them renders it.
+        let report = executor
+            .control_status_view(
+                dir.path(),
+                Some("fg0000000001"),
+                None,
+                false,
+                StatusViewSelector {
+                    index: Some(2),
+                    ..transcript_view()
+                },
+            )
+            .await
+            .expect("a named child renders");
+        assert!(report.contains("Child: 2 (scout)"), "{report}");
+    }
+
+    /// S6's executor half: the deps handed to the renderer carry each control's session, its
+    /// parent workflow id and its ACTIVE CHILD INDEXES, already ascending — which is what lets
+    /// `run_status.rs` skip upstream's `:687` numeric sort.
+    #[test]
+    fn the_run_status_render_deps_project_active_child_indexes_in_ascending_order() {
+        let executor = SubagentExecutor::new();
+        register_control(&executor, "fg0000000001", Some("session-a"), 0, &[5, 0, 2]);
+        let deps = executor.run_status_render_deps();
+        assert_eq!(deps.foreground_controls.len(), 1);
+        assert_eq!(deps.foreground_controls[0].child_indexes, vec![0, 2, 5]);
+        assert_eq!(
+            deps.foreground_controls[0].session_id,
+            crate::identity::SessionId::parse("session-a")
         );
     }
 }

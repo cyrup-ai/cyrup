@@ -1152,6 +1152,7 @@ mod tests {
             .expect("Running -> Complete is legal");
         write_status(&paths, &status).await;
         let result = crate::background::ResultFile {
+            schedule_origin: None,
             id: run_id.clone(),
             run_id: run_id.clone(),
             agent: "researcher".to_string(),

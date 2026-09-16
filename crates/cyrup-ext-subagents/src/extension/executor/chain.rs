@@ -388,6 +388,8 @@ impl SubagentExecutor {
                         // SUBA-073: no policy on this path — same pre-existing incompleteness as
                         // `turn_budget` immediately above; not this task's fix to extend.
                         permission_rules: None,
+                        // SCOPE_9: a fresh background chain/parallel run, never a resume.
+                        transfer_from: None,
                         steps: graph,
                         mode,
                         session_file: first_session_file,

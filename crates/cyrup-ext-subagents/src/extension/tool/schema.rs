@@ -609,6 +609,27 @@ pub(crate) fn subagent_tool_parameters() -> serde_json::Value {
         serde_json::json!({ "type": "string", "description": "Summary for mission.close, or the resolution text for mission.resolve-decision." }),
     );
 
+    // SUBA-016 — the schedule surface (`extension/schemas.ts:279`, `:311-318`, `:345` @v0.68.0),
+    // advertised together with its dispatch arm (`route_action`'s `schedule.*` case) and its
+    // reader (`SubagentToolParams::schedule_action_params`), per the crate's
+    // advertise-vs-dispatch invariant. `id`/`timeoutMs`/`cwd`/`workflowScript` already exist above
+    // and are shared.
+    //
+    // `on` and `timezone` are DECLARED AND REFUSED, deliberately: upstream answers a calendar
+    // schedule with an actionable sentence naming the fixed-interval form to use instead, and a
+    // model can only receive that sentence if the schema let the call through in the first place.
+    props.insert("name".to_string(), serde_json::json!({ "type": "string", "description": "Display name for schedule.create. Omitted: derived from the workflowScript target." }));
+    props.insert("at".to_string(), serde_json::json!({ "type": "string", "description": "schedule.create: delay (+10m) or zoned ISO timestamp." }));
+    props.insert("every".to_string(), serde_json::json!({ "type": "string", "description": "schedule.create interval, e.g. 30m/6h/2d/2w." }));
+    props.insert("sessionOnly".to_string(), serde_json::json!({ "type": "boolean", "description": "schedule.create: fire only while the creating session is live. Omitted: the schedule is project-wide and outlives this session." }));
+    props.insert("quiet".to_string(), serde_json::json!({ "type": "boolean", "description": "schedule.create (recurring only) or schedule.run: deliver the completion without waking a turn. Omitted: a completion wakes the turn like any other." }));
+    props.insert("on".to_string(), serde_json::json!({ "anyOf": [{ "type": "string" }, { "type": "integer" }], "description": "Reserved calendar selector." }));
+    props.insert("timezone".to_string(), serde_json::json!({ "type": "string", "description": "Reserved calendar timezone; calendar schedules are not supported yet." }));
+    props.insert("overlap".to_string(), serde_json::json!({ "type": "string", "enum": ["skip"], "description": "schedule.create overlap policy. Only skip is supported: a fire while the previous run is still going is recorded as skipped." }));
+    props.insert("catchUp".to_string(), serde_json::json!({ "type": "string", "enum": ["none", "latest"], "description": "Missed schedule occurrences; default latest." }));
+    props.insert("baseRef".to_string(), serde_json::json!({ "type": "string", "description": "Git ref a scheduled run should execute against. Not honoured yet; schedule.create refuses it rather than running against the wrong tree." }));
+    props.insert("args".to_string(), serde_json::json!({ "type": "object", "additionalProperties": true, "description": "Arguments object a scheduled workflowScript runs with. Omitted: an empty object." }));
+
     serde_json::json!({
         "type": "object",
         "additionalProperties": true,
@@ -877,7 +898,19 @@ mod tests {
                 "watchdog.status",
                 "watchdog.check",
                 "watchdog.configure",
-                "watchdog.recommend-model"
+                "watchdog.recommend-model",
+                // SUBA-016 — pi's own index for the nine `schedule.*` verbs
+                // (`shared/types.ts:2760` @v0.68.0 ends `… "watchdog.recommend-model",
+                // "schedule.create", … "schedule.delete"`).
+                "schedule.create",
+                "schedule.list",
+                "schedule.show",
+                "schedule.history",
+                "schedule.pause",
+                "schedule.resume",
+                "schedule.run",
+                "schedule.run-due",
+                "schedule.delete"
             ],
             "the action enum must be pi's SUBAGENT_ACTIONS in pi's own order, for the verbs cyrup \
              dispatches"

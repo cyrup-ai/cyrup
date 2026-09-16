@@ -63,6 +63,29 @@ const SCRATCH_SUBDIR: &str = "scratch";
 /// registration is not a result.
 const SUBSCRIPTIONS_SUBDIR: &str = "wait-subscriptions";
 
+/// Path segment, under [`temp_root_dir`], holding one directory per SESSION's active-async
+/// capacity pool ([`crate::background::active_async_capacity`]) — pi `ACTIVE_ASYNC_CAPACITY_DIR`,
+/// `path.join(TEMP_ROOT_DIR, "session-active-async-capacity")`
+/// (`runs/background/active-async-capacity.ts:10` @v0.66.0, byte-identical at `v0.68.0`).
+///
+/// # THE ONE ROOT IN THIS CRATE KEYED BY SESSION AND BY NOTHING ELSE
+///
+/// [`ASYNC_SUBDIR`], [`RESULTS_SUBDIR`], [`SCRATCH_SUBDIR`] and [`SUBSCRIPTIONS_SUBDIR`] are all
+/// keyed by [`cwd_key`] — the working directory, and nothing else (see [`RunArtifactRoots`]'s own
+/// `# EVERY cyrup instance in a directory resolves these SAME two paths`). This one is keyed by
+/// [`crate::identity::SessionId`] instead, and the two consequences are exactly the inverse of
+/// that block's:
+///
+/// * two cyrup instances running in the SAME working directory hold **different** pools, which is
+///   the whole point of the cap being per session — one instance's fan-out cannot starve another
+///   instance sharing the directory;
+/// * the SAME session opened against two different working directories holds **one** pool, so a
+///   single session's runs across two projects compete for one cap.
+///
+/// A reader who assumes this file's cwd-keying convention will place a capacity path wrong, which
+/// is why the convention's own doc block carries the reciprocal pointer back here.
+const CAPACITY_SUBDIR: &str = "session-active-async-capacity";
+
 /// One segment of a temp-scope id, with every character outside the keep-set — ASCII
 /// alphanumerics plus `.`, `_` and `-`, i.e. [`crate::workflows::WorkflowKey`]'s alphabet —
 /// collapsed to a single `-` and leading/trailing `-` stripped; an empty result becomes
@@ -290,6 +313,11 @@ pub(crate) fn cwd_key(cwd: &Path) -> String {
 ///
 /// A reader who needs "only my runs" must filter by
 /// [`crate::background::RunStatus::session_id`], never by directory.
+///
+/// There is exactly ONE exception in this file: [`active_async_capacity_root_in`] is keyed by
+/// session rather than by [`cwd_key`], because the cap it addresses is per session by definition.
+/// Everything else here — async, results, scratch, wait-subscriptions — is keyed as described
+/// above.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunArtifactRoots {
     /// `<temp_root_dir>/async/<cwd_key>` — passed as `RunPaths::for_run`'s `async_root`.
@@ -338,6 +366,51 @@ pub fn wait_subscriptions_dir_in(roots: &crate::paths::Roots, cwd: &Path) -> Pat
         .run_scratch()
         .join(SUBSCRIPTIONS_SUBDIR)
         .join(cwd_key(cwd))
+}
+
+/// The per-SESSION root [`crate::background::active_async_capacity`] keeps its slot pools under:
+/// `<temp_root_dir>/session-active-async-capacity`. pi `ACTIVE_ASYNC_CAPACITY_DIR`
+/// (`active-async-capacity.ts:10` @v0.66.0).
+///
+/// The same arithmetic, against the same resolved [`crate::paths::Roots`], as
+/// [`run_artifact_roots_in`] and [`wait_subscriptions_dir_in`] — **minus the [`cwd_key`] join**.
+/// See [`CAPACITY_SUBDIR`] for why that omission is the feature and not an oversight.
+///
+/// Takes a resolved [`crate::paths::Roots`] rather than re-reading the environment, for
+/// [`run_artifact_roots_in`]'s stated reason: "the optional form put this decision in the callee,
+/// where it could be answered differently from the same decision made two frames up". Pure path
+/// arithmetic; creation is the caller's job.
+#[must_use]
+pub fn active_async_capacity_root_in(roots: &crate::paths::Roots) -> PathBuf {
+    roots.run_scratch().join(CAPACITY_SUBDIR)
+}
+
+/// One session's capacity pool: `<capacity root>/<IndexSegment(session)>` — pi `sessionDir`
+/// (`active-async-capacity.ts:95-97` @v0.66.0), whose own key is `sha256(sessionId)`.
+///
+/// # One key, never the alias fan-out
+///
+/// The segment comes from [`crate::identity::IndexSegment::encode`], never
+/// [`crate::identity::IndexSegment::read_aliases`] — the same single-key discipline
+/// `terminal_run_index`'s `session_index_dir` applies, and for a sharper reason here: every owner
+/// record in the pool re-states its own `ownerSessionId`, and reconciliation re-verifies it
+/// against the session it was asked about, so the single hashed key is safe as an address. Fanning
+/// out over aliases would let ONE session hold TWO pools, which would defeat the cap entirely.
+///
+/// [CYRUP-DELTA] pi hashes the session id with a bare `sha256` hex digest and no encoder
+/// (`activeAsyncCapacitySessionKey`, `:91-93`). cyrup routes it through the crate's one path-segment
+/// encoder instead, so a session id that is already a safe component stays human-readable on disk
+/// and a session id that is a full `.jsonl` PATH still collapses to exactly one component. Nothing
+/// cross-implementation reads this tree — unlike the terminal-run index, it is scratch state for
+/// live admission decisions only — so byte-compatibility with pi's digest buys nothing, while a
+/// second hashing scheme in a crate that already has one costs a reader a wrong assumption.
+#[must_use]
+pub fn active_async_capacity_session_dir(
+    roots: &crate::paths::Roots,
+    session_id: &crate::identity::SessionId,
+) -> PathBuf {
+    active_async_capacity_root_in(roots)
+        .join(crate::identity::IndexSegment::encode(session_id.as_str()).as_str())
 }
 
 /// The per-`cwd` directory `exec::run_sync` writes its per-attempt raw-stdout tee

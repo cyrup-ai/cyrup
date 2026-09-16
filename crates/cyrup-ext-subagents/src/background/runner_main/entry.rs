@@ -299,6 +299,24 @@ pub(super) async fn publish_initial_status(
         .await;
         return None;
     }
+
+    // SCOPE_9/SUBTASK5 — the ACTIVE arm of pi's `updateActiveRunIndex` router
+    // (`active-run-index.ts:81-95`). This is the one call site that files a marker rather than
+    // releasing one: the run has just become `Running`, and until it does, "which runs are in
+    // flight" can only be answered by reading every run directory in the shared per-cwd async
+    // root. Issued AFTER the status write so the marker never advertises a run whose own record
+    // failed to land. Best-effort and logged, the contract every index call site in this crate
+    // shares.
+    if let Err(err) =
+        crate::background::active_run_index::update_active_run_index(&run_paths.run_dir, &status)
+            .await
+    {
+        tracing::warn!(
+            run_id = %status.run_id,
+            error = %err,
+            "failed to write the async active-run index marker; the run itself is unaffected"
+        );
+    }
     Some(status)
 }
 

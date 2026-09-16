@@ -12,12 +12,14 @@ pub(crate) mod foreground;
 pub(crate) mod foreground_actions;
 pub(crate) mod foreground_control;
 pub(crate) mod foreground_history;
+pub(crate) mod foreground_transcript;
 pub(crate) mod nested_control;
 pub(crate) mod notices;
 pub(crate) mod paths;
 pub(crate) mod reports;
 pub(crate) mod requests;
 pub(crate) mod resolve;
+pub(crate) mod scheduled_runs;
 pub(crate) mod session_state;
 pub(crate) mod spawn_budget;
 pub(crate) mod status;
@@ -26,6 +28,7 @@ pub(crate) mod workflow;
 pub(crate) mod workflow_child_stops;
 pub(crate) mod workflow_controllers;
 pub(crate) mod workflow_detach;
+pub(crate) mod workflow_launch;
 pub(crate) mod workflow_steering;
 
 use std::collections::HashMap;
@@ -67,7 +70,7 @@ pub struct SubagentExecutor {
     /// teardown (`extension/index.ts:1044`): `install_completion_watcher` is re-run on EVERY
     /// `SessionStart`, and without an abort a rapid session loop would stack one sleeping sweep per
     /// start. Aborting is also all that is needed — the sweep holds nothing but a path.
-    retention_sweep: AsyncMutex<Option<tokio::task::JoinHandle<()>>>,
+    retention_sweep: AsyncMutex<Option<crate::extension::executor::notices::RetentionSweepHandle>>,
     /// SUBA-034 — the in-process completion bus (pi's `SUBAGENT_ASYNC_COMPLETE_EVENT`). Published
     /// into by the watcher installed above (as one member of its observer fan-out) and subscribed
     /// to by the `wait` tool, so a wait wakes on the observation of a terminal result instead of
@@ -94,6 +97,11 @@ pub struct SubagentExecutor {
     /// watcher's composite must reach whichever manager is current at observation time — the two
     /// are rebuilt on independent `SessionStart` edges.
     wait_subscriptions: wait_subscriptions::WaitSubscriptionSlot,
+    /// SUBA-016 — the scheduled-run manager for this session, installed on `SessionStart` and
+    /// disposed on `SessionShutdown`. A SHARED slot for the same reason
+    /// [`Self::wait_subscriptions`] is one: the `schedule.*` tool arm must reach whichever manager
+    /// is current at dispatch time, and the two are rebuilt on independent `SessionStart` edges.
+    scheduled_runs: scheduled_runs::Slot,
     /// `ASYNC_NOTIFY_BUG_REPORT` F3.5 — the claim/answer ledger the `wait` tool (and the headless
     /// auto-drain) share with the completion watcher's delivery decorator
     /// ([`crate::background::watch::InlineAnsweredSink`]), so a value a live wait already
@@ -297,6 +305,7 @@ impl SubagentExecutor {
                 crate::background::wait_completions::WaitCompletionStore::default(),
             ),
             wait_subscriptions: Arc::new(std::sync::Mutex::new(None)),
+            scheduled_runs: Arc::new(std::sync::Mutex::new(None)),
             inline_answers: crate::background::watch::InlineAnswerLedger::default(),
             host_services: Arc::new(OnceLock::new()),
             root_parent_session: Arc::new(std::sync::Mutex::new(None)),
@@ -532,6 +541,32 @@ impl SubagentExecutor {
     #[must_use]
     pub(crate) fn notice_state(&self) -> &AsyncMutex<crate::tui::notices::ControlNoticeState> {
         &self.notices
+    }
+
+    /// Snapshot `state.foregroundControls` into the rows the detached-workflow reconciler's
+    /// identity back-fill reads (`workflow_detach::identity`'s clause 1).
+    ///
+    /// This is SCOPE_8 §Y-1 shape (a), made real: the CALLER snapshots the registry and hands the
+    /// rows in, rather than the reconciler reaching into a live executor handle it may not have.
+    /// The snapshot is what keeps the registry's `std::sync::Mutex` — documented as "every access
+    /// is a short synchronous read" — from ever being alive across the reconciler's `.await`s, and
+    /// it is why this returns an owned `Vec` rather than a guard.
+    ///
+    /// The run id is the map KEY here and a FIELD on the row, because
+    /// [`ForegroundControlEntry`] carries none (the same reason
+    /// `resolve_workflow_foreground_steering_target` carries it out as a pair).
+    #[must_use]
+    pub(crate) fn live_foreground_controls(&self) -> Vec<workflow_detach::LiveForegroundControl> {
+        self.foreground_controls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(run_id, entry)| workflow_detach::LiveForegroundControl {
+                run_id: crate::background::RunId::from_token(run_id.clone()),
+                parent_workflow_run_id: entry.parent_workflow_run_id.clone(),
+                workflow_key: entry.workflow_key.clone(),
+            })
+            .collect()
     }
 
     /// The live foreground-run control registry (pi `state.foregroundControls`). `pub(crate)` for

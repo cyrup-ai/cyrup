@@ -205,7 +205,7 @@ pub(crate) struct WorkflowResultFields {
 /// reconciler ([`crate::extension::executor::workflow_detach::reconcile_detached_workflow_child_completion`])
 /// is this function's first production caller, which is why the
 /// `#[cfg_attr(not(test), allow(dead_code))]` that used to sit here is gone. It calls this and
-/// then performs its OWN `write_atomic_json` → `update_terminal_run_index` →
+/// then performs its OWN `write_atomic_json` → `update_active_run_index` →
 /// `write_async_result_file` sequence — the same ordering `finish_run` performs — rather than
 /// calling `finish_run`, whose double-invocation guard (`:237-245`) refuses precisely the
 /// superseding second write over an already-published `Paused` result that a detached-child
@@ -358,20 +358,24 @@ pub(super) async fn finish_run(
     // strictly after the status write is issued here.
     let status_write = write_atomic_json(&run_paths.status, &status).await;
 
-    // The terminal-run index marker (pi `updateTerminalRunIndex`, reached from
-    // `updateActiveRunIndex`'s terminal arm, `active-run-index.ts:100-108`) — best-effort and in
-    // the same "both writes are attempted" spirit as the two writes around it: an advisory index
-    // that failed to write must never fail the run that was finishing.
-    if let Err(err) = crate::background::terminal_run_index::update_terminal_run_index(
-        &run_paths.run_dir,
-        &status,
-    )
-    .await
+    // SCOPE_9/SUBTASK5 — the index router (pi `updateActiveRunIndex`, `subagent-runner.ts:2137`),
+    // whose TERMINAL arm is what reaches `updateTerminalRunIndex`. This call site's comment used
+    // to name that indirection as a fact about upstream while calling the terminal writer
+    // directly; the router now exists, so the loop is closed and the active marker this run wrote
+    // at startup (`runner_main/entry.rs`) is released here rather than outliving the run.
+    //
+    // Best-effort, in the same "both writes are attempted" spirit as the two writes around it: an
+    // advisory index that failed to write must never fail the run that was finishing. The router
+    // writes the terminal marker BEFORE releasing the active one, so a process dying between them
+    // leaves the run in both indexes rather than in neither.
+    if let Err(err) =
+        crate::background::active_run_index::update_active_run_index(&run_paths.run_dir, &status)
+            .await
     {
         tracing::warn!(
             run_id = %status.run_id,
             error = %err,
-            "failed to write terminal-run index marker; the run's own terminal record is unaffected"
+            "failed to update the async run index; the run's own terminal record is unaffected"
         );
     }
 
@@ -427,6 +431,11 @@ pub(super) async fn finish_run(
         results,
         workflow_children: workflow.workflow_children,
         workflow_receipt: workflow.workflow_receipt,
+        // `None` structurally: the detached runner executes an agent/chain graph, and
+        // `RunMode::Workflow` is never emitted here (`background/state.rs:22-37`) — so no run this
+        // function settles can be a scheduled fire. A schedule's origin is stamped by the one
+        // writer that has it, `extension/executor/scheduled_runs.rs`.
+        schedule_origin: None,
     };
     let result_write = write_result_file(run_paths, &status, &result_file).await;
 

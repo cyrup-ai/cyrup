@@ -124,14 +124,19 @@
 //! `"detached"` — so this narrows an existing upstream boundary rather than opening a new one.
 //! See [`ForegroundSubscriptionProbe`] for the two-map mechanism that closes the rest of it.
 //!
-//! # Out of scope, recorded so it is not re-derived
+//! # The async-retention coupling, now owned
 //!
 //! Upstream's async retention reaper reads this directory: `async-retention.ts:307-316`'s
 //! `parseWaitRunIds` protects a run referenced by a live subscription from being reaped, re-read
 //! before each destructive action, and skips the whole pass as `"wait-references-unknown"` when
-//! any record is unparseable. cyrup has **no `async-retention.ts` port** (`PARITY-GAPS.md:55`
-//! lists it, 912 LOC, still open), so there is nothing to wire this into. Whoever ports the reaper
-//! owns the coupling.
+//! any record is unparseable.
+//!
+//! The reader half now exists as
+//! [`crate::background::async_retention::wait_run_ids`], which consumes [`parse_record`] against
+//! the DIRECTORY (never [`WaitSubscriptionManager::armed`], which is narrowed to this session by
+//! construction and would leave another instance's waited-on run unprotected in a shared root),
+//! and whose `None` is upstream's `safe: false`. The re-read before each destructive action and
+//! the pass-level abort are sweep control flow and belong to the sweep.
 
 use std::time::Duration;
 

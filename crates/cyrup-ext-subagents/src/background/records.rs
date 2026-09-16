@@ -388,6 +388,46 @@ impl RunStatus {
         }
     }
 
+    /// Record one host-step transition onto [`RunStatus::telemetry`], UPSERTING BY ID — pi's
+    /// `job.hostSteps = validHostStepNodes(status.workflowGraph)` refresh
+    /// (`async-job-tracker.ts:469`), reached here one transition at a time because cyrup's
+    /// producer is a callback stream rather than a graph rebuild (see
+    /// [`RunTelemetry::host_steps`]).
+    ///
+    /// ⚠ UPSERT, never push. The scripted engine emits each `runs.host` call TWICE — a `Running`
+    /// node when the op starts (`workflows/scripted/engine.rs:1259`) and a terminal one when it
+    /// settles (`:1320`/`:1367`) — both carrying the same [`crate::workflows::HostStepNode::id`].
+    /// A blind push would put two rows with one id into `status.json`, which is exactly what
+    /// [`crate::workflows::assert_unique_host_step_ids`] (pi Rule 11) exists to reject, and would
+    /// make the projection render one monitor as two children.
+    ///
+    /// A NEW id beyond [`HOST_STEP_MAX_COUNT`](crate::workflows::HOST_STEP_MAX_COUNT) is dropped
+    /// rather than appended: upstream's own readers slice to that bound (`validHostStepNodes`,
+    /// `host-step-status.ts:141`) and its receipt builder THROWS past it, so a status that
+    /// carried more could never be projected or receipted anyway. The engine refuses the 33rd `runs.host` call outright, so the bound is
+    /// defence for a status written by something else — an upsert onto an ALREADY-recorded id is
+    /// therefore never refused, only a genuinely new row.
+    ///
+    /// `last_update` is deliberately NOT touched: this is a telemetry fold, and the caller that
+    /// persists the status is the one that decides the write moment (R-SA-075), exactly as
+    /// [`Self::sync_top_level_telemetry`] leaves the timestamp alone.
+    pub fn record_host_step(&mut self, node: &crate::workflows::HostStepNode) {
+        let host_steps = &mut self.telemetry.host_steps;
+        // `position` then `get_mut`, not `iter_mut().find()`: the length test in the `None` arm
+        // needs the borrow back, and an index-first match is the form that gives it back.
+        match host_steps.iter().position(|step| step.id == node.id) {
+            Some(index) => {
+                if let Some(existing) = host_steps.get_mut(index) {
+                    existing.clone_from(node);
+                }
+            }
+            None if host_steps.len() < crate::workflows::HOST_STEP_MAX_COUNT => {
+                host_steps.push(node.clone());
+            }
+            None => {}
+        }
+    }
+
     /// Roll the per-step telemetry of the step at `flat_index` up into the top-level
     /// [`RunStatus::telemetry`] fields, mirroring pi's `syncTopLevelCurrentTool` +
     /// `statusPayload.toolCount`/`turnCount`/`totalTokens`/`lastActivityAt` maintenance
@@ -540,6 +580,34 @@ pub struct ResultFile {
     /// `:238`; here the key is built conditionally and never inserted-then-removed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_receipt: Option<crate::workflows::WorkflowReceiptRef>,
+    /// SUBA-016 — pi `scheduleOrigin` (`runs/background/scheduled-runs.ts:461`,
+    /// `runs/background/notify.ts:59`): which SCHEDULE fired this run, when one did.
+    ///
+    /// `None` for every run a human or a model launched, which is all of them before SUBA-016.
+    /// `Some` only for a run produced by
+    /// [`crate::background::scheduled_runs::ScheduleLauncher::launch`], and it is what makes a
+    /// scheduled completion distinguishable from any other — the one thing
+    /// `background/watch/message.rs`'s `completion_notice_display` doc asked for by name
+    /// ("When either input lands, OR it in here").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_origin: Option<ScheduleOrigin>,
+}
+
+/// pi `ScheduleOrigin` (`runs/background/notify.ts:59`, built at `scheduled-runs.ts:461`) — the
+/// schedule that fired a run, carried on its result so the completion can name it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduleOrigin {
+    /// The schedule's id.
+    pub id: String,
+    /// Its display name, when it has one distinct from the id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// pi `quiet?` — a successful completion of a QUIET schedule does not wake the parent's turn
+    /// (`notify.ts:363-365`'s `scheduledCompletionTriggersTurn`). It is still DELIVERED and still
+    /// displayed: quiet means "do not interrupt me", never "do not tell me".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quiet: Option<bool>,
 }
 
 #[cfg(test)]
@@ -571,6 +639,91 @@ mod tests {
         assert_eq!(provisional.mode, RunMode::Chain);
         assert_eq!(provisional.state, RunState::Queued);
         assert_eq!(provisional.pid, Some(99));
+    }
+
+    /// The recorder's two rules, which the scripted engine's emission pattern makes load-bearing:
+    /// the SAME id collapses last-write-wins (the engine emits every `runs.host` call twice, a
+    /// `Running` node then a terminal one), and a NEW id past `HOST_STEP_MAX_COUNT` is dropped
+    /// rather than appended — a status carrying 33 rows could be neither projected
+    /// (`validHostStepNodes` slices to 32) nor receipted (`build_workflow_receipt` throws).
+    #[test]
+    fn record_host_step_upserts_by_id_and_stops_at_the_host_step_cap() {
+        let node =
+            |id: &str, state: crate::workflows::HostStepState| crate::workflows::HostStepNode {
+                version: crate::workflows::HostStepVersion,
+                kind: crate::workflows::HostStepKind,
+                monitor_kind: crate::workflows::HostStepMonitorKind::Command,
+                id: id.to_string(),
+                label: id.to_string(),
+                role: None,
+                provider: None,
+                state,
+                verdict: None,
+                reason_code: None,
+                detail: None,
+                target: None,
+                freshness: None,
+                report_path: None,
+                exit_code: None,
+                updated_at: serde_json::Number::from(1),
+                deadline_at: None,
+            };
+        let mut status = RunStatus::queued(RunId::new(), RunMode::Workflow, None);
+
+        status.record_host_step(&node("gate", crate::workflows::HostStepState::Running));
+        status.record_host_step(&node("gate", crate::workflows::HostStepState::Done));
+        assert_eq!(
+            status.telemetry.host_steps.len(),
+            1,
+            "the engine's Running-then-terminal pair is ONE row, not two"
+        );
+        assert_eq!(
+            status.telemetry.host_steps[0].state,
+            crate::workflows::HostStepState::Done,
+            "last write wins"
+        );
+        assert!(
+            crate::workflows::assert_unique_host_step_ids(&status.telemetry.host_steps, "status")
+                .is_ok(),
+            "a pushed duplicate would fail the receipt this same list is built from"
+        );
+
+        for index in 0..crate::workflows::HOST_STEP_MAX_COUNT + 4 {
+            status.record_host_step(&node(
+                &format!("gate-{index}"),
+                crate::workflows::HostStepState::Done,
+            ));
+        }
+        assert_eq!(
+            status.telemetry.host_steps.len(),
+            crate::workflows::HOST_STEP_MAX_COUNT,
+            "the cap bounds NEW ids"
+        );
+        status.record_host_step(&node("gate", crate::workflows::HostStepState::Error));
+        assert_eq!(
+            status.telemetry.host_steps.len(),
+            crate::workflows::HOST_STEP_MAX_COUNT,
+            "an upsert onto a recorded id is never refused by the cap"
+        );
+        assert_eq!(
+            status.telemetry.host_steps[0].state,
+            crate::workflows::HostStepState::Error
+        );
+    }
+
+    /// The field is `skip_serializing_if = "Vec::is_empty"` + `default`, so a run that never
+    /// called `runs.host` writes the exact `status.json` shape it wrote before this field
+    /// existed, and a status written by an older build still reads back.
+    #[test]
+    fn host_steps_are_absent_from_the_wire_when_a_run_produced_none() {
+        let status = RunStatus::queued(RunId::new(), RunMode::Single, None);
+        let json = serde_json::to_value(&status).expect("serializes");
+        assert!(
+            json.get("hostSteps").is_none(),
+            "an empty list must not add a key: {json}"
+        );
+        let round: RunStatus = serde_json::from_value(json).expect("round-trips");
+        assert!(round.telemetry.host_steps.is_empty());
     }
 
     #[test]
@@ -687,6 +840,7 @@ mod tests {
     fn result_file_round_trips_through_json() {
         let run_id = RunId::new();
         let result = ResultFile {
+            schedule_origin: None,
             id: run_id.clone(),
             run_id,
             agent: "researcher".to_string(),

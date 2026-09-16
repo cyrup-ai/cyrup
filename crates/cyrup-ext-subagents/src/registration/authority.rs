@@ -63,8 +63,12 @@ impl AuthorityAction {
     /// `action === "stop" ? "stopRun" : action === "steer" ? "steerRun" : action ===
     /// "schedule.create" ? "scheduleCreate" : undefined`.
     ///
-    /// `schedule.create` is mapped here even though cyrup does not dispatch it yet (SUBA-016), so
-    /// the verb arrives already gated rather than needing a second change to gate it.
+    /// `schedule.create` was mapped here BEFORE cyrup dispatched it, so the verb would arrive
+    /// already gated rather than needing a second change to gate it. SUBA-016 landed that
+    /// dispatch: `route_action`'s `schedule.*` arm runs the same three-arm consult
+    /// `route_control_action` applies to `stop`/`steer`, so the mapping now has one meaning on
+    /// both surfaces and the other eight `schedule.*` verbs stay ungated — which is upstream's own
+    /// mapping (`subagent-executor.ts:4412` names only `schedule.create`).
     #[must_use]
     pub fn for_tool_action(action: &str) -> Option<Self> {
         match action {

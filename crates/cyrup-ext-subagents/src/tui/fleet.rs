@@ -516,31 +516,57 @@ pub async fn collect_fleet_history(
 /// The candidate run paths for [`collect_fleet_history`], newest first and bounded by
 /// [`MAX_FLEET_HISTORY_CANDIDATES`].
 ///
-/// Upstream builds its candidate set from the run INDEXES when it wants terminal states
-/// (`async-status.ts:513-517`, `readRecentTerminalRunIndex` with the caller's `sessionId` and
-/// `entryLimit`) and only falls back to a directory scan under `repairScan` (`:501-502`). So the
-/// terminal-run index is tried first — its ids come back newest-first and already session-filtered,
-/// making the scan's mtime sort redundant on that path — and the full scan survives underneath as
-/// the fallback for an `Err` or an EMPTY index. That fallback is not defensive padding: it is what
-/// makes the index safe to consume before every producer has been running long enough to populate
-/// it, and it is the property that lets a marker be unlinked at any time without losing data.
-/// (An untracked still-ACTIVE run is the in-memory tracker's and `resume_tracking`'s to surface;
-/// upstream serves that corner from `active-run-index.ts`, which is unported.)
+/// Upstream builds its candidate set from BOTH run indexes (`async-status.ts:506-521`
+/// @`v0.68.0`): `readActiveRunIndex` when the caller wants active states and
+/// `readRecentTerminalRunIndex` — with the caller's `sessionId` and `entryLimit` — when it wants
+/// terminal ones, unioned into one `indexed` set, and only falls back to a directory scan under
+/// `repairScan` (`:503-504`). The inspector passes no `states`, so it wants both halves, and this
+/// is that union.
+///
+/// The ACTIVE half comes first, exactly as upstream inserts it, and it is what makes the roster
+/// honest: without it a run that is in flight *right now* but is not in this process's
+/// [`crate::background::tracker::JobTracker`] — a run launched by a sibling cyrup in the same cwd,
+/// or one this process adopted after a restart — appears nowhere, because the terminal index by
+/// construction only lists runs that have already finished. A fleet view that can list yesterday's
+/// finished runs but not today's live ones is the wrong way round.
+/// [`crate::background::active_run_index::read_live_active_run_ids`] also carries the staleness
+/// rung, so a marker orphaned by a killed process stops being offered as a live candidate instead
+/// of pinning a ghost to the roster forever. It takes no session filter — upstream's
+/// `readActiveRunIndex` takes none either, because the active index is not session-partitioned the
+/// way `.terminal-runs` is — so a live run belonging to another session arrives as a CANDIDATE and
+/// is dropped by [`collect_fleet_history`]'s own `status.sessionId` check, which is the one place
+/// that filter is applied.
+///
+/// The full scan survives underneath as the fallback for an `Err` or an EMPTY union. That fallback
+/// is not defensive padding: it is what makes the indexes safe to consume before every producer
+/// has been running long enough to populate them, and it is the property that lets a marker be
+/// unlinked at any time without losing data.
 async fn fleet_history_candidates(
     async_root: &Path,
     results_dir: &Path,
     current_session_id: Option<&str>,
 ) -> Result<Vec<RunPaths>, String> {
     let session = SessionId::parse_opt(current_session_id);
+    let mut indexed: Vec<crate::background::RunId> =
+        crate::background::active_run_index::read_live_active_run_ids(async_root)
+            .await
+            .unwrap_or_default();
     if let Ok(ids) = crate::background::terminal_run_index::read_recent_terminal_run_index(
         async_root,
         session.as_ref(),
         Some(MAX_FLEET_HISTORY_CANDIDATES),
     )
     .await
-        && !ids.is_empty()
     {
-        return Ok(ids
+        // pi's `indexed` is a `Set`: a run that is in both indexes (its terminal write landed
+        // before its active marker was released) is one candidate, keeping its ACTIVE-half
+        // position.
+        let fresh: Vec<_> = ids.into_iter().filter(|id| !indexed.contains(id)).collect();
+        indexed.extend(fresh);
+    }
+    if !indexed.is_empty() {
+        indexed.truncate(MAX_FLEET_HISTORY_CANDIDATES);
+        return Ok(indexed
             .iter()
             .map(|run_id| RunPaths::for_run(async_root, results_dir, run_id))
             .collect());
@@ -2382,6 +2408,119 @@ mod tests {
             history_ids(&runs),
             vec!["scanned1"],
             "the scan serves the unindexed run and skips the reserved dirs"
+        );
+    }
+
+    /// Write a live (running) on-disk run with its ACTIVE-run index marker — what
+    /// [`crate::background::runner_main`] writes at launch.
+    async fn launch_on_disk(async_root: &Path, run: &str, session_id: &str) {
+        let run_dir = async_root.join(run);
+        tokio::fs::create_dir_all(&run_dir)
+            .await
+            .expect("mkdir run dir");
+        let mut status = RunStatus::queued(RunId::from_token(run), RunMode::Single, Some(1));
+        status.state = RunState::Running;
+        status.session_id = SessionId::parse(session_id);
+        tokio::fs::write(
+            run_dir.join("status.json"),
+            serde_json::to_vec(&status).expect("ser"),
+        )
+        .await
+        .expect("write status");
+        crate::background::active_run_index::update_active_run_index(&run_dir, &status)
+            .await
+            .expect("active index write");
+    }
+
+    /// Backdate an active-run marker's mtime so
+    /// [`crate::background::active_run_index::active_run_marker_age_ms`] reads it as older than
+    /// [`crate::background::active_run_index::DEFAULT_STALE_TERMINAL_ACTIVE_MARKER_MS`].
+    fn age_marker(async_root: &Path, run: &str, age: std::time::Duration) {
+        let marker = async_root
+            .join(crate::background::active_run_index::ACTIVE_RUN_INDEX_DIR)
+            .join(run);
+        let when = std::time::SystemTime::now()
+            .checked_sub(age)
+            .expect("a representable instant");
+        std::fs::File::options()
+            .write(true)
+            .open(&marker)
+            .expect("open marker")
+            .set_times(std::fs::FileTimes::new().set_modified(when))
+            .expect("backdate marker");
+    }
+
+    /// The live half of the roster, and the reason the ACTIVE index is read here at all: a run that
+    /// is in flight RIGHT NOW is in no terminal index and in no in-memory tracker of this process,
+    /// so before the active index was consumed the inspector could show yesterday's finished runs
+    /// and not today's live one.
+    ///
+    /// The terminal run is the control: it proves the union, not a swap.
+    #[tokio::test]
+    async fn fleet_history_lists_live_runs_from_the_active_run_index() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let async_root = tmp.path().join("async");
+        let results_dir = tmp.path().join("results");
+        launch_on_disk(&async_root, "live1", "s1").await;
+        settle_on_disk(&async_root, "done1", RunState::Complete, "s1", 100).await;
+
+        let runs = collect_fleet_history(&async_root, &results_dir, Some("s1"))
+            .await
+            .expect("history collects");
+        assert_eq!(
+            history_ids(&runs),
+            vec!["live1", "done1"],
+            "the live run leads the union, exactly where pi's Set inserts it"
+        );
+    }
+
+    /// The staleness rung (pi `async-status.ts:573-577`), reached through the production reader.
+    ///
+    /// `ghost1` is a run whose process was killed after its status went terminal but before its
+    /// active marker was released — 25 hours ago. `fresh1` is the same shape, seconds old: its
+    /// terminal write may simply not have landed yet, so its marker is LEFT, which is what keeps
+    /// the rung from re-opening the hole the terminal-before-release ordering closed.
+    #[tokio::test]
+    async fn a_day_old_active_marker_for_a_settled_run_is_released_by_the_fleet_read() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let async_root = tmp.path().join("async");
+        let results_dir = tmp.path().join("results");
+        for run in ["ghost1", "fresh1"] {
+            launch_on_disk(&async_root, run, "s1").await;
+            // The run settles on disk without anyone releasing its active marker.
+            settle_on_disk(&async_root, run, RunState::Failed, "s1", 100).await;
+        }
+        age_marker(
+            &async_root,
+            "ghost1",
+            std::time::Duration::from_millis(
+                u64::try_from(
+                    crate::background::active_run_index::DEFAULT_STALE_TERMINAL_ACTIVE_MARKER_MS,
+                )
+                .expect("24h fits")
+                    + 3_600_000,
+            ),
+        );
+
+        let runs = collect_fleet_history(&async_root, &results_dir, Some("s1"))
+            .await
+            .expect("history collects");
+        let mut ids = history_ids(&runs);
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["fresh1", "ghost1"],
+            "both are terminal runs and both come back from the TERMINAL index"
+        );
+
+        let index_dir = async_root.join(crate::background::active_run_index::ACTIVE_RUN_INDEX_DIR);
+        assert!(
+            !index_dir.join("ghost1").exists(),
+            "the day-old marker is released rather than offered as live forever"
+        );
+        assert!(
+            index_dir.join("fresh1").is_file(),
+            "a marker that is merely seconds ahead of its terminal write is left alone"
         );
     }
 

@@ -216,6 +216,18 @@ impl SubagentsExtension {
         ) {
             tracing::warn!("[cyrup-ext-subagents] {error}");
         }
+        // SCOPE_9 — pi `validateCapacityConfig(config.capacity)` (`extension/config.ts:86-98`),
+        // run once as the config lands, beside the model-exclusions guard immediately above and
+        // for the same reason: a malformed `capacity.abandonedSlotReleaseAfterMs` is refused with
+        // upstream's own config-layer sentence, and the capacity resolvers keep the built-in
+        // 20-minute default. Upstream THROWS here, taking the extension down; this constructor is
+        // infallible by design (like its neighbour), so an unusable reclamation policy is reported
+        // and survived rather than fatal — the operator sees the exact sentence either way.
+        if let Err(error) = crate::background::active_async_capacity::validate_capacity_config(
+            config.capacity.as_ref(),
+        ) {
+            tracing::warn!("[cyrup-ext-subagents] {error}");
+        }
         if let Ok(mut guard) = executor.config_cell().try_lock() {
             *guard = config;
         }

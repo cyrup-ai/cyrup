@@ -15,6 +15,7 @@
 use std::path::PathBuf;
 
 use super::{StepStatus, WorkflowGraphSnapshot};
+use crate::workflows::HostStepNode;
 
 /// pi's `ActivityState` (`shared/types.ts:156`): a run/step that is idle-but-long-running or has
 /// tripped a needs-attention control heuristic. Absent (`None` on the carrying field) is pi's
@@ -170,6 +171,28 @@ pub struct RunTelemetry {
     /// `shared/types.ts:597`) — node ids, phases, group-status precedence, `currentNodeId`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_graph: Option<WorkflowGraphSnapshot>,
+    /// The run's host-owned monitor rows — pi `AsyncJobState.hostSteps` (`shared/types.ts:2034`),
+    /// whose own doc reads *"Bounded host-owned CI/gate nodes loaded from the workflow status
+    /// graph."* Serialized as `hostSteps`, the key upstream's readers already key on, and carried
+    /// beside [`Self::workflow_graph`] because that is the pair every host-step consumer reads
+    /// together (`tui/fleet-status.ts:434`'s `job.workflowGraph ?? job.hostSteps`).
+    ///
+    /// [CYRUP-DELTA] upstream does not STORE this list, it DERIVES it —
+    /// `validHostStepNodes(status.workflowGraph)` (`async-status.ts:297`,
+    /// `async-job-tracker.ts:469`, `run-status.ts:595`) walks the graph for nodes whose
+    /// `kind === "host-step"` and lifts each one's `hostStep` payload back out. That derivation
+    /// needs a graph node kind cyrup's [`crate::background::WorkflowNodeKind`] deliberately does
+    /// not have (`background/workflow_graph.rs:42-53` enumerates four structural kinds, and a
+    /// host monitor is a separate record in this tree, never a graph node). So the same list is
+    /// carried DIRECTLY, under the same wire key, rather than a host-step graph kind being
+    /// invented solely to be immediately flattened back out again by every reader.
+    ///
+    /// Written only through
+    /// [`RunStatus::record_host_step`](crate::background::RunStatus::record_host_step), which owns
+    /// the upsert-by-id rule and the [`HOST_STEP_MAX_COUNT`](crate::workflows::HOST_STEP_MAX_COUNT)
+    /// bound.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_steps: Vec<HostStepNode>,
     /// G90: total steering messages accepted anywhere in this run (pi `statusPayload.steerCount`,
     /// `subagent-runner.ts:1766`).
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -2016,6 +2016,109 @@ async fn a_workflow_that_dies_on_a_host_command_still_records_the_step() {
     assert_eq!(steps[0]["exitCode"].as_i64(), Some(9));
 }
 
+/// THE REACHABILITY PROOF for `background::async_status_snapshot::project::host_steps_for_run`.
+///
+/// That projector used to return `&'static []` unconditionally, on the recorded reasoning that a
+/// [`crate::workflows::HostStepNode`] "lives on the LIVE workflowScript engine and on a workflow
+/// RECEIPT — never on the persisted status a snapshot reads". The producer was already real (the
+/// engine emits the nodes and `on_host_step` was already wired); what was missing was the ONE hop
+/// that put them on the run, so this asserts that hop through the production path, end to end,
+/// touching no surface directly:
+///
+/// 1. the real dispatch runs a real `runs.host` command through the real engine,
+/// 2. the engine's `on_host_step` folds each transition onto the run's `RunStatus` via
+///    `record_host_step`, and `settle_foreground_workflow` writes that status to `status.json`,
+/// 3. `tui::fleet::collect_fleet_history` — the inspector's own on-disk reader, which knows
+///    nothing about host steps — loads it back as an `AsyncRunView`,
+/// 4. the projection, handed that view and nothing else, emits the monitor as a `host-step` child
+///    of the run.
+///
+/// Step 3 is what makes this a reachability test rather than a round-trip: the view is read off
+/// the FILESYSTEM by a production reader, so the assertion cannot pass on an in-memory record the
+/// test itself populated.
+#[tokio::test]
+async fn a_workflow_host_step_reaches_the_async_status_snapshot() {
+    use crate::background::async_status_snapshot::{
+        AsyncStatusSnapshotKind, AsyncStatusSnapshotOptions, build_async_status_snapshot,
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let executor = Arc::new(SubagentExecutor::new());
+    arm_scoped_missions(&executor, dir.path()).await;
+    let tool = SubagentTool::new(executor.clone(), dir.path().to_path_buf());
+
+    let script = r#"
+        const gate = await runs.host("gate", { kind: "command", command: "exit 0", timeoutMs: 30000, role: "gate" });
+        return gate.state;
+    "#;
+    let result = dispatch_tool(&tool, serde_json::json!({ "workflowScript": script }))
+        .await
+        .expect("a passing host command must not fail the workflow");
+    let workflow_run_id = result.details.as_ref().expect("details")["workflowRunId"]
+        .as_str()
+        .expect("the settlement stamps the run id")
+        .to_string();
+
+    // The SAME roots arithmetic the dispatch itself used (`routing.rs`'s
+    // `default_async_root_in(&cfg.roots, cwd)`), so this reads the tree the run really wrote to.
+    let cfg = executor.config_snapshot().await;
+    let async_root =
+        crate::extension::executor::paths::default_async_root_in(&cfg.roots, dir.path());
+    let results_dir =
+        crate::extension::executor::paths::default_results_dir_in(&cfg.roots, dir.path());
+    let runs = crate::tui::fleet::collect_fleet_history(&async_root, &results_dir, None)
+        .await
+        .expect("the async root exists — the dispatch created it");
+    let job = runs
+        .iter()
+        .find(|run| run.status.run_id.as_str() == workflow_run_id)
+        .expect("the workflow's own status.json must be on disk and readable");
+
+    assert_eq!(
+        job.status
+            .telemetry
+            .host_steps
+            .iter()
+            .map(|step| step.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["gate"],
+        "the terminal status.json must carry the monitor — an empty list here IS the unwired          `host_steps_for_run` regression, one hop upstream of the projection"
+    );
+
+    let snapshot = build_async_status_snapshot([job], &AsyncStatusSnapshotOptions::default());
+    let run = snapshot
+        .runs
+        .iter()
+        .find(|run| run.id == workflow_run_id)
+        .expect("the run is projected");
+    let host_step = run
+        .children
+        .as_ref()
+        .expect("a run with a host step has children")
+        .iter()
+        .find(|child| child.kind == AsyncStatusSnapshotKind::HostStep)
+        .expect(
+            "the projection must emit the monitor as a `host-step` child — this is the \
+             assertion a `&'static []` `host_steps_for_run` cannot satisfy",
+        );
+    assert_eq!(host_step.id, "gate");
+    assert_eq!(host_step.label, "gate");
+    let metadata = host_step
+        .host_step
+        .as_ref()
+        .expect("the host-step node carries its monitor metadata");
+    assert_eq!(metadata.state, crate::workflows::HostStepState::Done);
+    assert_eq!(
+        metadata.verdict,
+        Some(crate::workflows::HostStepVerdict::Pass)
+    );
+    assert_eq!(metadata.role.as_deref(), Some("gate"));
+    assert!(
+        host_step.ended_at.is_some(),
+        "a settled monitor is terminal, so it carries an endedAt"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // WORKFLOW_20 — `state.get`/`state.set`: the mission scratchpad, bound end to end through the
 // real `execute` seam. The binding `tool/mod.rs` already resolved for every mode is what decides
@@ -2316,5 +2419,231 @@ async fn inspect_is_both_advertised_and_dispatched() {
     assert!(
         error.to_string().contains("action='inspect' requires id"),
         "{error}"
+    );
+}
+
+/// A child binary that emits a BLOCKING `contact_supervisor` ask on its NDJSON stdout and then
+/// fails — the one shape that produces a genuinely detached [`crate::exec::SingleResult`].
+///
+/// The ask is an ordinary `tool_execution_start` for the `contact_supervisor` tool carrying
+/// `reason: "need_decision"`, which is exactly what `exec::drive_attempt`'s
+/// `contact_supervisor_block_prompt` recognises (R-SA-037). The non-zero exit is the second half of
+/// the shape under test: `deliver_launch` rejects a launch only for a child that is `!ok`
+/// (`engine.rs:1824`), so a detached child that exited cleanly would resolve normally and never
+/// park the workflow.
+fn write_detaching_child_binary(dir: &std::path::Path) -> PathBuf {
+    let script = dir.join("detaching-child.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\n\
+printf '%s\\n' '{\"type\":\"agent_start\"}'\n\
+printf '%s\\n' '{\"type\":\"tool_execution_start\",\"toolCallId\":\"c1\",\
+\"toolName\":\"contact_supervisor\",\"args\":{\"reason\":\"need_decision\",\
+\"message\":\"which branch do I target?\"}}'\n\
+printf '%s\\n' '{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\
+\"content\":[{\"type\":\"text\",\"text\":\"waiting on the supervisor\"}]}}'\n\
+printf '%s\\n' '{\"type\":\"agent_settled\"}'\n\
+exit 1\n",
+    )
+    .expect("write the scripted child");
+    std::fs::set_permissions(
+        &script,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .expect("make the scripted child executable");
+    script
+}
+
+/// THE REACHABILITY PROOF for
+/// [`crate::extension::executor::workflow_detach::reconcile_detached_workflow_child_completion`].
+///
+/// That reconciler was SCOPE_8's whole deliverable and carried `#[cfg_attr(not(test),
+/// allow(dead_code))]` on the recorded reasoning that *"cyrup has no detach hook to fire it"*. The
+/// reasoning was wrong: cyrup's drive loop keeps driving a detached child to its real exit, so the
+/// detached child's COMPLETION — the very event upstream's `onDetachedExit` closure waits for —
+/// arrives synchronously in `WorkflowRunHost::launch`'s return. This drives that hook end to end
+/// through the production dispatch, touching no surface directly:
+///
+/// 1. a REAL `workflowScript` dispatch launches a REAL child through
+///    `WorkflowRunHost::launch` → `run_foreground_streaming`;
+/// 2. the child emits a blocking `contact_supervisor` ask, so `exec::drive_attempt` marks the
+///    attempt detached and `classify_attempt` settles the ladder at `LadderStop::Detached`;
+/// 3. `deliver_launch` rejects the launch with `workflowErrorKind: "detached-child"`, the engine
+///    hangs that kind on the error, and `route_workflow_mode`'s failure arm parks the run at
+///    `Paused` — pi's own shape;
+/// 4. `reconcile_detached_workflow_children` drives the reconciler over the detached child's
+///    settled result, which supersedes that paused status with a terminal one.
+///
+/// Step 4's evidence is read back off the FILESYSTEM by production readers — `collect_fleet_history`
+/// for the status and the run's own `events.jsonl` for the completion line — so nothing here can
+/// pass on an in-memory record the test itself populated. The `reconciledFromDetachedChild` key is
+/// written by exactly one function in the crate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_detached_workflow_child_reconciles_the_paused_workflow() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = write_detaching_child_binary(dir.path());
+
+    let executor = Arc::new(SubagentExecutor::new());
+    arm_scoped_missions(&executor, dir.path()).await;
+    // A live session id: the reconciled `ResultFile` is session-partitioned, and an unattributable
+    // result cannot be indexed (`finish.rs:478-484`'s refusal, reproduced by the reconciler).
+    executor.set_host_services(Arc::new(crate::extension::testsupport::FixedSessionHost(
+        "session-detach",
+    )));
+    {
+        let mut cfg = executor.config_cell().lock().await;
+        cfg.spawn_command = Some(crate::spawn::SpawnCommand {
+            binary: script,
+            base_args: Vec::new(),
+        });
+    }
+    let tool = SubagentTool::new(executor.clone(), dir.path().to_path_buf());
+
+    let error = dispatch_tool(
+        &tool,
+        serde_json::json!({
+            "workflowScript":
+                "await runs.run(\"a\", { agent: \"worker\", task: \"T\", model: \"sonnet\" });\n\
+                 return \"unreachable\";"
+        }),
+    )
+    .await
+    .expect_err("a detached-child rejection must fail the workflow");
+
+    assert!(
+        error.to_string().contains("Run 'a' detached"),
+        "the engine must reject the launch with the DETACHED wording, not the plain failure one: \
+         {error}"
+    );
+    let details = error
+        .details
+        .as_ref()
+        .expect("the failure arm folds details, and that is what carries the reconciliation");
+    let workflow_run_id = details["workflowRunId"]
+        .as_str()
+        .expect("the settlement stamps the run id")
+        .to_string();
+    let reconciled = details["reconciledFromDetachedChildren"].as_array().expect(
+        "the dispatch must report the reconciled child run ids — an absent key IS the unwired \
+             reconciler",
+    );
+    assert_eq!(
+        reconciled.len(),
+        1,
+        "one detached child, one reconciliation"
+    );
+    let child_run_id = reconciled[0]
+        .as_str()
+        .expect("a reconciled entry is a run id")
+        .to_string();
+
+    // The SAME roots arithmetic the dispatch used, so this reads the tree the run really wrote to.
+    let cfg = executor.config_snapshot().await;
+    let async_root =
+        crate::extension::executor::paths::default_async_root_in(&cfg.roots, dir.path());
+    let results_dir =
+        crate::extension::executor::paths::default_results_dir_in(&cfg.roots, dir.path());
+
+    // 1. The status the inspector's own on-disk reader loads back is TERMINAL, not the `paused` the
+    //    settlement wrote a moment earlier. Only the reconciler takes it back out of `paused`.
+    let runs = crate::tui::fleet::collect_fleet_history(&async_root, &results_dir, None)
+        .await
+        .expect("the async root exists — the dispatch created it");
+    let job = runs
+        .iter()
+        .find(|run| run.status.run_id.as_str() == workflow_run_id)
+        .expect("the workflow's own status.json must be on disk and readable");
+    assert_eq!(
+        job.status.state,
+        crate::background::RunState::Failed,
+        "a workflow left at `paused` is the unreconciled regression; the reconciler promotes it"
+    );
+    assert!(
+        job.status.ended_at.is_some(),
+        "a promoted workflow carries the settlement's own endedAt"
+    );
+
+    // 2. The `subagent.workflow.completed` line, with the ONE key only this reconciler writes.
+    let events = tokio::fs::read_to_string(async_root.join(&workflow_run_id).join("events.jsonl"))
+        .await
+        .expect("the reconciler appends the workflow's event journal");
+    let completed = events
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|event| event["type"] == "subagent.workflow.completed")
+        .expect("the promoted workflow emits its completion line");
+    assert_eq!(
+        completed["reconciledFromDetachedChild"].as_str(),
+        Some(child_run_id.as_str()),
+        "`reconciledFromDetachedChild` has exactly one writer in this crate — \
+         `reconciled_from_detached_child`"
+    );
+    assert_eq!(completed["runId"].as_str(), Some(workflow_run_id.as_str()));
+
+    // PROVENANCE. The child's run id belongs in `reconciledFromDetachedChild` (asserted above) and
+    // deliberately NOT in the prose — a 32-hex token inside a human-readable line is noise. An
+    // earlier revision asserted `summary.contains(child_run_id)` and failed against a summary that
+    // was already correct, which is the wrong test, not a missing feature.
+    //
+    // What must hold is that the promoter CARRIES UP the child's failure rather than synthesizing a
+    // placeholder: the settled summary is the failure reason itself, and is the same text the
+    // event's own `error` carries. A promoter that invented "Workflow script failed." would satisfy
+    // neither.
+    let summary = completed["summary"]
+        .as_str()
+        .expect("a settled workflow carries a summary");
+    assert_eq!(
+        Some(summary),
+        completed["error"].as_str(),
+        "the settled summary is the carried-up failure reason, not a second synthesized string"
+    );
+    assert!(
+        !summary.trim().is_empty() && summary != "Workflow script failed.",
+        "the promoter must carry the detached child's failure up, not a generic placeholder: \
+         {summary:?}"
+    );
+
+    // 3. The superseding payload: `agent: "workflow"`, literal, never synthesized from the steps —
+    //    which is what tells it apart from anything `finish_run` would have published.
+    let session_id =
+        crate::identity::SessionId::parse_opt(Some("session-detach")).expect("a valid session id");
+    let run_id = crate::background::RunId::from_token(workflow_run_id.clone());
+    let payload = crate::background::RunPaths::for_run(&async_root, &results_dir, &run_id)
+        .resolve_result(&session_id, &run_id)
+        .await
+        .expect("the reconciler publishes a result file for the settled workflow");
+    let result: serde_json::Value =
+        serde_json::from_slice(&tokio::fs::read(&payload).await.expect("read the payload"))
+            .expect("the payload is JSON");
+    assert_eq!(result["agent"].as_str(), Some("workflow"));
+    assert_eq!(result["mode"].as_str(), Some("workflow"));
+    assert_eq!(result["success"].as_bool(), Some(false));
+    // The rebuilt children carry the reconciled child's OWN settled result, and the child is no
+    // longer marked detached — upstream clears it explicitly (`detached: undefined`,
+    // `foreground/workflow-detach-reconcile.ts:66` @v0.68.0), because once the reconciler has the
+    // child's result the child is settled, not outstanding. An earlier revision of this test
+    // asserted `detached == true`, which would have passed only if the reconciler had FAILED to
+    // clear the flag — it asserted the defect rather than the fix.
+    let children = result["results"]
+        .as_array()
+        .expect("the settled workflow payload rebuilds its children");
+    let reconciled_child = children
+        .iter()
+        .find(|child| child["childRunId"].as_str() == Some(child_run_id.as_str()))
+        .unwrap_or_else(|| panic!("the rebuilt children name the reconciled child: {result}"));
+    assert_ne!(
+        reconciled_child["detached"],
+        serde_json::Value::Bool(true),
+        "the reconciler clears `detached` on the child it settled: {reconciled_child}"
+    );
+    assert_eq!(
+        reconciled_child["error"].as_str(),
+        completed["error"].as_str(),
+        "the rebuilt child carries its own failure, the same one the completion line reports"
+    );
+    assert_eq!(
+        reconciled_child["outputState"].as_str(),
+        Some("present"),
+        "the reconciled child's output is delivered, not still outstanding: {reconciled_child}"
     );
 }

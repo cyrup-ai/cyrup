@@ -367,6 +367,14 @@ impl NativeExtension for SubagentsExtension {
                 // message (with `triggerTurn`) and has its result file deleted (R-SA-099/101). When the
                 // P-1 host-services slot is bound this installs the live turn-injecting
                 // `HostServicesCompletionSink` (R-SA-101); otherwise the stderr LoggingCompletionSink.
+                //
+                // THIS CALL WENT MISSING. The comment above survived without it, so every reader —
+                // including the two tasks that built on it — took the watcher for granted while
+                // `install_completion_watcher` had ZERO production callers: only `#[cfg(test)]` and
+                // the cyrup-it suites reached it. In a real session nothing surfaced a detached
+                // run's completion, no result file was reclaimed, and SCOPE_14's retention sweep —
+                // which arms inside this very method — could never start. A comment is not a call.
+                self.executor.install_completion_watcher(&ctx.cwd).await;
                 // SCOPE_11 — pi `waitSubscriptionManager.restore()` (`extension/index.ts:971`),
                 // ordered AFTER `install_completion_watcher` so the composite observer's slot is
                 // already shared (the observer resolves the manager LATE, so the order is not
@@ -382,6 +390,20 @@ impl NativeExtension for SubagentsExtension {
                 } else {
                     self.executor.dispose_wait_subscriptions();
                 }
+
+                // SUBA-016 — pi `scheduledRunManager.bindSession(ctx)` + `restore()`. Ordered
+                // AFTER `capture_parent_session_anchor()` above, because the manager PINS the
+                // session identity at install (`ScheduleSessionSnapshot`) and a snapshot taken
+                // before the anchor is bound would pin nothing.
+                //
+                // ⚠ Deliberately NOT gated on `ctx.has_ui`, unlike wait subscriptions directly
+                // above. That gate exists because a wake scheduled for a later turn could never be
+                // received by a headless run that ends in one turn. A schedule's output is a RUN
+                // ON DISK — a headless process can produce one perfectly well, and a `cyrup -p`
+                // invocation that fires a due schedule is the intended behaviour, not an
+                // accident. Copying the `if ctx.has_ui` by reflex would make every schedule
+                // interactive-only.
+                self.executor.install_scheduled_runs(&ctx.cwd).await;
 
                 // pi `fleetStatus.setContext(ctx)` (`tui/fleet-status.ts:271-288`): arm the
                 // always-on fleet status widget for this session and paint it once. See
@@ -491,6 +513,12 @@ impl NativeExtension for SubagentsExtension {
                 // that is the entire point of the durable half, and the next session's `restore()`
                 // is what picks them up.
                 self.executor.dispose_wait_subscriptions();
+                // SUBA-016 — pi `scheduledRunManager.stop()`. Aborts the tick and clears the slot,
+                // and touches NEITHER the store nor an in-flight `active.lock`: the records are
+                // the whole point of a cwd-keyed store, and releasing a live claim here would let
+                // the next session double-launch a schedule whose run is still going.
+                // `restore_one`'s stale-claim recovery is what clears a claim whose process died.
+                self.executor.dispose_scheduled_runs();
                 self.executor.teardown_session().await;
                 // pi `fleetStatus.dispose()` — clear the widget and drop every piece of
                 // registration state (`tui/fleet-status.ts:290-299,533-563`).

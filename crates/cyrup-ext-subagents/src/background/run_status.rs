@@ -255,14 +255,181 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
 }
 
 // =================================================================================================
+// S6 — live workflow controls (`run-status.ts:609-613`, consumed at `:684-691`)
+// =================================================================================================
+
+/// One element of pi's `[...deps.state.foregroundControls.values()]` (`run-status.ts:610`),
+/// reduced to the three facts S6 tests plus the one its rendered line interpolates.
+///
+/// `run_id` is a FIELD here because it is the `foreground_controls` MAP KEY on the cyrup side:
+/// [`crate::extension::executor::notices::ForegroundControlEntry`] carries no run id of its own
+/// (pi's `ForegroundRunControl.runId` is a field), which is the same reason
+/// `extension/executor/workflow_steering.rs` carries a `control_run_id` beside its cloned entry.
+///
+/// `child_indexes` is `control.activeChildren.keys()`, ALREADY ascending: `active_children` is a
+/// `BTreeMap` (chosen for exactly this), so pi's `.sort((left, right) => left - right)` at `:687`
+/// is a no-op here and is deliberately NOT re-applied.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LiveWorkflowControlCandidate {
+    /// The `foreground_controls` key this entry was registered under.
+    pub run_id: String,
+    /// pi `control.sessionId`.
+    pub session_id: Option<SessionId>,
+    /// pi `control.parentWorkflowRunId`.
+    pub parent_workflow_run_id: Option<RunId>,
+    /// pi `[...control.activeChildren.keys()]`.
+    pub child_indexes: Vec<usize>,
+}
+
+impl LiveWorkflowControlCandidate {
+    /// The admitted projection — the two fields `:688` interpolates, and nothing else.
+    fn to_live(&self) -> LiveWorkflowControl {
+        LiveWorkflowControl {
+            run_id: self.run_id.clone(),
+            child_indexes: self.child_indexes.clone(),
+        }
+    }
+}
+
+/// One element of pi's `liveWorkflowControls` (`run-status.ts:609-613`) — a foreground control
+/// that survived all four terms of the S6 filter.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LiveWorkflowControl {
+    /// The control's run id, interpolated into the `id:` of the rendered steer hint.
+    pub run_id: String,
+    /// Its active children, ascending; one rendered line each.
+    pub child_indexes: Vec<usize>,
+}
+
+/// The subset of pi's `deps` that [`format_status`] reads — `deps.state?.currentSessionId`,
+/// `deps.state?.workflowControllers`, `deps.state.foregroundControls`.
+///
+/// # Why the renderer is HANDED this rather than reading the registries itself
+///
+/// Both registries are `std::sync::Mutex`es
+/// (`extension/executor/mod.rs:157,171`) and this crate's rule — stated at `mod.rs:168-169` and
+/// again at `workflow_child_stops.rs:36` — is that no `.await` happens inside their critical
+/// sections. [`format_status`] is `async`. So the projection is built by the executor, which owns
+/// the locks, and arrives here already materialised and lock-free.
+///
+/// # Why `live_workflow_run_ids` is a SET and not the bool `deps.state?.workflowControllers?.has(status.runId)`
+///
+/// Upstream evaluates `has(runId)` at the call site because it already holds the status. cyrup's
+/// entry point is [`inspect_status_by_id`], which RESOLVES the selector (an id, or a unique
+/// directory-name prefix) to a [`RunId`] inside this module — so at the moment the executor builds
+/// these deps there is no run id yet to ask about. A snapshot of
+/// [`crate::extension::executor::workflow_controllers`]' keys answers the same question at the
+/// same instant, and `contains` at the seam below IS `has`.
+///
+/// `Default::default()` is upstream's `deps.state === undefined`: every optional chain
+/// short-circuits, so `liveWorkflowControls` is `[]` (`:613`) and a running workflow renders the
+/// `Steer: unavailable;` sentence.
+#[derive(Clone, Debug, Default)]
+pub struct RunStatusRenderDeps {
+    /// pi `deps.state?.currentSessionId`.
+    pub current_session: Option<SessionId>,
+    /// pi `deps.state?.workflowControllers`' key set — see this type's own doc.
+    pub live_workflow_run_ids: std::collections::HashSet<RunId>,
+    /// pi `[...deps.state.foregroundControls.values()]`, unfiltered. Both session comparisons
+    /// happen HERE, in [`Self::live_workflow_controls`], so they stay in one expression.
+    pub foreground_controls: Vec<LiveWorkflowControlCandidate>,
+}
+
+impl RunStatusRenderDeps {
+    /// pi `run-status.ts:609-613`. FOUR terms; all four are required and none is redundant.
+    ///
+    /// ```ts
+    /// const liveWorkflowControls =
+    ///     status.mode === "workflow"
+    ///     && deps.state?.currentSessionId === status.sessionId
+    ///     && deps.state?.workflowControllers?.has(status.runId)
+    ///         ? [...deps.state.foregroundControls.values()].filter((control) =>
+    ///               control.parentWorkflowRunId === status.runId
+    ///            && control.sessionId === status.sessionId
+    ///            && (control.activeChildren?.size ?? 0) > 0)
+    ///         : [];
+    /// ```
+    ///
+    /// # ⚠ The two session comparisons are `Option` EQUALITY, and NOT [`crate::background::delivery::SessionGate`]
+    ///
+    /// Reaching for `SessionGate` here compiles and passes a happy-path test, and is wrong. Both
+    /// gate classes disagree with upstream's `===` in exactly one row, and in DIFFERENT rows:
+    ///
+    /// | `current` | `record` | pi `a === b` | `Strict.admits` | `Permissive.admits` |
+    /// |---|---|---|---|---|
+    /// | `None` | `None` | **true** | false | true |
+    /// | `None` | `Some(x)` | **false** | false | true |
+    /// | `Some(x)` | `None` | false | false | false |
+    /// | `Some(x)` | `Some(x)` | true | true | true |
+    /// | `Some(x)` | `Some(y)` | false | false | false |
+    ///
+    /// The row that bites is `None`/`None`: a headless or SDK-embedded orchestrator with no
+    /// session identity, running a workflow whose `status.json` records no session. Upstream
+    /// renders its steer hints; `SessionGate::Strict` would suppress them and the run would
+    /// report `Steer: unavailable; …` for its whole life even though the route is right there.
+    /// `SessionGate::Permissive` fails the other way, admitting a control from a session this
+    /// status does not name.
+    ///
+    /// The sibling gate at `run-status.ts:249` IS `SessionGate::Strict` — see
+    /// [`crate::extension::executor`]'s live-foreground transcript refusal. These are different
+    /// gates with different classes and the difference is upstream's, not cyrup's.
+    ///
+    /// # The two comparisons are against two DIFFERENT objects
+    ///
+    /// Gate 1 is the STATE's current session vs the status's; gate 2 is each CONTROL's session vs
+    /// the status's. They are not redundant: a control can carry a stale session after a rotation,
+    /// and collapsing them would let it through.
+    ///
+    /// # Ordering
+    ///
+    /// Upstream's argument that the registry check happens "before any disk read"
+    /// (`workflow_controllers.rs:133-136`) does NOT transfer: cyrup reaches [`format_status`]
+    /// only after reconciliation has already read the run, so the registry term here is an
+    /// ordinary conjunct and is documented as one rather than as an ordering guarantee.
+    #[must_use]
+    pub fn live_workflow_controls(&self, status: &RunStatus) -> Vec<LiveWorkflowControl> {
+        if status.mode != RunMode::Workflow
+            // gate 1 — `deps.state?.currentSessionId === status.sessionId`.
+            || self.current_session.as_ref() != status.session_id.as_ref()
+            // `deps.state?.workflowControllers?.has(status.runId)`.
+            || !self.live_workflow_run_ids.contains(&status.run_id)
+        {
+            return Vec::new(); // `:613`
+        }
+        self.foreground_controls
+            .iter()
+            .filter(|control| {
+                // `:610`
+                control.parent_workflow_run_id.as_ref() == Some(&status.run_id)
+                    // `:611` — gate 2, `Option` equality again for the reason above.
+                    && control.session_id.as_ref() == status.session_id.as_ref()
+                    // `:612` — `(control.activeChildren?.size ?? 0) > 0`.
+                    && !control.child_indexes.is_empty()
+            })
+            .map(LiveWorkflowControlCandidate::to_live)
+            .collect()
+    }
+}
+
+/// pi `run-status.ts:685` — the sentence a running workflow gets when no live foreground route
+/// survived the S6 filter. Wire text; reproduced byte-for-byte.
+const STEER_UNAVAILABLE_NOTICE: &str =
+    "Steer: unavailable; no live foreground route is registered in the active session.";
+
+// =================================================================================================
 // Single-run status report (`inspectSubagentStatus`, run-status.ts:101-273)
 // =================================================================================================
 
 /// Renders one reconciled [`RunStatus`] as pi's full status report (`run-status.ts:202-243`) —
 /// run identity/state/mode/progress, pending appends, timestamps, dir, the authoritative terminal
-/// `Result:` reference (when its file exists), per-step lines, resume guidance for a non-running
-/// run, and the `Log`/`Events` artifact references (when they exist).
-async fn format_status(status: &RunStatus, paths: &RunPaths) -> String {
+/// `Result:` reference (when its file exists), per-step lines, S6's live-workflow steer hints,
+/// resume guidance for a non-running run, and the `Log`/`Events` artifact references (when they
+/// exist).
+///
+/// `deps` is pi's `deps` (`run-status.ts:609-613`), already materialised out of the executor's
+/// live registries — see [`RunStatusRenderDeps`] for why this renderer is handed it rather than
+/// reading them. [`RunStatusRenderDeps::default`] is upstream's `deps.state === undefined`.
+async fn format_status(status: &RunStatus, paths: &RunPaths, deps: &RunStatusRenderDeps) -> String {
     let mut lines: Vec<String> = Vec::new();
     lines.push(format!("Run: {}", status.run_id));
     // pi `run-status.ts:373-385` @v0.43.0: the DURABLE MISSION this run is bound to, read back
@@ -360,6 +527,31 @@ async fn format_status(status: &RunStatus, paths: &RunPaths) -> String {
         }
     }
 
+    // S6 — pi `run-status.ts:684-691`, the CONSUMER of `:609-613`. Positioned by upstream's own
+    // relative order, which is the transferable anchor (the same argument the `Workflow receipt:`
+    // line below already makes): after the per-step lines and immediately before it.
+    //
+    // Both strings are wire text an operator copies out of the report and pastes back as a tool
+    // call, so both are byte-for-byte upstream's.
+    if status.mode == RunMode::Workflow && status.state == RunState::Running {
+        let live_workflow_controls = deps.live_workflow_controls(status);
+        if live_workflow_controls.is_empty() {
+            lines.push(STEER_UNAVAILABLE_NOTICE.to_string()); // `:685`
+        } else {
+            for control in &live_workflow_controls {
+                // `:687` — ALREADY ascending (`LiveWorkflowControlCandidate::child_indexes`), so
+                // upstream's numeric re-sort is a no-op and is not repeated.
+                for index in &control.child_indexes {
+                    lines.push(format!(
+                        "Steer live foreground child: subagent({{ action: \"steer\", id: \"{}\", \
+                         index: {index}, message: \"...\" }})",
+                        control.run_id
+                    )); // `:688`
+                }
+            }
+        }
+    }
+
     // pi `if (status.workflowReceiptPath) lines.push(\`Workflow receipt: ${...}\`)`
     // (`run-status.ts:697`) — immediately before `Session:` upstream, which cyrup's own report has
     // no equivalent line for; the transferable anchor is upstream's OWN relative order —
@@ -397,7 +589,10 @@ async fn format_status(status: &RunStatus, paths: &RunPaths) -> String {
 ///
 /// Propagates a genuine I/O/parse failure from the reconciliation read (anything other than the
 /// "neither file exists" not-found case).
-async fn inspect_paths(paths: &RunPaths) -> Result<Option<String>, SubagentError> {
+async fn inspect_paths(
+    paths: &RunPaths,
+    deps: &RunStatusRenderDeps,
+) -> Result<Option<String>, SubagentError> {
     match reconcile_before_control_op(paths).await {
         // SUBA-057 — pi `run-status.ts:332-345`: a dismissed run answers with the display-dismissed
         // report instead of the ordinary one. `reconcile_before_control_op` has already erased the
@@ -407,7 +602,7 @@ async fn inspect_paths(paths: &RunPaths) -> Result<Option<String>, SubagentError
             Some(dismissed_at) => {
                 format_display_dismissed_status(status.run_id.as_str(), dismissed_at)
             }
-            None => format_status(&status, paths).await,
+            None => format_status(&status, paths, deps).await,
         })),
         Err(SubagentError::Spawn(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
@@ -514,6 +709,10 @@ async fn path_exists(path: &Path) -> bool {
 /// `run-status.ts:128-243`): resolve the selector, reconcile, and render the full per-step report.
 /// Returns `Ok(None)` for an unresolved/absent run (the caller renders the not-found notice).
 ///
+/// `deps` is upstream's second argument, threaded through to [`format_status`] for S6's live
+/// workflow controls; [`RunStatusRenderDeps::default`] is upstream's `deps.state === undefined`
+/// and renders the report with no steer hints.
+///
 /// # Errors
 ///
 /// Propagates safe-token/ambiguity resolution errors and genuine reconciliation I/O failures.
@@ -521,12 +720,13 @@ pub async fn inspect_status_by_id(
     async_root: &Path,
     results_dir: &Path,
     selector: &str,
+    deps: &RunStatusRenderDeps,
 ) -> Result<Option<String>, SubagentError> {
     let Some(run_id) = resolve_run_id(async_root, results_dir, selector).await? else {
         return Ok(None);
     };
     let paths = RunPaths::for_run(async_root, results_dir, &run_id);
-    inspect_paths(&paths).await
+    inspect_paths(&paths, deps).await
 }
 
 /// G92: the same id resolution + R-SA-079 reconciliation [`inspect_status_by_id`] performs, but
@@ -587,6 +787,8 @@ async fn reconcile_paths(paths: RunPaths) -> Result<Option<(RunStatus, RunPaths)
 /// `results_dir` and the directory's own basename. Returns `Ok(None)` when neither status nor
 /// result exists there.
 ///
+/// `deps` is [`inspect_status_by_id`]'s, for the same reason and with the same default.
+///
 /// # Errors
 ///
 /// Returns [`SubagentError::UnsafePathToken`] if `async_dir` has no usable basename, or propagates
@@ -594,6 +796,7 @@ async fn reconcile_paths(paths: RunPaths) -> Result<Option<(RunStatus, RunPaths)
 pub async fn inspect_status_by_dir(
     async_dir: &Path,
     results_dir: &Path,
+    deps: &RunStatusRenderDeps,
 ) -> Result<Option<String>, SubagentError> {
     let run_id = async_dir
         .file_name()
@@ -607,7 +810,7 @@ pub async fn inspect_status_by_dir(
         })?;
     let async_root = async_dir.parent().unwrap_or(async_dir);
     let paths = RunPaths::for_run(async_root, results_dir, &run_id);
-    inspect_paths(&paths).await
+    inspect_paths(&paths, deps).await
 }
 
 // =================================================================================================
@@ -662,6 +865,17 @@ fn list_rank(state: RunState) -> u8 {
 ///   launching session explicitly rather than leaving the runner to re-derive it from the
 ///   permission-system-published anchor, which is absent whenever that extension is not loaded.
 ///
+/// # Where the candidates come from (pi `async-status.ts:506-516` @`v0.68.0`)
+///
+/// Upstream stopped enumerating the async root for this listing: with no `repairScan`, the
+/// candidate set is `readActiveRunIndex(asyncDirRoot)`. cyrup reads it through
+/// [`crate::background::active_run_index::read_live_active_run_ids`], which also performs
+/// upstream's two in-read index repairs, and falls back to the directory scan when that reader
+/// answers `None` (no index exists in this root) or an empty list. The fallback is
+/// [`crate::tui::fleet::collect_fleet_history`]'s idiom for the TERMINAL index and it holds for
+/// the same reason: the index accelerates a listing, it must never be the only way a run can be
+/// found, and an async root written before the index existed must still list.
+///
 /// # Errors
 ///
 /// Returns [`SubagentError::Spawn`] only if `async_root` exists but its directory listing itself
@@ -673,29 +887,7 @@ pub async fn list_active_runs(
 ) -> Result<Vec<ActiveRun>, SubagentError> {
     let mut runs: Vec<ActiveRun> = Vec::new();
 
-    let mut entries = match tokio::fs::read_dir(async_root).await {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(runs),
-        Err(e) => return Err(SubagentError::Spawn(e)),
-    };
-
-    while let Some(entry) = entries.next_entry().await.map_err(SubagentError::Spawn)? {
-        let Ok(file_type) = entry.file_type().await else {
-            continue;
-        };
-        if !file_type.is_dir() {
-            continue;
-        }
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        // pi `entry !== ACTIVE_RUN_INDEX_DIR && entry !== TERMINAL_RUN_INDEX_DIR`
-        // (`async-status.ts:502`): the reserved index dirs live inside the async root but are not
-        // runs — without this, every listing reconciles `.terminal-runs` as a status-less run.
-        if crate::background::terminal_run_index::is_reserved_async_root_entry(&name) {
-            continue;
-        }
-        let run_id = RunId::from_token(name);
+    for run_id in active_run_candidates(async_root).await? {
         let paths = RunPaths::for_run(async_root, results_dir, &run_id);
         // Reconcile before summarizing (R-SA-079); a run that reconciles to a terminal/paused
         // state, or that cannot be read at all, is simply not an *active* run.
@@ -735,6 +927,53 @@ pub async fn list_active_runs(
             .then_with(|| b.status.last_update.cmp(&a.status.last_update))
     });
     Ok(runs)
+}
+
+/// The run ids [`list_active_runs`] considers, index-first with the directory scan underneath.
+///
+/// [`crate::background::active_run_index::read_live_active_run_ids`] is the bounded read of
+/// `<async_root>/.active-runs` (pi `async-status.ts:506-516`); it has already dropped every entry
+/// whose run reads back non-active and repaired the index for those. Only a `None` (this root has
+/// no index) or an empty answer falls through to `read_dir`, and the scan then reproduces pi's
+/// `repairScan` arm (`:503-504`) verbatim, reserved index dirs skipped.
+///
+/// # Errors
+///
+/// The scan's own listing failure. A missing `async_root` is an empty list, not an error, and the
+/// index read never fails — a listing that cannot read the index still has the scan.
+async fn active_run_candidates(async_root: &Path) -> Result<Vec<RunId>, SubagentError> {
+    if let Some(indexed) =
+        crate::background::active_run_index::read_live_active_run_ids(async_root).await
+        && !indexed.is_empty()
+    {
+        return Ok(indexed);
+    }
+
+    let mut candidates: Vec<RunId> = Vec::new();
+    let mut entries = match tokio::fs::read_dir(async_root).await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(candidates),
+        Err(e) => return Err(SubagentError::Spawn(e)),
+    };
+    while let Some(entry) = entries.next_entry().await.map_err(SubagentError::Spawn)? {
+        let Ok(file_type) = entry.file_type().await else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        // pi `entry !== ACTIVE_RUN_INDEX_DIR && entry !== TERMINAL_RUN_INDEX_DIR`
+        // (`async-status.ts:504`): the reserved index dirs live inside the async root but are not
+        // runs — without this, every listing reconciles `.terminal-runs` as a status-less run.
+        if crate::background::terminal_run_index::is_reserved_async_root_entry(&name) {
+            continue;
+        }
+        candidates.push(RunId::from_token(name));
+    }
+    Ok(candidates)
 }
 
 /// Render the active-run list (pi `formatAsyncRunList`, `async-status.ts:516-537`): a
@@ -828,7 +1067,7 @@ mod tests {
         step.telemetry.last_steer_at = Some(1_700_000_000_000);
         status.steps = vec![step];
 
-        let report = format_status(&status, &paths).await;
+        let report = format_status(&status, &paths, &RunStatusRenderDeps::default()).await;
         assert!(
             report.contains(
                 "Step 1: scout running, steering: 2 steers, last 2023-11-14T22:13:20.000Z"
@@ -840,13 +1079,13 @@ mod tests {
         status.steps[0].telemetry.steer_count = Some(1);
         status.steps[0].telemetry.last_steer_at = None;
         assert!(
-            format_status(&status, &paths)
+            format_status(&status, &paths, &RunStatusRenderDeps::default())
                 .await
                 .contains(", steering: 1 steer"),
             "singular form"
         );
         status.steps[0].telemetry.steer_count = None;
-        let quiet = format_status(&status, &paths).await;
+        let quiet = format_status(&status, &paths, &RunStatusRenderDeps::default()).await;
         assert!(
             !quiet.contains("steering:"),
             "an unsteered step gets no suffix: {quiet}"
@@ -891,7 +1130,7 @@ mod tests {
         );
         status.steps = vec![step];
 
-        let report = format_status(&status, &paths).await;
+        let report = format_status(&status, &paths, &RunStatusRenderDeps::default()).await;
         assert!(
             report.contains(
                 "  Recovery needed: review the diff and artifacts before resuming or launching dependent stages."
@@ -929,7 +1168,7 @@ mod tests {
                 },
             ),
         );
-        let quiet = format_status(&status, &paths).await;
+        let quiet = format_status(&status, &paths, &RunStatusRenderDeps::default()).await;
         assert!(!quiet.contains("Recovery"), "{quiet}");
     }
 
@@ -953,7 +1192,7 @@ mod tests {
         step.error = Some(control::STOP_MESSAGE.to_string());
         status.steps = vec![step];
 
-        let report = format_status(&status, &paths).await;
+        let report = format_status(&status, &paths, &RunStatusRenderDeps::default()).await;
         assert!(report.contains("State: stopped"), "{report}");
         assert!(report.contains("Step 1: scout stopped"), "{report}");
         assert!(report.contains(STOPPED_NOT_RESUMABLE_GUIDANCE), "{report}");
@@ -1107,6 +1346,95 @@ mod tests {
         );
     }
 
+    /// The ACTIVE-run index is what [`list_active_runs`] enumerates — not the async root — so the
+    /// whole `wait`/`status`/`auto_drain`/control family reaches
+    /// [`crate::background::active_run_index::read_live_active_run_ids`] through this one listing.
+    ///
+    /// Proved by the only asymmetry a scan cannot reproduce: BOTH runs are running on disk, and
+    /// only one carries an index marker. A directory scan lists two; the index lists one.
+    #[tokio::test]
+    async fn list_active_runs_enumerates_the_active_run_index_not_the_directory() {
+        let (_dir, async_root, results_dir) = roots();
+
+        let indexed_id = RunId::from_token("run0indexed");
+        let indexed_paths = RunPaths::for_run(&async_root, &results_dir, &indexed_id);
+        let indexed = running_status(&indexed_id, RunMode::Single, vec![StepStatus::pending("a")]);
+        write_status(&indexed_paths, &indexed).await;
+        crate::background::active_run_index::update_active_run_index(
+            &indexed_paths.run_dir,
+            &indexed,
+        )
+        .await
+        .expect("index the launch");
+
+        // Running on disk, absent from the index — the shape a scan cannot tell from the above.
+        let unindexed_id = RunId::from_token("run0scanonly");
+        let unindexed_paths = RunPaths::for_run(&async_root, &results_dir, &unindexed_id);
+        let unindexed = running_status(
+            &unindexed_id,
+            RunMode::Single,
+            vec![StepStatus::pending("a")],
+        );
+        write_status(&unindexed_paths, &unindexed).await;
+
+        let ids: Vec<String> = list_active_runs(&async_root, &results_dir, None)
+            .await
+            .expect("list active")
+            .iter()
+            .map(|run| run.status.run_id.as_str().to_string())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["run0indexed"],
+            "the listing is the index's, not the directory's"
+        );
+    }
+
+    /// pi `async-status.ts:514`/`:570` — an index entry whose run has no readable `status.json` is
+    /// a phantom, and the listing that trips over it calls `updateActiveRunIndex(asyncDir,
+    /// "failed")` ([`crate::background::active_run_index::mark_active_run_failed`]) to release it.
+    ///
+    /// Reached here only through `list_active_runs`: the marker is planted by hand, the production
+    /// listing is the single call, and the marker is gone afterwards.
+    #[tokio::test]
+    async fn a_phantom_active_marker_is_released_by_the_listing_that_trips_over_it() {
+        let (_dir, async_root, results_dir) = roots();
+
+        let real_id = RunId::from_token("run0realrun");
+        let real_paths = RunPaths::for_run(&async_root, &results_dir, &real_id);
+        let real = running_status(&real_id, RunMode::Single, vec![StepStatus::pending("a")]);
+        write_status(&real_paths, &real).await;
+        crate::background::active_run_index::update_active_run_index(&real_paths.run_dir, &real)
+            .await
+            .expect("index the launch");
+
+        // A marker with no run behind it at all — the residue of a directory removed underneath
+        // the index.
+        let phantom = async_root
+            .join(crate::background::active_run_index::ACTIVE_RUN_INDEX_DIR)
+            .join("run0phantom0");
+        tokio::fs::write(&phantom, b"").await.expect("plant marker");
+
+        let ids: Vec<String> = list_active_runs(&async_root, &results_dir, None)
+            .await
+            .expect("list active")
+            .iter()
+            .map(|run| run.status.run_id.as_str().to_string())
+            .collect();
+        assert_eq!(ids, vec!["run0realrun"], "the phantom is not a run");
+        assert!(
+            !phantom.exists(),
+            "the listing released the phantom's marker"
+        );
+        assert!(
+            real_paths.run_dir.parent().is_some_and(|root| root
+                .join(crate::background::active_run_index::ACTIVE_RUN_INDEX_DIR)
+                .join("run0realrun")
+                .is_file()),
+            "the live run's own marker is untouched"
+        );
+    }
+
     #[tokio::test]
     async fn format_run_list_empty_is_the_no_active_sentinel() {
         let (_dir, async_root, results_dir) = roots();
@@ -1195,10 +1523,15 @@ mod tests {
         let status = running_status(&run_id, RunMode::Chain, vec![step0, step1]);
         write_status(&paths, &status).await;
 
-        let report = inspect_status_by_id(&async_root, &results_dir, "run0chain00")
-            .await
-            .expect("inspect ok")
-            .expect("run found");
+        let report = inspect_status_by_id(
+            &async_root,
+            &results_dir,
+            "run0chain00",
+            &RunStatusRenderDeps::default(),
+        )
+        .await
+        .expect("inspect ok")
+        .expect("run found");
 
         assert!(report.contains("Run: run0chain00"), "{report}");
         assert!(report.contains("State: running"), "{report}");
@@ -1223,19 +1556,145 @@ mod tests {
         );
         write_status(&paths, &status).await;
 
-        let report = inspect_status_by_id(&async_root, &results_dir, "abcdef")
-            .await
-            .expect("inspect ok")
-            .expect("prefix resolves");
+        let report = inspect_status_by_id(
+            &async_root,
+            &results_dir,
+            "abcdef",
+            &RunStatusRenderDeps::default(),
+        )
+        .await
+        .expect("inspect ok")
+        .expect("prefix resolves");
         assert!(report.contains("Run: abcdef123456"), "{report}");
+    }
+
+    /// [`resolve_run_id`]'s two ERROR arms, reached through the production entry point rather
+    /// than by calling the resolver: the R-SA-087 safe-token gate, and pi's ambiguity refusal
+    /// (`async-status.ts:508`). Both were uncovered — only the resolver's resolving paths had
+    /// tests, so a regression that silently picked the first prefix match, or that dropped the
+    /// token gate, would have gone unnoticed here.
+    #[tokio::test]
+    async fn inspect_status_by_id_refuses_an_unsafe_token_and_an_ambiguous_prefix() {
+        let (_dir, async_root, results_dir) = roots();
+        for token in ["run0ambig001", "run0ambig002"] {
+            let id = RunId::from_token(token);
+            let paths = RunPaths::for_run(&async_root, &results_dir, &id);
+            let status = running_status(&id, RunMode::Single, vec![StepStatus::pending("a")]);
+            write_status(&paths, &status).await;
+        }
+
+        let unsafe_selector = inspect_status_by_id(
+            &async_root,
+            &results_dir,
+            "../etc/passwd",
+            &RunStatusRenderDeps::default(),
+        )
+        .await
+        .expect_err("a selector that escapes the async root is refused before any read");
+        assert!(
+            matches!(unsafe_selector, SubagentError::UnsafePathToken(_)),
+            "{unsafe_selector:?}"
+        );
+
+        let ambiguous = inspect_status_by_id(
+            &async_root,
+            &results_dir,
+            "run0ambig",
+            &RunStatusRenderDeps::default(),
+        )
+        .await
+        .expect_err("a prefix matching two runs must refuse, never silently pick one");
+        match ambiguous {
+            SubagentError::AmbiguousRunId(message) => assert!(
+                message.contains("2 runs match id prefix \"run0ambig\""),
+                "{message}"
+            ),
+            other => panic!("expected AmbiguousRunId, got {other:?}"),
+        }
+
+        // The control: one more character resolves the same selector, so the refusal above is
+        // about ambiguity and not about the prefix being unresolvable in this root.
+        let report = inspect_status_by_id(
+            &async_root,
+            &results_dir,
+            "run0ambig001",
+            &RunStatusRenderDeps::default(),
+        )
+        .await
+        .expect("an exact id resolves")
+        .expect("the run is found");
+        assert!(report.contains("Run: run0ambig001"), "{report}");
+    }
+
+    /// SUBA-057 — the dismissed-run pair, both halves of which live in this module and neither of
+    /// which had a test: an id-addressed lookup answers with
+    /// [`format_display_dismissed_status`] instead of a stale `running` report, and the no-id
+    /// listing (`list_active_runs`' own `continue`) drops the run entirely.
+    #[tokio::test]
+    async fn a_display_dismissed_run_is_reported_as_dismissed_and_never_listed_as_active() {
+        let (_dir, async_root, results_dir) = roots();
+
+        let dismissed_id = RunId::from_token("run0dismiss");
+        let dismissed_paths = RunPaths::for_run(&async_root, &results_dir, &dismissed_id);
+        let mut dismissed = running_status(
+            &dismissed_id,
+            RunMode::Single,
+            vec![StepStatus::pending("scout")],
+        );
+        dismissed.display_dismissed_at = Some(1_700_000_000_000);
+        write_status(&dismissed_paths, &dismissed).await;
+
+        // A live neighbour, so the listing assertion below is an EXCLUSION rather than an empty
+        // root passing vacuously.
+        let live_id = RunId::from_token("run0liveone");
+        let live_paths = RunPaths::for_run(&async_root, &results_dir, &live_id);
+        let live = running_status(
+            &live_id,
+            RunMode::Single,
+            vec![StepStatus::pending("scout")],
+        );
+        write_status(&live_paths, &live).await;
+
+        let report = inspect_status_by_id(
+            &async_root,
+            &results_dir,
+            "run0dismiss",
+            &RunStatusRenderDeps::default(),
+        )
+        .await
+        .expect("inspect ok")
+        .expect("a dismissed run is still addressable by id");
+        assert_eq!(
+            report,
+            "Run: run0dismiss\nState: display-dismissed\nDismissed: \
+             2023-11-14T22:13:20.000Z\nNo running work was terminated.",
+            "the dismissal outranks the run's own recorded `running` state"
+        );
+
+        let ids: Vec<String> = list_active_runs(&async_root, &results_dir, None)
+            .await
+            .expect("list active")
+            .iter()
+            .map(|run| run.status.run_id.as_str().to_string())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["run0liveone"],
+            "a dismissed run disappears from the fleet listing while its neighbour stays"
+        );
     }
 
     #[tokio::test]
     async fn inspect_status_by_id_missing_run_is_none() {
         let (_dir, async_root, results_dir) = roots();
-        let found = inspect_status_by_id(&async_root, &results_dir, "nosuchrun00")
-            .await
-            .expect("inspect ok");
+        let found = inspect_status_by_id(
+            &async_root,
+            &results_dir,
+            "nosuchrun00",
+            &RunStatusRenderDeps::default(),
+        )
+        .await
+        .expect("inspect ok");
         assert!(
             found.is_none(),
             "a missing run resolves to None (not-found notice)"
@@ -1300,10 +1759,15 @@ mod tests {
         write_status(&paths, &paused).await;
 
         // Observable outcome: the status report now reads paused, with a real revive guidance line.
-        let report = inspect_status_by_id(&async_root, &results_dir, "run0intr000")
-            .await
-            .expect("inspect ok")
-            .expect("found");
+        let report = inspect_status_by_id(
+            &async_root,
+            &results_dir,
+            "run0intr000",
+            &RunStatusRenderDeps::default(),
+        )
+        .await
+        .expect("inspect ok")
+        .expect("found");
         assert!(
             report.contains("State: paused"),
             "soft-pause, not failed: {report}"
@@ -1349,10 +1813,15 @@ mod tests {
         assert_eq!(pending, 1, "exactly one append is now pending");
 
         // The pending count surfaces in the status report (append_step persists it into status.json).
-        let report = inspect_status_by_id(&async_root, &results_dir, "run0appchn0")
-            .await
-            .expect("inspect ok")
-            .expect("found");
+        let report = inspect_status_by_id(
+            &async_root,
+            &results_dir,
+            "run0appchn0",
+            &RunStatusRenderDeps::default(),
+        )
+        .await
+        .expect("inspect ok")
+        .expect("found");
         assert!(report.contains("Pending appends: 1"), "{report}");
     }
 
@@ -1443,6 +1912,376 @@ mod tests {
                 session_file,
             },
             "a terminal run with a transcript resolves to the respawn-from-transcript branch"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // SCOPE_10 S6 — live workflow controls (`run-status.ts:609-613`) and their consumer
+    // (`:684-691`).
+    //
+    // Every test below fails on the pre-SCOPE_10 tree for the same reason: `format_status` took
+    // no `deps` at all, so no steer line — neither the hints nor the `Steer: unavailable;`
+    // sentence — could be rendered for any input.
+    // ---------------------------------------------------------------------------------------
+
+    /// A workflow run in `state`, owned by `session`. The walk goes through `Running` because
+    /// `RunState`'s transition guard is monotone-forward and `Queued -> Complete` is not one of
+    /// its edges (`background/state.rs:162-175`).
+    fn workflow_status(run_id: &RunId, session: Option<&str>, state: RunState) -> RunStatus {
+        let mut status = RunStatus::queued(run_id.clone(), RunMode::Workflow, None);
+        if state != RunState::Queued {
+            status
+                .advance_state(RunState::Running)
+                .expect("Queued -> Running");
+            if state != RunState::Running {
+                status
+                    .advance_state(state)
+                    .expect("Running -> the test state");
+            }
+        }
+        status.session_id = SessionId::parse_opt(session);
+        status
+    }
+
+    fn candidate(
+        run_id: &str,
+        session: Option<&str>,
+        parent: Option<&RunId>,
+        child_indexes: Vec<usize>,
+    ) -> LiveWorkflowControlCandidate {
+        LiveWorkflowControlCandidate {
+            run_id: run_id.to_string(),
+            session_id: SessionId::parse_opt(session),
+            parent_workflow_run_id: parent.cloned(),
+            child_indexes,
+        }
+    }
+
+    fn render_deps(
+        current: Option<&str>,
+        live: &[&RunId],
+        controls: Vec<LiveWorkflowControlCandidate>,
+    ) -> RunStatusRenderDeps {
+        RunStatusRenderDeps {
+            current_session: SessionId::parse_opt(current),
+            live_workflow_run_ids: live.iter().map(|id| (*id).clone()).collect(),
+            foreground_controls: controls,
+        }
+    }
+
+    /// `:611` — gate 2, on its own. The registry has the run and gate 1 passes, so the ONLY thing
+    /// that can exclude the second control is its own session. The two comparisons are against
+    /// two different objects and a control can carry a stale session after a rotation; collapsing
+    /// them would let that control through and steer another instance's child.
+    #[test]
+    fn live_workflow_controls_require_both_session_comparisons() {
+        let run_id = RunId::from_token("wf0000000001");
+        let status = workflow_status(&run_id, Some("session-a"), RunState::Running);
+        let deps = render_deps(
+            Some("session-a"),
+            &[&run_id],
+            vec![
+                candidate("fg-own", Some("session-a"), Some(&run_id), vec![0]),
+                candidate("fg-foreign", Some("session-b"), Some(&run_id), vec![0]),
+            ],
+        );
+        let live = deps.live_workflow_controls(&status);
+        assert_eq!(live.len(), 1, "{live:?}");
+        assert_eq!(live[0].run_id, "fg-own");
+    }
+
+    /// `:609`'s `deps.state?.workflowControllers?.has(status.runId)` arm. A `status.json` saying
+    /// `workflow`/`running` is not evidence THIS process is driving it — another instance may be,
+    /// and its controls are not ours to steer.
+    #[test]
+    fn live_workflow_controls_are_empty_without_a_registry_entry() {
+        let run_id = RunId::from_token("wf0000000001");
+        let status = workflow_status(&run_id, Some("session-a"), RunState::Running);
+        let controls = vec![candidate(
+            "fg-own",
+            Some("session-a"),
+            Some(&run_id),
+            vec![0],
+        )];
+        assert!(
+            render_deps(Some("session-a"), &[], controls.clone())
+                .live_workflow_controls(&status)
+                .is_empty(),
+            "no registry entry means this process is not driving the workflow"
+        );
+        // Control: the identical input WITH the registry entry is admitted, so the assertion
+        // above is proving the registry term rather than passing vacuously.
+        assert_eq!(
+            render_deps(Some("session-a"), &[&run_id], controls)
+                .live_workflow_controls(&status)
+                .len(),
+            1
+        );
+    }
+
+    /// `:612` — `(control.activeChildren?.size ?? 0) > 0`. A control whose child has already
+    /// finished is still registered for a moment; steering it would deliver into a dead inbox.
+    #[test]
+    fn live_workflow_controls_exclude_children_with_no_active_children() {
+        let run_id = RunId::from_token("wf0000000001");
+        let status = workflow_status(&run_id, Some("session-a"), RunState::Running);
+        let deps = render_deps(
+            Some("session-a"),
+            &[&run_id],
+            vec![candidate(
+                "fg-own",
+                Some("session-a"),
+                Some(&run_id),
+                vec![],
+            )],
+        );
+        assert!(deps.live_workflow_controls(&status).is_empty());
+    }
+
+    /// `:609`'s gate 1, on its own: the registry is live and the control matches the status in
+    /// every other respect, and only the STATE's current session differs from the status's.
+    #[test]
+    fn live_workflow_controls_are_empty_when_the_state_session_differs_from_the_status() {
+        let run_id = RunId::from_token("wf0000000001");
+        let status = workflow_status(&run_id, Some("session-a"), RunState::Running);
+        let deps = render_deps(
+            Some("session-b"),
+            &[&run_id],
+            vec![candidate(
+                "fg-own",
+                Some("session-a"),
+                Some(&run_id),
+                vec![0],
+            )],
+        );
+        assert!(deps.live_workflow_controls(&status).is_empty());
+    }
+
+    /// The `None`/`None` row: a headless or SDK-embedded orchestrator with no session identity,
+    /// running a workflow whose `status.json` records no session. Upstream's `===` is TRUE here
+    /// and the hints render.
+    ///
+    /// This is the test that fails the moment anyone "fixes" the two comparisons into
+    /// `SessionGate::Strict` — which refuses a `None` current session — and it is the whole
+    /// reason `run_status.rs` mentions no gate class at all.
+    #[test]
+    fn live_workflow_controls_admit_an_unattributed_run_in_a_sessionless_host() {
+        let run_id = RunId::from_token("wf0000000001");
+        let status = workflow_status(&run_id, None, RunState::Running);
+        let deps = render_deps(
+            None,
+            &[&run_id],
+            vec![candidate("fg-own", None, Some(&run_id), vec![0])],
+        );
+        assert_eq!(
+            deps.live_workflow_controls(&status).len(),
+            1,
+            "a sessionless host steering its own unattributed workflow is upstream's behaviour"
+        );
+    }
+
+    /// `:685`'s exact sentence, and its position: after the per-step lines and immediately before
+    /// `Workflow receipt:`. The relative order is the transferable anchor (upstream's own
+    /// `Session:` line has no cyrup counterpart).
+    #[tokio::test]
+    async fn a_running_workflow_with_no_live_route_renders_the_unavailable_sentence() {
+        let (_dir, async_root, results_dir) = roots();
+        let run_id = RunId::from_token("wf0000000001");
+        let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
+        let mut status = workflow_status(&run_id, Some("session-a"), RunState::Running);
+        status.steps = vec![StepStatus::pending("scout")];
+        status.workflow_receipt_path = Some(async_root.join("receipt.json"));
+
+        let report = format_status(&status, &paths, &RunStatusRenderDeps::default()).await;
+        assert!(
+            report.contains(
+                "Steer: unavailable; no live foreground route is registered in the active session."
+            ),
+            "{report}"
+        );
+        let notice = report
+            .find("Steer: unavailable;")
+            .expect("the notice is present");
+        // A WORKFLOW row is labelled `Child N/M`, not `Step N` (`step_line_label`'s own note).
+        let step = report
+            .find("Child 1/1: scout")
+            .expect("the step line is present");
+        let receipt = report
+            .find("Workflow receipt:")
+            .expect("the receipt line is present");
+        assert!(step < notice && notice < receipt, "{report}");
+    }
+
+    /// `:687-688` — one line per ACTIVE CHILD INDEX, ascending, byte-for-byte upstream's text.
+    ///
+    /// The indexes are produced the way the executor produces them — out of a `BTreeMap`'s
+    /// `keys()` — which is exactly why upstream's `.sort((left, right) => left - right)` is not
+    /// repeated in the renderer: the ordering is the map's, and this test is what says so.
+    #[tokio::test]
+    async fn live_workflow_child_steer_hints_are_emitted_in_ascending_index_order() {
+        let (_dir, async_root, results_dir) = roots();
+        let run_id = RunId::from_token("wf0000000001");
+        let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
+        let status = workflow_status(&run_id, Some("session-a"), RunState::Running);
+
+        let mut active_children: std::collections::BTreeMap<usize, ()> =
+            std::collections::BTreeMap::new();
+        for index in [5usize, 0, 2] {
+            active_children.insert(index, ());
+        }
+        let deps = render_deps(
+            Some("session-a"),
+            &[&run_id],
+            vec![candidate(
+                "fg-own",
+                Some("session-a"),
+                Some(&run_id),
+                active_children.keys().copied().collect(),
+            )],
+        );
+
+        let report = format_status(&status, &paths, &deps).await;
+        let hints: Vec<&str> = report
+            .lines()
+            .filter(|line| line.starts_with("Steer live foreground child:"))
+            .collect();
+        assert_eq!(
+            hints,
+            vec![
+                "Steer live foreground child: subagent({ action: \"steer\", id: \"fg-own\", index: 0, message: \"...\" })",
+                "Steer live foreground child: subagent({ action: \"steer\", id: \"fg-own\", index: 2, message: \"...\" })",
+                "Steer live foreground child: subagent({ action: \"steer\", id: \"fg-own\", index: 5, message: \"...\" })",
+            ],
+            "{report}"
+        );
+        assert!(
+            !report.contains("Steer: unavailable;"),
+            "a run WITH a live route never also gets the unavailable sentence: {report}"
+        );
+    }
+
+    /// `:684`'s `status.state === "running"` conjunct. A settled workflow has nothing to steer, so
+    /// it gets neither the hints nor — and this is the half that is easy to lose — the
+    /// `Steer: unavailable;` sentence, which would otherwise read as a fault on every completed
+    /// workflow in the log.
+    #[tokio::test]
+    async fn a_non_running_workflow_renders_no_steer_lines() {
+        let (_dir, async_root, results_dir) = roots();
+        let run_id = RunId::from_token("wf0000000001");
+        let paths = RunPaths::for_run(&async_root, &results_dir, &run_id);
+        let status = workflow_status(&run_id, Some("session-a"), RunState::Complete);
+        let deps = render_deps(
+            Some("session-a"),
+            &[&run_id],
+            vec![candidate(
+                "fg-own",
+                Some("session-a"),
+                Some(&run_id),
+                vec![0],
+            )],
+        );
+        let report = format_status(&status, &paths, &deps).await;
+        assert!(!report.contains("Steer"), "{report}");
+
+        // And the same for a non-workflow run, whatever the registry says (`:684`'s first
+        // conjunct).
+        let single = RunId::from_token("run000000001");
+        let single_paths = RunPaths::for_run(&async_root, &results_dir, &single);
+        let mut single_status = RunStatus::queued(single.clone(), RunMode::Single, None);
+        single_status
+            .advance_state(RunState::Running)
+            .expect("Queued -> Running");
+        single_status.session_id = SessionId::parse("session-a");
+        let single_report = format_status(
+            &single_status,
+            &single_paths,
+            &render_deps(
+                Some("session-a"),
+                &[&single],
+                vec![candidate(
+                    "fg-own",
+                    Some("session-a"),
+                    Some(&single),
+                    vec![0],
+                )],
+            ),
+        )
+        .await;
+        assert!(!single_report.contains("Steer"), "{single_report}");
+    }
+
+    /// SCOPE_13 — the async-root reaper renames a run tree onto `.deleting-run-<id>` IN PLACE,
+    /// beside the live runs. This is the production listing behind `/subagents-fleet` and
+    /// `{action:"status"}` with no id: without the `RUN_TOMBSTONE_PREFIX` arm on
+    /// [`crate::background::terminal_run_index::is_reserved_async_root_entry`], a tombstone that
+    /// outlives its pass — exactly the case the 24 h grace exists for — would be reconciled and
+    /// rendered to the user as a run.
+    #[tokio::test]
+    async fn a_run_tombstone_is_never_listed_as_an_active_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let async_root = dir.path().join("async");
+        let results_dir = dir.path().join("results");
+        tokio::fs::create_dir_all(&async_root).await.expect("mkdir");
+        tokio::fs::create_dir_all(&results_dir)
+            .await
+            .expect("mkdir");
+
+        let live = RunId::from_token("run000000001".to_string());
+        let mut live_status = RunStatus::queued(live.clone(), RunMode::Single, None);
+        live_status
+            .advance_state(RunState::Running)
+            .expect("Queued -> Running");
+        let live_dir = async_root.join(live.as_str());
+        tokio::fs::create_dir_all(&live_dir).await.expect("mkdir");
+        write_atomic_json(
+            &crate::background::RunDir::for_existing(&live_dir).status(),
+            &live_status,
+        )
+        .await
+        .expect("write live status");
+
+        // A tombstone carrying a perfectly readable RUNNING status — the shape that would
+        // otherwise survive every other filter in this listing.
+        let retired = RunId::from_token("run000000002".to_string());
+        let mut retired_status = RunStatus::queued(retired, RunMode::Single, None);
+        retired_status
+            .advance_state(RunState::Running)
+            .expect("Queued -> Running");
+        let tombstone_dir = async_root.join(".deleting-run-0123456789abcdef");
+        tokio::fs::create_dir_all(&tombstone_dir)
+            .await
+            .expect("mkdir");
+        write_atomic_json(
+            &crate::background::RunDir::for_existing(&tombstone_dir).status(),
+            &retired_status,
+        )
+        .await
+        .expect("write retired status");
+        // And the reaper's own maintenance directory, which is likewise not a run.
+        tokio::fs::create_dir_all(crate::background::async_retention::maintenance_root(
+            &async_root,
+        ))
+        .await
+        .expect("mkdir maintenance");
+
+        let candidates = active_run_candidates(&async_root)
+            .await
+            .expect("candidate scan");
+        assert_eq!(
+            candidates.iter().map(RunId::as_str).collect::<Vec<_>>(),
+            vec!["run000000001"],
+            "neither the tombstone nor the maintenance dir is a run candidate"
+        );
+
+        let listed = list_active_runs(&async_root, &results_dir, None)
+            .await
+            .expect("listing");
+        assert_eq!(listed.len(), 1, "{listed:#?}");
+        assert_eq!(listed[0].status.run_id.as_str(), "run000000001");
+        let rendered = format_run_list(&listed);
+        assert!(
+            !rendered.contains(".deleting-run-"),
+            "a tombstone must never reach a user-visible fleet listing: {rendered}"
         );
     }
 }

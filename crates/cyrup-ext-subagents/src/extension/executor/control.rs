@@ -348,6 +348,17 @@ impl SubagentExecutor {
                     // SUBA-073: no policy on this path — same pre-existing incompleteness as
                     // `turn_budget` immediately above; not this task's fix to extend.
                     permission_rules: None,
+                    // SCOPE_9 — pi `target.source === "async"` selecting
+                    // `transferActiveAsyncCapacity` (`subagent-executor.ts:2086-2093` @v0.68.0).
+                    // THIS is cyrup's `source == "async"` moment: `control::resume` resolved this
+                    // target out of the per-cwd ASYNC root and reconciled it to a terminal state
+                    // before handing back `RespawnFromTranscript`, so the source is exactly the
+                    // settled async run whose slot upstream moves. Taking it over (generation
+                    // bumped, `source_run_id` breadcrumb written) is what keeps ONE operator-visible
+                    // run on ONE slot across a revive — acquiring afresh would double-charge the
+                    // session, and at a cap of 1 the source's own retained slot would make this
+                    // revive refuse itself with the exhausted sentence.
+                    transfer_from: Some(RunId::from_token(source_run_id.to_string())),
                     steps: vec![RunnerStep::SingleStep(step)],
                     mode: RunMode::Single,
                     session_file: Some(session_file.to_path_buf()),
