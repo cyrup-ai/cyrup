@@ -2,6 +2,46 @@
 
 ---
 
+## ⚠ 2026-09-16 — the SCOPE sequence (#137 / #139 / #140) landed; §0, §1b and §2 are reconciled against it, and the rest of this file is NOT
+
+**Why this note exists.** Three PRs merged after the twelfth-edition census was written —
+`21d1acc` (#137, `2bd76ac` "SCOPE batch 1"), `b2fdc7e` (#139, `e61ff44` "SCOPE batch 2") and
+`cc7818b` (#140, `7e41cf9` "finish the SCOPE sequence") — and this file did not know. Measured with
+`git diff --shortstat 0d653d2 cc7818b -- crates/`, the three feature commits are **+45 072 / −1 091
+under `crates/`** (181 file-touches; 136 distinct files in `crates/cyrup-ext-subagents`), which is
+the largest single movement this document has ever had to absorb. `cargo nextest` at the last of
+them reports 10 124 tests run / 10 124 passed / 9 skipped.
+
+**What this pass did, and what it did not.** §0 carries a thirteenth-edition census from
+`scripts/count_open_items.py` run at `cc7818b`. §1b's `pi-subagents` entries and §2's unwired
+register were **each re-greped against the code at `cc7818b`** and are marked closed, partially
+closed or refreshed accordingly; `PB-11`/`SUBA-016` and the four SCOPE-closed entries in the
+session-scoping block above are the substantive movements. **§1a, §1c, §1d, §1e, §3, §4, §5 and §6
+were NOT re-walked** and keep whatever staleness they already carried.
+
+**Two citation classes this pass found dead, recorded once here rather than repeated per row.**
+
+1. **`crates/cyrup-ext-subagents/src/extension.rs` no longer exists.** It was split into
+   `extension/{mod,wait_tool,models,testsupport}.rs` plus `extension/{executor,host,tool}/`. **Every
+   `extension.rs:<line>` citation anywhere in this document is therefore dead**, not merely offset —
+   `§1b`'s VL-S8 already said so for one line; it is true for all of them. The rows this pass
+   touched carry refreshed citations; the rows it did not touch still carry dead ones, and that is
+   a known, stated defect rather than a silent one.
+2. **The "27-verb enum at `extension.rs:6557`" is wrong twice over.** The action list is now
+   `extension/tool/text.rs:215` (`pub(crate) const SUBAGENT_ACTIONS`) and carries **42** verbs, of
+   which nine are the `schedule.*` family `PB-11` says are absent. Re-derived this pass against
+   `pi-subagents` v0.68.0 `shared/types.ts:2801`, which carries **57**: cyrup is missing seventeen
+   (`children.list`, `worktree.discard`, `worktree.cleanup`, `lane.status`, `lane.recordMerge`,
+   `lane.recordSupersession`, `refine`, `refine.show`, `refine.rollback`, `inspector.{open,command,status,close}`,
+   `project.{open,status,close}`, `debug.run`) and carries two of its own (`append-step`, `inspect`).
+   Those seventeen are the live verb-level gap; use this number, not 27.
+
+**Tag re-measured this pass, not inherited.** `git -C tmp/pi-subagents tag --sort=-v:refname | head -1`
+returns **`v0.68.0`**, superseding the `v0.67.0` the 2026-09-14 pin correction below recorded. Every
+upstream read in this pass's edits was taken with `git -C tmp/pi-subagents show v0.68.0:<path>`.
+
+---
+
 ## ⚠ 2026-09-06 — session scoping landed; this document was generated against STALE upstream tags
 
 **Version correction.** This analysis was generated against pi v0.84.1, pi-subagents v0.43.0 and
@@ -51,13 +91,24 @@ already been fixed. One implementation now serves all of them —
 `OwnershipSnapshot::owns` for "may I consume this completion?".
 
 **Still open from that work** (upstream files with no cyrup counterpart, all session-scoped
-upstream): ~~`completion-replay.ts` (287 LOC, `SUBA-056`)~~ — **CLOSED**, ported as
-`background/completion_replay/`, ~~`wait-subscriptions.ts` (348)~~ — **CLOSED**, ported as
-`background/wait_subscriptions/`,
-`terminal-run-index.ts` (138), `foreground-history.ts` (162),
+upstream). **RE-READ 2026-09-16 against cyrup `cc7818b`; four of the seven entries below are now
+CLOSED and are struck rather than deleted, per this directory's id-retention rule.**
+~~`completion-replay.ts` (287 LOC, `SUBA-056`)~~ — **CLOSED**, ported as
+`background/completion_replay/` (`2bd76ac`), ~~`wait-subscriptions.ts` (348)~~ — **CLOSED**, ported as
+`background/wait_subscriptions/` (`e61ff44`),
+~~`terminal-run-index.ts` (138)~~ — **CLOSED**, ported in full as `background/terminal_run_index/`
+(4 files, 948 LOC; its own module doc names the upstream file and LOC), read in production by
+`tui/fleet.rs:554` and written by `tui/fleet.rs:2339`; ~~`foreground-history.ts` (162)~~ —
+**CLOSED**, ported as `extension/executor/foreground_history/` (mod/persist/record/restore) and
+consumed at `extension/executor/mod.rs:214-220`;
 `async-{stop,steering,dismiss}-action.ts` (418 — cyrup applies their gates from its own control
-layer, but does not port the actions), `active-async-capacity.ts` (516 — per-session concurrency
-cap), `async-retention.ts` (912 — the async-root reaper; its RUN half is ported in full as
+layer, but does not port the actions; **still true at `cc7818b`** — `background/delivery/gate.rs:3-4`
+cites all three upstream files as the source of the predicate and nothing ports the actions
+themselves), ~~`active-async-capacity.ts` (516 — per-session concurrency cap)~~ — **CLOSED**,
+ported as `background/active_async_capacity/` (7 files, 3 603 LOC incl. 1 344 of tests) and
+**acquired on the live async spawn path** at `extension/executor/background.rs:587`, with the
+resume arm taking `transfer` at `:577` instead of a second slot; the doctor surface reads it at
+`extension/executor/reports.rs:99-117`. `async-retention.ts` (912 — the async-root reaper; its RUN half is ported in full as
 `background/async_retention/` — policy, batched cursor-windowed scan, tombstone markers,
 wait-reference reader, the cross-instance lock, the destructive rename-then-delete sweep, the
 report and its maintenance log — and runs as the third stage of `spawn_retention_sweep`, 60 s after
@@ -155,6 +206,96 @@ numbers and file existence both mislead. §7 says how much of this was first-han
 ---
 
 ## 0. Census — every open item in the fourteen area files, by class
+
+> **THIRTEENTH EDITION 2026-09-16, cyrup code HEAD `cc7818b` — the same script, unchanged, re-run
+> after the SCOPE sequence (#137/#139/#140, +45 072 lines under `crates/`). This is the first
+> edition of this census to publish a number it can PROVE is wrong, in a stated direction and by a
+> stated amount.** `python3 scripts/count_open_items.py` from `docs/gap-analysis/`, over the fourteen
+> files' current `## Open items` tables (and `09a`'s `## Summary — confirmed items` table),
+> reproduced verbatim below; `SEAM-058` and `SUBA-005` remain the two hand-counted trackers outside
+> any table. **No script change this edition.**
+>
+> **Open set: 77 work items — 0 critical, 0 high, 12 medium, 65 low**, of which 75 sort into the six
+> Kind-derived classes and 2 do not (`EXT-058`, `PERM-032`). **599 closed.**
+>
+> | area | open | crit | high | med | low | trackers | closed |
+> |---|---:|---:|---:|---:|---:|---:|---:|
+> | [01 core + provider](01-cyrup-core-and-provider.md) | 4 | 0 | 0 | 1 | 3 | 0 | 57 |
+> | [02 agent](02-cyrup-agent.md) | 3 | 0 | 0 | 0 | 3 | 1 | 28 |
+> | [03 session](03-cyrup-session.md) | 3 | 0 | 0 | 0 | 3 | 1 | 32 |
+> | [04 tools](04-cyrup-tools.md) | 0 | 0 | 0 | 0 | 0 | 0 | 34 |
+> | [05 config + resources](05-cyrup-config-and-resources.md) | 12 | 0 | 0 | 4 | 8 | 0 | 55 |
+> | [06 ext host](06-cyrup-ext.md) | 10 | 0 | 0 | 1 | 9 | 0 | 63 |
+> | [07 tui](07-cyrup-tui.md) | 21 | 0 | 0 | 0 | 21 | 0 | 85 |
+> | [08 session-svc + modes](08-cyrup-session-svc-and-modes.md) | 3 | 0 | 0 | 0 | 3 | 0† | 72 |
+> | [09 subagents](09-cyrup-ext-subagents.md) | 10 | 0 | 0 | 3 | 7 | 0† | 41 |
+> | [09a v0.57 drift](09a-cyrup-ext-subagents-v0.57-drift.md) | 1 | 0 | 0 | 1 | 0 | 0 | 23 |
+> | [10 permission system](10-cyrup-permission-system.md) | 1 | 0 | 0 | 0 | 1 | 1 | 22 |
+> | [11 intercom](11-cyrup-intercom.md) | 3 | 0 | 0 | 0 | 3 | 0 | 51 |
+> | [12 pi core drift](12-upstream-drift-pi-core.md) | 5 | 0 | 0 | 2 | 3 | 3 | 30 |
+> | [14 flux](14-cyrup-flux.md) | 1 | 0 | 0 | 0 | 1 | 0 | 6 |
+> | **total** | **77** | **0** | **0** | **12** | **65** | **6 + 2‡** | **599** |
+>
+> † `SEAM-058` and `SUBA-005` sit outside their files' `## Open items` tables (standalone
+> `## Trackers` sections) and print as 0 here; ‡ they are the "+ 2" hand-counted in the total.
+>
+> | class | n |
+> |---|---:|
+> | **Port bug** (`not-ported` + `parity-bug` + `port-divergence`) | **43** |
+> | **Version lag** (`upstream-drift`) | **14** |
+> | **Reverse lag** (`stale-port`) | **1** |
+> | **Test defect** (`test-defect`) | **0** |
+> | **Invented surface** (`cyrup-original`) | **15** |
+> | **Tooling** (`tooling`) | **2** |
+> | *(unclassified — `EXT-058`, `PERM-032`)* | 2 |
+> | | **75 + 2 = 77** |
+>
+> **⚠ THIS TABLE IS A KNOWN OVERCOUNT BY TWO ROWS, AND BOTH ARE NAMED.** The script reports what the
+> area tables SAY; two rows in area `09` say "open" about work that shipped and is tested:
+>
+> | row | table says | code at `cc7818b` says | landed |
+> |---|---|---|---|
+> | `SUBA-016` | open, `medium`, XL, BLOCKED, *"zero hits for `scheduled_runs`"* | `background/scheduled_runs/` = 8 files / 6 669 LOC; all **nine** verbs advertised (`extension/tool/text.rs:298-306`) and dispatched (`extension/tool/routing.rs:1243-1250`); 80/80 schedule tests pass | `7e41cf9` (#140) |
+> | `SUBA-056` | open, `medium` | `background/completion_replay/` = 5 files / 1 810 LOC, third rung of `collect_wait_completions`, second consumer `background/inspect_rpc/read_output.rs` | `2bd76ac` (#137) |
+>
+> **The behavioural figure is therefore `75 open / 10 medium`; the mechanical figure is `77 / 12`.**
+> Both are published because concealing either would misrepresent something. `09-cyrup-ext-subagents.md`
+> is outside this pass's write scope, which is why the rows are not struck — see
+> `00-residual-ledger.md`'s eleventh edition, whose first recommendation is to strike them.
+> **Do not schedule `SUBA-016` or `SUBA-056`.**
+>
+> **A second reason not to over-read this number: the directory was being edited while it was
+> measured.** The script was run twice by this pass at the same code sha, and moved: **76 open / 11
+> medium at the start, 77 / 12 at the end**, because area `09a` went `0 → 1` open in between. Neither
+> run is wrong. Quote the run, not the number.
+>
+> **What moved since the twelfth edition (84 → 77 open; 590 → 599 closed), derived by differencing
+> the two per-area tables cell by cell.** `04` 1 open / 33 closed → **0 / 34** (**that file's open set
+> is now empty**); `07` 28 / 78 → **21 / 85** (seven closed — the largest single-area movement);
+> `09` 11 / 40 → **10 / 41**; `01` 3 / 57 → **4 / 57** (open rose with closed unchanged, so a row was
+> **FILED** in area 01, not closed); `09a` 0 / 23 → **1 / 23** (likewise a filing — the row this
+> pass watched appear mid-measurement). Every other area is unchanged. **The arithmetic: nine rows
+> closed, two filed, 84 − 9 + 2 = 77.**
+>
+> **None of that movement is this pass's.** This edition is a reconciliation of the navigation layer
+> — §0, §1b and §2 of this file, plus `00-residual-ledger.md` — and it wrote no code and touched no
+> area file. The tenth edition's 90 → 84 remains the last delta produced by a code batch, and the
+> nine closures above were written by passes whose own blocks this census does not carry.
+>
+> **Above-medium open rows: ZERO**, for the third consecutive edition. The script prints
+> `Above-medium open rows (0)`. See §0a for what that does not mean.
+>
+> **`UW-21` is filed by this pass and is NOT in this table.** It is a §2 entry with no area-file id,
+> because the area file that should own it is outside this pass's write scope. **The census counts
+> area-file rows; a real defect with no row is invisible to it.** That is a property of the counting
+> rule, not of the defect — see §2.
+>
+> **Not counted, deliberately:** area 13 (`13-cyrup-mcp*.md`) stays outside this census by the
+> standing counting rule, unchanged by this pass. Its last counted census is
+> **244 implemented / 82 partial / 84 missing / 27 n-a of 437** at `pi-mcp-adapter` v2.32.1 — a floor,
+> not an answer; see `13-cyrup-mcp-STATUS.md`. Area 15 (`pi-acp`) is likewise outside it.
+>
+> Every block below this one is superseded.
 
 > **TWELFTH EDITION 2026-09-05 (batch 4), cyrup code HEAD `f2630a7a` — the same script, unchanged,
 > re-run after six closures, three narrowings, and — for the first time in this ledger's history —
@@ -1012,6 +1153,13 @@ closes: `AGENT-020`+`AGENT-030`, `TUI-042`+`TUI-043`+`TUI-044`, `SEAM-047`+`SEAM
 > open — the owning area file's `## Open items` table is the only authority, and §0's new block names
 > exactly which ids are open today.
 
+> **PARTIAL EXCEPTION 2026-09-16 — §1b, and only §1b, IS status-audited.** All 23 of its entries
+> (`PB-8`…`PB-14`, `PB-31`, `VL-S1`…`VL-S15`) were re-greped against cyrup `cc7818b` and each now
+> carries its current status: ten struck as CLOSED, one marked PARTIALLY CLOSED with the halves
+> named, twelve refreshed and still open. **`§1a`, `§1c`, `§1d` and `§1e` were NOT touched and the
+> warning above applies to them in full.** Note also that this file's `extension.rs:<line>`
+> citations are dead rather than stale — see the ⚠ block at the top of this file.
+
 **These rank above everything else in this document at equal severity.** They are not version lag:
 the behaviour was available to be ported and was not.
 
@@ -1160,91 +1308,141 @@ the behaviour was available to be ported and was not.
 > Area 09 deliberately does **not** restate `PB-8…PB-14`, `UW-3…UW-8` or `VL-S1…VL-S15` as findings —
 > it confirmed them still accurate at HEAD by spot-check and left them owned here. **This section is
 > therefore the only record for that work; do not compress it away.**
+>
+> **SWEEP 2026-09-16 at cyrup `cc7818b`, and the reason it mattered: because area 09 left these rows
+> owned HERE, nothing in the area files was ever going to correct them.** All **23** entries
+> (`PB-8`…`PB-14`, `PB-31`, `VL-S1`…`VL-S15`) were re-greped against the code this pass.
+> **TEN closed** — `PB-10`, `PB-11`, `PB-13`, `PB-31`, `VL-S1`, `VL-S2`, `VL-S7`, `VL-S9`, `VL-S14`,
+> `VL-S15`. **ONE is partially closed and says which half** — `PB-12`. **TWELVE stay open with
+> refreshed evidence** — `PB-8`, `PB-9`, `PB-14`, `VL-S3`, `VL-S4`, `VL-S5`, `VL-S6`, `VL-S8`,
+> `VL-S10`, `VL-S11`, `VL-S12`, `VL-S13`. 10 + 1 + 12 = 23, which is the whole section. Closed
+> entries are struck and keep their bodies as history, per this directory's id-retention rule.
+>
+> **Read every un-refreshed `extension.rs:<line>` citation in this section as DEAD, not as stale.**
+> That file was split into `extension/{mod,wait_tool,models,testsupport}.rs` + `extension/{executor,host,tool}/`
+> and no line in it resolves. The rows this pass touched carry current addresses; the rest do not, and
+> the ⚠ block at the top of this file states the general repair.
 
-**PB-8 · Subagent RPC bridge is entirely absent** — *large*
-- upstream: `src/extension/rpc.ts:622` @v0.43.0 (`registerSubagentRpcBridge`, 653-line file; method list `:29`; event names `:25-27`), registered from `src/extension/index.ts:529`. First tag **v0.33.0**
-- cyrup: `crates/cyrup-ext-subagents/src/extension.rs:9313-9352` (the whole `init` registration/subscription block) — no bridge; `grep -ri 'subagents:rpc' crates/` returns 0
-- observable: no host, embedder or sibling extension can drive subagents programmatically. Upstream answers `ping`/`status`/`spawn`/`steer`/`interrupt`/`stop`/`resume` over `subagents:rpc:v1:request` with a `subagents:rpc:v1:reply:<id>` envelope; cyrup emits no ready event and answers nothing. *(Area 09 blind spot 3: `src/extension/rpc.ts` was not read on the upstream side this pass either.)*
+**PB-8 · Subagent RPC bridge is entirely absent** — *large* · **STILL OPEN at `cc7818b`; evidence refreshed 2026-09-16**
+- upstream: `src/extension/rpc.ts:622` @v0.43.0 (`registerSubagentRpcBridge`, 653-line file; method list `:29`; event names `:25-27`), registered from `src/extension/index.ts:529`. First tag **v0.33.0**. **Re-read at v0.68.0 this pass** (`git -C tmp/pi-subagents show v0.68.0:src/extension/rpc.ts`): `registerSubagentRpcBridge` has moved to **`:817`** and the three event constants are `:30-32` (`SUBAGENT_RPC_REQUEST_EVENT` / `…_READY_EVENT` / `…_REPLY_EVENT_PREFIX`). The surface grew; it did not go away
+- cyrup: **the old `extension.rs:9313-9352` citation is DEAD — that file no longer exists.** The current registration/subscription block is `crates/cyrup-ext-subagents/src/extension/host/native_impl.rs:45-250` (`async fn init`), whose `api.subscribe(&[…])` is `:246` and whose `register_tool`/`register_command` calls are `:48`, `:142`, `:156`, `:171`, `:200`, `:221`, `:234`. **No bridge**, and `grep -rn 'subagents:rpc' crates/` **still returns 0**, re-run at `cc7818b`
+- **Do not confuse this row with SCOPE_12.** `background/inspect_rpc/` (4 files, 2 459 LOC, landed `e61ff44`) ports a **different upstream file** — `runs/background/inspect-rpc.ts` (443 LOC @v0.68.0), a read-only artifact inspector reached through `/subagents-inspect-rpc` and cyrup's own `inspect` verb. It registers no event bridge, answers no `ping`/`spawn`/`steer`, and its own module doc says so. PB-8 is untouched by it
+- observable: no host, embedder or sibling extension can drive subagents programmatically. Upstream answers `ping`/`status`/`spawn`/`steer`/`interrupt`/`stop`/`resume` over `subagents:rpc:v1:request` with a `subagents:rpc:v1:reply:<id>` envelope; cyrup emits no ready event and answers nothing. *(Area 09 blind spot 3: `src/extension/rpc.ts` was read on the upstream side for the first time in this 2026-09-16 pass, for the offsets above only — the method list was not diffed against v0.43.0.)*
 
-**PB-9 · `clarify: true` is advertised but shows no preview/edit UI** — *large*
+**PB-9 · `clarify: true` is advertised but shows no preview/edit UI** — *large* · **STILL OPEN at `cc7818b`; re-greped 2026-09-16**
+- **Re-greped this pass:** `grep -rn 'ChainClarify\|chain_clarify' crates/cyrup-ext-subagents/src/` returns **0**. No clarify UI exists. The `extension.rs:6634` / `:5576-5578` / `:9678` citations below are **dead** (`extension.rs` no longer exists); the surviving evidence is the zero-hit grep, which is the load-bearing part of this row. Refreshing them to the split modules is the next reader's job and is **not** done here.
 - upstream: `src/runs/foreground/chain-clarify.ts:199` (`ChainClarifyComponent`, 1350-line file), dispatched at `subagent-executor.ts:3190`, `:3572` and `chain-execution.ts:692`, all three via `await ctx.ui.custom<ChainClarifyResult>(...)`. First tag **v0.21.2**
 - cyrup: `extension.rs:6634` declares the param with the description "Show TUI to preview/edit before execution."; the flag is read at `:5576-5578` (the async→foreground downgrade) and at `:9678` (suppressing the `[async]` badge) — **neither read produces a UI**
 - observable: cyrup accepts `clarify: true`, forces the run foreground, and launches immediately with the model's unmodified prompt. The tool description promises a UI that does not exist. The seam it needs is live: `HostServices::open_overlay` (`cyrup-ext/src/host/services.rs:224`) is already consumed in production by this same crate at `extension.rs:9908`.
 
-**PB-10 · `turnBudget` — no soft assistant-turn budget for children** — *medium* · = area 09 `SUBA-008`
+**~~PB-10 · `turnBudget` — no soft assistant-turn budget for children~~** — ~~*medium*~~ **CLOSED** · = area 09 `SUBA-008`, closed there 2026-08-14 (sweep 8)
+- **CLOSED, re-verified in code 2026-09-16 at `cc7818b`.** `exec/turn_budget.rs` exists (~888 LOC); `"turnBudget"` now has **29** occurrences across the crate including the advertised schema key, and the run-level budget is carried onto the runner at `extension/executor/background.rs:622` (`turn_budget` on `RunnerConfig`, commented "SUBA-008 — the run-level turn budget the orchestrator resolved, carried verbatim"). The three hard-coded `false` consumers this row names are gone. **The body below is the original filing and is kept as history.**
 - upstream: `src/runs/shared/turn-budget.ts:5` (`resolveTurnBudgetConfig`) and `:26` (`appendTurnBudgetSystemPrompt`); tool param `src/extension/schemas.ts:328`. First tag **v0.33.0**
 - cyrup: the tool schema at `extension.rs:6634` has 45 `props.insert` keys and none is `turnBudget`; the flag has **three** hard-coded `false` consumers, each commented as having no source — `tui/intercom.rs:348-352`, `exec/fallback.rs`, `exec/mod.rs:2354-2360` *(the previous count of two was wrong)*
 - observable: no "## Turn budget" wrap-up block in the child's system prompt, no abort past `maxTurns+graceTurns`, and the result always reports `turnBudgetExceeded: false`, so an unexplained process signal is misattributed. (Frontmatter `toolBudget` **is** read, `discovery/frontmatter.rs:850` — this is the turn half only.)
 
-**PB-11 · Scheduled subagent runs (`schedule.*`) are unported — and it is NINE verbs, not four** — *large* · = area 09 `SUBA-016`
-- upstream: `src/runs/background/scheduled-runs.ts:14` (`SCHEDULED_RUN_ACTIONS`) and `:358` (`class ScheduledRunManager`), 753-line file, present at v0.43.0 and v0.47.1. **Nine** verbs in `shared/types.ts:1968` — `schedule.create`, `.list`, `.show`, `.history`, `.pause`, `.resume`, `.run`, `.run-due`, `.delete`. First tag **v0.33.0**
-- cyrup: zero hits for `scheduled_runs`; the 27-verb enum at `extension.rs:6557` has nothing beginning `schedule.`; `extension.rs:3909` states "The `schedule.*` family is unported"
-- observable: `subagent({action:"schedule.create", at:…})` is refused as an unknown action **after its schedule parameters are silently discarded**, so the error does not explain the failure. The in-tree note at `extension.rs:12572` pinning the enum as "pi's SUBAGENT_ACTIONS union minus the deferred schedule* four" is stale on the count.
+**~~PB-11 · Scheduled subagent runs (`schedule.*`) are unported — and it is NINE verbs, not four~~** — ~~*large*~~ **CLOSED 2026-09-16** · = area 09 `SUBA-016`
 
-**PB-12 · No live child transcript writer; the `transcriptPath` artifact is missing** — *medium*
+> **CLOSED at `7e41cf9` (PR #140, merge `cc7818b`) — "finish the SCOPE sequence — capacity, status, retention, scheduled runs".** All three closure tests this directory requires are met and were run by this pass, not taken from a commit subject.
+>
+> * **Present.** `background/scheduled_runs/` — 8 files, **6 669 LOC** (`ceiling_gate` 407, `manager` 266, `mod` 158, `schedule` 1 712, `store` 1 419, `test_fixtures` 80, `tool` 1 040, `trigger` 1 587). `tool.rs:35-45` is `SCHEDULED_RUN_ACTIONS`, all **nine** verbs in upstream's own order, with `ScheduledRunAction::{from_wire,as_str,is_mutating}` beside it.
+> * **Reachable from production.** Advertised at `extension/tool/text.rs:298-306` (inside the 42-verb `SUBAGENT_ACTIONS`) and **dispatched** at `extension/tool/routing.rs:1243-1250` through `ScheduledRunAction::from_wire`, in upstream's own dispatch position; `schedule.create` is gated through the existing `registration::authority::AuthorityAction::ScheduleCreate` arm (`registration/authority.rs:77`) rather than a second policy surface, and the six mutating verbs are refused from child-safe fanout. The manager is installed from `extension/executor/scheduled_runs.rs:292` (`install_scheduled_runs`), gated on `cfg.scheduled_runs_enabled()` (`registration/mod.rs:573`).
+> * **Pinned by tests.** `cargo nextest run -p cyrup-ext-subagents -E 'test(schedule)'` → **80 run, 80 passed** (this pass, at `cc7818b`), including `every_scheduled_run_action_dispatches` — the advertise-vs-dispatch proof — plus `the_armed_tick_fires_a_due_schedule_with_nobody_asking`, `run_due_reports_what_it_processed`, `deleting_a_schedule_with_a_live_run_is_refused` and `the_max_pending_limit_refuses_the_twenty_first_schedule`.
+>
+> **The row's own evidence line was false when this pass opened it, and both halves are corrected here rather than deleted.** *"Zero hits for `scheduled_runs`"* — there are now hits in eleven files outside the module. *"The 27-verb enum at `extension.rs:6557` has nothing beginning `schedule.`"* — `extension.rs` does not exist, the enum is `extension/tool/text.rs:215` and has 42 verbs, nine of them `schedule.*`. The `extension.rs:3909` and `extension.rs:12572` in-tree notes this row quoted are likewise gone with the file.
+>
+> **Upstream re-measured this pass at the real latest tag.** `scheduled-runs.ts` is **1 012 LOC @v0.68.0** (753 at v0.43.0/v0.47.1) and `SCHEDULED_RUN_ACTIONS` is still exactly the nine verbs (`v0.68.0:src/runs/background/scheduled-runs.ts:20-30`); the union is `shared/types.ts:2801`. **The `v0.47.1..v0.68.0` growth in that file (+259 lines) was NOT diffed against the port** — a residual, stated so it is not mistaken for coverage.
+>
+> **Area 09's own table still carries `SUBA-016` as an OPEN medium.** That file is not this pass's to edit; the discrepancy is recorded in §0's thirteenth edition and in `00-residual-ledger.md`'s eleventh edition, and it is why the script's open count is a known overcount by this row.
+
+- upstream *(original filing, kept as history)*: `src/runs/background/scheduled-runs.ts:14` (`SCHEDULED_RUN_ACTIONS`) and `:358` (`class ScheduledRunManager`), 753-line file, present at v0.43.0 and v0.47.1. **Nine** verbs in `shared/types.ts:1968`. First tag **v0.33.0**
+- ~~cyrup: zero hits for `scheduled_runs`; the 27-verb enum at `extension.rs:6557` has nothing beginning `schedule.`; `extension.rs:3909` states "The `schedule.*` family is unported"~~ — **all three claims false at `cc7818b`, see above**
+- ~~observable: `subagent({action:"schedule.create", at:…})` is refused as an unknown action **after its schedule parameters are silently discarded**~~ — **no longer observable**; the verb dispatches, and a disabled install answers pi's own `"Scheduled runs are disabled by scheduledRuns.enabled=false."` (`background/scheduled_runs/tool.rs:48-49`)
+
+**PB-12 · No live child transcript writer; the `transcriptPath` artifact is missing** — *medium* · **PARTIALLY CLOSED 2026-09-16 — say which half**
+- **The ARTIFACT half shipped; the WRITER half did not.** `ArtifactPaths` now carries a fifth field — `artifacts.rs:75` `pub transcript_path: PathBuf`, documented as pi's `transcriptPath` and minted at `artifacts.rs:310` as `<base>_transcript.jsonl` — so **the "four fields (input/output/jsonl/metadata)" claim below is false at HEAD** and the field is consumed at `exec/mod.rs:580-582` and rendered by `tui/fleet.rs:916`/`:1162`. **What is still open is the thing the row is named for:** nothing writes that file live. `spawn/mod.rs:1144` states in-tree that there is no `ChildTranscriptWriter` port and that the lines go to `tracing` at debug level; `background/runner_main/status.rs:593` and `executor.rs:1218` both publish `transcript_path: None`; and `tui/fleet.rs:1144-1148` carries the explicit note "When a transcript writer lands, switch this to `paths.transcript_path`". **Do not round this to closed** — the FleetView transcript pane for a RUNNING child still has nothing to read
 - upstream: `src/shared/child-transcript.ts:102` (`createChildTranscriptWriter`, per-record `fs.appendFileSync` at `:133`), created at `runs/background/subagent-runner.ts:1200-1201`; the field is the **fourth** `ArtifactPaths` member (`src/shared/types.ts:1048`, interface opens `:1044`); reported by `runs/background/run-status.ts:128`. First tag **v0.33.0**
 - cyrup: `crates/cyrup-ext-subagents/src/artifacts.rs:61-70` — `ArtifactPaths` has four fields (input/output/jsonl/metadata) and `:58` says so; the substitute `.jsonl` is written only after the run settles (`extension.rs:4925-4928` foreground, `background/runner_main.rs:2611-2614` background). A live NDJSON stream exists but goes elsewhere: `exec/mod.rs:2113-2118` writes `<cwd>/.cyrup-subagent-scratch/attempt-N.jsonl`
 - observable: the FleetView transcript pane for a RUNNING foreground child points at `paths.jsonl_path` (`tui/fleet.rs:1041-1058`), a file that does not exist until the child finishes, so it renders empty where upstream's fills in real time; `status`/`run-status` never print a `Transcript:` line.
 
-**PB-13 · Chain-run artifacts default to the temp root, not the project** — *small*
+**~~PB-13 · Chain-run artifacts default to the temp root, not the project~~** — ~~*small*~~ **CLOSED**
+- **CLOSED, re-verified in code 2026-09-16 at `cc7818b`.** `artifacts.rs:274` resolves `ArtifactDirPreference::Project => project_chain_runs_dir(project_cwd)` inside `resolve_chain_runs_dir`, and `artifacts.rs:266` records this row's own history in-tree: *"…unconditionally used the temp root, so `project_chain_runs_dir` had zero references"*. Pinned at `artifacts.rs:704-712`. The `artifactDir` preference key this row said to land with (area 09 `SUBA-048`) is the same resolver and landed with it. **The body below is the original filing and is kept as history.**
 - upstream: `runs/foreground/subagent-executor.ts:2022` @v0.34.0 (`chainDir: params.chainDir ?? getProjectChainRunsDir(effectiveCwd)`), helper `src/shared/artifacts.ts:16`. At v0.43.0 the same slot is `subagent-executor.ts:2623` via `getChainRunsDir`, whose "project" default still resolves to `getProjectChainRunsDir` (`shared/artifacts.ts:141-143`)
 - cyrup: `artifacts.rs:146` (`project_chain_runs_dir`) has **zero references of any kind**; the live resolver `resolve_chain_dir` (`extension.rs:6539`) falls back to `chain_runs_dir(cwd)` = `temp_root_dir()/chain-runs/<cwd_key>` (`artifacts.rs:164-166`)
 - observable: a chain run's artifacts land under `$TMPDIR/.../chain-runs/<cwd_key>/<runId>` instead of `<cwd>/.cyrup-subagents/chain-runs/<runId>` — invisible to the project, not committable, swept by OS tmp cleanup. The `[CYRUP-DELTA]` at `extension.rs:6536-6538` documents only the added per-run subdirectory and is silent on the root change. **Land with area 09 `SUBA-048`** (the `artifactDir` preference key, which is the same resolver and makes `project` the correct default for both).
 
-**PB-14 · The "skills not found" warning is unported on BOTH surfaces** — *small*
+**PB-14 · The "skills not found" warning is unported on BOTH surfaces** — *small* · **STILL OPEN at `cc7818b`; re-greped 2026-09-16**
+- **Re-greped this pass:** `grep -rn 'skills_warning\|skillsWarning' crates/cyrup-ext-subagents/src/` returns exactly **one** hit and it is a confession, not a port — `artifacts.rs:537` documents `skillsWarning` as one of the fields *"which `SingleResult` does not carry in this crate"*. Both surfaces stay unported. The `exec/mod.rs:3190-3193` and `discovery/management.rs:1276-1277` line citations below were not re-resolved this pass
 - upstream, run side: `runs/foreground/execution.ts:1112` @v0.34.0 — `skillsWarning: missingSkills.length > 0 ? …` declared on the shared result shape at `:179` (v0.43.0: `execution.ts:1524`)
 - upstream, management side: `agents/agent-management.ts:773` and `:823` @v0.34.0 call `skillsWarning(ctx.cwd, …)`, helper `:190` (v0.43.0: `:971`, `:1023`, helper `:206`)
 - cyrup: `exec/mod.rs:3190-3193` keeps `resolution.resolved` and **discards `resolution.missing`**; `SingleResult` has no `skills_warning` field and `artifacts.rs:427` documents omitting it. On the management side `discovery/skills.rs:149` (`resolve_skills`) has zero callers, and the stale deferral note at `discovery/management.rs:1276-1277` still claims the skills subsystem is "entirely absent today"
 - observable: `subagent({action:"create", config:{skills:"typo"}})` reports success with no warning, **and** a run with the same typo produces no warning either. (The `Skills not found:` string at `exec/mod.rs:3180` is a different thing: the hard failure for a missing *orchestration* skill, exit 1.)
 
-**PB-31 · `requireReadTool` unported — a skill-carrying agent is told to `read` a skill it has no `read` tool for** — *high* · = area 09 `SUBA-014` (severity raised from medium)
+**~~PB-31 · `requireReadTool` unported — a skill-carrying agent is told to `read` a skill it has no `read` tool for~~** — ~~*high*~~ **CLOSED** · = area 09 `SUBA-014`, closed there 2026-08-14 (sweep 1)
+- **CLOSED, re-verified in code 2026-09-16 at `cc7818b`.** The head-injection lives at `exec/tool_surface.rs:466` and `:484`, driven by the `require_read_tool: bool` parameter threaded at `:384`, `:392` and `:419`; the seam is `exec::build_attempt_spawn_plan_with_read_requirement` and the 7-arg `build_attempt_spawn_plan` survives as pi's `requireReadTool: undefined` form. The `exec/mod.rs:1463-1491` citation below is dead (that allowlist builder moved into `exec/tool_surface.rs`). **The body below is the original filing and is kept as history.**
 - upstream: `src/runs/shared/pi-args.ts:355-372` @v0.43.0 — `requireReadTool` head-injects `read` into the allowlist under `requireReadTool && requestedBuiltinTools.length > 0 && !includes("read")`, with **seven** live setters, all deriving it from `Boolean(resolvedSkills.length)`
 - cyrup: `exec/mod.rs:1463-1491` builds the tool allowlist with no `read` head-injection, while `discovery/skills.rs:273` tells the child to "use the read tool to load a skill's file"
 - observable: an agent with an explicit `tools:` list plus any resolved skill silently cannot load it. The child is instructed to use a tool it does not have and the failure surfaces as a model apology rather than a config error.
 
-**VL-S1 · No capability ceiling on child tools/agents/extensions** — *medium* · id retained, **class corrected to port bug** · area 09 `SUBA-021`
+**~~VL-S1 · No capability ceiling on child tools/agents/extensions~~** — ~~*medium*~~ **CLOSED** · id retained · area 09 `SUBA-021`, closed there 2026-08-15 (sweep 10)
+- **CLOSED, re-verified in code 2026-09-16 at `cc7818b`.** `exec/capability_ceiling.rs` exists and `CAPABILITY_CEILING_ENV = "CYRUP_SUBAGENT_CAPABILITY_CEILING_V1"` is declared at `:68` and **written into the child env**, read back at `exec/spawn_plan.rs:557`. The `exec/mod.rs:1428` comment this row quotes ("no capability ceiling in this port") no longer exists. A second consumer landed with the SCOPE sequence: `background/scheduled_runs/ceiling_gate.rs:352` makes the ceiling a precondition for persisting a schedule. **The body below is the original filing and is kept as history.**
 `src/runs/shared/capability-ceiling.ts:5`, `:95`, `:106` (209 lines) — present at **both** v0.43.0 and v0.47.1; env write and the `MCP_DIRECT_TOOLS="__none__"` forcing at `src/runs/shared/pi-args.ts:741-756` — vs `exec/mod.rs:1428`, the single workspace-wide mention, a comment reading "no capability ceiling in this port". `CAPABILITY_CEILING_V1` is one of the six upstream child env names with no cyrup counterpart (area 09 sweep 1). **Observable**: a grandchild inherits its parent's full tool/extension surface; upstream clamps monotonically and stamps the ceiling so the child cannot re-widen.
 
-**VL-S2 · `workflowScript` runtime (and `chatProgress`)** — *large* · id retained, **class corrected to port bug** (first tag v0.41.0 ≤ baseline)
+**~~VL-S2 · `workflowScript` runtime (and `chatProgress`)~~** — ~~*large*~~ **CLOSED** · id retained
+- **CLOSED, re-verified in code 2026-09-16 at `cc7818b`.** `"workflowScript"` has **56** occurrences across the crate; the runtime is `workflows/scripted/` (`engine.rs` alone carries `WORKFLOW_DEFAULT_TIMEOUT_MS` at `:2178`) and the `WorkflowStateStore` trait is implemented by `missions/workflow_state.rs:298`, constructed in production at `extension/tool/routing.rs:571`. The `extension.rs:5327-5338` claim this row quotes ("the identifier appears nowhere in this crate") is gone with the file. **This closure is what discharges UW-8** (§2), exactly as UW-8's own text predicted. **NOT closed by it and still owed:** VL-S12's reverse-lag half — the four v0.41.0-deleted slash commands are still registered, see that entry. **The body below is the original filing and is kept as history.**
 `src/workflows/scripted-workflow.ts:311` (`runWorkflowScript`, 502 lines) plus `src/workflows/chat-progress.ts` (140); tool params `src/extension/schemas.ts:317`, `:318` — vs `extension.rs:5327-5338` ("the identifier appears nowhere in this crate") and `missions/workflow_state.rs:26-30`. **Observable**: the model cannot express a dynamic workflow (`runs.run`/`runs.all`/`emit`/`state.get`/`state.set`); conversely cyrup still exposes the `tasks`/`chain`/`concurrency`/`chainDir` shapes v0.41.0 removed (that half is VL-S12). **Area 09's blind spot 2 is a warning about this entry specifically:** upstream deleted the entire task/chain execution surface at v0.41.0 and replaced it with `workflowScript`; at v0.43.0 the top-level schema has **no `task` key at all** and the whole model-facing tool description is workflowScript-centric. cyrup implements the v0.34.0-era surface. **This is not one item — it is a different execution model**, and its per-behaviour consequences (`runs.ref`, `emit`, per-child gates, `prompts.render`, `chatProgress`, retained-child `resume`, `children.list`) have never been decomposed by any pass. Treat area 09's count as a floor "by a wide margin" because of it.
 
-**VL-S3 · Session lease — two runners can own one session file** — *medium* · id retained, class corrected (v0.35.0)
+**VL-S3 · Session lease — two runners can own one session file** — *medium* · id retained, class corrected (v0.35.0) · **STILL OPEN at `cc7818b`; re-greped 2026-09-16**
+- **Re-greped this pass:** `grep -rn 'session_lease\|SessionLease' crates/cyrup-ext-subagents/src/` returns **0** — no lease machinery, not even a doc citation. The zero-hit finding below re-measures identically at HEAD. Note that the SCOPE sequence added a *different* cross-instance lock (`background/async_retention/lock.rs`, 721 LOC) which guards the retention sweep and is **not** a session lease; do not mistake it for this row closing
 `src/runs/shared/session-lease.ts:9`, `:59`, `:208` (299 lines); acquired `subagent-runner.ts:4618`, released `:4648`; present at v0.47.1 — vs zero lease machinery anywhere in `crates/cyrup-ext-subagents/src` (area 09 `SUBA-023` re-confirms zero-hit). **Observable**: nothing prevents two runner processes writing one async session file concurrently, and there is no dead-owner reclaim on the next revival.
 
-**VL-S4 · Process-terminal record — a killed runner leaves an ambiguous run** — *medium* · id retained, class corrected (v0.37.0)
+**VL-S4 · Process-terminal record — a killed runner leaves an ambiguous run** — *medium* · id retained, class corrected (v0.37.0) · **STILL OPEN at `cc7818b`, and the SCOPE sequence made it LOAD-BEARING; re-greped 2026-09-16**
+- **Re-greped this pass:** the only two hits for `process_terminal`/`ProcessTerminal` in the crate are doc citations — `background/active_run_index.rs:56` and `background/active_async_capacity/inspect.rs:152`. There is still no port
+- **New consequence, filed here because it is this row's cost and not a new gap.** `active_async_capacity`'s own module doc (`background/active_async_capacity/mod.rs`, §D3) records that upstream releases a capacity slot on ONE positive proof — a `processTerminal` artifact whose `state === "observed"` matches the owner's `runnerProcessInstanceId` — and that **cyrup has neither input**, so the release rung had to be substituted with runner-pid liveness (`background::reconcile::check_pid_liveness`). Ported verbatim it would have retained a successful run's slot forever. **So VL-S4 is no longer only a status-reporting gap: a second subsystem now runs on a substitute for it**, and closing VL-S4 should revisit that substitution
 `src/runs/background/process-terminal.ts:52`, `:163`, `:216` (280 lines); present at v0.47.1 — vs zero hits crate-wide; run state comes from `background/run_status.rs` and `background/reconcile.rs`. Area 09 `SUBA-023` adds the missing half: `TerminationOutcome` (`spawn/signal.rs:90-106`) carries only `status` + `stage`, with no `ExitStatus::signal()` name mapping. **Observable**: when a runner dies without writing a result, upstream still reports a definite terminal cause; cyrup can only report the reconciled "stale" guess, so `status` cannot distinguish a crash from a slow start.
 
-**VL-S5 · Revival does not restore the child's effective config** — *small* · id retained, class corrected (v0.35.0)
+**VL-S5 · Revival does not restore the child's effective config** — *small* · id retained, class corrected (v0.35.0) · **STILL OPEN at `cc7818b`; re-greped 2026-09-16**
+- **Re-greped this pass, and cyrup now says so in its own source:** `background/async_retention/scan.rs:56` defines `RECOVERY_DESCRIPTOR_FILE = "recovery-descriptor.json"` as a *reader* (it is one of the resumability signals the retention scan honours, pi `hasResumableContract`), and `:381` carries the explicit `[CYRUP-DELTA] no cyrup writer produces recovery-descriptor.json today`. **The read half now exists and the write half still does not** — which is strictly worse than before, because the retention scan's resumable-contract check can never fire. The `extension.rs:4269-4285` citation below is dead
 `runs/background/async-execution.ts:1358` builds a `SteeringRecoveryDescriptor` and `:1401` persists it as `recovery-descriptor.json`; `async-resume.ts:276` reads it back and `:501-524` re-applies model, fallbackModels, thinking, tools, extensions, mcpDirectTools, systemPrompt, skills, completionGuard, memory, output, toolBudget and maxSubagentDepth — vs cyrup, which writes no descriptor and rebuilds the revived step with `model: None, tools: None, extensions: None` at `extension.rs:4269-4285`. **Observable**: a run launched with per-call `model`/`tools`/`toolBudget` overrides revives without them. *(Revival ITSELF is ported and works — `ResumeOutcome::RespawnFromTranscript` at `background/control.rs:1214` → `revive_from_transcript` at `extension.rs:4232`.)*
 
-**VL-S6 · Herdr inspector subsystem** — *large* · id retained, class corrected (v0.41.0)
+**VL-S6 · Herdr inspector subsystem** — *large* · id retained, class corrected (v0.41.0) · **STILL OPEN at `cc7818b`; re-measured 2026-09-16**
+- **Re-measured this pass against the verb set rather than a line citation:** of the 57 verbs in `pi-subagents` v0.68.0 `shared/types.ts:2801`, cyrup's 42-verb list (`extension/tool/text.rs:215`) is missing all seven this row owns — `inspector.{open,command,status,close}` and `project.{open,status,close}`. The `extension.rs:6557` / `extension.rs:9863` citations below are dead; `tui/fleet.rs`'s "Herdr inspector controls are unavailable in this context." refusal was not re-resolved to a current line this pass
 `src/inspectors/herdr/actions.ts:15` (`HERDR_INSPECTOR_ACTIONS`) and `:158`, plus `client.ts` (130), `inspector-runner.ts` (141), `project-panes.ts` (154), `src/integrations/herdr-status.ts` (330) — vs `tui/fleet.rs:1654` ("Herdr inspector controls are unavailable in this context."), the hard-coded `false` at `extension.rs:9863`, and no `inspector.*` verb in the enum at `extension.rs:6557`. **Observable**: the FleetView's advertised `H` key (footer at `tui/fleet.rs:2025`) always answers "unavailable".
 
-**VL-S7 · Authority policy (confirm/forbid gates)** — *medium* · id retained, class corrected (v0.41.0) · now also area 09 `SUBA-064`
+**~~VL-S7 · Authority policy (confirm/forbid gates)~~** — ~~*medium*~~ **CLOSED** · id retained · area 09 `SUBA-064`, closed there 2026-08-14 (sweep 1)
+- **CLOSED, re-verified in code 2026-09-16 at `cc7818b`.** `registration/authority.rs` is the port and names the upstream file in its own header; `validate_authority_policy` exists; the gate is consulted from the live `stop`/`steer` path and, since `7e41cf9`, from `schedule.create` through the SAME three-arm gate (`extension/tool/routing.rs:1268-1275` → `AuthorityAction::for_tool_action`, mapping at `registration/authority.rs:77`). **The scope caveat this row records STILL HOLDS and is the reason it was rated medium:** `worktree.discard` and `worktree.cleanup` are among the seventeen verbs cyrup's action list is still missing, so those arms have nothing to attach to. **The body below is the original filing and is kept as history.**
 `src/policy/authority.ts:1-8` (`AUTHORITY_ACTIONS`), `:14-21` (defaults — discardWorktree/destructiveCleanup/spawnBudgetGrant default to `confirm`), `:23`, `:30`; consumed by `inspectors/herdr/actions.ts:205-206` (`allowSteer`/`allowStop`) and validated at `src/extension/config.ts:26` — vs `extension.rs:7574` (a doc line naming upstream's dispatch arm) and no `authorityPolicy` config key anywhere. **Area 09 sharpened this**: the `stop`/`steer` gate it drives is **live-reachable** in cyrup today, so the missing policy is not merely unconfigurable — it is an unguarded live path. Scope caveat: upstream's `discardWorktree` gate hangs off a `worktree.discard` action cyrup does not have, so that arm has nothing to attach to yet. **`SUBA-064` stays medium only because of that caveat — it becomes critical the day `worktree.discard` or `destructiveCleanup` lands**, and its Fix now carries that as a hard prerequisite.
 
 **VL-S8 · Wait tool is still `wait`** — *medium* (was *large*) · id retained, class corrected (v0.35.0/v0.41.0) · **narrowed, NOT closed**
 `src/runs/background/wait-tool.ts:9` (`name: "subagent_wait"`), backed by `subagent-wait.ts` (651), `wait-config.ts` (36) and `auto-drain.ts` (67) at v0.35.0 plus `wait-subscriptions.ts` (348 @ `7fe9dee1`; 253 at v0.41.0, the tag this row was first written against) — vs `extension/wait_tool.rs:16` (`WAIT_TOOL_NAME: &str = "wait"`; `extension.rs` no longer exists as a monolith, so the old `extension.rs:6704` citation is stale). **Still observable**: a child prompted by upstream's tool description calls `subagent_wait` — or, at `7fe9dee1`, `bg_wait` — and gets "unknown tool". **Closed since**: the `{id, nonBlocking:true}` wake subscription is ported as `background/wait_subscriptions/` (SCOPE_11) and armed from `background/wait.rs`'s own arming site, rendered by `extension/executor/status.rs`'s no-id branch, and reconciled as the FOURTH member of the completion watcher's composite observer; auto-drain at `agent_end` is ported as `background/auto_drain.rs` and driven from `extension/host/native_impl.rs`'s `AgentEnd` arm. Related residuals now filed in area 09: `SUBA-034` (event-bus wake) and `SUBA-031` (`wait` scoping) are both **CLOSED**. `SUBA-056` (durable completion replay) is **CLOSED** — `background/completion_replay/` is the port, and `collect_wait_completions`' third rung reads it; `wait_subscriptions`' own settle reads through the same three rungs. **What remains in this row is the tool RENAME and nothing else.**
 
-**VL-S9 · `usageBudget`** — *small* · id retained, **class corrected to port bug** · area 09 `SUBA-021`
+**~~VL-S9 · `usageBudget`~~** — ~~*small*~~ **CLOSED** · id retained · area 09 `SUBA-021`, closed there 2026-08-15 (sweep 10)
+- **CLOSED, re-verified in code 2026-09-16 at `cc7818b`.** `exec/usage_budget.rs` exists; `"usageBudget"` has **14** occurrences including the advertised schema key, and the resolved budget is carried onto the runner at `extension/executor/background.rs:620` (`usage_budget` on `RunnerConfig`, commented "SUBA-021 — the run-level usage budget the orchestrator validated, carried verbatim onto hop 2"). The "zero hits in the crate" claim below is false at HEAD. **The body below is the original filing and is kept as history.**
 `src/runs/shared/usage-budget.ts:14`, `:44`, `:61` (65 lines) — present at **both** v0.43.0 and v0.47.1; tool param `src/extension/schemas.ts:330` — vs zero hits in the crate and no such key among the 45 schema properties. **Observable**: a run cannot be capped by cost/token spend.
 
-**VL-S10 · Parallel worktree handoff manifests** — *medium* · id retained, class corrected (v0.36.0) · area 09 `SUBA-024`
+**VL-S10 · Parallel worktree handoff manifests** — *medium* · id retained, class corrected (v0.36.0) · area 09 `SUBA-024` (still open there) · **STILL OPEN at `cc7818b`; re-greped 2026-09-16**
+- **Re-greped this pass:** `grep -rn '"handoffPath"' crates/cyrup-ext-subagents/src/` returns **0** — the param is still unadvertised and there is still no manifest writer. Adjacent and also still missing: `worktree.discard` / `worktree.cleanup` are two of the seventeen verbs absent from cyrup's action list, which is why VL-S7's authority arms for them have nothing to attach to
 `src/runs/shared/parallel-handoff.ts:74`, `:158`, `:162`, `:183` (238 lines), present at v0.47.1; `handoffPath` tool param at `src/extension/schemas.ts:274` — vs `spawn/parallel.rs` (no manifest writer) and three incidental mentions only. **Observable**: after a parallel run with `worktree: true` there is no handoff manifest, no `handoffPath` to hand preserved worktrees to a follow-up, and no `discardPreservedWorktrees` cleanup — the branches are left for the user to find by hand.
 
-**VL-S11 · Three slash commands missing: `/subagents`, `/subagents-refine`, `/subagents-detach`** — *medium* · id retained, class corrected (v0.35.0/v0.43.0/v0.39.0) · area 09 `SUBA-026` (partially closed: `/subagents-stop` landed)
+**VL-S11 · Three slash commands missing: `/subagents`, `/subagents-refine`, `/subagents-detach`** — *medium* · id retained, class corrected (v0.35.0/v0.43.0/v0.39.0) · area 09 `SUBA-026` (still open there) · **STILL OPEN at `cc7818b`; re-read 2026-09-16**
+- **Re-read this pass:** the match is now **17** variants at `registration/slash_commands.rs:83-121` (the "16-variant match at `:127-145`" citation below is stale on both count and line), and none of the three is among them. **One correction to this row's own note:** the "fourth is now known — `/subagents-guide`, filed as `SUBA-066`" clause is **discharged** — `SlashCommandName::SubagentsGuide` is `registration/slash_commands.rs:121` and `SUBA-066` is closed in area 09. `/subagents-stop` is `:117`, as this row already records
 `src/slash/slash-commands.ts:651`, `:701`, `:724`; the admin surface is `src/slash/subagents-admin.ts` (432 lines) — vs the 16-variant match at `registration/slash_commands.rs:127-145`, which has none of the three. **A fourth is now known**: `/subagents-guide`, filed separately as area 09 `SUBA-066` because it sits outside both this entry and `SUBA-055`. **Observable**: no interactive admin surface for an agent's model/thinking/prompt, no way to detach a live foreground run from a slash command, no refinement overlay generation.
 
-**VL-S12 · Four slash commands upstream deleted at v0.41.0 are still registered** — *small* · **reverse lag**, not a port bug and not lag
+**VL-S12 · Four slash commands upstream deleted at v0.41.0 are still registered** — *small* · **reverse lag**, not a port bug and not lag · **STILL OPEN at `cc7818b`; re-read 2026-09-16**
+- **Re-read this pass:** all four are still there — `SlashCommandName::Chain` `registration/slash_commands.rs:83`, `Parallel` `:84`, `RunChain` `:85`, `ChainPrompts` `:101` (the `:128`-`:142` citations below are stale). **The blocker this row names is now DISCHARGED**: VL-S2's `workflowScript` runtime landed, so the capability no longer disappears if these four are deleted. This is now a straightforward deletion and should be scheduled as one
 `git grep -oh 'registerCommand("[a-z-]*"' <tag> -- src` gives 19 unique names at v0.40.0 including `chain`, `parallel`, `run-chain`, `chain-prompts`, and 15 at v0.41.0 with all four gone (still gone at v0.43.0 and v0.47.1) — vs `registration/slash_commands.rs:128` (`Chain`), `:129` (`Parallel`), `:130` (`RunChain`), `:142` (`ChainPrompts`). **Observable**: cyrup's palette advertises four commands upstream no longer has, whose function moved into `workflowScript` (VL-S2). Do not delete them before VL-S2 lands or the capability disappears entirely.
 
-**VL-S13 · Agent refinement WRITE half** — *medium* · id retained, class corrected (v0.43.0)
+**VL-S13 · Agent refinement WRITE half** — *medium* · id retained, class corrected (v0.43.0) · **STILL OPEN at `cc7818b`; re-measured 2026-09-16**
+- **Re-measured this pass against the verb set:** `refine`, `refine.show` and `refine.rollback` are three of the seventeen verbs absent from cyrup's 42-verb action list (`extension/tool/text.rs:215`) — so the "no `refine*` verb in the enum at `extension.rs:6557`" claim is still TRUE, at a new address. The read-half-only statement at `exec/agent_refinements.rs:12-20` was not re-resolved to a current line this pass
 `src/agents/agent-refinements.ts:349` (`collectBoundedRefinementEvidence`), `:448` (`validateRefinementProposal`), `:546` (`handleRefinementAction`) — vs `exec/agent_refinements.rs:12-20`, which states the port is the read half only, and no `refine*` verb in the enum at `extension.rs:6557` (area 09 counts three such verbs missing). **Observable**: an overlay written by upstream (or by hand) is applied correctly at spawn (`exec/mod.rs:1565`), but cyrup can never generate or roll one back.
 
-**VL-S14 · `runner: external-cli` agents unsupported** — *medium* · id retained, class corrected (v0.41.0)
+**~~VL-S14 · `runner: external-cli` agents unsupported~~** — ~~*medium*~~ **CLOSED** · id retained
+- **CLOSED, re-verified in code 2026-09-16 at `cc7818b`.** `exec/external_cli/` is the port — `mod.rs`, `run.rs`, `env.rs`, `framing.rs`, `preflight.rs`, `prompt.rs` and an `adapters/` directory (`claude_code.rs` among them) — and the frontmatter `runner` key round-trips at `discovery/management/frontmatter_write.rs:343`/`:773`/`:779`. `background/runner_main.rs:4020` is no longer "the sole trace". Its residual defects are tracked on area 09 `SUBA-095`, which is closed; `00-residual-ledger.md`'s tenth edition records one unfixed comment-level finding against `external_cli/run.rs` that this pass did not re-check. **The body below is the original filing and is kept as history.**
 `src/runs/shared/external-cli-runner.ts:12`, `:26`; `src/api/external-runs.ts` (129 lines); refusal text `runs/foreground/subagent-executor.ts:5023` — vs `discovery/frontmatter.rs` (no `runner` key) and `discovery/types.rs` (no `runner`/`external` field); the sole trace is a doc citation at `background/runner_main.rs:4020`. **Observable**: `runner: {type:'external-cli'}` in frontmatter parses as if absent and the agent is launched as an ordinary cyrup re-exec instead of shelling out to the declared CLI (or being refused, as upstream does for foreground/clarify).
 
-**VL-S15 · Native extensions cannot register a keyboard shortcut** — *small* · **host-seam gap, not upstream lag** · see also §2 UW-7, area 06 `EXT-039`
+**~~VL-S15 · Native extensions cannot register a keyboard shortcut~~** — ~~*small*~~ **CLOSED** · area 06 `EXT-039`, closed there · see also §2 UW-7, which this does **not** close
+- **CLOSED, re-verified in code 2026-09-16 at `cc7818b`.** `InitApi::register_shortcut` exists at `crates/cyrup-ext/src/native.rs:406`, is carried into the registry at `crates/cyrup-ext/src/facade.rs:502`, and is **dispatched** — `native.rs:651` runs the declared shortcut, with `:664` recording in-tree that it was a write-only surface before that landed (EXT-035). The `native.rs:240-297` "no `register_shortcut`" citation below is false at HEAD
+- **This does NOT close UW-7.** UW-7 needs `on_terminal_input` — a per-keystroke stream into a widget — not a registered chord; the fleet-status widget still receives no keystrokes. Two different seams, and this row's old "same missing seam family as VL-S15" cross-reference in UW-7 is corrected there. **The body below is the original filing and is kept as history.**
 `src/slash/slash-commands.ts:719-722` (`pi.registerShortcut(Key.ctrlAlt("f"), … showFleet(ctx))`) — vs `crates/cyrup-ext/src/native.rs:240-297` (`InitApi` exposes `subscribe`, `register_tool`, `register_command` and three renderer registrations; no `register_shortcut`). The WASM-guest path HAS one (`cyrup-ext/src/host/live.rs:98`), which proves the seam can carry it. **Observable**: the fleet inspector opens only by typing `/subagents-fleet`; Ctrl+Alt+F has no counterpart, and the same limit blocks every other native-extension shortcut (`crates/cyrup-intercom/src/extension.rs:465` records the identical complaint). Note area 11's correction: `ui/mod.rs:12-19`'s rationale is now **half stale** — `register_message_renderer` DOES exist at `native.rs:270`; only `register_shortcut` is missing.
 
 ### 1c. From `pi-permission-system` v0.7.1
@@ -1351,7 +1549,22 @@ A refinement this pass earned, recorded by area 05 and worth generalising: **a `
 a consumer.** The previous sweep's "has a consumer" test let `doubleEscapeAction` through because it
 was rendered in the settings list — and nothing else read it.
 
-**UW-1 · The native modifier probe has no production caller, so the Apple-Terminal Shift+Enter rescue never fires** — *medium*
+> **SWEEP 2026-09-16, cyrup `cc7818b` — every row below re-greped, and this register was badly
+> stale.** Eleven of the twenty entries are closed or partially closed and are marked in place;
+> five that stay open carry refreshed citations; **one new entry, `UW-21`, is filed by this pass
+> against code the SCOPE sequence itself landed** — which makes it the FIFTH time this programme has
+> shipped tested machinery with no production caller, and the second time the batch that shipped it
+> also wrote the test that proves the machinery works in isolation. Ids are never renumbered or
+> deleted here, so a closed `UW-` keeps its number and its body.
+>
+> **The method, so a later reader can re-run it rather than trust it.** For each row: grep the named
+> symbol workspace-wide, subtract every hit inside the symbol's own module and every hit under
+> `tests/`/`#[cfg(test)]`, and ask whether anything is left. A row closes only when what remains is a
+> call on a path a user can reach. A doc-comment mention is not a caller — three rows below were
+> kept open on exactly that distinction.
+
+**~~UW-1 · The native modifier probe has no production caller, so the Apple-Terminal Shift+Enter rescue never fires~~** — ~~*medium*~~ **CLOSED**
+- **CLOSED, re-greped 2026-09-16 at `cc7818b`.** `crates/cyrup/src/main.rs:241` calls `cyrup_tui::set_native_modifier_probe(native_modifier_probe::probe)` — a production install in the binary's own startup, which is exactly the caller this row said did not exist. The remaining hits are the definition (`cyrup-tui/src/native_modifiers.rs:62`), the re-export (`lib.rs:196`), the module doc (`:36`), one test (`tests/native_shift_enter.rs:155`) and a `cyrup-it` doc note (`tests/misc/main.rs:21`) recording that the probe is first-writer-wins. **Not live-verified on macOS Apple Terminal** — the wiring is proven, the rescue's behaviour on that terminal is not. **The body below is the original filing and is kept as history.**
 - upstream: `pi/packages/tui/src/native-modifiers.ts:21-56` (`loadNativeModifiersHelper` loads the prebuilt darwin/win32 addon), consumed at `packages/tui/src/terminal.ts:6` and used at `:324`
 - cyrup: `crates/cyrup-tui/src/native_modifiers.rs:62` (`set_native_modifier_probe`) — the only call workspace-wide is `crates/cyrup-tui/src/tests/native_shift_enter.rs:138`. The consumer side IS wired: `app/input_reader.rs:403` calls `is_native_modifier_pressed` on the production `map_event_on` path *(`app/settings_rows.rs:110` was a bad `40821ed` remap — that line is an idle-timeout description)*
 - observable: with no probe installed the predicate always answers false, so on macOS Apple Terminal Shift+Enter still submits instead of inserting a newline — the exact defect the ported code exists to fix. Mechanism note: pi `require`s a prebuilt `.node` addon; cyrup needs an OS query (`CGEventSourceKeyState`/`GetKeyState`), which is FFI and cannot live inside `#![forbid(unsafe_code)]` `cyrup-tui` — the injectable seam exists precisely for that and is fed by nothing. *(Area 07 did not restate this item; `native_modifiers.rs` is one of fifteen files that did not exist at the older baseline. The citations above are at `04c1ba2`.)*
@@ -1365,47 +1578,59 @@ was rendered in the settings list — and nothing else read it.
 - observable: on a first run with `CYRUP_EXPERIMENTAL=1`, no `settings.json` and no agent-dir override, pi presents the theme + analytics wizard and persists the answers; cyrup does nothing. **The gate can fire**: `OFFICIAL_PACKAGE_NAME`/`APP_NAME`/`CONFIG_DIR_NAME` (`startup.rs:32-34`) name cyrup itself and match the live values at `:38-43`, so `is_official_distribution()` (`:71-73`) is **true** for this build. This is the one place where the standing "deliberately unreachable first-run wizard" trap and the code disagree — the comment at `main.rs:215-217` and CLAUDE.md's "compile-time constant `false`" are both stale. Escalated to **OQ-6**.
 - **observed 2026-08-13, live terminal, and the trap list is now settled on evidence rather than on a read.** With `CYRUP_EXPERIMENTAL=1`, no `settings.json` and the *default* agent dir, the binary goes straight to the interactive TUI: no theme picker, no analytics question, and no `settings.json` written. Two independent corroborations that the gate's inputs were **all true in that very process**: the footer printed the `xp` experimental badge (`crates/cyrup-tui/src/status.rs:356`, pi `footer.ts:162-164`), proving `CYRUP_EXPERIMENTAL=1` was read; and the agent dir ended the run containing only `models-store.json.lock`, proving `settings_path` did not exist. The wizard is also **not** broken-but-invisible: the sibling pre-launch selectors (trust prompt, resume picker) rendered fine on the same pty in the same pass, so a wizard that ran would have been seen. **The standing trap-list entry "the deliberately unreachable first-run wizard" is wrong and should be struck**; OQ-6 is a live product decision, not a documentation cleanup.
 
-**UW-3 · Child-watchdog NDJSON status events are never read by the parent** — *medium* · confirmed at HEAD by area 09
+**UW-3 · Child-watchdog NDJSON status events are never read by the parent** — *medium* · **STILL OPEN at `cc7818b`; citations refreshed 2026-09-16**
+- **Re-greped this pass:** `is_child_watchdog_status_event` (`watchdog/child_status.rs:489`) and `child_watchdog_is_active` (`:512`) have **zero** callers of any kind outside their own module — the `:480`/`:497`/`:516` offsets below have drifted and are corrected here. The CONFIG half IS wired and was not before: `exec/spawn_plan.rs:1045-1055` resolves and encodes `CHILD_WATCHDOG_CONFIG_ENV` into the child env, and `:2333-2341` decodes it. **So the child is now told to run a watchdog and the parent still cannot read what it reports** — the gap moved one step later, it did not close
 - upstream: `pi-subagents/src/runs/foreground/execution.ts:846`, `:848`, `:857`, `:585`; `runs/background/subagent-runner.ts:626`, `:628`, `:640`, `:831`, `:2711-2712`; definitions `src/watchdog/child-status.ts:167`, `:181`, `:186`
 - cyrup: `watchdog/child_status.rs:480`, `:497`, `:516` — production callers zero. The two readers that should call them (`exec/ndjson.rs`, `background/`) contain no watchdog reference. The child EMIT side is wired (`prompt_runtime.rs:1701`; `exec/mod.rs:1727-1737`)
 - observable: a child mid-watchdog-review when its agent settles is killed by the ordinary final-drain timer instead of held open by the watchdog tail timer, so its blocker/concern warnings are lost. cyrup emits `subagent.watchdog.status` frames its own parent discards as an unknown event type. `child_status.rs:461-473` states this in-tree.
 
-**UW-4 · Watchdog review never runs a model turn — every review is silently clean** — *medium* · confirmed at HEAD
+**UW-4 · Watchdog review never runs a model turn — every review is silently clean** — *medium* · **STILL OPEN at `cc7818b`; citations refreshed 2026-09-16**
+- **Re-greped this pass:** `NoTurnReviewAgent` is defined at `watchdog/review.rs:876` (was `:871`) and is still the agent bound in **both** production paths — `watchdog/register_main.rs:168` and `prompt_runtime.rs:2438` (was `:1761`). `prompt_runtime.rs:2405` now carries an in-tree comment acknowledging why the stub exists. Nothing about this row has changed except the line numbers
 - upstream: `src/watchdog/review.ts:295` — `await agent.prompt(buildReviewPrompt(request, selection))` inside `createMainWatchdogReview` (`:249`)
 - cyrup: `watchdog/review.rs:871` (`NoTurnReviewAgent`) whose `run` returns `Ok(Vec::new())` at `:876`; it is the agent bound in BOTH production paths — `watchdog/register_main.rs:169` and `prompt_runtime.rs:1761`
 - observable: the whole `watchdog/` subtree is wired — 18 modules, `register_main_watchdog` at `extension.rs:9055`, nine subscriptions `:9338-9352`, `/subagents-watchdog` `:9326`, four `watchdog.*` verbs `:7567-7570` — and a review model is resolved on every agent-end boundary, but **no warning can ever be emitted**. `/subagents-watchdog status` reports "real model review" (`register_main.rs:191`) over a machine that cannot produce a finding. **This is the canonical example of "closing a not-implemented item means the subsystem exists, not that it is correct."**
 
-**UW-5 · Watchdog permission arbiter never runs a model turn — every `ask` denies** — *medium* · confirmed at HEAD
+**UW-5 · Watchdog permission arbiter never runs a model turn — every `ask` denies** — *medium* · **STILL OPEN at `cc7818b`; citations refreshed 2026-09-16**
+- **Re-greped this pass:** `NoDecisionPermissionAgent` is defined at `watchdog/permission_arbiter.rs:600` (was `:587`) and bound at `prompt_runtime.rs:2407` and `:2858` (was `:1734`). `prompt_runtime.rs:2775` documents the `ask`-tier consequence in-tree. **This row's blast radius GREW with UW-6's closure**: now that a real policy reaches the child (see UW-6), an `ask`-tier rule can actually be hit in production, where before the gate never received a policy at all. It should be scheduled ahead of its `medium` rating
 - upstream: `src/watchdog/permission-arbiter.ts:41` (`createWatchdogPermissionArbiter`) constructing `new Agent({… streamFunction })` at `:102`, exported as `requestWatchdogPermission` at `:145`
 - cyrup: `watchdog/permission_arbiter.rs:587` (`NoDecisionPermissionAgent`, returning `Ok(None)` at `:595`), bound at `prompt_runtime.rs:1734` — the sole production construction of the gate
 - observable: a child tool whose policy tier is `ask` is denied with the `malformed` reason ("Watchdog permission arbiter returned no decision.", `permission_arbiter.rs:734`). Fail-closed is the right direction, but no `ask`-tier tool can ever succeed inside a subagent.
 
-**UW-6 · Nothing ever ships a permission policy to a child — the child-side gate is inert** — *medium* · confirmed at HEAD
+**~~UW-6 · Nothing ever ships a permission policy to a child — the child-side gate is inert~~** — ~~*medium*~~ **CLOSED**
+- **CLOSED, re-greped 2026-09-16 at `cc7818b`.** `exec/spawn_plan.rs:1178` carries the comment "SUBA-073 — pi ships the resolved permission policy to the child in `PERMISSION_POLICY_ENV`" and `:1202` writes `crate::watchdog::permission_arbiter::PERMISSION_POLICY_ENV` into the child env overlay; `:3171-3252` is the test that pins it reaching the child as `CYRUP_SUBAGENT_PERMISSION_POLICY`. The run-level, fully-merged policy is carried onto the runner at `extension/executor/background.rs:625` (`RunnerConfig`, "SUBA-073 — the run-level, fully-merged permission policy the orchestrator resolved"), and `exec/external_cli/env.rs:189-205` deliberately withholds it from an external-CLI child. **The "only writer workspace-wide is a test stub" claim below is false at HEAD.**
+- **What this closure does NOT do — read it with UW-5.** The child-side gate now receives a policy and can reach the `ask` tier; the arbiter that would decide an `ask` is still `NoDecisionPermissionAgent`, so every `ask` still denies. **Wiring the input to an inert decider is a closure of this row and an escalation of UW-5.** **The body below is the original filing and is kept as history.**
 - upstream: `src/runs/shared/permissions.ts:40` (`resolvePermissionRules`) and `:51` (`encodePermissionRules`), written into the child env at `src/runs/shared/pi-args.ts:730` and `:758`
 - cyrup: `exec/mod.rs:1376` (`build_attempt_spawn_plan`) builds the child env overlay through `~:1874` — structured-output vars, `TOOL_BUDGET_ENV` (`:1840-1846`), steer inbox, supervisor channel, required child tools — but never `CYRUP_SUBAGENT_PERMISSION_POLICY` / `…_PERMISSION_AUDIT_PATH` (defined at `watchdog/permission_arbiter.rs:358`, `:361`). The only writer workspace-wide is a test stub at `prompt_runtime.rs:1949-1950`; the reader is `prompt_runtime.rs:1716-1717`
 - observable: `with_permission_gate` always receives `None`, so no child tool is ever checked against agent/config permission rules and no `permission.request`/`permission.decision` audit record is ever appended. `permission_arbiter.rs:56-63` admits this in-tree.
 
-**UW-7 · The fleet-status widget receives no keystrokes** — *medium* · confirmed at HEAD
+**UW-7 · The fleet-status widget receives no keystrokes** — *medium* · **STILL OPEN at `cc7818b`; citations refreshed 2026-09-16**
+- **Re-greped this pass:** `SubagentFleetStatus::handle_key` is now `tui/fleet_status.rs:740` (was `:764`) and every caller is a test in the same file (`:1554`, `:1569`, `:1586`, `:1588`, `:1599`, …). The host seam is still absent — `cyrup-ext/src/host/services.rs` has nothing resembling `on_terminal_input`
+- **Cross-reference corrected:** this row's "same missing seam family as VL-S15" is **wrong now**. VL-S15's `register_shortcut` landed (`cyrup-ext/src/native.rs:406`, dispatched `:651`) and did not help, because a registered chord is not a per-keystroke stream. UW-7 needs its own seam and should no longer be scheduled behind VL-S15
 - upstream: `src/tui/fleet-status.ts:282-283` (`ui.onTerminalInput((data) => this.handleKey(data))`), handler `:352`
 - cyrup: `tui/fleet_status.rs:764` (`handle_key`) has zero production callers, as do `press` (`:1169`) and `is_widget_registered` (`:711`). The host has no seam to wire it to: `cyrup-ext/src/host/services.rs` has `set_widget` (`:260`) and `open_overlay` (`:224`) but nothing resembling `on_terminal_input`. The PUBLISH half is live (`extension.rs:9489`, `:9889`, `:9978`)
 - observable: while subagents run, pressing ↓ or ← on an empty editor expands pi's widget into a selectable roster whose Enter opens the fleet inspector; in cyrup the widget is display-only and those keys fall through to the editor. Same missing seam family as VL-S15 and area 06 `EXT-021`.
 
-**UW-8 · Mission workflow state is never written** — *small* · confirmed at HEAD
+**~~UW-8 · Mission workflow state is never written~~** — ~~*small*~~ **CLOSED**
+- **CLOSED, re-greped 2026-09-16 at `cc7818b`, and it closed exactly the way this row predicted.** `extension/tool/routing.rs:571` constructs `crate::missions::MissionWorkflowStateStore::create(…)` on the production workflow-launch path; that store wraps `create_mission_workflow_state` (`missions/workflow_state.rs:294`) and implements `workflows::scripted::WorkflowStateStore` (`:298`), so the scripted runtime's `state.get` / `state.set` now reach the real file. **"Closes for free the moment VL-S2 lands" — VL-S2 landed, and it did.** The read half (`mission_state_path` from `missions/goal_driver.rs` and `missions/actions.rs`) was already live and now finds a file that can exist. **The body below is the original filing and is kept as history.**
 - upstream: `src/missions/workflow-state.ts:17` (`missionStatePath`); its only consumer is the `workflowScript` runtime at `runs/foreground/subagent-executor.ts:4139`, which exposes `state.get`/`state.set`
 - cyrup: `missions/workflow_state.rs:209` (`get`) and `:222` (`set`) have no non-test caller. The **read** half IS live — `mission_state_path` is called from `missions/goal_driver.rs:372` and `missions/actions.rs:908`
 - observable: `<missionDir>/<missionId>/state.json` is never written, so `goal_driver`'s production read always finds a missing file and falls through to the decisions list, and `mission.show` advertises a path that never exists. **Closes for free the moment VL-S2 lands.**
 
-**UW-9 · The yolo-mode runtime API has no publish seam and no caller** — *medium* · = area 10 `PERM-011` half A
+**~~UW-9 · The yolo-mode runtime API has no publish seam and no caller~~** — ~~*medium*~~ **CLOSED** · = area 10 `PERM-011` half A, closed there 2026-08-15
+- **CLOSED, re-greped 2026-09-16 at `cc7818b` — and the closure is a DECISION, which is why the symbol still has no external caller.** Area 10 established that upstream's "publish seam" is not a host registry at all: `registerPiPermissionSystemRuntimeApi` writes one object into `globalThis.__piPermissionSystem` (`yolo-mode-api.ts:20-43` @v0.8.0), a process-global single slot. The false in-tree doc this row's last sentence calls out is **fixed**: `crates/cyrup-permission-system/src/extension/command.rs:57-60` now states plainly that an earlier revision routed the `/permission-system` yolo row through `set_yolo_mode` *"so that method would have a caller"*, and that this was reverted rather than kept — i.e. the code refuses to change behaviour to satisfy a reachability rule, and says so. `yolo_api.rs:22-24` records the same. **A reader checking this row by grepping for callers will still find none; that is the answer, not the defect.** **The body below is the original filing and is kept as history.**
 - upstream: `src/index.ts:1480-1484` @v0.8.0 (`registerPiPermissionSystemRuntimeApi({getYoloMode,setYoloMode,toggleYoloMode})`); `src/yolo-mode-api.ts:23-29` publishes it on `globalThis.__piPermissionSystem`, `:40-43` reads it back. `git diff v0.7.1..v0.8.0 -- src/yolo-mode-api.ts` is empty
 - cyrup: `extension.rs:608` (`yolo_mode`), `:628` (`set_yolo_mode`), `:693` (`toggle_yolo_mode`). `set_yolo_mode` has exactly one caller — `:694`, inside `toggle_yolo_mode` — and `toggle_yolo_mode` has none. The `/permission-system` yoloMode row deliberately routes through `save_extension_config` instead (`:783-790`). `crates/cyrup-ext/src/native.rs:318` (`trait NativeExtension`) exposes `id`/`init`/`on_event`/`execute_command` — no way to publish a callable API object
 - observable: the three methods compile, are documented and tested, and cannot be invoked in production. **And `yolo_api.rs:16` claims they are "reached through the `/permission-system` command", which `extension.rs:721-728` contradicts** — the same doc-asserts-wiring-that-does-not-exist pattern as `PERM-014`. Unlike PB-16 this needs a new seam: `SharedBus` is an event bus, not a callable-API registry.
 
-**UW-10 · The intercom compose and session-picker overlays are render-only** — *medium* · confirmed at HEAD by area 11
+**UW-10 · The intercom compose and session-picker overlays are render-only** — *medium* · **STILL OPEN at `cc7818b`; cross-references corrected 2026-09-16**
+- **Re-greped this pass:** `open_overlay` is still never called from `crates/cyrup-intercom/`, and `ui/mod.rs:29` still says so in-tree — *"…is likewise not reachable yet. The overlays' interactive `handle_input` state machines are ported faithfully and…"*. The row stands
+- **Cross-reference corrected — this row's Fix pointer was wrong.** It says "Fix the comment with `ICOM-024`/`ICOM-028`". **Both are now CLOSED and neither touched overlay reachability**: `ICOM-024` (closed 2026-09-04) landed `register_message_renderer` for the inbound message card, and `ICOM-028` (closed 2026-08-14, REFUTED) resolved the `intercom_message` entry surface through `render_entry`. Renderers, not overlays. **UW-10 now has no owning id in area 11's open set** (`ICOM-052`, `ICOM-057`, `ICOM-061`) — it needs one filed by that area's owner, and this pass may not file it there
 - upstream: `pi-intercom/index.ts:1857` (`new SessionListOverlay(...)`) and `:1874` (`new ComposeOverlay(...)`), both handed to `ctx.ui.custom`; classes at `ui/session-list.ts:44` and `ui/compose.ts:13`
 - cyrup: `ui/compose.rs:86` (`handle_input`), `:74`, `:79` and `ui/session_list.rs:75` have zero production callers; `open_overlay` is never called from this crate. The only production use is a one-shot `render` at `extension.rs:404-407` whose output ends "Type `/intercom {target} <message>` to send."
 - observable: `/intercom <target>` prints a picture of a compose box and asks the user to retype the whole command with a body. **Rationale correction**: `ui/mod.rs:12-19` blames a missing `register_message_renderer` AND `register_shortcut`; the first now exists (`cyrup-ext/src/native.rs:270`), so only the `alt+m` path stays blocked by VL-S15 — the slash-command path is reachable today. Fix the comment with `ICOM-024`/`ICOM-028`.
 
-**UW-11 · Copilot and Codex login flows are fully written and unreachable** — *high* · = area 01 `PROV-029`
+**~~UW-11 · Copilot and Codex login flows are fully written and unreachable~~** — ~~*high*~~ **CLOSED — REFUTED** · = area 01 `PROV-029`, closed there 2026-08-14 (sweep 2)
+- **CLOSED as REFUTED-at-HEAD, re-checked 2026-09-16 at `cc7818b`.** Area 01 established that `providers/github_copilot.rs:157` wires `GitHubCopilotLogin` (the flow that HAS `login`) with an explanatory block at `:141-146`, and `providers/openai_codex.rs:137` does the same for the Codex flow — i.e. the one-field-assignment fix this row proposed had already landed when the row was re-read. **The second half of this row's Fix is NOT discharged and is not tracked anywhere**: "either populate the flow registry or delete it" — `register_bundled_oauth_flow_loaders` (`auth/oauth/load.rs:111`) was not re-greped this pass. If it still has zero callers it is a live UW-class defect with no id. **The body below is the original filing and is kept as history.**
 - upstream: `providers/github-copilot.ts:16` and `openai-codex.ts:**13**` @v0.83.0 both carry `lazyOAuth({… load: load*OAuth })`. **Citation corrected this pass**: the previous edition cited `openai-codex.ts:15` (that line is `models:` at v0.83.0), and elsewhere quoted an `isSubscription: true` property from `github-copilot.ts:16` that **does not exist at v0.83.0 at all** — it is a v0.84.1 addition. Both sides re-read at the tag
 - cyrup: two Copilot OAuth types exist — `GitHubCopilotLogin` (`auth/oauth/github_copilot.rs`, real `login` at `:821`) and `GitHubCopilotOAuth` (`providers/github_copilot.rs:410`, refresh/to_auth only) — and `github_copilot_auth()` (`providers/github_copilot.rs:142-146`) wires the **second**. Same shape for Codex: `openai_codex_auth()` (`providers/openai_codex.rs:129-131`) wires `OpenAiCodexOAuth`, not `OpenAiCodexOAuthFlow` (`auth/oauth/openai_codex.rs:516`). `/login` resolves through `provider.provider_auth().oauth` (`cyrup-config/src/login.rs:784`), so both dead-end on `LoginUnsupported` (`auth/mod.rs:124-131`). `providers/builtin_oauth.rs:37-56` has four arms and a prose exemption at `:14-16`; `register_bundled_oauth_flow_loaders` (`auth/oauth/load.rs:111`) has **zero production callers**
 - observable: `/login` advertises both providers — with the subscription marker, since both `is_subscription` returns true — and dead-ends. Two complete, tested login flows ship in the binary and cannot be reached. Fix is one field assignment per provider; separately, either populate the flow registry or delete it.
@@ -1428,24 +1653,45 @@ was rendered in the settings list — and nothing else read it.
 - cyrup: it is not among the 45 props at `extension.rs:6543-6690`, and `structured_output_schema` is hardcoded `None` at `:1934` and `:2295` — the runner already carries the field; only the two constructors pin it
 - observable: the schema is silently dropped and the run returns prose. **`SUBA-S01` was closed to deliver exactly this channel** — the transport exists and the surface a model calls does not expose it. Area 09 names the general fix: a schema/dispatch guard asserting every advertised property has a consumer, which would have caught this, `SUBA-047` and `SUBA-N05` as a class.
 
-**UW-15 · Concurrent-duplicate ask collapse is implemented in `dedup.rs` and never wired** — *medium* · = area 10 `PERM-014`
+**~~UW-15 · Concurrent-duplicate ask collapse is implemented in `dedup.rs` and never wired~~** — ~~*medium*~~ **CLOSED** · = area 10 `PERM-014`, closed there 2026-08-14 (sweep 1)
+- **CLOSED, re-greped 2026-09-16 at `cc7818b`.** `crate::dedup::DedupCache` is constructed at `crates/cyrup-permission-system/src/extension/construct.rs:14` and `DedupDetails` is consumed on the live decision, event and audit paths — `extension/decide.rs:12`, `extension/events.rs:6`, `extension/audit.rs:7`. Pinned by `two_concurrent_identical_asks_collapse_to_one_prompt`. The "in-tree docs read as though it were wired" complaint is discharged: `dedup.rs`'s module doc is now true. **The body below is the original filing and is kept as history.**
 - cyrup: the module exists and is tested; nothing in the live gate path calls it, and the in-tree docs read as though it were wired
 - observable: two concurrent identical asks each prompt the user, where pi collapses them onto one decision. (Examined and deliberately **not** raised this pass: a double-ask is not an unasked approval.)
 
-**UW-16 · Implemented-and-unadvertised, subagents edition** — *medium* · area 09 `SUBA-047`, `SUBA-054`, `SUBA-046`
+**UW-16 · Implemented-and-unadvertised, subagents edition** — *medium* · **PARTIALLY CLOSED 2026-09-16 — two of three shipped**
+- **`SUBA-047` CLOSED** (area 09, 2026-08-14): the top-level `toolBudget` is advertised; a per-call budget from an orchestrator is no longer discarded. Its own residual — the PER-ITEM `toolBudget` override on `tasks[]`/`chain[]` — was deliberately left unadvertised because advertising without a consumer is this very defect class
+- **`SUBA-046` CLOSED — REFUTED** (area 09, 2026-08-14): `exec/spawn_budget.rs` exists, the `grant-spawn-budget` verb is in the advertised list, and the SUBA-064 authority consult is live
+- **`SUBA-054` STILL OPEN** (area 09, `medium`): `defaultReads` is parsed and rendered and still never reaches a single run, so `[Read from: …]` never appears outside chains. **This is the whole of what UW-16 still owes**, and it is one of only three mediums left in area 09
 `toolBudget` is fully enforced (`exec/tool_budget.rs`, 388 lines; `TOOL_BUDGET_ENV` written at `exec/mod.rs:1837-1846`) and **not advertised** on the tool schema, so a per-call budget from an orchestrator is silently discarded (`SUBA-047`). `defaultReads` is parsed and rendered and **never reaches a single run**, so `[Read from: …]` never appears outside chains (`SUBA-054`). And the inverse shape: `grant-spawn-budget` is **advertised and unported**, so an exhausted spawn cap is terminal for the session (`SUBA-046`). Area 09 found the first two *by accident*, without running a systematic hunt — which is the argument for doing one.
 
-**UW-17 · Extension widgets, headers and footers reach the TUI and are stored where nothing renders them** — *medium* · area 07 `TUI-014`, `TUI-033`
+**~~UW-17 · Extension widgets, headers and footers reach the TUI and are stored where nothing renders them~~** — ~~*medium*~~ **CLOSED** · area 07 `TUI-014` + `TUI-033`, both closed there 2026-08-14
+- **CLOSED on the strength of both owning rows.** `TUI-014` (`ui.setWidget`) and `TUI-033` (`ui.setHeader`/`ui.setFooter`) are struck in `07-cyrup-tui.md` and neither appears in that file's current open set. **Not independently re-greped by this pass** — this closure rests on the area file, which is weaker evidence than the rows above and is marked so deliberately. The wire-shape companions this row names (`SEAM-011`, `SEAM-028`) are likewise absent from area 08's open set. **The body below is the original filing and is kept as history.**
 The delivery half of `ui.setWidget` / `ui.setHeader` / `ui.setFooter` is live all the way into `cyrup-tui`, and the values land in fields no draw path reads. Related on the wire: `SEAM-011` sends `setWidget` with a cyrup-invented `{widget}` blob, and `SEAM-028` is the test pinning it.
 
-**UW-18 · Settings rows that toggle values nothing reads** — *low* · area 05 `CFG-045`, `CFG-015`, `CFG-044`
+**UW-18 · Settings rows that toggle values nothing reads** — *low* · **PARTIALLY CLOSED 2026-09-16 — the headline example shipped, the register did not**
+- **`CFG-045` CLOSED, re-greped this pass:** `doubleEscapeAction` is no longer a settings row nothing reads — `crates/cyrup-tui/src/app/input.rs:336-342` is the double-Escape window and reads `self.state.double_escape_action`, cached at `app/state.rs:196-199`. **This matters beyond the row**: `doubleEscapeAction` is the example §2's own header paragraph uses to define "a `/settings` row is not a consumer", and that example is now stale as an example while remaining correct as a lesson
+- **`CFG-015` STILL OPEN** (area 05, `low`): five unconsumed settings accessors including `lastChangelogVersion` and `collapseChangelog`, which is PB-6's home
+- **`CFG-044` CLOSED** (absent from area 05's open set; not independently re-greped this pass)
+- The adjacent list in the body below (`AGENT-031`, `CFG-006`, `AGENT-S03`, `SESS-033`, `PROV-032`, `SEAM-048`, `TOOL-015`, `EXT-024`, `EXT-025`) was **not** re-checked row by row; of those ids only `EXT-025` is in any area's current open set
 `doubleEscapeAction` is offered in `/settings` and the Escape handler has no double-escape and no bash-mode-exit branch (`CFG-045`, and `TUI-009` is its TUI half). `CFG-015` carries five unconsumed settings accessors including `lastChangelogVersion` and `collapseChangelog` (PB-6's home). `CFG-044`'s `get_auth_status` is dead. Adjacent: `AGENT-031` / `CFG-006` (`websocketConnectTimeoutMs` parsed, never reaching the HTTP layer), `AGENT-S03` (`StreamOptions.metadata` unreachable from the agent loop), `SESS-033` (`inputs_fingerprint` has no caller and its doc claims otherwise), `PROV-032` (`filter_github_copilot_models`, zero production callers), `SEAM-048` (pi's `name:N` command disambiguation is dead code), `TOOL-015` / `EXT-024` (nothing reads `render_kind`), `EXT-025` (`reload()` plus four `emit_*` facade methods).
 
-**UW-19 · `keybindings.json` is read exactly once, at boot, and no other surface ever reads it** — *medium* · **new this edition** · area 07 `TUI-051`, area 08 `SEAM-067`, area 05 `CFG-048`
+**~~UW-19 · `keybindings.json` is read exactly once, at boot, and no other surface ever reads it~~** — ~~*medium*~~ **CLOSED** · area 07 `TUI-051`, area 08 `SEAM-067`, area 05 `CFG-048` — **all three closed 2026-08-14**
+- **CLOSED on the strength of all three owning rows**, none of which is in its file's current open set: `TUI-051` (`/reload` never re-reads `keybindings.json` while its help text claims it does), `SEAM-067` (pre-launch selectors never load it and print wrong hint rows), `CFG-048` (pi's sixth startup migration, `migrateKeybindingsConfig`, 59 legacy names). **Not independently re-greped by this pass.**
+- **The ordering constraint this row records is DISCHARGED, and that is the load-bearing part:** "`CFG-048` must precede `TUI-028`, or the `editor.*`→`tui.editor.*` namespace rename breaks every config written against shipped cyrup." `CFG-048` has landed, so `TUI-028` is unblocked. **The body below is the original filing and is kept as history.**
 Three findings, one wiring hole. `/reload` (`cyrup-tui/src/app/execute_session.rs:241-268`, `rt.reload(None).await` at `:264`) calls only `rt.reload`; `load_keybindings_json` has exactly **one** non-test caller — `crates/cyrup/src/main.rs:1626`, at boot — while both the command's help text and its in-source comment claim keybindings are re-read (`TUI-051`). The **pre-launch** selectors (`--resume` picker, trust prompt, config selector) never load it at all and print hint rows naming the built-in keys (`SEAM-067`). And pi's sixth startup migration, `migrateKeybindingsConfigFile` → `migrateKeybindingsConfig` (`core/keybindings.ts:289-309`, **59** legacy names, also applied at read time at `keybindings.ts:366`), is not ported at write time or read time, so every legacy name is silently inert (`CFG-048`; `crates/cyrup/src/migrations.rs:26-33` makes four calls, pi's `runMigrations` six). **Ordering matters: `CFG-048` must precede `TUI-028`**, or the `editor.*`→`tui.editor.*` namespace rename breaks every config written against shipped cyrup.
 
-**UW-20 · The faithful fuzzy matcher is ported and unused; `--list-models` hand-rolls a lossier one** — *low* · **new this edition** · area 08 `SEAM-068`
+**~~UW-20 · The faithful fuzzy matcher is ported and unused; `--list-models` hand-rolls a lossier one~~** — ~~*low*~~ **CLOSED** · area 08 `SEAM-068`, closed there 2026-08-14
+- **CLOSED on the strength of the owning row**, which is struck in `08-cyrup-session-svc-and-modes.md` and absent from that file's open set. **Not independently re-greped by this pass.** **`SEAM-020` is STILL OPEN** (area 08, `low`) — the companion this row said to ship with it: `--list-models` still prints the whole compiled catalog rather than the auth-configured one, so its no-models-available branch stays unreachable. **The body below is the original filing and is kept as history.**
 The port of pi's `fuzzy.ts` exists and has no caller on the `--list-models <search>` path, which uses a hand-written filter that drops matches pi returns. Same shape as UW-1: a correct port sitting beside the code that should call it. Ships naturally with `SEAM-020` (the same command prints the whole compiled catalog rather than the auth-configured one, and its no-models-available branch is therefore unreachable).
+
+**UW-21 · The whole `async_status_snapshot` subsystem has no production caller — 1 928 LOC landed unwired, and the fifth instance of this class** — *low* · **FILED 2026-09-16 by this pass, against code `7e41cf9` landed** · **no owning area-09 id yet**
+- upstream: `src/runs/background/async-status-snapshot.ts`. Two callers, both read at the tags this pass opened: the RPC bridge's `status` method — `extension/rpc.ts:725` and `:749` @v0.66.0 (`:729`/`:753` @v0.67.0; at v0.68.0 the shape changed to `asyncStatusSnapshot: {kind, version}` at `:449`) — and `ctx.ui.setWidget(WIDGET_KEY, encodeAsyncStatusSnapshotWidget(jobs))` at `tui/render.ts:2863` @v0.66.0 (`:2984` @v0.67.0, `:3000` @v0.68.0)
+- cyrup: `crates/cyrup-ext-subagents/src/background/async_status_snapshot/` — 4 files, **1 928 LOC** (`mod` 202, `project` 1 153, `state` 205, `types` 368), landed in `7e41cf9`. Workspace-wide, the ONLY references outside the module are `background/mod.rs:48` (`pub mod`) and one test — `extension/tool/routing_tests.rs:2040` `a_workflow_host_step_reaches_the_async_status_snapshot`, which calls `build_async_status_snapshot` at `:2088`. `grep -rn 'PI_SUBAGENT_ASYNC_JSON' crates/` finds the constant and no emitter
+- observable: **nothing**, and that is the point — the `PI_SUBAGENT_ASYNC_JSON:` widget line pi emits while async runs are in flight is never produced by cyrup, so any reader keying on that prefix sees nothing, and the projection's correctness cannot be observed from the shipped binary
+- **This is the fifth time this programme has shipped tested machinery with no production caller** (UW-1, UW-8, UW-15 and UW-4/UW-5 are the precedents), and the second time the shipping batch also wrote the test that proves the machinery works in isolation — `routing_tests.rs:2019` is even headed "THE REACHABILITY PROOF", which proves a *projection hop*, not reachability from a user
+- **Filed at `low`, and the rating is argued rather than assumed.** Unlike its four precedents this module **declares its own unwiredness in-tree**, at length and correctly: `background/async_status_snapshot/mod.rs:27-49` is headed "⚠ `encode_async_status_snapshot_widget` has NO production caller in cyrup, and that is the decision, not an oversight", names both blockers (`cyrup-ext` has no `set_widget` capability — the same one `tui/events.rs:49` already blocks on — and cyrup has no RPC bridge, which is **PB-8**), and records the two shortcuts it deliberately refused: it does not splice the 32 KiB line into `control_status`'s text output, and it does not invent a `SubagentExecutor::async_status_snapshot` entry point whose only caller would be its own test. **That is the right behaviour under this document's rules and it does not make the code reachable.** It is filed so the register is complete and so the debt is visible when `set_widget` or PB-8 lands
+- **Depends on:** PB-8 (§1b) for the RPC half, and a `set_widget` capability on `cyrup-ext`'s native-extension seam for the widget half — the same seam family as UW-7 and area 06 `EXT-021`. **Neither is scheduled.** This row closes for free when either does
+- **Owning id:** none. Area 09's `## Open items` table is not this pass's to edit, so a `SUBA-` id must be assigned by that area's owner; until then this entry is the only record. Its in-source citations are **correct at v0.66.0**, the tag the sibling capacity module pins, and have drifted by v0.68.0 as noted above
 
 ---
 
@@ -1454,6 +1700,18 @@ The port of pi's `fuzzy.ts` exists and has no caller on the `--list-models <sear
 Still work. An item here is in scope for the next version bump, not out of scope.
 **66 items: 36 against `pi`, 17 against `pi-subagents`, 13 against `pi-intercom`, 0 against
 `pi-permission-system`.**
+
+> **CORRECTION 2026-09-16 — the `pi-subagents` figure is spent, and the WINDOW is wrong.** §3b was
+> re-read against cyrup `cc7818b` this pass: **fourteen of its seventeen items are CLOSED** and
+> four remain (`SUBA-054`, `SUBA-023`, `SUBA-024`, `SUBA-026`), every one of which is also carried
+> in §1b. So the honest figure is **53 items: 36 `pi`, 4 `pi-subagents`, 13 `pi-intercom`** — and
+> §3a and §3c were **not** re-read, so 36 and 13 are themselves unverified.
+>
+> **The larger problem is the window, not the count.** §3b's range is `v0.43.0..v0.47.1`. Latest,
+> re-measured this pass with `git -C tmp/pi-subagents tag --sort=-v:refname | head -1`, is
+> **`v0.68.0`**. **`v0.47.1..v0.68.0` is owned by no area file and no item in this document** —
+> area 09 is settled at v0.47.1 and `09a`'s scope stops at v0.57.0. Closing §3b's fourteen does not
+> shrink the lag; it exhausts the only window anyone has measured.
 
 **Why this fell from 78.** Nothing was closed and nothing was deleted. Area 12 ran
 `git cat-file -e v0.83.0:<path>` before trusting any inherited `upstream-drift` kind and **six items
@@ -1561,8 +1819,16 @@ recorded v0.43.0 as "latest". The src-only sweep covered **96 non-merge commits,
 +4 696/−769 and 12 net-new source files, all 12 read**; fourteen commits were diffed line by line.
 All 17 items live in area 09 with two-sided evidence:
 
-- **medium** — `SUBA-044` (the bundled `reviewer` agent still grants `bash`/`edit`/`write`; upstream made the lane read-only), `SUBA-050` (`subagents.modelScope.strict`), `SUBA-051` (async **child** runs have no default wall-clock timeout; upstream bounds them at 30 min), `SUBA-052` (YAML literal block scalars `|`/`|-` parse to the literal string `"|"`), `SUBA-053` (`~` never expanded in chain read/write paths), `SUBA-054` (`defaultReads` never reaches a single run — also UW-16), `SUBA-055` (the `guide` action and its packaged version-matched docs), ~~`SUBA-056` (durable completion replay and output archives)~~ — **CLOSED**, `SUBA-057` (`dismiss` — a recovered workflow with no live controller is stuck "running" forever)
-- **low** — `SUBA-023` (async lifecycle hardening; no signal-name attribution), `SUBA-024` (`parallel-handoff` / `agent-contract`; `task-intent` closed, `chain-validation` **struck — the file never existed at any tag**), `SUBA-026` (interactive admin UI and selector; `/subagents-stop` landed), `SUBA-058` (chain read instructions not filtered by existence), `SUBA-059` (`artifactConfig.cleanupDays` never wired to the type that already parses it), `SUBA-060` ("resume-first" guidance for failed async runs), `SUBA-065` (`unknownSubagentActionMessage` — did-you-mean recovery and its destructive-action gate), `SUBA-066` (`/subagents-guide`)
+> **RE-READ 2026-09-16 at `cc7818b`: fourteen of the seventeen are CLOSED, and the strikes below are
+> this pass's.** Each was checked against area 09's current `## Open items` table AND spot-verified in
+> code; the three that remain are `SUBA-054`, `SUBA-023` and `SUBA-024`, plus `SUBA-026`. **The
+> upstream window this section names is itself obsolete** — `v0.47.1` was latest when it was written;
+> re-measured this pass, latest is **`v0.68.0`**. `v0.47.1..v0.68.0` is owned by no area file and no
+> item here, which is a larger hole than the seventeen items this section counts.
+
+- **medium** — ~~`SUBA-044`~~ **CLOSED** (the bundled `reviewer` agent's tool grant), ~~`SUBA-050` (`subagents.modelScope.strict`)~~ — **CLOSED**, ported as `exec/model_scope.rs` and enforced over the whole fallback ladder at `exec/fallback.rs:279`, `:417`, `:437`, `:457` (landed `2bd76ac`, SCOPE batch 1), ~~`SUBA-051`~~ **CLOSED** (default wall-clock bound; `exec/mod.rs:215` `DEFAULT_FOREGROUND_TIMEOUT_MS = 30 * 60 * 1000` and `workflows/scripted/engine.rs:2178` the workflow twin), ~~`SUBA-052`~~ **CLOSED** (YAML block scalars — `discovery/frontmatter.rs:337` folds `>`/`>-` and `:507` takes the dedented literal block verbatim), ~~`SUBA-053`~~ **CLOSED** (`~` expansion — `extension/executor/paths.rs:152` `expand_tilde`, `spawn/chain_graph.rs:710` `expand_home_path`, both with live callers), **`SUBA-054` (`defaultReads` never reaches a single run — also UW-16) — STILL OPEN, and it is one of only three mediums left in area 09**, ~~`SUBA-055` (the `guide` action)~~ — **CLOSED**, `guide` is in the 42-verb list at `extension/tool/text.rs:215` and `/subagents-guide` is `registration/slash_commands.rs:121`, ~~`SUBA-056` (durable completion replay and output archives)~~ — **CLOSED**, ported as `background/completion_replay/` (5 files, 1 810 LOC, landed `2bd76ac`) and read as the THIRD rung of `collect_wait_completions`; `background/inspect_rpc/read_output.rs` is a second consumer. **Area 09's table still carries this row as an open medium — see §0's thirteenth edition**, ~~`SUBA-057` (`dismiss`)~~ — **CLOSED**, `dismiss` is in the advertised verb list
+- **low** — **`SUBA-023` (async lifecycle hardening; no signal-name attribution) — STILL OPEN**, and §1b's VL-S3/VL-S4 are its two halves: `session_lease`/`SessionLease` and a real `process_terminal` port are both still zero-hit, **`SUBA-024` (`parallel-handoff` / `agent-contract`) — STILL OPEN**, `"handoffPath"` is still zero-hit (§1b VL-S10), **`SUBA-026` (interactive admin UI and selector) — STILL OPEN**, three slash commands still absent from the now-17-variant match at `registration/slash_commands.rs:83-121` (§1b VL-S11), ~~`SUBA-058`~~ **CLOSED**, ~~`SUBA-059`~~ **CLOSED**, ~~`SUBA-060`~~ **CLOSED**, ~~`SUBA-065` (`unknownSubagentActionMessage`)~~ — **CLOSED**, and its `DESTRUCTIVE_MANAGEMENT_ACTIONS` gate (`extension/tool/text.rs:317`) had carried `schedule.delete` since before that verb dispatched — deliberately, so the stricter did-you-mean rule applied from the first call, ~~`SUBA-066` (`/subagents-guide`)~~ — **CLOSED**, `registration/slash_commands.rs:121`
+- **The four still-open rows are ALL in §1b as well** (VL-S3, VL-S4, VL-S10, VL-S11, UW-16), which means §3b now records no work §1b does not. That is a sign this section has been fully absorbed, not a sign it should be deleted: ids are retained.
 
 **Not filed by rule**: `run-fanout-budget.ts` (257 lines — a whole per-run logical fan-out cap with
 config, doctor check and status surface) landed on `main` at `17b4078`/`668c587` **after v0.47.1** and

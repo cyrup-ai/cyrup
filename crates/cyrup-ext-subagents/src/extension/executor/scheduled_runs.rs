@@ -363,3 +363,297 @@ impl SubagentExecutor {
         Arc::clone(&self.scheduled_runs)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
+
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::background::scheduled_runs::{
+        ScheduleId, ScheduleRunRecord, ScheduleRunState, ScheduledRunAction,
+        ScheduledRunActionParams,
+    };
+    use crate::extension::testsupport::{FixedSessionHost, arm_scoped_missions};
+
+    /// A scripted child that leaves a MARKER on disk and then settles cleanly.
+    ///
+    /// This is route (a) from the task brief and it is chosen over a `return 1;` script on
+    /// purpose: a workflow body that spawns nothing proves the engine evaluated some JavaScript,
+    /// while this one proves the fire reached `exec`'s real spawn path and a separate OS process
+    /// really started. The marker is written by that process and by nothing in this test, so it
+    /// cannot be faked by an in-memory record.
+    ///
+    /// The NDJSON is the child protocol's success shape (`exec/ndjson.rs`): `agent_start`, one
+    /// assistant `message_end`, `agent_settled`, exit 0 — the mirror of
+    /// `routing_tests::write_detaching_child_binary`'s failure shape.
+    fn write_marking_child_binary(dir: &Path, marker: &Path) -> PathBuf {
+        let script = dir.join("marking-child.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+printf 'the scheduled run reached a real child process\\n' > '{}'\n\
+printf '%s\\n' '{{\"type\":\"agent_start\"}}'\n\
+printf '%s\\n' '{{\"type\":\"message_end\",\"message\":{{\"role\":\"assistant\",\
+\"content\":[{{\"type\":\"text\",\"text\":\"swept\"}}]}}}}'\n\
+printf '%s\\n' '{{\"type\":\"agent_settled\"}}'\n\
+exit 0\n",
+                marker.display()
+            ),
+        )
+        .expect("write the scripted child");
+        std::fs::set_permissions(
+            &script,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .expect("make the scripted child executable");
+        script
+    }
+
+    /// Poll the schedule's own history until its run leaves `Running`.
+    async fn await_settled(manager: &ScheduledRunManager, id: &ScheduleId) -> ScheduleRunRecord {
+        for _ in 0..600 {
+            let history = manager.store().history(id).await.expect("history");
+            if let Some(run) = history
+                .iter()
+                .find(|run| run.state != ScheduleRunState::Running)
+            {
+                return run.clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("a fired run never settled");
+    }
+
+    /// Every [`crate::background::ResultFile`] under this cwd's results dir.
+    async fn published_results(
+        executor: &SubagentExecutor,
+        cwd: &Path,
+    ) -> Vec<crate::background::ResultFile> {
+        let roots = executor.config_snapshot().await.roots.clone();
+        let dir = crate::extension::executor::paths::default_results_dir_in(&roots, cwd);
+        let mut found = Vec::new();
+        let mut stack = vec![dir];
+        while let Some(next) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&next) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if let Ok(bytes) = std::fs::read(&path)
+                    && let Ok(result) =
+                        serde_json::from_slice::<crate::background::ResultFile>(&bytes)
+                {
+                    found.push(result);
+                }
+            }
+        }
+        found
+    }
+
+    /// **THE LAUNCHER'S OWN REACHABILITY PROOF** — a schedule an agent creates really becomes a
+    /// running process.
+    ///
+    /// `background/scheduled_runs/`'s own rows all drive that module's `StubLauncher` and
+    /// therefore prove only that the trigger DECIDES to fire; [`ExecutorScheduleLauncher`] itself
+    /// had no row in its own file. This one drives it through the production entry points and
+    /// nothing else:
+    ///
+    /// 1. [`SubagentExecutor::install_scheduled_runs`] builds the manager, which is the ONLY
+    ///    construction site of [`ExecutorScheduleLauncher`] (no launcher is injected here);
+    /// 2. [`ScheduledRunManager::handle_action`] with the real `schedule.create` /
+    ///    `schedule.run` verbs;
+    /// 3. the fire runs the schedule's `workflowScript` in the real engine, which spawns a real
+    ///    child through `exec`'s real spawn path.
+    ///
+    /// The evidence is all on the FILESYSTEM and all written by production code:
+    ///
+    /// * a marker file written by the CHILD PROCESS itself — nothing in this test touches it, so
+    ///   a launch that returned `Ok` without spawning cannot produce it;
+    /// * the fired run's own `status.json`, in a terminal state, `mode: workflow`, attributed to
+    ///   the live session;
+    /// * the `ResultFile` [`publish_scheduled_result`] indexed, carrying this schedule's
+    ///   `scheduleOrigin` — the write that IS the emit for a run with no caller to return to.
+    ///
+    /// A `multi_thread` runtime because the launch's completion future is `tokio::spawn`ed and
+    /// this test blocks on its on-disk effects.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_scheduled_run_really_spawns_a_process_through_the_production_launcher() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path();
+        let marker = cwd.join("the-child-ran");
+        let script = write_marking_child_binary(cwd, &marker);
+
+        let executor = Arc::new(SubagentExecutor::new());
+        arm_scoped_missions(&executor, cwd).await;
+        // A live session id: a scheduled result is session-partitioned and an unattributable one
+        // is refused by `write_async_result_file`.
+        executor.set_host_services(Arc::new(FixedSessionHost("session-sched")));
+        executor.capture_parent_session_anchor();
+        {
+            let mut cfg = executor.config_cell().lock().await;
+            cfg.spawn_command = Some(crate::spawn::SpawnCommand {
+                binary: script,
+                base_args: Vec::new(),
+            });
+        }
+
+        // PRODUCTION ENTRY POINT 1 — this is what builds `ExecutorScheduleLauncher`.
+        let manager = executor
+            .install_scheduled_runs(cwd)
+            .await
+            .expect("scheduled runs are enabled by default");
+
+        assert!(
+            !marker.exists(),
+            "precondition: nothing has spawned before the schedule fires"
+        );
+
+        // PRODUCTION ENTRY POINT 2 — the real `schedule.create` verb.
+        manager
+            .handle_action(
+                ScheduledRunAction::Create,
+                &ScheduledRunActionParams {
+                    id: Some("nightly".to_string()),
+                    at: Some("+1h".to_string()),
+                    workflow_script: Some(
+                        "await runs.run(\"sweep\", { agent: \"worker\", task: \"sweep the tree\", \
+                         model: \"sonnet\" });\nreturn \"swept\";"
+                            .to_string(),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("schedule.create");
+
+        // PRODUCTION ENTRY POINT 3 — the real `schedule.run` verb, which reaches
+        // `trigger::launch` and thence the injected-at-install production launcher.
+        let fired = manager
+            .handle_action(
+                ScheduledRunAction::Run,
+                &ScheduledRunActionParams {
+                    id: Some("nightly".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("schedule.run");
+        assert!(
+            !fired.is_error,
+            "the fire must not report a failed launch: {}",
+            fired.text
+        );
+
+        let id = ScheduleId::parse("nightly").expect("id");
+        let settled = await_settled(&manager, &id).await;
+        assert_eq!(
+            settled.state,
+            ScheduleRunState::Completed,
+            "the fired run must really have completed: {settled:?}"
+        );
+
+        // EVIDENCE 1 — a separate OS process ran, and wrote this.
+        let written = std::fs::read_to_string(&marker).unwrap_or_else(|error| {
+            panic!(
+                "the scheduled run never spawned a child process — the marker at {} is absent \
+                 ({error}). A launcher that returns Ok without spawning passes every other \
+                 scheduled-run row in this crate and fails exactly here.",
+                marker.display()
+            )
+        });
+        assert_eq!(
+            written.trim(),
+            "the scheduled run reached a real child process"
+        );
+
+        // EVIDENCE 2 — the run's own status.json, written by the runner, not by this test.
+        let async_dir = settled
+            .async_dir
+            .clone()
+            .expect("an attached async run names its directory");
+        // The SAME roots arithmetic production used, so this reads the tree the fire really
+        // wrote to rather than a path the test invented.
+        let cfg = executor.config_snapshot().await;
+        let async_root = crate::extension::executor::paths::default_async_root_in(&cfg.roots, cwd);
+        assert!(
+            async_dir.starts_with(&async_root),
+            "the fired run must live under THIS project's async root ({}), not somewhere the \
+             schedule invented: {}",
+            async_root.display(),
+            async_dir.display()
+        );
+        let status = crate::background::control::read_status_file(&async_dir.join("status.json"))
+            .await
+            .expect("status read")
+            .expect("a fired run really wrote a status.json");
+        assert_eq!(status.mode, crate::background::RunMode::Workflow);
+        assert!(
+            status.state.is_terminal(),
+            "the fired run's status must be terminal on disk, not left Running: {:?}",
+            status.state
+        );
+        assert_eq!(
+            status
+                .session_id
+                .as_ref()
+                .map(crate::identity::SessionId::as_str),
+            Some("session-sched"),
+            "the run is attributed to the session that was live when it fired"
+        );
+        assert_eq!(
+            settled.async_id.as_deref(),
+            Some(status.run_id.as_str()),
+            "the schedule's recorded async id and the run's own id must agree — `schedule.delete`'s \
+             active-run guard cross-checks exactly this pair"
+        );
+
+        // EVIDENCE 3 — `publish_scheduled_result`'s write, which IS the emit for a run nobody is
+        // waiting on. Without it the run happened where no session could ever see it.
+        let results = published_results(&executor, cwd).await;
+        let published = results
+            .iter()
+            .find(|result| {
+                result
+                    .schedule_origin
+                    .as_ref()
+                    .is_some_and(|origin| origin.id == "nightly")
+            })
+            .expect("the fired run must publish a result carrying its scheduleOrigin");
+        assert!(published.success, "{published:?}");
+        assert_eq!(published.state, crate::background::RunState::Complete);
+        assert_eq!(published.mode, crate::background::RunMode::Workflow);
+        assert_eq!(
+            published
+                .session_id
+                .as_ref()
+                .map(crate::identity::SessionId::as_str),
+            Some("session-sched"),
+            "an unattributable scheduled result is invisible to every reader"
+        );
+        assert_eq!(
+            published.run_id.as_str(),
+            status.run_id.as_str(),
+            "the published result names the run that actually ran"
+        );
+
+        // EVIDENCE 4 — the budget the schedule path is documented to charge really moved.
+        let cap = cfg.max_subagent_spawns_per_session;
+        assert_eq!(
+            executor.spawn_budget_snapshot(cap).used,
+            1,
+            "the fired run is billed to this session exactly once"
+        );
+
+        manager.dispose();
+    }
+}
