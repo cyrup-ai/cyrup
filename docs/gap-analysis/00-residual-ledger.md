@@ -5,6 +5,371 @@ next work item**.
 
 ---
 
+# NAVIGATION — 2026-09-16 (twelfth edition, RANKING pass) — the area tables are now reconciled too; the census is **76 open**, and the ranked set below is what a builder should read first
+
+> **Read this block first; it supersedes the eleventh edition's counts and nothing else.** The
+> eleventh edition (immediately below) reconciled the *navigation* layer and published **77 open**
+> while stating, correctly, that the figure was a **known overcount of two** because
+> `09-cyrup-ext-subagents.md` had not yet struck `SUBA-016` and `SUBA-056`. **It has now.** Four
+> verification passes have since corrected the area tables. This block does not re-verify their
+> work; it ranks what they left.
+>
+> **THE COUNT AT HEAD, quoted verbatim from `python3 scripts/count_open_items.py`, not hand-tallied:**
+>
+> ```
+> area   open  crit  high   med   low  trackers  closed
+> 01        4     0     0     1     3         0      57
+> 02        3     0     0     0     3         1      28
+> 03        3     0     0     0     3         1      32
+> 04        0     0     0     0     0         0      34
+> 05       12     0     0     4     8         0      55
+> 06       10     0     0     1     9         0      63
+> 07       21     0     0     0    21         0      86
+> 08        4     0     0     0     4         0      72
+> 09       10     0     0     1     9         0      43
+> 10        1     0     0     0     1         1      22
+> 11        3     0     0     0     3         0      51
+> 12        3     0     0     1     2         3      32
+> 14        1     0     0     0     1         0       6
+> 09a       1     0     0     1     0         0      23
+> TOTAL    76     0     0     9    67         6     604
+> ```
+>
+> **The lineage of the prose figures, so no reader re-derives it by hand.** Tenth edition: **90 → 84
+> open** (batch 4, `scripts/count_open_items.py` run twice). Eleventh edition: **84 → 77 open / 599
+> closed**, published alongside a 76 first-run reading and a **behavioural 75**. This edition:
+> **77 → 76 open / 599 → 604 closed, 12 → 9 medium.** The arithmetic reconciles exactly and is worth
+> stating because the two numbers disagree in opposite directions: area 09 struck `SUBA-016` and
+> `SUBA-056` (−2) and filed `SUBA-097` + `SUBA-098` (+2), so it stayed at 10; area 12 closed
+> `DRIFT-015` and `DRIFT-019` (−2); area 08 filed `SEAM-119` (+1); area 07 filed `TUI-N14` already
+> closed (+1 closed, +0 open); `09a` filed `SUBA-096` (+1 open, already counted in the eleventh
+> edition's 77). **The eleventh edition's behavioural 75 is now superseded by a mechanical 76, and
+> the two readings have converged** — the map and the territory agree for the first time since the
+> SCOPE sequence merged.
+>
+> **ZERO open critical and ZERO open high, for the seventh consecutive edition.** Nine mediums and
+> 67 lows remain. **The severity column is therefore no longer a scheduling signal in this
+> directory**, and this block exists to replace it with one.
+>
+> ---
+>
+> ## What this census does NOT count, stated first because it dwarfs what it does
+>
+> * **`PARITY-GAPS.md` §1b and §2 carry twenty-one open entries with no area-file id** — `PB-8`,
+>   `PB-9`, `PB-12`, `PB-14`, `VL-S3`…`VL-S6`, `VL-S8`, `VL-S10`…`VL-S13`, `UW-3`, `UW-4`, `UW-5`,
+>   `UW-7`, `UW-10`, `UW-16`, `UW-18`, `UW-21`. **`count_open_items.py` cannot see any of them**, and
+>   **the highest-value delegation work in this directory is in that set, not in the 76.** Ranking
+>   only the 76 would have produced a worklist of mostly cosmetic lows.
+> * **Area 13 (`cyrup-mcp`) is outside the census entirely and carries ~198 open units — 8 critical
+>   and 73 high** (`13-cyrup-mcp-STATUS.md`, 98 missing + 100 partial of 437). Its pins are stale
+>   (`v2.26.1`/`v2.32.1` against a current `v2.33.0`) and `v2.32.1..v2.33.0` — 123 files,
+>   +9 455 / −1 352 — is measured by nobody. **If "what to build next" is asked about the PRODUCT
+>   rather than about this census, area 13 is the answer and it needs a re-census before it can be
+>   scheduled.** Area 15 (`cyrup-acp`) is similarly uncounted, with three `crates/cyrup-acp` commits
+>   recorded nowhere but `git log`.
+>
+> ---
+>
+> ## THE RANKED SET — by what a user or an agent GAINS, not by severity
+>
+> Re-derived this pass by opening the code, against the stated goal (delegation and inter-agent
+> coordination). Every entry names the capability that does not exist today.
+>
+> | # | row | gain | size | blocked? |
+> |---:|---|---|---|---|
+> | 1 | **`PB-8`** (§1b) | an editor, host or sibling extension can **drive subagents programmatically** — `ping`/`status`/`spawn`/`steer`/`interrupt`/`stop`/`resume` over `subagents:rpc:v1:request`. Today nothing outside the tool surface can delegate at all. `git grep subagents:rpc crates/` = **0** at `cc7818b` | L | no |
+> | 2 | **`UW-5` + `UW-4`** (§2) | a delegated child can **use an `ask`-tier tool at all** (today every `ask` denies with *"Watchdog permission arbiter returned no decision."*), and the watchdog can **report a blocked child** instead of reporting clean. Both are one bound agent impl: `NoDecisionPermissionAgent` (`prompt_runtime.rs:2407`, `:2858`) and `NoTurnReviewAgent` (`:2438`, `watchdog/register_main.rs:168`) | M | no |
+> | 3 | **`UW-10`** (§2, **no area-11 id — file one**) | `/intercom <target>` **opens a live compose box and session picker** instead of printing a picture of one and asking the user to retype the command. **Both blockers this row named are discharged** (`register_message_renderer` = `cyrup-ext/src/native.rs:270`; `VL-S15`/`register_shortcut` closed) and `HostServices::open_overlay` is production-consumed by three other crates — intercom simply never calls it. The `handle_input` state machines are ported and unit-tested | S–M | no |
+> | 4 | **`VL-S13`** (§1b) | an agent can be **refined from its own run evidence and rolled back**. cyrup applies an overlay at spawn (`exec/mod.rs:1565`) and can never generate or revert one. `refine`/`refine.show`/`refine.rollback` are 3 of the 17 missing verbs | L | no |
+> | 5 | **`VL-S10` = `SUBA-024`** (§1b / 09) | after a parallel run with `worktree: true`, a **handoff manifest and a cleanup verb** instead of orphan branches to find by hand. Half-built already: `has_unresolved_run_handoff` (`background/async_retention/scan.rs:423-440`) is a complete READER whose own doc says no cyrup writer produces the file. Also gives `VL-S7`'s authority gate the two arms (`worktree.discard`/`worktree.cleanup`) it has nothing to attach to | L | no |
+> | 6 | **`VL-S8`** (§1b) | a **pi-authored agent's prompt that calls `subagent_wait` stops getting "unknown tool"**. `extension/wait_tool.rs:16` is `"wait"`. One const plus a compat alias — **the best value-per-line row in the directory** | XS | no |
+> | 7 | **`SUBA-096`** (09a) | an operator's **`acceptanceRole` override actually sets the acceptance gate's strictness** instead of being silently dropped so `infer_level` decides. Three fields (`acceptanceRole`, `outputMode`, `fast`) missing from `AgentOverrideConfig`, which has no `deny_unknown_fields` | S | no |
+> | 8 | **`PB-14`** (§1b) | creating or running an agent with a **mistyped skill name says so** instead of reporting success on both surfaces | S | no |
+> | 9 | **`VL-S5`** (§1b) | a **revived async run keeps its per-call `model`/`tools`/`toolBudget`**, and the retention scan's resumable-contract check can fire at all. The READ half shipped (`async_retention/scan.rs:56`); `:381` carries `[CYRUP-DELTA] no cyrup writer produces recovery-descriptor.json today` — **strictly worse than before it half-landed** | S | no |
+> | 10 | **`VL-S12`** (§1b) | the palette **stops advertising four commands upstream deleted at v0.41.0** (`slash_commands.rs:83`/`:84`/`:85`/`:101`). **Its blocker is discharged** — `VL-S2` landed — so this is now a clean deletion | XS | no |
+> | 11 | **`PB-12`** (§1b, partial) | the FleetView pane for a **RUNNING** child has something to read. `transcript_path` is a real field now (`artifacts.rs:75`) and **nothing writes the file live** | M | no |
+> | 12 | **`VL-S3` + `VL-S4`** (§1b) | many-agent correctness: no two runners owning one session file, and a **definite terminal cause** instead of a reconciled "stale" guess. `VL-S4` is now LOAD-BEARING — `active_async_capacity` substituted runner-pid liveness for the missing `processTerminal` proof | M each | no |
+> | 13 | **`PB-9`** (§1b) | `clarify: true` **shows the preview/edit UI its own tool description promises**. The seam is live (`open_overlay`) | L | no |
+> | 14 | **`VL-S11` = `SUBA-026`**, **`VL-S6`** (§1b) | the `/subagents` admin surface and the herdr inspector's advertised `H` key. Real delight, large, and behind everything above it | L each | no |
+>
+> **Rows whose `medium` label overstates what they deliver**, said plainly so nobody schedules by the
+> column: `CFG-020` (no `ModelRuntime` type — a refactor absorption with no user-visible gain),
+> `CFG-068` / `CFG-074` (documenting invented env vars — real ledger hygiene, zero new capability),
+> `PROV-071` (catalog freeze — DATA-blocked, see below). **And the reverse**: `VL-S8` and `VL-S12`
+> carry no severity in this census at all and are each an afternoon.
+>
+> **Area 07's twenty-one rows are all `low` and none of them is delegation work.** That file's own
+> shape summary groups them into five clusters and names the one structural blocker four of them
+> share (`escape_reassembly.rs:44-50`, no raw-byte pre-parse seam) — **rank that cluster as one item
+> or it produces four blocked passes.**
+>
+> ---
+>
+> ## BLOCKED — and on what, so nobody schedules one of these as if it were effort
+>
+> * **`SUBA-054`** (area 09's only medium) — on a **decision**, not effort: which of upstream's two
+>   cwds a runner step's `reads` resolve against. Setting the field blindly double-emits the
+>   instruction on every chain step.
+> * **`UW-21`** — `background/async_status_snapshot/` (1 928 LOC, landed unwired) on **`PB-8` or a
+>   `set_widget` capability**. Closes for free when either lands.
+> * **`UW-7`** — on a **new `on_terminal_input` host seam**; `VL-S15`'s `register_shortcut` landed and
+>   did not help, because a registered chord is not a keystroke stream.
+> * **`DRIFT-009` / `PROV-071`** — a **DATA block, not an effort one**: the four provider modules are
+>   re-exports of gitignored JSON at every tag, and `models.dev` is egress-denied here (403). No
+>   toolchain install lifts it.
+> * **`children.list`** — on **retention**; `extension/tool/text.rs:215` records that the listing
+>   would always be empty until the async/detached workflow shape lands.
+> * **`VL-S7`'s `worktree.discard`/`destructiveCleanup` arms** — on `VL-S10` landing those verbs.
+> * **`SESS-S05`** — on **one struct field**: `SessionDagNode` (`cyrup-session-svc/src/session/types.rs:84-103`)
+>   carries only the entry timestamp. Producer and renderer are both done and pinned.
+> * **`PERM-032`** — on a **decisive experiment** (compare the two request bodies); every cyrup-side
+>   hypothesis is refuted, so it has no assignable kind and `tracker` is its correct disposition.
+> * **Areas 13 and 15** — on a **re-census**; their pins are stale and their newest windows are
+>   measured by nobody.
+>
+> ---
+>
+> ## Is cyrup-subagents done? — **the honest answer is "nearly, and the remainder is not in area 09"**
+>
+> Measured rather than asserted, at `cc7818b`: `crates/cyrup-ext-subagents` is **387 `.rs` files /
+> 314 709 lines** against upstream's 286 `.ts` files @`v0.68.0`. Areas 09 + 09a carry **11 open rows,
+> 2 medium, 66 closed** — and **9 of the 11 are `low`**, several of them cosmetic (`SUBA-098` is a
+> stray CJK token in a doc comment). **Area 09's own table is effectively worked out.**
+>
+> **What is genuinely left is verb-level and it is measurable in one command.** Re-derived
+> independently this pass, not carried: upstream `SUBAGENT_ACTIONS` @`v0.68.0`
+> (`src/shared/types.ts:2801`) is **57 verbs**; cyrup's list (`extension/tool/text.rs:215`) is
+> **42**; the difference is **17 missing** — `children.list`, `worktree.{discard,cleanup}`,
+> `lane.{status,recordMerge,recordSupersession}`, `refine{,.show,.rollback}`,
+> `inspector.{open,command,status,close}`, `project.{open,status,close}`, `debug.run` — plus **2
+> cyrup-only** (`append-step`, `inspect`). **That 17, plus `PB-8`, plus `UW-4`/`UW-5`, is the whole
+> remaining subagents story**, and none of it has an area-09 id today.
+>
+> **So: do NOT schedule another general area-09 reconciliation pass.** Schedule the ranked rows above
+> by name. **Intercom (area 11) is the opposite case** — 3 open lows and 51 closed, *but* `UW-10` is a
+> real, unblocked, user-facing gap that area 11's open set does not carry an id for. **File it there
+> first; it is the cheapest genuinely-delightful row on this list.**
+>
+> ---
+>
+> ## One structural warning this edition inherits and re-states
+>
+> **Five subsystems have now shipped tested with no production caller** (`UW-1`, `UW-8`, `UW-15`,
+> `UW-4`/`UW-5`, `UW-21`), and `run_fanout_budget` is a sixth that has no `UW-` id. Twice the
+> shipping batch also wrote the test that proves the machinery works in isolation. **"Present and
+> tested" is not closure in this directory; "present AND reachable from production AND pinned by a
+> test" is** — and the ranked set above is weighted accordingly: rows 2, 3 and 11 are each a matter
+> of *connecting* code that already exists and is already tested.
+
+---
+
+# RECONCILED 2026-09-16 (eleventh edition) — the SCOPE sequence (#137/#139/#140, +45 072 lines under `crates/`) had landed and the ledger did not know; **the navigation layer is now reconciled and the AREA tables are not, so the published open count is a KNOWN OVERCOUNT by at least two rows**
+
+> **Read this block before planning, and read its one uncomfortable sentence first: this edition
+> publishes a number it can prove is wrong in a stated direction.** cyrup **code** HEAD
+> **`cc7818b`** (`Merge pull request #140 from cyrup-ai/claude/subagents-scope-3`), branch
+> `claude/subagents-next` cut from `main` at `cc7818b`. This is a **ledger pass over three
+> already-merged PRs**, not a batch: no code was written, and `crates/` was read only.
+>
+> **WHAT LANDED THAT THIS DIRECTORY HAD NOT SEEN.** Three PRs merged after the twelfth-edition
+> census was written:
+>
+> | PR | merge | feature commit | subject |
+> |---|---|---|---|
+> | #137 | `21d1acc` | `2bd76ac` | SCOPE batch 1 — session index, durable replay, model exclusions, steer handle |
+> | #139 | `b2fdc7e` | `e61ff44` | SCOPE batch 2 — wait subscriptions, inspect RPC, detached-child reconciliation |
+> | #140 | `cc7818b` | `7e41cf9` | finish the SCOPE sequence — capacity, status, retention, scheduled runs |
+>
+> Measured, not asserted (`git show --shortstat <sha> -- crates/`): **7 530 + 9 769 + 27 773 =
+> +45 072 insertions / −1 091 deletions** across 181 file-touches, 136 of them distinct files in
+> `crates/cyrup-ext-subagents`. `git diff --shortstat 0d653d2 cc7818b` over the whole tree is
+> **178 files, +55 468 / −1 769**, the remainder being `.flux/todo` specs and PR #138's TUI work.
+> **The "~31k lines" figure this pass was briefed with is an undercount**; the real crates-only
+> figure is 45k, and it is the largest single movement this directory has ever had to absorb in one
+> reconciliation.
+>
+> **THE COUNTS, and why there are two readings.** `python3 scripts/count_open_items.py` at
+> `cc7818b`, run by this pass:
+>
+> * **first run, at the start of the pass: 76 open** (0 critical, 0 high, 11 medium, 65 low), **599
+>   closed**, 6 trackers.
+> * **final run, at the end of the pass: 77 open** (0 critical, 0 high, **12** medium, 65 low),
+>   **599 closed**, 6 trackers. Area `09a` moved `0 → 1` open between the two runs.
+>
+> **Both are published, because the difference is not an error — it is evidence that this directory
+> was being edited by another pass while this one ran**, and a single quoted number would have
+> concealed that. The delta from the tenth edition's **84 open / 590 closed** is therefore
+> `84 → 77` open and `590 → 599` closed: **nine rows closed and two filed** since batch 4, by passes
+> other than this one. §0 of `PARITY-GAPS.md` carries the per-area table (thirteenth edition);
+> it is not duplicated here.
+>
+> ---
+>
+> ## The finding this edition exists to publish: the count is an OVERCOUNT, and by how much is knowable
+>
+> **A ledger that reports shipped work as open silently misdirects the next planning pass.** Two
+> rows were found by hand before this pass started and **both reproduce**:
+>
+> | row | what the table says | what the code says at `cc7818b` |
+> |---|---|---|
+> | `SUBA-016` | open, `medium`, `not-ported`, XL, BLOCKED — *"Zero hits for `scheduled_runs`; nothing beginning `schedule.` in the 27-verb enum"* | `background/scheduled_runs/` is 8 files / **6 669 LOC**; **all nine** verbs are advertised (`extension/tool/text.rs:298-306`) and dispatched (`extension/tool/routing.rs:1243-1250`); `cargo nextest run -p cyrup-ext-subagents -E 'test(schedule)'` → **80 run, 80 passed**, including `every_scheduled_run_action_dispatches`. Landed `7e41cf9` |
+> | `SUBA-056` | open, `medium` | `background/completion_replay/` is 5 files / **1 810 LOC**, read as the third rung of `collect_wait_completions` and again by `background/inspect_rpc/read_output.rs`. Landed `2bd76ac`. `PARITY-GAPS.md` was updated by the SCOPE_4 work; **area 09's own table was not** |
+>
+> **Neither is corrected here, and that is deliberate, not an oversight.** `09-cyrup-ext-subagents.md`
+> is outside this pass's write scope. The consequence is stated rather than hidden: **the published
+> `77 open / 12 medium` is an overcount of at least two rows, both of them mediums in area 09** — the
+> true figure, once area 09 strikes them, is **75 open / 10 medium**. **Do not schedule `SUBA-016` or
+> `SUBA-056`.** Anyone re-deriving this delta should use 77/599 as the mechanical reading and 75 as
+> the behavioural one.
+>
+> **This is the same failure the ninth and tenth editions kept finding in a different place.** Batch 3
+> filed rows against its own code and merged. Batch 4 declined to file and merged with four unfixed
+> findings. The SCOPE sequence did neither — it shipped 45k lines of genuinely working, genuinely
+> tested, genuinely wired code — **and then left the map describing the territory it had just
+> changed.** Closing work without closing its row costs the next planner exactly as much as not
+> doing the work.
+>
+> ---
+>
+> ## What this pass verified, row by row, and what it refused to claim
+>
+> Every row below was settled by opening the code, not by reading a commit subject. The closure test
+> applied throughout is this directory's own: **present AND reachable from production AND pinned by a
+> test.** "The module exists" closed nothing.
+>
+> **`PARITY-GAPS.md` §1b — all 23 entries re-greped. Ten closed, one partially closed, twelve
+> refreshed-and-still-open.**
+>
+> * **Closed:** `PB-10` (`turnBudget`), **`PB-11` (`schedule.*`, the headline)**, `PB-13` (chain-run
+>   artifact root), `PB-31` (`requireReadTool`), `VL-S1` (capability ceiling), `VL-S2`
+>   (`workflowScript` runtime), `VL-S7` (authority policy), `VL-S9` (`usageBudget`), `VL-S14`
+>   (`runner: external-cli`), `VL-S15` (`register_shortcut`).
+> * **Partially closed, and the halves are named rather than rounded:** `PB-12` — `ArtifactPaths`
+>   now carries a fifth field, `transcript_path` (`artifacts.rs:75`, minted `:310`, consumed
+>   `exec/mod.rs:580`), so the row's "four fields" claim is false; **but nothing writes the file
+>   live** — `spawn/mod.rs:1144` says there is no `ChildTranscriptWriter` port, two status writers
+>   publish `transcript_path: None`, and `tui/fleet.rs:1148` carries the note "When a transcript
+>   writer lands". The FleetView pane for a RUNNING child still has nothing to read.
+> * **Still open, evidence refreshed to current addresses:** `PB-8`, `PB-9`, `PB-14`, `VL-S3`,
+>   `VL-S4`, `VL-S5`, `VL-S6`, `VL-S8`, `VL-S10`, `VL-S11`, `VL-S12`, `VL-S13`.
+>
+> **`PARITY-GAPS.md` §2 (the unwired register) — all twenty entries re-greped. It was the stalest
+> section in the file.** `UW-1`, `UW-6`, `UW-8`, `UW-9`, `UW-11`, `UW-15`, `UW-17`, `UW-19` and
+> `UW-20` closed; `UW-16` and `UW-18` partially closed with their remaining halves named
+> (`SUBA-054`; `CFG-015`); `UW-3`, `UW-4`, `UW-5`, `UW-7` and `UW-10` stay open with corrected line
+> numbers. **Three cross-references in that section were pointing at closed rows that never touched
+> the problem** and are corrected in place — `UW-7`'s "same seam family as VL-S15" (a registered
+> chord is not a keystroke stream), `UW-10`'s "fix the comment with ICOM-024/ICOM-028" (both closed,
+> both about renderers), and `UW-18`'s use of `doubleEscapeAction` as its example (now consumed at
+> `cyrup-tui/src/app/input.rs:336-342`).
+>
+> **Three closures were taken on the strength of the owning area file rather than an independent
+> grep, and are marked as such in place** — `UW-17`, `UW-19`, `UW-20`. That is weaker evidence than
+> the rest of this pass and is labelled, not laundered.
+>
+> ---
+>
+> ## One row FILED by this pass, against the SCOPE sequence's own code
+>
+> **`UW-21` — `background/async_status_snapshot/` (4 files, 1 928 LOC, landed `7e41cf9`) has no
+> production caller.** Workspace-wide, the only references outside the module are `background/mod.rs:48`
+> and one test, `extension/tool/routing_tests.rs:2040`, which calls `build_async_status_snapshot` at
+> `:2088`. The `PI_SUBAGENT_ASYNC_JSON:` widget line pi emits while async runs are in flight is never
+> produced by the shipped binary.
+>
+> **This is the fifth time this programme has shipped tested machinery with no production caller**,
+> and the second time the shipping batch also wrote the test that proves the machinery works in
+> isolation — `routing_tests.rs:2019` is headed "THE REACHABILITY PROOF" and proves a projection hop,
+> not reachability from a user.
+>
+> **It is filed `low`, and the rating is argued.** Unlike its four precedents this module **declares
+> its own unwiredness in-tree and correctly**: `mod.rs:27-49` is headed *"⚠ … has NO production
+> caller in cyrup, and that is the decision, not an oversight"*, names both blockers (`cyrup-ext` has
+> no `set_widget` capability; cyrup has no RPC bridge — that is `PB-8`), and records the two
+> shortcuts it refused to take: it did not splice a 32 KiB JSON line into `control_status`'s text
+> output, and it did not invent an entry point whose only caller would be its own test. **Under this
+> directory's rules that is the right behaviour, and it does not make the code reachable.** The row
+> exists so the debt is visible when either blocker lands. It has **no area-09 id**, because that
+> file is outside this pass's write scope.
+>
+> ---
+>
+> ## Citation rot found this pass, recorded once rather than per row
+>
+> 1. **`crates/cyrup-ext-subagents/src/extension.rs` NO LONGER EXISTS.** It was split into
+>    `extension/{mod,wait_tool,models,testsupport}.rs` plus `extension/{executor,host,tool}/`.
+>    **Every `extension.rs:<line>` citation anywhere in `PARITY-GAPS.md` is dead, not merely
+>    offset** — `VL-S8` had already noticed this for one line; it is true for all of them. Rows this
+>    pass touched carry current addresses; the rest do not, and the ⚠ block at the top of that file
+>    now states the general repair. **This is the fifth consecutive edition to report citation rot
+>    and the first to find a whole cited FILE gone.**
+> 2. **The "27-verb enum" is wrong twice.** The action list is `extension/tool/text.rs:215` and
+>    carries **42** verbs. Re-derived against `pi-subagents` v0.68.0 `shared/types.ts:2801` (**57**
+>    verbs), cyrup is missing **seventeen** — `children.list`, `worktree.{discard,cleanup}`,
+>    `lane.{status,recordMerge,recordSupersession}`, `refine{,.show,.rollback}`,
+>    `inspector.{open,command,status,close}`, `project.{open,status,close}`, `debug.run` — and
+>    carries two of its own (`append-step`, `inspect`). **Seventeen is the live verb-level gap; 27
+>    was never a gap figure at all.**
+> 3. **The upstream pin moved again, and this pass re-measured rather than inherited it.**
+>    `git -C tmp/pi-subagents tag --sort=-v:refname | head -1` returns **`v0.68.0`**, superseding the
+>    `v0.67.0` recorded 2026-09-14. Every upstream read in this pass used
+>    `git -C tmp/pi-subagents show v0.68.0:<path>`. **`PARITY-GAPS.md` §3b's whole window
+>    (`v0.43.0..v0.47.1`) is obsolete**: fourteen of its seventeen items are closed, and the real
+>    blind window `v0.47.1..v0.68.0` is owned by no area file and no item.
+>
+> ---
+>
+> ## What this edition explicitly did NOT do
+>
+> * **It did not touch any area file.** `00-residual-ledger.md` and `PARITY-GAPS.md` are its whole
+>   write scope. `SUBA-016` and `SUBA-056` therefore stay open in `09-cyrup-ext-subagents.md`, and
+>   `UW-21` has no `SUBA-` id. All three are work for area 09's owner, named here so they cannot be
+>   lost.
+> * **It did not re-walk `PARITY-GAPS.md` §1a, §1c, §1d, §1e, §3a, §3c, §4, §5 or §6.** Those keep
+>   whatever staleness they already carried, and §1's standing "per-item bodies not re-walked" caveat
+>   still applies to them.
+> * **It did not run the full workspace suite.** The only test evidence it generated first-hand is
+>   `cargo nextest run -p cyrup-ext-subagents -E 'test(schedule)'` → 80 run, 80 passed, at `cc7818b`.
+>   The 10 124-passing workspace figure quoted above is `e61ff44`'s own commit message and was **not**
+>   re-derived. **Do not quote it as this pass's measurement.**
+> * **It did not re-check the four unfixed findings the tenth edition left open** against
+>   `run.rs:333-336`, `run_fanout_budget.rs:888-902` and the dead `terminated` state. They are not
+>   discharged by anything here; `external_cli/run.rs` has since been heavily edited by the SCOPE
+>   sequence, so their line numbers are suspect and they need re-reading, not re-quoting.
+>
+> ---
+>
+> ## Recommended next batch
+>
+> Ranked by what a wrong entry costs, not by effort.
+>
+> 1. **Strike `SUBA-016` and `SUBA-056` in `09-cyrup-ext-subagents.md`, and file `UW-21` there as a
+>    `SUBA-` row.** This is the cheapest work on the list and the only work that is a *map* defect
+>    rather than a *code* defect. Until it is done every census this directory publishes is knowingly
+>    wrong. Cite `7e41cf9` and `2bd76ac`.
+> 2. **`PB-8` — the subagent RPC bridge.** It is now load-bearing for two other rows rather than one:
+>    `UW-21`'s RPC half is blocked on it, and `inspect_rpc` (which ports a *different* upstream file)
+>    has demonstrated that the artifact-read side is already solved. Upstream is
+>    `extension/rpc.ts:817` @v0.68.0.
+> 3. **`VL-S12`, as a deletion.** Four slash commands upstream deleted at v0.41.0 are still
+>    registered (`registration/slash_commands.rs:83`, `:84`, `:85`, `:101`). **The blocker this row
+>    carried is discharged** — it said "do not delete them before VL-S2 lands or the capability
+>    disappears", and `VL-S2` landed. This is now a clean deletion and the cheapest reverse-lag row
+>    in the directory.
+> 4. **`UW-5` ahead of its `medium` rating.** `UW-6`'s closure means a real permission policy now
+>    reaches the child, so an `ask`-tier rule can actually be hit in production — and the arbiter that
+>    would decide it is still `NoDecisionPermissionAgent` (`watchdog/permission_arbiter.rs:600`, bound
+>    at `prompt_runtime.rs:2407`), so every `ask` denies. **Wiring an input to an inert decider raised
+>    this row's blast radius without raising its severity.**
+> 5. **`VL-S4`, for the same reason.** `active_async_capacity` had to substitute runner-pid liveness
+>    for upstream's `processTerminal` proof (`active_async_capacity/mod.rs` §D3) because the port does
+>    not exist. A second subsystem now runs on a workaround for this row.
+> 6. **The `v0.47.1..v0.68.0` window.** It is owned by nothing. §3b is spent — fourteen of seventeen
+>    closed — and the range that replaced it has never been opened.
+> 7. **Area 13 is still outside the census**, unchanged by anything here.
+
+---
+
 # RECONCILED 2026-09-05 (tenth edition) — batch 4: six rows closed, three narrowed, **ZERO rows filed — and zero of them against its own code**, the number the ninth edition set as the target; but the batch merged with four unfixed findings against that same code
 
 > **Read this block before planning, and read the three numbers in the heading together — each one

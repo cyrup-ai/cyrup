@@ -1,7 +1,7 @@
 ---
 stage: qa
-status: needs-rework
-updated: 2026-09-15 18:00
+status: completed
+updated: 2026-09-16 09:00
 ---
 
 # SCOPE_14 — async retention, part B: sweep, report, wiring

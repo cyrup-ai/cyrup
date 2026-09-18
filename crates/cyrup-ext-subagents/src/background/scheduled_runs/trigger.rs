@@ -883,8 +883,19 @@ mod tests {
     ///
     /// The production launcher spawns a real `RunMode::Workflow` run; these rows are about the
     /// state machine AROUND that launch — the lock, the claim, the rollback, the catch-up
-    /// arithmetic — so a stub is the right seam and the integration suite
-    /// (`tests/scheduled_runs_integration.rs`) covers the production one.
+    /// arithmetic — so a stub is the right seam here.
+    ///
+    /// The PRODUCTION launcher is covered by
+    /// `extension::executor::scheduled_runs::tests::a_scheduled_run_really_spawns_a_process_through_the_production_launcher`,
+    /// which drives [`crate::extension::executor::SubagentExecutor::install_scheduled_runs`] and
+    /// the real `schedule.create`/`schedule.run` verbs and then reads back a marker file written
+    /// by the spawned child process itself.
+    ///
+    /// ⚠ This comment previously cited `tests/scheduled_runs_integration.rs`. That file has never
+    /// existed anywhere in the workspace — this crate has no `tests/` directory at all — so the
+    /// citation was load-bearing and false. (`extension/tool/scheduled_runs_tests.rs` does reach
+    /// the production launcher from the tool side; the named file never did.) Do not re-point
+    /// this at a path without checking that it is there.
     struct StubLauncher {
         state: Mutex<StubState>,
         /// `None` succeeds; `Some(message)` fails the launch with that message.
