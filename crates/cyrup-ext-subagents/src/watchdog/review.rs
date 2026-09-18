@@ -30,12 +30,17 @@
 //! [CYRUP-DELTA] upstream constructs a `pi-agent-core` `Agent` in-process and awaits
 //! `agent.prompt(...)`. This crate's charter (`lib.rs`) is that a SUBAGENT run is always a real OS
 //! subprocess — but a watchdog review is not a subagent run, it is a nested single-turn model call,
-//! and cyrup has no in-crate agent-loop dependency to build one from (`cyrup-agent` is a dependency
-//! for TYPES only, per `Cargo.toml`'s own comment). The turn itself is therefore expressed as the
+//! and upstream says so itself (`shared/opencode-session-headers.ts:17-18 @v0.68.0`: "subagent-
+//! internal calls … stream through bare Agents"). The turn is therefore expressed as the
 //! [`WatchdogReviewAgent`] trait — one method, "run this system prompt + prompt with these tools and
-//! tell me the stop reason" — and EVERYTHING else in `review.ts` (model resolution, thinking
+//! tell me the stop reason" — so EVERYTHING else in `review.ts` (model resolution, thinking
 //! resolution, both prompts, the tool schema, the warn-parameter validation, the allow-list, the
 //! stop-reason fold) is ported here and runs identically whichever agent implementation is bound.
+//!
+//! UW-4 filled that seam: [`ModelTurnReviewAgent`] runs the real nested `cyrup_agent::Agent` and is
+//! what both production paths bind. The construction it shares with the permission arbiter lives in
+//! [`super::agent_turn`], which is pinned to v0.68.0 while this file stays pinned to v0.43.0 — see
+//! that module's doc for why the two tags are stated separately rather than mixed.
 
 use std::sync::Arc;
 
@@ -758,7 +763,8 @@ impl MainWatchdogReview {
     /// No production caller, and none is coming: upstream reads the LIVE session
     /// (`options.getThinkingLevel?.()` calls `pi.getThinkingLevel()`), which is
     /// [`Self::with_session_context`], and both cyrup production paths bind that instead
-    /// (`register_main.rs:176`, `prompt_runtime.rs:1764`). This and [`Self::with_current_model`]
+    /// (`register_main::register_main_watchdog`'s review arm and
+    /// `prompt_runtime::child_watchdog_review`). This and [`Self::with_current_model`]
     /// are the pair that fills the same two slots for an embedder with NO live session provider —
     /// `review()` reads them via `.or_else()` after the provider — so deleting one and keeping the
     /// other would leave a half-usable fallback.
@@ -866,15 +872,144 @@ impl WatchdogReview for MainWatchdogReview {
     }
 }
 
-/// A review agent that runs no model at all and reports a clean turn — the honest stand-in for a
-/// deployment with no provider bound, and the fixture every test in this module drives.
+/// `runWatchdogAttempt`'s turn (`review.ts:304-358 @v0.68.0`) — the REAL review agent: build the
+/// read-only tool set over the review's cwd, add the bound `watchdog_warn` tool, run ONE nested
+/// [`cyrup_agent::Agent`] turn under the two-layer tool policy, and hand back the message list the
+/// stop-reason fold reads.
 ///
-/// It is NOT `InertWatchdogReview`: that one bypasses model resolution entirely, where this still
-/// resolves and validates the review model (so a misconfigured `subagents.watchdog.main.model`
-/// still fails loudly) and simply performs no turn.
+/// Bound in BOTH production paths (`register_main.rs`'s `options.review.unwrap_or_else` arm and
+/// `prompt_runtime.rs`'s `child_watchdog_review`), which is what makes the runtime's
+/// `review_description` — "real model review" — true.
+///
+/// [CYRUP-DELTA] this file is a v0.43.0 port; THIS type is pinned to **v0.68.0** and every citation
+/// on it says so. The three v0.68.0 features that live in the same upstream block are deliberately
+/// NOT adopted here, because this crate has no port of any of them and building one is a different
+/// task: `watchdog_diff` (`:10,:294,:307`), `watchdog_ask`/the clarification yield
+/// (`:295,:298-323,:338`), and `loadWatchdogGuidance`/`WATCHDOG.md` (`:11,:234,:328`). The turn
+/// UW-4 names needs none of them.
+pub struct ModelTurnReviewAgent {
+    cwd: std::path::PathBuf,
+    turn: super::agent_turn::WatchdogAgentTurn,
+}
+
+impl std::fmt::Debug for ModelTurnReviewAgent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelTurnReviewAgent")
+            .field("cwd", &self.cwd)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ModelTurnReviewAgent {
+    /// Bind the turn to the review's working directory (`createReadOnlyTools(ctx.cwd)`,
+    /// `review.ts:305 @v0.68.0`) and to the late-resolved capability backend it streams through.
+    #[must_use]
+    pub fn new(
+        cwd: std::path::PathBuf,
+        services: super::register_main::WatchdogServicesFn,
+    ) -> Self {
+        Self {
+            cwd,
+            turn: super::agent_turn::WatchdogAgentTurn::new(services),
+        }
+    }
+
+    /// `beforeToolCall` (`review.ts:338-340 @v0.68.0`) — the EXECUTION-TIME half of the two-layer
+    /// tool policy, as an `Arc` so the value production installs on the nested agent is a value a
+    /// caller can hold and exercise.
+    ///
+    /// This accessor is the ONLY source of the policy [`Self::turn_request`] installs, so it is
+    /// not a second copy that can drift from the one the agent runs under: gutting it guts the
+    /// running turn. It is `pub` because the layer it guards is unreachable end to end — cyrup's
+    /// nested agent gets its tool list from [`Self::turn_request`] and nowhere else, so a tool the
+    /// permit list rejects is a tool the agent does not have and the loop answers "Tool <name> not
+    /// found" before any hook runs (`cyrup-agent`'s `agent/run/tools/preflight.rs:17`, where the
+    /// lookup precedes `before_tool_call`). An out-of-crate test therefore has to reach the policy
+    /// here to assert the sentence a blocked call produces.
+    #[must_use]
+    #[allow(clippy::type_complexity)]
+    pub fn tool_call_block_reason(&self) -> Arc<dyn Fn(&str) -> Option<String> + Send + Sync> {
+        Arc::new(watchdog_tool_call_block_reason)
+    }
+
+    /// The exact [`super::agent_turn::WatchdogTurnRequest`] [`WatchdogReviewAgent::run`] hands the
+    /// nested agent: the filtered read-only tool list plus the bound `watchdog_warn` tool
+    /// (`review.ts:305-306 @v0.68.0`) and the execution-time policy (`:338-340`).
+    ///
+    /// Extracted from `run` so the construction is reachable without a provider, a model or a
+    /// stream: `run` builds nothing of its own, so a test over this function is a test over what
+    /// production installs rather than over a re-declared copy of it.
+    pub(crate) fn turn_request<'a>(
+        &self,
+        turn: WatchdogReviewTurn<'a>,
+    ) -> super::agent_turn::WatchdogTurnRequest<'a> {
+        // `...(options.createReadOnlyTools ?? createReadOnlyTools)(ctx.cwd).filter((tool) =>
+        // WATCHDOG_ALLOWED_TOOL_NAMES.has(tool.name) && tool.name !== "watchdog_warn")`
+        // (`review.ts:305 @v0.68.0`). `cyrup_tools::read_only_tools` IS
+        // `createReadOnlyToolDefinitions` — it filters the eight built-ins to exactly
+        // `{read,grep,find,ls}` (`cyrup-tools/src/registry.rs:195-202`) — and the filter below is
+        // upstream's, kept rather than assumed: it is what guarantees the EXPOSE list stays the
+        // permit list minus `watchdog_warn`, so nothing the registry gains can shadow the bound
+        // tool.
+        let mut tools: Vec<Arc<dyn cyrup_core::Tool>> = cyrup_tools::read_only_tools(
+            self.cwd.clone(),
+            cyrup_tools::Backend::local(),
+            cyrup_tools::ToolsOptions::default(),
+        )
+        .into_iter()
+        .filter(|tool| {
+            turn.allowed_tools.contains(&tool.name())
+                && turn.read_only_tools.contains(&tool.name())
+                && tool.name() != WATCHDOG_WARN_TOOL_NAME
+        })
+        .collect();
+        // `createWatchdogWarnTool(warnRequest)` (`:306 @v0.68.0`) — the one tool that can report
+        // anything, already bound to this request's emitter by the turn descriptor.
+        tools.push(Arc::new(super::agent_turn::WatchdogWarnAgentTool::new(
+            turn.emit_warning.clone(),
+        )));
+        super::agent_turn::WatchdogTurnRequest {
+            system_prompt: turn.system_prompt,
+            prompt: turn.prompt,
+            selection: turn.selection,
+            tools,
+            // `beforeToolCall` (`:338-340 @v0.68.0`) — the EXECUTION-TIME layer, checked against
+            // the wider PERMIT list, which is what refuses a tool the harness supplied from
+            // outside the list above.
+            block_reason: self.tool_call_block_reason(),
+            cancel: turn.cancel.clone(),
+        }
+    }
+}
+
+#[async_trait]
+impl WatchdogReviewAgent for ModelTurnReviewAgent {
+    async fn run(&self, turn: WatchdogReviewTurn<'_>) -> Result<Vec<Value>, String> {
+        let messages = self.turn.run(self.turn_request(turn)).await?;
+        // `if (ctx.signal?.aborted || request.signal?.aborted) return { stopReason: "aborted" }`
+        // (`:355 @v0.68.0`) — re-checked AFTER the prompt. An empty list folds to `Stop`, so an
+        // aborted run has to say so through the terminal assistant message the loop emitted; the
+        // fold reads it.
+        Ok(messages)
+    }
+}
+
+/// A review agent that runs no model at all and reports a clean turn.
+///
+/// **Test fixture only, as of UW-4.** Production binds [`ModelTurnReviewAgent`] on both paths; this
+/// remains because it is the honest double for "the turn produced nothing", which every test in
+/// this module drives and which the `Stop`-with-zero-warnings contract
+/// ([`final_stop_reason`]'s empty-list arm) is stated in terms of. It is NOT
+/// `#[allow(dead_code)]`-ed and it is NOT bound in production.
+///
+/// It is also NOT `InertWatchdogReview`: that one bypasses model resolution entirely, where a
+/// review over THIS agent still resolves and validates the review model (so a misconfigured
+/// `subagents.watchdog.main.model` still fails loudly) and simply performs no turn.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoTurnReviewAgent;
 
+#[cfg(test)]
 #[async_trait]
 impl WatchdogReviewAgent for NoTurnReviewAgent {
     async fn run(&self, _turn: WatchdogReviewTurn<'_>) -> Result<Vec<Value>, String> {
@@ -890,19 +1025,18 @@ impl WatchdogReviewAgent for NoTurnReviewAgent {
 // the private `current_provider_family` in `model_selection.rs:604`, called at `:632`. This one
 // returned a bare normalized provider string, branched on nothing, and existed in no upstream file.
 
-// ## What in this module still has no production caller, and why
+// ## Where the seam's contract runs (UW-4: it now does)
 //
 // [`WatchdogWarnTool::execute`], [`WatchdogReviewTurn::block_reason`] and
-// [`WatchdogWarnTool::SEQUENTIAL`] are the SEAM's own contract: they run when a bound
-// [`WatchdogReviewAgent`] runs a model turn, which is upstream's `agent.prompt(...)` (`:295`). The
-// only implementation in this workspace is [`NoTurnReviewAgent`], bound in BOTH production paths
-// (`register_main.rs:168`, `prompt_runtime.rs:1761`), so no model turn happens anywhere and
-// therefore no tool call does either. Everything the turn CARRIES is now built on the production
-// path (`MainWatchdogReview::review` constructs the descriptor, both tool lists and the sequential
-// flag on every review), so what is missing is one thing and it is nameable: a
-// `WatchdogReviewAgent` that actually runs the turn. Until then this module resolves and validates
-// a review model on every boundary and then reports a clean review — which is why the runtime's
-// `review_description` says "real model review" while no warning is ever emitted.
+// [`WatchdogWarnTool::SEQUENTIAL`] are the SEAM's own contract, and they run when a bound
+// [`WatchdogReviewAgent`] runs a model turn — upstream's `agent.prompt(...)`
+// (`review.ts:350 @v0.68.0`). That implementation is [`ModelTurnReviewAgent`], bound in BOTH
+// production paths: `register_main::register_main_watchdog`'s `options.review.unwrap_or_else` arm
+// (reached from `extension/host/mod.rs`'s `SubagentsExtension::new`) and
+// `prompt_runtime::child_watchdog_review` (reached from `crates/cyrup/src/session_launch.rs`).
+// `WatchdogWarnTool::execute` is reached through `agent_turn::WatchdogWarnAgentTool`, and
+// `block_reason` through the `Hooks::before_tool_call` the same module installs — the execution-time
+// layer, which is the one a tool-LIST filter alone would leave unenforced.
 
 #[cfg(test)]
 #[allow(
@@ -1210,6 +1344,67 @@ mod tests {
         assert_eq!(
             watchdog_tool_call_block_reason(WATCHDOG_WARN_TOOL_NAME),
             None
+        );
+    }
+
+    /// **The production construction, pinned.** [`WatchdogReviewAgent::run`] on
+    /// [`ModelTurnReviewAgent`] builds nothing of its own — both halves of the two-layer tool
+    /// policy come out of [`ModelTurnReviewAgent::turn_request`] — so this drives the EXACT
+    /// [`super::agent_turn::WatchdogTurnRequest`] a real review turn is built with, rather than a
+    /// tool list and a closure the test itself declared.
+    ///
+    /// Layer one (`review.ts:305-306 @v0.68.0`): the tools the agent is GIVEN are the read-only
+    /// four plus the bound `watchdog_warn`, and nothing else.
+    ///
+    /// Layer two (`:338-340`): the execution-time refusal, checked against the wider PERMIT list.
+    /// Replacing [`ModelTurnReviewAgent::tool_call_block_reason`]'s body with
+    /// `Arc::new(|_| None)` — which is exactly what deleting the execution-time layer looks like —
+    /// fails the three `block_reason` assertions below.
+    #[test]
+    fn the_production_review_turn_installs_the_expose_list_and_the_execution_time_policy() {
+        let emitter = WatchdogWarningEmitter::inert();
+        let selection = WatchdogReviewModelSelection {
+            model: WatchdogModelInfo::new("anthropic", "claude-opus-4-8"),
+            thinking_level: "off".to_string(),
+            auth: WatchdogReviewAuth::default(),
+            explicit: true,
+        };
+        let agent = ModelTurnReviewAgent::new(std::env::temp_dir(), Arc::new(|| None));
+        let request = agent.turn_request(WatchdogReviewTurn {
+            selection: &selection,
+            system_prompt: "system".to_string(),
+            prompt: "prompt".to_string(),
+            allowed_tools: &WATCHDOG_ALLOWED_TOOL_NAMES,
+            read_only_tools: &WATCHDOG_REVIEW_READ_ONLY_TOOL_NAMES,
+            warn_tool: WatchdogWarnTool::new(&emitter),
+            tool_execution_sequential: true,
+            emit_warning: &emitter,
+            cancel: CancelToken::new(),
+        });
+
+        let mut offered: Vec<&str> = request.tools.iter().map(|tool| tool.name()).collect();
+        offered.sort_unstable();
+        assert_eq!(
+            offered,
+            vec!["find", "grep", "ls", "read", "watchdog_warn"],
+            "the EXPOSE list is the read-only four plus the one bound warn tool"
+        );
+
+        // The execution-time layer, read off the value production installed on the turn.
+        assert_eq!((request.block_reason)("read"), None);
+        assert_eq!((request.block_reason)(WATCHDOG_WARN_TOOL_NAME), None);
+        assert_eq!(
+            (request.block_reason)("write").as_deref(),
+            Some("Watchdog reviews are read-only; tool 'write' is not allowed."),
+            "a reviewer that names `write` must be refused at execution time, not merely un-offered"
+        );
+        assert_eq!(
+            (request.block_reason)("bash").as_deref(),
+            Some("Watchdog reviews are read-only; tool 'bash' is not allowed.")
+        );
+        assert_eq!(
+            (request.block_reason)("subagent").as_deref(),
+            Some("Watchdog reviews are read-only; tool 'subagent' is not allowed.")
         );
     }
 

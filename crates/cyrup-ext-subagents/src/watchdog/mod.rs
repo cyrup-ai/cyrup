@@ -44,6 +44,10 @@
 //! makes no model call and emits no message. Every event handler's first act after refreshing the
 //! config is `if (!this.isEnabled()) return`.
 
+/// The nested single-turn `Agent` both the review and the permission arbiter run — upstream's
+/// `new Agent({…}); await agent.prompt(…)`, expressed once. Pinned to **v0.68.0**, unlike the
+/// v0.43.0 modules around it; see the module doc.
+pub mod agent_turn;
 pub mod change_signature;
 pub mod child_status;
 pub mod emission_guard;

@@ -139,11 +139,17 @@ impl NativeExtension for SubagentsExtension {
                     tracing::warn!("[cyrup-subagents] {warning}");
                 }
 
-                api.register_tool(Arc::new(
+                // PB-8: built ONCE, registered, and the SAME `Arc` stashed on the extension so
+                // the RPC bridge dispatches into the instance the model uses — same resolved
+                // description, same `allow_mutating_management`, same `DispatchGuard`. See
+                // `SubagentsExtension::rpc_tool` for why this is not `subagent_tool()`.
+                let subagent_tool = Arc::new(
                     SubagentTool::new(self.executor.clone(), self.cwd.clone())
                         .with_watchdog(Arc::clone(&self.watchdog))
                         .with_description(resolved_description),
-                ));
+                );
+                let _ = self.rpc_tool.set(Arc::clone(&subagent_tool));
+                api.register_tool(subagent_tool);
 
                 // SUBA-004 (pi `extension/index.ts:519-527`): the `wait` tool registers alongside
                 // `subagent`, in the Full arm only. Without it an orchestrator has NO way to block
@@ -242,6 +248,17 @@ impl NativeExtension for SubagentsExtension {
                 api.register_message_renderer(
                     crate::watchdog::types::SUBAGENT_WATCHDOG_WARNING_TYPE,
                 );
+
+                // PB-8 — pi `registerSubagentRpcBridge({ events: pi.events, … })`
+                // (`extension/index.ts:759-764` @v0.68.0, impl `extension/rpc.ts:817-848`): the
+                // ONE inter-extension topic this extension listens on, so a host, an editor or a
+                // sibling extension can drive subagents programmatically instead of only the model
+                // being able to. Deliveries land at `Self::on_bus_event` below.
+                //
+                // Full arm ONLY. A `ChildSafe` fanout child registers no orchestrator surface and
+                // must not answer RPC — it would otherwise expose spawn/stop/manage on the bus
+                // from inside a child.
+                api.subscribe_bus(crate::extension::rpc::SUBAGENT_RPC_REQUEST_EVENT);
 
                 api.subscribe(&[
                     cyrup_ext::EventKind::SessionStart,
@@ -409,7 +426,15 @@ impl NativeExtension for SubagentsExtension {
                 // always-on fleet status widget for this session and paint it once. See
                 // [`Self::refresh_fleet_status_widget`] for why the tick rides host event edges
                 // rather than upstream's 500 ms interval.
-                self.refresh_fleet_status_widget(&ctx.cwd, ctx.has_ui).await;
+                self.refresh_fleet_status_widget(&ctx.cwd, ctx.has_ui, ctx.mode)
+                    .await;
+
+                // PB-8 — pi `rpcBridge.emitReady(ctx)` (`extension/index.ts:1186`, the tail of its
+                // own `session_start` handler, after the herdr bridge and before
+                // `supervisorChannel.start()`): a client that attached before this process came up
+                // learns the surface is live and reads the whole capability set off the ready
+                // payload, instead of having to poll `ping` until one answers.
+                self.emit_rpc_ready();
             }
             // pi's `agent_end` handler (`extension/index.ts:585-601` @v0.43.0). Its first line
             // (`drainOutstandingWork` when there is no UI) belongs to the background-drain
@@ -498,7 +523,8 @@ impl NativeExtension for SubagentsExtension {
                     .await;
                 // The fleet status widget's repaint edge (pi's 500 ms `setInterval` tick) — not a
                 // registered handler, so its position here is free.
-                self.refresh_fleet_status_widget(&ctx.cwd, ctx.has_ui).await;
+                self.refresh_fleet_status_widget(&ctx.cwd, ctx.has_ui, ctx.mode)
+                    .await;
             }
             HostEvent::SessionShutdown { .. } => {
                 // pi `runtimeCleanup`/`session_shutdown` both call `supervisorChannel.dispose()`
@@ -531,6 +557,17 @@ impl NativeExtension for SubagentsExtension {
                     // slot stayed occupied after dispose.
                     services.set_widget(
                         crate::tui::fleet_status::FLEET_STATUS_WIDGET_KEY,
+                        None,
+                        cyrup_ext::host::WidgetPlacement::default(),
+                    );
+                    // PB-8 — pi's cleanup block clears BOTH of this extension's widget slots:
+                    // `fleetStatus?.dispose()` (`extension/index.ts:1063`) takes the fleet-status
+                    // key, and `:1098`'s `ctx.ui.setWidget(WIDGET_KEY, undefined)` takes the
+                    // async-jobs key. Since `refresh_fleet_status_widget` publishes the machine
+                    // document into that second slot in `ExtMode::Rpc`, leaving it out here would
+                    // strand a `PI_SUBAGENT_ASYNC_JSON:` line describing a session that is gone.
+                    services.set_widget(
+                        crate::background::async_status_snapshot::ASYNC_STATUS_SNAPSHOT_WIDGET_KEY,
                         None,
                         cyrup_ext::host::WidgetPlacement::default(),
                     );
@@ -618,6 +655,83 @@ impl NativeExtension for SubagentsExtension {
             _ => {}
         }
         HookOutcome::Noop
+    }
+
+    /// PB-8 — answer one inter-extension RPC request (pi's ONE listener,
+    /// `extension/rpc.ts:822-838` @v0.68.0): parse, handle, reply.
+    ///
+    /// **A handler fault is REPLIED, never returned.** Upstream's `try`/`catch` at `:834-837` has
+    /// no path that returns silently, and returning `Err` here would be CONTAINED and logged by
+    /// `BusFanout::drain_bus` (`cyrup-ext/src/facade.rs:2740-2750`) — fan-out would continue and
+    /// the caller would wait forever for a reply that never comes. So `Err` is reserved for the
+    /// one case where there is genuinely no reply to be had: the reply itself could not be
+    /// emitted, because no capability backend is bound and therefore no bus exists to emit on.
+    ///
+    /// The reply travels back out through
+    /// [`cyrup_ext::host::HostServices::emit_event`] → `SharedBus::emit`, which QUEUES; the
+    /// in-flight `drain_bus` picks it up on its next round, so a client subscribed to the reply
+    /// topic is reached inside the same `deliver_bus_events(..)` call that carried the request.
+    /// See [`crate::extension::rpc`]'s module doc for the whole client contract.
+    ///
+    /// # `[CYRUP-DELTA, mechanism]` — the handler body runs ON the host's drain, not beside it
+    ///
+    /// Upstream registers `options.events.on(SUBAGENT_RPC_REQUEST_EVENT, async (raw) => {…})`
+    /// (`rpc.ts:822`). pi's `EventEmitter` discards the returned promise, so `emit` returns at
+    /// once and the handler's I/O costs the emitter nothing.
+    ///
+    /// cyrup's `on_bus_event` is `async` and is AWAITED by `BusFanout::drain_bus`
+    /// (`cyrup-ext/src/facade.rs:2736-2748`), which holds the RAII `DrainLatch` acquired at
+    /// `facade.rs:2724` for the whole fan-out, and is itself awaited from every host event
+    /// dispatch (`cyrup-ext/src/dispatch.rs:327,352,372,388,417`) and from
+    /// `run_command`/`run_shortcut` (`facade.rs:2150,2371`).
+    ///
+    /// **The real consequence**, stated plainly: for as long as one RPC method runs — a `status`
+    /// that reconciles runs and reads a transcript, a `stop` that walks a run tree — every OTHER
+    /// extension's bus event queued in the same batch waits behind it, and if the drain was
+    /// entered from `run_command` the user's slash command does not return until it finishes.
+    /// Upstream's equivalent request blocks nothing.
+    ///
+    /// This is not fixed by spawning the body onto a task. The trait hands out `&self` with no
+    /// owning handle (`cyrup_ext::native::NativeExtension::on_bus_event`), and detaching would
+    /// also break the guarantee this surface is built on — that a reply is emitted inside the SAME
+    /// `deliver_bus_events(..)` call, which is what lets a client round-trip with no pump and
+    /// nothing to sleep on (see [`crate::extension::rpc`]'s "Delivery is deferred, but not slow").
+    /// The cost is paid deliberately to buy that; it is recorded here so nobody has to rediscover
+    /// it from a stalled `/command`.
+    async fn on_bus_event(
+        &self,
+        topic: &str,
+        payload: &serde_json::Value,
+        _ctx: &HostCtx,
+    ) -> Result<(), ExtError> {
+        if topic != crate::extension::rpc::SUBAGENT_RPC_REQUEST_EVENT {
+            return Ok(());
+        }
+        let (reply_topic, reply) = match self.rpc_tool.get() {
+            Some(tool) => {
+                self.rpc_bridge
+                    .dispatch(
+                        payload,
+                        &crate::extension::rpc::RpcDeps {
+                            tool,
+                            executor: &self.executor,
+                            cwd: &self.cwd,
+                        },
+                    )
+                    .await
+            }
+            // Structurally unreachable: the subscription above and the tool capture are the same
+            // arm of `init`. Answered anyway — see `rpc::unregistered_reply`.
+            None => crate::extension::rpc::unregistered_reply(payload),
+        };
+        let Some(services) = self.executor.host_services() else {
+            return Err(ExtError::Component(
+                "subagents: no capability backend is bound, so the RPC reply cannot be emitted"
+                    .to_string(),
+            ));
+        };
+        services.emit_event(&reply_topic, &reply);
+        Ok(())
     }
 
     /// Dispatch a registered slash command through the SAME executor the `subagent` tool uses

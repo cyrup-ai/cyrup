@@ -68,6 +68,24 @@ cyrup-resources = { workspace = true }
 # to invent the deferred live-probe algorithm. `cyrup-ext` (already a direct dependency above)
 # itself depends on `cyrup-provider`, so this adds no new layering cycle.
 cyrup-provider = { workspace = true }
+# PRODUCTION as of UW-4: `watchdog::review::ModelTurnReviewAgent` builds the review's tool set with
+# `cyrup_tools::read_only_tools(cwd, Backend, ToolsOptions)`, which IS pi's
+# `createReadOnlyToolDefinitions` — the eight built-ins filtered to exactly `{read,grep,find,ls}`
+# (`cyrup-tools/src/registry.rs:195-202`) — and is what upstream's
+# `createReadOnlyTools(ctx.cwd)` (`watchdog/review.ts:305 @v0.68.0`) resolves to. No new compile
+# surface: `cyrup-tools` was already normal-reachable through `cyrup-ext` with the same default
+# features, and its own dependency set is `cyrup-core` plus leaf crates, so nothing cycles.
+#
+# This entry USED to be dev-only, with a comment saying production code in this crate never names
+# `cyrup_tools` so that a REFUSAL vocabulary could not be silently widened by a future registry
+# entry. That statement is preserved and is still true of the thing it was about: the refusal
+# vocabularies here are `HOST_BUILTIN_TOOL_NAMES` (`exec/tool_surface.rs`) and
+# `WATCHDOG_ALLOWED_TOOL_NAMES` (`watchdog/review.rs`), both of them local literals, and
+# `exec/tool_surface.rs::host_builtin_tool_names_track_the_tool_registry` remains a TEST-ONLY oracle
+# comparing them against `cyrup_tools::BUILTIN_NAMES` rather than aliasing it. Obtaining four real
+# `Arc<dyn Tool>` handles is a different use and widens no name list — the review still filters what
+# it got through its own permit list, and `beforeToolCall` re-checks every call at execution time.
+cyrup-tools = { workspace = true }
 tokio = { workspace = true, features = ["process", "io-util", "fs", "sync", "time", "signal", "macros", "rt-multi-thread"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -179,19 +197,6 @@ required-features = ["test-fixtures"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
-# TEST-ONLY oracle for `exec/tool_surface.rs::host_builtin_tool_names_track_the_tool_registry`.
-# `HOST_BUILTIN_TOOL_NAMES` is the closed set of built-in tool names `ToolRegistry::with_builtins`
-# installs, in wire order — the vocabulary a host observation is validated against. Extension tools
-# are merged in AFTER the allowlist filter
-# (`cyrup-session-svc/src/builder.rs:1075` -> `:1499` -> `cyrup-ext/src/registry.rs:1319`), so the
-# CSV proves nothing about them. `cyrup_tools::BUILTIN_NAMES` answers a DIFFERENT question (which
-# tools the registry installs, in wire order). The two coincide today and the test fails the build
-# the day they stop — but the sets stay separately stated, and production code in this crate never
-# names `cyrup_tools`, exactly as `cyrup-permission-system/Cargo.toml:112` does for its own
-# `BUILT_IN_TOOL_NAMES`. An alias would silently widen a REFUSAL vocabulary to any name a future
-# registry adds, which is the dangerous direction. No new compile surface: `cyrup-tools` is already
-# normal-reachable through `cyrup-ext` with the same default features.
-cyrup-tools = { workspace = true }
 # CROSS-CRATE CONFORMANCE, TEST-ONLY (MCP-141/142/146/370). `exec/mcp_direct_tools.rs` is the READER
 # of `<agent_dir>/mcp-cache.json`; `cyrup-mcp` is its WRITER, and the two also have to agree on the
 # name a direct MCP tool is registered under. They share an on-disk file rather than a type — on

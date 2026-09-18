@@ -66,6 +66,11 @@ mod host;
 // SUBA-075: crate-visible so `fork_context`'s ported `findModelInfo` can resolve a fork's candidate
 // models against `registry_models` — the same catalog binding every model-facing command here uses.
 pub(crate) mod models;
+// PB-8 — the inter-extension RPC bridge (pi `src/extension/rpc.ts` @v0.68.0). Crate-visible
+// because `extension/host/native_impl.rs` subscribes its topic, dispatches into it and emits its
+// ready payload, and `background/watch/observer.rs` advertises the completion topic it names; the
+// four WIRE constants a client integrates against are `pub` on the module itself.
+pub(crate) mod rpc;
 mod tool;
 pub(crate) mod wait_tool;
 

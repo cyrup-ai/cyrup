@@ -469,6 +469,25 @@ impl SubagentExecutor {
                     }),
                     // SUBA-034: the wake-up every in-flight `wait` is selecting on.
                     Arc::new(self.completion_bus.clone()),
+                    // PB-8 §4.5 — pi's `pi.events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, …)`
+                    // (`result-watcher.ts:589` @v0.68.0), which upstream gets for free because its
+                    // completion signal IS an event-bus emit. cyrup's fan-out is this composite,
+                    // so the INTER-EXTENSION half has to be a member of it — and without this
+                    // member a host that delegated work through the RPC bridge would have to poll
+                    // `status` in a loop to learn a child finished, and `pingData`'s
+                    // `events.asyncComplete` advertisement would be a lie.
+                    //
+                    // Position: after the store (member #1, which must stay first) and before the
+                    // wait-subscription reconciler (which must stay last). Nothing here reads or
+                    // writes state the other members touch, so its place among the middle members
+                    // is not load-bearing. It shares the executor's OWN late-bound host-services
+                    // slot rather than a snapshot, so a watcher reinstalled on a later
+                    // `SessionStart` publishes onto whatever backend is bound by then.
+                    Arc::new(
+                        crate::background::watch::BusAnnouncingCompletionObserver::new(
+                            Arc::clone(&self.host_services),
+                        ),
+                    ),
                     // SCOPE_11: pi's FOURTH listener (`wait-subscriptions.ts`'s own
                     // `pi.events.on(SUBAGENT_ASYNC_COMPLETE_EVENT, reconcile)`, `:285`).
                     //

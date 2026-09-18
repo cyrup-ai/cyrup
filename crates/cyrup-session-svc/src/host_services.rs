@@ -735,6 +735,15 @@ pub struct LiveHostServices {
     /// queue and are fanned out by the one drain. `None` on the default/by-value backend, where an
     /// emit is dropped (PERM-011 half B).
     event_bus: Mutex<Option<Arc<cyrup_ext::host::SharedBus>>>,
+    /// The LIVE, swappable provider the session's agent loop streams through
+    /// ([`crate::ProviderSwap`]), attached by the builder via [`Self::attach_provider_swap`] — it is
+    /// constructed AFTER this backend, exactly like [`Self::event_bus`].
+    ///
+    /// Read by [`cyrup_ext::host::HostServices::registered_provider`] so a subagent-internal model
+    /// call follows a mid-session cross-provider `/model` swap instead of pinning the provider this
+    /// backend was built with. `None` (no swap attached) falls back to [`Self::provider`], which is
+    /// that same initial provider.
+    provider_swap: Mutex<Option<Arc<crate::ProviderSwap>>>,
 }
 
 impl LiveHostServices {
@@ -767,6 +776,7 @@ impl LiveHostServices {
             theme_access: Mutex::new(None),
             editor_mirror: Mutex::new(None),
             event_bus: Mutex::new(None),
+            provider_swap: Mutex::new(None),
         }
     }
 
@@ -778,6 +788,18 @@ impl LiveHostServices {
     /// point, so no emit can be issued before the bus is in place.
     pub fn attach_event_bus(&self, bus: Arc<cyrup_ext::host::SharedBus>) {
         *Self::lock(&self.event_bus) = Some(bus);
+    }
+
+    /// Hand this backend the session's live [`crate::ProviderSwap`], so
+    /// [`cyrup_ext::host::HostServices::registered_provider`] answers with whatever provider the
+    /// agent loop is CURRENTLY streaming through rather than the one this backend was built with.
+    ///
+    /// Called by the builder once the swap exists (it is constructed after this backend, because it
+    /// wraps the same provider plus the resolver seam). Absent it, `registered_provider` still
+    /// answers — from the initial provider — so a backend built directly in a test is not broken by
+    /// the late bind.
+    pub fn attach_provider_swap(&self, swap: Arc<crate::ProviderSwap>) {
+        *Self::lock(&self.provider_swap) = Some(swap);
     }
 
     /// Build with a caller-supplied fallback exec timeout (tests only; production always gets the
@@ -1480,6 +1502,21 @@ impl HostServices for LiveHostServices {
 
     fn thinking_level(&self) -> Option<String> {
         Self::lock(&self.snapshot).thinking_level.clone()
+    }
+
+    /// pi `ctx.modelRegistry.getRegisteredProviderConfig(provider)`
+    /// (`pi-subagents/src/watchdog/permission-arbiter.ts:99-104`, `review.ts:276-281` @v0.68.0).
+    ///
+    /// Answers from the LIVE [`crate::ProviderSwap`] when the builder attached one, so a
+    /// cross-provider `/model` select is honoured; otherwise from the provider this backend was
+    /// built with. `None` when `provider_id` is not the one the session streams against — upstream's
+    /// fall-through to the generic `streamSimple`. The api-equality guard is the CALLER's, matching
+    /// upstream (`registeredProvider.api === selection.model.api`).
+    fn registered_provider(&self, provider_id: &str) -> Option<Arc<dyn Provider>> {
+        let current = Self::lock(&self.provider_swap)
+            .as_ref()
+            .map_or_else(|| Arc::clone(&self.provider), |swap| swap.current());
+        (current.id().as_str() == provider_id).then_some(current)
     }
 
     fn context_usage(&self) -> Value {

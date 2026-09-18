@@ -78,6 +78,90 @@ impl CompletionObserver for CompositeCompletionObserver {
     }
 }
 
+/// pi `SUBAGENT_ASYNC_COMPLETE_EVENT` (`src/shared/types.ts:2355` @v0.68.0) — the
+/// INTER-EXTENSION topic every observed background completion is republished on by
+/// [`BusAnnouncingCompletionObserver`].
+///
+/// Owned here, by the emitter, rather than by [`crate::extension::rpc`], which merely advertises
+/// it: a topic constant belongs to whatever publishes on it, so an advertisement can never name a
+/// topic nothing emits.
+pub const SUBAGENT_ASYNC_COMPLETE_EVENT: &str = "subagent:async-complete";
+
+/// PB-8 §4.5 — republish every observed background completion on the host-owned inter-extension
+/// bus, so a host or sibling extension that delegated work learns it finished instead of polling
+/// `status` in a loop.
+///
+/// This is pi's `pi.events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, {...})`
+/// (`runs/background/result-watcher.ts:589-606` @v0.68.0). Upstream's completion signal IS an
+/// event-bus emit, so its four in-process listeners and any cross-extension listener are the same
+/// mechanism; cyrup's completion fan-out is the in-process [`CompletionObserver`] composite, and
+/// before this member existed NOTHING in this crate reached the inter-extension bus with a
+/// completion at all. That is why [`crate::extension::rpc`]'s `ping` reply may advertise
+/// `events.asyncComplete`: the advertisement is paid for here.
+///
+/// # Ordering in the composite
+///
+/// Registered AFTER [`crate::background::wait_completions::WaitCompletionStore`] (which must stay
+/// first — see `extension/executor/notices.rs`'s ordering doc) and before the wait-subscription
+/// reconciler (which must stay last). Its own position among the middle members is not
+/// load-bearing: it neither reads nor writes any state the others touch.
+///
+/// # `[CYRUP-DELTA]` — the payload is the result file, and only the result file
+///
+/// Upstream spreads the result payload and adds `runId`, `triggerTurn`, `intercomDelivered` and a
+/// re-normalized `results` array (`result-watcher.ts:590-605`). `runId` is already a field of
+/// [`crate::background::ResultFile`] here and `results` is already the per-child vector, so both
+/// arrive for free. `triggerTurn` and `intercomDelivered` are decisions made by the DELIVERY half
+/// (the sink), one layer past this observer, and are not knowable at the moment of observation —
+/// this observer runs BEFORE delivery, by the trait's own contract — so they are omitted rather
+/// than guessed.
+///
+/// Fire-and-forget: [`cyrup_ext::host::HostServices::emit_event`] queues on
+/// [`cyrup_ext::bus::SharedBus`] and the host fans out at its next seam boundary. With no backend
+/// bound (a by-value session) there is no bus, so nothing is published and the observation still
+/// counts as successful — a missing coordination channel must never make a completion look failed
+/// and get it retried.
+pub struct BusAnnouncingCompletionObserver {
+    /// The executor's own late-bound P-1 slot (`extension/executor/mod.rs:120`), shared rather
+    /// than copied: `set_host_services` runs before `init`, but the completion watcher is
+    /// installed later still, and a REINSTALL on a subsequent `SessionStart` must see whatever the
+    /// slot holds then.
+    host_services: Arc<std::sync::OnceLock<Arc<dyn cyrup_ext::host::HostServices>>>,
+}
+
+impl BusAnnouncingCompletionObserver {
+    /// Announce onto whatever backend `host_services` resolves to at observation time.
+    #[must_use]
+    pub fn new(
+        host_services: Arc<std::sync::OnceLock<Arc<dyn cyrup_ext::host::HostServices>>>,
+    ) -> Self {
+        Self { host_services }
+    }
+}
+
+#[async_trait::async_trait]
+impl CompletionObserver for BusAnnouncingCompletionObserver {
+    async fn observe(&self, notification: &CompletionNotification) -> bool {
+        let Some(services) = self.host_services.get() else {
+            return true;
+        };
+        match serde_json::to_value(&notification.result) {
+            Ok(payload) => services.emit_event(SUBAGENT_ASYNC_COMPLETE_EVENT, &payload),
+            Err(error) => {
+                // A result that cannot be serialized is a bug in `ResultFile`, not a delivery
+                // failure; say so and keep the pipeline moving (the trait forbids failing it).
+                tracing::warn!(
+                    target: "cyrup_ext_subagents::rpc",
+                    run_id = %notification.result.run_id,
+                    %error,
+                    "completion could not be encoded for the inter-extension bus"
+                );
+            }
+        }
+        true
+    }
+}
+
 /// SUBA-034 — the payload published on [`CompletionBus`] when a background run reaches a terminal
 /// state: pi's `SUBAGENT_ASYNC_COMPLETE_EVENT` payload, narrowed to the fields a subscriber can act
 /// on without re-reading the run tree.

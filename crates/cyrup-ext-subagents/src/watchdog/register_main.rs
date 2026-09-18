@@ -153,6 +153,10 @@ pub fn register_main_watchdog(
     // rather than silently reviewing nothing) and runs its turn through whichever
     // [`super::review::WatchdogReviewAgent`] is bound.
     let review_services = Arc::clone(&services);
+    // The same late-bound capability slot the review's session context resolves through — the
+    // nested turn reads `registered_provider` and `session_id` off it (pi `ctx.modelRegistry` /
+    // `ctx.sessionManager`, `review.ts:276-282 @v0.68.0`).
+    let turn_services = Arc::clone(&services);
     let review: Arc<dyn WatchdogReview> = options.review.unwrap_or_else(move || {
         // The registry MUST see the process's real `auth.json` — see [`watchdog_config_dirs`] for
         // why `BuiltinWatchdogModelRegistry::new(None)` cannot resolve any configured model.
@@ -165,7 +169,15 @@ pub fn register_main_watchdog(
             super::review::MainWatchdogReview::new(
                 registry,
                 Arc::new(super::review::AmbientReviewAuth),
-                Arc::new(super::review::NoTurnReviewAgent),
+                // UW-4 — the REAL model turn (`review.ts:324-358 @v0.68.0`). This is the
+                // orchestrator's review, and binding it here is what makes `review_description`
+                // below ("real model review") true rather than aspirational: with the previous
+                // `NoTurnReviewAgent` the runtime resolved a review model on every agent-end
+                // boundary and then reported a clean turn, so no finding could ever be emitted.
+                Arc::new(super::review::ModelTurnReviewAgent::new(
+                    cwd.to_path_buf(),
+                    Arc::clone(&turn_services),
+                )),
                 cwd.to_path_buf(),
             )
             // `createMainWatchdogReview(() => currentContext, { getThinkingLevel: () =>

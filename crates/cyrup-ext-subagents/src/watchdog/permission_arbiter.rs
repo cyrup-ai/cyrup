@@ -14,11 +14,22 @@
 //! | the child config does not decode | `unavailable` | `…configuration is invalid: <detail>` |
 //! | there is no child watchdog | `unavailable` | `…unavailable because the child watchdog is disabled.` |
 //! | the request or the context was cancelled BEFORE the turn | `cancelled` | `Watchdog permission decision was cancelled.` |
-//! | it is cancelled DURING the turn | `error` | `…failed closed: Watchdog permission decision was aborted.` |
+//! | it is cancelled DURING the turn | `cancelled` | `Watchdog permission decision was cancelled.` |
 //! | the model called no tool | `malformed` | `…returned no decision.` |
-//! | the turn exceeded `agentEndTimeoutMs` | `timeout` | `…failed closed: Watchdog permission decision timed out.` |
+//! | the turn exceeded `agentEndTimeoutMs` | `timeout` | `Watchdog permission decision timed out.` |
 //! | anything else threw | `error` | `…failed closed: <detail>` |
 //! | the model answered `deny` | `deny` | the model's own reason |
+//!
+//! **The last three rows moved to v0.68.0 with UW-5, deliberately.** `git diff v0.43.0 v0.68.0 --
+//! src/watchdog/permission-arbiter.ts` restructured the `Promise.race` three ways: the timeout arm
+//! now RESOLVES `finish(false, "…timed out.", "timeout")` (`:136 @v0.68.0`) instead of rejecting
+//! into the catch, so its message no longer carries the `failed closed:` prefix; a mid-turn cancel
+//! now resolves `finish(false, "…was cancelled.", "cancelled")` (`:138 @v0.68.0`) instead of only
+//! calling `agent.abort()` and surfacing as `error`; and a `completed` latch (`:49,:52-53`) makes
+//! `finish` idempotent so a losing race arm cannot append a SECOND `permission.decision` record.
+//! All three still deny (`approved: false` on every arm), so the security property is unchanged and
+//! the file now matches the tag its turn is ported from. The generic `failed closed:` catch arm
+//! (`:143-145 @v0.68.0`) is untouched and still carries the prefix.
 //!
 //! Both audit records are written whatever happens (`:44,52-61`): a `permission.request` before any
 //! work, and a `permission.decision` afterwards carrying `requestCreatedAt` so the two join. A
@@ -517,6 +528,17 @@ pub struct WatchdogPermissionRequest {
     pub audit_path: Option<PathBuf>,
     /// Cancellation.
     pub cancel: Option<CancelToken>,
+    /// `request.ctx` as far as this module needs it (`permission-arbiter.ts:96 @v0.68.0`, which
+    /// passes the whole `ExtensionContext` to `resolveWatchdogReviewModel`): the LIVE session model
+    /// and reasoning level, snapshotted by the caller at the moment the `ask` fires.
+    ///
+    /// `None` is upstream's context-less call and leaves the arbiter with only
+    /// `subagents.watchdog.children.model` to resolve from — which is unset in the DEFAULT config,
+    /// so the arbiter then fails closed with "the current Pi session model is unavailable"
+    /// ([`super::review::resolve_watchdog_review_model`]). Every ask in an ordinary session takes
+    /// the inherited-model arm, so a production caller that leaves this `None` has wired an arbiter
+    /// that can never approve.
+    pub session: Option<super::review::WatchdogSessionContext>,
 }
 
 /// The model's answer (`PermissionDecisionParams`, `permission-arbiter.ts:11-14`).
@@ -542,6 +564,100 @@ pub fn permission_decision_parameters_schema() -> Value {
     })
 }
 
+/// `const tool: AgentTool<typeof PermissionDecisionParams, { recorded: boolean }>`
+/// (`permission-arbiter.ts:78-88 @v0.68.0`) — the complete descriptor of the ONE tool an arbiter
+/// turn may call, and the only path from a model call to a decision.
+///
+/// It exists as a value, and not as loose helpers, for exactly the reason
+/// [`super::review::WatchdogWarnTool`] does: before it the seam carried only
+/// [`permission_decision_parameters_schema`], so a bound [`WatchdogPermissionAgent`] had no way to
+/// learn the tool's NAME (`:79`), its LABEL (`:80`), its DESCRIPTION (`:81` — prompt text the model
+/// reads to decide what the tool is for) or its `executionMode` (`:83`), and had to re-derive the
+/// first-call-wins latch (`:85`) from prose.
+///
+/// [CYRUP-DELTA] this file is otherwise a v0.43.0 port; this type is pinned to **v0.68.0**, where
+/// the tool object is unchanged from v0.43.0 except for its surrounding `run()`. Every citation on
+/// it says `@v0.68.0` so the two tags never silently mix.
+#[derive(Debug, Default)]
+pub struct WatchdogPermissionDecisionTool {
+    decision: std::sync::Mutex<Option<WatchdogPermissionDecision>>,
+}
+
+impl WatchdogPermissionDecisionTool {
+    /// `name: "watchdog_permission_decision"` (`:79 @v0.68.0`).
+    pub const NAME: &'static str = "watchdog_permission_decision";
+    /// `label: "Watchdog permission decision"` (`:80 @v0.68.0`).
+    pub const LABEL: &'static str = "Watchdog permission decision";
+    /// `description` (`:81 @v0.68.0`).
+    pub const DESCRIPTION: &'static str =
+        "Approve or deny this exact child tool call. Call exactly once.";
+    /// `executionMode: "sequential"` (`:83 @v0.68.0`) — distinct from the agent-wide
+    /// `toolExecution: "sequential"` (`:127`), and load-bearing for the same reason the latch is:
+    /// two calls in one assistant message must reach [`Self::record`] in order.
+    pub const SEQUENTIAL: bool = true;
+    /// `content: [{ type: "text", text: "Permission decision recorded." }]` (`:86 @v0.68.0`) —
+    /// returned for EVERY well-formed call, including the ignored later ones.
+    pub const RESULT_TEXT: &'static str = "Permission decision recorded.";
+
+    /// A fresh, undecided latch.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `parameters: PermissionDecisionParams` (`:82 @v0.68.0`).
+    #[must_use]
+    pub fn parameters(&self) -> Value {
+        permission_decision_parameters_schema()
+    }
+
+    /// `execute(_toolCallId, params) { if (!decision) decision = params; … }` (`:84-87 @v0.68.0`)
+    /// — the FIRST well-formed call wins and every later one is ignored but still answered
+    /// [`Self::RESULT_TEXT`].
+    ///
+    /// # Errors
+    ///
+    /// The per-field message for arguments the schema would have rejected. Upstream's typebox
+    /// validation happens in the harness before `execute` and surfaces to the model as a tool
+    /// error; this reproduces that so a malformed decision becomes a correction the model can act
+    /// on rather than a silent no-decision.
+    pub fn record(&self, params: &Value) -> Result<(), String> {
+        let object = params
+            .as_object()
+            .ok_or_else(|| format!("{} requires an object argument.", Self::NAME))?;
+        let decision = object
+            .get("decision")
+            .and_then(Value::as_str)
+            .filter(|value| *value == "approve" || *value == "deny")
+            .ok_or_else(|| format!("{}.decision must be approve or deny.", Self::NAME))?;
+        let reason = object
+            .get("reason")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("{}.reason must be a string.", Self::NAME))?;
+        let mut slot = self
+            .decision
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.is_none() {
+            *slot = Some(WatchdogPermissionDecision {
+                decision: decision.to_string(),
+                reason: reason.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// `if (!decision) …` (`:130 @v0.68.0`) — what the turn recorded, or `None` for the model that
+    /// called no tool, which denies as `malformed`.
+    #[must_use]
+    pub fn decision(&self) -> Option<WatchdogPermissionDecision> {
+        self.decision
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
 /// The arbiter's system prompt (`permission-arbiter.ts:130-135`), lines in upstream's order.
 #[must_use]
 pub fn permission_arbiter_system_prompt() -> String {
@@ -564,6 +680,10 @@ pub fn permission_arbiter_prompt(tool_name: &str, preview: &str) -> String {
 pub struct WatchdogPermissionTurn<'a> {
     /// The child watchdog config, for the model/thinking selection.
     pub config: &'a ChildWatchdogConfig,
+    /// `request.ctx`'s live model + reasoning level (`permission-arbiter.ts:96 @v0.68.0`), carried
+    /// from [`WatchdogPermissionRequest::session`]. See that field for why a `None` here is the
+    /// difference between an arbiter that can approve and one that cannot.
+    pub session: Option<&'a super::review::WatchdogSessionContext>,
     /// [`permission_arbiter_system_prompt`].
     pub system_prompt: String,
     /// [`permission_arbiter_prompt`].
@@ -592,13 +712,168 @@ pub trait WatchdogPermissionAgent: Send + Sync {
     ) -> Result<Option<WatchdogPermissionDecision>, String>;
 }
 
+/// `createWatchdogPermissionArbiter`'s own `run()` body (`permission-arbiter.ts:94-132 @v0.68.0`)
+/// — the REAL arbiter: resolve the arbiter's model against the child's config and the live session,
+/// run one nested [`cyrup_agent::Agent`] turn whose only tool is
+/// [`WatchdogPermissionDecisionTool`], and report what it recorded.
+///
+/// Bound in production at `crate::prompt_runtime`'s `with_permission_gate` call, the single
+/// production arbiter site.
+///
+/// [CYRUP-DELTA] this file is a v0.43.0 port; THIS type is pinned to **v0.68.0** and says so on
+/// every citation. Nothing around it changed — the audit pair, the timeout, the fail-closed
+/// mapping and the cancel checks all still live in [`request_watchdog_permission`], which is
+/// upstream's `:44-93` + `:134-152`.
+pub struct ModelTurnPermissionAgent {
+    registry: std::sync::Arc<dyn super::model_selection::WatchdogModelRegistry>,
+    auth_resolver: std::sync::Arc<dyn super::review::WatchdogReviewAuthResolver>,
+    turn: super::agent_turn::WatchdogAgentTurn,
+}
+
+impl std::fmt::Debug for ModelTurnPermissionAgent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelTurnPermissionAgent")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ModelTurnPermissionAgent {
+    /// Bind the arbiter to a model registry, an auth resolver and the late-resolved capability
+    /// backend the nested turn streams through.
+    #[must_use]
+    pub fn new(
+        registry: std::sync::Arc<dyn super::model_selection::WatchdogModelRegistry>,
+        auth_resolver: std::sync::Arc<dyn super::review::WatchdogReviewAuthResolver>,
+        services: super::register_main::WatchdogServicesFn,
+    ) -> Self {
+        Self {
+            registry,
+            auth_resolver,
+            turn: super::agent_turn::WatchdogAgentTurn::new(services),
+        }
+    }
+
+    /// `beforeToolCall: async ({ toolCall }) => toolCall.name === tool.name ? undefined :
+    /// { block: true, reason: … }` (`permission-arbiter.ts:126 @v0.68.0`) — the arbiter's
+    /// execution-time tool policy, as an `Arc` so the value production installs on the nested
+    /// agent is a value a caller can hold and exercise.
+    ///
+    /// This accessor is the ONLY source of the policy [`Self::turn_request`] installs, so a test
+    /// over it is a test over the closure the running turn is built with rather than over a
+    /// re-declared copy.
+    #[must_use]
+    #[allow(clippy::type_complexity)]
+    pub fn tool_call_block_reason(
+        &self,
+    ) -> std::sync::Arc<dyn Fn(&str) -> Option<String> + Send + Sync> {
+        std::sync::Arc::new(|name: &str| {
+            (name != WatchdogPermissionDecisionTool::NAME)
+                .then(|| format!("Permission arbiter tool '{name}' is not allowed."))
+        })
+    }
+
+    /// The exact [`super::agent_turn::WatchdogTurnRequest`] [`WatchdogPermissionAgent::decide`]
+    /// hands the nested agent once the model is resolved: the ONE decision tool
+    /// (`permission-arbiter.ts:121 @v0.68.0`) bound to `latch`, and the execution-time policy
+    /// (`:126`).
+    ///
+    /// Extracted from `decide` so the construction is reachable without a provider, a model or a
+    /// stream: `decide` builds nothing of its own, so a test over this function is a test over
+    /// what production installs.
+    pub(crate) fn turn_request<'a>(
+        &self,
+        system_prompt: String,
+        prompt: String,
+        selection: &'a super::review::WatchdogReviewModelSelection,
+        latch: &std::sync::Arc<WatchdogPermissionDecisionTool>,
+        cancel: CancelToken,
+    ) -> super::agent_turn::WatchdogTurnRequest<'a> {
+        super::agent_turn::WatchdogTurnRequest {
+            system_prompt,
+            prompt,
+            selection,
+            // `tools: [tool]` (`:121 @v0.68.0`) — exactly one, and it writes the latch this call
+            // reads back.
+            tools: vec![std::sync::Arc::new(
+                super::agent_turn::WatchdogPermissionDecisionAgentTool::new(std::sync::Arc::clone(
+                    latch,
+                )),
+            )],
+            block_reason: self.tool_call_block_reason(),
+            cancel,
+        }
+    }
+}
+
+#[async_trait]
+impl WatchdogPermissionAgent for ModelTurnPermissionAgent {
+    async fn decide(
+        &self,
+        turn: WatchdogPermissionTurn<'_>,
+    ) -> Result<Option<WatchdogPermissionDecision>, String> {
+        use std::sync::Arc;
+
+        // `const config = childResolvedConfig(childConfig); const selection = await
+        // resolveWatchdogReviewModel(request.ctx, config)` (`:95-96 @v0.68.0`). `request.ctx` is the
+        // LIVE session — without it the default config has no model at all and every ask denies.
+        let config = super::register_child::child_resolved_config(turn.config);
+        let ctx = super::model_selection::WatchdogModelContext {
+            registry: self.registry.as_ref(),
+            current_model: turn.session.and_then(|session| session.model.clone()),
+        };
+        let selection = super::review::resolve_watchdog_review_model(
+            &ctx,
+            &config,
+            self.auth_resolver.as_ref(),
+            turn.session
+                .and_then(|session| session.thinking_level.as_deref()),
+        )?;
+        let decision_tool = Arc::new(WatchdogPermissionDecisionTool::new());
+        let messages = self
+            .turn
+            .run(self.turn_request(
+                turn.system_prompt,
+                turn.prompt,
+                &selection,
+                &decision_tool,
+                turn.cancel.clone(),
+            ))
+            .await?;
+        // A transport failure does not reject `prompt` in cyrup — it arrives as a terminal `error`
+        // assistant message. Surfacing it as `Err` is what keeps the fail-closed table honest: the
+        // decision is recorded as `error` rather than as `malformed`, which would claim the model
+        // answered badly when it never answered at all.
+        if super::review::final_stop_reason(&messages) == super::runtime::ReviewStopReason::Error {
+            let detail = messages
+                .iter()
+                .rev()
+                .find_map(|message| {
+                    message
+                        .get("errorMessage")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| "the arbiter model turn failed".to_string());
+            return Err(detail);
+        }
+        Ok(decision_tool.decision())
+    }
+}
+
 /// The no-agent stand-in: reaches no decision, so the arbiter denies as `malformed`.
 ///
-/// This is the correct behaviour for a deployment with no provider bound — the arbiter exists to
-/// answer an `ask` in a process with no human, and "no answer" must never mean "allowed".
+/// **Test fixture only, as of UW-5.** Production binds [`ModelTurnPermissionAgent`]; this remains
+/// because it is the honest double for "the model answered nothing", which is the arm the
+/// fail-closed table's `malformed` row describes and which ~10 tests in this module (and
+/// `prompt_runtime`'s `a_child_with_no_policy_installs_no_gate`) drive. It is NOT
+/// `#[allow(dead_code)]`-ed and it is NOT bound anywhere in production — a `pub` type whose doc
+/// claimed to be the deployment default while production bound something else would be exactly the
+/// doc-asserts-wiring defect this task set out to remove.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoDecisionPermissionAgent;
 
+#[cfg(test)]
 #[async_trait]
 impl WatchdogPermissionAgent for NoDecisionPermissionAgent {
     async fn decide(
@@ -627,15 +902,28 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
-/// `finish` (`permission-arbiter.ts:47-61`): write the decision record, then return it.
+/// `finish` (`permission-arbiter.ts:50-65 @v0.68.0`): write the decision record, then return it.
+///
+/// `completed` is upstream's idempotence latch (`:49`, `:52-53`): the FIRST call writes the audit
+/// record and every later one returns the same shape without appending a second. cyrup's
+/// `tokio::select!` has exactly one winner so it cannot double-fire today, but the latch is what
+/// makes that a property of this function rather than of its one caller's control flow.
 fn finish(
     request: &WatchdogPermissionRequest,
+    completed: &std::cell::Cell<bool>,
     created_at: i64,
     approved: bool,
     reason: &str,
     decision: &str,
 ) -> WatchdogPermissionResult {
     let reason = concise_reason(reason);
+    if completed.replace(true) {
+        return WatchdogPermissionResult {
+            approved,
+            reason,
+            source: "watchdog",
+        };
+    }
     let mut record = Map::new();
     record.insert("type".into(), json!("permission.decision"));
     record.insert("createdAt".into(), json!(now_millis()));
@@ -664,6 +952,8 @@ pub async fn request_watchdog_permission(
 ) -> WatchdogPermissionResult {
     let preview = permission_args_preview(&request.args);
     let created_at = now_millis();
+    // `let completed = false` (`:49 @v0.68.0`) — see [`finish`].
+    let completed = std::cell::Cell::new(false);
     let mut base = Map::new();
     base.insert("type".into(), json!("permission.request"));
     base.insert("createdAt".into(), json!(created_at));
@@ -678,6 +968,7 @@ pub async fn request_watchdog_permission(
         Err(error) => {
             return finish(
                 request,
+                &completed,
                 created_at,
                 false,
                 &format!("Watchdog permission arbiter configuration is invalid: {error}"),
@@ -688,6 +979,7 @@ pub async fn request_watchdog_permission(
     let Some(child_config) = child_config else {
         return finish(
             request,
+            &completed,
             created_at,
             false,
             "Watchdog permission arbiter is unavailable because the child watchdog is disabled.",
@@ -698,6 +990,7 @@ pub async fn request_watchdog_permission(
     if cancel.is_cancelled() {
         return finish(
             request,
+            &completed,
             created_at,
             false,
             "Watchdog permission decision was cancelled.",
@@ -707,51 +1000,80 @@ pub async fn request_watchdog_permission(
 
     let turn = WatchdogPermissionTurn {
         config: &child_config,
+        // `resolveWatchdogReviewModel(request.ctx, config)` (`:96 @v0.68.0`) — the live session,
+        // snapshotted by the caller when the `ask` fired.
+        session: request.session.as_ref(),
         system_prompt: permission_arbiter_system_prompt(),
         prompt: permission_arbiter_prompt(&request.tool_name, &preview),
         decision_tool_schema: permission_decision_parameters_schema(),
         cancel: cancel.clone(),
     };
-    // `Promise.race([agent.prompt(...), timeout])` (`:147-153`): the timeout aborts the agent and
-    // rejects, which lands in the catch below as a `timeout` decision.
+    // `Promise.race([run(), timeout, abort])` (`:134-142 @v0.68.0`). The `agentEndTimeoutMs` bound
+    // stays OUTSIDE the agent (upstream's `setTimeout`, `:136`) and cancels the token so the nested
+    // run actually stops rather than being abandoned mid-stream.
     let outcome = tokio::select! {
         biased;
-        () = cancel.cancelled() => Err("Watchdog permission decision was aborted.".to_string()),
+        // `:137-141 @v0.68.0` — the abort arm RESOLVES a `cancelled` decision. At v0.43.0 it only
+        // called `agent.abort()` and the rejected prompt surfaced through the catch as `error`;
+        // both deny, and this is the answer at the tag the turn is ported from.
+        () = cancel.cancelled() => ArbiterOutcome::Cancelled,
         raced = tokio::time::timeout(
             Duration::from_millis(child_config.agent_end_timeout_ms),
             agent.decide(turn),
         ) => match raced {
-            Ok(result) => result,
+            Ok(Ok(decision)) => ArbiterOutcome::Decided(decision),
+            Ok(Err(reason)) => ArbiterOutcome::Failed(reason),
             Err(_) => {
+                // `agent?.abort()` before resolving (`:136 @v0.68.0`).
                 cancel.cancel();
-                Err("Watchdog permission decision timed out.".to_string())
+                ArbiterOutcome::TimedOut
             }
         },
     };
 
     match outcome {
-        Ok(Some(decision)) => {
+        // `:131-132 @v0.68.0`.
+        ArbiterOutcome::Decided(Some(decision)) => {
             let approved = decision.decision == "approve";
             finish(
                 request,
+                &completed,
                 created_at,
                 approved,
                 &decision.reason,
                 &decision.decision,
             )
         }
-        Ok(None) => finish(
+        // `if (!decision) return finish(false, "…returned no decision.", "malformed")`
+        // (`:130 @v0.68.0`).
+        ArbiterOutcome::Decided(None) => finish(
             request,
+            &completed,
             created_at,
             false,
             "Watchdog permission arbiter returned no decision.",
             "malformed",
         ),
-        Err(reason) => {
-            // A cancel that lands DURING the turn takes this generic catch arm, not the `cancelled`
-            // one: upstream's mid-turn abort aborts the agent, whose rejected `prompt` lands in
-            // `catch` (`:127-137`) and is reported as `error`. Only the PRE-turn check (`:73`)
-            // produces the `cancelled` decision.
+        // `:136 @v0.68.0` — RESOLVED, so no `failed closed:` prefix.
+        ArbiterOutcome::TimedOut => finish(
+            request,
+            &completed,
+            created_at,
+            false,
+            "Watchdog permission decision timed out.",
+            "timeout",
+        ),
+        // `:138 @v0.68.0`.
+        ArbiterOutcome::Cancelled => finish(
+            request,
+            &completed,
+            created_at,
+            false,
+            "Watchdog permission decision was cancelled.",
+            "cancelled",
+        ),
+        // The generic `catch` (`:143-145 @v0.68.0`), which still carries the prefix.
+        ArbiterOutcome::Failed(reason) => {
             let decision = if reason.contains("timed out") {
                 "timeout"
             } else {
@@ -759,6 +1081,7 @@ pub async fn request_watchdog_permission(
             };
             finish(
                 request,
+                &completed,
                 created_at,
                 false,
                 &format!("Watchdog permission arbiter failed closed: {reason}"),
@@ -766,6 +1089,22 @@ pub async fn request_watchdog_permission(
             )
         }
     }
+}
+
+/// Which arm of the `Promise.race` (`permission-arbiter.ts:134-142 @v0.68.0`) won.
+///
+/// A named enum rather than a `Result<Option<_>, String>` because v0.68.0 has four distinct losing
+/// arms with three different decision strings, and collapsing them onto one `Err` is exactly what
+/// made the v0.43.0 shape report a mid-turn cancel as `error`.
+enum ArbiterOutcome {
+    /// `run()` returned — with or without a recorded decision.
+    Decided(Option<WatchdogPermissionDecision>),
+    /// The `agentEndTimeoutMs` arm.
+    TimedOut,
+    /// The abort arm.
+    Cancelled,
+    /// The agent itself reported a failure, which lands in upstream's `catch`.
+    Failed(String),
 }
 
 #[cfg(test)]
@@ -801,6 +1140,7 @@ mod tests {
             raw_watchdog_config: raw,
             audit_path: audit,
             cancel: None,
+            session: None,
         }
     }
 
@@ -826,6 +1166,37 @@ mod tests {
         ) -> Result<Option<WatchdogPermissionDecision>, String> {
             Err(self.0.to_string())
         }
+    }
+
+    /// A registry that knows no model at all — the "no model bound" configuration, which is what
+    /// every unconfigured child has until a session model reaches it.
+    struct EmptyRegistry;
+
+    impl crate::watchdog::model_selection::WatchdogModelRegistry for EmptyRegistry {
+        fn available(&self) -> Vec<crate::watchdog::model_selection::WatchdogModelInfo> {
+            Vec::new()
+        }
+        fn find(
+            &self,
+            _provider: &str,
+            _id: &str,
+        ) -> Option<crate::watchdog::model_selection::WatchdogModelInfo> {
+            None
+        }
+        fn has_configured_auth(
+            &self,
+            _model: &crate::watchdog::model_selection::WatchdogModelInfo,
+        ) -> bool {
+            false
+        }
+    }
+
+    fn real_arbiter() -> ModelTurnPermissionAgent {
+        ModelTurnPermissionAgent::new(
+            std::sync::Arc::new(EmptyRegistry),
+            std::sync::Arc::new(crate::watchdog::review::AmbientReviewAuth),
+            std::sync::Arc::new(|| None),
+        )
     }
 
     struct HangingAgent;
@@ -1029,6 +1400,11 @@ mod tests {
         );
     }
 
+    /// UPDATED DELIBERATELY at v0.68.0 (UW-5). The timeout arm now RESOLVES
+    /// `finish(false, "Watchdog permission decision timed out.", "timeout")`
+    /// (`permission-arbiter.ts:136 @v0.68.0`) instead of rejecting into the catch, so the message no
+    /// longer carries the `failed closed:` prefix v0.43.0 gave it. The property this test exists for
+    /// — a hung turn DENIES, on the CONFIGURED bound — is unchanged and is asserted first.
     #[tokio::test]
     async fn a_hanging_agent_denies_on_the_configured_timeout() {
         let mut config = default_watchdog_config();
@@ -1038,12 +1414,197 @@ mod tests {
         let raw = encode_child_watchdog_config(
             resolve_child_watchdog_config(&config, None, None, None).as_ref(),
         );
-        let result = request_watchdog_permission(&request(raw, None), &HangingAgent).await;
+        let dir = TempDir::new().unwrap();
+        let audit = dir.path().join("audit.jsonl");
+        let result =
+            request_watchdog_permission(&request(raw, Some(audit.clone())), &HangingAgent).await;
+        assert!(!result.approved);
+        assert_eq!(result.reason, "Watchdog permission decision timed out.");
+        let lines: Vec<Value> = std::fs::read_to_string(&audit)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2, "exactly ONE decision record (the latch)");
+        assert_eq!(lines[1]["decision"], json!("timeout"));
+        assert_eq!(lines[1]["approved"], json!(false));
+    }
+
+    /// `:137-141 @v0.68.0` — a cancel that lands DURING the turn resolves `cancelled`, where
+    /// v0.43.0 only aborted the agent and the rejection surfaced through the catch as `error`. Both
+    /// deny; this pins WHICH answer, because the fail-closed table in the module doc names it.
+    #[tokio::test]
+    async fn a_mid_turn_cancel_denies_as_cancelled_not_as_error() {
+        let cancel = CancelToken::new();
+        let mut req = request(Some(enabled_child_config()), None);
+        req.cancel = Some(cancel.clone());
+        let spawned = tokio::spawn(async move { cancel.cancel() });
+        let result = request_watchdog_permission(&req, &HangingAgent).await;
+        spawned.await.unwrap();
+        assert!(!result.approved);
+        assert_eq!(result.reason, "Watchdog permission decision was cancelled.");
+    }
+
+    /// **The production construction, pinned.** [`ModelTurnPermissionAgent::decide`] builds
+    /// nothing of its own once the model is resolved — the tool list and the execution-time policy
+    /// both come out of [`ModelTurnPermissionAgent::turn_request`] — so this drives the EXACT
+    /// [`crate::watchdog::agent_turn::WatchdogTurnRequest`] a real arbiter turn is built with,
+    /// rather than a closure the test itself declared.
+    ///
+    /// `tools: [tool]` + `beforeToolCall` (`permission-arbiter.ts:121,126 @v0.68.0`): exactly one
+    /// tool, and every other name refused at execution time. Gutting
+    /// [`ModelTurnPermissionAgent::tool_call_block_reason`] to `Arc::new(|_| None)` — which would
+    /// let an arbiter turn call anything the harness ever supplies — fails the refusal assertions
+    /// below.
+    #[test]
+    fn the_production_arbiter_turn_installs_one_tool_and_refuses_every_other_name() {
+        let agent = real_arbiter();
+        let selection = crate::watchdog::review::WatchdogReviewModelSelection {
+            model: crate::watchdog::model_selection::WatchdogModelInfo::new("anthropic", "m"),
+            thinking_level: "off".to_string(),
+            auth: crate::watchdog::review::WatchdogReviewAuth::default(),
+            explicit: true,
+        };
+        let latch = std::sync::Arc::new(WatchdogPermissionDecisionTool::new());
+        let request = agent.turn_request(
+            permission_arbiter_system_prompt(),
+            permission_arbiter_prompt("write", "{}"),
+            &selection,
+            &latch,
+            CancelToken::new(),
+        );
+
+        let offered: Vec<&str> = request.tools.iter().map(|tool| tool.name()).collect();
+        assert_eq!(
+            offered,
+            vec![WatchdogPermissionDecisionTool::NAME],
+            "the arbiter turn gets exactly one tool"
+        );
+
+        // The execution-time layer, read off the value production installed on the turn.
+        assert_eq!(
+            (request.block_reason)(WatchdogPermissionDecisionTool::NAME),
+            None
+        );
+        for forbidden in ["read", "write", "bash", "watchdog_warn", "subagent"] {
+            assert_eq!(
+                (request.block_reason)(forbidden).as_deref(),
+                Some(format!("Permission arbiter tool '{forbidden}' is not allowed.").as_str()),
+                "the arbiter must refuse '{forbidden}' at execution time"
+            );
+        }
+    }
+
+    /// **Fail-closed, through the REAL agent: no model bound.** An armed child whose registry knows
+    /// no model and whose session carries none cannot resolve an arbiter model, so
+    /// [`ModelTurnPermissionAgent::decide`] returns `Err` before any turn — and the ask DENIES,
+    /// recorded as `error` with the `failed closed:` prefix (`:143-145 @v0.68.0`).
+    ///
+    /// This is the arm an embedder hits first (the default config sets no model at all), and it is
+    /// the one where a fail-OPEN would be silent: nothing failed loudly, the model simply was not
+    /// there.
+    #[tokio::test]
+    async fn the_real_arbiter_denies_when_no_model_can_be_resolved() {
+        let dir = TempDir::new().unwrap();
+        let audit = dir.path().join("audit.jsonl");
+        let result = request_watchdog_permission(
+            &request(Some(enabled_child_config()), Some(audit.clone())),
+            &real_arbiter(),
+        )
+        .await;
+        assert!(
+            !result.approved,
+            "an arbiter with no model must NEVER approve: {result:?}"
+        );
+        assert!(
+            result
+                .reason
+                .starts_with("Watchdog permission arbiter failed closed: "),
+            "{}",
+            result.reason
+        );
+        let lines: Vec<Value> = std::fs::read_to_string(&audit)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2, "both audit records, always: {lines:#?}");
+        assert_eq!(lines[1]["approved"], json!(false));
+        assert_eq!(lines[1]["decision"], json!("error"));
+    }
+
+    /// **Fail-closed, through the REAL agent: cancelled.** A token already cancelled when the ask
+    /// fires denies as `cancelled` without reaching a model (`:137-141 @v0.68.0`) — asserted here
+    /// against the production agent rather than against a double, because the fail-closed table is
+    /// a property of the pair, not of the stand-in.
+    #[tokio::test]
+    async fn the_real_arbiter_denies_a_cancelled_request() {
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let mut req = request(Some(enabled_child_config()), None);
+        req.cancel = Some(cancel);
+        let result = request_watchdog_permission(&req, &real_arbiter()).await;
+        assert!(!result.approved, "a cancelled ask must never approve");
+        assert_eq!(result.reason, "Watchdog permission decision was cancelled.");
+    }
+
+    /// **Fail-closed, through the REAL agent: the child watchdog is disabled.** No config at all is
+    /// the shipped default, and it denies as `unavailable` before any turn (`:74 @v0.68.0`).
+    #[tokio::test]
+    async fn the_real_arbiter_denies_when_the_child_watchdog_is_disabled() {
+        let result = request_watchdog_permission(&request(None, None), &real_arbiter()).await;
         assert!(!result.approved);
         assert_eq!(
             result.reason,
-            "Watchdog permission arbiter failed closed: Watchdog permission decision timed out."
+            "Watchdog permission arbiter is unavailable because the child watchdog is disabled."
         );
+    }
+
+    /// `if (completed) return …` (`:52-53 @v0.68.0`) — the idempotence latch, asserted on the
+    /// function rather than on its caller's control flow.
+    #[test]
+    fn finish_appends_exactly_one_decision_record() {
+        let dir = TempDir::new().unwrap();
+        let audit = dir.path().join("audit.jsonl");
+        let req = request(None, Some(audit.clone()));
+        let completed = std::cell::Cell::new(false);
+        let first = finish(&req, &completed, 1, false, "first", "timeout");
+        let second = finish(&req, &completed, 1, false, "second", "cancelled");
+        assert_eq!(first.reason, "first");
+        assert_eq!(
+            second.reason, "second",
+            "the caller still sees its own shape"
+        );
+        let lines: Vec<&str> = std::fs::read_to_string(&audit)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .map(|s| Box::leak(s.into_boxed_str()) as &str)
+            .collect();
+        assert_eq!(lines.len(), 1, "only the FIRST finish writes");
+        let record: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(record["decision"], json!("timeout"));
+    }
+
+    /// GAP-3 — the first well-formed call wins and later ones are ignored but still answered
+    /// (`:85-86 @v0.68.0`); a malformed one is a tool ERROR the model can correct.
+    #[test]
+    fn the_decision_tool_latches_the_first_well_formed_call() {
+        let tool = WatchdogPermissionDecisionTool::new();
+        assert!(tool.decision().is_none());
+        assert!(
+            tool.record(&json!({ "decision": "maybe", "reason": "x" }))
+                .is_err()
+        );
+        assert!(tool.record(&json!({ "decision": "approve" })).is_err());
+        assert!(tool.decision().is_none(), "a rejected call records nothing");
+        tool.record(&json!({ "decision": "approve", "reason": "first" }))
+            .unwrap();
+        tool.record(&json!({ "decision": "deny", "reason": "second" }))
+            .unwrap();
+        let decision = tool.decision().unwrap();
+        assert_eq!(decision.decision, "approve");
+        assert_eq!(decision.reason, "first");
     }
 
     #[tokio::test]

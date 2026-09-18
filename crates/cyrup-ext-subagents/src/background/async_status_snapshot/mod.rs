@@ -24,28 +24,29 @@
 //! reason, that [`crate::background::inspect_rpc`] records for `INSPECT_REPLY_KIND` /
 //! `INSPECT_WIDGET_PREFIX`.
 //!
-//! # ⚠ [`encode_async_status_snapshot_widget`] has NO production caller in cyrup, and that is the
-//! # decision, not an oversight
+//! # Where this module is reached from in production
 //!
-//! Upstream has exactly two callers: the subagent RPC bridge's `status` method
-//! (`extension/rpc.ts:725,749`), which cyrup has no equivalent of, and
-//! `ctx.ui.setWidget(WIDGET_KEY, encodeAsyncStatusSnapshotWidget(jobs))` (`tui/render.ts:2863`),
-//! reached only when `ctx.mode === "rpc"`. **cyrup's extension surface has no `set_widget`
-//! capability** — [`crate::tui::events`] already states this at length for the C21 async-jobs
-//! widget and names the same missing capability, *"a change outside this crate"*.
+//! Upstream has exactly two call sites, and cyrup now has both:
 //!
-//! So the encoder lands as public API with no in-crate caller, exactly as that widget did, and
-//! this paragraph is the record of it. Two things were deliberately NOT done instead:
+//! * **The subagent RPC bridge's `status` method** — pi
+//!   `buildAsyncStatusSnapshotForState(options.state, sessionId)` at `extension/rpc.ts:729` (the
+//!   in-memory tier) and `:753` (the executor tier) @v0.68.0. cyrup's port calls
+//!   [`state::build_async_status_snapshot_for_state`] from
+//!   `extension/rpc/mod.rs`'s `SubagentRpcBridge::fleet_and_snapshot`, on BOTH tiers exactly as
+//!   upstream calls it on both, so every `status` reply that crosses the inter-extension bus
+//!   carries an `asyncSnapshot` block. See [`crate::extension::rpc`] for the client contract.
+//! * **The RPC-mode widget slot** — pi
+//!   `ctx.ui.setWidget(WIDGET_KEY, encodeAsyncStatusSnapshotWidget(jobs))` (`tui/render.ts:3000`),
+//!   reached when `ctx.mode === "rpc"`. cyrup's port calls
+//!   [`encode_async_status_snapshot_widget`] from
+//!   `SubagentsExtension::publish_async_status_snapshot_widget`
+//!   (`extension/host/slash.rs`), driven by the same `SessionStart`/`AgentEnd`/`SessionShutdown`
+//!   edges that drive the human fleet-status widget. In `ExtMode::Rpc` the reader of that slot is
+//!   a machine, so it gets this document rather than ASCII columns.
 //!
-//! * the encoded line is **never appended to `control_status`'s text output**. Upstream emits it
-//!   through `setWidget` and never into the status report; splicing a 32 KiB JSON line into the
-//!   report would corrupt it for every reader that exists today in order to serve one that does
-//!   not.
-//! * no `SubagentExecutor::async_status_snapshot` entry point is invented. A host entry point
-//!   whose only caller is the test that proves it compiles is not an entry point, and the one
-//!   this surface actually wants (`set_widget`) is outside this crate.
-//!
-//! The module is reachable, correct and tested; it is waiting on a capability, not on a decision.
+//! Both paths run the jobs through [`state::async_status_snapshot_jobs_for_state`] first, so the
+//! `:31` session gate applies to both: a state that does not belong to the live session yields an
+//! EMPTY snapshot, never an unfiltered one.
 //!
 //! # `[CYRUP-DELTA]`s, each also recorded at its own seam
 //!
@@ -73,6 +74,18 @@ pub use types::{
 
 use crate::tui::fleet_state::AsyncRunView;
 
+/// pi `WIDGET_KEY` (`shared/types.ts:2789` @v0.68.0) — the host widget slot the ASYNC-JOBS
+/// document is published into, and the ONLY slot `renderWidget` (`tui/render.ts:2991-3008`) ever
+/// writes to or clears.
+///
+/// It is deliberately NOT [`crate::tui::fleet_status::FLEET_STATUS_WIDGET_KEY`]
+/// (`"subagent-fleet-status"`, `tui/fleet-status.ts:14`). Upstream runs the two widgets side by
+/// side under two distinct keys, and [`cyrup_ext::host::HostServices::set_widget`] takes the key
+/// as its first argument (`cyrup-ext/src/host/services.rs:376`), so nothing forces them to share
+/// a slot here either. Publishing the machine document into the fleet-status slot would REPLACE
+/// the always-on human widget, and clear it outright whenever the async roster is empty — a
+/// default-on regression to a shipped feature for every `--acp`/`--rpc` client.
+pub const ASYNC_STATUS_SNAPSHOT_WIDGET_KEY: &str = "subagent-async";
 /// pi `ASYNC_STATUS_SNAPSHOT_WIDGET_PREFIX` (`async-status-snapshot.ts:24`).
 pub const ASYNC_STATUS_SNAPSHOT_WIDGET_PREFIX: &str = "PI_SUBAGENT_ASYNC_JSON:";
 /// pi `ASYNC_STATUS_SNAPSHOT_KIND` (`async-status-projection.ts:8`).
@@ -96,9 +109,9 @@ where
 /// pi `encodeAsyncStatusSnapshotWidget` (`async-status-snapshot.ts:46-48`) — the snapshot as the
 /// single prefixed line a host widget slot carries.
 ///
-/// A `Vec<String>` of exactly one element, matching upstream's `string[]`: `setWidget` takes a
-/// line array, and collapsing it to a `String` here would mean re-wrapping it at the call site
-/// that does not exist yet (see this module's own note on that caller).
+/// A `Vec<String>` of exactly one element, matching upstream's `string[]`:
+/// [`cyrup_ext::host::HostServices::set_widget`] takes a line array, exactly as pi's `setWidget`
+/// does, so the caller passes this straight through (see this module's own note on that caller).
 ///
 /// A serialization failure yields the prefix with an EMPTY body rather than a panic
 /// (`lib.rs:19-24` denies `unwrap`/`expect`/`panic` crate-wide) — it cannot happen for

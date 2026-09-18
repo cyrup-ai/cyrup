@@ -36,6 +36,7 @@ use cyrup_ext::HostServices;
 use cyrup_ext::event::HostEvent;
 use cyrup_ext::host::{WidgetEffect, WidgetPlacement};
 use cyrup_ext::native::{ExtMode, HostCtx, NativeExtension};
+use cyrup_ext_subagents::background::async_status_snapshot::ASYNC_STATUS_SNAPSHOT_WIDGET_KEY;
 use cyrup_ext_subagents::extension::SubagentsExtension;
 use cyrup_ext_subagents::paths::Roots;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
@@ -436,12 +437,28 @@ async fn the_fleet_status_widget_is_published_and_cleared_through_live_host_serv
     )
     .await;
     let widgets = services.widgets.lock().expect("lock").clone();
-    let clear = widgets.last().expect("shutdown publishes a clear");
-    assert_eq!(clear.key, FLEET_STATUS_WIDGET_KEY);
+    // The shutdown block clears BOTH of this extension's widget slots, in upstream's order:
+    // `fleetStatus?.dispose()` takes the fleet-status key (`extension/index.ts:1063`) and
+    // `ctx.ui.setWidget(WIDGET_KEY, undefined)` takes the async-jobs key (`:1098`). So this looks
+    // the fleet-status clear up BY KEY rather than assuming it is the last call — which it stopped
+    // being when PB-8 added the second slot.
+    let clear = widgets
+        .iter()
+        .find(|effect| effect.key == FLEET_STATUS_WIDGET_KEY)
+        .unwrap_or_else(|| panic!("shutdown publishes a fleet-status clear; got {widgets:?}"));
     // EXT-047: the removal is pi's `setWidget(key, undefined)` — an absent `content` ARGUMENT
     // (`tui/fleet-status.ts:309,320`) — not a `{"content": null}` blob. `lines: None` is the only
     // shape that removes the key; anything else leaves the slot occupied.
     assert_eq!(clear.lines, None, "shutdown REMOVES the widget: {clear:?}");
+    let async_clear = widgets
+        .iter()
+        .find(|effect| effect.key == ASYNC_STATUS_SNAPSHOT_WIDGET_KEY)
+        .unwrap_or_else(|| panic!("shutdown also clears the async slot; got {widgets:?}"));
+    assert_eq!(
+        async_clear.lines, None,
+        "the async-jobs slot is REMOVED too, or a stale `PI_SUBAGENT_ASYNC_JSON:` line outlives \
+         the session: {async_clear:?}"
+    );
 }
 
 // =================================================================================================
