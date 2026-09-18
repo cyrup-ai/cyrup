@@ -136,7 +136,8 @@ pub use message::{
     format_missing_payload_message, format_undeliverable_message, result_display_summary,
 };
 pub use observer::{
-    CompletionBus, CompletionEvent, CompletionObserver, CompositeCompletionObserver,
+    BusAnnouncingCompletionObserver, CompletionBus, CompletionEvent, CompletionObserver,
+    CompositeCompletionObserver, SUBAGENT_ASYNC_COMPLETE_EVENT,
 };
 pub use results_watcher::{
     CompletionBand, CompletionNotification, DEDUP_TTL, LossReport, MAX_PROCESSING_ATTEMPTS,

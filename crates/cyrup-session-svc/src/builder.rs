@@ -1802,6 +1802,12 @@ impl SessionBuilder {
             Some(f) => f,
             None => provider_swap.clone(),
         };
+        // GAP-2 (UW-4/UW-5): hand the host-services backend the SAME live swap, so
+        // `HostServices::registered_provider` — pi
+        // `ctx.modelRegistry.getRegisteredProviderConfig(provider)` — answers with the provider the
+        // loop is currently streaming through. Done here and not at `LiveHostServices::new` because
+        // the ordering is forced: the swap wraps the provider that constructor already took.
+        host_services.attach_provider_swap(Arc::clone(&provider_swap));
         let mut agent_builder = cyrup_agent::AgentBuilder::new(agent_stream_fn)
             .system_prompt(system_prompt.clone())
             .thinking_level(thinking)

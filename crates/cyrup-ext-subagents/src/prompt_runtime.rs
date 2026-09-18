@@ -1464,6 +1464,15 @@ pub struct PermissionGate {
     raw_watchdog_config: Option<String>,
     audit_path: Option<PathBuf>,
     arbiter: Arc<dyn crate::watchdog::permission_arbiter::WatchdogPermissionAgent>,
+    /// UW-5 / GAP-1 — `request.ctx`, which upstream's arbiter resolves its model against
+    /// (`permission-arbiter.ts:96 @v0.68.0`). Resolved at ASK time, not at construction, because
+    /// the capability backend is late-bound and the session model can change under a gate that
+    /// outlives one model selection.
+    ///
+    /// Without it the arbiter has only `subagents.watchdog.children.model` to resolve from, which
+    /// the default config leaves unset — so every `ask` denies with "the current Pi session model is
+    /// unavailable" no matter which agent is bound. `None` is the embedder/test form.
+    session: Option<crate::watchdog::review::WatchdogSessionContextFn>,
 }
 
 impl std::fmt::Debug for PermissionGate {
@@ -1519,7 +1528,16 @@ impl PermissionGate {
                         args: input.clone(),
                         raw_watchdog_config: self.raw_watchdog_config.clone(),
                         audit_path: self.audit_path.clone(),
+                        // [CYRUP-DELTA] RESIDUAL, unchanged by UW-5: upstream races the turn
+                        // against `request.signal` AND `ctx.signal`
+                        // (`permission-arbiter.ts:139-140 @v0.68.0`). The cyrup `tool_call` hook
+                        // carries neither — `HostEvent::ToolCall` has no token and `HostCtx` exposes
+                        // none — so the arbiter's own `agentEndTimeoutMs` bound is the only thing
+                        // that stops a hung turn here. That bound is real and fails closed, so the
+                        // residual costs latency on an aborted child, never an approval.
                         cancel: None,
+                        // `resolveWatchdogReviewModel(request.ctx, config)` (`:96 @v0.68.0`).
+                        session: self.session.as_ref().and_then(|provider| provider()),
                     },
                     self.arbiter.as_ref(),
                 )
@@ -1746,12 +1764,17 @@ impl SubagentPromptRuntime {
     /// (`permission-arbiter.ts:63,86`) — an `ask` in a child whose watchdog is off has no reviewer
     /// and therefore denies.
     #[must_use]
+    ///
+    /// `session` is upstream's `request.ctx` (`permission-arbiter.ts:96 @v0.68.0`) as a LATE-bound
+    /// getter — see [`PermissionGate::session`] for why passing `None` here produces an arbiter
+    /// that can never approve in the default configuration.
     pub fn with_permission_gate(
         mut self,
         encoded_policy: Option<&str>,
         raw_watchdog_config: Option<String>,
         audit_path: Option<PathBuf>,
         arbiter: Arc<dyn crate::watchdog::permission_arbiter::WatchdogPermissionAgent>,
+        session: Option<crate::watchdog::review::WatchdogSessionContextFn>,
     ) -> Self {
         // pi `:285-286`: `const rules = decodePermissionRules(...); if (!rules) return;` — no
         // policy means no handler at all.
@@ -1763,12 +1786,14 @@ impl SubagentPromptRuntime {
                     raw_watchdog_config,
                     audit_path,
                     arbiter,
+                    session,
                 }),
                 Err(message) => Some(PermissionGate {
                     policy: PermissionPolicy::Invalid(message),
                     raw_watchdog_config,
                     audit_path,
                     arbiter,
+                    session,
                 }),
             };
         self
@@ -2385,6 +2410,17 @@ pub fn prompt_runtime_from_env(
     let permission_audit_path =
         non_empty(crate::watchdog::permission_arbiter::PERMISSION_AUDIT_PATH_ENV)
             .map(PathBuf::from);
+    // The arbiter's own model registry — the same `auth.json`-backed one the review builds from, so
+    // `hasConfiguredAuth` answers about the process's real credentials (`review.ts:107-109`).
+    let arbiter_registry: Arc<dyn crate::watchdog::model_selection::WatchdogModelRegistry> =
+        Arc::new(
+            crate::watchdog::model_selection::BuiltinWatchdogModelRegistry::new(
+                crate::watchdog::register_main::watchdog_config_dirs().as_ref(),
+            ),
+        );
+    let arbiter_session_registry = Arc::clone(&arbiter_registry);
+    let arbiter_services = Arc::clone(&services);
+    let arbiter_session_services = Arc::clone(&services);
 
     let runtime = SubagentPromptRuntime::from_parts(tool, rewrite, fanout_child == Some(true))
         .with_supervisor_tool(supervisor_tool)
@@ -2400,11 +2436,24 @@ pub fn prompt_runtime_from_env(
             permission_policy.as_deref(),
             raw_watchdog_config,
             permission_audit_path,
-            // `createWatchdogPermissionArbiter()` with no `streamFn` override
-            // (`permission-arbiter.ts:145`). cyrup binds no in-process model turn here for the
-            // same reason [`crate::watchdog::review::NoTurnReviewAgent`] exists, and the result is
-            // the fail-closed one: an `ask` denies as `malformed` rather than approving silently.
-            Arc::new(crate::watchdog::permission_arbiter::NoDecisionPermissionAgent),
+            // UW-5 — `createWatchdogPermissionArbiter()` with no `streamFn` override
+            // (`permission-arbiter.ts:156 @v0.68.0`): the REAL nested turn. This is the single
+            // production arbiter site; with the previous `NoDecisionPermissionAgent` every
+            // `ask`-tier tool inside a subagent denied as `malformed`, so a delegated agent under a
+            // merged policy was silently capped.
+            Arc::new(
+                crate::watchdog::permission_arbiter::ModelTurnPermissionAgent::new(
+                    arbiter_registry,
+                    Arc::new(crate::watchdog::review::AmbientReviewAuth),
+                    child_services_fn(&arbiter_services),
+                ),
+            ),
+            // GAP-1 — `request.ctx` (`:96 @v0.68.0`). Without this the arbiter resolves no model in
+            // the default configuration and the ask denies anyway, with a different sentence.
+            Some(child_watchdog_session_context(
+                &arbiter_session_services,
+                &arbiter_session_registry,
+            )),
         )
         .with_watchdog(watchdog, services)
         // SUBA-045 / pi `refreshChildToolDiagnostic` (`subagent-prompt-runtime.ts:98-103`), armed
@@ -2431,32 +2480,69 @@ fn child_watchdog_review(
     );
     let session_registry = Arc::clone(&registry);
     let session_services = Arc::clone(services);
+    let turn_services = Arc::clone(services);
     Arc::new(
         crate::watchdog::review::MainWatchdogReview::new(
             registry,
             Arc::new(crate::watchdog::review::AmbientReviewAuth),
-            Arc::new(crate::watchdog::review::NoTurnReviewAgent),
+            // UW-4 — the REAL model turn (`review.ts:324-358 @v0.68.0`), the child's half of the
+            // same binding `register_main` makes for the orchestrator. Previously
+            // `NoTurnReviewAgent`, so an armed child's every boundary reported clean.
+            Arc::new(crate::watchdog::review::ModelTurnReviewAgent::new(
+                cwd.to_path_buf(),
+                child_services_fn(&turn_services),
+            )),
             cwd.to_path_buf(),
         )
-        .with_session_context(Arc::new(move || {
-            let services = session_services
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()?;
-            let model = services.current_model().as_deref().and_then(|model| {
-                let info = crate::watchdog::register_main::watchdog_model_info(model)?;
-                Some(
-                    session_registry
-                        .find(&info.provider, &info.id)
-                        .unwrap_or(info),
-                )
-            });
-            Some(crate::watchdog::review::WatchdogSessionContext {
-                model,
-                thinking_level: services.thinking_level(),
-            })
-        })),
+        .with_session_context(child_watchdog_session_context(
+            &session_services,
+            &session_registry,
+        )),
     )
+}
+
+/// The child role's [`cyrup_ext::host::HostServices`] getter, over the late-bound slot
+/// `NativeExtension::set_host_services` fills. This is what the nested watchdog turn reads
+/// `registered_provider` and `session_id` off (pi `ctx.modelRegistry` / `ctx.sessionManager`,
+/// `review.ts:276-282 @v0.68.0`), and what `register_main` already hands its own review from the
+/// orchestrator side.
+fn child_services_fn(
+    services: &Arc<std::sync::Mutex<Option<Arc<dyn cyrup_ext::host::HostServices>>>>,
+) -> crate::watchdog::register_main::WatchdogServicesFn {
+    let services = Arc::clone(services);
+    Arc::new(move || {
+        services
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    })
+}
+
+/// `() => currentContext` for the CHILD role (`register-child.ts:77`) — the live session model and
+/// reasoning level, resolved at CALL time through the late-bound capability slot.
+///
+/// Shared by the child's review ([`child_watchdog_review`]) and its permission arbiter (GAP-1), so
+/// the two cannot resolve different models for the same session.
+fn child_watchdog_session_context(
+    services: &Arc<std::sync::Mutex<Option<Arc<dyn cyrup_ext::host::HostServices>>>>,
+    registry: &Arc<dyn crate::watchdog::model_selection::WatchdogModelRegistry>,
+) -> crate::watchdog::review::WatchdogSessionContextFn {
+    let services = Arc::clone(services);
+    let registry = Arc::clone(registry);
+    Arc::new(move || {
+        let services = services
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()?;
+        let model = services.current_model().as_deref().and_then(|model| {
+            let info = crate::watchdog::register_main::watchdog_model_info(model)?;
+            Some(registry.find(&info.provider, &info.id).unwrap_or(info))
+        });
+        Some(crate::watchdog::review::WatchdogSessionContext {
+            model,
+            thinking_level: services.thinking_level(),
+        })
+    })
 }
 
 #[cfg(test)]
@@ -2772,9 +2858,19 @@ mod permission_gate_tests {
         ));
     }
 
-    /// The `ask` tier with no model turn bound: [`NoDecisionPermissionAgent`] reaches no decision,
-    /// which the arbiter reports as `malformed` and the gate turns into a BLOCK. Fail-closed is the
-    /// whole point — a child has no human to ask.
+    /// The `ask` tier with the child watchdog DISABLED — which is what this env is, because
+    /// `env_extension` ships no `CHILD_WATCHDOG_CONFIG_ENV`.
+    ///
+    /// Production binds the real `ModelTurnPermissionAgent` here (`prompt_runtime.rs`'s single
+    /// `with_permission_gate` call), but the arbiter never reaches it: `request_watchdog_permission`
+    /// takes its "the child watchdog is disabled" arm (`permission-arbiter.ts:74 @v0.68.0`) and
+    /// denies as `unavailable` BEFORE any agent runs. That is the reason asserted below — not
+    /// `malformed`, which is the different arm where a bound model DID run and called no tool
+    /// (covered by `watchdog_permission_arbiter_integration`'s
+    /// `an_arbiter_turn_that_calls_no_tool_denies_as_malformed`).
+    ///
+    /// Either way the gate turns it into a BLOCK. Fail-closed is the whole point — a child has no
+    /// human to ask.
     #[tokio::test]
     async fn an_ask_tier_tool_fails_closed_and_writes_both_audit_records() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2856,6 +2952,7 @@ mod permission_gate_tests {
             None,
             None,
             Arc::new(crate::watchdog::permission_arbiter::NoDecisionPermissionAgent),
+            None,
         );
         assert!(runtime.permission_gate().is_none());
         assert!(runtime.is_inert());

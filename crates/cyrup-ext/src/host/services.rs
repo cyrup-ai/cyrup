@@ -552,6 +552,26 @@ pub trait HostServices: Send + Sync {
         None
     }
 
+    /// pi `ctx.modelRegistry.getRegisteredProviderConfig(provider)`
+    /// (`pi-subagents/src/watchdog/permission-arbiter.ts:99-104` and
+    /// `src/watchdog/review.ts:276-281` @v0.68.0) — the SESSION's own provider for `provider_id`,
+    /// so a subagent-internal model call (the watchdog review, the permission arbiter) streams
+    /// through the same transport, credentials, proxy and catalog overlay the session does instead
+    /// of rebuilding one from the process environment.
+    ///
+    /// `None` is upstream's `undefined`, which falls through to the generic `streamSimple`: either
+    /// no live session is attached, or this is not the provider it streams against. A caller MUST
+    /// still apply upstream's api-equality guard (`registeredProvider.api === selection.model.api`)
+    /// before using the returned provider — a provider registered for a different wire API would
+    /// encode the request wrongly.
+    ///
+    /// Defaulted to `None` so no existing backend changes behaviour; `LiveHostServices` is the one
+    /// implementation and answers from the live [`cyrup_provider::Provider`] the session's agent
+    /// loop streams through, so a mid-session cross-provider `/model` swap is honoured.
+    fn registered_provider(&self, _provider_id: &str) -> Option<Arc<dyn cyrup_provider::Provider>> {
+        None
+    }
+
     // --- exec capability (R-08-030); denied by default ---
     /// Run a DIRECT argv (shell:false) command (Pi `execCommand`, exec.ts:34-46). `opts` is the
     /// `ExecOptions` bag (`{cwd, timeoutMs, signalId}`; NO `env` — Pi's real `execCommand` never

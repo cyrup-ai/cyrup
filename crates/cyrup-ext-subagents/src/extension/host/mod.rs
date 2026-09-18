@@ -88,6 +88,26 @@ pub struct SubagentsExtension {
     /// `fleetViewPlacement` (`extension/index.ts:334,382`). Published through
     /// [`cyrup_ext::HostServices::set_widget`] by [`Self::refresh_fleet_status_widget`].
     fleet_status: Arc<std::sync::Mutex<crate::tui::fleet_status::SubagentFleetStatus>>,
+    /// PB-8 — the `Arc<SubagentTool>` [`cyrup_ext::NativeExtension::init`] REGISTERED with the
+    /// host, captured so [`cyrup_ext::NativeExtension::on_bus_event`] dispatches an RPC request
+    /// into the SAME instance the model uses: same resolved description, same
+    /// `allow_mutating_management`, same single-dispatch `DispatchGuard`.
+    ///
+    /// That equivalence is upstream's. `registerSubagentRpcBridge`'s `execute` option is
+    /// `executor.executePublic` (`extension/index.ts:762`), which is the identical seam the
+    /// registered `ToolDefinition.execute` calls at `:776`.
+    ///
+    /// **Not [`Self::subagent_tool`].** That constructor builds a FRESH tool with a default
+    /// description and its own `DispatchGuard`, and its doc says plainly that it exists for tests
+    /// and non-`InitApi` callers; routing RPC through it would give the bridge a second,
+    /// independent single-dispatch budget. Filled in the [`RegistrationMode::Full`] arm only — a
+    /// `ChildSafe` child subscribes to no bus topic, so it never reads this.
+    rpc_tool: std::sync::OnceLock<Arc<SubagentTool>>,
+    /// PB-8 — pi's `registerSubagentRpcBridge` closure state (`extension/rpc.ts:821`): the
+    /// process-lifetime opaque fleet-key map the `status` reply's `fleet` block is numbered from.
+    /// Held on the extension for the same reason upstream holds it in the registration closure —
+    /// `fleet-<n>` is only comparable across replies if the same map answers all of them.
+    rpc_bridge: crate::extension::rpc::SubagentRpcBridge,
 }
 
 impl SubagentsExtension {
@@ -254,6 +274,8 @@ impl SubagentsExtension {
             fleet_inspector_open: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fleet_view_enabled,
             fleet_status: Arc::new(std::sync::Mutex::new(fleet_status)),
+            rpc_tool: std::sync::OnceLock::new(),
+            rpc_bridge: crate::extension::rpc::SubagentRpcBridge::new(),
         }
     }
 

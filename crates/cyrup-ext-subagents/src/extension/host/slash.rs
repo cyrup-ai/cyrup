@@ -167,6 +167,111 @@ impl SubagentsExtension {
         }
     }
 
+    /// SCOPE_10 — publish (or clear) the ASYNC-JOBS widget slot's MACHINE document: pi
+    /// `renderWidget` (`tui/render.ts:2991-3008` @v0.68.0), whole.
+    ///
+    /// The slot is [`crate::background::async_status_snapshot::ASYNC_STATUS_SNAPSHOT_WIDGET_KEY`]
+    /// (`"subagent-async"`, `shared/types.ts:2789`) — upstream's `WIDGET_KEY`, the only key
+    /// `renderWidget` writes or clears. The always-on fleet-status slot
+    /// ([`crate::tui::fleet_status::FLEET_STATUS_WIDGET_KEY`], `tui/fleet-status.ts:14`) is a
+    /// DIFFERENT widget upstream and stays a different widget here, so an `--acp`/`--rpc` client
+    /// keeps the human fleet rows and gains the machine document beside them.
+    ///
+    /// **Upstream's order is kept exactly**: the `jobs.length === 0` branch is tested FIRST
+    /// (`:2992`) and only the `setWidget` clear inside it is guarded by `ctx.hasUI` (`:2995`); the
+    /// bare `if (!ctx.hasUI) return` sits AFTER that branch, at `:2998`. Upstream's order is
+    /// load-bearing because `:2993-2994` run OUTSIDE the `hasUI` guard; cyrup has no analogue for
+    /// either statement (see the empty branch below), so here the two orders are provably
+    /// equivalent — `set_widget` fires iff `has_ui && !jobs.is_empty()` either way, and no test can
+    /// distinguish them. The order is matched anyway, so that adding a cyrup-side analogue later
+    /// lands in the arm upstream put it in rather than one behind a guard it does not have.
+    ///
+    /// The job list is
+    /// [`crate::background::async_status_snapshot::async_status_snapshot_jobs_for_state`]'s, so the
+    /// `:31` session gate applies here exactly as it applies to the RPC `status` reply: a state
+    /// that does not belong to the live session publishes NOTHING, rather than one instance's runs
+    /// into another's widget slot.
+    fn publish_async_status_snapshot_widget(
+        &self,
+        services: &dyn cyrup_ext::host::HostServices,
+        state: &crate::tui::fleet_state::FleetState,
+        has_ui: bool,
+    ) {
+        use crate::background::async_status_snapshot::{
+            ASYNC_STATUS_SNAPSHOT_WIDGET_KEY, AsyncStatusSnapshotOptions,
+            async_status_snapshot_jobs_for_state, encode_async_status_snapshot_widget,
+        };
+
+        let placement = match self
+            .fleet_status
+            .lock()
+            .map(|widget| widget.placement())
+            .unwrap_or_default()
+        {
+            crate::tui::fleet_status::FleetViewPlacement::BelowEditor => {
+                cyrup_ext::host::WidgetPlacement::BelowEditor
+            }
+            crate::tui::fleet_status::FleetViewPlacement::AboveEditor => {
+                cyrup_ext::host::WidgetPlacement::AboveEditor
+            }
+        };
+        let session = crate::identity::SessionId::parse_opt(state.current_session_id.as_deref());
+        let jobs = async_status_snapshot_jobs_for_state(Some(state), session.as_ref());
+        // `:2992-2997` — an empty roster REMOVES the widget rather than publishing an empty
+        // document, so a machine reader is not handed a snapshot that says nothing. `:2993-2994`'s
+        // `resetWidgetLayoutSession()` / `asyncWidgetUpdates.delete(ctx.ui)` have no analogue:
+        // both belong to upstream's mounted-component update path (`:3005-3007`), which
+        // [`cyrup_ext::host::HostServices::set_widget`]'s fire-and-forget payload does not have.
+        if jobs.is_empty() {
+            // `:2995` — the clear itself, and only the clear, is behind `ctx.hasUI`.
+            if has_ui {
+                services.set_widget(ASYNC_STATUS_SNAPSHOT_WIDGET_KEY, None, placement);
+            }
+            return;
+        }
+        // `:2998` — with no UI there is no widget slot to write to at all.
+        if !has_ui {
+            return;
+        }
+        let lines = encode_async_status_snapshot_widget(
+            jobs,
+            &AsyncStatusSnapshotOptions {
+                generated_at: Some(crate::time::now_epoch_millis()),
+                ..AsyncStatusSnapshotOptions::default()
+            },
+        );
+        services.set_widget(ASYNC_STATUS_SNAPSHOT_WIDGET_KEY, Some(&lines), placement);
+    }
+
+    /// PB-8 — pi `rpcBridge.emitReady(ctx)` (`extension/rpc.ts:841-843`, called from
+    /// `extension/index.ts:1186`): announce on [`crate::extension::rpc::SUBAGENT_RPC_READY_EVENT`]
+    /// that the RPC surface is live, carrying the SAME document a `ping` reply carries.
+    ///
+    /// A client that attached before this process came up cannot know when to start; without this
+    /// it would have to emit `ping` on a timer until one was answered. The ready payload also
+    /// carries the whole capability set and the live session block, so a host reads the contract
+    /// off one event instead of negotiating for it.
+    ///
+    /// Silent when no capability backend is bound: the bus IS the backend here
+    /// ([`cyrup_ext::host::HostServices::emit_event`] →
+    /// [`cyrup_ext::bus::SharedBus::emit`]), so there is nowhere to announce to. Upstream's
+    /// `emitReady` accepts a null ctx and still emits, because its event bus exists independently
+    /// of any session — cyrup's does not, and a by-value session genuinely has no bus at all
+    /// (`cyrup-ext/src/host/services.rs:468`'s default is a no-op for exactly this reason).
+    pub(crate) fn emit_rpc_ready(&self) {
+        let Some(services) = self.executor.host_services() else {
+            tracing::debug!(
+                target: "cyrup_ext_subagents::rpc",
+                "no capability backend bound; subagent RPC ready is not announced"
+            );
+            return;
+        };
+        services.emit_event(
+            crate::extension::rpc::SUBAGENT_RPC_READY_EVENT,
+            &crate::extension::rpc::ping::ping_data(&self.executor, &self.cwd),
+        );
+    }
+
     /// pi's `SubagentFleetStatus.refresh()` tick (`tui/fleet-status.ts:285,301-350`) — recollect
     /// the active-agent roster and republish (or clear) the status widget.
     ///
@@ -178,7 +283,12 @@ impl SubagentsExtension {
     /// `AgentEnd` (repaint after every turn) and `SessionShutdown` (clear). The change-detector
     /// ([`crate::tui::fleet_status::SubagentFleetStatus::render_key`]) still suppresses redundant
     /// publishes exactly as upstream's does, so a no-op edge costs one fold and no host call.
-    pub(crate) async fn refresh_fleet_status_widget(&self, cwd: &Path, has_ui: bool) {
+    pub(crate) async fn refresh_fleet_status_widget(
+        &self,
+        cwd: &Path,
+        has_ui: bool,
+        mode: cyrup_ext::ExtMode,
+    ) {
         use std::sync::atomic::Ordering;
 
         // pi's `fleetViewEnabled` gate (`extension/index.ts:378`): with the fleet view off there is
@@ -197,6 +307,28 @@ impl SubagentsExtension {
                 self.fleet_inspector_open.load(Ordering::Acquire),
             )
             .await;
+        // SCOPE_10 / pi `renderWidget`'s RPC branch (`tui/render.ts:2999-3002` @v0.68.0):
+        //
+        // ```ts
+        // if ((ctx as { mode?: string }).mode === "rpc") {               // :2999
+        //     ctx.ui.setWidget(WIDGET_KEY, encodeAsyncStatusSnapshotWidget(jobs));
+        //     return;
+        // }
+        // ```
+        //
+        // In RPC mode the thing reading the ASYNC-JOBS slot is a MACHINE, so it gets the machine
+        // document — one `PI_SUBAGENT_ASYNC_JSON:` line carrying the bounded snapshot — instead of
+        // the component upstream mounts for a human, and
+        // [`crate::background::async_status_snapshot::encode_async_status_snapshot_widget`] has a
+        // production caller.
+        //
+        // It does NOT `return`: upstream's `return` leaves `renderWidget`, whose ONLY slot is
+        // `WIDGET_KEY`. The always-on fleet-status widget (`tui/fleet-status.ts:14`'s own key) is
+        // driven by its own 500 ms tick and is untouched by that branch, so the human widget below
+        // must keep running in `--acp`/`--rpc` too.
+        if mode == cyrup_ext::ExtMode::Rpc {
+            self.publish_async_status_snapshot_widget(services.as_ref(), &state, has_ui);
+        }
         let now = crate::time::now_epoch_millis();
         let payload = {
             let Ok(mut widget) = self.fleet_status.lock() else {

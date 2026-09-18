@@ -104,6 +104,8 @@ mod management_actions_tool_dispatch_integration;
 mod registration_commands_integration;
 mod subagents_optin_gate_integration;
 mod wait_tool_registration_integration;
+mod watchdog_model_turn_integration;
+mod watchdog_permission_arbiter_integration;
 
 // ---- companion subsystems: host services, intercom delivery, supervisor channel ----
 mod companions_hostservices_proof;

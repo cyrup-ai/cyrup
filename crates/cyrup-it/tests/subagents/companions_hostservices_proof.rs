@@ -10,7 +10,10 @@
 //!   via `HostServices::inject_message(..., trigger_turn=true)` (R-SA-101), on the REAL scripted
 //!   backend — NOT the stderr `LoggingCompletionSink`. Proven by binding a recording `HostServices`
 //!   into the executor, installing the real completion watcher, dropping a terminal `ResultFile`, and
-//!   asserting `inject_message` fired with `trigger_turn=true` and the `subagent-notify` custom type.
+//!   asserting the host's ACKNOWLEDGED injection seam (`inject_message_ack` — what
+//!   `HostServicesCompletionSink` delivers through, because only a real `InjectOutcome::Accepted`
+//!   licenses deleting the run's sole result payload) fired with `trigger_turn=true` and the
+//!   `subagent-notify` custom type.
 //!
 //! These exercise `SubagentExecutor::{set_host_services, resolve_context, install_completion_watcher}`
 //! end to end — the seams `crates/cyrup-session-svc/src/builder.rs`'s P-1 `load_native_with_services`
@@ -29,7 +32,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cyrup_core::{AssistantMessage, Content, Message, StopReason, Usage};
-use cyrup_ext::host::HostServices;
+use cyrup_ext::host::{HostServices, InjectOutcome};
 use cyrup_ext_subagents::background::{ResultFile, RunId, RunMode, RunState};
 use cyrup_ext_subagents::extension::SubagentExecutor;
 use cyrup_ext_subagents::fork_context::ContextMode;
@@ -158,13 +161,38 @@ async fn fork_branches_from_the_real_session_file_handle_not_the_mtime_heuristic
 }
 
 // =================================================================================================
-// (e) LIVE COMPLETION TURN-INJECTION: inject_message(trigger_turn=true), not the stderr sink.
+// (e) LIVE COMPLETION TURN-INJECTION: inject_message_ack(trigger_turn=true), not the stderr sink.
 // =================================================================================================
 
+/// A host backend that records every injection, wired the way the ONE production backend
+/// (`cyrup-session-svc`'s `LiveHostServices`, `host_services.rs:1578-1613`) is: both capability
+/// methods funnel into the same recording queue, so the fire-and-forget and the ACKNOWLEDGED seam
+/// cannot be two different delivery routes.
+///
+/// Implementing only `inject_message` would make this test vacuous rather than strict: the
+/// completion sink under test is `HostServicesCompletionSink`, which delivers through
+/// `inject_message_ack` (`background/watch/sink.rs:104-119`) precisely because it holds a
+/// background run's SOLE terminal result file and may only destroy it against a real
+/// `InjectOutcome::Accepted`. The trait's `inject_message_ack` default denies
+/// (`cyrup-ext/src/host/services.rs:530-539`), so a recorder missing it records nothing and every
+/// delivery defers forever.
 #[derive(Default)]
 struct RecordingInjectServices {
-    /// (content, custom_type, display, trigger_turn) of each `inject_message` call.
+    /// (content, custom_type, display, trigger_turn) of each injection, from either seam.
     calls: Mutex<Vec<(String, Option<String>, bool, bool)>>,
+}
+
+impl RecordingInjectServices {
+    /// The single delivery route both capability methods share — `LiveHostServices`'s
+    /// `enqueue_injection` (`host_services.rs:1083-1106`) reduced to "the session took it".
+    fn record(&self, content: &str, custom_type: Option<&str>, display: bool, trigger_turn: bool) {
+        self.calls.lock().expect("inject lock").push((
+            content.to_string(),
+            custom_type.map(str::to_string),
+            display,
+            trigger_turn,
+        ));
+    }
 }
 
 impl HostServices for RecordingInjectServices {
@@ -184,13 +212,26 @@ impl HostServices for RecordingInjectServices {
         _details: Option<&serde_json::Value>,
         trigger_turn: bool,
     ) -> Result<(), String> {
-        self.calls.lock().expect("inject lock").push((
-            content.to_string(),
-            custom_type.map(str::to_string),
-            display,
-            trigger_turn,
-        ));
+        self.record(content, custom_type, display, trigger_turn);
         Ok(())
+    }
+
+    fn inject_message_ack(
+        &self,
+        content: &str,
+        custom_type: Option<&str>,
+        display: bool,
+        _details: Option<&serde_json::Value>,
+        trigger_turn: bool,
+    ) -> Result<tokio::sync::oneshot::Receiver<InjectOutcome>, String> {
+        self.record(content, custom_type, display, trigger_turn);
+        // A live session resolves this once the message is really in the transcript; this recorder
+        // IS the transcript, so the message is in it by the time the receiver is handed back.
+        // `Accepted` is the only licence the sink has to consume the run's payload (R-SA-099).
+        let (ack, rx) = tokio::sync::oneshot::channel();
+        ack.send(InjectOutcome::Accepted)
+            .map_err(|_| "ack receiver dropped".to_string())?;
+        Ok(rx)
     }
 }
 
@@ -210,6 +251,11 @@ fn completed_result(run_id: &str) -> ResultFile {
         success: true,
         cwd: PathBuf::from("/tmp"),
         session_file: None,
+        // SUBA-016: this fixture is a plain tool-launched run, not a scheduled one, so it carries
+        // no `ScheduleOrigin` (pi `AsyncStatus.scheduleOrigin` is set only by the scheduled-run
+        // manager). Spelled out because `ResultFile` has no `Default`, so the field's addition
+        // broke this literal.
+        schedule_origin: None,
         results: Vec::new(),
         workflow_children: None,
         workflow_receipt: None,
@@ -276,7 +322,7 @@ async fn background_completion_injects_a_turn_triggering_message_on_the_real_hos
         }
         if Instant::now() >= deadline {
             panic!(
-                "inject_message never fired: the completion did not reach the live host services"
+                "inject_message_ack never fired: the completion did not reach the live host services"
             );
         }
         tokio::time::sleep(Duration::from_millis(25)).await;

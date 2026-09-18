@@ -150,6 +150,17 @@ impl Harness {
         &self.session
     }
 
+    /// The session's working directory — the temp dir every relative tool path resolves against,
+    /// and the one this harness removes on drop.
+    ///
+    /// A test that asserts a file was or was NOT written has to name THIS directory: the test
+    /// process's own cwd is the cargo target/workspace dir, which no tool in the session ever
+    /// writes to, so `PathBuf::from("probe").exists()` is vacuously false there whatever the
+    /// session did.
+    pub fn cwd(&self) -> &std::path::Path {
+        self._temp.path()
+    }
+
     /// The scripted provider (reconfigure responses mid-test).
     pub fn provider(&self) -> &Arc<ScriptedProvider> {
         &self.provider

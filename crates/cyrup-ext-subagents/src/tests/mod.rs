@@ -29,6 +29,7 @@ mod dynamic_collect_record_fidelity;
 mod dynamic_group_acceptance_parity;
 mod management_actions_integration;
 mod read_only_agent_name_alternation;
+mod rpc_bridge_integration;
 mod runtime_agent_registration_integration;
 mod spawn_temp_file_cleanup;
 mod steer_delivery_integration;
