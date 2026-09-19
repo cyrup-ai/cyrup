@@ -11,13 +11,27 @@
 //!
 //! # Scope of this port
 //!
-//! Only the read path is ported here: [`get_agent_refinement_path`], [`parse_refinement_file`] and
-//! [`append_agent_refinement_overlay`]. Upstream's WRITE half — `collectBoundedRefinementEvidence`,
-//! `validateRefinementProposal` and `handleRefinementAction` (the `refine` / `refine.show` /
-//! `refine.rollback` management actions) — is a separate v0.43.0 management surface that this
-//! crate does not yet register, and porting it does not belong on the spawn path. The read half is
-//! independently complete: an overlay file authored by any means (upstream, or by hand) is applied
-//! exactly as upstream applies it, and an absent file is the no-op that virtually every spawn hits.
+//! Both halves are ported, and the pin moved from v0.43.0 to **v0.68.0** with the write half
+//! (upstream's `src/agents/agent-refinements.ts` is 624 lines at that tag). This file holds the
+//! READ path — [`get_agent_refinement_path`], [`parse_refinement_file`] and
+//! [`append_agent_refinement_overlay`] — which the spawn path needs and which nothing else may
+//! depend on the shape of. The WRITE half lives in two submodules beside it so this file stays
+//! the one the spawn path reads:
+//!
+//! * [`proposal`] — `validateRefinementProposal` (`:448`), `proposalSchema` (`:474`),
+//!   `proposalFromChild` (`:502`), `proposalTask` (`:514`) and `guidanceFromProposal` (`:534`).
+//! * [`action`] — `serializeRefinementFile` (`:239`), `writeRefinementFile` (`:262`),
+//!   `metadataFor` (`:277`), `hashPrompt` (`:143`), `readExisting` (`:165`), `resolveOneAgent`
+//!   (`:538`) and `handleRefinementAction` (`:546`) — the `refine` / `refine.show` /
+//!   `refine.rollback` management verbs.
+//!
+//! The evidence collector the `refine` verb feeds on is
+//! [`crate::exec::refinement_evidence`] (`collectBoundedRefinementEvidence`, `:349`), a separate
+//! module because it reads the FLEET projection rather than this file's format.
+//!
+//! [`parse_refinement_file`] is what makes the write half provably correct: [`action`]'s
+//! serializer is derived from this parser and re-parses every file before renaming it into place,
+//! so a file this crate cannot read back is never written.
 //!
 //! # Why the on-disk and prompt markers keep upstream's literal `pi-subagents-` spelling
 //!
@@ -44,28 +58,43 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+/// pi `handleRefinementAction` (`agent-refinements.ts:546`) and the write primitives it drives.
+pub(crate) mod action;
+/// pi `validateRefinementProposal` (`agent-refinements.ts:448`) and the proposal-child plumbing.
+pub(crate) mod proposal;
+
 /// pi `REFINEMENT_DIR` (`agent-refinements.ts:10`).
 const REFINEMENT_DIR: &str = "refinements";
 /// pi `CURRENT_FENCE` (`agent-refinements.ts:11`).
-const CURRENT_FENCE: &str = "pi-subagents-refinement-current";
+pub(crate) const CURRENT_FENCE: &str = "pi-subagents-refinement-current";
 /// pi `SNAPSHOTS_FENCE` (`agent-refinements.ts:12`).
-const SNAPSHOTS_FENCE: &str = "pi-subagents-refinement-snapshots-json";
-/// pi `MAX_EVIDENCE_ITEMS` (`agent-refinements.ts:13`) — the `evidence.maxItems` default a
-/// metadata block that omits the field parses to.
-const MAX_EVIDENCE_ITEMS: f64 = 8.0;
+pub(crate) const SNAPSHOTS_FENCE: &str = "pi-subagents-refinement-snapshots-json";
+/// pi `MAX_EVIDENCE_ITEMS` (`agent-refinements.ts:13`) — the collector's own item cap AND the
+/// `evidence.maxItems` default a metadata block that omits the field parses to.
+///
+/// `u32`, not `f64`: this is a COUNT, and it is consumed as one by
+/// [`crate::exec::refinement_evidence`] (`items.len() >= MAX_EVIDENCE_ITEMS as usize`). The
+/// `f64` the parser and [`RefinementEvidenceLimits`] need is produced losslessly by
+/// [`RefinementEvidenceLimits::defaults`] below, so there is exactly ONE set of caps for the
+/// collector, the writer's `metadataFor` and this parser's defaults.
+pub(crate) const MAX_EVIDENCE_ITEMS: u32 = 8;
 /// pi `MAX_AGE_DAYS` (`agent-refinements.ts:14`).
-const MAX_AGE_DAYS: f64 = 14.0;
+pub(crate) const MAX_AGE_DAYS: u32 = 14;
 /// pi `MAX_ITEM_BYTES` (`agent-refinements.ts:15`).
-const MAX_ITEM_BYTES: f64 = 2_048.0;
+pub(crate) const MAX_ITEM_BYTES: u32 = 2_048;
 /// pi `MAX_PACKET_BYTES` (`agent-refinements.ts:16`).
-const MAX_PACKET_BYTES: f64 = 16_384.0;
+pub(crate) const MAX_PACKET_BYTES: u32 = 16_384;
+/// pi `REFINEMENT_FORMAT_VERSION` (`agent-refinements.ts:9`). Embedded in [`METADATA_PREFIX`],
+/// which is the literal the parser matches and the serializer emits; a test pins the two together
+/// rather than a comment.
+pub(crate) const REFINEMENT_FORMAT_VERSION: u32 = 1;
 
 /// The literal prefix of pi's metadata regex `/^<!-- pi-subagents-refinement:v1\n…/`
 /// (`agent-refinements.ts:178`). Anchored at index 0 (the regex has no `m` flag, so `^` is
 /// start-of-STRING).
-const METADATA_PREFIX: &str = "<!-- pi-subagents-refinement:v1\n";
+pub(crate) const METADATA_PREFIX: &str = "<!-- pi-subagents-refinement:v1\n";
 /// The metadata regex's closing literal `\n-->\n`.
-const METADATA_SUFFIX: &str = "\n-->\n";
+pub(crate) const METADATA_SUFFIX: &str = "\n-->\n";
 
 /// pi `RefinementMetadata["base"]` (`agent-refinements.ts:58-62`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,6 +114,26 @@ pub struct RefinementEvidenceLimits {
     pub max_age_days: f64,
     pub item_bytes: f64,
     pub total_bytes: f64,
+}
+
+impl RefinementEvidenceLimits {
+    /// pi `metadataFor`'s `evidence` block (`agent-refinements.ts:283-288`) — the SAME four
+    /// constants the collector bounds itself by, rendered as the `f64`s this module's parser reads
+    /// back and as the values the writer stamps into a new metadata block.
+    ///
+    /// `f64::from(u32)` is exact for every `u32`, so this conversion is lossless and carries no
+    /// `cast_precision_loss`. The FIELD types stay `f64` on purpose: upstream's parse accepts any
+    /// JSON number here with no integrality check, and that tolerance is a property of the file
+    /// format rather than of these constants.
+    #[must_use]
+    pub fn defaults() -> Self {
+        Self {
+            max_items: f64::from(MAX_EVIDENCE_ITEMS),
+            max_age_days: f64::from(MAX_AGE_DAYS),
+            item_bytes: f64::from(MAX_ITEM_BYTES),
+            total_bytes: f64::from(MAX_PACKET_BYTES),
+        }
+    }
 }
 
 /// pi `RefinementMetadata` (`agent-refinements.ts:54-69`).
@@ -121,13 +170,13 @@ pub struct ParsedRefinementFile {
 
 /// pi `record(value)` (`agent-refinements.ts:121-123`): an object that is not an array and not
 /// `null`. `serde_json::Value::Object` already excludes both.
-fn record(value: Option<&Value>) -> Option<&serde_json::Map<String, Value>> {
+pub(crate) fn record(value: Option<&Value>) -> Option<&serde_json::Map<String, Value>> {
     value.and_then(Value::as_object)
 }
 
 /// pi `text(value)` (`agent-refinements.ts:125-127`): a string whose TRIMMED form is non-empty,
 /// returned trimmed.
-fn text(value: Option<&Value>) -> Option<&str> {
+pub(crate) fn text(value: Option<&Value>) -> Option<&str> {
     value
         .and_then(Value::as_str)
         .map(str::trim)
@@ -136,7 +185,7 @@ fn text(value: Option<&Value>) -> Option<&str> {
 
 /// pi `textArray(value)` (`agent-refinements.ts:129-132`): a non-array is `[]`; entries that are
 /// not non-empty strings are dropped.
-fn text_array(value: Option<&Value>) -> Vec<String> {
+pub(crate) fn text_array(value: Option<&Value>) -> Vec<String> {
     value
         .and_then(Value::as_array)
         .map(|items| {
@@ -339,11 +388,14 @@ pub fn parse_refinement_file(markdown: &str, label: &str) -> Result<ParsedRefine
                 file_path: file_path.to_string(),
                 system_prompt_sha256: system_prompt_sha256.to_string(),
             },
-            evidence: RefinementEvidenceLimits {
-                max_items: number_or(evidence.get("maxItems"), MAX_EVIDENCE_ITEMS),
-                max_age_days: number_or(evidence.get("maxAgeDays"), MAX_AGE_DAYS),
-                item_bytes: number_or(evidence.get("itemBytes"), MAX_ITEM_BYTES),
-                total_bytes: number_or(evidence.get("totalBytes"), MAX_PACKET_BYTES),
+            evidence: {
+                let defaults = RefinementEvidenceLimits::defaults();
+                RefinementEvidenceLimits {
+                    max_items: number_or(evidence.get("maxItems"), defaults.max_items),
+                    max_age_days: number_or(evidence.get("maxAgeDays"), defaults.max_age_days),
+                    item_bytes: number_or(evidence.get("itemBytes"), defaults.item_bytes),
+                    total_bytes: number_or(evidence.get("totalBytes"), defaults.total_bytes),
+                }
             },
         },
         current: current.to_string(),
@@ -599,8 +651,14 @@ mod tests {
         assert_eq!(parsed.current, "Be terse.");
         assert!(parsed.snapshots.is_empty());
         // The omitted `evidence` fields fall back to pi's constants rather than to zero.
-        assert_eq!(parsed.metadata.evidence.max_items, MAX_EVIDENCE_ITEMS);
-        assert_eq!(parsed.metadata.evidence.total_bytes, MAX_PACKET_BYTES);
+        assert_eq!(
+            parsed.metadata.evidence.max_items,
+            f64::from(MAX_EVIDENCE_ITEMS)
+        );
+        assert_eq!(
+            parsed.metadata.evidence.total_bytes,
+            f64::from(MAX_PACKET_BYTES)
+        );
 
         let with_empty_fence = refinement_file("r", "Be terse.", "");
         assert!(parse_refinement_file(&with_empty_fence, "f").is_err());

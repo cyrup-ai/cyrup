@@ -119,6 +119,12 @@ pub enum SlashCommandName {
     /// user-facing half of the `guide` action: same reader, same packaged documents, same
     /// unknown-topic message.
     SubagentsGuide,
+    /// VL-S13 — `/subagents-refine <agent>` (pi `slash/slash-commands.ts:960-971` @v0.68.0). The
+    /// user-facing half of the `refine` action, and the command upstream's OWN refusal sentence
+    /// names (`agents/agent-refinements.ts:548`) — so that error text is a lie until this exists.
+    /// It dispatches `refine` only; `refine.show`/`refine.rollback` have no slash surface
+    /// upstream either.
+    SubagentsRefine,
 }
 
 impl SlashCommandName {
@@ -145,11 +151,12 @@ impl SlashCommandName {
             SlashCommandName::SubagentsFleet => "subagents-fleet",
             SlashCommandName::SubagentsStop => "subagents-stop",
             SlashCommandName::SubagentsGuide => "subagents-guide",
+            SlashCommandName::SubagentsRefine => "subagents-refine",
         }
     }
 
     /// Parse a bare command name (no leading `/`) back into its typed variant, or `None` if it
-    /// does not match any of the 13. Case-sensitive, exact match only (mirrors R-SA-008's
+    /// does not match any entry in [`SLASH_COMMANDS`]. Case-sensitive, exact match only (mirrors R-SA-008's
     /// "exact string equality only, no fuzzy matching" convention applied here to command names).
     #[must_use]
     pub fn from_str_exact(name: &str) -> Option<Self> {
@@ -277,6 +284,16 @@ pub const SLASH_COMMANDS: &[SlashCommandDescriptor] = &[
         name: SlashCommandName::SubagentsGuide,
         usage: "Usage: /subagents-guide [topic]",
         description: "Show a packaged subagents guide topic",
+    },
+    // VL-S13: `/subagents-refine` (`slash/slash-commands.ts:960-971` @v0.68.0). `description` is
+    // upstream's verbatim (`:961`); `usage` is upstream's own error text (`:966`), reused as the
+    // usage line exactly as `/subagents-guide` reuses `:713` — it is the sentence the user is
+    // shown when they get it wrong, and upstream refuses BOTH zero words and two (`:965` is
+    // `parts.length !== 1`).
+    SlashCommandDescriptor {
+        name: SlashCommandName::SubagentsRefine,
+        usage: "Usage: /subagents-refine <agent>",
+        description: "Generate a bounded project-local refinement overlay for one subagent",
     },
 ];
 
@@ -1834,8 +1851,8 @@ mod tests {
     /// `/subagents-guide` did not exist — a user who read pi's docs and typed it got an unknown
     /// command.
     #[test]
-    fn slash_commands_table_has_the_twelve_plus_the_five_extra_commands() {
-        assert_eq!(SLASH_COMMANDS.len(), R_SA_129_COMMAND_COUNT + 5);
+    fn slash_commands_table_has_the_twelve_plus_the_six_extra_commands() {
+        assert_eq!(SLASH_COMMANDS.len(), R_SA_129_COMMAND_COUNT + 6);
         let tail: Vec<&str> = SLASH_COMMANDS
             .iter()
             .skip(R_SA_129_COMMAND_COUNT)
@@ -1849,6 +1866,10 @@ mod tests {
                 "subagents-fleet",
                 "subagents-stop",
                 "subagents-guide",
+                // VL-S13 — `/subagents-refine` (pi `slash/slash-commands.ts:960` @v0.68.0). Like
+                // the five above it, NOT one of R-SA-129's twelve; registered by the same
+                // `registerSlashCommands` call.
+                "subagents-refine",
             ]
         );
     }

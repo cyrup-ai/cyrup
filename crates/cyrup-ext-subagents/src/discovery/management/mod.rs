@@ -68,10 +68,10 @@ mod chain_crud;
 mod config_parse;
 mod frontmatter_write;
 mod handlers;
-mod helpers;
+pub(crate) mod helpers;
 mod lookup;
 mod render;
-mod test_support;
+pub(crate) mod test_support;
 mod tier_actions;
 mod visibility;
 

@@ -389,6 +389,7 @@ impl SubagentsExtension {
             SlashCommandName::SubagentsFleet => self.show_fleet(cwd, has_ui).await,
             SlashCommandName::SubagentsStop => self.slash_subagents_stop(args, cwd).await,
             SlashCommandName::SubagentsGuide => self.slash_subagents_guide(args),
+            SlashCommandName::SubagentsRefine => self.slash_subagents_refine(args, cwd).await,
             SlashCommandName::SubagentsProfiles => self.slash_subagents_profiles(),
             SlashCommandName::SubagentsLoadProfile => self.slash_load_profile(args).await,
             SlashCommandName::SubagentCost => Ok(self.executor.run_cost_report(cwd).await),
@@ -617,6 +618,44 @@ impl SubagentsExtension {
             ));
         }
         Ok(crate::registration::guide::read_subagent_guide(Some(topic)))
+    }
+
+    /// VL-S13 — `/subagents-refine <agent>` (pi `slash/slash-commands.ts:963-970` @v0.68.0).
+    ///
+    /// `parts.length !== 1` (`:965`) refuses BOTH zero words and two, with upstream's own usage
+    /// sentence — the same sentence carried as this command's
+    /// [`crate::registration::slash_commands::SlashCommandDescriptor::usage`], so the two spellings
+    /// cannot drift.
+    ///
+    /// One word dispatches `refine` through the SAME
+    /// [`crate::extension::tool::refinement::run_refinement_action`] body the tool's own arm calls
+    /// (`:969` is `runCommand(ctx, { action: "refine", agent: parts[0] })`), which is the rule the
+    /// `/subagents-guide` + `guide` pairing already establishes: two surfaces, one implementation.
+    /// `refine.show` and `refine.rollback` deliberately have no slash surface — upstream
+    /// registers none either.
+    async fn slash_subagents_refine(
+        &self,
+        args: &str,
+        cwd: &Path,
+    ) -> Result<String, SubagentError> {
+        let parts: Vec<&str> = args.split_whitespace().filter(|p| !p.is_empty()).collect();
+        let [agent] = parts[..] else {
+            return Err(SubagentError::Management(
+                "Usage: /subagents-refine <agent>".to_string(),
+            ));
+        };
+        let outcome = crate::extension::tool::refinement::run_refinement_action(
+            &self.executor,
+            crate::exec::agent_refinements::action::RefinementAction::Refine,
+            Some(agent),
+            cwd,
+            &CancelToken::new(),
+        )
+        .await?;
+        if outcome.is_error {
+            return Err(SubagentError::Management(outcome.text));
+        }
+        Ok(outcome.text)
     }
 
     /// /subagents-profiles — list the names of every saved profile in the profiles directory.

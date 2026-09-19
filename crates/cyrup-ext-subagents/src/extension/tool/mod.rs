@@ -3,6 +3,8 @@
 pub(crate) mod lane_actions;
 pub(crate) mod mission;
 pub(crate) mod params;
+/// VL-S13 — the `refine`/`refine.show`/`refine.rollback` arm and its proposal-child launch.
+pub(crate) mod refinement;
 pub(crate) mod routing;
 pub(crate) mod schema;
 pub(crate) mod task_items;
@@ -252,7 +254,9 @@ impl Tool for SubagentTool {
         // `extension/public-execution.ts`.
         let action = normalize_public_subagent_execution(parsed.action.as_deref())?;
         if let Some(action) = action {
-            return self.route_action(action, &parsed, &effective_cwd).await;
+            return self
+                .route_action(action, &parsed, &effective_cwd, &cancel)
+                .await;
         }
 
         // SCOPE_18 — hoisted from below the guard so `is_background` can decide, before acquiring

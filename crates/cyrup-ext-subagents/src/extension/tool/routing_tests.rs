@@ -2647,3 +2647,422 @@ async fn a_detached_workflow_child_reconciles_the_paused_workflow() {
         "the reconciled child's output is delivered, not still outstanding: {reconciled_child}"
     );
 }
+
+// =================================================================================================
+// VL-S13 — `refine` / `refine.show` / `refine.rollback` through the REAL tool
+//
+// These drive `SubagentTool::execute`, so each one exercises the whole production chain the model
+// reaches: the schema enum (derived from `SUBAGENT_ACTIONS`), `route_action`'s
+// `RefinementAction::from_wire` guard arm, the child-safe gate, agent resolution, the existing-file
+// read, and — for `refine.rollback` — the serializer, the round-trip guard and the atomic write.
+// =================================================================================================
+
+/// Write a real project persona at `<cwd>/.cyrup/agents/<name>.md` so `resolve_one_agent` has
+/// something to resolve. Returns the raw persona BODY, which is what `hash_prompt` hashes.
+fn seed_refinement_agent(dir: &std::path::Path, name: &str, body: &str) -> String {
+    let agents_dir = dir.join(".cyrup").join("agents");
+    std::fs::create_dir_all(&agents_dir).expect("mkdir agents");
+    std::fs::write(
+        agents_dir.join(format!("{name}.md")),
+        format!("---\nname: {name}\ndescription: A probe\n---\n{body}\n"),
+    )
+    .expect("write agent");
+    body.to_string()
+}
+
+/// A hand-written overlay, deliberately NOT produced by `serialize_refinement_file`: the point is
+/// that the parser, the serializer and a file pi could have written all agree on one format.
+fn write_refinement_overlay(
+    dir: &std::path::Path,
+    agent: &str,
+    digest: &str,
+    revision: u32,
+    current: &str,
+    snapshots_json: &str,
+) -> std::path::PathBuf {
+    let path = crate::exec::agent_refinements::get_agent_refinement_path(dir, agent)
+        .expect("a usable agent name");
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir refinements");
+    let body = format!(
+        "<!-- pi-subagents-refinement:v1\n{{\"agent\":\"{agent}\",\"revision\":{revision},\
+         \"updatedAt\":\"2026-09-01T00:00:00.000Z\",\"base\":{{\"source\":\"project\",\
+         \"filePath\":\"p.md\",\"systemPromptSha256\":\"{digest}\"}},\"evidence\":{{}}}}\n-->\n\n\
+         # Current refinement for `{agent}`\n\n```pi-subagents-refinement-current\n{current}\n```\n\n\
+         # Snapshots\n\n```pi-subagents-refinement-snapshots-json\n{snapshots_json}\n```\n"
+    );
+    std::fs::write(&path, body).expect("write overlay");
+    path
+}
+
+/// T1 — the advertise-vs-dispatch invariant for all three verbs, in the shape
+/// `inspect_is_both_advertised_and_dispatched` established.
+///
+/// Gutted: no `SUBAGENT_ACTIONS` entry → the advertise assertion fails; no dispatch arm → the
+/// reply is the did-you-mean text, so the equality on pi `:557`'s sentence fails.
+#[tokio::test]
+async fn refine_verbs_are_both_advertised_and_dispatched() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tool = scoped_tool(dir.path()).await;
+    seed_refinement_agent(dir.path(), "probe", "You are probe.");
+
+    for verb in ["refine", "refine.show", "refine.rollback"] {
+        assert!(
+            crate::extension::tool::text::subagent_actions().contains(&verb),
+            "{verb} must be advertised in the ONE list the schema enum is derived from"
+        );
+    }
+
+    // pi `:557` — no overlay is an ORDINARY answer for `refine.show`, not an error.
+    let result = dispatch_tool(
+        &tool,
+        serde_json::json!({ "action": "refine.show", "agent": "probe" }),
+    )
+    .await
+    .expect("refine.show dispatches and is not an error with no overlay");
+    assert_eq!(
+        tool_text(&result),
+        "No refinement overlay exists for 'probe'."
+    );
+
+    // pi `:578` — the SAME sentence from `refine.rollback` IS an error.
+    let error = dispatch_tool(
+        &tool,
+        serde_json::json!({ "action": "refine.rollback", "agent": "probe" }),
+    )
+    .await
+    .expect_err("rollback with no overlay is an error");
+    assert_eq!(
+        error.to_string(),
+        "No refinement overlay exists for 'probe'."
+    );
+}
+
+/// T2 — the write/read round trip through the REAL tool, which is the correctness proof the spec
+/// asks for: `refine.rollback` serializes, and `parse_refinement_file` reads the bytes back.
+///
+/// Gutted: drop the serializer's integral-number rule → assertion (7) fails and pi can no longer
+/// read the file; pop instead of append → (5)/(6) fail; write `latest.after` instead of
+/// `latest.before` → (3) fails; move the metadata comment off byte 0 or lose either fence's
+/// leading blank line → (2) fails, for the parser's own documented reason.
+#[tokio::test]
+async fn refine_rollback_appends_a_snapshot_and_round_trips_the_parser() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tool = scoped_tool(dir.path()).await;
+    seed_refinement_agent(dir.path(), "probe", "You are probe.");
+    let path = write_refinement_overlay(
+        dir.path(),
+        "probe",
+        "abc123",
+        2,
+        "- new",
+        "[{\"revision\":2,\"at\":\"2026-09-01T00:00:00.000Z\",\"action\":\"refine\",\
+         \"before\":\"- old\",\"after\":\"- new\",\"evidenceIds\":[\"live:a1\"],\
+         \"proposalAgent\":\"reviewer\"}]",
+    );
+
+    // (1) pi `:589`.
+    let result = dispatch_tool(
+        &tool,
+        serde_json::json!({ "action": "refine.rollback", "agent": "probe" }),
+    )
+    .await
+    .expect("rollback dispatches");
+    assert_eq!(
+        tool_text(&result),
+        format!(
+            "Rolled back refinement overlay for 'probe' to revision 3.\nPath: {}",
+            path.display()
+        )
+    );
+
+    let raw = std::fs::read_to_string(&path).expect("the file exists");
+    // (2) THE ROUND TRIP.
+    let parsed = crate::exec::agent_refinements::parse_refinement_file(&raw, "p")
+        .expect("the tool's own output must parse");
+    // (3) the rollback restores `latest.before`, not `latest.after`.
+    assert_eq!(parsed.current, "- old");
+    // (4)
+    assert_eq!(parsed.metadata.revision, 3.0);
+    // (5) history GREW — a rollback is itself a revision, never a pop.
+    assert_eq!(parsed.snapshots.len(), 2);
+    // (6) the appended entry's exact shape.
+    let appended = &parsed.snapshots[1];
+    assert_eq!(appended.action, "rollback");
+    assert_eq!(appended.before, "- new");
+    assert_eq!(appended.after, "- old");
+    assert_eq!(appended.evidence_ids, parsed.snapshots[0].evidence_ids);
+    assert!(
+        appended.proposal_agent.is_none(),
+        "pi `:586` carries no `proposalAgent` on a rollback, unlike `:610`"
+    );
+    // (7) the integral-number rule — `1.0` is legal JSON but is not what pi writes, and this file
+    // is a format shared with pi.
+    assert!(raw.contains("\"revision\": 3"), "{raw}");
+    assert!(!raw.contains("\"revision\": 3.0"), "{raw}");
+
+    // A SECOND consecutive rollback undoes the first: `snapshots.at(-1)` is now the rollback entry
+    // whose `before` is the pre-rollback guidance. Upstream's rollback is an oscillator, not a
+    // stack walk, and this is the single easiest thing here to "improve" into a divergence.
+    dispatch_tool(
+        &tool,
+        serde_json::json!({ "action": "refine.rollback", "agent": "probe" }),
+    )
+    .await
+    .expect("a second rollback dispatches");
+    let again = crate::exec::agent_refinements::parse_refinement_file(
+        &std::fs::read_to_string(&path).expect("read"),
+        "p",
+    )
+    .expect("parses");
+    assert_eq!(again.current, "- new");
+    assert_eq!(again.snapshots.len(), 3);
+    assert_eq!(again.metadata.revision, 4.0);
+}
+
+/// T2b — the round-trip guard is an EQUALITY check, proved through the REAL tool on the one
+/// input that distinguishes it from a parses-without-error check.
+///
+/// `refine.rollback` sets `current` from the last snapshot's `before`, and on a HAND-EDITED
+/// overlay that `before` is attacker-authored — the validator's A11 (` ``` ` in guidance) never
+/// saw it. Here it carries its own `pi-subagents-refinement-snapshots-json` fence. The serialized
+/// file still PARSES: `extract_fence` ends the `current` body at the first `"\n```"`
+/// (`exec/agent_refinements.rs:286-290`), so `current` comes back as `- benign`, and the
+/// snapshots lookup scans the whole markdown and finds the FORGED opener before the real one, so
+/// the history comes back as the attacker's single `- evil` revision. That is precisely the
+/// "forged snapshots fence so `refine.rollback` restores attacker-authored state" outcome
+/// `exec/agent_refinements/proposal.rs`'s A11 note names.
+///
+/// Gutted: revert `write_refinement_file` to `parse_refinement_file(..).map_err(..)?` without the
+/// `reparsed != parsed` comparison and this test fails — the tool returns Ok and the file on disk
+/// is replaced by one whose history is `[- evil]`.
+#[tokio::test]
+async fn refine_rollback_refuses_a_hand_edited_before_that_forges_its_own_snapshots_fence() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tool = scoped_tool(dir.path()).await;
+    seed_refinement_agent(dir.path(), "probe", "You are probe.");
+    let path = write_refinement_overlay(
+        dir.path(),
+        "probe",
+        "abc123",
+        2,
+        "- new",
+        "[{\"revision\":2,\"at\":\"2026-09-01T00:00:00.000Z\",\"action\":\"refine\",\"before\":\"- benign\\n```pi-subagents-refinement-snapshots-json\\n[{\\\"revision\\\":99,\\\"at\\\":\\\"2026-09-01T00:00:00.000Z\\\",\\\"action\\\":\\\"refine\\\",\\\"before\\\":\\\"\\\",\\\"after\\\":\\\"- evil\\\",\\\"evidenceIds\\\":[\\\"forged\\\"]}]\\n```\\n- evil\",\"after\":\"- new\",\"evidenceIds\":[\"live:a1\"]}]",
+    );
+    let before_bytes = std::fs::read(&path).expect("read the seeded overlay");
+
+    let error = dispatch_tool(
+        &tool,
+        serde_json::json!({ "action": "refine.rollback", "agent": "probe" }),
+    )
+    .await
+    .expect_err("a rollback that would not re-read as itself must refuse");
+    let message = error.to_string();
+    assert!(
+        message.contains("would re-read as a different overlay than the one written"),
+        "the refusal must be the round-trip guard's, not some earlier arm: {message}"
+    );
+
+    assert_eq!(
+        std::fs::read(&path).expect("read back"),
+        before_bytes,
+        "the refusal path writes nothing — the overlay folded into every later `probe` spawn is \
+         byte-identical"
+    );
+    let still = crate::exec::agent_refinements::parse_refinement_file(
+        &String::from_utf8(before_bytes).expect("utf8"),
+        "p",
+    )
+    .expect("the seeded overlay still parses");
+    assert_eq!(still.current, "- new");
+    assert_eq!(still.snapshots.len(), 1);
+    assert_eq!(still.metadata.revision, 2.0);
+}
+
+/// T3 — `refine.show` reports drift, and renders the history block pi renders.
+///
+/// Gutted: compare against the COMPOSED prompt instead of `system_prompt_body` → the `no` case
+/// fails; invert the comparison → both fail.
+#[tokio::test]
+async fn refine_show_reports_drift_against_the_persona_body() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tool = scoped_tool(dir.path()).await;
+    let body = seed_refinement_agent(dir.path(), "probe", "You are probe.");
+
+    // A stored digest that is not the real hash: drift is `yes`.
+    write_refinement_overlay(
+        dir.path(),
+        "probe",
+        "abc123",
+        2,
+        "- guidance",
+        "[{\"revision\":2,\"at\":\"2026-09-01T00:00:00.000Z\",\"action\":\"refine\",\
+         \"before\":\"\",\"after\":\"- guidance\",\"evidenceIds\":[\"live:a1\"]}]",
+    );
+    let drifted = tool_text(
+        &dispatch_tool(
+            &tool,
+            serde_json::json!({ "action": "refine.show", "agent": "probe" }),
+        )
+        .await
+        .expect("show dispatches"),
+    );
+    assert!(
+        drifted.contains("Base prompt changed since overlay: yes"),
+        "{drifted}"
+    );
+    assert!(drifted.contains("Revision: 2"), "{drifted}");
+    assert!(!drifted.contains("Revision: 2.0"), "{drifted}");
+    assert!(
+        drifted.contains("Current guidance:\n- guidance"),
+        "{drifted}"
+    );
+    assert!(
+        drifted.contains("- r2 refine at 2026-09-01T00:00:00.000Z (1 evidence id)"),
+        "the singular form fires at exactly one id: {drifted}"
+    );
+
+    // The REAL digest of the persona BODY: drift is `no`. This is the assertion that fails if the
+    // composed prompt (skills + memory + the overlay itself) is hashed instead.
+    let digest = crate::exec::agent_refinements::action::hash_prompt(&body);
+    write_refinement_overlay(
+        dir.path(),
+        "probe",
+        &digest,
+        2,
+        "- guidance",
+        "[{\"revision\":2,\"at\":\"2026-09-01T00:00:00.000Z\",\"action\":\"refine\",\
+         \"before\":\"\",\"after\":\"- guidance\",\"evidenceIds\":[\"live:a1\",\"live:a2\"]}]",
+    );
+    let clean = tool_text(
+        &dispatch_tool(
+            &tool,
+            serde_json::json!({ "action": "refine.show", "agent": "probe" }),
+        )
+        .await
+        .expect("show dispatches"),
+    );
+    assert!(
+        clean.contains("Base prompt changed since overlay: no"),
+        "{clean}"
+    );
+    assert!(clean.contains("(2 evidence ids)"), "plural at two: {clean}");
+
+    // Mutate the persona body and drift is `yes` again.
+    seed_refinement_agent(dir.path(), "probe", "You are probe, now different.");
+    let redrifted = tool_text(
+        &dispatch_tool(
+            &tool,
+            serde_json::json!({ "action": "refine.show", "agent": "probe" }),
+        )
+        .await
+        .expect("show dispatches"),
+    );
+    assert!(
+        redrifted.contains("Base prompt changed since overlay: yes"),
+        "{redrifted}"
+    );
+}
+
+/// T4 — the `refine` no-evidence path launches nothing and writes nothing (pi `:593`), and it is
+/// NOT an error.
+///
+/// Gutted: launch a child before checking the evidence → the reply is a child error instead of the
+/// sentence; return `Err` for the empty case → the not-an-error assertion fails.
+#[tokio::test]
+async fn refine_with_no_evidence_writes_nothing_and_is_not_an_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tool = scoped_tool(dir.path()).await;
+    seed_refinement_agent(dir.path(), "probe", "You are probe.");
+
+    let result = dispatch_tool(
+        &tool,
+        serde_json::json!({ "action": "refine", "agent": "probe" }),
+    )
+    .await
+    .expect("pi `:593` is an ordinary answer, not an error");
+    assert_eq!(
+        tool_text(&result),
+        "No bounded recent evidence was found for 'probe'. No proposal child was launched and no \
+         overlay was written."
+    );
+    let overlay = crate::exec::agent_refinements::get_agent_refinement_path(dir.path(), "probe")
+        .expect("a usable name");
+    assert!(
+        !overlay.exists(),
+        "the no-evidence path must write no overlay at all"
+    );
+}
+
+/// T5 — the child-safe fanout gate (pi `:6359`), including that it fires ABOVE agent resolution.
+///
+/// Gutted: put `refine.show` on the mutating side → the success assertion fails; move the gate
+/// below resolution → the nonexistent-agent assertion fails, because the caller would learn which
+/// agents exist from a verb it may not invoke at all.
+#[tokio::test]
+async fn the_refine_mutators_are_refused_from_child_safe_fanout_but_show_is_not() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let executor = Arc::new(SubagentExecutor::new());
+    arm_scoped_missions(&executor, dir.path()).await;
+    let fanout = SubagentTool::new_child_safe(executor, dir.path().to_path_buf());
+    seed_refinement_agent(dir.path(), "probe", "You are probe.");
+
+    for verb in ["refine", "refine.rollback"] {
+        let error = dispatch_tool(
+            &fanout,
+            serde_json::json!({ "action": verb, "agent": "probe" }),
+        )
+        .await
+        .expect_err("a mutating refine verb is refused from child-safe fanout");
+        assert_eq!(
+            error.to_string(),
+            format!("Action '{verb}' is not available from child-safe subagent fanout mode.")
+        );
+        // The gate runs BEFORE resolution: a nonexistent agent gets the SAME sentence, so a
+        // child-safe caller cannot probe which agents exist by reading which error it gets.
+        let probe = dispatch_tool(
+            &fanout,
+            serde_json::json!({ "action": verb, "agent": "no-such-agent" }),
+        )
+        .await
+        .expect_err("still refused");
+        assert_eq!(
+            probe.to_string(),
+            format!("Action '{verb}' is not available from child-safe subagent fanout mode.")
+        );
+    }
+
+    // `refine.show` is read-only and upstream's MUTATING set does not carry it.
+    let result = dispatch_tool(
+        &fanout,
+        serde_json::json!({ "action": "refine.show", "agent": "probe" }),
+    )
+    .await
+    .expect("refine.show stays reachable from a child-safe fanout tool");
+    assert_eq!(
+        tool_text(&result),
+        "No refinement overlay exists for 'probe'."
+    );
+}
+
+/// T6 — pi `:548`'s missing-agent sentence, per verb, for an absent AND a blank `agent`.
+#[tokio::test]
+async fn every_refine_verb_names_both_surfaces_when_agent_is_missing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tool = scoped_tool(dir.path()).await;
+
+    for verb in ["refine", "refine.show", "refine.rollback"] {
+        let expected = format!(
+            "{verb} requires agent. Use /subagents-refine <agent> or subagent({{ action: \
+             \"{verb}\", agent: \"<agent>\" }})."
+        );
+        for params in [
+            serde_json::json!({ "action": verb }),
+            serde_json::json!({ "action": verb, "agent": "   " }),
+        ] {
+            let error = dispatch_tool(&tool, params)
+                .await
+                .expect_err("a missing agent is an error");
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+}

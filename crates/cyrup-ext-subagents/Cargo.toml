@@ -144,6 +144,21 @@ tracing = "0.1.44"
 # already in this workspace's lockfile via `syntect`'s `default-fancy` — zero new transitive
 # crates. See the justifying comment on the `[workspace.dependencies]` entry.
 fancy-regex = { workspace = true }
+# VL-S13 (`exec/agent_refinements/proposal.rs` ONLY): the refinement proposal validator's blocked-
+# guidance pattern is a SECURITY control — the string that survives it is folded into the system
+# prompt of every subsequent spawn of that agent. It must reproduce JavaScript's ASCII `\b`
+# (`agent-refinements.ts:457` builds the RegExp without the `u` flag), which is spelled `(?-u:\b)`.
+# fancy-regex 0.18 REJECTS a negated `u` outright (`src/parse.rs:1029-1033` returns
+# `ParseError::NonUnicodeUnsupported`, and `:122` ORs `FLAG_UNICODE` into every parse), so the
+# faithful port is not expressible there. Under the Rust engine's DEFAULT Unicode `\b`, appending
+# U+200D ZERO WIDTH JOINER — a `Join_Control`, hence a `\w` char in Unicode mode, and rendered as
+# nothing — defeats the trailing boundary: `all agents\u{200D}` and `global\u{200D}` both PASS
+# where node BLOCKS them, and the evading text renders byte-for-byte identically. Secondary
+# benefit: `regex::Regex::is_match` is infallible, so this control has no `unwrap_or(true)`
+# fail-closed wrapper to get backwards. 1.12.4 is already built in this workspace by four sibling
+# crates (`cyrup-ext`, `cyrup-mcp`, `cyrup-tui`, `cyrup-permission-system`), so this adds nothing
+# to the lockfile or the build graph.
+regex = "1.12.4"
 # SCOPE_3f (`workflows/scripted/`): the workflowScript runtime embeds V8 through `deno_core` — the
 # same engine core Deno itself ships. Chosen because the ONE correctness term that decides this
 # feature is whether the engine behaves the way the authoring model predicts, and the model's prior

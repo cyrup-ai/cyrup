@@ -37,8 +37,13 @@
 
 use serde::{Deserialize, Serialize};
 
-/// pi `AUTHORITY_ACTIONS` (`policy/authority.ts:1-8`), in upstream's own order — which is the order
-/// [`validate_authority_policy`]'s error message enumerates.
+/// pi `AUTHORITY_ACTIONS` (`policy/authority.ts:1-10` @v0.68.0), in upstream's own order — which
+/// is the order [`validate_authority_policy`]'s error message enumerates.
+///
+/// A SUBSET, not a copy: upstream declares EIGHT and this is the first six. `inspectorOpen` and
+/// `projectOpen` are omitted because the `inspector.*` / `project.*` verbs they gate are not
+/// ported, and an authority action naming a verb with no dispatch arm would be a policy key the
+/// operator can set and nothing can ever consult.
 pub const AUTHORITY_ACTIONS: &[&str] = &[
     "discardWorktree",
     "destructiveCleanup",
@@ -48,7 +53,7 @@ pub const AUTHORITY_ACTIONS: &[&str] = &[
     "steerRun",
 ];
 
-/// pi `AuthorityAction` (`policy/authority.ts:10`).
+/// pi `AuthorityAction` (`policy/authority.ts:12` @v0.68.0).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthorityAction {
     DiscardWorktree,
@@ -100,8 +105,11 @@ impl AuthorityAction {
         }
     }
 
-    /// pi `DEFAULT_AUTHORITY_POLICY` (`policy/authority.ts:14-21`): the three privileged/destructive
-    /// actions default to `confirm`, the three ordinary ones to `auto`.
+    /// pi `DEFAULT_AUTHORITY_POLICY` (`policy/authority.ts:16-25` @v0.68.0), restricted to the six
+    /// actions [`AUTHORITY_ACTIONS`] ports: cyrup's three privileged/destructive ones default to
+    /// `confirm` and its three ordinary ones to `auto`. Upstream's map has eight entries because it
+    /// also carries `inspectorOpen: "auto"` and `projectOpen: "confirm"`, so the three/three split
+    /// is a statement about THIS list, not about upstream's.
     #[must_use]
     pub fn default_decision(self) -> AuthorityDecision {
         match self {
@@ -252,8 +260,10 @@ pub fn declined_message(action: &str) -> String {
 mod tests {
     use super::*;
 
-    /// pi `DEFAULT_AUTHORITY_POLICY` (`policy/authority.ts:14-21`), pinned element by element: the
-    /// three privileged actions default to `confirm` and the three ordinary ones to `auto`. Getting
+    /// pi `DEFAULT_AUTHORITY_POLICY` (`policy/authority.ts:16-25` @v0.68.0), pinned element by
+    /// element over the six actions cyrup ports: the three privileged ones default to `confirm` and
+    /// the three ordinary ones to `auto` (upstream's other two, `inspectorOpen`/`projectOpen`, gate
+    /// unported verbs and are not in [`AUTHORITY_ACTIONS`]). Getting
     /// this backwards would either gate every stop behind a dialog or let a worktree discard run
     /// unasked.
     #[test]

@@ -1538,7 +1538,42 @@ the behaviour was available to be ported and was not.
 - **Re-read this pass:** all four are still there — `SlashCommandName::Chain` `registration/slash_commands.rs:83`, `Parallel` `:84`, `RunChain` `:85`, `ChainPrompts` `:101` (the `:128`-`:142` citations below are stale). **The blocker this row names is now DISCHARGED**: VL-S2's `workflowScript` runtime landed, so the capability no longer disappears if these four are deleted. This is now a straightforward deletion and should be scheduled as one
 `git grep -oh 'registerCommand("[a-z-]*"' <tag> -- src` gives 19 unique names at v0.40.0 including `chain`, `parallel`, `run-chain`, `chain-prompts`, and 15 at v0.41.0 with all four gone (still gone at v0.43.0 and v0.47.1) — vs `registration/slash_commands.rs:128` (`Chain`), `:129` (`Parallel`), `:130` (`RunChain`), `:142` (`ChainPrompts`). **Observable**: cyrup's palette advertises four commands upstream no longer has, whose function moved into `workflowScript` (VL-S2). Do not delete them before VL-S2 lands or the capability disappears entirely.
 
-**VL-S13 · Agent refinement WRITE half** — *medium* · id retained, class corrected (v0.43.0) · **STILL OPEN at `cc7818b`; re-measured 2026-09-16**
+**~~VL-S13 · Agent refinement WRITE half~~** — ~~*medium*~~ **CLOSED 2026-09-19**
+- **CLOSED.** `exec/agent_refinements/` (evidence, proposal, action) + `exec/refinement_evidence.rs`
+  port the three functions the READ half's own module doc named as missing —
+  `collectBoundedRefinementEvidence`, `validateRefinementProposal`, `handleRefinementAction` — so
+  cyrup can now GENERATE and REVERT the overlay it has always applied at spawn. `SUBAGENT_ACTIONS`
+  47 → 50; the remaining gap is **9** verbs (`children.list`, `inspector.*`, `project.*`,
+  `debug.run`)
+- **This was the FOURTH reader-without-writer, and the last one known.** The handoff manifest was
+  the first (PR #143), the recovery descriptor and the child transcript the second and third
+  (PR #144). `exec/agent_refinements.rs` (673 lines) declared its own gap in its module doc —
+  *"restricted to the READ half that the spawn path needs"* — and that doc is now true of a
+  complete feature instead of half of one
+- **Two production surfaces**, sharing one body: the `subagent` tool's `refine`/`refine.show`/
+  `refine.rollback` arms (`extension/tool/routing.rs`) and `/subagents-refine <agent>`
+  (`extension/host/slash.rs`). `refine` and `refine.rollback` are gated as mutating and refused in
+  child-safe fanout; `refine.show` is read-only and stays reachable there, matching pi's
+  `MUTATING_MANAGEMENT_ACTIONS` (`subagent-executor.ts:213`), which omits it
+- **The writer round-trips the EXISTING parser** — `write_refinement_file` reparses its own bytes
+  and compares, so a file this crate writes is one `parse_refinement_file` reads back, and the
+  `<!-- pi-subagents-refinement:v1 -->` metadata comment and both fence languages stay
+  byte-identical so pi and cyrup still read each other's overlays
+- **A SECURITY BYPASS was found and closed inside this batch, by the QA lens written to hunt for
+  it.** `validateRefinementProposal` is a privilege boundary, not a lint: the overlay it gates is
+  folded into every later spawn's system prompt, so guidance that slips through silently
+  re-instructs every future run of that agent. A verbatim port of upstream's `\s+` is NOT
+  equivalent in Rust — Rust's `\s` is `\p{White_Space}`, which **excludes U+FEFF**, while
+  ECMAScript's `\s` includes it, so `disable\u{FEFF}acceptance` passed cyrup's regex and is
+  blocked by pi's. Measured in both engines rather than argued. The class is now
+  `[\s\x{FEFF}]+`, every alternative of the pattern has its own test, and the one residual
+  divergence (U+0085 NEL, which Rust blocks and ECMAScript does not) is stricter — the safe
+  direction — and recorded
+- **No overlay is written on ANY failure path** — no evidence, child error, invalid proposal, zero
+  edits — and the tests assert the FILE ON DISK is unchanged, not merely that an error was returned
+- upstream: `src/agents/agent-refinements.ts` (624 lines @v0.68.0) —
+  `collectBoundedRefinementEvidence:349`, `validateRefinementProposal:448`, `proposalSchema:471`,
+  `proposalFromChild:502`, `handleRefinementAction:546`
 - **Re-measured this pass against the verb set:** `refine`, `refine.show` and `refine.rollback` are three of the seventeen verbs absent from cyrup's 42-verb action list (`extension/tool/text.rs:215`) — so the "no `refine*` verb in the enum at `extension.rs:6557`" claim is still TRUE, at a new address. The read-half-only statement at `exec/agent_refinements.rs:12-20` was not re-resolved to a current line this pass
 `src/agents/agent-refinements.ts:349` (`collectBoundedRefinementEvidence`), `:448` (`validateRefinementProposal`), `:546` (`handleRefinementAction`) — vs `exec/agent_refinements.rs:12-20`, which states the port is the read half only, and no `refine*` verb in the enum at `extension.rs:6557` (area 09 counts three such verbs missing). **Observable**: an overlay written by upstream (or by hand) is applied correctly at spawn (`exec/mod.rs:1565`), but cyrup can never generate or roll one back.
 
