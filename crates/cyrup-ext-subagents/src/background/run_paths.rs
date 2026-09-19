@@ -17,6 +17,11 @@ const STATUS_FILE_NAME: &str = "status.json";
 /// [`crate::workflows::read_workflow_receipt`]'s absent-receipt probe, WORKFLOW_3 §0.9).
 const EVENTS_FILE_NAME: &str = "events.jsonl";
 
+/// `handoff.json` — the parallel-handoff manifest's file name, spelled ONCE for the writer
+/// ([`crate::handoff::write_group`], via [`RunDir::handoff`]) and the reader
+/// ([`crate::background::async_retention`]) alike.
+const HANDOFF_FILE_NAME: &str = "handoff.json";
+
 /// The filesystem directory, keyed by run id, holding one background run's `status.json`,
 /// `events.jsonl`, control-inbox files, append-request files, output/log files, and (once
 /// terminal) its human-readable run-log — everything **except** the terminal [`ResultFile`](crate::background::ResultFile)
@@ -70,6 +75,19 @@ impl RunDir {
     #[must_use]
     pub fn events(&self) -> PathBuf {
         self.0.join(EVENTS_FILE_NAME)
+    }
+
+    /// `<run_dir>/handoff.json` — the parallel-handoff manifest a `worktree: true` fan-out
+    /// writes, and pi `parallelHandoffPath(asyncDir)` with no run id
+    /// (`runs/shared/parallel-handoff.ts:615` @v0.68.0).
+    ///
+    /// The third accessor in the `status()`/`events()` family, and the SINGLE place the
+    /// `handoff.json` literal is spelled. [`crate::background::async_retention`]'s retention scan
+    /// used to carry its own copy of the constant, which is exactly how a writer and a reader
+    /// drift; it now calls this.
+    #[must_use]
+    pub fn handoff(&self) -> PathBuf {
+        self.0.join(HANDOFF_FILE_NAME)
     }
 }
 

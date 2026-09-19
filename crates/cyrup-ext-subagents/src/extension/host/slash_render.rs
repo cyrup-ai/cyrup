@@ -415,6 +415,7 @@ mod tests {
                 concurrency: 2,
                 fail_fast: false,
                 worktree: false,
+                lane: None,
             }),
         ];
         assert_eq!(describe_chain(&graph), "a -> [b+c]");
@@ -581,6 +582,7 @@ mod tests {
             concurrency: 4,
             fail_fast: false,
             worktree: false,
+            lane: None,
         });
 
         let (graph, _first) = apply_fork_contexts(

@@ -521,6 +521,60 @@ impl SubagentExecutor {
         self.config_cell().lock().await.clone()
     }
 
+    /// LANES_2 — whether a FOREGROUND run this process launched is provably over, for
+    /// [`crate::spawn::cleanup_plan`]'s ownership probe. Port of the closure upstream injects at
+    /// `subagent-executor.ts:6230-6235` @v0.68.0:
+    ///
+    /// ```text
+    /// if (deps.state.foregroundControls.has(runId)) return "active";
+    /// const remembered = deps.state.foregroundRuns?.get(runId);
+    /// if (!remembered || remembered.children.length === 0
+    ///     || remembered.children.some((c) => c.status === "detached")) return "unknown";
+    /// return "terminal";
+    /// ```
+    ///
+    /// The two maps are disjoint by construction (see [`Self::foreground_runs`]'s own note): an
+    /// entry appears in `foreground_runs` at the exact moment its `foreground_controls` entry is
+    /// removed. So "live" and "remembered and fully settled" are the only two provable answers,
+    /// and **everything else is [`ForegroundRunOwnership::Unknown`]** — a run this process never
+    /// saw, a run whose memory was evicted, or a run with a detached child that may still be
+    /// writing into its worktree. Absence of proof is never proof of termination, which is why
+    /// the caller treats `Unknown` as non-removable.
+    #[must_use]
+    pub(crate) fn foreground_run_ownership(
+        &self,
+        run_id: &str,
+    ) -> crate::spawn::cleanup_plan::model::ForegroundRunOwnership {
+        use crate::spawn::cleanup_plan::model::ForegroundRunOwnership;
+
+        if self
+            .foreground_controls
+            .lock()
+            .is_ok_and(|controls| controls.contains_key(run_id))
+        {
+            return ForegroundRunOwnership::Active;
+        }
+        let Ok(runs) = self.foreground_runs.lock() else {
+            return ForegroundRunOwnership::Unknown;
+        };
+        let Some(remembered) = runs
+            .iter()
+            .find(|(id, _)| id.as_str() == run_id)
+            .map(|(_, run)| run)
+        else {
+            return ForegroundRunOwnership::Unknown;
+        };
+        if remembered.children.is_empty()
+            || remembered
+                .children
+                .iter()
+                .any(|child| child.status == "detached")
+        {
+            return ForegroundRunOwnership::Unknown;
+        }
+        ForegroundRunOwnership::Terminal
+    }
+
     /// The shared background-job tracker (R-SA-093), so `on_event`'s `SessionStart` handler can
     /// resume tracking any runs still recorded on disk from a prior process.
     #[must_use]

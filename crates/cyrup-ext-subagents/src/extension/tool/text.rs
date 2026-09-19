@@ -283,6 +283,27 @@ pub(crate) const SUBAGENT_ACTIONS: &[&str] = &[
     "mission.resolve-decision",
     "mission.attach-run",
     "mission.close",
+    // LANES_2 — the five convergence verbs, at pi's own indices: upstream `SUBAGENT_ACTIONS`
+    // (`shared/types.ts:2801` @v0.68.0) reads `… "mission.close", "worktree.discard",
+    // "worktree.cleanup", "lane.status", "lane.recordMerge", "lane.recordSupersession",
+    // "refine", …`. cyrup omits `refine*`/`inspector.*`/`project.*`, so the five land
+    // contiguously between `mission.close` and `watchdog.status`.
+    //
+    // `worktree.discard` slots ABOVE `worktree.cleanup`, which is why the cleanup verb's own
+    // note (landed one change earlier) said it would. All five are dispatched by
+    // `route_action`'s ONE `LaneAction::from_wire` guard arm, per the advertise-vs-dispatch
+    // invariant this slice's doc above records.
+    //
+    // `DESTRUCTIVE_MANAGEMENT_ACTIONS` below already carries `worktree.discard` (ported verbatim
+    // from `subagent-executor.ts:168` @v0.47.1, ahead of this dispatch) and deliberately does NOT
+    // carry `worktree.cleanup` or any `lane.*` verb — upstream's list does not either, because
+    // cleanup is PLAN-ONLY (`:6217-6222` refuses `mode != 'plan'`) and the `lane.*` verbs edit a
+    // JSON file rather than removing anything.
+    "worktree.discard",
+    "worktree.cleanup",
+    "lane.status",
+    "lane.recordMerge",
+    "lane.recordSupersession",
     "watchdog.status",
     "watchdog.check",
     "watchdog.configure",

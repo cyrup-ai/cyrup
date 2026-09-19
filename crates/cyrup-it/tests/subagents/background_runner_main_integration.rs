@@ -2656,6 +2656,7 @@ async fn a_child_scoped_stop_kills_one_fan_out_member_and_its_siblings_still_com
             concurrency: 3,
             fail_fast: false,
             worktree: false,
+            lane: None,
         })],
         ..child_stop_chain_config(dir.path(), &run_id, &async_root, &results_dir)
     };
@@ -2781,5 +2782,329 @@ async fn a_child_scoped_stop_kills_one_fan_out_member_and_its_siblings_still_com
     assert!(
         of("subagent.run.stopped").is_empty() && of("subagent.run.paused").is_empty(),
         "a child-scoped stop must not end the run stopped or paused: {events:?}"
+    );
+}
+
+// =================================================================================================
+// The parallel-handoff manifest (`cyrup_ext_subagents::handoff`) — reachability
+// =================================================================================================
+
+/// A real, throwaway git repo with one commit — the thing a `worktree: true` group needs before
+/// `git worktree add` can do anything. Mirrors `spawn/worktree.rs`'s own `make_real_git_repo`.
+fn make_real_git_repo(dir: &Path) {
+    let run = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .expect("git spawns");
+        assert!(status.success(), "git {args:?} must succeed in the fixture");
+    };
+    run(&["init", "-q"]);
+    run(&["config", "user.email", "test@example.com"]);
+    run(&["config", "user.name", "Handoff Tests"]);
+    std::fs::write(dir.join("tracked.txt"), "initial\n").expect("tracked file");
+    run(&["add", "-A"]);
+    run(&["commit", "-q", "-m", "initial commit"]);
+}
+
+/// **The reachability proof for the parallel-handoff manifest.**
+///
+/// A `worktree: true` fan-out, driven through the REAL detached-runner `run_with` against the
+/// REAL scripted fixture binary in a REAL git repository, must leave a REAL manifest on disk that
+/// the REAL production readers can see. Nothing here constructs a `handoff::` type by hand: the
+/// test hands a `RunnerConfig` to the runner and then reads files back through
+/// `handoff::read_manifest`, `RunStatus::parallel_handoff` and `async_retention::scan_run_candidates`.
+///
+/// Every assertion below is downstream of something that had to really happen:
+/// * the file exists ONLY if `run_parallel_group` called `handoff::write_group` after
+///   `dispatch_group`;
+/// * `groups[0].children.len() == 2` holds ONLY if the real `StepResult`s were folded in;
+/// * `cleanup.tasks.len() == 2` holds ONLY if the real `WorktreeSetup` survived
+///   `assign_worktree_cwds` (which used to discard it);
+/// * `base_commit` equals the repo's real HEAD ONLY if `git rev-parse` ran in the real repo;
+/// * `changed_patches == 2` holds ONLY if `diff_worktrees` really diffed two real worktrees that
+///   two real child processes really wrote into;
+/// * `cleanup.state == Complete` holds ONLY if `cleanup_worktrees` really removed them and the
+///   SECOND of the two writes really landed;
+/// * and the retention verdict is produced by a function this change does not call from the
+///   writer at all.
+///
+/// Note `worktree_base_dir: None` — the DEFAULT configuration. This test fails outright if the
+/// `worktree: true` path still requires an operator-configured base directory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worktree_fan_out_publishes_a_real_parallel_handoff_manifest() {
+    use cyrup_ext_subagents::background::RunDir;
+    use cyrup_ext_subagents::background::async_retention::{RunScanRequest, scan_run_candidates};
+    use cyrup_ext_subagents::handoff::{
+        CleanupState, HandoffMode, HandoffSource, LaneId, read_manifest,
+    };
+
+    let dir = tempfile::tempdir().expect("real tempdir");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    make_real_git_repo(&repo);
+    let head = String::from_utf8(
+        std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("git rev-parse")
+            .stdout,
+    )
+    .expect("utf8")
+    .trim()
+    .to_string();
+
+    let script = serde_json::json!({
+        "steps": [
+            {"kind": "emit", "line": message_end_line("lane done")},
+        ],
+        "exit_code": 0
+    });
+
+    // Each lane declares a RELATIVE `output:` file, which the runner resolves against that step's
+    // effective cwd (`runner_main/executor.rs`'s `effective_cwd.join(candidate)`) — under worktree
+    // isolation that is the lane's OWN dedicated checkout. So each child's delivered output lands
+    // inside its own worktree, which is what makes the captured patches non-empty. No fixture step
+    // writes it: the file appears only if `assign_worktree_cwds` really pointed the step at a real,
+    // distinct worktree.
+    let lane_step = |agent: &str, task: &str| SingleStepSpec {
+        output_path: Some("lane-output.txt".to_string()),
+        ..single_step(agent, task)
+    };
+
+    let run_id = RunId::from_token("handoffrun01");
+    let async_root = dir.path().join("async");
+    let results_dir = dir.path().join("results");
+    let config = RunnerConfig {
+        run_id: run_id.clone(),
+        mode: RunMode::Parallel,
+        steps: vec![RunnerStep::ParallelGroup(ParallelGroupSpec {
+            steps: vec![
+                lane_step("first", "lane zero"),
+                lane_step("second", "lane one"),
+            ],
+            concurrency: 2,
+            fail_fast: false,
+            worktree: true,
+            // LANES_2 — this group declares no launch lane; the lane-carrying path is covered by
+            // `extension/tool/lane_actions_tests.rs` through the real tool.
+            lane: None,
+        })],
+        cwd: repo.clone(),
+        // The DEFAULT: no operator-configured worktree base directory.
+        worktree_base_dir: None,
+        async_root: async_root.clone(),
+        results_dir: results_dir.clone(),
+        host_available_builtins: None,
+        completion_owner_id: None,
+        turn_budget: None,
+        permission_rules: None,
+        usage_budget: None,
+        timeout_ms: None,
+        deadline_at_ms: None,
+        share: None,
+        artifacts_dir: None,
+        artifact_config: cyrup_ext_subagents::artifacts::ArtifactConfig::default(),
+        session_file: None,
+        session_id: Some("it-session".to_string()),
+        global_concurrency_limit: 20,
+        max_subagent_depth: 2,
+        resolved_agents: all_personas(),
+        original_task: String::new(),
+        chain_dir: None,
+        orchestrator_intercom_target: None,
+        inherited_session_model: None,
+        inherited_session_thinking: None,
+        nested_route: None,
+        nested_self: None,
+        dynamic_fanout_max_items: None,
+        model_scope: None,
+        control: None,
+        include_progress: None,
+    };
+
+    let (status, result_file) = run_against_fixture(dir.path(), &script, config).await;
+    assert_eq!(
+        status.state,
+        RunState::Complete,
+        "run did not complete: status={:?} result={:?}",
+        status.steps,
+        result_file.results
+    );
+
+    // ---- 1. The file exists, at the path the RunDir accessor names. -----------------------
+    let run_dir = async_root.join(run_id.as_str());
+    let manifest_path = RunDir::for_existing(&run_dir).handoff();
+    assert!(
+        manifest_path.exists(),
+        "a worktree fan-out must leave a manifest at {}",
+        manifest_path.display()
+    );
+
+    // ---- 2. The production reader parses it, and it describes the run that really ran. ----
+    let manifest = read_manifest(&manifest_path)
+        .await
+        .expect("manifest validates")
+        .expect("manifest present");
+    assert_eq!(manifest.run_id, LaneId::parse(run_id.as_str()).unwrap());
+    assert_eq!(manifest.mode, HandoffMode::Parallel);
+    assert_eq!(manifest.source, HandoffSource::Async);
+    assert_eq!(manifest.cwd, repo);
+    assert_eq!(manifest.groups.len(), 1);
+
+    // The manifest was written TWICE, around cleanup (pi `subagent-runner.ts:4425`/`:4427`).
+    // `createdAt` is stamped by the FIRST write and preserved by the second, so a single
+    // post-cleanup write — which would leave nothing at all if the process died mid-removal —
+    // shows up here as the two timestamps being equal.
+    assert!(
+        manifest.updated_at > manifest.created_at,
+        "createdAt {} / updatedAt {}: the pre-cleanup write must precede the post-cleanup one",
+        manifest.created_at,
+        manifest.updated_at
+    );
+
+    let group = &manifest.groups[0];
+    assert_eq!(group.base_commit, head, "the REAL repo HEAD, from git");
+    assert_eq!(group.children.len(), 2, "one row per dispatched child");
+    assert_eq!(
+        group.cleanup.tasks.len(),
+        2,
+        "one cleanup task per allocated worktree — only possible if the WorktreeSetup survived"
+    );
+    for child in &group.children {
+        assert!(
+            child.status.is_terminal(),
+            "settled children: {:?}",
+            child.status
+        );
+        assert!(
+            child.patch.changed,
+            "each child wrote a file into its own worktree, so its patch must be non-empty: {:?}",
+            child.patch
+        );
+        assert!(
+            child.patch.path.exists(),
+            "the .patch artifact itself: {}",
+            child.patch.path.display()
+        );
+        assert!(
+            std::fs::read_to_string(&child.patch.path)
+                .expect("read patch")
+                .contains("lane-output.txt"),
+            "the captured patch names the file that landed in this child's own worktree"
+        );
+    }
+
+    // Every allocated worktree is a DISTINCT directory under the default base dir, named with
+    // `build_worktree_path`'s `cyrup-worktree-` prefix. This is the half that used to be
+    // unreachable: with `worktree_base_dir: None` the group was refused outright, so a manifest
+    // naming two real worktrees is itself the proof that the default-config fallback runs.
+    let mut worktree_paths: Vec<&Path> = group
+        .cleanup
+        .tasks
+        .iter()
+        .map(|task| task.path.as_path())
+        .collect();
+    worktree_paths.sort_unstable();
+    worktree_paths.dedup();
+    assert_eq!(worktree_paths.len(), 2, "two DISTINCT worktrees");
+    for task in &group.cleanup.tasks {
+        assert!(
+            task.path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("cyrup-worktree-")),
+            "allocated by `build_worktree_path`: {task:?}"
+        );
+        assert!(
+            task.branch.starts_with("cyrup-parallel-"),
+            "allocated by `build_worktree_branch`: {task:?}"
+        );
+    }
+
+    // ---- 3. The cleanup half: worktrees really removed, second write really landed. -------
+    assert_eq!(
+        group.cleanup.state,
+        CleanupState::Complete,
+        "cleanup report: {:?}",
+        group.cleanup
+    );
+    for task in &group.cleanup.tasks {
+        assert!(task.worktree_removed, "{task:?}");
+        assert!(task.branch_removed, "{task:?}");
+        assert!(!task.path.exists(), "worktree dir removed: {task:?}");
+    }
+    let branches = String::from_utf8(
+        std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["branch", "--list"])
+            .output()
+            .expect("git branch")
+            .stdout,
+    )
+    .expect("utf8");
+    assert!(
+        !branches.contains("cyrup-parallel-"),
+        "no orphan branches left behind: {branches}"
+    );
+
+    // ---- 4. The status payload carries the reference a caller addresses the manifest by. ---
+    let reference = status
+        .parallel_handoff
+        .as_ref()
+        .expect("RunStatus::parallel_handoff is how a caller learns the handoffPath");
+    assert_eq!(reference.path, manifest_path);
+    assert_eq!(reference.child_count, 2);
+    assert_eq!(reference.changed_patches, 2);
+    assert_eq!(reference.cleanup_state, CleanupState::Complete);
+
+    // ---- 5. The retention scan — a production reader this change never calls from the
+    //         writer — agrees the handoff is RESOLVED now that cleanup completed. ------------
+    let window = scan_run_candidates(RunScanRequest {
+        async_root: &async_root,
+        results_dir: &results_dir,
+        maintenance_root: None,
+        after: None,
+        budget: 10,
+    })
+    .await
+    .expect("scan");
+    let facts = window
+        .candidates
+        .iter()
+        .find(|facts| facts.dir_name == run_id.as_str())
+        .expect("the run is a scan candidate");
+    assert!(
+        !facts.unresolved_handoff,
+        "a complete cleanup resolves the handoff"
+    );
+
+    // ---- 6. …and reports it UNRESOLVED again the moment a group is partial. Same file, same
+    //         production reader, opposite verdict — which is what proves the probe is reading
+    //         THIS file rather than short-circuiting. ----------------------------------------
+    let mut partial = manifest.clone();
+    partial.groups[0].cleanup.state = CleanupState::Partial;
+    tokio::fs::write(&manifest_path, serde_json::to_vec(&partial).unwrap())
+        .await
+        .expect("rewrite manifest");
+    let window = scan_run_candidates(RunScanRequest {
+        async_root: &async_root,
+        results_dir: &results_dir,
+        maintenance_root: None,
+        after: None,
+        budget: 10,
+    })
+    .await
+    .expect("rescan");
+    let facts = window
+        .candidates
+        .iter()
+        .find(|facts| facts.dir_name == run_id.as_str())
+        .expect("the run is still a scan candidate");
+    assert!(
+        facts.unresolved_handoff,
+        "a partial cleanup pins the run against retention"
     );
 }

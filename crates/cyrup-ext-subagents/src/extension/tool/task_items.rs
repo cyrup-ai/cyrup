@@ -567,6 +567,9 @@ pub(crate) fn parse_tool_chain_items(
                     concurrency,
                     fail_fast,
                     worktree,
+                    // A `chain[].parallel` group is a nested fan-out; the call's `lane` describes
+                    // the top-level launch and is bound there.
+                    lane: None,
                 }));
             }
             Some(_) => {

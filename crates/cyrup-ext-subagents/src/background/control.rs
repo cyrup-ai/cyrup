@@ -304,6 +304,10 @@ fn terminal_status_from_result(result: &ResultFile, pid: Option<u32>) -> RunStat
         workflow_children: result.workflow_children.clone(),
         workflow_receipt_path: result.workflow_receipt.as_ref().map(|r| r.path.clone()),
         telemetry: crate::background::RunTelemetry::default(),
+        // A repaired status cannot know where the run's worktree handoff landed: the `ResultFile`
+        // does not carry the reference. Absent is the honest answer, and the retention scan's
+        // local `<run_dir>/handoff.json` probe still finds a manifest if one was written.
+        parallel_handoff: None,
     }
 }
 

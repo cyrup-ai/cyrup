@@ -51,6 +51,8 @@
 //! checklist.rs      the checklist projection + formatters (SCOPE_3e SUBTASK2)
 //! host_command.rs   the runs.host executor — the family's one shell/write module (SCOPE_3e SUBTASK3)
 //! lane_metadata.rs  normalize_workflow_lane_metadata / assert_workflow_lane_key (WORKFLOW_3 SUBTASK0a)
+//!                   + ManagedWorktreeProvider / WorktreeNaming, the manifest's cleanup-task
+//!                   naming evidence (lane-metadata.ts:9-11,76-96 — LANES_2)
 //! receipt.rs        the durable terminal evidence record: build/write/read (WORKFLOW_3 SUBTASK1)
 //! settlement.rs     how a settled workflow's terminal payload is assembled (WORKFLOW_3 SUBTASK2)
 //! ```
@@ -107,10 +109,12 @@ pub use host_step::{
 };
 pub use key::{WorkflowKey, WorkflowKeyError};
 pub use lane_metadata::{
-    LaneMetadataError, WORKFLOW_LANE_CLAIM_MAX_BYTES, WORKFLOW_LANE_CLAIMS_MAX,
-    WORKFLOW_LANE_KEY_MAX_BYTES, WORKFLOW_LANE_OUTPUT_PATH_MAX_BYTES,
-    WORKFLOW_LANE_OUTPUT_PATHS_MAX, WORKFLOW_LANE_SOURCE_REF_MAX_BYTES, assert_workflow_lane_key,
-    normalize_workflow_lane_metadata,
+    LaneMetadataError, ManagedWorktreeProvider, WORKFLOW_LANE_CLAIM_MAX_BYTES,
+    WORKFLOW_LANE_CLAIMS_MAX, WORKFLOW_LANE_KEY_MAX_BYTES, WORKFLOW_LANE_OUTPUT_PATH_MAX_BYTES,
+    WORKFLOW_LANE_OUTPUT_PATHS_MAX, WORKFLOW_LANE_SOURCE_REF_MAX_BYTES,
+    WORKTREE_STATUS_BRANCH_MAX_BYTES, WORKTREE_STATUS_NAMING_LABEL_MAX_BYTES,
+    WORKTREE_STATUS_PATH_MAX_BYTES, WorktreeNaming, WorktreeNamingCollision,
+    assert_workflow_lane_key, normalize_workflow_lane_metadata,
 };
 pub use permit::{
     WorkflowResourceAuthority, WorkflowResourceConsumption, WorkflowResourceExpansionState,

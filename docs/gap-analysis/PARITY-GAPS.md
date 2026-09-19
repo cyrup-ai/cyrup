@@ -1449,7 +1449,32 @@ the behaviour was available to be ported and was not.
 - **CLOSED, re-verified in code 2026-09-16 at `cc7818b`.** `exec/usage_budget.rs` exists; `"usageBudget"` has **14** occurrences including the advertised schema key, and the resolved budget is carried onto the runner at `extension/executor/background.rs:620` (`usage_budget` on `RunnerConfig`, commented "SUBA-021 — the run-level usage budget the orchestrator validated, carried verbatim onto hop 2"). The "zero hits in the crate" claim below is false at HEAD. **The body below is the original filing and is kept as history.**
 `src/runs/shared/usage-budget.ts:14`, `:44`, `:61` (65 lines) — present at **both** v0.43.0 and v0.47.1; tool param `src/extension/schemas.ts:330` — vs zero hits in the crate and no such key among the 45 schema properties. **Observable**: a run cannot be capped by cost/token spend.
 
-**VL-S10 · Parallel worktree handoff manifests** — *medium* · id retained, class corrected (v0.36.0) · area 09 `SUBA-024` (still open there) · **STILL OPEN at `cc7818b`; re-greped 2026-09-16**
+**~~VL-S10 · Parallel worktree handoff manifests~~** — ~~*medium*~~ **CLOSED** · area 09 `SUBA-024`
+- **CLOSED 2026-09-19.** `handoff/` (9 modules) writes the manifest the retention reader has been
+  looking for since it landed: `background/async_retention/scan.rs`'s `has_unresolved_run_handoff`
+  now finds real files, and the `[CYRUP-DELTA]` saying no cyrup writer produces one is gone. The
+  writer is reached from `spawn/chain_graph.rs`'s `publish_worktree_handoff`, on every
+  `worktree: true` group settle, in two phases around cleanup so the removal ledger is recorded
+  with the group rather than guessed afterwards
+- **Five verbs, not two, and they are ONE feature.** This row named `worktree.discard`/
+  `worktree.cleanup`; `lane.status`/`lane.recordMerge`/`lane.recordSupersession` were filed
+  separately inside the seventeen-verb list. All five dispatch through the same manifest upstream
+  (`subagent-executor.ts:6270-6290` @v0.68.0). `SUBAGENT_ACTIONS` is 42 → 47
+- **`VL-S7`'s authority arms now have something to attach to**, as this row predicted:
+  `registration/authority.rs` maps `worktree.discard` → `discardWorktree` (Confirm by default) and
+  the in-tree note saying "whoever lands `worktree.discard` … must wire them through" is discharged
+- **`worktree: true` did not WORK before this.** It was advertised at
+  `extension/tool/schema.rs:430` and returned *"worktree: true group requires
+  `ChainRunContext::worktree_base_dir` to be configured"* in a default install. So this closed more
+  than the convergence layer it was scoped as
+- **A data-loss defect was introduced and closed inside this batch, and it is worth recording.**
+  Giving the harvest a cleanup call made it force-remove worktrees holding uncommitted work, with
+  nobody asked — upstream refuses at `worktree.ts:1197-1231`. The gate is now ported with all four
+  interlocks (both probes; the capture row carries a real error; the manifest must RECORD the patch;
+  the patch must still represent the worktree), `git branch -D` runs only after a successful
+  removal, and both paths are pinned by mutation-proven tests
+- upstream: `src/runs/shared/parallel-handoff.ts` (741 lines @v0.68.0),
+  `src/runs/shared/worktree-cleanup-plan.ts` (869), `src/runs/shared/lane-metadata.ts` (126)
 - **Re-greped this pass:** `grep -rn '"handoffPath"' crates/cyrup-ext-subagents/src/` returns **0** — the param is still unadvertised and there is still no manifest writer. Adjacent and also still missing: `worktree.discard` / `worktree.cleanup` are two of the seventeen verbs absent from cyrup's action list, which is why VL-S7's authority arms for them have nothing to attach to
 `src/runs/shared/parallel-handoff.ts:74`, `:158`, `:162`, `:183` (238 lines), present at v0.47.1; `handoffPath` tool param at `src/extension/schemas.ts:274` — vs `spawn/parallel.rs` (no manifest writer) and three incidental mentions only. **Observable**: after a parallel run with `worktree: true` there is no handoff manifest, no `handoffPath` to hand preserved worktrees to a follow-up, and no `discardPreservedWorktrees` cleanup — the branches are left for the user to find by hand.
 

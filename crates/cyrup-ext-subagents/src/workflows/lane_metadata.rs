@@ -1,6 +1,22 @@
-//! Launch-declared workflow lane metadata — pi `runs/shared/lane-metadata.ts:1-74`, the half
-//! `workflow-receipt.ts` needs. The worktree-reference half (`:99-126`, `normalizeWorktreeStatusReference`/
-//! `validateAsyncStatusLaneMetadata`) belongs to a different family and has no consumer here.
+//! Launch-declared workflow lane metadata — pi `runs/shared/lane-metadata.ts`, both halves.
+//!
+//! `:1-74` is the lane record `workflow-receipt.ts` needs:
+//! [`normalize_workflow_lane_metadata`] and [`assert_workflow_lane_key`], keyed on
+//! [`WorkflowKey`] and producing a [`WorkflowLaneMetadata`].
+//!
+//! `:9-11` and `:76-96` are the **worktree-naming** half, which LANES_2 gave a consumer:
+//! [`ManagedWorktreeProvider`] and [`WorktreeNaming`] are what a parallel-handoff manifest's
+//! `cleanup.tasks[].provider` / `.naming` carry (pi `shared/types.ts:454-467`), so they are read
+//! by every [`crate::handoff::read_manifest`] and written by every worktree cleanup.
+//!
+//! **Deliberately NOT ported**: `WorktreeStatusReference` /
+//! `normalizeWorktreeStatusReference` (`:76-81,99-110`) and `validateAsyncStatusLaneMetadata`
+//! (`:113-126`). Both validate the additive lane/worktree fields of a persisted **async status**
+//! — `AsyncStatus.steps[].{lane,worktreePath,branch,provider,naming}` — and cyrup's step record
+//! ([`crate::background::records::RunStatus`]) has none of those five fields. The validation they
+//! perform on the naming/provider pair lives here instead, in the types' own fallible
+//! constructors, where a manifest read reaches it; porting the outer validators as well would
+//! land two functions with nothing in this crate to validate.
 
 use serde_json::Value;
 
@@ -214,6 +230,113 @@ pub fn normalize_workflow_lane_metadata(
     }))
 }
 
+/// pi `WORKTREE_STATUS_PATH_MAX_BYTES` (`lane-metadata.ts:9`).
+pub const WORKTREE_STATUS_PATH_MAX_BYTES: usize = 4096;
+/// pi `WORKTREE_STATUS_BRANCH_MAX_BYTES` (`:10`).
+pub const WORKTREE_STATUS_BRANCH_MAX_BYTES: usize = 256;
+/// pi `WORKTREE_STATUS_NAMING_LABEL_MAX_BYTES` (`:11`).
+pub const WORKTREE_STATUS_NAMING_LABEL_MAX_BYTES: usize = 256;
+
+/// pi `ManagedWorktreeProvider` (`shared/types.ts:405`) — `Exclude<WorktreeProvider, "auto">`,
+/// i.e. the provider that ACTUALLY allocated a worktree, after `auto` has resolved.
+///
+/// A two-variant enum rather than upstream's string union, so `"auto"` — a request, never an
+/// outcome — is unrepresentable in a record that describes something already allocated. The
+/// validation pi spends a runtime `!== "native" && !== "worktrunk"` check on
+/// (`lane-metadata.ts:103`) is the `Deserialize` derive's job here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ManagedWorktreeProvider {
+    /// `git worktree add` — the only allocator cyrup has.
+    Native,
+    /// pi's external `worktrunk` provider. Parsed, never produced here.
+    Worktrunk,
+}
+
+/// pi `WorktreeNaming["collision"]` (`shared/types.ts:412`) — which half of a managed worktree's
+/// name had to be disambiguated. A three-variant enum, per the batch directive on string unions;
+/// pi validates it with a three-way `!==` chain at `lane-metadata.ts:89`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorktreeNamingCollision {
+    /// Only the branch name collided.
+    Branch,
+    /// Only the path component collided.
+    Path,
+    /// Both did.
+    Both,
+}
+
+/// pi `WorktreeNaming` (`shared/types.ts:407-414`), normalized by `normalizeWorktreeNaming`
+/// (`lane-metadata.ts:83-96`) — the branch/path naming evidence retained with a worktree's
+/// cleanup authority, so a later reader can tell WHY a worktree is called what it is called.
+///
+/// Every one of pi's four required fields is required here and bounded by its type, and the two
+/// optional ones are `Option`, so pi's six `boundedNonEmptyString` calls and its
+/// `assertKnownFields` allow-list (`:86`) are both discharged by the declaration:
+/// `deny_unknown_fields` is the allow-list, and [`Bounded`]'s hand-written `Deserialize` (which
+/// routes through `Bounded::parse`) is the bound. The one rule the types do not carry is pi's
+/// `\n`/`\r`/NUL exclusion, which [`WorktreeNaming::validate`] applies.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorktreeNaming {
+    /// The branch the caller asked for, before collision handling.
+    pub requested_branch: Bounded<WORKTREE_STATUS_BRANCH_MAX_BYTES>,
+    /// The prefix every managed branch for this run shares.
+    pub branch_prefix: Bounded<WORKTREE_STATUS_BRANCH_MAX_BYTES>,
+    /// The human-facing label the branch and path were derived from.
+    pub label: Bounded<WORKTREE_STATUS_NAMING_LABEL_MAX_BYTES>,
+    /// The label after sanitization into a single path component.
+    pub sanitized_path_component: Bounded<WORKTREE_STATUS_NAMING_LABEL_MAX_BYTES>,
+    /// Which half collided, when one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collision: Option<WorktreeNamingCollision>,
+    /// The suffix appended to break that collision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collision_suffix: Option<Bounded<WORKTREE_STATUS_NAMING_LABEL_MAX_BYTES>>,
+}
+
+impl WorktreeNaming {
+    /// pi `boundedNonEmptyString`'s control-character rule (`lane-metadata.ts:23`), applied
+    /// across every string this record carries.
+    ///
+    /// Separate from `Deserialize` for the reason [`has_forbidden_control_character`] is separate
+    /// from [`Bounded::parse`]: the rule belongs to pi's lane-metadata helper, not to the bound,
+    /// and folding it into `Bounded` would silently change nine other fields' contracts.
+    ///
+    /// # Errors
+    ///
+    /// `<label>.<field> must not contain newlines or NUL bytes.` — the same sentence
+    /// [`lane_bounded_string`] produces, so a naming record rejected here reads identically to a
+    /// lane field rejected there.
+    pub fn validate(&self, label: &str) -> Result<(), LaneMetadataError> {
+        let fields: [(&str, &str); 4] = [
+            ("requestedBranch", self.requested_branch.as_str()),
+            ("branchPrefix", self.branch_prefix.as_str()),
+            ("label", self.label.as_str()),
+            (
+                "sanitizedPathComponent",
+                self.sanitized_path_component.as_str(),
+            ),
+        ];
+        for (name, value) in fields {
+            if has_forbidden_control_character(value) {
+                return Err(LaneMetadataError::new(format!(
+                    "{label}.{name} must not contain newlines or NUL bytes."
+                )));
+            }
+        }
+        if let Some(suffix) = self.collision_suffix.as_ref()
+            && has_forbidden_control_character(suffix.as_str())
+        {
+            return Err(LaneMetadataError::new(format!(
+                "{label}.collisionSuffix must not contain newlines or NUL bytes."
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// pi `assertWorkflowLaneKey` (`lane-metadata.ts:71-74`) — a lane's key must equal the workflow
 /// key it is attached to. **Both guards are the point**: it is a no-op when either side is absent
 /// (`:72`), so a caller with no key in hand cannot accidentally reject a valid lane.
@@ -410,6 +533,77 @@ mod tests {
         assert_eq!(
             assert_workflow_lane_key(Some(&lane), Some(&key("lane.a")), "lane"),
             Ok(())
+        );
+    }
+
+    /// The on-disk spelling of the naming record IS the interface — a manifest written by pi
+    /// carries these exact keys (`shared/types.ts:407-414`), so the round-trip is asserted against
+    /// a literal JSON string rather than only against itself.
+    #[test]
+    fn worktree_naming_round_trips_pis_exact_on_disk_spelling() {
+        let json = r#"{"requestedBranch":"lane-0","branchPrefix":"lane-","label":"lane a","sanitizedPathComponent":"lane-a","collision":"both","collisionSuffix":"-2"}"#;
+        let naming: WorktreeNaming = serde_json::from_str(json).expect("parses");
+        assert_eq!(naming.collision, Some(WorktreeNamingCollision::Both));
+        assert_eq!(serde_json::to_string(&naming).expect("serializes"), json);
+        // The two optional keys are ABSENT, not null, when unset — pi elides them.
+        let minimal = r#"{"requestedBranch":"b","branchPrefix":"p","label":"l","sanitizedPathComponent":"s"}"#;
+        let naming: WorktreeNaming = serde_json::from_str(minimal).expect("parses");
+        assert_eq!(serde_json::to_string(&naming).expect("serializes"), minimal);
+    }
+
+    /// `assertKnownFields` (`lane-metadata.ts:86`) and the three-way `collision` check (`:89`) are
+    /// both discharged by the declaration: an unknown key and an unknown collision word are
+    /// refused on the way in, with no runtime check to forget.
+    #[test]
+    fn worktree_naming_refuses_unknown_fields_and_an_invalid_collision() {
+        assert!(
+            serde_json::from_str::<WorktreeNaming>(
+                r#"{"requestedBranch":"b","branchPrefix":"p","label":"l","sanitizedPathComponent":"s","whoops":1}"#
+            )
+            .is_err(),
+            "deny_unknown_fields IS pi's allow-list"
+        );
+        assert!(
+            serde_json::from_str::<WorktreeNaming>(
+                r#"{"requestedBranch":"b","branchPrefix":"p","label":"l","sanitizedPathComponent":"s","collision":"sideways"}"#
+            )
+            .is_err()
+        );
+        // `auto` is a REQUEST, never an outcome; a record describing an allocated worktree cannot
+        // spell it (pi `ManagedWorktreeProvider = Exclude<WorktreeProvider, "auto">`).
+        assert!(serde_json::from_str::<ManagedWorktreeProvider>(r#""auto""#).is_err());
+        assert_eq!(
+            serde_json::from_str::<ManagedWorktreeProvider>(r#""worktrunk""#).expect("parses"),
+            ManagedWorktreeProvider::Worktrunk
+        );
+    }
+
+    /// The bound is the TYPE's, not a runtime `if length >`: an over-long branch prefix never
+    /// becomes a `WorktreeNaming` at all.
+    #[test]
+    fn worktree_naming_bounds_are_parse_time() {
+        let long = "b".repeat(WORKTREE_STATUS_BRANCH_MAX_BYTES + 1);
+        let json = format!(
+            r#"{{"requestedBranch":"{long}","branchPrefix":"p","label":"l","sanitizedPathComponent":"s"}}"#
+        );
+        assert!(serde_json::from_str::<WorktreeNaming>(&json).is_err());
+    }
+
+    /// pi's `\n`/`\r`/NUL rule (`boundedNonEmptyString:23`, reached through
+    /// `normalizeWorktreeNaming`) is not a bound, so it is a separate check — and it matters
+    /// because a branch name carrying a newline is printed verbatim into the manual
+    /// `git branch -D <branch>` lines a discard renders.
+    #[test]
+    fn worktree_naming_validate_rejects_control_characters() {
+        let naming: WorktreeNaming = serde_json::from_str(
+            "{\"requestedBranch\":\"lane\\n0\",\"branchPrefix\":\"p\",\"label\":\"l\",\"sanitizedPathComponent\":\"s\"}",
+        )
+        .expect("a newline is within the byte bound, so the TYPE accepts it");
+        assert_eq!(
+            naming.validate("task.naming"),
+            Err(LaneMetadataError::new(
+                "task.naming.requestedBranch must not contain newlines or NUL bytes."
+            ))
         );
     }
 

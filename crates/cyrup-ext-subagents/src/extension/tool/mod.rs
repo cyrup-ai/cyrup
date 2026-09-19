@@ -1,5 +1,6 @@
 //! The `subagent` [`Tool`] itself: its construction and its [`cyrup_core::Tool`] impl.
 
+pub(crate) mod lane_actions;
 pub(crate) mod mission;
 pub(crate) mod params;
 pub(crate) mod routing;

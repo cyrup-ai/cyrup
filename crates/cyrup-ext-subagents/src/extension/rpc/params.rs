@@ -119,6 +119,17 @@ fn names_a_target(params: &Map<String, Value>) -> bool {
 /// `schedule.run-due`). That narrowing is upstream's own choice — an RPC caller may inspect and
 /// steer the schedule, and creates a schedule through `spawn`'s own surface — so the list stays at
 /// seven rather than being widened to whatever this side happens to dispatch.
+///
+/// **Re-checked when the five lane/worktree verbs landed (LANES_2).** `rpc.ts:65-73` @v0.68.0 is
+/// still the same seven, and `git show v0.68.0:src/extension/rpc.ts | grep -n
+/// 'lane\|worktree\|handoff'` returns nothing — the whole RPC surface has no concept of either.
+/// The symmetry argument for widening ("a host that fanned out over the bridge should converge
+/// over it") rests on a FALSE premise, which is why it was checked: neither `rpc.ts`'s `spawn`
+/// nor [`super::SUBAGENT_RPC_METHODS`] has a `worktree` parameter, so a bridge caller cannot
+/// create a manifest here and has nothing to converge. Separately, `worktree.discard` is
+/// confirm-gated by default and a bridge caller is not the session holding the UI, so widening
+/// would either bypass that gate or route a destructive prompt to an arbitrary host. Unchanged,
+/// and NOT a `[CYRUP-DELTA]` — matching upstream is the default.
 pub(crate) fn manage_params(
     params: Option<&Value>,
 ) -> Result<Map<String, Value>, SubagentRpcError> {

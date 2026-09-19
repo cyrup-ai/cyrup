@@ -131,6 +131,53 @@ pub(crate) struct SubagentToolParams {
     /// [`crate::background::control::SteerDeliveryMode::parse`] and be refused with a sentence the
     /// model can act on, not rejected by serde with a deserialization error it cannot.
     pub(crate) mode: Option<String>,
+    /// LANES_2 / pi `params.handoffPath` (`extension/schemas.ts:298` @v0.68.0) — an EXISTING
+    /// parallel-handoff manifest for a `worktree.*`/`lane.*` action. Resolved against the request
+    /// cwd, never the process cwd (pi `:6228`).
+    pub(crate) handoff_path: Option<String>,
+    /// LANES_2 / pi `params.repo` (`extension/schemas.ts:299` @v0.68.0) — which repository
+    /// `worktree.cleanup` plans for. Absent means the request cwd (pi `:6225-6227`).
+    pub(crate) repo: Option<String>,
+    /// LANES_2 / pi `params.planId` (`extension/schemas.ts:300` @v0.68.0: *"Reserved; cleanup is
+    /// plan-only."*).
+    ///
+    /// A raw `String` and NOT a [`crate::spawn::cleanup_plan::model::PlanId`], deliberately: the
+    /// dispatch refuses ANY value here with pi's own sentence (`:6220-6222`), so parsing it into
+    /// the validated newtype first would answer a caller who tried to apply a saved plan with a
+    /// pattern-validation error instead of "apply is not available yet".
+    pub(crate) plan_id: Option<String>,
+    /// LANES_2 / pi `params.laneId` (`extension/schemas.ts:301` @v0.68.0, `minLength: 1,
+    /// maxLength: 128`) — *"Exact manifest run id for lane actions."*
+    ///
+    /// Raw, per this struct's stated house rule: upstream trims it and answers a blank with
+    /// `${action} requires laneId.` (`:6275`), and the manifest comparison at `:6283` is a plain
+    /// string equality against `manifest.runId`. A `LaneId` newtype here would answer a caller
+    /// who sent `""` with a deserialization error instead of the sentence naming the verb.
+    pub(crate) lane_id: Option<String>,
+    /// LANES_2 / pi `params.merge` (`extension/schemas.ts:302` @v0.68.0:
+    /// `Type.Unsafe({type: "object", additionalProperties: true})`) — the merge attestation for
+    /// `action='lane.recordMerge'`.
+    ///
+    /// Raw [`serde_json::Value`] because [`crate::handoff::record_merge`] owns the validation and
+    /// its rejections are the product surface. The TYPED shape is
+    /// [`crate::handoff::MergeEvidence`], whose newtypes deserialize through their own fallible
+    /// constructors; this field is the untyped carrier that reaches them **unmodified** — no
+    /// trimming, no key filtering, because `manifestDigest` is stamped by the recorder and every
+    /// other key is evidence.
+    pub(crate) merge: Option<serde_json::Value>,
+    /// LANES_2 / pi `params.supersession` (`extension/schemas.ts:303` @v0.68.0) — the
+    /// supersession attestation for `action='lane.recordSupersession'`. Raw, for the same reason
+    /// [`Self::merge`] is.
+    pub(crate) supersession: Option<serde_json::Value>,
+    /// LANES_2 / pi `params.lane` (`extension/schemas.ts:355` @v0.68.0 → the TypeBox at
+    /// `:103-110`) — launch-declared lane metadata for a fan-out child.
+    ///
+    /// Carried as a `Value` and normalized at the dispatch boundary through the LANDED
+    /// [`crate::workflows::normalize_workflow_lane_metadata`], NOT by serde: upstream's eight
+    /// lane rejections are sentences a model can act on and
+    /// [`crate::workflows::LaneMetadataError`] already carries them verbatim, where a
+    /// `serde::de::Error` would not. One line at the boundary, upstream's messages.
+    pub(crate) lane: Option<serde_json::Value>,
     pub(crate) chain_name: Option<String>,
     pub(crate) config: Option<serde_json::Value>,
     pub(crate) tasks: Option<Vec<serde_json::Value>>,
@@ -313,6 +360,36 @@ impl SubagentToolParams {
             // `chain[i].parallel[j]` as well as the top-level policy, and `background/` can see
             // none of that.
             acceptance_errors: validate_execution_acceptance(self),
+        }
+    }
+
+    /// LANES_2 — the `lane.*` argument projection (pi `subagent-executor.ts:6274-6288`).
+    ///
+    /// ⚠ Here, in `extension/tool/`, for the reason [`Self::schedule_action_params`] records:
+    /// `every_advertised_schema_property_is_read_outside_provided_keys` walks ONLY the
+    /// `src/extension/` tree, so a read of `laneId`/`merge`/`supersession` that lived in
+    /// `handoff/` would leave all three reported as advertised-but-unwired.
+    pub(crate) fn lane_action_params(
+        &self,
+    ) -> crate::extension::tool::lane_actions::LaneActionParams {
+        crate::extension::tool::lane_actions::LaneActionParams {
+            handoff_path: self.handoff_path.clone(),
+            lane_id: self.lane_id.clone(),
+            // Cloned, never rebuilt: the attestation must reach the recorder byte-identical.
+            merge: self.merge.clone(),
+            supersession: self.supersession.clone(),
+        }
+    }
+
+    /// LANES_2 — the `worktree.cleanup` argument projection (pi
+    /// `subagent-executor.ts:6217-6228`), here for the same placement reason.
+    pub(crate) fn cleanup_plan_params(
+        &self,
+    ) -> crate::extension::tool::lane_actions::CleanupPlanParams {
+        crate::extension::tool::lane_actions::CleanupPlanParams {
+            repo: self.repo.clone(),
+            plan_id: self.plan_id.clone(),
+            mode: self.mode.clone(),
         }
     }
 
@@ -614,6 +691,27 @@ impl SubagentToolParams {
         }
         if self.message.is_some() {
             keys.push("message");
+        }
+        if self.handoff_path.is_some() {
+            keys.push("handoffPath");
+        }
+        if self.repo.is_some() {
+            keys.push("repo");
+        }
+        if self.plan_id.is_some() {
+            keys.push("planId");
+        }
+        if self.lane_id.is_some() {
+            keys.push("laneId");
+        }
+        if self.merge.is_some() {
+            keys.push("merge");
+        }
+        if self.supersession.is_some() {
+            keys.push("supersession");
+        }
+        if self.lane.is_some() {
+            keys.push("lane");
         }
         if self.chain_name.is_some() {
             keys.push("chainName");

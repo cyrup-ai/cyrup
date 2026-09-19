@@ -152,6 +152,7 @@ mod tests {
             concurrency: 4,
             fail_fast: false,
             worktree: false,
+            lane: None,
         })
     }
 

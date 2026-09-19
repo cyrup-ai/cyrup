@@ -128,12 +128,18 @@ impl SubagentExecutor {
         // this orchestrator's own presence target so each foreground-spawned child registers its
         // `contact_supervisor` bridge addressed at the live human orchestrator — the SAME activation
         // the background path gets via `RunnerConfig`. `None` target leaves each child un-bridged.
+        // Minted ABOVE the executor rather than inline, so the executor and the handoff manifest
+        // path share ONE id: pi derives the foreground manifest path from the same `input.runId`
+        // the run itself carries (`subagent-executor.ts:3718`,
+        // `parallelHandoffPath(input.artifactsDir, input.runId)`), and two independently minted
+        // ids would file a run's worktrees under a name nothing else in the run knows.
+        let run_id = RunId::new();
         let executor: Arc<dyn SingleStepExecutor> = Arc::new(
             ExecSingleStepExecutor::foreground(
                 depth,
                 Arc::new(resolved_agents),
                 self.orchestrator_intercom_target(),
-                Some(RunId::new()),
+                Some(run_id.clone()),
                 // Session-model inheritance for foreground `/chain`//`/parallel` steps (pi's
                 // `data.parentModel`, read at `subagent-executor.ts:3165,3549` @v0.43.0 and fed by the
                 // same `requestParentModel`): an inheriting step (no persona `model:`, no per-step
@@ -187,6 +193,17 @@ impl SubagentExecutor {
         // `cfg` below by the struct literal — `dynamic_fanout_max_items()` takes `&self` on the
         // whole (by-then-partially-moved) `cfg`, so it must be evaluated first.
         let dynamic_fanout_max_items = cfg.dynamic_fanout_max_items();
+        // Resolved BEFORE `cfg.worktree_base_dir` is moved out of `cfg` by the struct literal
+        // below, for the same reason `dynamic_fanout_max_items` is: `artifact_dir_preference()`
+        // borrows the whole (by-then-partially-moved) `cfg`.
+        let handoff_artifacts_dir = crate::artifacts::resolve_artifacts_dir(
+            self.host_services()
+                .and_then(|services| services.session_file())
+                .as_deref(),
+            Some(cwd),
+            cwd,
+            cfg.artifact_dir_preference(),
+        );
         let ctx = ChainRunContext {
             cwd: cwd.to_path_buf(),
             deadline_at,
@@ -212,6 +229,30 @@ impl SubagentExecutor {
             // so nothing reads this slot; it exists for the background runner, which re-stamps it
             // per dispatch.
             step_slot: crate::spawn::chain_graph::StepSlot::Exclusive(0),
+            // The FOREGROUND manifest shape — pi `parallelHandoffPath(input.artifactsDir,
+            // input.runId)` (`subagent-executor.ts:3718` @v0.68.0), i.e.
+            // `<artifacts_dir>/handoffs/<run_id>.json`. The artifacts dir is resolved the same
+            // way `extension/executor/background.rs` resolves it for the async path, so a
+            // foreground `/parallel` and an `async: true` one leave their manifests under the
+            // same root.
+            handoff: Some(crate::spawn::chain_graph::HandoffBinding {
+                manifest_path: crate::handoff::handoff_manifest_path(
+                    &handoff_artifacts_dir,
+                    &run_id,
+                ),
+                run_id: crate::handoff::LaneId::from(&run_id),
+                // pi `(config.resultMode ?? statusPayload.mode) === "parallel" ? "parallel" :
+                // "chain"` (`subagent-runner.ts:4417` @v0.68.0). This one entry point serves both
+                // `/parallel` and `/chain`, and `mode` is manifest IDENTITY — a rewrite whose mode
+                // disagrees with the file on disk is refused (`parallel-handoff.ts:514-516`) — so
+                // it is derived from the graph's actual shape rather than hard-coded: a lone
+                // fan-out step IS the parallel shape, anything else is a chain walk.
+                mode: match graph.as_slice() {
+                    [RunnerStep::ParallelGroup(_)] => crate::handoff::HandoffMode::Parallel,
+                    _ => crate::handoff::HandoffMode::Chain,
+                },
+                source: crate::handoff::HandoffSource::Foreground,
+            }),
         };
         let mut registry = OutputRegistry::new();
         walk_chain(&graph, &mut registry, &executor, &ctx).await
